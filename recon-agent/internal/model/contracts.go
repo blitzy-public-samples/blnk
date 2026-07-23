@@ -65,6 +65,28 @@ type Provenance struct {
 	UploadID string `json:"upload_id"`
 	// Source is the external-statement source label (e.g. the bank name).
 	Source string `json:"source"`
+
+	// The following fields carry the machine-readable audit evidence stamped by
+	// the internal/audit builders so the append-only trail is fully
+	// self-describing and queryable (not buried in free-text rationale). They
+	// are persisted transparently: agent.agent_audit stores Provenance as a
+	// single JSONB column, so store.InsertAudit/ListAudit marshal and restore
+	// these fields with no schema change. All are optional (omitempty): an event
+	// that does not concern a classification or rule simply omits them.
+
+	// RootCause is the classified root cause (one of the RootCause constants)
+	// for the break the event concerns. Stamped on classified/escalated events.
+	RootCause string `json:"root_cause,omitempty"`
+	// Regulated marks the break as touching a regulated flow (Rule 5.4). Stamped
+	// on classification-derived events so a regulated break is auditable as such.
+	Regulated bool `json:"regulated,omitempty"`
+	// RuleID identifies the Blnk matching rule the event concerns (a proposed or
+	// created rule). Empty when the event does not concern a rule.
+	RuleID string `json:"rule_id,omitempty"`
+	// RuleField / RuleOperator record the primary criterion of that rule, giving
+	// the audit trail machine-readable rule identity without a Blnk lookup.
+	RuleField    string `json:"rule_field,omitempty"`
+	RuleOperator string `json:"rule_operator,omitempty"`
 }
 
 // AuditEvent is a single immutable entry in the append-only audit trail
