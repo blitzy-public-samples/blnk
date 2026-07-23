@@ -1,0 +1,69 @@
+{
+  "ledger": {
+    "name": "Recon Demo Ledger",
+    "meta_data": {
+      "purpose": "recon-agent demo seed"
+    }
+  },
+  "balances": [
+    {
+      "key": "treasury_usd",
+      "currency": "USD",
+      "precision": 100,
+      "track_fund_lineage": false,
+      "meta_data": {
+        "role": "internal treasury"
+      }
+    }
+  ],
+  "transactions": [
+    {
+      "reference": "INV-1001",
+      "amount": 1500.00,
+      "currency": "USD",
+      "description": "Vendor payout ACH to supplier",
+      "source": "@world",
+      "destination": "treasury_usd",
+      "precision": 100,
+      "allow_overdraft": true,
+      "skip_queue": true,
+      "scenario": "timing"
+    },
+    {
+      "reference": "INV-1002",
+      "amount": 250.00,
+      "currency": "USD",
+      "description": "Card capture gross booking",
+      "source": "@world",
+      "destination": "treasury_usd",
+      "precision": 100,
+      "allow_overdraft": true,
+      "skip_queue": true,
+      "scenario": "amount_drift"
+    },
+    {
+      "reference": "INV-1003",
+      "amount": 980.00,
+      "currency": "USD",
+      "description": "Wire credit from vendor ACME",
+      "source": "@world",
+      "destination": "treasury_usd",
+      "precision": 100,
+      "allow_overdraft": true,
+      "skip_queue": true,
+      "scenario": "reference_mismatch"
+    },
+    {
+      "reference": "INV-1006",
+      "amount": 700.00,
+      "currency": "USD",
+      "description": "SEPA credit booked in USD",
+      "source": "@world",
+      "destination": "treasury_usd",
+      "precision": 100,
+      "allow_overdraft": true,
+      "skip_queue": true,
+      "scenario": "currency_mismatch counterpart"
+    }
+  ]
+}
