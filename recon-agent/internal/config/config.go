@@ -13,8 +13,10 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Default values applied when the corresponding environment variable is unset
@@ -73,20 +75,29 @@ type Config struct {
 }
 
 // Load reads the recon-agent configuration from the process environment,
-// applying defaults for optional fields and validating required ones.
+// applying defaults for optional fields and validating required and typed
+// ones.
 //
-// It returns an error when a required field is missing (AGENT_DATABASE_URL) or
-// a typed field fails to parse (CONF_AUTO_THRESHOLD). Callers (cmd/main.go)
-// should treat a non-nil error as fatal at startup.
+// It returns a descriptive error when a required field is missing or
+// whitespace-only (AGENT_DATABASE_URL) or a typed field fails to parse or
+// falls outside its accepted range (CONF_AUTO_THRESHOLD must be a finite value
+// in [0,1]; HITL_PORT must be an integer TCP port in 1..65535). Failing fast on
+// an unusable value is deliberate: silently accepting an out-of-range
+// CONF_AUTO_THRESHOLD would subvert the Rule 5.4 auto-remediation gate, and an
+// unusable DSN or port would otherwise surface only later as an opaque
+// connect/bind error. Callers (cmd/main.go) should treat a non-nil error as
+// fatal at startup.
 func Load() (Config, error) {
 	cfg := Config{
-		LLMBaseURL:       getEnv("LLM_BASE_URL", defaultLLMBaseURL),
-		LLMApiKey:        os.Getenv("LLM_API_KEY"),
-		LLMModel:         getEnv("LLM_MODEL", defaultLLMModel),
-		BlnkBaseURL:      getEnv("BLNK_BASE_URL", defaultBlnkBaseURL),
-		BlnkApiKey:       os.Getenv("BLNK_API_KEY"),
-		HitlPort:         getEnv("HITL_PORT", defaultHitlPort),
-		AgentDatabaseURL: os.Getenv("AGENT_DATABASE_URL"),
+		LLMBaseURL:  getEnv("LLM_BASE_URL", defaultLLMBaseURL),
+		LLMApiKey:   os.Getenv("LLM_API_KEY"),
+		LLMModel:    getEnv("LLM_MODEL", defaultLLMModel),
+		BlnkBaseURL: getEnv("BLNK_BASE_URL", defaultBlnkBaseURL),
+		BlnkApiKey:  os.Getenv("BLNK_API_KEY"),
+		// Trim surrounding whitespace so a whitespace-only DSN (e.g. from a
+		// templating slip) fails the required-field check below instead of
+		// being stored verbatim and failing later at DB-connect time.
+		AgentDatabaseURL: strings.TrimSpace(os.Getenv("AGENT_DATABASE_URL")),
 	}
 
 	threshold, err := parseFloat("CONF_AUTO_THRESHOLD", defaultConfAutoThreshold)
@@ -95,6 +106,12 @@ func Load() (Config, error) {
 	}
 	cfg.ConfAutoThreshold = threshold
 
+	port, err := parsePort("HITL_PORT", defaultHitlPort)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.HitlPort = port
+
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
@@ -102,11 +119,23 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// validate enforces required-field constraints. AGENT_DATABASE_URL is the only
-// strictly required field; every other field has a safe default.
+// validate enforces required-field and range constraints. AGENT_DATABASE_URL
+// is the only strictly required field (it has no default); the confidence
+// threshold must additionally be a finite value within the closed interval
+// [0,1] so the Rule 5.4 auto-remediation gate (confidence >= threshold) behaves
+// as intended. A threshold <= 0 would auto-remediate every break regardless of
+// LLM confidence; NaN or > 1 would silently disable auto-remediation. Both are
+// misconfigurations that must fail fast rather than subvert the safety gate.
 func (c Config) validate() error {
 	if c.AgentDatabaseURL == "" {
 		return fmt.Errorf("config: AGENT_DATABASE_URL is required")
+	}
+	if math.IsNaN(c.ConfAutoThreshold) || math.IsInf(c.ConfAutoThreshold, 0) ||
+		c.ConfAutoThreshold < 0 || c.ConfAutoThreshold > 1 {
+		return fmt.Errorf(
+			"config: CONF_AUTO_THRESHOLD %v is out of range; must be a finite value in [0,1]",
+			c.ConfAutoThreshold,
+		)
 	}
 	return nil
 }
@@ -133,4 +162,27 @@ func parseFloat(key string, def float64) (float64, error) {
 		return 0, fmt.Errorf("config: invalid %s %q: %w", key, raw, err)
 	}
 	return v, nil
+}
+
+// parsePort reads a TCP port environment variable named by key. Surrounding
+// whitespace is trimmed first, so an accidental value like "8088 " is accepted
+// and canonicalized. It returns def when the variable is unset or empty (after
+// trimming), and a descriptive error when the value does not parse to an
+// integer within the valid TCP port range 1..65535. The returned value is the
+// trimmed, canonical port string the HITL server binds its listener to (as
+// ":" + port); validating here fails fast instead of surfacing an opaque
+// net.Listen error later at bind time.
+func parsePort(key, def string) (string, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		raw = def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return "", fmt.Errorf("config: invalid %s %q: must be an integer TCP port in 1..65535", key, raw)
+	}
+	if n < 1 || n > 65535 {
+		return "", fmt.Errorf("config: %s %d is out of range; must be in 1..65535", key, n)
+	}
+	return raw, nil
 }

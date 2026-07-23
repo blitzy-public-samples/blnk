@@ -43,15 +43,19 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -265,6 +269,39 @@ func (c *blnkClient) uploadFile(path, csvPath, source string) ([]byte, int, erro
 	return respBody, resp.StatusCode, nil
 }
 
+// transactionExistsByRef reports whether an internal transaction with the given
+// reference already exists in Blnk, via GET /transactions/reference/:reference.
+// A 2xx response means the transaction exists; a 404 means it does not. Any
+// other status — or a transport error — is returned as an error so a caller
+// never mistakes an ambiguous backend failure for "absent". It underpins the
+// seed's idempotency guard (so a re-run neither creates orphan ledgers/balances
+// nor aborts on a duplicate-reference conflict).
+func (c *blnkClient) transactionExistsByRef(reference string) (bool, error) {
+	endpoint := c.baseURL + "/transactions/reference/" + url.PathEscape(reference)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, fmt.Errorf("build request for reference %q: %w", reference, err)
+	}
+	req.Header.Set(blnkKeyHeader, c.apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("GET /transactions/reference/%s: %w", reference, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	// Drain the body so the connection can be reused.
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	switch {
+	case is2xx(resp.StatusCode):
+		return true, nil
+	case resp.StatusCode == http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("GET /transactions/reference/%s returned unexpected HTTP %d", reference, resp.StatusCode)
+	}
+}
+
 // waitForReady best-effort waits for Blnk to accept connections by polling the
 // unauthenticated GET /health endpoint. It retries only on transport errors
 // (e.g. connection refused while the stack is still starting) and returns as
@@ -353,6 +390,137 @@ func loadSeedData(path string) (*seedData, error) {
 		return nil, fmt.Errorf("seed file %s: ledger.name is required and must be non-empty", path)
 	}
 	return &data, nil
+}
+
+// internalSeedState classifies whether the internal transactions declared by
+// the seed are already present in Blnk. It drives the idempotency guard.
+type internalSeedState int
+
+const (
+	// seedAbsent means none of the declared internal transaction references
+	// exist yet — a clean, first-time run.
+	seedAbsent internalSeedState = iota
+	// seedPresent means every declared internal transaction reference already
+	// exists — the environment is already seeded, so seeding is a no-op.
+	seedPresent
+	// seedPartial means some (but not all) declared references exist — an
+	// ambiguous/inconsistent state the seed refuses to build on top of.
+	seedPartial
+)
+
+// checkInternalSeedState probes each declared internal transaction reference
+// (via the native GET /transactions/reference/:reference route) and reports
+// whether the internal side is fully absent, fully present, or partially
+// present, along with the number of references found. It is the read-only
+// preflight that makes the seed idempotent: it runs BEFORE any ledger, balance,
+// or transaction is created, so a re-run never leaves orphan objects behind.
+func checkInternalSeedState(client *blnkClient, data *seedData) (state internalSeedState, present int, err error) {
+	total := len(data.Transactions)
+	if total == 0 {
+		return seedAbsent, 0, nil
+	}
+
+	for _, t := range data.Transactions {
+		exists, probeErr := client.transactionExistsByRef(t.Reference)
+		if probeErr != nil {
+			return seedPartial, present, probeErr
+		}
+		if exists {
+			present++
+		}
+	}
+
+	switch present {
+	case 0:
+		return seedAbsent, 0, nil
+	case total:
+		return seedPresent, present, nil
+	default:
+		return seedPartial, present, nil
+	}
+}
+
+// requiredCSVColumns are the columns the external statement MUST provide. They
+// mirror the case-insensitive column contract enforced by
+// internal/files/files.go. The seed validates them locally so a malformed
+// statement fails fast with a clear message instead of being silently accepted
+// by Blnk, which coerces an unparseable amount to 0 and an unparseable date to
+// the zero time rather than rejecting the row.
+var requiredCSVColumns = []string{"id", "amount", "currency", "reference", "description", "date"}
+
+// validateExternalCSV reads and strictly validates the external statement CSV,
+// returning the number of data rows (excluding the header). It fails if a
+// required column is missing, a row has the wrong number of fields, a required
+// field is empty, an amount is not a valid float, or a date is not valid
+// RFC3339. The returned count is later asserted against the record_count Blnk
+// reports for the upload, so a silently dropped or added row is caught too.
+func validateExternalCSV(csvPath string) (int, error) {
+	f, err := os.Open(csvPath)
+	if err != nil {
+		return 0, fmt.Errorf("open csv file %s: %w", csvPath, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	reader := csv.NewReader(f)
+	// Disable the automatic fields-per-record check so we can surface a clearer,
+	// row-numbered error message ourselves.
+	reader.FieldsPerRecord = -1
+
+	header, err := reader.Read()
+	if err != nil {
+		return 0, fmt.Errorf("read csv header from %s: %w", csvPath, err)
+	}
+
+	// Build a case-insensitive column-name -> index map (mirrors files.go).
+	colIndex := make(map[string]int, len(header))
+	for i, name := range header {
+		colIndex[strings.ToLower(strings.TrimSpace(name))] = i
+	}
+	for _, col := range requiredCSVColumns {
+		if _, ok := colIndex[col]; !ok {
+			return 0, fmt.Errorf("csv %s is missing required column %q (need: %s)",
+				csvPath, col, strings.Join(requiredCSVColumns, ", "))
+		}
+	}
+
+	dataRows := 0
+	line := 1 // the header row was already consumed
+	for {
+		record, readErr := reader.Read()
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		line++
+		if readErr != nil {
+			return 0, fmt.Errorf("read csv %s row %d: %w", csvPath, line, readErr)
+		}
+
+		if len(record) != len(header) {
+			return 0, fmt.Errorf("csv %s row %d: expected %d fields but found %d",
+				csvPath, line, len(header), len(record))
+		}
+		for _, col := range requiredCSVColumns {
+			if strings.TrimSpace(record[colIndex[col]]) == "" {
+				return 0, fmt.Errorf("csv %s row %d: required field %q is empty", csvPath, line, col)
+			}
+		}
+		// Amount must parse as a float; Blnk would otherwise coerce it to 0.
+		amountStr := strings.TrimSpace(record[colIndex["amount"]])
+		if _, convErr := strconv.ParseFloat(amountStr, 64); convErr != nil {
+			return 0, fmt.Errorf("csv %s row %d: amount %q is not a valid number", csvPath, line, amountStr)
+		}
+		// Date must parse as RFC3339; Blnk would otherwise coerce it to the zero time.
+		dateStr := strings.TrimSpace(record[colIndex["date"]])
+		if _, convErr := time.Parse(time.RFC3339, dateStr); convErr != nil {
+			return 0, fmt.Errorf("csv %s row %d: date %q is not a valid RFC3339 timestamp", csvPath, line, dateStr)
+		}
+		dataRows++
+	}
+
+	if dataRows == 0 {
+		return 0, fmt.Errorf("csv %s contains a header but no data rows", csvPath)
+	}
+	return dataRows, nil
 }
 
 // createLedger creates the internal ledger via POST /ledgers and returns the
@@ -516,10 +684,46 @@ func main() {
 		log.Fatalf("failed to load seed data: %v", err)
 	}
 
+	// Validate the external statement up front so a malformed CSV fails fast —
+	// before any ledger/balance/transaction is created — and so its data-row
+	// count can be asserted against Blnk's reported record_count after upload.
+	expectedRecords, err := validateExternalCSV(cfg.csvFile)
+	if err != nil {
+		log.Fatalf("external statement validation failed: %v", err)
+	}
+
 	client := newBlnkClient(cfg.baseURL, cfg.apiKey)
 
 	// Tolerate a just-started stack; best-effort, never blocks indefinitely.
 	client.waitForReady()
+
+	// Idempotency guard: probe whether the internal side already exists BEFORE
+	// creating anything, so a re-run neither creates orphan ledgers/balances nor
+	// aborts on a duplicate-reference conflict.
+	state, present, err := checkInternalSeedState(client, data)
+	if err != nil {
+		log.Fatalf("failed to probe existing seed state: %v", err)
+	}
+	switch state {
+	case seedPresent:
+		// Already fully seeded — do nothing (idempotent no-op). Re-creating the
+		// ledger/balances would orphan objects and re-uploading the CSV would
+		// collide on the external transaction primary key.
+		log.Printf("internal side already seeded: all %d internal transaction(s) present; "+
+			"skipping ledger, balance, transaction creation and CSV upload (idempotent no-op)",
+			len(data.Transactions))
+		fmt.Printf("Seed skipped: already seeded (internal_transactions=%d present)\n", present)
+		return
+	case seedPartial:
+		// Ambiguous/inconsistent state — refuse to build on top of it. Nothing
+		// new has been created at this point.
+		log.Fatalf("refusing to seed: %d of %d internal transaction(s) already present — "+
+			"the environment is in a partial/inconsistent state. Reset the database before "+
+			"re-seeding. No ledger, balance, or transaction was created.",
+			present, len(data.Transactions))
+	case seedAbsent:
+		// Clean environment — fall through to a fresh seed below.
+	}
 
 	ledgerID, err := createLedger(client, data)
 	if err != nil {
@@ -540,6 +744,15 @@ func main() {
 	upload, err := uploadExternal(client, cfg.csvFile, cfg.source)
 	if err != nil {
 		log.Fatalf("failed to upload external statement: %v", err)
+	}
+
+	// Assert Blnk ingested exactly the number of data rows the CSV contains.
+	// Blnk tolerates and silently coerces malformed rows, so without this check
+	// a dropped or altered row would go unnoticed.
+	if upload.RecordCount != expectedRecords {
+		log.Fatalf("upload record_count mismatch: Blnk reported %d but %s contains %d data row(s); "+
+			"the upload may have silently dropped or altered rows",
+			upload.RecordCount, cfg.csvFile, expectedRecords)
 	}
 
 	// One-line internal-side summary for operators and CI logs.
