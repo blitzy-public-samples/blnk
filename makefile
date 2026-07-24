@@ -23,8 +23,15 @@ init:
 generate:
 	go generate ./...
 
+RECON_COVERAGE_THRESHOLD=80
 test:
-	go test -short  ./...
+	go test -short ./...
+	@echo "==> recon-agent tests (coverage gate ${RECON_COVERAGE_THRESHOLD}%)"
+	@cd recon-agent && go test -covermode=atomic -coverprofile=coverage.out ./... && \
+		total=$$(go tool cover -func=coverage.out | awk '/^total:/ {print $$3}' | tr -d '%'); \
+		echo "recon-agent total coverage: $$total%"; \
+		awk -v c="$$total" -v t="${RECON_COVERAGE_THRESHOLD}" 'BEGIN { exit (c+0 < t+0) ? 1 : 0 }' \
+			|| { echo "COVERAGE GATE FAILED: recon-agent $$total% is below ${RECON_COVERAGE_THRESHOLD}%"; exit 1; }
 
 # Mutation testing on the money-critical fast packages (model, filter).
 # Plants hundreds of one-line bugs and re-runs the tests against each one;
@@ -79,3 +86,23 @@ backup:
 
 backup_s3:
 	./${PROJECT} backup s3
+
+# ---- recon-agent feature targets ----
+
+# These targets are phony. In particular `seed` shares its name with the
+# seed/ directory, so without .PHONY `make seed` would be treated as
+# "up to date" and silently skip its recipe. `demo` and `test` are likewise
+# not file-producing targets.
+.PHONY: seed demo test
+
+# Load internal ledger/balances/transactions and upload the 6-break external CSV into Blnk via its HTTP API.
+seed:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	go run ./seed
+
+# Run the recon-agent pipeline end-to-end (ingest → derive breaks → classify → gate → remediate/escalate → audit)
+# and print the summary table (breaks in / auto-resolved / escalated / audit count). Must finish within 60s;
+# runs in one-shot mode (does NOT block on the HITL server).
+demo:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	cd recon-agent && go run ./cmd -once
