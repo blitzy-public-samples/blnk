@@ -52,6 +52,7 @@ const (
 	reasonEmptyRuleID              = "Blnk returned an empty matching-rule id; cannot probe"
 	reasonProbeFailed              = "Blnk dry-run probe failed"
 	reasonNotCleared               = "Blnk dry-run did not confirm clearance"
+	reasonOrphanedRuleResume       = "prior rule proposal recorded without a persisted created rule; possible orphaned Blnk rule from an interrupted attempt — routed to HITL to avoid creating a duplicate"
 )
 
 // operatorEquals is the only matching operator tight enough to auto-apply to a
@@ -117,6 +118,13 @@ type storePort interface {
 	SetBreakStatusTx(ctx context.Context, tx *sql.Tx, externalTxnID, status string) error
 	EnqueueHITLTx(ctx context.Context, tx *sql.Tx, externalTxnID, reason string) error
 	SetCreatedRuleTx(ctx context.Context, tx *sql.Tx, externalTxnID, ruleID string) error
+	// CountAuditByAction returns how many append-only audit events a break has
+	// recorded for the given action (SELECT only — no write). It drives the
+	// fail-closed resume guard against duplicate Blnk rule creation
+	// (SEAM-MIN-1): a rule_proposed event is durably recorded before the Blnk
+	// CreateMatchingRule POST, so a positive count with no persisted created
+	// rule id signals a prior attempt may have orphaned a rule in Blnk.
+	CountAuditByAction(ctx context.Context, externalTxnID, action string) (int, error)
 }
 
 // Remediator orchestrates classification, gating, deterministic remediation and
@@ -169,7 +177,15 @@ func New(cls classifierPort, blnkClient blnkPort, auditWriter auditPort, store s
 // classification and any created Blnk rule — without re-classifying or creating
 // a duplicate rule (M-3). Every state transition commits atomically with its
 // audit event, so no partial outcome is ever durable (C-1, C-2, M-2, M-4).
-func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction) error {
+//
+// uploadID identifies the reconciliation upload batch this break originated
+// from. It is stamped into the provenance of EVERY audit event the break emits
+// (finding m-2), so the append-only trail attributes each action to its source
+// upload and per-run summaries can be scoped correctly (finding M-6). Blnk's
+// own external-transaction JSON carries no upload id (it is a property of the
+// reconciliation run, not the transaction line), so it is threaded here as an
+// explicit parameter rather than read off txn.
+func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, uploadID string) error {
 	// M-5: serialize concurrent Handle calls for the SAME break. Released after
 	// the break reaches a terminal, committed state (or an error), so a racing
 	// caller observes that terminal state and no-ops below rather than
@@ -178,8 +194,9 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction) e
 	defer unlock()
 
 	prov := model.Provenance{
-		Model:  r.llmModel,
-		Source: txn.Source,
+		Model:    r.llmModel,
+		Source:   txn.Source,
+		UploadID: uploadID,
 	}
 
 	// M-6 idempotency / crash-resume: consult the persisted state first.
@@ -289,6 +306,27 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction) e
 	// → persist the created rule id atomically with its rule_created event.
 	ruleID := createdRuleID
 	if ruleID == "" {
+		// SEAM-MIN-1 (fail-closed resume guard against a DUPLICATE Blnk rule).
+		// The rule_proposed audit event below is recorded durably BEFORE the
+		// CreateMatchingRule POST, and the created rule id is persisted only
+		// AFTER the POST, atomically with the rule_created event. So if we reach
+		// this block for a break that has NO persisted created rule id yet
+		// already has a rule_proposed event, a prior attempt crashed in the
+		// window between the Blnk POST and that atomic commit — Blnk may hold an
+		// orphaned rule (deterministically named agent-proposed-<id>). Blnk
+		// exposes no list/get matching-rule route (only POST/PUT/DELETE), so the
+		// orphan cannot be reconciled over the native HTTP surface (Rule 5.1),
+		// and re-POSTing would create a DUPLICATE. Escalate to HITL for human
+		// reconciliation rather than auto-recreating the rule. A fresh break
+		// (no prior rule_proposed event) is unaffected and proceeds normally.
+		proposedCount, err := r.store.CountAuditByAction(ctx, id, audit.ActionRuleProposed)
+		if err != nil {
+			return fmt.Errorf("remediator: check prior rule proposal for break %q: %w", id, err)
+		}
+		if proposedCount > 0 {
+			return r.escalate(ctx, classification, prov, reasonOrphanedRuleResume)
+		}
+
 		// Rule 5.2: never POST a rule whose Field/Operator falls outside Blnk's
 		// accepted grammar. The classifier already grammar-gates proposals; this
 		// is defense-in-depth immediately before the POST.
@@ -441,15 +479,31 @@ func autoApplySafe(rule blnk.MatchingRule) error {
 }
 
 // validConfidence reports whether c is a finite probability in [0,1]. A
-// classifier that returns NaN, ±Inf, or an out-of-range value is treated as
-// malformed and fails closed to HITL (finding m-4).
+// confidence that is NaN, ±Inf, or out of range is treated as malformed and
+// fails the break closed to HITL (finding m-4).
+//
+// This is the CONSUMER half of recon-agent's two-layer confidence policy
+// (finding SEAM-INFO-1); the PRODUCER half is classifier.clampConfidence, which
+// normalizes every raw model confidence into [0,1] before it leaves the
+// classifier. The two layers form ONE coherent policy, not two competing
+// philosophies: a confidence produced by the classifier is already clamped, so
+// this check passes it through untouched (a legitimately clamped value — e.g. a
+// model over-confidence normalized to 1.0 — is never falsely escalated, and is
+// then decided by Blnk's deterministic arbiter per Rule 5.3). The check exists
+// as defense in depth for confidences that did NOT pass through the clamp:
+// values reconstructed from the store on resume, injected by tests, or emitted
+// by any future non-clamping producer. If such a value reaches the gate
+// malformed, failing closed here prevents a NaN comparison from silently
+// defeating the confidence gate (Rule 5.4).
 func validConfidence(c float64) bool {
 	return !math.IsNaN(c) && !math.IsInf(c, 0) && c >= 0 && c <= 1
 }
 
 // safeConfidence clamps a possibly-malformed confidence to a value the audit
 // validator accepts (finite, in [0,1]); malformed inputs collapse to 0 so an
-// escalated event can still be recorded for the break.
+// escalated event can still be recorded for the break. It mirrors the
+// producer-side classifier.clampConfidence for the escalation path (finding
+// SEAM-INFO-1), keeping the two layers of the confidence policy consistent.
 func safeConfidence(c float64) float64 {
 	if !validConfidence(c) {
 		return 0

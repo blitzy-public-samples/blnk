@@ -335,6 +335,29 @@ func TestClampConfidence(t *testing.T) {
 	}
 }
 
+// TestClampConfidence_ProducerInvariant is the SEAM-INFO-1 producer-invariant
+// test: whatever a model returns — a percentage, a huge value, +Inf, -Inf, or
+// NaN — the classifier NEVER emits an out-of-range or non-finite confidence
+// downstream. Locking "output is always a finite probability in [0,1]" for
+// adversarial inputs (not only the two boundary cases above) documents that the
+// remediator's validConfidence backstop can never be tripped by a value the
+// classifier itself produced; it exists only for confidences that bypass this
+// clamp (resume/store, tests, future producers).
+func TestClampConfidence_ProducerInvariant(t *testing.T) {
+	adversarial := []float64{
+		0, 1, 0.5, // in range
+		1.7, 95, 1e18, math.Inf(1), // over-range / percentage / +Inf
+		-0.3, -1e18, math.Inf(-1), // under-range / -Inf
+		math.NaN(), // not a number
+	}
+	for _, in := range adversarial {
+		got := clampConfidence(in)
+		if math.IsNaN(got) || math.IsInf(got, 0) || got < 0 || got > 1 {
+			t.Fatalf("clampConfidence(%v) = %v, which is not a finite probability in [0,1]", in, got)
+		}
+	}
+}
+
 func TestParseClassificationNoRuleWhenAbsent(t *testing.T) {
 	bc, err := parseClassification(`{"root_cause":"timing","confidence":0.7,"regulated":false,"rationale":"ok"}`, sampleTxn())
 	if err != nil {

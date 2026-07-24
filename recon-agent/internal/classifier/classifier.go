@@ -274,8 +274,37 @@ func normalizeRootCause(s string) model.RootCause {
 	return model.RootCauseUnknown
 }
 
-// clampConfidence constrains confidence to the closed interval [0, 1] and maps
-// NaN to 0.
+// clampConfidence constrains a raw model confidence to the closed interval
+// [0, 1], mapping NaN and any value < 0 (including -Inf) to 0 and any value > 1
+// (including +Inf) to 1. Its output is therefore ALWAYS a finite probability in
+// [0, 1] for every possible float64 input.
+//
+// This is the PRODUCER half of recon-agent's two-layer confidence policy
+// (finding SEAM-INFO-1); the CONSUMER half is remediator.validConfidence. The
+// two are complementary, not contradictory:
+//
+//   - Here, at the producer boundary, an out-of-range value is NORMALIZED
+//     rather than rejected. A model that answers with a percentage (e.g. 95),
+//     a slightly-over-one float (1.0000001), or an under-zero artifact is
+//     almost always a formatting quirk, not a signal that the whole
+//     classification is untrustworthy; clamping keeps that break in the normal
+//     pipeline. Because the AAP requires only that confidence be "in 0..1"
+//     (§0.1.1) — a property the clamp GUARANTEES — normalization is fully
+//     AAP-compliant.
+//   - Crucially, clamping an over-confident value up to 1.0 is SAFE because LLM
+//     confidence alone never resolves a break: auto-remediation additionally
+//     requires a non-regulated, auto-eligible root cause and a tight
+//     equality-only proposed rule, and a resolution is recorded ONLY after
+//     Blnk's deterministic dry-run reconciliation confirms clearance (Rule
+//     5.3). The confidence gate protects the LOWER bound (don't auto-act on
+//     weak classifications); the clamp never weakens that, since values below
+//     the threshold — including negatives mapped to 0 — still escalate to HITL.
+//
+// The remediator's validConfidence then fails a break closed to HITL if a
+// confidence that did NOT pass through this clamp (e.g. one reconstructed from
+// the store on resume, injected by a test, or produced by a future non-clamping
+// source) ever reaches the gate malformed — defense in depth over one coherent
+// policy rather than two competing philosophies.
 func clampConfidence(v float64) float64 {
 	if math.IsNaN(v) || v < 0 {
 		return 0

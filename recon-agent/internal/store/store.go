@@ -519,3 +519,26 @@ ORDER BY "timestamp" ASC`
 	}
 	return events, nil
 }
+
+// CountAuditByAction returns how many append-only audit events a break has
+// recorded for the given action. It is a read only (SELECT COUNT(*); Rule 5.5
+// forbids only UPDATE/DELETE against agent_audit, never a SELECT) and issues no
+// write, preserving append-only immutability.
+//
+// It backs the remediator's fail-closed resume guard (SEAM-MIN-1): a
+// rule_proposed event is durably recorded BEFORE the Blnk CreateMatchingRule
+// POST. On resume, a positive rule_proposed count for a break that still has no
+// persisted created-rule id means a prior attempt crashed in the window between
+// the POST and the atomic created-rule commit, so Blnk may hold an orphaned
+// matching rule. Blnk exposes no list/get matching-rule route (only
+// POST/PUT/DELETE), so the orphan cannot be reconciled over the native HTTP
+// surface (Rule 5.1); the remediator therefore escalates to HITL rather than
+// re-creating a duplicate rule.
+func (s *Store) CountAuditByAction(ctx context.Context, externalTxnID, action string) (int, error) {
+	const q = `SELECT count(*) FROM agent.agent_audit WHERE external_txn_id = $1 AND action = $2`
+	var n int
+	if err := s.db.QueryRowContext(ctx, q, externalTxnID, action).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}

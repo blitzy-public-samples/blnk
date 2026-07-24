@@ -691,6 +691,53 @@ func TestListAuditBadProvenanceJSON(t *testing.T) {
 	}
 }
 
+// CountAuditByAction returns the number of audit events for a break+action and
+// must do so with a READ-ONLY SELECT COUNT scoped by both parameters (Rule 5.5:
+// SELECT is permitted on agent_audit; UPDATE/DELETE are not). Backs the
+// remediator's SEAM-MIN-1 fail-closed resume guard.
+func TestCountAuditByAction(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"count"}
+	fdb.rows = [][]driver.Value{{int64(3)}}
+
+	n, err := s.CountAuditByAction(context.Background(), "ext_1", audit.ActionRuleProposed)
+	if err != nil {
+		t.Fatalf("CountAuditByAction: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("expected count 3, got %d", n)
+	}
+	if len(fdb.queries) != 1 {
+		t.Fatalf("expected exactly one query, got %d", len(fdb.queries))
+	}
+	q := fdb.queries[0].query
+	if !strings.Contains(q, "count(*)") || !strings.Contains(q, "agent.agent_audit") ||
+		!strings.Contains(q, "external_txn_id = $1") || !strings.Contains(q, "action = $2") {
+		t.Fatalf("unexpected count query: %q", q)
+	}
+	if up := strings.ToUpper(q); strings.Contains(up, "UPDATE") || strings.Contains(up, "DELETE") {
+		t.Fatalf("CountAuditByAction must be read-only, got: %q", q)
+	}
+	args := fdb.queries[0].args
+	if len(args) != 2 {
+		t.Fatalf("expected 2 args, got %d: %+v", len(args), args)
+	}
+	if got, _ := args[0].Value.(string); got != "ext_1" {
+		t.Fatalf("arg0 = %v, want external txn id ext_1", args[0].Value)
+	}
+	if got, _ := args[1].Value.(string); got != audit.ActionRuleProposed {
+		t.Fatalf("arg1 = %v, want action %q", args[1].Value, audit.ActionRuleProposed)
+	}
+}
+
+func TestCountAuditByActionQueryError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.queryErr = errors.New("count fail")
+	if _, err := s.CountAuditByAction(context.Background(), "ext_1", audit.ActionRuleProposed); err == nil {
+		t.Fatal("expected query error")
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Rule 5.1 + Rule 5.5 whole-surface assertions
 // -----------------------------------------------------------------------------
