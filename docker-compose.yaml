@@ -120,6 +120,29 @@ services:
       - server
       - worker
 
+  recon-agent:
+    build:
+      context: ./recon-agent
+    container_name: recon-agent
+    restart: on-failure
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      LLM_BASE_URL: ${LLM_BASE_URL}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL:-kimi-k3}
+      BLNK_BASE_URL: http://server:5001
+      BLNK_API_KEY: ${BLNK_API_KEY}
+      CONF_AUTO_THRESHOLD: ${CONF_AUTO_THRESHOLD:-0.85}
+      HITL_PORT: ${HITL_PORT:-8088}
+      AGENT_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable
+    ports:
+      - "${HITL_PORT:-8088}:${HITL_PORT:-8088}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      server:
+        condition: service_started
+
 volumes:
   pg_data:
   typesense_data:

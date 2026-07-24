@@ -1,0 +1,138 @@
+name: recon-agent CI
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "recon-agent/**"
+      - "seed/**"
+      - "eval/**"
+      - "makefile"
+      - "docker-compose.yaml"
+      - ".env.example"
+      - ".github/workflows/recon-agent.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "recon-agent/**"
+      - "seed/**"
+      - "eval/**"
+      - "makefile"
+      - "docker-compose.yaml"
+      - ".env.example"
+      - ".github/workflows/recon-agent.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.0
+
+      - name: Vet and build recon-agent (zero-warning gate)
+        run: |
+          cd recon-agent
+          go vet ./...
+          go build ./...
+
+      - name: Dependency audit (no proprietary LLM SDK)
+        run: |
+          ! grep -E 'anthropic|openai/openai-go|google.golang.org/genai' recon-agent/go.mod
+
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: blnk
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:latest
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      typesense:
+        image: typesense/typesense:29.0
+        env:
+          TYPESENSE_API_KEY: blnk-api-key
+          TYPESENSE_DATA_DIR: /tmp
+        ports:
+          - 8108:8108
+        options: >-
+          --health-cmd "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8108 && printf \"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n\" >&3 && grep -q \"200 OK\" <&3'"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 5
+
+    env:
+      # Blnk daemon + Blnk root tests (copied from go.yml)
+      BLNK_DATA_SOURCE_DNS: postgres://postgres@localhost:5432/blnk?sslmode=disable
+      BLNK_REDIS_DNS: localhost:6379
+      BLNK_TYPESENSE_DNS: http://localhost:8108
+      # recon-agent host-side env (Blnk auth disabled in CI ⇒ placeholder key is fine)
+      BLNK_BASE_URL: http://localhost:5001
+      BLNK_API_KEY: ci-test-key
+      AGENT_DATABASE_URL: postgres://postgres:password@localhost:5432/blnk?sslmode=disable
+      LLM_MODEL: kimi-k3
+      CONF_AUTO_THRESHOLD: "0.85"
+      HITL_PORT: "8088"
+      # LLM_BASE_URL intentionally unset: the classifier fail-closes to HITL,
+      # which is fine because the 80% coverage gate is driven by unit tests with mocked LLM/Blnk.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.0
+
+      - name: Tidy (root Blnk module)
+        run: go mod tidy
+
+      - name: Migrate Blnk database
+        run: go run ./cmd migrate up
+
+      - name: Start Blnk daemon
+        run: |
+          go run ./cmd start &
+          echo "BLNK_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for Blnk to accept connections
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -sS -o /dev/null http://localhost:5001; then
+              echo "Blnk is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Blnk did not become ready on :5001"; exit 1
+
+      - name: Seed (ledger + 6-break external CSV via Blnk HTTP)
+        run: make seed
+
+      - name: Test (make test — recon-agent coverage gate >= 80%)
+        run: make test
