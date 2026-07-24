@@ -734,11 +734,14 @@ func TestReconAgentPipeline(t *testing.T) {
 	rejectStatus := postDecision(ctx, t, hitlHTTP.URL, model.HITLDecision{ExternalTxnID: rejectID, Decision: audit.DecisionReject, Reviewer: integrationReviewer, Note: "integration reject"})
 	require.Equal(t, http.StatusOK, rejectStatus, "POST /decisions reject")
 
-	// re_drive re-tests clearance via a Blnk dry-run. The HITL handler probes with
-	// NO matching rule, and Blnk's start-instant REQUIRES a non-empty
-	// matching_rule_ids set, so against a live Blnk this returns 502 (probe
-	// failed) and writes no audit event; a successful probe returns 200 and audits
-	// a re_driven decision. Either way the re_drive branch is invoked (Gate 13).
+	// re_drive re-tests clearance via a Blnk dry-run. Per finding L2 the HITL
+	// handler now loads the break's FULL external transaction and probes with a
+	// grammar-conformant matching rule built from its fields (a non-empty
+	// matching_rule_ids set is required by Blnk's start-instant), so against a
+	// live Blnk the probe succeeds and this returns 200 — writing a re_driven
+	// audit event (whether or not Blnk reports the break cleared). Only an
+	// upstream Blnk failure (rule creation or probe) surfaces as 502 (finding
+	// L2), never 500. Either outcome invokes the re_drive branch (Gate 13).
 	reDriveStatus := postDecision(ctx, t, hitlHTTP.URL, model.HITLDecision{ExternalTxnID: reDriveID, Decision: audit.DecisionReDrive, Reviewer: integrationReviewer, Note: "integration re_drive"})
 	require.Contains(t, []int{http.StatusOK, http.StatusBadGateway}, reDriveStatus, "POST /decisions re_drive must be handled (200 or 502)")
 

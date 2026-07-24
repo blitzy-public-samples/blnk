@@ -4,20 +4,24 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
+	"html"
+	"log"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/blnkfinance/recon-agent/internal/audit"
+	"github.com/blnkfinance/recon-agent/internal/blnk"
 	"github.com/blnkfinance/recon-agent/internal/model"
 	"github.com/blnkfinance/recon-agent/internal/store"
 )
 
-// Break statuses relevant to HITL decisions. statusQueued is the ONLY decidable
-// state: accept/re_drive/reject transition a queued break, and every other
-// status (accepted / rejected / re_driven / auto-resolved) is terminal and
-// rejected as a conflict (finding C-04).
+// Break statuses set by human decisions. statusQueued is the ONLY state a
+// decision is eligible from (finding M-01); a decision transitions the break to
+// a terminal state (accepted/re_driven/rejected). re_driven is set ONLY when
+// Blnk confirms clearance; a non-clearing re_drive leaves the break queued
+// (finding m-04).
 const (
 	statusQueued   = "queued"
 	statusAccepted = "accepted"
@@ -25,32 +29,58 @@ const (
 	statusRejected = "rejected"
 )
 
-// errNoReDriveContext is returned when a queued break lacks the durable context
-// a contract-valid Blnk dry-run requires (finding C-03): the full external
-// transaction and at least one applicable matching-rule id. Rather than submit
-// an id-only, rule-less probe that Blnk's start-instant rejects, re_drive fails
-// closed and the handler maps this to 422 Unprocessable Entity.
-var errNoReDriveContext = errors.New("hitl: break has no durable re-drive context (missing transaction or applicable rule)")
+// Grammar-conformant field/operator constants for the rule re_drive builds to
+// probe a queued break (Rule 5.2). They mirror the domain Blnk accepts.
+const (
+	fieldAmount    = "amount"
+	fieldCurrency  = "currency"
+	operatorEquals = "equals"
+)
 
-// errProbeFailed wraps a Blnk dry-run (ProbeBreak) failure during re_drive. Per
-// the fail-closed rule (Rule 5.7) a probe error causes NO state change and NO
-// audit event; the handler maps it to 502 Bad Gateway so the operator can retry
-// once Blnk is reachable, and the break stays queued and re-drivable.
-var errProbeFailed = errors.New("hitl: blnk dry-run probe failed")
+// upstreamError marks a failure that originated in the Blnk dependency (an
+// upstream service), so handleDecision maps it to 502 Bad Gateway instead of
+// 500 (finding L2) — distinguishing a dependency fault from an internal agent
+// fault. It unwraps to the underlying error for logging/inspection.
+type upstreamError struct{ err error }
+
+func (e *upstreamError) Error() string { return e.err.Error() }
+func (e *upstreamError) Unwrap() error { return e.err }
+
+// asUpstream wraps err as an upstreamError (nil-safe).
+func asUpstream(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &upstreamError{err: err}
+}
 
 // handleDecision binds a model.HITLDecision (JSON body or HTML form) and
 // dispatches it to the accept/re_drive/reject handlers. Each successful decision
-// writes exactly one AuditEvent via the append-only audit writer (Gate 13,
-// Rule 5.5). Unknown decisions and blank ids are rejected before any state
-// change or audit write.
+// writes exactly one AuditEvent via the append-only audit writer, committed
+// atomically with the state change it records (Gate 13; Rule 5.5; findings
+// M-01/M-02). Invalid input (bad payload, blank id, unknown decision) is
+// rejected with a sanitized 400 before any state change or audit write; internal
+// and upstream errors are logged server-side and returned as stable, sanitized
+// messages (M-03) with the right status — 404 unknown break, 409 already-decided
+// break, 502 Blnk (upstream) fault, 500 otherwise.
 func (s *Server) handleDecision(c *gin.Context) {
 	d, err := bindDecision(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		// M-03: never leak the framework/JSON parse error (it names Go struct
+		// internals); log it and return a stable message.
+		log.Printf("hitl: decision bind error: %v", err)
+		s.respondDecisionError(c, http.StatusBadRequest, "invalid request payload")
 		return
 	}
 	if d.ExternalTxnID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "external_txn_id is required"})
+		s.respondDecisionError(c, http.StatusBadRequest, "external_txn_id is required")
+		return
+	}
+	if !audit.IsValidDecision(d.Decision) {
+		// The decision verb is client-supplied; do not echo it back (avoids
+		// reflecting arbitrary input onto the page/response). A generic message
+		// suffices (M-03).
+		s.respondDecisionError(c, http.StatusBadRequest, "unknown decision")
 		return
 	}
 	if d.Reviewer == "" {
@@ -67,46 +97,41 @@ func (s *Server) handleDecision(c *gin.Context) {
 	case audit.DecisionReject:
 		handleErr = s.reject(ctx, d)
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown decision: " + d.Decision})
+		// Unreachable: IsValidDecision gated the verb above. Defensive only.
+		s.respondDecisionError(c, http.StatusBadRequest, "unknown decision")
 		return
 	}
 
 	if handleErr != nil {
-		s.respondDecisionError(c, handleErr)
+		status, msg := publicError(handleErr)
+		// M-03: log the concrete error server-side; return only the sanitized
+		// message to the client.
+		log.Printf("hitl: decision %q for break %q failed: %v", d.Decision, d.ExternalTxnID, handleErr)
+		s.respondDecisionError(c, status, msg)
 		return
 	}
 
 	s.respondDecision(c, d)
 }
 
-// respondDecisionError maps a decision handler error to the HTTP status that
-// tells the operator precisely what happened, and — critically — guarantees that
-// the failure path never reports success for an unmutated break (finding C-04):
-//   - ErrNotFound       -> 404: no such break;
-//   - ErrConflict       -> 409: the break is no longer queued (already decided,
-//     re-driven, or auto-resolved) or the decision was replayed — a terminal or
-//     duplicate transition is refused, not applied;
-//   - errNoReDriveContext -> 422: a queued break cannot be re-driven because its
-//     durable transaction / applicable rule set is missing (fail-closed, C-03);
-//   - errProbeFailed    -> 502: the Blnk dry-run was unreachable/failed, so the
-//     break stayed queued (fail-closed, Rule 5.7);
-//   - anything else      -> 500.
-//
-// Because every mutating handler runs in a single WithTx, a non-nil error here
-// means the transaction rolled back and NO partial state (status, queue drain,
-// or audit event) was committed.
-func (s *Server) respondDecisionError(c *gin.Context, err error) {
+// publicError maps an internal error to a stable, client-safe (status, message)
+// pair (M-03). It never exposes the underlying pq:/framework/upstream/Go error
+// text — the caller logs that separately. A missing break is 404 (finding
+// m-01), a non-queued (already-decided) break is 409 (finding M-01), and a Blnk
+// (upstream) fault is 502 so the operator can distinguish a dependency fault
+// from an agent bug and safely retry (finding L2). Every other error collapses
+// to a generic 500 so no internal detail leaks by default.
+func publicError(err error) (int, string) {
+	var upstream *upstreamError
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, store.ErrConflict):
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-	case errors.Is(err, errNoReDriveContext):
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
-	case errors.Is(err, errProbeFailed):
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return http.StatusNotFound, "break not found"
+	case errors.Is(err, store.ErrNotQueued):
+		return http.StatusConflict, "break is not awaiting review"
+	case errors.As(err, &upstream):
+		return http.StatusBadGateway, "reconciliation service temporarily unavailable"
 	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return http.StatusInternalServerError, "internal error processing decision"
 	}
 }
 
@@ -141,72 +166,95 @@ func (s *Server) respondDecision(c *gin.Context, d model.HITLDecision) {
 	c.Redirect(http.StatusSeeOther, "/")
 }
 
-// accept settles a queued break as resolved-by-human. Its status change, its
-// removal from the HITL queue, and its `accepted` audit event all commit inside
-// a single transaction (finding C-04): either the break moves queued->accepted,
-// is drained, and the audit row lands together, or nothing does. The queued-only
-// compare-and-set guarantees a terminal break (already decided/re-driven/
-// auto-resolved) is refused with ErrConflict rather than overwritten, which also
-// makes a replayed accept idempotent — the second attempt matches no queued row
-// and returns 409.
+// respondDecisionError returns a sanitized error to the client: JSON for API
+// clients and a minimal, friendly HTML panel for browser/form submissions
+// (M-03). It never includes the underlying internal error text.
+func (s *Server) respondDecisionError(c *gin.Context, status int, msg string) {
+	if c.ContentType() == "application/json" {
+		c.JSON(status, gin.H{"error": msg})
+		return
+	}
+	c.Data(status, "text/html; charset=utf-8", errorPageHTML(msg))
+}
+
+// errorPageHTML renders a minimal, friendly HTML error panel (embedded CSS only,
+// AAP 0.5.3) carrying a sanitized message and a link back to the status page.
+// The message is HTML-escaped defensively even though callers pass only fixed,
+// internal constants — never raw error text (M-03). The status page reuses this
+// via renderStatusError so page-load and form-submit errors share one surface.
+func errorPageHTML(msg string) []byte {
+	return []byte(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>recon-agent &mdash; error</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; color: #1a1a1a; }
+  .panel { border: 1px solid #f0c0c0; background: #fdf2f2; color: #b00020; padding: 1rem 1.2rem; border-radius: 6px; max-width: 40rem; }
+  a { color: #0b5cad; }
+</style>
+</head>
+<body>
+  <div class="panel">` + html.EscapeString(msg) + `</div>
+  <p><a href="/">&larr; Back to review</a></p>
+</body>
+</html>
+`)
+}
+
+// accept marks a queued break resolved-by-human, drains it from the HITL queue,
+// and records an `accepted` audit event — all atomically (findings M-01/M-02).
 func (s *Server) accept(ctx context.Context, d model.HITLDecision) error {
-	return s.settle(ctx, d, statusAccepted, model.Provenance{Model: s.llmModel})
+	return s.decide(ctx, d, statusAccepted)
 }
 
-// reject settles a queued break as closed-by-human. Like accept, its status
-// change, queue drain, and `rejected` audit event commit atomically under a
-// queued-only CAS, so a terminal or replayed reject is refused (409), never
-// applied (finding C-04).
-func (s *Server) reject(ctx context.Context, d model.HITLDecision) error {
-	return s.settle(ctx, d, statusRejected, model.Provenance{Model: s.llmModel})
-}
-
-// settle is the shared accept/reject core: a single transaction that (1)
-// compare-and-sets the break from queued to the terminal status, (2) drains it
-// from the HITL queue, and (3) appends the decision's audit event — all or
-// nothing (finding C-04). SetBreakStatusIfQueuedTx returns ErrNotFound when no
-// such break exists and ErrConflict when it is no longer queued, so terminal and
-// replayed decisions never mutate settled state; any error rolls the whole
-// transaction back, leaving no partial outcome.
-func (s *Server) settle(ctx context.Context, d model.HITLDecision, terminalStatus string, prov model.Provenance) error {
+// decide is the shared accept/reject path: in ONE transaction it (1) transitions
+// the break out of the queued state via the queued-only guard
+// (SetBreakStatusFromQueuedTx — so a terminal/already-decided break yields
+// ErrNotQueued -> 409 and a missing break yields ErrNotFound -> 404, never a
+// silent overwrite: findings M-01/m-01), (2) drains the HITL queue, and (3)
+// records the decision audit event via the tx-bound append-only writer (Rule
+// 5.5). Because all three commit or roll back together, a decision can never
+// report success while leaving status, queue, and audit inconsistent (M-02).
+func (s *Server) decide(ctx context.Context, d model.HITLDecision, status string) error {
 	return s.st.WithTx(ctx, func(tx *sql.Tx) error {
-		if err := s.st.SetBreakStatusIfQueuedTx(ctx, tx, d.ExternalTxnID, terminalStatus); err != nil {
+		if err := s.st.SetBreakStatusFromQueuedTx(ctx, tx, d.ExternalTxnID, status); err != nil {
 			return err
 		}
 		if err := s.st.DequeueHITLTx(ctx, tx, d.ExternalTxnID); err != nil {
 			return err
 		}
-		return s.aud.RecordTx(ctx, tx, audit.Decision(d, prov))
+		return s.aud.RecordTx(ctx, tx, audit.Decision(d, model.Provenance{Model: s.llmModel}))
 	})
 }
 
-// reDrive re-tests a queued break against Blnk (the deterministic arbiter,
-// Rule 5.3) and settles it only if Blnk confirms clearance. It first loads the
-// break's durable re-drive context (finding C-03) — the FULL external
-// transaction and the applicable matching-rule id set — so the dry-run probe is
-// a contract-valid start-instant payload rather than an id-only, rule-less call.
+// reDrive re-tests clearance by re-invoking a Blnk dry-run probe (the
+// deterministic arbiter, Rule 5.3), updates status, drains the queue only when
+// Blnk confirms clearance, and records a `re_driven` audit event carrying the
+// recon_id.
 //
-// Pre-transaction guards (no state mutated on any of these paths):
-//   - break missing            -> ErrNotFound (404);
-//   - break not queued          -> ErrConflict (409): a terminal break is not
-//     re-drivable, and a replayed re_drive against a settled break is refused;
-//   - no transaction / no rule  -> errNoReDriveContext (422): fail closed rather
-//     than probe Blnk with an invalid rule-less request (C-03);
-//   - probe error/timeout       -> errProbeFailed (502): fail closed (Rule 5.7),
-//     the break stays queued and re-drivable.
+// Finding L2: the probe must carry the break's FULL external transaction (not
+// just its id) and a NON-EMPTY matching_rule_ids set — Blnk's start-instant
+// rejects an empty rule set with 400. We therefore load the persisted
+// transaction, reuse any matching rule a prior auto-attempt created for it, and
+// otherwise build a grammar-conformant {amount,equals}(+{currency,equals})
+// rule (Rule 5.2) just to probe. A rule created here is a throwaway probe
+// artifact and is always deleted afterwards so no orphan rule accumulates in
+// Blnk (finding F5 parity) — the clearance verdict recorded on the audit event
+// (recon_id) is the durable proof, not the rule.
 //
-// Then, inside one transaction (finding C-04):
-//   - cleared:     queued->re_driven via the queued-only CAS + queue drain, so a
-//     racing decision cannot be clobbered;
-//   - not cleared: the break stays queued (still re-drivable); RequireQueuedTx
-//     re-confirms it is queued under a row lock before the audit event is
-//     appended, so no re-drive is recorded against a break another decision
-//     settled between the probe and this commit.
-//
-// In both branches exactly one `re_driven` audit event (carrying the dry-run's
-// recon_id, Rule 5.3) commits atomically with the status/queue effect.
+// Failures originating in Blnk (rule creation or probe) are wrapped as
+// upstreamError so handleDecision returns 502, never 500, and the break is left
+// in the queue unchanged (fail-closed, Rule 5.7). Only a successful probe
+// updates status / drains the queue / writes the audit event.
 func (s *Server) reDrive(ctx context.Context, d model.HITLDecision) error {
-	status, txn, ruleIDs, found, err := s.st.LoadBreakContext(ctx, d.ExternalTxnID)
+	id := d.ExternalTxnID
+
+	// (1) Existence + eligibility BEFORE any Blnk call: a missing break is 404
+	//     and a non-queued (already-decided) break is 409, both decided before
+	//     any external work (findings m-01/M-01).
+	_, status, _, found, err := s.st.LoadBreak(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -214,29 +262,99 @@ func (s *Server) reDrive(ctx context.Context, d model.HITLDecision) error {
 		return store.ErrNotFound
 	}
 	if status != statusQueued {
-		return store.ErrConflict
-	}
-	if txn == nil || len(ruleIDs) == 0 {
-		return errNoReDriveContext
+		return store.ErrNotQueued
 	}
 
-	cleared, reconID, err := s.bc.ProbeBreak(ctx, *txn, ruleIDs)
+	// (2) Load the FULL external transaction (and any rule a prior auto-attempt
+	//     created) so the clearance probe carries a real transaction and a
+	//     non-empty rule set — Blnk's start-instant rejects an empty rule set
+	//     (findings L2/C-01).
+	txn, createdRuleID, found, err := s.st.LoadBreakTxn(ctx, id)
 	if err != nil {
-		return fmt.Errorf("%w: %v", errProbeFailed, err)
+		return err
+	}
+	if !found {
+		// Raced with a concurrent delete between the two reads.
+		return store.ErrNotFound
 	}
 
-	prov := model.Provenance{Model: s.llmModel, ReconID: reconID}
+	ruleID := createdRuleID
+	createdHere := false
+	if ruleID == "" {
+		// No rule persisted for this break — build a throwaway rule from the
+		// transaction's own fields so Blnk has a non-empty rule set to probe.
+		created, cerr := s.bc.CreateMatchingRule(ctx, buildReDriveRule(txn))
+		if cerr != nil {
+			return asUpstream(cerr)
+		}
+		if created.RuleID == "" {
+			return asUpstream(errors.New("blnk returned an empty rule id for re_drive probe"))
+		}
+		ruleID = created.RuleID
+		createdHere = true
+	}
+	// A rule created purely to probe is always removed afterwards (F5 parity).
+	if createdHere {
+		defer func() { _ = s.bc.DeleteMatchingRule(ctx, ruleID) }()
+	}
+
+	// (3) Deterministic arbiter: probe Blnk with the full txn + rule id (Rule
+	//     5.3). Any error fails closed, leaving the break queued (Rule 5.7/L2).
+	cleared, reconID, perr := s.bc.ProbeBreak(ctx, txn, []string{ruleID})
+	if perr != nil {
+		return asUpstream(perr)
+	}
+
+	// (4a) Not cleared: keep the break queued (no dequeue, no terminal status),
+	//      record a re_driven decision WITHOUT a recon_id so a recon_id never
+	//      implies a false clearance (finding m-04; only `resolved` proves
+	//      clearance, and HITL never writes `resolved` — Rule 5.3).
+	if !cleared {
+		return s.aud.Record(ctx, audit.Decision(d, model.Provenance{Model: s.llmModel}))
+	}
+
+	// (4b) Cleared: mark re_driven, drain the queue, and audit WITH the
+	//      confirming recon_id — atomically and queued-only (findings M-01/M-02,
+	//      m-04).
 	return s.st.WithTx(ctx, func(tx *sql.Tx) error {
-		if cleared {
-			if err := s.st.SetBreakStatusIfQueuedTx(ctx, tx, d.ExternalTxnID, statusReDriven); err != nil {
-				return err
-			}
-			if err := s.st.DequeueHITLTx(ctx, tx, d.ExternalTxnID); err != nil {
-				return err
-			}
-		} else if err := s.st.RequireQueuedTx(ctx, tx, d.ExternalTxnID); err != nil {
+		if err := s.st.SetBreakStatusFromQueuedTx(ctx, tx, id, statusReDriven); err != nil {
 			return err
 		}
-		return s.aud.RecordTx(ctx, tx, audit.Decision(d, prov))
+		if err := s.st.DequeueHITLTx(ctx, tx, id); err != nil {
+			return err
+		}
+		return s.aud.RecordTx(ctx, tx, audit.Decision(d, model.Provenance{Model: s.llmModel, ReconID: reconID}))
 	})
+}
+
+// buildReDriveRule constructs a grammar-conformant (Rule 5.2) matching rule from
+// a break's own transaction so re_drive can probe with a non-empty rule set. It
+// mirrors the remediator's rule narrowing (amount, plus currency when present)
+// without importing remediator (Rule 5.1). Blnk matches external-vs-internal
+// field values and ignores criteria.Value, but Value is still populated for
+// intent/audit fidelity.
+func buildReDriveRule(txn blnk.ExternalTransaction) blnk.MatchingRule {
+	criteria := []blnk.MatchingCriteria{{
+		Field:    fieldAmount,
+		Operator: operatorEquals,
+		Value:    strconv.FormatFloat(txn.Amount, 'f', -1, 64),
+	}}
+	if txn.Currency != "" {
+		criteria = append(criteria, blnk.MatchingCriteria{
+			Field:    fieldCurrency,
+			Operator: operatorEquals,
+			Value:    txn.Currency,
+		})
+	}
+	return blnk.MatchingRule{
+		Name:        "hitl-redrive-" + txn.ID,
+		Description: "ephemeral re_drive probe rule (auto-deleted)",
+		Criteria:    criteria,
+	}
+}
+
+// reject marks a queued break closed, drains it from the HITL queue, and records
+// a `rejected` audit event — all atomically (findings M-01/M-02).
+func (s *Server) reject(ctx context.Context, d model.HITLDecision) error {
+	return s.decide(ctx, d, statusRejected)
 }

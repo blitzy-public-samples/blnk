@@ -3,6 +3,7 @@ package hitl
 import (
 	"bytes"
 	"html/template"
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -52,7 +53,8 @@ func (s *Server) statusPage(c *gin.Context) {
 
 	breaks, err := s.st.ListBreaks(ctx)
 	if err != nil {
-		c.String(http.StatusInternalServerError, "failed to load breaks: %v", err)
+		log.Printf("hitl: status page — list breaks failed: %v", err)
+		s.renderStatusError(c)
 		return
 	}
 	for _, b := range breaks {
@@ -72,7 +74,8 @@ func (s *Server) statusPage(c *gin.Context) {
 
 	audits, err := s.st.ListAudit(ctx)
 	if err != nil {
-		c.String(http.StatusInternalServerError, "failed to load audit trail: %v", err)
+		log.Printf("hitl: status page — list audit failed: %v", err)
+		s.renderStatusError(c)
 		return
 	}
 	for _, a := range audits {
@@ -89,10 +92,23 @@ func (s *Server) statusPage(c *gin.Context) {
 
 	var buf bytes.Buffer
 	if err := s.tmpl.Execute(&buf, data); err != nil {
-		c.String(http.StatusInternalServerError, "failed to render status page: %v", err)
+		log.Printf("hitl: status page — render failed: %v", err)
+		s.renderStatusError(c)
 		return
 	}
 	c.Data(http.StatusOK, "text/html; charset=utf-8", buf.Bytes())
+}
+
+// renderStatusError renders the friendly, sanitized HTML error panel for the
+// status page when a store query or template render fails (finding M-03). The
+// concrete error is logged server-side by the caller; the operator sees only a
+// stable, non-disclosing message — never a raw pq:/driver/Go error string that
+// would reveal the DB engine, schema, or table names on this unauthenticated
+// surface. It reuses errorPageHTML so the status-page and form-submit error
+// panels are visually identical.
+func (s *Server) renderStatusError(c *gin.Context) {
+	c.Data(http.StatusInternalServerError, "text/html; charset=utf-8",
+		errorPageHTML("unable to load the review page"))
 }
 
 // statusPageHTML is the html/template source for the status page. Styling is
@@ -141,7 +157,7 @@ const statusPageHTML = `<!DOCTYPE html>
       <tr>
         <td>{{.ExternalTxnID}}</td>
         <td>{{.RootCause}}</td>
-        <td>{{printf "%.2f" .Confidence}}</td>
+        <td>{{printf "%.3f" .Confidence}}</td>
         <td>{{if .Regulated}}<span class="regulated">yes</span>{{else}}no{{end}}</td>
         <td class="status-{{.Status}}">{{.Status}}</td>
         <td>{{if .HasRule}}{{.RuleName}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
@@ -181,7 +197,7 @@ const statusPageHTML = `<!DOCTYPE html>
         <td>{{.ExternalTxnID}}</td>
         <td>{{.Actor}}</td>
         <td>{{.Action}}</td>
-        <td>{{printf "%.2f" .Confidence}}</td>
+        <td>{{printf "%.3f" .Confidence}}</td>
         <td>{{if .ReconID}}{{.ReconID}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
         <td>{{.Rationale}}</td>
       </tr>

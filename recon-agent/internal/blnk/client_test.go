@@ -331,6 +331,14 @@ func probeServer(t *testing.T, status string, unmatched int, startedPolls int32)
 			if len(req.ExternalTransactions) != 1 {
 				t.Fatalf("ProbeBreak must submit exactly one txn, got %d", len(req.ExternalTransactions))
 			}
+			// F3/F8: ProbeBreak MUST submit a FRESH ephemeral id (never the
+			// caller's real external id) so the same break can be probed
+			// repeatedly — during detection then auto-remediation confirm, and
+			// across reruns against a shared Blnk database — without colliding on
+			// Blnk's external_transactions_pkey (which would return HTTP 500).
+			if got := req.ExternalTransactions[0].ID; !strings.HasPrefix(got, "probe-") {
+				t.Fatalf("ProbeBreak must submit an ephemeral probe- id, got %q", got)
+			}
 			if req.Strategy != probeStrategy {
 				t.Fatalf("strategy: got %q want %q", req.Strategy, probeStrategy)
 			}
@@ -457,6 +465,106 @@ func TestProbeBreakInstantError(t *testing.T) {
 	}
 }
 
+// TestProbeBreakUsesEphemeralID pins the F3/F8 double-persist elimination: the
+// probe submitted to Blnk must carry a FRESH ephemeral id distinct from the
+// caller's real external id, while preserving every matchable field so Blnk's
+// field-to-field verdict is unchanged. It also asserts the caller's own txn
+// value is left unmodified (the ephemeral id is applied to a copy).
+func TestProbeBreakUsesEphemeralID(t *testing.T) {
+	txnDate := time.Date(2024, 5, 1, 12, 0, 0, 0, time.UTC)
+	input := ExternalTransaction{
+		ID:          "EXT-001",
+		Amount:      1500,
+		Reference:   "INV-1001",
+		Currency:    "USD",
+		Description: "wire settlement",
+		Date:        txnDate,
+		Source:      "bank_statement",
+	}
+
+	var submitted ExternalTransaction
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requireBlnkKey(t, r)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == routeStartInstant:
+			var req InstantReconciliationRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode instant: %v", err)
+			}
+			if len(req.ExternalTransactions) != 1 {
+				t.Fatalf("expected exactly one txn, got %d", len(req.ExternalTransactions))
+			}
+			submitted = req.ExternalTransactions[0]
+			_ = json.NewEncoder(w).Encode(StartReconciliationResponse{ReconciliationID: "recon_probe"})
+		case r.Method == http.MethodGet && r.URL.Path == routeReconByID+"recon_probe":
+			_ = json.NewEncoder(w).Encode(Reconciliation{
+				ReconciliationID:      "recon_probe",
+				Status:                statusCompleted,
+				UnmatchedTransactions: 0,
+				IsDryRun:              true,
+			})
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	if _, _, err := c.ProbeBreak(context.Background(), input, []string{"rule_1"}); err != nil {
+		t.Fatalf("ProbeBreak: %v", err)
+	}
+
+	// The submitted id must be a fresh ephemeral id, never the caller's id.
+	if submitted.ID == input.ID {
+		t.Fatalf("probe reused the caller's external id %q; expected a fresh ephemeral id", input.ID)
+	}
+	if !strings.HasPrefix(submitted.ID, "probe-") {
+		t.Fatalf("expected ephemeral probe- id, got %q", submitted.ID)
+	}
+	// Every matchable field must be preserved so the verdict is invariant.
+	if submitted.Amount != input.Amount ||
+		submitted.Reference != input.Reference ||
+		submitted.Currency != input.Currency ||
+		submitted.Description != input.Description ||
+		!submitted.Date.Equal(input.Date) ||
+		submitted.Source != input.Source {
+		t.Fatalf("matchable fields not preserved: got %+v want (matchable of) %+v", submitted, input)
+	}
+	// The caller's original txn value must be untouched.
+	if input.ID != "EXT-001" {
+		t.Fatalf("caller txn id was mutated: %q", input.ID)
+	}
+}
+
+func TestDeleteMatchingRule(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requireBlnkKey(t, r)
+		if r.Method != http.MethodDelete || r.URL.Path != routeMatchingRules+"/rule_1" {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"message": "deleted"})
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	if err := c.DeleteMatchingRule(context.Background(), "rule_1"); err != nil {
+		t.Fatalf("DeleteMatchingRule: %v", err)
+	}
+}
+
+func TestDeleteMatchingRuleErrorStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	if err := c.DeleteMatchingRule(context.Background(), "rule_1"); err == nil {
+		t.Fatal("expected error on 500")
+	}
+}
+
 func TestJSONMethodsRequestBuildError(t *testing.T) {
 	c := NewClient("http://%zz", testKey) // invalid URL escaping trips request build
 	ctx := context.Background()
@@ -471,6 +579,9 @@ func TestJSONMethodsRequestBuildError(t *testing.T) {
 	}
 	if _, err := c.UpdateMatchingRule(ctx, "rule_1", MatchingRule{}); err == nil {
 		t.Fatal("UpdateMatchingRule: expected request-build error")
+	}
+	if err := c.DeleteMatchingRule(ctx, "rule_1"); err == nil {
+		t.Fatal("DeleteMatchingRule: expected request-build error")
 	}
 }
 

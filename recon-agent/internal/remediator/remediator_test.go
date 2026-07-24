@@ -121,16 +121,39 @@ type fakeBlnk struct {
 	createCalls  int
 	probeCalls   int
 	probeRuleIDs [][]string
+	// createdRules records every rule passed to CreateMatchingRule (finding F7),
+	// so tests can assert the ACTUAL narrowed rule that was POSTed (Value
+	// populated, {currency,equals} appended) rather than the classifier's raw
+	// proposal.
+	createdRules []blnk.MatchingRule
+	// deleteCalls / deletedRuleIDs record DeleteMatchingRule invocations (finding
+	// F5), so tests can assert a rule created for a non-clearing attempt is
+	// rolled back — and, crucially, that a rule for a CLEARED attempt is NOT.
+	deleteCalls    int
+	deletedRuleIDs []string
+	deleteErr      error
 }
 
-func (f *fakeBlnk) CreateMatchingRule(_ context.Context, _ blnk.MatchingRule) (blnk.MatchingRule, error) {
+func (f *fakeBlnk) CreateMatchingRule(_ context.Context, rule blnk.MatchingRule) (blnk.MatchingRule, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createCalls++
+	f.createdRules = append(f.createdRules, rule)
 	if f.createErr != nil {
 		return blnk.MatchingRule{}, f.createErr
 	}
 	return f.created, nil
+}
+
+// DeleteMatchingRule records the rollback of a created rule (finding F5). It
+// returns f.deleteErr so tests can assert the remediator still escalates
+// fail-closed (Rule 5.7) even when catalog cleanup fails.
+func (f *fakeBlnk) DeleteMatchingRule(_ context.Context, ruleID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteCalls++
+	f.deletedRuleIDs = append(f.deletedRuleIDs, ruleID)
+	return f.deleteErr
 }
 
 func (f *fakeBlnk) ProbeBreak(_ context.Context, _ blnk.ExternalTransaction, ids []string) (bool, string, error) {
@@ -165,6 +188,29 @@ func (f *fakeBlnk) lastProbeRuleIDs() []string {
 	return f.probeRuleIDs[len(f.probeRuleIDs)-1]
 }
 
+func (f *fakeBlnk) deleteCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.deleteCalls
+}
+
+func (f *fakeBlnk) deletedRules() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.deletedRuleIDs...)
+}
+
+// lastCreatedRule returns the most recent rule passed to CreateMatchingRule
+// (finding F7), so tests can assert the narrowed rule that was actually POSTed.
+func (f *fakeBlnk) lastCreatedRule() (blnk.MatchingRule, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.createdRules) == 0 {
+		return blnk.MatchingRule{}, false
+	}
+	return f.createdRules[len(f.createdRules)-1], true
+}
+
 // -----------------------------------------------------------------------------
 // fakeBackend: implements BOTH storePort and auditPort, modelling the shared
 // transaction so atomicity can be asserted.
@@ -174,10 +220,10 @@ type fakeBreak struct {
 	classification model.BreakClassification
 	status         string
 	createdRuleID  string
-	// txn mirrors the store's JSONB txn column: the full external transaction
-	// persisted at escalate time so a later HITL re_drive can reconstruct a
-	// complete, contract-valid probe payload (finding C-03).
-	txn *blnk.ExternalTransaction
+	// txn captures the matchable transaction fields persisted alongside the
+	// verdict (finding L2), so tests can assert the break remembers the
+	// transaction it was managing for a later re_drive.
+	txn blnk.ExternalTransaction
 }
 
 type fakeBackend struct {
@@ -204,7 +250,7 @@ type fakeBackend struct {
 	setBreakStatusTxHook func(string, string) error
 	enqueueHITLTxHook    func(string, string) error
 	setCreatedRuleTxHook func(string, string) error
-	saveBreakTxnTxHook   func(string, *blnk.ExternalTransaction) error
+	setCreatedRuleHook   func(string, string) error
 }
 
 func newBackend(t *testing.T) *fakeBackend {
@@ -293,7 +339,7 @@ func (f *fakeBackend) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) err
 	return nil
 }
 
-func (f *fakeBackend) UpsertBreakTx(_ context.Context, tx *sql.Tx, c model.BreakClassification, status string) error {
+func (f *fakeBackend) UpsertBreakTx(_ context.Context, tx *sql.Tx, c model.BreakClassification, txn blnk.ExternalTransaction, status string) error {
 	if f.upsertBreakTxHook != nil {
 		if err := f.upsertBreakTxHook(c, status); err != nil {
 			return err
@@ -309,6 +355,9 @@ func (f *fakeBackend) UpsertBreakTx(_ context.Context, tx *sql.Tx, c model.Break
 		// ON CONFLICT DO UPDATE that never overwrites created_rule_id.
 		b.classification = c
 		b.status = status
+		// Persist the matchable transaction fields (finding L2) so a queued
+		// break can be re-driven without reading any blnk.* table.
+		b.txn = txn
 	})
 	return nil
 }
@@ -351,22 +400,20 @@ func (f *fakeBackend) SetCreatedRuleTx(_ context.Context, tx *sql.Tx, id, ruleID
 	return nil
 }
 
-// SaveBreakTxnTx mirrors the store's UPDATE ... SET txn = $2, buffering the full
-// external transaction onto the break so it survives the same commit as the
-// UpsertBreakTx that created the row. Faithfully modeling this write is what
-// lets a later re_drive load a complete probe payload (finding C-03); escalate
-// invokes it inside its WithTx immediately after UpsertBreakTx.
-func (f *fakeBackend) SaveBreakTxnTx(_ context.Context, tx *sql.Tx, id string, txn *blnk.ExternalTransaction) error {
-	if f.saveBreakTxnTxHook != nil {
-		if err := f.saveBreakTxnTxHook(id, txn); err != nil {
+// SetCreatedRule mirrors the store's AUTOCOMMIT setter: it applies immediately
+// (no transaction buffer). The remediator uses it to CLEAR the persisted
+// created-rule id while rolling back a non-clearing rule (finding F5).
+func (f *fakeBackend) SetCreatedRule(_ context.Context, id, ruleID string) error {
+	if f.setCreatedRuleHook != nil {
+		if err := f.setCreatedRuleHook(id, ruleID); err != nil {
 			return err
 		}
 	}
-	f.buffer(tx, func() {
-		if b := f.breaks[id]; b != nil {
-			b.txn = txn
-		}
-	})
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if b := f.breaks[id]; b != nil {
+		b.createdRuleID = ruleID
+	}
 	return nil
 }
 
@@ -787,6 +834,10 @@ func TestHandleAutoPathEscalations(t *testing.T) {
 		setup      func(h *harness)
 		wantCreate int
 		wantProbe  int
+		// wantDelete asserts finding F5: a rule this invocation created for an
+		// attempt that did not clear MUST be rolled back (deleted) before the
+		// break escalates, so a failed auto-attempt leaves no orphan Blnk rule.
+		wantDelete int
 	}{
 		{
 			name: "grammar-invalid rule never reaches Blnk",
@@ -797,6 +848,7 @@ func TestHandleAutoPathEscalations(t *testing.T) {
 			},
 			wantCreate: 0,
 			wantProbe:  0,
+			wantDelete: 0, // nothing was created, so nothing to roll back
 		},
 		{
 			name: "Blnk rule-create failure escalates",
@@ -805,6 +857,7 @@ func TestHandleAutoPathEscalations(t *testing.T) {
 			},
 			wantCreate: 1,
 			wantProbe:  0,
+			wantDelete: 0, // creation failed => no rule id to delete
 		},
 		{
 			name: "empty created rule id is guarded before probing (m-7)",
@@ -813,6 +866,7 @@ func TestHandleAutoPathEscalations(t *testing.T) {
 			},
 			wantCreate: 1,
 			wantProbe:  0,
+			wantDelete: 0, // no usable rule id to delete
 		},
 		{
 			name: "Blnk probe failure escalates",
@@ -821,6 +875,7 @@ func TestHandleAutoPathEscalations(t *testing.T) {
 			},
 			wantCreate: 1,
 			wantProbe:  1,
+			wantDelete: 1, // F5: created rule rolled back on probe failure
 		},
 		{
 			name: "dry-run that does not clear escalates",
@@ -830,6 +885,7 @@ func TestHandleAutoPathEscalations(t *testing.T) {
 			},
 			wantCreate: 1,
 			wantProbe:  1,
+			wantDelete: 1, // F5: created rule rolled back when not cleared
 		},
 		{
 			name: "cleared but empty recon id cannot prove resolution (Rule 5.3)",
@@ -839,6 +895,7 @@ func TestHandleAutoPathEscalations(t *testing.T) {
 			},
 			wantCreate: 1,
 			wantProbe:  1,
+			wantDelete: 1, // F5: created rule rolled back when clearance unprovable
 		},
 	}
 	for _, tc := range cases {
@@ -868,7 +925,218 @@ func TestHandleAutoPathEscalations(t *testing.T) {
 			if got := h.bnk.probeCount(); got != tc.wantProbe {
 				t.Fatalf("Blnk probe calls: want %d got %d", tc.wantProbe, got)
 			}
+			// F5: verify rollback of a rule created for a non-clearing attempt.
+			if got := h.bnk.deleteCount(); got != tc.wantDelete {
+				t.Fatalf("Blnk delete calls: want %d got %d", tc.wantDelete, got)
+			}
+			if tc.wantDelete == 1 {
+				if dels := h.bnk.deletedRules(); len(dels) != 1 || dels[0] != "rule_1" {
+					t.Fatalf("F5: expected the created rule %q to be deleted, got %v", "rule_1", dels)
+				}
+			}
+			// F5: whichever branch escalated, the break must retain NO persisted
+			// created-rule id — either none was ever set, or the rollback cleared
+			// it — so a later HITL re_drive cannot reuse a dangling/deleted rule.
+			if crid := h.back.createdRuleOf(id); crid != "" {
+				t.Fatalf("F5: escalated auto-path break must not retain a created-rule id, got %q", crid)
+			}
 		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Finding F7: the proposed rule is narrowed before it is POSTed to Blnk — each
+// equality criterion's Value is populated from the transaction, and a
+// {currency,equals} criterion is appended so an amount-only proposal cannot
+// clear across a currency boundary. The classifier's persisted rule must not be
+// mutated by this narrowing (deep copy).
+// -----------------------------------------------------------------------------
+
+func TestHandleF7NarrowsProposedRule(t *testing.T) {
+	const id = "ext_f7"
+	h := newHarness(t)
+	// A distinctive amount so the populated Value is unambiguous, and a currency
+	// so the appended criterion is exercised.
+	txn := blnk.ExternalTransaction{ID: id, Source: "bank-x", Amount: 1500.5, Currency: "USD", Reference: "INV-1001"}
+	// The classifier proposes an amount-only rule with an EMPTY Value — exactly
+	// the shape finding F7 says Blnk would clear by coincidental same-amount.
+	origRule := &blnk.MatchingRule{
+		Name:     "amount-eq",
+		Criteria: []blnk.MatchingCriteria{{Field: "amount", Operator: "equals", Value: ""}},
+	}
+	h.cls.result = model.BreakClassification{
+		ExternalTxnID: id,
+		RootCause:     model.RootCauseAmountDrift,
+		Confidence:    0.95,
+		ProposedRule:  origRule,
+		Rationale:     "amount drift within fee tolerance",
+	}
+	h.bnk.created = blnk.MatchingRule{RuleID: "rule_1"}
+	h.bnk.cleared = true
+	h.bnk.reconID = "recon_1"
+
+	if err := h.rem.Handle(context.Background(), txn, testUploadID); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	posted, ok := h.bnk.lastCreatedRule()
+	if !ok {
+		t.Fatal("F7: expected a rule to be POSTed to Blnk")
+	}
+	var amtVal, curVal string
+	var haveAmt, haveCur bool
+	for _, c := range posted.Criteria {
+		switch c.Field {
+		case "amount":
+			haveAmt, amtVal = true, c.Value
+		case "currency":
+			haveCur, curVal = true, c.Value
+		}
+	}
+	// F7: the amount criterion's Value is populated from the transaction.
+	if !haveAmt || amtVal != "1500.5" {
+		t.Fatalf("F7: amount criterion Value must be populated from txn, got have=%v val=%q", haveAmt, amtVal)
+	}
+	// F7: a {currency,equals} criterion is appended, pinning the currency.
+	if !haveCur || curVal != "USD" {
+		t.Fatalf("F7: expected an appended {currency,equals,USD} criterion, got have=%v val=%q", haveCur, curVal)
+	}
+	// F7: the deep copy must leave the classifier's persisted rule untouched.
+	if len(origRule.Criteria) != 1 {
+		t.Fatalf("F7: narrowing must not mutate the classification's rule criteria, got %d", len(origRule.Criteria))
+	}
+	if origRule.Criteria[0].Value != "" {
+		t.Fatalf("F7: narrowing must not mutate the original criterion Value, got %q", origRule.Criteria[0].Value)
+	}
+	// The narrowed rule is a valid equality rule, so the break still auto-resolves.
+	if status, _ := h.back.statusOf(id); status != statusAutoResolved {
+		t.Fatalf("F7: narrowed rule should still auto-resolve, got %q", status)
+	}
+}
+
+// F7: when the proposal ALREADY constrains currency, no duplicate currency
+// criterion is appended — the existing one is populated in place.
+func TestHandleF7DoesNotDuplicateCurrencyCriterion(t *testing.T) {
+	const id = "ext_f7_cur"
+	h := newHarness(t)
+	txn := blnk.ExternalTransaction{ID: id, Source: "bank-x", Amount: 42.0, Currency: "EUR"}
+	origRule := &blnk.MatchingRule{
+		Name: "amount+cur",
+		Criteria: []blnk.MatchingCriteria{
+			{Field: "amount", Operator: "equals"},
+			{Field: "currency", Operator: "equals"},
+		},
+	}
+	h.cls.result = model.BreakClassification{
+		ExternalTxnID: id,
+		RootCause:     model.RootCauseAmountDrift,
+		Confidence:    0.95,
+		ProposedRule:  origRule,
+		Rationale:     "amount drift",
+	}
+	h.bnk.created = blnk.MatchingRule{RuleID: "rule_1"}
+	h.bnk.cleared = true
+	h.bnk.reconID = "recon_1"
+
+	if err := h.rem.Handle(context.Background(), txn, testUploadID); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	posted, _ := h.bnk.lastCreatedRule()
+	curCount := 0
+	for _, c := range posted.Criteria {
+		if c.Field == "currency" {
+			curCount++
+			if c.Value != "EUR" {
+				t.Fatalf("F7: existing currency criterion must be populated from txn, got %q", c.Value)
+			}
+		}
+	}
+	if curCount != 1 {
+		t.Fatalf("F7: expected exactly one currency criterion (no duplicate), got %d", curCount)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Finding F5: a rule this invocation created for an auto-attempt that did not
+// clear is rolled back (deleted + persisted id cleared) so no orphan Blnk rule
+// accumulates. The rollback is best-effort and never blocks the fail-closed
+// escalation; a reused rule and a successfully-resolving rule are never deleted.
+// -----------------------------------------------------------------------------
+
+// A successful resolution must NOT delete the rule that cleared the break.
+func TestHandleF5NoRollbackOnSuccess(t *testing.T) {
+	const id = "ext_f5_ok"
+	h := autoHarness(t, id)
+
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if status, _ := h.back.statusOf(id); status != statusAutoResolved {
+		t.Fatalf("expected auto-resolved, got %q", status)
+	}
+	if h.bnk.deleteCount() != 0 {
+		t.Fatalf("F5: a rule that cleared the break must NOT be deleted, got %d deletes", h.bnk.deleteCount())
+	}
+	if crid := h.back.createdRuleOf(id); crid != "rule_1" {
+		t.Fatalf("F5: a resolving rule id must be retained, got %q", crid)
+	}
+}
+
+// The rollback is best-effort: even when the Blnk delete FAILS, the break still
+// escalates fail-closed (Rule 5.7), and because the rule likely still exists we
+// KEEP our persisted reference to it rather than orphaning it.
+func TestHandleF5RollbackBestEffortStillEscalates(t *testing.T) {
+	const id = "ext_f5_beffort"
+	h := autoHarness(t, id)
+	h.bnk.cleared = false // probe does not clear => rollback path
+	h.bnk.reconID = "recon_x"
+	h.bnk.deleteErr = errors.New("blnk delete 500")
+
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
+		t.Fatalf("Handle must not fail when rule rollback fails (fail-closed): %v", err)
+	}
+	if status, _ := h.back.statusOf(id); status != statusQueued {
+		t.Fatalf("break must still escalate despite rollback failure, got %q", status)
+	}
+	if _, queued := h.back.inHITL(id); !queued {
+		t.Fatal("break must be enqueued for HITL despite rollback failure (Rule 5.7)")
+	}
+	if h.bnk.deleteCount() != 1 {
+		t.Fatalf("F5: rollback delete must be ATTEMPTED once, got %d", h.bnk.deleteCount())
+	}
+	// Delete failed, so the rule likely still exists — keep the reference.
+	if crid := h.back.createdRuleOf(id); crid != "rule_1" {
+		t.Fatalf("F5: on delete failure the created-rule id must be retained, got %q", crid)
+	}
+	if h.back.countAction(id, audit.ActionResolved) != 0 {
+		t.Fatal("a non-clearing break must never resolve")
+	}
+}
+
+// A REUSED (already-persisted) rule is not this call's to roll back: only a rule
+// created in THIS invocation is deleted on failure.
+func TestHandleF5DoesNotDeleteReusedRuleOnFailure(t *testing.T) {
+	const id = "ext_f5_reused"
+	h := autoHarness(t, id)
+	// A prior attempt already created & persisted this rule (resume-classified).
+	h.back.seedBreak(id, autoClassification(id), statusClassified, "rule_prior")
+	h.bnk.cleared = false // this attempt's probe does not clear
+	h.bnk.reconID = "recon_x"
+
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if h.bnk.createCount() != 0 {
+		t.Fatalf("resume must reuse the persisted rule, got %d creates", h.bnk.createCount())
+	}
+	if h.bnk.deleteCount() != 0 {
+		t.Fatalf("F5: a reused rule must NOT be deleted on failure, got %d deletes", h.bnk.deleteCount())
+	}
+	if crid := h.back.createdRuleOf(id); crid != "rule_prior" {
+		t.Fatalf("F5: a reused rule id must be retained, got %q", crid)
+	}
+	if status, _ := h.back.statusOf(id); status != statusQueued {
+		t.Fatalf("break must escalate, got %q", status)
 	}
 }
 
@@ -997,40 +1265,6 @@ func TestHandleAtomicity_EscalateEnqueueFailure(t *testing.T) {
 	status, _ := h.back.statusOf(id)
 	if status == statusQueued {
 		t.Fatal("break must NOT be marked queued when the HITL enqueue fails (M-4)")
-	}
-	if _, queued := h.back.inHITL(id); queued {
-		t.Fatal("no HITL-queue entry may be durable after rollback")
-	}
-	if h.back.countAction(id, audit.ActionEscalated) != 0 {
-		t.Fatal("no escalated audit event may be durable after rollback")
-	}
-}
-
-// C-03 atomicity: the full-transaction persist (SaveBreakTxnTx) fails inside the
-// escalate transaction. The whole escalation must roll back — the break is not
-// queued, has no HITL entry, and has no escalated event — so the durable
-// re-drive context and the queued break are always committed together or not at
-// all (there can never be a queued break with a missing/half-written txn).
-func TestHandleAtomicity_EscalateSaveTxnFailure(t *testing.T) {
-	const id = "ext_c03"
-	h := autoHarness(t, id)
-	c := autoClassification(id)
-	c.Regulated = true // force the escalate path
-	h.cls.result = c
-	h.back.saveBreakTxnTxHook = func(_ string, _ *blnk.ExternalTransaction) error {
-		return errors.New("txn persist down")
-	}
-
-	err := h.rem.Handle(context.Background(), txnFor(id), testUploadID)
-	if err == nil {
-		t.Fatal("expected the txn-persist failure to surface as an error")
-	}
-	status, _ := h.back.statusOf(id)
-	if status == statusQueued {
-		t.Fatal("break must NOT be marked queued when the txn persist fails (C-03)")
-	}
-	if status != statusClassified {
-		t.Fatalf("break should remain classified after escalate rollback, got %q", status)
 	}
 	if _, queued := h.back.inHITL(id); queued {
 		t.Fatal("no HITL-queue entry may be durable after rollback")

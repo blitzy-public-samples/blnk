@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -25,6 +27,9 @@ const (
 	routeStartInstant  = "/reconciliation/start-instant"
 	routeReconByID     = "/reconciliation/" // + reconciliation id
 	routeMatchingRules = "/reconciliation/matching-rules"
+	// routeHealth is Blnk's unauthenticated liveness endpoint, used by Ready to
+	// await dependency readiness at startup (finding L1).
+	routeHealth = "/health"
 
 	// probeStrategy is the reconciliation strategy used by ProbeBreak. A single
 	// external transaction is probed one-to-one against the internal ledger.
@@ -75,6 +80,28 @@ func NewClient(baseURL, apiKey string) *Client {
 		probeInterval: defaultProbeInterval,
 		probeTimeout:  defaultProbeTimeout,
 	}
+}
+
+// Ready reports whether Blnk is reachable and serving, by issuing GET /health.
+// cmd/main.go calls it (with bounded retries) to await dependency readiness
+// before running the pipeline, so the agent never triages against a not-yet-up
+// Blnk and reports a false-green result (finding L1). A transport error or a
+// 5xx response means not-ready; any other response means reachable.
+func (c *Client) Ready(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+routeHealth, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= http.StatusInternalServerError {
+		return fmt.Errorf("blnk health check returned status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // UploadExternalData uploads an external statement via multipart/form-data
@@ -181,6 +208,21 @@ func (c *Client) UpdateMatchingRule(ctx context.Context, ruleID string, rule Mat
 	return out, nil
 }
 
+// DeleteMatchingRule removes a matching rule via
+// DELETE /reconciliation/matching-rules/:id (Blnk returns 200 with a message).
+// It is used to roll back a rule the agent created for an auto-remediation
+// attempt that did not clear, so a failed attempt leaves no orphan rule behind
+// in the shared Blnk catalog (finding F5). A not-found rule is reported as an
+// error for the caller to treat as best-effort (the orphan-prevention goal is
+// already met when the rule is gone, however it got there).
+func (c *Client) DeleteMatchingRule(ctx context.Context, ruleID string) error {
+	req, err := c.newJSONRequest(ctx, http.MethodDelete, routeMatchingRules+"/"+url.PathEscape(ruleID), nil)
+	if err != nil {
+		return err
+	}
+	return c.do(req, http.StatusOK, nil)
+}
+
 // ProbeBreak is the break-identity bridge and the DETERMINISTIC ARBITER for
 // whether a break is cleared (Rule 5.3). It submits a SINGLE external
 // transaction through POST /reconciliation/start-instant with dry_run=true,
@@ -195,8 +237,31 @@ func (c *Client) UpdateMatchingRule(ctx context.Context, ruleID string, rule Mat
 // the caller can fail closed (Rule 5.7) and route the break to HITL. LLM
 // confidence must never substitute for this deterministic check.
 func (c *Client) ProbeBreak(ctx context.Context, txn ExternalTransaction, matchingRuleIDs []string) (cleared bool, reconID string, err error) {
+	// Double-persist elimination (findings F3/F8). Blnk's start-instant
+	// UNCONDITIONALLY persists every submitted external transaction by its OWN id
+	// via a plain INSERT (database/reconciliation.go RecordExternalTransaction —
+	// no ON CONFLICT), EVEN under dry_run (reconciliation.go
+	// StartInstantReconciliation stores before matching). blnk.external_transactions
+	// keys on the transaction id (TEXT PRIMARY KEY), so submitting a given
+	// external id more than once collides on external_transactions_pkey and Blnk
+	// returns HTTP 500 (RECON_START_FAILED) — which previously made the second
+	// probe of a break (detect, then auto-remediation confirm) fail and made a
+	// rerun of a resolved id fail.
+	//
+	// Blnk matches an external transaction against internal bookings
+	// FIELD-TO-FIELD — amount/date/reference/description/currency — and NEVER by
+	// the transaction id (reconciliation.go matchesRules / findMatchingInternal
+	// Transaction), so the matched/unmatched verdict is invariant under the id.
+	// We therefore submit a FRESH, unique ephemeral id on every probe while
+	// preserving all matchable fields: the dry-run yields the identical verdict,
+	// but no id is ever inserted twice, so repeated probes of the same break —
+	// within one run and across reruns against a shared Blnk database — never
+	// collide. The caller's txn value is left unmodified (probeTxn is a copy).
+	probeTxn := txn
+	probeTxn.ID = "probe-" + uuid.NewString()
+
 	reconID, err = c.InstantReconciliation(ctx, InstantReconciliationRequest{
-		ExternalTransactions: []ExternalTransaction{txn},
+		ExternalTransactions: []ExternalTransaction{probeTxn},
 		Strategy:             probeStrategy,
 		DryRun:               true,
 		MatchingRuleIDs:      matchingRuleIDs,

@@ -34,13 +34,14 @@ CREATE SCHEMA IF NOT EXISTS agent;
 -- Blnk matching rule the agent created while auto-remediating this break, so a
 -- retry after a partial failure can reuse the already-created rule instead of
 -- creating a duplicate one in Blnk (deterministic-arbiter side-effect safety).
--- txn persists the FULL external transaction that broke (finding C-03): a HITL
--- re-drive re-tests clearance with a Blnk dry-run (POST /reconciliation/
--- start-instant), which requires the complete transaction line AND a non-empty
--- matching_rule_ids set. Persisting the whole transaction here (as JSONB) lets
--- the re-drive handler reconstruct a valid, complete probe payload instead of
--- submitting only an id with nil rules; the applicable rule id set is derived
--- from created_rule_id at load time (LoadBreakContext).
+-- The amount/currency/reference/description/txn_date columns persist the
+-- matchable fields of the ORIGINAL external transaction alongside the classifier
+-- verdict. A queued break is later re-driven from the HITL surface, and the
+-- native Blnk HTTP contract exposes no route that lists an unmatched
+-- transaction's fields (Rule 5.1 forbids reading Blnk-owned tables directly), so
+-- the agent must remember the transaction it was managing in order to rebuild
+-- the single-transaction dry-run for a re_drive. They are nullable so a
+-- previously-migrated database upgrades cleanly (finding L2).
 CREATE TABLE IF NOT EXISTS agent.agent_break (
     external_txn_id TEXT PRIMARY KEY,
     root_cause      TEXT NOT NULL,
@@ -50,7 +51,11 @@ CREATE TABLE IF NOT EXISTS agent.agent_break (
     proposed_rule   JSONB,
     rationale       TEXT NOT NULL DEFAULT '',
     created_rule_id TEXT,
-    txn             JSONB,
+    amount          DOUBLE PRECISION,
+    currency        TEXT,
+    reference       TEXT,
+    description     TEXT,
+    txn_date        TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -60,7 +65,11 @@ CREATE TABLE IF NOT EXISTS agent.agent_break (
 -- Migrate stays idempotent on both fresh and previously-migrated databases.
 ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS rationale TEXT NOT NULL DEFAULT '';
 ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS created_rule_id TEXT;
-ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS txn JSONB;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS amount DOUBLE PRECISION;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS currency TEXT;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS reference TEXT;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS txn_date TIMESTAMPTZ;
 
 -- agent.agent_audit is the append-only action ledger (Rule 5.5). No UPDATE or
 -- DELETE statement may ever target this table; only INSERT and SELECT.
