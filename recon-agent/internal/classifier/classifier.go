@@ -20,7 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"strings"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 
@@ -33,6 +35,24 @@ import (
 // to 2 retries after the initial attempt (3 attempts total) before failing
 // closed.
 const defaultMaxRetries = 2
+
+// defaultPerAttemptTimeout bounds a SINGLE inference attempt. go-openai's
+// DefaultConfig installs an http.Client with NO Timeout, so absent an explicit
+// bound a hung/slow endpoint would block Classify forever under a non-deadline
+// context (e.g. context.Background()) — defeating the fail-closed guarantee
+// (Rule 5.7) and the <=60s demo budget. Classify derives a per-attempt context
+// deadline from this value so every attempt is self-bounded regardless of the
+// caller's context; after the retry cap the break fails closed and is routed to
+// HITL. It is generous enough for a healthy Kimi K3 response yet finite.
+const defaultPerAttemptTimeout = 30 * time.Second
+
+// defaultHTTPClientTimeout is a hard backstop on the underlying HTTP client that
+// covers the entire request/response exchange (connect, TLS, headers, body). It
+// is set slightly above defaultPerAttemptTimeout so that, in normal operation,
+// the per-attempt context deadline is the binding limit; the client Timeout only
+// engages if the per-attempt bound is ever disabled. Together they guarantee no
+// LLM call can hang unbounded even when the caller supplies context.Background().
+const defaultHTTPClientTimeout = 60 * time.Second
 
 // deterministicTemperature forces near-deterministic sampling for demo
 // reproducibility. go-openai marshals Temperature with `omitempty`, so a literal
@@ -69,19 +89,36 @@ type Classifier struct {
 	model       string
 	temperature float32
 	maxRetries  int
+
+	// perAttemptTimeout bounds each individual inference attempt (Rule 5.7 /
+	// AAP §0.1.2 fail-closed). Classify derives a context deadline from it so a
+	// hung or slow endpoint cannot stall a single attempt beyond this value even
+	// when the caller passes a context without a deadline. A value <= 0 disables
+	// the per-attempt bound (the http.Client.Timeout backstop still applies).
+	perAttemptTimeout time.Duration
 }
 
 // New builds a Classifier from configuration. The OpenAI-compatible client is
 // pointed at cfg.LLMBaseURL and every request carries Model = cfg.LLMModel, so
 // the model name is fully config-driven (Rule 5.6).
+//
+// It also installs explicit timeouts so inference can never hang unbounded
+// (Rule 5.7 / AAP §0.1.2). go-openai's DefaultConfig uses an http.Client with no
+// Timeout; New overrides it with a bounded client (defaultHTTPClientTimeout) as
+// a hard backstop, and Classify additionally bounds every attempt with a
+// per-attempt context deadline (defaultPerAttemptTimeout). Under a hung endpoint
+// with a non-deadline context, Classify therefore returns after the retry cap
+// and fails closed instead of blocking forever.
 func New(cfg config.Config) *Classifier {
 	oaCfg := openai.DefaultConfig(cfg.LLMApiKey)
 	oaCfg.BaseURL = cfg.LLMBaseURL
+	oaCfg.HTTPClient = &http.Client{Timeout: defaultHTTPClientTimeout}
 	return &Classifier{
-		client:      openai.NewClientWithConfig(oaCfg),
-		model:       cfg.LLMModel,
-		temperature: deterministicTemperature,
-		maxRetries:  defaultMaxRetries,
+		client:            openai.NewClientWithConfig(oaCfg),
+		model:             cfg.LLMModel,
+		temperature:       deterministicTemperature,
+		maxRetries:        defaultMaxRetries,
+		perAttemptTimeout: defaultPerAttemptTimeout,
 	}
 }
 
@@ -119,9 +156,19 @@ func (c *Classifier) Classify(ctx context.Context, txn blnk.ExternalTransaction)
 
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
-		resp, err := c.client.CreateChatCompletion(ctx, req)
+		resp, err := c.createChatCompletion(ctx, req)
 		if err != nil {
 			lastErr = err
+			// If the CALLER's context is done (cancelled or its own deadline
+			// exceeded), stop retrying: the caller has given up, so further
+			// attempts would only waste the retry budget and delay the
+			// fail-closed return. A per-attempt timeout firing does NOT mark the
+			// caller's context done (only the derived attempt context), so a
+			// genuinely slow or hung endpoint still retries up to the cap before
+			// failing closed (Rule 5.7).
+			if ctx.Err() != nil {
+				break
+			}
 			continue
 		}
 		if len(resp.Choices) == 0 {
@@ -142,6 +189,24 @@ func (c *Classifier) Classify(ctx context.Context, txn blnk.ExternalTransaction)
 		Confidence:    0,
 	}
 	return stub, fmt.Errorf("%w: %v", ErrClassificationFailed, lastErr)
+}
+
+// createChatCompletion issues a single inference attempt bounded by an explicit
+// per-attempt deadline derived from ctx (Rule 5.7 / AAP §0.1.2). This guarantees
+// a hung or slow endpoint cannot block one attempt beyond perAttemptTimeout even
+// when the caller supplies a context without a deadline. When the caller's
+// context already carries an earlier deadline, that earlier deadline wins because
+// context.WithTimeout takes the minimum of the two. A perAttemptTimeout <= 0
+// disables the per-attempt bound (the client-level Timeout backstop still
+// applies). The derived context is always cancelled before returning so no timer
+// leaks between attempts.
+func (c *Classifier) createChatCompletion(ctx context.Context, req openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
+	if c.perAttemptTimeout <= 0 {
+		return c.client.CreateChatCompletion(ctx, req)
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, c.perAttemptTimeout)
+	defer cancel()
+	return c.client.CreateChatCompletion(attemptCtx, req)
 }
 
 // parseClassification extracts the JSON object from a raw model reply and

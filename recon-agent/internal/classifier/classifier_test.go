@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -355,5 +356,233 @@ func TestTruncate(t *testing.T) {
 	got := truncate(string(long), 120)
 	if len([]rune(got)) != 123 { // 120 runes + "..."
 		t.Errorf("truncate long rune len = %d, want 123", len([]rune(got)))
+	}
+}
+
+// hangingServer returns an httptest server whose handler blocks (never sends a
+// response) so the classifier's own per-attempt timeout — not the server — is
+// what unblocks Classify. It records how many requests reached it. A handler
+// unblocks either when the client aborts the request (per-attempt timeout /
+// caller cancel fires r.Context().Done()) or when the test's registered cleanup
+// closes the release channel; the cleanup closes release BEFORE srv.Close() so
+// any straggler handler goroutine returns promptly and Close never blocks.
+func hangingServer(t *testing.T, calls *int32) *httptest.Server {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(calls, 1)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+	return srv
+}
+
+// TestClassify_PerAttemptTimeoutBoundsHungEndpoint reproduces finding C1: a hung
+// endpoint under a NON-deadline context (context.Background) previously blocked
+// Classify forever. With the per-attempt timeout the classifier now self-bounds
+// each attempt, exhausts the retry cap, and fails closed (Rule 5.7) instead of
+// hanging.
+func TestClassify_PerAttemptTimeoutBoundsHungEndpoint(t *testing.T) {
+	var calls int32
+	srv := hangingServer(t, &calls)
+
+	c := newTestClassifier(srv.URL)
+	c.perAttemptTimeout = 120 * time.Millisecond // small explicit per-attempt bound for the test
+
+	start := time.Now()
+	got, err := c.Classify(context.Background(), sampleTxn()) // NO caller deadline
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrClassificationFailed) {
+		t.Fatalf("error = %v, want errors.Is ErrClassificationFailed (fail-closed under a hung endpoint)", err)
+	}
+	// The classifier must bound itself; total ~ (maxRetries+1) * perAttemptTimeout,
+	// comfortably under this generous ceiling. Before the fix this blocked forever.
+	if elapsed > 2*time.Second {
+		t.Fatalf("Classify blocked %v under a hung endpoint with context.Background(); want bounded by its own per-attempt timeout", elapsed)
+	}
+	// Each attempt is bounded then retried up to the cap: 1 initial + 2 retries.
+	if n := atomic.LoadInt32(&calls); n != int32(defaultMaxRetries+1) {
+		t.Fatalf("attempts reaching server = %d, want %d", n, defaultMaxRetries+1)
+	}
+	// The stub result must never look auto-resolvable.
+	if got.ExternalTxnID != sampleTxn().ID || got.RootCause != model.RootCauseUnknown || got.Confidence != 0 {
+		t.Errorf("stub = {%q,%q,%v}, want {%q,unknown,0}", got.ExternalTxnID, got.RootCause, got.Confidence, sampleTxn().ID)
+	}
+}
+
+// TestClassify_CallerDeadlineWinsAndShortCircuits verifies finding C1 repro
+// step 3: a caller-supplied deadline shorter than the per-attempt bound governs,
+// and once the caller's context is done the retry loop stops early (does not burn
+// the full retry budget) yet still fails closed.
+func TestClassify_CallerDeadlineWinsAndShortCircuits(t *testing.T) {
+	var calls int32
+	srv := hangingServer(t, &calls)
+
+	c := newTestClassifier(srv.URL)
+	c.perAttemptTimeout = 10 * time.Second // large; the caller deadline below must win
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := c.Classify(ctx, sampleTxn())
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrClassificationFailed) {
+		t.Fatalf("error = %v, want errors.Is ErrClassificationFailed", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Classify took %v; the caller's 150ms deadline should bound it", elapsed)
+	}
+	// The caller's context expired, so the loop must short-circuit rather than
+	// retry to the cap. Exactly one request should have reached the server.
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("attempts reaching server = %d, want 1 (retry loop must stop once the caller context is done)", n)
+	}
+}
+
+// TestClassify_SlowAttemptsAreBoundedThenFailClosed reproduces finding C1
+// repro step 4: three slow attempts are each bounded by the per-attempt timeout
+// (they do not run unbounded) and the pipeline fails closed after the cap.
+func TestClassify_SlowAttemptsAreBoundedThenFailClosed(t *testing.T) {
+	var calls int32
+	srv := hangingServer(t, &calls)
+
+	c := newTestClassifier(srv.URL)
+	c.perAttemptTimeout = 100 * time.Millisecond
+
+	start := time.Now()
+	_, err := c.Classify(context.Background(), sampleTxn())
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrClassificationFailed) {
+		t.Fatalf("error = %v, want ErrClassificationFailed", err)
+	}
+	// At least the per-attempt bound elapsed (attempts really were bounded, not
+	// instantaneous), and the total stayed well under the runaway ceiling.
+	if elapsed < c.perAttemptTimeout {
+		t.Fatalf("elapsed %v < per-attempt timeout %v; attempts were not actually bounded", elapsed, c.perAttemptTimeout)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("elapsed %v exceeds a sane ceiling for 3 bounded attempts", elapsed)
+	}
+	if n := atomic.LoadInt32(&calls); n != int32(defaultMaxRetries+1) {
+		t.Fatalf("attempts = %d, want %d", n, defaultMaxRetries+1)
+	}
+}
+
+// TestNewInstallsPerAttemptTimeout verifies the real constructor wires the C1
+// per-attempt bound default (go-openai's DefaultConfig otherwise ships an
+// unbounded http.Client, which is why New must install its own bounds). The
+// bounded behavior itself is exercised end-to-end by the hung-endpoint tests.
+func TestNewInstallsPerAttemptTimeout(t *testing.T) {
+	c := New(config.Config{LLMBaseURL: "http://example.test", LLMApiKey: "k", LLMModel: testModel})
+	if c.perAttemptTimeout != defaultPerAttemptTimeout {
+		t.Errorf("perAttemptTimeout = %v, want %v", c.perAttemptTimeout, defaultPerAttemptTimeout)
+	}
+	if c.perAttemptTimeout <= 0 || c.perAttemptTimeout > defaultHTTPClientTimeout {
+		t.Errorf("perAttemptTimeout %v must be a positive bound no greater than the HTTP backstop %v", c.perAttemptTimeout, defaultHTTPClientTimeout)
+	}
+}
+
+// TestClassify_DisabledPerAttemptTimeoutHonorsCallerCancel verifies the
+// perAttemptTimeout<=0 branch: the per-attempt bound is disabled, but a caller
+// cancellation still returns promptly and fails closed (no hang, no auto-resolve).
+func TestClassify_DisabledPerAttemptTimeoutHonorsCallerCancel(t *testing.T) {
+	var calls int32
+	srv := hangingServer(t, &calls)
+
+	c := newTestClassifier(srv.URL)
+	c.perAttemptTimeout = 0 // disable per-attempt bound; rely on caller context
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err := c.Classify(ctx, sampleTxn())
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrClassificationFailed) {
+		t.Fatalf("error = %v, want ErrClassificationFailed", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Classify took %v; caller cancellation should return promptly", elapsed)
+	}
+}
+
+// TestClassify_PromptCarriesReconciliationReasoning verifies finding C2: the
+// prompt now grounds classification in reconciliation reality. The captured
+// on-the-wire request must (a) keep exactly two messages [system, user] and
+// (b) carry reconciliation-reasoning markers — per-root-cause internal-ledger
+// definitions and the counterpart-state checklist — so the label derives from
+// ledger reasoning, not description prose alone.
+func TestClassify_PromptCarriesReconciliationReasoning(t *testing.T) {
+	var captured atomic.Value // openai.ChatCompletionRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req openai.ChatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		captured.Store(req)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(chatResponseBody(t, `{"root_cause":"timing","confidence":0.9,"regulated":false,"rationale":"x"}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClassifier(srv.URL)
+	if _, err := c.Classify(context.Background(), sampleTxn()); err != nil {
+		t.Fatalf("Classify: %v", err)
+	}
+
+	req, ok := captured.Load().(openai.ChatCompletionRequest)
+	if !ok {
+		t.Fatalf("no request captured")
+	}
+	// Invariant preserved: exactly two messages [system, user].
+	if len(req.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2 [system,user]", len(req.Messages))
+	}
+	if req.Messages[0].Role != openai.ChatMessageRoleSystem {
+		t.Errorf("message[0].Role = %q, want system", req.Messages[0].Role)
+	}
+	if req.Messages[1].Role != openai.ChatMessageRoleUser {
+		t.Errorf("message[1].Role = %q, want user", req.Messages[1].Role)
+	}
+	// Marker checks are case-insensitive: they assert the presence of the
+	// reconciliation-reasoning CONCEPTS, not any particular casing.
+	sys := strings.ToLower(req.Messages[0].Content)
+	// Reconciliation-reality markers: internal-counterpart reasoning and the
+	// discriminating semantics for the labels the seed cannot separate on
+	// external fields alone (timing vs duplicate vs missing_internal).
+	for _, marker := range []string{
+		"internal", "counterpart", "already", "consumed",
+		"duplicate", "missing_internal", "timing",
+	} {
+		if !strings.Contains(sys, marker) {
+			t.Errorf("system prompt missing reconciliation-reasoning marker %q", marker)
+		}
+	}
+	// The system prompt must forbid proposing a rule for the escalate-only
+	// causes, hardening classification against over-eager auto-remediation.
+	if !strings.Contains(sys, "omit") {
+		t.Errorf("system prompt does not instruct omitting proposed_rule for escalate-only causes")
+	}
+	// The user turn must restate the counterpart-state checklist so the label is
+	// derived from ledger reasoning per break.
+	user := strings.ToLower(req.Messages[1].Content)
+	for _, marker := range []string{"internal counterpart", "duplicate", "missing_internal"} {
+		if !strings.Contains(user, marker) {
+			t.Errorf("user prompt missing reconciliation-reasoning marker %q", marker)
+		}
 	}
 }

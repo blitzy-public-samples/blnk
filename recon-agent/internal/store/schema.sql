@@ -27,6 +27,13 @@
 CREATE SCHEMA IF NOT EXISTS agent;
 
 -- agent.agent_break holds one row per external break under management.
+--
+-- rationale carries the classifier's short natural-language justification so
+-- the break row is self-describing on the HITL status page (the full rationale
+-- is also captured on every audit event). created_rule_id records the id of the
+-- Blnk matching rule the agent created while auto-remediating this break, so a
+-- retry after a partial failure can reuse the already-created rule instead of
+-- creating a duplicate one in Blnk (deterministic-arbiter side-effect safety).
 CREATE TABLE IF NOT EXISTS agent.agent_break (
     external_txn_id TEXT PRIMARY KEY,
     root_cause      TEXT NOT NULL,
@@ -34,9 +41,17 @@ CREATE TABLE IF NOT EXISTS agent.agent_break (
     regulated       BOOLEAN NOT NULL DEFAULT FALSE,
     status          TEXT NOT NULL,
     proposed_rule   JSONB,
+    rationale       TEXT NOT NULL DEFAULT '',
+    created_rule_id TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Upgrade path: add the newer columns to a pre-existing agent_break table.
+-- ADD COLUMN IF NOT EXISTS is a no-op when the column is already present, so
+-- Migrate stays idempotent on both fresh and previously-migrated databases.
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS rationale TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS created_rule_id TEXT;
 
 -- agent.agent_audit is the append-only action ledger (Rule 5.5). No UPDATE or
 -- DELETE statement may ever target this table; only INSERT and SELECT.
@@ -63,7 +78,36 @@ CREATE INDEX IF NOT EXISTS idx_agent_break_status ON agent.agent_break (status);
 CREATE INDEX IF NOT EXISTS idx_agent_audit_external_txn_id ON agent.agent_audit (external_txn_id);
 CREATE INDEX IF NOT EXISTS idx_agent_audit_timestamp ON agent.agent_audit ("timestamp");
 
+-- Rule 5.5 (defense-in-depth): enforce the append-only invariant at the
+-- database boundary, not merely by application convention. A BEFORE trigger
+-- fires for EVERY role including the table owner and a superuser (unlike a
+-- REVOKE, which superusers bypass), so no connection can mutate or remove a
+-- recorded audit event. The trigger raises on any row-level UPDATE or DELETE;
+-- INSERT and SELECT are unaffected, so the writer (INSERT) and status page
+-- (SELECT) work normally.
+CREATE OR REPLACE FUNCTION agent.agent_audit_reject_mutation() RETURNS trigger AS $reject$
+BEGIN
+    RAISE EXCEPTION 'agent.agent_audit is append-only (Rule 5.5); % is not permitted', TG_OP
+        USING ERRCODE = 'restrict_violation';
+END;
+$reject$ LANGUAGE plpgsql;
+
+-- CREATE TRIGGER has no IF NOT EXISTS form, so guard it in a DO block that
+-- swallows duplicate_object. This keeps Migrate idempotent and safe under
+-- concurrent invocations (the losing racer catches the duplicate and no-ops).
+DO $ensure_trigger$
+BEGIN
+    CREATE TRIGGER agent_audit_no_mutate
+        BEFORE UPDATE OR DELETE ON agent.agent_audit
+        FOR EACH ROW EXECUTE FUNCTION agent.agent_audit_reject_mutation();
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END;
+$ensure_trigger$;
+
 -- +migrate Down
+DROP TRIGGER IF EXISTS agent_audit_no_mutate ON agent.agent_audit;
+DROP FUNCTION IF EXISTS agent.agent_audit_reject_mutation();
 DROP INDEX IF EXISTS agent.idx_agent_audit_timestamp;
 DROP INDEX IF EXISTS agent.idx_agent_audit_external_txn_id;
 DROP INDEX IF EXISTS agent.idx_agent_break_status;

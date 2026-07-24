@@ -17,8 +17,11 @@ package remediator
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"math"
+	"sync"
 
 	"github.com/blnkfinance/recon-agent/internal/audit"
 	"github.com/blnkfinance/recon-agent/internal/blnk"
@@ -37,15 +40,45 @@ const (
 // Human-readable escalation reasons recorded on the HITL queue entry and on the
 // rationale of the escalated AuditEvent.
 const (
-	reasonRegulated        = "regulated break requires human review"
-	reasonLowConfidence    = "classification confidence below auto-remediation threshold"
-	reasonClassifierFailed = "classifier failed; routed to HITL (fail-closed)"
-	reasonMissingRule      = "no matching rule proposed; cannot auto-remediate"
-	reasonGrammarReject    = "proposed matching rule failed grammar validation"
-	reasonRuleCreateFailed = "failed to create matching rule in Blnk"
-	reasonProbeFailed      = "Blnk dry-run probe failed"
-	reasonNotCleared       = "Blnk dry-run did not confirm clearance"
+	reasonRegulated                = "regulated break requires human review"
+	reasonLowConfidence            = "classification confidence below auto-remediation threshold"
+	reasonRootCauseNotAutoEligible = "root cause is not eligible for automatic remediation; requires human review"
+	reasonClassifierFailed         = "classifier failed; routed to HITL (fail-closed)"
+	reasonInvalidConfidence        = "classifier returned a malformed confidence; routed to HITL (fail-closed)"
+	reasonMissingRule              = "no matching rule proposed; cannot auto-remediate"
+	reasonGrammarReject            = "proposed matching rule failed grammar validation"
+	reasonOverbroadRule            = "proposed matching rule is too broad to auto-apply safely"
+	reasonRuleCreateFailed         = "failed to create matching rule in Blnk"
+	reasonEmptyRuleID              = "Blnk returned an empty matching-rule id; cannot probe"
+	reasonProbeFailed              = "Blnk dry-run probe failed"
+	reasonNotCleared               = "Blnk dry-run did not confirm clearance"
 )
+
+// operatorEquals is the only matching operator tight enough to auto-apply to a
+// single-transaction dry-run (finding C3). Blnk compares the external transaction
+// against internal transactions FIELD-TO-FIELD and IGNORES criteria.Value for all
+// operators (see Blnk reconciliation.go matchesString / matchesGroupAmount /
+// matchesCurrency), so a range/substring operator (greater_than / less_than /
+// contains) can match an UNINTENDED internal counterpart and make a single-txn
+// probe falsely report "cleared". Equality pins external == internal on a field.
+const operatorEquals = "equals"
+
+// autoEligibleRootCauses is the closed allow-list of root causes the agent may
+// auto-remediate (finding C3). It is defense-in-depth ABOVE the classifier's soft
+// "omit a rule for unsafe causes" behavior: even if a high-confidence
+// classification arrives WITH a grammar-valid rule attached, only these causes may
+// proceed down the auto path. duplicate, missing_internal, currency_mismatch and
+// unknown are deliberately excluded and ALWAYS route to HITL regardless of
+// confidence, because a single-transaction Blnk dry-run can falsely "clear" them
+// (e.g. a duplicate double-matches the sole internal counterpart of the original
+// line; missing_internal has no counterpart to match; currency_mismatch is
+// treated as regulated). This mirrors the evaluation corpus, which auto-resolves
+// only timing / amount_drift / reference_mismatch and escalates the rest.
+var autoEligibleRootCauses = map[model.RootCause]bool{
+	model.RootCauseTiming:            true,
+	model.RootCauseAmountDrift:       true,
+	model.RootCauseReferenceMismatch: true,
+}
 
 // classifierPort is the subset of the classifier used by the remediator.
 type classifierPort interface {
@@ -60,15 +93,30 @@ type blnkPort interface {
 }
 
 // auditPort is the append-only audit writer used by the remediator (Rule 5.5).
+// RecordTx enrolls an append in a caller-supplied transaction so a state change
+// and its audit event commit atomically (Rule 5.3); Record is used for the
+// advisory rule_proposed/probed events that accompany no state change.
 type auditPort interface {
 	Record(ctx context.Context, ev model.AuditEvent) error
+	RecordTx(ctx context.Context, tx *sql.Tx, ev model.AuditEvent) error
 }
 
-// storePort is the subset of the persistence layer used by the remediator.
+// storePort is the subset of the persistence layer used by the remediator. All
+// writes are transaction-bound so each break state transition commits together
+// with its audit event (the atomicity the QA fault-injection findings require);
+// WithTx supplies the transaction and LoadBreak drives idempotency/resume.
 type storePort interface {
-	UpsertBreak(ctx context.Context, c model.BreakClassification, status string) error
-	SetBreakStatus(ctx context.Context, externalTxnID, status string) error
-	EnqueueHITL(ctx context.Context, externalTxnID, reason string) error
+	// LoadBreak returns the persisted classification, status, and created rule
+	// id for a break (found=false when absent), enabling idempotent re-runs and
+	// crash-resume without re-classifying or duplicating a Blnk rule.
+	LoadBreak(ctx context.Context, externalTxnID string) (model.BreakClassification, string, string, bool, error)
+	// WithTx runs fn in one transaction, committing on nil and rolling back on
+	// error so partial writes are never durable.
+	WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error
+	UpsertBreakTx(ctx context.Context, tx *sql.Tx, c model.BreakClassification, status string) error
+	SetBreakStatusTx(ctx context.Context, tx *sql.Tx, externalTxnID, status string) error
+	EnqueueHITLTx(ctx context.Context, tx *sql.Tx, externalTxnID, reason string) error
+	SetCreatedRuleTx(ctx context.Context, tx *sql.Tx, externalTxnID, ruleID string) error
 }
 
 // Remediator orchestrates classification, gating, deterministic remediation and
@@ -85,6 +133,11 @@ type Remediator struct {
 
 	// llmModel is recorded as provenance on every AuditEvent (Rule 5.6).
 	llmModel string
+
+	// locks serializes concurrent Handle calls for the SAME break so a break is
+	// never classified/remediated twice by racing goroutines (finding M-5).
+	// Distinct breaks acquire distinct keys and still run in parallel.
+	locks keyedMutex
 }
 
 // New wires the remediator with its collaborators. The parameters are
@@ -108,47 +161,101 @@ func New(cls classifierPort, blnkClient blnkPort, auditWriter auditPort, store s
 // (auto-resolved or escalated to HITL). It returns a non-nil error only when an
 // agent-side infrastructure operation (persistence or audit write) fails; such
 // errors never leave a break auto-resolved.
+//
+// Handle is safe to call concurrently and is idempotent: concurrent calls for
+// the same break are serialized (M-5), an already-terminal break is a no-op so
+// a re-run never double-records a resolution or escalation (M-6), and a break
+// left "classified" by a crashed prior attempt is resumed — reusing its stored
+// classification and any created Blnk rule — without re-classifying or creating
+// a duplicate rule (M-3). Every state transition commits atomically with its
+// audit event, so no partial outcome is ever durable (C-1, C-2, M-2, M-4).
 func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction) error {
+	// M-5: serialize concurrent Handle calls for the SAME break. Released after
+	// the break reaches a terminal, committed state (or an error), so a racing
+	// caller observes that terminal state and no-ops below rather than
+	// re-processing.
+	unlock := r.locks.lock(txn.ID)
+	defer unlock()
+
 	prov := model.Provenance{
 		Model:  r.llmModel,
 		Source: txn.Source,
 	}
 
-	// 1. Classify. Rule 5.7 (fail-closed): ANY classifier error/timeout — the
-	// classifier signals terminal failure with ErrClassificationFailed after
-	// exhausting its retry cap — routes the break straight to HITL. The break
-	// is never dropped and never auto-resolved, and no "classified" event is
-	// emitted because classification did not succeed.
-	classification, err := r.cls.Classify(ctx, txn)
+	// M-6 idempotency / crash-resume: consult the persisted state first.
+	loaded, status, createdRuleID, found, err := r.store.LoadBreak(ctx, txn.ID)
 	if err != nil {
-		stub := classification
-		stub.ExternalTxnID = txn.ID
-		if stub.RootCause == "" {
-			stub.RootCause = model.RootCauseUnknown
+		return fmt.Errorf("remediator: load break %q: %w", txn.ID, err)
+	}
+
+	var classification model.BreakClassification
+	switch {
+	case found && (status == statusAutoResolved || status == statusQueued):
+		// Terminal outcome already recorded. A re-run (or the loser of a race)
+		// is a no-op, so a resolved/escalated event is never double-counted.
+		return nil
+
+	case found && status == statusClassified:
+		// Resume a break a prior attempt persisted+audited as classified but did
+		// not carry to a terminal state. Reuse the stored classification (and any
+		// created rule id) WITHOUT re-classifying or re-emitting a classified
+		// event; fall through to the gate and auto path below.
+		classification = loaded
+		classification.ExternalTxnID = txn.ID
+
+	default:
+		// Fresh break: classify (fail-closed on error), validate confidence,
+		// then persist + audit the classification atomically (M-2).
+		c, cerr := r.cls.Classify(ctx, txn)
+		if cerr != nil {
+			// Rule 5.7 (fail-closed): ANY classifier error/timeout routes the
+			// break straight to HITL. It is never dropped or auto-resolved, and
+			// no classified event is emitted because classification did not
+			// succeed.
+			stub := c
+			stub.ExternalTxnID = txn.ID
+			if stub.RootCause == "" {
+				stub.RootCause = model.RootCauseUnknown
+			}
+			reason := reasonClassifierFailed
+			if !errors.Is(cerr, classifier.ErrClassificationFailed) {
+				reason = fmt.Sprintf("%s (unexpected error: %v)", reasonClassifierFailed, cerr)
+			}
+			return r.escalate(ctx, stub, prov, reason)
 		}
-		reason := reasonClassifierFailed
-		if !errors.Is(err, classifier.ErrClassificationFailed) {
-			reason = fmt.Sprintf("%s (unexpected error: %v)", reasonClassifierFailed, err)
+
+		// Defensive: guarantee the break is keyed by the transaction under
+		// management regardless of what the classifier populated.
+		c.ExternalTxnID = txn.ID
+
+		// m-4: a malformed confidence (NaN/Inf or outside [0,1]) must fail closed
+		// to HITL, never silently flow into the auto path (NaN comparisons make
+		// the gate below ineffective). No classified event is emitted; escalate
+		// sanitizes the confidence so the escalated event is itself well-formed.
+		if !validConfidence(c.Confidence) {
+			return r.escalate(ctx, c, prov, fmt.Sprintf("%s (confidence=%v)", reasonInvalidConfidence, c.Confidence))
 		}
-		return r.escalate(ctx, stub, prov, reason)
+
+		// M-2: persist the classified break and emit the classified AuditEvent in
+		// ONE transaction, so a classified break can never exist without its
+		// audit event (nor an audit event without the break).
+		if err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
+			if e := r.store.UpsertBreakTx(ctx, tx, c, statusClassified); e != nil {
+				return e
+			}
+			return r.auditWriter.RecordTx(ctx, tx, audit.Classified(c, prov))
+		}); err != nil {
+			return fmt.Errorf("remediator: persist+audit classified break %q: %w", txn.ID, err)
+		}
+		classification = c
 	}
 
-	// Defensive: guarantee the break is keyed by the transaction under
-	// management regardless of what the classifier populated.
-	classification.ExternalTxnID = txn.ID
+	id := classification.ExternalTxnID
 
-	// 2. Persist the classified break and emit the classified AuditEvent
-	// (Rule 5.5 — classification is an auditable action).
-	if err := r.store.UpsertBreak(ctx, classification, statusClassified); err != nil {
-		return fmt.Errorf("remediator: persist classified break %q: %w", txn.ID, err)
-	}
-	if err := r.auditWriter.Record(ctx, audit.Classified(classification, prov)); err != nil {
-		return fmt.Errorf("remediator: audit classified break %q: %w", txn.ID, err)
-	}
-
-	// 3. Confidence/regulation gate (Rule 5.4). A regulated break, or one below
-	// the confidence threshold, is NEVER auto-remediated: it is escalated to
-	// HITL with no resolved event.
+	// Confidence/regulation gate (Rule 5.4). A regulated break, or one below the
+	// confidence threshold, is NEVER auto-remediated: it is escalated to HITL
+	// with no resolved event. (On resume this re-applies the gate to a break a
+	// crashed attempt left classified.)
 	if classification.Regulated {
 		return r.escalate(ctx, classification, prov, reasonRegulated)
 	}
@@ -156,70 +263,241 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction) e
 		return r.escalate(ctx, classification, prov, reasonLowConfidence)
 	}
 
-	// 4. Auto path. The agent only PROPOSES; Blnk DECIDES (Rule 5.3).
+	// Root-cause auto-eligibility (finding C3). Confidence and the regulated flag
+	// alone are NOT sufficient to auto-remediate: the root cause itself must be
+	// one that a single-transaction dry-run can safely clear. duplicate,
+	// missing_internal, currency_mismatch and unknown are escalated here
+	// REGARDLESS of confidence, so a high-confidence classification of an unsafe
+	// cause — even one that (incorrectly) carries a grammar-valid proposed rule —
+	// can never be auto-applied. This is a hard, model-independent backstop above
+	// the classifier's soft guidance to omit a rule for these causes.
+	if !autoEligibleRootCauses[classification.RootCause] {
+		return r.escalate(ctx, classification, prov, reasonRootCauseNotAutoEligible)
+	}
+
+	// Auto path. The agent only PROPOSES; Blnk DECIDES (Rule 5.3).
 	if classification.ProposedRule == nil {
 		return r.escalate(ctx, classification, prov, reasonMissingRule)
 	}
 
-	// Rule 5.2: never POST a rule whose Field/Operator falls outside Blnk's
-	// accepted grammar. The classifier already grammar-gates proposals; this is
-	// defense-in-depth immediately before the POST.
-	if err := classifier.ValidateRule(*classification.ProposedRule); err != nil {
-		return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonGrammarReject, err))
+	// provEv carries the classification evidence (root cause, regulated flag,
+	// rule identity) on every auto-path audit event.
+	provEv := audit.WithClassificationEvidence(prov, classification)
+
+	// M-3: reuse a rule a prior attempt already created for this break rather
+	// than creating a duplicate in Blnk. When none exists yet, propose → create
+	// → persist the created rule id atomically with its rule_created event.
+	ruleID := createdRuleID
+	if ruleID == "" {
+		// Rule 5.2: never POST a rule whose Field/Operator falls outside Blnk's
+		// accepted grammar. The classifier already grammar-gates proposals; this
+		// is defense-in-depth immediately before the POST.
+		if err := classifier.ValidateRule(*classification.ProposedRule); err != nil {
+			return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonGrammarReject, err))
+		}
+
+		// Semantic safety before any POST (finding C3): reject proposed rules that
+		// are too broad to auto-apply to a single-transaction dry-run. A
+		// grammar-valid rule can still be unsafe — a range/substring operator can
+		// match an unintended internal counterpart and falsely clear the probe —
+		// so only tight equality criteria may proceed; anything else routes to
+		// HITL.
+		if err := autoApplySafe(*classification.ProposedRule); err != nil {
+			return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonOverbroadRule, err))
+		}
+
+		// m-3: record the proposal (previously dead-code audit builder) before
+		// any POST to Blnk.
+		if err := r.auditWriter.Record(ctx, audit.RuleProposed(id, ruleRefOf(*classification.ProposedRule), classification.Confidence, provEv)); err != nil {
+			return fmt.Errorf("remediator: audit proposed rule for break %q: %w", id, err)
+		}
+
+		created, err := r.blnkClient.CreateMatchingRule(ctx, *classification.ProposedRule)
+		if err != nil {
+			return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonRuleCreateFailed, err))
+		}
+		// m-7: guard an empty rule id BEFORE probing — Blnk's instant
+		// reconciliation requires a non-empty matching_rule_ids set, and probing
+		// with [""] would be meaningless. Fail closed to HITL.
+		if created.RuleID == "" {
+			return r.escalate(ctx, classification, prov, reasonEmptyRuleID)
+		}
+		ruleID = created.RuleID
+
+		// M-3 / m-3: persist the created rule id ATOMICALLY with its rule_created
+		// audit event. Committing them together means a crash cannot leave an
+		// orphaned Blnk rule the agent has forgotten; on resume the persisted id
+		// is reused instead of creating another rule.
+		if err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
+			if e := r.store.SetCreatedRuleTx(ctx, tx, id, ruleID); e != nil {
+				return e
+			}
+			return r.auditWriter.RecordTx(ctx, tx, audit.RuleCreated(id, ruleRefOf(created), classification.Confidence, provEv))
+		}); err != nil {
+			return fmt.Errorf("remediator: persist+audit created rule for break %q: %w", id, err)
+		}
 	}
 
-	created, err := r.blnkClient.CreateMatchingRule(ctx, *classification.ProposedRule)
-	if err != nil {
-		return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonRuleCreateFailed, err))
-	}
-
-	// Re-drive a single-transaction Blnk dry-run using the freshly created
-	// rule. Blnk's InstantReconciliation requires a non-empty matching_rule_ids
-	// set, so the created rule's ID is passed explicitly.
-	cleared, reconID, err := r.blnkClient.ProbeBreak(ctx, txn, []string{created.RuleID})
+	// Deterministic re-drive: a single-transaction Blnk dry-run with the rule.
+	cleared, reconID, err := r.blnkClient.ProbeBreak(ctx, txn, []string{ruleID})
 	if err != nil {
 		return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonProbeFailed, err))
+	}
+	// m-3: record the probe outcome (previously dead-code audit builder).
+	if err := r.auditWriter.Record(ctx, audit.Probed(id, reconID, cleared, provEv)); err != nil {
+		return fmt.Errorf("remediator: audit probe for break %q: %w", id, err)
 	}
 	if !cleared {
 		return r.escalate(ctx, classification, prov, reasonNotCleared)
 	}
 
-	// 5. Blnk confirmed clearance — and only Blnk can (Rule 5.3). Build the
-	// clearance proof from the confirming reconciliation id BEFORE marking the
-	// break resolved: audit.Resolved takes a ClearanceProof (never a bare id),
-	// so a resolution is impossible to record without evidence of an actual
-	// dry-run clearance. If the arbiter reported cleared but returned no usable
-	// reconciliation id, fail closed and escalate rather than record an
-	// unprovable resolution (Rule 5.7). LLM confidence alone never resolves.
+	// Blnk confirmed clearance — and only Blnk can (Rule 5.3). Build the
+	// clearance proof from the confirming reconciliation id: audit.Resolved
+	// takes a ClearanceProof (never a bare id), so a resolution is impossible to
+	// record without evidence of an actual dry-run clearance. If the arbiter
+	// reported cleared but returned no usable reconciliation id, fail closed and
+	// escalate rather than record an unprovable resolution (Rule 5.7). LLM
+	// confidence alone never resolves.
 	proof, err := audit.NewClearanceProof(reconID, cleared)
 	if err != nil {
 		return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonNotCleared, err))
 	}
-	if err := r.store.SetBreakStatus(ctx, classification.ExternalTxnID, statusAutoResolved); err != nil {
-		return fmt.Errorf("remediator: mark break %q auto-resolved: %w", txn.ID, err)
-	}
-	// The proof's confirming recon_id is stamped onto the resolved AuditEvent's
-	// provenance, making every resolution traceable to the dry-run that cleared it.
-	if err := r.auditWriter.Record(ctx, audit.Resolved(classification.ExternalTxnID, classification.Rationale, classification.Confidence, prov, proof)); err != nil {
-		return fmt.Errorf("remediator: audit resolved break %q: %w", txn.ID, err)
+
+	// C-1: mark the break auto-resolved and record the resolved AuditEvent in
+	// ONE transaction, so an auto-resolved status can never be durable without
+	// its resolved event (nor vice versa). The proof's confirming recon_id is
+	// stamped onto the event's provenance, making every resolution traceable to
+	// the dry-run that cleared it.
+	if err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
+		if e := r.store.SetBreakStatusTx(ctx, tx, id, statusAutoResolved); e != nil {
+			return e
+		}
+		return r.auditWriter.RecordTx(ctx, tx, audit.Resolved(id, classification.Rationale, classification.Confidence, provEv, proof))
+	}); err != nil {
+		return fmt.Errorf("remediator: resolve break %q: %w", id, err)
 	}
 	return nil
 }
 
 // escalate routes a break to the human-in-the-loop queue: it marks the break
 // queued, enqueues it with the given reason, and emits an escalated AuditEvent
-// (Rule 5.5). It never records a resolved event, guaranteeing that a break the
-// agent could not auto-clear is surfaced to a human rather than left silently
-// unresolved (Rules 5.4 / 5.7).
+// — all in ONE transaction (C-2, M-4), so a queued break can never exist
+// without both its queue entry AND its audit event. It never records a resolved
+// event, guaranteeing that a break the agent could not auto-clear is surfaced
+// to a human rather than left silently unresolved (Rules 5.4 / 5.7).
 func (r *Remediator) escalate(ctx context.Context, classification model.BreakClassification, prov model.Provenance, reason string) error {
-	if err := r.store.UpsertBreak(ctx, classification, statusQueued); err != nil {
-		return fmt.Errorf("remediator: persist queued break %q: %w", classification.ExternalTxnID, err)
-	}
-	if err := r.store.EnqueueHITL(ctx, classification.ExternalTxnID, reason); err != nil {
-		return fmt.Errorf("remediator: enqueue break %q for HITL: %w", classification.ExternalTxnID, err)
-	}
-	if err := r.auditWriter.Record(ctx, audit.Escalated(classification.ExternalTxnID, reason, classification.Confidence, prov)); err != nil {
-		return fmt.Errorf("remediator: audit escalated break %q: %w", classification.ExternalTxnID, err)
+	// Sanitize a possibly-malformed confidence so both the persisted break and
+	// the escalated audit event are well-formed (the audit validator rejects a
+	// non-finite or out-of-range confidence).
+	classification.Confidence = safeConfidence(classification.Confidence)
+
+	// Enrich the escalation provenance with the classification evidence (root
+	// cause, regulated flag, proposed-rule identity) so the HITL/audit trail is
+	// self-describing rather than free-text only.
+	provEv := audit.WithClassificationEvidence(prov, classification)
+
+	if err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
+		if e := r.store.UpsertBreakTx(ctx, tx, classification, statusQueued); e != nil {
+			return e
+		}
+		if e := r.store.EnqueueHITLTx(ctx, tx, classification.ExternalTxnID, reason); e != nil {
+			return e
+		}
+		return r.auditWriter.RecordTx(ctx, tx, audit.Escalated(classification.ExternalTxnID, reason, classification.Confidence, provEv))
+	}); err != nil {
+		return fmt.Errorf("remediator: escalate break %q to HITL: %w", classification.ExternalTxnID, err)
 	}
 	return nil
+}
+
+// ruleRefOf projects a Blnk matching rule to the audit RuleRef (id + primary
+// criterion) stamped onto rule_proposed/rule_created events.
+func ruleRefOf(rule blnk.MatchingRule) audit.RuleRef {
+	ref := audit.RuleRef{ID: rule.RuleID}
+	if len(rule.Criteria) > 0 {
+		ref.Field = rule.Criteria[0].Field
+		ref.Operator = rule.Criteria[0].Operator
+	}
+	return ref
+}
+
+// autoApplySafe reports whether a grammar-valid proposed rule is tight enough to
+// be auto-applied to a single-transaction Blnk dry-run (finding C3). Blnk matches
+// the external transaction against internal transactions field-to-field and
+// ignores criteria.Value, so a non-equality operator (greater_than, less_than,
+// contains) can match an unintended internal counterpart and make the probe
+// falsely report the break cleared. Only equality criteria pin external ==
+// internal on a field, so every criterion must use the equals operator; any other
+// operator returns an error and the break is escalated to HITL instead of
+// auto-applied. The rule's grammar (non-empty criteria, allowed fields/operators)
+// is validated separately by classifier.ValidateRule before this check.
+func autoApplySafe(rule blnk.MatchingRule) error {
+	for _, c := range rule.Criteria {
+		if c.Operator != operatorEquals {
+			return fmt.Errorf("criterion on field %q uses non-equality operator %q; only %q may be auto-applied", c.Field, c.Operator, operatorEquals)
+		}
+	}
+	return nil
+}
+
+// validConfidence reports whether c is a finite probability in [0,1]. A
+// classifier that returns NaN, ±Inf, or an out-of-range value is treated as
+// malformed and fails closed to HITL (finding m-4).
+func validConfidence(c float64) bool {
+	return !math.IsNaN(c) && !math.IsInf(c, 0) && c >= 0 && c <= 1
+}
+
+// safeConfidence clamps a possibly-malformed confidence to a value the audit
+// validator accepts (finite, in [0,1]); malformed inputs collapse to 0 so an
+// escalated event can still be recorded for the break.
+func safeConfidence(c float64) float64 {
+	if !validConfidence(c) {
+		return 0
+	}
+	return c
+}
+
+// keyedMutex provides per-key mutual exclusion. It serializes concurrent Handle
+// calls for the SAME break (keyed by external transaction id) so a break is
+// never processed twice concurrently (finding M-5), while distinct breaks
+// acquire distinct keys and proceed in parallel. Entries are reference-counted
+// and deleted when the last holder releases, so the map does not grow without
+// bound over a long-running pipeline.
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*refCountedLock
+}
+
+type refCountedLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lock acquires the per-key mutex and returns a release function. Callers must
+// invoke the returned function exactly once (typically via defer).
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	if k.locks == nil {
+		k.locks = make(map[string]*refCountedLock)
+	}
+	rl, ok := k.locks[key]
+	if !ok {
+		rl = &refCountedLock{}
+		k.locks[key] = rl
+	}
+	// Register interest BEFORE releasing the guard so the entry cannot be
+	// deleted out from under a waiter.
+	rl.refs++
+	k.mu.Unlock()
+
+	rl.mu.Lock()
+	return func() {
+		rl.mu.Unlock()
+		k.mu.Lock()
+		rl.refs--
+		if rl.refs == 0 {
+			delete(k.locks, key)
+		}
+		k.mu.Unlock()
+	}
 }

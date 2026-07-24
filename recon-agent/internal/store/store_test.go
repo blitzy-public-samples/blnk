@@ -11,9 +11,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/blnkfinance/recon-agent/internal/audit"
 	"github.com/blnkfinance/recon-agent/internal/blnk"
 	"github.com/blnkfinance/recon-agent/internal/model"
 )
+
+// Compile-time proof that *Store satisfies both the audit sink (InsertAudit)
+// and the transaction-bound audit.TxSink (InsertAuditTx). The latter is what
+// makes audit.Writer.RecordTx live instead of returning ErrTxSinkUnsupported,
+// closing the dead-code path that findings C-1/C-2/M-2/M-4 depend on.
+var _ audit.TxSink = (*Store)(nil)
 
 // -----------------------------------------------------------------------------
 // Hand-rolled database/sql/driver fake.
@@ -42,10 +49,24 @@ type fakeDB struct {
 
 	execResult driver.Result
 	execErr    error
+	// execHook, when non-nil, is consulted on every Exec (autocommit or
+	// transaction-scoped). Returning a non-nil error fails that specific
+	// statement, letting a test inject a fault at a chosen point in a WithTx
+	// sequence (e.g. let the status UPDATE succeed but fail the audit INSERT) to
+	// prove the whole transaction rolls back and nothing partial is committed.
+	execHook func(query string) error
 
 	cols     []string
 	rows     [][]driver.Value
 	queryErr error
+
+	// Transaction instrumentation. WithTx exercises BeginTx/Commit/Rollback;
+	// these fields let tests inject failures and count what actually happened.
+	beginErr  error
+	commitErr error
+	begins    int
+	commits   int
+	rollbacks int
 }
 
 // execQueries returns just the SQL text of every recorded Exec call.
@@ -73,11 +94,32 @@ type fakeConn struct{ db *fakeDB }
 func (c *fakeConn) Prepare(string) (driver.Stmt, error) {
 	return nil, errors.New("prepare not supported by fake")
 }
-func (c *fakeConn) Close() error              { return nil }
-func (c *fakeConn) Begin() (driver.Tx, error) { return nil, errors.New("begin not supported by fake") }
+func (c *fakeConn) Close() error { return nil }
+
+// Begin delegates to BeginTx so both the legacy and context-aware transaction
+// entry points share one code path. database/sql invokes BeginTx (this conn
+// implements driver.ConnBeginTx), so Begin is retained only for completeness.
+func (c *fakeConn) Begin() (driver.Tx, error) {
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
+
+// BeginTx implements driver.ConnBeginTx so *sql.DB.BeginTx (used by store.WithTx)
+// hands back a fakeTx whose Commit/Rollback are counted and can be made to fail.
+func (c *fakeConn) BeginTx(_ context.Context, _ driver.TxOptions) (driver.Tx, error) {
+	c.db.begins++
+	if c.db.beginErr != nil {
+		return nil, c.db.beginErr
+	}
+	return &fakeTx{db: c.db}, nil
+}
 
 func (c *fakeConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	c.db.execs = append(c.db.execs, recordedCall{query: query, args: args})
+	if c.db.execHook != nil {
+		if err := c.db.execHook(query); err != nil {
+			return nil, err
+		}
+	}
 	if c.db.execErr != nil {
 		return nil, c.db.execErr
 	}
@@ -93,6 +135,24 @@ func (c *fakeConn) QueryContext(_ context.Context, query string, args []driver.N
 		return nil, c.db.queryErr
 	}
 	return &fakeRows{cols: c.db.cols, data: c.db.rows}, nil
+}
+
+// fakeTx is the fake driver's transaction. It records whether the store
+// committed or rolled back so atomicity tests can assert the outcome, and can
+// be made to fail its Commit to exercise WithTx's commit-error path.
+type fakeTx struct{ db *fakeDB }
+
+func (t *fakeTx) Commit() error {
+	t.db.commits++
+	if t.db.commitErr != nil {
+		return t.db.commitErr
+	}
+	return nil
+}
+
+func (t *fakeTx) Rollback() error {
+	t.db.rollbacks++
+	return nil
 }
 
 type fakeRows struct {
@@ -267,8 +327,8 @@ func TestUpsertBreakWithRule(t *testing.T) {
 		t.Fatalf("unexpected upsert SQL:\n%s", q)
 	}
 	args := fdb.execs[0].args
-	if len(args) != 6 {
-		t.Fatalf("expected 6 args, got %d", len(args))
+	if len(args) != 7 {
+		t.Fatalf("expected 7 args, got %d", len(args))
 	}
 	if args[0].Value != "ext_1" || args[1].Value != "amount_drift" || args[2].Value != 0.91 || args[3].Value != false || args[4].Value != "classified" {
 		t.Fatalf("unexpected args: %+v", args)
@@ -276,6 +336,10 @@ func TestUpsertBreakWithRule(t *testing.T) {
 	ruleArg, ok := args[5].Value.(string)
 	if !ok || !strings.Contains(ruleArg, "\"field\":\"amount\"") {
 		t.Fatalf("proposed_rule arg should be JSON string with the rule, got %#v", args[5].Value)
+	}
+	// finding m-1: the classifier's rationale is persisted (arg 7).
+	if args[6].Value != "amount drifted by fees" {
+		t.Fatalf("rationale arg should round-trip, got %#v", args[6].Value)
 	}
 }
 
@@ -345,10 +409,10 @@ func TestSetBreakStatusRowsAffectedError(t *testing.T) {
 func TestListBreaks(t *testing.T) {
 	s, fdb := newTestStore()
 	now := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
-	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "created_at", "updated_at"}
+	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "created_at", "updated_at"}
 	fdb.rows = [][]driver.Value{
-		{"ext_1", "amount_drift", 0.91, false, "auto-resolved", mustMarshal(t, sampleRule()), now, now},
-		{"ext_2", "timing", 0.42, true, "queued", nil, now, now},
+		{"ext_1", "amount_drift", 0.91, false, "auto-resolved", mustMarshal(t, sampleRule()), "amount drifted", "rule_abc", now, now},
+		{"ext_2", "timing", 0.42, true, "queued", nil, "", nil, now, now},
 	}
 	breaks, err := s.ListBreaks(context.Background())
 	if err != nil {
@@ -363,11 +427,21 @@ func TestListBreaks(t *testing.T) {
 	if breaks[0].Classification.ProposedRule == nil || breaks[0].Classification.ProposedRule.Criteria[0].Field != "amount" {
 		t.Fatalf("break0 rule not unmarshaled: %+v", breaks[0].Classification.ProposedRule)
 	}
+	// finding m-1 + M-3: rationale and created_rule_id round-trip out of storage.
+	if breaks[0].Classification.Rationale != "amount drifted" {
+		t.Fatalf("break0 rationale mismatch: %q", breaks[0].Classification.Rationale)
+	}
+	if breaks[0].CreatedRuleID != "rule_abc" {
+		t.Fatalf("break0 created_rule_id mismatch: %q", breaks[0].CreatedRuleID)
+	}
 	if !breaks[0].CreatedAt.Equal(now) {
 		t.Fatalf("break0 created_at mismatch: %v", breaks[0].CreatedAt)
 	}
 	if breaks[1].Classification.ProposedRule != nil {
 		t.Fatalf("break1 should have nil rule, got %+v", breaks[1].Classification.ProposedRule)
+	}
+	if breaks[1].CreatedRuleID != "" {
+		t.Fatalf("break1 created_rule_id should be empty (NULL), got %q", breaks[1].CreatedRuleID)
 	}
 	if !breaks[1].Classification.Regulated {
 		t.Fatal("break1 should be regulated")
@@ -384,24 +458,39 @@ func TestListBreaksQueryError(t *testing.T) {
 
 func TestListBreaksScanError(t *testing.T) {
 	s, fdb := newTestStore()
-	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "created_at", "updated_at"}
+	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "created_at", "updated_at"}
 	// confidence is a non-numeric string => Scan into *float64 fails.
 	fdb.rows = [][]driver.Value{
-		{"ext_1", "amount_drift", "not-a-float", false, "queued", nil, time.Now(), time.Now()},
+		{"ext_1", "amount_drift", "not-a-float", false, "queued", nil, "", nil, time.Now(), time.Now()},
 	}
 	if _, err := s.ListBreaks(context.Background()); err == nil {
 		t.Fatal("expected scan error")
 	}
 }
 
+// TestListBreaksBadRuleJSON asserts finding m-5's per-row isolation: a single
+// row whose proposed_rule column is not valid JSON leaves that row's
+// ProposedRule nil but does NOT fail the whole listing, so every healthy row
+// (and the HITL status page) stays readable.
 func TestListBreaksBadRuleJSON(t *testing.T) {
 	s, fdb := newTestStore()
-	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "created_at", "updated_at"}
+	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "created_at", "updated_at"}
 	fdb.rows = [][]driver.Value{
-		{"ext_1", "amount_drift", 0.9, false, "queued", []byte("{not-json"), time.Now(), time.Now()},
+		{"ext_bad", "amount_drift", 0.9, false, "queued", []byte("{not-json"), "", nil, time.Now(), time.Now()},
+		{"ext_ok", "timing", 0.5, false, "classified", mustMarshal(t, sampleRule()), "", nil, time.Now(), time.Now()},
 	}
-	if _, err := s.ListBreaks(context.Background()); err == nil {
-		t.Fatal("expected unmarshal error for bad proposed_rule JSON")
+	breaks, err := s.ListBreaks(context.Background())
+	if err != nil {
+		t.Fatalf("ListBreaks must not fail on one bad rule row (per-row isolation): %v", err)
+	}
+	if len(breaks) != 2 {
+		t.Fatalf("expected 2 breaks, got %d", len(breaks))
+	}
+	if breaks[0].Classification.ExternalTxnID != "ext_bad" || breaks[0].Classification.ProposedRule != nil {
+		t.Fatalf("bad-rule row must have nil ProposedRule, got %+v", breaks[0].Classification.ProposedRule)
+	}
+	if breaks[1].Classification.ProposedRule == nil || breaks[1].Classification.ProposedRule.Criteria[0].Field != "amount" {
+		t.Fatalf("healthy row must still parse its rule, got %+v", breaks[1].Classification.ProposedRule)
 	}
 }
 
@@ -655,11 +744,14 @@ func TestSQLSurfaceRules(t *testing.T) {
 		if strings.Contains(lower, "blnk.") {
 			t.Fatalf("Rule 5.1 violation: statement references blnk.*:\n%s", c.query)
 		}
-		// Rule 5.5: no UPDATE/DELETE may target agent_audit.
-		if strings.Contains(lower, "agent_audit") {
-			if strings.Contains(lower, "update ") || strings.Contains(lower, "delete ") {
-				t.Fatalf("Rule 5.5 violation: mutating statement targets agent_audit:\n%s", c.query)
-			}
+		// Rule 5.5: no UPDATE/DELETE may target agent_audit. Match the specific
+		// DML forms (UPDATE <table> / DELETE FROM <table>) rather than the bare
+		// keywords, so the append-only ENFORCEMENT trigger — whose definition
+		// legitimately reads "BEFORE UPDATE OR DELETE ON agent.agent_audit" — is
+		// not itself misread as a mutation of the table.
+		if strings.Contains(lower, "update agent.agent_audit") ||
+			strings.Contains(lower, "delete from agent.agent_audit") {
+			t.Fatalf("Rule 5.5 violation: mutating statement targets agent_audit:\n%s", c.query)
 		}
 	}
 
@@ -690,4 +782,349 @@ func stripSQLComments(s string) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// -----------------------------------------------------------------------------
+// Transaction API (WithTx + *Tx write methods)
+//
+// These cover the atomicity primitive the remediator uses so a break's state
+// transition and its audit event commit-or-roll-back together (findings C-1,
+// C-2, M-2, M-4 and Rule 5.3).
+// -----------------------------------------------------------------------------
+
+func TestWithTxCommitsOnSuccess(t *testing.T) {
+	s, fdb := newTestStore()
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		if err := s.UpsertBreakTx(context.Background(), tx, model.BreakClassification{ExternalTxnID: "ext_1", RootCause: model.RootCauseTiming}, "classified"); err != nil {
+			return err
+		}
+		return s.InsertAuditTx(context.Background(), tx, sampleAudit())
+	})
+	if err != nil {
+		t.Fatalf("WithTx: %v", err)
+	}
+	if fdb.begins != 1 {
+		t.Fatalf("expected 1 begin, got %d", fdb.begins)
+	}
+	if fdb.commits != 1 || fdb.rollbacks != 0 {
+		t.Fatalf("success must commit exactly once and never roll back: commits=%d rollbacks=%d", fdb.commits, fdb.rollbacks)
+	}
+	// Both writes were recorded and both are agent-schema statements.
+	if len(fdb.execs) != 2 {
+		t.Fatalf("expected 2 tx execs, got %d", len(fdb.execs))
+	}
+	if !strings.HasPrefix(fdb.execs[0].query, "INSERT INTO agent.agent_break") {
+		t.Fatalf("first tx exec should be the break upsert:\n%s", fdb.execs[0].query)
+	}
+	if !strings.HasPrefix(fdb.execs[1].query, "INSERT INTO agent.agent_audit") {
+		t.Fatalf("second tx exec should be the audit insert:\n%s", fdb.execs[1].query)
+	}
+}
+
+func TestWithTxRollsBackOnError(t *testing.T) {
+	s, fdb := newTestStore()
+	sentinel := errors.New("fn failed")
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		// A write happens, then fn returns an error: the whole tx must roll back.
+		if e := s.SetBreakStatusTx(context.Background(), tx, "ext_1", "auto-resolved"); e != nil {
+			return e
+		}
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("WithTx must surface fn's error, got %v", err)
+	}
+	if fdb.commits != 0 || fdb.rollbacks != 1 {
+		t.Fatalf("fn error must roll back and never commit: commits=%d rollbacks=%d", fdb.commits, fdb.rollbacks)
+	}
+}
+
+func TestWithTxBeginError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.beginErr = errors.New("cannot begin")
+	called := false
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected begin error")
+	}
+	if called {
+		t.Fatal("fn must not be called when BeginTx fails")
+	}
+	if fdb.commits != 0 || fdb.rollbacks != 0 {
+		t.Fatalf("no commit/rollback expected on begin failure: commits=%d rollbacks=%d", fdb.commits, fdb.rollbacks)
+	}
+}
+
+func TestWithTxCommitError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.commitErr = errors.New("commit failed")
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.InsertAuditTx(context.Background(), tx, sampleAudit())
+	})
+	if err == nil {
+		t.Fatal("expected commit error to surface")
+	}
+	if fdb.commits != 1 {
+		t.Fatalf("expected exactly 1 commit attempt, got %d", fdb.commits)
+	}
+}
+
+// TestWithTxAtomicityFaultInjection reproduces the QA fault-injection scenario
+// (FI3 / C-1): the break status UPDATE succeeds but the accompanying audit
+// INSERT fails inside the same transaction. WithTx must roll back so NEITHER
+// write is committed — a terminal status can never be persisted without its
+// audit event.
+func TestWithTxAtomicityFaultInjection(t *testing.T) {
+	s, fdb := newTestStore()
+	// Let the status update succeed, but fail the audit insert.
+	fdb.execHook = func(query string) error {
+		if strings.HasPrefix(query, "INSERT INTO agent.agent_audit") {
+			return errors.New("audit insert failed")
+		}
+		return nil
+	}
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		if e := s.SetBreakStatusTx(context.Background(), tx, "ext_1", "auto-resolved"); e != nil {
+			return e
+		}
+		return s.InsertAuditTx(context.Background(), tx, sampleAudit())
+	})
+	if err == nil {
+		t.Fatal("expected the audit-insert failure to abort the transaction")
+	}
+	if fdb.commits != 0 || fdb.rollbacks != 1 {
+		t.Fatalf("partial failure must roll back everything: commits=%d rollbacks=%d", fdb.commits, fdb.rollbacks)
+	}
+	// Both statements were attempted (the status update and the failing audit
+	// insert), but because the tx rolled back neither is durable.
+	if len(fdb.execs) != 2 {
+		t.Fatalf("expected 2 attempted execs, got %d", len(fdb.execs))
+	}
+}
+
+func TestUpsertBreakTx(t *testing.T) {
+	s, fdb := newTestStore()
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.UpsertBreakTx(context.Background(), tx, model.BreakClassification{
+			ExternalTxnID: "ext_1",
+			RootCause:     model.RootCauseAmountDrift,
+			Confidence:    0.9,
+			Rationale:     "why",
+		}, "classified")
+	})
+	if err != nil {
+		t.Fatalf("UpsertBreakTx: %v", err)
+	}
+	if len(fdb.execs) != 1 || !strings.HasPrefix(fdb.execs[0].query, "INSERT INTO agent.agent_break") {
+		t.Fatalf("unexpected tx exec: %+v", fdb.execs)
+	}
+	if len(fdb.execs[0].args) != 7 || fdb.execs[0].args[6].Value != "why" {
+		t.Fatalf("UpsertBreakTx must pass 7 args incl. rationale, got %+v", fdb.execs[0].args)
+	}
+}
+
+func TestSetBreakStatusTx(t *testing.T) {
+	s, fdb := newTestStore()
+	if err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SetBreakStatusTx(context.Background(), tx, "ext_1", "auto-resolved")
+	}); err != nil {
+		t.Fatalf("SetBreakStatusTx: %v", err)
+	}
+	if !strings.HasPrefix(fdb.execs[0].query, "UPDATE agent.agent_break SET status") {
+		t.Fatalf("unexpected SQL:\n%s", fdb.execs[0].query)
+	}
+}
+
+func TestSetBreakStatusTxNotFound(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.execResult = driver.RowsAffected(0)
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SetBreakStatusTx(context.Background(), tx, "missing", "auto-resolved")
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound to propagate out of WithTx, got %v", err)
+	}
+	// ErrNotFound from the update forces a rollback.
+	if fdb.rollbacks != 1 || fdb.commits != 0 {
+		t.Fatalf("ErrNotFound must roll back: commits=%d rollbacks=%d", fdb.commits, fdb.rollbacks)
+	}
+}
+
+func TestEnqueueHITLTx(t *testing.T) {
+	s, fdb := newTestStore()
+	if err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.EnqueueHITLTx(context.Background(), tx, "ext_2", "regulated")
+	}); err != nil {
+		t.Fatalf("EnqueueHITLTx: %v", err)
+	}
+	if !strings.HasPrefix(fdb.execs[0].query, "INSERT INTO agent.agent_hitl_queue") {
+		t.Fatalf("unexpected SQL:\n%s", fdb.execs[0].query)
+	}
+	if fdb.execs[0].args[0].Value != "ext_2" || fdb.execs[0].args[1].Value != "regulated" {
+		t.Fatalf("unexpected args: %+v", fdb.execs[0].args)
+	}
+}
+
+func TestInsertAuditTx(t *testing.T) {
+	s, fdb := newTestStore()
+	if err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.InsertAuditTx(context.Background(), tx, sampleAudit())
+	}); err != nil {
+		t.Fatalf("InsertAuditTx: %v", err)
+	}
+	q := fdb.execs[0].query
+	if !strings.HasPrefix(q, "INSERT INTO agent.agent_audit") {
+		t.Fatalf("audit tx write must be an INSERT:\n%s", q)
+	}
+	upper := strings.ToUpper(q)
+	if strings.Contains(upper, "UPDATE") || strings.Contains(upper, "DELETE") {
+		t.Fatalf("Rule 5.5: audit tx statement must not UPDATE/DELETE:\n%s", q)
+	}
+	if len(fdb.execs[0].args) != 8 {
+		t.Fatalf("expected 8 audit args, got %d", len(fdb.execs[0].args))
+	}
+}
+
+// -----------------------------------------------------------------------------
+// SetCreatedRule / SetCreatedRuleTx (finding M-3)
+// -----------------------------------------------------------------------------
+
+func TestSetCreatedRuleOK(t *testing.T) {
+	s, fdb := newTestStore()
+	if err := s.SetCreatedRule(context.Background(), "ext_1", "rule_123"); err != nil {
+		t.Fatalf("SetCreatedRule: %v", err)
+	}
+	q := fdb.execs[0].query
+	if !strings.HasPrefix(q, "UPDATE agent.agent_break SET created_rule_id") {
+		t.Fatalf("unexpected SQL:\n%s", q)
+	}
+	if fdb.execs[0].args[0].Value != "ext_1" || fdb.execs[0].args[1].Value != "rule_123" {
+		t.Fatalf("unexpected args: %+v", fdb.execs[0].args)
+	}
+}
+
+func TestSetCreatedRuleNotFound(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.execResult = driver.RowsAffected(0)
+	if err := s.SetCreatedRule(context.Background(), "missing", "r"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestSetCreatedRuleExecError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.execErr = errors.New("boom")
+	if err := s.SetCreatedRule(context.Background(), "ext_1", "r"); err == nil {
+		t.Fatal("expected exec error")
+	}
+}
+
+func TestSetCreatedRuleTx(t *testing.T) {
+	s, fdb := newTestStore()
+	if err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SetCreatedRuleTx(context.Background(), tx, "ext_1", "rule_123")
+	}); err != nil {
+		t.Fatalf("SetCreatedRuleTx: %v", err)
+	}
+	if !strings.HasPrefix(fdb.execs[0].query, "UPDATE agent.agent_break SET created_rule_id") {
+		t.Fatalf("unexpected SQL:\n%s", fdb.execs[0].query)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// LoadBreak (findings M-3, M-6 idempotency/resume)
+// -----------------------------------------------------------------------------
+
+func TestLoadBreakFound(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id"}
+	fdb.rows = [][]driver.Value{
+		{"amount_drift", 0.91, false, "auto-resolved", mustMarshal(t, sampleRule()), "why", "rule_abc"},
+	}
+	c, status, ruleID, found, err := s.LoadBreak(context.Background(), "ext_1")
+	if err != nil || !found {
+		t.Fatalf("LoadBreak: found=%v err=%v", found, err)
+	}
+	if c.ExternalTxnID != "ext_1" || c.RootCause != model.RootCauseAmountDrift || c.Confidence != 0.91 {
+		t.Fatalf("classification mismatch: %+v", c)
+	}
+	if c.Rationale != "why" {
+		t.Fatalf("rationale mismatch: %q", c.Rationale)
+	}
+	if c.ProposedRule == nil || c.ProposedRule.Criteria[0].Field != "amount" {
+		t.Fatalf("proposed rule not loaded: %+v", c.ProposedRule)
+	}
+	if status != "auto-resolved" {
+		t.Fatalf("status mismatch: %q", status)
+	}
+	if ruleID != "rule_abc" {
+		t.Fatalf("created_rule_id mismatch: %q", ruleID)
+	}
+}
+
+func TestLoadBreakNotFound(t *testing.T) {
+	s, fdb := newTestStore()
+	// No rows programmed => the underlying QueryRow.Scan returns sql.ErrNoRows,
+	// which LoadBreak maps to found=false with a nil error.
+	fdb.cols = []string{"root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id"}
+	fdb.rows = nil
+	c, status, ruleID, found, err := s.LoadBreak(context.Background(), "missing")
+	if err != nil {
+		t.Fatalf("not-found must be a nil error, got %v", err)
+	}
+	if found {
+		t.Fatal("found must be false for a missing break")
+	}
+	if status != "" || ruleID != "" || c.ExternalTxnID != "" {
+		t.Fatalf("zero values expected when not found: %+v %q %q", c, status, ruleID)
+	}
+}
+
+func TestLoadBreakNullCreatedRule(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id"}
+	fdb.rows = [][]driver.Value{
+		{"timing", 0.5, true, "queued", nil, "", nil},
+	}
+	c, status, ruleID, found, err := s.LoadBreak(context.Background(), "ext_2")
+	if err != nil || !found {
+		t.Fatalf("LoadBreak: found=%v err=%v", found, err)
+	}
+	if !c.Regulated || status != "queued" {
+		t.Fatalf("unexpected load: regulated=%v status=%q", c.Regulated, status)
+	}
+	if c.ProposedRule != nil {
+		t.Fatalf("nil proposed_rule expected, got %+v", c.ProposedRule)
+	}
+	if ruleID != "" {
+		t.Fatalf("NULL created_rule_id must map to empty string, got %q", ruleID)
+	}
+}
+
+func TestLoadBreakScanError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id"}
+	fdb.rows = [][]driver.Value{
+		{"timing", "not-a-float", true, "queued", nil, "", nil},
+	}
+	if _, _, _, _, err := s.LoadBreak(context.Background(), "ext_2"); err == nil {
+		t.Fatal("expected scan error")
+	}
+}
+
+func TestLoadBreakBadRuleJSON(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id"}
+	fdb.rows = [][]driver.Value{
+		{"timing", 0.5, false, "classified", []byte("{not-json"), "", nil},
+	}
+	// LoadBreak feeds the resume/idempotency path; a corrupt persisted rule must
+	// surface as an error there (unlike ListBreaks, which isolates per row for
+	// display), so the remediator never resumes from a corrupt rule.
+	if _, _, _, _, err := s.LoadBreak(context.Background(), "ext_2"); err == nil {
+		t.Fatal("expected unmarshal error for bad proposed_rule JSON")
+	}
 }
