@@ -1,17 +1,8 @@
-// Package hitl — decision handler.
-//
-// This file provides the (*Server).handleDecision handler referenced by
-// server.go and bound to POST "/decisions". It applies a human reviewer's
-// decision (accept / re_drive / reject) to a queued break. Every decision —
-// whatever its verb — writes exactly one append-only AuditEvent (Rule 5.5,
-// Gate 13). accept and reject drain the break from the HITL queue; re_drive
-// re-tests clearance through a Blnk dry-run (start-instant, dry_run=true) so
-// that Blnk, never the agent, decides whether the break actually cleared
-// (Rule 5.3). It reaches Blnk only through the injected prober (internal/blnk),
-// never a Blnk internal package (Rule 5.1).
 package hitl
 
 import (
+	"context"
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -19,30 +10,29 @@ import (
 	"github.com/blnkfinance/recon-agent/internal/audit"
 	"github.com/blnkfinance/recon-agent/internal/blnk"
 	"github.com/blnkfinance/recon-agent/internal/model"
+	"github.com/blnkfinance/recon-agent/internal/store"
 )
 
-// Break lifecycle statuses written by HITL decisions. They align with the
-// statuses the remediator produces and the status page renders.
+// Break statuses set by human decisions.
 const (
-	statusAccepted     = "accepted"
-	statusRejected     = "rejected"
-	statusReDriven     = "re_driven"
-	statusAutoResolved = "auto-resolved"
+	statusAccepted = "accepted"
+	statusReDriven = "re_driven"
+	statusRejected = "rejected"
 )
 
-// handleDecision applies a reviewer's accept / re_drive / reject decision to a
-// queued break and records exactly one append-only AuditEvent for it.
+// handleDecision binds a model.HITLDecision (JSON body or HTML form) and
+// dispatches it to the accept/re_drive/reject handlers. Each successful decision
+// writes exactly one AuditEvent via the append-only audit writer (Gate 13,
+// Rule 5.5). Unknown decisions and blank ids are rejected before any state
+// change or audit write.
 func (s *Server) handleDecision(c *gin.Context) {
-	d := s.bindDecision(c)
-
-	if d.ExternalTxnID == "" {
-		s.respondError(c, http.StatusBadRequest, "external_txn_id is required")
+	d, err := bindDecision(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	// Reject any verb outside the closed HITL set before mutating state or
-	// building an event, so an arbitrary decision can never be recorded.
-	if !audit.IsValidDecision(d.Decision) {
-		s.respondError(c, http.StatusBadRequest, "decision must be one of: accept, re_drive, reject")
+	if d.ExternalTxnID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "external_txn_id is required"})
 		return
 	}
 	if d.Reviewer == "" {
@@ -50,104 +40,103 @@ func (s *Server) handleDecision(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	// llmModel is config-driven (Rule 5.6) and recorded on the decision's provenance.
-	prov := model.Provenance{Model: s.llmModel}
-	result := gin.H{"external_txn_id": d.ExternalTxnID, "decision": d.Decision, "reviewer": d.Reviewer}
-
+	var handleErr error
 	switch d.Decision {
 	case audit.DecisionAccept:
-		if err := s.st.SetBreakStatus(ctx, d.ExternalTxnID, statusAccepted); err != nil {
-			s.respondError(c, http.StatusInternalServerError, "set status: "+err.Error())
-			return
-		}
-		if err := s.st.DequeueHITL(ctx, d.ExternalTxnID); err != nil {
-			s.respondError(c, http.StatusInternalServerError, "dequeue: "+err.Error())
-			return
-		}
-	case audit.DecisionReject:
-		if err := s.st.SetBreakStatus(ctx, d.ExternalTxnID, statusRejected); err != nil {
-			s.respondError(c, http.StatusInternalServerError, "set status: "+err.Error())
-			return
-		}
-		if err := s.st.DequeueHITL(ctx, d.ExternalTxnID); err != nil {
-			s.respondError(c, http.StatusInternalServerError, "dequeue: "+err.Error())
-			return
-		}
+		handleErr = s.accept(ctx, d)
 	case audit.DecisionReDrive:
-		// Re-test clearance via a Blnk dry-run. Blnk is the sole arbiter of
-		// clearance (Rule 5.3); the confirming reconciliation id is recorded on
-		// the decision's provenance.
-		cleared, reconID, err := s.bc.ProbeBreak(ctx, blnk.ExternalTransaction{ID: d.ExternalTxnID}, nil)
-		if err != nil {
-			s.respondError(c, http.StatusBadGateway, "re_drive probe failed: "+err.Error())
+		handleErr = s.reDrive(ctx, d)
+	case audit.DecisionReject:
+		handleErr = s.reject(ctx, d)
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown decision: " + d.Decision})
+		return
+	}
+
+	if handleErr != nil {
+		if errors.Is(handleErr, store.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": handleErr.Error()})
 			return
 		}
-		prov.ReconID = reconID
-		result["cleared"] = cleared
-		result["recon_id"] = reconID
-		if cleared {
-			// Only a Blnk dry-run may clear a break; drain it from the queue.
-			if err := s.st.SetBreakStatus(ctx, d.ExternalTxnID, statusAutoResolved); err != nil {
-				s.respondError(c, http.StatusInternalServerError, "set status: "+err.Error())
-				return
-			}
-			if err := s.st.DequeueHITL(ctx, d.ExternalTxnID); err != nil {
-				s.respondError(c, http.StatusInternalServerError, "dequeue: "+err.Error())
-				return
-			}
-		} else {
-			// Still unmatched: keep the break under human review, recording the
-			// re_drive attempt in its status.
-			if err := s.st.SetBreakStatus(ctx, d.ExternalTxnID, statusReDriven); err != nil {
-				s.respondError(c, http.StatusInternalServerError, "set status: "+err.Error())
-				return
-			}
-		}
-	}
-
-	// Every decision emits exactly one append-only AuditEvent (Rule 5.5,
-	// Gate 13). audit.Decision maps the verb to its past-tense action and
-	// records the reviewer as the actor; IsValidDecision above guarantees the
-	// verb is recordable.
-	if err := s.aud.Record(ctx, audit.Decision(d, prov)); err != nil {
-		s.respondError(c, http.StatusInternalServerError, "record decision audit: "+err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"error": handleErr.Error()})
 		return
 	}
 
-	// Browser form posts are redirected back to the status page; JSON API
-	// clients receive a JSON acknowledgement.
-	if isJSON(c) {
-		result["status"] = "ok"
-		c.JSON(http.StatusOK, result)
-		return
-	}
-	c.Redirect(http.StatusSeeOther, "/")
+	s.respondDecision(c, d)
 }
 
-// bindDecision reads a HITLDecision from a JSON body or from posted form fields,
-// so both the status-page form controls and JSON API clients are supported.
-func (s *Server) bindDecision(c *gin.Context) model.HITLDecision {
+// bindDecision reads a HITLDecision from a JSON body (Content-Type
+// application/json) or, otherwise, from posted form fields.
+func bindDecision(c *gin.Context) (model.HITLDecision, error) {
 	var d model.HITLDecision
-	if isJSON(c) {
-		_ = c.ShouldBindJSON(&d)
-		return d
+	if c.ContentType() == "application/json" {
+		if err := c.ShouldBindJSON(&d); err != nil {
+			return model.HITLDecision{}, err
+		}
+		return d, nil
 	}
 	d.ExternalTxnID = c.PostForm("external_txn_id")
 	d.Decision = c.PostForm("decision")
 	d.Reviewer = c.PostForm("reviewer")
 	d.Note = c.PostForm("note")
-	return d
+	return d, nil
 }
 
-// respondError writes an error as JSON for API clients or as plain text for
-// browser posts.
-func (s *Server) respondError(c *gin.Context, code int, msg string) {
-	if isJSON(c) {
-		c.JSON(code, gin.H{"error": msg})
+// respondDecision replies with JSON for API clients and a 303 redirect back to
+// the status page for browser form submissions.
+func (s *Server) respondDecision(c *gin.Context, d model.HITLDecision) {
+	if c.ContentType() == "application/json" {
+		c.JSON(http.StatusOK, gin.H{
+			"external_txn_id": d.ExternalTxnID,
+			"decision":        d.Decision,
+			"status":          "recorded",
+		})
 		return
 	}
-	c.String(code, msg)
+	c.Redirect(http.StatusSeeOther, "/")
 }
 
-// isJSON reports whether the request carries a JSON body.
-func isJSON(c *gin.Context) bool { return c.ContentType() == "application/json" }
+// accept marks the break resolved-by-human, drains it from the HITL queue, and
+// records an `accepted` audit event.
+func (s *Server) accept(ctx context.Context, d model.HITLDecision) error {
+	if err := s.st.SetBreakStatus(ctx, d.ExternalTxnID, statusAccepted); err != nil {
+		return err
+	}
+	if err := s.st.DequeueHITL(ctx, d.ExternalTxnID); err != nil {
+		return err
+	}
+	return s.aud.Record(ctx, audit.Decision(d, model.Provenance{Model: s.llmModel}))
+}
+
+// reDrive re-tests clearance by re-invoking a Blnk dry-run probe (the
+// deterministic arbiter, Rule 5.3), updates status, drains the queue only when
+// Blnk confirms clearance, and records a `re_driven` audit event carrying the
+// recon_id. On probe error it fails closed (Rule 5.7): no state change, no audit
+// event, error surfaced to the caller.
+func (s *Server) reDrive(ctx context.Context, d model.HITLDecision) error {
+	cleared, reconID, err := s.bc.ProbeBreak(ctx, blnk.ExternalTransaction{ID: d.ExternalTxnID}, nil)
+	if err != nil {
+		return err
+	}
+	if err := s.st.SetBreakStatus(ctx, d.ExternalTxnID, statusReDriven); err != nil {
+		return err
+	}
+	if cleared {
+		if err := s.st.DequeueHITL(ctx, d.ExternalTxnID); err != nil {
+			return err
+		}
+	}
+	return s.aud.Record(ctx, audit.Decision(d, model.Provenance{Model: s.llmModel, ReconID: reconID}))
+}
+
+// reject marks the break closed, drains it from the HITL queue, and records a
+// `rejected` audit event.
+func (s *Server) reject(ctx context.Context, d model.HITLDecision) error {
+	if err := s.st.SetBreakStatus(ctx, d.ExternalTxnID, statusRejected); err != nil {
+		return err
+	}
+	if err := s.st.DequeueHITL(ctx, d.ExternalTxnID); err != nil {
+		return err
+	}
+	return s.aud.Record(ctx, audit.Decision(d, model.Provenance{Model: s.llmModel}))
+}
