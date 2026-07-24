@@ -1175,3 +1175,400 @@ func TestLoadBreakBadRuleJSON(t *testing.T) {
 		t.Fatal("expected unmarshal error for bad proposed_rule JSON")
 	}
 }
+
+// -----------------------------------------------------------------------------
+// SaveBreakTxnTx — persist the FULL external transaction (finding C-03)
+// -----------------------------------------------------------------------------
+
+func TestSaveBreakTxnTx(t *testing.T) {
+	s, fdb := newTestStore()
+	txn := &blnk.ExternalTransaction{ID: "ext_1", Amount: 42.5, Currency: "USD", Reference: "INV-1"}
+	if err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SaveBreakTxnTx(context.Background(), tx, "ext_1", txn)
+	}); err != nil {
+		t.Fatalf("SaveBreakTxnTx: %v", err)
+	}
+	q := fdb.execs[0].query
+	if !strings.HasPrefix(q, "UPDATE agent.agent_break SET txn") {
+		t.Fatalf("unexpected SQL:\n%s", q)
+	}
+	// Rule 5.5 does not apply here (this is agent_break, not agent_audit), but
+	// the write must be scoped to the agent schema (Rule 5.1).
+	if !strings.Contains(q, "agent.agent_break") {
+		t.Fatalf("SaveBreakTxnTx must target agent.agent_break:\n%s", q)
+	}
+	if fdb.execs[0].args[0].Value != "ext_1" {
+		t.Fatalf("first arg must be the external txn id, got %+v", fdb.execs[0].args[0])
+	}
+	// The second arg is the JSON encoding of the full transaction — proving the
+	// COMPLETE line is persisted so a later re_drive can reconstruct it (C-03),
+	// not just the id.
+	encoded, ok := fdb.execs[0].args[1].Value.(string)
+	if !ok {
+		t.Fatalf("txn arg must be a JSON string, got %T", fdb.execs[0].args[1].Value)
+	}
+	var round blnk.ExternalTransaction
+	if err := json.Unmarshal([]byte(encoded), &round); err != nil {
+		t.Fatalf("txn arg is not valid JSON: %v", err)
+	}
+	if round.ID != "ext_1" || round.Amount != 42.5 || round.Currency != "USD" || round.Reference != "INV-1" {
+		t.Fatalf("persisted txn lost fields: %+v", round)
+	}
+}
+
+func TestSaveBreakTxnTxNilStoresNull(t *testing.T) {
+	s, fdb := newTestStore()
+	if err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SaveBreakTxnTx(context.Background(), tx, "ext_1", nil)
+	}); err != nil {
+		t.Fatalf("SaveBreakTxnTx(nil): %v", err)
+	}
+	if fdb.execs[0].args[1].Value != nil {
+		t.Fatalf("nil txn must store SQL NULL, got %+v", fdb.execs[0].args[1].Value)
+	}
+}
+
+func TestSaveBreakTxnTxNotFound(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.execResult = driver.RowsAffected(0)
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SaveBreakTxnTx(context.Background(), tx, "missing", &blnk.ExternalTransaction{ID: "missing"})
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound when no break row exists, got %v", err)
+	}
+	if fdb.rollbacks != 1 || fdb.commits != 0 {
+		t.Fatalf("ErrNotFound must roll back: commits=%d rollbacks=%d", fdb.commits, fdb.rollbacks)
+	}
+}
+
+func TestSaveBreakTxnTxExecError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.execErr = errors.New("boom")
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SaveBreakTxnTx(context.Background(), tx, "ext_1", &blnk.ExternalTransaction{ID: "ext_1"})
+	})
+	if err == nil {
+		t.Fatal("expected exec error to propagate")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// LoadBreakContext — durable re-drive context (finding C-03)
+// -----------------------------------------------------------------------------
+
+func TestLoadBreakContextFound(t *testing.T) {
+	s, fdb := newTestStore()
+	txn := &blnk.ExternalTransaction{ID: "ext_1", Amount: 100, Currency: "EUR", Reference: "R-1"}
+	fdb.cols = []string{"status", "txn", "created_rule_id"}
+	fdb.rows = [][]driver.Value{{"queued", mustMarshal(t, txn), "rule_abc"}}
+
+	status, gotTxn, ruleIDs, found, err := s.LoadBreakContext(context.Background(), "ext_1")
+	if err != nil || !found {
+		t.Fatalf("LoadBreakContext: found=%v err=%v", found, err)
+	}
+	if status != "queued" {
+		t.Fatalf("status = %q, want queued", status)
+	}
+	if gotTxn == nil || gotTxn.ID != "ext_1" || gotTxn.Amount != 100 || gotTxn.Currency != "EUR" || gotTxn.Reference != "R-1" {
+		t.Fatalf("txn not reconstructed in full: %+v", gotTxn)
+	}
+	// The applicable-rule set is derived from created_rule_id, so a re_drive
+	// probes the same rule the auto-remediation created (C-03).
+	if len(ruleIDs) != 1 || ruleIDs[0] != "rule_abc" {
+		t.Fatalf("applicable rule ids = %v, want [rule_abc]", ruleIDs)
+	}
+}
+
+func TestLoadBreakContextNoTxnNoRule(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"status", "txn", "created_rule_id"}
+	fdb.rows = [][]driver.Value{{"queued", nil, nil}}
+
+	status, gotTxn, ruleIDs, found, err := s.LoadBreakContext(context.Background(), "ext_2")
+	if err != nil || !found {
+		t.Fatalf("LoadBreakContext: found=%v err=%v", found, err)
+	}
+	if status != "queued" {
+		t.Fatalf("status = %q, want queued", status)
+	}
+	// A queued break with neither a persisted transaction nor a created rule
+	// yields empty context, so the re_drive handler fails closed (C-03) instead
+	// of probing Blnk with an invalid rule-less request.
+	if gotTxn != nil {
+		t.Fatalf("txn must be nil when NULL, got %+v", gotTxn)
+	}
+	if len(ruleIDs) != 0 {
+		t.Fatalf("rule ids must be empty when created_rule_id is NULL, got %v", ruleIDs)
+	}
+}
+
+func TestLoadBreakContextBlankCreatedRule(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"status", "txn", "created_rule_id"}
+	// A present-but-blank created_rule_id must NOT yield an applicable rule.
+	fdb.rows = [][]driver.Value{{"queued", nil, "   "}}
+
+	_, _, ruleIDs, found, err := s.LoadBreakContext(context.Background(), "ext_3")
+	if err != nil || !found {
+		t.Fatalf("LoadBreakContext: found=%v err=%v", found, err)
+	}
+	if len(ruleIDs) != 0 {
+		t.Fatalf("blank created_rule_id must not produce a rule id, got %v", ruleIDs)
+	}
+}
+
+func TestLoadBreakContextNotFound(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"status", "txn", "created_rule_id"}
+	fdb.rows = nil // QueryRow.Scan => sql.ErrNoRows => found=false, nil error
+	status, gotTxn, ruleIDs, found, err := s.LoadBreakContext(context.Background(), "missing")
+	if err != nil {
+		t.Fatalf("not-found must be a nil error, got %v", err)
+	}
+	if found || status != "" || gotTxn != nil || ruleIDs != nil {
+		t.Fatalf("zero values expected when not found: status=%q txn=%+v ids=%v found=%v", status, gotTxn, ruleIDs, found)
+	}
+}
+
+func TestLoadBreakContextQueryError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.queryErr = errors.New("db down")
+	if _, _, _, _, err := s.LoadBreakContext(context.Background(), "ext_1"); err == nil {
+		t.Fatal("expected query error to surface")
+	}
+}
+
+func TestLoadBreakContextBadTxnJSON(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"status", "txn", "created_rule_id"}
+	fdb.rows = [][]driver.Value{{"queued", []byte("{not-json"), nil}}
+	if _, _, _, _, err := s.LoadBreakContext(context.Background(), "ext_1"); err == nil {
+		t.Fatal("expected unmarshal error for corrupt persisted txn JSON")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// SetBreakStatusIfQueuedTx — queued-only CAS (finding C-04)
+// -----------------------------------------------------------------------------
+
+func TestSetBreakStatusIfQueuedTxOK(t *testing.T) {
+	s, fdb := newTestStore()
+	// Default exec result is RowsAffected(1): the CAS matched a queued row.
+	if err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SetBreakStatusIfQueuedTx(context.Background(), tx, "ext_1", "accepted")
+	}); err != nil {
+		t.Fatalf("SetBreakStatusIfQueuedTx: %v", err)
+	}
+	q := fdb.execs[0].query
+	if !strings.HasPrefix(q, "UPDATE agent.agent_break SET status") {
+		t.Fatalf("unexpected SQL:\n%s", q)
+	}
+	// The CAS predicate must pin the current status to 'queued' ($3).
+	if len(fdb.execs[0].args) != 3 || fdb.execs[0].args[0].Value != "ext_1" ||
+		fdb.execs[0].args[1].Value != "accepted" || fdb.execs[0].args[2].Value != statusQueued {
+		t.Fatalf("CAS args must be (id, newStatus, 'queued'), got %+v", fdb.execs[0].args)
+	}
+	if fdb.commits != 1 {
+		t.Fatalf("successful CAS must commit once, got commits=%d", fdb.commits)
+	}
+}
+
+func TestSetBreakStatusIfQueuedTxNotFound(t *testing.T) {
+	s, fdb := newTestStore()
+	// CAS matches no row (0 affected) AND the follow-up existence probe finds no
+	// row => the break does not exist => ErrNotFound.
+	fdb.execResult = driver.RowsAffected(0)
+	fdb.cols = []string{"?column?"}
+	fdb.rows = nil
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SetBreakStatusIfQueuedTx(context.Background(), tx, "missing", "accepted")
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	if fdb.rollbacks != 1 || fdb.commits != 0 {
+		t.Fatalf("ErrNotFound must roll back: commits=%d rollbacks=%d", fdb.commits, fdb.rollbacks)
+	}
+}
+
+func TestSetBreakStatusIfQueuedTxConflict(t *testing.T) {
+	s, fdb := newTestStore()
+	// CAS matches no row (0 affected) BUT the existence probe finds the row =>
+	// the break exists but is no longer queued => ErrConflict (terminal/replay).
+	fdb.execResult = driver.RowsAffected(0)
+	fdb.cols = []string{"?column?"}
+	fdb.rows = [][]driver.Value{{int64(1)}}
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SetBreakStatusIfQueuedTx(context.Background(), tx, "ext_1", "accepted")
+	})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected ErrConflict for a non-queued break, got %v", err)
+	}
+	if fdb.rollbacks != 1 || fdb.commits != 0 {
+		t.Fatalf("ErrConflict must roll back: commits=%d rollbacks=%d", fdb.commits, fdb.rollbacks)
+	}
+}
+
+func TestSetBreakStatusIfQueuedTxExecError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.execErr = errors.New("boom")
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SetBreakStatusIfQueuedTx(context.Background(), tx, "ext_1", "accepted")
+	})
+	if err == nil {
+		t.Fatal("expected exec error to propagate")
+	}
+}
+
+func TestSetBreakStatusIfQueuedTxRowsAffectedError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.execResult = errResult{}
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SetBreakStatusIfQueuedTx(context.Background(), tx, "ext_1", "accepted")
+	})
+	if err == nil {
+		t.Fatal("expected RowsAffected error to propagate")
+	}
+}
+
+func TestSetBreakStatusIfQueuedTxExistenceProbeError(t *testing.T) {
+	s, fdb := newTestStore()
+	// CAS matches no row, then the existence probe query itself fails.
+	fdb.execResult = driver.RowsAffected(0)
+	fdb.queryErr = errors.New("probe query failed")
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.SetBreakStatusIfQueuedTx(context.Background(), tx, "ext_1", "accepted")
+	})
+	if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrConflict) {
+		t.Fatalf("existence-probe failure must surface the raw error, got %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// RequireQueuedTx — lock+confirm still queued (finding C-04)
+// -----------------------------------------------------------------------------
+
+func TestRequireQueuedTxOK(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"status"}
+	fdb.rows = [][]driver.Value{{"queued"}}
+	if err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.RequireQueuedTx(context.Background(), tx, "ext_1")
+	}); err != nil {
+		t.Fatalf("RequireQueuedTx: %v", err)
+	}
+	// It must lock the row (SELECT ... FOR UPDATE) and not mutate anything.
+	if len(fdb.queries) != 1 || !strings.Contains(fdb.queries[0].query, "FOR UPDATE") {
+		t.Fatalf("RequireQueuedTx must SELECT ... FOR UPDATE, got %+v", fdb.queries)
+	}
+	if len(fdb.execs) != 0 {
+		t.Fatalf("RequireQueuedTx must not execute any write, got %+v", fdb.execs)
+	}
+}
+
+func TestRequireQueuedTxNotFound(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"status"}
+	fdb.rows = nil
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.RequireQueuedTx(context.Background(), tx, "missing")
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestRequireQueuedTxConflict(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"status"}
+	fdb.rows = [][]driver.Value{{"auto-resolved"}}
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.RequireQueuedTx(context.Background(), tx, "ext_1")
+	})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected ErrConflict for a non-queued break, got %v", err)
+	}
+}
+
+func TestRequireQueuedTxQueryError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.queryErr = errors.New("db down")
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.RequireQueuedTx(context.Background(), tx, "ext_1")
+	})
+	if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrConflict) {
+		t.Fatalf("query failure must surface the raw error, got %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// DequeueHITLTx — transaction-bound, idempotent queue drain (finding C-04)
+// -----------------------------------------------------------------------------
+
+func TestDequeueHITLTx(t *testing.T) {
+	s, fdb := newTestStore()
+	if err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.DequeueHITLTx(context.Background(), tx, "ext_1")
+	}); err != nil {
+		t.Fatalf("DequeueHITLTx: %v", err)
+	}
+	q := fdb.execs[0].query
+	if !strings.HasPrefix(q, "DELETE FROM agent.agent_hitl_queue") {
+		t.Fatalf("unexpected SQL:\n%s", q)
+	}
+	if fdb.execs[0].args[0].Value != "ext_1" {
+		t.Fatalf("unexpected args: %+v", fdb.execs[0].args)
+	}
+	if fdb.commits != 1 {
+		t.Fatalf("DequeueHITLTx must commit within the tx, got commits=%d", fdb.commits)
+	}
+}
+
+func TestDequeueHITLTxExecError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.execErr = errors.New("delete boom")
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.DequeueHITLTx(context.Background(), tx, "ext_1")
+	})
+	if err == nil {
+		t.Fatal("expected exec error to propagate and roll back")
+	}
+	if fdb.rollbacks != 1 || fdb.commits != 0 {
+		t.Fatalf("exec error must roll back: commits=%d rollbacks=%d", fdb.commits, fdb.rollbacks)
+	}
+}
+
+// TestDecisionAtomicityFaultInjection reproduces, at the store layer, the exact
+// HITL fault the review flagged (C-04): a queued break's terminal status UPDATE
+// (the queued-only CAS) and its queue-drain DELETE succeed, but the accompanying
+// audit INSERT fails. WithTx must roll everything back — no status change, no
+// dequeue, no audit — so a decision is all-or-nothing.
+func TestDecisionAtomicityFaultInjection(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.execHook = func(query string) error {
+		if strings.HasPrefix(query, "INSERT INTO agent.agent_audit") {
+			return errors.New("audit insert failed")
+		}
+		return nil
+	}
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		if e := s.SetBreakStatusIfQueuedTx(context.Background(), tx, "ext_1", "accepted"); e != nil {
+			return e
+		}
+		if e := s.DequeueHITLTx(context.Background(), tx, "ext_1"); e != nil {
+			return e
+		}
+		return s.InsertAuditTx(context.Background(), tx, sampleAudit())
+	})
+	if err == nil {
+		t.Fatal("expected the audit-insert failure to abort the decision")
+	}
+	if fdb.commits != 0 || fdb.rollbacks != 1 {
+		t.Fatalf("partial decision failure must roll back everything: commits=%d rollbacks=%d", fdb.commits, fdb.rollbacks)
+	}
+	// All three statements were attempted, but none is durable.
+	if len(fdb.execs) != 3 {
+		t.Fatalf("expected 3 attempted execs (CAS, dequeue, audit), got %d", len(fdb.execs))
+	}
+}

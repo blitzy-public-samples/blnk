@@ -33,6 +33,21 @@ var schemaSQL string
 // exist.
 var ErrNotFound = errors.New("store: record not found")
 
+// ErrConflict is returned when a state transition is attempted against a break
+// that is not in the expected precondition state. For the HITL decision path
+// this means a break that is no longer queued (already accepted / rejected /
+// re-driven, or auto-resolved by the agent). It powers the queued-only
+// compare-and-set (CAS) that makes a human decision idempotent and rejects a
+// terminal or replayed decision (finding C-04) rather than silently
+// overwriting a settled outcome.
+var ErrConflict = errors.New("store: break is not in the expected (queued) state")
+
+// statusQueued is the single lifecycle status from which a HITL decision may
+// transition a break (finding C-04). It MUST match the value the remediator
+// writes when it escalates a break to human review and the value the HITL layer
+// treats as "awaiting a human decision".
+const statusQueued = "queued"
+
 // Break is one external break under management as persisted in
 // agent.agent_break. It carries the classifier's verdict plus the agent's
 // current lifecycle status and timestamps.
@@ -247,6 +262,78 @@ func (s *Store) SetBreakStatusTx(ctx context.Context, tx *sql.Tx, externalTxnID,
 	return setBreakStatus(ctx, tx, externalTxnID, status)
 }
 
+const setBreakStatusIfQueuedSQL = `UPDATE agent.agent_break SET status = $2, updated_at = now() WHERE external_txn_id = $1 AND status = $3`
+
+// SetBreakStatusIfQueuedTx transitions a break to status inside the caller's
+// transaction, but ONLY when the break is currently queued — a compare-and-set
+// (CAS). It returns:
+//   - ErrNotFound when no break with externalTxnID exists;
+//   - ErrConflict when the break exists but is no longer queued (already
+//     decided, re-driven, or auto-resolved), so a terminal or replayed HITL
+//     decision is rejected rather than overwriting a settled outcome;
+//   - nil when the queued break was transitioned.
+//
+// Combined with WithTx and a transaction-bound audit write, this is the atomic,
+// idempotent, terminal-safe primitive the HITL decision handlers use so a human
+// decision either commits in full (status + queue drain + audit) or not at all,
+// and can never mutate an already-terminal break (finding C-04).
+func (s *Store) SetBreakStatusIfQueuedTx(ctx context.Context, tx *sql.Tx, externalTxnID, status string) error {
+	res, err := tx.ExecContext(ctx, setBreakStatusIfQueuedSQL, externalTxnID, status, statusQueued)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// The CAS matched no row: either the break does not exist, or it exists
+		// but is no longer queued. Distinguish the two — in the SAME transaction,
+		// so the check is consistent with the (failed) update — so the caller can
+		// map to 404 vs 409.
+		return existsThenConflict(ctx, tx, externalTxnID)
+	}
+	return nil
+}
+
+// RequireQueuedTx verifies, inside the caller's transaction and holding a row
+// lock (SELECT ... FOR UPDATE), that the break is currently queued WITHOUT
+// changing its status. It returns ErrNotFound when the break does not exist and
+// ErrConflict when it is no longer queued. The re-drive handler uses it on the
+// "dry-run did not clear" path to record the re-drive audit event while leaving
+// the break queued (still re-drivable), guarding against a concurrent decision
+// that settled the break between the probe and the commit (finding C-04).
+func (s *Store) RequireQueuedTx(ctx context.Context, tx *sql.Tx, externalTxnID string) error {
+	const q = `SELECT status FROM agent.agent_break WHERE external_txn_id = $1 FOR UPDATE`
+	var status string
+	if err := tx.QueryRowContext(ctx, q, externalTxnID).Scan(&status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if status != statusQueued {
+		return ErrConflict
+	}
+	return nil
+}
+
+// existsThenConflict returns ErrNotFound when no break with externalTxnID
+// exists and ErrConflict otherwise. It is the shared "distinguish 404 from a
+// state conflict" helper for the queued-only CAS, run inside the caller's
+// transaction.
+func existsThenConflict(ctx context.Context, tx *sql.Tx, externalTxnID string) error {
+	const q = `SELECT 1 FROM agent.agent_break WHERE external_txn_id = $1`
+	var one int
+	if err := tx.QueryRowContext(ctx, q, externalTxnID).Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	return ErrConflict
+}
+
 const setCreatedRuleSQL = `UPDATE agent.agent_break SET created_rule_id = $2, updated_at = now() WHERE external_txn_id = $1`
 
 // setCreatedRule is the single definition of the created-rule-id write, shared
@@ -315,6 +402,81 @@ WHERE external_txn_id = $1`
 		createdRuleID = crid.String
 	}
 	return c, status, createdRuleID, true, nil
+}
+
+const saveBreakTxnSQL = `UPDATE agent.agent_break SET txn = $2, updated_at = now() WHERE external_txn_id = $1`
+
+// SaveBreakTxnTx persists the FULL external transaction for a break inside the
+// caller's transaction (finding C-03). The remediator calls it right after it
+// upserts a break row so the complete transaction line is durable and a later
+// HITL re-drive can reconstruct a valid Blnk dry-run payload — the whole
+// transaction plus a non-empty matching-rule-id set — instead of probing with
+// only an id and nil rules. Because it runs in the same transaction as the
+// escalation, the persisted transaction commits atomically with the queued
+// break. A nil txn stores SQL NULL. It returns ErrNotFound when no break row
+// exists to attach the transaction to.
+func (s *Store) SaveBreakTxnTx(ctx context.Context, tx *sql.Tx, externalTxnID string, txn *blnk.ExternalTransaction) error {
+	var encoded any
+	if txn != nil {
+		b, err := json.Marshal(txn)
+		if err != nil {
+			return err
+		}
+		encoded = string(b)
+	}
+	res, err := tx.ExecContext(ctx, saveBreakTxnSQL, externalTxnID, encoded)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// LoadBreakContext returns the durable context a HITL re-drive needs to re-test
+// a break against Blnk (finding C-03): the break's current lifecycle status,
+// the FULL persisted external transaction, and the set of applicable Blnk
+// matching-rule ids to probe with. found is false (with a nil error) when no
+// such break exists.
+//
+// The applicable rule-id set is derived from created_rule_id: when the agent
+// created a Blnk matching rule for the break (the break was probed against that
+// rule during auto-remediation and escalated because the dry-run did not clear
+// it — e.g. a timing break whose internal counterpart had not yet posted), a
+// re-drive re-tests the same transaction against that same rule. A break with
+// no created rule yields an empty applicable-rule set, and the re-drive handler
+// fails closed rather than submitting an invalid rule-less probe (which Blnk's
+// start-instant rejects). The txn is nil when none was persisted, which the
+// handler likewise treats as insufficient context to re-drive.
+func (s *Store) LoadBreakContext(ctx context.Context, externalTxnID string) (status string, txn *blnk.ExternalTransaction, ruleIDs []string, found bool, err error) {
+	const q = `SELECT status, txn, created_rule_id FROM agent.agent_break WHERE external_txn_id = $1`
+	var (
+		txnJSON []byte
+		crid    sql.NullString
+	)
+	row := s.db.QueryRowContext(ctx, q, externalTxnID)
+	if err = row.Scan(&status, &txnJSON, &crid); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil, nil, false, nil
+		}
+		return "", nil, nil, false, err
+	}
+	if len(txnJSON) > 0 {
+		var t blnk.ExternalTransaction
+		if err = json.Unmarshal(txnJSON, &t); err != nil {
+			return "", nil, nil, false, err
+		}
+		txn = &t
+	}
+	if crid.Valid && strings.TrimSpace(crid.String) != "" {
+		ruleIDs = append(ruleIDs, crid.String)
+	}
+	return status, txn, ruleIDs, true, nil
 }
 
 // ListBreaks returns every break under management, oldest first.
@@ -424,12 +586,28 @@ ORDER BY enqueued_at ASC`
 	return items, nil
 }
 
+const dequeueHITLSQL = `DELETE FROM agent.agent_hitl_queue WHERE external_txn_id = $1`
+
+// dequeueHITL is the single definition of the HITL-dequeue write, shared by
+// DequeueHITL (autocommit) and DequeueHITLTx (transaction-bound) via sqlExecer.
+func dequeueHITL(ctx context.Context, ex sqlExecer, externalTxnID string) error {
+	_, err := ex.ExecContext(ctx, dequeueHITLSQL, externalTxnID)
+	return err
+}
+
 // DequeueHITL removes a break from the human-review queue. Removing a break
 // that is not queued is a no-op (not an error), so HITL draining is idempotent.
 func (s *Store) DequeueHITL(ctx context.Context, externalTxnID string) error {
-	const q = `DELETE FROM agent.agent_hitl_queue WHERE external_txn_id = $1`
-	_, err := s.db.ExecContext(ctx, q, externalTxnID)
-	return err
+	return dequeueHITL(ctx, s.db, externalTxnID)
+}
+
+// DequeueHITLTx removes a break from the human-review queue inside the caller's
+// transaction so the queue drain commits atomically with the break's decided
+// status and its decision audit event (finding C-04). Like DequeueHITL,
+// removing a break that is not queued is a no-op (not an error), so the drain
+// is idempotent.
+func (s *Store) DequeueHITLTx(ctx context.Context, tx *sql.Tx, externalTxnID string) error {
+	return dequeueHITL(ctx, tx, externalTxnID)
 }
 
 // InsertAudit appends one event to the append-only audit ledger. Per Rule 5.5

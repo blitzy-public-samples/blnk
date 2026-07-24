@@ -118,6 +118,12 @@ type storePort interface {
 	SetBreakStatusTx(ctx context.Context, tx *sql.Tx, externalTxnID, status string) error
 	EnqueueHITLTx(ctx context.Context, tx *sql.Tx, externalTxnID, reason string) error
 	SetCreatedRuleTx(ctx context.Context, tx *sql.Tx, externalTxnID, ruleID string) error
+	// SaveBreakTxnTx persists the full external transaction on the break row so a
+	// later HITL re-drive can reconstruct a valid, complete Blnk dry-run payload
+	// instead of probing with only an id and nil rules (finding C-03). It runs in
+	// the same transaction as the escalation so the transaction is durable
+	// exactly when the break becomes queued for human review.
+	SaveBreakTxnTx(ctx context.Context, tx *sql.Tx, externalTxnID string, txn *blnk.ExternalTransaction) error
 	// CountAuditByAction returns how many append-only audit events a break has
 	// recorded for the given action (SELECT only — no write). It drives the
 	// fail-closed resume guard against duplicate Blnk rule creation
@@ -238,7 +244,7 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 			if !errors.Is(cerr, classifier.ErrClassificationFailed) {
 				reason = fmt.Sprintf("%s (unexpected error: %v)", reasonClassifierFailed, cerr)
 			}
-			return r.escalate(ctx, stub, prov, reason)
+			return r.escalate(ctx, txn, stub, prov, reason)
 		}
 
 		// Defensive: guarantee the break is keyed by the transaction under
@@ -250,7 +256,7 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 		// the gate below ineffective). No classified event is emitted; escalate
 		// sanitizes the confidence so the escalated event is itself well-formed.
 		if !validConfidence(c.Confidence) {
-			return r.escalate(ctx, c, prov, fmt.Sprintf("%s (confidence=%v)", reasonInvalidConfidence, c.Confidence))
+			return r.escalate(ctx, txn, c, prov, fmt.Sprintf("%s (confidence=%v)", reasonInvalidConfidence, c.Confidence))
 		}
 
 		// M-2: persist the classified break and emit the classified AuditEvent in
@@ -274,10 +280,10 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	// with no resolved event. (On resume this re-applies the gate to a break a
 	// crashed attempt left classified.)
 	if classification.Regulated {
-		return r.escalate(ctx, classification, prov, reasonRegulated)
+		return r.escalate(ctx, txn, classification, prov, reasonRegulated)
 	}
 	if classification.Confidence < r.threshold {
-		return r.escalate(ctx, classification, prov, reasonLowConfidence)
+		return r.escalate(ctx, txn, classification, prov, reasonLowConfidence)
 	}
 
 	// Root-cause auto-eligibility (finding C3). Confidence and the regulated flag
@@ -289,12 +295,12 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	// can never be auto-applied. This is a hard, model-independent backstop above
 	// the classifier's soft guidance to omit a rule for these causes.
 	if !autoEligibleRootCauses[classification.RootCause] {
-		return r.escalate(ctx, classification, prov, reasonRootCauseNotAutoEligible)
+		return r.escalate(ctx, txn, classification, prov, reasonRootCauseNotAutoEligible)
 	}
 
 	// Auto path. The agent only PROPOSES; Blnk DECIDES (Rule 5.3).
 	if classification.ProposedRule == nil {
-		return r.escalate(ctx, classification, prov, reasonMissingRule)
+		return r.escalate(ctx, txn, classification, prov, reasonMissingRule)
 	}
 
 	// provEv carries the classification evidence (root cause, regulated flag,
@@ -324,14 +330,14 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 			return fmt.Errorf("remediator: check prior rule proposal for break %q: %w", id, err)
 		}
 		if proposedCount > 0 {
-			return r.escalate(ctx, classification, prov, reasonOrphanedRuleResume)
+			return r.escalate(ctx, txn, classification, prov, reasonOrphanedRuleResume)
 		}
 
 		// Rule 5.2: never POST a rule whose Field/Operator falls outside Blnk's
 		// accepted grammar. The classifier already grammar-gates proposals; this
 		// is defense-in-depth immediately before the POST.
 		if err := classifier.ValidateRule(*classification.ProposedRule); err != nil {
-			return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonGrammarReject, err))
+			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonGrammarReject, err))
 		}
 
 		// Semantic safety before any POST (finding C3): reject proposed rules that
@@ -341,7 +347,7 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 		// so only tight equality criteria may proceed; anything else routes to
 		// HITL.
 		if err := autoApplySafe(*classification.ProposedRule); err != nil {
-			return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonOverbroadRule, err))
+			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonOverbroadRule, err))
 		}
 
 		// m-3: record the proposal (previously dead-code audit builder) before
@@ -352,13 +358,13 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 
 		created, err := r.blnkClient.CreateMatchingRule(ctx, *classification.ProposedRule)
 		if err != nil {
-			return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonRuleCreateFailed, err))
+			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonRuleCreateFailed, err))
 		}
 		// m-7: guard an empty rule id BEFORE probing — Blnk's instant
 		// reconciliation requires a non-empty matching_rule_ids set, and probing
 		// with [""] would be meaningless. Fail closed to HITL.
 		if created.RuleID == "" {
-			return r.escalate(ctx, classification, prov, reasonEmptyRuleID)
+			return r.escalate(ctx, txn, classification, prov, reasonEmptyRuleID)
 		}
 		ruleID = created.RuleID
 
@@ -379,14 +385,14 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	// Deterministic re-drive: a single-transaction Blnk dry-run with the rule.
 	cleared, reconID, err := r.blnkClient.ProbeBreak(ctx, txn, []string{ruleID})
 	if err != nil {
-		return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonProbeFailed, err))
+		return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonProbeFailed, err))
 	}
 	// m-3: record the probe outcome (previously dead-code audit builder).
 	if err := r.auditWriter.Record(ctx, audit.Probed(id, reconID, cleared, provEv)); err != nil {
 		return fmt.Errorf("remediator: audit probe for break %q: %w", id, err)
 	}
 	if !cleared {
-		return r.escalate(ctx, classification, prov, reasonNotCleared)
+		return r.escalate(ctx, txn, classification, prov, reasonNotCleared)
 	}
 
 	// Blnk confirmed clearance — and only Blnk can (Rule 5.3). Build the
@@ -398,7 +404,7 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	// confidence alone never resolves.
 	proof, err := audit.NewClearanceProof(reconID, cleared)
 	if err != nil {
-		return r.escalate(ctx, classification, prov, fmt.Sprintf("%s: %v", reasonNotCleared, err))
+		return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonNotCleared, err))
 	}
 
 	// C-1: mark the break auto-resolved and record the resolved AuditEvent in
@@ -418,12 +424,19 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 }
 
 // escalate routes a break to the human-in-the-loop queue: it marks the break
-// queued, enqueues it with the given reason, and emits an escalated AuditEvent
-// — all in ONE transaction (C-2, M-4), so a queued break can never exist
-// without both its queue entry AND its audit event. It never records a resolved
-// event, guaranteeing that a break the agent could not auto-clear is surfaced
-// to a human rather than left silently unresolved (Rules 5.4 / 5.7).
-func (r *Remediator) escalate(ctx context.Context, classification model.BreakClassification, prov model.Provenance, reason string) error {
+// queued, persists the full external transaction, enqueues it with the given
+// reason, and emits an escalated AuditEvent — all in ONE transaction (C-2, M-4,
+// C-03), so a queued break can never exist without its queue entry, its audit
+// event, AND the durable transaction context a later re-drive needs. It never
+// records a resolved event, guaranteeing that a break the agent could not
+// auto-clear is surfaced to a human rather than left silently unresolved
+// (Rules 5.4 / 5.7).
+//
+// txn is the full external transaction under management. It is persisted on the
+// break row (finding C-03) so a HITL re-drive can reconstruct a complete,
+// valid Blnk dry-run payload — the whole transaction line plus a non-empty
+// matching-rule-id set — instead of probing with only an id and nil rules.
+func (r *Remediator) escalate(ctx context.Context, txn blnk.ExternalTransaction, classification model.BreakClassification, prov model.Provenance, reason string) error {
 	// Sanitize a possibly-malformed confidence so both the persisted break and
 	// the escalated audit event are well-formed (the audit validator rejects a
 	// non-finite or out-of-range confidence).
@@ -436,6 +449,13 @@ func (r *Remediator) escalate(ctx context.Context, classification model.BreakCla
 
 	if err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
 		if e := r.store.UpsertBreakTx(ctx, tx, classification, statusQueued); e != nil {
+			return e
+		}
+		// C-03: persist the full transaction alongside the queued break, inside
+		// the same transaction, so the durable re-drive context commits exactly
+		// when the break becomes queued. The break row was just upserted above,
+		// so this UPDATE always finds its row.
+		if e := r.store.SaveBreakTxnTx(ctx, tx, classification.ExternalTxnID, &txn); e != nil {
 			return e
 		}
 		if e := r.store.EnqueueHITLTx(ctx, tx, classification.ExternalTxnID, reason); e != nil {

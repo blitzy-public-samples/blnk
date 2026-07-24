@@ -13,6 +13,7 @@ package hitl
 
 import (
 	"context"
+	"database/sql"
 	"html/template"
 	"net/http"
 
@@ -27,16 +28,38 @@ import (
 
 // breakStore is the read/update surface hitl needs from the persistence layer.
 // The concrete *store.Store satisfies it (asserted below); tests inject a mock.
+//
+// The decision surface is deliberately transaction-scoped (finding C-04): a
+// human decision must commit its status change, its queue drain, and its audit
+// event together or not at all, and must never mutate a break that is no longer
+// queued (already decided/re-driven/auto-resolved) or replay a settled outcome.
+// So instead of the previous fire-and-forget SetBreakStatus + DequeueHITL
+// (three independent autocommits, no state guard), the handlers open a single
+// WithTx and drive it with:
+//   - SetBreakStatusIfQueuedTx — queued-only compare-and-set (ErrNotFound/ErrConflict);
+//   - RequireQueuedTx — lock+confirm still-queued without mutating (the re-drive
+//     "not cleared" path);
+//   - DequeueHITLTx — transaction-bound, idempotent queue drain.
+//
+// LoadBreakContext supplies the durable re-drive payload (full transaction +
+// applicable rule ids) so re_drive submits a contract-valid Blnk dry-run rather
+// than an id-only, rule-less probe (finding C-03).
 type breakStore interface {
 	ListBreaks(ctx context.Context) ([]store.Break, error)
 	ListAudit(ctx context.Context) ([]model.AuditEvent, error)
-	SetBreakStatus(ctx context.Context, externalTxnID, status string) error
-	DequeueHITL(ctx context.Context, externalTxnID string) error
+	LoadBreakContext(ctx context.Context, externalTxnID string) (status string, txn *blnk.ExternalTransaction, ruleIDs []string, found bool, err error)
+	WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error
+	SetBreakStatusIfQueuedTx(ctx context.Context, tx *sql.Tx, externalTxnID, status string) error
+	RequireQueuedTx(ctx context.Context, tx *sql.Tx, externalTxnID string) error
+	DequeueHITLTx(ctx context.Context, tx *sql.Tx, externalTxnID string) error
 }
 
-// recorder is the append-only audit surface (Rule 5.5). *audit.Writer satisfies it.
+// recorder is the append-only audit surface (Rule 5.5). *audit.Writer satisfies
+// it. RecordTx enrolls the decision's audit event in the caller's transaction so
+// it commits atomically with the status change and queue drain (finding C-04) —
+// there is no non-transactional decision-audit path.
 type recorder interface {
-	Record(ctx context.Context, ev model.AuditEvent) error
+	RecordTx(ctx context.Context, tx *sql.Tx, ev model.AuditEvent) error
 }
 
 // prober re-tests break clearance via a Blnk dry-run (start-instant, dry_run=true).

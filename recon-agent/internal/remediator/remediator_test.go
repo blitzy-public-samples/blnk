@@ -174,6 +174,10 @@ type fakeBreak struct {
 	classification model.BreakClassification
 	status         string
 	createdRuleID  string
+	// txn mirrors the store's JSONB txn column: the full external transaction
+	// persisted at escalate time so a later HITL re_drive can reconstruct a
+	// complete, contract-valid probe payload (finding C-03).
+	txn *blnk.ExternalTransaction
 }
 
 type fakeBackend struct {
@@ -200,6 +204,7 @@ type fakeBackend struct {
 	setBreakStatusTxHook func(string, string) error
 	enqueueHITLTxHook    func(string, string) error
 	setCreatedRuleTxHook func(string, string) error
+	saveBreakTxnTxHook   func(string, *blnk.ExternalTransaction) error
 }
 
 func newBackend(t *testing.T) *fakeBackend {
@@ -341,6 +346,25 @@ func (f *fakeBackend) SetCreatedRuleTx(_ context.Context, tx *sql.Tx, id, ruleID
 	f.buffer(tx, func() {
 		if b := f.breaks[id]; b != nil {
 			b.createdRuleID = ruleID
+		}
+	})
+	return nil
+}
+
+// SaveBreakTxnTx mirrors the store's UPDATE ... SET txn = $2, buffering the full
+// external transaction onto the break so it survives the same commit as the
+// UpsertBreakTx that created the row. Faithfully modeling this write is what
+// lets a later re_drive load a complete probe payload (finding C-03); escalate
+// invokes it inside its WithTx immediately after UpsertBreakTx.
+func (f *fakeBackend) SaveBreakTxnTx(_ context.Context, tx *sql.Tx, id string, txn *blnk.ExternalTransaction) error {
+	if f.saveBreakTxnTxHook != nil {
+		if err := f.saveBreakTxnTxHook(id, txn); err != nil {
+			return err
+		}
+	}
+	f.buffer(tx, func() {
+		if b := f.breaks[id]; b != nil {
+			b.txn = txn
 		}
 	})
 	return nil
@@ -973,6 +997,40 @@ func TestHandleAtomicity_EscalateEnqueueFailure(t *testing.T) {
 	status, _ := h.back.statusOf(id)
 	if status == statusQueued {
 		t.Fatal("break must NOT be marked queued when the HITL enqueue fails (M-4)")
+	}
+	if _, queued := h.back.inHITL(id); queued {
+		t.Fatal("no HITL-queue entry may be durable after rollback")
+	}
+	if h.back.countAction(id, audit.ActionEscalated) != 0 {
+		t.Fatal("no escalated audit event may be durable after rollback")
+	}
+}
+
+// C-03 atomicity: the full-transaction persist (SaveBreakTxnTx) fails inside the
+// escalate transaction. The whole escalation must roll back — the break is not
+// queued, has no HITL entry, and has no escalated event — so the durable
+// re-drive context and the queued break are always committed together or not at
+// all (there can never be a queued break with a missing/half-written txn).
+func TestHandleAtomicity_EscalateSaveTxnFailure(t *testing.T) {
+	const id = "ext_c03"
+	h := autoHarness(t, id)
+	c := autoClassification(id)
+	c.Regulated = true // force the escalate path
+	h.cls.result = c
+	h.back.saveBreakTxnTxHook = func(_ string, _ *blnk.ExternalTransaction) error {
+		return errors.New("txn persist down")
+	}
+
+	err := h.rem.Handle(context.Background(), txnFor(id), testUploadID)
+	if err == nil {
+		t.Fatal("expected the txn-persist failure to surface as an error")
+	}
+	status, _ := h.back.statusOf(id)
+	if status == statusQueued {
+		t.Fatal("break must NOT be marked queued when the txn persist fails (C-03)")
+	}
+	if status != statusClassified {
+		t.Fatalf("break should remain classified after escalate rollback, got %q", status)
 	}
 	if _, queued := h.back.inHITL(id); queued {
 		t.Fatal("no HITL-queue entry may be durable after rollback")
