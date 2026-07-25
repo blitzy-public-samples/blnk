@@ -6,20 +6,26 @@
 //
 // Modes are selected by the -once flag:
 //
-//	-once=false (default) SERVE mode: start the HITL/status server (initially
-//	                      reporting not-ready on /healthz), await dependency
-//	                      readiness, attempt the pipeline once, mark ready on
-//	                      success, and block until SIGINT/SIGTERM triggers a
-//	                      graceful shutdown. This is what the docker-compose
-//	                      recon-agent service runs — and there the seed
-//	                      statement CSV lives at ../seed (repo root), OUTSIDE
-//	                      the image's ./recon-agent build context, so it is not
-//	                      baked in and the boot pipeline has no statement to
-//	                      ingest. In that deployment the one-shot demo pipeline
-//	                      is run on the HOST via `make demo`, and the container
-//	                      serves the HITL API + status page over the shared
-//	                      agent_* tables while /healthz stays not-ready (by
-//	                      design — never a false-green).
+//	-once=false (default) SERVE mode: start the HITL/status server (immediately
+//	                      LIVE on /healthz but NOT-ready on /readyz), await
+//	                      dependency readiness, run the pipeline once, mark
+//	                      /readyz ready on success, and block until
+//	                      SIGINT/SIGTERM triggers a graceful shutdown. This is
+//	                      what the docker-compose recon-agent service runs: the
+//	                      image BAKES IN the seed statement CSV — the Dockerfile
+//	                      uses the repository-ROOT build context to COPY
+//	                      seed/external_transactions.csv to /seed, and the
+//	                      default -csv path ../seed/external_transactions.csv
+//	                      resolves there from WORKDIR /app — so the boot pipeline
+//	                      has a real 6-break statement to ingest and runs to
+//	                      completion on startup with no host mount required.
+//	                      /healthz is pure LIVENESS (200 as soon as the listener
+//	                      binds); /readyz is the readiness gate and stays 503
+//	                      until the boot pipeline succeeds — never a false-green.
+//	                      The same one-shot pipeline is also run on the HOST via
+//	                      `make demo` (go run ./cmd -once, where ../seed resolves
+//	                      at the repo root); either way the container serves the
+//	                      HITL API + status page over the shared agent_* tables.
 //	-once=true            ONE-SHOT mode: await readiness, run the pipeline once,
 //	                      print the summary table, and exit — nonzero on any
 //	                      failure (CSV/Blnk/LLM/dependency). This is what
@@ -93,7 +99,7 @@ const (
 	// summaryReportBase is the basename of the machine-readable one-shot run
 	// report written alongside the resolved artifact in `-once` (demo) mode
 	// (findings M-01, M-17). It carries the same run-scoped counts printSummary
-	// renders (breaks in / auto-resolved / escalated / audit count) in a stable
+	// renders (breaks in / auto-resolved / escalated / audit events) in a stable
 	// JSON shape the standalone eval scorer (eval/scorer) consumes to enforce the
 	// AAP's acceptance criteria and exit nonzero on any failed invariant. It is a
 	// SEPARATE, idempotent artifact (truncated each run), never the committed

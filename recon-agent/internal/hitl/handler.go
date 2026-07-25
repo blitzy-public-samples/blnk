@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 
@@ -177,6 +178,14 @@ func validateDecisionFields(d *model.HITLDecision) (string, bool) {
 	if len(d.ExternalTxnID) > maxExternalTxnIDLen {
 		return "external_txn_id is too long", false
 	}
+	// Finding #5: reject a control character (e.g. an embedded NUL U+0000) in the
+	// identifier BEFORE it reaches the store. PostgreSQL's text type cannot hold a
+	// NUL, so lib/pq would otherwise fail the query and the request would surface
+	// as a confusing HTTP 500 instead of a clean 400. Identifiers carry no control
+	// characters, so ALL of them are rejected here.
+	if containsDisallowedControlChar(d.ExternalTxnID, false) {
+		return "external_txn_id contains invalid control characters", false
+	}
 	if !audit.IsValidDecision(d.Decision) {
 		return "unknown decision", false
 	}
@@ -190,10 +199,48 @@ func validateDecisionFields(d *model.HITLDecision) (string, bool) {
 	if len(d.Reviewer) > maxReviewerLen {
 		return "reviewer is too long", false
 	}
+	// Finding #5: the reviewer identity is an identifier — no control characters
+	// (including an embedded NUL) are valid; reject them with a 400 rather than
+	// letting a NUL reach lib/pq and surface as a 500.
+	if containsDisallowedControlChar(d.Reviewer, false) {
+		return "reviewer contains invalid control characters", false
+	}
 	if len(d.Note) > maxNoteLen {
 		return "note is too long", false
 	}
+	// Finding #5: the free-text note may legitimately contain ordinary text
+	// whitespace (tab / newline / carriage return) — a multi-line note is
+	// preserved — but an embedded NUL (unstorable in a PostgreSQL text column) and
+	// every other C0/C1/DEL control character are rejected with a 400 rather than
+	// surfacing as a 500 from the persistence layer.
+	if containsDisallowedControlChar(d.Note, true) {
+		return "note contains invalid control characters", false
+	}
 	return "", true
+}
+
+// containsDisallowedControlChar reports whether s contains a control character
+// that must cause a 400 rather than propagate to the persistence layer. An
+// embedded NUL (U+0000) is the motivating case (finding #5): PostgreSQL's text
+// type cannot store it, so lib/pq rejects the query and the request would
+// otherwise return a confusing HTTP 500 instead of a clean client-side 400.
+//
+// For identifier fields (external_txn_id, reviewer) EVERY control character is
+// disallowed — they carry none legitimately. For the free-text note,
+// allowTextWhitespace permits ordinary text whitespace (tab, newline, carriage
+// return) so a legitimate multi-line note is preserved, while NUL and every
+// other C0/C1/DEL control character (unicode.IsControl) are still rejected.
+func containsDisallowedControlChar(s string, allowTextWhitespace bool) bool {
+	for _, r := range s {
+		if !unicode.IsControl(r) {
+			continue
+		}
+		if allowTextWhitespace && (r == '\t' || r == '\n' || r == '\r') {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // bindDecision reads a HITLDecision from a JSON body (Content-Type

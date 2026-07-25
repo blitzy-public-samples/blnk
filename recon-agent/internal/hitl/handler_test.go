@@ -607,6 +607,132 @@ func TestHandleDecisionExternalIDTooLong(t *testing.T) {
 	}
 }
 
+// ----- Finding #5: control-character (NUL) input rejected with 400 ----------
+
+func TestHandleDecisionControlCharExternalIDRejected(t *testing.T) {
+	// Finding #5: an embedded NUL (U+0000) in the identifier must be rejected with
+	// a clean 400 BEFORE the store is touched — never surface as an HTTP 500 from
+	// lib/pq (which cannot store a NUL in a PostgreSQL text column). No mutation,
+	// no audit.
+	st := &fakeStore{found: true}
+	aud := &fakeAudit{}
+	srv := newTestServer(st, aud, &fakeProber{})
+
+	w := postDecisionJSON(t, srv, model.HITLDecision{
+		ExternalTxnID: "EXT-\x00001", Decision: audit.DecisionAccept, Reviewer: "alice"})
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("NUL external_txn_id status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "external_txn_id contains invalid control characters") {
+		t.Fatalf("body = %s, want external_txn_id control-character message", w.Body.String())
+	}
+	if _, ok := st.lastStatus(); ok {
+		t.Fatalf("a control-char decision must change no status")
+	}
+	if len(aud.recorded()) != 0 {
+		t.Fatalf("a control-char decision must audit nothing; got %d", len(aud.recorded()))
+	}
+}
+
+func TestHandleDecisionControlCharReviewerRejected(t *testing.T) {
+	// Finding #5: a NUL / control character in the reviewer identity → 400.
+	st := &fakeStore{found: true}
+	aud := &fakeAudit{}
+	srv := newTestServer(st, aud, &fakeProber{})
+
+	w := postDecisionJSON(t, srv, model.HITLDecision{
+		ExternalTxnID: "x", Decision: audit.DecisionAccept, Reviewer: "ali\x00ce"})
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("NUL reviewer status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "reviewer contains invalid control characters") {
+		t.Fatalf("body = %s, want reviewer control-character message", w.Body.String())
+	}
+	if _, ok := st.lastStatus(); ok {
+		t.Fatalf("a control-char decision must change no status")
+	}
+	if len(aud.recorded()) != 0 {
+		t.Fatalf("a control-char decision must audit nothing; got %d", len(aud.recorded()))
+	}
+}
+
+func TestHandleDecisionControlCharNoteRejected(t *testing.T) {
+	// Finding #5: a NUL in the free-text note → 400. A NUL is unstorable in a
+	// PostgreSQL text column regardless of the note being free-text, so it is
+	// rejected even though ordinary text whitespace in a note is allowed.
+	st := &fakeStore{found: true}
+	aud := &fakeAudit{}
+	srv := newTestServer(st, aud, &fakeProber{})
+
+	w := postDecisionJSON(t, srv, model.HITLDecision{
+		ExternalTxnID: "x", Decision: audit.DecisionAccept, Reviewer: "alice", Note: "bad\x00note"})
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("NUL note status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "note contains invalid control characters") {
+		t.Fatalf("body = %s, want note control-character message", w.Body.String())
+	}
+	if _, ok := st.lastStatus(); ok {
+		t.Fatalf("a control-char decision must change no status")
+	}
+}
+
+func TestHandleDecisionNoteWithNewlineAccepted(t *testing.T) {
+	// Finding #5 preserves legitimate free-text whitespace: a multi-line note
+	// (containing \n / \r / \t) is still accepted and drives the decision — the
+	// runtime-accepted "CRLF stored as a literal newline" behavior is not
+	// regressed; only NUL and other control characters are rejected.
+	st := &fakeStore{found: true}
+	aud := &fakeAudit{}
+	srv := newTestServer(st, aud, &fakeProber{})
+
+	w := postDecisionJSON(t, srv, model.HITLDecision{
+		ExternalTxnID: "dup-1", Decision: audit.DecisionAccept, Reviewer: "alice",
+		Note: "line one\nline two\twith tab\r\n"})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("multi-line note status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	last, ok := st.lastStatus()
+	if !ok || last.status != statusAccepted {
+		t.Fatalf("multi-line note decision must accept; lastStatus=%+v ok=%v", last, ok)
+	}
+}
+
+func TestContainsDisallowedControlChar(t *testing.T) {
+	// Direct coverage of both branches of the Finding #5 guard: identifiers reject
+	// ALL control characters; the free-text note (allowTextWhitespace=true) permits
+	// tab/newline/CR but still rejects NUL and every other control character.
+	cases := []struct {
+		name                string
+		s                   string
+		allowTextWhitespace bool
+		want                bool
+	}{
+		{"plain identifier", "EXT-001-abc", false, false},
+		{"nul in identifier", "EXT-\x00", false, true},
+		{"bell in identifier", "EXT\x07", false, true},
+		{"newline in identifier", "EXT\n", false, true},
+		{"tab in identifier", "EXT\t", false, true},
+		{"del in identifier", "EXT\x7f", false, true},
+		{"plain note", "a normal note", true, false},
+		{"newline note allowed", "line1\nline2", true, false},
+		{"tab and cr note allowed", "a\tb\r\nc", true, false},
+		{"nul note rejected", "a\x00b", true, true},
+		{"bell note rejected", "a\x07b", true, true},
+		{"empty", "", false, false},
+	}
+	for _, tc := range cases {
+		if got := containsDisallowedControlChar(tc.s, tc.allowTextWhitespace); got != tc.want {
+			t.Errorf("%s: containsDisallowedControlChar(%q, %v) = %v, want %v",
+				tc.name, tc.s, tc.allowTextWhitespace, got, tc.want)
+		}
+	}
+}
+
 // ----- C-05 / M-23: strict bounded request decoding -------------------------
 
 func TestHandleDecisionUnknownJSONFieldRejected(t *testing.T) {

@@ -19,7 +19,17 @@
 # ---- build stage ----
 # Digest-pinned, supported base (finding M-20): the tag comment is for humans /
 # Dependabot; the @sha256 is what Docker resolves, so the builder is immutable.
-FROM golang:1.25-alpine3.22@sha256:65b4400aee0927412e9ed791a11893273a49d55df24841f7599660fb80dae464 AS build-env
+# Toolchain: go1.25.12 (Alpine 3.23.5). Re-pinned from golang:1.25-alpine3.22
+# (which is frozen at go1.25.11 — no golang:1.25.12-alpine3.22 image is published)
+# to clear the go1.25.11 stdlib CVEs baked into the compiled binary:
+#   * GO-2026-5856 / CVE-2026-42505 — crypto/tls Encrypted Client Hello PSK-identity
+#     privacy leak (govulncheck binary-mode flagged the tls.Conn/tls.Dialer symbols
+#     reachable), and
+#   * GO-2026-4970 / CVE-2026-39822 — os Root symlink-escape,
+# both fixed in go1.25.12. alpine3.23 is the minimal successor to the frozen
+# alpine3.22; this build stage is discarded — only the static CGO_ENABLED=0 binary
+# is copied into the alpine:3.22 runtime below, whose OS packages are unaffected.
+FROM golang:1.25-alpine3.23@sha256:cc985ef6f9c3bf9ece7488129c9abe0a150388ccdfa428d886fc709dca0b230a AS build-env
 WORKDIR /src
 
 # Leverage layer caching: download modules before copying the full source so the
