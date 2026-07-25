@@ -1142,7 +1142,8 @@ func expectedActionFor(status string) string {
 }
 
 // printSummary renders the demo scorecard: breaks in / auto-resolved /
-// escalated / audit count (all scoped to this run, finding M1).
+// escalated / audit events (all scoped to this run, finding M1). The label
+// text here MUST match the emitted label below ("audit events").
 func printSummary(w io.Writer, s summary) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "=== recon-agent pipeline summary ===")

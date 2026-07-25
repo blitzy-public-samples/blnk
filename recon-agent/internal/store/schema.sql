@@ -21,7 +21,7 @@
 -- Rule 5.1: every object lives under the agent schema; the agent never reads or
 -- writes any blnk.* table.
 -- Rule 5.5: agent.agent_audit is append-only (INSERT and SELECT only; never
--- UPDATE or DELETE).
+-- UPDATE, DELETE, or TRUNCATE).
 
 -- +migrate Up
 CREATE SCHEMA IF NOT EXISTS agent;
@@ -146,8 +146,9 @@ EXCEPTION WHEN duplicate_object THEN NULL;
 END;
 $agent_break_resolved_proof$;
 
--- agent.agent_audit is the append-only action ledger (Rule 5.5). No UPDATE or
--- DELETE statement may ever target this table; only INSERT and SELECT.
+-- agent.agent_audit is the append-only action ledger (Rule 5.5). No UPDATE,
+-- DELETE, or TRUNCATE statement may ever target this table; only INSERT and
+-- SELECT.
 CREATE TABLE IF NOT EXISTS agent.agent_audit (
     event_id        UUID PRIMARY KEY,
     external_txn_id TEXT NOT NULL,
@@ -313,9 +314,12 @@ CREATE INDEX IF NOT EXISTS idx_agent_rule_outbox_pending
 -- database boundary, not merely by application convention. A BEFORE trigger
 -- fires for EVERY role including the table owner and a superuser (unlike a
 -- REVOKE, which superusers bypass), so no connection can mutate or remove a
--- recorded audit event. The trigger raises on any row-level UPDATE or DELETE;
--- INSERT and SELECT are unaffected, so the writer (INSERT) and status page
--- (SELECT) work normally.
+-- recorded audit event. Two triggers share one reject function: a row-level
+-- trigger raises on UPDATE or DELETE, and a statement-level trigger raises on
+-- TRUNCATE (a distinct event that row-level triggers never fire for, so without
+-- it the whole trail could be wiped in one statement despite the row-level
+-- guard). INSERT and SELECT are unaffected, so the writer (INSERT) and status
+-- page (SELECT) work normally.
 CREATE OR REPLACE FUNCTION agent.agent_audit_reject_mutation() RETURNS trigger AS $reject$
 BEGIN
     RAISE EXCEPTION 'agent.agent_audit is append-only (Rule 5.5); % is not permitted', TG_OP
@@ -336,7 +340,22 @@ EXCEPTION
 END;
 $ensure_trigger$;
 
+-- TRUNCATE does not fire row-level triggers, so it needs a dedicated
+-- STATEMENT-level BEFORE trigger (reusing the same reject function, which raises
+-- for any TG_OP including 'TRUNCATE'). Guarded in a DO block that swallows
+-- duplicate_object for the same idempotency/concurrency reasons as above.
+DO $ensure_truncate_trigger$
+BEGIN
+    CREATE TRIGGER agent_audit_no_truncate
+        BEFORE TRUNCATE ON agent.agent_audit
+        FOR EACH STATEMENT EXECUTE FUNCTION agent.agent_audit_reject_mutation();
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END;
+$ensure_truncate_trigger$;
+
 -- +migrate Down
+DROP TRIGGER IF EXISTS agent_audit_no_truncate ON agent.agent_audit;
 DROP TRIGGER IF EXISTS agent_audit_no_mutate ON agent.agent_audit;
 DROP FUNCTION IF EXISTS agent.agent_audit_reject_mutation();
 DROP INDEX IF EXISTS agent.idx_agent_rule_outbox_pending;

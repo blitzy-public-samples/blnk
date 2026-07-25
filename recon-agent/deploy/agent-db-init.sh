@@ -65,10 +65,19 @@ SELECT format('CREATE SCHEMA IF NOT EXISTS agent AUTHORIZATION %I', :'agent_user
 SELECT format('ALTER SCHEMA agent OWNER TO %I', :'agent_user')
 \gexec
 
--- Minimal privileges: connect to the database and use/create within `agent`
--- only. Revoke any ambient rights on `public` so the role is confined to its
--- own schema (Rule 5.1: the agent never touches blnk.* tables).
+-- Minimal privileges: connect to the database, own/use/create within `agent`,
+-- and hold database-level CREATE. The CREATE-on-database grant is required
+-- because store.Migrate runs an idempotent `CREATE SCHEMA IF NOT EXISTS agent`
+-- at boot, and PostgreSQL evaluates the CREATE-on-database privilege BEFORE the
+-- IF-NOT-EXISTS short-circuit — so even though this script pre-creates the
+-- schema (owned by the role), that statement still fails with "permission
+-- denied for database" without the grant. It grants NO access to Blnk's data:
+-- `public` is revoked below and the role holds no privileges on any blnk.*
+-- object, so it can only create/own its own additive schemas (Rule 5.1: the
+-- agent never touches blnk.* tables).
 SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), :'agent_user')
+\gexec
+SELECT format('GRANT CREATE ON DATABASE %I TO %I', current_database(), :'agent_user')
 \gexec
 SELECT format('GRANT USAGE, CREATE ON SCHEMA agent TO %I', :'agent_user')
 \gexec

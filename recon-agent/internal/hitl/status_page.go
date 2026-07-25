@@ -203,6 +203,8 @@ const statusPageHTML = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="recon-agent human-in-the-loop review console: reconciliation breaks, proposed matching rules, and the append-only audit trail.">
+<link rel="icon" href="data:,">
 <title>{{.Title}}</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
@@ -222,6 +224,8 @@ const statusPageHTML = `<!DOCTYPE html>
   .status-auto-resolved { color: #0a7d28; font-weight: 600; }
   .status-rejected { color: #b00020; }
   .status-re_driven { color: #0b5cad; }
+  .status-queued { color: #8a5a00; font-weight: 600; }
+  .status-accepted { color: #0a7d28; font-weight: 600; }
   .rationale { display: block; margin-top: .2rem; }
   .criteria { margin: .2rem 0 0; padding-left: 1.1rem; }
   .criteria li { font-size: .85rem; }
@@ -271,7 +275,7 @@ const statusPageHTML = `<!DOCTYPE html>
           {{.RootCause}}
           {{if .Rationale}}<span class="rationale muted">{{.Rationale}}</span>{{end}}
         </td>
-        <td>{{printf "%.3f" .Confidence}}</td>
+        <td>{{printf "%.4f" .Confidence}}</td>
         <td>{{if .Regulated}}<span class="regulated">yes</span>{{else}}no{{end}}</td>
         <td class="status-{{.Status}}">{{.Status}}</td>
         <td>
@@ -328,7 +332,7 @@ const statusPageHTML = `<!DOCTYPE html>
         <td>{{.ExternalTxnID}}</td>
         <td>{{.Actor}}</td>
         <td>{{.Action}}</td>
-        <td>{{printf "%.3f" .Confidence}}</td>
+        <td>{{printf "%.4f" .Confidence}}</td>
         <td>{{if .ReconID}}{{.ReconID}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
         <td>{{.Rationale}}</td>
       </tr>

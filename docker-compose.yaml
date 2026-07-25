@@ -24,16 +24,28 @@ services:
     environment:
       TZ: ${TZ:-Etc/UTC}
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      # Configure Blnk entirely via BLNK_* env (envconfig); no blnk.json file is
+      # required. blnk.json is .gitignored (operator-supplied), so a bare clone
+      # ships none — bind-mounting the absent file materializes an empty
+      # DIRECTORY at /blnk.json and Blnk's loader fails with
+      # "read blnk.json: is a directory". These DSNs target the compose service
+      # names so a clean-machine `docker compose up --build` needs no host config.
+      BLNK_DATA_SOURCE_DNS: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable
+      BLNK_REDIS_DNS: redis:6379
+      BLNK_TYPESENSE_DNS: http://typesense:8108
     ports:
       - "5001:5001"
       - "80:80"
       - "443:443"
     depends_on:
-      - redis
-      - postgres
-      - jaeger
-    volumes:
-      - ./blnk.json:/blnk.json
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      typesense:
+        condition: service_started
+      jaeger:
+        condition: service_started
     # Readiness signal so dependents (recon-agent) can gate on Blnk actually
     # serving, not merely started (finding M-16). Blnk exposes /health => UP on
     # 5001; the published image is Debian-slim with wget available. Generous
@@ -51,15 +63,23 @@ services:
     restart: on-failure
     entrypoint: ["blnk", "workers"]
     environment:
+      TZ: ${TZ:-Etc/UTC}
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      # Same env-only Blnk configuration as the server service (no blnk.json).
+      BLNK_DATA_SOURCE_DNS: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable
+      BLNK_REDIS_DNS: redis:6379
+      BLNK_TYPESENSE_DNS: http://typesense:8108
     ports:
       - "5004:5004"
     depends_on:
-      - redis
-      - postgres
-      - jaeger
-    volumes:
-      - ./blnk.json:/blnk.json
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      typesense:
+        condition: service_started
+      jaeger:
+        condition: service_started
 
   redis:
     image: redis:7.2.4
