@@ -12,3 +12,14 @@ CLAUDE.md
 __pycache__
 tests/loadtest/*.json
 tests/loadtest/*.ndjson
+
+# recon-agent one-shot / `make demo` run artifact. defaultResolvedPath is
+# "recon_resolved.jsonl" (recon-agent/cmd/main.go), written to the CWD (the
+# recon-agent/ dir under `make demo`, or the repo root if run there). It is a
+# per-run output log, never a committed artifact (the committed eval corpus is
+# eval/recon_corpus.jsonl). Ignoring it (in any directory) keeps demo/one-shot
+# runs from dirtying the working tree.
+recon_resolved.jsonl
+# recon-agent coverage profile written by `make test` (Finding #4): a build/run
+# output, never source, so it must not pollute the working tree.
+recon-agent/coverage.out

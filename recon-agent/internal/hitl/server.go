@@ -43,6 +43,12 @@ import (
 type breakStore interface {
 	ListBreaks(ctx context.Context) ([]store.Break, error)
 	ListAudit(ctx context.Context) ([]model.AuditEvent, error)
+	// ListHITL returns the breaks currently awaiting a human decision so the
+	// status page can surface WHY each queued break was routed to a human
+	// (regulated, low confidence, fail-closed, ...) — finding F-I. The reason is
+	// persisted on agent.agent_hitl_queue and is meaningful only while a break is
+	// still queued; a decided/auto-resolved break has been drained and carries none.
+	ListHITL(ctx context.Context) ([]store.HITLItem, error)
 	// LoadBreak returns the persisted classification, current status, and any
 	// created rule id for a break. re_drive uses the status to reject a missing
 	// break (404) or an already-decided break (409) BEFORE any Blnk call
@@ -144,8 +150,13 @@ type Server struct {
 	aud      recorder
 	bc       prober
 	llmModel string
-	tmpl     *template.Template
-	engine   *gin.Engine
+	// autoThreshold is the auto-remediation confidence gate (CONF_AUTO_THRESHOLD,
+	// Rule 5.4). The status page annotates any break whose confidence is below it
+	// as human-gated so a sub-threshold confidence can never read as auto-eligible
+	// (finding F-A), and surfaces the threshold itself in the page header.
+	autoThreshold float64
+	tmpl          *template.Template
+	engine        *gin.Engine
 
 	// owner uniquely identifies THIS server instance when it claims a
 	// per-break processing lease before re_drive's external Blnk work, so the
@@ -177,11 +188,12 @@ type Server struct {
 func NewServer(cfg config.Config, st breakStore, aud recorder, bc prober) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	s := &Server{
-		st:       st,
-		aud:      aud,
-		bc:       bc,
-		llmModel: cfg.LLMModel,
-		tmpl:     statusTemplate,
+		st:            st,
+		aud:           aud,
+		bc:            bc,
+		llmModel:      cfg.LLMModel,
+		autoThreshold: cfg.ConfAutoThreshold,
+		tmpl:          statusTemplate,
 		// A unique owner identity per instance so re_drive's DB processing lease
 		// is a cross-instance mutual-exclusion primitive (finding M-15).
 		owner: "recon-agent-hitl-" + uuid.NewString(),
@@ -201,8 +213,8 @@ func NewServer(cfg config.Config, st breakStore, aud recorder, bc prober) *Serve
 //   - securityHeaders runs on EVERY response and sets a restrictive baseline
 //     (nosniff, frame/clickjacking denial via CSP frame-ancestors + legacy
 //     X-Frame-Options, an inline-style-only CSP with form-action 'self', a
-//     no-referrer policy, and no-store caching) so the page cannot be framed,
-//     MIME-sniffed, or have its forms retargeted cross-origin.
+//     same-origin referrer policy, and no-store caching) so the page cannot be
+//     framed, MIME-sniffed, or have its forms retargeted cross-origin.
 //   - mutationGuard runs ONLY on the state-changing POST /decisions and enforces
 //     the local boundary and same-origin/CSRF protections the finding requires:
 //     a bounded body, an allow-listed content type, an Origin/Referer same-origin
@@ -230,20 +242,40 @@ func (s *Server) buildRouter() *gin.Engine {
 // securityHeaders sets a restrictive security-header baseline on every response
 // (finding C-05). The Content-Security-Policy permits only same-origin
 // resources and the page's own inline <style> (no external or inline scripts,
-// no framing), restricts form submissions to the same origin, and disables the
-// <base> element; X-Frame-Options mirrors frame-ancestors for legacy browsers.
-// Cache-Control: no-store keeps the unauthenticated review data and the CSRF
-// token out of shared/browser caches.
+// no framing), allows the page's inline data: favicon via img-src, restricts
+// form submissions to the same origin, and disables the <base> element;
+// X-Frame-Options mirrors frame-ancestors for legacy browsers. Cache-Control:
+// no-store keeps the unauthenticated review data and the CSRF token out of
+// shared/browser caches.
+//
+// Referrer-Policy is "same-origin" (deliberately NOT "no-referrer"): per the
+// Fetch standard's "byte-serialize a request origin" algorithm, a document with
+// a "no-referrer" policy makes the browser send Origin: null on a basic
+// (non-CORS) same-origin form POST. The same-origin guard on POST /decisions
+// then parses that null origin to an empty host, treats the request as
+// cross-origin, and aborts 403 BEFORE the CSRF check — which broke EVERY
+// browser-driven accept/re_drive/reject decision. "same-origin" instead sends
+// the real Origin on a same-origin POST (so the guard and double-submit CSRF
+// checks run and the form works) while still sending NO referrer — and Origin:
+// null — on cross-origin requests, so genuine cross-site submissions remain
+// rejected. The origin allow-list and CSRF token are therefore both preserved.
 func (s *Server) securityHeaders() gin.HandlerFunc {
-	const csp = "default-src 'self'; style-src 'self' 'unsafe-inline'; " +
-		"script-src 'none'; object-src 'none'; base-uri 'none'; " +
+	// img-src 'self' data: permits the page's inline data: favicon
+	// (<link rel="icon" href="data:,"> in status_page.go) without relaxing the
+	// script/object/frame restrictions; the default-src 'self' baseline would
+	// otherwise block it and log a CSP error on every page load.
+	const csp = "default-src 'self'; img-src 'self' data:; " +
+		"style-src 'self' 'unsafe-inline'; script-src 'none'; " +
+		"object-src 'none'; base-uri 'none'; " +
 		"form-action 'self'; frame-ancestors 'none'"
 	return func(c *gin.Context) {
 		h := c.Writer.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Content-Security-Policy", csp)
-		h.Set("Referrer-Policy", "no-referrer")
+		// same-origin (not no-referrer) so a same-origin form POST carries a real
+		// Origin and passes the mutation guard; see the function doc above (F-CRIT-1).
+		h.Set("Referrer-Policy", "same-origin")
 		h.Set("Cache-Control", "no-store")
 		c.Next()
 	}

@@ -8,25 +8,36 @@
 //
 //	-once=false (default) SERVE mode: start the HITL/status server (initially
 //	                      reporting not-ready on /healthz), await dependency
-//	                      readiness, run the pipeline once, mark ready on
+//	                      readiness, attempt the pipeline once, mark ready on
 //	                      success, and block until SIGINT/SIGTERM triggers a
 //	                      graceful shutdown. This is what the docker-compose
-//	                      recon-agent service runs.
+//	                      recon-agent service runs — and there the seed
+//	                      statement CSV lives at ../seed (repo root), OUTSIDE
+//	                      the image's ./recon-agent build context, so it is not
+//	                      baked in and the boot pipeline has no statement to
+//	                      ingest. In that deployment the one-shot demo pipeline
+//	                      is run on the HOST via `make demo`, and the container
+//	                      serves the HITL API + status page over the shared
+//	                      agent_* tables while /healthz stays not-ready (by
+//	                      design — never a false-green).
 //	-once=true            ONE-SHOT mode: await readiness, run the pipeline once,
 //	                      print the summary table, and exit — nonzero on any
 //	                      failure (CSV/Blnk/LLM/dependency). This is what
 //	                      `make demo` (go run ./cmd -once) invokes.
 //
-// Pipeline (the required Blnk-native flow, findings F1/F2): load the external
-// statement -> UploadExternalData (consume the real upload_id) -> create a
-// detection matching rule -> StartReconciliation (dry-run) -> poll
-// GetReconciliation to completion -> derive per-break identity via a valid
-// single-transaction dry-run ProbeBreak (a probe transport/validation error is
-// fail-closed to HITL, never counted as "unmatched", finding F2) -> hand each
-// break to the remediator (classify -> gate -> auto-remediate or escalate).
-// Resolved-run artifacts are written to a SEPARATE, idempotent file — never the
-// committed ground-truth corpus (finding F6). Summary counts are scoped to this
-// run's id set (finding M1). Any failure exits nonzero in one-shot (finding F4).
+// Pipeline (the required Blnk-native flow, findings F1/F2 and F-1): load the
+// external statement -> UploadExternalData (consume the real upload_id) -> hand
+// EVERY uploaded row to the remediator as a candidate break. The remediator
+// classifies and gates each break and then runs the run's SINGLE cold Blnk
+// reconciliation — one dedicated-cohort dry-run (POST /reconciliation/start-instant)
+// that is the deterministic arbiter of clearance (Rule 5.3). The pipeline runs
+// NO reconciliation of its own beforehand: a prior start+get would poison Blnk's
+// upload-agnostic pagination cache (protected-core defect INFO#4 / Rule 5.8) and
+// leave that cohort dry-run reading stale rows, so the former detection
+// reconciliation has been removed. Resolved-run artifacts are written to a
+// SEPARATE, idempotent file — never the committed ground-truth corpus (finding
+// F6). Summary counts are scoped to this run's id set (finding M1). Any failure
+// exits nonzero in one-shot (finding F4).
 //
 // The agent reaches Blnk exclusively over HTTP through internal/blnk; this file
 // imports only recon-agent's own internal packages plus the standard library
@@ -90,34 +101,52 @@ const (
 	summaryReportBase = "recon_summary.json"
 )
 
-// Agent-domain lifecycle/grammar vocabulary and Blnk-wire status/strategy
-// values are deliberately NOT redeclared in cmd (finding m-01). cmd consumes
-// the single module-wide sources of truth directly: break statuses and the
-// Rule 5.2 detection-rule grammar from internal/model (model.Status*,
-// model.Field*, model.Operator*), and Blnk's reconciliation strategy and
-// terminal run-status strings from internal/blnk (blnk.StrategyOneToOne,
-// blnk.ReconStatusCompleted, blnk.ReconStatusFailed). This removes the former
-// local duplicates that risked silently diverging from the packages that
-// actually write and read these values.
-//
-// The strict detection rule (built in detectionRule below) still pins ALL
-// matchable fields with the equals operator so a transaction counts as MATCHED
-// only when it aligns exactly on amount, date, reference AND currency with an
-// internal booking; anything differing in any field is surfaced as a break
-// (finding C-02).
+// Agent-domain lifecycle vocabulary is deliberately NOT redeclared in cmd
+// (finding m-01). cmd consumes the single module-wide source of truth directly:
+// break statuses and root causes from internal/model (model.Status*,
+// model.RootCause*). The Rule 5.2 rule grammar and Blnk's reconciliation
+// strategy / terminal run-status strings now live entirely behind the remediator
+// and the internal/blnk client, since the F-1 fix moved ALL reconciliation into
+// the remediator's cohort dry-run — the pipeline no longer builds a detection
+// rule or runs its own reconciliation. This keeps a single source of truth for
+// each value and removes the former local duplicates that risked silently
+// diverging from the packages that actually write and read them.
 
 // Lifecycle bounds.
+//
+// pipelineTimeout MUST stay below the 60s `make demo` SLA (finding MINOR-1).
+// Under a hung LLM the one-shot pipeline runs classification attempts until this
+// deadline elapses and then fails the remaining breaks closed, so the demo's
+// wall time is bounded by roughly this value (previously 90s, which overran the
+// SLA by ~30s). 55s leaves ample headroom while still allowing genuine retry
+// behavior; the healthy demo completes in ~1-2s and never approaches it. The
+// classifier's per-attempt bound (15s * 3 attempts = 45s worst case per break)
+// ensures the deadline, not a single hung break, governs total time.
 const (
-	readinessTimeout  = 30 * time.Second
-	reconPollInterval = 200 * time.Millisecond
-	pipelineTimeout   = 90 * time.Second
-	shutdownTimeout   = 10 * time.Second
+	readinessTimeout = 30 * time.Second
+	// pipelineTimeout bounds the whole one-shot pipeline. It is kept STRICTLY
+	// under the demo's <=60s budget (Finding #1 / MINOR-1) so the pipeline
+	// self-limits and exits well before `make demo`'s outer `timeout 60s` wrapper
+	// would send SIGTERM. It also exceeds the classifier's worst-case inference
+	// budget (classifier.defaultPerAttemptTimeout * (defaultMaxRetries+1) =
+	// 15s*3 = 45s) with headroom, so the fail-closed escalation write has time to
+	// run within the same budget.
+	pipelineTimeout = 55 * time.Second
+	shutdownTimeout = 10 * time.Second
 	// migrateTimeout bounds the whole boot migration — advisory-lock acquisition
 	// (itself capped at the store's migrateLockTimeout) plus the additive DDL — so
 	// startup can never hang unbounded on a stuck lock or a slow statement
 	// (finding M-16 "bounded startup"). It is comfortably larger than the store's
 	// lock ceiling so a legitimately queued migration still completes.
 	migrateTimeout = 60 * time.Second
+
+	// summaryTimeout bounds the post-pipeline store reads that tally the summary.
+	// It runs on a context DETACHED from the pipeline deadline (finding MINOR-1)
+	// so the scorecard still computes — and the demo still exits cleanly with a
+	// summary — even when the pipeline budget elapsed while failing breaks closed
+	// under a hung LLM. It is a reporting step, not inference, so it is not
+	// subject to the inference budget.
+	summaryTimeout = 15 * time.Second
 )
 
 // External-statement CSV bounds (finding M-07). The demo entrypoint reads the
@@ -160,6 +189,18 @@ const maxPipelineAttempts = 3
 // can shrink it; production code never mutates it.
 var pipelineRetryBackoff = 2 * time.Second
 
+// readinessProbeTimeout bounds a SINGLE dependency-readiness probe (finding
+// MINOR-2). Without a per-probe bound, a dependency that accepts the connection
+// but never answers made the FIRST probe block for the full HTTP-client timeout
+// (~60s) because the overall deadline was only checked BETWEEN probes — so the
+// effective startup wait was ~2x the intended readiness budget while the error
+// still cited the nominal budget. awaitReadiness now bounds each probe by the
+// smaller of this value and the time remaining until the deadline, so the wait
+// honors readinessTimeout closely and the reported elapsed time is accurate. It
+// is a var (not a const) solely so the readiness unit test can shrink it; only
+// production reads it, never mutates it.
+var readinessProbeTimeout = 5 * time.Second
+
 // summary captures the demo scorecard printed after the pipeline runs. Every
 // count is scoped to the current run's id set (finding M1).
 type summary struct {
@@ -173,24 +214,28 @@ type summary struct {
 // them (asserted below), so cmd/main.go wires them directly (Gate 9); the unit
 // test injects lightweight fakes / a mock Blnk endpoint (finding M5).
 type (
-	// reconClient is the subset of *blnk.Client the pipeline drives. Break
-	// detection reads Blnk's authoritative integer unmatched count from the
-	// run's single detection reconciliation (GetReconciliation) rather than
-	// probing per transaction, so the pipeline no longer calls ProbeBreak
-	// (findings C-02/C-03).
+	// reconClient is the subset of *blnk.Client the pipeline drives DIRECTLY.
+	// The F-1 fix makes the remediator's dedicated-cohort dry-run the run's
+	// SINGLE cold reconciliation and the deterministic arbiter of clearance
+	// (Rule 5.3), so the pipeline no longer runs its own detection
+	// reconciliation before triage: a prior start+get would poison Blnk's
+	// upload-agnostic pagination cache (protected-core defect INFO#4 / Rule 5.8)
+	// and leave that cohort dry-run reading stale rows. The pipeline therefore
+	// only uploads the statement; every reconciliation call now originates from
+	// the remediator's ConfirmCohortCleared. (The client STILL wraps and unit-
+	// tests StartReconciliation / GetReconciliation as AAP-consumed routes; they
+	// are simply no longer part of the pipeline's direct surface.)
 	reconClient interface {
 		UploadExternalData(ctx context.Context, source, filename string, file io.Reader) (blnk.UploadResponse, error)
-		CreateMatchingRule(ctx context.Context, rule blnk.MatchingRule) (blnk.MatchingRule, error)
-		DeleteMatchingRule(ctx context.Context, ruleID string) error
-		StartReconciliation(ctx context.Context, req blnk.StartReconciliationRequest) (string, error)
-		GetReconciliation(ctx context.Context, reconciliationID string) (blnk.Reconciliation, error)
 	}
-	// remediatorPort triages a single break (classify -> gate -> auto/escalate).
-	// baselineUnmatched is the run's detection unmatched count; the auto path
-	// confirms clearance only when a dry-run over the break's upload drives the
-	// unmatched count strictly below it (findings C-03, Rule 5.3).
+	// remediatorPort triages a COHORT of breaks in ONE call: classify -> gate ->
+	// propose a safe rule for each auto-eligible break -> run the run's SINGLE
+	// dedicated-cohort dry-run -> resolve every confirmed member or fail the
+	// cohort closed to HITL. Routing the whole cohort through one dry-run whose
+	// unmatched==0 proves EVERY member left the unmatched set is the
+	// deterministic-arbiter guarantee that fixes F-1 (Rule 5.3).
 	remediatorPort interface {
-		Handle(ctx context.Context, txn blnk.ExternalTransaction, uploadID string, baselineUnmatched int) error
+		ProcessCohort(ctx context.Context, breaks []blnk.ExternalTransaction, uploadID string) error
 	}
 	// pipelineStore is the persistence surface the pipeline uses directly. It is
 	// READ/idempotency-only: every break STATE change (classify/resolve/escalate)
@@ -317,7 +362,7 @@ func run(once bool, csvPath, resolvedPath, source string) error {
 	}
 	blnkClient := blnk.NewClient(cfg.BlnkBaseURL, cfg.BlnkApiKey)
 	cls := classifier.New(cfg)
-	rem := remediator.New(cls, blnkClient, auditWriter, st, cfg.ConfAutoThreshold, cfg.LLMModel)
+	rem := remediator.New(cls, blnkClient, auditWriter, st, cfg.ConfAutoThreshold, cfg.LLMModel, cfg.AgentBaseCurrency, remediator.DefaultClassifyBudget)
 
 	// M-11: on startup, run the durable rule-outbox recovery sweep BEFORE any
 	// pipeline work. It compensates (deletes + audits) any Blnk matching rule a
@@ -370,6 +415,7 @@ func runOnce(blnkClient blnkPort, rem remediatorPort, st storePort, csvPath, res
 	if err := writeSummaryReport(resolvedPath, s); err != nil {
 		return fmt.Errorf("write summary report: %w", err)
 	}
+
 	return nil
 }
 
@@ -489,19 +535,49 @@ func runStartupPipeline(ctx context.Context, srv readySetter, blnkClient blnkPor
 // awaitReadiness polls the Blnk endpoint and the agent store until both are
 // reachable or the timeout elapses (finding L1). It returns an error on timeout
 // (one-shot treats this as fatal) or when ctx is cancelled.
+//
+// Each probe is bounded by the smaller of readinessProbeTimeout and the time
+// remaining until the deadline (finding MINOR-2), so a dependency that accepts
+// the connection but never answers cannot make one probe run for the full
+// HTTP-client timeout — which previously doubled the effective wait because the
+// deadline was only checked BETWEEN probes. The timeout error reports the ACTUAL
+// elapsed wait (not the nominal budget), so the observed startup time and the
+// reported time agree.
 func awaitReadiness(ctx context.Context, rp readinessProbe, pg pinger, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
+	deadline := start.Add(timeout)
+	var lastErr error
 	for {
-		var lastErr error
-		if err := rp.Ready(ctx); err != nil {
+		// Stop as soon as the overall readiness budget is exhausted, reporting the
+		// real elapsed wait rather than the nominal timeout (finding MINOR-2).
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("readiness budget %s elapsed before any dependency probe completed", timeout)
+			}
+			return fmt.Errorf("timed out after %s: %w", time.Since(start).Round(time.Millisecond), lastErr)
+		}
+
+		// Bound this single probe by the smaller of the per-probe cap and the
+		// remaining budget, so one hung dependency cannot block past the deadline
+		// and the loop cannot overshoot it (finding MINOR-2).
+		probeTimeout := readinessProbeTimeout
+		if remaining < probeTimeout {
+			probeTimeout = remaining
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		if err := rp.Ready(probeCtx); err != nil {
 			lastErr = fmt.Errorf("blnk not ready: %w", err)
-		} else if err := pg.Ping(ctx); err != nil {
+		} else if err := pg.Ping(probeCtx); err != nil {
 			lastErr = fmt.Errorf("store not ready: %w", err)
 		} else {
+			cancel()
 			return nil
 		}
+		cancel()
+
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out after %s: %w", timeout, lastErr)
+			return fmt.Errorf("timed out after %s: %w", time.Since(start).Round(time.Millisecond), lastErr)
 		}
 		select {
 		case <-ctx.Done():
@@ -599,71 +675,29 @@ func runPipeline(ctx context.Context, bc reconClient, rem remediatorPort, st pip
 	}
 	log.Printf("recon-agent: uploaded %d record(s); upload_id=%s", upload.RecordCount, upload.UploadID)
 
-	// C-02: create the strict all-field detection matching rule (amount + date +
-	// reference + currency, all equals). Under it Blnk treats an uploaded row as
-	// matched only when it aligns EXACTLY with an internal booking on every
-	// field, so every genuine break differs in at least one field and is surfaced
-	// as unmatched — a live-proven detector whose authoritative unmatched count
-	// (read from GetReconciliation below) is the exact break set. This replaces
-	// the earlier reference-only detector and its sequential per-transaction
-	// ProbeBreak loop, which could neither satisfy exact-six semantics (C-02) nor
-	// avoid Blnk's upload-agnostic pagination cache (C-03). The rule is the
-	// required non-empty matching_rule_ids set for the run and is deleted
-	// afterwards so no detection rule accumulates in Blnk's catalog (finding F5
-	// parity).
-	detect, err := bc.CreateMatchingRule(ctx, detectionRule(runID))
-	if err != nil {
-		return summary{}, fmt.Errorf("create detection rule: %w", err)
-	}
-	if detect.RuleID == "" {
-		return summary{}, fmt.Errorf("create detection rule returned an empty rule id")
-	}
-	defer func() {
-		if derr := bc.DeleteMatchingRule(context.Background(), detect.RuleID); derr != nil {
-			log.Printf("recon-agent: could not delete detection rule %s: %v", detect.RuleID, derr)
-		}
-	}()
+	// F-1 (Rule 5.3): the pipeline performs NO reconciliation of its own before
+	// triage. Every uploaded row is a candidate break (deriveBreaks); the
+	// remediator's ProcessCohort classifies and gates each break and then runs
+	// the run's SINGLE cold reconciliation — one dedicated-cohort dry-run whose
+	// unmatched==0 proves EVERY cohort member left the unmatched set, so a
+	// resolution is attributable per break. A prior detection start+get here
+	// would poison Blnk's upload-agnostic pagination cache (protected-core defect
+	// INFO#4 / Rule 5.8) and leave that cohort dry-run reading stale rows, so the
+	// detection reconciliation the pipeline used to run has been removed. Blnk's
+	// authoritative upload record_count (validated above) is the count of rows
+	// actually ingested and is the "breaks in" tally.
+	breaks := deriveBreaks(scoped)
+	log.Printf("recon-agent: triaging %d candidate break(s) from the uploaded statement", len(breaks))
 
-	// F1: start a dry-run reconciliation over the uploaded batch and poll it to
-	// completion (the required upload -> start -> get flow).
-	reconID, err := bc.StartReconciliation(ctx, blnk.StartReconciliationRequest{
-		UploadID:        upload.UploadID,
-		Strategy:        blnk.StrategyOneToOne,
-		DryRun:          true,
-		MatchingRuleIDs: []string{detect.RuleID},
-	})
-	if err != nil {
-		return summary{}, fmt.Errorf("start reconciliation: %w", err)
-	}
-	if err := pollReconciliation(ctx, bc, reconID); err != nil {
-		return summary{}, fmt.Errorf("await reconciliation %s: %w", reconID, err)
-	}
-
-	// C-02: read Blnk's AUTHORITATIVE integer unmatched count from the completed
-	// detection reconciliation. This is the live-proven detection signal (and the
-	// baseline against which each break's clearance is later confirmed, C-03),
-	// derived entirely from Blnk's own result over the persisted upload rather
-	// than from sequential per-transaction probes that would trip Blnk's
-	// upload-agnostic pagination cache (Rule 5.8).
-	detectRecon, err := bc.GetReconciliation(ctx, reconID)
-	if err != nil {
-		return summary{}, fmt.Errorf("read reconciliation %s result: %w", reconID, err)
-	}
-	baselineUnmatched := detectRecon.UnmatchedTransactions
-	log.Printf("recon-agent: reconciliation %s completed; %d unmatched of %d uploaded", reconID, baselineUnmatched, len(scoped))
-
-	// C-02: derive the exact break set from the authoritative unmatched count.
-	breaks := deriveBreaks(scoped, baselineUnmatched)
-	log.Printf("recon-agent: derived %d break(s) to triage", len(breaks))
-
-	// Triage each break via the remediator, threading the detection upload and
-	// baseline so the auto path confirms clearance with a cache-safe,
-	// upload-scoped dry-run (findings C-03, Rule 5.3). A per-break agent-side
-	// infra failure aborts the run nonzero (finding F4).
-	for _, txn := range breaks {
-		if err := rem.Handle(ctx, txn, upload.UploadID, baselineUnmatched); err != nil {
-			return summary{}, fmt.Errorf("remediate break %q: %w", txn.ID, err)
-		}
+	// Triage the whole cohort in ONE call. ProcessCohort classifies+gates each
+	// break, proposes a deterministic safe rule for each auto-eligible one,
+	// confirms the eligible cohort with the run's single dedicated-cohort dry-run
+	// (Blnk decides, Rule 5.3), and either resolves every confirmed member or
+	// fails the cohort closed to HITL (Rule 5.7). A per-break agent-side infra
+	// failure (persistence/audit) surfaces here and aborts the run nonzero
+	// (finding F4).
+	if err := rem.ProcessCohort(ctx, breaks, upload.UploadID); err != nil {
+		return summary{}, fmt.Errorf("process break cohort: %w", err)
 	}
 
 	// M-15: mark this fixture's run durably complete so a serve restart over the
@@ -675,8 +709,13 @@ func runPipeline(ctx context.Context, bc reconClient, rem remediatorPort, st pip
 		return summary{}, fmt.Errorf("complete run for fixture %s: %w", fixtureKey, err)
 	}
 
-	// M1: scope every tally to THIS run's id set.
-	s, runBreaks, err := scopedSummary(ctx, st, runIDs)
+	// M1 + MINOR-1: scope every tally to THIS run's id set on a context DETACHED
+	// from the pipeline deadline and separately bounded, so the scorecard still
+	// computes — and the demo still exits cleanly with a summary — even when the
+	// pipeline budget elapsed while failing breaks closed under a hung dependency.
+	summaryCtx, cancelSummary := context.WithTimeout(context.Background(), summaryTimeout)
+	s, runBreaks, err := scopedSummary(summaryCtx, st, runIDs)
+	cancelSummary()
 	if err != nil {
 		return summary{}, err
 	}
@@ -707,92 +746,29 @@ func fixtureKeyFor(source string, txns []blnk.ExternalTransaction) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// deriveBreaks derives the exact set of breaks to triage from Blnk's
-// AUTHORITATIVE detection result (findings C-02/C-03) instead of sequential
-// per-transaction dry-run probes. The run's single detection reconciliation over
-// the persisted upload applies the strict all-field rule, under which a genuine
-// match requires amount, date, reference AND currency to align exactly; every
-// uploaded transaction that differs in any field is surfaced as unmatched.
+// deriveBreaks returns the set of candidate breaks to triage from the uploaded
+// statement. The F-1 fix removed the pipeline's own detection reconciliation
+// (which used to derive the break set from Blnk's authoritative unmatched
+// count), because ANY reconciliation run before the remediator's cohort dry-run
+// would poison Blnk's upload-agnostic pagination cache — a protected-core defect
+// the agent must not modify (INFO#4 / Rule 5.8) — and that cohort dry-run must
+// be the run's SINGLE cold read to attribute clearance per break (Rule 5.3).
 //
-// baselineUnmatched is that reconciliation's authoritative unmatched count. When
-// it equals the uploaded cardinality, EVERY uploaded transaction is a break — the
-// exact-six live proof the demo relies on. When it is smaller (an uploaded row
-// perfectly matched an internal booking and is therefore NOT a break), Blnk's
-// count-only HTTP surface cannot name WHICH rows matched (the unmatched id list
-// is never exposed, and reading Blnk's tables is forbidden, Rule 5.1); rather
-// than risk DROPPING a genuine break, the agent conservatively triages ALL
-// uploaded rows and logs the discrepancy. A perfectly-matched row that is
-// triaged simply clears immediately on its own confirmation and is recorded
-// auto-resolved — never lost. This per-row-identity imprecision is the residual
-// of Blnk's protected-core cache/list surface (Rule 5.8 / AAP §0.6.2) and is the
-// strongest derivation obtainable over the native HTTP contract.
-//
-// A zero unmatched count means Blnk matched every uploaded row: there are no
-// breaks to triage, which is a legitimate empty-result success (not an error).
-func deriveBreaks(txns []blnk.ExternalTransaction, baselineUnmatched int) []blnk.ExternalTransaction {
-	if baselineUnmatched == 0 {
-		log.Printf("recon-agent: detection reported 0 unmatched of %d uploaded; no breaks to triage", len(txns))
-		return nil
-	}
-	if baselineUnmatched != len(txns) {
-		// Defensive: Blnk matched some uploaded rows, but count-only HTTP cannot
-		// identify which. Triage all rows conservatively so no genuine break is
-		// dropped; a truly-matched row clears immediately and is auto-resolved.
-		log.Printf("recon-agent: WARNING detection unmatched count %d != %d uploaded; count-only HTTP cannot name matched rows (Rule 5.8), triaging all rows conservatively", baselineUnmatched, len(txns))
-	}
+// With no pre-triage reconciliation, EVERY uploaded row is treated as a
+// candidate break. This is safe and never over-resolves: the remediator
+// classifies and gates each candidate, and only the deterministic cohort
+// dry-run can mark any of them resolved (a row that is in fact already matched
+// simply clears on that dry-run and is recorded auto-resolved; a row that is a
+// genuine break either clears under its safe rule or fails closed to HITL).
+// Because Blnk validated the upload's record_count equals the uploaded
+// cardinality, len(txns) is Blnk's authoritative count of ingested rows and thus
+// the correct "breaks in" tally. Triaging all rows rather than a Blnk-named
+// subset is the strongest derivation obtainable over the count-only HTTP surface
+// without the forbidden reconciliation-before-cohort step.
+func deriveBreaks(txns []blnk.ExternalTransaction) []blnk.ExternalTransaction {
 	breaks := make([]blnk.ExternalTransaction, len(txns))
 	copy(breaks, txns)
 	return breaks
-}
-
-// detectionRule builds the run-scoped, grammar-conformant (Rule 5.2) detection
-// rule used to derive breaks from Blnk's authoritative unmatched count (finding
-// C-02). It pins ALL matchable fields (amount, date, reference, currency) with
-// the equals operator, so Blnk treats an uploaded transaction as MATCHED only
-// when it aligns EXACTLY with an internal booking on every field. A single-field
-// (e.g. reference-only) rule would spuriously match genuine breaks that share a
-// reference but differ in amount/date/currency — the defect this replaces — and
-// could not satisfy the exact-six break semantics. Under this strict rule every
-// genuine break (timing/amount/reference/currency mismatch, duplicate, or
-// missing internal counterpart) differs in at least one field and is surfaced as
-// unmatched, so the detection reconciliation's unmatched count equals the number
-// of breaks. The rule is deleted after the run (runPipeline's defer) so no
-// detection rule accumulates in Blnk's catalog (finding F5 parity).
-func detectionRule(runID string) blnk.MatchingRule {
-	return blnk.MatchingRule{
-		Name:        "recon-agent-detect-" + runID,
-		Description: "strict all-field detection rule (amount+date+reference+currency equals; surfaces every non-exact-match upload row as a break; auto-deleted after the run)",
-		Criteria: []blnk.MatchingCriteria{
-			{Field: model.FieldAmount, Operator: model.OperatorEquals},
-			{Field: model.FieldDate, Operator: model.OperatorEquals},
-			{Field: model.FieldReference, Operator: model.OperatorEquals},
-			{Field: model.FieldCurrency, Operator: model.OperatorEquals},
-		},
-	}
-}
-
-// pollReconciliation polls GET /reconciliation/:id until the run completes or
-// fails, or ctx is cancelled/timed out.
-func pollReconciliation(ctx context.Context, bc reconClient, reconID string) error {
-	ticker := time.NewTicker(reconPollInterval)
-	defer ticker.Stop()
-	for {
-		rec, err := bc.GetReconciliation(ctx, reconID)
-		if err != nil {
-			return err
-		}
-		switch rec.Status {
-		case blnk.ReconStatusCompleted:
-			return nil
-		case blnk.ReconStatusFailed:
-			return fmt.Errorf("reconciliation reported status %q", rec.Status)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
 }
 
 // runBreaksPageSize bounds each page fetched while collecting the current run's
@@ -1143,7 +1119,8 @@ func expectedActionFor(status string) string {
 
 // printSummary renders the demo scorecard: breaks in / auto-resolved /
 // escalated / audit events (all scoped to this run, finding M1). The label
-// text here MUST match the emitted label below ("audit events").
+// text here MUST match the emitted label below ("audit events") and the
+// makefile `demo` target comment (finding C1).
 func printSummary(w io.Writer, s summary) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "=== recon-agent pipeline summary ===")

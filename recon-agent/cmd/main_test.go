@@ -445,35 +445,41 @@ func (f *fakeBackend) hitlLen() int {
 // ---------------------------------------------------------------------------
 
 type fakeRemediator struct {
-	backend   *fakeBackend
-	handled   []string
-	baselines []int
-	escalate  map[string]bool // originalPrefix -> escalate instead of auto-resolve
-	err       error
+	backend  *fakeBackend
+	handled  []string
+	escalate map[string]bool // originalPrefix -> escalate instead of auto-resolve
+	err      error
 }
 
-func (r *fakeRemediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, uploadID string, baselineUnmatched int) error {
+// ProcessCohort models the real remediator's cohort triage (the F-1 seam): it
+// records every break it was handed and reproduces the store/audit side effects
+// the real remediator commits per break — auto-resolve, or escalate to HITL for
+// any id whose original prefix is in the escalate map. A configured err aborts
+// the WHOLE cohort (finding F4), mirroring how a per-break infra failure aborts
+// the real remediator's run.
+func (r *fakeRemediator) ProcessCohort(ctx context.Context, breaks []blnk.ExternalTransaction, uploadID string) error {
 	if r.err != nil {
 		return r.err
 	}
-	r.handled = append(r.handled, txn.ID)
-	r.baselines = append(r.baselines, baselineUnmatched)
-	if r.escalate[originalPrefix(txn.ID)] {
-		cls := model.BreakClassification{ExternalTxnID: txn.ID, RootCause: model.RootCauseUnknown, Confidence: 0.10}
-		_ = r.backend.UpsertBreak(ctx, cls, txn, model.Provenance{UploadID: uploadID}, model.StatusQueued)
-		_ = r.backend.EnqueueHITL(ctx, txn.ID, "low_confidence")
+	for _, txn := range breaks {
+		r.handled = append(r.handled, txn.ID)
+		if r.escalate[originalPrefix(txn.ID)] {
+			cls := model.BreakClassification{ExternalTxnID: txn.ID, RootCause: model.RootCauseUnknown, Confidence: 0.10}
+			_ = r.backend.UpsertBreak(ctx, cls, txn, model.Provenance{UploadID: uploadID}, model.StatusQueued)
+			_ = r.backend.EnqueueHITL(ctx, txn.ID, "low_confidence")
+			_ = r.backend.Record(ctx, model.AuditEvent{
+				ExternalTxnID: txn.ID, Actor: "agent", Action: "escalated",
+				Provenance: model.Provenance{UploadID: uploadID},
+			})
+			continue
+		}
+		cls := model.BreakClassification{ExternalTxnID: txn.ID, RootCause: model.RootCauseTiming, Confidence: 0.99}
+		_ = r.backend.UpsertBreak(ctx, cls, txn, model.Provenance{UploadID: uploadID}, model.StatusAutoResolved)
 		_ = r.backend.Record(ctx, model.AuditEvent{
-			ExternalTxnID: txn.ID, Actor: "agent", Action: "escalated",
-			Provenance: model.Provenance{UploadID: uploadID},
+			ExternalTxnID: txn.ID, Actor: "agent", Action: "resolved",
+			Provenance: model.Provenance{UploadID: uploadID, ReconID: "recon-x"},
 		})
-		return nil
 	}
-	cls := model.BreakClassification{ExternalTxnID: txn.ID, RootCause: model.RootCauseTiming, Confidence: 0.99}
-	_ = r.backend.UpsertBreak(ctx, cls, txn, model.Provenance{UploadID: uploadID}, model.StatusAutoResolved)
-	_ = r.backend.Record(ctx, model.AuditEvent{
-		ExternalTxnID: txn.ID, Actor: "agent", Action: "resolved",
-		Provenance: model.Provenance{UploadID: uploadID, ReconID: "recon-x"},
-	})
 	return nil
 }
 
@@ -565,38 +571,39 @@ func TestRunPipeline_DrivesBlnkNativeFlow(t *testing.T) {
 		t.Fatalf("runPipeline returned error: %v", err)
 	}
 
-	// C-02: the required upload -> create-rule -> start -> get -> cleanup flow
-	// occurred, in order. There is NO per-transaction start-instant probe: breaks
-	// are derived from the detection reconciliation's authoritative count.
+	// F-1: the pipeline now performs ONLY the upload directly; it runs NO
+	// reconciliation of its own before triage (a prior detection start+get would
+	// poison Blnk's upload-agnostic pagination cache, INFO#4 / Rule 5.8, and
+	// leave the remediator's cohort dry-run reading stale rows). Every
+	// reconciliation call now originates from the remediator's ConfirmCohortCleared
+	// (here a fake), so the pipeline's direct Blnk surface is upload only.
 	assertSubsequence(t, m.sequence(), []string{
 		"POST /reconciliation/upload",
-		"POST /reconciliation/matching-rules",
-		"POST /reconciliation/start",
-		"GET /reconciliation/{id}",
-		"DELETE /reconciliation/matching-rules/{id}",
 	})
 	for _, req := range m.sequence() {
-		if req == "POST /reconciliation/start-instant" {
-			t.Fatalf("pipeline must not per-transaction probe (findings C-02/C-03); saw start-instant in %v", m.sequence())
+		switch req {
+		case "POST /reconciliation/matching-rules",
+			"POST /reconciliation/start",
+			"GET /reconciliation/{id}",
+			"DELETE /reconciliation/matching-rules/{id}":
+			t.Fatalf("pipeline must not run its own detection reconciliation (F-1); saw %q in %v", req, m.sequence())
 		}
 	}
 
-	// The detection rule was deleted (finding F5 parity: no orphan rule).
-	if len(m.deletedRules) != 1 {
-		t.Fatalf("expected exactly 1 detection rule deleted, got %d (%v)", len(m.deletedRules), m.deletedRules)
+	// No detection rule is created, so none is deleted (the former F5 parity is
+	// moot — the pipeline creates no orphan-prone detection rule at all).
+	if len(m.deletedRules) != 0 {
+		t.Fatalf("expected no detection rule created/deleted by the pipeline, got %d (%v)", len(m.deletedRules), m.deletedRules)
 	}
 
-	// C-02: with the detection count == uploaded cardinality (4), ALL uploaded
-	// rows are triaged as breaks, each carrying the run baseline.
+	// F-1: EVERY uploaded row is handed to the remediator as a candidate break
+	// (the cohort dry-run, not a pipeline-side count, decides clearance).
 	if len(rem.handled) != 4 {
 		t.Fatalf("expected all 4 uploaded rows triaged, got %d (%v)", len(rem.handled), rem.handled)
 	}
-	for i, id := range rem.handled {
+	for _, id := range rem.handled {
 		if !strings.Contains(id, "-") {
 			t.Fatalf("handled id %q is not run-scoped", id)
-		}
-		if rem.baselines[i] != 4 {
-			t.Fatalf("expected baseline 4 threaded to Handle, got %d", rem.baselines[i])
 		}
 	}
 
@@ -666,34 +673,6 @@ func TestRunPipeline_EscalatedBreaksCounted(t *testing.T) {
 	if actions["T1"] != "auto_resolve" || actions["T3"] != "auto_resolve" ||
 		actions["T2"] != "escalate" || actions["T4"] != "escalate" {
 		t.Fatalf("unexpected expected_action mapping: %v", actions)
-	}
-}
-
-func TestRunPipeline_ZeroUnmatchedNoBreaks(t *testing.T) {
-	m := newMockBlnk()
-	defer m.close()
-	m.mainUnmatchedSet = true
-	m.mainUnmatched = 0 // Blnk matched every uploaded row
-	backend := newFakeBackend()
-	rem := &fakeRemediator{backend: backend}
-	resolved := filepath.Join(t.TempDir(), "out.jsonl")
-
-	s, err := runPipeline(context.Background(), m.client(), rem, backend, writeTempCSV(t, happyCSV), resolved, "seed-bank")
-	if err != nil {
-		t.Fatalf("a zero-unmatched detection is a legitimate empty success, got error: %v", err)
-	}
-	if len(rem.handled) != 0 {
-		t.Fatalf("expected no breaks triaged when unmatched==0, got %v", rem.handled)
-	}
-	if s.breaksIn != 0 || s.autoResolved != 0 || s.escalated != 0 {
-		t.Fatalf("unexpected summary: %+v", s)
-	}
-	// M-15: the run is still marked complete on the empty-result path.
-	if backend.completeRunCalls != 1 {
-		t.Fatalf("expected CompleteRun even for an empty result, got %d", backend.completeRunCalls)
-	}
-	if _, statErr := os.Stat(resolved); !os.IsNotExist(statErr) {
-		t.Fatalf("no artifact file should be written when there are no breaks")
 	}
 }
 
@@ -823,47 +802,14 @@ func TestRunPipeline_UploadCountMismatchIsFatal(t *testing.T) {
 	}
 }
 
-func TestRunPipeline_StartFailurePropagates(t *testing.T) {
-	m := newMockBlnk()
-	defer m.close()
-	m.startStatus = http.StatusBadRequest
-	backend := newFakeBackend()
-	rem := &fakeRemediator{backend: backend}
-
-	_, err := runPipeline(context.Background(), m.client(), rem, backend,
-		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank")
-	if err == nil {
-		t.Fatalf("expected error when start reconciliation fails, got nil")
-	}
-}
-
-func TestRunPipeline_ReconFailedStatusIsFatal(t *testing.T) {
-	m := newMockBlnk()
-	defer m.close()
-	m.mainReconStatus = "failed"
-	backend := newFakeBackend()
-	rem := &fakeRemediator{backend: backend}
-
-	_, err := runPipeline(context.Background(), m.client(), rem, backend,
-		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank")
-	if err == nil {
-		t.Fatalf("expected error when the reconciliation reports failed, got nil")
-	}
-}
-
-func TestRunPipeline_CreateRuleFailurePropagates(t *testing.T) {
-	m := newMockBlnk()
-	defer m.close()
-	m.createRuleStatus = http.StatusBadRequest
-	backend := newFakeBackend()
-	rem := &fakeRemediator{backend: backend}
-
-	_, err := runPipeline(context.Background(), m.client(), rem, backend,
-		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank")
-	if err == nil {
-		t.Fatalf("expected error when detection-rule creation fails, got nil")
-	}
-}
+// NOTE: the former TestRunPipeline_StartFailurePropagates,
+// TestRunPipeline_ReconFailedStatusIsFatal and TestRunPipeline_CreateRuleFailurePropagates
+// tested failures of the pipeline's OWN detection reconciliation (start / get /
+// create-rule). The F-1 fix removed that detection step — all reconciliation now
+// lives inside the remediator's cohort dry-run — so those pipeline-level failure
+// modes no longer exist here. Their equivalents (start-instant failure, failed
+// status, rule-create failure) are exercised in internal/blnk/client_test.go
+// (ConfirmCohortCleared*) and internal/remediator/remediator_test.go.
 
 func TestRunPipeline_RemediatorErrorPropagates(t *testing.T) {
 	m := newMockBlnk()
@@ -892,47 +838,36 @@ func TestRunPipeline_RejectsCommittedCorpusPath(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C-02: detector unit tests (deriveBreaks / detectionRule)
+// F-1: candidate-break derivation (deriveBreaks)
 // ---------------------------------------------------------------------------
 
 func TestDeriveBreaks(t *testing.T) {
 	txns := []blnk.ExternalTransaction{{ID: "A"}, {ID: "B"}, {ID: "C"}, {ID: "D"}}
 
-	if got := deriveBreaks(txns, 0); got != nil {
-		t.Fatalf("zero unmatched must yield no breaks, got %v", got)
+	// The F-1 fix removed the pipeline's own detection reconciliation: EVERY
+	// uploaded row is now a candidate break (the remediator's cohort dry-run,
+	// not a pipeline-side count, decides clearance). deriveBreaks therefore
+	// returns all rows.
+	got := deriveBreaks(txns)
+	if len(got) != len(txns) {
+		t.Fatalf("deriveBreaks must return every uploaded row, got %d want %d", len(got), len(txns))
 	}
-	if got := deriveBreaks(txns, len(txns)); len(got) != len(txns) {
-		t.Fatalf("unmatched==cardinality must triage all rows, got %d", len(got))
+	for i := range txns {
+		if got[i].ID != txns[i].ID {
+			t.Fatalf("deriveBreaks must preserve order/identity: got[%d]=%q want %q", i, got[i].ID, txns[i].ID)
+		}
 	}
-	// Mismatch (some rows matched): conservatively triage ALL rows so no genuine
-	// break is dropped (count-only HTTP cannot name matched rows, Rule 5.8).
-	if got := deriveBreaks(txns, 2); len(got) != len(txns) {
-		t.Fatalf("count<cardinality must still triage all rows conservatively, got %d", len(got))
-	}
-	if got := deriveBreaks(nil, 0); got != nil {
-		t.Fatalf("empty input with zero unmatched must yield nil, got %v", got)
-	}
-}
 
-func TestDetectionRuleGrammar(t *testing.T) {
-	r := detectionRule("abc123")
-	if len(r.Criteria) != 4 {
-		t.Fatalf("detection rule must pin all four matchable fields, got %d criteria: %+v", len(r.Criteria), r.Criteria)
+	// It returns a COPY, so a caller mutating the result never corrupts the
+	// source slice.
+	got[0].ID = "mutated"
+	if txns[0].ID != "A" {
+		t.Fatalf("deriveBreaks must return a copy, source was mutated to %q", txns[0].ID)
 	}
-	fields := map[string]bool{}
-	for _, c := range r.Criteria {
-		if c.Operator != model.OperatorEquals {
-			t.Fatalf("every detection criterion must use %q, got %q", model.OperatorEquals, c.Operator)
-		}
-		fields[c.Field] = true
-	}
-	for _, want := range []string{model.FieldAmount, model.FieldDate, model.FieldReference, model.FieldCurrency} {
-		if !fields[want] {
-			t.Fatalf("detection rule is missing the %q criterion: %+v", want, r.Criteria)
-		}
-	}
-	if !strings.Contains(r.Name, "abc123") {
-		t.Fatalf("detection rule name should be run-scoped: %q", r.Name)
+
+	// An empty statement yields an empty (never nil-panicking) break set.
+	if got := deriveBreaks(nil); len(got) != 0 {
+		t.Fatalf("empty input must yield an empty break set, got %d", len(got))
 	}
 }
 
@@ -1249,6 +1184,141 @@ func TestAwaitReadiness_ContextCancelled(t *testing.T) {
 	}
 }
 
+// blockingProbe simulates a dependency that ACCEPTS a probe but never answers
+// (finding MINOR-2's black-hole): Ready blocks until the per-probe context is
+// cancelled, then returns an error — it is never "ready". A safety valve far
+// larger than any per-probe bound prevents a regressed (unbounded)
+// awaitReadiness from hanging the test forever; a probe that reaches the safety
+// valve necessarily runs far longer than the per-probe bound and so trips the
+// duration assertion below.
+type blockingProbe struct {
+	mu       sync.Mutex
+	calls    int
+	maxBlock time.Duration
+	safety   time.Duration
+}
+
+func (p *blockingProbe) Ready(ctx context.Context) error {
+	start := time.Now()
+	p.mu.Lock()
+	p.calls++
+	safety := p.safety
+	p.mu.Unlock()
+	if safety <= 0 {
+		safety = 2 * time.Second
+	}
+	timer := time.NewTimer(safety)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		// Correctly bounded by awaitReadiness's per-probe context.
+	case <-timer.C:
+		// Safety valve: only reached if the probe was NOT bounded (regression).
+	}
+	d := time.Since(start)
+	p.mu.Lock()
+	if d > p.maxBlock {
+		p.maxBlock = d
+	}
+	p.mu.Unlock()
+	return fmt.Errorf("blnk not answering (blocked %s)", d.Round(time.Millisecond))
+}
+
+// parseTimedOutElapsed extracts the duration reported in a "timed out after
+// <dur>: ..." error message.
+func parseTimedOutElapsed(t *testing.T, msg string) time.Duration {
+	t.Helper()
+	const marker = "timed out after "
+	i := strings.Index(msg, marker)
+	if i < 0 {
+		t.Fatalf("message missing %q: %q", marker, msg)
+	}
+	rest := msg[i+len(marker):]
+	j := strings.Index(rest, ":")
+	if j < 0 {
+		t.Fatalf("message missing duration terminator: %q", msg)
+	}
+	d, perr := time.ParseDuration(strings.TrimSpace(rest[:j]))
+	if perr != nil {
+		t.Fatalf("could not parse elapsed from %q: %v", msg, perr)
+	}
+	return d
+}
+
+// TestAwaitReadiness_PerProbeBoundedAndReportsActualElapsed is the regression
+// guard for finding MINOR-2. Against a dependency that accepts the connection
+// but never answers, awaitReadiness must (1) bound EACH probe by
+// readinessProbeTimeout so no single probe blocks for the full HTTP-client
+// timeout, (2) bound the overall loop by the deadline so the wait does not
+// overshoot (previously ~2x the budget because the deadline was only checked
+// BETWEEN probes), and (3) report the ACTUAL elapsed wait, not the nominal
+// budget. The old, unbounded code passed the caller context straight to the
+// probe, so a single probe blocked until the safety valve and only one probe
+// ever ran — which trips every assertion here.
+func TestAwaitReadiness_PerProbeBoundedAndReportsActualElapsed(t *testing.T) {
+	oldInterval := readinessInterval
+	oldProbe := readinessProbeTimeout
+	readinessInterval = time.Millisecond
+	readinessProbeTimeout = 20 * time.Millisecond
+	defer func() {
+		readinessInterval = oldInterval
+		readinessProbeTimeout = oldProbe
+	}()
+
+	const budget = 120 * time.Millisecond
+	probe := &blockingProbe{safety: 2 * time.Second}
+
+	start := time.Now()
+	err := awaitReadiness(context.Background(), probe, &fakePinger{}, budget)
+	wall := time.Since(start)
+
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected a timeout error, got %v", err)
+	}
+	// (1) Per-probe bound enforced: no single probe ran near the safety valve.
+	if probe.maxBlock > 500*time.Millisecond {
+		t.Fatalf("a single probe blocked %v — per-probe bound not enforced (finding MINOR-2)", probe.maxBlock)
+	}
+	// (2) No overshoot: the whole wait stays within the budget (+ CI margin),
+	// not ~2x it.
+	if wall > budget+750*time.Millisecond {
+		t.Fatalf("awaitReadiness took %v, want <= budget %v (+margin) — overshoot (finding MINOR-2)", wall, budget)
+	}
+	// Multiple bounded probes must have occurred; an unbounded probe would block
+	// on the safety valve and run exactly once.
+	if probe.calls < 2 {
+		t.Fatalf("expected multiple bounded probes, got %d (finding MINOR-2)", probe.calls)
+	}
+	// (3) The error reports the ACTUAL elapsed wait, close to the real wall time,
+	// not some nominal-but-wrong value.
+	reported := parseTimedOutElapsed(t, err.Error())
+	if reported < budget-20*time.Millisecond {
+		t.Fatalf("reported elapsed %v is below the real wait ~%v; message must reflect actual elapsed (finding MINOR-2)", reported, budget)
+	}
+	if reported > wall+50*time.Millisecond {
+		t.Fatalf("reported elapsed %v exceeds the real wall %v; message must reflect actual elapsed (finding MINOR-2)", reported, wall)
+	}
+}
+
+// TestPipelineTimeoutWithinDemoBudget asserts the one-shot pipeline budget stays
+// safely under the 60s `make demo` SLA (finding MINOR-1), and that the readiness
+// budget fits within the pipeline budget so startup waiting cannot by itself
+// exhaust the whole demo budget.
+func TestPipelineTimeoutWithinDemoBudget(t *testing.T) {
+	const demoSLA = 60 * time.Second
+	if pipelineTimeout >= demoSLA {
+		t.Fatalf("pipelineTimeout %v must be < the %v demo SLA (finding MINOR-1)", pipelineTimeout, demoSLA)
+	}
+	if readinessTimeout > pipelineTimeout {
+		t.Fatalf("readinessTimeout %v must be <= pipelineTimeout %v so readiness cannot exhaust the demo budget", readinessTimeout, pipelineTimeout)
+	}
+	// The per-probe readiness bound must be strictly smaller than the overall
+	// readiness budget, or bounding each probe would be a no-op.
+	if readinessProbeTimeout >= readinessTimeout {
+		t.Fatalf("readinessProbeTimeout %v must be < readinessTimeout %v (finding MINOR-2)", readinessProbeTimeout, readinessTimeout)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // M-16: serve-mode startup pipeline (bounded retry policy)
 // ---------------------------------------------------------------------------
@@ -1458,55 +1528,12 @@ func TestRunOnce_PipelineErrorPropagates(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// pollReconciliation — terminal-status / error / cancellation branches.
-// ---------------------------------------------------------------------------
-
-// reconStatusClient returns a *blnk.Client pointed at a stub that answers
-// GET /reconciliation/<id> with the given status (or an HTTP error when
-// httpStatus is a non-200 code), so pollReconciliation's branches can be driven
-// deterministically.
-func reconStatusClient(t *testing.T, status string, httpStatus int) *blnk.Client {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if httpStatus != 0 && httpStatus != http.StatusOK {
-			http.Error(w, "boom", httpStatus)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"reconciliation_id":      "recon_1",
-			"status":                 status,
-			"unmatched_transactions": 1,
-		})
-	}))
-	t.Cleanup(srv.Close)
-	return blnk.NewClient(srv.URL, "")
-}
-
-func TestPollReconciliation_FailedStatusIsError(t *testing.T) {
-	bc := reconStatusClient(t, "failed", 0)
-	if err := pollReconciliation(context.Background(), bc, "recon_1"); err == nil {
-		t.Fatal("a reconciliation reporting status=failed must be surfaced as an error")
-	}
-}
-
-func TestPollReconciliation_TransportErrorPropagates(t *testing.T) {
-	bc := reconStatusClient(t, "", http.StatusInternalServerError)
-	if err := pollReconciliation(context.Background(), bc, "recon_1"); err == nil {
-		t.Fatal("a transport/status error from GetReconciliation must propagate")
-	}
-}
-
-func TestPollReconciliation_ContextCancel(t *testing.T) {
-	// A non-terminal status keeps the loop polling; the bounded context must make
-	// it give up rather than spin forever.
-	bc := reconStatusClient(t, "processing", 0)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
-	defer cancel()
-	if err := pollReconciliation(ctx, bc, "recon_1"); err == nil {
-		t.Fatal("pollReconciliation must return when the context deadline elapses")
-	}
-}
+// NOTE: the former TestPollReconciliation_* tests (and their reconStatusClient
+// helper) exercised the pipeline's own pollReconciliation loop, which the F-1
+// fix removed along with the detection reconciliation. The equivalent poll-to-
+// terminal / failed-status / context-cancel branches are now covered by
+// internal/blnk/client_test.go's ConfirmCohortCleared* tests, since all
+// reconciliation polling now lives inside the blnk client's cohort dry-run.
 
 // ---------------------------------------------------------------------------
 // scopedSummary — each id-scoped query's error branch (finding M-14). The

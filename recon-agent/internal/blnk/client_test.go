@@ -3,6 +3,7 @@ package blnk
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -735,30 +736,35 @@ func TestResponseBodyBounded(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// ReconcileUpload / ConfirmClearedOverUpload (finding C-03).
+// ConfirmCohortCleared (finding F-1, Rule 5.3).
 //
-// These exercise the cache-safe, UPLOAD-SCOPED deterministic-arbiter seam that
-// replaced the removed per-transaction ProbeBreak. ReconcileUpload runs a DRY
-// RUN reconciliation over ONE persisted upload with the proposed rule and
-// returns Blnk's authoritative unmatched count; ConfirmClearedOverUpload reports
-// the break cleared only when that count drops strictly BELOW the detection
-// baseline (Rule 5.3 — Blnk, never LLM confidence, decides clearance).
+// This exercises the per-break-attributable, cache-safe deterministic-arbiter
+// seam that replaced the earlier aggregate ConfirmClearedOverUpload. It submits
+// the eligible cohort inline via POST /reconciliation/start-instant with FRESH
+// per-run "cohort-" ids and dry_run=true (never mutating Blnk), polls GET to a
+// terminal status, and reports cleared ONLY when Blnk's authoritative counts show
+// unmatched==0 AND matched+unmatched==len(cohort). Because the dedicated upload
+// contains ONLY the cohort, unmatched==0 proves EVERY member left the unmatched
+// set, so a resolution is attributable per break (Rule 5.3); the cardinality
+// guard fails closed if a stale-cache read (protected-core defect INFO#4)
+// returns a different-cardinality page.
 // -----------------------------------------------------------------------------
 
-// reconMock returns an httptest server answering the two routes ReconcileUpload
-// drives. Successive GET /reconciliation/<id> calls return statuses[i] (the last
-// element repeats once exhausted); the returned unmatched count is `unmatched`.
-// It captures the decoded start request into *gotStart for assertion.
-func reconMock(t *testing.T, reconID string, unmatched int, statuses []string, gotStart *StartReconciliationRequest) *httptest.Server {
+// cohortMock returns an httptest server answering the two routes
+// ConfirmCohortCleared drives (POST /reconciliation/start-instant, then GET
+// /reconciliation/<id>). Successive GET calls return statuses[i] (the last
+// element repeats once exhausted); the reconciliation reports matched/unmatched.
+// It captures the decoded start-instant request into *gotReq for assertion.
+func cohortMock(t *testing.T, reconID string, matched, unmatched int, statuses []string, gotReq *InstantReconciliationRequest) *httptest.Server {
 	t.Helper()
 	var getCalls int
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requireBlnkKey(t, r)
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == routeStart:
-			if gotStart != nil {
-				if err := json.NewDecoder(r.Body).Decode(gotStart); err != nil {
-					t.Fatalf("decode start body: %v", err)
+		case r.Method == http.MethodPost && r.URL.Path == routeStartInstant:
+			if gotReq != nil {
+				if err := json.NewDecoder(r.Body).Decode(gotReq); err != nil {
+					t.Fatalf("decode start-instant body: %v", err)
 				}
 			}
 			_ = json.NewEncoder(w).Encode(StartReconciliationResponse{ReconciliationID: reconID})
@@ -771,7 +777,9 @@ func reconMock(t *testing.T, reconID string, unmatched int, statuses []string, g
 			_ = json.NewEncoder(w).Encode(Reconciliation{
 				ReconciliationID:      reconID,
 				Status:                st,
+				MatchedTransactions:   matched,
 				UnmatchedTransactions: unmatched,
+				IsDryRun:              true,
 			})
 		default:
 			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
@@ -779,138 +787,153 @@ func reconMock(t *testing.T, reconID string, unmatched int, statuses []string, g
 	}))
 }
 
-func TestReconcileUploadReturnsUnmatchedCount(t *testing.T) {
-	var gotStart StartReconciliationRequest
-	srv := reconMock(t, "recon_probe_1", 4, []string{statusCompleted}, &gotStart)
+func cohortOf(n int) []ExternalTransaction {
+	cohort := make([]ExternalTransaction, n)
+	for i := range cohort {
+		cohort[i] = ExternalTransaction{ID: fmt.Sprintf("ext_%d", i), Amount: 100, Currency: "USD"}
+	}
+	return cohort
+}
+
+func TestConfirmCohortClearedAllCleared(t *testing.T) {
+	// A 3-member cohort whose dedicated dry-run reports matched=3, unmatched=0:
+	// every member left the unmatched set => cleared (Rule 5.3), attributable per
+	// break because the dedicated upload contained ONLY these three rows.
+	var gotReq InstantReconciliationRequest
+	srv := cohortMock(t, "recon_cohort_ok", 3, 0, []string{statusCompleted}, &gotReq)
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
-	unmatched, reconID, err := c.ReconcileUpload(context.Background(), "upload_x", []string{"rule_9"})
+	cleared, reconID, err := c.ConfirmCohortCleared(context.Background(), cohortOf(3), []string{"rule_a", "rule_b", "rule_c"})
 	if err != nil {
-		t.Fatalf("ReconcileUpload: %v", err)
+		t.Fatalf("ConfirmCohortCleared: %v", err)
 	}
-	if unmatched != 4 {
-		t.Fatalf("unmatched: got %d want 4", unmatched)
+	if !cleared {
+		t.Fatal("unmatched==0 and matched+unmatched==len(cohort) must report cleared=true")
 	}
-	if reconID != "recon_probe_1" {
-		t.Fatalf("reconID: got %q want recon_probe_1", reconID)
+	if reconID != "recon_cohort_ok" {
+		t.Fatalf("confirming recon id: got %q want recon_cohort_ok", reconID)
 	}
-	// Rule 5.3 / C-03: the confirmation reconciliation MUST be a DRY RUN scoped to
-	// the caller's ORIGINAL upload, carrying exactly the proposed rule and the
-	// probe strategy — never a live run and never a fresh single-txn upload.
-	if !gotStart.DryRun {
-		t.Fatal("ReconcileUpload must run a DRY RUN (Rule 5.3), never mutate Blnk state")
+	// Rule 5.3 / F3/F8: the cohort dry-run MUST be a DRY RUN carrying the proposed
+	// rules and FRESH ephemeral "cohort-" ids (never the caller's real external
+	// ids, which would collide on Blnk's external_transactions_pkey across reruns).
+	if !gotReq.DryRun {
+		t.Fatal("ConfirmCohortCleared must run a DRY RUN (Rule 5.3), never mutate Blnk state")
 	}
-	if gotStart.UploadID != "upload_x" {
-		t.Fatalf("upload id not threaded through: got %q want upload_x", gotStart.UploadID)
+	if gotReq.Strategy != probeStrategy {
+		t.Fatalf("strategy: got %q want %q", gotReq.Strategy, probeStrategy)
 	}
-	if gotStart.Strategy != probeStrategy {
-		t.Fatalf("strategy: got %q want %q", gotStart.Strategy, probeStrategy)
+	if len(gotReq.ExternalTransactions) != 3 {
+		t.Fatalf("cohort size submitted: got %d want 3", len(gotReq.ExternalTransactions))
 	}
-	if len(gotStart.MatchingRuleIDs) != 1 || gotStart.MatchingRuleIDs[0] != "rule_9" {
-		t.Fatalf("matching rule ids: got %v want [rule_9]", gotStart.MatchingRuleIDs)
+	for _, txn := range gotReq.ExternalTransactions {
+		if !strings.HasPrefix(txn.ID, "cohort-") {
+			t.Fatalf("cohort member must carry a fresh cohort- id, got %q", txn.ID)
+		}
+	}
+	if len(gotReq.MatchingRuleIDs) != 3 {
+		t.Fatalf("matching rule ids: got %v want 3 ids", gotReq.MatchingRuleIDs)
 	}
 }
 
-func TestReconcileUploadPollsUntilTerminal(t *testing.T) {
+func TestConfirmCohortClearedNotClearedWhenUnmatched(t *testing.T) {
+	// A misclassified no-counterpart break in the cohort cannot clear: the
+	// dedicated dry-run reports unmatched>0, so the WHOLE cohort fails closed
+	// (cleared=false). LLM confidence must never substitute for this Blnk verdict.
+	srv := cohortMock(t, "recon_cohort_no", 2, 1, []string{statusCompleted}, nil)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	cleared, _, err := c.ConfirmCohortCleared(context.Background(), cohortOf(3), []string{"rule_a", "rule_b", "rule_c"})
+	if err != nil {
+		t.Fatalf("ConfirmCohortCleared: %v", err)
+	}
+	if cleared {
+		t.Fatal("unmatched(1) > 0 must report cleared=false (fail closed)")
+	}
+}
+
+func TestConfirmCohortClearedCardinalityGuardFailsClosed(t *testing.T) {
+	// INFO#4 defense: a stale-cache read returns a DIFFERENT-cardinality page
+	// (matched=6, unmatched=0 for a 3-member cohort). Even though unmatched==0,
+	// matched+unmatched(6) != len(cohort)(3), so the cardinality guard fails
+	// closed rather than trusting an unattributable result.
+	srv := cohortMock(t, "recon_cohort_stale", 6, 0, []string{statusCompleted}, nil)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	cleared, _, err := c.ConfirmCohortCleared(context.Background(), cohortOf(3), []string{"rule_a"})
+	if err != nil {
+		t.Fatalf("ConfirmCohortCleared: %v", err)
+	}
+	if cleared {
+		t.Fatal("a different-cardinality (stale-cache) read must fail the guard closed (cleared=false)")
+	}
+}
+
+func TestConfirmCohortClearedPollsUntilTerminal(t *testing.T) {
 	// First GET is non-terminal ("processing"); the loop must poll again on the
 	// ticker and only return once Blnk reports a terminal "completed".
-	srv := reconMock(t, "recon_poll", 2, []string{"processing", statusCompleted}, nil)
+	srv := cohortMock(t, "recon_cohort_poll", 2, 0, []string{"processing", statusCompleted}, nil)
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
-	unmatched, _, err := c.ReconcileUpload(context.Background(), "upload_poll", nil)
+	cleared, _, err := c.ConfirmCohortCleared(context.Background(), cohortOf(2), []string{"rule_a"})
 	if err != nil {
-		t.Fatalf("ReconcileUpload: %v", err)
+		t.Fatalf("ConfirmCohortCleared: %v", err)
 	}
-	if unmatched != 2 {
-		t.Fatalf("unmatched: got %d want 2", unmatched)
+	if !cleared {
+		t.Fatal("matched=2 unmatched=0 for a 2-member cohort must report cleared=true")
 	}
 }
 
-func TestReconcileUploadFailedStatusErrors(t *testing.T) {
-	srv := reconMock(t, "recon_fail", 0, []string{statusFailed}, nil)
+func TestConfirmCohortClearedEmptyCohortErrors(t *testing.T) {
+	c := NewClient("http://unused.invalid", testKey)
+	if _, _, err := c.ConfirmCohortCleared(context.Background(), nil, []string{"rule_a"}); err == nil {
+		t.Fatal("an empty cohort must be rejected with an error, never treated as cleared")
+	}
+}
+
+func TestConfirmCohortClearedFailedStatusErrors(t *testing.T) {
+	srv := cohortMock(t, "recon_cohort_fail", 0, 0, []string{statusFailed}, nil)
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
-	if _, _, err := c.ReconcileUpload(context.Background(), "upload_f", nil); err == nil {
+	cleared, _, err := c.ConfirmCohortCleared(context.Background(), cohortOf(1), []string{"rule_a"})
+	if err == nil {
 		t.Fatal("a Blnk reconciliation that reports status=failed must surface an error")
 	}
+	if cleared {
+		t.Fatal("a failed reconciliation must never report cleared=true")
+	}
 }
 
-func TestReconcileUploadStartError(t *testing.T) {
+func TestConfirmCohortClearedStartError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
-	if _, _, err := c.ReconcileUpload(context.Background(), "upload_e", nil); err == nil {
-		t.Fatal("a failed start must abort ReconcileUpload with an error")
+	cleared, _, err := c.ConfirmCohortCleared(context.Background(), cohortOf(1), nil)
+	if err == nil {
+		t.Fatal("a failed start-instant must abort ConfirmCohortCleared with an error")
+	}
+	if cleared {
+		t.Fatal("an errored confirmation must never report cleared=true")
 	}
 }
 
-func TestReconcileUploadContextCancel(t *testing.T) {
+func TestConfirmCohortClearedContextCancel(t *testing.T) {
 	// GET never reaches a terminal status, so the bounded poll must give up when
 	// the caller's context deadline elapses rather than blocking forever.
-	srv := reconMock(t, "recon_hang", 1, []string{"processing"}, nil)
+	srv := cohortMock(t, "recon_cohort_hang", 1, 0, []string{"processing"}, nil)
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, _, err := c.ReconcileUpload(ctx, "upload_h", nil); err == nil {
-		t.Fatal("ReconcileUpload must error when the context deadline elapses before completion")
-	}
-}
-
-func TestConfirmClearedOverUploadClearedWhenBelowBaseline(t *testing.T) {
-	// baseline 6, unmatched drops to 5 => the created rule moved at least one txn
-	// out of the unmatched set => Blnk confirms clearance (Rule 5.3).
-	srv := reconMock(t, "recon_confirm", 5, []string{statusCompleted}, nil)
-	defer srv.Close()
-
-	c := NewClient(srv.URL, testKey)
-	cleared, reconID, err := c.ConfirmClearedOverUpload(context.Background(), "upload_c", "rule_ok", 6)
-	if err != nil {
-		t.Fatalf("ConfirmClearedOverUpload: %v", err)
-	}
-	if !cleared {
-		t.Fatal("unmatched(5) < baseline(6) must report cleared=true")
-	}
-	if reconID != "recon_confirm" {
-		t.Fatalf("confirming recon id: got %q want recon_confirm", reconID)
-	}
-}
-
-func TestConfirmClearedOverUploadNotClearedWhenNotBelowBaseline(t *testing.T) {
-	// unmatched stays at the baseline => no txn left the unmatched set => NOT
-	// cleared. LLM confidence must never substitute for this Blnk verdict.
-	srv := reconMock(t, "recon_noclear", 6, []string{statusCompleted}, nil)
-	defer srv.Close()
-
-	c := NewClient(srv.URL, testKey)
-	cleared, _, err := c.ConfirmClearedOverUpload(context.Background(), "upload_n", "rule_noop", 6)
-	if err != nil {
-		t.Fatalf("ConfirmClearedOverUpload: %v", err)
-	}
-	if cleared {
-		t.Fatal("unmatched(6) not < baseline(6) must report cleared=false")
-	}
-}
-
-func TestConfirmClearedOverUploadPropagatesError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "down", http.StatusBadGateway)
-	}))
-	defer srv.Close()
-
-	c := NewClient(srv.URL, testKey)
-	cleared, _, err := c.ConfirmClearedOverUpload(context.Background(), "upload_p", "rule_x", 6)
-	if err == nil {
-		t.Fatal("a reconciliation transport error must propagate (fail-closed), not be swallowed")
-	}
-	if cleared {
-		t.Fatal("an errored confirmation must never report cleared=true")
+	if _, _, err := c.ConfirmCohortCleared(ctx, cohortOf(1), nil); err == nil {
+		t.Fatal("ConfirmCohortCleared must error when the context deadline elapses before completion")
 	}
 }

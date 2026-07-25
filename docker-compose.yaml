@@ -202,14 +202,18 @@ services:
       # protections in the HITL server are defense in depth.
       - "127.0.0.1:${HITL_PORT:-8088}:${HITL_PORT:-8088}"
     healthcheck:
-      # Container liveness (finding M-16): /healthz is always-on once the HITL
-      # server binds (readiness is separately exposed at /readyz). busybox wget
-      # ships in the alpine runtime; the image also declares this HEALTHCHECK.
-      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:${HITL_PORT:-8088}/healthz >/dev/null 2>&1 || exit 1"]
-      interval: 15s
+      # Container READINESS gate: /readyz returns 200 only after Blnk is reachable
+      # AND the startup pipeline has completed (503 until then), so the container
+      # is reported healthy only when it can actually serve — never a false-green.
+      # BusyBox wget (alpine runtime) exits non-zero on a 503, so an unready agent
+      # is reported unhealthy; /healthz remains available for plain liveness. The
+      # start_period is generous to cover the initial one-shot pipeline (dependency
+      # readiness + LLM classification of the seed breaks).
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:${HITL_PORT:-8088}/readyz || exit 1"]
+      interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 90s
     depends_on:
       # Gate startup on REAL readiness of both dependencies (finding M-16), not
       # merely service_started.

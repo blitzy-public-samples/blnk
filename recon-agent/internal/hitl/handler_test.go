@@ -45,6 +45,7 @@ type fakeStore struct {
 
 	breaks []store.Break
 	events []model.AuditEvent
+	hitl   []store.HITLItem // rows returned by ListHITL (status-page reason column)
 
 	// LoadBreak (re_drive eligibility gate) programmed result. status defaults
 	// to "queued" when empty so happy-path tests need not set it; found is
@@ -67,6 +68,7 @@ type fakeStore struct {
 	dequeueErr    error // returned by DequeueHITLTx
 	listBreaksErr error
 	listAuditErr  error
+	listHITLErr   error // returned by ListHITL (status-page queue read)
 
 	// Claim/lease programming for the re_drive processing lease (finding M-15).
 	// claimBusy makes ClaimBreak report "another owner holds it" (granted=false,
@@ -91,6 +93,12 @@ func (f *fakeStore) ListBreaks(ctx context.Context) ([]store.Break, error) {
 }
 func (f *fakeStore) ListAudit(ctx context.Context) ([]model.AuditEvent, error) {
 	return f.events, f.listAuditErr
+}
+
+// ListHITL is the status-page read of the pending HITL queue; its rows supply
+// the per-break routing reason surfaced in the "Reason" column (finding F-I).
+func (f *fakeStore) ListHITL(ctx context.Context) ([]store.HITLItem, error) {
+	return f.hitl, f.listHITLErr
 }
 
 // LoadBreak is the re_drive eligibility read: it returns the break's current
@@ -750,16 +758,28 @@ func TestSecurityHeadersPresent(t *testing.T) {
 	checks := map[string]string{
 		"X-Content-Type-Options": "nosniff",
 		"X-Frame-Options":        "DENY",
-		"Referrer-Policy":        "no-referrer",
-		"Cache-Control":          "no-store",
+		// F-CRIT-1: same-origin (not no-referrer) so a same-origin form POST
+		// carries a real Origin and is not rejected 403 by the mutation guard.
+		"Referrer-Policy": "same-origin",
+		"Cache-Control":   "no-store",
 	}
 	for k, want := range checks {
 		if got := h.Get(k); got != want {
 			t.Fatalf("header %s = %q, want %q", k, got, want)
 		}
 	}
-	if csp := h.Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors 'none'") || !strings.Contains(csp, "form-action 'self'") {
+	csp := h.Get("Content-Security-Policy")
+	if !strings.Contains(csp, "frame-ancestors 'none'") || !strings.Contains(csp, "form-action 'self'") {
 		t.Fatalf("CSP = %q, want frame-ancestors 'none' + form-action 'self'", csp)
+	}
+	// F-INFO-1: the inline data: favicon must be permitted so no CSP error is
+	// logged on every page load, WITHOUT relaxing the script restriction that
+	// keeps injected markup inert (the XSS defense).
+	if !strings.Contains(csp, "img-src 'self' data:") {
+		t.Fatalf("CSP = %q, want img-src 'self' data: (favicon)", csp)
+	}
+	if !strings.Contains(csp, "script-src 'none'") {
+		t.Fatalf("CSP = %q, want script-src 'none' preserved (XSS defense)", csp)
 	}
 }
 
@@ -1942,5 +1962,179 @@ func TestRuleCriteriaViews(t *testing.T) {
 		if got[i].Field != crit[i].Field || got[i].Operator != crit[i].Operator {
 			t.Fatalf("criterion %d field/operator not carried through", i)
 		}
+	}
+}
+
+// serverWithThreshold builds a status server whose auto-remediation threshold is
+// set, so the below-threshold tag (finding F-A) can be exercised — newTestServer
+// leaves the threshold at its zero value.
+func serverWithThreshold(st breakStore, thr float64) *Server {
+	return NewServer(config.Config{LLMModel: "kimi-k3", ConfAutoThreshold: thr}, st, &fakeAudit{}, &fakeProber{})
+}
+
+// TestStatusPageBelowThresholdTagAndHeader proves finding F-A: the page header
+// surfaces the auto-remediation threshold, and a queued break whose confidence
+// is below that threshold renders an explicit "below auto-threshold" tag so a
+// human-gated break can never read as auto-eligible.
+func TestStatusPageBelowThresholdTagAndHeader(t *testing.T) {
+	st := &fakeStore{
+		breaks: []store.Break{{
+			Classification: model.BreakClassification{
+				ExternalTxnID: "b-low",
+				RootCause:     model.RootCauseTiming,
+				Confidence:    0.40,
+			},
+			Status: statusQueued,
+		}},
+	}
+	srv := serverWithThreshold(st, 0.85)
+	w := doGET(t, srv, "/")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status page = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "below auto-threshold") {
+		t.Fatalf("below-threshold break must render the below-auto-threshold tag (F-A)")
+	}
+	if !strings.Contains(body, "0.8500") {
+		t.Fatalf("status page header must surface the auto-remediation threshold 0.8500 (F-A)")
+	}
+}
+
+// TestStatusPageAtOrAboveThresholdNoTag proves the F-A tag is confined to breaks
+// strictly below the threshold: a confident break carries no tag.
+func TestStatusPageAtOrAboveThresholdNoTag(t *testing.T) {
+	st := &fakeStore{
+		breaks: []store.Break{{
+			Classification: model.BreakClassification{
+				ExternalTxnID: "b-high",
+				RootCause:     model.RootCauseTiming,
+				Confidence:    0.95,
+			},
+			Status: statusQueued,
+		}},
+	}
+	srv := serverWithThreshold(st, 0.85)
+	w := doGET(t, srv, "/")
+	body := w.Body.String()
+	if strings.Contains(body, "below auto-threshold") {
+		t.Fatalf("a break at/above the threshold must NOT render the below-auto-threshold tag (F-A)")
+	}
+}
+
+// TestStatusPageReasonColumn proves finding F-I: the status page shows a Reason
+// column, and a queued break's HITL routing reason (from ListHITL) is surfaced
+// against its row.
+func TestStatusPageReasonColumn(t *testing.T) {
+	st := &fakeStore{
+		breaks: []store.Break{{
+			Classification: model.BreakClassification{
+				ExternalTxnID: "b-reg",
+				RootCause:     model.RootCauseUnknown,
+				Confidence:    0.10,
+			},
+			Status: statusQueued,
+		}},
+		hitl: []store.HITLItem{{ExternalTxnID: "b-reg", Reason: "regulated flow requires human review"}},
+	}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := doGET(t, srv, "/")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status page = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `<th scope="col">Reason</th>`) {
+		t.Fatalf("breaks table must include a Reason column header (F-I)")
+	}
+	if !strings.Contains(body, "regulated flow requires human review") {
+		t.Fatalf("queued break must surface its HITL routing reason (F-I)")
+	}
+}
+
+// TestStatusPageUnnamedRulePlaceholder proves finding F-E: a proposed rule with
+// an empty Name renders a "(unnamed rule)" placeholder rather than a blank cell,
+// so the reviewer always sees that a rule was proposed.
+func TestStatusPageUnnamedRulePlaceholder(t *testing.T) {
+	st := &fakeStore{
+		breaks: []store.Break{{
+			Classification: model.BreakClassification{
+				ExternalTxnID: "b-unnamed",
+				RootCause:     model.RootCauseAmountDrift,
+				Confidence:    0.50,
+				ProposedRule: &blnk.MatchingRule{
+					Name: "",
+					Criteria: []blnk.MatchingCriteria{
+						{Field: fieldAmount, Operator: operatorEquals, AllowableDrift: 0.01},
+					},
+				},
+			},
+			Status: statusQueued,
+		}},
+	}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := doGET(t, srv, "/")
+	body := w.Body.String()
+	if !strings.Contains(body, "(unnamed rule)") {
+		t.Fatalf("an unnamed proposed rule must render the (unnamed rule) placeholder (F-E)")
+	}
+}
+
+// TestStatusPageAuditProvenanceColumns proves finding F-K: the audit table
+// surfaces the break origin (source label + Blnk upload batch id) from the event
+// provenance so a reviewer can trace which statement/batch a break came from.
+func TestStatusPageAuditProvenanceColumns(t *testing.T) {
+	st := &fakeStore{
+		events: []model.AuditEvent{{
+			ExternalTxnID: "b-src",
+			Actor:         "agent",
+			Action:        audit.ActionClassified,
+			Confidence:    0.72,
+			Provenance:    model.Provenance{Model: "kimi-k3", Source: "acme-bank-stmt", UploadID: "upload-4242"},
+		}},
+	}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := doGET(t, srv, "/")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status page = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`<th scope="col">Source</th>`, `<th scope="col">Upload ID</th>`, "acme-bank-stmt", "upload-4242"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("audit table must surface provenance origin %q (F-K)", want)
+		}
+	}
+}
+
+// TestStatusPageHumanDecisionConfidenceEmDash proves finding F-J: a human
+// decision (accepted / re_driven / rejected) is recorded with no classification
+// confidence, so the audit row renders an em-dash rather than a misleading
+// "0.0000" — while an agent action keeps its genuine numeric confidence.
+func TestStatusPageHumanDecisionConfidenceEmDash(t *testing.T) {
+	st := &fakeStore{
+		events: []model.AuditEvent{
+			{ExternalTxnID: "b-1", Actor: "operator", Action: audit.ActionAccepted, Confidence: 0},
+			{ExternalTxnID: "b-1", Actor: "agent", Action: audit.ActionClassified, Confidence: 0.7300},
+		},
+	}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := doGET(t, srv, "/")
+	body := w.Body.String()
+	if !strings.Contains(body, "&mdash;") {
+		t.Fatalf("a human-decision audit row must render an em-dash for confidence (F-J)")
+	}
+	if !strings.Contains(body, "0.7300") {
+		t.Fatalf("an agent audit row must keep its genuine numeric confidence (F-J)")
+	}
+}
+
+// TestStatusPageListHITLErrorReturns500 covers the queue-read failure path added
+// for the Reason column (F-I): a ListHITL error is handled like a breaks/audit
+// read failure — the sanitized error panel with a 500, never a partial page.
+func TestStatusPageListHITLErrorReturns500(t *testing.T) {
+	st := &fakeStore{listHITLErr: errors.New("hitl queue query failed")}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := doGET(t, srv, "/")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 when ListHITL fails", w.Code)
 	}
 }

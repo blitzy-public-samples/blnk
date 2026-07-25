@@ -343,10 +343,10 @@ func (c *Client) DeleteMatchingRule(ctx context.Context, ruleID string) error {
 // defect must NOT be modified (Rule 5.8 / AAP §0.6.2). ProbeBreak is therefore
 // retained ONLY for the single, human-triggered HITL re_drive of one break — a
 // lone, non-sequential invocation for which the collision does not manifest. The
-// automated pipeline's break detection and clearance confirmation instead use
-// the cache-safe, upload-scoped ReconcileUpload / ConfirmClearedOverUpload
-// bridge below, which funnels every reconciliation through the ONE persisted
-// upload and so makes the shared cache benign.
+// automated pipeline's clearance confirmation instead uses ConfirmCohortCleared
+// below, which submits the whole eligible cohort as ONE dedicated dry-run — the
+// run's single COLD read — so per-break clearance is attributable (unmatched==0
+// proves every cohort row cleared) rather than inferred from an aggregate count.
 func (c *Client) ProbeBreak(ctx context.Context, txn ExternalTransaction, matchingRuleIDs []string) (cleared bool, reconID string, err error) {
 	// Double-persist elimination (findings F3/F8). Blnk's start-instant
 	// UNCONDITIONALLY persists every submitted external transaction by its OWN id
@@ -406,32 +406,75 @@ func (c *Client) ProbeBreak(ctx context.Context, txn ExternalTransaction, matchi
 	}
 }
 
-// ReconcileUpload runs a cache-safe, UPLOAD-SCOPED dry-run reconciliation over
-// an ALREADY-PERSISTED upload and returns Blnk's authoritative integer unmatched
-// count plus the reconciliation id (findings C-02/C-03). It is the cache-safe
-// replacement for sequential per-transaction ProbeBreak probing.
+// ConfirmCohortCleared is the cache-safe, PER-BREAK-ATTRIBUTABLE deterministic
+// arbiter (Rule 5.3) for whether EVERY break in an auto-remediation cohort left
+// the unmatched set. It submits the WHOLE cohort as a SINGLE dry-run
+// reconciliation over a DEDICATED ephemeral upload (via start-instant,
+// one_to_one) carrying the cohort's proposed matching rules, polls it to a
+// terminal status, then reads Blnk's authoritative integer counts and reports:
 //
-// Blnk's external-transaction pagination cache
-// (database/reconciliation.go GetExternalTransactionsPaginated) keys ONLY on
-// (batch_size, offset) and OMITS the upload id, so within its 5-minute TTL the
-// FIRST reconciliation's rows are returned to every later reconciliation
-// regardless of upload id. That defect lives in Blnk's PROTECTED core and MUST
-// NOT be modified (Rule 5.8 / AAP §0.6.2). The agent instead makes the shared
-// cache BENIGN by funnelling detection AND every clearance confirmation through
-// the SAME persisted upload: every such reconciliation reads exactly that one
-// upload's rows, so a cache hit returns the rows the caller intended rather than
-// a stale different-upload page. Callers MUST pass the SAME uploadID they
-// detected over. The run is a dry run (never mutating Blnk state) and is polled
-// to a terminal status exactly like ProbeBreak.
-func (c *Client) ReconcileUpload(ctx context.Context, uploadID string, matchingRuleIDs []string) (unmatched int, reconID string, err error) {
-	reconID, err = c.StartReconciliation(ctx, StartReconciliationRequest{
-		UploadID:        uploadID,
-		Strategy:        probeStrategy,
-		DryRun:          true,
-		MatchingRuleIDs: matchingRuleIDs,
+//	cleared == (unmatched == 0 && matched+unmatched == len(cohort))
+//
+// WHY A COHORT (finding F-1, Rule 5.3). Blnk's HTTP surface returns only integer
+// counts, never the unmatched id list, and its matcher applies each rule
+// GLOBALLY to every row of the reconciled set. The earlier
+// ConfirmClearedOverUpload confirmed a single break by re-reconciling the FULL
+// statement upload with that break's rule and declaring success when the
+// aggregate unmatched count merely dropped below a baseline. Because a relaxed
+// timing rule ({amount,currency,reference} equality) matches ANY row sharing
+// that profile, a genuinely un-clearable break (e.g. a mis-labelled
+// missing_internal posting, or a duplicate) could ride the count-drop caused by
+// an UNRELATED row and be falsely auto-resolved with a reconciliation id whose
+// unmatched set still contained it — the exact F-1 / Rule 5.3 violation.
+// Reconciling a DEDICATED upload that contains ONLY the cohort's rows removes
+// that ambiguity: unmatched == 0 proves Blnk moved EVERY one of the cohort's
+// rows out of the unmatched set, so clearance is attributable to the whole
+// cohort with no unrelated row able to mask a residual break. The caller
+// resolves the cohort only on a true verdict and otherwise fails every member
+// closed to HITL (Rule 5.7).
+//
+// CARDINALITY GUARD (INFO#4, Rule 5.8). Blnk's external-transaction pagination
+// cache (database/reconciliation.go GetExternalTransactionsPaginated) keys ONLY
+// on (batch_size, offset) and OMITS the upload id; within its 5-minute TTL a
+// reconciliation can read a DIFFERENT upload's cached page. That defect lives in
+// Blnk's PROTECTED core and MUST NOT be modified (Rule 5.8 / AAP §0.6.2). The
+// matched+unmatched == len(cohort) guard makes such a stale read FAIL CLOSED: if
+// Blnk processed a page whose row count differs from the cohort size, the guard
+// reports NOT cleared, so a stale cache read can never falsely resolve a break —
+// it degrades to HITL routing. For a cache HIT to be benign the caller MUST run
+// this as the run's COLD read (no prior reconciliation this run); the pipeline
+// removed its detection reconciliation precisely so this cohort confirm is that
+// single cold read.
+//
+// FRESH IDS (findings F3/F8). Blnk's start-instant UNCONDITIONALLY persists each
+// submitted external transaction by its own id (plain INSERT, no ON CONFLICT),
+// EVEN under dry_run, and blnk.external_transactions keys on the id, so
+// resubmitting a real break id collides on external_transactions_pkey (HTTP
+// 500). Because Blnk matches FIELD-TO-FIELD and never by id (reconciliation.go
+// matchesRules), every cohort member is copied with a fresh ephemeral
+// "cohort-<uuid>" id that preserves all matchable fields; the verdict is
+// identical but no id is ever inserted twice, so repeated confirms across a run
+// and across reruns against a shared Blnk database never collide. The caller's
+// slice and elements are left unmodified (each cohort entry is copied).
+func (c *Client) ConfirmCohortCleared(ctx context.Context, cohort []ExternalTransaction, matchingRuleIDs []string) (cleared bool, reconID string, err error) {
+	if len(cohort) == 0 {
+		return false, "", fmt.Errorf("confirm cohort cleared: empty cohort")
+	}
+
+	cohortCopy := make([]ExternalTransaction, len(cohort))
+	for i, txn := range cohort {
+		txn.ID = "cohort-" + uuid.NewString()
+		cohortCopy[i] = txn
+	}
+
+	reconID, err = c.InstantReconciliation(ctx, InstantReconciliationRequest{
+		ExternalTransactions: cohortCopy,
+		Strategy:             probeStrategy,
+		DryRun:               true,
+		MatchingRuleIDs:      matchingRuleIDs,
 	})
 	if err != nil {
-		return 0, "", fmt.Errorf("reconcile upload start: %w", err)
+		return false, "", fmt.Errorf("confirm cohort start-instant: %w", err)
 	}
 
 	pollCtx, cancel := context.WithTimeout(ctx, c.probeTimeout)
@@ -445,46 +488,25 @@ func (c *Client) ReconcileUpload(ctx context.Context, uploadID string, matchingR
 		if gErr == nil {
 			switch recon.Status {
 			case statusCompleted:
-				return recon.UnmatchedTransactions, reconID, nil
+				// Deterministic arbiter (Rule 5.3): cleared iff Blnk moved EVERY
+				// cohort row out of the unmatched set (unmatched == 0) AND the run
+				// actually processed the whole cohort (cardinality guard against a
+				// stale cache page). Either condition failing => NOT cleared => the
+				// caller fails every cohort member closed to HITL.
+				cleared = recon.UnmatchedTransactions == 0 &&
+					recon.MatchedTransactions+recon.UnmatchedTransactions == len(cohort)
+				return cleared, reconID, nil
 			case statusFailed:
-				return 0, reconID, fmt.Errorf("reconcile upload %s failed", reconID)
+				return false, reconID, fmt.Errorf("confirm cohort reconciliation %s failed", reconID)
 			}
 		}
 		select {
 		case <-pollCtx.Done():
-			return 0, reconID, fmt.Errorf("reconcile upload %s did not complete: %w", reconID, pollCtx.Err())
+			return false, reconID, fmt.Errorf("confirm cohort reconciliation %s did not complete: %w", reconID, pollCtx.Err())
 		case <-ticker.C:
 			// poll again
 		}
 	}
-}
-
-// ConfirmClearedOverUpload is the cache-safe DETERMINISTIC ARBITER (Rule 5.3)
-// for whether a proposed matching rule cleared its break (finding C-03). It runs
-// a dry-run reconciliation over the break's ORIGINAL persisted upload with the
-// single proposed ruleID and reports the break cleared when Blnk's authoritative
-// unmatched count drops strictly BELOW baselineUnmatched — the count under the
-// strict detection rule, i.e. with no safe rule applied. A strict decrease is
-// live proof that adding this rule moved at least one external transaction out
-// of the unmatched set; LLM confidence never substitutes for it. reconID is the
-// confirming reconciliation id the caller records on the resolved audit event.
-//
-// IDENTITY PRECISION (residual, Rule 5.8). Blnk's HTTP surface returns only
-// integer counts — never the unmatched id list — and its matcher applies a rule
-// GLOBALLY to every row in the upload, so when two breaks share a match profile
-// (e.g. a duplicate posting that also fits a timing break's relaxed rule) the
-// count alone cannot attribute the clearance to one specific id. Attributing the
-// clearance to the break whose safe rule was just added is the strongest
-// attribution obtainable over the native HTTP contract (Rule 5.1) without the
-// forbidden upload-scoped cache/list fix in Blnk's protected core (Rule 5.8 /
-// AAP §0.6.2). The resolution remains genuinely Blnk-arbitrated (the unmatched
-// set demonstrably shrank), satisfying Rule 5.3.
-func (c *Client) ConfirmClearedOverUpload(ctx context.Context, uploadID, ruleID string, baselineUnmatched int) (cleared bool, reconID string, err error) {
-	unmatched, reconID, err := c.ReconcileUpload(ctx, uploadID, []string{ruleID})
-	if err != nil {
-		return false, "", err
-	}
-	return unmatched < baselineUnmatched, reconID, nil
 }
 
 // newJSONRequest builds an HTTP request with the X-Blnk-Key header attached and,

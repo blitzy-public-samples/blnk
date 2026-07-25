@@ -53,14 +53,6 @@ const testThreshold = 0.85
 // in finding m-2 (provenance.upload_id is populated, no longer always empty).
 const testUploadID = "upload_test"
 
-// testBaselineUnmatched is the detection-baseline unmatched count a single
-// planted break carries into Handle: without the created rule the break
-// remains unmatched (count 1), so ConfirmClearedOverUpload reports cleared
-// only when a dry-run over the upload drives the count strictly below it
-// (to 0). Threading it through Handle mirrors the pipeline, which passes
-// Blnk's authoritative detection count (finding C-03, Rule 5.3).
-const testBaselineUnmatched = 1
-
 // -----------------------------------------------------------------------------
 // Minimal database/sql driver used ONLY to mint real *sql.Tx values so
 // fakeBackend can key its per-transaction buffers by the *sql.Tx pointer and
@@ -102,12 +94,26 @@ type fakeClassifier struct {
 	result model.BreakClassification
 	err    error
 	calls  int
+	// delay, when > 0, makes Classify block for that long OR until the caller's
+	// context is cancelled — whichever comes first — returning the context error
+	// on cancellation. It models a slow/hung LLM endpoint so the remediator's
+	// per-break classify budget (INFO#3) can be exercised: a budget shorter than
+	// delay cancels the call and the break fails closed to HITL (Rule 5.7).
+	delay time.Duration
 }
 
-func (f *fakeClassifier) Classify(_ context.Context, _ blnk.ExternalTransaction) (model.BreakClassification, error) {
+func (f *fakeClassifier) Classify(ctx context.Context, _ blnk.ExternalTransaction) (model.BreakClassification, error) {
 	f.mu.Lock()
 	f.calls++
+	delay := f.delay
 	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return model.BreakClassification{}, ctx.Err()
+		}
+	}
 	return f.result, f.err
 }
 
@@ -122,21 +128,19 @@ func (f *fakeClassifier) callCount() int {
 // -----------------------------------------------------------------------------
 
 type fakeBlnk struct {
-	mu           sync.Mutex
-	created      blnk.MatchingRule
-	createErr    error
-	cleared      bool
-	reconID      string
-	probeErr     error
-	createCalls  int
-	probeCalls   int
+	mu          sync.Mutex
+	created     blnk.MatchingRule
+	createErr   error
+	cleared     bool
+	reconID     string
+	probeErr    error
+	createCalls int
+	probeCalls  int
+	// probeRuleIDs captures the matching-rule id set threaded into each
+	// ConfirmCohortCleared call (one call per cohort; for the cohort-of-one
+	// Handle wrapper that is a single rule id), so a test can assert the
+	// confirmation targeted the created/persisted rule(s).
 	probeRuleIDs [][]string
-	// probeUploadIDs / probeBaselines capture the upload id and detection
-	// baseline threaded into each ConfirmClearedOverUpload call (finding
-	// C-03), so a test can assert the confirmation is scoped to the break's
-	// ORIGINAL persisted upload and compared against the run's baseline.
-	probeUploadIDs []string
-	probeBaselines []int
 	// createdRules records every rule passed to CreateMatchingRule (finding F7),
 	// so tests can assert the ACTUAL narrowed rule that was POSTed (Value
 	// populated, {currency,equals} appended) rather than the classifier's raw
@@ -172,23 +176,21 @@ func (f *fakeBlnk) DeleteMatchingRule(_ context.Context, ruleID string) error {
 	return f.deleteErr
 }
 
-// ConfirmClearedOverUpload is the cache-safe deterministic-arbiter seam the
-// remediator uses after creating a rule (finding C-03): a single dry-run
-// reconciliation over the break's ORIGINAL persisted upload with the created
-// rule, reporting cleared when Blnk's authoritative unmatched count drops
-// strictly below the detection baseline. The fake records the rule id (so a
-// test can assert the confirmation targeted the created/persisted rule), the
-// upload id, and the baseline it was asked to compare against; the cleared /
-// reconID / error verdict remain test-configurable knobs. The historical
-// probe* field names are retained because they model exactly one arbiter
-// call per auto-remediation attempt, as the removed per-txn ProbeBreak did.
-func (f *fakeBlnk) ConfirmClearedOverUpload(_ context.Context, uploadID, ruleID string, baselineUnmatched int) (bool, string, error) {
+// ConfirmCohortCleared is the cache-safe, per-break-attributable
+// deterministic-arbiter seam the remediator uses after creating the eligible
+// cohort's rules (finding F-1, Rule 5.3): ONE dry-run reconciliation over a
+// dedicated upload containing ONLY the cohort, reporting cleared when Blnk's
+// authoritative unmatched count is 0 (every member left the unmatched set). The
+// fake records the cohort's rule id set (so a test can assert the confirmation
+// targeted the created/persisted rules) and returns the test-configurable
+// cleared / reconID / error verdict. It is invoked exactly once per cohort; the
+// cohort-of-one Handle wrapper therefore records a single rule id, matching the
+// per-attempt semantics the earlier ConfirmClearedOverUpload modelled.
+func (f *fakeBlnk) ConfirmCohortCleared(_ context.Context, cohort []blnk.ExternalTransaction, matchingRuleIDs []string) (bool, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.probeCalls++
-	f.probeRuleIDs = append(f.probeRuleIDs, []string{ruleID})
-	f.probeUploadIDs = append(f.probeUploadIDs, uploadID)
-	f.probeBaselines = append(f.probeBaselines, baselineUnmatched)
+	f.probeRuleIDs = append(f.probeRuleIDs, append([]string(nil), matchingRuleIDs...))
 	if f.probeErr != nil {
 		return false, "", f.probeErr
 	}
@@ -874,7 +876,7 @@ func newHarness(t *testing.T) *harness {
 	cls := &fakeClassifier{}
 	bnk := &fakeBlnk{}
 	back := newBackend(t)
-	rem := New(cls, bnk, back, back, testThreshold, "kimi-k3")
+	rem := New(cls, bnk, back, back, testThreshold, "kimi-k3", "", 0)
 	return &harness{rem: rem, cls: cls, bnk: bnk, back: back}
 }
 
@@ -896,7 +898,7 @@ func TestHandleAutoResolvesHighConfidenceBreak(t *testing.T) {
 	const id = "ext_auto"
 	h := autoHarness(t, id)
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 
@@ -987,7 +989,7 @@ func TestHandleGateMatrix(t *testing.T) {
 			tc.mutate(&c)
 			h.cls.result = c
 
-			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 				t.Fatalf("Handle: %v", err)
 			}
 			status, _ := h.back.statusOf(id)
@@ -1015,6 +1017,172 @@ func TestHandleGateMatrix(t *testing.T) {
 	}
 }
 
+// newHarnessCfg is newHarness with the two INFO-hardening knobs made explicit:
+// the independent non-LLM base currency (INFO#2) and the per-break classify
+// budget (INFO#3). The default newHarness passes ("", 0) so those backstops are
+// dormant and every pre-existing test observes unchanged behavior; these two
+// tests arm them to cover the NEW code paths.
+func newHarnessCfg(t *testing.T, baseCurrency string, classifyBudget time.Duration) *harness {
+	cls := &fakeClassifier{}
+	bnk := &fakeBlnk{}
+	back := newBackend(t)
+	rem := New(cls, bnk, back, back, testThreshold, "kimi-k3", baseCurrency, classifyBudget)
+	return &harness{rem: rem, cls: cls, bnk: bnk, back: back}
+}
+
+// TestHandleForeignCurrencyBackstopEscalates covers INFO#2: the independent,
+// non-LLM regulated backstop. When a base currency is configured, a break whose
+// currency differs from it must be routed to HITL as regulated REGARDLESS of the
+// classifier's (LLM-sourced, prompt-injectable) regulated flag — so a flipped
+// regulated=false can never open the auto path for a foreign-currency break.
+// The disarmed contrast proves the currency backstop is the ONLY thing gating
+// the otherwise fully auto-eligible break here.
+func TestHandleForeignCurrencyBackstopEscalates(t *testing.T) {
+	t.Run("armed backstop escalates a foreign-currency break despite regulated=false", func(t *testing.T) {
+		const id = "ext_fx"
+		// Base currency USD; classify budget dormant (0) to isolate INFO#2.
+		h := newHarnessCfg(t, "USD", 0)
+		// A fully auto-eligible classification: high confidence, NOT regulated,
+		// valid proposed rule. Nothing in the classification would gate it.
+		h.cls.result = autoClassification(id)
+		h.bnk.created = blnk.MatchingRule{RuleID: "rule_1", Criteria: validRule().Criteria}
+		h.bnk.cleared = true
+		h.bnk.reconID = "recon_1"
+
+		txn := txnFor(id)    // USD by default...
+		txn.Currency = "EUR" // ...flipped to a foreign currency.
+
+		if err := h.rem.Handle(context.Background(), txn, testUploadID); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+
+		status, _ := h.back.statusOf(id)
+		if status != statusQueued {
+			t.Fatalf("foreign-currency break must be queued, got %q", status)
+		}
+		reason, queued := h.back.inHITL(id)
+		if !queued {
+			t.Fatal("foreign-currency break must be in the HITL queue")
+		}
+		if reason != reasonForeignCurrency {
+			t.Fatalf("HITL reason must be the currency backstop, got %q", reason)
+		}
+		// A well-formed classification still emits its classified event before the gate...
+		if got := h.back.countAction(id, audit.ActionClassified); got != 1 {
+			t.Fatalf("classified events: want 1 got %d", got)
+		}
+		// ...then exactly one escalation, and NOTHING on the auto path.
+		if got := h.back.countAction(id, audit.ActionEscalated); got != 1 {
+			t.Fatalf("escalated events: want 1 got %d", got)
+		}
+		if got := h.back.countAction(id, audit.ActionResolved); got != 0 {
+			t.Fatalf("a foreign-currency break must never be resolved, got %d resolved events", got)
+		}
+		if h.bnk.createCount() != 0 {
+			t.Fatalf("auto path must not create a rule for a foreign-currency break, got %d", h.bnk.createCount())
+		}
+		if h.bnk.probeCount() != 0 {
+			t.Fatalf("auto path must not probe for a foreign-currency break, got %d", h.bnk.probeCount())
+		}
+	})
+
+	t.Run("disarmed backstop lets the same break reach the auto path", func(t *testing.T) {
+		const id = "ext_fx_off"
+		// baseCurrency "" (autoHarness default) => backstop OFF.
+		h := autoHarness(t, id)
+		txn := txnFor(id)
+		txn.Currency = "EUR" // identical foreign currency as the armed case
+
+		if err := h.rem.Handle(context.Background(), txn, testUploadID); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		status, found := h.back.statusOf(id)
+		if !found || status != statusAutoResolved {
+			t.Fatalf("with the backstop disarmed the break must auto-resolve, got found=%v status=%q", found, status)
+		}
+		if _, queued := h.back.inHITL(id); queued {
+			t.Fatal("with the backstop disarmed the break must NOT be in HITL")
+		}
+	})
+}
+
+// TestHandleClassifyBudgetTimeoutFailsClosed covers INFO#3: a per-break classify
+// budget so one hung LLM call cannot consume the whole run's budget. When the
+// budget elapses the break fails closed to HITL (Rule 5.7) — never dropped,
+// never auto-resolved — and the call returns without waiting for the full,
+// slower classifier delay. The disarmed contrast (budget 0) proves a fast call
+// within budget still flows to the auto path unchanged.
+func TestHandleClassifyBudgetTimeoutFailsClosed(t *testing.T) {
+	t.Run("a classify call exceeding the budget fails closed", func(t *testing.T) {
+		const id = "ext_slow"
+		// Tiny 20ms budget; classifier blocks 2s (a hung endpoint). The budget
+		// must cancel the call long before the delay elapses.
+		h := newHarnessCfg(t, "", 20*time.Millisecond)
+		h.cls.delay = 2 * time.Second
+		h.cls.result = autoClassification(id) // never observed: the call times out first
+
+		start := time.Now()
+		if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		elapsed := time.Since(start)
+		if elapsed >= time.Second {
+			t.Fatalf("classify budget must cut the hung call short; waited %v (>= 1s)", elapsed)
+		}
+
+		status, _ := h.back.statusOf(id)
+		if status != statusQueued {
+			t.Fatalf("a classify-timeout break must be queued, got %q", status)
+		}
+		reason, queued := h.back.inHITL(id)
+		if !queued {
+			t.Fatal("a classify-timeout break must be in the HITL queue")
+		}
+		// Fail-closed reason with the underlying deadline surfaced.
+		if !strings.HasPrefix(reason, reasonClassifierFailed) {
+			t.Fatalf("HITL reason must be the fail-closed classifier reason, got %q", reason)
+		}
+		if !strings.Contains(reason, "deadline exceeded") {
+			t.Fatalf("HITL reason should surface the classify-budget timeout, got %q", reason)
+		}
+		// Classification did not succeed => no classified event, exactly one escalation.
+		if got := h.back.countAction(id, audit.ActionClassified); got != 0 {
+			t.Fatalf("no classified event must be emitted on a classify timeout, got %d", got)
+		}
+		if got := h.back.countAction(id, audit.ActionEscalated); got != 1 {
+			t.Fatalf("escalated events: want 1 got %d", got)
+		}
+		if got := h.back.countAction(id, audit.ActionResolved); got != 0 {
+			t.Fatalf("a classify-timeout break must never be resolved, got %d resolved events", got)
+		}
+		if h.bnk.createCount() != 0 || h.bnk.probeCount() != 0 {
+			t.Fatalf("auto path must not run on a classify timeout, got creates=%d probes=%d", h.bnk.createCount(), h.bnk.probeCount())
+		}
+	})
+
+	t.Run("a fast classify within budget reaches the auto path", func(t *testing.T) {
+		const id = "ext_fast"
+		// Generous 2s budget; classifier returns almost immediately.
+		h := newHarnessCfg(t, "", 2*time.Second)
+		h.cls.delay = 1 * time.Millisecond
+		h.cls.result = autoClassification(id)
+		h.bnk.created = blnk.MatchingRule{RuleID: "rule_1", Criteria: validRule().Criteria}
+		h.bnk.cleared = true
+		h.bnk.reconID = "recon_1"
+
+		if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		status, found := h.back.statusOf(id)
+		if !found || status != statusAutoResolved {
+			t.Fatalf("a fast classify within budget must auto-resolve, got found=%v status=%q", found, status)
+		}
+		if _, queued := h.back.inHITL(id); queued {
+			t.Fatal("a fast classify within budget must NOT be in HITL")
+		}
+	})
+}
+
 // TestHandleMalformedConfidenceFailsClosed covers finding m-4: a NaN/Inf or
 // out-of-range confidence must fail closed to HITL, never silently flow into
 // the auto path, and no classified event is emitted for the malformed input.
@@ -1029,7 +1197,7 @@ func TestHandleMalformedConfidenceFailsClosed(t *testing.T) {
 			c.Confidence = conf
 			h.cls.result = c
 
-			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 				t.Fatalf("Handle: %v", err)
 			}
 			status, _ := h.back.statusOf(id)
@@ -1071,7 +1239,7 @@ func TestHandleClampedCeilingConfidenceDefersToArbiter(t *testing.T) {
 	c.Confidence = 1.0 // the clamp ceiling for any over-confident model answer
 	h.cls.result = c
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	// Not falsely escalated: the clamped ceiling confidence reaches the auto path.
@@ -1099,7 +1267,7 @@ func TestHandleClassifierFailureFailsClosed(t *testing.T) {
 	h := newHarness(t)
 	h.cls.err = fmt.Errorf("boom: %w", classifier.ErrClassificationFailed)
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	status, found := h.back.statusOf(id)
@@ -1126,7 +1294,7 @@ func TestHandleClassifierUnexpectedErrorFailsClosed(t *testing.T) {
 	// A non-sentinel error still fails closed.
 	h.cls.err = errors.New("network reset")
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if status, _ := h.back.statusOf(id); status != statusQueued {
@@ -1134,6 +1302,64 @@ func TestHandleClassifierUnexpectedErrorFailsClosed(t *testing.T) {
 	}
 	if got := h.back.countAction(id, audit.ActionEscalated); got != 1 {
 		t.Fatalf("expected 1 escalated event, got %d", got)
+	}
+}
+
+// TestHandleEscalatesOnExpiredContext reproduces finding MINOR-1: under an LLM
+// black-hole the one-shot pipeline context can elapse WHILE classifying earlier
+// breaks, so a later break reaches escalate with an ALREADY-EXPIRED caller
+// context. The fail-closed escalation write MUST still succeed — the break is
+// never dropped — because Handle's idempotency read and escalate's persistence
+// both run on a context detached from the caller's deadline (finding MINOR-1).
+//
+// Before the fix, escalate reused the expired caller context: BeginTx failed
+// with "context deadline exceeded", Handle returned an error, the break was
+// persisted NOWHERE (0 break / 0 hitl / 0 audit rows), and the pipeline aborted,
+// dropping this break and every remaining one. This test fails against that old
+// behavior and passes against the detached-context fix, guarding the regression.
+func TestHandleEscalatesOnExpiredContext(t *testing.T) {
+	const id = "ext_expiredctx"
+	h := newHarness(t)
+	// The LLM black-hole ultimately surfaces as a classifier failure after the
+	// retry cap (Rule 5.7). Wrapping the sentinel yields the clean
+	// classifier-failed escalation reason.
+	h.cls.err = fmt.Errorf("llm black-hole: %w", classifier.ErrClassificationFailed)
+
+	// An already-expired DEADLINE context — exactly the state the pipeline
+	// context is in for a break reached after the inference budget elapsed under
+	// a hung LLM. fakeBackend.WithTx threads this through sql.DB.BeginTx, which
+	// honors an expired context, so this faithfully exercises the failure the
+	// detached persistence context must survive.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
+	defer cancel()
+	if ctx.Err() == nil {
+		t.Fatal("precondition: context must already be expired")
+	}
+
+	// The break must be ESCALATED, not dropped: Handle returns nil despite the
+	// expired context.
+	if err := h.rem.Handle(ctx, txnFor(id), testUploadID); err != nil {
+		t.Fatalf("Handle must escalate (never drop) a break reached with an expired context, got error: %v", err)
+	}
+
+	// It is durably queued for HITL...
+	status, found := h.back.statusOf(id)
+	if !found || status != statusQueued {
+		t.Fatalf("break must be persisted as queued despite expired ctx, got found=%v status=%q", found, status)
+	}
+	if _, queued := h.back.inHITL(id); !queued {
+		t.Fatal("break must be enqueued for HITL despite expired ctx (never dropped)")
+	}
+	// ...with exactly one escalated audit event, and never a classified or
+	// resolved event (classification failed; the LLM never marks a match).
+	if got := h.back.countAction(id, audit.ActionEscalated); got != 1 {
+		t.Fatalf("expected exactly 1 escalated audit event, got %d", got)
+	}
+	if got := h.back.countAction(id, audit.ActionClassified); got != 0 {
+		t.Fatalf("no classified event when classification failed, got %d", got)
+	}
+	if got := h.back.countAction(id, audit.ActionResolved); got != 0 {
+		t.Fatalf("an expired-context escalation must never resolve a break, got %d resolved", got)
 	}
 }
 
@@ -1207,7 +1433,7 @@ func TestHandleAutoPathEscalations(t *testing.T) {
 			h := autoHarness(t, id)
 			tc.setup(h)
 
-			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 				t.Fatalf("Handle: %v", err)
 			}
 			if status, _ := h.back.statusOf(id); status != statusQueued {
@@ -1306,7 +1532,7 @@ func TestHandleC6BuildsDeterministicAmountDriftProfile(t *testing.T) {
 	h.bnk.cleared = true
 	h.bnk.reconID = "recon_1"
 
-	if err := h.rem.Handle(context.Background(), txn, testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txn, testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 
@@ -1360,7 +1586,7 @@ func TestHandleC6ReferenceMismatchProfileOmitsReference(t *testing.T) {
 	h.bnk.cleared = true
 	h.bnk.reconID = "recon_1"
 
-	if err := h.rem.Handle(context.Background(), txn, testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txn, testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	posted, _ := h.bnk.lastCreatedRule()
@@ -1401,7 +1627,7 @@ func TestHandleF5NoRollbackOnSuccess(t *testing.T) {
 	const id = "ext_f5_ok"
 	h := autoHarness(t, id)
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if status, _ := h.back.statusOf(id); status != statusAutoResolved {
@@ -1439,7 +1665,7 @@ func TestHandleM11CompensationFailureLeavesDurableEvidence(t *testing.T) {
 	h.bnk.reconID = "recon_x"
 	h.bnk.deleteErr = errors.New("blnk delete 500")
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle must not fail when rule compensation fails (fail-closed): %v", err)
 	}
 	if status, _ := h.back.statusOf(id); status != statusQueued {
@@ -1485,7 +1711,7 @@ func TestHandleF5DoesNotDeleteReusedRuleOnFailure(t *testing.T) {
 	h.bnk.cleared = false // this attempt's probe does not clear
 	h.bnk.reconID = "recon_x"
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if h.bnk.createCount() != 0 {
@@ -1524,7 +1750,7 @@ func TestHandleAtomicity_ClassifyAuditFailure(t *testing.T) {
 		return nil
 	}
 
-	err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched)
+	err := h.rem.Handle(context.Background(), txnFor(id), testUploadID)
 	if err == nil {
 		t.Fatal("expected the classified-audit failure to surface as an error")
 	}
@@ -1552,7 +1778,7 @@ func TestHandleAtomicity_ResolveAuditFailure(t *testing.T) {
 		return nil
 	}
 
-	err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched)
+	err := h.rem.Handle(context.Background(), txnFor(id), testUploadID)
 	if err == nil {
 		t.Fatal("expected the resolved-audit failure to surface as an error")
 	}
@@ -1592,7 +1818,7 @@ func TestHandleAtomicity_EscalateAuditFailure(t *testing.T) {
 		return nil
 	}
 
-	err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched)
+	err := h.rem.Handle(context.Background(), txnFor(id), testUploadID)
 	if err == nil {
 		t.Fatal("expected the escalated-audit failure to surface as an error")
 	}
@@ -1625,7 +1851,7 @@ func TestHandleAtomicity_EscalateEnqueueFailure(t *testing.T) {
 	h.cls.result = c
 	h.back.enqueueHITLTxHook = func(_, _ string) error { return errors.New("queue down") }
 
-	err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched)
+	err := h.rem.Handle(context.Background(), txnFor(id), testUploadID)
 	if err == nil {
 		t.Fatal("expected the HITL-enqueue failure to surface as an error")
 	}
@@ -1654,7 +1880,7 @@ func TestHandleAtomicity_ClassifyStoreFailure(t *testing.T) {
 		}
 		return nil
 	}
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err == nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err == nil {
 		t.Fatal("expected the classify store-write failure to surface")
 	}
 	if _, found := h.back.statusOf(id); found {
@@ -1680,7 +1906,7 @@ func TestHandleAtomicity_RuleStoreFailure(t *testing.T) {
 	h.back.setCreatedRuleTxHook = func(_, _ string) error { return errors.New("store down") }
 	// M-11: the failure is handled durably (compensation + escalation), NOT
 	// surfaced as a raw error — Handle returns nil having routed the break to HITL.
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("create-tx failure must be handled fail-closed, not surfaced: %v", err)
 	}
 	// The Blnk rule was created (external side effect)...
@@ -1728,7 +1954,7 @@ func TestHandleAtomicity_ResolveStoreFailure(t *testing.T) {
 	h.back.markResolvedTxHook = func(_, _ string) error {
 		return errors.New("store down")
 	}
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err == nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err == nil {
 		t.Fatal("expected the resolve store-write failure to surface")
 	}
 	if status, _ := h.back.statusOf(id); status == statusAutoResolved {
@@ -1751,7 +1977,7 @@ func TestHandleAtomicity_EscalateStoreFailure(t *testing.T) {
 		}
 		return nil
 	}
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err == nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err == nil {
 		t.Fatal("expected the escalate store-write failure to surface")
 	}
 	if status, _ := h.back.statusOf(id); status == statusQueued {
@@ -1772,7 +1998,7 @@ func TestHandleLoadBreakError(t *testing.T) {
 	const id = "ext_loaderr"
 	h := autoHarness(t, id)
 	h.back.loadErr = errors.New("db unreachable")
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err == nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err == nil {
 		t.Fatal("expected LoadBreak error to surface")
 	}
 	if h.cls.callCount() != 0 {
@@ -1784,7 +2010,7 @@ func TestHandleClassifyBeginError(t *testing.T) {
 	const id = "ext_beginerr"
 	h := autoHarness(t, id)
 	h.back.beginErr = errors.New("cannot begin")
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err == nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err == nil {
 		t.Fatal("expected the transaction-begin error to surface")
 	}
 	if _, found := h.back.statusOf(id); found {
@@ -1803,7 +2029,7 @@ func TestHandleProposedAuditFailure(t *testing.T) {
 		}
 		return nil
 	}
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err == nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err == nil {
 		t.Fatal("expected rule_proposed audit failure to surface")
 	}
 	if h.bnk.createCount() != 0 {
@@ -1823,7 +2049,7 @@ func TestHandleProbeAuditFailure(t *testing.T) {
 		}
 		return nil
 	}
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err == nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err == nil {
 		t.Fatal("expected probed audit failure to surface")
 	}
 	if h.back.countAction(id, audit.ActionResolved) != 0 {
@@ -1841,11 +2067,11 @@ func TestHandleIdempotentRerunOnResolvedBreak(t *testing.T) {
 	const id = "ext_rerun"
 	h := autoHarness(t, id)
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("first Handle: %v", err)
 	}
 	// Re-run the exact same break.
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("second Handle: %v", err)
 	}
 
@@ -1869,7 +2095,7 @@ func TestHandleIdempotentRerunOnQueuedBreak(t *testing.T) {
 	// Seed an already-queued (escalated) break.
 	h.back.seedBreak(id, autoClassification(id), statusQueued, "")
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if h.cls.callCount() != 0 {
@@ -1891,7 +2117,7 @@ func TestHandleResumeClassifiedWithCreatedRule(t *testing.T) {
 	h := autoHarness(t, id)
 	h.back.seedBreak(id, autoClassification(id), statusClassified, "rule_existing")
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if h.cls.callCount() != 0 {
@@ -1922,7 +2148,7 @@ func TestHandleResumeClassifiedWithoutCreatedRule(t *testing.T) {
 	h := autoHarness(t, id)
 	h.back.seedBreak(id, autoClassification(id), statusClassified, "")
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if h.cls.callCount() != 0 {
@@ -1953,7 +2179,7 @@ func TestHandleResumeRuleProposedWithoutCreatedRuleEscalates(t *testing.T) {
 	h.back.seedBreak(id, autoClassification(id), statusClassified, "")
 	h.back.seedAudit(id, audit.ActionRuleProposed)
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 
@@ -1995,7 +2221,7 @@ func TestHandleResumeCountAuditErrorFailsClosed(t *testing.T) {
 	h.back.seedBreak(id, autoClassification(id), statusClassified, "")
 	h.back.countAuditErr = errors.New("audit count query failed")
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err == nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err == nil {
 		t.Fatal("Handle must return an error when the resume audit-count read fails")
 	}
 	if h.bnk.createCount() != 0 {
@@ -2015,7 +2241,7 @@ func TestHandleStampsUploadIDIntoProvenance(t *testing.T) {
 	const id = "ext_upload_prov"
 	h := autoHarness(t, id)
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 
@@ -2039,7 +2265,7 @@ func TestHandleResumeClassifiedRegulatedEscalates(t *testing.T) {
 	c.Regulated = true
 	h.back.seedBreak(id, c, statusClassified, "")
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if status, _ := h.back.statusOf(id); status != statusQueued {
@@ -2069,7 +2295,7 @@ func TestHandleConcurrentSameBreakResolvesOnce(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 				t.Errorf("concurrent Handle: %v", err)
 			}
 		}()
@@ -2100,7 +2326,7 @@ func TestHandleConcurrentDistinctBreaks(t *testing.T) {
 		id := fmt.Sprintf("ext_conc_%d", i)
 		go func(id string) {
 			defer wg.Done()
-			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 				t.Errorf("Handle(%s): %v", id, err)
 			}
 		}(id)
@@ -2166,7 +2392,7 @@ func TestHandleRootCauseNotAutoEligibleEscalates(t *testing.T) {
 			c.RootCause = rc
 			h.cls.result = c
 
-			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 				t.Fatalf("Handle: %v", err)
 			}
 			if status, _ := h.back.statusOf(id); status != statusQueued {
@@ -2211,7 +2437,7 @@ func TestHandleAutoEligibleRootCausesReachAutoPath(t *testing.T) {
 			c.RootCause = rc
 			h.cls.result = c
 
-			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 				t.Fatalf("Handle: %v", err)
 			}
 			if status, _ := h.back.statusOf(id); status != statusAutoResolved {
@@ -2246,7 +2472,7 @@ func TestHandleC6IgnoresOverbroadAdvisoryOperator(t *testing.T) {
 			}
 			h.cls.result = c
 
-			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+			if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 				t.Fatalf("Handle: %v", err)
 			}
 			// The advisory operator is ignored; the safe profile auto-resolves.
@@ -2492,7 +2718,7 @@ func TestHandleClaimNotGrantedYields(t *testing.T) {
 	h := autoHarness(t, id)
 	h.back.claimBreakHook = func(_, _ string) (bool, error) { return false, nil }
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("a not-granted lease must be a safe no-op, got error: %v", err)
 	}
 	// The fresh break was classified+persisted before the claim...
@@ -2521,7 +2747,7 @@ func TestHandleClaimErrorSurfaces(t *testing.T) {
 	h := autoHarness(t, id)
 	h.back.claimBreakHook = func(_, _ string) (bool, error) { return false, errors.New("lease table down") }
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err == nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err == nil {
 		t.Fatal("a claim error must surface as a Handle error")
 	}
 	if h.bnk.createCount() != 0 {
@@ -2534,7 +2760,7 @@ func TestHandleClaimErrorSurfaces(t *testing.T) {
 func TestHandleReleasesLeaseOnResolve(t *testing.T) {
 	const id = "ext_lease_release"
 	h := autoHarness(t, id)
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if status, _ := h.back.statusOf(id); status != statusAutoResolved {
@@ -2692,7 +2918,7 @@ func TestHandleM10EscalationSurvivesCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // parent context is already canceled
 
-	if err := h.rem.Handle(ctx, txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(ctx, txnFor(id), testUploadID); err != nil {
 		t.Fatalf("M-10: escalation must succeed despite a canceled parent context, got %v", err)
 	}
 	if status, _ := h.back.statusOf(id); status != statusQueued {
@@ -2715,7 +2941,7 @@ func TestHandleUnsafeProfileEscalates(t *testing.T) {
 	// amount_drift requires a reference; strip it so safeRuleForBreak errors.
 	txn := blnk.ExternalTransaction{ID: id, Source: "bank-x", Amount: 10.0, Currency: "USD"}
 
-	if err := h.rem.Handle(context.Background(), txn, testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txn, testUploadID); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if status, _ := h.back.statusOf(id); status != statusQueued {
@@ -2743,7 +2969,7 @@ func TestHandleOutboxRecordFailureCompensates(t *testing.T) {
 	h := autoHarness(t, id)
 	h.back.recordRuleOutboxTxHook = func(_, _ string) error { return errors.New("outbox insert down") }
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err != nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err != nil {
 		t.Fatalf("an outbox-record failure must be handled fail-closed, not surfaced: %v", err)
 	}
 	if h.bnk.createCount() != 1 {
@@ -2782,7 +3008,7 @@ func TestHandleOutboxConfirmFailureRollsBackResolve(t *testing.T) {
 	h := autoHarness(t, id)
 	h.back.confirmRuleOutboxTxHook = func(_, _ string) error { return errors.New("outbox confirm down") }
 
-	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID, testBaselineUnmatched); err == nil {
+	if err := h.rem.Handle(context.Background(), txnFor(id), testUploadID); err == nil {
 		t.Fatal("a resolve-tx confirm failure must surface as an error")
 	}
 	// Atomicity: neither the resolved status nor the resolved event became durable.
@@ -2791,5 +3017,84 @@ func TestHandleOutboxConfirmFailureRollsBackResolve(t *testing.T) {
 	}
 	if h.back.countAction(id, audit.ActionResolved) != 0 {
 		t.Fatal("no resolved audit may be durable after the resolve transaction rolled back")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Finding #5 / Rule 5.7 durability: the fail-closed escalation write MUST persist
+// even when the pipeline's parent context is already cancelled/expired (e.g. a
+// fully hung LLM consumed the entire pipeline budget before the break reached
+// this path). escalate() runs its persistence on a context DETACHED from the
+// parent (context.WithoutCancel) so the break is durably queued + audited
+// regardless. These tests reproduce that fault injection through escalate()
+// directly and through the public Handle() fail-closed path.
+// -----------------------------------------------------------------------------
+
+func deadContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+func TestEscalatePersistsUnderCancelledParentContext(t *testing.T) {
+	const id = "ext_hung_llm"
+	h := newHarness(t)
+
+	// A regulated classification is a representative fail-closed escalation.
+	cls := model.BreakClassification{
+		ExternalTxnID: id,
+		RootCause:     model.RootCauseCurrencyMismatch,
+		Confidence:    0.90,
+		Regulated:     true,
+		Rationale:     "regulated cross-border flow; must be reviewed by a human",
+	}
+	prov := model.Provenance{UploadID: testUploadID, Source: "bank-x"}
+
+	// The parent context is already dead — as it would be after a hung LLM
+	// consumed the whole pipeline budget.
+	if err := h.rem.escalate(deadContext(), txnFor(id), cls, prov, "regulated break requires human review"); err != nil {
+		t.Fatalf("escalate under a cancelled parent context must still persist the break, got error: %v", err)
+	}
+
+	// The break must be durably queued to HITL (never dropped, Rule 5.7).
+	if reason, ok := h.back.inHITL(id); !ok {
+		t.Fatalf("break %q was DROPPED — no HITL queue entry after escalate under a dead context", id)
+	} else if reason == "" {
+		t.Fatalf("break %q enqueued to HITL with an empty reason", id)
+	}
+
+	// The break must be persisted in the queued state.
+	if status, ok := h.back.statusOf(id); !ok || status != statusQueued {
+		t.Fatalf("break %q status = %q found=%v, want %q", id, status, ok, statusQueued)
+	}
+
+	// Exactly one append-only escalated audit event must have been recorded
+	// (100%-of-actions-emit-an-AuditEvent, even on the fail-closed path).
+	if got := h.back.countAction(id, audit.ActionEscalated); got != 1 {
+		t.Fatalf("expected exactly 1 %q audit event for a break escalated under a dead context, got %d", audit.ActionEscalated, got)
+	}
+}
+func TestHandleFailClosedIsDurableUnderCancelledContext(t *testing.T) {
+	const id = "ext_hung_llm_e2e"
+	h := newHarness(t)
+	// The classifier failed (as a hung endpoint does after the retry cap); the
+	// returned stub carries no usable classification.
+	h.cls.result = model.BreakClassification{ExternalTxnID: id, RootCause: model.RootCauseUnknown}
+	h.cls.err = fmt.Errorf("classify: %w", classifier.ErrClassificationFailed)
+
+	if err := h.rem.Handle(deadContext(), txnFor(id), testUploadID); err != nil {
+		t.Fatalf("Handle must durably fail-close (escalate) a break whose classifier failed even under a cancelled context, got error: %v", err)
+	}
+
+	if reason, ok := h.back.inHITL(id); !ok {
+		t.Fatalf("break %q was DROPPED under a cancelled context — no HITL entry (Rule 5.7 violated)", id)
+	} else if reason == "" {
+		t.Fatalf("break %q enqueued to HITL with an empty reason", id)
+	}
+	if got := h.back.countAction(id, audit.ActionEscalated); got != 1 {
+		t.Fatalf("expected exactly 1 %q audit event for the fail-closed break, got %d", audit.ActionEscalated, got)
+	}
+	// A fail-closed break must NEVER be auto-resolved (Rule 5.7).
+	if got := h.back.countAction(id, audit.ActionResolved); got != 0 {
+		t.Fatalf("fail-closed break %q must have 0 %q audit events, got %d", id, audit.ActionResolved, got)
 	}
 }

@@ -34,9 +34,9 @@ func TestLoad_Defaults(t *testing.T) {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
 
-	// M-04: the shipped default MUST be a non-routable loopback placeholder,
-	// never a live third-party provider, so copying the defaults cannot
-	// silently transmit transaction data off-box.
+	// M-04 / Finding #2 / Rule 5.6: the shipped default MUST be a non-routable
+	// loopback placeholder, never a live third-party provider, so copying the
+	// defaults cannot silently transmit transaction data off-box.
 	if cfg.LLMBaseURL != "http://localhost:11434/v1" {
 		t.Errorf("LLMBaseURL default = %q, want %q", cfg.LLMBaseURL, "http://localhost:11434/v1")
 	}
@@ -63,6 +63,46 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.AgentDatabaseURL != testDSN {
 		t.Errorf("AgentDatabaseURL = %q, want %q", cfg.AgentDatabaseURL, testDSN)
+	}
+}
+
+// TestLoad_DefaultLLMBaseURLIsNotPublic pins Rule 5.6 / config-safety
+// (Finding #2): when LLM_BASE_URL is unset OR explicitly blank, the resolved
+// base URL must be a LOCAL (loopback) endpoint and must NOT be any public SaaS
+// host. Defaulting to the internet would risk transmitting transaction bodies
+// (PII) off-box the moment the agent is run without a configured endpoint.
+func TestLoad_DefaultLLMBaseURLIsNotPublic(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		unset bool
+	}{
+		{name: "unset", unset: true},
+		{name: "blank", unset: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("AGENT_DATABASE_URL", testDSN)
+			if !tc.unset {
+				t.Setenv("LLM_BASE_URL", "") // explicitly blank
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() unexpected error: %v", err)
+			}
+
+			// The default must be a loopback URL.
+			if !strings.HasPrefix(cfg.LLMBaseURL, "http://localhost") &&
+				!strings.HasPrefix(cfg.LLMBaseURL, "http://127.0.0.1") {
+				t.Errorf("default LLMBaseURL %q is not a loopback endpoint; a missing base URL must fail closed to a non-public target", cfg.LLMBaseURL)
+			}
+			// Belt-and-suspenders: it must not be a known public host.
+			for _, publicHost := range []string{"moonshot.ai", "api.openai.com", "googleapis.com", "anthropic.com"} {
+				if strings.Contains(cfg.LLMBaseURL, publicHost) {
+					t.Errorf("default LLMBaseURL %q must never resolve to a public host (%q)", cfg.LLMBaseURL, publicHost)
+				}
+			}
+		})
 	}
 }
 

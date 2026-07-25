@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/blnkfinance/recon-agent/internal/audit"
 	"github.com/blnkfinance/recon-agent/internal/blnk"
 )
 
@@ -49,6 +50,13 @@ type breakView struct {
 	// reviewer can see exactly what Blnk would match on (finding M-22). Empty when
 	// no rule was proposed.
 	RuleCriteria []ruleCriterionView
+	// BelowThreshold marks a break whose confidence is below the auto-remediation
+	// threshold; the row renders an explicit "below auto-threshold" tag so a
+	// human-gated break can never read as auto-eligible (finding F-A).
+	BelowThreshold bool
+	// Reason is the human-readable routing reason recorded on the HITL queue for a
+	// currently-queued break (finding F-I); empty (em-dash) for non-queued rows.
+	Reason string
 }
 
 // auditView is a single append-only audit row rendered on the status page.
@@ -58,8 +66,18 @@ type auditView struct {
 	Actor         string
 	Action        string
 	Confidence    float64
-	ReconID       string
-	Rationale     string
+	// ConfidenceNA marks a human-decision audit row (accepted/re_driven/rejected)
+	// whose stored Confidence is a zero value meaning "not applicable"; it renders
+	// as an em-dash rather than a misleading "0.0000" (finding F-J). Agent actions
+	// always carry a real confidence and stay numeric, including a genuine 0.0000.
+	ConfidenceNA bool
+	ReconID      string
+	// Source and UploadID surface the break's origin — the external-statement
+	// source label and the Blnk upload batch id — from the event provenance, so a
+	// reviewer can trace which statement/batch a break came from (finding F-K).
+	Source    string
+	UploadID  string
+	Rationale string
 }
 
 // pageData is the view model handed to statusTemplate.
@@ -70,8 +88,11 @@ type pageData struct {
 	// field in every decision form; it must equal the csrf_token cookie the page
 	// set for the POST to be accepted by the mutation guard (finding C-05).
 	CSRFToken string
-	Breaks    []breakView
-	Audits    []auditView
+	// AutoThreshold is the auto-remediation confidence gate surfaced in the page
+	// header and used to render the per-break below-threshold tag (finding F-A).
+	AutoThreshold float64
+	Breaks        []breakView
+	Audits        []auditView
 }
 
 // statusPage renders the operator/demo status page: the breaks table (with the
@@ -79,7 +100,7 @@ type pageData struct {
 // <form> controls on each row POST an accept/re_drive/reject decision.
 func (s *Server) statusPage(c *gin.Context) {
 	ctx := c.Request.Context()
-	data := pageData{Title: "recon-agent — HITL review", Model: s.llmModel}
+	data := pageData{Title: "recon-agent — HITL review", Model: s.llmModel, AutoThreshold: s.autoThreshold}
 
 	// C-05: mint a fresh double-submit CSRF token, set it as a SameSite=Strict,
 	// HttpOnly cookie, and embed the same value in every decision form below. The
@@ -106,6 +127,25 @@ func (s *Server) statusPage(c *gin.Context) {
 		s.renderStatusError(c)
 		return
 	}
+
+	// F-I: fetch the human-review queue so each queued break can display WHY it
+	// was routed to a human (regulated, low confidence, fail-closed, ...). The
+	// reason is persisted on agent.agent_hitl_queue and is meaningful only while a
+	// break is still queued; a decided/auto-resolved break has been drained and
+	// carries no reason (it renders an em-dash). A queue-read failure is handled
+	// like a breaks/audit-read failure: log server-side and show the sanitized
+	// error panel rather than a partially-populated, misleading page.
+	queue, err := s.st.ListHITL(ctx)
+	if err != nil {
+		log.Printf("hitl: status page — list HITL queue failed: %v", err)
+		s.renderStatusError(c)
+		return
+	}
+	reasonByID := make(map[string]string, len(queue))
+	for _, q := range queue {
+		reasonByID[q.ExternalTxnID] = q.Reason
+	}
+
 	for _, b := range breaks {
 		bv := breakView{
 			ExternalTxnID: b.Classification.ExternalTxnID,
@@ -116,6 +156,12 @@ func (s *Server) statusPage(c *gin.Context) {
 			// C-07: decision controls render ONLY for persisted queued rows.
 			Queued:    b.Status == statusQueued,
 			Rationale: b.Classification.Rationale,
+			// F-A: flag a below-threshold confidence explicitly so the human
+			// safety surface never presents it as auto-eligible.
+			BelowThreshold: b.Classification.Confidence < s.autoThreshold,
+			// F-I: the routing reason for a currently-queued break (empty for a
+			// non-queued break, which renders an em-dash).
+			Reason: reasonByID[b.Classification.ExternalTxnID],
 		}
 		if r := b.Classification.ProposedRule; r != nil {
 			bv.HasRule = true
@@ -134,14 +180,27 @@ func (s *Server) statusPage(c *gin.Context) {
 		return
 	}
 	for _, a := range audits {
+		// F-J: a human decision (accepted / re_driven / rejected) is recorded with
+		// no classification confidence, so its stored Confidence is a zero value
+		// meaning "not applicable" — render it as an em-dash rather than a
+		// misleading "0.0000". Agent actions (classified/resolved/escalated/...)
+		// always carry a real confidence and stay numeric, including a genuine 0.
+		confidenceNA := a.Action == audit.ActionAccepted ||
+			a.Action == audit.ActionReDriven ||
+			a.Action == audit.ActionRejected
 		data.Audits = append(data.Audits, auditView{
 			Timestamp:     a.Timestamp,
 			ExternalTxnID: a.ExternalTxnID,
 			Actor:         a.Actor,
 			Action:        a.Action,
 			Confidence:    a.Confidence,
+			ConfidenceNA:  confidenceNA,
 			ReconID:       a.Provenance.ReconID,
-			Rationale:     a.Rationale,
+			// F-K: surface the break's origin (source label + Blnk upload batch id)
+			// from the event provenance so a reviewer can trace its statement/batch.
+			Source:    a.Provenance.Source,
+			UploadID:  a.Provenance.UploadID,
+			Rationale: a.Rationale,
 		})
 	}
 
@@ -222,8 +281,8 @@ const statusPageHTML = `<!DOCTYPE html>
   th { background: #f2f2f2; }
   .regulated { color: #b00020; font-weight: 600; }
   .status-auto-resolved { color: #0a7d28; font-weight: 600; }
-  .status-rejected { color: #b00020; }
-  .status-re_driven { color: #0b5cad; }
+  .status-rejected { color: #b00020; font-weight: 600; }
+  .status-re_driven { color: #0b5cad; font-weight: 600; }
   .status-queued { color: #8a5a00; font-weight: 600; }
   .status-accepted { color: #0a7d28; font-weight: 600; }
   .rationale { display: block; margin-top: .2rem; }
@@ -237,12 +296,18 @@ const statusPageHTML = `<!DOCTYPE html>
   .decision-form button { min-height: 44px; min-width: 44px; padding: .5rem .75rem; cursor: pointer; font-size: .9rem; }
   .no-action { color: #666; font-size: .85rem; }
   .muted { color: #666; font-size: .8rem; }
+  /* F-A: flag a below-threshold confidence with an explicit textual tag so it
+     can never be misread as auto-eligible on this human safety surface. */
+  .thresh-tag { color: #8a4b00; font-size: .75rem; font-weight: 600; white-space: nowrap; }
+  /* F-M: the optional note input sits alongside the reviewer id on the form. */
+  .note-input { min-height: 44px; padding: .4rem .6rem; font-size: .9rem; min-width: 10rem; }
   /* M-22: small-screen reflow — reduce chrome so the content fits a phone. */
   @media (max-width: 640px) {
     body { margin: .75rem; }
     h1 { font-size: 1.2rem; }
     th, td { padding: .35rem .45rem; }
     .reviewer-input { min-width: 100%; }
+    .note-input { min-width: 100%; }
     .decision-form button { flex: 1 1 auto; }
   }
 </style>
@@ -250,7 +315,7 @@ const statusPageHTML = `<!DOCTYPE html>
 <body>
   <main>
   <h1>{{.Title}}</h1>
-  <p class="muted">LLM model: {{.Model}}</p>
+  <p class="muted">LLM model: {{.Model}} &middot; auto-remediation threshold: {{printf "%.4f" .AutoThreshold}}</p>
 
   <h2 id="breaks-heading">Breaks</h2>
   <div class="table-wrap">
@@ -263,6 +328,7 @@ const statusPageHTML = `<!DOCTYPE html>
         <th scope="col">Confidence</th>
         <th scope="col">Regulated</th>
         <th scope="col">Status</th>
+        <th scope="col">Reason</th>
         <th scope="col">Proposed Rule</th>
         <th scope="col">Decision</th>
       </tr>
@@ -275,12 +341,13 @@ const statusPageHTML = `<!DOCTYPE html>
           {{.RootCause}}
           {{if .Rationale}}<span class="rationale muted">{{.Rationale}}</span>{{end}}
         </td>
-        <td>{{printf "%.4f" .Confidence}}</td>
+        <td>{{printf "%.4f" .Confidence}}{{if .BelowThreshold}} <span class="thresh-tag" title="below the auto-remediation threshold">below auto-threshold</span>{{end}}</td>
         <td>{{if .Regulated}}<span class="regulated">yes</span>{{else}}no{{end}}</td>
         <td class="status-{{.Status}}">{{.Status}}</td>
+        <td>{{if .Reason}}{{.Reason}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
         <td>
           {{if .HasRule}}
-            {{.RuleName}}
+            {{if .RuleName}}{{.RuleName}}{{else}}<span class="muted">(unnamed rule)</span>{{end}}
             {{if .RuleCriteria}}
             <ul class="criteria">
               {{range .RuleCriteria}}<li>{{.Field}} {{.Operator}}{{if .Detail}} &mdash; {{.Detail}}{{end}}</li>{{end}}
@@ -294,6 +361,7 @@ const statusPageHTML = `<!DOCTYPE html>
             <input type="hidden" name="external_txn_id" value="{{.ExternalTxnID}}">
             <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
             <input class="reviewer-input" type="text" name="reviewer" placeholder="reviewer id" required maxlength="128" autocomplete="off" aria-label="reviewer id for break {{.ExternalTxnID}}">
+            <input class="note-input" type="text" name="note" placeholder="note (optional)" maxlength="2048" autocomplete="off" aria-label="optional note for break {{.ExternalTxnID}}">
             <button type="submit" name="decision" value="accept" aria-label="accept break {{.ExternalTxnID}}">accept</button>
             <button type="submit" name="decision" value="re_drive" aria-label="re_drive break {{.ExternalTxnID}}">re_drive</button>
             <button type="submit" name="decision" value="reject" aria-label="reject break {{.ExternalTxnID}}">reject</button>
@@ -304,7 +372,7 @@ const statusPageHTML = `<!DOCTYPE html>
         </td>
       </tr>
     {{else}}
-      <tr><td colspan="7" class="muted">No breaks under management.</td></tr>
+      <tr><td colspan="8" class="muted">No breaks under management.</td></tr>
     {{end}}
     </tbody>
   </table>
@@ -322,6 +390,8 @@ const statusPageHTML = `<!DOCTYPE html>
         <th scope="col">Action</th>
         <th scope="col">Confidence</th>
         <th scope="col">Recon ID</th>
+        <th scope="col">Source</th>
+        <th scope="col">Upload ID</th>
         <th scope="col">Rationale</th>
       </tr>
     </thead>
@@ -332,12 +402,14 @@ const statusPageHTML = `<!DOCTYPE html>
         <td>{{.ExternalTxnID}}</td>
         <td>{{.Actor}}</td>
         <td>{{.Action}}</td>
-        <td>{{printf "%.4f" .Confidence}}</td>
+        <td>{{if .ConfidenceNA}}<span class="muted" title="not applicable for a human decision">&mdash;</span>{{else}}{{printf "%.4f" .Confidence}}{{end}}</td>
         <td>{{if .ReconID}}{{.ReconID}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+        <td>{{if .Source}}{{.Source}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+        <td>{{if .UploadID}}{{.UploadID}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
         <td>{{.Rationale}}</td>
       </tr>
     {{else}}
-      <tr><td colspan="7" class="muted">No audit events recorded yet.</td></tr>
+      <tr><td colspan="9" class="muted">No audit events recorded yet.</td></tr>
     {{end}}
     </tbody>
   </table>

@@ -50,6 +50,7 @@ const (
 // rationale of the escalated AuditEvent.
 const (
 	reasonRegulated                = "regulated break requires human review"
+	reasonForeignCurrency          = "break currency differs from the ledger base currency; treated as regulated (independent non-LLM backstop) and routed to human review"
 	reasonLowConfidence            = "classification confidence below auto-remediation threshold"
 	reasonRootCauseNotAutoEligible = "root cause is not eligible for automatic remediation; requires human review"
 	reasonClassifierFailed         = "classifier failed; routed to HITL (fail-closed)"
@@ -98,6 +99,19 @@ const (
 	remediationLeaseTTL = 2 * time.Minute
 )
 
+// DefaultClassifyBudget bounds a SINGLE break's classification (INFO#3). The
+// classifier retries up to defaultMaxRetries (2) after the initial attempt, each
+// attempt self-bounded by defaultPerAttemptTimeout (30s), so a HUNG endpoint
+// could otherwise make one break's classification consume up to ~90s — the whole
+// pipelineTimeout — starving every remaining break. propose() wraps Classify in
+// a context bounded by this budget when it is > 0, so a single hung inference
+// fails THAT break closed to HITL (Rule 5.7) after ~one attempt's worth of hang
+// without aborting or starving the run. It is generous for a healthy Kimi K3
+// response yet finite. cmd passes this to remediator.New; the unit tests pass 0
+// to leave the caller's context unwrapped (the fake classifier returns
+// immediately, so no budget is needed there).
+const DefaultClassifyBudget = 30 * time.Second
+
 // operatorEquals is the only matching operator tight enough to auto-apply to a
 // single-transaction dry-run (finding C3). Blnk compares the external transaction
 // against internal transactions FIELD-TO-FIELD and IGNORES criteria.Value for all
@@ -139,16 +153,20 @@ type blnkPort interface {
 	// attempt that did not clear, so a failed attempt leaves no orphan rule
 	// behind (finding F5).
 	DeleteMatchingRule(ctx context.Context, ruleID string) error
-	// ConfirmClearedOverUpload is the cache-safe DETERMINISTIC ARBITER (Rule 5.3)
-	// for whether the created rule cleared the break (finding C-03). It runs a
-	// dry-run reconciliation over the break's ORIGINAL persisted upload with the
-	// single created rule and reports cleared when Blnk's authoritative unmatched
-	// count drops strictly BELOW the detection baseline. It replaces the earlier
-	// per-transaction ProbeBreak, whose sequential ephemeral single-transaction
-	// uploads tripped Blnk's upload-agnostic pagination cache (a protected-core
-	// defect the agent must not modify, Rule 5.8). Funnelling every confirmation
-	// through the one persisted upload makes that shared cache benign.
-	ConfirmClearedOverUpload(ctx context.Context, uploadID, ruleID string, baselineUnmatched int) (cleared bool, reconID string, err error)
+	// ConfirmCohortCleared is the cache-safe, PER-BREAK-ATTRIBUTABLE
+	// DETERMINISTIC ARBITER (Rule 5.3, finding F-1) for whether EVERY break in an
+	// auto-remediation cohort left the unmatched set. It submits the whole cohort
+	// as ONE dry-run reconciliation over a DEDICATED ephemeral upload carrying the
+	// cohort's created rules and reports cleared only when Blnk's authoritative
+	// counts show unmatched==0 over exactly the cohort's rows (a cardinality guard
+	// fails a stale-cache read closed). This replaces the earlier
+	// ConfirmClearedOverUpload aggregate confirm, under which an unrelated row's
+	// match could drop the full-upload count and falsely "clear" a genuinely
+	// un-clearable break. Because Blnk's pagination cache is upload-agnostic
+	// (a protected-core defect the agent must not modify, Rule 5.8), the confirm
+	// must be the run's single COLD reconciliation; the pipeline removed its
+	// detection reconciliation so this cohort confirm is that read.
+	ConfirmCohortCleared(ctx context.Context, cohort []blnk.ExternalTransaction, matchingRuleIDs []string) (cleared bool, reconID string, err error)
 }
 
 // auditPort is the append-only audit writer used by the remediator (Rule 5.5).
@@ -243,6 +261,20 @@ type Remediator struct {
 	// llmModel is recorded as provenance on every AuditEvent (Rule 5.6).
 	llmModel string
 
+	// baseCurrency is the ledger's settlement currency (config AGENT_BASE_CURRENCY;
+	// may be empty). When non-empty it is an INDEPENDENT, non-LLM regulated
+	// backstop (INFO#2): a break whose currency differs is treated as regulated
+	// and escalated regardless of the classifier's (LLM-sourced, thus
+	// prompt-injectable) regulated flag, so a foreign-currency break can never be
+	// auto-remediated on the strength of a flipped flag alone. Empty disables the
+	// backstop; the deterministic cohort dry-run (which cannot match across
+	// currencies) remains the always-on independent arbiter (Rule 5.3).
+	baseCurrency string
+
+	// classifyBudget bounds a single break's classification (INFO#3). See
+	// DefaultClassifyBudget. Zero leaves the caller's context unwrapped.
+	classifyBudget time.Duration
+
 	// owner uniquely identifies THIS remediator instance when it claims a
 	// database processing lease on a break (finding M-15). It is generated once
 	// per instance in New so that leases this instance takes can be told apart
@@ -261,14 +293,21 @@ type Remediator struct {
 // consumer-side interfaces so tests can inject fakes; the concrete
 // *classifier.Classifier, *blnk.Client, *audit.Writer and *store.Store returned
 // by the module's own constructors satisfy them structurally.
-func New(cls classifierPort, blnkClient blnkPort, auditWriter auditPort, store storePort, threshold float64, llmModel string) *Remediator {
+//
+// baseCurrency (config AGENT_BASE_CURRENCY, may be empty) is the independent
+// non-LLM regulated backstop of INFO#2; classifyBudget (see DefaultClassifyBudget)
+// bounds a single break's classification per INFO#3. Tests pass baseCurrency=""
+// and classifyBudget=0 to exercise the pre-INFO behavior unchanged.
+func New(cls classifierPort, blnkClient blnkPort, auditWriter auditPort, store storePort, threshold float64, llmModel string, baseCurrency string, classifyBudget time.Duration) *Remediator {
 	return &Remediator{
-		cls:         cls,
-		blnkClient:  blnkClient,
-		auditWriter: auditWriter,
-		store:       store,
-		threshold:   threshold,
-		llmModel:    llmModel,
+		cls:            cls,
+		blnkClient:     blnkClient,
+		auditWriter:    auditWriter,
+		store:          store,
+		threshold:      threshold,
+		llmModel:       llmModel,
+		baseCurrency:   strings.TrimSpace(baseCurrency),
+		classifyBudget: classifyBudget,
 		// A unique owner identity per instance so database processing leases
 		// (finding M-15) taken by this remediator are distinguishable from any
 		// other instance's.
@@ -276,46 +315,155 @@ func New(cls classifierPort, blnkClient blnkPort, auditWriter auditPort, store s
 	}
 }
 
-// Handle processes exactly one external break end to end.
+// foreignCurrency reports whether the break's currency differs from the ledger
+// base currency, implementing the INFO#2 independent (non-LLM) regulated
+// backstop. It returns false when no base currency is configured (the backstop
+// is disabled) or when the currencies match case-insensitively; a mismatch means
+// the break must be treated as regulated and routed to human review regardless
+// of the classifier's LLM-sourced regulated flag. Comparing on the transaction's
+// OWN currency field keeps this backstop entirely independent of model output,
+// so a prompt-injection that flips regulated=false cannot open the auto path for
+// a cross-currency break.
+func (r *Remediator) foreignCurrency(txn blnk.ExternalTransaction) bool {
+	if r.baseCurrency == "" {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(txn.Currency), r.baseCurrency)
+}
+
+// Handle processes exactly one external break end to end. It is the
+// cohort-of-one convenience wrapper over ProcessCohort, preserving the original
+// single-break API for callers (and the unit suite) that triage one break at a
+// time. For a cohort of one, the dedicated cohort dry-run contains only that
+// break, so unmatched==0 proves THAT break cleared — the deterministic-arbiter
+// guarantee (Rule 5.3) holds exactly as for a multi-break cohort.
 //
 // It returns nil once the break has reached a terminal, safely-recorded outcome
 // (auto-resolved or escalated to HITL). It returns a non-nil error only when an
 // agent-side infrastructure operation (persistence or audit write) fails; such
 // errors never leave a break auto-resolved.
 //
-// Handle is safe to call concurrently and is idempotent: concurrent calls for
-// the same break are serialized (M-5), an already-terminal break is a no-op so
-// a re-run never double-records a resolution or escalation (M-6), and a break
-// left "classified" by a crashed prior attempt is resumed — reusing its stored
-// classification and any created Blnk rule — without re-classifying or creating
-// a duplicate rule (M-3). Every state transition commits atomically with its
-// audit event, so no partial outcome is ever durable (C-1, C-2, M-2, M-4).
-//
 // uploadID identifies the reconciliation upload batch this break originated
 // from. It is stamped into the provenance of EVERY audit event the break emits
 // (finding m-2), so the append-only trail attributes each action to its source
-// upload and per-run summaries can be scoped correctly (finding M-6). Blnk's
-// own external-transaction JSON carries no upload id (it is a property of the
-// reconciliation run, not the transaction line), so it is threaded here as an
-// explicit parameter rather than read off txn. It is ALSO the upload the
-// clearance confirmation reconciles over, keeping the confirmation cache-safe
-// (finding C-03).
+// upload and per-run summaries can be scoped correctly (finding M-6).
+func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, uploadID string) error {
+	return r.ProcessCohort(ctx, []blnk.ExternalTransaction{txn}, uploadID)
+}
+
+// pendingRemediation carries a break that propose() advanced to the point of
+// having a created (or reused) Blnk matching rule awaiting the cohort clearance
+// confirmation. finalize() consumes it after the SINGLE cohort dry-run. Its
+// release closure holds the break's M-5 in-process mutex AND M-15 durable lease
+// and MUST be invoked exactly once — finalize defers it — so both are released
+// only after the break reaches its terminal outcome.
+type pendingRemediation struct {
+	txn            blnk.ExternalTransaction
+	classification model.BreakClassification
+	prov           model.Provenance // base provenance (model, source, upload)
+	provEv         model.Provenance // prov + classification evidence (auto-path events)
+	id             string           // classification.ExternalTxnID (== txn.ID)
+	ruleID         string           // the Blnk rule created/reused for this break
+	createdHere    bool             // true iff THIS run created the rule (gates rollback)
+	release        func()           // releases M-5 mutex + M-15 lease; call exactly once
+}
+
+// ProcessCohort triages a batch of breaks with the deterministic-arbiter
+// guarantee that fixes finding F-1 (Rule 5.3). It runs in three phases:
 //
-// baselineUnmatched is Blnk's authoritative unmatched count from the run's
-// detection reconciliation (the count with no safe rule applied). The auto path
-// confirms a break cleared only when a dry-run reconciliation over uploadID with
-// the created rule drives the unmatched count strictly below this baseline
-// (Rule 5.3) — see ConfirmClearedOverUpload. A caller that has no meaningful
-// baseline (e.g. a resumed single-break re-drive outside the batch pipeline)
-// passes the number of breaks it expects to remain unmatched without the rule;
-// the pipeline passes the detection count.
-func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, uploadID string, baselineUnmatched int) error {
-	// M-5: serialize concurrent Handle calls for the SAME break. Released after
-	// the break reaches a terminal, committed state (or an error), so a racing
-	// caller observes that terminal state and no-ops below rather than
-	// re-processing.
-	unlock := r.locks.lock(txn.ID)
-	defer unlock()
+//  1. PROPOSE every break independently (classify -> gate -> build+create the
+//     safe rule), collecting those that reached the point of a created/reused
+//     rule awaiting confirmation. Breaks that terminate during propose
+//     (already-terminal no-op, classifier fail-closed, gate escalation, unsafe
+//     profile, rule-create failure, ...) are fully resolved there and are not
+//     carried forward.
+//  2. CONFIRM the whole eligible cohort with ONE ConfirmCohortCleared dry-run —
+//     the run's SINGLE cold reconciliation. Because that dry-run reconciles a
+//     DEDICATED upload containing only the cohort's rows, unmatched==0 proves
+//     EVERY cohort member left the unmatched set, so clearance is attributable
+//     per break (unlike the earlier full-upload aggregate confirm that F-1
+//     exploited). This is the only cache-safe way to attribute clearance over
+//     Blnk's count-only HTTP surface without touching its protected-core
+//     pagination cache (Rule 5.8 / INFO#4).
+//  3. FINALIZE every pending break with the shared verdict: on a true verdict
+//     resolve ALL (each stamped with the confirming cohort reconciliation id,
+//     Rule 5.3); otherwise fail EVERY member closed to HITL and compensate any
+//     rule created this run (Rule 5.7). A mixed cohort in which even one member
+//     cannot clear therefore fails the whole cohort closed rather than risk a
+//     false resolution — the safe posture the count-only surface permits.
+//
+// It returns the joined error of any per-break infrastructure failures (nil when
+// every break reached a terminal, safely-recorded outcome). Each break's M-5
+// mutex and M-15 lease are held from its propose() through its finalize().
+func (r *Remediator) ProcessCohort(ctx context.Context, breaks []blnk.ExternalTransaction, uploadID string) error {
+	var (
+		pending []*pendingRemediation
+		errs    []error
+	)
+
+	// Phase 1: propose each break independently. A propose error is collected but
+	// does not abort the cohort — other breaks must still be triaged.
+	for _, txn := range breaks {
+		p, err := r.propose(ctx, txn, uploadID)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if p != nil {
+			pending = append(pending, p)
+		}
+	}
+
+	// No break reached the confirmation phase: every one terminated in propose.
+	if len(pending) == 0 {
+		return errors.Join(errs...)
+	}
+
+	// Phase 2: ONE dedicated-cohort dry-run — the run's single COLD read and the
+	// deterministic arbiter (Rule 5.3). A transport/validation error yields a
+	// false verdict so finalize fails every member closed (Rule 5.7).
+	cohort := make([]blnk.ExternalTransaction, len(pending))
+	ruleIDs := make([]string, len(pending))
+	for i, p := range pending {
+		cohort[i] = p.txn
+		ruleIDs[i] = p.ruleID
+	}
+	cleared, reconID, confirmErr := r.blnkClient.ConfirmCohortCleared(ctx, cohort, ruleIDs)
+
+	// Phase 3: finalize every pending break with the shared cohort verdict.
+	for _, p := range pending {
+		if err := r.finalize(ctx, p, cleared, reconID, confirmErr); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// propose advances one break from classification through creating (or reusing)
+// its safe Blnk matching rule, up to — but NOT including — the cohort clearance
+// confirmation. It returns:
+//
+//   - (nil, nil)  when the break reached a terminal outcome here (already
+//     terminal, classifier fail-closed, gate escalation, unsafe profile,
+//     orphaned-rule resume, empty/failed rule creation, ...): it performed the
+//     escalation itself and released the break's mutex/lease.
+//   - (nil, err)  when an agent-side persistence/audit operation failed; the
+//     mutex/lease are released.
+//   - (&pendingRemediation, nil)  when a rule was created/reused and the break
+//     awaits the cohort confirmation; the returned release closure still holds
+//     the break's mutex AND lease and MUST be invoked by finalize.
+//
+// It preserves every durability guarantee of the original monolithic Handle:
+// M-5 in-process serialization, M-6 idempotency/crash-resume, M-2 atomic
+// classify+audit, M-15 durable lease, the Rule 5.4 confidence/regulation gate,
+// the INFO#2 currency backstop, the C3 root-cause allow-list, the SEAM-MIN-1
+// orphaned-rule guard, and the M-3/M-11 atomic rule-create + outbox.
+func (r *Remediator) propose(ctx context.Context, txn blnk.ExternalTransaction, uploadID string) (*pendingRemediation, error) {
+	// M-5: serialize concurrent processing of the SAME break. Unlike the original
+	// Handle this is NOT deferred: the mutex must stay held across the cohort
+	// confirmation and finalize, so it is released explicitly on every terminal
+	// path here and, on the success path, by finalize via the release closure.
+	unlockMutex := r.locks.lock(txn.ID)
 
 	prov := model.Provenance{
 		Model:    r.llmModel,
@@ -326,7 +474,8 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	// M-6 idempotency / crash-resume: consult the persisted state first.
 	loaded, status, createdRuleID, found, err := r.store.LoadBreak(ctx, txn.ID)
 	if err != nil {
-		return fmt.Errorf("remediator: load break %q: %w", txn.ID, err)
+		unlockMutex()
+		return nil, fmt.Errorf("remediator: load break %q: %w", txn.ID, err)
 	}
 
 	var classification model.BreakClassification
@@ -334,7 +483,8 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	case found && (status == statusAutoResolved || status == statusQueued):
 		// Terminal outcome already recorded. A re-run (or the loser of a race)
 		// is a no-op, so a resolved/escalated event is never double-counted.
-		return nil
+		unlockMutex()
+		return nil, nil
 
 	case found && status == statusClassified:
 		// Resume a break a prior attempt persisted+audited as classified but did
@@ -347,7 +497,20 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	default:
 		// Fresh break: classify (fail-closed on error), validate confidence,
 		// then persist + audit the classification atomically (M-2).
-		c, cerr := r.cls.Classify(ctx, txn)
+		//
+		// INFO#3: bound this single break's classification by r.classifyBudget so
+		// a HUNG LLM endpoint cannot let one break consume the whole run's budget
+		// (the classifier retries up to the Rule 5.7 cap, each attempt self-bounded
+		// but summing to ~90s). When the budget elapses, Classify returns and the
+		// break fails closed to HITL below. A zero budget (unit tests) leaves the
+		// caller's context unwrapped.
+		classifyCtx := ctx
+		if r.classifyBudget > 0 {
+			var cancelClassify context.CancelFunc
+			classifyCtx, cancelClassify = context.WithTimeout(ctx, r.classifyBudget)
+			defer cancelClassify()
+		}
+		c, cerr := r.cls.Classify(classifyCtx, txn)
 		if cerr != nil {
 			// Rule 5.7 (fail-closed): ANY classifier error/timeout routes the
 			// break straight to HITL. It is never dropped or auto-resolved, and
@@ -362,7 +525,9 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 			if !errors.Is(cerr, classifier.ErrClassificationFailed) {
 				reason = fmt.Sprintf("%s (unexpected error: %v)", reasonClassifierFailed, cerr)
 			}
-			return r.escalate(ctx, txn, stub, prov, reason)
+			escErr := r.escalate(ctx, txn, stub, prov, reason)
+			unlockMutex()
+			return nil, escErr
 		}
 
 		// Defensive: guarantee the break is keyed by the transaction under
@@ -374,7 +539,9 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 		// the gate below ineffective). No classified event is emitted; escalate
 		// sanitizes the confidence so the escalated event is itself well-formed.
 		if !validConfidence(c.Confidence) {
-			return r.escalate(ctx, txn, c, prov, fmt.Sprintf("%s (confidence=%v)", reasonInvalidConfidence, c.Confidence))
+			escErr := r.escalate(ctx, txn, c, prov, fmt.Sprintf("%s (confidence=%v)", reasonInvalidConfidence, c.Confidence))
+			unlockMutex()
+			return nil, escErr
 		}
 
 		// M-2: persist the classified break and emit the classified AuditEvent in
@@ -386,7 +553,8 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 			}
 			return r.auditWriter.RecordTx(ctx, tx, audit.Classified(c, prov))
 		}); err != nil {
-			return fmt.Errorf("remediator: persist+audit classified break %q: %w", txn.ID, err)
+			unlockMutex()
+			return nil, fmt.Errorf("remediator: persist+audit classified break %q: %w", txn.ID, err)
 		}
 		classification = c
 	}
@@ -411,30 +579,54 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	// gates all external work below.
 	granted, claimErr := r.store.ClaimBreak(ctx, id, r.owner, remediationLeaseTTL)
 	if claimErr != nil {
-		return fmt.Errorf("remediator: claim processing lease for break %q: %w", id, claimErr)
+		unlockMutex()
+		return nil, fmt.Errorf("remediator: claim processing lease for break %q: %w", id, claimErr)
 	}
 	if !granted {
-		return nil
+		unlockMutex()
+		return nil, nil
 	}
-	// Release the lease when the break reaches a terminal outcome (or on error)
-	// so a retry or another instance can reclaim it. Release runs on an
-	// independent context so a canceled parent cannot leave the lease dangling;
-	// if release still fails, the lease self-expires after remediationLeaseTTL.
-	defer func() {
+	// release retires the break's durable lease (M-15) and then its in-process
+	// mutex (M-5). Unlike the original monolithic Handle's deferred cleanup it is
+	// NOT fired here: the lease and mutex must stay held across the cohort
+	// clearance confirmation, so every terminal path in propose() invokes
+	// release() explicitly, and the success path hands it to finalize(), which
+	// defers it. The lease release runs on an independent context so a canceled
+	// parent cannot leave the lease dangling; if it still fails, the lease
+	// self-expires after remediationLeaseTTL. It is invoked exactly once.
+	release := func() {
 		relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), escalateTimeout)
 		defer cancel()
 		_ = r.store.ReleaseBreak(relCtx, id, r.owner)
-	}()
+		unlockMutex()
+	}
 
 	// Confidence/regulation gate (Rule 5.4). A regulated break, or one below the
 	// confidence threshold, is NEVER auto-remediated: it is escalated to HITL
 	// with no resolved event. (On resume this re-applies the gate to a break a
 	// crashed attempt left classified.)
 	if classification.Regulated {
-		return r.escalate(ctx, txn, classification, prov, reasonRegulated)
+		escErr := r.escalate(ctx, txn, classification, prov, reasonRegulated)
+		release()
+		return nil, escErr
+	}
+	// INFO#2 independent, non-LLM regulated backstop. The classifier's regulated
+	// flag is entirely LLM-sourced and thus prompt-injectable; this backstop
+	// treats a break whose currency differs from the ledger base currency as
+	// regulated REGARDLESS of that flag, so a flipped regulated=false can never
+	// open the auto path for a foreign-currency break. It is defense-in-depth
+	// ABOVE the always-on deterministic cohort dry-run (which independently
+	// cannot match across currencies, Rule 5.3). Disabled when baseCurrency is
+	// empty; a cohort-of-one whose sole currency equals itself is unaffected.
+	if r.foreignCurrency(txn) {
+		escErr := r.escalate(ctx, txn, classification, prov, reasonForeignCurrency)
+		release()
+		return nil, escErr
 	}
 	if classification.Confidence < r.threshold {
-		return r.escalate(ctx, txn, classification, prov, reasonLowConfidence)
+		escErr := r.escalate(ctx, txn, classification, prov, reasonLowConfidence)
+		release()
+		return nil, escErr
 	}
 
 	// Root-cause auto-eligibility (finding C3). Confidence and the regulated flag
@@ -446,12 +638,16 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	// can never be auto-applied. This is a hard, model-independent backstop above
 	// the classifier's soft guidance to omit a rule for these causes.
 	if !autoEligibleRootCauses[classification.RootCause] {
-		return r.escalate(ctx, txn, classification, prov, reasonRootCauseNotAutoEligible)
+		escErr := r.escalate(ctx, txn, classification, prov, reasonRootCauseNotAutoEligible)
+		release()
+		return nil, escErr
 	}
 
 	// Auto path. The agent only PROPOSES; Blnk DECIDES (Rule 5.3).
 	if classification.ProposedRule == nil {
-		return r.escalate(ctx, txn, classification, prov, reasonMissingRule)
+		escErr := r.escalate(ctx, txn, classification, prov, reasonMissingRule)
+		release()
+		return nil, escErr
 	}
 
 	// provEv carries the classification evidence (root cause, regulated flag,
@@ -485,10 +681,13 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 		// (no prior rule_proposed event) is unaffected and proceeds normally.
 		proposedCount, err := r.store.CountAuditByAction(ctx, id, audit.ActionRuleProposed)
 		if err != nil {
-			return fmt.Errorf("remediator: check prior rule proposal for break %q: %w", id, err)
+			release()
+			return nil, fmt.Errorf("remediator: check prior rule proposal for break %q: %w", id, err)
 		}
 		if proposedCount > 0 {
-			return r.escalate(ctx, txn, classification, prov, reasonOrphanedRuleResume)
+			escErr := r.escalate(ctx, txn, classification, prov, reasonOrphanedRuleResume)
+			release()
+			return nil, escErr
 		}
 
 		// C-06: build the EXACT, deterministic safe rule profile for this break's
@@ -503,7 +702,9 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 		// closed to HITL. See safeRuleForBreak for the per-root-cause profiles.
 		rule, ruleErr := safeRuleForBreak(classification, txn)
 		if ruleErr != nil {
-			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonUnsafeProfile, ruleErr))
+			escErr := r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonUnsafeProfile, ruleErr))
+			release()
+			return nil, escErr
 		}
 
 		// Rule 5.2: never POST a rule whose Field/Operator falls outside Blnk's
@@ -511,7 +712,9 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 		// the equals operator, so this is a defensive assertion immediately before
 		// the POST, validating the ACTUAL rule that will be sent.
 		if err := classifier.ValidateRule(rule); err != nil {
-			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonGrammarReject, err))
+			escErr := r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonGrammarReject, err))
+			release()
+			return nil, escErr
 		}
 
 		// Semantic safety before any POST (finding C-06): every criterion the
@@ -522,24 +725,31 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 		// equality criteria, so this is a defensive assertion that the built
 		// profile conforms.
 		if err := autoApplySafe(rule); err != nil {
-			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonOverbroadRule, err))
+			escErr := r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonOverbroadRule, err))
+			release()
+			return nil, escErr
 		}
 
 		// m-3: record the proposal (previously dead-code audit builder) before
 		// any POST to Blnk.
 		if err := r.auditWriter.Record(ctx, audit.RuleProposed(id, ruleRefOf(rule), classification.Confidence, provEv)); err != nil {
-			return fmt.Errorf("remediator: audit proposed rule for break %q: %w", id, err)
+			release()
+			return nil, fmt.Errorf("remediator: audit proposed rule for break %q: %w", id, err)
 		}
 
 		created, err := r.blnkClient.CreateMatchingRule(ctx, rule)
 		if err != nil {
-			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonRuleCreateFailed, err))
+			escErr := r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonRuleCreateFailed, err))
+			release()
+			return nil, escErr
 		}
 		// m-7: guard an empty rule id BEFORE probing — Blnk's instant
 		// reconciliation requires a non-empty matching_rule_ids set, and probing
 		// with [""] would be meaningless. Fail closed to HITL.
 		if created.RuleID == "" {
-			return r.escalate(ctx, txn, classification, prov, reasonEmptyRuleID)
+			escErr := r.escalate(ctx, txn, classification, prov, reasonEmptyRuleID)
+			release()
+			return nil, escErr
 		}
 		ruleID = created.RuleID
 		createdHere = true
@@ -569,58 +779,95 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 			// of THIS failed transaction and so was never committed; the
 			// compensation's outbox mark is therefore a harmless no-op.)
 			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "created-rule local commit failed")
-			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonRuleCreateFailed, err))
+			escErr := r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonRuleCreateFailed, err))
+			release()
+			return nil, escErr
 		}
 	}
 
-	// Deterministic re-drive (finding C-03): a cache-safe, UPLOAD-SCOPED Blnk
-	// dry-run reconciliation over the break's ORIGINAL persisted upload with the
-	// created rule. Clearance is confirmed when Blnk's authoritative unmatched
-	// count drops strictly below the detection baseline — the count with no safe
-	// rule applied. This replaces the earlier per-transaction ProbeBreak, whose
-	// sequential ephemeral single-transaction uploads tripped Blnk's
-	// upload-agnostic pagination cache (a protected-core defect the agent must
-	// not modify, Rule 5.8). Funnelling the confirmation through the same
-	// persisted upload the run detected over makes that shared cache benign,
-	// while Blnk remains the sole arbiter of clearance (Rule 5.3).
-	cleared, reconID, err := r.blnkClient.ConfirmClearedOverUpload(ctx, uploadID, ruleID, baselineUnmatched)
-	if err != nil {
-		// M-11: the confirmation transport/validation failed, so this rule will
-		// not clear the break. If we created it in this call, durably compensate
-		// it (delete from Blnk, mark the outbox obligation, audit the outcome —
-		// including a delete failure) before escalating, so a failed auto-attempt
-		// leaves no unaudited orphan rule behind.
+	// propose has created (or reused) the break's safe rule and durably recorded
+	// its compensation obligation. The break now awaits the SHARED cohort
+	// clearance confirmation (ProcessCohort phase 2), so hand it forward with its
+	// M-5 mutex AND M-15 lease STILL HELD — release is deliberately NOT called
+	// here; finalize() invokes it exactly once. Blnk remains the sole arbiter of
+	// clearance (Rule 5.3): propose never marks a resolution, it only prepares
+	// the break for the deterministic cohort dry-run.
+	return &pendingRemediation{
+		txn:            txn,
+		classification: classification,
+		prov:           prov,
+		provEv:         provEv,
+		id:             id,
+		ruleID:         ruleID,
+		createdHere:    createdHere,
+		release:        release,
+	}, nil
+}
+
+// finalize applies the SHARED cohort clearance verdict to one pending break and
+// releases its M-5 mutex + M-15 lease exactly once (deferred). It reproduces the
+// tail of the original monolithic Handle — probe audit, fail-closed
+// compensation, and the atomic auto-resolve — but keyed off the COHORT-level
+// (cleared, reconID, confirmErr) computed by ProcessCohort rather than a
+// per-break probe. Because that verdict comes from a dedicated-cohort dry-run
+// whose unmatched==0 proves EVERY member left the unmatched set, a resolution is
+// attributable to a dry-run that genuinely cleared THIS break — closing F-1's
+// aggregate-count hole (Rule 5.3). On a false or error verdict it fails the
+// break closed to HITL (Rule 5.7) and compensates any rule this run created, so
+// a failed cohort leaves neither an orphan rule nor an unprovable resolution.
+func (r *Remediator) finalize(ctx context.Context, p *pendingRemediation, cleared bool, reconID string, confirmErr error) error {
+	// Release the break's mutex + lease exactly once, however finalize returns.
+	defer p.release()
+
+	txn := p.txn
+	classification := p.classification
+	prov := p.prov
+	provEv := p.provEv
+	id := p.id
+	ruleID := p.ruleID
+	createdHere := p.createdHere
+
+	if confirmErr != nil {
+		// M-11: the cohort confirmation transport/validation failed, so this rule
+		// cannot be proven to clear the break. If we created it in this run,
+		// durably compensate it (delete from Blnk, mark the outbox obligation,
+		// audit the outcome — including a delete failure) before escalating, so a
+		// failed auto-attempt leaves no unaudited orphan rule behind.
 		if createdHere {
-			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "dry-run probe failed before clearance")
+			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "cohort dry-run failed before clearance")
 		}
-		return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonProbeFailed, err))
+		return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonProbeFailed, confirmErr))
 	}
-	// m-3: record the probe outcome (previously dead-code audit builder).
+	// m-3: record the probe outcome (previously dead-code audit builder). The
+	// same confirming cohort reconciliation id is stamped on every member's probe
+	// event, so each resolution traces to the dry-run that cleared the cohort.
 	if err := r.auditWriter.Record(ctx, audit.Probed(id, reconID, cleared, provEv)); err != nil {
 		return fmt.Errorf("remediator: audit probe for break %q: %w", id, err)
 	}
 	if !cleared {
-		// M-11: Blnk did not confirm clearance, so this rule did not do its job.
-		// Durably compensate a rule created in this call before escalating.
+		// M-11: Blnk did not confirm the cohort cleared, so this rule did not do
+		// its job. Durably compensate a rule created in this run before escalating.
+		// A mixed cohort in which even one member cannot clear fails EVERY member
+		// closed here rather than risk a false resolution — the safe posture the
+		// count-only HTTP surface permits (F-1 / Rule 5.7).
 		if createdHere {
-			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "dry-run did not confirm clearance")
+			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "cohort dry-run did not confirm clearance")
 		}
 		return r.escalate(ctx, txn, classification, prov, reasonNotCleared)
 	}
 
-	// Blnk confirmed clearance — and only Blnk can (Rule 5.3). Build the
-	// clearance proof from the confirming reconciliation id: audit.Resolved
-	// takes a ClearanceProof (never a bare id), so a resolution is impossible to
-	// record without evidence of an actual dry-run clearance. If the arbiter
-	// reported cleared but returned no usable reconciliation id, fail closed and
-	// escalate rather than record an unprovable resolution (Rule 5.7). LLM
-	// confidence alone never resolves.
+	// Blnk confirmed the whole cohort cleared — and only Blnk can (Rule 5.3).
+	// Build the clearance proof from the confirming reconciliation id:
+	// audit.Resolved takes a ClearanceProof (never a bare id), so a resolution is
+	// impossible to record without evidence of an actual dry-run clearance. If the
+	// arbiter reported cleared but returned no usable reconciliation id, fail
+	// closed and escalate rather than record an unprovable resolution (Rule 5.7).
+	// LLM confidence alone never resolves.
 	proof, err := audit.NewClearanceProof(reconID, cleared)
 	if err != nil {
-		// M-11: Blnk reported cleared but returned no usable reconciliation id, so
-		// we fail closed and escalate rather than record an unprovable resolution.
-		// Durably compensate a rule created in this call so the aborted attempt
-		// leaves no unaudited orphan rule behind.
+		// M-11: cleared but no usable reconciliation id — fail closed and escalate
+		// rather than record an unprovable resolution. Durably compensate a rule
+		// created in this run so the aborted attempt leaves no unaudited orphan.
 		if createdHere {
 			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "clearance reported without a usable reconciliation id")
 		}
@@ -633,13 +880,14 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	// without its resolved event (nor vice versa); and confirming the outbox in
 	// the SAME commit means a rule that legitimately cleared its break is marked
 	// 'confirmed' rather than being mistaken for an orphan by the recovery sweep.
-	// MarkResolvedTx stamps the SAME confirming recon_id the proof carries onto
-	// the break row, and audit.Resolved stamps it onto the event's provenance —
-	// so the row's resolved_recon_id and the audit trail agree, and the store's
-	// resolved-proof CHECK guarantees the row cannot be auto-resolved without it
-	// (Rule 5.3). Every resolution is thus traceable to the dry-run that cleared
-	// it. ConfirmRuleOutboxTx targets only a still-'pending' row, so on the resume
-	// path (where the outbox may already be confirmed) it is a harmless no-op.
+	// MarkResolvedTx stamps the SAME confirming cohort recon_id the proof carries
+	// onto the break row, and audit.Resolved stamps it onto the event's
+	// provenance — so the row's resolved_recon_id and the audit trail agree, and
+	// the store's resolved-proof CHECK guarantees the row cannot be auto-resolved
+	// without it (Rule 5.3). Every resolution is thus traceable to the cohort
+	// dry-run that cleared it. ConfirmRuleOutboxTx targets only a still-'pending'
+	// row, so on the resume path (where the outbox may already be confirmed) it is
+	// a harmless no-op.
 	if err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
 		if e := r.store.MarkResolvedTx(ctx, tx, id, proof.ReconID()); e != nil {
 			return e

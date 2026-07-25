@@ -102,7 +102,7 @@ DEMO_TIMEOUT=60
 DEMO_LLM_ADDR=127.0.0.1:11434
 
 # Run the recon-agent pipeline end-to-end (ingest → derive breaks → classify → gate → remediate/escalate → audit),
-# print the summary table (breaks in / auto-resolved / escalated / audit count), and ASSERT the AAP acceptance
+# print the summary table (breaks in / auto-resolved / escalated / audit events), and ASSERT the AAP acceptance
 # criteria via the canonical scorer, exiting NONZERO on any failed criterion (findings M-01, M-17).
 #
 # Determinism: the demo launches the bundled OpenAI-compatible stub LLM

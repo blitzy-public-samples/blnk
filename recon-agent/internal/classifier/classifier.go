@@ -44,16 +44,27 @@ const defaultMaxRetries = 2
 // (Rule 5.7) and the <=60s demo budget. Classify derives a per-attempt context
 // deadline from this value so every attempt is self-bounded regardless of the
 // caller's context; after the retry cap the break fails closed and is routed to
-// HITL. It is generous enough for a healthy Kimi K3 response yet finite.
-const defaultPerAttemptTimeout = 30 * time.Second
+// HITL.
+//
+// It is sized (with the retry cap of 2) so a single break's worst-case
+// classification under a hung endpoint — (maxRetries+1) * perAttemptTimeout =
+// 3 * 15s = 45s — stays STRICTLY under cmd.pipelineTimeout (55s), so even a
+// fully hung endpoint leaves headroom for the fail-closed escalation write to
+// run within the same pipeline budget (findings MINOR-1 / #5: the previous 30s
+// value let one break's three attempts alone consume the whole 90s pipeline
+// budget). 15s remains generous for a healthy Kimi K3 classification response
+// yet finite.
+const defaultPerAttemptTimeout = 15 * time.Second
 
 // defaultHTTPClientTimeout is a hard backstop on the underlying HTTP client that
 // covers the entire request/response exchange (connect, TLS, headers, body). It
-// is set slightly above defaultPerAttemptTimeout so that, in normal operation,
-// the per-attempt context deadline is the binding limit; the client Timeout only
+// is set above defaultPerAttemptTimeout so that, in normal operation, the
+// per-attempt context deadline is the binding limit; the client Timeout only
 // engages if the per-attempt bound is ever disabled. Together they guarantee no
 // LLM call can hang unbounded even when the caller supplies context.Background().
-const defaultHTTPClientTimeout = 60 * time.Second
+// Kept tight (findings MINOR-1 / #5) so the backstop, too, cannot stall the
+// pipeline.
+const defaultHTTPClientTimeout = 20 * time.Second
 
 // deterministicTemperature forces near-deterministic sampling for demo
 // reproducibility. go-openai marshals Temperature with `omitempty`, so a literal

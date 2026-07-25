@@ -52,8 +52,9 @@ const (
 //
 // Every exported field has a corresponding read-site in another package
 // (Gate 12): the LLM* fields are read by internal/classifier, the Blnk*
-// fields by internal/blnk, ConfAutoThreshold by internal/remediator, HitlPort
-// by internal/hitl (via cmd/main.go), and AgentDatabaseURL by internal/store.
+// fields by internal/blnk, ConfAutoThreshold and AgentBaseCurrency by
+// internal/remediator, HitlPort by internal/hitl (via cmd/main.go), and
+// AgentDatabaseURL by internal/store.
 type Config struct {
 	// LLMBaseURL is the OpenAI-compatible Chat Completions base URL
 	// (LLM_BASE_URL). Read by the classifier.
@@ -79,6 +80,15 @@ type Config struct {
 	// AgentDatabaseURL is the PostgreSQL DSN for the agent-owned tables
 	// (AGENT_DATABASE_URL). Required. Read by the store.
 	AgentDatabaseURL string
+	// AgentBaseCurrency is the ledger's settlement (base) currency
+	// (AGENT_BASE_CURRENCY). OPTIONAL — when empty, the independent non-LLM
+	// regulated backstop it powers is disabled. When set, the remediator treats
+	// any break whose currency differs from it as regulated REGARDLESS of the
+	// classifier's LLM-sourced regulated flag, so a prompt-injection that flips
+	// regulated=false can never open the auto path for a foreign-currency break
+	// (INFO#2 defense-in-depth for finding F-1, above the always-on deterministic
+	// cohort dry-run). Read by the remediator (via cmd/main.go).
+	AgentBaseCurrency string
 }
 
 // Load reads the recon-agent configuration from the process environment,
@@ -109,6 +119,11 @@ func Load() (Config, error) {
 		// templating slip) fails the required-field check below instead of
 		// being stored verbatim and failing later at DB-connect time.
 		AgentDatabaseURL: strings.TrimSpace(os.Getenv("AGENT_DATABASE_URL")),
+		// Optional independent (non-LLM) regulated backstop of INFO#2. Trimmed;
+		// empty disables the backstop. Not validated as required — a deployment
+		// that omits it simply relies on the always-on deterministic cohort
+		// dry-run (Rule 5.3) without the extra currency guard.
+		AgentBaseCurrency: strings.TrimSpace(os.Getenv("AGENT_BASE_CURRENCY")),
 	}
 
 	threshold, err := parseFloat("CONF_AUTO_THRESHOLD", defaultConfAutoThreshold)
