@@ -52,17 +52,29 @@ const ActorAgent = "agent"
 
 // Action constants are the closed set of values written to agent_audit.action.
 // Any event whose Action is outside this set is rejected by Record/RecordTx
-// (finding M-13: no arbitrary action may reach the ledger).
+// (finding M-13: no arbitrary action may reach the ledger). Each name aliases
+// the canonical literal in internal/model (finding m-01), so the value is
+// declared exactly once module-wide while this package's public audit.Action*
+// API — referenced by the remediator, hitl, cmd, and their tests — stays
+// stable.
 const (
-	ActionClassified   = "classified"
-	ActionRuleProposed = "rule_proposed"
-	ActionRuleCreated  = "rule_created"
-	ActionProbed       = "probed"
-	ActionResolved     = "resolved"
-	ActionEscalated    = "escalated"
-	ActionAccepted     = "accepted"
-	ActionReDriven     = "re_driven"
-	ActionRejected     = "rejected"
+	ActionClassified   = model.ActionClassified
+	ActionRuleProposed = model.ActionRuleProposed
+	ActionRuleCreated  = model.ActionRuleCreated
+	ActionProbed       = model.ActionProbed
+	ActionResolved     = model.ActionResolved
+	ActionEscalated    = model.ActionEscalated
+	ActionAccepted     = model.ActionAccepted
+	ActionReDriven     = model.ActionReDriven
+	ActionRejected     = model.ActionRejected
+	// ActionRuleCompensated records the OUTCOME of compensating a Blnk matching
+	// rule the agent created but whose auto-remediation attempt did not resolve
+	// the break — the rule is deleted from Blnk's shared catalog so no orphan
+	// survives (finding M-11). It is emitted by the remediator's in-call
+	// rollback and by its startup recovery sweep, and — crucially — is recorded
+	// even when the deletion FAILED, so an orphaned rule that could not be
+	// removed is durably visible in the append-only trail for human cleanup.
+	ActionRuleCompensated = model.ActionRuleCompensated
 )
 
 // Decision verbs, as submitted on model.HITLDecision.Decision. DecisionAction
@@ -96,6 +108,19 @@ var (
 	// ErrInvalidConfidence is returned when confidence is NaN, infinite, or
 	// outside [0,1] (finding C-07).
 	ErrInvalidConfidence = errors.New("audit: confidence must be a finite number in [0,1]")
+	// ErrEmptyRationale is returned when an event carries no rationale (finding
+	// M-12). Every action must record WHY it happened so the append-only trail
+	// is self-describing; this mirrors the agent_audit_rationale_nonempty DB
+	// CHECK, failing fast at the application boundary with a clear error. The
+	// evidence-stamping builders synthesize a sensible default rationale when a
+	// caller supplies none, so a well-formed event never trips this.
+	ErrEmptyRationale = errors.New("audit: rationale must not be empty")
+	// ErrMissingProvenance is returned when an event lacks the action-specific
+	// evidence its action requires (finding M-12): a classification must name the
+	// model, a proposed rule must carry its field, a created rule its id, and a
+	// probe its reconciliation id. Without this, an action would be recorded
+	// without the machine-readable proof that makes it independently meaningful.
+	ErrMissingProvenance = errors.New("audit: action is missing required provenance evidence")
 	// ErrInvalidEventID is returned when a caller-supplied event id is not a
 	// valid UUID.
 	ErrInvalidEventID = errors.New("audit: event_id must be a valid UUID")
@@ -205,7 +230,7 @@ func (w *Writer) prepare(ev model.AuditEvent) (model.AuditEvent, error) {
 }
 
 // validateEvent enforces the required-field and domain invariants every audit
-// event must satisfy before it is written (findings C-07, M-13, Rule 5.3).
+// event must satisfy before it is written (findings C-07, M-12, M-13, Rule 5.3).
 func validateEvent(ev model.AuditEvent) error {
 	if strings.TrimSpace(ev.ExternalTxnID) == "" {
 		return ErrEmptyExternalTxnID
@@ -219,12 +244,69 @@ func validateEvent(ev model.AuditEvent) error {
 	if math.IsNaN(ev.Confidence) || math.IsInf(ev.Confidence, 0) || ev.Confidence < 0 || ev.Confidence > 1 {
 		return ErrInvalidConfidence
 	}
-	// Rule 5.3: a resolved event is only valid with a confirming reconciliation
-	// id in its provenance. This backstops the ClearanceProof requirement on
-	// Resolved so that no resolution — however the event was constructed — can
-	// be persisted without deterministic-arbiter proof.
-	if ev.Action == ActionResolved && strings.TrimSpace(ev.Provenance.ReconID) == "" {
-		return ErrEmptyReconID
+	// M-12: every event must record a non-empty rationale so the append-only
+	// trail explains WHY each action happened, not just that it did. The
+	// builders synthesize a default when a caller supplies none, so this only
+	// rejects a genuinely empty direct Record call.
+	if strings.TrimSpace(ev.Rationale) == "" {
+		return ErrEmptyRationale
+	}
+	// M-12: action-specific provenance — each action must carry the
+	// machine-readable evidence that makes it independently meaningful and
+	// queryable in the trail.
+	return validateActionProvenance(ev)
+}
+
+// validateActionProvenance enforces the per-action evidence each audit action
+// must carry in its provenance (finding M-12). The required evidence is exactly
+// what every legitimate emission site of that action populates, so this rejects
+// under-attributed events without ever rejecting a well-formed one:
+//
+//   - classified   → the model that produced the classification;
+//   - rule_proposed → the proposed rule's primary criterion field (a proposed
+//     rule has no Blnk id yet, so the field — not the id — is its evidence);
+//   - rule_created → the Blnk-assigned rule id;
+//   - rule_compensated → the Blnk rule id that was compensated (deleted, or
+//     attempted): the compensation event is only meaningful if it names WHICH
+//     orphaned rule it concerns, so a failed cleanup is traceable to the exact
+//     rule still needing manual removal (finding M-11);
+//   - probed       → the dry-run reconciliation id the probe ran under;
+//   - resolved     → the confirming reconciliation id (Rule 5.3): a resolution
+//     must be provably traceable to the Blnk dry-run that cleared it. Kept as a
+//     distinct ErrEmptyReconID sentinel so the deterministic-arbiter proof has
+//     its own matchable error.
+//
+// escalated, accepted, re_driven, and rejected intentionally require no extra
+// provenance: a probe-error escalation precedes any LLM call so carries no
+// model (cmd/main.go), and a "not cleared" re_driven event deliberately carries
+// no recon_id so a recon_id can never imply a false clearance (finding m-04).
+// For those, the required non-empty actor and rationale are sufficient evidence.
+func validateActionProvenance(ev model.AuditEvent) error {
+	switch ev.Action {
+	case ActionClassified:
+		if strings.TrimSpace(ev.Provenance.Model) == "" {
+			return fmt.Errorf("%w: %q requires provenance.model", ErrMissingProvenance, ev.Action)
+		}
+	case ActionRuleProposed:
+		if strings.TrimSpace(ev.Provenance.RuleField) == "" {
+			return fmt.Errorf("%w: %q requires provenance.rule_field", ErrMissingProvenance, ev.Action)
+		}
+	case ActionRuleCreated:
+		if strings.TrimSpace(ev.Provenance.RuleID) == "" {
+			return fmt.Errorf("%w: %q requires provenance.rule_id", ErrMissingProvenance, ev.Action)
+		}
+	case ActionRuleCompensated:
+		if strings.TrimSpace(ev.Provenance.RuleID) == "" {
+			return fmt.Errorf("%w: %q requires provenance.rule_id", ErrMissingProvenance, ev.Action)
+		}
+	case ActionProbed:
+		if strings.TrimSpace(ev.Provenance.ReconID) == "" {
+			return fmt.Errorf("%w: %q requires provenance.recon_id", ErrMissingProvenance, ev.Action)
+		}
+	case ActionResolved:
+		if strings.TrimSpace(ev.Provenance.ReconID) == "" {
+			return ErrEmptyReconID
+		}
 	}
 	return nil
 }
@@ -235,7 +317,8 @@ func validateEvent(ev model.AuditEvent) error {
 func isAllowedAction(action string) bool {
 	switch action {
 	case ActionClassified, ActionRuleProposed, ActionRuleCreated, ActionProbed,
-		ActionResolved, ActionEscalated, ActionAccepted, ActionReDriven, ActionRejected:
+		ActionResolved, ActionEscalated, ActionAccepted, ActionReDriven, ActionRejected,
+		ActionRuleCompensated:
 		return true
 	default:
 		return false
@@ -313,11 +396,22 @@ func withRuleEvidence(prov model.Provenance, rule RuleRef) model.Provenance {
 // plus the given provenance enriched with machine-readable classification
 // evidence (root cause, regulated flag, proposed-rule identity — finding M-13).
 func Classified(c model.BreakClassification, prov model.Provenance) model.AuditEvent {
+	rationale := c.Rationale
+	if strings.TrimSpace(rationale) == "" {
+		// M-12: synthesize a non-empty rationale from the classification's own
+		// evidence when the classifier returned none, so the classified event is
+		// still self-describing rather than being rejected as under-attributed.
+		rootCause := string(c.RootCause)
+		if rootCause == "" {
+			rootCause = string(model.RootCauseUnknown)
+		}
+		rationale = "agent classified break; root cause: " + rootCause
+	}
 	return model.AuditEvent{
 		ExternalTxnID: c.ExternalTxnID,
 		Actor:         ActorAgent,
 		Action:        ActionClassified,
-		Rationale:     c.Rationale,
+		Rationale:     rationale,
 		Confidence:    c.Confidence,
 		Provenance:    WithClassificationEvidence(prov, c),
 	}
@@ -351,6 +445,33 @@ func RuleCreated(externalTxnID string, rule RuleRef, confidence float64, prov mo
 	}
 }
 
+// RuleCompensated builds the audit event recording the OUTCOME of compensating a
+// Blnk matching rule the agent created for an auto-remediation attempt that did
+// not resolve the break (finding M-11). deleted reports whether the rule was
+// successfully removed from Blnk's shared catalog; the compensated rule's id is
+// stamped into provenance so the trail names the exact rule. When deleted is
+// false the event is a DURABLE record that an orphaned rule could NOT be removed
+// and still exists in Blnk, needing human cleanup — the "audit cleanup failures"
+// obligation of M-11. A caller-supplied rationale is preserved; an empty one is
+// synthesized from the outcome so the event is always self-describing.
+func RuleCompensated(externalTxnID, ruleID string, deleted bool, rationale string, confidence float64, prov model.Provenance) model.AuditEvent {
+	if strings.TrimSpace(rationale) == "" {
+		if deleted {
+			rationale = "agent compensated a non-clearing matching rule: deleted rule " + ruleID + " from Blnk"
+		} else {
+			rationale = "agent FAILED to compensate matching rule " + ruleID + "; it may still exist in Blnk and needs manual cleanup"
+		}
+	}
+	return model.AuditEvent{
+		ExternalTxnID: externalTxnID,
+		Actor:         ActorAgent,
+		Action:        ActionRuleCompensated,
+		Rationale:     rationale,
+		Confidence:    confidence,
+		Provenance:    withRuleEvidence(prov, RuleRef{ID: ruleID}),
+	}
+}
+
 // Probed builds the audit event recording a Blnk dry-run probe of a break
 // (finding M-13: probe actions are audited). The confirming reconciliation id
 // is stamped into provenance and the outcome (cleared or still unmatched) is
@@ -379,6 +500,11 @@ func Probed(externalTxnID, reconID string, cleared bool, prov model.Provenance) 
 // every resolved event provably traceable to the dry-run that cleared it.
 func Resolved(externalTxnID, rationale string, confidence float64, prov model.Provenance, proof ClearanceProof) model.AuditEvent {
 	prov.ReconID = proof.reconID
+	if strings.TrimSpace(rationale) == "" {
+		// M-12: a resolution is always self-describing — default to naming the
+		// confirming dry-run so the event explains WHY the break is resolved.
+		rationale = "Blnk dry-run reconciliation " + proof.reconID + " confirmed the break cleared"
+	}
 	return model.AuditEvent{
 		ExternalTxnID: externalTxnID,
 		Actor:         ActorAgent,
@@ -394,6 +520,11 @@ func Resolved(externalTxnID, rationale string, confidence float64, prov model.Pr
 // Enrich prov via WithClassificationEvidence before calling to record the root
 // cause and regulated flag that drove the escalation (finding M-13).
 func Escalated(externalTxnID, rationale string, confidence float64, prov model.Provenance) model.AuditEvent {
+	if strings.TrimSpace(rationale) == "" {
+		// M-12: never record a bare escalation — always explain that the break
+		// was routed to human review even when the caller passed no reason.
+		rationale = "break routed to human review (HITL)"
+	}
 	return model.AuditEvent{
 		ExternalTxnID: externalTxnID,
 		Actor:         ActorAgent,
@@ -412,11 +543,17 @@ func Escalated(externalTxnID, rationale string, confidence float64, prov model.P
 // ErrInvalidAction, so an arbitrary decision can never be recorded (finding
 // M-13). Callers should gate on IsValidDecision first for a clear early error.
 func Decision(d model.HITLDecision, prov model.Provenance) model.AuditEvent {
+	rationale := d.Note
+	if strings.TrimSpace(rationale) == "" {
+		// M-12: a human decision always records WHAT was decided even when the
+		// reviewer left no note, so the trail is never a bare, noteless verb.
+		rationale = "human reviewer decision: " + d.Decision
+	}
 	return model.AuditEvent{
 		ExternalTxnID: d.ExternalTxnID,
 		Actor:         d.Reviewer,
 		Action:        DecisionAction(d.Decision),
-		Rationale:     d.Note,
+		Rationale:     rationale,
 		Provenance:    prov,
 	}
 }

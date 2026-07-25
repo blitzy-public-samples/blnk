@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"strings"
@@ -59,6 +60,20 @@ const defaultHTTPClientTimeout = 60 * time.Second
 // 0 would be dropped and the server default (~1.0) applied; the smallest
 // non-zero float32 is the documented way to request temperature ~0.
 const deterministicTemperature float32 = math.SmallestNonzeroFloat32
+
+// defaultMaxTokens hard-bounds the completion length (C-06). A triage verdict is
+// a small JSON object (root cause, confidence, regulated flag, a handful of
+// proposed criteria, and a short rationale); capping the response prevents a
+// hostile or malfunctioning endpoint from returning an unbounded stream that
+// would inflate cost/latency and complicate strict parsing. It is generous
+// enough for the full multi-criteria schema yet finite.
+const defaultMaxTokens = 768
+
+// maxReplyBytes hard-bounds how many bytes of assistant content the parser will
+// scan (C-06). Combined with defaultMaxTokens on the request side, this caps the
+// blast radius of an endpoint that ignores the token limit and streams an
+// oversized body: content beyond this bound is rejected rather than parsed.
+const maxReplyBytes = 16 * 1024
 
 // ErrClassificationFailed is the sentinel returned (wrapped) when classification
 // cannot be completed within the retry cap. Callers detect it with errors.Is and
@@ -122,15 +137,30 @@ func New(cfg config.Config) *Classifier {
 	}
 }
 
-// rawProposedRule is the on-the-wire shape the model emits for a proposed rule.
+// rawCriterion is the on-the-wire shape of ONE proposed matching criterion
+// (M-08). A safe Blnk-native rule is generally multi-dimensional — e.g. pin
+// reference+currency AND allow a bounded amount drift — so the schema models a
+// LIST of criteria, each carrying the optional Pattern / AllowableDrift fields
+// Blnk's MatchingCriteria supports. Field/Operator are grammar-validated
+// (Rule 5.2) before the rule is attached.
+type rawCriterion struct {
+	Field          string  `json:"field"`
+	Operator       string  `json:"operator"`
+	Value          string  `json:"value"`
+	Pattern        string  `json:"pattern"`
+	AllowableDrift float64 `json:"allowable_drift"`
+}
+
+// rawProposedRule is the on-the-wire shape the model emits for a proposed rule:
+// a complete, multi-criteria representation rather than a single field/operator.
 type rawProposedRule struct {
-	Field    string `json:"field"`
-	Operator string `json:"operator"`
-	Value    string `json:"value"`
+	Criteria []rawCriterion `json:"criteria"`
 }
 
 // rawClassification is the intermediate JSON shape parsed from the model reply
-// before it is normalized into model.BreakClassification.
+// before it is normalized into model.BreakClassification. The struct is decoded
+// with DisallowUnknownFields (M-08): any field the model invents outside this
+// closed schema is treated as ambiguous output and rejected (fail closed).
 type rawClassification struct {
 	RootCause    string           `json:"root_cause"`
 	Confidence   float64          `json:"confidence"`
@@ -148,6 +178,13 @@ func (c *Classifier) Classify(ctx context.Context, txn blnk.ExternalTransaction)
 	req := openai.ChatCompletionRequest{
 		Model:       c.model,
 		Temperature: c.temperature,
+		// C-06: constrain the reply to a single JSON object and bound its length.
+		// ResponseFormat asks the OpenAI-compatible endpoint to emit strict JSON
+		// (no prose/Markdown), which pairs with the strict decoder in
+		// parseClassification; MaxTokens caps the completion so a hostile or
+		// malfunctioning endpoint cannot stream an unbounded body.
+		MaxTokens:      defaultMaxTokens,
+		ResponseFormat: &openai.ChatCompletionResponseFormat{Type: openai.ChatCompletionResponseFormatTypeJSONObject},
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 			{Role: openai.ChatMessageRoleUser, Content: buildUserPrompt(txn)},
@@ -209,41 +246,66 @@ func (c *Classifier) createChatCompletion(ctx context.Context, req openai.ChatCo
 	return c.client.CreateChatCompletion(attemptCtx, req)
 }
 
-// parseClassification extracts the JSON object from a raw model reply and
-// normalizes it into a BreakClassification. The external transaction id is taken
-// authoritatively from txn (never from the model). Any proposed rule is
-// grammar-validated (Rule 5.2) and dropped if it falls outside Blnk's domain.
+// parseClassification strictly decodes a raw model reply into a
+// BreakClassification. The external transaction id is taken authoritatively from
+// txn (never from the model). Any proposed rule is grammar-validated (Rule 5.2)
+// and dropped if it falls outside Blnk's domain.
+//
+// Parsing is deliberately STRICT (M-08 / C-06). The reply is size-capped, a
+// single well-formed Markdown code fence is stripped, and the JSON is decoded
+// with DisallowUnknownFields and a no-trailing-content check. Anything the model
+// emits that is not exactly one object of the closed schema — extra fields,
+// trailing prose, multiple objects, non-JSON — is a parse error, which makes
+// Classify retry and ultimately fail closed to HITL (Rule 5.7). Confidence is
+// REJECTED (not clamped) when it is not a finite probability in [0,1] (M-09):
+// promoting a malformed/over-range value would let it clear the Rule 5.4 gate,
+// so a malformed confidence must instead route the break to a human.
 func parseClassification(content string, txn blnk.ExternalTransaction) (model.BreakClassification, error) {
-	jsonStr := extractJSONObject(content)
-	if jsonStr == "" {
-		return model.BreakClassification{}, fmt.Errorf("no JSON object found in reply: %q", truncate(content, 120))
+	if len(content) > maxReplyBytes {
+		return model.BreakClassification{}, fmt.Errorf("model reply exceeds %d-byte cap (%d bytes)", maxReplyBytes, len(content))
 	}
 
-	var raw rawClassification
-	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
-		return model.BreakClassification{}, fmt.Errorf("unmarshal classification: %w", err)
+	raw, err := decodeStrictClassification(content)
+	if err != nil {
+		return model.BreakClassification{}, err
+	}
+
+	// M-09: reject non-finite / out-of-range confidence outright. Failing the
+	// parse here routes the break to HITL (fail closed) instead of silently
+	// promoting an over-range value to an auto-eligible one.
+	if !isFiniteProbability(raw.Confidence) {
+		return model.BreakClassification{}, fmt.Errorf(
+			"confidence %v is not a finite probability in [0,1]; failing closed", raw.Confidence)
 	}
 
 	bc := model.BreakClassification{
 		ExternalTxnID: txn.ID,
 		RootCause:     normalizeRootCause(raw.RootCause),
-		Confidence:    clampConfidence(raw.Confidence),
+		Confidence:    raw.Confidence,
 		Regulated:     raw.Regulated,
 		Rationale:     strings.TrimSpace(raw.Rationale),
 	}
 
-	if raw.ProposedRule != nil {
+	if raw.ProposedRule != nil && len(raw.ProposedRule.Criteria) > 0 {
+		criteria := make([]blnk.MatchingCriteria, 0, len(raw.ProposedRule.Criteria))
+		for _, rc := range raw.ProposedRule.Criteria {
+			criteria = append(criteria, blnk.MatchingCriteria{
+				Field:          strings.ToLower(strings.TrimSpace(rc.Field)),
+				Operator:       strings.ToLower(strings.TrimSpace(rc.Operator)),
+				Value:          rc.Value,
+				Pattern:        rc.Pattern,
+				AllowableDrift: rc.AllowableDrift,
+			})
+		}
 		rule := blnk.MatchingRule{
 			Name:        fmt.Sprintf("agent-proposed-%s", txn.ID),
 			Description: "agent-proposed matching rule",
-			Criteria: []blnk.MatchingCriteria{{
-				Field:    strings.ToLower(strings.TrimSpace(raw.ProposedRule.Field)),
-				Operator: strings.ToLower(strings.TrimSpace(raw.ProposedRule.Operator)),
-				Value:    raw.ProposedRule.Value,
-			}},
+			Criteria:    criteria,
 		}
-		// Rule 5.2: attach only if it conforms to Blnk's grammar; otherwise the
-		// out-of-grammar rule is silently dropped and never leaves the agent.
+		// Rule 5.2: attach only if EVERY criterion conforms to Blnk's grammar;
+		// otherwise the out-of-grammar rule is dropped and never leaves the agent.
+		// The remediator additionally replaces this advisory rule with a
+		// deterministic, root-cause-specific safe profile before any POST (C-06).
 		if err := ValidateRule(rule); err == nil {
 			bc.ProposedRule = &rule
 		}
@@ -252,16 +314,54 @@ func parseClassification(content string, txn blnk.ExternalTransaction) (model.Br
 	return bc, nil
 }
 
-// extractJSONObject returns the substring spanning the first '{' to the last '}'
-// (inclusive), tolerating Markdown code fences or incidental prose around the
-// JSON. It returns "" when no plausible object is present.
-func extractJSONObject(s string) string {
-	start := strings.IndexByte(s, '{')
-	end := strings.LastIndexByte(s, '}')
-	if start < 0 || end < 0 || end < start {
-		return ""
+// decodeStrictClassification strips a single surrounding Markdown code fence (a
+// benign, deterministic wrapper some endpoints add) and then decodes the reply
+// as exactly one JSON object of the closed rawClassification schema. It uses
+// DisallowUnknownFields to reject invented fields and verifies there is no
+// trailing content after the object. It replaces the previous tolerant
+// first-'{'-to-last-'}' extraction, which silently accepted objects buried in
+// arbitrary surrounding prose (M-08).
+func decodeStrictClassification(content string) (rawClassification, error) {
+	s := stripCodeFence(strings.TrimSpace(content))
+	if s == "" {
+		return rawClassification{}, errors.New("empty model reply")
 	}
-	return s[start : end+1]
+
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.DisallowUnknownFields()
+
+	var raw rawClassification
+	if err := dec.Decode(&raw); err != nil {
+		return rawClassification{}, fmt.Errorf("strict-decode classification: %w", err)
+	}
+	// Reject any trailing tokens (a second object, prose, etc.): a compliant
+	// reply is exactly one JSON object.
+	if _, err := dec.Token(); err != io.EOF {
+		return rawClassification{}, errors.New("unexpected trailing content after JSON object")
+	}
+	return raw, nil
+}
+
+// stripCodeFence removes a single pair of surrounding triple-backtick Markdown
+// fences (optionally tagged, e.g. ```json) when present, returning the inner
+// content. When no complete fence is present the input is returned unchanged.
+// This is intentionally narrow: it only unwraps a clean fenced block and never
+// hunts for JSON embedded in free prose.
+func stripCodeFence(s string) string {
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	// Drop the opening fence line (the backticks plus any language tag such as
+	// "json"), then trim everything from the closing fence onward.
+	nl := strings.IndexByte(s, '\n')
+	if nl < 0 {
+		return s
+	}
+	inner := s[nl+1:]
+	if i := strings.LastIndex(inner, "```"); i >= 0 {
+		inner = inner[:i]
+	}
+	return strings.TrimSpace(inner)
 }
 
 // normalizeRootCause lower-cases and trims the model's label and maps it to a
@@ -274,45 +374,14 @@ func normalizeRootCause(s string) model.RootCause {
 	return model.RootCauseUnknown
 }
 
-// clampConfidence constrains a raw model confidence to the closed interval
-// [0, 1], mapping NaN and any value < 0 (including -Inf) to 0 and any value > 1
-// (including +Inf) to 1. Its output is therefore ALWAYS a finite probability in
-// [0, 1] for every possible float64 input.
-//
-// This is the PRODUCER half of recon-agent's two-layer confidence policy
-// (finding SEAM-INFO-1); the CONSUMER half is remediator.validConfidence. The
-// two are complementary, not contradictory:
-//
-//   - Here, at the producer boundary, an out-of-range value is NORMALIZED
-//     rather than rejected. A model that answers with a percentage (e.g. 95),
-//     a slightly-over-one float (1.0000001), or an under-zero artifact is
-//     almost always a formatting quirk, not a signal that the whole
-//     classification is untrustworthy; clamping keeps that break in the normal
-//     pipeline. Because the AAP requires only that confidence be "in 0..1"
-//     (§0.1.1) — a property the clamp GUARANTEES — normalization is fully
-//     AAP-compliant.
-//   - Crucially, clamping an over-confident value up to 1.0 is SAFE because LLM
-//     confidence alone never resolves a break: auto-remediation additionally
-//     requires a non-regulated, auto-eligible root cause and a tight
-//     equality-only proposed rule, and a resolution is recorded ONLY after
-//     Blnk's deterministic dry-run reconciliation confirms clearance (Rule
-//     5.3). The confidence gate protects the LOWER bound (don't auto-act on
-//     weak classifications); the clamp never weakens that, since values below
-//     the threshold — including negatives mapped to 0 — still escalate to HITL.
-//
-// The remediator's validConfidence then fails a break closed to HITL if a
-// confidence that did NOT pass through this clamp (e.g. one reconstructed from
-// the store on resume, injected by a test, or produced by a future non-clamping
-// source) ever reaches the gate malformed — defense in depth over one coherent
-// policy rather than two competing philosophies.
-func clampConfidence(v float64) float64 {
-	if math.IsNaN(v) || v < 0 {
-		return 0
-	}
-	if v > 1 {
-		return 1
-	}
-	return v
+// isFiniteProbability reports whether v is a finite real number in the closed
+// interval [0,1]. It is the strict confidence predicate used to REJECT (M-09) —
+// rather than clamp — a malformed model confidence. A value that fails this test
+// (NaN, ±Inf, negative, a percentage like 95, or a slightly-over-one artifact)
+// makes parseClassification fail closed so the break is routed to HITL and can
+// never satisfy the Rule 5.4 auto-remediation gate.
+func isFiniteProbability(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v <= 1
 }
 
 // truncate shortens s to at most n runes for safe inclusion in error messages.

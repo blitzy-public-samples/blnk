@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -66,7 +67,7 @@ func TestClassify_SuccessParsesAndAttachesValidRule(t *testing.T) {
 		"root_cause": "reference_mismatch",
 		"confidence": 0.92,
 		"regulated": false,
-		"proposed_rule": {"field": "Reference", "operator": "Equals", "value": "INV-1001"},
+		"proposed_rule": {"criteria": [{"field": "Reference", "operator": "Equals", "value": "INV-1001"}]},
 		"rationale": "reference differs only by casing"
 	}`
 
@@ -138,7 +139,7 @@ func TestClassify_DropsOutOfGrammarRule(t *testing.T) {
 		"root_cause": "amount_drift",
 		"confidence": 0.9,
 		"regulated": false,
-		"proposed_rule": {"field": "vendor", "operator": "equals", "value": "x"},
+		"proposed_rule": {"criteria": [{"field": "vendor", "operator": "equals", "value": "x"}]},
 		"rationale": "bad field must be dropped"
 	}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -164,8 +165,9 @@ func TestClassify_DropsOutOfGrammarRule(t *testing.T) {
 
 func TestClassify_HandlesCodeFencedJSONAndUnknownEnum(t *testing.T) {
 	// Reply wrapped in a Markdown code fence, with an unrecognized root cause and
-	// an out-of-range confidence that must be clamped.
-	content := "```json\n{\"root_cause\":\"martian_interference\",\"confidence\":1.7,\"regulated\":true,\"rationale\":\"weird\"}\n```"
+	// an IN-RANGE confidence. Fence stripping must succeed and the unknown enum
+	// must normalize to "unknown".
+	content := "```json\n{\"root_cause\":\"martian_interference\",\"confidence\":0.9,\"regulated\":true,\"rationale\":\"weird\"}\n```"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(chatResponseBody(t, content))
@@ -180,11 +182,115 @@ func TestClassify_HandlesCodeFencedJSONAndUnknownEnum(t *testing.T) {
 	if got.RootCause != model.RootCauseUnknown {
 		t.Errorf("RootCause = %q, want %q (unknown enum normalizes to unknown)", got.RootCause, model.RootCauseUnknown)
 	}
-	if got.Confidence != 1.0 {
-		t.Errorf("Confidence = %v, want clamped 1.0", got.Confidence)
+	if got.Confidence != 0.9 {
+		t.Errorf("Confidence = %v, want 0.9", got.Confidence)
 	}
 	if !got.Regulated {
 		t.Errorf("Regulated = false, want true")
+	}
+}
+
+// TestClassify_FailClosedOnOutOfRangeConfidence asserts that a malformed model
+// confidence — over-range (1.7), a percentage (95), +Inf, -Inf, negative, or
+// NaN — is REJECTED and the break fails closed to HITL (M-09 / Rule 5.4 /
+// Rule 5.7), rather than being clamped up to an auto-eligible value. The stub
+// result must be safe (unknown / zero confidence) so it can never auto-action.
+func TestClassify_FailClosedOnOutOfRangeConfidence(t *testing.T) {
+	for _, raw := range []string{"1.7", "95", "1e18", "-0.3", "1e309", "-1e309"} {
+		t.Run(raw, func(t *testing.T) {
+			content := fmt.Sprintf(`{"root_cause":"timing","confidence":%s,"regulated":false,"rationale":"x"}`, raw)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(chatResponseBody(t, content))
+			}))
+			defer srv.Close()
+
+			c := newTestClassifier(srv.URL)
+			got, err := c.Classify(context.Background(), sampleTxn())
+			if !errors.Is(err, ErrClassificationFailed) {
+				t.Fatalf("error = %v, want fail-closed ErrClassificationFailed for confidence=%s", err, raw)
+			}
+			if got.RootCause != model.RootCauseUnknown || got.Confidence != 0 {
+				t.Fatalf("stub = {%q, %v}, want safe {unknown, 0}", got.RootCause, got.Confidence)
+			}
+		})
+	}
+}
+
+// TestClassify_FailClosedOnUnknownField asserts that an ambiguous reply carrying
+// a field outside the closed schema is rejected by the strict decoder (M-08)
+// and the break fails closed to HITL rather than being parsed leniently.
+func TestClassify_FailClosedOnUnknownField(t *testing.T) {
+	content := `{"root_cause":"timing","confidence":0.9,"regulated":false,"rationale":"x","auto_approve":true}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(chatResponseBody(t, content))
+	}))
+	defer srv.Close()
+
+	c := newTestClassifier(srv.URL)
+	if _, err := c.Classify(context.Background(), sampleTxn()); !errors.Is(err, ErrClassificationFailed) {
+		t.Fatalf("error = %v, want fail-closed for unknown field", err)
+	}
+}
+
+// TestClassify_FailClosedOnTrailingContent asserts that a reply containing a
+// second JSON object (or trailing prose) after a valid object is rejected
+// (M-08), rather than silently accepting the first object.
+func TestClassify_FailClosedOnTrailingContent(t *testing.T) {
+	content := `{"root_cause":"timing","confidence":0.9,"regulated":false,"rationale":"x"}{"root_cause":"duplicate"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(chatResponseBody(t, content))
+	}))
+	defer srv.Close()
+
+	c := newTestClassifier(srv.URL)
+	if _, err := c.Classify(context.Background(), sampleTxn()); !errors.Is(err, ErrClassificationFailed) {
+		t.Fatalf("error = %v, want fail-closed for trailing content", err)
+	}
+}
+
+// TestClassify_MultiCriteriaRuleParsed asserts the complete multi-criteria rule
+// representation (M-08), including allowable_drift, is parsed and attached when
+// every criterion is in-grammar.
+func TestClassify_MultiCriteriaRuleParsed(t *testing.T) {
+	content := `{
+		"root_cause": "amount_drift",
+		"confidence": 0.9,
+		"regulated": false,
+		"proposed_rule": {"criteria": [
+			{"field": "reference", "operator": "equals", "value": "INV-1002"},
+			{"field": "currency", "operator": "equals", "value": "USD"},
+			{"field": "amount", "operator": "equals", "value": "250.00", "allowable_drift": 0.05}
+		]},
+		"rationale": "amount drifts within tolerance; pin reference+currency"
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(chatResponseBody(t, content))
+	}))
+	defer srv.Close()
+
+	c := newTestClassifier(srv.URL)
+	got, err := c.Classify(context.Background(), sampleTxn())
+	if err != nil {
+		t.Fatalf("Classify error: %v", err)
+	}
+	if got.ProposedRule == nil {
+		t.Fatalf("ProposedRule = nil, want attached multi-criteria rule")
+	}
+	if len(got.ProposedRule.Criteria) != 3 {
+		t.Fatalf("Criteria len = %d, want 3", len(got.ProposedRule.Criteria))
+	}
+	var amountDrift float64
+	for _, cr := range got.ProposedRule.Criteria {
+		if cr.Field == "amount" {
+			amountDrift = cr.AllowableDrift
+		}
+	}
+	if amountDrift != 0.05 {
+		t.Fatalf("amount criterion AllowableDrift = %v, want 0.05", amountDrift)
 	}
 }
 
@@ -313,47 +419,103 @@ func TestClassify_FailClosedOnMalformedJSONObject(t *testing.T) {
 	}
 }
 
-func TestClampConfidence(t *testing.T) {
+// TestIsFiniteProbability verifies the strict confidence predicate used to
+// REJECT (not clamp) malformed confidence (M-09). Only finite values in the
+// closed interval [0,1] are accepted; percentages, over-range floats, negatives
+// and non-finite values are rejected so the break fails closed to HITL.
+func TestIsFiniteProbability(t *testing.T) {
 	tests := []struct {
 		name string
 		in   float64
-		want float64
+		want bool
 	}{
-		{"in range", 0.5, 0.5},
-		{"zero", 0, 0},
-		{"one", 1, 1},
-		{"above one", 1.7, 1},
-		{"negative", -0.3, 0},
-		{"nan", math.NaN(), 0},
+		{"zero", 0, true},
+		{"half", 0.5, true},
+		{"one", 1, true},
+		{"just over one", 1.0000001, false},
+		{"above one", 1.7, false},
+		{"percentage", 95, false},
+		{"huge", 1e18, false},
+		{"negative", -0.3, false},
+		{"pos inf", math.Inf(1), false},
+		{"neg inf", math.Inf(-1), false},
+		{"nan", math.NaN(), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := clampConfidence(tt.in); got != tt.want {
-				t.Fatalf("clampConfidence(%v) = %v, want %v", tt.in, got, tt.want)
+			if got := isFiniteProbability(tt.in); got != tt.want {
+				t.Fatalf("isFiniteProbability(%v) = %v, want %v", tt.in, got, tt.want)
 			}
 		})
 	}
 }
 
-// TestClampConfidence_ProducerInvariant is the SEAM-INFO-1 producer-invariant
-// test: whatever a model returns — a percentage, a huge value, +Inf, -Inf, or
-// NaN — the classifier NEVER emits an out-of-range or non-finite confidence
-// downstream. Locking "output is always a finite probability in [0,1]" for
-// adversarial inputs (not only the two boundary cases above) documents that the
-// remediator's validConfidence backstop can never be tripped by a value the
-// classifier itself produced; it exists only for confidences that bypass this
-// clamp (resume/store, tests, future producers).
-func TestClampConfidence_ProducerInvariant(t *testing.T) {
-	adversarial := []float64{
-		0, 1, 0.5, // in range
-		1.7, 95, 1e18, math.Inf(1), // over-range / percentage / +Inf
-		-0.3, -1e18, math.Inf(-1), // under-range / -Inf
-		math.NaN(), // not a number
+// TestParseClassification_RejectsMalformedConfidence asserts parseClassification
+// itself returns an error (rather than a clamped value) for every malformed
+// confidence, which is what drives the fail-closed routing (M-09). It also
+// asserts a valid in-range confidence is preserved EXACTLY (no upward promotion).
+func TestParseClassification_RejectsMalformedConfidence(t *testing.T) {
+	for _, raw := range []string{"1.7", "95", "1e18", "-0.3", "1e309", "-1e309", "NaN"} {
+		t.Run("reject_"+raw, func(t *testing.T) {
+			content := fmt.Sprintf(`{"root_cause":"timing","confidence":%s,"regulated":false,"rationale":"x"}`, raw)
+			// NaN is not valid JSON; emit it as the bareword some models produce
+			// by testing the numeric ones through JSON and NaN via a crafted value.
+			if raw == "NaN" {
+				// A JSON number cannot be NaN, so simulate a producer that bypasses
+				// JSON by calling isFiniteProbability directly.
+				if isFiniteProbability(math.NaN()) {
+					t.Fatal("isFiniteProbability(NaN) = true, want false")
+				}
+				return
+			}
+			if _, err := parseClassification(content, sampleTxn()); err == nil {
+				t.Fatalf("parseClassification accepted malformed confidence=%s, want error", raw)
+			}
+		})
 	}
-	for _, in := range adversarial {
-		got := clampConfidence(in)
-		if math.IsNaN(got) || math.IsInf(got, 0) || got < 0 || got > 1 {
-			t.Fatalf("clampConfidence(%v) = %v, which is not a finite probability in [0,1]", in, got)
+	// A valid confidence is stored verbatim.
+	bc, err := parseClassification(`{"root_cause":"timing","confidence":0.83,"regulated":false,"rationale":"x"}`, sampleTxn())
+	if err != nil {
+		t.Fatalf("parseClassification error for valid confidence: %v", err)
+	}
+	if bc.Confidence != 0.83 {
+		t.Fatalf("Confidence = %v, want exactly 0.83 (no promotion)", bc.Confidence)
+	}
+}
+
+// TestParseClassification_RejectsOversizedReply asserts the byte cap (C-06)
+// rejects an over-large assistant body before parsing.
+func TestParseClassification_RejectsOversizedReply(t *testing.T) {
+	huge := `{"root_cause":"timing","confidence":0.9,"regulated":false,"rationale":"` +
+		strings.Repeat("A", maxReplyBytes) + `"}`
+	if _, err := parseClassification(huge, sampleTxn()); err == nil {
+		t.Fatal("parseClassification accepted oversized reply, want error")
+	}
+}
+
+// TestParseClassification_RejectsEmptyReply asserts an empty/whitespace reply is
+// rejected (fail closed).
+func TestParseClassification_RejectsEmptyReply(t *testing.T) {
+	for _, raw := range []string{"", "   ", "\n\t"} {
+		if _, err := parseClassification(raw, sampleTxn()); err == nil {
+			t.Fatalf("parseClassification accepted empty reply %q, want error", raw)
+		}
+	}
+}
+
+// TestStripCodeFence covers the fence-stripping edge cases: a clean fenced block
+// is unwrapped, a bare object is unchanged, and a malformed lone fence (no
+// newline) is returned unchanged rather than mangled.
+func TestStripCodeFence(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"```json\n{\"a\":1}\n```", `{"a":1}`},
+		{"```\n{\"a\":1}\n```", `{"a":1}`},
+		{`{"a":1}`, `{"a":1}`},
+		{"```no-newline-fence", "```no-newline-fence"},
+	}
+	for _, c := range cases {
+		if got := stripCodeFence(c.in); got != c.want {
+			t.Fatalf("stripCodeFence(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }

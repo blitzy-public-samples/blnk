@@ -14,6 +14,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -23,9 +24,15 @@ import (
 // or empty. These mirror the host-side defaults documented in the repository
 // .env.example so the agent has sensible fallbacks without a .env file.
 const (
-	// defaultLLMBaseURL is a documentation-only placeholder pointing at an
-	// OpenAI-compatible endpoint that serves the open-source Kimi K3 model.
-	defaultLLMBaseURL = "https://api.moonshot.ai/v1"
+	// defaultLLMBaseURL is a NON-ROUTABLE, loopback-only placeholder pointing at
+	// the conventional local OpenAI-compatible port (e.g. a self-hosted vLLM or
+	// Ollama server). It is deliberately NOT a live third-party provider: a
+	// developer who copies the shipped defaults and runs the agent must never
+	// silently transmit transaction data to an external endpoint (M-04). If no
+	// local server is listening, the classifier fails closed and every break is
+	// routed to HITL (Rule 5.7), which is the safe outcome. Operators point
+	// LLM_BASE_URL at their own OpenAI-compatible endpoint explicitly.
+	defaultLLMBaseURL = "http://localhost:11434/v1"
 	// defaultLLMModel is the open-source model name. Rule 5.6 requires the
 	// model to be config-driven; this is the ONLY place the default name is
 	// defined and it must never be hardcoded in downstream inference code.
@@ -79,14 +86,18 @@ type Config struct {
 // ones.
 //
 // It returns a descriptive error when a required field is missing or
-// whitespace-only (AGENT_DATABASE_URL) or a typed field fails to parse or
-// falls outside its accepted range (CONF_AUTO_THRESHOLD must be a finite value
-// in [0,1]; HITL_PORT must be an integer TCP port in 1..65535). Failing fast on
-// an unusable value is deliberate: silently accepting an out-of-range
-// CONF_AUTO_THRESHOLD would subvert the Rule 5.4 auto-remediation gate, and an
+// whitespace-only (AGENT_DATABASE_URL, LLM_MODEL) or a typed field fails to
+// parse or falls outside its accepted range: CONF_AUTO_THRESHOLD must be a
+// finite value in [0,1]; HITL_PORT must be an integer TCP port in 1..65535; and
+// LLM_BASE_URL / BLNK_BASE_URL must each be an absolute http(s) URL with a host
+// and NO embedded userinfo/credentials (M-04). Failing fast on an unusable
+// value is deliberate: silently accepting an out-of-range CONF_AUTO_THRESHOLD
+// would subvert the Rule 5.4 auto-remediation gate; a malformed or non-HTTP(S)
+// LLM_BASE_URL could send transaction data to an unintended destination; and an
 // unusable DSN or port would otherwise surface only later as an opaque
-// connect/bind error. Callers (cmd/main.go) should treat a non-nil error as
-// fatal at startup.
+// connect/bind error. Error messages deliberately never echo the offending URL
+// or DSN, so a credential accidentally embedded in one is not leaked. Callers
+// (cmd/main.go) should treat a non-nil error as fatal at startup.
 func Load() (Config, error) {
 	cfg := Config{
 		LLMBaseURL:  getEnv("LLM_BASE_URL", defaultLLMBaseURL),
@@ -119,17 +130,43 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// validate enforces required-field and range constraints. AGENT_DATABASE_URL
-// is the only strictly required field (it has no default); the confidence
-// threshold must additionally be a finite value within the closed interval
-// [0,1] so the Rule 5.4 auto-remediation gate (confidence >= threshold) behaves
-// as intended. A threshold <= 0 would auto-remediate every break regardless of
-// LLM confidence; NaN or > 1 would silently disable auto-remediation. Both are
-// misconfigurations that must fail fast rather than subvert the safety gate.
-func (c Config) validate() error {
+// validate enforces required-field, URL, and range constraints, and rewrites
+// the URL/model fields in place to their trimmed canonical form. It uses a
+// pointer receiver so the canonicalized values persist on the Config returned
+// by Load.
+//
+// AGENT_DATABASE_URL and LLM_MODEL are required (LLM_MODEL has a default but a
+// caller may not blank it out). LLM_BASE_URL and BLNK_BASE_URL must each be an
+// absolute http(s) URL with a host and no embedded userinfo (see
+// validateHTTPURL). The confidence threshold must be a finite value within the
+// closed interval [0,1] so the Rule 5.4 auto-remediation gate
+// (confidence >= threshold) behaves as intended: a threshold <= 0 would
+// auto-remediate every break regardless of LLM confidence; NaN or > 1 would
+// silently disable auto-remediation. Each of these is a misconfiguration that
+// must fail fast rather than subvert a safety gate or exfiltrate data.
+func (c *Config) validate() error {
 	if c.AgentDatabaseURL == "" {
 		return fmt.Errorf("config: AGENT_DATABASE_URL is required")
 	}
+
+	llmBase, err := validateHTTPURL("LLM_BASE_URL", c.LLMBaseURL)
+	if err != nil {
+		return err
+	}
+	c.LLMBaseURL = llmBase
+
+	blnkBase, err := validateHTTPURL("BLNK_BASE_URL", c.BlnkBaseURL)
+	if err != nil {
+		return err
+	}
+	c.BlnkBaseURL = blnkBase
+
+	model := strings.TrimSpace(c.LLMModel)
+	if model == "" {
+		return fmt.Errorf("config: LLM_MODEL is required and must not be blank")
+	}
+	c.LLMModel = model
+
 	if math.IsNaN(c.ConfAutoThreshold) || math.IsInf(c.ConfAutoThreshold, 0) ||
 		c.ConfAutoThreshold < 0 || c.ConfAutoThreshold > 1 {
 		return fmt.Errorf(
@@ -138,6 +175,42 @@ func (c Config) validate() error {
 		)
 	}
 	return nil
+}
+
+// validateHTTPURL parses raw as an absolute OpenAI-compatible / Blnk HTTP(S)
+// service URL and returns its trimmed canonical form. It fails closed on the
+// classes of malformed value that would otherwise surface only at request time
+// or, worse, silently transmit data to an unintended destination (M-04): a
+// value that is empty/whitespace-only, is not parseable, uses a scheme other
+// than http or https, omits a host, or embeds userinfo (credentials in the
+// URL).
+//
+// Embedded userinfo is rejected outright because it both leaks a secret into
+// logs/redirect targets and signals a misconfiguration; the API key belongs in
+// the dedicated *_API_KEY variable and the X-Blnk-Key / Authorization header,
+// never in the base URL. The returned error names only the variable and (for an
+// unsupported scheme) the scheme; it never echoes the raw value, so a
+// credential accidentally embedded in the URL is not leaked through the error.
+func validateHTTPURL(name, raw string) (string, error) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return "", fmt.Errorf("config: %s is required and must be an absolute http(s) URL", name)
+	}
+	u, err := url.Parse(v)
+	if err != nil {
+		return "", fmt.Errorf("config: invalid %s: not a valid URL", name)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("config: invalid %s: scheme %q is not supported; use http or https", name, u.Scheme)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("config: invalid %s: must be an absolute URL including a host", name)
+	}
+	if u.User != nil {
+		return "", fmt.Errorf("config: invalid %s: URL must not embed userinfo/credentials; put the secret in the API-key variable instead", name)
+	}
+	return v, nil
 }
 
 // getEnv returns the value of the environment variable named by key, or def

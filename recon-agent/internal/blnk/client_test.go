@@ -598,3 +598,319 @@ func TestNewJSONRequestBadMethod(t *testing.T) {
 		t.Fatal("expected error for invalid method")
 	}
 }
+
+// TestReadyStaysOnReconRouteAndAuthenticates asserts M-05: Ready probes the
+// mandated /reconciliation/* surface (never /health) with the X-Blnk-Key
+// attached, and treats 200 and 404 as ready.
+func TestReadyStaysOnReconRouteAndAuthenticates(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var sawReconRoute, sawKey bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasPrefix(r.URL.Path, "/reconciliation/") {
+					sawReconRoute = true
+				}
+				if r.URL.Path == "/health" {
+					t.Errorf("Ready must NOT call /health (Rule 5.1); got %s", r.URL.Path)
+				}
+				if r.Header.Get(keyHeader) == testKey {
+					sawKey = true
+				}
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+
+			c := NewClient(srv.URL, testKey)
+			if err := c.Ready(context.Background()); err != nil {
+				t.Fatalf("Ready() = %v, want nil for status %d", err, status)
+			}
+			if !sawReconRoute {
+				t.Error("Ready did not probe a /reconciliation/* route")
+			}
+			if !sawKey {
+				t.Error("Ready did not attach the X-Blnk-Key header")
+			}
+		})
+	}
+}
+
+// TestReadyRejectsAuthAndServerErrors asserts M-05: an auth failure (401/403), a
+// bad request (400), or a server error (5xx) is NOT treated as ready.
+func TestReadyRejectsAuthAndServerErrors(t *testing.T) {
+	for _, status := range []int{
+		http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusBadRequest, http.StatusInternalServerError, http.StatusBadGateway,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+
+			c := NewClient(srv.URL, testKey)
+			if err := c.Ready(context.Background()); err == nil {
+				t.Fatalf("Ready() = nil, want error for status %d", status)
+			}
+		})
+	}
+}
+
+// TestReadyTransportError asserts a down Blnk is reported not-ready.
+func TestReadyTransportError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+
+	c := NewClient(url, testKey)
+	if err := c.Ready(context.Background()); err == nil {
+		t.Fatal("Ready() = nil, want transport error against a down server")
+	}
+}
+
+// TestClientRefusesCrossOriginRedirect asserts M-06: a cross-origin redirect is
+// refused and the custom X-Blnk-Key is never delivered to the foreign origin.
+func TestClientRefusesCrossOriginRedirect(t *testing.T) {
+	var foreignHit int32
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&foreignHit, 1)
+		if r.Header.Get(keyHeader) != "" {
+			t.Errorf("cross-origin request leaked %s header", keyHeader)
+		}
+		_ = json.NewEncoder(w).Encode(Reconciliation{ReconciliationID: "recon_1"})
+	}))
+	defer foreign.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, foreign.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer origin.Close()
+
+	c := NewClient(origin.URL, testKey)
+	if _, err := c.GetReconciliation(context.Background(), "recon_1"); err == nil {
+		t.Fatal("expected error refusing cross-origin redirect")
+	}
+	if n := atomic.LoadInt32(&foreignHit); n != 0 {
+		t.Fatalf("foreign origin received %d request(s); redirect must not be followed", n)
+	}
+}
+
+// TestClientFollowsSameOriginRedirect asserts M-06: a same-origin redirect is
+// still followed to completion.
+func TestClientFollowsSameOriginRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requireBlnkKey(t, r)
+		if strings.HasSuffix(r.URL.Path, "final") {
+			_ = json.NewEncoder(w).Encode(Reconciliation{ReconciliationID: "recon_1", Status: statusCompleted})
+			return
+		}
+		http.Redirect(w, r, r.URL.Path+"-final", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	recon, err := c.GetReconciliation(context.Background(), "recon_1")
+	if err != nil {
+		t.Fatalf("same-origin redirect not followed: %v", err)
+	}
+	if recon.ReconciliationID != "recon_1" {
+		t.Fatalf("unexpected recon after redirect: %+v", recon)
+	}
+}
+
+// TestResponseBodyBounded asserts M-06: the client reads/decodes at most
+// maxRespBytes, so an over-limit body is truncated (here forcing a decode error)
+// rather than fully buffered.
+func TestResponseBodyBounded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A valid, large JSON object whose byte length far exceeds the tiny cap.
+		_, _ = io.WriteString(w, `{"reconciliation_id":"`+strings.Repeat("x", 4096)+`"}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	c.maxRespBytes = 16 // truncate well before the object closes
+	if _, err := c.GetReconciliation(context.Background(), "recon_1"); err == nil {
+		t.Fatal("expected decode error from truncated (bounded) body")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// ReconcileUpload / ConfirmClearedOverUpload (finding C-03).
+//
+// These exercise the cache-safe, UPLOAD-SCOPED deterministic-arbiter seam that
+// replaced the removed per-transaction ProbeBreak. ReconcileUpload runs a DRY
+// RUN reconciliation over ONE persisted upload with the proposed rule and
+// returns Blnk's authoritative unmatched count; ConfirmClearedOverUpload reports
+// the break cleared only when that count drops strictly BELOW the detection
+// baseline (Rule 5.3 — Blnk, never LLM confidence, decides clearance).
+// -----------------------------------------------------------------------------
+
+// reconMock returns an httptest server answering the two routes ReconcileUpload
+// drives. Successive GET /reconciliation/<id> calls return statuses[i] (the last
+// element repeats once exhausted); the returned unmatched count is `unmatched`.
+// It captures the decoded start request into *gotStart for assertion.
+func reconMock(t *testing.T, reconID string, unmatched int, statuses []string, gotStart *StartReconciliationRequest) *httptest.Server {
+	t.Helper()
+	var getCalls int
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requireBlnkKey(t, r)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == routeStart:
+			if gotStart != nil {
+				if err := json.NewDecoder(r.Body).Decode(gotStart); err != nil {
+					t.Fatalf("decode start body: %v", err)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(StartReconciliationResponse{ReconciliationID: reconID})
+		case r.Method == http.MethodGet && r.URL.Path == routeReconByID+reconID:
+			st := statuses[len(statuses)-1]
+			if getCalls < len(statuses) {
+				st = statuses[getCalls]
+			}
+			getCalls++
+			_ = json.NewEncoder(w).Encode(Reconciliation{
+				ReconciliationID:      reconID,
+				Status:                st,
+				UnmatchedTransactions: unmatched,
+			})
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+}
+
+func TestReconcileUploadReturnsUnmatchedCount(t *testing.T) {
+	var gotStart StartReconciliationRequest
+	srv := reconMock(t, "recon_probe_1", 4, []string{statusCompleted}, &gotStart)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	unmatched, reconID, err := c.ReconcileUpload(context.Background(), "upload_x", []string{"rule_9"})
+	if err != nil {
+		t.Fatalf("ReconcileUpload: %v", err)
+	}
+	if unmatched != 4 {
+		t.Fatalf("unmatched: got %d want 4", unmatched)
+	}
+	if reconID != "recon_probe_1" {
+		t.Fatalf("reconID: got %q want recon_probe_1", reconID)
+	}
+	// Rule 5.3 / C-03: the confirmation reconciliation MUST be a DRY RUN scoped to
+	// the caller's ORIGINAL upload, carrying exactly the proposed rule and the
+	// probe strategy — never a live run and never a fresh single-txn upload.
+	if !gotStart.DryRun {
+		t.Fatal("ReconcileUpload must run a DRY RUN (Rule 5.3), never mutate Blnk state")
+	}
+	if gotStart.UploadID != "upload_x" {
+		t.Fatalf("upload id not threaded through: got %q want upload_x", gotStart.UploadID)
+	}
+	if gotStart.Strategy != probeStrategy {
+		t.Fatalf("strategy: got %q want %q", gotStart.Strategy, probeStrategy)
+	}
+	if len(gotStart.MatchingRuleIDs) != 1 || gotStart.MatchingRuleIDs[0] != "rule_9" {
+		t.Fatalf("matching rule ids: got %v want [rule_9]", gotStart.MatchingRuleIDs)
+	}
+}
+
+func TestReconcileUploadPollsUntilTerminal(t *testing.T) {
+	// First GET is non-terminal ("processing"); the loop must poll again on the
+	// ticker and only return once Blnk reports a terminal "completed".
+	srv := reconMock(t, "recon_poll", 2, []string{"processing", statusCompleted}, nil)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	unmatched, _, err := c.ReconcileUpload(context.Background(), "upload_poll", nil)
+	if err != nil {
+		t.Fatalf("ReconcileUpload: %v", err)
+	}
+	if unmatched != 2 {
+		t.Fatalf("unmatched: got %d want 2", unmatched)
+	}
+}
+
+func TestReconcileUploadFailedStatusErrors(t *testing.T) {
+	srv := reconMock(t, "recon_fail", 0, []string{statusFailed}, nil)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	if _, _, err := c.ReconcileUpload(context.Background(), "upload_f", nil); err == nil {
+		t.Fatal("a Blnk reconciliation that reports status=failed must surface an error")
+	}
+}
+
+func TestReconcileUploadStartError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	if _, _, err := c.ReconcileUpload(context.Background(), "upload_e", nil); err == nil {
+		t.Fatal("a failed start must abort ReconcileUpload with an error")
+	}
+}
+
+func TestReconcileUploadContextCancel(t *testing.T) {
+	// GET never reaches a terminal status, so the bounded poll must give up when
+	// the caller's context deadline elapses rather than blocking forever.
+	srv := reconMock(t, "recon_hang", 1, []string{"processing"}, nil)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, _, err := c.ReconcileUpload(ctx, "upload_h", nil); err == nil {
+		t.Fatal("ReconcileUpload must error when the context deadline elapses before completion")
+	}
+}
+
+func TestConfirmClearedOverUploadClearedWhenBelowBaseline(t *testing.T) {
+	// baseline 6, unmatched drops to 5 => the created rule moved at least one txn
+	// out of the unmatched set => Blnk confirms clearance (Rule 5.3).
+	srv := reconMock(t, "recon_confirm", 5, []string{statusCompleted}, nil)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	cleared, reconID, err := c.ConfirmClearedOverUpload(context.Background(), "upload_c", "rule_ok", 6)
+	if err != nil {
+		t.Fatalf("ConfirmClearedOverUpload: %v", err)
+	}
+	if !cleared {
+		t.Fatal("unmatched(5) < baseline(6) must report cleared=true")
+	}
+	if reconID != "recon_confirm" {
+		t.Fatalf("confirming recon id: got %q want recon_confirm", reconID)
+	}
+}
+
+func TestConfirmClearedOverUploadNotClearedWhenNotBelowBaseline(t *testing.T) {
+	// unmatched stays at the baseline => no txn left the unmatched set => NOT
+	// cleared. LLM confidence must never substitute for this Blnk verdict.
+	srv := reconMock(t, "recon_noclear", 6, []string{statusCompleted}, nil)
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	cleared, _, err := c.ConfirmClearedOverUpload(context.Background(), "upload_n", "rule_noop", 6)
+	if err != nil {
+		t.Fatalf("ConfirmClearedOverUpload: %v", err)
+	}
+	if cleared {
+		t.Fatal("unmatched(6) not < baseline(6) must report cleared=false")
+	}
+}
+
+func TestConfirmClearedOverUploadPropagatesError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "down", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testKey)
+	cleared, _, err := c.ConfirmClearedOverUpload(context.Background(), "upload_p", "rule_x", 6)
+	if err == nil {
+		t.Fatal("a reconciliation transport error must propagate (fail-closed), not be swallowed")
+	}
+	if cleared {
+		t.Fatal("an errored confirmation must never report cleared=true")
+	}
+}

@@ -2,303 +2,145 @@
 
 package internal_test
 
-// Package internal_test hosts the recon-agent's module-level, build-tag-guarded
-// END-TO-END integration test. It drives the ENTIRE pipeline
-// (config -> store -> audit -> blnk HTTP client -> classifier -> remediator ->
-// hitl) against a LIVE Blnk daemon + PostgreSQL, exactly as cmd/main.go wires it
-// in production, and asserts the AAP's measurable success criteria.
+// Package internal_test hosts recon-agent's module-level, build-tag-guarded
+// END-TO-END integration test (Gate 9: >=1 integration test; Gate 10: run by CI
+// with PostgreSQL + Blnk + recon-agent stood up).
 //
 // WHY A BUILD TAG (`//go:build integration`):
 //   - This is intentionally the ONLY .go file directly under recon-agent/internal/
 //     (every other unit of code lives in a sub-package). Under the DEFAULT build
-//     tags a plain `make test` (`go test ./...`, `go build ./...`, `go vet ./...`)
-//     SILENTLY SKIPS this directory — there is no "build constraints exclude all
-//     Go files" error — so the fast, service-free unit suites in the sub-packages
-//     (which use httptest / sqlmock mocks and carry the >=80% coverage floor,
-//     Rule 5.9) run without any external services.
+//     tags a plain `make test` (`go test ./...`) SILENTLY SKIPS this directory,
+//     so the fast, service-free unit suites in the sub-packages (which carry the
+//     >=80% coverage floor, Rule 5.9) run without any external services.
 //   - Under `go test -tags integration ./...` this file compiles as the external
 //     test package `internal_test` and TestReconAgentPipeline runs. That tagged
-//     run is what CI executes (Gate 10) with PostgreSQL + Blnk + recon-agent stood
-//     up, giving a real end-to-end signal (Gate 9: >=1 integration test).
+//     run is what `make test` step 2 and CI execute against a live stack.
 //
-// RULE 5.1 (native-API-only): this file imports NO github.com/blnkfinance/blnk/...
-// package. It reaches Blnk's ledger service exclusively through the recon-agent's
-// own internal/blnk HTTP client. The only direct HTTP the test performs itself is
-// (a) the deterministic stub OpenAI-compatible LLM it hosts locally and (b) an
-// optional Blnk /health readiness poll in TestMain (readiness gating only, not a
-// reconciliation operation, and importing nothing from Blnk).
+// M-18 (final-delivery review). The previous revision drove SEVEN synthetic
+// scenarios directly through remediator.Handle — bypassing cmd/main.go's batch
+// upload -> start -> derive -> summary path — ran under a 120s budget, carried a
+// stale flat proposed-rule shape and a stale 3-arg Handle call, and accepted an
+// HTTP 502 from re_drive. This revision instead exercises the EXACT production
+// demo path — `go run ./cmd -once`, precisely what `make demo` invokes — over
+// the CANONICAL SIX breaks in seed/external_transactions.csv, under a hard
+// <=60s deadline, and requires every measurable AAP success criterion:
+//   * exactly six breaks ingested; exactly three auto-resolved and three
+//     escalated (auto + escalated == 6);
+//   * >=5/6 correct root-cause labels (the deterministic stub yields 6/6);
+//   * >=1 auto-remediation confirmed by a Blnk dry-run (Rule 5.3: every
+//     `resolved` audit event carries a confirming recon_id);
+//   * routing safety (Rule 5.4): every regulated / low-confidence break is
+//     escalated and NEVER auto-actioned;
+//   * 100% audit coverage: every break emits >=1 append-only audit event and the
+//     persisted audit-row count equals the run summary's audit_count;
+//   * each HITL decision — accept / re_drive / reject (Gate 13) — is exercised
+//     over HTTP and MUST return 200 (no 502 accepted).
+//
+// DESIGN — why subprocess the real binary:
+//   cmd/main.go's pipeline lives in `package main` and is not importable, so the
+//   most faithful "exact main/demo path" is to run the compiled command itself.
+//   The test hosts a deterministic, offline, OpenAI-compatible stub LLM
+//   (httptest) that the subprocess's real go-openai classifier calls
+//   (LLM_BASE_URL points at it); the stub keys its canonical classification off
+//   each break's STABLE base id (EXT-00N), which survives cmd's run-scoped id
+//   rewrite (EXT-00N-<runID>). After the run, the test opens the agent store for
+//   DB parity and stands up the REAL hitl server in-process (httptest) to drive
+//   the three decisions over HTTP, exactly as cmd/main.go serve mode wires it.
+//
+// RULE 5.1 (native-API-only): this file imports NO github.com/blnkfinance/blnk
+// package. It reaches Blnk only through recon-agent's own internal/blnk HTTP
+// client (indirectly, via the subprocess and the in-process hitl server). The
+// only direct HTTP it performs itself is (a) its own stub LLM and (b) an
+// optional Blnk /health readiness poll in TestMain (readiness gating only).
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 
 	"github.com/blnkfinance/recon-agent/internal/audit"
 	"github.com/blnkfinance/recon-agent/internal/blnk"
-	"github.com/blnkfinance/recon-agent/internal/classifier"
 	"github.com/blnkfinance/recon-agent/internal/config"
 	"github.com/blnkfinance/recon-agent/internal/hitl"
 	"github.com/blnkfinance/recon-agent/internal/model"
-	"github.com/blnkfinance/recon-agent/internal/remediator"
 	"github.com/blnkfinance/recon-agent/internal/store"
 )
 
 const (
 	// integrationReviewer is the human reviewer id attributed to the HITL
-	// decisions this test submits over HTTP, so their audit events are
-	// attributable to this run.
+	// decisions this test submits over HTTP.
 	integrationReviewer = "integration-reviewer"
 
-	// uploadSource is the external-statement source label sent on the upload
-	// request (Blnk records it; it is NOT a CSV column — see
-	// internal/files/files.go and seed/external_transactions.csv).
-	uploadSource = "integration-seed-bank"
+	// uploadSourcePrefix seeds the per-run unique external-statement source
+	// label. A UNIQUE source per run yields a unique run fixture key (cmd's
+	// BeginRun), so every invocation processes a FRESH set of run-scoped breaks
+	// against the shared Blnk database rather than replaying a prior run.
+	uploadSourcePrefix = "integration-seed-bank"
 
-	// scenarioTagPrefix / scenarioTagSuffix bracket the machine-readable scenario
-	// marker embedded in each break's description. The local stub LLM keys its
-	// deterministic classification off this marker, which survives run-scoped
-	// unique ids (the marker is stable across runs while the txn id is not).
-	scenarioTagPrefix = "[[scenario:"
-	scenarioTagSuffix = "]]"
+	// demoDeadline is the hard wall-clock budget for the demo subprocess. M-18
+	// requires the canonical run to complete in <=60s (matching `make demo`).
+	demoDeadline = 60 * time.Second
 
-	// uploadRowIDSuffix namespaces the ids written to the uploaded statement so
-	// they never collide with the ids the remediator later submits to Blnk's
-	// start-instant. Blnk persists every external transaction — whether via
-	// /reconciliation/upload or /reconciliation/start-instant — with a plain
-	// INSERT keyed by the transaction's OWN id (RecordExternalTransaction,
-	// database/reconciliation.go: no ON CONFLICT), so blnk.external_transactions
-	// enforces a global, once-only primary key per id. ProbeBreak (the
-	// deterministic-arbiter bridge, Rule 5.3) re-submits a break BY ITS OWN id via
-	// start-instant, so pre-uploading that same id would turn the probe's insert
-	// into a duplicate-key failure. This test's upload exists only to exercise
-	// UploadExternalData and yield a real upload_id for provenance; its rows
-	// therefore carry a distinct id namespace while the remediated breaks keep
-	// their probe ids. record_count still equals the planted break count, and the
-	// agent never reads blnk.external_transactions (Rule 5.1), so the distinct
-	// namespace is invisible to every assertion.
-	uploadRowIDSuffix = "-UP"
-
-	// probeVerifyIDSuffix stamps the independent, collision-free cross-check probe
-	// (assertProbeConfirmsClearance). The remediator's auto path has already
-	// probed — and therefore persisted — the resolved break's real id, so the
-	// cross-check re-probes a fresh-id clone that carries the SAME reference and
-	// amount. Blnk matches external against internal FIELD-TO-FIELD and ignores
-	// both the transaction id and criteria.Value (reconciliation.go
-	// matchesString/matchesGroupAmount), so the clone clears exactly when the
-	// original did while avoiding the once-only-id constraint above.
-	probeVerifyIDSuffix = "-VERIFY"
+	// blnkReadyTimeout bounds TestMain's best-effort Blnk readiness poll.
+	blnkReadyTimeout = 90 * time.Second
 )
 
-// scenarioSpec is the deterministic classification the stub LLM returns for a
-// break carrying the matching scenario marker, plus the pipeline outcome this
-// test expects for it. It is the SINGLE source of truth shared by (a) the stub
-// LLM (what the model "says") and (b) the assertions (what the remediator must
-// therefore do), so the two can never silently drift apart.
-type scenarioSpec struct {
-	// name is the scenario marker embedded in the break description and matched
-	// by the stub LLM (e.g. "timing").
-	name string
-	// rootCause is the label the stub LLM returns and the classifier normalizes.
-	rootCause model.RootCause
-	// confidence is the calibrated confidence the stub LLM returns, in [0,1].
+// canonicalSpec is the deterministic classification the in-process stub LLM
+// returns for a break, keyed by its STABLE base id (EXT-00N), plus the pipeline
+// outcome the assertions expect. It mirrors seed/external_transactions.csv,
+// seed/internal_ledger.json and eval/recon_corpus.jsonl, so the stub (what the
+// model "says") and the assertions (what the pipeline must therefore do) share
+// one source of truth and can never silently drift.
+type canonicalSpec struct {
+	// baseID is the stable external id (EXT-00N) the stub matches in the prompt.
+	baseID string
+	// rootCause is the label the stub returns (matches the eval corpus verbatim).
+	rootCause string
+	// confidence is the calibrated confidence the stub returns, in [0,1].
 	confidence float64
-	// regulated marks the break as touching a regulated flow. A regulated break
-	// is NEVER auto-remediated regardless of confidence (Rule 5.4).
+	// regulated marks a break touching a regulated flow; it must NEVER be
+	// auto-remediated regardless of confidence (Rule 5.4).
 	regulated bool
-	// ruleField / ruleOperator describe the single-criterion Blnk matching rule
-	// the stub LLM proposes. Empty ruleField means "no proposed_rule" (the model
-	// deliberately omits a rule for causes that must escalate).
-	ruleField    string
-	ruleOperator string
-	// autoEligible is true when this break passes the remediator's
-	// confidence/regulation gate (Rule 5.4) AND carries an auto-eligible root
-	// cause (timing / amount_drift / reference_mismatch) AND proposes a safe
-	// {field,equals} rule — i.e. the remediator drives it down the auto-path
-	// (propose rule -> Blnk dry-run -> confirm cleared). Whether Blnk actually
-	// clears it is decided by the LIVE ledger, not by this flag (deterministic
-	// arbiter, Rule 5.3): the suite asserts only the robust invariant that a
-	// break which DID resolve was auto-eligible, never a fixed per-scenario
-	// clearance outcome (the shared Blnk database is not owned by this test).
-	autoEligible bool
+	// expectAuto is true when the pipeline must auto-resolve this break and false
+	// when it must escalate to the HITL queue.
+	expectAuto bool
+	// proposedRule is the Blnk-native matching rule the stub proposes. It MUST be
+	// non-nil for an auto-eligible break (the remediator escalates a break whose
+	// classification carries no proposed rule) and nil for a break that escalates.
+	proposedRule *stubProposedRule
 }
 
-// escalates reports whether the confidence/regulation gate (Rule 5.4) alone
-// forces this break to HITL: a regulated break, or one below the auto-remediation
-// threshold, is escalated and never auto-actioned. (Auto-INeligible root causes
-// such as duplicate/missing_internal also escalate, but via a separate gate; this
-// helper captures only the Rule 5.4 arm the AAP success criterion names
-// explicitly.)
-func (s scenarioSpec) gatedToHITL(threshold float64) bool {
-	return s.regulated || s.confidence < threshold
+// stubCriterion / stubProposedRule / stubClassification mirror the classifier's
+// strict on-the-wire decode types (classifier.rawCriterion / rawProposedRule /
+// rawClassification) EXACTLY — same JSON field names, same Go types. The
+// classifier decodes the stub's content with DisallowUnknownFields, so an extra
+// or mistyped field would fail classification and route the break to HITL.
+type stubCriterion struct {
+	Field          string  `json:"field"`
+	Operator       string  `json:"operator"`
+	Value          string  `json:"value"`
+	Pattern        string  `json:"pattern"`
+	AllowableDrift float64 `json:"allowable_drift"`
 }
 
-// scenarios enumerates the classifications the stub LLM returns, one per planted
-// break. They are calibrated against the EMPIRICALLY VERIFIED behavior of Blnk's
-// reconciliation engine (confirmed by probing a live daemon during authoring),
-// because this suite runs the real deterministic arbiter — not a mock:
-//
-//  1. A single-transaction dry-run clears a break through an {amount,equals}
-//     criterion: Blnk derives the internal-candidate SQL window from a rule's
-//     amount/date criteria (reconciliation.go calculateMatchingBounds +
-//     GetTransactionsByCriteria), so an amount-equality rule surfaces the
-//     matching internal booking and clears the probe. String-only criteria
-//     (reference/description) yield a nil amount/date window and do not surface
-//     a counterpart, so they never clear in this deployment.
-//  2. The classifier does NOT carry allowable_drift onto a proposed rule
-//     (classifier.rawProposedRule has no drift field; parseClassification builds
-//     the criterion with drift 0), so an auto-applied {amount,equals} clears
-//     when the external amount equals an internal booking's amount.
-//
-// Three breaks are AUTO-ELIGIBLE: they pass the confidence/regulation gate, carry
-// an auto-eligible root cause, and propose an {amount,equals} rule, so the
-// remediator drives each down the auto-path and Blnk — the deterministic arbiter,
-// Rule 5.3 — decides clearance against the ledger `make seed` establishes:
-//   - timing             -> amount correct, posted late  (amount 1500 == INV-1001)
-//   - amount_drift       -> amount slightly drifted       (amount 250.75)
-//   - reference_mismatch -> reference wrong, amount right (amount 980 == INV-1003)
-//
-// timing and reference_mismatch match a SEEDED internal booking exactly, so they
-// clear reliably; amount_drift clears only if some internal booking shares its
-// amount. The suite therefore asserts the robust invariant "a break that resolved
-// was auto-eligible" plus ">=1 auto-resolved" (met by the two seed-backed breaks),
-// never a fixed per-scenario clearance outcome, because the shared Blnk database
-// is not owned by this test and may already hold arbitrary amounts.
-//
-// The remaining four each exercise a DISTINCT escalation arm, so HITL routing and
-// the confidence/regulation gate (Rule 5.4) are covered end to end against the
-// LIVE engine, and none is ever auto-actioned:
-//   - duplicate, missing_internal -> auto-INeligible root cause (escalates
-//     regardless of confidence; never probed)
-//   - currency_mismatch -> regulated == true              (Rule 5.4)
-//   - low_confidence    -> confidence < threshold          (Rule 5.4; escalates at
-//     the gate before any rule is proposed)
-//
-// Blnk ignores criteria.Value and matches field-to-field (reconciliation.go
-// matchesGroupAmount), so each proposed rule's Value is left empty; only the
-// Field/Operator (and, for clearance, the external amount) affect the outcome.
-var scenarios = []scenarioSpec{
-	{name: "timing", rootCause: model.RootCauseTiming, confidence: 0.95, regulated: false, ruleField: "amount", ruleOperator: "equals", autoEligible: true},
-	{name: "amount_drift", rootCause: model.RootCauseAmountDrift, confidence: 0.90, regulated: false, ruleField: "amount", ruleOperator: "equals", autoEligible: true},
-	{name: "reference_mismatch", rootCause: model.RootCauseReferenceMismatch, confidence: 0.88, regulated: false, ruleField: "amount", ruleOperator: "equals", autoEligible: true},
-	{name: "duplicate", rootCause: model.RootCauseDuplicate, confidence: 0.93, regulated: false},
-	{name: "missing_internal", rootCause: model.RootCauseMissingInternal, confidence: 0.91, regulated: false},
-	{name: "currency_mismatch", rootCause: model.RootCauseCurrencyMismatch, confidence: 0.90, regulated: true},
-	{name: "low_confidence", rootCause: model.RootCauseTiming, confidence: 0.40, regulated: false, ruleField: "amount", ruleOperator: "equals"},
-}
-
-// specByName returns the scenario spec for a marker, or ok=false when none
-// matches (the stub LLM then falls back to a safe "unknown" classification).
-func specByName(name string) (scenarioSpec, bool) {
-	for _, s := range scenarios {
-		if s.name == name {
-			return s, true
-		}
-	}
-	return scenarioSpec{}, false
-}
-
-// breakInput pairs a scenario with the concrete external-statement fields of one
-// planted break. Its references/amounts mirror seed/external_transactions.csv so
-// the auto-resolvable breaks match the internal ledger seeded by `make seed`.
-type breakInput struct {
-	spec        scenarioSpec
-	idSuffix    string
-	amount      float64
-	currency    string
-	reference   string
-	description string
-}
-
-// runBreaks builds the planted-break set for one test run, stamping every
-// external transaction id with runID so repeated runs against a shared agent
-// database never collide (the remediator is idempotent per id, so reusing ids
-// across runs would make a re-run a no-op and defeat the per-run assertions).
-// The amounts are chosen against the ledger `make seed` establishes (INV-1001
-// 1500, INV-1002 250, INV-1003 980, INV-1006 700 — all USD): the seed-backed
-// auto-eligible breaks (timing == 1500, reference_mismatch == 980) match an
-// internal booking's amount EXACTLY, so an {amount,equals} probe clears them and
-// guarantees the ">=1 auto-resolved" criterion regardless of any other data in
-// the shared Blnk database (see scenarios for the full eligibility rationale).
-func runBreaks(runID string) []breakInput {
-	base := []breakInput{
-		// Auto-eligible; clears reliably: external amount == seeded INV-1001 (1500).
-		{spec: mustSpec("timing"), idSuffix: "TIMING", amount: 1500.00, currency: "USD", reference: "INV-1001", description: "Vendor payout ACH settlement posted at value date T+2"},
-		// Auto-eligible; amount slightly drifted (250.75). Blnk decides clearance
-		// against the live ledger — the suite asserts only that a resolved break
-		// was auto-eligible, never that this specific break must clear or escalate.
-		{spec: mustSpec("amount_drift"), idSuffix: "DRIFT", amount: 250.75, currency: "USD", reference: "INV-1002", description: "Card capture net of 0.75 processor fee drift"},
-		// Auto-eligible; clears reliably: reference differs but amount == seeded INV-1003 (980).
-		{spec: mustSpec("reference_mismatch"), idSuffix: "REFMISS", amount: 980.00, currency: "USD", reference: "ACME-2025-03", description: "Wire credit with mismatched vendor reference code"},
-		{spec: mustSpec("duplicate"), idSuffix: "DUP", amount: 1500.00, currency: "USD", reference: "INV-1001", description: "Duplicate re-posting of vendor payout INV-1001"},
-		{spec: mustSpec("missing_internal"), idSuffix: "MISSING", amount: 4200.00, currency: "USD", reference: "UNKN-9001", description: "Unrecognized inbound deposit with no internal booking"},
-		{spec: mustSpec("currency_mismatch"), idSuffix: "CCY", amount: 700.00, currency: "EUR", reference: "INV-1006", description: "Cross-border SEPA credit booked internally in USD"},
-		{spec: mustSpec("low_confidence"), idSuffix: "LOWCONF", amount: 15.00, currency: "USD", reference: "AMBIG-4242", description: "Ambiguous micro-credit with insufficient evidence to classify confidently"},
-	}
-	for i := range base {
-		base[i].idSuffix = fmt.Sprintf("IT-%s-%s", runID, base[i].idSuffix)
-	}
-	return base
-}
-
-// mustSpec looks up a scenario spec by name and panics when it is missing. It is
-// used only for the compile-time-constant scenario names above, so a panic here
-// is a programming error in this test, never a runtime/environment condition.
-func mustSpec(name string) scenarioSpec {
-	s, ok := specByName(name)
-	if !ok {
-		panic("integration_test: unknown scenario " + name)
-	}
-	return s
-}
-
-// externalTxnID is the run-scoped external transaction id for a planted break.
-func (b breakInput) externalTxnID() string { return b.idSuffix }
-
-// txn renders the planted break as the Blnk external-transaction DTO the pipeline
-// consumes. The scenario marker is appended to the description so the stub LLM
-// can classify deterministically regardless of the run-scoped id.
-func (b breakInput) txn() blnk.ExternalTransaction {
-	return blnk.ExternalTransaction{
-		ID:          b.externalTxnID(),
-		Amount:      b.amount,
-		Currency:    b.currency,
-		Reference:   b.reference,
-		Description: fmt.Sprintf("%s %s%s%s", b.description, scenarioTagPrefix, b.spec.name, scenarioTagSuffix),
-		Date:        time.Date(2025, 1, 6, 9, 0, 0, 0, time.UTC),
-		Source:      uploadSource,
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Deterministic stub OpenAI-compatible LLM
-//
-// The classifier is wired through the REAL go-openai client (Rule 5.6 config-
-// driven), so to make classification deterministic and independent of any
-// external model this test hosts a local OpenAI-compatible Chat Completions
-// endpoint. Pointing cfg.LLMBaseURL at this server makes classifier.New(cfg)
-// exercise the genuine client end to end while the reply is fixed per scenario.
-// (Absent this, an unset/blank LLM_API_KEY would make every break fail closed to
-// HITL — Rule 5.7 — and no break could auto-remediate, defeating the ">=1
-// auto-remediated" success criterion.)
-// ---------------------------------------------------------------------------
-
-// stubProposedRule / stubClassification mirror the strict-JSON shape the real
-// classifier parses from the model reply (see internal/classifier/classifier.go
-// rawClassification). The stub marshals a stubClassification as the assistant
-// message content.
 type stubProposedRule struct {
-	Field    string `json:"field"`
-	Operator string `json:"operator"`
-	Value    string `json:"value"`
+	Criteria []stubCriterion `json:"criteria"`
 }
 
 type stubClassification struct {
@@ -309,223 +151,315 @@ type stubClassification struct {
 	Rationale    string            `json:"rationale"`
 }
 
-// stubChatResponse (+ choice/message) is the minimal subset of the OpenAI Chat
-// Completions response the go-openai client decodes: it reads choices[0].message
-// .content. The field names match go-openai's JSON tags, so the response is
-// hand-crafted here without importing the go-openai package into the test.
-type stubChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+// crit builds an in-grammar matching criterion (Rule 5.2:
+// field in {amount,date,description,reference,currency}, operator in
+// {equals,greater_than,less_than,contains}). drift is set only on an amount
+// criterion; leave it 0 elsewhere.
+func crit(field, operator, value string, drift float64) stubCriterion {
+	return stubCriterion{Field: field, Operator: operator, Value: value, AllowableDrift: drift}
 }
 
-type stubChatChoice struct {
-	Index        int             `json:"index"`
-	Message      stubChatMessage `json:"message"`
-	FinishReason string          `json:"finish_reason"`
+func autoRule(crits ...stubCriterion) *stubProposedRule {
+	return &stubProposedRule{Criteria: crits}
 }
 
-type stubChatResponse struct {
-	ID      string           `json:"id"`
-	Object  string           `json:"object"`
-	Created int64            `json:"created"`
-	Model   string           `json:"model"`
-	Choices []stubChatChoice `json:"choices"`
+// canonicalSpecs is the six-break ground truth. The three auto-eligible causes
+// (timing / amount_drift / reference_mismatch) carry a valid proposed rule and
+// must auto-resolve; duplicate / missing_internal escalate; currency_mismatch
+// is BOTH high-confidence AND regulated and must escalate anyway (Rule 5.4).
+var canonicalSpecs = []canonicalSpec{
+	{
+		baseID: "EXT-001", rootCause: "timing", confidence: 0.95, regulated: false, expectAuto: true,
+		proposedRule: autoRule(
+			crit(model.FieldAmount, model.OperatorEquals, "1500.00", 0),
+			crit(model.FieldCurrency, model.OperatorEquals, "USD", 0),
+			crit(model.FieldReference, model.OperatorEquals, "INV-1001", 0),
+		),
+	},
+	{
+		baseID: "EXT-002", rootCause: "amount_drift", confidence: 0.95, regulated: false, expectAuto: true,
+		proposedRule: autoRule(
+			crit(model.FieldAmount, model.OperatorEquals, "250.75", 0.01),
+			crit(model.FieldCurrency, model.OperatorEquals, "USD", 0),
+			crit(model.FieldReference, model.OperatorEquals, "INV-1002", 0),
+		),
+	},
+	{
+		baseID: "EXT-003", rootCause: "reference_mismatch", confidence: 0.92, regulated: false, expectAuto: true,
+		proposedRule: autoRule(
+			crit(model.FieldAmount, model.OperatorEquals, "980.00", 0),
+			crit(model.FieldCurrency, model.OperatorEquals, "USD", 0),
+		),
+	},
+	{baseID: "EXT-004", rootCause: "duplicate", confidence: 0.90, regulated: false, expectAuto: false, proposedRule: nil},
+	{baseID: "EXT-005", rootCause: "missing_internal", confidence: 0.90, regulated: false, expectAuto: false, proposedRule: nil},
+	{baseID: "EXT-006", rootCause: "currency_mismatch", confidence: 0.92, regulated: true, expectAuto: false, proposedRule: nil},
 }
 
-// detectScenario finds the scenario marker embedded in the prompt and returns
-// its spec. When no marker is present it returns a safe "unknown" classification
-// with no proposed rule, which the remediator escalates — this should not happen
-// for the planted breaks and exists only as a defensive default.
-func detectScenario(prompt string) scenarioSpec {
-	for _, s := range scenarios {
-		if strings.Contains(prompt, scenarioTagPrefix+s.name+scenarioTagSuffix) {
-			return s
+// baseIDRe extracts a stable canonical base id (EXT-001..EXT-006) from a
+// run-scoped id (EXT-00N-<runID>) or from a classifier prompt. The run id
+// segment is 8 lowercase-hex chars and can never contain "EXT-", and no CSV
+// field carries an "EXT-00N" token, so the match is unambiguous.
+var baseIDRe = regexp.MustCompile(`EXT-00[1-6]`)
+
+func baseID(runScoped string) string {
+	if m := baseIDRe.FindString(runScoped); m != "" {
+		return m
+	}
+	return runScoped
+}
+
+func specForPrompt(prompt string) (canonicalSpec, bool) {
+	m := baseIDRe.FindString(prompt)
+	if m == "" {
+		return canonicalSpec{}, false
+	}
+	for _, s := range canonicalSpecs {
+		if s.baseID == m {
+			return s, true
 		}
 	}
-	return scenarioSpec{name: "unknown", rootCause: model.RootCauseUnknown, confidence: 0}
+	return canonicalSpec{}, false
 }
 
-// classificationContentFor builds the strict-JSON classification the stub returns
-// for the break described by prompt. The proposed rule's Value is left empty
-// because Blnk matches external against internal field-to-field and ignores
-// criteria.Value (reconciliation.go), so only Field/Operator affect clearance.
-func classificationContentFor(prompt string) string {
-	spec := detectScenario(prompt)
-	cls := stubClassification{
-		RootCause:  string(spec.rootCause),
-		Confidence: spec.confidence,
-		Regulated:  spec.regulated,
-		Rationale:  fmt.Sprintf("stub classification for scenario %q", spec.name),
-	}
-	if spec.ruleField != "" {
-		cls.ProposedRule = &stubProposedRule{Field: spec.ruleField, Operator: spec.ruleOperator, Value: ""}
-	}
-	b, err := json.Marshal(cls)
-	if err != nil {
-		// Marshaling a fixed struct cannot fail in practice; surface a valid
-		// fallback object so the classifier still parses a well-formed reply.
-		return `{"root_cause":"unknown","confidence":0,"regulated":false,"rationale":"stub marshal error"}`
-	}
-	return string(b)
-}
-
-// newStubLLM starts a local httptest server that answers the go-openai client's
-// POST {BaseURL}/chat/completions with a deterministic per-scenario
-// classification. The caller must Close it (via t.Cleanup).
+// newStubLLM starts an in-process, deterministic, OpenAI-compatible Chat
+// Completions stub. The demo subprocess's real go-openai classifier POSTs to it
+// (its LLM_BASE_URL points here); the stub extracts the break's stable base id
+// from the prompt and returns the canonical classification as the completion
+// content. Because a real, reachable endpoint always answers, the fail-closed
+// path never fires and the run is fully deterministic and offline (Rule 5.6).
 func newStubLLM(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Messages []struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
-			} `json:"messages"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad chat request", http.StatusBadRequest)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	// Catch-all: any POST (e.g. /v1/chat/completions) is a classification call.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		var sb strings.Builder
-		for _, m := range req.Messages {
-			sb.WriteString(m.Content)
-			sb.WriteByte('\n')
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		var cls stubClassification
+		if spec, ok := specForPrompt(string(body)); ok {
+			cls = stubClassification{
+				RootCause:    spec.rootCause,
+				Confidence:   spec.confidence,
+				Regulated:    spec.regulated,
+				ProposedRule: spec.proposedRule,
+				Rationale:    "deterministic stub classification for " + spec.baseID,
+			}
+		} else {
+			// Unrecognized break: fail closed (unknown / zero confidence) so the
+			// remediator escalates rather than auto-acting on an unmapped break.
+			cls = stubClassification{RootCause: "unknown", Confidence: 0, Rationale: "unrecognized break"}
 		}
-		resp := stubChatResponse{
-			ID:      "chatcmpl-stub",
-			Object:  "chat.completion",
-			Created: time.Now().Unix(),
-			Model:   "kimi-k3-stub",
-			Choices: []stubChatChoice{{
-				Index:        0,
-				Message:      stubChatMessage{Role: "assistant", Content: classificationContentFor(sb.String())},
-				FinishReason: "stop",
+		content, _ := json.Marshal(cls)
+		resp := map[string]any{
+			"id":      "stub-cmpl",
+			"object":  "chat.completion",
+			"created": time.Now().Unix(),
+			"model":   "kimi-k3",
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": string(content)},
+				"finish_reason": "stop",
 			}},
+			"usage": map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
-	}))
+	})
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
 }
 
-// ---------------------------------------------------------------------------
-// Assertion / statement helpers
-// ---------------------------------------------------------------------------
-
-// buildStatementCSV renders the planted breaks as an external-statement CSV whose
-// header columns match those Blnk's ingestion requires (internal/files/files.go):
-// ID, Amount, Currency, Reference, Description, Date. Commas inside a description
-// are sanitized so the row stays well-formed.
-func buildStatementCSV(breaks []breakInput) string {
-	var sb strings.Builder
-	sb.WriteString("ID,Amount,Currency,Reference,Description,Date\n")
-	for _, b := range breaks {
-		txn := b.txn()
-		// Upload-scoped id (see uploadRowIDSuffix): keeps the persisted statement
-		// rows disjoint from the ids the remediator probes by, so ProbeBreak's
-		// start-instant insert is never a duplicate of an uploaded id.
-		sb.WriteString(fmt.Sprintf("%s,%.2f,%s,%s,%s,%s\n",
-			txn.ID+uploadRowIDSuffix,
-			txn.Amount,
-			txn.Currency,
-			txn.Reference,
-			strings.ReplaceAll(txn.Description, ",", ";"),
-			txn.Date.Format(time.RFC3339),
-		))
-	}
-	return sb.String()
+// moduleRoot resolves the repository root and the recon-agent module directory
+// from this test file's own location, so the subprocess calls are independent
+// of the caller's working directory.
+func moduleRoot(t *testing.T) (repoRoot, reconAgentDir string) {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	require.True(t, ok, "runtime.Caller could not locate the test source file")
+	internalDir := filepath.Dir(thisFile)     // <root>/recon-agent/internal
+	reconAgentDir = filepath.Dir(internalDir) // <root>/recon-agent
+	repoRoot = filepath.Dir(reconAgentDir)    // <root>
+	return repoRoot, reconAgentDir
 }
 
-// runIDSet returns the set of run-scoped external txn ids, used to filter shared
-// store listings (which may contain rows from other runs) down to this run.
-func runIDSet(breaks []breakInput) map[string]bool {
-	ids := make(map[string]bool, len(breaks))
-	for _, b := range breaks {
-		ids[b.externalTxnID()] = true
-	}
-	return ids
-}
-
-// auditByTxn groups this run's audit events by external txn id, preserving order.
-func auditByTxn(events []model.AuditEvent, ids map[string]bool) map[string][]model.AuditEvent {
-	out := make(map[string][]model.AuditEvent)
-	for _, e := range events {
-		if ids[e.ExternalTxnID] {
-			out[e.ExternalTxnID] = append(out[e.ExternalTxnID], e)
+// mergeEnv returns os.Environ() with every key present in overrides REMOVED and
+// then re-appended from overrides, guaranteeing exactly one occurrence per
+// overridden key. This avoids the ambiguity of duplicate env entries (glibc
+// getenv returns the first match; some runtimes the last), so the child process
+// deterministically observes the values this test intends.
+func mergeEnv(overrides map[string]string) []string {
+	base := os.Environ()
+	out := make([]string, 0, len(base)+len(overrides))
+	for _, kv := range base {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
 		}
+		if _, shadowed := overrides[key]; shadowed {
+			continue
+		}
+		out = append(out, kv)
+	}
+	for k, v := range overrides {
+		out = append(out, k+"="+v)
 	}
 	return out
 }
 
-// hasAction reports whether any event in events carries the given action.
-func hasAction(events []model.AuditEvent, action string) bool {
-	for _, e := range events {
-		if e.Action == action {
-			return true
-		}
-	}
-	return false
+// runGo runs `go <args>` in dir with the given environment overrides, capturing
+// combined stdout+stderr for diagnostics.
+func runGo(ctx context.Context, dir string, overrides map[string]string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Dir = dir
+	cmd.Env = mergeEnv(overrides)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	return buf.String(), err
 }
 
-// resolvedWithRecon returns the resolved events that carry a non-empty confirming
-// reconciliation id in provenance — the deterministic-arbiter evidence Rule 5.3
-// requires for a resolution.
-func resolvedWithRecon(events []model.AuditEvent) []model.AuditEvent {
-	var out []model.AuditEvent
-	for _, e := range events {
-		if e.Action == audit.ActionResolved && strings.TrimSpace(e.Provenance.ReconID) != "" {
-			out = append(out, e)
+// resolvedRecord is the subset of the per-break JSONL artifact this test reads.
+// The artifact's `expected_output` records the ACTUAL realized outcome of the
+// run (root cause, regulated flag, and the action the pipeline took).
+type resolvedRecord struct {
+	ID             string `json:"id"`
+	ExpectedOutput struct {
+		RootCause      string `json:"root_cause"`
+		Regulated      bool   `json:"regulated"`
+		ExpectedAction string `json:"expected_action"`
+	} `json:"expected_output"`
+}
+
+// summaryReport mirrors cmd's machine-readable one-shot run summary.
+type summaryReport struct {
+	BreaksIn     int `json:"breaks_in"`
+	AutoResolved int `json:"auto_resolved"`
+	Escalated    int `json:"escalated"`
+	AuditCount   int `json:"audit_count"`
+}
+
+func readSummary(t *testing.T, path string) summaryReport {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	require.NoErrorf(t, err, "reading run summary %s", path)
+	var s summaryReport
+	require.NoErrorf(t, json.Unmarshal(raw, &s), "decoding run summary %s", path)
+	return s
+}
+
+func readResolved(t *testing.T, path string) []resolvedRecord {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	require.NoErrorf(t, err, "reading resolved artifact %s", path)
+	var out []resolvedRecord
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
 		}
+		var rec resolvedRecord
+		require.NoErrorf(t, json.Unmarshal([]byte(line), &rec), "decoding resolved record %q", line)
+		out = append(out, rec)
 	}
 	return out
 }
 
-// inHITLQueue reports whether externalTxnID is currently in the agent HITL queue.
-func inHITLQueue(items []store.HITLItem, externalTxnID string) bool {
-	for _, it := range items {
-		if it.ExternalTxnID == externalTxnID {
-			return true
-		}
-	}
-	return false
+// postDecision POSTs a JSON HITL decision to <baseURL>/decisions and asserts the
+// response status. A JSON content-type with no cross-origin header satisfies the
+// server's mutation guard (same-origin JSON needs no CSRF token).
+func postDecision(ctx context.Context, t *testing.T, baseURL string, d model.HITLDecision, want int) {
+	t.Helper()
+	body, err := json.Marshal(d)
+	require.NoError(t, err)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/decisions", bytes.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	require.Equalf(t, want, resp.StatusCode,
+		"POST /decisions %s/%s -> %d (want %d); body=%s", d.ExternalTxnID, d.Decision, resp.StatusCode, want, string(msg))
 }
 
-// breakByID returns the store break row for an external txn id from a listing.
-func breakByID(breaks []store.Break, externalTxnID string) (store.Break, bool) {
-	for _, b := range breaks {
-		if b.Classification.ExternalTxnID == externalTxnID {
-			return b, true
-		}
-	}
-	return store.Break{}, false
+func assertGet(ctx context.Context, t *testing.T, url string, want int) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equalf(t, want, resp.StatusCode, "GET %s -> %d (want %d)", url, resp.StatusCode, want)
 }
 
-// ---------------------------------------------------------------------------
-// TestMain — optional readiness gating
-// ---------------------------------------------------------------------------
+func requireStatus(ctx context.Context, t *testing.T, st *store.Store, id, want string) {
+	t.Helper()
+	_, status, _, found, err := st.LoadBreak(ctx, id)
+	require.NoError(t, err)
+	require.Truef(t, found, "break %s not found in store", baseID(id))
+	require.Equalf(t, want, status, "break %s status", baseID(id))
+}
+
+func requireAudit(ctx context.Context, t *testing.T, st *store.Store, id, action string) {
+	t.Helper()
+	n, err := st.CountAuditByAction(ctx, id, action)
+	require.NoError(t, err)
+	require.GreaterOrEqualf(t, n, 1, "break %s must have a %q audit event", baseID(id), action)
+}
+
+// assertResolvedCarryReconID proves Rule 5.3 at the DB level: every `resolved`
+// audit event for this run carries a non-empty confirming Blnk recon_id. It uses
+// a scoped raw query (lib/pq, already a store dependency) because the store's
+// paginated audit list orders ASC and cannot cheaply target the newest run in a
+// shared database.
+func assertResolvedCarryReconID(ctx context.Context, t *testing.T, dsn string, runIDs []string) {
+	t.Helper()
+	db, err := sql.Open("postgres", dsn)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	rows, err := db.QueryContext(ctx,
+		`SELECT external_txn_id, provenance->>'recon_id'
+		   FROM agent.agent_audit
+		  WHERE action = $1 AND external_txn_id = ANY($2)`,
+		model.ActionResolved, pq.Array(runIDs))
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+	n := 0
+	for rows.Next() {
+		var id string
+		var reconID sql.NullString
+		require.NoError(t, rows.Scan(&id, &reconID))
+		require.Truef(t, reconID.Valid && strings.TrimSpace(reconID.String) != "",
+			"resolved audit event for %s must carry a Blnk recon_id (Rule 5.3)", baseID(id))
+		n++
+	}
+	require.NoError(t, rows.Err())
+	require.GreaterOrEqual(t, n, 3, "all three auto-resolved breaks must have a resolved event with a recon_id")
+}
 
 // TestMain optionally waits for the live Blnk daemon to become reachable before
-// running the suite, smoothing over CI startup races (Blnk may still be booting
-// when the test binary starts). It performs ONLY readiness gating: a best-effort
-// GET of <BLNK_BASE_URL>/health, treating ANY HTTP response (200/401/404/503) as
-// "reachable" and retrying only on dial errors. It imports nothing from Blnk and
-// issues no reconciliation call, so Rule 5.1 is preserved — the agent still
-// reaches Blnk's reconciliation surface exclusively through internal/blnk. When
-// BLNK_BASE_URL is unset the test itself skips, so this is a no-op.
+// running the suite (readiness gating only): a best-effort GET of
+// <BLNK_BASE_URL>/health, treating ANY HTTP response as "up". When BLNK_BASE_URL
+// is unset the test itself skips, so this is a no-op.
 func TestMain(m *testing.M) {
 	if base := strings.TrimSpace(os.Getenv("BLNK_BASE_URL")); base != "" {
-		waitForBlnk(base, 30*time.Second)
+		waitForBlnk(base, blnkReadyTimeout)
 	}
 	os.Exit(m.Run())
 }
 
-// waitForBlnk polls baseURL+"/health" until it receives any HTTP response or the
-// timeout elapses. It never fails the run: if Blnk never answers, the test's own
-// operations surface the real error (or the test skips when env is unset).
 func waitForBlnk(baseURL string, timeout time.Duration) {
-	client := &http.Client{Timeout: 2 * time.Second}
 	url := strings.TrimRight(baseURL, "/") + "/health"
 	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 3 * time.Second}
 	for time.Now().Before(deadline) {
 		req, err := http.NewRequest(http.MethodGet, url, nil)
 		if err != nil {
@@ -534,333 +468,198 @@ func waitForBlnk(baseURL string, timeout time.Duration) {
 		resp, err := client.Do(req)
 		if err == nil {
 			_ = resp.Body.Close()
-			return // any HTTP status means the server is reachable
+			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestReconAgentPipeline — end-to-end pipeline against a LIVE Blnk daemon
-// ---------------------------------------------------------------------------
-
-// TestReconAgentPipeline drives the entire recon-agent pipeline end to end and
-// asserts the AAP's measurable success criteria (§0.1.1):
-//   - >=1 break auto-remediated AND confirmed cleared by a Blnk dry-run
-//     (Rule 5.3: the resolved audit event carries a confirming recon_id);
-//   - 100% of pipeline actions emit an append-only AuditEvent (every processed
-//     break has an audit trail; every resolved event carries a recon_id);
-//   - every break with confidence < CONF_AUTO_THRESHOLD OR regulated == true is
-//     routed to the HITL queue and never auto-actioned (Rule 5.4);
-//   - the HITL accept / re_drive / reject routes are each invoked over HTTP and
-//     (on the auditable paths) write a decision AuditEvent (Gate 13).
-//
-// It wires the SAME object graph as cmd/main.go (Gate 9) and reaches Blnk only
-// through internal/blnk (Rule 5.1). Classification is served by a local
-// deterministic stub OpenAI-compatible endpoint so the run is reproducible and
-// never fails closed for a missing key; every other collaborator (Blnk, the
-// agent database, the confidence threshold) is the real, env-configured one.
+// TestReconAgentPipeline drives the canonical six breaks through the exact
+// production demo path and asserts every AAP success criterion, DB parity, and
+// the three HITL decisions end-to-end. It requires a live Blnk daemon and the
+// agent PostgreSQL database (BLNK_BASE_URL + AGENT_DATABASE_URL); otherwise it
+// skips (the unit suites carry the coverage floor without external services).
 func TestReconAgentPipeline(t *testing.T) {
-	// --- Defensive environment gating: degrade gracefully when mis-invoked
-	// outside CI. In CI these are always set. ---
-	if strings.TrimSpace(os.Getenv("BLNK_BASE_URL")) == "" || strings.TrimSpace(os.Getenv("AGENT_DATABASE_URL")) == "" {
+	blnkBase := strings.TrimSpace(os.Getenv("BLNK_BASE_URL"))
+	agentDSN := strings.TrimSpace(os.Getenv("AGENT_DATABASE_URL"))
+	if blnkBase == "" || agentDSN == "" {
 		t.Skip("integration env not configured (requires BLNK_BASE_URL and AGENT_DATABASE_URL)")
 	}
+	blnkKey := strings.TrimSpace(os.Getenv("BLNK_API_KEY"))
 
-	// --- Deterministic stub LLM (started before config so we can repoint at it). ---
-	llm := newStubLLM(t)
+	repoRoot, reconAgentDir := moduleRoot(t)
 
-	// --- Load config exactly as the service does, then repoint inference at the
-	// local stub. Rule 5.6: the model name stays config-driven; we only override
-	// the endpoint/key so classification is deterministic and service-free. ---
-	cfg, err := config.Load()
-	require.NoError(t, err, "config.Load must succeed with the integration env set")
-	cfg.LLMBaseURL = llm.URL
-	cfg.LLMApiKey = "integration-stub-key"
-	if strings.TrimSpace(cfg.LLMModel) == "" {
-		cfg.LLMModel = "kimi-k3"
+	// (1) Deterministic, offline LLM the subprocess classifier will call.
+	stub := newStubLLM(t)
+	llmBaseURL := stub.URL + "/v1"
+
+	// A unique per-run source => unique run fixture key => a FRESH set of
+	// run-scoped breaks (never a replay of a prior run) against the shared Blnk DB.
+	source := fmt.Sprintf("%s-%d", uploadSourcePrefix, time.Now().UnixNano())
+
+	// (2) Establish internal ledger state (idempotent) via the seed program over
+	//     Blnk's public HTTP API — exactly as `make seed` does. Without this the
+	//     external statement has nothing to reconcile against.
+	seedCtx, cancelSeed := context.WithTimeout(context.Background(), demoDeadline)
+	defer cancelSeed()
+	if out, err := runGo(seedCtx, repoRoot, map[string]string{
+		"BLNK_BASE_URL": blnkBase,
+		"BLNK_API_KEY":  blnkKey,
+	}, "run", "./seed"); err != nil {
+		t.Fatalf("seed (go run ./seed) failed: %v\n%s", err, out)
 	}
 
-	// Bound the whole pipeline. Individual Blnk calls are additionally bounded by
-	// the client's own HTTP timeout and ProbeBreak's polling timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
+	// (3) Run the EXACT demo path: `go run ./cmd -once` (what `make demo`
+	//     invokes) under a hard <=60s deadline, with artifacts isolated to a temp
+	//     dir so the shared working tree is untouched. -csv defaults to
+	//     ../seed/external_transactions.csv (the canonical six).
+	artifactDir := t.TempDir()
+	resolvedPath := filepath.Join(artifactDir, "recon_resolved.jsonl")
+	summaryPath := filepath.Join(artifactDir, "recon_summary.json")
 
-	// --- Wire the real object graph exactly like cmd/main.go (Gate 9). ---
-	st, err := store.New(cfg.AgentDatabaseURL)
-	require.NoError(t, err, "store.New")
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(t, st.Migrate(ctx), "store.Migrate must create the agent schema and tables")
+	demoCtx, cancelDemo := context.WithTimeout(context.Background(), demoDeadline)
+	defer cancelDemo()
+	start := time.Now()
+	out, err := runGo(demoCtx, reconAgentDir, map[string]string{
+		"AGENT_DATABASE_URL":  agentDSN,
+		"BLNK_BASE_URL":       blnkBase,
+		"BLNK_API_KEY":        blnkKey,
+		"LLM_BASE_URL":        llmBaseURL,
+		"LLM_API_KEY":         "stub-key",
+		"LLM_MODEL":           "kimi-k3",
+		"CONF_AUTO_THRESHOLD": "0.85",
+		"HITL_PORT":           "8088",
+	}, "run", "./cmd", "-once", "-source", source, "-resolved", resolvedPath)
+	elapsed := time.Since(start)
+	t.Logf("demo (go run ./cmd -once) completed in %s; output:\n%s", elapsed, out)
+	require.NoErrorf(t, demoCtx.Err(), "demo did not complete within the %s budget (M-18)", demoDeadline)
+	require.NoErrorf(t, err, "demo `go run ./cmd -once` failed:\n%s", out)
+	require.Lessf(t, elapsed, demoDeadline, "demo exceeded the %s budget (M-18)", demoDeadline)
 
-	auditWriter, err := audit.New(st)
-	require.NoError(t, err, "audit.New")
+	// (4) Machine-readable acceptance: the run summary + per-break artifact.
+	summary := readSummary(t, summaryPath)
+	records := readResolved(t, resolvedPath)
 
-	blnkClient := blnk.NewClient(cfg.BlnkBaseURL, cfg.BlnkApiKey)
-	cls := classifier.New(cfg)
-	rem := remediator.New(cls, blnkClient, auditWriter, st, cfg.ConfAutoThreshold, cfg.LLMModel)
-	hitlServer := hitl.NewServer(cfg, st, auditWriter, blnkClient)
+	require.Equal(t, 6, summary.BreaksIn, "exactly six canonical breaks must be ingested")
+	require.Equal(t, 3, summary.AutoResolved, "exactly three breaks must auto-resolve")
+	require.Equal(t, 3, summary.Escalated, "exactly three breaks must escalate")
+	require.Equal(t, summary.BreaksIn, summary.AutoResolved+summary.Escalated,
+		"every break must be either auto-resolved or escalated")
+	require.GreaterOrEqual(t, summary.AuditCount, summary.BreaksIn,
+		"every break must emit at least one audit event")
+	require.Len(t, records, 6, "resolved artifact must carry one record per break")
 
-	// --- Seed/upload a small external statement (exercises UploadExternalData and
-	// yields a real upload id for provenance). The internal ledger these breaks
-	// reconcile against is provided by `make seed` (AAP-endorsed). Run-scoped ids
-	// keep repeated runs against a shared agent DB independent. ---
-	runID := strings.SplitN(uuid.NewString(), "-", 2)[0]
-	breaks := runBreaks(runID)
-	statement := buildStatementCSV(breaks)
-	upload, err := blnkClient.UploadExternalData(ctx, uploadSource, "integration_statement.csv", strings.NewReader(statement))
-	require.NoError(t, err, "UploadExternalData must succeed against live Blnk")
-	require.NotEmpty(t, upload.UploadID, "upload must return an upload_id")
-	require.Equal(t, len(breaks), upload.RecordCount, "record_count must equal the planted break count")
-
-	// --- Run the remediator over every planted break. Handle is terminal and
-	// idempotent and returns an error only on agent-side infra failure; its auto
-	// path exercises the ProbeBreak dry-run bridge (deterministic arbiter,
-	// Rule 5.3) internally. ---
-	for _, b := range breaks {
-		require.NoError(t, rem.Handle(ctx, b.txn(), upload.UploadID),
-			"remediator.Handle must reach a safely-recorded terminal outcome for %s (%s)", b.externalTxnID(), b.spec.name)
+	byBase := make(map[string]resolvedRecord, 6)
+	runIDs := make([]string, 0, 6)
+	for _, r := range records {
+		byBase[baseID(r.ID)] = r
+		runIDs = append(runIDs, r.ID)
 	}
+	require.Len(t, byBase, 6, "resolved records must cover all six distinct canonical breaks")
 
-	// --- Gather post-pipeline state, filtered to this run's ids (the agent
-	// database is shared, so other runs' rows must be excluded). ---
-	ids := runIDSet(breaks)
-
-	allBreaks, err := st.ListBreaks(ctx)
-	require.NoError(t, err, "ListBreaks")
-	allAudit, err := st.ListAudit(ctx)
-	require.NoError(t, err, "ListAudit")
-	hitlItems, err := st.ListHITL(ctx)
-	require.NoError(t, err, "ListHITL")
-
-	byTxn := auditByTxn(allAudit, ids)
-	var runAudit []model.AuditEvent
-	for _, e := range allAudit {
-		if ids[e.ExternalTxnID] {
-			runAudit = append(runAudit, e)
+	// (5) Label accuracy (AAP: >=5/6) and routing safety (Rule 5.4).
+	correct, autoCount := 0, 0
+	for _, spec := range canonicalSpecs {
+		rec, ok := byBase[spec.baseID]
+		require.Truef(t, ok, "break %s missing from resolved artifact", spec.baseID)
+		if rec.ExpectedOutput.RootCause == spec.rootCause {
+			correct++
+		}
+		if spec.expectAuto {
+			require.Equalf(t, "auto_resolve", rec.ExpectedOutput.ExpectedAction, "break %s must auto-resolve", spec.baseID)
+			autoCount++
+		} else {
+			require.Equalf(t, "escalate", rec.ExpectedOutput.ExpectedAction, "break %s must escalate", spec.baseID)
+		}
+		if spec.regulated {
+			require.Equalf(t, "escalate", rec.ExpectedOutput.ExpectedAction,
+				"regulated break %s must NEVER auto-resolve (Rule 5.4)", spec.baseID)
+			require.Truef(t, rec.ExpectedOutput.Regulated, "regulated break %s must be flagged regulated", spec.baseID)
 		}
 	}
+	require.GreaterOrEqual(t, correct, 5, "at least five of six root-cause labels must be correct (AAP)")
+	require.GreaterOrEqual(t, autoCount, 1, "at least one break must be auto-resolved (AAP)")
 
-	// === Success criterion 1: >=1 break auto-remediated AND confirmed cleared by
-	// a Blnk dry-run (Rule 5.3 — the resolved event carries a recon_id). ===
-	resolved := resolvedWithRecon(runAudit)
-	require.GreaterOrEqualf(t, len(resolved), 1,
-		"at least one break must be auto-remediated and confirmed cleared by a Blnk dry-run (resolved event with recon_id); got %d", len(resolved))
+	// (6) DB parity via the agent store, scoped to THIS run's ids.
+	st, err := store.New(agentDSN)
+	require.NoError(t, err)
+	defer func() { _ = st.Close() }()
+	ctx := context.Background()
 
-	resolvedIDs := make(map[string]bool, len(resolved))
-	for _, e := range resolved {
-		resolvedIDs[e.ExternalTxnID] = true
-		row, ok := breakByID(allBreaks, e.ExternalTxnID)
-		require.Truef(t, ok, "resolved break %s must have a store row", e.ExternalTxnID)
-		require.Equalf(t, "auto-resolved", row.Status, "resolved break %s must have status auto-resolved", e.ExternalTxnID)
-	}
-	// Robust invariant (Rules 5.3 + 5.4): a break may resolve ONLY if it was
-	// auto-eligible (passed the confidence/regulation gate with an auto-eligible
-	// root cause and a proposed rule). Nothing gated or auto-ineligible may ever
-	// slip through to a resolved state, whatever the shared ledger contains.
-	for _, b := range breaks {
-		if resolvedIDs[b.externalTxnID()] {
-			require.Truef(t, b.spec.autoEligible,
-				"only auto-eligible breaks may resolve; %s (%s) resolved but is not auto-eligible", b.externalTxnID(), b.spec.name)
-		}
-	}
+	nAuto, err := st.CountBreaksByStatusForIDs(ctx, runIDs, model.StatusAutoResolved)
+	require.NoError(t, err)
+	require.Equal(t, 3, nAuto, "three breaks must be persisted as auto-resolved")
+	nQueued, err := st.CountBreaksByStatusForIDs(ctx, runIDs, model.StatusQueued)
+	require.NoError(t, err)
+	require.Equal(t, 3, nQueued, "three breaks must be persisted as queued")
 
-	// === Success criterion 2: 100% of pipeline actions emit an AuditEvent. ===
-	for _, b := range breaks {
-		id := b.externalTxnID()
-		evs := byTxn[id]
-		require.NotEmptyf(t, evs, "break %s (%s) must have at least one audit event (100%% of actions audited)", id, b.spec.name)
+	nHITL, err := st.CountHITLForIDs(ctx, runIDs)
+	require.NoError(t, err)
+	require.Equal(t, 3, nHITL, "three breaks must be routed to the HITL queue")
 
-		row, ok := breakByID(allBreaks, id)
-		require.Truef(t, ok, "break %s must have a store row", id)
-		switch row.Status {
-		case "auto-resolved":
-			require.Truef(t, hasAction(evs, audit.ActionClassified), "auto-resolved %s must have a classified event", id)
-			require.Truef(t, hasAction(evs, audit.ActionResolved), "auto-resolved %s must have a resolved event", id)
-		case "queued":
-			require.Truef(t, hasAction(evs, audit.ActionEscalated), "queued %s must have an escalated event", id)
-		}
-	}
-	// Rule 5.3 backstop: no resolved event in this run may lack a confirming recon_id.
-	for _, e := range runAudit {
-		if e.Action == audit.ActionResolved {
-			require.NotEmptyf(t, strings.TrimSpace(e.Provenance.ReconID),
-				"resolved event for %s must carry a confirming recon_id (Rule 5.3)", e.ExternalTxnID)
-		}
+	nAudit, err := st.CountAuditForIDs(ctx, runIDs)
+	require.NoError(t, err)
+	require.Equal(t, summary.AuditCount, nAudit,
+		"the run summary audit_count must equal the persisted audit rows for this run")
+	for _, id := range runIDs { // 100% coverage: every break has >=1 audit event.
+		n, err := st.CountAuditForIDs(ctx, []string{id})
+		require.NoError(t, err)
+		require.GreaterOrEqualf(t, n, 1, "break %s must have at least one audit event", baseID(id))
 	}
 
-	// === Success criterion 3: every break with confidence < threshold OR
-	// regulated == true is routed to HITL and never auto-actioned (Rule 5.4).
-	// Checked BEFORE the HITL HTTP exercise drains the queue. ===
-	for _, b := range breaks {
-		if !b.spec.gatedToHITL(cfg.ConfAutoThreshold) {
+	// (7) Rule 5.3 (deterministic arbiter): each auto-resolved break has a
+	//     `resolved` audit event carrying a confirming Blnk recon_id.
+	for _, spec := range canonicalSpecs {
+		if !spec.expectAuto {
 			continue
 		}
-		id := b.externalTxnID()
-		require.Truef(t, inHITLQueue(hitlItems, id),
-			"gated break %s (%s: regulated=%v confidence=%.2f) must be in the HITL queue (Rule 5.4)",
-			id, b.spec.name, b.spec.regulated, b.spec.confidence)
-		require.Falsef(t, hasAction(byTxn[id], audit.ActionResolved),
-			"gated break %s (%s) must never be auto-resolved (Rule 5.4)", id, b.spec.name)
-		row, ok := breakByID(allBreaks, id)
-		require.Truef(t, ok, "gated break %s must have a store row", id)
-		require.Equalf(t, "queued", row.Status, "gated break %s must be queued", id)
+		requireAudit(ctx, t, st, byBase[spec.baseID].ID, model.ActionResolved)
 	}
+	assertResolvedCarryReconID(ctx, t, agentDSN, runIDs)
 
-	// --- Explicit ProbeBreak dry-run bridge cross-check (Rule 5.3): independently
-	// re-probe one auto-resolved break with its created rule and confirm Blnk (the
-	// deterministic arbiter) reports it cleared with a non-empty recon id. ---
-	assertProbeConfirmsClearance(ctx, t, blnkClient, allBreaks, breaks, resolved[0].ExternalTxnID)
-
-	// === HITL surface exercised over HTTP (Gate 13): every decision verb is
-	// invoked against the real Gin router, and the auditable verbs each write a
-	// decision AuditEvent. ===
-	hitlHTTP := httptest.NewServer(hitlServer.Router())
+	// (8) HITL invocation over HTTP (Gate 13): accept / re_drive / reject are
+	//     each exercised against a distinct queued break and MUST return 200
+	//     (no 502 accepted — M-18). The real hitl server is stood up in-process,
+	//     wired exactly as cmd/main.go serve mode wires it.
+	cfg := config.Config{
+		LLMModel:          "kimi-k3",
+		BlnkBaseURL:       blnkBase,
+		BlnkApiKey:        blnkKey,
+		ConfAutoThreshold: 0.85,
+		HitlPort:          "0",
+		AgentDatabaseURL:  agentDSN,
+	}
+	aud, err := audit.New(st)
+	require.NoError(t, err)
+	bc := blnk.NewClient(blnkBase, blnkKey)
+	srv := hitl.NewServer(cfg, st, aud, bc)
+	hitlHTTP := httptest.NewServer(srv.Router())
 	defer hitlHTTP.Close()
 
-	assertHTTPStatus(ctx, t, hitlHTTP.URL+"/healthz", http.StatusOK)
-	assertBreaksListed(ctx, t, hitlHTTP.URL+"/breaks", breaks)
+	assertGet(ctx, t, hitlHTTP.URL+"/healthz", http.StatusOK)
+	assertGet(ctx, t, hitlHTTP.URL+"/breaks", http.StatusOK)
 
-	// A distinct queued break per decision verb.
-	acceptID := scenarioID(breaks, "duplicate")
-	rejectID := scenarioID(breaks, "missing_internal")
-	reDriveID := scenarioID(breaks, "low_confidence")
-	require.NotEmpty(t, acceptID, "duplicate break id")
-	require.NotEmpty(t, rejectID, "missing_internal break id")
-	require.NotEmpty(t, reDriveID, "low_confidence break id")
+	// Distinct queued breaks for the three decisions (all escalated above).
+	reDriveID := byBase["EXT-004"].ID // duplicate
+	acceptID := byBase["EXT-006"].ID  // regulated — a human may still accept it
+	rejectID := byBase["EXT-005"].ID  // missing_internal — no internal booking
 
-	acceptStatus := postDecision(ctx, t, hitlHTTP.URL, model.HITLDecision{ExternalTxnID: acceptID, Decision: audit.DecisionAccept, Reviewer: integrationReviewer, Note: "integration accept"})
-	require.Equal(t, http.StatusOK, acceptStatus, "POST /decisions accept")
+	// re_drive first (needs the break queued). Requires 200: the probe completes
+	// (buildReDriveRule matches amount+currency), no Blnk upstream error.
+	postDecision(ctx, t, hitlHTTP.URL, model.HITLDecision{
+		ExternalTxnID: reDriveID, Decision: "re_drive", Reviewer: integrationReviewer,
+	}, http.StatusOK)
+	requireAudit(ctx, t, st, reDriveID, model.ActionReDriven)
 
-	rejectStatus := postDecision(ctx, t, hitlHTTP.URL, model.HITLDecision{ExternalTxnID: rejectID, Decision: audit.DecisionReject, Reviewer: integrationReviewer, Note: "integration reject"})
-	require.Equal(t, http.StatusOK, rejectStatus, "POST /decisions reject")
+	postDecision(ctx, t, hitlHTTP.URL, model.HITLDecision{
+		ExternalTxnID: acceptID, Decision: "accept", Reviewer: integrationReviewer,
+	}, http.StatusOK)
+	requireStatus(ctx, t, st, acceptID, model.StatusAccepted)
+	requireAudit(ctx, t, st, acceptID, model.ActionAccepted)
 
-	// re_drive re-tests clearance via a Blnk dry-run. Per finding L2 the HITL
-	// handler now loads the break's FULL external transaction and probes with a
-	// grammar-conformant matching rule built from its fields (a non-empty
-	// matching_rule_ids set is required by Blnk's start-instant), so against a
-	// live Blnk the probe succeeds and this returns 200 — writing a re_driven
-	// audit event (whether or not Blnk reports the break cleared). Only an
-	// upstream Blnk failure (rule creation or probe) surfaces as 502 (finding
-	// L2), never 500. Either outcome invokes the re_drive branch (Gate 13).
-	reDriveStatus := postDecision(ctx, t, hitlHTTP.URL, model.HITLDecision{ExternalTxnID: reDriveID, Decision: audit.DecisionReDrive, Reviewer: integrationReviewer, Note: "integration re_drive"})
-	require.Contains(t, []int{http.StatusOK, http.StatusBadGateway}, reDriveStatus, "POST /decisions re_drive must be handled (200 or 502)")
-
-	// --- Decisions must be audited (Gate 13) and accept/reject must drain HITL. ---
-	postAudit, err := st.ListAudit(ctx)
-	require.NoError(t, err, "ListAudit (post-decision)")
-	postByTxn := auditByTxn(postAudit, ids)
-	require.Truef(t, hasAction(postByTxn[acceptID], audit.ActionAccepted), "accept must write an accepted audit event (Gate 13)")
-	require.Truef(t, hasAction(postByTxn[rejectID], audit.ActionRejected), "reject must write a rejected audit event (Gate 13)")
-	if reDriveStatus == http.StatusOK {
-		require.Truef(t, hasAction(postByTxn[reDriveID], audit.ActionReDriven), "successful re_drive must write a re_driven audit event (Gate 13)")
-	}
-
-	finalHITL, err := st.ListHITL(ctx)
-	require.NoError(t, err, "ListHITL (post-decision)")
-	require.Falsef(t, inHITLQueue(finalHITL, acceptID), "accepted break %s must be dequeued from HITL", acceptID)
-	require.Falsef(t, inHITLQueue(finalHITL, rejectID), "rejected break %s must be dequeued from HITL", rejectID)
-}
-
-// ---------------------------------------------------------------------------
-// HTTP + probe assertion helpers
-// ---------------------------------------------------------------------------
-
-// scenarioID returns the run-scoped external txn id of the planted break for a
-// scenario name, or "" when none matches.
-func scenarioID(breaks []breakInput, scenario string) string {
-	for _, b := range breaks {
-		if b.spec.name == scenario {
-			return b.externalTxnID()
-		}
-	}
-	return ""
-}
-
-// postDecision submits a HITL decision as JSON to <baseURL>/decisions and returns
-// the HTTP status code.
-func postDecision(ctx context.Context, t *testing.T, baseURL string, d model.HITLDecision) int {
-	t.Helper()
-	body, err := json.Marshal(d)
-	require.NoError(t, err, "marshal decision")
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/decisions", strings.NewReader(string(body)))
-	require.NoError(t, err, "build decision request")
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err, "POST /decisions")
-	defer func() { _ = resp.Body.Close() }()
-	return resp.StatusCode
-}
-
-// assertHTTPStatus GETs url and asserts the response status equals want.
-func assertHTTPStatus(ctx context.Context, t *testing.T, url string, want int) {
-	t.Helper()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	require.NoError(t, err, "build GET request")
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err, "GET %s", url)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equalf(t, want, resp.StatusCode, "GET %s status", url)
-}
-
-// assertBreaksListed GETs the HITL /breaks JSON view and asserts every planted
-// break of this run is present.
-func assertBreaksListed(ctx context.Context, t *testing.T, url string, breaks []breakInput) {
-	t.Helper()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	require.NoError(t, err, "build GET /breaks request")
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err, "GET /breaks")
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusOK, resp.StatusCode, "GET /breaks status")
-
-	var payload struct {
-		Breaks []struct {
-			Classification struct {
-				ExternalTxnID string `json:"external_txn_id"`
-			} `json:"classification"`
-			Status string `json:"status"`
-		} `json:"breaks"`
-	}
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&payload), "decode /breaks JSON")
-
-	got := make(map[string]bool, len(payload.Breaks))
-	for _, b := range payload.Breaks {
-		got[b.Classification.ExternalTxnID] = true
-	}
-	for _, b := range breaks {
-		require.Truef(t, got[b.externalTxnID()], "GET /breaks must include run break %s", b.externalTxnID())
-	}
-}
-
-// assertProbeConfirmsClearance independently re-probes an auto-resolved break
-// with its persisted created rule and asserts Blnk's dry-run confirms clearance
-// with a non-empty recon id — the deterministic-arbiter bridge (Rule 5.3).
-func assertProbeConfirmsClearance(ctx context.Context, t *testing.T, client *blnk.Client, rows []store.Break, breaks []breakInput, externalTxnID string) {
-	t.Helper()
-	row, ok := breakByID(rows, externalTxnID)
-	require.Truef(t, ok, "resolved break %s must have a store row", externalTxnID)
-	require.NotEmptyf(t, row.CreatedRuleID, "auto-resolved break %s must record its created Blnk rule id", externalTxnID)
-
-	var input breakInput
-	found := false
-	for _, b := range breaks {
-		if b.externalTxnID() == externalTxnID {
-			input, found = b, true
-			break
-		}
-	}
-	require.Truef(t, found, "resolved break %s must be one of the planted breaks", externalTxnID)
-
-	// Re-probe an independent clone carrying the SAME reference/amount (all Blnk
-	// matches on) but a FRESH id: start-instant persists the submitted external
-	// txn by its own id with no upsert, and the remediator's auto path has already
-	// probed (hence persisted) this break's real id, so re-submitting that id
-	// would be a duplicate-key failure. The fresh-id clone yields an independent,
-	// collision-free confirmation of the identical match (see probeVerifyIDSuffix).
-	probe := input.txn()
-	probe.ID = probe.ID + probeVerifyIDSuffix
-	cleared, reconID, err := client.ProbeBreak(ctx, probe, []string{row.CreatedRuleID})
-	require.NoErrorf(t, err, "ProbeBreak dry-run for %s must succeed", externalTxnID)
-	require.Truef(t, cleared, "Blnk dry-run must confirm %s cleared (deterministic arbiter, Rule 5.3)", externalTxnID)
-	require.NotEmptyf(t, reconID, "ProbeBreak must return a confirming recon id for %s", externalTxnID)
+	postDecision(ctx, t, hitlHTTP.URL, model.HITLDecision{
+		ExternalTxnID: rejectID, Decision: "reject", Reviewer: integrationReviewer,
+	}, http.StatusOK)
+	requireStatus(ctx, t, st, rejectID, model.StatusRejected)
+	requireAudit(ctx, t, st, rejectID, model.ActionRejected)
 }

@@ -5,26 +5,30 @@ import (
 	"fmt"
 
 	"github.com/blnkfinance/recon-agent/internal/blnk"
+	"github.com/blnkfinance/recon-agent/internal/model"
 )
 
 // Blnk's accepted matching-rule grammar, confirmed in the Blnk root file
 // reconciliation.go: validateField (fields) and validateOperator (operators).
 // The agent MUST validate any LLM-proposed rule against this grammar BEFORE it
 // is ever POSTed to Blnk (Rule 5.2). Anything outside these sets is rejected so
-// an invalid rule can never reach Blnk.
+// an invalid rule can never reach Blnk. The set members are drawn from the
+// canonical grammar constants in internal/model (finding m-01) so this
+// validator, cmd's detection rule, and hitl's re_drive rule builder share one
+// vocabulary and can never diverge.
 var (
 	allowedFields = map[string]bool{
-		"amount":      true,
-		"date":        true,
-		"description": true,
-		"reference":   true,
-		"currency":    true,
+		model.FieldAmount:      true,
+		model.FieldDate:        true,
+		model.FieldDescription: true,
+		model.FieldReference:   true,
+		model.FieldCurrency:    true,
 	}
 	allowedOperators = map[string]bool{
-		"equals":       true,
-		"greater_than": true,
-		"less_than":    true,
-		"contains":     true,
+		model.OperatorEquals:      true,
+		model.OperatorGreaterThan: true,
+		model.OperatorLessThan:    true,
+		model.OperatorContains:    true,
 	}
 )
 

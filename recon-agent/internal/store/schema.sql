@@ -42,22 +42,44 @@ CREATE SCHEMA IF NOT EXISTS agent;
 -- the agent must remember the transaction it was managing in order to rebuild
 -- the single-transaction dry-run for a re_drive. They are nullable so a
 -- previously-migrated database upgrades cleanly (finding L2).
+-- source/upload_id/main_recon_id persist the break's durable provenance and
+-- correlation identity (finding M-13): the external-statement source label, the
+-- Blnk upload batch it arrived in, and the batch reconciliation run that
+-- surfaced it. Persisting source in particular fixes the re-drive bug where the
+-- rebuilt transaction carried an empty Source. resolved_recon_id records the
+-- confirming Blnk dry-run reconciliation id when (and only when) the break is
+-- auto-resolved; the agent_break_resolved_proof CHECK below makes an
+-- auto-resolved row without that proof impossible (Rule 5.3, defense-in-depth
+-- alongside the audit trail's own resolved-proof CHECK).
+--
+-- status_version is a monotonically-increasing optimistic-concurrency counter
+-- bumped on every status transition, and claimed_by/lease_expires_at implement
+-- a durable processing lease (finding M-15) so that at most one agent instance
+-- processes a given break at a time — replacing reliance on a process-local
+-- mutex, which cannot coordinate across instances.
 CREATE TABLE IF NOT EXISTS agent.agent_break (
-    external_txn_id TEXT PRIMARY KEY,
-    root_cause      TEXT NOT NULL,
-    confidence      DOUBLE PRECISION NOT NULL DEFAULT 0,
-    regulated       BOOLEAN NOT NULL DEFAULT FALSE,
-    status          TEXT NOT NULL,
-    proposed_rule   JSONB,
-    rationale       TEXT NOT NULL DEFAULT '',
-    created_rule_id TEXT,
-    amount          DOUBLE PRECISION,
-    currency        TEXT,
-    reference       TEXT,
-    description     TEXT,
-    txn_date        TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    external_txn_id   TEXT PRIMARY KEY,
+    root_cause        TEXT NOT NULL,
+    confidence        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    regulated         BOOLEAN NOT NULL DEFAULT FALSE,
+    status            TEXT NOT NULL,
+    proposed_rule     JSONB,
+    rationale         TEXT NOT NULL DEFAULT '',
+    created_rule_id   TEXT,
+    amount            DOUBLE PRECISION,
+    currency          TEXT,
+    reference         TEXT,
+    description       TEXT,
+    txn_date          TIMESTAMPTZ,
+    source            TEXT,
+    upload_id         TEXT,
+    main_recon_id     TEXT,
+    resolved_recon_id TEXT,
+    status_version    BIGINT NOT NULL DEFAULT 0,
+    claimed_by        TEXT,
+    lease_expires_at  TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Upgrade path: add the newer columns to a pre-existing agent_break table.
@@ -70,6 +92,59 @@ ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS currency TEXT;
 ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS reference TEXT;
 ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS txn_date TIMESTAMPTZ;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS upload_id TEXT;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS main_recon_id TEXT;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS resolved_recon_id TEXT;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS status_version BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS claimed_by TEXT;
+ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+
+-- Domain / finiteness / resolved-proof integrity for agent_break (finding
+-- M-13). CHECK constraints are added via guarded DO blocks because Postgres has
+-- no "ADD CONSTRAINT IF NOT EXISTS": the block adds the constraint once and
+-- swallows duplicate_object on every subsequent (idempotent) Migrate. The
+-- confidence bound rejects NaN/±Inf as well as out-of-range values because in
+-- Postgres NaN sorts greater than every value (so NaN <= 1 is false) and ±Inf
+-- fails one of the bounds. The resolved-proof constraint makes an auto-resolved
+-- break without a confirming reconciliation id impossible.
+DO $agent_break_checks$
+BEGIN
+    ALTER TABLE agent.agent_break
+        ADD CONSTRAINT agent_break_confidence_range
+        CHECK (confidence >= 0 AND confidence <= 1);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$agent_break_checks$;
+
+DO $agent_break_root_cause$
+BEGIN
+    ALTER TABLE agent.agent_break
+        ADD CONSTRAINT agent_break_root_cause_domain
+        CHECK (root_cause IN ('timing', 'amount_drift', 'reference_mismatch',
+                              'duplicate', 'missing_internal', 'currency_mismatch', 'unknown'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$agent_break_root_cause$;
+
+DO $agent_break_status$
+BEGIN
+    ALTER TABLE agent.agent_break
+        ADD CONSTRAINT agent_break_status_domain
+        CHECK (status IN ('classified', 'auto-resolved', 'queued', 'accepted', 're_driven', 'rejected'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$agent_break_status$;
+
+DO $agent_break_resolved_proof$
+BEGIN
+    ALTER TABLE agent.agent_break
+        ADD CONSTRAINT agent_break_resolved_proof
+        CHECK (status <> 'auto-resolved'
+               OR (resolved_recon_id IS NOT NULL AND length(btrim(resolved_recon_id)) > 0));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$agent_break_resolved_proof$;
 
 -- agent.agent_audit is the append-only action ledger (Rule 5.5). No UPDATE or
 -- DELETE statement may ever target this table; only INSERT and SELECT.
@@ -84,6 +159,64 @@ CREATE TABLE IF NOT EXISTS agent.agent_audit (
     provenance      JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
+-- Domain / evidence integrity for the append-only audit ledger (finding M-13),
+-- enforced at the database boundary as defense-in-depth behind the application
+-- validator in internal/audit. Each constraint is added via a guarded DO block
+-- for idempotency (no "ADD CONSTRAINT IF NOT EXISTS" exists). Because agent_audit
+-- is append-only (its trigger blocks UPDATE/DELETE) the constraints are added
+-- NOT VALID: they are enforced on every future INSERT but the initial existence
+-- scan of any pre-existing rows is skipped, so Migrate can never fail on legacy
+-- data it is forbidden to rewrite. The action domain matches the closed set in
+-- internal/audit; the resolved-proof constraint refuses any 'resolved' event
+-- without a confirming reconciliation id in its provenance (Rule 5.3); the
+-- rationale constraint requires a non-empty justification on every event.
+-- The action domain is (re)established via DROP-then-ADD rather than the guarded
+-- ADD ... EXCEPTION-WHEN-duplicate pattern used by the other constraints. The
+-- closed action set grew over time (finding M-11 added 'rule_compensated' to
+-- durably record orphaned-rule cleanup outcomes), and a plain guarded ADD would
+-- silently keep a stale, narrower domain on any database migrated before the set
+-- expanded. Dropping first makes Migrate converge the constraint to the CURRENT
+-- domain on every boot. This is safe under concurrency because Migrate runs the
+-- whole Up section inside one transaction holding the migration advisory lock, so
+-- no two migrations execute this DDL at the same time; and it is still added
+-- NOT VALID so the scan of any pre-existing rows is skipped (agent_audit is
+-- append-only and must never be rewritten).
+ALTER TABLE agent.agent_audit DROP CONSTRAINT IF EXISTS agent_audit_action_domain;
+ALTER TABLE agent.agent_audit
+    ADD CONSTRAINT agent_audit_action_domain
+    CHECK (action IN ('classified', 'rule_proposed', 'rule_created', 'probed',
+                      'resolved', 'escalated', 'accepted', 're_driven', 'rejected',
+                      'rule_compensated')) NOT VALID;
+
+DO $agent_audit_confidence$
+BEGIN
+    ALTER TABLE agent.agent_audit
+        ADD CONSTRAINT agent_audit_confidence_range
+        CHECK (confidence >= 0 AND confidence <= 1) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$agent_audit_confidence$;
+
+DO $agent_audit_rationale$
+BEGIN
+    ALTER TABLE agent.agent_audit
+        ADD CONSTRAINT agent_audit_rationale_nonempty
+        CHECK (length(btrim(rationale)) > 0) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$agent_audit_rationale$;
+
+DO $agent_audit_resolved_proof$
+BEGIN
+    ALTER TABLE agent.agent_audit
+        ADD CONSTRAINT agent_audit_resolved_proof
+        CHECK (action <> 'resolved'
+               OR ((provenance ->> 'recon_id') IS NOT NULL
+                   AND length(btrim(provenance ->> 'recon_id')) > 0)) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$agent_audit_resolved_proof$;
+
 -- agent.agent_hitl_queue holds breaks awaiting a human decision (low
 -- confidence, regulated, or fail-closed). It is drained by the HITL handlers.
 CREATE TABLE IF NOT EXISTS agent.agent_hitl_queue (
@@ -92,9 +225,89 @@ CREATE TABLE IF NOT EXISTS agent.agent_hitl_queue (
     enqueued_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- agent.agent_rule_outbox is the durable compensation ledger for the one
+-- external, non-transactional side effect the agent performs: creating a Blnk
+-- matching rule while auto-remediating a break (findings M-12 / M-11). Creating
+-- the rule is an HTTP POST that cannot participate in a database transaction, so
+-- a crash in the window between "rule created in Blnk" and "break durably
+-- resolved" would otherwise strand an orphaned rule the agent has forgotten. To
+-- make compensation crash-safe, the remediator records a 'pending' outbox row in
+-- the SAME transaction that persists the created rule id and its rule_created
+-- audit event; it flips the row to 'confirmed' in the SAME transaction that
+-- marks the break auto-resolved (the rule legitimately did its job), or — when
+-- the attempt aborts — deletes the rule from Blnk and marks the row
+-- 'compensated'. On startup the remediator scans 'pending' rows (whose owning
+-- attempt never confirmed) and compensates them, recording last_error/attempts
+-- and surfacing a persistent failure as 'compensation_failed'. Unlike
+-- agent_audit this table is intentionally mutable (Rule 5.5 protects only the
+-- audit ledger); every compensation OUTCOME is additionally written to the
+-- append-only audit trail.
+CREATE TABLE IF NOT EXISTS agent.agent_rule_outbox (
+    id              BIGSERIAL PRIMARY KEY,
+    external_txn_id TEXT NOT NULL,
+    rule_id         TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Constrain the outbox status to its closed lifecycle domain. Added via a
+-- guarded DO block (Postgres lacks "ADD CONSTRAINT IF NOT EXISTS") so Migrate
+-- stays idempotent.
+DO $agent_rule_outbox_status$
+BEGIN
+    ALTER TABLE agent.agent_rule_outbox
+        ADD CONSTRAINT agent_rule_outbox_status_domain
+        CHECK (status IN ('pending', 'confirmed', 'compensated', 'compensation_failed'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$agent_rule_outbox_status$;
+
+-- agent.agent_run is the durable run-idempotency ledger (finding M-15). Serve
+-- mode runs the seed fixture through the pipeline on startup; without a durable
+-- marker a process restart would reprocess the SAME fixture under fresh random
+-- scoped ids, permanently duplicating the break/audit history and inflating the
+-- demo summary on every restart. Each distinct fixture (identified by
+-- fixture_key, a deterministic content hash of the ingested CSV plus its source
+-- label) gets exactly one row. BeginRun inserts a 'running' row the first time a
+-- fixture is seen and records the scoped run_id it chose; CompleteRun flips that
+-- row to 'completed' once the pipeline finishes. On a later boot BeginRun finds
+-- the existing row: if 'completed' it reports alreadyCompleted=true (returning
+-- the recorded run_id so the summary can be rebuilt from that run's rows without
+-- reprocessing); if still 'running' (a crash mid-pipeline) it hands back the
+-- SAME recorded run_id so the retry reuses the original id set rather than
+-- forking a new duplicate history. The row is intentionally mutable (Rule 5.5
+-- protects only agent_audit); every break state change it gates is still written
+-- through the append-only audit trail.
+CREATE TABLE IF NOT EXISTS agent.agent_run (
+    fixture_key TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'running',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Constrain the run status to its closed lifecycle domain. Guarded DO block for
+-- idempotency (Postgres lacks "ADD CONSTRAINT IF NOT EXISTS").
+DO $agent_run_status$
+BEGIN
+    ALTER TABLE agent.agent_run
+        ADD CONSTRAINT agent_run_status_domain
+        CHECK (status IN ('running', 'completed'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$agent_run_status$;
+
 CREATE INDEX IF NOT EXISTS idx_agent_break_status ON agent.agent_break (status);
 CREATE INDEX IF NOT EXISTS idx_agent_audit_external_txn_id ON agent.agent_audit (external_txn_id);
 CREATE INDEX IF NOT EXISTS idx_agent_audit_timestamp ON agent.agent_audit ("timestamp");
+-- Partial index over just the 'pending' outbox rows: startup compensation
+-- recovery scans only this small, transient set, never the confirmed/compensated
+-- history that accumulates over time.
+CREATE INDEX IF NOT EXISTS idx_agent_rule_outbox_pending
+    ON agent.agent_rule_outbox (created_at) WHERE status = 'pending';
 
 -- Rule 5.5 (defense-in-depth): enforce the append-only invariant at the
 -- database boundary, not merely by application convention. A BEFORE trigger
@@ -126,9 +339,12 @@ $ensure_trigger$;
 -- +migrate Down
 DROP TRIGGER IF EXISTS agent_audit_no_mutate ON agent.agent_audit;
 DROP FUNCTION IF EXISTS agent.agent_audit_reject_mutation();
+DROP INDEX IF EXISTS agent.idx_agent_rule_outbox_pending;
 DROP INDEX IF EXISTS agent.idx_agent_audit_timestamp;
 DROP INDEX IF EXISTS agent.idx_agent_audit_external_txn_id;
 DROP INDEX IF EXISTS agent.idx_agent_break_status;
+DROP TABLE IF EXISTS agent.agent_run CASCADE;
+DROP TABLE IF EXISTS agent.agent_rule_outbox CASCADE;
 DROP TABLE IF EXISTS agent.agent_hitl_queue CASCADE;
 DROP TABLE IF EXISTS agent.agent_audit CASCADE;
 DROP TABLE IF EXISTS agent.agent_break CASCADE;

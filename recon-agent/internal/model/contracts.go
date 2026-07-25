@@ -66,6 +66,28 @@ type Provenance struct {
 	// Source is the external-statement source label (e.g. the bank name).
 	Source string `json:"source"`
 
+	// The following identity fields (finding M-13) let the append-only trail
+	// prove and reconstruct the EXACT transaction lifecycle end-to-end, not just
+	// the final clearance. They are optional (omitempty) so an event that does
+	// not concern a given stage simply omits the corresponding id.
+
+	// MainReconID is the id of the batch reconciliation run over the persisted
+	// upload that surfaced this break. It is DISTINCT from ReconID, which is the
+	// per-break single-transaction dry-run that confirms an individual
+	// clearance: MainReconID anchors the break to the run that produced it,
+	// while ReconID proves that one break cleared (Rule 5.3).
+	MainReconID string `json:"main_recon_id,omitempty"`
+	// RunID correlates every event emitted during a single agent pipeline run,
+	// so the complete set of actions for one execution can be reconstructed even
+	// across many breaks.
+	RunID string `json:"run_id,omitempty"`
+	// ProbeTxnID is the ephemeral external-transaction id the agent submitted to
+	// Blnk's single-transaction dry-run to probe/confirm this break. The agent
+	// uses a fresh probe-<uuid> id to avoid colliding with Blnk's
+	// external_transactions primary key, so recording it is the ONLY way to tie
+	// a probe/confirmation back to the real break it stands in for.
+	ProbeTxnID string `json:"probe_txn_id,omitempty"`
+
 	// The following fields carry the machine-readable audit evidence stamped by
 	// the internal/audit builders so the append-only trail is fully
 	// self-describing and queryable (not buried in free-text rationale). They

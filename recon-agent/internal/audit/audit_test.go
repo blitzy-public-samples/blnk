@@ -266,6 +266,186 @@ func TestRecord_ValidationErrors(t *testing.T) {
 	}
 }
 
+// -----------------------------------------------------------------------------
+// M-12: non-empty rationale + action-specific provenance validation
+// -----------------------------------------------------------------------------
+
+// TestRecord_RejectsEmptyRationale proves a directly-constructed event with no
+// rationale is rejected (finding M-12: every action must explain WHY). The
+// builders synthesize a default, so this guards the raw Record path.
+func TestRecord_RejectsEmptyRationale(t *testing.T) {
+	for _, r := range []string{"", "   ", "\t\n"} {
+		fs := &recordingSink{}
+		w, _ := New(fs)
+		ev := validEvent()
+		ev.Rationale = r
+		if err := w.Record(context.Background(), ev); !errors.Is(err, ErrEmptyRationale) {
+			t.Fatalf("rationale %q: want ErrEmptyRationale, got %v", r, err)
+		}
+		if len(fs.events) != 0 {
+			t.Fatal("an event with no rationale must not be written")
+		}
+	}
+}
+
+// TestRecord_ActionSpecificProvenance proves each action is rejected when it
+// lacks the machine-readable evidence its action requires, and accepted once
+// that evidence is present (finding M-12). Events are built directly (not via
+// the evidence-stamping builders) so the validation itself is exercised.
+func TestRecord_ActionSpecificProvenance(t *testing.T) {
+	base := func(action string, prov model.Provenance) model.AuditEvent {
+		return model.AuditEvent{
+			ExternalTxnID: "EXT-100",
+			Actor:         ActorAgent,
+			Action:        action,
+			Rationale:     "non-empty rationale",
+			Confidence:    0.5,
+			Provenance:    prov,
+		}
+	}
+	cases := []struct {
+		name    string
+		missing model.AuditEvent
+		wantErr error
+		present model.AuditEvent
+	}{
+		{
+			name:    "classified requires model",
+			missing: base(ActionClassified, model.Provenance{Source: "bank-x"}),
+			wantErr: ErrMissingProvenance,
+			present: base(ActionClassified, model.Provenance{Model: "kimi-k3"}),
+		},
+		{
+			name:    "rule_proposed requires rule_field",
+			missing: base(ActionRuleProposed, model.Provenance{RuleID: "rule_1"}),
+			wantErr: ErrMissingProvenance,
+			present: base(ActionRuleProposed, model.Provenance{RuleField: "amount"}),
+		},
+		{
+			name:    "rule_created requires rule_id",
+			missing: base(ActionRuleCreated, model.Provenance{RuleField: "amount"}),
+			wantErr: ErrMissingProvenance,
+			present: base(ActionRuleCreated, model.Provenance{RuleID: "rule_1"}),
+		},
+		{
+			name:    "probed requires recon_id",
+			missing: base(ActionProbed, model.Provenance{}),
+			wantErr: ErrMissingProvenance,
+			present: base(ActionProbed, model.Provenance{ReconID: "recon_p"}),
+		},
+		{
+			// resolved keeps its own distinct sentinel (Rule 5.3 deterministic
+			// arbiter proof) rather than the generic missing-provenance error.
+			name:    "resolved requires recon_id (distinct sentinel)",
+			missing: base(ActionResolved, model.Provenance{Model: "kimi-k3"}),
+			wantErr: ErrEmptyReconID,
+			present: base(ActionResolved, model.Provenance{ReconID: "recon_r"}),
+		},
+		{
+			// rule_compensated (finding M-11) names the exact rule that was
+			// deleted (or failed to delete) via its rule_id, so the compensation
+			// trail is traceable to a specific Blnk rule.
+			name:    "rule_compensated requires rule_id",
+			missing: base(ActionRuleCompensated, model.Provenance{Model: "kimi-k3"}),
+			wantErr: ErrMissingProvenance,
+			present: base(ActionRuleCompensated, model.Provenance{RuleID: "rule_1"}),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &recordingSink{}
+			w, _ := New(fs)
+			if err := w.Record(context.Background(), tc.missing); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("missing evidence: want %v, got %v", tc.wantErr, err)
+			}
+			if len(fs.events) != 0 {
+				t.Fatal("an under-attributed event must not be written")
+			}
+			if err := w.Record(context.Background(), tc.present); err != nil {
+				t.Fatalf("present evidence: unexpected error %v", err)
+			}
+			if len(fs.events) != 1 {
+				t.Fatal("a fully-attributed event must be written")
+			}
+		})
+	}
+}
+
+// TestRecord_ActionsWithoutExtraProvenance proves the actions that intentionally
+// require no extra provenance (finding M-12 / m-04) are accepted with only the
+// required actor + rationale: a probe-error escalation carries no model, and a
+// "not cleared" re_driven decision carries no recon_id.
+func TestRecord_ActionsWithoutExtraProvenance(t *testing.T) {
+	for _, action := range []string{ActionEscalated, ActionAccepted, ActionReDriven, ActionRejected} {
+		fs := &recordingSink{}
+		w, _ := New(fs)
+		ev := model.AuditEvent{
+			ExternalTxnID: "EXT-101",
+			Actor:         "alice", // reviewer for decisions; agent for escalated
+			Action:        action,
+			Rationale:     "decided",
+			Confidence:    0,
+			Provenance:    model.Provenance{}, // deliberately bare
+		}
+		if err := w.Record(context.Background(), ev); err != nil {
+			t.Fatalf("action %q with only actor+rationale must be recordable, got %v", action, err)
+		}
+		if len(fs.events) != 1 {
+			t.Fatalf("action %q must be written", action)
+		}
+	}
+}
+
+// TestBuilders_SynthesizeDefaultRationale proves each builder that accepts a
+// caller rationale substitutes a non-empty default when given none, so the
+// resulting event passes the M-12 non-empty-rationale rule and is recordable.
+func TestBuilders_SynthesizeDefaultRationale(t *testing.T) {
+	proof, err := NewClearanceProof("recon_x", true)
+	if err != nil {
+		t.Fatalf("NewClearanceProof: %v", err)
+	}
+	events := map[string]model.AuditEvent{
+		"classified": Classified(
+			model.BreakClassification{ExternalTxnID: "EXT-200", RootCause: model.RootCauseTiming, Confidence: 0.9},
+			model.Provenance{Model: "kimi-k3"},
+		),
+		"resolved":  Resolved("EXT-201", "", 0.9, model.Provenance{Model: "kimi-k3"}, proof),
+		"escalated": Escalated("EXT-202", "", 0.3, model.Provenance{}),
+		"decision":  Decision(model.HITLDecision{ExternalTxnID: "EXT-203", Decision: DecisionAccept, Reviewer: "alice"}, model.Provenance{}),
+	}
+	for name, ev := range events {
+		if strings.TrimSpace(ev.Rationale) == "" {
+			t.Fatalf("%s: builder must synthesize a non-empty default rationale", name)
+		}
+		fs := &recordingSink{}
+		w, _ := New(fs)
+		if err := w.Record(context.Background(), ev); err != nil {
+			t.Fatalf("%s: default-rationale event must be recordable, got %v", name, err)
+		}
+	}
+	// The synthesized defaults are informative, not generic placeholders.
+	if !strings.Contains(events["classified"].Rationale, "timing") {
+		t.Fatalf("classified default should name the root cause: %q", events["classified"].Rationale)
+	}
+	// A classification with neither rationale NOR root cause still yields a
+	// non-empty, recordable rationale that names the unknown root cause.
+	blank := Classified(model.BreakClassification{ExternalTxnID: "EXT-204"}, model.Provenance{Model: "kimi-k3"})
+	if !strings.Contains(blank.Rationale, string(model.RootCauseUnknown)) {
+		t.Fatalf("classified default with no root cause should name %q: %q", model.RootCauseUnknown, blank.Rationale)
+	}
+	blankSink := &recordingSink{}
+	blankWriter, _ := New(blankSink)
+	if err := blankWriter.Record(context.Background(), blank); err != nil {
+		t.Fatalf("blank-classification default must be recordable: %v", err)
+	}
+	if !strings.Contains(events["resolved"].Rationale, "recon_x") {
+		t.Fatalf("resolved default should name the confirming recon id: %q", events["resolved"].Rationale)
+	}
+	if !strings.Contains(events["decision"].Rationale, DecisionAccept) {
+		t.Fatalf("decision default should name the verb: %q", events["decision"].Rationale)
+	}
+}
+
 func TestRecord_PropagatesSinkError(t *testing.T) {
 	sentinel := errors.New("db down")
 	fs := &recordingSink{err: sentinel}
@@ -486,6 +666,48 @@ func TestRuleProposedAndCreated(t *testing.T) {
 		if err := w.Record(context.Background(), ev); err != nil {
 			t.Fatalf("Record rule event: %v", err)
 		}
+	}
+}
+
+// TestRuleCompensated covers the finding M-11 audit builder that records the
+// OUTCOME of compensating a rule the agent created for a non-clearing attempt.
+// The compensated rule's id is stamped into provenance; a successful delete and
+// a FAILED delete each synthesize a self-describing default rationale (the
+// failure one flagging manual cleanup — the durable failure evidence M-11
+// requires); and a caller-supplied rationale is preserved.
+func TestRuleCompensated(t *testing.T) {
+	fs := &recordingSink{}
+	w, _ := New(fs)
+
+	// Successful deletion.
+	del := RuleCompensated("EXT-011", "rule_1", true, "", 0.9, model.Provenance{Model: "kimi-k3"})
+	if del.Action != ActionRuleCompensated || del.Actor != ActorAgent {
+		t.Fatalf("unexpected action/actor: %+v", del)
+	}
+	if del.Provenance.RuleID != "rule_1" {
+		t.Fatalf("compensated rule id must be stamped into provenance: %+v", del.Provenance)
+	}
+	if !strings.Contains(del.Rationale, "rule_1") {
+		t.Fatalf("deleted default rationale should name the rule: %q", del.Rationale)
+	}
+	if err := w.Record(context.Background(), del); err != nil {
+		t.Fatalf("Record compensated (deleted): %v", err)
+	}
+
+	// FAILED deletion — the default rationale must flag that the orphan may still
+	// exist and needs manual cleanup.
+	failed := RuleCompensated("EXT-012", "rule_2", false, "", 0.9, model.Provenance{Model: "kimi-k3"})
+	if !strings.Contains(strings.ToLower(failed.Rationale), "manual cleanup") {
+		t.Fatalf("failed default rationale must flag manual cleanup: %q", failed.Rationale)
+	}
+	if err := w.Record(context.Background(), failed); err != nil {
+		t.Fatalf("Record compensated (failed): %v", err)
+	}
+
+	// A caller-supplied rationale is preserved verbatim.
+	custom := RuleCompensated("EXT-013", "rule_3", true, "custom reason", 0.9, model.Provenance{Model: "kimi-k3"})
+	if custom.Rationale != "custom reason" {
+		t.Fatalf("caller rationale must be preserved, got %q", custom.Rationale)
 	}
 }
 

@@ -11,12 +11,15 @@ import (
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	// lib/pq registers the "postgres" database/sql driver via its init side
-	// effect. It is the ONLY external dependency of this package.
-	_ "github.com/lib/pq"
+	// effect and provides pq.Array for binding a text[] parameter (used by the
+	// database-side current-run aggregation queries). It is the ONLY external
+	// dependency of this package.
+	"github.com/lib/pq"
 
 	"github.com/blnkfinance/recon-agent/internal/blnk"
 	"github.com/blnkfinance/recon-agent/internal/model"
@@ -39,6 +42,63 @@ var ErrNotFound = errors.New("store: record not found")
 // failure signal backing the queued-only guard (finding M-01); handleDecision
 // maps it to 409 Conflict.
 var ErrNotQueued = errors.New("store: break is not awaiting review")
+
+// ErrLeaseNotHeld is returned by ReleaseBreak (and Claim-release paths) when the
+// caller tries to release a processing lease it does not currently own — either
+// because the row is unclaimed, was claimed by a different owner, or the lease
+// already expired and was reclaimed. It is part of the durable, cross-instance
+// concurrency control that replaces the process-local mutex (finding M-15).
+var ErrLeaseNotHeld = errors.New("store: processing lease is not held by this owner")
+
+// Pagination bounds for the list endpoints (finding M-14). Every list query is
+// bounded so an unbounded audit/break history can never be streamed into memory
+// in a single call. A caller may request a specific page via the *Page methods;
+// the zero Page (or any Limit <= 0) yields defaultPageLimit rows, and any
+// requested Limit is capped at maxPageLimit.
+const (
+	defaultPageLimit = 500
+	maxPageLimit     = 5000
+)
+
+// Page is a bounded pagination request. Limit <= 0 selects defaultPageLimit;
+// a Limit above maxPageLimit is clamped to maxPageLimit. Offset < 0 is treated
+// as 0. normalize applies these rules so no caller can request an unbounded or
+// negative window.
+type Page struct {
+	Limit  int
+	Offset int
+}
+
+// normalize clamps a Page to the enforced bounds. It is total: every input maps
+// to a valid (Limit in [1,maxPageLimit], Offset >= 0) window.
+func (p Page) normalize() Page {
+	out := p
+	if out.Limit <= 0 {
+		out.Limit = defaultPageLimit
+	}
+	if out.Limit > maxPageLimit {
+		out.Limit = maxPageLimit
+	}
+	if out.Offset < 0 {
+		out.Offset = 0
+	}
+	return out
+}
+
+// defaultLeaseTTL is the default duration a processing lease is held before it
+// is considered expired and eligible for reclamation by another instance. It
+// bounds how long a crashed instance can block reprocessing of a break.
+const defaultLeaseTTL = 2 * time.Minute
+
+// migrateLockTimeout bounds how long Migrate waits to acquire the boot-migration
+// advisory lock before giving up (finding M-16). A try-lock retry loop honors
+// both this ceiling and the caller's context deadline, so a stuck peer holding
+// the lock can never make Migrate block indefinitely.
+const migrateLockTimeout = 30 * time.Second
+
+// migrateLockRetryInterval is how long the try-lock loop sleeps between failed
+// acquisition attempts.
+const migrateLockRetryInterval = 100 * time.Millisecond
 
 // Break is one external break under management as persisted in
 // agent.agent_break. It carries the classifier's verdict plus the agent's
@@ -71,6 +131,52 @@ type HITLItem struct {
 	Reason        string    `json:"reason"`
 	EnqueuedAt    time.Time `json:"enqueued_at"`
 }
+
+// RuleOutboxItem is one durable compensation-ledger entry from
+// agent.agent_rule_outbox (findings M-12 / M-11): a Blnk matching rule the agent
+// created that must be either confirmed (the break resolved) or compensated (the
+// rule deleted from Blnk). ListPendingRuleOutbox returns the 'pending' rows a
+// crashed attempt left behind so the remediator can compensate them on startup.
+type RuleOutboxItem struct {
+	ID            int64     `json:"id"`
+	ExternalTxnID string    `json:"external_txn_id"`
+	RuleID        string    `json:"rule_id"`
+	Status        string    `json:"status"`
+	Attempts      int       `json:"attempts"`
+	LastError     string    `json:"last_error,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// Rule-outbox lifecycle status values (findings M-12 / M-11). They mirror the
+// agent_rule_outbox_status_domain CHECK constraint in schema.sql.
+const (
+	// OutboxPending marks a created Blnk rule whose owning remediation attempt
+	// has not yet confirmed (break resolved) or compensated (rule deleted). A
+	// pending row surviving a restart indicates a crash mid-attempt.
+	OutboxPending = "pending"
+	// OutboxConfirmed marks a rule that legitimately cleared its break: the
+	// break reached auto-resolved in the same transaction that confirmed it.
+	OutboxConfirmed = "confirmed"
+	// OutboxCompensated marks a rule the agent successfully deleted from Blnk
+	// after its attempt aborted, leaving no orphan behind.
+	OutboxCompensated = "compensated"
+	// OutboxCompensationFailed marks a rule whose deletion from Blnk repeatedly
+	// failed; last_error/attempts capture why, and the failure is also audited.
+	OutboxCompensationFailed = "compensation_failed"
+)
+
+const (
+	// RunRunning marks an agent_run row whose pipeline has begun but not yet
+	// finished. A running row surviving a restart indicates a crash mid-pipeline
+	// (finding M-15); BeginRun hands the original run_id back so the retry reuses
+	// the same scoped id set instead of forking a duplicate history.
+	RunRunning = "running"
+	// RunCompleted marks a fixture whose pipeline finished. BeginRun reports
+	// alreadyCompleted for such a fixture so a serve restart rebuilds the summary
+	// from the recorded run rather than reprocessing the fixture (finding M-15).
+	RunCompleted = "completed"
+)
 
 // Store is the sole PostgreSQL gateway for the recon-agent. Every statement it
 // issues targets the agent schema; no blnk.* table is ever read or written.
@@ -142,8 +248,19 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if strings.TrimSpace(up) == "" {
 		return errors.New("store: migration has no Up section")
 	}
+	// M-16: bound the wait for the migration lock. If the caller's context has
+	// no deadline, impose migrateLockTimeout so that a peer holding the lock (or
+	// a stuck migration) can never make Migrate block forever.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, migrateLockTimeout)
+		defer cancel()
+	}
 	return s.WithTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", migrateAdvisoryLockKey); err != nil {
+		// Acquire the transaction-scoped advisory lock with a bounded try-lock
+		// retry loop rather than the blocking pg_advisory_xact_lock, so the wait
+		// is capped by the context deadline above (finding M-16).
+		if err := acquireMigrateLock(ctx, tx); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, up); err != nil {
@@ -151,6 +268,30 @@ func (s *Store) Migrate(ctx context.Context) error {
 		}
 		return nil
 	})
+}
+
+// acquireMigrateLock takes the transaction-scoped advisory lock, retrying on
+// contention until it succeeds or ctx is done (finding M-16). It uses the
+// NON-blocking pg_try_advisory_xact_lock so a stuck holder cannot make this
+// block past the caller's deadline; the lock releases automatically on the
+// enclosing transaction's COMMIT/ROLLBACK. Retrying in the same transaction is
+// safe because the lock is not yet held by this backend until the call returns
+// true.
+func acquireMigrateLock(ctx context.Context, tx *sql.Tx) error {
+	for {
+		var got bool
+		if err := tx.QueryRowContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", migrateAdvisoryLockKey).Scan(&got); err != nil {
+			return err
+		}
+		if got {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("store: timed out acquiring migration advisory lock: %w", ctx.Err())
+		case <-time.After(migrateLockRetryInterval):
+		}
+	}
 }
 
 // upSection returns the text of a migration's Up block: everything between a
@@ -217,8 +358,8 @@ func (s *Store) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 // rule id a prior attempt already recorded.
 const upsertBreakSQL = `INSERT INTO agent.agent_break
 	(external_txn_id, root_cause, confidence, regulated, status, proposed_rule, rationale,
-	 amount, currency, reference, description, txn_date)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	 amount, currency, reference, description, txn_date, source, upload_id, main_recon_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 ON CONFLICT (external_txn_id) DO UPDATE SET
 	root_cause = EXCLUDED.root_cause,
 	confidence = EXCLUDED.confidence,
@@ -231,16 +372,37 @@ ON CONFLICT (external_txn_id) DO UPDATE SET
 	reference = EXCLUDED.reference,
 	description = EXCLUDED.description,
 	txn_date = EXCLUDED.txn_date,
+	source = COALESCE(EXCLUDED.source, agent.agent_break.source),
+	upload_id = COALESCE(EXCLUDED.upload_id, agent.agent_break.upload_id),
+	main_recon_id = COALESCE(EXCLUDED.main_recon_id, agent.agent_break.main_recon_id),
+	status_version = agent.agent_break.status_version + 1,
 	updated_at = now()`
+
+// nullIfEmpty returns SQL NULL (nil) for an empty/whitespace-only string, else
+// the string itself. It keeps optional provenance columns NULL rather than
+// storing empty strings, so the COALESCE-on-conflict logic in upsertBreakSQL
+// can preserve a previously-persisted value across a later upsert that carries
+// no provenance (e.g. a crash-resume re-upsert).
+func nullIfEmpty(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return s
+}
 
 // upsertBreak is the single definition of the break-upsert write, shared by the
 // autocommit UpsertBreak and the transactional UpsertBreakTx via sqlExecer. The
 // txn argument carries the matchable fields of the original external transaction
-// (amount/currency/reference/description/date); they are persisted so a queued
-// break can be re-driven from the HITL surface without reading any blnk.* table
-// (finding L2, Rule 5.1). txn_date is stored as SQL NULL when the transaction
-// carries no date, so the column faithfully round-trips a zero date.
-func upsertBreak(ctx context.Context, ex sqlExecer, c model.BreakClassification, txn blnk.ExternalTransaction, status string) error {
+// (amount/currency/reference/description/date) AND its source label; they are
+// persisted so a queued break can be re-driven from the HITL surface without
+// reading any blnk.* table (finding L2/M-13, Rule 5.1). prov supplies the
+// break's durable correlation identity — the upload batch and the batch
+// reconciliation run that surfaced it (finding M-13). txn_date and the optional
+// provenance columns are stored as SQL NULL when empty, so the columns
+// faithfully round-trip absence and a later upsert cannot wipe a value a prior
+// one recorded. Every ON CONFLICT update bumps status_version (finding M-15) so
+// concurrent processors observe a monotonically-advancing optimistic counter.
+func upsertBreak(ctx context.Context, ex sqlExecer, c model.BreakClassification, txn blnk.ExternalTransaction, prov model.Provenance, status string) error {
 	var rule any
 	if c.ProposedRule != nil {
 		encoded, err := json.Marshal(c.ProposedRule)
@@ -266,24 +428,29 @@ func upsertBreak(ctx context.Context, ex sqlExecer, c model.BreakClassification,
 		txn.Reference,
 		txn.Description,
 		txnDate,
+		nullIfEmpty(txn.Source),
+		nullIfEmpty(prov.UploadID),
+		nullIfEmpty(prov.MainReconID),
 	)
 	return err
 }
 
 // UpsertBreak inserts or updates a break in autocommit mode. txn supplies the
-// original transaction's matchable fields to persist alongside the verdict.
-func (s *Store) UpsertBreak(ctx context.Context, c model.BreakClassification, txn blnk.ExternalTransaction, status string) error {
-	return upsertBreak(ctx, s.db, c, txn, status)
+// original transaction's matchable fields and source; prov supplies the upload
+// and main-reconciliation correlation identity persisted alongside the verdict.
+func (s *Store) UpsertBreak(ctx context.Context, c model.BreakClassification, txn blnk.ExternalTransaction, prov model.Provenance, status string) error {
+	return upsertBreak(ctx, s.db, c, txn, prov, status)
 }
 
 // UpsertBreakTx inserts or updates a break inside the caller's transaction so it
 // commits atomically with the accompanying audit event. txn supplies the
-// original transaction's matchable fields to persist alongside the verdict.
-func (s *Store) UpsertBreakTx(ctx context.Context, tx *sql.Tx, c model.BreakClassification, txn blnk.ExternalTransaction, status string) error {
-	return upsertBreak(ctx, tx, c, txn, status)
+// original transaction's matchable fields and source; prov supplies the upload
+// and main-reconciliation correlation identity persisted alongside the verdict.
+func (s *Store) UpsertBreakTx(ctx context.Context, tx *sql.Tx, c model.BreakClassification, txn blnk.ExternalTransaction, prov model.Provenance, status string) error {
+	return upsertBreak(ctx, tx, c, txn, prov, status)
 }
 
-const setBreakStatusSQL = `UPDATE agent.agent_break SET status = $2, updated_at = now() WHERE external_txn_id = $1`
+const setBreakStatusSQL = `UPDATE agent.agent_break SET status = $2, status_version = status_version + 1, updated_at = now() WHERE external_txn_id = $1`
 
 // setBreakStatus is the single definition of the status-update write, shared by
 // SetBreakStatus and SetBreakStatusTx via sqlExecer.
@@ -314,8 +481,40 @@ func (s *Store) SetBreakStatusTx(ctx context.Context, tx *sql.Tx, externalTxnID,
 	return setBreakStatus(ctx, tx, externalTxnID, status)
 }
 
+const markResolvedSQL = `UPDATE agent.agent_break
+SET status = 'auto-resolved', resolved_recon_id = $2, status_version = status_version + 1, updated_at = now()
+WHERE external_txn_id = $1`
+
+// MarkResolvedTx transitions a break to the auto-resolved terminal state inside
+// the caller's transaction, durably recording the confirming Blnk dry-run
+// reconciliation id (Rule 5.3, finding M-13) that proves clearance. The
+// reconciliation id MUST be non-empty: the agent_break_resolved_proof CHECK
+// constraint rejects an auto-resolved row without it, and the remediator only
+// ever calls this with a proven ClearanceProof reconciliation id. It bumps
+// status_version (finding M-15) and returns ErrNotFound when no row matches.
+// Using this dedicated transition (rather than SetBreakStatusTx) guarantees the
+// durable resolved-proof column is populated atomically with the status change
+// and its accompanying resolved audit event.
+func (s *Store) MarkResolvedTx(ctx context.Context, tx *sql.Tx, externalTxnID, reconID string) error {
+	if strings.TrimSpace(reconID) == "" {
+		return fmt.Errorf("store: MarkResolvedTx requires a non-empty confirming reconciliation id")
+	}
+	res, err := tx.ExecContext(ctx, markResolvedSQL, externalTxnID, reconID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 const setBreakStatusFromQueuedSQL = `UPDATE agent.agent_break
-SET status = $2, updated_at = now()
+SET status = $2, status_version = status_version + 1, updated_at = now()
 WHERE external_txn_id = $1 AND status = 'queued'`
 
 // SetBreakStatusFromQueuedTx transitions a break out of the queued state inside
@@ -357,6 +556,83 @@ func (s *Store) SetBreakStatusFromQueuedTx(ctx context.Context, tx *sql.Tx, exte
 		return qerr
 	}
 	return ErrNotQueued
+}
+
+const claimBreakSQL = `UPDATE agent.agent_break
+SET claimed_by = $2, lease_expires_at = $3, updated_at = now()
+WHERE external_txn_id = $1
+  AND (claimed_by IS NULL OR claimed_by = $2 OR lease_expires_at IS NULL OR lease_expires_at < now())`
+
+// ClaimBreak acquires (or renews) a durable processing lease on an existing
+// break row for owner, valid for ttl (finding M-15). It is a cross-instance
+// mutual-exclusion primitive: at most one owner holds a break's lease at a time,
+// so at most one agent instance performs that break's external remediation
+// (rule creation / dry-run probe) — something a process-local mutex cannot
+// guarantee. A lease is grantable when the row is unclaimed, already owned by
+// the SAME owner (renewal — idempotent), or the prior lease has expired (crash
+// recovery). It returns:
+//   - (true, nil)            when the lease was granted or renewed,
+//   - (false, nil)           when another live owner currently holds the lease,
+//   - (false, ErrNotFound)   when no such break exists.
+//
+// ttl <= 0 falls back to defaultLeaseTTL. The expiry is computed from the
+// application clock and stored as an absolute timestamp, so a crashed holder's
+// lease becomes reclaimable after ttl without any background sweeper.
+func (s *Store) ClaimBreak(ctx context.Context, externalTxnID, owner string, ttl time.Duration) (bool, error) {
+	if strings.TrimSpace(owner) == "" {
+		return false, fmt.Errorf("store: ClaimBreak requires a non-empty owner")
+	}
+	if ttl <= 0 {
+		ttl = defaultLeaseTTL
+	}
+	res, err := s.db.ExecContext(ctx, claimBreakSQL, externalTxnID, owner, time.Now().Add(ttl))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 1 {
+		return true, nil
+	}
+	// Zero rows updated: distinguish a missing break from one currently held by
+	// another live owner, so the caller can tell "does not exist" from "busy".
+	var exists bool
+	qerr := s.db.QueryRowContext(ctx,
+		`SELECT true FROM agent.agent_break WHERE external_txn_id = $1`, externalTxnID).Scan(&exists)
+	if errors.Is(qerr, sql.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if qerr != nil {
+		return false, qerr
+	}
+	return false, nil // exists, but a live owner holds the lease
+}
+
+const releaseBreakSQL = `UPDATE agent.agent_break
+SET claimed_by = NULL, lease_expires_at = NULL, updated_at = now()
+WHERE external_txn_id = $1 AND claimed_by = $2`
+
+// ReleaseBreak releases a processing lease held by owner (finding M-15),
+// letting another instance (or a retry) reclaim the break. It returns
+// ErrLeaseNotHeld when the row is not currently claimed by owner — whether it
+// was never claimed, already released/reclaimed, held by someone else, or does
+// not exist — so a caller can never mistakenly believe it released a lease it
+// did not own.
+func (s *Store) ReleaseBreak(ctx context.Context, externalTxnID, owner string) error {
+	res, err := s.db.ExecContext(ctx, releaseBreakSQL, externalTxnID, owner)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrLeaseNotHeld
+	}
+	return nil
 }
 
 const setCreatedRuleSQL = `UPDATE agent.agent_break SET created_rule_id = $2, updated_at = now() WHERE external_txn_id = $1`
@@ -439,12 +715,15 @@ WHERE external_txn_id = $1`
 // dry-run, but the native Blnk HTTP surface exposes no route that returns an
 // unmatched transaction's fields, and Rule 5.1 forbids reading blnk.* tables
 // directly. The agent therefore reconstructs the transaction from the fields it
-// persisted when the break was first managed. The returned transaction's ID is
-// the break's external id; the caller (ProbeBreak) substitutes a fresh
-// ephemeral id before submission so a re_drive never collides on Blnk's
-// external_transactions primary key (finding F3).
+// persisted when the break was first managed. The persisted source label is
+// reloaded into txn.Source (finding M-13): Blnk's matching engine keys on the
+// source, so omitting it would submit a mislabeled transaction and silently
+// change which internal candidates a re_drive can match. The returned
+// transaction's ID is the break's external id; the caller (ProbeBreak)
+// substitutes a fresh ephemeral id before submission so a re_drive never
+// collides on Blnk's external_transactions primary key (finding F3).
 func (s *Store) LoadBreakTxn(ctx context.Context, externalTxnID string) (txn blnk.ExternalTransaction, createdRuleID string, found bool, err error) {
-	const q = `SELECT amount, currency, reference, description, txn_date, created_rule_id
+	const q = `SELECT amount, currency, reference, description, txn_date, source, created_rule_id
 FROM agent.agent_break
 WHERE external_txn_id = $1`
 	var (
@@ -453,10 +732,11 @@ WHERE external_txn_id = $1`
 		ref      sql.NullString
 		desc     sql.NullString
 		date     sql.NullTime
+		source   sql.NullString
 		crid     sql.NullString
 	)
 	row := s.db.QueryRowContext(ctx, q, externalTxnID)
-	if err = row.Scan(&amount, &currency, &ref, &desc, &date, &crid); err != nil {
+	if err = row.Scan(&amount, &currency, &ref, &desc, &date, &source, &crid); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return blnk.ExternalTransaction{}, "", false, nil
 		}
@@ -478,23 +758,23 @@ WHERE external_txn_id = $1`
 	if date.Valid {
 		txn.Date = date.Time
 	}
+	if source.Valid {
+		txn.Source = source.String
+	}
 	if crid.Valid {
 		createdRuleID = crid.String
 	}
 	return txn, createdRuleID, true, nil
 }
 
-// ListBreaks returns every break under management, oldest first.
-func (s *Store) ListBreaks(ctx context.Context) ([]Break, error) {
-	const q = `SELECT external_txn_id, root_cause, confidence, regulated, status, proposed_rule, rationale, created_rule_id, created_at, updated_at
-FROM agent.agent_break
-ORDER BY created_at ASC`
-	rows, err := s.db.QueryContext(ctx, q)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
+// breakSelectColumns is the shared column list for every query that scans into a
+// Break, so ListBreaks, ListBreaksPage, and ListBreaksForIDs decode identically.
+const breakSelectColumns = `external_txn_id, root_cause, confidence, regulated, status, proposed_rule, rationale, created_rule_id, created_at, updated_at`
 
+// scanBreaks decodes a *sql.Rows opened over breakSelectColumns into a slice of
+// Break, applying the per-row proposed_rule isolation described on ListBreaks.
+// It is shared by every break-listing query so decoding stays consistent.
+func scanBreaks(rows *sql.Rows) ([]Break, error) {
 	var breaks []Break
 	for rows.Next() {
 		var (
@@ -541,6 +821,101 @@ ORDER BY created_at ASC`
 	return breaks, nil
 }
 
+// ListBreaks returns a bounded page of breaks under management, oldest first. It
+// is equivalent to ListBreaksPage(ctx, Page{}) and therefore returns at most
+// defaultPageLimit rows (finding M-14): no caller can stream an unbounded break
+// history into memory. Use ListBreaksPage to walk further pages.
+func (s *Store) ListBreaks(ctx context.Context) ([]Break, error) {
+	return s.ListBreaksPage(ctx, Page{})
+}
+
+// ListBreaksPage returns one bounded page of breaks, oldest first (finding
+// M-14). The page is normalized: Limit defaults to defaultPageLimit and is
+// capped at maxPageLimit, and a negative Offset is treated as 0.
+func (s *Store) ListBreaksPage(ctx context.Context, page Page) ([]Break, error) {
+	p := page.normalize()
+	q := `SELECT ` + breakSelectColumns + `
+FROM agent.agent_break
+ORDER BY created_at ASC
+LIMIT $1 OFFSET $2`
+	rows, err := s.db.QueryContext(ctx, q, p.Limit, p.Offset)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanBreaks(rows)
+}
+
+// ListBreaksForIDs returns, in one bounded query, only the break rows whose
+// external_txn_id is in ids — the database-side scoping the pipeline summary
+// needs so it never lists the entire historical break table only to discard
+// every row outside the current run (finding M-14). ids are bound as a single
+// text[] parameter via pq.Array. The result is bounded by page like
+// ListBreaksPage; callers scoping to a known id set pass Page{Limit: len(ids)}.
+func (s *Store) ListBreaksForIDs(ctx context.Context, ids []string, page Page) ([]Break, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	p := page.normalize()
+	q := `SELECT ` + breakSelectColumns + `
+FROM agent.agent_break
+WHERE external_txn_id = ANY($1)
+ORDER BY created_at ASC
+LIMIT $2 OFFSET $3`
+	rows, err := s.db.QueryContext(ctx, q, pq.Array(ids), p.Limit, p.Offset)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanBreaks(rows)
+}
+
+// CountBreaksByStatusForIDs counts, database-side, how many of the given breaks
+// currently hold status — used by the pipeline summary to tally auto-resolved
+// breaks for the current run without materializing every row (finding M-14).
+func (s *Store) CountBreaksByStatusForIDs(ctx context.Context, ids []string, status string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	const q = `SELECT count(*) FROM agent.agent_break WHERE external_txn_id = ANY($1) AND status = $2`
+	var n int
+	if err := s.db.QueryRowContext(ctx, q, pq.Array(ids), status).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// CountHITLForIDs counts, database-side, how many of the given breaks are
+// currently in the human-review queue — the current-run "escalated" tally
+// (finding M-14).
+func (s *Store) CountHITLForIDs(ctx context.Context, ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	const q = `SELECT count(*) FROM agent.agent_hitl_queue WHERE external_txn_id = ANY($1)`
+	var n int
+	if err := s.db.QueryRowContext(ctx, q, pq.Array(ids)).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// CountAuditForIDs counts, database-side, how many append-only audit events
+// belong to the given breaks — the current-run "audit count" (finding M-14).
+// It is a SELECT COUNT(*), permitted on the append-only ledger (Rule 5.5 forbids
+// only UPDATE/DELETE).
+func (s *Store) CountAuditForIDs(ctx context.Context, ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	const q = `SELECT count(*) FROM agent.agent_audit WHERE external_txn_id = ANY($1)`
+	var n int
+	if err := s.db.QueryRowContext(ctx, q, pq.Array(ids)).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // EnqueueHITL adds (or refreshes) a break in the human-review queue with the
 // given reason.
 func (s *Store) EnqueueHITL(ctx context.Context, externalTxnID, reason string) error {
@@ -565,13 +940,22 @@ func enqueueHITL(ctx context.Context, ex sqlExecer, externalTxnID, reason string
 	return err
 }
 
-// ListHITL returns the breaks currently awaiting a human decision, oldest
-// first.
+// ListHITL returns a bounded page of breaks awaiting a human decision, oldest
+// first. It is equivalent to ListHITLPage(ctx, Page{}) and returns at most
+// defaultPageLimit rows (finding M-14).
 func (s *Store) ListHITL(ctx context.Context) ([]HITLItem, error) {
+	return s.ListHITLPage(ctx, Page{})
+}
+
+// ListHITLPage returns one bounded page of the human-review queue, oldest first
+// (finding M-14). The page is normalized to the enforced Limit/Offset bounds.
+func (s *Store) ListHITLPage(ctx context.Context, page Page) ([]HITLItem, error) {
+	p := page.normalize()
 	const q = `SELECT external_txn_id, reason, enqueued_at
 FROM agent.agent_hitl_queue
-ORDER BY enqueued_at ASC`
-	rows, err := s.db.QueryContext(ctx, q)
+ORDER BY enqueued_at ASC
+LIMIT $1 OFFSET $2`
+	rows, err := s.db.QueryContext(ctx, q, p.Limit, p.Offset)
 	if err != nil {
 		return nil, err
 	}
@@ -651,14 +1035,25 @@ func insertAudit(ctx context.Context, ex sqlExecer, e model.AuditEvent) error {
 	return err
 }
 
-// ListAudit returns the full append-only audit trail, oldest first. SELECT is
-// permitted on agent_audit (Rule 5.5 forbids only UPDATE/DELETE); the HITL
-// status page renders this trail.
+// ListAudit returns a bounded page of the append-only audit trail, oldest
+// first. It is equivalent to ListAuditPage(ctx, Page{}) and returns at most
+// defaultPageLimit rows (finding M-14). SELECT is permitted on agent_audit
+// (Rule 5.5 forbids only UPDATE/DELETE); the HITL status page renders this
+// trail.
 func (s *Store) ListAudit(ctx context.Context) ([]model.AuditEvent, error) {
+	return s.ListAuditPage(ctx, Page{})
+}
+
+// ListAuditPage returns one bounded page of the append-only audit trail, oldest
+// first (finding M-14). The page is normalized to the enforced Limit/Offset
+// bounds so no caller can stream the entire audit history in a single query.
+func (s *Store) ListAuditPage(ctx context.Context, page Page) ([]model.AuditEvent, error) {
+	p := page.normalize()
 	const q = `SELECT event_id, external_txn_id, actor, action, "timestamp", rationale, confidence, provenance
 FROM agent.agent_audit
-ORDER BY "timestamp" ASC`
-	rows, err := s.db.QueryContext(ctx, q)
+ORDER BY "timestamp" ASC
+LIMIT $1 OFFSET $2`
+	rows, err := s.db.QueryContext(ctx, q, p.Limit, p.Offset)
 	if err != nil {
 		return nil, err
 	}
@@ -718,4 +1113,232 @@ func (s *Store) CountAuditByAction(ctx context.Context, externalTxnID, action st
 		return 0, err
 	}
 	return n, nil
+}
+
+const recordRuleOutboxSQL = `INSERT INTO agent.agent_rule_outbox (external_txn_id, rule_id, status)
+VALUES ($1, $2, 'pending')`
+
+// RecordRuleOutboxTx records, inside the caller's transaction, that a Blnk
+// matching rule was created for a break and now requires either confirmation or
+// compensation (findings M-12 / M-11). The remediator calls it in the SAME
+// transaction that persists the created rule id and appends the rule_created
+// audit event, so the durable "a rule exists in Blnk" fact and its compensation
+// obligation commit atomically — a crash can never create a rule without also
+// recording the pending obligation to clean it up.
+func (s *Store) RecordRuleOutboxTx(ctx context.Context, tx *sql.Tx, externalTxnID, ruleID string) error {
+	if strings.TrimSpace(ruleID) == "" {
+		return fmt.Errorf("store: RecordRuleOutboxTx requires a non-empty rule id")
+	}
+	_, err := tx.ExecContext(ctx, recordRuleOutboxSQL, externalTxnID, ruleID)
+	return err
+}
+
+const confirmRuleOutboxSQL = `UPDATE agent.agent_rule_outbox
+SET status = 'confirmed', updated_at = now()
+WHERE external_txn_id = $1 AND rule_id = $2 AND status = 'pending'`
+
+// ConfirmRuleOutboxTx marks a created rule's outbox obligation confirmed inside
+// the caller's transaction (findings M-12 / M-11): the rule legitimately cleared
+// its break, so no compensation is owed. The remediator calls it in the SAME
+// transaction that marks the break auto-resolved, so a confirmed resolution and
+// the retirement of its compensation obligation commit atomically. It targets
+// only the still-'pending' row, so a replay or double-confirm is a harmless
+// no-op rather than an error.
+func (s *Store) ConfirmRuleOutboxTx(ctx context.Context, tx *sql.Tx, externalTxnID, ruleID string) error {
+	_, err := tx.ExecContext(ctx, confirmRuleOutboxSQL, externalTxnID, ruleID)
+	return err
+}
+
+// ListPendingRuleOutbox returns up to limit oldest 'pending' outbox rows —
+// created Blnk rules whose owning remediation attempt never confirmed or
+// compensated them (findings M-12 / M-11). The remediator scans these on startup
+// to delete orphaned rules left by a crash. limit <= 0 selects defaultPageLimit
+// and is capped at maxPageLimit, so recovery can never stream an unbounded set
+// into memory (finding M-14).
+func (s *Store) ListPendingRuleOutbox(ctx context.Context, limit int) ([]RuleOutboxItem, error) {
+	p := Page{Limit: limit}.normalize()
+	const q = `SELECT id, external_txn_id, rule_id, status, attempts, last_error, created_at, updated_at
+FROM agent.agent_rule_outbox
+WHERE status = 'pending'
+ORDER BY created_at ASC
+LIMIT $1`
+	rows, err := s.db.QueryContext(ctx, q, p.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var items []RuleOutboxItem
+	for rows.Next() {
+		var (
+			it      RuleOutboxItem
+			lastErr sql.NullString
+		)
+		if err := rows.Scan(&it.ID, &it.ExternalTxnID, &it.RuleID, &it.Status,
+			&it.Attempts, &lastErr, &it.CreatedAt, &it.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if lastErr.Valid {
+			it.LastError = lastErr.String
+		}
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markRuleOutboxCompensatedSQL = `UPDATE agent.agent_rule_outbox
+SET status = $2, attempts = attempts + 1, last_error = $3, updated_at = now()
+WHERE id = $1`
+
+// MarkRuleOutboxCompensated records the outcome of a compensation attempt on a
+// pending outbox row (findings M-12 / M-11). On success (ok) the row becomes
+// 'compensated' — the orphaned Blnk rule was deleted; on failure it becomes
+// 'compensation_failed' and errMsg is stored in last_error for diagnosis. Every
+// call increments attempts. It returns ErrNotFound when no such outbox row
+// exists. The compensation OUTCOME is additionally written to the append-only
+// audit trail by the caller, so this mutable ledger and the immutable audit stay
+// consistent.
+func (s *Store) MarkRuleOutboxCompensated(ctx context.Context, id int64, ok bool, errMsg string) error {
+	status := OutboxCompensated
+	if !ok {
+		status = OutboxCompensationFailed
+	}
+	res, err := s.db.ExecContext(ctx, markRuleOutboxCompensatedSQL, id, status, nullIfEmpty(errMsg))
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+const compensateRuleOutboxSQL = `UPDATE agent.agent_rule_outbox
+SET status = $3, attempts = attempts + 1, last_error = $4, updated_at = now()
+WHERE external_txn_id = $1 AND rule_id = $2 AND status = 'pending'`
+
+// CompensateRuleOutbox records the outcome of an IN-CALL compensation attempt on
+// the still-'pending' outbox obligation for (externalTxnID, ruleID), in
+// autocommit mode (findings M-12 / M-11). On success (ok) the row becomes
+// 'compensated' — the orphaned Blnk rule was deleted; on failure it becomes
+// 'compensation_failed' and errMsg is stored in last_error for diagnosis. Every
+// matching call increments attempts.
+//
+// It is the by-(externalTxnID, ruleID) counterpart of MarkRuleOutboxCompensated
+// (which addresses a row by its numeric id during the startup recovery sweep,
+// where the caller holds that id). It mirrors ConfirmRuleOutboxTx's
+// (externalTxnID, ruleID) addressing so the remediator's in-call compensation
+// path — which holds the rule identity but not the row id — can retire the
+// obligation atomically-enough without a prior lookup.
+//
+// It targets ONLY the still-'pending' row, so it is idempotent and, crucially,
+// tolerant of the "no row" case: when a create-commit itself failed the outbox
+// row was never durably written, so there is nothing to compensate; a replay or
+// double-compensation likewise matches no pending row. In all of these it is a
+// harmless no-op that returns nil rather than ErrNotFound. The compensation
+// OUTCOME is additionally written to the append-only audit trail by the caller,
+// so this mutable ledger and the immutable audit stay consistent.
+func (s *Store) CompensateRuleOutbox(ctx context.Context, externalTxnID, ruleID string, ok bool, errMsg string) error {
+	status := OutboxCompensated
+	if !ok {
+		status = OutboxCompensationFailed
+	}
+	_, err := s.db.ExecContext(ctx, compensateRuleOutboxSQL, externalTxnID, ruleID, status, nullIfEmpty(errMsg))
+	return err
+}
+
+const beginRunInsertSQL = `INSERT INTO agent.agent_run (fixture_key, run_id, status)
+VALUES ($1, $2, 'running')
+ON CONFLICT (fixture_key) DO NOTHING
+RETURNING run_id, status`
+
+const beginRunSelectSQL = `SELECT run_id, status FROM agent.agent_run WHERE fixture_key = $1`
+
+// BeginRun implements durable run idempotency for serve mode (finding M-15).
+// fixtureKey is a deterministic content hash of the ingested fixture (CSV bytes
+// plus source label); runID is the scoped id the caller WOULD use for a fresh
+// run. BeginRun records that intent exactly once per fixture and reports what the
+// caller should actually do:
+//
+//   - First time this fixture is seen: it inserts a 'running' row recording
+//     runID and returns (alreadyCompleted=false, existingRunID=runID, nil) — the
+//     caller proceeds with its own runID.
+//   - Fixture already 'completed' (a prior boot finished it): it returns
+//     (alreadyCompleted=true, existingRunID=<recorded>, nil) — the caller SKIPS
+//     reprocessing and rebuilds the summary from the recorded run's rows,
+//     preventing the duplicate-history / inflated-summary bug on every restart.
+//   - Fixture still 'running' (a crash mid-pipeline): it returns
+//     (alreadyCompleted=false, existingRunID=<recorded>, nil) — the caller
+//     retries but reuses the ORIGINAL scoped run id, so the retry converges on
+//     the same id set (upsert-idempotent break rows) rather than forking a new
+//     duplicate history under a fresh random id.
+//
+// The insert-then-select pattern tolerates a concurrent first-boot race: the PK
+// guarantees exactly one INSERT wins; the loser reads the winner's committed row
+// and reuses its run id, and per-break claim leases (ClaimBreak) provide the
+// actual mutual exclusion for individual break processing.
+func (s *Store) BeginRun(ctx context.Context, fixtureKey, runID string) (bool, string, error) {
+	if strings.TrimSpace(fixtureKey) == "" {
+		return false, "", fmt.Errorf("store: BeginRun requires a non-empty fixture key")
+	}
+	if strings.TrimSpace(runID) == "" {
+		return false, "", fmt.Errorf("store: BeginRun requires a non-empty run id")
+	}
+	var (
+		gotRunID string
+		status   string
+	)
+	err := s.db.QueryRowContext(ctx, beginRunInsertSQL, fixtureKey, runID).Scan(&gotRunID, &status)
+	if err == nil {
+		// A row was inserted: this is a fresh run under the caller's runID.
+		return false, gotRunID, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, "", err
+	}
+	// ON CONFLICT DO NOTHING returned no row: the fixture already exists. Read
+	// the recorded run to decide whether to skip (completed) or resume (running).
+	if err := s.db.QueryRowContext(ctx, beginRunSelectSQL, fixtureKey).Scan(&gotRunID, &status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Extremely unlikely TOCTOU (row removed between the two statements);
+			// surface it rather than silently reprocessing.
+			return false, "", ErrNotFound
+		}
+		return false, "", err
+	}
+	return status == RunCompleted, gotRunID, nil
+}
+
+const completeRunSQL = `UPDATE agent.agent_run
+SET status = 'completed', updated_at = now()
+WHERE fixture_key = $1`
+
+// CompleteRun flips the fixture's run row to 'completed' (finding M-15) once the
+// pipeline has finished, so a later serve restart over the same fixture is
+// reported alreadyCompleted by BeginRun and skips reprocessing. It returns
+// ErrNotFound when no run row exists for fixtureKey (BeginRun must have created
+// it first).
+func (s *Store) CompleteRun(ctx context.Context, fixtureKey string) error {
+	if strings.TrimSpace(fixtureKey) == "" {
+		return fmt.Errorf("store: CompleteRun requires a non-empty fixture key")
+	}
+	res, err := s.db.ExecContext(ctx, completeRunSQL, fixtureKey)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

@@ -22,21 +22,28 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/blnkfinance/recon-agent/internal/audit"
 	"github.com/blnkfinance/recon-agent/internal/blnk"
 	"github.com/blnkfinance/recon-agent/internal/classifier"
 	"github.com/blnkfinance/recon-agent/internal/model"
+	"github.com/blnkfinance/recon-agent/internal/store"
 )
 
 // Break lifecycle status strings persisted through the store. They MUST match
-// the values the store and HITL status page understand.
+// the values the store and HITL status page understand, so each name aliases
+// the canonical literal in internal/model (finding m-01) — the single
+// module-wide source of truth — while local use sites keep their concise
+// unqualified names.
 const (
-	statusClassified   = "classified"
-	statusAutoResolved = "auto-resolved"
-	statusQueued       = "queued"
+	statusClassified   = model.StatusClassified
+	statusAutoResolved = model.StatusAutoResolved
+	statusQueued       = model.StatusQueued
 )
 
 // Human-readable escalation reasons recorded on the HITL queue entry and on the
@@ -55,6 +62,40 @@ const (
 	reasonProbeFailed              = "Blnk dry-run probe failed"
 	reasonNotCleared               = "Blnk dry-run did not confirm clearance"
 	reasonOrphanedRuleResume       = "prior rule proposal recorded without a persisted created rule; possible orphaned Blnk rule from an interrupted attempt — routed to HITL to avoid creating a duplicate"
+	reasonUnsafeProfile            = "no safe root-cause-specific rule profile could be built for this break; cannot auto-remediate"
+)
+
+// Auto-remediation safety and durability tuning constants.
+const (
+	// maxAmountDriftFraction caps the AllowableDrift the agent will auto-apply on
+	// an amount_drift break's amount criterion (finding C-06). Blnk's
+	// matchesGroupAmount treats an equality criterion's AllowableDrift as a
+	// FRACTION of the internal amount (|ext-int| <= |int|*drift), so 0.05 permits
+	// at most a 5% amount difference to auto-clear. A classifier-proposed drift
+	// above this cap is clamped DOWN to the cap (never up); a missing, non-finite,
+	// or non-positive proposal collapses to 0 (exact amount match). This bounds
+	// financial exposure so a large amount discrepancy can never be silently
+	// auto-cleared as "drift".
+	maxAmountDriftFraction = 0.05
+
+	// escalateTimeout bounds the independent fail-closed context used to route a
+	// break to HITL (finding M-10). Escalation must not be defeated by a canceled
+	// or deadline-exceeded parent context (e.g. an LLM timeout), so it runs on a
+	// context that keeps the parent's values but drops its cancellation, bounded
+	// by this timeout.
+	escalateTimeout = 10 * time.Second
+
+	// compensateTimeout bounds the independent fail-closed context used to delete
+	// a non-clearing created rule from Blnk and audit the outcome (finding M-11),
+	// for the same reason as escalateTimeout.
+	compensateTimeout = 10 * time.Second
+
+	// remediationLeaseTTL is how long a database processing lease is held while a
+	// break undergoes external remediation (finding M-15). It bounds how long a
+	// crashed holder blocks another instance: after it elapses the lease becomes
+	// reclaimable. It is a durable, cross-instance complement to the in-process
+	// keyedMutex.
+	remediationLeaseTTL = 2 * time.Minute
 )
 
 // operatorEquals is the only matching operator tight enough to auto-apply to a
@@ -64,7 +105,8 @@ const (
 // matchesCurrency), so a range/substring operator (greater_than / less_than /
 // contains) can match an UNINTENDED internal counterpart and make a single-txn
 // probe falsely report "cleared". Equality pins external == internal on a field.
-const operatorEquals = "equals"
+// Aliases the canonical grammar operator in internal/model (finding m-01).
+const operatorEquals = model.OperatorEquals
 
 // autoEligibleRootCauses is the closed allow-list of root causes the agent may
 // auto-remediate (finding C3). It is defense-in-depth ABOVE the classifier's soft
@@ -97,7 +139,16 @@ type blnkPort interface {
 	// attempt that did not clear, so a failed attempt leaves no orphan rule
 	// behind (finding F5).
 	DeleteMatchingRule(ctx context.Context, ruleID string) error
-	ProbeBreak(ctx context.Context, txn blnk.ExternalTransaction, matchingRuleIDs []string) (cleared bool, reconID string, err error)
+	// ConfirmClearedOverUpload is the cache-safe DETERMINISTIC ARBITER (Rule 5.3)
+	// for whether the created rule cleared the break (finding C-03). It runs a
+	// dry-run reconciliation over the break's ORIGINAL persisted upload with the
+	// single created rule and reports cleared when Blnk's authoritative unmatched
+	// count drops strictly BELOW the detection baseline. It replaces the earlier
+	// per-transaction ProbeBreak, whose sequential ephemeral single-transaction
+	// uploads tripped Blnk's upload-agnostic pagination cache (a protected-core
+	// defect the agent must not modify, Rule 5.8). Funnelling every confirmation
+	// through the one persisted upload makes that shared cache benign.
+	ConfirmClearedOverUpload(ctx context.Context, uploadID, ruleID string, baselineUnmatched int) (cleared bool, reconID string, err error)
 }
 
 // auditPort is the append-only audit writer used by the remediator (Rule 5.5).
@@ -121,8 +172,14 @@ type storePort interface {
 	// WithTx runs fn in one transaction, committing on nil and rolling back on
 	// error so partial writes are never durable.
 	WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error
-	UpsertBreakTx(ctx context.Context, tx *sql.Tx, c model.BreakClassification, txn blnk.ExternalTransaction, status string) error
-	SetBreakStatusTx(ctx context.Context, tx *sql.Tx, externalTxnID, status string) error
+	UpsertBreakTx(ctx context.Context, tx *sql.Tx, c model.BreakClassification, txn blnk.ExternalTransaction, prov model.Provenance, status string) error
+	// MarkResolvedTx transitions a break to auto-resolved AND stamps the
+	// confirming Blnk dry-run reconciliation id onto the row in one statement.
+	// The store's agent_break_resolved_proof CHECK makes an auto-resolved row
+	// without that proof impossible, so the remediator can never record a
+	// resolution the arbiter did not confirm (Rule 5.3). It replaces a bare
+	// status write for the resolve path.
+	MarkResolvedTx(ctx context.Context, tx *sql.Tx, externalTxnID, reconID string) error
 	EnqueueHITLTx(ctx context.Context, tx *sql.Tx, externalTxnID, reason string) error
 	SetCreatedRuleTx(ctx context.Context, tx *sql.Tx, externalTxnID, ruleID string) error
 	// SetCreatedRule records (or, with an empty ruleID, CLEARS) the persisted
@@ -138,6 +195,37 @@ type storePort interface {
 	// CreateMatchingRule POST, so a positive count with no persisted created
 	// rule id signals a prior attempt may have orphaned a rule in Blnk.
 	CountAuditByAction(ctx context.Context, externalTxnID, action string) (int, error)
+
+	// ClaimBreak acquires (or renews) a durable, cross-instance processing lease
+	// on a break before the remediator performs external remediation (finding
+	// M-15). It returns granted=false with a nil error when another live owner
+	// currently holds the lease, so the caller yields rather than racing. This
+	// is the database-level complement to the in-process keyedMutex.
+	ClaimBreak(ctx context.Context, externalTxnID, owner string, ttl time.Duration) (granted bool, err error)
+	// ReleaseBreak releases a processing lease this instance holds, letting a
+	// retry or another instance reclaim the break (finding M-15).
+	ReleaseBreak(ctx context.Context, externalTxnID, owner string) error
+
+	// RecordRuleOutboxTx records, in the caller's transaction, that a Blnk rule
+	// was created for a break and now owes confirmation or compensation (finding
+	// M-11). Committed atomically with the created-rule id + rule_created audit
+	// event so a crash can never create a rule without a durable cleanup
+	// obligation.
+	RecordRuleOutboxTx(ctx context.Context, tx *sql.Tx, externalTxnID, ruleID string) error
+	// ConfirmRuleOutboxTx retires a rule's compensation obligation in the
+	// caller's transaction because the rule legitimately cleared its break
+	// (finding M-11). Committed atomically with MarkResolvedTx.
+	ConfirmRuleOutboxTx(ctx context.Context, tx *sql.Tx, externalTxnID, ruleID string) error
+	// CompensateRuleOutbox marks the pending obligation for (externalTxnID,
+	// ruleID) compensated (ok) or compensation_failed (!ok) after an in-call rule
+	// deletion attempt (finding M-11). Idempotent and tolerant of a missing row.
+	CompensateRuleOutbox(ctx context.Context, externalTxnID, ruleID string, ok bool, errMsg string) error
+	// ListPendingRuleOutbox returns pending compensation obligations left by a
+	// crashed attempt, for the startup recovery sweep (finding M-11).
+	ListPendingRuleOutbox(ctx context.Context, limit int) ([]store.RuleOutboxItem, error)
+	// MarkRuleOutboxCompensated records, by row id, the outcome of compensating a
+	// pending obligation during the startup recovery sweep (finding M-11).
+	MarkRuleOutboxCompensated(ctx context.Context, id int64, ok bool, errMsg string) error
 }
 
 // Remediator orchestrates classification, gating, deterministic remediation and
@@ -155,9 +243,17 @@ type Remediator struct {
 	// llmModel is recorded as provenance on every AuditEvent (Rule 5.6).
 	llmModel string
 
+	// owner uniquely identifies THIS remediator instance when it claims a
+	// database processing lease on a break (finding M-15). It is generated once
+	// per instance in New so that leases this instance takes can be told apart
+	// from those of any other instance (or a crashed prior incarnation).
+	owner string
+
 	// locks serializes concurrent Handle calls for the SAME break so a break is
 	// never classified/remediated twice by racing goroutines (finding M-5).
-	// Distinct breaks acquire distinct keys and still run in parallel.
+	// Distinct breaks acquire distinct keys and still run in parallel. It is the
+	// in-process fast path; the database lease (owner + storePort.ClaimBreak) is
+	// the durable, cross-instance complement (finding M-15).
 	locks keyedMutex
 }
 
@@ -173,6 +269,10 @@ func New(cls classifierPort, blnkClient blnkPort, auditWriter auditPort, store s
 		store:       store,
 		threshold:   threshold,
 		llmModel:    llmModel,
+		// A unique owner identity per instance so database processing leases
+		// (finding M-15) taken by this remediator are distinguishable from any
+		// other instance's.
+		owner: "recon-agent-" + uuid.NewString(),
 	}
 }
 
@@ -197,8 +297,19 @@ func New(cls classifierPort, blnkClient blnkPort, auditWriter auditPort, store s
 // upload and per-run summaries can be scoped correctly (finding M-6). Blnk's
 // own external-transaction JSON carries no upload id (it is a property of the
 // reconciliation run, not the transaction line), so it is threaded here as an
-// explicit parameter rather than read off txn.
-func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, uploadID string) error {
+// explicit parameter rather than read off txn. It is ALSO the upload the
+// clearance confirmation reconciles over, keeping the confirmation cache-safe
+// (finding C-03).
+//
+// baselineUnmatched is Blnk's authoritative unmatched count from the run's
+// detection reconciliation (the count with no safe rule applied). The auto path
+// confirms a break cleared only when a dry-run reconciliation over uploadID with
+// the created rule drives the unmatched count strictly below this baseline
+// (Rule 5.3) — see ConfirmClearedOverUpload. A caller that has no meaningful
+// baseline (e.g. a resumed single-break re-drive outside the batch pipeline)
+// passes the number of breaks it expects to remain unmatched without the rule;
+// the pipeline passes the detection count.
+func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, uploadID string, baselineUnmatched int) error {
 	// M-5: serialize concurrent Handle calls for the SAME break. Released after
 	// the break reaches a terminal, committed state (or an error), so a racing
 	// caller observes that terminal state and no-ops below rather than
@@ -270,7 +381,7 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 		// ONE transaction, so a classified break can never exist without its
 		// audit event (nor an audit event without the break).
 		if err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
-			if e := r.store.UpsertBreakTx(ctx, tx, c, txn, statusClassified); e != nil {
+			if e := r.store.UpsertBreakTx(ctx, tx, c, txn, prov, statusClassified); e != nil {
 				return e
 			}
 			return r.auditWriter.RecordTx(ctx, tx, audit.Classified(c, prov))
@@ -281,6 +392,39 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	}
 
 	id := classification.ExternalTxnID
+
+	// M-15: acquire a durable, cross-instance processing lease before performing
+	// any external remediation. The in-process keyedMutex above serializes racing
+	// goroutines WITHIN this process; the lease additionally guarantees that at
+	// most one AGENT INSTANCE drives a given break's Blnk rule creation / dry-run
+	// probe / resolution at a time — something a process-local mutex cannot. The
+	// break row now exists (a fresh break was just persisted as classified; a
+	// resumed one was loaded), so the lease is claimable. If another live
+	// instance already holds it, we YIELD: the break is being handled elsewhere,
+	// so this call is a safe no-op rather than a competing (and potentially
+	// rule-duplicating) second attempt.
+	//
+	// A fresh break may be classified by two instances in the brief window before
+	// either claims (both upsert the same row and append a classified event); the
+	// only artifact is a duplicate classified audit event, never a duplicate
+	// resolution or Blnk rule, because exactly one instance wins the lease that
+	// gates all external work below.
+	granted, claimErr := r.store.ClaimBreak(ctx, id, r.owner, remediationLeaseTTL)
+	if claimErr != nil {
+		return fmt.Errorf("remediator: claim processing lease for break %q: %w", id, claimErr)
+	}
+	if !granted {
+		return nil
+	}
+	// Release the lease when the break reaches a terminal outcome (or on error)
+	// so a retry or another instance can reclaim it. Release runs on an
+	// independent context so a canceled parent cannot leave the lease dangling;
+	// if release still fails, the lease self-expires after remediationLeaseTTL.
+	defer func() {
+		relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), escalateTimeout)
+		defer cancel()
+		_ = r.store.ReleaseBreak(relCtx, id, r.owner)
+	}()
 
 	// Confidence/regulation gate (Rule 5.4). A regulated break, or one below the
 	// confidence threshold, is NEVER auto-remediated: it is escalated to HITL
@@ -347,39 +491,36 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 			return r.escalate(ctx, txn, classification, prov, reasonOrphanedRuleResume)
 		}
 
-		// F7: narrow the proposed rule before any POST. The classifier's
-		// {amount,equals} proposal carries an empty (or model-suggested) Value,
-		// and Blnk's field-to-field matcher IGNORES MatchingCriteria.Value
-		// entirely — it compares each external field against the internal
-		// candidate's same field — so an amount-only rule can clear a break by
-		// coincidentally matching an internal booking of the SAME amount in a
-		// DIFFERENT currency. We deep-copy the proposal (Criteria is a slice, so
-		// copying the struct alone would alias it and mutate the persisted
-		// classification's rule), populate each equality criterion's Value from
-		// the transaction for auditability/intent, and append a {currency,equals}
-		// criterion when the break carries a currency so clearance requires the
-		// internal booking to match BOTH amount and currency. A residual
-		// limitation remains — two internal bookings of the same amount AND
-		// currency are still indistinguishable field-to-field — which is inherent
-		// to matching over Blnk's native HTTP surface (Rule 5.1 forbids reading
-		// Blnk's tables to disambiguate further).
-		rule := narrowProposedRule(*classification.ProposedRule, txn)
+		// C-06: build the EXACT, deterministic safe rule profile for this break's
+		// (already gated, auto-eligible) root cause, rather than trusting the
+		// classifier's advisory rule STRUCTURE. The classifier's proposal only
+		// SIGNALS that the break looked auto-remediable — its nil-ness gated us
+		// above — but the rule the agent actually POSTs is constructed here from
+		// the root cause and the transaction's OWN identity fields, so clearance
+		// pins the intended counterpart and can never be steered by weakly-bounded
+		// model output. safeRuleForBreak returns an error when no safe profile
+		// applies (e.g. a required identity field is missing), failing the break
+		// closed to HITL. See safeRuleForBreak for the per-root-cause profiles.
+		rule, ruleErr := safeRuleForBreak(classification, txn)
+		if ruleErr != nil {
+			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonUnsafeProfile, ruleErr))
+		}
 
 		// Rule 5.2: never POST a rule whose Field/Operator falls outside Blnk's
-		// accepted grammar. The classifier already grammar-gates proposals; this
-		// is defense-in-depth immediately before the POST, validating the ACTUAL
-		// (narrowed) rule that will be sent.
+		// accepted grammar. safeRuleForBreak only ever emits allowed fields with
+		// the equals operator, so this is a defensive assertion immediately before
+		// the POST, validating the ACTUAL rule that will be sent.
 		if err := classifier.ValidateRule(rule); err != nil {
 			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonGrammarReject, err))
 		}
 
-		// Semantic safety before any POST (finding C3): reject proposed rules that
-		// are too broad to auto-apply to a single-transaction dry-run. A
-		// grammar-valid rule can still be unsafe — a range/substring operator can
-		// match an unintended internal counterpart and falsely clear the probe —
-		// so only tight equality criteria may proceed; anything else routes to
-		// HITL. The appended {currency,equals} criterion is an equality criterion
-		// and therefore compatible with this check.
+		// Semantic safety before any POST (finding C-06): every criterion the
+		// agent auto-applies must be a tight equality pin. Blnk's field-to-field
+		// matcher ignores criteria.Value, and a range/substring operator could
+		// match an unintended internal counterpart and falsely "clear" the probe,
+		// so a non-equality operator routes to HITL. safeRuleForBreak builds only
+		// equality criteria, so this is a defensive assertion that the built
+		// profile conforms.
 		if err := autoApplySafe(rule); err != nil {
 			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonOverbroadRule, err))
 		}
@@ -403,29 +544,54 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 		ruleID = created.RuleID
 		createdHere = true
 
-		// M-3 / m-3: persist the created rule id ATOMICALLY with its rule_created
-		// audit event. Committing them together means a crash cannot leave an
-		// orphaned Blnk rule the agent has forgotten; on resume the persisted id
-		// is reused instead of creating another rule.
+		// M-3 / m-3 / M-11: persist the created rule id, record the durable
+		// compensation obligation (a 'pending' outbox row), and emit the
+		// rule_created audit event — all ATOMICALLY in ONE transaction. Committing
+		// them together means a crash can never leave an orphaned Blnk rule
+		// WITHOUT also recording the pending obligation to clean it up (the
+		// outbox) and its audit event; on resume the persisted id is reused
+		// instead of creating another rule.
 		if err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
 			if e := r.store.SetCreatedRuleTx(ctx, tx, id, ruleID); e != nil {
 				return e
 			}
+			if e := r.store.RecordRuleOutboxTx(ctx, tx, id, ruleID); e != nil {
+				return e
+			}
 			return r.auditWriter.RecordTx(ctx, tx, audit.RuleCreated(id, ruleRefOf(created), classification.Confidence, provEv))
 		}); err != nil {
-			return fmt.Errorf("remediator: persist+audit created rule for break %q: %w", id, err)
+			// M-11: the local commit failed but the Blnk rule EXISTS (the POST
+			// already succeeded), so without cleanup it is an orphan the agent has
+			// no durable record of. Compensate immediately — delete it from Blnk
+			// and audit the outcome (including a delete failure) — then fail the
+			// break closed to HITL. Compensation runs on an independent fail-closed
+			// context so a canceled parent cannot skip it. (The outbox row was part
+			// of THIS failed transaction and so was never committed; the
+			// compensation's outbox mark is therefore a harmless no-op.)
+			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "created-rule local commit failed")
+			return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonRuleCreateFailed, err))
 		}
 	}
 
-	// Deterministic re-drive: a single-transaction Blnk dry-run with the rule.
-	cleared, reconID, err := r.blnkClient.ProbeBreak(ctx, txn, []string{ruleID})
+	// Deterministic re-drive (finding C-03): a cache-safe, UPLOAD-SCOPED Blnk
+	// dry-run reconciliation over the break's ORIGINAL persisted upload with the
+	// created rule. Clearance is confirmed when Blnk's authoritative unmatched
+	// count drops strictly below the detection baseline — the count with no safe
+	// rule applied. This replaces the earlier per-transaction ProbeBreak, whose
+	// sequential ephemeral single-transaction uploads tripped Blnk's
+	// upload-agnostic pagination cache (a protected-core defect the agent must
+	// not modify, Rule 5.8). Funnelling the confirmation through the same
+	// persisted upload the run detected over makes that shared cache benign,
+	// while Blnk remains the sole arbiter of clearance (Rule 5.3).
+	cleared, reconID, err := r.blnkClient.ConfirmClearedOverUpload(ctx, uploadID, ruleID, baselineUnmatched)
 	if err != nil {
-		// F5: the probe transport/validation failed, so this rule will not be
-		// used to clear the break. If we created it in this call, roll it back
-		// (delete from Blnk + clear the persisted id) before escalating so a
-		// failed auto-attempt leaves no orphan rule behind.
+		// M-11: the confirmation transport/validation failed, so this rule will
+		// not clear the break. If we created it in this call, durably compensate
+		// it (delete from Blnk, mark the outbox obligation, audit the outcome —
+		// including a delete failure) before escalating, so a failed auto-attempt
+		// leaves no unaudited orphan rule behind.
 		if createdHere {
-			r.rollbackCreatedRule(ctx, id, ruleID)
+			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "dry-run probe failed before clearance")
 		}
 		return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonProbeFailed, err))
 	}
@@ -434,10 +600,10 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 		return fmt.Errorf("remediator: audit probe for break %q: %w", id, err)
 	}
 	if !cleared {
-		// F5: Blnk did not confirm clearance, so this rule did not do its job.
-		// Roll back a rule created in this call before escalating.
+		// M-11: Blnk did not confirm clearance, so this rule did not do its job.
+		// Durably compensate a rule created in this call before escalating.
 		if createdHere {
-			r.rollbackCreatedRule(ctx, id, ruleID)
+			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "dry-run did not confirm clearance")
 		}
 		return r.escalate(ctx, txn, classification, prov, reasonNotCleared)
 	}
@@ -451,23 +617,34 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 	// confidence alone never resolves.
 	proof, err := audit.NewClearanceProof(reconID, cleared)
 	if err != nil {
-		// F5: Blnk reported cleared but returned no usable reconciliation id, so
-		// we fail closed and escalate rather than record an unprovable
-		// resolution. Roll back a rule created in this call so the aborted
-		// attempt leaves no orphan rule behind.
+		// M-11: Blnk reported cleared but returned no usable reconciliation id, so
+		// we fail closed and escalate rather than record an unprovable resolution.
+		// Durably compensate a rule created in this call so the aborted attempt
+		// leaves no unaudited orphan rule behind.
 		if createdHere {
-			r.rollbackCreatedRule(ctx, id, ruleID)
+			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "clearance reported without a usable reconciliation id")
 		}
 		return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonNotCleared, err))
 	}
 
-	// C-1: mark the break auto-resolved and record the resolved AuditEvent in
-	// ONE transaction, so an auto-resolved status can never be durable without
-	// its resolved event (nor vice versa). The proof's confirming recon_id is
-	// stamped onto the event's provenance, making every resolution traceable to
-	// the dry-run that cleared it.
+	// C-1 / M-11: mark the break auto-resolved, retire the rule's compensation
+	// obligation (confirm the outbox row), and record the resolved AuditEvent —
+	// all in ONE transaction. An auto-resolved status can never be durable
+	// without its resolved event (nor vice versa); and confirming the outbox in
+	// the SAME commit means a rule that legitimately cleared its break is marked
+	// 'confirmed' rather than being mistaken for an orphan by the recovery sweep.
+	// MarkResolvedTx stamps the SAME confirming recon_id the proof carries onto
+	// the break row, and audit.Resolved stamps it onto the event's provenance —
+	// so the row's resolved_recon_id and the audit trail agree, and the store's
+	// resolved-proof CHECK guarantees the row cannot be auto-resolved without it
+	// (Rule 5.3). Every resolution is thus traceable to the dry-run that cleared
+	// it. ConfirmRuleOutboxTx targets only a still-'pending' row, so on the resume
+	// path (where the outbox may already be confirmed) it is a harmless no-op.
 	if err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
-		if e := r.store.SetBreakStatusTx(ctx, tx, id, statusAutoResolved); e != nil {
+		if e := r.store.MarkResolvedTx(ctx, tx, id, proof.ReconID()); e != nil {
+			return e
+		}
+		if e := r.store.ConfirmRuleOutboxTx(ctx, tx, id, ruleID); e != nil {
 			return e
 		}
 		return r.auditWriter.RecordTx(ctx, tx, audit.Resolved(id, classification.Rationale, classification.Confidence, provEv, proof))
@@ -487,6 +664,17 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 // queued break persists them and can later be re-driven from the HITL surface
 // (finding L2).
 func (r *Remediator) escalate(ctx context.Context, txn blnk.ExternalTransaction, classification model.BreakClassification, prov model.Provenance, reason string) error {
+	// M-10: fail-closed durable routing must NOT be defeated by a canceled or
+	// deadline-exceeded parent context. A frequent escalation trigger is an LLM
+	// timeout (Rule 5.7), whose context is already past its deadline; reusing it
+	// here would make the very database writes that record the escalation
+	// (persist queued + enqueue HITL + escalated audit) fail, silently DROPPING
+	// the break instead of routing it. Derive an independent context that keeps
+	// the parent's values but drops its cancellation/deadline, bounded by its own
+	// short timeout, so the escalation always commits.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), escalateTimeout)
+	defer cancel()
+
 	// Sanitize a possibly-malformed confidence so both the persisted break and
 	// the escalated audit event are well-formed (the audit validator rejects a
 	// non-finite or out-of-range confidence).
@@ -498,7 +686,7 @@ func (r *Remediator) escalate(ctx context.Context, txn blnk.ExternalTransaction,
 	provEv := audit.WithClassificationEvidence(prov, classification)
 
 	if err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
-		if e := r.store.UpsertBreakTx(ctx, tx, classification, txn, statusQueued); e != nil {
+		if e := r.store.UpsertBreakTx(ctx, tx, classification, txn, provEv, statusQueued); e != nil {
 			return e
 		}
 		if e := r.store.EnqueueHITLTx(ctx, tx, classification.ExternalTxnID, reason); e != nil {
@@ -522,130 +710,260 @@ func ruleRefOf(rule blnk.MatchingRule) audit.RuleRef {
 	return ref
 }
 
-// Blnk matching-criteria field names the remediator populates or appends when
-// narrowing a proposed rule (finding F7). They mirror Blnk's accepted field
-// grammar (classifier.allowedFields) — validated defensively by
-// classifier.ValidateRule before any POST.
+// Blnk matching-criteria field names the remediator uses when building a safe
+// root-cause-specific rule profile (finding C-06). They alias the canonical
+// grammar vocabulary in internal/model (finding m-01) — the same domain the
+// classifier's allowedFields validator enforces via classifier.ValidateRule
+// before any POST — so the profile builder and the validator share one source.
 const (
-	fieldAmount      = "amount"
-	fieldCurrency    = "currency"
-	fieldReference   = "reference"
-	fieldDescription = "description"
-	fieldDate        = "date"
+	fieldAmount    = model.FieldAmount
+	fieldCurrency  = model.FieldCurrency
+	fieldReference = model.FieldReference
 )
 
-// narrowProposedRule returns a defensive DEEP COPY of the classifier's proposed
-// rule, tightened for the specific transaction under remediation (finding F7:
-// "non-deterministic clearance depends on polluted shared DB state").
+// safeRuleForBreak builds the EXACT, deterministic Blnk matching rule the agent
+// is permitted to auto-apply for an auto-eligible break, keyed on its (already
+// gated) root cause (finding C-06). It does NOT trust the classifier's advisory
+// rule STRUCTURE; it constructs the rule from the root cause and the
+// transaction's OWN fields, so the semantic safety of an auto-remediation is a
+// deterministic property of the code rather than of weakly-bounded model output.
 //
-// It (1) copies the rule and its Criteria slice so the persisted
-// classification's rule is never mutated, (2) fills each equality criterion's
-// Value from the corresponding transaction field (the fix explicitly suggested
-// by the QA finding — for auditability and human intent), and (3) appends a
-// {currency,equals} criterion when the transaction carries a currency and the
-// proposal does not already constrain it, so clearance requires the candidate
-// to match BOTH amount and currency (this reduces cross-currency spurious
-// matches and still clears the real same-currency seed counterparts).
+// Each profile pins the intended counterpart's IDENTITY with equality criteria
+// (which Blnk matches field-to-field) and omits exactly the field that
+// legitimately differs for that root cause. Because Blnk IGNORES criteria.Value
+// and matches field-to-field, the equals OPERATOR — not the Value — is what pins
+// external == internal on a field; Value is still populated from the transaction
+// for auditability and human intent.
 //
-// RESIDUAL LIMITATION (documented, bounded by explicit AAP rules — see finding
-// F7 and AAP §0.1.1/§0.4.1). Full, deterministic clearance-against-the-specific
-// -intended-counterpart is NOT achievable over Blnk's native HTTP surface,
-// because Blnk-core behavior — which Rule 5.8 forbids modifying and Rule 5.1
-// forbids reading around — determines matching:
-//   - Blnk's matcher (reconciliation.go matchesRules/matchesString/
-//     matchesGroupAmount) compares each EXTERNAL field against the INTERNAL
-//     candidate's same field and IGNORES MatchingCriteria.Value; populating
-//     Value therefore records intent but cannot itself change what Blnk matches.
-//   - Blnk's start-instant PERSISTS every probed external transaction even under
-//     dry_run, and matches against that shared, growing transaction set, so an
-//     amount-only equality can clear by coincidentally matching a stray
-//     same-amount transaction left by an earlier run rather than the intended
-//     seed booking.
+//   - timing: amount, currency and reference all match the internal booking;
+//     only the settlement DATE differs. Profile = {amount==, currency==,
+//     reference==}; the date is intentionally omitted so the lag cannot defeat
+//     the match. Requires a reference (the strongest available identity).
+//   - amount_drift: reference and currency match; only the AMOUNT drifted
+//     slightly. Profile = {amount== within a bounded AllowableDrift, currency==,
+//     reference==}. The drift is derived from the classifier's advisory proposal
+//     and hard-capped by boundedAmountDrift. Requires a reference so a
+//     bounded-amount match stays pinned to a stable identity.
+//   - reference_mismatch: amount and currency match; only the REFERENCE differs
+//     (e.g. a vendor ref vs an invoice number). Profile = {amount==, currency==};
+//     the reference is intentionally omitted because it is the differing field.
+//     This is the narrowest safe identity the HTTP-only surface allows for this
+//     cause.
 //
-// This narrowing applies the maximum tightening the HTTP-only contract permits
-// (populated Value + currency pinning); the remaining non-determinism is a
-// property of the off-limits Blnk engine on a shared database, not of the agent.
-func narrowProposedRule(rule blnk.MatchingRule, txn blnk.ExternalTransaction) blnk.MatchingRule {
-	out := rule
-	out.Criteria = append([]blnk.MatchingCriteria(nil), rule.Criteria...)
+// Every profile requires a currency (to forbid a cross-currency match). A break
+// missing a field its profile requires — or any root cause outside the auto path
+// (a programming error, since the gate escalates all others) — returns an error
+// so the break fails closed to HITL rather than being auto-applied unsafely.
+//
+// RESIDUAL LIMITATION (documented, bounded by explicit AAP rules — AAP
+// §0.1.1/§0.4.1, Rules 5.1/5.8): two internal bookings identical on a profile's
+// pinned fields remain indistinguishable field-to-field, because Blnk-core
+// matching may not be modified (Rule 5.8) or read around (Rule 5.1). The profiles
+// apply the tightest identity the native HTTP surface permits; the remaining
+// non-determinism is a property of the off-limits Blnk engine, not the agent, and
+// clearance is ALWAYS confirmed by Blnk's own dry-run arbiter (Rule 5.3) before a
+// resolution is recorded.
+func safeRuleForBreak(c model.BreakClassification, txn blnk.ExternalTransaction) (blnk.MatchingRule, error) {
+	if strings.TrimSpace(txn.Currency) == "" {
+		return blnk.MatchingRule{}, fmt.Errorf("break %q carries no currency; cannot pin currency identity for a safe %s rule", txn.ID, c.RootCause)
+	}
+	amountEq := blnk.MatchingCriteria{Field: fieldAmount, Operator: operatorEquals, Value: formatAmount(txn.Amount)}
+	currencyEq := blnk.MatchingCriteria{Field: fieldCurrency, Operator: operatorEquals, Value: txn.Currency}
+	referenceEq := blnk.MatchingCriteria{Field: fieldReference, Operator: operatorEquals, Value: txn.Reference}
 
-	hasCurrency := false
-	for i := range out.Criteria {
-		c := &out.Criteria[i]
-		if c.Field == fieldCurrency {
-			hasCurrency = true
+	var criteria []blnk.MatchingCriteria
+	switch c.RootCause {
+	case model.RootCauseTiming:
+		if strings.TrimSpace(txn.Reference) == "" {
+			return blnk.MatchingRule{}, fmt.Errorf("timing break %q carries no reference; cannot pin identity for a safe rule", txn.ID)
 		}
-		// Only populate the Value of tight equality criteria; leave any
-		// range/substring operator (which autoApplySafe rejects anyway) untouched.
-		if c.Operator != operatorEquals {
-			continue
+		criteria = []blnk.MatchingCriteria{amountEq, currencyEq, referenceEq}
+	case model.RootCauseAmountDrift:
+		if strings.TrimSpace(txn.Reference) == "" {
+			return blnk.MatchingRule{}, fmt.Errorf("amount_drift break %q carries no reference; cannot pin identity for a safe rule", txn.ID)
 		}
-		switch c.Field {
-		case fieldAmount:
-			c.Value = strconv.FormatFloat(txn.Amount, 'f', -1, 64)
-		case fieldCurrency:
-			c.Value = txn.Currency
-		case fieldReference:
-			c.Value = txn.Reference
-		case fieldDescription:
-			c.Value = txn.Description
-		case fieldDate:
-			if !txn.Date.IsZero() {
-				c.Value = txn.Date.Format(time.RFC3339)
-			}
-		}
+		amountEq.AllowableDrift = boundedAmountDrift(c.ProposedRule)
+		criteria = []blnk.MatchingCriteria{amountEq, currencyEq, referenceEq}
+	case model.RootCauseReferenceMismatch:
+		criteria = []blnk.MatchingCriteria{amountEq, currencyEq}
+	default:
+		return blnk.MatchingRule{}, fmt.Errorf("root cause %q has no safe auto-remediation rule profile", c.RootCause)
 	}
 
-	// Append a currency equality criterion when the break carries a currency and
-	// the proposal does not already constrain it, so an amount-only proposal
-	// cannot clear across a currency boundary.
-	if !hasCurrency && txn.Currency != "" {
-		out.Criteria = append(out.Criteria, blnk.MatchingCriteria{
-			Field:    fieldCurrency,
-			Operator: operatorEquals,
-			Value:    txn.Currency,
-		})
-	}
-	return out
+	return blnk.MatchingRule{
+		// Deterministic name so an orphaned rule from an interrupted attempt is
+		// identifiable and the SEAM-MIN-1 resume guard can reason about it. It
+		// mirrors the name the classifier stamps on its advisory proposal.
+		Name:        fmt.Sprintf("agent-proposed-%s", txn.ID),
+		Description: fmt.Sprintf("agent safe auto-remediation rule for %s break %s", c.RootCause, txn.ID),
+		Criteria:    criteria,
+	}, nil
 }
 
-// rollbackCreatedRule best-effort deletes a Blnk matching rule the remediator
-// created in the current invocation for an auto-remediation attempt that did
-// not clear, and clears the persisted created-rule id on the break (finding
-// F5). Without this, every non-clearing auto-attempt would leave an orphan rule
-// in Blnk's shared catalog (observed accumulating 30 -> 88 during QA).
+// boundedAmountDrift extracts a safe amount AllowableDrift from the classifier's
+// advisory proposed rule, capped at maxAmountDriftFraction (finding C-06). It
+// takes the largest finite, positive AllowableDrift on any amount criterion of
+// the proposal and clamps it DOWN to the cap; a nil, non-finite, or non-positive
+// proposal yields 0 (exact amount match). Clamping never INCREASES the drift, so
+// a model cannot widen the tolerance beyond the hard cap, bounding how large an
+// amount discrepancy may auto-clear as "drift".
+func boundedAmountDrift(proposed *blnk.MatchingRule) float64 {
+	if proposed == nil {
+		return 0
+	}
+	best := 0.0
+	for _, c := range proposed.Criteria {
+		if strings.ToLower(strings.TrimSpace(c.Field)) != fieldAmount {
+			continue
+		}
+		d := c.AllowableDrift
+		if math.IsNaN(d) || math.IsInf(d, 0) || d <= 0 {
+			continue
+		}
+		if d > best {
+			best = d
+		}
+	}
+	if best > maxAmountDriftFraction {
+		best = maxAmountDriftFraction
+	}
+	return best
+}
+
+// formatAmount renders an amount as the canonical string stamped into a
+// criterion's Value for auditability (Blnk itself ignores the Value).
+func formatAmount(a float64) string {
+	return strconv.FormatFloat(a, 'f', -1, 64)
+}
+
+// compensateCreatedRule durably compensates a Blnk matching rule the agent
+// created in THIS invocation for an auto-remediation attempt that did not
+// resolve the break (finding M-11), replacing the earlier best-effort rollback
+// whose delete error was silently ignored. It:
+//  1. deletes the rule from Blnk's shared catalog so no orphan accumulates
+//     (observed growing 30 -> 88 during QA);
+//  2. records the compensation OUTCOME to the append-only audit trail — INCLUDING
+//     a delete failure, so an orphan that could not be removed stays durably
+//     visible for human cleanup (M-11's "audit cleanup failures" obligation);
+//  3. marks the durable outbox obligation compensated / compensation_failed
+//     (idempotent; tolerant of a missing row when the create-commit itself
+//     failed and no pending row was ever written); and
+//  4. on a successful delete, clears the persisted created-rule id so a later
+//     HITL re_drive does not reuse a now-deleted rule.
 //
-// Both steps are best-effort by design: their failures never abort the caller,
-// because the break MUST still route to HITL (Rule 5.7 fail-closed) even when
-// catalog cleanup cannot complete. Only a rule created in THIS call is ever
-// passed here (createdHere gate) — a reused, already-persisted rule is never
-// deleted.
-//
-// The persisted created-rule id is cleared ONLY when the Blnk delete actually
-// succeeded: on success, clearing it prevents a later HITL re_drive from
-// reusing a now-deleted rule; on failure, the rule likely still exists in Blnk,
-// so we KEEP our reference to it (rather than clearing it and forgetting an
-// orphan) — a re_drive can still reuse it or a human can reconcile it.
-func (r *Remediator) rollbackCreatedRule(ctx context.Context, externalTxnID, ruleID string) {
+// It never returns an error: the break MUST still route to HITL (Rule 5.7
+// fail-closed) even when catalog cleanup cannot complete, and any un-removed
+// orphan is both audited and left as a 'compensation_failed' outbox row for the
+// startup sweep to retry. It runs on an independent fail-closed context (finding
+// M-10) so a canceled parent cannot skip compensation. Only a rule created in
+// THIS call is ever passed here (createdHere gate).
+func (r *Remediator) compensateCreatedRule(ctx context.Context, externalTxnID, ruleID string, prov model.Provenance, confidence float64, why string) {
 	if ruleID == "" {
 		return
 	}
-	if err := r.blnkClient.DeleteMatchingRule(ctx, ruleID); err != nil {
-		return
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), compensateTimeout)
+	defer cancel()
+
+	delErr := r.blnkClient.DeleteMatchingRule(ctx, ruleID)
+	ok := delErr == nil
+	errMsg := ""
+	rationale := fmt.Sprintf("compensation (%s): deleted non-clearing rule %s from Blnk", why, ruleID)
+	if delErr != nil {
+		errMsg = delErr.Error()
+		rationale = fmt.Sprintf("compensation (%s): FAILED to delete rule %s from Blnk (%v); it may still exist and needs manual cleanup", why, ruleID, delErr)
 	}
-	_ = r.store.SetCreatedRule(ctx, externalTxnID, "")
+
+	// M-11: durable failure evidence — record the outcome in the append-only
+	// audit trail regardless of success.
+	_ = r.auditWriter.Record(ctx, audit.RuleCompensated(externalTxnID, ruleID, ok, rationale, confidence, prov))
+	// Retire (or fail) the durable outbox obligation for this rule.
+	_ = r.store.CompensateRuleOutbox(ctx, externalTxnID, ruleID, ok, errMsg)
+
+	if ok {
+		// Deletion succeeded: forget the rule so a re_drive cannot reuse it.
+		_ = r.store.SetCreatedRule(ctx, externalTxnID, "")
+	}
 }
 
-// autoApplySafe reports whether a grammar-valid proposed rule is tight enough to
-// be auto-applied to a single-transaction Blnk dry-run (finding C3). Blnk matches
-// the external transaction against internal transactions field-to-field and
-// ignores criteria.Value, so a non-equality operator (greater_than, less_than,
-// contains) can match an unintended internal counterpart and make the probe
-// falsely report the break cleared. Only equality criteria pin external ==
-// internal on a field, so every criterion must use the equals operator; any other
-// operator returns an error and the break is escalated to HITL instead of
-// auto-applied. The rule's grammar (non-empty criteria, allowed fields/operators)
-// is validated separately by classifier.ValidateRule before this check.
+// RecoverPendingRules is the startup compensation sweep for the durable rule
+// outbox (finding M-11). A 'pending' outbox row is a Blnk matching rule the agent
+// created whose owning attempt did not durably CONFIRM (break resolved) or
+// COMPENSATE (rule deleted) — the signature of a crash mid-attempt. For each
+// pending row it consults the break's CURRENT persisted status and reconciles:
+//
+//   - break auto-resolved -> the rule legitimately cleared the break, so it is
+//     NOT an orphan; CONFIRM the obligation and leave the rule in Blnk.
+//   - otherwise            -> the attempt never resolved; COMPENSATE: delete the
+//     orphaned rule from Blnk, mark the obligation, and audit the outcome
+//     (including a delete failure, so an un-removable orphan stays visible).
+//
+// It runs on an independent fail-closed context so a canceled parent cannot
+// interrupt recovery. It returns the number of pending rows it processed and a
+// non-nil error only when the pending set itself could not be listed; a per-row
+// failure is recorded (marked compensation_failed + audited) and never aborts
+// recovery of the remaining rows.
+func (r *Remediator) RecoverPendingRules(ctx context.Context) (int, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), compensateTimeout)
+	defer cancel()
+
+	pending, err := r.store.ListPendingRuleOutbox(ctx, 0)
+	if err != nil {
+		return 0, fmt.Errorf("remediator: list pending rule outbox: %w", err)
+	}
+
+	for _, item := range pending {
+		// Was the created rule the one that legitimately cleared its break? If so
+		// it is NOT an orphan and must not be deleted.
+		_, status, _, found, lerr := r.store.LoadBreak(ctx, item.ExternalTxnID)
+		if lerr != nil {
+			// Could not read the break's status; leave the row pending for a later
+			// sweep rather than risk deleting a legitimately-resolving rule.
+			continue
+		}
+		if found && status == statusAutoResolved {
+			// The rule did its job; confirm the obligation (idempotent) and keep
+			// the rule. Wrap the tx-bound confirm in a trivial transaction.
+			_ = r.store.WithTx(ctx, func(tx *sql.Tx) error {
+				return r.store.ConfirmRuleOutboxTx(ctx, tx, item.ExternalTxnID, item.RuleID)
+			})
+			continue
+		}
+
+		// Orphan: the attempt never resolved. Delete the rule from Blnk and record
+		// the outcome durably in BOTH the outbox and the append-only audit trail.
+		delErr := r.blnkClient.DeleteMatchingRule(ctx, item.RuleID)
+		ok := delErr == nil
+		errMsg := ""
+		rationale := fmt.Sprintf("startup recovery sweep: deleted orphaned rule %s from Blnk", item.RuleID)
+		if delErr != nil {
+			errMsg = delErr.Error()
+			rationale = fmt.Sprintf("startup recovery sweep: FAILED to delete orphaned rule %s from Blnk (%v); it may still exist and needs manual cleanup", item.RuleID, delErr)
+		}
+		_ = r.auditWriter.Record(ctx, audit.RuleCompensated(item.ExternalTxnID, item.RuleID, ok, rationale, 0, model.Provenance{Model: r.llmModel}))
+		_ = r.store.MarkRuleOutboxCompensated(ctx, item.ID, ok, errMsg)
+		if ok {
+			// Forget the rule so a later HITL re_drive cannot reuse a deleted one.
+			_ = r.store.SetCreatedRule(ctx, item.ExternalTxnID, "")
+		}
+	}
+	return len(pending), nil
+}
+
+// autoApplySafe reports whether a rule is tight enough to be auto-applied to a
+// single-transaction Blnk dry-run (finding C-06). Blnk matches the external
+// transaction against internal transactions field-to-field and ignores
+// criteria.Value, so a non-equality operator (greater_than, less_than, contains)
+// can match an unintended internal counterpart and make the probe falsely report
+// the break cleared. Only equality criteria pin external == internal on a field,
+// so every criterion must use the equals operator; any other operator returns an
+// error and the break is escalated to HITL instead of auto-applied.
+//
+// Since safeRuleForBreak now BUILDS the auto-applied rule deterministically from
+// a per-root-cause profile (which uses only equality criteria), this is a
+// defensive post-build assertion that the constructed profile conforms — a
+// belt-and-braces gate immediately before the POST, not the primary safety
+// mechanism. The rule's grammar (non-empty criteria, allowed fields/operators) is
+// validated separately by classifier.ValidateRule before this check.
 func autoApplySafe(rule blnk.MatchingRule) error {
 	for _, c := range rule.Criteria {
 		if c.Operator != operatorEquals {
@@ -657,30 +975,28 @@ func autoApplySafe(rule blnk.MatchingRule) error {
 
 // validConfidence reports whether c is a finite probability in [0,1]. A
 // confidence that is NaN, ±Inf, or out of range is treated as malformed and
-// fails the break closed to HITL (finding m-4).
+// fails the break closed to HITL (finding M-09).
 //
-// This is the CONSUMER half of recon-agent's two-layer confidence policy
-// (finding SEAM-INFO-1); the PRODUCER half is classifier.clampConfidence, which
-// normalizes every raw model confidence into [0,1] before it leaves the
-// classifier. The two layers form ONE coherent policy, not two competing
-// philosophies: a confidence produced by the classifier is already clamped, so
-// this check passes it through untouched (a legitimately clamped value — e.g. a
-// model over-confidence normalized to 1.0 — is never falsely escalated, and is
-// then decided by Blnk's deterministic arbiter per Rule 5.3). The check exists
-// as defense in depth for confidences that did NOT pass through the clamp:
-// values reconstructed from the store on resume, injected by tests, or emitted
-// by any future non-clamping producer. If such a value reaches the gate
+// The classifier REJECTS a malformed model confidence at parse time (a
+// non-finite or out-of-range value makes classification fail, which itself
+// fails the break closed per Rule 5.7) — it does NOT silently clamp one into
+// range. This check is therefore the remediator's independent, defense-in-depth
+// guard for confidences that did NOT originate from a fresh classifier parse:
+// values reconstructed from the store on a crash-resume, injected by tests, or
+// produced by any future alternative source. If such a value reaches the gate
 // malformed, failing closed here prevents a NaN comparison from silently
-// defeating the confidence gate (Rule 5.4).
+// defeating the confidence gate (Rule 5.4); a well-formed value passes through
+// untouched and is then decided by Blnk's deterministic arbiter (Rule 5.3).
 func validConfidence(c float64) bool {
 	return !math.IsNaN(c) && !math.IsInf(c, 0) && c >= 0 && c <= 1
 }
 
-// safeConfidence clamps a possibly-malformed confidence to a value the audit
-// validator accepts (finite, in [0,1]); malformed inputs collapse to 0 so an
-// escalated event can still be recorded for the break. It mirrors the
-// producer-side classifier.clampConfidence for the escalation path (finding
-// SEAM-INFO-1), keeping the two layers of the confidence policy consistent.
+// safeConfidence coerces a possibly-malformed confidence to a value the audit
+// validator accepts (finite, in [0,1]); a malformed input collapses to 0 so an
+// escalated event can still be recorded for the break. It exists only for the
+// escalation path, where a break carrying a store-reconstructed or test-injected
+// out-of-range confidence must still be routed to HITL with a well-formed audit
+// event rather than being dropped.
 func safeConfidence(c float64) float64 {
 	if !validConfidence(c) {
 		return 0

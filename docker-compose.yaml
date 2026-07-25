@@ -34,6 +34,16 @@ services:
       - jaeger
     volumes:
       - ./blnk.json:/blnk.json
+    # Readiness signal so dependents (recon-agent) can gate on Blnk actually
+    # serving, not merely started (finding M-16). Blnk exposes /health => UP on
+    # 5001; the published image is Debian-slim with wget available. Generous
+    # start_period covers the `blnk migrate up && blnk start` boot.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:5001/health 2>/dev/null | grep -q UP || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   worker:
     image: ${BLNK_IMAGE:-jerryenebeli/blnk:0.15.0}
@@ -67,8 +77,20 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
       POSTGRES_DB: ${POSTGRES_DB:-blnk}
+      # recon-agent (finding M-13): the DEDICATED, least-privilege role the agent
+      # connects as at runtime. Consumed ONCE, on first DB initialization, by the
+      # mounted agent-db-init.sh below (which creates the role and the `agent`
+      # schema it owns). This password MUST match the one embedded in the
+      # recon-agent service's AGENT_DATABASE_URL — synchronized credentials — and
+      # is NOT the Postgres superuser password.
+      AGENT_POSTGRES_USER: ${AGENT_POSTGRES_USER:-recon_agent}
+      AGENT_POSTGRES_PASSWORD: ${AGENT_POSTGRES_PASSWORD:-recon_agent_pw}
     volumes:
       - pg_data:/var/lib/postgresql/data
+      # Provision the recon-agent's dedicated role + owned `agent` schema at first
+      # init so the agent NEVER holds superuser credentials at runtime (M-13).
+      # Runs once on an empty data volume; idempotent if re-applied by an operator.
+      - ./recon-agent/deploy/agent-db-init.sh:/docker-entrypoint-initdb.d/10-agent-db-init.sh:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-postgres}"]
       interval: 10s
@@ -122,26 +144,59 @@ services:
 
   recon-agent:
     build:
-      context: ./recon-agent
+      # Repo-ROOT build context so the image can package the seed statement
+      # fixture (seed/external_transactions.csv) — finding C-04. The Dockerfile
+      # lives under recon-agent/ but addresses paths from the root context.
+      context: .
+      dockerfile: recon-agent/Dockerfile
     container_name: recon-agent
     restart: on-failure
+    # Explicit work trigger (finding C-04): serve mode runs the pipeline once on
+    # boot, then serves the HITL surface. A distinct -source isolates this boot
+    # run from host-driven `make demo` (default source "seed-bank") so the two
+    # never collide on the shared agent_run idempotency key (finding M-15).
+    command: ["recon-agent", "-source", "compose-boot"]
     environment:
       TZ: ${TZ:-Etc/UTC}
-      LLM_BASE_URL: ${LLM_BASE_URL}
+      # Safe NON-ROUTABLE loopback default so `docker compose up` works out of the
+      # box even before .env is customized: nothing listens on the container's own
+      # 127.0.0.1:11434, so the classifier fails closed and every break routes to
+      # HITL (Rule 5.7 — the safe outcome). Point LLM_BASE_URL in .env at a real
+      # OpenAI-compatible endpoint to enable auto-remediation. A loopback default
+      # can never transmit transaction data off-box.
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://127.0.0.1:11434/v1}
       LLM_API_KEY: ${LLM_API_KEY}
       LLM_MODEL: ${LLM_MODEL:-kimi-k3}
       BLNK_BASE_URL: http://server:5001
       BLNK_API_KEY: ${BLNK_API_KEY}
       CONF_AUTO_THRESHOLD: ${CONF_AUTO_THRESHOLD:-0.85}
       HITL_PORT: ${HITL_PORT:-8088}
-      AGENT_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable
+      # Connect as the DEDICATED, least-privilege role provisioned by
+      # agent-db-init.sh — NOT the Postgres superuser (finding M-13). The password
+      # MUST equal AGENT_POSTGRES_PASSWORD given to the postgres service above
+      # (synchronized credentials).
+      AGENT_DATABASE_URL: postgres://${AGENT_POSTGRES_USER:-recon_agent}:${AGENT_POSTGRES_PASSWORD:-recon_agent_pw}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable
     ports:
-      - "${HITL_PORT:-8088}:${HITL_PORT:-8088}"
+      # Publish the UNAUTHENTICATED HITL API + status page on LOOPBACK ONLY so it
+      # is not exposed on every host interface (finding C-05). Same-origin/CSRF
+      # protections in the HITL server are defense in depth.
+      - "127.0.0.1:${HITL_PORT:-8088}:${HITL_PORT:-8088}"
+    healthcheck:
+      # Container liveness (finding M-16): /healthz is always-on once the HITL
+      # server binds (readiness is separately exposed at /readyz). busybox wget
+      # ships in the alpine runtime; the image also declares this HEALTHCHECK.
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:${HITL_PORT:-8088}/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
+      # Gate startup on REAL readiness of both dependencies (finding M-16), not
+      # merely service_started.
       postgres:
         condition: service_healthy
       server:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   pg_data:

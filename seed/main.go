@@ -50,6 +50,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -76,6 +77,28 @@ const httpTimeout = 30 * time.Second
 const (
 	readinessAttempts = 10
 	readinessDelay    = 1 * time.Second
+)
+
+// Response and redirect bounds (M-06). The Blnk responses the seed consumes are
+// small JSON documents, so a few MiB is a generous cap that still prevents a
+// malicious or misconfigured endpoint from streaming an unbounded body into
+// memory. Redirects are restricted to the same origin so the custom X-Blnk-Key
+// header — which Go, unlike Authorization/Cookie, does NOT strip on a
+// cross-origin redirect — can never be forwarded to a foreign host.
+const (
+	maxRespBytes int64 = 4 << 20 // 4 MiB cap on any response body the seed reads
+	maxRedirects       = 10      // upper bound on a same-origin redirect chain
+)
+
+// External-statement input bounds (M-07). The seed validates the CSV strictly
+// and with hard limits so a malformed, hostile, or accidentally-huge statement
+// fails fast instead of exhausting memory or smuggling non-finite/duplicate
+// data past Blnk (which silently coerces an unparseable amount to 0).
+const (
+	maxCSVFileBytes  int64 = 8 << 20  // 8 MiB cap on the whole statement file
+	maxCSVRows             = 100_000  // cap on data rows (excludes the header)
+	maxCSVFieldBytes       = 64 << 10 // 64 KiB cap on any single field
+	maxAbsAmount           = 1e12     // reject non-finite / absurd-magnitude amounts
 )
 
 // config holds the resolved runtime configuration. Values come from
@@ -186,8 +209,36 @@ func newBlnkClient(baseURL, apiKey string) *blnkClient {
 	return &blnkClient{
 		baseURL: baseURL,
 		apiKey:  apiKey,
-		http:    &http.Client{Timeout: httpTimeout},
+		http: &http.Client{
+			Timeout:       httpTimeout,
+			CheckRedirect: sameOriginOnly,
+		},
 	}
+}
+
+// sameOriginOnly is an http.Client.CheckRedirect hook that refuses any redirect
+// to a different origin (scheme+host) and caps the length of a same-origin
+// redirect chain. This is a security control (M-06): the seed attaches the
+// custom X-Blnk-Key header to every request, and Go's http.Client forwards
+// custom headers across redirects — it only strips a fixed set (Authorization,
+// WWW-Authenticate, Cookie) on a cross-origin hop. Refusing cross-origin
+// redirects outright guarantees the key is never delivered to a foreign host.
+func sameOriginOnly(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxRedirects)
+	}
+	// via[0] is the original request; every hop must stay on its origin.
+	if len(via) > 0 && !sameOrigin(via[0].URL, req.URL) {
+		return fmt.Errorf("refusing cross-origin redirect from %s://%s to %s://%s",
+			via[0].URL.Scheme, via[0].URL.Host, req.URL.Scheme, req.URL.Host)
+	}
+	return nil
+}
+
+// sameOrigin reports whether two URLs share the same scheme and host
+// (case-insensitively), i.e. the same web origin.
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
 }
 
 // postJSON marshals payload to JSON and POSTs it to baseURL+path with a JSON
@@ -213,7 +264,7 @@ func (c *blnkClient) postJSON(path string, payload any) ([]byte, int, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("read response body for %s: %w", path, err)
 	}
@@ -225,7 +276,7 @@ func (c *blnkClient) postJSON(path string, payload any) ([]byte, int, error) {
 // and a "source" field-part. The X-Blnk-Key header is attached. It returns the
 // raw response body and HTTP status code.
 func (c *blnkClient) uploadFile(path, csvPath, source string) ([]byte, int, error) {
-	fileBytes, err := os.ReadFile(csvPath)
+	fileBytes, err := readFileBounded(csvPath, maxCSVFileBytes)
 	if err != nil {
 		return nil, 0, fmt.Errorf("read csv file %s: %w", csvPath, err)
 	}
@@ -262,7 +313,7 @@ func (c *blnkClient) uploadFile(path, csvPath, source string) ([]byte, int, erro
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("read upload response body: %w", err)
 	}
@@ -373,6 +424,29 @@ func is2xx(status int) bool {
 	return status >= 200 && status < 300
 }
 
+// readFileBounded reads at most limit bytes from the file at path, returning an
+// error if the file exceeds the limit (M-06/M-07). It guards the upload path
+// against a statement that grew — or was swapped for a symlink to something
+// enormous — between validation and upload, so the seed never buffers an
+// unbounded file into memory.
+func readFileBounded(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	// Read one extra byte so a file exactly at the limit is accepted while a
+	// larger one is reliably detected.
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("file %s exceeds the %d-byte limit", path, limit)
+	}
+	return data, nil
+}
+
 // loadSeedData reads and decodes the internal ledger JSON file into seedData,
 // failing with an actionable error if the file is missing, invalid, or lacks a
 // ledger name.
@@ -449,19 +523,38 @@ func checkInternalSeedState(client *blnkClient, data *seedData) (state internalS
 var requiredCSVColumns = []string{"id", "amount", "currency", "reference", "description", "date"}
 
 // validateExternalCSV reads and strictly validates the external statement CSV,
-// returning the number of data rows (excluding the header). It fails if a
-// required column is missing, a row has the wrong number of fields, a required
-// field is empty, an amount is not a valid float, or a date is not valid
-// RFC3339. The returned count is later asserted against the record_count Blnk
-// reports for the upload, so a silently dropped or added row is caught too.
+// returning the number of data rows (excluding the header). Validation is
+// bounded and streaming (M-07): the file is capped at maxCSVFileBytes, the
+// number of data rows at maxCSVRows, and each field at maxCSVFieldBytes, so a
+// malformed or hostile statement fails fast rather than exhausting memory.
+//
+// A row is rejected if a required column is missing, the field count is wrong,
+// any field is too large, a required field is empty, an external id is
+// duplicated, the amount is not a FINITE float in (0, maxAbsAmount], or the
+// date is not valid RFC3339. Rejecting NaN/±Inf and non-numeric amounts matters
+// because Blnk silently coerces an unparseable amount to 0; likewise it coerces
+// an unparseable date to the zero time. The returned count is later asserted
+// against the record_count Blnk reports for the upload, so a silently dropped
+// or added row is caught too.
 func validateExternalCSV(csvPath string) (int, error) {
+	// Fast pre-check on the file size before opening for read, so an obviously
+	// oversized statement is rejected without streaming any of it.
+	if info, statErr := os.Stat(csvPath); statErr == nil && info.Size() > maxCSVFileBytes {
+		return 0, fmt.Errorf("csv %s is %d bytes, exceeding the %d-byte limit",
+			csvPath, info.Size(), maxCSVFileBytes)
+	}
+
 	f, err := os.Open(csvPath)
 	if err != nil {
 		return 0, fmt.Errorf("open csv file %s: %w", csvPath, err)
 	}
 	defer func() { _ = f.Close() }()
 
-	reader := csv.NewReader(f)
+	// Defense-in-depth byte bound: even if os.Stat under-reported (a symlink,
+	// concurrent growth, or a stat error above), never read more than the cap
+	// (+1 to keep a file exactly at the limit valid). Reading is row-by-row; the
+	// whole file is never buffered.
+	reader := csv.NewReader(io.LimitReader(f, maxCSVFileBytes+1))
 	// Disable the automatic fields-per-record check so we can surface a clearer,
 	// row-numbered error message ourselves.
 	reader.FieldsPerRecord = -1
@@ -483,6 +576,9 @@ func validateExternalCSV(csvPath string) (int, error) {
 		}
 	}
 
+	idIdx := colIndex["id"]
+	seenIDs := make(map[string]int) // external id -> the first line it appeared on
+
 	dataRows := 0
 	line := 1 // the header row was already consumed
 	for {
@@ -495,20 +591,60 @@ func validateExternalCSV(csvPath string) (int, error) {
 			return 0, fmt.Errorf("read csv %s row %d: %w", csvPath, line, readErr)
 		}
 
+		// Cap the number of data rows so an enormous statement cannot make the
+		// seed run unbounded.
+		if dataRows >= maxCSVRows {
+			return 0, fmt.Errorf("csv %s exceeds the %d-row limit", csvPath, maxCSVRows)
+		}
+
 		if len(record) != len(header) {
 			return 0, fmt.Errorf("csv %s row %d: expected %d fields but found %d",
 				csvPath, line, len(header), len(record))
 		}
+
+		// Bound each field's size so a single monster cell cannot balloon memory.
+		for i, field := range record {
+			if len(field) > maxCSVFieldBytes {
+				return 0, fmt.Errorf("csv %s row %d: field %d is %d bytes, exceeding the %d-byte limit",
+					csvPath, line, i+1, len(field), maxCSVFieldBytes)
+			}
+		}
+
 		for _, col := range requiredCSVColumns {
 			if strings.TrimSpace(record[colIndex[col]]) == "" {
 				return 0, fmt.Errorf("csv %s row %d: required field %q is empty", csvPath, line, col)
 			}
 		}
-		// Amount must parse as a float; Blnk would otherwise coerce it to 0.
+
+		// External id must be unique across the statement: Blnk keys external
+		// transactions by id, so a duplicate would collide on upload/reconcile.
+		id := strings.TrimSpace(record[idIdx])
+		if first, dup := seenIDs[id]; dup {
+			return 0, fmt.Errorf("csv %s row %d: duplicate id %q (first seen on row %d)",
+				csvPath, line, id, first)
+		}
+		seenIDs[id] = line
+
+		// Amount must parse as a FINITE float within a sane magnitude and be
+		// non-zero. Blnk would otherwise coerce an unparseable amount to 0; a
+		// NaN/±Inf or absurd magnitude is rejected here so it can never enter
+		// reconciliation.
 		amountStr := strings.TrimSpace(record[colIndex["amount"]])
-		if _, convErr := strconv.ParseFloat(amountStr, 64); convErr != nil {
+		amount, convErr := strconv.ParseFloat(amountStr, 64)
+		if convErr != nil {
 			return 0, fmt.Errorf("csv %s row %d: amount %q is not a valid number", csvPath, line, amountStr)
 		}
+		if math.IsNaN(amount) || math.IsInf(amount, 0) {
+			return 0, fmt.Errorf("csv %s row %d: amount %q is not finite", csvPath, line, amountStr)
+		}
+		if amount == 0 {
+			return 0, fmt.Errorf("csv %s row %d: amount must be non-zero", csvPath, line)
+		}
+		if math.Abs(amount) > maxAbsAmount {
+			return 0, fmt.Errorf("csv %s row %d: amount %q exceeds the maximum magnitude %g",
+				csvPath, line, amountStr, float64(maxAbsAmount))
+		}
+
 		// Date must parse as RFC3339; Blnk would otherwise coerce it to the zero time.
 		dateStr := strings.TrimSpace(record[colIndex["date"]])
 		if _, convErr := time.Parse(time.RFC3339, dateStr); convErr != nil {

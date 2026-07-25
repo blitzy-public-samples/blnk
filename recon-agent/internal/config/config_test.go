@@ -34,8 +34,14 @@ func TestLoad_Defaults(t *testing.T) {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
 
-	if cfg.LLMBaseURL != "https://api.moonshot.ai/v1" {
-		t.Errorf("LLMBaseURL default = %q, want %q", cfg.LLMBaseURL, "https://api.moonshot.ai/v1")
+	// M-04: the shipped default MUST be a non-routable loopback placeholder,
+	// never a live third-party provider, so copying the defaults cannot
+	// silently transmit transaction data off-box.
+	if cfg.LLMBaseURL != "http://localhost:11434/v1" {
+		t.Errorf("LLMBaseURL default = %q, want %q", cfg.LLMBaseURL, "http://localhost:11434/v1")
+	}
+	if strings.Contains(cfg.LLMBaseURL, "moonshot.ai") || strings.Contains(cfg.LLMBaseURL, "api.openai.com") {
+		t.Errorf("LLMBaseURL default = %q must not point at a live external provider", cfg.LLMBaseURL)
 	}
 	if cfg.LLMModel != "kimi-k3" {
 		t.Errorf("LLMModel default = %q, want %q", cfg.LLMModel, "kimi-k3")
@@ -287,5 +293,124 @@ func TestLoad_SecretsNotEchoed(t *testing.T) {
 		if strings.Contains(err.Error(), secret) {
 			t.Fatalf("error message leaks secret %q: %s", secret, err.Error())
 		}
+	}
+}
+
+// TestLoad_InvalidBaseURL asserts that a malformed, non-HTTP(S), host-less, or
+// userinfo-bearing LLM_BASE_URL or BLNK_BASE_URL is rejected at load time
+// rather than surfacing only at request time (or silently transmitting data to
+// an unintended destination). Covers M-04.
+func TestLoad_InvalidBaseURL(t *testing.T) {
+	for _, key := range []string{"LLM_BASE_URL", "BLNK_BASE_URL"} {
+		for _, raw := range []string{
+			"   ",                           // whitespace-only
+			"not a url",                     // unparseable / spaces
+			"ftp://host/v1",                 // unsupported scheme
+			"file:///etc/passwd",            // unsupported scheme
+			"://missing-scheme",             // no scheme
+			"http://",                       // missing host
+			"https://",                      // missing host
+			"http://user:pass@host:8000/v1", // embedded userinfo (credential leak)
+			"localhost:8000",                // relative, no scheme/host
+		} {
+			t.Run(key+"="+raw, func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("AGENT_DATABASE_URL", testDSN)
+				t.Setenv(key, raw)
+
+				_, err := Load()
+				if err == nil {
+					t.Fatalf("Load() error = nil, want error for %s=%q", key, raw)
+				}
+				if !strings.Contains(err.Error(), key) {
+					t.Fatalf("error %q does not name %s", err.Error(), key)
+				}
+			})
+		}
+	}
+}
+
+// TestLoad_BaseURLUserinfoNotEchoed asserts that when a URL embeds credentials
+// the resulting error never echoes the secret back (defense against leaking a
+// misplaced token into logs). Covers M-04.
+func TestLoad_BaseURLUserinfoNotEchoed(t *testing.T) {
+	const secret = "sup3r-secret-token"
+	clearEnv(t)
+	t.Setenv("AGENT_DATABASE_URL", testDSN)
+	t.Setenv("LLM_BASE_URL", "https://user:"+secret+"@api.example.com/v1")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want userinfo-rejected error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error message leaks embedded URL secret: %s", err.Error())
+	}
+}
+
+// TestLoad_ValidBaseURLAccepted asserts representative valid absolute http(s)
+// URLs are accepted and stored trimmed/canonical for both LLM and Blnk bases.
+func TestLoad_ValidBaseURLAccepted(t *testing.T) {
+	for _, raw := range []string{
+		"http://localhost:11434/v1",
+		"https://api.example.com/v1",
+		"http://server:5001",
+		"  http://localhost:8000/v1  ", // surrounding whitespace trimmed
+	} {
+		t.Run(raw, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("AGENT_DATABASE_URL", testDSN)
+			t.Setenv("LLM_BASE_URL", raw)
+			t.Setenv("BLNK_BASE_URL", raw)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() unexpected error for base URL %q: %v", raw, err)
+			}
+			want := strings.TrimSpace(raw)
+			if cfg.LLMBaseURL != want {
+				t.Fatalf("LLMBaseURL = %q, want canonical %q", cfg.LLMBaseURL, want)
+			}
+			if cfg.BlnkBaseURL != want {
+				t.Fatalf("BlnkBaseURL = %q, want canonical %q", cfg.BlnkBaseURL, want)
+			}
+		})
+	}
+}
+
+// TestLoad_BlankModelRejected asserts that a blank or whitespace-only LLM_MODEL
+// (an explicit misconfiguration, since the model name is Rule 5.6 config-driven)
+// fails fast rather than sending an empty model to the endpoint.
+func TestLoad_BlankModelRejected(t *testing.T) {
+	for _, raw := range []string{" ", "   ", "\t", "\n"} {
+		t.Run(fmt.Sprintf("%q", raw), func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("AGENT_DATABASE_URL", testDSN)
+			t.Setenv("LLM_MODEL", raw)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() error = nil, want error for blank LLM_MODEL=%q", raw)
+			}
+			if !strings.Contains(err.Error(), "LLM_MODEL") {
+				t.Fatalf("error %q does not name LLM_MODEL", err.Error())
+			}
+		})
+	}
+}
+
+// TestLoad_ModelTrimmed asserts a valid model with surrounding whitespace is
+// stored in canonical trimmed form.
+func TestLoad_ModelTrimmed(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("AGENT_DATABASE_URL", testDSN)
+	t.Setenv("LLM_MODEL", "  kimi-k3  ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.LLMModel != "kimi-k3" {
+		t.Fatalf("LLMModel = %q, want trimmed %q", cfg.LLMModel, "kimi-k3")
 	}
 }
