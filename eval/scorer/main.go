@@ -7,23 +7,23 @@
 //
 // Criteria enforced
 //
-//   1. Exactly six breaks were ingested (breaks_in == 6, six resolved records,
-//      every canonical id present).
-//   2. At least five of six root-cause LABELS match the corpus ground truth.
-//   3. At least one break was auto-resolved (>= 1 clearance). Clearance itself
-//      is proven in-code: the remediator marks a break resolved ONLY after a
-//      Blnk dry-run reconciliation confirms it left the unmatched set (Rule 5.3);
-//      the DB-backed integration test additionally asserts this against a live
-//      Blnk. The scorer verifies the resulting auto-resolve OUTCOME count.
-//   4. Routing safety (Rule 5.4): no break the corpus marks escalate, and no
-//      regulated break, is ever auto-resolved; every regulated break escalates.
-//   5. Complete disposition + audit parity: every break reached exactly one
-//      terminal outcome (breaks_in == auto_resolved + escalated, so none is
-//      silently dropped) and produced at least one audit event
-//      (audit_count >= breaks_in). Exact per-ACTION audit parity is asserted by
-//      the DB-backed integration test, which can enumerate every store row.
-//   6. Fixture integrity: the seed CSV and the corpus still describe exactly the
-//      same six canonical breaks (guards against fixture/corpus drift).
+//  1. Exactly six breaks were ingested (breaks_in == 6, six resolved records,
+//     every canonical id present).
+//  2. At least five of six root-cause LABELS match the corpus ground truth.
+//  3. At least one break was auto-resolved (>= 1 clearance). Clearance itself
+//     is proven in-code: the remediator marks a break resolved ONLY after a
+//     Blnk dry-run reconciliation confirms it left the unmatched set (Rule 5.3);
+//     the DB-backed integration test additionally asserts this against a live
+//     Blnk. The scorer verifies the resulting auto-resolve OUTCOME count.
+//  4. Routing safety (Rule 5.4): no break the corpus marks escalate, and no
+//     regulated break, is ever auto-resolved; every regulated break escalates.
+//  5. Complete disposition + audit parity: every break reached exactly one
+//     terminal outcome (breaks_in == auto_resolved + escalated, so none is
+//     silently dropped) and produced at least one audit event
+//     (audit_count >= breaks_in). Exact per-ACTION audit parity is asserted by
+//     the DB-backed integration test, which can enumerate every store row.
+//  6. Fixture integrity: the seed CSV and the corpus still describe exactly the
+//     same six canonical breaks (guards against fixture/corpus drift).
 //
 // Scope / dependency hygiene
 //

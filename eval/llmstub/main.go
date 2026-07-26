@@ -3,7 +3,7 @@
 // recon-agent pipeline with reproducible classifications WITHOUT contacting a
 // real LLM provider.
 //
-// Why it exists
+// # Why it exists
 //
 // The recon-agent classifier always issues a real OpenAI-compatible chat
 // completion against LLM_BASE_URL (Rule 5.6: model + endpoint are config-driven,
@@ -30,7 +30,7 @@
 // test/demo harness, explicitly outside the recon-agent coverage floor scope
 // (Rule 5.9 excludes seed/ and eval/).
 //
-// Protocol
+// # Protocol
 //
 // It serves an OpenAI-compatible POST .../chat/completions surface (any path is
 // accepted, so it works whether or not LLM_BASE_URL includes a /v1 suffix) plus
