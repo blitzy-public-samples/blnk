@@ -1,0 +1,13 @@
+# Generated run artifacts produced by the recon-agent make targets. These are
+# machine-local outputs, never committed:
+#   coverage.out         -> written by `make test` (go test -coverprofile).
+#   recon_resolved.jsonl -> written by `make demo` / `go run ./cmd` (the
+#                           idempotent per-run resolved/escalated log; this is
+#                           NOT the committed ground-truth corpus at
+#                           eval/recon_corpus.jsonl).
+#   recon_summary.json   -> written by `make demo` / `go run ./cmd` (the
+#                           machine-readable one-shot run report of breaks in /
+#                           auto-resolved / escalated / audit count).
+/coverage.out
+/recon_resolved.jsonl
+/recon_summary.json

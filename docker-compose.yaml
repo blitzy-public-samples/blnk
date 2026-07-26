@@ -24,16 +24,38 @@ services:
     environment:
       TZ: ${TZ:-Etc/UTC}
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      # Configure Blnk entirely via BLNK_* env (envconfig); no blnk.json file is
+      # required. blnk.json is .gitignored (operator-supplied), so a bare clone
+      # ships none — bind-mounting the absent file materializes an empty
+      # DIRECTORY at /blnk.json and Blnk's loader fails with
+      # "read blnk.json: is a directory". These DSNs target the compose service
+      # names so a clean-machine `docker compose up --build` needs no host config.
+      BLNK_DATA_SOURCE_DNS: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable
+      BLNK_REDIS_DNS: redis:6379
+      BLNK_TYPESENSE_DNS: http://typesense:8108
     ports:
       - "5001:5001"
       - "80:80"
       - "443:443"
     depends_on:
-      - redis
-      - postgres
-      - jaeger
-    volumes:
-      - ./blnk.json:/blnk.json
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      typesense:
+        condition: service_started
+      jaeger:
+        condition: service_started
+    # Readiness signal so dependents (recon-agent) can gate on Blnk actually
+    # serving, not merely started (finding M-16). Blnk exposes /health => UP on
+    # 5001; the published image is Debian-slim with wget available. Generous
+    # start_period covers the `blnk migrate up && blnk start` boot.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:5001/health 2>/dev/null | grep -q UP || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   worker:
     image: ${BLNK_IMAGE:-jerryenebeli/blnk:0.15.0}
@@ -41,15 +63,23 @@ services:
     restart: on-failure
     entrypoint: ["blnk", "workers"]
     environment:
+      TZ: ${TZ:-Etc/UTC}
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      # Same env-only Blnk configuration as the server service (no blnk.json).
+      BLNK_DATA_SOURCE_DNS: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable
+      BLNK_REDIS_DNS: redis:6379
+      BLNK_TYPESENSE_DNS: http://typesense:8108
     ports:
       - "5004:5004"
     depends_on:
-      - redis
-      - postgres
-      - jaeger
-    volumes:
-      - ./blnk.json:/blnk.json
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      typesense:
+        condition: service_started
+      jaeger:
+        condition: service_started
 
   redis:
     image: redis:7.2.4
@@ -67,8 +97,28 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
       POSTGRES_DB: ${POSTGRES_DB:-blnk}
+      # recon-agent two-role least-privilege model (findings M-13 and F05).
+      # Consumed ONCE, on first DB initialization, by the mounted agent-db-init.sh
+      # below. It provisions TWO roles with strict privilege separation:
+      #   * the RESTRICTED RUNTIME role (AGENT_POSTGRES_*) the agent connects as
+      #     for all normal work: it owns NOTHING, has NO database CREATE, and
+      #     cannot disable the append-only audit trigger or mutate/drop audit
+      #     history. Its password MUST match the one embedded in the recon-agent
+      #     service's AGENT_DATABASE_URL (synchronized credentials).
+      #   * the OWNER/MIGRATOR role (AGENT_MIGRATOR_*) that owns the `agent`
+      #     schema and runs ONLY the boot migration. Its password MUST match the
+      #     one embedded in the recon-agent service's AGENT_MIGRATE_DATABASE_URL.
+      # Neither is the Postgres superuser.
+      AGENT_POSTGRES_USER: ${AGENT_POSTGRES_USER:-recon_agent}
+      AGENT_POSTGRES_PASSWORD: ${AGENT_POSTGRES_PASSWORD:-recon_agent_pw}
+      AGENT_MIGRATOR_USER: ${AGENT_MIGRATOR_USER:-recon_agent_migrator}
+      AGENT_MIGRATOR_PASSWORD: ${AGENT_MIGRATOR_PASSWORD:-recon_agent_migrator_pw}
     volumes:
       - pg_data:/var/lib/postgresql/data
+      # Provision the recon-agent's dedicated role + owned `agent` schema at first
+      # init so the agent NEVER holds superuser credentials at runtime (M-13).
+      # Runs once on an empty data volume; idempotent if re-applied by an operator.
+      - ./recon-agent/deploy/agent-db-init.sh:/docker-entrypoint-initdb.d/10-agent-db-init.sh:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-postgres}"]
       interval: 10s
@@ -119,6 +169,86 @@ services:
     depends_on:
       - server
       - worker
+
+  recon-agent:
+    build:
+      # Repo-ROOT build context so the image can package the seed statement
+      # fixture (seed/external_transactions.csv) — finding C-04. The Dockerfile
+      # lives under recon-agent/ but addresses paths from the root context.
+      context: .
+      dockerfile: recon-agent/Dockerfile
+    container_name: recon-agent
+    restart: on-failure
+    # F01: by DEFAULT this long-lived container boots SERVE-ONLY — it waits for
+    # its dependencies to be reachable, marks the HITL surface ready, and serves,
+    # but it does NOT process the baked fixture on boot. The documented
+    # clean-machine contract is `docker compose up → make seed → make demo`: the
+    # six-break run is the explicit host-driven `make demo` one-shot AFTER the
+    # ledger is seeded, so the sidecar must never triage merely because the
+    # container started (which would run against an un-seeded Blnk and permanently
+    # record a bogus run). Set AGENT_RUN_ON_BOOT=true (below) ONLY for an
+    # environment whose Blnk DB is already seeded before the agent boots, to opt
+    # into the AAP §0.5.1 "run pipeline once → serve" boot behavior; the -source
+    # label then isolates that boot run from host-driven `make demo` (default
+    # source "seed-bank") so the two never collide (findings M-15 / F17).
+    command: ["recon-agent", "-source", "compose-boot"]
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      # Safe NON-ROUTABLE loopback default so `docker compose up` works out of the
+      # box even before .env is customized: nothing listens on the container's own
+      # 127.0.0.1:11434, so the classifier fails closed and every break routes to
+      # HITL (Rule 5.7 — the safe outcome). Point LLM_BASE_URL in .env at a real
+      # OpenAI-compatible endpoint to enable auto-remediation. A loopback default
+      # can never transmit transaction data off-box.
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://127.0.0.1:11434/v1}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL:-kimi-k3}
+      BLNK_BASE_URL: http://server:5001
+      BLNK_API_KEY: ${BLNK_API_KEY}
+      CONF_AUTO_THRESHOLD: ${CONF_AUTO_THRESHOLD:-0.85}
+      HITL_PORT: ${HITL_PORT:-8088}
+      # F01: OFF by default so this container boots serve-only and never triages
+      # the baked fixture merely because it started (which would run against an
+      # un-seeded Blnk on a clean machine). Set to true ONLY when Blnk's DB is
+      # already seeded before the agent boots, to run the pipeline once on boot.
+      AGENT_RUN_ON_BOOT: ${AGENT_RUN_ON_BOOT:-false}
+      # Connect as the RESTRICTED RUNTIME role provisioned by agent-db-init.sh —
+      # NOT the Postgres superuser and NOT the schema owner (findings M-13, F05).
+      # The password MUST equal AGENT_POSTGRES_PASSWORD given to the postgres
+      # service above (synchronized credentials).
+      AGENT_DATABASE_URL: postgres://${AGENT_POSTGRES_USER:-recon_agent}:${AGENT_POSTGRES_PASSWORD:-recon_agent_pw}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable
+      # Owner/migrator DSN used SOLELY to run the boot migration and then grant
+      # the runtime role its least privileges (finding F05). Setting this selects
+      # the two-role model; the password MUST equal AGENT_MIGRATOR_PASSWORD given
+      # to the postgres service above (synchronized credentials).
+      AGENT_MIGRATE_DATABASE_URL: postgres://${AGENT_MIGRATOR_USER:-recon_agent_migrator}:${AGENT_MIGRATOR_PASSWORD:-recon_agent_migrator_pw}@postgres:5432/${POSTGRES_DB:-blnk}?sslmode=disable
+    ports:
+      # Publish the UNAUTHENTICATED HITL API + status page on LOOPBACK ONLY so it
+      # is not exposed on every host interface (finding C-05). Same-origin/CSRF
+      # protections in the HITL server are defense in depth.
+      - "127.0.0.1:${HITL_PORT:-8088}:${HITL_PORT:-8088}"
+    healthcheck:
+      # Container READINESS gate: /readyz returns 200 only once the agent has
+      # reached its ready state (503 until then), so the container is reported
+      # healthy only when it can actually serve — never a false-green. In the
+      # DEFAULT serve-only boot (F01), ready means dependencies (Blnk + the agent
+      # store) are reachable; when AGENT_RUN_ON_BOOT=true, ready additionally means
+      # the boot pipeline completed. BusyBox wget (alpine runtime) exits non-zero
+      # on a 503, so an unready agent is reported unhealthy; /healthz remains
+      # available for plain liveness. The start_period is generous to cover
+      # dependency readiness (and, when enabled, the initial one-shot pipeline).
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:${HITL_PORT:-8088}/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    depends_on:
+      # Gate startup on REAL readiness of both dependencies (finding M-16), not
+      # merely service_started.
+      postgres:
+        condition: service_healthy
+      server:
+        condition: service_healthy
 
 volumes:
   pg_data:

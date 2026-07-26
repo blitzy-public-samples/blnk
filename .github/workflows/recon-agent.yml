@@ -1,0 +1,440 @@
+name: recon-agent CI
+
+# M-03: deterministic, exact-acceptance CI for the recon-agent sidecar.
+#   * Triggers on the agent's own tree AND on the Blnk HTTP CONTRACT AUTHORITIES it
+#     consumes (Rule 5.1), so a change to a consumed route/DTO re-runs this CI.
+#   * Environment is scoped PER STEP: BLNK_DATA_SOURCE_DNS/REDIS/TYPESENSE are set
+#     only on the Blnk migrate/start steps, never job-globally, so Blnk's
+#     config-package file-load unit tests (run by `make test` step 3) are not
+#     broken by an inherited DSN.
+#   * Gates: zero-warning build/vet (Gate 2), dependency audit + govulncheck +
+#     protected-core preservation (Gate 8 / Rule 5.6 / Rule 5.8), image + compose
+#     build (C-04), unit coverage >=80% + tagged integration (Gate 9/10), and the
+#     end-to-end `make demo` with its <=60s scorer acceptance (Gate 1).
+#   * Supply chain: every action is pinned by full commit SHA and every service
+#     image by an immutable version tag; both jobs carry an explicit timeout.
+
+on:
+  push:
+    branches: ["main"]
+    paths: &trigger_paths
+      - "recon-agent/**"
+      - "seed/**"
+      - "eval/**"
+      - "makefile"
+      - "docker-compose.yaml"
+      - ".env.example"
+      - ".github/workflows/recon-agent.yml"
+      # Blnk HTTP contract authorities the agent consumes over the native API
+      # (Rule 5.1). A change to any of these can shift a route/DTO the agent
+      # mirrors, so it must re-trigger the agent's contract verification.
+      - "api/api.go"
+      - "api/reconciliation_api.go"
+      - "model/reconciliation_model.go"
+      - "reconciliation.go"
+      - "database/reconciliation.go"
+      - "internal/files/files.go"
+  pull_request:
+    branches: ["main"]
+    paths: *trigger_paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recon-agent-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build / static / supply-chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # full history so the protected-core diff has a base
+
+      - name: Set up Go
+        uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version: "1.25.0"
+
+      - name: Zero-warning build + vet — recon-agent module (Gate 2)
+        run: |
+          cd recon-agent
+          go vet ./...
+          go build ./...
+
+      - name: Zero-warning build + vet — root module (incl. seed/ + eval/) (Gate 2)
+        run: |
+          go vet ./...
+          go build ./...
+
+      - name: Dependency audit — open-source model binding only (Rule 5.6 / Gate 8)
+        run: |
+          if grep -REn 'anthropic|openai/openai-go|google\.golang\.org/genai' recon-agent/go.mod recon-agent/go.sum; then
+            echo "FAIL: a proprietary/first-party LLM SDK is present in the recon-agent dependency graph (Rule 5.6)"
+            exit 1
+          fi
+          grep -Eq 'github\.com/sashabaranov/go-openai v1\.41\.2($|[^0-9])' recon-agent/go.mod \
+            || { echo "FAIL: go-openai is not pinned to the exact required version v1.41.2 (Rule 5.6)"; exit 1; }
+          echo "dependency audit OK: no proprietary SDK; go-openai pinned to v1.41.2"
+
+      - name: Protected-core preservation (Rule 5.8)
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ]; then base="$(git rev-parse HEAD~1 2>/dev/null || true)"; fi
+          if [ -n "$base" ]; then
+            changed="$(git diff --name-only "$base" HEAD || true)"
+          else
+            changed="$(git show --name-only --pretty=format: HEAD || true)"
+          fi
+          echo "changed files since base:"; echo "$changed"
+          # Repo-root-anchored patterns: Blnk core (reconciliation*/lineage*/
+          # transaction*.go, model/), and the root go.mod/go.sum. The agent's own
+          # recon-agent/** (including recon-agent/internal/model/ and
+          # recon-agent/go.mod) is prefixed and therefore never matches.
+          if echo "$changed" | grep -Eq '^(reconciliation[^/]*\.go|lineage[^/]*\.go|transaction[^/]*\.go|model/.*\.go|go\.mod|go\.sum)$'; then
+            echo "FAIL: a Rule-5.8-protected Blnk core file or the root module manifest was modified"
+            exit 1
+          fi
+          echo "protected-core preserved: no Blnk core / root manifest change"
+
+      # Vulnerability scanning (M-20 "image vulnerability scanning" clause + Gate 8).
+      #
+      # Software (Go) layer: govulncheck (Go's first-party scanner from
+      # golang.org/x/vuln) scans the compiled binary + the entire module dependency
+      # graph against the Go vulnerability database. Kept at @latest deliberately so
+      # the freshest advisory set is applied (the vuln DB, not the tool tag, is what
+      # gates); the tool is delivered through the pinned Go toolchain, not a
+      # third-party Action.
+      #
+      # OS/image layer: the runtime image's vuln exposure is minimized at the source
+      # rather than scanned after the fact — a digest-pinned, actively-supported
+      # minimal base (alpine:3.22, replacing EOL 3.20), pinned current OS package
+      # versions (ca-certificates/tzdata), a non-root user, and contents limited to
+      # the static Go binary + CA certs + tzdata (minimal attack surface). A dedicated
+      # container-image scanner Action (e.g. aquasecurity/trivy-action) is
+      # INTENTIONALLY NOT wired in: that action suffered a supply-chain compromise in
+      # March 2026 (75 of 76 version tags force-pushed to malicious code, SHA-pinning
+      # subverted via orphan commits), so importing it would add a known-compromised
+      # dependency and defeat the very hardening it purports to provide. Revisit when a
+      # vetted, integrity-verified image scanner is available.
+      - name: Vulnerability scan — govulncheck (Gate 8 / M-20)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          GOVULN="$(go env GOPATH)/bin/govulncheck"
+          echo "== recon-agent =="; ( cd recon-agent && "$GOVULN" ./... )
+
+      - name: recon-agent image builds (C-04 — fixture packaged; root build context)
+        run: docker build -t recon-agent:ci -f recon-agent/Dockerfile .
+
+      - name: docker compose configuration is valid (Compose v2 CLI)
+        run: docker compose -f docker-compose.yaml config >/dev/null
+
+  test:
+    name: test / integration / demo (live Blnk + Postgres)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16 # major-pinned (never floating :latest)
+        env:
+          POSTGRES_DB: blnk
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        # Pinned to match docker-compose.yaml (redis:7.2.4) for reproducibility;
+        # CI previously used the mutable redis:latest tag (M-03 / report INFO(c)).
+        image: redis:7.2.4
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      typesense:
+        image: typesense/typesense:29.0 # version-pinned
+        env:
+          TYPESENSE_API_KEY: blnk-api-key
+          TYPESENSE_DATA_DIR: /tmp
+        ports:
+          - 8108:8108
+        # No in-container health-cmd: the typesense image ships no curl/bash for a
+        # reliable probe. Readiness is polled host-side (runner has curl) in the
+        # "Wait for Typesense" step below before Blnk migrate/start.
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version: "1.25.0"
+
+      - name: Wait for Typesense readiness (host-side)
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:8108/health | grep -q '"ok":true'; then
+              echo "Typesense is ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Typesense did not become ready on :8108"; exit 1
+
+      # --- Blnk daemon bring-up (Blnk-only DSNs scoped to these steps) ---
+      - name: Migrate Blnk database
+        env:
+          BLNK_DATA_SOURCE_DNS: postgres://postgres@localhost:5432/blnk?sslmode=disable
+          BLNK_REDIS_DNS: localhost:6379
+          BLNK_TYPESENSE_DNS: http://localhost:8108
+        run: go run ./cmd migrate up
+
+      - name: Start Blnk daemon
+        env:
+          BLNK_DATA_SOURCE_DNS: postgres://postgres@localhost:5432/blnk?sslmode=disable
+          BLNK_REDIS_DNS: localhost:6379
+          BLNK_TYPESENSE_DNS: http://localhost:8108
+        run: |
+          nohup go run ./cmd start > /tmp/blnk.log 2>&1 &
+          echo "$!" > /tmp/blnk.pid
+
+      - name: Wait for Blnk readiness (/health => UP)
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -sf http://localhost:5001/health | grep -q '"status":"UP"'; then
+              echo "Blnk is UP"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Blnk did not become ready on :5001"; cat /tmp/blnk.log || true; exit 1
+
+      # --- recon-agent seed + gates (recon-agent env only; NO BLNK_DATA_SOURCE_DNS) ---
+      - name: Seed internal ledger + 6-break external CSV (via Blnk HTTP)
+        env:
+          BLNK_BASE_URL: http://localhost:5001
+          BLNK_API_KEY: ""
+        run: make seed
+
+      - name: make test — unit coverage >=80% + tagged integration + root suite (Gate 9/10)
+        env:
+          BLNK_BASE_URL: http://localhost:5001
+          BLNK_API_KEY: ""
+          AGENT_DATABASE_URL: postgres://postgres:password@localhost:5432/blnk?sslmode=disable
+          AGENT_TEST_DATABASE_URL: postgres://postgres:password@localhost:5432/blnk?sslmode=disable
+          BLNK_TYPESENSE_DNS: http://localhost:8108
+          # BLNK_DATA_SOURCE_DNS deliberately UNSET: `make test` step 3 runs the
+          # Blnk root suite with `env -u BLNK_DATA_SOURCE_DNS`; setting it here
+          # would break Blnk's config-package file-load tests (M-03).
+        run: make test
+
+  # Finding #3: the pipeline itself must be exercised in CI, not just the unit
+  # suite. This job stands up PostgreSQL + Redis + Typesense + a live Blnk daemon
+  # (Gate 10) and then (1) runs the tagged end-to-end integration test — which
+  # was previously SILENTLY SKIPPED because CI never passed `-tags=integration`
+  # (Gate 9) — and (2) runs the real `make demo` scripting contract under its
+  # <=60s budget (Gate 1/8). Neither step performs any public LLM egress: the
+  # integration test hosts its OWN in-process OpenAI-compatible stub, and the
+  # demo self-hosts a deterministic OpenAI-compatible stub (eval/llmstub) that
+  # LLM_BASE_URL points at, so classification is reproducible and fully offline.
+  integration:
+    runs-on: ubuntu-24.04
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: blnk
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        # Pinned to match docker-compose.yaml (redis:7.2.4) for reproducibility.
+        image: redis:7.2.4
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      typesense:
+        image: typesense/typesense:29.0
+        env:
+          TYPESENSE_API_KEY: blnk-api-key
+          TYPESENSE_DATA_DIR: /tmp
+        ports:
+          - 8108:8108
+        options: >-
+          --health-cmd "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8108 && printf \"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n\" >&3 && grep -q \"200 OK\" <&3'"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 5
+
+    env:
+      # Blnk daemon configuration (env-only; mirrors the compose server service).
+      BLNK_DATA_SOURCE_DNS: postgres://postgres@localhost:5432/blnk?sslmode=disable
+      BLNK_REDIS_DNS: localhost:6379
+      BLNK_TYPESENSE_DNS: http://localhost:8108
+      # recon-agent host-side env consumed by the integration test and the demo.
+      BLNK_BASE_URL: http://localhost:5001
+      BLNK_API_KEY: ci-test-key
+      AGENT_DATABASE_URL: postgres://postgres:password@localhost:5432/blnk?sslmode=disable
+      LLM_MODEL: kimi-k3
+      CONF_AUTO_THRESHOLD: "0.85"
+      HITL_PORT: "8088"
+      # LLM_BASE_URL is intentionally UNSET at the job level. Both inference
+      # consumers supply their OWN OpenAI-compatible endpoint with ZERO public
+      # egress, so neither depends on this job-global value:
+      #   * the integration test repoints inference at its own IN-PROCESS stub;
+      #   * `make demo` launches the bundled deterministic stub (eval/llmstub) and
+      #     points the pipeline's LLM_BASE_URL at it INLINE (see the makefile
+      #     `demo` recipe), so classification is reproducible and the demo
+      #     exercises the full classify -> gate -> remediate path and
+      #     auto-resolves >=1 break (it does NOT fail-close to HITL).
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version: 1.25.0
+
+      - name: Tidy (root Blnk module)
+        run: go mod tidy
+
+      - name: Migrate Blnk database
+        run: go run ./cmd migrate up
+
+      - name: Start Blnk daemon
+        run: |
+          go run ./cmd start &
+          echo "BLNK_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for Blnk to accept connections
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -sS -o /dev/null http://localhost:5001; then
+              echo "Blnk is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Blnk did not become ready on :5001"; exit 1
+
+      - name: Seed (ledger + 6-break external CSV via Blnk HTTP)
+        run: make seed
+
+      # AUTHORITATIVE end-to-end gate (Gate 9, Rule 5.3). Runs FIRST — before any
+      # full reconciliation warms Blnk's shared external-transactions paginated
+      # cache — so its per-break dry-run probes read a cold cache and clearance
+      # is decided correctly. The test hosts its own deterministic stub LLM (no
+      # public egress) and asserts >=1 break auto-remediated AND confirmed
+      # cleared by a Blnk dry-run, that gated (low-confidence/regulated) breaks
+      # never auto-resolve (Rule 5.4), and that every action is audited.
+      - name: Integration test (go test -tags=integration — >=1 auto-resolve on a cold cache)
+        run: |
+          cd recon-agent
+          go test -tags=integration ./...
+
+      # AUTHORITATIVE scripting-contract acceptance gate (Gate 1/8, AAP §0.1.1).
+      # Exercises the REAL `make demo` recipe end-to-end and ENFORCES every
+      # mandatory acceptance signal — with NO tolerated failure (finding F03: the
+      # previous step false-greened a failed acceptance by swallowing a non-zero
+      # `make demo`/scorer exit and checking only budget + summary presence).
+      #
+      # `make demo` runs the pipeline and then the canonical scorer as its LAST
+      # command, and the scorer os.Exit(1)s on ANY unmet criterion (exactly six,
+      # >=5 labels, >=1 Blnk-confirmed clearance, routing safety, disposition +
+      # audit parity), so `make demo`'s exit code already reflects acceptance.
+      # This step (1) bounds the FULL `make demo` wall-clock to <=60s (the AAP
+      # success criterion — measured directly, not via a recipe string), (2)
+      # requires the end-to-end summary, (3) requires the scorer's explicit PASS
+      # verdict and forbids its FAIL, (4) re-asserts the mandatory counters from
+      # the scorer's own summary line, and (5) PROPAGATES the `make demo` exit
+      # code. Any one of these failing fails CI. No public LLM egress: `make demo`
+      # self-hosts the deterministic eval/llmstub and points inference at it.
+      - name: Timed demo — enforce <=60s + propagate exit + assert acceptance counters (Gate 1/8, F03)
+        run: |
+          set +e
+          SECONDS=0
+          out="$(make -s demo 2>&1)"; status=$?
+          elapsed=$SECONDS
+          set -e
+          printf '%s\n' "$out"
+          echo "make demo exit=$status; wall-clock=${elapsed}s (budget <=60s)"
+
+          # (1) <=60s wall-clock budget for the FULL `make demo` (AAP success
+          # criterion). Measured directly so it no longer depends on any recipe
+          # message string (the makefile's timeout branch prints its own text and
+          # exits non-zero, which (5) also catches).
+          if [ "$elapsed" -gt 60 ]; then
+            echo "FAIL: make demo took ${elapsed}s, exceeding the <=60s budget (AAP success criterion)"
+            exit 1
+          fi
+
+          # (2) the pipeline actually ran end-to-end (summary table printed).
+          if ! printf '%s' "$out" | grep -q "recon-agent pipeline summary"; then
+            echo "FAIL: make demo did not run end-to-end (pipeline summary was not printed)"
+            exit 1
+          fi
+
+          # (3) the canonical scorer must explicitly PASS and must never FAIL.
+          if printf '%s' "$out" | grep -q "SCORER: FAIL"; then
+            echo "FAIL: canonical scorer rejected the run (a mandatory acceptance criterion was unmet)"
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q "SCORER: PASS (all acceptance criteria met)"; then
+            echo "FAIL: canonical scorer did not report PASS (acceptance was not proven)"
+            exit 1
+          fi
+
+          # (4) re-assert every mandatory counter from the scorer's summary line
+          # (belt-and-suspenders on top of the scorer's own os.Exit): exactly six
+          # breaks in, >=1 auto-resolved (Rule 5.3 clearance), audit parity floor,
+          # and complete disposition (auto + escalated == breaks_in, none dropped).
+          sline="$(printf '%s\n' "$out" | grep -E '^summary: breaks_in=' | tail -n1)"
+          [ -n "$sline" ] || { echo "FAIL: scorer summary counter line missing"; exit 1; }
+          breaks_in=$(printf '%s' "$sline" | sed -E 's/.*breaks_in=([0-9]+).*/\1/')
+          auto=$(printf '%s' "$sline" | sed -E 's/.*auto_resolved=([0-9]+).*/\1/')
+          esc=$(printf '%s' "$sline" | sed -E 's/.*escalated=([0-9]+).*/\1/')
+          audit=$(printf '%s' "$sline" | sed -E 's/.*audit_count=([0-9]+).*/\1/')
+          echo "counters: breaks_in=$breaks_in auto_resolved=$auto escalated=$esc audit_count=$audit"
+          [ "$breaks_in" = "6" ] || { echo "FAIL: breaks_in=$breaks_in (want 6)"; exit 1; }
+          { [ "$auto" -ge 1 ]; } 2>/dev/null || { echo "FAIL: auto_resolved=$auto (want >=1; Rule 5.3 clearance)"; exit 1; }
+          { [ "$audit" -ge "$breaks_in" ] && [ "$audit" -gt 0 ]; } 2>/dev/null || { echo "FAIL: audit_count=$audit (want >= breaks_in=$breaks_in and > 0)"; exit 1; }
+          { [ "$((auto + esc))" -eq "$breaks_in" ]; } 2>/dev/null || { echo "FAIL: disposition auto($auto)+escalated($esc) != breaks_in($breaks_in)"; exit 1; }
+
+          # (5) FINALLY propagate the `make demo` exit code — a non-zero demo or
+          # scorer result MUST fail CI (F03: exit propagated, never tolerated).
+          if [ "$status" -ne 0 ]; then
+            echo "FAIL: make demo exited non-zero ($status) — acceptance failed (F03: exit code propagated)"
+            exit "$status"
+          fi
+          echo "PASS: make demo ran end-to-end within <=60s and met EVERY mandatory acceptance criterion."
+
+      # Diagnostics: dump the Blnk daemon log on completion (success or failure)
+      # to aid triage of any integration/demo failure.
+      - name: Blnk daemon log (diagnostics)
+        if: always()
+        run: cat /tmp/blnk.log || true

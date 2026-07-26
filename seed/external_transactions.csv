@@ -1,0 +1,7 @@
+ID,Amount,Currency,Reference,Description,Date
+EXT-001,1500.00,USD,INV-1001,Vendor payout ACH settlement posted at value date T+2,2025-01-06T09:00:00Z
+EXT-002,250.75,USD,INV-1002,Card capture net of 0.75 processor fee drift,2025-01-05T14:30:00Z
+EXT-003,980.00,USD,ACME-2025-03,Wire credit with mismatched vendor reference code,2025-01-04T11:15:00Z
+EXT-004,1500.00,USD,INV-1001,Duplicate re-posting of vendor payout INV-1001,2025-01-06T09:05:00Z
+EXT-005,4200.00,USD,UNKN-9001,Unrecognized inbound deposit with no internal booking,2025-01-03T08:00:00Z
+EXT-006,700.00,EUR,INV-1006,Cross-border SEPA credit booked internally in USD,2025-01-02T16:45:00Z
