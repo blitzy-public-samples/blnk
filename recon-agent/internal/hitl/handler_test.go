@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -40,6 +41,11 @@ const testCSRF = "test-csrf-token-0123456789abcdef"
 
 type statusCall struct{ id, status string }
 
+// reconStamp records a (break id, confirming reconciliation id) pair the cleared
+// re_drive path durably stamps via MarkReDrivenClearedFromQueuedTx (finding
+// F16). Tests assert the proof recon id was persisted with the re_driven status.
+type reconStamp struct{ id, reconID string }
+
 type fakeStore struct {
 	mu sync.Mutex
 
@@ -63,12 +69,13 @@ type fakeStore struct {
 	loadTxnErr  error
 	txnNotFound bool
 
-	pingErr       error
-	setStatusErr  error // returned by SetBreakStatusFromQueuedTx (e.g. ErrNotQueued / ErrNotFound)
-	dequeueErr    error // returned by DequeueHITLTx
-	listBreaksErr error
-	listAuditErr  error
-	listHITLErr   error // returned by ListHITL (status-page queue read)
+	pingErr        error
+	setStatusErr   error // returned by SetBreakStatusFromQueuedTx (e.g. ErrNotQueued / ErrNotFound)
+	dequeueErr     error // returned by DequeueHITLTx
+	listBreaksErr  error
+	countBreaksErr error // returned by CountBreaks (finding F06 pagination total)
+	listAuditErr   error
+	listHITLErr    error // returned by ListHITL (status-page queue read)
 
 	// Claim/lease programming for the re_drive processing lease (finding M-15).
 	// claimBusy makes ClaimBreak report "another owner holds it" (granted=false,
@@ -81,6 +88,7 @@ type fakeStore struct {
 
 	// committed calls (rolled back by WithTx when its fn returns an error).
 	statusCalls    []statusCall
+	reconStamps    []reconStamp // (id, reconID) stamped by MarkReDrivenClearedFromQueuedTx (finding F16)
 	dequeueCalls   []string
 	loadCalls      []string // LoadBreakTxn ids
 	loadBreakCalls []string // LoadBreak ids
@@ -90,6 +98,34 @@ type fakeStore struct {
 
 func (f *fakeStore) ListBreaks(ctx context.Context) ([]store.Break, error) {
 	return f.breaks, f.listBreaksErr
+}
+
+// ListBreaksPage returns one bounded in-memory page of f.breaks honoring the
+// normalized Limit/Offset, so the /breaks and / handlers can be tested walking
+// past the first page (finding F06). It reuses listBreaksErr for fault
+// injection so existing error-path tests keep exercising the breaks read.
+func (f *fakeStore) ListBreaksPage(ctx context.Context, page store.Page) ([]store.Break, error) {
+	if f.listBreaksErr != nil {
+		return nil, f.listBreaksErr
+	}
+	p := page.Normalize()
+	if p.Offset >= len(f.breaks) {
+		return nil, nil
+	}
+	end := p.Offset + p.Limit
+	if end > len(f.breaks) {
+		end = len(f.breaks)
+	}
+	return f.breaks[p.Offset:end], nil
+}
+
+// CountBreaks returns the total number of breaks (finding F06). countBreaksErr
+// injects a count-read failure independently of the page read.
+func (f *fakeStore) CountBreaks(ctx context.Context) (int, error) {
+	if f.countBreaksErr != nil {
+		return 0, f.countBreaksErr
+	}
+	return len(f.breaks), nil
 }
 func (f *fakeStore) ListAudit(ctx context.Context) ([]model.AuditEvent, error) {
 	return f.events, f.listAuditErr
@@ -136,6 +172,7 @@ func (f *fakeStore) LoadBreakTxn(ctx context.Context, id string) (blnk.ExternalT
 func (f *fakeStore) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	f.mu.Lock()
 	nStatus := len(f.statusCalls)
+	nRecon := len(f.reconStamps)
 	nDequeue := len(f.dequeueCalls)
 	f.mu.Unlock()
 
@@ -143,6 +180,7 @@ func (f *fakeStore) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error
 	if err != nil {
 		f.mu.Lock()
 		f.statusCalls = f.statusCalls[:nStatus]
+		f.reconStamps = f.reconStamps[:nRecon]
 		f.dequeueCalls = f.dequeueCalls[:nDequeue]
 		f.mu.Unlock()
 	}
@@ -161,6 +199,24 @@ func (f *fakeStore) SetBreakStatusFromQueuedTx(ctx context.Context, tx *sql.Tx, 
 		return f.setStatusErr
 	}
 	f.statusCalls = append(f.statusCalls, statusCall{id, status})
+	return nil
+}
+
+// MarkReDrivenClearedFromQueuedTx models the cleared-re_drive queued-only CAS
+// that ALSO stamps the confirming reconciliation id (finding F16). It reuses the
+// programmed setStatusErr (both are the same queued-only compare-and-set, so an
+// ErrNotQueued/ErrNotFound test programs one field). On success it records BOTH
+// the re_driven status transition (so lastStatus still observes it) and the
+// (id, reconID) proof stamp, letting tests assert the proof was persisted
+// atomically with the status change.
+func (f *fakeStore) MarkReDrivenClearedFromQueuedTx(ctx context.Context, tx *sql.Tx, id, reconID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.setStatusErr != nil {
+		return f.setStatusErr
+	}
+	f.statusCalls = append(f.statusCalls, statusCall{id, statusReDriven})
+	f.reconStamps = append(f.reconStamps, reconStamp{id, reconID})
 	return nil
 }
 
@@ -221,6 +277,17 @@ func (f *fakeStore) lastStatus() (statusCall, bool) {
 		return statusCall{}, false
 	}
 	return f.statusCalls[len(f.statusCalls)-1], true
+}
+
+// lastReconStamp returns the most recent (id, reconID) proof stamp committed by
+// the cleared re_drive path (finding F16), and whether any stamp was committed.
+func (f *fakeStore) lastReconStamp() (reconStamp, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.reconStamps) == 0 {
+		return reconStamp{}, false
+	}
+	return f.reconStamps[len(f.reconStamps)-1], true
 }
 func (f *fakeStore) dequeueCount() int {
 	f.mu.Lock()
@@ -331,6 +398,9 @@ type fakeProber struct {
 	createID  string // rule id CreateMatchingRule echoes back
 	createErr error
 	deleteErr error
+	// readyErr controls the Blnk reachability dimension probed by /readyz
+	// (finding F08): nil => Blnk reachable, non-nil => Blnk unreachable.
+	readyErr error
 
 	probeCalls  []probeCall
 	createCalls []blnk.MatchingRule
@@ -361,6 +431,15 @@ func (f *fakeProber) DeleteMatchingRule(ctx context.Context, ruleID string) erro
 	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, ruleID)
 	return f.deleteErr
+}
+
+// Ready satisfies the prober interface's Blnk-reachability probe used by /readyz
+// (finding F08). It returns f.readyErr so a test can simulate Blnk up (nil) or
+// down (non-nil) independently of the DB (fakeStore.pingErr) dimension.
+func (f *fakeProber) Ready(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.readyErr
 }
 func (f *fakeProber) probeCount() int {
 	f.mu.Lock()
@@ -958,9 +1037,21 @@ func TestHandleReDriveBuildsRuleProbesClearsAndDeletes(t *testing.T) {
 	if st.dequeueCount() != 1 {
 		t.Fatalf("cleared re_drive must dequeue; dequeueCount=%d", st.dequeueCount())
 	}
-	// M-12: every Blnk interaction is audited — rule_created, probed(recon), the
-	// terminal re_driven(recon), and rule_compensated(deleted).
+	// F16: the confirming recon id is durably STAMPED onto the break row as the
+	// first-class clearance proof (resolved_recon_id), atomically with the status
+	// change — not left blank as it was before.
+	stamp, ok := st.lastReconStamp()
+	if !ok || stamp.id != "low-1" || stamp.reconID != "rec_1" {
+		t.Fatalf("expected proof recon rec_1 stamped on break low-1, got %+v (ok=%v)", stamp, ok)
+	}
+	// F16/M-12: every Blnk interaction is audited — the uniform re_drive_attempted,
+	// rule_created, probed(recon), the DISTINCT terminal re_drive_cleared(recon),
+	// and rule_compensated(deleted). The ambiguous legacy re_driven action is NOT
+	// emitted.
 	evs := aud.recorded()
+	if _, ok := firstWithAction(evs, audit.ActionReDriveAttempted); !ok {
+		t.Fatalf("expected re_drive_attempted audit; events=%+v", evs)
+	}
 	rc, ok := firstWithAction(evs, audit.ActionRuleCreated)
 	if !ok || rc.Provenance.RuleID != "rule_x" {
 		t.Fatalf("expected rule_created audit for rule_x; events=%+v", evs)
@@ -969,13 +1060,21 @@ func TestHandleReDriveBuildsRuleProbesClearsAndDeletes(t *testing.T) {
 	if !ok || pb.Provenance.ReconID != "rec_1" {
 		t.Fatalf("expected probed audit with recon rec_1; events=%+v", evs)
 	}
-	rd, ok := firstWithAction(evs, audit.ActionReDriven)
+	rd, ok := firstWithAction(evs, audit.ActionReDriveCleared)
 	if !ok || rd.Provenance.ReconID != "rec_1" {
-		t.Fatalf("expected terminal re_driven audit with recon rec_1; events=%+v", evs)
+		t.Fatalf("expected terminal re_drive_cleared audit with recon rec_1; events=%+v", evs)
+	}
+	if countAction(evs, audit.ActionReDriven) != 0 {
+		t.Fatalf("cleared re_drive must emit re_drive_cleared, never the ambiguous re_driven; events=%+v", evs)
 	}
 	comp, ok := firstWithAction(evs, audit.ActionRuleCompensated)
 	if !ok || comp.Provenance.RuleID != "rule_x" {
 		t.Fatalf("expected rule_compensated audit for rule_x; events=%+v", evs)
+	}
+	// F16 (Bug B): the ephemeral probe rule's compensation must NOT be mislabeled
+	// "non-clearing" on a re_drive that DID clear the break.
+	if strings.Contains(strings.ToLower(comp.Rationale), "non-clearing") {
+		t.Fatalf("compensation of a cleared re_drive's ephemeral rule mislabeled non-clearing: %q", comp.Rationale)
 	}
 	// Throwaway rule deleted afterwards (F5 parity).
 	if got := bc.deletes(); len(got) != 1 || got[0] != "rule_x" {
@@ -1007,15 +1106,25 @@ func TestHandleReDriveNotClearedStaysQueued(t *testing.T) {
 	if last, ok := st.lastStatus(); ok {
 		t.Fatalf("uncleared re_drive must NOT change status (stays queued); got %+v", last)
 	}
-	// The re_drive action is still audited, but the terminal re_driven event
-	// carries NO recon_id — only Blnk-confirmed clearance carries one (m-04).
+	// F16: the uniform attempt is audited, and the terminal outcome is a DISTINCT
+	// re_drive_unmatched action (not the ambiguous re_driven) carrying NO recon_id
+	// — only a Blnk-confirmed clearance carries one (m-04). No proof is stamped.
 	evs := aud.recorded()
-	rd, ok := firstWithAction(evs, audit.ActionReDriven)
+	if _, ok := firstWithAction(evs, audit.ActionReDriveAttempted); !ok {
+		t.Fatalf("expected re_drive_attempted audit; events=%+v", evs)
+	}
+	rd, ok := firstWithAction(evs, audit.ActionReDriveUnmatched)
 	if !ok {
-		t.Fatalf("expected a re_driven audit; events=%+v", evs)
+		t.Fatalf("expected a re_drive_unmatched audit; events=%+v", evs)
 	}
 	if rd.Provenance.ReconID != "" {
-		t.Fatalf("uncleared re_drive re_driven audit must carry NO recon_id, got %q", rd.Provenance.ReconID)
+		t.Fatalf("uncleared re_drive terminal audit must carry NO recon_id, got %q", rd.Provenance.ReconID)
+	}
+	if countAction(evs, audit.ActionReDriven) != 0 {
+		t.Fatalf("uncleared re_drive must emit re_drive_unmatched, never the ambiguous re_driven; events=%+v", evs)
+	}
+	if _, ok := st.lastReconStamp(); ok {
+		t.Fatalf("an uncleared re_drive must NOT stamp a clearance proof onto the break")
 	}
 	// M-12: the probe outcome (not cleared) is still audited with its recon id.
 	if pb, ok := firstWithAction(evs, audit.ActionProbed); !ok || pb.Provenance.ReconID != "rec_2" {
@@ -1060,8 +1169,15 @@ func TestHandleReDriveReusesPersistedRule(t *testing.T) {
 	if countAction(evs, audit.ActionRuleCreated) != 0 || countAction(evs, audit.ActionRuleCompensated) != 0 {
 		t.Fatalf("reused rule must not audit create/compensate; events=%+v", evs)
 	}
-	if rd, ok := firstWithAction(evs, audit.ActionReDriven); !ok || rd.Provenance.ReconID != "rec_3" {
-		t.Fatalf("expected terminal re_driven with recon rec_3; events=%+v", evs)
+	if rd, ok := firstWithAction(evs, audit.ActionReDriveCleared); !ok || rd.Provenance.ReconID != "rec_3" {
+		t.Fatalf("expected terminal re_drive_cleared with recon rec_3; events=%+v", evs)
+	}
+	if countAction(evs, audit.ActionReDriven) != 0 {
+		t.Fatalf("cleared re_drive must emit re_drive_cleared, never the ambiguous re_driven; events=%+v", evs)
+	}
+	// F16: the proof recon id is stamped on the break even when reusing a rule.
+	if stamp, ok := st.lastReconStamp(); !ok || stamp.id != "b3" || stamp.reconID != "rec_3" {
+		t.Fatalf("expected proof recon rec_3 stamped on break b3, got %+v (ok=%v)", stamp, ok)
 	}
 }
 
@@ -1100,16 +1216,23 @@ func TestHandleReDriveCreateRuleErrorReturns502AndAuditsAttempt(t *testing.T) {
 	if _, ok := st.lastStatus(); ok {
 		t.Fatalf("must not change status on upstream failure")
 	}
-	// M-12: the FAILED create attempt is audited (a re_driven event with a
-	// failure rationale and no recon_id), not silently dropped. Because creation
-	// failed there is no rule_created and nothing to compensate.
+	// F16/M-12: the FAILED create attempt is audited as a DISTINCT re_drive_failed
+	// event (with a failure rationale and no recon_id), not silently dropped and
+	// not the ambiguous re_driven. Because creation failed there is no
+	// rule_created and nothing to compensate.
 	evs := aud.recorded()
-	rd, ok := firstWithAction(evs, audit.ActionReDriven)
+	if _, ok := firstWithAction(evs, audit.ActionReDriveAttempted); !ok {
+		t.Fatalf("expected re_drive_attempted audit; events=%+v", evs)
+	}
+	rd, ok := firstWithAction(evs, audit.ActionReDriveFailed)
 	if !ok || rd.Provenance.ReconID != "" {
 		t.Fatalf("expected an audited failed re_drive attempt with no recon_id; events=%+v", evs)
 	}
 	if !strings.Contains(strings.ToLower(rd.Rationale), "creation failed") {
 		t.Fatalf("failure rationale = %q, want it to name the failed creation", rd.Rationale)
+	}
+	if countAction(evs, audit.ActionReDriven) != 0 {
+		t.Fatalf("re_drive failure must emit re_drive_failed, never the ambiguous re_driven; events=%+v", evs)
 	}
 	if countAction(evs, audit.ActionRuleCreated) != 0 || countAction(evs, audit.ActionRuleCompensated) != 0 {
 		t.Fatalf("no rule created/compensated when creation failed; events=%+v", evs)
@@ -1138,15 +1261,25 @@ func TestHandleReDriveProbeErrorReturns502AuditsAttemptAndCompensates(t *testing
 	if got := bc.deletes(); len(got) != 1 || got[0] != "rule_z" {
 		t.Fatalf("expected rule_z cleanup on probe error, got %v", got)
 	}
-	// M-12: rule_created (the successful create), the FAILED probe attempt
-	// (re_driven, no recon), and the compensation outcome are all audited.
+	// F16/M-12: the uniform ATTEMPT, rule_created (the successful create), the
+	// FAILED probe attempt (a DISTINCT re_drive_failed action, no recon), and the
+	// compensation outcome are all audited.
 	evs := aud.recorded()
+	if _, ok := firstWithAction(evs, audit.ActionReDriveAttempted); !ok {
+		t.Fatalf("expected re_drive_attempted audit; events=%+v", evs)
+	}
 	if _, ok := firstWithAction(evs, audit.ActionRuleCreated); !ok {
 		t.Fatalf("expected rule_created audit; events=%+v", evs)
 	}
-	rd, ok := firstWithAction(evs, audit.ActionReDriven)
+	// F16: the Blnk-down failure is a first-class re_drive_failed action (never a
+	// generic re_driven), carries the failure rationale, and no clearance recon.
+	rd, ok := firstWithAction(evs, audit.ActionReDriveFailed)
 	if !ok || rd.Provenance.ReconID != "" || !strings.Contains(strings.ToLower(rd.Rationale), "probe failed") {
 		t.Fatalf("expected audited failed probe attempt; events=%+v", evs)
+	}
+	// The failure must NOT be recorded as the ambiguous legacy re_driven action.
+	if countAction(evs, audit.ActionReDriven) != 0 {
+		t.Fatalf("re_drive failure must not emit the ambiguous re_driven action; events=%+v", evs)
 	}
 	if _, ok := firstWithAction(evs, audit.ActionRuleCompensated); !ok {
 		t.Fatalf("expected rule_compensated audit; events=%+v", evs)
@@ -1166,9 +1299,17 @@ func TestHandleReDriveEmptyRuleIDReturns502AndAuditsAttempt(t *testing.T) {
 	if bc.probeCount() != 0 {
 		t.Fatalf("must not probe with an empty rule id")
 	}
-	// M-12: the failed attempt is audited.
-	if _, ok := firstWithAction(aud.recorded(), audit.ActionReDriven); !ok {
-		t.Fatalf("expected an audited failed re_drive attempt")
+	// F16/M-12: the uniform attempt is audited, and the failed attempt is a
+	// DISTINCT re_drive_failed action (not the ambiguous legacy re_driven).
+	evs := aud.recorded()
+	if _, ok := firstWithAction(evs, audit.ActionReDriveAttempted); !ok {
+		t.Fatalf("expected re_drive_attempted audit; events=%+v", evs)
+	}
+	if _, ok := firstWithAction(evs, audit.ActionReDriveFailed); !ok {
+		t.Fatalf("expected an audited failed re_drive attempt (re_drive_failed); events=%+v", evs)
+	}
+	if countAction(evs, audit.ActionReDriven) != 0 {
+		t.Fatalf("re_drive failure must not emit the ambiguous re_driven action; events=%+v", evs)
 	}
 }
 
@@ -1402,6 +1543,128 @@ func TestListBreaksErrorReturns500(t *testing.T) {
 	w := doGET(t, srv, "/breaks")
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", w.Code)
+	}
+}
+
+func mkPageBreak(id string) store.Break {
+	return store.Break{
+		Classification: model.BreakClassification{ExternalTxnID: id, RootCause: model.RootCause("timing"), Confidence: 0.9},
+		Status:         "queued",
+	}
+}
+
+// TestListBreaksPaginationMetadata asserts finding F06: /breaks returns ONE
+// bounded page plus continuation metadata so a client can page past the first
+// defaultPageLimit rows. With 3 breaks and ?limit=2 the first page returns 2
+// rows with next_offset=2; the second (final) page returns the last row with
+// next_offset=null — an unambiguous stop condition. This is the exact mechanism
+// that makes a queued row beyond row 500 discoverable.
+func TestListBreaksPaginationMetadata(t *testing.T) {
+	st := &fakeStore{breaks: []store.Break{mkPageBreak("b1"), mkPageBreak("b2"), mkPageBreak("b3")}}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+
+	type pag struct {
+		Total      int  `json:"total"`
+		Limit      int  `json:"limit"`
+		Offset     int  `json:"offset"`
+		Returned   int  `json:"returned"`
+		NextOffset *int `json:"next_offset"`
+	}
+	decode := func(w *httptest.ResponseRecorder) ([]store.Break, pag) {
+		t.Helper()
+		var resp struct {
+			Breaks     []store.Break `json:"breaks"`
+			Pagination pag           `json:"pagination"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode /breaks: %v", err)
+		}
+		return resp.Breaks, resp.Pagination
+	}
+
+	// Page 1.
+	w := doGET(t, srv, "/breaks?limit=2&offset=0")
+	if w.Code != http.StatusOK {
+		t.Fatalf("page1 status = %d, want 200", w.Code)
+	}
+	breaks, p := decode(w)
+	if len(breaks) != 2 || breaks[0].Classification.ExternalTxnID != "b1" || breaks[1].Classification.ExternalTxnID != "b2" {
+		t.Fatalf("page1 breaks = %+v, want b1,b2", breaks)
+	}
+	if p.Total != 3 || p.Limit != 2 || p.Offset != 0 || p.Returned != 2 {
+		t.Fatalf("page1 pagination = %+v, want {total:3 limit:2 offset:0 returned:2}", p)
+	}
+	if p.NextOffset == nil || *p.NextOffset != 2 {
+		t.Fatalf("page1 next_offset = %v, want 2", p.NextOffset)
+	}
+
+	// Page 2 (final): the last row, next_offset null.
+	w = doGET(t, srv, "/breaks?limit=2&offset=2")
+	breaks, p = decode(w)
+	if len(breaks) != 1 || breaks[0].Classification.ExternalTxnID != "b3" {
+		t.Fatalf("page2 breaks = %+v, want b3", breaks)
+	}
+	if p.Total != 3 || p.Returned != 1 {
+		t.Fatalf("page2 pagination = %+v, want {total:3 returned:1}", p)
+	}
+	if p.NextOffset != nil {
+		t.Fatalf("page2 next_offset = %v, want null (last page)", p.NextOffset)
+	}
+}
+
+// TestListBreaksCountErrorReturns500 asserts a count-read failure is sanitized
+// to a 500 rather than silently under-reporting the total (finding F06).
+func TestListBreaksCountErrorReturns500(t *testing.T) {
+	st := &fakeStore{countBreaksErr: errors.New("count failed")}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := doGET(t, srv, "/breaks")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 on count error", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "count failed") {
+		t.Fatalf("/breaks 500 leaked raw error: %s", w.Body.String())
+	}
+}
+
+// TestStatusPagePaginationNav asserts finding F06 on the browser surface: the
+// status page pages the breaks table and renders a "Showing X–Y of N" summary
+// plus Prev/Next traversal links, so queued rows beyond the first page are
+// reachable. With 3 breaks and ?limit=2, page 1 shows b1,b2 with a Next link
+// (no Prev) and hides b3; page 2 shows b3 with a Prev link (no Next).
+func TestStatusPagePaginationNav(t *testing.T) {
+	st := &fakeStore{breaks: []store.Break{mkPageBreak("b1"), mkPageBreak("b2"), mkPageBreak("b3")}}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+
+	// Page 1.
+	body := doGET(t, srv, "/?limit=2&offset=0").Body.String()
+	if !strings.Contains(body, "of 3 breaks") {
+		t.Fatalf("page1 missing total summary; body:\n%s", body)
+	}
+	if !strings.Contains(body, `rel="next"`) || !strings.Contains(body, "offset=2") {
+		t.Fatalf("page1 missing Next link to offset=2; body:\n%s", body)
+	}
+	if strings.Contains(body, `rel="prev"`) {
+		t.Fatalf("page1 must NOT render a Prev link on the first page")
+	}
+	// Match the exact External-Txn-ID table cell (>b3<) rather than the bare
+	// substring "b3", which would spuriously match the random hex CSRF token.
+	if strings.Contains(body, ">b3<") {
+		t.Fatalf("page1 must not include b3 (it belongs to page 2) — pagination not applied")
+	}
+
+	// Page 2 (final).
+	body = doGET(t, srv, "/?limit=2&offset=2").Body.String()
+	if !strings.Contains(body, "of 3 breaks") {
+		t.Fatalf("page2 missing total summary; body:\n%s", body)
+	}
+	if !strings.Contains(body, `rel="prev"`) || !strings.Contains(body, "offset=0") {
+		t.Fatalf("page2 missing Prev link to offset=0; body:\n%s", body)
+	}
+	if strings.Contains(body, `rel="next"`) {
+		t.Fatalf("page2 must NOT render a Next link on the last page")
+	}
+	if !strings.Contains(body, ">b3<") {
+		t.Fatalf("page2 must include b3 — the row hidden on page 1 is now discoverable")
 	}
 }
 
@@ -1667,6 +1930,63 @@ func TestServerShutdownBeforeRunIsNoop(t *testing.T) {
 	}
 }
 
+// TestListenConfiguresHardeningTimeouts verifies the HITL http.Server is
+// constructed with the bounded read/write/idle deadlines and the header-size cap
+// (finding F09), rather than the former Addr+Handler-only server that left a
+// slowloris client able to hold partial-request sockets open indefinitely.
+func TestListenConfiguresHardeningTimeouts(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	srv := newTestServer(&fakeStore{}, &fakeAudit{}, &fakeProber{})
+	if err := srv.Listen(addr); err != nil {
+		t.Fatalf("Listen(%s): %v", addr, err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	srv.mu.Lock()
+	hs := srv.httpServer
+	srv.mu.Unlock()
+	if hs == nil {
+		t.Fatal("Listen did not publish an *http.Server")
+	}
+	if hs.ReadHeaderTimeout != readHeaderTimeout {
+		t.Errorf("ReadHeaderTimeout = %v, want %v", hs.ReadHeaderTimeout, readHeaderTimeout)
+	}
+	if hs.ReadTimeout != readTimeout {
+		t.Errorf("ReadTimeout = %v, want %v", hs.ReadTimeout, readTimeout)
+	}
+	if hs.WriteTimeout != writeTimeout {
+		t.Errorf("WriteTimeout = %v, want %v", hs.WriteTimeout, writeTimeout)
+	}
+	if hs.IdleTimeout != idleTimeout {
+		t.Errorf("IdleTimeout = %v, want %v", hs.IdleTimeout, idleTimeout)
+	}
+	if hs.MaxHeaderBytes != maxHeaderBytes {
+		t.Errorf("MaxHeaderBytes = %d, want %d", hs.MaxHeaderBytes, maxHeaderBytes)
+	}
+	// The slowloris defense that actually matters is a bounded header-read
+	// deadline: assert it is positive AND strictly under the 8s partial-header
+	// window the finding's reproduction uses, so an abusive socket is terminated
+	// before then.
+	if hs.ReadHeaderTimeout <= 0 || hs.ReadHeaderTimeout >= 8*time.Second {
+		t.Errorf("ReadHeaderTimeout = %v, want a positive bound < 8s (slowloris defense)", hs.ReadHeaderTimeout)
+	}
+	// WriteTimeout must comfortably exceed the ~30s Blnk dry-run probe budget so a
+	// legitimate long-running re_drive response is never truncated mid-flight.
+	if hs.WriteTimeout < 60*time.Second {
+		t.Errorf("WriteTimeout = %v, want >= 60s so re_drive's ~30s Blnk probe is never truncated", hs.WriteTimeout)
+	}
+}
+
 func TestAsUpstreamNilReturnsNil(t *testing.T) {
 	if err := asUpstream(nil); err != nil {
 		t.Fatalf("asUpstream(nil) = %v, want nil", err)
@@ -1848,18 +2168,29 @@ func TestListBreaksErrorSanitized(t *testing.T) {
 // ----- /readyz readiness probe (finding m-02) --------------------------------
 
 func TestReadyzReadyAndReachableReturns200(t *testing.T) {
+	// Both dimensions healthy: DB reachable (fakeStore ping ok) AND Blnk
+	// reachable (fakeProber readyErr nil). /readyz reports 200 with both
+	// dimensions "ok" (finding F08).
 	srv := newTestServer(&fakeStore{}, &fakeAudit{}, &fakeProber{})
 	w := doGET(t, srv, "/readyz")
 	if w.Code != http.StatusOK {
 		t.Fatalf("readyz status = %d, want 200", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "ready") {
-		t.Fatalf("readyz body = %s, want ready", w.Body.String())
+	body := w.Body.String()
+	if !strings.Contains(body, `"status":"ready"`) {
+		t.Fatalf("readyz body = %s, want status ready", body)
+	}
+	if !strings.Contains(body, `"database":"ok"`) || !strings.Contains(body, `"blnk":"ok"`) {
+		t.Fatalf("readyz body = %s, want database:ok AND blnk:ok dimensions", body)
 	}
 }
 
 func TestReadyzPingFailureReturns503Sanitized(t *testing.T) {
-	st := &fakeStore{pingErr: errors.New("pq: postgres unreachable")}
+	// The raw driver error carries sensitive tokens ("pq:", "postgres") that must
+	// never reach the client (M-03). The generic word "unreachable" is now a
+	// legitimate dimension LABEL ("database":"unreachable"), so the leak assertion
+	// targets the sensitive tokens themselves, not that label.
+	st := &fakeStore{pingErr: errors.New("pq: dial tcp 10.0.0.5:5432: postgres connection refused")}
 	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
 	w := doGET(t, srv, "/readyz")
 	if w.Code != http.StatusServiceUnavailable {
@@ -1869,8 +2200,66 @@ func TestReadyzPingFailureReturns503Sanitized(t *testing.T) {
 	if !strings.Contains(body, "not ready") {
 		t.Fatalf("readyz body = %s, want 'not ready'", body)
 	}
-	if strings.Contains(body, "pq:") || strings.Contains(body, "unreachable") {
+	if !strings.Contains(body, `"database":"unreachable"`) {
+		t.Fatalf("readyz body = %s, want database dimension labeled unreachable", body)
+	}
+	if strings.Contains(body, "pq:") || strings.Contains(body, "postgres") || strings.Contains(body, "10.0.0.5") {
 		t.Fatalf("readyz 503 leaked raw ping error: %s", body)
+	}
+}
+
+// TestReadyzBlnkUnreachableReturns503Degraded is the core F08 assertion: when the
+// database is healthy but Blnk is unreachable, /readyz must NO LONGER report a
+// false-green 200 {"status":"ready"} — it reports 503 {"status":"degraded"} with
+// the Blnk dimension explicitly named, so a consumer sees the required Blnk
+// dependency is down (re_drive cannot succeed until it returns).
+func TestReadyzBlnkUnreachableReturns503Degraded(t *testing.T) {
+	bc := &fakeProber{readyErr: errors.New("blnk not ready: GET /health returned status 503")}
+	srv := newTestServer(&fakeStore{}, &fakeAudit{}, bc)
+	w := doGET(t, srv, "/readyz")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz status = %d, want 503 when Blnk is unreachable (F08)", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"status":"degraded"`) {
+		t.Fatalf("readyz body = %s, want status degraded (F08)", body)
+	}
+	if !strings.Contains(body, `"database":"ok"`) || !strings.Contains(body, `"blnk":"unreachable"`) {
+		t.Fatalf("readyz body = %s, want database:ok AND blnk:unreachable dimensions (F08)", body)
+	}
+	// The degraded response must NOT be the old false-green "ready".
+	if strings.Contains(body, `"status":"ready"`) {
+		t.Fatalf("readyz reported ready while Blnk is down (F08 regression): %s", body)
+	}
+	// The raw Blnk error must not leak to the client (M-03).
+	if strings.Contains(body, "GET /health") || strings.Contains(body, "status 503") {
+		t.Fatalf("readyz degraded response leaked raw blnk error: %s", body)
+	}
+}
+
+// TestReadyzDatabaseDownTakesPrecedenceOverBlnk verifies the hard dependency is
+// evaluated first: when BOTH the DB and Blnk are down, /readyz reports the DB as
+// the not-ready cause (flat "not ready"), because without the DB no decision —
+// not even accept/reject — can be served.
+func TestReadyzDatabaseDownTakesPrecedenceOverBlnk(t *testing.T) {
+	st := &fakeStore{pingErr: errors.New("db down")}
+	bc := &fakeProber{readyErr: errors.New("blnk down")}
+	srv := newTestServer(st, &fakeAudit{}, bc)
+	w := doGET(t, srv, "/readyz")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz status = %d, want 503", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"status":"not ready"`) {
+		t.Fatalf("readyz body = %s, want flat 'not ready' when DB is down", body)
+	}
+	if !strings.Contains(body, `"database":"unreachable"`) {
+		t.Fatalf("readyz body = %s, want database dimension unreachable", body)
+	}
+	// Blnk must not even be consulted / reported once the hard DB dependency
+	// fails, so the degraded-Blnk label must be absent.
+	if strings.Contains(body, "degraded") {
+		t.Fatalf("readyz reported degraded (Blnk) while DB is the real cause: %s", body)
 	}
 }
 
@@ -1890,7 +2279,10 @@ func TestHandleReDriveRuleCreatedAuditFailureCompensatesAndFailsClosed(t *testin
 	// unaudited rule — the rule is compensated (deleted) and the decision fails
 	// closed (500) BEFORE any probe.
 	st := &fakeStore{found: true, txn: blnk.ExternalTransaction{ID: "ba-1", Amount: 1, Currency: "USD"}}
-	aud := &fakeAudit{err: errors.New("pq: audit down")} // failAction "" -> all audits fail
+	// F16: fail ONLY the rule_created audit — the uniform re_drive_attempted
+	// audit (now written first) succeeds, so this exercises exactly the
+	// rule_created-audit-failure path this test targets.
+	aud := &fakeAudit{err: errors.New("pq: audit down"), failAction: audit.ActionRuleCreated}
 	bc := &fakeProber{createID: "rule_af", cleared: true, reconID: "rec_af"}
 	srv := newTestServer(st, aud, bc)
 
@@ -1914,13 +2306,44 @@ func TestHandleReDriveCreateErrorWithAuditFailureStillReturns502(t *testing.T) {
 	// original upstream (502) cause is surfaced — the audit hiccup is logged, not
 	// allowed to mask the real dependency fault.
 	st := &fakeStore{found: true, txn: blnk.ExternalTransaction{ID: "bb-1", Amount: 1, Currency: "USD"}}
-	aud := &fakeAudit{err: errors.New("pq: audit down")}
+	// F16: fail ONLY the re_drive_failed audit (the audit of the FAILED create
+	// attempt) — the uniform re_drive_attempted audit succeeds — so this
+	// exercises the "audit of the failure itself fails, but the 502 upstream
+	// cause is still surfaced" path.
+	aud := &fakeAudit{err: errors.New("pq: audit down"), failAction: audit.ActionReDriveFailed}
 	bc := &fakeProber{createErr: errors.New("blnk unreachable")}
 	srv := newTestServer(st, aud, bc)
 
 	w := postDecisionJSON(t, srv, model.HITLDecision{ExternalTxnID: "bb-1", Decision: audit.DecisionReDrive, Reviewer: "alice"})
 	if w.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 (upstream cause preserved despite audit failure)", w.Code)
+	}
+}
+
+// TestHandleReDriveAttemptAuditFailureFailsClosed asserts the NEW uniform
+// re_drive_attempted audit fails closed (finding F16): if the very first audit —
+// recording that a human initiated the re_drive — cannot be written, the
+// decision returns 500 and NO Blnk work happens (no rule created, no probe, no
+// status change), so an unaudited re_drive can never touch Blnk.
+func TestHandleReDriveAttemptAuditFailureFailsClosed(t *testing.T) {
+	st := &fakeStore{found: true, txn: blnk.ExternalTransaction{ID: "attempt-fail", Amount: 1, Currency: "USD"}}
+	aud := &fakeAudit{err: errors.New("pq: audit down"), failAction: audit.ActionReDriveAttempted}
+	bc := &fakeProber{createID: "rule_x", cleared: true, reconID: "rec_x"}
+	srv := newTestServer(st, aud, bc)
+
+	w := postDecisionJSON(t, srv, model.HITLDecision{ExternalTxnID: "attempt-fail", Decision: audit.DecisionReDrive, Reviewer: "alice"})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 when the re_drive_attempted audit fails", w.Code)
+	}
+	if bc.createCount() != 0 || bc.probeCount() != 0 {
+		t.Fatalf("no Blnk work must happen when the attempt cannot be audited: creates=%d probes=%d", bc.createCount(), bc.probeCount())
+	}
+	if _, ok := st.lastStatus(); ok {
+		t.Fatalf("must not change status when the attempt audit fails closed")
+	}
+	// The lease is still claimed then released around the fail-closed attempt.
+	if st.claimCount() != 1 || st.releaseCount() != 1 || st.heldLeases() != 0 {
+		t.Fatalf("lease lifecycle = %d/%d/%d, want 1/1/0", st.claimCount(), st.releaseCount(), st.heldLeases())
 	}
 }
 
@@ -2262,5 +2685,443 @@ func TestStatusPageListHITLErrorReturns500(t *testing.T) {
 	w := doGET(t, srv, "/")
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 when ListHITL fails", w.Code)
+	}
+}
+
+// ============================================================================
+// Group G — HITL handler validation & response contract (F21/F22/F23/F24)
+// ============================================================================
+
+// ----- F21: one documented length unit (runes); browser-valid is server-valid --
+
+// TestValidateDecisionMultibyteWithinRuneBoundAccepted proves the byte-vs-UTF-16
+// mismatch (F21) is gone: values the browser's maxlength (UTF-16 code units)
+// admits — but that EXCEEDED the old UTF-8 BYTE limit — are now accepted, because
+// the server bounds by RUNES. Each case previously returned a spurious 400.
+func TestValidateDecisionMultibyteWithinRuneBoundAccepted(t *testing.T) {
+	cases := []struct{ name, reviewer, note string }{
+		// 33 emoji: 33 runes (<=128) but 132 UTF-8 bytes (>128, the old limit).
+		{"33-emoji-reviewer", strings.Repeat("😀", 33), ""},
+		// 65 precomposed "é": 65 runes (<=128) but 130 UTF-8 bytes.
+		{"65-eacute-reviewer", strings.Repeat("é", 65), ""},
+		// 513 emoji note: 513 runes (<=2048) but 2052 UTF-8 bytes.
+		{"513-emoji-note", "alice", strings.Repeat("😀", 513)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &fakeStore{found: true}
+			srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+			w := postDecisionJSON(t, srv, model.HITLDecision{
+				ExternalTxnID: "ext-1", Decision: audit.DecisionAccept, Reviewer: tc.reviewer, Note: tc.note})
+			if w.Code != http.StatusOK {
+				t.Fatalf("%s: status = %d, want 200 (browser-valid multibyte must not be rejected server-side); body=%s",
+					tc.name, w.Code, w.Body.String())
+			}
+			if _, ok := st.lastStatus(); !ok {
+				t.Fatalf("%s: expected the decision to commit a status change", tc.name)
+			}
+		})
+	}
+}
+
+// TestValidateDecisionReviewerRuneUpperBound proves the reviewer bound is enforced
+// in RUNES: exactly maxReviewerLen runes is accepted and one more is rejected —
+// using emoji so the assertion cannot pass under a byte or UTF-16 interpretation
+// (maxReviewerLen emoji is 4x the bytes and 2x the UTF-16 units of the limit).
+func TestValidateDecisionReviewerRuneUpperBound(t *testing.T) {
+	// exactly the limit, in runes → accepted
+	st := &fakeStore{found: true}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := postDecisionJSON(t, srv, model.HITLDecision{
+		ExternalTxnID: "x", Decision: audit.DecisionAccept, Reviewer: strings.Repeat("😀", maxReviewerLen)})
+	if w.Code != http.StatusOK {
+		t.Fatalf("reviewer of exactly %d runes: status = %d, want 200; body=%s", maxReviewerLen, w.Code, w.Body.String())
+	}
+	// one rune over the limit → rejected
+	st2 := &fakeStore{found: true}
+	aud2 := &fakeAudit{}
+	srv2 := newTestServer(st2, aud2, &fakeProber{})
+	w2 := postDecisionJSON(t, srv2, model.HITLDecision{
+		ExternalTxnID: "x", Decision: audit.DecisionAccept, Reviewer: strings.Repeat("😀", maxReviewerLen+1)})
+	if w2.Code != http.StatusBadRequest {
+		t.Fatalf("reviewer of %d runes: status = %d, want 400", maxReviewerLen+1, w2.Code)
+	}
+	if !strings.Contains(w2.Body.String(), "reviewer is too long") {
+		t.Fatalf("body = %s, want 'reviewer is too long'", w2.Body.String())
+	}
+	if _, ok := st2.lastStatus(); ok {
+		t.Fatalf("over-long reviewer must change no status")
+	}
+	if len(aud2.recorded()) != 0 {
+		t.Fatalf("over-long reviewer must audit nothing")
+	}
+}
+
+// TestValidateDecisionNoteRuneUpperBound proves the note bound is likewise
+// enforced in runes at its exact boundary.
+func TestValidateDecisionNoteRuneUpperBound(t *testing.T) {
+	st := &fakeStore{found: true}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := postDecisionJSON(t, srv, model.HITLDecision{
+		ExternalTxnID: "x", Decision: audit.DecisionAccept, Reviewer: "alice", Note: strings.Repeat("😀", maxNoteLen)})
+	if w.Code != http.StatusOK {
+		t.Fatalf("note of exactly %d runes: status = %d, want 200; body=%s", maxNoteLen, w.Code, w.Body.String())
+	}
+	st2 := &fakeStore{found: true}
+	srv2 := newTestServer(st2, &fakeAudit{}, &fakeProber{})
+	w2 := postDecisionJSON(t, srv2, model.HITLDecision{
+		ExternalTxnID: "x", Decision: audit.DecisionAccept, Reviewer: "alice", Note: strings.Repeat("😀", maxNoteLen+1)})
+	if w2.Code != http.StatusBadRequest {
+		t.Fatalf("note of %d runes: status = %d, want 400", maxNoteLen+1, w2.Code)
+	}
+	if !strings.Contains(w2.Body.String(), "note is too long") {
+		t.Fatalf("body = %s, want 'note is too long'", w2.Body.String())
+	}
+}
+
+// TestStatusPageFormMaxlengthMatchesRuneBounds proves F21's single source of
+// truth: the decision form's HTML maxlength attributes are rendered FROM the
+// server-side rune bounds (maxReviewerLen/maxNoteLen), so the client-side limit
+// can never drift from what validateDecisionFields enforces.
+func TestStatusPageFormMaxlengthMatchesRuneBounds(t *testing.T) {
+	st := &fakeStore{breaks: []store.Break{{
+		Classification: model.BreakClassification{ExternalTxnID: "EXT-1", RootCause: model.RootCauseTiming},
+		Status:         statusQueued,
+	}}}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	body := doGET(t, srv, "/").Body.String()
+	for _, want := range []string{
+		fmt.Sprintf(`name="reviewer" placeholder="reviewer id" required maxlength="%d"`, maxReviewerLen),
+		fmt.Sprintf(`name="note" placeholder="note (optional)" maxlength="%d"`, maxNoteLen),
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("status page form missing rune-bound maxlength %q", want)
+		}
+	}
+}
+
+// ----- F23: unspoofable actor — reject bidi controls & malformed UTF-8 --------
+
+// TestValidateDecisionReviewerBidiOverrideRejected proves a right-to-left override
+// in the reviewer (the Trojan-Source spoof that renders "qa-<RLO>nimda" as the
+// plausible "qa-admin") is REJECTED before it can become the immutable audit
+// actor (F23) — no status change, no audit event.
+func TestValidateDecisionReviewerBidiOverrideRejected(t *testing.T) {
+	st := &fakeStore{found: true}
+	aud := &fakeAudit{}
+	srv := newTestServer(st, aud, &fakeProber{})
+	w := postDecisionJSON(t, srv, model.HITLDecision{
+		ExternalTxnID: "x", Decision: audit.DecisionAccept, Reviewer: "qa-\u202Enimda"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("bidi reviewer status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "reviewer contains disallowed formatting characters") {
+		t.Fatalf("body = %s, want reviewer formatting-character message", w.Body.String())
+	}
+	if _, ok := st.lastStatus(); ok {
+		t.Fatalf("bidi reviewer must change no status")
+	}
+	if len(aud.recorded()) != 0 {
+		t.Fatalf("bidi reviewer must audit nothing")
+	}
+}
+
+// TestValidateDecisionReviewerFormatCharsRejected sweeps the invisible/format
+// codepoints an identifier must never carry (F23): bidi controls, isolates,
+// directional marks, zero-width space, soft hyphen, and the BOM — all category
+// Cf — are each rejected in the reviewer.
+func TestValidateDecisionReviewerFormatCharsRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		r    rune
+	}{
+		{"RLO-U+202E", '\u202E'},
+		{"LRO-U+202D", '\u202D'},
+		{"LRI-U+2066", '\u2066'},
+		{"PDI-U+2069", '\u2069'},
+		{"LRM-U+200E", '\u200E'},
+		{"ZWSP-U+200B", '\u200B'},
+		{"soft-hyphen-U+00AD", '\u00AD'},
+		{"BOM-U+FEFF", '\uFEFF'},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &fakeStore{found: true}
+			srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+			w := postDecisionJSON(t, srv, model.HITLDecision{
+				ExternalTxnID: "x", Decision: audit.DecisionAccept, Reviewer: "qa" + string(tc.r) + "bob"})
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("%s reviewer status = %d, want 400; body=%s", tc.name, w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "reviewer contains disallowed formatting characters") {
+				t.Fatalf("%s: body = %s, want formatting-character message", tc.name, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestValidateDecisionReviewerReplacementCharRejected proves a reviewer carrying
+// U+FFFD — the artifact Go's form parser leaves when it silently "repairs"
+// undecodable request bytes — is rejected rather than persisted as a lossy,
+// unattributable actor (F23).
+func TestValidateDecisionReviewerReplacementCharRejected(t *testing.T) {
+	st := &fakeStore{found: true}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := postDecisionJSON(t, srv, model.HITLDecision{
+		ExternalTxnID: "x", Decision: audit.DecisionAccept, Reviewer: "qa-\uFFFD-user"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("U+FFFD reviewer status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "reviewer contains invalid text encoding") {
+		t.Fatalf("body = %s, want reviewer encoding message", w.Body.String())
+	}
+}
+
+// TestValidateDecisionReviewerRawInvalidUTF8FormRejected proves the OTHER
+// malformed-UTF-8 path (F23): a raw undecodable byte (0xFF) posted in a urlencoded
+// form value is rejected as invalid text encoding — exercising the
+// utf8.ValidString guard, since url-unescaping delivers the byte UNREPAIRED
+// (unlike the U+FFFD form).
+func TestValidateDecisionReviewerRawInvalidUTF8FormRejected(t *testing.T) {
+	st := &fakeStore{found: true}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	body := "external_txn_id=x&decision=accept&reviewer=qa-%FF-user&csrf_token=" + testCSRF
+	req := httptest.NewRequest(http.MethodPost, "/decisions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://"+req.Host)
+	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: testCSRF})
+	w := serve(srv, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("raw-invalid-UTF8 reviewer status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "invalid text encoding") {
+		t.Fatalf("body = %s, want 'invalid text encoding'", w.Body.String())
+	}
+	if _, ok := st.lastStatus(); ok {
+		t.Fatalf("raw-invalid-UTF8 reviewer must change no status")
+	}
+}
+
+// TestValidateDecisionNoteBidiRejectedButEmojiZWJAllowed proves the note path is
+// strict on the visual-spoofing bidi controls yet still permits a legitimate
+// emoji zero-width-joiner sequence (identifier=false) (F23).
+func TestValidateDecisionNoteBidiRejectedButEmojiZWJAllowed(t *testing.T) {
+	// bidi control in the note → rejected
+	st := &fakeStore{found: true}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := postDecisionJSON(t, srv, model.HITLDecision{
+		ExternalTxnID: "x", Decision: audit.DecisionAccept, Reviewer: "alice", Note: "see \u202Ethis"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("bidi note status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "note contains disallowed formatting characters") {
+		t.Fatalf("body = %s, want note formatting-character message", w.Body.String())
+	}
+	// legitimate emoji ZWJ sequence in the note → accepted (man+ZWJ+woman+ZWJ+girl)
+	st2 := &fakeStore{found: true}
+	srv2 := newTestServer(st2, &fakeAudit{}, &fakeProber{})
+	w2 := postDecisionJSON(t, srv2, model.HITLDecision{
+		ExternalTxnID: "x", Decision: audit.DecisionAccept, Reviewer: "alice",
+		Note: "family \U0001F468\u200D\U0001F469\u200D\U0001F467"})
+	if w2.Code != http.StatusOK {
+		t.Fatalf("emoji-ZWJ note status = %d, want 200 (legitimate ZWJ must be allowed); body=%s", w2.Code, w2.Body.String())
+	}
+}
+
+// TestValidateDecisionExternalTxnIDFormatCharRejected proves an identifier field
+// other than the reviewer is held to the same F23 rule: a bidi control in the
+// external txn id is rejected.
+func TestValidateDecisionExternalTxnIDFormatCharRejected(t *testing.T) {
+	st := &fakeStore{found: true}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := postDecisionJSON(t, srv, model.HITLDecision{
+		ExternalTxnID: "EXT\u202E1", Decision: audit.DecisionAccept, Reviewer: "alice"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("bidi txn id status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "external_txn_id contains disallowed formatting characters") {
+		t.Fatalf("body = %s, want external_txn_id formatting-character message", w.Body.String())
+	}
+}
+
+// ----- F24: mixed-case JSON media type is negotiated consistently -------------
+
+// postJSONWithContentType posts a JSON body under an explicit (possibly
+// mixed-case) Content-Type, with no Origin header (a trusted non-browser API
+// client), so the response-format negotiation can be asserted in isolation.
+func postJSONWithContentType(srv *Server, ct string, d model.HITLDecision) *httptest.ResponseRecorder {
+	b, _ := json.Marshal(d)
+	req := httptest.NewRequest(http.MethodPost, "/decisions", bytes.NewReader(b))
+	req.Header.Set("Content-Type", ct)
+	return serve(srv, req)
+}
+
+// TestRespondDecisionMixedCaseJSONReturnsJSONSuccess proves F24: a valid decision
+// posted with a mixed-case media type ("APPLICATION/JSON") — which is bound and
+// COMMITTED as JSON — also RECEIVES the JSON success schema (200 + recorded),
+// not the browser 303 redirect it previously fell through to.
+func TestRespondDecisionMixedCaseJSONReturnsJSONSuccess(t *testing.T) {
+	st := &fakeStore{found: true}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := postJSONWithContentType(srv, "APPLICATION/JSON", model.HITLDecision{
+		ExternalTxnID: "dup-1", Decision: audit.DecisionAccept, Reviewer: "alice"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("mixed-case JSON status = %d, want 200 (JSON success, not 303); body=%s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("response Content-Type = %q, want application/json", ct)
+	}
+	if !strings.Contains(w.Body.String(), `"status":"recorded"`) {
+		t.Fatalf("body = %s, want the JSON recorded schema", w.Body.String())
+	}
+	if _, ok := st.lastStatus(); !ok {
+		t.Fatalf("mixed-case JSON decision must commit the status change")
+	}
+}
+
+// TestRespondDecisionErrorMixedCaseJSONReturnsJSONError proves the error path is
+// negotiated the same way (F24): a mixed-case JSON request for a MISSING break
+// gets the JSON error schema (404 + {"error":...}), never the HTML error panel.
+func TestRespondDecisionErrorMixedCaseJSONReturnsJSONError(t *testing.T) {
+	st := &fakeStore{setStatusErr: store.ErrNotFound}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	w := postJSONWithContentType(srv, "Application/Json", model.HITLDecision{
+		ExternalTxnID: "missing-1", Decision: audit.DecisionAccept, Reviewer: "bob"})
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("mixed-case JSON missing-break status = %d, want 404; body=%s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("error response Content-Type = %q, want application/json", ct)
+	}
+	if !strings.Contains(w.Body.String(), `"error"`) {
+		t.Fatalf("body = %s, want the JSON error schema", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "<!DOCTYPE html>") {
+		t.Fatalf("mixed-case JSON error must NOT return the HTML error page")
+	}
+}
+
+// ----- F22: accessible error page --------------------------------------------
+
+// TestErrorPageHTMLAccessibleLandmarks asserts the standalone error surface
+// carries the semantics F22 requires: exactly one <main> landmark (so
+// landmark-one-main passes), a top-level <h1>, an announced alert region
+// (role="alert" + aria-live), a deterministic focus target (tabindex + autofocus,
+// no client JS under the strict CSP), and a >=44px Back tap target. The message
+// is still HTML-escaped (M-03).
+func TestErrorPageHTMLAccessibleLandmarks(t *testing.T) {
+	out := string(errorPageHTML("boom <x>"))
+	if n := strings.Count(out, "<main>"); n != 1 {
+		t.Fatalf("error page has %d <main> landmarks, want exactly 1 (landmark-one-main)", n)
+	}
+	for _, want := range []string{
+		"<h1>",
+		`role="alert"`,
+		`aria-live="assertive"`,
+		`tabindex="-1"`,
+		"autofocus",
+		`class="back"`,
+		"min-height: 44px",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("error page missing accessibility affordance %q", want)
+		}
+	}
+	if !strings.Contains(out, "boom &lt;x&gt;") || strings.Contains(out, "boom <x>") {
+		t.Fatalf("error page did not HTML-escape the message: %s", out)
+	}
+}
+
+// TestFormValidationErrorRendersAccessibleErrorPage proves the wired path (F22):
+// a browser FORM submission that fails validation renders the accessible error
+// page (with <main>, <h1>, and the alert region), not a bare panel.
+func TestFormValidationErrorRendersAccessibleErrorPage(t *testing.T) {
+	st := &fakeStore{found: true}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	form := url.Values{}
+	form.Set("external_txn_id", "x")
+	form.Set("decision", "not-a-decision") // invalid verb → 400 validation error
+	form.Set("reviewer", "alice")
+	w := postDecisionForm(t, srv, form)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid-decision form status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{"<main>", `role="alert"`, "<h1>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("form error page missing %q", want)
+		}
+	}
+}
+
+// ============================================================================
+// Group H — HITL status-page visual & accessibility (F19/F20)
+// ============================================================================
+
+// TestStatusPageClassifiedStatusStyled proves F19: the transient `classified`
+// lifecycle state receives the SAME explicit semantic treatment (a dedicated
+// status color + font-weight 600) as every other status, instead of rendering as
+// ordinary, unstyled body text. It asserts both that a classified row is emitted
+// with the status-classified class AND that the stylesheet defines that class.
+func TestStatusPageClassifiedStatusStyled(t *testing.T) {
+	st := &fakeStore{breaks: []store.Break{{
+		Classification: model.BreakClassification{ExternalTxnID: "EXT-CL", RootCause: model.RootCauseTiming},
+		Status:         model.StatusClassified,
+	}}}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	body := doGET(t, srv, "/").Body.String()
+
+	// the row is emitted with the status-specific class (same pattern as siblings)
+	if !strings.Contains(body, `class="status-classified">classified<`) {
+		t.Fatalf("classified row not rendered with the status-classified class")
+	}
+	// the stylesheet defines the class with an explicit color and weight 600,
+	// consistent with the other .status-* rules (never default body text).
+	if !strings.Contains(body, ".status-classified { color: #5a4b8b; font-weight: 600; }") {
+		t.Fatalf("stylesheet missing a consistent .status-classified rule (color + weight 600)")
+	}
+	// guard the consistency invariant: every status class the template can emit
+	// has a matching styled rule, so no lifecycle state is ever left unstyled.
+	for _, cls := range []string{
+		".status-auto-resolved", ".status-rejected", ".status-re_driven",
+		".status-queued", ".status-accepted", ".status-classified",
+	} {
+		if !strings.Contains(body, cls+" { color:") {
+			t.Fatalf("stylesheet missing a color rule for %s", cls)
+		}
+	}
+}
+
+// TestStatusPageScrollableRegionsFocusable proves F20 (WCAG 2.1.1 Keyboard): each
+// horizontally-scrollable table wrapper is a focusable, named region so a
+// keyboard-only user can Tab to it and arrow-scroll to reveal off-screen columns
+// (e.g. the audit trail's Recon ID / Source / Upload ID / Rationale) at narrow
+// widths — and a visible focus ring marks it. Both the breaks and audit wrappers
+// carry role="region", tabindex="0", and an aria-labelledby naming them.
+func TestStatusPageScrollableRegionsFocusable(t *testing.T) {
+	st := &fakeStore{breaks: []store.Break{{
+		Classification: model.BreakClassification{ExternalTxnID: "EXT-1", RootCause: model.RootCauseTiming},
+		Status:         statusQueued,
+	}}}
+	srv := newTestServer(st, &fakeAudit{}, &fakeProber{})
+	body := doGET(t, srv, "/").Body.String()
+
+	for _, want := range []string{
+		// audit overflow region (the finding's primary target): focusable + named
+		`<div class="table-wrap" tabindex="0" role="region" aria-labelledby="audit-heading">`,
+		// breaks overflow region: same treatment so neither region is a keyboard trap
+		`<div class="table-wrap" tabindex="0" role="region" aria-labelledby="breaks-heading">`,
+		// a visible focus indicator for the focused scroll region
+		".table-wrap:focus { outline:",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("status page missing scrollable-region-focusable affordance %q", want)
+		}
+	}
+	// the section headings that name the regions must exist as label targets.
+	for _, id := range []string{`id="breaks-heading"`, `id="audit-heading"`} {
+		if !strings.Contains(body, id) {
+			t.Fatalf("status page missing region label target %q", id)
+		}
 	}
 }

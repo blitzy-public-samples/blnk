@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,10 +39,71 @@ import (
 	"github.com/blnkfinance/recon-agent/internal/store"
 )
 
+// HTTP server hardening deadlines (finding F09). The HITL listener previously
+// constructed its *http.Server with ONLY Addr + Handler, leaving every read,
+// write, and idle phase unbounded — so a slowloris client that opens many
+// connections and dribbles partial request headers could hold sockets open
+// indefinitely and exhaust the accept budget. These bounded deadlines close
+// abusive partial requests deterministically while leaving legitimate local
+// traffic unaffected.
+const (
+	// readHeaderTimeout bounds how long the server waits for a request's COMPLETE
+	// headers before closing the connection. This is the PRIMARY slowloris
+	// defense: a client that sends incomplete headers is dropped at this
+	// deadline. It is deliberately shorter than the 8-second partial-header
+	// window the finding's reproduction uses, so an abusive socket is terminated
+	// well before then, yet 5s is ample for a real local client whose headers
+	// arrive together.
+	readHeaderTimeout = 5 * time.Second
+
+	// readTimeout bounds the total time to read the entire request (headers +
+	// body). POST /decisions bodies are small (mutationGuard caps them via a
+	// MaxBytesReader), so this generous bound only ever terminates a client that
+	// stalls mid-body.
+	readTimeout = 15 * time.Second
+
+	// writeTimeout bounds the total time from the end of request-header read to
+	// the end of the response write. It MUST exceed the longest legitimate
+	// synchronous handler: a re_drive POST /decisions performs a Blnk dry-run
+	// probe that polls up to blnk.defaultProbeTimeout (30s) plus rule
+	// create/compensate round-trips, so a short write deadline would truncate a
+	// valid re_drive mid-flight. It is therefore set well above that budget. The
+	// slowloris / partial-request defense is carried entirely by
+	// readHeaderTimeout + readTimeout (both read-side), NOT by writeTimeout, so a
+	// generous write deadline weakens none of the protection the finding requires.
+	writeTimeout = 120 * time.Second
+
+	// idleTimeout bounds how long an idle keep-alive connection is retained
+	// between requests before the server closes it, so pooled abusive
+	// connections cannot accumulate across requests.
+	idleTimeout = 60 * time.Second
+
+	// maxHeaderBytes caps the total size of request headers (finding F09),
+	// bounding header-based memory amplification. 1 MiB matches net/http's own
+	// default but is set EXPLICITLY so the bound is documented and intentional
+	// rather than implicit.
+	maxHeaderBytes = 1 << 20
+
+	// readyzBlnkTimeout bounds the Blnk dependency-reachability probe issued by
+	// /readyz (finding F08) so a hung or unreachable Blnk can never make the
+	// readiness endpoint itself hang; on timeout the Blnk dimension is reported
+	// unreachable and /readyz returns promptly.
+	readyzBlnkTimeout = 3 * time.Second
+)
+
 // breakStore is the read/update surface hitl needs from the persistence layer.
 // The concrete *store.Store satisfies it (asserted below); tests inject a mock.
 type breakStore interface {
 	ListBreaks(ctx context.Context) ([]store.Break, error)
+	// ListBreaksPage returns one bounded page of breaks (Limit/Offset), so the
+	// JSON `/breaks` view and the `/` status page can walk past the first
+	// defaultPageLimit rows instead of silently truncating at 500 (finding F06).
+	ListBreaksPage(ctx context.Context, page store.Page) ([]store.Break, error)
+	// CountBreaks returns the total number of breaks so both surfaces can emit
+	// continuation metadata (total + next offset) and traversal controls,
+	// making every break — including queued rows beyond the first page —
+	// discoverable (finding F06).
+	CountBreaks(ctx context.Context) (int, error)
 	ListAudit(ctx context.Context) ([]model.AuditEvent, error)
 	// ListHITL returns the breaks currently awaiting a human decision so the
 	// status page can surface WHY each queued break was routed to a human
@@ -68,6 +130,14 @@ type breakStore interface {
 	// for an already-decided break and store.ErrNotFound for a missing one so a
 	// decision never silently overwrites a terminal status (finding M-01).
 	SetBreakStatusFromQueuedTx(ctx context.Context, tx *sql.Tx, externalTxnID, status string) error
+	// MarkReDrivenClearedFromQueuedTx is the queued-only compare-and-set for a
+	// CONFIRMED-CLEARING re_drive: it transitions the break to re_driven AND
+	// durably stamps the confirming Blnk dry-run reconciliation id into
+	// resolved_recon_id atomically (finding F16, Rule 5.3), returning
+	// store.ErrNotQueued / store.ErrNotFound like SetBreakStatusFromQueuedTx. It
+	// makes the clearance proof a first-class column on a re_driven break rather
+	// than a value buried only in one audit event's provenance.
+	MarkReDrivenClearedFromQueuedTx(ctx context.Context, tx *sql.Tx, externalTxnID, reconID string) error
 	// DequeueHITLTx drains a break from the review queue inside the caller's
 	// transaction (finding M-02).
 	DequeueHITLTx(ctx context.Context, tx *sql.Tx, externalTxnID string) error
@@ -108,6 +178,13 @@ type prober interface {
 	ProbeBreak(ctx context.Context, txn blnk.ExternalTransaction, matchingRuleIDs []string) (cleared bool, reconID string, err error)
 	CreateMatchingRule(ctx context.Context, rule blnk.MatchingRule) (blnk.MatchingRule, error)
 	DeleteMatchingRule(ctx context.Context, ruleID string) error
+	// Ready reports whether Blnk is reachable via a bounded, read-only check on
+	// the same Blnk service that hosts the /reconciliation/* surface (the
+	// concrete *blnk.Client issues GET /health). /readyz uses it so readiness
+	// reflects the Blnk dependency truthfully (finding F08) instead of reporting
+	// ready while Blnk is down — re_drive, the one decision that needs Blnk,
+	// cannot succeed until Blnk returns.
+	Ready(ctx context.Context) error
 }
 
 // Compile-time guarantees that the concrete sibling types satisfy the consumer
@@ -398,7 +475,21 @@ func (s *Server) Listen(addr string) error {
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{Addr: addr, Handler: s.engine}
+	// Construct the server with bounded read/write/idle deadlines and a header
+	// size cap (finding F09) rather than the former Addr+Handler-only server,
+	// which left every phase unbounded and a slowloris client able to hold
+	// sockets open indefinitely. See the hardening-timeout constants above for
+	// the rationale behind each value (in particular why writeTimeout is
+	// generous — it must not truncate a legitimate long-running re_drive probe).
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s.engine,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
 	s.mu.Lock()
 	s.httpServer = srv
 	s.listener = ln
@@ -483,39 +574,136 @@ func (s *Server) healthz(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-// readyz is a dedicated READINESS probe (finding m-02). It reports 200
-// {"status":"ready"} only when the service has been marked ready AND the
-// dependency every decision requires — the agent database — is reachable via
-// store.Ping; otherwise 503 {"status":"not ready"}. The concrete error is
-// logged server-side, never returned to the client (M-03).
+// readyz is a dedicated READINESS probe (findings m-02, F08). It reports the
+// service's readiness across two INDEPENDENT, explicitly-labeled dimensions so a
+// consumer can tell precisely which dependency is degraded rather than seeing a
+// single opaque verdict:
 //
-// Blnk reachability is deliberately NOT probed here: the agent may reach Blnk
-// only through /reconciliation/* routes (Rule 5.1), and re_drive already fails
-// closed if Blnk is unavailable at decision time (Rule 5.7). Accept/reject do
-// not touch Blnk at all, so DB readiness is the meaningful signal for the
-// decision surface as a whole.
+//   - database — the HARD dependency EVERY decision requires (accept, reject, and
+//     re_drive all persist their state change + audit event through it). Checked
+//     via store.Ping.
+//   - blnk — the dependency re_drive requires to re-probe clearance (Rule 5.3).
+//     Checked via a bounded, read-only GET /health on the SAME Blnk service that
+//     hosts the /reconciliation/* routes (Rule 5.1-consistent), so /readyz
+//     reflects a Blnk outage instead of falsely reporting ready (finding F08).
+//
+// Status / HTTP-code contract:
+//   - not marked ready, OR database unreachable => 503 {"status":"not ready", ...}
+//     (the surface cannot serve ANY decision).
+//   - database ok but Blnk unreachable          => 503 {"status":"degraded",
+//     "database":"ok","blnk":"unreachable"} — the misleading 200 {"status":
+//     "ready"} the finding flagged is gone; re_drive cannot succeed until Blnk
+//     returns, and the body names exactly which dependency is degraded.
+//   - both reachable                            => 200 {"status":"ready",
+//     "database":"ok","blnk":"ok"}.
+//
+// The Blnk probe is bounded (readyzBlnkTimeout) so a hung Blnk can never make
+// /readyz itself hang. Concrete dependency errors are logged server-side, never
+// returned to the client (M-03).
 func (s *Server) readyz(c *gin.Context) {
 	if !s.ready.Load() {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready"})
 		return
 	}
+	// Hard dependency: the agent database. Without it no decision can be served,
+	// so an unreachable DB is a flat not-ready (503).
 	if err := s.st.Ping(c.Request.Context()); err != nil {
-		log.Printf("hitl: readiness check failed: %v", err)
-		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready"})
+		log.Printf("hitl: readiness check failed (database unreachable): %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status":   "not ready",
+			"database": "unreachable",
+		})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ready"})
+	// Soft/partial dependency: Blnk. accept/reject do not touch Blnk, but re_drive
+	// does, so a Blnk outage is a genuine partial-readiness degradation the
+	// endpoint must SURFACE rather than hide (finding F08). Bound the probe so a
+	// hung Blnk cannot stall /readyz itself.
+	blnkCtx, cancel := context.WithTimeout(c.Request.Context(), readyzBlnkTimeout)
+	defer cancel()
+	if err := s.bc.Ready(blnkCtx); err != nil {
+		log.Printf("hitl: readiness check degraded (blnk unreachable): %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status":   "degraded",
+			"database": "ok",
+			"blnk":     "unreachable",
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "ready",
+		"database": "ok",
+		"blnk":     "ok",
+	})
 }
 
-// listBreaks returns the machine-readable JSON view of all breaks under
-// management. On a store failure it logs the concrete error server-side and
-// returns a stable, sanitized message — never the raw pq:/driver string (M-03).
+// pageParams parses the bounded limit/offset pagination query parameters shared
+// by the JSON `/breaks` view and the `/` status page (finding F06). An absent or
+// non-numeric `limit` leaves Limit=0 (store.Page.Normalize then selects the
+// default page size); an absent, non-numeric, or negative `offset` leaves
+// Offset=0. store.Page.Normalize enforces the hard [1, maxPageLimit] / offset>=0
+// bounds, so a client can never request an unbounded or negative window even by
+// supplying an out-of-range value.
+func pageParams(c *gin.Context) store.Page {
+	var p store.Page
+	if v := strings.TrimSpace(c.Query("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			p.Limit = n
+		}
+	}
+	if v := strings.TrimSpace(c.Query("offset")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			p.Offset = n
+		}
+	}
+	return p
+}
+
+// listBreaks returns the machine-readable JSON view of the breaks under
+// management, as ONE bounded page plus continuation metadata (finding F06).
+// Previously it returned s.ListBreaks (a single default-capped page) with no
+// total, cursor, or next link, so any break beyond the first defaultPageLimit
+// rows — including still-queued ones — was invisible to an API client. It now
+// accepts ?limit= and ?offset=, returns the requested page, and always includes
+// a `pagination` object {total, limit, offset, returned, next_offset} where
+// next_offset is the offset to fetch the following page (null on the last page).
+// A client walks the entire set by following next_offset until it is null.
+// On a store failure it logs the concrete error server-side and returns a
+// stable, sanitized message — never the raw pq:/driver string (M-03).
 func (s *Server) listBreaks(c *gin.Context) {
-	breaks, err := s.st.ListBreaks(c.Request.Context())
+	ctx := c.Request.Context()
+	p := pageParams(c).Normalize()
+
+	total, err := s.st.CountBreaks(ctx)
+	if err != nil {
+		log.Printf("hitl: count breaks failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	breaks, err := s.st.ListBreaksPage(ctx, p)
 	if err != nil {
 		log.Printf("hitl: list breaks failed: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"breaks": breaks})
+
+	// next_offset points at the first row NOT included in this page; it is null
+	// once this page reaches the end of the set, giving clients an unambiguous
+	// stop condition. len(breaks) (not the requested limit) is used so a short
+	// final page terminates correctly.
+	var nextOffset *int
+	if p.Offset+len(breaks) < total {
+		n := p.Offset + p.Limit
+		nextOffset = &n
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"breaks": breaks,
+		"pagination": gin.H{
+			"total":       total,
+			"limit":       p.Limit,
+			"offset":      p.Offset,
+			"returned":    len(breaks),
+			"next_offset": nextOffset,
+		},
+	})
 }

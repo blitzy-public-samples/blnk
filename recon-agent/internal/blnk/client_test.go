@@ -3,7 +3,6 @@ package blnk
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -314,9 +313,12 @@ func TestUpdateMatchingRuleErrorStatus(t *testing.T) {
 }
 
 // probeServer builds a mock Blnk exposing start-instant + GET, returning the
-// supplied status/unmatched for the reconciliation and honoring an optional
-// number of "started" polls before completion.
-func probeServer(t *testing.T, status string, unmatched int, startedPolls int32) *httptest.Server {
+// supplied status/matched-count for the reconciliation and honoring an optional
+// number of "started" polls before completion. It ALWAYS reports a nonzero
+// UnmatchedTransactions (contamination by unrelated internal bookings, as a real
+// many_to_one run does) so the tests prove ProbeBreak's verdict keys off
+// matched>=1 and IGNORES unmatched.
+func probeServer(t *testing.T, status string, matched int, startedPolls int32) *httptest.Server {
 	var gets int32
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requireBlnkKey(t, r)
@@ -340,8 +342,16 @@ func probeServer(t *testing.T, status string, unmatched int, startedPolls int32)
 			if got := req.ExternalTransactions[0].ID; !strings.HasPrefix(got, "probe-") {
 				t.Fatalf("ProbeBreak must submit an ephemeral probe- id, got %q", got)
 			}
-			if req.Strategy != probeStrategy {
-				t.Fatalf("strategy: got %q want %q", req.Strategy, probeStrategy)
+			// F02/F18/Rule 5.8: the per-break probe MUST use the cache-safe
+			// many_to_one strategy with reference grouping so sequential per-break
+			// probes never collide on Blnk's upload-agnostic pagination cache.
+			// probeStrategy is defined as StrategyManyToOne in client.go; asserting
+			// the wire value equals the exported many_to_one literal pins that.
+			if req.Strategy != StrategyManyToOne {
+				t.Fatalf("strategy: got %q want %q (many_to_one)", req.Strategy, StrategyManyToOne)
+			}
+			if req.GroupingCriteria != probeGroupingCriteria {
+				t.Fatalf("grouping_criteria: got %q want %q", req.GroupingCriteria, probeGroupingCriteria)
 			}
 			if len(req.MatchingRuleIDs) != 1 || req.MatchingRuleIDs[0] != "rule_1" {
 				t.Fatalf("matching rule ids: %+v", req.MatchingRuleIDs)
@@ -356,7 +366,8 @@ func probeServer(t *testing.T, status string, unmatched int, startedPolls int32)
 			_ = json.NewEncoder(w).Encode(Reconciliation{
 				ReconciliationID:      "recon_probe",
 				Status:                st,
-				UnmatchedTransactions: unmatched,
+				MatchedTransactions:   matched,
+				UnmatchedTransactions: 3, // contamination: proves verdict ignores unmatched
 				IsDryRun:              true,
 			})
 		default:
@@ -366,7 +377,7 @@ func probeServer(t *testing.T, status string, unmatched int, startedPolls int32)
 }
 
 func TestProbeBreakCleared(t *testing.T) {
-	srv := probeServer(t, statusCompleted, 0, 0)
+	srv := probeServer(t, statusCompleted, 1, 0) // matched=1 => cleared
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
@@ -375,7 +386,7 @@ func TestProbeBreakCleared(t *testing.T) {
 		t.Fatalf("ProbeBreak: %v", err)
 	}
 	if !cleared {
-		t.Fatal("expected cleared=true for unmatched=0")
+		t.Fatal("expected cleared=true for matched>=1")
 	}
 	if reconID != "recon_probe" {
 		t.Fatalf("reconID: got %q", reconID)
@@ -383,7 +394,7 @@ func TestProbeBreakCleared(t *testing.T) {
 }
 
 func TestProbeBreakStillBreak(t *testing.T) {
-	srv := probeServer(t, statusCompleted, 1, 0)
+	srv := probeServer(t, statusCompleted, 0, 0) // matched=0 => still a break
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
@@ -392,7 +403,7 @@ func TestProbeBreakStillBreak(t *testing.T) {
 		t.Fatalf("ProbeBreak: %v", err)
 	}
 	if cleared {
-		t.Fatal("expected cleared=false for unmatched=1")
+		t.Fatal("expected cleared=false for matched=0")
 	}
 	if reconID != "recon_probe" {
 		t.Fatalf("reconID: got %q", reconID)
@@ -400,7 +411,7 @@ func TestProbeBreakStillBreak(t *testing.T) {
 }
 
 func TestProbeBreakPollsUntilComplete(t *testing.T) {
-	srv := probeServer(t, statusCompleted, 0, 2) // two "started" polls, then completed
+	srv := probeServer(t, statusCompleted, 1, 2) // matched=1; two "started" polls, then completed
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
@@ -432,7 +443,7 @@ func TestProbeBreakFailed(t *testing.T) {
 }
 
 func TestProbeBreakTimeout(t *testing.T) {
-	srv := probeServer(t, statusCompleted, 0, 1<<30) // never terminal within the window
+	srv := probeServer(t, statusCompleted, 1, 1<<30) // never terminal within the window
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
@@ -501,6 +512,7 @@ func TestProbeBreakUsesEphemeralID(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(Reconciliation{
 				ReconciliationID:      "recon_probe",
 				Status:                statusCompleted,
+				MatchedTransactions:   1,
 				UnmatchedTransactions: 0,
 				IsDryRun:              true,
 			})
@@ -600,57 +612,69 @@ func TestNewJSONRequestBadMethod(t *testing.T) {
 	}
 }
 
-// TestReadyStaysOnReconRouteAndAuthenticates asserts M-05: Ready probes the
-// mandated /reconciliation/* surface (never /health) with the X-Blnk-Key
-// attached, and treats 200 and 404 as ready.
-func TestReadyStaysOnReconRouteAndAuthenticates(t *testing.T) {
-	for _, status := range []int{http.StatusOK, http.StatusNotFound} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
-			var sawReconRoute, sawKey bool
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if strings.HasPrefix(r.URL.Path, "/reconciliation/") {
-					sawReconRoute = true
-				}
-				if r.URL.Path == "/health" {
-					t.Errorf("Ready must NOT call /health (Rule 5.1); got %s", r.URL.Path)
-				}
-				if r.Header.Get(keyHeader) == testKey {
-					sawKey = true
-				}
-				w.WriteHeader(status)
-			}))
-			defer srv.Close()
+// TestReadyProbesHealthAndAuthenticates asserts F13: Ready probes Blnk's
+// purpose-built GET /health liveness endpoint (which never logs an error on the
+// Blnk side, unlike the former sentinel-reconciliation-id probe) with the
+// X-Blnk-Key attached, and treats 200 + an "UP" status body as ready.
+func TestReadyProbesHealthAndAuthenticates(t *testing.T) {
+	var sawHealth, sawKey bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == routeHealth {
+			sawHealth = true
+		}
+		// F13: Ready must NOT request a (nonexistent) reconciliation id, which is
+		// what made Blnk log a spurious ERROR on every boot.
+		if strings.HasPrefix(r.URL.Path, routeReconByID) && r.URL.Path != routeHealth {
+			t.Errorf("Ready must NOT probe a reconciliation id (finding F13); got %s", r.URL.Path)
+		}
+		if r.Header.Get(keyHeader) == testKey {
+			sawKey = true
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"UP"}`))
+	}))
+	defer srv.Close()
 
-			c := NewClient(srv.URL, testKey)
-			if err := c.Ready(context.Background()); err != nil {
-				t.Fatalf("Ready() = %v, want nil for status %d", err, status)
-			}
-			if !sawReconRoute {
-				t.Error("Ready did not probe a /reconciliation/* route")
-			}
-			if !sawKey {
-				t.Error("Ready did not attach the X-Blnk-Key header")
-			}
-		})
+	c := NewClient(srv.URL, testKey)
+	if err := c.Ready(context.Background()); err != nil {
+		t.Fatalf("Ready() = %v, want nil for a healthy Blnk", err)
+	}
+	if !sawHealth {
+		t.Error("Ready did not probe GET /health")
+	}
+	if !sawKey {
+		t.Error("Ready did not attach the X-Blnk-Key header")
 	}
 }
 
-// TestReadyRejectsAuthAndServerErrors asserts M-05: an auth failure (401/403), a
-// bad request (400), or a server error (5xx) is NOT treated as ready.
-func TestReadyRejectsAuthAndServerErrors(t *testing.T) {
-	for _, status := range []int{
-		http.StatusUnauthorized, http.StatusForbidden,
-		http.StatusBadRequest, http.StatusInternalServerError, http.StatusBadGateway,
-	} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
+// TestReadyRejectsUnhealthyAndErrors asserts F13/F08 posture: a degraded Blnk
+// (503 {"status":"DOWN"}), an auth failure (401/403), a bad request (400), a
+// server error (5xx), or a 200 whose body is not UP is NOT treated as ready.
+func TestReadyRejectsUnhealthyAndErrors(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"down", http.StatusServiceUnavailable, `{"status":"DOWN"}`},
+		{"unauthorized", http.StatusUnauthorized, ``},
+		{"forbidden", http.StatusForbidden, ``},
+		{"badRequest", http.StatusBadRequest, ``},
+		{"serverError", http.StatusInternalServerError, ``},
+		{"badGateway", http.StatusBadGateway, ``},
+		{"okButNotUp", http.StatusOK, `{"status":"STARTING"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(status)
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
 			}))
 			defer srv.Close()
 
 			c := NewClient(srv.URL, testKey)
 			if err := c.Ready(context.Background()); err == nil {
-				t.Fatalf("Ready() = nil, want error for status %d", status)
+				t.Fatalf("Ready() = nil, want error for %s (status %d body %q)", tc.name, tc.status, tc.body)
 			}
 		})
 	}
@@ -736,49 +760,51 @@ func TestResponseBodyBounded(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// ConfirmCohortCleared (finding F-1, Rule 5.3).
+// EstablishMainReconciliation (finding F02, Rule 5.3).
 //
-// This exercises the per-break-attributable, cache-safe deterministic-arbiter
-// seam that replaced the earlier aggregate ConfirmClearedOverUpload. It submits
-// the eligible cohort inline via POST /reconciliation/start-instant with FRESH
-// per-run "cohort-" ids and dry_run=true (never mutating Blnk), polls GET to a
-// terminal status, and reports cleared ONLY when Blnk's authoritative counts show
-// unmatched==0 AND matched+unmatched==len(cohort). Because the dedicated upload
-// contains ONLY the cohort, unmatched==0 proves EVERY member left the unmatched
-// set, so a resolution is attributable per break (Rule 5.3); the cardinality
-// guard fails closed if a stale-cache read (protected-core defect INFO#4)
-// returns a different-cardinality page.
+// This exercises the pipeline's INITIAL reconciliation over the already-uploaded
+// statement — the mandated Upload -> start -> read topology (F02). It POSTs
+// /reconciliation/start for the upload with the cache-safe many_to_one strategy,
+// reference grouping and dry_run=true (never mutating Blnk state, Rule 5.3),
+// polls GET /reconciliation/:id to a terminal status, and returns the completed
+// reconciliation's id (the "main_recon_id") that callers persist as each break's
+// batch-reconciliation provenance. Blnk requires >=1 matching rule id for both
+// /reconciliation/start and /reconciliation/start-instant, so an empty upload id
+// or an empty rule set is rejected before any HTTP call, and a start error, a
+// failed run or a timeout surfaces as an error rather than a silent success.
 // -----------------------------------------------------------------------------
 
-// cohortMock returns an httptest server answering the two routes
-// ConfirmCohortCleared drives (POST /reconciliation/start-instant, then GET
+// mainReconMock returns an httptest server answering the two routes
+// EstablishMainReconciliation drives (POST /reconciliation/start, then GET
 // /reconciliation/<id>). Successive GET calls return statuses[i] (the last
-// element repeats once exhausted); the reconciliation reports matched/unmatched.
-// It captures the decoded start-instant request into *gotReq for assertion.
-func cohortMock(t *testing.T, reconID string, matched, unmatched int, statuses []string, gotReq *InstantReconciliationRequest) *httptest.Server {
+// element repeats once exhausted). It captures the decoded start request into
+// *gotReq for assertion. The reconciliation always reports NONZERO counts to
+// prove EstablishMainReconciliation ignores them (it returns purely on terminal
+// status, F02), unlike the per-break ProbeBreak verdict.
+func mainReconMock(t *testing.T, reconID string, statuses []string, gotReq *StartReconciliationRequest) *httptest.Server {
 	t.Helper()
-	var getCalls int
+	var gets int32
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requireBlnkKey(t, r)
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == routeStartInstant:
+		case r.Method == http.MethodPost && r.URL.Path == routeStart:
 			if gotReq != nil {
 				if err := json.NewDecoder(r.Body).Decode(gotReq); err != nil {
-					t.Fatalf("decode start-instant body: %v", err)
+					t.Fatalf("decode start body: %v", err)
 				}
 			}
 			_ = json.NewEncoder(w).Encode(StartReconciliationResponse{ReconciliationID: reconID})
 		case r.Method == http.MethodGet && r.URL.Path == routeReconByID+reconID:
+			n := atomic.AddInt32(&gets, 1)
 			st := statuses[len(statuses)-1]
-			if getCalls < len(statuses) {
-				st = statuses[getCalls]
+			if int(n) <= len(statuses) {
+				st = statuses[n-1]
 			}
-			getCalls++
 			_ = json.NewEncoder(w).Encode(Reconciliation{
 				ReconciliationID:      reconID,
 				Status:                st,
-				MatchedTransactions:   matched,
-				UnmatchedTransactions: unmatched,
+				MatchedTransactions:   2,
+				UnmatchedTransactions: 4, // counts are irrelevant to Establish; only status matters
 				IsDryRun:              true,
 			})
 		default:
@@ -787,153 +813,119 @@ func cohortMock(t *testing.T, reconID string, matched, unmatched int, statuses [
 	}))
 }
 
-func cohortOf(n int) []ExternalTransaction {
-	cohort := make([]ExternalTransaction, n)
-	for i := range cohort {
-		cohort[i] = ExternalTransaction{ID: fmt.Sprintf("ext_%d", i), Amount: 100, Currency: "USD"}
-	}
-	return cohort
-}
-
-func TestConfirmCohortClearedAllCleared(t *testing.T) {
-	// A 3-member cohort whose dedicated dry-run reports matched=3, unmatched=0:
-	// every member left the unmatched set => cleared (Rule 5.3), attributable per
-	// break because the dedicated upload contained ONLY these three rows.
-	var gotReq InstantReconciliationRequest
-	srv := cohortMock(t, "recon_cohort_ok", 3, 0, []string{statusCompleted}, &gotReq)
+func TestEstablishMainReconciliationSuccess(t *testing.T) {
+	// The initial run must POST /reconciliation/start for the upload as a DRY RUN
+	// carrying the cache-safe many_to_one strategy, reference grouping and the
+	// supplied rule ids, poll GET to a terminal status, and return the completed
+	// reconciliation id (the main_recon_id, F02).
+	var gotReq StartReconciliationRequest
+	srv := mainReconMock(t, "recon_main_ok", []string{statusCompleted}, &gotReq)
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
-	cleared, reconID, err := c.ConfirmCohortCleared(context.Background(), cohortOf(3), []string{"rule_a", "rule_b", "rule_c"})
+	reconID, err := c.EstablishMainReconciliation(context.Background(), "up_main", []string{"rule_a", "rule_b"})
 	if err != nil {
-		t.Fatalf("ConfirmCohortCleared: %v", err)
+		t.Fatalf("EstablishMainReconciliation: %v", err)
 	}
-	if !cleared {
-		t.Fatal("unmatched==0 and matched+unmatched==len(cohort) must report cleared=true")
+	if reconID != "recon_main_ok" {
+		t.Fatalf("main recon id: got %q want recon_main_ok", reconID)
 	}
-	if reconID != "recon_cohort_ok" {
-		t.Fatalf("confirming recon id: got %q want recon_cohort_ok", reconID)
-	}
-	// Rule 5.3 / F3/F8: the cohort dry-run MUST be a DRY RUN carrying the proposed
-	// rules and FRESH ephemeral "cohort-" ids (never the caller's real external
-	// ids, which would collide on Blnk's external_transactions_pkey across reruns).
 	if !gotReq.DryRun {
-		t.Fatal("ConfirmCohortCleared must run a DRY RUN (Rule 5.3), never mutate Blnk state")
+		t.Fatal("EstablishMainReconciliation must run a DRY RUN (Rule 5.3), never mutate Blnk state")
 	}
-	if gotReq.Strategy != probeStrategy {
-		t.Fatalf("strategy: got %q want %q", gotReq.Strategy, probeStrategy)
+	if gotReq.UploadID != "up_main" {
+		t.Fatalf("upload id: got %q want up_main", gotReq.UploadID)
 	}
-	if len(gotReq.ExternalTransactions) != 3 {
-		t.Fatalf("cohort size submitted: got %d want 3", len(gotReq.ExternalTransactions))
+	// F02/F18/Rule 5.8: the initial run MUST use the SAME cache-safe many_to_one
+	// strategy + reference grouping as the per-break probes, so the real upload's
+	// run cannot poison the per-break probes' disjoint upload-scoped cache entries.
+	// probeStrategy is defined as StrategyManyToOne in client.go; asserting the
+	// wire value equals the exported many_to_one literal pins that invariant.
+	if gotReq.Strategy != StrategyManyToOne {
+		t.Fatalf("strategy: got %q want %q (many_to_one)", gotReq.Strategy, StrategyManyToOne)
 	}
-	for _, txn := range gotReq.ExternalTransactions {
-		if !strings.HasPrefix(txn.ID, "cohort-") {
-			t.Fatalf("cohort member must carry a fresh cohort- id, got %q", txn.ID)
-		}
+	if gotReq.GroupingCriteria != probeGroupingCriteria {
+		t.Fatalf("grouping_criteria: got %q want %q", gotReq.GroupingCriteria, probeGroupingCriteria)
 	}
-	if len(gotReq.MatchingRuleIDs) != 3 {
-		t.Fatalf("matching rule ids: got %v want 3 ids", gotReq.MatchingRuleIDs)
+	if len(gotReq.MatchingRuleIDs) != 2 {
+		t.Fatalf("matching rule ids: got %v want 2 ids", gotReq.MatchingRuleIDs)
 	}
 }
 
-func TestConfirmCohortClearedNotClearedWhenUnmatched(t *testing.T) {
-	// A misclassified no-counterpart break in the cohort cannot clear: the
-	// dedicated dry-run reports unmatched>0, so the WHOLE cohort fails closed
-	// (cleared=false). LLM confidence must never substitute for this Blnk verdict.
-	srv := cohortMock(t, "recon_cohort_no", 2, 1, []string{statusCompleted}, nil)
+func TestEstablishMainReconciliationPollsUntilTerminal(t *testing.T) {
+	// First GET is non-terminal ("processing"); the poll loop must try again and
+	// only return once Blnk reports a terminal "completed".
+	srv := mainReconMock(t, "recon_main_poll", []string{"processing", statusCompleted}, nil)
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
-	cleared, _, err := c.ConfirmCohortCleared(context.Background(), cohortOf(3), []string{"rule_a", "rule_b", "rule_c"})
+	c.probeInterval = time.Millisecond // speed up polling for the test
+	reconID, err := c.EstablishMainReconciliation(context.Background(), "up_main", []string{"rule_a"})
 	if err != nil {
-		t.Fatalf("ConfirmCohortCleared: %v", err)
+		t.Fatalf("EstablishMainReconciliation: %v", err)
 	}
-	if cleared {
-		t.Fatal("unmatched(1) > 0 must report cleared=false (fail closed)")
+	if reconID != "recon_main_poll" {
+		t.Fatalf("main recon id: got %q want recon_main_poll", reconID)
 	}
 }
 
-func TestConfirmCohortClearedCardinalityGuardFailsClosed(t *testing.T) {
-	// INFO#4 defense: a stale-cache read returns a DIFFERENT-cardinality page
-	// (matched=6, unmatched=0 for a 3-member cohort). Even though unmatched==0,
-	// matched+unmatched(6) != len(cohort)(3), so the cardinality guard fails
-	// closed rather than trusting an unattributable result.
-	srv := cohortMock(t, "recon_cohort_stale", 6, 0, []string{statusCompleted}, nil)
-	defer srv.Close()
-
-	c := NewClient(srv.URL, testKey)
-	cleared, _, err := c.ConfirmCohortCleared(context.Background(), cohortOf(3), []string{"rule_a"})
-	if err != nil {
-		t.Fatalf("ConfirmCohortCleared: %v", err)
-	}
-	if cleared {
-		t.Fatal("a different-cardinality (stale-cache) read must fail the guard closed (cleared=false)")
-	}
-}
-
-func TestConfirmCohortClearedPollsUntilTerminal(t *testing.T) {
-	// First GET is non-terminal ("processing"); the loop must poll again on the
-	// ticker and only return once Blnk reports a terminal "completed".
-	srv := cohortMock(t, "recon_cohort_poll", 2, 0, []string{"processing", statusCompleted}, nil)
-	defer srv.Close()
-
-	c := NewClient(srv.URL, testKey)
-	cleared, _, err := c.ConfirmCohortCleared(context.Background(), cohortOf(2), []string{"rule_a"})
-	if err != nil {
-		t.Fatalf("ConfirmCohortCleared: %v", err)
-	}
-	if !cleared {
-		t.Fatal("matched=2 unmatched=0 for a 2-member cohort must report cleared=true")
-	}
-}
-
-func TestConfirmCohortClearedEmptyCohortErrors(t *testing.T) {
+func TestEstablishMainReconciliationEmptyUploadErrors(t *testing.T) {
+	// An empty (whitespace-only) upload id is rejected BEFORE any HTTP call: a
+	// missing initial reconciliation must surface, never be silently skipped (F02).
 	c := NewClient("http://unused.invalid", testKey)
-	if _, _, err := c.ConfirmCohortCleared(context.Background(), nil, []string{"rule_a"}); err == nil {
-		t.Fatal("an empty cohort must be rejected with an error, never treated as cleared")
+	if _, err := c.EstablishMainReconciliation(context.Background(), "  ", []string{"rule_a"}); err == nil {
+		t.Fatal("an empty upload id must be rejected with an error")
 	}
 }
 
-func TestConfirmCohortClearedFailedStatusErrors(t *testing.T) {
-	srv := cohortMock(t, "recon_cohort_fail", 0, 0, []string{statusFailed}, nil)
+func TestEstablishMainReconciliationEmptyRulesErrors(t *testing.T) {
+	// Blnk rejects /reconciliation/start with no matching_rule_ids, so the client
+	// fails fast (before any HTTP call) when the caller supplies none.
+	c := NewClient("http://unused.invalid", testKey)
+	if _, err := c.EstablishMainReconciliation(context.Background(), "up_main", nil); err == nil {
+		t.Fatal("an empty matching_rule_ids set must be rejected with an error")
+	}
+}
+
+func TestEstablishMainReconciliationFailedStatusErrors(t *testing.T) {
+	// A Blnk run that reports status=failed must surface an error while still
+	// returning the reconciliation id for diagnostics.
+	srv := mainReconMock(t, "recon_main_fail", []string{statusFailed}, nil)
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
-	cleared, _, err := c.ConfirmCohortCleared(context.Background(), cohortOf(1), []string{"rule_a"})
+	reconID, err := c.EstablishMainReconciliation(context.Background(), "up_main", []string{"rule_a"})
 	if err == nil {
-		t.Fatal("a Blnk reconciliation that reports status=failed must surface an error")
+		t.Fatal("a reconciliation that reports status=failed must surface an error")
 	}
-	if cleared {
-		t.Fatal("a failed reconciliation must never report cleared=true")
+	if reconID != "recon_main_fail" {
+		t.Fatalf("recon id should still be returned on failure: got %q", reconID)
 	}
 }
 
-func TestConfirmCohortClearedStartError(t *testing.T) {
+func TestEstablishMainReconciliationStartError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
-	cleared, _, err := c.ConfirmCohortCleared(context.Background(), cohortOf(1), nil)
-	if err == nil {
-		t.Fatal("a failed start-instant must abort ConfirmCohortCleared with an error")
-	}
-	if cleared {
-		t.Fatal("an errored confirmation must never report cleared=true")
+	if _, err := c.EstablishMainReconciliation(context.Background(), "up_main", []string{"rule_a"}); err == nil {
+		t.Fatal("a failed /reconciliation/start must abort EstablishMainReconciliation with an error")
 	}
 }
 
-func TestConfirmCohortClearedContextCancel(t *testing.T) {
+func TestEstablishMainReconciliationContextCancel(t *testing.T) {
 	// GET never reaches a terminal status, so the bounded poll must give up when
 	// the caller's context deadline elapses rather than blocking forever.
-	srv := cohortMock(t, "recon_cohort_hang", 1, 0, []string{"processing"}, nil)
+	srv := mainReconMock(t, "recon_main_hang", []string{"processing"}, nil)
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testKey)
+	c.probeInterval = time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, _, err := c.ConfirmCohortCleared(ctx, cohortOf(1), nil); err == nil {
-		t.Fatal("ConfirmCohortCleared must error when the context deadline elapses before completion")
+	if _, err := c.EstablishMainReconciliation(ctx, "up_main", []string{"rule_a"}); err == nil {
+		t.Fatal("EstablishMainReconciliation must error when the context deadline elapses before completion")
 	}
 }

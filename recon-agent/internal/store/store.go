@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -62,16 +64,19 @@ const (
 
 // Page is a bounded pagination request. Limit <= 0 selects defaultPageLimit;
 // a Limit above maxPageLimit is clamped to maxPageLimit. Offset < 0 is treated
-// as 0. normalize applies these rules so no caller can request an unbounded or
+// as 0. Normalize applies these rules so no caller can request an unbounded or
 // negative window.
 type Page struct {
 	Limit  int
 	Offset int
 }
 
-// normalize clamps a Page to the enforced bounds. It is total: every input maps
-// to a valid (Limit in [1,maxPageLimit], Offset >= 0) window.
-func (p Page) normalize() Page {
+// Normalize clamps a Page to the enforced bounds. It is total: every input maps
+// to a valid (Limit in [1,maxPageLimit], Offset >= 0) window. It is exported so
+// the HITL surfaces can report the EFFECTIVE limit/offset actually applied and
+// compute continuation metadata (next offset) consistently with the bounds the
+// store enforces (finding F06).
+func (p Page) Normalize() Page {
 	out := p
 	if out.Limit <= 0 {
 		out.Limit = defaultPageLimit
@@ -110,9 +115,17 @@ type Break struct {
 	// auto-remediating this break (empty when none was created). It is persisted
 	// so a retry after a partial failure can reuse the already-created rule
 	// instead of creating a duplicate one in Blnk.
-	CreatedRuleID string    `json:"created_rule_id,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	CreatedRuleID string `json:"created_rule_id,omitempty"`
+	// ResolvedReconID is the confirming Blnk dry-run reconciliation id that
+	// proves this break cleared — the durable clearance proof (Rule 5.3). It is
+	// populated for an auto-resolved break (MarkResolvedTx) and for a re_driven
+	// break whose re_drive Blnk-confirmed clearance (MarkReDrivenClearedFromQueuedTx,
+	// finding F16); it is empty for every non-cleared status. Surfacing it here
+	// lets the HITL status page display the exact proof next to a cleared break
+	// rather than leaving a re_driven row with a blank proof.
+	ResolvedReconID string    `json:"resolved_recon_id,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // sqlExecer is the subset of *sql.DB and *sql.Tx used by the write helpers.
@@ -182,20 +195,121 @@ const (
 // issues targets the agent schema; no blnk.* table is ever read or written.
 type Store struct {
 	db *sql.DB
+	// dsn is the connection string this Store was opened with. It is retained
+	// SOLELY so error surfaces that could echo it (lib/pq forces a lazy connect
+	// on the first query and Go's net/url parse error embeds the RAW DSN — see
+	// sanitizeDBError) can be scrubbed of any embedded credential before the
+	// error propagates to a log (finding F07). It is never itself logged.
+	dsn string
+}
+
+// dsnURLUserinfoPassword matches the password segment of a URL-form DSN's
+// userinfo (scheme://user:PASSWORD@host...). It is used only to extract/redact
+// the secret when net/url cannot parse the DSN (e.g. an invalid port), which is
+// exactly the malformed-DSN case whose parse error would otherwise leak the
+// password verbatim (finding F07).
+var dsnURLUserinfoPassword = regexp.MustCompile(`://[^:@/]+:([^@/\s]+)@`)
+
+// dsnKeywordPassword matches the value of a libpq keyword/value DSN's password
+// field (host=... password=SECRET ...), quoted or bare.
+var dsnKeywordPassword = regexp.MustCompile(`(?i)password\s*=\s*('[^']*'|"[^"]*"|[^\s'"]+)`)
+
+// redactDSN returns a display-safe rendering of dsn with any embedded password
+// masked. It first tries net/url (the common URL form) and, whether or not that
+// succeeds, additionally applies the regex fallbacks so a DSN that net/url
+// cannot parse — the precise malformed case that leaks in finding F07 — is
+// still redacted. An empty dsn yields "(empty)".
+func redactDSN(dsn string) string {
+	if strings.TrimSpace(dsn) == "" {
+		return "(empty)"
+	}
+	out := dsn
+	if u, err := url.Parse(dsn); err == nil && u.User != nil {
+		if _, hasPw := u.User.Password(); hasPw {
+			u.User = url.UserPassword(u.User.Username(), "xxxxx")
+			out = u.String()
+		}
+	}
+	// Replace the captured userinfo password with the mask (handles the malformed
+	// DSN that net/url could not parse above).
+	out = dsnURLUserinfoPassword.ReplaceAllStringFunc(out, func(m string) string {
+		sub := dsnURLUserinfoPassword.FindStringSubmatch(m)
+		if len(sub) == 2 {
+			return strings.Replace(m, sub[1], "xxxxx", 1)
+		}
+		return m
+	})
+	out = dsnKeywordPassword.ReplaceAllString(out, "password=xxxxx")
+	return out
+}
+
+// dsnSecrets returns every literal secret token embedded in dsn (the URL
+// userinfo password and/or a keyword password value). These exact substrings
+// are stripped from any error message that might echo them (finding F07),
+// which defends against error text that reproduces the raw DSN verbatim even
+// when the DSN itself is malformed and cannot be parsed structurally.
+func dsnSecrets(dsn string) []string {
+	var secrets []string
+	seen := map[string]struct{}{}
+	add := func(s string) {
+		s = strings.Trim(s, `'"`)
+		if s == "" {
+			return
+		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		secrets = append(secrets, s)
+	}
+	if u, err := url.Parse(dsn); err == nil && u.User != nil {
+		if pw, ok := u.User.Password(); ok {
+			add(pw)
+		}
+	}
+	if m := dsnURLUserinfoPassword.FindStringSubmatch(dsn); len(m) == 2 {
+		add(m[1])
+	}
+	if m := dsnKeywordPassword.FindStringSubmatch(dsn); len(m) == 2 {
+		add(m[1])
+	}
+	return secrets
+}
+
+// sanitizeDBError returns an error whose message is guaranteed to contain no
+// credential embedded in dsn (finding F07). It replaces every secret token from
+// the DSN with a mask and, if the raw DSN appears verbatim, replaces it with its
+// redacted form. A brand-new error is returned (the original is NOT wrapped)
+// because lib/pq / net/url attach the leaking text to the error's own message,
+// so preserving the chain via %w would re-expose the secret through Error().
+// nil in yields nil out.
+func sanitizeDBError(err error, dsn string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	for _, secret := range dsnSecrets(dsn) {
+		msg = strings.ReplaceAll(msg, secret, "xxxxx")
+	}
+	if dsn != "" && strings.Contains(msg, dsn) {
+		msg = strings.ReplaceAll(msg, dsn, redactDSN(dsn))
+	}
+	return errors.New(msg)
 }
 
 // New opens a Store against the given PostgreSQL DSN (from AGENT_DATABASE_URL)
 // using the lib/pq "postgres" driver. The connection is opened lazily; call
-// Migrate (or any method) to force a real connection.
+// Migrate (or any method) to force a real connection. Any error is scrubbed of
+// DSN credentials before it is returned (finding F07).
 func New(dsn string) (*Store, error) {
 	if strings.TrimSpace(dsn) == "" {
 		return nil, errors.New("store: empty DSN")
 	}
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
-		return nil, err
+		return nil, sanitizeDBError(err, dsn)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, dsn: dsn}, nil
 }
 
 // Close releases the underlying connection pool.
@@ -214,7 +328,33 @@ func (s *Store) Ping(ctx context.Context) error {
 	if s.db == nil {
 		return errors.New("store: not initialized")
 	}
-	return s.db.PingContext(ctx)
+	// lib/pq forces the lazy connection here; a malformed DSN surfaces a
+	// net/url parse error that embeds the RAW DSN (password included). Scrub it
+	// before it reaches /healthz logging (finding F07).
+	return sanitizeDBError(s.db.PingContext(ctx), s.dsn)
+}
+
+// SelectOne verifies the database can actually SERVE a query, not merely accept
+// a TCP connection, by executing a real `SELECT 1` round-trip (finding F01). A
+// container orchestrator's TCP/`pg_isready` gate can report PostgreSQL "healthy"
+// during the window between accepting connections and being able to run queries
+// (startup, recovery, a brief reset); running the boot migration in that window
+// fails with an opaque "connection reset". cmd/main.go calls SelectOne in a
+// bounded retry BEFORE migrating so that transient window is waited out instead
+// of turning into a fatal boot error. Any driver error is scrubbed of DSN
+// secrets first (finding F07).
+func (s *Store) SelectOne(ctx context.Context) error {
+	if s.db == nil {
+		return errors.New("store: not initialized")
+	}
+	var one int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1`).Scan(&one); err != nil {
+		return sanitizeDBError(err, s.dsn)
+	}
+	if one != 1 {
+		return fmt.Errorf("store: readiness probe returned unexpected value %d", one)
+	}
+	return nil
 }
 
 // migrateAdvisoryLockKey is the fixed key every recon-agent instance uses for
@@ -244,6 +384,32 @@ const migrateAdvisoryLockKey int64 = 0x7265636F6E
 // of the race simply re-runs the idempotent DDL after acquiring the lock, which
 // no-ops.
 func (s *Store) Migrate(ctx context.Context) error {
+	return s.migrate(ctx, "")
+}
+
+// MigrateAndGrant applies the schema AS THE OWNER/MIGRATOR role this Store is
+// connected as, and then grants the restricted RUNTIME role (identified by the
+// username embedded in runtimeDSN) exactly the least privileges it needs
+// (finding F05, Rule 5.5): USAGE on the agent schema; SELECT+INSERT on the
+// append-only agent_audit (NO update/delete/truncate); the specific DML each
+// mutable table requires; and USAGE on the outbox sequence. It deliberately
+// grants NO ownership, NO database CREATE, and NO privilege that would let the
+// runtime role disable the append-only trigger or mutate/drop audit history.
+//
+// This is the two-role production path: cmd/main.go connects this Store as the
+// migrator (AGENT_MIGRATE_DATABASE_URL) purely to run MigrateAndGrant, while the
+// long-lived application Store connects as the runtime role (AGENT_DATABASE_URL).
+// When runtimeDSN is empty (single-role dev/test) it degrades to a plain
+// Migrate with no cross-role grants. Granting to a role identical to the
+// migrator (a misconfiguration) is harmless (a grant to self).
+func (s *Store) MigrateAndGrant(ctx context.Context, runtimeDSN string) error {
+	return s.migrate(ctx, runtimeRoleFromDSN(runtimeDSN))
+}
+
+// migrate runs the Up section (and, when runtimeRole is non-empty, the runtime
+// privilege grants) inside ONE advisory-locked transaction, then scrubs any DSN
+// credential from the returned error (finding F07).
+func (s *Store) migrate(ctx context.Context, runtimeRole string) error {
 	up := upSection(schemaSQL)
 	if strings.TrimSpace(up) == "" {
 		return errors.New("store: migration has no Up section")
@@ -256,7 +422,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 		ctx, cancel = context.WithTimeout(ctx, migrateLockTimeout)
 		defer cancel()
 	}
-	return s.WithTx(ctx, func(tx *sql.Tx) error {
+	err := s.WithTx(ctx, func(tx *sql.Tx) error {
 		// Acquire the transaction-scoped advisory lock with a bounded try-lock
 		// retry loop rather than the blocking pg_advisory_xact_lock, so the wait
 		// is capped by the context deadline above (finding M-16).
@@ -266,8 +432,79 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, up); err != nil {
 			return err
 		}
+		// Least-privilege grants to the restricted runtime role (finding F05).
+		// Runs in the SAME transaction as the DDL so the schema and its grants
+		// commit atomically; GRANT is transactional in PostgreSQL.
+		if runtimeRole != "" {
+			if err := grantRuntimePrivileges(ctx, tx, runtimeRole); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
+	return sanitizeDBError(err, s.dsn)
+}
+
+// runtimeRoleFromDSN extracts the login role name from a PostgreSQL DSN so the
+// migrator can grant privileges to the runtime role without a separate config
+// field. It understands both the URL form (postgres://ROLE:pw@host/db) and the
+// libpq keyword form (user=ROLE ...). It returns "" when no role can be
+// determined (in which case the caller performs no cross-role grants).
+func runtimeRoleFromDSN(dsn string) string {
+	if strings.TrimSpace(dsn) == "" {
+		return ""
+	}
+	if u, err := url.Parse(dsn); err == nil && u.User != nil {
+		if name := u.User.Username(); name != "" {
+			return name
+		}
+	}
+	if m := regexp.MustCompile(`(?i)\buser\s*=\s*('[^']*'|"[^"]*"|[^\s'"]+)`).FindStringSubmatch(dsn); len(m) == 2 {
+		return strings.Trim(m[1], `'"`)
+	}
+	return ""
+}
+
+// grantRuntimePrivileges issues the exact least-privilege GRANTs the runtime
+// role needs against the migrator-owned agent objects (finding F05). The role
+// name is interpolated via pq.QuoteIdentifier so it cannot be used for SQL
+// injection. The privilege set mirrors the DML in this package: agent_audit is
+// SELECT+INSERT only (append-only, Rule 5.5); agent_break / agent_rule_outbox /
+// agent_run get their required UPDATE; agent_hitl_queue gets UPDATE for its
+// re-enqueue upsert (INSERT ... ON CONFLICT DO UPDATE, which PostgreSQL checks
+// as an UPDATE) plus DELETE for draining; and the outbox's BIGSERIAL sequence
+// gets USAGE for nextval on INSERT. No TRUNCATE, no schema/database CREATE, and
+// no ownership are granted, so the runtime role can neither disable the
+// append-only trigger nor create unrelated objects.
+func grantRuntimePrivileges(ctx context.Context, tx *sql.Tx, runtimeRole string) error {
+	for _, stmt := range runtimeGrantStatements(runtimeRole) {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("store: grant runtime privileges: %w", err)
+		}
+	}
+	return nil
+}
+
+// runtimeGrantStatements returns the exact least-privilege GRANT statements the
+// runtime role receives, as a pure (side-effect-free) function so the privilege
+// set is unit-testable without a live database (finding F05 regression guard).
+// Each statement mirrors the DML this package actually issues per object: the
+// privilege set MUST include UPDATE for every table written via an
+// "INSERT ... ON CONFLICT DO UPDATE" upsert (agent_break, agent_hitl_queue),
+// because PostgreSQL checks the DO UPDATE arm as an UPDATE — omitting it makes
+// the upsert fail at runtime with "permission denied". agent_audit stays
+// SELECT+INSERT only to preserve append-only immutability (Rule 5.5).
+func runtimeGrantStatements(runtimeRole string) []string {
+	role := pq.QuoteIdentifier(runtimeRole)
+	return []string{
+		"GRANT USAGE ON SCHEMA agent TO " + role,
+		"GRANT SELECT, INSERT ON agent.agent_audit TO " + role,
+		"GRANT SELECT, INSERT, UPDATE ON agent.agent_break TO " + role,
+		"GRANT SELECT, INSERT, UPDATE, DELETE ON agent.agent_hitl_queue TO " + role,
+		"GRANT SELECT, INSERT, UPDATE ON agent.agent_rule_outbox TO " + role,
+		"GRANT USAGE ON SEQUENCE agent.agent_rule_outbox_id_seq TO " + role,
+		"GRANT SELECT, INSERT, UPDATE ON agent.agent_run TO " + role,
+	}
 }
 
 // acquireMigrateLock takes the transaction-scoped advisory lock, retrying on
@@ -513,6 +750,33 @@ func (s *Store) MarkResolvedTx(ctx context.Context, tx *sql.Tx, externalTxnID, r
 	return nil
 }
 
+// stampMainReconIDSQL records the run's initial (batch) reconciliation id on a
+// set of breaks, but ONLY where main_recon_id is still blank. The
+// COALESCE-style guard (NULL or all-whitespace) makes the write idempotent and
+// non-destructive: re-running it never overwrites an id already recorded, and it
+// only ever FILLS the provenance the initial reconciliation establishes (finding
+// F02). It intentionally does NOT bump status_version — main_recon_id is
+// provenance metadata, not a lifecycle transition — so it cannot disturb the
+// M-15 optimistic-concurrency accounting.
+const stampMainReconIDSQL = `UPDATE agent.agent_break
+SET main_recon_id = $1, updated_at = now()
+WHERE external_txn_id = ANY($2)
+  AND (main_recon_id IS NULL OR length(btrim(main_recon_id)) = 0)`
+
+// StampMainReconID stamps mainReconID as the main_recon_id of every break in
+// externalTxnIDs whose column is still blank (see stampMainReconIDSQL). It is an
+// autocommit write called once per run after the initial reconciliation
+// completes (finding F02), so every break — auto-resolved or escalated — points
+// at the batch reconciliation that surfaced it. An empty id or empty id list is
+// a no-op (nothing to stamp), never an error.
+func (s *Store) StampMainReconID(ctx context.Context, mainReconID string, externalTxnIDs []string) error {
+	if strings.TrimSpace(mainReconID) == "" || len(externalTxnIDs) == 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, stampMainReconIDSQL, mainReconID, pq.Array(externalTxnIDs))
+	return err
+}
+
 const setBreakStatusFromQueuedSQL = `UPDATE agent.agent_break
 SET status = $2, status_version = status_version + 1, updated_at = now()
 WHERE external_txn_id = $1 AND status = 'queued'`
@@ -546,6 +810,57 @@ func (s *Store) SetBreakStatusFromQueuedTx(ctx context.Context, tx *sql.Tx, exte
 	// break that exists but is no longer queued (ErrNotQueued) so the HITL
 	// handler can return 404 vs 409. The follow-up read runs inside the same
 	// transaction, so it observes a consistent snapshot.
+	var existing string
+	qerr := tx.QueryRowContext(ctx,
+		`SELECT status FROM agent.agent_break WHERE external_txn_id = $1`, externalTxnID).Scan(&existing)
+	if errors.Is(qerr, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if qerr != nil {
+		return qerr
+	}
+	return ErrNotQueued
+}
+
+const markReDrivenClearedFromQueuedSQL = `UPDATE agent.agent_break
+SET status = 're_driven', resolved_recon_id = $2, status_version = status_version + 1, updated_at = now()
+WHERE external_txn_id = $1 AND status = 'queued'`
+
+// MarkReDrivenClearedFromQueuedTx transitions a queued break to the re_driven
+// terminal state AND durably stamps the confirming Blnk dry-run reconciliation
+// id into resolved_recon_id — atomically, inside the caller's transaction
+// (finding F16, Rule 5.3). It is to a cleared re_drive what MarkResolvedTx is to
+// an auto-resolution: it makes the durable clearance proof a first-class column
+// on the break row (not merely a value buried in one audit event's provenance),
+// so a reviewer or query can read WHICH dry-run cleared a re_driven break, and
+// the agent_break_resolved_proof CHECK can require that proof for a re_driven
+// row exactly as it does for an auto-resolved one.
+//
+// Like SetBreakStatusFromQueuedTx it is a queued-only compare-and-set: it
+// transitions ONLY a currently-queued break (findings M-01/m-04) and returns
+// ErrNotQueued for an already-decided break and ErrNotFound for a missing one,
+// so a replayed or concurrent re_drive can never overwrite a terminal status
+// nor mark a non-queued break cleared. The reconciliation id MUST be non-empty:
+// the re_drive handler only ever calls this after a ProbeBreak returned a real
+// confirming id, and the CHECK constraint refuses a blank proof.
+func (s *Store) MarkReDrivenClearedFromQueuedTx(ctx context.Context, tx *sql.Tx, externalTxnID, reconID string) error {
+	if strings.TrimSpace(reconID) == "" {
+		return fmt.Errorf("store: MarkReDrivenClearedFromQueuedTx requires a non-empty confirming reconciliation id")
+	}
+	res, err := tx.ExecContext(ctx, markReDrivenClearedFromQueuedSQL, externalTxnID, reconID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 1 {
+		return nil
+	}
+	// No row transitioned: distinguish a missing break (ErrNotFound) from a
+	// break that exists but is no longer queued (ErrNotQueued), mirroring
+	// SetBreakStatusFromQueuedTx so the HITL handler maps them to 404 vs 409.
 	var existing string
 	qerr := tx.QueryRowContext(ctx,
 		`SELECT status FROM agent.agent_break WHERE external_txn_id = $1`, externalTxnID).Scan(&existing)
@@ -769,7 +1084,7 @@ WHERE external_txn_id = $1`
 
 // breakSelectColumns is the shared column list for every query that scans into a
 // Break, so ListBreaks, ListBreaksPage, and ListBreaksForIDs decode identically.
-const breakSelectColumns = `external_txn_id, root_cause, confidence, regulated, status, proposed_rule, rationale, created_rule_id, created_at, updated_at`
+const breakSelectColumns = `external_txn_id, root_cause, confidence, regulated, status, proposed_rule, rationale, created_rule_id, resolved_recon_id, created_at, updated_at`
 
 // scanBreaks decodes a *sql.Rows opened over breakSelectColumns into a slice of
 // Break, applying the per-row proposed_rule isolation described on ListBreaks.
@@ -782,6 +1097,7 @@ func scanBreaks(rows *sql.Rows) ([]Break, error) {
 			cause    string
 			ruleJSON []byte
 			crid     sql.NullString
+			rrid     sql.NullString
 		)
 		if err := rows.Scan(
 			&b.Classification.ExternalTxnID,
@@ -792,6 +1108,7 @@ func scanBreaks(rows *sql.Rows) ([]Break, error) {
 			&ruleJSON,
 			&b.Classification.Rationale,
 			&crid,
+			&rrid,
 			&b.CreatedAt,
 			&b.UpdatedAt,
 		); err != nil {
@@ -800,6 +1117,9 @@ func scanBreaks(rows *sql.Rows) ([]Break, error) {
 		b.Classification.RootCause = model.RootCause(cause)
 		if crid.Valid {
 			b.CreatedRuleID = crid.String
+		}
+		if rrid.Valid {
+			b.ResolvedReconID = rrid.String
 		}
 		if len(ruleJSON) > 0 {
 			// Per-row isolation (finding m-5): a single row whose proposed_rule
@@ -833,7 +1153,7 @@ func (s *Store) ListBreaks(ctx context.Context) ([]Break, error) {
 // M-14). The page is normalized: Limit defaults to defaultPageLimit and is
 // capped at maxPageLimit, and a negative Offset is treated as 0.
 func (s *Store) ListBreaksPage(ctx context.Context, page Page) ([]Break, error) {
-	p := page.normalize()
+	p := page.Normalize()
 	q := `SELECT ` + breakSelectColumns + `
 FROM agent.agent_break
 ORDER BY created_at ASC
@@ -856,7 +1176,7 @@ func (s *Store) ListBreaksForIDs(ctx context.Context, ids []string, page Page) (
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	p := page.normalize()
+	p := page.Normalize()
 	q := `SELECT ` + breakSelectColumns + `
 FROM agent.agent_break
 WHERE external_txn_id = ANY($1)
@@ -868,6 +1188,23 @@ LIMIT $2 OFFSET $3`
 	}
 	defer func() { _ = rows.Close() }()
 	return scanBreaks(rows)
+}
+
+// CountBreaks returns the total number of breaks under management, database-side
+// (finding F06). The HITL surfaces page the break list at defaultPageLimit rows;
+// without a total the JSON `/breaks` view and the `/` status page silently
+// stopped at the first page and later (e.g. queued) rows were invisible with no
+// total, cursor, or next link. Callers pair this count with ListBreaksPage to
+// emit continuation metadata (total + next offset) and render traversal
+// controls, so every break — including those beyond the first page — is
+// discoverable. It is a bounded COUNT(*) that never materializes any row.
+func (s *Store) CountBreaks(ctx context.Context) (int, error) {
+	const q = `SELECT count(*) FROM agent.agent_break`
+	var n int
+	if err := s.db.QueryRowContext(ctx, q).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // CountBreaksByStatusForIDs counts, database-side, how many of the given breaks
@@ -950,7 +1287,7 @@ func (s *Store) ListHITL(ctx context.Context) ([]HITLItem, error) {
 // ListHITLPage returns one bounded page of the human-review queue, oldest first
 // (finding M-14). The page is normalized to the enforced Limit/Offset bounds.
 func (s *Store) ListHITLPage(ctx context.Context, page Page) ([]HITLItem, error) {
-	p := page.normalize()
+	p := page.Normalize()
 	const q = `SELECT external_txn_id, reason, enqueued_at
 FROM agent.agent_hitl_queue
 ORDER BY enqueued_at ASC
@@ -1048,7 +1385,7 @@ func (s *Store) ListAudit(ctx context.Context) ([]model.AuditEvent, error) {
 // first (finding M-14). The page is normalized to the enforced Limit/Offset
 // bounds so no caller can stream the entire audit history in a single query.
 func (s *Store) ListAuditPage(ctx context.Context, page Page) ([]model.AuditEvent, error) {
-	p := page.normalize()
+	p := page.Normalize()
 	const q = `SELECT event_id, external_txn_id, actor, action, "timestamp", rationale, confidence, provenance
 FROM agent.agent_audit
 ORDER BY "timestamp" ASC
@@ -1156,7 +1493,7 @@ func (s *Store) ConfirmRuleOutboxTx(ctx context.Context, tx *sql.Tx, externalTxn
 // and is capped at maxPageLimit, so recovery can never stream an unbounded set
 // into memory (finding M-14).
 func (s *Store) ListPendingRuleOutbox(ctx context.Context, limit int) ([]RuleOutboxItem, error) {
-	p := Page{Limit: limit}.normalize()
+	p := Page{Limit: limit}.Normalize()
 	const q = `SELECT id, external_txn_id, rule_id, status, attempts, last_error, created_at, updated_at
 FROM agent.agent_rule_outbox
 WHERE status = 'pending'
@@ -1254,36 +1591,41 @@ func (s *Store) CompensateRuleOutbox(ctx context.Context, externalTxnID, ruleID 
 	return err
 }
 
-const beginRunInsertSQL = `INSERT INTO agent.agent_run (fixture_key, run_id, status)
+const beginRunInsertSQL = `INSERT INTO agent.agent_run (run_id, fixture_key, status)
 VALUES ($1, $2, 'running')
-ON CONFLICT (fixture_key) DO NOTHING
+ON CONFLICT (run_id) DO NOTHING
 RETURNING run_id, status`
 
-const beginRunSelectSQL = `SELECT run_id, status FROM agent.agent_run WHERE fixture_key = $1`
+const beginRunSelectSQL = `SELECT run_id, status FROM agent.agent_run WHERE run_id = $1`
 
-// BeginRun implements durable run idempotency for serve mode (finding M-15).
-// fixtureKey is a deterministic content hash of the ingested fixture (CSV bytes
-// plus source label); runID is the scoped id the caller WOULD use for a fresh
-// run. BeginRun records that intent exactly once per fixture and reports what the
-// caller should actually do:
+// BeginRun implements durable per-INVOCATION run idempotency (findings M-15,
+// F17). runID is THIS invocation's identity (the caller generates exactly one
+// per process invocation and reuses it across in-process retries); fixtureKey is
+// the immutable content hash of the ingested fixture (CSV bytes plus source
+// label), recorded for provenance and deliberately non-unique so many
+// invocations may share one fixture. BeginRun records the invocation exactly
+// once per runID and reports what the caller should do:
 //
-//   - First time this fixture is seen: it inserts a 'running' row recording
-//     runID and returns (alreadyCompleted=false, existingRunID=runID, nil) — the
-//     caller proceeds with its own runID.
-//   - Fixture already 'completed' (a prior boot finished it): it returns
-//     (alreadyCompleted=true, existingRunID=<recorded>, nil) — the caller SKIPS
-//     reprocessing and rebuilds the summary from the recorded run's rows,
-//     preventing the duplicate-history / inflated-summary bug on every restart.
-//   - Fixture still 'running' (a crash mid-pipeline): it returns
-//     (alreadyCompleted=false, existingRunID=<recorded>, nil) — the caller
-//     retries but reuses the ORIGINAL scoped run id, so the retry converges on
-//     the same id set (upsert-idempotent break rows) rather than forking a new
-//     duplicate history under a fresh random id.
+//   - First time this runID is seen (a fresh invocation): it inserts a 'running'
+//     row recording runID + fixtureKey and returns
+//     (alreadyCompleted=false, existingRunID=runID, nil) — the caller proceeds.
+//     A genuinely NEW invocation of the SAME fixture supplies a NEW runID and so
+//     always lands here, which is what lets a legitimate rerun/recovery
+//     reprocess eligible work under a fresh run-scoped id set instead of being
+//     refused as "already done" (finding F17).
+//   - Same runID already 'running' (an in-process M-16 retry of the SAME
+//     invocation): it returns (alreadyCompleted=false, existingRunID=runID, nil)
+//     — the retry reuses the original scoped id set (upsert-idempotent break
+//     rows) rather than forking duplicate history under a fresh id.
+//   - Same runID already 'completed': it returns
+//     (alreadyCompleted=true, existingRunID=runID, nil) — an idempotent replay of
+//     an invocation that already finished (the caller rebuilds the summary from
+//     that run's rows without reprocessing).
 //
-// The insert-then-select pattern tolerates a concurrent first-boot race: the PK
-// guarantees exactly one INSERT wins; the loser reads the winner's committed row
-// and reuses its run id, and per-break claim leases (ClaimBreak) provide the
-// actual mutual exclusion for individual break processing.
+// The insert-then-select pattern tolerates a concurrent same-runID race: the PK
+// on run_id guarantees exactly one INSERT wins; the loser reads the winner's
+// committed row, and per-break claim leases (ClaimBreak) provide the actual
+// mutual exclusion for individual break processing.
 func (s *Store) BeginRun(ctx context.Context, fixtureKey, runID string) (bool, string, error) {
 	if strings.TrimSpace(fixtureKey) == "" {
 		return false, "", fmt.Errorf("store: BeginRun requires a non-empty fixture key")
@@ -1295,17 +1637,18 @@ func (s *Store) BeginRun(ctx context.Context, fixtureKey, runID string) (bool, s
 		gotRunID string
 		status   string
 	)
-	err := s.db.QueryRowContext(ctx, beginRunInsertSQL, fixtureKey, runID).Scan(&gotRunID, &status)
+	err := s.db.QueryRowContext(ctx, beginRunInsertSQL, runID, fixtureKey).Scan(&gotRunID, &status)
 	if err == nil {
-		// A row was inserted: this is a fresh run under the caller's runID.
+		// A row was inserted: this is a fresh invocation under the caller's runID.
 		return false, gotRunID, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return false, "", err
 	}
-	// ON CONFLICT DO NOTHING returned no row: the fixture already exists. Read
-	// the recorded run to decide whether to skip (completed) or resume (running).
-	if err := s.db.QueryRowContext(ctx, beginRunSelectSQL, fixtureKey).Scan(&gotRunID, &status); err != nil {
+	// ON CONFLICT DO NOTHING returned no row: this runID already exists (an
+	// in-process retry or an idempotent replay of the same invocation). Read the
+	// recorded run to decide whether to skip (completed) or resume (running).
+	if err := s.db.QueryRowContext(ctx, beginRunSelectSQL, runID).Scan(&gotRunID, &status); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Extremely unlikely TOCTOU (row removed between the two statements);
 			// surface it rather than silently reprocessing.
@@ -1318,18 +1661,19 @@ func (s *Store) BeginRun(ctx context.Context, fixtureKey, runID string) (bool, s
 
 const completeRunSQL = `UPDATE agent.agent_run
 SET status = 'completed', updated_at = now()
-WHERE fixture_key = $1`
+WHERE run_id = $1`
 
-// CompleteRun flips the fixture's run row to 'completed' (finding M-15) once the
-// pipeline has finished, so a later serve restart over the same fixture is
-// reported alreadyCompleted by BeginRun and skips reprocessing. It returns
-// ErrNotFound when no run row exists for fixtureKey (BeginRun must have created
-// it first).
-func (s *Store) CompleteRun(ctx context.Context, fixtureKey string) error {
-	if strings.TrimSpace(fixtureKey) == "" {
-		return fmt.Errorf("store: CompleteRun requires a non-empty fixture key")
+// CompleteRun flips THIS invocation's run row (by run_id) to 'completed'
+// (findings M-15, F17) once the pipeline has finished, so an in-process replay of
+// the same invocation is reported alreadyCompleted by BeginRun and skips
+// reprocessing, while a genuinely new invocation (new run_id) is unaffected and
+// runs fresh. It returns ErrNotFound when no run row exists for runID (BeginRun
+// must have created it first).
+func (s *Store) CompleteRun(ctx context.Context, runID string) error {
+	if strings.TrimSpace(runID) == "" {
+		return fmt.Errorf("store: CompleteRun requires a non-empty run id")
 	}
-	res, err := s.db.ExecContext(ctx, completeRunSQL, fixtureKey)
+	res, err := s.db.ExecContext(ctx, completeRunSQL, runID)
 	if err != nil {
 		return err
 	}

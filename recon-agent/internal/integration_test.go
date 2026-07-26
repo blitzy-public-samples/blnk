@@ -645,11 +645,18 @@ func TestReconAgentPipeline(t *testing.T) {
 	rejectID := byBase["EXT-005"].ID  // missing_internal — no internal booking
 
 	// re_drive first (needs the break queued). Requires 200: the probe completes
-	// (buildReDriveRule matches amount+currency), no Blnk upstream error.
+	// (buildReDriveRule matches amount+currency), no Blnk upstream error, and the
+	// Blnk dry-run CONFIRMS clearance. Post-F16 the handler no longer emits the
+	// generic `re_driven` action: a confirmed-clearing re_drive transitions the
+	// break to StatusReDriven and records BOTH the durable early
+	// `re_drive_attempted` event and the terminal `re_drive_cleared` outcome
+	// (the latter carrying the confirming Blnk recon_id — Rule 5.3 / finding F16).
 	postDecision(ctx, t, hitlHTTP.URL, model.HITLDecision{
 		ExternalTxnID: reDriveID, Decision: "re_drive", Reviewer: integrationReviewer,
 	}, http.StatusOK)
-	requireAudit(ctx, t, st, reDriveID, model.ActionReDriven)
+	requireStatus(ctx, t, st, reDriveID, model.StatusReDriven)
+	requireAudit(ctx, t, st, reDriveID, model.ActionReDriveAttempted)
+	requireAudit(ctx, t, st, reDriveID, model.ActionReDriveCleared)
 
 	postDecision(ctx, t, hitlHTTP.URL, model.HITLDecision{
 		ExternalTxnID: acceptID, Decision: "accept", Reviewer: integrationReviewer,

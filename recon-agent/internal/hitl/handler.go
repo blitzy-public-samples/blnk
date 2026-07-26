@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -46,15 +47,25 @@ const (
 	operatorEquals = model.OperatorEquals
 )
 
-// Field bounds for a submitted decision (findings C-05, M-23). They keep the
+// Field bounds for a submitted decision (findings C-05, M-23, F21). They keep the
 // unauthenticated endpoint from accepting an unattributable or unbounded
 // payload even after the router-level body/content-type/origin guard.
+//
+// F21: the ONE documented length unit is RUNES (Unicode code points), enforced
+// server-side by utf8.RuneCountInString in validateDecisionFields. The status
+// page form's HTML maxlength attributes (status_page.go) carry these SAME numeric
+// bounds, derived from these constants so the two can never drift. Because an
+// HTML maxlength counts UTF-16 code units and a UTF-16 code unit count is always
+// >= the rune count of the same string, any value the browser's maxlength admits
+// is within the rune bound here — a browser-valid reviewer or note is therefore
+// NEVER rejected server-side (eliminating the byte-vs-UTF-16 mismatch that made
+// e.g. 33 emoji or 65 precomposed "é" fail with a 400).
 const (
-	// maxExternalTxnIDLen bounds the external txn id a decision may target.
+	// maxExternalTxnIDLen bounds the external txn id a decision may target, in runes.
 	maxExternalTxnIDLen = 256
-	// maxReviewerLen bounds the reviewer identity string.
+	// maxReviewerLen bounds the reviewer identity string, in runes.
 	maxReviewerLen = 128
-	// maxNoteLen bounds the optional free-text reviewer note.
+	// maxNoteLen bounds the optional free-text reviewer note, in runes.
 	maxNoteLen = 2048
 )
 
@@ -175,7 +186,15 @@ func validateDecisionFields(d *model.HITLDecision) (string, bool) {
 	if d.ExternalTxnID == "" {
 		return "external_txn_id is required", false
 	}
-	if len(d.ExternalTxnID) > maxExternalTxnIDLen {
+	// F23: reject malformed / lossily-decoded UTF-8 in the identifier before it is
+	// used to look up or attribute a break (see hasInvalidUTF8).
+	if hasInvalidUTF8(d.ExternalTxnID) {
+		return "external_txn_id contains invalid text encoding", false
+	}
+	// F21: bound by RUNES (Unicode code points), the ONE documented unit, so the
+	// server limit matches the browser's maxlength for every value (see the
+	// maxExternalTxnIDLen doc block).
+	if utf8.RuneCountInString(d.ExternalTxnID) > maxExternalTxnIDLen {
 		return "external_txn_id is too long", false
 	}
 	// Finding #5: reject a control character (e.g. an embedded NUL U+0000) in the
@@ -185,6 +204,12 @@ func validateDecisionFields(d *model.HITLDecision) (string, bool) {
 	// characters, so ALL of them are rejected here.
 	if containsDisallowedControlChar(d.ExternalTxnID, false) {
 		return "external_txn_id contains invalid control characters", false
+	}
+	// F23: an identifier is canonical plain text — reject every Unicode format
+	// codepoint (bidi controls, zero-width, soft hyphen, BOM, ...) so it can carry
+	// no invisible or direction-altering characters.
+	if containsDisallowedFormatChar(d.ExternalTxnID, true) {
+		return "external_txn_id contains disallowed formatting characters", false
 	}
 	if !audit.IsValidDecision(d.Decision) {
 		return "unknown decision", false
@@ -196,7 +221,16 @@ func validateDecisionFields(d *model.HITLDecision) (string, bool) {
 	if d.Reviewer == "" {
 		return "reviewer is required", false
 	}
-	if len(d.Reviewer) > maxReviewerLen {
+	// F23: the reviewer becomes the IMMUTABLE audit actor. Reject malformed /
+	// lossily-decoded UTF-8 (a raw 0xFF that Go's form parser silently turned into
+	// U+FFFD) so a corrupted, unattributable identity can never be persisted — the
+	// decision fails closed rather than recording a spoofable actor.
+	if hasInvalidUTF8(d.Reviewer) {
+		return "reviewer contains invalid text encoding", false
+	}
+	// F21: bound the reviewer by RUNES (see above) so a browser-valid identity is
+	// never rejected server-side.
+	if utf8.RuneCountInString(d.Reviewer) > maxReviewerLen {
 		return "reviewer is too long", false
 	}
 	// Finding #5: the reviewer identity is an identifier — no control characters
@@ -205,7 +239,22 @@ func validateDecisionFields(d *model.HITLDecision) (string, bool) {
 	if containsDisallowedControlChar(d.Reviewer, false) {
 		return "reviewer contains invalid control characters", false
 	}
-	if len(d.Note) > maxNoteLen {
+	// F23: reject bidirectional and other invisible/format codepoints in the
+	// actor. A right-to-left override (U+202E) can make "qa-<RLO>nimda" RENDER as
+	// the plausible "qa-admin" while its logical/stored bytes differ (Trojan
+	// Source, CVE-2021-42574) — spoofing immutable attribution. As an identifier
+	// the reviewer carries no format codepoints legitimately, so all are rejected.
+	if containsDisallowedFormatChar(d.Reviewer, true) {
+		return "reviewer contains disallowed formatting characters", false
+	}
+	// F23: the free-text note is displayed in the append-only audit trail; reject
+	// malformed / lossily-decoded UTF-8 here too so the trail cannot record
+	// corrupted bytes.
+	if hasInvalidUTF8(d.Note) {
+		return "note contains invalid text encoding", false
+	}
+	// F21: bound the note by RUNES (see above).
+	if utf8.RuneCountInString(d.Note) > maxNoteLen {
 		return "note is too long", false
 	}
 	// Finding #5: the free-text note may legitimately contain ordinary text
@@ -215,6 +264,12 @@ func validateDecisionFields(d *model.HITLDecision) (string, bool) {
 	// surfacing as a 500 from the persistence layer.
 	if containsDisallowedControlChar(d.Note, true) {
 		return "note contains invalid control characters", false
+	}
+	// F23: reject the bidirectional control characters (the visual-reordering
+	// spoofing vector) in the note as well, while permitting other legitimate
+	// format codepoints such as an emoji zero-width joiner (identifier=false).
+	if containsDisallowedFormatChar(d.Note, false) {
+		return "note contains disallowed formatting characters", false
 	}
 	return "", true
 }
@@ -239,6 +294,64 @@ func containsDisallowedControlChar(s string, allowTextWhitespace bool) bool {
 			continue
 		}
 		return true
+	}
+	return false
+}
+
+// hasInvalidUTF8 reports whether s is not valid UTF-8 OR contains the Unicode
+// replacement character U+FFFD (finding F23). Go's net/http form parser silently
+// substitutes U+FFFD for undecodable request bytes (for example a lone 0xFF), so
+// a raw malformed-UTF-8 field arrives here already "repaired" and lossy — the
+// original bytes are gone and the value is no longer what the client sent. A
+// legitimate reviewer id, txn id, or note never contains U+FFFD, so its presence
+// is a reliable signal of malformed input: the decision is REJECTED (fail-closed)
+// rather than persisting a corrupted, unattributable identity. The explicit
+// utf8.ValidString guard additionally rejects any invalid encoding that reaches
+// us unrepaired (e.g. via the JSON path).
+func hasInvalidUTF8(s string) bool {
+	return !utf8.ValidString(s) || strings.ContainsRune(s, utf8.RuneError)
+}
+
+// isBidiControl reports whether r is a Unicode bidirectional formatting control —
+// the Trojan-Source (CVE-2021-42574) vector. A right-to-left override or embedding
+// can visually reorder surrounding text so a logical actor id such as
+// "qa-<U+202E>nimda" RENDERS as the plausible "qa-admin" while its stored bytes
+// differ, spoofing immutable attribution (finding F23). It covers the explicit
+// embeddings/overrides (U+202A–U+202E), the isolates (U+2066–U+2069), the
+// directional marks (U+200E/U+200F), and the Arabic letter mark (U+061C).
+func isBidiControl(r rune) bool {
+	switch r {
+	case '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', // LRE RLE PDF LRO RLO
+		'\u2066', '\u2067', '\u2068', '\u2069', // LRI RLI FSI PDI
+		'\u200E', '\u200F', // LRM RLM
+		'\u061C': // ALM
+		return true
+	}
+	return false
+}
+
+// containsDisallowedFormatChar reports whether s contains a Unicode formatting /
+// invisible codepoint that must be rejected to keep actor attribution unspoofable
+// and the audit trail faithful (finding F23).
+//
+// For identifier fields (reviewer, external_txn_id) EVERY format codepoint
+// (Unicode category Cf — the bidi controls, zero-width joiner/space, soft hyphen,
+// byte-order mark, ...) is disallowed: an identifier is canonical plain text and
+// legitimately carries none, so the strictest rule applies. For the free-text
+// note only the bidirectional controls (the visual-reordering spoofing vector)
+// are rejected, so a legitimate emoji zero-width-joiner sequence in a note is
+// preserved while a Trojan-Source override is still refused.
+func containsDisallowedFormatChar(s string, identifier bool) bool {
+	for _, r := range s {
+		if identifier {
+			if unicode.Is(unicode.Cf, r) {
+				return true
+			}
+			continue
+		}
+		if isBidiControl(r) {
+			return true
+		}
 	}
 	return false
 }
@@ -274,8 +387,14 @@ func bindDecision(c *gin.Context) (model.HITLDecision, error) {
 
 // respondDecision replies with JSON for API clients and a 303 redirect back to
 // the status page for browser form submissions.
+//
+// F24: the format is chosen from contentTypeOf(c) — the SAME case-insensitive,
+// parameter-stripping helper used by the mutation guard and bindDecision — so a
+// mixed-case media type like "APPLICATION/JSON" that was bound and committed as
+// JSON also RECEIVES the JSON response, instead of falling through to the browser
+// 303 redirect (a raw c.ContentType() comparison is case-sensitive and missed it).
 func (s *Server) respondDecision(c *gin.Context, d model.HITLDecision) {
-	if c.ContentType() == "application/json" {
+	if contentTypeOf(c) == "application/json" {
 		c.JSON(http.StatusOK, gin.H{
 			"external_txn_id": d.ExternalTxnID,
 			"decision":        d.Decision,
@@ -289,8 +408,12 @@ func (s *Server) respondDecision(c *gin.Context, d model.HITLDecision) {
 // respondDecisionError returns a sanitized error to the client: JSON for API
 // clients and a minimal, friendly HTML panel for browser/form submissions
 // (M-03). It never includes the underlying internal error text.
+//
+// F24: the response format is negotiated with contentTypeOf(c) (case-insensitive)
+// so a mixed-case JSON request receives the JSON error schema, matching how the
+// same request's body was bound.
 func (s *Server) respondDecisionError(c *gin.Context, status int, msg string) {
-	if c.ContentType() == "application/json" {
+	if contentTypeOf(c) == "application/json" {
 		c.JSON(status, gin.H{"error": msg})
 		return
 	}
@@ -302,6 +425,16 @@ func (s *Server) respondDecisionError(c *gin.Context, status int, msg string) {
 // The message is HTML-escaped defensively even though callers pass only fixed,
 // internal constants — never raw error text (M-03). The status page reuses this
 // via renderStatusError so page-load and form-submit errors share one surface.
+//
+// F22 (accessibility): the page provides the essential landmarks and semantics a
+// standalone error surface needs — exactly one <main> landmark (so
+// landmark-one-main passes), a top-level <h1>, and an alert region
+// (role="alert" aria-live="assertive") that a screen reader announces
+// immediately. Focus is placed deterministically WITHOUT client JS (the strict
+// CSP forbids scripts): the alert panel is focusable (tabindex="-1") and carries
+// autofocus, so on load focus lands on the announced message. The "Back to
+// review" control is a ≥44px tap target (min-height:44px), meeting the WCAG AA
+// target-size guidance the previous ~22px link failed.
 func errorPageHTML(msg string) []byte {
 	return []byte(`<!DOCTYPE html>
 <html lang="en">
@@ -310,14 +443,22 @@ func errorPageHTML(msg string) []byte {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>recon-agent &mdash; error</title>
 <style>
+  *, *::before, *::after { box-sizing: border-box; }
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; color: #1a1a1a; }
-  .panel { border: 1px solid #f0c0c0; background: #fdf2f2; color: #b00020; padding: 1rem 1.2rem; border-radius: 6px; max-width: 40rem; }
-  a { color: #0b5cad; }
+  main { max-width: 40rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 1rem; }
+  .panel { border: 1px solid #f0c0c0; background: #fdf2f2; color: #b00020; padding: 1rem 1.2rem; border-radius: 6px; }
+  .panel:focus { outline: 3px solid #b00020; outline-offset: 2px; }
+  .back { display: inline-flex; align-items: center; min-height: 44px; margin-top: 1rem; padding: .5rem .9rem; color: #0b5cad; text-decoration: none; border: 1px solid #0b5cad; border-radius: 6px; }
+  .back:hover, .back:focus { text-decoration: underline; }
 </style>
 </head>
 <body>
-  <div class="panel">` + html.EscapeString(msg) + `</div>
-  <p><a href="/">&larr; Back to review</a></p>
+  <main>
+    <h1>Something went wrong</h1>
+    <div class="panel" role="alert" aria-live="assertive" tabindex="-1" autofocus>` + html.EscapeString(msg) + `</div>
+    <a class="back" href="/">&larr; Back to review</a>
+  </main>
 </body>
 </html>
 `)
@@ -374,17 +515,28 @@ func (s *Server) decide(ctx context.Context, d model.HITLDecision, status string
 // idempotency backstop — a replayed re_drive after the break already reached a
 // terminal state yields ErrNotQueued (409), never a double transition.
 //
-// Finding M-12 (audit every attempt and compensation outcome): every Blnk
-// interaction is now recorded on the append-only trail — a successful ephemeral
-// rule creation (`rule_created`), the probe outcome (`probed`, with its recon
-// id), the compensation of the ephemeral rule (`rule_compensated`, deleted or
-// not), and a FAILED rule-creation/probe attempt (a `re_driven` event carrying a
-// failure rationale and no recon id). Nothing that touches Blnk is silent.
+// Finding M-12 / F16 (audit every attempt and outcome, unambiguously): the
+// append-only trail now records each re_drive as a uniform ATTEMPT
+// (`re_drive_attempted`, written before any Blnk call) followed by exactly one
+// outcome-specific terminal action, plus every Blnk interaction in between:
+//   - `re_drive_attempted` — the human initiated the re_drive;
+//   - `rule_created`       — a successful ephemeral rule creation (when needed);
+//   - `probed`             — the dry-run probe outcome, with its recon id;
+//   - `rule_compensated`   — the ephemeral rule's cleanup outcome (deleted or not);
+//   - one terminal of: `re_drive_cleared` (Blnk confirmed clearance — carries the
+//     confirming recon id, the durable proof), `re_drive_unmatched` (probe ran
+//     but did not clear — no recon id, break stays queued), or `re_drive_failed`
+//     (a Blnk rule-creation/probe error — failure rationale, no recon id, break
+//     stays queued). Cleared / still-unmatched / failed are thus DISTINCT
+//     immutable actions rather than one `re_driven` value disambiguated only by
+//     free text (finding F16). Nothing that touches Blnk is silent.
 //
 // Failures originating in Blnk (rule creation or probe) are wrapped as
 // upstreamError so handleDecision returns 502, never 500, and the break is left
-// in the queue unchanged (fail-closed, Rule 5.7). Only a successful CLEARING
-// probe updates status / drains the queue / writes the terminal re_driven event.
+// in the queue unchanged (fail-closed, Rule 5.7). Only a confirmed CLEARING
+// probe transitions status to re_driven, stamps the confirming recon id into
+// resolved_recon_id, drains the queue, and writes the terminal
+// `re_drive_cleared` event.
 func (s *Server) reDrive(ctx context.Context, d model.HITLDecision) error {
 	id := d.ExternalTxnID
 
@@ -423,6 +575,18 @@ func (s *Server) reDrive(ctx context.Context, d model.HITLDecision) error {
 		defer cancel()
 		_ = s.st.ReleaseBreak(relCtx, id, s.owner)
 	}()
+
+	// (2.5) F16: record the re_drive ATTEMPT now — after eligibility (so a
+	//       missing/already-decided break records no attempt) and after the lease
+	//       (so a busy 409 records none), but BEFORE any Blnk interaction. This
+	//       gives every re_drive a uniform, immutable "attempted" marker on the
+	//       append-only trail regardless of its eventual outcome — including an
+	//       attempt that then fails against Blnk and emits no probe. It fails
+	//       closed (500) if the attempt cannot be audited, since 100% of actions
+	//       must be recorded; no Blnk work has happened yet, so nothing leaks.
+	if aerr := s.aud.Record(ctx, audit.ReDriveAttempted(d, model.Provenance{Model: s.llmModel})); aerr != nil {
+		return aerr
+	}
 
 	// (3) Load the FULL external transaction (and any rule a prior auto-attempt
 	//     created) so the clearance probe carries a real transaction and a
@@ -487,40 +651,48 @@ func (s *Server) reDrive(ctx context.Context, d model.HITLDecision) error {
 	}
 
 	// (5a) Not cleared: keep the break queued (no dequeue, no terminal status),
-	//      record a re_driven decision WITHOUT a recon_id so a recon_id never
-	//      implies a false clearance (finding m-04; only `resolved` proves
-	//      clearance, and HITL never writes `resolved` — Rule 5.3).
+	//      and record a distinct `re_drive_unmatched` terminal outcome (finding
+	//      F16) — NOT a generic `re_driven`. It carries NO recon_id so a recon_id
+	//      never implies a false clearance (finding m-04); the preceding `probed`
+	//      event already recorded the dry-run id and still-unmatched verdict. Only
+	//      a confirmed clearance transitions status — Rule 5.3.
 	if !cleared {
-		return s.aud.Record(ctx, audit.Decision(d, model.Provenance{Model: s.llmModel}))
+		return s.aud.Record(ctx, audit.ReDriveUnmatched(d, model.Provenance{Model: s.llmModel}))
 	}
 
-	// (5b) Cleared: mark re_driven, drain the queue, and audit WITH the
-	//      confirming recon_id — atomically and queued-only (findings M-01/M-02,
-	//      m-04). The queued-only CAS also makes a replayed re_drive idempotent:
-	//      a second attempt after this transition yields ErrNotQueued (409).
+	// (5b) Cleared: mark re_driven AND durably stamp the confirming recon_id into
+	//      resolved_recon_id, drain the queue, and audit a distinct
+	//      `re_drive_cleared` terminal outcome WITH the confirming recon_id — all
+	//      atomically and queued-only (findings M-01/M-02, m-04, F16). Persisting
+	//      the recon_id on the break row (MarkReDrivenClearedFromQueuedTx) makes
+	//      the clearance proof a first-class column a reviewer/query can read, not
+	//      a value buried only in one audit event's provenance. The queued-only
+	//      CAS also makes a replayed re_drive idempotent: a second attempt after
+	//      this transition yields ErrNotQueued (409).
 	return s.st.WithTx(ctx, func(tx *sql.Tx) error {
-		if err := s.st.SetBreakStatusFromQueuedTx(ctx, tx, id, statusReDriven); err != nil {
+		if err := s.st.MarkReDrivenClearedFromQueuedTx(ctx, tx, id, reconID); err != nil {
 			return err
 		}
 		if err := s.st.DequeueHITLTx(ctx, tx, id); err != nil {
 			return err
 		}
-		return s.aud.RecordTx(ctx, tx, audit.Decision(d, model.Provenance{Model: s.llmModel, ReconID: reconID}))
+		return s.aud.RecordTx(ctx, tx, audit.ReDriveCleared(d, reconID, model.Provenance{Model: s.llmModel}))
 	})
 }
 
-// auditReDriveFailure records a best-effort `re_driven` audit event capturing a
-// re_drive attempt that failed against Blnk — a failed rule creation or a failed
-// probe (finding M-12). The break is left queued (fail-closed, Rule 5.7); the
+// auditReDriveFailure records a best-effort `re_drive_failed` audit event
+// capturing a re_drive attempt that failed against Blnk — a failed rule creation
+// or a failed probe (findings M-12/F16). The distinct `re_drive_failed` action
+// makes a Blnk-down attempt unambiguous on the trail: it no longer shares the
+// `re_driven` value with a successful clearance and so can be identified without
+// parsing free text. The break is left queued (fail-closed, Rule 5.7); the
 // reviewer can retry. The event carries a failure-specific rationale and NO
 // recon_id (no clearance was proven, finding m-04). An audit-write failure here
 // is logged rather than surfaced, because the caller is already returning the
 // originating upstream error to the client — we do not want a secondary audit
 // hiccup to mask the real (502) upstream cause.
 func (s *Server) auditReDriveFailure(ctx context.Context, d model.HITLDecision, reason string) {
-	ev := audit.Decision(d, model.Provenance{Model: s.llmModel})
-	ev.Rationale = reason
-	if aerr := s.aud.Record(ctx, ev); aerr != nil {
+	if aerr := s.aud.Record(ctx, audit.ReDriveFailed(d, reason, model.Provenance{Model: s.llmModel})); aerr != nil {
 		log.Printf("hitl: failed to audit re_drive failure for break %q: %v", d.ExternalTxnID, aerr)
 	}
 }
@@ -544,7 +716,19 @@ func (s *Server) compensateReDriveRule(ctx context.Context, externalTxnID, ruleI
 	if derr != nil {
 		log.Printf("hitl: re_drive could not delete ephemeral probe rule %q for break %q (orphaned in Blnk): %v", ruleID, externalTxnID, derr)
 	}
-	if aerr := s.aud.Record(cctx, audit.RuleCompensated(externalTxnID, ruleID, deleted, "", 0, model.Provenance{Model: s.llmModel})); aerr != nil {
+	// F16 (Bug B): pass an EXPLICIT, clearing-neutral rationale so this event is
+	// never labeled "non-clearing" by RuleCompensated's default. The rule this
+	// re_drive created is EPHEMERAL — built solely to give Blnk a non-empty rule
+	// set to probe — and is removed regardless of whether the probe cleared the
+	// break, so calling it "non-clearing" (which the default does) is wrong on a
+	// re_drive that DID clear. This wording is accurate for both outcomes; the
+	// remediator, which compensates genuinely non-clearing auto-remediation
+	// rules, keeps RuleCompensated's default.
+	rationale := "agent removed the ephemeral re_drive probe rule " + ruleID + " from Blnk (created solely to probe clearance)"
+	if !deleted {
+		rationale = "agent FAILED to remove the ephemeral re_drive probe rule " + ruleID + " from Blnk; it may still exist and needs manual cleanup"
+	}
+	if aerr := s.aud.Record(cctx, audit.RuleCompensated(externalTxnID, ruleID, deleted, rationale, 0, model.Provenance{Model: s.llmModel})); aerr != nil {
 		log.Printf("hitl: failed to audit re_drive rule compensation for break %q rule %q: %v", externalTxnID, ruleID, aerr)
 	}
 }

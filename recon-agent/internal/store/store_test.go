@@ -553,10 +553,10 @@ func TestSetBreakStatusRowsAffectedError(t *testing.T) {
 func TestListBreaks(t *testing.T) {
 	s, fdb := newTestStore()
 	now := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
-	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "created_at", "updated_at"}
+	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "resolved_recon_id", "created_at", "updated_at"}
 	fdb.rows = [][]driver.Value{
-		{"ext_1", "amount_drift", 0.91, false, "auto-resolved", mustMarshal(t, sampleRule()), "amount drifted", "rule_abc", now, now},
-		{"ext_2", "timing", 0.42, true, "queued", nil, "", nil, now, now},
+		{"ext_1", "amount_drift", 0.91, false, "auto-resolved", mustMarshal(t, sampleRule()), "amount drifted", "rule_abc", "recon_ext1", now, now},
+		{"ext_2", "timing", 0.42, true, "queued", nil, "", nil, nil, now, now},
 	}
 	breaks, err := s.ListBreaks(context.Background())
 	if err != nil {
@@ -567,6 +567,14 @@ func TestListBreaks(t *testing.T) {
 	}
 	if breaks[0].Classification.ExternalTxnID != "ext_1" || breaks[0].Classification.RootCause != model.RootCauseAmountDrift {
 		t.Fatalf("break0 mismatch: %+v", breaks[0])
+	}
+	// F16: the confirming clearance proof (resolved_recon_id) round-trips out of
+	// storage for a cleared break, and is empty (NULL) for a non-cleared one.
+	if breaks[0].ResolvedReconID != "recon_ext1" {
+		t.Fatalf("break0 resolved_recon_id mismatch: %q, want recon_ext1", breaks[0].ResolvedReconID)
+	}
+	if breaks[1].ResolvedReconID != "" {
+		t.Fatalf("break1 resolved_recon_id should be empty (NULL/queued), got %q", breaks[1].ResolvedReconID)
 	}
 	if breaks[0].Classification.ProposedRule == nil || breaks[0].Classification.ProposedRule.Criteria[0].Field != "amount" {
 		t.Fatalf("break0 rule not unmarshaled: %+v", breaks[0].Classification.ProposedRule)
@@ -602,10 +610,10 @@ func TestListBreaksQueryError(t *testing.T) {
 
 func TestListBreaksScanError(t *testing.T) {
 	s, fdb := newTestStore()
-	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "created_at", "updated_at"}
+	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "resolved_recon_id", "created_at", "updated_at"}
 	// confidence is a non-numeric string => Scan into *float64 fails.
 	fdb.rows = [][]driver.Value{
-		{"ext_1", "amount_drift", "not-a-float", false, "queued", nil, "", nil, time.Now(), time.Now()},
+		{"ext_1", "amount_drift", "not-a-float", false, "queued", nil, "", nil, nil, time.Now(), time.Now()},
 	}
 	if _, err := s.ListBreaks(context.Background()); err == nil {
 		t.Fatal("expected scan error")
@@ -618,10 +626,10 @@ func TestListBreaksScanError(t *testing.T) {
 // (and the HITL status page) stays readable.
 func TestListBreaksBadRuleJSON(t *testing.T) {
 	s, fdb := newTestStore()
-	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "created_at", "updated_at"}
+	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "resolved_recon_id", "created_at", "updated_at"}
 	fdb.rows = [][]driver.Value{
-		{"ext_bad", "amount_drift", 0.9, false, "queued", []byte("{not-json"), "", nil, time.Now(), time.Now()},
-		{"ext_ok", "timing", 0.5, false, "classified", mustMarshal(t, sampleRule()), "", nil, time.Now(), time.Now()},
+		{"ext_bad", "amount_drift", 0.9, false, "queued", []byte("{not-json"), "", nil, nil, time.Now(), time.Now()},
+		{"ext_ok", "timing", 0.5, false, "classified", mustMarshal(t, sampleRule()), "", nil, nil, time.Now(), time.Now()},
 	}
 	breaks, err := s.ListBreaks(context.Background())
 	if err != nil {
@@ -791,6 +799,80 @@ func TestSetBreakStatusFromQueuedTxExecError(t *testing.T) {
 	})
 	if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotQueued) {
 		t.Fatalf("expected raw exec error, got %v", err)
+	}
+}
+
+// TestMarkReDrivenClearedFromQueuedTxOK proves the cleared-re_drive terminal
+// transition (finding F16) sets status='re_driven' AND stamps resolved_recon_id
+// in ONE guarded, queued-only statement — the durable clearance proof committed
+// atomically with the status change — and binds (id, reconID) in that order.
+func TestMarkReDrivenClearedFromQueuedTxOK(t *testing.T) {
+	s, fdb := newTestStore() // default execResult => RowsAffected 1
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.MarkReDrivenClearedFromQueuedTx(context.Background(), tx, "ext_1", "recon_confirm")
+	})
+	if err != nil {
+		t.Fatalf("MarkReDrivenClearedFromQueuedTx: %v", err)
+	}
+	q := fdb.execs[0].query
+	if !strings.Contains(q, "status = 're_driven'") || !strings.Contains(q, "resolved_recon_id = $2") {
+		t.Fatalf("must set status AND resolved_recon_id in one statement:\n%s", q)
+	}
+	if !strings.Contains(q, "status = 'queued'") {
+		t.Fatalf("CAS must guard on the queued state (queued-only):\n%s", q)
+	}
+	if fdb.execs[0].args[0].Value != "ext_1" || fdb.execs[0].args[1].Value != "recon_confirm" {
+		t.Fatalf("unexpected args: %+v", fdb.execs[0].args)
+	}
+	if fdb.commits != 1 || fdb.rollbacks != 0 {
+		t.Fatalf("a successful guarded update must commit: commits=%d rollbacks=%d", fdb.commits, fdb.rollbacks)
+	}
+}
+
+// TestMarkReDrivenClearedFromQueuedTxRejectsEmptyReconID proves a cleared
+// re_drive can never be persisted without its confirming reconciliation id
+// (Rule 5.3): a blank id is rejected BEFORE any UPDATE runs.
+func TestMarkReDrivenClearedFromQueuedTxRejectsEmptyReconID(t *testing.T) {
+	s, fdb := newTestStore()
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.MarkReDrivenClearedFromQueuedTx(context.Background(), tx, "ext_1", "   ")
+	})
+	if err == nil {
+		t.Fatal("expected an error for a blank confirming reconciliation id")
+	}
+	if len(fdb.execs) != 0 {
+		t.Fatalf("no UPDATE must run when the reconciliation id is blank; execs=%d", len(fdb.execs))
+	}
+}
+
+// TestMarkReDrivenClearedFromQueuedTxNotQueued proves that a re_drive replayed
+// after the break already reached a terminal state yields ErrNotQueued (409) —
+// never a second, silent re_driven transition.
+func TestMarkReDrivenClearedFromQueuedTxNotQueued(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.execResult = driver.RowsAffected(0)    // no queued row transitioned
+	fdb.cols = []string{"status"}              // the follow-up existence read
+	fdb.rows = [][]driver.Value{{"re_driven"}} // already terminal
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.MarkReDrivenClearedFromQueuedTx(context.Background(), tx, "ext_1", "recon_confirm")
+	})
+	if !errors.Is(err, ErrNotQueued) {
+		t.Fatalf("expected ErrNotQueued, got %v", err)
+	}
+}
+
+// TestMarkReDrivenClearedFromQueuedTxNotFound proves a missing break yields
+// ErrNotFound (404) rather than ErrNotQueued.
+func TestMarkReDrivenClearedFromQueuedTxNotFound(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.execResult = driver.RowsAffected(0)
+	fdb.cols = []string{"status"}
+	fdb.rows = nil // no row => sql.ErrNoRows => ErrNotFound
+	err := s.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return s.MarkReDrivenClearedFromQueuedTx(context.Background(), tx, "missing", "recon_confirm")
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
 
@@ -1867,7 +1949,7 @@ func TestPageNormalize(t *testing.T) {
 		{Page{Limit: maxPageLimit + 1}, Page{Limit: maxPageLimit, Offset: 0}},
 	}
 	for _, c := range cases {
-		if got := c.in.normalize(); got != c.want {
+		if got := c.in.Normalize(); got != c.want {
 			t.Fatalf("normalize(%+v) = %+v, want %+v", c.in, got, c.want)
 		}
 	}
@@ -1875,7 +1957,7 @@ func TestPageNormalize(t *testing.T) {
 
 func TestListBreaksPageBindsBounds(t *testing.T) {
 	s, fdb := newTestStore()
-	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "created_at", "updated_at"}
+	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "resolved_recon_id", "created_at", "updated_at"}
 	if _, err := s.ListBreaksPage(context.Background(), Page{Limit: 25, Offset: 50}); err != nil {
 		t.Fatalf("ListBreaksPage: %v", err)
 	}
@@ -1924,9 +2006,9 @@ func TestListBreaksForIDsEmpty(t *testing.T) {
 func TestListBreaksForIDs(t *testing.T) {
 	s, fdb := newTestStore()
 	now := time.Now().UTC()
-	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "created_at", "updated_at"}
+	fdb.cols = []string{"external_txn_id", "root_cause", "confidence", "regulated", "status", "proposed_rule", "rationale", "created_rule_id", "resolved_recon_id", "created_at", "updated_at"}
 	fdb.rows = [][]driver.Value{
-		{"ext_1", "timing", 0.9, false, "auto-resolved", nil, "", nil, now, now},
+		{"ext_1", "timing", 0.9, false, "auto-resolved", nil, "", nil, "recon_forid", now, now},
 	}
 	got, err := s.ListBreaksForIDs(context.Background(), []string{"ext_1", "ext_2"}, Page{Limit: 2})
 	if err != nil {
@@ -1994,6 +2076,37 @@ func TestCountForIDs(t *testing.T) {
 			t.Fatalf("must count the audit ledger:\n%s", fdb.queries[0].query)
 		}
 	})
+}
+
+// TestCountBreaks asserts the F06 total-count helper the paginated HITL surfaces
+// use to emit continuation metadata: it is a bounded COUNT(*) over the whole
+// agent_break table and returns the scanned total.
+func TestCountBreaks(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.cols = []string{"count"}
+	fdb.rows = [][]driver.Value{{int64(512)}}
+	n, err := s.CountBreaks(context.Background())
+	if err != nil || n != 512 {
+		t.Fatalf("CountBreaks n=%d err=%v, want 512", n, err)
+	}
+	if !strings.Contains(fdb.queries[0].query, "count(*)") || !strings.Contains(fdb.queries[0].query, "agent.agent_break") {
+		t.Fatalf("CountBreaks must be a COUNT(*) over agent.agent_break:\n%s", fdb.queries[0].query)
+	}
+	// It must NOT be scoped/filtered — F06 needs the grand total so pagination
+	// can report how many rows exist in all.
+	if strings.Contains(fdb.queries[0].query, "WHERE") {
+		t.Fatalf("CountBreaks must count ALL breaks (no WHERE filter):\n%s", fdb.queries[0].query)
+	}
+}
+
+// TestCountBreaksQueryError propagates a DB failure (the paginated handlers turn
+// it into a sanitized 500 / error panel rather than silently under-reporting).
+func TestCountBreaksQueryError(t *testing.T) {
+	s, fdb := newTestStore()
+	fdb.queryErr = errors.New("count fail")
+	if _, err := s.CountBreaks(context.Background()); err == nil {
+		t.Fatal("expected CountBreaks query error to propagate")
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -2190,16 +2303,20 @@ func TestRealPostgresMigrationContention(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// BeginRun / CompleteRun — durable run idempotency (finding M-15).
+// BeginRun / CompleteRun — per-INVOCATION run idempotency (findings M-15, F17).
 //
-// These prove the serve path can no longer reprocess the same fixture under a
-// fresh random id after a restart: the FIRST BeginRun records the run under its
-// id; a later BeginRun for the same fixture reuses that id (never forks a new
-// history) and, once CompleteRun has marked it completed, reports
-// alreadyCompleted so the pipeline short-circuits. The lifecycle test needs real
-// PostgreSQL (INSERT ... ON CONFLICT DO NOTHING RETURNING + fallback SELECT +
-// UPDATE ... RETURNING semantics); the pure input-validation checks run against
-// the in-process fake because they short-circuit before any query.
+// These prove the two identities are cleanly separated: run_id (the invocation
+// identity, the PRIMARY KEY) and fixture_key (the immutable, NON-unique fixture
+// identity). The FIRST BeginRun records the run under its run_id; a later
+// BeginRun under the SAME run_id (an in-process retry) reuses it and, once
+// CompleteRun has marked it completed, reports alreadyCompleted so the retry
+// short-circuits — never forking duplicate history. Crucially, a BeginRun under a
+// DIFFERENT run_id for the SAME fixture (a legitimate new invocation / rerun)
+// starts a FRESH run and is NEVER refused as already-completed (finding F17). The
+// lifecycle test needs real PostgreSQL (INSERT ... ON CONFLICT (run_id) DO
+// NOTHING RETURNING + fallback SELECT + UPDATE semantics); the pure
+// input-validation checks run against the in-process fake because they
+// short-circuit before any query.
 // -----------------------------------------------------------------------------
 
 // realStore opens a *Store against live PostgreSQL and migrates the agent
@@ -2251,50 +2368,79 @@ func TestBeginRunCompleteRunLifecycle(t *testing.T) {
 	fx := fmt.Sprintf("test_fixture_%d", time.Now().UnixNano())
 	defer cleanupRun(t, st, fx)
 
-	// 1. A fresh fixture is recorded under the caller's run id and is NOT
+	// 1. A fresh invocation is recorded under the caller's run id and is NOT
 	//    already-completed.
 	done, gotID, err := st.BeginRun(ctx, fx, "run_A")
 	if err != nil {
 		t.Fatalf("BeginRun (fresh): %v", err)
 	}
 	if done {
-		t.Fatal("a fresh fixture must not report already-completed")
+		t.Fatal("a fresh invocation must not report already-completed")
 	}
 	if gotID != "run_A" {
 		t.Fatalf("fresh run id: got %q want run_A", gotID)
 	}
 
-	// 2. A second BeginRun for the SAME fixture while it is still running must
-	//    REUSE the first run id and ignore the new one — the fixture is resumed
-	//    under its original identity, never forked into a duplicate history
-	//    (this is the exact restart-dedup guarantee finding M-15 requires).
-	done, gotID, err = st.BeginRun(ctx, fx, "run_B_ignored")
+	// 2. A second BeginRun under the SAME run_id while it is still running is an
+	//    in-process retry: it reuses run_A and does not report completed — the
+	//    invocation resumes under its own identity, never forking duplicate
+	//    history (the M-16 retry idempotency guarantee).
+	done, gotID, err = st.BeginRun(ctx, fx, "run_A")
 	if err != nil {
-		t.Fatalf("BeginRun (resume-running): %v", err)
+		t.Fatalf("BeginRun (resume-running same run id): %v", err)
 	}
 	if done {
-		t.Fatal("a still-running fixture must not report already-completed")
+		t.Fatal("a still-running invocation must not report already-completed")
 	}
 	if gotID != "run_A" {
-		t.Fatalf("resume must reuse the first run id, got %q (must not fork run_B_ignored)", gotID)
+		t.Fatalf("resume must stay on run_A, got %q", gotID)
 	}
 
-	// 3. Mark the run completed.
-	if err := st.CompleteRun(ctx, fx); err != nil {
+	// 3. Mark THIS invocation's run completed (by run_id).
+	if err := st.CompleteRun(ctx, "run_A"); err != nil {
 		t.Fatalf("CompleteRun: %v", err)
 	}
 
-	// 4. After completion, BeginRun reports already-completed (still under the
-	//    original id) so the serve path short-circuits and never reprocesses.
-	done, gotID, err = st.BeginRun(ctx, fx, "run_C_ignored")
+	// 4. Under the SAME run_id after completion, BeginRun reports
+	//    already-completed so an idempotent replay of THIS invocation
+	//    short-circuits and never reprocesses.
+	done, gotID, err = st.BeginRun(ctx, fx, "run_A")
 	if err != nil {
-		t.Fatalf("BeginRun (post-complete): %v", err)
+		t.Fatalf("BeginRun (post-complete same run id): %v", err)
 	}
 	if !done {
-		t.Fatal("a completed fixture MUST report already-completed=true (M-15)")
+		t.Fatal("a completed invocation MUST report already-completed=true under its own run id (M-15)")
 	}
 	if gotID != "run_A" {
 		t.Fatalf("post-complete run id: got %q want run_A", gotID)
+	}
+
+	// 5. F17: a NEW invocation (different run_id) for the SAME fixture must start
+	//    a FRESH run and NOT be refused as already-completed — this is the exact
+	//    rerun/recovery capability finding F17 requires (immutable fixture identity
+	//    separated from invocation identity).
+	done, gotID, err = st.BeginRun(ctx, fx, "run_B")
+	if err != nil {
+		t.Fatalf("BeginRun (new invocation, same fixture): %v", err)
+	}
+	if done {
+		t.Fatal("F17: a NEW invocation of the same fixture must NOT report already-completed")
+	}
+	if gotID != "run_B" {
+		t.Fatalf("F17: new invocation must run under its own run id, got %q want run_B", gotID)
+	}
+	if err := st.CompleteRun(ctx, "run_B"); err != nil {
+		t.Fatalf("CompleteRun (run_B): %v", err)
+	}
+
+	// Both runs must persist as distinct rows sharing the one fixture identity.
+	var runCount int
+	if err := st.db.QueryRowContext(ctx,
+		"SELECT count(*) FROM agent.agent_run WHERE fixture_key = $1", fx).Scan(&runCount); err != nil {
+		t.Fatalf("count runs for fixture: %v", err)
+	}
+	if runCount != 2 {
+		t.Fatalf("F17: expected 2 distinct runs sharing the fixture, got %d", runCount)
 	}
 }
 
@@ -2314,15 +2460,35 @@ func TestCompleteRunRejectsBlankKey(t *testing.T) {
 	st, _ := newTestStore()
 	defer func() { _ = st.Close() }()
 	if err := st.CompleteRun(context.Background(), "   "); err == nil {
-		t.Fatal("CompleteRun with a blank fixture key must error")
+		t.Fatal("CompleteRun with a blank run id must error")
 	}
 }
 
-func TestCompleteRunUnknownFixtureNotFound(t *testing.T) {
+func TestCompleteRunUnknownRunNotFound(t *testing.T) {
 	st := realStore(t)
 	defer func() { _ = st.Close() }()
-	fx := fmt.Sprintf("test_missing_%d", time.Now().UnixNano())
-	if err := st.CompleteRun(context.Background(), fx); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("CompleteRun on an unrecorded fixture must return ErrNotFound, got %v", err)
+	runID := fmt.Sprintf("run_missing_%d", time.Now().UnixNano())
+	if err := st.CompleteRun(context.Background(), runID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("CompleteRun on an unrecorded run id must return ErrNotFound, got %v", err)
+	}
+}
+
+// TestSelectOneReady proves the true-SQL-readiness probe (finding F01) succeeds
+// against a live database — cmd/main.go waits on this before migrating so a
+// pg_isready-but-not-query-ready window is waited out rather than fataling.
+func TestSelectOneReady(t *testing.T) {
+	st := realStore(t)
+	defer func() { _ = st.Close() }()
+	if err := st.SelectOne(context.Background()); err != nil {
+		t.Fatalf("SelectOne against a live database must succeed, got %v", err)
+	}
+}
+
+// TestSelectOneUninitialized proves SelectOne fails cleanly on an unopened store
+// rather than panicking on a nil handle.
+func TestSelectOneUninitialized(t *testing.T) {
+	var st Store
+	if err := st.SelectOne(context.Background()); err == nil {
+		t.Fatal("SelectOne on an uninitialized store must error")
 	}
 }

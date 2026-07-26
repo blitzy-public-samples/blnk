@@ -16,6 +16,7 @@ func clearEnv(t *testing.T) {
 		"LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL",
 		"BLNK_BASE_URL", "BLNK_API_KEY",
 		"CONF_AUTO_THRESHOLD", "HITL_PORT", "AGENT_DATABASE_URL",
+		"AGENT_MIGRATE_DATABASE_URL", "AGENT_RUN_ON_BOOT", "AGENT_BASE_CURRENCY",
 	} {
 		t.Setenv(k, "")
 	}
@@ -63,6 +64,62 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.AgentDatabaseURL != testDSN {
 		t.Errorf("AgentDatabaseURL = %q, want %q", cfg.AgentDatabaseURL, testDSN)
+	}
+	// F01: the serve-mode boot pipeline is OFF by default, so a long-lived
+	// compose container never processes the baked fixture merely because it
+	// started (the six-break run is the explicit `make demo` one-shot).
+	if cfg.AgentRunOnBoot {
+		t.Errorf("AgentRunOnBoot default = true, want false (serve-only boot, finding F01)")
+	}
+}
+
+// TestLoad_AgentRunOnBoot pins the finding-F01 gate: AGENT_RUN_ON_BOOT parses to
+// a boolean (defaulting false when unset/blank), accepts strconv.ParseBool
+// spellings, and rejects a non-boolean value at startup rather than silently
+// treating it as false and subtly changing the boot lifecycle.
+func TestLoad_AgentRunOnBoot(t *testing.T) {
+	valid := []struct {
+		raw  string
+		want bool
+	}{
+		{"true", true},
+		{"True", true},
+		{"1", true},
+		{"t", true},
+		{"false", false},
+		{"False", false},
+		{"0", false},
+		{"f", false},
+		{"   ", false}, // blank after trim -> default false
+	}
+	for _, tc := range valid {
+		t.Run("valid_"+strings.TrimSpace(tc.raw), func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("AGENT_DATABASE_URL", testDSN)
+			t.Setenv("AGENT_RUN_ON_BOOT", tc.raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() unexpected error for AGENT_RUN_ON_BOOT=%q: %v", tc.raw, err)
+			}
+			if cfg.AgentRunOnBoot != tc.want {
+				t.Fatalf("AgentRunOnBoot for %q = %v, want %v", tc.raw, cfg.AgentRunOnBoot, tc.want)
+			}
+		})
+	}
+
+	for _, bad := range []string{"yes", "no", "on", "off", "2", "maybe"} {
+		t.Run("invalid_"+bad, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("AGENT_DATABASE_URL", testDSN)
+			t.Setenv("AGENT_RUN_ON_BOOT", bad)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() error = nil, want error for non-boolean AGENT_RUN_ON_BOOT=%q", bad)
+			}
+			if !strings.Contains(err.Error(), "AGENT_RUN_ON_BOOT") {
+				t.Fatalf("error %q does not name AGENT_RUN_ON_BOOT", err.Error())
+			}
+		})
 	}
 }
 

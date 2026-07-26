@@ -801,6 +801,125 @@ func TestDecision_EmptyReviewerRejected(t *testing.T) {
 	}
 }
 
+// -----------------------------------------------------------------------------
+// F16: the finer-grained re_drive outcome actions are DISTINCT, recordable, and
+// carry the right evidence — cleared alone bears the confirming reconciliation id.
+// -----------------------------------------------------------------------------
+
+func TestReDriveOutcomeConstructors(t *testing.T) {
+	fs := &recordingSink{}
+	w, _ := New(fs)
+	d := model.HITLDecision{ExternalTxnID: "EXT-R1", Decision: DecisionReDrive, Reviewer: "alice"}
+
+	attempted := ReDriveAttempted(d, model.Provenance{Model: "kimi-k3"})
+	if attempted.Action != ActionReDriveAttempted || attempted.Actor != "alice" {
+		t.Fatalf("attempted wrong: %+v", attempted)
+	}
+	if attempted.Provenance.ReconID != "" {
+		t.Fatalf("attempted must carry no recon id, got %q", attempted.Provenance.ReconID)
+	}
+
+	cleared := ReDriveCleared(d, "recon_ok", model.Provenance{Model: "kimi-k3"})
+	if cleared.Action != ActionReDriveCleared || cleared.Actor != "alice" {
+		t.Fatalf("cleared wrong: %+v", cleared)
+	}
+	if cleared.Provenance.ReconID != "recon_ok" {
+		t.Fatalf("cleared must carry the confirming recon id, got %q", cleared.Provenance.ReconID)
+	}
+	if !strings.Contains(cleared.Rationale, "recon_ok") {
+		t.Fatalf("cleared rationale should name the confirming recon: %q", cleared.Rationale)
+	}
+
+	unmatched := ReDriveUnmatched(d, model.Provenance{Model: "kimi-k3"})
+	if unmatched.Action != ActionReDriveUnmatched || unmatched.Actor != "alice" {
+		t.Fatalf("unmatched wrong: %+v", unmatched)
+	}
+	if unmatched.Provenance.ReconID != "" {
+		t.Fatalf("unmatched must carry NO recon id (m-04), got %q", unmatched.Provenance.ReconID)
+	}
+
+	failed := ReDriveFailed(d, "re_drive probe failed (Blnk upstream)", model.Provenance{Model: "kimi-k3"})
+	if failed.Action != ActionReDriveFailed || failed.Actor != "alice" {
+		t.Fatalf("failed wrong: %+v", failed)
+	}
+	if failed.Provenance.ReconID != "" {
+		t.Fatalf("failed must carry no recon id, got %q", failed.Provenance.ReconID)
+	}
+	if !strings.Contains(strings.ToLower(failed.Rationale), "probe failed") {
+		t.Fatalf("failed rationale should carry the reason: %q", failed.Rationale)
+	}
+
+	// All four are in the closed set and record cleanly.
+	for _, ev := range []model.AuditEvent{attempted, cleared, unmatched, failed} {
+		if err := w.Record(context.Background(), ev); err != nil {
+			t.Fatalf("Record %s: %v", ev.Action, err)
+		}
+	}
+}
+
+// TestReDriveCleared_RequiresReconID proves a cleared re_drive is impossible to
+// record without its confirming reconciliation id — the deterministic-arbiter
+// proof (Rule 5.3), surfaced via the same ErrEmptyReconID sentinel as `resolved`.
+func TestReDriveCleared_RequiresReconID(t *testing.T) {
+	fs := &recordingSink{}
+	w, _ := New(fs)
+	d := model.HITLDecision{ExternalTxnID: "EXT-R2", Decision: DecisionReDrive, Reviewer: "alice"}
+	if err := w.Record(context.Background(), ReDriveCleared(d, "", model.Provenance{})); !errors.Is(err, ErrEmptyReconID) {
+		t.Fatalf("want ErrEmptyReconID for a blank-proof re_drive_cleared, got %v", err)
+	}
+	if err := w.Record(context.Background(), ReDriveCleared(d, "   ", model.Provenance{})); !errors.Is(err, ErrEmptyReconID) {
+		t.Fatalf("want ErrEmptyReconID for a whitespace-proof re_drive_cleared, got %v", err)
+	}
+	if len(fs.events) != 0 {
+		t.Fatal("a proofless re_drive_cleared must not be recorded")
+	}
+}
+
+// TestReDriveOutcomes_EmptyReviewerRejected proves every re_drive outcome, like
+// any human-attributed decision, requires a non-empty actor (M-13).
+func TestReDriveOutcomes_EmptyReviewerRejected(t *testing.T) {
+	fs := &recordingSink{}
+	w, _ := New(fs)
+	d := model.HITLDecision{ExternalTxnID: "EXT-R3", Decision: DecisionReDrive, Reviewer: ""}
+	evs := []model.AuditEvent{
+		ReDriveAttempted(d, model.Provenance{}),
+		ReDriveCleared(d, "recon_ok", model.Provenance{}),
+		ReDriveUnmatched(d, model.Provenance{}),
+		ReDriveFailed(d, "boom", model.Provenance{}),
+	}
+	for _, ev := range evs {
+		if err := w.Record(context.Background(), ev); !errors.Is(err, ErrEmptyActor) {
+			t.Fatalf("%s with empty reviewer: want ErrEmptyActor, got %v", ev.Action, err)
+		}
+	}
+}
+
+// TestReDriveOutcomes_ReviewerNoteBecomesRationale proves a reviewer's note is
+// preserved as the rationale across the attempt/cleared/unmatched outcomes.
+func TestReDriveOutcomes_ReviewerNoteBecomesRationale(t *testing.T) {
+	d := model.HITLDecision{ExternalTxnID: "EXT-R4", Decision: DecisionReDrive, Reviewer: "alice", Note: "manual retry after fix"}
+	for _, ev := range []model.AuditEvent{
+		ReDriveAttempted(d, model.Provenance{}),
+		ReDriveCleared(d, "recon_ok", model.Provenance{}),
+		ReDriveUnmatched(d, model.Provenance{}),
+	} {
+		if ev.Rationale != "manual retry after fix" {
+			t.Fatalf("%s should preserve the reviewer note, got %q", ev.Action, ev.Rationale)
+		}
+	}
+}
+
+// TestReDriveActions_InClosedSet proves the four new actions are members of the
+// closed action set (isAllowedAction), so Record accepts them and the append-only
+// DB action-domain CHECK must include them too.
+func TestReDriveActions_InClosedSet(t *testing.T) {
+	for _, a := range []string{ActionReDriveAttempted, ActionReDriveCleared, ActionReDriveUnmatched, ActionReDriveFailed} {
+		if !isAllowedAction(a) {
+			t.Fatalf("action %q must be in the closed set", a)
+		}
+	}
+}
+
 func TestDecisionAction(t *testing.T) {
 	cases := map[string]string{
 		DecisionAccept:  ActionAccepted,

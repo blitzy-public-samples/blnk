@@ -70,13 +70,46 @@ const (
 	ActionEscalated = "escalated"
 	// ActionAccepted records a human accept decision.
 	ActionAccepted = "accepted"
-	// ActionReDriven records a human re_drive decision.
+	// ActionReDriven records a human re_drive decision. It remains the value of
+	// StatusReDriven (the terminal break status after a confirmed-clearing
+	// re_drive) and stays in the closed action set for backward compatibility
+	// with any historical audit rows, but the re_drive HANDLER no longer emits
+	// it: a re_drive now records the finer-grained, outcome-specific actions
+	// below (finding F16) so cleared / still-unmatched / failed attempts are
+	// each an unambiguous, immutable action rather than one 're_driven' value
+	// disambiguated only by free-text rationale.
 	ActionReDriven = "re_driven"
 	// ActionRejected records a human reject decision.
 	ActionRejected = "rejected"
 	// ActionRuleCompensated records that a previously created Blnk matching rule
 	// was compensated (deleted) after its remediation attempt did not clear.
 	ActionRuleCompensated = "rule_compensated"
+	// ActionReDriveAttempted records that a human INITIATED a re_drive of a
+	// queued break (finding F16). It is written once, immediately after the
+	// processing lease is acquired and before any Blnk interaction, so every
+	// re_drive attempt is durably visible on the append-only trail regardless of
+	// its eventual outcome — including an attempt that then fails against Blnk
+	// and emits no probe. It carries no reconciliation id (nothing has cleared).
+	ActionReDriveAttempted = "re_drive_attempted"
+	// ActionReDriveCleared records the terminal outcome of a re_drive whose Blnk
+	// dry-run CONFIRMED the break moved out of the unmatched set (finding F16,
+	// Rule 5.3). It is the ONLY re_drive outcome action that carries a confirming
+	// reconciliation id in its provenance (the durable clearance proof), and it
+	// accompanies the break's transition to StatusReDriven.
+	ActionReDriveCleared = "re_drive_cleared"
+	// ActionReDriveUnmatched records the terminal outcome of a re_drive whose
+	// Blnk dry-run ran but did NOT confirm clearance (finding F16). The break is
+	// left queued for further review. It carries NO reconciliation id so a
+	// reconciliation id can never imply a false clearance (finding m-04); the
+	// preceding `probed` event already records the dry-run id and verdict.
+	ActionReDriveUnmatched = "re_drive_unmatched"
+	// ActionReDriveFailed records the terminal outcome of a re_drive that could
+	// not complete because a Blnk interaction failed — the ephemeral rule
+	// creation or the dry-run probe errored (finding F16, fail-closed Rule 5.7).
+	// The break is left queued; the event carries a failure rationale and no
+	// reconciliation id, so a Blnk-down attempt is a first-class, unambiguous
+	// action rather than a 're_driven' value distinguishable only by its text.
+	ActionReDriveFailed = "re_drive_failed"
 )
 
 // Matching-rule grammar (Rule 5.2) — the closed field and operator domains

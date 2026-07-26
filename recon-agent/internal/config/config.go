@@ -54,7 +54,8 @@ const (
 // (Gate 12): the LLM* fields are read by internal/classifier, the Blnk*
 // fields by internal/blnk, ConfAutoThreshold and AgentBaseCurrency by
 // internal/remediator, HitlPort by internal/hitl (via cmd/main.go), and
-// AgentDatabaseURL by internal/store.
+// AgentDatabaseURL (and the optional AgentMigrateDatabaseURL) by internal/store
+// via cmd/main.go.
 type Config struct {
 	// LLMBaseURL is the OpenAI-compatible Chat Completions base URL
 	// (LLM_BASE_URL). Read by the classifier.
@@ -78,8 +79,21 @@ type Config struct {
 	// default "8088"). Read by the hitl server via cmd/main.go.
 	HitlPort string
 	// AgentDatabaseURL is the PostgreSQL DSN for the agent-owned tables
-	// (AGENT_DATABASE_URL). Required. Read by the store.
+	// (AGENT_DATABASE_URL). Required. Read by the store. In the two-role
+	// deployment (finding F05) this is the RESTRICTED RUNTIME role's DSN: it can
+	// INSERT/SELECT the audit ledger and perform the specific DML the mutable
+	// tables need, but owns nothing, holds no database CREATE, and cannot disable
+	// the append-only trigger.
 	AgentDatabaseURL string
+	// AgentMigrateDatabaseURL is the OPTIONAL PostgreSQL DSN of the OWNER/MIGRATOR
+	// role (AGENT_MIGRATE_DATABASE_URL). When set, cmd/main.go connects as this
+	// role SOLELY to run the boot migration and then grant the runtime role
+	// (AgentDatabaseURL) its least privileges (finding F05, Rule 5.5). When empty,
+	// the agent runs in single-role mode (dev/test): the runtime DSN performs the
+	// migration itself with no cross-role grants. Read by the store via
+	// cmd/main.go. Its error surfaces, like the runtime DSN's, never echo the raw
+	// value (finding F07).
+	AgentMigrateDatabaseURL string
 	// AgentBaseCurrency is the ledger's settlement (base) currency
 	// (AGENT_BASE_CURRENCY). OPTIONAL — when empty, the independent non-LLM
 	// regulated backstop it powers is disabled. When set, the remediator treats
@@ -89,6 +103,21 @@ type Config struct {
 	// (INFO#2 defense-in-depth for finding F-1, above the always-on deterministic
 	// cohort dry-run). Read by the remediator (via cmd/main.go).
 	AgentBaseCurrency string
+	// AgentRunOnBoot controls whether SERVE mode (the long-lived compose
+	// container) runs the triage pipeline once automatically on boot
+	// (AGENT_RUN_ON_BOOT, default false). It is OFF by default so the sidecar
+	// NEVER processes the baked fixture merely because the container process
+	// started — critically, before an operator has run `make seed`, which would
+	// triage against an un-seeded Blnk and permanently record a bogus run
+	// (finding F01). With the default, serve mode binds the HITL surface, waits
+	// for its dependencies to be reachable, marks itself ready, and leaves the
+	// actual six-break run to the explicit `make demo` trigger (the documented
+	// `docker compose up → make seed → make demo` contract). Set it to true ONLY
+	// in an environment whose Blnk database is already seeded before the agent
+	// boots (e.g. a pre-provisioned fixture), where the AAP §0.5.1 "run pipeline
+	// → serve" boot behavior is desired. The one-shot `-once` path (`make demo`)
+	// ignores this flag and always runs the pipeline. Read by cmd/main.go.
+	AgentRunOnBoot bool
 }
 
 // Load reads the recon-agent configuration from the process environment,
@@ -119,12 +148,22 @@ func Load() (Config, error) {
 		// templating slip) fails the required-field check below instead of
 		// being stored verbatim and failing later at DB-connect time.
 		AgentDatabaseURL: strings.TrimSpace(os.Getenv("AGENT_DATABASE_URL")),
+		// Optional owner/migrator DSN for the two-role least-privilege model
+		// (finding F05). Trimmed; empty selects single-role mode. Never validated
+		// as an HTTP URL (it is a DSN) and never echoed on error (finding F07).
+		AgentMigrateDatabaseURL: strings.TrimSpace(os.Getenv("AGENT_MIGRATE_DATABASE_URL")),
 		// Optional independent (non-LLM) regulated backstop of INFO#2. Trimmed;
 		// empty disables the backstop. Not validated as required — a deployment
 		// that omits it simply relies on the always-on deterministic cohort
 		// dry-run (Rule 5.3) without the extra currency guard.
 		AgentBaseCurrency: strings.TrimSpace(os.Getenv("AGENT_BASE_CURRENCY")),
 	}
+
+	runOnBoot, err := parseBool("AGENT_RUN_ON_BOOT", false)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AgentRunOnBoot = runOnBoot
 
 	threshold, err := parseFloat("CONF_AUTO_THRESHOLD", defaultConfAutoThreshold)
 	if err != nil {
@@ -248,6 +287,25 @@ func parseFloat(key string, def float64) (float64, error) {
 	v, err := strconv.ParseFloat(raw, 64)
 	if err != nil {
 		return 0, fmt.Errorf("config: invalid %s %q: %w", key, raw, err)
+	}
+	return v, nil
+}
+
+// parseBool reads a boolean environment variable named by key. Surrounding
+// whitespace is trimmed first. It returns def when the variable is unset or
+// empty (after trimming), and a descriptive error when a non-empty value cannot
+// be parsed as a boolean. The accepted spellings are those of strconv.ParseBool
+// (1, t, T, TRUE, true, True, 0, f, F, FALSE, false, False), so a typo like
+// "yes" fails fast at startup rather than being silently treated as false and
+// subtly changing the boot lifecycle (finding F01).
+func parseBool(key string, def bool) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("config: invalid %s %q: must be a boolean (true/false)", key, raw)
 	}
 	return v, nil
 }

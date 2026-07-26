@@ -146,6 +146,17 @@ const (
 	// lock ceiling so a legitimately queued migration still completes.
 	migrateTimeout = 60 * time.Second
 
+	// dbReadyTimeout bounds how long run() waits for the database to be able to
+	// SERVE a query (a real `SELECT 1`) before it runs the boot migration
+	// (finding F01). A container `pg_isready`/TCP gate can report PostgreSQL
+	// healthy during the brief window before it can actually answer queries;
+	// migrating in that window fails with an opaque "connection reset". Waiting
+	// this window out here turns that flaky fatal boot into a bounded, deterministic
+	// startup. It is separate from (and smaller than) migrateTimeout so a truly
+	// unreachable database still fails fast rather than consuming the whole
+	// migration budget on readiness polling.
+	dbReadyTimeout = 30 * time.Second
+
 	// summaryTimeout bounds the post-pipeline store reads that tally the summary.
 	// It runs on a context DETACHED from the pipeline deadline (finding MINOR-1)
 	// so the scorecard still computes — and the demo still exits cleanly with a
@@ -220,26 +231,26 @@ type summary struct {
 // them (asserted below), so cmd/main.go wires them directly (Gate 9); the unit
 // test injects lightweight fakes / a mock Blnk endpoint (finding M5).
 type (
-	// reconClient is the subset of *blnk.Client the pipeline drives DIRECTLY.
-	// The F-1 fix makes the remediator's dedicated-cohort dry-run the run's
-	// SINGLE cold reconciliation and the deterministic arbiter of clearance
-	// (Rule 5.3), so the pipeline no longer runs its own detection
-	// reconciliation before triage: a prior start+get would poison Blnk's
-	// upload-agnostic pagination cache (protected-core defect INFO#4 / Rule 5.8)
-	// and leave that cohort dry-run reading stale rows. The pipeline therefore
-	// only uploads the statement; every reconciliation call now originates from
-	// the remediator's ConfirmCohortCleared. (The client STILL wraps and unit-
-	// tests StartReconciliation / GetReconciliation as AAP-consumed routes; they
-	// are simply no longer part of the pipeline's direct surface.)
+	// reconClient is the subset of *blnk.Client the pipeline drives DIRECTLY —
+	// only the statement upload. The mandated Upload -> start -> read topology
+	// (finding F02) and every per-break dry-run probe are owned by the remediator
+	// (ProcessCohort), which holds each break's M-5 mutex and M-15 lease across
+	// the propose -> establish-main-reconciliation -> per-break-probe -> finalize
+	// span; splitting those Blnk calls back out to the pipeline would break that
+	// locking, so the pipeline uploads and then hands the batch to ProcessCohort.
+	// (The client STILL wraps StartReconciliation / GetReconciliation as
+	// AAP-consumed routes; the remediator invokes them via EstablishMainReconciliation.)
 	reconClient interface {
 		UploadExternalData(ctx context.Context, source, filename string, file io.Reader) (blnk.UploadResponse, error)
 	}
-	// remediatorPort triages a COHORT of breaks in ONE call: classify -> gate ->
-	// propose a safe rule for each auto-eligible break -> run the run's SINGLE
-	// dedicated-cohort dry-run -> resolve every confirmed member or fail the
-	// cohort closed to HITL. Routing the whole cohort through one dry-run whose
-	// unmatched==0 proves EVERY member left the unmatched set is the
-	// deterministic-arbiter guarantee that fixes F-1 (Rule 5.3).
+	// remediatorPort triages a batch of breaks in ONE call: classify -> gate ->
+	// propose a safe rule for each auto-eligible break -> establish the run's
+	// initial dry-run reconciliation over the upload (the main_recon_id, finding
+	// F02) -> probe EACH break with its OWN single-transaction dry-run and resolve
+	// the ones Blnk confirms matched INDEPENDENTLY (finding F18). Adjudicating each
+	// break with its own probe (matched>=1) is the deterministic-arbiter guarantee
+	// (Rule 5.3) that also lets a confirmed break resolve even when a sibling
+	// remains unmatched.
 	remediatorPort interface {
 		ProcessCohort(ctx context.Context, breaks []blnk.ExternalTransaction, uploadID string) error
 	}
@@ -249,17 +260,19 @@ type (
 	// them atomically (finding M-12) — the pipeline never performs a direct,
 	// un-audited or multi-commit break write.
 	//
-	// BeginRun/CompleteRun implement durable run idempotency (finding M-15): a
-	// serve restart over the same fixture reuses the recorded run rather than
-	// reprocessing it under fresh ids and duplicating history. The summary scopes
-	// every tally to the current run's id set database-side (finding M-14) rather
-	// than listing the entire historical table and discarding rows in Go:
-	// ListBreaksForIDs returns only this run's break rows (bounded) for the
+	// BeginRun/CompleteRun implement durable per-INVOCATION run idempotency
+	// (findings M-15, F17): an in-process retry reuses the invocation's own run_id
+	// (converging on one run rather than duplicating history), while a genuinely
+	// new invocation supplies a fresh run_id and always runs fresh — so a
+	// legitimate rerun/recovery is never refused as "already done". The summary
+	// scopes every tally to the CURRENT run's id set database-side (findings M-14,
+	// F17) rather than listing the entire historical table and discarding rows in
+	// Go: ListBreaksForIDs returns only this run's break rows (bounded) for the
 	// resolved-artifact writer, and the Count*ForIDs helpers tally auto-resolved /
-	// escalated / audit counts with a COUNT(*).
+	// escalated / audit counts with a COUNT(*), so counters are current-run-only.
 	pipelineStore interface {
 		BeginRun(ctx context.Context, fixtureKey, runID string) (alreadyCompleted bool, existingRunID string, err error)
-		CompleteRun(ctx context.Context, fixtureKey string) error
+		CompleteRun(ctx context.Context, runID string) error
 		ListBreaksForIDs(ctx context.Context, ids []string, page store.Page) ([]store.Break, error)
 		CountBreaksByStatusForIDs(ctx context.Context, ids []string, status string) (int, error)
 		CountHITLForIDs(ctx context.Context, ids []string) (int, error)
@@ -304,6 +317,7 @@ var (
 	_ pipelineStore  = (*store.Store)(nil)
 	_ readinessProbe = (*blnk.Client)(nil)
 	_ pinger         = (*store.Store)(nil)
+	_ sqlReadier     = (*store.Store)(nil)
 	// The combined ports the serve-mode startup pipeline depends on: the Blnk
 	// client is both the reconciliation driver and the readiness probe, the store
 	// is both the pipeline persistence surface and the readiness pinger, and the
@@ -354,8 +368,45 @@ func run(once bool, csvPath, resolvedPath, source string) error {
 	// M-16 (bounded startup): apply the additive agent schema under a bounded
 	// context so a stuck advisory lock or slow DDL fails fast instead of hanging
 	// boot indefinitely.
+	//
+	// F05 (two-role least privilege): when AGENT_MIGRATE_DATABASE_URL is set, the
+	// migration + runtime grants run as the OWNER/MIGRATOR role via a throwaway
+	// migrator store; the long-lived application store `st` stays connected as the
+	// RESTRICTED RUNTIME role (AGENT_DATABASE_URL) and never owns objects, holds
+	// database CREATE, or can disable the append-only trigger. When the migrate
+	// DSN is empty the agent runs single-role (dev/test) and `st` migrates itself.
 	migrateCtx, migrateCancel := context.WithTimeout(context.Background(), migrateTimeout)
-	err = st.Migrate(migrateCtx)
+	if cfg.AgentMigrateDatabaseURL != "" {
+		var migStore *store.Store
+		migStore, err = store.New(cfg.AgentMigrateDatabaseURL)
+		if err != nil {
+			migrateCancel()
+			return fmt.Errorf("init migrator store: %w", err)
+		}
+		// F01: wait for the migrator connection to actually SERVE a query (a real
+		// SELECT 1) before running DDL, so a pg_isready-but-not-query-ready startup
+		// window becomes a bounded wait instead of a fatal "connection reset"
+		// mid-migration.
+		if rerr := awaitSQLReady(context.Background(), migStore, dbReadyTimeout); rerr != nil {
+			if cerr := migStore.Close(); cerr != nil {
+				log.Printf("recon-agent: closing migrator store: %v", cerr)
+			}
+			migrateCancel()
+			return fmt.Errorf("migrator database not ready: %w", rerr)
+		}
+		err = migStore.MigrateAndGrant(migrateCtx, cfg.AgentDatabaseURL)
+		if cerr := migStore.Close(); cerr != nil {
+			log.Printf("recon-agent: closing migrator store: %v", cerr)
+		}
+	} else {
+		// F01: same true-SQL-readiness wait for the single-role runtime store
+		// before it migrates itself.
+		if rerr := awaitSQLReady(context.Background(), st, dbReadyTimeout); rerr != nil {
+			migrateCancel()
+			return fmt.Errorf("database not ready: %w", rerr)
+		}
+		err = st.Migrate(migrateCtx)
+	}
 	migrateCancel()
 	if err != nil {
 		return fmt.Errorf("migrate store: %w", err)
@@ -408,7 +459,10 @@ func runOnce(blnkClient blnkPort, rem remediatorPort, st storePort, csvPath, res
 		return fmt.Errorf("dependencies not ready: %w", err)
 	}
 
-	s, err := runPipeline(ctx, blnkClient, rem, st, csvPath, resolvedPath, source)
+	// F17: a one-shot invocation (`make demo`) gets ONE fresh run identity, so
+	// re-running the demo over the same fixture always reprocesses under a new run
+	// rather than being refused as already-completed.
+	s, err := runPipeline(ctx, blnkClient, rem, st, csvPath, resolvedPath, source, shortRunID())
 	if err != nil {
 		return fmt.Errorf("pipeline failed: %w", err)
 	}
@@ -425,12 +479,19 @@ func runOnce(blnkClient blnkPort, rem remediatorPort, st storePort, csvPath, res
 	return nil
 }
 
-// runServe binds the HITL server, serves it (initially not-ready), retries the
-// startup pipeline under a bounded policy (finding M-16), marks the service
-// ready on the first success, and blocks until SIGINT/SIGTERM triggers a bounded
-// graceful shutdown (finding M4). While dependencies are unready or the pipeline
-// has not yet succeeded, /readyz reports not-ready (finding M3) — never a
-// false-green.
+// runServe binds the HITL server, serves it (initially not-ready), brings it to
+// ready, and blocks until SIGINT/SIGTERM triggers a bounded graceful shutdown
+// (finding M4). While dependencies are unready /readyz reports not-ready (finding
+// M3) — never a false-green.
+//
+// Finding F01 — the boot lifecycle is gated on AGENT_RUN_ON_BOOT:
+//   - DEFAULT (unset/false): SERVE-ONLY. It waits for dependency readiness and
+//     then marks ready WITHOUT running the pipeline, so the long-lived compose
+//     container never triages the baked fixture merely because it started (before
+//     `make seed`). The actual six-break run is the explicit `make demo` one-shot.
+//   - AGENT_RUN_ON_BOOT=true: runs the startup pipeline once on boot under the
+//     bounded M-16 retry policy and marks ready on the first success — the AAP
+//     §0.5.1 "run pipeline → serve" behavior, for a Blnk DB seeded before boot.
 //
 // Finding M-16 — startup lifecycle — is addressed in three ways:
 //   - BIND FIRST, SYNCHRONOUSLY. srv.Listen binds the socket before any
@@ -469,11 +530,29 @@ func runServe(cfg config.Config, srv *hitl.Server, blnkClient *blnk.Client, rem 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
 
-	// M-16: run the startup pipeline under a bounded retry policy in the
-	// background so shutdown signals and fatal serve errors remain responsive
-	// while retries/backoffs are in flight. The goroutine honors ctx, so a
-	// shutdown during a backoff or an in-flight attempt cancels promptly.
-	go runStartupPipeline(ctx, srv, blnkClient, rem, st, csvPath, resolvedPath, source)
+	// F01: serve mode does NOT process the baked fixture on boot by default. The
+	// documented clean-machine contract is `docker compose up → make seed → make
+	// demo`: the sidecar must never triage merely because the container process
+	// started — critically before `make seed` has established the internal ledger,
+	// which would run against an un-seeded Blnk and permanently record a bogus run.
+	// So by default we only wait for dependencies to be reachable and then mark
+	// the HITL surface ready; the actual six-break run is the explicit `make demo`
+	// one-shot. Setting AGENT_RUN_ON_BOOT=true opts into the AAP §0.5.1 "run
+	// pipeline → serve" boot behavior for environments whose Blnk DB is already
+	// seeded before the agent boots. Either goroutine honors ctx, so a shutdown
+	// during a backoff or an in-flight attempt cancels promptly.
+	if cfg.AgentRunOnBoot {
+		// M-16: run the startup pipeline under a bounded retry policy in the
+		// background so shutdown signals and fatal serve errors remain responsive
+		// while retries/backoffs are in flight.
+		log.Printf("recon-agent: AGENT_RUN_ON_BOOT=true; running the triage pipeline once on boot")
+		go runStartupPipeline(ctx, srv, blnkClient, rem, st, csvPath, resolvedPath, source)
+	} else {
+		// Default: serve-only. Wait for dependency readiness, then flip ready —
+		// never processing the fixture on boot (finding F01).
+		log.Printf("recon-agent: serve-only boot (AGENT_RUN_ON_BOOT unset); the pipeline runs on the explicit `make demo` trigger")
+		go awaitServeReadiness(ctx, srv, blnkClient, st)
+	}
 
 	// Block until a shutdown signal or a fatal server error.
 	select {
@@ -505,6 +584,12 @@ func runServe(cfg config.Config, srv *hitl.Server, blnkClient *blnk.Client, rem 
 // rather than crash-looping or reporting a false-green. It honors ctx throughout,
 // so a shutdown signal during an attempt or a backoff ends it promptly.
 func runStartupPipeline(ctx context.Context, srv readySetter, blnkClient blnkPort, rem remediatorPort, st storePort, csvPath, resolvedPath, source string) {
+	// F17 + M-16: generate ONE run identity for this boot invocation and reuse it
+	// across every retry, so the bounded retry policy converges on a single run
+	// (upsert-idempotent, never duplicating history) rather than forking a new run
+	// per attempt. A subsequent process restart is a NEW invocation and gets a new
+	// runID (a fresh run), which is the F17-correct behavior.
+	runID := shortRunID()
 	for attempt := 1; attempt <= maxPipelineAttempts; attempt++ {
 		if ctx.Err() != nil {
 			return
@@ -515,7 +600,7 @@ func runStartupPipeline(ctx context.Context, srv readySetter, blnkClient blnkPor
 			// Each attempt runs under its own bounded context so a wedged
 			// pipeline can never hang the startup sequence (M-16 bounded startup).
 			pctx, cancel := context.WithTimeout(ctx, pipelineTimeout)
-			s, perr := runPipeline(pctx, blnkClient, rem, st, csvPath, resolvedPath, source)
+			s, perr := runPipeline(pctx, blnkClient, rem, st, csvPath, resolvedPath, source, runID)
 			cancel()
 			if perr == nil {
 				printSummary(os.Stdout, s)
@@ -536,6 +621,88 @@ func runStartupPipeline(ctx context.Context, srv readySetter, blnkClient blnkPor
 		}
 	}
 	log.Printf("recon-agent: pipeline did not succeed after %d attempt(s); serving in not-ready state for operator review", maxPipelineAttempts)
+}
+
+// awaitServeReadiness is the DEFAULT serve-mode boot behavior (finding F01): it
+// waits for the agent's dependencies (Blnk + the store) to be reachable and then
+// marks the HITL surface ready — WITHOUT running the triage pipeline. The
+// documented clean-machine contract runs the actual six-break pipeline via the
+// explicit `make demo` one-shot AFTER `make seed`, so the long-lived compose
+// container must never process the baked fixture merely because it started (which
+// would triage against an un-seeded Blnk and permanently record a bogus run). It
+// retries readiness under the same bounded policy as the boot pipeline so a
+// dependency that is briefly slow to come up does not leave the container
+// permanently not-ready, and it honors ctx so shutdown ends it promptly. If
+// readiness never succeeds within the bounded attempts it leaves the server
+// not-ready (never a false-green) for operator review.
+func awaitServeReadiness(ctx context.Context, srv readySetter, rp readinessProbe, pg pinger) {
+	for attempt := 1; attempt <= maxPipelineAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
+		if rerr := awaitReadiness(ctx, rp, pg, readinessTimeout); rerr != nil {
+			log.Printf("recon-agent: dependencies not ready (attempt %d/%d): %v", attempt, maxPipelineAttempts, rerr)
+		} else {
+			srv.SetReady(true)
+			log.Printf("recon-agent: dependencies ready (attempt %d/%d); serving HITL in ready state (serve-only; pipeline runs on the explicit `make demo` trigger)", attempt, maxPipelineAttempts)
+			return
+		}
+		if attempt < maxPipelineAttempts {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(pipelineRetryBackoff):
+			}
+		}
+	}
+	log.Printf("recon-agent: dependencies not ready after %d attempt(s); serving in not-ready state for operator review", maxPipelineAttempts)
+}
+
+// sqlReadier is the minimal store surface awaitSQLReady needs (finding F01): the
+// ability to run a real SELECT 1 round-trip. *store.Store satisfies it.
+type sqlReadier interface {
+	SelectOne(ctx context.Context) error
+}
+
+// awaitSQLReady blocks until the database can SERVE a query (SELECT 1 succeeds)
+// or the timeout elapses (finding F01). It exists because a container's
+// pg_isready / TCP readiness gate can report PostgreSQL healthy during the brief
+// window before it can actually answer queries; running the boot migration in
+// that window fails with an opaque "connection reset". Each probe is bounded by
+// the smaller of readinessProbeTimeout and the remaining budget so one hung
+// probe cannot overshoot the deadline. It returns nil on the first success and a
+// descriptive error wrapping the last probe failure on timeout, so run() waits
+// the window out and only then migrates — turning a flaky fatal boot into a
+// bounded, deterministic startup.
+func awaitSQLReady(ctx context.Context, sr sqlReadier, timeout time.Duration) error {
+	start := time.Now()
+	deadline := start.Add(timeout)
+	var lastErr error
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("database readiness budget %s elapsed before the first probe completed", timeout)
+			}
+			return fmt.Errorf("timed out after %s: %w", time.Since(start).Round(time.Millisecond), lastErr)
+		}
+		probeTimeout := readinessProbeTimeout
+		if remaining < probeTimeout {
+			probeTimeout = remaining
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		err := sr.SelectOne(probeCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(readinessInterval):
+		}
+	}
 }
 
 // awaitReadiness polls the Blnk endpoint and the agent store until both are
@@ -596,7 +763,15 @@ func awaitReadiness(ctx context.Context, rp readinessProbe, pg pinger, timeout t
 // runPipeline drives the required Blnk-native reconciliation flow and returns a
 // run-scoped summary. It returns an error on any failure so callers can exit
 // nonzero (finding F4). See the package doc for the step-by-step flow.
-func runPipeline(ctx context.Context, bc reconClient, rem remediatorPort, st pipelineStore, csvPath, resolvedPath, source string) (summary, error) {
+func runPipeline(ctx context.Context, bc reconClient, rem remediatorPort, st pipelineStore, csvPath, resolvedPath, source, runID string) (summary, error) {
+	// F17: runID is THIS invocation's identity, generated once by the caller
+	// (runOnce / runStartupPipeline) and reused across in-process retries. A
+	// genuinely new invocation supplies a fresh runID and therefore always begins
+	// a fresh run below (never refused as "already done"); an in-process M-16
+	// retry reuses the same runID and converges on the one run.
+	if strings.TrimSpace(runID) == "" {
+		return summary{}, fmt.Errorf("runPipeline requires a non-empty run id")
+	}
 	// F6: refuse a dangerous resolved-artifact path (e.g. the committed eval
 	// corpus) BEFORE doing any work, so a misconfiguration fails fast instead of
 	// running the whole pipeline and only then discovering the output is
@@ -617,31 +792,38 @@ func runPipeline(ctx context.Context, bc reconClient, rem remediatorPort, st pip
 	}
 	log.Printf("recon-agent: loaded %d external transaction(s) from %q", len(txns), csvPath)
 
-	// M-15: durable run idempotency. A fixture is identified by a deterministic
-	// content hash of its canonical rows plus the source label, so the SAME
-	// statement always maps to the SAME fixture key regardless of the random
-	// per-run id suffix. BeginRun records the run once and tells us what to do:
+	// M-15 + F17: per-INVOCATION run idempotency. fixtureKey is the IMMUTABLE
+	// fixture identity — a deterministic content hash of the canonical rows plus
+	// the source label — recorded on the run for provenance. runID is THIS
+	// invocation's identity, passed in by the caller (generated once per process
+	// invocation and reused across in-process retries). BeginRun records the
+	// invocation under runID and tells us what to do:
 	//
-	//   - fresh fixture  -> proceed under a newly-generated run id;
-	//   - already done   -> a prior boot fully processed this fixture; rebuild the
-	//                        summary from the recorded run's persisted rows and
-	//                        return WITHOUT touching Blnk or reprocessing, so a
-	//                        serve restart can no longer duplicate history or
-	//                        inflate the demo scorecard;
-	//   - crashed run     -> reuse the ORIGINAL run id so the retry converges on
-	//                        the same scoped id set (upsert-idempotent) instead of
-	//                        forking a new duplicate history under a fresh id.
+	//   - fresh invocation -> a new runID: proceed under it. A legitimate rerun of
+	//                         the SAME fixture is a NEW invocation with a NEW runID,
+	//                         so it ALWAYS lands here and reprocesses eligible work
+	//                         instead of being refused as "already done" (F17);
+	//   - same runID, done  -> an idempotent replay of THIS invocation already
+	//                         finished: rebuild the summary from the recorded run's
+	//                         rows and return WITHOUT touching Blnk or reprocessing;
+	//   - same runID, running -> an in-process M-16 retry: reuse the SAME scoped id
+	//                         set (upsert-idempotent) rather than forking a new
+	//                         duplicate history.
+	//
+	// Because the runID is per-invocation (not a fixture-content hash), the
+	// summary this pipeline returns is scoped to THIS run's id set and is
+	// therefore current-run-only — never a stale cumulative count (F17).
 	fixtureKey := fixtureKeyFor(source, txns)
-	alreadyCompleted, runID, err := st.BeginRun(ctx, fixtureKey, shortRunID())
+	alreadyCompleted, runID, err := st.BeginRun(ctx, fixtureKey, runID)
 	if err != nil {
-		return summary{}, fmt.Errorf("begin run for fixture %s: %w", fixtureKey, err)
+		return summary{}, fmt.Errorf("begin run %s for fixture %s: %w", runID, fixtureKey, err)
 	}
 
-	// Reconstruct the run-scoped id set (id + "-" + runID) that this fixture used.
+	// Reconstruct the run-scoped id set (id + "-" + runID) that this run uses.
 	// Run-scoped ids make the upload rerun-safe (no external_transactions_pkey
 	// collisions, findings F3/F8) and scope the summary/artifacts to THIS run
-	// (finding M1). The reconstruction is deterministic, so it is identical on a
-	// fresh run and on an idempotent replay of a completed/crashed run.
+	// (findings M1, F17). The reconstruction is deterministic, so it is identical
+	// on a fresh run and on an idempotent replay of the same invocation.
 	scoped := make([]blnk.ExternalTransaction, len(txns))
 	txnByID := make(map[string]blnk.ExternalTransaction, len(txns))
 	runIDs := make(map[string]bool, len(txns))
@@ -681,38 +863,36 @@ func runPipeline(ctx context.Context, bc reconClient, rem remediatorPort, st pip
 	}
 	log.Printf("recon-agent: uploaded %d record(s); upload_id=%s", upload.RecordCount, upload.UploadID)
 
-	// F-1 (Rule 5.3): the pipeline performs NO reconciliation of its own before
-	// triage. Every uploaded row is a candidate break (deriveBreaks); the
-	// remediator's ProcessCohort classifies and gates each break and then runs
-	// the run's SINGLE cold reconciliation — one dedicated-cohort dry-run whose
-	// unmatched==0 proves EVERY cohort member left the unmatched set, so a
-	// resolution is attributable per break. A prior detection start+get here
-	// would poison Blnk's upload-agnostic pagination cache (protected-core defect
-	// INFO#4 / Rule 5.8) and leave that cohort dry-run reading stale rows, so the
-	// detection reconciliation the pipeline used to run has been removed. Blnk's
-	// authoritative upload record_count (validated above) is the count of rows
-	// actually ingested and is the "breaks in" tally.
+	// Every uploaded row is a candidate break (deriveBreaks). Blnk's authoritative
+	// upload record_count (validated above) is the count of rows actually ingested
+	// and is the "breaks in" tally. The mandated Upload -> start -> read topology
+	// (finding F02) runs inside ProcessCohort, not here: it must run AFTER the
+	// per-break rules exist (Blnk rejects a start with no matching rules) and its
+	// span shares each break's M-5 mutex / M-15 lease with the per-break probes,
+	// so it is kept together with them in the remediator.
 	breaks := deriveBreaks(scoped)
 	log.Printf("recon-agent: triaging %d candidate break(s) from the uploaded statement", len(breaks))
 
-	// Triage the whole cohort in ONE call. ProcessCohort classifies+gates each
+	// Triage the whole batch in ONE call. ProcessCohort classifies+gates each
 	// break, proposes a deterministic safe rule for each auto-eligible one,
-	// confirms the eligible cohort with the run's single dedicated-cohort dry-run
-	// (Blnk decides, Rule 5.3), and either resolves every confirmed member or
-	// fails the cohort closed to HITL (Rule 5.7). A per-break agent-side infra
-	// failure (persistence/audit) surfaces here and aborts the run nonzero
-	// (finding F4).
+	// establishes the run's initial dry-run reconciliation over the upload (the
+	// main_recon_id it stamps onto every break, finding F02), then probes EACH
+	// break with its OWN single-transaction dry-run and resolves the ones Blnk
+	// confirms matched INDEPENDENTLY (finding F18, Rule 5.3) or fails them closed
+	// to HITL (Rule 5.7). A per-break agent-side infra failure (persistence/audit)
+	// surfaces here and aborts the run nonzero (finding F4).
 	if err := rem.ProcessCohort(ctx, breaks, upload.UploadID); err != nil {
 		return summary{}, fmt.Errorf("process break cohort: %w", err)
 	}
 
-	// M-15: mark this fixture's run durably complete so a serve restart over the
-	// same statement is reported alreadyCompleted by BeginRun and skips
-	// reprocessing. This runs only after every break triaged successfully, so a
-	// mid-pipeline crash leaves the run 'running' and the retry resumes it under
-	// the same scoped id set rather than being falsely treated as done.
-	if err := st.CompleteRun(ctx, fixtureKey); err != nil {
-		return summary{}, fmt.Errorf("complete run for fixture %s: %w", fixtureKey, err)
+	// M-15 + F17: mark THIS invocation's run (by runID) durably complete so an
+	// in-process replay is reported alreadyCompleted by BeginRun and skips
+	// reprocessing, while a genuinely new invocation (new runID) is unaffected and
+	// runs fresh. This runs only after every break triaged successfully, so a
+	// mid-pipeline crash leaves the run 'running' and the in-process retry resumes
+	// it under the same scoped id set rather than being falsely treated as done.
+	if err := st.CompleteRun(ctx, runID); err != nil {
+		return summary{}, fmt.Errorf("complete run %s for fixture %s: %w", runID, fixtureKey, err)
 	}
 
 	// M1 + MINOR-1: scope every tally to THIS run's id set on a context DETACHED

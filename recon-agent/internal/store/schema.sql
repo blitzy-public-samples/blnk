@@ -106,8 +106,10 @@ ALTER TABLE agent.agent_break ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAM
 -- swallows duplicate_object on every subsequent (idempotent) Migrate. The
 -- confidence bound rejects NaN/±Inf as well as out-of-range values because in
 -- Postgres NaN sorts greater than every value (so NaN <= 1 is false) and ±Inf
--- fails one of the bounds. The resolved-proof constraint makes an auto-resolved
--- break without a confirming reconciliation id impossible.
+-- fails one of the bounds. The resolved-proof constraint (defined further below
+-- via a DROP-then-ADD converge, because its definition grew in finding F16)
+-- makes a CLEARED break — 'auto-resolved' or 're_driven' — without a confirming
+-- reconciliation id impossible.
 DO $agent_break_checks$
 BEGIN
     ALTER TABLE agent.agent_break
@@ -136,15 +138,28 @@ EXCEPTION WHEN duplicate_object THEN NULL;
 END;
 $agent_break_status$;
 
-DO $agent_break_resolved_proof$
-BEGIN
-    ALTER TABLE agent.agent_break
-        ADD CONSTRAINT agent_break_resolved_proof
-        CHECK (status <> 'auto-resolved'
-               OR (resolved_recon_id IS NOT NULL AND length(btrim(resolved_recon_id)) > 0));
-EXCEPTION WHEN duplicate_object THEN NULL;
-END;
-$agent_break_resolved_proof$;
+-- Finding F16 extends the resolved-proof constraint to also require the
+-- confirming reconciliation id on a 're_driven' break — a re_drive that Blnk
+-- confirmed cleared, exactly like an 'auto-resolved' break (Rule 5.3,
+-- defense-in-depth behind MarkReDrivenClearedFromQueuedTx, which only ever sets
+-- 're_driven' together with a non-empty proof). It is (re)established via
+-- DROP-then-ADD ... NOT VALID rather than the guarded ADD-EXCEPTION pattern the
+-- other agent_break constraints use, for the same reason the audit action-domain
+-- is: the constraint's definition GREW (from auto-resolved-only to also cover
+-- re_driven), and a plain guarded ADD would silently keep the older, narrower
+-- definition on any database migrated before it expanded. Dropping first makes
+-- Migrate converge it to the CURRENT definition on every boot. NOT VALID skips
+-- the existence scan of pre-existing rows, so Migrate can never fail on a legacy
+-- re_driven row written before F16 (when the clearance proof was recorded only
+-- in the audit event's provenance, not on the break row); the constraint is
+-- still enforced on every future INSERT/UPDATE. This is safe under concurrency
+-- because Migrate runs the whole Up section inside one transaction holding the
+-- migration advisory lock.
+ALTER TABLE agent.agent_break DROP CONSTRAINT IF EXISTS agent_break_resolved_proof;
+ALTER TABLE agent.agent_break
+    ADD CONSTRAINT agent_break_resolved_proof
+    CHECK (status NOT IN ('auto-resolved', 're_driven')
+           OR (resolved_recon_id IS NOT NULL AND length(btrim(resolved_recon_id)) > 0)) NOT VALID;
 
 -- agent.agent_audit is the append-only action ledger (Rule 5.5). No UPDATE,
 -- DELETE, or TRUNCATE statement may ever target this table; only INSERT and
@@ -182,12 +197,20 @@ CREATE TABLE IF NOT EXISTS agent.agent_audit (
 -- no two migrations execute this DDL at the same time; and it is still added
 -- NOT VALID so the scan of any pre-existing rows is skipped (agent_audit is
 -- append-only and must never be rewritten).
+-- Finding F16 grew the closed set again with the finer-grained re_drive outcome
+-- actions ('re_drive_attempted' / 're_drive_cleared' / 're_drive_unmatched' /
+-- 're_drive_failed'), so the re_drive HANDLER records cleared / still-unmatched /
+-- failed attempts as distinct immutable actions rather than one 're_driven'
+-- value. 're_driven' is retained in the domain: it remains the break STATUS of a
+-- confirmed-clearing re_drive and stays valid for any historical audit rows.
 ALTER TABLE agent.agent_audit DROP CONSTRAINT IF EXISTS agent_audit_action_domain;
 ALTER TABLE agent.agent_audit
     ADD CONSTRAINT agent_audit_action_domain
     CHECK (action IN ('classified', 'rule_proposed', 'rule_created', 'probed',
                       'resolved', 'escalated', 'accepted', 're_driven', 'rejected',
-                      'rule_compensated')) NOT VALID;
+                      'rule_compensated',
+                      're_drive_attempted', 're_drive_cleared', 're_drive_unmatched',
+                      're_drive_failed')) NOT VALID;
 
 DO $agent_audit_confidence$
 BEGIN
@@ -266,29 +289,46 @@ EXCEPTION WHEN duplicate_object THEN NULL;
 END;
 $agent_rule_outbox_status$;
 
--- agent.agent_run is the durable run-idempotency ledger (finding M-15). Serve
--- mode runs the seed fixture through the pipeline on startup; without a durable
--- marker a process restart would reprocess the SAME fixture under fresh random
--- scoped ids, permanently duplicating the break/audit history and inflating the
--- demo summary on every restart. Each distinct fixture (identified by
--- fixture_key, a deterministic content hash of the ingested CSV plus its source
--- label) gets exactly one row. BeginRun inserts a 'running' row the first time a
--- fixture is seen and records the scoped run_id it chose; CompleteRun flips that
--- row to 'completed' once the pipeline finishes. On a later boot BeginRun finds
--- the existing row: if 'completed' it reports alreadyCompleted=true (returning
--- the recorded run_id so the summary can be rebuilt from that run's rows without
--- reprocessing); if still 'running' (a crash mid-pipeline) it hands back the
--- SAME recorded run_id so the retry reuses the original id set rather than
--- forking a new duplicate history. The row is intentionally mutable (Rule 5.5
+-- agent.agent_run is the durable per-INVOCATION run ledger (findings M-15, F17).
+-- It cleanly separates two identities that finding F17 showed must not be
+-- conflated:
+--
+--   * run_id (PRIMARY KEY) — the INVOCATION identity. Every distinct pipeline
+--     invocation gets its OWN row under its own run_id. This is what lets a
+--     legitimate re-invocation of the SAME fixture (an operator re-running the
+--     demo after applying HITL decisions, or re-running after restoring a failed
+--     LLM) start a FRESH run, safely reprocess eligible work under a fresh
+--     run-scoped id set, and report current-run-only counters — instead of being
+--     silently refused as "already completed" and emitting a stale summary.
+--
+--   * fixture_key — the IMMUTABLE fixture identity: a deterministic content hash
+--     of the ingested CSV plus its source label. It is recorded on every run for
+--     provenance/observability (which fixture a run processed) and is
+--     deliberately NON-UNIQUE: many runs may share one fixture over time.
+--
+-- BeginRun inserts a 'running' row under the caller's run_id; CompleteRun flips
+-- THAT row (by run_id) to 'completed'. Idempotency is now scoped to the
+-- invocation, not the fixture content: a retry WITHIN one invocation reuses the
+-- same run_id (ON CONFLICT (run_id) DO NOTHING), so an in-process M-16 retry
+-- converges on the one run rather than forking duplicate history; a genuinely
+-- NEW invocation supplies a fresh run_id and therefore always gets a new run.
+-- Because serve mode no longer processes the fixture on boot by default (finding
+-- F01; gated behind AGENT_RUN_ON_BOOT), a plain container restart does not
+-- reprocess anything, so the previous fixture-keyed dedup is no longer needed to
+-- prevent restart duplication. The row is intentionally mutable (Rule 5.5
 -- protects only agent_audit); every break state change it gates is still written
 -- through the append-only audit trail.
 CREATE TABLE IF NOT EXISTS agent.agent_run (
-    fixture_key TEXT PRIMARY KEY,
-    run_id      TEXT NOT NULL,
+    run_id      TEXT PRIMARY KEY,
+    fixture_key TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'running',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Look up all runs of a given fixture (provenance / operator inspection). Not
+-- unique: finding F17 requires many invocations to share one fixture identity.
+CREATE INDEX IF NOT EXISTS idx_agent_run_fixture_key ON agent.agent_run (fixture_key);
 
 -- Constrain the run status to its closed lifecycle domain. Guarded DO block for
 -- idempotency (Postgres lacks "ADD CONSTRAINT IF NOT EXISTS").

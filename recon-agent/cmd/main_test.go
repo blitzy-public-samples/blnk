@@ -140,7 +140,11 @@ func (m *mockBlnk) handle(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case r.Method == http.MethodGet && path == "/health":
-		w.WriteHeader(http.StatusOK)
+		// Mirror Blnk's real liveness contract (cmd/server.go healthCheckHandler):
+		// 200 with a JSON body reporting "status":"UP". recon-agent's Ready()
+		// (finding F13) treats Blnk ready ONLY when GET /health is 200 AND the body
+		// reports UP, so the double must return the body, not a bare 200.
+		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
 
 	case r.Method == http.MethodPost && path == "/reconciliation/upload":
 		m.mu.Lock()
@@ -246,8 +250,9 @@ func (m *mockBlnk) client() *blnk.Client { return blnk.NewClient(m.srv.URL, "") 
 // ---------------------------------------------------------------------------
 
 type fakeRun struct {
-	runID     string
-	completed bool
+	runID      string
+	fixtureKey string
+	completed  bool
 }
 
 type fakeBackend struct {
@@ -279,18 +284,26 @@ func newFakeBackend() *fakeBackend {
 	return &fakeBackend{breaks: map[string]store.Break{}, runs: map[string]*fakeRun{}}
 }
 
-// preseedCompletedRun records a fixture as already completed under runID and
-// pre-populates its persisted break rows, so a runPipeline call over the same
-// fixture takes the finding-M-15 already-completed short-circuit.
+// preseedCompletedRun records an invocation as already completed under runID and
+// pre-populates its persisted break rows, so a runPipeline call that REPLAYS the
+// SAME runID takes the finding-M-15 already-completed short-circuit. Because the
+// run map is keyed by run_id (matching the real store's run_id PRIMARY KEY), a
+// runPipeline call over the same fixture under a DIFFERENT runID is unaffected —
+// exactly the F17 rerun separation.
 func (f *fakeBackend) preseedCompletedRun(fixtureKey, runID string, breaks []store.Break) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.runs[fixtureKey] = &fakeRun{runID: runID, completed: true}
+	f.runs[runID] = &fakeRun{runID: runID, fixtureKey: fixtureKey, completed: true}
 	for _, b := range breaks {
 		f.breaks[b.Classification.ExternalTxnID] = b
 	}
 }
 
+// BeginRun mirrors the real store's per-INVOCATION semantics: keyed on run_id
+// (the PRIMARY KEY), an existing run_id is resumed/replayed under its own
+// identity (ON CONFLICT (run_id) DO NOTHING), while a fresh run_id ALWAYS starts
+// a new run regardless of whether the (now non-unique) fixture was seen before —
+// the finding-F17 rerun capability.
 func (f *fakeBackend) BeginRun(_ context.Context, fixtureKey, runID string) (bool, string, error) {
 	if f.beginRunErr != nil {
 		return false, "", f.beginRunErr
@@ -298,21 +311,23 @@ func (f *fakeBackend) BeginRun(_ context.Context, fixtureKey, runID string) (boo
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.beginRunCalls++
-	if r, ok := f.runs[fixtureKey]; ok {
+	if r, ok := f.runs[runID]; ok {
 		return r.completed, r.runID, nil
 	}
-	f.runs[fixtureKey] = &fakeRun{runID: runID, completed: false}
+	f.runs[runID] = &fakeRun{runID: runID, fixtureKey: fixtureKey, completed: false}
 	return false, runID, nil
 }
 
-func (f *fakeBackend) CompleteRun(_ context.Context, fixtureKey string) error {
+// CompleteRun marks THIS invocation's run (identified by run_id) durably
+// complete, matching the real store's UPDATE ... WHERE run_id = $1.
+func (f *fakeBackend) CompleteRun(_ context.Context, runID string) error {
 	if f.completeRunErr != nil {
 		return f.completeRunErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.completeRunCalls++
-	if r, ok := f.runs[fixtureKey]; ok {
+	if r, ok := f.runs[runID]; ok {
 		r.completed = true
 		return nil
 	}
@@ -566,17 +581,20 @@ func TestRunPipeline_DrivesBlnkNativeFlow(t *testing.T) {
 	rem := &fakeRemediator{backend: backend}
 	resolved := filepath.Join(t.TempDir(), "recon_resolved.jsonl")
 
-	s, err := runPipeline(context.Background(), m.client(), rem, backend, writeTempCSV(t, happyCSV), resolved, "seed-bank")
+	s, err := runPipeline(context.Background(), m.client(), rem, backend, writeTempCSV(t, happyCSV), resolved, "seed-bank", "runtest")
 	if err != nil {
 		t.Fatalf("runPipeline returned error: %v", err)
 	}
 
-	// F-1: the pipeline now performs ONLY the upload directly; it runs NO
-	// reconciliation of its own before triage (a prior detection start+get would
-	// poison Blnk's upload-agnostic pagination cache, INFO#4 / Rule 5.8, and
-	// leave the remediator's cohort dry-run reading stale rows). Every
-	// reconciliation call now originates from the remediator's ConfirmCohortCleared
-	// (here a fake), so the pipeline's direct Blnk surface is upload only.
+	// F02/F-1: the pipeline performs ONLY the upload directly and delegates the
+	// ENTIRE reconciliation topology to the remediator's ProcessCohort — the
+	// mandated initial dry-run start+read (EstablishMainReconciliation, finding
+	// F02) and the per-break single-transaction dry-run probes (ProbeBreak,
+	// finding F18) both live inside the remediator, sharing each break's M-5
+	// mutex / M-15 lease and needing the per-break rules that ProcessCohort
+	// creates first. The pipeline itself never issues a start/get/matching-rules
+	// call. Because this test wires a FAKE remediator (which makes no HTTP calls),
+	// the mock Blnk therefore records ONLY the upload.
 	assertSubsequence(t, m.sequence(), []string{
 		"POST /reconciliation/upload",
 	})
@@ -586,7 +604,7 @@ func TestRunPipeline_DrivesBlnkNativeFlow(t *testing.T) {
 			"POST /reconciliation/start",
 			"GET /reconciliation/{id}",
 			"DELETE /reconciliation/matching-rules/{id}":
-			t.Fatalf("pipeline must not run its own detection reconciliation (F-1); saw %q in %v", req, m.sequence())
+			t.Fatalf("pipeline must delegate ALL reconciliation to the remediator (F02/F-1); saw pipeline-direct %q in %v", req, m.sequence())
 		}
 	}
 
@@ -597,7 +615,8 @@ func TestRunPipeline_DrivesBlnkNativeFlow(t *testing.T) {
 	}
 
 	// F-1: EVERY uploaded row is handed to the remediator as a candidate break
-	// (the cohort dry-run, not a pipeline-side count, decides clearance).
+	// (each break's OWN per-break dry-run probe, not a pipeline-side count,
+	// decides clearance).
 	if len(rem.handled) != 4 {
 		t.Fatalf("expected all 4 uploaded rows triaged, got %d (%v)", len(rem.handled), rem.handled)
 	}
@@ -650,7 +669,7 @@ func TestRunPipeline_EscalatedBreaksCounted(t *testing.T) {
 	rem := &fakeRemediator{backend: backend, escalate: map[string]bool{"T2": true, "T4": true}}
 	resolved := filepath.Join(t.TempDir(), "out.jsonl")
 
-	s, err := runPipeline(context.Background(), m.client(), rem, backend, writeTempCSV(t, happyCSV), resolved, "seed-bank")
+	s, err := runPipeline(context.Background(), m.client(), rem, backend, writeTempCSV(t, happyCSV), resolved, "seed-bank", "runtest")
 	if err != nil {
 		t.Fatalf("runPipeline returned error: %v", err)
 	}
@@ -698,7 +717,7 @@ func TestRunPipeline_AlreadyCompletedSkipsReprocessing(t *testing.T) {
 	}
 	backend.preseedCompletedRun(fixtureKey, runID, seeded)
 
-	s, err := runPipeline(context.Background(), m.client(), rem, backend, csvPath, resolved, "seed-bank")
+	s, err := runPipeline(context.Background(), m.client(), rem, backend, csvPath, resolved, "seed-bank", runID)
 	if err != nil {
 		t.Fatalf("runPipeline returned error: %v", err)
 	}
@@ -720,6 +739,82 @@ func TestRunPipeline_AlreadyCompletedSkipsReprocessing(t *testing.T) {
 	}
 }
 
+// TestRunPipeline_NewInvocationRerunsSameFixture proves finding F17: a NEW
+// invocation (a fresh runID) over a fixture that was ALREADY completed under a
+// PRIOR runID is NOT refused as already-completed — it starts a fresh run,
+// reprocesses every break, and reports current-run-only counters (never the
+// stale prior summary). This is the rerun/recovery capability F17 mandates,
+// enabled by separating immutable fixture identity (now non-unique) from
+// invocation identity (the run_id PRIMARY KEY). It is the exact complement of
+// TestRunPipeline_AlreadyCompletedSkipsReprocessing, which proves that replaying
+// the SAME runID still short-circuits (M-15).
+func TestRunPipeline_NewInvocationRerunsSameFixture(t *testing.T) {
+	m := newMockBlnk()
+	defer m.close()
+	backend := newFakeBackend()
+	rem := &fakeRemediator{backend: backend}
+	resolved := filepath.Join(t.TempDir(), "out.jsonl")
+
+	csvPath := writeTempCSV(t, happyCSV)
+	txns, err := loadExternalTransactions(csvPath, "seed-bank")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	fixtureKey := fixtureKeyFor("seed-bank", txns)
+
+	// A PRIOR invocation already completed this exact fixture under "oldrun",
+	// persisting a stale 2-break / 1-auto summary scoped to that old run.
+	const priorRunID = "oldrun"
+	stale := []store.Break{
+		{Classification: model.BreakClassification{ExternalTxnID: "T1-" + priorRunID, RootCause: model.RootCauseTiming}, Status: model.StatusAutoResolved},
+		{Classification: model.BreakClassification{ExternalTxnID: "T2-" + priorRunID, RootCause: model.RootCauseUnknown}, Status: model.StatusQueued},
+	}
+	backend.preseedCompletedRun(fixtureKey, priorRunID, stale)
+
+	// A genuinely NEW invocation supplies a NEW runID for the SAME fixture.
+	const newRunID = "newrun"
+	s, err := runPipeline(context.Background(), m.client(), rem, backend, csvPath, resolved, "seed-bank", newRunID)
+	if err != nil {
+		t.Fatalf("runPipeline (rerun) returned error: %v", err)
+	}
+
+	// F17: the rerun is NOT short-circuited — it uploads to Blnk and reprocesses.
+	assertSubsequence(t, m.sequence(), []string{"POST /reconciliation/upload"})
+	if len(rem.handled) != 4 {
+		t.Fatalf("F17: a new invocation must reprocess ALL breaks, got %d (%v)", len(rem.handled), rem.handled)
+	}
+	for _, id := range rem.handled {
+		if !strings.HasSuffix(id, "-"+newRunID) {
+			t.Fatalf("F17: reprocessed break %q must be scoped to the NEW run id %q", id, newRunID)
+		}
+	}
+
+	// F17: the new run is begun+completed exactly once (the preseed set state
+	// directly and did NOT go through BeginRun/CompleteRun, so these counters
+	// reflect ONLY the rerun — proving BeginRun did not take the completed
+	// short-circuit).
+	if backend.beginRunCalls != 1 || backend.completeRunCalls != 1 {
+		t.Fatalf("expected the rerun to Begin+Complete exactly once, got Begin=%d Complete=%d", backend.beginRunCalls, backend.completeRunCalls)
+	}
+
+	// F17: current-run-only counters — the fresh 4-break run, NOT the stale
+	// prior 2-break / 1-auto summary.
+	if s.breaksIn != 4 || s.autoResolved != 4 || s.escalated != 0 {
+		t.Fatalf("F17: rerun summary must reflect ONLY the current run (4/4/0), got %+v", s)
+	}
+	if s.auditCount != 4 {
+		t.Fatalf("F17: expected 4 current-run-scoped audit events, got %d", s.auditCount)
+	}
+
+	// Both runs persist as distinct invocation rows sharing the one fixture.
+	backend.mu.Lock()
+	nRuns := len(backend.runs)
+	backend.mu.Unlock()
+	if nRuns != 2 {
+		t.Fatalf("F17: expected 2 distinct invocation rows (prior + rerun) sharing one fixture, got %d", nRuns)
+	}
+}
+
 func TestRunPipeline_BeginRunErrorIsFatal(t *testing.T) {
 	m := newMockBlnk()
 	defer m.close()
@@ -728,7 +823,7 @@ func TestRunPipeline_BeginRunErrorIsFatal(t *testing.T) {
 	rem := &fakeRemediator{backend: backend}
 
 	_, err := runPipeline(context.Background(), m.client(), rem, backend,
-		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank")
+		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank", "runtest")
 	if err == nil {
 		t.Fatalf("expected BeginRun error to be fatal, got nil")
 	}
@@ -745,7 +840,7 @@ func TestRunPipeline_CompleteRunErrorIsFatal(t *testing.T) {
 	rem := &fakeRemediator{backend: backend}
 
 	_, err := runPipeline(context.Background(), m.client(), rem, backend,
-		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank")
+		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank", "runtest")
 	if err == nil {
 		t.Fatalf("expected CompleteRun error to be fatal, got nil")
 	}
@@ -762,7 +857,7 @@ func TestRunPipeline_MissingCSVReturnsErrorAndCallsNoBlnk(t *testing.T) {
 	rem := &fakeRemediator{backend: backend}
 
 	_, err := runPipeline(context.Background(), m.client(), rem, backend,
-		filepath.Join(t.TempDir(), "does-not-exist.csv"), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank")
+		filepath.Join(t.TempDir(), "does-not-exist.csv"), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank", "runtest")
 	if err == nil {
 		t.Fatalf("expected error for a missing CSV, got nil")
 	}
@@ -779,7 +874,7 @@ func TestRunPipeline_UploadFailurePropagates(t *testing.T) {
 	rem := &fakeRemediator{backend: backend}
 
 	_, err := runPipeline(context.Background(), m.client(), rem, backend,
-		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank")
+		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank", "runtest")
 	if err == nil {
 		t.Fatalf("expected error when upload fails, got nil")
 	}
@@ -796,7 +891,7 @@ func TestRunPipeline_UploadCountMismatchIsFatal(t *testing.T) {
 	rem := &fakeRemediator{backend: backend}
 
 	_, err := runPipeline(context.Background(), m.client(), rem, backend,
-		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank")
+		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank", "runtest")
 	if err == nil {
 		t.Fatalf("expected error on upload record_count mismatch, got nil")
 	}
@@ -805,11 +900,14 @@ func TestRunPipeline_UploadCountMismatchIsFatal(t *testing.T) {
 // NOTE: the former TestRunPipeline_StartFailurePropagates,
 // TestRunPipeline_ReconFailedStatusIsFatal and TestRunPipeline_CreateRuleFailurePropagates
 // tested failures of the pipeline's OWN detection reconciliation (start / get /
-// create-rule). The F-1 fix removed that detection step — all reconciliation now
-// lives inside the remediator's cohort dry-run — so those pipeline-level failure
-// modes no longer exist here. Their equivalents (start-instant failure, failed
+// create-rule). The F-1 fix removed that detection step — the whole
+// reconciliation topology (the F02 initial dry-run start+read via
+// EstablishMainReconciliation and the per-break dry-run probes via ProbeBreak)
+// now lives inside the remediator — so those pipeline-level failure modes no
+// longer exist here. Their equivalents (start / start-instant failure, failed
 // status, rule-create failure) are exercised in internal/blnk/client_test.go
-// (ConfirmCohortCleared*) and internal/remediator/remediator_test.go.
+// (EstablishMainReconciliation* / ProbeBreak*) and
+// internal/remediator/remediator_test.go.
 
 func TestRunPipeline_RemediatorErrorPropagates(t *testing.T) {
 	m := newMockBlnk()
@@ -818,7 +916,7 @@ func TestRunPipeline_RemediatorErrorPropagates(t *testing.T) {
 	rem := &fakeRemediator{backend: backend, err: fmt.Errorf("boom")}
 
 	_, err := runPipeline(context.Background(), m.client(), rem, backend,
-		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank")
+		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), "o.jsonl"), "seed-bank", "runtest")
 	if err == nil {
 		t.Fatalf("expected error to propagate from the remediator, got nil")
 	}
@@ -831,7 +929,7 @@ func TestRunPipeline_RejectsCommittedCorpusPath(t *testing.T) {
 	rem := &fakeRemediator{backend: backend}
 
 	_, err := runPipeline(context.Background(), m.client(), rem, backend,
-		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), committedCorpusBase), "seed-bank")
+		writeTempCSV(t, happyCSV), filepath.Join(t.TempDir(), committedCorpusBase), "seed-bank", "runtest")
 	if err == nil {
 		t.Fatalf("expected runPipeline to refuse the committed corpus basename, got nil")
 	}
@@ -845,8 +943,8 @@ func TestDeriveBreaks(t *testing.T) {
 	txns := []blnk.ExternalTransaction{{ID: "A"}, {ID: "B"}, {ID: "C"}, {ID: "D"}}
 
 	// The F-1 fix removed the pipeline's own detection reconciliation: EVERY
-	// uploaded row is now a candidate break (the remediator's cohort dry-run,
-	// not a pipeline-side count, decides clearance). deriveBreaks therefore
+	// uploaded row is now a candidate break (each break's OWN per-break dry-run
+	// probe, not a pipeline-side count, decides clearance). deriveBreaks therefore
 	// returns all rows.
 	got := deriveBreaks(txns)
 	if len(got) != len(txns) {
@@ -1428,6 +1526,142 @@ func TestRunStartupPipeline_ContextCancelled(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// F01: default serve-only boot (awaitServeReadiness) — the container must NEVER
+// process the baked fixture merely because it started; the six-break run is the
+// explicit `make demo` one-shot AFTER `make seed`.
+// ---------------------------------------------------------------------------
+
+// TestAwaitServeReadiness_FlipsReadyWithoutRunningPipeline proves the finding-F01
+// default: once dependencies are reachable, the serve-only boot marks the HITL
+// surface ready BUT never uploads/processes the fixture and never touches the run
+// lifecycle. This is the exact regression guard against re-introducing a
+// boot-time pipeline that would triage against an un-seeded Blnk.
+func TestAwaitServeReadiness_FlipsReadyWithoutRunningPipeline(t *testing.T) {
+	shrinkStartupTimers(t)
+	m := newMockBlnk()
+	defer m.close()
+	backend := newFakeBackend()
+	rs := &fakeReadySetter{}
+
+	awaitServeReadiness(context.Background(), rs, m.client(), backend)
+
+	// The HITL surface is flipped ready once deps are reachable...
+	if !rs.isReady() {
+		t.Fatal("F01: serve-only boot must flip the HITL surface ready once dependencies are reachable")
+	}
+	// ...but the baked fixture is NEVER processed on boot: no upload, no
+	// start/get, and no run-lifecycle bookkeeping.
+	if m.uploadCount() != 0 {
+		t.Fatalf("F01: serve-only boot must NOT upload/process the fixture, got %d upload(s)", m.uploadCount())
+	}
+	for _, req := range m.sequence() {
+		if strings.Contains(req, "upload") || strings.Contains(req, "start") {
+			t.Fatalf("F01: serve-only boot must issue no pipeline calls, saw %q in %v", req, m.sequence())
+		}
+	}
+	if backend.beginRunCalls != 0 || backend.completeRunCalls != 0 {
+		t.Fatalf("F01: serve-only boot must not begin/complete any run, got Begin=%d Complete=%d", backend.beginRunCalls, backend.completeRunCalls)
+	}
+}
+
+// TestAwaitServeReadiness_StaysNotReadyWhenDepsDown proves the serve-only boot
+// never reports a false-green: when a dependency never comes up it leaves the
+// server not-ready (for operator review) and still never runs the pipeline. A
+// short context bounds the otherwise-30s readiness budget for the test.
+func TestAwaitServeReadiness_StaysNotReadyWhenDepsDown(t *testing.T) {
+	shrinkStartupTimers(t)
+	backend := newFakeBackend()
+	rs := &fakeReadySetter{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	awaitServeReadiness(ctx, rs, &fakeProbe{alwaysErr: true}, backend)
+
+	if rs.isReady() {
+		t.Fatal("F01: serve-only boot must NOT report ready when a dependency never comes up (no false-green)")
+	}
+	if backend.beginRunCalls != 0 {
+		t.Fatalf("F01: serve-only boot must never begin a run, got %d", backend.beginRunCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// F01: true-SQL-readiness gate (awaitSQLReady) — run() must wait until the DB
+// can actually SERVE a query (SELECT 1) before migrating, so a pg_isready /
+// TCP-ready-but-not-query-ready window no longer fatals the boot migration with
+// an opaque "connection reset".
+// ---------------------------------------------------------------------------
+
+// fakeSQLReadier models a database that answers SELECT 1 only after an initial
+// warming window (or never, when alwaysErr is set).
+type fakeSQLReadier struct {
+	failFirst int
+	calls     int
+	alwaysErr bool
+}
+
+func (f *fakeSQLReadier) SelectOne(context.Context) error {
+	f.calls++
+	if f.alwaysErr {
+		return fmt.Errorf("connection reset by peer")
+	}
+	if f.calls <= f.failFirst {
+		return fmt.Errorf("the database system is starting up")
+	}
+	return nil
+}
+
+// TestAwaitSQLReady_SucceedsAfterInitialFailures proves the finding-F01 wait
+// rides out the brief window where PostgreSQL accepts connections but cannot yet
+// answer a query, returning nil on the first SELECT 1 that succeeds.
+func TestAwaitSQLReady_SucceedsAfterInitialFailures(t *testing.T) {
+	oldInterval := readinessInterval
+	readinessInterval = time.Millisecond
+	defer func() { readinessInterval = oldInterval }()
+
+	sr := &fakeSQLReadier{failFirst: 2}
+	if err := awaitSQLReady(context.Background(), sr, 2*time.Second); err != nil {
+		t.Fatalf("awaitSQLReady must succeed once SELECT 1 answers, got %v", err)
+	}
+	if sr.calls < 3 {
+		t.Fatalf("expected the probe to retry until success, got %d probe(s)", sr.calls)
+	}
+}
+
+// TestAwaitSQLReady_TimesOutWhenNeverReady proves the wait is bounded: if the DB
+// never answers, awaitSQLReady returns a descriptive timeout error (so run()
+// fails deterministically rather than hanging or crashing mid-migration).
+func TestAwaitSQLReady_TimesOutWhenNeverReady(t *testing.T) {
+	oldInterval := readinessInterval
+	readinessInterval = time.Millisecond
+	defer func() { readinessInterval = oldInterval }()
+
+	sr := &fakeSQLReadier{alwaysErr: true}
+	err := awaitSQLReady(context.Background(), sr, 60*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("awaitSQLReady must time out when the DB never answers, got %v", err)
+	}
+	if sr.calls < 1 {
+		t.Fatal("expected at least one probe before timing out")
+	}
+}
+
+// TestAwaitSQLReady_ContextCancelled proves the wait honors shutdown: a cancelled
+// context ends the probe loop promptly with the context error.
+func TestAwaitSQLReady_ContextCancelled(t *testing.T) {
+	oldInterval := readinessInterval
+	readinessInterval = 50 * time.Millisecond
+	defer func() { readinessInterval = oldInterval }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sr := &fakeSQLReadier{alwaysErr: true}
+	if err := awaitSQLReady(ctx, sr, time.Hour); err == nil {
+		t.Fatal("awaitSQLReady must return an error when the context is cancelled")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers: date parsing, CSV round-trip, summary printing
 // ---------------------------------------------------------------------------
 
@@ -1532,8 +1766,10 @@ func TestRunOnce_PipelineErrorPropagates(t *testing.T) {
 // helper) exercised the pipeline's own pollReconciliation loop, which the F-1
 // fix removed along with the detection reconciliation. The equivalent poll-to-
 // terminal / failed-status / context-cancel branches are now covered by
-// internal/blnk/client_test.go's ConfirmCohortCleared* tests, since all
-// reconciliation polling now lives inside the blnk client's cohort dry-run.
+// internal/blnk/client_test.go's EstablishMainReconciliation* and ProbeBreak*
+// tests, since all reconciliation polling now lives inside the blnk client's
+// initial dry-run (EstablishMainReconciliation) and per-break dry-run probes
+// (ProbeBreak).
 
 // ---------------------------------------------------------------------------
 // scopedSummary — each id-scoped query's error branch (finding M-14). The

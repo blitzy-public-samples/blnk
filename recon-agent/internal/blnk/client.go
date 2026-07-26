@@ -29,22 +29,43 @@ const (
 	routeReconByID     = "/reconciliation/" // + reconciliation id
 	routeMatchingRules = "/reconciliation/matching-rules"
 
-	// routeReadinessProbe is a sentinel reconciliation id used by Ready to
-	// exercise the AUTHENTICATED GET /reconciliation/:id contract (M-05, Rule
-	// 5.1). Blnk returns 404 for an unknown id ONLY after the request has passed
-	// API-key auth, so a 200/404 response proves both that the reconciliation
-	// surface is reachable AND that the agent's X-Blnk-Key is accepted. Readiness
-	// therefore stays strictly within the mandated /reconciliation/* surface
-	// instead of calling Blnk's out-of-scope /health endpoint, and it no longer
-	// treats an auth failure (401/403) or a server error (5xx) as "ready".
-	routeReadinessProbe = "recon-agent-readiness-probe"
+	// routeHealth is Blnk's liveness endpoint. Ready GETs it to confirm Blnk is
+	// reachable (finding F13). Unlike the former sentinel-reconciliation-id probe
+	// — which requested a deliberately nonexistent reconciliation id and made
+	// Blnk log a spurious ERROR on every agent boot — GET /health is a
+	// purpose-built, auth-bypassed liveness signal (Blnk cmd/server.go
+	// healthCheckHandler; api/middleware/auth.go skips auth for "/health") that
+	// returns 200 {"status":"UP"} when healthy and NEVER emits an error log.
+	// Readiness therefore produces no misleading Blnk errors. Reaching /health is
+	// consistent with Rule 5.1: it is a read-only liveness check on the same Blnk
+	// service that hosts the /reconciliation/* routes, not a bypass of them.
+	routeHealth = "/health"
 
-	// probeStrategy is the reconciliation strategy used by ProbeBreak. A single
-	// external transaction is probed one-to-one against the internal ledger.
-	// Blnk accepts {one_to_one, one_to_many, many_to_one}; one_to_one is the
-	// documented default for per-transaction reconciliation. It aliases the
-	// exported StrategyOneToOne so the literal is declared exactly once.
-	probeStrategy = StrategyOneToOne
+	// probeStrategy is the reconciliation strategy used by ProbeBreak and
+	// EstablishMainReconciliation. It is MANY-TO-ONE, not one-to-one, and this
+	// choice is load-bearing for correctness (findings F02/F18, Rule 5.8).
+	//
+	// Blnk accepts {one_to_one, one_to_many, many_to_one}. A one_to_one probe
+	// reads the external side through GetExternalTransactionsPaginated, whose
+	// cache key (Blnk database/reconciliation.go) is (batch_size, offset) and
+	// OMITS the upload id, so within its 5-minute TTL a SECOND single-transaction
+	// probe silently reads the FIRST probe's cached page instead of its own — a
+	// protected-core defect (Rule 5.8 / AAP §0.6.2) that makes sequential
+	// per-break one_to_one probes collide and return each other's verdict. A
+	// many_to_one probe instead reads the external side through
+	// FetchAndGroupExternalTransactions, whose cache key INCLUDES the upload id,
+	// so each probe's OWN ephemeral upload keys a distinct entry and sequential
+	// per-break probes never collide. many_to_one is therefore the only
+	// cache-safe way to adjudicate each break with its own dry-run over Blnk's
+	// count-only HTTP surface without touching its protected core.
+	probeStrategy = StrategyManyToOne
+
+	// probeGroupingCriteria is the grouping field ProbeBreak and
+	// EstablishMainReconciliation pass to Blnk's many_to_one reconciler. Blnk
+	// groups the external side by this field; "reference" is a stable,
+	// always-present field on every external transaction the agent submits, so
+	// grouping is deterministic and never empty.
+	probeGroupingCriteria = "reference"
 )
 
 // Exported Blnk-wire vocabulary (finding m-01): the single source of truth for
@@ -57,8 +78,17 @@ const (
 // Blnk's HTTP contract, not the agent's domain, making internal/blnk their
 // correct home.
 const (
-	// StrategyOneToOne is Blnk's per-transaction reconciliation strategy.
+	// StrategyOneToOne is Blnk's per-transaction reconciliation strategy. It is
+	// retained as part of the exported Blnk-wire vocabulary but is deliberately
+	// NOT used for the agent's per-break probes: sequential one_to_one probes
+	// collide on Blnk's upload-agnostic external-transaction pagination cache
+	// (see probeStrategy). The agent probes with StrategyManyToOne instead.
 	StrategyOneToOne = "one_to_one"
+	// StrategyManyToOne is Blnk's many-to-one reconciliation strategy. The agent
+	// probes each break with it because its external-side read is upload-scoped
+	// (cache key includes the upload id), so per-break probes never collide (see
+	// probeStrategy, findings F02/F18/Rule 5.8).
+	StrategyManyToOne = "many_to_one"
 	// ReconStatusCompleted is Blnk's terminal "run finished" status.
 	ReconStatusCompleted = "completed"
 	// ReconStatusFailed is Blnk's terminal "run failed" status.
@@ -166,23 +196,32 @@ func sameOrigin(a, b *url.URL) bool {
 	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
 }
 
-// Ready reports whether Blnk's reconciliation API is reachable AND the agent is
-// authenticated, by issuing an AUTHENTICATED GET /reconciliation/:id against a
-// sentinel id (M-05, Rule 5.1). cmd/main.go calls it (with bounded retries) to
-// await dependency readiness before running the pipeline, so the agent never
-// triages against a not-yet-up Blnk and reports a false-green result.
+// Ready reports whether Blnk is reachable, by issuing a read-only GET /health
+// (finding F13). cmd/main.go calls it (with bounded retries) to await dependency
+// readiness before running the pipeline, so the agent never triages against a
+// not-yet-up Blnk and reports a false-green result; the HITL /readyz handler
+// calls it (bounded) so readiness reflects the Blnk dependency truthfully rather
+// than reporting ready while Blnk is down (finding F08).
 //
-// The readiness contract stays strictly within the mandated /reconciliation/*
-// surface (never Blnk's out-of-scope /health) and requires an EXPECTED status:
+// Probing GET /health — Blnk's purpose-built, auth-bypassed liveness endpoint —
+// rather than the former sentinel GET /reconciliation/:id is what fixed F13: the
+// sentinel probe requested a deliberately nonexistent reconciliation id and made
+// Blnk log a spurious ERROR on every agent boot, whereas /health never logs an
+// error. Reaching /health is consistent with Rule 5.1: it is a read-only
+// liveness check on the SAME Blnk service that hosts the /reconciliation/*
+// routes, not a bypass of them. The readiness verdict requires an EXPECTED
+// healthy response:
 //
-//   - 200 or 404 => ready. The request passed Blnk's API-key auth middleware and
-//     the route answered; 404 simply means the sentinel id does not exist, which
-//     is the expected healthy response for an unknown id.
-//   - transport error, 401/403 (auth failure), 400, or 5xx => NOT ready. Unlike
-//     the previous implementation, an auth failure or server error is no longer
-//     treated as "ready".
+//   - 200 with an "UP" status body => ready.
+//   - transport error, or any non-200 (including a 503 "DOWN" when a Blnk
+//     dependency such as its DB is degraded) => NOT ready. A degraded Blnk is
+//     correctly reported as not-ready rather than mistaken for reachable.
 func (c *Client) Ready(ctx context.Context) error {
-	req, err := c.newJSONRequest(ctx, http.MethodGet, routeReconByID+routeReadinessProbe, nil)
+	// F13: probe Blnk's purpose-built liveness endpoint (GET /health) rather than
+	// a deliberately nonexistent reconciliation id. The former sentinel probe
+	// made Blnk log a spurious ERROR on every agent boot; /health is auth-bypassed
+	// and never logs an error, so readiness produces no misleading Blnk errors.
+	req, err := c.newJSONRequest(ctx, http.MethodGet, routeHealth, nil)
 	if err != nil {
 		return err
 	}
@@ -191,13 +230,15 @@ func (c *Client) Ready(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, c.maxRespBytes))
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusNotFound:
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, c.maxRespBytes))
+	// Blnk returns 200 {"status":"UP"} when healthy and 503 {"status":"DOWN"}
+	// when a dependency (config/DB) is unavailable. Ready ONLY when Blnk reports
+	// 200 AND an UP status, so a degraded Blnk (or any non-200) is correctly
+	// reported as not-ready rather than being mistaken for reachable.
+	if resp.StatusCode == http.StatusOK && strings.Contains(string(body), "UP") {
 		return nil
-	default:
-		return fmt.Errorf("blnk not ready: GET %s returned status %d", req.URL.Path, resp.StatusCode)
 	}
+	return fmt.Errorf("blnk not ready: GET %s returned status %d", req.URL.Path, resp.StatusCode)
 }
 
 // UploadExternalData uploads an external statement via multipart/form-data
@@ -319,34 +360,43 @@ func (c *Client) DeleteMatchingRule(ctx context.Context, ruleID string) error {
 	return c.do(req, http.StatusOK, nil)
 }
 
-// ProbeBreak is the SINGLE-TRANSACTION break-identity bridge and a
-// DETERMINISTIC ARBITER (Rule 5.3) for whether one break is cleared. It submits
-// a SINGLE external transaction through POST /reconciliation/start-instant with
-// dry_run=true, then polls GET /reconciliation/:id until the (asynchronous) run
-// reaches a terminal status and inspects the integer unmatched count:
+// ProbeBreak is the SINGLE-TRANSACTION break-identity bridge and the
+// DETERMINISTIC ARBITER (Rule 5.3) for whether ONE break is cleared. It is the
+// unit of per-break adjudication used BOTH by the automated pipeline (to confirm
+// an auto-remediation, findings F02/F18) AND by the human-triggered HITL
+// re_drive of a single break (finding F16). It submits a SINGLE external
+// transaction through POST /reconciliation/start-instant with dry_run=true and
+// strategy=many_to_one, then polls GET /reconciliation/:id until the
+// (asynchronous) run reaches a terminal status and reads Blnk's integer counts.
 //
-//	unmatched_transactions == 0  => cleared = true  (the break resolved)
-//	unmatched_transactions == 1  => cleared = false (still a break)
+// VERDICT — matched_transactions >= 1 (NOT unmatched == 0). Under many_to_one
+// Blnk drives the reconciliation over the INTERNAL ledger and groups the
+// external side by reference; the run's unmatched count therefore includes
+// UNRELATED internal bookings that share no external counterpart and is NOT a
+// clean signal for a single external probe. The matched count, however, is
+// clean: because the probe submits EXACTLY ONE external transaction, any match
+// Blnk reports necessarily involves THAT transaction. Hence:
 //
-// reconID is the reconciliation id of the probe; callers record it on the
-// resulting audit event. A failed run or a timeout is returned as an error so
-// the caller can fail closed (Rule 5.7) and route the break to HITL. LLM
-// confidence must never substitute for this deterministic check.
+//	matched_transactions >= 1  => cleared = true  (Blnk matched the break)
+//	matched_transactions == 0  => cleared = false (still an unmatched break)
 //
-// RESIDUAL CACHE LIMITATION (findings C-02/C-03, Rule 5.8). Because ProbeBreak
-// submits each probe as its OWN ephemeral single-transaction upload, running
-// several probes in sequence trips a defect in Blnk's PROTECTED core: the
-// external-transaction pagination cache
-// (database/reconciliation.go GetExternalTransactionsPaginated) keys ONLY on
-// (batch_size, offset) and OMITS the upload id, so within its 5-minute TTL every
-// later probe reads the FIRST probe's cached row instead of its own. That core
-// defect must NOT be modified (Rule 5.8 / AAP §0.6.2). ProbeBreak is therefore
-// retained ONLY for the single, human-triggered HITL re_drive of one break — a
-// lone, non-sequential invocation for which the collision does not manifest. The
-// automated pipeline's clearance confirmation instead uses ConfirmCohortCleared
-// below, which submits the whole eligible cohort as ONE dedicated dry-run — the
-// run's single COLD read — so per-break clearance is attributable (unmatched==0
-// proves every cohort row cleared) rather than inferred from an aggregate count.
+// COLLISION-FREE PER-BREAK PROBING (findings F02/F18, Rule 5.8). Each probe is
+// its OWN ephemeral single-transaction upload. Under many_to_one, Blnk reads the
+// external side through FetchAndGroupExternalTransactions, whose cache key
+// INCLUDES the upload id, so each probe keys a DISTINCT cache entry and
+// sequential per-break probes never read each other's page. (A one_to_one probe
+// would instead read through GetExternalTransactionsPaginated, whose cache key
+// OMITS the upload id — a protected-core defect, Rule 5.8 / AAP §0.6.2 — making
+// sequential one_to_one probes collide within the cache's 5-minute TTL. That is
+// precisely why the agent probes with many_to_one.) This lets the pipeline
+// adjudicate EACH break with its OWN dry-run and resolve the confirmed ones
+// independently, even when a sibling break in the same run remains unmatched
+// (F18) — replacing the earlier all-or-nothing whole-cohort dry-run.
+//
+// reconID is the reconciliation id of the probe; callers record it as the
+// clearance proof on the resulting audit event (Rule 5.3). A failed run or a
+// timeout is returned as an error so the caller can fail closed (Rule 5.7) and
+// route the break to HITL. LLM confidence must never substitute for this check.
 func (c *Client) ProbeBreak(ctx context.Context, txn ExternalTransaction, matchingRuleIDs []string) (cleared bool, reconID string, err error) {
 	// Double-persist elimination (findings F3/F8). Blnk's start-instant
 	// UNCONDITIONALLY persists every submitted external transaction by its OWN id
@@ -374,6 +424,7 @@ func (c *Client) ProbeBreak(ctx context.Context, txn ExternalTransaction, matchi
 	reconID, err = c.InstantReconciliation(ctx, InstantReconciliationRequest{
 		ExternalTransactions: []ExternalTransaction{probeTxn},
 		Strategy:             probeStrategy,
+		GroupingCriteria:     probeGroupingCriteria,
 		DryRun:               true,
 		MatchingRuleIDs:      matchingRuleIDs,
 	})
@@ -392,7 +443,10 @@ func (c *Client) ProbeBreak(ctx context.Context, txn ExternalTransaction, matchi
 		if gErr == nil {
 			switch recon.Status {
 			case statusCompleted:
-				return recon.UnmatchedTransactions == 0, reconID, nil
+				// matched >= 1 proves Blnk matched the single probed transaction
+				// (see the VERDICT note above). unmatched is NOT consulted: under
+				// many_to_one it is contaminated by unrelated internal bookings.
+				return recon.MatchedTransactions >= 1, reconID, nil
 			case statusFailed:
 				return false, reconID, fmt.Errorf("probe reconciliation %s failed", reconID)
 			}
@@ -406,75 +460,50 @@ func (c *Client) ProbeBreak(ctx context.Context, txn ExternalTransaction, matchi
 	}
 }
 
-// ConfirmCohortCleared is the cache-safe, PER-BREAK-ATTRIBUTABLE deterministic
-// arbiter (Rule 5.3) for whether EVERY break in an auto-remediation cohort left
-// the unmatched set. It submits the WHOLE cohort as a SINGLE dry-run
-// reconciliation over a DEDICATED ephemeral upload (via start-instant,
-// one_to_one) carrying the cohort's proposed matching rules, polls it to a
-// terminal status, then reads Blnk's authoritative integer counts and reports:
+// EstablishMainReconciliation runs the pipeline's INITIAL reconciliation over
+// the already-uploaded statement and returns its reconciliation id (the
+// "main_recon_id"). It implements the mandated Upload -> start -> read topology
+// (finding F02): it POSTs /reconciliation/start for the given upload with
+// dry_run=true, then polls GET /reconciliation/:id until the (asynchronous) run
+// reaches a terminal status, so the returned id is the id of a reconciliation
+// Blnk actually completed. Callers persist it as each break's main_recon_id
+// provenance, giving every break a directly traceable pointer to the batch
+// reconciliation that surfaced it (findings F02/F13).
 //
-//	cleared == (unmatched == 0 && matched+unmatched == len(cohort))
+// It is a DRY RUN: it never mutates Blnk state, consistent with the deterministic
+// arbiter rule (Rule 5.3) that only a Blnk dry-run — never LLM confidence — may
+// speak to clearance. Blnk requires at least one matching rule id for both
+// /reconciliation/start and /reconciliation/start-instant, so the caller passes
+// the ids of the rules it created for this run's auto-eligible breaks; the
+// initial run's integer counts are not consulted for any per-break decision
+// (those come from the individual ProbeBreak dry-runs), so the specific rules
+// only need to be valid.
 //
-// WHY A COHORT (finding F-1, Rule 5.3). Blnk's HTTP surface returns only integer
-// counts, never the unmatched id list, and its matcher applies each rule
-// GLOBALLY to every row of the reconciled set. The earlier
-// ConfirmClearedOverUpload confirmed a single break by re-reconciling the FULL
-// statement upload with that break's rule and declaring success when the
-// aggregate unmatched count merely dropped below a baseline. Because a relaxed
-// timing rule ({amount,currency,reference} equality) matches ANY row sharing
-// that profile, a genuinely un-clearable break (e.g. a mis-labelled
-// missing_internal posting, or a duplicate) could ride the count-drop caused by
-// an UNRELATED row and be falsely auto-resolved with a reconciliation id whose
-// unmatched set still contained it — the exact F-1 / Rule 5.3 violation.
-// Reconciling a DEDICATED upload that contains ONLY the cohort's rows removes
-// that ambiguity: unmatched == 0 proves Blnk moved EVERY one of the cohort's
-// rows out of the unmatched set, so clearance is attributable to the whole
-// cohort with no unrelated row able to mask a residual break. The caller
-// resolves the cohort only on a true verdict and otherwise fails every member
-// closed to HITL (Rule 5.7).
+// STRATEGY. It uses many_to_one with reference grouping — the SAME cache-safe
+// strategy as ProbeBreak (see probeStrategy) — so the initial run over the real
+// upload cannot poison the per-break probes: FetchAndGroupExternalTransactions
+// keys its cache on the upload id, and the real upload's id differs from every
+// probe's ephemeral upload id, so their cache entries are disjoint.
 //
-// CARDINALITY GUARD (INFO#4, Rule 5.8). Blnk's external-transaction pagination
-// cache (database/reconciliation.go GetExternalTransactionsPaginated) keys ONLY
-// on (batch_size, offset) and OMITS the upload id; within its 5-minute TTL a
-// reconciliation can read a DIFFERENT upload's cached page. That defect lives in
-// Blnk's PROTECTED core and MUST NOT be modified (Rule 5.8 / AAP §0.6.2). The
-// matched+unmatched == len(cohort) guard makes such a stale read FAIL CLOSED: if
-// Blnk processed a page whose row count differs from the cohort size, the guard
-// reports NOT cleared, so a stale cache read can never falsely resolve a break —
-// it degrades to HITL routing. For a cache HIT to be benign the caller MUST run
-// this as the run's COLD read (no prior reconciliation this run); the pipeline
-// removed its detection reconciliation precisely so this cohort confirm is that
-// single cold read.
-//
-// FRESH IDS (findings F3/F8). Blnk's start-instant UNCONDITIONALLY persists each
-// submitted external transaction by its own id (plain INSERT, no ON CONFLICT),
-// EVEN under dry_run, and blnk.external_transactions keys on the id, so
-// resubmitting a real break id collides on external_transactions_pkey (HTTP
-// 500). Because Blnk matches FIELD-TO-FIELD and never by id (reconciliation.go
-// matchesRules), every cohort member is copied with a fresh ephemeral
-// "cohort-<uuid>" id that preserves all matchable fields; the verdict is
-// identical but no id is ever inserted twice, so repeated confirms across a run
-// and across reruns against a shared Blnk database never collide. The caller's
-// slice and elements are left unmodified (each cohort entry is copied).
-func (c *Client) ConfirmCohortCleared(ctx context.Context, cohort []ExternalTransaction, matchingRuleIDs []string) (cleared bool, reconID string, err error) {
-	if len(cohort) == 0 {
-		return false, "", fmt.Errorf("confirm cohort cleared: empty cohort")
+// A start error, a failed run, or a timeout is returned to the caller so a
+// missing initial reconciliation surfaces rather than being silently ignored.
+func (c *Client) EstablishMainReconciliation(ctx context.Context, uploadID string, matchingRuleIDs []string) (reconID string, err error) {
+	if strings.TrimSpace(uploadID) == "" {
+		return "", fmt.Errorf("establish main reconciliation: empty upload id")
+	}
+	if len(matchingRuleIDs) == 0 {
+		return "", fmt.Errorf("establish main reconciliation: at least one matching rule id is required")
 	}
 
-	cohortCopy := make([]ExternalTransaction, len(cohort))
-	for i, txn := range cohort {
-		txn.ID = "cohort-" + uuid.NewString()
-		cohortCopy[i] = txn
-	}
-
-	reconID, err = c.InstantReconciliation(ctx, InstantReconciliationRequest{
-		ExternalTransactions: cohortCopy,
-		Strategy:             probeStrategy,
-		DryRun:               true,
-		MatchingRuleIDs:      matchingRuleIDs,
+	reconID, err = c.StartReconciliation(ctx, StartReconciliationRequest{
+		UploadID:         uploadID,
+		Strategy:         probeStrategy,
+		GroupingCriteria: probeGroupingCriteria,
+		DryRun:           true,
+		MatchingRuleIDs:  matchingRuleIDs,
 	})
 	if err != nil {
-		return false, "", fmt.Errorf("confirm cohort start-instant: %w", err)
+		return "", fmt.Errorf("establish main reconciliation start: %w", err)
 	}
 
 	pollCtx, cancel := context.WithTimeout(ctx, c.probeTimeout)
@@ -488,21 +517,14 @@ func (c *Client) ConfirmCohortCleared(ctx context.Context, cohort []ExternalTran
 		if gErr == nil {
 			switch recon.Status {
 			case statusCompleted:
-				// Deterministic arbiter (Rule 5.3): cleared iff Blnk moved EVERY
-				// cohort row out of the unmatched set (unmatched == 0) AND the run
-				// actually processed the whole cohort (cardinality guard against a
-				// stale cache page). Either condition failing => NOT cleared => the
-				// caller fails every cohort member closed to HITL.
-				cleared = recon.UnmatchedTransactions == 0 &&
-					recon.MatchedTransactions+recon.UnmatchedTransactions == len(cohort)
-				return cleared, reconID, nil
+				return reconID, nil
 			case statusFailed:
-				return false, reconID, fmt.Errorf("confirm cohort reconciliation %s failed", reconID)
+				return reconID, fmt.Errorf("main reconciliation %s failed", reconID)
 			}
 		}
 		select {
 		case <-pollCtx.Done():
-			return false, reconID, fmt.Errorf("confirm cohort reconciliation %s did not complete: %w", reconID, pollCtx.Err())
+			return reconID, fmt.Errorf("main reconciliation %s did not complete: %w", reconID, pollCtx.Err())
 		case <-ticker.C:
 			// poll again
 		}

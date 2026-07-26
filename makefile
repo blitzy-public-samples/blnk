@@ -112,7 +112,7 @@ DEMO_LLM_ADDR=127.0.0.1:11434
 # routing safety, audit parity) are meaningful. Blnk still DECIDES every
 # clearance via its own dry-run reconciliation (Rule 5.3); the stub only supplies
 # the language-inference step. Production inference uses the real LLM_BASE_URL
-# from the environment (docker-compose / .env), not this stub.
+# from the environment (docker compose / .env), not this stub.
 #
 # A hard <=$(DEMO_TIMEOUT)s deadline bounds the pipeline. The stub is started in
 # the background and trap-killed on exit. Requires a reachable Blnk (BLNK_BASE_URL)

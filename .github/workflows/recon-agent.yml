@@ -130,7 +130,7 @@ jobs:
       - name: recon-agent image builds (C-04 — fixture packaged; root build context)
         run: docker build -t recon-agent:ci -f recon-agent/Dockerfile .
 
-      - name: docker-compose configuration is valid
+      - name: docker compose configuration is valid (Compose v2 CLI)
         run: docker compose -f docker-compose.yaml config >/dev/null
 
   test:
@@ -303,10 +303,15 @@ jobs:
       LLM_MODEL: kimi-k3
       CONF_AUTO_THRESHOLD: "0.85"
       HITL_PORT: "8088"
-      # LLM_BASE_URL is intentionally UNSET. The integration test repoints
-      # inference at its own in-process stub (no egress); the demo therefore
-      # runs with the classifier fail-closing to HITL (Rule 5.7) — still a
-      # full end-to-end exercise of the scripting contract with zero egress.
+      # LLM_BASE_URL is intentionally UNSET at the job level. Both inference
+      # consumers supply their OWN OpenAI-compatible endpoint with ZERO public
+      # egress, so neither depends on this job-global value:
+      #   * the integration test repoints inference at its own IN-PROCESS stub;
+      #   * `make demo` launches the bundled deterministic stub (eval/llmstub) and
+      #     points the pipeline's LLM_BASE_URL at it INLINE (see the makefile
+      #     `demo` recipe), so classification is reproducible and the demo
+      #     exercises the full classify -> gate -> remediate path and
+      #     auto-resolves >=1 break (it does NOT fail-close to HITL).
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -352,35 +357,81 @@ jobs:
           cd recon-agent
           go test -tags=integration ./...
 
-      # Finding #1 scripting-contract gate. Exercises the REAL `make demo` recipe
-      # (build outside the timer, run the one-shot binary under `timeout 60s`,
-      # propagate its exit). Asserts the <=60s budget was honored and the
-      # end-to-end summary was produced. A non-zero `make demo` exit is TOLERATED
-      # here and explained below; a budget overrun or a missing summary FAILS.
-      - name: Timed demo (enforce <=60s budget + success-criteria assertions, no public egress)
+      # AUTHORITATIVE scripting-contract acceptance gate (Gate 1/8, AAP §0.1.1).
+      # Exercises the REAL `make demo` recipe end-to-end and ENFORCES every
+      # mandatory acceptance signal — with NO tolerated failure (finding F03: the
+      # previous step false-greened a failed acceptance by swallowing a non-zero
+      # `make demo`/scorer exit and checking only budget + summary presence).
+      #
+      # `make demo` runs the pipeline and then the canonical scorer as its LAST
+      # command, and the scorer os.Exit(1)s on ANY unmet criterion (exactly six,
+      # >=5 labels, >=1 Blnk-confirmed clearance, routing safety, disposition +
+      # audit parity), so `make demo`'s exit code already reflects acceptance.
+      # This step (1) bounds the FULL `make demo` wall-clock to <=60s (the AAP
+      # success criterion — measured directly, not via a recipe string), (2)
+      # requires the end-to-end summary, (3) requires the scorer's explicit PASS
+      # verdict and forbids its FAIL, (4) re-asserts the mandatory counters from
+      # the scorer's own summary line, and (5) PROPAGATES the `make demo` exit
+      # code. Any one of these failing fails CI. No public LLM egress: `make demo`
+      # self-hosts the deterministic eval/llmstub and points inference at it.
+      - name: Timed demo — enforce <=60s + propagate exit + assert acceptance counters (Gate 1/8, F03)
         run: |
           set +e
-          # `make -s` (silent) is REQUIRED: without it make echoes the recipe
-          # text — which literally contains the string "exceeded the 60s budget"
-          # inside its timeout branch — and the grep below would false-positive.
-          # It also means the ONLY source of that string in the output is the
-          # recipe's runtime message printed on a genuine 60s SIGTERM (exit 124).
+          SECONDS=0
           out="$(make -s demo 2>&1)"; status=$?
+          elapsed=$SECONDS
           set -e
           printf '%s\n' "$out"
-          echo "make demo exit=$status"
-          if printf '%s' "$out" | grep -q "exceeded the 60s budget"; then
-            echo "FAIL: make demo exceeded its <=60s wall-clock budget (Finding #1 timing regression)"
+          echo "make demo exit=$status; wall-clock=${elapsed}s (budget <=60s)"
+
+          # (1) <=60s wall-clock budget for the FULL `make demo` (AAP success
+          # criterion). Measured directly so it no longer depends on any recipe
+          # message string (the makefile's timeout branch prints its own text and
+          # exits non-zero, which (5) also catches).
+          if [ "$elapsed" -gt 60 ]; then
+            echo "FAIL: make demo took ${elapsed}s, exceeding the <=60s budget (AAP success criterion)"
             exit 1
           fi
+
+          # (2) the pipeline actually ran end-to-end (summary table printed).
           if ! printf '%s' "$out" | grep -q "recon-agent pipeline summary"; then
             echo "FAIL: make demo did not run end-to-end (pipeline summary was not printed)"
             exit 1
           fi
-          echo "PASS: make demo ran end-to-end within the <=60s budget and enforced its success criteria (eval/scorer)."
-          if [ "$status" -ne 0 ]; then
-            echo "NOTE: the non-zero exit is the auto-resolve criterion being unmet, which is EXPECTED and TOLERATED in CI. The demo's upfront full reconciliation warms Blnk's shared external-transactions paginated cache — a defect in the OUT-OF-SCOPE, protected database/reconciliation.go (cache key omits the upload id; 5-minute TTL) — before its per-break dry-run probes run, so the probes read a stale set and nothing clears. The authoritative >=1 auto-resolve proof is the integration test above, which drives the remediator directly on a cold cache and asserts clearance (Rule 5.3)."
+
+          # (3) the canonical scorer must explicitly PASS and must never FAIL.
+          if printf '%s' "$out" | grep -q "SCORER: FAIL"; then
+            echo "FAIL: canonical scorer rejected the run (a mandatory acceptance criterion was unmet)"
+            exit 1
           fi
+          if ! printf '%s' "$out" | grep -q "SCORER: PASS (all acceptance criteria met)"; then
+            echo "FAIL: canonical scorer did not report PASS (acceptance was not proven)"
+            exit 1
+          fi
+
+          # (4) re-assert every mandatory counter from the scorer's summary line
+          # (belt-and-suspenders on top of the scorer's own os.Exit): exactly six
+          # breaks in, >=1 auto-resolved (Rule 5.3 clearance), audit parity floor,
+          # and complete disposition (auto + escalated == breaks_in, none dropped).
+          sline="$(printf '%s\n' "$out" | grep -E '^summary: breaks_in=' | tail -n1)"
+          [ -n "$sline" ] || { echo "FAIL: scorer summary counter line missing"; exit 1; }
+          breaks_in=$(printf '%s' "$sline" | sed -E 's/.*breaks_in=([0-9]+).*/\1/')
+          auto=$(printf '%s' "$sline" | sed -E 's/.*auto_resolved=([0-9]+).*/\1/')
+          esc=$(printf '%s' "$sline" | sed -E 's/.*escalated=([0-9]+).*/\1/')
+          audit=$(printf '%s' "$sline" | sed -E 's/.*audit_count=([0-9]+).*/\1/')
+          echo "counters: breaks_in=$breaks_in auto_resolved=$auto escalated=$esc audit_count=$audit"
+          [ "$breaks_in" = "6" ] || { echo "FAIL: breaks_in=$breaks_in (want 6)"; exit 1; }
+          { [ "$auto" -ge 1 ]; } 2>/dev/null || { echo "FAIL: auto_resolved=$auto (want >=1; Rule 5.3 clearance)"; exit 1; }
+          { [ "$audit" -ge "$breaks_in" ] && [ "$audit" -gt 0 ]; } 2>/dev/null || { echo "FAIL: audit_count=$audit (want >= breaks_in=$breaks_in and > 0)"; exit 1; }
+          { [ "$((auto + esc))" -eq "$breaks_in" ]; } 2>/dev/null || { echo "FAIL: disposition auto($auto)+escalated($esc) != breaks_in($breaks_in)"; exit 1; }
+
+          # (5) FINALLY propagate the `make demo` exit code — a non-zero demo or
+          # scorer result MUST fail CI (F03: exit propagated, never tolerated).
+          if [ "$status" -ne 0 ]; then
+            echo "FAIL: make demo exited non-zero ($status) — acceptance failed (F03: exit code propagated)"
+            exit "$status"
+          fi
+          echo "PASS: make demo ran end-to-end within <=60s and met EVERY mandatory acceptance criterion."
 
       # Diagnostics: dump the Blnk daemon log on completion (success or failure)
       # to aid triage of any integration/demo failure.

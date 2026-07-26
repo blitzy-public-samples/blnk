@@ -3,7 +3,7 @@
 # Multi-stage build (golang:1.25-alpine builder -> minimal alpine runtime),
 # tailored to the self-contained recon-agent module.
 #
-# BUILD CONTEXT: the repository ROOT (not ./recon-agent). The docker-compose
+# BUILD CONTEXT: the repository ROOT (not ./recon-agent). The docker compose
 # recon-agent service sets `build.context: .` with `dockerfile:
 # recon-agent/Dockerfile`, and CI builds it with `docker build -f
 # recon-agent/Dockerfile .`. A root context is REQUIRED (finding C-04) so the
@@ -13,7 +13,7 @@
 # module's Go code is compiled — no Blnk source is copied or imported (Rule 5.1).
 #
 # The image is configured entirely at runtime by the environment variables
-# docker-compose injects (LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, BLNK_BASE_URL,
+# docker compose injects (LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, BLNK_BASE_URL,
 # BLNK_API_KEY, CONF_AUTO_THRESHOLD, HITL_PORT, AGENT_DATABASE_URL).
 
 # ---- build stage ----
@@ -80,7 +80,7 @@ RUN chown -R recon:recon /app && chmod 0555 /seed/external_transactions.csv
 USER recon
 
 # HITL review API + server-rendered status page (default 8088; overridable via
-# the HITL_PORT env injected by docker-compose). recon-agent has no other
+# the HITL_PORT env injected by docker compose). recon-agent has no other
 # listeners, so no other port is exposed.
 EXPOSE 8088
 
@@ -92,6 +92,6 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
 
 # Default serve mode (NO -once flag): run the pipeline once, then serve the HITL
 # API and status page on HITL_PORT. The -once flag is a host-only `make demo`
-# tool and is never used inside the container. docker-compose may pass a
+# tool and is never used inside the container. docker compose may pass a
 # `-source` to isolate the container's boot run from host-driven `make demo`.
 CMD ["recon-agent"]

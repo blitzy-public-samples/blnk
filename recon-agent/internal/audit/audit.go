@@ -75,6 +75,16 @@ const (
 	// even when the deletion FAILED, so an orphaned rule that could not be
 	// removed is durably visible in the append-only trail for human cleanup.
 	ActionRuleCompensated = model.ActionRuleCompensated
+	// ActionReDriveAttempted / ActionReDriveCleared / ActionReDriveUnmatched /
+	// ActionReDriveFailed are the finer-grained re_drive outcome actions (finding
+	// F16). They replace the single 're_driven' audit action the HITL re_drive
+	// path used to emit for every outcome: an attempt, a confirmed clearance
+	// (carrying the proof reconciliation id), a ran-but-still-unmatched result,
+	// and a Blnk-upstream failure are now each an unambiguous, immutable action.
+	ActionReDriveAttempted = model.ActionReDriveAttempted
+	ActionReDriveCleared   = model.ActionReDriveCleared
+	ActionReDriveUnmatched = model.ActionReDriveUnmatched
+	ActionReDriveFailed    = model.ActionReDriveFailed
 )
 
 // Decision verbs, as submitted on model.HITLDecision.Decision. DecisionAction
@@ -275,12 +285,17 @@ func validateEvent(ev model.AuditEvent) error {
 //     must be provably traceable to the Blnk dry-run that cleared it. Kept as a
 //     distinct ErrEmptyReconID sentinel so the deterministic-arbiter proof has
 //     its own matchable error.
+//   - re_drive_cleared → the confirming reconciliation id (finding F16, Rule
+//     5.3): a cleared re_drive is a Blnk-confirmed clearance and, like resolved,
+//     must carry the dry-run id that proves it. Reuses ErrEmptyReconID.
 //
-// escalated, accepted, re_driven, and rejected intentionally require no extra
+// escalated, accepted, re_driven, rejected, re_drive_attempted,
+// re_drive_unmatched, and re_drive_failed intentionally require no extra
 // provenance: a probe-error escalation precedes any LLM call so carries no
-// model (cmd/main.go), and a "not cleared" re_driven event deliberately carries
-// no recon_id so a recon_id can never imply a false clearance (finding m-04).
-// For those, the required non-empty actor and rationale are sufficient evidence.
+// model (cmd/main.go), and a non-clearing re_drive outcome (attempted /
+// unmatched / failed) deliberately carries no recon_id so a recon_id can never
+// imply a false clearance (finding m-04/F16). For those, the required non-empty
+// actor and rationale are sufficient evidence.
 func validateActionProvenance(ev model.AuditEvent) error {
 	switch ev.Action {
 	case ActionClassified:
@@ -307,6 +322,14 @@ func validateActionProvenance(ev model.AuditEvent) error {
 		if strings.TrimSpace(ev.Provenance.ReconID) == "" {
 			return ErrEmptyReconID
 		}
+	case ActionReDriveCleared:
+		// F16: a cleared re_drive is a Blnk-confirmed clearance and MUST carry the
+		// confirming reconciliation id — the durable proof (Rule 5.3), exactly like
+		// `resolved`. Reuse the ErrEmptyReconID sentinel so the deterministic-arbiter
+		// proof has one matchable error across every clearance-bearing action.
+		if strings.TrimSpace(ev.Provenance.ReconID) == "" {
+			return ErrEmptyReconID
+		}
 	}
 	return nil
 }
@@ -318,7 +341,9 @@ func isAllowedAction(action string) bool {
 	switch action {
 	case ActionClassified, ActionRuleProposed, ActionRuleCreated, ActionProbed,
 		ActionResolved, ActionEscalated, ActionAccepted, ActionReDriven, ActionRejected,
-		ActionRuleCompensated:
+		ActionRuleCompensated,
+		// F16: the finer-grained re_drive outcome actions.
+		ActionReDriveAttempted, ActionReDriveCleared, ActionReDriveUnmatched, ActionReDriveFailed:
 		return true
 	default:
 		return false
@@ -558,11 +583,105 @@ func Decision(d model.HITLDecision, prov model.Provenance) model.AuditEvent {
 	}
 }
 
+// ReDriveAttempted builds the audit event recording that a human INITIATED a
+// re_drive of a queued break (finding F16). The actor is the reviewer; it is
+// written once, right after the processing lease is acquired and before any
+// Blnk interaction, so every attempt is durably on the trail regardless of the
+// eventual outcome. It carries no reconciliation id (nothing has cleared yet).
+// The reviewer's note becomes the rationale; an empty note yields a
+// self-describing default so the event is never a bare verb (finding M-12).
+func ReDriveAttempted(d model.HITLDecision, prov model.Provenance) model.AuditEvent {
+	rationale := d.Note
+	if strings.TrimSpace(rationale) == "" {
+		rationale = "human reviewer initiated re_drive"
+	}
+	return model.AuditEvent{
+		ExternalTxnID: d.ExternalTxnID,
+		Actor:         d.Reviewer,
+		Action:        ActionReDriveAttempted,
+		Rationale:     rationale,
+		Provenance:    prov,
+	}
+}
+
+// ReDriveCleared builds the terminal audit event for a re_drive whose Blnk
+// dry-run CONFIRMED clearance (finding F16, Rule 5.3). The actor is the
+// reviewer. It is the only re_drive outcome that carries the confirming
+// reconciliation id — the durable clearance proof — stamped into provenance
+// (overriding any prior ReconID), so the cleared outcome is provably traceable
+// to the dry-run that cleared it and is never confused with a still-unmatched
+// or failed attempt. The reconciliation id MUST be non-empty (enforced by
+// validateActionProvenance via ErrEmptyReconID). The reviewer's note becomes
+// the rationale; an empty note names the confirming reconciliation instead.
+func ReDriveCleared(d model.HITLDecision, reconID string, prov model.Provenance) model.AuditEvent {
+	prov.ReconID = reconID
+	rationale := d.Note
+	if strings.TrimSpace(rationale) == "" {
+		rationale = "re_drive cleared the break: Blnk dry-run reconciliation " + reconID + " confirmed it moved out of the unmatched set"
+	}
+	return model.AuditEvent{
+		ExternalTxnID: d.ExternalTxnID,
+		Actor:         d.Reviewer,
+		Action:        ActionReDriveCleared,
+		Rationale:     rationale,
+		Provenance:    prov,
+	}
+}
+
+// ReDriveUnmatched builds the terminal audit event for a re_drive whose Blnk
+// dry-run ran but did NOT confirm clearance (finding F16). The actor is the
+// reviewer; the break is left queued for further review. It deliberately
+// carries NO reconciliation id so a reconciliation id can never imply a false
+// clearance (finding m-04) — the immediately preceding `probed` event already
+// records the dry-run id and the still-unmatched verdict. The reviewer's note
+// becomes the rationale; an empty note yields a self-describing default.
+func ReDriveUnmatched(d model.HITLDecision, prov model.Provenance) model.AuditEvent {
+	rationale := d.Note
+	if strings.TrimSpace(rationale) == "" {
+		rationale = "re_drive did not clear the break: Blnk dry-run still reports it unmatched — left queued for further review"
+	}
+	return model.AuditEvent{
+		ExternalTxnID: d.ExternalTxnID,
+		Actor:         d.Reviewer,
+		Action:        ActionReDriveUnmatched,
+		Rationale:     rationale,
+		Provenance:    prov,
+	}
+}
+
+// ReDriveFailed builds the terminal audit event for a re_drive that could not
+// complete because a Blnk interaction failed — the ephemeral rule creation or
+// the dry-run probe errored (finding F16, fail-closed Rule 5.7). The actor is
+// the reviewer; the break is left queued so the reviewer can retry. The event
+// carries the failure-specific rationale (required, supplied by the caller) and
+// NO reconciliation id (no clearance was proven), so a Blnk-down attempt is a
+// first-class, unambiguous action rather than a 're_driven' value that must be
+// distinguished by parsing its free text.
+func ReDriveFailed(d model.HITLDecision, reason string, prov model.Provenance) model.AuditEvent {
+	rationale := reason
+	if strings.TrimSpace(rationale) == "" {
+		rationale = "re_drive failed against Blnk (upstream); break left queued"
+	}
+	return model.AuditEvent{
+		ExternalTxnID: d.ExternalTxnID,
+		Actor:         d.Reviewer,
+		Action:        ActionReDriveFailed,
+		Rationale:     rationale,
+		Provenance:    prov,
+	}
+}
+
 // DecisionAction maps a HITL decision verb to its audit action:
 // accept -> accepted, re_drive -> re_driven, reject -> rejected. An
 // unrecognized verb maps to "" (not the raw verb) so that it is rejected by
 // event validation rather than silently recorded (finding M-13: arbitrary
 // decisions must not pass through).
+//
+// NOTE (finding F16): the re_drive HANDLER no longer records its outcome via
+// Decision()/DecisionAction() — it emits the outcome-specific ReDrive*
+// constructors above. This mapping is retained for accept/reject (which still
+// use Decision) and for backward compatibility; re_drive -> re_driven stays so
+// the value remains recognized, but it is not the path re_drive audits take.
 func DecisionAction(decision string) string {
 	switch decision {
 	case DecisionAccept:

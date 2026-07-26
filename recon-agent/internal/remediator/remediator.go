@@ -153,20 +153,22 @@ type blnkPort interface {
 	// attempt that did not clear, so a failed attempt leaves no orphan rule
 	// behind (finding F5).
 	DeleteMatchingRule(ctx context.Context, ruleID string) error
-	// ConfirmCohortCleared is the cache-safe, PER-BREAK-ATTRIBUTABLE
-	// DETERMINISTIC ARBITER (Rule 5.3, finding F-1) for whether EVERY break in an
-	// auto-remediation cohort left the unmatched set. It submits the whole cohort
-	// as ONE dry-run reconciliation over a DEDICATED ephemeral upload carrying the
-	// cohort's created rules and reports cleared only when Blnk's authoritative
-	// counts show unmatched==0 over exactly the cohort's rows (a cardinality guard
-	// fails a stale-cache read closed). This replaces the earlier
-	// ConfirmClearedOverUpload aggregate confirm, under which an unrelated row's
-	// match could drop the full-upload count and falsely "clear" a genuinely
-	// un-clearable break. Because Blnk's pagination cache is upload-agnostic
-	// (a protected-core defect the agent must not modify, Rule 5.8), the confirm
-	// must be the run's single COLD reconciliation; the pipeline removed its
-	// detection reconciliation so this cohort confirm is that read.
-	ConfirmCohortCleared(ctx context.Context, cohort []blnk.ExternalTransaction, matchingRuleIDs []string) (cleared bool, reconID string, err error)
+	// EstablishMainReconciliation runs the pipeline's INITIAL dry-run
+	// reconciliation over the uploaded statement and returns its reconciliation
+	// id (the main_recon_id). It implements the mandated Upload -> start -> read
+	// topology (finding F02); the remediator stamps the returned id onto every
+	// break's provenance so each break points at the batch reconciliation that
+	// surfaced it. It is a dry run (Rule 5.3): it never mutates Blnk state.
+	EstablishMainReconciliation(ctx context.Context, uploadID string, matchingRuleIDs []string) (reconID string, err error)
+	// ProbeBreak is the PER-BREAK DETERMINISTIC ARBITER (Rule 5.3). It submits a
+	// SINGLE external transaction as its own dry-run (many_to_one, cache-safe) and
+	// reports cleared iff Blnk matched that transaction (matched>=1). Adjudicating
+	// each break with its OWN probe lets a confirmed break resolve independently
+	// even when a sibling in the same run remains unmatched (finding F18),
+	// replacing the earlier all-or-nothing whole-cohort dry-run. The returned
+	// reconciliation id is the clearance proof recorded on the resolved break; a
+	// probe error fails the break closed to HITL (Rule 5.7).
+	ProbeBreak(ctx context.Context, txn blnk.ExternalTransaction, matchingRuleIDs []string) (cleared bool, reconID string, err error)
 }
 
 // auditPort is the append-only audit writer used by the remediator (Rule 5.5).
@@ -191,6 +193,12 @@ type storePort interface {
 	// error so partial writes are never durable.
 	WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error
 	UpsertBreakTx(ctx context.Context, tx *sql.Tx, c model.BreakClassification, txn blnk.ExternalTransaction, prov model.Provenance, status string) error
+	// StampMainReconID records the run's initial (batch) reconciliation id as the
+	// main_recon_id of every listed break, but ONLY where that column is still
+	// blank, so it fills the provenance the initial run establishes (finding F02)
+	// without ever overwriting a value already recorded. Autocommit; safe to call
+	// once per run after the initial reconciliation completes.
+	StampMainReconID(ctx context.Context, mainReconID string, externalTxnIDs []string) error
 	// MarkResolvedTx transitions a break to auto-resolved AND stamps the
 	// confirming Blnk dry-run reconciliation id onto the row in one statement.
 	// The store's agent_break_resolved_proof CHECK makes an auto-resolved row
@@ -267,8 +275,8 @@ type Remediator struct {
 	// and escalated regardless of the classifier's (LLM-sourced, thus
 	// prompt-injectable) regulated flag, so a foreign-currency break can never be
 	// auto-remediated on the strength of a flipped flag alone. Empty disables the
-	// backstop; the deterministic cohort dry-run (which cannot match across
-	// currencies) remains the always-on independent arbiter (Rule 5.3).
+	// backstop; the deterministic per-break dry-run probe (which cannot match
+	// across currencies) remains the always-on independent arbiter (Rule 5.3).
 	baseCurrency string
 
 	// classifyBudget bounds a single break's classification (INFO#3). See
@@ -332,11 +340,11 @@ func (r *Remediator) foreignCurrency(txn blnk.ExternalTransaction) bool {
 }
 
 // Handle processes exactly one external break end to end. It is the
-// cohort-of-one convenience wrapper over ProcessCohort, preserving the original
+// single-break convenience wrapper over ProcessCohort, preserving the original
 // single-break API for callers (and the unit suite) that triage one break at a
-// time. For a cohort of one, the dedicated cohort dry-run contains only that
-// break, so unmatched==0 proves THAT break cleared — the deterministic-arbiter
-// guarantee (Rule 5.3) holds exactly as for a multi-break cohort.
+// time. A batch of one still gets its own per-break dry-run probe, so a
+// matched>=1 verdict proves THAT break cleared — the deterministic-arbiter
+// guarantee (Rule 5.3) holds exactly as for a multi-break batch.
 //
 // It returns nil once the break has reached a terminal, safely-recorded outcome
 // (auto-resolved or escalated to HITL). It returns a non-nil error only when an
@@ -352,11 +360,12 @@ func (r *Remediator) Handle(ctx context.Context, txn blnk.ExternalTransaction, u
 }
 
 // pendingRemediation carries a break that propose() advanced to the point of
-// having a created (or reused) Blnk matching rule awaiting the cohort clearance
-// confirmation. finalize() consumes it after the SINGLE cohort dry-run. Its
-// release closure holds the break's M-5 in-process mutex AND M-15 durable lease
-// and MUST be invoked exactly once — finalize defers it — so both are released
-// only after the break reaches its terminal outcome.
+// having a created (or reused) Blnk matching rule awaiting its per-break
+// clearance confirmation. finalize() consumes it after that break's OWN
+// single-transaction dry-run probe. Its release closure holds the break's M-5
+// in-process mutex AND M-15 durable lease and MUST be invoked exactly once —
+// finalize defers it — so both are released only after the break reaches its
+// terminal outcome.
 type pendingRemediation struct {
 	txn            blnk.ExternalTransaction
 	classification model.BreakClassification
@@ -369,7 +378,8 @@ type pendingRemediation struct {
 }
 
 // ProcessCohort triages a batch of breaks with the deterministic-arbiter
-// guarantee that fixes finding F-1 (Rule 5.3). It runs in three phases:
+// guarantee (Rule 5.3) and the per-break independence that fixes findings
+// F02/F18. It runs in three phases:
 //
 //  1. PROPOSE every break independently (classify -> gate -> build+create the
 //     safe rule), collecting those that reached the point of a created/reused
@@ -377,20 +387,25 @@ type pendingRemediation struct {
 //     (already-terminal no-op, classifier fail-closed, gate escalation, unsafe
 //     profile, rule-create failure, ...) are fully resolved there and are not
 //     carried forward.
-//  2. CONFIRM the whole eligible cohort with ONE ConfirmCohortCleared dry-run —
-//     the run's SINGLE cold reconciliation. Because that dry-run reconciles a
-//     DEDICATED upload containing only the cohort's rows, unmatched==0 proves
-//     EVERY cohort member left the unmatched set, so clearance is attributable
-//     per break (unlike the earlier full-upload aggregate confirm that F-1
-//     exploited). This is the only cache-safe way to attribute clearance over
-//     Blnk's count-only HTTP surface without touching its protected-core
-//     pagination cache (Rule 5.8 / INFO#4).
-//  3. FINALIZE every pending break with the shared verdict: on a true verdict
-//     resolve ALL (each stamped with the confirming cohort reconciliation id,
-//     Rule 5.3); otherwise fail EVERY member closed to HITL and compensate any
-//     rule created this run (Rule 5.7). A mixed cohort in which even one member
-//     cannot clear therefore fails the whole cohort closed rather than risk a
-//     false resolution — the safe posture the count-only surface permits.
+//  2. ESTABLISH the run's INITIAL reconciliation over the uploaded statement
+//     (finding F02): a single dry-run POST /reconciliation/start followed by a
+//     GET read, yielding the main_recon_id. That id is stamped onto EVERY
+//     break's persisted row (StampMainReconID) and onto each pending break's
+//     provenance, so every break points at the batch reconciliation that
+//     surfaced it. The initial run needs at least one matching rule id (Blnk
+//     rejects an empty set), so it uses the ids of the rules just created for
+//     the auto-eligible breaks; its counts are not consulted for any per-break
+//     decision. When no break is auto-eligible there is no rule to run it with
+//     and nothing to auto-remediate, so the initial run is skipped.
+//  3. CONFIRM + FINALIZE each pending break INDEPENDENTLY (finding F18): each
+//     break gets its OWN single-transaction dry-run probe (ProbeBreak, cache-safe
+//     many_to_one) and is finalized with its OWN verdict. A break Blnk confirms
+//     matched is resolved (stamped with that probe's reconciliation id, Rule
+//     5.3) EVEN IF a sibling break in the same run remains unmatched; an
+//     unmatched or errored probe fails only THAT break closed to HITL and
+//     compensates only its own rule (Rule 5.7). This replaces the earlier
+//     all-or-nothing whole-cohort dry-run under which one unmatched member
+//     suppressed every valid resolution (F18).
 //
 // It returns the joined error of any per-break infrastructure failures (nil when
 // every break reached a terminal, safely-recorded outcome). Each break's M-5
@@ -415,24 +430,54 @@ func (r *Remediator) ProcessCohort(ctx context.Context, breaks []blnk.ExternalTr
 	}
 
 	// No break reached the confirmation phase: every one terminated in propose.
+	// With nothing auto-eligible there is no rule to run an initial reconciliation
+	// with and nothing to auto-remediate, so the initial run is skipped.
 	if len(pending) == 0 {
 		return errors.Join(errs...)
 	}
 
-	// Phase 2: ONE dedicated-cohort dry-run — the run's single COLD read and the
-	// deterministic arbiter (Rule 5.3). A transport/validation error yields a
-	// false verdict so finalize fails every member closed (Rule 5.7).
-	cohort := make([]blnk.ExternalTransaction, len(pending))
+	// Phase 2 (F02): establish the run's initial reconciliation over the upload
+	// and stamp its id as every break's main_recon_id provenance. A failure here
+	// is recorded but does NOT abort triage: the per-break probes below remain the
+	// authoritative clearance signal, and a break simply carries no main_recon_id
+	// rather than being dropped. The initial run uses the auto-eligible breaks'
+	// rule ids because Blnk requires a non-empty rule set.
 	ruleIDs := make([]string, len(pending))
 	for i, p := range pending {
-		cohort[i] = p.txn
 		ruleIDs[i] = p.ruleID
 	}
-	cleared, reconID, confirmErr := r.blnkClient.ConfirmCohortCleared(ctx, cohort, ruleIDs)
+	mainReconID, mainErr := r.blnkClient.EstablishMainReconciliation(ctx, uploadID, ruleIDs)
+	if mainErr != nil {
+		errs = append(errs, fmt.Errorf("remediator: establish main reconciliation: %w", mainErr))
+	}
+	if mainReconID != "" {
+		// Stamp the main reconciliation id onto EVERY break in this run (eligible
+		// and already-escalated), so no break's persisted row leaves main_recon_id
+		// blank (finding F02). StampMainReconID only fills a blank column, so it
+		// never overwrites a resolution's proof id.
+		breakIDs := make([]string, len(breaks))
+		for i, txn := range breaks {
+			breakIDs[i] = txn.ID
+		}
+		if serr := r.store.StampMainReconID(ctx, mainReconID, breakIDs); serr != nil {
+			errs = append(errs, fmt.Errorf("remediator: stamp main reconciliation id: %w", serr))
+		}
+		// Thread the id into each pending break's provenance so its probe/resolve
+		// audit events also carry it.
+		for _, p := range pending {
+			p.prov.MainReconID = mainReconID
+			p.provEv.MainReconID = mainReconID
+		}
+	}
 
-	// Phase 3: finalize every pending break with the shared cohort verdict.
+	// Phase 3 (F18): adjudicate EACH pending break with its OWN single-transaction
+	// dry-run probe and finalize it with its OWN verdict, so a confirmed break
+	// resolves independently of any unmatched sibling. A probe transport/validation
+	// error yields a false verdict + error so finalize fails only THAT break closed
+	// (Rule 5.7).
 	for _, p := range pending {
-		if err := r.finalize(ctx, p, cleared, reconID, confirmErr); err != nil {
+		cleared, reconID, probeErr := r.blnkClient.ProbeBreak(ctx, p.txn, []string{p.ruleID})
+		if err := r.finalize(ctx, p, cleared, reconID, probeErr); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -440,8 +485,8 @@ func (r *Remediator) ProcessCohort(ctx context.Context, breaks []blnk.ExternalTr
 }
 
 // propose advances one break from classification through creating (or reusing)
-// its safe Blnk matching rule, up to — but NOT including — the cohort clearance
-// confirmation. It returns:
+// its safe Blnk matching rule, up to — but NOT including — its per-break
+// clearance confirmation. It returns:
 //
 //   - (nil, nil)  when the break reached a terminal outcome here (already
 //     terminal, classifier fail-closed, gate escalation, unsafe profile,
@@ -450,8 +495,8 @@ func (r *Remediator) ProcessCohort(ctx context.Context, breaks []blnk.ExternalTr
 //   - (nil, err)  when an agent-side persistence/audit operation failed; the
 //     mutex/lease are released.
 //   - (&pendingRemediation, nil)  when a rule was created/reused and the break
-//     awaits the cohort confirmation; the returned release closure still holds
-//     the break's mutex AND lease and MUST be invoked by finalize.
+//     awaits its per-break confirmation probe; the returned release closure
+//     still holds the break's mutex AND lease and MUST be invoked by finalize.
 //
 // It preserves every durability guarantee of the original monolithic Handle:
 // M-5 in-process serialization, M-6 idempotency/crash-resume, M-2 atomic
@@ -588,7 +633,7 @@ func (r *Remediator) propose(ctx context.Context, txn blnk.ExternalTransaction, 
 	}
 	// release retires the break's durable lease (M-15) and then its in-process
 	// mutex (M-5). Unlike the original monolithic Handle's deferred cleanup it is
-	// NOT fired here: the lease and mutex must stay held across the cohort
+	// NOT fired here: the lease and mutex must stay held across the per-break
 	// clearance confirmation, so every terminal path in propose() invokes
 	// release() explicitly, and the success path hands it to finalize(), which
 	// defers it. The lease release runs on an independent context so a canceled
@@ -615,9 +660,10 @@ func (r *Remediator) propose(ctx context.Context, txn blnk.ExternalTransaction, 
 	// treats a break whose currency differs from the ledger base currency as
 	// regulated REGARDLESS of that flag, so a flipped regulated=false can never
 	// open the auto path for a foreign-currency break. It is defense-in-depth
-	// ABOVE the always-on deterministic cohort dry-run (which independently
-	// cannot match across currencies, Rule 5.3). Disabled when baseCurrency is
-	// empty; a cohort-of-one whose sole currency equals itself is unaffected.
+	// ABOVE the always-on deterministic per-break dry-run probe (which
+	// independently cannot match across currencies, Rule 5.3). Disabled when
+	// baseCurrency is empty; a single break whose currency equals itself is
+	// unaffected.
 	if r.foreignCurrency(txn) {
 		escErr := r.escalate(ctx, txn, classification, prov, reasonForeignCurrency)
 		release()
@@ -786,12 +832,12 @@ func (r *Remediator) propose(ctx context.Context, txn blnk.ExternalTransaction, 
 	}
 
 	// propose has created (or reused) the break's safe rule and durably recorded
-	// its compensation obligation. The break now awaits the SHARED cohort
-	// clearance confirmation (ProcessCohort phase 2), so hand it forward with its
-	// M-5 mutex AND M-15 lease STILL HELD — release is deliberately NOT called
-	// here; finalize() invokes it exactly once. Blnk remains the sole arbiter of
-	// clearance (Rule 5.3): propose never marks a resolution, it only prepares
-	// the break for the deterministic cohort dry-run.
+	// its compensation obligation. The break now awaits its per-break clearance
+	// probe (ProcessCohort phase 3), so hand it forward with its M-5 mutex AND
+	// M-15 lease STILL HELD — release is deliberately NOT called here; finalize()
+	// invokes it exactly once. Blnk remains the sole arbiter of clearance (Rule
+	// 5.3): propose never marks a resolution, it only prepares the break for its
+	// deterministic single-transaction dry-run probe.
 	return &pendingRemediation{
 		txn:            txn,
 		classification: classification,
@@ -804,17 +850,17 @@ func (r *Remediator) propose(ctx context.Context, txn blnk.ExternalTransaction, 
 	}, nil
 }
 
-// finalize applies the SHARED cohort clearance verdict to one pending break and
+// finalize applies THIS break's OWN clearance verdict to one pending break and
 // releases its M-5 mutex + M-15 lease exactly once (deferred). It reproduces the
 // tail of the original monolithic Handle — probe audit, fail-closed
-// compensation, and the atomic auto-resolve — but keyed off the COHORT-level
-// (cleared, reconID, confirmErr) computed by ProcessCohort rather than a
-// per-break probe. Because that verdict comes from a dedicated-cohort dry-run
-// whose unmatched==0 proves EVERY member left the unmatched set, a resolution is
-// attributable to a dry-run that genuinely cleared THIS break — closing F-1's
-// aggregate-count hole (Rule 5.3). On a false or error verdict it fails the
-// break closed to HITL (Rule 5.7) and compensates any rule this run created, so
-// a failed cohort leaves neither an orphan rule nor an unprovable resolution.
+// compensation, and the atomic auto-resolve — keyed off the PER-BREAK
+// (cleared, reconID, confirmErr) that ProcessCohort obtained from THIS break's
+// single-transaction dry-run probe (ProbeBreak). Because that verdict comes from
+// a probe over exactly this one transaction, a matched>=1 result is attributable
+// to a dry-run that genuinely cleared THIS break, and a sibling break's verdict
+// never affects it (finding F18, Rule 5.3). On a false or error verdict it fails
+// only THIS break closed to HITL (Rule 5.7) and compensates only its own rule, so
+// a failed attempt leaves neither an orphan rule nor an unprovable resolution.
 func (r *Remediator) finalize(ctx context.Context, p *pendingRemediation, cleared bool, reconID string, confirmErr error) error {
 	// Release the break's mutex + lease exactly once, however finalize returns.
 	defer p.release()
@@ -828,35 +874,34 @@ func (r *Remediator) finalize(ctx context.Context, p *pendingRemediation, cleare
 	createdHere := p.createdHere
 
 	if confirmErr != nil {
-		// M-11: the cohort confirmation transport/validation failed, so this rule
-		// cannot be proven to clear the break. If we created it in this run,
-		// durably compensate it (delete from Blnk, mark the outbox obligation,
-		// audit the outcome — including a delete failure) before escalating, so a
-		// failed auto-attempt leaves no unaudited orphan rule behind.
+		// M-11: this break's probe transport/validation failed, so its rule cannot
+		// be proven to clear the break. If we created it in this run, durably
+		// compensate it (delete from Blnk, mark the outbox obligation, audit the
+		// outcome — including a delete failure) before escalating, so a failed
+		// auto-attempt leaves no unaudited orphan rule behind.
 		if createdHere {
-			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "cohort dry-run failed before clearance")
+			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "dry-run probe failed before clearance")
 		}
 		return r.escalate(ctx, txn, classification, prov, fmt.Sprintf("%s: %v", reasonProbeFailed, confirmErr))
 	}
-	// m-3: record the probe outcome (previously dead-code audit builder). The
-	// same confirming cohort reconciliation id is stamped on every member's probe
-	// event, so each resolution traces to the dry-run that cleared the cohort.
+	// m-3: record the probe outcome (previously dead-code audit builder). This
+	// break's OWN probe reconciliation id is stamped on its probe event, so its
+	// resolution traces to the dry-run that cleared exactly this break.
 	if err := r.auditWriter.Record(ctx, audit.Probed(id, reconID, cleared, provEv)); err != nil {
 		return fmt.Errorf("remediator: audit probe for break %q: %w", id, err)
 	}
 	if !cleared {
-		// M-11: Blnk did not confirm the cohort cleared, so this rule did not do
+		// M-11: Blnk did not confirm THIS break cleared, so its rule did not do
 		// its job. Durably compensate a rule created in this run before escalating.
-		// A mixed cohort in which even one member cannot clear fails EVERY member
-		// closed here rather than risk a false resolution — the safe posture the
-		// count-only HTTP surface permits (F-1 / Rule 5.7).
+		// Only this break is failed closed — an unmatched sibling never suppresses
+		// another break's valid resolution (finding F18 / Rule 5.7).
 		if createdHere {
-			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "cohort dry-run did not confirm clearance")
+			r.compensateCreatedRule(ctx, id, ruleID, provEv, classification.Confidence, "dry-run probe did not confirm clearance")
 		}
 		return r.escalate(ctx, txn, classification, prov, reasonNotCleared)
 	}
 
-	// Blnk confirmed the whole cohort cleared — and only Blnk can (Rule 5.3).
+	// Blnk confirmed THIS break cleared — and only Blnk can (Rule 5.3).
 	// Build the clearance proof from the confirming reconciliation id:
 	// audit.Resolved takes a ClearanceProof (never a bare id), so a resolution is
 	// impossible to record without evidence of an actual dry-run clearance. If the
@@ -880,11 +925,11 @@ func (r *Remediator) finalize(ctx context.Context, p *pendingRemediation, cleare
 	// without its resolved event (nor vice versa); and confirming the outbox in
 	// the SAME commit means a rule that legitimately cleared its break is marked
 	// 'confirmed' rather than being mistaken for an orphan by the recovery sweep.
-	// MarkResolvedTx stamps the SAME confirming cohort recon_id the proof carries
-	// onto the break row, and audit.Resolved stamps it onto the event's
+	// MarkResolvedTx stamps the SAME confirming per-break recon_id the proof
+	// carries onto the break row, and audit.Resolved stamps it onto the event's
 	// provenance — so the row's resolved_recon_id and the audit trail agree, and
 	// the store's resolved-proof CHECK guarantees the row cannot be auto-resolved
-	// without it (Rule 5.3). Every resolution is thus traceable to the cohort
+	// without it (Rule 5.3). Every resolution is thus traceable to the probe
 	// dry-run that cleared it. ConfirmRuleOutboxTx targets only a still-'pending'
 	// row, so on the resume path (where the outbox may already be confirmed) it is
 	// a harmless no-op.

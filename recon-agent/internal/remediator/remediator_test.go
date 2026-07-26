@@ -128,19 +128,43 @@ func (f *fakeClassifier) callCount() int {
 // -----------------------------------------------------------------------------
 
 type fakeBlnk struct {
-	mu          sync.Mutex
-	created     blnk.MatchingRule
-	createErr   error
-	cleared     bool
-	reconID     string
-	probeErr    error
-	createCalls int
-	probeCalls  int
-	// probeRuleIDs captures the matching-rule id set threaded into each
-	// ConfirmCohortCleared call (one call per cohort; for the cohort-of-one
-	// Handle wrapper that is a single rule id), so a test can assert the
-	// confirmation targeted the created/persisted rule(s).
+	mu        sync.Mutex
+	created   blnk.MatchingRule
+	createErr error
+	// cleared / reconID / probeErr are the DEFAULT per-break verdict ProbeBreak
+	// returns for any break without a probeVerdicts override, modelling the Blnk
+	// dry-run arbiter (Rule 5.3). probeErr fails a break closed to HITL (Rule 5.7).
+	cleared  bool
+	reconID  string
+	probeErr error
+	// probeVerdicts optionally overrides the verdict PER external transaction id
+	// (keyed by txn.ID). It lets the F18 partial-cohort test give each break its
+	// OWN independent verdict — some cleared, some still unmatched — proving each
+	// break is adjudicated by its own single-transaction probe rather than a
+	// single all-or-nothing cohort dry-run.
+	probeVerdicts map[string]probeVerdict
+	// mainReconID / mainReconErr are what EstablishMainReconciliation returns: the
+	// run's initial (batch) reconciliation id and an optional error (finding F02).
+	mainReconID  string
+	mainReconErr error
+	createCalls  int
+	probeCalls   int
+	// establishCalls counts EstablishMainReconciliation invocations; a run with
+	// >=1 auto-eligible break establishes the initial reconciliation exactly once
+	// (finding F02), and a run with none skips it entirely.
+	establishCalls int
+	// establishUploadID / establishRuleIDs capture the last upload id and rule id
+	// set threaded into EstablishMainReconciliation, so a test can assert the
+	// initial run targeted the uploaded statement with the created rules.
+	establishUploadID string
+	establishRuleIDs  []string
+	// probeRuleIDs captures the matching-rule id set threaded into each ProbeBreak
+	// call (one call per break; a single rule id for the break being confirmed),
+	// so a test can assert the probe targeted the created/persisted rule.
 	probeRuleIDs [][]string
+	// probedTxnIDs records the external transaction id probed on each ProbeBreak
+	// call (finding F18), so a test can assert EACH break received its OWN probe.
+	probedTxnIDs []string
 	// createdRules records every rule passed to CreateMatchingRule (finding F7),
 	// so tests can assert the ACTUAL narrowed rule that was POSTed (Value
 	// populated, {currency,equals} appended) rather than the classifier's raw
@@ -152,6 +176,15 @@ type fakeBlnk struct {
 	deleteCalls    int
 	deletedRuleIDs []string
 	deleteErr      error
+}
+
+// probeVerdict is one break's configured dry-run verdict for the fake's per-txn
+// ProbeBreak override, enabling the F18 test to adjudicate each break
+// independently.
+type probeVerdict struct {
+	cleared bool
+	reconID string
+	err     error
 }
 
 func (f *fakeBlnk) CreateMatchingRule(_ context.Context, rule blnk.MatchingRule) (blnk.MatchingRule, error) {
@@ -176,21 +209,41 @@ func (f *fakeBlnk) DeleteMatchingRule(_ context.Context, ruleID string) error {
 	return f.deleteErr
 }
 
-// ConfirmCohortCleared is the cache-safe, per-break-attributable
-// deterministic-arbiter seam the remediator uses after creating the eligible
-// cohort's rules (finding F-1, Rule 5.3): ONE dry-run reconciliation over a
-// dedicated upload containing ONLY the cohort, reporting cleared when Blnk's
-// authoritative unmatched count is 0 (every member left the unmatched set). The
-// fake records the cohort's rule id set (so a test can assert the confirmation
-// targeted the created/persisted rules) and returns the test-configurable
-// cleared / reconID / error verdict. It is invoked exactly once per cohort; the
-// cohort-of-one Handle wrapper therefore records a single rule id, matching the
-// per-attempt semantics the earlier ConfirmClearedOverUpload modelled.
-func (f *fakeBlnk) ConfirmCohortCleared(_ context.Context, cohort []blnk.ExternalTransaction, matchingRuleIDs []string) (bool, string, error) {
+// EstablishMainReconciliation models the pipeline's INITIAL dry-run
+// reconciliation over the uploaded statement (finding F02): it records the
+// upload id and rule id set it was called with (so a test can assert the
+// initial run targeted the upload with the created rules) and returns the
+// test-configurable main_recon_id / error. It is invoked at most once per run —
+// only when at least one break is auto-eligible.
+func (f *fakeBlnk) EstablishMainReconciliation(_ context.Context, uploadID string, matchingRuleIDs []string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.establishCalls++
+	f.establishUploadID = uploadID
+	f.establishRuleIDs = append([]string(nil), matchingRuleIDs...)
+	if f.mainReconErr != nil {
+		return "", f.mainReconErr
+	}
+	return f.mainReconID, nil
+}
+
+// ProbeBreak is the PER-BREAK deterministic-arbiter seam (findings F02/F18,
+// Rule 5.3): the remediator submits a SINGLE external transaction as its own
+// cache-safe dry-run and resolves the break iff Blnk matched it. The fake
+// records the probed txn id and the rule id set (so a test can assert each
+// break got its OWN probe targeting its created rule) and returns either the
+// per-txn override verdict (if configured, letting the F18 test adjudicate each
+// break independently) or the default cleared / reconID / error verdict. A
+// probe error fails only that break closed to HITL (Rule 5.7).
+func (f *fakeBlnk) ProbeBreak(_ context.Context, txn blnk.ExternalTransaction, matchingRuleIDs []string) (bool, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.probeCalls++
 	f.probeRuleIDs = append(f.probeRuleIDs, append([]string(nil), matchingRuleIDs...))
+	f.probedTxnIDs = append(f.probedTxnIDs, txn.ID)
+	if v, ok := f.probeVerdicts[txn.ID]; ok {
+		return v.cleared, v.reconID, v.err
+	}
 	if f.probeErr != nil {
 		return false, "", f.probeErr
 	}
@@ -207,6 +260,23 @@ func (f *fakeBlnk) probeCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.probeCalls
+}
+
+// establishCount reports how many times the run established its initial
+// reconciliation (finding F02): exactly once when a break reaches confirmation,
+// zero when nothing is auto-eligible.
+func (f *fakeBlnk) establishCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.establishCalls
+}
+
+// probedTxns returns the external transaction ids probed, in call order
+// (finding F18), so a test can assert EACH break received its own probe.
+func (f *fakeBlnk) probedTxns() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.probedTxnIDs...)
 }
 
 func (f *fakeBlnk) lastProbeRuleIDs() []string {
@@ -315,6 +385,7 @@ type fakeBackend struct {
 	enqueueHITLTxHook    func(string, string) error
 	setCreatedRuleTxHook func(string, string) error
 	setCreatedRuleHook   func(string, string) error
+	stampMainReconIDHook func(mainReconID string, ids []string) error
 
 	// M-11/M-15 fault-injection hooks for the durable outbox + lease surface.
 	claimBreakHook          func(id, owner string) (bool, error)
@@ -494,6 +565,31 @@ func (f *fakeBackend) SetCreatedRule(_ context.Context, id, ruleID string) error
 	defer f.mu.Unlock()
 	if b := f.breaks[id]; b != nil {
 		b.createdRuleID = ruleID
+	}
+	return nil
+}
+
+// StampMainReconID mirrors the store's AUTOCOMMIT UPDATE that fills the
+// main_recon_id of each listed break ONLY where the column is still blank
+// (finding F02): it records the run's initial (batch) reconciliation id as
+// batch provenance without ever overwriting a resolution's proof id. A
+// stampMainReconIDHook lets a test fault-inject the F02 provenance write; an
+// empty id or empty id-set is a no-op, exactly like the store's guarded UPDATE.
+func (f *fakeBackend) StampMainReconID(_ context.Context, mainReconID string, externalTxnIDs []string) error {
+	if f.stampMainReconIDHook != nil {
+		if err := f.stampMainReconIDHook(mainReconID, externalTxnIDs); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(mainReconID) == "" || len(externalTxnIDs) == 0 {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, id := range externalTxnIDs {
+		if b := f.breaks[id]; b != nil && strings.TrimSpace(b.prov.MainReconID) == "" {
+			b.prov.MainReconID = mainReconID
+		}
 	}
 	return nil
 }
@@ -730,6 +826,17 @@ func (f *fakeBackend) createdRuleOf(id string) string {
 	return ""
 }
 
+// mainReconIDOf returns the batch reconciliation id stamped onto a break's
+// persisted provenance by StampMainReconID (finding F02), or "" if none.
+func (f *fakeBackend) mainReconIDOf(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if b := f.breaks[id]; b != nil {
+		return b.prov.MainReconID
+	}
+	return ""
+}
+
 func (f *fakeBackend) inHITL(id string) (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -927,6 +1034,181 @@ func TestHandleAutoResolvesHighConfidenceBreak(t *testing.T) {
 	}
 	if _, queued := h.back.inHITL(id); queued {
 		t.Fatal("an auto-resolved break must NOT be in the HITL queue")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Reconciliation topology (finding F02) and per-break independence (finding
+// F18): the whole-batch ProcessCohort path.
+// -----------------------------------------------------------------------------
+
+// TestProcessCohortEstablishesMainReconciliationAndStampsProvenance proves the
+// AAP-mandated Upload -> start -> read topology (finding F02): a cohort with
+// auto-eligible breaks establishes the run's INITIAL reconciliation EXACTLY ONCE
+// (over the upload, carrying the created rule ids) and stamps its main_recon_id
+// onto every break's persisted provenance AND onto each break's resolve audit
+// event — while each break's resolution still carries its OWN per-break probe
+// recon_id as the clearance proof (Rule 5.3). The batch reconciliation supplies
+// traceability; only the per-break dry-run proves clearance.
+func TestProcessCohortEstablishesMainReconciliationAndStampsProvenance(t *testing.T) {
+	h := newHarness(t)
+	h.cls.result = autoClassification("ignored") // ExternalTxnID is overridden per break
+	h.bnk.created = blnk.MatchingRule{RuleID: "rule_1", Criteria: validRule().Criteria}
+	h.bnk.mainReconID = "recon_main"
+	// Distinct per-break clearance proofs prove each break is adjudicated by its
+	// OWN single-transaction dry-run, not by the batch reconciliation (Rule 5.3).
+	h.bnk.probeVerdicts = map[string]probeVerdict{
+		"ext_a": {cleared: true, reconID: "recon_a"},
+		"ext_b": {cleared: true, reconID: "recon_b"},
+	}
+
+	breaks := []blnk.ExternalTransaction{txnFor("ext_a"), txnFor("ext_b")}
+	if err := h.rem.ProcessCohort(context.Background(), breaks, testUploadID); err != nil {
+		t.Fatalf("ProcessCohort: %v", err)
+	}
+
+	// F02: the initial reconciliation is established EXACTLY ONCE, over the
+	// uploaded statement, carrying the rules created for the auto-eligible breaks.
+	if got := h.bnk.establishCount(); got != 1 {
+		t.Fatalf("initial reconciliation must be established exactly once, got %d", got)
+	}
+	if h.bnk.establishUploadID != testUploadID {
+		t.Fatalf("initial reconciliation must target upload id %q, got %q", testUploadID, h.bnk.establishUploadID)
+	}
+	if len(h.bnk.establishRuleIDs) != 2 {
+		t.Fatalf("initial reconciliation must carry the 2 created rule ids, got %v", h.bnk.establishRuleIDs)
+	}
+
+	for _, id := range []string{"ext_a", "ext_b"} {
+		status, found := h.back.statusOf(id)
+		if !found || status != statusAutoResolved {
+			t.Fatalf("break %q must be auto-resolved, got found=%v status=%q", id, found, status)
+		}
+		// F02: every break's persisted row is stamped with the batch main_recon_id.
+		if got := h.back.mainReconIDOf(id); got != "recon_main" {
+			t.Fatalf("break %q must be stamped with main_recon_id=recon_main, got %q", id, got)
+		}
+		// The resolved event's provenance ALSO carries the batch main_recon_id...
+		prov, ok := h.back.auditProvenance(id, audit.ActionResolved)
+		if !ok || prov.MainReconID != "recon_main" {
+			t.Fatalf("break %q resolved event must carry main_recon_id=recon_main, got ok=%v prov=%+v", id, ok, prov)
+		}
+	}
+	// ...while each resolution's PROOF is that break's OWN probe recon_id (5.3).
+	if rid := h.back.resolvedReconID("ext_a"); rid != "recon_a" {
+		t.Fatalf("ext_a resolved proof must be its own probe recon_a, got %q", rid)
+	}
+	if rid := h.back.resolvedReconID("ext_b"); rid != "recon_b" {
+		t.Fatalf("ext_b resolved proof must be its own probe recon_b, got %q", rid)
+	}
+	// F18: each break received its OWN single-transaction probe.
+	if probed := h.bnk.probedTxns(); len(probed) != 2 {
+		t.Fatalf("expected exactly 2 per-break probes (one per break), got %v", probed)
+	}
+}
+
+// TestProcessCohortResolvesConfirmedBreaksIndependentlyOfUnmatchedSibling is the
+// direct regression for finding F18: under the OLD all-or-nothing whole-cohort
+// dry-run, ONE unmatched member suppressed EVERY valid resolution in the batch
+// and the demo escalated all breaks. With per-break probing each break is
+// adjudicated by its OWN single-transaction dry-run, so the two Blnk confirms
+// resolve independently EVEN THOUGH the third remains unmatched — and only the
+// unmatched one fails closed to HITL (Rule 5.7).
+func TestProcessCohortResolvesConfirmedBreaksIndependentlyOfUnmatchedSibling(t *testing.T) {
+	h := newHarness(t)
+	h.cls.result = autoClassification("ignored")
+	h.bnk.created = blnk.MatchingRule{RuleID: "rule_1", Criteria: validRule().Criteria}
+	h.bnk.mainReconID = "recon_main"
+	// ext_1 and ext_2 are confirmed cleared by their own probes; ext_3's probe
+	// completed (so it carries a recon_id) but Blnk still reports it unmatched.
+	h.bnk.probeVerdicts = map[string]probeVerdict{
+		"ext_1": {cleared: true, reconID: "recon_1"},
+		"ext_2": {cleared: true, reconID: "recon_2"},
+		"ext_3": {cleared: false, reconID: "recon_3"},
+	}
+
+	breaks := []blnk.ExternalTransaction{txnFor("ext_1"), txnFor("ext_2"), txnFor("ext_3")}
+	if err := h.rem.ProcessCohort(context.Background(), breaks, testUploadID); err != nil {
+		t.Fatalf("ProcessCohort: %v", err)
+	}
+
+	// The two Blnk-confirmed breaks resolve independently of the unmatched one.
+	for _, id := range []string{"ext_1", "ext_2"} {
+		status, found := h.back.statusOf(id)
+		if !found || status != statusAutoResolved {
+			t.Fatalf("confirmed break %q must be auto-resolved (F18), got found=%v status=%q", id, found, status)
+		}
+		if _, queued := h.back.inHITL(id); queued {
+			t.Fatalf("confirmed break %q must NOT be escalated to HITL", id)
+		}
+	}
+	if rid := h.back.resolvedReconID("ext_1"); rid != "recon_1" {
+		t.Fatalf("ext_1 resolved proof must be recon_1, got %q", rid)
+	}
+	if rid := h.back.resolvedReconID("ext_2"); rid != "recon_2" {
+		t.Fatalf("ext_2 resolved proof must be recon_2, got %q", rid)
+	}
+
+	// Only the unmatched break fails closed to HITL — it never suppresses the
+	// others' valid resolutions (the exact F18 defect).
+	status, found := h.back.statusOf("ext_3")
+	if !found || status != statusQueued {
+		t.Fatalf("unmatched break ext_3 must be queued to HITL, got found=%v status=%q", found, status)
+	}
+	if _, queued := h.back.inHITL("ext_3"); !queued {
+		t.Fatal("unmatched break ext_3 must be enqueued in the HITL queue")
+	}
+	if rid := h.back.resolvedReconID("ext_3"); rid != "" {
+		t.Fatalf("unmatched break ext_3 must have NO resolved proof, got %q", rid)
+	}
+
+	// Every break was adjudicated by its OWN probe (three independent probes),
+	// and the initial reconciliation was still established exactly once (F02).
+	if probed := h.bnk.probedTxns(); len(probed) != 3 {
+		t.Fatalf("each break must get its OWN probe: expected 3 probes, got %v", probed)
+	}
+	if got := h.bnk.establishCount(); got != 1 {
+		t.Fatalf("initial reconciliation must be established exactly once, got %d", got)
+	}
+}
+
+// TestProcessCohortMainReconciliationErrorSurfacesButTriageCompletes proves that
+// a failure of the initial reconciliation (finding F02) is surfaced as a run
+// error (finding F4) but does NOT abort per-break triage: the Phase-3 probes
+// remain the authoritative clearance signal, so a break Blnk confirms still
+// resolves (carrying its own probe proof, Rule 5.3) and simply carries no
+// main_recon_id rather than being dropped.
+func TestProcessCohortMainReconciliationErrorSurfacesButTriageCompletes(t *testing.T) {
+	h := newHarness(t)
+	h.cls.result = autoClassification("ignored")
+	h.bnk.created = blnk.MatchingRule{RuleID: "rule_1", Criteria: validRule().Criteria}
+	h.bnk.mainReconErr = errors.New("blnk start 500")
+	h.bnk.probeVerdicts = map[string]probeVerdict{
+		"ext_x": {cleared: true, reconID: "recon_x"},
+	}
+
+	err := h.rem.ProcessCohort(context.Background(), []blnk.ExternalTransaction{txnFor("ext_x")}, testUploadID)
+	// F02/F4: the initial-reconciliation failure is surfaced to the caller.
+	if err == nil {
+		t.Fatal("an initial-reconciliation failure must surface as a run error (F02/F4)")
+	}
+	if !strings.Contains(err.Error(), "establish main reconciliation") {
+		t.Fatalf("returned error must identify the initial reconciliation failure, got %v", err)
+	}
+	// Triage still completed: the break Blnk confirmed is resolved via its own
+	// probe, and it simply carries no main_recon_id (never dropped).
+	status, found := h.back.statusOf("ext_x")
+	if !found || status != statusAutoResolved {
+		t.Fatalf("triage must complete despite the initial-reconciliation error: got found=%v status=%q", found, status)
+	}
+	if rid := h.back.resolvedReconID("ext_x"); rid != "recon_x" {
+		t.Fatalf("resolution proof must still be the break's own probe recon_x, got %q", rid)
+	}
+	if got := h.back.mainReconIDOf("ext_x"); got != "" {
+		t.Fatalf("a break whose initial reconciliation failed must carry no main_recon_id, got %q", got)
+	}
+	if got := h.bnk.establishCount(); got != 1 {
+		t.Fatalf("the initial reconciliation must have been attempted once, got %d", got)
 	}
 }
 
@@ -2344,6 +2626,61 @@ func TestHandleConcurrentDistinctBreaks(t *testing.T) {
 		if got := h.back.countAction(id, audit.ActionResolved); got != 1 {
 			t.Fatalf("distinct break %s must resolve exactly once, got %d", id, got)
 		}
+	}
+}
+
+// TestProcessCohortConcurrentJobsResolveIndependently models two concurrent
+// isolated pipeline jobs (finding F18): two whole-batch ProcessCohort runs over
+// DISJOINT break sets and DISTINCT uploads execute at the same time, and each
+// break is adjudicated by its OWN per-break dry-run probe. Every Blnk-confirmed
+// break in either job resolves independently, the single unmatched break fails
+// closed to HITL without suppressing its job's sibling, and each job establishes
+// its OWN initial reconciliation. This is the agent-side, deterministic analog
+// of the live cross-run cache isolation the cache-safe many_to_one probe
+// strategy provides (run under -race, it also proves ProcessCohort is data-race
+// free under concurrent whole-batch use).
+func TestProcessCohortConcurrentJobsResolveIndependently(t *testing.T) {
+	h := newHarness(t)
+	h.cls.result = autoClassification("ignored")
+	h.bnk.created = blnk.MatchingRule{RuleID: "rule_1", Criteria: validRule().Criteria}
+	h.bnk.mainReconID = "recon_main"
+	// Job A: two breaks, both cleared. Job B: one cleared + one still unmatched.
+	h.bnk.probeVerdicts = map[string]probeVerdict{
+		"jobA_1": {cleared: true, reconID: "recon_a1"},
+		"jobA_2": {cleared: true, reconID: "recon_a2"},
+		"jobB_1": {cleared: true, reconID: "recon_b1"},
+		"jobB_2": {cleared: false, reconID: "recon_b2"},
+	}
+	jobA := []blnk.ExternalTransaction{txnFor("jobA_1"), txnFor("jobA_2")}
+	jobB := []blnk.ExternalTransaction{txnFor("jobB_1"), txnFor("jobB_2")}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = h.rem.ProcessCohort(context.Background(), jobA, "upload_A") }()
+	go func() { defer wg.Done(); _ = h.rem.ProcessCohort(context.Background(), jobB, "upload_B") }()
+	wg.Wait()
+
+	// Every confirmed break resolved independently, across both concurrent jobs.
+	for _, id := range []string{"jobA_1", "jobA_2", "jobB_1"} {
+		if status, _ := h.back.statusOf(id); status != statusAutoResolved {
+			t.Fatalf("confirmed break %q must be auto-resolved across concurrent jobs, got %q", id, status)
+		}
+	}
+	// The single unmatched break fails closed to HITL WITHOUT affecting its job's
+	// resolved sibling (jobB_1) — no cross-break suppression (F18).
+	if status, _ := h.back.statusOf("jobB_2"); status != statusQueued {
+		t.Fatalf("unmatched break jobB_2 must be queued to HITL, got %q", status)
+	}
+	if _, queued := h.back.inHITL("jobB_2"); !queued {
+		t.Fatal("unmatched break jobB_2 must be enqueued in the HITL queue")
+	}
+	// Each concurrent job established its OWN initial reconciliation (F02), and
+	// all four breaks were probed independently.
+	if got := h.bnk.establishCount(); got != 2 {
+		t.Fatalf("each concurrent job must establish its own initial reconciliation: want 2, got %d", got)
+	}
+	if probed := h.bnk.probedTxns(); len(probed) != 4 {
+		t.Fatalf("each break must get its OWN probe across both jobs: want 4, got %v", probed)
 	}
 }
 
