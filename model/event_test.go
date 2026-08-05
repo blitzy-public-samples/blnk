@@ -1,0 +1,951 @@
+/*
+Copyright 2024 Blnk Finance Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+package model
+
+import (
+	"encoding/json"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// These tests pin the Kafka event contract declared in event.go — the canonical
+// JSON event schema, the event-type-to-category mapping, and the status and
+// category vocabularies that the topic-naming, persistence, relay, dead-letter
+// and metrics layers all agree on.
+//
+// Two properties make them worth reading rather than skimming.
+//
+// First, every assertion pins an EXACT VALUE and carries a message explaining
+// what breaks if that value drifts. A shape-only assertion ("not empty", "no
+// error") would let a silent contract change through: a renamed JSON tag becomes
+// a runtime row-scan failure rather than a compile error, and a retargeted
+// category token silently renames a Kafka topic. Those are precisely the
+// failures a compiler cannot catch, which is why they are pinned here.
+//
+// Second, the coverage of EventCategory's branches is deliberately exhaustive —
+// all thirteen emitted event strings written out as literals, plus the prefix
+// boundary, the case-sensitivity boundary and the catch-all default arm. That is
+// what keeps the model package above the repository's mutation-score gate
+// (MUTATION_THRESHOLD=80, enforced by the makefile's `mutate` target, which runs
+// gremlins from inside this directory), following the same rationale documented
+// at the top of mutation_killers_test.go: a mutant is only killed by a test that
+// pins the exact behaviour it perturbs.
+//
+// Everything here is a pure in-process assertion. No broker, no database, no
+// network call and no configuration load is involved, so the whole file runs
+// under `go test -short`.
+
+// jsonTagName returns the name portion of a struct field's json tag, discarding
+// any option suffix such as ",omitempty".
+//
+// It is written as a manual scan rather than a strings.Split so that this file
+// needs no import beyond the four standard-library packages and testify: the
+// import set is part of the contract that these tests stay dependency-free.
+func jsonTagName(tag string) string {
+	for i := 0; i < len(tag); i++ {
+		if tag[i] == ',' {
+			return tag[:i]
+		}
+	}
+	return tag
+}
+
+// jsonTagNames returns the json tag names of every field of a struct type, in
+// declaration order, with option suffixes stripped. Declaration order is
+// preserved because encoding/json emits struct keys in that order, so the
+// sequence itself is part of the observable wire shape.
+func jsonTagNames(t *testing.T, typ reflect.Type) []string {
+	t.Helper()
+	require.Equal(t, reflect.Struct, typ.Kind(), "jsonTagNames is only meaningful for a struct type")
+
+	names := make([]string, 0, typ.NumField())
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		tag := field.Tag.Get("json")
+		require.NotEmpty(t, tag, "field %s must carry an explicit json tag: an untagged field marshals under its Go name, which would not match its database column or its documented wire key", field.Name)
+		names = append(names, jsonTagName(tag))
+	}
+	return names
+}
+
+// mustMarshal marshals v and fails the test immediately if it cannot, so that a
+// marshalling failure is reported as itself rather than as a confusing downstream
+// assertion failure on empty bytes.
+func mustMarshal(t *testing.T, v interface{}) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err, "marshalling the event contract must never fail")
+	return b
+}
+
+// decodeObject decodes a JSON object into a map of raw values. Decoding into
+// json.RawMessage rather than interface{} is essential to every byte-fidelity
+// assertion in this file: interface{} would turn the payload into a
+// map[string]interface{}, reordering its keys and renormalising its numbers, and
+// the very thing under test would be destroyed by the test's own decoding.
+func decodeObject(t *testing.T, b []byte) map[string]json.RawMessage {
+	t.Helper()
+	out := map[string]json.RawMessage{}
+	require.NoError(t, json.Unmarshal(b, &out), "the marshaled form must be a JSON object")
+	return out
+}
+
+// TestEventCategory_ResolvesEveryEmittedEventString walks the complete catalogue
+// of event strings Blnk actually emits and asserts each one resolves to the
+// category token that routes it to the right topic.
+//
+// Every event string below is written as a LITERAL and never composed from a
+// constant or generated by a loop. That is the whole point of the table: it must
+// fail when a mapping arm in event.go is dropped, renamed or retargeted, and a
+// table built from the constants under test could not detect any of those.
+//
+// The catalogue was taken from the producers themselves, not from documentation:
+// seven names from the transaction status-to-event mapping (including
+// "transaction.unknown", which the COMMIT status genuinely falls through to —
+// pre-existing behaviour that is preserved deliberately so the dual-delivery
+// payload comparison stays exact), the runtime-composed bulk transaction names,
+// "ledger.created", "identity.created", "balance.created", "balance.monitor",
+// and "system.error" raised through the registered webhook-sender indirection.
+//
+// On the fourth `system` category: it is deliberate, not an accident of
+// implementation. "ledger.created" and "system.error" are genuinely emitted yet
+// belong to none of the three categories the requirements name, while the
+// coverage requirement is absolute — every event type that reaches the legacy
+// webhook sender must be published, with zero exceptions. A fourth category
+// following the identical naming convention satisfies both; forcing those two
+// onto an unrelated topic would corrupt that topic's semantics for every
+// subscriber filtering on it, and dropping them would breach coverage outright.
+func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType string
+		want      string
+		reason    string
+	}{
+		// --- transactions: the seven names the status-to-event mapping returns ---
+		{
+			name:      "transaction queued",
+			eventType: "transaction.queued",
+			want:      EventCategoryTransactions,
+			reason:    "transaction lifecycle events must route to the transactions category",
+		},
+		{
+			name:      "transaction applied",
+			eventType: "transaction.applied",
+			want:      EventCategoryTransactions,
+			reason:    "transaction lifecycle events must route to the transactions category",
+		},
+		{
+			name:      "transaction scheduled",
+			eventType: "transaction.scheduled",
+			want:      EventCategoryTransactions,
+			reason:    "transaction lifecycle events must route to the transactions category",
+		},
+		{
+			name:      "transaction inflight",
+			eventType: "transaction.inflight",
+			want:      EventCategoryTransactions,
+			reason:    "transaction lifecycle events must route to the transactions category",
+		},
+		{
+			name:      "transaction void",
+			eventType: "transaction.void",
+			want:      EventCategoryTransactions,
+			reason:    "transaction lifecycle events must route to the transactions category",
+		},
+		{
+			name:      "transaction rejected",
+			eventType: "transaction.rejected",
+			want:      EventCategoryTransactions,
+			reason:    "transaction.rejected is emitted from two places — the execution path and the worker rejection handler — so losing this arm drops events from both",
+		},
+		{
+			name:      "transaction unknown",
+			eventType: "transaction.unknown",
+			want:      EventCategoryTransactions,
+			reason:    "transaction.unknown is reachable, not a placeholder: the status-to-event mapping has no COMMIT case, so a committed inflight transaction falls through to it and its events must still reach the transactions topic",
+		},
+
+		// --- transactions: bulk names, composed at runtime as prefix + status ---
+		{
+			name:      "bulk transaction applied",
+			eventType: "bulk_transaction.applied",
+			want:      EventCategoryTransactions,
+			reason:    "bulk_transaction.applied is emitted on both the synchronous and asynchronous batch success paths",
+		},
+		{
+			name:      "bulk transaction failed",
+			eventType: "bulk_transaction.failed",
+			want:      EventCategoryTransactions,
+			reason:    "bulk_transaction.failed is emitted by the asynchronous batch failure handler",
+		},
+		{
+			name:      "bulk transaction with a status not emitted today",
+			eventType: "bulk_transaction.partially_applied",
+			want:      EventCategoryTransactions,
+			reason:    "this status is NOT emitted today and that is the point: bulk event names are composed at runtime as \"bulk_transaction.\" + status, so the suffix set is open. Matching by prefix is what routes any future status correctly; exact-match routing would silently misroute it to the catch-all category instead",
+		},
+
+		// --- balances ---
+		{
+			name:      "balance created",
+			eventType: "balance.created",
+			want:      EventCategoryBalances,
+			reason:    "balance creation events must route to the balances category",
+		},
+		{
+			name:      "balance monitor",
+			eventType: "balance.monitor",
+			want:      EventCategoryBalances,
+			reason:    "balance monitor alerts are balance events, not system events, and must route to the balances category",
+		},
+
+		// --- identities ---
+		{
+			name:      "identity created",
+			eventType: "identity.created",
+			want:      EventCategoryIdentities,
+			reason:    "identity events must route to the identities category",
+		},
+
+		// --- system: the two event types outside the three named categories ---
+		{
+			name:      "ledger created",
+			eventType: "ledger.created",
+			want:      EventCategorySystem,
+			reason:    "ledger.created belongs to none of the three named categories, so it routes to the deliberate fourth one rather than being dropped",
+		},
+		{
+			name:      "system error",
+			eventType: "system.error",
+			want:      EventCategorySystem,
+			reason:    "system.error is emitted indirectly through the registered webhook-sender closure, and is covered like every other event type",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, EventCategory(tt.eventType), tt.reason)
+		})
+	}
+
+	// Guard the table itself. Thirteen distinct event types are emitted today:
+	// the seven transaction names, the runtime-composed bulk name, ledger,
+	// identity, the two balance names, and the system error. The bulk name is
+	// exercised with three concrete suffixes, so the table holds fifteen rows.
+	// Asserting the count stops a future edit from quietly deleting a row and
+	// leaving an event type unproven.
+	assert.Len(t, tests, 15, "the table must cover all thirteen emitted event types, with the runtime-composed bulk name exercised by three suffixes")
+}
+
+// TestEventCategory_UnknownEventFallsBackToSystem pins the catch-all arm.
+//
+// The default is what keeps the coverage guarantee true for event types that do
+// not exist yet: a producer added later that forgets to extend the mapping still
+// gets its events published to a real topic where they are observable, instead of
+// being rejected or silently dropped. That behaviour is load-bearing, so it is
+// asserted rather than assumed.
+func TestEventCategory_UnknownEventFallsBackToSystem(t *testing.T) {
+	assert.Equal(t, EventCategorySystem, EventCategory("totally.unknown.event"),
+		"an unrecognised event type must fall back to the system category — dropping it or returning an empty token would breach the zero-exceptions coverage guarantee for event types added later")
+
+	assert.Equal(t, EventCategorySystem, EventCategory(""),
+		"the empty event type must also resolve to a real category: the resolver is total, so no input can ever produce an empty category token that would then compose a malformed topic name")
+}
+
+// TestEventCategory_PrefixBoundaryIsExact pins the boundary between the
+// prefix-matched bulk arm and the exact-matched arms.
+//
+// Three near-misses are asserted because each catches a different mistake: a
+// mutated prefix constant, a prefix test swapped for an equality or suffix test,
+// and an exact arm loosened into a prefix match.
+func TestEventCategory_PrefixBoundaryIsExact(t *testing.T) {
+	assert.Equal(t, EventCategoryTransactions, EventCategory("bulk_transaction."),
+		"the bare prefix with an empty status must still satisfy the prefix test; requiring a non-empty suffix would be a stricter rule than the producer guarantees")
+
+	assert.Equal(t, EventCategorySystem, EventCategory("bulk_transaction"),
+		"\"bulk_transaction\" without the trailing dot is not an emitted event string and must NOT satisfy the prefix test — the separator is part of the prefix, so dropping it from the constant is caught here")
+
+	assert.Equal(t, EventCategorySystem, EventCategory("transaction.applied.v2"),
+		"the transaction arms are exact matches, not prefix matches: a longer string that merely starts with an emitted name must fall through to the catch-all rather than being routed as if it were that event")
+}
+
+// TestEventCategory_IsCaseSensitive documents that no case normalisation happens.
+//
+// Producers pass the exact literals, so folding case would add a branch with no
+// behavioural benefit that then has to be mutation-tested. Pinning the absence of
+// folding is what catches a mutant — or a well-meaning refactor — that inserts it.
+func TestEventCategory_IsCaseSensitive(t *testing.T) {
+	assert.Equal(t, EventCategorySystem, EventCategory("TRANSACTION.APPLIED"),
+		"comparison is exact and case-sensitive: an upper-cased event type is not an emitted event string and must fall through to the catch-all, not be folded into the transactions category")
+
+	assert.Equal(t, EventCategorySystem, EventCategory("BULK_TRANSACTION.applied"),
+		"the prefix test is case-sensitive too, for the same reason: producers compose the lower-case prefix literally")
+}
+
+// TestBulkTransactionEventPrefix_IsTheProducerLiteral pins the prefix constant to
+// the exact literal the bulk producer composes its event names from.
+//
+// The producer builds the name as "bulk_transaction." + status. If this constant
+// and that literal ever disagree, every bulk event silently routes to the
+// catch-all category instead of the transactions topic — a failure with no
+// compile error, no runtime error and no log line, visible only as events
+// arriving on the wrong topic. Pinning both halves of the agreement is the only
+// way to catch it.
+func TestBulkTransactionEventPrefix_IsTheProducerLiteral(t *testing.T) {
+	assert.Equal(t, "bulk_transaction.", bulkTransactionEventPrefix,
+		"the prefix must match the literal the bulk transaction producer prepends to the batch status, including the trailing dot separator")
+}
+
+// TestSchemaVersionV1_IsOne pins the initial envelope version.
+func TestSchemaVersionV1_IsOne(t *testing.T) {
+	assert.Equal(t, 1, SchemaVersionV1,
+		"the canonical event schema starts at version 1: subscribers branch on schema_version to tell an additive change they can ignore from a breaking reshaping, so the first published version must be 1")
+
+	// Pinning the type as well as the value matters because the wire form differs:
+	// an integer marshals as 1 while a string would marshal as "1", and the schema
+	// specifies an integer.
+	assert.Equal(t, reflect.Int, reflect.TypeOf(SchemaVersionV1).Kind(),
+		"schema_version is specified as an integer, so the constant must default to int and marshal as 1 rather than \"1\"")
+}
+
+// TestEventCategoryConstants_HaveWireValues pins the four category tokens.
+//
+// These are bare tokens, not topic names: the topic-naming layer composes
+// "<prefix>.<category>" and "<prefix>.<category>.dlt" from them. Changing one of
+// these values therefore silently renames a Kafka topic and its dead-letter
+// sibling, orphaning every subscriber already consuming the old name and every
+// message already sitting on it. That is why the tokens are pinned as literals
+// here rather than merely being assumed distinct.
+func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
+	assert.Equal(t, "transactions", EventCategoryTransactions,
+		"the transactions token composes blnk.transactions and blnk.transactions.dlt")
+	assert.Equal(t, "balances", EventCategoryBalances,
+		"the balances token composes blnk.balances and blnk.balances.dlt")
+	assert.Equal(t, "identities", EventCategoryIdentities,
+		"the identities token composes blnk.identities and blnk.identities.dlt")
+	assert.Equal(t, "system", EventCategorySystem,
+		"the system token composes blnk.system and blnk.system.dlt — the deliberate fourth category that keeps ledger and system-error events covered")
+
+	// The four must be mutually distinct, or two categories would collapse onto
+	// one topic and a subscriber filtering by topic would receive events it never
+	// subscribed to.
+	distinct := map[string]struct{}{
+		EventCategoryTransactions: {},
+		EventCategoryBalances:     {},
+		EventCategoryIdentities:   {},
+		EventCategorySystem:       {},
+	}
+	assert.Len(t, distinct, 4,
+		"the four category tokens must be mutually distinct: two sharing a value would silently merge two topics into one")
+
+	// A category token must never contain the separator the topic-naming layer
+	// uses, or "<prefix>.<category>" would produce an extra segment and the
+	// resulting topic would not be the documented one.
+	for _, category := range []string{EventCategoryTransactions, EventCategoryBalances, EventCategoryIdentities, EventCategorySystem} {
+		for i := 0; i < len(category); i++ {
+			assert.NotEqual(t, byte('.'), category[i],
+				"category token %q must not contain a dot: the topic-naming layer owns the separator, and an embedded one would add an unintended topic segment", category)
+		}
+	}
+}
+
+// TestPublishStatus_HasExactlyTheThreeReportedOutcomes pins the per-attempt
+// publish outcome vocabulary.
+//
+// The metrics layer uses these values verbatim as metric attribute values — the
+// publish-attempts counter is attributed by outcome — so a drift here does not
+// break a build, it breaks the alerting queries that select on those attribute
+// values. Declaring the vocabulary once and pinning it once is what stops the code
+// and the label set from diverging unnoticed.
+func TestPublishStatus_HasExactlyTheThreeReportedOutcomes(t *testing.T) {
+	// PublishStatus is a named string type, so the comparison is made on the
+	// converted value: a typed constant and an untyped string literal are not
+	// deeply equal, and asserting them directly would fail for the wrong reason.
+	assert.Equal(t, "dispatched", string(PublishStatusDispatched),
+		"a broker acknowledgement is reported as \"dispatched\" — the value the publish-attempts counter carries as its outcome attribute")
+	assert.Equal(t, "retrying", string(PublishStatusRetrying),
+		"a failure inside the retry budget is reported as \"retrying\", distinguishing a transient blip from a final give-up in the metrics")
+	assert.Equal(t, "dead_lettered", string(PublishStatusDeadLettered),
+		"retry exhaustion is reported as \"dead_lettered\", the value the dead-letter alerting rule selects on")
+
+	assert.Equal(t, reflect.String, reflect.TypeOf(PublishStatusDispatched).Kind(),
+		"PublishStatus must remain a string-kinded named type so it can be used directly as a metric attribute value without conversion tables")
+
+	distinct := map[PublishStatus]struct{}{
+		PublishStatusDispatched:   {},
+		PublishStatusRetrying:     {},
+		PublishStatusDeadLettered: {},
+	}
+	assert.Len(t, distinct, 3,
+		"exactly three outcomes are reported, and they must be mutually distinct: collapsing two would make a retry indistinguishable from a success in the metrics")
+}
+
+// TestEventOutboxStatus_ValuesAndLineageRelationship pins the durable outbox
+// state vocabulary and its documented value-level relationship to the lineage
+// outbox.
+//
+// These values are stored in the status column and filtered on by the relay's
+// claim query and by the table's partial indexes, so a drift between the Go
+// constant and the SQL predicate produces a relay that claims nothing while
+// reporting no error at all.
+func TestEventOutboxStatus_ValuesAndLineageRelationship(t *testing.T) {
+	t.Run("the five durable states have their stored values", func(t *testing.T) {
+		assert.Equal(t, "pending", EventOutboxStatusPending,
+			"pending is the initial state set by the column default when the row is inserted alongside the ledger mutation, and the value the pending partial index filters on")
+		assert.Equal(t, "processing", EventOutboxStatusProcessing,
+			"processing means a relay holds a lease on the row, and is one of the two values the composite claim index is restricted to")
+		assert.Equal(t, "dispatched", EventOutboxStatusDispatched,
+			"dispatched is the success terminal state, named to match the dispatched_at column")
+		assert.Equal(t, "failed", EventOutboxStatusFailed,
+			"failed means the retry budget was exhausted, and is the value the failed partial index filters on")
+		assert.Equal(t, "dead_lettered", EventOutboxStatusDeadLettered,
+			"dead_lettered is the failure terminal state and the only state eligible for replay, so the dead-letter listing query selects exactly this value")
+
+		distinct := map[string]struct{}{
+			EventOutboxStatusPending:      {},
+			EventOutboxStatusProcessing:   {},
+			EventOutboxStatusDispatched:   {},
+			EventOutboxStatusFailed:       {},
+			EventOutboxStatusDeadLettered: {},
+		}
+		assert.Len(t, distinct, 5,
+			"the five states must be mutually distinct: two sharing a value would make the state machine ambiguous and the claim query non-deterministic")
+	})
+
+	t.Run("three values are shared with the lineage outbox vocabulary", func(t *testing.T) {
+		// The overlap is asserted BY VALUE, not by reusing the lineage constants
+		// in event.go. That is the documented arrangement: the shared values are
+		// what let the partial-index convention proven on the lineage outbox
+		// table carry over to the event outbox table unchanged, while the two
+		// vocabularies stay separate declarations so the two state machines —
+		// separate tables served by separate relays — can evolve independently.
+		// lineage.go is not modified by this feature; this test pins the
+		// relationship without touching it.
+		assert.Equal(t, OutboxStatusPending, EventOutboxStatusPending,
+			"the pending value is shared with the lineage outbox so the pending partial index convention carries over unchanged")
+		assert.Equal(t, OutboxStatusProcessing, EventOutboxStatusProcessing,
+			"the processing value is shared with the lineage outbox so the composite claim index convention carries over unchanged")
+		assert.Equal(t, OutboxStatusFailed, EventOutboxStatusFailed,
+			"the failed value is shared with the lineage outbox so the failed partial index convention carries over unchanged")
+	})
+
+	t.Run("the event vocabulary diverges where the pipelines differ", func(t *testing.T) {
+		// completed has no counterpart: dispatched names the same idea in this
+		// pipeline's language and matches its column. dead_lettered has no
+		// lineage equivalent at all, because the lineage machine has no terminal
+		// state meaning "we gave up and preserved the event for replay".
+		assert.NotEqual(t, OutboxStatusCompleted, EventOutboxStatusDispatched,
+			"the event pipeline's success state is \"dispatched\", not the lineage outbox's \"completed\": the two must not be conflated, because the event table's column is dispatched_at")
+		assert.NotEqual(t, OutboxStatusCompleted, EventOutboxStatusDeadLettered,
+			"dead_lettered has no lineage equivalent — it is the state that distinguishes a preserved, replayable event from a plain failure")
+		assert.NotEqual(t, OutboxStatusFailed, EventOutboxStatusDeadLettered,
+			"failed and dead_lettered are distinct states: a row is failed once its budget is spent and only becomes dead_lettered once the event has actually been written to its dead-letter topic, and only the latter is replayable")
+	})
+}
+
+// legacyWebhookBody is the payload fixture used by the byte-fidelity tests.
+//
+// It reproduces the shape of today's webhook HTTP body — the marshaled two-key
+// object {"event": ..., "data": ...} — because the resolved reading of "payload
+// matching today's webhook body field-for-field" is that the ENTIRE object is
+// carried, both keys included, so an existing subscriber's body parser keeps
+// working unchanged and only the transport differs.
+//
+// Three properties of this literal are deliberate:
+//
+//   - It is COMPACT — no spaces, no newlines. encoding/json compacts a
+//     json.RawMessage when marshalling it, so byte equality is only observable
+//     when the input is already compact. The compaction behaviour itself is
+//     documented by a separate sub-test so it cannot contaminate this one.
+//   - Its keys are in NON-ALPHABETICAL order ("zeta" before "alpha"). Any decode
+//     into a map and re-encode would sort them, so this ordering makes key
+//     reordering visible rather than theoretical.
+//   - It carries a HIGH-PRECISION numeric string that no float64 can represent
+//     exactly. Renormalising the literal through a number type would corrupt it
+//     visibly, which is the failure mode this fixture exists to expose.
+const legacyWebhookBody = `{"event":"transaction.applied","data":{"zeta":1,"alpha":2,"precise_amount":"100000000000000000001"}}`
+
+// TestLedgerEvent_PayloadIsRawMessage pins the payload field type on both the
+// wire envelope and the persisted row.
+//
+// The type is the guarantee. A map[string]interface{} would sort keys on re-encode
+// and turn every number into a float64; a typed struct would drop unknown fields
+// and re-render known ones. Either would make the dual-delivery byte-equality
+// guarantee and the byte-for-byte dead-letter replay guarantee unachievable —
+// not merely harder to test, but false. json.RawMessage is what makes the bytes
+// pass through untransformed from the producer, through the outbox row, to the
+// broker and back out again on a replay.
+func TestLedgerEvent_PayloadIsRawMessage(t *testing.T) {
+	rawMessageType := reflect.TypeOf(json.RawMessage(nil))
+
+	t.Run("LedgerEvent.Payload", func(t *testing.T) {
+		field, ok := reflect.TypeOf(LedgerEvent{}).FieldByName("Payload")
+		require.True(t, ok, "LedgerEvent must declare a Payload field: it is the field that carries the legacy webhook body verbatim")
+		assert.Equal(t, rawMessageType, field.Type,
+			"LedgerEvent.Payload must be json.RawMessage so the published bytes are the bytes the producer marshaled; a map or a typed struct would reorder keys and renormalise numbers")
+	})
+
+	t.Run("EventOutbox.Payload", func(t *testing.T) {
+		field, ok := reflect.TypeOf(EventOutbox{}).FieldByName("Payload")
+		require.True(t, ok, "EventOutbox must declare a Payload field: it is the stored copy both transports read during the dual-delivery window")
+		assert.Equal(t, rawMessageType, field.Type,
+			"EventOutbox.Payload must be json.RawMessage so the stored JSONB bytes are neither reordered nor renormalised between the insert and the publish — that identity is what makes the two transports' payloads equal structurally rather than by careful coding")
+	})
+
+	t.Run("EventOutbox.FailureMetadata", func(t *testing.T) {
+		field, ok := reflect.TypeOf(EventOutbox{}).FieldByName("FailureMetadata")
+		require.True(t, ok, "EventOutbox must declare a FailureMetadata field: it is the stored dead-letter diagnostic record")
+		assert.Equal(t, rawMessageType, field.Type,
+			"EventOutbox.FailureMetadata must be json.RawMessage so the stored bytes are handed back to the dead-letter API exactly as they were written, rather than being re-rendered by a decode-and-re-encode round trip")
+	})
+}
+
+// TestLedgerEvent_PayloadBytesSurviveMarshalUnchanged is the byte-identity round
+// trip, and it is the mechanical basis of two acceptance criteria.
+//
+// Dual-delivery consistency holds because the relay publishes to Kafka and
+// enqueues the legacy webhook task from the SAME claimed outbox row, so both
+// transports carry the same payload bytes and cannot drift apart. Replay fidelity
+// holds because a replay re-publishes the STORED BYTES to the original topic
+// rather than re-marshalling from a struct, so the replayed event matches the
+// original byte-for-byte aside from the failure metadata. Both guarantees reduce
+// to one question: does marshalling an envelope leave its payload bytes alone?
+// This test answers it exactly.
+//
+// Byte equality is asserted on the strings, deliberately not with a JSON-semantic
+// comparison. A semantic comparison would pass even if the keys were reordered and
+// the numbers renormalised, which is precisely the failure being excluded.
+func TestLedgerEvent_PayloadBytesSurviveMarshalUnchanged(t *testing.T) {
+	raw := json.RawMessage(legacyWebhookBody)
+
+	event := LedgerEvent{
+		EventID:       "8f14e45f-ea8f-4b3a-9c2d-0a7b6c5d4e3f",
+		EventType:     "transaction.applied",
+		AggregateID:   "txn_9f2b1c",
+		OccurredAt:    time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		Payload:       raw,
+		SchemaVersion: SchemaVersionV1,
+	}
+
+	t.Run("payload bytes are identical after a marshal round trip", func(t *testing.T) {
+		decoded := decodeObject(t, mustMarshal(t, event))
+
+		got, ok := decoded["payload"]
+		require.True(t, ok, "the marshaled envelope must carry a payload key")
+		assert.Equal(t, legacyWebhookBody, string(got),
+			"the payload bytes must survive marshalling unchanged, byte for byte. This identity is what makes the Kafka message and the legacy webhook body equal during the dual-delivery window, and what lets a dead-letter replay reproduce the original event exactly by re-publishing stored bytes instead of re-marshalling a struct")
+
+		// State the two failure modes explicitly, so a regression reports which
+		// one occurred rather than only that the bytes differ.
+		assert.Equal(t, `{"event":"transaction.applied","data":{"zeta":1,"alpha":2,"precise_amount":"100000000000000000001"}}`, string(got),
+			"neither key order nor number rendering may change: \"zeta\" must still precede \"alpha\" (no map round trip sorted them) and the 21-digit precise amount must still be the exact literal (no float64 renormalised it)")
+	})
+
+	t.Run("the payload is not re-nested or wrapped", func(t *testing.T) {
+		decoded := decodeObject(t, mustMarshal(t, event))
+
+		// Decode one level in and assert the two legacy keys are still the
+		// payload's own top-level keys. If the envelope ever wrapped the payload
+		// in another object, an existing subscriber's body parser would break even
+		// though the bytes round-tripped.
+		inner := decodeObject(t, decoded["payload"])
+		assert.Len(t, inner, 2,
+			"the payload must remain the legacy webhook body's own two-key object — the entire {\"event\": ..., \"data\": ...} object is carried, both keys included, so a subscriber's existing parser works unchanged")
+		assert.Equal(t, `"transaction.applied"`, string(inner["event"]),
+			"the payload's inner event key is preserved verbatim, which is why the envelope's event_type is a redundant convenience for routing rather than a replacement for it")
+		assert.Equal(t, `{"zeta":1,"alpha":2,"precise_amount":"100000000000000000001"}`, string(inner["data"]),
+			"the payload's data object is preserved verbatim, including its declared key order")
+	})
+
+	t.Run("a pretty-printed payload is compacted, never reordered", func(t *testing.T) {
+		// Documented separately so it cannot weaken the byte-identity assertion
+		// above. encoding/json strips insignificant whitespace from a
+		// json.RawMessage when marshalling it, but it never reorders keys and
+		// never renormalises number literals. The practical consequence for the
+		// producers: store the payload compact, and byte identity holds all the
+		// way through.
+		pretty := LedgerEvent{
+			EventID:       event.EventID,
+			EventType:     event.EventType,
+			AggregateID:   event.AggregateID,
+			OccurredAt:    event.OccurredAt,
+			SchemaVersion: event.SchemaVersion,
+			Payload: json.RawMessage("{\n  \"event\": \"transaction.applied\",\n  " +
+				"\"data\": {\n    \"zeta\": 1,\n    \"alpha\": 2,\n    " +
+				"\"precise_amount\": \"100000000000000000001\"\n  }\n}"),
+		}
+
+		decoded := decodeObject(t, mustMarshal(t, pretty))
+		assert.Equal(t, legacyWebhookBody, string(decoded["payload"]),
+			"insignificant whitespace is stripped, but the key order and the exact numeric literal are untouched — so a payload stored compact is republished byte-identically, and one stored pretty-printed is compacted deterministically rather than reshaped")
+	})
+}
+
+// TestLedgerEvent_WireContract pins the exact serialised shape of the envelope:
+// the complete key set, the timestamp format, and the schema version.
+//
+// The key set is asserted by LENGTH as well as by membership, so that adding a
+// field to the struct fails here. That is intentional. The six keys are the
+// subscriber-facing contract, and a new key that appears without a deliberate
+// decision is a contract change made by accident.
+func TestLedgerEvent_WireContract(t *testing.T) {
+	event := LedgerEvent{
+		EventID:       "8f14e45f-ea8f-4b3a-9c2d-0a7b6c5d4e3f",
+		EventType:     "balance.monitor",
+		AggregateID:   "bln_4c7d2e",
+		OccurredAt:    time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		Payload:       json.RawMessage(legacyWebhookBody),
+		SchemaVersion: SchemaVersionV1,
+	}
+	decoded := decodeObject(t, mustMarshal(t, event))
+
+	t.Run("the key set is exactly the six documented keys", func(t *testing.T) {
+		for _, key := range []string{"event_id", "event_type", "aggregate_id", "occurred_at", "payload", "schema_version"} {
+			assert.Contains(t, decoded, key,
+				"the envelope must always carry %q: no field is omitempty, so a subscriber can rely on all six keys being present on every message even when a value is at its zero value", key)
+		}
+		assert.Len(t, decoded, 6,
+			"the envelope must carry exactly six keys — an added or renamed key is a change to the subscriber-facing contract and must be a deliberate decision, not a side effect of editing the struct")
+	})
+
+	t.Run("the declared json tag names match the wire keys", func(t *testing.T) {
+		assert.Equal(t,
+			[]string{"event_id", "event_type", "aggregate_id", "occurred_at", "payload", "schema_version"},
+			jsonTagNames(t, reflect.TypeOf(LedgerEvent{})),
+			"the tags must be the documented snake_case keys in declaration order: encoding/json emits struct keys in that order, so the sequence is itself part of the observable wire shape")
+	})
+
+	t.Run("occurred_at is RFC3339", func(t *testing.T) {
+		assert.Equal(t, `"2026-01-02T03:04:05Z"`, string(decoded["occurred_at"]),
+			"occurred_at must serialise as RFC3339. time.Time's standard encoding already produces it, so no custom marshaller is defined or wanted — adding one would be a way to break the documented format silently")
+
+		var occurredAt string
+		require.NoError(t, json.Unmarshal(decoded["occurred_at"], &occurredAt), "occurred_at must be a JSON string")
+		assert.Equal(t, "2026-01-02T03:04:05Z", occurredAt,
+			"a UTC instant with zero nanoseconds encodes unambiguously with the Z designator and no fractional part")
+
+		parsed, err := time.Parse(time.RFC3339, occurredAt)
+		require.NoError(t, err, "the emitted timestamp must parse back with time.RFC3339: a subscriber in any language relies on that")
+		assert.True(t, parsed.Equal(event.OccurredAt),
+			"the round-tripped instant must equal the original — no truncation and no zone shift")
+	})
+
+	t.Run("schema_version marshals as the integer 1", func(t *testing.T) {
+		assert.Equal(t, "1", string(decoded["schema_version"]),
+			"schema_version must marshal as the bare integer 1, not the string \"1\": subscribers branch on it numerically")
+
+		var schemaVersion int
+		require.NoError(t, json.Unmarshal(decoded["schema_version"], &schemaVersion), "schema_version must be a JSON number")
+		assert.Equal(t, SchemaVersionV1, schemaVersion,
+			"the serialised version must be the value of SchemaVersionV1, so a future bump of that constant flows straight to the wire with no second literal to remember")
+	})
+
+	t.Run("the scalar envelope fields are carried verbatim", func(t *testing.T) {
+		assert.Equal(t, `"8f14e45f-ea8f-4b3a-9c2d-0a7b6c5d4e3f"`, string(decoded["event_id"]),
+			"event_id is carried verbatim: it is the subscriber idempotency key, so any transformation of it would break duplicate suppression")
+		assert.Equal(t, `"balance.monitor"`, string(decoded["event_type"]),
+			"event_type is carried verbatim so subscribers can route and filter on it without parsing the payload")
+		assert.Equal(t, `"bln_4c7d2e"`, string(decoded["aggregate_id"]),
+			"aggregate_id is carried verbatim: it is what a consumer groups by once the messages arrive")
+	})
+}
+
+// TestFailureMetadata_HasExactlyFiveFields pins the dead-letter diagnostic record.
+//
+// The five fields are exactly the five the requirement enumerates — original
+// topic, error reason, attempt count, first attempted at, last attempted at — and
+// they answer the three questions an operator triaging a dead-lettered event
+// always has: where was this meant to go, why did it not get there, and over what
+// window did we try. The field COUNT is asserted alongside the tags so that
+// neither a dropped field nor an undocumented addition can pass.
+func TestFailureMetadata_HasExactlyFiveFields(t *testing.T) {
+	typ := reflect.TypeOf(FailureMetadata{})
+
+	assert.Equal(t, 5, typ.NumField(),
+		"the failure metadata must carry exactly the five specified fields: fewer leaves an operator unable to triage, and more is an undocumented addition to a published dead-letter schema")
+
+	assert.Equal(t,
+		[]string{"original_topic", "error_reason", "attempt_count", "first_attempted_at", "last_attempted_at"},
+		jsonTagNames(t, typ),
+		"the json tags are the published dead-letter schema — a rename would break every operator query and dashboard reading them, with no compile error to warn of it")
+
+	t.Run("field types match their meaning", func(t *testing.T) {
+		attemptCount, ok := typ.FieldByName("AttemptCount")
+		require.True(t, ok, "FailureMetadata must declare AttemptCount")
+		assert.Equal(t, reflect.Int, attemptCount.Type.Kind(),
+			"attempt_count must be an integer so it marshals as a bare number an alerting rule can compare numerically")
+
+		for _, name := range []string{"FirstAttemptedAt", "LastAttemptedAt"} {
+			field, ok := typ.FieldByName(name)
+			require.True(t, ok, "FailureMetadata must declare %s", name)
+			assert.Equal(t, reflect.TypeOf(time.Time{}), field.Type,
+				"%s must be a plain time.Time, not a pointer: by the time an event is dead-lettered it has definitively been attempted, so both timestamps are always known and neither is nullable", name)
+		}
+	})
+
+	t.Run("the record serialises with all five keys", func(t *testing.T) {
+		first := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+		last := time.Date(2026, 1, 2, 3, 4, 35, 0, time.UTC)
+
+		decoded := decodeObject(t, mustMarshal(t, FailureMetadata{
+			OriginalTopic:    "blnk.transactions",
+			ErrorReason:      "write tcp 10.0.0.4:9092: broken pipe",
+			AttemptCount:     5,
+			FirstAttemptedAt: first,
+			LastAttemptedAt:  last,
+		}))
+
+		assert.Len(t, decoded, 5, "all five keys must be present — none is omitempty, so an operator never has to distinguish a missing key from a zero value")
+		assert.Equal(t, `"blnk.transactions"`, string(decoded["original_topic"]),
+			"original_topic records the topic a replay must send the event back to, so it is the field the replay path depends on")
+		assert.Equal(t, `"write tcp 10.0.0.4:9092: broken pipe"`, string(decoded["error_reason"]),
+			"error_reason carries the final attempt's failure verbatim, taken from the row's last recorded error")
+		assert.Equal(t, "5", string(decoded["attempt_count"]),
+			"attempt_count marshals as a bare integer: it is how many attempts were made before giving up, matching the configured retry budget of five")
+		assert.Equal(t, `"2026-01-02T03:04:05Z"`, string(decoded["first_attempted_at"]),
+			"first_attempted_at is RFC3339, consistent with the envelope's occurred_at")
+		assert.Equal(t, `"2026-01-02T03:04:35Z"`, string(decoded["last_attempted_at"]),
+			"last_attempted_at is RFC3339; together with first_attempted_at it bounds the window over which the failure persisted, which is what distinguishes a momentary broker blip from a sustained outage")
+	})
+}
+
+// TestFailureMetadata_MarshalsAsAdditiveSibling proves the attachment is strictly
+// additive, which is the precondition for byte-faithful replay.
+//
+// The dead-letter message is the envelope's own keys plus one sibling top-level
+// key. The metadata is never nested inside the payload, never substituted for it,
+// and never rewrites any of the six envelope keys. That is exactly what leaves the
+// original event recoverable unchanged: strip the one added key and what remains is
+// the original event, so a replay can re-publish the stored bytes rather than
+// re-marshalling a struct — which would renormalise the JSON and break byte
+// equality.
+func TestFailureMetadata_MarshalsAsAdditiveSibling(t *testing.T) {
+	envelopeKeys := []string{"event_id", "event_type", "aggregate_id", "occurred_at", "payload", "schema_version"}
+
+	event := LedgerEvent{
+		EventID:       "8f14e45f-ea8f-4b3a-9c2d-0a7b6c5d4e3f",
+		EventType:     "transaction.applied",
+		AggregateID:   "txn_9f2b1c",
+		OccurredAt:    time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		Payload:       json.RawMessage(legacyWebhookBody),
+		SchemaVersion: SchemaVersionV1,
+	}
+	failure := FailureMetadata{
+		OriginalTopic:    "blnk.transactions",
+		ErrorReason:      "write tcp 10.0.0.4:9092: broken pipe",
+		AttemptCount:     5,
+		FirstAttemptedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		LastAttemptedAt:  time.Date(2026, 1, 2, 3, 4, 35, 0, time.UTC),
+	}
+
+	// Compose the dead-letter message the way the dead-letter publisher does:
+	// decode the envelope into raw values, add exactly one key, re-encode.
+	// Decoding into json.RawMessage is what keeps the payload bytes untouched
+	// while the sibling key is added around them.
+	deadLetter := decodeObject(t, mustMarshal(t, event))
+	deadLetter["failure_metadata"] = mustMarshal(t, failure)
+	deadLetterBytes := mustMarshal(t, deadLetter)
+
+	t.Run("failure_metadata is a top-level sibling of the envelope keys", func(t *testing.T) {
+		decoded := decodeObject(t, deadLetterBytes)
+
+		assert.Len(t, decoded, 7,
+			"the dead-letter message must be the six envelope keys plus exactly one added key — nothing removed, nothing replaced")
+		assert.Contains(t, decoded, "failure_metadata",
+			"failure_metadata must sit at the TOP LEVEL beside the envelope keys, not inside the payload: nesting it would rewrite the payload bytes and destroy replay fidelity")
+		for _, key := range envelopeKeys {
+			assert.Contains(t, decoded, key,
+				"the envelope key %q must survive the attachment untouched", key)
+		}
+
+		// The added key must decode back to the metadata that was attached,
+		// proving the attachment is a real record and not an opaque marker.
+		var roundTripped FailureMetadata
+		require.NoError(t, json.Unmarshal(decoded["failure_metadata"], &roundTripped),
+			"the attached metadata must decode back into FailureMetadata")
+		assert.Equal(t, failure.OriginalTopic, roundTripped.OriginalTopic,
+			"the original topic must survive the attachment: it is what the replay path sends the event back to")
+		assert.Equal(t, failure.ErrorReason, roundTripped.ErrorReason, "the error reason must survive the attachment")
+		assert.Equal(t, failure.AttemptCount, roundTripped.AttemptCount, "the attempt count must survive the attachment")
+		assert.True(t, roundTripped.FirstAttemptedAt.Equal(failure.FirstAttemptedAt), "the first-attempted instant must survive the attachment")
+		assert.True(t, roundTripped.LastAttemptedAt.Equal(failure.LastAttemptedAt), "the last-attempted instant must survive the attachment")
+	})
+
+	t.Run("the payload is unchanged byte for byte by the attachment", func(t *testing.T) {
+		decoded := decodeObject(t, deadLetterBytes)
+		assert.Equal(t, legacyWebhookBody, string(decoded["payload"]),
+			"attaching failure metadata must not touch one byte of the payload — the dead-lettered event carries the same bytes the original publish attempt carried, which is what makes the replay comparison byte-for-byte rather than approximate")
+	})
+
+	t.Run("removing failure_metadata reproduces the original envelope", func(t *testing.T) {
+		stripped := decodeObject(t, deadLetterBytes)
+		delete(stripped, "failure_metadata")
+		strippedBytes := mustMarshal(t, stripped)
+		decoded := decodeObject(t, strippedBytes)
+
+		assert.Len(t, decoded, 6,
+			"stripping the one added key must leave exactly the six envelope keys: that is the operational definition of an additive attachment, and it is why a replay can recover the original event from the dead-letter message")
+		for _, key := range envelopeKeys {
+			assert.Contains(t, decoded, key, "envelope key %q must be recovered after stripping the metadata", key)
+		}
+		assert.NotContains(t, decoded, "failure_metadata", "the metadata must be fully removable, leaving no residue behind")
+
+		assert.Equal(t, legacyWebhookBody, string(decoded["payload"]),
+			"the recovered payload must be byte-identical to the original — this is precisely the assertion behind the requirement that a replayed event matches the original byte-for-byte aside from the failure metadata")
+
+		// Every scalar field must be recovered exactly too, so the recovered
+		// envelope is the original event and not merely something shaped like it.
+		var recovered LedgerEvent
+		require.NoError(t, json.Unmarshal(strippedBytes, &recovered),
+			"the stripped message must decode back into a LedgerEvent")
+		assert.Equal(t, event.EventID, recovered.EventID,
+			"the event_id must be recovered unchanged: it is the idempotency key a subscriber deduplicates a replayed event on")
+		assert.Equal(t, event.EventType, recovered.EventType, "the event_type must be recovered unchanged so the replay routes to the same topic")
+		assert.Equal(t, event.AggregateID, recovered.AggregateID, "the aggregate_id must be recovered unchanged")
+		assert.Equal(t, event.SchemaVersion, recovered.SchemaVersion, "the schema_version must be recovered unchanged")
+		assert.True(t, recovered.OccurredAt.Equal(event.OccurredAt),
+			"the occurred_at instant must be recovered unchanged: a replay reports when the domain action happened, not when it was replayed")
+		assert.Equal(t, legacyWebhookBody, string(recovered.Payload),
+			"the decoded payload must still be the original bytes, because it is held as json.RawMessage all the way through")
+	})
+}
+
+// TestEventOutbox_ColumnContract pins the persisted row's field set against the
+// event outbox table's columns.
+//
+// This is a cross-file contract with the migration that creates the table and the
+// repository that scans rows into this struct, and it has no compiler behind it:
+// drift between a json tag and a column name surfaces at runtime as a scan
+// failure on a live ledger write, not as a build error. That asymmetry — cheap to
+// get wrong, expensive to discover — is exactly why the whole tag set is pinned
+// here rather than trusted.
+func TestEventOutbox_ColumnContract(t *testing.T) {
+	typ := reflect.TypeOf(EventOutbox{})
+
+	t.Run("the complete tag set matches the table columns", func(t *testing.T) {
+		// The four documented groups, in declaration order: the event envelope,
+		// the relay state machine, the dual-delivery marker, and the dead-letter
+		// record. Option suffixes such as ",omitempty" are stripped before
+		// comparing, because the column name is the tag's name portion only.
+		expected := []string{
+			// event envelope
+			"id", "event_id", "event_type", "aggregate_id", "ledger_id", "topic",
+			"schema_version", "payload", "occurred_at",
+			// relay state machine
+			"status", "attempts", "max_attempts", "last_error",
+			"first_attempted_at", "last_attempted_at", "dispatched_at", "locked_until",
+			// dual-delivery marker
+			"webhook_dispatched",
+			// dead-letter record
+			"dlt_topic", "failure_metadata",
+		}
+
+		assert.Equal(t, expected, jsonTagNames(t, typ),
+			"every json tag must match its event outbox column name, in the four documented groups: the repository scans rows into this struct, so a rename here is a runtime scan failure on a live ledger write rather than a compile error")
+		assert.Equal(t, len(expected), typ.NumField(),
+			"the row must declare exactly these %d fields — an extra field with no column, or a column with no field, breaks the insert and claim statements at runtime", len(expected))
+	})
+
+	t.Run("nullable timestamp columns are pointers", func(t *testing.T) {
+		// Each of these columns is genuinely NULL for part of the row's life, so
+		// the Go field must be able to represent absence. A plain time.Time would
+		// scan NULL as the zero instant, making "never attempted" indistinguishable
+		// from "attempted at the zero time" and, worse, making an unclaimed row
+		// look as though its lease had expired in the year 1.
+		timePointer := reflect.PointerTo(reflect.TypeOf(time.Time{}))
+
+		nullable := map[string]string{
+			"FirstAttemptedAt": "nil until the row is first claimed, so it distinguishes a never-attempted row from one attempted at the zero instant",
+			"LastAttemptedAt":  "nil until the row is first claimed, and is what the retry bookkeeping advances on each attempt",
+			"DispatchedAt":     "nil until the broker acknowledges the publish, and is set together with the dispatched status",
+			"LockedUntil":      "nil while the row is unclaimed; a non-nil expired lease is what makes a crashed relay's in-flight work claimable again rather than stranded",
+		}
+		for name, why := range nullable {
+			field, ok := typ.FieldByName(name)
+			require.True(t, ok, "EventOutbox must declare %s", name)
+			assert.Equal(t, timePointer, field.Type,
+				"%s must be *time.Time because its column is nullable: %s", name, why)
+		}
+	})
+
+	t.Run("occurred_at is not nullable", func(t *testing.T) {
+		field, ok := typ.FieldByName("OccurredAt")
+		require.True(t, ok, "EventOutbox must declare OccurredAt")
+		assert.Equal(t, reflect.TypeOf(time.Time{}), field.Type,
+			"OccurredAt must be a plain time.Time, not a pointer: it is always known at insert time, and the relay claims rows in ascending occurred_at order, so a NULL would have no defined position in the FIFO ordering")
+	})
+
+	t.Run("the state and counter fields have their storage types", func(t *testing.T) {
+		id, ok := typ.FieldByName("ID")
+		require.True(t, ok, "EventOutbox must declare ID")
+		assert.Equal(t, reflect.Int64, id.Type.Kind(),
+			"ID must be int64 to hold a BIGSERIAL surrogate key without overflow")
+
+		for _, name := range []string{"Attempts", "MaxAttempts", "SchemaVersion"} {
+			field, ok := typ.FieldByName(name)
+			require.True(t, ok, "EventOutbox must declare %s", name)
+			assert.Equal(t, reflect.Int, field.Type.Kind(),
+				"%s must be an int: it maps to an integer column and is compared numerically by the claim query", name)
+		}
+
+		webhookDispatched, ok := typ.FieldByName("WebhookDispatched")
+		require.True(t, ok, "EventOutbox must declare WebhookDispatched")
+		assert.Equal(t, reflect.Bool, webhookDispatched.Type.Kind(),
+			"WebhookDispatched must be a bool: it makes the legacy delivery leg individually idempotent, so a row republished to Kafka after a crash does not also re-enqueue a duplicate webhook")
+
+		for _, name := range []string{"EventID", "EventType", "AggregateID", "LedgerID", "Topic", "Status", "LastError", "DLTTopic"} {
+			field, ok := typ.FieldByName(name)
+			require.True(t, ok, "EventOutbox must declare %s", name)
+			assert.Equal(t, reflect.String, field.Type.Kind(),
+				"%s must be a string: it maps to a text column", name)
+		}
+	})
+
+	t.Run("optional fields are omitempty and required fields are not", func(t *testing.T) {
+		// The distinction is not cosmetic. The row is serialised into dead-letter
+		// API responses, where a required key must always be present so a caller
+		// never has to distinguish a missing key from a zero value, while a field
+		// that is genuinely absent for most of the row's life should not clutter
+		// every response with a null.
+		omitempty := map[string]bool{
+			"id": false, "event_id": false, "event_type": false, "aggregate_id": false,
+			"ledger_id": true, "topic": false, "schema_version": false, "payload": false,
+			"occurred_at": false, "status": false, "attempts": false, "max_attempts": false,
+			"last_error": true, "first_attempted_at": true, "last_attempted_at": true,
+			"dispatched_at": true, "locked_until": true, "webhook_dispatched": false,
+			"dlt_topic": true, "failure_metadata": true,
+		}
+		require.Len(t, omitempty, typ.NumField(), "every field must have a documented omitempty expectation")
+
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			tag := field.Tag.Get("json")
+			name := jsonTagName(tag)
+			want, known := omitempty[name]
+			require.True(t, known, "unexpected json tag %q on field %s: the tag set is pinned above, so a new field must be added there deliberately", name, field.Name)
+
+			hasOmitempty := tag != name
+			assert.Equal(t, want, hasOmitempty,
+				"field %s (column %q) must%s be omitempty: required columns are always present in a dead-letter API response so a caller never distinguishes a missing key from a zero value, while a column that is NULL for most of the row's life is omitted rather than rendered as null on every response",
+				field.Name, name, map[bool]string{true: "", false: " not"}[want])
+		}
+	})
+}

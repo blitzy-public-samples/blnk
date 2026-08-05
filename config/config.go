@@ -96,6 +96,30 @@ var (
 		ConnMaxLifetime: 30 * time.Minute,
 		ConnMaxIdleTime: 5 * time.Minute,
 	}
+
+	// defaultKafka deliberately leaves Brokers, SASLAdminUser and SASLAdminSecret
+	// zero-valued. An empty broker list is a legitimate steady state, not an error:
+	// it selects the no-op event publisher, reproducing the historic
+	// no-op-when-unconfigured contract so a deployment without Kafka keeps working.
+	// The two SASL fields are credentials and must never carry a shipped default.
+	// ReplicationFactor defaults to 3 for production durability; a single-broker
+	// cluster must set it to 1 explicitly, which setKafkaDefaults preserves because
+	// it only fills zero values.
+	defaultKafka = KafkaConfig{
+		TopicPrefix:       "blnk",
+		MinPartitions:     6,
+		ReplicationFactor: 3,
+	}
+
+	// defaultRelay encodes the bounded exponential backoff schedule: five attempts
+	// starting at 1s and doubling (1s, 2s, 4s, 8s, 16s), capped at 30s. The cap is
+	// never reached with these parameters, which is intentional — it only engages
+	// when the configured base or attempt count would exceed it.
+	defaultRelay = RelayConfig{
+		MaxRetryAttempts:   5,
+		RetryBaseBackoffMS: 1000,
+		RetryMaxBackoffMS:  30000,
+	}
 )
 
 var ConfigStore atomic.Value
@@ -213,6 +237,56 @@ type QueueConfig struct {
 	TransactionWorkerConcurrency    int           `json:"transaction_worker_concurrency"     envconfig:"BLNK_QUEUE_TRANSACTION_WORKER_CONCURRENCY"`
 }
 
+// KafkaConfig configures the Kafka event-publishing pipeline: the brokers the
+// producer and admin client dial, the prefix every category and dead-letter topic
+// is derived from, the SASL/SCRAM administrative principal used to provision
+// subscriber credentials and ACLs, and the topic geometry applied when topics are
+// created or grown.
+//
+// Note on the environment variable names: unlike every other struct in this file,
+// these tags carry no BLNK_ prefix, because the deployment contract mandates the
+// bare names (KAFKA_BROKERS, KAFKA_TOPIC_PREFIX, ...). Do NOT add one.
+//
+// Those bare names are honoured through envconfig's alternate-key fallback. For
+// each field envconfig derives a primary key by accumulating the prefix through
+// every enclosing struct, and uses the raw tag literal as an alternate key that is
+// consulted only when the primary is unset. Because Configuration.Kafka is itself a
+// prefix segment, the primary key here is BLNK_KAFKA_<TAG> — for example
+// BLNK_KAFKA_KAFKA_BROKERS, not BLNK_KAFKA_BROKERS, which is honoured by neither
+// key. Setting the mandated bare KAFKA_BROKERS is therefore the supported way to
+// configure this struct from the environment, and it is verified by test.
+//
+// This is not a special case: every nested field in this file already depends on the
+// same fallback. Redis.Dns is read from its BLNK_REDIS_DNS tag literal, not from any
+// prefix composition. Adding a BLNK_ prefix to a tag below would simply change which
+// bare name is honoured and would break the mandated one.
+//
+// Brokers, SASLAdminUser and SASLAdminSecret have no defaults by design — see
+// defaultKafka.
+type KafkaConfig struct {
+	Brokers           []string `json:"brokers"            envconfig:"KAFKA_BROKERS"`
+	TopicPrefix       string   `json:"topic_prefix"       envconfig:"KAFKA_TOPIC_PREFIX"`
+	SASLAdminUser     string   `json:"sasl_admin_user"    envconfig:"KAFKA_SASL_ADMIN_USER"`
+	SASLAdminSecret   string   `json:"sasl_admin_secret"  envconfig:"KAFKA_SASL_ADMIN_SECRET"`
+	MinPartitions     int      `json:"min_partitions"     envconfig:"KAFKA_MIN_PARTITIONS"`
+	ReplicationFactor int      `json:"replication_factor" envconfig:"KAFKA_REPLICATION_FACTOR"`
+}
+
+// RelayConfig tunes the transactional-outbox relay that publishes event rows to
+// Kafka. The three values define a bounded exponential backoff: the relay makes at
+// most MaxRetryAttempts attempts, waiting RetryBaseBackoffMS before the first retry
+// and doubling thereafter, never sleeping longer than RetryMaxBackoffMS. Both delay
+// values are milliseconds and are used verbatim — they are never reinterpreted as
+// another unit. Bad tuning is reported as a warning, never as a fatal error, so a
+// misconfigured relay can never stop the server from starting.
+//
+// Env tags are un-prefixed for the same reason as KafkaConfig's; see the note there.
+type RelayConfig struct {
+	MaxRetryAttempts   int `json:"max_retry_attempts"    envconfig:"RELAY_MAX_RETRY_ATTEMPTS"`
+	RetryBaseBackoffMS int `json:"retry_base_backoff_ms" envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
+	RetryMaxBackoffMS  int `json:"retry_max_backoff_ms"  envconfig:"RELAY_RETRY_MAX_BACKOFF_MS"`
+}
+
 type Configuration struct {
 	ProjectName             string                        `json:"project_name"              envconfig:"BLNK_PROJECT_NAME"`
 	BackupDir               string                        `json:"backup_dir"                envconfig:"BLNK_BACKUP_DIR"`
@@ -236,6 +310,20 @@ type Configuration struct {
 	Transaction             TransactionConfig             `json:"transaction"`
 	Reconciliation          ReconciliationConfig          `json:"reconciliation"`
 	Queue                   QueueConfig                   `json:"queue"`
+	Kafka                   KafkaConfig                   `json:"kafka"`
+	Relay                   RelayConfig                   `json:"relay"`
+	// WebhookDeprecationSunsetDate is the RFC3339 instant at which the legacy HTTP
+	// webhook transport is retired. Before it, Kafka publishing and legacy webhook
+	// delivery run concurrently from the same outbox rows; from it onwards Kafka is
+	// the only transport and the deprecated webhook routes answer 410 Gone. An unset
+	// or unparseable value means the sunset has not passed, so dual delivery
+	// continues — a malformed date is reported as a warning, never a fatal error.
+	//
+	// Being a top-level field, it accumulates no intermediate prefix segment, so both
+	// the mandated bare WEBHOOK_DEPRECATION_SUNSET_DATE and the house-convention
+	// BLNK_WEBHOOK_DEPRECATION_SUNSET_DATE are honoured, the prefixed form winning
+	// if both are set. Contrast KafkaConfig, whose fields are nested.
+	WebhookDeprecationSunsetDate string `json:"webhook_deprecation_sunset_date" envconfig:"WEBHOOK_DEPRECATION_SUNSET_DATE"`
 }
 
 // HashChainConfig controls the background hash-chainer that seals transaction
@@ -321,7 +409,66 @@ func (cnf *Configuration) validateAndAddDefaults() error {
 		logrus.Warn("tokenization secret should be 32 bytes for AES-256 encryption")
 	}
 
+	cnf.validateWebhookDeprecationSunsetDate()
+	cnf.validateRelayRetryWindow()
+
 	return nil
+}
+
+// validateWebhookDeprecationSunsetDate advises on an unparseable sunset date.
+//
+// It deliberately never returns an error. An empty value is valid and means the
+// sunset has not passed, and a malformed value is treated the same way by the
+// sunset decision helper, so refusing to load the configuration would contradict
+// that contract and would take the whole service down over an advisory field.
+func (cnf *Configuration) validateWebhookDeprecationSunsetDate() {
+	if cnf.WebhookDeprecationSunsetDate == "" {
+		return
+	}
+
+	if _, err := time.Parse(time.RFC3339, cnf.WebhookDeprecationSunsetDate); err != nil {
+		logrus.WithFields(logrus.Fields{
+			"value":    cnf.WebhookDeprecationSunsetDate,
+			"expected": time.RFC3339,
+		}).Warn(
+			"webhook_deprecation_sunset_date is not a valid RFC3339 timestamp and will be ignored; " +
+				"the webhook sunset is treated as not yet passed, so dual delivery continues",
+		)
+	}
+}
+
+// validateRelayRetryWindow advises on a relay retry window that cannot behave as
+// intended. Every finding is a warning: relay tuning is an operational knob, and a
+// bad value must degrade event delivery rather than prevent the server from
+// starting. It runs after setDefaultValues, so it inspects effective values with
+// defaults already applied.
+func (cnf *Configuration) validateRelayRetryWindow() {
+	if cnf.Relay.MaxRetryAttempts < 1 {
+		logrus.WithField("max_retry_attempts", cnf.Relay.MaxRetryAttempts).Warn(
+			"relay max_retry_attempts is below 1; events will not be retried before being dead-lettered",
+		)
+	}
+
+	if cnf.Relay.RetryBaseBackoffMS < 0 {
+		logrus.WithField("retry_base_backoff_ms", cnf.Relay.RetryBaseBackoffMS).Warn(
+			"relay retry_base_backoff_ms is negative; retries will not be delayed",
+		)
+	}
+
+	if cnf.Relay.RetryMaxBackoffMS < 0 {
+		logrus.WithField("retry_max_backoff_ms", cnf.Relay.RetryMaxBackoffMS).Warn(
+			"relay retry_max_backoff_ms is negative; the backoff cap will not delay retries",
+		)
+	}
+
+	if cnf.Relay.RetryBaseBackoffMS > cnf.Relay.RetryMaxBackoffMS {
+		logrus.WithFields(logrus.Fields{
+			"retry_base_backoff_ms": cnf.Relay.RetryBaseBackoffMS,
+			"retry_max_backoff_ms":  cnf.Relay.RetryMaxBackoffMS,
+		}).Warn(
+			"relay retry_base_backoff_ms exceeds retry_max_backoff_ms; every retry will wait the capped maximum",
+		)
+	}
 }
 
 func (cnf *Configuration) validateRequiredFields() error {
@@ -372,6 +519,8 @@ func (cnf *Configuration) setDefaultValues() {
 	cnf.setReconciliationDefaults()
 	cnf.setQueueDefaults()
 	cnf.setHashChainDefaults()
+	cnf.setKafkaDefaults()
+	cnf.setRelayDefaults()
 
 	if cnf.EnableTelemetry {
 		logrus.Info("telemetry enabled")
@@ -510,6 +659,69 @@ func (cnf *Configuration) setDatabaseDefaults() {
 	}
 	if cnf.DataSource.ConnMaxIdleTime == 0 {
 		cnf.DataSource.ConnMaxIdleTime = defaultDatabase.ConnMaxIdleTime
+	}
+}
+
+// setKafkaDefaults fills only the unset Kafka topic-geometry values. Brokers,
+// SASLAdminUser and SASLAdminSecret are never defaulted: an empty broker list
+// selects the no-op event publisher, and the two SASL fields are credentials.
+//
+// Because every assignment is guarded on the zero value, an explicitly configured
+// value always survives — in particular ReplicationFactor: 1, which a single-broker
+// cluster requires and which must not be overwritten by the production default of 3.
+func (cnf *Configuration) setKafkaDefaults() {
+	if cnf.Kafka.TopicPrefix == "" {
+		cnf.Kafka.TopicPrefix = defaultKafka.TopicPrefix
+	}
+	if cnf.Kafka.MinPartitions == 0 {
+		cnf.Kafka.MinPartitions = defaultKafka.MinPartitions
+	}
+	if cnf.Kafka.ReplicationFactor == 0 {
+		cnf.Kafka.ReplicationFactor = defaultKafka.ReplicationFactor
+	}
+	cnf.Kafka.Brokers = normalizeBrokers(cnf.Kafka.Brokers)
+}
+
+// normalizeBrokers trims surrounding whitespace from each broker address and drops
+// empty entries, preserving the configured order.
+//
+// This is a correctness fix, not cosmetics: envconfig splits a comma-separated
+// value without trimming, so BLNK_KAFKA_BROKERS="a:9092, b:9092" yields the address
+// " b:9092", which cannot be dialled. envconfig likewise keeps the empty entries
+// produced by consecutive or trailing commas, which this function discards.
+//
+// The function is idempotent — re-running it over its own output is a no-op, which
+// matters because validateAndAddDefaults may be invoked more than once on the same
+// Configuration. An empty or all-blank input yields an empty slice rather than an
+// error, because "no brokers configured" is a supported deployment mode.
+func normalizeBrokers(brokers []string) []string {
+	if len(brokers) == 0 {
+		return brokers
+	}
+
+	normalized := make([]string, 0, len(brokers))
+	for _, broker := range brokers {
+		broker = strings.TrimSpace(broker)
+		if broker == "" {
+			continue
+		}
+		normalized = append(normalized, broker)
+	}
+	return normalized
+}
+
+// setRelayDefaults fills only the unset relay retry values. The two backoff values
+// are milliseconds and are stored verbatim; unlike the queue's HotPairTTL they are
+// never reinterpreted as another unit, so a configured 1000 stays 1000.
+func (cnf *Configuration) setRelayDefaults() {
+	if cnf.Relay.MaxRetryAttempts == 0 {
+		cnf.Relay.MaxRetryAttempts = defaultRelay.MaxRetryAttempts
+	}
+	if cnf.Relay.RetryBaseBackoffMS == 0 {
+		cnf.Relay.RetryBaseBackoffMS = defaultRelay.RetryBaseBackoffMS
+	}
+	if cnf.Relay.RetryMaxBackoffMS == 0 {
+		cnf.Relay.RetryMaxBackoffMS = defaultRelay.RetryMaxBackoffMS
 	}
 }
 
