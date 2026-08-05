@@ -1,6 +1,32 @@
 global:
   scrape_interval: 15s
 
+# Alerting rules to evaluate. A rule file is inert unless it is listed here,
+# so this stanza — not the mere presence of the file — is what arms
+# alerts/blnk-kafka-alerts.yml: a dead-letter entry unresolved for more than
+# 15 minutes, and a subscriber consumer group trailing by more than 10,000
+# messages. Those rules match on the Prometheus forms of the OTel instrument
+# names declared in internal/metrics/metrics.go, dots becoming underscores.
+#
+# The pattern below is a path INSIDE the Prometheus container, not a
+# repository path: the prometheus service bind-mounts this repository's
+# ./alerts directory into /etc/prometheus/alerts, alongside ./prometheus.yml
+# at /etc/prometheus/prometheus.yml. Keep that mount in step with this path —
+# otherwise the rules never load, which shows up as their absence from /rules
+# rather than as a startup error.
+#
+# The glob is deliberate. It resolves for either mount style, file-level
+#   ./alerts/blnk-kafka-alerts.yml:/etc/prometheus/alerts/blnk-kafka-alerts.yml
+# or directory-level
+#   ./alerts:/etc/prometheus/alerts
+# it picks up rule files added to ./alerts later without a further edit here,
+# and it keeps `promtool check config prometheus.yml` usable on a host that
+# has no /etc/prometheus, where a literal path instead fails outright with
+# "does not point to an existing file". A matched glob is still validated in
+# full, so nothing is traded away for that robustness.
+rule_files:
+  - '/etc/prometheus/alerts/*.yml'
+
 scrape_configs:
   - job_name: 'blnk-server'
     # Uncomment to authenticate when metrics_bearer_token is configured in blnk.json:
