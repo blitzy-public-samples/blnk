@@ -46,6 +46,8 @@ const (
 	ResourceReconciliation  Resource = "reconciliation"
 	ResourceMetadata        Resource = "metadata"
 	ResourceBackup          Resource = "backup"
+	ResourceEvents          Resource = "events"
+	ResourceSubscribers     Resource = "subscribers"
 	ResourceAll             Resource = "*"
 )
 

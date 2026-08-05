@@ -73,6 +73,45 @@ var ChainHeadSeq metric.Int64Gauge
 // advanced it.
 var ChainLagSeconds metric.Float64Gauge
 
+// EventsPublishedTotal counts ledger events that were published to a Kafka category
+// topic and acknowledged by the broker. Paired with EventsDeadLetteredTotal, which is
+// scoped identically, so the dead-letter rate is the ratio of the two.
+// Attributes: topic, event_type
+var EventsPublishedTotal metric.Int64Counter
+
+// EventPublishAttemptsTotal counts individual relay publish attempts, retries included,
+// so retry pressure stays visible independently of how many events were delivered.
+// Attributes: outcome (dispatched, retrying, dead_lettered)
+var EventPublishAttemptsTotal metric.Int64Counter
+
+// EventPublishDuration records how long a single publish attempt took, measured from the
+// moment the relay claimed the outbox row to broker acknowledgement. The attempt attribute
+// carries the attempt number as a string, so publish latency excluding retries reads as
+// histogram_quantile(0.99, rate(blnk_events_publish_duration_seconds_bucket{attempt="1"}[5m])).
+// Attributes: topic, attempt (1, 2, 3, 4, 5)
+var EventPublishDuration metric.Float64Histogram
+
+// EventsDeadLetteredTotal counts ledger events diverted to a dead-letter topic after the
+// relay exhausted its retry budget. The topic attribute carries the original category
+// topic, not the .dlt sibling, so it is comparable with EventsPublishedTotal.
+// Attributes: topic, event_type
+var EventsDeadLetteredTotal metric.Int64Counter
+
+// DLTOldestMessageAgeSeconds is the age of the oldest unresolved message sitting on a
+// dead-letter topic: seconds since it was dead-lettered. Alerting fires above 900s.
+// Attributes: topic
+var DLTOldestMessageAgeSeconds metric.Float64Gauge
+
+// SubscriberConsumerLag is how many messages a subscriber's consumer group trails the log
+// end offset by, computed in-process by differencing committed offsets against end offsets.
+// Alerting fires above 10000 messages.
+// Attributes: subscriber, group, topic
+var SubscriberConsumerLag metric.Int64Gauge
+
+// OutboxPendingBacklog is the number of event outbox rows still waiting to be published
+// to Kafka (the relay's backlog).
+var OutboxPendingBacklog metric.Int64Gauge
+
 // Init creates all metric instruments. It should be called once during application
 // startup. Safe to call even when observability is disabled
 func Init() error {
@@ -201,6 +240,62 @@ func Init() error {
 	ChainLagSeconds, err = meter.Float64Gauge("blnk.chain.lag_seconds",
 		metric.WithDescription("Seconds since the hash chain last advanced"),
 		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return err
+	}
+
+	EventsPublishedTotal, err = meter.Int64Counter("blnk.events.published.total",
+		metric.WithDescription("Total number of ledger events acknowledged by Kafka by topic and event type"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return err
+	}
+
+	EventPublishAttemptsTotal, err = meter.Int64Counter("blnk.events.publish.attempts.total",
+		metric.WithDescription("Total number of event publish attempts by outcome, retries included"),
+		metric.WithUnit("{attempt}"),
+	)
+	if err != nil {
+		return err
+	}
+
+	EventPublishDuration, err = meter.Float64Histogram("blnk.events.publish.duration",
+		metric.WithDescription("Duration of a single event publish attempt, from outbox claim to broker acknowledgement"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return err
+	}
+
+	EventsDeadLetteredTotal, err = meter.Int64Counter("blnk.events.dead_lettered.total",
+		metric.WithDescription("Total number of events dead-lettered after retry exhaustion by topic and event type"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return err
+	}
+
+	DLTOldestMessageAgeSeconds, err = meter.Float64Gauge("blnk.dlt.oldest_message_age_seconds",
+		metric.WithDescription("Seconds since the oldest unresolved dead-letter message was dead-lettered"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return err
+	}
+
+	SubscriberConsumerLag, err = meter.Int64Gauge("blnk.kafka.consumer_lag",
+		metric.WithDescription("Number of messages a subscriber consumer group trails the log end offset by"),
+		metric.WithUnit("{message}"),
+	)
+	if err != nil {
+		return err
+	}
+
+	OutboxPendingBacklog, err = meter.Int64Gauge("blnk.outbox.pending",
+		metric.WithDescription("Number of event outbox rows not yet published to Kafka"),
+		metric.WithUnit("{event}"),
 	)
 	if err != nil {
 		return err

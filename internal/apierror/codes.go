@@ -33,6 +33,7 @@ const (
 	ErrGenBadRequest       ErrorCode = "GEN_BAD_REQUEST"
 	ErrGenNotFound         ErrorCode = "GEN_NOT_FOUND"
 	ErrGenConflict         ErrorCode = "GEN_CONFLICT"
+	ErrGenGone             ErrorCode = "GEN_GONE" // permanently removed surface; see api/middleware/sunset.go
 	ErrGenResourceLocked   ErrorCode = "GEN_RESOURCE_LOCKED"
 	ErrGenPayloadTooLarge  ErrorCode = "GEN_PAYLOAD_TOO_LARGE"
 	ErrGenRateLimited      ErrorCode = "GEN_RATE_LIMITED"
@@ -128,6 +129,24 @@ const (
 
 	// ADMIN — administrative operations
 	ErrAdminBackupFailed ErrorCode = "ADMIN_BACKUP_FAILED"
+
+	// EVENT — event streaming, outbox & dead-letter.
+	// ErrKafkaUnavailable intentionally carries the EVENT_ prefix: keeping it in
+	// this family means the catalog gains exactly two new families rather than a
+	// third one holding a single code. It resolves to 503 and not to the 500 used
+	// by the other *_FAILED codes because an unreachable broker is a retryable
+	// upstream condition, not a defect in this service — do not "correct" it.
+	ErrEventNotFound        ErrorCode = "EVENT_NOT_FOUND"
+	ErrEventNotDeadLettered ErrorCode = "EVENT_NOT_DEAD_LETTERED"
+	ErrEventReplayFailed    ErrorCode = "EVENT_REPLAY_FAILED"
+	ErrKafkaUnavailable     ErrorCode = "EVENT_KAFKA_UNAVAILABLE"
+
+	// SUBSCRIBER — Kafka subscriber registry & credentials.
+	// ErrSubscriberProvisioningFailed also resolves to 503 rather than 500 for the
+	// same reason: provisioning depends on the Kafka admin API, so a failure is
+	// retryable by the caller rather than a server defect.
+	ErrSubscriberNotFound           ErrorCode = "SUBSCRIBER_NOT_FOUND"
+	ErrSubscriberProvisioningFailed ErrorCode = "SUBSCRIBER_PROVISIONING_FAILED"
 )
 
 // statusByCode is the single source of truth for the default HTTP status of
@@ -139,6 +158,7 @@ var statusByCode = map[ErrorCode]int{
 	ErrGenBadRequest:       http.StatusBadRequest,
 	ErrGenNotFound:         http.StatusNotFound,
 	ErrGenConflict:         http.StatusConflict,
+	ErrGenGone:             http.StatusGone,
 	ErrGenResourceLocked:   http.StatusLocked,
 	ErrGenPayloadTooLarge:  http.StatusRequestEntityTooLarge,
 	ErrGenRateLimited:      http.StatusTooManyRequests,
@@ -222,6 +242,17 @@ var statusByCode = map[ErrorCode]int{
 	ErrSrchReindexNotStarted: http.StatusNotFound,
 
 	ErrAdminBackupFailed: http.StatusInternalServerError,
+
+	// EVENT — 503 for the broker being unreachable is deliberate (retryable
+	// upstream condition); every other *_FAILED code in this map is 500.
+	ErrEventNotFound:        http.StatusNotFound,
+	ErrEventNotDeadLettered: http.StatusConflict,
+	ErrEventReplayFailed:    http.StatusInternalServerError,
+	ErrKafkaUnavailable:     http.StatusServiceUnavailable,
+
+	// SUBSCRIBER — 503 on provisioning failure is deliberate for the same reason.
+	ErrSubscriberNotFound:           http.StatusNotFound,
+	ErrSubscriberProvisioningFailed: http.StatusServiceUnavailable,
 
 	// Legacy codes — same statuses MapErrorToHTTPStatus implied, with the
 	// BAD_REQUEST omission fixed (it previously fell through to 500).

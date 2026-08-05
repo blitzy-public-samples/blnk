@@ -163,7 +163,7 @@ func TestCodeNamingConvention(t *testing.T) {
 		ErrNotFound: true, ErrConflict: true, ErrBadRequest: true,
 		ErrInvalidInput: true, ErrInternalServer: true, ErrRateLimited: true,
 	}
-	prefixes := []string{"GEN_", "AUTH_", "APIKEY_", "TXN_", "BAL_", "LGR_", "ACC_", "IDT_", "RECON_", "META_", "HOOK_", "SRCH_", "ADMIN_"}
+	prefixes := []string{"GEN_", "AUTH_", "APIKEY_", "TXN_", "BAL_", "LGR_", "ACC_", "IDT_", "RECON_", "META_", "HOOK_", "SRCH_", "ADMIN_", "EVENT_", "SUBSCRIBER_"}
 	for code := range statusByCode {
 		if legacySet[code] {
 			continue
