@@ -25,6 +25,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -61,6 +62,12 @@ import (
 // three gauge attribute keys are all written out LONGHAND below rather than derived from
 // the code under test. A test that asks the implementation what it expects agrees with
 // any implementation, including a broken one.
+//
+// The longhand inventory is then tied back to event_topics.go — the one place topic names
+// are composed — by TestEventTopicInventory_MatchesTheSingleSourceOfTruth. That is the
+// bridge that lets both properties hold at once: the literal list keeps every assertion
+// here non-vacuous, and the bridge stops the literal list from drifting away from the
+// names the pipeline actually publishes to.
 
 // expectedEventTopics is the topic inventory, spelled out independently of
 // event_topics.go: the four category topics followed by their four dead-letter siblings,
@@ -701,6 +708,53 @@ func requestedACLs(fake *fakeAdminClient) []kafka.ACLEntry {
 	return entries
 }
 
+// TestEventTopicInventory_MatchesTheSingleSourceOfTruth ties the longhand inventory above
+// to event_topics.go, which is the one place topic names are composed.
+//
+// It is the bridge that lets the literal list and the derived list coexist without either
+// being redundant. The literal list is what stops every other assertion in this file from
+// being vacuous — a test that asks the implementation what it expects agrees with any
+// implementation, including one that provisions nothing. THIS test is what stops the literal
+// list from silently drifting: if the category set, the prefix resolution or the dead-letter
+// suffix ever changes, the two disagree here rather than in production, where the only
+// symptom is a subscriber that never receives an event.
+//
+// The prefix is pinned to the default for the duration, because the literal names above are
+// written with it.
+func TestEventTopicInventory_MatchesTheSingleSourceOfTruth(t *testing.T) {
+	storeKafkaTopicPrefix(t, "")
+
+	assert.Equal(t, expectedEventTopics, AllTopicsWithDeadLetters(),
+		"the inventory this file asserts against must be exactly the inventory event_topics.go composes, "+
+			"so the test and the implementation share one source of truth")
+
+	const categoryCount = 4
+
+	require.Len(t, expectedEventTopics, categoryCount*2,
+		"four category topics and one dead-letter sibling each")
+	assert.Equal(t, expectedEventTopics[:categoryCount], AllTopics(),
+		"the first four entries are the category topics, in canonical provisioning order")
+	assert.Equal(t, expectedEventTopics[categoryCount:], AllDeadLetterTopics(),
+		"the last four entries are their dead-letter siblings, in the same order")
+
+	categories := EventCategories()
+	require.Len(t, categories, categoryCount,
+		"four categories are what give every emitted event type a home; a fifth would need a topic here")
+
+	for index, category := range categories {
+		topic := TopicForCategory(category)
+
+		assert.Equal(t, expectedEventTopics[index], topic,
+			"category %q must compose topic %q", category, expectedEventTopics[index])
+		assert.Equal(t, expectedEventTopics[index+categoryCount], DLTFor(topic),
+			"the dead-letter sibling of %q must follow the published <topic>.dlt convention", topic)
+		assert.True(t, IsDeadLetterTopic(DLTFor(topic)),
+			"a dead-letter topic must be recognisable as one, since the relay routes on that")
+		assert.False(t, IsDeadLetterTopic(topic),
+			"a category topic must never be mistaken for a dead-letter topic")
+	}
+}
+
 // TestEnsureTopics_CreatesTheEightTopicsWithTheConfiguredGeometry pins the inventory and
 // the geometry of a first run against an empty broker.
 //
@@ -784,6 +838,102 @@ func TestEnsureTopics_HonoursAPartitionCountAboveTheMinimum(t *testing.T) {
 	assert.Equal(t, configured, report.Partitions)
 }
 
+// TestEnsureTopics_TakesItsGeometryFromConfiguration walks the whole path a deployment
+// actually takes: config.Kafka -> NewKafkaAdmin -> the outgoing CreateTopics request.
+//
+// The two tests above pin the geometry on a client whose fields were set directly, and the
+// constructor tests further down pin the fields. Neither proves the JOIN, and the join is
+// exactly where a hard-coded literal would hide: a constructor that read configuration
+// faithfully and a creation path that ignored it would satisfy both halves separately while
+// provisioning the wrong geometry. Injecting the fake seam into a CONFIGURATION-BUILT client
+// is the only way to show the configured numbers arriving in the request.
+//
+// The two dimensions are asserted differently, and deliberately so:
+//
+//   - The partition count is a FLOOR. Six partitions is requirement R-6, so a configured
+//     value below it is raised rather than honoured, and a value above it is honoured rather
+//     than clamped.
+//   - The replication factor is EXACT. A single-broker KRaft cluster rejects a factor of 3
+//     outright with INVALID_REPLICATION_FACTOR, so a hard-coded 3 makes local bring-up
+//     impossible; a hard-coded 1 would silently discard the durability requirement in
+//     production. Both configured values are therefore asserted to arrive unchanged.
+func TestEnsureTopics_TakesItsGeometryFromConfiguration(t *testing.T) {
+	cases := []struct {
+		name               string
+		minPartitions      int
+		replicationFactor  int
+		expectedPartitions int
+	}{
+		{
+			name:          "below the floor is raised",
+			minPartitions: 1, replicationFactor: 1, expectedPartitions: MinTopicPartitions,
+		},
+		{
+			name:          "unset is raised",
+			minPartitions: 0, replicationFactor: 1, expectedPartitions: MinTopicPartitions,
+		},
+		{
+			name:          "exactly the floor on a single-broker stack",
+			minPartitions: MinTopicPartitions, replicationFactor: 1, expectedPartitions: MinTopicPartitions,
+		},
+		{
+			name:          "production geometry",
+			minPartitions: MinTopicPartitions, replicationFactor: 3, expectedPartitions: MinTopicPartitions,
+		},
+		{
+			name:          "above the floor is honoured",
+			minPartitions: 18, replicationFactor: 3, expectedPartitions: 18,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			storeKafkaTopicPrefix(t, "")
+
+			admin, err := NewKafkaAdmin(&config.Configuration{
+				Kafka: config.KafkaConfig{
+					Brokers:           []string{"broker-1:9092"},
+					MinPartitions:     testCase.minPartitions,
+					ReplicationFactor: testCase.replicationFactor,
+				},
+			})
+			require.NoError(t, err, "a configured broker list with a usable geometry must construct")
+			t.Cleanup(func() { assert.NoError(t, admin.Close()) })
+
+			// Substituting only the transport seam keeps everything else — the partition
+			// count and the replication factor — exactly as configuration produced it, which
+			// is what makes this an assertion about the join rather than about either half.
+			fake := newFakeAdminClient()
+			admin.client = fake
+
+			report, err := admin.EnsureTopics(context.Background())
+			require.NoError(t, err)
+
+			configs := createdTopicConfigs(fake)
+			require.Len(t, configs, len(expectedEventTopics),
+				"the whole inventory must be provisioned regardless of geometry")
+
+			for _, topicConfig := range configs {
+				assert.Equal(t, testCase.expectedPartitions, topicConfig.NumPartitions,
+					"topic %q must carry the partition count configuration resolves to", topicConfig.Topic)
+				assert.GreaterOrEqual(t, topicConfig.NumPartitions, MinTopicPartitions,
+					"topic %q must never be provisioned below the required minimum of six partitions",
+					topicConfig.Topic)
+				assert.Equal(t, testCase.replicationFactor, topicConfig.ReplicationFactor,
+					"topic %q must carry the configured replication factor verbatim, never a literal",
+					topicConfig.Topic)
+			}
+
+			assert.Equal(t, testCase.expectedPartitions, admin.partitions,
+				"the client must resolve the configured partition count once, at construction")
+			assert.Equal(t, testCase.replicationFactor, admin.replicationFactor,
+				"the configured replication factor must be carried through without adjustment")
+			assert.Equal(t, testCase.expectedPartitions, report.Partitions)
+			assert.Equal(t, testCase.replicationFactor, report.ReplicationFactor)
+		})
+	}
+}
+
 // TestEnsureTopics_IsIdempotentAcrossRuns is the property that lets topic assurance run on
 // every start-up rather than behind a first-deploy-only flag.
 //
@@ -813,6 +963,25 @@ func TestEnsureTopics_IsIdempotentAcrossRuns(t *testing.T) {
 		"a second run must not send a creation request for topics that already exist")
 	assert.Zero(t, fake.callCount("CreatePartitions"),
 		"a topic already at the configured partition count must not be grown")
+
+	// The same operation once more, but with the broker itself answering
+	// TOPIC_ALREADY_EXISTS for every topic rather than the metadata probe reporting them
+	// present. That is what a second server instance starting at the same moment sees, and a
+	// whole inventory answering "already exists" must still be a successful, non-creating run
+	// — otherwise a rolling restart of two replicas fails one of them every time.
+	concurrent := newFakeAdminClient()
+	for _, topic := range expectedEventTopics {
+		concurrent.createTopicErrors[topic] = kafka.TopicAlreadyExists
+	}
+
+	third, err := newTestKafkaAdmin(concurrent, MinTopicPartitions, 1).EnsureTopics(context.Background())
+	require.NoError(t, err,
+		"an inventory that answers \"already exists\" throughout must not fail the run")
+	assert.Zero(t, third.CreatedCount, "nothing was created by this run")
+	assert.Equal(t, len(expectedEventTopics), third.UnchangedCount,
+		"every topic must be reported as unchanged once its real partition count is known")
+	assert.Zero(t, concurrent.callCount("CreatePartitions"),
+		"the winning provisioner used the configured geometry, so there is nothing to grow")
 }
 
 // TestEnsureTopics_GrowsAnUnderPartitionedTopic covers the single-partition topic an
@@ -896,6 +1065,9 @@ func TestEnsureTopics_TreatsAConcurrentCreationAsSuccess(t *testing.T) {
 func TestEnsureTopics_RefusesToShrinkAnOverPartitionedTopic(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
 	const oversized = "blnk.identities"
 
 	fake := newFakeAdminClient().withTopic(oversized, 12)
@@ -916,6 +1088,32 @@ func TestEnsureTopics_RefusesToShrinkAnOverPartitionedTopic(t *testing.T) {
 		assert.NotEqual(t, oversized, growth.Name,
 			"no partition change may be attempted on an over-partitioned topic")
 	}
+
+	// "Detected and reported clearly rather than attempted" is two obligations. The refusal is
+	// only useful if an operator can act on it, so the warning has to name the topic, the two
+	// partition counts and the variable to change — a silent refusal would leave a topic
+	// permanently disagreeing with configuration and nobody knowing why.
+	var reported bool
+	for _, entry := range hook.AllEntries() {
+		if entry.Level != logrus.WarnLevel {
+			continue
+		}
+		if entry.Data["topic"] != oversized {
+			continue
+		}
+
+		reported = true
+
+		assert.Equal(t, 12, entry.Data["partitions"], "the warning must state the topic's actual geometry")
+		assert.Equal(t, MinTopicPartitions, entry.Data["configured"],
+			"the warning must state the configured geometry it is refusing to impose")
+		assert.Contains(t, entry.Message, "KAFKA_MIN_PARTITIONS",
+			"the warning must name the variable an operator can change")
+		assert.Contains(t, entry.Message, "reducing partitions",
+			"the warning must say why the refusal is not a defect")
+	}
+	assert.True(t, reported,
+		"an over-partitioned topic must be reported at warning level, not merely recorded in the report")
 }
 
 // TestEnsureTopics_RefusesAnUnconfiguredReplicationFactor proves the factor is never
@@ -1297,12 +1495,155 @@ func TestProvisionSubscriberPrincipal_NeverGrantsWriteOrAWildcardPattern(t *test
 	}
 }
 
+// TestProvisionSubscriberPrincipal_NeverReachesAnotherSubscribersTopicsOrGroup is the
+// cross-subscriber half of the isolation criterion.
+//
+// The access model has NO per-tenant topics: every subscriber reads the same four category
+// topics and their dead-letter siblings, so the only thing keeping one subscriber out of
+// another's data is this ACL grant. That means the boundary has to be asserted from the
+// outside in — not "the grant contains what it should", which the equality test above already
+// pins, but "the grant contains nothing else at all", enumerated against the FULL inventory
+// and against a second subscriber's namespace.
+//
+// The two grants are provisioned against separate fakes and then compared, because the
+// failure this guards against is not one malformed binding but a shared boundary: a request
+// assembled from two different registry rows, or a topic list that leaked between them.
+//
+// ⚠️ This asserts CONSTRUCTION, not ENFORCEMENT. In KRaft mode a broker enforces these
+// bindings only when it is started with
+// authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer. Without it
+// CreateACLs succeeds, the bindings are visible in kafka-acls output, and every request from
+// every principal is allowed — so an isolation test run against such a broker passes while
+// proving nothing at all. Broker-side proof therefore belongs to
+// event_isolation_integration_test.go, and the broker's authorizer configuration is part of
+// that criterion rather than an environmental detail.
+func TestProvisionSubscriberPrincipal_NeverReachesAnotherSubscribersTopicsOrGroup(t *testing.T) {
+	// Two subscribers with deliberately disjoint boundaries. The group IDs are chosen to be
+	// prefix-adjacent neighbours of each other's namespace root ("acme-" appears in one and
+	// not the other) so that a grant widened by even a few characters would be caught.
+	acme := testSubscriber()
+	acme.AuthorizedTopics = []string{"blnk.transactions"}
+
+	globex := &model.EventSubscriber{
+		SubscriberID:     "sub_9d3b1f04",
+		Name:             "Globex Risk",
+		KafkaPrincipal:   "globex-risk",
+		ConsumerGroupID:  "globex-risk-group",
+		AuthorizedTopics: []string{"blnk.identities", "blnk.identities.dlt"},
+	}
+
+	acmeTopics, acmeGroups := provisionAndCollectGrant(t, acme)
+	globexTopics, globexGroups := provisionAndCollectGrant(t, globex)
+
+	assert.Equal(t, map[string]struct{}{"blnk.transactions": {}}, acmeTopics,
+		"only the single authorised topic may be bound for this subscriber")
+	assert.Equal(t, map[string]struct{}{"blnk.identities": {}, "blnk.identities.dlt": {}}, globexTopics,
+		"the other subscriber's grant must be exactly its own two topics")
+
+	// Enumerated against the WHOLE inventory rather than against the other subscriber's list
+	// alone, because the dead-letter siblings are what an accidental widening would most
+	// plausibly reach: each one has its category topic's name as a prefix, so a literal
+	// pattern turned prefixed would swallow it.
+	for _, topic := range expectedEventTopics {
+		if topic != "blnk.transactions" {
+			assert.NotContains(t, acmeTopics, topic,
+				"a subscriber authorised only for blnk.transactions must not be granted %q", topic)
+		}
+		if topic != "blnk.identities" && topic != "blnk.identities.dlt" {
+			assert.NotContains(t, globexTopics, topic,
+				"a subscriber authorised only for the identity topics must not be granted %q", topic)
+		}
+	}
+
+	for topic := range globexTopics {
+		assert.NotContains(t, acmeTopics, topic,
+			"one subscriber's grant must never include another subscriber's topic %q", topic)
+	}
+
+	assert.Equal(t, map[string]struct{}{acme.ConsumerGroupID: {}}, acmeGroups,
+		"exactly one consumer-group namespace may be reserved, and it must be the subscriber's own")
+	assert.Equal(t, map[string]struct{}{globex.ConsumerGroupID: {}}, globexGroups,
+		"the other subscriber's reservation must likewise be its own and nothing more")
+
+	// The group binding uses a PREFIXED pattern, which reserves "<group>*". That is the one
+	// intentional widening in the model, and it must widen only inside the subscriber's own
+	// namespace: a reserved prefix that is also a prefix of somebody else's group would hand
+	// over their offsets and their coordinator.
+	for reserved := range acmeGroups {
+		assert.False(t, strings.HasPrefix(globex.ConsumerGroupID, reserved),
+			"reserved prefix %q must not cover another subscriber's group %q",
+			reserved, globex.ConsumerGroupID)
+	}
+	for reserved := range globexGroups {
+		assert.False(t, strings.HasPrefix(acme.ConsumerGroupID, reserved),
+			"reserved prefix %q must not cover another subscriber's group %q",
+			reserved, acme.ConsumerGroupID)
+	}
+}
+
+// provisionAndCollectGrant provisions one subscriber against a fresh fake and returns the
+// topic names and consumer-group namespaces its bindings actually covered.
+//
+// Every binding's principal is checked here rather than in the caller, so that a grant
+// assembled from two different registry rows — one subscriber's principal paired with
+// another's topics — cannot slip through as a set that merely looks right.
+//
+// Returns:
+//   - map[string]struct{}: the topic resource names bound.
+//   - map[string]struct{}: the consumer-group resource names bound.
+func provisionAndCollectGrant(t *testing.T, subscriber *model.EventSubscriber) (
+	map[string]struct{}, map[string]struct{},
+) {
+	t.Helper()
+
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	result, err := admin.ProvisionSubscriberPrincipal(
+		context.Background(),
+		NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+	)
+	require.NoError(t, err, "provisioning %q must succeed", subscriber.KafkaPrincipal)
+	assert.Equal(t, subscriber.KafkaPrincipal, result.Principal)
+
+	entries := requestedACLs(fake)
+	require.NotEmpty(t, entries, "a subscriber with a grant must produce bindings")
+
+	topics := map[string]struct{}{}
+	groups := map[string]struct{}{}
+	for _, entry := range entries {
+		assert.Equal(t, "User:"+subscriber.KafkaPrincipal, entry.Principal,
+			"every binding must belong to the subscriber being provisioned and to nobody else")
+
+		switch entry.ResourceType {
+		case kafka.ResourceTypeTopic:
+			topics[entry.ResourceName] = struct{}{}
+		case kafka.ResourceTypeGroup:
+			groups[entry.ResourceName] = struct{}{}
+		default:
+			t.Errorf("unexpected resource type %v on %q: only topics and consumer groups are ever bound",
+				entry.ResourceType, entry.ResourceName)
+		}
+	}
+
+	return topics, groups
+}
+
 // TestProvisionSubscriberPrincipal_NeverLeaksThePassword is the secret-handling assertion,
 // exercised over the whole successful path and over a failing one.
 //
 // It checks all four escape routes at once: the log message, the structured log fields, the
 // serialised result and the returned error.
+//
+// The logger is turned all the way up to trace for the duration, which is not incidental.
+// logrus defaults to info, so a leak written at DEBUG level — the level a developer reaches
+// for precisely when they want to see a value while diagnosing something — would never reach
+// the hook and this test would pass while the credential was being written to every
+// development log. Capturing every level is what closes that hole; the syntax-tree scan
+// further down closes the remaining one, which is a path this test never executes.
 func TestProvisionSubscriberPrincipal_NeverLeaksThePassword(t *testing.T) {
+	captureEveryLogLevel(t)
+
 	t.Run("successful provisioning", func(t *testing.T) {
 		hook := logtest.NewGlobal()
 		defer hook.Reset()
@@ -1363,6 +1704,21 @@ func TestProvisionSubscriberPrincipal_NeverLeaksThePassword(t *testing.T) {
 		assert.Zero(t, fake.totalCalls(), "an unusable password must not reach the broker")
 		assertNoPasswordInLogs(t, hook)
 	})
+}
+
+// captureEveryLogLevel raises the standard logger to trace for one test and restores the
+// previous level afterwards.
+//
+// Without it a secret-leak assertion only sees info and above, so a value logged at debug or
+// trace level would slip past unnoticed — and debug is exactly the level such a line gets
+// written at.
+func captureEveryLogLevel(t *testing.T) {
+	t.Helper()
+
+	previous := logrus.GetLevel()
+	t.Cleanup(func() { logrus.SetLevel(previous) })
+
+	logrus.SetLevel(logrus.TraceLevel)
 }
 
 // assertNoPasswordInLogs fails when the sentinel appears anywhere in the captured log
@@ -1477,6 +1833,24 @@ func TestProvisionSubscriberPrincipal_ReportsAReplacedCredential(t *testing.T) {
 	require.NoError(t, err, "re-issuing a credential must not be an error")
 	assert.True(t, result.CredentialReplaced, "replacing an existing credential must be reported")
 	assert.Equal(t, 1, fake.callCount("AlterUserScramCredentials"), "the credential must be upserted")
+
+	// The replacement is known to BE a replacement only because provisioning describes the
+	// principal before writing. Without that probe the flag could only ever be guessed, and an
+	// operator would have no way to tell a new subscriber apart from one whose running
+	// consumer just lost its credential.
+	assert.Equal(t, 1, fake.callCount("DescribeUserScramCredentials"),
+		"provisioning must probe for an existing credential so re-issuance is a defined operation")
+
+	// The same call against a principal that holds nothing must report the opposite, which is
+	// what makes the flag informative rather than always true.
+	firstIssuance := newFakeAdminClient()
+	fresh, err := newTestKafkaAdmin(firstIssuance, MinTopicPartitions, 1).ProvisionSubscriberPrincipal(
+		context.Background(),
+		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
+	)
+	require.NoError(t, err)
+	assert.False(t, fresh.CredentialReplaced, "a principal that held nothing must not report a replacement")
+	assert.Equal(t, 1, firstIssuance.callCount("DescribeUserScramCredentials"))
 }
 
 // TestProvisionSubscriberPrincipal_WarnsWhenTheBrokerEnforcesNothing is the guard against a
@@ -1616,6 +1990,19 @@ func TestSubscriberCredentialExists_DistinguishesMechanismAndAbsence(t *testing.
 	exists, err := admin.SubscriberCredentialExists(context.Background(), "has-sha512")
 	require.NoError(t, err)
 	assert.True(t, exists, "a SHA-512 credential must be reported as present")
+
+	fake.mu.Lock()
+	described := fake.describeScramRequests
+	fake.mu.Unlock()
+
+	// The probe must name exactly the principal it was asked about. An empty user list is
+	// how kafka-go asks about EVERY principal in the cluster, which would answer a different
+	// question, cost far more, and require a broader administrative grant than provisioning
+	// one subscriber needs.
+	require.Len(t, described, 1, "one probe, one round trip")
+	require.Len(t, described[0].Users, 1,
+		"the describe request must name exactly one principal, never the whole cluster")
+	assert.Equal(t, "has-sha512", described[0].Users[0].Name)
 
 	exists, err = admin.SubscriberCredentialExists(context.Background(), "has-sha256")
 	require.NoError(t, err)
@@ -1980,6 +2367,150 @@ func TestConsumerLag_ReadsBothOffsetBoundsInOneRequest(t *testing.T) {
 	assert.Equal(t, 2, timestamps[kafka.LastOffset], "each partition's end offset must be requested")
 	assert.Equal(t, kafka.ReadUncommitted, request.IsolationLevel,
 		"the conventional LOG-END-OFFSET definition is what operators compare against")
+
+	fake.mu.Lock()
+	fetch := fake.offsetFetchRequests[0]
+	fake.mu.Unlock()
+
+	// The group is the whole subject of the measurement: an OffsetFetch aimed at the wrong
+	// group returns a perfectly valid answer about somebody else, and the lag figure would be
+	// wrong without a single error anywhere.
+	assert.Equal(t, "acme-recon-group", fetch.GroupID,
+		"committed offsets must be read for the requested consumer group and no other")
+	assert.Equal(t, []int{0, 1}, fetch.Topics["blnk.transactions"],
+		"every partition of the measured topic must be included in the commit fetch")
+}
+
+// TestConsumerLag_CarriesAlertScaleMagnitudesWithoutOverflowOrTruncation pins the number at
+// the scale the alert actually fires at.
+//
+// alerts/blnk-kafka-alerts.yml fires SubscriberConsumerLagHigh on
+// blnk_kafka_consumer_lag > 10000, so a measurement that saturated, truncated or wrapped
+// anywhere below that would DISABLE the alert rather than trip it — and silently, because a
+// smaller-than-true lag is indistinguishable from a healthy consumer. Every figure below
+// therefore sits above the threshold, and the second case sits high in the int64 range that
+// Kafka offsets and the gauge both use.
+func TestConsumerLag_CarriesAlertScaleMagnitudesWithoutOverflowOrTruncation(t *testing.T) {
+	// alertThreshold mirrors the rule file. It is written out here rather than imported
+	// because the rule is PromQL and not Go: asserting the number on both sides is the only
+	// way the two can be kept in agreement.
+	const alertThreshold = int64(10_000)
+
+	t.Run("an aggregate above the alert threshold is reported exactly", func(t *testing.T) {
+		gauge := captureConsumerLagGauge(t)
+
+		// Six partitions — the required minimum — each individually below the threshold. The
+		// alert reads the AGGREGATE, so per-partition figures that each look survivable must
+		// still sum to a firing value; a per-partition comparison would never fire here.
+		const endOffset = int64(10_000)
+		const perPartitionLag = int64(4_000)
+
+		fake := newFakeAdminClient()
+		for partition := 0; partition < MinTopicPartitions; partition++ {
+			fake.withOffsets("blnk.transactions", partition, 0, endOffset)
+			fake.withCommitted("blnk.transactions", partition, endOffset-perPartitionLag)
+		}
+
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		report, err := admin.ConsumerLag(context.Background(), ConsumerLagRequest{
+			SubscriberID: "sub_0f6e2c8a",
+			GroupID:      "acme-recon-group",
+			Topics:       []string{"blnk.transactions"},
+		})
+		require.NoError(t, err)
+
+		const expected = perPartitionLag * MinTopicPartitions
+		require.Greater(t, int64(expected), alertThreshold,
+			"the fixture itself must exceed the alert threshold, or this test proves nothing")
+
+		assert.Equal(t, int64(24_000), report.TotalLag,
+			"every one of the six partitions must contribute its full four thousand")
+		require.Len(t, report.Topics, 1)
+		assert.Equal(t, int64(24_000), report.Topics[0].TotalLag)
+		assert.Len(t, report.Topics[0].Partitions, MinTopicPartitions,
+			"a partition dropped from the sum would understate the lag")
+
+		records := gauge.snapshot()
+		require.Len(t, records, 1, "one topic measured, one gauge value published")
+		assert.Equal(t, int64(24_000), records[0].value,
+			"the gauge must carry the aggregate undiminished; a truncated value would silence the alert")
+		assert.Greater(t, records[0].value, alertThreshold,
+			"the published value must cross the threshold the rule fires on")
+	})
+
+	t.Run("offsets near the int64 ceiling neither wrap nor saturate", func(t *testing.T) {
+		gauge := captureConsumerLagGauge(t)
+
+		// Kafka offsets are int64 and a long-lived partition genuinely grows without bound.
+		// The instrument is an Int64Gauge, so the only remaining failure mode is arithmetic:
+		// an int or int32 anywhere in the chain would wrap this into a negative number, and a
+		// negative contribution would drag the summed figure below the truth.
+		const endOffset = int64(1) << 62
+		const behind = int64(1_500_000)
+
+		fake := newFakeAdminClient()
+		fake.withOffsets("blnk.transactions", 0, 0, endOffset).
+			withCommitted("blnk.transactions", 0, endOffset-behind)
+		fake.withOffsets("blnk.balances", 0, 0, endOffset).
+			withCommitted("blnk.balances", 0, endOffset-behind)
+
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		report, err := admin.ConsumerLag(context.Background(), ConsumerLagRequest{
+			SubscriberID: "sub_0f6e2c8a",
+			GroupID:      "acme-recon-group",
+			Topics:       []string{"blnk.transactions", "blnk.balances"},
+		})
+		require.NoError(t, err)
+
+		require.Len(t, report.Topics, 2)
+		assert.Equal(t, behind, report.Topics[0].TotalLag,
+			"the difference between two very large offsets must be exact, not approximate")
+		assert.Equal(t, behind, report.Topics[1].TotalLag)
+		assert.Equal(t, behind*2, report.TotalLag, "the cross-topic sum must not overflow")
+		assert.Greater(t, report.TotalLag, alertThreshold)
+
+		records := gauge.snapshot()
+		require.Len(t, records, 2)
+		for _, record := range records {
+			assert.Equal(t, behind, record.value,
+				"the gauge must receive the exact figure at this scale")
+			assert.GreaterOrEqual(t, record.value, int64(0),
+				"a wrapped or saturated value would surface as a negative gauge reading")
+		}
+
+		// The arithmetic itself, at the scale a 32-bit accumulator could not survive: an
+		// uncommitted partition at the int64 ceiling must report full lag at that ceiling.
+		assert.Equal(t, endOffset, lagForPartition(-1, 0, endOffset),
+			"full lag on a partition at the int64 scale must be reported at that scale")
+		assert.Equal(t, endOffset-1, lagForPartition(1, 0, endOffset),
+			"a single committed record at the int64 scale must reduce the lag by exactly one")
+	})
+
+	t.Run("the gauge the alert reads is the one internal metrics declares", func(t *testing.T) {
+		// The rule names the Prometheus series blnk_kafka_consumer_lag, which is the
+		// OpenTelemetry instrument blnk.kafka.consumer_lag after the exporter's
+		// dot-to-underscore mapping. A rename on either side leaves a rule that matches
+		// nothing and reports itself permanently healthy, so the name is asserted against its
+		// declaration rather than assumed.
+		declaration, err := os.ReadFile(
+			filepath.Join(moduleRootDir(t), "internal", "metrics", "metrics.go"),
+		)
+		require.NoError(t, err, "internal/metrics/metrics.go must be readable")
+
+		assert.Contains(t, string(declaration), `"blnk.kafka.consumer_lag"`,
+			"the consumer-lag gauge must be declared under the exact name the alert rule reads")
+
+		rule, err := os.ReadFile(
+			filepath.Join(moduleRootDir(t), "alerts", "blnk-kafka-alerts.yml"),
+		)
+		require.NoError(t, err, "alerts/blnk-kafka-alerts.yml must be readable")
+
+		assert.Contains(t, string(rule), "blnk_kafka_consumer_lag > 10000",
+			"the alert must fire above ten thousand messages, which is the magnitude this "+
+				"measurement has to represent without truncation")
+	})
 }
 
 // TestTopicEndOffsets_DefaultsToTheWholeInventory pins the reconciliation's default scope.
@@ -2012,6 +2543,23 @@ func TestTopicEndOffsets_DefaultsToTheWholeInventory(t *testing.T) {
 	assert.Empty(t, report.MissingTopics)
 	assert.Zero(t, report.PartitionsUnavailable,
 		"the reconciliation is only valid when every partition was readable")
+
+	// The figure has to come from the broker's own offsets. ListOffsets is the only request
+	// that reports them, so a reconciliation built on anything else — a cached count, a
+	// consumer's own position — would be comparing the outbox against itself.
+	assert.Equal(t, 1, fake.callCount("ListOffsets"),
+		"end offsets must be read from the broker with ListOffsets, in one request")
+	assert.Zero(t, fake.callCount("OffsetFetch"),
+		"the reconciliation is about what was published, not about what any group consumed")
+
+	// Every topic in the inventory must appear in the per-topic reduction, which is the shape
+	// GET /events/stats reports and the runbook sums.
+	endOffsets := report.EndOffsetsByTopic()
+	require.Len(t, endOffsets, len(expectedEventTopics))
+	for _, topic := range expectedEventTopics {
+		assert.Equal(t, int64(1), endOffsets[topic],
+			"topic %q must contribute its own end offset to the reconciliation", topic)
+	}
 }
 
 // TestTopicEndOffsets_SumsEndOffsetsAndSeparatesRetention keeps the two figures apart.
@@ -2435,8 +2983,17 @@ func TestMissingTopics_NamesTheAbsentOnesInRequestedOrder(t *testing.T) {
 // asserted over the syntax tree rather than over one execution.
 //
 // The runtime tests above prove the password does not leak on the paths they exercise. This
-// proves it cannot leak on ANY path, including one added later, by checking that no logging
-// or error-formatting call anywhere in the file takes the password as an argument.
+// proves it cannot leak on ANY path, including one added later, by checking that no logging,
+// error-formatting, trace-attribute or metric-label call anywhere in the file takes the
+// password as an argument.
+//
+// The four call families are covered together because they are one hazard wearing four
+// faces: a log line, an error message, a span attribute and a gauge label all end up
+// somewhere an operator — or an exported telemetry backend — can read.
+//
+// The derivation call is deliberately NOT in the forbidden set. pbkdf2 has to be handed the
+// plaintext; that is the one place it legitimately goes, and the value that comes out is
+// one-way.
 func TestEventAdminSource_NeverHandsThePasswordToALogOrAnErrorCall(t *testing.T) {
 	parsed, fileSet := parseEventAdminSource(t)
 
@@ -2459,11 +3016,28 @@ func TestEventAdminSource_NeverHandsThePasswordToALogOrAnErrorCall(t *testing.T)
 		}
 
 		switch name {
-		case "Errorf", "New", "Sprintf", "Sprint", "Print", "Printf",
-			"Debug", "Debugf", "Info", "Infof", "Warn", "Warnf", "Error", "Errorf2",
-			"Fatal", "Fatalf", "Panic", "Panicf",
-			"WithField", "WithFields", "WithError", "String", "Int", "Int64", "Bool":
+		// Error construction and string formatting: the classic way a secret reaches an
+		// operator, by being interpolated into a message that is then returned or logged.
+		case "New", "Errorf", "Sprintf", "Sprint", "Sprintln",
+			"Fprint", "Fprintf", "Fprintln", "Print", "Printf", "Println":
 			return true
+
+		// logrus, at every level, plus its structured-field builders.
+		case "Debug", "Debugf", "Debugln", "Info", "Infof", "Infoln",
+			"Warn", "Warnf", "Warnln", "Warning", "Warningf",
+			"Error", "Errorln", "Fatal", "Fatalf", "Fatalln", "Panic", "Panicf", "Panicln",
+			"WithField", "WithFields", "WithError", "WithContext":
+			return true
+
+		// Trace attributes and metric labels. These are named explicitly because they are
+		// the least obvious escape route and the easiest to add without thinking: a span
+		// attribute or a gauge label carrying the password publishes it to every backend the
+		// telemetry pipeline exports to, and nothing about the call site looks like logging.
+		case "SetAttributes", "WithAttributes", "AddEvent", "RecordError", "SetStatus",
+			"Record", "Add", "Observe",
+			"String", "StringSlice", "Int", "IntValue", "Int64", "Float64", "Bool", "Any":
+			return true
+
 		default:
 			return false
 		}
@@ -2507,6 +3081,82 @@ func TestEventAdminSource_NeverHandsThePasswordToALogOrAnErrorCall(t *testing.T)
 
 		return true
 	})
+}
+
+// TestAdminResultTypes_HaveNowhereToPutTheSecret closes the last escape route the runtime
+// and syntax-tree tests cannot see: a return value.
+//
+// A single field is all it would take. SubscriberProvisioningResult is logged, and it is
+// serialised into the credential-endpoint response, so a "Password" or "Secret" field added
+// to it later would disclose the credential on every issuance without one logging call being
+// written and without the syntax-tree scan above noticing anything. The same goes for the
+// reports the measurement methods return, which the statistics endpoint serialises.
+//
+// The second half asserts that no method hands back the REQUEST, which does legitimately
+// carry the plaintext: an accessor returning it — a "LastProvisioned" style getter, say —
+// would put the secret straight into a caller's hands and, from there, into whatever the
+// caller logs.
+func TestAdminResultTypes_HaveNowhereToPutTheSecret(t *testing.T) {
+	// Deliberately does NOT include "credential": CredentialReplaced is a legitimate boolean
+	// that reports a replacement without carrying anything. The words listed are the ones
+	// that could only ever name the value itself.
+	forbiddenFragments := []string{"password", "secret", "passphrase", "plaintext"}
+
+	returned := []interface{}{
+		SubscriberProvisioningResult{},
+		TopicAssurance{},
+		TopicAssuranceReport{},
+		ConsumerLagReport{},
+		TopicLag{},
+		PartitionLag{},
+		TopicOffsetReport{},
+		TopicOffsetSnapshot{},
+		PartitionOffsetSnapshot{},
+	}
+
+	for _, value := range returned {
+		valueType := reflect.TypeOf(value)
+
+		for index := 0; index < valueType.NumField(); index++ {
+			field := strings.ToLower(valueType.Field(index).Name)
+
+			for _, fragment := range forbiddenFragments {
+				assert.NotContains(t, field, fragment,
+					"%s.%s: a returned type must have no field that could carry the SCRAM password, "+
+						"because these values are logged and serialised",
+					valueType.Name(), valueType.Field(index).Name)
+			}
+		}
+	}
+
+	// The request is the one type that holds the plaintext, which is exactly why it must
+	// never come back out.
+	requestType := reflect.TypeOf(SubscriberProvisioningRequest{})
+	require.NotEqual(t, -1, fieldIndexNamed(requestType, "Password"),
+		"the request is expected to carry the password; if it stopped doing so this test would "+
+			"be guarding nothing")
+
+	adminType := reflect.TypeOf((*KafkaAdminClient)(nil))
+	for index := 0; index < adminType.NumMethod(); index++ {
+		method := adminType.Method(index)
+
+		for out := 0; out < method.Type.NumOut(); out++ {
+			assert.NotEqual(t, requestType, method.Type.Out(out),
+				"%s returns the provisioning request, which carries the plaintext password",
+				method.Name)
+		}
+	}
+}
+
+// fieldIndexNamed returns the index of a struct field by name, or -1 when it is absent.
+func fieldIndexNamed(structType reflect.Type, name string) int {
+	for index := 0; index < structType.NumField(); index++ {
+		if structType.Field(index).Name == name {
+			return index
+		}
+	}
+
+	return -1
 }
 
 // TestEventAdminSource_SpellsNoTopicNameAsALiteral enforces the single source of truth for

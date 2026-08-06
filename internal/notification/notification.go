@@ -152,9 +152,16 @@ func NotifyError(systemError error) {
 			SlackNotification(systemError)
 		}
 
-		// If a webhook sender is registered and webhook URL is configured, send the webhook
+		// Dispatch system.error whenever EITHER event transport is configured: Kafka
+		// brokers or the legacy webhook URL. This sender is system.error's only route
+		// into the event pipeline — it is the one event type with no direct producer
+		// call site — so gating on the webhook URL alone would drop it entirely on a
+		// Kafka-only deployment, which is the intended end state once webhooks are
+		// retired. With neither configured nothing is attempted, preserving the
+		// historic no-op-when-unconfigured behaviour. A non-empty broker list means at
+		// least one dialable address: setKafkaDefaults normalizes blank entries away.
 		sender := getWebhookSender()
-		if sender != nil && conf.Notification.Webhook.Url != "" {
+		if sender != nil && (len(conf.Kafka.Brokers) > 0 || conf.Notification.Webhook.Url != "") {
 			payload := map[string]interface{}{
 				"error": systemError.Error(),
 				"time":  time.Now(),

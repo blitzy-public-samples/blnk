@@ -33,6 +33,23 @@ type MockDataSource struct {
 	mock.Mock
 }
 
+// Compile-time proof that MockDataSource still satisfies the full IDataSource
+// contract.
+//
+// Without this, a method missing from the mock surfaces as a compile error in
+// every unrelated package that builds a mock — the api package, the root blnk
+// package, internal/search — with no indication that the mock is the cause. This
+// single line turns that confusing suite-wide failure into one clear local one at
+// the file that actually needs fixing.
+//
+// It is stated here, immediately after the type it constrains and ahead of the
+// method bodies, so that the contract this file exists to satisfy is the first
+// thing a reader meets rather than something they have to find at the bottom.
+//
+// It belongs in this package and NOT in the database package: database does not
+// import mocks, and adding the assertion there would create an import cycle.
+var _ database.IDataSource = (*MockDataSource)(nil)
+
 // Transaction methods
 
 func (m *MockDataSource) RecordTransaction(ctx context.Context, txn *model.Transaction) (*model.Transaction, error) {
@@ -59,6 +76,8 @@ func (m *MockDataSource) RecordTransactionWithBalances(ctx context.Context, txn 
 // the event rows should assert on the outbox repository instead, which is where
 // they are actually written.
 func (m *MockDataSource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance, outbox *model.LineageOutbox, eventOutbox ...*model.EventOutbox) (*model.Transaction, error) {
+	// eventOutbox is deliberately NOT forwarded into m.Called — see the note above.
+	// Do not "complete" this call: it breaks matching at run time, not compile time.
 	args := m.Called(ctx, txn, sourceBalance, destinationBalance, outbox)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -67,6 +86,9 @@ func (m *MockDataSource) RecordTransactionWithBalancesAndOutbox(ctx context.Cont
 }
 
 func (m *MockDataSource) RecordTransactionsWithBalancesAndOutboxes(ctx context.Context, txns []*model.Transaction, sourceBalance, destinationBalance *model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
+	// eventOutboxes is deliberately NOT forwarded into m.Called — see the note on
+	// RecordTransactionWithBalancesAndOutbox above. Adding it here would change the
+	// argument count testify matches on, which fails at run time, not compile time.
 	args := m.Called(ctx, txns, sourceBalance, destinationBalance, outboxes)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -75,6 +97,9 @@ func (m *MockDataSource) RecordTransactionsWithBalancesAndOutboxes(ctx context.C
 }
 
 func (m *MockDataSource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Context, txns []*model.Transaction, balances []*model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
+	// eventOutboxes is deliberately NOT forwarded into m.Called — see the note on
+	// RecordTransactionWithBalancesAndOutbox above. Adding it here would change the
+	// argument count testify matches on, which fails at run time, not compile time.
 	args := m.Called(ctx, txns, balances, outboxes)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -830,16 +855,3 @@ func (m *MockDataSource) MarkSubscriberMigrated(ctx context.Context, subscriberI
 	args := m.Called(ctx, subscriberID, migratedAt)
 	return args.Error(0)
 }
-
-// Compile-time proof that MockDataSource still satisfies the full IDataSource
-// contract.
-//
-// Without this, a method missing from the mock surfaces as a compile error in
-// every unrelated package that builds a mock — the api package, the root blnk
-// package, internal/search — with no indication that the mock is the cause. This
-// single line turns that confusing suite-wide failure into one clear local one at
-// the file that actually needs fixing.
-//
-// It belongs here and NOT in the database package: database does not import mocks,
-// and adding the assertion there would create an import cycle.
-var _ database.IDataSource = (*MockDataSource)(nil)
