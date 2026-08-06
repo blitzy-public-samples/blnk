@@ -18,6 +18,13 @@ package blnk
 
 import (
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -248,6 +255,53 @@ func TestWebhookSunsetPassed_MalformedDateHasNotPassedWithoutPanic(t *testing.T)
 	}
 }
 
+// TestWebhookSunsetPassed_MalformedDateWarnsThroughThePublicPath asserts the log
+// contract on the path production actually takes.
+//
+// The test below this one covers the internal helper, but neither consumer of the
+// sunset calls that helper: the relay and the HTTP guard both go through
+// WebhookSunsetPassed. A warning that only fired on the internal path would leave a
+// mis-typed environment variable completely silent in production, so the whole chain
+// — configuration store, resolve, parse, warn — is exercised here end to end.
+//
+// The structured fields are asserted individually because they are what makes the
+// warning actionable: an operator needs the offending value, the layout it failed to
+// match, and the parser's own complaint. The message fragment is deliberately the one
+// unique to this file ("instant"). The configuration loader emits its own,
+// separately tested warning about the very same field using the word "timestamp", and
+// an assertion that either could satisfy would prove nothing about this code.
+func TestWebhookSunsetPassed_MalformedDateWarnsThroughThePublicPath(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	// Structurally plausible, every component out of range — the shape of a real typo.
+	const raw = "2026-13-45T99:99:99Z"
+	storeSunsetDate(t, raw) // also resets the warn suppressor
+
+	require.False(t, WebhookSunsetPassed(time.Now()),
+		"a malformed date must leave the sunset un-passed")
+
+	var warning *logrus.Entry
+	for _, entry := range hook.AllEntries() {
+		if entry.Level == logrus.WarnLevel && strings.Contains(entry.Message, "not a valid RFC3339 instant") {
+			warning = entry
+
+			break
+		}
+	}
+	require.NotNil(t, warning,
+		"a malformed sunset date must be reported through the public predicate, not swallowed")
+
+	assert.Equal(t, raw, warning.Data["value"],
+		"the warning must name the offending value")
+	assert.Equal(t, webhookSunsetLayout, warning.Data["expected"],
+		"the warning must name the layout the value failed to match")
+	assert.NotNil(t, warning.Data[logrus.ErrorKey],
+		"the warning must carry the parse error itself")
+	assert.Contains(t, warning.Message, "dual delivery continues",
+		"the warning must state the consequence, which is what an operator acts on")
+}
+
 // TestWebhookSunsetInstant_MalformedDateWarnsOncePerDistinctValue verifies both
 // halves of the log contract: a malformed value is reported, and it is reported once
 // rather than on every call, because the predicate sits on two hot paths.
@@ -377,6 +431,88 @@ func TestWebhookSunsetPassedNow_DelegatesToTheParameterisedPredicate(t *testing.
 	assert.Equal(t, WebhookSunsetPassed(time.Now()), WebhookSunsetPassedNow())
 }
 
+// TestWebhookSunsetPassed_BothConsumersFlipAtTheSameInstant pins the invariant that
+// gives this decision point its reason to exist.
+//
+// The sunset has two observable consequences, and they live in two different
+// packages. The relay stops dual delivering — it enqueues a legacy webhook task only
+// while the sunset has NOT passed. The HTTP guard starts refusing the deprecated
+// webhook routes with 410 Gone — only once it HAS passed. Those two are exact
+// complements at every instant, and they must flip together. If they did not, the
+// service could stop dual writing while still accepting webhook management calls, or
+// keep dual writing after the routes had already gone; both are silent failures that
+// would only surface as a subscriber complaining about missing events.
+//
+// The invariant holds here BY CONSTRUCTION: both closures below consult the one
+// predicate, which is precisely why every consumer is routed through it. What keeps it
+// that way over time is not this test but
+// TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead, which fails the moment any
+// consumer grows a date comparison of its own. This test states the property the two
+// consumers must satisfy and pins the exact instant at which both change their mind.
+func TestWebhookSunsetPassed_BothConsumersFlipAtTheSameInstant(t *testing.T) {
+	const raw = "2026-06-15T12:30:45Z"
+	storeSunsetDate(t, raw)
+
+	sunset := mustParseSunset(t, raw)
+
+	// The relay's dual-delivery branch: legacy delivery continues for exactly as long
+	// as the sunset has not passed.
+	relayDualDelivers := func(now time.Time) bool { return !WebhookSunsetPassed(now) }
+	// The API guard's decision: the deprecated webhook routes answer 410 Gone from the
+	// sunset instant onwards.
+	webhookRoutesAreGone := func(now time.Time) bool { return WebhookSunsetPassed(now) }
+
+	probes := []struct {
+		name string
+		now  time.Time
+	}{
+		{name: "long before the sunset", now: sunset.Add(-30 * 24 * time.Hour)},
+		{name: "one nanosecond before", now: sunset.Add(-time.Nanosecond)},
+		{name: "at the sunset instant", now: sunset},
+		{name: "one nanosecond after", now: sunset.Add(time.Nanosecond)},
+		{name: "long after the sunset", now: sunset.Add(30 * 24 * time.Hour)},
+	}
+
+	// The index of the probe at which each consumer changes its mind. Both must land on
+	// the same index, and that index must be the sunset instant itself.
+	const instantProbe = 2
+	relayFlippedAt, guardFlippedAt := -1, -1
+
+	for i, probe := range probes {
+		dualDelivering := relayDualDelivers(probe.now)
+		gone := webhookRoutesAreGone(probe.now)
+
+		assert.NotEqual(t, dualDelivering, gone,
+			"%s: dual delivery and 410 Gone must never both be on nor both be off", probe.name)
+
+		if i == 0 {
+			continue
+		}
+		if dualDelivering != relayDualDelivers(probes[i-1].now) {
+			relayFlippedAt = i
+		}
+		if gone != webhookRoutesAreGone(probes[i-1].now) {
+			guardFlippedAt = i
+		}
+	}
+
+	require.Equal(t, instantProbe, relayFlippedAt,
+		"dual delivery must stop exactly at the sunset instant, which is probe %d", instantProbe)
+	assert.Equal(t, relayFlippedAt, guardFlippedAt,
+		"both consumers must change their mind at the very same instant")
+
+	// Restated without the indirection, so the expected behaviour of each consumer is
+	// legible from the assertions alone.
+	assert.True(t, relayDualDelivers(sunset.Add(-time.Nanosecond)),
+		"the relay is still dual delivering one nanosecond before the sunset")
+	assert.False(t, webhookRoutesAreGone(sunset.Add(-time.Nanosecond)),
+		"the webhook routes still answer normally one nanosecond before the sunset")
+	assert.False(t, relayDualDelivers(sunset),
+		"the relay has stopped dual delivering at the sunset instant")
+	assert.True(t, webhookRoutesAreGone(sunset),
+		"the webhook routes are gone at the sunset instant")
+}
+
 // TestWebhookSunsetPassed_IsSafeForConcurrentCallers guards the warn suppressor's
 // shared state. Both consumers of the predicate are concurrent — the relay's poll
 // loop and the HTTP request path — so a data race here would be a production defect.
@@ -413,4 +549,184 @@ func TestSunsetWarnGuard_WarnsOnChangeAndAfterReset(t *testing.T) {
 
 	guard.reset()
 	assert.True(t, guard.shouldWarn("second"), "a reset guard treats the value as new")
+}
+
+// -----------------------------------------------------------------------------
+// The single-decision-point invariant.
+//
+// Everything above pins WHAT the sunset decision is. This section pins WHERE that
+// decision is allowed to live, which is the structural property that stops the two
+// consumers from ever drifting apart. A behavioural test cannot catch a second
+// comparison appearing in another package; only a scan of the source can.
+// -----------------------------------------------------------------------------
+
+// sunsetRawDateReaders are the only files permitted to read the raw sunset value,
+// given as paths relative to the module root.
+//
+//   - event_sunset.go is the decision point itself. Reading the raw value is its job.
+//   - config/config.go declares the field and parses it once at load time purely to
+//     warn about a malformed value. It performs no comparison and reaches no verdict,
+//     and it cannot delegate to the helper because package blnk imports package
+//     config, not the reverse.
+//
+// A file showing up in the scan below is a defect to fix, not a reason to extend this
+// list. Consumers get the answer from WebhookSunsetPassed, WebhookSunsetPassedNow or
+// WebhookSunsetDate.
+var sunsetRawDateReaders = map[string]struct{}{
+	"event_sunset.go":  {},
+	"config/config.go": {},
+}
+
+// sunsetRawDateFieldIdent is the configuration field holding the raw value.
+const sunsetRawDateFieldIdent = "WebhookDeprecationSunsetDate"
+
+// sunsetRawDateLiterals are the string spellings through which the raw value can be
+// reached without naming the field: the environment variable, and the JSON key a
+// hand-rolled decode of blnk.json would use.
+var sunsetRawDateLiterals = []string{
+	"WEBHOOK_DEPRECATION_SUNSET_DATE",
+	"webhook_deprecation_sunset_date",
+}
+
+// sunsetScanSkipDirs are directories holding no first-party source.
+var sunsetScanSkipDirs = map[string]struct{}{
+	".git":         {},
+	"vendor":       {},
+	"node_modules": {},
+	"testdata":     {},
+}
+
+// moduleRootDir walks up from the test's working directory until it finds the
+// directory holding go.mod.
+//
+// `go test` runs in the package directory, which for this package is already the
+// module root, but resolving it explicitly keeps the scan correct if these tests are
+// ever moved into a subpackage, and makes the failure legible if they are not run
+// through `go test` at all.
+func moduleRootDir(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.Getwd()
+	require.NoError(t, err, "the working directory must be readable to locate the module root")
+
+	for {
+		if _, statErr := os.Stat(filepath.Join(dir, "go.mod")); statErr == nil {
+			return dir
+		}
+
+		parent := filepath.Dir(dir)
+		require.NotEqual(t, dir, parent,
+			"walked to the filesystem root from %q without finding go.mod", dir)
+		dir = parent
+	}
+}
+
+// TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead enforces that exactly one
+// place in this repository reads the sunset date and compares a clock against it.
+//
+// A consumer cannot compare against the sunset without first obtaining it, and there
+// are only three ways to obtain it: the configuration field, the environment variable,
+// or the JSON key. Scanning for those three is therefore equivalent to scanning for a
+// second comparison, and it is far more precise than hunting for time.Parse calls —
+// the codebase parses RFC3339 in many legitimate places that have nothing to do with
+// the sunset.
+//
+// The scan reads the AST rather than the raw bytes, with comments deliberately left
+// unattached. Explaining the sunset in a doc comment is encouraged; only executable
+// code counts as a second reader. Test files are exempt because fixtures legitimately
+// set the field, as this file and config/config_test.go both do.
+//
+// This test is forward looking. It is the tripwire that fires if the relay's
+// dual-delivery branch or the API's 410 Gone guard is later written with a date
+// comparison of its own instead of calling the helper — which is the exact regression
+// TestWebhookSunsetPassed_BothConsumersFlipAtTheSameInstant could never detect.
+func TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead(t *testing.T) {
+	root := moduleRootDir(t)
+	fset := token.NewFileSet()
+
+	// findings maps an offending file to the human-readable places it read the value.
+	findings := make(map[string][]string)
+	scanned := 0
+
+	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if entry.IsDir() {
+			if _, skip := sunsetScanSkipDirs[entry.Name()]; skip {
+				return filepath.SkipDir
+			}
+
+			return nil
+		}
+
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+
+		relative, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return relErr
+		}
+		relative = filepath.ToSlash(relative)
+
+		if _, allowed := sunsetRawDateReaders[relative]; allowed {
+			return nil
+		}
+
+		parsed, parseErr := parser.ParseFile(fset, path, nil, 0)
+		if parseErr != nil {
+			// A file that does not parse already fails `go build ./...`. Reporting it
+			// here as a sunset violation would only misdirect whoever reads the failure.
+			t.Logf("skipping unparseable file %s: %v", relative, parseErr)
+
+			return nil
+		}
+		scanned++
+
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.Ident:
+				if typed.Name == sunsetRawDateFieldIdent {
+					findings[relative] = append(findings[relative], fmt.Sprintf(
+						"reads the %s field at line %d",
+						sunsetRawDateFieldIdent, fset.Position(typed.Pos()).Line,
+					))
+				}
+			case *ast.BasicLit:
+				if typed.Kind != token.STRING {
+					return true
+				}
+				for _, literal := range sunsetRawDateLiterals {
+					if strings.Contains(typed.Value, literal) {
+						findings[relative] = append(findings[relative], fmt.Sprintf(
+							"names %s at line %d", literal, fset.Position(typed.Pos()).Line,
+						))
+					}
+				}
+			}
+
+			return true
+		})
+
+		return nil
+	})
+	require.NoError(t, walkErr, "the module tree must be walkable for this invariant to mean anything")
+
+	// Without this the test would pass vacuously if the walk ever stopped finding
+	// files — the most dangerous way for a structural assertion to fail.
+	require.Greater(t, scanned, 1,
+		"the scan inspected %d files, so it cannot have covered the module", scanned)
+
+	for file, places := range findings {
+		t.Errorf(
+			"%s reads the raw webhook sunset date (%s). The sunset is a single decision "+
+				"point: call WebhookSunsetPassed, WebhookSunsetPassedNow or WebhookSunsetDate "+
+				"instead, so the relay's dual-delivery branch and the API's 410 Gone guard "+
+				"can never disagree about when the sunset happens.",
+			file, strings.Join(places, "; "),
+		)
+	}
 }

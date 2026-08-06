@@ -255,10 +255,15 @@ func (d Datasource) RecordTransactionWithBalances(ctx context.Context, txn *mode
 // - sourceBalance: The source balance to be updated.
 // - destinationBalance: The destination balance to be updated.
 // - outbox: Optional lineage outbox entry to insert atomically (can be nil if no lineage processing needed).
+// - eventOutbox: Optional event outbox entries to insert atomically. Variadic so
+// every pre-existing caller stays source-compatible; omitting it means this
+// mutation captures no Kafka event, exactly as a nil lineage outbox means it
+// captures no lineage work. See the note on the declaration in repository.go for
+// why this must not become a positional parameter.
 //
 // Returns:
 // - The recorded transaction if successful, or an error if any operation fails.
-func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance, outbox *model.LineageOutbox) (*model.Transaction, error) {
+func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance, outbox *model.LineageOutbox, eventOutbox ...*model.EventOutbox) (*model.Transaction, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RecordTransactionWithBalancesAndOutbox")
 	defer span.End()
 
@@ -299,6 +304,18 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 		))
 	}
 
+	// Insert event outbox entries atomically, immediately after the lineage
+	// outbox and before the commit. This placement is the whole mechanism behind
+	// the transactional-outbox guarantee: the event rows share this transaction
+	// with the balance updates and the transaction record above, so the mutation
+	// and its events commit or roll back together. There is no window in which a
+	// balance moved but its event was lost, and none in which an event describes a
+	// mutation that was rolled back.
+	if err := insertEventOutboxesInTx(ctx, tx, eventOutbox); err != nil {
+		span.RecordError(err)
+		return nil, fmt.Errorf("failed to insert event outbox: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		span.RecordError(err)
 		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
@@ -309,21 +326,32 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 		attribute.String("source.balance_id", sourceBalance.BalanceID),
 		attribute.String("destination.balance_id", destinationBalance.BalanceID),
 		attribute.Bool("outbox.included", outbox != nil),
+		attribute.Int("event_outbox.count", len(eventOutbox)),
 	))
 
 	return txn, nil
 }
 
 // RecordTransactionsWithBalancesAndOutboxes atomically records multiple transactions, updates
-// the source and destination balances once, and inserts any lineage outbox entries in the same
-// database transaction.
-func (d Datasource) RecordTransactionsWithBalancesAndOutboxes(ctx context.Context, txns []*model.Transaction, sourceBalance, destinationBalance *model.Balance, outboxes []*model.LineageOutbox) ([]*model.Transaction, error) {
-	return d.RecordTransactionsWithBalanceSetAndOutboxes(ctx, txns, []*model.Balance{sourceBalance, destinationBalance}, outboxes)
+// the source and destination balances once, and inserts any lineage and event outbox entries in
+// the same database transaction.
+//
+// The variadic event outbox entries are forwarded verbatim with eventOutboxes...
+// so this delegation stays a pure pass-through: an omitted variadic arrives as an
+// empty slice and is forwarded as one, which is why a caller that captures no
+// events needs no change here.
+func (d Datasource) RecordTransactionsWithBalancesAndOutboxes(ctx context.Context, txns []*model.Transaction, sourceBalance, destinationBalance *model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
+	return d.RecordTransactionsWithBalanceSetAndOutboxes(ctx, txns, []*model.Balance{sourceBalance, destinationBalance}, outboxes, eventOutboxes...)
 }
 
 // RecordTransactionsWithBalanceSetAndOutboxes atomically records multiple transactions, updates
-// all changed balances, and inserts any lineage outbox entries in the same database transaction.
-func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Context, txns []*model.Transaction, balances []*model.Balance, outboxes []*model.LineageOutbox) ([]*model.Transaction, error) {
+// all changed balances, and inserts any lineage and event outbox entries in the same database
+// transaction.
+//
+// eventOutboxes is variadic for the same source-compatibility reason documented on
+// the declaration in repository.go: the transaction coalescing path calls this
+// method with four arguments and belongs to a frozen pipeline.
+func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Context, txns []*model.Transaction, balances []*model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RecordTransactionsWithBalancesAndOutboxes")
 	defer span.End()
 
@@ -352,6 +380,14 @@ func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Cont
 		return nil, fmt.Errorf("failed to insert lineage outboxes: %w", err)
 	}
 
+	// Event outbox entries go in at the same point as in the single-transaction
+	// writer above — after the lineage outbox, before the commit — so the batch's
+	// events share the fate of the batch's balance updates.
+	if err := insertEventOutboxesInTx(ctx, tx, eventOutboxes); err != nil {
+		span.RecordError(err)
+		return nil, fmt.Errorf("failed to insert event outboxes: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		span.RecordError(err)
 		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
@@ -361,6 +397,7 @@ func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Cont
 		attribute.Int("transaction.count", len(txns)),
 		attribute.Int("balance.count", len(balances)),
 		attribute.Int("outbox.count", len(outboxes)),
+		attribute.Int("event_outbox.count", len(eventOutboxes)),
 	))
 
 	return txns, nil

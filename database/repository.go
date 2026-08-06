@@ -28,25 +28,47 @@ import (
 
 // IDataSource defines the interface for data source operations, grouping related functionalities.
 type IDataSource interface {
-	transaction    // Interface for transaction-related operations
-	ledger         // Interface for ledger-related operations
-	balance        // Interface for balance-related operations
-	identity       // Interface for identity-related operations
-	balanceMonitor // Interface for balance monitoring operations
-	account        // Interface for account-related operations
-	reconciliation // Interface for reconciliation-related operations
-	apikey         // Interface for API key operations
-	lineage        // Interface for fund lineage operations
-	chain          // Interface for hash-chain operations
+	transaction     // Interface for transaction-related operations
+	ledger          // Interface for ledger-related operations
+	balance         // Interface for balance-related operations
+	identity        // Interface for identity-related operations
+	balanceMonitor  // Interface for balance monitoring operations
+	account         // Interface for account-related operations
+	reconciliation  // Interface for reconciliation-related operations
+	apikey          // Interface for API key operations
+	lineage         // Interface for fund lineage operations
+	chain           // Interface for hash-chain operations
+	eventOutbox     // Interface for event outbox operations
+	eventSubscriber // Interface for event subscriber operations
 }
 
 // transaction defines methods for handling transactions.
 type transaction interface {
-	RecordTransaction(cxt context.Context, txn *model.Transaction) (*model.Transaction, error)                                                                                                     // Records a new transaction
-	RecordTransactionWithBalances(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance) (*model.Transaction, error)                                       // Records a transaction with balance updates atomically
-	RecordTransactionWithBalancesAndOutbox(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance, outbox *model.LineageOutbox) (*model.Transaction, error) // Records a transaction with balance updates and optional lineage outbox atomically
-	RecordTransactionsWithBalancesAndOutboxes(ctx context.Context, txns []*model.Transaction, sourceBalance, destinationBalance *model.Balance, outboxes []*model.LineageOutbox) ([]*model.Transaction, error)
-	RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Context, txns []*model.Transaction, balances []*model.Balance, outboxes []*model.LineageOutbox) ([]*model.Transaction, error)
+	RecordTransaction(cxt context.Context, txn *model.Transaction) (*model.Transaction, error)                                                               // Records a new transaction
+	RecordTransactionWithBalances(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance) (*model.Transaction, error) // Records a transaction with balance updates atomically
+	// The three atomic writers below take their event outbox rows as a VARIADIC
+	// parameter, and that is a deliberate, load-bearing choice rather than a
+	// stylistic one. DO NOT "tidy" it into a positional parameter.
+	//
+	// Event rows have to be inserted inside the very same database transaction as
+	// the ledger mutation that produced them, which is what makes an event and its
+	// mutation commit or roll back together. Threading them through these writers
+	// is therefore unavoidable. Making the parameter variadic is what keeps every
+	// pre-existing caller source-compatible while doing so: a variadic tail may be
+	// omitted entirely, so callers that pass only lineage outboxes still compile
+	// untouched. Callers that pass nothing here are opting out of event capture,
+	// exactly as a nil lineage outbox opts out of lineage capture.
+	//
+	// A positional sixth parameter would break callers this change is explicitly
+	// not permitted to edit — the transaction coalescing path in
+	// transaction_coalescing.go, which belongs to the frozen transaction-processing
+	// pipeline, plus the pre-existing atomic-writer tests in
+	// database/transactions_test.go and the mock argument list in
+	// transaction_benchmark_test.go. Widening positionally is not a bigger diff, it
+	// is an impossible one.
+	RecordTransactionWithBalancesAndOutbox(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance, outbox *model.LineageOutbox, eventOutbox ...*model.EventOutbox) (*model.Transaction, error) // Records a transaction with balance updates and optional lineage and event outbox entries atomically
+	RecordTransactionsWithBalancesAndOutboxes(ctx context.Context, txns []*model.Transaction, sourceBalance, destinationBalance *model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error)
+	RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Context, txns []*model.Transaction, balances []*model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error)
 	GetTransaction(cxt context.Context, id string) (*model.Transaction, error)                                                                      // Retrieves a transaction by ID
 	IsParentTransactionVoid(cxt context.Context, parentID string) (bool, error)                                                                     // Checks if a parent transaction is void
 	GetTransactionByRef(cxt context.Context, reference string) (model.Transaction, error)                                                           // Retrieves a transaction by reference
@@ -195,10 +217,149 @@ type lineage interface {
 	HasPendingCreditOutbox(ctx context.Context, balanceID string) (bool, error)                                              // Checks if there are pending credit outbox entries for a balance
 }
 
+// eventOutbox defines methods for the Kafka event-publishing transactional
+// outbox: blnk.event_outbox, and the relay state machine that drains it.
+//
+// It sits beside the lineage outbox above deliberately, because it reuses that
+// proven shape — an in-transaction insert, a FIFO claim that takes a lease, and
+// explicit terminal-state transitions — rather than inventing a second pattern.
+// The two are nonetheless SEPARATE CONTRACTS over SEPARATE TABLES served by
+// SEPARATE RELAYS. They are not merged, and the lineage declarations above are
+// not modified or reused by name, so the two state machines can evolve
+// independently.
+//
+// # Why the insert has to happen inside a caller-supplied transaction
+//
+// InsertEventOutboxInTx takes an existing *sql.Tx so the event row commits in
+// the SAME database transaction as the ledger mutation that produced it. That is
+// the whole point of the outbox: the mutation and its event commit or roll back
+// together, so there is no window in which a balance moved but the event was
+// lost, and none in which an event describes a mutation that was rolled back.
+// This yields exactly-once semantics ON THE WRITE SIDE. Kafka delivery itself
+// stays at-least-once, which is why the event_id column is uniquely indexed and
+// why duplicate suppression on it is a documented subscriber obligation.
+//
+// # Vocabulary
+//
+// Statuses are the model.EventOutboxStatus* values — pending, processing,
+// dispatched, failed, dead_lettered — and NOT the four-value lineage
+// model.OutboxStatus* set. The terminal success state here is DISPATCHED, not
+// "completed": nothing in this contract should be named as though a row could
+// complete. The int64 ids taken by the Mark* methods are the BIGSERIAL surrogate
+// key, whereas GetEventByID takes the business event_id UUID; the two are not
+// interchangeable.
+//
+// # The one method with a limited lifetime
+//
+// MarkWebhookDispatched serves the 30-day window during which Kafka publishing
+// and legacy HTTP webhook delivery run side by side FROM THE SAME CLAIMED ROW —
+// which is what makes the two transports carry byte-identical payloads
+// structurally rather than by careful coding. The relay calls it once it has
+// enqueued the legacy task, so a row republished to Kafka after a crash does not
+// enqueue a second webhook. It is the only member of this contract that the
+// webhook sunset makes redundant; every other method outlives the sunset.
+type eventOutbox interface {
+	// Insert methods for atomic event capture
+	InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *model.EventOutbox) error // Inserts an event outbox entry within an existing transaction
+	InsertEventOutbox(ctx context.Context, e *model.EventOutbox) error                 // Inserts an event outbox entry directly, outside any ledger transaction
+
+	// Relay state machine: claim a batch, then drive each row to a terminal state
+	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims pending entries FIFO for publishing, taking a lease for lockDuration
+	MarkEventDispatched(ctx context.Context, id int64) error                                                             // Marks an entry dispatched after the broker acknowledges the publish
+	MarkEventFailed(ctx context.Context, id int64, errMsg string) error                                                  // Records a failed publish attempt and its reason against an entry
+	MarkWebhookDispatched(ctx context.Context, id int64) error                                                           // Marks the legacy webhook leg dispatched, so a republished row cannot double-enqueue it
+
+	// Dead-letter and reporting reads
+	GetEventByID(ctx context.Context, eventID string) (*model.EventOutbox, error)               // Retrieves an entry by its business event_id UUID, for replay
+	ListDeadLetteredEvents(ctx context.Context, limit, offset int) ([]model.EventOutbox, error) // Pages the dead-letter inventory for the dead-letter API
+
+	// CountEventOutboxByStatus returns a status-keyed count of every row in
+	// blnk.event_outbox.
+	//
+	// IT IS NOT UNUSED — do not delete it. It exists for one named purpose: the
+	// daily zero-loss reconciliation, which passes when the dispatched plus
+	// dead-lettered counts equal the sum of the main-topic and dead-letter-topic
+	// end offsets reported by the broker. Three things consume it: the event
+	// statistics endpoint, the reconciliation runbook in the Kafka operations
+	// documentation, and the pending-backlog gauge exported to the metrics
+	// pipeline. A grep for callers inside this package alone will find none,
+	// which is exactly the trap this comment exists to prevent.
+	//
+	// The map is keyed by the model.EventOutboxStatus* values, and a status with
+	// no rows is absent from the map rather than present with a zero — callers
+	// must read it with the two-value form or accept the zero value.
+	CountEventOutboxByStatus(ctx context.Context) (map[string]int64, error)
+}
+
+// eventSubscriber defines methods for the Kafka subscriber registry:
+// blnk.event_subscribers. A row records one subscriber's identity together with
+// the four values that ARE its access boundary — the Kafka principal its ACLs are
+// granted to, the consumer group it reads under, the topics it is authorised for,
+// and the partition-key prefix its grant is narrowed to. Provisioning translates
+// that row into one SASL/SCRAM credential and a set of ACL bindings; there are no
+// per-tenant topics.
+//
+// # NO METHOD HERE MAY ACCEPT OR RETURN A PLAINTEXT SECRET
+//
+// This is a hard constraint on what may be declared in this contract, not a
+// guideline, and it is why the credential method below takes a reference rather
+// than a password.
+//
+// The SASL secret is generated during provisioning, returned to the caller
+// EXACTLY ONCE by the subscriber service, and persisted nowhere: it cannot be
+// recovered afterwards, only replaced by issuing a new one. Only a
+// non-reversible reference and the issuance instant are stored — the same posture
+// as blnk.api_keys, where the key column holds a bcrypt hash and the raw key is
+// never stored. RecordSubscriberCredential therefore takes a credentialReference
+// that the CALLER has already derived, and no reader returns anything a caller
+// could authenticate with.
+//
+// Do not add a method that takes or hands back a password, secret, SASL password,
+// token, or any encrypted variant of one. Such a method would also be
+// unimplementable: blnk.event_subscribers deliberately has NO column capable of
+// holding a plaintext or reversibly-encrypted secret, so there is nothing for it
+// to write to or read from. The prohibition lives in the schema precisely because
+// a column that exists eventually gets written to, and removing a secret column
+// that has already shipped and been populated is an incident rather than a
+// migration.
+//
+// # Reads and error shape
+//
+// Single-entity reads return (*model.EventSubscriber, error) rather than a value
+// and a boolean, so an implementation can distinguish "no such subscriber" from
+// "the query failed" by returning an apierror-wrapped not-found instead of
+// leaking a bare sql.ErrNoRows to the API layer.
+type eventSubscriber interface {
+	// Registry CRUD
+	CreateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber) (*model.EventSubscriber, error) // Registers a subscriber and returns the stored row
+	GetEventSubscriberByID(ctx context.Context, subscriberID string) (*model.EventSubscriber, error)              // Retrieves a subscriber by its business subscriber_id
+	ListEventSubscribers(ctx context.Context, limit, offset int) ([]model.EventSubscriber, error)                 // Pages the registry
+	UpdateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber) error                           // Updates a subscriber's access model and legacy webhook URL
+	DeleteEventSubscriber(ctx context.Context, subscriberID string) error                                         // Removes a subscriber from the registry
+
+	// RecordSubscriberCredential persists the outcome of a credential issuance:
+	// a NON-REVERSIBLE reference to the credential and the instant it was
+	// issued, which together are the complete stored record of an issuance. A
+	// reissue overwrites both.
+	//
+	// credentialReference is already derived by the caller and MUST NOT be a
+	// password or anything from which one can be recovered — see the prohibition
+	// in this interface's documentation. A NULL credential reference on a row
+	// means no credential has ever been issued to that subscriber, which is a
+	// legitimate "registered, not yet provisioned" state.
+	RecordSubscriberCredential(ctx context.Context, subscriberID, credentialReference string, issuedAt time.Time) error
+
+	// MarkSubscriberMigrated stamps migrated_at, recording that the subscriber
+	// has completed its move from legacy HTTP webhook delivery to Kafka
+	// consumption. A NULL migrated_at means NOT YET MIGRATED, which is exactly
+	// what migration-progress reporting counts during the dual-delivery window.
+	MarkSubscriberMigrated(ctx context.Context, subscriberID string, migratedAt time.Time) error
+}
+
 // chain defines the hash-chain (tamper-evidence) operations.
 type chain interface {
-	ChainPendingTransactions(ctx context.Context, cutoff time.Time, batchSize int) (int, error)           // Seals the next batch of unchained transactions
-	GetChainState(ctx context.Context) (*model.ChainState, error)                                         // Returns the global chain bookmark
+	ChainPendingTransactions(ctx context.Context, cutoff time.Time, batchSize int) (int, error)                     // Seals the next batch of unchained transactions
+	GetChainState(ctx context.Context) (*model.ChainState, error)                                                   // Returns the global chain bookmark
 	GetChainedTransactionsAfter(ctx context.Context, afterSeq int64, limit int) ([]model.ChainedTransaction, error) // Pages chained transactions in chain order
-	CountUnchainedTransactions(ctx context.Context, cutoff time.Time) (int64, error)                      // Counts the chainer backlog
+	CountUnchainedTransactions(ctx context.Context, cutoff time.Time) (int64, error)                                // Counts the chainer backlog
 }

@@ -7,6 +7,34 @@ data:
   prometheus.yml: |
     global:
       scrape_interval: 15s
+    # Alerting rules to evaluate. This stanza — not the mere presence of a rule
+    # file — is what arms the two Kafka event-streaming alerts, and it repeats
+    # the identical stanza in the repository-root prometheus.yml so the
+    # Kubernetes and Compose monitoring configurations stay in lockstep. Were it
+    # missing here, Kubernetes would silently have no Kafka alerting while
+    # Compose had it, and nothing would look wrong in either file.
+    #
+    # This is a path INSIDE the Prometheus container, not a repository path.
+    # Compose bind-mounts ./alerts to /etc/prometheus/alerts; Kubernetes has no
+    # bind mounts, so the rule file travels as the blnk-kafka-alerts.yml key
+    # below and prometheus-deployment.yaml must project that key into this same
+    # directory, alongside its existing prometheus.yml mount:
+    #   - name: prometheus-config
+    #     mountPath: /etc/prometheus/alerts/blnk-kafka-alerts.yml
+    #     subPath: blnk-kafka-alerts.yml
+    # Keep the key name, the subPath, the mountPath and this path in step. An
+    # unmounted rule file is a SILENT failure: it surfaces as the alerts being
+    # absent from /api/v1/rules, not as a startup error, so verify there after
+    # changing any of the four.
+    #
+    # The glob is deliberate and matches the root file character for character.
+    # It resolves for either the per-key subPath mount above or a whole-
+    # directory projection, it picks up rule files added later without a further
+    # edit here, and a glob that matches nothing still lets Prometheus start,
+    # whereas a literal missing path fails `promtool check config` outright with
+    # "does not point to an existing file".
+    rule_files:
+      - '/etc/prometheus/alerts/*.yml'
     scrape_configs:
       - job_name: 'blnk-server'
         # Uncomment to authenticate when metrics_bearer_token is configured in blnk.json:
@@ -21,3 +49,81 @@ data:
         #   credentials: '<your-metrics-bearer-token>'
         static_configs:
           - targets: ['worker:5004']
+  # The Kubernetes copy of alerts/blnk-kafka-alerts.yml. That file is the source
+  # of truth; this is its mirror. Compose bind-mounts the original into the
+  # Prometheus container, but a ConfigMap cannot reference a file on disk, so the
+  # content is duplicated here by design rather than by oversight. The two copies
+  # MUST stay identical — same group, same interval, same expressions,
+  # thresholds, dwell times, labels and annotations — because a divergence
+  # between them means one environment alerts and the other does not.
+  #
+  # The two series are the Prometheus renderings of the OpenTelemetry gauges
+  # declared in internal/metrics/metrics.go, dots becoming underscores:
+  # blnk.dlt.oldest_message_age_seconds and blnk.kafka.consumer_lag. Both are
+  # already exposed on the /metrics endpoints that the two scrape jobs above
+  # collect, so no additional scrape target is required: consumer lag is computed
+  # in-process by differencing committed offsets against log end offsets, not by
+  # a lag exporter. Copy these names, never retype them — one wrong character
+  # yields a rule that evaluates against a series nothing records, so it can
+  # never fire and reports no error anywhere.
+  blnk-kafka-alerts.yml: |
+    groups:
+      # One group, deliberately. Both rules cover the same domain and share one
+      # evaluation cadence.
+      - name: blnk-kafka-alerts
+        # Pinned explicitly rather than inherited. The config above sets only
+        # global.scrape_interval (15s) and leaves global.evaluation_interval at
+        # its 1 minute default, so an unpinned group would silently change
+        # cadence the day someone adds that global. 30s is one evaluation per
+        # two scrapes: responsive, not wasteful.
+        interval: 30s
+        rules:
+          # Events have been dead-lettered and nobody has cleared them. In a
+          # financial ledger that means ledger mutations are not reaching
+          # subscribers, so this pages rather than warns.
+          - alert: DeadLetterMessageStuck
+            # 900 is the 15 minute dwell the requirement states, written as a
+            # literal so the threshold is greppable. The gauge is the age of the
+            # OLDEST unresolved dead-letter entry, so this one comparison covers
+            # every entry. Left bare on purpose: no label matcher, so the rule
+            # keeps whatever attributes the gauge carries and cannot be broken
+            # by an attribute being renamed.
+            expr: blnk_dlt_oldest_message_age_seconds > 900
+            # Deliberately zero, not omitted. The threshold already carries the
+            # 15 minutes; a dwell here would double-count it and push the first
+            # notification past the boundary the requirement fixes. There is
+            # also no flapping to damp: the gauge climbs monotonically while
+            # anything is stuck and drops to zero the moment the dead-letter
+            # topic drains. Do not "fix" this by adding a dwell.
+            for: 0m
+            labels:
+              severity: critical
+              component: event-streaming
+            annotations:
+              summary: "Dead-lettered events unresolved for more than 15 minutes"
+              description: "The oldest unresolved dead-letter entry on topic {{ $labels.topic }} (instance {{ $labels.instance }}) has been waiting {{ $value | humanizeDuration }}. This value is an age, not a count: one entry this old is enough to fire. Triage it and replay it with POST /events/dead-letter/:event_id/replay."
+              runbook_url: docs/kafka-operations.md
+
+          # A subscriber is falling behind. The events are durably in Kafka and
+          # the consumer will catch up on its own, so this is degradation
+          # rather than loss.
+          - alert: SubscriberConsumerLagHigh
+            # blnk_kafka_consumer_lag is computed in-process and is already
+            # summed across a topic's partitions, so it is compared bare: no
+            # sum(), no sum by(), no clamp_min(). Staying bare also keeps the
+            # subscriber, group and topic attributes on the notification, which
+            # is exactly what makes it actionable.
+            expr: blnk_kafka_consumer_lag > 10000
+            # Two minutes, i.e. four consecutive evaluations at the interval
+            # above. Unlike a dead-letter age, consumer lag is legitimately
+            # spiky, so a short dwell avoids paging on a burst that
+            # self-corrects while staying short enough to observe promptly when
+            # the rule is being verified.
+            for: 2m
+            labels:
+              severity: warning
+              component: event-streaming
+            annotations:
+              summary: "Subscriber consumer group lag is above 10,000 messages"
+              description: "Subscriber {{ $labels.subscriber }} (consumer group {{ $labels.group }}) is {{ $value | humanize }} messages behind the end of topic {{ $labels.topic }}. Confirm the consumer is running and keeping up before Kafka's retention window is reached."
+              runbook_url: docs/kafka-operations.md

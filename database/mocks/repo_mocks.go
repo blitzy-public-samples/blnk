@@ -21,6 +21,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/internal/filter"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/stretchr/testify/mock"
@@ -43,7 +44,20 @@ func (m *MockDataSource) RecordTransactionWithBalances(ctx context.Context, txn 
 	return args.Get(0).(*model.Transaction), args.Error(1)
 }
 
-func (m *MockDataSource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance, outbox *model.LineageOutbox) (*model.Transaction, error) {
+// The three atomic writers below accept the same variadic event outbox tail as the
+// real datasource, but they deliberately DO NOT forward it into m.Called().
+//
+// testify matches an expectation by argument count and position, so forwarding the
+// variadic would change the argument list every existing expectation was written
+// against — a caller that set up five mock.Anything matchers would stop matching
+// the moment a fourth argument became a slice, and the failure would surface as an
+// unexpected-call panic rather than a compile error. Keeping the Called() argument
+// list exactly as it was is what lets every pre-existing expectation in the suite
+// continue to match untouched, which is the same source-compatibility property the
+// variadic exists to provide on the real interface. A test that needs to assert on
+// the event rows should assert on the outbox repository instead, which is where
+// they are actually written.
+func (m *MockDataSource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance, outbox *model.LineageOutbox, eventOutbox ...*model.EventOutbox) (*model.Transaction, error) {
 	args := m.Called(ctx, txn, sourceBalance, destinationBalance, outbox)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -51,7 +65,7 @@ func (m *MockDataSource) RecordTransactionWithBalancesAndOutbox(ctx context.Cont
 	return args.Get(0).(*model.Transaction), args.Error(1)
 }
 
-func (m *MockDataSource) RecordTransactionsWithBalancesAndOutboxes(ctx context.Context, txns []*model.Transaction, sourceBalance, destinationBalance *model.Balance, outboxes []*model.LineageOutbox) ([]*model.Transaction, error) {
+func (m *MockDataSource) RecordTransactionsWithBalancesAndOutboxes(ctx context.Context, txns []*model.Transaction, sourceBalance, destinationBalance *model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
 	args := m.Called(ctx, txns, sourceBalance, destinationBalance, outboxes)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -59,7 +73,7 @@ func (m *MockDataSource) RecordTransactionsWithBalancesAndOutboxes(ctx context.C
 	return args.Get(0).([]*model.Transaction), args.Error(1)
 }
 
-func (m *MockDataSource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Context, txns []*model.Transaction, balances []*model.Balance, outboxes []*model.LineageOutbox) ([]*model.Transaction, error) {
+func (m *MockDataSource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Context, txns []*model.Transaction, balances []*model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
 	args := m.Called(ctx, txns, balances, outboxes)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -701,3 +715,125 @@ func (m *MockDataSource) CountUnchainedTransactions(ctx context.Context, cutoff 
 	args := m.Called(ctx, cutoff)
 	return args.Get(0).(int64), args.Error(1)
 }
+
+// Event outbox methods
+
+func (m *MockDataSource) InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *model.EventOutbox) error {
+	args := m.Called(ctx, tx, e)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox) error {
+	args := m.Called(ctx, e)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
+	args := m.Called(ctx, batchSize, lockDuration)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.EventOutbox), args.Error(1)
+}
+
+func (m *MockDataSource) MarkEventDispatched(ctx context.Context, id int64) error {
+	args := m.Called(ctx, id)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, errMsg string) error {
+	args := m.Called(ctx, id, errMsg)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) MarkWebhookDispatched(ctx context.Context, id int64) error {
+	args := m.Called(ctx, id)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) GetEventByID(ctx context.Context, eventID string) (*model.EventOutbox, error) {
+	args := m.Called(ctx, eventID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.EventOutbox), args.Error(1)
+}
+
+func (m *MockDataSource) ListDeadLetteredEvents(ctx context.Context, limit, offset int) ([]model.EventOutbox, error) {
+	args := m.Called(ctx, limit, offset)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.EventOutbox), args.Error(1)
+}
+
+func (m *MockDataSource) CountEventOutboxByStatus(ctx context.Context) (map[string]int64, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(map[string]int64), args.Error(1)
+}
+
+// Event subscriber methods
+//
+// None of these carries a plaintext secret, mirroring the real repository: the
+// credential method takes an already-derived, non-reversible reference and an
+// issuance instant, and no getter hands one back.
+
+func (m *MockDataSource) CreateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber) (*model.EventSubscriber, error) {
+	args := m.Called(ctx, subscriber)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.EventSubscriber), args.Error(1)
+}
+
+func (m *MockDataSource) GetEventSubscriberByID(ctx context.Context, subscriberID string) (*model.EventSubscriber, error) {
+	args := m.Called(ctx, subscriberID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.EventSubscriber), args.Error(1)
+}
+
+func (m *MockDataSource) ListEventSubscribers(ctx context.Context, limit, offset int) ([]model.EventSubscriber, error) {
+	args := m.Called(ctx, limit, offset)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.EventSubscriber), args.Error(1)
+}
+
+func (m *MockDataSource) UpdateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber) error {
+	args := m.Called(ctx, subscriber)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) DeleteEventSubscriber(ctx context.Context, subscriberID string) error {
+	args := m.Called(ctx, subscriberID)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) RecordSubscriberCredential(ctx context.Context, subscriberID, credentialReference string, issuedAt time.Time) error {
+	args := m.Called(ctx, subscriberID, credentialReference, issuedAt)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) MarkSubscriberMigrated(ctx context.Context, subscriberID string, migratedAt time.Time) error {
+	args := m.Called(ctx, subscriberID, migratedAt)
+	return args.Error(0)
+}
+
+// Compile-time proof that MockDataSource still satisfies the full IDataSource
+// contract.
+//
+// Without this, a method missing from the mock surfaces as a compile error in
+// every unrelated package that builds a mock — the api package, the root blnk
+// package, internal/search — with no indication that the mock is the cause. This
+// single line turns that confusing suite-wide failure into one clear local one at
+// the file that actually needs fixing.
+//
+// It belongs here and NOT in the database package: database does not import mocks,
+// and adding the assertion there would create an import cycle.
+var _ database.IDataSource = (*MockDataSource)(nil)

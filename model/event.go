@@ -515,3 +515,155 @@ func EventCategory(eventType string) string {
 		return EventCategorySystem
 	}
 }
+
+// EventSubscriber is one row of blnk.event_subscribers: a registered Kafka
+// subscriber, the access boundary provisioned for it, and — during the dual-run
+// only — the legacy webhook URL it is being migrated away from (requirement R-7).
+//
+// # The access model this type carries
+//
+// There are no per-tenant topics. Isolation is achieved instead by making each
+// subscriber a Kafka principal whose ACLs are scoped to its authorised topics, its
+// consumer group and its partition-key prefix. KafkaPrincipal, ConsumerGroupID,
+// AuthorizedTopics and PartitionKeyPrefix are therefore not descriptive metadata:
+// they ARE the boundary, and a provisioning call translates them into exactly one
+// SCRAM credential plus a set of ACL bindings. KafkaPrincipal is the join key
+// between a registry row and the broker's own authorization state, because every
+// ACL binding provisioned for the subscriber names it.
+//
+// # No secret is stored here, and none can be
+//
+// The SASL secret is generated during provisioning, returned to the caller
+// EXACTLY ONCE, and persisted nowhere — not in this struct and not in the table
+// behind it. It cannot be recovered afterwards, only replaced by issuing a new
+// one. Only CredentialReference, a non-reversible reference sufficient to prove
+// which credential a row corresponds to and insufficient to authenticate with,
+// and CredentialIssuedAt are retained. This is the same posture as APIKey, whose
+// Key column holds a bcrypt hash rather than the raw key.
+//
+// There is deliberately NO field capable of holding a plaintext or reversibly
+// encrypted secret, and none may be added: blnk.event_subscribers has no column
+// to store one in, so such a field would be unimplementable as well as unsafe.
+//
+// # Nullable fields and what their absence means
+//
+// Four fields are pointers because for each of them NULL carries information that
+// a zero value would destroy:
+//
+//   - PartitionKeyPrefix nil means the subscriber is entitled to whole topics
+//     rather than to a key-prefixed slice of them. That is a legitimate, broader
+//     grant — it must never be read as "restrict to the empty prefix", which would
+//     invert the intent.
+//   - CredentialReference nil is the reliable test for "no credential has ever
+//     been issued", the real "registered, not yet provisioned" state.
+//   - CredentialIssuedAt nil accompanies it; the two are set and overwritten
+//     together as one issuance record.
+//   - MigratedAt nil means NOT YET MIGRATED, which is precisely what
+//     migration-progress reporting counts during the dual-delivery window.
+//
+// AuthorizedTopics, by contrast, is a plain slice because the column is NOT NULL
+// with a '{}' default: a freshly registered subscriber is authorised for NOTHING
+// rather than for NULL, so the registry fails closed and no authorisation check
+// has to guess whether an absent grant meant "none" or "not yet known".
+//
+// The Group 4 fields, WebhookURL and MigratedAt, are temporary by design: they
+// exist only for the 30-day window in which Kafka publishing and legacy HTTP
+// webhook delivery run side by side, and they are what a post-sunset migration
+// removes.
+type EventSubscriber struct {
+	// ID is the BIGSERIAL surrogate primary key, assigned by the database. The
+	// key callers use is SubscriberID.
+	ID int64 `json:"id"`
+
+	// --- Subscriber identity ---
+
+	// SubscriberID is the business key and the {id} in
+	// POST /subscribers/{id}/kafka-credentials. It is a '<prefix>_<uuid>' string
+	// produced by GenerateUUIDWithSuffix, exactly as every other business key in
+	// this schema is.
+	SubscriberID string `json:"subscriber_id"`
+	// Name is the human label an operator recognises the subscriber by. It is
+	// required, because an unnamed principal cannot be triaged — being able to
+	// answer "who is this principal?" months later is most of the reason the
+	// registry exists.
+	Name string `json:"name"`
+
+	// --- The Kafka access model ---
+
+	// KafkaPrincipal is the SASL/SCRAM username the ACLs are granted to.
+	KafkaPrincipal string `json:"kafka_principal"`
+	// ConsumerGroupID is the consumer group the subscriber reads under, returned
+	// verbatim by the credential endpoint. The provisioned ACL grants Read on it
+	// with a prefixed pattern type, reserving the subscriber's whole group
+	// namespace without enumerating every group it might create.
+	ConsumerGroupID string `json:"consumer_group_id"`
+	// AuthorizedTopics is the exact set of topics the subscriber may Read and
+	// Describe, and the set the ACLs are granted over. Empty means authorised for
+	// nothing — the registry fails closed.
+	AuthorizedTopics []string `json:"authorized_topics"`
+	// PartitionKeyPrefix narrows the grant to a key-prefixed slice of the
+	// authorised topics. Nil means no key restriction, which is a broader grant
+	// and not a missing value.
+	PartitionKeyPrefix *string `json:"partition_key_prefix,omitempty"`
+
+	// --- The credential record ---
+
+	// CredentialReference is a non-reversible reference to the issued
+	// credential. It is NOT the secret and nothing can be authenticated with it.
+	// Nil means no credential has ever been issued.
+	CredentialReference *string `json:"credential_reference,omitempty"`
+	// CredentialIssuedAt is when the credential was issued, set together with
+	// CredentialReference. A reissue overwrites both.
+	CredentialIssuedAt *time.Time `json:"credential_issued_at,omitempty"`
+
+	// --- Dual-run migration tracking (temporary by design) ---
+
+	// WebhookURL is the legacy HTTP webhook URL this subscriber received pushes
+	// on before moving to Kafka. Nil for a subscriber onboarded after the
+	// cutover, which never had one.
+	WebhookURL *string `json:"webhook_url,omitempty"`
+	// MigratedAt is when the subscriber completed its move to Kafka consumption.
+	// Nil means not yet migrated.
+	MigratedAt *time.Time `json:"migrated_at,omitempty"`
+
+	// --- Row bookkeeping ---
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// HasTopicAccess reports whether the subscriber is authorised for the given
+// topic.
+//
+// The comparison is exact and the empty-grant case falls out of it naturally: a
+// subscriber with no authorised topics matches nothing, so the registry fails
+// closed rather than open. This is a read over the recorded grant and is NOT a
+// substitute for broker-side ACL enforcement — the broker is the authority, and
+// this method exists so the service layer can reject an obviously
+// out-of-boundary request before spending a round trip to find out.
+func (s *EventSubscriber) HasTopicAccess(topic string) bool {
+	for _, t := range s.AuthorizedTopics {
+		if t == topic {
+			return true
+		}
+	}
+	return false
+}
+
+// IsProvisioned reports whether a credential has ever been issued to this
+// subscriber.
+//
+// It tests the credential reference rather than the issuance timestamp because
+// the reference is the value the repository writes first and the two are always
+// written together; either would do, and testing the reference keeps the
+// "registered, not yet provisioned" state readable at the call site.
+func (s *EventSubscriber) IsProvisioned() bool {
+	return s.CredentialReference != nil && *s.CredentialReference != ""
+}
+
+// IsMigrated reports whether the subscriber has completed its move from legacy
+// HTTP webhook delivery to Kafka consumption. A nil MigratedAt means not yet
+// migrated, which is what dual-window migration-progress reporting counts.
+func (s *EventSubscriber) IsMigrated() bool {
+	return s.MigratedAt != nil
+}
