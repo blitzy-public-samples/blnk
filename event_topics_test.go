@@ -46,6 +46,203 @@ import (
 // thirteen event strings and all four topic names by hand is what makes this file a
 // second, independent statement of the routing contract.
 
+// eventCatalogueSize is the number of event strings Blnk emits: thirteen.
+//
+// It is spelled as a number, separately from the catalogue itself, so that the catalogue
+// cannot silently shrink. `assert.Len(eventCatalogue, len(eventCatalogue))` would be a
+// tautology; comparing against an independently written constant is not.
+//
+// Thirteen is a CONTRACTUAL figure, not an incidental one. The coverage requirement is
+// that every event type which reached the legacy webhook sender reaches Kafka, with zero
+// exceptions, and thirteen is what an exhaustive sweep of the producer call sites found:
+// seven transaction lifecycle events from getEventFromStatus, the runtime-composed bulk
+// transaction family, two balance events, one identity event, one ledger event, and the
+// system error raised through the registered webhook-sender indirection.
+//
+// Changing this number is therefore a deliberate act. A fourteenth event type is welcome,
+// but it must arrive with a catalogue row, a topic assertion and — if it needs one — a new
+// category, which is exactly what failing here forces whoever adds it to do.
+const eventCatalogueSize = 13
+
+// eventCatalogueEntry is one row of the event catalogue: an event string Blnk emits,
+// paired with every exact name it must resolve to.
+type eventCatalogueEntry struct {
+	// eventType is the event string as a producer spells it. For the bulk transaction
+	// family this is one concrete member of the family; the open-ended suffix set is
+	// covered separately and exhaustively by the prefix test.
+	eventType string
+
+	// vocabularyKey is how this event appears in model.EventCategory's SOURCE.
+	//
+	// For twelve of the thirteen entries it is identical to eventType, because the
+	// mapping matches those by exact equality and each one is a literal in a case
+	// clause. For the bulk transaction family it is the bare "bulk_transaction." prefix,
+	// because those names are composed at runtime from the batch status: there is no
+	// exhaustive literal to name, and the implementation matches them by prefix.
+	//
+	// The field exists so the count assertion can compare this hand-written catalogue
+	// against the vocabulary actually present in the implementation. Without it, the
+	// comparison would have to guess which rows are exact matches and which are
+	// families.
+	vocabularyKey string
+
+	// topic is the fully-qualified category topic, with the default prefix applied.
+	topic string
+
+	// deadLetterTopic is topic's dead-letter sibling, written out in full rather than
+	// derived, so that a change to either the topic or the suffix fails here.
+	deadLetterTopic string
+
+	// category is the bare token model.EventCategory must resolve eventType to. It
+	// catches a category rename, which would otherwise only show up as a changed topic
+	// name and could be mistaken for an intended renaming of the namespace.
+	category string
+}
+
+// eventCatalogue is the complete, independently written statement of the routing
+// contract: all thirteen event strings Blnk emits, their four category topics and their
+// four dead-letter siblings.
+//
+// EVERY VALUE HERE IS A LITERAL, and that is the single most important property of this
+// file. Nothing is computed from model.EventCategory, from TopicForEvent, or from the
+// prefix and separator constants. A table built by asking the implementation what it
+// thinks would agree with the implementation no matter what the implementation said —
+// including after an entry had been deleted, a category renamed or the separator changed.
+// Writing the expectations out by hand is what makes this a second opinion rather than an
+// echo, and it is what makes the file resistant to mutation testing.
+//
+// The order is the order the events are documented in: the transaction family, then
+// balances, then identities, then the two events that motivate the fourth category.
+var eventCatalogue = []eventCatalogueEntry{
+	// The seven transaction lifecycle events. All seven originate in
+	// getEventFromStatus, which is the transaction event-string vocabulary and which
+	// relocates into event_topics.go when the legacy transport is retired.
+	{
+		eventType:       "transaction.queued",
+		vocabularyKey:   "transaction.queued",
+		topic:           "blnk.transactions",
+		deadLetterTopic: "blnk.transactions.dlt",
+		category:        "transactions",
+	},
+	{
+		eventType:       "transaction.applied",
+		vocabularyKey:   "transaction.applied",
+		topic:           "blnk.transactions",
+		deadLetterTopic: "blnk.transactions.dlt",
+		category:        "transactions",
+	},
+	{
+		eventType:       "transaction.scheduled",
+		vocabularyKey:   "transaction.scheduled",
+		topic:           "blnk.transactions",
+		deadLetterTopic: "blnk.transactions.dlt",
+		category:        "transactions",
+	},
+	{
+		eventType:       "transaction.inflight",
+		vocabularyKey:   "transaction.inflight",
+		topic:           "blnk.transactions",
+		deadLetterTopic: "blnk.transactions.dlt",
+		category:        "transactions",
+	},
+	{
+		eventType:       "transaction.void",
+		vocabularyKey:   "transaction.void",
+		topic:           "blnk.transactions",
+		deadLetterTopic: "blnk.transactions.dlt",
+		category:        "transactions",
+	},
+	{
+		eventType:       "transaction.rejected",
+		vocabularyKey:   "transaction.rejected",
+		topic:           "blnk.transactions",
+		deadLetterTopic: "blnk.transactions.dlt",
+		category:        "transactions",
+	},
+	// transaction.unknown is reachable, not hypothetical: the COMMIT status has no case
+	// in getEventFromStatus and falls through to it. That behaviour is preserved
+	// deliberately so the dual-delivery payload comparison stays exact, so the event
+	// name must route like any other.
+	{
+		eventType:       "transaction.unknown",
+		vocabularyKey:   "transaction.unknown",
+		topic:           "blnk.transactions",
+		deadLetterTopic: "blnk.transactions.dlt",
+		category:        "transactions",
+	},
+	// The eighth transaction event is a FAMILY, composed at runtime as
+	// "bulk_transaction." + batch status. One concrete member stands for it here; the
+	// open suffix set is covered exhaustively by the prefix test.
+	{
+		eventType:       "bulk_transaction.applied",
+		vocabularyKey:   "bulk_transaction.",
+		topic:           "blnk.transactions",
+		deadLetterTopic: "blnk.transactions.dlt",
+		category:        "transactions",
+	},
+	// The two balance events.
+	{
+		eventType:       "balance.created",
+		vocabularyKey:   "balance.created",
+		topic:           "blnk.balances",
+		deadLetterTopic: "blnk.balances.dlt",
+		category:        "balances",
+	},
+	{
+		eventType:       "balance.monitor",
+		vocabularyKey:   "balance.monitor",
+		topic:           "blnk.balances",
+		deadLetterTopic: "blnk.balances.dlt",
+		category:        "balances",
+	},
+	// The single identity event.
+	{
+		eventType:       "identity.created",
+		vocabularyKey:   "identity.created",
+		topic:           "blnk.identities",
+		deadLetterTopic: "blnk.identities.dlt",
+		category:        "identities",
+	},
+	// The two events that belong to none of the three requirement-named categories, and
+	// which are the entire reason the fourth category exists. If either ever resolves to
+	// blnk.transactions, blnk.balances or blnk.identities, the fourth category has been
+	// "simplified away" and a subscriber filtering that topic is now receiving events it
+	// never subscribed to.
+	{
+		eventType:       "ledger.created",
+		vocabularyKey:   "ledger.created",
+		topic:           "blnk.system",
+		deadLetterTopic: "blnk.system.dlt",
+		category:        "system",
+	},
+	{
+		eventType:       "system.error",
+		vocabularyKey:   "system.error",
+		topic:           "blnk.system",
+		deadLetterTopic: "blnk.system.dlt",
+		category:        "system",
+	},
+}
+
+// catalogueEventTypes returns just the event strings from the catalogue.
+//
+// It exists so that a test asserting membership does not have to rebuild the projection
+// inline, and it deliberately returns the eventType column rather than vocabularyKey: the
+// question being asked is "is this a name a producer emits", not "is this how the mapping
+// spells it".
+//
+// Returns:
+//   - []string: a fresh slice the caller may append to or mutate; the catalogue itself is
+//     never handed out, so no test can reorder or truncate it for another.
+func catalogueEventTypes() []string {
+	eventTypes := make([]string, 0, len(eventCatalogue))
+	for _, entry := range eventCatalogue {
+		eventTypes = append(eventTypes, entry.eventType)
+	}
+
+	return eventTypes
+}
+
 // storeKafkaTopicPrefix publishes a configuration carrying prefix as
 // config.Kafka.TopicPrefix, restoring whatever configuration was in place when the test
 // finishes.
@@ -114,6 +311,142 @@ func parseEventTopicsSource(t *testing.T) *ast.File {
 	return parsed
 }
 
+// findFunctionDeclaration returns the top-level function of the given name, or nil.
+func findFunctionDeclaration(parsed *ast.File, name string) *ast.FuncDecl {
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Name.Name == name {
+			return function
+		}
+	}
+
+	return nil
+}
+
+// constStringValue returns the value of the named string constant declared in parsed.
+//
+// The second result reports whether a constant of that name with an unquotable string
+// value was found, so a caller can produce a failure message that names the constant
+// rather than reporting a bare empty string.
+func constStringValue(parsed *ast.File, name string) (string, bool) {
+	for _, declaration := range parsed.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || general.Tok != token.CONST {
+			continue
+		}
+
+		for _, specification := range general.Specs {
+			value, ok := specification.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+
+			for i, identifier := range value.Names {
+				if identifier.Name != name || i >= len(value.Values) {
+					continue
+				}
+
+				literal, ok := value.Values[i].(*ast.BasicLit)
+				if !ok || literal.Kind != token.STRING {
+					continue
+				}
+
+				unquoted, err := strconv.Unquote(literal.Value)
+				if err != nil {
+					continue
+				}
+
+				return unquoted, true
+			}
+		}
+	}
+
+	return "", false
+}
+
+// discoverEventVocabulary reads the event vocabulary out of model/event.go's source and
+// returns it as a set of vocabulary keys, directly comparable with eventCatalogue's
+// vocabularyKey column.
+//
+// # Why the source is read rather than the function called
+//
+// This is what makes the thirteen-event count assertion mean something. model.EventCategory
+// answers for ANY input — its catch-all routes an unmapped event to the system category
+// without complaint — so no amount of calling it can reveal that an event string was
+// deleted from its table, nor that a fourteenth was added. Both are invisible
+// behaviourally and both are plainly visible in the source.
+//
+// The alternative, exporting the table from model so a test could count it, would put the
+// count under the control of the code being counted: an entry removed from the table would
+// be removed from the count too and the test would agree with the loss. Reading the source
+// keeps the test's thirteen literals as the only authority.
+//
+// # What counts as one entry in the vocabulary
+//
+// Two forms, matching the two ways the implementation matches:
+//
+//   - Every string literal in a case clause of EventCategory's switch. These are the
+//     exact-match names, twelve of the thirteen.
+//   - The prefix constant used by the single strings.HasPrefix guard, which stands for the
+//     whole runtime-composed bulk transaction family. The constant is resolved through the
+//     identifier the guard actually names, so renaming it breaks nothing here; removing the
+//     guard, or adding a second one, does — a second prefix family is a routing rule this
+//     test has never been told about.
+func discoverEventVocabulary(t *testing.T) []string {
+	t.Helper()
+
+	path := filepath.Join(moduleRootDir(t), "model", "event.go")
+	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	require.NoError(t, err, "model/event.go must be parseable to discover the event vocabulary")
+
+	mapping := findFunctionDeclaration(parsed, "EventCategory")
+	require.NotNil(t, mapping,
+		"model.EventCategory must exist: it is the single event-type-to-category mapping the topic layer delegates to")
+
+	vocabulary := make([]string, 0, eventCatalogueSize)
+	prefixIdentifiers := make([]string, 0, 1)
+
+	ast.Inspect(mapping, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.CaseClause:
+			// A default clause has no expressions and contributes no names, which is
+			// correct: the catch-all is a fallback, not part of the vocabulary.
+			for _, expression := range typed.List {
+				literal, ok := expression.(*ast.BasicLit)
+				if !ok || literal.Kind != token.STRING {
+					continue
+				}
+
+				if unquoted, unquoteErr := strconv.Unquote(literal.Value); unquoteErr == nil {
+					vocabulary = append(vocabulary, unquoted)
+				}
+			}
+		case *ast.CallExpr:
+			selector, ok := typed.Fun.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != "HasPrefix" || len(typed.Args) != 2 {
+				return true
+			}
+
+			// The prefix is passed as a named constant rather than a literal, so the
+			// identifier is resolved to its declaration below.
+			if identifier, isIdentifier := typed.Args[1].(*ast.Ident); isIdentifier {
+				prefixIdentifiers = append(prefixIdentifiers, identifier.Name)
+			}
+		}
+
+		return true
+	})
+
+	require.Len(t, prefixIdentifiers, 1,
+		"model.EventCategory must contain exactly one prefix-matched event family (the bulk transaction one); found %v", prefixIdentifiers)
+
+	prefix, found := constStringValue(parsed, prefixIdentifiers[0])
+	require.True(t, found,
+		"the prefix constant %q named by model.EventCategory's HasPrefix guard must be a string constant declared in model/event.go", prefixIdentifiers[0])
+
+	return append(vocabulary, prefix)
+}
+
 // TestTopicForEvent_RoutesEveryEmittedEventString pins the routing of all thirteen event
 // strings Blnk emits to their exact topic names.
 //
@@ -125,39 +458,158 @@ func parseEventTopicsSource(t *testing.T) *ast.File {
 func TestTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
-	// The seven transaction lifecycle events. All seven originate in
-	// getEventFromStatus, which is the transaction event-string vocabulary and which
-	// relocates into event_topics.go at sunset.
-	assert.Equal(t, "blnk.transactions", TopicForEvent("transaction.queued"))
-	assert.Equal(t, "blnk.transactions", TopicForEvent("transaction.applied"))
-	assert.Equal(t, "blnk.transactions", TopicForEvent("transaction.scheduled"))
-	assert.Equal(t, "blnk.transactions", TopicForEvent("transaction.inflight"))
-	assert.Equal(t, "blnk.transactions", TopicForEvent("transaction.void"))
-	assert.Equal(t, "blnk.transactions", TopicForEvent("transaction.rejected"))
-	// transaction.unknown is reachable, not hypothetical: the COMMIT status has no case
-	// in getEventFromStatus and falls through to it. That behaviour is preserved
-	// deliberately so the dual-delivery payload comparison stays exact, so the event
-	// name must route like any other.
-	assert.Equal(t, "blnk.transactions", TopicForEvent("transaction.unknown"))
+	require.Len(t, eventCatalogue, eventCatalogueSize,
+		"the catalogue must hold every event string Blnk emits; see eventCatalogueSize")
 
-	// The eighth transaction event is composed at runtime from the batch status, and is
-	// covered exhaustively by the prefix test below.
-	assert.Equal(t, "blnk.transactions", TopicForEvent("bulk_transaction.applied"))
+	for _, entry := range eventCatalogue {
+		t.Run(entry.eventType, func(t *testing.T) {
+			assert.Equal(t, entry.topic, TopicForEvent(entry.eventType),
+				"%q must be published to %q", entry.eventType, entry.topic)
 
-	// The two balance events.
-	assert.Equal(t, "blnk.balances", TopicForEvent("balance.created"))
-	assert.Equal(t, "blnk.balances", TopicForEvent("balance.monitor"))
+			assert.Equal(t, entry.deadLetterTopic, DeadLetterTopicForEvent(entry.eventType),
+				"%q must dead-letter to %q", entry.eventType, entry.deadLetterTopic)
 
-	// The single identity event.
-	assert.Equal(t, "blnk.identities", TopicForEvent("identity.created"))
+			// The category is asserted separately from the topic so that a renamed
+			// category is distinguishable from a renamed namespace. Both change the
+			// topic name; only one of them is ever intended.
+			assert.Equal(t, entry.category, model.EventCategory(entry.eventType),
+				"%q must resolve to the %q category", entry.eventType, entry.category)
 
-	// The two events that belong to none of the three requirement-named categories, and
-	// which are the entire reason the fourth category exists. If either of these ever
-	// resolves to blnk.transactions, blnk.balances or blnk.identities, the fourth
-	// category has been "simplified away" and a subscriber filtering that topic is now
-	// receiving events it never subscribed to.
-	assert.Equal(t, "blnk.system", TopicForEvent("ledger.created"))
-	assert.Equal(t, "blnk.system", TopicForEvent("system.error"))
+			// A category topic must never itself look like a dead-letter topic: that
+			// would mean events were being published directly onto a dead-letter topic,
+			// which no subscriber reads and every alert treats as a failure.
+			assert.False(t, IsDeadLetterTopic(entry.topic),
+				"%q is a category topic and must not carry the dead-letter suffix", entry.topic)
+			assert.True(t, IsDeadLetterTopic(entry.deadLetterTopic),
+				"%q must be recognisable as a dead-letter topic", entry.deadLetterTopic)
+		})
+	}
+
+	// Coverage of the four topics is asserted from the catalogue's own rows, so an event
+	// silently rerouted away from a topic — leaving that topic with no producers at all —
+	// fails here as well as in its own subtest.
+	routed := make(map[string][]string, len(eventCatalogue))
+	for _, entry := range eventCatalogue {
+		routed[entry.topic] = append(routed[entry.topic], entry.eventType)
+	}
+
+	assert.Len(t, routed["blnk.transactions"], 8,
+		"the transactions topic carries the seven lifecycle events plus the bulk transaction family")
+	assert.Len(t, routed["blnk.balances"], 2, "the balances topic carries balance.created and balance.monitor")
+	assert.Len(t, routed["blnk.identities"], 1, "the identities topic carries identity.created")
+	assert.Len(t, routed["blnk.system"], 2, "the system topic carries ledger.created and system.error")
+	assert.Len(t, routed, 4, "every emitted event must land on one of exactly four category topics")
+}
+
+// TestTopicForEvent_CoversEveryEventTypeTheMappingKnows is the count assertion, and it is
+// the assertion that makes the coverage requirement enforceable rather than merely stated.
+//
+// It compares the thirteen event strings written out by hand in eventCatalogue against the
+// vocabulary actually present in model.EventCategory's source, in BOTH directions:
+//
+//   - An event string in the implementation but not in the catalogue means a fourteenth
+//     event type was added without a routing expectation. That is the case the requirement
+//     is worried about: the new event would route somewhere, nobody would have said where,
+//     and no test would have disagreed.
+//   - An event string in the catalogue but not in the implementation means a mapping was
+//     deleted. Behaviourally that is invisible — the catch-all quietly absorbs the orphaned
+//     event onto the system topic — so nothing but a source-level comparison catches it.
+//
+// Neither direction is detectable by calling the mapping, because the mapping answers for
+// every input. See discoverEventVocabulary for why the vocabulary is read from source.
+func TestTopicForEvent_CoversEveryEventTypeTheMappingKnows(t *testing.T) {
+	expected := make([]string, 0, len(eventCatalogue))
+	for _, entry := range eventCatalogue {
+		expected = append(expected, entry.vocabularyKey)
+	}
+
+	require.Len(t, expected, eventCatalogueSize,
+		"the catalogue must contribute exactly %d vocabulary keys", eventCatalogueSize)
+
+	discovered := discoverEventVocabulary(t)
+
+	assert.Len(t, discovered, eventCatalogueSize,
+		"model.EventCategory recognises %d event types but the catalogue names %d; a routed event type has been added or removed without updating this test",
+		len(discovered), eventCatalogueSize)
+
+	assert.ElementsMatch(t, expected, discovered,
+		"the catalogue and model.EventCategory must name exactly the same event types; anything only on one side is an event with no asserted topic, or an asserted topic with no event")
+
+	// Every vocabulary key must be distinct. A duplicated case literal would inflate the
+	// discovered count and could mask a deletion elsewhere in the same table.
+	seen := make(map[string]struct{}, len(discovered))
+	for _, key := range discovered {
+		_, duplicate := seen[key]
+		assert.False(t, duplicate, "event type %q is mapped twice", key)
+		assert.NotEmpty(t, key, "the vocabulary must not contain an empty event type")
+		seen[key] = struct{}{}
+	}
+	assert.Len(t, seen, eventCatalogueSize)
+}
+
+// TestGetEventFromStatus_EveryTransactionStatusRoutesToTheTransactionsTopic joins the two
+// halves of transaction event routing: the status-to-event-name mapping that produces the
+// names, and the name-to-topic mapping that routes them.
+//
+// Testing them separately is not enough. getEventFromStatus is the ONLY producer of the
+// seven transaction event strings, and it is declared in webhooks.go — a file scheduled for
+// deletion. If it ever emitted a name the routing table does not know, the event would land
+// on the system catch-all: transaction events arriving on a topic no transaction subscriber
+// reads, with no error, no log line and no alert. Driving the real status constants through
+// the real function and asserting the real topic is the only way to close that gap.
+//
+// The statuses are taken from the constants rather than re-spelled, so a change to a status
+// value is carried into this test automatically instead of being hidden by a stale literal.
+func TestGetEventFromStatus_EveryTransactionStatusRoutesToTheTransactionsTopic(t *testing.T) {
+	storeKafkaTopicPrefix(t, "")
+
+	for _, testCase := range []struct {
+		status    string
+		eventType string
+	}{
+		{status: StatusQueued, eventType: "transaction.queued"},
+		{status: StatusApplied, eventType: "transaction.applied"},
+		{status: StatusScheduled, eventType: "transaction.scheduled"},
+		{status: StatusInflight, eventType: "transaction.inflight"},
+		{status: StatusVoid, eventType: "transaction.void"},
+		{status: StatusRejected, eventType: "transaction.rejected"},
+		// COMMIT has no case in getEventFromStatus and falls through to the default.
+		// That is a PRE-EXISTING behaviour, preserved on purpose: correcting it here
+		// would make the dual-delivery payload comparison differ for a reason that has
+		// nothing to do with the transport. It is documented for correction as a
+		// separate, intentional change. Until then transaction.unknown is a real event
+		// name reached by a real status, so it must route like any other.
+		{status: StatusCommit, eventType: "transaction.unknown"},
+	} {
+		t.Run(testCase.status, func(t *testing.T) {
+			assert.Equal(t, testCase.eventType, getEventFromStatus(testCase.status),
+				"the %q status must produce the %q event", testCase.status, testCase.eventType)
+
+			// The event name produced from the status must be one the catalogue knows.
+			// This is the join: a name that routes correctly but is not in the catalogue
+			// is a name nobody asserted, and a name in neither is an event that silently
+			// reaches the catch-all.
+			assert.Contains(t, catalogueEventTypes(), testCase.eventType,
+				"the event name produced from the %q status must appear in the catalogue", testCase.status)
+
+			assert.Equal(t, "blnk.transactions", TopicForEvent(getEventFromStatus(testCase.status)),
+				"every transaction status must route to the transactions topic, including %q", testCase.status)
+			assert.Equal(t, "blnk.transactions.dlt", DeadLetterTopicForEvent(getEventFromStatus(testCase.status)),
+				"and to the transactions dead-letter sibling on exhaustion, including %q", testCase.status)
+		})
+	}
+
+	// The status mapping is case-insensitive, so a lower-cased status must produce the
+	// same event and route identically. Asserting it here prevents a future normalisation
+	// change from quietly sending correctly-cased-but-unexpected statuses to the
+	// catch-all.
+	assert.Equal(t, "transaction.applied", getEventFromStatus(strings.ToLower(StatusApplied)))
+	assert.Equal(t, "blnk.transactions", TopicForEvent(getEventFromStatus(strings.ToLower(StatusApplied))))
+
+	// A status nobody defined still yields a routable transaction event rather than
+	// nothing, which is what keeps an unrecognised status from stranding its event.
+	assert.Equal(t, "transaction.unknown", getEventFromStatus("NO_SUCH_STATUS"))
+	assert.Equal(t, "blnk.transactions", TopicForEvent(getEventFromStatus("NO_SUCH_STATUS")))
 }
 
 // TestTopicForEvent_DelegatesTheMappingToModel enforces the single-source-of-truth
@@ -171,21 +623,12 @@ func TestTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 func TestTopicForEvent_DelegatesTheMappingToModel(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
-	for _, eventType := range []string{
-		"transaction.queued",
-		"transaction.applied",
-		"transaction.scheduled",
-		"transaction.inflight",
-		"transaction.void",
-		"transaction.rejected",
-		"transaction.unknown",
-		"bulk_transaction.failed",
-		"balance.created",
-		"balance.monitor",
-		"identity.created",
-		"ledger.created",
-		"system.error",
-	} {
+	// The catalogue supplies the inputs deliberately, and it is safe for it to do so:
+	// the EXPECTATION here is computed from model.EventCategory, not from the catalogue,
+	// so this test asserts the composition rule rather than the mapping values. Driving
+	// it from the catalogue also means a fourteenth event type inherits this check for
+	// free once its row is added.
+	for _, eventType := range append(catalogueEventTypes(), "bulk_transaction.failed") {
 		expected := "blnk" + "." + model.EventCategory(eventType)
 		assert.Equal(t, expected, TopicForEvent(eventType),
 			"the topic for %q must be the configured prefix joined to the category model.EventCategory resolves; a second mapping table in event_topics.go would break this", eventType)
@@ -258,11 +701,35 @@ func TestTopicForEvent_UnrecognisedEventRoutesToTheSystemTopic(t *testing.T) {
 		"Balance.Created",
 		// A longer string that merely starts with an emitted name is not that event.
 		"transaction.applied.v2",
+		// Unusual characters. None of these is a realistic event name, and that is the
+		// point: routing has to be TOTAL. Anything a caller can hand this function must
+		// come back as a usable topic, because the relay publishes to whatever name it is
+		// given and has no branch for "no topic". A panic, an empty string or a
+		// half-composed name here would each strand the event, so the awkward inputs are
+		// asserted rather than assumed.
+		"événement.créé",             // non-ASCII letters
+		"事件.已创建",                     // multi-byte, no ASCII at all
+		"transaction.applied.💥",      // an emoji outside the Basic Multilingual Plane
+		"!@#$%^&*()",                 // punctuation only
+		"...",                        // separators only, which must not compose an empty segment
+		".",                          // a lone separator
+		"transaction\n.applied",      // an embedded newline, as a mangled environment value might carry
+		"transaction\t.applied",      // an embedded tab
+		"transaction\x00.applied",    // an embedded NUL, which Kafka rejects but naming must survive
+		"  transaction.applied  ",    // surrounded by whitespace, so NOT the emitted string
+		"transaction.applied\u200b",  // a zero-width space, invisible in a diff
+		strings.Repeat("very.", 200), // longer than Kafka's 249-character topic limit
 	} {
 		assert.Equal(t, "blnk.system", TopicForEvent(eventType),
 			"unrecognised event type %q must route to the system catch-all topic", eventType)
 		assert.NotEmpty(t, TopicForEvent(eventType),
 			"TopicForEvent must never return an empty string: the relay would strand the event")
+
+		// The event's own name must never leak into the topic name. Composing the event
+		// into the topic would create a topic per event type on demand — unprovisioned,
+		// single-partition, wrongly replicated, and read by nobody.
+		assert.Equal(t, "blnk.system.dlt", DeadLetterTopicForEvent(eventType),
+			"and its dead-letter sibling must be the system topic's, not one derived from %q", eventType)
 	}
 }
 
@@ -715,6 +1182,67 @@ func TestAllTopicsWithDeadLetters_IsTheEightProvisionedTopics(t *testing.T) {
 		seen[topic] = struct{}{}
 	}
 	assert.Len(t, seen, 8, "the inventory is four category topics plus four dead-letter siblings")
+
+	// Exactly half the inventory is dead-letter topics, so a category that lost its
+	// sibling — or gained a second one — is caught even if the total still came to eight.
+	deadLetters := 0
+	for _, topic := range AllTopicsWithDeadLetters() {
+		if IsDeadLetterTopic(topic) {
+			deadLetters++
+		}
+	}
+	assert.Equal(t, 4, deadLetters, "every category topic must contribute exactly one dead-letter sibling")
+}
+
+// TestTopicInventory_ContainsNoEmptyOrMalformedName is the guard against a name that is
+// present in the inventory but unusable.
+//
+// The list equality assertions above prove the names are right for the default prefix, and
+// for the one override they exercise. This test asserts the structural properties for every
+// accessor under both, because the inventory is consumed by topic creation and by
+// provisioning: an empty entry would be an attempt to create a topic with no name, and an
+// entry with a stray separator or surrounding whitespace would create a topic adjacent to
+// the intended one that nothing reads.
+//
+// It is deliberately about SHAPE, not about specific names — the specific names are pinned
+// by the exact list comparisons — so it holds for any configured namespace.
+func TestTopicInventory_ContainsNoEmptyOrMalformedName(t *testing.T) {
+	for _, prefix := range []string{"", "acme.events"} {
+		storeKafkaTopicPrefix(t, prefix)
+
+		inventories := map[string][]string{
+			"AllTopics":                AllTopics(),
+			"AllDeadLetterTopics":      AllDeadLetterTopics(),
+			"AllTopicsWithDeadLetters": AllTopicsWithDeadLetters(),
+			"EventCategories":          EventCategories(),
+		}
+
+		for name, entries := range inventories {
+			assert.NotEmpty(t, entries, "%s must not be empty", name)
+
+			for i, entry := range entries {
+				assert.NotEmpty(t, entry,
+					"%s[%d] is empty; naming a topic nothing is not a name", name, i)
+				assert.NotEmpty(t, strings.TrimSpace(entry),
+					"%s[%d] = %q is only whitespace", name, i, entry)
+				assert.Equal(t, strings.TrimSpace(entry), entry,
+					"%s[%d] = %q carries surrounding whitespace, which Kafka rejects in a topic name", name, i, entry)
+				assert.False(t, strings.HasPrefix(entry, "."),
+					"%s[%d] = %q starts with the separator, so its first segment is empty", name, i, entry)
+				assert.False(t, strings.HasSuffix(entry, "."),
+					"%s[%d] = %q ends with the separator, so its last segment is empty", name, i, entry)
+				assert.NotContains(t, entry, "..",
+					"%s[%d] = %q contains a doubled separator, which names a topic adjacent to the intended one", name, i, entry)
+			}
+		}
+
+		// The two halves must partition the whole: no category topic may appear among the
+		// dead-letter topics and vice versa.
+		for _, topic := range AllTopics() {
+			assert.NotContains(t, AllDeadLetterTopics(), topic,
+				"category topic %q must not also appear as a dead-letter topic", topic)
+		}
+	}
 }
 
 // TestTopicInventory_ReturnsFreshSlicesCallersMayMutate proves the accessors hand back
@@ -904,10 +1432,30 @@ func TestEventTopicsSource_RecordsTheSunsetRelocationOfGetEventFromStatus(t *tes
 	}
 	documentation := comments.String()
 
-	assert.Contains(t, documentation, "SUNSET RELOCATION TARGET",
-		"the delimited sunset relocation block must remain in event_topics.go")
-	assert.Contains(t, documentation, "getEventFromStatus",
-		"the relocation block must name the symbol that relocates here")
+	// BOTH delimiters are required, not merely the phrase. Asserting the phrase alone is
+	// too weak to be useful: the opening and closing markers both contain it, so deleting
+	// either one leaves the other to satisfy a substring check. Requiring the pair means a
+	// partial deletion — the most likely way this block erodes, since the two markers sit
+	// eighty lines apart — is caught as readily as a wholesale one.
+	//
+	// The last entry is the INSTRUCTION rather than a heading. A block reduced to its
+	// delimiters would satisfy every other requirement here while having lost the only
+	// thing that makes it worth keeping: the warning that moving the function early is a
+	// duplicate declaration and breaks the build outright.
+	//
+	// Each is checked with strings.Contains behind assert.True rather than assert.Contains
+	// so that a failure reports the missing fragment instead of dumping the whole file's
+	// documentation — roughly twenty thousand characters — into the test output, which
+	// would bury the one line an engineer needs to read.
+	for _, fragment := range []string{
+		"===== SUNSET RELOCATION TARGET =====",
+		"===== END SUNSET RELOCATION TARGET =====",
+		"getEventFromStatus",
+		"DO NOT MOVE IT NOW",
+	} {
+		assert.True(t, strings.Contains(documentation, fragment),
+			"event_topics.go's documentation must still contain %q; the sunset relocation block is the only record that getEventFromStatus must be moved here before webhooks.go is deleted", fragment)
+	}
 
 	for _, declaration := range parsed.Decls {
 		function, ok := declaration.(*ast.FuncDecl)

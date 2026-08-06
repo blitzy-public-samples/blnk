@@ -245,9 +245,13 @@ func (d Datasource) RecordTransactionWithBalances(ctx context.Context, txn *mode
 }
 
 // RecordTransactionWithBalancesAndOutbox atomically records a transaction, updates balances,
-// and optionally inserts a lineage outbox entry within a single database transaction.
+// and optionally inserts a lineage outbox entry and event outbox entries within a single
+// database transaction.
 // This ensures that the lineage processing intent is captured atomically with the main transaction,
-// guaranteeing no lineage work is lost even if subsequent async operations fail.
+// guaranteeing no lineage work is lost even if subsequent async operations fail. The event outbox
+// rows are captured under the same guarantee, which is what makes a published event and the ledger
+// mutation it describes inseparable: both are written by this one transaction, so a rollback takes
+// the event with it and a commit can never leave the event behind.
 //
 // Parameters:
 // - ctx: Context for managing the request and tracing.
@@ -310,10 +314,30 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 	// with the balance updates and the transaction record above, so the mutation
 	// and its events commit or roll back together. There is no window in which a
 	// balance moved but its event was lost, and none in which an event describes a
-	// mutation that was rolled back.
-	if err := insertEventOutboxesInTx(ctx, tx, eventOutbox); err != nil {
-		span.RecordError(err)
-		return nil, fmt.Errorf("failed to insert event outbox: %w", err)
+	// mutation that was rolled back. Move this below tx.Commit() and the guarantee
+	// is gone while every happy-path test still passes, which is exactly why it
+	// sits here and not there.
+	//
+	// This single-transaction writer inserts row by row through the exported
+	// InsertEventOutboxInTx, deliberately mirroring the single-row lineage idiom
+	// immediately above rather than borrowing the batch helper the bulk writer
+	// uses: this path carries at most one event per ledger mutation, and a
+	// per-entry insert is what lets each event be traced individually. Nil entries
+	// are skipped rather than rejected, matching insertLineageOutboxesInTx, so a
+	// producer that assembles its slice conditionally does not have to compact it.
+	for _, e := range eventOutbox {
+		if e == nil {
+			continue
+		}
+		if err := d.InsertEventOutboxInTx(ctx, tx, e); err != nil {
+			span.RecordError(err)
+			return nil, fmt.Errorf("failed to insert event outbox: %w", err)
+		}
+		span.AddEvent("Event outbox entry inserted", trace.WithAttributes(
+			attribute.String("event.id", e.EventID),
+			attribute.String("event.type", e.EventType),
+			attribute.String("event.topic", e.Topic),
+		))
 	}
 
 	if err := tx.Commit(); err != nil {
