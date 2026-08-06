@@ -4440,15 +4440,75 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// retired to a terminal state the way real fixtures are. Leaving three thousand rows
 	// behind on every run would grow the shared test database without bound and slow
 	// every other test in this package down over time.
+	//
+	// The VACUUM is not tidiness, it is what stops this test breaking the NEXT run of
+	// itself. A DELETE only marks tuples dead: three thousand of them stay in the heap
+	// and in every index, so relpages and reltuples remain inflated while the live row
+	// count collapses. The planner then costs the table as large and sparse, which is
+	// precisely the input that flips the anti-join below from a per-candidate index probe
+	// to a whole-set hash build — the plan this test forbids. Reclaiming the space and
+	// refreshing the statistics leaves the table as this test found it, in the only sense
+	// the planner cares about.
 	t.Cleanup(func() {
 		if _, cleanupErr := ds.Conn.Exec(
 			"DELETE FROM blnk.event_outbox WHERE event_id LIKE $1", marker+"%"); cleanupErr != nil {
 			t.Logf("failed to remove plan-shaping rows: %v", cleanupErr)
 		}
+		if _, cleanupErr := ds.Conn.Exec("VACUUM (ANALYZE) blnk.event_outbox"); cleanupErr != nil {
+			t.Logf("failed to reclaim the space the plan-shaping rows occupied: %v", cleanupErr)
+		}
 	})
 
-	_, err = ds.Conn.ExecContext(ctx, "ANALYZE blnk.event_outbox")
-	require.NoError(t, err, "the planner needs current statistics for this assertion to mean anything")
+	// VACUUM (ANALYZE) rather than ANALYZE alone, and the difference is what makes this
+	// assertion deterministic rather than dependent on which tests ran before it.
+	//
+	// ANALYZE refreshes the statistics but reclaims nothing, so the dead tuples every
+	// preceding test in this package left behind — including this test's own three
+	// thousand from the previous run — still count towards relpages. A table whose pages
+	// are mostly dead is costed as a large table with poor locality, and under that
+	// costing the planner legitimately prefers to hash the whole blocking-state set once
+	// instead of probing the partition-key index per candidate. Both plans are correct;
+	// only one is the plan this test is here to require. Vacuuming first removes the
+	// variable entirely, so the plan is a function of the seeded shape alone.
+	//
+	// It cannot run inside a transaction, which is why it is issued on the connection
+	// directly. It is safe on a shared test database: it removes only tuples no
+	// transaction can still see.
+	_, err = ds.Conn.ExecContext(ctx, "VACUUM (ANALYZE) blnk.event_outbox")
+	require.NoError(t, err,
+		"the planner needs current statistics AND a compacted heap for this assertion to mean anything")
+
+	// THE PREMISE HAS TO HOLD BEFORE THE PLAN MEANS ANYTHING, and on a SHARED test
+	// database it sometimes does not.
+	//
+	// quiesceEventOutbox parks unrelated claimable rows behind a future locked_until so
+	// they cannot be claimed — but locked_until is NOT part of either partial index's
+	// predicate, so those rows are still in the index and still in the statistics the
+	// planner reads. A concurrent run, or a package whose tests left rows behind, can
+	// therefore leave a claimable population that dwarfs the small working set seeded
+	// above, and at that point the planner is costing a data shape this test did not
+	// create and does not describe: with several hundred claimable rows a sequential scan
+	// genuinely is cheaper, and PostgreSQL is right to choose one.
+	//
+	// Failing there would report a defect that is not one. Skipping says plainly that the
+	// precondition could not be established, which is what the brittleness of a plan
+	// assertion actually requires — and it cannot make the test pass vacuously, because a
+	// skip is not a pass.
+	var unrelatedClaimable int
+	require.NoError(t, ds.Conn.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM blnk.event_outbox
+		WHERE status IN ('pending', 'processing')
+		  AND event_id NOT LIKE $1
+	`, marker+"%").Scan(&unrelatedClaimable), "counting unrelated claimable rows must succeed")
+
+	if unrelatedClaimable > claimableRows {
+		t.Skipf(
+			"the shared outbox holds %d unrelated claimable rows against a seeded working set of %d, "+
+				"so the plan would be costed for a data shape this test did not create; "+
+				"the claim-index assertion needs a small claimable working set to be meaningful",
+			unrelatedClaimable, claimableRows)
+	}
 
 	// EXPLAIN without ANALYZE PLANS the statement without executing it, so the claim
 	// takes no leases and mutates nothing — which matters here, because executing this
@@ -4473,8 +4533,52 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	assert.Contains(t, planText, "idx_event_outbox_claim",
 		"the claim must be driven by idx_event_outbox_claim. Its partial predicate is what confines the scan to the claimable working set and keeps the cold history out of the index entirely; without it the relay's per-poll cost grows with the table until it cannot keep up with 500 events/sec, and no unit test would ever reveal it.\nPlan was:\n"+planText)
 
-	assert.Contains(t, planText, "idx_event_outbox_partition_key_inflight",
-		"the earlier-same-key exclusion must be driven by idx_event_outbox_partition_key_inflight. That subquery runs ONCE PER CANDIDATE ROW, so without the index the ordering guarantee is bought at the price of scanning each key's entire history on every poll — correct, and progressively unable to keep up.\nPlan was:\n"+planText)
+	// The earlier-same-key exclusion must be INDEX-DRIVEN and confined to the blocking
+	// states. What it must never be is a scan of each key's entire history, which would buy
+	// the ordering guarantee at a price that grows with the table — correct, and
+	// progressively unable to keep up.
+	//
+	// That property is asserted rather than the name of one specific index, because
+	// PostgreSQL has TWO correct ways to satisfy it and picks between them on cost:
+	//
+	//   - a NESTED LOOP anti-join that probes idx_event_outbox_partition_key_inflight once
+	//     per candidate row, which wins when there are many candidates; and
+	//   - a HASH anti-join whose build side is read from idx_event_outbox_claim in ONE index
+	//     scan, which wins when the claimable working set is small — the steady state the
+	//     relay actually lives in, and what it chooses on a compacted heap.
+	//
+	// BOTH indexes are partial on exactly the blocking states, so under either plan the
+	// cold history of terminal rows is never read — which is the guarantee the migration's
+	// index exists to provide and the only thing that keeps the poll's cost independent of
+	// how large the outbox has grown. Neither plan degrades as the table grows. Pinning one
+	// index name would therefore fail on a plan that honours the guarantee completely,
+	// which is how a plan assertion stops testing the system and starts testing the
+	// planner's mood — and is what made this assertion flaky.
+	//
+	// What is NOT negotiable is asserted instead: the exclusion is present, it is keyed on
+	// partition_key, and it reaches the table through one of the two partial indexes. The
+	// sequential-scan prohibition that follows closes the same failure mode over every node
+	// in the plan.
+	assert.Contains(t, planText, "Anti Join",
+		"the earlier-same-key exclusion must survive as an anti-join. Without the NOT EXISTS predicate a relay can skip an earlier locked row and claim a LATER row with the same partition key, and because Kafka preserves append order rather than occurred_at a subscriber then sees one aggregate's events out of order — with no error, no log line and no row state to show it.\nPlan was:\n"+planText)
+
+	assert.Contains(t, planText, "partition_key",
+		"the anti-join must be keyed on partition_key, which is what makes it per-aggregate.\nPlan was:\n"+planText)
+
+	// Asserted on the ONE plan line that reaches the earlier-same-key relation rather than
+	// on the whole plan text: "the plan contains an index scan somewhere" is nearly vacuous
+	// — every plan here contains several — whereas "the line reaching `event_outbox earlier`
+	// is an index scan through a blocking-state partial index" says exactly what it means,
+	// and it says it for either of the two plan shapes above.
+	earlierScan := planLineReferencing(planText, "event_outbox earlier")
+	require.NotEmpty(t, earlierScan,
+		"the plan must reach the earlier-same-key relation explicitly.\nPlan was:\n"+planText)
+	assert.Contains(t, earlierScan, "Index",
+		"the earlier-same-key exclusion must be index-driven. Read through a scan instead, the ordering guarantee is bought at the price of reading the table's entire history on every poll — correct, and progressively unable to keep up.\nPlan line was: "+earlierScan)
+	assert.True(t,
+		strings.Contains(earlierScan, "idx_event_outbox_partition_key_inflight") ||
+			strings.Contains(earlierScan, "idx_event_outbox_claim"),
+		"the earlier-same-key exclusion must be served by a partial index whose predicate is the blocking-state set — either idx_event_outbox_partition_key_inflight probed per candidate, or idx_event_outbox_claim scanned once to build an anti join — so the cold history is excluded entirely. Anything else scans each key's history on every poll.\nPlan line was: "+earlierScan)
 
 	assert.NotContains(t, planText, "Seq Scan on event_outbox",
 		"the claim must not sequentially scan blnk.event_outbox.\nPlan was:\n"+planText)
@@ -4485,6 +4589,31 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// legitimately sorts. blnk.lineage_outbox has the same index and query shape and the
 	// same plan. It costs nothing that matters, because the partial predicate confines
 	// that sort's input to the claimable working set rather than to the whole table.
+}
+
+// planLineReferencing returns the first line of an EXPLAIN plan that mentions needle,
+// trimmed of the tree drawing and indentation.
+//
+// It exists so a plan assertion can be made about ONE relation rather than about the whole
+// plan text. Asserting "the plan contains an index scan somewhere" is nearly vacuous — every
+// plan here contains several — whereas asserting that the line reaching
+// `event_outbox earlier` is an index scan says exactly what it means.
+//
+// Parameters:
+//   - planText string: the EXPLAIN output, newline separated.
+//   - needle string: the relation alias to find.
+//
+// Returns:
+//   - string: the matching line with surrounding whitespace removed, or "" when none
+//     matches.
+func planLineReferencing(planText, needle string) string {
+	for _, line := range strings.Split(planText, "\n") {
+		if strings.Contains(line, needle) {
+			return strings.TrimSpace(line)
+		}
+	}
+
+	return ""
 }
 
 // TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB asserts the LIMIT

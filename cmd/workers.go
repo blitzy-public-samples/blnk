@@ -157,11 +157,11 @@ func handleTransactionRejection(ctx context.Context, b *blnkInstance, txn *model
 		return rejectErr
 	}
 
-	webhookErr := b.blnk.SendWebhook(blnk.NewWebhook{
+	publishErr := b.blnk.PublishEvent(ctx, blnk.NewWebhook{
 		Event:   "transaction.rejected",
 		Payload: *txn,
 	})
-	return webhookErr
+	return publishErr
 }
 
 func hasReachedMaxRetryAttempt(cfg *config.Configuration, retryCount int) bool {

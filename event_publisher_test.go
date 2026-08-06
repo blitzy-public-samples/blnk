@@ -14,14 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Tests for the event publisher's PROCESS-WIDE LIFECYCLE.
+// Tests for the event publisher: the contract it exposes, the settings it publishes with,
+// and the process-wide lifecycle of the instance that does the publishing.
 //
-// # What this file defends
+// # The two halves of this file, and why they are one file
 //
-// A publisher is eight Kafka writers over one shared transport with one SASL session per
-// broker. Constructing it performs no I/O at all — kafka.TCP only canonicalises address
-// strings and a SCRAM mechanism is pure computation — but the FIRST WRITE on each writer
-// dials a broker and negotiates SASL. That asymmetry is the whole subject here: a
+// The first half is the PROCESS-WIDE LIFECYCLE — which instance a caller gets, when it is
+// rebuilt, and who may close it. The second half, beginning at "The mandated contract, the
+// writer settings, and the wire form of one publish", is ONE PUBLISH — the interface it is
+// made through, the three load-bearing writer settings, the key that decides its partition,
+// the bytes that reach the topic, what the publisher reports afterwards, and what it records
+// while doing so. They belong together because they are two views of the same object, and
+// because both rest on the same load-bearing property: construction performs no I/O, so a
+// publisher can be built, inspected and published through in a unit test with no broker
+// anywhere.
+//
+// # What the lifecycle half defends
+//
+// A publisher is one Kafka writer per owned topic over one shared transport with one SASL
+// session per broker. Constructing it performs no I/O at all — kafka.TCP only canonicalises
+// address strings and a SCRAM mechanism is pure computation — but the FIRST WRITE on each
+// writer dials a broker and negotiates SASL. That asymmetry is the whole subject here: a
 // publisher is cheap to build and expensive to use for the first time, so building one per
 // request is not a minor inefficiency but continuous connection and SASL churn against the
 // broker, with a fresh principal session per request.
@@ -39,24 +52,43 @@ limitations under the License.
 //     publisher outlives anything that borrows it, and closing it would take a live
 //     transport down while every later publish failed on a closed writer.
 //
-// None of these tests contact a broker, and none can: every publisher resolved here is
-// either the no-op implementation or a Kafka publisher whose writers are never written to.
+// None of the lifecycle tests contact a broker, and none can: every publisher resolved there
+// is either the no-op implementation or a Kafka publisher whose writers are never written to.
+// The publish tests in the second half DO write, but every write is intercepted at
+// kafka.Writer.Transport by an in-memory fake round tripper, so the whole file runs under
+// `go test -short` with no Kafka, no credentials and — as one of its own assertions proves —
+// no name resolution.
 
 package blnk
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/protocol"
+	metadataAPI "github.com/segmentio/kafka-go/protocol/metadata"
+	produceAPI "github.com/segmentio/kafka-go/protocol/produce"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/embedded"
 
 	"github.com/blnkfinance/blnk/config"
+	"github.com/blnkfinance/blnk/internal/metrics"
 	"github.com/blnkfinance/blnk/model"
 )
 
@@ -806,4 +838,1865 @@ func TestPublishRequestFromOutbox_OrdersTwoAggregatesSharingOneKeyOntoOneKey(t *
 			"broker places them independently and the ordering the claim query paid for is lost")
 	assert.Equal(t, outboxSourceBalanceID, firstKey,
 		"and the shared key is the source balance, matching the transaction queue's own sharding")
+}
+
+// ---------------------------------------------------------------------------
+// The mandated contract, the writer settings, and the wire form of one publish
+// ---------------------------------------------------------------------------
+
+// Everything below asserts the properties of ONE PUBLISH — the interface it is made
+// through, the three writer settings that decide where a message lands and how durably it
+// lands there, the key that decides its partition, the bytes that reach the topic, and what
+// the publisher reports afterwards — and it does all of that with NO KAFKA ANYWHERE. These
+// are unit tests: they run under `go test -short` on a machine with no broker, no
+// credentials and, as asserted below, no name resolution.
+//
+// # How a publish is observed without a broker
+//
+// kafka-go exposes the seam itself. kafka.Writer.Transport is an exported
+// kafka.RoundTripper, and the client behind a writer falls back to the shared default
+// transport only when that field is nil, so substituting a fake round tripper on a
+// constructed writer intercepts the only two requests a synchronous write issues: the
+// metadata lookup that resolves a topic's partition count, and the produce request itself.
+//
+// That substitution is what turns intentions into facts. The acknowledgement mode is
+// asserted as the Acks field of the produce request the broker would have received; the
+// balancer's decision is asserted as the partition that request names; and the key and
+// value are asserted as the record it carries. A test that read the writer's struct fields
+// alone would agree with the implementation by construction — it would still pass if the
+// writer never used the field it set — whereas these assertions fail if the wire form is
+// wrong for any reason, including one the struct does not show.
+//
+// # What is deliberately NOT here
+//
+// The retry schedule and its per-attempt backoff belong to the relay and are covered by
+// event_relay_test.go; dead-letter routing and replay belong to event_dlt_test.go; topic
+// assurance, SCRAM provisioning and ACLs belong to event_admin_test.go; and outbox row
+// construction belongs to event_outbox_test.go. This file asserts what the publisher does
+// with one event, once.
+
+// publisherFakePartitions is the partition count the fake broker reports for every topic.
+//
+// Six is not arbitrary: it is the minimum partition count requirement R-6 states and the
+// default KAFKA_MIN_PARTITIONS carries, so the modular arithmetic the balancer performs
+// here is the arithmetic it performs against a provisioned topic. It is also more than
+// one, which two of the assertions below depend on — with a single partition every key
+// would "route correctly" no matter what the balancer or the key did.
+const publisherFakePartitions = 6
+
+// publisherConstructionBudget bounds how long building a publisher may take.
+//
+// It is deliberately far above the cost of the pure computation construction actually
+// performs (microseconds) and far below the transport's five-second dial timeout, so it
+// distinguishes the two outcomes it exists to distinguish rather than measuring machine
+// speed: a construction that dialled or resolved a name would blow through it, and a
+// construction that did neither cannot approach it.
+const publisherConstructionBudget = 2 * time.Second
+
+// publisherBlackholeBroker is an address in TEST-NET-2 (RFC 5737), reserved for
+// documentation and routed nowhere. A dial to it hangs until it times out rather than
+// failing fast, which is precisely what makes it a useful probe: if construction dialled,
+// the construction budget above would be exceeded.
+const publisherBlackholeBroker = "198.51.100.1:9092"
+
+// publisherUnresolvableBroker uses the .invalid top-level domain, which RFC 2606 reserves
+// so that it is guaranteed never to resolve. If construction resolved names, this address
+// would either fail construction outright or make it wait on a DNS timeout.
+const publisherUnresolvableBroker = "broker.publisher-test.invalid:9092"
+
+// publisherLedgerID and publisherOtherLedgerID are two ledger identifiers, which are the
+// values the message key carries. Requirement R-6 partitions by ledger, and
+// PrepareEventOutbox stores a known ledger in the partition-key column, so a ledger id is
+// what a real outbox-backed publish keys on.
+const (
+	publisherLedgerID      = "ldg_publisher_wire_001"
+	publisherOtherLedgerID = "ldg_publisher_wire_002"
+)
+
+// publisherPayload is an ordinary legacy webhook body: the marshalled NewWebhook object,
+// both of its keys included, exactly as the dual-delivery guarantee requires the payload
+// column to carry it.
+const publisherPayload = `{"event":"transaction.applied","data":{"transaction_id":"txn_publisher_wire","status":"APPLIED","amount":100}}`
+
+// publisherAdversarialPayload is the payload that separates SPLICING the stored bytes from
+// re-marshalling a struct, and every element of it is chosen for that purpose:
+//
+//   - `<`, `>` and `&` are rewritten as \u003c, \u003e and \u0026 by encoding/json, whose
+//     HTML escaping is on by default.
+//   - The runs of insignificant whitespace are removed by the encoder's compactor.
+//   - 9007199254740993 is 2^53+1, which cannot be represented exactly as a float64, so a
+//     decode-then-encode round trip through interface{} would silently change the number.
+//
+// A message value that still contains these bytes verbatim can only have been spliced.
+const publisherAdversarialPayload = `{"event":"identity.created","data":{"note":"<b>a & b</b>",  "identity_id":"idt_publisher_wire",   "credit_score":9007199254740993}}`
+
+// publisherIdentityEventType is the identity event name, spelled as a literal because model
+// declares event-name constants only for the transaction family and the two repeatable
+// names. It is the same string the event catalogue in event_topics_test.go states.
+const publisherIdentityEventType = "identity.created"
+
+// publisherFixedOccurredAt is a fixed occurrence instant, so that the message timestamp
+// asserted below is a stated value rather than whatever the clock said.
+var publisherFixedOccurredAt = time.Date(2026, time.May, 18, 11, 42, 3, 250000000, time.UTC)
+
+// publisherProducedRecord is one record as the broker would have received it: the key that
+// decides its partition, the value that reaches subscribers, and the timestamp.
+type publisherProducedRecord struct {
+	Key   []byte
+	Value []byte
+	Time  time.Time
+}
+
+// publisherProducedBatch is one produce request as the broker would have received it.
+//
+// Acks and Partition are the two fields that make the writer's configuration observable
+// rather than merely declared: Acks is int16(Writer.RequiredAcks) as the request carries
+// it, and Partition is the partition the writer's balancer chose for the key.
+type publisherProducedBatch struct {
+	Topic     string
+	Partition int
+	Acks      int16
+	Records   []publisherProducedRecord
+}
+
+// publisherFakeTransport is a kafka.RoundTripper that answers metadata and produce
+// requests in memory, capturing everything a publish sends.
+//
+// It is deliberately narrow — no mocking library, no expectations to arrange, and only the
+// two request types a synchronous write issues. Anything else is recorded as unexpected and
+// refused, so a change that made the publish path talk to the broker in some further way
+// would surface as a test failure rather than as a silently-ignored request.
+//
+// It is safe for concurrent use because it must be: kafka-go performs the produce on the
+// partition writer's own goroutine, and the concurrency test below drives several publishes
+// at once through one shared writer.
+type publisherFakeTransport struct {
+	mu sync.Mutex
+
+	// partitions is how many partitions every topic reports in metadata.
+	partitions int
+
+	// produceErrorCode is returned as the produce response's per-partition error code.
+	// Zero means success. A non-zero value is how a BROKER-SIDE failure is simulated,
+	// which is the realistic failure shape: the request was delivered and the cluster
+	// refused it.
+	produceErrorCode int16
+
+	// transportErr, when set, fails the produce round trip itself rather than the
+	// response — the shape a connection failure takes.
+	transportErr error
+
+	// metadataTopics and batches are what was asked of the broker, in order.
+	metadataTopics []string
+	batches        []publisherProducedBatch
+
+	// unexpected records any request type other than metadata or produce.
+	unexpected []string
+}
+
+// Compile-time proof that the double satisfies the interface the writer's field takes. If
+// kafka-go ever changed that contract, this fails the build here rather than leaving a
+// test that quietly stopped intercepting anything.
+var _ kafka.RoundTripper = (*publisherFakeTransport)(nil)
+
+// newPublisherFakeTransport returns a transport that reports publisherFakePartitions
+// partitions for every topic and acknowledges every write.
+//
+// Returns:
+//   - *publisherFakeTransport: a ready transport that has captured nothing yet.
+func newPublisherFakeTransport() *publisherFakeTransport {
+	return &publisherFakeTransport{partitions: publisherFakePartitions}
+}
+
+// failProduceWith makes the fake broker refuse every produce request with a Kafka error
+// code, returning the transport so it can be configured inline.
+//
+// Parameters:
+//   - code kafka.Error: the error code the response carries.
+//
+// Returns:
+//   - *publisherFakeTransport: the same transport, for chaining.
+func (f *publisherFakeTransport) failProduceWith(code kafka.Error) *publisherFakeTransport {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.produceErrorCode = int16(code)
+
+	return f
+}
+
+// RoundTrip answers one request.
+//
+// The context check comes first and is not defensive: a real transport fails on an expired
+// or cancelled context, and one of the assertions below depends on this double behaving the
+// same way rather than succeeding where a broker could not have been reached.
+//
+// Parameters:
+//   - ctx context.Context: the request context.
+//   - _ net.Addr: the broker address, unused because nothing is dialled.
+//   - request kafka.Request: the request to answer.
+//
+// Returns:
+//   - kafka.Response: the response for a recognised request.
+//   - error: the context error, a configured transport failure, or a refusal for an
+//     unrecognised request type.
+func (f *publisherFakeTransport) RoundTrip(
+	ctx context.Context,
+	_ net.Addr,
+	request kafka.Request,
+) (kafka.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	switch typed := request.(type) {
+	case *metadataAPI.Request:
+		return f.metadata(typed), nil
+	case *produceAPI.Request:
+		return f.produce(typed)
+	default:
+		f.mu.Lock()
+		f.unexpected = append(f.unexpected, fmt.Sprintf("%T", request))
+		f.mu.Unlock()
+
+		return nil, fmt.Errorf(
+			"publisherFakeTransport: unexpected kafka request %T; a synchronous publish must "+
+				"issue only metadata and produce requests", request,
+		)
+	}
+}
+
+// metadata answers the partition lookup a write performs before balancing.
+//
+// Every requested topic is reported with publisherFakePartitions partitions, all led by the
+// single fake broker. The writer reads only the partition COUNT from this, which is what it
+// hands to the balancer.
+//
+// Parameters:
+//   - request *metadataAPI.Request: the lookup, naming one topic per write.
+//
+// Returns:
+//   - *metadataAPI.Response: a healthy response for every requested topic.
+func (f *publisherFakeTransport) metadata(request *metadataAPI.Request) *metadataAPI.Response {
+	f.mu.Lock()
+	f.metadataTopics = append(f.metadataTopics, request.TopicNames...)
+	partitions := f.partitions
+	f.mu.Unlock()
+
+	response := &metadataAPI.Response{
+		Brokers:      []metadataAPI.ResponseBroker{{NodeID: 1, Host: "fake-broker", Port: 9092}},
+		ControllerID: 1,
+		ClusterID:    "publisher-fake-cluster",
+	}
+
+	for _, name := range request.TopicNames {
+		topic := metadataAPI.ResponseTopic{Name: name}
+		for partition := 0; partition < partitions; partition++ {
+			topic.Partitions = append(topic.Partitions, metadataAPI.ResponsePartition{
+				PartitionIndex: int32(partition),
+				LeaderID:       1,
+				ReplicaNodes:   []int32{1},
+				IsrNodes:       []int32{1},
+			})
+		}
+		response.Topics = append(response.Topics, topic)
+	}
+
+	return response
+}
+
+// produce captures the request and answers it.
+//
+// The records are drained BEFORE any configured failure is applied, so a failing publish is
+// still observable: the bytes and the acknowledgement mode of a refused write are exactly
+// what a test about failure classification needs to be able to see.
+//
+// Parameters:
+//   - request *produceAPI.Request: the produce request to capture and answer.
+//
+// Returns:
+//   - kafka.Response: the produce response, carrying the configured error code.
+//   - error: a configured transport failure, or a record-reading failure.
+func (f *publisherFakeTransport) produce(request *produceAPI.Request) (kafka.Response, error) {
+	f.mu.Lock()
+	errorCode := f.produceErrorCode
+	transportErr := f.transportErr
+	f.mu.Unlock()
+
+	captured := publisherProducedBatch{Acks: request.Acks}
+	response := &produceAPI.Response{}
+
+	for _, topic := range request.Topics {
+		captured.Topic = topic.Topic
+
+		for _, partition := range topic.Partitions {
+			captured.Partition = int(partition.Partition)
+
+			records, err := publisherDrainRecords(partition.RecordSet.Records)
+			if err != nil {
+				return nil, err
+			}
+			captured.Records = append(captured.Records, records...)
+
+			response.Topics = append(response.Topics, produceAPI.ResponseTopic{
+				Topic: topic.Topic,
+				Partitions: []produceAPI.ResponsePartition{{
+					Partition:  partition.Partition,
+					ErrorCode:  errorCode,
+					BaseOffset: 1,
+				}},
+			})
+		}
+	}
+
+	f.mu.Lock()
+	f.batches = append(f.batches, captured)
+	f.mu.Unlock()
+
+	if transportErr != nil {
+		return nil, transportErr
+	}
+
+	return response, nil
+}
+
+// publisherDrainRecords reads every record out of a produce request's record set.
+//
+// The reader is single-pass and the fake is its terminal consumer, so draining it here is
+// both safe and the only way to see the key and value bytes: they travel as
+// protocol.Bytes readers rather than as slices.
+//
+// Parameters:
+//   - reader protocol.RecordReader: the record set's reader. May be nil.
+//
+// Returns:
+//   - []publisherProducedRecord: the records, in order.
+//   - error: a read failure, which would be a defect in this double rather than in the
+//     publisher.
+func publisherDrainRecords(reader protocol.RecordReader) ([]publisherProducedRecord, error) {
+	if reader == nil {
+		return nil, nil
+	}
+
+	records := make([]publisherProducedRecord, 0, 1)
+
+	for {
+		record, err := reader.ReadRecord()
+		if errors.Is(err, io.EOF) {
+			return records, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		key, err := protocol.ReadAll(record.Key)
+		if err != nil {
+			return nil, err
+		}
+
+		value, err := protocol.ReadAll(record.Value)
+		if err != nil {
+			return nil, err
+		}
+
+		records = append(records, publisherProducedRecord{Key: key, Value: value, Time: record.Time})
+	}
+}
+
+// producedBatches returns a copy of everything produced so far.
+//
+// Returns:
+//   - []publisherProducedBatch: the captured batches, in order.
+func (f *publisherFakeTransport) producedBatches() []publisherProducedBatch {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]publisherProducedBatch, len(f.batches))
+	copy(out, f.batches)
+
+	return out
+}
+
+// onlyRecord returns the single record of the single batch produced so far, failing the
+// test if the publish path batched, split or duplicated anything.
+//
+// The requirement is exact rather than lenient because "one publish is one produce request
+// carrying one record" is itself a property worth holding: batching across rows would
+// couple the latency of unrelated events, and a duplicate record on one request would be a
+// silent double delivery.
+//
+// Returns:
+//   - publisherProducedBatch: the batch.
+//   - publisherProducedRecord: its only record.
+func (f *publisherFakeTransport) onlyRecord(t *testing.T) (publisherProducedBatch, publisherProducedRecord) {
+	t.Helper()
+
+	batches := f.producedBatches()
+	require.Len(t, batches, 1, "exactly one produce request must have been issued")
+	require.Len(t, batches[0].Records, 1, "one publish must carry exactly one record")
+
+	return batches[0], batches[0].Records[0]
+}
+
+// requestedMetadataTopics returns the topics whose partition counts were looked up.
+//
+// Returns:
+//   - []string: the topic names, in request order.
+func (f *publisherFakeTransport) requestedMetadataTopics() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]string, len(f.metadataTopics))
+	copy(out, f.metadataTopics)
+
+	return out
+}
+
+// unexpectedRequests returns the request types the publish path issued that this double did
+// not expect.
+//
+// Returns:
+//   - []string: the Go type names of any unexpected requests.
+func (f *publisherFakeTransport) unexpectedRequests() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]string, len(f.unexpected))
+	copy(out, f.unexpected)
+
+	return out
+}
+
+// publisherWithFakeTransport builds a real Kafka publisher whose every writer is wired to
+// transport, so publishing exercises the production code path end to end without a broker.
+//
+// The topic prefix is published FIRST because the publisher pre-creates one writer per owned
+// topic at construction, and the inventory it enumerates is derived from the configured
+// prefix. Substituting the transport afterwards is safe precisely because construction
+// performs no I/O: no writer has connected, so none is holding the transport it was built
+// with.
+//
+// Parameters:
+//   - transport *publisherFakeTransport: the double every writer will use.
+//
+// Returns:
+//   - *kafkaPublisher: the publisher, closed automatically when the test ends.
+func publisherWithFakeTransport(t *testing.T, transport *publisherFakeTransport) *kafkaPublisher {
+	t.Helper()
+
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	publisher := newTestKafkaPublisher(t)
+
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+
+	for _, writer := range publisher.writers {
+		writer.Transport = transport
+	}
+
+	return publisher
+}
+
+// publisherWriterSnapshot copies the writer inventory out from under the lock, so
+// assertions run without holding it.
+//
+// Parameters:
+//   - publisher *kafkaPublisher: the publisher to read.
+//
+// Returns:
+//   - map[string]*kafka.Writer: the writers, keyed by topic.
+func publisherWriterSnapshot(publisher *kafkaPublisher) map[string]*kafka.Writer {
+	publisher.mu.RLock()
+	defer publisher.mu.RUnlock()
+
+	writers := make(map[string]*kafka.Writer, len(publisher.writers))
+	for topic, writer := range publisher.writers {
+		writers[topic] = writer
+	}
+
+	return writers
+}
+
+// publisherPartitionIDs is the partition list the writer hands its balancer: every
+// partition of the topic, in ascending order.
+//
+// Returns:
+//   - []int: 0 through publisherFakePartitions-1.
+func publisherPartitionIDs() []int {
+	partitions := make([]int, 0, publisherFakePartitions)
+	for partition := 0; partition < publisherFakePartitions; partition++ {
+		partitions = append(partitions, partition)
+	}
+
+	return partitions
+}
+
+// publisherExpectedPartition computes where Murmur2 places a key, independently of the
+// publisher.
+//
+// This is the behavioural half of the balancer assertion: the struct field says which
+// balancer was configured, and this says where that balancer actually puts the message. A
+// switch to any other stable hash changes this number for at least some keys, so the two
+// assertions together cannot both be satisfied by a different balancer.
+//
+// Parameters:
+//   - key string: the message key.
+//
+// Returns:
+//   - int: the partition Murmur2 selects out of publisherFakePartitions.
+func publisherExpectedPartition(key string) int {
+	balancer := kafka.Murmur2Balancer{}
+
+	return balancer.Balance(kafka.Message{Key: []byte(key)}, publisherPartitionIDs()...)
+}
+
+// publisherKeyOnAnotherPartition returns a ledger identifier that Murmur2 places on a
+// different partition from key.
+//
+// It exists so the "a different ledger can land elsewhere" assertion is deterministic
+// rather than hopeful: with six partitions, two arbitrary keys collide one time in six, and
+// a test that assumed otherwise would fail intermittently for a reason having nothing to do
+// with the publisher.
+//
+// Parameters:
+//   - key string: the key whose partition must be avoided.
+//
+// Returns:
+//   - string: a key on a different partition.
+func publisherKeyOnAnotherPartition(t *testing.T, key string) string {
+	t.Helper()
+
+	target := publisherExpectedPartition(key)
+
+	for candidate := 0; candidate < 512; candidate++ {
+		probe := fmt.Sprintf("ldg_publisher_probe_%03d", candidate)
+		if publisherExpectedPartition(probe) != target {
+			return probe
+		}
+	}
+
+	t.Fatalf("no probe key out of 512 landed on a partition other than %d, which cannot happen "+
+		"with %d partitions unless the balancer ignores the key entirely", target, publisherFakePartitions)
+
+	return ""
+}
+
+// publisherEvent builds a LedgerEvent with a fresh identifier and a fixed occurrence
+// instant.
+//
+// Parameters:
+//   - eventType string: the event name.
+//   - aggregateID string: the aggregate the event is about.
+//   - payload string: the payload bytes, carried through untransformed.
+//
+// Returns:
+//   - model.LedgerEvent: the envelope.
+func publisherEvent(eventType, aggregateID, payload string) model.LedgerEvent {
+	return model.LedgerEvent{
+		EventID:       uuid.NewString(),
+		EventType:     eventType,
+		AggregateID:   aggregateID,
+		OccurredAt:    publisherFixedOccurredAt,
+		Payload:       json.RawMessage(payload),
+		SchemaVersion: model.SchemaVersionV1,
+	}
+}
+
+// publisherMetricRecord is one captured measurement: its value and its attributes,
+// flattened to strings so an assertion can compare a whole attribute set at once. Comparing
+// the SET rather than probing for individual keys is what catches an extra, unbounded
+// attribute as well as a missing one.
+type publisherMetricRecord struct {
+	value      float64
+	attributes map[string]string
+}
+
+// publisherRecordedCounter captures Int64Counter measurements.
+//
+// The instruments live as package-level variables in internal/metrics, so a test swaps the
+// variable rather than installing a global meter provider. That keeps the capture local:
+// otel delegates its global meter to the first provider set, once and permanently, so a
+// provider installed here would silently blind every other test in the binary that recorded
+// afterwards.
+type publisherRecordedCounter struct {
+	embedded.Int64Counter
+
+	mu      sync.Mutex
+	records []publisherMetricRecord
+}
+
+var _ otelmetric.Int64Counter = (*publisherRecordedCounter)(nil)
+
+// Add captures one increment and its attributes.
+func (c *publisherRecordedCounter) Add(_ context.Context, value int64, options ...otelmetric.AddOption) {
+	attributes := publisherAttributeMap(otelmetric.NewAddConfig(options).Attributes())
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.records = append(c.records, publisherMetricRecord{value: float64(value), attributes: attributes})
+}
+
+// Enabled reports that measurements are always processed, so the code under test takes the
+// same path it takes in a process with an exporter configured.
+func (c *publisherRecordedCounter) Enabled(context.Context) bool { return true }
+
+// snapshot returns the captured measurements in order.
+func (c *publisherRecordedCounter) snapshot() []publisherMetricRecord {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	out := make([]publisherMetricRecord, len(c.records))
+	copy(out, c.records)
+
+	return out
+}
+
+// total sums the captured increments, which is how a counter is actually read.
+func (c *publisherRecordedCounter) total() float64 {
+	total := 0.0
+	for _, record := range c.snapshot() {
+		total += record.value
+	}
+
+	return total
+}
+
+// publisherRecordedHistogram captures Float64Histogram measurements.
+type publisherRecordedHistogram struct {
+	embedded.Float64Histogram
+
+	mu      sync.Mutex
+	records []publisherMetricRecord
+}
+
+var _ otelmetric.Float64Histogram = (*publisherRecordedHistogram)(nil)
+
+// Record captures one observation and its attributes.
+func (h *publisherRecordedHistogram) Record(_ context.Context, value float64, options ...otelmetric.RecordOption) {
+	attributes := publisherAttributeMap(otelmetric.NewRecordConfig(options).Attributes())
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.records = append(h.records, publisherMetricRecord{value: value, attributes: attributes})
+}
+
+// Enabled reports that measurements are always processed.
+func (h *publisherRecordedHistogram) Enabled(context.Context) bool { return true }
+
+// snapshot returns the captured observations in order.
+func (h *publisherRecordedHistogram) snapshot() []publisherMetricRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	out := make([]publisherMetricRecord, len(h.records))
+	copy(out, h.records)
+
+	return out
+}
+
+// publisherAttributeMap flattens an attribute set to a comparable map.
+//
+// Parameters:
+//   - set attribute.Set: the recorded attributes.
+//
+// Returns:
+//   - map[string]string: key to rendered value; never nil, so an empty set compares
+//     cleanly.
+func publisherAttributeMap(set attribute.Set) map[string]string {
+	attributes := make(map[string]string, set.Len())
+	for _, keyValue := range set.ToSlice() {
+		attributes[string(keyValue.Key)] = keyValue.Value.Emit()
+	}
+
+	return attributes
+}
+
+// publisherInstruments is the three instruments one publish records.
+type publisherInstruments struct {
+	published *publisherRecordedCounter
+	attempts  *publisherRecordedCounter
+	duration  *publisherRecordedHistogram
+}
+
+// publisherCaptureInstruments swaps the three publish instruments for recorders and
+// restores the originals when the test ends.
+//
+// Returns:
+//   - *publisherInstruments: the recorders, empty at first.
+func publisherCaptureInstruments(t *testing.T) *publisherInstruments {
+	t.Helper()
+
+	captured := &publisherInstruments{
+		published: &publisherRecordedCounter{},
+		attempts:  &publisherRecordedCounter{},
+		duration:  &publisherRecordedHistogram{},
+	}
+
+	publishedOriginal := metrics.EventsPublishedTotal
+	attemptsOriginal := metrics.EventPublishAttemptsTotal
+	durationOriginal := metrics.EventPublishDuration
+
+	t.Cleanup(func() {
+		metrics.EventsPublishedTotal = publishedOriginal
+		metrics.EventPublishAttemptsTotal = attemptsOriginal
+		metrics.EventPublishDuration = durationOriginal
+	})
+
+	metrics.EventsPublishedTotal = captured.published
+	metrics.EventPublishAttemptsTotal = captured.attempts
+	metrics.EventPublishDuration = captured.duration
+
+	return captured
+}
+
+// ---------------------------------------------------------------------------
+// The mandated interface
+// ---------------------------------------------------------------------------
+
+// Compile-time proof that both implementations satisfy the contract, and that the method
+// they satisfy it with has EXACTLY the mandated shape.
+//
+// The signature `Publish(ctx context.Context, event model.LedgerEvent) error` is a literal
+// artifact supplied by the user, so it is pinned in two independent places: here, where an
+// added parameter or a tuple return fails the BUILD, and in the reflection test below, which
+// states the same contract in a form a reader can see the requirement in. Duplicating the
+// implementation file's own assertions is deliberate — a test file that assumed the
+// implementation was still asserting them would pass after they were deleted.
+var (
+	_ EventPublisher = (*kafkaPublisher)(nil)
+	_ EventPublisher = (*NoopEventPublisher)(nil)
+
+	// Both implementations also satisfy the fuller internal contract, which is what lets a
+	// caller hold either without feature-detecting.
+	_ TopicEventPublisher = (*kafkaPublisher)(nil)
+	_ TopicEventPublisher = (*NoopEventPublisher)(nil)
+
+	// The typed function-variable assignment only compiles for the exact signature. The
+	// values are discarded; the assignment is the assertion.
+	_ func(context.Context, model.LedgerEvent) error = (&kafkaPublisher{}).Publish
+	_ func(context.Context, model.LedgerEvent) error = (&NoopEventPublisher{}).Publish
+)
+
+// TestEventPublisher_MandatedSignatureIsPinnedByReflection states the user-supplied contract
+// as a runtime assertion over the interface's own type.
+//
+// The compile-time assignments above already stop the build on drift, so why also assert it
+// here? Because they can be deleted as easily as the signature can be changed, and because
+// they cannot say WHY the shape is what it is. This test names the requirement: one method,
+// called Publish, taking a context and a model.LedgerEvent, returning a bare error and
+// nothing else. Anything richer that a caller needs — the destination, the attempt, the
+// result — is exposed through TopicEventPublisher instead, which is how the contract stays
+// exactly as it was specified while the pipeline around it grows.
+func TestEventPublisher_MandatedSignatureIsPinnedByReflection(t *testing.T) {
+	contract := reflect.TypeOf((*EventPublisher)(nil)).Elem()
+	require.Equal(t, reflect.Interface, contract.Kind())
+
+	require.Equal(t, 1, contract.NumMethod(),
+		"EventPublisher must declare exactly one method; anything else belongs on TopicEventPublisher")
+
+	method := contract.Method(0)
+	assert.Equal(t, "Publish", method.Name, "the method name is part of the mandated form")
+
+	signature := method.Type
+	require.Equal(t, reflect.Func, signature.Kind())
+	assert.False(t, signature.IsVariadic(), "the mandated form takes no variadic options")
+
+	// Two parameters, in this order. A reflected interface method carries no receiver, so
+	// these are exactly the declared parameters.
+	require.Equal(t, 2, signature.NumIn(),
+		"Publish must take a context and an event and nothing more; a third parameter is drift")
+	assert.Equal(t, reflect.TypeOf((*context.Context)(nil)).Elem(), signature.In(0),
+		"the first parameter must be context.Context, so a publish is cancellable")
+	assert.Equal(t, reflect.TypeOf(model.LedgerEvent{}), signature.In(1),
+		"the second parameter must be model.LedgerEvent BY VALUE, which is the canonical "+
+			"envelope every producer builds")
+
+	// One return, and it is the bare error the specification names.
+	require.Equal(t, 1, signature.NumOut(),
+		"Publish must return only an error; the richer per-attempt record is PublishToTopic's job")
+	assert.Equal(t, reflect.TypeOf((*error)(nil)).Elem(), signature.Out(0))
+}
+
+// ---------------------------------------------------------------------------
+// The writer inventory and the three load-bearing settings
+// ---------------------------------------------------------------------------
+
+// TestEventPublisher_HoldsOneWriterPerOwnedTopic asserts the shape of the publisher's writer
+// inventory: one writer per topic Blnk owns, no writer for anything else, and one shared
+// transport and address underneath all of them.
+//
+// Both halves matter. A MISSING writer means a publish to that topic takes the lazy-growth
+// path on the hot path instead of the map's fast path, taking the write lock for every event.
+// An EXTRA writer means a connection pool and a SASL session for a destination nothing
+// publishes to. And the sharing is what keeps the connection count proportional to brokers
+// rather than to brokers times topics: per-writer transports would multiply both TCP
+// connections and SASL handshakes by the size of the inventory for no benefit at all.
+//
+// The inventory is taken from AllTopicsWithDeadLetters rather than hardcoded, so this test
+// and event_topics.go work from ONE list and a new category cannot leave a topic without a
+// writer. The eight names requirement R-5 and R-6 state literally are then required
+// individually, because deriving the whole expectation from the implementation would let a
+// silently-dropped category pass.
+func TestEventPublisher_HoldsOneWriterPerOwnedTopic(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+	publisher := newTestKafkaPublisher(t)
+
+	inventory := AllTopicsWithDeadLetters()
+	require.NotEmpty(t, inventory, "the owned-topic inventory cannot be empty")
+
+	writers := publisherWriterSnapshot(publisher)
+	require.Len(t, writers, len(inventory),
+		"exactly one writer per owned topic: a missing one forces lazy creation onto the publish "+
+			"path, an extra one holds connections for a destination nothing publishes to")
+
+	// The three category topics requirement R-6 names, the fourth category the ledger and
+	// system-error events made necessary, and the four `.dlt` siblings requirement R-5 names.
+	// Written out as literals so a renamed topic or a dropped dead-letter sibling fails here.
+	for _, topic := range []string{
+		"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system",
+		"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.system.dlt",
+	} {
+		writer, present := writers[topic]
+		require.True(t, present, "topic %q must have its own writer", topic)
+		require.NotNil(t, writer)
+		assert.Equal(t, topic, writer.Topic,
+			"the writer keyed by %q must publish to %q; a mismatch delivers events to the wrong topic", topic, topic)
+	}
+
+	// Distinct writers, one shared transport, one shared address.
+	seen := make(map[*kafka.Writer]string, len(writers))
+	for topic, writer := range writers {
+		if previous, duplicate := seen[writer]; duplicate {
+			t.Fatalf("topics %q and %q share one writer, so one of them publishes to the other's topic",
+				previous, topic)
+		}
+		seen[writer] = topic
+
+		transport, isSharedTransport := writer.Transport.(*kafka.Transport)
+		require.True(t, isSharedTransport, "writer for %q must use the publisher's transport", topic)
+		assert.Same(t, publisher.transport, transport,
+			"every writer must draw on ONE connection pool and ONE SASL session per broker")
+		assert.Equal(t, publisher.addr, writer.Addr,
+			"every writer must address the same bootstrap list the publisher was built with")
+	}
+}
+
+// TestEventPublisher_WriterSettingsAreStatedExplicitly pins every setting on every writer,
+// and it exists because three of kafka-go's defaults are actively wrong for a ledger event
+// pipeline while the rest would let a library upgrade change delivery semantics with no code
+// change at all.
+//
+// The three the plan calls load-bearing are asserted first and hardest:
+//
+//   - THE BALANCER is Murmur2, asserted by concrete type AND by value. Any stable hash
+//     would pin a key to a partition, but Murmur2 reproduces the Java client's default
+//     partitioner exactly, so a message Blnk produces for a key lands where a Java or
+//     librdkafka producer would have put it — which matters the moment anything else writes
+//     to these topics or a subscriber reasons about partition assignment from the key. The
+//     value assertion additionally pins Consistent to false, which is the Java behaviour for
+//     a keyless message: spread it, rather than pinning every keyless event to one partition.
+//   - REQUIRED ACKS is RequireAll. This MUST be set explicitly: kafka-go substitutes
+//     RequireAll for a zero value only inside its deprecated WriterConfig constructor, and a
+//     Writer built as a struct literal — which is what this code does — keeps the zero value,
+//     which is RequireNone. Under RequireNone a produce call returns as soon as the request
+//     is written to the socket, so WriteMessages would report success for events the cluster
+//     never stored and the relay would mark their rows dispatched. The assertion below is
+//     therefore written to fail if the field is left out, and the wire-level test that follows
+//     proves the value actually reaches the broker.
+//   - THE INTERNAL RETRY LOOP is off (MaxAttempts 1). kafka-go retries ten times by default
+//     with its own backoff, which would multiply the relay's attempt count by ten and make
+//     the logged attempt number a fiction. The relay owns retry; its schedule is asserted in
+//     event_relay_test.go, not here.
+func TestEventPublisher_WriterSettingsAreStatedExplicitly(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+	publisher := newTestKafkaPublisher(t)
+
+	writers := publisherWriterSnapshot(publisher)
+	require.NotEmpty(t, writers)
+
+	// The zero value of the field is RequireNone, which is what makes "set explicitly"
+	// a testable property rather than a comment: the assertion below cannot be satisfied
+	// by omitting the field.
+	require.Equal(t, kafka.RequireNone, kafka.RequiredAcks(0),
+		"kafka-go's zero RequiredAcks is RequireNone; if that ever changes, the durability "+
+			"assertion below needs rewriting rather than merely re-running")
+	require.Equal(t, kafka.RequireAll, eventWriterRequiredAcks,
+		"the publisher's acknowledgement constant must be the all-replicas setting")
+
+	for topic, writer := range writers {
+		t.Run(topic, func(t *testing.T) {
+			// SETTING 1's mechanism: a per-topic writer, so the message carries no topic of
+			// its own and the key is free to carry the partition key.
+			assert.Equal(t, topic, writer.Topic)
+
+			// SETTING 2 — a stable hash balancer, and specifically Murmur2.
+			require.NotNil(t, writer.Balancer,
+				"a nil balancer falls back to round robin, which scatters one aggregate's events "+
+					"across every partition and silently destroys ordering")
+			assert.IsType(t, kafka.Murmur2Balancer{}, writer.Balancer,
+				"the balancer must be Murmur2, which matches the Java client's default partitioner")
+			assert.Equal(t, kafka.Murmur2Balancer{}, writer.Balancer,
+				"Consistent must stay false, so a keyless event is spread rather than pinned to one partition")
+
+			// The alternatives kafka-go offers, refused by type. Naming them is what makes a
+			// swap to another hash — which would still "work" for ordering — fail here.
+			for _, rejected := range []kafka.Balancer{
+				&kafka.Hash{}, &kafka.ReferenceHash{}, kafka.CRC32Balancer{},
+				&kafka.RoundRobin{}, &kafka.LeastBytes{},
+			} {
+				assert.NotEqual(t, reflect.TypeOf(rejected), reflect.TypeOf(writer.Balancer),
+					"%T is not the configured balancer", rejected)
+			}
+
+			// SETTING 3 — the acknowledgement mode, present on the constructed writer.
+			assert.Equal(t, kafka.RequireAll, writer.RequiredAcks,
+				"only an all-in-sync-replicas acknowledgement makes a dispatched row a durable statement")
+			assert.EqualValues(t, -1, writer.RequiredAcks,
+				"RequireAll is -1 on the wire; this is the value the produce request must carry")
+			assert.NotEqual(t, kafka.RequiredAcks(0), writer.RequiredAcks,
+				"the field must be SET: left at its zero value it is RequireNone, and every publish "+
+					"would report success without any acknowledgement at all")
+
+			// The remaining settings, each stated rather than inherited.
+			assert.Equal(t, 1, writer.MaxAttempts,
+				"the writer's own retry loop must be off; retry is the relay's, bounded by its budget")
+			assert.Equal(t, 1, writer.BatchSize,
+				"a synchronous write must flush immediately; batching to 100 would put kafka-go's "+
+					"one-second batch timeout on the latency of every non-bursty publish")
+			assert.False(t, writer.Async,
+				"an async writer returns nil the moment a message is queued, so a broker outage "+
+					"would be invisible and every outbox row would be marked dispatched")
+			assert.False(t, writer.AllowAutoTopicCreation,
+				"auto-creation would silently take the cluster's default partition count and "+
+					"replication factor, discarding both guarantees the pipeline is built on")
+			assert.EqualValues(t, eventWriterBatchBytes, writer.BatchBytes,
+				"the byte ceiling must leave headroom above the application limit for a dead-letter "+
+					"copy, which is the original envelope plus its failure metadata")
+			assert.Equal(t, eventWriterBatchTimeout, writer.BatchTimeout)
+			assert.Equal(t, eventWriterWriteTimeout, writer.WriteTimeout)
+			assert.Equal(t, eventWriterReadTimeout, writer.ReadTimeout)
+			assert.NotNil(t, writer.Addr, "a writer with a nil address refuses every write")
+			assert.NotNil(t, writer.Logger, "the client's own diagnostics must reach the structured log")
+			assert.NotNil(t, writer.ErrorLogger)
+		})
+	}
+}
+
+// TestEventPublisher_ProducesTheEventOnTheWireAsConfigured is the assertion the struct-field
+// tests above cannot make: that the settings are what the BROKER would have seen.
+//
+// One publish is intercepted at the transport and every part of the resulting produce
+// request is checked — the destination topic, the acknowledgement mode, the partition the
+// balancer chose, the key, the value and the timestamp — together with the result the
+// publisher reported for it. This is the single test that would fail if the writer read its
+// key from somewhere other than the resolved partition key, if the balancer were swapped, or
+// if RequiredAcks were removed and left at its RequireNone zero value.
+func TestEventPublisher_ProducesTheEventOnTheWireAsConfigured(t *testing.T) {
+	transport := newPublisherFakeTransport()
+	publisher := publisherWithFakeTransport(t, transport)
+
+	event := publisherEvent(model.EventTypeTransactionApplied, "txn_publisher_wire", publisherPayload)
+
+	result, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+		Event: event,
+		Topic: TopicForEvent(event.EventType),
+		Key:   publisherLedgerID,
+	})
+	require.NoError(t, err, "an acknowledged write must not report an error")
+
+	batch, record := transport.onlyRecord(t)
+
+	assert.Equal(t, "blnk.transactions", batch.Topic,
+		"a transaction event must be produced to the transactions category topic")
+
+	// The acknowledgement mode, as the broker would have received it.
+	assert.EqualValues(t, kafka.RequireAll, batch.Acks,
+		"the produce request must ask for an all-in-sync-replicas acknowledgement")
+	assert.EqualValues(t, -1, batch.Acks,
+		"RequireAll is -1; a 0 here would be RequireNone — fire-and-forget with reported success")
+
+	// The key, which is the whole ordering mechanism.
+	assert.Equal(t, []byte(publisherLedgerID), record.Key,
+		"the message key must be the resolved partition key — the ledger id — verbatim")
+
+	// The partition, which is the balancer's decision about that key.
+	assert.Equal(t, publisherExpectedPartition(publisherLedgerID), batch.Partition,
+		"the partition must be the one Murmur2 selects for this key out of %d; another stable "+
+			"hash would choose differently", publisherFakePartitions)
+
+	// The value, which is the serialised envelope.
+	expectedValue, marshalErr := marshalLedgerEvent(event)
+	require.NoError(t, marshalErr)
+	assert.Equal(t, expectedValue, record.Value,
+		"the message value must be the envelope the publisher serialises, byte for byte")
+	assert.True(t, bytes.Contains(record.Value, []byte(publisherPayload)),
+		"and the stored payload must appear inside it untransformed")
+	assert.True(t, event.OccurredAt.Equal(record.Time),
+		"the record timestamp must be the event's occurrence instant, not the publish instant")
+
+	// The result the publisher reported for the attempt.
+	assert.Equal(t, model.PublishStatusDispatched, result.Status)
+	assert.True(t, result.Dispatched())
+	assert.NoError(t, result.Err)
+	assert.Equal(t, event.EventID, result.EventID)
+	assert.Equal(t, model.EventTypeTransactionApplied, result.EventType)
+	assert.Equal(t, "blnk.transactions", result.Topic)
+	assert.Equal(t, publisherLedgerID, result.PartitionKey)
+	assert.Equal(t, 1, result.Attempt, "an unstated attempt is the first attempt")
+	assert.Equal(t, PublishPurposeOriginal, result.Purpose,
+		"an unstated purpose is a first delivery, which is what the envelope-only path submits")
+
+	// And nothing else was asked of the broker.
+	assert.Equal(t, []string{"blnk.transactions"}, transport.requestedMetadataTopics(),
+		"the only metadata lookup must be for the destination topic")
+	assert.Empty(t, transport.unexpectedRequests(),
+		"a publish must issue only metadata and produce requests")
+}
+
+// TestEventPublisher_MessageValueSplicesThePayloadBytesVerbatim is the byte-fidelity
+// guarantee, asserted on the wire.
+//
+// LedgerEvent.Payload is typed json.RawMessage precisely so the stored bytes pass through
+// untransformed, and two acceptance criteria rest on that: V-8 requires the Kafka message and
+// the legacy webhook body to be identical during the dual-delivery window, and V-9 requires a
+// replayed dead-lettered event to match the original byte for byte. Both are only achievable
+// if the payload is SPLICED into the envelope rather than re-marshalled.
+//
+// The proof is constructive rather than assumed: the same envelope is also produced by
+// marshalling the struct, and the two are asserted to DIFFER. If splicing were replaced by a
+// struct marshal, the difference would vanish and this test would fail on that assertion —
+// which is what stops it from passing for both implementations.
+func TestEventPublisher_MessageValueSplicesThePayloadBytesVerbatim(t *testing.T) {
+	transport := newPublisherFakeTransport()
+	publisher := publisherWithFakeTransport(t, transport)
+
+	// The event name is a literal rather than a constant because model declares constants
+	// only for the transaction family and the two repeatable names; "identity.created" is
+	// spelled the same way the event catalogue in event_topics_test.go spells it.
+	event := publisherEvent(publisherIdentityEventType, "idt_publisher_wire", publisherAdversarialPayload)
+
+	require.NoError(t, publisher.Publish(context.Background(), event))
+
+	_, record := transport.onlyRecord(t)
+
+	assert.True(t, bytes.Contains(record.Value, []byte(publisherAdversarialPayload)),
+		"the payload bytes must appear in the message verbatim: HTML characters unescaped, "+
+			"insignificant whitespace intact and the 2^53+1 integer unrounded")
+
+	// The payload is reachable as the envelope's payload member, byte-identical.
+	var envelope struct {
+		EventID       string          `json:"event_id"`
+		EventType     string          `json:"event_type"`
+		AggregateID   string          `json:"aggregate_id"`
+		Payload       json.RawMessage `json:"payload"`
+		SchemaVersion int             `json:"schema_version"`
+	}
+	require.NoError(t, json.Unmarshal(record.Value, &envelope),
+		"the spliced envelope must still be valid JSON")
+	assert.Equal(t, publisherAdversarialPayload, string(envelope.Payload),
+		"the payload member must be the stored bytes and nothing else")
+	assert.Equal(t, event.EventID, envelope.EventID,
+		"event_id is the subscriber idempotency key and must survive serialisation")
+	assert.Equal(t, publisherIdentityEventType, envelope.EventType)
+	assert.Equal(t, "idt_publisher_wire", envelope.AggregateID)
+	assert.Equal(t, model.SchemaVersionV1, envelope.SchemaVersion)
+
+	// The counter-example: marshalling the struct produces different bytes, so a message
+	// equal to the spliced form cannot have been produced that way.
+	remarshalled, err := json.Marshal(event)
+	require.NoError(t, err)
+	assert.NotEqual(t, remarshalled, record.Value,
+		"a struct marshal escapes < > & and compacts whitespace, so it cannot equal the spliced "+
+			"envelope; if these are equal the payload is no longer being spliced")
+	assert.NotContains(t, string(remarshalled), publisherAdversarialPayload,
+		"which is exactly why re-marshalling would break the dual-delivery and replay guarantees")
+}
+
+// ---------------------------------------------------------------------------
+// Key derivation: the mechanism behind per-aggregate ordering
+// ---------------------------------------------------------------------------
+
+// publisherMustPublish publishes one request and requires it to succeed, returning the
+// result.
+//
+// Parameters:
+//   - publisher *kafkaPublisher: the publisher to write through.
+//   - request PublishRequest: the request to publish.
+//
+// Returns:
+//   - PublishResult: the successful result.
+func publisherMustPublish(t *testing.T, publisher *kafkaPublisher, request PublishRequest) PublishResult {
+	t.Helper()
+
+	result, err := publisher.PublishToTopic(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, result.Dispatched())
+
+	return result
+}
+
+// TestEventPublisher_OneLedgerIsOneKeyAndOnePartition is the property acceptance criterion
+// V-6 is decided by, asserted at the only place it is actually decided: the message on the
+// wire.
+//
+// Kafka orders within a PARTITION and nowhere else, so per-aggregate ordering exists only if
+// every event sharing an aggregate shares a partition — which is exactly what a stable hash
+// over a shared key produces. Two events with the same ledger id must therefore carry the
+// same key AND land on the same partition, whatever else differs between them: different
+// event types, different aggregate ids, different payloads.
+//
+// The converse is asserted too, and it is not symmetry for its own sake. If different keys
+// could never land on different partitions the first assertion would hold vacuously — a
+// balancer that ignored the key entirely, or a single-partition topic, would satisfy it — so
+// a key known to hash elsewhere is published and required to land elsewhere. That is what
+// makes this a test of the key's INFLUENCE rather than of its constancy.
+//
+// It mirrors the precedent the repository already set: the transaction queue shards by
+// hashing the source balance id so that work for one pair stays on one lane. This is the same
+// idea applied to the transport that now carries the events.
+func TestEventPublisher_OneLedgerIsOneKeyAndOnePartition(t *testing.T) {
+	transport := newPublisherFakeTransport()
+	publisher := publisherWithFakeTransport(t, transport)
+
+	// Two DIFFERENT aggregates, in the same ledger, with different event types.
+	first := publisherEvent(model.EventTypeTransactionQueued, "txn_publisher_first", publisherPayload)
+	second := publisherEvent(model.EventTypeTransactionApplied, "txn_publisher_second", publisherPayload)
+
+	firstResult := publisherMustPublish(t, publisher, PublishRequest{Event: first, Key: publisherLedgerID})
+	secondResult := publisherMustPublish(t, publisher, PublishRequest{Event: second, Key: publisherLedgerID})
+
+	assert.Equal(t, publisherLedgerID, firstResult.PartitionKey)
+	assert.Equal(t, firstResult.PartitionKey, secondResult.PartitionKey)
+
+	batches := transport.producedBatches()
+	require.Len(t, batches, 2)
+	assert.Equal(t, batches[0].Records[0].Key, batches[1].Records[0].Key,
+		"two events in one ledger must be keyed identically")
+	assert.Equal(t, batches[0].Partition, batches[1].Partition,
+		"and must therefore land on ONE partition, because Kafka orders within a partition only")
+
+	// A different ledger: a different key, and — for a key chosen to hash elsewhere — a
+	// different partition.
+	elsewhere := publisherKeyOnAnotherPartition(t, publisherLedgerID)
+	third := publisherEvent(model.EventTypeTransactionApplied, "txn_publisher_third", publisherPayload)
+	thirdResult := publisherMustPublish(t, publisher, PublishRequest{Event: third, Key: elsewhere})
+
+	assert.NotEqual(t, publisherLedgerID, thirdResult.PartitionKey)
+
+	batches = transport.producedBatches()
+	require.Len(t, batches, 3)
+	assert.NotEqual(t, batches[0].Records[0].Key, batches[2].Records[0].Key,
+		"a different ledger must produce a different key")
+	assert.NotEqual(t, batches[0].Partition, batches[2].Partition,
+		"and the key must actually drive placement: if every key landed on one partition, the "+
+			"ordering assertion above would hold for a balancer that ignored the key")
+
+	// A second ledger id spelled out, for the plain statement of the rule.
+	fourth := publisherEvent(model.EventTypeTransactionApplied, "txn_publisher_fourth", publisherPayload)
+	fourthResult := publisherMustPublish(t, publisher, PublishRequest{Event: fourth, Key: publisherOtherLedgerID})
+	assert.Equal(t, publisherOtherLedgerID, fourthResult.PartitionKey)
+	assert.NotEqual(t, firstResult.PartitionKey, fourthResult.PartitionKey)
+}
+
+// TestEventPublisher_KeyIsNeverEmptyForAnyCatalogueEventType walks the WHOLE event catalogue
+// and requires every one of the thirteen event strings to reach the broker with a key.
+//
+// An empty key is the one failure mode here that nothing reports: kafka-go treats a nil key
+// as absent and the balancer spreads the message across partitions, so ordering is lost
+// quietly, with no error, no log line and no metric — and it is lost for the aggregate whose
+// events were spread, which is a correctness property of the ledger rather than a delivery
+// inconvenience.
+//
+// Both rungs of the documented fallback chain are exercised for every event type: the
+// supplied partition key, which is what PublishRequestFromOutbox provides from the stored
+// row, and the aggregate id, which is what the envelope-only Publish path falls back to. The
+// runtime-composed bulk family and system.error are included by construction, because the
+// catalogue is the source of the list rather than a hand-written subset of it — and the
+// composed bulk name is additionally published, since that family's names never appear as
+// literals anywhere.
+func TestEventPublisher_KeyIsNeverEmptyForAnyCatalogueEventType(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	eventTypes := catalogueEventTypes()
+	require.Len(t, eventTypes, eventCatalogueSize,
+		"every event string Blnk emits must be covered; a fourteenth arriving without a catalogue "+
+			"row would otherwise be published unkeyed with nothing to say so")
+
+	// A name composed at runtime the way transaction_bulk.go composes it — the literal
+	// prefix plus the batch status, of which "failed" is one that reaches it — so the family
+	// is covered as a family and not only through its one catalogued member. Its names never
+	// appear as literals in the producer, so nothing else can cover it.
+	eventTypes = append(eventTypes, "bulk_transaction.failed")
+
+	for _, eventType := range eventTypes {
+		t.Run(eventType, func(t *testing.T) {
+			aggregateID := "agg_" + strings.ReplaceAll(eventType, ".", "_")
+
+			t.Run("keyed by the stored partition key", func(t *testing.T) {
+				transport := newPublisherFakeTransport()
+				publisher := publisherWithFakeTransport(t, transport)
+
+				event := publisherEvent(eventType, aggregateID, publisherPayload)
+				result := publisherMustPublish(t, publisher, PublishRequest{
+					Event: event,
+					Topic: TopicForEvent(eventType),
+					Key:   publisherLedgerID,
+				})
+
+				_, record := transport.onlyRecord(t)
+				assert.Equal(t, publisherLedgerID, result.PartitionKey)
+				assert.Equal(t, []byte(publisherLedgerID), record.Key,
+					"the stored key must reach the wire for %q", eventType)
+				assert.NotEmpty(t, record.Key)
+			})
+
+			t.Run("falling back to the aggregate when no key is supplied", func(t *testing.T) {
+				transport := newPublisherFakeTransport()
+				publisher := publisherWithFakeTransport(t, transport)
+
+				event := publisherEvent(eventType, aggregateID, publisherPayload)
+
+				// The envelope-only path: no topic, no key, no attempt — exactly what the
+				// mandated Publish method submits.
+				require.NoError(t, publisher.Publish(context.Background(), event))
+
+				_, record := transport.onlyRecord(t)
+				assert.Equal(t, []byte(aggregateID), record.Key,
+					"with no stored key, %q must still be pinned to one partition by its aggregate", eventType)
+				assert.NotEmpty(t, record.Key,
+					"a keyless message is spread across partitions, which discards ordering silently")
+			})
+		})
+	}
+}
+
+// TestEventPublisher_AnEventBelongingToNothingIsWrittenUnkeyed is the deliberate exception,
+// asserted so that it stays deliberate.
+//
+// An event with neither a partition key nor an aggregate — an internal error notification, for
+// instance — has nothing to be ordered against, and pinning every such event to one partition
+// would only create a hot spot. The key must then be NIL rather than an empty slice, because
+// Murmur2 (like the Java partitioner it reproduces) treats a nil key as absent and spreads the
+// message, while an empty non-nil slice is a defined value that hashes to one fixed partition.
+//
+// This case is unreachable for an outbox-backed event: the partition key column is NOT NULL
+// with a non-blank CHECK, and PrepareEventOutbox has its own fallback chain.
+func TestEventPublisher_AnEventBelongingToNothingIsWrittenUnkeyed(t *testing.T) {
+	transport := newPublisherFakeTransport()
+	publisher := publisherWithFakeTransport(t, transport)
+
+	event := publisherEvent(model.EventTypeSystemError, "", publisherPayload)
+
+	result := publisherMustPublish(t, publisher, PublishRequest{Event: event})
+
+	assert.Empty(t, result.PartitionKey,
+		"an event belonging to neither a ledger nor an aggregate has no key to report")
+
+	_, record := transport.onlyRecord(t)
+	assert.Nil(t, record.Key,
+		"the key must be nil, not empty: an empty slice is a defined value that would pin every "+
+			"such event to one partition")
+}
+
+// ---------------------------------------------------------------------------
+// Graceful degradation: the no-broker steady state
+// ---------------------------------------------------------------------------
+
+// TestNoOpPublisher_IsSelectedWhenNoBrokersAreConfigured is the single most load-bearing test
+// in this file, because it protects code that has nothing to do with Kafka.
+//
+// # Why an unconfigured deployment must not be an error
+//
+// Blnk has always been able to run with no notification sink: SendWebhook returns nil without
+// enqueuing anything when no webhook URL is configured (webhooks.go), so a deployment with no
+// subscriber is a supported configuration rather than a broken one. The Kafka publisher
+// reproduces that contract exactly — no brokers means the no-op and a NIL ERROR — and the
+// consequences of getting it wrong reach far outside this feature:
+//
+//   - webhooks_test.go calls NewBlnk(nil) with only Redis.Dns configured, and
+//     TestHTTPClientConfiguration does so with nothing else configured at all. NewBlnk builds
+//     the event publisher on that path, so a constructor that errored, dialled or blocked on an
+//     empty broker list would break a large part of the root test suite for reasons unrelated
+//     to what those tests assert.
+//   - Every existing production deployment that does not run Kafka would fail to start.
+//
+// The no-broker state is a legitimate steady state, not a degraded one. Every way of arriving
+// at it is asserted, because they are all reachable: a process whose configuration has not
+// been loaded, a deployment that never sets KAFKA_BROKERS, and an environment file whose stray
+// separator or trailing comma leaves whitespace-only entries behind.
+func TestNoOpPublisher_IsSelectedWhenNoBrokersAreConfigured(t *testing.T) {
+	testCases := []struct {
+		name          string
+		configuration *config.Configuration
+	}{
+		{
+			name:          "a nil configuration, from a process whose configuration was never loaded",
+			configuration: nil,
+		},
+		{
+			name:          "no Kafka block at all, which is every deployment that does not run Kafka",
+			configuration: &config.Configuration{},
+		},
+		{
+			name:          "an explicitly empty broker list",
+			configuration: &config.Configuration{Kafka: config.KafkaConfig{Brokers: []string{}}},
+		},
+		{
+			name:          "a whitespace-only broker, from a stray separator in an environment file",
+			configuration: &config.Configuration{Kafka: config.KafkaConfig{Brokers: []string{"   "}}},
+		},
+		{
+			name: "empty entries left by a trailing comma and a stray newline",
+			configuration: &config.Configuration{Kafka: config.KafkaConfig{
+				Brokers: []string{"", "\t", "\n"},
+			}},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			started := time.Now()
+			publisher, err := NewEventPublisher(testCase.configuration)
+			elapsed := time.Since(started)
+
+			require.NoError(t, err,
+				"the absence of Kafka must never be reported as an error, or every deployment "+
+					"without a broker fails to start")
+			require.NotNil(t, publisher,
+				"the publisher must never be nil, so no caller needs a nil branch")
+			assert.IsType(t, &NoopEventPublisher{}, publisher,
+				"an empty broker list must select the no-op implementation")
+			assert.True(t, IsNoopEventPublisher(publisher),
+				"and that choice must be observable, because startup validation asserts it")
+
+			assert.Less(t, elapsed, publisherConstructionBudget,
+				"selecting the no-op must be immediate: nothing may be dialled or resolved")
+
+			assert.NoError(t, publisher.Publish(context.Background(), model.LedgerEvent{}),
+				"the no-op accepts an event and reports success, exactly as SendWebhook did with "+
+					"no webhook URL configured")
+		})
+	}
+}
+
+// TestEventPublisher_ConstructionPerformsNoDialAndNoNameResolution proves the no-I/O property
+// for the CONFIGURED case too, which is the half that could regress unnoticed.
+//
+// The no-op path obviously touches no network. The Kafka path is the interesting one: it
+// builds a transport, prepares SASL credentials and creates a writer per owned topic, and
+// every one of those is pure computation — kafka.TCP only canonicalises address strings, a
+// SCRAM mechanism is arithmetic over the credential, and a kafka.Writer connects lazily on its
+// first write. If any of it became eager, NewBlnk would start depending on a reachable broker
+// on every process start and in every test that constructs a Blnk instance.
+//
+// The two broker addresses are chosen so that eagerness cannot hide. broker.publisher-test.invalid
+// uses the .invalid TLD, which RFC 2606 guarantees never resolves, so a construction that
+// resolved names would fail or wait on a resolver timeout. 198.51.100.1 is TEST-NET-2 from RFC
+// 5737, routed nowhere, so a construction that dialled would hang until the transport's
+// five-second dial timeout — well past the budget asserted here. The writer statistics are then
+// read as a direct statement of the same fact: zero dials, zero writes, zero errors.
+func TestEventPublisher_ConstructionPerformsNoDialAndNoNameResolution(t *testing.T) {
+	kafkaConfig := config.KafkaConfig{
+		Brokers:     []string{publisherUnresolvableBroker, publisherBlackholeBroker},
+		TopicPrefix: DefaultTopicPrefix,
+		// The transport refuses a plaintext broker without this acknowledgement, because SASL
+		// over plaintext puts the credential on the wire in the clear. Nothing here dials, so
+		// the acknowledgement is the honest way to reach a constructed publisher rather than a
+		// reason to weaken the refusal.
+		InsecureLocalDev: true,
+	}
+	storeKafkaConfig(t, kafkaConfig)
+
+	started := time.Now()
+	publisher, err := NewEventPublisher(&config.Configuration{Kafka: kafkaConfig})
+	elapsed := time.Since(started)
+
+	require.NoError(t, err, "a configured broker list must build a publisher without contacting it")
+	require.IsType(t, &kafkaPublisher{}, publisher,
+		"a configured broker list must select the Kafka implementation, not the no-op")
+	assert.False(t, IsNoopEventPublisher(publisher))
+
+	kafkaBacked, isKafkaBacked := publisher.(*kafkaPublisher)
+	require.True(t, isKafkaBacked)
+	t.Cleanup(func() {
+		if closeErr := kafkaBacked.Close(); closeErr != nil {
+			t.Logf("failed to close the publisher: %v", closeErr)
+		}
+	})
+
+	assert.Less(t, elapsed, publisherConstructionBudget,
+		"construction must be pure computation; a dial to TEST-NET-2 would hang for the "+
+			"transport's five-second dial timeout and a name lookup for a .invalid host would "+
+			"wait on the resolver")
+
+	writers := publisherWriterSnapshot(kafkaBacked)
+	require.Len(t, writers, len(AllTopicsWithDeadLetters()),
+		"every owned topic must have a writer, all of them built without I/O")
+
+	for topic, writer := range writers {
+		stats := writer.Stats()
+		assert.Zero(t, stats.Dials, "writer for %q must not have dialled during construction", topic)
+		assert.Zero(t, stats.Writes, "writer for %q must not have written during construction", topic)
+		assert.Zero(t, stats.Errors, "writer for %q must not have failed during construction", topic)
+	}
+}
+
+// TestNoOpPublisher_PublishesNothingAndFailsNothing pins the no-op's whole observable
+// behaviour.
+//
+// The I/O claim is proved with a CANCELLED context, which is the strongest statement available
+// without a broker to not-contact: any implementation that performed a network call would fail
+// on it, so returning success is evidence that nothing was attempted. The same reasoning covers
+// the invalid payload — a publisher that serialised the event would reject bytes that are not
+// JSON, and this one has nothing to serialise.
+//
+// Its lifecycle is asserted for the same reason blnk.go's shutdown path can stay simple: Close
+// is idempotent and nil-safe, and a nil publisher counts as a no-op, because a publisher that
+// publishes nothing and one that does not exist have identical observable behaviour.
+func TestNoOpPublisher_PublishesNothingAndFailsNothing(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	publisher := NewNoopEventPublisher()
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assert.NoError(t, publisher.Publish(cancelled, model.LedgerEvent{}),
+		"the no-op must succeed even on a cancelled context: a real network call could not")
+	assert.NoError(t, publisher.Publish(
+		cancelled,
+		publisherEvent(model.EventTypeTransactionApplied, "txn_noop", publisherPayload),
+	))
+	assert.NoError(t, publisher.Publish(context.Background(), model.LedgerEvent{
+		EventID:   uuid.NewString(),
+		EventType: model.EventTypeTransactionApplied,
+		Payload:   json.RawMessage(`{"not":`),
+	}), "nothing is serialised, so even a payload no broker would accept is discarded cleanly")
+
+	// The fuller contract is satisfied too, so a relay or dead-letter writer holding a no-op
+	// needs no special case.
+	result, err := publisher.PublishToTopic(cancelled, PublishRequest{
+		Event: publisherEvent(model.EventTypeTransactionApplied, "txn_noop", publisherPayload),
+		Key:   publisherLedgerID,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, model.PublishStatusDispatched, result.Status,
+		"with no broker configured there is nothing to fail against, so the result is dispatched")
+	assert.True(t, result.Dispatched())
+	assert.Equal(t, "blnk.transactions", result.Topic,
+		"the request's topic is resolved through the same fallback the Kafka path uses")
+	assert.Equal(t, publisherLedgerID, result.PartitionKey)
+	assert.Equal(t, 1, result.Attempt)
+	assert.Equal(t, PublishPurposeOriginal, result.Purpose)
+	assert.Zero(t, result.Duration, "nothing was dispatched, so nothing took any time")
+
+	assert.NoError(t, publisher.Close())
+	assert.NoError(t, publisher.Close(), "Close must be idempotent")
+
+	var unassigned *NoopEventPublisher
+	assert.NoError(t, unassigned.Close(),
+		"Close must be nil-safe, which is what lets the Blnk shutdown path stay nil-guarded")
+	assert.True(t, IsNoopEventPublisher(nil),
+		"a nil publisher publishes nothing, which is the same observable behaviour as the no-op")
+}
+
+// ---------------------------------------------------------------------------
+// PublishResult: what one attempt reports
+// ---------------------------------------------------------------------------
+
+// TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt covers the status vocabulary a
+// single attempt can report, and why the distinctions in it exist.
+//
+// PublishResult is the observability record requirement R-3 asks for, and it is consumed by two
+// audiences that need different things: the relay reads the classification to decide whether
+// another attempt is worth making, and the metrics layer reads the status verbatim as the
+// outcome attribute of the publish-attempts counter. Both break in the same way if a failure is
+// described imprecisely.
+//
+// The four cases below are the four an attempt can actually be in, and the two failure axes are
+// deliberately independent:
+//
+//   - TRANSIENT says what the failure LOOKED like — a leader election in flight, a broker that
+//     is down, a timeout.
+//   - RETRYABLE says whether anything further will actually be tried, which is transient AND
+//     budget remaining.
+//
+// They differ exactly on the last permitted attempt, and that is the case an operator most needs
+// to see: reporting it as "retrying" describes retry pressure that no longer exists and makes a
+// permanently-stuck event indistinguishable from a busy one on the attempts counter.
+//
+// The retry SCHEDULE — base delay, multiplier, cap, attempt count — is the relay's and is
+// asserted in event_relay_test.go. Nothing here sleeps or loops.
+func TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt(t *testing.T) {
+	t.Run("a broker acknowledgement is dispatched", func(t *testing.T) {
+		transport := newPublisherFakeTransport()
+		publisher := publisherWithFakeTransport(t, transport)
+
+		event := publisherEvent(model.EventTypeTransactionApplied, "txn_dispatched", publisherPayload)
+		result, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+			Event:       event,
+			Key:         publisherLedgerID,
+			Attempt:     1,
+			MaxAttempts: 5,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, model.PublishStatusDispatched, result.Status)
+		assert.True(t, result.Dispatched(), "Dispatched must read the status, so success has one definition")
+		assert.NoError(t, result.Err)
+		assert.False(t, result.Transient, "a success has no failure to classify")
+		assert.False(t, result.Retryable, "and nothing to retry")
+		assert.Equal(t, 5, result.MaxAttempts,
+			"the stated budget must be carried through, so a log line can say 'attempt 1 of 5'")
+		assert.GreaterOrEqual(t, result.Duration, time.Duration(0))
+	})
+
+	t.Run("a transient failure inside the budget is retrying", func(t *testing.T) {
+		transport := newPublisherFakeTransport().failProduceWith(kafka.LeaderNotAvailable)
+		publisher := publisherWithFakeTransport(t, transport)
+
+		event := publisherEvent(model.EventTypeTransactionApplied, "txn_retrying", publisherPayload)
+		result, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+			Event:       event,
+			Key:         publisherLedgerID,
+			Attempt:     2,
+			MaxAttempts: 5,
+		})
+
+		require.Error(t, err, "an unacknowledged write must be reported, never swallowed")
+		assert.Equal(t, model.PublishStatusRetrying, result.Status,
+			"a leader election in flight is the textbook recoverable failure")
+		assert.True(t, result.Transient)
+		assert.True(t, result.Retryable, "attempt 2 of 5 leaves budget, so another attempt is possible")
+		assert.False(t, result.Dispatched())
+		assert.Equal(t, err, result.Err,
+			"the returned error and the result's error must be the same value, so a caller may branch on either")
+
+		// The classification must also be readable from the error alone, because the mandated
+		// Publish signature narrows the result away.
+		assert.True(t, IsTransientPublishError(err))
+
+		var publishErr *PublishError
+		require.ErrorAs(t, err, &publishErr, "the error must be the typed publish error")
+		assert.Equal(t, 2, publishErr.Attempt)
+		assert.Equal(t, event.EventID, publishErr.EventID)
+		assert.True(t, publishErr.Transient)
+
+		// And the underlying broker failure must remain reachable through the wrapper, which is
+		// what lets a caller inspect the real cause.
+		var writeErrors kafka.WriteErrors
+		require.ErrorAs(t, err, &writeErrors,
+			"Unwrap must expose the library's own error rather than replacing it")
+		assert.Equal(t, 1, writeErrors.Count())
+
+		// The write did reach the broker — it was refused, not skipped.
+		batch, record := transport.onlyRecord(t)
+		assert.EqualValues(t, kafka.RequireAll, batch.Acks)
+		assert.Equal(t, []byte(publisherLedgerID), record.Key)
+	})
+
+	t.Run("a transient failure on the last permitted attempt is failed", func(t *testing.T) {
+		transport := newPublisherFakeTransport().failProduceWith(kafka.LeaderNotAvailable)
+		publisher := publisherWithFakeTransport(t, transport)
+
+		event := publisherEvent(model.EventTypeTransactionApplied, "txn_exhausted", publisherPayload)
+		result, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+			Event:       event,
+			Key:         publisherLedgerID,
+			Attempt:     5,
+			MaxAttempts: 5,
+		})
+
+		require.Error(t, err)
+		assert.Equal(t, model.PublishStatusFailed, result.Status,
+			"the attempt that spent the budget is failed, not retrying: nothing further will be tried "+
+				"and reporting otherwise hides a stuck event among the busy ones")
+		assert.True(t, result.Transient,
+			"the failure still LOOKED recoverable, which is a different question from whether "+
+				"anything more will be attempted")
+		assert.False(t, result.Retryable)
+		assert.Equal(t, 5, result.MaxAttempts)
+	})
+
+	t.Run("a permanent failure is failed whatever the budget says", func(t *testing.T) {
+		transport := newPublisherFakeTransport().failProduceWith(kafka.TopicAuthorizationFailed)
+		publisher := publisherWithFakeTransport(t, transport)
+
+		event := publisherEvent(model.EventTypeTransactionApplied, "txn_permanent", publisherPayload)
+		result, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+			Event:       event,
+			Key:         publisherLedgerID,
+			Attempt:     1,
+			MaxAttempts: 5,
+		})
+
+		require.Error(t, err)
+		assert.Equal(t, model.PublishStatusFailed, result.Status)
+		assert.False(t, result.Transient,
+			"an unauthorised principal is not a condition another attempt can change")
+		assert.False(t, result.Retryable,
+			"so the whole budget must not be spent establishing what is already known")
+		assert.False(t, IsTransientPublishError(err))
+	})
+}
+
+// ---------------------------------------------------------------------------
+// The three instruments one publish records
+// ---------------------------------------------------------------------------
+
+// TestEventPublisher_RecordsThePublishInstruments asserts the observability the plan specifies,
+// with the attribute sets the instrument declarations in internal/metrics document.
+//
+// Each of the three carries a specific operational weight, which is why the attributes are
+// asserted as whole SETS rather than probed key by key — an extra attribute is as much of a
+// defect as a missing one, since a histogram multiplies its label cardinality by its bucket
+// count:
+//
+//   - EventsPublishedTotal is the DENOMINATOR of the dead-letter rate that acceptance criterion
+//     V-3 is stated against (dead-lettered over published, under 0.1%). If it is not incremented
+//     on a successful publish, that rate is undefined while every dashboard still renders.
+//   - EventPublishAttemptsTotal makes retry pressure visible independently of delivery volume,
+//     and its outcome vocabulary is the model.PublishStatus values, reused rather than
+//     redeclared so the code and the label set cannot drift.
+//   - EventPublishDuration is where criterion V-1's sub-two-second p99 is read from, and the
+//     instrument's declaration states that query as {attempt="1",outcome="dispatched"}. Both
+//     attributes must therefore be present, or the population the target is stated over cannot
+//     be selected at all.
+//
+// The envelope-only Publish method is used deliberately: it submits a request with no topic, no
+// key, no attempt and no purpose, so the recorded attributes are the ones the fallbacks produce
+// — which is the path every domain call site takes.
+func TestEventPublisher_RecordsThePublishInstruments(t *testing.T) {
+	instruments := publisherCaptureInstruments(t)
+	transport := newPublisherFakeTransport()
+	publisher := publisherWithFakeTransport(t, transport)
+
+	event := publisherEvent(model.EventTypeTransactionApplied, "txn_publisher_metrics", publisherPayload)
+	require.NoError(t, publisher.Publish(context.Background(), event))
+
+	published := instruments.published.snapshot()
+	require.Len(t, published, 1,
+		"a successful publish must increment the published-events counter exactly once; without it "+
+			"the dead-letter rate has no denominator")
+	assert.EqualValues(t, 1, published[0].value)
+	assert.Equal(t, map[string]string{
+		"topic":      "blnk.transactions",
+		"event_type": "transaction.applied",
+	}, published[0].attributes,
+		"published events are attributed by topic and event type, and by nothing else")
+
+	attempts := instruments.attempts.snapshot()
+	require.Len(t, attempts, 1, "exactly one attempt was made, so exactly one is counted")
+	assert.EqualValues(t, 1, attempts[0].value)
+	assert.Equal(t, map[string]string{"outcome": string(model.PublishStatusDispatched)}, attempts[0].attributes,
+		"the outcome vocabulary is model.PublishStatus, reused rather than redeclared")
+
+	duration := instruments.duration.snapshot()
+	require.Len(t, duration, 1)
+	assert.Equal(t, map[string]string{
+		"topic":   "blnk.transactions",
+		"attempt": "1",
+		"outcome": string(model.PublishStatusDispatched),
+	}, duration[0].attributes,
+		"the latency target is read from {attempt=\"1\",outcome=\"dispatched\"}, so both attributes "+
+			"must be recorded or that query matches nothing")
+	assert.GreaterOrEqual(t, duration[0].value, 0.0, "the duration is recorded in seconds")
+	assert.Less(t, duration[0].value, publisherConstructionBudget.Seconds(),
+		"an in-memory publish cannot plausibly take longer than this")
+}
+
+// TestEventPublisher_KeepsRetriedAndReplayedPublishesOutOfTheFirstAttemptPopulation is the other
+// half of the latency contract: the population the p99 is read from must contain first
+// deliveries and nothing else.
+//
+// Three cases would contaminate it if the attempt attribute were derived from the attempt number
+// alone, and each is asserted here:
+//
+//   - A RETRY is a genuine attempt in a retry sequence and gets its number, so it is visible but
+//     separable.
+//   - A REPLAY is an operator-triggered re-publication of a dead-lettered event. It is not part
+//     of any retry sequence — the sequence it belonged to ended — so it carries the fixed
+//     "replay" token instead of a number, and it must NOT increment the published-events
+//     counter: doing so would make the dead-letter rate depend on how much triage happened that
+//     day rather than on how the pipeline behaved.
+//   - A FAILED attempt is recorded on the duration histogram too, under its own outcome. A broker
+//     that times out is precisely when latency data matters, and the outcome attribute is what
+//     keeps those observations out of the success population.
+func TestEventPublisher_KeepsRetriedAndReplayedPublishesOutOfTheFirstAttemptPopulation(t *testing.T) {
+	t.Run("a retry carries its attempt number", func(t *testing.T) {
+		instruments := publisherCaptureInstruments(t)
+		publisher := publisherWithFakeTransport(t, newPublisherFakeTransport())
+
+		publisherMustPublish(t, publisher, PublishRequest{
+			Event:       publisherEvent(model.EventTypeTransactionApplied, "txn_retry_label", publisherPayload),
+			Key:         publisherLedgerID,
+			Attempt:     3,
+			MaxAttempts: 5,
+		})
+
+		duration := instruments.duration.snapshot()
+		require.Len(t, duration, 1)
+		assert.Equal(t, "3", duration[0].attributes["attempt"],
+			"a third attempt must be reported as such, so first-attempt latency stays readable alone")
+		assert.EqualValues(t, 1, instruments.published.total(),
+			"a retried delivery is still a first delivery of the event, so it counts once")
+	})
+
+	t.Run("a replay is neither counted as a delivery nor labelled with an attempt number", func(t *testing.T) {
+		instruments := publisherCaptureInstruments(t)
+		publisher := publisherWithFakeTransport(t, newPublisherFakeTransport())
+
+		publisherMustPublish(t, publisher, PublishRequest{
+			Event:   publisherEvent(model.EventTypeTransactionApplied, "txn_replay_label", publisherPayload),
+			Key:     publisherLedgerID,
+			Attempt: 1,
+			Purpose: PublishPurposeReplay,
+		})
+
+		assert.Zero(t, instruments.published.total(),
+			"a replay must not inflate the denominator of the dead-letter rate")
+
+		duration := instruments.duration.snapshot()
+		require.Len(t, duration, 1)
+		assert.Equal(t, "replay", duration[0].attributes["attempt"],
+			"a replay belongs to no retry sequence, so it gets a fixed token rather than a number")
+
+		attempts := instruments.attempts.snapshot()
+		require.Len(t, attempts, 1,
+			"a replay is still an attempt: it is visible on the attempts counter, which is where "+
+				"re-delivery belongs")
+	})
+
+	t.Run("a dead-letter write is kept out of the delivery count as well", func(t *testing.T) {
+		instruments := publisherCaptureInstruments(t)
+		publisher := publisherWithFakeTransport(t, newPublisherFakeTransport())
+
+		publisherMustPublish(t, publisher, PublishRequest{
+			Event:   publisherEvent(model.EventTypeTransactionApplied, "txn_dlt_label", publisherPayload),
+			Topic:   DLTFor(TopicForEvent(model.EventTypeTransactionApplied)),
+			Key:     publisherLedgerID,
+			Attempt: 5,
+			Purpose: PublishPurposeDeadLetter,
+		})
+
+		assert.Zero(t, instruments.published.total(),
+			"counting a dead-letter write as a delivery would count one event twice")
+
+		duration := instruments.duration.snapshot()
+		require.Len(t, duration, 1)
+		assert.Equal(t, "blnk.transactions.dlt", duration[0].attributes["topic"])
+		assert.Equal(t, "dead_letter", duration[0].attributes["attempt"])
+	})
+
+	t.Run("a failed attempt is still measured, under its own outcome", func(t *testing.T) {
+		instruments := publisherCaptureInstruments(t)
+		publisher := publisherWithFakeTransport(t, newPublisherFakeTransport().failProduceWith(kafka.LeaderNotAvailable))
+
+		_, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+			Event:       publisherEvent(model.EventTypeTransactionApplied, "txn_failed_label", publisherPayload),
+			Key:         publisherLedgerID,
+			Attempt:     1,
+			MaxAttempts: 5,
+		})
+		require.Error(t, err)
+
+		assert.Zero(t, instruments.published.total(), "nothing was delivered, so nothing is counted as delivered")
+
+		attempts := instruments.attempts.snapshot()
+		require.Len(t, attempts, 1)
+		assert.Equal(t, string(model.PublishStatusRetrying), attempts[0].attributes["outcome"])
+
+		duration := instruments.duration.snapshot()
+		require.Len(t, duration, 1,
+			"a broker that refuses a write is exactly when latency data matters, so the observation "+
+				"is recorded rather than dropped")
+		assert.Equal(t, "1", duration[0].attributes["attempt"])
+		assert.Equal(t, string(model.PublishStatusRetrying), duration[0].attributes["outcome"],
+			"and its outcome keeps it out of the success population the p99 is read from")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: one writer, many publishers
+// ---------------------------------------------------------------------------
+
+// TestEventPublisher_ConcurrentPublishesShareOneWriterPerTopic is the property that makes
+// sharing a publisher safe, and it is the reason this file must be run under -race.
+//
+// The relay publishes a claimed batch concurrently over the publisher it was handed, so several
+// goroutines write through the SAME *kafka.Writer at once — which kafka-go explicitly supports
+// and which is how throughput is reached without one writer per event. What has to hold under
+// that load is not only that no publish is lost, but that the publisher's own bookkeeping is not
+// racing: the writer map is read on every publish and written only on lazy growth, the
+// retirement list is ordered, and the metric recorders are shared.
+//
+// So three things are asserted: every publish succeeds, every publish reaches the broker exactly
+// once, and the writer inventory is UNCHANGED afterwards — no lazy growth, no duplicate writer
+// for a topic two goroutines happened to publish to simultaneously. Several event types are used
+// so more than one writer is exercised at a time.
+func TestEventPublisher_ConcurrentPublishesShareOneWriterPerTopic(t *testing.T) {
+	transport := newPublisherFakeTransport()
+	publisher := publisherWithFakeTransport(t, transport)
+	instruments := publisherCaptureInstruments(t)
+
+	eventTypes := []string{
+		model.EventTypeTransactionApplied,
+		model.EventTypeTransactionQueued,
+		publisherIdentityEventType,
+		model.EventTypeBalanceMonitor,
+		model.EventTypeSystemError,
+	}
+
+	const goroutines, perGoroutine = 8, 5
+
+	var group sync.WaitGroup
+	failures := make(chan error, goroutines*perGoroutine)
+
+	for worker := 0; worker < goroutines; worker++ {
+		group.Add(1)
+
+		go func(worker int) {
+			defer group.Done()
+
+			for publish := 0; publish < perGoroutine; publish++ {
+				eventType := eventTypes[(worker+publish)%len(eventTypes)]
+				event := publisherEvent(
+					eventType,
+					fmt.Sprintf("agg_publisher_concurrent_%d_%d", worker, publish),
+					publisherPayload,
+				)
+
+				if err := publisher.Publish(context.Background(), event); err != nil {
+					failures <- err
+				}
+			}
+		}(worker)
+	}
+
+	group.Wait()
+	close(failures)
+
+	for err := range failures {
+		assert.NoError(t, err, "every concurrent publish must succeed over the shared writers")
+	}
+
+	assert.Len(t, transport.producedBatches(), goroutines*perGoroutine,
+		"every publish must reach the broker exactly once: a lost one is a lost event and a "+
+			"duplicated one is a double delivery")
+	assert.EqualValues(t, goroutines*perGoroutine, instruments.published.total(),
+		"and each must be counted once, which also exercises the shared instruments under load")
+
+	publisher.mu.RLock()
+	writers := len(publisher.writers)
+	lazy := len(publisher.lazyTopics)
+	publisher.mu.RUnlock()
+
+	assert.Equal(t, len(AllTopicsWithDeadLetters()), writers,
+		"concurrent publishing must not grow the writer cache; every destination was pre-created")
+	assert.Zero(t, lazy,
+		"and none of it may be recorded as lazy growth, which would churn the retirement bookkeeping "+
+			"on the hot path")
 }

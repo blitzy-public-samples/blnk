@@ -214,7 +214,7 @@ func (l *Blnk) updateTransactionDetails(ctx context.Context, transaction *model.
 
 // postTransactionActions performs post-processing actions for a transaction.
 // It starts a tracing span, queues the transaction and balance data for indexing in dependency order,
-// sends a webhook notification, and processes fund lineage if applicable.
+// captures the transaction's event in the transactional outbox, and processes fund lineage if applicable.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -246,8 +246,24 @@ func (l *Blnk) postTransactionActions(ctx context.Context, transaction *model.Tr
 			notification.NotifyError(err)
 		}
 
-		// Send webhook notification
-		err = l.SendWebhook(NewWebhook{
+		// PRODUCER CALL SITE for the seven status-derived transaction events. Only the
+		// TRANSPORT changed: the event string and the payload object are the same ones
+		// SendWebhook was handed, so the bytes recorded in the outbox are the bytes that
+		// used to be the HTTP body, and the relay delivers that one row over both
+		// transports during the dual-delivery window.
+		//
+		// getEventFromStatus is reused VERBATIM, which is what keeps all seven of its
+		// event names — including its documented fall-through of COMMIT to
+		// transaction.unknown. Do not "correct" that here: the dual-delivery comparison
+		// asserts both transports carry identical bytes, and changing one side of it
+		// would fail for a reason that has nothing to do with the transport.
+		//
+		// context.WithoutCancel mirrors monitorCtx in runTransactionPostCommitWorkWithHooks
+		// and is required, not cosmetic. This goroutine outlives the request or asynq task
+		// that spawned it, and PublishEvent writes the outbox row, so inheriting that
+		// cancellation would abort event capture the instant the response was written and
+		// lose the event. Trace context still propagates, so the capture stays in the trace.
+		err = l.PublishEvent(context.WithoutCancel(ctx), NewWebhook{
 			Event:   getEventFromStatus(transaction.Status),
 			Payload: transaction,
 		})

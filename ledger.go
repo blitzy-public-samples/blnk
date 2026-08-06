@@ -26,18 +26,26 @@ import (
 
 // postLedgerActions performs some actions after a ledger has been created.
 // It sends the newly created ledger to the search index queue, which indexes the ledger in Typesense.
-// It also sends a webhook notification.
+// It also captures a "ledger.created" event in the transactional outbox.
+//
+// The event capture is a transport substitution for the HTTP webhook push this used to
+// perform: the event name and the payload object are unchanged, and PublishEvent stores
+// exactly the body the webhook would have sent. It writes one pending outbox row and
+// returns without contacting a broker, so creating a ledger never waits on — or fails
+// because of — Kafka. The relay publishes that row and, during the dual-delivery window,
+// enqueues the legacy webhook task from the very same row. When no transport is
+// configured PublishEvent returns nil, preserving the previous no-op behaviour.
 //
 // Parameters:
-// - _ context.Context: The context for the operation (not used in this function).
+// - ctx context.Context: The context for the operation, forwarded to the event capture.
 // - ledger *model.Ledger: A pointer to the newly created Ledger model.
-func (l *Blnk) postLedgerActions(_ context.Context, ledger *model.Ledger) {
+func (l *Blnk) postLedgerActions(ctx context.Context, ledger *model.Ledger) {
 	go func() {
 		err := l.queue.queueIndexData(ledger.LedgerID, "ledgers", ledger)
 		if err != nil {
 			notification.NotifyError(err)
 		}
-		err = l.SendWebhook(NewWebhook{
+		err = l.PublishEvent(ctx, NewWebhook{
 			Event:   "ledger.created",
 			Payload: ledger,
 		})

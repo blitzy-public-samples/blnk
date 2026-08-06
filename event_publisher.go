@@ -1744,12 +1744,40 @@ func (p *kafkaPublisher) Publish(ctx context.Context, event model.LedgerEvent) e
 func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest) (PublishResult, error) {
 	started := time.Now()
 
+	// EVERY field is resolved through the same helpers the no-op uses, and the last two
+	// are not decoration: they are read by code below and in recordPublishAttempt.
+	//
+	// MaxAttempts is what lets fail() distinguish "this attempt failed and another will
+	// follow" from "this attempt spent the budget", which is the difference between
+	// retrying and failed on the attempts counter. Left unset it is always zero, so a
+	// terminal failure is reported as retry pressure that no longer exists.
+	//
+	// Purpose is read twice: the published-events counter below increments only for an
+	// ORIGINAL publish, and attemptLabel turns a replay or a dead-letter write into its
+	// own fixed attempt token. Left unset it is the empty string, which is neither
+	// PublishPurposeOriginal nor either of the other two — so the counter that is the
+	// denominator of the dead-letter rate would never increment at all, and a replay
+	// would be labelled with a retry-sequence attempt number it does not belong to.
 	result := PublishResult{
 		EventID:      req.Event.EventID,
 		EventType:    req.Event.EventType,
 		Topic:        resolveTopic(req),
 		PartitionKey: resolvePartitionKey(req),
 		Attempt:      resolveAttempt(req),
+		// RESOLVED HERE, on the same line of reasoning as the topic and the key above, and
+		// for the same reason the no-op resolves them: every one of the five is a request
+		// field with a documented fallback, and a result that omits one silently changes
+		// what the pipeline reports.
+		//
+		// These two in particular are load-bearing rather than cosmetic. The PURPOSE gates
+		// the EventsPublishedTotal increment below, which is the DENOMINATOR of the
+		// dead-letter rate; left at its zero value it never equals PublishPurposeOriginal,
+		// so the counter would never move and the rate would be undefined. The BUDGET is
+		// what lets fail() tell a failure that still has attempts left from the one that
+		// spent the last of them, and it is the "of 5" in the "attempt 3 of 5" that
+		// requirement R-4 requires on every attempt.
+		MaxAttempts: resolveMaxAttempts(req),
+		Purpose:     resolvePurpose(req),
 	}
 
 	// elapsed measures from the outbox claim when the relay supplied that instant, so
@@ -2384,9 +2412,20 @@ func recordPublishAttempt(ctx context.Context, result PublishResult) {
 	// attemptLabel and not strconv: the attribute sits on a HISTOGRAM, so its cardinality
 	// is multiplied by the bucket count and the domain has to stay closed at its eight
 	// declared values. See attemptLabel for the three inputs that would otherwise widen it.
+	//
+	// The OUTCOME accompanies the attempt, because the latency target is stated over
+	// first-attempt SUCCESSFUL publishes and the instrument's declaration in
+	// internal/metrics spells that query out as
+	// {attempt="1",outcome="dispatched"}. Recording the attempt alone would leave that
+	// query matching nothing at all, so the p99 the acceptance criterion is read from
+	// would be unreadable — while every dashboard still looked populated, because the
+	// series exist under a shorter label set. Its domain is the same closed
+	// model.PublishStatus vocabulary the attempts counter uses, so it adds no unbounded
+	// dimension.
 	metrics.EventPublishDuration.Record(ctx, result.Duration.Seconds(), otelmetric.WithAttributes(
 		attribute.String(publishAttrTopic, boundedTopicLabel(result.Topic)),
 		attribute.String(publishAttrAttempt, attemptLabel(result.Purpose, result.Attempt)),
+		attribute.String(publishAttrOutcome, string(result.Status)),
 	))
 }
 

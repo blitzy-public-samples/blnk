@@ -108,7 +108,56 @@ func (l *Blnk) logRollbackResult(batchID string, action string, err error) {
 	}
 }
 
-// sendBulkTransactionWebhook sends a webhook notification for a bulk transaction result
+// sendBulkTransactionWebhook captures the bulk_transaction.<status> event for a batch result.
+//
+// This is the producer call site for the bulk_transaction.* family, and the transport
+// beneath it is now the transactional outbox rather than the legacy webhook queue:
+// PublishEvent replaces SendWebhook and nothing else here changes. The relay claims the
+// row it writes, publishes it to blnk.transactions with bounded retry, dead-letters it to
+// blnk.transactions.dlt if the retry budget is spent, and — during the dual-delivery
+// window — enqueues the legacy webhook task from that same row. The event therefore still
+// reaches a webhook subscriber while the window lasts, which is why this function keeps
+// its name and its log message.
+//
+// THE PAYLOAD MAP IS PASSED THROUGH UNCHANGED, and every line of it above the call is
+// deliberately untouched. It is the reason this function reads as a transport
+// substitution: the same map value that used to be marshaled into the HTTP body is the
+// one PrepareEventOutbox marshals into the outbox payload column, so the two bodies
+// cannot differ. Re-shaping it into a struct, normalising its keys, or replacing
+// time.Now() with an injected clock would each break that equivalence — and the
+// dual-delivery byte-comparison that verifies it — while leaving the payload looking
+// perfectly reasonable.
+//
+// The map has THREE shapes, not one, and all three are part of the contract:
+//
+//	status != "failed"                   → batch_id, status, timestamp, transaction_count
+//	status == "failed", errorMsg != ""   → batch_id, status, timestamp, error
+//	status == "failed", errorMsg == ""   → batch_id, status, timestamp
+//
+// batch_id is what makes the family coherent downstream: it is the aggregate id the
+// outbox derives for a map payload, so the sequence of events describing one batch's
+// progress groups and orders by the batch it belongs to.
+//
+// The event string stays a RUNTIME CONCATENATION of "bulk_transaction." and the status.
+// This is the only event name in the catalogue with an open suffix set, and it is routed
+// by prefix in model.EventCategory precisely for that reason; spelling it as a lookup or
+// a format string would invite a literal that no longer shares the prefix, which would
+// misroute the event to the quarantine topic with nothing failing to say so.
+//
+// context.Background() is deliberate, and it is not laziness about threading a parameter.
+// Both callers run inside the async batch goroutine's 30-minute context, and the failure
+// caller reaches this line only AFTER a full batch rollback has run; inheriting a context
+// that a long rollback may have exhausted would abandon the durable capture of an outcome
+// that has already happened. The row must be written on the strength of the batch being
+// finished, not of its context still being alive.
+//
+// Parameters:
+//   - batchID string: the parent transaction id of the batch, and the event's aggregate.
+//   - status string: the batch outcome — "applied", "inflight" or "failed" today. It is
+//     both a payload field and the event name's suffix.
+//   - errorMsg string: the failure detail, including rollback status. Empty on success.
+//   - transactionCount int: the number of transactions in the batch. Omitted from the
+//     payload on the failure path, where callers pass 0.
 func (l *Blnk) sendBulkTransactionWebhook(batchID, status, errorMsg string, transactionCount int) {
 	// Create payload with or without error info depending on status
 	payload := map[string]interface{}{
@@ -127,7 +176,7 @@ func (l *Blnk) sendBulkTransactionWebhook(batchID, status, errorMsg string, tran
 		payload["error"] = errorMsg
 	}
 
-	err := l.SendWebhook(NewWebhook{
+	err := l.PublishEvent(context.Background(), NewWebhook{
 		Event:   "bulk_transaction." + status,
 		Payload: payload,
 	})

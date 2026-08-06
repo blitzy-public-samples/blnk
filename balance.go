@@ -52,7 +52,7 @@ func NewBalanceTracker() *model.BalanceTracker {
 
 // checkBalanceMonitors checks the balance monitors for a given updated balance.
 // It starts a tracing span, fetches the monitors, and checks each monitor's condition.
-// If a condition is met, it sends a webhook notification.
+// If a condition is met, it captures a balance.monitor event in the transactional outbox.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -74,7 +74,24 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 		if monitor.CheckCondition(updatedBalance) {
 			span.AddEvent(fmt.Sprintf("Condition met for balance: %s", monitor.MonitorID))
 			go func(monitor model.BalanceMonitor) {
-				err := l.SendWebhook(NewWebhook{
+				// PRODUCER CALL SITE FOR balance.monitor. SendWebhook became PublishEvent
+				// and nothing else changed: the event string and the payload object are the
+				// same ones the legacy transport received, so the outbox stores exactly the
+				// bytes that used to be the HTTP body and the two transports cannot diverge
+				// during the dual-delivery window. The event routes to blnk.balances, keyed
+				// on the monitored balance.
+				//
+				// The payload stays a model.BalanceMonitor BY VALUE, exactly as the
+				// goroutine parameter delivers it. Taking its address or wrapping it would
+				// re-shape the marshaled body and break that equivalence.
+				//
+				// ctx is passed through rather than detached because the only caller —
+				// runTransactionPostCommitWorkWithHooks in transaction_execution.go — already
+				// hands this function a context.WithoutCancel context before spawning its
+				// monitor goroutines. The publish therefore inherits the trace linkage
+				// without inheriting a cancellation that would abort the outbox insert once
+				// the originating request finished.
+				err := l.PublishEvent(ctx, NewWebhook{
 					Event:   "balance.monitor",
 					Payload: monitor,
 				})
@@ -190,7 +207,8 @@ func (l *Blnk) getOrCreateBalanceByIndicator(ctx context.Context, indicator, cur
 }
 
 // postBalanceActions performs some actions after a balance has been created.
-// It starts a tracing span, sends the balance to the search index queue, and sends a webhook notification.
+// It starts a tracing span, sends the balance to the search index queue, and captures a
+// balance.created event in the transactional outbox.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -199,13 +217,33 @@ func (l *Blnk) postBalanceActions(ctx context.Context, balance *model.Balance) {
 	_, span := balanceTracer.Start(ctx, "PostBalanceActions")
 	defer span.End()
 
+	// The publish context is DETACHED FROM CANCELLATION but not from the trace, using the
+	// same context.WithoutCancel idiom runTransactionPostCommitWorkWithHooks already applies
+	// to the monitor goroutines in transaction_execution.go.
+	//
+	// It is derived here, outside the goroutine, because ctx is still live at this point.
+	// The goroutine below deliberately outlives this function: CreateBalance is reached from
+	// the API with c.Request.Context(), which net/http cancels the moment the handler
+	// returns, and the outbox insert issues its statement with the context it is given. A
+	// raw request context would therefore abort the insert whenever the response won the
+	// race, losing the event with nothing but a log line to show it — the one failure the
+	// outbox exists to rule out. queueIndexData is unaffected either way; it takes no
+	// context.
+	publishCtx := context.WithoutCancel(ctx)
+
 	go func() {
 		err := l.queue.queueIndexData(balance.BalanceID, "balances", balance)
 		if err != nil {
 			span.RecordError(err)
 			notification.NotifyError(err)
 		}
-		err = l.SendWebhook(NewWebhook{
+		// PRODUCER CALL SITE FOR balance.created. SendWebhook became PublishEvent and
+		// nothing else changed: the same *model.Balance the legacy transport marshaled is
+		// the object the outbox row stores, so the payload is preserved field-for-field and
+		// the legacy webhook delivered from that same row during the dual-delivery window
+		// carries identical bytes. The event routes to blnk.balances, keyed on the
+		// balance's ledger.
+		err = l.PublishEvent(publishCtx, NewWebhook{
 			Event:   "balance.created",
 			Payload: balance,
 		})

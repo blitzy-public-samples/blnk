@@ -60,6 +60,8 @@ var pathToResource = map[string]Resource{
 	"reconciliation":   ResourceReconciliation,
 	"metadata":         ResourceMetadata,
 	"backup":           ResourceBackup,
+	"events":           ResourceEvents,
+	"subscribers":      ResourceSubscribers,
 }
 
 // AuthMiddleware handles authentication and authorization for API routes.

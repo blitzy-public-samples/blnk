@@ -1,0 +1,118 @@
+# The Kafka broker's Service surface, and it is TWO Services in ONE file by
+# design:
+#
+#   kafka           the client-facing ClusterIP Service. KAFKA_BROKERS names it
+#                   bare as kafka:9092, exactly as data_source.dns names
+#                   postgres and redis.dns names redis in blnk-config.yaml.
+#   kafka-headless  the headless companion kafka-statefulset.yaml points its
+#                   serviceName at, which is what gives every broker pod a
+#                   stable DNS name of its own.
+#
+# Nothing else belongs here. Consumer lag is measured in-process by
+# event_admin.go, differencing OffsetFetch against ListOffsets over the client
+# Service below, so this deployment needs no lag-exporter workload and no
+# Service to expose one.
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    kompose.cmd: kompose convert -f docker-compose.yaml -o k8s-manifests/
+    kompose.version: 1.26.1 (a9d05d509)
+  creationTimestamp: null
+  labels:
+    io.kompose.service: kafka
+  name: kafka
+  namespace: blnk
+spec:
+  # ONLY the SASL client listener, 9092 — the port docker-compose.yaml
+  # advertises as BROKER://kafka:9092 and .env.example documents as
+  # KAFKA_BROKERS=kafka:9092. Keep this number, the broker's client listener in
+  # kafka-statefulset.yaml and that variable in step; a Service pointing at a
+  # port the broker does not serve fails like a broken broker, not like a typo.
+  #
+  # The KRaft controller listener, 9093, is deliberately ABSENT from this
+  # Service. It carries quorum traffic between brokers, speaks its own security
+  # protocol and authenticates with its own credential, so publishing it beside
+  # the client port would invite a client to dial the wrong listener and fail in
+  # a way that reads as a rejected password. It is served by kafka-headless
+  # below, where only the brokers use it.
+  #
+  # No `type:` key, so this is a plain ClusterIP Service like postgres, redis
+  # and typesense. Load-balancing across the broker pods is correct for clients:
+  # a producer dials any broker to bootstrap and the metadata response then
+  # redirects it to the leader of each partition it writes to.
+  ports:
+    - name: "9092"
+      port: 9092
+      targetPort: 9092
+  selector:
+    io.kompose.service: kafka
+status:
+  loadBalancer: {}
+# --------------------------------------------------------------------------
+# DO NOT SPLIT THIS FILE APART. What follows is a SECOND Service, not a second
+# copy of the first, and both are load-bearing:
+#
+#   * clients — the event publisher, the outbox relay and
+#     scripts/kafka-provision.sh — dial the load-balanced `kafka` above;
+#   * the brokers themselves cannot. Their advertised listeners and their KRaft
+#     controller.quorum.voters have to name one specific pod each, and only a
+#     headless Service publishes a per-pod name.
+#
+# They share this file because the implementation plan names exactly one
+# Service manifest for this folder, so a separate kafka-headless-service.yaml
+# would be an invented filename. The `---` below is consequently the first
+# document separator in infrastructure/k8s-manifests/; it is deliberate rather
+# than a stray marker left behind by an editor.
+# --------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    kompose.cmd: kompose convert -f docker-compose.yaml -o k8s-manifests/
+    kompose.version: 1.26.1 (a9d05d509)
+  creationTimestamp: null
+  labels:
+    io.kompose.service: kafka
+  name: kafka-headless
+  namespace: blnk
+spec:
+  # No virtual IP and no load balancing: this name resolves to the broker pod
+  # addresses themselves, and each pod additionally answers to
+  # kafka-<ordinal>.kafka-headless.blnk.svc.cluster.local.
+  #
+  # kafka-statefulset.yaml MUST carry `serviceName: kafka-headless` for those
+  # per-pod records to exist. Pointing it at the plain `kafka` Service — the
+  # shape postgres-statefulset.yaml uses, adequate there only because that
+  # workload is a single replica — would leave a three-broker cluster unable
+  # to name its own members: a quorum voter must be a specific broker, and an
+  # advertised listener must resolve back to the one pod holding the partition
+  # leadership it just claimed.
+  clusterIP: None
+  # Both listeners, unlike the client-facing Service above: 9092 carries client
+  # and inter-broker traffic, 9093 carries the KRaft controller quorum. Being
+  # reachable on either by a per-pod name is this Service's whole purpose, so
+  # both belong here. These are Kubernetes port names following this folder's
+  # Kompose idiom of the quoted port number — they are not Kafka listener
+  # names; BROKER and CONTROLLER are configured on the broker itself.
+  ports:
+    - name: "9092"
+      port: 9092
+      targetPort: 9092
+    - name: "9093"
+      port: 9093
+      targetPort: 9093
+  # Quorum formation happens BEFORE any broker can pass a readiness probe, so
+  # the voters must be resolvable before then. Left at its default, DNS omits
+  # not-ready pods and a cold start deadlocks: readiness waits on the quorum,
+  # the quorum waits on DNS, and DNS waits on readiness. Every Kafka and etcd
+  # operator sets this for exactly that reason.
+  publishNotReadyAddresses: true
+  # Identical to the client Service's selector, and to the StatefulSet's
+  # selector.matchLabels: both Services front the same three broker pods and
+  # differ only in how they are addressed.
+  selector:
+    io.kompose.service: kafka
+status:
+  loadBalancer: {}

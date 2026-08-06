@@ -30,14 +30,43 @@ import (
 )
 
 // postIdentityActions performs actions after an identity has been created.
-// It sends the newly created identity to the search index queue and sends a webhook notification.
-func (l *Blnk) postIdentityActions(_ context.Context, identity *model.Identity) {
+// It sends the newly created identity to the search index queue and captures an
+// identity.created event in the transactional outbox.
+//
+// PRODUCER CALL SITE FOR identity.created — one of the eight sites that used to call
+// SendWebhook. Only the TRANSPORT changed here: the event string and the payload object
+// below are the same ones the legacy HTTP webhook carried, so the bytes recorded in
+// blnk.event_outbox.payload are the bytes that would have been the HTTP body. That
+// identity is what makes the dual-delivery payload-equivalence guarantee verifiable by
+// reading this diff rather than by trusting a description of it. PublishEvent does not
+// talk to a broker; it writes one pending row and returns, and the event relay publishes
+// it to blnk.identities — identity.created is the only event type routed there — with
+// bounded retry, dead-lettering and, while the window is open, legacy HTTP delivery from
+// that same row.
+//
+// The payload is FORWARDED VERBATIM, and that is deliberate despite model.Identity
+// carrying PII fields. Redacting, detokenizing or filtering it here would change what
+// subscribers receive relative to the HTTP era and break the equivalence the transport
+// substitution is measured by. The exposure is a pre-existing property of the webhook
+// contract, and narrowing it is a separate, deliberate change to that contract — not a
+// side effect of moving transports.
+//
+// Failures still route to notification.NotifyError unchanged: PublishEvent returns a
+// persistence error exactly where SendWebhook returned an enqueue error, and returns nil
+// for every no-op — including the unconfigured case, so a deployment with neither Kafka
+// brokers nor a webhook URL keeps creating identities with no notification sink, as before.
+//
+// The context parameter was previously discarded. It is named now because PublishEvent
+// needs one for tracing and for the datasource call; the signature's arity is unchanged
+// and the sole caller, CreateIdentity, already supplies context.Background(), so the
+// goroutine below cannot inherit a request scope that is cancelled out from under it.
+func (l *Blnk) postIdentityActions(ctx context.Context, identity *model.Identity) {
 	go func() {
 		err := l.queue.queueIndexData(identity.IdentityID, "identities", identity)
 		if err != nil {
 			notification.NotifyError(err)
 		}
-		err = l.SendWebhook(NewWebhook{
+		err = l.PublishEvent(ctx, NewWebhook{
 			Event:   "identity.created",
 			Payload: identity,
 		})
