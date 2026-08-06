@@ -1012,8 +1012,12 @@ func (s *EventDeadLetterService) PublishToDeadLetter(
 	}
 
 	// The SAME key the original publish used, resolved through the publisher's own rule
-	// (the row's ledger id, falling back to its aggregate id) so the two cannot diverge.
-	// The attempt argument plays no part in key resolution.
+	// (the row's stored partition key, falling back to its ledger id and then its
+	// aggregate id) so the two cannot diverge. Keeping them identical is what makes the
+	// dead-letter topic preserve the same per-aggregate ordering as the topic the event
+	// failed to reach, and it is why this is resolved through PublishRequestFromOutbox
+	// rather than by reading a column here. The attempt argument plays no part in key
+	// resolution.
 	partitionKey := resolvePartitionKey(PublishRequestFromOutbox(row, 1))
 
 	outcome := DeadLetterOutcome{

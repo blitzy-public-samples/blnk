@@ -290,8 +290,10 @@ type outboxEventFixture struct {
 	topic string
 	// aggregateID is the entity the event is ABOUT: what a consumer groups by.
 	aggregateID string
-	// partitionKey is the expected ledger_id column — the Kafka message key, and
-	// therefore the partition, and therefore the ordering guarantee.
+	// partitionKey is the expected partition_key column — the Kafka message key, and
+	// therefore the partition, and therefore the ordering guarantee. It is a DIFFERENT
+	// column from ledger_id, which records the authoritative ledger and takes no part
+	// in partitioning; several shapes below have a partition key and no ledger at all.
 	partitionKey string
 }
 

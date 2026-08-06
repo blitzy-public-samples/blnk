@@ -1030,10 +1030,21 @@ func dltExhaustedRow(eventID, eventType, topic string) model.EventOutbox {
 	lastAttempt := firstAttempt.Add(31 * time.Second)
 
 	return model.EventOutbox{
-		ID:               dltRowID(eventID),
-		EventID:          eventID,
-		EventType:        eventType,
-		AggregateID:      "txn_9c2f4a17",
+		ID:          dltRowID(eventID),
+		EventID:     eventID,
+		EventType:   eventType,
+		AggregateID: "txn_9c2f4a17",
+		// THREE DIFFERENT VALUES in the three columns, deliberately.
+		//
+		// A real transaction row looks exactly like this: the partition key is the
+		// source balance the transaction moved value from, the aggregate is the
+		// transaction itself, and the ledger column is populated only when the payload
+		// carries a ledger. Making all three distinct is what lets an assertion on the
+		// message key mean something — a fixture that left the partition key blank, or
+		// set it equal to the ledger, would pass whether the implementation keyed on
+		// partition_key, ledger_id or aggregate_id, which is precisely how the key
+		// diverging from the column the claim query serialises on went unnoticed.
+		PartitionKey:     "bln_7d3ac6f1",
 		LedgerID:         "ldg_5f1b8e04",
 		Topic:            topic,
 		SchemaVersion:    model.SchemaVersionV1,
@@ -1281,10 +1292,13 @@ func TestDeadLetterRouting_SendsEachCategoryToItsOwnDeadLetterTopic(t *testing.T
 			require.Len(t, written, 1, "exactly one dead-letter message must be written")
 			assert.Equal(t, route.deadLetterTopic, written[0].topic,
 				"the writer resolved for %s must be the one that wrote the message", route.deadLetterTopic)
-			assert.Equal(t, []byte(row.LedgerID), written[0].message.Key,
-				"the dead-letter message must keep the original ledger-id key so the .dlt topic "+
+			assert.Equal(t, []byte(row.PartitionKey), written[0].message.Key,
+				"the dead-letter message must keep the original partition key so the .dlt topic "+
 					"preserves the same per-aggregate ordering as the topic it failed to reach")
-			assert.Equal(t, row.LedgerID, outcome.PartitionKey)
+			assert.Equal(t, row.PartitionKey, outcome.PartitionKey)
+			assert.NotEqual(t, row.LedgerID, outcome.PartitionKey,
+				"the key must come from partition_key, which the claim query serialises on, and not "+
+					"from ledger_id, which is NULL for most event types")
 			assert.True(t, outcome.Published, "a resolved writer that accepted the message means published")
 			assert.Equal(t, model.PublishStatusDeadLettered, outcome.Status)
 		})
@@ -2333,10 +2347,10 @@ func TestReplayDeadLetteredEvent_TargetsTheTopicRecordedInTheStoredMetadata(t *t
 // TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged is the ordering guarantee applied to
 // the replay itself.
 //
-// The key is the ledger id, and keying by ledger id with a stable hash balancer is what pins
-// every event for one ledger to one partition. A replay published under a different key — or
-// under none — would land on a different partition, and the replay would itself violate the
-// per-aggregate ordering the pipeline exists to preserve.
+// The key is the row's stored partition key, and keying by it with a stable hash balancer is
+// what pins every event sharing that key to one partition. A replay published under a
+// different key — or under none — would land on a different partition, and the replay would
+// itself violate the per-aggregate ordering the pipeline exists to preserve.
 func TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2345,16 +2359,36 @@ func TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged(t *testing.T) {
 	outcome, err := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
 	require.NoError(t, err)
 
-	assert.Equal(t, fixture.row.LedgerID, outcome.PartitionKey,
-		"the replay must be keyed by the row's ledger id, exactly as the original publish was")
-	assert.Equal(t, fixture.row.LedgerID, fixture.request(t).Key)
+	assert.Equal(t, fixture.row.PartitionKey, outcome.PartitionKey,
+		"the replay must be keyed by the row's partition key, exactly as the original publish was")
+	assert.Equal(t, fixture.row.PartitionKey, fixture.request(t).Key)
 	assert.Equal(t, fixture.outcome.PartitionKey, outcome.PartitionKey,
 		"the dead-letter write and the replay must use one and the same key")
 	assert.NotEmpty(t, outcome.PartitionKey,
 		"an empty key would spread the event across partitions and give up its ordering")
+	assert.NotEqual(t, fixture.row.LedgerID, outcome.PartitionKey,
+		"partition_key and ledger_id are different columns, and the key is the former")
+	assert.NotEqual(t, fixture.row.AggregateID, outcome.PartitionKey,
+		"the stored key must be used rather than fallen through to the aggregate")
 
-	t.Run("a row without a ledger id falls back to the aggregate", func(t *testing.T) {
+	t.Run("a row without a partition key falls back to the ledger", func(t *testing.T) {
 		row := fixture.row
+		row.PartitionKey = ""
+
+		store := newDltFakeStore().withRow(row)
+		publisher := &dltFakePublisher{}
+		service := dltNewService(store, publisher, &dltFakeTransport{})
+
+		replayed, replayErr := service.ReplayDeadLetteredEvent(context.Background(), row.EventID)
+		require.NoError(t, replayErr)
+
+		assert.Equal(t, row.LedgerID, replayed.PartitionKey,
+			"a row assembled without the column still keys by its ledger rather than going unkeyed")
+	})
+
+	t.Run("a row without a partition key or a ledger id falls back to the aggregate", func(t *testing.T) {
+		row := fixture.row
+		row.PartitionKey = ""
 		row.LedgerID = ""
 
 		store := newDltFakeStore().withRow(row)
@@ -2365,7 +2399,7 @@ func TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged(t *testing.T) {
 		require.NoError(t, replayErr)
 
 		assert.Equal(t, row.AggregateID, replayed.PartitionKey,
-			"the fallback still pins one aggregate's events to one partition")
+			"the last rung of the chain still pins one aggregate's events to one partition")
 	})
 }
 

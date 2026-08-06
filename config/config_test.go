@@ -1935,3 +1935,271 @@ func TestValidateSASLPair_NamesTheRightVariablesForEachRole(t *testing.T) {
 		t.Errorf("the error must not echo the secret, got '%v'", secretOnly)
 	}
 }
+
+// TestLoadConfigFromFile_BareNameParseErrorNamesTheVariableThatWasSet closes the gap
+// between the variable an operator set and the variable the failure named.
+//
+// envconfig derives a nested field's primary key by accumulating the prefix through every
+// enclosing struct and treats the tag literal as an alternate, then always reports the
+// PRIMARY in its ParseError. So setting the mandated bare RELAY_MAX_RETRY_ATTEMPTS=five
+// used to fail with "assigning BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS to MaxRetryAttempts" —
+// a name that appears nowhere in the operator's configuration and that searching for it
+// will not find.
+//
+// The load must still FAIL, and fail for the same values it always did. What changes is
+// only which name leads the message. Both are asserted, and the original wording is
+// asserted to survive so no diagnostic detail is traded away for the better name.
+func TestLoadConfigFromFile_BareNameParseErrorNamesTheVariableThatWasSet(t *testing.T) {
+	cases := []struct {
+		name       string
+		key        string
+		value      string
+		nestedName string
+	}{
+		{
+			name:       "the retry attempt count",
+			key:        "RELAY_MAX_RETRY_ATTEMPTS",
+			value:      "five",
+			nestedName: "BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS",
+		},
+		{
+			name:       "a backoff bound",
+			key:        "RELAY_RETRY_BASE_BACKOFF_MS",
+			value:      "1s",
+			nestedName: "BLNK_RELAY_RELAY_RETRY_BASE_BACKOFF_MS",
+		},
+		{
+			name:       "the partition count",
+			key:        "KAFKA_MIN_PARTITIONS",
+			value:      "six",
+			nestedName: "BLNK_KAFKA_KAFKA_MIN_PARTITIONS",
+		},
+		{
+			// Two structs deep: KafkaConfig.TLS. The accumulated primary doubles the
+			// whole KAFKA_TLS segment, which is the case a single-segment recovery
+			// would have missed.
+			name:       "a doubly nested tls switch",
+			key:        "KAFKA_TLS_ENABLED",
+			value:      "yeah",
+			nestedName: "BLNK_KAFKA_TLS_KAFKA_TLS_ENABLED",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEventStreamingEnv(t)
+			restoreConfigStore(t)
+
+			configFile := writeTempEventConfigFileWithWindow(t)
+			t.Setenv(tc.key, tc.value)
+
+			err := loadConfigFromFile(configFile)
+			if err == nil {
+				t.Fatalf("Expected loadConfigFromFile to fail for %s=%q", tc.key, tc.value)
+			}
+
+			message := err.Error()
+			if !strings.HasPrefix(message, tc.key+" ") {
+				t.Errorf("Expected the error to LEAD with %s, got %q", tc.key, message)
+			}
+			if !strings.Contains(message, tc.value) {
+				t.Errorf("Expected the error to quote the offending value %q, got %q", tc.value, message)
+			}
+			if !strings.Contains(message, tc.nestedName) {
+				t.Errorf("Expected the nested name %s to be retained for reference, got %q",
+					tc.nestedName, message)
+			}
+			if !strings.Contains(message, "envconfig.Process") {
+				t.Errorf("Expected envconfig's own wording to be preserved by wrapping, got %q", message)
+			}
+		})
+	}
+
+	t.Run("the nested name is left alone when it is the variable that was set", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+		restoreConfigStore(t)
+
+		configFile := writeTempEventConfigFileWithWindow(t)
+		t.Setenv("BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS", "five")
+
+		err := loadConfigFromFile(configFile)
+		if err == nil {
+			t.Fatal("Expected loadConfigFromFile to fail")
+		}
+		if !strings.HasPrefix(err.Error(), "envconfig.Process") {
+			t.Errorf("Expected envconfig's unaltered message when it already names the right variable, got %q",
+				err.Error())
+		}
+	})
+
+	t.Run("a valid bare value is still applied", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+		restoreConfigStore(t)
+
+		configFile := writeTempEventConfigFileWithWindow(t)
+		t.Setenv("RELAY_MAX_RETRY_ATTEMPTS", "4")
+
+		if err := loadConfigFromFile(configFile); err != nil {
+			t.Fatalf("Expected a valid value to load, got %v", err)
+		}
+
+		cnf, err := Fetch()
+		if err != nil {
+			t.Fatalf("Unable to fetch the loaded configuration: %v", err)
+		}
+		if cnf.Relay.MaxRetryAttempts != 4 {
+			t.Errorf("Expected MaxRetryAttempts 4, got %d", cnf.Relay.MaxRetryAttempts)
+		}
+	})
+}
+
+// TestBareEnvNameFrom covers the recovery in isolation, including what it must REFUSE.
+//
+// Returning a wrong bare name would be worse than returning none: the message would then
+// confidently name a variable the operator did not set. Every non-matching shape must
+// therefore yield the empty string so the caller falls back to envconfig's own wording.
+func TestBareEnvNameFrom(t *testing.T) {
+	cases := []struct {
+		key  string
+		want string
+	}{
+		{key: "BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS", want: "RELAY_MAX_RETRY_ATTEMPTS"},
+		{key: "BLNK_KAFKA_KAFKA_MIN_PARTITIONS", want: "KAFKA_MIN_PARTITIONS"},
+		{key: "BLNK_KAFKA_KAFKA_BROKERS", want: "KAFKA_BROKERS"},
+		{key: "BLNK_KAFKA_TLS_KAFKA_TLS_ENABLED", want: "KAFKA_TLS_ENABLED"},
+		{key: "BLNK_KAFKA_TLS_KAFKA_TLS_INSECURE_SKIP_VERIFY", want: "KAFKA_TLS_INSECURE_SKIP_VERIFY"},
+
+		// Shapes that must NOT be described by a guess.
+		{key: "BLNK_SERVER_BLNK_SERVER_MAX_UPLOAD_SIZE_MB", want: ""},
+		{key: "BLNK_WEBHOOK_DEPRECATION_SUNSET_DATE", want: ""},
+		{key: "KAFKA_MIN_PARTITIONS", want: ""},
+		{key: "BLNK_", want: ""},
+		{key: "BLNK_KAFKA", want: ""},
+		{key: "", want: ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			if got := bareEnvNameFrom(tc.key); got != tc.want {
+				t.Errorf("bareEnvNameFrom(%q) = %q, want %q", tc.key, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateAndAddDefaults_KafkaGeometryAndPrefixWarnings covers the two load-time
+// diagnostics for values that are silently corrected, or silently rejected, later on.
+//
+// Both exist because the correction happens somewhere the operator is not looking. A
+// negative partition count is raised to the required minimum by topic assurance, and a
+// prefix carrying an illegal character composes a topic name the broker refuses — in both
+// cases at the moment Kafka is first used, which for a deployment with no event traffic in
+// flight can be long after start-up and a long way from the variable that caused it.
+//
+// They stay WARNINGS: validateRequiredFields requires only the two DSNs, and a deployment
+// that does not use Kafka must not be stopped from booting by a stray variable.
+func TestValidateAndAddDefaults_KafkaGeometryAndPrefixWarnings(t *testing.T) {
+	const (
+		negativePartitionsWarning = "KAFKA_MIN_PARTITIONS is negative"
+		negativeReplicationWarn   = "KAFKA_REPLICATION_FACTOR is negative"
+		illegalPrefixWarning      = "KAFKA_TOPIC_PREFIX contains characters Kafka does not permit"
+	)
+
+	cases := []struct {
+		name     string
+		kafka    KafkaConfig
+		want     []string
+		unwanted []string
+	}{
+		{
+			name:     "a negative partition count warns",
+			kafka:    KafkaConfig{MinPartitions: -4},
+			want:     []string{negativePartitionsWarning},
+			unwanted: []string{negativeReplicationWarn, illegalPrefixWarning},
+		},
+		{
+			name:     "a negative replication factor warns",
+			kafka:    KafkaConfig{ReplicationFactor: -1},
+			want:     []string{negativeReplicationWarn},
+			unwanted: []string{negativePartitionsWarning, illegalPrefixWarning},
+		},
+		{
+			name:     "an interior space in the prefix warns",
+			kafka:    KafkaConfig{TopicPrefix: "with space"},
+			want:     []string{illegalPrefixWarning},
+			unwanted: []string{negativePartitionsWarning, negativeReplicationWarn},
+		},
+		{
+			name:     "an interior slash in the prefix warns",
+			kafka:    KafkaConfig{TopicPrefix: "tenant/one"},
+			want:     []string{illegalPrefixWarning},
+			unwanted: []string{negativePartitionsWarning, negativeReplicationWarn},
+		},
+		{
+			// Trimmed by the topic composer, so reporting it would be noise about
+			// something that is already handled correctly.
+			name:     "surrounding whitespace and dots are not reported",
+			kafka:    KafkaConfig{TopicPrefix: "  .blnk. \n"},
+			want:     nil,
+			unwanted: []string{illegalPrefixWarning},
+		},
+		{
+			name:     "a legal prefix with every permitted character warns about nothing",
+			kafka:    KafkaConfig{TopicPrefix: "blnk-2_prod.eu"},
+			want:     nil,
+			unwanted: []string{illegalPrefixWarning, negativePartitionsWarning, negativeReplicationWarn},
+		},
+		{
+			name:     "an unset geometry warns about nothing",
+			kafka:    KafkaConfig{},
+			want:     nil,
+			unwanted: []string{negativePartitionsWarning, negativeReplicationWarn, illegalPrefixWarning},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEventStreamingEnv(t)
+
+			hook := logtest.NewGlobal()
+			defer hook.Reset()
+
+			cnf := eventStreamingBaseConfig()
+			cnf.Kafka = tc.kafka
+
+			if err := cnf.validateAndAddDefaults(); err != nil {
+				t.Fatalf("Expected a Kafka geometry or prefix problem to warn, not to fail; got %v", err)
+			}
+
+			for _, warning := range tc.want {
+				if !warnedAbout(hook, warning) {
+					t.Errorf("Expected a warning containing %q", warning)
+				}
+			}
+			for _, warning := range tc.unwanted {
+				if warnedAbout(hook, warning) {
+					t.Errorf("Did not expect a warning containing %q", warning)
+				}
+			}
+		})
+	}
+
+	t.Run("a negative value is reported but never becomes the value in effect", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka = KafkaConfig{MinPartitions: -4, ReplicationFactor: -1}
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected the load to succeed, got %v", err)
+		}
+
+		// The defaults do not replace a negative value here — zero alone means unset —
+		// so the warning is the ONLY signal at load time, which is exactly why it had
+		// to be added. The floor is applied where topics are provisioned.
+		if cnf.Kafka.MinPartitions != -4 {
+			t.Errorf("Expected the configured value to be preserved for the warning to describe, got %d",
+				cnf.Kafka.MinPartitions)
+		}
+	})
+}

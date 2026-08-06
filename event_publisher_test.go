@@ -651,3 +651,159 @@ func TestMaxLazyTopicWriters_IsTwoPrefixGenerations(t *testing.T) {
 		"the bound must be TWO generations' worth: one for the previous prefix whose rows are "+
 			"still arriving, and one for a further change on top of it")
 }
+
+// ---------------------------------------------------------------------------
+// The outbox-to-message key contract
+// ---------------------------------------------------------------------------
+
+// TestPublishRequestFromOutbox_KeysByTheStoredPartitionKey is the regression test for the
+// defect in which the database and the broker chose DIFFERENT ordering domains.
+//
+// # What went wrong
+//
+// PublishRequestFromOutbox keyed the message by the row's ledger_id. ledger_id is
+// deliberately NULL for every event whose payload carries no ledger — transactions,
+// bulk batches, balance monitors, identities and system.error, which is eleven of the
+// thirteen event strings — so the key fell through to the aggregate id. Meanwhile
+// ClaimPendingEventOutbox serialises dispatch so that at most one row per PARTITION KEY
+// is in flight, paying for a NOT EXISTS anti-join and a dedicated partial index to do it.
+// Two transactions moving value between the same balances were therefore serialised in the
+// outbox and then routed to different Kafka partitions, and that balance's event sequence
+// was no longer ordered as seen by a consumer. Nothing errored and nothing was logged.
+//
+// # Why this test is shaped the way it is
+//
+// It asserts on rows built by the REAL producer path, PrepareEventOutbox, across the whole
+// event catalogue, because the defect lived exactly in the seam between the producer's two
+// columns and the publisher's single key. A test that hand-built a row could set the two
+// columns to the same value and pass either way, which is how the divergence survived a
+// suite that already covered both sides in isolation.
+//
+// The shapes where partition_key differs from BOTH ledger_id and aggregate_id are counted
+// and required to be non-empty, so this test cannot quietly degrade into a tautology if
+// the fixtures are ever simplified.
+func TestPublishRequestFromOutbox_KeysByTheStoredPartitionKey(t *testing.T) {
+	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
+
+	discriminating := 0
+
+	for _, fixture := range outboxEventFixtures() {
+		t.Run(fixture.name, func(t *testing.T) {
+			row := mustPrepareEventOutbox(t, blnk, NewWebhook{
+				Event:   fixture.eventType,
+				Payload: fixture.payload,
+			})
+
+			require.Equal(t, fixture.partitionKey, row.PartitionKey,
+				"the fixture's expected partition key must be what the producer stored")
+			require.NotEmpty(t, row.PartitionKey,
+				"a blank key would be scattered across partitions with nothing in the data to show it")
+
+			request := PublishRequestFromOutbox(*row, 1)
+
+			assert.Equal(t, row.PartitionKey, request.Key,
+				"the request must be keyed by the column ClaimPendingEventOutbox serialises on")
+			assert.Equal(t, row.PartitionKey, resolvePartitionKey(request),
+				"and resolution must not fall through to the aggregate when the key is present")
+			assert.Equal(t, []byte(row.PartitionKey), partitionKeyBytes(resolvePartitionKey(request)),
+				"the bytes handed to kafka.Message.Key must be the stored key verbatim")
+		})
+
+		if fixture.partitionKey != fixture.aggregateID {
+			discriminating++
+		}
+	}
+
+	assert.GreaterOrEqual(t, discriminating, 3,
+		"at least the transaction, bulk and monitor shapes must key by something OTHER than their "+
+			"aggregate, or this test would pass even if the stored key were ignored entirely")
+}
+
+// TestPublishRequestFromOutbox_AppliesTheDocumentedFallbackChain pins the three rungs.
+//
+// partition_key is NOT NULL with a not-blank CHECK, so a row read back from PostgreSQL
+// always supplies the first rung. The other two exist for a row assembled in Go — by a
+// caller that set only the ledger, or by neither — and they are asserted because an
+// unkeyed message is the one outcome that silently discards the ordering guarantee.
+func TestPublishRequestFromOutbox_AppliesTheDocumentedFallbackChain(t *testing.T) {
+	base := model.EventOutbox{
+		EventID:       "evt_fallback_chain",
+		EventType:     "transaction.applied",
+		AggregateID:   "txn_fallback",
+		PartitionKey:  "bln_fallback_source",
+		LedgerID:      "ldg_fallback",
+		Topic:         "blnk.transactions",
+		SchemaVersion: model.SchemaVersionV1,
+	}
+
+	t.Run("the stored partition key wins", func(t *testing.T) {
+		assert.Equal(t, "bln_fallback_source", resolvePartitionKey(PublishRequestFromOutbox(base, 1)))
+	})
+
+	t.Run("a blank partition key falls back to the ledger", func(t *testing.T) {
+		row := base
+		row.PartitionKey = "   "
+
+		assert.Equal(t, "ldg_fallback", resolvePartitionKey(PublishRequestFromOutbox(row, 1)),
+			"whitespace must read as absence rather than becoming a key made of spaces")
+	})
+
+	t.Run("neither leaves the aggregate", func(t *testing.T) {
+		row := base
+		row.PartitionKey = ""
+		row.LedgerID = ""
+
+		assert.Equal(t, "txn_fallback", resolvePartitionKey(PublishRequestFromOutbox(row, 1)),
+			"the last rung still pins one aggregate's events to one partition")
+	})
+
+	t.Run("an event belonging to nothing is written unkeyed", func(t *testing.T) {
+		row := base
+		row.PartitionKey = ""
+		row.LedgerID = ""
+		row.AggregateID = ""
+
+		key := resolvePartitionKey(PublishRequestFromOutbox(row, 1))
+		assert.Empty(t, key)
+		assert.Nil(t, partitionKeyBytes(key),
+			"an absent key must be nil so the balancer spreads the message rather than pinning it")
+	})
+}
+
+// TestPublishRequestFromOutbox_OrdersTwoAggregatesSharingOneKeyOntoOneKey is the property
+// requirement V-6 is decided by, expressed at the seam this file owns.
+//
+// Two transactions that move value between the same balances are DIFFERENT aggregates and
+// therefore carry different aggregate ids, but they share a partition key. The outbox
+// serialises them relative to each other; keying both by that shared value is what makes
+// the broker place them on one partition and preserve the order the outbox established.
+// Keying by the aggregate would place them independently and lose it.
+func TestPublishRequestFromOutbox_OrdersTwoAggregatesSharingOneKeyOntoOneKey(t *testing.T) {
+	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
+
+	first := mustPrepareEventOutbox(t, blnk, NewWebhook{
+		Event:   "transaction.queued",
+		Payload: outboxSampleTransaction("QUEUED"),
+	})
+
+	second := outboxSampleTransaction("APPLIED")
+	second.TransactionID = "txn_outbox_second"
+	applied := mustPrepareEventOutbox(t, blnk, NewWebhook{
+		Event:   "transaction.applied",
+		Payload: second,
+	})
+
+	require.NotEqual(t, first.AggregateID, applied.AggregateID,
+		"the two events must be about different transactions, or the property is untested")
+	require.Equal(t, first.PartitionKey, applied.PartitionKey,
+		"both transactions move value from the same source balance, so they share a partition key")
+
+	firstKey := resolvePartitionKey(PublishRequestFromOutbox(*first, 1))
+	appliedKey := resolvePartitionKey(PublishRequestFromOutbox(*applied, 1))
+
+	assert.Equal(t, firstKey, appliedKey,
+		"two events serialised against each other in the outbox must be keyed identically, or the "+
+			"broker places them independently and the ordering the claim query paid for is lost")
+	assert.Equal(t, outboxSourceBalanceID, firstKey,
+		"and the shared key is the source balance, matching the transaction queue's own sharding")
+}

@@ -491,7 +491,7 @@ func loadConfigFromFile(file string) error {
 	// override config from environment variables
 	err = envconfig.Process("blnk", &cnf)
 	if err != nil {
-		return err
+		return explainEnvProcessError(err)
 	}
 
 	// The BLNK_-prefixed aliases of the nested Kafka and relay variables, which
@@ -513,6 +513,126 @@ func loadConfigFromFile(file string) error {
 // envAliasPrefix is the house prefix every other variable in this file answers to.
 // It is applied to the bare Kafka and relay names to form their ordinary aliases.
 const envAliasPrefix = "BLNK_"
+
+// explainEnvProcessError re-states an envconfig parse failure in terms of the variable
+// the operator actually set.
+//
+// # The problem it solves
+//
+// envconfig derives a nested field's PRIMARY key by accumulating the prefix through every
+// enclosing struct and treats the raw tag literal as an ALTERNATE. Configuration.Relay.
+// MaxRetryAttempts, tagged RELAY_MAX_RETRY_ATTEMPTS, therefore has the primary key
+// BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS and the alternate RELAY_MAX_RETRY_ATTEMPTS. The value
+// is read from whichever is set, but *envconfig.ParseError always reports the PRIMARY.
+//
+// So an operator who sets the mandated bare name RELAY_MAX_RETRY_ATTEMPTS=five is told
+// "assigning BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS to MaxRetryAttempts" — a variable name
+// that appears nowhere in their configuration and that a search of it will not find. The
+// failure is correct and it is loud; only the name is unhelpful, and the name is the one
+// piece of information the operator needs.
+//
+// # What it does and, deliberately, does not do
+//
+// It rewrites the MESSAGE and nothing else. Which values are accepted is left entirely to
+// envconfig, because that acceptance is subtle — integers are parsed with base 0, so
+// "0x10" is 16, and no trimming is performed, so " 4 " is rejected — and a hand-written
+// pre-flight check would have to reproduce it exactly or would silently change behaviour.
+// The original error is wrapped, so errors.As still recovers the *envconfig.ParseError.
+//
+// The primary key is only rewritten when it is genuinely ABSENT from the environment and a
+// name the operator could have set is present. When the primary itself is set, it is the
+// variable at fault and it is already named correctly.
+//
+// Parameters:
+//   - err error: the error returned by envconfig.Process. Never nil at the call site.
+//
+// Returns:
+//   - error: err unchanged when it is not a parse failure or the reported key is the one
+//     that was set; otherwise a wrapping error naming the variable that was set.
+func explainEnvProcessError(err error) error {
+	var parseErr *envconfig.ParseError
+	if !errors.As(err, &parseErr) {
+		return err
+	}
+
+	// The reported variable IS the one that was set: nothing to explain.
+	if _, reported := os.LookupEnv(parseErr.KeyName); reported {
+		return err
+	}
+
+	// The names an operator may legitimately have used for this field, in the order
+	// envconfig itself consults them: the house-prefixed alias applyPrefixedEnvAliases
+	// adds, then the bare name the deployment contract mandates. The bare name is
+	// recovered from the primary key rather than from a second table, so this cannot
+	// drift out of step with the tags.
+	bare := bareEnvNameFrom(parseErr.KeyName)
+	if bare == "" {
+		return err
+	}
+
+	for _, candidate := range []string{envAliasPrefix + bare, bare} {
+		value, present := os.LookupEnv(candidate)
+		if !present {
+			continue
+		}
+
+		return fmt.Errorf(
+			"%s must be a valid %s, got %q (envconfig reports this field under its nested "+
+				"name %s): %w",
+			candidate, parseErr.TypeName, value, parseErr.KeyName, err,
+		)
+	}
+
+	return err
+}
+
+// bareEnvNameFrom recovers the tag literal from an accumulated envconfig primary key.
+//
+// A nested primary key is "BLNK_" + every enclosing struct field name + "_" + the tag
+// literal:
+//
+//	BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS      accumulated "BLNK_RELAY",     tag RELAY_MAX_RETRY_ATTEMPTS
+//	BLNK_KAFKA_KAFKA_MIN_PARTITIONS          accumulated "BLNK_KAFKA",     tag KAFKA_MIN_PARTITIONS
+//	BLNK_KAFKA_TLS_KAFKA_TLS_ENABLED         accumulated "BLNK_KAFKA_TLS", tag KAFKA_TLS_ENABLED
+//
+// Every struct this feature adds is NAMED AFTER the prefix its tags already carry, and
+// that is what makes the literal recoverable rather than guessed: the accumulated segment
+// is repeated as the head of the tag, so the split point is the position where the
+// remainder begins with the segment that precedes it. The loop below walks the underscore
+// boundaries and returns at the first such position, which handles a struct nested one or
+// two levels deep without a table to keep in step with the tags.
+//
+// Anything that does not match that shape returns the empty string, so a field outside
+// these structs is left to envconfig's own wording rather than being described by a guess.
+//
+// Parameters:
+//   - key string: the primary key envconfig reported.
+//
+// Returns:
+//   - string: the bare tag literal, or "" when the key is not one of the nested forms.
+func bareEnvNameFrom(key string) string {
+	trimmed, hadPrefix := strings.CutPrefix(key, envAliasPrefix)
+	if !hadPrefix {
+		return ""
+	}
+
+	for i, char := range trimmed {
+		if char != '_' {
+			continue
+		}
+
+		accumulated, remainder := trimmed[:i], trimmed[i+1:]
+		if accumulated == "" {
+			return ""
+		}
+
+		if strings.HasPrefix(remainder, accumulated+"_") {
+			return remainder
+		}
+	}
+
+	return ""
+}
 
 // applyPrefixedEnvAliases overlays the BLNK_-prefixed alias of every Kafka and relay
 // environment variable onto an already-processed Configuration.
@@ -1107,6 +1227,121 @@ func (cnf *Configuration) setKafkaDefaults() {
 				"refused rather than run unauthenticated",
 		)
 	}
+
+	cnf.warnOnUnusableKafkaTopicGeometry()
+	cnf.warnOnIllegalKafkaTopicPrefix()
+}
+
+// warnOnUnusableKafkaTopicGeometry reports a topic geometry that will be silently
+// corrected at the point of use.
+//
+// # Why a negative value needs its own line
+//
+// Zero means "unset" and is replaced by the default just above, which is correct and needs
+// no comment. A NEGATIVE value is different: it cannot have been intended, and the topic
+// assurance path raises it to the required six partitions anyway. Without this warning the
+// operator's stated number and the provisioned number differ with nothing anywhere saying
+// so — and the same value would then be reported back by a status endpoint as though it had
+// been honoured.
+//
+// A value below the six-partition floor but positive is warned about where it is applied,
+// because that is where the floor lives and where the correction is made; only the negative
+// case is invisible at that point, since a negative count reads as a paste error rather
+// than as a layout choice.
+//
+// A negative replication factor is warned about for the same reason and is more dangerous:
+// Kafka reads a negative replica count in a create request as "use the broker default", so
+// a topic would be created successfully with a durability the operator never chose.
+//
+// It is a WARNING and not a fatal error, matching every other Kafka diagnostic here:
+// validateRequiredFields requires only the two DSNs, and a deployment that does not use
+// Kafka must not be stopped from booting by a stray variable.
+func (cnf *Configuration) warnOnUnusableKafkaTopicGeometry() {
+	if cnf.Kafka.MinPartitions < 0 {
+		logrus.WithFields(logrus.Fields{
+			"configured": cnf.Kafka.MinPartitions,
+			"will_use":   defaultKafka.MinPartitions,
+		}).Warn(
+			"KAFKA_MIN_PARTITIONS is negative, which cannot be provisioned; topic assurance will " +
+				"raise it to the required minimum, so the configured value will not be the value " +
+				"in effect",
+		)
+	}
+
+	if cnf.Kafka.ReplicationFactor < 0 {
+		logrus.WithFields(logrus.Fields{
+			"configured": cnf.Kafka.ReplicationFactor,
+			"will_use":   defaultKafka.ReplicationFactor,
+		}).Warn(
+			"KAFKA_REPLICATION_FACTOR is negative; a negative replica count is read by Kafka as " +
+				"'use the broker default', so topics would be created with a durability that was " +
+				"never chosen",
+		)
+	}
+}
+
+// kafkaTopicNameCutset is the set of characters Kafka permits in a topic name:
+// alphanumerics, dot, underscore and hyphen. Anything else is rejected by the broker.
+const kafkaTopicNameCutset = "abcdefghijklmnopqrstuvwxyz" +
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
+	"0123456789._-"
+
+// warnOnIllegalKafkaTopicPrefix reports a topic prefix that cannot compose a legal Kafka
+// topic name.
+//
+// # What is and is not corrected
+//
+// Leading and trailing whitespace and separators are stripped by the topic composer, and a
+// blank prefix falls back to the default, so the realistic accidents — a trailing newline
+// in an environment file, a lone dot — are already handled and are not reported here.
+//
+// An INTERIOR illegal character is different. The composer deliberately leaves it alone,
+// because silently rewriting a prefix would produce topic names the operator never asked
+// for and never sees; the broker then refuses the name loudly at topic creation. That is
+// the correct end state, but it arrives at the moment Kafka is first used, which for a
+// deployment with no event traffic in flight can be long after start-up and a long way from
+// the variable that caused it. Naming the offending characters while configuration is being
+// loaded is what turns "InvalidTopicException" later into an actionable line in the boot
+// log.
+//
+// It stays a WARNING rather than becoming fatal, for the same reason as every other Kafka
+// diagnostic here, and because the broker remains the authority on what it will accept: a
+// future Kafka that widened its character set must not be unreachable because this file
+// refused to boot.
+func (cnf *Configuration) warnOnIllegalKafkaTopicPrefix() {
+	// The composer's own normalisation, applied first so nothing it strips is reported.
+	prefix := strings.Trim(cnf.Kafka.TopicPrefix, " \t\n\v\f\r.")
+	if prefix == "" {
+		return
+	}
+
+	illegal := map[rune]struct{}{}
+	var offenders []string
+	for _, char := range prefix {
+		if strings.ContainsRune(kafkaTopicNameCutset, char) {
+			continue
+		}
+		if _, seen := illegal[char]; seen {
+			continue
+		}
+		illegal[char] = struct{}{}
+		offenders = append(offenders, strconv.QuoteRune(char))
+	}
+
+	if len(offenders) == 0 {
+		return
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"topic_prefix":       prefix,
+		"illegal_characters": strings.Join(offenders, ", "),
+		"example_topic":      prefix + ".transactions",
+	}).Warn(
+		"KAFKA_TOPIC_PREFIX contains characters Kafka does not permit in a topic name " +
+			"(only letters, digits, '.', '_' and '-' are legal); every topic composed from it " +
+			"will be refused by the broker, so topic assurance, event publishing and subscriber " +
+			"provisioning will all fail",
+	)
 }
 
 // ProducerSASL returns the SASL identity the steady-state event publisher should

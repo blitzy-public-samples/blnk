@@ -1338,6 +1338,55 @@ func TestResolveTopicPartitions_AppliesTheRequiredFloorAndACeiling(t *testing.T)
 	}
 }
 
+// TestResolveTopicPartitions_ReportsEveryCorrectionItMakes is the "never silently" half of
+// the floor.
+//
+// Raising a configured value is correct, but doing it without a word means the number an
+// operator stated and the number in effect differ with nothing anywhere to show it — and a
+// status endpoint would then report the configured value back as though it had been
+// honoured. A NEGATIVE value used to slip through the report for exactly this reason: the
+// guard tested for a POSITIVE below-floor value, so the one input that cannot possibly have
+// been intended was the one input corrected in silence.
+//
+// Zero stays silent, and must: zero means unset, the configuration defaults it, and nothing
+// was overridden.
+func TestResolveTopicPartitions_ReportsEveryCorrectionItMakes(t *testing.T) {
+	const correctionWarning = "KAFKA_MIN_PARTITIONS is below the required minimum"
+
+	cases := []struct {
+		name       string
+		configured int
+		warns      bool
+	}{
+		{name: "unset is silent because nothing was stated", configured: 0, warns: false},
+		{name: "a positive below-floor value is reported", configured: 2, warns: true},
+		{name: "a negative value is reported", configured: -4, warns: true},
+		{name: "exactly the floor needs no correction", configured: MinTopicPartitions, warns: false},
+		{name: "above the floor is honoured", configured: 24, warns: false},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			hook := logtest.NewGlobal()
+			defer hook.Reset()
+
+			resolveTopicPartitions(testCase.configured)
+
+			warned := false
+			for _, entry := range hook.AllEntries() {
+				if entry.Level == logrus.WarnLevel && strings.Contains(entry.Message, correctionWarning) {
+					warned = true
+
+					break
+				}
+			}
+
+			assert.Equal(t, testCase.warns, warned,
+				"a correction must be reported and a non-correction must stay quiet")
+		})
+	}
+}
+
 // sentinelPassword is a value that could not occur by accident, so any appearance of it in
 // a log line, an error or a serialised result is proof that the secret escaped.
 //

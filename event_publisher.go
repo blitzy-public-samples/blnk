@@ -383,8 +383,8 @@ type EventPublisher interface {
 //   - The DESTINATION TOPIC. A stored outbox row records its topic at insert time, so
 //     a row remains publishable — and a dead-lettered event replayable — to the topic
 //     it was always meant for, even if the naming configuration changed since.
-//   - The PARTITION KEY. The key is the ledger ID, and the ledger ID is not one of
-//     the six envelope fields; it lives on the outbox row. See resolvePartitionKey.
+//   - The PARTITION KEY. The key is the row's partition key, which is not one of the
+//     six envelope fields; it lives on the outbox row. See resolvePartitionKey.
 //   - The ATTEMPT NUMBER, which the publish-duration metric is attributed by so that
 //     first-attempt latency can be read separately from retried latency.
 type TopicEventPublisher interface {
@@ -418,10 +418,18 @@ type PublishRequest struct {
 	// `<topic>.dlt` sibling.
 	Topic string
 
-	// Key is the Kafka message key, which is the LEDGER ID. Keying by ledger ID with
-	// a stable hash balancer pins every event for one ledger to a single partition,
-	// and that partition affinity is what makes per-aggregate ordering hold: Kafka
-	// orders within a partition only.
+	// Key is the Kafka message key, which is the outbox row's PARTITION KEY —
+	// model.EventOutbox.PartitionKey, the value the row was stored with and the value
+	// ClaimPendingEventOutbox serialises dispatch on. Keying with a stable hash
+	// balancer pins every event sharing a key to a single partition, and that
+	// partition affinity is what makes per-aggregate ordering hold: Kafka orders
+	// within a partition only.
+	//
+	// It is the ledger ID exactly when the event has one — PrepareEventOutbox stores
+	// a known ledger in the partition-key column as well, which is how requirement
+	// R-6's ledger partitioning is honoured — and the next-best stable aggregate
+	// otherwise. Populate it with PublishRequestFromOutbox rather than by hand, so the
+	// key on the wire cannot diverge from the key the database ordered on.
 	//
 	// When empty, the event's aggregate ID is used instead — see resolvePartitionKey
 	// for why that fallback is safe and what it does and does not preserve.
@@ -496,10 +504,12 @@ type PublishResult struct {
 	Topic string
 
 	// PartitionKey is the key the message was written with, after the fallback in
-	// resolvePartitionKey was applied. An empty value means the message was written
-	// without a key and was therefore balanced across partitions rather than pinned
-	// to one — correct for an event that belongs to no ledger and no aggregate, and a
-	// red flag for anything else.
+	// resolvePartitionKey was applied. For an outbox-backed publish it is the row's
+	// stored partition key, which is the same value ClaimPendingEventOutbox serialised
+	// dispatch on. An empty value means the message was written without a key and was
+	// therefore balanced across partitions rather than pinned to one — correct for an
+	// event that belongs to no ledger and no aggregate, and a red flag for anything
+	// else.
 	PartitionKey string
 
 	// Attempt is the 1-based attempt number this result describes.
@@ -1678,8 +1688,8 @@ func (p *kafkaPublisher) retireOldestLazyWriterLocked() (*kafka.Writer, string) 
 // the result use PublishToTopic.
 //
 // The destination is resolved with TopicForEvent, and the message key falls back to the
-// event's aggregate ID because the ledger ID is not carried in the envelope — see
-// resolvePartitionKey, which documents exactly what that fallback preserves.
+// event's aggregate ID because the stored partition key is not carried in the envelope —
+// see resolvePartitionKey, which documents exactly what that fallback preserves.
 //
 // Parameters:
 //   - ctx context.Context: cancels the partition-metadata lookup and the wait for the
@@ -1962,11 +1972,46 @@ func (p *kafkaPublisher) Close() error {
 // PublishRequestFromOutbox builds the publish request for a claimed outbox row.
 //
 // It is THE single place the load-bearing routing rule is applied — the Kafka message key
-// is the LEDGER ID recorded on the row, and the destination is the topic recorded on the
-// row — so that the relay and the dead-letter writer cannot each apply it slightly
+// is the row's PARTITION KEY, and the destination is the topic recorded on the row — so
+// that the relay, the dead-letter writer and a replay cannot each apply it slightly
 // differently. A relay that composed the request inline would be one refactor away from
 // dropping the key and silently losing per-aggregate ordering, a defect that no unit test
 // of the relay would notice.
+//
+// # Why the key is partition_key and not ledger_id
+//
+// The two are separate columns, and which one is keyed on decides whether the ordering the
+// DATABASE pays for actually reaches a subscriber. ClaimPendingEventOutbox serialises
+// dispatch so that at most ONE row per partition_key is ever in flight — that is the whole
+// purpose of the NOT EXISTS anti-join in claimPendingEventOutboxQuery and of the
+// idx_event_outbox_partition_key_inflight index that backs it. Kafka then orders within a
+// PARTITION. So the two guarantees compose into an end-to-end ordering guarantee only when
+// the partition is a function of the same value the claim serialises on.
+//
+// Keying by ledger_id instead broke that composition for almost every event, because
+// ledger_id is deliberately NULL wherever the payload carries no ledger: transactions
+// (model.Transaction has no ledger field), balance monitors, identities, bulk batches and
+// system.error. The key then silently fell through to the aggregate id, so two
+// transactions moving value between the same balances — serialised in the outbox at real
+// cost — were routed to different partitions and their event sequence was no longer
+// consumer-visible-ordered. Nothing errored and nothing was logged, which is exactly the
+// failure mode model.EventOutbox.PartitionKey's own documentation warns about.
+//
+// Requirement R-6's "partitioned by ledger ID" is preserved rather than abandoned: when a
+// ledger IS known, PrepareEventOutbox stores it in BOTH columns — a ledger.created or
+// balance.created event derives it from the payload, and WithEventLedgerID sets both
+// explicitly — so keying on partition_key keys on the ledger precisely when there is a
+// ledger to key on, and on the next-best aggregate when there is not.
+//
+// # The fallback chain
+//
+// partition_key is NOT NULL in the schema, has a not-blank CHECK, and PrepareEventOutbox
+// guarantees a value through its own chain, so a row read back from the database always
+// carries one. LedgerID is the next rung for a row assembled in Go by a caller that set
+// only the ledger, and resolvePartitionKey supplies the final rung — the aggregate id — so
+// the effective chain is partition_key → ledger_id → aggregate_id. Every rung is stable
+// per aggregate, so ordering survives all of them; only an event belonging to no aggregate
+// at all ends up unkeyed.
 //
 // The row's own topic is used rather than re-deriving one from the event type, because the
 // row recorded its destination at insert time precisely so it stays publishable to the
@@ -1981,7 +2026,7 @@ func (p *kafkaPublisher) Close() error {
 //
 // Returns:
 //   - PublishRequest: a request whose event is reconstructed from the row's envelope
-//     columns, keyed by the row's ledger ID and targeted at the row's topic.
+//     columns, keyed by the row's partition key and targeted at the row's topic.
 func PublishRequestFromOutbox(row model.EventOutbox, attempt int) PublishRequest {
 	return PublishRequest{
 		Event: model.LedgerEvent{
@@ -1993,7 +2038,7 @@ func PublishRequestFromOutbox(row model.EventOutbox, attempt int) PublishRequest
 			SchemaVersion: row.SchemaVersion,
 		},
 		Topic:   row.Topic,
-		Key:     row.LedgerID,
+		Key:     firstNonBlank(row.PartitionKey, row.LedgerID),
 		Attempt: attempt,
 	}
 }
@@ -2122,17 +2167,20 @@ func resolveTopic(req PublishRequest) string {
 
 // resolvePartitionKey returns the Kafka message key for a request.
 //
-// THE KEY IS THE LEDGER ID. Every event for one ledger hashes to one partition, Kafka
-// orders within a partition, and that is the whole mechanism behind the per-aggregate
-// ordering guarantee. It is the same idea the transaction queue already applies when it
-// shards by hashing the source balance ID, applied to the transport that now carries the
-// events.
+// THE KEY IS THE STORED PARTITION KEY — model.EventOutbox.PartitionKey, which is the
+// ledger ID whenever the event has one and the next-best stable aggregate otherwise.
+// Every event sharing a key hashes to one partition, Kafka orders within a partition,
+// and that is the whole mechanism behind the per-aggregate ordering guarantee. It is the
+// same idea the transaction queue already applies when it shards by hashing the source
+// balance ID, applied to the transport that now carries the events. It is also the value
+// ClaimPendingEventOutbox serialises dispatch on, so keying on it is what makes the
+// database's ordering domain and the broker's partitioning domain the same domain.
 //
-// The ledger ID is NOT one of the six envelope fields — the envelope is a fixed
+// The partition key is NOT one of the six envelope fields — the envelope is a fixed
 // subscriber-facing contract and carries the aggregate ID instead — so it reaches this
-// function only when a caller supplies it, which the relay does from the ledger ID column
-// of the claimed outbox row. When it is absent, the aggregate ID is used, and the
-// consequences of that fallback are worth stating precisely:
+// function only when a caller supplies it, which PublishRequestFromOutbox does from the
+// partition-key column of the claimed outbox row. When it is absent, the aggregate ID is
+// used, and the consequences of that fallback are worth stating precisely:
 //
 //   - It PRESERVES per-aggregate ordering, which is the property acceptance requires.
 //     Every event for one aggregate still shares a key and therefore a partition.
@@ -2141,20 +2189,21 @@ func resolveTopic(req PublishRequest) string {
 //     ordering across aggregates, so nothing is lost.
 //   - It cannot split ONE aggregate's stream across two partitions, which would be the
 //     only genuinely harmful outcome, because outbox-backed events always arrive with the
-//     recorded ledger ID and non-outbox events never share an aggregate with them.
+//     recorded partition key and non-outbox events never share an aggregate with them.
 //
 // An empty result means the message is written with no key at all and is spread across
 // partitions by the balancer. That is the right answer for an event belonging to neither a
 // ledger nor an aggregate — an internal-error notification, for instance — where there is
 // nothing to order it against and pinning every such event to one partition would only
-// create a hot spot.
+// create a hot spot. It is unreachable for an outbox-backed event, whose partition key is
+// NOT NULL, non-blank by CHECK, and guaranteed by PrepareEventOutbox's own fallback chain.
 //
 // Parameters:
 //   - req PublishRequest: the request to resolve.
 //
 // Returns:
 //   - string: the partition key, or the empty string when the request carries neither a
-//     ledger ID nor an aggregate ID.
+//     supplied key nor an aggregate ID.
 func resolvePartitionKey(req PublishRequest) string {
 	if key := strings.TrimSpace(req.Key); key != "" {
 		return key

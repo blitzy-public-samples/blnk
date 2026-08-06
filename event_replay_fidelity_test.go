@@ -212,9 +212,21 @@ type replayFidelityFixture struct {
 	eventType string
 	// aggregateID is the subject of the event and appears in the envelope.
 	aggregateID string
-	// ledgerID is the Kafka message key. It is deliberately DIFFERENT from
-	// aggregateID everywhere it can be, so an implementation that keyed by the
-	// aggregate instead of the ledger is caught rather than passing by coincidence.
+	// partitionKey is the Kafka message key — model.EventOutbox.PartitionKey, the
+	// column ClaimPendingEventOutbox serialises dispatch on. It is deliberately
+	// DIFFERENT from aggregateID everywhere it can be, so an implementation that keyed
+	// by the aggregate instead is caught rather than passing by coincidence.
+	//
+	// It used to be called ledgerID, and the values below show why that name was
+	// wrong: a transaction keys by its SOURCE BALANCE and a monitor by the BALANCE it
+	// watches, neither of which is a ledger. The two are separate columns precisely
+	// because conflating them made the key lie about most of its values.
+	partitionKey string
+	// ledgerID is the AUTHORITATIVE ledger the event belongs to, and it takes no part
+	// in partitioning. It is empty for every event whose payload carries no ledger — a
+	// transaction, a balance monitor, an identity — exactly as PrepareEventOutbox
+	// stores it, so the fixture cannot accidentally make ledger_id look like a usable
+	// key.
 	ledgerID string
 	// payload is the stored payload column, byte for byte.
 	payload string
@@ -235,36 +247,49 @@ type replayFidelityFixture struct {
 func replayFidelityFixtures() []replayFidelityFixture {
 	return []replayFidelityFixture{
 		{
-			name:            "transactions",
-			eventType:       "transaction.applied",
-			aggregateID:     "txn_replay_fidelity_001",
-			ledgerID:        "bln_source_001",
+			name:        "transactions",
+			eventType:   "transaction.applied",
+			aggregateID: "txn_replay_fidelity_001",
+			// A transaction keys by its source balance and carries NO ledger:
+			// model.Transaction has no ledger field, so ledger_id stays NULL.
+			partitionKey:    "bln_source_001",
+			ledgerID:        "",
 			payload:         replayFidelityTransactionPayload,
 			topic:           "blnk.transactions",
 			deadLetterTopic: "blnk.transactions.dlt",
 		},
 		{
-			name:            "balances",
-			eventType:       "balance.monitor",
-			aggregateID:     "mon_replay_fidelity_002",
-			ledgerID:        "bln_replay_fidelity_002",
+			name:        "balances",
+			eventType:   "balance.monitor",
+			aggregateID: "mon_replay_fidelity_002",
+			// A monitor keys by the balance it watches; BalanceMonitor carries no
+			// ledger field either.
+			partitionKey:    "bln_replay_fidelity_002",
+			ledgerID:        "",
 			payload:         replayFidelityBalancePayload,
 			topic:           "blnk.balances",
 			deadLetterTopic: "blnk.balances.dlt",
 		},
 		{
-			name:            "identities",
-			eventType:       "identity.created",
-			aggregateID:     "idt_replay_fidelity_003",
-			ledgerID:        "idt_replay_fidelity_003",
+			name:        "identities",
+			eventType:   "identity.created",
+			aggregateID: "idt_replay_fidelity_003",
+			// An identity is not scoped to a ledger in this model, so it keys by
+			// itself and records no ledger.
+			partitionKey:    "idt_replay_fidelity_003",
+			ledgerID:        "",
 			payload:         replayFidelityIdentityPayload,
 			topic:           "blnk.identities",
 			deadLetterTopic: "blnk.identities.dlt",
 		},
 		{
-			name:            "system",
-			eventType:       "ledger.created",
-			aggregateID:     "ldg_replay_fidelity_004",
+			name:        "system",
+			eventType:   "ledger.created",
+			aggregateID: "ldg_replay_fidelity_004",
+			// ledger.created is one of the two shapes that genuinely DO carry a
+			// ledger, so both columns hold it — which is how requirement R-6's
+			// "partitioned by ledger ID" is honoured wherever a ledger exists.
+			partitionKey:    "ldg_replay_fidelity_004",
 			ledgerID:        "ldg_replay_fidelity_004",
 			payload:         replayFidelitySystemPayload,
 			topic:           "blnk.system",
@@ -285,6 +310,7 @@ func (f replayFidelityFixture) row(id int64) model.EventOutbox {
 		EventID:       fmt.Sprintf("event-replay-fidelity-%s-%d", f.name, id),
 		EventType:     f.eventType,
 		AggregateID:   f.aggregateID,
+		PartitionKey:  f.partitionKey,
 		LedgerID:      f.ledgerID,
 		Topic:         f.topic,
 		SchemaVersion: model.SchemaVersionV1,
@@ -1327,7 +1353,7 @@ func (h *replayFidelityHarness) runScenario(
 		require.Equal(t, string(originalBytes), string(attempt.value),
 			"attempt %d offered different bytes from attempt 1", i+1)
 		require.Equal(t, fixture.topic, attempt.topic)
-		require.Equal(t, fixture.ledgerID, attempt.key)
+		require.Equal(t, fixture.partitionKey, attempt.key)
 		require.True(t, attempt.failed)
 	}
 
@@ -1537,13 +1563,18 @@ func TestReplayFidelity_ReplayedMessageIsByteIdenticalToTheOriginal(t *testing.T
 				"exactly one writer must have been resolved, for the .dlt sibling")
 
 			// --- 4. The message key. ---
-			assert.Equal(t, fixture.ledgerID, scenario.replay.PartitionKey,
+			//
+			// It is the row's PARTITION KEY, which is the column
+			// ClaimPendingEventOutbox serialises dispatch on. Keying on anything else
+			// would put the database's ordering domain and the broker's partitioning
+			// domain in disagreement, and the disagreement would be silent.
+			assert.Equal(t, fixture.partitionKey, scenario.replay.PartitionKey,
 				"the replay must reuse the original key so it lands on the same partition")
-			assert.Equal(t, fixture.ledgerID, scenario.outcome.PartitionKey,
+			assert.Equal(t, fixture.partitionKey, scenario.outcome.PartitionKey,
 				"the dead-letter message must reuse the original key too")
 			written := harness.writerFor(fixture.deadLetterTopic).written()
 			require.Len(t, written, 1)
-			assert.Equal(t, fixture.ledgerID, string(written[0].Key))
+			assert.Equal(t, fixture.partitionKey, string(written[0].Key))
 			assert.Empty(t, written[0].Topic,
 				"a per-topic writer rejects a message that names its own topic")
 
@@ -1931,7 +1962,7 @@ func TestReplayFidelity_ReplayTopicComesFromTheStoredFailureMetadata(t *testing.
 	assert.Equal(t, legacyTopic, replayed.topic)
 	assert.Equal(t, string(attempts[0].value), string(replayed.value),
 		"a changed destination must not change one byte of the message")
-	assert.Equal(t, fixture.ledgerID, replayed.key,
+	assert.Equal(t, fixture.partitionKey, replayed.key,
 		"a changed destination must not change the partition key either")
 }
 

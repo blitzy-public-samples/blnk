@@ -679,7 +679,12 @@ func resolveTopicPartitions(configured int) int {
 		return configured
 	}
 
-	if configured > 0 {
+	// Zero alone is silent, because zero means UNSET: the configuration defaults it and
+	// nothing was overridden. Every other below-floor value was stated by an operator and
+	// is being changed, so it is reported — including a NEGATIVE one, which used to slip
+	// through this branch and be corrected with nothing anywhere to show the configured
+	// number was not the number in effect.
+	if configured != 0 {
 		logrus.WithFields(logrus.Fields{
 			"configured": configured,
 			"minimum":    MinTopicPartitions,
