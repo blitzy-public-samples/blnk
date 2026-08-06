@@ -187,6 +187,14 @@ func TestValidateAndAddDefaults_TransactionLockWaitTimeoutAlreadyDuration(t *tes
 }
 
 func TestLoadConfigFromFile(t *testing.T) {
+	// This test asserts what loadConfigFromFile does with a FILE, so the event-streaming
+	// variables must not reach it from the surrounding environment. They are cleared because
+	// an exported KAFKA_BROKERS — which is what the local stack and the integration tests set
+	// — is picked up by envconfig for a fixture that states no deprecation window, and the
+	// load then correctly refuses. The refusal is the intended behaviour; inheriting the
+	// variable is not.
+	clearEventStreamingEnv(t)
+
 	// Create a temporary file
 	tmpFile, err := os.CreateTemp("", "blnk.json")
 	if err != nil {
@@ -254,6 +262,11 @@ func TestLoadConfigFromFile(t *testing.T) {
 }
 
 func TestLoadConfigFromFileMonitoringDSN(t *testing.T) {
+	// Cleared for the same reason as in TestLoadConfigFromFile: this fixture states no
+	// deprecation window, so an inherited KAFKA_BROKERS would make the load refuse and the
+	// monitoring DSN assertion never run.
+	clearEventStreamingEnv(t)
+
 	tmpFile, err := os.CreateTemp("", "blnk.json")
 	if err != nil {
 		t.Fatalf("Unable to create temporary file: %v", err)
@@ -295,6 +308,11 @@ func TestLoadConfigFromFileMonitoringDSN(t *testing.T) {
 }
 
 func TestInitConfig(t *testing.T) {
+	// Cleared for the same reason as in TestLoadConfigFromFile: InitConfig goes through the
+	// same load pipeline, so an inherited KAFKA_BROKERS with no window in the fixture would
+	// make it refuse.
+	clearEventStreamingEnv(t)
+
 	// Create a temporary file
 	tmpFile, err := os.CreateTemp("", "blnk.json")
 	if err != nil {

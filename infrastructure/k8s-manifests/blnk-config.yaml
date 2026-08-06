@@ -4,6 +4,137 @@ metadata:
   name: blnk-config
   namespace: blnk
 data:
+  # Kafka event streaming and outbox relay. Blnk reads these nine keys from its
+  # process environment; they reproduce config.KafkaConfig, config.RelayConfig
+  # and the top-level WebhookDeprecationSunsetDate field of config/config.go,
+  # and the matching block of .env.example, so the three can be diffed by eye.
+  #
+  # They are DISCRETE ConfigMap keys rather than extra settings inside the
+  # blnk.json document below, for three reasons: the deployment contract names
+  # these exact variables; config/config.go applies envconfig AFTER decoding
+  # blnk.json, so the environment wins and the two sources can never disagree
+  # about a value; and blnk.json is projected with subPath, so editing it needs
+  # a pod rollout (see the note on that key) while these keys leave the mount
+  # untouched. Do not split the nine across both mechanisms.
+  #
+  # server-deployment.yaml and worker-deployment.yaml surface each key with its
+  # own env entry and a valueFrom.configMapKeyRef. Do NOT collapse those into
+  # envFrom.configMapRef, which takes EVERY key in this map, blnk.json included.
+  # Kubernetes allows a dot in an environment variable name, so it does not skip
+  # that key or warn: it injects the whole JSON document — data source DSN and
+  # password and all — into every container's environment, where it surfaces in
+  # env, in kubectl describe pod, in crash dumps and in every child process.
+  # Naming the nine keys explicitly injects the nine and nothing else.
+  # Nor is the answer to move blnk.json elsewhere: both Deployments mount this
+  # ConfigMap's blnk.json key at /blnk.json and pass --config /blnk.json, so
+  # relocating it breaks both.
+  #
+  # Every value below is a QUOTED STRING, the numbers included: a ConfigMap
+  # data map is map[string]string, and an unquoted 6 is a YAML integer the API
+  # server rejects outright.
+  #
+  # The absent BLNK_ prefix is deliberate — do not "correct" it. These names
+  # reproduce the envconfig tag literals in config/config.go character for
+  # character. Every other variable in that file is BLNK_-prefixed; these are
+  # the documented exception, and the BLNK_-prefixed alias of each name below
+  # resolves as well, winning when both forms are set.
+  #
+  # KAFKA_SASL_ADMIN_SECRET IS DELIBERATELY ABSENT AND MUST NEVER BE ADDED
+  # HERE. It is the one event-streaming variable that is a credential, and a
+  # ConfigMap is readable by anything holding get on this namespace, so it
+  # reaches the pods as an env entry with a valueFrom.secretKeyRef against a
+  # Secret the operator provisions out of band. No Secret manifest is committed
+  # to this folder.
+
+  # Empty is a supported steady state, not a missing value: with no brokers
+  # configured, initializeEventPublisher returns the no-op publisher and Blnk
+  # starts, serves and processes transactions exactly as it did before Kafka
+  # existed. That is what lets an existing deployment adopt these manifests
+  # before it adopts Kafka.
+  #
+  # TO PUBLISH EVENTS, SET THIS TO kafka:9092 — the client-facing ClusterIP
+  # Service in kafka-service.yaml, named bare within the blnk namespace exactly
+  # as data_source.dns names postgres and redis.dns names redis below. Use
+  # 9092, the SASL client listener; 9093 carries the KRaft controller quorum
+  # and is deliberately absent from that Service, so a client that dials it
+  # fails in a way that reads as a rejected password. Comma-separate several
+  # brokers; surrounding whitespace is trimmed and empty entries are dropped.
+  #
+  # Setting this key alone is not enough, and what it needs alongside it is
+  # deliberately not in this ConfigMap: WEBHOOK_DEPRECATION_SUNSET_DATE below
+  # becomes mandatory, the SASL credentials belong in a Secret, and the TLS
+  # settings name paths inside a mounted volume. Blnk REFUSES to build a Kafka
+  # client that is neither TLS-protected nor explicitly marked as local
+  # development, so a production cluster sets KAFKA_TLS_ENABLED and
+  # KAFKA_TLS_CA_FILE through the two Deployments' env blocks.
+  KAFKA_BROKERS: ""
+
+  # The prefix every topic name derives from: the four category topics
+  # blnk.transactions, blnk.balances, blnk.identities and blnk.system, and
+  # their blnk.<category>.dlt dead-letter siblings.
+  KAFKA_TOPIC_PREFIX: "blnk"
+
+  # The SASL/SCRAM principal used ONLY for provisioning — topic assurance,
+  # subscriber credential and ACL management, and the offset reads behind lag
+  # and reconciliation. Keep it out of anything that merely publishes. The
+  # username is not a credential and belongs here; its secret does not.
+  # config/config.go validates the two as a PAIR and refuses to start on a
+  # username without a secret or a secret without a username, because either
+  # half alone would otherwise connect anonymously while looking configured —
+  # so fill this in and create that Secret in the same change.
+  KAFKA_SASL_ADMIN_USER: ""
+
+  # Topic geometry applied when topics are created or grown. Six partitions is
+  # the required minimum; messages are keyed per aggregate, so a higher count
+  # buys parallelism without weakening the ordering guarantee.
+  KAFKA_MIN_PARTITIONS: "6"
+
+  # Three for production durability, and this file is the production manifest.
+  # The local single-broker compose stack overrides it to 1 because a
+  # one-broker cluster cannot satisfy 3 and topic creation fails outright.
+  # Keep it in step with the broker count: 3 needs at least three brokers.
+  KAFKA_REPLICATION_FACTOR: "3"
+
+  # Bounded exponential backoff for the outbox-to-Kafka relay: at most five
+  # attempts, the first retry after 1000ms and doubling thereafter, never
+  # sleeping longer than 30000ms — 1s, 2s, 4s, 8s, 16s. Both delays are
+  # milliseconds and are used verbatim. The cap is deliberately out of reach
+  # inside five attempts; it engages only if the base delay or the attempt
+  # count is raised. Every attempt is logged with its number and reason, and on
+  # exhaustion the event is written to its category's <topic>.dlt with failure
+  # metadata attached. Five is also a hard ceiling rather than merely a
+  # default: a larger value is clamped back to it, because the attempt number
+  # is an exported metric label and its domain is part of that contract.
+  RELAY_MAX_RETRY_ATTEMPTS: "5"
+  RELAY_RETRY_BASE_BACKOFF_MS: "1000"
+  RELAY_RETRY_MAX_BACKOFF_MS: "30000"
+
+  # The RFC3339 instant at which the legacy HTTP webhook transport is retired.
+  # Until then Kafka publishing and webhook delivery run concurrently from the
+  # same outbox rows, which is what makes both transports carry an identical
+  # payload; from it onwards Kafka is the only transport and the deprecated
+  # webhook management routes answer 410 Gone. One decision point serves both
+  # behaviours, so they can never disagree about the date.
+  #
+  # Empty ships here because KAFKA_BROKERS above is empty: with nothing to
+  # migrate to there is no window to describe, and that pairing is the only one
+  # in which it may be left blank. IT BECOMES MANDATORY THE MOMENT
+  # KAFKA_BROKERS IS SET — Blnk then refuses to start without it, rather than
+  # letting one typo keep the deprecated transport running indefinitely with
+  # nothing failing anywhere. Set it to an instant such as 2026-09-04T00:00:00Z
+  # (UTC, seconds precision), or add a WEBHOOK_DEPRECATION_START_DATE key and
+  # its own configMapKeyRef and let the sunset be derived as exactly 30 days
+  # later; give both and they must agree to the second or startup is refused.
+  WEBHOOK_DEPRECATION_SUNSET_DATE: ""
+
+  # UPDATING THIS KEY REQUIRES A POD ROLLOUT. Both Deployments project it with
+  # subPath: blnk.json, and Kubernetes does not refresh a subPath-projected
+  # file inside a running container the way it refreshes a whole-volume mount,
+  # so run
+  #   kubectl -n blnk rollout restart deployment/server deployment/worker
+  # after editing it. The nine keys above arrive as environment variables and
+  # leave this mount undisturbed — though a pod likewise only observes a
+  # changed environment value once it restarts.
   blnk.json: |
     {
       "project_name": "Blnk",
