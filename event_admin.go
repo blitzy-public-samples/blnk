@@ -25,10 +25,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/segmentio/kafka-go"
-	"github.com/segmentio/kafka-go/sasl/scram"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
@@ -92,6 +92,29 @@ import (
 //     single source of truth shared with scripts/kafka-provision.sh. A literal here
 //     would ignore KAFKA_TOPIC_PREFIX and provision topics nothing publishes to.
 //
+// # The service boundary: every result and report here is INTERNAL
+//
+// SubscriberProvisioningResult, SubscriberProvisioningRequest, TopicAssurance(Report),
+// ConsumerLagReport, TopicLag, PartitionLag, TopicOffsetReport, TopicOffsetSnapshot,
+// PartitionOffsetSnapshot and OutboxReconciliation are values this package hands to its own
+// callers. NONE of them is an HTTP response shape, and none carries a struct tag, so that
+// nothing about them invites being handed to a JSON encoder and returned to a client.
+//
+// That is a boundary rather than a preference, for two reasons. First, api/model owns the
+// API contract: api/model.KafkaCredentialsResponse is the single, authoritative shape for
+// a credential issuance, and api/model.EventOutboxStatsResponse for the statistics
+// endpoint. A second, tag-bearing shape reaching a client would mean two contracts for one
+// endpoint, drifting independently and with no test pinning the one that shipped. Second,
+// these values legitimately describe the INSIDE of the system — the PBKDF2 iteration
+// count, how many ACL bindings were written, whether an existing credential was replaced,
+// whether the broker's authorizer appears to be enforcing, per-partition offset windows.
+// That is exactly what an operator's log line needs and exactly what a subscriber has no
+// business being told, and telling it publishes a map of the security posture to whoever
+// holds an API key.
+//
+// A handler that reports any of this therefore maps the fields it needs onto the api/model
+// DTO explicitly, field by field, and everything it does not name stays inside.
+//
 // # Secret handling
 //
 // A subscriber's SASL password reaches this file as a parameter, is converted
@@ -130,6 +153,22 @@ const DefaultScramIterations = 4096
 // RFC 8018 recommends at least 8 bytes; 32 is generous, costs nothing, and matches the
 // SHA-512 security level the mechanism is derived at.
 const scramSaltLength = 32
+
+// MinSCRAMPasswordLength is the shortest secret this service will mint a credential from.
+//
+// Thirty-two characters over the printable ASCII alphabet is far beyond what an unrated,
+// unlocked SASL handshake can be attacked at. It is a floor on a GENERATED value rather than
+// a human-chosen one, so it costs no usability: the issuing service's generator produces
+// exactly this alphabet at or above this length.
+const MinSCRAMPasswordLength = 32
+
+// MinSCRAMPasswordDistinctChars is the minimum number of distinct characters a secret must
+// contain.
+//
+// It exists because a length floor on its own accepts a long run of one character. Sixteen
+// distinct characters out of thirty-two is met by a random draw over a 94-character alphabet
+// with overwhelming probability, and is not met by a padded constant or a repeated pattern.
+const MinSCRAMPasswordDistinctChars = 16
 
 // MinTopicPartitions is the minimum number of partitions every event topic is created
 // or grown to.
@@ -212,13 +251,27 @@ var ErrKafkaAdminNotConfigured = errors.New(
 // *kafka.Client satisfies this interface as declared, with no adapter.
 //
 // Adding a method here is how a new administrative capability arrives. Do NOT add
-// DeleteTopics, DeleteACLs or any producing method: the first two make destructive
-// operations reachable from server code, and the third would let event messages bypass
-// the outbox.
+// DeleteTopics or any producing method: the first makes an irreversible, data-destroying
+// operation reachable from server code, and the second would let event messages bypass the
+// outbox.
+//
+// # AUTH-01: why DeleteACLs is now here, having been excluded
+//
+// It was excluded on the same "no destructive operations" reasoning as DeleteTopics, and that
+// conflated two very different kinds of destruction. Deleting a TOPIC destroys committed
+// events and cannot be undone. Deleting an ACL BINDING removes an authorization, and the
+// authorization can be recreated from the registry row that describes it — the registry, not
+// the broker, is the record of what a subscriber may read.
+//
+// Excluding it meant Blnk could grant access and never withdraw it. Reducing a subscriber's
+// topics left the wider grant standing; deleting a subscriber left its whole boundary live
+// with no registry row left to describe it. So the safe-looking omission produced the less
+// safe system: a set of permissions that only ever grew.
 type kafkaAdminAPI interface {
 	CreateTopics(ctx context.Context, req *kafka.CreateTopicsRequest) (*kafka.CreateTopicsResponse, error)
 	CreatePartitions(ctx context.Context, req *kafka.CreatePartitionsRequest) (*kafka.CreatePartitionsResponse, error)
 	CreateACLs(ctx context.Context, req *kafka.CreateACLsRequest) (*kafka.CreateACLsResponse, error)
+	DeleteACLs(ctx context.Context, req *kafka.DeleteACLsRequest) (*kafka.DeleteACLsResponse, error)
 	DescribeACLs(ctx context.Context, req *kafka.DescribeACLsRequest) (*kafka.DescribeACLsResponse, error)
 	AlterUserScramCredentials(ctx context.Context, req *kafka.AlterUserScramCredentialsRequest) (*kafka.AlterUserScramCredentialsResponse, error)
 	DescribeUserScramCredentials(ctx context.Context, req *kafka.DescribeUserScramCredentialsRequest) (*kafka.DescribeUserScramCredentialsResponse, error)
@@ -257,6 +310,16 @@ type KafkaAdmin interface {
 	// SubscriberCredentialExists reports whether a principal already holds a SCRAM
 	// credential.
 	SubscriberCredentialExists(ctx context.Context, principal string) (bool, error)
+
+	// RevokeSubscriber removes a subscriber's ACL bindings and then its SCRAM credential,
+	// ending its access at the broker. Call it BEFORE deleting the registry row: the row
+	// is the only record of which principal and which bindings to remove.
+	RevokeSubscriber(ctx context.Context, subscriber *model.EventSubscriber) error
+
+	// RevokeSubscriberPrincipal deletes one principal's SCRAM credential. It is
+	// idempotent, so it is safe to retry and safe to call on a principal that may not
+	// exist.
+	RevokeSubscriberPrincipal(ctx context.Context, principal string) error
 
 	// AuthorizerActive reports whether the broker enforces ACLs at all.
 	AuthorizerActive(ctx context.Context) (bool, error)
@@ -306,7 +369,100 @@ type KafkaAdminClient struct {
 	// taken from configuration and never defaulted to a literal here. Zero means
 	// unconfigured, which EnsureTopics reports as an actionable error.
 	replicationFactor int
+
+	// allowPartitionGrowth permits raising the partition count of a topic that already
+	// holds records.
+	//
+	// It defaults to false, which is the safe direction: growing a live topic re-maps keys
+	// to partitions and splits every existing aggregate's history irreversibly. Setting it
+	// is an operator's statement that the ordering consequences have been planned for.
+	allowPartitionGrowth bool
+
+	// cacheMu guards every memoised answer below. A plain Mutex rather than an RWMutex
+	// because a read that misses has to write, so no path is purely a read.
+	cacheMu sync.Mutex
+
+	// authorizerProbe memoises whether the broker enforces ACLs.
+	//
+	// Whether a broker runs an authorizer is fixed at broker startup — it comes from
+	// authorizer.class.name in the broker's own configuration — so asking on every
+	// provisioning call re-answers a question that cannot have changed, and does so from
+	// the same five-second budget as the credential write and the ACL batch. The answer
+	// is still re-checked periodically rather than once per process, because the cluster
+	// a long-lived server is pointed at CAN be restarted with different settings
+	// underneath it, and continuing to report "enforcing" would be reporting a security
+	// property that has stopped being true.
+	authorizerProbe cachedAuthorizerProbe
+
+	// offsetSnapshots memoises the partition metadata and end offsets per topic set.
+	//
+	// A consumer-lag sweep asks the same two questions for every subscriber — which
+	// partitions exist, and where each one ends — and only the third, the group's
+	// committed offsets, actually differs between them. Caching the shared pair turns an
+	// N-subscriber sweep from 3N round trips into 1 metadata + 1 ListOffsets + N
+	// OffsetFetch, on the metrics path, at whatever interval the gauge is refreshed.
+	offsetSnapshots map[string]*offsetSnapshot
+
+	// offsetSnapshotTTL is how long a snapshot may be reused. Zero selects
+	// defaultOffsetSnapshotTTL; a negative value disables caching entirely, which is
+	// what a test asserting on raw round trips wants.
+	offsetSnapshotTTL time.Duration
+
+	// now is the clock, injectable so cache expiry is testable without sleeping. Nil
+	// means time.Now.
+	now func() time.Time
 }
+
+// cachedAuthorizerProbe is a memoised answer to "does this broker enforce ACLs".
+type cachedAuthorizerProbe struct {
+	// active is the cached answer, meaningful only when checkedAt is non-zero.
+	active bool
+
+	// checkedAt is when the broker last answered. Zero means never asked.
+	checkedAt time.Time
+}
+
+// offsetSnapshot is a cached view of the partition layout and the end offsets for one set
+// of topics.
+//
+// It holds the ERROR-FREE result only. A failed probe is never cached: caching a failure
+// would keep answering a transient broker problem long after it cleared, and the lag
+// gauge would stay wrong for the life of the TTL rather than self-correcting on the next
+// sweep.
+type offsetSnapshot struct {
+	// partitions maps each topic to its partition IDs.
+	partitions map[string][]int
+
+	// bounds maps each topic and partition to its offset bounds.
+	bounds map[string]map[int]partitionOffsetBounds
+
+	// missing holds the requested topics the broker did not report.
+	missing []string
+
+	// takenAt is when the two reads completed.
+	takenAt time.Time
+}
+
+// defaultOffsetSnapshotTTL is how long a partition/end-offset snapshot is reused.
+//
+// The end offset is the head of the log, and it moves. A cached one is therefore slightly
+// behind, and the question is whether that can change an answer anybody acts on. It
+// cannot: at the target rate of 500 events per second a few seconds of staleness is a few
+// thousand records against a lag alert threshold of 10,000, and a subscriber close enough
+// to that boundary for the difference to matter is already alerting on the next sweep. A
+// few seconds is long enough to collapse one sweep's fan-out — which is the only thing
+// this cache is for — and short enough that no operator reads a stale figure for long.
+const defaultOffsetSnapshotTTL = 5 * time.Second
+
+// maxCachedOffsetSnapshots bounds how many distinct topic sets are remembered.
+//
+// The cache is keyed by topic set, and different subscribers legitimately hold different
+// grants, so the key space is influenced by registry rows an API client authors. A cache
+// with a caller-influenced key space and no bound is a leak. When the bound is reached the
+// cache is dropped wholesale rather than evicted entry by entry: entries live for seconds,
+// so the next sweep repopulates exactly what it needs and precise eviction would be
+// bookkeeping for no benefit.
+const maxCachedOffsetSnapshots = 64
 
 // Compile-time proof that the concrete client implements the published interface.
 var _ KafkaAdmin = (*KafkaAdminClient)(nil)
@@ -323,21 +479,23 @@ var _ KafkaAdmin = (*KafkaAdminClient)(nil)
 // returns ErrKafkaAdminNotConfigured without touching the network. That is what keeps a
 // Kafka-less deployment working unchanged.
 //
-// # Authentication
+// # Authentication and transport security
 //
-// When KAFKA_SASL_ADMIN_USER is set, the transport authenticates with SCRAM-SHA-512
-// built from it and KAFKA_SASL_ADMIN_SECRET. When it is unset, no SASL mechanism is
-// attached, which is the correct behaviour for a PLAINTEXT broker: attaching one would
-// fail the handshake against a listener that offers no mechanism. A user without a
-// secret is the one genuinely broken combination and is the only case that returns an
-// error, because it would otherwise surface later as an authentication failure that
-// reads like a wrong password.
+// The transport is built by NewKafkaTransport — the SAME function the event publisher
+// dials through — with the administrative role. That sharing is the fix for CRYPTO-01 and
+// it is structural rather than tidy: this client and the publisher previously assembled
+// their own transports with their own credential checks, so the two could disagree about
+// whether TLS was required and about what counted as a valid credential pair. One of them
+// being right was not enough, because the administrative client is the one that carries
+// SCRAM credentials for OTHER principals across the wire.
 //
-// The transport carries no TLS configuration, because none is configurable: the Kafka
-// configuration surface has no TLS fields. SCRAM over SASL_PLAINTEXT is acceptable for
-// the local single-broker stack; a production deployment terminates transport security
-// at the broker's listener, and adding a client-side TLS option is a configuration
-// change (a new field in KafkaConfig) rather than something to improvise here.
+// What that shared policy means here: TLS is the default posture and an unencrypted
+// connection has to be asked for explicitly with KAFKA_INSECURE_LOCAL_DEV, certificate
+// verification cannot be disabled outside that mode, and the SASL pair is validated
+// centrally so a username without a secret is refused at construction rather than
+// surfacing later as what looks like a wrong password. SCRAM-SHA-512 is fixed, matching
+// what scripts/kafka-bootstrap.sh seeds and what every subscriber credential is
+// provisioned with.
 //
 // # Geometry
 //
@@ -355,8 +513,10 @@ var _ KafkaAdmin = (*KafkaAdminClient)(nil)
 // Returns:
 //   - *KafkaAdminClient: a client that is never nil when err is nil, and which is safe
 //     to share across goroutines.
-//   - error: only when the SASL credentials are internally inconsistent or the SCRAM
-//     mechanism cannot be constructed. Never for an absent broker list.
+//   - error: when the SASL credentials are internally inconsistent, the SCRAM mechanism
+//     cannot be constructed, the TLS material is unreadable or invalid, or plaintext
+//     would be used without the explicit local-dev acknowledgement. Never for an absent
+//     broker list.
 func NewKafkaAdmin(cnf *config.Configuration) (*KafkaAdminClient, error) {
 	if cnf == nil {
 		logrus.Debug("kafka admin: configuration is not loaded; administrative operations are unavailable")
@@ -371,7 +531,7 @@ func NewKafkaAdmin(cnf *config.Configuration) (*KafkaAdminClient, error) {
 		return &KafkaAdminClient{}, nil
 	}
 
-	transport, err := adminTransport(cnf.Kafka.SASLAdminUser, cnf.Kafka.SASLAdminSecret)
+	transport, err := adminTransport(cnf.Kafka)
 	if err != nil {
 		return nil, err
 	}
@@ -382,10 +542,11 @@ func NewKafkaAdmin(cnf *config.Configuration) (*KafkaAdminClient, error) {
 			Timeout:   kafkaAdminRequestTimeout,
 			Transport: transport,
 		},
-		transport:         transport,
-		brokers:           brokers,
-		partitions:        resolveTopicPartitions(cnf.Kafka.MinPartitions),
-		replicationFactor: cnf.Kafka.ReplicationFactor,
+		transport:            transport,
+		brokers:              brokers,
+		partitions:           resolveTopicPartitions(cnf.Kafka.MinPartitions),
+		replicationFactor:    cnf.Kafka.ReplicationFactor,
+		allowPartitionGrowth: cnf.Kafka.AllowPartitionGrowth,
 	}
 
 	if admin.replicationFactor < 1 {
@@ -402,64 +563,57 @@ func NewKafkaAdmin(cnf *config.Configuration) (*KafkaAdminClient, error) {
 		"partitions":         admin.partitions,
 		"replication_factor": admin.replicationFactor,
 		"sasl":               transport.SASL != nil,
+		"tls":                transport.TLS != nil,
 	}).Debug("kafka admin: client constructed")
 
 	return admin, nil
 }
 
-// adminTransport builds the connection pool the administrative client sends through,
-// including its SCRAM-SHA-512 authentication when SASL is configured.
+// adminTransport builds the connection pool the administrative client sends through.
 //
-// The mechanism is built here rather than returned to the caller so that the SASL
-// interface type never has to be named outside kafka-go's own packages, keeping this
-// file's kafka-go imports to the two the plan permits.
+// # CRYPTO-01: one transport policy, not two
 //
-// SHA-512 is fixed rather than negotiated: it is the mechanism
-// scripts/kafka-bootstrap.sh seeds the administrative principal with and the mechanism
-// every subscriber credential is provisioned with, so a second choice here could only
-// ever be a mismatch.
+// This used to assemble its own transport and do its own credential checking, in parallel
+// with the publisher doing the same. Two implementations of one security decision is one
+// implementation too many: they disagreed about whether TLS was required and about what
+// counted as a valid credential pair, and this is the client whose requests CARRY SCRAM
+// CREDENTIALS FOR OTHER PRINCIPALS — a subscriber's password crosses the wire inside an
+// AlterUserScramCredentials request. An unencrypted administrative connection therefore
+// discloses not one deployment's data but every subscriber's credential as it is minted.
+//
+// It now delegates to NewKafkaTransport with the administrative role, so the TLS policy,
+// the plaintext refusal, the verification requirement and the credential validation are
+// literally the same code the publisher runs. The role selects the administrative
+// principal (KAFKA_SASL_ADMIN_USER / KAFKA_SASL_ADMIN_SECRET) rather than the producer's.
+//
+// The timeouts remain this client's own, because an administrative request has a different
+// shape from a produce: it is rare, it is interactive, and it should give up sooner rather
+// than hold a credential-issuance request open.
+//
+// SCRAM-SHA-512 is fixed rather than negotiated: it is what scripts/kafka-bootstrap.sh
+// seeds the administrative principal with and what every subscriber credential is
+// provisioned with, so a second choice could only ever be a mismatch.
 //
 // Parameters:
-//   - user string: KAFKA_SASL_ADMIN_USER. Empty selects no SASL at all, which is
-//     correct for a PLAINTEXT listener.
-//   - secret string: KAFKA_SASL_ADMIN_SECRET. Required when user is set.
+//   - cfg config.KafkaConfig: the Kafka block, read for the administrative credential
+//     pair and the TLS material.
 //
 // Returns:
 //   - *kafka.Transport: never nil when err is nil.
-//   - error: when a user is configured without a secret, or when the mechanism cannot
-//     be constructed. Neither message contains the secret.
-func adminTransport(user, secret string) (*kafka.Transport, error) {
-	transport := &kafka.Transport{
-		ClientID:    kafkaAdminClientID,
-		DialTimeout: kafkaAdminDialTimeout,
-		IdleTimeout: kafkaAdminIdleTimeout,
-	}
-
-	user = strings.TrimSpace(user)
-	if user == "" {
-		return transport, nil
-	}
-
-	if strings.TrimSpace(secret) == "" {
-		return nil, errors.New(
-			"kafka admin: KAFKA_SASL_ADMIN_USER is set but KAFKA_SASL_ADMIN_SECRET is empty; " +
-				"SASL/SCRAM authentication needs both",
-		)
-	}
-
-	mechanism, err := scram.Mechanism(scram.SHA512, user, secret)
+//   - error: a half-configured credential pair, a credential SASL preparation rejects,
+//     unreadable or invalid TLS material, or plaintext without the explicit local-dev
+//     acknowledgement. No message contains the secret.
+func adminTransport(cfg config.KafkaConfig) (*kafka.Transport, error) {
+	transport, err := NewKafkaTransport(cfg, KafkaTransportRoleAdmin)
 	if err != nil {
-		// The error from the SCRAM library can quote the credential it was given, so it
-		// is deliberately NOT wrapped: only the fact of failure and the mechanism name
-		// are reported.
-		return nil, fmt.Errorf(
-			"kafka admin: cannot build the %s mechanism for administrative user %q; "+
-				"the username or secret contains characters SASL preparation rejects",
-			SubscriberSASLMechanism, user,
-		)
+		return nil, fmt.Errorf("kafka admin: %w", err)
 	}
 
-	transport.SASL = mechanism
+	// The shared builder sets the publisher's client id and timeouts; the administrative
+	// client identifies itself separately in broker logs and gives up sooner.
+	transport.ClientID = kafkaAdminClientID
+	transport.DialTimeout = kafkaAdminDialTimeout
+	transport.IdleTimeout = kafkaAdminIdleTimeout
 
 	return transport, nil
 }
@@ -627,57 +781,82 @@ func (a *KafkaAdminClient) ready(ctx context.Context) error {
 // infer it from the absence of an error.
 type TopicAssurance struct {
 	// Topic is the fully-qualified topic name, as resolved by event_topics.go.
-	Topic string `json:"topic"`
+	Topic string
 
 	// Created is true when this run created the topic.
-	Created bool `json:"created"`
+	Created bool
 
 	// PartitionsBefore is the partition count found before this run, and 0 for a topic
 	// this run created.
-	PartitionsBefore int `json:"partitions_before"`
+	PartitionsBefore int
 
 	// PartitionsAfter is the partition count in force after this run.
-	PartitionsAfter int `json:"partitions_after"`
+	PartitionsAfter int
 
 	// PartitionsAdded is true when this run grew an existing topic.
-	PartitionsAdded bool `json:"partitions_added"`
+	PartitionsAdded bool
 
 	// ShrinkRefused is true when the topic has MORE partitions than configured and was
 	// deliberately left alone. See EnsureTopics for why shrinking is never attempted.
-	ShrinkRefused bool `json:"shrink_refused"`
+	ShrinkRefused bool
 
-	// ReplicationFactor is the factor the topic was created with, and 0 for a topic
-	// that already existed — its factor is a property of the existing topic and is not
-	// altered by this operation.
-	ReplicationFactor int `json:"replication_factor,omitempty"`
+	// GrowthRefused is true when the topic has FEWER partitions than configured, already
+	// holds records, and was therefore not grown.
+	//
+	// It is a refusal rather than a failure: the topic works, and what it cannot offer is
+	// the partition count the configuration asks for. Reaching that count is a planned
+	// migration, because adding partitions to a live topic re-maps keys and splits
+	// aggregate histories — see EnsureTopics.
+	GrowthRefused bool
+
+	// ReplicationFactor is the topic's OBSERVED minimum replica count across its
+	// partitions, or the factor it was created with for a topic this run created. Zero
+	// means the topic was not visible in metadata yet.
+	//
+	// The minimum is reported rather than an average because durability is decided by the
+	// weakest partition.
+	ReplicationFactor int
+
+	// ReplicationInadequate is true when the observed replica count is below the
+	// configured KAFKA_REPLICATION_FACTOR.
+	//
+	// It exists because this was previously invisible: the factor was applied to newly
+	// created topics and discarded from the metadata of existing ones, so a topic at one
+	// replica was reported as assured under a configuration asking for three.
+	ReplicationInadequate bool
 }
 
 // TopicAssuranceReport is the outcome of one EnsureTopics call across every topic Blnk
 // owns.
 type TopicAssuranceReport struct {
 	// Topics carries one entry per topic, in the canonical order
-	// AllTopicsWithDeadLetters returns: the four category topics, then their four
+	// AllTopicsWithDeadLetters returns: every category topic, then each one's
 	// dead-letter siblings. The stable order is what lets the report be diffed against
 	// the provisioning script line for line.
-	Topics []TopicAssurance `json:"topics"`
+	Topics []TopicAssurance
+
+	// GrowthRefusedCount is how many topics needed partitions and were not grown because
+	// they already hold records. A non-zero value is a geometry defect that needs a planned
+	// migration, and EnsureTopics returns ErrPartitionGrowthRefused alongside it.
+	GrowthRefusedCount int
 
 	// Partitions is the partition count applied, after the MinTopicPartitions floor.
-	Partitions int `json:"partitions"`
+	Partitions int
 
 	// ReplicationFactor is the factor applied to newly created topics, straight from
 	// configuration.
-	ReplicationFactor int `json:"replication_factor"`
+	ReplicationFactor int
 
 	// CreatedCount, GrownCount, UnchangedCount and ShrinkRefusedCount summarise
 	// Topics. They are computed here rather than left to the caller so that a log line
 	// or an operator response does not have to re-derive them.
-	CreatedCount       int `json:"created_count"`
-	GrownCount         int `json:"grown_count"`
-	UnchangedCount     int `json:"unchanged_count"`
-	ShrinkRefusedCount int `json:"shrink_refused_count"`
+	CreatedCount       int
+	GrownCount         int
+	UnchangedCount     int
+	ShrinkRefusedCount int
 
 	// CompletedAt is when the assurance finished.
-	CompletedAt time.Time `json:"completed_at"`
+	CompletedAt time.Time
 }
 
 // Lookup finds the assurance for one topic.
@@ -761,11 +940,37 @@ type topicCreationOutcome struct {
 // while a hard-coded 1 would silently discard the durability requirement in production.
 // An unconfigured factor is refused with an actionable message rather than guessed at.
 //
-// # Growing is allowed; shrinking is refused, never attempted
+// # TOPIC-01: growing an EMPTY topic is safe; growing a LIVE one destroys ordering
 //
-// A topic with too few partitions is grown with CreatePartitions, because a topic
-// provisioned by hand or auto-created with one partition would otherwise cap how far a
-// subscriber can scale.
+// A topic with too few partitions is grown with CreatePartitions ONLY WHILE IT IS EMPTY,
+// because a topic provisioned by hand or auto-created with one partition would otherwise cap
+// how far a subscriber can scale.
+//
+// Growth used to be unconditional, and that was the defect. The partition a key lands on is
+// murmur2(key) mod partitionCount, so raising the count re-maps keys: a ledger that hashed
+// into partition 2 of six lands somewhere else out of twelve, and its history is then split
+// across two partitions with no ordering between them. Every key already written loses the
+// per-aggregate ordering guarantee, permanently and unrecoverably — the events cannot be
+// moved back.
+//
+// So a non-empty topic is REFUSED and reported rather than grown, and EnsureTopics returns
+// ErrPartitionGrowthRefused so the refusal cannot be missed. Reaching six partitions on a live
+// topic is a planned migration — provision a correctly-shaped topic, move consumers, drain the
+// old one — not something a provisioning pass should do behind an operator's back.
+// KAFKA_ALLOW_PARTITION_GROWTH exists for the operator who HAS planned that migration and
+// wants the pass to perform the growth step.
+//
+// # TOPIC-01: the replication factor of an EXISTING topic is verified, not assumed
+//
+// The factor was previously applied to topics this pass CREATED and discarded from the
+// metadata of topics that already existed, so a topic sitting at one replica was reported as
+// assured under a configuration asking for three. The report said the durability requirement
+// was met; the cluster did not meet it, and a single broker failure would have taken the
+// events with it.
+//
+// The observed minimum replica count is now recorded on every assurance entry and compared
+// against the configured factor. A shortfall returns ErrReplicationFactorInadequate. The
+// MINIMUM across partitions is used because durability is decided by the weakest one.
 //
 // A topic with MORE partitions than configured is LEFT ALONE and reported. Kafka cannot
 // reduce a partition count at all, so attempting it can only fail; but the deeper reason
@@ -783,8 +988,11 @@ type topicCreationOutcome struct {
 // Returns:
 //   - TopicAssuranceReport: populated even when an error is returned, so a caller can
 //     see how far the assurance got.
-//   - error: ErrKafkaAdminNotConfigured when no broker is configured, an actionable
-//     error when the replication factor is unconfigured, or a wrapped broker error.
+//   - error: ErrKafkaAdminNotConfigured when no broker is configured, an actionable error
+//     when the replication factor is unconfigured, ErrPartitionGrowthRefused when a
+//     non-empty topic needs growing, ErrReplicationFactorInadequate when an existing topic
+//     is under-replicated, or a wrapped broker error. The two geometry errors are joined
+//     when both apply, and the report is fully populated alongside them.
 func (a *KafkaAdminClient) EnsureTopics(ctx context.Context) (TopicAssuranceReport, error) {
 	report := TopicAssuranceReport{CompletedAt: time.Now().UTC()}
 	if err := a.ready(ctx); err != nil {
@@ -803,7 +1011,7 @@ func (a *KafkaAdminClient) EnsureTopics(ctx context.Context) (TopicAssuranceRepo
 	}
 
 	// The inventory comes from event_topics.go, never from literals here, so this
-	// operation and scripts/kafka-provision.sh provision exactly the same eight topics
+	// operation and scripts/kafka-provision.sh provision exactly the same topics
 	// under whatever KAFKA_TOPIC_PREFIX is configured.
 	desired := AllTopicsWithDeadLetters()
 
@@ -827,25 +1035,56 @@ func (a *KafkaAdminClient) EnsureTopics(ctx context.Context) (TopicAssuranceRepo
 		}
 	}
 
+	// Re-read as metadata rather than counts, because the replica sets are needed too and a
+	// second read would observe a different moment from the one the counts came from.
+	observed, err := a.topicMetadata(ctx, desired)
+	if err != nil {
+		return report, err
+	}
+
 	plan := a.planAssurance(desired, partitionsBefore, outcome)
 	report.Topics = plan.assurances
 	report.CreatedCount = plan.created
 	report.UnchangedCount = plan.unchanged
 	report.ShrinkRefusedCount = plan.shrinkRefused
 
+	replicationErr := a.verifyReplication(report.Topics, observed)
+
+	var growthErr error
 	if len(plan.grow) > 0 {
-		// The plan describes the topics as they are, so a failure here returns a report
-		// that still says "one partition", not one that claims a growth that did not
-		// happen. The entries are only updated once the broker has confirmed it.
-		if growErr := a.growTopics(ctx, plan.grow); growErr != nil {
-			return report, growErr
+		growable, refused, inspectErr := a.partitionGrowthDecision(ctx, plan.grow, observed)
+		if inspectErr != nil {
+			return report, inspectErr
 		}
 
-		a.markPartitionsGrown(report.Topics, plan.grow)
-		report.GrownCount = len(plan.grow)
+		if len(refused) > 0 {
+			a.markGrowthRefused(report.Topics, refused)
+			report.GrowthRefusedCount = len(refused)
+			growthErr = growthRefusedError(refused, a.partitions)
+		}
+
+		if len(growable) > 0 {
+			// The plan describes the topics as they are, so a failure here returns a report
+			// that still says "one partition", not one that claims a growth that did not
+			// happen. The entries are only updated once the broker has confirmed it.
+			if growErr := a.growTopics(ctx, growable); growErr != nil {
+				return report, growErr
+			}
+
+			a.markPartitionsGrown(report.Topics, growable)
+			report.GrownCount = len(growable)
+		}
 	}
 
 	report.CompletedAt = time.Now().UTC()
+
+	// Any cached partition layout is now KNOWN to be wrong rather than merely old: a topic
+	// was created or repartitioned. Dropping the snapshot here — rather than waiting for
+	// the TTL — is what stops a lag measurement taken straight after provisioning from
+	// reporting against a layout that no longer exists.
+	if report.CreatedCount > 0 || report.GrownCount > 0 {
+		a.InvalidateOffsetSnapshot()
+	}
 
 	logrus.WithFields(logrus.Fields{
 		"topics":             len(report.Topics),
@@ -853,11 +1092,186 @@ func (a *KafkaAdminClient) EnsureTopics(ctx context.Context) (TopicAssuranceRepo
 		"grown":              report.GrownCount,
 		"unchanged":          report.UnchangedCount,
 		"shrink_refused":     report.ShrinkRefusedCount,
+		"growth_refused":     report.GrowthRefusedCount,
 		"partitions":         report.Partitions,
 		"replication_factor": report.ReplicationFactor,
 	}).Info("kafka admin: event topics assured")
 
-	return report, nil
+	// Joined rather than short-circuited: an operator fixing a geometry problem needs to see
+	// every geometry problem, not the first one in an arbitrary order.
+	return report, errors.Join(replicationErr, growthErr)
+}
+
+// ErrPartitionGrowthRefused reports that a topic needs more partitions and already holds
+// records, so growing it would re-map keys and split aggregate histories.
+var ErrPartitionGrowthRefused = errors.New(
+	"kafka admin: refusing to add partitions to a topic that already holds records",
+)
+
+// ErrReplicationFactorInadequate reports that an existing topic has fewer replicas than the
+// configured replication factor.
+var ErrReplicationFactorInadequate = errors.New(
+	"kafka admin: an existing topic has fewer replicas than KAFKA_REPLICATION_FACTOR requires",
+)
+
+// verifyReplication records the observed replica count on each assurance entry and reports
+// every topic that falls short of the configured factor.
+//
+// It records BEFORE it judges, so the report describes the cluster accurately whether or not
+// an error is returned — which is what makes the error actionable: the operator reads the
+// report to see which topics and how far short.
+//
+// Parameters:
+//   - assurances []TopicAssurance: the report entries, mutated in place.
+//   - observed map[string]observedTopicMetadata: the metadata read.
+//
+// Returns:
+//   - error: wrapping ErrReplicationFactorInadequate and naming every short topic, or nil.
+func (a *KafkaAdminClient) verifyReplication(
+	assurances []TopicAssurance,
+	observed map[string]observedTopicMetadata,
+) error {
+	short := make([]string, 0, len(assurances))
+
+	for i := range assurances {
+		metadata, exists := observed[assurances[i].Topic]
+		if !exists || metadata.minReplicas <= 0 {
+			// The topic is not visible yet — created moments ago, or its leader is still
+			// being assigned. Its factor was set by whoever created it and cannot be read
+			// now; the next assurance pass reads it.
+			continue
+		}
+
+		assurances[i].ReplicationFactor = metadata.minReplicas
+
+		if metadata.minReplicas < a.replicationFactor {
+			assurances[i].ReplicationInadequate = true
+			short = append(short, fmt.Sprintf("%s (%d)", assurances[i].Topic, metadata.minReplicas))
+
+			logrus.WithFields(logrus.Fields{
+				"topic":             assurances[i].Topic,
+				"observed_replicas": metadata.minReplicas,
+				"configured_factor": a.replicationFactor,
+				"consequence":       "events on this topic are lost if that broker is lost",
+				"remedy":            "reassign partitions with kafka-reassign-partitions",
+			}).Error(
+				"kafka admin: existing topic is under-replicated relative to KAFKA_REPLICATION_FACTOR; " +
+					"a replication factor cannot be raised by creating a topic that already exists",
+			)
+		}
+	}
+
+	if len(short) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"%w: %s each have fewer replicas than the configured factor %d. Raising the factor of an "+
+			"existing topic requires a partition reassignment (kafka-reassign-partitions); it cannot be "+
+			"done by re-running topic assurance",
+		ErrReplicationFactorInadequate, strings.Join(short, ", "), a.replicationFactor,
+	)
+}
+
+// partitionGrowthDecision splits the topics that need growing into those that may be grown
+// and those that must not be.
+//
+// A topic is growable when it holds NO RECORDS, because there is then no key-to-partition
+// mapping to preserve. It is also growable when an operator has set
+// KAFKA_ALLOW_PARTITION_GROWTH, which is the explicit statement that the ordering
+// consequences have been planned for — that path logs at warning level naming the record
+// count it is about to re-map.
+//
+// Parameters:
+//   - ctx context.Context
+//   - candidates []string: topics with fewer partitions than configured.
+//   - observed map[string]observedTopicMetadata: the metadata read, for partition IDs.
+//
+// Returns:
+//   - growable []string: topics safe to grow, in the candidates' order.
+//   - refused []string: topics that hold records and must not be grown.
+//   - error: a wrapped broker error from the offset read.
+func (a *KafkaAdminClient) partitionGrowthDecision(
+	ctx context.Context,
+	candidates []string,
+	observed map[string]observedTopicMetadata,
+) (growable, refused []string, err error) {
+	partitions := make(map[string][]int, len(candidates))
+	for _, topic := range candidates {
+		if metadata, exists := observed[topic]; exists && len(metadata.partitionIDs) > 0 {
+			partitions[topic] = metadata.partitionIDs
+		}
+	}
+
+	holding, err := a.topicsHoldingRecords(ctx, partitions)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	growable = make([]string, 0, len(candidates))
+	refused = make([]string, 0, len(candidates))
+
+	for _, topic := range candidates {
+		records, occupied := holding[topic]
+		switch {
+		case !occupied:
+			growable = append(growable, topic)
+
+		case a.allowPartitionGrowth:
+			logrus.WithFields(logrus.Fields{
+				"topic":      topic,
+				"records":    records,
+				"partitions": a.partitions,
+			}).Warn(
+				"kafka admin: growing a topic that holds records because KAFKA_ALLOW_PARTITION_GROWTH is " +
+					"set. Keys already written will re-map to different partitions, so the per-aggregate " +
+					"ordering of existing events is not preserved",
+			)
+
+			growable = append(growable, topic)
+
+		default:
+			refused = append(refused, topic)
+		}
+	}
+
+	return growable, refused, nil
+}
+
+// markGrowthRefused records a refusal on the report entries.
+//
+// Parameters:
+//   - assurances []TopicAssurance: the report entries, mutated in place.
+//   - refused []string: the topics that were not grown.
+func (a *KafkaAdminClient) markGrowthRefused(assurances []TopicAssurance, refused []string) {
+	names := make(map[string]struct{}, len(refused))
+	for _, topic := range refused {
+		names[topic] = struct{}{}
+	}
+
+	for i := range assurances {
+		if _, ok := names[assurances[i].Topic]; ok {
+			assurances[i].GrowthRefused = true
+		}
+	}
+}
+
+// growthRefusedError builds the actionable message for a refused growth.
+//
+// Parameters:
+//   - refused []string: the topics that were not grown.
+//   - configured int: the partition count they fall short of.
+//
+// Returns:
+//   - error: wrapping ErrPartitionGrowthRefused.
+func growthRefusedError(refused []string, configured int) error {
+	return fmt.Errorf(
+		"%w: %s hold records and have fewer than the configured %d partitions. Adding partitions would "+
+			"re-map keys and split existing aggregate histories across partitions, breaking per-aggregate "+
+			"ordering irreversibly. Provision a correctly-shaped topic and migrate consumers to it, or set "+
+			"KAFKA_ALLOW_PARTITION_GROWTH once that migration is planned",
+		ErrPartitionGrowthRefused, strings.Join(refused, ", "), configured,
+	)
 }
 
 // topicAssurancePlan is what planAssurance decided: the per-topic report entries as the
@@ -1137,20 +1551,79 @@ func (a *KafkaAdminClient) growTopics(ctx context.Context, topics []string) erro
 //     instance, which means the administrative principal lacks the grant it needs and
 //     must be reported rather than mistaken for an absent topic.
 func (a *KafkaAdminClient) topicPartitions(ctx context.Context, topics []string) (map[string][]int, error) {
+	metadata, err := a.topicMetadata(ctx, topics)
+	if err != nil {
+		return nil, err
+	}
+
+	partitions := make(map[string][]int, len(metadata))
+	for topic := range metadata {
+		partitions[topic] = metadata[topic].partitionIDs
+	}
+
+	return partitions, nil
+}
+
+// observedTopicMetadata is what the broker says about one existing topic.
+//
+// The REPLICA COUNT is carried alongside the partition IDs because a topic's durability is
+// as much a part of its geometry as its partition count, and it was previously read and
+// thrown away — see EnsureTopics for what that cost.
+type observedTopicMetadata struct {
+	// partitionIDs are the topic's partition IDs, ascending.
+	partitionIDs []int
+
+	// minReplicas is the SMALLEST replica-set size across the topic's partitions.
+	//
+	// The minimum rather than an average or the first, because durability is decided by
+	// the weakest partition: a topic with five partitions replicated three times and one
+	// replicated once loses data when that one broker fails, and reporting three would
+	// hide exactly the partition that matters.
+	minReplicas int
+}
+
+// topicMetadata probes which of the given topics exist, which partition IDs each has, and
+// how many replicas the least-replicated partition of each has.
+//
+// It is the single metadata read in this file; topic assurance, consumer lag and the offset
+// snapshot all go through it, so they cannot disagree about which topics exist.
+//
+// Naming the topics explicitly is safe with respect to auto-creation: kafka-go never sets
+// the metadata request's AllowAutoTopicCreation flag, so an unknown topic is reported as
+// unknown rather than being created behind the caller's back with the broker's default
+// single partition and default replication factor.
+//
+// Parameters:
+//   - ctx context.Context
+//   - topics []string: the topics to probe.
+//
+// Returns:
+//   - map[string]observedTopicMetadata: one entry per EXISTING topic. An absent key means
+//     the topic does not exist, or exists but has no visible partitions yet.
+//   - error: a wrapped transport error, or a per-topic error that is not simply "unknown
+//     topic" or "leader not available".
+func (a *KafkaAdminClient) topicMetadata(
+	ctx context.Context,
+	topics []string,
+) (map[string]observedTopicMetadata, error) {
 	response, err := a.client.Metadata(ctx, &kafka.MetadataRequest{Topics: topics})
 	if err != nil {
 		return nil, fmt.Errorf("kafka admin: reading topic metadata: %w", err)
 	}
 
-	partitions := make(map[string][]int, len(response.Topics))
+	partitions := make(map[string]observedTopicMetadata, len(response.Topics))
 	for _, topic := range response.Topics {
 		if len(topic.Partitions) > 0 {
 			ids := make([]int, 0, len(topic.Partitions))
+			minReplicas := -1
 			for _, partition := range topic.Partitions {
 				ids = append(ids, partition.ID)
+				if replicas := len(partition.Replicas); minReplicas < 0 || replicas < minReplicas {
+					minReplicas = replicas
+				}
 			}
 			sort.Ints(ids)
-			partitions[topic.Name] = ids
+			partitions[topic.Name] = observedTopicMetadata{partitionIDs: ids, minReplicas: minReplicas}
 
 			continue
 		}
@@ -1172,8 +1645,7 @@ func (a *KafkaAdminClient) topicPartitions(ctx context.Context, topics []string)
 	return partitions, nil
 }
 
-// partitionCounts is topicPartitions reduced to a count per topic, which is all the
-// topic-assurance path needs.
+// partitionCounts is topicMetadata reduced to a count per topic.
 //
 // Parameters:
 //   - ctx context.Context
@@ -1181,7 +1653,7 @@ func (a *KafkaAdminClient) topicPartitions(ctx context.Context, topics []string)
 //
 // Returns:
 //   - map[string]int: partition count per existing topic.
-//   - error: as topicPartitions.
+//   - error: as topicMetadata.
 func (a *KafkaAdminClient) partitionCounts(ctx context.Context, topics []string) (map[string]int, error) {
 	partitions, err := a.topicPartitions(ctx, topics)
 	if err != nil {
@@ -1194,6 +1666,62 @@ func (a *KafkaAdminClient) partitionCounts(ctx context.Context, topics []string)
 	}
 
 	return counts, nil
+}
+
+// topicsHoldingRecords reports which of the given topics currently hold at least one
+// retained record.
+//
+// It is the test partition growth is gated on: growing an EMPTY topic re-maps nothing,
+// while growing one that holds records re-maps keys to partitions and splits an aggregate's
+// history irreversibly.
+//
+// A partition whose offsets the broker will not report is treated as NON-EMPTY. That is the
+// safe direction: assuming empty on missing information is what would allow the destructive
+// growth this check exists to prevent.
+//
+// Parameters:
+//   - ctx context.Context
+//   - partitions map[string][]int: the partitions to inspect, per topic.
+//
+// Returns:
+//   - map[string]int64: retained record count per topic, only for topics holding records.
+//   - error: a wrapped transport error.
+func (a *KafkaAdminClient) topicsHoldingRecords(
+	ctx context.Context,
+	partitions map[string][]int,
+) (map[string]int64, error) {
+	if len(partitions) == 0 {
+		return nil, nil
+	}
+
+	bounds, err := a.offsetBounds(ctx, partitions)
+	if err != nil {
+		return nil, err
+	}
+
+	holding := make(map[string]int64, len(partitions))
+	for topic, ids := range partitions {
+		var records int64
+
+		for _, id := range ids {
+			bound, ok := bounds[topic][id]
+			if !ok || bound.unavailable {
+				// Unknown is treated as occupied. Guessing "empty" here would authorise a
+				// growth that cannot be undone.
+				records++
+
+				continue
+			}
+
+			records += retainedRecords(bound.first, bound.end)
+		}
+
+		if records > 0 {
+			holding[topic] = records
+		}
+	}
+
+	return holding, nil
 }
 
 // missingTopics lists the requested topics the broker does not have.
@@ -1261,6 +1789,120 @@ func normalizeTopicList(topics []string) []string {
 	return normalized
 }
 
+// RedactedSecretPlaceholder is what a SubscriberSecret renders as, in every form.
+//
+// A fixed, obviously-deliberate string rather than an empty value: an empty rendering
+// reads as "there was no secret", which would make a leak and an absence look the same in
+// a log line.
+const RedactedSecretPlaceholder = "[REDACTED]"
+
+// SubscriberSecret carries a generated SCRAM password in a form that cannot be printed,
+// logged or serialised by accident.
+//
+// # Why a type rather than a convention
+//
+// The password was previously a plain string field on the provisioning request. Nothing
+// in this file leaked it — that is asserted by tests — but the protection was a property
+// of the code that happened to exist rather than of the value itself. A plain string
+// field is carried into a log the moment anyone writes logrus.WithField("request", req),
+// into an API response the moment the struct is embedded in one, and into a stack trace
+// or a test failure message whenever %+v is used on anything containing it. Each of those
+// is one ordinary line of code away, none of them fails, and the leak is permanent
+// because logs are retained.
+//
+// This type removes the possibility instead of documenting the rule:
+//
+//   - Format covers EVERY fmt verb, so %s, %v, %+v, %#v, %q and %x all render the
+//     placeholder. Format is what fmt consults first, ahead of Stringer.
+//   - MarshalJSON and MarshalText cover encoding/json and every library that uses the
+//     text marshaller, so a struct carrying one can be serialised without exposing it.
+//   - The value itself is unexported, so no package outside this one can read it at all.
+//
+// The field on the request stays EXPORTED and typed as this struct, which is load-bearing
+// and easy to get wrong: fmt can only call a field's methods when the field is exported
+// (it needs CanInterface). An unexported field of a redacting type would be printed by
+// %+v as its raw contents, so hiding the field would defeat the redaction rather than
+// strengthen it.
+//
+// # Reading it back
+//
+// reveal is unexported, so the plaintext is reachable only from this package, where the
+// derivation happens. Nothing returns it, and no exported accessor exists: the credential
+// is handed to the subscriber exactly once by the endpoint that generated it, which holds
+// the plaintext itself and never needs to read it back out of here.
+type SubscriberSecret struct {
+	// value is the plaintext. Unexported so that no other package can read it, and
+	// deliberately not tagged: no tag is needed because the marshallers below are what
+	// encoding/json consults.
+	value string
+}
+
+// NewSubscriberSecret wraps a generated password.
+//
+// Parameters:
+//   - password string: the plaintext, generated by the subscriber service.
+//
+// Returns:
+//   - SubscriberSecret: a value that renders as RedactedSecretPlaceholder everywhere.
+func NewSubscriberSecret(password string) SubscriberSecret {
+	return SubscriberSecret{value: password}
+}
+
+// IsZero reports whether no secret is held. Used by validation, which must distinguish
+// "absent" from "present but unusable" without reading the value.
+func (s SubscriberSecret) IsZero() bool {
+	return s.value == ""
+}
+
+// Len returns the secret's length in bytes.
+//
+// The length is safe to publish and is the one property worth reporting: it lets a test
+// or an operator confirm a secret of the expected strength was generated without the
+// value appearing anywhere.
+func (s SubscriberSecret) Len() int {
+	return len(s.value)
+}
+
+// String renders the placeholder, so a Stringer-aware caller cannot print the secret.
+func (s SubscriberSecret) String() string {
+	return RedactedSecretPlaceholder
+}
+
+// GoString renders the placeholder for %#v, which would otherwise print the struct
+// literal including the unexported field's contents.
+func (s SubscriberSecret) GoString() string {
+	return "SubscriberSecret(" + RedactedSecretPlaceholder + ")"
+}
+
+// Format renders the placeholder for every fmt verb.
+//
+// Implementing fmt.Formatter rather than only fmt.Stringer is what closes %+v, %#v, %q
+// and %x: fmt consults Formatter first and ignores Stringer entirely when it is present,
+// so a single method covers verbs a Stringer does not reach.
+func (s SubscriberSecret) Format(state fmt.State, _ rune) {
+	_, _ = state.Write([]byte(RedactedSecretPlaceholder))
+}
+
+// MarshalJSON renders the placeholder as a JSON string.
+//
+// Returning the placeholder rather than an error is deliberate: an error would make any
+// struct carrying a secret unserialisable, and a caller would work around that by
+// copying the field out — which is the leak this type exists to prevent. A redacted
+// value serialises cleanly and says plainly that something was withheld.
+func (s SubscriberSecret) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + RedactedSecretPlaceholder + `"`), nil
+}
+
+// MarshalText renders the placeholder, covering encoding.TextMarshaler consumers.
+func (s SubscriberSecret) MarshalText() ([]byte, error) {
+	return []byte(RedactedSecretPlaceholder), nil
+}
+
+// reveal returns the plaintext. Unexported by design: only this package derives from it.
+func (s SubscriberSecret) reveal() string {
+	return s.value
+}
+
 // SubscriberProvisioningRequest is everything needed to turn a registry row into a real
 // Kafka access boundary: one SCRAM credential plus a set of ACL bindings.
 //
@@ -1281,7 +1923,14 @@ type SubscriberProvisioningRequest struct {
 	// Password is the generated secret. Required, and restricted to printable ASCII —
 	// see validateSCRAMPassword for why that restriction is a correctness requirement
 	// rather than a policy preference.
-	Password string
+	//
+	// It is TYPED so that printing, logging or serialising this struct cannot expose it;
+	// see SubscriberSecret. The field stays EXPORTED, which is load-bearing rather than
+	// incidental: fmt can only call a field's methods when it can take its interface,
+	// so an unexported field of a redacting type would be printed by %+v as its raw
+	// contents and the redaction would be defeated by the very change meant to
+	// strengthen it. Do not add a plain string field that would carry the plaintext.
+	Password SubscriberSecret
 
 	// ConsumerGroupPrefix is the consumer group namespace the subscriber is granted
 	// Read on, bound with a PREFIXED pattern so every group whose name starts with it
@@ -1334,13 +1983,13 @@ type SubscriberProvisioningRequest struct {
 //   - SubscriberProvisioningRequest: ready to pass to ProvisionSubscriberPrincipal.
 func NewSubscriberProvisioningRequest(subscriber *model.EventSubscriber, password string) SubscriberProvisioningRequest {
 	if subscriber == nil {
-		return SubscriberProvisioningRequest{Password: password}
+		return SubscriberProvisioningRequest{Password: NewSubscriberSecret(password)}
 	}
 
 	return SubscriberProvisioningRequest{
 		SubscriberID:        subscriber.SubscriberID,
 		Principal:           subscriber.KafkaPrincipal,
-		Password:            password,
+		Password:            NewSubscriberSecret(password),
 		ConsumerGroupPrefix: subscriber.ConsumerGroupID,
 		Topics:              subscriber.AuthorizedTopics,
 	}
@@ -1354,41 +2003,63 @@ func NewSubscriberProvisioningRequest(subscriber *model.EventSubscriber, passwor
 // returned to the subscriber exactly once by the endpoint that generated it.
 type SubscriberProvisioningResult struct {
 	// SubscriberID echoes the request, for correlation.
-	SubscriberID string `json:"subscriber_id,omitempty"`
+	SubscriberID string
 
 	// Principal is the principal the credential belongs to.
-	Principal string `json:"principal"`
+	Principal string
 
 	// Mechanism is always SubscriberSASLMechanism.
-	Mechanism string `json:"mechanism"`
+	Mechanism string
 
 	// Iterations is the PBKDF2 iteration count actually used, after the minimum was
 	// applied.
-	Iterations int `json:"iterations"`
+	Iterations int
 
 	// Topics is the normalised topic set the credential was granted Read and Describe
 	// on.
-	Topics []string `json:"topics"`
+	Topics []string
 
 	// ConsumerGroupPrefix is the group namespace granted Read, empty when none was
 	// requested.
-	ConsumerGroupPrefix string `json:"consumer_group_prefix,omitempty"`
+	ConsumerGroupPrefix string
 
 	// ACLBindings is how many bindings were created.
-	ACLBindings int `json:"acl_bindings"`
+	ACLBindings int
 
 	// CredentialReplaced is true when the principal already held a SCRAM credential and
 	// this call replaced it. Re-issuing is a supported operation, not an error, and this
 	// flag is how an operator sees that an existing consumer's credential just stopped
 	// working.
-	CredentialReplaced bool `json:"credential_replaced"`
+	CredentialReplaced bool
 
-	// AuthorizerActive reports whether the broker appears to enforce ACLs. False means
-	// the bindings were accepted and will not be enforced — see AuthorizerActive.
-	AuthorizerActive bool `json:"authorizer_active"`
+	// AuthorizerActive reports whether the broker confirmed that it enforces ACLs.
+	//
+	// It is ALWAYS true on a successful return, because provisioning now refuses to write a
+	// credential against a broker whose enforcement is not confirmed — see
+	// requireEnforcedAuthorizer. It is retained as a field rather than dropped so that the
+	// property is assertable from the result, and so a caller logging the result records the
+	// fact rather than the assumption.
+	AuthorizerActive bool
+
+	// CredentialWritten reports whether the SCRAM credential reached the broker.
+	//
+	// It exists for the failure path: a caller handed an error needs to know whether a
+	// credential now exists, because that is the difference between "retry" and "a live
+	// principal is unaccounted for". It is false on a successful compensation, which is the
+	// state the broker is actually left in.
+	CredentialWritten bool
+
+	// Compensated reports that provisioning failed after the credential was written and the
+	// credential and its attempted bindings were revoked.
+	//
+	// True means the broker was left clean; the caller must not persist an issuance record,
+	// and the secret it generated is dead. False alongside an error after CredentialWritten
+	// means revocation itself failed and a principal needs manual attention — the log line
+	// names it.
+	Compensated bool
 
 	// ProvisionedAt is when provisioning completed.
-	ProvisionedAt time.Time `json:"provisioned_at"`
+	ProvisionedAt time.Time
 }
 
 // ProvisionSubscriberPrincipal creates or replaces a subscriber's SCRAM credential and
@@ -1418,16 +2089,34 @@ type SubscriberProvisioningResult struct {
 // replay group beside its live one, say) without an administrative round trip, while
 // still excluding every other subscriber's namespace.
 //
-// # ⚠️ ACLs are only ENFORCED when the broker runs an authorizer
+// # SEC-02: enforcement is verified BEFORE the credential is written, and failure is fatal
 //
 // In KRaft mode a broker enforces ACLs only when it is started with
 // authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer.
-// WITHOUT IT, CreateACLs SUCCEEDS AND THE BINDINGS ARE NEVER APPLIED: every request
-// from every principal is allowed, the bindings are visible in kafka-acls output, and an
-// isolation test would pass while proving nothing at all. This method probes for the
-// authorizer and logs a prominent warning when the probe says it is absent, so a
-// misconfigured broker is loud rather than silent, and it reports the finding through
-// SubscriberProvisioningResult.AuthorizerActive so a test or an operator can assert it.
+// WITHOUT IT, CreateACLs SUCCEEDS AND THE BINDINGS ARE NEVER APPLIED: every request from
+// every principal is allowed, the bindings are visible in kafka-acls output, and an isolation
+// test would pass while proving nothing at all.
+//
+// The probe used to run AFTER the credential was written and was warning-only, so on such a
+// broker this method minted a working credential, returned it, and reported success. The
+// subscriber then held cluster-wide read access to every ledger topic, every dead-letter
+// topic and every other subscriber's data — and the only trace was a log line in a stream
+// nobody reads during a successful provisioning.
+//
+// Now the probe runs FIRST and it FAILS CLOSED. No credential is written, no binding is
+// created and nothing is returned unless the broker has affirmatively answered that it
+// enforces ACLs. Two distinct failures are both fatal:
+//
+//   - The broker reports SECURITY_DISABLED. There is no authorizer; a credential issued here
+//     would have no boundary at all.
+//   - The question cannot be answered — the administrative principal may not describe ACLs,
+//     or the broker is unreachable. "I am not allowed to ask" is not "the answer is yes", and
+//     issuing a credential whose isolation is unverifiable is the same exposure as issuing one
+//     with no isolation. The remedy is operational and the error says so: grant the
+//     administrative principal Describe on the cluster.
+//
+// The finding is still reported through SubscriberProvisioningResult.AuthorizerActive, which
+// is now always true on a successful return — a property a test can assert directly.
 //
 // # Secret handling
 //
@@ -1473,6 +2162,14 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 	result.Topics = topics
 	result.ConsumerGroupPrefix = groupPrefix
 
+	// SEC-02: BEFORE anything is written. A credential minted against a broker that does not
+	// enforce ACLs — or one whose enforcement cannot be confirmed — has no boundary, so this
+	// is a precondition rather than a diagnostic.
+	if err := a.requireEnforcedAuthorizer(ctx, principal); err != nil {
+		return result, err
+	}
+	result.AuthorizerActive = true
+
 	// Informational only: the upsert below works whether or not a credential exists, so a
 	// probe failure that is not a cancellation must not stop provisioning.
 	existed, err := a.SubscriberCredentialExists(ctx, principal)
@@ -1487,7 +2184,7 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 		)
 	}
 
-	upsertion, err := deriveScramUpsertion(principal, req.Password, iterations)
+	upsertion, err := deriveScramUpsertion(principal, req.Password.reveal(), iterations)
 	if err != nil {
 		return result, err
 	}
@@ -1495,13 +2192,17 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 	if err := a.upsertScramCredential(ctx, upsertion); err != nil {
 		return result, err
 	}
-
-	// Probed after the credential is written and before the bindings, so the warning is
-	// emitted even if the binding call then fails.
-	result.AuthorizerActive = a.warnIfAuthorizerInactive(ctx, principal)
+	result.CredentialWritten = true
 
 	bindings := req.aclEntries()
 	if err := a.createACLBindings(ctx, principal, bindings); err != nil {
+		// AUTH-01: the credential exists and its boundary does not. That combination is the
+		// one state provisioning must never leave behind, because the principal can
+		// authenticate — so it is compensated by revoking the credential before returning.
+		a.compensateFailedProvisioning(ctx, principal, bindings)
+		result.CredentialWritten = false
+		result.Compensated = true
+
 		return result, err
 	}
 	result.ACLBindings = len(bindings)
@@ -1544,32 +2245,212 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 	return result, nil
 }
 
-// validate rejects a request that cannot produce a usable credential.
+// validate rejects a request that cannot produce a usable credential, or that asks for a
+// boundary this service will not grant.
 //
-// No message quotes the password, not even to say what is wrong with it beyond the rule
-// it broke.
+// # SEC-03: the boundary is DERIVED, and the request is checked against it
+//
+// The principal and the consumer group namespace are not names, they are the access
+// boundary: the credential is minted for the principal and every ACL binding names it and
+// the namespace. Accepting them from a caller — which is what merely trimming them amounted
+// to — meant a request could ask for the principal or group "*", and Kafka treats the
+// resource name "*" as matching ANY resource, so the binding became a cluster-wide grant. A
+// namespace could also be chosen to OVERLAP another subscriber's, which is a cross-domain
+// grant obtained through an ordinary authorized request.
+//
+// So both are derived from the subscriber's immutable identifier, and a supplied value is
+// only ever COMPARED against the derived one. A mismatch is refused rather than corrected,
+// because a caller that sent a different boundary asked for something it may not have and
+// silently substituting the right answer would hide that.
+//
+// The topic list is checked against the grantable allowlist for the same reason — see
+// normalizedTopics — and the host pattern is checked because an unconstrained host string
+// ends up inside an ACL binding.
+//
+// No message quotes the password, not even to say what is wrong with it beyond the rule it
+// broke.
 //
 // Returns:
-//   - error: nil when the request can be provisioned.
+//   - error: nil when the request can be provisioned exactly as asked.
 func (r SubscriberProvisioningRequest) validate() error {
-	if r.principal() == "" {
+	subscriberID := strings.TrimSpace(r.SubscriberID)
+	if subscriberID == "" {
 		return errors.New(
-			"kafka admin: a Kafka principal is required to provision a subscriber credential; " +
-				"the subscriber's kafka_principal is empty",
+			"kafka admin: a subscriber id is required to provision a credential; the principal and " +
+				"consumer group namespace are derived from it and cannot be taken from the request",
 		)
 	}
 
-	return validateSCRAMPassword(r.Password)
+	expectedPrincipal, err := model.CanonicalKafkaPrincipal(subscriberID)
+	if err != nil {
+		return fmt.Errorf("kafka admin: cannot derive a Kafka principal for this subscriber: %w", err)
+	}
+
+	// Compared EXACTLY, not after trimming. A recorded principal that differs from the derived
+	// one only by whitespace is the SEC-04 duplicate seen from this side: it looks like the
+	// same identity, and a registry that holds it can hold two rows for one principal. The
+	// values are quoted so a whitespace-only difference is visible in the message.
+	if r.Principal != expectedPrincipal {
+		return fmt.Errorf(
+			"kafka admin: refusing to provision principal %q for subscriber %q; the only principal "+
+				"this subscriber may hold is %q, derived from its identifier. A principal supplied by a "+
+				"caller is a request for an access boundary, not for a name",
+			r.Principal, subscriberID, expectedPrincipal,
+		)
+	}
+
+	expectedNamespace, err := model.CanonicalConsumerGroupNamespace(subscriberID)
+	if err != nil {
+		return fmt.Errorf("kafka admin: cannot derive a consumer group namespace for this subscriber: %w", err)
+	}
+
+	// The request carries the subscriber's consumer group, which must be a leaf INSIDE its
+	// own namespace. The prefixed binding is then made over the namespace, never over the
+	// supplied string, so a group chosen to overlap a sibling's namespace cannot be granted.
+	if group := strings.TrimSpace(r.ConsumerGroupPrefix); group != "" &&
+		!model.IsInSubscriberGroupNamespace(group, expectedNamespace) {
+		return fmt.Errorf(
+			"kafka admin: refusing to grant consumer group %q to subscriber %q; it lies outside the "+
+				"subscriber's own namespace %q, and a prefixed grant on it would reach another "+
+				"subscriber's groups",
+			group, subscriberID, expectedNamespace,
+		)
+	}
+
+	if err := r.validateTopics(); err != nil {
+		return err
+	}
+
+	if err := r.validateHost(); err != nil {
+		return err
+	}
+
+	return validateSCRAMPassword(r.Password.reveal())
 }
 
-// principal returns the trimmed SASL username.
+// validateTopics refuses any topic outside the subscriber-grantable allowlist.
+//
+// # SEC-03: an allowlist, not a shape check
+//
+// The list arrives from the registry and ends up as the resource name of a LITERAL ACL
+// binding, so whatever is in it is what the credential can read. Three classes have to be
+// excluded and each for its own reason:
+//
+//   - "*" and other WILDCARDS, because Kafka's resource name "*" matches any resource: one
+//     such entry turns a per-topic grant into a cluster-wide one.
+//   - FOREIGN topics, because a grant over a topic Blnk does not own is a grant into
+//     somebody else's data on a broker Blnk shares.
+//   - DEAD-LETTER and INTERNAL topics, because the DLTs carry failed events with Blnk's own
+//     failure metadata and the system and quarantine categories carry Blnk's internal
+//     diagnostics and uncatalogued payloads. None of those has a subscriber audience.
+//
+// IsSubscriberGrantableTopic is the single test for all three, so the API layer, this path
+// and the provisioning script cannot disagree about what is grantable.
+//
+// Returns:
+//   - error: naming the first offending topic, nil when every topic is grantable.
+func (r SubscriberProvisioningRequest) validateTopics() error {
+	for _, topic := range normalizeTopicList(r.Topics) {
+		if !IsSubscriberGrantableTopic(topic) {
+			return fmt.Errorf(
+				"kafka admin: refusing to grant topic %q; only Blnk-owned subscriber-facing category "+
+					"topics may be granted (%s). Dead-letter and internal topics carry Blnk's own "+
+					"failure and diagnostic data and have no subscriber audience",
+				topic, strings.Join(SubscriberGrantableTopics(), ", "),
+			)
+		}
+	}
+
+	return nil
+}
+
+// validateHost refuses a host pattern that is neither the explicit any-host wildcard nor a
+// plausible single host.
+//
+// The value becomes the Host field of every ACL binding, where "*" means "from anywhere".
+// That is the intended default, so it is accepted as an exact value — but a string that
+// merely CONTAINS a wildcard, or carries whitespace or control characters, is refused: it
+// would either widen the binding in a way nobody asked for or produce a binding that matches
+// nothing while looking like a restriction.
+//
+// Returns:
+//   - error: nil when the host is usable.
+func (r SubscriberProvisioningRequest) validateHost() error {
+	host := strings.TrimSpace(r.Host)
+	if host == "" || host == ACLHostAny {
+		return nil
+	}
+
+	for i := 0; i < len(host); i++ {
+		if character := host[i]; character < '!' || character > '~' ||
+			character == '*' || character == '?' || character == ',' {
+			return fmt.Errorf(
+				"kafka admin: refusing ACL host %q; a host restriction must be a single host, or %q "+
+					"to allow any host. Wildcards, separators and non-printable characters are not accepted",
+				host, ACLHostAny,
+			)
+		}
+	}
+
+	return nil
+}
+
+// principal returns the trimmed SASL username as SUPPLIED.
+//
+// It is trimmed only so that the comparison in validate reports a whitespace mismatch as a
+// mismatch of NAMES rather than of invisible characters. Nothing downstream relies on
+// trimming to make a value safe: validate has already established that this equals the
+// derived principal exactly.
 func (r SubscriberProvisioningRequest) principal() string {
 	return strings.TrimSpace(r.Principal)
 }
 
-// consumerGroupPrefix returns the trimmed group namespace, empty when none was given.
+// boundPrincipal returns the principal every ACL binding is made over, DERIVED from the
+// subscriber identifier.
+//
+// Bindings are made over the derived name rather than the supplied one so that the grant and
+// the credential are provably the same identity: validate refuses a mismatch, and deriving
+// here means the bindings would still be correct even if a future caller reached aclEntries
+// without going through validate.
+//
+// It falls back to the supplied principal only when derivation is impossible — an identifier
+// that is not canonical — which provisioning refuses outright. The fallback exists for
+// REVOCATION, which must be able to remove the bindings of a row written before these rules
+// existed rather than refusing to clean it up.
+func (r SubscriberProvisioningRequest) boundPrincipal() string {
+	if derived, err := model.CanonicalKafkaPrincipal(strings.TrimSpace(r.SubscriberID)); err == nil {
+		return derived
+	}
+
+	return r.principal()
+}
+
+// consumerGroupPrefix returns the PREFIXED ACL resource name for this subscriber's consumer
+// group namespace, DERIVED from its identifier.
+//
+// Two decisions are combined here, and both matter:
+//
+//   - WHETHER to bind at all is taken from the request. A registry row with no consumer group
+//     is a subscriber that has not been set up to consume, and it gets no group grant — the
+//     fail-closed default, reported as a warning rather than silently widened.
+//   - WHAT to bind is DERIVED and never taken from the request. validate has already confirmed
+//     the recorded group lies inside this namespace; binding the derived namespace rather than
+//     the recorded string is what makes an overlapping grant unreachable even if a future
+//     caller stops going through validate.
+//
+// An empty return therefore means either "no group recorded" or "the identifier cannot produce
+// a namespace", and validate rejects the second before this is reached.
 func (r SubscriberProvisioningRequest) consumerGroupPrefix() string {
-	return strings.TrimSpace(r.ConsumerGroupPrefix)
+	if strings.TrimSpace(r.ConsumerGroupPrefix) == "" {
+		return ""
+	}
+
+	namespace, err := model.CanonicalConsumerGroupNamespace(strings.TrimSpace(r.SubscriberID))
+	if err != nil {
+		return ""
+	}
+
+	return namespace
 }
 
 // host returns the ACL host pattern, defaulting to ACLHostAny.
@@ -1642,7 +2523,7 @@ func (r SubscriberProvisioningRequest) normalizedTopics() []string {
 //     first topic, then the second, and the group binding last. Nil only when there is
 //     nothing at all to grant.
 func (r SubscriberProvisioningRequest) aclEntries() []kafka.ACLEntry {
-	principal := kafkaPrincipalPrefix + r.principal()
+	principal := kafkaPrincipalPrefix + r.boundPrincipal()
 	host := r.host()
 	topics := r.normalizedTopics()
 	groupPrefix := r.consumerGroupPrefix()
@@ -1701,6 +2582,25 @@ func (r SubscriberProvisioningRequest) aclEntries() []kafka.ACLEntry {
 // survives round trips through shells, environment files and connection strings badly
 // enough that it has no place in a generated secret.
 //
+// # PASS-01: strength is enforced here, at the boundary that mints the credential
+//
+// This used to check the alphabet and nothing else, so a ONE-CHARACTER password passed and
+// was minted into a real, working SCRAM credential with Read on live ledger topics. There is
+// no rate limit at a Kafka SASL handshake and no lockout, so a short secret is not "weak", it
+// is open.
+//
+// Two rules replace that. A LENGTH FLOOR of MinSCRAMPasswordLength, because the secret is
+// generated by the issuing service rather than chosen by a human — nothing legitimate is
+// short, so the floor costs nobody anything and refuses everything that reached here by
+// mistake. And a DISTINCT-CHARACTER FLOOR, because a length floor alone accepts a run of
+// thirty-two identical characters, which is long and has almost no entropy; a generated
+// secret over this alphabet exceeds the floor overwhelmingly, while a padded constant does
+// not.
+//
+// Neither rule is a substitute for generating the secret properly, and neither can be: this
+// function sees a string, not its provenance. They are the boundary check that makes a
+// generator defect — or a caller passing a placeholder — impossible to mint.
+//
 // Parameters:
 //   - password string: the secret. Never echoed, in any branch.
 //
@@ -1719,6 +2619,29 @@ func validateSCRAMPassword(password string) error {
 					"authenticate; generate the secret from printable ASCII only",
 			)
 		}
+	}
+
+	if len(password) < MinSCRAMPasswordLength {
+		return fmt.Errorf(
+			"kafka admin: the SCRAM password is shorter than the %d character minimum. A subscriber "+
+				"credential is generated, never chosen, and a Kafka SASL handshake has no rate limit or "+
+				"lockout, so a short secret is guessable without restriction",
+			MinSCRAMPasswordLength,
+		)
+	}
+
+	distinct := make(map[byte]struct{}, len(password))
+	for i := 0; i < len(password); i++ {
+		distinct[password[i]] = struct{}{}
+	}
+
+	if len(distinct) < MinSCRAMPasswordDistinctChars {
+		return fmt.Errorf(
+			"kafka admin: the SCRAM password uses fewer than %d distinct characters, so it is long "+
+				"without being unpredictable. Generate it from the printable ASCII alphabet rather than "+
+				"padding a shorter value",
+			MinSCRAMPasswordDistinctChars,
+		)
 	}
 
 	return nil
@@ -1984,42 +2907,567 @@ func (a *KafkaAdminClient) AuthorizerActive(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// warnIfAuthorizerInactive probes the authorizer and shouts if it is missing.
+// ErrAuthorizerNotEnforcing reports that the broker does not enforce ACLs, or that its
+// enforcement could not be confirmed.
 //
-// It never fails provisioning. A broker that will not answer the question is a reason to
-// log, not a reason to refuse a credential the operator asked for — and refusing would
-// make Blnk unusable against a broker whose administrative principal simply lacks the
-// DescribeACLs grant.
+// It is a sentinel so the subscriber service, the API layer and a test all recognise the
+// refusal without matching message text, and so the two distinct causes — no authorizer, and
+// no answer — are provably one refusal.
+var ErrAuthorizerNotEnforcing = errors.New(
+	"kafka admin: the broker's ACL enforcement is not confirmed, so no subscriber credential may be issued",
+)
+
+// clock returns the time source, defaulting to time.Now.
+//
+// Cache expiry is the only thing in this file that depends on the passage of time, and a
+// test that had to sleep to observe it would be both slow and flaky. Reading the clock
+// through a field makes expiry directly assertable.
+//
+// Returns:
+//   - time.Time: the current instant.
+func (a *KafkaAdminClient) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+
+	return time.Now()
+}
+
+// snapshotTTL returns the effective cache lifetime.
+//
+// Zero — the value a client built by any constructor in this file carries unless told
+// otherwise — selects the default, so PRODUCTION GETS THE BENEFIT WITHOUT OPTING IN. A
+// negative value disables caching, which is what a test asserting on raw round-trip counts
+// wants and is deliberately not reachable from configuration.
+//
+// Returns:
+//   - time.Duration: the lifetime; non-positive means caching is off.
+func (a *KafkaAdminClient) snapshotTTL() time.Duration {
+	if a.offsetSnapshotTTL == 0 {
+		return defaultOffsetSnapshotTTL
+	}
+
+	return a.offsetSnapshotTTL
+}
+
+// WithOffsetSnapshotTTL sets how long a partition/end-offset snapshot may be reused.
+//
+// It follows the fluent configurator convention the outbox processors already use. A
+// negative value disables caching entirely; zero restores the default.
+//
+// Parameters:
+//   - ttl time.Duration: the lifetime. Negative disables caching, zero restores the
+//     default.
+//
+// Returns:
+//   - *KafkaAdminClient: the client, for chaining.
+func (a *KafkaAdminClient) WithOffsetSnapshotTTL(ttl time.Duration) *KafkaAdminClient {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+
+	a.offsetSnapshotTTL = ttl
+	a.offsetSnapshots = nil
+	a.authorizerProbe = cachedAuthorizerProbe{}
+
+	return a
+}
+
+// InvalidateOffsetSnapshot drops every cached snapshot and the authorizer probe.
+//
+// It exists for the two cases where a cached answer is known to be wrong rather than merely
+// old: immediately after topics are created or repartitioned, which changes the partition
+// layout a snapshot describes, and in a test that wants the next read to go to the broker.
+func (a *KafkaAdminClient) InvalidateOffsetSnapshot() {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+
+	a.offsetSnapshots = nil
+	a.authorizerProbe = cachedAuthorizerProbe{}
+}
+
+// offsetSnapshotKey builds the cache key for a topic set.
+//
+// The topics are joined with a byte that cannot occur in a Kafka topic name, so two
+// different sets cannot produce one key by concatenation. Order is preserved rather than
+// sorted: the lists reaching here are already normalised and come from a canonical order,
+// so two callers asking about the same topics produce the same key, and a differently
+// ordered list producing a second entry costs one extra snapshot rather than a wrong
+// answer.
+//
+// Parameters:
+//   - topics []string: the normalised topic list.
+//
+// Returns:
+//   - string: the cache key.
+func offsetSnapshotKey(topics []string) string {
+	return strings.Join(topics, "\x00")
+}
+
+// partitionOffsetSnapshot returns the partition layout and end offsets for a topic set,
+// from cache when it is fresh.
+//
+// # What this removes
+//
+// A consumer-lag sweep over N subscribers asked the same two questions N times — which
+// partitions exist, and where does each one end — because only the third question, the
+// group's committed offsets, actually differs between subscribers. That made a sweep cost
+// 3N round trips where 1 + 1 + N would do, and it did so on the metrics path, at whatever
+// interval the gauge is refreshed.
+//
+// The two reads are cached TOGETHER, as one snapshot, because they must be consistent with
+// each other: a partition present in the layout but absent from the bounds, or the reverse,
+// would produce a lag figure computed from two different views of the cluster.
+//
+// A failure is returned and NOT cached, so a transient broker problem is re-asked on the
+// next call instead of being remembered for the life of the TTL.
+//
+// Parameters:
+//   - ctx context.Context: cancels either read.
+//   - topics []string: the normalised, bounded topic list.
+//
+// Returns:
+//   - *offsetSnapshot: never nil when the error is nil.
+//   - error: a wrapped broker error from either read.
+func (a *KafkaAdminClient) partitionOffsetSnapshot(
+	ctx context.Context,
+	topics []string,
+) (*offsetSnapshot, error) {
+	ttl := a.snapshotTTL()
+	key := offsetSnapshotKey(topics)
+
+	if ttl > 0 {
+		a.cacheMu.Lock()
+		cached, found := a.offsetSnapshots[key]
+		a.cacheMu.Unlock()
+
+		if found && a.clock().Sub(cached.takenAt) < ttl {
+			return cached, nil
+		}
+	}
+
+	partitions, err := a.topicPartitions(ctx, topics)
+	if err != nil {
+		// The partial result is still useful to the caller: it reports which topics were
+		// missing, which is a caveat the lag report carries even on failure.
+		return &offsetSnapshot{
+			partitions: partitions,
+			missing:    missingTopics(topics, partitions),
+			takenAt:    a.clock(),
+		}, err
+	}
+
+	snapshot := &offsetSnapshot{
+		partitions: partitions,
+		missing:    missingTopics(topics, partitions),
+		takenAt:    a.clock(),
+	}
+
+	if len(partitions) > 0 {
+		bounds, boundsErr := a.offsetBounds(ctx, partitions)
+		if boundsErr != nil {
+			return snapshot, boundsErr
+		}
+		snapshot.bounds = bounds
+	}
+
+	if ttl > 0 {
+		a.cacheMu.Lock()
+		// Dropped wholesale at the bound rather than evicted entry by entry: entries live
+		// for seconds, so the next sweep repopulates exactly what it needs and precise
+		// eviction would be bookkeeping for no benefit.
+		if len(a.offsetSnapshots) >= maxCachedOffsetSnapshots {
+			a.offsetSnapshots = nil
+		}
+		if a.offsetSnapshots == nil {
+			a.offsetSnapshots = make(map[string]*offsetSnapshot, 8)
+		}
+		a.offsetSnapshots[key] = snapshot
+		a.cacheMu.Unlock()
+	}
+
+	return snapshot, nil
+}
+
+// authorizerActiveCached answers "does this broker enforce ACLs" from a memoised probe.
+//
+// Whether a broker runs an authorizer comes from its own startup configuration, so the
+// answer cannot change while the broker is up. Asking on every provisioning call therefore
+// spent a serial DescribeACLs round trip — from the same five-second budget as the
+// credential write and the ACL batch — to re-learn something already known.
+//
+// The memo has a TTL rather than being permanent, because a long-lived server can be
+// pointed at a cluster that is restarted with different settings underneath it, and
+// continuing to report "enforcing" would be reporting a security property that has stopped
+// being true.
+//
+// A FAILED probe is not cached. A permission problem or a transient broker error must be
+// re-asked next time; caching it would turn one bad answer into TTL-long silence about
+// whether the isolation guarantee holds.
 //
 // Parameters:
 //   - ctx context.Context
-//   - principal string: included in the log line for correlation.
 //
 // Returns:
-//   - bool: true only when the broker was asked and answered that it enforces ACLs.
-func (a *KafkaAdminClient) warnIfAuthorizerInactive(ctx context.Context, principal string) bool {
+//   - bool: true when the broker enforces ACLs.
+//   - error: as AuthorizerActive.
+func (a *KafkaAdminClient) authorizerActiveCached(ctx context.Context) (bool, error) {
+	ttl := a.snapshotTTL()
+
+	if ttl > 0 {
+		a.cacheMu.Lock()
+		probe := a.authorizerProbe
+		a.cacheMu.Unlock()
+
+		if !probe.checkedAt.IsZero() && a.clock().Sub(probe.checkedAt) < ttl {
+			return probe.active, nil
+		}
+	}
+
 	active, err := a.AuthorizerActive(ctx)
 	if err != nil {
-		logrus.WithError(err).WithField("principal", principal).Warn(
-			"kafka admin: could not confirm that the broker enforces ACLs, so the isolation guarantee for this " +
-				"principal is unverified. Confirm the broker runs " +
+		return false, err
+	}
+
+	a.cacheMu.Lock()
+	a.authorizerProbe = cachedAuthorizerProbe{active: active, checkedAt: a.clock()}
+	a.cacheMu.Unlock()
+
+	return active, nil
+}
+
+// requireEnforcedAuthorizer is the SEC-02 gate: no credential is written unless the broker has
+// affirmatively confirmed that it enforces ACLs.
+//
+// It replaces a warning-only probe that ran AFTER the credential was written. The difference
+// is the whole finding: a warning on a broker with no authorizer still left a working
+// credential with cluster-wide read access in a subscriber's hands, whereas this refuses
+// before anything exists to clean up.
+//
+// Both failure modes are fatal, and the messages differ because the remedies do:
+//
+//   - NO AUTHORIZER. The broker must be restarted with the KRaft StandardAuthorizer. Until
+//     then no boundary of any kind can be created on it.
+//   - NO ANSWER. Usually the administrative principal lacks Describe on the cluster, or the
+//     broker is unreachable. Unverifiable enforcement is treated exactly as absent
+//     enforcement, because from the point of view of the credential about to be minted the
+//     two are indistinguishable.
+//
+// Parameters:
+//   - ctx context.Context: cancels the probe.
+//   - principal string: included in the log line and the error for correlation.
+//
+// Returns:
+//   - error: nil ONLY when the broker confirmed it enforces ACLs; otherwise wrapping
+//     ErrAuthorizerNotEnforcing.
+func (a *KafkaAdminClient) requireEnforcedAuthorizer(ctx context.Context, principal string) error {
+	// The MEMOISED probe, not the raw one. Whether the broker enforces ACLs comes from its
+	// own startup configuration, so asking on every provisioning call spends a serial
+	// round trip out of the five-second budget to re-learn something already known. The
+	// memo has a TTL and a failed probe is never cached, so the FAIL-CLOSED behaviour below
+	// is unchanged: an unanswerable probe is still treated as an absent boundary.
+	active, err := a.authorizerActiveCached(ctx)
+	if err != nil {
+		logrus.WithError(err).WithField("principal", principal).Error(
+			"kafka admin: refusing to issue a subscriber credential because the broker's ACL enforcement " +
+				"could not be confirmed. Confirm the broker runs " +
 				"authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer and that the " +
-				"administrative principal may describe ACLs",
+				"administrative principal is allowed to describe ACLs",
 		)
 
-		return false
+		return fmt.Errorf(
+			"%w: the enforcement probe for principal %q did not answer; an unverifiable boundary is "+
+				"treated as an absent one. Grant the administrative principal Describe on the cluster, or "+
+				"fix broker reachability, then retry",
+			ErrAuthorizerNotEnforcing, principal,
+		)
 	}
 
 	if !active {
 		logrus.WithField("principal", principal).Error(
-			"kafka admin: THE BROKER HAS NO AUTHORIZER CONFIGURED. The ACLs just created were accepted and will " +
-				"NOT be enforced: every principal can read every topic, including other subscribers' topics and " +
-				"the dead-letter topics. Start the broker with " +
+			"kafka admin: THE BROKER HAS NO AUTHORIZER CONFIGURED, so no credential was issued. ACL " +
+				"bindings would be accepted and never applied, leaving every principal able to read every " +
+				"topic including other subscribers' topics and the dead-letter topics. Start the broker with " +
 				"authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer",
+		)
+
+		return fmt.Errorf(
+			"%w: the broker reports that security is disabled, so ACL bindings for principal %q would be "+
+				"accepted and never enforced. Start the broker with "+
+				"authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer",
+			ErrAuthorizerNotEnforcing, principal,
 		)
 	}
 
-	return active
+	return nil
+}
+
+// compensateFailedProvisioning undoes a half-completed provisioning.
+//
+// # AUTH-01: a credential without its boundary must not survive the failure that created it
+//
+// Provisioning writes the SCRAM credential first and the ACL bindings second, because a
+// binding for a principal that does not exist is inert while a credential without bindings is
+// not: it AUTHENTICATES. On a broker whose default is deny that principal can read nothing,
+// but it is a live, valid credential that was handed to a subscriber by a call that then
+// reported failure — so the subscriber holds a secret nobody is tracking, and a later change
+// to a default or a broad binding gives it reach.
+//
+// So the failure path revokes. Both directions are attempted, and independently: the
+// bindings, because CreateACLs is not atomic across entries and some may have landed before
+// the error; and the credential itself.
+//
+// Failures HERE are logged and not returned, deliberately. The caller is already returning
+// the original error, which is the one that explains what happened, and replacing it with a
+// cleanup error would hide the cause. What the log line guarantees is that an operator can
+// find the principal that needs manual revocation, which is why it names it at error level.
+//
+// Parameters:
+//   - ctx context.Context: the provisioning context. Note that a cancelled context cannot
+//     revoke anything, which is itself logged.
+//   - principal string: the principal to revoke.
+//   - bindings []kafka.ACLEntry: the bindings that were attempted, so exactly those are
+//     deleted rather than everything the principal holds.
+func (a *KafkaAdminClient) compensateFailedProvisioning(
+	ctx context.Context,
+	principal string,
+	bindings []kafka.ACLEntry,
+) {
+	logger := logrus.WithField("principal", principal)
+
+	if err := a.deleteACLBindings(ctx, principal, bindings); err != nil {
+		logger.WithError(err).Error(
+			"kafka admin: could not remove the ACL bindings of a failed provisioning; " +
+				"remove them manually with kafka-acls before reissuing",
+		)
+	}
+
+	if err := a.RevokeSubscriberPrincipal(ctx, principal); err != nil {
+		logger.WithError(err).Error(
+			"kafka admin: A SCRAM CREDENTIAL WAS WRITTEN AND COULD NOT BE REVOKED after provisioning " +
+				"failed. The principal can authenticate and is not recorded in the registry. Delete it " +
+				"manually: kafka-configs --alter --delete-config SCRAM-SHA-512 --entity-type users " +
+				"--entity-name <principal>",
+		)
+
+		return
+	}
+
+	logger.Warn(
+		"kafka admin: provisioning failed after the credential was written; the credential and its " +
+			"attempted ACL bindings have been revoked, so no unbounded principal was left behind",
+	)
+}
+
+// RevokeSubscriberPrincipal deletes a subscriber's SCRAM credential.
+//
+// # AUTH-01: deletion is part of the lifecycle, not an afterthought
+//
+// The administrative contract used to expose creation and no removal at all, so reducing a
+// subscriber's topics, or deleting the subscriber entirely, left the credential and its
+// bindings live at the broker. The registry row was gone and the access was not: a
+// deprovisioned subscriber kept consuming, and nothing in Blnk could see it any more.
+//
+// Deleting the credential is the operation that actually ends access, because it is what the
+// SASL handshake checks. Removing bindings alone leaves a principal that can authenticate;
+// removing the credential alone leaves inert bindings. Callers ending a subscriber's life
+// should do both, and should do them BEFORE deleting the registry row — the row is the only
+// record of which principal to revoke.
+//
+// It is IDEMPOTENT: deleting a credential that does not exist is reported by the broker as
+// RESOURCE_NOT_FOUND, which is treated as success. That matters because revocation is
+// retried by operators and by compensation paths, and a second attempt must not fail.
+//
+// Parameters:
+//   - ctx context.Context: cancels the request.
+//   - principal string: the SASL username to delete. Required.
+//
+// Returns:
+//   - error: ErrKafkaAdminNotConfigured, a validation error, or a wrapped broker error.
+func (a *KafkaAdminClient) RevokeSubscriberPrincipal(ctx context.Context, principal string) error {
+	if err := a.ready(ctx); err != nil {
+		return err
+	}
+
+	principal = strings.TrimSpace(principal)
+	if principal == "" {
+		return errors.New("kafka admin: a principal is required to revoke a SCRAM credential")
+	}
+
+	response, err := a.client.AlterUserScramCredentials(ctx, &kafka.AlterUserScramCredentialsRequest{
+		Deletions: []kafka.UserScramCredentialsDeletion{{
+			Name:      principal,
+			Mechanism: kafka.ScramMechanismSha512,
+		}},
+	})
+	if err != nil {
+		return fmt.Errorf("kafka admin: deleting the %s credential for principal %q: %w",
+			SubscriberSASLMechanism, principal, err)
+	}
+
+	for i := range response.Results {
+		resultErr := response.Results[i].Error
+		if resultErr == nil || errors.Is(resultErr, kafka.ResourceNotFound) {
+			// Nothing to delete is the desired end state, so it is success. This is what
+			// makes revocation safe to retry, which both operators and the compensation
+			// path depend on.
+			continue
+		}
+
+		return fmt.Errorf("kafka admin: deleting the %s credential for principal %q: %w",
+			SubscriberSASLMechanism, response.Results[i].User, resultErr)
+	}
+
+	logrus.WithField("principal", principal).Info("kafka admin: subscriber SCRAM credential revoked")
+
+	return nil
+}
+
+// RevokeSubscriber removes a subscriber's ACL bindings and then its SCRAM credential, ending
+// its access at the broker.
+//
+// # AUTH-01: deletion propagation, and why the order is fixed
+//
+// This is the operation a caller ending a subscriber's life must use, and it must run BEFORE
+// the registry row is deleted — the row is the only record of which principal holds which
+// grant, so deleting it first strands live broker state that nothing can any longer describe.
+//
+// The repository half it pairs with is Datasource.TakeEventSubscriber, which deletes the row
+// and RETURNS it, so the value passed here is exactly the boundary that was removed rather
+// than one re-read beforehand and possibly since changed. The full sequence a delete handler
+// runs is: Take the row, Revoke with it here, and — if this fails — log the principal from
+// the returned row so an operator can revoke by hand. Datasource.ClearSubscriberCredential
+// is the corresponding call when only the credential is being revoked and the subscriber
+// itself stays registered.
+//
+// The ORDER inside it is bindings first, credential second. Reversed, there is a window in
+// which the principal cannot authenticate while its bindings still stand, and if the
+// credential is ever recreated — by a retry, or by an operator — the old boundary is silently
+// back in force. In this order the boundary goes first, so a partial failure always leaves the
+// principal with FEWER rights rather than more.
+//
+// Both steps are attempted even when the first fails, so a binding-removal problem does not
+// leave the credential live. The returned error names whichever step failed; when both fail
+// the credential error is returned, because a principal that can still authenticate is the
+// more serious of the two.
+//
+// The bindings removed are exactly those the registry row describes, derived the same way
+// provisioning derived them. A subscriber whose topics were reduced before revocation may
+// therefore still hold bindings for the topics it lost — which is why a topic reduction must
+// itself go through a reconciliation rather than relying on eventual revocation.
+//
+// Parameters:
+//   - ctx context.Context: cancels the requests.
+//   - subscriber *model.EventSubscriber: the registry row. Nil is refused, because there
+//     would be no principal to revoke.
+//
+// Returns:
+//   - error: nil when the broker holds neither the bindings nor the credential.
+func (a *KafkaAdminClient) RevokeSubscriber(ctx context.Context, subscriber *model.EventSubscriber) error {
+	if err := a.ready(ctx); err != nil {
+		return err
+	}
+
+	if subscriber == nil {
+		return errors.New("kafka admin: a subscriber is required to revoke its Kafka access")
+	}
+
+	// The password plays no part in a binding, so revocation builds the request without one.
+	request := NewSubscriberProvisioningRequest(subscriber, "")
+	principal := request.boundPrincipal()
+	if principal == "" {
+		return errors.New(
+			"kafka admin: the subscriber has neither a derivable nor a recorded Kafka principal, " +
+				"so there is nothing to revoke",
+		)
+	}
+
+	bindingErr := a.deleteACLBindings(ctx, principal, request.aclEntries())
+	credentialErr := a.RevokeSubscriberPrincipal(ctx, principal)
+
+	switch {
+	case credentialErr != nil:
+		if bindingErr != nil {
+			logrus.WithError(bindingErr).WithField("principal", principal).Error(
+				"kafka admin: removing a subscriber's ACL bindings also failed; both need manual attention",
+			)
+		}
+
+		return credentialErr
+	case bindingErr != nil:
+		return bindingErr
+	default:
+		logrus.WithFields(logrus.Fields{
+			"subscriber": strings.TrimSpace(subscriber.SubscriberID),
+			"principal":  principal,
+		}).Info("kafka admin: subscriber access revoked at the broker")
+
+		return nil
+	}
+}
+
+// deleteACLBindings removes exactly the bindings it is given.
+//
+// It deletes by an EXACT FILTER per binding — resource type, name, pattern type, principal,
+// host, operation and permission all matched — rather than by a broad "everything for this
+// principal" filter. A broad delete is the more convenient call and the more dangerous one: a
+// filter wide enough to catch a subscriber's own bindings is wide enough to catch bindings an
+// operator created by hand, and ACL deletion has no undo.
+//
+// A binding that is already absent is not an error. Kafka reports zero matches, which is the
+// desired end state, so this is idempotent and safe in a retry or a compensation path.
+//
+// Parameters:
+//   - ctx context.Context: cancels the request.
+//   - principal string: used only for the log line; the filters carry their own principal.
+//   - bindings []kafka.ACLEntry: the bindings to remove. Empty is a no-op.
+//
+// Returns:
+//   - error: a wrapped broker error, or the first per-filter error the broker reported.
+func (a *KafkaAdminClient) deleteACLBindings(
+	ctx context.Context,
+	principal string,
+	bindings []kafka.ACLEntry,
+) error {
+	if len(bindings) == 0 {
+		return nil
+	}
+
+	filters := make([]kafka.DeleteACLsFilter, 0, len(bindings))
+	for _, binding := range bindings {
+		filters = append(filters, kafka.DeleteACLsFilter{
+			ResourceTypeFilter:        binding.ResourceType,
+			ResourceNameFilter:        binding.ResourceName,
+			ResourcePatternTypeFilter: binding.ResourcePatternType,
+			PrincipalFilter:           binding.Principal,
+			HostFilter:                binding.Host,
+			Operation:                 binding.Operation,
+			PermissionType:            binding.PermissionType,
+		})
+	}
+
+	response, err := a.client.DeleteACLs(ctx, &kafka.DeleteACLsRequest{Filters: filters})
+	if err != nil {
+		return fmt.Errorf("kafka admin: deleting %d ACL bindings for principal %q: %w",
+			len(filters), principal, err)
+	}
+
+	removed := 0
+	for i := range response.Results {
+		if response.Results[i].Error != nil {
+			return fmt.Errorf("kafka admin: deleting ACL bindings for principal %q: %w",
+				principal, response.Results[i].Error)
+		}
+
+		removed += len(response.Results[i].MatchingACLs)
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"principal": principal,
+		"filters":   len(filters),
+		"removed":   removed,
+	}).Info("kafka admin: subscriber ACL bindings removed")
+
+	return nil
 }
 
 // ConsumerLagRequest identifies the consumer group whose lag is to be measured.
@@ -2045,77 +3493,77 @@ type ConsumerLagRequest struct {
 // arguing about the metric.
 type PartitionLag struct {
 	// Topic and Partition identify the partition.
-	Topic     string `json:"topic"`
-	Partition int    `json:"partition"`
+	Topic     string
+	Partition int
 
 	// CommittedOffset is the group's committed offset, or -1 when it has never
 	// committed here. Committed says which of the two it is, so a caller never has to
 	// know that -1 is the sentinel.
-	CommittedOffset int64 `json:"committed_offset"`
-	Committed       bool  `json:"committed"`
+	CommittedOffset int64
+	Committed       bool
 
 	// FirstOffset is the earliest offset still retained, which is above zero once
 	// retention has deleted the head of the log. It is the baseline for a partition with
 	// no commit.
-	FirstOffset int64 `json:"first_offset"`
+	FirstOffset int64
 
 	// EndOffset is the log end offset: the offset the next produced record will take.
-	EndOffset int64 `json:"end_offset"`
+	EndOffset int64
 
 	// Lag is EndOffset minus the baseline, never negative.
-	Lag int64 `json:"lag"`
+	Lag int64
 
 	// Unavailable is true when the broker could not report this partition's offsets, in
 	// which case Lag is 0 and the partition contributes nothing. It is reported so a
 	// zero caused by an unreadable partition is distinguishable from a zero caused by a
 	// consumer that is keeping up.
-	Unavailable bool `json:"unavailable,omitempty"`
+	Unavailable bool
 }
 
 // TopicLag aggregates one topic's partitions.
 type TopicLag struct {
 	// Topic is the topic measured.
-	Topic string `json:"topic"`
+	Topic string
 
 	// TotalLag is the sum of the partition lags, and the value published to the
 	// consumer-lag gauge for this topic.
-	TotalLag int64 `json:"total_lag"`
+	TotalLag int64
 
 	// Partitions carries the per-partition detail, in ascending partition order.
-	Partitions []PartitionLag `json:"partitions"`
+	Partitions []PartitionLag
 
 	// PartitionsWithoutCommit counts partitions the group has never committed on. A
 	// number equal to the partition count on a supposedly running consumer means the
 	// group is not consuming this topic at all, which is a different fault from being
 	// behind.
-	PartitionsWithoutCommit int `json:"partitions_without_commit"`
+	PartitionsWithoutCommit int
 
 	// PartitionsUnavailable counts partitions whose offsets could not be read.
-	PartitionsUnavailable int `json:"partitions_unavailable,omitempty"`
+	PartitionsUnavailable int
 }
 
 // ConsumerLagReport is the outcome of one lag measurement.
 type ConsumerLagReport struct {
 	// SubscriberID and GroupID echo the request.
-	SubscriberID string `json:"subscriber_id,omitempty"`
-	GroupID      string `json:"group_id"`
+	SubscriberID string
+	GroupID      string
 
 	// TotalLag is the sum across every topic measured.
-	TotalLag int64 `json:"total_lag"`
+	TotalLag int64
 
 	// Topics carries per-topic detail, in the order the request listed them.
-	Topics []TopicLag `json:"topics"`
+	Topics []TopicLag
 
 	// MissingTopics lists requested topics that do not exist on the broker. They
 	// contribute no lag, and they are reported because a lag alert on a topic that
 	// silently does not exist would read as permanently healthy.
-	MissingTopics []string `json:"missing_topics,omitempty"`
+	MissingTopics []string
 
 	// MeasuredAt is when the measurement was taken. Committed offsets and end offsets
 	// are read in two separate round trips, so under live traffic the figure is a
 	// snapshot of two moments a few milliseconds apart, and a caller comparing it with
 	// anything else needs to know when it was made.
-	MeasuredAt time.Time `json:"measured_at"`
+	MeasuredAt time.Time
 }
 
 // LagByTopic reduces the report to the per-topic totals.
@@ -2210,8 +3658,15 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 		return report, nil
 	}
 
-	partitions, err := a.topicPartitions(ctx, topics)
-	report.MissingTopics = missingTopics(topics, partitions)
+	// The partition layout and the end offsets come from ONE memoised snapshot, because
+	// they are the two questions every subscriber in a sweep asks identically — only the
+	// committed offsets below actually differ. Reading them together also keeps them
+	// CONSISTENT with each other: a partition present in the layout but absent from the
+	// bounds, or the reverse, would produce a lag computed from two different views of the
+	// cluster.
+	snapshot, err := a.partitionOffsetSnapshot(ctx, topics)
+	partitions := snapshot.partitions
+	report.MissingTopics = snapshot.missing
 	if err != nil {
 		return report, err
 	}
@@ -2228,10 +3683,7 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 		return report, nil
 	}
 
-	bounds, err := a.offsetBounds(ctx, partitions)
-	if err != nil {
-		return report, err
-	}
+	bounds := snapshot.bounds
 
 	committed, err := a.committedOffsets(ctx, report.GroupID, partitions)
 	if err != nil {
@@ -2426,10 +3878,17 @@ func recordConsumerLag(ctx context.Context, subscriber, group, topic string, lag
 		return
 	}
 
+	// Every attribute goes through its RESOLVER, and for two reasons that both matter.
+	// It bounds the cardinality: the three values arrive from registry rows, so an
+	// unconstrained one would mint a new time series on every collection cycle. And it is
+	// what lets a stale series be CLEARED — the collector zeroes a series by writing to
+	// the identical label tuple, so if it resolved labels differently from this function
+	// it would zero a tuple nobody published and leave the real one standing at its last
+	// reading for ever. See event_metrics_support.go.
 	metrics.SubscriberConsumerLag.Record(ctx, lag, otelmetric.WithAttributes(
-		attribute.String("subscriber", subscriber),
-		attribute.String("group", group),
-		attribute.String("topic", topic),
+		attribute.String("subscriber", subscriberLagLabel(subscriber)),
+		attribute.String("group", consumerGroupLagLabel(group)),
+		attribute.String("topic", topicLagLabel(topic)),
 	))
 }
 
@@ -2605,41 +4064,41 @@ func (a *KafkaAdminClient) committedOffsets(
 // PartitionOffsetSnapshot is one partition's offset window at a point in time.
 type PartitionOffsetSnapshot struct {
 	// Partition is the partition ID.
-	Partition int `json:"partition"`
+	Partition int
 
 	// FirstOffset is the earliest offset still retained.
-	FirstOffset int64 `json:"first_offset"`
+	FirstOffset int64
 
 	// EndOffset is the log end offset, which equals the total number of records ever
 	// produced to the partition. It is the figure the zero-loss reconciliation sums.
-	EndOffset int64 `json:"end_offset"`
+	EndOffset int64
 
 	// Unavailable is true when the broker could not report this partition, in which case
 	// both offsets are meaningless and the partition contributes nothing to the sums.
-	Unavailable bool `json:"unavailable,omitempty"`
+	Unavailable bool
 }
 
 // TopicOffsetSnapshot aggregates one topic's partitions.
 type TopicOffsetSnapshot struct {
 	// Topic is the topic measured.
-	Topic string `json:"topic"`
+	Topic string
 
 	// Partitions carries the per-partition detail, in ascending partition order.
-	Partitions []PartitionOffsetSnapshot `json:"partitions"`
+	Partitions []PartitionOffsetSnapshot
 
 	// EndOffsetSum is the sum of the partitions' end offsets: every record ever
 	// published to this topic, whether or not it is still retained. This is the
 	// reconciliation figure.
-	EndOffsetSum int64 `json:"end_offset_sum"`
+	EndOffsetSum int64
 
 	// RetainedCount is the sum of end minus first across partitions: the records still
 	// on the log. It is NOT the reconciliation figure — retention deletes records, so
 	// this number legitimately falls below the outbox count — and it is reported so that
 	// a discrepancy caused by retention can be told apart from one caused by loss.
-	RetainedCount int64 `json:"retained_count"`
+	RetainedCount int64
 
 	// PartitionsUnavailable counts partitions excluded from the sums.
-	PartitionsUnavailable int `json:"partitions_unavailable,omitempty"`
+	PartitionsUnavailable int
 }
 
 // TopicOffsetReport is the broker-side half of the zero-loss reconciliation.
@@ -2653,21 +4112,26 @@ type TopicOffsetSnapshot struct {
 type TopicOffsetReport struct {
 	// Topics carries per-topic detail, in the order the request listed them, or the
 	// canonical inventory order when the request named no topics.
-	Topics []TopicOffsetSnapshot `json:"topics"`
+	Topics []TopicOffsetSnapshot
 
-	// EndOffsetSum and RetainedCount are the totals across every topic measured.
-	EndOffsetSum  int64 `json:"end_offset_sum"`
-	RetainedCount int64 `json:"retained_count"`
+	// EndOffsetSum is the total number of RECORDS WRITTEN across every topic measured, and
+	// RetainedCount how many of those the broker still holds.
+	//
+	// EndOffsetSum is NOT a count of events: it counts every redelivery, every replay and
+	// every dead-letter copy as its own record. See TopicEndOffsets and
+	// ReconcileAgainstOutbox for what may and may not be concluded from it.
+	EndOffsetSum  int64
+	RetainedCount int64
 
 	// MissingTopics lists requested topics that do not exist on the broker.
-	MissingTopics []string `json:"missing_topics,omitempty"`
+	MissingTopics []string
 
 	// PartitionsUnavailable counts partitions excluded from the totals across all
 	// topics.
-	PartitionsUnavailable int `json:"partitions_unavailable,omitempty"`
+	PartitionsUnavailable int
 
 	// MeasuredAt is when the snapshot was taken.
-	MeasuredAt time.Time `json:"measured_at"`
+	MeasuredAt time.Time
 }
 
 // EndOffsetsByTopic reduces the report to one end-offset sum per topic.
@@ -2708,16 +4172,40 @@ func (r TopicOffsetReport) Lookup(topic string) (TopicOffsetSnapshot, bool) {
 	return TopicOffsetSnapshot{}, false
 }
 
-// TopicEndOffsets reads the broker-side offsets the daily zero-loss reconciliation
-// compares outbox counts against.
+// TopicEndOffsets reads the broker-side offsets the daily zero-loss reconciliation reads.
 //
-// Summed end offsets are the count of every record ever published to a topic, so the
-// reconciliation is: outbox rows marked dispatched, plus rows marked dead-lettered,
-// should equal the summed end offsets of the category topics plus their dead-letter
-// siblings. A shortfall on the broker side is a lost publish; a shortfall on the outbox
-// side is a lost row.
+// # OBS-01: this is a LOWER BOUND on messages, not a count of events
 //
-// Called with no topics it measures the whole inventory — the four category topics and
+// Summed end offsets count RECORDS WRITTEN, and the outbox counts EVENTS. Those are
+// deliberately different numbers, and the reconciliation used to be documented as an
+// equality between them, which cannot hold:
+//
+//   - A REDELIVERY writes a second record for one event. The relay can crash between a
+//     successful publish and the row being marked dispatched, so the redelivery is a designed
+//     behaviour of an at-least-once transport, not a fault.
+//   - A REPLAY writes another record for an event that already has one, on purpose.
+//   - A DEAD-LETTERED event has a record on its `.dlt` topic and its row counted once.
+//   - RETENTION deletes records while their rows remain, so the end offset keeps climbing
+//     while retained records fall.
+//
+// So messages >= events, always, and an equality check would report loss on a healthy system
+// the first time anything was redelivered — the classic alert that gets muted, taking the
+// real signal with it.
+//
+// What this number CAN establish is the direction that matters. Every dispatched or
+// dead-lettered row must have produced at least one record, so:
+//
+//	messages <  events   ⇒  LOSS. Rows claim publication that never reached a broker.
+//	messages >= events   ⇒  no loss detectable this way; the excess is the duplicate,
+//	                        replay and dead-letter overhead, and it is expected.
+//
+// Proving the stronger property — that every event_id appears at least once — requires
+// reading the topics and deduplicating on event_id, which needs a consumer. Blnk implements
+// no consumer by design, so that check belongs to the audit procedure in
+// docs/kafka-operations.md rather than to this method, and this method must not be presented
+// as a substitute for it.
+//
+// Called with no topics it measures the whole inventory — every category topic and
 // their four dead-letter siblings — which is what the reconciliation wants and what the
 // statistics endpoint reports. Named topics are measured instead, for narrowing an
 // investigation to one category.
@@ -2730,7 +4218,8 @@ func (r TopicOffsetReport) Lookup(topic string) (TopicOffsetSnapshot, bool) {
 // Returns:
 //   - TopicOffsetReport: per-partition detail and the sums, plus the caveats
 //     (MissingTopics, PartitionsUnavailable) that say whether the reconciliation may be
-//     trusted.
+//     trusted. Use ReconcileAgainstOutbox to interpret it rather than comparing the sums by
+//     hand.
 //   - error: ErrKafkaAdminNotConfigured, or a wrapped broker error.
 func (a *KafkaAdminClient) TopicEndOffsets(ctx context.Context, topics ...string) (TopicOffsetReport, error) {
 	report := TopicOffsetReport{MeasuredAt: time.Now().UTC()}
@@ -2835,4 +4324,140 @@ func retainedRecords(firstOffset, endOffset int64) int64 {
 	}
 
 	return endOffset - first
+}
+
+// OutboxReconciliation is the verdict of comparing the outbox against the broker.
+//
+// # OBS-01: a verdict, not an equality
+//
+// It exists because callers were left to compare a record count against an event count
+// themselves, and the only comparison available — equality — is wrong. This type states what
+// the comparison can and cannot establish, so no caller has to re-derive it and none can
+// accidentally report "reconciled" from a number that was never going to match.
+type OutboxReconciliation struct {
+	// TerminalEvents is how many outbox rows claim to have been published: dispatched plus
+	// dead-lettered. Each is counted exactly ONCE, which is the property the unique index on
+	// event_id gives.
+	TerminalEvents int64
+
+	// MessagesWritten is how many records the broker has accepted across the measured
+	// topics, from summed end offsets. It counts every redelivery, replay and dead-letter
+	// copy separately.
+	MessagesWritten int64
+
+	// Overhead is MessagesWritten minus TerminalEvents: the redelivery, replay and
+	// dead-letter copies. Its EXPECTED value is greater than or equal to zero, and a healthy
+	// system's overhead is small but not zero.
+	//
+	// It is negative exactly when loss is detected, which is why the field is signed rather
+	// than clamped: clamping would erase the only signal this reconciliation carries.
+	Overhead int64
+
+	// LossDetected is true when the broker holds FEWER records than the outbox has terminal
+	// rows. That is unambiguous: rows claim a publication that no record corresponds to.
+	//
+	// False does NOT mean "proven no loss" — see Conclusive. It means no loss is detectable
+	// by counting.
+	LossDetected bool
+
+	// Conclusive reports whether the count could be trusted at all.
+	//
+	// It is false when a measured topic was missing, when any partition's offsets were
+	// unavailable, or when retention has deleted records — in each case the record count is
+	// not a complete picture of what was written, so neither a shortfall nor a surplus proves
+	// anything. A caller must not report a green reconciliation on an inconclusive result.
+	Conclusive bool
+
+	// Caveats names, in plain words, every reason the result is inconclusive. Empty when
+	// Conclusive is true.
+	Caveats []string
+
+	// MeasuredAt is when the broker side was measured.
+	MeasuredAt time.Time
+}
+
+// Summary renders the verdict as one sentence for a log line or a runbook.
+//
+// Returns:
+//   - string: the verdict, always naming both numbers so the sentence is checkable.
+func (r OutboxReconciliation) Summary() string {
+	switch {
+	case r.LossDetected:
+		return fmt.Sprintf(
+			"LOSS DETECTED: %d outbox rows are marked published but the broker holds only %d records "+
+				"across the measured topics (%d missing). Every dispatched or dead-lettered row must have "+
+				"produced at least one record",
+			r.TerminalEvents, r.MessagesWritten, -r.Overhead,
+		)
+	case !r.Conclusive:
+		return fmt.Sprintf(
+			"INCONCLUSIVE: %d outbox rows against %d broker records, but the count cannot be trusted (%s)",
+			r.TerminalEvents, r.MessagesWritten, strings.Join(r.Caveats, "; "),
+		)
+	default:
+		return fmt.Sprintf(
+			"NO LOSS DETECTED: %d outbox rows against %d broker records, %d of which are redelivery, "+
+				"replay or dead-letter overhead. This establishes that nothing claims a publication that "+
+				"did not happen; proving every event_id is present requires the audit consumer described "+
+				"in docs/kafka-operations.md",
+			r.TerminalEvents, r.MessagesWritten, r.Overhead,
+		)
+	}
+}
+
+// ReconcileAgainstOutbox interprets an offset report against the outbox's terminal row count.
+//
+// It is the ONLY sanctioned way to compare the two, and it exists so that the asymmetry is
+// applied in one place: messages are a lower bound on events, never an equality, so the test
+// is a DIRECTIONAL one and the surplus is expected rather than suspicious.
+//
+// Retention is treated as a caveat rather than folded into the arithmetic. A topic whose
+// records have partly aged out has an end offset that still counts them, so the comparison
+// remains valid in the direction that matters — but a reader must know that retention is in
+// play before concluding anything about what is still consumable.
+//
+// Parameters:
+//   - report TopicOffsetReport: the broker-side measurement from TopicEndOffsets.
+//   - terminalEvents int64: dispatched plus dead-lettered outbox rows, from
+//     CountEventOutboxByStatus. Each event counted once.
+//
+// Returns:
+//   - OutboxReconciliation: the verdict, always populated.
+func ReconcileAgainstOutbox(report TopicOffsetReport, terminalEvents int64) OutboxReconciliation {
+	verdict := OutboxReconciliation{
+		TerminalEvents:  terminalEvents,
+		MessagesWritten: report.EndOffsetSum,
+		Overhead:        report.EndOffsetSum - terminalEvents,
+		MeasuredAt:      report.MeasuredAt,
+	}
+
+	verdict.LossDetected = verdict.Overhead < 0
+
+	caveats := make([]string, 0, 3)
+	if len(report.MissingTopics) > 0 {
+		caveats = append(caveats, fmt.Sprintf(
+			"%d measured topic(s) do not exist on the broker (%s), so their records cannot be counted",
+			len(report.MissingTopics), strings.Join(report.MissingTopics, ", "),
+		))
+	}
+
+	if report.PartitionsUnavailable > 0 {
+		caveats = append(caveats, fmt.Sprintf(
+			"%d partition(s) did not report offsets, so their records are missing from the total",
+			report.PartitionsUnavailable,
+		))
+	}
+
+	if report.RetainedCount < report.EndOffsetSum {
+		caveats = append(caveats, fmt.Sprintf(
+			"retention has removed %d record(s) that were written, so the broker no longer holds "+
+				"everything the offsets count",
+			report.EndOffsetSum-report.RetainedCount,
+		))
+	}
+
+	verdict.Caveats = caveats
+	verdict.Conclusive = len(caveats) == 0
+
+	return verdict
 }

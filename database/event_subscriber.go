@@ -90,6 +90,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -247,17 +251,44 @@ func requireSubscriberID(subscriberID string) error {
 	return nil
 }
 
-// requireSubscriberFields validates the four NOT NULL business columns.
+// requireSubscriberFields validates the four NOT NULL business columns AND canonicalizes the
+// three that make up the subscriber's Kafka identity.
 //
-// NOT NULL alone does not stop an empty string, and each of these being blank is a
-// real hazard rather than a cosmetic one. A blank subscriber_id yields a row no
-// endpoint can address. A blank name defeats the reason the registry exists — the
-// schema documents name as NOT NULL because an unnamed principal cannot be
-// triaged. A blank kafka_principal is the worst of the four: it would occupy the
-// unique principal index while naming a principal that authenticates as nothing,
-// and because the index is unique it would also block the next subscriber that
-// really did have no principal set. A blank consumer_group_id would be returned
-// verbatim to a subscriber that then could not join a group.
+// NOT NULL alone does not stop an empty string, and each of these being blank is a real hazard
+// rather than a cosmetic one. A blank subscriber_id yields a row no endpoint can address. A
+// blank name defeats the reason the registry exists — the schema documents name as NOT NULL
+// because an unnamed principal cannot be triaged. A blank kafka_principal is the worst of the
+// four: it would occupy the unique principal index while naming a principal that authenticates
+// as nothing, and because the index is unique it would also block the next subscriber that
+// really did have no principal set. A blank consumer_group_id would be returned verbatim to a
+// subscriber that then could not join a group.
+//
+// # SEC-04: canonical BEFORE persistence, not at provisioning
+//
+// Canonicalization used to happen only where the credential was provisioned, and the row was
+// stored as given. So the rows "alice" and " alice " both satisfied the unique index — two
+// distinct registry subscribers — while provisioning trimmed both to the SAME Kafka principal.
+// The two subscribers then shared one credential and one ACL set, and reissuing for either
+// silently invalidated the other's consumer. Nothing in the registry could show that, because
+// as far as the registry was concerned they were different subscribers.
+//
+// The identifier is canonicalized here, at the write, so the DATABASE can only ever hold one
+// spelling of it — which is what makes the unique index mean what it says. The migration adds
+// matching CHECK constraints, so the guarantee survives a write that bypasses this function.
+//
+// # The principal and the group are DERIVED, and a mismatch is refused
+//
+// Both are the subscriber's access boundary rather than labels: the SCRAM credential is minted
+// for the principal and every ACL binding names it and the group namespace. Accepting either
+// from a caller is accepting a caller's choice of boundary, so both are derived from the
+// canonical identifier and a supplied value that differs is REFUSED rather than corrected — a
+// caller that sent a different boundary asked for something it may not have, and silently
+// substituting the right answer would hide that. The refusal names the derived value, so the
+// caller learns what to send.
+//
+// The subscriber struct is MUTATED to its canonical form on success, so the row written and the
+// row a caller subsequently reads are the same, and a caller that trimmed nothing still stores
+// something canonical.
 func requireSubscriberFields(subscriber *model.EventSubscriber) error {
 	if subscriber == nil {
 		return apierror.NewAPIError(apierror.ErrBadRequest, "Subscriber is required", nil)
@@ -268,13 +299,268 @@ func requireSubscriberFields(subscriber *model.EventSubscriber) error {
 	if strings.TrimSpace(subscriber.Name) == "" {
 		return apierror.NewAPIError(apierror.ErrBadRequest, "Subscriber name is required", nil)
 	}
-	if strings.TrimSpace(subscriber.KafkaPrincipal) == "" {
-		return apierror.NewAPIError(apierror.ErrBadRequest, "Kafka principal is required", nil)
+
+	canonicalID, err := model.CanonicalizeSubscriberIdentifier(subscriber.SubscriberID)
+	if err != nil {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"Subscriber ID cannot be used to derive a Kafka identity", err)
 	}
-	if strings.TrimSpace(subscriber.ConsumerGroupID) == "" {
-		return apierror.NewAPIError(apierror.ErrBadRequest, "Consumer group ID is required", nil)
+
+	principal, err := model.CanonicalKafkaPrincipal(canonicalID)
+	if err != nil {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"Subscriber ID cannot be used to derive a Kafka principal", err)
 	}
+
+	group, err := model.CanonicalConsumerGroupID(canonicalID)
+	if err != nil {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"Subscriber ID cannot be used to derive a consumer group", err)
+	}
+
+	namespace, err := model.CanonicalConsumerGroupNamespace(canonicalID)
+	if err != nil {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"Subscriber ID cannot be used to derive a consumer group namespace", err)
+	}
+
+	// ABSENT means DERIVE; PRESENT means it must match exactly.
+	//
+	// The two cases are different requests and deserve different answers. An empty principal
+	// is a caller that has not expressed an opinion, and there is exactly one correct value to
+	// fill in — filling it is safe by construction, because what gets stored is the canonical
+	// derivation itself. Refusing instead would force every caller to compute the value only
+	// to have it compared against the same computation, which adds a step that can be got
+	// wrong without adding a check that can catch anything.
+	//
+	// A NON-EMPTY principal that differs is refused, and that is the SEC-04 guarantee: a
+	// supplied principal is not a request for a name, it is a request for a BOUNDARY, because
+	// the principal is what every ACL binding is granted to.
+	if subscriber.KafkaPrincipal == "" {
+		subscriber.KafkaPrincipal = principal
+	}
+
+	if subscriber.KafkaPrincipal != principal {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"The Kafka principal must be the one derived from the subscriber ID",
+			fmt.Errorf("subscriber %q may only hold principal %q, not %q",
+				canonicalID, principal, subscriber.KafkaPrincipal))
+	}
+
+	// An absent group is likewise derived, to the default leaf. Deriving the DEFAULT rather
+	// than the namespace itself is deliberate: the bare namespace is not a usable group, and a
+	// prefixed ACL over it would grant the namespace instead of a group inside it.
+	if subscriber.ConsumerGroupID == "" {
+		subscriber.ConsumerGroupID = group
+	}
+
+	// The recorded group may be any leaf inside the subscriber's own namespace — that is what
+	// the prefixed ACL grant is for — but never a value outside it, which a prefixed grant
+	// would turn into a reach into another subscriber's groups.
+	if !model.IsInSubscriberGroupNamespace(subscriber.ConsumerGroupID, namespace) {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"The consumer group must lie inside the subscriber's own namespace",
+			fmt.Errorf("subscriber %q may use any group under %q (for example %q), not %q",
+				canonicalID, namespace, group, subscriber.ConsumerGroupID))
+	}
+
+	if err := requireGrantableTopics(subscriber.AuthorizedTopics); err != nil {
+		return err
+	}
+
+	if err := requireSafeWebhookURL(subscriber.WebhookURL); err != nil {
+		return err
+	}
+
+	subscriber.SubscriberID = canonicalID
+	subscriber.Name = strings.TrimSpace(subscriber.Name)
+
 	return nil
+}
+
+// grantableTopicPrefixes is the set of topic names a subscriber may be authorised for, as
+// bare category topics under the configured prefix.
+//
+// It is derived from the model's own category vocabulary rather than listed here, so a new
+// category is covered without an edit and an INTERNAL category is excluded automatically.
+// The repository cannot call into the root package — the root imports database — so the
+// prefix is read from configuration the same way the outbox's topic validation reads it.
+func grantableTopicPrefixes() map[string]struct{} {
+	grantable := make(map[string]struct{})
+	for _, topic := range model.SubscriberGrantableTopics(expectedEventTopicPrefix()) {
+		grantable[topic] = struct{}{}
+	}
+
+	return grantable
+}
+
+// requireGrantableTopics refuses an authorised-topic list containing anything a subscriber may
+// not be granted.
+//
+// # SEC-03 at the persistence boundary
+//
+// The list is what the ACL bindings are built from, so whatever is stored here is what the
+// credential can read. Three classes must be impossible and the check is here as well as in
+// the provisioning path because the row outlives any single request: a topic accepted now is
+// granted at the next issuance, whichever code path performs it.
+//
+//   - "*" and other WILDCARDS, because Kafka treats the resource name "*" as matching any
+//     resource, so one such entry turns a per-topic grant into a cluster-wide one.
+//   - FOREIGN topics, because a grant over a topic Blnk does not own is a grant into somebody
+//     else's data on a broker Blnk may share.
+//   - DEAD-LETTER and INTERNAL topics, because the DLTs carry failed events with Blnk's own
+//     failure metadata and the system and quarantine categories carry Blnk's internal
+//     diagnostics and uncatalogued payloads. Neither has a subscriber audience.
+//
+// An EMPTY list is accepted: a subscriber authorised for nothing is the fail-closed default of
+// a fresh registration, and refusing it would make registration and authorisation one
+// inseparable step.
+//
+// Parameters:
+//   - topics []string: the authorised topics as supplied.
+//
+// Returns:
+//   - error: a typed invalid-input error naming the first offending topic, or nil.
+func requireGrantableTopics(topics []string) error {
+	if len(topics) == 0 {
+		return nil
+	}
+
+	grantable := grantableTopicPrefixes()
+
+	allowed := make([]string, 0, len(grantable))
+	for topic := range grantable {
+		allowed = append(allowed, topic)
+	}
+	sort.Strings(allowed)
+
+	for _, topic := range topics {
+		trimmed := strings.TrimSpace(topic)
+		if trimmed == "" {
+			continue
+		}
+
+		if _, ok := grantable[trimmed]; !ok {
+			return apierror.NewAPIError(apierror.ErrInvalidInput,
+				"Authorized topics must be Blnk-owned subscriber-facing category topics",
+				fmt.Errorf("topic %q is not grantable; the grantable topics are %s",
+					trimmed, strings.Join(allowed, ", ")))
+		}
+	}
+
+	return nil
+}
+
+// requireSafeWebhookURL applies the destination policy to the legacy dual-run webhook URL.
+//
+// # SSRF-01: the column has no processed sink TODAY, which is exactly when to constrain it
+//
+// The URL is recorded so a subscriber already receiving HTTP pushes has somewhere to be
+// migrated FROM. Nothing sends to it yet — but a stored URL is a future sink, and the moment
+// any code does send to it, whatever is in this column becomes a request Blnk makes from
+// inside its own network. Constraining it now costs nothing; constraining it after a sender
+// exists means auditing every row already written.
+//
+// Two rules, and each closes a distinct route:
+//
+//   - HTTPS ONLY. A cleartext push carries ledger and identity data — names, email addresses,
+//     phone numbers, addresses, dates of birth — over a network Blnk does not control, and it
+//     is trivially redirectable. "http" is refused rather than upgraded, because upgrading a
+//     URL an operator supplied would send data somewhere they did not name.
+//   - NO INTERNAL DESTINATION. Loopback, link-local (including the 169.254.169.254 cloud
+//     metadata address), private ranges and unqualified hostnames are refused. Those are the
+//     targets a server-side request forgery aims at: the metadata endpoint hands out cloud
+//     credentials, and a private address reaches services that trust the network rather than
+//     the caller.
+//
+// A hostname that RESOLVES to an internal address cannot be caught here — that is a DNS
+// rebinding problem and it belongs to the sender, at connect time, not to a validator running
+// hours earlier. This function refuses what is visibly internal; docs/kafka-operations.md
+// records the rest as an obligation on whoever wires delivery.
+//
+// Parameters:
+//   - webhookURL *string: the URL as supplied. Nil and empty are accepted — most subscribers
+//     never had a webhook.
+//
+// Returns:
+//   - error: a typed invalid-input error naming the rule broken, or nil.
+func requireSafeWebhookURL(webhookURL *string) error {
+	if webhookURL == nil || strings.TrimSpace(*webhookURL) == "" {
+		return nil
+	}
+
+	raw := strings.TrimSpace(*webhookURL)
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"The webhook URL is not a valid URL", err)
+	}
+
+	if parsed.Scheme != "https" {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"The webhook URL must use https",
+			fmt.Errorf("scheme %q is not permitted; ledger and identity payloads must not be pushed in cleartext",
+				parsed.Scheme))
+	}
+
+	host := parsed.Hostname()
+	if host == "" {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"The webhook URL must name a host", nil)
+	}
+
+	if reason := internalDestinationReason(host); reason != "" {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"The webhook URL must not address an internal destination",
+			fmt.Errorf("host %q is refused: %s", host, reason))
+	}
+
+	return nil
+}
+
+// internalDestinationReason reports why a host is an internal destination, or "" when it is
+// not visibly internal.
+//
+// Literal addresses are classified with net.IP so every form of them is covered — IPv4, IPv6,
+// and IPv4-mapped IPv6, which is the spelling a denylist of strings always misses. A name
+// without a dot is refused because it can only resolve through a search domain or a hosts
+// entry, both of which are inside the deployment.
+//
+// Parameters:
+//   - host string: the hostname or literal address from the URL.
+//
+// Returns:
+//   - string: a short reason, or "" when the host is acceptable.
+func internalDestinationReason(host string) string {
+	if address := net.ParseIP(host); address != nil {
+		switch {
+		case address.IsLoopback():
+			return "it is a loopback address, which would make Blnk call itself"
+		case address.IsLinkLocalUnicast(), address.IsLinkLocalMulticast():
+			return "it is a link-local address, the range the cloud metadata service lives on"
+		case address.IsPrivate():
+			return "it is a private address, which reaches services that trust the network rather than the caller"
+		case address.IsUnspecified():
+			return "it is the unspecified address"
+		case address.IsInterfaceLocalMulticast(), address.IsMulticast():
+			return "it is a multicast address"
+		default:
+			return ""
+		}
+	}
+
+	lowered := strings.ToLower(host)
+	switch {
+	case lowered == "localhost", strings.HasSuffix(lowered, ".localhost"):
+		return "it resolves to loopback"
+	case strings.HasSuffix(lowered, ".local"), strings.HasSuffix(lowered, ".internal"):
+		return "it is an internal-only name"
+	case !strings.Contains(lowered, "."):
+		return "it is unqualified, so it can only resolve inside this deployment"
+	default:
+		return ""
+	}
 }
 
 // classifySubscriberWriteError turns a driver error from an insert or update into
@@ -297,14 +583,14 @@ func classifySubscriberWriteError(err error, internalMessage string) error {
 	if errors.As(err, &pqErr) && pqErr.Code.Name() == uniqueViolationPostgresCode {
 		switch pqErr.Constraint {
 		case subscriberIDUniqueIndex:
-			return apierror.NewAPIError(apierror.ErrConflict, "A subscriber with this ID already exists", err)
+			return loggedDatabaseError(apierror.ErrConflict, "A subscriber with this ID already exists", "classify_subscriber_write_error", err)
 		case kafkaPrincipalUniqueIndex:
-			return apierror.NewAPIError(apierror.ErrConflict, "Another subscriber already uses this Kafka principal", err)
+			return loggedDatabaseError(apierror.ErrConflict, "Another subscriber already uses this Kafka principal", "classify_subscriber_write_error", err)
 		default:
-			return apierror.NewAPIError(apierror.ErrConflict, "Subscriber already exists", err)
+			return loggedDatabaseError(apierror.ErrConflict, "Subscriber already exists", "classify_subscriber_write_error", err)
 		}
 	}
-	return apierror.NewAPIError(apierror.ErrInternalServer, internalMessage, err)
+	return loggedDatabaseError(apierror.ErrInternalServer, internalMessage, "classify_subscriber_write_error", err)
 }
 
 // assertSubscriberRowAffected turns a zero-row write into a typed not-found error.
@@ -328,7 +614,7 @@ func classifySubscriberWriteError(err error, internalMessage string) error {
 func assertSubscriberRowAffected(result sql.Result, internalMessage string) error {
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return apierror.NewAPIError(apierror.ErrInternalServer, internalMessage, err)
+		return loggedDatabaseError(apierror.ErrInternalServer, internalMessage, "assert_subscriber_row_affected", err)
 	}
 	if affected == 0 {
 		return apierror.NewAPIError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, nil)
@@ -429,9 +715,9 @@ func (d Datasource) GetEventSubscriberByID(ctx context.Context, subscriberID str
 	if err != nil {
 		span.RecordError(err)
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, apierror.NewAPIError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, err)
+			return nil, loggedDatabaseError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, "get_event_subscriber_by_id", err)
 		}
-		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to retrieve event subscriber", err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to retrieve event subscriber", "get_event_subscriber_by_id", err)
 	}
 
 	span.AddEvent("Event subscriber retrieved", trace.WithAttributes(
@@ -479,7 +765,7 @@ func (d Datasource) ListEventSubscribers(ctx context.Context, limit, offset int)
 	`, limit, offset)
 	if err != nil {
 		span.RecordError(err)
-		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to list event subscribers", err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to list event subscribers", "list_event_subscribers", err)
 	}
 	defer func() {
 		if closeErr := rows.Close(); closeErr != nil {
@@ -497,14 +783,14 @@ func (d Datasource) ListEventSubscribers(ctx context.Context, limit, offset int)
 		subscriber, scanErr := scanEventSubscriber(rows)
 		if scanErr != nil {
 			span.RecordError(scanErr)
-			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan event subscriber", scanErr)
+			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event subscriber", "list_event_subscribers", scanErr)
 		}
 		subscribers = append(subscribers, subscriber)
 	}
 
 	if err = rows.Err(); err != nil {
 		span.RecordError(err)
-		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Error iterating over event subscribers", err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event subscribers", "list_event_subscribers", err)
 	}
 
 	span.AddEvent("Event subscribers listed", trace.WithAttributes(
@@ -588,6 +874,12 @@ func (d Datasource) UpdateEventSubscriber(ctx context.Context, subscriber *model
 // there leaves a principal that can still authenticate and still read. The
 // deletion is reported as not-found when no row matched, so a caller cannot mistake
 // "already gone" for "just removed" and skip the broker-side work.
+//
+// PREFER TakeEventSubscriber for any deletion that has to be followed by broker-side
+// revocation. It performs the same removal but returns the row it deleted, which carries the
+// principal and the authorised topics that revocation needs — information this function
+// destroys without reporting. Use this one only when the broker side is already deprovisioned,
+// or when there is demonstrably no broker-side state to revoke.
 func (d Datasource) DeleteEventSubscriber(ctx context.Context, subscriberID string) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "DeleteEventSubscriber")
 	defer span.End()
@@ -604,7 +896,7 @@ func (d Datasource) DeleteEventSubscriber(ctx context.Context, subscriberID stri
 	`, subscriberID)
 	if err != nil {
 		span.RecordError(err)
-		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to delete event subscriber", err)
+		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to delete event subscriber", "delete_event_subscriber", err)
 	}
 
 	if err := assertSubscriberRowAffected(result, "Failed to delete event subscriber"); err != nil {
@@ -653,6 +945,20 @@ func (d Datasource) DeleteEventSubscriber(ctx context.Context, subscriberID stri
 // An empty reference is rejected rather than written: once stored it would be
 // indistinguishable from NULL and would make the "registered, not yet provisioned"
 // test lie about a subscriber that really had been provisioned.
+//
+// # SECRET-01: the FORMAT is validated, so a secret cannot be mislabelled as a reference
+//
+// The column is TEXT and would accept anything — INCLUDING A PLAINTEXT PASSWORD handed over by
+// a caller who misunderstood the field. Once a secret has been written to a column documented
+// as never holding one, removing it is an incident rather than a migration: it is in the
+// backups, in the replicas, and in whatever read it since.
+//
+// So the value is checked against the format model.DeriveCredentialReference produces before it
+// is written. A generated SASL secret cannot satisfy that shape — it has no scheme prefix and no
+// 64-character hex digest — so the mistake is refused at the boundary instead of being detected
+// later by reading the column, which is the one way of detecting it that requires reading
+// secrets. The check makes "no secret is stored here" a property of the schema rather than a
+// convention in a comment.
 func (d Datasource) RecordSubscriberCredential(ctx context.Context, subscriberID, credentialReference string, issuedAt time.Time) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RecordSubscriberCredential")
 	defer span.End()
@@ -664,6 +970,16 @@ func (d Datasource) RecordSubscriberCredential(ctx context.Context, subscriberID
 	if strings.TrimSpace(credentialReference) == "" {
 		err := apierror.NewAPIError(apierror.ErrBadRequest, "Credential reference is required", nil)
 		span.RecordError(err)
+		return err
+	}
+	if err := model.ValidateCredentialReference(credentialReference); err != nil {
+		// The offending value is NOT quoted, in the message or in the details: if a caller has
+		// passed a secret by mistake, echoing it into a log is the very disclosure this check
+		// exists to prevent.
+		err = apierror.NewAPIError(apierror.ErrInvalidInput,
+			"The credential reference is not a reference derived by the issuance service", nil)
+		span.RecordError(err)
+
 		return err
 	}
 	if issuedAt.IsZero() {
@@ -683,7 +999,7 @@ func (d Datasource) RecordSubscriberCredential(ctx context.Context, subscriberID
 	`, credentialReference, issuedAt, time.Now(), subscriberID)
 	if err != nil {
 		span.RecordError(err)
-		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to record subscriber credential", err)
+		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to record subscriber credential", "record_subscriber_credential", err)
 	}
 
 	if err := assertSubscriberRowAffected(result, "Failed to record subscriber credential"); err != nil {
@@ -736,7 +1052,7 @@ func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID str
 	`, migratedAt, time.Now(), subscriberID)
 	if err != nil {
 		span.RecordError(err)
-		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to mark subscriber migrated", err)
+		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark subscriber migrated", "mark_subscriber_migrated", err)
 	}
 
 	if err := assertSubscriberRowAffected(result, "Failed to mark subscriber migrated"); err != nil {
@@ -748,5 +1064,371 @@ func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID str
 		attribute.String("subscriber.id", subscriberID),
 		attribute.String("subscriber.migrated_at", migratedAt.UTC().Format(time.RFC3339)),
 	))
+	return nil
+}
+
+// ClearSubscriberCredential erases a subscriber's credential record, returning it to the
+// "registered, not yet provisioned" state.
+//
+// # AUTH-01: the registry has to be able to say that a credential is gone
+//
+// Revocation happens at the broker — deleting the SCRAM credential is what actually ends
+// access, because it is what the SASL handshake checks. But if the registry still shows a
+// credential reference and an issuance timestamp afterwards, every reader of the registry
+// believes the subscriber is provisioned: the operator triaging it, the migration report
+// counting provisioned subscribers, and any future reconciliation comparing registry state
+// against broker state. The two records have to be able to agree.
+//
+// It is the COMPENSATING half of RecordSubscriberCredential and is written the same way: both
+// columns together, because together they are one issuance record. Nothing here touches the
+// broker; the caller revokes there FIRST and clears here second, so a failure between the two
+// leaves the registry claiming a credential that no longer exists — which is the safe
+// direction, because it over-reports access rather than under-reporting it.
+//
+// It is IDEMPOTENT with respect to the credential columns: clearing a subscriber that holds no
+// credential is a successful no-change, because the desired end state has been reached. A
+// MISSING SUBSCRIBER is still an error, for the same reason every other write here reports one
+// — silently succeeding would let a caller believe it had cleaned up a row that does not exist.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriberID string: the business key. Required.
+//
+// Returns:
+//   - error: a typed not-found error when no subscriber matches, or a logged internal error.
+func (d Datasource) ClearSubscriberCredential(ctx context.Context, subscriberID string) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClearSubscriberCredential")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		span.RecordError(err)
+
+		return err
+	}
+	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
+
+	result, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET credential_reference = NULL,
+			credential_issued_at = NULL,
+			updated_at = $1
+		WHERE subscriber_id = $2
+	`, time.Now(), strings.TrimSpace(subscriberID))
+	if err != nil {
+		span.RecordError(err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to clear subscriber credential", "clear_subscriber_credential", err)
+	}
+
+	if err := assertSubscriberRowAffected(result, "Failed to clear subscriber credential"); err != nil {
+		span.RecordError(err)
+
+		return err
+	}
+
+	span.AddEvent("Subscriber credential cleared", trace.WithAttributes(
+		attribute.String("subscriber.id", subscriberID),
+	))
+
+	return nil
+}
+
+// TakeEventSubscriber removes a subscriber and RETURNS the row it removed.
+//
+// # AUTH-01: deletion must hand back what has to be revoked
+//
+// DeleteEventSubscriber tells a caller only whether a row went away, which is not enough to
+// deprovision: revoking at the broker needs the principal and the authorised topics, and those
+// are only in the row that has just been deleted. A caller therefore had to read, then delete,
+// then revoke — and between the read and the delete the row could change, so it could revoke a
+// boundary that was no longer the one in force.
+//
+// Returning the deleted row closes that window: what is revoked is exactly what was removed,
+// in one statement. The intended sequence is deleted-row-then-revoke, and the ORDER is
+// deliberate: revoking first and failing to delete leaves a registry row claiming access that
+// no longer exists (over-reporting, discoverable), while deleting first and failing to revoke
+// leaves live broker access with nothing to describe it (under-reporting, invisible). The
+// returned row is what makes the second recoverable — a caller that cannot revoke can log the
+// principal it must revoke by hand.
+//
+// A missing subscriber is a typed not-found error rather than a nil row, so "already gone" and
+// "just removed" cannot be confused, and a caller cannot skip the broker-side work by mistake.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriberID string: the business key. Required.
+//
+// Returns:
+//   - *model.EventSubscriber: the row as it was immediately before deletion.
+//   - error: a typed not-found error when no subscriber matched, or a logged internal error.
+func (d Datasource) TakeEventSubscriber(ctx context.Context, subscriberID string) (*model.EventSubscriber, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "TakeEventSubscriber")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		span.RecordError(err)
+
+		return nil, err
+	}
+	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
+
+	row := d.Conn.QueryRowContext(ctx, `
+		DELETE FROM blnk.event_subscribers
+		WHERE subscriber_id = $1
+		RETURNING `+eventSubscriberColumns,
+		strings.TrimSpace(subscriberID),
+	)
+
+	deleted, err := scanEventSubscriber(row)
+	if err != nil {
+		span.RecordError(err)
+
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, apierror.NewAPIError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, nil)
+		}
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to delete event subscriber", "take_event_subscriber", err)
+	}
+
+	span.AddEvent("Event subscriber deleted", trace.WithAttributes(
+		attribute.String("subscriber.id", deleted.SubscriberID),
+		attribute.String("subscriber.principal", deleted.KafkaPrincipal),
+		attribute.Int("subscriber.authorized_topic_count", len(deleted.AuthorizedTopics)),
+	))
+
+	return &deleted, nil
+}
+
+// PurgeMigratedSubscriberWebhookURLs erases the legacy webhook URL of every subscriber that
+// completed its migration before a cut-off.
+//
+// # RETAIN-01: the dual-run columns are temporary by design and must actually go
+//
+// webhook_url exists for one purpose: to give a subscriber already receiving HTTP pushes
+// somewhere to be migrated FROM. Once it has migrated, the column holds a third-party endpoint
+// — an operational secret of somebody else's system, and a destination that becomes a request
+// Blnk makes the moment any sender is wired to it — with no remaining use. Keeping it is
+// retention without a purpose, which is the definition of the finding.
+//
+// The URL is set to NULL rather than the row being deleted, because the subscriber is still a
+// live subscriber; only the migration artefact is expired. migrated_at is deliberately KEPT: it
+// is an audit fact about when the cutover happened, it is not personal or third-party data, and
+// the migration report reads it.
+//
+// The cut-off is the caller's, so the retention period is a policy decision made where policy
+// belongs and not a constant buried here. A zero time is refused rather than treated as "purge
+// everything", because a zero-valued argument is far more often a bug than an intention.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - migratedBefore time.Time: purge subscribers whose migration completed strictly before
+//     this instant. Required.
+//
+// Returns:
+//   - int64: how many rows were purged. Zero is a normal outcome.
+//   - error: a typed invalid-input error for a zero cut-off, or a logged internal error.
+func (d Datasource) PurgeMigratedSubscriberWebhookURLs(
+	ctx context.Context,
+	migratedBefore time.Time,
+) (int64, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "PurgeMigratedSubscriberWebhookURLs")
+	defer span.End()
+
+	if migratedBefore.IsZero() {
+		err := apierror.NewAPIError(apierror.ErrInvalidInput,
+			"A retention cut-off is required to purge migrated subscriber webhook URLs", nil)
+		span.RecordError(err)
+
+		return 0, err
+	}
+
+	result, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET webhook_url = NULL,
+			updated_at = $1
+		WHERE webhook_url IS NOT NULL
+		  AND migrated_at IS NOT NULL
+		  AND migrated_at < $2
+	`, time.Now(), migratedBefore.UTC())
+	if err != nil {
+		span.RecordError(err)
+
+		return 0, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to purge migrated subscriber webhook URLs",
+			"purge_migrated_subscriber_webhook_urls", err)
+	}
+
+	purged, err := result.RowsAffected()
+	if err != nil {
+		span.RecordError(err)
+
+		return 0, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to purge migrated subscriber webhook URLs",
+			"purge_migrated_subscriber_webhook_urls", err)
+	}
+
+	if purged > 0 {
+		logrus.WithFields(logrus.Fields{
+			"purged":          purged,
+			"migrated_before": migratedBefore.UTC().Format(time.RFC3339),
+		}).Info("purged the legacy webhook URL of migrated subscribers")
+	}
+
+	span.SetAttributes(attribute.Int64("subscriber.webhook_urls_purged", purged))
+
+	return purged, nil
+}
+
+// RecordSubscriberCredentialIfUnchanged persists an issuance ONLY IF the subscriber still
+// holds the credential reference the caller last observed.
+//
+// # AUTH-01: two concurrent issuances must not both report success
+//
+// Credential issuance is not idempotent — each call generates a new secret and writes it to
+// the broker, where the LAST write wins and every earlier secret stops working. Two
+// operators issuing at once therefore end with one usable secret and two successful-looking
+// responses, and the one holding the loser's secret has a credential that authenticates
+// against nothing. They have no way to know: their request returned 200 with a password in
+// it.
+//
+// This is the write that lets the loser find out. The caller reads the subscriber, provisions
+// at the broker, then records with the reference it read as `expected`; the UPDATE matches
+// only while that is still the stored value. The second writer to arrive matches no row and
+// receives a CONFLICT, which its handler turns into "your issuance was superseded, read the
+// subscriber and issue again" instead of a secret that does not work.
+//
+// It does not make issuance atomic across Blnk and the broker — nothing at this layer can,
+// because the broker is a separate system of record with its own last-write-wins semantics.
+// What it does is make the DIVERGENCE DETECTABLE at the only point where both outcomes are
+// still visible, which is the difference between a confusing failure and a silent one.
+//
+// # Why a CAS rather than a lock
+//
+// A row lock held across provisioning would serialize correctly, but it would hold a
+// PostgreSQL transaction open across a network call to Kafka for the length of the 5-second
+// issuance budget — a lock whose duration is set by a third party's responsiveness. The CAS
+// costs one predicate and holds nothing.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriberID string: the business key. Required.
+//   - expected *string: the credential reference the caller observed before provisioning.
+//     Pass nil to require that NO credential has been issued, which is the first-issuance
+//     case and is what makes a race between two first issuances detectable too.
+//   - credentialReference string: the new non-reversible reference. Validated, and never a
+//     secret.
+//   - issuedAt time.Time: the issuance instant.
+//
+// Returns:
+//   - error: a typed conflict when the stored reference no longer matches expected, a typed
+//     not-found when no subscriber matches, an invalid-input error when the reference is not
+//     a derived reference, or a logged internal error.
+func (d Datasource) RecordSubscriberCredentialIfUnchanged(
+	ctx context.Context,
+	subscriberID string,
+	expected *string,
+	credentialReference string,
+	issuedAt time.Time,
+) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RecordSubscriberCredentialIfUnchanged")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		span.RecordError(err)
+
+		return err
+	}
+
+	// The same guard RecordSubscriberCredential applies, and for the same reason: the
+	// column must never hold anything a caller could authenticate with, and the offending
+	// value is deliberately not echoed into the error, because a caller who passed a
+	// secret here by mistake must not have it copied into a log line.
+	if err := model.ValidateCredentialReference(credentialReference); err != nil {
+		wrapped := apierror.NewAPIError(apierror.ErrInvalidInput,
+			"Credential reference must be a reference derived by model.DeriveCredentialReference", nil)
+		span.RecordError(wrapped)
+
+		return wrapped
+	}
+
+	span.SetAttributes(
+		attribute.String("subscriber.id", subscriberID),
+		attribute.Bool("subscriber.first_issuance", expected == nil),
+	)
+
+	// Two arms rather than one predicate, because `credential_reference = NULL` is never
+	// true in SQL: IS NULL and = <value> are different operators, and folding them into one
+	// statement with a coalesce would make an empty-string reference collide with the
+	// no-credential case.
+	var (
+		result sql.Result
+		err    error
+		now    = time.Now()
+	)
+	if expected == nil {
+		result, err = d.Conn.ExecContext(ctx, `
+			UPDATE blnk.event_subscribers
+			SET credential_reference = $1,
+				credential_issued_at = $2,
+				updated_at = $3
+			WHERE subscriber_id = $4
+			  AND credential_reference IS NULL
+		`, credentialReference, issuedAt, now, strings.TrimSpace(subscriberID))
+	} else {
+		result, err = d.Conn.ExecContext(ctx, `
+			UPDATE blnk.event_subscribers
+			SET credential_reference = $1,
+				credential_issued_at = $2,
+				updated_at = $3
+			WHERE subscriber_id = $4
+			  AND credential_reference = $5
+		`, credentialReference, issuedAt, now, strings.TrimSpace(subscriberID), *expected)
+	}
+	if err != nil {
+		span.RecordError(err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to record subscriber credential",
+			"record_subscriber_credential_if_unchanged", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		span.RecordError(err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to record subscriber credential",
+			"record_subscriber_credential_if_unchanged", err)
+	}
+
+	if affected == 0 {
+		// No row matched, and the two reasons need different answers: the subscriber may not
+		// exist, or it may exist holding a different reference. A separate read distinguishes
+		// them, because reporting a conflict for a subscriber that was never registered
+		// would send an operator looking for a race that did not happen.
+		if _, readErr := d.GetEventSubscriberByID(ctx, subscriberID); readErr != nil {
+			span.RecordError(readErr)
+
+			return readErr
+		}
+
+		conflict := apierror.NewAPIError(apierror.ErrConflict,
+			"The subscriber's credential changed while this issuance was in flight",
+			fmt.Errorf("subscriber %q no longer holds the expected credential reference; "+
+				"a concurrent issuance superseded this one, and the secret it returned is the "+
+				"one that works", subscriberID))
+		span.RecordError(conflict)
+
+		return conflict
+	}
+
+	span.AddEvent("Subscriber credential recorded", trace.WithAttributes(
+		attribute.String("subscriber.id", subscriberID),
+		attribute.String("subscriber.credential_fingerprint",
+			model.CredentialFingerprint(credentialReference)),
+	))
+
 	return nil
 }

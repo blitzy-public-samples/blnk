@@ -21,7 +21,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -100,7 +102,7 @@ type eventCatalogueEntry struct {
 }
 
 // eventCatalogue is the complete, independently written statement of the routing
-// contract: all thirteen event strings Blnk emits, their four category topics and their
+// contract: all thirteen event strings Blnk emits, the four category topics they route to and their
 // four dead-letter siblings.
 //
 // EVERY VALUE HERE IS A LITERAL, and that is the single most important property of this
@@ -498,7 +500,10 @@ func TestTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 	assert.Len(t, routed["blnk.balances"], 2, "the balances topic carries balance.created and balance.monitor")
 	assert.Len(t, routed["blnk.identities"], 1, "the identities topic carries identity.created")
 	assert.Len(t, routed["blnk.system"], 2, "the system topic carries ledger.created and system.error")
-	assert.Len(t, routed, 4, "every emitted event must land on one of exactly four category topics")
+	assert.Len(t, routed, 4,
+		"every EMITTED event must land on one of exactly four category topics; the fifth, "+
+			"quarantine, is reachable only by an event type the mapping table does not recognise, "+
+			"so no entry in the catalogue may route there")
 }
 
 // TestTopicForEvent_CoversEveryEventTypeTheMappingKnows is the count assertion, and it is
@@ -674,19 +679,27 @@ func TestTopicForEvent_BulkTransactionMatchesByPrefix(t *testing.T) {
 	// satisfy the prefix rule. This is the assertion that catches a prefix constant with
 	// the dot dropped — which would otherwise route "bulk_transactions_report" and any
 	// other similarly-named string onto the transactions topic.
-	assert.Equal(t, "blnk.system", TopicForEvent("bulk_transaction"))
+	assert.Equal(t, "blnk.quarantine", TopicForEvent("bulk_transaction"))
 }
 
-// TestTopicForEvent_UnrecognisedEventRoutesToTheSystemTopic pins the chosen behaviour
-// for an event type that is not in the catalogue.
+// TestTopicForEvent_UnrecognisedEventRoutesToTheQuarantineTopic pins the chosen
+// behaviour for an event type that is not in the catalogue, and pins WHICH topic it is.
 //
-// The choice is deliberate and it is the safe one. The relay publishes to whatever topic
-// it is handed, so returning an empty string would strand the event: no topic, no
-// publish, no dead-letter entry, nothing to replay. Routing to the system topic keeps
-// the event published, observable and replayable. A producer added later without
-// extending the mapping therefore degrades to "landed on the catch-all topic" instead of
-// "silently lost".
-func TestTopicForEvent_UnrecognisedEventRoutesToTheSystemTopic(t *testing.T) {
+// Two requirements meet here, and one topic cannot serve both:
+//
+//   - The routing must be TOTAL. The relay publishes to whatever topic it is handed, so
+//     returning an empty string would strand a committed event — no topic, no publish,
+//     no dead-letter entry, nothing to replay — and dropping it would lose it outright.
+//   - The destination must not be a topic real subscribers consume. The catch-all used
+//     to be blnk.system, which meant a producer added without extending the catalogue
+//     delivered its payload — plausibly a balance or an identity record — to whoever
+//     consumes system events.
+//
+// Quarantine satisfies both: the event is published, observable and replayable, and the
+// topic is internal so no subscriber can be granted it. The explicit not-system
+// assertion below is the one that matters — an edit reverting the catch-all restores the
+// disclosure, and a totality-only assertion would not notice.
+func TestTopicForEvent_UnrecognisedEventRoutesToTheQuarantineTopic(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
 	for _, eventType := range []string{
@@ -720,21 +733,25 @@ func TestTopicForEvent_UnrecognisedEventRoutesToTheSystemTopic(t *testing.T) {
 		"transaction.applied\u200b",  // a zero-width space, invisible in a diff
 		strings.Repeat("very.", 200), // longer than Kafka's 249-character topic limit
 	} {
-		assert.Equal(t, "blnk.system", TopicForEvent(eventType),
-			"unrecognised event type %q must route to the system catch-all topic", eventType)
+		assert.Equal(t, "blnk.quarantine", TopicForEvent(eventType),
+			"unrecognised event type %q must route to the quarantine catch-all topic", eventType)
+		assert.NotEqual(t, "blnk.system", TopicForEvent(eventType),
+			"unrecognised event type %q must NOT route to the system topic: its consumers expect Blnk's own ledger and error records, not an unclassified domain payload", eventType)
 		assert.NotEmpty(t, TopicForEvent(eventType),
 			"TopicForEvent must never return an empty string: the relay would strand the event")
+		assert.False(t, IsSubscriberGrantableTopic(TopicForEvent(eventType)),
+			"the catch-all topic must not be grantable to a subscriber, or containment is nominal")
 
 		// The event's own name must never leak into the topic name. Composing the event
 		// into the topic would create a topic per event type on demand — unprovisioned,
 		// single-partition, wrongly replicated, and read by nobody.
-		assert.Equal(t, "blnk.system.dlt", DeadLetterTopicForEvent(eventType),
-			"and its dead-letter sibling must be the system topic's, not one derived from %q", eventType)
+		assert.Equal(t, "blnk.quarantine.dlt", DeadLetterTopicForEvent(eventType),
+			"and its dead-letter sibling must be the quarantine topic's, not one derived from %q", eventType)
 	}
 }
 
-// TestDLTFor_DerivesTheFourDeadLetterTopics asserts the exact dead-letter names for all
-// four category topics.
+// TestDLTFor_DerivesTheFourDeadLetterTopics asserts the exact dead-letter names for
+// every category topic.
 //
 // Three of these four strings are the literal names the requirements specify, so they
 // must match byte for byte. They are also the names the local provisioning path creates,
@@ -745,6 +762,7 @@ func TestDLTFor_DerivesTheFourDeadLetterTopics(t *testing.T) {
 	assert.Equal(t, "blnk.balances.dlt", DLTFor("blnk.balances"))
 	assert.Equal(t, "blnk.identities.dlt", DLTFor("blnk.identities"))
 	assert.Equal(t, "blnk.system.dlt", DLTFor("blnk.system"))
+	assert.Equal(t, "blnk.quarantine.dlt", DLTFor("blnk.quarantine"))
 
 	// The suffix constant is the published convention. Its value is part of the
 	// subscriber contract, so it is pinned independently of the names derived from it.
@@ -827,8 +845,8 @@ func TestDeadLetterTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 
 	// An unrecognised event dead-letters to the catch-all's sibling, so even an event
 	// nobody mapped remains recoverable.
-	assert.Equal(t, "blnk.system.dlt", DeadLetterTopicForEvent("totally.unknown"))
-	assert.Equal(t, "blnk.system.dlt", DeadLetterTopicForEvent(""))
+	assert.Equal(t, "blnk.quarantine.dlt", DeadLetterTopicForEvent("totally.unknown"))
+	assert.Equal(t, "blnk.quarantine.dlt", DeadLetterTopicForEvent(""))
 }
 
 // TestDeadLetterTopicForEvent_IsDLTForOfTopicForEvent pins the composition order.
@@ -896,6 +914,7 @@ func TestTopicPrefix_DefaultsToBlnkWhenUnset(t *testing.T) {
 		"blnk.balances",
 		"blnk.identities",
 		"blnk.system",
+		"blnk.quarantine",
 	}, AllTopics())
 }
 
@@ -917,7 +936,7 @@ func TestTopicPrefix_HonoursAConfiguredOverride(t *testing.T) {
 	assert.Equal(t, "acme.events.identities", TopicForEvent("identity.created"))
 	assert.Equal(t, "acme.events.system", TopicForEvent("ledger.created"))
 	assert.Equal(t, "acme.events.system", TopicForEvent("system.error"))
-	assert.Equal(t, "acme.events.system", TopicForEvent("totally.unknown"))
+	assert.Equal(t, "acme.events.quarantine", TopicForEvent("totally.unknown"))
 
 	assert.Equal(t, "acme.events.transactions.dlt", DeadLetterTopicForEvent("transaction.applied"))
 	assert.Equal(t, "acme.events.system.dlt", DeadLetterTopicForEvent("system.error"))
@@ -927,6 +946,7 @@ func TestTopicPrefix_HonoursAConfiguredOverride(t *testing.T) {
 		"acme.events.balances",
 		"acme.events.identities",
 		"acme.events.system",
+		"acme.events.quarantine",
 	}, AllTopics())
 
 	assert.Equal(t, []string{
@@ -934,6 +954,7 @@ func TestTopicPrefix_HonoursAConfiguredOverride(t *testing.T) {
 		"acme.events.balances.dlt",
 		"acme.events.identities.dlt",
 		"acme.events.system.dlt",
+		"acme.events.quarantine.dlt",
 	}, AllDeadLetterTopics())
 
 	assert.Equal(t, []string{
@@ -941,10 +962,12 @@ func TestTopicPrefix_HonoursAConfiguredOverride(t *testing.T) {
 		"acme.events.balances",
 		"acme.events.identities",
 		"acme.events.system",
+		"acme.events.quarantine",
 		"acme.events.transactions.dlt",
 		"acme.events.balances.dlt",
 		"acme.events.identities.dlt",
 		"acme.events.system.dlt",
+		"acme.events.quarantine.dlt",
 	}, AllTopicsWithDeadLetters())
 
 	// No derived name may retain the default namespace once an override is configured.
@@ -1036,6 +1059,7 @@ func TestTopicPrefix_DefaultsWhenConfigurationIsNotLoaded(t *testing.T) {
 		"blnk.balances",
 		"blnk.identities",
 		"blnk.system",
+		"blnk.quarantine",
 	}, AllTopics())
 }
 
@@ -1111,6 +1135,7 @@ func TestAllTopics_IsTheFourCategoryTopicsInCanonicalOrder(t *testing.T) {
 		"blnk.balances",
 		"blnk.identities",
 		"blnk.system",
+		"blnk.quarantine",
 	}, AllTopics())
 
 	// None of the publish-side topics may be a dead-letter topic; that would mean events
@@ -1134,6 +1159,7 @@ func TestAllDeadLetterTopics_IsTheFourSiblingsInCanonicalOrder(t *testing.T) {
 		"blnk.balances.dlt",
 		"blnk.identities.dlt",
 		"blnk.system.dlt",
+		"blnk.quarantine.dlt",
 	}, AllDeadLetterTopics())
 
 	category := AllTopics()
@@ -1147,16 +1173,17 @@ func TestAllDeadLetterTopics_IsTheFourSiblingsInCanonicalOrder(t *testing.T) {
 	}
 }
 
-// TestAllTopicsWithDeadLetters_IsTheEightProvisionedTopics pins the complete inventory —
+// TestAllTopicsWithDeadLetters_IsTheProvisionedInventory pins the complete inventory —
 // the single source of truth shared by the Go admin path and the provisioning script.
 //
-// These eight names, in this order, are what the local stack provisions. If this list and
+// These names, in this order, are what the provisioning script creates; the parity itself is
+// enforced by TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns. If this list and
 // the provisioning script ever disagree, the failure is silent in the worst way: the
 // script creates topics the code never writes to, and the code writes to topics the script
 // never created, which either fails on an unprovisioned topic or auto-creates one with a
 // single partition and the wrong replication factor — quietly discarding the ordering and
 // durability guarantees.
-func TestAllTopicsWithDeadLetters_IsTheEightProvisionedTopics(t *testing.T) {
+func TestAllTopicsWithDeadLetters_IsTheProvisionedInventory(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
 	assert.Equal(t, []string{
@@ -1164,10 +1191,12 @@ func TestAllTopicsWithDeadLetters_IsTheEightProvisionedTopics(t *testing.T) {
 		"blnk.balances",
 		"blnk.identities",
 		"blnk.system",
+		"blnk.quarantine",
 		"blnk.transactions.dlt",
 		"blnk.balances.dlt",
 		"blnk.identities.dlt",
 		"blnk.system.dlt",
+		"blnk.quarantine.dlt",
 	}, AllTopicsWithDeadLetters())
 
 	// It must be exactly the concatenation of the two halves, in that order.
@@ -1181,17 +1210,19 @@ func TestAllTopicsWithDeadLetters_IsTheEightProvisionedTopics(t *testing.T) {
 		assert.False(t, duplicate, "topic %q appears twice in the inventory", topic)
 		seen[topic] = struct{}{}
 	}
-	assert.Len(t, seen, 8, "the inventory is four category topics plus four dead-letter siblings")
+	assert.Len(t, seen, 2*len(EventCategories()),
+		"the inventory is one category topic plus one dead-letter sibling per category")
 
 	// Exactly half the inventory is dead-letter topics, so a category that lost its
-	// sibling — or gained a second one — is caught even if the total still came to eight.
+	// sibling — or gained a second one — is caught even if the total still came out right.
 	deadLetters := 0
 	for _, topic := range AllTopicsWithDeadLetters() {
 		if IsDeadLetterTopic(topic) {
 			deadLetters++
 		}
 	}
-	assert.Equal(t, 4, deadLetters, "every category topic must contribute exactly one dead-letter sibling")
+	assert.Equal(t, len(EventCategories()), deadLetters,
+		"every category topic must contribute exactly one dead-letter sibling")
 }
 
 // TestTopicInventory_ContainsNoEmptyOrMalformedName is the guard against a name that is
@@ -1275,17 +1306,24 @@ func TestTopicInventory_ReturnsFreshSlicesCallersMayMutate(t *testing.T) {
 		"EventCategories must not be backed by shared state")
 }
 
-// TestEventCategories_IsTheFourTokensInCanonicalOrder pins the category enumeration.
+// TestEventCategories_IsTheCanonicalTokenListInOrder pins the category enumeration.
 //
 // The tokens are compared against the model constants they are built from, so the
-// enumeration cannot drift from the vocabulary; the ORDER, which model does not declare,
-// is pinned by the literal list.
-func TestEventCategories_IsTheFourTokensInCanonicalOrder(t *testing.T) {
+// enumeration cannot drift from the vocabulary, and the literal list pins the ORDER —
+// which the provisioning script and the operator documentation are diffed against.
+//
+// There is now exactly ONE declaration of this list, in model.AllEventCategories. It used
+// to be declared twice, here and in model, and a second copy of an enumeration is a
+// second thing to forget: adding the quarantine category to the routing table without
+// adding it to the topic inventory would have produced a topic that events route to and
+// that nothing provisions.
+func TestEventCategories_IsTheCanonicalTokenListInOrder(t *testing.T) {
 	assert.Equal(t, []string{
 		"transactions",
 		"balances",
 		"identities",
 		"system",
+		"quarantine",
 	}, EventCategories())
 
 	assert.Equal(t, []string{
@@ -1293,8 +1331,18 @@ func TestEventCategories_IsTheFourTokensInCanonicalOrder(t *testing.T) {
 		model.EventCategoryBalances,
 		model.EventCategoryIdentities,
 		model.EventCategorySystem,
+		model.EventCategoryQuarantine,
 	}, EventCategories(),
 		"the enumeration must be built from the model constants, not from re-spelled literals")
+
+	assert.Equal(t, model.AllEventCategories(), EventCategories(),
+		"the topic layer must delegate to the single category declaration in model rather than keep a copy")
+
+	// The accessor must hand back a copy: one caller sorting the result must not
+	// reorder the inventory for the provisioning path.
+	mutated := EventCategories()
+	mutated[0] = "mutated"
+	assert.NotContains(t, EventCategories(), "mutated")
 }
 
 // TestEventCategories_ContainsNoCategoryNamedDLT enforces the invariant that DLFor's
@@ -1320,18 +1368,22 @@ func TestEventCategories_ContainsNoCategoryNamedDLT(t *testing.T) {
 	}
 }
 
-// TestTopicForCategory_BlankCategoryFallsBackToSystem pins the guard against composing a
-// name with an empty final segment.
+// TestTopicForCategory_BlankCategoryFallsBackToQuarantine pins the guard against
+// composing a name with an empty final segment, and pins where the fallback goes.
 //
-// "<prefix>." is a topic Kafka would accept and nothing would read. Falling back to the
-// catch-all keeps every result a usable topic, which is the same never-drop-an-event
-// policy the event mapping's own catch-all implements.
-func TestTopicForCategory_BlankCategoryFallsBackToSystem(t *testing.T) {
+// "<prefix>." is a topic Kafka would accept and nothing would read, so a blank category
+// must still compose a usable name — the same never-drop-an-event policy the event
+// mapping's own catch-all implements. It falls back to QUARANTINE rather than the system
+// topic: a blank category means the caller could not classify the event, so its audience
+// is unknown, and quarantine is the internal topic no subscriber can be granted.
+func TestTopicForCategory_BlankCategoryFallsBackToQuarantine(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
 	for _, blank := range []string{"", " ", "\t", ".", " . ", "\n"} {
-		assert.Equal(t, "blnk.system", TopicForCategory(blank),
-			"a blank category %q must fall back to the system topic, never compose %q", blank, "blnk.")
+		assert.Equal(t, "blnk.quarantine", TopicForCategory(blank),
+			"a blank category %q must fall back to the quarantine topic, never compose %q", blank, "blnk.")
+		assert.NotEqual(t, "blnk.system", TopicForCategory(blank),
+			"an unclassifiable event must not land on the topic whose consumers expect Blnk's own records")
 		assert.NotEqual(t, "blnk.", TopicForCategory(blank))
 	}
 }
@@ -1352,6 +1404,111 @@ func TestTopicForCategory_ComposesAnUnknownCategoryAsGiven(t *testing.T) {
 	assert.Equal(t, "blnk.balances", TopicForCategory(model.EventCategoryBalances))
 	assert.Equal(t, "blnk.identities", TopicForCategory(model.EventCategoryIdentities))
 	assert.Equal(t, "blnk.system", TopicForCategory(model.EventCategorySystem))
+	assert.Equal(t, "blnk.quarantine", TopicForCategory(model.EventCategoryQuarantine))
+}
+
+// TestSubscriberGrantableTopics_ExcludesDeadLettersAndInternalTopics is the test for the
+// authorization allowlist, and it is the one that stops an over-broad grant.
+//
+// Before the allowlist existed, both the request-validation layer and the ACL
+// provisioning simply trimmed whatever topic list the caller supplied and granted what
+// remained. An authorized request could therefore name the literal wildcard, a
+// dead-letter topic, an internal topic, or a topic belonging to another system entirely,
+// and receive a real ACL binding over it. Every rejected value below is one of those.
+func TestSubscriberGrantableTopics_ExcludesDeadLettersAndInternalTopics(t *testing.T) {
+	storeKafkaTopicPrefix(t, "")
+
+	assert.Equal(t, []string{
+		"blnk.transactions",
+		"blnk.balances",
+		"blnk.identities",
+	}, SubscriberGrantableTopics(),
+		"only the non-internal category topics may be granted to a subscriber")
+
+	for _, topic := range SubscriberGrantableTopics() {
+		assert.True(t, IsSubscriberGrantableTopic(topic),
+			"%q is listed as grantable, so the predicate must accept it", topic)
+		assert.False(t, IsDeadLetterTopic(topic),
+			"%q must not be a dead-letter topic: a .dlt record carries Blnk's failure metadata, which is operator detail rather than subscriber data", topic)
+	}
+
+	refused := map[string]string{
+		"the transactions dead-letter topic": "blnk.transactions.dlt",
+		"the balances dead-letter topic":     "blnk.balances.dlt",
+		"the identities dead-letter topic":   "blnk.identities.dlt",
+		"the internal system topic":          "blnk.system",
+		"the internal system DLT":            "blnk.system.dlt",
+		"the internal quarantine topic":      "blnk.quarantine",
+		"the internal quarantine DLT":        "blnk.quarantine.dlt",
+		"the literal wildcard":               "*",
+		"a wildcard suffix":                  "blnk.*",
+		"a single-character wildcard":        "blnk.transaction?",
+		"an empty topic":                     "",
+		"a whitespace-only topic":            "   ",
+		"a foreign topic":                    "someone-elses.topic",
+		"a Kafka internal topic":             "__consumer_offsets",
+		"the KRaft metadata topic":           "__cluster_metadata",
+		"a near-miss with a suffix":          "blnk.transactions.something-else",
+		"a near-miss with a prefix":          "not-blnk.transactions",
+		"an upper-cased grantable topic":     "BLNK.TRANSACTIONS",
+		"a mixed-case grantable topic":       "Blnk.Transactions",
+		"a topic with an embedded newline":   "blnk.transactions\nblnk.system",
+		"a topic with an embedded NUL":       "blnk.transactions\x00",
+	}
+	for name, topic := range refused {
+		assert.False(t, IsSubscriberGrantableTopic(topic),
+			"%s (%q) must not be grantable to a subscriber", name, topic)
+	}
+
+	// Trailing and leading whitespace on an otherwise valid name IS tolerated, because
+	// an operator pasting a topic name is a routine mistake and the trimmed value is
+	// unambiguous. Nothing else is normalised.
+	assert.True(t, IsSubscriberGrantableTopic("  blnk.transactions  "),
+		"surrounding whitespace on an exact match is trimmed, which is the only normalisation applied")
+
+	// The allowlist must follow the configured namespace, or a non-default deployment
+	// could grant nothing at all.
+	storeKafkaTopicPrefix(t, "acme.events")
+	assert.Equal(t, []string{
+		"acme.events.transactions",
+		"acme.events.balances",
+		"acme.events.identities",
+	}, SubscriberGrantableTopics())
+	assert.True(t, IsSubscriberGrantableTopic("acme.events.transactions"))
+	assert.False(t, IsSubscriberGrantableTopic("blnk.transactions"),
+		"a topic from a different namespace must not be grantable just because it looks Blnk-owned")
+}
+
+// TestIsBlnkOwnedTopic_CoversTheWholeInventoryAndNothingElse pins the broader check the
+// publisher and the repository apply.
+//
+// The two predicates answer different questions and must not be confused:
+// IsBlnkOwnedTopic answers "may WE write here?", which includes the internal and
+// dead-letter names because Blnk legitimately writes to all of them;
+// IsSubscriberGrantableTopic answers "may a SUBSCRIBER read here?", which does not.
+func TestIsBlnkOwnedTopic_CoversTheWholeInventoryAndNothingElse(t *testing.T) {
+	storeKafkaTopicPrefix(t, "")
+
+	for _, topic := range AllTopicsWithDeadLetters() {
+		assert.True(t, IsBlnkOwnedTopic(topic),
+			"%q is in the inventory, so the publisher must be allowed to write to it", topic)
+	}
+
+	// Every grantable topic is Blnk-owned; the converse is deliberately false.
+	for _, topic := range SubscriberGrantableTopics() {
+		assert.True(t, IsBlnkOwnedTopic(topic))
+	}
+	assert.True(t, IsBlnkOwnedTopic("blnk.system"),
+		"Blnk writes to the internal system topic even though no subscriber may read it")
+	assert.False(t, IsSubscriberGrantableTopic("blnk.system"))
+
+	for _, topic := range []string{
+		"", "   ", "*", "blnk", "blnk.", "blnk.orders", "__consumer_offsets",
+		"blnk.transactions.dlt.dlt", "blnk.transactions.replayed", "BLNK.TRANSACTIONS",
+	} {
+		assert.False(t, IsBlnkOwnedTopic(topic),
+			"%q is not in the inventory and must not be writable: a stored or replayed row must not be able to steer the publisher at an arbitrary topic", topic)
+	}
 }
 
 // TestEventTopicsSource_HardcodesNoComposedTopicName is a structural guarantee that every
@@ -1473,4 +1630,277 @@ func TestEventTopicsSource_RecordsTheSunsetRelocationOfGetEventFromStatus(t *tes
 		"the event vocabulary must remain callable from its declaration site in webhooks.go")
 	assert.Equal(t, "transaction.unknown", getEventFromStatus(StatusCommit),
 		"and the deliberately preserved COMMIT fall-through must be untouched")
+}
+
+// ---------------------------------------------------------------------------------------
+// Consequences of topic ownership — VALID-01 and DATA-01
+//
+// The rest of this file establishes WHICH topics Blnk owns. These tests cover what follows
+// from that answer at the two places it is load-bearing outside naming: the publisher's
+// refusal to write to a topic outside the namespace, and the bounding of stored strings
+// before they become metric labels.
+//
+// They live here rather than beside the publisher because event_publisher_test.go belongs to
+// a later checkpoint and is not in this scope, and because both behaviours are questions
+// about ownership — this file is the authority on that. None of them performs I/O: a
+// kafka.Writer is constructed lazily and no case below reaches a write.
+// ---------------------------------------------------------------------------------------
+
+// newOwnershipPublisher builds a real Kafka-backed publisher with no broker contact.
+//
+// newKafkaPublisher assembles a transport and one writer per owned topic, all of which are
+// pure construction — kafka-go dials on first use, and no test here uses one.
+func newOwnershipPublisher(t *testing.T) *kafkaPublisher {
+	t.Helper()
+
+	publisher, err := newKafkaPublisher([]string{"localhost:9092"}, config.KafkaConfig{
+		Brokers:          []string{"localhost:9092"},
+		TopicPrefix:      DefaultTopicPrefix,
+		InsecureLocalDev: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = publisher.Close() })
+
+	return publisher
+}
+
+// TestWriterFor_RefusesATopicBlnkDoesNotOwn is the VALID-01 guard on the publish path.
+//
+// The destination of a publish comes from a STORED OUTBOX ROW. Writer creation used to grow
+// lazily with no membership test, so ANY topic name that reached the table was created as a
+// writer and published to — using Blnk's own producer credentials, on Blnk's own broker, at
+// the direction of stored data. A row carrying "attacker.transactions", or a name with an
+// injected segment, was delivered exactly as asked.
+//
+// Persistence now rejects such a row at insert, and this is the second half of that defence:
+// a row would have to bypass validation AND survive this check to reach a foreign topic. The
+// refusal is asserted to happen WITHOUT caching the writer, because a rejected name that
+// entered the map would be admitted by the fast path on the next attempt.
+func TestWriterFor_RefusesATopicBlnkDoesNotOwn(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	publisher := newOwnershipPublisher(t)
+	owned := len(publisher.writers)
+
+	for _, topic := range []string{
+		"attacker.transactions",
+		"blnkfinance.transactions",
+		"transactions",
+		"blnk",
+		"BLNK.transactions",
+		" blnk.transactions",
+		"blnk.transactions\n",
+		"__consumer_offsets",
+		"legacy.transactions",
+		"legacy.transactions.dlt",
+	} {
+		writer, err := publisher.writerFor(topic)
+		require.Error(t, err, "writerFor(%q) must be refused", topic)
+		assert.Nil(t, writer)
+		assert.ErrorIs(t, err, ErrTopicNotOwned,
+			"the refusal must be recognisable without matching message text")
+		assert.Len(t, publisher.writers, owned,
+			"a refused topic %q must not be cached, or the fast path would admit it next time", topic)
+	}
+}
+
+// TestWriterFor_ServesEveryPreCreatedTopic covers the fast path.
+//
+// The pre-created set comes from AllTopicsWithDeadLetters — Blnk's own configuration — and under
+// a fixed prefix it is already the whole owned namespace, since ownership is exactly
+// prefix.<known-category> and its `.dlt` sibling. Every one must be served, and the writer must
+// carry the topic it was asked for: a per-topic writer bound to the wrong topic would publish
+// silently to the wrong audience, which no runtime error would reveal.
+func TestWriterFor_ServesEveryPreCreatedTopic(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	publisher := newOwnershipPublisher(t)
+	require.NotEmpty(t, publisher.writers, "the publisher must pre-create its inventory")
+
+	for _, topic := range AllTopicsWithDeadLetters() {
+		writer, err := publisher.writerFor(topic)
+		require.NoError(t, err, "an owned topic %q must be served", topic)
+		require.NotNil(t, writer)
+		assert.Equal(t, topic, writer.Topic)
+	}
+}
+
+// TestWriterFor_GrowsForANewPrefixAndKeepsServingTheOld covers the ONE situation in which lazy
+// growth is reachable, and the reason it does not strand a committed event.
+//
+// The prefix is re-read from live configuration on every naming call, so a reload starts
+// resolving events to names this publisher was never constructed with. Those are owned under the
+// new prefix, so they are admitted and cached — and asserting the cache grew by exactly one, and
+// that a second call returns the SAME writer, is what proves growth is shared rather than
+// per-publish.
+//
+// Meanwhile a row stored before the change still names a pre-created topic, so it is still
+// served. That is the case the membership test must not break: the row recorded its destination
+// precisely so the event would reach the topic it was bound for, and the process holds a writer
+// for it built from its own configuration.
+func TestWriterFor_GrowsForANewPrefixAndKeepsServingTheOld(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+	publisher := newOwnershipPublisher(t)
+	before := len(publisher.writers)
+
+	storeKafkaTopicPrefix(t, "renamed")
+
+	grown, err := publisher.writerFor("renamed.transactions")
+	require.NoError(t, err, "the new prefix is Blnk's namespace and must be admitted")
+	require.NotNil(t, grown)
+	assert.Equal(t, "renamed.transactions", grown.Topic)
+	assert.Len(t, publisher.writers, before+1, "and cached, so the next publish takes the fast path")
+
+	again, err := publisher.writerFor("renamed.transactions")
+	require.NoError(t, err)
+	assert.Same(t, grown, again, "two publishes to one topic must share one writer")
+
+	stored, err := publisher.writerFor("blnk.transactions")
+	require.NoError(t, err,
+		"a row stored before the prefix change names a pre-created topic and must still publish")
+	assert.Equal(t, "blnk.transactions", stored.Topic)
+
+	// A prefix change does not widen the namespace: a foreign name is refused under either.
+	_, err = publisher.writerFor("attacker.transactions")
+	assert.ErrorIs(t, err, ErrTopicNotOwned)
+}
+
+// TestBoundedTopicLabel_CollapsesEveryNameBlnkDoesNotOwn is the DATA-01 cardinality guard.
+//
+// Every value that reaches this label arrives from an outbox row, and the FAILURE path records
+// an attempt for a topic that was rejected — precisely the case where the name is not Blnk's.
+// An unbounded label is two defects at once: each distinct value creates a time series, so a
+// stream of odd names is a storage attack on the metrics pipeline with no request rate to limit;
+// and the label publishes whatever string was stored to anyone who can read /metrics.
+func TestBoundedTopicLabel_CollapsesEveryNameBlnkDoesNotOwn(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	for _, topic := range AllTopicsWithDeadLetters() {
+		assert.Equal(t, topic, boundedTopicLabel(topic),
+			"an owned topic is reported verbatim, which is what the per-topic queries need")
+	}
+
+	for _, topic := range []string{
+		"attacker.transactions",
+		"",
+		"blnk",
+		strings.Repeat("x", 4096),
+		"blnk.transactions; DROP TABLE",
+		"legacy.transactions",
+	} {
+		assert.Equal(t, unownedTopicLabel, boundedTopicLabel(topic),
+			"an unowned topic %q must collapse to one fixed label", topic)
+	}
+}
+
+// TestBoundedEventTypeLabel_CollapsesEveryUncataloguedType is the other half of the same guard.
+//
+// The catalogue is the bound: a recognised event type is one of a fixed set this repository
+// emits. An unrecognised one routes to quarantine, and those names are exactly the ones that
+// could be arbitrary — a stored row from a producer that was never catalogued.
+//
+// Collapsing does not hide the condition: a non-zero count on the collapsed label is the signal
+// that something is publishing an uncatalogued event, and the quarantine topic names it.
+func TestBoundedEventTypeLabel_CollapsesEveryUncataloguedType(t *testing.T) {
+	for _, eventType := range []string{
+		"transaction.queued", "transaction.applied", "transaction.scheduled",
+		"transaction.inflight", "transaction.void", "transaction.rejected",
+		"transaction.unknown", "bulk_transaction.applied", "bulk_transaction.failed",
+		"balance.created", "balance.monitor", "identity.created",
+		"ledger.created", "system.error",
+	} {
+		assert.Equal(t, eventType, boundedEventTypeLabel(eventType),
+			"a catalogued event type is reported verbatim")
+	}
+
+	for _, eventType := range []string{
+		"", "not.an.event", "Transaction.Applied", " transaction.applied",
+		strings.Repeat("y", 4096), "transaction.applied\n",
+	} {
+		assert.Equal(t, unrecognisedEventTypeLabel, boundedEventTypeLabel(eventType),
+			"an uncatalogued event type %q must collapse to one fixed label", eventType)
+	}
+}
+
+// TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns pins the parity between the
+// Go topic catalogue and the shell script that provisions it.
+//
+// # Why this test exists rather than a comment
+//
+// event_admin.go states that AllTopicsWithDeadLetters is "the single source of truth shared
+// with scripts/kafka-provision.sh", and the script states that its own list "is
+// eventCategoryOrder". Both claims were true when written and neither was enforced, so when
+// a category was added to the Go side the script kept provisioning the older, shorter set —
+// and nothing anywhere failed. The drift is invisible in every unit test, invisible in every
+// build, and visible only against a real broker, as a publish to a topic that does not
+// exist.
+//
+// # Why a missing topic is not a cosmetic problem
+//
+// Against a broker with auto.create.topics.enable=false — the correct production setting,
+// because auto-creation would silently manufacture a topic with the wrong partition count
+// and the wrong replication factor — a publish to an unprovisioned topic FAILS. The row
+// retries until its budget is spent and the dead-letter write then fails too, because the
+// missing category's `.dlt` sibling is missing for the same reason. The event is stranded.
+//
+// That lands hardest on exactly the category most likely to be forgotten: quarantine exists
+// so that an event type the mapping table does not recognise is still published rather than
+// dropped, which is the whole of the zero-exceptions coverage guarantee. An unprovisioned
+// quarantine topic turns that guarantee into its opposite.
+func TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns(t *testing.T) {
+	script, err := os.ReadFile(filepath.Join(moduleRootDir(t), "scripts", "kafka-provision.sh"))
+	require.NoError(t, err, "scripts/kafka-provision.sh must be readable to compare its catalogue")
+
+	declaration := regexp.MustCompile(`(?m)^readonly EVENT_CATEGORIES=\(([^)]*)\)`)
+	match := declaration.FindSubmatch(script)
+	require.NotNil(t, match,
+		"the script must declare its catalogue as `readonly EVENT_CATEGORIES=(...)`; if that "+
+			"declaration is renamed or restructured, update this test rather than deleting it — "+
+			"the parity it enforces is what keeps a publish from reaching a topic nobody created")
+
+	scriptCategories := strings.Fields(string(match[1]))
+	assert.Equal(t, model.AllEventCategories(), scriptCategories,
+		"the script's categories must match model.AllEventCategories EXACTLY, including ORDER: "+
+			"the script's own comment names eventCategoryOrder as canonical, and the ordering "+
+			"fixes the order of AllTopics, AllDeadLetterTopics and AllTopicsWithDeadLetters that "+
+			"provisioning is compared against")
+
+	t.Run("an internal category is still provisioned", func(t *testing.T) {
+		// Internal means "no subscriber may be granted it", not "it does not need to exist".
+		// Conflating those is precisely how the quarantine topic went unprovisioned.
+		grantable := model.SubscriberGrantableEventCategories()
+		require.NotEqual(t, len(model.AllEventCategories()), len(grantable),
+			"at least one category is expected to be internal; if none is, this subtest is guarding nothing")
+
+		for _, category := range model.AllEventCategories() {
+			assert.Contains(t, scriptCategories, category,
+				"%q must be provisioned whether or not a subscriber may be granted it", category)
+		}
+	})
+
+	t.Run("the dead-letter suffix agrees too", func(t *testing.T) {
+		// The script derives the `.dlt` names rather than listing them, so the suffix is the
+		// other half of the catalogue and drifts just as silently.
+		suffix := regexp.MustCompile(`(?m)^readonly DEAD_LETTER_SUFFIX="([^"]*)"`).FindSubmatch(script)
+		require.NotNil(t, suffix, "the script must declare DEAD_LETTER_SUFFIX")
+		assert.Equal(t, DeadLetterTopicSuffix, string(suffix[1]),
+			"the script's dead-letter suffix must equal DeadLetterTopicSuffix, which is the published "+
+				"<topic>.dlt convention subscribers are told to stay clear of")
+	})
+
+	t.Run("the whole inventory is derivable from the script's two declarations", func(t *testing.T) {
+		storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+		derived := make([]string, 0, len(scriptCategories)*2)
+		for _, category := range scriptCategories {
+			derived = append(derived, DefaultTopicPrefix+"."+category)
+		}
+		for _, category := range scriptCategories {
+			derived = append(derived, DefaultTopicPrefix+"."+category+DeadLetterTopicSuffix)
+		}
+
+		assert.Equal(t, AllTopicsWithDeadLetters(), derived,
+			"the topics the script creates must be exactly the topics the publisher writes to and "+
+				"the admin client assures")
+	})
 }

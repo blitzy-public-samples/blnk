@@ -41,12 +41,16 @@ package metrics
 import (
 	"context"
 	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 // Compile-time instrument-kind guards for the event-streaming instruments.
@@ -75,24 +79,43 @@ var (
 )
 
 // publishOutcomes is the complete vocabulary of the "outcome" attribute carried by
-// EventPublishAttemptsTotal, matching the documented attribute list on its
-// declaration in metrics.go.
+// EventPublishAttemptsTotal and EventPublishDuration, matching the documented
+// attribute list on their declarations in metrics.go.
 //
 // Note the UNDERSCORE in dead_lettered. Surrounding prose spells the concept
 // "dead-lettered" with a hyphen; that is not the attribute value, and a metric
 // consumer filtering on the hyphenated spelling would match nothing.
 //
+// "failed" is here because it is a DISTINCT outcome from "retrying" and not a
+// synonym for it: an attempt that failed permanently, or that spent the last of the
+// retry budget, will never be retried, and reporting it as retrying would report
+// retry pressure that does not exist. The four values are mutually exclusive and
+// exhaustive, so their sum is the total number of attempted writes.
+//
 // Spelled as literals deliberately: this test file stays as dependency-free as the
-// package it covers, so it does not import the model package merely to obtain three
+// package it covers, so it does not import the model package merely to obtain four
 // strings.
-var publishOutcomes = []string{"dispatched", "retrying", "dead_lettered"}
+var publishOutcomes = []string{"dispatched", "retrying", "failed", "dead_lettered"}
 
-// maxRelayRetryAttempts is the relay's default attempt budget
-// (RELAY_MAX_RETRY_ATTEMPTS), which bounds the values the "attempt" attribute on
-// EventPublishDuration can take: 1 through 5 inclusive, rendered as strings.
-// Mirrored as a literal for the same reason as publishOutcomes — this package reads
-// no configuration, and neither does its test.
+// maxRelayRetryAttempts is the relay's attempt budget CEILING
+// (config.MaxRelayRetryAttempts, which RELAY_MAX_RETRY_ATTEMPTS is clamped to),
+// bounding the numeric values the "attempt" attribute can take: 1 through 5
+// inclusive, rendered as strings. Mirrored as a literal for the same reason as
+// publishOutcomes — this package reads no configuration, and neither does its test.
 const maxRelayRetryAttempts = 5
+
+// publishAttemptLabels is the COMPLETE, closed domain of the "attempt" attribute:
+// the five numeric attempts, one overflow bucket, and one fixed token for each of the
+// two publishes that are not part of a retry sequence.
+//
+// The domain has to be closed because this attribute is carried by a histogram, whose
+// series count is its label cardinality multiplied by its bucket count. "over" is what
+// a row whose per-row max_attempts was raised directly in the database collapses into,
+// and "replay" and "dead_letter" keep operator-triggered replays and dead-letter writes
+// out of the attempt="1" population the latency target is read from — rather than
+// extending the numeric domain past the budget, which is what an attempt-count label
+// on a replay would do.
+var publishAttemptLabels = []string{"1", "2", "3", "4", "5", "over", "replay", "dead_letter"}
 
 // namedInstrument pairs an instrument with the name of the variable holding it, so
 // that a table-driven failure names the exact declaration at fault instead of
@@ -375,13 +398,24 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 // spelling the relay emits and the alerting rules filter on. dead_lettered in
 // particular is easy to get wrong: the hyphenated "dead-lettered" reads more
 // naturally in prose and matches nothing at query time.
+//
+// The vocabulary is FOUR values, not three. "retrying" and "failed" are separate
+// outcomes because a failure that will be retried and a failure that will not are
+// different operational states: labelling a permanent failure, or the one that spent
+// the last of the retry budget, as "retrying" reports retry pressure that no longer
+// exists and hides the events that are actually stuck. Any change to this list is a
+// change to a published attribute domain and has to be made deliberately here, on the
+// instrument's declaration, and in anything querying it.
 func TestEventPublishAttemptsTotal_AcceptsEveryPublishOutcome(t *testing.T) {
 	ctx := context.Background()
 
-	require.Len(t, publishOutcomes, 3,
-		"the outcome vocabulary is dispatched, retrying and dead_lettered; a fourth publish status needs a deliberate decision here and in the alerting rules")
+	require.Len(t, publishOutcomes, 4,
+		"the outcome vocabulary is dispatched, retrying, failed and dead_lettered; "+
+			"a fifth publish outcome needs a deliberate decision here and in the alerting rules")
 	require.Contains(t, publishOutcomes, "dead_lettered",
 		"the dead-letter outcome is spelled with an underscore, not a hyphen")
+	require.Contains(t, publishOutcomes, "failed",
+		"a terminal failure must be distinguishable from one that will be retried")
 
 	for _, outcome := range publishOutcomes {
 		t.Run(outcome, func(t *testing.T) {
@@ -445,4 +479,418 @@ func TestOutboxPendingBacklog_AcceptsZeroWhenOutboxIsDrained(t *testing.T) {
 	require.NotPanics(t, func() {
 		OutboxPendingBacklog.Record(ctx, 0)
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Exported-contract assertions, made against a real SDK reader
+//
+// Everything above this line runs against the no-op instruments a process gets
+// when no MeterProvider is installed, and that is all those tests can do: a
+// delegating no-op discards its measurements and exposes no descriptor, so
+// "does not panic" is the strongest statement available. It is not enough for
+// the properties an alert or a latency query actually depends on — the metric
+// NAME the exporter publishes, the UNIT it publishes it in, the explicit
+// BUCKET BOUNDARIES that decide whether a p99 near two seconds is measurable
+// at all, and the ATTRIBUTE KEYS the alert annotations interpolate. A rename,
+// a unit slip, or a silent fall back to OTel's millisecond-scale default
+// buckets would leave every test above passing.
+//
+// The tests below therefore install a real SDK MeterProvider backed by a
+// manual reader, re-run Init() so the instruments are constructed through it,
+// record one representative measurement per instrument, collect, and assert on
+// the collected metricdata. That is the same path the Prometheus exporter
+// takes, so what is asserted here is what is exported.
+//
+// Global-state note: otel.SetMeterProvider delegates the package's meter
+// permanently — the delegation is a sync.Once — so it is done exactly once, in
+// installSDKReader, and the tests that share it are strictly serial (no
+// t.Parallel anywhere in this file). Delegation is harmless to the tests above:
+// their measurements simply land in a reader nobody collects.
+// ---------------------------------------------------------------------------
+
+// sharedReader and installOnce back installSDKReader.
+//
+// They are package-level and guarded by a sync.Once because the installation CANNOT be
+// repeated: otel delegates the global meter to the first provider set and does so under
+// its own sync.Once, so a second provider installed by a second test would never receive
+// this package's measurements — the meter stays bound to the first. Installing per test
+// therefore does not isolate the tests, it silently blinds all but the first of them.
+// One installation, shared, with the tests kept serial, is the only arrangement that
+// works.
+//
+// The provider is deliberately never shut down. A shut-down provider drops
+// measurements while the meter remains delegated to it, which would leave every
+// subsequent test collecting an empty snapshot.
+var (
+	sharedReader *sdkmetric.ManualReader
+	installOnce  sync.Once
+)
+
+// installSDKReader returns the shared SDK-backed manual reader, installing the provider
+// and rebuilding every instrument through it on first use.
+//
+// Init() is called AFTER the provider is installed, which is what makes the instruments
+// real SDK instruments rather than delegating no-ops: an instrument created before
+// delegation replays its creation, but creating it afterwards is direct and leaves no room
+// for the replay to lose an option — and the option that matters most here, the explicit
+// bucket boundaries, is exactly the kind of thing a replay could drop.
+//
+// The reader accumulates cumulatively across the tests that share it, so a test asserting
+// on SERIES COUNTS must scope itself with an attribute value of its own rather than
+// counting everything present.
+//
+// Returns:
+//   - *sdkmetric.ManualReader: the reader to collect from.
+func installSDKReader(t *testing.T) *sdkmetric.ManualReader {
+	t.Helper()
+
+	installOnce.Do(func() {
+		sharedReader = sdkmetric.NewManualReader()
+		otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(sharedReader)))
+	})
+
+	require.NoError(t, Init(), "Init must rebuild every instrument through the installed provider")
+	require.NotNil(t, sharedReader, "the shared manual reader was not installed")
+
+	return sharedReader
+}
+
+// recordEveryEventInstrument drives one representative measurement through each of the
+// seven event-streaming instruments, using the attribute keys their declarations
+// document.
+//
+// It exists so the descriptor assertions below have something to collect: the SDK
+// reports a metric only once it has a data point, so an instrument that is never
+// recorded is indistinguishable from one that was never declared.
+func recordEveryEventInstrument(ctx context.Context) {
+	EventsPublishedTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("topic", "blnk.transactions"),
+		attribute.String("event_type", "transaction.applied"),
+	))
+	EventPublishAttemptsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("outcome", "dispatched"),
+	))
+	EventPublishDuration.Record(ctx, 0.42, metric.WithAttributes(
+		attribute.String("topic", "blnk.transactions"),
+		attribute.String("attempt", "1"),
+		attribute.String("outcome", "dispatched"),
+	))
+	EventsDeadLetteredTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("topic", "blnk.transactions"),
+		attribute.String("event_type", "transaction.applied"),
+	))
+	DLTOldestMessageAgeSeconds.Record(ctx, 901, metric.WithAttributes(
+		attribute.String("topic", "blnk.transactions.dlt"),
+	))
+	SubscriberConsumerLag.Record(ctx, 10001, metric.WithAttributes(
+		attribute.String("subscriber", "sub_0f6e2c8a"),
+		attribute.String("group", "blnk-grp-0f6e2c8a1b944106b4d6793e838afcbf"),
+		attribute.String("topic", "blnk.transactions"),
+	))
+	OutboxPendingBacklog.Record(ctx, 7)
+}
+
+// collectScopeMetrics collects one snapshot and returns the metrics of the "blnk"
+// meter, indexed by metric name.
+func collectScopeMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[string]metricdata.Metrics {
+	t.Helper()
+
+	var snapshot metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &snapshot), "collecting the manual reader")
+
+	collected := make(map[string]metricdata.Metrics)
+	for _, scope := range snapshot.ScopeMetrics {
+		if scope.Scope.Name != "blnk" {
+			continue
+		}
+		for _, m := range scope.Metrics {
+			collected[m.Name] = m
+		}
+	}
+
+	require.NotEmpty(t, collected, "the blnk meter produced no metrics; is the scope name still \"blnk\"?")
+
+	return collected
+}
+
+// TestEventStreamingInstruments_ExportedDescriptors asserts the name, description and
+// unit of every event-streaming instrument as the exporter sees them.
+//
+// The names are the load-bearing part. Alert rules and dashboards reference the
+// PROMETHEUS forms of these names — dots become underscores and the unit suffix is
+// appended — so alerts/blnk-kafka-alerts.yml matching on
+// blnk_dlt_oldest_message_age_seconds and blnk_kafka_consumer_lag depends on the OTel
+// names below being exactly what they are. A rename here does not fail a build and does
+// not fail promtool; it silently makes the rule evaluate against nothing, which cannot
+// fire and cannot be distinguished from "no problem". The units matter for the same
+// reason: the Prometheus exporter derives a series suffix from them, so a unit change is
+// a rename.
+func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
+	reader := installSDKReader(t)
+	recordEveryEventInstrument(context.Background())
+	collected := collectScopeMetrics(t, reader)
+
+	expected := []struct {
+		name        string
+		unit        string
+		description string
+	}{
+		{
+			name:        "blnk.events.published.total",
+			unit:        "{event}",
+			description: "Total number of ledger events acknowledged by Kafka by topic and event type",
+		},
+		{
+			name:        "blnk.events.publish.attempts.total",
+			unit:        "{attempt}",
+			description: "Total number of event publish attempts by outcome, retries included",
+		},
+		{
+			name:        "blnk.events.publish.duration",
+			unit:        "s",
+			description: "Duration of a single event publish attempt, from outbox claim to broker acknowledgement",
+		},
+		{
+			name:        "blnk.events.dead_lettered.total",
+			unit:        "{event}",
+			description: "Total number of events dead-lettered after retry exhaustion by topic and event type",
+		},
+		{
+			name:        "blnk.dlt.oldest_message_age_seconds",
+			unit:        "s",
+			description: "Seconds since the oldest unresolved dead-letter message was dead-lettered",
+		},
+		{
+			name:        "blnk.kafka.consumer_lag",
+			unit:        "{message}",
+			description: "Number of messages a subscriber consumer group trails the log end offset by",
+		},
+		{
+			name:        "blnk.outbox.pending",
+			unit:        "{event}",
+			description: "Number of event outbox rows not yet published to Kafka",
+		},
+	}
+
+	require.Len(t, expected, len(eventStreamingInstruments()),
+		"every declared event-streaming instrument must have a descriptor expectation here")
+
+	for _, want := range expected {
+		t.Run(want.name, func(t *testing.T) {
+			got, ok := collected[want.name]
+			require.True(t, ok, "%s was not exported; declared but never assigned in Init, or renamed", want.name)
+			assert.Equal(t, want.unit, got.Unit, "%s carries the wrong unit, which renames its exported series", want.name)
+			assert.Equal(t, want.description, got.Description, "%s carries the wrong description", want.name)
+		})
+	}
+}
+
+// TestEventPublishDuration_UsesExplicitSubTwoSecondBuckets is the assertion the
+// latency acceptance criterion rests on.
+//
+// OTel's DEFAULT histogram boundaries are 0, 5, 10, 25, 50, 75, 100, 250, 500, 750,
+// 1000, 2500, 5000, 7500, 10000 — chosen for milliseconds. This instrument records
+// SECONDS, so under those defaults every realistic publish latency falls in the single
+// bucket [0, 5] and histogram_quantile can only interpolate inside a five-second span:
+// the sub-two-second p99 target would be unmeasurable, and a regression from 50 ms to
+// 4 s would not move the reported quantile at all. Nothing about that failure is
+// visible in a build, in promtool, or in a "does not panic" test.
+//
+// So this test asserts the boundaries actually in force on the collected data point,
+// and asserts specifically that 2 is one of them: with a bucket edge exactly at the
+// threshold, "is p99 under 2 seconds" is answered from bucket counts rather than
+// estimated across it.
+func TestEventPublishDuration_UsesExplicitSubTwoSecondBuckets(t *testing.T) {
+	reader := installSDKReader(t)
+
+	// A topic of this test's own. The shared reader is cumulative, so a data point
+	// keyed on a topic other tests also use would carry their measurements too and the
+	// bucket-placement assertion below would count them.
+	const scopedTopic = "blnk.bucket-boundaries.test"
+
+	EventPublishDuration.Record(context.Background(), 0.42, metric.WithAttributes(
+		attribute.String("topic", scopedTopic),
+		attribute.String("attempt", "1"),
+		attribute.String("outcome", "dispatched"),
+	))
+
+	collected := collectScopeMetrics(t, reader)
+
+	metricData, ok := collected["blnk.events.publish.duration"]
+	require.True(t, ok, "the publish-duration histogram was not exported")
+
+	histogram, ok := metricData.Data.(metricdata.Histogram[float64])
+	require.True(t, ok, "blnk.events.publish.duration must aggregate as a float64 histogram, got %T", metricData.Data)
+	require.NotEmpty(t, histogram.DataPoints, "the histogram reported no data points")
+
+	var point metricdata.HistogramDataPoint[float64]
+	var found bool
+	for _, candidate := range histogram.DataPoints {
+		if topic, ok := candidate.Attributes.Value("topic"); ok && topic.AsString() == scopedTopic {
+			point = candidate
+			found = true
+
+			break
+		}
+	}
+	require.True(t, found, "the scoped measurement produced no data point")
+
+	assert.Equal(t, EventPublishDurationBuckets, point.Bounds,
+		"the histogram is not using its declared explicit boundaries; "+
+			"OTel's millisecond-scale defaults make a sub-2s p99 unmeasurable on a second-valued instrument")
+	assert.Contains(t, point.Bounds, float64(2),
+		"2 must be a bucket EDGE so the two-second target is read from counts rather than interpolated across it")
+	assert.NotContains(t, point.Bounds, float64(10000),
+		"10000s is an OTel default millisecond boundary and has no meaning on a second-valued instrument")
+
+	// The recorded 0.42s must land below the 0.5 edge, which is the cheapest possible
+	// proof that the boundaries are in seconds rather than milliseconds.
+	require.Len(t, point.BucketCounts, len(point.Bounds)+1, "bucket counts must be boundaries+1")
+	edge := indexOfBound(point.Bounds, 0.5)
+	require.GreaterOrEqual(t, edge, 0, "0.5 must be a boundary")
+	assert.Equal(t, uint64(1), point.BucketCounts[edge],
+		"a 0.42s measurement must fall in the bucket ending at 0.5s")
+}
+
+// indexOfBound returns the index of bound in bounds, or -1.
+func indexOfBound(bounds []float64, bound float64) int {
+	for i, candidate := range bounds {
+		if candidate == bound {
+			return i
+		}
+	}
+
+	return -1
+}
+
+// TestEventStreamingInstruments_ExportedAttributeKeys asserts the attribute KEYS that
+// reach the exporter on each instrument.
+//
+// These keys are a published contract, not an implementation detail: the two alert
+// rules interpolate {{ $labels.topic }}, {{ $labels.subscriber }} and
+// {{ $labels.group }} into the notification an operator is paged with, and the latency
+// query selects on attempt and outcome. A renamed key leaves the alert firing with an
+// empty interpolation, or leaves the query selecting nothing.
+func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
+	reader := installSDKReader(t)
+	recordEveryEventInstrument(context.Background())
+	collected := collectScopeMetrics(t, reader)
+
+	cases := []struct {
+		metric string
+		keys   []string
+	}{
+		{metric: "blnk.events.published.total", keys: []string{"topic", "event_type"}},
+		{metric: "blnk.events.publish.attempts.total", keys: []string{"outcome"}},
+		{metric: "blnk.events.publish.duration", keys: []string{"topic", "attempt", "outcome"}},
+		{metric: "blnk.events.dead_lettered.total", keys: []string{"topic", "event_type"}},
+		{metric: "blnk.dlt.oldest_message_age_seconds", keys: []string{"topic"}},
+		{metric: "blnk.kafka.consumer_lag", keys: []string{"subscriber", "group", "topic"}},
+		// Deliberately unattributed: one process has one outbox backlog, so a label
+		// would add cardinality without adding information.
+		{metric: "blnk.outbox.pending", keys: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.metric, func(t *testing.T) {
+			metricData, ok := collected[tc.metric]
+			require.True(t, ok, "%s was not exported", tc.metric)
+
+			keys := attributeKeysOf(t, metricData)
+			assert.ElementsMatch(t, tc.keys, keys,
+				"%s carries the wrong attribute keys; the alert rules and latency queries name these", tc.metric)
+		})
+	}
+}
+
+// attributeKeysOf returns the attribute keys of a collected metric's first data point.
+//
+// The four aggregation shapes are handled explicitly rather than through reflection so
+// that an instrument whose KIND changed — a counter declared as a gauge, say — fails
+// here with a message naming the aggregation it actually produced.
+func attributeKeysOf(t *testing.T, m metricdata.Metrics) []string {
+	t.Helper()
+
+	var set attribute.Set
+	switch data := m.Data.(type) {
+	case metricdata.Sum[int64]:
+		require.NotEmpty(t, data.DataPoints, "%s reported no data points", m.Name)
+		set = data.DataPoints[0].Attributes
+	case metricdata.Gauge[int64]:
+		require.NotEmpty(t, data.DataPoints, "%s reported no data points", m.Name)
+		set = data.DataPoints[0].Attributes
+	case metricdata.Gauge[float64]:
+		require.NotEmpty(t, data.DataPoints, "%s reported no data points", m.Name)
+		set = data.DataPoints[0].Attributes
+	case metricdata.Histogram[float64]:
+		require.NotEmpty(t, data.DataPoints, "%s reported no data points", m.Name)
+		set = data.DataPoints[0].Attributes
+	default:
+		t.Fatalf("%s aggregated as an unexpected shape %T", m.Name, m.Data)
+	}
+
+	keys := make([]string, 0, set.Len())
+	for _, kv := range set.ToSlice() {
+		keys = append(keys, string(kv.Key))
+	}
+
+	return keys
+}
+
+// TestEventPublishTelemetry_LabelDomainsStayClosed records every legal value of the two
+// bounded attributes and asserts the resulting series count is exactly the size of the
+// declared domains.
+//
+// This is a CARDINALITY BUDGET expressed as a test. The attempt attribute sits on a
+// histogram, so each of its values costs a full set of buckets; letting an unbounded
+// value in — an attempt number straight from a row whose max_attempts was raised in the
+// database, or an attempt count invented for a replay — is how a single instrument comes
+// to dominate the exporter. Recording the whole domain and counting the result is what
+// makes an accidental widening visible: a new value shows up as this count being wrong,
+// which is a test edit rather than a silent production cost.
+func TestEventPublishTelemetry_LabelDomainsStayClosed(t *testing.T) {
+	reader := installSDKReader(t)
+	ctx := context.Background()
+
+	// A topic value used by no other test, so the series counted below are exactly the
+	// ones recorded here. The shared reader is cumulative, so counting every series
+	// present would count whatever the other tests recorded too.
+	const scopedTopic = "blnk.cardinality-budget.test"
+
+	for _, attempt := range publishAttemptLabels {
+		for _, outcome := range publishOutcomes {
+			EventPublishDuration.Record(ctx, 0.1, metric.WithAttributes(
+				attribute.String("topic", scopedTopic),
+				attribute.String("attempt", attempt),
+				attribute.String("outcome", outcome),
+			))
+		}
+	}
+	for _, outcome := range publishOutcomes {
+		EventPublishAttemptsTotal.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("outcome", outcome),
+		))
+	}
+
+	collected := collectScopeMetrics(t, reader)
+
+	histogram, ok := collected["blnk.events.publish.duration"].Data.(metricdata.Histogram[float64])
+	require.True(t, ok, "the publish-duration histogram was not exported as a float64 histogram")
+
+	scoped := 0
+	for _, point := range histogram.DataPoints {
+		if topic, found := point.Attributes.Value("topic"); found && topic.AsString() == scopedTopic {
+			scoped++
+		}
+	}
+	assert.Equal(t, len(publishAttemptLabels)*len(publishOutcomes), scoped,
+		"one series per (attempt, outcome) pair for a single topic: %d attempt values x %d outcomes. "+
+			"A larger number means a value outside the declared domains reached the histogram",
+		len(publishAttemptLabels), len(publishOutcomes))
+
+	attempts, ok := collected["blnk.events.publish.attempts.total"].Data.(metricdata.Sum[int64])
+	require.True(t, ok, "the attempts counter was not exported as an int64 sum")
+	assert.Len(t, attempts.DataPoints, len(publishOutcomes),
+		"the attempts counter carries only the outcome attribute, so its series count is the outcome domain")
+	assert.True(t, attempts.IsMonotonic, "an attempts counter must be monotonic")
 }

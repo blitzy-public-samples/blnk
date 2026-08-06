@@ -20,12 +20,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +41,7 @@ import (
 	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/embedded"
 
+	apimodel "github.com/blnkfinance/blnk/api/model"
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/metrics"
 	"github.com/blnkfinance/blnk/model"
@@ -58,7 +61,7 @@ import (
 // isolation integration test. Keeping this file broker-free is what keeps
 // `go test -short ./...` and CI green with no Kafka service.
 //
-// The eight topic names, the six-partition floor, the 4096-iteration minimum and the
+// The ten topic names, the six-partition floor, the 4096-iteration minimum and the
 // three gauge attribute keys are all written out LONGHAND below rather than derived from
 // the code under test. A test that asks the implementation what it expects agrees with
 // any implementation, including a broken one.
@@ -70,17 +73,24 @@ import (
 // names the pipeline actually publishes to.
 
 // expectedEventTopics is the topic inventory, spelled out independently of
-// event_topics.go: the four category topics followed by their four dead-letter siblings,
+// event_topics.go: the five category topics followed by their five dead-letter siblings,
 // in the canonical order provisioning uses.
+//
+// blnk.quarantine is where an event type the catalogue does not recognise is routed. It is
+// INTERNAL — no subscriber can be granted it — but Blnk itself writes to it, so it must be
+// provisioned with the same geometry as every other topic. A quarantine topic that does not
+// exist would strand exactly the events that already indicate a routing defect.
 var expectedEventTopics = []string{
 	"blnk.transactions",
 	"blnk.balances",
 	"blnk.identities",
 	"blnk.system",
+	"blnk.quarantine",
 	"blnk.transactions.dlt",
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
 	"blnk.system.dlt",
+	"blnk.quarantine.dlt",
 }
 
 // fakeAdminClient is a stateful stand-in for kafka-go's Client.
@@ -99,6 +109,10 @@ type fakeAdminClient struct {
 
 	// partitions maps an existing topic to its partition IDs.
 	partitions map[string][]int
+	// replicas maps a topic to the size of each partition's replica set. An absent entry
+	// models a broker that reported no replica information, which the assurance pass treats
+	// as "not visible yet" rather than as under-replication.
+	replicas map[string]int
 	// first and end are the offset bounds per topic and partition.
 	first map[string]map[int]int64
 	end   map[string]map[int]int64
@@ -134,6 +148,10 @@ type fakeAdminClient struct {
 	scramUpsertNoResult bool
 	// aclErrors is returned positionally by CreateACLs.
 	aclErrors []error
+	// deleteACLErrors is returned positionally as the per-filter result of DeleteACLs.
+	deleteACLErrors []error
+	// scramDeleteError is returned as the per-user result of a credential deletion.
+	scramDeleteError error
 
 	// --- Recordings ---
 
@@ -142,6 +160,7 @@ type fakeAdminClient struct {
 	createTopicsRequests     []*kafka.CreateTopicsRequest
 	createPartitionsRequests []*kafka.CreatePartitionsRequest
 	createACLsRequests       []*kafka.CreateACLsRequest
+	deleteACLsRequests       []*kafka.DeleteACLsRequest
 	describeACLsRequests     []*kafka.DescribeACLsRequest
 	scramUpsertRequests      []*kafka.AlterUserScramCredentialsRequest
 	describeScramRequests    []*kafka.DescribeUserScramCredentialsRequest
@@ -154,6 +173,7 @@ type fakeAdminClient struct {
 func newFakeAdminClient() *fakeAdminClient {
 	return &fakeAdminClient{
 		partitions:          map[string][]int{},
+		replicas:            map[string]int{},
 		first:               map[string]map[int]int64{},
 		end:                 map[string]map[int]int64{},
 		committed:           map[string]map[int]int64{},
@@ -175,6 +195,18 @@ func (f *fakeAdminClient) withTopic(topic string, partitions int) *fakeAdminClie
 		ids = append(ids, id)
 	}
 	f.partitions[topic] = ids
+
+	return f
+}
+
+// withReplicas sets the replica-set size the topic's partitions report, creating the topic
+// with the given partition count if it does not exist.
+//
+// It models the ONE fact the assurance pass could previously not see: a topic's actual
+// durability, as opposed to the factor it was requested with.
+func (f *fakeAdminClient) withReplicas(topic string, partitions, replicas int) *fakeAdminClient {
+	f.withTopic(topic, partitions)
+	f.replicas[topic] = replicas
 
 	return f
 }
@@ -300,8 +332,13 @@ func (f *fakeAdminClient) Metadata(
 			continue
 		}
 
+		replicaCount := f.replicas[name]
 		for _, id := range ids {
-			topic.Partitions = append(topic.Partitions, kafka.Partition{Topic: name, ID: id})
+			partition := kafka.Partition{Topic: name, ID: id}
+			for broker := 0; broker < replicaCount; broker++ {
+				partition.Replicas = append(partition.Replicas, kafka.Broker{ID: broker})
+			}
+			topic.Partitions = append(topic.Partitions, partition)
 		}
 		response.Topics = append(response.Topics, topic)
 	}
@@ -402,6 +439,49 @@ func (f *fakeAdminClient) CreateACLs(
 	return &kafka.CreateACLsResponse{Errors: make([]error, len(req.ACLs))}, nil
 }
 
+// DeleteACLs models binding removal.
+//
+// It reports the MATCHING bindings back, as the broker does, so a test can assert that
+// revocation removed exactly the bindings provisioning created rather than merely that a
+// request was sent. Deleting a binding that was never created matches nothing and is not an
+// error, which is the idempotence the compensation path depends on.
+func (f *fakeAdminClient) DeleteACLs(
+	ctx context.Context,
+	req *kafka.DeleteACLsRequest,
+) (*kafka.DeleteACLsResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := f.record("DeleteACLs", ctx); err != nil {
+		return nil, err
+	}
+	f.deleteACLsRequests = append(f.deleteACLsRequests, req)
+
+	response := &kafka.DeleteACLsResponse{Results: make([]kafka.DeleteACLsResult, 0, len(req.Filters))}
+	for i, filter := range req.Filters {
+		result := kafka.DeleteACLsResult{}
+		if i < len(f.deleteACLErrors) {
+			result.Error = f.deleteACLErrors[i]
+		}
+
+		if result.Error == nil {
+			result.MatchingACLs = append(result.MatchingACLs, kafka.DeleteACLsMatchingACLs{
+				ResourceType:        filter.ResourceTypeFilter,
+				ResourceName:        filter.ResourceNameFilter,
+				ResourcePatternType: filter.ResourcePatternTypeFilter,
+				Principal:           filter.PrincipalFilter,
+				Host:                filter.HostFilter,
+				Operation:           filter.Operation,
+				PermissionType:      filter.PermissionType,
+			})
+		}
+
+		response.Results = append(response.Results, result)
+	}
+
+	return response, nil
+}
+
 func (f *fakeAdminClient) DescribeACLs(
 	ctx context.Context,
 	req *kafka.DescribeACLsRequest,
@@ -447,6 +527,25 @@ func (f *fakeAdminClient) AlterUserScramCredentials(
 		if f.scramUpsertError == nil {
 			f.scram[upsertion.Name] = []kafka.ScramMechanism{upsertion.Mechanism}
 		}
+	}
+
+	// Deletions are modelled on the same request, as the protocol does. A deletion for a
+	// principal that holds no credential answers RESOURCE_NOT_FOUND, exactly as the broker
+	// does, so the idempotence revocation relies on is exercised rather than assumed.
+	for _, deletion := range req.Deletions {
+		resultErr := f.scramDeleteError
+		if resultErr == nil {
+			if _, exists := f.scram[deletion.Name]; !exists {
+				resultErr = kafka.ResourceNotFound
+			} else {
+				delete(f.scram, deletion.Name)
+			}
+		}
+
+		response.Results = append(response.Results, kafka.AlterUserScramCredentialsResponseUser{
+			User:  deletion.Name,
+			Error: resultErr,
+		})
 	}
 
 	return response, nil
@@ -728,18 +827,29 @@ func TestEventTopicInventory_MatchesTheSingleSourceOfTruth(t *testing.T) {
 		"the inventory this file asserts against must be exactly the inventory event_topics.go composes, "+
 			"so the test and the implementation share one source of truth")
 
-	const categoryCount = 4
+	const categoryCount = 5
 
 	require.Len(t, expectedEventTopics, categoryCount*2,
-		"four category topics and one dead-letter sibling each")
+		"five category topics and one dead-letter sibling each")
 	assert.Equal(t, expectedEventTopics[:categoryCount], AllTopics(),
-		"the first four entries are the category topics, in canonical provisioning order")
+		"the first five entries are the category topics, in canonical provisioning order")
 	assert.Equal(t, expectedEventTopics[categoryCount:], AllDeadLetterTopics(),
-		"the last four entries are their dead-letter siblings, in the same order")
+		"the last five entries are their dead-letter siblings, in the same order")
 
 	categories := EventCategories()
 	require.Len(t, categories, categoryCount,
-		"four categories are what give every emitted event type a home; a fifth would need a topic here")
+		"five categories are what give every emitted event type a home — including the quarantine category an unrecognised type routes to; a sixth would need a topic here")
+
+	// The internal categories must be provisioned but not grantable. Both halves matter:
+	// Blnk writes to them, so they need topics, and their contents are not subscriber
+	// data, so no ACL may cover them.
+	for _, category := range []string{model.EventCategorySystem, model.EventCategoryQuarantine} {
+		topic := TopicForCategory(category)
+		assert.Contains(t, expectedEventTopics, topic,
+			"internal topic %q must still be provisioned: Blnk publishes to it", topic)
+		assert.False(t, IsSubscriberGrantableTopic(topic),
+			"internal topic %q must never be grantable to a subscriber", topic)
+	}
 
 	for index, category := range categories {
 		topic := TopicForCategory(category)
@@ -755,14 +865,14 @@ func TestEventTopicInventory_MatchesTheSingleSourceOfTruth(t *testing.T) {
 	}
 }
 
-// TestEnsureTopics_CreatesTheEightTopicsWithTheConfiguredGeometry pins the inventory and
-// the geometry of a first run against an empty broker.
+// TestEnsureTopics_CreatesTheWholeInventoryWithTheConfiguredGeometry pins the inventory
+// and the geometry of a first run against an empty broker.
 //
-// The eight names are asserted exactly and in order. Topic naming has no runtime failure
+// Every name is asserted exactly and in order. Topic naming has no runtime failure
 // mode — a wrong name is a valid topic nobody reads — so an assertion that merely counted
-// eight creations, or checked that the names were non-empty, would pass while the whole
+// creations, or checked that the names were non-empty, would pass while the whole
 // pipeline published into the void.
-func TestEnsureTopics_CreatesTheEightTopicsWithTheConfiguredGeometry(t *testing.T) {
+func TestEnsureTopics_CreatesTheWholeInventoryWithTheConfiguredGeometry(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
 	fake := newFakeAdminClient()
@@ -773,7 +883,7 @@ func TestEnsureTopics_CreatesTheEightTopicsWithTheConfiguredGeometry(t *testing.
 
 	configs := createdTopicConfigs(fake)
 	require.Len(t, configs, len(expectedEventTopics),
-		"exactly the eight owned topics must be created: the four categories and their four dead-letter siblings")
+		"exactly the owned topics must be created: every category and its dead-letter sibling")
 
 	for index, expected := range expectedEventTopics {
 		assert.Equal(t, expected, configs[index].Topic,
@@ -894,6 +1004,7 @@ func TestEnsureTopics_TakesItsGeometryFromConfiguration(t *testing.T) {
 				Kafka: config.KafkaConfig{
 					Brokers:           []string{"broker-1:9092"},
 					MinPartitions:     testCase.minPartitions,
+					InsecureLocalDev:  true, // the transport refuses plaintext without this
 					ReplicationFactor: testCase.replicationFactor,
 				},
 			})
@@ -1230,22 +1341,71 @@ func TestResolveTopicPartitions_AppliesTheRequiredFloorAndACeiling(t *testing.T)
 // sentinelPassword is a value that could not occur by accident, so any appearance of it in
 // a log line, an error or a serialised result is proof that the secret escaped.
 //
-// It is a fake credential, not a real one, and it is printable ASCII so it passes the
-// derivation's own input rule.
-const sentinelPassword = "Sentinel-Do-Not-Log-9f3c1a7e"
+// It is a fake credential, not a real one. It is printable ASCII so it passes the derivation's
+// own input rule, and it is long and varied enough to satisfy the PASS-01 strength floor —
+// which a fixture must do honestly rather than by being exempted, since the floor is exactly
+// what the provisioning boundary now enforces.
+const sentinelPassword = "Sentinel-Do-Not-Log-9f3c1a7e-Kq4Zv8Rm2Tb6"
+
+// testSubscriberID is the fixture's business key, and every identity in the fixture is
+// DERIVED from it.
+//
+// It is spelled out as a constant so the derivations below cannot drift from the identifier
+// they are supposed to come from, and so a reader can see that no name in the fixture was
+// chosen by hand — which is the property SEC-03 turns into a rule.
+const testSubscriberID = "sub_0f6e2c8a"
 
 // testSubscriber returns a registry row with a realistic access boundary.
+//
+// The principal and consumer group are derived rather than written out, because provisioning
+// refuses any other value: they ARE the access boundary, so accepting a caller's choice of
+// them is accepting a caller's choice of boundary. A fixture that hard-coded "acme-recon"
+// would be asserting a shape the production path no longer permits.
+//
+// PartitionKeyPrefix is set to prove it is carried and NOT enforced: it is an advisory
+// client-side filter hint, and no ACL derives from it.
 func testSubscriber() *model.EventSubscriber {
 	prefix := "acme-"
 
+	principal, err := model.CanonicalKafkaPrincipal(testSubscriberID)
+	if err != nil {
+		panic("test fixture: the subscriber identifier must derive a principal: " + err.Error())
+	}
+
+	group, err := model.CanonicalConsumerGroupID(testSubscriberID)
+	if err != nil {
+		panic("test fixture: the subscriber identifier must derive a consumer group: " + err.Error())
+	}
+
 	return &model.EventSubscriber{
-		SubscriberID:       "sub_0f6e2c8a",
+		SubscriberID:       testSubscriberID,
 		Name:               "Acme Reconciliation",
-		KafkaPrincipal:     "acme-recon",
-		ConsumerGroupID:    "acme-recon-group",
+		KafkaPrincipal:     principal,
+		ConsumerGroupID:    group,
 		AuthorizedTopics:   []string{"blnk.transactions", "blnk.balances"},
 		PartitionKeyPrefix: &prefix,
 	}
+}
+
+// testSubscriberPrincipal is the ACL principal string the fixture's bindings carry.
+func testSubscriberPrincipal(t *testing.T) string {
+	t.Helper()
+
+	principal, err := model.CanonicalKafkaPrincipal(testSubscriberID)
+	require.NoError(t, err)
+
+	return kafkaPrincipalPrefix + principal
+}
+
+// testSubscriberGroupNamespace is the PREFIXED ACL resource name the fixture's group binding
+// carries. It is the namespace, not the group: the binding reserves everything under it.
+func testSubscriberGroupNamespace(t *testing.T) string {
+	t.Helper()
+
+	namespace, err := model.CanonicalConsumerGroupNamespace(testSubscriberID)
+	require.NoError(t, err)
+
+	return namespace
 }
 
 // TestProvisionSubscriberPrincipal_UsesSha512WithAtLeastTheMinimumIterations pins the
@@ -1274,7 +1434,10 @@ func TestProvisionSubscriberPrincipal_UsesSha512WithAtLeastTheMinimumIterations(
 	require.Empty(t, requests[0].Deletions, "provisioning must never delete a credential")
 
 	upsertion := requests[0].Upsertions[0]
-	assert.Equal(t, "acme-recon", upsertion.Name, "the credential must belong to the subscriber's principal")
+	expectedPrincipal, err := model.CanonicalKafkaPrincipal(testSubscriberID)
+	require.NoError(t, err)
+	assert.Equal(t, expectedPrincipal, upsertion.Name,
+		"the credential must belong to the principal DERIVED from the subscriber id")
 	assert.Equal(t, kafka.ScramMechanismSha512, upsertion.Mechanism,
 		"Blnk standardises on SCRAM-SHA-512; SHA-256 cannot authenticate that mechanism")
 	assert.GreaterOrEqual(t, upsertion.Iterations, MinScramIterations,
@@ -1292,7 +1455,7 @@ func TestProvisionSubscriberPrincipal_UsesSha512WithAtLeastTheMinimumIterations(
 
 	assert.Equal(t, SubscriberSASLMechanism, result.Mechanism)
 	assert.Equal(t, DefaultScramIterations, result.Iterations)
-	assert.Equal(t, "acme-recon", result.Principal)
+	assert.Equal(t, strings.TrimPrefix(testSubscriberPrincipal(t), kafkaPrincipalPrefix), result.Principal)
 	assert.False(t, result.CredentialReplaced, "no credential existed beforehand")
 	assert.True(t, result.AuthorizerActive, "the modelled broker enforces ACLs")
 	assert.False(t, result.ProvisionedAt.IsZero(), "the result must record when provisioning completed")
@@ -1386,12 +1549,14 @@ func TestProvisionSubscriberPrincipal_BindsLeastPrivilegeACLs(t *testing.T) {
 	require.Len(t, entries, 5,
 		"two topics need Read and Describe each, plus one consumer-group binding")
 
+	principal := testSubscriberPrincipal(t)
+
 	expected := []kafka.ACLEntry{
 		{
 			ResourceType:        kafka.ResourceTypeTopic,
 			ResourceName:        "blnk.transactions",
 			ResourcePatternType: kafka.PatternTypeLiteral,
-			Principal:           "User:acme-recon",
+			Principal:           principal,
 			Host:                ACLHostAny,
 			Operation:           kafka.ACLOperationTypeRead,
 			PermissionType:      kafka.ACLPermissionTypeAllow,
@@ -1400,7 +1565,7 @@ func TestProvisionSubscriberPrincipal_BindsLeastPrivilegeACLs(t *testing.T) {
 			ResourceType:        kafka.ResourceTypeTopic,
 			ResourceName:        "blnk.transactions",
 			ResourcePatternType: kafka.PatternTypeLiteral,
-			Principal:           "User:acme-recon",
+			Principal:           principal,
 			Host:                ACLHostAny,
 			Operation:           kafka.ACLOperationTypeDescribe,
 			PermissionType:      kafka.ACLPermissionTypeAllow,
@@ -1409,7 +1574,7 @@ func TestProvisionSubscriberPrincipal_BindsLeastPrivilegeACLs(t *testing.T) {
 			ResourceType:        kafka.ResourceTypeTopic,
 			ResourceName:        "blnk.balances",
 			ResourcePatternType: kafka.PatternTypeLiteral,
-			Principal:           "User:acme-recon",
+			Principal:           principal,
 			Host:                ACLHostAny,
 			Operation:           kafka.ACLOperationTypeRead,
 			PermissionType:      kafka.ACLPermissionTypeAllow,
@@ -1418,16 +1583,16 @@ func TestProvisionSubscriberPrincipal_BindsLeastPrivilegeACLs(t *testing.T) {
 			ResourceType:        kafka.ResourceTypeTopic,
 			ResourceName:        "blnk.balances",
 			ResourcePatternType: kafka.PatternTypeLiteral,
-			Principal:           "User:acme-recon",
+			Principal:           principal,
 			Host:                ACLHostAny,
 			Operation:           kafka.ACLOperationTypeDescribe,
 			PermissionType:      kafka.ACLPermissionTypeAllow,
 		},
 		{
 			ResourceType:        kafka.ResourceTypeGroup,
-			ResourceName:        "acme-recon-group",
+			ResourceName:        testSubscriberGroupNamespace(t),
 			ResourcePatternType: kafka.PatternTypePrefixed,
-			Principal:           "User:acme-recon",
+			Principal:           principal,
 			Host:                ACLHostAny,
 			Operation:           kafka.ACLOperationTypeRead,
 			PermissionType:      kafka.ACLPermissionTypeAllow,
@@ -1450,7 +1615,11 @@ func TestProvisionSubscriberPrincipal_NeverGrantsWriteOrAWildcardPattern(t *test
 	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
 
 	subscriber := testSubscriber()
-	subscriber.AuthorizedTopics = expectedEventTopics // the widest legitimate grant
+	// The widest LEGITIMATE grant, which is the grantable allowlist rather than the whole
+	// inventory: the dead-letter and internal topics are no longer grantable at all, so asking
+	// for them is refused before any binding is built (see
+	// TestProvisionSubscriberPrincipal_RefusesATopicOutsideTheGrantableAllowlist).
+	subscriber.AuthorizedTopics = SubscriberGrantableTopics()
 
 	_, err := admin.ProvisionSubscriberPrincipal(
 		context.Background(),
@@ -1518,26 +1687,22 @@ func TestProvisionSubscriberPrincipal_NeverGrantsWriteOrAWildcardPattern(t *test
 // event_isolation_integration_test.go, and the broker's authorizer configuration is part of
 // that criterion rather than an environmental detail.
 func TestProvisionSubscriberPrincipal_NeverReachesAnotherSubscribersTopicsOrGroup(t *testing.T) {
-	// Two subscribers with deliberately disjoint boundaries. The group IDs are chosen to be
-	// prefix-adjacent neighbours of each other's namespace root ("acme-" appears in one and
-	// not the other) so that a grant widened by even a few characters would be caught.
+	// Two subscribers with deliberately disjoint boundaries. Both identities are DERIVED from
+	// their subscriber ids, because that is the only form provisioning accepts — and it is
+	// also what makes their group namespaces provably disjoint rather than disjoint by the
+	// author's choice of names.
 	acme := testSubscriber()
 	acme.AuthorizedTopics = []string{"blnk.transactions"}
 
-	globex := &model.EventSubscriber{
-		SubscriberID:     "sub_9d3b1f04",
-		Name:             "Globex Risk",
-		KafkaPrincipal:   "globex-risk",
-		ConsumerGroupID:  "globex-risk-group",
-		AuthorizedTopics: []string{"blnk.identities", "blnk.identities.dlt"},
-	}
+	globex := derivedSubscriber(t, "sub_9d3b1f04", "Globex Risk",
+		[]string{"blnk.identities", "blnk.balances"})
 
 	acmeTopics, acmeGroups := provisionAndCollectGrant(t, acme)
 	globexTopics, globexGroups := provisionAndCollectGrant(t, globex)
 
 	assert.Equal(t, map[string]struct{}{"blnk.transactions": {}}, acmeTopics,
 		"only the single authorised topic may be bound for this subscriber")
-	assert.Equal(t, map[string]struct{}{"blnk.identities": {}, "blnk.identities.dlt": {}}, globexTopics,
+	assert.Equal(t, map[string]struct{}{"blnk.identities": {}, "blnk.balances": {}}, globexTopics,
 		"the other subscriber's grant must be exactly its own two topics")
 
 	// Enumerated against the WHOLE inventory rather than against the other subscriber's list
@@ -1549,9 +1714,9 @@ func TestProvisionSubscriberPrincipal_NeverReachesAnotherSubscribersTopicsOrGrou
 			assert.NotContains(t, acmeTopics, topic,
 				"a subscriber authorised only for blnk.transactions must not be granted %q", topic)
 		}
-		if topic != "blnk.identities" && topic != "blnk.identities.dlt" {
+		if topic != "blnk.identities" && topic != "blnk.balances" {
 			assert.NotContains(t, globexTopics, topic,
-				"a subscriber authorised only for the identity topics must not be granted %q", topic)
+				"a subscriber authorised only for its two topics must not be granted %q", topic)
 		}
 	}
 
@@ -1560,9 +1725,16 @@ func TestProvisionSubscriberPrincipal_NeverReachesAnotherSubscribersTopicsOrGrou
 			"one subscriber's grant must never include another subscriber's topic %q", topic)
 	}
 
-	assert.Equal(t, map[string]struct{}{acme.ConsumerGroupID: {}}, acmeGroups,
+	// The reserved resource is the derived NAMESPACE, not the group the subscriber joins: the
+	// binding is prefixed, so it covers every leaf the subscriber creates under it.
+	acmeNamespace, err := model.CanonicalConsumerGroupNamespace(acme.SubscriberID)
+	require.NoError(t, err)
+	globexNamespace, err := model.CanonicalConsumerGroupNamespace(globex.SubscriberID)
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]struct{}{acmeNamespace: {}}, acmeGroups,
 		"exactly one consumer-group namespace may be reserved, and it must be the subscriber's own")
-	assert.Equal(t, map[string]struct{}{globex.ConsumerGroupID: {}}, globexGroups,
+	assert.Equal(t, map[string]struct{}{globexNamespace: {}}, globexGroups,
 		"the other subscriber's reservation must likewise be its own and nothing more")
 
 	// The group binding uses a PREFIXED pattern, which reserves "<group>*". That is the one
@@ -1578,6 +1750,28 @@ func TestProvisionSubscriberPrincipal_NeverReachesAnotherSubscribersTopicsOrGrou
 		assert.False(t, strings.HasPrefix(acme.ConsumerGroupID, reserved),
 			"reserved prefix %q must not cover another subscriber's group %q",
 			reserved, acme.ConsumerGroupID)
+	}
+}
+
+// derivedSubscriber builds a registry row whose Kafka identity is DERIVED from the identifier,
+// which is the only form provisioning accepts.
+//
+// It exists so a test needing a second subscriber cannot accidentally hand-pick a principal or
+// a group — the two values that ARE the access boundary.
+func derivedSubscriber(t *testing.T, subscriberID, name string, topics []string) *model.EventSubscriber {
+	t.Helper()
+
+	principal, err := model.CanonicalKafkaPrincipal(subscriberID)
+	require.NoError(t, err)
+	group, err := model.CanonicalConsumerGroupID(subscriberID)
+	require.NoError(t, err)
+
+	return &model.EventSubscriber{
+		SubscriberID:     subscriberID,
+		Name:             name,
+		KafkaPrincipal:   principal,
+		ConsumerGroupID:  group,
+		AuthorizedTopics: topics,
 	}
 }
 
@@ -1762,27 +1956,33 @@ func format(value interface{}) string {
 // password.
 func TestValidateSCRAMPassword_RejectsAnythingOutsidePrintableASCII(t *testing.T) {
 	valid := []string{
-		"Sentinel-Do-Not-Log-9f3c1a7e",
+		sentinelPassword,
 		"aB3!@#$%^&*()_+-=[]{}|;:',.<>/?`~\"\\",
-		"0123456789",
+		"0123456789abcdefghijklmnopqrstuvwxyz",
 	}
 	for _, password := range valid {
 		assert.NoError(t, validateSCRAMPassword(password),
-			"printable ASCII must be accepted: %q", password)
+			"printable ASCII of sufficient length and variety must be accepted: %q", password)
 	}
 
 	// The values are deliberately unlike any English word: a password that happened to be a
 	// substring of the rejection message would make the "must not echo the value" assertion
 	// below fail for a reason that has nothing to do with the code.
+	// Every value here is long enough to clear the length floor, so each case fails for the
+	// alphabet reason it is named for rather than incidentally for its length.
+	longEnough := func(seed string) string {
+		return seed + "Kq4Zv8Rm2Tb6Wn5Yp3Xj7Hd9Ls1Gf0Ac"
+	}
+
 	invalid := map[string]string{
 		"empty":          "",
-		"trailing space": "Xk9qZ2 ",
-		"leading space":  " Xk9qZ2",
-		"newline":        "Xk9qZ2\n",
-		"tab":            "Xk9q\tZ2",
-		"null byte":      "Xk9qZ2\x00",
-		"non-ascii":      "Xk9qZé2",
-		"delete":         "Xk9qZ2\x7f",
+		"trailing space": longEnough("Xk9qZ2") + " ",
+		"leading space":  " " + longEnough("Xk9qZ2"),
+		"newline":        longEnough("Xk9qZ2") + "\n",
+		"tab":            longEnough("Xk9q\tZ2"),
+		"null byte":      longEnough("Xk9qZ2\x00"),
+		"non-ascii":      longEnough("Xk9qZé2"),
+		"delete":         longEnough("Xk9qZ2\x7f"),
 	}
 	for name, password := range invalid {
 		t.Run(name, func(t *testing.T) {
@@ -1796,22 +1996,216 @@ func TestValidateSCRAMPassword_RejectsAnythingOutsidePrintableASCII(t *testing.T
 	}
 }
 
-// TestProvisionSubscriberPrincipal_RejectsAnEmptyPrincipal covers the subscriber row that
-// was never given a Kafka principal.
-func TestProvisionSubscriberPrincipal_RejectsAnEmptyPrincipal(t *testing.T) {
-	fake := newFakeAdminClient()
-	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+// TestValidateSCRAMPassword_EnforcesGeneratedStrength is the PASS-01 guard.
+//
+// A ONE-CHARACTER password used to pass this function and be minted into a real, working
+// SCRAM credential holding Read on live ledger topics. A Kafka SASL handshake has no rate
+// limit and no lockout, so that credential was not weak, it was open.
+//
+// Both rules are exercised, and the second is the one that is easy to omit: a length floor on
+// its own accepts thirty-two identical characters, which is long and almost entropy-free.
+func TestValidateSCRAMPassword_EnforcesGeneratedStrength(t *testing.T) {
+	t.Run("a single character is refused", func(t *testing.T) {
+		err := validateSCRAMPassword("x")
+		require.Error(t, err, "a one-character secret must never be minted into a credential")
+		assert.Contains(t, err.Error(), "minimum")
+	})
 
-	subscriber := testSubscriber()
-	subscriber.KafkaPrincipal = "   "
+	// Built from the constant rather than written out, so the two boundary cases stay exactly
+	// one character apart if the floor is ever changed.
+	varied := "Kq4Zv8Rm2Tb6Wn5Yp3Xj7Hd9Ls1Gf0AcJw"
+	require.Greater(t, len(varied), MinSCRAMPasswordLength)
 
-	_, err := admin.ProvisionSubscriberPrincipal(
-		context.Background(),
-		NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
-	)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "kafka_principal", "the error must name the field that is missing")
-	assert.Zero(t, fake.totalCalls(), "nothing may be sent without a principal to bind it to")
+	t.Run("one character short of the floor is refused", func(t *testing.T) {
+		// The boundary, exactly: a mutation that turned >= into > would pass every other
+		// case in this file and fail here.
+		short := varied[:MinSCRAMPasswordLength-1]
+
+		require.Error(t, validateSCRAMPassword(short))
+	})
+
+	t.Run("exactly the floor is accepted", func(t *testing.T) {
+		atFloor := varied[:MinSCRAMPasswordLength]
+
+		require.NoError(t, validateSCRAMPassword(atFloor),
+			"the floor must be inclusive, or a correctly generated secret at the boundary is refused")
+	})
+
+	t.Run("long but repetitive is refused", func(t *testing.T) {
+		padded := strings.Repeat("a", MinSCRAMPasswordLength*2)
+
+		err := validateSCRAMPassword(padded)
+		require.Error(t, err, "length without variety is not entropy")
+		assert.Contains(t, err.Error(), "distinct")
+	})
+
+	t.Run("a padded short secret is refused", func(t *testing.T) {
+		// The realistic form of the defect: a real-looking prefix padded out to length.
+		err := validateSCRAMPassword("abc" + strings.Repeat("-", MinSCRAMPasswordLength))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "distinct")
+	})
+
+	t.Run("the rejection never echoes the secret", func(t *testing.T) {
+		for _, password := range []string{"x", strings.Repeat("a", MinSCRAMPasswordLength*2)} {
+			err := validateSCRAMPassword(password)
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), password,
+				"a strength rejection must not quote the value it rejected")
+		}
+	})
+}
+
+// TestProvisionSubscriberPrincipal_RefusesAnyPrincipalItDidNotDerive is the SEC-03 guard on
+// the identity half of the boundary.
+//
+// The principal is not a name, it is the identity the credential is minted for and every ACL
+// binding is granted to, so accepting one from a caller is accepting a caller's choice of
+// access boundary. Values here were previously only TRIMMED, so every one of these passed.
+//
+// The wildcard case is the sharpest: Kafka treats the resource name "*" as matching ANY
+// resource, and a principal chosen to collide with another subscriber's takes over that
+// subscriber's grant. Both are ordinary, authorized requests — nothing about them looks like
+// an attack — which is why the refusal has to be structural.
+//
+// Nothing may be SENT in any of these cases: a refusal that had already written a credential
+// would be the AUTH-01 defect arriving through the SEC-03 door.
+func TestProvisionSubscriberPrincipal_RefusesAnyPrincipalItDidNotDerive(t *testing.T) {
+	derived, err := model.CanonicalKafkaPrincipal(testSubscriberID)
+	require.NoError(t, err)
+
+	cases := map[string]string{
+		"blank":                       "   ",
+		"empty":                       "",
+		"a hand-chosen name":          "acme-recon",
+		"the wildcard":                "*",
+		"a wildcard suffix":           derived + "*",
+		"another subscriber's":        "blnk-sub-sub_ffffffff",
+		"the namespace alone":         model.SubscriberPrincipalNamespace,
+		"correct but with padding":    " " + derived + " ",
+		"correct but upper-cased":     strings.ToUpper(derived),
+		"correct with a null byte":    derived + "\x00",
+		"correct with a group suffix": derived + ".default",
+	}
+
+	for name, principal := range cases {
+		t.Run(name, func(t *testing.T) {
+			fake := newFakeAdminClient()
+			admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+			subscriber := testSubscriber()
+			subscriber.KafkaPrincipal = principal
+
+			_, err := admin.ProvisionSubscriberPrincipal(
+				context.Background(),
+				NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+			)
+			require.Error(t, err, "%s must be refused", name)
+			assert.Contains(t, err.Error(), derived,
+				"the refusal must name the only principal this subscriber may hold")
+			assert.Zero(t, fake.totalCalls(),
+				"nothing may reach the broker when the requested boundary is refused")
+		})
+	}
+}
+
+// TestProvisionSubscriberPrincipal_RefusesAConsumerGroupOutsideTheSubscribersNamespace is the
+// SEC-03 guard on the group half of the boundary.
+//
+// The group binding is PREFIXED, which is what lets a subscriber run several groups without an
+// administrative round trip — and what makes a chosen prefix dangerous. A subscriber asking for
+// the group "blnk-sub-" would be granted Read on every group whose name starts with it,
+// including every other subscriber's: a cross-domain grant obtained through an ordinary
+// request.
+func TestProvisionSubscriberPrincipal_RefusesAConsumerGroupOutsideTheSubscribersNamespace(t *testing.T) {
+	namespace, err := model.CanonicalConsumerGroupNamespace(testSubscriberID)
+	require.NoError(t, err)
+
+	cases := map[string]string{
+		"a hand-chosen group":            "acme-recon-group",
+		"the wildcard":                   "*",
+		"the shared namespace prefix":    model.SubscriberPrincipalNamespace,
+		"another subscriber's namespace": "blnk-sub-sub_ffffffff.live",
+		"the bare namespace":             namespace,
+		"a sibling by truncation":        strings.TrimSuffix(namespace, model.SubscriberGroupTerminator),
+	}
+
+	for name, group := range cases {
+		t.Run(name, func(t *testing.T) {
+			fake := newFakeAdminClient()
+			admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+			subscriber := testSubscriber()
+			subscriber.ConsumerGroupID = group
+
+			_, err := admin.ProvisionSubscriberPrincipal(
+				context.Background(),
+				NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+			)
+			require.Error(t, err, "%s must be refused", name)
+			assert.Contains(t, err.Error(), namespace,
+				"the refusal must name the namespace the group has to be inside")
+			assert.Zero(t, fake.totalCalls())
+		})
+	}
+
+	t.Run("any leaf inside the namespace is accepted", func(t *testing.T) {
+		// The widening the prefixed grant exists for: a replay group beside a live one, with
+		// no administrative round trip and still inside the boundary.
+		for _, leaf := range []string{"default", "replay", "live-2", "a"} {
+			fake := newFakeAdminClient()
+			admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+			subscriber := testSubscriber()
+			subscriber.ConsumerGroupID = namespace + leaf
+
+			_, err := admin.ProvisionSubscriberPrincipal(
+				context.Background(),
+				NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+			)
+			require.NoError(t, err, "the leaf %q is inside the subscriber's own namespace", leaf)
+		}
+	})
+}
+
+// TestProvisionSubscriberPrincipal_RefusesATopicOutsideTheGrantableAllowlist is the SEC-03
+// guard on the topic half of the boundary.
+//
+// The list becomes the resource name of a LITERAL binding, so whatever is in it is what the
+// credential can read. Three classes must be impossible: the wildcard, because "*" matches
+// every resource; a foreign topic, because that is somebody else's data on a shared broker;
+// and the dead-letter and internal topics, which carry Blnk's own failure metadata and
+// diagnostics and have no subscriber audience.
+func TestProvisionSubscriberPrincipal_RefusesATopicOutsideTheGrantableAllowlist(t *testing.T) {
+	cases := map[string]string{
+		"the wildcard":            "*",
+		"a foreign topic":         "attacker.transactions",
+		"a dead-letter topic":     "blnk.transactions.dlt",
+		"the system topic":        "blnk.system",
+		"the quarantine topic":    "blnk.quarantine",
+		"an internal Kafka topic": "__consumer_offsets",
+		"a prefix fragment":       "blnk.",
+		"the prefix alone":        "blnk",
+	}
+
+	for name, topic := range cases {
+		t.Run(name, func(t *testing.T) {
+			fake := newFakeAdminClient()
+			admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+			subscriber := testSubscriber()
+			subscriber.AuthorizedTopics = []string{"blnk.transactions", topic}
+
+			_, err := admin.ProvisionSubscriberPrincipal(
+				context.Background(),
+				NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+			)
+			require.Error(t, err, "%s must be refused", name)
+			assert.Contains(t, err.Error(), topic, "the refusal must name the topic it refused")
+			assert.Zero(t, fake.totalCalls(),
+				"one ungrantable topic must refuse the whole request rather than being dropped silently")
+		})
+	}
 }
 
 // TestProvisionSubscriberPrincipal_ReportsAReplacedCredential proves re-issuing is a
@@ -1822,7 +2216,8 @@ func TestProvisionSubscriberPrincipal_RejectsAnEmptyPrincipal(t *testing.T) {
 // stopped working.
 func TestProvisionSubscriberPrincipal_ReportsAReplacedCredential(t *testing.T) {
 	fake := newFakeAdminClient()
-	fake.scram["acme-recon"] = []kafka.ScramMechanism{kafka.ScramMechanismSha512}
+	fake.scram[strings.TrimPrefix(testSubscriberPrincipal(t), kafkaPrincipalPrefix)] =
+		[]kafka.ScramMechanism{kafka.ScramMechanismSha512}
 
 	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
 
@@ -1853,14 +2248,22 @@ func TestProvisionSubscriberPrincipal_ReportsAReplacedCredential(t *testing.T) {
 	assert.Equal(t, 1, firstIssuance.callCount("DescribeUserScramCredentials"))
 }
 
-// TestProvisionSubscriberPrincipal_WarnsWhenTheBrokerEnforcesNothing is the guard against a
-// vacuous isolation guarantee.
+// TestProvisionSubscriberPrincipal_RefusesWhenTheBrokerEnforcesNothing is the SEC-02 guard.
 //
-// A KRaft broker without an authorizer accepts every binding and applies none. Provisioning
-// still succeeds — refusing would make Blnk unusable against such a broker — but the
-// finding must be reported and shouted about, because the alternative is a security
-// property that reports itself satisfied while absent.
-func TestProvisionSubscriberPrincipal_WarnsWhenTheBrokerEnforcesNothing(t *testing.T) {
+// This test used to require the opposite: that provisioning SUCCEED against a broker with no
+// authorizer, on the reasoning that refusing would make Blnk unusable there. What that
+// actually produced was a working credential with cluster-wide read access to every ledger
+// topic, every dead-letter topic and every other subscriber's data — returned to the caller
+// as a success, with the only trace a log line in a successful provisioning nobody reads.
+//
+// A KRaft broker without authorizer.class.name accepts every ACL binding and applies none. So
+// there is no such thing as issuing a bounded credential on it, and "usable" is the wrong
+// property to optimise: the broker must be fixed.
+//
+// The refusal is asserted to happen BEFORE anything is written, which is the whole ordering
+// half of the finding — a refusal after the upsert would leave exactly the credential it was
+// trying to prevent.
+func TestProvisionSubscriberPrincipal_RefusesWhenTheBrokerEnforcesNothing(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
 
@@ -1873,8 +2276,18 @@ func TestProvisionSubscriberPrincipal_WarnsWhenTheBrokerEnforcesNothing(t *testi
 		context.Background(),
 		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
 	)
-	require.NoError(t, err, "an unenforced broker must not block provisioning")
+	require.Error(t, err, "a broker that enforces no ACLs must not have a credential issued against it")
+	assert.ErrorIs(t, err, ErrAuthorizerNotEnforcing,
+		"the refusal must be recognisable without matching message text")
+	assert.Contains(t, err.Error(), "StandardAuthorizer",
+		"the error must name the broker setting that fixes it")
+
 	assert.False(t, result.AuthorizerActive, "the finding must be reported to the caller")
+	assert.False(t, result.CredentialWritten, "no credential may exist")
+	assert.Zero(t, fake.callCount("AlterUserScramCredentials"),
+		"the probe must run BEFORE the credential is written, not after")
+	assert.Zero(t, fake.callCount("CreateACLs"), "and before any binding is attempted")
+	assert.Empty(t, fake.scram, "the broker must hold no credential for this principal")
 
 	var shouted bool
 	for _, entry := range hook.AllEntries() {
@@ -1887,6 +2300,66 @@ func TestProvisionSubscriberPrincipal_WarnsWhenTheBrokerEnforcesNothing(t *testi
 	}
 	assert.True(t, shouted,
 		"a broker that enforces no ACLs must produce a prominent log entry naming the authorizer to configure")
+}
+
+// TestProvisionSubscriberPrincipal_RefusesWhenEnforcementCannotBeConfirmed is the second half
+// of SEC-02, and it is the case that is tempting to let through.
+//
+// The probe needs the administrative principal to be allowed to describe ACLs. When it is not
+// — or when the broker cannot be reached — the honest answer is "I do not know whether
+// anything is being enforced", and that was previously treated as a reason to log and carry
+// on. From the point of view of the credential about to be minted, unverifiable enforcement
+// and absent enforcement are indistinguishable, so both must refuse.
+func TestProvisionSubscriberPrincipal_RefusesWhenEnforcementCannotBeConfirmed(t *testing.T) {
+	fake := newFakeAdminClient()
+	fake.transportErrors["DescribeACLs"] = errors.New("broker unreachable")
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	result, err := admin.ProvisionSubscriberPrincipal(
+		context.Background(),
+		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
+	)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrAuthorizerNotEnforcing)
+	assert.Contains(t, err.Error(), "Describe",
+		"the error must say what the administrative principal needs, since that is the usual cause")
+
+	assert.False(t, result.CredentialWritten)
+	assert.Zero(t, fake.callCount("AlterUserScramCredentials"),
+		"an unanswerable probe must stop provisioning before the credential is written")
+	assert.Empty(t, fake.scram)
+}
+
+// TestProvisionSubscriberPrincipal_RevokesTheCredentialWhenBindingFails is the AUTH-01
+// compensation guard.
+//
+// Provisioning writes the credential first, because a binding for a principal that does not
+// exist is inert while a credential without bindings AUTHENTICATES. So a binding failure used
+// to leave a live, valid credential that had been generated and returned by a call which then
+// reported failure — a secret in a subscriber's hands that no registry row records.
+//
+// The compensation revokes it. Both halves are asserted, because either alone leaves the
+// system in a state somebody has to clean up by hand.
+func TestProvisionSubscriberPrincipal_RevokesTheCredentialWhenBindingFails(t *testing.T) {
+	fake := newFakeAdminClient()
+	fake.aclErrors = []error{errors.New("binding rejected")}
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	result, err := admin.ProvisionSubscriberPrincipal(
+		context.Background(),
+		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
+	)
+	require.Error(t, err, "a failed binding must fail the provisioning")
+
+	assert.True(t, result.Compensated, "the caller must be told the broker was left clean")
+	assert.False(t, result.CredentialWritten,
+		"CredentialWritten must describe the state the broker is actually left in, not the step that ran")
+	assert.Empty(t, fake.scram,
+		"the credential written before the binding failed must not survive the failure")
+	assert.NotZero(t, fake.callCount("DeleteACLs"),
+		"the bindings that may have landed must be removed too, since CreateACLs is not atomic")
 }
 
 // TestProvisionSubscriberPrincipal_WarnsWhenTheGrantIsEmpty covers the fail-closed registry
@@ -1939,7 +2412,12 @@ func TestNewSubscriberProvisioningRequest_MapsTheRegistryRowAndNotThePartitionKe
 	assert.Equal(t, subscriber.KafkaPrincipal, request.Principal)
 	assert.Equal(t, subscriber.ConsumerGroupID, request.ConsumerGroupPrefix)
 	assert.Equal(t, subscriber.AuthorizedTopics, request.Topics)
-	assert.Equal(t, sentinelPassword, request.Password, "the password must be carried through unchanged")
+	// The plaintext is unreachable from outside the package by design, so the assertion is
+	// on what IS observable: a secret of exactly the expected length is held. Reading the
+	// value back would be the leak the type exists to prevent.
+	assert.Equal(t, len(sentinelPassword), request.Password.Len(),
+		"the password must be carried through unchanged")
+	assert.False(t, request.Password.IsZero(), "a secret must be present")
 
 	for _, entry := range request.aclEntries() {
 		if entry.ResourceType != kafka.ResourceTypeTopic {
@@ -1951,22 +2429,29 @@ func TestNewSubscriberProvisioningRequest_MapsTheRegistryRowAndNotThePartitionKe
 			"the partition-key prefix must never be expressed as a prefixed topic pattern")
 	}
 
-	assert.Equal(t, SubscriberProvisioningRequest{Password: sentinelPassword},
+	assert.Equal(t, SubscriberProvisioningRequest{Password: NewSubscriberSecret(sentinelPassword)},
 		NewSubscriberProvisioningRequest(nil, sentinelPassword),
 		"a nil registry row must produce a request that fails validation rather than a panic")
 }
 
 // TestSubscriberProvisioningRequest_NormalisesItsInputs covers the small normalisations the
-// bindings depend on.
+// bindings depend on, and the one value that is DERIVED rather than normalised.
+//
+// The consumer group namespace is the derived one: trimming a caller's group prefix would
+// still be honouring a caller's choice of boundary, and a prefixed grant over a chosen string
+// is exactly how one subscriber reaches another's groups. The principal is trimmed only so
+// that validate can report a whitespace mismatch as a mismatch of names.
 func TestSubscriberProvisioningRequest_NormalisesItsInputs(t *testing.T) {
 	request := SubscriberProvisioningRequest{
+		SubscriberID:        testSubscriberID,
 		Principal:           "  acme-recon  ",
 		ConsumerGroupPrefix: "  acme-group ",
 		Topics:              []string{" blnk.transactions ", "", "blnk.transactions", "blnk.balances"},
 	}
 
 	assert.Equal(t, "acme-recon", request.principal())
-	assert.Equal(t, "acme-group", request.consumerGroupPrefix())
+	assert.Equal(t, testSubscriberGroupNamespace(t), request.consumerGroupPrefix(),
+		"the group namespace is derived from the subscriber id, never taken from the request")
 	assert.Equal(t, []string{"blnk.transactions", "blnk.balances"}, request.normalizedTopics(),
 		"blanks and duplicates must be dropped while the registry's order is preserved")
 	assert.Equal(t, ACLHostAny, request.host(), "an unset host must widen to every host, not to none")
@@ -2180,9 +2665,18 @@ func TestConsumerLag_SumsPartitionsAndTopicsAndFeedsTheSharedGauge(t *testing.T)
 
 	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
 
+	// The group id is the DERIVED one, because that is the only kind the collector will
+	// ever hand to this method: a registry row whose identifiers are not generated is
+	// skipped before it is measured. Its leaf ("default") is deliberately absent from the
+	// gauge assertion below — see the group-label expectation.
+	group, err := model.CanonicalConsumerGroupID("sub_0f6e2c8a")
+	require.NoError(t, err)
+	require.Equal(t, "blnk-sub-sub_0f6e2c8a.default", group,
+		"the derived group shape is what the gauge label is resolved against")
+
 	report, err := admin.ConsumerLag(context.Background(), ConsumerLagRequest{
 		SubscriberID: "sub_0f6e2c8a",
-		GroupID:      "acme-recon-group",
+		GroupID:      group,
 		Topics:       []string{"blnk.transactions", "blnk.balances"},
 	})
 	require.NoError(t, err)
@@ -2219,7 +2713,11 @@ func TestConsumerLag_SumsPartitionsAndTopicsAndFeedsTheSharedGauge(t *testing.T)
 	for _, record := range records {
 		assert.Equal(t, "sub_0f6e2c8a", record.attributes["subscriber"],
 			"the alert rule interpolates $labels.subscriber")
-		assert.Equal(t, "acme-recon-group", record.attributes["group"],
+		// The SUBSCRIBER-SCOPED ROOT, not the full group id. A subscriber that runs
+		// several consumer groups is one subscriber to an operator triaging the alert,
+		// and collapsing the leaf is what keeps its lag on one series instead of one
+		// series per group it happens to be running.
+		assert.Equal(t, "blnk-sub-sub_0f6e2c8a", record.attributes["group"],
 			"the alert rule interpolates $labels.group")
 		assert.NotEmpty(t, record.attributes["topic"], "the alert rule interpolates $labels.topic")
 		assert.GreaterOrEqual(t, record.value, int64(0), "no negative value may ever reach the gauge")
@@ -2516,7 +3014,7 @@ func TestConsumerLag_CarriesAlertScaleMagnitudesWithoutOverflowOrTruncation(t *t
 // TestTopicEndOffsets_DefaultsToTheWholeInventory pins the reconciliation's default scope.
 //
 // The daily check compares outbox counts against the summed offsets of every topic Blnk
-// owns, so an unnamed call must cover exactly the eight-topic inventory — no more, and
+// owns, so an unnamed call must cover exactly the whole topic inventory — no more, and
 // crucially no fewer, since a missing dead-letter topic would make the broker side look
 // short and read as message loss.
 func TestTopicEndOffsets_DefaultsToTheWholeInventory(t *testing.T) {
@@ -2743,10 +3241,14 @@ func TestNewKafkaAdmin_EmptyBrokersYieldsAnUnconfiguredClientThatFailsFast(t *te
 func TestNewKafkaAdmin_BuildsAScramAuthenticatedTransport(t *testing.T) {
 	admin, err := NewKafkaAdmin(&config.Configuration{
 		Kafka: config.KafkaConfig{
-			Brokers:           []string{" broker-1:9092 ", "", "broker-2:9092"},
-			SASLAdminUser:     "admin",
-			SASLAdminSecret:   "REDACTED_TEST_SECRET",
-			MinPartitions:     2,
+			Brokers:         []string{" broker-1:9092 ", "", "broker-2:9092"},
+			SASLAdminUser:   "admin",
+			SASLAdminSecret: "REDACTED_TEST_SECRET",
+			MinPartitions:   2,
+			// The local single-broker stack listens on SASL_PLAINTEXT, and the transport
+			// refuses to dial unencrypted without this acknowledgement — see
+			// TestNewKafkaAdmin_RefusesToDialAnUnencryptedBrokerByDefault.
+			InsecureLocalDev:  true,
 			ReplicationFactor: 1,
 		},
 	})
@@ -2785,12 +3287,59 @@ func TestNewKafkaAdmin_RejectsAnAdminUserWithoutASecret(t *testing.T) {
 		Kafka: config.KafkaConfig{
 			Brokers:           []string{"broker-1:9092"},
 			SASLAdminUser:     "admin",
+			InsecureLocalDev:  true,
 			ReplicationFactor: 1,
 		},
 	})
 	require.Error(t, err)
 	assert.Nil(t, admin)
-	assert.Contains(t, err.Error(), "KAFKA_SASL_ADMIN_SECRET", "the error must name the missing variable")
+	assert.Contains(t, err.Error(), "admin", "the error must name which principal is half-configured")
+	assert.Contains(t, err.Error(), "secret", "and which half is missing")
+}
+
+// TestNewKafkaAdmin_RefusesToDialAnUnencryptedBrokerByDefault is the CRYPTO-01 guard on the
+// ADMINISTRATIVE transport, which is the one that matters most.
+//
+// This client's requests carry SCRAM credentials FOR OTHER PRINCIPALS: a subscriber's salted
+// password crosses the wire inside an AlterUserScramCredentials request. So an unencrypted
+// administrative connection does not expose one deployment's data, it exposes every
+// subscriber's credential at the moment it is minted.
+//
+// The refusal shares its implementation with the publisher's transport, which is the point of
+// the finding: two hand-rolled transports could disagree about whether TLS was required, and
+// one of them being right was not enough.
+func TestNewKafkaAdmin_RefusesToDialAnUnencryptedBrokerByDefault(t *testing.T) {
+	admin, err := NewKafkaAdmin(&config.Configuration{
+		Kafka: config.KafkaConfig{
+			Brokers:           []string{"broker-1:9092"},
+			SASLAdminUser:     "admin",
+			SASLAdminSecret:   "REDACTED_TEST_SECRET",
+			ReplicationFactor: 1,
+		},
+	})
+	require.Error(t, err, "an unacknowledged plaintext administrative connection must be refused")
+	assert.Nil(t, admin)
+	assert.Contains(t, err.Error(), "KAFKA_TLS_ENABLED")
+	assert.Contains(t, err.Error(), "KAFKA_INSECURE_LOCAL_DEV")
+}
+
+// TestNewKafkaAdmin_ReportsEveryTransportProblemAtOnce covers the diagnostics, which is where
+// a security check most easily becomes an operational nuisance.
+//
+// A deployment that has neither enabled TLS nor finished configuring its credentials has two
+// problems. Reporting one sends the operator round the loop twice — fix the encryption,
+// restart, then learn about the credential — so both are reported together.
+func TestNewKafkaAdmin_ReportsEveryTransportProblemAtOnce(t *testing.T) {
+	_, err := NewKafkaAdmin(&config.Configuration{
+		Kafka: config.KafkaConfig{
+			Brokers:           []string{"broker-1:9092"},
+			SASLAdminUser:     "admin",
+			ReplicationFactor: 1,
+		},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "KAFKA_TLS_ENABLED", "the encryption problem must be reported")
+	assert.Contains(t, err.Error(), "secret", "and the credential problem in the same failure")
 }
 
 // TestNewKafkaAdmin_AllowsAPlaintextBrokerWithoutSASL keeps a broker with no SASL listener
@@ -2800,6 +3349,7 @@ func TestNewKafkaAdmin_AllowsAPlaintextBrokerWithoutSASL(t *testing.T) {
 		Kafka: config.KafkaConfig{
 			Brokers:           []string{"broker-1:9092"},
 			MinPartitions:     MinTopicPartitions,
+			InsecureLocalDev:  true,
 			ReplicationFactor: 1,
 		},
 	})
@@ -2916,7 +3466,11 @@ func TestProvisionSubscriberPrincipal_PropagatesTheFiveSecondBudgetToEveryRoundT
 // process that may have more than one shutdown path.
 func TestKafkaAdminClient_CloseIsIdempotent(t *testing.T) {
 	admin, err := NewKafkaAdmin(&config.Configuration{
-		Kafka: config.KafkaConfig{Brokers: []string{"broker-1:9092"}, ReplicationFactor: 1},
+		Kafka: config.KafkaConfig{
+			Brokers:           []string{"broker-1:9092"},
+			InsecureLocalDev:  true,
+			ReplicationFactor: 1,
+		},
 	})
 	require.NoError(t, err)
 
@@ -3112,6 +3666,7 @@ func TestAdminResultTypes_HaveNowhereToPutTheSecret(t *testing.T) {
 		TopicOffsetReport{},
 		TopicOffsetSnapshot{},
 		PartitionOffsetSnapshot{},
+		OutboxReconciliation{},
 	}
 
 	for _, value := range returned {
@@ -3208,9 +3763,17 @@ func TestEventAdminSource_StaysWithinItsMandate(t *testing.T) {
 	}
 
 	assert.Contains(t, imports, "github.com/segmentio/kafka-go")
-	assert.Contains(t, imports, "github.com/segmentio/kafka-go/sasl/scram")
 	assert.Contains(t, imports, "github.com/blnkfinance/blnk/internal/metrics",
 		"the consumer-lag figure must feed the shared gauge")
+
+	// sasl/scram is deliberately NOT imported here any more, and that absence is the CRYPTO-01
+	// fix rather than an omission. The transport — TLS policy, plaintext refusal, credential
+	// validation and the SCRAM mechanism — is built by NewKafkaTransport, which the publisher
+	// shares. Two hand-rolled transports is one implementation too many of a single security
+	// decision, and this is the client whose requests carry OTHER PRINCIPALS' credentials, so
+	// it must not be the one that gets it wrong on its own.
+	assert.NotContains(t, imports, "github.com/segmentio/kafka-go/sasl/scram",
+		"the administrative transport must be built by the shared NewKafkaTransport, not assembled here")
 
 	// The forbidden names are looked for in the SYNTAX TREE rather than in the file text,
 	// because the file discusses several of them in its comments — explaining why they are
@@ -3230,7 +3793,6 @@ func TestEventAdminSource_StaysWithinItsMandate(t *testing.T) {
 
 	forbiddenReferences := map[string]string{
 		"DeleteTopics":  "no normal operation may destroy an event topic; it would discard undelivered events for every subscriber",
-		"DeleteACLs":    "revoking a boundary is not part of provisioning",
 		"WriteMessages": "producing belongs to the publisher, and only the relay may write events",
 		"Writer":        "an admin client that could also produce would make it possible to bypass the outbox",
 		"Reader":        "consuming, consumer error handling and subscriber-side dead-lettering are out of scope",
@@ -3240,6 +3802,24 @@ func TestEventAdminSource_StaysWithinItsMandate(t *testing.T) {
 		_, present := referenced[name]
 		assert.False(t, present, "event_admin.go must not reference %s: %s", name, reason)
 	}
+
+	// DeleteACLs is REQUIRED here, and this assertion used to forbid it.
+	//
+	// The exclusion was made on the same "no destructive operations" reasoning as DeleteTopics,
+	// and that conflated two different kinds of destruction. Deleting a topic destroys committed
+	// events irreversibly. Deleting an ACL binding removes an authorization that the registry
+	// row can recreate — the registry, not the broker, is the record of what a subscriber may
+	// read.
+	//
+	// Excluding it meant Blnk could grant access and never withdraw it: reducing a subscriber's
+	// topics left the wider grant standing, and deleting a subscriber left its whole boundary
+	// live with no row left to describe it. The safe-looking omission produced the less safe
+	// system — a set of permissions that only ever grew.
+	assert.Contains(t, referenced, "DeleteACLs",
+		"revoking a boundary is part of the lifecycle; without it a grant can only ever widen")
+	assert.Contains(t, referenced, "Deletions",
+		"SCRAM credential deletion is what actually ends access, because it is what the SASL "+
+			"handshake checks")
 
 	assert.Contains(t, referenced, "SubscriberConsumerLag",
 		"the lag figure must be published on the instrument the alert rule reads")
@@ -3263,4 +3843,844 @@ func readEventAdminSource(t *testing.T) string {
 	require.NoError(t, err, "event_admin.go must be readable")
 
 	return string(contents)
+}
+
+// ---------------------------------------------------------------------------------------
+// Topic geometry — TOPIC-01
+// ---------------------------------------------------------------------------------------
+
+// TestEnsureTopics_RefusesToGrowATopicThatHoldsRecords is the TOPIC-01 guard on partition
+// growth.
+//
+// Growth was previously unconditional, and the cost is not recoverable. The partition a key
+// lands on is murmur2(key) mod partitionCount, so raising the count RE-MAPS keys: a ledger
+// that hashed into partition 2 of one lands elsewhere out of six, and its history is split
+// across two partitions with no ordering between them. Every key already written loses the
+// per-aggregate ordering guarantee, and the events cannot be moved back.
+//
+// So a topic that holds records is refused, and the refusal is loud: EnsureTopics returns
+// ErrPartitionGrowthRefused rather than reporting a quiet success, because the deployment now
+// has a topic that cannot satisfy the configured geometry and only a planned migration fixes
+// it.
+func TestEnsureTopics_RefusesToGrowATopicThatHoldsRecords(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	fake := newFakeAdminClient()
+	// One partition holding four records: exactly the legacy topic this check exists for.
+	fake.withTopic("blnk.transactions", 1).withOffsets("blnk.transactions", 0, 0, 4)
+	for _, topic := range AllTopicsWithDeadLetters() {
+		if topic != "blnk.transactions" {
+			fake.withTopic(topic, MinTopicPartitions)
+		}
+	}
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	report, err := admin.EnsureTopics(context.Background())
+	require.Error(t, err, "a refused growth must be reported as an error, not as a quiet success")
+	assert.ErrorIs(t, err, ErrPartitionGrowthRefused)
+	assert.Contains(t, err.Error(), "blnk.transactions", "the error must name the topic")
+	assert.Contains(t, err.Error(), "KAFKA_ALLOW_PARTITION_GROWTH",
+		"and the flag an operator sets once the migration is planned")
+
+	assert.Zero(t, fake.callCount("CreatePartitions"),
+		"no partition may be added to a topic that holds records")
+
+	assert.Equal(t, 1, report.GrowthRefusedCount)
+	entry, found := report.Lookup("blnk.transactions")
+	require.True(t, found)
+	assert.True(t, entry.GrowthRefused)
+	assert.Equal(t, 1, entry.PartitionsAfter,
+		"the report must describe the topic as it still is, not as configuration wants it")
+	assert.False(t, entry.PartitionsAdded)
+}
+
+// TestEnsureTopics_GrowsAnEmptyTopic keeps the safe case working.
+//
+// A topic with no records has no key-to-partition mapping to preserve, so growing it costs
+// nothing and is exactly what an under-provisioned but unused topic needs.
+func TestEnsureTopics_GrowsAnEmptyTopic(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	fake := newFakeAdminClient()
+	fake.withTopic("blnk.transactions", 1)
+	for _, topic := range AllTopicsWithDeadLetters() {
+		if topic != "blnk.transactions" {
+			fake.withTopic(topic, MinTopicPartitions)
+		}
+	}
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	report, err := admin.EnsureTopics(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, report.GrownCount)
+	assert.Zero(t, report.GrowthRefusedCount)
+
+	fake.mu.Lock()
+	requests := fake.createPartitionsRequests
+	fake.mu.Unlock()
+	require.Len(t, requests, 1)
+	require.Len(t, requests[0].Topics, 1)
+	assert.Equal(t, "blnk.transactions", requests[0].Topics[0].Name)
+	assert.Equal(t, int32(MinTopicPartitions), requests[0].Topics[0].Count,
+		"CreatePartitions takes the new TOTAL, not a delta")
+}
+
+// TestEnsureTopics_GrowsALiveTopicOnlyWhenExplicitlyPermitted covers the deliberate escape
+// hatch.
+//
+// It exists for the operator who HAS planned the migration and wants the pass to perform the
+// growth step. It must warn while doing it, naming the record count it is about to re-map,
+// because the consequence is not reversible and the flag may outlive the intent that set it.
+func TestEnsureTopics_GrowsALiveTopicOnlyWhenExplicitlyPermitted(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	fake := newFakeAdminClient()
+	fake.withTopic("blnk.transactions", 1).withOffsets("blnk.transactions", 0, 0, 9)
+	for _, topic := range AllTopicsWithDeadLetters() {
+		if topic != "blnk.transactions" {
+			fake.withTopic(topic, MinTopicPartitions)
+		}
+	}
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+	admin.allowPartitionGrowth = true
+
+	report, err := admin.EnsureTopics(context.Background())
+	require.NoError(t, err, "an explicitly permitted growth must proceed")
+	assert.Equal(t, 1, report.GrownCount)
+	assert.Zero(t, report.GrowthRefusedCount)
+
+	var warned bool
+	for _, entry := range hook.AllEntries() {
+		if entry.Level <= logrus.WarnLevel && strings.Contains(entry.Message, "re-map") {
+			warned = true
+
+			break
+		}
+	}
+	assert.True(t, warned,
+		"permitting the growth must still warn that existing events lose their ordering guarantee")
+}
+
+// TestEnsureTopics_TreatsUnreadableOffsetsAsOccupied covers the direction the uncertainty must
+// resolve in.
+//
+// If the broker will not report a partition's offsets, the pass does not know whether the
+// topic holds records. Assuming "empty" would authorise the one operation that cannot be
+// undone, so the unknown is treated as occupied and the growth is refused.
+func TestEnsureTopics_TreatsUnreadableOffsetsAsOccupied(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	fake := newFakeAdminClient()
+	fake.withTopic("blnk.transactions", 1)
+	fake.offsetErrors["blnk.transactions"] = map[int]error{0: kafka.LeaderNotAvailable}
+	for _, topic := range AllTopicsWithDeadLetters() {
+		if topic != "blnk.transactions" {
+			fake.withTopic(topic, MinTopicPartitions)
+		}
+	}
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	_, err := admin.EnsureTopics(context.Background())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPartitionGrowthRefused,
+		"an unanswerable offset read must not be read as an empty topic")
+	assert.Zero(t, fake.callCount("CreatePartitions"))
+}
+
+// TestEnsureTopics_ReportsAnUnderReplicatedExistingTopic is the TOPIC-01 guard on durability.
+//
+// The configured factor was applied to topics this pass CREATED and discarded from the
+// metadata of topics that already existed. So a topic sitting at one replica was reported as
+// assured under a configuration asking for three: the report said the durability requirement
+// was met, the cluster did not meet it, and losing one broker would have taken the events.
+//
+// The observed count is now recorded and compared, and the error says what an operator has to
+// do — a factor cannot be raised by re-running assurance, only by reassigning partitions.
+func TestEnsureTopics_ReportsAnUnderReplicatedExistingTopic(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	fake := newFakeAdminClient()
+	for _, topic := range AllTopicsWithDeadLetters() {
+		fake.withReplicas(topic, MinTopicPartitions, 3)
+	}
+	// One topic left at a single replica, which is the realistic shape: it was created by
+	// hand, or auto-created, before the configuration asked for three.
+	fake.withReplicas("blnk.transactions", MinTopicPartitions, 1)
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 3)
+
+	report, err := admin.EnsureTopics(context.Background())
+	require.Error(t, err, "an under-replicated topic must not be reported as assured")
+	assert.ErrorIs(t, err, ErrReplicationFactorInadequate)
+	assert.Contains(t, err.Error(), "blnk.transactions")
+	assert.Contains(t, err.Error(), "reassign",
+		"the error must say that re-running assurance cannot fix an existing topic's factor")
+
+	entry, found := report.Lookup("blnk.transactions")
+	require.True(t, found)
+	assert.True(t, entry.ReplicationInadequate)
+	assert.Equal(t, 1, entry.ReplicationFactor,
+		"the report must carry the OBSERVED replica count, not the configured one")
+
+	healthy, found := report.Lookup("blnk.balances")
+	require.True(t, found)
+	assert.False(t, healthy.ReplicationInadequate)
+	assert.Equal(t, 3, healthy.ReplicationFactor)
+}
+
+// TestEnsureTopics_ReportsEveryGeometryProblemTogether covers the diagnostics.
+//
+// An operator fixing topic geometry needs to see every problem at once: fixing the replication
+// and re-running only to discover the partition refusal is two maintenance windows where one
+// would do.
+func TestEnsureTopics_ReportsEveryGeometryProblemTogether(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	fake := newFakeAdminClient()
+	for _, topic := range AllTopicsWithDeadLetters() {
+		fake.withReplicas(topic, MinTopicPartitions, 3)
+	}
+	fake.withReplicas("blnk.balances", MinTopicPartitions, 1)
+	fake.withReplicas("blnk.transactions", 1, 3).withOffsets("blnk.transactions", 0, 0, 2)
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 3)
+
+	_, err := admin.EnsureTopics(context.Background())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrReplicationFactorInadequate, "the replication problem must be reported")
+	assert.ErrorIs(t, err, ErrPartitionGrowthRefused, "and the partition problem in the same failure")
+}
+
+// ---------------------------------------------------------------------------------------
+// Revocation and lifecycle — AUTH-01
+// ---------------------------------------------------------------------------------------
+
+// TestRevokeSubscriber_RemovesTheBoundaryBeforeTheIdentity is the AUTH-01 guard on
+// deprovisioning.
+//
+// The administrative contract used to expose creation and no removal at all, so reducing a
+// subscriber's topics or deleting the subscriber entirely left the credential and its bindings
+// live at the broker: the registry row was gone and the access was not, and nothing in Blnk
+// could see it any more.
+//
+// The ORDER is asserted, not just the effect. Bindings must go before the credential: reversed,
+// there is a window in which the principal cannot authenticate while its bindings still stand,
+// and recreating the credential — by a retry, or by an operator — silently restores the old
+// boundary.
+func TestRevokeSubscriber_RemovesTheBoundaryBeforeTheIdentity(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+	subscriber := testSubscriber()
+
+	_, err := admin.ProvisionSubscriberPrincipal(
+		context.Background(),
+		NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, fake.scram, "the fixture must start from a provisioned principal")
+
+	require.NoError(t, admin.RevokeSubscriber(context.Background(), subscriber))
+
+	assert.Empty(t, fake.scram, "revocation must delete the credential, which is what ends access")
+
+	fake.mu.Lock()
+	deleteRequests := fake.deleteACLsRequests
+	calls := append([]string(nil), fake.calls...)
+	fake.mu.Unlock()
+
+	require.Len(t, deleteRequests, 1)
+	assert.Len(t, deleteRequests[0].Filters, 5,
+		"exactly the five bindings provisioning created must be removed, no more")
+
+	// Every filter must be exact rather than a broad "everything for this principal" match: a
+	// filter wide enough to catch a subscriber's bindings is wide enough to catch an operator's,
+	// and ACL deletion has no undo.
+	for _, filter := range deleteRequests[0].Filters {
+		assert.Equal(t, testSubscriberPrincipal(t), filter.PrincipalFilter)
+		assert.NotEqual(t, kafka.ACLOperationTypeAny, filter.Operation,
+			"a filter must name the operation it removes")
+		assert.NotEqual(t, kafka.ACLPermissionTypeAny, filter.PermissionType)
+		assert.NotEqual(t, kafka.PatternTypeAny, filter.ResourcePatternTypeFilter)
+		assert.NotEmpty(t, filter.ResourceNameFilter)
+	}
+
+	deleteIndex, credentialIndex := -1, -1
+	for i, call := range calls {
+		if call == "DeleteACLs" && deleteIndex < 0 {
+			deleteIndex = i
+		}
+		if call == "AlterUserScramCredentials" {
+			credentialIndex = i // the last one, which is the deletion
+		}
+	}
+	require.NotEqual(t, -1, deleteIndex)
+	require.NotEqual(t, -1, credentialIndex)
+	assert.Less(t, deleteIndex, credentialIndex,
+		"the boundary must be removed before the identity, so a partial failure leaves fewer rights")
+}
+
+// TestRevokeSubscriberPrincipal_IsIdempotent covers the property both operators and the
+// compensation path depend on.
+//
+// Revocation is retried: by a person working through a failure, and by
+// compensateFailedProvisioning. A second attempt that failed because there was nothing left to
+// delete would make the retry look like a new problem.
+func TestRevokeSubscriberPrincipal_IsIdempotent(t *testing.T) {
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+	principal := strings.TrimPrefix(testSubscriberPrincipal(t), kafkaPrincipalPrefix)
+
+	fake.scram[principal] = []kafka.ScramMechanism{kafka.ScramMechanismSha512}
+
+	require.NoError(t, admin.RevokeSubscriberPrincipal(context.Background(), principal))
+	assert.Empty(t, fake.scram)
+
+	require.NoError(t, admin.RevokeSubscriberPrincipal(context.Background(), principal),
+		"deleting a credential that no longer exists is the desired end state, not an error")
+}
+
+// TestRevokeSubscriberPrincipal_ReportsARealFailure keeps idempotence from swallowing
+// everything.
+//
+// RESOURCE_NOT_FOUND is success; any other broker error is a credential that is still live and
+// must be reported, because the caller is about to delete the registry row that names it.
+func TestRevokeSubscriberPrincipal_ReportsARealFailure(t *testing.T) {
+	fake := newFakeAdminClient()
+	fake.scramDeleteError = errors.New("not authorized")
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	err := admin.RevokeSubscriberPrincipal(context.Background(), "blnk-sub-sub_0f6e2c8a")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not authorized")
+}
+
+// TestRevokeSubscriber_RefusesWithoutASubscriber covers the guard that keeps a nil row from
+// becoming a broad deletion.
+func TestRevokeSubscriber_RefusesWithoutASubscriber(t *testing.T) {
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	require.Error(t, admin.RevokeSubscriber(context.Background(), nil))
+	assert.Zero(t, fake.totalCalls(), "nothing may be deleted without a row saying what to delete")
+}
+
+// ---------------------------------------------------------------------------------------
+// Zero-loss reconciliation — OBS-01
+// ---------------------------------------------------------------------------------------
+
+// TestReconcileAgainstOutbox_TreatsMessagesAsALowerBoundOnEvents is the OBS-01 guard.
+//
+// Summed end offsets count RECORDS and the outbox counts EVENTS, and the reconciliation used to
+// be documented as an equality between them. It cannot hold: a redelivery after a crash writes
+// a second record for one event, a replay writes another on purpose, and a dead-lettered event
+// has a record on its `.dlt` topic. So messages >= events always, and an equality check reports
+// loss on a healthy system the first time anything is redelivered — the alert that gets muted,
+// taking the real signal with it.
+func TestReconcileAgainstOutbox_TreatsMessagesAsALowerBoundOnEvents(t *testing.T) {
+	t.Run("a surplus is expected, not loss", func(t *testing.T) {
+		report := TopicOffsetReport{EndOffsetSum: 1_100, RetainedCount: 1_100, MeasuredAt: time.Now().UTC()}
+
+		verdict := ReconcileAgainstOutbox(report, 1_000)
+		assert.False(t, verdict.LossDetected,
+			"100 more records than events is redelivery and replay overhead, which is normal")
+		assert.True(t, verdict.Conclusive)
+		assert.Equal(t, int64(100), verdict.Overhead)
+		assert.Contains(t, verdict.Summary(), "NO LOSS DETECTED")
+		assert.Contains(t, verdict.Summary(), "audit consumer",
+			"the verdict must not be mistaken for a proof that every event is present")
+	})
+
+	t.Run("a shortfall is loss", func(t *testing.T) {
+		report := TopicOffsetReport{EndOffsetSum: 990, RetainedCount: 990, MeasuredAt: time.Now().UTC()}
+
+		verdict := ReconcileAgainstOutbox(report, 1_000)
+		assert.True(t, verdict.LossDetected,
+			"fewer records than rows means rows claim a publication that never happened")
+		assert.Equal(t, int64(-10), verdict.Overhead,
+			"the shortfall must stay signed; clamping it would erase the only signal here")
+		assert.Contains(t, verdict.Summary(), "LOSS DETECTED")
+	})
+
+	t.Run("exact equality is not loss", func(t *testing.T) {
+		report := TopicOffsetReport{EndOffsetSum: 1_000, RetainedCount: 1_000, MeasuredAt: time.Now().UTC()}
+
+		verdict := ReconcileAgainstOutbox(report, 1_000)
+		assert.False(t, verdict.LossDetected, "the boundary is inclusive: equal is not short")
+		assert.Zero(t, verdict.Overhead)
+	})
+}
+
+// TestReconcileAgainstOutbox_RefusesToConcludeFromAnIncompleteMeasurement covers the caveats,
+// which are what stop a green verdict being reported from a number that was never complete.
+func TestReconcileAgainstOutbox_RefusesToConcludeFromAnIncompleteMeasurement(t *testing.T) {
+	cases := map[string]TopicOffsetReport{
+		"a missing topic": {
+			EndOffsetSum: 1_000, RetainedCount: 1_000,
+			MissingTopics: []string{"blnk.identities"},
+		},
+		"an unavailable partition": {
+			EndOffsetSum: 1_000, RetainedCount: 1_000,
+			PartitionsUnavailable: 2,
+		},
+		"retention has deleted records": {
+			EndOffsetSum: 1_000, RetainedCount: 400,
+		},
+	}
+
+	for name, report := range cases {
+		t.Run(name, func(t *testing.T) {
+			verdict := ReconcileAgainstOutbox(report, 1_000)
+			assert.False(t, verdict.Conclusive, "%s makes the count incomplete", name)
+			require.NotEmpty(t, verdict.Caveats, "the reason must be stated, not just flagged")
+			assert.Contains(t, verdict.Summary(), "INCONCLUSIVE")
+		})
+	}
+
+	t.Run("loss is still reported on an inconclusive measurement", func(t *testing.T) {
+		// A shortfall is unambiguous even when the count is incomplete: an incomplete count
+		// can only ever be LOWER than the truth, so it cannot manufacture a shortfall.
+		verdict := ReconcileAgainstOutbox(TopicOffsetReport{
+			EndOffsetSum: 900, RetainedCount: 900, PartitionsUnavailable: 1,
+		}, 1_000)
+
+		assert.True(t, verdict.LossDetected)
+		assert.False(t, verdict.Conclusive)
+		assert.Contains(t, verdict.Summary(), "LOSS DETECTED",
+			"loss takes precedence over inconclusiveness in the summary")
+	})
+}
+
+// TestAdminResultTypes_AreNotResponseShapes pins the service boundary this file's results
+// and reports sit behind.
+//
+// Two shapes for one endpoint is the failure this prevents. api/model owns the API
+// contract: KafkaCredentialsResponse is the single authoritative body for a credential
+// issuance and EventOutboxStatsResponse for the statistics endpoint, and both are what the
+// handler tests assert over real HTTP. If an admin result were serialised directly instead,
+// a client would receive different key names for the same facts — "principal" where the
+// contract says "username", "topics" where it says "authorized_topics",
+// "consumer_group_prefix" where it says "consumer_group_id" — and the two shapes would
+// drift apart with only one of them tested.
+//
+// The first assertion is structural: no admin result or report declares a json tag, so
+// nothing about these types suggests they are meant for an encoder. The second is the
+// mapping itself, written out as the handler must write it, followed by proof that the
+// facts a subscriber has no business knowing — the PBKDF2 iteration count, how many ACL
+// bindings were written, whether an existing credential was just invalidated, whether the
+// broker's authorizer is enforcing at all, and whether a failed provisioning had to be
+// compensated — reach no client. Those describe Blnk's own isolation model, and disclosing
+// them hands a map of it to anybody holding an API key.
+func TestAdminResultTypes_AreNotResponseShapes(t *testing.T) {
+	internalValues := []interface{}{
+		SubscriberProvisioningResult{},
+		SubscriberProvisioningRequest{},
+		TopicAssurance{},
+		TopicAssuranceReport{},
+		ConsumerLagReport{},
+		TopicLag{},
+		PartitionLag{},
+		TopicOffsetReport{},
+		TopicOffsetSnapshot{},
+		PartitionOffsetSnapshot{},
+		OutboxReconciliation{},
+	}
+
+	for _, value := range internalValues {
+		valueType := reflect.TypeOf(value)
+
+		for index := 0; index < valueType.NumField(); index++ {
+			field := valueType.Field(index)
+
+			assert.Empty(t, field.Tag.Get("json"),
+				"%s.%s carries a json tag; admin results and reports are internal values, and a "+
+					"tagged field invites being encoded straight into a response beside the "+
+					"api/model DTO that owns that contract",
+				valueType.Name(), field.Name)
+		}
+	}
+
+	// The mapping the credential endpoint must perform: every field of the response comes
+	// either from configuration, from the generated secret, or from the named fields of the
+	// provisioning result. Nothing else crosses.
+	result := SubscriberProvisioningResult{
+		SubscriberID:        "sub_reconciliation",
+		Principal:           "blnk-sub-sub_reconciliation",
+		Mechanism:           SubscriberSASLMechanism,
+		Iterations:          DefaultScramIterations,
+		Topics:              []string{"blnk.transactions", "blnk.balances"},
+		ConsumerGroupPrefix: "blnk-sub-sub_reconciliation.",
+		ACLBindings:         5,
+		CredentialReplaced:  true,
+		AuthorizerActive:    true,
+		CredentialWritten:   true,
+		ProvisionedAt:       time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC),
+	}
+
+	response := apimodel.KafkaCredentialsResponse{
+		Brokers:          []string{"kafka-0:9092", "kafka-1:9092"},
+		BrokerEndpoint:   "kafka-0:9092,kafka-1:9092",
+		AuthorizedTopics: result.Topics,
+		ConsumerGroupID:  result.ConsumerGroupPrefix,
+		Username:         result.Principal,
+		Password:         sentinelPassword,
+		Mechanism:        result.Mechanism,
+		IssuedAt:         result.ProvisionedAt,
+	}
+
+	encoded, err := json.Marshal(response)
+	require.NoError(t, err, "the credential response must serialise")
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(encoded, &body))
+
+	// The contract's own keys, so a mapping that silently dropped one fails here.
+	for _, key := range []string{
+		"brokers", "broker_endpoint", "authorized_topics", "consumer_group_id",
+		"username", "password", "mechanism", "issued_at",
+	} {
+		assert.Contains(t, body, key, "the credential contract requires %q", key)
+	}
+
+	assert.Equal(t, result.Principal, body["username"],
+		"the principal is reported under the contract's name for it, not the admin layer's")
+	assert.Equal(t, result.ConsumerGroupPrefix, body["consumer_group_id"])
+	assert.Equal(t, []interface{}{"blnk.transactions", "blnk.balances"}, body["authorized_topics"])
+
+	// The internal-only facts, named individually so that adding one to the DTO later fails
+	// this test rather than shipping.
+	for _, key := range []string{
+		"principal", "topics", "consumer_group_prefix", "subscriber_id",
+		"iterations", "acl_bindings", "credential_replaced", "authorizer_active",
+		"credential_written", "compensated", "provisioned_at",
+	} {
+		assert.NotContains(t, body, key,
+			"%q is an admin-layer field and must not appear in the credential response", key)
+	}
+
+	rendered := string(encoded)
+	assert.NotContains(t, rendered, strconv.Itoa(DefaultScramIterations),
+		"the PBKDF2 iteration count must not be disclosed to a subscriber")
+	assert.NotContains(t, rendered, "authorizer",
+		"whether the broker enforces ACLs is Blnk's security posture, not a subscriber's business")
+}
+
+// TestConsumerLag_ReusesOnePartitionAndOffsetSnapshotAcrossGroups is the request fan-out
+// reduction on the metrics path.
+//
+// A lag sweep asks three questions per subscriber, and only one of them — the group's
+// committed offsets — actually differs between subscribers. The partition layout and the end
+// offsets are properties of the topics, identical for every group reading them, so asking
+// them per subscriber made an N-subscriber sweep cost 3N round trips where 1 + 1 + N would do.
+//
+// The assertion is on the round-trip counts, because the reports are identical either way.
+func TestConsumerLag_ReusesOnePartitionAndOffsetSnapshotAcrossGroups(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	fake := newFakeAdminClient()
+	// The fake serves one set of committed offsets for any group, which is exactly right
+	// here: the test is about how many round trips each group costs, not about their
+	// individual positions.
+	fake.withOffsets("blnk.transactions", 0, 0, 100).withCommitted("blnk.transactions", 0, 40)
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+	current := time.Now()
+	admin.now = func() time.Time { return current }
+
+	const groups = 3
+	for _, group := range []string{"group-a", "group-b", "group-c"} {
+		report, err := admin.ConsumerLag(context.Background(), ConsumerLagRequest{
+			SubscriberID: group,
+			GroupID:      group,
+			Topics:       []string{"blnk.transactions"},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, int64(60), report.TotalLag,
+			"a cached snapshot must not change the answer; %s", group)
+	}
+
+	assert.Equal(t, 1, fake.callCount("Metadata"),
+		"the partition layout is a property of the topics, so ONE read serves every group in the sweep")
+	assert.Equal(t, 1, fake.callCount("ListOffsets"),
+		"the end offsets are a property of the topics too; asking per subscriber is the 3N fan-out this removes")
+	assert.Equal(t, groups, fake.callCount("OffsetFetch"),
+		"only the committed offsets differ per group, so this is the one read that must happen per subscriber")
+
+	// Past the TTL the shared reads happen again, so the gauge cannot serve a stale head
+	// indefinitely.
+	current = current.Add(defaultOffsetSnapshotTTL + time.Second)
+
+	_, err := admin.ConsumerLag(context.Background(), ConsumerLagRequest{
+		GroupID: "group-a",
+		Topics:  []string{"blnk.transactions"},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, fake.callCount("Metadata"),
+		"the snapshot must expire; a permanently cached end offset would understate lag forever")
+	assert.Equal(t, 2, fake.callCount("ListOffsets"))
+}
+
+// TestInvalidateOffsetSnapshot_ForcesTheNextReadToTheBroker covers the case where a cached
+// answer is known to be wrong rather than merely old.
+//
+// Creating or repartitioning topics changes the partition layout a snapshot describes, so a
+// caller that has just done either must be able to discard the snapshot instead of waiting
+// out the TTL with a layout it knows is stale. EnsureTopics does exactly that whenever it
+// created or grew anything.
+func TestInvalidateOffsetSnapshot_ForcesTheNextReadToTheBroker(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	fake := newFakeAdminClient()
+	fake.withOffsets("blnk.transactions", 0, 0, 10).withCommitted("blnk.transactions", 0, 4)
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	request := ConsumerLagRequest{GroupID: "acme-recon-group", Topics: []string{"blnk.transactions"}}
+
+	_, err := admin.ConsumerLag(context.Background(), request)
+	require.NoError(t, err)
+	_, err = admin.ConsumerLag(context.Background(), request)
+	require.NoError(t, err)
+	assert.Equal(t, 1, fake.callCount("Metadata"), "the second read comes from the snapshot")
+
+	admin.InvalidateOffsetSnapshot()
+
+	_, err = admin.ConsumerLag(context.Background(), request)
+	require.NoError(t, err)
+	assert.Equal(t, 2, fake.callCount("Metadata"),
+		"invalidation must force the next read to the broker, so a caller that just repartitioned is not served a stale layout")
+}
+
+// TestWithOffsetSnapshotTTL_CanDisableCachingEntirely keeps the caching optional for a caller
+// that must observe raw round trips.
+//
+// A negative TTL disables it. That is deliberately not reachable from configuration: the
+// default exists so PRODUCTION GETS THE BENEFIT WITHOUT OPTING IN, and an operator has no
+// reason to turn coalescing off — but a test asserting on exact round-trip counts does.
+func TestWithOffsetSnapshotTTL_CanDisableCachingEntirely(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	fake := newFakeAdminClient()
+	fake.withOffsets("blnk.transactions", 0, 0, 10).withCommitted("blnk.transactions", 0, 4)
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1).WithOffsetSnapshotTTL(-1)
+
+	request := ConsumerLagRequest{GroupID: "acme-recon-group", Topics: []string{"blnk.transactions"}}
+	for i := 0; i < 3; i++ {
+		_, err := admin.ConsumerLag(context.Background(), request)
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, 3, fake.callCount("Metadata"), "a negative TTL disables the snapshot cache")
+
+	// And zero restores the default rather than disabling it, so a caller cannot switch
+	// caching off by accident.
+	assert.Equal(t, defaultOffsetSnapshotTTL,
+		newTestKafkaAdmin(newFakeAdminClient(), MinTopicPartitions, 1).snapshotTTL(),
+		"a client that was never configured must still cache; the benefit must not require opting in")
+	assert.Equal(t, defaultOffsetSnapshotTTL,
+		newTestKafkaAdmin(newFakeAdminClient(), MinTopicPartitions, 1).WithOffsetSnapshotTTL(0).snapshotTTL(),
+		"zero restores the default")
+}
+
+// TestPartitionOffsetSnapshot_NeverCachesAFailedRead is the correctness half of the cache.
+//
+// A transient broker problem must be re-asked on the next call. Caching it would keep
+// answering a failure that had already cleared for the life of the TTL, and the lag gauge
+// would stay wrong instead of self-correcting on the next sweep.
+func TestPartitionOffsetSnapshot_NeverCachesAFailedRead(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	fake := newFakeAdminClient()
+	fake.transportErrors["Metadata"] = errors.New("broker unreachable")
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	request := ConsumerLagRequest{GroupID: "acme-recon-group", Topics: []string{"blnk.transactions"}}
+
+	_, first := admin.ConsumerLag(context.Background(), request)
+	require.Error(t, first)
+	_, second := admin.ConsumerLag(context.Background(), request)
+	require.Error(t, second)
+
+	assert.Equal(t, 2, fake.callCount("Metadata"),
+		"a failed read must not be remembered: the next sweep has to see the broker recover")
+
+	// And once it does recover, the very next call succeeds rather than serving the
+	// remembered failure.
+	delete(fake.transportErrors, "Metadata")
+	fake.withOffsets("blnk.transactions", 0, 0, 10).withCommitted("blnk.transactions", 0, 4)
+
+	report, err := admin.ConsumerLag(context.Background(), request)
+	require.NoError(t, err)
+	assert.Equal(t, int64(6), report.TotalLag)
+}
+
+// TestProvisionSubscriberPrincipal_MemoisesTheAuthorizerProbe covers the probe on the
+// provisioning path.
+//
+// Whether the broker enforces ACLs comes from its own startup configuration, so it cannot
+// change while it is up. Asking on every issuance re-learned a fixed fact using a serial
+// DescribeACLs round trip out of the five-second budget R-7 sets.
+//
+// The memo must not be permanent, though: a long-lived server can be pointed at a cluster
+// restarted with different settings, and continuing to report "enforcing" would be reporting
+// a security property that has stopped being true. So expiry is asserted too, through the
+// injected clock rather than by sleeping.
+func TestProvisionSubscriberPrincipal_MemoisesTheAuthorizerProbe(t *testing.T) {
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	current := time.Now()
+	admin.now = func() time.Time { return current }
+
+	for i := 0; i < 4; i++ {
+		_, err := admin.ProvisionSubscriberPrincipal(context.Background(),
+			NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword))
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, 1, fake.callCount("DescribeACLs"),
+		"the authorizer probe must be answered from the memo after the first ask; it re-learns a fact fixed at broker startup")
+
+	// Past the TTL the question is asked again, so a cluster restarted with a different
+	// authorizer setting is noticed rather than reported from a stale answer.
+	current = current.Add(defaultOffsetSnapshotTTL + time.Second)
+
+	_, err := admin.ProvisionSubscriberPrincipal(context.Background(),
+		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword))
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, fake.callCount("DescribeACLs"),
+		"the memo must expire; a permanent one would keep reporting an isolation guarantee that may have stopped holding")
+}
+
+// TestAuthorizerProbeMemo_IsNotConsultedAfterAFailure keeps the FAIL-CLOSED guarantee intact
+// across the memo.
+//
+// The probe is what stands between a subscriber credential and a broker that would accept
+// every ACL and enforce none. A memo that remembered a FAILED probe would answer "could not
+// confirm" for the life of the TTL — but far worse, a memo that remembered a failure as
+// "inactive" or a success it never got as "active" would hand out a credential against an
+// unverified boundary. Only a definite answer is ever remembered.
+func TestAuthorizerProbeMemo_IsNotConsultedAfterAFailure(t *testing.T) {
+	fake := newFakeAdminClient()
+	fake.transportErrors["DescribeACLs"] = errors.New("broker unreachable")
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	_, first := admin.ProvisionSubscriberPrincipal(context.Background(),
+		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword))
+	require.ErrorIs(t, first, ErrAuthorizerNotEnforcing,
+		"an unanswerable probe must still fail closed")
+	_, second := admin.ProvisionSubscriberPrincipal(context.Background(),
+		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword))
+	require.ErrorIs(t, second, ErrAuthorizerNotEnforcing)
+
+	assert.Equal(t, 2, fake.callCount("DescribeACLs"),
+		"a failed probe must be re-asked, not remembered: caching it would turn one bad answer into TTL-long silence about whether the isolation guarantee holds")
+	assert.Zero(t, fake.callCount("AlterUserScramCredentials"),
+		"no credential may be written while the boundary is unverified")
+}
+
+// TestSubscriberSecret_CannotBeLeakedByAnyRenderingPath is the CWE-532 boundary around the
+// only secret this package handles.
+//
+// # Why the type exists rather than a convention
+//
+// The password used to be a plain string field. Nothing in the file leaked it — that is
+// what TestAdminResultTypes_HaveNowhereToPutTheSecret asserts — but the protection was a
+// property of the code that happened to exist rather than of the value itself. A plain
+// string is carried into a log the moment anyone writes logrus.WithField("request", req),
+// into a test failure message whenever %+v is used on anything containing it, and into a
+// response body the moment the struct is embedded in one. Each of those is one ordinary
+// line away, none of them fails, and the leak is permanent because logs are retained.
+//
+// So every rendering path is asserted, not just the obvious one. fmt consults Formatter
+// FIRST and ignores Stringer entirely when it is present, which is why one Format method
+// covers verbs — %+v, %#v, %q, %x — that a Stringer alone would not reach.
+func TestSubscriberSecret_CannotBeLeakedByAnyRenderingPath(t *testing.T) {
+	secret := NewSubscriberSecret(sentinelPassword)
+
+	t.Run("every fmt verb renders the placeholder", func(t *testing.T) {
+		for _, verb := range []string{"%s", "%v", "%+v", "%#v", "%q", "%x", "%d"} {
+			rendered := fmt.Sprintf(verb, secret)
+			assert.NotContains(t, rendered, sentinelPassword,
+				"%s must not render the plaintext, got %q", verb, rendered)
+			assert.Contains(t, rendered, RedactedSecretPlaceholder,
+				"%s must render the placeholder so an absence and a redaction are distinguishable", verb)
+		}
+	})
+
+	t.Run("json and text marshalling render the placeholder", func(t *testing.T) {
+		encoded, err := json.Marshal(secret)
+		require.NoError(t, err,
+			"marshalling must SUCCEED rather than error: an error would make every struct carrying a secret unserialisable, and a caller would work around it by copying the field out")
+		assert.NotContains(t, string(encoded), sentinelPassword)
+		assert.JSONEq(t, `"`+RedactedSecretPlaceholder+`"`, string(encoded))
+
+		text, err := secret.MarshalText()
+		require.NoError(t, err)
+		assert.Equal(t, RedactedSecretPlaceholder, string(text))
+	})
+
+	t.Run("the enclosing request cannot leak it either", func(t *testing.T) {
+		// The realistic leak: the whole request rendered, not the field on its own.
+		request := NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword)
+
+		for _, verb := range []string{"%v", "%+v", "%#v"} {
+			rendered := fmt.Sprintf(verb, request)
+			assert.NotContains(t, rendered, sentinelPassword,
+				"%s of the whole request must not expose the password, got %q", verb, rendered)
+		}
+
+		encoded, err := json.Marshal(request)
+		require.NoError(t, err)
+		assert.NotContains(t, string(encoded), sentinelPassword,
+			"serialising the request must not expose the password")
+
+		// And through a logrus entry, which is the path the original defect took.
+		logger, hook := logtest.NewNullLogger()
+		logger.WithField("request", request).Info("provisioning")
+		require.Len(t, hook.Entries, 1)
+		assert.NotContains(t, fmt.Sprint(hook.Entries[0].Data["request"]), sentinelPassword,
+			"a logrus field carrying the request must not expose the password")
+	})
+
+	t.Run("what is observable is enough to work with", func(t *testing.T) {
+		// The length is safe to publish and is the one property worth reporting: it lets a
+		// test or an operator confirm a secret of the expected strength was generated
+		// without the value appearing anywhere.
+		assert.Equal(t, len(sentinelPassword), secret.Len())
+		assert.False(t, secret.IsZero())
+
+		var absent SubscriberSecret
+		assert.True(t, absent.IsZero(), "the zero value must read as 'no secret'")
+		assert.Zero(t, absent.Len())
+		assert.Contains(t, fmt.Sprint(absent), RedactedSecretPlaceholder,
+			"even an empty secret renders the placeholder, so a leak and an absence never look the same")
+	})
+
+	t.Run("the field is exported, which is what makes the redaction work", func(t *testing.T) {
+		// fmt can only call a field's methods when it can take its interface, so an
+		// UNEXPORTED field of a redacting type would be printed by %+v as its raw
+		// contents. Hiding the field would defeat the redaction rather than strengthen it,
+		// which is the opposite of what it looks like.
+		field, ok := reflect.TypeOf(SubscriberProvisioningRequest{}).FieldByName("Password")
+		require.True(t, ok, "the request must declare Password")
+		assert.True(t, field.IsExported(),
+			"Password must stay exported or fmt cannot call its redacting methods")
+		assert.Equal(t, reflect.TypeOf(SubscriberSecret{}), field.Type,
+			"Password must be the redacting type, not a plain string")
+	})
 }

@@ -31,6 +31,63 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// resolveEventOutboxes settles which event rows an atomic writer will insert, and
+// enforces the transaction-to-event cardinality.
+//
+// Nil entries are dropped rather than rejected, matching insertLineageOutboxesInTx,
+// so a producer that assembles its slice conditionally does not have to compact it.
+// A caller that supplies NO row at all is accepted: PrepareEventOutbox returns nil
+// when publishing is unconfigured, and that no-op-when-unconfigured contract is the
+// one this pipeline inherited from SendWebhook. But a caller that supplies SOME rows
+// must supply exactly one per committed transaction — a count mismatch means either a
+// duplicate publication or a silently dropped event, and neither is recoverable once
+// the mutation has committed.
+//
+// Parameters:
+//   - txnCount: the number of transactions being committed by this writer.
+//   - supplied: the caller's rows, possibly empty or containing nils.
+//
+// Returns:
+//   - []*model.EventOutbox: the rows to insert, never containing a nil.
+//   - error: a typed bad request when the supplied count does not match txnCount.
+func resolveEventOutboxes(txnCount int, supplied []*model.EventOutbox) ([]*model.EventOutbox, error) {
+	present := make([]*model.EventOutbox, 0, len(supplied))
+	for _, row := range supplied {
+		if row != nil {
+			present = append(present, row)
+		}
+	}
+
+	if len(present) == 0 {
+		return nil, nil
+	}
+
+	// The equality is required only when the writer is actually committing
+	// transactions. A call carrying event rows and NO transactions is the batch-level
+	// case — one event describing a whole operation rather than one event per ledger
+	// mutation — and refusing it here would make that event unrepresentable.
+	//
+	// What the check does catch is the two mismatches that are silent and
+	// unrecoverable once the mutation has committed: more rows than transactions is a
+	// duplicate publication, and fewer is a batch that publishes one event and loses
+	// the rest. Neither is detectable afterwards, because the transaction rows are all
+	// there and the missing events exist nowhere to be counted.
+	//
+	// NOT caught, and deliberately so: supplying NO events at all. That is the
+	// no-op-when-unconfigured contract this pipeline inherited from SendWebhook —
+	// PrepareEventOutbox returns nil when publishing is off — so it cannot be
+	// distinguished here from a producer that forgot to capture. Capture itself is
+	// asserted at the producer call sites, which are the only place that knows an
+	// event was due.
+	if txnCount > 0 && len(present) != txnCount {
+		return nil, apierror.NewAPIError(apierror.ErrBadRequest,
+			"Each committed transaction must carry exactly one event",
+			fmt.Errorf("blnk: %d event rows supplied for %d transactions", len(present), txnCount))
+	}
+
+	return present, nil
+}
+
 // utcOrNil normalizes an optional timestamp to UTC so the naive value stored
 // in timestamp-without-time-zone columns is timezone-independent.
 func utcOrNil(t *time.Time) *time.Time {
@@ -318,17 +375,25 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 	// is gone while every happy-path test still passes, which is exactly why it
 	// sits here and not there.
 	//
+	// THE CARDINALITY IS ENFORCED RATHER THAN TOLERATED. Capture itself happens at
+	// the producer call site, which is the only place that knows the event type and
+	// the payload; what this layer owns is the invariant that a committed mutation
+	// carries exactly one event. A caller supplying two rows for one transaction
+	// publishes a duplicate, and one row for a batch of fifty silently loses
+	// forty-nine — neither is detectable afterwards, because the mutation succeeds
+	// and the missing events exist nowhere to be counted. See resolveEventOutboxes.
+	//
 	// This single-transaction writer inserts row by row through the exported
 	// InsertEventOutboxInTx, deliberately mirroring the single-row lineage idiom
 	// immediately above rather than borrowing the batch helper the bulk writer
-	// uses: this path carries at most one event per ledger mutation, and a
-	// per-entry insert is what lets each event be traced individually. Nil entries
-	// are skipped rather than rejected, matching insertLineageOutboxesInTx, so a
-	// producer that assembles its slice conditionally does not have to compact it.
-	for _, e := range eventOutbox {
-		if e == nil {
-			continue
-		}
+	// uses: this path carries exactly one event per ledger mutation, and a
+	// per-entry insert is what lets each event be traced individually.
+	eventRows, err := resolveEventOutboxes(1, eventOutbox)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	for _, e := range eventRows {
 		if err := d.InsertEventOutboxInTx(ctx, tx, e); err != nil {
 			span.RecordError(err)
 			return nil, fmt.Errorf("failed to insert event outbox: %w", err)
@@ -337,6 +402,7 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 			attribute.String("event.id", e.EventID),
 			attribute.String("event.type", e.EventType),
 			attribute.String("event.topic", e.Topic),
+			attribute.String("event.ledger_id", e.LedgerID),
 		))
 	}
 
@@ -350,7 +416,7 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 		attribute.String("source.balance_id", sourceBalance.BalanceID),
 		attribute.String("destination.balance_id", destinationBalance.BalanceID),
 		attribute.Bool("outbox.included", outbox != nil),
-		attribute.Int("event_outbox.count", len(eventOutbox)),
+		attribute.Int("event_outbox.count", len(eventRows)),
 	))
 
 	return txn, nil
@@ -407,7 +473,18 @@ func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Cont
 	// Event outbox entries go in at the same point as in the single-transaction
 	// writer above — after the lineage outbox, before the commit — so the batch's
 	// events share the fate of the batch's balance updates.
-	if err := insertEventOutboxesInTx(ctx, tx, eventOutboxes); err != nil {
+	//
+	// One event PER TRANSACTION, count-checked whenever the caller supplies any.
+	// The coalescing path can reach this writer with no event rows at all, which is
+	// how coalesced mutations used to commit without events: fifty transactions, one
+	// commit, and nothing published. The cardinality check is what makes "one event
+	// per committed transaction" an enforced invariant instead of a convention.
+	eventRows, err := resolveEventOutboxes(len(txns), eventOutboxes)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	if err := insertEventOutboxesInTx(ctx, tx, eventRows); err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("failed to insert event outboxes: %w", err)
 	}
@@ -421,7 +498,7 @@ func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Cont
 		attribute.Int("transaction.count", len(txns)),
 		attribute.Int("balance.count", len(balances)),
 		attribute.Int("outbox.count", len(outboxes)),
-		attribute.Int("event_outbox.count", len(eventOutboxes)),
+		attribute.Int("event_outbox.count", len(eventRows)),
 	))
 
 	return txns, nil

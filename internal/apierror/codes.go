@@ -33,7 +33,7 @@ const (
 	ErrGenBadRequest       ErrorCode = "GEN_BAD_REQUEST"
 	ErrGenNotFound         ErrorCode = "GEN_NOT_FOUND"
 	ErrGenConflict         ErrorCode = "GEN_CONFLICT"
-	ErrGenGone             ErrorCode = "GEN_GONE" // permanently removed surface; see api/middleware/sunset.go
+	ErrGenGone             ErrorCode = "GEN_GONE" // a deprecated surface past its configured sunset
 	ErrGenResourceLocked   ErrorCode = "GEN_RESOURCE_LOCKED"
 	ErrGenPayloadTooLarge  ErrorCode = "GEN_PAYLOAD_TOO_LARGE"
 	ErrGenRateLimited      ErrorCode = "GEN_RATE_LIMITED"

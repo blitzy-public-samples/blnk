@@ -36,8 +36,66 @@ spec:
             - name: prometheus-config
               mountPath: /etc/prometheus/alerts/blnk-kafka-alerts.yml
               subPath: blnk-kafka-alerts.yml
+            # The metrics bearer token both scrape jobs authenticate with.
+            # Without it Prometheus scrapes an endpoint that answers every
+            # unauthenticated request with an error, so no series is collected
+            # and the two Kafka alerts can never fire — a failure that looks
+            # exactly like health, because an absent alert and a healthy system
+            # are indistinguishable.
+            #
+            # A DIRECTORY mount, not a subPath one, and the difference matters:
+            # a subPath mount is resolved once at container start and does NOT
+            # track later updates to the Secret, whereas a directory mount is
+            # refreshed by the kubelet. Prometheus re-reads credentials_file on
+            # each scrape, so with this mount a rotated token takes effect
+            # without restarting the pod; with a subPath it would keep
+            # presenting the old one until someone noticed the targets had gone
+            # down. Nothing else lives in this directory, so a whole-directory
+            # mount shadows nothing.
+            #
+            # readOnly because Prometheus only ever reads it, and a credential
+            # that cannot be written cannot be corrupted by the process holding
+            # it.
+            - name: metrics-bearer-token
+              mountPath: /etc/prometheus/secrets
+              readOnly: true
       restartPolicy: Always
       volumes:
         - name: prometheus-config
           configMap:
             name: prometheus-config
+        # Secret, never ConfigMap. The token is a credential: a ConfigMap is
+        # stored unencrypted, is readable by anything holding get-configmap in
+        # the namespace, and is printed in full by `kubectl describe`.
+        #
+        # The Secret is NOT part of this manifest set, deliberately. A committed
+        # Secret manifest either carries a real token in the repository or
+        # carries a placeholder that silently authenticates as nothing, and both
+        # are worse than requiring one command:
+        #   kubectl -n blnk create secret generic blnk-metrics-token \
+        #     --from-literal=metrics-bearer-token="$BLNK_METRICS_BEARER_TOKEN"
+        #
+        # It is REQUIRED rather than optional: with the Secret absent the pod
+        # stays in ContainerCreating with a clear event naming it, instead of
+        # starting and scraping nothing. Failing loudly is the whole point — the
+        # defect this replaces was a monitoring stack that came up green while
+        # collecting no metrics.
+        - name: metrics-bearer-token
+          secret:
+            secretName: blnk-metrics-token
+            # items pins the filename, so the mounted path is exactly the
+            # credentials_file path in prometheus-configmap.yaml no matter what
+            # else the Secret gains later. Without it, every key in the Secret
+            # would appear in the directory and a renamed key would break the
+            # scrape with a file-not-found at config load.
+            items:
+              - key: metrics-bearer-token
+                path: metrics-bearer-token
+            # 0444, not 0400. Secret volume files are owned by root, and the
+            # prom/prometheus image runs as nobody (65534) — under 0400 the
+            # process could not read its own credential, and Prometheus would
+            # crash-loop on a permission error that reads like a missing file.
+            # 0444 is safe here because the volume exists only inside this pod's
+            # mount namespace; the token is not exposed to anything that could
+            # not already read the Secret.
+            defaultMode: 0444

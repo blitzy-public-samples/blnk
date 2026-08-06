@@ -82,6 +82,18 @@ groups:
           severity: warning
           component: event-streaming
         annotations:
+          # The subscriber and group values are OPAQUE registry-issued identifiers
+          # ('sub_<uuid>' and 'blnk-grp-<32 hex>') and never customer-chosen names,
+          # deliberately: an annotation is rendered into notifications and incident
+          # tickets, so a name-derived label would export a customer's identity into
+          # places it cannot be recalled from. Resolve the identifier through the
+          # subscriber registry when triaging.
+          #
+          # Three collapse tokens can appear in place of an identifier, each meaning
+          # something different: 'unattributed' — the reading came from a query that
+          # named no subscriber; 'unregistered' — a value was named but is not one Blnk
+          # issued, which is itself worth investigating; 'other' — the topic is not one
+          # Blnk owns. See recordConsumerLag in event_admin.go.
           summary: "Subscriber consumer group lag is above 10,000 messages"
-          description: "Subscriber {{ $labels.subscriber }} (consumer group {{ $labels.group }}) is {{ $value | humanize }} messages behind the end of topic {{ $labels.topic }}. Confirm the consumer is running and keeping up before Kafka's retention window is reached."
+          description: "Subscriber {{ $labels.subscriber }} (consumer group {{ $labels.group }}) is {{ $value | humanize }} messages behind the end of topic {{ $labels.topic }}. Confirm the consumer is running and keeping up before Kafka's retention window is reached. The subscriber and group values are opaque registry identifiers: resolve them through the subscriber registry."
           runbook_url: docs/kafka-operations.md

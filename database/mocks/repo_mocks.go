@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/blnkfinance/blnk/database"
@@ -31,6 +32,69 @@ import (
 // MockDataSource is a mock implementation of the IDataSource interface
 type MockDataSource struct {
 	mock.Mock
+
+	// capturedEventOutboxes records every event outbox row handed to the three
+	// atomic transaction writers, in call order.
+	//
+	// It exists because those rows arrive as a VARIADIC tail and cannot be
+	// forwarded into m.Called without breaking argument matching for every
+	// expectation already written against the writers — see the note above
+	// RecordTransactionWithBalancesAndOutbox. Without somewhere to record them, a
+	// caller could pass an event row, or fail to pass one, and no test could tell
+	// the difference: "the mutation was recorded" was assertable and "its event was
+	// captured with it" was not, which is precisely the half of the transactional
+	// outbox guarantee that matters.
+	//
+	// Read it through CapturedEventOutboxes and clear it with
+	// ResetCapturedEventOutboxes.
+	capturedEventOutboxes []*model.EventOutbox
+
+	// capturedMu guards capturedEventOutboxes. The writers are called from
+	// goroutines in several tests, and testify's own lock does not extend to fields
+	// this file adds, so an unguarded slice append would be a data race the race
+	// detector fails the suite on.
+	capturedMu sync.Mutex
+}
+
+// captureEventOutboxes records the variadic event rows from one writer call,
+// skipping nil entries exactly as the real datasource does so that what is recorded
+// is what would have been persisted rather than what was passed.
+func (m *MockDataSource) captureEventOutboxes(rows []*model.EventOutbox) {
+	if len(rows) == 0 {
+		return
+	}
+
+	m.capturedMu.Lock()
+	defer m.capturedMu.Unlock()
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		m.capturedEventOutboxes = append(m.capturedEventOutboxes, row)
+	}
+}
+
+// CapturedEventOutboxes returns a copy of every non-nil event outbox row passed to
+// the atomic transaction writers so far, in call order.
+//
+// A copy is returned rather than the backing slice so a test can hold the result
+// across further calls without it changing underneath, and so no test can mutate the
+// mock's record of what it observed.
+func (m *MockDataSource) CapturedEventOutboxes() []*model.EventOutbox {
+	m.capturedMu.Lock()
+	defer m.capturedMu.Unlock()
+
+	captured := make([]*model.EventOutbox, len(m.capturedEventOutboxes))
+	copy(captured, m.capturedEventOutboxes)
+	return captured
+}
+
+// ResetCapturedEventOutboxes clears the record, for a test that reuses one mock
+// across several phases and needs each phase's captures in isolation.
+func (m *MockDataSource) ResetCapturedEventOutboxes() {
+	m.capturedMu.Lock()
+	defer m.capturedMu.Unlock()
+	m.capturedEventOutboxes = nil
 }
 
 // Compile-time proof that MockDataSource still satisfies the full IDataSource
@@ -63,19 +127,33 @@ func (m *MockDataSource) RecordTransactionWithBalances(ctx context.Context, txn 
 }
 
 // The three atomic writers below accept the same variadic event outbox tail as the
-// real datasource, but they deliberately DO NOT forward it into m.Called().
+// real datasource. They RECORD it, through captureEventOutboxes, and they
+// deliberately DO NOT forward it into m.Called().
+//
+// # Why it is recorded
+//
+// Discarding it made half of the transactional outbox guarantee unassertable. A
+// test could confirm that a mutation was recorded and could not confirm that its
+// event was captured alongside it — so a caller that stopped passing an event row
+// entirely would break the guarantee with every test still green. Recording the
+// rows on the mock closes that: see CapturedEventOutboxes.
+//
+// # Why it is still not forwarded into m.Called
 //
 // testify matches an expectation by argument count and position, so forwarding the
 // variadic would change the argument list every existing expectation was written
 // against — a caller that set up five mock.Anything matchers would stop matching
-// the moment a fourth argument became a slice, and the failure would surface as an
-// unexpected-call panic rather than a compile error. Keeping the Called() argument
-// list exactly as it was is what lets every pre-existing expectation in the suite
-// continue to match untouched, which is the same source-compatibility property the
-// variadic exists to provide on the real interface. A test that needs to assert on
-// the event rows should assert on the outbox repository instead, which is where
-// they are actually written.
+// the moment a sixth argument appeared, and the failure would surface as an
+// unexpected-call panic at run time rather than as a compile error. Forwarding it
+// only when non-empty is worse still: the mock's arity would then depend on caller
+// data, so an expectation would match today and stop matching the day a caller
+// began passing rows, with nothing in either file to explain why.
+//
+// Recording gives assertability without touching argument matching, which is the
+// same source-compatibility property the variadic exists to provide on the real
+// interface. Assert on CapturedEventOutboxes, not on the Called() argument list.
 func (m *MockDataSource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance, outbox *model.LineageOutbox, eventOutbox ...*model.EventOutbox) (*model.Transaction, error) {
+	m.captureEventOutboxes(eventOutbox)
 	// eventOutbox is deliberately NOT forwarded into m.Called — see the note above.
 	// Do not "complete" this call: it breaks matching at run time, not compile time.
 	args := m.Called(ctx, txn, sourceBalance, destinationBalance, outbox)
@@ -86,6 +164,7 @@ func (m *MockDataSource) RecordTransactionWithBalancesAndOutbox(ctx context.Cont
 }
 
 func (m *MockDataSource) RecordTransactionsWithBalancesAndOutboxes(ctx context.Context, txns []*model.Transaction, sourceBalance, destinationBalance *model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
+	m.captureEventOutboxes(eventOutboxes)
 	// eventOutboxes is deliberately NOT forwarded into m.Called — see the note on
 	// RecordTransactionWithBalancesAndOutbox above. Adding it here would change the
 	// argument count testify matches on, which fails at run time, not compile time.
@@ -97,6 +176,7 @@ func (m *MockDataSource) RecordTransactionsWithBalancesAndOutboxes(ctx context.C
 }
 
 func (m *MockDataSource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Context, txns []*model.Transaction, balances []*model.Balance, outboxes []*model.LineageOutbox, eventOutboxes ...*model.EventOutbox) ([]*model.Transaction, error) {
+	m.captureEventOutboxes(eventOutboxes)
 	// eventOutboxes is deliberately NOT forwarded into m.Called — see the note on
 	// RecordTransactionWithBalancesAndOutbox above. Adding it here would change the
 	// argument count testify matches on, which fails at run time, not compile time.
@@ -762,24 +842,49 @@ func (m *MockDataSource) ClaimPendingEventOutbox(ctx context.Context, batchSize 
 	return args.Get(0).([]model.EventOutbox), args.Error(1)
 }
 
-func (m *MockDataSource) MarkEventDispatched(ctx context.Context, id int64) error {
-	args := m.Called(ctx, id)
+func (m *MockDataSource) MarkEventDispatched(ctx context.Context, id int64, claimToken string) error {
+	args := m.Called(ctx, id, claimToken)
 	return args.Error(0)
 }
 
-func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, errMsg string) error {
-	args := m.Called(ctx, id, errMsg)
+// MarkEventFailed returns the outcome the real datasource decides in SQL. A test
+// that stubs only the error must still supply an outcome, because the caller reads
+// Exhausted to decide whether to dead-letter — returning a zero outcome on the
+// error path is correct and is what the nil check below produces.
+func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration) (model.EventFailureOutcome, error) {
+	args := m.Called(ctx, id, claimToken, errMsg, retryAfter)
+	if args.Get(0) == nil {
+		return model.EventFailureOutcome{}, args.Error(1)
+	}
+	return args.Get(0).(model.EventFailureOutcome), args.Error(1)
+}
+
+func (m *MockDataSource) MarkEventDeadLettered(ctx context.Context, id int64, claimToken, dltTopic string, failureMetadata json.RawMessage) error {
+	args := m.Called(ctx, id, claimToken, dltTopic, failureMetadata)
 	return args.Error(0)
 }
 
-func (m *MockDataSource) MarkEventDeadLettered(ctx context.Context, id int64, dltTopic string, failureMetadata json.RawMessage) error {
-	args := m.Called(ctx, id, dltTopic, failureMetadata)
+func (m *MockDataSource) ClaimEventForReplay(ctx context.Context, eventID string, lockDuration time.Duration) (*model.EventOutbox, error) {
+	args := m.Called(ctx, eventID, lockDuration)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.EventOutbox), args.Error(1)
+}
+
+func (m *MockDataSource) ReleaseEventReplay(ctx context.Context, id int64, claimToken, replayErr string) error {
+	args := m.Called(ctx, id, claimToken, replayErr)
 	return args.Error(0)
 }
 
-func (m *MockDataSource) MarkWebhookDispatched(ctx context.Context, id int64) error {
-	args := m.Called(ctx, id)
+func (m *MockDataSource) MarkWebhookDispatched(ctx context.Context, id int64, claimToken string) error {
+	args := m.Called(ctx, id, claimToken)
 	return args.Error(0)
+}
+
+func (m *MockDataSource) PurgeTerminalEventsBefore(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	args := m.Called(ctx, cutoff, limit)
+	return args.Get(0).(int64), args.Error(1)
 }
 
 func (m *MockDataSource) GetEventByID(ctx context.Context, eventID string) (*model.EventOutbox, error) {
@@ -851,7 +956,30 @@ func (m *MockDataSource) RecordSubscriberCredential(ctx context.Context, subscri
 	return args.Error(0)
 }
 
+func (m *MockDataSource) RecordSubscriberCredentialIfUnchanged(ctx context.Context, subscriberID string, expected *string, credentialReference string, issuedAt time.Time) error {
+	args := m.Called(ctx, subscriberID, expected, credentialReference, issuedAt)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) TakeEventSubscriber(ctx context.Context, subscriberID string) (*model.EventSubscriber, error) {
+	args := m.Called(ctx, subscriberID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.EventSubscriber), args.Error(1)
+}
+
+func (m *MockDataSource) ClearSubscriberCredential(ctx context.Context, subscriberID string) error {
+	args := m.Called(ctx, subscriberID)
+	return args.Error(0)
+}
+
 func (m *MockDataSource) MarkSubscriberMigrated(ctx context.Context, subscriberID string, migratedAt time.Time) error {
 	args := m.Called(ctx, subscriberID, migratedAt)
 	return args.Error(0)
+}
+
+func (m *MockDataSource) PurgeMigratedSubscriberWebhookURLs(ctx context.Context, migratedBefore time.Time) (int64, error) {
+	args := m.Called(ctx, migratedBefore)
+	return args.Get(0).(int64), args.Error(1)
 }

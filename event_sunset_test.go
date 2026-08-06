@@ -69,6 +69,21 @@ func storeSunsetDate(t *testing.T, raw string) {
 	config.ConfigStore.Store(&config.Configuration{WebhookDeprecationSunsetDate: raw})
 }
 
+// restoreFetchConfiguration snapshots the package's configuration seam and puts it
+// back when the test finishes.
+//
+// Tests that need a configuration shape the global store cannot hold — brokers
+// configured alongside a deliberately unusable sunset window, which
+// validateAndAddDefaults refuses outright — swap the seam instead of the store. The
+// snapshot is mandatory: a leaked stub would make every later test in the package read
+// its configuration.
+func restoreFetchConfiguration(t *testing.T) {
+	t.Helper()
+
+	original := fetchConfiguration
+	t.Cleanup(func() { fetchConfiguration = original })
+}
+
 // mustParseSunset parses an RFC3339 instant that the test itself controls, so a
 // failure to parse is a defect in the test rather than in the code under test.
 func mustParseSunset(t *testing.T, value string) time.Time {
@@ -298,7 +313,14 @@ func TestWebhookSunsetPassed_MalformedDateWarnsThroughThePublicPath(t *testing.T
 		"the warning must name the layout the value failed to match")
 	assert.NotNil(t, warning.Data[logrus.ErrorKey],
 		"the warning must carry the parse error itself")
-	assert.Contains(t, warning.Message, "dual delivery continues",
+	// The consequence, which is what an operator acts on. With no Kafka broker
+	// configured there is no dual-delivery window to end, so the stated consequence is
+	// that the deprecated routes keep answering. The Kafka-configured case states the
+	// opposite consequence and is asserted by
+	// TestWebhookSunsetInstant_FailsClosedWhenPublishingWithoutAUsableWindow.
+	assert.Contains(t, warning.Message, "no Kafka broker is configured",
+		"the warning must say why the malformed value is being ignored rather than failing closed")
+	assert.Contains(t, warning.Message, "keep answering normally",
 		"the warning must state the consequence, which is what an operator acts on")
 }
 
@@ -324,10 +346,13 @@ func TestWebhookSunsetInstant_MalformedDateWarnsOncePerDistinctValue(t *testing.
 
 	const fragment = "not a valid RFC3339 instant"
 
+	// No brokers configured, so a malformed value is a WARNING and resolves to
+	// "no transport to migrate to". The fail-closed path is asserted separately, by
+	// TestWebhookSunsetInstant_FailsClosedWhenPublishingWithoutAUsableWindow.
 	first := &config.Configuration{WebhookDeprecationSunsetDate: "not-a-date"}
 	for i := 0; i < 5; i++ {
-		date, configured := webhookSunsetInstant(first)
-		assert.False(t, configured)
+		date, resolution := webhookSunsetInstant(first)
+		assert.Equal(t, sunsetAbsentNoTransport, resolution)
 		assert.True(t, date.IsZero())
 	}
 	assert.Equal(t, 1, countWarnings(fragment),
@@ -335,24 +360,101 @@ func TestWebhookSunsetInstant_MalformedDateWarnsOncePerDistinctValue(t *testing.
 
 	// A different malformed value is new information and must warn again.
 	second := &config.Configuration{WebhookDeprecationSunsetDate: "also-not-a-date"}
-	_, configured := webhookSunsetInstant(second)
-	assert.False(t, configured)
+	_, resolution := webhookSunsetInstant(second)
+	assert.Equal(t, sunsetAbsentNoTransport, resolution)
 	assert.Equal(t, 2, countWarnings(fragment),
 		"a changed malformed value must warn again")
 
 	// Well-formed and absent values must never warn.
 	hook.Reset()
-	_, configured = webhookSunsetInstant(&config.Configuration{WebhookDeprecationSunsetDate: "2026-06-15T12:30:45Z"})
-	assert.True(t, configured)
-	_, configured = webhookSunsetInstant(&config.Configuration{})
-	assert.False(t, configured)
+	_, resolution = webhookSunsetInstant(&config.Configuration{WebhookDeprecationSunsetDate: "2026-06-15T12:30:45Z"})
+	assert.Equal(t, sunsetResolved, resolution)
+	_, resolution = webhookSunsetInstant(&config.Configuration{})
+	assert.Equal(t, sunsetAbsentNoTransport, resolution)
 	assert.Zero(t, countWarnings(fragment), "valid and absent values must not warn")
 }
 
 func TestWebhookSunsetInstant_NilConfigurationIsNotConfigured(t *testing.T) {
-	date, configured := webhookSunsetInstant(nil)
+	date, resolution := webhookSunsetInstant(nil)
 
-	assert.False(t, configured)
+	assert.Equal(t, sunsetAbsentNoTransport, resolution,
+		"no configuration means no brokers either, so there is nothing to fail closed about")
+	assert.True(t, date.IsZero())
+}
+
+// TestWebhookSunsetInstant_FailsClosedWhenPublishingWithoutAUsableWindow is the test
+// for the finding that the sunset used to fail OPEN.
+//
+// An unset or mis-typed WEBHOOK_DEPRECATION_SUNSET_DATE resolved to "the sunset has
+// not passed", which preserved legacy HTTP webhook delivery and the deprecated webhook
+// management surface indefinitely — on a deployment that had already moved to Kafka,
+// silently, with nothing to alert on. One typo cancelled the retirement of the
+// transport this whole feature replaces.
+//
+// The distinguishing fact is whether a Kafka transport exists. With brokers configured
+// there IS somewhere to have migrated to, so an unusable window fails closed. With no
+// brokers there is not, so "not passed" is simply the truth.
+func TestWebhookSunsetInstant_FailsClosedWhenPublishingWithoutAUsableWindow(t *testing.T) {
+	unusable := []struct {
+		name   string
+		sunset string
+	}{
+		{name: "an unset window", sunset: ""},
+		{name: "a whitespace-only window", sunset: "   \n"},
+		{name: "a malformed window", sunset: "not-a-date"},
+		{name: "a date-only window", sunset: "2026-09-04"},
+	}
+
+	for _, tc := range unusable {
+		t.Run(tc.name, func(t *testing.T) {
+			sunsetParseWarnings.reset()
+
+			t.Run("fails closed when brokers are configured", func(t *testing.T) {
+				cnf := &config.Configuration{
+					Kafka:                        config.KafkaConfig{Brokers: []string{"broker-1:9092"}},
+					WebhookDeprecationSunsetDate: tc.sunset,
+				}
+
+				_, resolution := webhookSunsetInstant(cnf)
+				assert.Equal(t, sunsetUnusableWithTransport, resolution,
+					"an unusable window with a Kafka transport configured must fail closed")
+			})
+
+			t.Run("stays open when no broker is configured", func(t *testing.T) {
+				cnf := &config.Configuration{WebhookDeprecationSunsetDate: tc.sunset}
+
+				_, resolution := webhookSunsetInstant(cnf)
+				assert.Equal(t, sunsetAbsentNoTransport, resolution,
+					"with no Kafka transport there is nothing to have migrated to, so the sunset has not passed")
+			})
+		})
+	}
+}
+
+// TestWebhookSunsetPassed_FailsClosedThroughThePublicPredicate carries the fail-closed
+// behaviour all the way through the exported predicate both consumers call, so that the
+// relay's dual-delivery branch and the 410 guard are proven to see it — not just the
+// internal resolver.
+func TestWebhookSunsetPassed_FailsClosedThroughThePublicPredicate(t *testing.T) {
+	restoreFetchConfiguration(t)
+	sunsetParseWarnings.reset()
+
+	fetchConfiguration = func() (*config.Configuration, error) {
+		return &config.Configuration{
+			Kafka:                        config.KafkaConfig{Brokers: []string{"broker-1:9092"}},
+			WebhookDeprecationSunsetDate: "not-a-date",
+		}, nil
+	}
+
+	assert.True(t, WebhookSunsetPassed(time.Now()),
+		"the sunset must read as passed so dual delivery stops and the deprecated routes answer 410")
+	assert.True(t, WebhookSunsetPassed(time.Unix(0, 0)),
+		"the fail-closed verdict cannot depend on the clock")
+
+	// There is no instant to describe, which callers rendering a Sunset header must be
+	// able to tell apart from the verdict itself.
+	date, configured := WebhookSunsetDate()
+	assert.False(t, configured, "there is no parseable instant to report")
 	assert.True(t, date.IsZero())
 }
 
@@ -518,6 +620,9 @@ func TestWebhookSunsetPassed_BothConsumersFlipAtTheSameInstant(t *testing.T) {
 // loop and the HTTP request path — so a data race here would be a production defect.
 // Run under -race this fails if the guard is left unsynchronised.
 func TestWebhookSunsetPassed_IsSafeForConcurrentCallers(t *testing.T) {
+	// No brokers, so the malformed value resolves to sunsetAbsentNoTransport and the
+	// verdict is false. What is under test here is the warn suppressor's locking, not
+	// the verdict.
 	storeSunsetDate(t, "definitely-not-a-date")
 
 	const callers = 32
@@ -530,6 +635,33 @@ func TestWebhookSunsetPassed_IsSafeForConcurrentCallers(t *testing.T) {
 			assert.False(t, WebhookSunsetPassed(time.Now()))
 			_, configured := WebhookSunsetDate()
 			assert.False(t, configured)
+		}()
+	}
+
+	wg.Wait()
+}
+
+// TestWebhookSunsetPassed_FailClosedIsSafeForConcurrentCallers repeats the race check
+// on the fail-closed path, which takes a different branch of the warn suppressor: the
+// unset-window arm keys the guard on the empty string rather than on the raw value.
+func TestWebhookSunsetPassed_FailClosedIsSafeForConcurrentCallers(t *testing.T) {
+	restoreFetchConfiguration(t)
+	sunsetParseWarnings.reset()
+
+	fetchConfiguration = func() (*config.Configuration, error) {
+		return &config.Configuration{
+			Kafka: config.KafkaConfig{Brokers: []string{"broker-1:9092"}},
+		}, nil
+	}
+
+	const callers = 32
+	var wg sync.WaitGroup
+	wg.Add(callers)
+
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			assert.True(t, WebhookSunsetPassed(time.Now()))
 		}()
 	}
 

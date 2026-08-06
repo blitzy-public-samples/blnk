@@ -19,8 +19,10 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -44,6 +46,21 @@ const (
 	// upstream from hanging the handler.
 	DEFAULT_UPLOAD_URL_TIMEOUT_SEC = 30
 )
+
+// WebhookDualDeliveryWindowDays is the exact length of the window in which Kafka
+// publishing and legacy HTTP webhook delivery run side by side, in days.
+//
+// It is a constant rather than a configurable value because the length is part of
+// the deprecation contract published to subscribers, not an operational knob: a
+// deployment that quietly shortened it would retire a transport subscribers were
+// told they had until a stated date to move off. Operators choose WHEN the window
+// opens; they do not choose how long it lasts.
+const WebhookDualDeliveryWindowDays = 30
+
+// webhookDualDeliveryWindow is WebhookDualDeliveryWindowDays as a duration, used to
+// derive the sunset instant from the window's start and to verify a pair of
+// explicitly configured dates really is that far apart.
+const webhookDualDeliveryWindow = WebhookDualDeliveryWindowDays * 24 * time.Hour
 
 // Default values for different configurations
 var (
@@ -97,14 +114,19 @@ var (
 		ConnMaxIdleTime: 5 * time.Minute,
 	}
 
-	// defaultKafka deliberately leaves Brokers, SASLAdminUser and SASLAdminSecret
-	// zero-valued. An empty broker list is a legitimate steady state, not an error:
-	// it selects the no-op event publisher, reproducing the historic
-	// no-op-when-unconfigured contract so a deployment without Kafka keeps working.
-	// The two SASL fields are credentials and must never carry a shipped default.
-	// ReplicationFactor defaults to 3 for production durability; a single-broker
-	// cluster must set it to 1 explicitly, which setKafkaDefaults preserves because
-	// it only fills zero values.
+	// defaultKafka deliberately leaves Brokers and all four SASL fields zero-valued.
+	// An empty broker list is a legitimate steady state, not an error: it selects the
+	// no-op event publisher, reproducing the historic no-op-when-unconfigured
+	// contract so a deployment without Kafka keeps working. The SASL fields are
+	// credentials and must never carry a shipped default. ReplicationFactor defaults
+	// to 3 for production durability; a single-broker cluster must set it to 1
+	// explicitly, which setKafkaDefaults preserves because it only fills zero values.
+	//
+	// TLS.Enabled and InsecureLocalDev are both false by default, which is not a
+	// contradiction: it is the ONE combination that refuses to build a Kafka client
+	// at all. A deployment must choose, in writing, between verified TLS and an
+	// explicitly acknowledged local-dev plaintext connection — neither can be
+	// arrived at by leaving a variable unset.
 	defaultKafka = KafkaConfig{
 		TopicPrefix:       "blnk",
 		MinPartitions:     6,
@@ -251,25 +273,107 @@ type QueueConfig struct {
 // each field envconfig derives a primary key by accumulating the prefix through
 // every enclosing struct, and uses the raw tag literal as an alternate key that is
 // consulted only when the primary is unset. Because Configuration.Kafka is itself a
-// prefix segment, the primary key here is BLNK_KAFKA_<TAG> — for example
-// BLNK_KAFKA_KAFKA_BROKERS, not BLNK_KAFKA_BROKERS, which is honoured by neither
-// key. Setting the mandated bare KAFKA_BROKERS is therefore the supported way to
-// configure this struct from the environment, and it is verified by test.
+// prefix segment, the primary key envconfig derives here is BLNK_KAFKA_<TAG> — for
+// example BLNK_KAFKA_KAFKA_BROKERS, not BLNK_KAFKA_BROKERS.
 //
-// This is not a special case: every nested field in this file already depends on the
-// same fallback. Redis.Dns is read from its BLNK_REDIS_DNS tag literal, not from any
-// prefix composition. Adding a BLNK_ prefix to a tag below would simply change which
-// bare name is honoured and would break the mandated one.
+// BOTH FORMS RESOLVE ANYWAY. The house convention across this file is that a
+// setting also answers to its BLNK_-prefixed name, and a deployment that writes
+// BLNK_KAFKA_BROKERS out of habit must not silently select default behaviour. So
+// after envconfig has run, applyPrefixedEnvAliases overlays the ordinary
+// BLNK_-prefixed alias of every variable in this struct and in RelayConfig, and the
+// prefixed form wins when both are set — the same precedence the top-level
+// WebhookDeprecationSunsetDate already has, where envconfig itself provides it.
+// The alias table lives beside that function; adding a field here means adding it
+// there, and a test asserts every field of both structs is covered.
 //
-// Brokers, SASLAdminUser and SASLAdminSecret have no defaults by design — see
-// defaultKafka.
+// Brokers and the four SASL fields have no defaults by design — see defaultKafka.
 type KafkaConfig struct {
-	Brokers           []string `json:"brokers"            envconfig:"KAFKA_BROKERS"`
-	TopicPrefix       string   `json:"topic_prefix"       envconfig:"KAFKA_TOPIC_PREFIX"`
-	SASLAdminUser     string   `json:"sasl_admin_user"    envconfig:"KAFKA_SASL_ADMIN_USER"`
-	SASLAdminSecret   string   `json:"sasl_admin_secret"  envconfig:"KAFKA_SASL_ADMIN_SECRET"`
-	MinPartitions     int      `json:"min_partitions"     envconfig:"KAFKA_MIN_PARTITIONS"`
-	ReplicationFactor int      `json:"replication_factor" envconfig:"KAFKA_REPLICATION_FACTOR"`
+	Brokers     []string `json:"brokers"      envconfig:"KAFKA_BROKERS"`
+	TopicPrefix string   `json:"topic_prefix" envconfig:"KAFKA_TOPIC_PREFIX"`
+
+	// SASLUser and SASLSecret are the STEADY-STATE PRODUCER principal: the identity
+	// the event publisher in the server and worker processes authenticates as. It
+	// needs only Write and Describe on the topics Blnk owns.
+	//
+	// It is deliberately separate from the administrative principal below. A producer
+	// process that authenticates as the administrator holds authority to create
+	// topics, mint SCRAM credentials and rewrite ACLs, so compromising the busiest,
+	// most exposed process in the deployment would hand over the whole cluster's
+	// authorization state. Least privilege is the point: configure these two, and the
+	// admin credentials never leave the provisioning path.
+	//
+	// When they are empty the publisher falls back to the administrative principal so
+	// that an existing single-credential deployment keeps working, and it logs an
+	// excess-privilege warning every time it does. Treat that warning as a
+	// configuration defect, not as noise.
+	SASLUser   string `json:"sasl_user"   envconfig:"KAFKA_SASL_USER"`
+	SASLSecret string `json:"sasl_secret" envconfig:"KAFKA_SASL_SECRET"`
+
+	// SASLAdminUser and SASLAdminSecret are the ADMINISTRATIVE principal, used only
+	// for topic assurance, subscriber SCRAM credential provisioning, ACL grants and
+	// revocation, and the offset/lag reads behind reconciliation. Keep them out of
+	// every process that only publishes.
+	SASLAdminUser   string `json:"sasl_admin_user"   envconfig:"KAFKA_SASL_ADMIN_USER"`
+	SASLAdminSecret string `json:"sasl_admin_secret" envconfig:"KAFKA_SASL_ADMIN_SECRET"`
+
+	MinPartitions     int `json:"min_partitions"     envconfig:"KAFKA_MIN_PARTITIONS"`
+	ReplicationFactor int `json:"replication_factor" envconfig:"KAFKA_REPLICATION_FACTOR"`
+
+	// TLS carries the transport-security settings both the producer and the
+	// administrative client dial with. See KafkaTLSConfig.
+	TLS KafkaTLSConfig `json:"tls"`
+
+	// InsecureLocalDev permits an UNENCRYPTED Kafka connection.
+	//
+	// Ledger events carry financial amounts and identity events carry names, email
+	// addresses, phone numbers, addresses and dates of birth, so an unencrypted
+	// broker connection exposes exactly the data this system exists to protect. Both
+	// Kafka clients therefore REFUSE to dial without TLS unless this flag is
+	// explicitly set, which is what makes plaintext an opt-in rather than the
+	// accident of an unset variable.
+	//
+	// It exists because the local single-broker KRaft stack listens on
+	// SASL_PLAINTEXT, and only for that. Setting it in production defeats the
+	// protection; it is logged as a warning on every configuration load so that its
+	// presence in a real deployment cannot go unnoticed.
+	InsecureLocalDev bool `json:"insecure_local_dev" envconfig:"KAFKA_INSECURE_LOCAL_DEV"`
+
+	// AllowPartitionGrowth permits the topic-assurance pass to raise the partition
+	// count of a topic that ALREADY HOLDS MESSAGES.
+	//
+	// Growing a live topic re-maps keys to partitions — a key hashed into partition 2
+	// of six lands somewhere else out of twelve — so one aggregate's history is split
+	// across two partitions and its events can be consumed out of order. That breaks
+	// the per-aggregate ordering guarantee irreversibly for every key already
+	// written. Assurance therefore refuses to grow a non-empty topic and reports it
+	// instead, unless an operator has planned the migration and set this flag.
+	//
+	// An EMPTY topic is grown regardless of this flag: with no records written there
+	// is no mapping to preserve.
+	AllowPartitionGrowth bool `json:"allow_partition_growth" envconfig:"KAFKA_ALLOW_PARTITION_GROWTH"`
+}
+
+// KafkaTLSConfig configures the TLS client both Kafka transports use.
+//
+// Enabled turns TLS on. CAFile names a PEM bundle to verify the broker's
+// certificate against, which is required whenever the broker presents a
+// certificate signed by a private authority; leaving it empty uses the host trust
+// store. CertFile and KeyFile supply a client certificate for mutual TLS and must
+// be set together. ServerName overrides the name verified against the certificate,
+// which is needed when brokers are reached through an address that does not match
+// their advertised name.
+//
+// InsecureSkipVerify disables certificate verification entirely. It is a
+// LAST-RESORT development switch: with it set, TLS still encrypts but no longer
+// authenticates, so an interposed broker is indistinguishable from the real one.
+// It is warned about on every configuration load.
+type KafkaTLSConfig struct {
+	Enabled            bool   `json:"enabled"              envconfig:"KAFKA_TLS_ENABLED"`
+	CAFile             string `json:"ca_file"              envconfig:"KAFKA_TLS_CA_FILE"`
+	CertFile           string `json:"cert_file"            envconfig:"KAFKA_TLS_CERT_FILE"`
+	KeyFile            string `json:"key_file"             envconfig:"KAFKA_TLS_KEY_FILE"`
+	ServerName         string `json:"server_name"          envconfig:"KAFKA_TLS_SERVER_NAME"`
+	InsecureSkipVerify bool   `json:"insecure_skip_verify" envconfig:"KAFKA_TLS_INSECURE_SKIP_VERIFY"`
 }
 
 // RelayConfig tunes the transactional-outbox relay that publishes event rows to
@@ -312,17 +416,41 @@ type Configuration struct {
 	Queue                   QueueConfig                   `json:"queue"`
 	Kafka                   KafkaConfig                   `json:"kafka"`
 	Relay                   RelayConfig                   `json:"relay"`
+
+	// WebhookDeprecationStartDate is the RFC3339 instant at which the dual-delivery
+	// window OPENS. It exists so that the window's length is a derived fact rather
+	// than an operator's arithmetic: set it and the sunset is computed as exactly
+	// start + WebhookDualDeliveryWindowDays, which is the only way "exactly 30 days"
+	// can be enforced rather than hoped for.
+	//
+	// Set both this and WebhookDeprecationSunsetDate and they must agree to the
+	// second, or configuration is refused. Set only this one and the sunset is
+	// derived. Set only the sunset and it is used as given — an operator who states
+	// the retirement instant directly is not forced to back-calculate a start.
+	WebhookDeprecationStartDate string `json:"webhook_deprecation_start_date" envconfig:"WEBHOOK_DEPRECATION_START_DATE"`
+
 	// WebhookDeprecationSunsetDate is the RFC3339 instant at which the legacy HTTP
 	// webhook transport is retired. Before it, Kafka publishing and legacy webhook
 	// delivery run concurrently from the same outbox rows; from it onwards Kafka is
-	// the only transport and the deprecated webhook routes answer 410 Gone. An unset
-	// or unparseable value means the sunset has not passed, so dual delivery
-	// continues — a malformed date is reported as a warning, never a fatal error.
+	// the only transport and the deprecated webhook routes answer 410 Gone.
+	//
+	// IT IS NOT ADVISORY. A value that will not parse is a fatal configuration error,
+	// and so is leaving the whole window unset while Kafka publishing is enabled.
+	// Both used to be warnings, and both were wrong: a mis-typed date meant the
+	// legacy HTTP transport kept running forever with nothing failing, which is the
+	// deprecated, less protected of the two transports and precisely the one a
+	// migration exists to switch off. Refusing to start is loud, immediate and
+	// impossible to overlook, and the operator sees it before any traffic is served.
+	//
+	// The window may legitimately be left entirely unset on a deployment that has NO
+	// Kafka brokers configured. There is nothing to migrate to there, so there is no
+	// window to describe.
 	//
 	// Being a top-level field, it accumulates no intermediate prefix segment, so both
 	// the mandated bare WEBHOOK_DEPRECATION_SUNSET_DATE and the house-convention
 	// BLNK_WEBHOOK_DEPRECATION_SUNSET_DATE are honoured, the prefixed form winning
-	// if both are set. Contrast KafkaConfig, whose fields are nested.
+	// if both are set. KafkaConfig's nested fields get the same behaviour from
+	// applyPrefixedEnvAliases.
 	WebhookDeprecationSunsetDate string `json:"webhook_deprecation_sunset_date" envconfig:"WEBHOOK_DEPRECATION_SUNSET_DATE"`
 }
 
@@ -366,6 +494,13 @@ func loadConfigFromFile(file string) error {
 		return err
 	}
 
+	// The BLNK_-prefixed aliases of the nested Kafka and relay variables, which
+	// envconfig cannot reach on its own. Runs after Process so the prefixed form
+	// wins, matching the precedence the top-level sunset variable already has.
+	if err = applyPrefixedEnvAliases(&cnf); err != nil {
+		return err
+	}
+
 	err = cnf.validateAndAddDefaults()
 	if err != nil {
 		return err
@@ -373,6 +508,114 @@ func loadConfigFromFile(file string) error {
 
 	ConfigStore.Store(&cnf)
 	return err
+}
+
+// envAliasPrefix is the house prefix every other variable in this file answers to.
+// It is applied to the bare Kafka and relay names to form their ordinary aliases.
+const envAliasPrefix = "BLNK_"
+
+// applyPrefixedEnvAliases overlays the BLNK_-prefixed alias of every Kafka and relay
+// environment variable onto an already-processed Configuration.
+//
+// # Why this function has to exist
+//
+// envconfig derives a field's primary key by accumulating the prefix through every
+// enclosing struct and consults the raw tag literal only as an alternate key. For
+// Configuration.Kafka.Brokers, tagged KAFKA_BROKERS, the primary key is therefore
+// BLNK_KAFKA_KAFKA_BROKERS and the alternate is KAFKA_BROKERS. BLNK_KAFKA_BROKERS —
+// the name a reader of this file would naturally write, because every other setting
+// here is spelled that way — matches NEITHER, so it used to be read by nothing at
+// all. A deployment that set it got default behaviour: no brokers, the no-op
+// publisher, and no error anywhere to say why events were not being published.
+//
+// Rather than change the tags (which would break the mandated bare names) or flatten
+// the struct (which would break the blnk.json shape), the aliases are applied here,
+// explicitly and by name. Explicit beats reflective for a table this small: the set
+// of variables is fixed by the deployment contract, and a reader can check the list
+// against the two structs by eye.
+//
+// # Precedence
+//
+// The prefixed alias WINS over the bare name when both are set. That is the same
+// precedence envconfig itself gives the top-level WebhookDeprecationSunsetDate,
+// where the accumulated BLNK_ primary beats the bare alternate, so the behaviour is
+// uniform across every variable this feature adds rather than depending on whether a
+// given field happens to sit inside a nested struct.
+//
+// A malformed integer or boolean alias is an ERROR, not a silently ignored value:
+// BLNK_RELAY_MAX_RETRY_ATTEMPTS=five must not resolve to the default 5 and leave an
+// operator believing they had configured something.
+//
+// Returns:
+//   - error: when a prefixed alias holds a value that cannot be parsed as the
+//     field's type.
+func applyPrefixedEnvAliases(cnf *Configuration) error {
+	stringAliases := map[string]*string{
+		"KAFKA_TOPIC_PREFIX":              &cnf.Kafka.TopicPrefix,
+		"KAFKA_SASL_USER":                 &cnf.Kafka.SASLUser,
+		"KAFKA_SASL_SECRET":               &cnf.Kafka.SASLSecret,
+		"KAFKA_SASL_ADMIN_USER":           &cnf.Kafka.SASLAdminUser,
+		"KAFKA_SASL_ADMIN_SECRET":         &cnf.Kafka.SASLAdminSecret,
+		"KAFKA_TLS_CA_FILE":               &cnf.Kafka.TLS.CAFile,
+		"KAFKA_TLS_CERT_FILE":             &cnf.Kafka.TLS.CertFile,
+		"KAFKA_TLS_KEY_FILE":              &cnf.Kafka.TLS.KeyFile,
+		"KAFKA_TLS_SERVER_NAME":           &cnf.Kafka.TLS.ServerName,
+		"WEBHOOK_DEPRECATION_START_DATE":  &cnf.WebhookDeprecationStartDate,
+		"WEBHOOK_DEPRECATION_SUNSET_DATE": &cnf.WebhookDeprecationSunsetDate,
+	}
+	for name, target := range stringAliases {
+		if value, ok := os.LookupEnv(envAliasPrefix + name); ok {
+			*target = value
+		}
+	}
+
+	intAliases := map[string]*int{
+		"KAFKA_MIN_PARTITIONS":        &cnf.Kafka.MinPartitions,
+		"KAFKA_REPLICATION_FACTOR":    &cnf.Kafka.ReplicationFactor,
+		"RELAY_MAX_RETRY_ATTEMPTS":    &cnf.Relay.MaxRetryAttempts,
+		"RELAY_RETRY_BASE_BACKOFF_MS": &cnf.Relay.RetryBaseBackoffMS,
+		"RELAY_RETRY_MAX_BACKOFF_MS":  &cnf.Relay.RetryMaxBackoffMS,
+	}
+	for name, target := range intAliases {
+		key := envAliasPrefix + name
+		value, ok := os.LookupEnv(key)
+		if !ok {
+			continue
+		}
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("%s must be an integer, got %q: %w", key, value, err)
+		}
+		*target = parsed
+	}
+
+	boolAliases := map[string]*bool{
+		"KAFKA_TLS_ENABLED":              &cnf.Kafka.TLS.Enabled,
+		"KAFKA_TLS_INSECURE_SKIP_VERIFY": &cnf.Kafka.TLS.InsecureSkipVerify,
+		"KAFKA_INSECURE_LOCAL_DEV":       &cnf.Kafka.InsecureLocalDev,
+		"KAFKA_ALLOW_PARTITION_GROWTH":   &cnf.Kafka.AllowPartitionGrowth,
+	}
+	for name, target := range boolAliases {
+		key := envAliasPrefix + name
+		value, ok := os.LookupEnv(key)
+		if !ok {
+			continue
+		}
+		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("%s must be a boolean, got %q: %w", key, value, err)
+		}
+		*target = parsed
+	}
+
+	// Comma-separated, matching how envconfig splits the bare KAFKA_BROKERS. The
+	// entries are normalised later by setKafkaDefaults, so a value with spaces after
+	// the commas behaves identically whichever name supplied it.
+	if value, ok := os.LookupEnv(envAliasPrefix + "KAFKA_BROKERS"); ok {
+		cnf.Kafka.Brokers = strings.Split(value, ",")
+	}
+
+	return nil
 }
 
 func InitConfig(configFile string) error {
@@ -409,30 +652,154 @@ func (cnf *Configuration) validateAndAddDefaults() error {
 		logrus.Warn("tokenization secret should be 32 bytes for AES-256 encryption")
 	}
 
-	cnf.validateWebhookDeprecationSunsetDate()
+	if err := cnf.resolveWebhookDeprecationWindow(); err != nil {
+		return err
+	}
+
 	cnf.validateRelayRetryWindow()
+	cnf.warnOnInsecureKafkaTransport()
 
 	return nil
 }
 
-// validateWebhookDeprecationSunsetDate advises on an unparseable sunset date.
+// resolveWebhookDeprecationWindow validates the dual-delivery window and derives
+// whichever end of it was left out.
 //
-// It deliberately never returns an error. An empty value is valid and means the
-// sunset has not passed, and a malformed value is treated the same way by the
-// sunset decision helper, so refusing to load the configuration would contradict
-// that contract and would take the whole service down over an advisory field.
-func (cnf *Configuration) validateWebhookDeprecationSunsetDate() {
-	if cnf.WebhookDeprecationSunsetDate == "" {
+// It FAILS THE CONFIGURATION LOAD rather than warning, and that is the whole point
+// of the function. The sunset date drives two security-relevant behaviours — whether
+// the legacy HTTP transport still runs, and whether the deprecated webhook
+// management routes still answer — and both of them previously defaulted to "keep
+// the legacy behaviour" for an unset or mis-typed value. A single typo therefore
+// kept the deprecated transport alive indefinitely with nothing failing and nothing
+// to notice. Refusing to start is the only signal an operator cannot overlook, and
+// it happens before any traffic is served.
+//
+// The rules, in the order they are applied:
+//
+//  1. Both dates blank. Valid ONLY when no Kafka broker is configured: there is no
+//     Kafka to migrate to, so there is no window to describe and the legacy
+//     transport is simply the only transport. With brokers configured this is an
+//     error, because dual delivery would otherwise run forever.
+//  2. A date that will not parse as RFC3339. Always an error, for either end.
+//  3. Only the start given. The sunset is DERIVED as start + exactly
+//     WebhookDualDeliveryWindowDays, which is how "exactly 30 days" becomes a
+//     property of the code instead of an operator's arithmetic.
+//  4. Both given. They must be exactly WebhookDualDeliveryWindowDays apart, to the
+//     second, or the configuration is refused. A window that is silently 14 or 45
+//     days long contradicts what subscribers were told.
+//  5. Only the sunset given. Used verbatim, and the start is back-filled from it so
+//     both ends are available to describe the window.
+//
+// Every value written back is normalised to RFC3339 in UTC, so the stored strings
+// are canonical however they were supplied.
+//
+// Returns:
+//   - error: non-nil when the window is unparseable, inconsistent, or absent while
+//     Kafka publishing is enabled.
+func (cnf *Configuration) resolveWebhookDeprecationWindow() error {
+	rawStart := strings.TrimSpace(cnf.WebhookDeprecationStartDate)
+	rawSunset := strings.TrimSpace(cnf.WebhookDeprecationSunsetDate)
+
+	if rawStart == "" && rawSunset == "" {
+		if len(cnf.Kafka.Brokers) > 0 {
+			return errors.New(
+				"webhook_deprecation_sunset_date is required when kafka brokers are configured: " +
+					"set WEBHOOK_DEPRECATION_SUNSET_DATE to the RFC3339 instant the legacy HTTP webhook " +
+					"transport is retired, or set WEBHOOK_DEPRECATION_START_DATE and let the " +
+					"30-day dual-delivery window derive it. Without one of them the deprecated HTTP " +
+					"transport would run indefinitely alongside Kafka",
+			)
+		}
+
+		// No Kafka, no migration, no window. Both ends stay empty.
+		cnf.WebhookDeprecationStartDate = ""
+		cnf.WebhookDeprecationSunsetDate = ""
+
+		return nil
+	}
+
+	var start, sunset time.Time
+
+	if rawStart != "" {
+		parsed, err := time.Parse(time.RFC3339, rawStart)
+		if err != nil {
+			return fmt.Errorf(
+				"webhook_deprecation_start_date %q is not a valid RFC3339 instant (expected %s): %w",
+				rawStart, time.RFC3339, err,
+			)
+		}
+		start = parsed.UTC()
+	}
+
+	if rawSunset != "" {
+		parsed, err := time.Parse(time.RFC3339, rawSunset)
+		if err != nil {
+			return fmt.Errorf(
+				"webhook_deprecation_sunset_date %q is not a valid RFC3339 instant (expected %s): %w",
+				rawSunset, time.RFC3339, err,
+			)
+		}
+		sunset = parsed.UTC()
+	}
+
+	switch {
+	case rawSunset == "":
+		sunset = start.Add(webhookDualDeliveryWindow)
+		logrus.WithFields(logrus.Fields{
+			"start":       start.Format(time.RFC3339),
+			"sunset":      sunset.Format(time.RFC3339),
+			"window_days": WebhookDualDeliveryWindowDays,
+		}).Info("derived the webhook deprecation sunset from the configured window start")
+
+	case rawStart == "":
+		start = sunset.Add(-webhookDualDeliveryWindow)
+
+	case !sunset.Equal(start.Add(webhookDualDeliveryWindow)):
+		return fmt.Errorf(
+			"webhook deprecation window must be exactly %d days: start %s implies sunset %s, "+
+				"but webhook_deprecation_sunset_date is %s. Correct one of the two, or set only "+
+				"webhook_deprecation_start_date and let the sunset be derived",
+			WebhookDualDeliveryWindowDays,
+			start.Format(time.RFC3339),
+			start.Add(webhookDualDeliveryWindow).Format(time.RFC3339),
+			sunset.Format(time.RFC3339),
+		)
+	}
+
+	cnf.WebhookDeprecationStartDate = start.Format(time.RFC3339)
+	cnf.WebhookDeprecationSunsetDate = sunset.Format(time.RFC3339)
+
+	return nil
+}
+
+// warnOnInsecureKafkaTransport reports a Kafka client that is configured to give up
+// a protection it would otherwise have.
+//
+// Neither case is an error here, because both are reachable on purpose: the local
+// single-broker stack listens on SASL_PLAINTEXT, and a developer pointing at a
+// broker with a self-signed certificate may legitimately skip verification for an
+// afternoon. Both are refused at the point a client is actually built unless the
+// insecure flag is set, so this function's job is only to make the setting's
+// presence impossible to miss in a log an operator reads.
+func (cnf *Configuration) warnOnInsecureKafkaTransport() {
+	if len(cnf.Kafka.Brokers) == 0 {
 		return
 	}
 
-	if _, err := time.Parse(time.RFC3339, cnf.WebhookDeprecationSunsetDate); err != nil {
-		logrus.WithFields(logrus.Fields{
-			"value":    cnf.WebhookDeprecationSunsetDate,
-			"expected": time.RFC3339,
-		}).Warn(
-			"webhook_deprecation_sunset_date is not a valid RFC3339 timestamp and will be ignored; " +
-				"the webhook sunset is treated as not yet passed, so dual delivery continues",
+	if cnf.Kafka.InsecureLocalDev {
+		logrus.Warn(
+			"SECURITY: kafka.insecure_local_dev is true — the Kafka connection may run WITHOUT TLS, " +
+				"so ledger amounts and identity records (names, email addresses, phone numbers, " +
+				"addresses, dates of birth) can travel in cleartext. This setting is for the local " +
+				"single-broker stack only. Do not use it in production.",
+		)
+	}
+
+	if cnf.Kafka.TLS.Enabled && cnf.Kafka.TLS.InsecureSkipVerify {
+		logrus.Warn(
+			"SECURITY: kafka.tls.insecure_skip_verify is true — the broker's certificate is NOT " +
+				"verified, so TLS encrypts but no longer authenticates and an interposed broker is " +
+				"indistinguishable from the real one. Configure kafka.tls.ca_file instead.",
 		)
 	}
 }
@@ -447,6 +814,22 @@ func (cnf *Configuration) validateRelayRetryWindow() {
 		logrus.WithField("max_retry_attempts", cnf.Relay.MaxRetryAttempts).Warn(
 			"relay max_retry_attempts is below 1; events will not be retried before being dead-lettered",
 		)
+	}
+
+	// CLAMPED rather than merely warned about. The attempt number is a metric attribute on a
+	// histogram, so a configured budget above the ceiling widens that attribute's domain by
+	// one value per attempt — see MaxRelayRetryAttempts. Reducing it here is what keeps the
+	// domain closed at its declared eight values.
+	if cnf.Relay.MaxRetryAttempts > MaxRelayRetryAttempts {
+		logrus.WithFields(logrus.Fields{
+			"max_retry_attempts": cnf.Relay.MaxRetryAttempts,
+			"ceiling":            MaxRelayRetryAttempts,
+		}).Warn(
+			"relay max_retry_attempts exceeds the supported ceiling and has been reduced to it; " +
+				"the attempt number is a bounded metric attribute and cannot be extended by configuration",
+		)
+
+		cnf.Relay.MaxRetryAttempts = MaxRelayRetryAttempts
 	}
 
 	if cnf.Relay.RetryBaseBackoffMS < 0 {
@@ -680,6 +1063,213 @@ func (cnf *Configuration) setKafkaDefaults() {
 		cnf.Kafka.ReplicationFactor = defaultKafka.ReplicationFactor
 	}
 	cnf.Kafka.Brokers = normalizeBrokers(cnf.Kafka.Brokers)
+
+	// Credentials are trimmed here rather than in trimWhitespace because a stray
+	// newline from an environment file turns a correct SASL username into one the
+	// broker has never heard of, and the resulting authentication failure reads
+	// exactly like a wrong password. trimWhitespace is a fixed list of long-standing
+	// fields; extending it would change behaviour for those, so the Kafka fields are
+	// normalised in their own domain setter instead.
+	cnf.Kafka.SASLUser = strings.TrimSpace(cnf.Kafka.SASLUser)
+	cnf.Kafka.SASLSecret = strings.TrimSpace(cnf.Kafka.SASLSecret)
+	cnf.Kafka.SASLAdminUser = strings.TrimSpace(cnf.Kafka.SASLAdminUser)
+	cnf.Kafka.SASLAdminSecret = strings.TrimSpace(cnf.Kafka.SASLAdminSecret)
+	cnf.Kafka.TLS.CAFile = strings.TrimSpace(cnf.Kafka.TLS.CAFile)
+	cnf.Kafka.TLS.CertFile = strings.TrimSpace(cnf.Kafka.TLS.CertFile)
+	cnf.Kafka.TLS.KeyFile = strings.TrimSpace(cnf.Kafka.TLS.KeyFile)
+	cnf.Kafka.TLS.ServerName = strings.TrimSpace(cnf.Kafka.TLS.ServerName)
+
+	// A HALF-CONFIGURED pair is reported HERE, at load, and not only when a transport is
+	// eventually built.
+	//
+	// The construction paths already refuse it — kafkaTransportCredentials validates before
+	// it builds anything, so nothing half-authenticated can be dialled — but that failure
+	// arrives whenever the publisher or the admin client is first needed, which for a
+	// deployment with no Kafka work in flight can be long after start-up and a long way from
+	// the variable that caused it. Naming the missing variable while the configuration is
+	// being loaded is what turns "authentication failed" hours later into an actionable line
+	// in the boot log.
+	//
+	// It is a WARNING and not a fatal error, deliberately. validateRequiredFields requires
+	// only the two DSNs, and making a Kafka credential fatal would stop a server that does
+	// not use Kafka at all from booting because of a stray variable. The construction path
+	// remains the fail-closed one.
+	if err := cnf.Kafka.ValidateSASLAdminCredentials(); err != nil {
+		logrus.WithError(err).Warn(
+			"the Kafka administrative SASL credential is half-configured; topic assurance, " +
+				"subscriber provisioning and the offset reads behind reconciliation will all be " +
+				"refused rather than run unauthenticated",
+		)
+	}
+	if err := ValidateSASLPair("producer", cnf.Kafka.SASLUser, cnf.Kafka.SASLSecret); err != nil {
+		logrus.WithError(err).Warn(
+			"the Kafka producer SASL credential is half-configured; event publishing will be " +
+				"refused rather than run unauthenticated",
+		)
+	}
+}
+
+// ProducerSASL returns the SASL identity the steady-state event publisher should
+// authenticate as, and reports whether it is the ADMINISTRATIVE identity.
+//
+// It exists so that "which credential does the producer use?" is answered in exactly
+// one place. The publisher and the administrative client used to reach into the
+// configuration separately, which is how the producer ended up authenticating as the
+// administrator: nothing in either call site was wrong on its own, and no single
+// place expressed the intent that they should differ.
+//
+// The fallback to the administrative principal is deliberate and is not silent. An
+// existing deployment that configured only KAFKA_SASL_ADMIN_USER keeps working — no
+// upgrade breaks event publishing — but the caller is told, through the boolean, that
+// it is about to hand cluster-administration authority to a process that only needs
+// to write to four topics, and it warns.
+//
+// Returns:
+//   - user, secret string: the credentials to authenticate with. Both empty means no
+//     SASL at all, which is legitimate on a broker that requires none.
+//   - usingAdmin bool: true when the returned pair is the administrative principal
+//     because no dedicated producer principal is configured.
+func (cnf *Configuration) ProducerSASL() (user, secret string, usingAdmin bool) {
+	if cnf.Kafka.SASLUser != "" || cnf.Kafka.SASLSecret != "" {
+		return cnf.Kafka.SASLUser, cnf.Kafka.SASLSecret, false
+	}
+
+	if cnf.Kafka.SASLAdminUser == "" && cnf.Kafka.SASLAdminSecret == "" {
+		return "", "", false
+	}
+
+	return cnf.Kafka.SASLAdminUser, cnf.Kafka.SASLAdminSecret, true
+}
+
+// SASLAdminCredentials is THE one reading of the ADMINISTRATIVE SASL/SCRAM
+// credential, and every component that authenticates to a broker as the administrator
+// must resolve it through this method rather than inspecting the two fields itself.
+//
+// # The contract
+//
+//	both empty         no SASL. The broker is reached over a PLAINTEXT (or plain TLS)
+//	                   listener. This is a supported deployment, not a degraded one:
+//	                   the local single-broker stack can run without SASL.
+//	both set           SASL/SCRAM-SHA-512 as the named principal.
+//	exactly one set    a misconfiguration. enabled is false so no half-authenticated
+//	                   transport can be built, and ValidateSASLPair reports it by name.
+//
+// # Why this is a method rather than two field reads
+//
+// Before it existed, three components each invented their own reading of the same two
+// values. The publisher enabled SASL on a non-empty username and ignored an empty
+// secret. The admin client enabled it on a non-empty username, rejected a username
+// without a secret, and silently ignored a secret without a username — so a
+// deployment that set only KAFKA_SASL_ADMIN_SECRET connected as an anonymous
+// principal while its operator believed it was authenticating. The provisioning
+// scripts substituted the literal principal "admin" for an empty username, so the same
+// configuration meant "authenticate as admin" to a script and "authenticate as nobody"
+// to the service. One shared reading is what makes those three agree, and
+// scripts/kafka-provision.sh names this method as the contract it mirrors.
+//
+// Both values are trimmed here as well as at load, because a Configuration assembled
+// in a test or by a caller that bypassed validateAndAddDefaults must read the same way
+// as one that went through it: a trailing newline or space from a secret store, a
+// Kubernetes secret or a hand-edited .env would otherwise turn "unset" into a
+// credential made of whitespace, which fails SASL preparation or authenticates as a
+// principal nobody created.
+//
+// Returns:
+//   - user string: the trimmed principal, empty when SASL is not configured.
+//   - secret string: the trimmed secret, empty when SASL is not configured. Never log
+//     this value.
+//   - enabled bool: true only when BOTH values are present.
+func (k KafkaConfig) SASLAdminCredentials() (user, secret string, enabled bool) {
+	user = strings.TrimSpace(k.SASLAdminUser)
+	secret = strings.TrimSpace(k.SASLAdminSecret)
+
+	if user == "" || secret == "" {
+		return "", "", false
+	}
+
+	return user, secret, true
+}
+
+// ValidateSASLAdminCredentials reports a half-configured administrative credential.
+//
+// It is the administrative arm of ValidateSASLPair, named so that a caller holding only
+// a KafkaConfig — the scripts' Go counterpart, a start-up check, a test — does not have
+// to know which two fields to hand it.
+//
+// Returns:
+//   - error: non-nil only for a half-configured pair. Both-empty and both-set are valid
+//     and return nil.
+func (k KafkaConfig) ValidateSASLAdminCredentials() error {
+	return ValidateSASLPair("admin", k.SASLAdminUser, k.SASLAdminSecret)
+}
+
+// ValidateSASLPair rejects a half-configured SASL credential.
+//
+// One value without the other is always a mistake and never a mode: a username with
+// no secret cannot complete a SCRAM exchange, and a secret with no username has
+// nobody to present it as. Both used to be tolerated differently by the two Kafka
+// clients — one built a mechanism from whatever it had, the other skipped SASL
+// entirely — so the same misconfiguration produced an authentication failure in one
+// process and a silently unauthenticated connection in the other. Validating in one
+// exported place is what makes the two agree.
+//
+// Both empty is valid and means "no SASL".
+//
+// Parameters:
+//   - role string: "producer" or "admin", used only to name the offending pair in the
+//     error.
+//   - user, secret string: the configured pair. The secret is never echoed.
+//
+// Returns:
+//   - error: non-nil when exactly one of the two is set.
+func ValidateSASLPair(role, user, secret string) error {
+	user = strings.TrimSpace(user)
+	secret = strings.TrimSpace(secret)
+
+	userVar, secretVar := saslEnvNames(role)
+
+	switch {
+	case user == "" && secret == "":
+		return nil
+	case user == "":
+		// The DANGEROUS half. Every component used to ignore a secret with no username and
+		// connect anonymously while looking configured, so this arm is the reason the
+		// function exists rather than an afterthought. The secret is never echoed.
+		return fmt.Errorf(
+			"kafka %s SASL: %s is set but %s is empty; SASL/SCRAM needs both. Without a principal "+
+				"the secret cannot be used and the connection would be anonymous. Set the user, or "+
+				"clear both to reach a broker that has no SASL listener", role, secretVar, userVar,
+		)
+	case secret == "":
+		return fmt.Errorf(
+			"kafka %s SASL: %s is set to %q but %s is empty; SASL/SCRAM needs both. Set the "+
+				"secret, or clear both to reach a broker that has no SASL listener",
+			role, userVar, user, secretVar,
+		)
+	default:
+		return nil
+	}
+}
+
+// saslEnvNames maps a role onto the two environment variables that configure it.
+//
+// The error messages name the VARIABLE an operator has to change, not the struct field or
+// the role, because the variable is the only one of the three they can act on. An unknown
+// role still produces something useful rather than an empty name — the role is a literal at
+// every call site, so an unrecognised one is a programming slip and not an operator's
+// problem to decode.
+//
+// Parameters:
+//   - role string: "producer" or "admin".
+//
+// Returns:
+//   - userVar, secretVar string: the environment variable names.
+func saslEnvNames(role string) (userVar, secretVar string) {
+	if role == "admin" {
+		return "KAFKA_SASL_ADMIN_USER", "KAFKA_SASL_ADMIN_SECRET"
+	}
+
+	return "KAFKA_SASL_USER", "KAFKA_SASL_SECRET"
 }
 
 // normalizeBrokers trims surrounding whitespace from each broker address and drops
@@ -822,3 +1412,12 @@ func logger() {
 		FullTimestamp: true,
 	})
 }
+
+// MaxRelayRetryAttempts is the CEILING on RELAY_MAX_RETRY_ATTEMPTS, not merely its default.
+//
+// It is a ceiling because the attempt number is a METRIC ATTRIBUTE: the publish-duration
+// histogram is attributed by attempt, so every additional attempt the configuration allows is
+// another label value multiplied by the bucket count. AAP R-4 fixes the schedule at five
+// attempts, so five is both the default and the most a deployment may ask for; a larger value
+// is reduced to it with a warning rather than silently honoured.
+const MaxRelayRetryAttempts = 5

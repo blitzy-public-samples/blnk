@@ -19,6 +19,7 @@ package blnk
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -26,12 +27,14 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -42,6 +45,7 @@ import (
 	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/embedded"
 
+	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/internal/metrics"
 	"github.com/blnkfinance/blnk/model"
@@ -192,6 +196,12 @@ var dltAllDeadLetterTopics = []string{
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
 	"blnk.system.dlt",
+	// The quarantine category's sibling. Quarantine holds events whose type the
+	// catalogue does not recognise, and those are exactly the events most likely to
+	// fail to publish, so its dead-letter topic must be covered by the age gauge like
+	// any other — a stalled entry there being invisible would hide the failure of an
+	// event that was already a routing defect.
+	"blnk.quarantine.dlt",
 }
 
 // ---------------------------------------------------------------------------
@@ -206,9 +216,10 @@ var dltAllDeadLetterTopics = []string{
 // bytes spliced into the message are the SAME bytes rather than merely equivalent
 // documents.
 type dltMarkRecord struct {
-	id       int64
-	dltTopic string
-	metadata json.RawMessage
+	id         int64
+	claimToken string
+	dltTopic   string
+	metadata   json.RawMessage
 }
 
 // dltPageRequest is one recorded ListDeadLetteredEvents call.
@@ -252,13 +263,41 @@ type dltFakeStore struct {
 	countErr            error
 	markDeadLetteredErr error
 	markDispatchedErr   error
+	claimReplayErr      error
+	releaseReplayErr    error
 
 	// Recorded calls.
-	deadLettered []dltMarkRecord
-	dispatched   []int64
-	listCalls    []dltPageRequest
-	getCalls     []string
-	countCalls   int
+	deadLettered  []dltMarkRecord
+	dispatched    []dltDispatchRecord
+	listCalls     []dltPageRequest
+	getCalls      []string
+	countCalls    int
+	replayClaims  []string
+	replayRelease []dltReleaseRecord
+
+	// nextClaimToken is the token ClaimEventForReplay hands out. It is a field rather
+	// than a generated value so a test can assert that the token the service presents to
+	// its follow-up transition is EXACTLY the one the claim issued — which is the whole
+	// mechanism, and a generated token would make it unassertable.
+	nextClaimToken string
+}
+
+// dltDispatchRecord is one MarkEventDispatched call, with the token it presented.
+//
+// The token is recorded because a transition that ignored it would be indistinguishable
+// from one that honoured it if only the row id were captured — and ignoring it is exactly
+// the defect the token exists to prevent.
+type dltDispatchRecord struct {
+	id         int64
+	claimToken string
+}
+
+// dltReleaseRecord is one ReleaseEventReplay call: the rollback that keeps a failed
+// replay replayable.
+type dltReleaseRecord struct {
+	id         int64
+	claimToken string
+	replayErr  string
 }
 
 // dltFakeStore must satisfy the seam it stands in for, and must fail the build here if
@@ -381,14 +420,14 @@ func (s *dltFakeStore) CountEventOutboxByStatus(_ context.Context) (map[string]i
 func (s *dltFakeStore) MarkEventDeadLettered(
 	_ context.Context,
 	id int64,
-	dltTopic string,
+	claimToken, dltTopic string,
 	failureMetadata json.RawMessage,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.deadLettered = append(s.deadLettered, dltMarkRecord{
-		id: id, dltTopic: dltTopic, metadata: failureMetadata,
+		id: id, claimToken: claimToken, dltTopic: dltTopic, metadata: failureMetadata,
 	})
 
 	if s.markDeadLetteredErr != nil {
@@ -418,11 +457,11 @@ func (s *dltFakeStore) MarkEventDeadLettered(
 
 // MarkEventDispatched moves the row to dispatched and removes it from the dead-letter
 // inventory, mirroring the repository's status filter.
-func (s *dltFakeStore) MarkEventDispatched(_ context.Context, id int64) error {
+func (s *dltFakeStore) MarkEventDispatched(_ context.Context, id int64, claimToken string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.dispatched = append(s.dispatched, id)
+	s.dispatched = append(s.dispatched, dltDispatchRecord{id: id, claimToken: claimToken})
 
 	if s.markDispatchedErr != nil {
 		return s.markDispatchedErr
@@ -458,6 +497,118 @@ func (s *dltFakeStore) MarkEventDispatched(_ context.Context, id int64) error {
 	return nil
 }
 
+// ClaimEventForReplay is the atomic dead_lettered -> replaying transition, faithful to
+// the repository's discrimination between the two failure causes.
+//
+// It is a CLAIM and not a lookup, and modelling that faithfully in the fake is what lets
+// the concurrency test mean anything: the second claim of one row must fail because the
+// FIRST one moved it, not because the fake was told to fail.
+func (s *dltFakeStore) ClaimEventForReplay(
+	_ context.Context,
+	eventID string,
+	_ time.Duration,
+) (*model.EventOutbox, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.replayClaims = append(s.replayClaims, eventID)
+
+	if s.claimReplayErr != nil {
+		return nil, s.claimReplayErr
+	}
+	// getErr models a database that is unreachable, and the CLAIM is now the first read
+	// a replay performs — so it has to fail the same way GetEventByID would, or a
+	// database outage would be reported as a missing event.
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+
+	row, ok := s.rows[eventID]
+	if !ok {
+		return nil, apierror.NewAPIError(apierror.ErrNotFound, "Event not found", nil)
+	}
+
+	if row.Status != model.EventOutboxStatusDeadLettered {
+		return nil, apierror.NewAPIError(apierror.ErrConflict,
+			fmt.Sprintf("Event is not available for replay: its status is %q", row.Status), nil)
+	}
+
+	token := s.nextClaimToken
+	if token == "" {
+		token = "replay-claim-token"
+	}
+
+	row.Status = model.EventOutboxStatusReplaying
+	row.ClaimToken = token
+
+	// The status count moves with the row, exactly as a real GROUP BY would. Leaving it on
+	// dead_lettered would make the age gauge keep reporting an entry that is no longer in
+	// that state, so the fake's bookkeeping has to be as faithful as the transition itself.
+	if s.counts[model.EventOutboxStatusDeadLettered] > 0 {
+		s.counts[model.EventOutboxStatusDeadLettered]--
+	}
+	s.counts[model.EventOutboxStatusReplaying]++
+
+	claimed := *row
+	return &claimed, nil
+}
+
+// ReleaseEventReplay is the rollback: replaying -> dead_lettered, recording the reason.
+func (s *dltFakeStore) ReleaseEventReplay(_ context.Context, id int64, claimToken, replayErr string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.replayRelease = append(s.replayRelease, dltReleaseRecord{
+		id: id, claimToken: claimToken, replayErr: replayErr,
+	})
+
+	if s.releaseReplayErr != nil {
+		return s.releaseReplayErr
+	}
+
+	for eventID, row := range s.rows {
+		if row.ID != id {
+			continue
+		}
+		previous := row.Status
+		row.Status = model.EventOutboxStatusDeadLettered
+		row.ClaimToken = ""
+		if replayErr != "" {
+			row.LastError = replayErr
+		}
+		if !dltContainsString(s.inventory, eventID) {
+			s.inventory = append([]string{eventID}, s.inventory...)
+		}
+		if s.counts[previous] > 0 {
+			s.counts[previous]--
+		}
+		s.counts[model.EventOutboxStatusDeadLettered]++
+		break
+	}
+
+	return nil
+}
+
+// snapshotReplayClaims returns the event ids ClaimEventForReplay was called with.
+func (s *dltFakeStore) snapshotReplayClaims() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	claims := make([]string, len(s.replayClaims))
+	copy(claims, s.replayClaims)
+	return claims
+}
+
+// snapshotReplayReleases returns the rollback calls, with the tokens they presented.
+func (s *dltFakeStore) snapshotReplayReleases() []dltReleaseRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	releases := make([]dltReleaseRecord, len(s.replayRelease))
+	copy(releases, s.replayRelease)
+	return releases
+}
+
 // row returns a copy of a stored row for assertion.
 func (s *dltFakeStore) row(t *testing.T, eventID string) model.EventOutbox {
 	t.Helper()
@@ -482,13 +633,25 @@ func (s *dltFakeStore) snapshotDeadLettered() []dltMarkRecord {
 	return records
 }
 
-// snapshotDispatched returns a copy of the recorded MarkEventDispatched ids.
-func (s *dltFakeStore) snapshotDispatched() []int64 {
+// snapshotDispatched returns a copy of the recorded MarkEventDispatched calls, each with
+// the claim token it presented.
+func (s *dltFakeStore) snapshotDispatched() []dltDispatchRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ids := make([]int64, len(s.dispatched))
-	copy(ids, s.dispatched)
+	records := make([]dltDispatchRecord, len(s.dispatched))
+	copy(records, s.dispatched)
+
+	return records
+}
+
+// snapshotDispatchedIDs projects just the row ids, for assertions that are about WHICH
+// rows were dispatched rather than about the tokens.
+func (s *dltFakeStore) snapshotDispatchedIDs() []int64 {
+	ids := make([]int64, 0, len(s.dispatched))
+	for _, record := range s.snapshotDispatched() {
+		ids = append(ids, record.id)
+	}
 
 	return ids
 }
@@ -1216,12 +1379,22 @@ func TestDeadLetterRouting_LeavesADeadLetteredRowOutsideTheRelayClaimSet(t *test
 	require.NotEqual(t, -1, claimEnd, "the claim query must be followed by its method documentation")
 	claimQuery := source[claimStart : claimStart+claimEnd]
 
-	assert.Contains(t, claimQuery, "status IN ('pending', 'processing')",
+	// The SQL body only, not the surrounding documentation. The doc comment now
+	// discusses the dead-lettered state at length — explaining why a dead-lettered row
+	// does not block its partition key forever — and asserting over the comment text
+	// would fail on prose rather than on behaviour.
+	sqlStart := strings.Index(claimQuery, "`")
+	require.NotEqual(t, -1, sqlStart, "the claim query constant must have a raw string body")
+	claimSQL := claimQuery[sqlStart:]
+
+	assert.Contains(t, claimSQL, "status IN ('pending', 'processing')",
 		"the claim must restrict to the two claimable statuses, which excludes dead_lettered")
-	assert.Contains(t, claimQuery, "attempts < max_attempts",
+	assert.Contains(t, claimSQL, "candidate.attempts < candidate.max_attempts",
 		"the claim must exclude a row that has spent its retry budget")
-	assert.NotContains(t, claimQuery, model.EventOutboxStatusDeadLettered,
+	assert.NotContains(t, claimSQL, model.EventOutboxStatusDeadLettered,
 		"the claim query must never name the dead-lettered status")
+	assert.NotContains(t, claimSQL, model.EventOutboxStatusReplaying,
+		"nor the replaying status: a row a replay holds is not the relay's to publish")
 
 	// The state vocabulary itself has to keep the two apart, or the SQL above would be
 	// filtering on the wrong literal.
@@ -1248,13 +1421,23 @@ func TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow(t *testing.T) {
 		declared = append(declared, seam.Method(i).Name)
 	}
 
+	// Seven methods now, and the two additions are the replay CLAIM and its rollback.
+	// They are not "claim methods" in the relay's sense — neither can take a pending row
+	// or take part in publishing new events. ClaimEventForReplay moves a row that is
+	// ALREADY dead-lettered into replaying, which is what makes a replay atomic instead
+	// of a read followed by a check that two concurrent requests could both pass.
 	assert.ElementsMatch(t, []string{
 		"GetEventByID",
 		"ListDeadLetteredEvents",
 		"CountEventOutboxByStatus",
 		"MarkEventDeadLettered",
 		"MarkEventDispatched",
-	}, declared, "the dead-letter store seam must expose exactly these five methods")
+		"ClaimEventForReplay",
+		"ReleaseEventReplay",
+	}, declared, "the dead-letter store seam must expose exactly these seven methods")
+
+	assert.NotContains(t, declared, "ClaimPendingEventOutbox",
+		"the dead-letter surface must not be able to claim a PENDING row: that is the relay's job, and a surface that could do it could take part in publishing new events")
 
 	for _, forbidden := range []string{
 		"MarkEventFailed",
@@ -1286,17 +1469,24 @@ func TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow(t *testing.T) {
 		"the row's own attempts counter must be untouched by dead-lettering")
 }
 
-// TestDeadLetterRouting_RecordsTheEventWhenNoBrokerIsConfigured covers the degradation that
-// every Kafka-less deployment depends on.
+// TestDeadLetterRouting_RefusesToRecordADeadLetterWithoutABroker is the DLT-01 guard.
 //
-// A deployment with no brokers is a legitimate steady state — it reproduces the legacy
-// webhook sender's no-op-when-unconfigured contract. An exhausted event must not vanish from
-// the operator's view because a sink was never configured, so the message is still composed
-// and the row is still recorded, with Published false and NO error.
+// This test used to assert the opposite, and the behaviour it asserted lost events. With no
+// transport the service returned success, the caller marked the row dead_lettered, and the
+// dead-letter counter was incremented — while nothing had been written anywhere. The row's
+// only copy of the event was the row itself, dead_lettered is terminal so the relay would
+// never claim it again, and both the row and the metric reported the event as safely
+// preserved. Every signal an operator could read said the event was on a dead-letter topic;
+// none of them was true.
+//
+// The contract now: no broker means NO DEAD-LETTERING. An error is returned, the row is left
+// exactly as the caller had it — non-terminal, still in the inventory, still completable once
+// a transport exists — and nothing is counted. The composed message is still returned on the
+// partial outcome, so a caller can show what would have been written.
 //
 // The transport is the REAL production resolver wrapped around the REAL no-op publisher, so
 // this asserts the wiring rather than a fake's imitation of it.
-func TestDeadLetterRouting_RecordsTheEventWhenNoBrokerIsConfigured(t *testing.T) {
+func TestDeadLetterRouting_RefusesToRecordADeadLetterWithoutABroker(t *testing.T) {
 	dltPinTopicPrefix(t)
 
 	row := dltExhaustedRow("evt_no_broker", "balance.created", "blnk.balances")
@@ -1310,15 +1500,59 @@ func TestDeadLetterRouting_RecordsTheEventWhenNoBrokerIsConfigured(t *testing.T)
 	counter := dltCaptureDeadLetterCounter(t)
 
 	outcome, err := service.DeadLetter(context.Background(), row, errors.New("no sink"))
-	require.NoError(t, err, "an unconfigured deployment must not turn a dead-letter into an error")
+	dltAssertCodeAndStatus(t, err, apierror.ErrKafkaUnavailable, http.StatusServiceUnavailable)
 
 	assert.False(t, outcome.Published, "nothing can have been published without a broker")
-	assert.Equal(t, "blnk.balances.dlt", outcome.DeadLetterTopic)
+	assert.Equal(t, "blnk.balances.dlt", outcome.DeadLetterTopic,
+		"the resolved destination is still reported, so the failure names where the message was bound for")
 	assert.NotEmpty(t, outcome.Message,
 		"the message must still be composed so an operator can be shown what would have been written")
-	assert.Len(t, store.snapshotDeadLettered(), 1, "the row must still be recorded")
-	assert.Equal(t, int64(1), counter.total(),
-		"a completed dead-lettering is counted whether or not a broker took the message")
+
+	assert.Empty(t, store.snapshotDeadLettered(),
+		"a row must not be recorded as dead-lettered when no dead-letter message exists")
+	assert.Equal(t, model.EventOutboxStatusFailed, store.row(t, row.EventID).Status,
+		"the row keeps the non-terminal status the caller gave it, so it stays visible and completable")
+	assert.Zero(t, counter.total(),
+		"the dead-letter counter must not claim a dead-lettering that did not happen")
+}
+
+// TestDeadLetterRouting_RefusesToRecordADeadLetterWhenConfigurationCannotBeRead is the second
+// half of the DLT-01 guard, and it covers the more dangerous of the two paths.
+//
+// "No brokers configured" is at least an observed fact. "Configuration could not be read" is
+// an UNKNOWN, and it used to be silently downgraded to the first: a transient configuration
+// failure in a deployment that runs Kafka every day produced a row marked dead_lettered, a
+// counter increment, and no message. The event was gone, in a deployment where a broker was
+// sitting there ready to take it.
+//
+// It now fails, for the same reason and with the same consequences as the no-broker case.
+func TestDeadLetterRouting_RefusesToRecordADeadLetterWhenConfigurationCannotBeRead(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	row := dltExhaustedRow("evt_no_config", "identity.created", "blnk.identities")
+	store := newDltFakeStore().withRow(row)
+
+	// No injected transport, so the service resolves one from configuration — and the seam
+	// reports that configuration is unavailable.
+	service := NewEventDeadLetterService(store, nil)
+	service.now = func() time.Time { return dltFixedNow }
+
+	original := fetchConfiguration
+	t.Cleanup(func() { fetchConfiguration = original })
+	fetchConfiguration = func() (*config.Configuration, error) {
+		return nil, errors.New("configuration store is unavailable")
+	}
+
+	counter := dltCaptureDeadLetterCounter(t)
+
+	outcome, err := service.DeadLetter(context.Background(), row, errors.New("exhausted"))
+	dltAssertCodeAndStatus(t, err, apierror.ErrKafkaUnavailable, http.StatusServiceUnavailable)
+
+	assert.False(t, outcome.Published)
+	assert.Empty(t, store.snapshotDeadLettered(),
+		"an unreadable configuration must not be treated as a deployment without Kafka")
+	assert.Equal(t, model.EventOutboxStatusFailed, store.row(t, row.EventID).Status)
+	assert.Zero(t, counter.total())
 }
 
 // TestDeadLetterRouting_RefusesAPublisherItCannotComposeAMessageFor covers the third arm of
@@ -2212,8 +2446,11 @@ func TestReplayDeadLetteredEvent_MovesTheRowToDispatchedAndClearsTheInventory(t 
 	require.NoError(t, err)
 
 	assert.True(t, outcome.Recorded, "the bookkeeping must be reported as done")
-	assert.Equal(t, []int64{fixture.row.ID}, fixture.store.snapshotDispatched(),
-		"the row must be moved on with MarkEventDispatched, exactly once")
+	dispatched := fixture.store.snapshotDispatched()
+	require.Len(t, dispatched, 1, "the row must be moved on with MarkEventDispatched, exactly once")
+	assert.Equal(t, fixture.row.ID, dispatched[0].id)
+	assert.Equal(t, "replay-claim-token", dispatched[0].claimToken,
+		"the transition must present the token the replay CLAIM issued; without it a concurrent replay could complete over the top of this one")
 	assert.Equal(t, dltFixedNow, outcome.ReplayedAt)
 
 	stored := fixture.store.row(t, fixture.row.EventID)
@@ -2254,11 +2491,11 @@ func TestReplayDeadLetteredEvent_RefusesASecondReplay(t *testing.T) {
 
 	apiErr := dltAPIError(t, err)
 	assert.Equal(t, "This event has already been replayed and cannot be replayed again", apiErr.Message,
-		"the message must name the already-replayed case rather than only the state")
+		"the message must name the already-replayed case rather than only the state: an operator told merely \"not dead-lettered\" goes looking for the wrong problem")
 
 	assert.Len(t, fixture.publisher.snapshotRequests(), 1,
 		"a refused second replay must NOT publish the event again")
-	assert.Equal(t, []int64{fixture.row.ID}, fixture.store.snapshotDispatched(),
+	assert.Equal(t, []int64{fixture.row.ID}, fixture.store.snapshotDispatchedIDs(),
 		"and must not repeat the bookkeeping either")
 }
 
@@ -2415,24 +2652,101 @@ func TestReplayDeadLetteredEvent_RejectsAMissingEvent(t *testing.T) {
 // TestReplayDeadLetteredEvent_ReportsAFailedRepublish covers the publish-failure arm.
 //
 // The publisher's own error is wrapped in ErrEventReplayFailed rather than surfaced raw, so the
-// endpoint has one code to document, and the underlying cause stays reachable in the details for
-// an operator reading the log.
+// endpoint has one code to document.
+//
+// # DATA-01: what the caller receives, and what it must not
+//
+// This test used to require the opposite of what it now requires: that the broker's own error
+// text stay reachable in the API error's Details. That text is produced by the Kafka client,
+// so it routinely carries the broker's address and port ("write tcp 10.0.0.4:9092: broken
+// pipe") and its protocol state, and Details is serialised into the response body. An endpoint
+// reporting that one event failed to republish was therefore also publishing the deployment's
+// internal broker topology.
+//
+// The detail is now a bounded EventTransportErrorDetail: a fixed reason, the caller's own
+// event identifiers, the topic, and the transient classification — which is the one part a
+// caller can act on. The cause is not lost, it is redirected: it is logged with the error
+// attached at the failure site, which is where an operator reads it.
 func TestReplayDeadLetteredEvent_ReportsAFailedRepublish(t *testing.T) {
 	dltPinTopicPrefix(t)
 
 	fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
-	fixture.publisher.err = errors.New("[6] Not Leader For Partition")
+	fixture.publisher.err = errors.New("write tcp 10.0.0.4:9092: [6] Not Leader For Partition")
 
 	outcome, err := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
 	dltAssertCodeAndStatus(t, err, apierror.ErrEventReplayFailed, http.StatusInternalServerError)
 
-	assert.Contains(t, fmt.Sprint(dltAPIError(t, err).Details), "Not Leader For Partition",
-		"the underlying broker error must stay reachable for triage")
+	detail, ok := dltAPIError(t, err).Details.(EventTransportErrorDetail)
+	require.True(t, ok, "a transport failure must carry the bounded detail type, got %T",
+		dltAPIError(t, err).Details)
+	assert.Equal(t, "the Kafka broker did not acknowledge the replayed message", detail.Reason)
+	assert.Equal(t, fixture.row.EventID, detail.EventID, "the caller's own correlation handle is returned")
+	assert.Equal(t, "transaction.applied", detail.EventType)
+	assert.Equal(t, "blnk.transactions", detail.Topic)
+
+	// Rendered every way a handler might render it, none of which may contain the broker.
+	rendered := fmt.Sprint(detail)
+	marshalled, marshalErr := json.Marshal(dltAPIError(t, err))
+	require.NoError(t, marshalErr)
+	for _, leak := range []string{"10.0.0.4", "9092", "Not Leader For Partition", "broken pipe"} {
+		assert.NotContains(t, rendered, leak,
+			"the broker's own error text must not reach a caller through %%v")
+		assert.NotContains(t, string(marshalled), leak,
+			"the broker's own error text must not reach a caller through the response body")
+	}
+
 	assert.False(t, outcome.Recorded)
 	assert.Empty(t, fixture.store.snapshotDispatched(),
 		"a failed republish must not clear the row from the inventory")
 	assert.Equal(t, model.EventOutboxStatusDeadLettered, fixture.store.row(t, fixture.row.EventID).Status,
 		"the event stays dead-lettered so it can be replayed again once the broker recovers")
+}
+
+// TestWriteDeadLetterMessage_DoesNotLeakTheBrokerToTheCaller is the dead-letter half of the
+// same DATA-01 boundary.
+//
+// The dead-letter write is the other place a Kafka client error becomes an API error, and it
+// is reached by the operator-facing path as well as by the relay, so it gets the same
+// treatment and the same guard.
+func TestWriteDeadLetterMessage_DoesNotLeakTheBrokerToTheCaller(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	row := dltExhaustedRow("evt_broker_detail", "balance.created", "blnk.balances")
+	store := newDltFakeStore().withRow(row)
+
+	transport := &dltFakeTransport{
+		// The exact shape a refused dial produces: a *net.OpError whose exported Addr
+		// field carries the broker's address, wrapping the syscall error the transient
+		// classifier recognises.
+		writeErr: &net.OpError{
+			Op:   "dial",
+			Net:  "tcp",
+			Addr: &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 9092},
+			Err:  syscall.ECONNREFUSED,
+		},
+	}
+	service := dltNewService(store, &dltFakePublisher{}, transport)
+
+	outcome, err := service.DeadLetter(context.Background(), row, errors.New("exhausted"))
+	dltAssertCodeAndStatus(t, err, apierror.ErrKafkaUnavailable, http.StatusServiceUnavailable)
+	assert.False(t, outcome.Published)
+
+	detail, ok := dltAPIError(t, err).Details.(EventTransportErrorDetail)
+	require.True(t, ok, "a transport failure must carry the bounded detail type, got %T",
+		dltAPIError(t, err).Details)
+	assert.Equal(t, "the Kafka broker did not acknowledge the dead-letter message", detail.Reason)
+	assert.True(t, detail.Transient,
+		"a refused connection is recoverable, and that classification is the actionable part")
+
+	marshalled, marshalErr := json.Marshal(dltAPIError(t, err))
+	require.NoError(t, marshalErr)
+	for _, leak := range []string{"10.9.8.7", "9092", "connection refused", "dial"} {
+		assert.NotContains(t, string(marshalled), leak,
+			"a *net.OpError must not be serialised into the response body")
+	}
+
+	assert.Empty(t, store.snapshotDeadLettered(),
+		"a refused write leaves the row non-terminal, exactly as the no-broker case does")
 }
 
 // TestReplayDeadLetteredEvent_RefusesToReplayWithoutABroker covers the deliberate asymmetry
@@ -2777,6 +3091,111 @@ func TestDeadLetterAgeGauge_FallsBackToZeroWhenTheInventoryDrains(t *testing.T) 
 		assert.Zero(t, after.Outstanding)
 		assert.InDelta(t, 0.0, drained.byTopic()["blnk.transactions.dlt"], 0.0001,
 			"once the last entry is replayed the gauge must read zero, or the alert never clears")
+	})
+}
+
+// TestReplayDeadLetteredEvent_ClaimsTheRowSoConcurrentReplaysCannotBothPublish is the
+// STATE-01 proof on the replay path.
+//
+// # The defect this guards against
+//
+// A replay used to be a READ followed by a CHECK followed by a PUBLISH: fetch the row,
+// confirm it is dead-lettered, publish. Two requests for one event could both read a
+// dead_lettered row, both pass the check, and both publish — so an operator
+// double-clicking, or two operators working the same dead-letter backlog, put two copies
+// of the event on the topic. Because a replay re-publishes the STORED bytes, those copies
+// are byte-identical, so a subscriber deduplicating on event_id discards one; but the
+// duplicate is real, it occupies a partition slot, and leaning on consumer behaviour to
+// paper over a publishing-side defect is not a guarantee.
+//
+// # What is asserted
+//
+// The precondition now lives INSIDE the transition. Exactly one of two sequential replays
+// claims the row, so exactly one publishes; the second is refused before reaching the
+// publisher. The claim is asserted to have been attempted twice — proving the second
+// request really did try — while the publisher saw one message.
+func TestReplayDeadLetteredEvent_ClaimsTheRowSoConcurrentReplaysCannotBothPublish(t *testing.T) {
+	fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
+	fixture.store.nextClaimToken = "the-only-valid-token"
+
+	first, err := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
+	require.NoError(t, err, "the first replay must succeed")
+	assert.True(t, first.Recorded)
+
+	// The row is dispatched now, so a second request cannot claim it. That refusal is the
+	// mechanism: the check is the transition, not a separate read.
+	_, err = fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
+	dltAssertCodeAndStatus(t, err, apierror.ErrEventNotDeadLettered, http.StatusConflict)
+
+	assert.Len(t, fixture.store.snapshotReplayClaims(), 2,
+		"BOTH requests must have attempted the claim; if only one did, this test proves nothing about the second being refused")
+	assert.Len(t, fixture.publisher.snapshotRequests(), 1,
+		"only the request that WON the claim may publish; two publishes here is the duplicate the claim exists to prevent")
+
+	dispatched := fixture.store.snapshotDispatched()
+	require.Len(t, dispatched, 1, "only the winning request may record a terminal state")
+	assert.Equal(t, "the-only-valid-token", dispatched[0].claimToken,
+		"the winner must present the token ITS claim issued, or the conditional update is not conditional on anything")
+
+	assert.Empty(t, fixture.store.snapshotReplayReleases(),
+		"a successful replay reaches dispatched and must not release the claim back to dead_lettered")
+}
+
+// TestReplayDeadLetteredEvent_ReleasesTheClaimWhenTheReplayFails is the other half of the
+// replay claim, and without it the claim would be a trap rather than a fix.
+//
+// A claimed row sits in the replaying state, which is outside BOTH the relay's claimable
+// set and the dead-letter inventory. So a replay that claims a row and then fails to
+// publish would strand the event where nothing at all would pick it up again — the fix for
+// duplication would have introduced a way to lose an event's replayability entirely.
+//
+// Every exit path from a claimed row must therefore end in either a terminal transition or
+// a release. Both failure shapes are covered: the publish failing, and the bookkeeping
+// failing after a successful publish.
+func TestReplayDeadLetteredEvent_ReleasesTheClaimWhenTheReplayFails(t *testing.T) {
+	t.Run("a failed publish returns the row to dead_lettered", func(t *testing.T) {
+		fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
+		fixture.store.nextClaimToken = "claim-then-fail"
+		fixture.publisher.err = errors.New("broker refused the replay")
+
+		_, err := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
+		dltAssertCodeAndStatus(t, err, apierror.ErrEventReplayFailed, http.StatusInternalServerError)
+
+		releases := fixture.store.snapshotReplayReleases()
+		require.Len(t, releases, 1, "a failed replay must release its claim, or the row is stranded in replaying")
+		assert.Equal(t, fixture.row.ID, releases[0].id)
+		assert.Equal(t, "claim-then-fail", releases[0].claimToken,
+			"the release must present the claim's own token")
+		assert.Contains(t, releases[0].replayErr, "broker refused the replay",
+			"the reason must be recorded so the next operator sees why the replay failed rather than only the original publish failure")
+
+		assert.Equal(t, model.EventOutboxStatusDeadLettered,
+			fixture.store.row(t, fixture.row.EventID).Status,
+			"the row must be dead-lettered again, which is what keeps it replayable")
+
+		// And it really is replayable again — the property the rollback exists for.
+		fixture.publisher.err = nil
+		_, retryErr := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
+		require.NoError(t, retryErr, "a released row must be replayable again")
+	})
+
+	t.Run("a published event whose bookkeeping fails is still returned to the inventory", func(t *testing.T) {
+		fixture := dltNewReplayFixture(t, "balance.created", "blnk.balances", "")
+		fixture.store.nextClaimToken = "claim-then-mark-fails"
+		fixture.store.markDispatchedErr = errors.New("connection reset")
+
+		_, err := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
+		dltAssertCodeAndStatus(t, err, apierror.ErrEventReplayFailed, http.StatusInternalServerError)
+
+		assert.Len(t, fixture.publisher.snapshotRequests(), 1,
+			"the event WAS republished; only the bookkeeping failed")
+
+		releases := fixture.store.snapshotReplayReleases()
+		require.Len(t, releases, 1,
+			"the row must go back to dead_lettered rather than stay in replaying: the operator has been told it did not clear, so it has to be somewhere they can see it")
+		assert.Equal(t, "claim-then-mark-fails", releases[0].claimToken)
+		assert.Equal(t, model.EventOutboxStatusDeadLettered,
+			fixture.store.row(t, fixture.row.EventID).Status)
 	})
 }
 
@@ -3251,5 +3670,575 @@ func TestEventDeadLetterSource_BuildsNoConsumerSurface(t *testing.T) {
 		assert.True(t, IsDeadLetterTopic(topic))
 		assert.Equal(t, topic, DLTFor(topic),
 			"DLTFor must be idempotent so a name can never become %s.dlt", topic)
+	}
+}
+
+// ---------------------------------------------------------------------------------------
+// Kafka transport policy — CRYPTO-01 and PRIV-01
+//
+// These tests cover NewKafkaTransport, which is the security boundary BOTH Kafka clients
+// dial through: the producer that publishes ledger events, and the administrative client
+// that mints credentials. Two decisions live there and nowhere else — whether the connection
+// is encrypted, and which principal it authenticates as.
+//
+// They live in this file rather than beside the publisher because event_publisher_test.go
+// belongs to a later checkpoint and is not in this scope, while the dead-letter path is an
+// in-scope consumer of exactly this transport: every dead-letter write and every replay goes
+// over it. Placing the guards here keeps them running now instead of waiting for a file
+// another author owns.
+//
+// Nothing here performs I/O. Building a transport reads TLS material from disk and prepares a
+// SCRAM mechanism, both local, so every case below is decided before a socket would open —
+// which is the point: a misconfiguration must be refused at construction, not discovered on
+// the first publish hours later.
+// ---------------------------------------------------------------------------------------
+
+// kafkaTransportConfig builds a Kafka configuration with a valid producer credential pair and
+// TLS explicitly disabled-with-acknowledgement, which is the local development posture.
+//
+// Each test then changes the ONE field it is about, so a failure names the field rather than
+// leaving the reader to diff two literals.
+func kafkaTransportConfig() config.KafkaConfig {
+	return config.KafkaConfig{
+		Brokers:          []string{"localhost:9092"},
+		TopicPrefix:      DefaultTopicPrefix,
+		SASLUser:         "blnk-producer",
+		SASLSecret:       "producer-secret",
+		InsecureLocalDev: true,
+	}
+}
+
+// TestNewKafkaTransport_RefusesPlaintextUnlessLocalDevIsAcknowledged is the CRYPTO-01 guard.
+//
+// SASL/SCRAM authenticates the client to the broker. It does not encrypt the connection and it
+// does not authenticate the broker to the client, so over SASL_PLAINTEXT the SCRAM exchange and
+// every produce request travel in the clear — including identity events carrying names, email
+// addresses, phone numbers, postal addresses and dates of birth.
+//
+// The transport therefore refuses to dial without TLS unless an operator has explicitly said
+// this is a local development broker. The refusal is what makes plaintext an opt-in rather than
+// the accident of an unset variable: a deployment that simply never set KAFKA_TLS_ENABLED fails
+// at construction instead of silently shipping ledger data unencrypted.
+func TestNewKafkaTransport_RefusesPlaintextUnlessLocalDevIsAcknowledged(t *testing.T) {
+	cfg := kafkaTransportConfig()
+	cfg.InsecureLocalDev = false
+
+	for _, role := range []KafkaTransportRole{KafkaTransportRoleProducer, KafkaTransportRoleAdmin} {
+		roleCfg := cfg
+		if role == KafkaTransportRoleAdmin {
+			roleCfg.SASLAdminUser, roleCfg.SASLAdminSecret = "blnk-admin", "admin-secret"
+		}
+
+		transport, err := NewKafkaTransport(roleCfg, role)
+		require.Error(t, err, "the %s transport must refuse to dial in the clear", role)
+		assert.Nil(t, transport)
+		assert.Contains(t, err.Error(), "KAFKA_TLS_ENABLED",
+			"the refusal must name the variable that turns encryption on")
+		assert.Contains(t, err.Error(), "KAFKA_INSECURE_LOCAL_DEV",
+			"and the variable that acknowledges a local broker, so the operator has both choices")
+	}
+}
+
+// TestNewKafkaTransport_AcceptsAcknowledgedPlaintextForTheLocalStack covers the one supported
+// route to an unencrypted connection.
+//
+// The local single-broker KRaft stack listens on SASL_PLAINTEXT and only on that, so the escape
+// hatch has to exist. It is deliberately named for what it is, and a nil TLS configuration is
+// what makes kafka-go dial in the clear — asserted here so the acknowledgement is proven to
+// have an effect rather than merely being accepted.
+func TestNewKafkaTransport_AcceptsAcknowledgedPlaintextForTheLocalStack(t *testing.T) {
+	transport, err := NewKafkaTransport(kafkaTransportConfig(), KafkaTransportRoleProducer)
+	require.NoError(t, err)
+	require.NotNil(t, transport)
+
+	assert.Nil(t, transport.TLS, "an acknowledged local broker dials without TLS")
+	assert.NotNil(t, transport.SASL, "it is still authenticated, which is a separate concern from encryption")
+}
+
+// TestNewKafkaTransport_BuildsAVerifiedTLSConfiguration covers the production posture.
+//
+// Three properties are asserted because each one is separately capable of being wrong while the
+// connection still appears to work: the protocol floor, the server name used for verification,
+// and that verification is on.
+func TestNewKafkaTransport_BuildsAVerifiedTLSConfiguration(t *testing.T) {
+	cfg := kafkaTransportConfig()
+	cfg.InsecureLocalDev = false
+	cfg.TLS = config.KafkaTLSConfig{Enabled: true, ServerName: "kafka.internal"}
+
+	transport, err := NewKafkaTransport(cfg, KafkaTransportRoleProducer)
+	require.NoError(t, err)
+	require.NotNil(t, transport.TLS)
+
+	assert.Equal(t, uint16(tls.VersionTLS12), transport.TLS.MinVersion,
+		"TLS 1.2 is the floor; anything earlier has known weaknesses")
+	assert.Equal(t, "kafka.internal", transport.TLS.ServerName,
+		"the verified name must be the configured one, which is what makes an address that does not match the certificate usable")
+	assert.False(t, transport.TLS.InsecureSkipVerify, "verification must be on by default")
+}
+
+// TestNewKafkaTransport_RefusesToSkipVerificationOutsideLocalDev covers the subtler half of
+// CRYPTO-01.
+//
+// TLS with verification disabled still encrypts, so it looks like a working secure deployment.
+// It stops a passive reader and does nothing whatsoever about an active one: an interposed
+// broker is indistinguishable from the real one, and it collects the SCRAM handshake. A
+// deployment that set this would believe it had a protection it does not have, which is why it
+// is refused rather than warned about.
+func TestNewKafkaTransport_RefusesToSkipVerificationOutsideLocalDev(t *testing.T) {
+	cfg := kafkaTransportConfig()
+	cfg.InsecureLocalDev = false
+	cfg.TLS = config.KafkaTLSConfig{Enabled: true, InsecureSkipVerify: true}
+
+	transport, err := NewKafkaTransport(cfg, KafkaTransportRoleProducer)
+	require.Error(t, err)
+	assert.Nil(t, transport)
+	assert.Contains(t, err.Error(), "KAFKA_TLS_INSECURE_SKIP_VERIFY")
+}
+
+// TestNewKafkaTransport_RefusesAnUnusableCertificateAuthorityFile covers the trust-pool trap.
+//
+// An empty x509.CertPool is not an empty trust decision: with no certificates appended, the TLS
+// stack falls back to the SYSTEM roots, so a CA file that parsed to nothing would silently widen
+// trust from "the one authority this deployment issued its broker certificate from" to "every
+// authority the host trusts". The failure has to be at load time, because afterwards it is
+// indistinguishable from a correct configuration.
+func TestNewKafkaTransport_RefusesAnUnusableCertificateAuthorityFile(t *testing.T) {
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	require.NoError(t, os.WriteFile(caPath, []byte("this is not a certificate\n"), 0o600))
+
+	cfg := kafkaTransportConfig()
+	cfg.InsecureLocalDev = false
+	cfg.TLS = config.KafkaTLSConfig{Enabled: true, CAFile: caPath}
+
+	transport, err := NewKafkaTransport(cfg, KafkaTransportRoleProducer)
+	require.Error(t, err)
+	assert.Nil(t, transport)
+	assert.Contains(t, err.Error(), "no usable PEM certificate")
+	assert.Contains(t, err.Error(), "system roots",
+		"the message must say what the silent fallback would have been")
+}
+
+// TestNewKafkaTransport_RefusesAMissingCertificateAuthorityFile keeps an unreadable path from
+// being treated as "no CA configured".
+func TestNewKafkaTransport_RefusesAMissingCertificateAuthorityFile(t *testing.T) {
+	cfg := kafkaTransportConfig()
+	cfg.InsecureLocalDev = false
+	cfg.TLS = config.KafkaTLSConfig{
+		Enabled: true,
+		CAFile:  filepath.Join(t.TempDir(), "absent.pem"),
+	}
+
+	transport, err := NewKafkaTransport(cfg, KafkaTransportRoleProducer)
+	require.Error(t, err)
+	assert.Nil(t, transport)
+	assert.Contains(t, err.Error(), "KAFKA_TLS_CA_FILE")
+}
+
+// TestNewKafkaTransport_RefusesHalfAClientCertificate covers mutual TLS.
+//
+// A certificate without its key, or a key without its certificate, does not produce weaker
+// mutual TLS — it produces NO mutual TLS, silently, while the operator believes the broker is
+// authenticating them. Both orderings are tested because a check written for one field is easy
+// to write in a way that misses the other.
+func TestNewKafkaTransport_RefusesHalfAClientCertificate(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "client.pem")
+	keyPath := filepath.Join(dir, "client.key")
+	require.NoError(t, os.WriteFile(certPath, []byte("cert"), 0o600))
+	require.NoError(t, os.WriteFile(keyPath, []byte("key"), 0o600))
+
+	for name, tlsCfg := range map[string]config.KafkaTLSConfig{
+		"certificate without key": {Enabled: true, CertFile: certPath},
+		"key without certificate": {Enabled: true, KeyFile: keyPath},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := kafkaTransportConfig()
+			cfg.InsecureLocalDev = false
+			cfg.TLS = tlsCfg
+
+			transport, err := NewKafkaTransport(cfg, KafkaTransportRoleProducer)
+			require.Error(t, err)
+			assert.Nil(t, transport)
+			assert.Contains(t, err.Error(), "must be set together")
+		})
+	}
+}
+
+// TestKafkaTransportCredentials_ProducerPrefersItsOwnPrincipal is the PRIV-01 guard.
+//
+// The producer used to authenticate as KAFKA_SASL_ADMIN_USER — the principal that creates
+// topics, alters SCRAM credentials and manages ACLs. Every ledger event was published by the
+// most privileged identity in the deployment, so a leaked producer credential handed an
+// attacker the cluster's authorization state rather than the ability to publish, and the
+// broker's audit trail could not tell routine publishing from administration.
+//
+// The dedicated pair must win whenever it is set, even with admin credentials also present —
+// which is the realistic case, since the same process configuration often carries both.
+func TestKafkaTransportCredentials_ProducerPrefersItsOwnPrincipal(t *testing.T) {
+	cfg := kafkaTransportConfig()
+	cfg.SASLAdminUser, cfg.SASLAdminSecret = "blnk-admin", "admin-secret"
+
+	user, secret, err := kafkaTransportCredentials(cfg, KafkaTransportRoleProducer)
+	require.NoError(t, err)
+	assert.Equal(t, "blnk-producer", user, "the producer must not authenticate as the administrator")
+	assert.Equal(t, "producer-secret", secret)
+
+	adminUser, adminSecret, err := kafkaTransportCredentials(cfg, KafkaTransportRoleAdmin)
+	require.NoError(t, err)
+	assert.Equal(t, "blnk-admin", adminUser, "the admin role still resolves the admin principal")
+	assert.Equal(t, "admin-secret", adminSecret)
+}
+
+// TestKafkaTransportCredentials_FallsBackToTheAdminPrincipalOnlyWhenNoProducerExists covers the
+// compatibility path.
+//
+// It exists for one reason: an existing single-credential deployment must keep publishing across
+// an upgrade rather than stop dead. It is retained deliberately and it is not silent — the
+// fallback warns, naming the variables to set — because a silent compatibility path is how a
+// temporary allowance becomes the permanent configuration.
+func TestKafkaTransportCredentials_FallsBackToTheAdminPrincipalOnlyWhenNoProducerExists(t *testing.T) {
+	cfg := kafkaTransportConfig()
+	cfg.SASLUser, cfg.SASLSecret = "", ""
+	cfg.SASLAdminUser, cfg.SASLAdminSecret = "blnk-admin", "admin-secret"
+
+	user, secret, err := kafkaTransportCredentials(cfg, KafkaTransportRoleProducer)
+	require.NoError(t, err)
+	assert.Equal(t, "blnk-admin", user)
+	assert.Equal(t, "admin-secret", secret)
+}
+
+// TestKafkaTransportCredentials_RefusesAHalfConfiguredPair covers both roles.
+//
+// A username with no secret cannot authenticate, and neither can a secret with no username. The
+// refusal happens at construction so the operator learns about it at startup rather than through
+// an authentication failure on the first publish, in a log nobody is watching, hours later.
+func TestKafkaTransportCredentials_RefusesAHalfConfiguredPair(t *testing.T) {
+	t.Run("producer user without secret", func(t *testing.T) {
+		cfg := kafkaTransportConfig()
+		cfg.SASLSecret = ""
+
+		_, _, err := kafkaTransportCredentials(cfg, KafkaTransportRoleProducer)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "producer")
+	})
+
+	t.Run("producer secret without user", func(t *testing.T) {
+		cfg := kafkaTransportConfig()
+		cfg.SASLUser = ""
+
+		_, _, err := kafkaTransportCredentials(cfg, KafkaTransportRoleProducer)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "producer")
+	})
+
+	t.Run("admin secret without user", func(t *testing.T) {
+		cfg := kafkaTransportConfig()
+		cfg.SASLAdminSecret = "admin-secret"
+
+		_, _, err := kafkaTransportCredentials(cfg, KafkaTransportRoleAdmin)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "admin")
+	})
+
+	t.Run("a producer fallback inherits the admin pair's validation", func(t *testing.T) {
+		cfg := kafkaTransportConfig()
+		cfg.SASLUser, cfg.SASLSecret = "", ""
+		cfg.SASLAdminUser = "blnk-admin"
+
+		_, _, err := kafkaTransportCredentials(cfg, KafkaTransportRoleProducer)
+		require.Error(t, err,
+			"falling back must not bypass the check the admin role would have applied")
+		assert.Contains(t, err.Error(), "admin")
+	})
+}
+
+// TestKafkaTransportCredentials_NoCredentialsIsNotAnError covers the unauthenticated local
+// broker.
+//
+// Both values empty is a legitimate configuration — an unauthenticated development broker — and
+// it is distinguishable from a half-configured pair, which is not. The transport reports the
+// combination of unauthenticated AND unencrypted with a warning rather than an error, because
+// the local-dev acknowledgement has already been given for the encryption half.
+func TestKafkaTransportCredentials_NoCredentialsIsNotAnError(t *testing.T) {
+	cfg := kafkaTransportConfig()
+	cfg.SASLUser, cfg.SASLSecret = "", ""
+
+	user, secret, err := kafkaTransportCredentials(cfg, KafkaTransportRoleProducer)
+	require.NoError(t, err)
+	assert.Empty(t, user)
+	assert.Empty(t, secret)
+
+	transport, err := NewKafkaTransport(cfg, KafkaTransportRoleProducer)
+	require.NoError(t, err)
+	assert.Nil(t, transport.SASL, "no credentials means no SASL mechanism, not an empty one")
+}
+
+// TestSaslCredentialError_NamesTheRolesOwnVariables covers the diagnostic, which is the whole
+// value of the function.
+//
+// A credential that SASLprep rejects produces an error from the SCRAM client whose message
+// EMBEDS THE PLAINTEXT PASSWORD, which is why that error is deliberately not wrapped. What
+// replaces it has to be at least as useful, and pointing an operator at KAFKA_SASL_ADMIN_USER
+// when the producer pair is at fault sends them to the wrong line of their configuration.
+func TestSaslCredentialError_NamesTheRolesOwnVariables(t *testing.T) {
+	// U+0007 is a prohibited control character under SASLprep, so preparing it fails while
+	// the value itself is not a secret.
+	prohibited := "producer\u0007"
+
+	producerErr := saslCredentialError(KafkaTransportRoleProducer, prohibited)
+	require.Error(t, producerErr)
+	assert.Contains(t, producerErr.Error(), "KAFKA_SASL_USER")
+	assert.NotContains(t, producerErr.Error(), "KAFKA_SASL_ADMIN_USER")
+
+	adminErr := saslCredentialError(KafkaTransportRoleAdmin, prohibited)
+	require.Error(t, adminErr)
+	assert.Contains(t, adminErr.Error(), "KAFKA_SASL_ADMIN_USER")
+
+	// A username that prepares cleanly means the SECRET is the offender, and the message must
+	// say so — naming the secret's variable while never rendering its value.
+	secretErr := saslCredentialError(KafkaTransportRoleProducer, "blnk-producer")
+	require.Error(t, secretErr)
+	assert.Contains(t, secretErr.Error(), "KAFKA_SASL_SECRET")
+	assert.Contains(t, secretErr.Error(), "deliberately omitted",
+		"the message must state that the secret was withheld, so its absence is not read as a bug")
+}
+
+// TestReplayFailureOutcome_PairsEveryCodeWithAMessageThatNamesTheRightCulprit pins the mapper
+// itself, independently of the service that calls it.
+//
+// Two things are asserted that the service-level tests below cannot see. First, that each
+// code resolves to its intended status through an explicit statusByCode entry — an unmapped
+// code silently becomes 500, which would collapse the split this test exists to prove.
+// Second, that the message accompanying each code names the right culprit: a 503 that said
+// "failed to replay the event" would tell an operator to investigate Blnk while the broker
+// was down.
+func TestReplayFailureOutcome_PairsEveryCodeWithAMessageThatNamesTheRightCulprit(t *testing.T) {
+	unavailableCode, unavailableMessage := replayFailureOutcome(kafka.LeaderNotAvailable)
+	assert.Equal(t, apierror.ErrKafkaUnavailable, unavailableCode)
+	assert.Equal(t, http.StatusServiceUnavailable, apierror.StatusForCode(unavailableCode),
+		"the availability code must resolve to 503 through an explicit statusByCode entry")
+	assert.Contains(t, strings.ToLower(unavailableMessage), "broker",
+		"the message for an outage must name the broker, not the event")
+	assert.Contains(t, strings.ToLower(unavailableMessage), "retry",
+		"a 503 must tell the caller that repeating the request is the right response")
+
+	failedCode, failedMessage := replayFailureOutcome(kafka.MessageSizeTooLarge)
+	assert.Equal(t, apierror.ErrEventReplayFailed, failedCode)
+	assert.Equal(t, http.StatusInternalServerError, apierror.StatusForCode(failedCode))
+	assert.NotContains(t, strings.ToLower(failedMessage), "broker",
+		"a defect this service owns must not be described as a broker problem")
+	assert.NotEqual(t, unavailableMessage, failedMessage,
+		"the two outcomes must be distinguishable by message as well as by code")
+}
+
+// TestIsBrokerUnavailableError_SeparatesAnOutageFromADefect pins the classifier the mapper
+// reads, case by case.
+//
+// It is table-driven over the whole taxonomy because each entry closes a specific way the
+// classification could go wrong, and several of them are counter-intuitive:
+//
+//   - BrokerNotAvailable and ReplicaNotAvailable are NOT in kafka-go's retriable set, so
+//     they are only classified correctly because the implementation names them.
+//   - MessageSizeTooLarge, InvalidTopic and RecordListTooLarge ARE Kafka protocol errors,
+//     and they must still be defects. This is the case an interface test against net.Error
+//     would break: kafka.Error implements Error, Timeout and Temporary, so it satisfies
+//     net.Error, and classifying by that interface would turn every protocol error into an
+//     outage.
+//   - A PublishError's own verdict wins over any re-derivation, in BOTH directions.
+func TestIsBrokerUnavailableError_SeparatesAnOutageFromADefect(t *testing.T) {
+	unavailable := map[string]error{
+		"no leader available":                      kafka.LeaderNotAvailable,
+		"no leader for the partition":              kafka.NotLeaderForPartition,
+		"broker not available":                     kafka.BrokerNotAvailable,
+		"replica not available":                    kafka.ReplicaNotAvailable,
+		"request timed out":                        kafka.RequestTimedOut,
+		"network exception":                        kafka.NetworkException,
+		"not enough replicas":                      kafka.NotEnoughReplicas,
+		"storage error":                            kafka.KafkaStorageError,
+		"wrapped batch member":                     kafka.WriteErrors{nil, kafka.LeaderNotAvailable},
+		"connection refused":                       &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
+		"host unreachable":                         &net.OpError{Op: "dial", Net: "tcp", Err: syscall.EHOSTUNREACH},
+		"broker name does not resolve":             &net.DNSError{Err: "no such host", IsNotFound: true},
+		"connection reset":                         syscall.ECONNRESET,
+		"broken pipe":                              syscall.EPIPE,
+		"deadline expired":                         context.DeadlineExceeded,
+		"context cancelled":                        context.Canceled,
+		"publisher closed":                         ErrEventPublisherClosed,
+		"publisher closed, wrapped":                fmt.Errorf("writer: %w", ErrEventPublisherClosed),
+		"the publisher said transient":             &PublishError{Transient: true, Err: errors.New("some broker trouble")},
+		"the publisher said transient, and it was": &PublishError{Transient: true, Err: kafka.NotLeaderForPartition},
+	}
+
+	for name, err := range unavailable {
+		t.Run("unavailable/"+name, func(t *testing.T) {
+			assert.True(t, IsBrokerUnavailableError(err),
+				"%v must be classified as the broker being unavailable", err)
+		})
+	}
+
+	defects := map[string]error{
+		"message too large":               kafka.MessageSizeTooLarge,
+		"record list too large":           kafka.RecordListTooLarge,
+		"invalid topic":                   kafka.InvalidTopic,
+		"unsupported version":             kafka.UnsupportedVersion,
+		"empty batch":                     kafka.WriteErrors{},
+		"batch of defects":                kafka.WriteErrors{kafka.MessageSizeTooLarge},
+		"an unrecognised failure":         errors.New("blnk: something else entirely"),
+		"the publisher said permanent":    &PublishError{Transient: false, Err: errors.New("json: unsupported value")},
+		"the publisher overrides a retry": &PublishError{Transient: false, Err: kafka.LeaderNotAvailable},
+	}
+
+	for name, err := range defects {
+		t.Run("defect/"+name, func(t *testing.T) {
+			assert.False(t, IsBrokerUnavailableError(err),
+				"%v must NOT be excused as a broker outage", err)
+		})
+	}
+
+	assert.False(t, IsBrokerUnavailableError(nil), "a nil error is not a failure at all")
+}
+
+// TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable covers the publish-failure
+// arm for every way the BROKER can be the reason.
+//
+// All of them resolve to ErrKafkaUnavailable and 503, which is the same answer the
+// no-transport branch gives, and for the same reason: the event is intact, nothing about
+// Blnk is broken, and the correct response is to repeat the request once the broker
+// recovers. Answering 500 here — as a single catch-all replay code would — would classify a
+// rolling restart as an internal defect, send an operator hunting for a bug that does not
+// exist, and tell a client that retrying is pointless at the one moment it is the only
+// thing that helps.
+//
+// The cases are the real SIGNALS rather than error text, because text is not a contract: a
+// leaderless partition, a broker declaring itself unavailable (a code kafka-go does NOT
+// mark retriable, so it has to be named explicitly), the publisher's own transient verdict,
+// a batch whose members failed, a refused TCP connection, an expired deadline, and a
+// transport that has been closed.
+//
+// # The detail travels with the status, and still says nothing about the broker
+//
+// Two guarantees are asserted together here because they are easy to satisfy separately and
+// wrong separately. The bounded EventTransportErrorDetail reports transient TRUE, from the
+// same verdict that chose the status, so nothing tells a client to retry and not to retry
+// in one response. And it still carries no broker address, port or protocol text, so
+// classifying an outage correctly does not become a way to describe the deployment's
+// topology to whoever asked for the replay.
+func TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	cases := map[string]error{
+		"the partition has no leader":            kafka.NotLeaderForPartition,
+		"the leader is not available":            kafka.LeaderNotAvailable,
+		"the broker declares itself unavailable": kafka.BrokerNotAvailable,
+		"a replica is not available":             kafka.ReplicaNotAvailable,
+		"the publisher classified the attempt transient": &PublishError{
+			Topic:     "blnk.transactions",
+			EventID:   "evt_transaction.applied_replay",
+			EventType: "transaction.applied",
+			Attempt:   6,
+			Transient: true,
+			Err:       kafka.RequestTimedOut,
+		},
+		"a member of the write batch failed": kafka.WriteErrors{nil, kafka.KafkaStorageError},
+		"the connection was refused": &net.OpError{
+			Op: "dial", Net: "tcp",
+			Addr: &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 9092},
+			Err:  syscall.ECONNREFUSED,
+		},
+		"the broker host does not resolve": &net.DNSError{
+			Err: "no such host", Name: "kafka.internal", IsNotFound: true,
+		},
+		"the acknowledgement deadline expired": fmt.Errorf(
+			"waiting for acknowledgement: %w", context.DeadlineExceeded),
+		"the transport is closed": fmt.Errorf("resolving a writer: %w", ErrEventPublisherClosed),
+	}
+
+	for name, cause := range cases {
+		t.Run(name, func(t *testing.T) {
+			fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
+			fixture.publisher.err = cause
+
+			outcome, err := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
+			dltAssertCodeAndStatus(t, err, apierror.ErrKafkaUnavailable, http.StatusServiceUnavailable)
+
+			detail, ok := dltAPIError(t, err).Details.(EventTransportErrorDetail)
+			require.True(t, ok, "a transport failure must carry the bounded detail type, got %T",
+				dltAPIError(t, err).Details)
+			assert.True(t, detail.Transient,
+				"the body must agree with the 503: a caller reading transient=false would give up")
+			assert.Equal(t, fixture.row.EventID, detail.EventID)
+			assert.Equal(t, "blnk.transactions", detail.Topic)
+
+			// DATA-01 still holds on this arm. Rendered every way a handler might render it.
+			marshalled, marshalErr := json.Marshal(dltAPIError(t, err))
+			require.NoError(t, marshalErr)
+			for _, leak := range []string{"10.9.8.7", "9092", "kafka.internal", "Leader Not Available"} {
+				assert.NotContains(t, fmt.Sprint(detail), leak,
+					"the broker's own error text must not reach a caller through %%v")
+				assert.NotContains(t, string(marshalled), leak,
+					"the broker's own error text must not reach a caller through the response body")
+			}
+
+			assert.False(t, outcome.Recorded)
+			assert.Empty(t, fixture.store.snapshotDispatched(),
+				"a failed republish must not clear the row from the inventory")
+			assert.Equal(t, model.EventOutboxStatusDeadLettered,
+				fixture.store.row(t, fixture.row.EventID).Status,
+				"the event stays dead-lettered so it can be replayed again once the broker recovers")
+		})
+	}
+}
+
+// TestReplayDeadLetteredEvent_ReportsANonAvailabilityFailureAsAReplayDefect covers the other
+// half of the split.
+//
+// ErrEventReplayFailed and its 500 are RESERVED for a failure this service owns, where a
+// retry changes nothing: a message the broker will never accept at its current size, a
+// topic name that is not valid, bytes that could not be marshalled, or a failure that
+// cannot be attributed to the broker at all. The last case is the deliberately conservative
+// direction of the classifier — an unrecognised error stays visible as a fault here rather
+// than being written off as somebody else's outage.
+//
+// The detail reports transient FALSE on this arm, again from the same verdict as the status,
+// so the two halves of the response cannot advise a caller differently.
+func TestReplayDeadLetteredEvent_ReportsANonAvailabilityFailureAsAReplayDefect(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	cases := map[string]error{
+		"the message is larger than the broker accepts": kafka.MessageSizeTooLarge,
+		"the topic name is not valid":                   kafka.InvalidTopic,
+		"the publisher classified the attempt permanent": &PublishError{
+			Topic:     "blnk.transactions",
+			EventID:   "evt_transaction.applied_replay",
+			EventType: "transaction.applied",
+			Attempt:   6,
+			Transient: false,
+			Err:       errors.New("json: unsupported value: +Inf"),
+		},
+		"the failure cannot be attributed to the broker": errors.New(
+			"blnk: the composed message could not be written"),
+	}
+
+	for name, cause := range cases {
+		t.Run(name, func(t *testing.T) {
+			fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
+			fixture.publisher.err = cause
+
+			outcome, err := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
+			dltAssertCodeAndStatus(t, err, apierror.ErrEventReplayFailed, http.StatusInternalServerError)
+
+			detail, ok := dltAPIError(t, err).Details.(EventTransportErrorDetail)
+			require.True(t, ok, "a transport failure must carry the bounded detail type, got %T",
+				dltAPIError(t, err).Details)
+			assert.False(t, detail.Transient,
+				"the body must agree with the 500: a caller reading transient=true would retry for ever")
+
+			assert.False(t, outcome.Recorded)
+			assert.Empty(t, fixture.store.snapshotDispatched(),
+				"a failed republish must not clear the row from the inventory")
+			assert.Equal(t, model.EventOutboxStatusDeadLettered,
+				fixture.store.row(t, fixture.row.EventID).Status,
+				"the event stays dead-lettered, because a fixed defect makes it replayable again")
+		})
 	}
 }

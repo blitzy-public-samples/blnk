@@ -19,11 +19,14 @@ package blnk
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -137,6 +140,24 @@ const (
 	// reported missing events. Set explicitly for the same reason as the acks.
 	eventWriterAsync = false
 
+	// eventWriterBatchBytes is the writer's own byte ceiling, and it is set EXPLICITLY
+	// rather than left to kafka-go's 1 MiB default.
+	//
+	// The default is the problem. A dead-letter copy of an event is the ORIGINAL
+	// envelope plus its failure metadata — original topic, error reason, attempt count,
+	// and two timestamps — so it is always larger than the message that failed. An
+	// event that fits under a 1 MiB producer limit on its first publish can therefore
+	// exceed it on the dead-letter write, at which point the event cannot be preserved
+	// at the exact moment preservation is the only thing left to do.
+	//
+	// The ceiling here is deliberately ABOVE model.MaxEventMessageBytes, which is what
+	// the application enforces, so the two limits cannot fight: an event is refused by
+	// application validation with a diagnosable message long before the writer would
+	// refuse it with a produce error, and the headroom between them is what absorbs the
+	// failure metadata. Both remain comfortably under Kafka's own default
+	// message.max.bytes of roughly 1 MiB.
+	eventWriterBatchBytes = 1000000
+
 	// eventWriterAllowAutoTopicCreation is false so that writing to a topic which
 	// does not exist FAILS instead of creating one.
 	//
@@ -174,6 +195,144 @@ const (
 	publishAttrAttempt   = "attempt"
 )
 
+// The two replacement labels below bound metric cardinality. See boundedTopicLabel and
+// boundedEventTypeLabel for why an unbounded label is a defect rather than a detail.
+const (
+	// unownedTopicLabel replaces a topic name that is not in the Blnk-owned namespace.
+	unownedTopicLabel = "unowned"
+
+	// unrecognisedEventTypeLabel replaces an event type that has no entry in the
+	// event-type catalogue.
+	unrecognisedEventTypeLabel = "unrecognised"
+)
+
+// boundedTopicLabel renders a topic name as a metric label with BOUNDED cardinality.
+//
+// # DATA-01: a stored string must not become a metric dimension
+//
+// Every value that reaches these labels arrives from an OUTBOX ROW, and the failure path
+// records an attempt for a topic that was rejected — which is precisely the case where the
+// name is not one of Blnk's own. An unbounded label is two problems at once: each distinct
+// value creates a new time series, so a stream of odd names is a memory and storage attack
+// on the metrics pipeline with no request rate to rate-limit; and the label itself is a
+// disclosure channel, publishing whatever string was stored to anyone who can read
+// /metrics.
+//
+// A Blnk-owned name is a member of a small, enumerable set — prefix times four categories,
+// times the optional `.dlt` suffix — so it is safe to report verbatim, and reporting it is
+// what makes the dead-letter-rate and per-topic queries in docs/metrics.md work. Anything
+// else collapses to one fixed label: the series count stays bounded, and the anomaly is
+// still visible as a non-zero count on that label. The name itself remains available in the
+// log line and on the outbox row, which is where an operator triaging one event looks.
+//
+// Parameters:
+//   - topic string: the topic name to report.
+//
+// Returns:
+//   - string: the topic verbatim when Blnk owns it, unownedTopicLabel otherwise.
+func boundedTopicLabel(topic string) string {
+	if model.IsBlnkEventTopic(topic, TopicPrefix()) {
+		return topic
+	}
+
+	return unownedTopicLabel
+}
+
+// boundedEventTypeLabel renders an event type as a metric label with BOUNDED cardinality.
+//
+// The catalogue in model.EventCategory is the bound: an event type it recognises is one of
+// a fixed set that this repository emits, so it is reported verbatim. An event type it does
+// not recognise routes to the quarantine category, and those names are exactly the ones
+// that could be arbitrary — a stored row from a producer that was never catalogued, or a
+// value that reached the table before validation existed. They collapse to one label for
+// the same two reasons boundedTopicLabel exists.
+//
+// Collapsing does not hide the condition. A non-zero count on the unrecognised label is the
+// signal that something is publishing an uncatalogued event, and the quarantine topic plus
+// the publisher's warning name the specific event.
+//
+// Parameters:
+//   - eventType string: the event type to report.
+//
+// Returns:
+//   - string: the event type verbatim when catalogued, unrecognisedEventTypeLabel
+//     otherwise.
+func boundedEventTypeLabel(eventType string) string {
+	if model.EventCategory(eventType) == model.EventCategoryQuarantine {
+		return unrecognisedEventTypeLabel
+	}
+
+	return eventType
+}
+
+// EventTransportErrorDetail is the detail attached to a typed API error whose cause came
+// from the Kafka client rather than from Blnk.
+//
+// # DATA-01: a broker error object must not become a response body
+//
+// A typed apierror.APIError carries its cause in an interface{} Details field that is
+// serialised into the response. The Kafka client's errors are STRUCTS WITH EXPORTED FIELDS —
+// *net.OpError carries Op, Net and Addr, so marshalling one publishes the broker's address
+// and port; kafka.Error is an integer protocol code; kafka.WriteErrors is a slice of either.
+// Attaching such a value directly would hand a caller the deployment's internal broker
+// topology and the client's protocol state, from an endpoint whose job is to report that one
+// event did not publish.
+//
+// This type is what is attached instead. Every field is a BOUNDED value the caller either
+// supplied or already holds: the event's own identifiers, the topic (bounded by
+// boundedTopicLabel), a reason drawn from a fixed vocabulary declared beside the call, and
+// the transient classification the retry decision was made on — which is the one thing a
+// caller can act on, because it says whether waiting will help.
+//
+// The full cause is not discarded, only redirected. It is logged, with the error attached,
+// at the site that builds this detail, so an operator retains the broker's exact words while
+// the caller receives the diagnosis and nothing else.
+type EventTransportErrorDetail struct {
+	// Reason states what failed, in fixed wording chosen at the call site. It never
+	// interpolates the cause.
+	Reason string `json:"reason"`
+
+	// EventID is the event's UUID: the caller's own correlation handle, and what an
+	// operator needs to find the row and the log line.
+	EventID string `json:"event_id"`
+
+	// EventType is the event name, bounded to the catalogue.
+	EventType string `json:"event_type,omitempty"`
+
+	// Topic is the destination, bounded to the Blnk-owned namespace.
+	Topic string `json:"topic,omitempty"`
+
+	// Transient reports whether the failure looks recoverable, which is the actionable
+	// half of the diagnosis: a transient failure will clear, a permanent one will not.
+	Transient bool `json:"transient"`
+}
+
+// NewEventTransportErrorDetail builds a bounded transport-failure detail from a cause,
+// keeping the cause itself out of the result.
+//
+// The cause is used for exactly one thing — the transient classification — so the returned
+// value cannot contain any of its text or structure however the caller renders it: as JSON,
+// with %v, or field by field.
+//
+// Parameters:
+//   - reason string: fixed wording describing what failed. Supply a literal, never a
+//     formatted string containing the cause.
+//   - eventID, eventType, topic string: the event's identifiers and destination. The last
+//     two are bounded here so a caller cannot forget to.
+//   - cause error: the underlying failure, read only for its transient classification.
+//
+// Returns:
+//   - EventTransportErrorDetail: the safe detail.
+func NewEventTransportErrorDetail(reason, eventID, eventType, topic string, cause error) EventTransportErrorDetail {
+	return EventTransportErrorDetail{
+		Reason:    reason,
+		EventID:   eventID,
+		EventType: boundedEventTypeLabel(eventType),
+		Topic:     boundedTopicLabel(topic),
+		Transient: cause != nil && classifyTransientPublishError(cause),
+	}
+}
+
 // jsonNull is what a LedgerEvent with no payload bytes serialises its payload member
 // to. Emitting the JSON null literal keeps the envelope structurally valid and the
 // event published, observable and replayable; the alternative — omitting the member —
@@ -186,6 +345,14 @@ var jsonNull = []byte("null")
 // dispatched after a successful publish and becomes claimable again once the relay's
 // lease on it expires.
 var ErrEventPublisherClosed = errors.New("blnk: event publisher is closed")
+
+// ErrEventMessageTooLarge is returned when a fully-marshalled event envelope exceeds
+// model.MaxEventMessageBytes.
+//
+// It is a sentinel so the relay, the dead-letter path and a test can all recognise the
+// same condition without matching message text, and so that "too large" is provably
+// distinct from a transport failure that happens to mention a size.
+var ErrEventMessageTooLarge = errors.New("blnk: serialised event exceeds the maximum message size")
 
 // EventPublisher publishes a canonical ledger event.
 //
@@ -266,6 +433,25 @@ type PublishRequest struct {
 	// grows, because retry is the relay's responsibility alone.
 	Attempt int
 
+	// MaxAttempts is the retry budget the row states, and it is what lets a single
+	// attempt report whether it was the LAST one.
+	//
+	// Without it the publisher can only say "this attempt failed", and every failure is
+	// then reported as retrying — including the one that spent the budget, which is the
+	// single most important failure to be able to see.
+	//
+	// Zero means "not stated". A transient failure with no stated budget is reported as
+	// retrying, because whether another attempt follows is genuinely unknown here; a
+	// permanent failure is reported as failed regardless, because no budget makes
+	// corrupt bytes valid.
+	MaxAttempts int
+
+	// Purpose says which of the three publish paths this is, and it exists to keep three
+	// different populations out of each other's telemetry. The zero value is
+	// PublishPurposeOriginal, so an unstated purpose is a first delivery — which is what
+	// the mandated envelope-only Publish method submits. See PublishPurpose.
+	Purpose PublishPurpose
+
 	// ClaimedAt is when the relay claimed the outbox row, and it exists so the
 	// publish-duration histogram measures what its documentation says it measures:
 	// claim to broker acknowledgement, not just the time inside WriteMessages. Leave
@@ -318,6 +504,23 @@ type PublishResult struct {
 
 	// Attempt is the 1-based attempt number this result describes.
 	Attempt int
+
+	// MaxAttempts is the budget the attempt was measured against, carried through from the
+	// request so a log line can state "attempt 3 of 5" rather than "attempt 3". Zero means
+	// no budget was stated.
+	MaxAttempts int
+
+	// Purpose is the resolved publish purpose, never the empty string. It is what keeps an
+	// operator-triggered replay and a dead-letter write out of the first-attempt latency
+	// population the sub-2-second target is read from.
+	Purpose PublishPurpose
+
+	// Retryable states whether ANOTHER attempt is possible for this event: the failure
+	// looked transient AND the attempt did not spend the stated budget. It is false for a
+	// success and false for a terminal failure, so it answers exactly one question and is
+	// not a synonym for Transient — a transient failure on the last permitted attempt is
+	// not retryable.
+	Retryable bool
 
 	// Duration is how long the attempt took: from PublishRequest.ClaimedAt when it
 	// was set, otherwise the time spent in the write itself.
@@ -379,19 +582,48 @@ func (r PublishResult) DeadLettered() PublishResult {
 // Returns:
 //   - logrus.Fields: a fresh map the caller may extend.
 func (r PublishResult) LogFields() logrus.Fields {
+	// The partition key is HASHED rather than printed. It is a ledger id — a financial
+	// identifier naming the account an event belongs to — and a log stream is routinely
+	// shipped somewhere with a weaker access boundary than the ledger itself. The hash
+	// keeps the one property a log needs, that two lines about the same ledger are
+	// recognisable as such, and gives up the one it does not.
 	fields := logrus.Fields{
-		"event_id":      r.EventID,
-		"event_type":    r.EventType,
-		"topic":         r.Topic,
-		"partition_key": r.PartitionKey,
-		"attempt":       r.Attempt,
-		"status":        string(r.Status),
-		"duration_ms":   r.Duration.Milliseconds(),
+		"event_id":           r.EventID,
+		"event_type":         r.EventType,
+		"topic":              r.Topic,
+		"partition_key_hash": hashLogIdentifier(r.PartitionKey),
+		"attempt":            r.Attempt,
+		"status":             string(r.Status),
+		"duration_ms":        r.Duration.Milliseconds(),
+	}
+
+	// The budget accompanies the attempt on EVERY attempt, not only the last: "attempt 3"
+	// is unreadable on its own, while "attempt 3 of 5" says how much of the budget is
+	// left, which is the difference between an event that is progressing and one that is
+	// about to be dead-lettered. Omitted when unstated, so an envelope-only publish does
+	// not carry a fabricated zero.
+	if r.MaxAttempts > 0 {
+		fields["max_attempts"] = r.MaxAttempts
+	}
+
+	// The purpose is named only when it is NOT the default. An original publish is the
+	// overwhelming majority of lines, and a field whose value is the same on all of them
+	// is noise; a replay or a dead-letter write is the line an operator is looking for.
+	if r.Purpose != "" && r.Purpose != PublishPurposeOriginal {
+		fields["purpose"] = string(r.Purpose)
 	}
 
 	if r.Err != nil {
-		fields["error"] = r.Err.Error()
+		// BOUNDED, because this string came from a broker or a library rather than from
+		// this codebase: its length is not ours to choose, and it is emitted once per
+		// attempt per event, so an unbounded value multiplied by the retry budget and the
+		// event rate is how a log pipeline gets throttled for being over quota.
+		fields["error"] = sanitizeLogValue(r.Err.Error(), maxLoggedErrorLength)
 		fields["transient"] = r.Transient
+		// transient says what the failure LOOKED like; retryable says whether anything
+		// further will actually be tried. They differ on the last permitted attempt, and
+		// that is the case an operator most needs to be able to see.
+		fields["retryable"] = r.Retryable
 	}
 
 	return fields
@@ -475,6 +707,121 @@ func IsTransientPublishError(err error) bool {
 	return false
 }
 
+// IsBrokerUnavailableError reports whether a failed publish is the BROKER being unable to
+// accept the write, as opposed to a defect in the event or in this service.
+//
+// It exists because those two are different answers to an operator's question and, at the
+// API boundary, different HTTP statuses. An unreachable, leaderless or under-replicated
+// broker is a retryable upstream condition and must surface as
+// apierror.ErrKafkaUnavailable, which resolves to 503; a message that can never be
+// published — bytes that are not valid JSON, an event whose destination does not resolve —
+// is this service's problem and must surface as a 500. Reporting an outage as a 500 sends
+// an operator hunting for a defect in Blnk and tells a client that retrying is pointless
+// at the exact moment retrying is the only correct response.
+//
+// The verdict is taken from the first of these that applies:
+//
+//  1. ErrEventPublisherClosed. A closed publisher has no transport at all, which is the
+//     same operator situation as no broker being configured: nothing can be published from
+//     this process now, the event stays safe in its outbox row, and the honest answer is
+//     "unavailable, try again" rather than "internal error".
+//  2. A PublishError's OWN classification. Transient was decided at the moment of failure
+//     by classifyTransientPublishError against the broker's real error, so it is the most
+//     informed answer available and it is not second-guessed here.
+//  3. The raw error, for a failure that reached the caller unwrapped — a borrowed writer's
+//     WriteMessages error, or a double reporting the broker's own error code.
+//
+// Anything unrecognised is reported as false. That is the conservative direction: an
+// unknown failure stays visible as a fault in this service rather than being written off
+// as somebody else's outage.
+//
+// Parameters:
+//   - err error: the error returned by Publish, PublishToTopic or a raw writer. May be
+//     nil.
+//
+// Returns:
+//   - bool: true when the failure is the broker being unavailable.
+func IsBrokerUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, ErrEventPublisherClosed) {
+		return true
+	}
+
+	var publishErr *PublishError
+	if errors.As(err, &publishErr) {
+		return publishErr.Transient
+	}
+
+	return brokerUnavailable(err)
+}
+
+// brokerUnavailable classifies a RAW publish failure — one that has not been through
+// kafkaPublisher.fail and so carries no verdict of its own.
+//
+// It starts from the transient classification, because every recoverable failure that
+// function recognises (a Temporary or Timeout error, a context expiry, a refused or reset
+// connection) is by definition the broker not being reachable or not being ready. Three
+// additions cover what it deliberately does not:
+//
+//   - kafka.WriteErrors, so a batch is judged by its members exactly as the transient
+//     classification judges it.
+//   - BrokerNotAvailable and ReplicaNotAvailable. kafka-go does NOT list these in
+//     Error.Temporary, yet both are the broker stating plainly that it cannot serve the
+//     partition right now. They are the two codes a caller most expects to see during a
+//     rolling restart, so leaving them out would report the commonest planned outage as an
+//     internal error.
+//   - *net.OpError and *net.DNSError, which cover a dial, route or resolution failure
+//     whose underlying errno is outside the small set classifyTransientPublishError names.
+//
+// The net checks are deliberately made against those CONCRETE types and never against the
+// net.Error interface: kafka.Error implements Error, Timeout and Temporary, so it satisfies
+// net.Error, and an interface test would silently reclassify every Kafka protocol error —
+// including genuine defects such as an invalid topic or an oversized message — as a
+// broker outage.
+//
+// Parameters:
+//   - err error: the raw failure. May be nil.
+//
+// Returns:
+//   - bool: true when the failure is the broker being unavailable.
+func brokerUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var writeErrors kafka.WriteErrors
+	if errors.As(err, &writeErrors) {
+		for _, writeErr := range writeErrors {
+			if brokerUnavailable(writeErr) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	if classifyTransientPublishError(err) {
+		return true
+	}
+
+	var kafkaErr kafka.Error
+	if errors.As(err, &kafkaErr) {
+		return kafkaErr == kafka.BrokerNotAvailable || kafkaErr == kafka.ReplicaNotAvailable
+	}
+
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+
+	var dnsErr *net.DNSError
+
+	return errors.As(err, &dnsErr)
+}
+
 // NoopEventPublisher is the publisher selected when no Kafka brokers are configured.
 // It accepts every event, does nothing with it, and reports success.
 //
@@ -543,6 +890,8 @@ func (p *NoopEventPublisher) PublishToTopic(_ context.Context, req PublishReques
 		Topic:        resolveTopic(req),
 		PartitionKey: resolvePartitionKey(req),
 		Attempt:      resolveAttempt(req),
+		MaxAttempts:  resolveMaxAttempts(req),
+		Purpose:      resolvePurpose(req),
 	}, nil
 }
 
@@ -614,6 +963,15 @@ type kafkaPublisher struct {
 	// writers is keyed by topic. It is pre-populated with every topic Blnk owns and
 	// grows lazily — see writerFor for the two real cases that require growth.
 	writers map[string]*kafka.Writer
+
+	// lazyTopics is the topics added AFTER construction, in creation order.
+	//
+	// It exists to make the writer cache boundable. The map alone cannot answer either
+	// question retirement needs — which entries were added lazily, and which of those is
+	// oldest — because a map has no order and no record of how an entry arrived. The
+	// pre-created inventory is deliberately absent from this list: those writers are the
+	// deployment's current topics and must never be retired.
+	lazyTopics []string
 
 	// closed makes Close idempotent and turns a publish after shutdown into a clear
 	// error rather than a panic on a closed writer.
@@ -698,14 +1056,31 @@ func NewEventPublisher(cnf *config.Configuration) (EventPublisher, error) {
 		return nil, err
 	}
 
+	// The principal and the encryption state are the two facts an operator needs to
+	// confirm the producer connected as intended, so both are named explicitly rather
+	// than inferred from which variables happen to be set.
+	producerUser, _, credErr := kafkaTransportCredentials(cnf.Kafka, KafkaTransportRoleProducer)
+	if credErr != nil {
+		// Unreachable: newKafkaPublisher resolved the same pair a moment ago and would
+		// have returned the error. Logged rather than ignored so a future divergence
+		// between the two calls is visible instead of silent.
+		logrus.WithError(credErr).Warn(
+			"could not re-resolve the producer SASL principal for the initialisation log",
+		)
+	}
+
 	logrus.WithFields(logrus.Fields{
-		"brokers":        brokers,
-		"topics":         len(publisher.writers),
-		"sasl":           cnf.Kafka.SASLAdminUser != "",
-		"required_acks":  "all",
-		"balancer":       "murmur2",
-		"topic_prefix":   TopicPrefix(),
-		"internal_retry": false,
+		"brokers":         brokers,
+		"topics":          len(publisher.writers),
+		"sasl":            producerUser != "",
+		"sasl_principal":  producerUser,
+		"dedicated_sasl":  cnf.Kafka.SASLUser != "",
+		"tls":             cnf.Kafka.TLS.Enabled,
+		"required_acks":   "all",
+		"balancer":        "murmur2",
+		"topic_prefix":    TopicPrefix(),
+		"internal_retry":  false,
+		"max_event_bytes": model.MaxEventMessageBytes,
 	}).Info("kafka event publisher initialised")
 
 	return publisher, nil
@@ -717,35 +1092,25 @@ func NewEventPublisher(cnf *config.Configuration) (EventPublisher, error) {
 // without going through configuration selection, and so that the selection logic above
 // reads as the single decision it is.
 //
-// SASL is applied only when an administrative username is configured. That is a real
-// branch, not a defensive one: the local single-broker stack can run a plaintext
-// listener, while any cluster with the KRaft standard authorizer enabled requires
-// SCRAM. SHA-512 is used because Kafka supports only SHA-256 and SHA-512 for SCRAM and
-// SHA-512 is the stronger of the two.
+// The transport it builds is the SECURITY BOUNDARY of the producer path — TLS, credential
+// selection and the plaintext refusal all live in NewKafkaTransport, which the admin path
+// shares so the two cannot diverge.
 //
 // Parameters:
 //   - brokers []string: a non-empty, normalised bootstrap list.
-//   - cfg config.KafkaConfig: the Kafka configuration block, read for credentials.
+//   - cfg config.KafkaConfig: the Kafka configuration block, read for credentials and TLS.
 //
 // Returns:
 //   - *kafkaPublisher: the assembled publisher, with one writer per owned topic.
-//   - error: non-nil only when the SCRAM mechanism cannot be built.
+//   - error: non-nil when the transport cannot be built — malformed credentials, an
+//     unreadable or invalid TLS material, or plaintext without the explicit local-dev
+//     acknowledgement.
 func newKafkaPublisher(brokers []string, cfg config.KafkaConfig) (*kafkaPublisher, error) {
 	addr := kafka.TCP(brokers...)
 
-	transport := &kafka.Transport{
-		DialTimeout: eventTransportDialTimeout,
-		IdleTimeout: eventTransportIdleTimeout,
-		ClientID:    eventTransportClientID,
-	}
-
-	if cfg.SASLAdminUser != "" {
-		mechanism, err := scram.Mechanism(scram.SHA512, cfg.SASLAdminUser, cfg.SASLAdminSecret)
-		if err != nil {
-			return nil, saslCredentialError(cfg.SASLAdminUser)
-		}
-
-		transport.SASL = mechanism
+	transport, err := NewKafkaTransport(cfg, KafkaTransportRoleProducer)
+	if err != nil {
+		return nil, err
 	}
 
 	publisher := &kafkaPublisher{
@@ -764,6 +1129,267 @@ func newKafkaPublisher(brokers []string, cfg config.KafkaConfig) (*kafkaPublishe
 	}
 
 	return publisher, nil
+}
+
+// KafkaTransportRole names which principal a transport authenticates as.
+//
+// It exists because the producer and the administrator are DIFFERENT PRINCIPALS with
+// deliberately different privileges, and a single "the Kafka credentials" notion is what
+// erased that distinction. The role is an explicit argument so a caller cannot pick up the
+// wrong one by omission.
+type KafkaTransportRole string
+
+const (
+	// KafkaTransportRoleProducer is the steady-state event-publishing principal. It needs
+	// Write and Describe on the Blnk-owned topics and NOTHING ELSE — no topic creation, no
+	// credential alteration, no ACL management.
+	KafkaTransportRoleProducer KafkaTransportRole = "producer"
+
+	// KafkaTransportRoleAdmin is the provisioning principal. It creates topics, alters
+	// SCRAM credentials and manages ACLs, which is the most privileged identity in the
+	// system and is why it must not be the one used to publish every ledger event.
+	KafkaTransportRoleAdmin KafkaTransportRole = "admin"
+)
+
+// NewKafkaTransport builds the shared kafka.Transport for one role, applying the TLS and
+// credential policy.
+//
+// # TLS, and why plaintext must be asked for explicitly
+//
+// SASL/SCRAM authenticates the CLIENT to the BROKER; it does not encrypt the connection and
+// it does not authenticate the broker to the client. Over SASL_PLAINTEXT the SCRAM exchange
+// and every subsequent produce request travel in the clear, so anything on the path can read
+// the ledger events — which carry amounts, balance identifiers and, on identity events,
+// names, email addresses, phone numbers, postal addresses and dates of birth — and can
+// impersonate the broker to harvest the SCRAM handshake.
+//
+// So TLS is the default posture and plaintext is an OPT-IN that has to be stated:
+// KAFKA_TLS_ENABLED turns on a verified TLS transport, and KAFKA_INSECURE_LOCAL_DEV is the
+// only thing that permits running without it. Neither being set is a CONFIGURATION ERROR
+// rather than a silent downgrade, because a silent downgrade is indistinguishable from a
+// working deployment right up to the moment someone reads a packet capture. The local
+// single-broker stack runs SASL_PLAINTEXT, which is what the escape hatch is for, and it
+// names itself so it cannot be mistaken for a production setting.
+//
+// InsecureSkipVerify is honoured but refused outside local-dev for the same reason: TLS
+// without verification stops a passive reader and does nothing about an active one, so a
+// production deployment that set it would believe it had a protection it does not have.
+//
+// # Credentials
+//
+// The role decides which principal authenticates. Both pairs go through
+// Configuration.ValidateSASLPair, so a half-configured pair — a username with no secret, or
+// a secret with no username — is refused at construction rather than producing an
+// authentication failure on the first publish, hours later, in a log nobody is watching.
+//
+// Parameters:
+//   - cfg config.KafkaConfig: the Kafka block, read for TLS material and both credential
+//     pairs.
+//   - role KafkaTransportRole: which principal to authenticate as.
+//
+// Returns:
+//   - *kafka.Transport: the assembled transport. No I/O is performed: TLS material is read
+//     from disk, which is local, and a SCRAM mechanism is pure computation.
+//   - error: a malformed or half-configured credential pair, unreadable or invalid TLS
+//     material, or plaintext without the explicit local-dev acknowledgement.
+func NewKafkaTransport(cfg config.KafkaConfig, role KafkaTransportRole) (*kafka.Transport, error) {
+	transport := &kafka.Transport{
+		DialTimeout: eventTransportDialTimeout,
+		IdleTimeout: eventTransportIdleTimeout,
+		ClientID:    eventTransportClientID,
+	}
+
+	// Both halves are resolved before either is judged, and their errors are JOINED.
+	//
+	// A deployment that has neither enabled TLS nor finished configuring its credentials has
+	// two problems, and reporting one of them sends the operator round the loop twice: they
+	// fix the encryption, restart, and only then learn about the credential. Joining costs
+	// nothing and turns two boot failures into one.
+	tlsConfig, tlsErr := kafkaTLSConfig(cfg)
+	user, secret, credErr := kafkaTransportCredentials(cfg, role)
+	if err := errors.Join(tlsErr, credErr); err != nil {
+		return nil, err
+	}
+
+	transport.TLS = tlsConfig
+
+	if user != "" {
+		mechanism, mechErr := scram.Mechanism(scram.SHA512, user, secret)
+		if mechErr != nil {
+			return nil, saslCredentialError(role, user)
+		}
+
+		transport.SASL = mechanism
+	} else if tlsConfig == nil {
+		// Neither authenticated nor encrypted. That is only ever acceptable on a local
+		// broker, and only when the operator has said so.
+		logrus.WithField("role", string(role)).Warn(
+			"the Kafka transport is neither authenticated nor encrypted; " +
+				"this is only supported under KAFKA_INSECURE_LOCAL_DEV",
+		)
+	}
+
+	return transport, nil
+}
+
+// kafkaTLSConfig builds the verified TLS configuration, or returns nil when plaintext has
+// been explicitly permitted.
+//
+// A nil *tls.Config makes kafka-go dial in the clear, so returning nil is the plaintext
+// decision and it is reachable from exactly one place: TLS disabled AND local-dev
+// acknowledged. Every other combination either builds a verified configuration or fails.
+//
+// Returns:
+//   - *tls.Config: the verified configuration, or nil for explicitly-permitted plaintext.
+//   - error: TLS disabled without the local-dev acknowledgement, InsecureSkipVerify
+//     outside local dev, or unreadable/invalid CA or client key material.
+func kafkaTLSConfig(cfg config.KafkaConfig) (*tls.Config, error) {
+	if !cfg.TLS.Enabled {
+		if !cfg.InsecureLocalDev {
+			return nil, errors.New(
+				"blnk: KAFKA_TLS_ENABLED is false, so ledger events and the SASL/SCRAM handshake " +
+					"would travel in the clear. Enable TLS, or set KAFKA_INSECURE_LOCAL_DEV=true to " +
+					"acknowledge that this is a local development broker",
+			)
+		}
+
+		logrus.Warn(
+			"KAFKA_TLS_ENABLED is false and KAFKA_INSECURE_LOCAL_DEV is set: " +
+				"connecting to Kafka WITHOUT TLS. Ledger event payloads and SASL credentials are " +
+				"not encrypted in transit. This configuration must never be used outside local development",
+		)
+
+		return nil, nil
+	}
+
+	if cfg.TLS.InsecureSkipVerify && !cfg.InsecureLocalDev {
+		return nil, errors.New(
+			"blnk: KAFKA_TLS_INSECURE_SKIP_VERIFY disables broker certificate verification, which " +
+				"leaves the connection open to an active attacker while appearing encrypted. It is " +
+				"permitted only alongside KAFKA_INSECURE_LOCAL_DEV=true",
+		)
+	}
+
+	tlsConfig := &tls.Config{
+		// TLS 1.2 is the floor. Anything earlier has known weaknesses and no reason to be
+		// offered to a broker that this deployment controls.
+		MinVersion:         tls.VersionTLS12,
+		ServerName:         strings.TrimSpace(cfg.TLS.ServerName),
+		InsecureSkipVerify: cfg.TLS.InsecureSkipVerify, //nolint:gosec // refused above unless KAFKA_INSECURE_LOCAL_DEV is set
+	}
+
+	if caFile := strings.TrimSpace(cfg.TLS.CAFile); caFile != "" {
+		pem, readErr := os.ReadFile(caFile)
+		if readErr != nil {
+			return nil, fmt.Errorf("blnk: reading KAFKA_TLS_CA_FILE %q: %w", caFile, readErr)
+		}
+
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf(
+				"blnk: KAFKA_TLS_CA_FILE %q contains no usable PEM certificate; "+
+					"an empty trust pool would fall back to the system roots and silently trust "+
+					"a broker this deployment never intended to", caFile)
+		}
+
+		tlsConfig.RootCAs = pool
+	}
+
+	certFile := strings.TrimSpace(cfg.TLS.CertFile)
+	keyFile := strings.TrimSpace(cfg.TLS.KeyFile)
+
+	switch {
+	case certFile != "" && keyFile != "":
+		certificate, certErr := tls.LoadX509KeyPair(certFile, keyFile)
+		if certErr != nil {
+			// The paths are named; the key material is not rendered.
+			return nil, fmt.Errorf(
+				"blnk: loading the Kafka client certificate from KAFKA_TLS_CERT_FILE %q and "+
+					"KAFKA_TLS_KEY_FILE %q: %w", certFile, keyFile, certErr)
+		}
+
+		tlsConfig.Certificates = []tls.Certificate{certificate}
+
+	case certFile != "" || keyFile != "":
+		// Half a client certificate is not a weaker mutual-TLS setup; it is no mutual TLS
+		// at all, silently, while the operator believes otherwise.
+		return nil, errors.New(
+			"blnk: KAFKA_TLS_CERT_FILE and KAFKA_TLS_KEY_FILE must be set together; " +
+				"one without the other yields no client certificate and mutual TLS would not be in effect",
+		)
+	}
+
+	return tlsConfig, nil
+}
+
+// kafkaTransportCredentials selects and validates the credential pair for a role.
+//
+// # PRIV-01: the producer must not be the administrator
+//
+// The steady-state publisher used to authenticate as KAFKA_SASL_ADMIN_USER — the principal
+// that creates topics, alters SCRAM credentials and manages ACLs. Every ledger event was
+// therefore produced by the most privileged identity in the system, so a leaked producer
+// credential handed an attacker the ability to rewrite the access model rather than merely
+// to publish events, and nothing in the broker's audit trail could distinguish routine
+// publishing from administration.
+//
+// The producer role now prefers the DEDICATED pair, KAFKA_SASL_USER / KAFKA_SASL_SECRET.
+// Falling back to the admin pair is retained for one reason only — an existing deployment
+// that has not yet provisioned a producer principal must keep publishing rather than stop
+// dead on an upgrade — and it WARNS every time, naming the variables to set, because a
+// silent fallback is how a temporary compatibility path becomes the permanent
+// configuration.
+//
+// Parameters:
+//   - cfg config.KafkaConfig: the Kafka block.
+//   - role KafkaTransportRole: which principal to resolve.
+//
+// Returns:
+//   - user, secret string: the resolved pair. Both empty means no SASL is configured,
+//     which is legitimate for an unauthenticated local broker.
+//   - error: a half-configured pair, for either role.
+func kafkaTransportCredentials(cfg config.KafkaConfig, role KafkaTransportRole) (string, string, error) {
+	if role == KafkaTransportRoleAdmin {
+		if err := cfg.ValidateSASLAdminCredentials(); err != nil {
+			return "", "", err
+		}
+
+		// Resolved through the ONE named reading rather than by trimming the fields here.
+		// Both values are trimmed by it, so a secret carrying a trailing newline from a
+		// secret store cannot reach the SASL mechanism, and "exactly one set" cannot
+		// produce a half-authenticated transport: it is refused above.
+		user, secret, _ := cfg.SASLAdminCredentials()
+
+		return user, secret, nil
+	}
+
+	if err := config.ValidateSASLPair("producer", cfg.SASLUser, cfg.SASLSecret); err != nil {
+		return "", "", err
+	}
+
+	if producer := strings.TrimSpace(cfg.SASLUser); producer != "" {
+		return producer, cfg.SASLSecret, nil
+	}
+
+	if err := cfg.ValidateSASLAdminCredentials(); err != nil {
+		return "", "", err
+	}
+
+	if admin, adminSecret, enabled := cfg.SASLAdminCredentials(); enabled {
+		logrus.WithField("principal", admin).Warn(
+			"the event publisher is authenticating with the KAFKA ADMIN credentials because " +
+				"KAFKA_SASL_USER and KAFKA_SASL_SECRET are not set. The admin principal can create " +
+				"topics, alter SCRAM credentials and manage ACLs, so publishing every ledger event " +
+				"as that principal turns a leaked producer credential into a full compromise of the " +
+				"cluster's authorization state rather than the ability to publish events. " +
+				"Provision a dedicated producer principal with Write and Describe on the Blnk-owned " +
+				"topics and set KAFKA_SASL_USER and KAFKA_SASL_SECRET",
+		)
+
+		return admin, adminSecret, nil
+	}
+
+	return "", "", nil
 }
 
 // saslProbeValue is a fixed, non-secret placeholder used ONLY to establish which of the two
@@ -787,25 +1413,35 @@ const saslProbeValue = "sasl-probe"
 // two values is at fault is established by re-preparing the username alone against
 // saslProbeValue, so the answer is precise without the secret being rendered anywhere.
 //
+// The ROLE decides which variable names appear in the message, because telling an operator
+// to check KAFKA_SASL_ADMIN_USER when the producer pair is at fault sends them to the wrong
+// line of their configuration.
+//
 // Parameters:
-//   - username string: the configured KAFKA_SASL_ADMIN_USER.
+//   - role KafkaTransportRole: which principal failed to prepare.
+//   - username string: the configured username for that role.
 //
 // Returns:
 //   - error: a message naming the offending variable, never containing the secret.
-func saslCredentialError(username string) error {
+func saslCredentialError(role KafkaTransportRole, username string) error {
+	userVar, secretVar := "KAFKA_SASL_USER", "KAFKA_SASL_SECRET"
+	if role == KafkaTransportRoleAdmin {
+		userVar, secretVar = "KAFKA_SASL_ADMIN_USER", "KAFKA_SASL_ADMIN_SECRET"
+	}
+
 	if _, err := scram.Mechanism(scram.SHA512, username, saslProbeValue); err != nil {
 		return fmt.Errorf(
-			"blnk: KAFKA_SASL_ADMIN_USER %q cannot be prepared as a SASL/SCRAM-SHA-512 credential; "+
+			"blnk: %s %q cannot be prepared as a SASL/SCRAM-SHA-512 credential; "+
 				"SASLprep rejects it, typically because of a prohibited or unassigned Unicode code point",
-			username,
+			userVar, username,
 		)
 	}
 
 	return fmt.Errorf(
-		"blnk: KAFKA_SASL_ADMIN_SECRET cannot be prepared as a SASL/SCRAM-SHA-512 credential for user %q; "+
+		"blnk: %s cannot be prepared as a SASL/SCRAM-SHA-512 credential for user %q; "+
 			"SASLprep rejects it, typically because of a prohibited or unassigned Unicode code point. "+
 			"The secret is deliberately omitted from this message",
-		username,
+		secretVar, username,
 	)
 }
 
@@ -837,6 +1473,7 @@ func (p *kafkaPublisher) newWriter(topic string) *kafka.Writer {
 		RequiredAcks:           eventWriterRequiredAcks,
 		MaxAttempts:            eventWriterMaxAttempts,
 		BatchSize:              eventWriterBatchSize,
+		BatchBytes:             eventWriterBatchBytes,
 		BatchTimeout:           eventWriterBatchTimeout,
 		WriteTimeout:           eventWriterWriteTimeout,
 		ReadTimeout:            eventWriterReadTimeout,
@@ -848,31 +1485,66 @@ func (p *kafkaPublisher) newWriter(topic string) *kafka.Writer {
 	}
 }
 
-// writerFor returns the writer for a topic, creating and caching one if this is a topic
-// the publisher has not seen.
+// ErrTopicNotOwned is returned when a publish names a topic outside the Blnk-owned
+// namespace.
 //
-// Lazy growth is required for correctness rather than added for flexibility, because
-// two reachable situations produce a topic that is not in the pre-created set:
+// It is a sentinel rather than a formatted error so a caller can classify it without
+// matching on message text, and so the topic-membership refusal is provably the same
+// condition wherever it is checked.
+var ErrTopicNotOwned = errors.New("blnk: refusing to publish to a topic Blnk does not own")
+
+// writerFor returns the writer for a topic, creating and caching one only for topics
+// inside the Blnk-owned namespace.
 //
-//   - A TOPIC PREFIX CHANGE. The prefix is re-read from live configuration on every
-//     naming call, so a reload can start resolving events to names this publisher was
-//     not constructed with.
-//   - A STORED ROW FROM BEFORE SUCH A CHANGE. An outbox row records its destination at
-//     insert time, precisely so it stays publishable — and a dead-lettered event stays
-//     replayable — to the topic it was always meant for. Refusing to publish it because
-//     the name is no longer the one configuration would compose today would strand a
-//     committed event.
+// # VALID-01: lazy growth had no membership check, and that was a data-driven write
 //
-// The fast path takes only a read lock, so concurrent publishes to the eight known
-// topics never serialise. Growth double-checks under the write lock so two goroutines
-// racing on a new topic share one writer rather than orphaning one.
+// The destination of a publish comes from a STORED OUTBOX ROW. Lazy writer creation with no
+// membership test therefore meant that any topic name which reached the table would be
+// created as a writer and published to — using Blnk's own producer credentials, on Blnk's
+// own broker, at the direction of stored data. A row carrying "attacker.transactions", or a
+// name with an injected segment, would be delivered exactly as asked. The persistence layer
+// now refuses such a row at insert, and this is the second half of that defence: the two
+// together mean a row would have to bypass validation AND survive here to reach a foreign
+// topic.
+//
+// # What is admitted, and why the cache is not a hole in it
+//
+// Two sets of topics are served, and they have different provenance:
+//
+//   - THE PRE-CREATED SET, built at construction from AllTopicsWithDeadLetters — that is,
+//     from BLNK'S OWN CONFIGURATION. Under a fixed prefix this is already every owned name,
+//     since the owned namespace is exactly prefix.<category> and its `.dlt` sibling for the
+//     five known categories. These are served from the fast path with no membership test,
+//     which is safe precisely because stored data had no say in which ones exist.
+//   - LAZILY GROWN NAMES, which are the only ones a stored row can influence, and the only
+//     ones the membership test governs. It uses model.IsBlnkEventTopic against the CURRENTLY
+//     CONFIGURED prefix, so a name is admitted only if it is prefix.<known-category>
+//     optionally suffixed `.dlt`. Nothing else is.
+//
+// Growth is reachable in exactly one situation: a TOPIC PREFIX CHANGE. The prefix is re-read
+// from live configuration on every naming call, so a reload starts resolving events to names
+// this publisher was not constructed with; those names are owned under the new prefix and are
+// admitted and cached.
+//
+// A STORED ROW FROM BEFORE SUCH A CHANGE keeps working, because its topic is in the
+// pre-created set — the process built a writer for it at startup, from the prefix that was in
+// force then. So the committed event still reaches the topic it was always bound for, which
+// is what the row recorded its destination for in the first place. A row naming a prefix this
+// process never had is the one case that is refused, and refusing it loses nothing: the row
+// stays claimable, its failure names the reason, and an operator can re-point it.
+//
+// The fast path takes only a read lock, so concurrent publishes to the pre-created topics
+// never serialise, and no membership test is paid on it. Growth double-checks under the
+// write lock so two goroutines racing on a new topic share one writer rather than orphaning
+// one.
 //
 // Parameters:
 //   - topic string: a non-empty, fully-resolved topic name.
 //
 // Returns:
 //   - *kafka.Writer: the writer for that topic.
-//   - error: ErrEventPublisherClosed when the publisher has been closed.
+//   - error: ErrEventPublisherClosed when the publisher has been closed, or
+//     ErrTopicNotOwned when the topic lies outside the Blnk-owned namespace.
 func (p *kafkaPublisher) writerFor(topic string) (*kafka.Writer, error) {
 	p.mu.RLock()
 	if p.closed {
@@ -886,6 +1558,30 @@ func (p *kafkaPublisher) writerFor(topic string) (*kafka.Writer, error) {
 
 	if found {
 		return writer, nil
+	}
+
+	// Checked BEFORE the write lock is taken, so a rejected topic never contends with
+	// live publishes and never enters the map.
+	// Pinned to the CONFIGURED prefix, deliberately, and not to the owned FORM. A form test
+	// would also admit '<someone else>.transactions', and this is the one place a topic name
+	// turns into an outbound connection, so the narrower test is the right one here.
+	//
+	// It does not strand an event stored before a KAFKA_TOPIC_PREFIX change: the publisher
+	// pre-creates the whole inventory of the prefix it was BUILT with, so such a row names a
+	// topic already in the map and is served by the fast path above without reaching this
+	// check at all. What is refused is a generation that predates this process, which is an
+	// operator action — restore the prefix, or drain the old topics — rather than something
+	// to admit silently. IsOwnedTopicForm is the wider form test, for callers that need it.
+	if !model.IsBlnkEventTopic(topic, TopicPrefix()) {
+		logrus.WithFields(logrus.Fields{
+			"topic":          topic,
+			"owned_prefix":   TopicPrefix(),
+			"owned_topics":   len(p.writers),
+			"refusal_reason": "topic is not in the Blnk-owned namespace",
+		}).Error("refusing to create a Kafka writer for a topic Blnk does not own")
+
+		return nil, fmt.Errorf("%w: %q is not %s.<category> or %s.<category>.dlt",
+			ErrTopicNotOwned, topic, TopicPrefix(), TopicPrefix())
 	}
 
 	p.mu.Lock()
@@ -902,14 +1598,75 @@ func (p *kafkaPublisher) writerFor(topic string) (*kafka.Writer, error) {
 	}
 
 	logrus.WithField("topic", topic).Info(
-		"creating a Kafka writer for a topic outside the configured inventory; " +
-			"this is expected for an event stored before a topic-prefix change",
+		"creating a Kafka writer for a Blnk-owned topic outside the pre-created inventory; " +
+			"this is expected after a topic-prefix change",
 	)
 
 	writer = p.newWriter(topic)
 	p.writers[topic] = writer
+	p.lazyTopics = append(p.lazyTopics, topic)
+
+	retired, retiredTopic := p.retireOldestLazyWriterLocked()
+
+	if retired != nil {
+		lazyCount := len(p.lazyTopics)
+
+		// Closed in a goroutine so it happens OUTSIDE this function's deferred unlock.
+		// Close flushes whatever the writer still holds, and doing that under the write
+		// lock would stall every concurrent publish — including publishes to the eight
+		// known topics, which have nothing to do with this retirement.
+		go func() {
+			if err := retired.Close(); err != nil {
+				logrus.WithError(err).WithField("topic", retiredTopic).Warn(
+					"failed to close a retired Kafka writer while bounding the writer cache",
+				)
+			}
+
+			logrus.WithFields(logrus.Fields{
+				"retired_topic": retiredTopic,
+				"new_topic":     topic,
+				"lazy_writers":  lazyCount,
+				"bound":         maxLazyTopicWriters,
+			}).Info(
+				"retired the oldest lazily-created Kafka writer to stay within the writer cache bound",
+			)
+		}()
+	}
 
 	return writer, nil
+}
+
+// retireOldestLazyWriterLocked evicts the oldest lazily-created writer once the cache is
+// over its bound, and returns it for the caller to close.
+//
+// This is a CACHE EVICTION and not a refusal. A retired topic that is published to again
+// simply gets a new writer on the next call, so no event is ever stranded by an eviction —
+// which is what makes bounding the cache a cost decision rather than a correctness one. What
+// eviction costs is one reconnection for a topic that has not been used recently; what it
+// prevents is a writer pool, and its connections, that only ever grows.
+//
+// The caller must hold the write lock. The returned writer is NOT closed here, because
+// closing flushes and would stall every concurrent publish if done under the lock.
+//
+// Returns:
+//   - *kafka.Writer: the retired writer, or nil when the cache is within its bound.
+//   - string: the topic the retired writer served, or "".
+func (p *kafkaPublisher) retireOldestLazyWriterLocked() (*kafka.Writer, string) {
+	if len(p.lazyTopics) <= maxLazyTopicWriters {
+		return nil, ""
+	}
+
+	oldest := p.lazyTopics[0]
+	p.lazyTopics = p.lazyTopics[1:]
+
+	retired, found := p.writers[oldest]
+	if !found {
+		return nil, ""
+	}
+
+	delete(p.writers, oldest)
+
+	return retired, oldest
 }
 
 // Publish publishes an event to the topic its type routes to.
@@ -1004,6 +1761,34 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 		return failed, failed.Err
 	}
 
+	// SIZE-01: the size ceiling is enforced HERE, on the fully-marshalled envelope, and
+	// not only on the stored payload.
+	//
+	// Persistence validates the payload it is handed, which is the right place to reject a
+	// caller's oversized data. But what Kafka is asked to accept is this envelope: the
+	// payload plus event_id, event_type, aggregate_id, occurred_at and schema_version, and
+	// for a dead-letter copy the whole failure_metadata object as well. So a payload that
+	// passed validation can still produce a message over the limit, and without a check
+	// here that message reaches the writer, is rejected by it or by the broker on every
+	// attempt, and — because the dead-letter copy is strictly larger — cannot be
+	// dead-lettered either. The row would then never reach a terminal state: an unbounded,
+	// self-inflicted backlog from one event.
+	//
+	// The failure is PERMANENT. Retrying cannot shrink a message, and the broker's answer
+	// will not change, so classifying it transient would spend the whole retry budget
+	// establishing what is already known. Marked permanent, the relay exhausts it
+	// immediately and the operator sees the real reason in last_error.
+	if len(value) > model.MaxEventMessageBytes {
+		result.Duration = elapsed()
+		failed := p.fail(ctx, result, fmt.Errorf(
+			"%w: the serialised event is %d bytes, over the %d byte maximum; "+
+				"retrying cannot shrink it and a dead-letter copy would be larger still",
+			ErrEventMessageTooLarge, len(value), model.MaxEventMessageBytes,
+		), false)
+
+		return failed, failed.Err
+	}
+
 	writer, err := p.writerFor(result.Topic)
 	if err != nil {
 		result.Duration = elapsed()
@@ -1011,6 +1796,10 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 		// A closed publisher is permanent for this attempt: this instance will not
 		// accept another write. The event is safe, because its row is only marked
 		// dispatched on success and becomes claimable again when the lease expires.
+		//
+		// A refused topic (ErrTopicNotOwned) is permanent for a different and stronger
+		// reason: the destination itself is not one Blnk may write to, so no retry and no
+		// broker state can make the write legitimate.
 		failed := p.fail(ctx, result, err, false)
 
 		return failed, failed.Err
@@ -1034,13 +1823,28 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 	result.Duration = elapsed()
 	result.Status = model.PublishStatusDispatched
 
-	metrics.EventsPublishedTotal.Add(ctx, 1, otelmetric.WithAttributes(
-		attribute.String(publishAttrTopic, result.Topic),
-		attribute.String(publishAttrEventType, result.EventType),
-	))
+	// ONLY an original publish increments this counter. It is the denominator of the
+	// dead-letter rate, so a replay or a dead-letter write counted here would make that
+	// rate depend on how much triage happened that day rather than on how the pipeline is
+	// behaving.
+	if result.Purpose == PublishPurposeOriginal {
+		metrics.EventsPublishedTotal.Add(ctx, 1, otelmetric.WithAttributes(
+			attribute.String(publishAttrTopic, boundedTopicLabel(result.Topic)),
+			attribute.String(publishAttrEventType, boundedEventTypeLabel(result.EventType)),
+		))
+	}
+
 	recordPublishAttempt(ctx, result)
 
-	logrus.WithFields(result.LogFields()).Debug("ledger event published to kafka")
+	// GUARDED, and the failure log deliberately is not. LogFields builds a map, hashes the
+	// partition key and bounds the error string on every call, and this one runs once per
+	// published event at 500 events per second — work whose result is discarded whenever
+	// debug is off, which is every production deployment. The failure log stays unguarded
+	// because requirement R-4 mandates the attempt number and error reason on EVERY
+	// attempt.
+	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+		logrus.WithFields(result.LogFields()).Debug("ledger event published to kafka")
+	}
 
 	return result, nil
 }
@@ -1066,7 +1870,19 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 // Returns:
 //   - PublishResult: the completed result, with Status retrying and Err populated.
 func (p *kafkaPublisher) fail(ctx context.Context, result PublishResult, cause error, transient bool) PublishResult {
-	result.Status = model.PublishStatusRetrying
+	// RETRYING and FAILED are not the same outcome, and reporting every failure as
+	// retrying made a permanently-stuck event indistinguishable from a busy one in both
+	// the logs and the attempts counter. Another attempt is possible only when the failure
+	// looked transient AND the attempt did not spend the budget the row stated; a
+	// permanent error is terminal whatever the budget says, because no number of further
+	// attempts makes corrupt bytes valid or an oversized message small.
+	result.Retryable = transient && !attemptBudgetSpent(result.Attempt, result.MaxAttempts)
+	if result.Retryable {
+		result.Status = model.PublishStatusRetrying
+	} else {
+		result.Status = model.PublishStatusFailed
+	}
+
 	result.Transient = transient
 	result.Err = &PublishError{
 		Topic:     result.Topic,
@@ -1510,9 +2326,12 @@ func recordPublishAttempt(ctx context.Context, result PublishResult) {
 		attribute.String(publishAttrOutcome, string(result.Status)),
 	))
 
+	// attemptLabel and not strconv: the attribute sits on a HISTOGRAM, so its cardinality
+	// is multiplied by the bucket count and the domain has to stay closed at its eight
+	// declared values. See attemptLabel for the three inputs that would otherwise widen it.
 	metrics.EventPublishDuration.Record(ctx, result.Duration.Seconds(), otelmetric.WithAttributes(
-		attribute.String(publishAttrTopic, result.Topic),
-		attribute.String(publishAttrAttempt, strconv.Itoa(result.Attempt)),
+		attribute.String(publishAttrTopic, boundedTopicLabel(result.Topic)),
+		attribute.String(publishAttrAttempt, attemptLabel(result.Purpose, result.Attempt)),
 	))
 }
 

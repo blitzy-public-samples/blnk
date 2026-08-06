@@ -163,7 +163,9 @@ func TestCodeNamingConvention(t *testing.T) {
 		ErrNotFound: true, ErrConflict: true, ErrBadRequest: true,
 		ErrInvalidInput: true, ErrInternalServer: true, ErrRateLimited: true,
 	}
-	// Registry of legal code families. EVENT_ and SUBSCRIBER_ were registered by the event-streaming change — a registration, not a loosening: an unregistered prefix still fails.
+	// The registry of legal code families. A prefix absent from this list fails the
+	// test, so widening the vocabulary is a deliberate edit here rather than a side
+	// effect of adding a code.
 	prefixes := []string{"GEN_", "AUTH_", "APIKEY_", "TXN_", "BAL_", "LGR_", "ACC_", "IDT_", "RECON_", "META_", "HOOK_", "SRCH_", "ADMIN_", "EVENT_", "SUBSCRIBER_"}
 	for code := range statusByCode {
 		if legacySet[code] {

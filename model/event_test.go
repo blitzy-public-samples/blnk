@@ -18,6 +18,7 @@ package model
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -255,19 +256,85 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 	assert.Len(t, tests, 15, "the table must cover all thirteen emitted event types, with the runtime-composed bulk name exercised by three suffixes")
 }
 
-// TestEventCategory_UnknownEventFallsBackToSystem pins the catch-all arm.
+// TestEventCategory_UnknownEventFallsBackToQuarantine pins the catch-all arm, and
+// pins WHERE it points.
 //
-// The default is what keeps the coverage guarantee true for event types that do
-// not exist yet: a producer added later that forgets to extend the mapping still
-// gets its events published to a real topic where they are observable, instead of
-// being rejected or silently dropped. That behaviour is load-bearing, so it is
-// asserted rather than assumed.
-func TestEventCategory_UnknownEventFallsBackToSystem(t *testing.T) {
-	assert.Equal(t, EventCategorySystem, EventCategory("totally.unknown.event"),
-		"an unrecognised event type must fall back to the system category — dropping it or returning an empty token would breach the zero-exceptions coverage guarantee for event types added later")
+// Two properties are being asserted, and they pull in opposite directions:
+//
+//  1. Coverage. An event type nobody mapped must still resolve to a real category, so
+//     a producer added later that forgets to extend the table gets its events
+//     published and observable rather than rejected or dropped. The row is already
+//     committed by the time routing happens, so rejecting would strand a durable
+//     event.
+//  2. Containment. That destination must NOT be a topic real subscribers consume.
+//     The catch-all used to be the system category, which meant a forgotten mapping
+//     delivered whatever the new producer emitted — plausibly a balance or an
+//     identity record — to whoever consumes system events. Quarantine is internal and
+//     cannot be granted to a subscriber, so the omission stays contained.
+//
+// The explicit not-system assertions are the point of the test: an edit that
+// "simplifies" the catch-all back to EventCategorySystem restores the disclosure, and
+// a coverage-only assertion would not notice.
+func TestEventCategory_UnknownEventFallsBackToQuarantine(t *testing.T) {
+	assert.Equal(t, EventCategoryQuarantine, EventCategory("totally.unknown.event"),
+		"an unrecognised event type must fall back to the quarantine category — dropping it or returning an empty token would breach the zero-exceptions coverage guarantee for event types added later")
+	assert.NotEqual(t, EventCategorySystem, EventCategory("totally.unknown.event"),
+		"the catch-all must NOT be the system category: routing an unmapped payload there exposes it to whoever consumes system events")
 
-	assert.Equal(t, EventCategorySystem, EventCategory(""),
+	assert.Equal(t, EventCategoryQuarantine, EventCategory(""),
 		"the empty event type must also resolve to a real category: the resolver is total, so no input can ever produce an empty category token that would then compose a malformed topic name")
+	assert.NotEqual(t, EventCategorySystem, EventCategory(""),
+		"a blank event type is an unclassifiable event, which is exactly what quarantine exists for")
+
+	assert.True(t, IsInternalEventCategory(EventCategoryQuarantine),
+		"quarantine must be internal, or containment is nominal: a grantable quarantine topic is the same disclosure by another name")
+}
+
+// TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory pins the
+// allowlist the subscriber authorization path and the ACL provisioning both consult.
+//
+// It asserts the exclusions by NAME rather than by count, because a count-only
+// assertion passes just as happily when a category is swapped for another as when the
+// list is correct.
+func TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory(t *testing.T) {
+	grantable := SubscriberGrantableEventCategories()
+
+	assert.Contains(t, grantable, EventCategoryTransactions, "transactions is subscriber-facing ledger data")
+	assert.Contains(t, grantable, EventCategoryBalances, "balances is subscriber-facing ledger data")
+	assert.Contains(t, grantable, EventCategoryIdentities, "identities is subscriber-facing data")
+
+	assert.NotContains(t, grantable, EventCategorySystem,
+		"the system category carries Blnk's own internal error detail and must never be grantable to a subscriber")
+	assert.NotContains(t, grantable, EventCategoryQuarantine,
+		"the quarantine category carries events of unknown provenance, so its audience cannot be established and it must never be grantable")
+
+	for _, category := range grantable {
+		assert.False(t, IsInternalEventCategory(category),
+			"category %q is offered to subscribers, so it must not be internal", category)
+	}
+
+	// Every category is either grantable or internal — there is no third state a new
+	// category could quietly fall into.
+	for _, category := range AllEventCategories() {
+		if IsInternalEventCategory(category) {
+			assert.NotContains(t, grantable, category)
+
+			continue
+		}
+		assert.Contains(t, grantable, category,
+			"category %q is not internal, so it must appear in the grantable list; a category that is neither is unreachable for subscribers with nothing to say so", category)
+	}
+
+	// The accessors must hand back copies, or one caller's sort reorders every other
+	// caller's view.
+	grantable[0] = "mutated"
+	assert.NotContains(t, SubscriberGrantableEventCategories(), "mutated",
+		"SubscriberGrantableEventCategories must return a fresh slice")
+
+	all := AllEventCategories()
+	all[0] = "mutated"
+	assert.NotContains(t, AllEventCategories(), "mutated",
+		"AllEventCategories must return a fresh slice")
 }
 
 // TestEventCategory_PrefixBoundaryIsExact pins the boundary between the
@@ -280,10 +347,10 @@ func TestEventCategory_PrefixBoundaryIsExact(t *testing.T) {
 	assert.Equal(t, EventCategoryTransactions, EventCategory("bulk_transaction."),
 		"the bare prefix with an empty status must still satisfy the prefix test; requiring a non-empty suffix would be a stricter rule than the producer guarantees")
 
-	assert.Equal(t, EventCategorySystem, EventCategory("bulk_transaction"),
+	assert.Equal(t, EventCategoryQuarantine, EventCategory("bulk_transaction"),
 		"\"bulk_transaction\" without the trailing dot is not an emitted event string and must NOT satisfy the prefix test — the separator is part of the prefix, so dropping it from the constant is caught here")
 
-	assert.Equal(t, EventCategorySystem, EventCategory("transaction.applied.v2"),
+	assert.Equal(t, EventCategoryQuarantine, EventCategory("transaction.applied.v2"),
 		"the transaction arms are exact matches, not prefix matches: a longer string that merely starts with an emitted name must fall through to the catch-all rather than being routed as if it were that event")
 }
 
@@ -293,10 +360,10 @@ func TestEventCategory_PrefixBoundaryIsExact(t *testing.T) {
 // behavioural benefit that then has to be mutation-tested. Pinning the absence of
 // folding is what catches a mutant — or a well-meaning refactor — that inserts it.
 func TestEventCategory_IsCaseSensitive(t *testing.T) {
-	assert.Equal(t, EventCategorySystem, EventCategory("TRANSACTION.APPLIED"),
+	assert.Equal(t, EventCategoryQuarantine, EventCategory("TRANSACTION.APPLIED"),
 		"comparison is exact and case-sensitive: an upper-cased event type is not an emitted event string and must fall through to the catch-all, not be folded into the transactions category")
 
-	assert.Equal(t, EventCategorySystem, EventCategory("BULK_TRANSACTION.applied"),
+	assert.Equal(t, EventCategoryQuarantine, EventCategory("BULK_TRANSACTION.applied"),
 		"the prefix test is case-sensitive too, for the same reason: producers compose the lower-case prefix literally")
 }
 
@@ -326,7 +393,7 @@ func TestSchemaVersionV1_IsOne(t *testing.T) {
 		"schema_version is specified as an integer, so the constant must default to int and marshal as 1 rather than \"1\"")
 }
 
-// TestEventCategoryConstants_HaveWireValues pins the four category tokens.
+// TestEventCategoryConstants_HaveWireValues pins every category token.
 //
 // These are bare tokens, not topic names: the topic-naming layer composes
 // "<prefix>.<category>" and "<prefix>.<category>.dlt" from them. Changing one of
@@ -343,8 +410,10 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 		"the identities token composes blnk.identities and blnk.identities.dlt")
 	assert.Equal(t, "system", EventCategorySystem,
 		"the system token composes blnk.system and blnk.system.dlt — the deliberate fourth category that keeps ledger and system-error events covered")
+	assert.Equal(t, "quarantine", EventCategoryQuarantine,
+		"the quarantine token composes blnk.quarantine and blnk.quarantine.dlt — the catch-all that keeps an unrecognised event type published rather than dropped, and it is pinned for the same reason as the other four: renaming it renames two real Kafka topics")
 
-	// The four must be mutually distinct, or two categories would collapse onto
+	// Every token must be mutually distinct, or two categories would collapse onto
 	// one topic and a subscriber filtering by topic would receive events it never
 	// subscribed to.
 	distinct := map[string]struct{}{
@@ -352,9 +421,16 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 		EventCategoryBalances:     {},
 		EventCategoryIdentities:   {},
 		EventCategorySystem:       {},
+		EventCategoryQuarantine:   {},
 	}
-	assert.Len(t, distinct, 4,
-		"the four category tokens must be mutually distinct: two sharing a value would silently merge two topics into one")
+	assert.Len(t, distinct, len(AllEventCategories()),
+		"the category tokens must be mutually distinct: two sharing a value would silently merge two topics into one")
+	// Derived from the canonical order rather than counted by hand, so a category added
+	// there without a literal pinned above fails here instead of shipping unpinned.
+	for _, category := range AllEventCategories() {
+		assert.Contains(t, distinct, category,
+			"category %q has no pinned wire value; add one above", category)
+	}
 
 	// A category token must never contain the separator the topic-naming layer
 	// uses, or "<prefix>.<category>" would produce an extra segment and the
@@ -407,6 +483,25 @@ func TestPublishStatus_HasExactlyTheThreeReportedOutcomes(t *testing.T) {
 // constant and the SQL predicate produces a relay that claims nothing while
 // reporting no error at all.
 func TestEventOutboxStatus_ValuesAndLineageRelationship(t *testing.T) {
+	t.Run("the replaying state has its stored value and is distinct", func(t *testing.T) {
+		assert.Equal(t, "replaying", EventOutboxStatusReplaying,
+			"replaying is the transient state a replay CLAIMS a dead-lettered row into, which is what stops two concurrent replays from both publishing the same event")
+
+		// It must not collide with any other state, or a replay claim would be
+		// indistinguishable from an ordinary state and the conditional transition
+		// would match rows it must not touch.
+		for name, value := range map[string]string{
+			"pending":       EventOutboxStatusPending,
+			"processing":    EventOutboxStatusProcessing,
+			"dispatched":    EventOutboxStatusDispatched,
+			"failed":        EventOutboxStatusFailed,
+			"dead_lettered": EventOutboxStatusDeadLettered,
+		} {
+			assert.NotEqual(t, value, EventOutboxStatusReplaying,
+				"replaying must be distinct from %s, or the replay claim's conditional UPDATE would match rows in that state too", name)
+		}
+	})
+
 	t.Run("the five durable states have their stored values", func(t *testing.T) {
 		assert.Equal(t, "pending", EventOutboxStatusPending,
 			"pending is the initial state set by the column default when the row is inserted alongside the ledger mutation, and the value the pending partial index filters on")
@@ -507,7 +602,7 @@ func TestLedgerEvent_PayloadIsRawMessage(t *testing.T) {
 		field, ok := reflect.TypeOf(EventOutbox{}).FieldByName("Payload")
 		require.True(t, ok, "EventOutbox must declare a Payload field: it is the stored copy both transports read during the dual-delivery window")
 		assert.Equal(t, rawMessageType, field.Type,
-			"EventOutbox.Payload must be json.RawMessage so the stored JSONB bytes are neither reordered nor renormalised between the insert and the publish — that identity is what makes the two transports' payloads equal structurally rather than by careful coding")
+			"EventOutbox.Payload must be json.RawMessage so the bytes held in the payload_raw BYTEA column are neither reordered nor renormalised between the insert and the publish — that identity is what makes the two transports' payloads equal structurally rather than by careful coding")
 	})
 
 	t.Run("EventOutbox.FailureMetadata", func(t *testing.T) {
@@ -847,11 +942,15 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 		// comparing, because the column name is the tag's name portion only.
 		expected := []string{
 			// event envelope
-			"id", "event_id", "event_type", "aggregate_id", "ledger_id", "topic",
-			"schema_version", "payload", "occurred_at",
-			// relay state machine
-			"status", "attempts", "max_attempts", "last_error",
+			"id", "event_id", "event_type", "aggregate_id", "partition_key", "ledger_id",
+			"topic", "schema_version", "payload", "occurred_at",
+			// relay state machine. next_attempt_at is the DURABLE form of the
+			// configured backoff: the claim predicate is next_attempt_at <= NOW(),
+			// which is what keeps a retrying row out of the claimable set for the
+			// delay the caller computed instead of the relay having to sleep it.
+			"status", "attempts", "max_attempts", "next_attempt_at", "last_error",
 			"first_attempted_at", "last_attempted_at", "dispatched_at", "locked_until",
+			"claim_token",
 			// dual-delivery marker
 			"webhook_dispatched",
 			// dead-letter record
@@ -911,7 +1010,10 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 		assert.Equal(t, reflect.Bool, webhookDispatched.Type.Kind(),
 			"WebhookDispatched must be a bool: it makes the legacy delivery leg individually idempotent, so a row republished to Kafka after a crash does not also re-enqueue a duplicate webhook")
 
-		for _, name := range []string{"EventID", "EventType", "AggregateID", "LedgerID", "Topic", "Status", "LastError", "DLTTopic"} {
+		for _, name := range []string{
+			"EventID", "EventType", "AggregateID", "PartitionKey", "LedgerID", "Topic",
+			"Status", "LastError", "ClaimToken", "DLTTopic",
+		} {
 			field, ok := typ.FieldByName(name)
 			require.True(t, ok, "EventOutbox must declare %s", name)
 			assert.Equal(t, reflect.String, field.Type.Kind(),
@@ -927,11 +1029,26 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 		// every response with a null.
 		omitempty := map[string]bool{
 			"id": false, "event_id": false, "event_type": false, "aggregate_id": false,
-			"ledger_id": true, "topic": false, "schema_version": false, "payload": false,
+			// partition_key is required: it is the Kafka message key and is never
+			// blank on a persisted row, because a blank key would let the broker
+			// scatter the event round-robin and silently destroy per-aggregate
+			// ordering. ledger_id, by contrast, is legitimately absent for the
+			// event types that genuinely have no ledger.
+			"partition_key": false, "ledger_id": true,
+			"topic": false, "schema_version": false, "payload": false,
 			"occurred_at": false, "status": false, "attempts": false, "max_attempts": false,
-			"last_error": true, "first_attempted_at": true, "last_attempted_at": true,
-			"dispatched_at": true, "locked_until": true, "webhook_dispatched": false,
-			"dlt_topic": true, "failure_metadata": true,
+			// next_attempt_at is NOT NULL on the table with a NOW() default, so it
+			// always has a value and is always reported. Omitting it would make "due
+			// now" indistinguishable from "the field was not populated", which is the
+			// one question an operator asks of a row that is not being picked up.
+			"next_attempt_at": false,
+			"last_error":      true, "first_attempted_at": true, "last_attempted_at": true,
+			"dispatched_at": true, "locked_until": true,
+			// claim_token is empty on an unclaimed row and cleared at a terminal
+			// state, so its absence is meaningful and should not render as a null.
+			"claim_token":        true,
+			"webhook_dispatched": false,
+			"dlt_topic":          true, "failure_metadata": true,
 		}
 		require.Len(t, omitempty, typ.NumField(), "every field must have a documented omitempty expectation")
 
@@ -948,4 +1065,367 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 				field.Name, name, map[bool]string{true: "", false: " not"}[want])
 		}
 	})
+}
+
+// TestMaxEventMessageBytes_SitsBelowTheWriterFloorWithHeadroom pins the one size limit
+// the whole pipeline validates against.
+//
+// The finding this guards: request bodies are accepted up to 5 MiB and the event
+// payload IS the request-derived webhook body, while kafka-go's writer caps a message
+// at 1 MiB by default. An oversized event was therefore committed to the outbox and
+// then failed every publish attempt INCLUDING the dead-letter write — which is
+// strictly larger, because it appends failure metadata — so the row could reach
+// neither terminal state and was retried forever, growing the table without bound from
+// a single request.
+//
+// Both bounds are asserted. Too large and the original defect returns; too small and
+// legitimate events are refused for no reason.
+func TestMaxEventMessageBytes_SitsBelowTheWriterFloorWithHeadroom(t *testing.T) {
+	// kafka-go's Writer.BatchBytes default, and near enough a broker's own
+	// max.message.bytes default. Written as a literal rather than imported, because
+	// model must stay free of first-party and third-party imports.
+	const writerFloorBytes = 1048576
+
+	assert.Less(t, MaxEventMessageBytes, writerFloorBytes,
+		"the limit must be strictly below the 1 MiB writer floor, or an accepted event cannot be published at all")
+
+	// A dead-letter copy of a maximum-size event adds the failure metadata object,
+	// including a broker error string of unbounded length. Requiring a quarter of the
+	// floor as headroom is what makes "an event that can be published can also be
+	// dead-lettered" true rather than usually true.
+	headroom := writerFloorBytes - MaxEventMessageBytes
+	assert.GreaterOrEqual(t, headroom, writerFloorBytes/5,
+		"at least 20%% of the floor must be left free for the envelope, the failure metadata a dead-letter copy appends, and Kafka's key, header and framing overhead")
+
+	// And it must be large enough to be useful: a limit below the largest legitimate
+	// payload would reject real events.
+	assert.Greater(t, MaxEventMessageBytes, 256*1024,
+		"the limit must comfortably exceed a realistic ledger or identity payload, or valid events would be refused")
+}
+
+// TestDeriveCredentialReference_IsStableNonReversibleAndWellFormed covers the derived
+// credential reference.
+//
+// The finding it addresses: credential_reference was an unconstrained TEXT column
+// accepted as a plain string, so nothing structurally prevented a caller from storing
+// a PLAINTEXT SECRET in the one column documented as never holding one — and nothing
+// could tell afterwards whether a stored value was a reference or a password.
+func TestDeriveCredentialReference_IsStableNonReversibleAndWellFormed(t *testing.T) {
+	const (
+		principal = "blnk-subscriber-acme"
+		secret    = "aVeryLongGeneratedSecretValue0123456789"
+	)
+
+	reference, err := DeriveCredentialReference(principal, secret)
+	require.NoError(t, err)
+
+	t.Run("the reference is well-formed and self-describing", func(t *testing.T) {
+		assert.NoError(t, ValidateCredentialReference(reference),
+			"a freshly derived reference must validate; if it does not, nothing that persists one can trust the validator")
+		assert.True(t, strings.HasPrefix(reference, "scram-sha-512-ref-v1$"),
+			"the scheme must be part of the stored value so a reference is recognisable on sight and a later second scheme can coexist")
+		assert.Len(t, reference, len("scram-sha-512-ref-v1$")+64,
+			"the digest must be a full hex-encoded SHA-256")
+	})
+
+	t.Run("the secret is not recoverable from the reference", func(t *testing.T) {
+		assert.NotContains(t, reference, secret,
+			"the reference must not contain the secret in any form — that is the entire property that makes it safe to persist")
+		assert.NotContains(t, reference, principal,
+			"the principal is the HMAC key and must not be echoed either")
+	})
+
+	t.Run("the derivation is stable and pair-specific", func(t *testing.T) {
+		again, err := DeriveCredentialReference(principal, secret)
+		require.NoError(t, err)
+		assert.Equal(t, reference, again,
+			"the same pair must derive the same reference, or a reissue could never be distinguished from the credential it replaced")
+
+		otherSecret, err := DeriveCredentialReference(principal, secret+"x")
+		require.NoError(t, err)
+		assert.NotEqual(t, reference, otherSecret, "a different secret must derive a different reference")
+
+		// The principal is mixed in as the HMAC key precisely so that two
+		// subscribers issued the same generated secret still derive different
+		// references. Without it, an equality comparison on the reference would
+		// conflate them.
+		otherPrincipal, err := DeriveCredentialReference(principal+"-2", secret)
+		require.NoError(t, err)
+		assert.NotEqual(t, reference, otherPrincipal,
+			"the same secret under a different principal must derive a different reference")
+	})
+
+	t.Run("an incomplete pair is refused", func(t *testing.T) {
+		_, err := DeriveCredentialReference("", secret)
+		assert.Error(t, err, "a blank principal would let several rows share one reference")
+
+		_, err = DeriveCredentialReference("   ", secret)
+		assert.Error(t, err, "a whitespace-only principal is a blank principal")
+
+		_, err = DeriveCredentialReference(principal, "")
+		assert.Error(t, err, "a blank secret would derive a reference for a credential that was never issued")
+	})
+
+	t.Run("errors never carry the secret", func(t *testing.T) {
+		_, err := DeriveCredentialReference("", secret)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), secret,
+			"no branch of the derivation may echo the secret, not even to complain about the other argument")
+	})
+}
+
+// TestValidateCredentialReference_RefusesAnythingNotDerived is the test that makes the
+// "no secret is stored here" property structural.
+//
+// Every rejected value below is something a caller could plausibly pass to the
+// repository, and the plaintext-secret case is the one that matters: the column is
+// TEXT and would accept it silently, and once a secret has been written to a column
+// documented as never holding one, removing it is an incident rather than a migration.
+func TestValidateCredentialReference_RefusesAnythingNotDerived(t *testing.T) {
+	valid, err := DeriveCredentialReference("principal", "secret-value")
+	require.NoError(t, err)
+
+	_, digest, found := strings.Cut(valid, "$")
+	require.True(t, found)
+
+	rejected := map[string]string{
+		"a plaintext password":         "correct-horse-battery-staple",
+		"an empty string":              "",
+		"a bare digest with no scheme": digest,
+		"the scheme with no digest":    "scram-sha-512-ref-v1$",
+		"a truncated digest":           "scram-sha-512-ref-v1$" + digest[:32],
+		"an over-long digest":          "scram-sha-512-ref-v1$" + digest + "00",
+		"a non-hex digest":             "scram-sha-512-ref-v1$" + strings.Repeat("z", 64),
+		"an upper-cased digest":        "scram-sha-512-ref-v1$" + strings.ToUpper(digest),
+		"an unknown scheme":            "bcrypt$" + digest,
+		"a bcrypt hash":                "$2a$10$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV",
+		"a json object":                `{"reference":"` + valid + `"}`,
+	}
+
+	for name, value := range rejected {
+		t.Run(name, func(t *testing.T) {
+			assert.ErrorIs(t, ValidateCredentialReference(value), ErrInvalidCredentialReference,
+				"%s must be refused: the reference column exists precisely so that a value which is not a derived reference — above all a plaintext secret — cannot be persisted as one", name)
+			assert.Empty(t, CredentialFingerprint(value),
+				"a value that fails validation must not be rendered even partially, or a mis-stored secret would leak through the fingerprint")
+		})
+	}
+}
+
+// TestCredentialFingerprint_IsShortAndDerivedFromTheDigest covers the only form of the
+// reference that is safe to put in a response or a log line.
+func TestCredentialFingerprint_IsShortAndDerivedFromTheDigest(t *testing.T) {
+	reference, err := DeriveCredentialReference("principal", "secret-value")
+	require.NoError(t, err)
+
+	fingerprint := CredentialFingerprint(reference)
+
+	assert.Len(t, fingerprint, CredentialFingerprintLen,
+		"the fingerprint must be exactly CredentialFingerprintLen characters so responses are predictable")
+	assert.True(t, strings.HasPrefix(reference, "scram-sha-512-ref-v1$"+fingerprint),
+		"the fingerprint must be the leading digest characters, so two issuances can be told apart by comparing it")
+	assert.NotContains(t, fingerprint, "$",
+		"the fingerprint carries no scheme: it is an opaque short token, not a truncated reference a caller might try to validate")
+
+	// Different issuances must be distinguishable, which is the fingerprint's only
+	// job.
+	other, err := DeriveCredentialReference("principal", "another-secret-value")
+	require.NoError(t, err)
+	assert.NotEqual(t, fingerprint, CredentialFingerprint(other),
+		"two distinct credentials must produce distinct fingerprints, or the fingerprint answers nothing")
+}
+
+// TestEventSubscriber_PartitionKeyPrefixIsNotAnAccessCheck pins the behavioural half of
+// the unenforceable-isolation finding.
+//
+// The documentation now says plainly that PartitionKeyPrefix is advisory, but a reader
+// can only trust that if the code agrees. HasTopicAccess must therefore answer purely
+// from the recorded topic grant: a subscriber with a prefix set is not thereby
+// restricted, and a subscriber with no prefix is not thereby widened, because the
+// prefix has no bearing on what the broker will serve.
+func TestEventSubscriber_PartitionKeyPrefixIsNotAnAccessCheck(t *testing.T) {
+	prefix := "acme_"
+	withPrefix := &EventSubscriber{
+		AuthorizedTopics:   []string{"blnk.transactions"},
+		PartitionKeyPrefix: &prefix,
+	}
+	withoutPrefix := &EventSubscriber{
+		AuthorizedTopics: []string{"blnk.transactions"},
+	}
+
+	assert.True(t, withPrefix.HasTopicAccess("blnk.transactions"),
+		"a recorded topic grant is what HasTopicAccess reports; the key prefix does not narrow it, because Kafka cannot enforce a key restriction")
+	assert.True(t, withoutPrefix.HasTopicAccess("blnk.transactions"),
+		"the absence of a prefix does not widen the grant either — the two subscribers have identical broker-side access")
+	assert.False(t, withPrefix.HasTopicAccess("blnk.balances"),
+		"a topic outside the recorded grant is refused, which is the boundary that IS enforced")
+
+	empty := &EventSubscriber{}
+	assert.False(t, empty.HasTopicAccess("blnk.transactions"),
+		"a subscriber with no grant matches nothing: the registry fails closed")
+}
+
+// ---------------------------------------------------------------------------------------
+// Canonical subscriber identity — SEC-03 and SEC-04
+// ---------------------------------------------------------------------------------------
+
+// TestCanonicalizeSubscriberIdentifier_RefusesEverythingThatCouldWidenABoundary is the
+// primitive both findings rest on.
+//
+// The principal and the consumer group namespace are DERIVED from this identifier, and they
+// are the access boundary: the credential is minted for the principal and every ACL binding
+// names it and the namespace. So anything this function lets through becomes part of a real
+// grant at a real broker.
+//
+// Each rejected class is here for its own concrete failure:
+//
+//   - WILDCARDS, because Kafka treats the resource name "*" as matching any resource, so a
+//     binding on it is a cluster-wide grant.
+//   - WHITESPACE, because a value differing from another only by whitespace is the SEC-04
+//     duplicate: two registry rows, one Kafka principal, one credential silently shared.
+//   - The GROUP TERMINATOR ".", because the disjointness of two prefixed group namespaces
+//     depends on it being impossible inside an identifier.
+//   - The SASL and ACL METACHARACTERS, because they carry meaning in "User:name", in JAAS
+//     configuration and in shell arguments.
+//   - UPPERCASE, because Kafka principals are case-sensitive: folding would merge two
+//     distinct broker identities, and refusing leaves exactly one spelling.
+func TestCanonicalizeSubscriberIdentifier_RefusesEverythingThatCouldWidenABoundary(t *testing.T) {
+	valid := []string{
+		"sub_0f6e2c8a",
+		"sub-0f6e2c8a",
+		"abc",
+		"0f6e2c8a",
+		strings.Repeat("a", 128),
+	}
+	for _, identifier := range valid {
+		canonical, err := CanonicalizeSubscriberIdentifier(identifier)
+		require.NoError(t, err, "%q is a canonical identifier", identifier)
+		assert.Equal(t, identifier, canonical,
+			"a canonical identifier is returned unchanged, never rewritten")
+	}
+
+	invalid := map[string]string{
+		"empty":                   "",
+		"too short":               "ab",
+		"too long":                strings.Repeat("a", 129),
+		"the wildcard":            "*",
+		"a wildcard suffix":       "sub_0f6e2c8a*",
+		"a question mark":         "sub_0f6e?c8a",
+		"leading whitespace":      " sub_0f6e2c8a",
+		"trailing whitespace":     "sub_0f6e2c8a ",
+		"internal whitespace":     "sub 0f6e2c8a",
+		"a tab":                   "sub\t0f6e2c8a",
+		"a newline":               "sub_0f6e2c8a\n",
+		"a null byte":             "sub_0f6e2c8a\x00",
+		"uppercase":               "SUB_0F6E2C8A",
+		"mixed case":              "Sub_0f6e2c8a",
+		"the group terminator":    "sub.0f6e2c8a",
+		"the principal delimiter": "sub:0f6e2c8a",
+		"a comma":                 "sub,0f6e2c8a",
+		"a semicolon":             "sub;0f6e2c8a",
+		"an equals sign":          "sub=0f6e2c8a",
+		"a slash":                 "sub/0f6e2c8a",
+		"non-ascii":               "sub_0f6é2c8a",
+		"a leading hyphen":        "-sub_0f6e2c8a",
+		"a leading underscore":    "_sub_0f6e2c8a",
+	}
+	for name, identifier := range invalid {
+		t.Run(name, func(t *testing.T) {
+			_, err := CanonicalizeSubscriberIdentifier(identifier)
+			require.Error(t, err, "%s must be refused", name)
+			assert.ErrorIs(t, err, ErrInvalidSubscriberIdentifier,
+				"the refusal must be recognisable without matching message text")
+		})
+	}
+}
+
+// TestCanonicalKafkaPrincipal_IsDerivedAndNamespaced pins the derivation.
+//
+// The namespace prefix keeps a Blnk-issued principal from colliding with an operator's own,
+// and makes it recognisable at the broker. Deriving rather than accepting is what removes the
+// caller's ability to choose a boundary.
+func TestCanonicalKafkaPrincipal_IsDerivedAndNamespaced(t *testing.T) {
+	principal, err := CanonicalKafkaPrincipal("sub_0f6e2c8a")
+	require.NoError(t, err)
+	assert.Equal(t, "blnk-sub-sub_0f6e2c8a", principal)
+	assert.True(t, strings.HasPrefix(principal, SubscriberPrincipalNamespace))
+
+	// An unusable identifier must not produce a partial name that somebody then binds.
+	for _, identifier := range []string{"", "*", " sub_0f6e2c8a "} {
+		derived, err := CanonicalKafkaPrincipal(identifier)
+		require.Error(t, err, "%q must not derive a principal", identifier)
+		assert.Empty(t, derived, "a failed derivation must return nothing, not a prefix")
+	}
+}
+
+// TestCanonicalConsumerGroupNamespace_CannotOverlapAnotherSubscribersNamespace is the SEC-03
+// disjointness proof, and it is the reason the terminator exists.
+//
+// The group binding is PREFIXED, which reserves "<namespace>*". Without a terminator a
+// subscriber whose identifier is a leading substring of another's would reserve the other's
+// namespace as well — "blnk-sub-abc" covers "blnk-sub-abcd" — handing over its offsets and its
+// coordinator. The terminator cannot occur inside a canonical identifier, so the overlap is
+// unreachable however the identifiers relate.
+func TestCanonicalConsumerGroupNamespace_CannotOverlapAnotherSubscribersNamespace(t *testing.T) {
+	shortNamespace, err := CanonicalConsumerGroupNamespace("abc")
+	require.NoError(t, err)
+	longNamespace, err := CanonicalConsumerGroupNamespace("abcdef")
+	require.NoError(t, err)
+
+	assert.Equal(t, "blnk-sub-abc.", shortNamespace)
+	assert.True(t, strings.HasSuffix(shortNamespace, SubscriberGroupTerminator),
+		"the terminator is the disjointness guarantee and must be present")
+
+	assert.False(t, strings.HasPrefix(longNamespace, shortNamespace),
+		"one subscriber's namespace must never be a prefix of another's, even when its identifier is")
+	assert.False(t, strings.HasPrefix(shortNamespace, longNamespace))
+
+	// And the leaves under each are correspondingly disjoint.
+	assert.False(t, strings.HasPrefix(longNamespace+"live", shortNamespace),
+		"a leaf of the longer namespace must not fall inside the shorter one")
+}
+
+// TestCanonicalConsumerGroupID_IsALeafInsideItsOwnNamespace ties the two derivations together.
+//
+// The group a subscriber actually joins has to be inside the namespace its ACL reserves, or the
+// credential is issued with a grant it cannot use — a failure that surfaces at the subscriber
+// as an authorization error with no obvious cause.
+func TestCanonicalConsumerGroupID_IsALeafInsideItsOwnNamespace(t *testing.T) {
+	namespace, err := CanonicalConsumerGroupNamespace("sub_0f6e2c8a")
+	require.NoError(t, err)
+	group, err := CanonicalConsumerGroupID("sub_0f6e2c8a")
+	require.NoError(t, err)
+
+	assert.Equal(t, "blnk-sub-sub_0f6e2c8a.default", group)
+	assert.True(t, IsInSubscriberGroupNamespace(group, namespace),
+		"the default group must be inside the namespace its own ACL reserves")
+}
+
+// TestIsInSubscriberGroupNamespace_RequiresAProperLeaf covers the membership test the
+// provisioning path validates a recorded group with.
+func TestIsInSubscriberGroupNamespace_RequiresAProperLeaf(t *testing.T) {
+	namespace, err := CanonicalConsumerGroupNamespace("sub_0f6e2c8a")
+	require.NoError(t, err)
+
+	for _, group := range []string{namespace + "default", namespace + "replay", namespace + "a"} {
+		assert.True(t, IsInSubscriberGroupNamespace(group, namespace),
+			"%q is a leaf of its own namespace", group)
+	}
+
+	for name, group := range map[string]string{
+		"the bare namespace":        namespace,
+		"a truncated namespace":     strings.TrimSuffix(namespace, SubscriberGroupTerminator),
+		"another subscriber's leaf": "blnk-sub-sub_ffffffff.live",
+		"the shared prefix":         SubscriberPrincipalNamespace,
+		"the wildcard":              "*",
+		"empty":                     "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.False(t, IsInSubscriberGroupNamespace(group, namespace),
+				"%s must not count as inside the namespace", name)
+		})
+	}
+
+	assert.False(t, IsInSubscriberGroupNamespace(namespace+"default", ""),
+		"an empty namespace must match nothing rather than everything")
 }

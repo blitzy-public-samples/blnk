@@ -318,6 +318,72 @@ func gracefulShutdown(server *http.Server, quit <-chan os.Signal, timeout time.D
 	return nil
 }
 
+// startEventMetricsCollector starts the periodic collector that maintains the event
+// pipeline's three gauges, and returns the function that stops it and releases what it
+// opened.
+//
+// A cleanup FUNCTION rather than a deferred stop inside this helper, because a defer here
+// would fire the moment this function returned and the collector would stop before it ever
+// ticked. The caller defers the returned function for the process lifetime.
+//
+// # Nothing here may prevent the server from serving
+//
+// A metrics collector is an observer. Every failure below is logged and degraded past
+// rather than propagated: an admin client that cannot be built costs the consumer-lag
+// measurement and nothing else, and the backlog and dead-letter gauges — the two that do
+// not need a broker at all — still publish. Failing start-up because telemetry could not
+// be wired would trade a monitoring gap for an outage.
+//
+// Parameters:
+//   - ctx context.Context: cancelling it stops the collector.
+//   - instance *blnk.Blnk: the service container, for its datasource.
+//   - cfg *config.Configuration: read for the Kafka broker list.
+//
+// Returns:
+//   - func(): stops the collector and closes the admin client and dead-letter service.
+//     Never nil, so the caller can defer it unconditionally.
+func startEventMetricsCollector(
+	ctx context.Context,
+	instance *blnk.Blnk,
+	cfg *config.Configuration,
+) func() {
+	// The age gauge is read from the outbox table and resolves no publisher, so this
+	// service needs no broker. It is closed by the returned cleanup all the same, because
+	// EventDeadLetters documents the caller as its owner.
+	deadLetters := instance.EventDeadLetters()
+
+	// Declared as the interface and assigned only on success: a nil *KafkaAdminClient
+	// placed in an interface field is a non-nil interface holding a nil pointer, which
+	// passes every nil guard and then panics on first use.
+	var admin blnk.KafkaAdmin
+	kafkaAdmin, err := blnk.NewKafkaAdmin(cfg)
+	if err != nil {
+		logrus.WithError(err).Warn(
+			"event metrics: the Kafka admin client could not be built, so subscriber consumer lag will " +
+				"not be measured; the outbox backlog and dead-letter age gauges are unaffected",
+		)
+	} else {
+		admin = kafkaAdmin
+	}
+
+	collector := blnk.NewBlnkEventMetricsCollector(instance, deadLetters, admin)
+	collector.Start(ctx)
+
+	return func() {
+		collector.Stop()
+
+		if admin != nil {
+			if closeErr := admin.Close(); closeErr != nil {
+				logrus.WithError(closeErr).Warn("event metrics: closing the Kafka admin client failed")
+			}
+		}
+
+		if closeErr := deadLetters.Close(); closeErr != nil {
+			logrus.WithError(closeErr).Warn("event metrics: closing the dead-letter service failed")
+		}
+	}
+}
+
 // Renamed from initializeObservability to better reflect its purpose
 func initializeTelemetryAndObservability(ctx context.Context, cfg *config.Configuration) (posthog.Client, func(context.Context) error, error) {
 	var phClient posthog.Client
@@ -410,6 +476,23 @@ func serverCommands(b *blnkInstance) *cobra.Command {
 				chainProcessor.Start(ctx)
 				defer chainProcessor.Stop()
 			}
+
+			// Start the event metrics collector. It is the ONLY production maintainer of
+			// the event pipeline's three gauges — the outbox backlog, the dead-letter age
+			// and subscriber consumer lag — and without it all three are declared,
+			// initialised and never recorded, so the two rules in
+			// alerts/blnk-kafka-alerts.yml cannot fire whatever the system is doing.
+			//
+			// It runs in the SERVER role only, beside the lineage processor and for the
+			// same reason: this is where the outbox background work already lives.
+			// Starting it in the worker role as well would have two processes writing the
+			// same gauges, each zeroing the other's series as stale.
+			//
+			// It is unconditional. A deployment with no Kafka still accumulates outbox
+			// rows, and the backlog gauge is exactly what shows that; the collector skips
+			// the measurements it has no dependency for rather than declining to run.
+			stopEventMetrics := startEventMetricsCollector(ctx, b.blnk, cfg)
+			defer stopEventMetrics()
 
 			// Start server
 			if err := startServer(router, cfg.Server.Port); err != nil {

@@ -76,6 +76,20 @@
 #
 # There are no options to parse - only an optional trailing command. Configuration comes
 # from the environment; see the configuration block below.
+#
+# REQUIRED CONFIGURATION
+#
+# KAFKA_SASL_ADMIN_USER and KAFKA_SASL_ADMIN_SECRET must BOTH be set, and neither has a
+# default. They are one pair with one meaning, identical here, in
+# scripts/kafka-provision.sh and in config.KafkaConfig.SASLAdminCredentials. The username
+# used to fall back to the literal principal "admin", which made a single .env mean
+# "authenticate as admin" to the scripts and "no SASL at all" to the service; nothing
+# invents a principal for you now.
+#
+# Both values must be drawn from the safe credential alphabet documented further down.
+# Kafka's --add-scram value grammar has no escape sequence, so a password containing a
+# comma or a bracket cannot be expressed in it and would be silently truncated into a
+# credential nobody can authenticate with. Such a value is refused up front, by name.
 
 # Error handling
 set -euo pipefail
@@ -99,15 +113,30 @@ fi
 # deliberately absent from .env.example rather than duplicated into it.
 # ---------------------------------------------------------------------------------------
 
-# The SASL/SCRAM administrative principal seeded into the metadata log. .env.example ships
-# the key empty and documents "admin" as the principal the local stack bootstraps, so that
-# is the fallback here; keep the two aligned if either changes.
-KAFKA_SASL_ADMIN_USER="${KAFKA_SASL_ADMIN_USER:-admin}"
+# The SASL/SCRAM administrative principal seeded into the metadata log.
+#
+# NO DEFAULT, DELIBERATELY. This used to fall back to the literal principal "admin" when
+# the variable was empty, and that made one .env mean two different things: the scripts
+# seeded and authenticated as "admin", while the Go clients read the same empty value as
+# "no SASL configured" and connected anonymously. An operator reading either half learned
+# the wrong rule about the other.
+#
+# The username and the secret are now ONE PAIR with a single meaning, identical here, in
+# scripts/kafka-provision.sh, and in config.KafkaConfig.SASLAdminCredentials:
+#
+#     both set          SASL/SCRAM-SHA-512 as the named principal
+#     both empty        no SASL at all
+#     exactly one set   a misconfiguration, refused by name
+#
+# Because this script's entire job is to seed a SCRAM credential, "no SASL at all" is not
+# a state it can act on: require_admin_credentials refuses an empty pair here and names
+# both variables. The local stack conventionally uses "admin"; set it explicitly.
+KAFKA_SASL_ADMIN_USER="${KAFKA_SASL_ADMIN_USER:-}"
 
 # That principal's password. Deliberately has no default and never will: a credential must
 # not be guessable from source, and a present-but-wrong password would produce a broker
-# nobody can authenticate against. Validated by require_admin_secret, used exactly once,
-# and never printed.
+# nobody can authenticate against. Validated by require_admin_credentials, used exactly
+# once, and never printed.
 KAFKA_SASL_ADMIN_SECRET="${KAFKA_SASL_ADMIN_SECRET:-}"
 
 # SCRAM iteration count. 4096 is the minimum Kafka accepts and the default here. Kafka
@@ -136,6 +165,64 @@ readonly SCRAM_MECHANISM="SCRAM-SHA-512"
 readonly MIN_SCRAM_ITERATIONS=4096
 readonly DEFAULT_LOG_DIRS="/var/lib/kafka/data"
 readonly REQUIRED_AUTHORIZER="org.apache.kafka.metadata.authorizer.StandardAuthorizer"
+
+# ---------------------------------------------------------------------------------------
+# THE SAFE CREDENTIAL ALPHABET
+#
+# Two allow-lists, shared character-for-character with scripts/kafka-provision.sh. Any
+# credential this script handles is checked against one of them before it is placed into a
+# Kafka command, and a value outside the alphabet is REFUSED rather than escaped.
+#
+# WHY AN ALLOW-LIST RATHER THAN ESCAPING
+#
+# The value passed to "kafka-storage format --add-scram" is not a shell word, it is a
+# sentence in Kafka's own mini-grammar:
+#
+#     SCRAM-SHA-512=[name=<user>,password=<secret>,iterations=<n>]
+#
+# Kafka parses that by splitting on ',' and '=' inside '[' ... ']'. THE GRAMMAR HAS NO
+# ESCAPE SEQUENCE AT ALL - there is no backslash form, no quoting form, and no length
+# prefix - so a password containing a comma or a bracket cannot be expressed in it. Shell
+# quoting does not help: quoting delivers the bytes intact to Kafka, and it is Kafka that
+# then misreads them. The failure is silent in the worst way, too: 'a,b' is parsed as the
+# end of the password followed by an unrecognised key, so a credential is seeded that is
+# not the one the operator supplied and nothing they can authenticate with.
+# scripts/kafka-provision.sh has the same problem twice over, in --add-config and in the
+# JAAS properties value.
+#
+# An allow-list turns that class of corruption into an immediate, named refusal, and it is
+# the only mechanism available given a grammar with no escapes.
+#
+# THE PRINCIPAL LIST IS STRICTER, AND FOR AN ADDITIONAL REASON
+#
+# A principal name reaches ACL bindings as "User:<name>", where '*' is Kafka's wildcard.
+# A principal of '*' would therefore not be a corrupted grant but a grant to EVERYONE, so
+# the principal alphabet excludes it along with every grammar character. What remains is
+# the conventional identifier set - letters, digits, '.', '_', '@', '+' and '-' - which is
+# what real Kafka principals look like.
+#
+# RELATIONSHIP TO THE GO SIDE
+#
+# event_admin.go's validateSCRAMPassword requires printable ASCII (0x21-0x7E). This
+# alphabet is a strict SUBSET of that, and the difference is deliberate rather than an
+# inconsistency: the Go path sends the password over the Kafka protocol as a length-prefixed
+# field, where no grammar applies and every printable byte is safe, while these scripts must
+# put it through a CLI grammar that cannot express those bytes at all. A credential accepted
+# here is therefore always accepted by the Go path as well.
+#
+# The excluded printable characters, and what each one breaks:
+#   , = [ ]   Kafka's --add-scram / --add-config value grammar
+#   " \       the JAAS value and Java Properties escaping used by the provision script
+#   ;         terminates a JAAS login-module entry
+#   ' ` $     shell metacharacters; excluded as defence in depth, not because quoting is
+#             wrong here, but so that a credential can never depend on it being right
+#   space     Java Properties line handling, and word splitting in any consumer of it
+# Control characters and non-ASCII are excluded by construction.
+# ---------------------------------------------------------------------------------------
+readonly CREDENTIAL_SAFE_ERE='^[A-Za-z0-9!#%&()*+./:<>?@_{|}~^-]+$'
+readonly PRINCIPAL_SAFE_ERE='^[A-Za-z0-9._@+-]+$'
+readonly CREDENTIAL_SAFE_DESCRIPTION="letters, digits and ! # % & ( ) * + - . / : < > ? @ ^ _ { | } ~"
+readonly PRINCIPAL_SAFE_DESCRIPTION="letters, digits and . _ @ + -"
 
 # Resolved during main; declared here so the data flow between the steps is visible.
 STORAGE_CLI=""
@@ -328,18 +415,97 @@ require_add_scram_support() {
         "Fix: point KAFKA_IMAGE at Kafka 3.5 or later. The stack ships apache/kafka:3.9.1."
 }
 
-# Require the administrative secret, and refuse an unsubstituted template placeholder.
+# Refuse a credential that Kafka's SCRAM grammar cannot carry.
 #
-# Neither branch prints the value. .env.example ships this key empty - deliberately, since
-# stack.sh --init substitutes {POSTGRES_PASSWORD} and nothing else with a global sed, so
-# any other brace placeholder would survive into .env as a literal password - which makes
-# the empty case the one operators actually hit. The placeholder branch remains as defence
-# in depth for a hand-edited .env, because formatting storage with a literal placeholder
-# yields a broker nobody can authenticate against and the failure would surface a long way
-# from its cause.
-require_admin_secret() {
-    if [[ -z "$KAFKA_SASL_ADMIN_SECRET" ]]; then
-        die "KAFKA_SASL_ADMIN_SECRET is not set." \
+# Takes the variable NAME and its value, and prints only the name - never the value, since
+# the value is a secret in every call. See the safe-alphabet block above for why a refusal
+# is the only correct response to a character the grammar has no escape for.
+require_safe_credential() {
+    local name="$1" value="$2"
+    if [[ ! "$value" =~ $CREDENTIAL_SAFE_ERE ]]; then
+        die "${name} contains a character that Kafka's SCRAM credential grammar cannot carry." \
+            "Allowed: ${CREDENTIAL_SAFE_DESCRIPTION}" \
+            "The value is not echoed. It is refused rather than escaped because" \
+            "'${SCRAM_MECHANISM}=[name=...,password=...]' is parsed by splitting on ',' and" \
+            "'=' and has no escape sequence at all, so a password containing one of those" \
+            "characters would be silently truncated into a credential nobody can" \
+            "authenticate with - including you, on the next bring-up." \
+            "Fix: generate the secret from the allowed set. For example:" \
+            "  openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 32" \
+            "No storage has been touched."
+    fi
+}
+
+# Refuse a principal name that Kafka's grammar or its ACL wildcard cannot carry.
+#
+# The name IS printed here: a principal is an identifier rather than a credential, and the
+# operator needs to see which value was rejected.
+require_safe_principal() {
+    local name="$1" value="$2"
+    if [[ ! "$value" =~ $PRINCIPAL_SAFE_ERE ]]; then
+        die "${name} is '${value}', which is not a usable Kafka principal name." \
+            "Allowed: ${PRINCIPAL_SAFE_DESCRIPTION}" \
+            "A principal name goes into the SCRAM credential grammar, which has no escape" \
+            "sequence, and into ACL bindings as 'User:<name>', where '*' is the wildcard" \
+            "that matches every principal - so a name containing one of those characters" \
+            "would either be truncated or, in the case of '*', grant everyone access." \
+            "Fix: use a plain identifier, for example 'admin'." \
+            "No storage has been touched."
+    fi
+}
+
+# Require a COMPLETE administrative credential pair, refuse an unsubstituted template
+# placeholder, and hold both values to the safe alphabet.
+#
+# No branch prints the secret. The pair contract enforced here is the same one
+# config.KafkaConfig.SASLAdminCredentials applies in Go and scripts/kafka-provision.sh
+# applies for the runtime connection, so an operator debugging one learns the right rule
+# about the others. This script is the one place where an EMPTY pair is also refused: its
+# whole purpose is to seed a SCRAM credential into the metadata log, so "no SASL" is not a
+# state it can act on - it is a request to do nothing, made by running the one command
+# whose only job is to do this.
+#
+# .env.example ships both keys empty - deliberately, since stack.sh --init substitutes
+# {POSTGRES_PASSWORD} and nothing else with a global sed, so any other brace placeholder
+# would survive into .env as a literal password - which makes the empty case the one
+# operators actually hit. The placeholder branch remains as defence in depth for a
+# hand-edited .env, because formatting storage with a literal placeholder yields a broker
+# nobody can authenticate against and the failure would surface a long way from its cause.
+require_admin_credentials() {
+    local user secret
+    # Trimmed before every test, so that a value carrying a trailing newline from a secret
+    # store reads as absence rather than as a principal nobody created. This matches what
+    # config.KafkaConfig.SASLAdminCredentials does in Go.
+    user="$(trim "$KAFKA_SASL_ADMIN_USER")"
+    secret="$(trim "$KAFKA_SASL_ADMIN_SECRET")"
+
+    if [[ -z "$user" && -z "$secret" ]]; then
+        die "neither KAFKA_SASL_ADMIN_USER nor KAFKA_SASL_ADMIN_SECRET is set." \
+            "This script exists to seed a SASL/SCRAM credential into the KRaft metadata" \
+            "log, so it needs both: a principal to create and a password to create it" \
+            "with. Neither has a default - the username used to fall back to 'admin', and" \
+            "that silently disagreed with the Go clients, which read the same empty value" \
+            "as 'no SASL at all'." \
+            "Fix: create .env with './stack.sh --init' if you have not already, then set" \
+            "BOTH keys in it - .env.example ships them empty and --init generates neither" \
+            "- or export them for this process. 'admin' is the conventional local" \
+            "principal. Use the same values as the broker's SCRAM JAAS configuration." \
+            "If you meant to run a broker with no SASL listener, you do not need this" \
+            "script at all: format the storage without --add-scram."
+    fi
+
+    if [[ -z "$user" ]]; then
+        die "KAFKA_SASL_ADMIN_SECRET is set but KAFKA_SASL_ADMIN_USER is empty." \
+            "A SCRAM credential is a principal AND a password; there is nothing to name" \
+            "this one after. The username is never defaulted, so no principal is invented" \
+            "for you." \
+            "Fix: set KAFKA_SASL_ADMIN_USER to the principal the brokers and" \
+            "scripts/kafka-provision.sh will authenticate as - 'admin' is the conventional" \
+            "local choice. The secret is not echoed and no storage has been touched."
+    fi
+
+    if [[ -z "$secret" ]]; then
+        die "KAFKA_SASL_ADMIN_USER is set to '${user}' but KAFKA_SASL_ADMIN_SECRET is empty." \
             "The bootstrap SCRAM credential cannot be seeded without it, and there is no" \
             "default by design: a credential must not be guessable from source." \
             "Fix: create .env with './stack.sh --init' if you have not already, then set" \
@@ -348,8 +514,7 @@ require_admin_secret() {
             "same value as the broker's SCRAM JAAS configuration."
     fi
 
-    if [[ "$KAFKA_SASL_ADMIN_SECRET" == "{KAFKA_SASL_ADMIN_SECRET}" ]] ||
-        [[ "$KAFKA_SASL_ADMIN_SECRET" == "{"*"}" ]]; then
+    if [[ "$secret" == "{"*"}" ]]; then
         die "KAFKA_SASL_ADMIN_SECRET still holds an unsubstituted {PLACEHOLDER} value." \
             "It was copied from a template and never replaced with a real secret. Using it" \
             "would format storage with a literal placeholder as the password, producing a" \
@@ -358,6 +523,14 @@ require_admin_secret() {
             "to the password the broker's SCRAM JAAS configuration uses, or export it for" \
             "this process. No storage has been touched and the value is not echoed."
     fi
+
+    require_safe_principal "KAFKA_SASL_ADMIN_USER" "$user"
+    require_safe_credential "KAFKA_SASL_ADMIN_SECRET" "$secret"
+
+    # Publish the trimmed values, so that everything downstream - the --add-scram argument,
+    # the super.users advisory and every diagnostic - works from exactly what was validated.
+    KAFKA_SASL_ADMIN_USER="$user"
+    KAFKA_SASL_ADMIN_SECRET="$secret"
 }
 
 # The iteration count must be a whole number at or above the SCRAM minimum; Kafka rejects
@@ -536,6 +709,14 @@ bootstrap_storage() {
     # passed as a single argument, so no shell quoting can split it and no partially
     # interpolated command string exists to be logged by accident.
     #
+    # BOTH INTERPOLATED VALUES HAVE ALREADY BEEN HELD TO THE SAFE ALPHABET by
+    # require_admin_credentials, which is what makes this line correct rather than merely
+    # conventional. Shell quoting delivers the bytes to Kafka intact; it is KAFKA that then
+    # splits this value on ',' and '=' with no escape sequence available, so a comma or a
+    # bracket here would silently seed a credential that is not the one supplied. The
+    # alphabet check is the only defence against that, and it runs before anything is
+    # formatted.
+    #
     # An honest limitation, recorded rather than glossed over: a secret passed as a
     # command-line argument is briefly visible in the host's process table. It is accepted
     # here because there is no pre-broker alternative - needing one is the entire reason
@@ -589,7 +770,7 @@ main() {
     log "using storage CLI ${STORAGE_CLI}"
 
     require_add_scram_support
-    require_admin_secret
+    require_admin_credentials
     require_valid_iterations
 
     detect_kraft_config

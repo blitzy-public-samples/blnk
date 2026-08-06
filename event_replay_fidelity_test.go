@@ -365,6 +365,100 @@ type replayFidelityStore struct {
 
 	// getErr, when set, fails GetEventByID with a non-not-found error.
 	getErr error
+
+	// claimTokens records the token presented to every transition, keyed by the
+	// transition name, so a test can assert the service carried the token the claim
+	// issued rather than an empty string or one of its own invention.
+	claimTokens map[string]string
+
+	// issuedClaimToken is the token ClaimEventForReplay hands out. Fixed rather than
+	// generated so the assertion above can compare against a known value.
+	issuedClaimToken string
+}
+
+// recordClaimToken notes the token one transition presented. The caller holds the lock.
+func (s *replayFidelityStore) recordClaimToken(transition, token string) {
+	if s.claimTokens == nil {
+		s.claimTokens = make(map[string]string, 4)
+	}
+	s.claimTokens[transition] = token
+}
+
+// presentedClaimToken returns the token a named transition was called with.
+func (s *replayFidelityStore) presentedClaimToken(transition string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.claimTokens[transition]
+}
+
+// ClaimEventForReplay is the atomic dead_lettered -> replaying claim.
+//
+// The status precondition lives HERE, inside the transition, exactly as it does in SQL —
+// which is what makes a second concurrent replay of one row fail because the first one
+// moved it rather than because this double was told to fail.
+func (s *replayFidelityStore) ClaimEventForReplay(
+	_ context.Context,
+	eventID string,
+	_ time.Duration,
+) (*model.EventOutbox, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+
+	row, ok := s.rows[eventID]
+	if !ok {
+		return nil, apierror.NewAPIError(
+			apierror.ErrNotFound, "Event not found", fmt.Errorf("no event outbox row with event id %q", eventID),
+		)
+	}
+
+	if row.Status != model.EventOutboxStatusDeadLettered {
+		return nil, apierror.NewAPIError(apierror.ErrConflict,
+			fmt.Sprintf("Event is not available for replay: its status is %q", row.Status), nil)
+	}
+
+	token := s.issuedClaimToken
+	if token == "" {
+		token = "replay-claim-token"
+	}
+
+	row.Status = model.EventOutboxStatusReplaying
+	row.ClaimToken = token
+	s.transitions = append(s.transitions, row.EventID+":"+model.EventOutboxStatusReplaying)
+
+	claimed := *row
+	return &claimed, nil
+}
+
+// ReleaseEventReplay is the rollback that keeps a failed replay replayable.
+func (s *replayFidelityStore) ReleaseEventReplay(_ context.Context, id int64, claimToken, replayErr string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.recordClaimToken("release", claimToken)
+
+	row := s.byID(id)
+	if row == nil {
+		return apierror.NewAPIError(
+			apierror.ErrNotFound, "Event not found", fmt.Errorf("no event outbox row with id %d", id),
+		)
+	}
+
+	row.Status = model.EventOutboxStatusDeadLettered
+	row.ClaimToken = ""
+	if replayErr != "" {
+		row.LastError = replayErr
+	}
+	row.LockedUntil = nil
+	// dlt_topic and failure_metadata are RETAINED, exactly as the SQL retains them: a
+	// failed replay must leave the event exactly as replayable as it was before.
+	s.transitions = append(s.transitions, row.EventID+":"+model.EventOutboxStatusDeadLettered)
+
+	return nil
 }
 
 // newReplayFidelityStore returns an empty store.
@@ -499,11 +593,13 @@ func (s *replayFidelityStore) CountEventOutboxByStatus(_ context.Context) (map[s
 func (s *replayFidelityStore) MarkEventDeadLettered(
 	_ context.Context,
 	id int64,
-	dltTopic string,
+	claimToken, dltTopic string,
 	failureMetadata json.RawMessage,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.recordClaimToken("dead_lettered", claimToken)
 
 	row := s.byID(id)
 	if row == nil {
@@ -528,9 +624,11 @@ func (s *replayFidelityStore) MarkEventDeadLettered(
 }
 
 // MarkEventDispatched applies the post-replay transition.
-func (s *replayFidelityStore) MarkEventDispatched(_ context.Context, id int64) error {
+func (s *replayFidelityStore) MarkEventDispatched(_ context.Context, id int64, claimToken string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.recordClaimToken("dispatched", claimToken)
 
 	if s.markDispatchedErr != nil {
 		return s.markDispatchedErr
@@ -1605,13 +1703,25 @@ func TestReplayFidelity_ReplayedRowLeavesTheDeadLetterInventory(t *testing.T) {
 	assert.Equal(t, fixture.payload, string(after.Payload),
 		"the stored payload bytes must be untouched by dead-lettering and replay")
 
+	// THREE transitions, not two, and the middle one is the point. A replay CLAIMS the row
+	// — dead_lettered → replaying — before it publishes anything, which is what makes two
+	// concurrent replays of one event impossible: only the request whose transition changed
+	// a row proceeds. The path is therefore dead_lettered → replaying → dispatched, and any
+	// path that skipped replaying would be a replay that published on a read-then-check.
 	assert.Equal(t,
 		[]string{
 			scenario.row.EventID + ":" + model.EventOutboxStatusDeadLettered,
+			scenario.row.EventID + ":" + model.EventOutboxStatusReplaying,
 			scenario.row.EventID + ":" + model.EventOutboxStatusDispatched,
 		},
 		harness.store.appliedTransitions(),
-		"the row must reach dispatched by way of dead_lettered, and by no other path")
+		"the row must reach dispatched by way of dead_lettered and a replay CLAIM, and by no other path")
+
+	// The token the claim issued is the token the success transition presented. Anything
+	// else — an empty string, or one the service invented — would mean the conditional
+	// update was not actually conditional on holding the row.
+	assert.Equal(t, "replay-claim-token", harness.store.presentedClaimToken("dispatched"),
+		"the success transition must present the token the replay claim issued")
 
 	inventory, err := harness.service.ListDeadLetterEvents(ctx, DeadLetterListOptions{})
 	require.NoError(t, err)
@@ -1664,8 +1774,8 @@ func TestReplayFidelity_RepeatReplayIsRejectedRatherThanDuplicating(t *testing.T
 	require.True(t, ok)
 	assert.Equal(t, model.EventOutboxStatusDispatched, after.Status,
 		"a refused replay must not disturb the row")
-	assert.Len(t, harness.store.appliedTransitions(), 2,
-		"a refused replay must apply no transition")
+	assert.Len(t, harness.store.appliedTransitions(), 3,
+		"a refused replay must apply no FURTHER transition: the three recorded are dead_lettered, the first replay's claim, and its dispatch")
 }
 
 // TestReplayFidelity_ReplayRejectionsCarryTheirDocumentedCodeAndStatus asserts each
@@ -1862,7 +1972,7 @@ func TestReplayFidelity_RowFromTheRealProducerPathReplaysFaithfully(t *testing.T
 	// event_outbox_test.go.
 	producer := &Blnk{config: replayFidelityConfiguration()}
 
-	row := producer.PrepareEventOutbox(ctx, NewWebhook{
+	row := mustPrepareEventOutbox(t, producer, NewWebhook{
 		Event:   fixture.eventType,
 		Payload: dataObject,
 	})
@@ -1878,12 +1988,17 @@ func TestReplayFidelity_RowFromTheRealProducerPathReplaysFaithfully(t *testing.T
 	assert.NotEmpty(t, row.EventID)
 	// A raw-JSON payload carries no typed aggregate for the producer to read, so the
 	// documented fallback chain ends at the event type. Asserted rather than glossed
-	// over, because the invariant that matters is that the partition key is NEVER
+	// over, because the invariant that matters is that the PARTITION KEY is NEVER
 	// empty: an unkeyed message is spread across partitions and loses its ordering
 	// guarantee with nothing in the data to show it.
-	assert.Equal(t, fixture.eventType, row.LedgerID)
+	assert.Equal(t, fixture.eventType, row.PartitionKey)
 	assert.Equal(t, fixture.eventType, row.AggregateID)
-	assert.NotEmpty(t, row.LedgerID)
+	assert.NotEmpty(t, row.PartitionKey)
+	// The LEDGER column, by contrast, stays empty — and must. A raw-JSON payload carries
+	// no ledger, so there is no ledger to record, and putting the event type in a column
+	// called ledger_id is exactly the conflation the two-column split removed.
+	assert.Empty(t, row.LedgerID,
+		"an untyped payload carries no ledger: the column stays NULL rather than inheriting the routing key")
 	assert.Zero(t, row.Attempts)
 	assert.Nil(t, row.FirstAttemptedAt)
 	assert.Nil(t, row.DispatchedAt)

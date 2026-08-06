@@ -264,10 +264,27 @@ type eventOutbox interface {
 	InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *model.EventOutbox) error // Inserts an event outbox entry within an existing transaction
 	InsertEventOutbox(ctx context.Context, e *model.EventOutbox) error                 // Inserts an event outbox entry directly, outside any ledger transaction
 
-	// Relay state machine: claim a batch, then drive each row to a terminal state
-	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims pending entries FIFO for publishing, taking a lease for lockDuration
-	MarkEventDispatched(ctx context.Context, id int64) error                                                             // Marks an entry dispatched after the broker acknowledges the publish
-	MarkEventFailed(ctx context.Context, id int64, errMsg string) error                                                  // Records a failed publish attempt and its reason against an entry
+	// Relay state machine: claim a batch, then drive each row to a terminal state.
+	//
+	// EVERY TRANSITION IS CONDITIONAL ON THE CLAIM TOKEN the claim issued, and
+	// returns a typed conflict when no row matches. That is not defensive
+	// bookkeeping: a transition matching on id alone let a worker whose lease had
+	// expired overwrite the newer state of a row another instance had since taken,
+	// let two workers each record an attempt against one claim and double-spend the
+	// retry budget, and let a late call move a terminal row back out of its terminal
+	// state. A caller that receives the conflict has lost the row and must stop
+	// working on it — it must NOT treat its own publish as recorded.
+	//
+	// ClaimPendingEventOutbox additionally guarantees that AT MOST ONE ROW PER
+	// PARTITION KEY is claimable at any instant, across all relay instances. FOR
+	// UPDATE SKIP LOCKED alone does not give that: it stops two relays claiming the
+	// same row but lets one skip an earlier locked row and claim a LATER row with
+	// the same key, and because Kafka preserves append order rather than
+	// occurred_at, a subscriber then observes one aggregate's events out of order
+	// with nothing anywhere to show it happened.
+	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error)                   // Claims pending entries FIFO for publishing, one row per partition key, taking a lease and stamping a claim token
+	MarkEventDispatched(ctx context.Context, id int64, claimToken string) error                                                            // Marks a claimed entry dispatched after the broker acknowledges the publish
+	MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration) (model.EventFailureOutcome, error) // Records a failed attempt against a claimed entry, schedules its next due instant and reports whether the budget is now spent
 
 	// MarkEventDeadLettered completes the failure path: it moves an entry whose
 	// retry budget MarkEventFailed already exhausted into the dead_lettered
@@ -287,9 +304,43 @@ type eventOutbox interface {
 	// failure_metadata are what the dead-letter inventory displays, and
 	// dead_lettered is the state a replay requires before it will re-publish. Left
 	// uncalled, those columns stay NULL and no event is ever replayable.
-	MarkEventDeadLettered(ctx context.Context, id int64, dltTopic string, failureMetadata json.RawMessage) error
+	// claimToken is the one MarkEventFailed returned on its exhaustion arm, or the
+	// original claim token when a non-retryable failure dead-letters a row directly.
+	// Requiring it is what stops two workers each writing the event to the
+	// dead-letter topic: only one holds the token, so only one gets past this
+	// transition, and the caller that fails it knows not to have published. Publish
+	// to the dead-letter topic FIRST and record it here second, so a row is never
+	// marked dead-lettered without a message behind it.
+	MarkEventDeadLettered(ctx context.Context, id int64, claimToken, dltTopic string, failureMetadata json.RawMessage) error
 
-	MarkWebhookDispatched(ctx context.Context, id int64) error // Marks the legacy webhook leg dispatched, so a republished row cannot double-enqueue it
+	// ClaimEventForReplay atomically moves a dead-lettered row to replaying and
+	// returns it with a fresh claim token, so a replay is a CLAIM rather than a read
+	// followed by a check.
+	//
+	// It exists because the read-then-check form let two concurrent replays of one
+	// event both see a dead_lettered row, both pass the check, and both publish — an
+	// operator clicking twice, or two operators triaging the same backlog, putting
+	// two copies on the topic. Only the caller whose update actually changed a row
+	// proceeds to publish.
+	//
+	// An unknown event_id is a not-found; a row that exists but is not dead-lettered
+	// is a conflict naming the state it is actually in, because replaying an
+	// already-dispatched event and replaying a still-pending one are different
+	// operator mistakes that deserve different answers.
+	ClaimEventForReplay(ctx context.Context, eventID string, lockDuration time.Duration) (*model.EventOutbox, error)
+
+	// ReleaseEventReplay returns a replaying row to dead_lettered, recording
+	// replayErr in last_error when it is non-empty.
+	//
+	// It is the rollback half of ClaimEventForReplay, and the reason a failed replay
+	// does not cost an event its replayability: without it, a replay that claimed a
+	// row and then failed to publish would strand it in replaying, outside the
+	// relay's claimable set and outside the dead-letter inventory, where nothing
+	// would ever pick it up again. Every path out of a replay ends in either
+	// MarkEventDispatched or this.
+	ReleaseEventReplay(ctx context.Context, id int64, claimToken, replayErr string) error
+
+	MarkWebhookDispatched(ctx context.Context, id int64, claimToken string) error // Marks the legacy webhook leg dispatched for a claimed row, so a republished row cannot double-enqueue it
 
 	// Dead-letter and reporting reads
 	GetEventByID(ctx context.Context, eventID string) (*model.EventOutbox, error)               // Retrieves an entry by its business event_id UUID, for replay
@@ -311,15 +362,47 @@ type eventOutbox interface {
 	// no rows is absent from the map rather than present with a zero — callers
 	// must read it with the two-value form or accept the zero value.
 	CountEventOutboxByStatus(ctx context.Context) (map[string]int64, error)
+
+	// PurgeTerminalEventsBefore deletes at most limit TERMINAL rows whose
+	// occurrence predates cutoff, and returns how many it removed. A caller sweeps
+	// in a loop until fewer than limit come back.
+	//
+	// It is the retention primitive behind the outbox's data-minimisation contract,
+	// and it is needed because of WHAT THIS TABLE HOLDS: payload is the webhook body
+	// verbatim, so a transaction event carries amounts and balance identifiers and
+	// an identity event carries names, email addresses, phone numbers, postal
+	// addresses and dates of birth. Retained indefinitely, the delivery buffer
+	// becomes an unbounded secondary copy of the ledger's most sensitive data with
+	// none of the access controls the primary tables have around them.
+	//
+	// Only dispatched and dead_lettered rows are eligible. failed is deliberately
+	// excluded even though its retry budget is spent: its dead-letter write is still
+	// owed, so this table is the only copy of that event in existence.
+	PurgeTerminalEventsBefore(ctx context.Context, cutoff time.Time, limit int) (int64, error)
 }
 
 // eventSubscriber defines methods for the Kafka subscriber registry:
 // blnk.event_subscribers. A row records one subscriber's identity together with
-// the four values that ARE its access boundary — the Kafka principal its ACLs are
-// granted to, the consumer group it reads under, the topics it is authorised for,
-// and the partition-key prefix its grant is narrowed to. Provisioning translates
-// that row into one SASL/SCRAM credential and a set of ACL bindings; there are no
-// per-tenant topics.
+// the values that describe its access.
+//
+// # WHAT IS AND IS NOT AN ACCESS BOUNDARY (SEC-01)
+//
+// The ENFORCED boundary is exactly two things, because these are the two the broker
+// evaluates on every request: the ACL bindings on the topics the subscriber is
+// authorised for, and the ACL binding on its consumer group, both granted to the
+// Kafka principal on the row. Provisioning translates the row into one SASL/SCRAM
+// credential and those bindings; there are no per-tenant topics, so topic-level and
+// group-level ACLs are the whole of the enforcement.
+//
+// partition_key_prefix is NOT a boundary and must never be described or relied upon
+// as one. Kafka authorises reads at topic and group granularity — there is no ACL
+// operation that restricts a principal to a subset of a topic's partitions or to
+// records bearing a particular key, so a principal that may read a topic may read
+// EVERY record in it regardless of what this column says. The column is an ADVISORY
+// CONSUMER-SIDE FILTER: a hint a well-behaved subscriber may use to discard records
+// it does not care about. Treating it as isolation would mean believing two
+// subscribers on one topic cannot see each other's events, which is false, and
+// would make that belief the basis of a tenancy decision.
 //
 // # NO METHOD HERE MAY ACCEPT OR RETURN A PLAINTEXT SECRET
 //
@@ -359,6 +442,17 @@ type eventSubscriber interface {
 	UpdateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber) error                           // Updates a subscriber's access model and legacy webhook URL
 	DeleteEventSubscriber(ctx context.Context, subscriberID string) error                                         // Removes a subscriber from the registry
 
+	// TakeEventSubscriber removes a subscriber and RETURNS the row it removed,
+	// so the caller holds the principal and authorised topics that broker-side
+	// revocation needs — the very values a plain delete destroys unreported.
+	//
+	// This is the deletion to use whenever the broker side must also be
+	// deprovisioned. Read-then-delete-then-revoke leaves a window in which the
+	// row can change between the read and the delete, so what gets revoked may
+	// not be the boundary that was actually in force; returning the deleted row
+	// closes it.
+	TakeEventSubscriber(ctx context.Context, subscriberID string) (*model.EventSubscriber, error)
+
 	// RecordSubscriberCredential persists the outcome of a credential issuance:
 	// a NON-REVERSIBLE reference to the credential and the instant it was
 	// issued, which together are the complete stored record of an issuance. A
@@ -371,11 +465,60 @@ type eventSubscriber interface {
 	// legitimate "registered, not yet provisioned" state.
 	RecordSubscriberCredential(ctx context.Context, subscriberID, credentialReference string, issuedAt time.Time) error
 
+	// RecordSubscriberCredentialIfUnchanged persists an issuance only while the
+	// subscriber still holds the reference the caller observed before it
+	// provisioned at the broker. Pass expected == nil to require that no
+	// credential has ever been issued.
+	//
+	// Issuance is not idempotent: each call mints a new secret and the broker
+	// keeps only the last one written, so two concurrent issuances end with one
+	// usable secret and two successful-looking responses. This write is how the
+	// loser finds out — it matches no row and returns a CONFLICT, which a handler
+	// turns into "your issuance was superseded" rather than handing back a
+	// password that authenticates against nothing.
+	//
+	// It does not make issuance atomic across Blnk and the broker; nothing at
+	// this layer can. It makes the divergence DETECTABLE while both outcomes are
+	// still visible.
+	RecordSubscriberCredentialIfUnchanged(ctx context.Context, subscriberID string, expected *string, credentialReference string, issuedAt time.Time) error
+
+	// ClearSubscriberCredential erases the credential reference and issuance
+	// instant, returning the subscriber to the "registered, not yet
+	// provisioned" state. It is the compensating half of
+	// RecordSubscriberCredential.
+	//
+	// Broker-side deletion of the SCRAM credential is what actually ends
+	// access; this is what stops the registry from continuing to claim a
+	// credential that no longer exists, which every reader of the registry —
+	// operator, migration report, reconciliation — would otherwise believe.
+	// Revoke at the broker FIRST and clear here second, so a failure between
+	// the two over-reports access rather than hiding it.
+	//
+	// Clearing a subscriber that holds no credential succeeds: the desired end
+	// state is already true. A missing subscriber is still an error.
+	ClearSubscriberCredential(ctx context.Context, subscriberID string) error
+
 	// MarkSubscriberMigrated stamps migrated_at, recording that the subscriber
 	// has completed its move from legacy HTTP webhook delivery to Kafka
 	// consumption. A NULL migrated_at means NOT YET MIGRATED, which is exactly
 	// what migration-progress reporting counts during the dual-delivery window.
 	MarkSubscriberMigrated(ctx context.Context, subscriberID string, migratedAt time.Time) error
+
+	// PurgeMigratedSubscriberWebhookURLs erases the legacy webhook URL of every
+	// subscriber whose migration completed strictly before the cut-off,
+	// returning how many rows were purged.
+	//
+	// webhook_url exists solely to give an already-webhooked subscriber
+	// somewhere to be migrated FROM. Once migrated it holds a third-party
+	// endpoint with no remaining purpose — retention without a reason, and a
+	// destination that becomes a request Blnk makes the moment any sender is
+	// wired to it. migrated_at is deliberately KEPT: it is an audit fact the
+	// migration report reads, not third-party data.
+	//
+	// The cut-off is the caller's, so the retention period stays a policy
+	// decision. A zero cut-off is refused rather than read as "purge
+	// everything".
+	PurgeMigratedSubscriberWebhookURLs(ctx context.Context, migratedBefore time.Time) (int64, error)
 }
 
 // chain defines the hash-chain (tamper-evidence) operations.

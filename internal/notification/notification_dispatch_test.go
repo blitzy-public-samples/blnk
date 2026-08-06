@@ -249,7 +249,38 @@ func TestNotifyError_WebhookSenderReceivesSystemError(t *testing.T) {
 		assert.Equal(t, "system.error", got.event)
 		payloadMap, ok := got.payload.(map[string]interface{})
 		require.True(t, ok, "payload should be a map, got %T", got.payload)
-		assert.Equal(t, "queue worker crashed", payloadMap["error"])
+
+		// The payload is SANITIZED and carries no error text. This assertion replaces
+		// one that required payloadMap["error"] to equal the raw message, which is the
+		// behaviour the DATA-01 finding identified: Blnk's internal errors render with
+		// the schema, table, constraint, source file and routine that produced them, or
+		// with internal host addresses such as
+		// "write tcp 10.0.0.4:34918->10.0.0.7:9092: broken pipe", and system.error is
+		// published to a durable, replicated, retained Kafka topic and stored in
+		// blnk.event_outbox. The full text is logged instead, correlated by the ID
+		// below.
+		assert.NotContains(t, payloadMap, "error",
+			"the payload must not carry an error key at all")
+		for _, value := range payloadMap {
+			if text, isString := value.(string); isString {
+				assert.NotContains(t, text, "queue worker crashed",
+					"no field may carry the raw error text")
+			}
+		}
+
+		// What replaces it: a classified reason from a fixed vocabulary, and a
+		// correlation ID that is the operator's route to the full error in the log.
+		assert.Equal(t, SystemErrorReasonUnclassified, payloadMap["reason"],
+			"a plain errors.New with no recognisable signature classifies as unclassified")
+		correlationID, ok := payloadMap["correlation_id"].(string)
+		require.True(t, ok, "payload correlation_id should be a string")
+		assert.NotEmpty(t, correlationID,
+			"an empty correlation ID would leave the event unlinkable to any log line")
+
+		// error_code is omitted rather than blank for an untyped error, so that a
+		// recipient can tell "no code" from "the code is empty".
+		assert.NotContains(t, payloadMap, "error_code")
+
 		ts, ok := payloadMap["time"].(time.Time)
 		require.True(t, ok, "payload time should be a time.Time")
 		assert.WithinDuration(t, time.Now(), ts, 10*time.Second)

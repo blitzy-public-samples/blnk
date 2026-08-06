@@ -116,6 +116,19 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      # The rule directory prometheus.yml's rule_files glob resolves against.
+      #
+      # Without this mount the stanza matches nothing and BOTH alert rules are
+      # inert: a dead-letter entry stuck for 15 minutes and a subscriber trailing
+      # by 10,000 messages would never fire, however faithfully the gauges are
+      # published. That failure is silent — the rules are simply absent from
+      # /rules and there is no startup error to notice — which is exactly why the
+      # mount and the glob have to be kept in step.
+      #
+      # Mounted as a DIRECTORY rather than as a single file so a rule file added
+      # to ./alerts later is picked up without another edit here, and read-only
+      # because Prometheus never writes to it.
+      - ./alerts:/etc/prometheus/alerts:ro
     depends_on:
       - server
       - worker

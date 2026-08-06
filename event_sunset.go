@@ -49,10 +49,15 @@ import (
 // the divergence this file exists to prevent.
 //
 // The one other place that touches the raw value is
-// config.Configuration.validateWebhookDeprecationSunsetDate, which parses it purely
-// to warn about a malformed value at load time. It performs no comparison and makes
-// no decision, and it cannot delegate to this file because package blnk imports
-// package config, not the reverse.
+// config.Configuration.resolveWebhookDeprecationWindow, which parses it at load time
+// to REFUSE a configuration whose window is malformed, inconsistent with the 30-day
+// contract, or absent while Kafka publishing is enabled. It performs no clock
+// comparison and makes no sunset decision, and it cannot delegate to this file
+// because package blnk imports package config, not the reverse.
+//
+// The two therefore split the work cleanly: config decides whether a window is
+// ADMISSIBLE, at startup, once, and fatally. This file decides whether the admissible
+// window has ELAPSED, on every consultation. Neither duplicates the other.
 
 // webhookSunsetLayout is the layout the sunset date is written in. RFC3339 is the
 // deployment contract for WEBHOOK_DEPRECATION_SUNSET_DATE, and it is what the
@@ -112,58 +117,131 @@ var sunsetParseWarnings = &sunsetWarnGuard{}
 // atomic.Value cannot be emptied once written.
 var fetchConfiguration = config.Fetch
 
-// webhookSunsetInstant resolves the sunset instant from a configuration value.
+// webhookSunsetResolution is the tri-state answer to "what does configuration say
+// about the sunset?".
 //
-// It is the only parse of the sunset date that feeds a decision, and it applies
-// three deliberate leniencies, each of which resolves to "no sunset is configured":
+// A two-state answer is what made the previous behaviour unsafe. "Configured" and
+// "not configured" collapsed two very different situations into one: a deployment
+// that has no Kafka and therefore no migration to describe, and a deployment that IS
+// publishing to Kafka but whose window is missing or mis-typed. Both used to resolve
+// to "the sunset has not passed", which kept the deprecated HTTP transport running
+// indefinitely in the second case with nothing failing anywhere to say so.
+type webhookSunsetResolution int
+
+const (
+	// sunsetResolved means a sunset instant is configured and parses. The instant is
+	// meaningful and the verdict is a straight comparison against it.
+	sunsetResolved webhookSunsetResolution = iota
+
+	// sunsetAbsentNoTransport means no window is configured AND no Kafka broker is
+	// configured. There is nothing to migrate to, so there is no window to describe:
+	// the legacy transport is simply the only transport and the sunset has not
+	// passed. This is the graceful-degradation state every deployment without Kafka
+	// runs in, and it stays an ordinary, quiet outcome.
+	sunsetAbsentNoTransport
+
+	// sunsetUnusableWithTransport means Kafka publishing IS configured but the window
+	// is missing or will not parse. This FAILS CLOSED: the sunset is treated as
+	// passed, so dual delivery stops and the deprecated webhook management routes
+	// answer 410 Gone.
+	//
+	// Failing closed rather than open is the whole point of the tri-state. The
+	// alternative — carrying on with legacy HTTP push indefinitely — keeps the
+	// deprecated, less protected transport alive on the strength of a typo, and does
+	// it invisibly. Retiring it early is loud, immediately visible to anyone still
+	// consuming webhooks, and recoverable by correcting one variable.
+	//
+	// config.Configuration.resolveWebhookDeprecationWindow refuses to LOAD this
+	// combination, so it is unreachable through the normal startup path. This arm is
+	// what happens when configuration is published some other way — a test writing to
+	// the store directly, or a future reload path — and is a second line of defence
+	// rather than the primary one.
+	sunsetUnusableWithTransport
+)
+
+// webhookSunsetInstant resolves the sunset instant, and what its absence means, from
+// a configuration value.
 //
-//   - A nil configuration. Reached when configuration has not been loaded.
-//   - An empty or whitespace-only value. Whitespace matters: the configuration
-//     loader trims a fixed set of fields and this is not one of them, so a trailing
-//     newline from an environment file would otherwise be read as a malformed date.
-//   - A value that is not valid RFC3339. Reported as a warning, never as an error
-//     and never as a panic. A mis-typed date must not take a ledger down, and it
-//     must not silently retire a transport either.
+// It is the only parse of the sunset date that feeds a decision. Whitespace is
+// trimmed before parsing because a trailing newline from an environment file is not a
+// malformed date, and a successfully parsed instant is normalised to UTC: time.Time
+// comparisons are absolute, so the location cannot change any verdict, but
+// normalising means the value handed back — to a log line, to a Sunset response
+// header, to a test assertion — is always in one zone and reads unambiguously.
 //
-// A successfully parsed instant is normalised to UTC. time.Time comparisons are
-// absolute, so the location cannot change any verdict; normalising means the value
-// this function hands back — to a log line, to a Sunset response header, to a test
-// assertion — is always in one zone and reads unambiguously.
+// A malformed value is reported, never raised as an error and never a panic: a
+// mis-typed date must not take a ledger down. What it must ALSO not do is silently
+// preserve the deprecated transport, which is why the returned resolution
+// distinguishes "no transport to migrate to" from "publishing, but the window is
+// unusable".
 //
 // Parameters:
 //   - cnf *config.Configuration: the configuration to read the sunset date from. May
-//     be nil.
+//     be nil, which is reached when configuration has not been loaded.
 //
 // Returns:
 //   - time.Time: the sunset instant in UTC, or the zero time when none is configured.
-//   - bool: true only when a sunset date is configured AND parses.
-func webhookSunsetInstant(cnf *config.Configuration) (time.Time, bool) {
+//     Meaningful only alongside sunsetResolved.
+//   - webhookSunsetResolution: which of the three situations applies.
+func webhookSunsetInstant(cnf *config.Configuration) (time.Time, webhookSunsetResolution) {
 	if cnf == nil {
-		return time.Time{}, false
+		// No configuration at all means no brokers either, so there is no transport to
+		// migrate to and nothing to fail closed about.
+		return time.Time{}, sunsetAbsentNoTransport
+	}
+
+	publishing := len(cnf.Kafka.Brokers) > 0
+
+	unusable := func() webhookSunsetResolution {
+		if publishing {
+			return sunsetUnusableWithTransport
+		}
+
+		return sunsetAbsentNoTransport
 	}
 
 	raw := strings.TrimSpace(cnf.WebhookDeprecationSunsetDate)
 	if raw == "" {
-		return time.Time{}, false
+		if publishing && sunsetParseWarnings.shouldWarn("") {
+			logrus.Error(
+				"webhook_deprecation_sunset_date is NOT SET while Kafka brokers are configured. " +
+					"The dual-delivery window has no end, so the sunset is being treated as ALREADY " +
+					"PASSED: legacy HTTP webhook delivery stops and the deprecated webhook " +
+					"management routes answer 410 Gone. Set WEBHOOK_DEPRECATION_SUNSET_DATE, or " +
+					"WEBHOOK_DEPRECATION_START_DATE and let the 30-day window derive it",
+			)
+		}
+
+		return time.Time{}, unusable()
 	}
 
 	parsed, err := time.Parse(webhookSunsetLayout, raw)
 	if err != nil {
 		if sunsetParseWarnings.shouldWarn(raw) {
-			logrus.WithError(err).WithFields(logrus.Fields{
+			entry := logrus.WithError(err).WithFields(logrus.Fields{
 				"value":    raw,
 				"expected": webhookSunsetLayout,
-			}).Warn(
-				"webhook_deprecation_sunset_date is not a valid RFC3339 instant and is being ignored; " +
-					"the webhook sunset is treated as not yet passed, so dual delivery continues and the " +
-					"deprecated webhook routes keep answering normally",
-			)
+			})
+			if publishing {
+				entry.Error(
+					"webhook_deprecation_sunset_date is not a valid RFC3339 instant while Kafka " +
+						"brokers are configured. The sunset is being treated as ALREADY PASSED: " +
+						"legacy HTTP webhook delivery stops and the deprecated webhook management " +
+						"routes answer 410 Gone. Correct the value",
+				)
+			} else {
+				entry.Warn(
+					"webhook_deprecation_sunset_date is not a valid RFC3339 instant and is being " +
+						"ignored; no Kafka broker is configured, so there is no dual-delivery " +
+						"window to end and the deprecated webhook routes keep answering normally",
+				)
+			}
 		}
 
-		return time.Time{}, false
+		return time.Time{}, unusable()
 	}
 
-	return parsed.UTC(), true
+	return parsed.UTC(), sunsetResolved
 }
 
 // resolveWebhookSunset reads the sunset instant from the live configuration store.
@@ -175,22 +253,22 @@ func webhookSunsetInstant(cnf *config.Configuration) (time.Time, bool) {
 // configuration that no longer exists.
 //
 // A configuration store that has not been populated is not an error here. It means
-// no sunset date is configured, which resolves to "not passed" like every other
-// absent value, and is logged at debug level so the hot paths stay quiet. This
-// mirrors Blnk.Config, which likewise degrades to an empty configuration rather than
-// failing when the store is empty.
+// nothing is configured at all — no window and no brokers — which resolves to
+// sunsetAbsentNoTransport, and is logged at debug level so the hot paths stay quiet.
+// This mirrors Blnk.Config, which likewise degrades to an empty configuration rather
+// than failing when the store is empty.
 //
 // Returns:
 //   - time.Time: the sunset instant in UTC, or the zero time when none is configured.
-//   - bool: true only when a sunset date is configured AND parses.
-func resolveWebhookSunset() (time.Time, bool) {
+//   - webhookSunsetResolution: which of the three situations applies.
+func resolveWebhookSunset() (time.Time, webhookSunsetResolution) {
 	cnf, err := fetchConfiguration()
 	if err != nil {
 		logrus.WithError(err).Debug(
 			"configuration is not loaded; treating the webhook sunset as not yet passed",
 		)
 
-		return time.Time{}, false
+		return time.Time{}, sunsetAbsentNoTransport
 	}
 
 	return webhookSunsetInstant(cnf)
@@ -207,12 +285,19 @@ func resolveWebhookSunset() (time.Time, bool) {
 // format it with http.TimeFormat, which is the IMF-fixdate representation that
 // RFC 8594 requires.
 //
+// Note that false does NOT imply the sunset has not passed. A deployment publishing
+// to Kafka with an unusable window has no instant to report and yet IS past the
+// sunset, because that state fails closed. Callers must take the verdict from
+// WebhookSunsetPassed and use this only to describe a date they already know exists.
+//
 // Returns:
 //   - time.Time: the sunset instant in UTC, or the zero time when none is configured.
 //   - bool: true only when a sunset date is configured AND parses. When false, the
 //     returned time is meaningless and must not be rendered.
 func WebhookSunsetDate() (time.Time, bool) {
-	return resolveWebhookSunset()
+	instant, resolution := resolveWebhookSunset()
+
+	return instant, resolution == sunsetResolved
 }
 
 // WebhookSunsetPassed reports whether the legacy webhook sunset has passed as of now.
@@ -227,19 +312,28 @@ func WebhookSunsetDate() (time.Time, bool) {
 // the half-open interval that ends at — and excludes — the sunset instant. One
 // nanosecond before it, dual delivery is still running and the deprecated webhook
 // routes still answer normally; at it and after it, Kafka is the only transport and
-// those routes answer 410 Gone. Configuring the instant 30 days after the window
-// opens therefore yields exactly 30 days of dual delivery.
+// those routes answer 410 Gone. Because config.Configuration enforces a window of
+// exactly config.WebhookDualDeliveryWindowDays, that interval is exactly 30 days.
 //
 // Both sides of the comparison are normalised to UTC, so a date written with an
 // offset (2026-03-01T01:00:00+01:00) and the same instant written as Z
 // (2026-03-01T00:00:00Z) are indistinguishable, as they must be.
 //
-// When no sunset date is configured, or the configured value cannot be parsed, or
-// configuration has not been loaded, the answer is false — the sunset has NOT
-// passed. That default is chosen, not incidental: it keeps dual delivery running and
-// keeps the webhook management routes answering normally. Answering true for an
-// absent value would silently retire the HTTP transport on every deployment that
-// never set the variable.
+// # What an absent or unusable window means, and why it depends on the transport
+//
+// This function FAILS CLOSED when Kafka publishing is configured and the window is
+// missing or unparseable: it answers true, so dual delivery stops and the deprecated
+// routes answer 410 Gone. It answers false only when there is no Kafka transport at
+// all, where "the sunset has not passed" is simply the truth — there is nothing to
+// have migrated to, so nothing can have been retired.
+//
+// The previous behaviour answered false in BOTH cases. That is the defect this
+// distinction fixes: one mis-typed environment variable indefinitely preserved the
+// legacy HTTP transport and the webhook management surface on a deployment that had
+// already moved to Kafka, silently and with nothing to alert on. Configuration now
+// refuses to load that combination outright, so reaching this arm at all means
+// configuration arrived by some other route; the fail-closed answer is the second
+// line of defence.
 //
 // Parameters:
 //   - now time.Time: the instant to evaluate the sunset against. It is a parameter
@@ -247,14 +341,24 @@ func WebhookSunsetDate() (time.Time, bool) {
 //     pin the boundary to the nanosecond — control the clock.
 //
 // Returns:
-//   - bool: true when a sunset date is configured, parses, and now is at or after it.
+//   - bool: true when a sunset date is configured, parses, and now is at or after it;
+//     true when Kafka publishing is configured and the window is unusable; false
+//     otherwise.
 func WebhookSunsetPassed(now time.Time) bool {
-	sunset, configured := resolveWebhookSunset()
-	if !configured {
-		return false
-	}
+	sunset, resolution := resolveWebhookSunset()
 
-	return !now.UTC().Before(sunset)
+	switch resolution {
+	case sunsetResolved:
+		return !now.UTC().Before(sunset)
+	case sunsetUnusableWithTransport:
+		return true
+	case sunsetAbsentNoTransport:
+		return false
+	default:
+		// Unreachable: the three constants above are exhaustive. Answering "passed"
+		// keeps an unforeseen resolution on the fail-closed side.
+		return true
+	}
 }
 
 // WebhookSunsetPassedNow reports whether the webhook sunset has passed as of the

@@ -54,15 +54,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/blnkfinance/blnk/config"
+	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/model"
 )
 
@@ -254,7 +255,7 @@ func mapStringValue(payload map[string]interface{}, key string) string {
 // ABOUT — from the payload object the producer handed over.
 //
 // This is the value a consumer groups by once messages arrive. It is deliberately
-// distinct from the Kafka message key returned by eventLedgerID: the key controls
+// distinct from the Kafka message key returned by eventPartitionKey: the key controls
 // partitioning and therefore ordering, whereas this identifies the subject of the
 // event. The two coincide for some event types and differ for others.
 //
@@ -341,7 +342,25 @@ func eventAggregateID(payload interface{}) string {
 	}
 }
 
-// eventLedgerID derives the KAFKA MESSAGE KEY for an event.
+// eventPartitionKey derives the KAFKA MESSAGE KEY for an event.
+//
+// # IT IS NOT THE LEDGER ID, and it used to be called one
+//
+// This function was named eventLedgerID and its result was stored in a column called
+// ledger_id, which was wrong for most of the values it actually produced: depending
+// on the event it returns a ledger id, a source or destination BALANCE id, an
+// IDENTITY id, a MONITOR id, a BATCH id, or the event type itself. Two things
+// followed from the misnaming, and both were real rather than cosmetic. Anything
+// reading ledger_id to learn which ledger an event belonged to got a balance id for
+// every transaction event and had no way to tell. And any subscriber-facing claim
+// that a message-key prefix identifies a ledger was simply unfounded, because for
+// the highest-volume event type in the system the key is not a ledger id at all.
+//
+// The authoritative ledger now lives in its own column, populated by eventLedgerID,
+// which returns a value ONLY when the payload genuinely carries one. The two
+// functions answer different questions and must not be conflated again:
+// eventPartitionKey answers "where does this message go", eventLedgerID answers
+// "which ledger is this about".
 //
 // This value is the single most consequential field this file computes. The key is
 // hashed by a stable balancer to select a partition, so every event sharing a key
@@ -397,7 +416,7 @@ func eventAggregateID(payload interface{}) string {
 //
 // Returns:
 //   - string: the partition key, or "" when the payload carries none.
-func eventLedgerID(payload interface{}) string {
+func eventPartitionKey(payload interface{}) string {
 	switch typed := payload.(type) {
 	case *model.Transaction:
 		if typed == nil {
@@ -441,8 +460,73 @@ func eventLedgerID(payload interface{}) string {
 	}
 }
 
+// eventLedgerID resolves the AUTHORITATIVE ledger an event belongs to, or "" when the
+// event genuinely has no ledger.
+//
+// It takes no part in partitioning, in ordering, or in routing. Its only job is to
+// answer "which ledger is this about" honestly, which means returning nothing rather
+// than something plausible when the payload does not actually say.
+//
+// # Why the answer is empty so often, and why that is correct
+//
+// Only two payload shapes carry a ledger identifier at all:
+//
+//	*model.Ledger / model.Ledger   → LedgerID. The event is about the ledger itself.
+//	*model.Balance / model.Balance → LedgerID. A balance belongs to exactly one ledger.
+//
+// Every other event type returns "", and each for a concrete reason rather than an
+// oversight:
+//
+//   - TRANSACTIONS. model.Transaction HAS NO LEDGER FIELD. A transaction's ledger
+//     association is indirect, through the balances it moves value between, so
+//     resolving it would require reading one of those balances from the database — on
+//     the event-capture path, inside the caller's open ledger transaction, for a value
+//     nothing needs to route by. That cost is not worth paying, and INVENTING a value
+//     is worse: the previous code put the SOURCE BALANCE ID in the ledger column,
+//     where it read as a ledger id to everything downstream.
+//   - BALANCE MONITORS. model.BalanceMonitor carries a balance and a condition and no
+//     ledger.
+//   - IDENTITIES. model.Identity carries no ledger; an identity is not scoped to a
+//     ledger in this model.
+//   - BULK TRANSACTION BATCHES. A batch is a runtime grouping of work, not a ledger
+//     object, and its transactions may span ledgers.
+//   - SYSTEM ERRORS. There is no aggregate of any kind, let alone a ledger.
+//
+// The column is nullable precisely so this can be stated: NULL means "this event has
+// no ledger" as a fact, which a NOT NULL column defaulting to the empty string could
+// not distinguish from "nobody looked".
+//
+// Parameters:
+//   - payload interface{}: the NewWebhook payload object. May be nil or of any type.
+//
+// Returns:
+//   - string: the ledger id, trimmed, or "" when the payload carries none.
+func eventLedgerID(payload interface{}) string {
+	switch typed := payload.(type) {
+	case *model.Ledger:
+		if typed == nil {
+			return ""
+		}
+		return strings.TrimSpace(typed.LedgerID)
+	case model.Ledger:
+		return strings.TrimSpace(typed.LedgerID)
+	case *model.Balance:
+		if typed == nil {
+			return ""
+		}
+		// No fallback to BalanceID here, unlike the partition key. A balance id is not
+		// a ledger id, and returning one would put exactly the wrong kind of value in
+		// the ledger column again — which is the defect this split exists to fix.
+		return strings.TrimSpace(typed.LedgerID)
+	case model.Balance:
+		return strings.TrimSpace(typed.LedgerID)
+	default:
+		return ""
+	}
+}
+
 // transactionPartitionKey applies the transaction key preference documented on
-// eventLedgerID: source balance, then destination balance, then the transaction
+// eventPartitionKey: source balance, then destination balance, then the transaction
 // itself.
 //
 // Extracted so the pointer and value arms of the type switch cannot drift apart —
@@ -518,20 +602,38 @@ func firstNonBlank(candidates ...string) string {
 // subscribers, the relay and SQL-side triage route and filter without parsing the
 // payload at all, at a cost of one short string per message.
 //
-// # Return-nil cases, and why neither is an error
+// # The ONE nil-nil case, and the one error case
 //
-//   - Event publishing is not configured. Reproducing SendWebhook's
-//     no-op-when-unconfigured contract is what lets Blnk run with no notification
-//     sink; see eventPublishingConfigured.
-//   - The payload cannot be marshaled — a channel, a function, or a cyclic
-//     structure somewhere inside it. This mirrors PrepareLineageOutbox exactly: log
-//     it, record it on the span, and return nil. A MALFORMED PAYLOAD MUST NEVER
-//     TAKE DOWN A LEDGER WRITE. Propagating an error here would abort the enclosing
-//     ledger transaction and reject a financially valid mutation because of a
-//     notification defect, which is the wrong trade in a ledger by a wide margin.
+// (nil, nil) means "there is nothing to capture" and has exactly one cause: event
+// publishing is not configured. Reproducing SendWebhook's no-op-when-unconfigured
+// contract is what lets Blnk run with no notification sink; see
+// eventPublishingConfigured. A nil row is safe for every consumer — the atomic
+// writers' variadic event parameter skips nil entries, and publishEvent treats nil as
+// "nothing to persist".
 //
-// A nil return is safe for every consumer: the atomic writers' variadic event
-// parameter skips nil entries, and publishEvent treats nil as "nothing to persist".
+// A payload that CANNOT BE MARSHALED is an ERROR, and this is a deliberate change from
+// the earlier behaviour of logging it and returning nil.
+//
+// The old reasoning was that a malformed payload must never take down a ledger write,
+// and that propagating an error would reject a financially valid mutation because of a
+// notification defect. The trade it actually made was worse than the one it avoided:
+// the mutation committed, the event was silently gone, the caller was told everything
+// had succeeded, and NOTHING downstream could ever discover the loss — not the outbox,
+// not the relay, not the dead-letter inventory, not the daily reconciliation, which
+// counts rows that exist and cannot count a row that was never written. An event that
+// no mechanism can find is indistinguishable from an event that was never produced.
+//
+// Returning the error hands the decision to the caller, which is the only place it can
+// be made correctly. On the in-transaction path the caller's mutation rolls back, which
+// is what requirement R-2 asks for: a mutation whose event cannot be captured must not
+// commit. On the standalone path the caller reports the failure.
+//
+// The practical risk this adds is small and bounded, which is what makes the trade
+// right rather than merely principled. json.Marshal fails on channels, functions and
+// cyclic structures; the payloads reaching here are model structs and small
+// string-keyed maps built in this repository, none of which contain any of those. A
+// failure here is a programming defect in a new producer, and the loudest possible
+// moment to learn about it is the first time that producer runs.
 //
 // # Use with the atomic writers (requirement R-2)
 //
@@ -554,16 +656,112 @@ func firstNonBlank(candidates ...string) string {
 //     from the producer call site.
 //
 // Returns:
-//   - *model.EventOutbox: the row to persist, or nil when publishing is
-//     unconfigured or the payload cannot be marshaled.
-func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook) *model.EventOutbox {
+//   - *model.EventOutbox: the row to persist, or nil when publishing is unconfigured.
+//   - error: nil on success and on the unconfigured no-op; a typed internal-server
+//     error when the payload cannot be marshaled.
+//
+// EventOption supplies a fact about an event that the payload cannot yield.
+//
+// It is variadic at every entry point deliberately. The transport substitution at the
+// producer call sites must stay a one-identifier edit — SendWebhook becomes PublishEvent —
+// because that is what makes the payload-preservation guarantee verifiable by reading the
+// diff. A variadic option list keeps every one of those call sites source-compatible while
+// giving the sites that KNOW something the payload does not a way to state it.
+//
+// There is exactly one option today, WithEventLedgerID.
+type EventOption func(*eventAttributes)
+
+// eventAttributes carries what a caller supplied, before any derivation runs.
+//
+// It is a struct rather than a bare string so that adding a second caller-supplied
+// attribute is an additive change here instead of a new parameter everywhere.
+type eventAttributes struct {
+	// ledgerID is the ledger the mutation belonged to, as supplied by the caller.
+	// Empty means "not supplied", which sends the derivation on to the payload.
+	ledgerID string
+}
+
+// WithEventLedgerID supplies THE LEDGER THE MUTATION BELONGED TO.
+//
+// # Why a caller has to supply it at all
+//
+// model.Transaction HAS NO LEDGER FIELD. A transaction's ledger association is indirect,
+// through the balances it moves value between, so a transaction payload simply cannot yield
+// the ledger — and MetaData is caller-controlled and unfit to derive a routing key from.
+// Without this option every transaction event stores ledger_id as SQL NULL, which is
+// honest but leaves no way for a consumer, an operator or the daily reconciliation to group
+// a transaction event by ledger at all.
+//
+// Every producer that performs a ledger-scoped mutation DOES know it: transaction
+// execution has already loaded the source and destination balances, each of which carries
+// LedgerID, and the balance and ledger post-action hooks hold the entity itself.
+//
+// # It becomes the PARTITION KEY as well as the recorded ledger, and what that costs
+//
+// Requirement R-6 partitions by ledger id, and eventPartitionKey already keys by the ledger
+// for every payload that yields one — a ledger event by its own id, a balance event by its
+// ledger. A caller supplying the ledger is supplying exactly what the payload could not, so
+// it takes the same precedence; doing otherwise would make one rule apply to balances and a
+// different one to transactions.
+//
+// THE CONSEQUENCE IS EXPLICIT, not a side effect: every event of one ledger then lands on
+// ONE partition. That is the strongest ordering guarantee available and it is what R-6 asks
+// for, and it also means a deployment whose volume is concentrated in a single ledger reads
+// that topic through a single partition however many the topic has. Omitting the option
+// leaves a transaction event keyed on its source balance, which matches what the
+// transaction queue already shards on (hashBalanceID(transaction.Source) in queue.go),
+// spreads load across partitions, and preserves per-BALANCE rather than per-LEDGER
+// ordering — strictly weaker for the ledger, strictly better for parallelism. Neither is
+// wrong; the choice belongs to whoever wires the call site, which is why this is an option
+// and not a derivation.
+//
+// A blank or whitespace-only value is IGNORED rather than stored, because a whitespace key
+// hashes to a different partition from an empty one and would split one ledger's events
+// across two partitions — the precise failure this mechanism exists to prevent.
+//
+// Parameters:
+//   - ledgerID string: the ledger the mutation belonged to.
+//
+// Returns:
+//   - EventOption: applied by PrepareEventOutbox, PublishEvent and PublishEventInTx.
+func WithEventLedgerID(ledgerID string) EventOption {
+	return func(attributes *eventAttributes) {
+		if trimmed := strings.TrimSpace(ledgerID); trimmed != "" {
+			attributes.ledgerID = trimmed
+		}
+	}
+}
+
+// applyEventOptions folds a caller's options into a fresh attribute set.
+//
+// A nil option is skipped rather than panicking: the list is variadic and assembled at call
+// sites that may build it conditionally, and a nil entry there is a caller's slip that must
+// not take a ledger write down with it.
+//
+// Parameters:
+//   - options []EventOption: the caller's options, possibly empty or containing nils.
+//
+// Returns:
+//   - eventAttributes: the folded attributes.
+func applyEventOptions(options []EventOption) eventAttributes {
+	var attributes eventAttributes
+	for _, option := range options {
+		if option != nil {
+			option(&attributes)
+		}
+	}
+
+	return attributes
+}
+
+func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options ...EventOption) (*model.EventOutbox, error) {
 	_, span := tracer.Start(ctx, "PrepareEventOutbox")
 	defer span.End()
 
 	cnf := l.eventConfiguration()
 	if !eventPublishingConfigured(cnf) {
 		span.AddEvent("Event publishing not configured")
-		return nil
+		return nil, nil
 	}
 
 	// THE PAYLOAD GUARANTEE: marshal the whole NewWebhook value, both keys, exactly
@@ -571,43 +769,93 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook) *model.
 	// re-keyed.
 	payloadBytes, err := json.Marshal(event)
 	if err != nil {
-		logrus.Errorf("failed to marshal event outbox payload for event %q: %v", event.Event, err)
+		logrus.WithError(err).WithField("event_type", event.Event).
+			Error("event not captured: its payload could not be marshaled")
 		span.RecordError(err)
-		return nil
+
+		return nil, apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"The event payload could not be serialized",
+			fmt.Errorf("blnk: marshalling the payload of event %q: %w", event.Event, err),
+		)
 	}
 
 	eventType := strings.TrimSpace(event.Event)
 	aggregateID := eventAggregateID(event.Payload)
+
+	// TWO DIFFERENT VALUES, resolved from two different functions, stored in two
+	// different columns. Conflating them is the defect this split exists to fix; see
+	// eventPartitionKey and eventLedgerID.
+	partitionKey := eventPartitionKey(event.Payload)
 	ledgerID := eventLedgerID(event.Payload)
 
-	// The documented fallback chain. Its purpose is a partition key that is always
-	// present and always deterministic: an empty key would let Kafka scatter the
-	// event round-robin and destroy ordering with nothing in the data to show it.
+	// A CALLER-SUPPLIED LEDGER WINS over both derivations, and over each for its own
+	// reason. It is the authoritative ledger, so it is what ledger_id must record —
+	// a payload that yields none (a transaction) would otherwise store SQL NULL. And
+	// it is the R-6 partitioning dimension, so it takes the same precedence for the
+	// key that a ledger derived FROM the payload already takes: see WithEventLedgerID
+	// for the ordering-versus-parallelism trade this makes explicit.
+	if supplied := applyEventOptions(options).ledgerID; supplied != "" {
+		ledgerID = supplied
+		partitionKey = supplied
+	}
+
+	// The documented fallback chain, and it applies to the PARTITION KEY ONLY. Its
+	// purpose is a key that is always present and always deterministic: an empty key
+	// would let Kafka scatter the event round-robin and destroy ordering with nothing
+	// in the data to show it.
 	//
 	// Falling back to the event type is what gives system.error — which has no
 	// aggregate of any kind — a single partition and therefore a total order, which
 	// is precisely what an error stream wants. The sentinel is reached only when
 	// there is no event type either.
-	if ledgerID == "" {
-		ledgerID = aggregateID
+	//
+	// NOTHING LIKE THIS APPLIES TO ledgerID. A missing ledger stays missing: it is
+	// stored as SQL NULL, because a fabricated ledger id is worse than no ledger id.
+	if partitionKey == "" {
+		partitionKey = aggregateID
 	}
-	if ledgerID == "" {
-		ledgerID = eventType
+	if partitionKey == "" {
+		partitionKey = eventType
 	}
-	if ledgerID == "" {
-		ledgerID = unkeyedEventPartitionKey
+	if partitionKey == "" {
+		partitionKey = unkeyedEventPartitionKey
 	}
 	// aggregate_id is NOT NULL in the schema and is what consumers group by, so it
-	// inherits the key once every payload-derived candidate is exhausted.
+	// inherits the partition key once every payload-derived candidate is exhausted.
 	if aggregateID == "" {
-		aggregateID = ledgerID
+		aggregateID = partitionKey
+	}
+
+	// The event id is DERIVED when the event has a stable identity, and random when it
+	// does not.
+	//
+	// event_id carries two contracts at once: it is the subscriber's idempotency key,
+	// and it is the unique index that makes the outbox's write side exactly-once. A
+	// freshly random id satisfies neither for a RETRY — a mutation replayed after an
+	// ambiguous failure prepares its event a second time, the index sees a different
+	// key, admits a second row, and the subscriber receives one business event twice
+	// with no way to tell. It also makes the CONFLICT arm of
+	// wrapEventOutboxInsertError unreachable, so the discrimination it performs on the
+	// unique violation — which exists precisely so a caller retrying a captured
+	// mutation can recognise it and carry on — could never fire.
+	//
+	// Determinism is applied ONLY where it is correct. model.EventIdentityFor decides,
+	// and it refuses the repeatable events: balance.monitor fires every time its
+	// condition is met, and system.error is emitted per occurrence, so deriving either
+	// would collapse every later occurrence into a duplicate the index rejects and the
+	// pipeline would stop delivering them with no error anywhere.
+	eventID := model.NewEventID()
+	if identity, derivable := model.EventIdentityFor(eventType, event.Payload); derivable {
+		eventID = model.DeriveEventID(identity, eventType, model.SchemaVersionV1)
 	}
 
 	outbox := &model.EventOutbox{
-		EventID:     uuid.New().String(),
-		EventType:   eventType,
-		AggregateID: aggregateID,
-		LedgerID:    ledgerID,
+		EventID:      eventID,
+		EventType:    eventType,
+		AggregateID:  aggregateID,
+		PartitionKey: partitionKey,
+		LedgerID:     ledgerID,
 		// Resolved once, at construction, and stored on the row. The relay never
 		// re-derives it, so a row stays replayable to its ORIGINAL destination even
 		// if KAFKA_TOPIC_PREFIX changes afterwards.
@@ -629,11 +877,12 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook) *model.
 		attribute.String("event.id", outbox.EventID),
 		attribute.String("event.type", outbox.EventType),
 		attribute.String("event.aggregate_id", outbox.AggregateID),
+		attribute.String("event.partition_key", outbox.PartitionKey),
 		attribute.String("event.ledger_id", outbox.LedgerID),
 		attribute.String("event.topic", outbox.Topic),
 	))
 
-	return outbox
+	return outbox, nil
 }
 
 // PublishEvent captures a domain event in the transactional outbox. It is the
@@ -668,8 +917,8 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook) *model.
 //
 // Returns:
 //   - error: nil on success and on every no-op; the persistence error otherwise.
-func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook) error {
-	return l.publishEvent(ctx, nil, event)
+func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...EventOption) error {
+	return l.publishEvent(ctx, nil, event, options...)
 }
 
 // PublishEventInTx captures a domain event inside an existing database transaction,
@@ -704,8 +953,8 @@ func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook) error {
 //
 // Returns:
 //   - error: nil on success and on every no-op; the persistence error otherwise.
-func (l *Blnk) PublishEventInTx(ctx context.Context, tx *sql.Tx, event NewWebhook) error {
-	return l.publishEvent(ctx, tx, event)
+func (l *Blnk) PublishEventInTx(ctx context.Context, tx *sql.Tx, event NewWebhook, options ...EventOption) error {
+	return l.publishEvent(ctx, tx, event, options...)
 }
 
 // publishEvent is the single implementation behind PublishEvent and
@@ -732,14 +981,23 @@ func (l *Blnk) PublishEventInTx(ctx context.Context, tx *sql.Tx, event NewWebhoo
 //   - ctx context.Context: the context for the operation.
 //   - tx *sql.Tx: the caller's transaction, or nil for the standalone insert.
 //   - event NewWebhook: the event to capture.
+//   - options ...EventOption: caller-supplied facts the payload cannot yield, forwarded
+//     verbatim to PrepareEventOutbox.
 //
 // Returns:
 //   - error: nil on success and on every no-op; the persistence error otherwise.
-func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook) error {
+func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook, options ...EventOption) error {
 	ctx, span := tracer.Start(ctx, "PublishEvent")
 	defer span.End()
 
-	outbox := l.PrepareEventOutbox(ctx, event)
+	outbox, err := l.PrepareEventOutbox(ctx, event, options...)
+	if err != nil {
+		// A payload that will not serialise is a defect, not a transient condition, and
+		// it is returned rather than swallowed so the caller — and, on the
+		// in-transaction path, the caller's rollback — can act on it.
+		span.RecordError(err)
+		return err
+	}
 	if outbox == nil {
 		span.AddEvent("No event captured")
 		return nil
@@ -753,22 +1011,39 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook) e
 	)
 
 	// Checked AFTER the row is built, deliberately. Preparing the row costs one
-	// marshal and no I/O, and it is what gives this warning the event identity that
+	// marshal and no I/O, and it is what gives this failure the event identity that
 	// makes it actionable — "some event was dropped" is not a diagnosable message.
 	// The nil-receiver arm is evaluated first so the field access can never run on a
 	// nil pointer.
+	//
+	// THIS IS AN ERROR, not a warning, and that is a deliberate change. Reaching here
+	// means publishing IS configured — PrepareEventOutbox already returned nil for the
+	// unconfigured case — and there is nowhere to persist to. Every event in such a
+	// deployment is dropped, permanently and invisibly, while every caller is told it
+	// succeeded. Returning nil made that a log line nobody reads; returning the error
+	// makes it a failure the caller reports and, inside a ledger transaction, rolls
+	// back over.
+	//
+	// NewBlnk(nil) remains a supported construction: with no brokers configured it
+	// never reaches this line, so tests and deployments that run without a datasource
+	// and without Kafka are unaffected.
 	if l == nil || l.datasource == nil {
+		err = apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"Event publishing is configured but no datasource is available to capture the event",
+			fmt.Errorf("blnk: event %q (%s) cannot be captured: the Blnk instance has no datasource",
+				outbox.EventID, outbox.EventType),
+		)
 		logrus.WithFields(logrus.Fields{
 			"event_id":   outbox.EventID,
 			"event_type": outbox.EventType,
 			"topic":      outbox.Topic,
-		}).Warn("event not captured: no datasource is configured on this Blnk instance")
-		span.AddEvent("Event dropped: no datasource")
+		}).WithError(err).Error("event not captured: publishing is configured but this Blnk instance has no datasource")
+		span.RecordError(err)
 
-		return nil
+		return err
 	}
 
-	var err error
 	if tx != nil {
 		// Inside the caller's ledger transaction: the event commits with the
 		// mutation or not at all.

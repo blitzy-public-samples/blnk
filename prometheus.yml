@@ -24,6 +24,19 @@ global:
 # has no /etc/prometheus, where a literal path instead fails outright with
 # "does not point to an existing file". A matched glob is still validated in
 # full, so nothing is traded away for that robustness.
+#
+# THIS FILE EXISTS TWICE. Kubernetes has no bind mounts, so both this
+# configuration and the rule file travel as data in
+# infrastructure/k8s-manifests/prometheus-configmap.yaml. Edit BOTH copies
+# together: two hand-maintained copies of an alerting configuration diverge
+# silently — each file stays valid, each reads correctly in review, and the
+# only symptom is one environment alerting while the other does not.
+#
+# That is checked rather than trusted. TestPrometheusConfigParity_KeepsThe
+# KubernetesCopyInStepWithTheRoot compares the two copies SEMANTICALLY, and
+# TestPrometheusRuleFiles_AreMountedWhereTheGlobResolves asserts that both
+# Compose files mount a source at the directory this glob resolves against.
+# Either edit made alone fails a test instead of shipping.
 rule_files:
   - '/etc/prometheus/alerts/*.yml'
 

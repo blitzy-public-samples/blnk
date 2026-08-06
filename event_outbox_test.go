@@ -75,11 +75,13 @@ import (
 	"github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/database/mocks"
+	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/model"
 )
 
@@ -568,6 +570,48 @@ func outboxStoreConfiguration(t *testing.T, cnf *config.Configuration) {
 // asynq client, queue, search client or hook manager is constructed: none of them is on
 // the path under test, and none of them should be able to make this file's outcome
 // depend on infrastructure.
+// mustPrepareEventOutbox prepares a row and fails the test if preparation errors.
+//
+// PrepareEventOutbox now returns an error, because a payload that cannot be serialised is
+// a lost event rather than a no-op — see the marshal-failure test for why that changed.
+// Almost every test here is about a row that DOES prepare, so this helper keeps the error
+// handling out of them while still failing loudly if one starts erroring unexpectedly.
+// Tests that are ABOUT the error, or about the unconfigured nil-nil no-op, call the method
+// directly and assert both return values.
+func mustPrepareEventOutbox(t *testing.T, b *Blnk, event NewWebhook, options ...EventOption) *model.EventOutbox {
+	t.Helper()
+
+	row, err := b.PrepareEventOutbox(context.Background(), event, options...)
+	require.NoError(t, err, "preparing the outbox row for %q must not fail", event.Event)
+	require.NotNil(t, row, "publishing must be configured for this test, so a row is expected")
+
+	return row
+}
+
+// requireAPIErrorCode asserts an error carries a specific typed code.
+//
+// The code is what callers and handlers switch on, so asserting the message alone would
+// let the code change silently underneath every consumer of it.
+func requireAPIErrorCode(t *testing.T, err error, want apierror.ErrorCode) {
+	t.Helper()
+
+	require.Error(t, err)
+
+	var apiErr apierror.APIError
+	if errors.As(err, &apiErr) {
+		assert.Equal(t, want, apiErr.Code)
+		return
+	}
+
+	var apiErrPtr *apierror.APIError
+	if errors.As(err, &apiErrPtr) && apiErrPtr != nil {
+		assert.Equal(t, want, apiErrPtr.Code)
+		return
+	}
+
+	require.Failf(t, "not an APIError", "expected a typed APIError, got %T: %v", err, err)
+}
+
 func newOutboxBlnk(t *testing.T, cnf *config.Configuration, ds database.IDataSource) *Blnk {
 	t.Helper()
 
@@ -809,7 +853,7 @@ func TestPrepareEventOutbox_PayloadIsByteIdenticalToTheLegacyWebhookBody(t *test
 			// The reference: the body the legacy HTTP transport would have POSTed.
 			expected := outboxLegacyWebhookBody(t, event)
 
-			row := blnk.PrepareEventOutbox(context.Background(), event)
+			row := mustPrepareEventOutbox(t, blnk, event)
 			require.NotNil(t, row, "a configured deployment must capture %s", fixture.eventType)
 
 			assert.Equal(t, expected, []byte(row.Payload),
@@ -836,7 +880,7 @@ func TestPrepareEventOutbox_PayloadIsTheTwoKeyWebhookEnvelope(t *testing.T) {
 			blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 			event := NewWebhook{Event: fixture.eventType, Payload: fixture.payload}
 
-			row := blnk.PrepareEventOutbox(context.Background(), event)
+			row := mustPrepareEventOutbox(t, blnk, event)
 			require.NotNil(t, row)
 
 			assert.Equal(t, []string{"event", "data"}, outboxTopLevelKeys(t, []byte(row.Payload)),
@@ -871,7 +915,7 @@ func TestPrepareEventOutbox_LedgerCreatedPayloadIsExactlyTheDocumentedObject(t *
 
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
-	row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+	row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 		Event:   "ledger.created",
 		Payload: outboxSampleLedger(),
 	})
@@ -925,7 +969,7 @@ func TestPrepareEventOutbox_BulkTransactionPayloadShapes(t *testing.T) {
 			blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 			event := NewWebhook{Event: shape.eventType, Payload: shape.payload}
 
-			row := blnk.PrepareEventOutbox(context.Background(), event)
+			row := mustPrepareEventOutbox(t, blnk, event)
 			require.NotNil(t, row)
 
 			assert.Equal(t, string(outboxLegacyWebhookBody(t, event)), string(row.Payload),
@@ -936,7 +980,7 @@ func TestPrepareEventOutbox_BulkTransactionPayloadShapes(t *testing.T) {
 			// The batch is the aggregate for every shape, so a batch's progress events
 			// stay grouped and ordered however the batch ended.
 			assert.Equal(t, outboxBatchID, row.AggregateID)
-			assert.Equal(t, outboxBatchID, row.LedgerID)
+			assert.Equal(t, outboxBatchID, row.PartitionKey)
 			assert.Equal(t, "blnk.transactions", row.Topic)
 		})
 	}
@@ -988,30 +1032,120 @@ func TestPrepareEventOutbox_CoversEveryEmittedEventType(t *testing.T) {
 // derived from the payload, or a truncated string.
 const outboxUUIDSampleSize = 512
 
-// TestPrepareEventOutbox_EventIDIsAUniqueUUID asserts the identifier is a real,
-// canonically formatted UUID and that it is fresh on every call.
-func TestPrepareEventOutbox_EventIDIsAUniqueUUID(t *testing.T) {
+// TestPrepareEventOutbox_EventIDIsACanonicalUUIDAndStableForOneMutation asserts the
+// identifier is a real, canonically formatted UUID and that its STABILITY matches the
+// event's nature.
+//
+// # Why the same mutation must yield the same id
+//
+// event_id carries two contracts at once: it is the subscriber's idempotency key, and it
+// is the unique index that makes the outbox's write side exactly-once. A freshly random id
+// per preparation satisfies neither for a RETRY. A mutation replayed after an ambiguous
+// failure — a commit whose acknowledgement was lost, a request repeated by a client, a
+// worker that restarted mid-flight — prepares its event a second time, and with a random
+// id the index sees a different key, admits a second row, and the subscriber receives one
+// business event twice with nothing to tell them apart.
+//
+// It also makes the CONFLICT arm of the repository's insert-error discrimination
+// unreachable, and that arm exists for exactly this case: so a caller retrying a mutation
+// whose event was already captured can recognise it and carry on rather than see a server
+// fault.
+//
+// # Why different mutations, and different event types, must still differ
+//
+// The derivation is over the mutation identity, the event type and the schema version, so
+// two events about different things — and two events about the SAME thing at different
+// points in its life — remain distinct. Collapsing transaction.queued and
+// transaction.applied for one transaction into one id would suppress the second as a
+// duplicate of the first.
+func TestPrepareEventOutbox_EventIDIsACanonicalUUIDAndStableForOneMutation(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 	event := NewWebhook{Event: "ledger.created", Payload: outboxSampleLedger()}
 
-	seen := make(map[string]struct{}, outboxUUIDSampleSize)
+	first := mustPrepareEventOutbox(t, blnk, event)
+	require.NotNil(t, first)
+
+	parsed, err := uuid.Parse(first.EventID)
+	require.NoError(t, err, "event_id must be a valid UUID, got %q", first.EventID)
+	assert.Equal(t, first.EventID, parsed.String(),
+		"event_id must be in the canonical lower-case hyphenated form")
+	assert.Len(t, first.EventID, 36, "a canonical UUID is 36 characters")
+
 	for i := 0; i < outboxUUIDSampleSize; i++ {
-		row := blnk.PrepareEventOutbox(context.Background(), event)
-		require.NotNil(t, row)
-
-		parsed, err := uuid.Parse(row.EventID)
-		require.NoError(t, err, "event_id must be a valid UUID, got %q", row.EventID)
-		assert.Equal(t, row.EventID, parsed.String(),
-			"event_id must be in the canonical lower-case hyphenated form")
-		assert.Len(t, row.EventID, 36, "a canonical UUID is 36 characters")
-
-		_, duplicate := seen[row.EventID]
-		require.False(t, duplicate,
-			"event_id must be unique: it is the subscriber idempotency key (collision at draw %d)", i)
-		seen[row.EventID] = struct{}{}
+		repeat := mustPrepareEventOutbox(t, blnk, event)
+		require.NotNil(t, repeat)
+		require.Equal(t, first.EventID, repeat.EventID,
+			"re-preparing the SAME mutation must derive the SAME id, or a retried mutation is delivered twice (draw %d)", i)
 	}
 
-	assert.Len(t, seen, outboxUUIDSampleSize, "every draw must have produced a distinct event_id")
+	// A different ledger is a different event.
+	otherLedger := outboxSampleLedger()
+	otherLedger.LedgerID = "ldg_a_different_one"
+	other := mustPrepareEventOutbox(t, blnk, NewWebhook{Event: "ledger.created", Payload: otherLedger})
+	require.NotNil(t, other)
+	assert.NotEqual(t, first.EventID, other.EventID,
+		"two events about different ledgers must never share an id")
+
+	// The same transaction at two points in its life is two events.
+	transaction := outboxSampleTransaction(StatusQueued)
+	queued := mustPrepareEventOutbox(t, blnk, NewWebhook{Event: "transaction.queued", Payload: transaction})
+	applied := mustPrepareEventOutbox(t, blnk, NewWebhook{Event: "transaction.applied", Payload: transaction})
+	require.NotNil(t, queued)
+	require.NotNil(t, applied)
+	assert.NotEqual(t, queued.EventID, applied.EventID,
+		"two event types for one transaction must differ, or the second is suppressed as a duplicate of the first")
+}
+
+// TestPrepareEventOutbox_EventIDStaysFreshForARepEATABLEEvent is the other half of the
+// identity contract, and it is the half that is easy to get catastrophically wrong.
+//
+// Determinism is CORRECT only for an event describing a mutation that happens once.
+// Applying it to a repeatable event would collapse every later occurrence into a duplicate
+// the unique index rejects, and the pipeline would stop delivering those events with no
+// error anywhere at all:
+//
+//   - balance.monitor fires every time its condition is met. A derived id would deliver
+//     the first alert and silently discard every one after it — the exact opposite of
+//     what a monitor is for.
+//   - system.error is emitted per occurrence. Two identical messages a second apart are
+//     two events an operator needs to see twice.
+func TestPrepareEventOutbox_EventIDStaysFreshForARepeatableEvent(t *testing.T) {
+	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
+
+	for _, testCase := range []struct {
+		name  string
+		event NewWebhook
+	}{
+		{
+			name:  "a balance monitor fires repeatedly",
+			event: NewWebhook{Event: "balance.monitor", Payload: outboxSampleBalanceMonitor()},
+		},
+		{
+			name:  "a system error is emitted per occurrence",
+			event: NewWebhook{Event: "system.error", Payload: outboxSampleSystemErrorPayload()},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			seen := make(map[string]struct{}, outboxUUIDSampleSize)
+			for i := 0; i < outboxUUIDSampleSize; i++ {
+				row := mustPrepareEventOutbox(t, blnk, testCase.event)
+				require.NotNil(t, row)
+
+				parsed, err := uuid.Parse(row.EventID)
+				require.NoError(t, err, "event_id must be a valid UUID, got %q", row.EventID)
+				assert.Equal(t, row.EventID, parsed.String(),
+					"event_id must be in the canonical lower-case hyphenated form")
+
+				_, duplicate := seen[row.EventID]
+				require.False(t, duplicate,
+					"a repeatable event must get a FRESH id every time, or every occurrence after the first is silently discarded (collision at draw %d)", i)
+				seen[row.EventID] = struct{}{}
+			}
+
+			assert.Len(t, seen, outboxUUIDSampleSize,
+				"every occurrence must have produced a distinct event_id")
+		})
+	}
 }
 
 // TestPrepareEventOutbox_EventTypeMirrorsTheInnerEventName asserts the event name is
@@ -1025,7 +1159,7 @@ func TestPrepareEventOutbox_EventTypeMirrorsTheInnerEventName(t *testing.T) {
 		t.Run(fixture.name, func(t *testing.T) {
 			blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
-			row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+			row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 				Event:   fixture.eventType,
 				Payload: fixture.payload,
 			})
@@ -1056,7 +1190,7 @@ func TestPrepareEventOutbox_EventTypeIsTrimmedWhileThePayloadStaysVerbatim(t *te
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 	event := NewWebhook{Event: "  ledger.created\t", Payload: outboxSampleLedger()}
 
-	row := blnk.PrepareEventOutbox(context.Background(), event)
+	row := mustPrepareEventOutbox(t, blnk, event)
 	require.NotNil(t, row)
 
 	assert.Equal(t, "ledger.created", row.EventType, "event_type must be trimmed")
@@ -1081,7 +1215,7 @@ func TestPrepareEventOutbox_SchemaVersionIsV1(t *testing.T) {
 		t.Run(fixture.name, func(t *testing.T) {
 			blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
-			row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+			row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 				Event:   fixture.eventType,
 				Payload: fixture.payload,
 			})
@@ -1109,7 +1243,7 @@ func TestPrepareEventOutbox_OccurredAtIsUTCAndRoundTripsThroughRFC3339(t *testin
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
 	before := time.Now().UTC().Add(-time.Second)
-	row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+	row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 		Event:   "transaction.applied",
 		Payload: outboxSampleTransaction(StatusApplied),
 	})
@@ -1153,7 +1287,7 @@ func TestPrepareEventOutbox_TopicIsResolvedFromTheEventType(t *testing.T) {
 		t.Run(fixture.name, func(t *testing.T) {
 			blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
-			row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+			row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 				Event:   fixture.eventType,
 				Payload: fixture.payload,
 			})
@@ -1180,7 +1314,7 @@ func TestPrepareEventOutbox_TopicIsResolvedOnceAtConstruction(t *testing.T) {
 	configuration.Kafka.TopicPrefix = "acme"
 	blnk := newOutboxBlnk(t, configuration, nil)
 
-	row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+	row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 		Event:   "balance.created",
 		Payload: outboxSampleBalance(),
 	})
@@ -1226,7 +1360,7 @@ func TestPrepareEventOutbox_MaxAttemptsFollowsTheRelayConfiguration(t *testing.T
 			configuration.Relay.MaxRetryAttempts = budget.configured
 			blnk := newOutboxBlnk(t, configuration, nil)
 
-			row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+			row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 				Event:   "identity.created",
 				Payload: outboxSampleIdentity(),
 			})
@@ -1257,7 +1391,7 @@ func TestPrepareEventOutbox_StatusIsPendingAndTheRelayStateIsFresh(t *testing.T)
 		t.Run(fixture.name, func(t *testing.T) {
 			blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
-			row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+			row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 				Event:   fixture.eventType,
 				Payload: fixture.payload,
 			})
@@ -1284,7 +1418,7 @@ func TestPrepareEventOutbox_StatusIsPendingAndTheRelayStateIsFresh(t *testing.T)
 // The partition key: ledger_id, and therefore ordering
 // ---------------------------------------------------------------------------
 
-// TestPrepareEventOutbox_LedgerIDIsTheDocumentedPartitionKey asserts the derived key for
+// TestPrepareEventOutbox_PartitionKeyIsTheDocumentedDerivation asserts the derived key for
 // every payload type, against a literal expectation.
 //
 // This is the highest-consequence value the file under test computes. The key is hashed by
@@ -1296,20 +1430,20 @@ func TestPrepareEventOutbox_StatusIsPendingAndTheRelayStateIsFresh(t *testing.T)
 // The expectations are literals rather than calls into the derivation, so a reordered key
 // preference — source before destination, say, or ledger before balance — fails here
 // instead of silently moving a partition assignment.
-func TestPrepareEventOutbox_LedgerIDIsTheDocumentedPartitionKey(t *testing.T) {
+func TestPrepareEventOutbox_PartitionKeyIsTheDocumentedDerivation(t *testing.T) {
 	for _, fixture := range outboxEventFixtures() {
 		t.Run(fixture.name, func(t *testing.T) {
 			blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
-			row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+			row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 				Event:   fixture.eventType,
 				Payload: fixture.payload,
 			})
 			require.NotNil(t, row)
 
-			assert.Equal(t, fixture.partitionKey, row.LedgerID,
+			assert.Equal(t, fixture.partitionKey, row.PartitionKey,
 				"%s must be keyed on %s", fixture.eventType, fixture.partitionKey)
-			assert.NotEmpty(t, row.LedgerID,
+			assert.NotEmpty(t, row.PartitionKey,
 				"an empty key lets Kafka scatter the event round-robin and destroys ordering silently")
 		})
 	}
@@ -1329,7 +1463,7 @@ func TestPrepareEventOutbox_AggregateIDIsTheEventSubject(t *testing.T) {
 		t.Run(fixture.name, func(t *testing.T) {
 			blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
-			row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+			row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 				Event:   fixture.eventType,
 				Payload: fixture.payload,
 			})
@@ -1345,18 +1479,20 @@ func TestPrepareEventOutbox_AggregateIDIsTheEventSubject(t *testing.T) {
 	// The one fixture where subject and key legitimately differ, called out explicitly so
 	// a change that collapsed the two concepts into one cannot pass unnoticed.
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
-	monitorRow := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+	monitorRow := mustPrepareEventOutbox(t, blnk, NewWebhook{
 		Event:   "balance.monitor",
 		Payload: outboxSampleBalanceMonitor(),
 	})
 	require.NotNil(t, monitorRow)
 	assert.Equal(t, outboxMonitorID, monitorRow.AggregateID, "the monitor is the subject")
-	assert.Equal(t, outboxSourceBalanceID, monitorRow.LedgerID, "the watched balance is the key")
-	assert.NotEqual(t, monitorRow.AggregateID, monitorRow.LedgerID,
+	assert.Equal(t, outboxSourceBalanceID, monitorRow.PartitionKey, "the watched balance is the key")
+	assert.Empty(t, monitorRow.LedgerID,
+		"model.BalanceMonitor carries NO ledger, so the ledger column stays NULL rather than being filled with the balance id")
+	assert.NotEqual(t, monitorRow.AggregateID, monitorRow.PartitionKey,
 		"subject and partition key are different concepts and must not be conflated")
 }
 
-// TestPrepareEventOutbox_LedgerIDFallbackChain pins every step of the documented fallback,
+// TestPrepareEventOutbox_PartitionKeyFallbackChain pins every step of the documented fallback,
 // in order.
 //
 // The chain exists for exactly one reason: the key must ALWAYS be present and always
@@ -1364,7 +1500,7 @@ func TestPrepareEventOutbox_AggregateIDIsTheEventSubject(t *testing.T) {
 // is scattered round-robin and its ordering relative to its siblings is lost with nothing
 // in the data to show that it happened. Each case below is a real payload shape a producer
 // can present, and each one must still yield a usable key.
-func TestPrepareEventOutbox_LedgerIDFallbackChain(t *testing.T) {
+func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 	fallbacks := []struct {
 		name        string
 		eventType   string
@@ -1541,67 +1677,75 @@ func TestPrepareEventOutbox_LedgerIDFallbackChain(t *testing.T) {
 			blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
 			var row *model.EventOutbox
+			var prepareErr error
 			require.NotPanics(t, func() {
-				row = blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+				row, prepareErr = blnk.PrepareEventOutbox(context.Background(), NewWebhook{
 					Event:   fallback.eventType,
 					Payload: fallback.payload,
 				})
 			}, "no payload shape may panic the derivation: it runs on the ledger write path")
+			require.NoError(t, prepareErr)
 			require.NotNil(t, row)
 
-			assert.Equal(t, fallback.key, row.LedgerID)
+			assert.Equal(t, fallback.key, row.PartitionKey)
 			assert.Equal(t, fallback.aggregateID, row.AggregateID)
-			assert.NotEmpty(t, row.LedgerID, "the key must never be empty")
+			assert.NotEmpty(t, row.PartitionKey, "the key must never be empty")
 			assert.NotEmpty(t, row.AggregateID, "aggregate_id is NOT NULL in the schema")
 		})
 	}
 }
 
-// TestPrepareEventOutbox_UnkeyableEventGetsTheSentinelKey covers the terminal fallback.
+// TestPrepareEventOutbox_UnkeyableEventGetsTheSentinelPartitionKey covers the terminal fallback.
 //
 // It is reached only by a zero-valued NewWebhook — no aggregate of any kind AND no event
 // type to fall back to. Routing those to one fixed sentinel keeps them ordered amongst
 // themselves rather than scattered, and the distinctive value makes them trivial to find
 // in the table with `WHERE ledger_id = 'blnk.unkeyed'`.
-func TestPrepareEventOutbox_UnkeyableEventGetsTheSentinelKey(t *testing.T) {
+func TestPrepareEventOutbox_UnkeyableEventGetsTheSentinelPartitionKey(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
 	var row *model.EventOutbox
+	var prepareErr error
 	require.NotPanics(t, func() {
-		row = blnk.PrepareEventOutbox(context.Background(), NewWebhook{})
+		row, prepareErr = blnk.PrepareEventOutbox(context.Background(), NewWebhook{})
 	})
+	require.NoError(t, prepareErr)
 	require.NotNil(t, row, "even a zero-valued event is captured rather than dropped")
 
-	assert.Equal(t, unkeyedEventPartitionKey, row.LedgerID)
-	assert.Equal(t, "blnk.unkeyed", row.LedgerID,
+	assert.Equal(t, unkeyedEventPartitionKey, row.PartitionKey)
+	assert.Equal(t, "blnk.unkeyed", row.PartitionKey,
 		"the sentinel is a literal an operator can search the outbox for")
+	assert.Empty(t, row.LedgerID,
+		"a zero-valued event has NO ledger, and that is stored as NULL rather than as the sentinel: the sentinel is a routing key, never a ledger id")
 	assert.Equal(t, unkeyedEventPartitionKey, row.AggregateID,
 		"aggregate_id inherits the key once every payload-derived candidate is exhausted")
 	assert.Empty(t, row.EventType, "the event type really is empty; nothing was invented")
-	assert.Equal(t, "blnk.system", row.Topic,
-		"an unrecognised event type is routed to the catch-all rather than stranded")
+	assert.Equal(t, "blnk.quarantine", row.Topic,
+		"an unrecognised event type is routed to the quarantine catch-all rather than stranded")
+	assert.NotEqual(t, "blnk.system", row.Topic,
+		"and NOT to the system topic, whose consumers expect Blnk's own ledger and error records")
 	assert.Equal(t, `{"event":"","data":null}`, string(row.Payload),
 		"the payload is still the two-key envelope, faithfully describing an empty event")
 }
 
-// TestPrepareEventOutbox_LedgerIDIsStableWithinAnAggregate is the ordering guarantee
+// TestPrepareEventOutbox_PartitionKeyIsStableWithinAnAggregate is the ordering guarantee
 // expressed as a property rather than as a table.
 //
 // Two things have to hold for per-aggregate ordering to survive: every event belonging to
 // one aggregate must derive the SAME key, so they share a partition; and events belonging
 // to different aggregates must derive DIFFERENT keys, so one busy aggregate cannot
 // serialise the whole topic behind it.
-func TestPrepareEventOutbox_LedgerIDIsStableWithinAnAggregate(t *testing.T) {
+func TestPrepareEventOutbox_PartitionKeyIsStableWithinAnAggregate(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
 	keyFor := func(eventType string, payload interface{}) string {
-		row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+		row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 			Event:   eventType,
 			Payload: payload,
 		})
 		require.NotNil(t, row)
 
-		return row.LedgerID
+		return row.PartitionKey
 	}
 
 	t.Run("one transaction's whole lifecycle shares a key", func(t *testing.T) {
@@ -1735,8 +1879,10 @@ func TestPrepareEventOutbox_ReturnsNilWhenPublishingIsNotConfigured(t *testing.T
 			blnk := newOutboxBlnk(t, scenario.configuration, datasource)
 			event := NewWebhook{Event: "transaction.applied", Payload: outboxSampleTransaction(StatusApplied)}
 
-			assert.Nil(t, blnk.PrepareEventOutbox(context.Background(), event),
-				"an unconfigured deployment captures nothing")
+			unconfiguredRow, unconfiguredErr := blnk.PrepareEventOutbox(context.Background(), event)
+			assert.Nil(t, unconfiguredRow, "an unconfigured deployment captures nothing")
+			assert.NoError(t, unconfiguredErr,
+				"being unconfigured is the ONE nil-nil case: it is a no-op, not a failure")
 			assert.NoError(t, blnk.PublishEvent(context.Background(), event),
 				"not being configured is not a failure of the mutation the caller just performed")
 			assert.NoError(t, blnk.PublishEventInTx(context.Background(), nil, event),
@@ -1800,7 +1946,7 @@ func TestPrepareEventOutbox_IsConfiguredByEitherTransport(t *testing.T) {
 		t.Run(scenario.name, func(t *testing.T) {
 			blnk := newOutboxBlnk(t, scenario.configuration, nil)
 
-			row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+			row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 				Event:   "transaction.applied",
 				Payload: outboxSampleTransaction(StatusApplied),
 			})
@@ -1849,17 +1995,40 @@ func TestPrepareEventOutbox_ReturnsNilOnAnUnmarshalablePayload(t *testing.T) {
 			event := NewWebhook{Event: "ledger.created", Payload: scenario.payload}
 
 			var row *model.EventOutbox
+			var prepareErr error
 			require.NotPanics(t, func() {
-				row = blnk.PrepareEventOutbox(context.Background(), event)
+				row, prepareErr = blnk.PrepareEventOutbox(context.Background(), event)
 			}, "a payload defect must not panic the ledger write path")
 			assert.Nil(t, row, "an unmarshalable payload yields no row")
+
+			// THE BEHAVIOUR THIS TEST NOW GUARDS, and it is the reverse of what it
+			// asserted before.
+			//
+			// It used to require that a marshal failure be swallowed, on the reasoning
+			// that a notification defect must not abort a financially valid mutation.
+			// The trade that actually made was worse than the one it avoided: the
+			// mutation committed, the event was gone, the caller was told it had
+			// succeeded, and NOTHING downstream could ever find the loss — not the
+			// outbox, not the relay, not the dead-letter inventory, and not the daily
+			// reconciliation, which can only count rows that exist. An event no
+			// mechanism can find is indistinguishable from one that was never produced.
+			//
+			// It is now an error, so the caller decides — and on the in-transaction path
+			// the caller's mutation rolls back, which is what requirement R-2 asks for.
+			// The risk is bounded: json.Marshal fails on channels, functions and cyclic
+			// structures, none of which appear in the model structs and small
+			// string-keyed maps that reach here, so a failure is a defect in a new
+			// producer and the loudest possible moment to learn of it is its first run.
+			require.Error(t, prepareErr,
+				"a payload that cannot be serialised must be reported, not swallowed: a swallowed one is a lost event no mechanism can find")
+			requireAPIErrorCode(t, prepareErr, apierror.ErrInternalServer)
 
 			var publishErr error
 			require.NotPanics(t, func() {
 				publishErr = blnk.PublishEvent(context.Background(), event)
 			})
-			assert.NoError(t, publishErr,
-				"the failure must not propagate: it would abort a financially valid mutation")
+			require.Error(t, publishErr,
+				"the failure must reach the caller so an in-transaction mutation rolls back rather than committing without its event")
 
 			datasource.assertWroteNothing(t)
 
@@ -1868,8 +2037,7 @@ func TestPrepareEventOutbox_ReturnsNilOnAnUnmarshalablePayload(t *testing.T) {
 			var logged bool
 			for _, entry := range hook.AllEntries() {
 				if entry.Level == logrus.ErrorLevel &&
-					strings.Contains(entry.Message, "failed to marshal event outbox payload") &&
-					strings.Contains(entry.Message, "ledger.created") {
+					strings.Contains(entry.Message, "payload could not be marshaled") {
 					logged = true
 
 					break
@@ -1903,7 +2071,9 @@ func TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction(t *testing.T) {
 	require.Len(t, standalone, 1, "exactly one standalone insert must have been issued")
 	assert.Equal(t, "ledger.created", standalone[0].EventType)
 	assert.Equal(t, "blnk.system", standalone[0].Topic)
-	assert.Equal(t, outboxLedgerID, standalone[0].LedgerID)
+	assert.Equal(t, outboxLedgerID, standalone[0].PartitionKey)
+	assert.Equal(t, outboxLedgerID, standalone[0].LedgerID,
+		"a balance payload DOES carry a ledger, so the ledger column is populated as well as the key")
 	assert.Equal(t, string(outboxLegacyWebhookBody(t, event)), string(standalone[0].Payload),
 		"the row handed to the repository must carry the legacy body byte for byte")
 
@@ -1940,7 +2110,9 @@ func TestPublishEventInTx_UsesTheInTransactionInsertWithTheCallersTransaction(t 
 		"the insert must use the CALLER'S transaction, so the event and the mutation commit together")
 	assert.Equal(t, "transaction.applied", inTxRows[0].EventType)
 	assert.Equal(t, "blnk.transactions", inTxRows[0].Topic)
-	assert.Equal(t, outboxSourceBalanceID, inTxRows[0].LedgerID)
+	assert.Equal(t, outboxSourceBalanceID, inTxRows[0].PartitionKey)
+	assert.Empty(t, inTxRows[0].LedgerID,
+		"model.Transaction has NO ledger field, so the ledger column is NULL: a source balance id in a column called ledger_id is exactly the conflation this split removed")
 	assert.Equal(t, string(outboxLegacyWebhookBody(t, event)), string(inTxRows[0].Payload),
 		"the row handed to the repository must carry the legacy body byte for byte")
 
@@ -1984,15 +2156,27 @@ func TestPublishEvent_IssuesTheOutboxInsertWithThePayloadBytes(t *testing.T) {
 
 	expectedPayload := outboxLegacyWebhookBody(t, event)
 
+	// partition_key and ledger_id are SEPARATE bound values, and this is the one place
+	// the distinction is visible all the way at the SQL boundary. A balance payload is the
+	// case where both are populated and they happen to be the SAME value — the balance
+	// belongs to that ledger, so keying by the ledger co-locates its balance events — but
+	// they are still two columns carrying two different facts.
 	controller.ExpectQuery("INSERT INTO blnk.event_outbox").
 		WithArgs(
 			sqlmock.AnyArg(), // event_id: a fresh UUID per row
 			"balance.created",
 			outboxSourceBalanceID, // aggregate_id: the balance the event is about
-			outboxLedgerID,        // ledger_id: the partition key
+			outboxLedgerID,        // partition_key: the routing key
+			outboxLedgerID,        // ledger_id: the authoritative ledger, which a balance does carry
 			"blnk.balances",
 			model.SchemaVersionV1,
-			expectedPayload,  // the legacy webhook body, byte for byte
+			expectedPayload, // payload: the legacy webhook body, byte for byte
+			// payload_raw: the SAME bytes, bound from the SAME slice. Asserting the
+			// value twice is what pins the mechanism rather than merely the outcome —
+			// if a future edit re-marshalled for one of the two body columns, this
+			// expectation would fail here at the SQL boundary rather than silently
+			// producing a JSONB-normalised replay much later.
+			expectedPayload,
 			sqlmock.AnyArg(), // occurred_at: the domain instant, stamped at construction
 			model.EventOutboxStatusPending,
 			defaultEventMaxAttempts,
@@ -2041,10 +2225,16 @@ func TestPublishEventInTx_IssuesTheInsertInsideTheCallersTransaction(t *testing.
 			sqlmock.AnyArg(),
 			"transaction.queued",
 			outboxTransactionID,
-			outboxSourceBalanceID,
+			outboxSourceBalanceID, // partition_key: the source balance, matching the queue's own sharding
+			// ledger_id: SQL NULL. model.Transaction HAS NO LEDGER FIELD, so there is no
+			// ledger to record — and binding the source balance id here, as the single
+			// combined column used to, put a balance id in a column called ledger_id where
+			// everything downstream read it as a ledger.
+			nil,
 			"blnk.transactions",
 			model.SchemaVersionV1,
-			expectedPayload,
+			expectedPayload,  // payload
+			expectedPayload,  // payload_raw: the same slice bound into both body columns
 			sqlmock.AnyArg(), // occurred_at: the domain instant, stamped at construction
 			model.EventOutboxStatusPending,
 			defaultEventMaxAttempts,
@@ -2126,14 +2316,17 @@ func TestPublishEvent_ReturnsThePersistenceError(t *testing.T) {
 // TestPublishEvent_DoesNotPanicWithoutADatasource asserts the two degenerate receivers a
 // real deployment and the existing test suite both produce.
 //
-// NewBlnk(nil) is a supported construction — the legacy webhook tests use it — so there is
-// genuinely nowhere to persist to, and that must be a logged warning rather than a crash. A
-// nil receiver must not panic either: these methods are called from goroutines spawned by
-// post-action hooks, where a panic takes down the process instead of surfacing as an error.
+// NewBlnk(nil) is a supported construction — the legacy webhook tests use it — so a nil
+// datasource must never CRASH. It is nonetheless reported as an ERROR rather than swallowed
+// once publishing is configured: at that point every event in the deployment is being
+// dropped permanently and invisibly, and returning nil would tell every caller it had
+// succeeded. A nil receiver must not panic either: these methods are called from goroutines
+// spawned by post-action hooks, where a panic takes down the process instead of surfacing
+// as an error.
 func TestPublishEvent_DoesNotPanicWithoutADatasource(t *testing.T) {
 	event := NewWebhook{Event: "balance.created", Payload: outboxSampleBalance()}
 
-	t.Run("a nil datasource is a warning, not a crash", func(t *testing.T) {
+	t.Run("a nil datasource is a reported error, not a crash", func(t *testing.T) {
 		hook := logtest.NewGlobal()
 		defer hook.Reset()
 
@@ -2141,20 +2334,20 @@ func TestPublishEvent_DoesNotPanicWithoutADatasource(t *testing.T) {
 
 		var err error
 		require.NotPanics(t, func() { err = blnk.PublishEvent(context.Background(), event) })
-		assert.NoError(t, err)
+		requireAPIErrorCode(t, err, apierror.ErrInternalServer)
 
 		require.NotPanics(t, func() { err = blnk.PublishEventInTx(context.Background(), nil, event) })
-		assert.NoError(t, err)
+		requireAPIErrorCode(t, err, apierror.ErrInternalServer)
 
-		// The row is still built, which is what gives the warning an event identity an
+		// The row is still built, which is what gives the log line an event identity an
 		// operator can act on: "some event was dropped" is not a diagnosable message.
 		var warned bool
 		for _, entry := range hook.AllEntries() {
-			if entry.Level == logrus.WarnLevel && strings.Contains(entry.Message, "no datasource") {
+			if entry.Level == logrus.ErrorLevel && strings.Contains(entry.Message, "no datasource") {
 				assert.Equal(t, "balance.created", entry.Data["event_type"],
-					"the warning must name the event type that was dropped")
+					"the log line must name the event type that was dropped")
 				assert.Equal(t, "blnk.balances", entry.Data["topic"])
-				assert.NotEmpty(t, entry.Data["event_id"], "the warning must name the event id")
+				assert.NotEmpty(t, entry.Data["event_id"], "the log line must name the event id")
 				warned = true
 
 				break
@@ -2180,13 +2373,28 @@ func TestPublishEvent_DoesNotPanicWithoutADatasource(t *testing.T) {
 		require.Nil(t, blnk.GetDataSource(),
 			"the instance under test must carry no datasource, exactly as NewBlnk(nil) leaves it")
 
+		// A CONFIGURED PUBLISHER WITH NO DATASOURCE IS AN ERROR, and this is the reverse
+		// of what this test asserted before.
+		//
+		// Reaching this point means publishing IS configured and there is nowhere to
+		// persist to, so EVERY event in such a deployment is dropped — permanently,
+		// invisibly, and while every caller is told it succeeded. A warning made that a
+		// log line nobody reads. Returning the error makes it a failure the caller
+		// reports and, inside a ledger transaction, rolls back over.
+		//
+		// NewBlnk(nil) remains supported: with no brokers configured PrepareEventOutbox
+		// returns the nil-nil no-op long before this branch, so instances that run
+		// without a datasource AND without Kafka are unaffected.
 		var err error
 		require.NotPanics(t, func() { err = blnk.PublishEvent(context.Background(), event) })
-		assert.NoError(t, err)
+		require.Error(t, err,
+			"publishing configured with no datasource drops every event; reporting success hides that from every caller")
+		requireAPIErrorCode(t, err, apierror.ErrInternalServer)
 
 		// The row is still constructible, so nothing about the absent datasource is
 		// allowed to disturb the payload contract.
-		row := blnk.PrepareEventOutbox(context.Background(), event)
+		row, prepareErr := blnk.PrepareEventOutbox(context.Background(), event)
+		require.NoError(t, prepareErr)
 		require.NotNil(t, row)
 		assert.Equal(t, string(outboxLegacyWebhookBody(t, event)), string(row.Payload))
 	})
@@ -2196,18 +2404,25 @@ func TestPublishEvent_DoesNotPanicWithoutADatasource(t *testing.T) {
 
 		var blnk *Blnk
 
+		// A nil receiver must not PANIC — that is the property under test, and it matters
+		// because the post-action hooks call these from goroutines where a panic takes the
+		// process down rather than surfacing as an error. It is reported as an error for
+		// the same reason the nil-datasource case is: publishing is configured and the
+		// event is being dropped.
 		var err error
 		require.NotPanics(t, func() { err = blnk.PublishEvent(context.Background(), event) },
 			"a nil receiver must not panic: post-action hooks call this from goroutines")
-		assert.NoError(t, err)
+		require.Error(t, err, "a nil instance cannot capture the event, and saying so is the honest answer")
 
 		require.NotPanics(t, func() { err = blnk.PublishEventInTx(context.Background(), nil, event) })
-		assert.NoError(t, err)
+		require.Error(t, err, "the in-transaction entry point must honour the same contract")
 
 		// The row is still constructible from the configuration store alone, which is what
 		// the nil-receiver branch of the configuration read exists to provide.
 		var row *model.EventOutbox
-		require.NotPanics(t, func() { row = blnk.PrepareEventOutbox(context.Background(), event) })
+		var prepareErr error
+		require.NotPanics(t, func() { row, prepareErr = blnk.PrepareEventOutbox(context.Background(), event) })
+		require.NoError(t, prepareErr)
 		require.NotNil(t, row)
 		assert.Equal(t, "blnk.balances", row.Topic)
 	})
@@ -2282,7 +2497,7 @@ func TestPublishEvent_IsSafeWhenCalledConcurrently(t *testing.T) {
 	unique := make(map[string]struct{}, len(rows))
 	for _, row := range rows {
 		require.NotNil(t, row)
-		assert.NotEmpty(t, row.LedgerID, "no concurrently published row may lose its partition key")
+		assert.NotEmpty(t, row.PartitionKey, "no concurrently published row may lose its partition key")
 
 		_, duplicate := unique[row.EventID]
 		assert.False(t, duplicate, "event_id %q was issued twice under concurrency", row.EventID)
@@ -2313,7 +2528,7 @@ func TestPrepareEventOutbox_IsSafeWhenCalledConcurrently(t *testing.T) {
 			defer writers.Done()
 
 			fixture := fixtures[writer%len(fixtures)]
-			row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+			row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 				Event:   fixture.eventType,
 				Payload: fixture.payload,
 			})
@@ -2330,14 +2545,49 @@ func TestPrepareEventOutbox_IsSafeWhenCalledConcurrently(t *testing.T) {
 
 	require.Len(t, rows, outboxConcurrentWriters)
 
-	unique := make(map[string]struct{}, len(rows))
+	// The identity assertion is per FIXTURE, not per row, because a derived id is a pure
+	// function of the event: two writers preparing the same fixture must agree on the id,
+	// and two writers preparing different fixtures must not. Asserting "every row is
+	// distinct" would now be asserting the opposite of the idempotency contract — while
+	// still catching nothing about concurrency, since the derivation reads no shared state.
+	byFixture := make(map[string]map[string]struct{}, len(fixtures))
 	for index, row := range rows {
 		require.NotNil(t, row, "row %d must have been built", index)
 		assert.Equal(t, model.EventOutboxStatusPending, row.Status)
-		assert.NotEmpty(t, row.LedgerID, "no concurrently built row may lose its partition key")
-		unique[row.EventID] = struct{}{}
+		assert.NotEmpty(t, row.PartitionKey, "no concurrently built row may lose its partition key")
+		assert.NotEmpty(t, row.EventID, "no concurrently built row may lose its event id")
+
+		if byFixture[row.EventType] == nil {
+			byFixture[row.EventType] = make(map[string]struct{}, 1)
+		}
+		byFixture[row.EventType][row.EventID] = struct{}{}
 	}
-	assert.Len(t, unique, len(rows), "concurrent construction must still produce distinct event ids")
+
+	for eventType, ids := range byFixture {
+		if model.EventTypeIsRepeatable(eventType) {
+			// A repeatable event gets a fresh id per occurrence, so every writer that
+			// produced one must have produced a different id.
+			assert.Len(t, ids, countRowsOfType(rows, eventType),
+				"%s repeats, so concurrent construction must produce one distinct id per occurrence", eventType)
+
+			continue
+		}
+
+		assert.Len(t, ids, 1,
+			"%s is derived from the mutation, so every concurrent preparation of the same mutation must agree on one id", eventType)
+	}
+}
+
+// countRowsOfType counts the prepared rows carrying one event type.
+func countRowsOfType(rows []*model.EventOutbox, eventType string) int {
+	count := 0
+	for _, row := range rows {
+		if row != nil && row.EventType == eventType {
+			count++
+		}
+	}
+
+	return count
 }
 
 // ---------------------------------------------------------------------------
@@ -2410,7 +2660,7 @@ func TestPrepareEventOutbox_LeaksNoConfigurationBetweenTests(t *testing.T) {
 		configuration.Kafka.TopicPrefix = sentinelPrefix
 		blnk := newOutboxBlnk(t, configuration, nil)
 
-		row := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+		row := mustPrepareEventOutbox(t, blnk, NewWebhook{
 			Event:   "identity.created",
 			Payload: outboxSampleIdentity(),
 		})
@@ -2423,4 +2673,418 @@ func TestPrepareEventOutbox_LeaksNoConfigurationBetweenTests(t *testing.T) {
 		"the configuration store must be restored exactly as the subtest found it")
 	assert.NotEqual(t, sentinelPrefix, TopicPrefix(),
 		"no test may leave its own topic prefix in the process-global configuration store")
+}
+
+// ---------------------------------------------------------------------------------------
+// The size ceiling on the wire — SIZE-01
+//
+// The rest of this file proves what the stored payload IS. These tests prove that the
+// envelope built around it is refused when it cannot be published, which is the other half
+// of the same guarantee: a payload that is faithfully stored but can never leave is not
+// preserved, it is stuck.
+//
+// They live here rather than beside the publisher because event_publisher_test.go belongs to
+// a later checkpoint and is not in this scope, and because the subject is the ENVELOPE — this
+// file's subject — rather than the transport. No case reaches a broker: the size check
+// precedes writer resolution precisely so an oversized message costs nothing.
+// ---------------------------------------------------------------------------------------
+
+// sizeLimitPublisher builds a real Kafka-backed publisher without contacting a broker.
+func sizeLimitPublisher(t *testing.T) *kafkaPublisher {
+	t.Helper()
+
+	publisher, err := newKafkaPublisher([]string{"localhost:9092"}, config.KafkaConfig{
+		Brokers:          []string{"localhost:9092"},
+		TopicPrefix:      DefaultTopicPrefix,
+		InsecureLocalDev: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = publisher.Close() })
+
+	return publisher
+}
+
+// sizedLedgerEvent builds a valid event whose payload is exactly payloadBytes long.
+//
+// The payload is a JSON string of filler, so it is genuinely valid JSON — an invalid payload
+// would fail marshalling first and the test would pass for the wrong reason.
+func sizedLedgerEvent(payloadBytes int) model.LedgerEvent {
+	// Two bytes of the payload are the quotes around the filler.
+	filler := strings.Repeat("x", payloadBytes-2)
+
+	return model.LedgerEvent{
+		EventID:       uuid.NewString(),
+		EventType:     "transaction.applied",
+		AggregateID:   "txn_size_limit",
+		OccurredAt:    time.Now().UTC(),
+		Payload:       json.RawMessage(`"` + filler + `"`),
+		SchemaVersion: model.SchemaVersionV1,
+	}
+}
+
+// TestPublishToTopic_RefusesAnOversizedEnvelopeAsPermanent is the SIZE-01 guard on the wire.
+//
+// Persistence validates the PAYLOAD it is handed, which is the right place to reject a
+// caller's oversized data. What Kafka is asked to accept, though, is the ENVELOPE: the payload
+// plus the five sibling keys, and for a dead-letter copy the whole failure_metadata object as
+// well. So a payload that passed validation can still produce a message over the limit.
+//
+// Without a check here that message reached the writer, was rejected by it or by the broker on
+// every attempt, and — because the dead-letter copy is strictly larger — could not be
+// dead-lettered either. The row could reach neither terminal state, so it sat in the table
+// being retried forever: unbounded backlog growth from a single request, with the relay's
+// throughput spent on an event that can never leave.
+//
+// The failure must be PERMANENT. Retrying cannot shrink a message and the broker's answer will
+// not change, so a transient classification would spend the whole retry budget establishing
+// what is already known before reaching the same place.
+func TestPublishToTopic_RefusesAnOversizedEnvelopeAsPermanent(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	publisher := sizeLimitPublisher(t)
+	event := sizedLedgerEvent(model.MaxEventMessageBytes)
+
+	result, err := publisher.PublishToTopic(context.Background(), PublishRequest{Event: event})
+	require.Error(t, err, "an envelope over the ceiling must be refused")
+
+	assert.ErrorIs(t, err, ErrEventMessageTooLarge,
+		"the refusal must be recognisable without matching message text")
+	assert.Equal(t, model.PublishStatusFailed, result.Status,
+		"a PERMANENT failure is failed and not retrying: reporting it as retrying would make a "+
+			"message that can never fit indistinguishable from a busy broker, in both the logs "+
+			"and the attempts counter")
+	assert.False(t, result.Retryable,
+		"and nothing further will be tried for it, whatever budget the row states")
+	assert.False(t, result.Dispatched(), "nothing was published")
+	assert.False(t, result.Transient,
+		"an oversized message is permanent: no retry and no broker state can make it fit")
+	assert.False(t, IsTransientPublishError(err),
+		"and the relay must read the same classification from the error it is handed")
+	assert.Contains(t, err.Error(), strconv.Itoa(model.MaxEventMessageBytes),
+		"the operator must be told the limit, not just that one was exceeded")
+}
+
+// TestPublishToTopic_AcceptsAnEnvelopeInsideTheCeiling is the other side of the boundary.
+//
+// A ceiling that also rejected ordinary events would be a availability defect dressed as a
+// safety check, so the largest payload that fits must still be accepted. This is asserted by
+// showing the refusal is NOT the reason a publish stops: with no broker reachable the write
+// fails, but on a transport error rather than on the size check.
+func TestPublishToTopic_AcceptsAnEnvelopeInsideTheCeiling(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	publisher := sizeLimitPublisher(t)
+
+	// Sized so the envelope's scaffold and the five sibling keys still fit under the ceiling.
+	event := sizedLedgerEvent(model.MaxEventMessageBytes - (envelopeScaffoldBytes * 2))
+
+	// The write is expected to fail — there is no broker this test may rely on — and the
+	// deadline is what keeps that failure fast and identical whether or not something is
+	// listening on the port. What matters is only WHICH failure: any transport or deadline
+	// error is fine, the size refusal is not.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := publisher.PublishToTopic(ctx, PublishRequest{Event: event})
+	if err != nil {
+		assert.NotErrorIs(t, err, ErrEventMessageTooLarge,
+			"an envelope inside the ceiling must not be refused for its size")
+	}
+}
+
+// TestPublishToTopic_RefusesATopicOutsideTheOwnedNamespace is the VALID-01 guard reached
+// through the publish entry point rather than through writerFor directly.
+//
+// This is the realistic shape of the attack: the destination arrives on a PublishRequest built
+// from a stored row, so what matters is that the whole path refuses it, not merely that an
+// internal helper would have.
+func TestPublishToTopic_RefusesATopicOutsideTheOwnedNamespace(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	publisher := sizeLimitPublisher(t)
+
+	result, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+		Event: model.LedgerEvent{
+			EventID:       uuid.NewString(),
+			EventType:     "transaction.applied",
+			AggregateID:   "txn_foreign_topic",
+			OccurredAt:    time.Now().UTC(),
+			Payload:       json.RawMessage(`{"event":"transaction.applied","data":{}}`),
+			SchemaVersion: model.SchemaVersionV1,
+		},
+		Topic: "attacker.transactions",
+	})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTopicNotOwned)
+	assert.False(t, result.Transient,
+		"a destination Blnk may not write to is permanent: no retry makes the write legitimate")
+	assert.False(t, IsTransientPublishError(err))
+}
+
+// ---------------------------------------------------------------------------
+// COVER-01 / TEST-01: the mock must not hide the event rows it is handed
+// ---------------------------------------------------------------------------
+
+// TestMockDataSource_CapturesTheEventRowsHandedToTheAtomicWriters closes the last half of
+// COVER-01, which was that database/mocks/repo_mocks.go dropped the variadic event rows
+// so no test could see them.
+//
+// # Why the mock records rather than forwards, and why that needs a test
+//
+// The obvious repair — adding the variadic to the m.Called argument list — cannot be made.
+// testify matches an expectation on ARGUMENT COUNT, and it does so AT RUN TIME rather than
+// at compile time, so forwarding the rows turns every existing expectation written for five
+// arguments into a "mock: I don't know what to return" panic. There is such an expectation
+// in transaction_benchmark_test.go, which this checkpoint does not own. So the rows are
+// recorded on the mock and read through CapturedEventOutboxes instead.
+//
+// That design decision is exactly what makes this test necessary. A recording accessor
+// nobody calls is indistinguishable from one that does not work: the compiler is satisfied
+// either way, and the whole point of the accessor is that a caller's rows become visible.
+// This asserts the visibility, and it asserts the arity property the design rests on, so
+// that "complete" the forwarding later cannot pass silently.
+func TestMockDataSource_CapturesTheEventRowsHandedToTheAtomicWriters(t *testing.T) {
+	transaction := &model.Transaction{TransactionID: "txn_0f6e2c8a", Status: "APPLIED"}
+
+	firstRow := &model.EventOutbox{
+		EventID:      "0f6e2c8a-1b4d-4e9f-8a7c-2d5b6e3f1a9c",
+		EventType:    "transaction.applied",
+		AggregateID:  transaction.TransactionID,
+		PartitionKey: "ldg_4b1e7c30",
+		Topic:        "blnk.transactions",
+		Payload:      json.RawMessage(`{"event":"transaction.applied","data":{}}`),
+	}
+	secondRow := &model.EventOutbox{
+		EventID:      "1a7c2d5b-6e3f-4a9c-8f6e-2c8a1b4d4e9f",
+		EventType:    "transaction.queued",
+		AggregateID:  "txn_1a7c2d5b",
+		PartitionKey: "ldg_4b1e7c30",
+		Topic:        "blnk.transactions",
+		Payload:      json.RawMessage(`{"event":"transaction.queued","data":{}}`),
+	}
+
+	t.Run("the single-transaction writer", func(t *testing.T) {
+		datasource := new(mocks.MockDataSource)
+
+		// FIVE arguments, deliberately: this is the shape every existing expectation in
+		// the repository uses, and it must keep matching while the sixth variadic
+		// parameter is populated. If someone forwards the variadic into m.Called, this
+		// expectation stops matching and the call panics — which is the regression this
+		// arrangement exists to prevent, caught here rather than in an unrelated
+		// benchmark.
+		datasource.On("RecordTransactionWithBalancesAndOutbox",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(transaction, nil)
+
+		stored, err := datasource.RecordTransactionWithBalancesAndOutbox(
+			context.Background(), transaction, nil, nil, nil, firstRow, secondRow)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+
+		captured := datasource.CapturedEventOutboxes()
+		require.Len(t, captured, 2, "both rows handed to the writer must be visible")
+		assert.Equal(t, firstRow.EventID, captured[0].EventID)
+		assert.Equal(t, secondRow.EventID, captured[1].EventID,
+			"the order rows were passed in must be preserved, because it is the order they "+
+				"would be inserted and therefore claimed")
+		assert.Equal(t, "blnk.transactions", captured[0].Topic)
+		assert.Equal(t, "ldg_4b1e7c30", captured[0].PartitionKey)
+
+		datasource.AssertExpectations(t)
+	})
+
+	t.Run("the batch writer", func(t *testing.T) {
+		datasource := new(mocks.MockDataSource)
+		datasource.On("RecordTransactionsWithBalancesAndOutboxes",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return([]*model.Transaction{transaction}, nil)
+
+		_, err := datasource.RecordTransactionsWithBalancesAndOutboxes(
+			context.Background(), []*model.Transaction{transaction}, nil, nil, nil, firstRow)
+		require.NoError(t, err)
+
+		require.Len(t, datasource.CapturedEventOutboxes(), 1)
+		datasource.AssertExpectations(t)
+	})
+
+	t.Run("a nil row is not recorded", func(t *testing.T) {
+		// A nil row is what the atomic writers legitimately receive when publishing is
+		// unconfigured, and recording it would put a nil into the slice that every reader
+		// of the accessor would then have to guard against.
+		datasource := new(mocks.MockDataSource)
+		datasource.On("RecordTransactionWithBalancesAndOutbox",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(transaction, nil)
+
+		_, err := datasource.RecordTransactionWithBalancesAndOutbox(
+			context.Background(), transaction, nil, nil, nil, nil)
+		require.NoError(t, err)
+
+		assert.Empty(t, datasource.CapturedEventOutboxes(),
+			"a nil row must be skipped rather than recorded")
+	})
+
+	t.Run("no rows at all leaves the record empty", func(t *testing.T) {
+		// The out-of-scope callers that pass no event rows at all must keep working, and
+		// must not appear to have passed one.
+		datasource := new(mocks.MockDataSource)
+		datasource.On("RecordTransactionWithBalancesAndOutbox",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(transaction, nil)
+
+		_, err := datasource.RecordTransactionWithBalancesAndOutbox(
+			context.Background(), transaction, nil, nil, nil)
+		require.NoError(t, err)
+
+		assert.Empty(t, datasource.CapturedEventOutboxes())
+		datasource.AssertExpectations(t)
+	})
+
+	t.Run("the record can be reset for a reused mock", func(t *testing.T) {
+		datasource := new(mocks.MockDataSource)
+		datasource.On("RecordTransactionWithBalancesAndOutbox",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(transaction, nil)
+
+		_, err := datasource.RecordTransactionWithBalancesAndOutbox(
+			context.Background(), transaction, nil, nil, nil, firstRow)
+		require.NoError(t, err)
+		require.Len(t, datasource.CapturedEventOutboxes(), 1)
+
+		datasource.ResetCapturedEventOutboxes()
+		assert.Empty(t, datasource.CapturedEventOutboxes(),
+			"a test that drives the same mock twice must be able to separate the two runs")
+	})
+
+	t.Run("the accessor returns a copy", func(t *testing.T) {
+		// Otherwise a caller mutating the returned slice would corrupt the record, and the
+		// second assertion in a test would be reading something the first assertion wrote.
+		datasource := new(mocks.MockDataSource)
+		datasource.On("RecordTransactionWithBalancesAndOutbox",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(transaction, nil)
+
+		_, err := datasource.RecordTransactionWithBalancesAndOutbox(
+			context.Background(), transaction, nil, nil, nil, firstRow)
+		require.NoError(t, err)
+
+		captured := datasource.CapturedEventOutboxes()
+		require.Len(t, captured, 1)
+		captured[0] = nil
+
+		again := datasource.CapturedEventOutboxes()
+		require.Len(t, again, 1)
+		assert.NotNil(t, again[0], "the accessor must hand out a copy, not the record itself")
+	})
+}
+
+// TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield covers the one option
+// PrepareEventOutbox accepts.
+//
+// # The gap it closes
+//
+// model.Transaction HAS NO LEDGER FIELD — its ledger association is indirect, through the
+// balances it moves value between — so a transaction event stores ledger_id as SQL NULL and
+// is keyed on its source balance. That is honest, but it leaves no way for a consumer, an
+// operator or the daily reconciliation to group a transaction event by ledger, and it means
+// the topic is partitioned by balance rather than by ledger for exactly the event type that
+// dominates the volume.
+//
+// # What the option does, stated as two separate effects
+//
+// It records the ledger AND it becomes the partition key. Both are asserted, because
+// asserting only the column would let a change that stopped affecting the key pass while
+// silently reverting R-6 partitioning, and asserting only the key would let ledger_id go
+// back to NULL.
+func TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield(t *testing.T) {
+	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
+	event := NewWebhook{Event: "transaction.queued", Payload: outboxSampleTransaction(StatusQueued)}
+
+	t.Run("without it a transaction event has no ledger and is keyed on its source balance", func(t *testing.T) {
+		row := mustPrepareEventOutbox(t, blnk, event)
+		require.NotNil(t, row)
+
+		assert.Empty(t, row.LedgerID,
+			"a transaction payload carries no ledger, and a fabricated one is worse than none")
+		assert.Equal(t, outboxSourceBalanceID, row.PartitionKey,
+			"the fallback key is the source balance, matching what the transaction queue already shards on")
+	})
+
+	t.Run("with it the ledger is recorded and becomes the key", func(t *testing.T) {
+		row := mustPrepareEventOutbox(t, blnk, event, WithEventLedgerID(outboxLedgerID))
+		require.NotNil(t, row)
+
+		assert.Equal(t, outboxLedgerID, row.LedgerID,
+			"the supplied ledger is the authoritative one and must be recorded as such")
+		assert.Equal(t, outboxLedgerID, row.PartitionKey,
+			"requirement R-6 partitions by ledger id, and a supplied ledger takes the same precedence a derived one already takes")
+	})
+
+	t.Run("a blank or whitespace-only value is ignored rather than stored", func(t *testing.T) {
+		// A whitespace key hashes to a different partition from an empty one, so storing
+		// it would split one ledger's events across two partitions — the precise failure
+		// the option exists to prevent.
+		for _, blank := range []string{"", "   ", "\t\n"} {
+			row := mustPrepareEventOutbox(t, blnk, event, WithEventLedgerID(blank))
+			require.NotNil(t, row)
+
+			assert.Empty(t, row.LedgerID, "%q must read as absence", blank)
+			assert.Equal(t, outboxSourceBalanceID, row.PartitionKey,
+				"%q must leave the derived key alone", blank)
+		}
+	})
+
+	t.Run("the last non-blank option wins and a nil option is skipped", func(t *testing.T) {
+		row := mustPrepareEventOutbox(t, blnk, event,
+			WithEventLedgerID("ldg_first"), nil, WithEventLedgerID(outboxLedgerID))
+		require.NotNil(t, row, "a nil option must not panic: the list is assembled at call sites that may build it conditionally")
+
+		assert.Equal(t, outboxLedgerID, row.LedgerID)
+	})
+
+	t.Run("it does not override a ledger the payload already carries correctly", func(t *testing.T) {
+		// A balance payload yields its own ledger, and the two agree in every real call.
+		// Asserting the supplied value still wins is what keeps the precedence rule ONE
+		// rule rather than one per payload type.
+		balanceEvent := NewWebhook{Event: "balance.created", Payload: outboxSampleBalance()}
+
+		derived := mustPrepareEventOutbox(t, blnk, balanceEvent)
+		require.NotNil(t, derived)
+		assert.Equal(t, outboxLedgerID, derived.LedgerID, "a balance payload yields its ledger unaided")
+
+		supplied := mustPrepareEventOutbox(t, blnk, balanceEvent, WithEventLedgerID("ldg_explicit"))
+		require.NotNil(t, supplied)
+		assert.Equal(t, "ldg_explicit", supplied.LedgerID,
+			"the caller is the authority on which ledger the mutation belonged to")
+		assert.Equal(t, "ldg_explicit", supplied.PartitionKey)
+	})
+
+	t.Run("the aggregate id is unaffected", func(t *testing.T) {
+		// aggregate_id answers "what is this event about" and the option answers "where
+		// does it belong". Letting the option move the aggregate would change what a
+		// consumer groups by, which is not what supplying a ledger states.
+		without := mustPrepareEventOutbox(t, blnk, event)
+		with := mustPrepareEventOutbox(t, blnk, event, WithEventLedgerID(outboxLedgerID))
+		require.NotNil(t, without)
+		require.NotNil(t, with)
+
+		assert.Equal(t, without.AggregateID, with.AggregateID,
+			"the option states the ledger, not the subject")
+		assert.Equal(t, outboxTransactionID, with.AggregateID)
+	})
+
+	t.Run("the event id is unaffected, so an opted-in call site stays idempotent", func(t *testing.T) {
+		// The derived id is a function of the mutation identity, the event type and the
+		// schema version. If the ledger entered it, wiring the option at a call site
+		// would change every future event id for events already delivered, and a
+		// subscriber's idempotency store would stop recognising a replayed event.
+		without := mustPrepareEventOutbox(t, blnk, event)
+		with := mustPrepareEventOutbox(t, blnk, event, WithEventLedgerID(outboxLedgerID))
+		require.NotNil(t, without)
+		require.NotNil(t, with)
+
+		assert.Equal(t, without.EventID, with.EventID,
+			"supplying the ledger must not change the idempotency key of an event already delivered")
+	})
 }

@@ -53,20 +53,21 @@ limitations under the License.
 //     dual-delivery and replay guarantees, and a test comparing UNMARSHALLED values
 //     would not notice, because key order is exactly what a re-marshal changes.
 //
-// # One honest note on payload byte equality
+// # One note on payload byte equality
 //
-// The payload column is JSONB, and JSONB is a PARSED representation: PostgreSQL
-// sorts object keys and renormalises whitespace on write. event_outbox.go documents
-// this at length and it is not a defect — the column type is specified.
+// The body is stored twice: payload as JSONB, which PostgreSQL normalises, and
+// payload_raw as BYTEA, which returns the producer's exact bytes. event_outbox.go
+// documents the split at length. Reads project payload_raw.
 //
-// The consequence for this file is a hard rule, and getting it backwards produces a
-// test that fails while nothing is wrong:
+// The consequence for this file is a hard rule, and both tiers assert the SAME thing:
 //
-//   - TIER 1 asserts BYTE identity, because it inspects the value BOUND to the
-//     statement, before any database has touched it. That is the only place the
-//     repository could corrupt the bytes, so that is where byte equality belongs.
-//   - TIER 2 asserts JSON EQUIVALENCE, because it reads back through JSONB. Byte
-//     equality against a pre-insert value would fail on key order alone.
+//   - TIER 1 asserts BYTE identity of the value BOUND to the statement, before any
+//     database has touched it — the only place the repository itself could corrupt the
+//     bytes.
+//   - TIER 2 asserts BYTE identity of the value READ BACK, because payload_raw returns
+//     what was written. Asserting mere JSON equivalence here would pass just as well
+//     against a projection that had gone back to the JSONB column, which is exactly the
+//     regression the second column exists to prevent.
 package database
 
 import (
@@ -91,6 +92,7 @@ import (
 	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/brianvoe/gofakeit/v6"
+	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -253,7 +255,12 @@ func eventOutboxRow(e model.EventOutbox) []driver.Value {
 		e.EventID,
 		e.EventType,
 		e.AggregateID,
-		e.LedgerID,
+		e.PartitionKey,
+		// ledger_id is NULLABLE and NULL is the documented "this event has no ledger"
+		// value, so an empty Go string is rendered as SQL NULL rather than as ''. The
+		// column's own CHECK constraint refuses '', so rendering it would exercise a
+		// row PostgreSQL would never store.
+		nullText(e.LedgerID),
 		e.Topic,
 		int64(e.SchemaVersion),
 		[]byte(e.Payload),
@@ -261,15 +268,82 @@ func eventOutboxRow(e model.EventOutbox) []driver.Value {
 		e.Status,
 		int64(e.Attempts),
 		int64(e.MaxAttempts),
+		// next_attempt_at is NOT NULL on the table with a NOW() default, so it always has
+		// a value and is rendered as a plain instant rather than through nullTime.
+		e.NextAttemptAt,
 		nullText(e.LastError),
 		nullTime(e.FirstAttemptedAt),
 		nullTime(e.LastAttemptedAt),
 		nullTime(e.DispatchedAt),
 		nullTime(e.LockedUntil),
+		nullText(e.ClaimToken),
 		e.WebhookDispatched,
 		nullText(e.DLTTopic),
 		failureMetadata,
 	}
+}
+
+// indexOfProjectedColumn resolves a column's POSITION in the real projection, so a
+// test that needs to corrupt one cell can address it by name rather than by counting.
+//
+// Counting by hand is what makes such a test rot: it silently addresses a different
+// column the moment the projection changes, and the test then passes for the wrong
+// reason.
+func indexOfProjectedColumn(t *testing.T, name string) int {
+	t.Helper()
+
+	for i, column := range eventOutboxProjectedColumns() {
+		if column == name {
+			return i
+		}
+	}
+
+	require.FailNowf(t, "column not projected", "%q is not in eventOutboxColumns", name)
+	return -1
+}
+
+// eventOutboxInsertColumnNames splits the real insert column list, so a test can
+// address a bound value by COLUMN NAME instead of by counting placeholders.
+func eventOutboxInsertColumnNames() []string {
+	raw := strings.Split(eventOutboxInsertColumns, ",")
+	columns := make([]string, 0, len(raw))
+	for _, name := range raw {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			columns = append(columns, trimmed)
+		}
+	}
+	return columns
+}
+
+// insertArgMatchers builds the positional argument matchers for one inserted row —
+// exactly eventOutboxInsertValueCount of them — capturing the value bound to the named
+// column and accepting anything elsewhere.
+//
+// It is derived from eventOutboxInsertColumns rather than written out, and that is the
+// point: a hand-written list of AnyArg() matchers has to be re-counted by every author
+// who adds a column, and the failure mode when they forget is an unhelpful
+// "arguments do not match" a long way from the column that changed. Addressing the
+// value by name means these tests keep asserting the same thing as the schema grows.
+func insertArgMatchers(t *testing.T, column string, into *driver.Value) []driver.Value {
+	t.Helper()
+
+	columns := eventOutboxInsertColumnNames()
+	require.Len(t, columns, eventOutboxInsertValueCount,
+		"the insert column list and the bound value count must agree, or the placeholder arithmetic is wrong")
+
+	target := -1
+	matchers := make([]driver.Value, 0, len(columns))
+	for i, name := range columns {
+		if name == column {
+			target = i
+			matchers = append(matchers, captureArg(into))
+			continue
+		}
+		matchers = append(matchers, sqlmock.AnyArg())
+	}
+	require.NotEqual(t, -1, target, "%q is not an inserted column", column)
+
+	return matchers
 }
 
 // newEventOutboxRows builds a mocked result set over the real projected column
@@ -299,17 +373,28 @@ func dbTimestamp(ts time.Time) time.Time {
 
 // newEventOutboxFixture builds a valid, fully-populated entry ready to insert.
 //
-// markerPrefix is carried in event_id, aggregate_id and ledger_id so that the
+// markerPrefix is carried in aggregate_id, partition_key and ledger_id so that the
 // real-database tier can find, quiesce and retire exactly its own fixtures in a
 // shared database. The payload is deliberately shaped like the legacy webhook body
 // — the two-key {"event": ..., "data": ...} object that requirement R-2 preserves
 // verbatim — rather than an arbitrary JSON document, so the tests exercise the real
 // thing.
+//
+// event_id is a BARE canonical UUID and carries no marker, because the persistence
+// layer now requires canonical UUID form: event_id is the subscriber's idempotency
+// key, and two spellings of one UUID are two distinct keys to a consumer
+// deduplicating on the string. The fixtures find themselves by aggregate_id instead.
 func newEventOutboxFixture(markerPrefix string) *model.EventOutbox {
 	return &model.EventOutbox{
-		EventID:       markerPrefix + model.GenerateUUIDWithSuffix("evt"),
-		EventType:     "transaction.applied",
-		AggregateID:   markerPrefix + "agg",
+		EventID:     uuid.NewString(),
+		EventType:   "transaction.applied",
+		AggregateID: markerPrefix + "agg",
+		// UNIQUE PER FIXTURE, deliberately. At most one row per partition key is
+		// claimable at any instant — that is what preserves per-aggregate ordering —
+		// so fixtures sharing a key would drain one at a time and every test that
+		// claims a batch would see a single row. Tests that are ABOUT same-key
+		// behaviour set this explicitly; every other test wants independent rows.
+		PartitionKey:  markerPrefix + "key-" + uuid.NewString(),
 		LedgerID:      markerPrefix + "ldg",
 		Topic:         "blnk.transactions",
 		SchemaVersion: model.SchemaVersionV1,
@@ -364,10 +449,18 @@ func TestEventOutboxColumns_ProjectsEveryScannedColumnAndNoOthers(t *testing.T) 
 	columns := eventOutboxProjectedColumns()
 
 	want := []string{
-		"id", "event_id", "event_type", "aggregate_id", "ledger_id", "topic",
-		"schema_version", "payload", "occurred_at",
-		"status", "attempts", "max_attempts", "last_error",
-		"first_attempted_at", "last_attempted_at", "dispatched_at", "locked_until",
+		"id", "event_id", "event_type", "aggregate_id", "partition_key", "ledger_id", "topic",
+		// payload_raw and NOT payload: the BYTEA column carries the producer's exact
+		// bytes, the JSONB column carries PostgreSQL's normalised re-rendering of them,
+		// and every reader of the body — the Kafka publish, the legacy webhook leg and a
+		// dead-letter replay — must get the former.
+		"schema_version", "payload_raw", "occurred_at",
+		// next_attempt_at is projected because model.EventOutbox carries it and a caller
+		// deciding whether a row is due reads it. It sits between max_attempts and
+		// last_error, matching both the scanner's destination order and the column order
+		// in the migration.
+		"status", "attempts", "max_attempts", "next_attempt_at", "last_error",
+		"first_attempted_at", "last_attempted_at", "dispatched_at", "locked_until", "claim_token",
 		"webhook_dispatched", "dlt_topic", "failure_metadata",
 	}
 	assert.Equal(t, want, columns,
@@ -439,8 +532,23 @@ func TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering(t 
 	assert.NotContains(t, issued, "ORDER BY created_at",
 		"ordering by created_at would silently break per-aggregate ordering while leaving every other test green")
 
+	// THE ORD-01 PREDICATE. FOR UPDATE SKIP LOCKED stops two relays claiming the same
+	// row; it does NOT stop one relay skipping an earlier locked row and claiming a
+	// LATER row of the same partition key. Kafka preserves append order rather than
+	// occurred_at, so that reordering reaches subscribers with nothing anywhere to show
+	// it. The NOT EXISTS clause is what makes at most one row per key claimable, and it
+	// is asserted here because it is invisible in behaviour until two relays run.
+	assert.Contains(t, issued, "NOT EXISTS",
+		"the claim must exclude a row whose partition key already has an earlier row in flight; SKIP LOCKED alone permits same-key reordering")
+	assert.Contains(t, issued, "earlier.partition_key = candidate.partition_key",
+		"the exclusion must be scoped BY PARTITION KEY; scoping it wider would serialise unrelated aggregates and destroy throughput")
+	assert.Contains(t, issued, "(earlier.occurred_at, earlier.id) < (candidate.occurred_at, candidate.id)",
+		"the exclusion must compare occurrence THEN id, matching the claim ordering exactly, or two rows sharing an instant could both be claimed")
+	assert.Contains(t, issued, "earlier.status IN ('pending', 'processing')",
+		"only pending and processing rows may block their key: a permanently failed or dead-lettered row must not stall its aggregate forever")
+
 	// The remaining predicates the relay's correctness rests on.
-	assert.Contains(t, issued, "attempts < max_attempts",
+	assert.Contains(t, issued, "candidate.attempts < candidate.max_attempts",
 		"rows that have spent their retry budget must stay out of the claimable set, or an exhausted row is retried forever")
 	assert.Contains(t, issued, "locked_until",
 		"the lease predicate is what makes a crashed relay's in-flight rows reclaimable rather than stranded")
@@ -454,8 +562,10 @@ func TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering(t 
 	// UPDATE ... RETURNING does not preserve the inner ORDER BY, so the outer sort
 	// over the CTE is what guarantees FIFO WITHIN a batch. It is not redundant and
 	// must not be collapsed.
-	assert.Equal(t, 2, strings.Count(issued, "ORDER BY occurred_at"),
-		"both the inner selection and the outer re-sort over the CTE must order by occurred_at; UPDATE ... RETURNING does not preserve the inner ORDER BY")
+	assert.Contains(t, issued, "ORDER BY candidate.occurred_at ASC, candidate.id ASC",
+		"the inner selection must order by occurrence then id, so rows sharing an instant are still claimed in the order they were recorded")
+	assert.Contains(t, issued, "SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC",
+		"the outer re-sort over the CTE is what guarantees FIFO WITHIN a batch; UPDATE ... RETURNING does not preserve the inner ORDER BY, so it is not redundant and must not be collapsed")
 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -472,14 +582,20 @@ func TestClaimPendingEventOutbox_BindsProcessingStatusLockIntervalAndBatchSize(t
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
 
+	var claimToken driver.Value
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
-		WithArgs(model.EventOutboxStatusProcessing, "30s", 100).
+		WithArgs(model.EventOutboxStatusProcessing, "30s", captureArg(&claimToken), 100).
 		WillReturnRows(newEventOutboxRows())
 
 	_, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second)
 	require.NoError(t, err)
 	assert.NoError(t, mock.ExpectationsWereMet(),
-		"the claim must bind exactly (processing, lock interval string, batch size) in that order")
+		"the claim must bind exactly (processing, lock interval string, claim token, batch size) in that order")
+
+	token, ok := claimToken.(string)
+	require.True(t, ok, "the claim token must be bound as text")
+	assert.True(t, model.IsCanonicalUUID(token),
+		"the claim token must be a freshly generated UUID; a predictable or reused token would let a stale worker's transitions still match")
 }
 
 // TestClaimPendingEventOutbox_NonPositiveBatchSizeIsRejected locks in the guard.
@@ -522,7 +638,8 @@ func TestClaimPendingEventOutbox_NonPositiveLockDurationFallsBackToDefault(t *te
 			ds := Datasource{Conn: db}
 
 			mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
-				WithArgs(model.EventOutboxStatusProcessing, defaultEventClaimLease.String(), 25).
+				WithArgs(model.EventOutboxStatusProcessing, defaultEventClaimLease.String(),
+					sqlmock.AnyArg(), 25).
 				WillReturnRows(newEventOutboxRows())
 
 			_, err := ds.ClaimPendingEventOutbox(context.Background(), 25, lockDuration)
@@ -553,16 +670,16 @@ func TestClaimPendingEventOutbox_PreservesDriverRowOrderVerbatim(t *testing.T) {
 
 	base := time.Date(2024, 5, 1, 12, 0, 0, 0, time.UTC)
 	newest := model.EventOutbox{
-		ID: 3, EventID: "evt_newest", EventType: "transaction.applied", AggregateID: "agg_1",
-		LedgerID: "ldg_1", Topic: "blnk.transactions", SchemaVersion: model.SchemaVersionV1,
+		ID: 3, EventID: uuid.NewString(), EventType: "transaction.applied", AggregateID: "agg_1",
+		PartitionKey: "agg_1", LedgerID: "ldg_1", Topic: "blnk.transactions", SchemaVersion: model.SchemaVersionV1,
 		Payload:    json.RawMessage(`{"event":"transaction.applied","data":{}}`),
 		OccurredAt: base.Add(2 * time.Minute), Status: model.EventOutboxStatusProcessing,
 		MaxAttempts: 5,
 	}
 	middle := newest
-	middle.ID, middle.EventID, middle.OccurredAt = 2, "evt_middle", base.Add(time.Minute)
+	middle.ID, middle.EventID, middle.OccurredAt = 2, uuid.NewString(), base.Add(time.Minute)
 	oldest := newest
-	oldest.ID, oldest.EventID, oldest.OccurredAt = 1, "evt_oldest", base
+	oldest.ID, oldest.EventID, oldest.OccurredAt = 1, uuid.NewString(), base
 
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WillReturnRows(newEventOutboxRows(newest, middle, oldest))
@@ -570,7 +687,7 @@ func TestClaimPendingEventOutbox_PreservesDriverRowOrderVerbatim(t *testing.T) {
 	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 10, 30*time.Second)
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{"evt_newest", "evt_middle", "evt_oldest"}, eventIDsOf(entries),
+	assert.Equal(t, []string{newest.EventID, middle.EventID, oldest.EventID}, eventIDsOf(entries),
 		"the claim must return the driver's row order verbatim; a Go-side sort would mask a broken SQL ORDER BY")
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -594,9 +711,10 @@ func TestClaimPendingEventOutbox_ScansEveryColumnIntoItsField(t *testing.T) {
 
 	want := model.EventOutbox{
 		ID:                99,
-		EventID:           "evt_scan",
+		EventID:           "3f8c1b2a-5d6e-4f70-8a91-b2c3d4e5f607",
 		EventType:         "balance.monitor",
 		AggregateID:       "bln_agg",
+		PartitionKey:      "key_scan",
 		LedgerID:          "ldg_scan",
 		Topic:             "blnk.balances",
 		SchemaVersion:     model.SchemaVersionV1,
@@ -671,8 +789,8 @@ func TestClaimPendingEventOutbox_NullableColumnsScanCleanly(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	bare := model.EventOutbox{
-		ID: 1, EventID: "evt_bare", EventType: "ledger.created", AggregateID: "ldg_1",
-		LedgerID: "", Topic: "blnk.system", SchemaVersion: model.SchemaVersionV1,
+		ID: 1, EventID: uuid.NewString(), EventType: "ledger.created", AggregateID: "ldg_1",
+		PartitionKey: "ldg_1", LedgerID: "", Topic: "blnk.system", SchemaVersion: model.SchemaVersionV1,
 		Payload:     json.RawMessage(`{"event":"ledger.created","data":{}}`),
 		OccurredAt:  time.Date(2024, 5, 1, 12, 0, 0, 0, time.UTC),
 		Status:      model.EventOutboxStatusPending,
@@ -742,12 +860,20 @@ func TestClaimPendingEventOutbox_ScanErrorIsWrapped(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	// occurred_at is a timestamp; a non-numeric string cannot convert to time.Time.
-	broken := sqlmock.NewRows(eventOutboxProjectedColumns()).AddRow(
-		int64(1), "evt_broken", "transaction.applied", "agg", "ldg", "blnk.transactions",
-		int64(1), []byte(`{}`), "not-a-timestamp",
-		model.EventOutboxStatusProcessing, int64(0), int64(5), nil,
-		nil, nil, nil, nil, false, nil, nil,
-	)
+	// The row is built from the real fixture builder and then has its occurred_at cell
+	// corrupted by POSITION, so the column count can never drift away from the
+	// projection the way a hand-written value list does.
+	valid := model.EventOutbox{
+		ID: 1, EventID: uuid.NewString(), EventType: "transaction.applied", AggregateID: "agg",
+		PartitionKey: "agg", LedgerID: "ldg", Topic: "blnk.transactions",
+		SchemaVersion: model.SchemaVersionV1, Payload: json.RawMessage(`{}`),
+		OccurredAt: time.Now().UTC(), Status: model.EventOutboxStatusProcessing, MaxAttempts: 5,
+	}
+	cells := eventOutboxRow(valid)
+	occurredAtIndex := indexOfProjectedColumn(t, "occurred_at")
+	cells[occurredAtIndex] = "not-a-timestamp"
+
+	broken := sqlmock.NewRows(eventOutboxProjectedColumns()).AddRow(cells...)
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnRows(broken)
 
 	entries, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 30*time.Second)
@@ -765,8 +891,8 @@ func TestClaimPendingEventOutbox_RowIterationErrorIsWrapped(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	entry := model.EventOutbox{
-		ID: 1, EventID: "evt_1", EventType: "transaction.applied", AggregateID: "agg",
-		LedgerID: "ldg", Topic: "blnk.transactions", SchemaVersion: model.SchemaVersionV1,
+		ID: 1, EventID: uuid.NewString(), EventType: "transaction.applied", AggregateID: "agg",
+		PartitionKey: "agg", LedgerID: "ldg", Topic: "blnk.transactions", SchemaVersion: model.SchemaVersionV1,
 		Payload: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 		Status: model.EventOutboxStatusProcessing, MaxAttempts: 5,
 	}
@@ -795,19 +921,28 @@ func TestClaimPendingEventOutbox_RowIterationErrorIsWrapped(t *testing.T) {
 //     the lineage outbox uses processed_at and this table deliberately does not, so
 //     a copy-paste from that sibling would target a column that does not exist here.
 //   - locked_until is cleared, releasing the lease.
+//
+// It is additionally CONDITIONAL on the claim token and on the prior state, which is
+// what stops a worker whose lease expired from marking a row dispatched that another
+// instance has since taken and moved on.
 func TestMarkEventDispatched_SetsDispatchedStatusStampsTimestampAndClearsLease(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
 
 	mock.ExpectExec("").
-		WithArgs(model.EventOutboxStatusDispatched, int64(42)).
+		WithArgs(model.EventOutboxStatusDispatched, int64(42), "tok-42",
+			model.EventOutboxStatusProcessing, model.EventOutboxStatusReplaying).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	require.NoError(t, ds.MarkEventDispatched(context.Background(), 42))
+	require.NoError(t, ds.MarkEventDispatched(context.Background(), 42, "tok-42"))
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
 
 	assert.Contains(t, issued, "UPDATE blnk.event_outbox")
+	assert.Contains(t, issued, "claim_token = $3",
+		"the transition must be conditional on the claim token, or a zombie worker can overwrite newer state")
+	assert.Contains(t, issued, "claim_token = NULL",
+		"a terminal state releases the claim")
 	assert.Contains(t, issued, "dispatched_at = NOW()",
 		"the dispatch instant must be stamped; the column is dispatched_at, not the lineage outbox's processed_at")
 	assert.NotContains(t, issued, "processed_at",
@@ -843,16 +978,21 @@ func TestMarkEventFailed_ChoosesRetryOrExhaustionInSQL(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
 
-	mock.ExpectExec("").
+	mock.ExpectQuery("").
 		WithArgs(
-			model.EventOutboxStatusFailed,  // $1 — the exhaustion arm
-			model.EventOutboxStatusPending, // $2 — the retry arm
-			"broker unavailable",           // $3 — the reason
-			int64(7),                       // $4 — the row
+			model.EventOutboxStatusFailed,     // $1 — the exhaustion arm
+			model.EventOutboxStatusPending,    // $2 — the retry arm
+			"broker unavailable",              // $3 — the reason
+			"2s",                              // $4 — the backoff the caller computed
+			int64(7),                          // $5 — the row
+			"tok-7",                           // $6 — the claim token
+			model.EventOutboxStatusProcessing, // $7 — the required prior state
 		).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
+			AddRow(model.EventOutboxStatusPending, int64(1)))
 
-	require.NoError(t, ds.MarkEventFailed(context.Background(), 7, "broker unavailable"))
+	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7", "broker unavailable", 2*time.Second)
+	require.NoError(t, err)
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
 
@@ -862,9 +1002,120 @@ func TestMarkEventFailed_ChoosesRetryOrExhaustionInSQL(t *testing.T) {
 		"the attempt counter must be incremented by the same statement that reads it")
 	assert.Contains(t, issued, "locked_until = NULL",
 		"the lease must be released on BOTH arms, otherwise the retry is never picked up")
+	assert.Contains(t, issued, "RETURNING status, attempts",
+		"the decision the UPDATE made must be returned, not re-read: a second read reintroduces the race the in-SQL decision removes")
+	assert.Contains(t, issued, "claim_token = CASE WHEN attempts + 1 >= max_attempts THEN claim_token ELSE NULL END",
+		"the retry arm must release the claim so the row can be re-claimed, and the exhaustion arm must retain it so only this worker may dead-letter")
+	assert.Contains(t, issued, "next_attempt_at = CASE WHEN attempts + 1 >= max_attempts",
+		"the due instant must be advanced on the retry arm only: a terminal row is not waiting for anything, "+
+			"and a future due instant on one would read as though a retry were still coming")
+	assert.Contains(t, issued, "NOW() + $4::interval",
+		"the backoff must come from the caller's bound interval, not from arithmetic frozen into this statement — "+
+			"the schedule is RELAY_RETRY_* configuration")
+
+	assert.Equal(t, model.EventOutboxStatusPending, outcome.Status)
+	assert.Equal(t, 1, outcome.Attempts)
+	assert.False(t, outcome.Exhausted, "one failure against a five-attempt budget is not exhaustion")
+	assert.Empty(t, outcome.ClaimToken,
+		"the retry arm releases the claim, so there is no token to hand on")
 
 	assert.NoError(t, mock.ExpectationsWereMet(),
 		"the exhaustion arm must bind failed and the retry arm pending, in that order")
+}
+
+// TestMarkEventFailed_ExhaustionReportsTheHandOffToken is the exhaustion arm's
+// outcome, and it pins the hand-off that makes concurrent dead-lettering impossible.
+//
+// When the budget is spent the row still owes one step — the dead-letter write and the
+// transition that records it — and the claim token is RETAINED so that only the worker
+// which spent the last attempt can take it. Returning that token here is what lets the
+// caller perform the hand-off without knowing which arm keeps it.
+func TestMarkEventFailed_ExhaustionReportsTheHandOffToken(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
+			AddRow(model.EventOutboxStatusFailed, int64(5)))
+
+	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7", "final attempt failed", 0)
+	require.NoError(t, err)
+
+	assert.True(t, outcome.Exhausted, "five of five attempts is exhaustion")
+	assert.Equal(t, model.EventOutboxStatusFailed, outcome.Status,
+		"exhaustion produces failed, never dead_lettered: only the dead-letter publisher may declare that")
+	assert.Equal(t, "tok-7", outcome.ClaimToken,
+		"the exhaustion arm must hand the token on, or nothing can perform the dead-letter transition")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestMarkEventFailed_LostClaimIsAConflictAndNotASilentSuccess is the regression guard
+// on the behaviour that made stale workers dangerous.
+//
+// A transition matching no row means the lease expired and another instance owns the
+// row now. The old code logged a warning and returned nil, so the zombie worker
+// carried on as though it had recorded its attempt — which is exactly how the retry
+// budget got double-spent and how newer state got overwritten. It must be a conflict.
+func TestMarkEventFailed_LostClaimIsAConflictAndNotASilentSuccess(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+		WillReturnError(sql.ErrNoRows)
+
+	outcome, err := ds.MarkEventFailed(context.Background(), 7, "stale-token", "boom", 0)
+	require.Error(t, err, "a lost claim must NOT be reported as success")
+	assert.Equal(t, model.EventFailureOutcome{}, outcome,
+		"no decision was made, so no decision may be reported")
+
+	var apiErr apierror.APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, apierror.ErrConflict, apiErr.Code,
+		"a lost claim is a conflict: nothing is broken, the caller simply no longer owns the row")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestEventOutboxTransitions_RefuseABlankClaimToken proves every conditional
+// transition names the omission instead of matching a row nobody holds.
+//
+// A blank token could only ever match a row whose claim_token is NULL — a pending or
+// terminal row that is not the caller's to move. Passing it through would either match
+// nothing and be reported as a lost claim, which misleads, or match the wrong row.
+func TestEventOutboxTransitions_RefuseABlankClaimToken(t *testing.T) {
+	transitions := map[string]func(ctx context.Context, ds Datasource) error{
+		"MarkEventDispatched": func(ctx context.Context, ds Datasource) error {
+			return ds.MarkEventDispatched(ctx, 1, "   ")
+		},
+		"MarkEventFailed": func(ctx context.Context, ds Datasource) error {
+			_, err := ds.MarkEventFailed(ctx, 1, "", "boom", 0)
+			return err
+		},
+		"MarkEventDeadLettered": func(ctx context.Context, ds Datasource) error {
+			return ds.MarkEventDeadLettered(ctx, 1, "", "blnk.transactions.dlt", json.RawMessage(`{}`))
+		},
+		"MarkWebhookDispatched": func(ctx context.Context, ds Datasource) error {
+			return ds.MarkWebhookDispatched(ctx, 1, "")
+		},
+		"ReleaseEventReplay": func(ctx context.Context, ds Datasource) error {
+			return ds.ReleaseEventReplay(ctx, 1, "", "gave up")
+		},
+	}
+
+	for name, call := range transitions {
+		t.Run(name, func(t *testing.T) {
+			// No statement is expected: the guard must reject before touching the
+			// database, so an unexpected query would fail ExpectationsWereMet.
+			db, mock := newSQLMock(t)
+			err := call(context.Background(), Datasource{Conn: db})
+
+			require.Error(t, err, "a blank claim token must be refused, not passed through")
+			var apiErr apierror.APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, apierror.ErrBadRequest, apiErr.Code)
+			assert.NoError(t, mock.ExpectationsWereMet(),
+				"the guard must run before any statement is issued")
+		})
+	}
 }
 
 // TestMarkEventFailed_BelowMaxAttemptsReturnsToPending is arm one, asserted through
@@ -880,11 +1131,14 @@ func TestMarkEventFailed_BelowMaxAttemptsReturnsToPending(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	var retryArm driver.Value
-	mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
-		WithArgs(sqlmock.AnyArg(), captureArg(&retryArm), sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+		WithArgs(sqlmock.AnyArg(), captureArg(&retryArm), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
+			AddRow(model.EventOutboxStatusPending, int64(1)))
 
-	require.NoError(t, ds.MarkEventFailed(context.Background(), 7, "transient"))
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "transient", 0)
+	require.NoError(t, err)
 
 	assert.Equal(t, model.EventOutboxStatusPending, retryArm,
 		"a failure within budget must return the row to pending so the claim predicate and the pending partial index both pick it up")
@@ -904,11 +1158,14 @@ func TestMarkEventFailed_AtMaxAttemptsBecomesFailedNotDeadLettered(t *testing.T)
 	ds := Datasource{Conn: db}
 
 	var exhaustionArm driver.Value
-	mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
-		WithArgs(captureArg(&exhaustionArm), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+		WithArgs(captureArg(&exhaustionArm), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
+			AddRow(model.EventOutboxStatusFailed, int64(5)))
 
-	require.NoError(t, ds.MarkEventFailed(context.Background(), 7, "final attempt failed"))
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "final attempt failed", 0)
+	require.NoError(t, err)
 
 	assert.Equal(t, model.EventOutboxStatusFailed, exhaustionArm,
 		"exhausting the retry budget must produce failed; only MarkEventDeadLettered may declare dead_lettered, because only the dead-letter publisher knows the event reached its .dlt sibling")
@@ -934,8 +1191,10 @@ func TestMarkEventFailed_StampsFirstAttemptedAtOnceAndLastAttemptedAtEveryTime(t
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
 
-	mock.ExpectExec("").WillReturnResult(sqlmock.NewResult(0, 1))
-	require.NoError(t, ds.MarkEventFailed(context.Background(), 7, "boom"))
+	mock.ExpectQuery("").WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
+		AddRow(model.EventOutboxStatusPending, int64(1)))
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "boom", 0)
+	require.NoError(t, err)
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
 
@@ -960,11 +1219,14 @@ func TestMarkEventFailed_RecordsErrorMessageAsABoundParameter(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	hostile := "'; DROP TABLE blnk.event_outbox; --"
-	mock.ExpectExec("").
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), hostile, int64(7)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("").
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), hostile, sqlmock.AnyArg(), int64(7), "tok",
+			sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
+			AddRow(model.EventOutboxStatusPending, int64(1)))
 
-	require.NoError(t, ds.MarkEventFailed(context.Background(), 7, hostile))
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", hostile, 0)
+	require.NoError(t, err)
 	require.Len(t, *captured, 1)
 
 	assert.Contains(t, (*captured)[0], "last_error = $3",
@@ -995,17 +1257,24 @@ func TestMarkEventDeadLettered_RecordsTerminalStateTopicAndMetadata(t *testing.T
 			"blnk.transactions.dlt",
 			[]byte(metadata),
 			int64(11),
+			"tok-11",
+			model.EventOutboxStatusFailed,
+			model.EventOutboxStatusProcessing,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	require.NoError(t, ds.MarkEventDeadLettered(
-		context.Background(), 11, "blnk.transactions.dlt", metadata))
+		context.Background(), 11, "tok-11", "blnk.transactions.dlt", metadata))
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
 
 	assert.Contains(t, issued, "dlt_topic = $2")
 	assert.Contains(t, issued, "failure_metadata = $3")
 	assert.Contains(t, issued, "locked_until = NULL")
+	assert.Contains(t, issued, "claim_token = $5",
+		"only the worker holding the claim may dead-letter, or two workers each put a copy on the .dlt topic")
+	assert.Contains(t, issued, "status IN ($6, $7)",
+		"an already dead-lettered row must not be dead-lettered a second time")
 
 	assert.NoError(t, mock.ExpectationsWereMet(),
 		"the dead-letter transition must bind dead_lettered, the resolved .dlt topic and the metadata bytes")
@@ -1023,10 +1292,11 @@ func TestMarkEventDeadLettered_EmptyTopicAndMetadataBindAsNull(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
-		WithArgs(model.EventOutboxStatusDeadLettered, nil, nil, int64(11)).
+		WithArgs(model.EventOutboxStatusDeadLettered, nil, nil, int64(11), "tok-11",
+			model.EventOutboxStatusFailed, model.EventOutboxStatusProcessing).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	require.NoError(t, ds.MarkEventDeadLettered(context.Background(), 11, "", nil))
+	require.NoError(t, ds.MarkEventDeadLettered(context.Background(), 11, "tok-11", "", nil))
 	assert.NoError(t, mock.ExpectationsWereMet(),
 		"an empty topic or metadata must be stored as SQL NULL so \"not recorded\" stays distinct from \"recorded as empty\"")
 }
@@ -1048,14 +1318,16 @@ func TestMarkWebhookDispatched_SetsTheDualDeliveryFlag(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	mock.ExpectExec("").
-		WithArgs(int64(13)).
+		WithArgs(int64(13), "tok-13").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	require.NoError(t, ds.MarkWebhookDispatched(context.Background(), 13))
+	require.NoError(t, ds.MarkWebhookDispatched(context.Background(), 13, "tok-13"))
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
 
 	assert.Contains(t, issued, "webhook_dispatched = TRUE")
+	assert.Contains(t, issued, "claim_token = $2",
+		"the marker must be conditional on the claim, or a zombie worker can record a webhook that was never sent")
 	assert.NotContains(t, issued, "status =",
 		"the dual-delivery marker must not disturb the relay state machine: the Kafka leg owns status")
 	assert.NotContains(t, issued, "locked_until",
@@ -1064,25 +1336,34 @@ func TestMarkWebhookDispatched_SetsTheDualDeliveryFlag(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestMarkEventTransitions_DatabaseErrorIsWrapped covers the failure branch of every
-// transition in one table, so none of the four can be left without one.
-func TestMarkEventTransitions_DatabaseErrorIsWrapped(t *testing.T) {
-	transitions := map[string]func(context.Context, Datasource) error{
+// eventTransitionTable is every conditional transition, invoked with a held claim
+// token, reduced to a plain error-returning closure.
+//
+// One table drives the wrapped-error, lost-claim and undeterminable-count cases below,
+// which is what keeps a newly added transition from silently arriving without any of
+// the three. MarkEventFailed's outcome is discarded here on purpose: these cases are
+// about the failure branches, and the outcome is asserted where the decision is.
+func eventTransitionTable() map[string]func(context.Context, Datasource) error {
+	return map[string]func(context.Context, Datasource) error{
 		"MarkEventDispatched": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventDispatched(ctx, 1)
-		},
-		"MarkEventFailed": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventFailed(ctx, 1, "boom")
+			return ds.MarkEventDispatched(ctx, 1, "tok")
 		},
 		"MarkEventDeadLettered": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventDeadLettered(ctx, 1, "blnk.transactions.dlt", json.RawMessage(`{}`))
+			return ds.MarkEventDeadLettered(ctx, 1, "tok", "blnk.transactions.dlt", json.RawMessage(`{}`))
 		},
 		"MarkWebhookDispatched": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkWebhookDispatched(ctx, 1)
+			return ds.MarkWebhookDispatched(ctx, 1, "tok")
+		},
+		"ReleaseEventReplay": func(ctx context.Context, ds Datasource) error {
+			return ds.ReleaseEventReplay(ctx, 1, "tok", "gave up")
 		},
 	}
+}
 
-	for name, invoke := range transitions {
+// TestMarkEventTransitions_DatabaseErrorIsWrapped covers the failure branch of every
+// transition in one table, so none of them can be left without one.
+func TestMarkEventTransitions_DatabaseErrorIsWrapped(t *testing.T) {
+	for name, invoke := range eventTransitionTable() {
 		t.Run(name, func(t *testing.T) {
 			db, mock := newSQLMock(t)
 			ds := Datasource{Conn: db}
@@ -1095,37 +1376,27 @@ func TestMarkEventTransitions_DatabaseErrorIsWrapped(t *testing.T) {
 	}
 }
 
-// TestMarkEventTransitions_ZeroRowsAffectedIsNotAnError locks in the deliberate
-// decision NOT to fail when an UPDATE matches nothing.
+// TestMarkEventTransitions_ZeroRowsAffectedIsALostClaimConflict is the REGRESSION
+// GUARD on the most consequential behaviour change in this file, and it replaces a
+// test that asserted the opposite.
 //
-// This is the behaviour the implementation documents, and it is asserted rather than
-// assumed because the opposite choice is superficially more attractive. A concurrent
-// relay instance whose lease expired may legitimately have moved the row on already;
-// failing the caller would turn that benign race into a spurious retry and, on the
-// dispatch path, into a republished event. It is LOGGED rather than ignored because
-// the other explanation — an id that never existed — is a real defect an operator
-// needs to see.
+// The previous behaviour — and the previous test — treated an UPDATE that matched no
+// row as benign: log a warning, return nil. The reasoning was that a concurrent relay
+// whose lease expired may legitimately have moved the row on, and that failing the
+// caller would turn a benign race into a spurious retry.
 //
-// Note this is the opposite of DeleteLineageMapping's ErrNotFound treatment, which is
-// the right choice for a caller-visible delete and the wrong one for a relay
-// bookkeeping write.
-func TestMarkEventTransitions_ZeroRowsAffectedIsNotAnError(t *testing.T) {
-	transitions := map[string]func(context.Context, Datasource) error{
-		"MarkEventDispatched": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventDispatched(ctx, 999)
-		},
-		"MarkEventFailed": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventFailed(ctx, 999, "boom")
-		},
-		"MarkEventDeadLettered": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventDeadLettered(ctx, 999, "blnk.transactions.dlt", json.RawMessage(`{}`))
-		},
-		"MarkWebhookDispatched": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkWebhookDispatched(ctx, 999)
-		},
-	}
-
-	for name, invoke := range transitions {
+// That reasoning had the consequence backwards. Returning nil tells the caller its
+// transition SUCCEEDED, so a worker that had lost its claim went on to act as though
+// it owned the row: it recorded a terminal state over the top of the current holder's
+// work, it recorded a failed attempt against a claim it no longer held — spending the
+// retry budget at twice the intended rate — and it could move a row back out of a
+// terminal state entirely. The spurious retry the old behaviour avoided is a much
+// smaller cost than any of those.
+//
+// A lost claim is now a CONFLICT: nothing is broken, the caller simply no longer owns
+// what it is trying to change, and the correct response is to stop working on the row.
+func TestMarkEventTransitions_ZeroRowsAffectedIsALostClaimConflict(t *testing.T) {
+	for name, invoke := range eventTransitionTable() {
 		t.Run(name, func(t *testing.T) {
 			db, mock := newSQLMock(t)
 			ds := Datasource{Conn: db}
@@ -1133,8 +1404,14 @@ func TestMarkEventTransitions_ZeroRowsAffectedIsNotAnError(t *testing.T) {
 			mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 				WillReturnResult(sqlmock.NewResult(0, 0))
 
-			assert.NoError(t, invoke(context.Background(), ds),
-				"an UPDATE matching no row must be logged, not returned as an error: a concurrent relay may legitimately have moved the row on")
+			err := invoke(context.Background(), ds)
+			require.Error(t, err,
+				"an UPDATE matching no row means the claim was lost; reporting success lets a zombie worker overwrite the current holder's state")
+
+			var apiErr apierror.APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, apierror.ErrConflict, apiErr.Code,
+				"a lost claim is a conflict, not a server fault")
 			assert.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
@@ -1144,7 +1421,9 @@ func TestMarkEventTransitions_ZeroRowsAffectedIsNotAnError(t *testing.T) {
 // branch of the bookkeeping helper: a driver that cannot report RowsAffected.
 //
 // A completed UPDATE must not be turned into a failure by its own instrumentation.
-// The transition already succeeded; only the diagnostic is unavailable.
+// The transition already succeeded; only the diagnostic is unavailable. This is the
+// one case that still resolves to success, and it does so because the UPDATE itself
+// did not error — which is different in kind from an UPDATE that matched nothing.
 func TestMarkEventTransitions_UndeterminableRowsAffectedIsNotAnError(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -1152,21 +1431,229 @@ func TestMarkEventTransitions_UndeterminableRowsAffectedIsNotAnError(t *testing.
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WillReturnResult(sqlmock.NewErrorResult(errors.New("rows affected not supported")))
 
-	assert.NoError(t, ds.MarkEventDispatched(context.Background(), 5),
+	assert.NoError(t, ds.MarkEventDispatched(context.Background(), 5, "tok"),
 		"a driver that cannot report RowsAffected must not fail an UPDATE that already succeeded")
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestLogEventOutboxRowsUnaffected_ToleratesANilResult guards the defensive nil check
+// TestRequireEventOutboxRowAffected_ToleratesANilResult guards the defensive nil check
 // directly.
 //
 // database/sql guarantees a non-nil Result alongside a nil error, so this should be
 // unreachable — but a transition that has already SUCCEEDED must never be turned into
-// a panic by its own bookkeeping, and the cost of being sure is one assertion.
-func TestLogEventOutboxRowsUnaffected_ToleratesANilResult(t *testing.T) {
-	assert.NotPanics(t, func() {
-		logEventOutboxRowsUnaffected(nil, 1, model.EventOutboxStatusDispatched)
-	}, "bookkeeping must never panic on a transition that already succeeded")
+// a failure by its own bookkeeping, and the cost of being sure is one assertion.
+func TestRequireEventOutboxRowAffected_ToleratesANilResult(t *testing.T) {
+	assert.NoError(t, requireEventOutboxRowAffected(nil, 1, model.EventOutboxStatusDispatched),
+		"bookkeeping must never fail a transition that already succeeded")
+}
+
+// ===========================================================================
+// TIER 1 — the replay claim, and the concurrency it removes
+// ===========================================================================
+
+// TestClaimEventForReplay_TransitionsDeadLetteredToReplayingAndIssuesAToken pins the
+// transition that makes concurrent replay safe.
+//
+// The precondition lives INSIDE the update. Two concurrent replays of one event
+// therefore cannot both proceed: exactly one changes a row and receives a token, and
+// the other is refused before it can publish. The read-then-check form this replaced
+// let both pass and both publish, so an operator double-clicking put two copies of the
+// event on the topic.
+func TestClaimEventForReplay_TransitionsDeadLetteredToReplayingAndIssuesAToken(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	stored := model.EventOutbox{
+		ID: 21, EventID: "b1f0c2d3-4e5f-4061-8273-8495a6b7c8d9", EventType: "transaction.applied",
+		AggregateID: "agg", PartitionKey: "agg", Topic: "blnk.transactions",
+		SchemaVersion: model.SchemaVersionV1,
+		Payload:       json.RawMessage(`{"event":"transaction.applied","data":{}}`),
+		OccurredAt:    time.Now().UTC(), Status: model.EventOutboxStatusReplaying,
+		MaxAttempts: 5, DLTTopic: "blnk.transactions.dlt", ClaimToken: "issued-token",
+	}
+
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+		WillReturnRows(newEventOutboxRows(stored))
+
+	row, err := ds.ClaimEventForReplay(context.Background(), stored.EventID, time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "status = $1", "the row must be moved into the replaying state by the claim itself")
+	assert.Contains(t, issued, "claim_token = $2", "the claim must issue a token, or nothing can complete the replay")
+	assert.Contains(t, issued, "WHERE event_id = $4 AND status = $5",
+		"the dead-lettered precondition must be part of the UPDATE, not a separate read")
+	assert.Contains(t, issued, "RETURNING", "the claimed row must come back from the same statement")
+
+	assert.Equal(t, "issued-token", row.ClaimToken,
+		"the token must reach the caller; without it no follow-up transition can be authorised")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestClaimEventForReplay_DiscriminatesMissingFromWrongState keeps two different
+// operator mistakes apart.
+//
+// A wrong id and an event that is not dead-lettered are not the same problem. Told
+// "not found" for an event they had already replayed, an operator goes looking for a
+// typo instead of realising the replay had already happened — so the wrong-state case
+// must be a conflict whose message names the status the row is actually in.
+func TestClaimEventForReplay_DiscriminatesMissingFromWrongState(t *testing.T) {
+	t.Run("no such event", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+
+		mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnError(sql.ErrNoRows)
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT")).WillReturnError(sql.ErrNoRows)
+
+		_, err := ds.ClaimEventForReplay(context.Background(), "missing", time.Minute)
+		requireAPIError(t, err, apierror.ErrNotFound)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("present but already dispatched", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+
+		existing := model.EventOutbox{
+			ID: 7, EventID: "c2e1d3f4-5061-4172-8384-95a6b7c8d9e0", EventType: "transaction.applied",
+			AggregateID: "agg", PartitionKey: "agg", Topic: "blnk.transactions",
+			SchemaVersion: model.SchemaVersionV1,
+			Payload:       json.RawMessage(`{"event":"transaction.applied","data":{}}`),
+			OccurredAt:    time.Now().UTC(), Status: model.EventOutboxStatusDispatched, MaxAttempts: 5,
+		}
+
+		mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnError(sql.ErrNoRows)
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT")).WillReturnRows(newEventOutboxRows(existing))
+
+		_, err := ds.ClaimEventForReplay(context.Background(), existing.EventID, time.Minute)
+		requireAPIError(t, err, apierror.ErrConflict)
+		assert.Contains(t, err.Error(), model.EventOutboxStatusDispatched,
+			"the message must name the status the row is actually in, or an operator cannot tell which mistake they made")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+// TestReleaseEventReplay_ReturnsTheRowToDeadLetteredSoItStaysReplayable pins the
+// rollback half of the replay claim.
+//
+// Without it, a replay that claimed a row and then failed to publish would strand the
+// row in replaying — outside the relay's claimable set AND outside the dead-letter
+// inventory — where nothing would ever pick it up again. A failed replay must not cost
+// an event its replayability.
+func TestReleaseEventReplay_ReturnsTheRowToDeadLetteredSoItStaysReplayable(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec("").
+		WithArgs(model.EventOutboxStatusDeadLettered, "broker refused", int64(21), "tok-21",
+			model.EventOutboxStatusReplaying).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	require.NoError(t, ds.ReleaseEventReplay(context.Background(), 21, "tok-21", "broker refused"))
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "status = $1", "the row must go back to dead_lettered, not stay in replaying")
+	assert.Contains(t, issued, "last_error = COALESCE(NULLIF($2, ''), last_error)",
+		"a blank reason must leave the original publish failure in place rather than blanking it")
+	assert.Contains(t, issued, "claim_token = NULL", "the replay claim must be released")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// ===========================================================================
+// TIER 1 — retention
+// ===========================================================================
+
+// TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice pins the
+// retention primitive, and the safety property that makes it usable at all.
+//
+// WHAT THIS TABLE HOLDS is why retention exists: payload is the webhook body verbatim,
+// so an identity event carries names, email addresses, phone numbers, postal addresses
+// and dates of birth, and a transaction event carries amounts and balance identifiers.
+// Kept forever, the delivery buffer becomes an unbounded second copy of the ledger's
+// most sensitive data.
+//
+// The safety property is that ONLY terminal rows are eligible. A pending, processing,
+// replaying or failed row is still owed a delivery attempt. failed is the subtle one
+// and is asserted explicitly: its retry budget is spent but its dead-letter write is
+// not done, so this table is the ONLY copy of that event in existence and deleting it
+// would destroy it.
+func TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	cutoff := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM blnk.event_outbox")).
+		WithArgs(pq.Array(model.TerminalEventOutboxStatuses()), cutoff, 250).
+		WillReturnResult(sqlmock.NewResult(0, 3))
+
+	purged, err := ds.PurgeTerminalEventsBefore(context.Background(), cutoff, 250)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), purged, "the caller sweeps in a loop and needs the true count to know when to stop")
+
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+	assert.Contains(t, issued, "status = ANY($1)", "the eligible states must be bound, not interpolated")
+	assert.Contains(t, issued, "occurred_at < $2")
+	assert.Contains(t, issued, "LIMIT $3",
+		"the delete must be bounded, or one sweep blocks the relay and bloats the WAL in a single transaction")
+
+	assert.Equal(t, []string{model.EventOutboxStatusDispatched, model.EventOutboxStatusDeadLettered},
+		model.TerminalEventOutboxStatuses(),
+		"only dispatched and dead_lettered are terminal")
+	assert.NotContains(t, model.TerminalEventOutboxStatuses(), model.EventOutboxStatusFailed,
+		"a failed row still owes its dead-letter write, so this table is the only copy of that event and it must never be purged")
+	assert.NotContains(t, model.TerminalEventOutboxStatuses(), model.EventOutboxStatusPending)
+	assert.NotContains(t, model.TerminalEventOutboxStatuses(), model.EventOutboxStatusProcessing)
+	assert.NotContains(t, model.TerminalEventOutboxStatuses(), model.EventOutboxStatusReplaying)
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPurgeTerminalEventsBefore_RefusesAZeroCutoffAndClampsTheSlice covers the two
+// argument guards.
+//
+// A zero cutoff reads as "delete everything older than the year 1", which deletes
+// nothing — far more likely an unset field than an intention, and silently doing
+// nothing would hide a retention job that looks like it is running. A non-positive or
+// oversized limit is clamped rather than refused, because the caller's intent is clear
+// and the bound exists to protect the relay rather than the caller.
+func TestPurgeTerminalEventsBefore_RefusesAZeroCutoffAndClampsTheSlice(t *testing.T) {
+	t.Run("zero cutoff is refused before any statement", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+
+		_, err := ds.PurgeTerminalEventsBefore(context.Background(), time.Time{}, 100)
+		requireAPIError(t, err, apierror.ErrBadRequest)
+		assert.NoError(t, mock.ExpectationsWereMet(), "the guard must run before any statement is issued")
+	})
+
+	t.Run("limits are clamped into range", func(t *testing.T) {
+		for name, tc := range map[string]struct{ given, want int }{
+			"zero":      {0, defaultEventPurgeBatchSize},
+			"negative":  {-5, defaultEventPurgeBatchSize},
+			"oversized": {maxEventPurgeBatchSize * 10, maxEventPurgeBatchSize},
+			"in range":  {42, 42},
+		} {
+			t.Run(name, func(t *testing.T) {
+				db, mock := newSQLMock(t)
+				ds := Datasource{Conn: db}
+
+				var boundLimit driver.Value
+				mock.ExpectExec(regexp.QuoteMeta("DELETE FROM blnk.event_outbox")).
+					WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), captureArg(&boundLimit)).
+					WillReturnResult(sqlmock.NewResult(0, 0))
+
+				_, err := ds.PurgeTerminalEventsBefore(context.Background(),
+					time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), tc.given)
+				require.NoError(t, err)
+				assert.EqualValues(t, tc.want, boundLimit)
+				assert.NoError(t, mock.ExpectationsWereMet())
+			})
+		}
+	})
 }
 
 // ===========================================================================
@@ -1424,11 +1911,7 @@ func TestInsertEventOutboxInTx_BindsPendingStatusNotCallerStatus(t *testing.T) {
 			var boundStatus driver.Value
 			mock.ExpectBegin()
 			mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO blnk.event_outbox")).
-				WithArgs(
-					sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-					sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-					captureArg(&boundStatus), sqlmock.AnyArg(),
-				).
+				WithArgs(insertArgMatchers(t, "status", &boundStatus)...).
 				WillReturnRows(insertedEventOutboxRows(1))
 			mock.ExpectCommit()
 
@@ -1481,11 +1964,7 @@ func TestInsertEventOutboxInTx_PayloadBytesPassThroughUnmodified(t *testing.T) {
 	var boundPayload driver.Value
 	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO blnk.event_outbox")).
-		WithArgs(
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), captureArg(&boundPayload),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-		).
+		WithArgs(insertArgMatchers(t, "payload", &boundPayload)...).
 		WillReturnRows(insertedEventOutboxRows(1))
 	mock.ExpectCommit()
 
@@ -1552,40 +2031,76 @@ func TestInsertEventOutboxInTx_AppliesDocumentedDefaults(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestInsertEventOutbox_ValidationRejectsUnusableEntries covers all three guards, on
+// TestInsertEventOutbox_ValidationRejectsUnusableEntries covers EVERY field guard, on
 // all three insert entry points.
 //
-// Each guard converts a specific silent failure into a typed bad request raised BEFORE
-// any statement runs — which matters most inside a caller's ledger transaction, where
-// an opaque driver error surfaces far from its cause:
+// # Why the persistence layer validates at all
+//
+// A stored row is a COMMITMENT: the relay will try to publish it, retry it, spend its
+// budget on it and finally preserve it on a dead-letter topic. A row that could never
+// have been published is therefore not a harmless bad value — it is a guaranteed
+// dead-letter entry that an operator has to triage, and the cause will by then be far
+// away from the code that caused it. Each guard converts that into a typed bad request
+// raised BEFORE any statement runs, which matters most inside a caller's ledger
+// transaction where an opaque driver error surfaces nowhere near its origin.
+//
+// The cases, and the specific failure each prevents:
 //
 //   - A nil entry would panic on dereference.
-//   - An empty event_id would insert a row whose idempotency key is the empty string.
-//     The first such row succeeds and every later one collides on
-//     event_outbox_event_id_uidx, so the failure appears on an unrelated later write.
-//   - An empty payload would send NULL into a NOT NULL JSONB column. The payload IS
-//     the event body; a row without one has nothing to publish.
+//   - A non-UUID or non-canonical event_id is a SUBSCRIBER IDEMPOTENCY KEY a consumer
+//     cannot deduplicate on reliably; the braced and unhyphenated spellings are refused
+//     for the same reason, because two spellings of one UUID are two distinct keys. An
+//     empty one is worse: the first row succeeds and every later one collides on
+//     event_outbox_event_id_uidx, so the failure lands on an unrelated later write.
+//   - A blank event_type is unroutable and unfilterable; a blank aggregate_id leaves
+//     consumers nothing to group by; a blank partition_key makes Kafka scatter the event
+//     round-robin and silently destroys the per-aggregate ordering guarantee.
+//   - A topic outside the Blnk-owned namespace would have the relay lazily create a
+//     writer and PUBLISH TO A DESTINATION BLNK DOES NOT OWN, driven by stored data.
+//   - An unsupported schema_version reaches subscribers on the wire as an unknown
+//     envelope shape.
+//   - An absent payload has nothing to publish; invalid JSON would be rejected by the
+//     JSONB column with a driver error instead of a field name; and an oversize payload
+//     is accepted here only to be rejected by the broker on every attempt until it
+//     dead-letters.
 //
 // Every case also asserts that NO statement reached the database, which is the half
 // that proves the guard runs first rather than merely running.
 func TestInsertEventOutbox_ValidationRejectsUnusableEntries(t *testing.T) {
+	invalid := func(mutate func(*model.EventOutbox)) *model.EventOutbox {
+		e := newEventOutboxFixture("invalid-")
+		mutate(e)
+		return e
+	}
+
 	cases := map[string]*model.EventOutbox{
 		"nil entry": nil,
-		"empty event id": func() *model.EventOutbox {
-			e := newEventOutboxFixture("invalid-")
-			e.EventID = ""
-			return e
-		}(),
-		"nil payload": func() *model.EventOutbox {
-			e := newEventOutboxFixture("invalid-")
-			e.Payload = nil
-			return e
-		}(),
-		"empty payload": func() *model.EventOutbox {
-			e := newEventOutboxFixture("invalid-")
-			e.Payload = json.RawMessage{}
-			return e
-		}(),
+
+		"empty event id":         invalid(func(e *model.EventOutbox) { e.EventID = "" }),
+		"non-uuid event id":      invalid(func(e *model.EventOutbox) { e.EventID = "evt_1" }),
+		"braced uuid":            invalid(func(e *model.EventOutbox) { e.EventID = "{6ba7b810-9dad-11d1-80b4-00c04fd430c8}" }),
+		"unhyphenated uuid":      invalid(func(e *model.EventOutbox) { e.EventID = "6ba7b8109dad11d180b400c04fd430c8" }),
+		"urn prefixed uuid":      invalid(func(e *model.EventOutbox) { e.EventID = "urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8" }),
+		"uuid with whitespace":   invalid(func(e *model.EventOutbox) { e.EventID = " 6ba7b810-9dad-11d1-80b4-00c04fd430c8" }),
+		"blank event type":       invalid(func(e *model.EventOutbox) { e.EventType = "   " }),
+		"blank aggregate id":     invalid(func(e *model.EventOutbox) { e.AggregateID = "" }),
+		"blank partition key":    invalid(func(e *model.EventOutbox) { e.PartitionKey = "\t " }),
+		"blank topic":            invalid(func(e *model.EventOutbox) { e.Topic = "" }),
+		"foreign topic":          invalid(func(e *model.EventOutbox) { e.Topic = "attacker.transactions" }),
+		"unknown category topic": invalid(func(e *model.EventOutbox) { e.Topic = "blnk.payroll" }),
+		"bare topic":             invalid(func(e *model.EventOutbox) { e.Topic = "transactions" }),
+		"topic with whitespace":  invalid(func(e *model.EventOutbox) { e.Topic = " blnk.transactions" }),
+		"unsupported version":    invalid(func(e *model.EventOutbox) { e.SchemaVersion = model.SchemaVersionV1 + 1 }),
+
+		"nil payload":   invalid(func(e *model.EventOutbox) { e.Payload = nil }),
+		"empty payload": invalid(func(e *model.EventOutbox) { e.Payload = json.RawMessage{} }),
+		"invalid json":  invalid(func(e *model.EventOutbox) { e.Payload = json.RawMessage(`{"event":`) }),
+		"oversize payload": invalid(func(e *model.EventOutbox) {
+			// One byte past the limit, so the boundary itself is exercised rather than
+			// something comfortably over it.
+			filler := strings.Repeat("x", model.MaxEventMessageBytes)
+			e.Payload = json.RawMessage(`{"event":"x","data":"` + filler + `"}`)
+		}),
 	}
 
 	for name, entry := range cases {
@@ -1871,8 +2386,19 @@ func TestInsertEventOutboxesInTx_BuildsOneMultiRowStatementWithBoundPlaceholders
 	issued := (*captured)[0]
 
 	assert.Contains(t, issued, "INSERT INTO blnk.event_outbox")
-	assert.Contains(t, issued, "($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)", "the first row's placeholders must start at $1")
-	assert.Contains(t, issued, "($11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
+	// The expected tuples are DERIVED from eventOutboxInsertValueCount rather than
+	// written out, so adding a column changes the assertion automatically and the test
+	// keeps proving the same property: the numbering strides by the real column count.
+	tupleAt := func(base int) string {
+		placeholders := make([]string, 0, eventOutboxInsertValueCount)
+		for offset := 0; offset < eventOutboxInsertValueCount; offset++ {
+			placeholders = append(placeholders, fmt.Sprintf("$%d", base+offset))
+		}
+		return "(" + strings.Join(placeholders, ",") + ")"
+	}
+
+	assert.Contains(t, issued, tupleAt(1), "the first row's placeholders must start at $1")
+	assert.Contains(t, issued, tupleAt(1+eventOutboxInsertValueCount),
 		"the second row's placeholders must stride by the column count, proving the numbering is derived from eventOutboxInsertValueCount")
 	assert.Contains(t, issued, "RETURNING id, event_id",
 		"the batch must return event_id alongside id: RETURNING makes no promise about row order, so ids are matched by event id")
@@ -2207,9 +2733,10 @@ func TestListDeadLetteredEvents_NormalisesPagination(t *testing.T) {
 // iteration branches of the listing.
 func TestListDeadLetteredEvents_ErrorsAreWrapped(t *testing.T) {
 	valid := model.EventOutbox{
-		ID: 1, EventID: "evt_1", EventType: "transaction.applied", AggregateID: "agg",
-		LedgerID: "ldg", Topic: "blnk.transactions", SchemaVersion: model.SchemaVersionV1,
-		Payload: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+		ID: 1, EventID: uuid.NewString(), EventType: "transaction.applied", AggregateID: "agg",
+		PartitionKey: "agg", LedgerID: "ldg", Topic: "blnk.transactions",
+		SchemaVersion: model.SchemaVersionV1,
+		Payload:       json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
 		Status: model.EventOutboxStatusDeadLettered, MaxAttempts: 5,
 	}
 
@@ -2218,12 +2745,12 @@ func TestListDeadLetteredEvents_ErrorsAreWrapped(t *testing.T) {
 			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).WillReturnError(sql.ErrConnDone)
 		},
 		"scan error": func(mock sqlmock.Sqlmock) {
-			broken := sqlmock.NewRows(eventOutboxProjectedColumns()).AddRow(
-				int64(1), "evt_broken", "transaction.applied", "agg", "ldg", "blnk.transactions",
-				int64(1), []byte(`{}`), "not-a-timestamp",
-				model.EventOutboxStatusDeadLettered, int64(5), int64(5), nil,
-				nil, nil, nil, nil, false, nil, nil,
-			)
+			// Built from the real row builder with occurred_at corrupted BY POSITION,
+			// so the cell count can never drift away from the projection.
+			cells := eventOutboxRow(valid)
+			cells[indexOfProjectedColumn(t, "occurred_at")] = "not-a-timestamp"
+
+			broken := sqlmock.NewRows(eventOutboxProjectedColumns()).AddRow(cells...)
 			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).WillReturnRows(broken)
 		},
 		"row iteration error": func(mock sqlmock.Sqlmock) {
@@ -2704,21 +3231,25 @@ func TestEventSubscriberRepository_NoMethodReturnsPlaintextSecret(t *testing.T) 
 func quiesceEventOutbox(t *testing.T, ds Datasource, markerPrefix string) {
 	t.Helper()
 
+	// Keyed on AGGREGATE_ID and not on event_id. event_id must now be a canonical
+	// UUID — it is the subscriber's idempotency key, so the persistence layer refuses
+	// any other spelling — which leaves no room for a test marker in it. aggregate_id
+	// is unconstrained and carries the marker instead.
 	_, err := ds.Conn.Exec(`
 		UPDATE blnk.event_outbox
 		SET locked_until = NOW() + interval '1 hour'
 		WHERE status IN ('pending', 'processing')
 		  AND (locked_until IS NULL OR locked_until < NOW())
-		  AND event_id NOT LIKE $1
+		  AND aggregate_id NOT LIKE $1
 	`, markerPrefix+"%")
 	require.NoError(t, err, "failed to quiesce unrelated event outbox rows")
 
 	t.Cleanup(func() {
 		_, cleanupErr := ds.Conn.Exec(`
 			UPDATE blnk.event_outbox
-			SET status = 'dispatched', dispatched_at = NOW(), locked_until = NULL
-			WHERE event_id LIKE $1
-			  AND status IN ('pending', 'processing')
+			SET status = 'dispatched', dispatched_at = NOW(), locked_until = NULL, claim_token = NULL
+			WHERE aggregate_id LIKE $1
+			  AND status IN ('pending', 'processing', 'replaying')
 		`, markerPrefix+"%")
 		if cleanupErr != nil {
 			t.Logf("failed to retire event outbox fixtures: %v", cleanupErr)
@@ -2741,18 +3272,52 @@ func insertRealEventOutbox(t *testing.T, ds Datasource, entry *model.EventOutbox
 	return entry
 }
 
+// isMarkedEventOutbox reports whether a claimed row belongs to this test run.
+//
+// Matching is on AGGREGATE_ID, not event_id: event_id is now required to be a
+// canonical UUID, so there is nowhere in it for a marker to live.
+func isMarkedEventOutbox(entry model.EventOutbox, markerPrefix string) bool {
+	return strings.HasPrefix(entry.AggregateID, markerPrefix)
+}
+
+// claimEventOutboxToken claims a specific pending row and returns the claim token the
+// claim issued, which every subsequent transition must present.
+//
+// It exists because a transition is no longer addressable by row id alone. Threading
+// the real token through these tests is not ceremony: it is what makes them exercise
+// the same conditional path production takes, so a transition that stopped checking the
+// token would fail here rather than pass.
+//
+// It requires that the row actually be claimed, because a silently unclaimed row would
+// turn every following assertion into a test of the failure path.
+func claimEventOutboxToken(t *testing.T, ds Datasource, entry *model.EventOutbox) string {
+	t.Helper()
+
+	claimed, err := ds.ClaimPendingEventOutbox(context.Background(), 100, 5*time.Minute)
+	require.NoError(t, err)
+
+	for _, row := range claimed {
+		if row.EventID == entry.EventID {
+			require.NotEmpty(t, row.ClaimToken, "a claimed row must carry the token the claim issued")
+			return row.ClaimToken
+		}
+	}
+
+	require.FailNowf(t, "row was not claimed",
+		"event %q was expected in the claimed batch; without its token no transition can be authorised", entry.EventID)
+	return ""
+}
+
 // TestInsertEventOutbox_RoundTripsThroughTheDatabase_RealDB is the baseline: a row
 // inserted through the production path reads back with every field intact.
 //
-// The payload is compared by JSON EQUIVALENCE and NOT by byte equality, and that is
-// correct rather than a concession. The column is JSONB, which is a parsed
-// representation: PostgreSQL sorts object keys and renormalises whitespace on write, so
-// a payload written as {"event":...,"data":...} reads back as {"data":...,"event":...}.
-// Byte equality against the pre-insert spelling would fail on key order alone and look
-// like payload corruption when nothing is wrong. The guarantees that matter — dual
-// delivery and replay — are both relative to the STORED row, not to the pre-insert
-// spelling, so equivalence is the right assertion here and byte equality is the right
-// assertion at the bind site.
+// The payload is compared by BYTE EQUALITY, and that is the whole point of the two body
+// columns. The read projects payload_raw, which is BYTEA and therefore returns the
+// producer's exact bytes; the JSONB payload column, which PostgreSQL normalises on write,
+// exists only for SQL-side containment and extraction queries and is never read as the
+// body. Asserting equivalence here instead of equality would pass just as well against a
+// projection that returned the normalised bytes — which is precisely the defect the second
+// column removes, and precisely what acceptance criteria V-8 and V-9 compare.
 func TestInsertEventOutbox_RoundTripsThroughTheDatabase_RealDB(t *testing.T) {
 	ds := openRealTestDB(t)
 	ctx := context.Background()
@@ -2786,8 +3351,57 @@ func TestInsertEventOutbox_RoundTripsThroughTheDatabase_RealDB(t *testing.T) {
 	assert.True(t, entry.OccurredAt.Equal(got.OccurredAt),
 		"occurred_at must survive the round trip exactly: the FIFO claim orders by it")
 
-	assert.JSONEq(t, string(entry.Payload), string(got.Payload),
-		"the payload must round-trip as equivalent JSON; JSONB reorders keys on write, so byte equality against the pre-insert spelling is the wrong assertion here")
+	assert.Equal(t, string(entry.Payload), string(got.Payload),
+		"the payload must round-trip BYTE for byte: payload_raw is BYTEA and returns exactly what the producer marshaled, which is what the dual-delivery and replay-fidelity criteria compare")
+}
+
+// TestInsertEventOutbox_PreservesAHostilePayloadSpellingByteForByte is the test the
+// byte-preserving column exists for.
+//
+// The fixture payload is close to canonical, so it would round-trip through JSONB looking
+// almost right — which is exactly why this second case is needed. Every element of the
+// body below is one PostgreSQL's JSONB parser is documented to change:
+//
+//   - member order that is NOT the order JSONB stores in (it sorts by length, then bytes)
+//   - insignificant whitespace, which JSONB renormalises rather than merely strips
+//   - a 17-digit integer, beyond float64's exact range
+//   - a trailing zero in a decimal, which a re-marshal would drop
+//   - exponent notation, which JSONB expands
+//   - a duplicate key, which JSONB collapses to its last occurrence
+//
+// If the read ever goes back to the JSONB column, this test fails on the first of them.
+func TestInsertEventOutbox_PreservesAHostilePayloadSpellingByteForByte(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("hostile")
+	quiesceEventOutbox(t, ds, marker)
+
+	hostile := `{"event":"transaction.applied","data":{"zzz":1,  "amount":100.50,` +
+		`"id":12345678901234567,"ratio":1.0e3,"a":"x","dup":1,"dup":2}}`
+
+	entry := newEventOutboxFixture(marker)
+	entry.Payload = json.RawMessage(hostile)
+	insertRealEventOutbox(t, ds, entry)
+
+	got, err := ds.GetEventByID(ctx, entry.EventID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	assert.Equal(t, hostile, string(got.Payload),
+		"the stored body must be returned exactly as the producer marshaled it; a single "+
+			"reordered member, dropped zero or collapsed duplicate makes a replay differ from "+
+			"the original and the two dual-delivery transports differ from each other")
+
+	// And the JSONB projection really is a DIFFERENT rendering, which is what makes the
+	// assertion above meaningful rather than vacuous: if both columns returned the same
+	// bytes there would be nothing for the second column to fix.
+	var normalised string
+	require.NoError(t, ds.Conn.QueryRowContext(ctx,
+		`SELECT payload::text FROM blnk.event_outbox WHERE event_id = $1`, entry.EventID,
+	).Scan(&normalised))
+	assert.NotEqual(t, hostile, normalised,
+		"the JSONB column is expected to normalise this body; if it did not, this test would "+
+			"prove nothing about which column is projected")
 }
 
 // TestInsertEventOutbox_DuplicateEventIDIsRejectedByTheUniqueIndex_RealDB proves the
@@ -2902,11 +3516,14 @@ func TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB(t *testing.T) {
 		{"second", base.Add(2 * time.Minute)},
 	}
 
+	const sharedKey = "shared-partition-key"
+
 	byLabel := make(map[string]string, len(inserted))
 	insertionOrder := make([]string, 0, len(inserted))
 	for _, f := range inserted {
 		entry := newEventOutboxFixture(marker)
 		entry.AggregateID = marker + "shared-aggregate"
+		entry.PartitionKey = marker + sharedKey
 		entry.LedgerID = marker + "shared-ledger"
 		entry.OccurredAt = f.occurredAt
 		insertRealEventOutbox(t, ds, entry)
@@ -2914,29 +3531,184 @@ func TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB(t *testing.T) {
 		insertionOrder = append(insertionOrder, entry.EventID)
 	}
 
-	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
-	require.NoError(t, err)
+	// ONE AT A TIME, and that is the guarantee rather than a limitation of the test.
+	// Every fixture shares a partition key, and at most one row per key may be in
+	// flight — otherwise a second relay could claim a later row of the same key while
+	// an earlier one was still being published, and because Kafka preserves APPEND
+	// order rather than occurred_at, a subscriber would observe the aggregate's events
+	// out of order. So the batch is drained by claiming, retiring, and claiming again,
+	// and the sequence that comes out is the sequence a consumer sees.
+	drained := make([]string, 0, len(inserted))
+	for len(drained) < len(inserted) {
+		claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+		require.NoError(t, err)
 
-	mine := make([]string, 0, len(inserted))
-	for _, entry := range claimed {
-		if strings.HasPrefix(entry.EventID, marker) {
-			mine = append(mine, entry.EventID)
-			assert.Equal(t, model.EventOutboxStatusProcessing, entry.Status,
-				"a claimed row must be moved to processing and leased")
-			require.NotNil(t, entry.LockedUntil, "a claimed row must carry a lease")
-			require.NotNil(t, entry.FirstAttemptedAt, "the claim must stamp first_attempted_at")
-			require.NotNil(t, entry.LastAttemptedAt, "the claim must stamp last_attempted_at")
+		mine := make([]model.EventOutbox, 0, 1)
+		for _, entry := range claimed {
+			if isMarkedEventOutbox(entry, marker) {
+				mine = append(mine, entry)
+			}
 		}
+		require.Len(t, mine, 1,
+			"at most ONE row per partition key may be claimable at a time; more than one in flight is how same-aggregate events get appended out of order")
+
+		entry := mine[0]
+		assert.Equal(t, model.EventOutboxStatusProcessing, entry.Status,
+			"a claimed row must be moved to processing and leased")
+		require.NotNil(t, entry.LockedUntil, "a claimed row must carry a lease")
+		require.NotNil(t, entry.FirstAttemptedAt, "the claim must stamp first_attempted_at")
+		require.NotNil(t, entry.LastAttemptedAt, "the claim must stamp last_attempted_at")
+		require.NotEmpty(t, entry.ClaimToken, "a claimed row must carry the token the claim issued")
+
+		drained = append(drained, entry.EventID)
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, entry.ClaimToken))
 	}
-	require.Len(t, mine, len(inserted), "every fixture must be claimed in one batch")
 
 	wantOccurrenceOrder := []string{
 		byLabel["first"], byLabel["second"], byLabel["third"], byLabel["fourth"],
 	}
-	assert.Equal(t, wantOccurrenceOrder, mine,
-		"the claim must return rows in occurred_at order; ordering by created_at or id would return insertion order instead and silently break per-aggregate ordering")
-	assert.NotEqual(t, insertionOrder, mine,
+	assert.Equal(t, wantOccurrenceOrder, drained,
+		"the claim must release rows in occurred_at order; ordering by created_at or id would return insertion order instead and silently break per-aggregate ordering")
+	assert.NotEqual(t, insertionOrder, drained,
 		"the fixtures were built so occurrence order disagrees with insertion order; if these matched, the test could not distinguish occurred_at from created_at")
+}
+
+// TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB is the
+// direct proof of the ORD-01 predicate, and it is the test SKIP LOCKED alone cannot pass.
+//
+// # The failure it guards against
+//
+// FOR UPDATE SKIP LOCKED makes it impossible for two relays to claim the SAME row. It
+// does nothing about two relays claiming two DIFFERENT rows of the same aggregate out of
+// order: relay B skips the earlier row relay A holds and claims a LATER row with the same
+// key. Kafka preserves append order, not occurred_at, so relay B's message can land
+// first and a subscriber observes transaction.applied before transaction.queued for one
+// transaction — with no error, no log line, and nothing in the row state to show it.
+//
+// # What is asserted
+//
+// Two rows share a key and a third has its own. A first claim may take the earlier
+// same-key row and the independent row, and MUST NOT take the later same-key row. Only
+// once the earlier row leaves the blocking states does its successor become claimable.
+// The independent row proves the predicate is scoped to the key rather than serialising
+// the whole table, which would have destroyed throughput while passing the ordering test.
+func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("onekey")
+	quiesceEventOutbox(t, ds, marker)
+
+	base := dbTimestamp(time.Now().Add(-time.Hour))
+	sharedKey := marker + "one-key"
+
+	earlier := newEventOutboxFixture(marker)
+	earlier.PartitionKey = sharedKey
+	earlier.OccurredAt = base
+	insertRealEventOutbox(t, ds, earlier)
+
+	later := newEventOutboxFixture(marker)
+	later.PartitionKey = sharedKey
+	later.OccurredAt = base.Add(time.Minute)
+	insertRealEventOutbox(t, ds, later)
+
+	independent := newEventOutboxFixture(marker)
+	independent.OccurredAt = base.Add(2 * time.Minute)
+	insertRealEventOutbox(t, ds, independent)
+
+	first, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	require.NoError(t, err)
+	assert.True(t, containsEventID(first, earlier.EventID),
+		"the earliest row of a key must be claimable")
+	assert.False(t, containsEventID(first, later.EventID),
+		"a LATER row of the same partition key must not be claimable while an earlier one is in flight; this is exactly what SKIP LOCKED alone permits")
+	assert.True(t, containsEventID(first, independent.EventID),
+		"the exclusion must be scoped to the partition key: serialising unrelated keys would destroy throughput")
+
+	// A second poll, with the earlier row still held, must still refuse its successor —
+	// which is the multi-relay case, since a second relay's poll is indistinguishable
+	// from a second poll here.
+	second, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	require.NoError(t, err)
+	assert.False(t, containsEventID(second, later.EventID),
+		"a second relay instance must not be able to claim the successor either")
+
+	// A FAILURE within budget returns the earlier row to pending, where it still blocks
+	// its key — retries preserve order.
+	var earlierToken string
+	for _, row := range first {
+		if row.EventID == earlier.EventID {
+			earlierToken = row.ClaimToken
+		}
+	}
+	require.NotEmpty(t, earlierToken)
+	outcome, err := ds.MarkEventFailed(ctx, earlier.ID, earlierToken, "transient", 0)
+	require.NoError(t, err)
+	require.False(t, outcome.Exhausted)
+
+	retry, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	require.NoError(t, err)
+	assert.True(t, containsEventID(retry, earlier.EventID),
+		"a retryable row must be re-claimed")
+	assert.False(t, containsEventID(retry, later.EventID),
+		"a retrying row must still block its key, or a retry would be appended after its own successor")
+
+	// Retiring the earlier row finally releases the key.
+	var retryToken string
+	for _, row := range retry {
+		if row.EventID == earlier.EventID {
+			retryToken = row.ClaimToken
+		}
+	}
+	require.NotEmpty(t, retryToken)
+	require.NoError(t, ds.MarkEventDispatched(ctx, earlier.ID, retryToken))
+
+	released, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	require.NoError(t, err)
+	assert.True(t, containsEventID(released, later.EventID),
+		"once its predecessor reaches a terminal state the successor must become claimable, or the key stalls forever")
+}
+
+// TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB pins the
+// deliberate trade inside the ORD-01 predicate.
+//
+// The blocking set is pending and processing ONLY. A row that has spent its retry budget
+// (failed) or been preserved on its dead-letter topic (dead_lettered) does NOT hold its
+// key back. Strict ordering would demand that it did — but then a single permanently
+// undeliverable event would stall every subsequent event for that aggregate
+// indefinitely, which is a worse failure than a gap. That trade is asserted here so it
+// cannot be "tightened" into a stall by someone who reads the predicate and assumes the
+// narrower state list was an oversight.
+func TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("nostall")
+	quiesceEventOutbox(t, ds, marker)
+
+	base := dbTimestamp(time.Now().Add(-time.Hour))
+	sharedKey := marker + "stall-key"
+
+	doomed := newEventOutboxFixture(marker)
+	doomed.PartitionKey = sharedKey
+	doomed.OccurredAt = base
+	doomed.MaxAttempts = 1
+	insertRealEventOutbox(t, ds, doomed)
+
+	successor := newEventOutboxFixture(marker)
+	successor.PartitionKey = sharedKey
+	successor.OccurredAt = base.Add(time.Minute)
+	insertRealEventOutbox(t, ds, successor)
+
+	token := claimEventOutboxToken(t, ds, doomed)
+	outcome, err := ds.MarkEventFailed(ctx, doomed.ID, token, "permanently undeliverable", 0)
+	require.NoError(t, err)
+	require.True(t, outcome.Exhausted, "a one-attempt budget is spent by its first failure")
+
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	require.NoError(t, err)
+	assert.False(t, containsEventID(claimed, doomed.EventID),
+		"a failed row is out of the claimable set: it belongs to the dead-letter path")
+	assert.True(t, containsEventID(claimed, successor.EventID),
+		"a failed predecessor must NOT stall its key: one undeliverable event stalling an aggregate forever is worse than a gap in its sequence")
 }
 
 // TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB is the FOR UPDATE SKIP
@@ -3070,6 +3842,87 @@ func TestClaimPendingEventOutbox_ReclaimsAfterLockExpiry_RealDB(t *testing.T) {
 		"an expired lease on a processing row must make it claimable again; this is what stops a relay crash from stranding in-flight events forever")
 }
 
+// TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB is the STATE-01
+// scenario end to end, against real SQL, and it is the test that proves the claim token
+// does the job the lease alone could not.
+//
+// # The scenario, and what used to happen
+//
+// Relay A claims a row. A stalls — a long GC pause, a paused container, a network
+// partition — and its lease expires. Relay B reclaims the row and publishes the event
+// successfully. A then wakes up, still holding its own in-memory copy of the row, and
+// records the outcome of ITS attempt.
+//
+// When transitions matched on row id alone, A's write LANDED. Three things followed, and
+// every one of them was silent: A could mark the row failed and increment attempts,
+// double-spending a budget B had already used; A could mark it dispatched over the top of
+// a state B had moved on from; and A could move a terminal row back out of its terminal
+// state entirely. Nothing errored, and nothing in the row afterwards recorded that two
+// workers had written to it.
+//
+// The token closes it. A holds the token from ITS claim; B's reclaim issued a new one; so
+// every transition A attempts matches no row and is reported as a lost claim. A learns to
+// stop, which is the correct behaviour and the one the old code made impossible.
+func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("stale")
+	quiesceEventOutbox(t, ds, marker)
+
+	entry := newEventOutboxFixture(marker)
+	insertRealEventOutbox(t, ds, entry)
+
+	// Relay A claims and holds a token.
+	staleToken := claimEventOutboxToken(t, ds, entry)
+
+	// A stalls; its lease expires on the database clock.
+	_, err := ds.Conn.ExecContext(ctx,
+		"UPDATE blnk.event_outbox SET locked_until = NOW() - interval '1 minute' WHERE id = $1", entry.ID)
+	require.NoError(t, err)
+
+	// Relay B reclaims and gets its OWN token.
+	liveToken := claimEventOutboxToken(t, ds, entry)
+	require.NotEqual(t, staleToken, liveToken,
+		"a reclaim must issue a new token, or the stale holder's token would still authorise writes")
+
+	// Everything relay A now attempts must be refused.
+	t.Run("stale dispatch is refused", func(t *testing.T) {
+		requireAPIError(t, ds.MarkEventDispatched(ctx, entry.ID, staleToken), apierror.ErrConflict)
+	})
+	t.Run("stale failure is refused and does not spend the budget", func(t *testing.T) {
+		_, failErr := ds.MarkEventFailed(ctx, entry.ID, staleToken, "stale attempt", 0)
+		requireAPIError(t, failErr, apierror.ErrConflict)
+
+		got, getErr := ds.GetEventByID(ctx, entry.EventID)
+		require.NoError(t, getErr)
+		assert.Equal(t, 0, got.Attempts,
+			"a stale worker must not be able to spend an attempt: that is how a five-attempt budget got consumed at twice the intended rate")
+		assert.Equal(t, model.EventOutboxStatusProcessing, got.Status,
+			"the row must remain exactly as the live holder left it")
+	})
+	t.Run("stale dead-letter is refused", func(t *testing.T) {
+		requireAPIError(t, ds.MarkEventDeadLettered(ctx, entry.ID, staleToken,
+			entry.Topic+".dlt", json.RawMessage(`{"attempt_count":1}`)), apierror.ErrConflict)
+	})
+	t.Run("stale webhook marker is refused", func(t *testing.T) {
+		requireAPIError(t, ds.MarkWebhookDispatched(ctx, entry.ID, staleToken), apierror.ErrConflict)
+
+		got, getErr := ds.GetEventByID(ctx, entry.EventID)
+		require.NoError(t, getErr)
+		assert.False(t, got.WebhookDispatched,
+			"a stale worker must not be able to record a webhook leg the live holder has not sent")
+	})
+
+	// And the LIVE holder is unaffected throughout.
+	require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, liveToken),
+		"the live claim holder must still be able to complete its work")
+
+	final, err := ds.GetEventByID(ctx, entry.EventID)
+	require.NoError(t, err)
+	assert.Equal(t, model.EventOutboxStatusDispatched, final.Status)
+	assert.Equal(t, 0, final.Attempts, "no attempt was ever legitimately recorded against this row")
+}
+
 // TestClaimPendingEventOutbox_SkipsRowsAtMaxAttempts_RealDB asserts the retry budget is
 // honoured by the claim predicate.
 //
@@ -3139,13 +3992,25 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, containsEventID(claimed, entry.EventID))
 
-		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID))
+		var token string
+		for _, row := range claimed {
+			if row.EventID == entry.EventID {
+				token = row.ClaimToken
+			}
+		}
+		require.NotEmpty(t, token, "the claim must issue a token, or no transition can be authorised")
+
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token))
 
 		got, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
 		assert.Equal(t, model.EventOutboxStatusDispatched, got.Status)
 		require.NotNil(t, got.DispatchedAt, "dispatched_at must be stamped")
 		assert.Nil(t, got.LockedUntil, "the lease must be released")
+		assert.Empty(t, got.ClaimToken, "a terminal state releases the claim token")
+
+		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, token),
+			"replaying the same transition with the same token must be refused: the row is terminal and the token has been released")
 
 		again, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
 		require.NoError(t, err)
@@ -3158,16 +4023,20 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		entry.MaxAttempts = 3
 		insertRealEventOutbox(t, ds, entry)
 
-		claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
-		require.NoError(t, err)
-		require.True(t, containsEventID(claimed, entry.EventID))
+		token := claimEventOutboxToken(t, ds, entry)
 
-		require.NoError(t, ds.MarkEventFailed(ctx, entry.ID, "broker unavailable"))
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "broker unavailable", 0)
+		require.NoError(t, err)
+		assert.False(t, outcome.Exhausted, "one of three attempts is not exhaustion")
+		assert.Equal(t, model.EventOutboxStatusPending, outcome.Status)
+		assert.Equal(t, 1, outcome.Attempts)
 
 		got, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
 		assert.Equal(t, model.EventOutboxStatusPending, got.Status,
 			"a failure within budget must return the row to pending")
+		assert.Empty(t, got.ClaimToken,
+			"the retry arm must release the claim, or the row cannot be re-claimed")
 		assert.Equal(t, 1, got.Attempts)
 		assert.Equal(t, "broker unavailable", got.LastError)
 		assert.Nil(t, got.LockedUntil, "the lease must be released so the retry is actually picked up")
@@ -3179,6 +4048,77 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		assert.True(t, containsEventID(reclaimed, entry.EventID), "a retryable row must be reclaimable")
 	})
 
+	t.Run("a row inside its backoff window is not claimed until it is due", func(t *testing.T) {
+		// This is the DURABLE half of the configured exponential backoff, and it is a
+		// property of the claim rather than of the relay. Releasing the lease is not
+		// enough: at a 1-second poll interval a released row is retried on the very next
+		// lap, so the configured 1s/2s/4s/8s/16s schedule collapses into roughly five
+		// seconds of consecutive attempts against a broker that has barely begun to fail.
+		//
+		// Sleeping the delay in the relay is worse than no backoff at all: the schedule
+		// sums to 31 seconds, which OUTLIVES the 30-second lease, so a second instance
+		// reclaims the row mid-sleep and publishes the event twice.
+		entry := newEventOutboxFixture(marker)
+		entry.MaxAttempts = 3
+		insertRealEventOutbox(t, ds, entry)
+
+		token := claimEventOutboxToken(t, ds, entry)
+
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "broker unavailable", time.Hour)
+		require.NoError(t, err)
+		require.False(t, outcome.Exhausted)
+		require.Equal(t, model.EventOutboxStatusPending, outcome.Status)
+
+		got, err := ds.GetEventByID(ctx, entry.EventID)
+		require.NoError(t, err)
+		assert.Nil(t, got.LockedUntil,
+			"the lease is still released: it answers a different question from the due instant")
+		assert.True(t, got.NextAttemptAt.After(time.Now().Add(30*time.Minute)),
+			"the due instant must be advanced by the caller's delay, got %s", got.NextAttemptAt)
+
+		notDue, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+		require.NoError(t, err)
+		assert.False(t, containsEventID(notDue, entry.EventID),
+			"a pending, unleased row that is not yet DUE must not be claimed — that is the whole backoff")
+
+		// Bring the due instant into the past exactly as the passage of time would, and the
+		// same row becomes claimable with nothing else changed. Without this half the test
+		// would pass just as well against a row that had been made permanently unclaimable.
+		_, err = ds.Conn.ExecContext(ctx,
+			`UPDATE blnk.event_outbox SET next_attempt_at = NOW() - interval '1 second' WHERE id = $1`,
+			entry.ID)
+		require.NoError(t, err)
+
+		due, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+		require.NoError(t, err)
+		assert.True(t, containsEventID(due, entry.EventID),
+			"once the due instant passes the row must be claimed again")
+	})
+
+	t.Run("an exhausted row keeps the due instant it already had", func(t *testing.T) {
+		// A row whose budget is spent is not waiting for anything. Advancing its due
+		// instant would read as though a retry were still coming, which is exactly the
+		// wrong thing to show an operator triaging a dead-letter backlog.
+		entry := newEventOutboxFixture(marker)
+		entry.MaxAttempts = 1
+		insertRealEventOutbox(t, ds, entry)
+
+		before, err := ds.GetEventByID(ctx, entry.EventID)
+		require.NoError(t, err)
+
+		token := claimEventOutboxToken(t, ds, entry)
+
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "gave up", time.Hour)
+		require.NoError(t, err)
+		require.True(t, outcome.Exhausted, "one of one attempt is exhaustion")
+
+		got, err := ds.GetEventByID(ctx, entry.EventID)
+		require.NoError(t, err)
+		assert.Equal(t, model.EventOutboxStatusFailed, got.Status)
+		assert.WithinDuration(t, before.NextAttemptAt, got.NextAttemptAt, time.Second,
+			"the exhaustion arm must leave next_attempt_at alone, however large the delay it was handed")
+	})
+
 	t.Run("first_attempted_at is pinned across retries while last_attempted_at moves", func(t *testing.T) {
 		// This is what bounds the retry window reported in the dead-letter failure
 		// metadata, and it is only observable across MORE THAN ONE attempt.
@@ -3186,13 +4126,24 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		entry.MaxAttempts = 5
 		insertRealEventOutbox(t, ds, entry)
 
-		require.NoError(t, ds.MarkEventFailed(ctx, entry.ID, "attempt one"))
+		firstToken := claimEventOutboxToken(t, ds, entry)
+		_, err := ds.MarkEventFailed(ctx, entry.ID, firstToken, "attempt one", 0)
+		require.NoError(t, err)
 		afterFirst, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
 		require.NotNil(t, afterFirst.FirstAttemptedAt)
 		require.NotNil(t, afterFirst.LastAttemptedAt)
 
-		require.NoError(t, ds.MarkEventFailed(ctx, entry.ID, "attempt two"))
+		// A SECOND claim, and therefore a second token. The first token is now stale,
+		// which is precisely the state a zombie worker would be in.
+		secondToken := claimEventOutboxToken(t, ds, entry)
+		require.NotEqual(t, firstToken, secondToken,
+			"each claim must issue its own token, or a stale worker's token would still authorise a write")
+		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, firstToken),
+			"the stale token from the previous claim must no longer authorise anything")
+
+		_, err = ds.MarkEventFailed(ctx, entry.ID, secondToken, "attempt two", 0)
+		require.NoError(t, err)
 		afterSecond, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
 		require.NotNil(t, afterSecond.FirstAttemptedAt)
@@ -3211,12 +4162,20 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		entry.MaxAttempts = 1
 		insertRealEventOutbox(t, ds, entry)
 
+		token := claimEventOutboxToken(t, ds, entry)
+
 		// attempts 0 + 1 >= max_attempts 1, so the exhaustion arm fires on the first
 		// failure. This is the CASE boundary, exercised against real SQL.
-		require.NoError(t, ds.MarkEventFailed(ctx, entry.ID, "final failure"))
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "final failure", 0)
+		require.NoError(t, err)
+		assert.True(t, outcome.Exhausted, "one of one attempt is exhaustion")
+		assert.Equal(t, token, outcome.ClaimToken,
+			"the exhaustion arm must hand the token on so the dead-letter step can be authorised")
 
 		failed, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
+		assert.Equal(t, token, failed.ClaimToken,
+			"the exhaustion arm must RETAIN the claim, so only this worker may dead-letter the row")
 		assert.Equal(t, model.EventOutboxStatusFailed, failed.Status,
 			"exhausting the budget produces failed; dead_lettered is claimed only once the event reaches its .dlt sibling")
 		assert.Equal(t, 1, failed.Attempts)
@@ -3245,7 +4204,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, entry.Topic+".dlt", metadata))
+		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt", metadata))
 
 		deadLettered, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
@@ -3255,19 +4214,82 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		require.NotNil(t, deadLettered.FailureMetadata)
 		assert.JSONEq(t, string(metadata), string(deadLettered.FailureMetadata),
 			"the failure metadata must round-trip: it is what the dead-letter inventory displays and what a replay reads its origin topic from")
+		assert.Empty(t, deadLettered.ClaimToken, "a terminal state releases the claim")
+
+		assert.Error(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt", metadata),
+			"a second dead-letter of the same row must be refused, or two workers each put a copy on the .dlt topic")
+	})
+
+	t.Run("a replay claims the row atomically and can be rolled back", func(t *testing.T) {
+		entry := newEventOutboxFixture(marker)
+		entry.MaxAttempts = 1
+		insertRealEventOutbox(t, ds, entry)
+
+		token := claimEventOutboxToken(t, ds, entry)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "gave up", 0)
+		require.NoError(t, err)
+		require.True(t, outcome.Exhausted)
+		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, outcome.ClaimToken,
+			entry.Topic+".dlt", json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":1}`)))
+
+		claimed, err := ds.ClaimEventForReplay(ctx, entry.EventID, time.Minute)
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		assert.Equal(t, model.EventOutboxStatusReplaying, claimed.Status)
+		require.NotEmpty(t, claimed.ClaimToken, "the replay claim must issue a token")
+
+		// THE POINT OF THE CLAIM: a second concurrent replay request finds nothing to
+		// claim, so it cannot publish a duplicate.
+		_, err = ds.ClaimEventForReplay(ctx, entry.EventID, time.Minute)
+		requireAPIError(t, err, apierror.ErrConflict)
+
+		// A replaying row is also out of the relay's reach, so the relay cannot publish
+		// it underneath the replay.
+		relayBatch, err := ds.ClaimPendingEventOutbox(ctx, 100, time.Minute)
+		require.NoError(t, err)
+		assert.False(t, containsEventID(relayBatch, entry.EventID),
+			"a replaying row must be outside the relay's claimable set")
+
+		require.NoError(t, ds.ReleaseEventReplay(ctx, claimed.ID, claimed.ClaimToken, "broker refused"))
+
+		released, err := ds.GetEventByID(ctx, entry.EventID)
+		require.NoError(t, err)
+		assert.Equal(t, model.EventOutboxStatusDeadLettered, released.Status,
+			"a failed replay must return the row to dead_lettered, or it loses its replayability")
+		assert.Equal(t, "broker refused", released.LastError)
+		assert.Empty(t, released.ClaimToken)
+
+		// And it is replayable again, which is the property the rollback exists for.
+		reclaimed, err := ds.ClaimEventForReplay(ctx, entry.EventID, time.Minute)
+		require.NoError(t, err)
+		require.NotNil(t, reclaimed)
+		require.NoError(t, ds.MarkEventDispatched(ctx, reclaimed.ID, reclaimed.ClaimToken))
+
+		done, err := ds.GetEventByID(ctx, entry.EventID)
+		require.NoError(t, err)
+		assert.Equal(t, model.EventOutboxStatusDispatched, done.Status,
+			"a successful replay reaches the same terminal success state an ordinary publish does")
+		assert.Equal(t, entry.Topic+".dlt", done.DLTTopic,
+			"the dead-letter history must be retained so the record of what went wrong is not erased")
 	})
 
 	t.Run("the dual-delivery flag is set independently of the relay state machine", func(t *testing.T) {
 		entry := newEventOutboxFixture(marker)
 		insertRealEventOutbox(t, ds, entry)
 
-		require.NoError(t, ds.MarkWebhookDispatched(ctx, entry.ID))
+		token := claimEventOutboxToken(t, ds, entry)
+		require.NoError(t, ds.MarkWebhookDispatched(ctx, entry.ID, token))
 
 		got, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
 		assert.True(t, got.WebhookDispatched, "the legacy webhook leg must be recorded")
-		assert.Equal(t, model.EventOutboxStatusPending, got.Status,
-			"the dual-delivery marker must not disturb the relay state machine: the Kafka leg owns status")
+		assert.Equal(t, model.EventOutboxStatusProcessing, got.Status,
+			"the dual-delivery marker must not disturb the relay state machine: the row stays as the claim left it")
+
+		require.NoError(t, ds.MarkWebhookDispatched(ctx, entry.ID, token),
+			"an honest re-call from the claim holder must be idempotent, not reported as a lost claim")
+		assert.Error(t, ds.MarkWebhookDispatched(ctx, entry.ID, "someone-elses-token"),
+			"a worker that does not hold the claim must not be able to record a webhook it never sent")
 	})
 }
 
@@ -3298,17 +4320,24 @@ func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testin
 		wantDeadLettered = 1
 	)
 
-	for i := 0; i < wantPending; i++ {
-		insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
-	}
+	// ORDER MATTERS HERE, and getting it wrong is subtle. Driving a row to a terminal
+	// state requires CLAIMING it first, and a claim takes a whole batch — so any row
+	// left pending when the dispatched and dead-lettered fixtures are claimed would be
+	// swept into processing along with them and would then be counted in the wrong
+	// bucket. The terminal fixtures are therefore created first, and the pending ones
+	// last, so nothing claims them.
 	for i := 0; i < wantDispatched; i++ {
 		entry := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
-		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID))
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, claimEventOutboxToken(t, ds, entry)))
 	}
 	for i := 0; i < wantDeadLettered; i++ {
 		entry := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
-		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, entry.Topic+".dlt",
+		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, claimEventOutboxToken(t, ds, entry),
+			entry.Topic+".dlt",
 			json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`)))
+	}
+	for i := 0; i < wantPending; i++ {
+		insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 	}
 
 	after, err := ds.CountEventOutboxByStatus(ctx)
@@ -3380,11 +4409,16 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// Seeded in bulk rather than through InsertEventOutbox: this test is about the query
 	// PLAN, not the insert path, and three thousand single-row round trips would cost
 	// seconds for no additional coverage.
+	// partition_key is DISTINCT per row, and deliberately so: the plan under test
+	// includes the earlier-same-key exclusion, and seeding one shared key would give the
+	// planner a wildly unrepresentative selectivity estimate for that subquery.
 	_, err := ds.Conn.ExecContext(ctx, `
 		INSERT INTO blnk.event_outbox
-			(event_id, event_type, aggregate_id, ledger_id, topic, payload, occurred_at, status, dispatched_at)
-		SELECT $1 || 'cold-' || g, 'transaction.applied', $1 || 'agg', $1 || 'ldg', 'blnk.transactions',
-		       '{"event":"transaction.applied","data":{}}'::jsonb, NOW() - (g || ' seconds')::interval,
+			(event_id, event_type, aggregate_id, partition_key, ledger_id, topic, payload, payload_raw, occurred_at, status, dispatched_at)
+		SELECT $1 || 'cold-' || g, 'transaction.applied', $1 || 'agg', $1 || 'key-' || g, $1 || 'ldg', 'blnk.transactions',
+		       '{"event":"transaction.applied","data":{}}'::jsonb,
+		       convert_to('{"event":"transaction.applied","data":{}}', 'UTF8'),
+		       NOW() - (g || ' seconds')::interval,
 		       'dispatched', NOW()
 		FROM generate_series(1, $2) g
 	`, marker, coldHistory)
@@ -3392,9 +4426,11 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 
 	_, err = ds.Conn.ExecContext(ctx, `
 		INSERT INTO blnk.event_outbox
-			(event_id, event_type, aggregate_id, ledger_id, topic, payload, occurred_at, status)
-		SELECT $1 || 'warm-' || g, 'transaction.applied', $1 || 'agg', $1 || 'ldg', 'blnk.transactions',
-		       '{"event":"transaction.applied","data":{}}'::jsonb, NOW() - (g || ' seconds')::interval,
+			(event_id, event_type, aggregate_id, partition_key, ledger_id, topic, payload, payload_raw, occurred_at, status)
+		SELECT $1 || 'warm-' || g, 'transaction.applied', $1 || 'agg', $1 || 'key-w' || g, $1 || 'ldg', 'blnk.transactions',
+		       '{"event":"transaction.applied","data":{}}'::jsonb,
+		       convert_to('{"event":"transaction.applied","data":{}}', 'UTF8'),
+		       NOW() - (g || ' seconds')::interval,
 		       'pending'
 		FROM generate_series(1, $2) g
 	`, marker, claimableRows)
@@ -3418,7 +4454,7 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// takes no leases and mutates nothing — which matters here, because executing this
 	// particular statement would move rows into processing as a side effect.
 	rows, err := ds.Conn.QueryContext(ctx, "EXPLAIN "+claimPendingEventOutboxQuery,
-		model.EventOutboxStatusProcessing, (5 * time.Minute).String(), 100)
+		model.EventOutboxStatusProcessing, (5 * time.Minute).String(), uuid.NewString(), 100)
 	require.NoError(t, err, "EXPLAIN of the claim query must succeed")
 	defer func() { _ = rows.Close() }()
 
@@ -3436,6 +4472,9 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 
 	assert.Contains(t, planText, "idx_event_outbox_claim",
 		"the claim must be driven by idx_event_outbox_claim. Its partial predicate is what confines the scan to the claimable working set and keeps the cold history out of the index entirely; without it the relay's per-poll cost grows with the table until it cannot keep up with 500 events/sec, and no unit test would ever reveal it.\nPlan was:\n"+planText)
+
+	assert.Contains(t, planText, "idx_event_outbox_partition_key_inflight",
+		"the earlier-same-key exclusion must be driven by idx_event_outbox_partition_key_inflight. That subquery runs ONCE PER CANDIDATE ROW, so without the index the ordering guarantee is bought at the price of scanning each key's entire history on every poll — correct, and progressively unable to keep up.\nPlan was:\n"+planText)
 
 	assert.NotContains(t, planText, "Seq Scan on event_outbox",
 		"the claim must not sequentially scan blnk.event_outbox.\nPlan was:\n"+planText)
@@ -3480,7 +4519,7 @@ func TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB(t *tes
 
 		mine := make([]string, 0, batchSize)
 		for _, entry := range claimed {
-			if strings.HasPrefix(entry.EventID, marker) {
+			if isMarkedEventOutbox(entry, marker) {
 				mine = append(mine, entry.EventID)
 			}
 		}
@@ -3492,8 +4531,8 @@ func TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB(t *tes
 		// Retire the batch so the next poll sees the remainder, exactly as the relay
 		// does once the broker acknowledges.
 		for _, entry := range claimed {
-			if strings.HasPrefix(entry.EventID, marker) {
-				require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID))
+			if isMarkedEventOutbox(entry, marker) {
+				require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, entry.ClaimToken))
 			}
 		}
 	}
@@ -3522,7 +4561,8 @@ func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
 		entry := newEventOutboxFixture(marker)
 		entry.OccurredAt = base.Add(time.Duration(i) * time.Second)
 		insertRealEventOutbox(t, ds, entry)
-		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, entry.Topic+".dlt",
+		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, claimEventOutboxToken(t, ds, entry),
+			entry.Topic+".dlt",
 			json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`)))
 		oldestFirst = append(oldestFirst, entry.EventID)
 	}
@@ -3537,7 +4577,7 @@ func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
 	mineFrom := func(entries []model.EventOutbox) []string {
 		mine := make([]string, 0, len(entries))
 		for _, entry := range entries {
-			if strings.HasPrefix(entry.EventID, marker) {
+			if isMarkedEventOutbox(entry, marker) {
 				mine = append(mine, entry.EventID)
 			}
 		}
@@ -3563,5 +4603,566 @@ func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
 	for _, eventID := range oldestFirst {
 		assert.Equal(t, 1, seen[eventID],
 			"event %s appeared %d times across the pages; a non-deterministic tie-break makes an operator skip or repeat events", eventID, seen[eventID])
+	}
+}
+
+// ===========================================================================
+// Subscriber registry — SEC-04, SEC-03, SSRF-01, SECRET-01, AUTH-01, RETAIN-01
+//
+// These live in this file rather than beside database/event_subscriber.go because
+// there is no database/event_subscriber_test.go in this checkpoint's scope. They are
+// in the same package, so the unexported validators are reachable, and the subject
+// they guard — the event-outbox and subscriber repositories — is this file's subject.
+// ===========================================================================
+
+// canonicalSubscriber returns a registry row whose identity is derived correctly, so
+// that each test below mutates exactly one thing and the failure is unambiguous.
+func canonicalSubscriber(t *testing.T) *model.EventSubscriber {
+	t.Helper()
+
+	principal, err := model.CanonicalKafkaPrincipal("acme_prod")
+	require.NoError(t, err)
+	group, err := model.CanonicalConsumerGroupID("acme_prod")
+	require.NoError(t, err)
+
+	return &model.EventSubscriber{
+		SubscriberID:     "acme_prod",
+		Name:             "Acme production",
+		KafkaPrincipal:   principal,
+		ConsumerGroupID:  group,
+		AuthorizedTopics: []string{"blnk.transactions"},
+	}
+}
+
+// TestRequireSubscriberFields_DerivesTheIdentityAndRefusesASuppliedOne is the SEC-04
+// guard at the persistence boundary.
+//
+// The principal is what every ACL binding is granted TO and the consumer group is
+// what the group binding is granted OVER, so a row that stores a principal not
+// derived from its subscriber ID means the boundary provisioned is not the boundary
+// the registry appears to describe — and it fails silently, because both the row and
+// the resulting ACL look internally consistent.
+func TestRequireSubscriberFields_DerivesTheIdentityAndRefusesASuppliedOne(t *testing.T) {
+	t.Run("derives principal and group when neither is supplied", func(t *testing.T) {
+		subscriber := &model.EventSubscriber{SubscriberID: "acme_prod", Name: "Acme"}
+		require.NoError(t, requireSubscriberFields(subscriber))
+
+		assert.Equal(t, "blnk-sub-acme_prod", subscriber.KafkaPrincipal)
+		assert.Equal(t, "blnk-sub-acme_prod.default", subscriber.ConsumerGroupID)
+	})
+
+	t.Run("accepts a supplied principal that matches the derivation", func(t *testing.T) {
+		assert.NoError(t, requireSubscriberFields(canonicalSubscriber(t)))
+	})
+
+	t.Run("refuses a foreign principal", func(t *testing.T) {
+		subscriber := canonicalSubscriber(t)
+		subscriber.KafkaPrincipal = "blnk-sub-victim"
+		requireAPIError(t, requireSubscriberFields(subscriber), apierror.ErrInvalidInput)
+	})
+
+	t.Run("refuses the administrative principal", func(t *testing.T) {
+		subscriber := canonicalSubscriber(t)
+		subscriber.KafkaPrincipal = "admin"
+		requireAPIError(t, requireSubscriberFields(subscriber), apierror.ErrInvalidInput)
+	})
+
+	t.Run("refuses a principal differing only in case", func(t *testing.T) {
+		// Kafka compares principals byte-for-byte, so this is a DIFFERENT principal
+		// that reads as the same subscriber to every human who sees it.
+		subscriber := canonicalSubscriber(t)
+		subscriber.KafkaPrincipal = "BLNK-SUB-ACME_PROD"
+		requireAPIError(t, requireSubscriberFields(subscriber), apierror.ErrInvalidInput)
+	})
+
+	t.Run("refuses a principal differing only by whitespace", func(t *testing.T) {
+		// The comparison is EXACT rather than trimmed: a trimmed comparison would
+		// accept this and then store the untrimmed value, so the ACL would name a
+		// principal indistinguishable from the intended one in every log line.
+		subscriber := canonicalSubscriber(t)
+		subscriber.KafkaPrincipal = " blnk-sub-acme_prod"
+		requireAPIError(t, requireSubscriberFields(subscriber), apierror.ErrInvalidInput)
+	})
+
+	t.Run("refuses a group outside the derived namespace", func(t *testing.T) {
+		subscriber := canonicalSubscriber(t)
+		subscriber.ConsumerGroupID = "blnk-sub-victim.default"
+		requireAPIError(t, requireSubscriberFields(subscriber), apierror.ErrInvalidInput)
+	})
+
+	t.Run("refuses an adjacent-namespace group", func(t *testing.T) {
+		// The terminator is the disjointness guarantee: a PREFIXED grant on
+		// "blnk-sub-acme_prod" without it would also cover "blnk-sub-acme_production".
+		subscriber := canonicalSubscriber(t)
+		subscriber.ConsumerGroupID = "blnk-sub-acme_production.default"
+		requireAPIError(t, requireSubscriberFields(subscriber), apierror.ErrInvalidInput)
+	})
+
+	t.Run("refuses the bare namespace as a group", func(t *testing.T) {
+		// A PREFIXED ACL over the namespace itself grants the namespace rather than a
+		// group inside it.
+		subscriber := canonicalSubscriber(t)
+		subscriber.ConsumerGroupID = "blnk-sub-acme_prod."
+		requireAPIError(t, requireSubscriberFields(subscriber), apierror.ErrInvalidInput)
+	})
+
+	nonCanonical := map[string]string{
+		"uppercase":          "Acme_Prod",
+		"leading whitespace": " acme_prod",
+		"a wildcard":         "acme*",
+		"a control byte":     "acme\nprod",
+		"too short":          "ac",
+		"a colon":            "acme:prod",
+	}
+	for name, identifier := range nonCanonical {
+		t.Run("refuses a "+name+" identifier", func(t *testing.T) {
+			subscriber := &model.EventSubscriber{SubscriberID: identifier, Name: "Acme"}
+			requireAPIError(t, requireSubscriberFields(subscriber), apierror.ErrInvalidInput)
+		})
+	}
+}
+
+// TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist is SEC-03 at the
+// persistence boundary.
+//
+// The check is here as well as in the provisioning path because the ROW OUTLIVES ANY
+// SINGLE REQUEST: a topic accepted now is granted at the next issuance, whichever
+// code path performs it.
+func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.T) {
+	assert.NoError(t, requireGrantableTopics(nil),
+		"an empty grant is the fail-closed default of a fresh registration")
+	assert.NoError(t, requireGrantableTopics(model.SubscriberGrantableTopics(expectedEventTopicPrefix())),
+		"the composed grantable list must itself be accepted, or two layers disagree")
+
+	refused := map[string]string{
+		"the any-resource wildcard": "*",
+		"a wildcarded category":     "blnk.*",
+		"a foreign topic":           "attacker.transactions",
+		"a dead-letter topic":       "blnk.transactions.dlt",
+		"the system category":       "blnk.system",
+		"the quarantine category":   "blnk.quarantine",
+	}
+	for name, topic := range refused {
+		t.Run("refuses "+name, func(t *testing.T) {
+			requireAPIError(t, requireGrantableTopics([]string{topic}), apierror.ErrInvalidInput)
+		})
+	}
+
+	t.Run("refuses an offending topic in any position", func(t *testing.T) {
+		requireAPIError(t,
+			requireGrantableTopics([]string{"blnk.transactions", "blnk.transactions.dlt"}),
+			apierror.ErrInvalidInput)
+	})
+
+	t.Run("the persistence allowlist matches the model allowlist exactly", func(t *testing.T) {
+		// One answer to "which topics may a subscriber be granted?", checked rather
+		// than assumed: drift between layers means a topic one refuses and another
+		// grants.
+		prefixes := grantableTopicPrefixes()
+		composed := model.SubscriberGrantableTopics(expectedEventTopicPrefix())
+
+		assert.Len(t, prefixes, len(composed))
+		for _, topic := range composed {
+			_, present := prefixes[topic]
+			assert.True(t, present, "%q is grantable per model but absent here", topic)
+		}
+	})
+}
+
+// TestRequireSafeWebhookURL_AppliesTheDestinationPolicy is SSRF-01 at the persistence
+// boundary, so a URL arriving by a path that skipped the DTO is still refused.
+func TestRequireSafeWebhookURL_AppliesTheDestinationPolicy(t *testing.T) {
+	// The parameter is *string because the column is nullable and a nil pointer means
+	// "no URL recorded", which is different from a URL that is present and empty.
+	safeURL := func(raw string) *string { return &raw }
+
+	assert.NoError(t, requireSafeWebhookURL(nil), "no URL recorded is legitimate")
+	assert.NoError(t, requireSafeWebhookURL(safeURL("")), "a present empty URL clears the record")
+	assert.NoError(t, requireSafeWebhookURL(safeURL("https://hooks.example.com/blnk")))
+
+	refused := map[string]string{
+		"plaintext http":          "http://hooks.example.com/blnk",
+		"a file URL":              "file:///etc/passwd",
+		"loopback":                "https://127.0.0.1/blnk",
+		"localhost":               "https://localhost/blnk",
+		"IPv4-mapped loopback":    "https://[::ffff:127.0.0.1]/blnk",
+		"cloud metadata":          "https://169.254.169.254/latest/meta-data/",
+		"a private address":       "https://10.0.0.7:9092/blnk",
+		"an internal zone name":   "https://metadata.google.internal/blnk",
+		"an unqualified hostname": "https://postgres/blnk",
+	}
+	for name, raw := range refused {
+		t.Run("refuses "+name, func(t *testing.T) {
+			requireAPIError(t, requireSafeWebhookURL(safeURL(raw)), apierror.ErrInvalidInput)
+		})
+	}
+
+	t.Run("is applied through requireSubscriberFields", func(t *testing.T) {
+		// The policy is worthless if the write path does not consult it.
+		internal := "https://169.254.169.254/latest/meta-data/"
+		subscriber := canonicalSubscriber(t)
+		subscriber.WebhookURL = &internal
+		requireAPIError(t, requireSubscriberFields(subscriber), apierror.ErrInvalidInput)
+	})
+}
+
+// TestRecordSubscriberCredential_RefusesAnythingThatIsNotADerivedReference is the
+// SECRET-01 guard.
+//
+// The column must never hold a value anyone could authenticate with, and the guard is
+// structural rather than advisory: a plaintext secret is refused even though it is a
+// perfectly valid TEXT value.
+func TestRecordSubscriberCredential_RefusesAnythingThatIsNotADerivedReference(t *testing.T) {
+	db, mock := newSQLMock(t)
+	source := Datasource{Conn: db}
+
+	// An empty value is caught earlier, by the required-field guard, which reports
+	// ErrBadRequest; everything else reaches the reference-shape guard and reports
+	// ErrInvalidInput. Both are 400, and each case names the code its own path returns
+	// rather than asserting a single code that would hide which guard actually fired.
+	notReferences := map[string]struct {
+		value string
+		code  apierror.ErrorCode
+	}{
+		"a plaintext secret":     {"S3cret-Password-Not-A-Reference", apierror.ErrInvalidInput},
+		"an empty value":         {"", apierror.ErrBadRequest},
+		"a bare digest":          {strings.Repeat("a", 64), apierror.ErrInvalidInput},
+		"a wrong scheme":         {"bcrypt$" + strings.Repeat("a", 64), apierror.ErrInvalidInput},
+		"a non-hex digest":       {"blnkcred$" + strings.Repeat("z", 64), apierror.ErrInvalidInput},
+		"a truncated digest":     {"blnkcred$" + strings.Repeat("a", 10), apierror.ErrInvalidInput},
+		"a reference with space": {"blnkcred$ " + strings.Repeat("a", 63), apierror.ErrInvalidInput},
+	}
+
+	for name, expectation := range notReferences {
+		t.Run("refuses "+name, func(t *testing.T) {
+			value := expectation.value
+			err := source.RecordSubscriberCredential(context.Background(), "acme_prod", value, time.Now())
+			requireAPIError(t, err, expectation.code)
+
+			// The offending value must not be echoed: a caller who passed a secret
+			// here by mistake must not have it copied into an error or a log line.
+			if value != "" {
+				assert.NotContains(t, err.Error(), value,
+					"the rejected value must never appear in the error")
+			}
+		})
+	}
+
+	// Nothing reached the database: the guard runs before any statement.
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace is the AUTH-01 guard.
+//
+// Issuance is not idempotent — each call mints a new secret and the broker keeps only
+// the last one written — so two concurrent issuances would otherwise both return 200
+// with a password in the body, one of which authenticates against nothing.
+func TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace(t *testing.T) {
+	reference, err := model.DeriveCredentialReference("blnk-sub-acme_prod", "the-new-secret")
+	require.NoError(t, err)
+	previous, err := model.DeriveCredentialReference("blnk-sub-acme_prod", "the-previous-secret")
+	require.NoError(t, err)
+
+	t.Run("succeeds while the expected reference still stands", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("UPDATE blnk.event_subscribers").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		require.NoError(t, source.RecordSubscriberCredentialIfUnchanged(
+			context.Background(), "acme_prod", &previous, reference, time.Now()))
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("requires no credential when expected is nil", func(t *testing.T) {
+		// A separate arm, because `credential_reference = NULL` is never true in SQL:
+		// folding the two into one predicate would make an empty-string reference
+		// collide with the no-credential case.
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("credential_reference IS NULL").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		require.NoError(t, source.RecordSubscriberCredentialIfUnchanged(
+			context.Background(), "acme_prod", nil, reference, time.Now()))
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("returns a conflict when the reference moved under it", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		// No row matched...
+		mock.ExpectExec("UPDATE blnk.event_subscribers").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		// ...and the subscriber does exist, so this is a race and not a 404.
+		mock.ExpectQuery("SELECT").WillReturnRows(
+			sqlmock.NewRows(strings.Split(eventSubscriberColumns, ", ")).
+				AddRow(int64(1), "acme_prod", "Acme", "blnk-sub-acme_prod",
+					"blnk-sub-acme_prod.default", pq.Array([]string{"blnk.transactions"}),
+					nil, previous, time.Now(), nil, nil, time.Now(), time.Now()))
+
+		err := source.RecordSubscriberCredentialIfUnchanged(
+			context.Background(), "acme_prod", &previous, reference, time.Now())
+		requireAPIError(t, err, apierror.ErrConflict)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("reports not-found rather than a conflict for a missing subscriber", func(t *testing.T) {
+		// Reporting a conflict here would send an operator looking for a race that
+		// did not happen.
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("UPDATE blnk.event_subscribers").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery("SELECT").WillReturnError(sql.ErrNoRows)
+
+		err := source.RecordSubscriberCredentialIfUnchanged(
+			context.Background(), "acme_prod", &previous, reference, time.Now())
+		requireAPIError(t, err, apierror.ErrSubscriberNotFound)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("refuses a value that is not a derived reference", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		err := source.RecordSubscriberCredentialIfUnchanged(
+			context.Background(), "acme_prod", nil, "S3cret-Password", time.Now())
+		requireAPIError(t, err, apierror.ErrInvalidInput)
+		assert.NotContains(t, err.Error(), "S3cret")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+// TestClearSubscriberCredential_NullsBothHalvesTogether is the compensating half of
+// an issuance: revocation happens at the broker, and this is what stops the registry
+// from continuing to claim a credential that no longer exists.
+func TestClearSubscriberCredential_NullsBothHalvesTogether(t *testing.T) {
+	t.Run("clears the reference and the issuance instant", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		// Both columns in one statement, because together they are one issuance
+		// record: a reference without a timestamp cannot be audited, and a timestamp
+		// without a reference asserts an issuance it cannot identify.
+		mock.ExpectExec("credential_reference = NULL").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		require.NoError(t, source.ClearSubscriberCredential(context.Background(), "acme_prod"))
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("reports not-found for a missing subscriber", func(t *testing.T) {
+		// Succeeding silently would let a caller believe it cleaned up a row that
+		// does not exist.
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("UPDATE blnk.event_subscribers").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+
+		requireAPIError(t,
+			source.ClearSubscriberCredential(context.Background(), "acme_prod"),
+			apierror.ErrSubscriberNotFound)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("requires a subscriber ID", func(t *testing.T) {
+		db, _ := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		// ErrBadRequest is the code the shared required-field guard uses; both it and
+		// ErrInvalidInput are 400, and this asserts the one this path actually takes.
+		requireAPIError(t,
+			source.ClearSubscriberCredential(context.Background(), "  "),
+			apierror.ErrBadRequest)
+	})
+}
+
+// TestTakeEventSubscriber_ReturnsTheRowItDeleted is the AUTH-01 deletion-propagation
+// guard.
+//
+// Revoking at the broker needs the principal and the authorised topics, and those
+// exist only on the row being deleted. Returning it is what makes the revocation
+// target exactly what was removed, instead of a value read beforehand that may since
+// have changed.
+func TestTakeEventSubscriber_ReturnsTheRowItDeleted(t *testing.T) {
+	t.Run("hands back the principal and the grant", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectQuery("DELETE FROM blnk.event_subscribers").WillReturnRows(
+			sqlmock.NewRows(strings.Split(eventSubscriberColumns, ", ")).
+				AddRow(int64(7), "acme_prod", "Acme", "blnk-sub-acme_prod",
+					"blnk-sub-acme_prod.default",
+					pq.Array([]string{"blnk.transactions", "blnk.balances"}),
+					nil, nil, nil, nil, nil, time.Now(), time.Now()))
+
+		deleted, err := source.TakeEventSubscriber(context.Background(), "acme_prod")
+		require.NoError(t, err)
+		require.NotNil(t, deleted)
+
+		assert.Equal(t, "blnk-sub-acme_prod", deleted.KafkaPrincipal,
+			"the principal is what RevokeSubscriber needs")
+		assert.Equal(t, "blnk-sub-acme_prod.default", deleted.ConsumerGroupID)
+		assert.Equal(t, []string{"blnk.transactions", "blnk.balances"}, deleted.AuthorizedTopics,
+			"the topics are the bindings to remove")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("reports not-found rather than a nil row", func(t *testing.T) {
+		// "Already gone" and "just removed" must not be confusable, or a caller could
+		// skip the broker-side work by mistake.
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectQuery("DELETE FROM blnk.event_subscribers").WillReturnError(sql.ErrNoRows)
+
+		deleted, err := source.TakeEventSubscriber(context.Background(), "acme_prod")
+		assert.Nil(t, deleted)
+		requireAPIError(t, err, apierror.ErrSubscriberNotFound)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("does not leak driver detail on failure", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectQuery("DELETE FROM blnk.event_subscribers").WillReturnError(&pq.Error{
+			Code: "42P01", Message: "relation does not exist",
+			Schema: "blnk", Table: "event_subscribers", File: "namespace.c", Routine: "RangeVarGetRelid",
+		})
+
+		_, err := source.TakeEventSubscriber(context.Background(), "acme_prod")
+		requireAPIError(t, err, apierror.ErrInternalServer)
+		assertNoDatabaseDetailLeak(t, err)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+// TestPurgeMigratedSubscriberWebhookURLs_ExpiresTheDualRunArtefact is the RETAIN-01
+// guard.
+//
+// Once a subscriber has migrated, webhook_url holds a third party's endpoint with no
+// remaining purpose — retention without a reason, and a destination that becomes a
+// request Blnk makes the moment any sender is wired to it.
+func TestPurgeMigratedSubscriberWebhookURLs_ExpiresTheDualRunArtefact(t *testing.T) {
+	t.Run("nulls the URL of migrated subscribers before the cut-off", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("webhook_url = NULL").WillReturnResult(sqlmock.NewResult(0, 3))
+
+		purged, err := source.PurgeMigratedSubscriberWebhookURLs(
+			context.Background(), time.Now().Add(-24*time.Hour))
+		require.NoError(t, err)
+		assert.Equal(t, int64(3), purged)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("refuses a zero cut-off rather than purging everything", func(t *testing.T) {
+		// A zero-valued argument is far more often a bug than an intention.
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		purged, err := source.PurgeMigratedSubscriberWebhookURLs(context.Background(), time.Time{})
+		requireAPIError(t, err, apierror.ErrInvalidInput)
+		assert.Zero(t, purged)
+		assert.NoError(t, mock.ExpectationsWereMet(), "nothing may reach the database")
+	})
+
+	t.Run("purging nothing is a normal outcome", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("UPDATE blnk.event_subscribers").WillReturnResult(sqlmock.NewResult(0, 0))
+
+		purged, err := source.PurgeMigratedSubscriberWebhookURLs(context.Background(), time.Now())
+		require.NoError(t, err)
+		assert.Zero(t, purged)
+	})
+}
+
+// TestSubscriberRepository_DoesNotLeakDriverDetail is the DATA-01 guard for the
+// subscriber repository.
+//
+// A raw *pq.Error attached to APIError.Details serialises its Schema, Table, Column,
+// Constraint, File, Line and Routine straight into the response body, describing the
+// database's internal structure to any caller who can provoke an error.
+func TestSubscriberRepository_DoesNotLeakDriverDetail(t *testing.T) {
+	hostile := &pq.Error{
+		Severity: "ERROR", Code: "23505",
+		Message:    `duplicate key value violates unique constraint "event_subscribers_kafka_principal_uidx"`,
+		Schema:     "blnk",
+		Table:      "event_subscribers",
+		Column:     "kafka_principal",
+		Constraint: "event_subscribers_kafka_principal_uidx",
+		File:       "nbtinsert.c",
+		Line:       "666",
+		Routine:    "_bt_check_unique",
+	}
+
+	operations := map[string]func(Datasource) error{
+		"UpdateEventSubscriber": func(source Datasource) error {
+			return source.UpdateEventSubscriber(context.Background(), canonicalSubscriber(t))
+		},
+		"DeleteEventSubscriber": func(source Datasource) error {
+			return source.DeleteEventSubscriber(context.Background(), "acme_prod")
+		},
+		"ClearSubscriberCredential": func(source Datasource) error {
+			return source.ClearSubscriberCredential(context.Background(), "acme_prod")
+		},
+		"MarkSubscriberMigrated": func(source Datasource) error {
+			return source.MarkSubscriberMigrated(context.Background(), "acme_prod", time.Now())
+		},
+		"PurgeMigratedSubscriberWebhookURLs": func(source Datasource) error {
+			_, err := source.PurgeMigratedSubscriberWebhookURLs(context.Background(), time.Now())
+
+			return err
+		},
+	}
+
+	for name, operation := range operations {
+		t.Run(name, func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			source := Datasource{Conn: db}
+			mock.ExpectExec(".*").WillReturnError(hostile)
+
+			err := operation(source)
+			require.Error(t, err)
+			assertNoDatabaseDetailLeak(t, err)
+		})
+	}
+}
+
+// assertNoDatabaseDetailLeak proves an error carries none of the driver's structural
+// detail, checked through BOTH renderings a caller can reach: the error string, and
+// the JSON an API response is built from.
+//
+// Both are needed because they fail differently. A struct attached to Details is
+// invisible in %v — APIError.Error() prints only the code and message — and fully
+// visible once marshalled. Checking one alone would pass while the other leaked.
+func assertNoDatabaseDetailLeak(t *testing.T, err error) {
+	t.Helper()
+
+	rendered := err.Error()
+
+	var apiErr apierror.APIError
+	if errors.As(err, &apiErr) {
+		marshalled, marshalErr := json.Marshal(apiErr)
+		require.NoError(t, marshalErr)
+		rendered += " " + string(marshalled)
+	}
+
+	for _, forbidden := range []string{
+		"nbtinsert.c", "namespace.c", "_bt_check_unique", "RangeVarGetRelid",
+		"event_subscribers_kafka_principal_uidx", "666",
+	} {
+		assert.NotContains(t, rendered, forbidden,
+			"the driver's %q must not reach a caller; it belongs in the log", forbidden)
 	}
 }
