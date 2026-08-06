@@ -552,14 +552,18 @@ func NewKafkaAdmin(cnf *config.Configuration) (*KafkaAdminClient, error) {
 	if admin.replicationFactor < 1 {
 		// Reported here as well as rejected by EnsureTopics, so the misconfiguration is
 		// visible at start-up rather than only when a topic is first provisioned.
-		logrus.WithField("brokers", len(brokers)).Warn(
+		// broker_count, not brokers: the value is a COUNT, and a field named for the
+		// list would read as the endpoint list an operator could act on. The endpoints
+		// are deliberately not logged — see publisherAuthMode's note on why a broker
+		// address list is topology an error line does not need.
+		logrus.WithField("broker_count", len(brokers)).Warn(
 			"kafka admin: KAFKA_REPLICATION_FACTOR is not configured; topic creation will be refused until it is " +
 				"set (3 for a replicated production cluster, 1 for a single-broker stack)",
 		)
 	}
 
 	logrus.WithFields(logrus.Fields{
-		"brokers":            len(brokers),
+		"broker_count":       len(brokers),
 		"partitions":         admin.partitions,
 		"replication_factor": admin.replicationFactor,
 		"sasl":               transport.SASL != nil,
@@ -2214,8 +2218,8 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 
 	if len(topics) == 0 {
 		logrus.WithFields(logrus.Fields{
-			"principal":  principal,
-			"subscriber": result.SubscriberID,
+			"principal":  sanitizeLogValue(principal, maxLoggedFilterLength),
+			"subscriber": sanitizeLogValue(result.SubscriberID, maxLoggedFilterLength),
 		}).Warn(
 			"kafka admin: principal provisioned with no authorised topics, so it can read nothing. This is the " +
 				"fail-closed default of a newly registered subscriber; grant topics on the subscriber before " +
@@ -2225,8 +2229,8 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 
 	if groupPrefix == "" {
 		logrus.WithFields(logrus.Fields{
-			"principal":  principal,
-			"subscriber": result.SubscriberID,
+			"principal":  sanitizeLogValue(principal, maxLoggedFilterLength),
+			"subscriber": sanitizeLogValue(result.SubscriberID, maxLoggedFilterLength),
 		}).Warn(
 			"kafka admin: principal provisioned without a consumer group grant, so it cannot join a consumer " +
 				"group; set the subscriber's consumer group before issuing credentials",
@@ -2236,12 +2240,12 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 	result.ProvisionedAt = time.Now().UTC()
 
 	logrus.WithFields(logrus.Fields{
-		"subscriber":            result.SubscriberID,
-		"principal":             principal,
+		"subscriber":            sanitizeLogValue(result.SubscriberID, maxLoggedFilterLength),
+		"principal":             sanitizeLogValue(principal, maxLoggedFilterLength),
 		"mechanism":             SubscriberSASLMechanism,
 		"iterations":            iterations,
 		"topics":                len(topics),
-		"consumer_group_prefix": groupPrefix,
+		"consumer_group_prefix": sanitizeLogValue(groupPrefix, maxLoggedFilterLength),
 		"acl_bindings":          result.ACLBindings,
 		"credential_replaced":   result.CredentialReplaced,
 		"authorizer_active":     result.AuthorizerActive,
@@ -3656,8 +3660,8 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 	topics := normalizeTopicList(req.Topics)
 	if len(topics) == 0 {
 		logrus.WithFields(logrus.Fields{
-			"subscriber": report.SubscriberID,
-			"group":      report.GroupID,
+			"subscriber": sanitizeLogValue(report.SubscriberID, maxLoggedFilterLength),
+			"group":      sanitizeLogValue(report.GroupID, maxLoggedFilterLength),
 		}).Debug("kafka admin: no topics to measure consumer lag for")
 
 		return report, nil
@@ -3678,8 +3682,8 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 
 	if len(report.MissingTopics) > 0 {
 		logrus.WithFields(logrus.Fields{
-			"subscriber": report.SubscriberID,
-			"group":      report.GroupID,
+			"subscriber": sanitizeLogValue(report.SubscriberID, maxLoggedFilterLength),
+			"group":      sanitizeLogValue(report.GroupID, maxLoggedFilterLength),
 			"topics":     report.MissingTopics,
 		}).Warn("kafka admin: consumer lag was requested for topics that do not exist; they contribute no lag")
 	}
@@ -3727,8 +3731,8 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 	}
 
 	logrus.WithFields(logrus.Fields{
-		"subscriber": report.SubscriberID,
-		"group":      report.GroupID,
+		"subscriber": sanitizeLogValue(report.SubscriberID, maxLoggedFilterLength),
+		"group":      sanitizeLogValue(report.GroupID, maxLoggedFilterLength),
 		"topics":     len(report.Topics),
 		"total_lag":  report.TotalLag,
 	}).Debug("kafka admin: consumer lag measured")
@@ -3871,12 +3875,30 @@ func committedOffsetFor(committed map[string]map[int]int64, topic string, partit
 // — are the labels the alert rule's description interpolates, so they are fixed by that
 // contract rather than free.
 //
+// # Every label value is bounded here, at the last possible moment
+//
+// All three attribute values pass through a resolver that either recognises the value or
+// substitutes a fixed token. This is the THIRD enforcement of the identifier contract —
+// the repository validates before a write and the schema asserts a CHECK constraint — and
+// it is the only one that covers a value which never came from the registry at all. An
+// operator's ad-hoc lag query, a group id read back from the broker, or a future caller
+// assembling a ConsumerLagRequest by hand all arrive here without having passed either of
+// the other two gates.
+//
+// Two things would go wrong without it, and neither would fail loudly. A group named for
+// its owner would export a customer's name into the monitoring system's retention, onto
+// dashboards and into alert notifications. And because this is a GAUGE that a periodic
+// collector re-records on every cycle, each distinct label tuple is a series held for as
+// long as it is fed, so an unbounded value would make the series count a function of what
+// callers send rather than of how many subscribers are registered.
+//
 // The nil guard costs nothing and keeps a measurement path from panicking a ledger
 // process in a build where the instruments were never created.
 //
 // Parameters:
 //   - ctx context.Context: carries the metric's exemplar context.
-//   - subscriber, group, topic string: the gauge attributes.
+//   - subscriber, group, topic string: the RAW values; each is resolved to a bounded
+//     label here rather than by the caller, so no call site can bypass the bound.
 //   - lag int64: the value, already guaranteed non-negative.
 func recordConsumerLag(ctx context.Context, subscriber, group, topic string, lag int64) {
 	if metrics.SubscriberConsumerLag == nil {
@@ -4029,7 +4051,7 @@ func (a *KafkaAdminClient) committedOffsets(
 
 	if response.Error != nil {
 		if errors.Is(response.Error, kafka.GroupIdNotFound) {
-			logrus.WithField("group", group).Info(
+			logrus.WithField("group", sanitizeLogValue(group, maxLoggedFilterLength)).Info(
 				"kafka admin: consumer group does not exist yet, so it has committed nothing; " +
 					"its lag is the whole retained log",
 			)
@@ -4049,7 +4071,7 @@ func (a *KafkaAdminClient) committedOffsets(
 		for _, offset := range offsets {
 			if offset.Error != nil {
 				logrus.WithError(offset.Error).WithFields(logrus.Fields{
-					"group":     group,
+					"group":     sanitizeLogValue(group, maxLoggedFilterLength),
 					"topic":     topic,
 					"partition": offset.Partition,
 				}).Debug("kafka admin: no committed offset available for this partition; treating it as uncommitted")

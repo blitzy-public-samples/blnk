@@ -1028,11 +1028,13 @@ var (
 // AllTopicsWithDeadLetters so that this file and the provisioning path work from one
 // list.
 //
-// The only error it can return comes from building the SASL/SCRAM mechanism, which
-// fails when the configured credentials cannot be prepared (SASLprep rejects the
-// username or password). That IS a fatal misconfiguration and must not be silently
-// downgraded to the no-op: silently publishing nothing because a password was malformed
-// is precisely the failure mode the loud error prevents.
+// The errors it can return both come from the administrative SASL credential: the pair
+// is half-configured (exactly one of KAFKA_SASL_ADMIN_USER and KAFKA_SASL_ADMIN_SECRET
+// set), or the credentials cannot be prepared because SASLprep rejects the username or
+// password. Both ARE fatal misconfigurations and must not be silently downgraded to the
+// no-op: silently publishing nothing because a password was malformed, or publishing
+// anonymously because a username was missing, are precisely the failure modes the loud
+// error prevents.
 //
 // Parameters:
 //   - cnf *config.Configuration: the loaded configuration. May be nil.
@@ -1116,6 +1118,10 @@ func NewEventPublisher(cnf *config.Configuration) (EventPublisher, error) {
 //     unreadable or invalid TLS material, or plaintext without the explicit local-dev
 //     acknowledgement.
 func newKafkaPublisher(brokers []string, cfg config.KafkaConfig) (*kafkaPublisher, error) {
+	if err := cfg.ValidateSASLAdminCredentials(); err != nil {
+		return nil, fmt.Errorf("blnk: cannot build the Kafka event publisher: %w", err)
+	}
+
 	addr := kafka.TCP(brokers...)
 
 	transport, err := NewKafkaTransport(cfg, KafkaTransportRoleProducer)

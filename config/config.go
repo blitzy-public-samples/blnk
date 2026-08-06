@@ -138,11 +138,33 @@ var (
 	// never reached with these parameters, which is intentional — it only engages
 	// when the configured base or attempt count would exceed it.
 	defaultRelay = RelayConfig{
-		MaxRetryAttempts:   5,
+		MaxRetryAttempts:   MaxRelayRetryAttempts,
 		RetryBaseBackoffMS: 1000,
 		RetryMaxBackoffMS:  30000,
 	}
 )
+
+// MaxRelayRetryAttempts is the CEILING on RELAY_MAX_RETRY_ATTEMPTS, not merely its
+// default. A configured value above it is clamped down to it by setRelayDefaults.
+//
+// It is a hard bound rather than advice because the attempt number is an EXPORTED METRIC
+// LABEL. blnk.events.publish.duration carries the attempt as an attribute and multiplies it
+// by its bucket count, and blnk.events.publish.attempts.total is read per attempt, so the
+// attempt domain is part of the observability contract: it is documented as 1..5 in
+// internal/metrics, the alert queries select on attempt="1", and a deployment that set 5000
+// here would silently mint 5000 label values and make the histogram the most expensive
+// series in the exporter.
+//
+// Five is also the retry budget requirement itself, so clamping does not restrict any
+// supported configuration — it only rejects one that was never valid. Clamping rather than
+// refusing to start is deliberate and matches how every other bad value in this file is
+// handled: a misconfigured relay must never stop the ledger from serving, so the value is
+// corrected, the correction is logged loudly, and the process continues.
+//
+// The recording path in the root package bounds the label independently as well, collapsing
+// anything above this into a single "over" bucket, so the domain stays closed even for a row
+// whose per-row max_attempts was raised directly in the database.
+const MaxRelayRetryAttempts = 5
 
 var ConfigStore atomic.Value
 
@@ -384,11 +406,147 @@ type KafkaTLSConfig struct {
 // another unit. Bad tuning is reported as a warning, never as a fatal error, so a
 // misconfigured relay can never stop the server from starting.
 //
-// Env tags are un-prefixed for the same reason as KafkaConfig's; see the note there.
+// Env tags are un-prefixed for the same reason as KafkaConfig's, and both the bare
+// RELAY_* names and the conventional BLNK_RELAY_* names resolve through the same
+// mechanism; see the notes on KafkaConfig and eventStreamingEnvOverride.
 type RelayConfig struct {
 	MaxRetryAttempts   int `json:"max_retry_attempts"    envconfig:"RELAY_MAX_RETRY_ATTEMPTS"`
 	RetryBaseBackoffMS int `json:"retry_base_backoff_ms" envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
 	RetryMaxBackoffMS  int `json:"retry_max_backoff_ms"  envconfig:"RELAY_RETRY_MAX_BACKOFF_MS"`
+}
+
+// eventStreamingEnvOverride is how the CONVENTIONAL BLNK_-prefixed names for the
+// nested Kafka and relay blocks are resolved. It exists because one envconfig pass
+// cannot honour both name forms for the same field, and the deployment contract
+// requires both.
+//
+// # Why a second, flat struct is necessary rather than a prefix on the tags
+//
+// envconfig derives a field's PRIMARY key by accumulating the prefix through every
+// enclosing struct and appending the tag literal, then consults the bare tag literal
+// as an ALTERNATE key only when the primary is unset. Configuration.Kafka is itself a
+// prefix segment, so for Configuration.Kafka.Brokers — tagged KAFKA_BROKERS — the
+// primary key is BLNK_KAFKA_KAFKA_BROKERS and the alternate is the mandated bare
+// KAFKA_BROKERS. The conventional BLNK_KAFKA_BROKERS is neither key, so nesting alone
+// silently drops it.
+//
+// Renaming the tags cannot fix that. A tag of BROKERS would make the primary
+// BLNK_KAFKA_BROKERS and the alternate a bare BROKERS, honouring the convention but
+// breaking the mandated KAFKA_BROKERS. Either way one form is lost, because a field
+// has exactly one primary key and one alternate. Two forms therefore need two
+// sources, which is what this struct is.
+//
+// This struct is FLAT, so envconfig accumulates no intermediate segment: for
+// KafkaBrokers, tagged KAFKA_BROKERS, the primary key is BLNK_KAFKA_BROKERS and the
+// alternate is KAFKA_BROKERS. Both forms resolve here, the library performs all
+// parsing, and a malformed integer is reported by the library naming the exact
+// variable that carried it.
+//
+// # Every field is a POINTER, and that is the whole mechanism
+//
+// envconfig skips a field whose variable is unset, leaving a pointer nil, and
+// allocates one whose variable is set — even when the value is empty. Nil therefore
+// means "not configured through this name" and non-nil means "configured, use it",
+// which is exactly the distinction an overlay needs. A value struct could not tell an
+// explicit empty value from an absent one and would erase a value the file or the bare
+// name supplied.
+//
+// # The resulting precedence, highest first
+//
+//  1. BLNK_KAFKA_BROKERS / BLNK_RELAY_MAX_RETRY_ATTEMPTS — the conventional prefixed
+//     name, this struct's primary key. Highest because it matches the prefixed
+//     convention every other variable in this file follows.
+//  2. KAFKA_BROKERS / RELAY_MAX_RETRY_ATTEMPTS — the bare name the deployment
+//     contract mandates, this struct's alternate key.
+//  3. BLNK_KAFKA_KAFKA_BROKERS / BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS — the key
+//     envconfig derives from the nested struct. Still honoured, because it is what
+//     the nested pass applies and removing it would break any deployment that found
+//     it; lowest of the three because it is an artefact of the nesting rather than a
+//     name anybody would choose.
+//  4. The matching key under "kafka" or "relay" in blnk.json.
+//  5. The defaults in defaultKafka and defaultRelay.
+//
+// Levels 1 to 3 order themselves without any lookup gymnastics: the nested pass runs
+// first and applies level 3, this overlay runs second and applies level 1 or 2 over
+// it, and within the overlay envconfig's own primary-before-alternate rule orders 1
+// above 2.
+//
+// WebhookDeprecationSunsetDate is deliberately absent. It is a top-level field on
+// Configuration, so it accumulates no intermediate segment and the nested pass already
+// resolves both WEBHOOK_DEPRECATION_SUNSET_DATE and its BLNK_-prefixed form. Adding it
+// here would be redundant.
+type eventStreamingEnvOverride struct {
+	KafkaBrokers           *[]string `envconfig:"KAFKA_BROKERS"`
+	KafkaTopicPrefix       *string   `envconfig:"KAFKA_TOPIC_PREFIX"`
+	KafkaSASLAdminUser     *string   `envconfig:"KAFKA_SASL_ADMIN_USER"`
+	KafkaSASLAdminSecret   *string   `envconfig:"KAFKA_SASL_ADMIN_SECRET"`
+	KafkaMinPartitions     *int      `envconfig:"KAFKA_MIN_PARTITIONS"`
+	KafkaReplicationFactor *int      `envconfig:"KAFKA_REPLICATION_FACTOR"`
+
+	RelayMaxRetryAttempts   *int `envconfig:"RELAY_MAX_RETRY_ATTEMPTS"`
+	RelayRetryBaseBackoffMS *int `envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
+	RelayRetryMaxBackoffMS  *int `envconfig:"RELAY_RETRY_MAX_BACKOFF_MS"`
+}
+
+// applyEventStreamingEnvOverride resolves the Kafka and relay environment variables
+// through eventStreamingEnvOverride and copies whatever was set onto cnf.
+//
+// It is called from loadConfigFromFile immediately after the nested envconfig pass and
+// before validateAndAddDefaults, which is what produces the precedence documented on
+// eventStreamingEnvOverride. It does not re-process Configuration, add a configuration
+// source, or reorder the load pipeline: the pipeline remains file, then environment,
+// then defaults and validation, then publish.
+//
+// Only non-nil fields are copied, so a name that was never set cannot erase a value
+// the file or a lower-precedence name supplied. An explicitly EMPTY value is copied,
+// because emptying a variable is how an operator turns a setting off — most visibly
+// KAFKA_BROKERS, where empty is the supported "no Kafka configured" steady state that
+// selects the no-op event publisher.
+//
+// Parameters:
+//   - cnf *Configuration: the configuration being loaded, mutated in place.
+//
+// Returns:
+//   - error: the library's own error when a value cannot be parsed into its field —
+//     for example a non-numeric KAFKA_MIN_PARTITIONS. The message names the offending
+//     variable. It never contains KAFKA_SASL_ADMIN_SECRET's value, because that field
+//     is a string and a string conversion cannot fail.
+func applyEventStreamingEnvOverride(cnf *Configuration) error {
+	var override eventStreamingEnvOverride
+	if err := envconfig.Process("blnk", &override); err != nil {
+		return err
+	}
+
+	if override.KafkaBrokers != nil {
+		cnf.Kafka.Brokers = *override.KafkaBrokers
+	}
+	if override.KafkaTopicPrefix != nil {
+		cnf.Kafka.TopicPrefix = *override.KafkaTopicPrefix
+	}
+	if override.KafkaSASLAdminUser != nil {
+		cnf.Kafka.SASLAdminUser = *override.KafkaSASLAdminUser
+	}
+	if override.KafkaSASLAdminSecret != nil {
+		cnf.Kafka.SASLAdminSecret = *override.KafkaSASLAdminSecret
+	}
+	if override.KafkaMinPartitions != nil {
+		cnf.Kafka.MinPartitions = *override.KafkaMinPartitions
+	}
+	if override.KafkaReplicationFactor != nil {
+		cnf.Kafka.ReplicationFactor = *override.KafkaReplicationFactor
+	}
+
+	if override.RelayMaxRetryAttempts != nil {
+		cnf.Relay.MaxRetryAttempts = *override.RelayMaxRetryAttempts
+	}
+	if override.RelayRetryBaseBackoffMS != nil {
+		cnf.Relay.RetryBaseBackoffMS = *override.RelayRetryBaseBackoffMS
+	}
+	if override.RelayRetryMaxBackoffMS != nil {
+		cnf.Relay.RetryMaxBackoffMS = *override.RelayRetryMaxBackoffMS
+	}
+
+	return nil
 }
 
 type Configuration struct {
@@ -498,6 +656,14 @@ func loadConfigFromFile(file string) error {
 	// envconfig cannot reach on its own. Runs after Process so the prefixed form
 	// wins, matching the precedence the top-level sunset variable already has.
 	if err = applyPrefixedEnvAliases(&cnf); err != nil {
+		return err
+	}
+
+	// Then let the conventional BLNK_-prefixed names for the nested Kafka and relay
+	// blocks take effect. This runs between the environment overlay and the defaults so
+	// that the precedence documented on eventStreamingEnvOverride holds, and so that
+	// setKafkaDefaults and setRelayDefaults still see the final configured values.
+	if err = applyEventStreamingEnvOverride(&cnf); err != nil {
 		return err
 	}
 
@@ -779,6 +945,10 @@ func (cnf *Configuration) validateAndAddDefaults() error {
 	cnf.validateRelayRetryWindow()
 	cnf.warnOnInsecureKafkaTransport()
 
+	if err := cnf.validateKafkaSASLCredentials(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -922,6 +1092,39 @@ func (cnf *Configuration) warnOnInsecureKafkaTransport() {
 				"indistinguishable from the real one. Configure kafka.tls.ca_file instead.",
 		)
 	}
+}
+
+// validateKafkaSASLCredentials refuses a half-configured administrative SASL
+// credential at configuration load, so the deployment contract fails where it is
+// described rather than at the first broker dial.
+//
+// The severity depends on whether Kafka is in use. With brokers configured the pair is
+// load-bearing and a half-configured one is fatal: an admin username with no secret
+// cannot complete a SCRAM exchange, and a secret with no username would connect
+// anonymously while the operator believed it was authenticating. With no brokers
+// configured nothing reads the pair, so the defect is reported as a warning and
+// start-up continues — a deployment that does not publish events must not be blocked
+// by a credential it never uses.
+//
+// Returns:
+//   - error: non-nil only for a half-configured pair on a deployment that has brokers
+//     configured. The message never contains the secret.
+func (cnf *Configuration) validateKafkaSASLCredentials() error {
+	err := cnf.Kafka.ValidateSASLAdminCredentials()
+	if err == nil {
+		return nil
+	}
+
+	if len(cnf.Kafka.Brokers) == 0 {
+		logrus.WithField("reason", err.Error()).Warn(
+			"kafka: the administrative SASL credential is half-configured. No broker is configured, so " +
+				"nothing reads it today and start-up continues; it must be fixed before KAFKA_BROKERS is set",
+		)
+
+		return nil
+	}
+
+	return err
 }
 
 // validateRelayRetryWindow advises on a relay retry window that cannot behave as
@@ -1510,10 +1713,10 @@ func saslEnvNames(role string) (userVar, secretVar string) {
 // normalizeBrokers trims surrounding whitespace from each broker address and drops
 // empty entries, preserving the configured order.
 //
-// This is a correctness fix, not cosmetics: envconfig splits a comma-separated
+// Normalization is required rather than tidy: envconfig splits a comma-separated
 // value without trimming, so BLNK_KAFKA_BROKERS="a:9092, b:9092" yields the address
-// " b:9092", which cannot be dialled. envconfig likewise keeps the empty entries
-// produced by consecutive or trailing commas, which this function discards.
+// " b:9092", which cannot be dialled, and it preserves the empty entries produced by
+// consecutive or trailing commas, which this function discards.
 //
 // The function is idempotent — re-running it over its own output is a no-op, which
 // matters because validateAndAddDefaults may be invoked more than once on the same
@@ -1535,13 +1738,38 @@ func normalizeBrokers(brokers []string) []string {
 	return normalized
 }
 
-// setRelayDefaults fills only the unset relay retry values. The two backoff values
-// are milliseconds and are stored verbatim; unlike the queue's HotPairTTL they are
-// never reinterpreted as another unit, so a configured 1000 stays 1000.
+// setRelayDefaults fills the unset relay retry values and BOUNDS the attempt count.
+//
+// The two backoff values are milliseconds and are stored verbatim; unlike the queue's
+// HotPairTTL they are never reinterpreted as another unit, so a configured 1000 stays 1000.
+//
+// The attempt count is treated differently from the two delays, because it is the only one
+// of the three that leaves the process as an exported metric label, so it is CLAMPED as
+// well as defaulted: anything above MaxRelayRetryAttempts is reduced to it, with a warning
+// naming both numbers so the operator sees what was asked for and what is in force. See
+// MaxRelayRetryAttempts for why the ceiling exists.
+//
+// Values below 1 are deliberately left alone here. They are not a label-domain problem —
+// the recording path normalises any attempt number below 1 to 1 — and
+// validateRelayRetryWindow already reports them as the operational warning they are, which
+// keeps "no retries before dead-lettering" a visible choice rather than one this function
+// silently overrides.
 func (cnf *Configuration) setRelayDefaults() {
-	if cnf.Relay.MaxRetryAttempts == 0 {
+	switch {
+	case cnf.Relay.MaxRetryAttempts == 0:
 		cnf.Relay.MaxRetryAttempts = defaultRelay.MaxRetryAttempts
+	case cnf.Relay.MaxRetryAttempts > MaxRelayRetryAttempts:
+		logrus.WithFields(logrus.Fields{
+			"configured": cnf.Relay.MaxRetryAttempts,
+			"maximum":    MaxRelayRetryAttempts,
+			"variable":   "RELAY_MAX_RETRY_ATTEMPTS",
+		}).Warn(
+			"relay max_retry_attempts exceeds the supported maximum and is being clamped; " +
+				"the attempt number is an exported metric label and its domain is fixed",
+		)
+		cnf.Relay.MaxRetryAttempts = MaxRelayRetryAttempts
 	}
+
 	if cnf.Relay.RetryBaseBackoffMS == 0 {
 		cnf.Relay.RetryBaseBackoffMS = defaultRelay.RetryBaseBackoffMS
 	}
@@ -1647,12 +1875,3 @@ func logger() {
 		FullTimestamp: true,
 	})
 }
-
-// MaxRelayRetryAttempts is the CEILING on RELAY_MAX_RETRY_ATTEMPTS, not merely its default.
-//
-// It is a ceiling because the attempt number is a METRIC ATTRIBUTE: the publish-duration
-// histogram is attributed by attempt, so every additional attempt the configuration allows is
-// another label value multiplied by the bucket count. AAP R-4 fixes the schedule at five
-// attempts, so five is both the default and the most a deployment may ask for; a larger value
-// is reduced to it with a warning rather than silently honoured.
-const MaxRelayRetryAttempts = 5

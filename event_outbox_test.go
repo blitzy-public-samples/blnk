@@ -2313,6 +2313,55 @@ func TestPublishEvent_ReturnsThePersistenceError(t *testing.T) {
 		})
 		require.Error(t, err, "a driver failure must not be silently discarded")
 	})
+
+	t.Run("the failure line correlates by event id and hashes the aggregate", func(t *testing.T) {
+		// This is a FAILURE path a broker outage or a database incident can make
+		// high-volume, and the aggregate id is a ledger, balance, transaction or identity
+		// id — a financial identifier naming whose money the event is about. It is hashed
+		// rather than printed: event_id already identifies the event uniquely, so
+		// correlation loses nothing, and the token still shows that several failures share
+		// one aggregate, which is all the identifier was contributing.
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		datasource := newOutboxSpyDatasource()
+		datasource.insertErr = sentinel
+		blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
+
+		require.Error(t, blnk.PublishEvent(context.Background(), NewWebhook{
+			Event:   "transaction.applied",
+			Payload: outboxSampleTransaction(StatusApplied),
+		}))
+
+		var reported bool
+		for _, entry := range hook.AllEntries() {
+			if entry.Level != logrus.ErrorLevel ||
+				!strings.Contains(entry.Message, "failed to record event in the outbox") {
+				continue
+			}
+			reported = true
+
+			assert.Equal(t, hashLogIdentifier(outboxTransactionID), entry.Data["aggregate_id_hash"],
+				"the aggregate must be present as a stable token, so failures can still be grouped")
+			assert.NotContains(t, entry.Data, "aggregate_id",
+				"the plaintext identifier must be gone, not merely accompanied by the hash")
+			assert.NotEmpty(t, entry.Data["event_id"], "the line must identify the event that was lost")
+			assert.Equal(t, "transaction.applied", entry.Data["event_type"])
+
+			for field, value := range entry.Data {
+				text, ok := value.(string)
+				if !ok {
+					continue
+				}
+				assert.NotContains(t, text, outboxTransactionID,
+					"field %q must not carry the aggregate id in the clear", field)
+				assert.NotContains(t, text, outboxSourceBalanceID,
+					"field %q must not carry the ledger id in the clear either", field)
+			}
+		}
+		require.True(t, reported,
+			"a failed capture must be logged; silence would make a genuinely lost event invisible")
+	})
 }
 
 // TestPublishEvent_DoesNotPanicWithoutADatasource asserts the two degenerate receivers a

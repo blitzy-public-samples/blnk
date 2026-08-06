@@ -1081,10 +1081,107 @@ func TestValidateAndAddDefaults_KafkaConfiguredValuesSurvive(t *testing.T) {
 	})
 }
 
-// TestLoadConfigFromFile_KafkaEnvNameForms proves that both the bare environment
-// variable names the deployment contract mandates and the BLNK_-prefixed names the
-// rest of this file uses resolve into the new configuration, and records which
-// prefixed name is the real one.
+// TestValidateAndAddDefaults_KafkaSASLPairIsFatalOnlyWithBrokers pins where the pair
+// contract is enforced, which is as important as the contract itself.
+//
+// Two properties are in tension and both must hold. A half-configured credential has
+// to stop a deployment that actually uses Kafka, because it cannot be honoured and
+// fails much later as a wrong-password or authorization error. But it must NOT stop a
+// deployment with no brokers, because nothing reads it there and the graceful
+// degradation that lets Blnk run entirely without Kafka is a shipped guarantee — the
+// .env.example that ships an empty KAFKA_BROKERS would otherwise fail to load the
+// moment an operator filled in one SASL key.
+func TestValidateAndAddDefaults_KafkaSASLPairIsFatalOnlyWithBrokers(t *testing.T) {
+	clearEventStreamingEnv(t)
+
+	const secret = "placeholder-not-a-real-secret"
+
+	t.Run("a half pair with brokers configured refuses to load", func(t *testing.T) {
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.Brokers = []string{"broker-1:9092"}
+		cnf.WebhookDeprecationSunsetDate = testWindowSunset
+		cnf.Kafka.SASLAdminUser = "blnk-test-admin"
+
+		err := cnf.validateAndAddDefaults()
+		if err == nil {
+			t.Fatal("Expected a half-configured credential to fail validation when brokers are configured")
+		}
+		if !strings.Contains(err.Error(), "KAFKA_SASL_ADMIN_SECRET") {
+			t.Errorf("Expected the error to name the missing variable, got %v", err)
+		}
+	})
+
+	t.Run("a secret without a user and brokers configured refuses to load", func(t *testing.T) {
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.Brokers = []string{"broker-1:9092"}
+		cnf.WebhookDeprecationSunsetDate = testWindowSunset
+		cnf.Kafka.SASLAdminSecret = secret
+
+		err := cnf.validateAndAddDefaults()
+		if err == nil {
+			t.Fatal("Expected a secret with no principal to fail validation when brokers are configured")
+		}
+		if !strings.Contains(err.Error(), "KAFKA_SASL_ADMIN_USER") {
+			t.Errorf("Expected the error to name the missing variable, got %v", err)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Error("The error must never contain the secret's value")
+		}
+	})
+
+	t.Run("a half pair with no brokers warns and still loads", func(t *testing.T) {
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.SASLAdminUser = "blnk-test-admin"
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error when no broker is configured, got %v", err)
+		}
+		if !warnedAbout(hook, "half-configured") {
+			t.Error("Expected a warning that the administrative SASL credential is half-configured")
+		}
+	})
+
+	t.Run("a complete pair with brokers configured loads cleanly", func(t *testing.T) {
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.Brokers = []string{"broker-1:9092"}
+		cnf.WebhookDeprecationSunsetDate = testWindowSunset
+		cnf.Kafka.SASLAdminUser = "blnk-test-admin"
+		cnf.Kafka.SASLAdminSecret = secret
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error for a complete credential pair, got %v", err)
+		}
+		if warnedAbout(hook, "half-configured") {
+			t.Error("A complete credential pair must not be warned about")
+		}
+	})
+
+	t.Run("no credential at all with brokers configured loads cleanly", func(t *testing.T) {
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.Brokers = []string{"broker-1:9092"}
+		cnf.WebhookDeprecationSunsetDate = testWindowSunset
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected a plaintext broker to be supported, got %v", err)
+		}
+		if warnedAbout(hook, "half-configured") {
+			t.Error("An entirely unset credential pair is a plaintext deployment, not a half-configured one")
+		}
+	})
+}
+
+// TestLoadConfigFromFile_KafkaEnvNameForms proves that every environment variable
+// name form the deployment contract and the repository convention offer actually
+// resolves into the new configuration.
 //
 // Read this before "correcting" the un-prefixed envconfig tags in config.go.
 // envconfig builds a field's primary key by accumulating the prefix through every
@@ -1141,9 +1238,12 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			// applyPrefixedEnvAliases resolves it explicitly now.
 			name:   "the ordinary BLNK_KAFKA_BROKERS alias resolves",
 			envKey: "BLNK_KAFKA_BROKERS",
-			value:  "broker-5:9092",
+			value:  "broker-5:9092,broker-6:9092",
 			assert: func(t *testing.T, loaded *Configuration) {
-				assertBrokerList(t, loaded.Kafka.Brokers, []string{"broker-5:9092"})
+				// A comma-separated value through the alias must split the same way the
+				// bare and nested forms do, so the alias is a genuine equivalent rather
+				// than a single-value special case.
+				assertBrokerList(t, loaded.Kafka.Brokers, []string{"broker-5:9092", "broker-6:9092"})
 			},
 		},
 		{
@@ -1217,6 +1317,103 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
+			name:   "the conventional BLNK_KAFKA_TOPIC_PREFIX resolves through the overlay",
+			envKey: "BLNK_KAFKA_TOPIC_PREFIX",
+			value:  "acme",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.TopicPrefix != "acme" {
+					t.Errorf("Expected Kafka.TopicPrefix to be 'acme', got '%s'", loaded.Kafka.TopicPrefix)
+				}
+			},
+		},
+		{
+			name:   "the mandated bare KAFKA_SASL_ADMIN_USER resolves",
+			envKey: "KAFKA_SASL_ADMIN_USER",
+			value:  "blnk-test-admin",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.SASLAdminUser != "blnk-test-admin" {
+					t.Errorf("Expected Kafka.SASLAdminUser to be 'blnk-test-admin', got '%s'", loaded.Kafka.SASLAdminUser)
+				}
+			},
+		},
+		{
+			name:   "the conventional BLNK_KAFKA_SASL_ADMIN_USER resolves through the overlay",
+			envKey: "BLNK_KAFKA_SASL_ADMIN_USER",
+			value:  "blnk-test-admin",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.SASLAdminUser != "blnk-test-admin" {
+					t.Errorf("Expected Kafka.SASLAdminUser to be 'blnk-test-admin', got '%s'", loaded.Kafka.SASLAdminUser)
+				}
+			},
+		},
+		{
+			// Obviously fake: this file must never carry a value that could be
+			// mistaken for a real credential.
+			name:   "the mandated bare KAFKA_SASL_ADMIN_SECRET resolves",
+			envKey: "KAFKA_SASL_ADMIN_SECRET",
+			value:  "placeholder-not-a-real-secret",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.SASLAdminSecret != "placeholder-not-a-real-secret" {
+					t.Errorf("Expected Kafka.SASLAdminSecret to resolve, got a value of %d characters",
+						len(loaded.Kafka.SASLAdminSecret))
+				}
+			},
+		},
+		{
+			name:   "the conventional BLNK_KAFKA_SASL_ADMIN_SECRET resolves through the overlay",
+			envKey: "BLNK_KAFKA_SASL_ADMIN_SECRET",
+			value:  "placeholder-not-a-real-secret",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.SASLAdminSecret != "placeholder-not-a-real-secret" {
+					t.Errorf("Expected Kafka.SASLAdminSecret to resolve, got a value of %d characters",
+						len(loaded.Kafka.SASLAdminSecret))
+				}
+			},
+		},
+		{
+			name:   "the mandated bare KAFKA_MIN_PARTITIONS resolves",
+			envKey: "KAFKA_MIN_PARTITIONS",
+			value:  "12",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.MinPartitions != 12 {
+					t.Errorf("Expected Kafka.MinPartitions to be 12, got %d", loaded.Kafka.MinPartitions)
+				}
+			},
+		},
+		{
+			name:   "the conventional BLNK_KAFKA_MIN_PARTITIONS resolves through the overlay",
+			envKey: "BLNK_KAFKA_MIN_PARTITIONS",
+			value:  "12",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.MinPartitions != 12 {
+					t.Errorf("Expected Kafka.MinPartitions to be 12, got %d", loaded.Kafka.MinPartitions)
+				}
+			},
+		},
+		{
+			// A configured 1 is the single-broker local stack, and it must survive
+			// rather than being replaced by the production default of 3 — through
+			// either name form.
+			name:   "the mandated bare KAFKA_REPLICATION_FACTOR resolves",
+			envKey: "KAFKA_REPLICATION_FACTOR",
+			value:  "1",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.ReplicationFactor != 1 {
+					t.Errorf("Expected Kafka.ReplicationFactor to be 1, got %d", loaded.Kafka.ReplicationFactor)
+				}
+			},
+		},
+		{
+			name:   "the conventional BLNK_KAFKA_REPLICATION_FACTOR resolves through the overlay",
+			envKey: "BLNK_KAFKA_REPLICATION_FACTOR",
+			value:  "1",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.ReplicationFactor != 1 {
+					t.Errorf("Expected Kafka.ReplicationFactor to be 1, got %d", loaded.Kafka.ReplicationFactor)
+				}
+			},
+		},
+		{
 			name:   "the mandated bare RELAY_MAX_RETRY_ATTEMPTS resolves",
 			envKey: "RELAY_MAX_RETRY_ATTEMPTS",
 			value:  "3",
@@ -1280,8 +1477,38 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
+			name:   "the conventional BLNK_RELAY_RETRY_BASE_BACKOFF_MS resolves through the overlay",
+			envKey: "BLNK_RELAY_RETRY_BASE_BACKOFF_MS",
+			value:  "250",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Relay.RetryBaseBackoffMS != 250 {
+					t.Errorf("Expected Relay.RetryBaseBackoffMS to be 250, got %d", loaded.Relay.RetryBaseBackoffMS)
+				}
+			},
+		},
+		{
 			name:   "the mandated bare RELAY_RETRY_MAX_BACKOFF_MS resolves",
 			envKey: "RELAY_RETRY_MAX_BACKOFF_MS",
+			value:  "45000",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Relay.RetryMaxBackoffMS != 45000 {
+					t.Errorf("Expected Relay.RetryMaxBackoffMS to be 45000, got %d", loaded.Relay.RetryMaxBackoffMS)
+				}
+			},
+		},
+		{
+			name:   "the conventional BLNK_RELAY_RETRY_MAX_BACKOFF_MS resolves through the overlay",
+			envKey: "BLNK_RELAY_RETRY_MAX_BACKOFF_MS",
+			value:  "45000",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Relay.RetryMaxBackoffMS != 45000 {
+					t.Errorf("Expected Relay.RetryMaxBackoffMS to be 45000, got %d", loaded.Relay.RetryMaxBackoffMS)
+				}
+			},
+		},
+		{
+			name:   "the prefixed BLNK_RELAY_RELAY_RETRY_MAX_BACKOFF_MS primary key resolves",
+			envKey: "BLNK_RELAY_RELAY_RETRY_MAX_BACKOFF_MS",
 			value:  "45000",
 			assert: func(t *testing.T, loaded *Configuration) {
 				if loaded.Relay.RetryMaxBackoffMS != 45000 {
@@ -1338,6 +1565,238 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			tc.assert(t, loaded)
 		})
 	}
+}
+
+// TestLoadConfigFromFile_KafkaEnvNamePrecedence pins the order the three live name
+// forms resolve in when more than one is set at once.
+//
+// Coverage of each form in isolation, above, proves only that none of them is dead.
+// It says nothing about which value a deployment actually gets when two names
+// disagree — and two names disagreeing is not exotic: a Helm chart supplying the
+// conventional BLNK_-prefixed form over a base image's .env carrying the bare form
+// produces it on the first upgrade. The order below is the one documented on
+// eventStreamingEnvOverride:
+//
+//  1. BLNK_KAFKA_BROKERS       — the conventional prefixed name (overlay primary)
+//  2. KAFKA_BROKERS            — the mandated bare name        (overlay alternate)
+//  3. BLNK_KAFKA_KAFKA_BROKERS — the key the nested pass derives
+//
+// Every subtest sets values that are distinguishable from one another, so a wrong
+// answer names the form that won rather than merely failing.
+func TestLoadConfigFromFile_KafkaEnvNamePrecedence(t *testing.T) {
+	cases := []struct {
+		name   string
+		env    map[string]string
+		assert func(t *testing.T, loaded *Configuration)
+	}{
+		{
+			name: "the conventional prefixed name beats the mandated bare name",
+			env: map[string]string{
+				"BLNK_KAFKA_BROKERS": "conventional:9092",
+				"KAFKA_BROKERS":      "bare:9092",
+			},
+			assert: func(t *testing.T, loaded *Configuration) {
+				assertBrokerList(t, loaded.Kafka.Brokers, []string{"conventional:9092"})
+			},
+		},
+		{
+			name: "the conventional prefixed name beats the nested-pass key",
+			env: map[string]string{
+				"BLNK_KAFKA_BROKERS":       "conventional:9092",
+				"BLNK_KAFKA_KAFKA_BROKERS": "nested:9092",
+			},
+			assert: func(t *testing.T, loaded *Configuration) {
+				assertBrokerList(t, loaded.Kafka.Brokers, []string{"conventional:9092"})
+			},
+		},
+		{
+			name: "the mandated bare name beats the nested-pass key",
+			env: map[string]string{
+				"KAFKA_BROKERS":            "bare:9092",
+				"BLNK_KAFKA_KAFKA_BROKERS": "nested:9092",
+			},
+			assert: func(t *testing.T, loaded *Configuration) {
+				assertBrokerList(t, loaded.Kafka.Brokers, []string{"bare:9092"})
+			},
+		},
+		{
+			name: "all three forms set resolves to the conventional prefixed name",
+			env: map[string]string{
+				"BLNK_KAFKA_BROKERS":       "conventional:9092",
+				"KAFKA_BROKERS":            "bare:9092",
+				"BLNK_KAFKA_KAFKA_BROKERS": "nested:9092",
+			},
+			assert: func(t *testing.T, loaded *Configuration) {
+				assertBrokerList(t, loaded.Kafka.Brokers, []string{"conventional:9092"})
+			},
+		},
+		{
+			name: "the same order holds for an integer relay value",
+			env: map[string]string{
+				"BLNK_RELAY_MAX_RETRY_ATTEMPTS":       "2",
+				"RELAY_MAX_RETRY_ATTEMPTS":            "3",
+				"BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS": "4",
+			},
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Relay.MaxRetryAttempts != 2 {
+					t.Errorf("Expected Relay.MaxRetryAttempts to be 2 from the conventional prefixed name, got %d",
+						loaded.Relay.MaxRetryAttempts)
+				}
+			},
+		},
+		{
+			name: "the bare name still wins over the nested key for an integer value",
+			env: map[string]string{
+				"RELAY_RETRY_BASE_BACKOFF_MS":            "250",
+				"BLNK_RELAY_RELAY_RETRY_BASE_BACKOFF_MS": "500",
+			},
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Relay.RetryBaseBackoffMS != 250 {
+					t.Errorf("Expected Relay.RetryBaseBackoffMS to be 250 from the bare name, got %d",
+						loaded.Relay.RetryBaseBackoffMS)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEventStreamingEnv(t)
+			restoreConfigStore(t)
+
+			// The cases below configure brokers, and a configured broker makes the
+			// webhook deprecation window mandatory rather than advisory. Supplying it
+			// here keeps each case testing the one thing it is about — which environment
+			// name wins — instead of failing on an unrelated required setting.
+			t.Setenv("WEBHOOK_DEPRECATION_SUNSET_DATE", testWindowSunset)
+
+			configFile := writeTempEventConfigFile(t)
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+
+			if err := loadConfigFromFile(configFile); err != nil {
+				t.Fatalf("loadConfigFromFile failed: %v", err)
+			}
+			loaded, err := Fetch()
+			if err != nil {
+				t.Fatalf("Fetch failed: %v", err)
+			}
+
+			tc.assert(t, loaded)
+		})
+	}
+}
+
+// TestLoadConfigFromFile_KafkaEnvOverrideDoesNotErasePlainJSONConfiguration is the
+// companion property to the precedence test: an environment name that is NOT set must
+// leave the value blnk.json supplied exactly as it is.
+//
+// This is the failure mode an overlay invites. Copying a value struct rather than only
+// its set fields would write a zero over every Kafka and relay setting a JSON-only
+// deployment relies on — and it would do so silently, because zeros are then replaced
+// by defaults and the result looks plausible. The Kubernetes ConfigMap ships a literal
+// blnk.json, so JSON-only configuration is a real deployment shape rather than a
+// theoretical one.
+func TestLoadConfigFromFile_KafkaEnvOverrideDoesNotErasePlainJSONConfiguration(t *testing.T) {
+	fromFile := eventStreamingBaseConfig()
+	fromFile.Kafka = KafkaConfig{
+		Brokers:           []string{"file-1:9092", "file-2:9092"},
+		TopicPrefix:       "from-file",
+		SASLAdminUser:     "file-admin",
+		SASLAdminSecret:   "placeholder-not-a-real-secret",
+		MinPartitions:     9,
+		ReplicationFactor: 2,
+	}
+	fromFile.Relay = RelayConfig{MaxRetryAttempts: 4, RetryBaseBackoffMS: 750, RetryMaxBackoffMS: 20000}
+	// Supplied from the FILE rather than the environment, which is the deployment shape
+	// this test is about: the file configures brokers, and a configured broker makes the
+	// deprecation window mandatory.
+	fromFile.WebhookDeprecationSunsetDate = testWindowSunset
+
+	t.Run("no environment variable set leaves every file value intact", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+		restoreConfigStore(t)
+
+		if err := loadConfigFromFile(writeTempConfigFile(t, fromFile)); err != nil {
+			t.Fatalf("loadConfigFromFile failed: %v", err)
+		}
+		loaded, err := Fetch()
+		if err != nil {
+			t.Fatalf("Fetch failed: %v", err)
+		}
+
+		assertBrokerList(t, loaded.Kafka.Brokers, []string{"file-1:9092", "file-2:9092"})
+		if loaded.Kafka.TopicPrefix != "from-file" {
+			t.Errorf("Expected Kafka.TopicPrefix to stay 'from-file', got '%s'", loaded.Kafka.TopicPrefix)
+		}
+		if loaded.Kafka.SASLAdminUser != "file-admin" {
+			t.Errorf("Expected Kafka.SASLAdminUser to stay 'file-admin', got '%s'", loaded.Kafka.SASLAdminUser)
+		}
+		if loaded.Kafka.SASLAdminSecret == "" {
+			t.Error("Expected Kafka.SASLAdminSecret from the file to survive, got an empty value")
+		}
+		if loaded.Kafka.MinPartitions != 9 {
+			t.Errorf("Expected Kafka.MinPartitions to stay 9, got %d", loaded.Kafka.MinPartitions)
+		}
+		if loaded.Kafka.ReplicationFactor != 2 {
+			t.Errorf("Expected Kafka.ReplicationFactor to stay 2, got %d", loaded.Kafka.ReplicationFactor)
+		}
+		if loaded.Relay.MaxRetryAttempts != 4 {
+			t.Errorf("Expected Relay.MaxRetryAttempts to stay 4, got %d", loaded.Relay.MaxRetryAttempts)
+		}
+		if loaded.Relay.RetryBaseBackoffMS != 750 {
+			t.Errorf("Expected Relay.RetryBaseBackoffMS to stay 750, got %d", loaded.Relay.RetryBaseBackoffMS)
+		}
+		if loaded.Relay.RetryMaxBackoffMS != 20000 {
+			t.Errorf("Expected Relay.RetryMaxBackoffMS to stay 20000, got %d", loaded.Relay.RetryMaxBackoffMS)
+		}
+	})
+
+	t.Run("one environment variable overrides only its own field", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+		restoreConfigStore(t)
+
+		t.Setenv("BLNK_KAFKA_TOPIC_PREFIX", "from-env")
+
+		if err := loadConfigFromFile(writeTempConfigFile(t, fromFile)); err != nil {
+			t.Fatalf("loadConfigFromFile failed: %v", err)
+		}
+		loaded, err := Fetch()
+		if err != nil {
+			t.Fatalf("Fetch failed: %v", err)
+		}
+
+		if loaded.Kafka.TopicPrefix != "from-env" {
+			t.Errorf("Expected Kafka.TopicPrefix to be 'from-env', got '%s'", loaded.Kafka.TopicPrefix)
+		}
+		assertBrokerList(t, loaded.Kafka.Brokers, []string{"file-1:9092", "file-2:9092"})
+		if loaded.Kafka.MinPartitions != 9 {
+			t.Errorf("Expected Kafka.MinPartitions to stay 9, got %d", loaded.Kafka.MinPartitions)
+		}
+		if loaded.Relay.MaxRetryAttempts != 4 {
+			t.Errorf("Expected Relay.MaxRetryAttempts to stay 4, got %d", loaded.Relay.MaxRetryAttempts)
+		}
+	})
+
+	t.Run("an explicitly empty broker list turns Kafka off", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+		restoreConfigStore(t)
+
+		// Emptying the variable is how an operator disables publishing, and it must
+		// beat the file rather than being mistaken for "not configured".
+		t.Setenv("BLNK_KAFKA_BROKERS", "")
+
+		if err := loadConfigFromFile(writeTempConfigFile(t, fromFile)); err != nil {
+			t.Fatalf("loadConfigFromFile failed: %v", err)
+		}
+		loaded, err := Fetch()
+		if err != nil {
+			t.Fatalf("Fetch failed: %v", err)
+		}
+
+		assertBrokerList(t, loaded.Kafka.Brokers, nil)
+	})
 }
 
 // TestKafkaBrokersParsing verifies how a KAFKA_BROKERS value becomes a broker

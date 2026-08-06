@@ -7,118 +7,98 @@ data:
   prometheus.yml: |
     global:
       scrape_interval: 15s
-    # Alerting rules to evaluate. This stanza — not the mere presence of a rule
-    # file — is what arms the two Kafka event-streaming alerts, and it repeats
-    # the identical stanza in the repository-root prometheus.yml so the
-    # Kubernetes and Compose monitoring configurations stay in lockstep. Were it
-    # missing here, Kubernetes would silently have no Kafka alerting while
-    # Compose had it, and nothing would look wrong in either file.
-    #
-    # This is a path INSIDE the Prometheus container, not a repository path.
-    # Compose bind-mounts ./alerts to /etc/prometheus/alerts; Kubernetes has no
-    # bind mounts, so the rule file travels as the blnk-kafka-alerts.yml key
-    # below and prometheus-deployment.yaml must project that key into this same
-    # directory, alongside its existing prometheus.yml mount:
+    # This stanza repeats the one in the repository-root prometheus.yml so the
+    # Kubernetes and Compose monitoring configurations stay in lockstep, and the
+    # path is inside the Prometheus container rather than in the repository.
+    # Kubernetes has no bind mounts, so the rule file travels as the
+    # blnk-kafka-alerts.yml key below and prometheus-deployment.yaml must project
+    # that key into this same directory:
     #   - name: prometheus-config
     #     mountPath: /etc/prometheus/alerts/blnk-kafka-alerts.yml
     #     subPath: blnk-kafka-alerts.yml
     # Keep the key name, the subPath, the mountPath and this path in step. An
-    # unmounted rule file is a SILENT failure: it surfaces as the alerts being
-    # absent from /api/v1/rules, not as a startup error, so verify there after
-    # changing any of the four.
-    #
-    # The glob is deliberate and matches the root file character for character.
-    # It resolves for either the per-key subPath mount above or a whole-
-    # directory projection, it picks up rule files added later without a further
-    # edit here, and a glob that matches nothing still lets Prometheus start,
-    # whereas a literal missing path fails `promtool check config` outright with
-    # "does not point to an existing file".
+    # unmounted rule file is a SILENT failure — the alerts are absent from
+    # /api/v1/rules rather than the pod failing to start — so verify there after
+    # changing any of the four. The glob matches the root file character for
+    # character and resolves for either a per-key subPath mount or a whole-
+    # directory projection.
     rule_files:
       - '/etc/prometheus/alerts/*.yml'
+    # Both jobs authenticate. This is not optional hardening — it is what makes
+    # the alerts above capable of firing at all.
+    #
+    # Blnk's /metrics endpoint is guarded by MetricsAuthHandler: when
+    # server.secure is true it REQUIRES `Authorization: Bearer <token>` and
+    # answers everything else with an apierror, and when secure is true with no
+    # metrics_bearer_token configured it refuses every request outright. So an
+    # unauthenticated scrape against a production deployment collects nothing,
+    # every series the rules match on is absent, and the two alerts sit
+    # permanently in a state where they cannot fire. That failure is SILENT in
+    # the worst way: Prometheus reports the target as down, the rules report no
+    # error, and the absence of an alert is indistinguishable from health.
+    #
+    # credentials_file, never inline `credentials`. Inline would put the token
+    # in a ConfigMap, which is stored unencrypted, readable by anything with
+    # get-configmap in the namespace, and printed in full by `kubectl describe`
+    # — a credential in the one Kubernetes object specifically not intended to
+    # hold one. The file form keeps the token in a Secret and leaves only its
+    # path here. It also reloads: Prometheus re-reads the file on each scrape,
+    # so rotating the Secret takes effect without restarting the pod.
+    #
+    # The path is a MOUNT CONTRACT with prometheus-deployment.yaml, which
+    # projects Secret blnk-metrics-token into this directory. The two must agree
+    # exactly, and the failure mode if they do not is loud rather than silent:
+    # Prometheus validates that the file exists at config load and refuses to
+    # start without it, which is the correct direction — a monitoring stack that
+    # cannot authenticate should fail visibly rather than scrape nothing.
+    #
+    # Create the Secret before applying these manifests:
+    #   kubectl -n blnk create secret generic blnk-metrics-token \
+    #     --from-literal=metrics-bearer-token="$BLNK_METRICS_BEARER_TOKEN"
+    # The value must equal server.metrics_bearer_token in blnk.json (or the
+    # BLNK_METRICS_BEARER_TOKEN environment variable) for both the server and
+    # the worker, since one token guards both endpoints.
     scrape_configs:
       - job_name: 'blnk-server'
-        # Uncomment to authenticate when metrics_bearer_token is configured in blnk.json:
-        # authorization:
-        #   type: Bearer
-        #   credentials: '<your-metrics-bearer-token>'
+        authorization:
+          type: Bearer
+          credentials_file: /etc/prometheus/secrets/metrics-bearer-token
         static_configs:
           - targets: ['server:5001']
       - job_name: 'blnk-worker'
-        # authorization:
-        #   type: Bearer
-        #   credentials: '<your-metrics-bearer-token>'
+        authorization:
+          type: Bearer
+          credentials_file: /etc/prometheus/secrets/metrics-bearer-token
         static_configs:
           - targets: ['worker:5004']
-  # The Kubernetes copy of alerts/blnk-kafka-alerts.yml. That file is the source
-  # of truth; this is its mirror. Compose bind-mounts the original into the
-  # Prometheus container, but a ConfigMap cannot reference a file on disk, so the
-  # content is duplicated here by design rather than by oversight. The two copies
-  # MUST stay identical — same group, same interval, same expressions,
-  # thresholds, dwell times, labels and annotations — because a divergence
-  # between them means one environment alerts and the other does not.
-  #
-  # The two series are the Prometheus renderings of the OpenTelemetry gauges
-  # declared in internal/metrics/metrics.go, dots becoming underscores:
-  # blnk.dlt.oldest_message_age_seconds and blnk.kafka.consumer_lag. Both are
-  # already exposed on the /metrics endpoints that the two scrape jobs above
-  # collect, so no additional scrape target is required: consumer lag is computed
-  # in-process by differencing committed offsets against log end offsets, not by
-  # a lag exporter. Copy these names, never retype them — one wrong character
-  # yields a rule that evaluates against a series nothing records, so it can
-  # never fire and reports no error anywhere.
+  # The Kubernetes mirror of alerts/blnk-kafka-alerts.yml, which is the source of
+  # truth. A ConfigMap cannot reference a file on disk, so the rules are
+  # duplicated here by design; the two copies MUST stay identical in group,
+  # interval, expressions, thresholds, dwell times, labels and annotations,
+  # because a divergence means one environment alerts and the other does not. The
+  # rationale for each threshold and dwell lives in the source file rather than
+  # being duplicated here too. Both series are already exposed on the /metrics
+  # endpoints the scrape jobs above collect, so no extra target is needed; copy
+  # the names rather than retyping them, since one wrong character yields a rule
+  # that evaluates against a series nothing records and can never fire.
   blnk-kafka-alerts.yml: |
     groups:
-      # One group, deliberately. Both rules cover the same domain and share one
-      # evaluation cadence.
       - name: blnk-kafka-alerts
-        # Pinned explicitly rather than inherited. The config above sets only
-        # global.scrape_interval (15s) and leaves global.evaluation_interval at
-        # its 1 minute default, so an unpinned group would silently change
-        # cadence the day someone adds that global. 30s is one evaluation per
-        # two scrapes: responsive, not wasteful.
         interval: 30s
         rules:
-          # Events have been dead-lettered and nobody has cleared them. In a
-          # financial ledger that means ledger mutations are not reaching
-          # subscribers, so this pages rather than warns.
           - alert: DeadLetterMessageStuck
-            # 900 is the 15 minute dwell the requirement states, written as a
-            # literal so the threshold is greppable. The gauge is the age of the
-            # OLDEST unresolved dead-letter entry, so this one comparison covers
-            # every entry. Left bare on purpose: no label matcher, so the rule
-            # keeps whatever attributes the gauge carries and cannot be broken
-            # by an attribute being renamed.
             expr: blnk_dlt_oldest_message_age_seconds > 900
-            # Deliberately zero, not omitted. The threshold already carries the
-            # 15 minutes; a dwell here would double-count it and push the first
-            # notification past the boundary the requirement fixes. There is
-            # also no flapping to damp: the gauge climbs monotonically while
-            # anything is stuck and drops to zero the moment the dead-letter
-            # topic drains. Do not "fix" this by adding a dwell.
             for: 0m
             labels:
               severity: critical
               component: event-streaming
             annotations:
               summary: "Dead-lettered events unresolved for more than 15 minutes"
-              description: "The oldest unresolved dead-letter entry on topic {{ $labels.topic }} (instance {{ $labels.instance }}) has been waiting {{ $value | humanizeDuration }}. This value is an age, not a count: one entry this old is enough to fire. Triage it and replay it with POST /events/dead-letter/:event_id/replay."
+              description: "The oldest unresolved retry-exhausted event destined for {{ $labels.topic }} (instance {{ $labels.instance }}) has been waiting {{ $value | humanizeDuration }}. This value is an age, not a count: one event this old is enough to fire. Triage it and replay it with POST /events/dead-letter/:event_id/replay."
               runbook_url: docs/kafka-operations.md
 
-          # A subscriber is falling behind. The events are durably in Kafka and
-          # the consumer will catch up on its own, so this is degradation
-          # rather than loss.
           - alert: SubscriberConsumerLagHigh
-            # blnk_kafka_consumer_lag is computed in-process and is already
-            # summed across a topic's partitions, so it is compared bare: no
-            # sum(), no sum by(), no clamp_min(). Staying bare also keeps the
-            # subscriber, group and topic attributes on the notification, which
-            # is exactly what makes it actionable.
             expr: blnk_kafka_consumer_lag > 10000
-            # Two minutes, i.e. four consecutive evaluations at the interval
-            # above. Unlike a dead-letter age, consumer lag is legitimately
-            # spiky, so a short dwell avoids paging on a burst that
-            # self-corrects while staying short enough to observe promptly when
-            # the rule is being verified.
             for: 2m
             labels:
               severity: warning

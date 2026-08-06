@@ -39,16 +39,6 @@ import (
 
 // storeSunsetDate publishes a configuration carrying raw as the webhook sunset date
 // and restores whatever configuration was in place when the test finishes.
-//
-// It writes to config.ConfigStore directly rather than through config.MockConfig for
-// two reasons: MockConfig runs validateAndAddDefaults, which refuses to store a
-// configuration without a data-source and Redis DSN (so the test's value would be
-// silently dropped), and it also warns about a malformed sunset date, which would
-// contaminate the log assertions below. Storing directly is the same approach the
-// legacy webhook tests take.
-//
-// The warn guard is reset on every call so that log assertions never depend on
-// whether an earlier test already warned about the same value.
 func storeSunsetDate(t *testing.T, raw string) {
 	t.Helper()
 
@@ -152,10 +142,13 @@ func TestWebhookSunsetPassed_BoundaryIsInclusiveToTheNanosecond(t *testing.T) {
 		"one nanosecond after the sunset instant the sunset HAS passed")
 }
 
-// TestWebhookSunsetPassed_ExactlyThirtyDayDualDeliveryWindow expresses the
-// requirement directly: a sunset instant set 30 days after the window opens yields
-// exactly 30 days of dual delivery, no more and no less.
-func TestWebhookSunsetPassed_ExactlyThirtyDayDualDeliveryWindow(t *testing.T) {
+// TestWebhookSunsetPassed_ThirtyDayDualDeliveryWindowBoundary checks the predicate for a
+// date configured 30 days out: the legacy transport is in use from the moment the window
+// opens until the instant before the sunset, and retired from the sunset on. Nothing in
+// the code records the opening instant or enforces the interval — configuring the date 30
+// days ahead is the operator's responsibility — so what is verified here is the boundary
+// behaviour of a correctly configured date, not duration enforcement.
+func TestWebhookSunsetPassed_ThirtyDayDualDeliveryWindowBoundary(t *testing.T) {
 	windowOpens := mustParseSunset(t, "2026-01-01T00:00:00Z")
 	sunset := windowOpens.Add(30 * 24 * time.Hour)
 
@@ -272,19 +265,6 @@ func TestWebhookSunsetPassed_MalformedDateHasNotPassedWithoutPanic(t *testing.T)
 
 // TestWebhookSunsetPassed_MalformedDateWarnsThroughThePublicPath asserts the log
 // contract on the path production actually takes.
-//
-// The test below this one covers the internal helper, but neither consumer of the
-// sunset calls that helper: the relay and the HTTP guard both go through
-// WebhookSunsetPassed. A warning that only fired on the internal path would leave a
-// mis-typed environment variable completely silent in production, so the whole chain
-// — configuration store, resolve, parse, warn — is exercised here end to end.
-//
-// The structured fields are asserted individually because they are what makes the
-// warning actionable: an operator needs the offending value, the layout it failed to
-// match, and the parser's own complaint. The message fragment is deliberately the one
-// unique to this file ("instant"). The configuration loader emits its own,
-// separately tested warning about the very same field using the word "timestamp", and
-// an assertion that either could satisfy would prove nothing about this code.
 func TestWebhookSunsetPassed_MalformedDateWarnsThroughThePublicPath(t *testing.T) {
 	hook := logtest.NewGlobal()
 	defer hook.Reset()
@@ -535,22 +515,6 @@ func TestWebhookSunsetPassedNow_DelegatesToTheParameterisedPredicate(t *testing.
 
 // TestWebhookSunsetPassed_BothConsumersFlipAtTheSameInstant pins the invariant that
 // gives this decision point its reason to exist.
-//
-// The sunset has two observable consequences, and they live in two different
-// packages. The relay stops dual delivering — it enqueues a legacy webhook task only
-// while the sunset has NOT passed. The HTTP guard starts refusing the deprecated
-// webhook routes with 410 Gone — only once it HAS passed. Those two are exact
-// complements at every instant, and they must flip together. If they did not, the
-// service could stop dual writing while still accepting webhook management calls, or
-// keep dual writing after the routes had already gone; both are silent failures that
-// would only surface as a subscriber complaining about missing events.
-//
-// The invariant holds here BY CONSTRUCTION: both closures below consult the one
-// predicate, which is precisely why every consumer is routed through it. What keeps it
-// that way over time is not this test but
-// TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead, which fails the moment any
-// consumer grows a date comparison of its own. This test states the property the two
-// consumers must satisfy and pins the exact instant at which both change their mind.
 func TestWebhookSunsetPassed_BothConsumersFlipAtTheSameInstant(t *testing.T) {
 	const raw = "2026-06-15T12:30:45Z"
 	storeSunsetDate(t, raw)
@@ -683,27 +647,10 @@ func TestSunsetWarnGuard_WarnsOnChangeAndAfterReset(t *testing.T) {
 	assert.True(t, guard.shouldWarn("second"), "a reset guard treats the value as new")
 }
 
-// -----------------------------------------------------------------------------
 // The single-decision-point invariant.
-//
-// Everything above pins WHAT the sunset decision is. This section pins WHERE that
-// decision is allowed to live, which is the structural property that stops the two
-// consumers from ever drifting apart. A behavioural test cannot catch a second
-// comparison appearing in another package; only a scan of the source can.
-// -----------------------------------------------------------------------------
 
 // sunsetRawDateReaders are the only files permitted to read the raw sunset value,
 // given as paths relative to the module root.
-//
-//   - event_sunset.go is the decision point itself. Reading the raw value is its job.
-//   - config/config.go declares the field and parses it once at load time purely to
-//     warn about a malformed value. It performs no comparison and reaches no verdict,
-//     and it cannot delegate to the helper because package blnk imports package
-//     config, not the reverse.
-//
-// A file showing up in the scan below is a defect to fix, not a reason to extend this
-// list. Consumers get the answer from WebhookSunsetPassed, WebhookSunsetPassedNow or
-// WebhookSunsetDate.
 var sunsetRawDateReaders = map[string]struct{}{
 	"event_sunset.go":  {},
 	"config/config.go": {},
@@ -730,11 +677,6 @@ var sunsetScanSkipDirs = map[string]struct{}{
 
 // moduleRootDir walks up from the test's working directory until it finds the
 // directory holding go.mod.
-//
-// `go test` runs in the package directory, which for this package is already the
-// module root, but resolving it explicitly keeps the scan correct if these tests are
-// ever moved into a subpackage, and makes the failure legible if they are not run
-// through `go test` at all.
 func moduleRootDir(t *testing.T) string {
 	t.Helper()
 
@@ -755,23 +697,6 @@ func moduleRootDir(t *testing.T) string {
 
 // TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead enforces that exactly one
 // place in this repository reads the sunset date and compares a clock against it.
-//
-// A consumer cannot compare against the sunset without first obtaining it, and there
-// are only three ways to obtain it: the configuration field, the environment variable,
-// or the JSON key. Scanning for those three is therefore equivalent to scanning for a
-// second comparison, and it is far more precise than hunting for time.Parse calls —
-// the codebase parses RFC3339 in many legitimate places that have nothing to do with
-// the sunset.
-//
-// The scan reads the AST rather than the raw bytes, with comments deliberately left
-// unattached. Explaining the sunset in a doc comment is encouraged; only executable
-// code counts as a second reader. Test files are exempt because fixtures legitimately
-// set the field, as this file and config/config_test.go both do.
-//
-// This test is forward looking. It is the tripwire that fires if the relay's
-// dual-delivery branch or the API's 410 Gone guard is later written with a date
-// comparison of its own instead of calling the helper — which is the exact regression
-// TestWebhookSunsetPassed_BothConsumersFlipAtTheSameInstant could never detect.
 func TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead(t *testing.T) {
 	root := moduleRootDir(t)
 	fset := token.NewFileSet()

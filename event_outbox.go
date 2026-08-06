@@ -1057,16 +1057,23 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook, o
 		err = l.datasource.InsertEventOutbox(ctx, outbox)
 	}
 	if err != nil {
-		// Logged here for immediate operator visibility with the full event
-		// identity, and returned so the caller's existing error handling — which
-		// routes to notification.NotifyError at most call sites — behaves exactly as
-		// it did with SendWebhook.
+		// Logged here for immediate operator visibility, and returned so the caller's
+		// existing error handling — which routes to notification.NotifyError at most
+		// call sites — behaves exactly as it did with SendWebhook.
+		//
+		// The aggregate id is HASHED rather than printed. It is a ledger, balance,
+		// transaction or identity id: a financial identifier naming whose money this
+		// event is about, and this line is emitted on a failure path that a broker
+		// outage can make high-volume. Correlation does not need the plaintext —
+		// event_id identifies the event uniquely and is already here — and the token
+		// still lets an operator see that several failures share one aggregate, which
+		// is the only thing the identifier was contributing.
 		logrus.WithFields(logrus.Fields{
-			"event_id":       outbox.EventID,
-			"event_type":     outbox.EventType,
-			"topic":          outbox.Topic,
-			"aggregate_id":   outbox.AggregateID,
-			"in_transaction": tx != nil,
+			"event_id":          outbox.EventID,
+			"event_type":        outbox.EventType,
+			"topic":             outbox.Topic,
+			"aggregate_id_hash": hashLogIdentifier(outbox.AggregateID),
+			"in_transaction":    tx != nil,
 		}).WithError(err).Error("failed to record event in the outbox")
 		span.RecordError(err)
 

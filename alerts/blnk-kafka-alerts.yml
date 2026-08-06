@@ -12,71 +12,59 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Prometheus alerting rules for Blnk's Kafka event-publishing pipeline: a
-# dead-lettered ledger event left unresolved for more than 15 minutes must
-# alert, and a subscriber consumer group trailing the log end by more than
-# 10,000 messages must alert. The two gauges evaluated below are declared in
-# internal/metrics/metrics.go and exposed on /metrics; Prometheus loads this
-# file through the rule_files: stanza in prometheus.yml. Both halves matter:
-# a gauge nothing evaluates is never alerted on, and a rule whose series is
-# never recorded evaluates against nothing, so it can never fire.
+# Prometheus alerting rules for Blnk's Kafka event-publishing pipeline. Both
+# gauges are declared in internal/metrics/metrics.go and exposed on /metrics;
+# Prometheus loads this file through the rule_files: stanza in prometheus.yml.
+# A gauge nothing evaluates is never alerted on, and a rule whose series is
+# never recorded can never fire, so both halves have to be in place.
 
 groups:
-  # One group, deliberately. Both rules cover the same domain and share one
-  # evaluation cadence, and a single self-contained block copies verbatim
-  # into the prometheus-config ConfigMap that the Kubernetes manifests
-  # mount, keeping Compose and Kubernetes aligned.
+  # One group: both rules cover the same domain and share one cadence, and a
+  # single self-contained block copies verbatim into the prometheus-config
+  # ConfigMap the Kubernetes manifests mount.
   - name: blnk-kafka-alerts
-    # Pinned explicitly rather than inherited. prometheus.yml sets only
-    # global.scrape_interval (15s) and leaves global.evaluation_interval at
-    # its 1 minute default, so an unpinned group would silently change
-    # cadence the day someone adds that global. 30s is one evaluation per
-    # two scrapes: responsive, not wasteful.
+    # Pinned rather than inherited. prometheus.yml sets only
+    # global.scrape_interval (15s) and leaves global.evaluation_interval at its
+    # 1 minute default, so an unpinned group would change cadence the day
+    # someone adds that global. 30s is one evaluation per two scrapes.
     interval: 30s
     rules:
-      # Events have been dead-lettered and nobody has cleared them. In a
-      # financial ledger that means mutations are not reaching subscribers,
-      # so this pages rather than warns.
+      # Retry-exhausted events nobody has cleared. In a financial ledger that
+      # means mutations are not reaching subscribers, so this pages.
       - alert: DeadLetterMessageStuck
-        # 900 is the 15 minute dwell the requirement states, written as a
-        # literal so the threshold is greppable.
-        # blnk_dlt_oldest_message_age_seconds is the age of the OLDEST
-        # unresolved dead-letter entry, so this one comparison covers every
-        # entry. Left bare on purpose: no label matcher, so the rule keeps
-        # whatever attributes the gauge carries and cannot be broken by an
-        # attribute being renamed.
+        # 900 is the 15 minute threshold the requirement states, as a literal so
+        # it is greppable. blnk_dlt_oldest_message_age_seconds is the age of the
+        # OLDEST unresolved retry-exhausted event, so one comparison covers the
+        # whole inventory. That inventory is every outbox row in the
+        # dead_lettered or failed state, so an event whose dead-letter write
+        # itself failed is included, reported under the .dlt topic it was
+        # destined for. Left bare on purpose: no label matcher, so the rule keeps
+        # whatever attributes the gauge carries.
         expr: blnk_dlt_oldest_message_age_seconds > 900
-        # Deliberately zero, not omitted. The threshold already carries the
-        # 15 minutes; a dwell here would double-count it and push the first
-        # notification past the boundary the requirement fixes. There is
-        # also no flapping to damp: the gauge climbs monotonically while
-        # anything is stuck and drops to zero the moment the dead-letter
-        # topic drains. Do not "fix" this by adding a dwell.
+        # Deliberately zero, not omitted: the threshold already carries the 15
+        # minutes, and a dwell here would double-count it and push the first
+        # notification past the boundary the requirement fixes.
         for: 0m
         labels:
           severity: critical
           component: event-streaming
         annotations:
           summary: "Dead-lettered events unresolved for more than 15 minutes"
-          description: "The oldest unresolved dead-letter entry on topic {{ $labels.topic }} (instance {{ $labels.instance }}) has been waiting {{ $value | humanizeDuration }}. This value is an age, not a count: one entry this old is enough to fire. Triage it and replay it with POST /events/dead-letter/:event_id/replay."
+          description: "The oldest unresolved retry-exhausted event destined for {{ $labels.topic }} (instance {{ $labels.instance }}) has been waiting {{ $value | humanizeDuration }}. This value is an age, not a count: one event this old is enough to fire. Triage it and replay it with POST /events/dead-letter/:event_id/replay."
           runbook_url: docs/kafka-operations.md
 
-      # A subscriber is falling behind. The events are durably in Kafka and
-      # the consumer will catch up on its own, so this is degradation
-      # rather than loss.
+      # A subscriber falling behind. The events are durably in Kafka and the
+      # consumer catches up on its own, so this is degradation, not loss.
       - alert: SubscriberConsumerLagHigh
         # blnk_kafka_consumer_lag is computed in-process by differencing
-        # committed offsets against log end offsets and is already summed
-        # across a topic's partitions, so it is compared bare: no sum(), no
-        # sum by(), no clamp_min(). Staying bare also keeps the subscriber,
-        # group and topic attributes on the notification, which is exactly
-        # what makes it actionable.
+        # committed offsets against log end offsets and is already summed across
+        # a topic's partitions, so it is compared bare — no sum(), no
+        # clamp_min() — which also keeps the subscriber, group and topic
+        # attributes on the notification.
         expr: blnk_kafka_consumer_lag > 10000
-        # Two minutes, i.e. four consecutive evaluations at the interval
-        # above. Unlike a dead-letter age, consumer lag is legitimately
-        # spiky, so a short dwell avoids paging on a burst that
-        # self-corrects while staying short enough to observe promptly when
-        # the rule is being verified.
+        # Four consecutive evaluations at the interval above. Unlike an age,
+        # consumer lag is legitimately spiky, so a short dwell avoids paging on a
+        # burst that self-corrects.
         for: 2m
         labels:
           severity: warning

@@ -1551,10 +1551,32 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 
 			expected := readYAMLFile(t, pair.rootPath)
 
+			// SCRAPE AUTHENTICATION IS THE ONE SANCTIONED DIVERGENCE, and it is stripped
+			// from both sides before the documents are compared.
+			//
+			// Kubernetes always has a metrics bearer token, so its copy authenticates
+			// unconditionally with credentials_file. The root copy cannot: Prometheus
+			// validates credentials_file at CONFIG LOAD and refuses to start when the file
+			// is absent, so enabling it there would break every local stack that runs
+			// without a token — a legitimate and common shape, since server.secure defaults
+			// to false locally. The block is therefore present-but-commented at the root and
+			// live in the ConfigMap, deliberately.
+			//
+			// Everything else — the scrape targets, the intervals and rule_files — must
+			// still match exactly, which is what this test exists for, so only this one key
+			// is normalised away and the Kubernetes side's authentication is then asserted
+			// positively below.
+			stripScrapeAuthorization(expected)
+			stripScrapeAuthorization(embedded)
+
 			assert.Equal(t, expected, embedded,
 				"the ConfigMap's %s has diverged from the repository-root copy. Update BOTH: "+
 					"one environment alerting while the other does not is a silent failure, and "+
 					"each file looks correct on its own", pair.key)
+
+			if pair.key == "prometheus.yml" {
+				assertKubernetesScrapesAuthenticate(t, embeddedText)
+			}
 		})
 	}
 
@@ -1620,6 +1642,74 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 		}
 		assert.Equal(t, 2, found, "both event-streaming alerts must be present")
 	})
+}
+
+// stripScrapeAuthorization removes the authorization block from every scrape job in a
+// parsed Prometheus configuration, in place.
+//
+// It exists so the parity comparison can assert on everything that must match while
+// tolerating the one setting that must not — see the note at the comparison site. A
+// document with no scrape_configs, or jobs with no authorization, is left untouched.
+//
+// Parameters:
+//   - document map[string]interface{}: the parsed configuration, mutated in place. A
+//     document that is not a Prometheus scrape configuration at all is a no-op, which is
+//     what lets the same helper be applied to the alert-rules file.
+func stripScrapeAuthorization(document map[string]interface{}) {
+	jobs, ok := document["scrape_configs"].([]interface{})
+	if !ok {
+		return
+	}
+
+	for _, entry := range jobs {
+		job, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		delete(job, "authorization")
+	}
+}
+
+// assertKubernetesScrapesAuthenticate pins the property the stripped comparison can no
+// longer see: the Kubernetes copy authenticates every scrape, by file and never inline.
+//
+// An unauthenticated scrape against a deployment with server.secure true collects nothing,
+// so every series the two Kafka alert rules match on is absent and neither can ever fire —
+// a failure indistinguishable from health. And an inline credential would put the token
+// into a ConfigMap, which is stored unencrypted and printed in full by kubectl describe.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - embeddedText string: the ConfigMap's prometheus.yml value, parsed here rather than
+//     taken pre-stripped.
+func assertKubernetesScrapesAuthenticate(t *testing.T, embeddedText string) {
+	t.Helper()
+
+	var document map[string]interface{}
+	require.NoError(t, yaml.Unmarshal([]byte(embeddedText), &document))
+
+	jobs, ok := document["scrape_configs"].([]interface{})
+	require.True(t, ok, "the embedded configuration must declare scrape jobs")
+	require.NotEmpty(t, jobs)
+
+	for _, entry := range jobs {
+		job, ok := entry.(map[string]interface{})
+		require.True(t, ok)
+
+		name, _ := job["job_name"].(string)
+		authorization, ok := job["authorization"].(map[string]interface{})
+		require.True(t, ok,
+			"job %q must authenticate: an unauthenticated scrape of a secure deployment "+
+				"collects nothing and leaves both Kafka alerts unable to fire", name)
+
+		assert.Equal(t, "Bearer", authorization["type"], "job %q must present a bearer token", name)
+		assert.Equal(t, "/etc/prometheus/secrets/metrics-bearer-token", authorization["credentials_file"],
+			"job %q must read the token from the path prometheus-deployment.yaml projects "+
+				"the blnk-metrics-token Secret into", name)
+		assert.NotContains(t, job, "credentials",
+			"job %q must not carry an inline credential: a ConfigMap is stored unencrypted "+
+				"and printed in full by kubectl describe", name)
+	}
 }
 
 // readYAMLFile parses a YAML file into a generic map.

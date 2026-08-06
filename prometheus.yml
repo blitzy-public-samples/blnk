@@ -40,17 +40,72 @@ global:
 rule_files:
   - '/etc/prometheus/alerts/*.yml'
 
+# AUTHENTICATION — READ THIS BEFORE RUNNING THE MONITORING PROFILE.
+#
+# Blnk's /metrics endpoint is guarded by MetricsAuthHandler, whose behaviour
+# depends on two settings and has three distinct outcomes:
+#
+#   1. server.secure false, no metrics_bearer_token  -> every scrape succeeds
+#      unauthenticated. This is the default local stack, and the jobs below work
+#      as written.
+#   2. metrics_bearer_token SET                      -> every request without
+#      `Authorization: Bearer <token>` is refused. The jobs below then collect
+#      NOTHING, every series the alert rules match on is absent, and the two
+#      Kafka alerts sit permanently unable to fire. Prometheus shows the target
+#      as down; the rules report no error. An alert that cannot fire looks
+#      exactly like a system with nothing wrong.
+#   3. server.secure true with NO metrics_bearer_token -> the endpoint refuses
+#      every request outright, including authenticated ones.
+#
+# So if you have configured a token — which the production Kubernetes manifests
+# assume, and which any secure deployment requires — you MUST enable the two
+# authorization blocks below, and that takes a change in docker-compose.yaml as
+# well as here.
+#
+# Why this is commented out rather than simply enabled, unlike the Kubernetes
+# copy in infrastructure/k8s-manifests/prometheus-configmap.yaml where it is
+# unconditional: case 1 above is a legitimate and common way to run locally, and
+# credentials_file is validated at CONFIG LOAD. Prometheus refuses to start when
+# the file is absent, so enabling it unconditionally here would break every
+# local stack that does not use a token, to fix a case that does not apply to
+# them. Production has no such ambiguity — it always has a token — which is why
+# the Kubernetes side is enabled outright.
+#
+# TO ENABLE (two steps, both required):
+#
+#   1. Write the token to a file that is NOT committed, and mount it. The
+#      prometheus service in docker-compose.yaml already mounts ./alerts, so the
+#      rule_files glob above is armed; the token file is the one mount to add:
+#        volumes:
+#          - ./prometheus.yml:/etc/prometheus/prometheus.yml
+#          - ./alerts:/etc/prometheus/alerts:ro
+#          - ./.secrets/metrics-bearer-token:/etc/prometheus/secrets/metrics-bearer-token:ro
+#      Create the file with the same value as server.metrics_bearer_token in
+#      blnk.json (one token guards both the server and the worker):
+#        mkdir -p .secrets && printf '%s' "$BLNK_METRICS_BEARER_TOKEN" > .secrets/metrics-bearer-token
+#      Keep .secrets/ out of version control.
+#
+#   2. Uncomment the two authorization blocks below.
+#
+# Use credentials_file and NOT inline `credentials`. Inline would put the token
+# into this committed file, which is how tokens end up in version control
+# history; and credentials_file is re-read on every scrape, so rotating the
+# token needs no restart.
+#
+# Verify afterwards at http://localhost:9090: /targets must show both jobs UP,
+# and /rules must list DeadLetterMessageStuck and SubscriberConsumerLagHigh.
+# Checking /targets alone is not enough — a target can be UP while the rules
+# never loaded.
 scrape_configs:
   - job_name: 'blnk-server'
-    # Uncomment to authenticate when metrics_bearer_token is configured in blnk.json:
     # authorization:
     #   type: Bearer
-    #   credentials: '<your-metrics-bearer-token>'
+    #   credentials_file: /etc/prometheus/secrets/metrics-bearer-token
     static_configs:
       - targets: ['server:5001']
   - job_name: 'blnk-worker'
     # authorization:
     #   type: Bearer
-    #   credentials: '<your-metrics-bearer-token>'
+    #   credentials_file: /etc/prometheus/secrets/metrics-bearer-token
     static_configs:
       - targets: ['worker:5004']

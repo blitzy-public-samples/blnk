@@ -162,8 +162,9 @@ func NotifyError(systemError error) {
 		// call site — so gating on the webhook URL alone would drop it entirely on a
 		// Kafka-only deployment, which is the intended end state once webhooks are
 		// retired. With neither configured nothing is attempted, preserving the
-		// historic no-op-when-unconfigured behaviour. A non-empty broker list means at
-		// least one dialable address: setKafkaDefaults normalizes blank entries away.
+		// no-op-when-unconfigured behaviour. A non-empty broker list means at least one
+		// nonblank configured address, since setKafkaDefaults normalizes blank entries
+		// away; whether that address is reachable is not established here.
 		sender := getWebhookSender()
 		if sender != nil && (len(conf.Kafka.Brokers) > 0 || conf.Notification.Webhook.Url != "") {
 			// The payload is SANITIZED and the raw error is NOT in it. See

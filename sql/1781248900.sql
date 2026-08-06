@@ -498,6 +498,35 @@ CREATE UNIQUE INDEX IF NOT EXISTS event_subscribers_kafka_principal_uidx
 CREATE INDEX IF NOT EXISTS idx_event_subscribers_migrated_at
     ON blnk.event_subscribers (migrated_at);
 
+-- The listing order, matched exactly.
+--
+-- The registry is read newest first, ORDER BY created_at DESC, id DESC. Without an
+-- index in that order PostgreSQL has to read every subscriber and sort the whole
+-- set before it can return the first page, so the cost of page one grows with the
+-- size of the registry and a large enough registry spills the sort to disk. With
+-- it, the scan starts at the newest row and stops once LIMIT is satisfied, so the
+-- cost is proportional to the PAGE.
+--
+-- The column order is the ORDER BY, term for term, including both DESC markers.
+-- That is what lets the index be read forwards to produce the required order
+-- directly. It is also what makes the keyset cursor work: the paging predicate is
+-- the row comparison (created_at, id) < (:created_at, :id), and a leading-column
+-- match on the same pair is what the planner positions the scan from instead of
+-- filtering after the fact.
+--
+-- The id tie-break is not decoration. created_at is stamped in Go, so two
+-- subscribers registered in the same microsecond share an instant and their
+-- relative order would otherwise be whatever the scan happened to produce —
+-- unstable between two executions of the same query, which is precisely how a
+-- paginated walk both repeats and skips rows at a page boundary.
+--
+-- A btree can be scanned in either direction, so this one also serves an
+-- oldest-first read of the same pair; the explicit DESC is about matching the
+-- default listing without a reverse scan, not about making the other direction
+-- possible.
+CREATE INDEX IF NOT EXISTS idx_event_subscribers_created_at
+    ON blnk.event_subscribers (created_at DESC, id DESC);
+
 -- +migrate Down
 
 -- Indexes first, then the table, in reverse creation order. Dropping the table
@@ -506,6 +535,7 @@ CREATE INDEX IF NOT EXISTS idx_event_subscribers_migrated_at
 -- other, and it documents exactly what this migration created. Index names are
 -- schema-qualified in the drop even though they are unqualified in the create;
 -- that asymmetry is the house convention.
+DROP INDEX IF EXISTS blnk.idx_event_subscribers_created_at;
 DROP INDEX IF EXISTS blnk.idx_event_subscribers_migrated_at;
 DROP INDEX IF EXISTS blnk.event_subscribers_kafka_principal_uidx;
 DROP INDEX IF EXISTS blnk.event_subscribers_subscriber_id_uidx;

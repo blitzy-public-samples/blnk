@@ -36,67 +36,36 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
-// event_replay_fidelity_test.go proves ONE acceptance criterion and nothing else:
-// a replayed dead-lettered event matches the original BYTE FOR BYTE, aside from the
-// failure metadata.
+// event_replay_fidelity_test.go is the acceptance evidence for one criterion: a replayed
+// dead-lettered event carries the same bytes as the original, aside from the failure
+// metadata.
 //
-// # WHY BYTE EQUALITY IS ACHIEVABLE AT ALL
+// What a replay reproduces is the envelope deterministically reconstructed from the stored
+// outbox row. The payload is the stored bytes, spliced in untransformed because
+// model.LedgerEvent.Payload is json.RawMessage rather than a map or a typed struct, and the
+// five envelope scalars are re-serialised from the same row by marshalLedgerEvent, which
+// composes the object member by member — so one row always yields one byte sequence.
 //
-// It is achievable because replay re-publishes the ORIGINAL STORED BYTES rather than
-// re-marshalling from a struct. Two design decisions in the code under test make that
-// true, and this file exists to hold both of them in place:
+// ComposeDeadLetterMessage attaches the failure metadata by replacing the envelope's closing
+// brace with `,"failure_metadata":<metadata>}`. Every envelope byte before that brace is
+// preserved, so the envelope is not a complete prefix of the dead-letter message — the brace
+// is the byte that moves — while StripFailureMetadata is the exact inverse and reconstructs
+// the envelope byte for byte.
 //
-//  1. model.LedgerEvent.Payload is typed json.RawMessage — not map[string]interface{},
-//     not a typed struct — precisely so the payload bytes pass through untransformed.
-//  2. marshalLedgerEvent composes the envelope member by member and SPLICES those bytes
-//     in verbatim, and ComposeDeadLetterMessage attaches the failure metadata by
-//     replacing the envelope's closing brace with `,"failure_metadata":<metadata>}`.
-//     The original envelope is therefore a byte-exact PREFIX of the dead-letter message,
-//     and StripFailureMetadata is the exact byte-level inverse.
+// The fixtures are chosen so a struct round trip would be visible: decoding into a map or a
+// typed struct and re-encoding would reorder keys, renormalise number literals, re-render
+// timestamps or drop members no Go struct declares.
 //
-// Every alternative implementation of the same feature — decode into a map and
-// re-encode, decode into a typed struct and re-encode, "just re-marshal the
-// LedgerEvent" — would reorder keys, renormalise number literals, re-render timestamp
-// strings, strip insignificant whitespace, or silently drop members no Go struct
-// declares. Any one of those makes the guarantee unachievable rather than merely
-// harder.
+// No broker is required. The transport is substituted through
+// EventDeadLetterService.withTransport with a recording publisher and dead-letter writer, and
+// the recording publisher marshals through the real marshalLedgerEvent, so the bytes it
+// captures are the bytes a broker would have received.
 //
-// THIS FILE'S JOB IS TO FAIL IF A FUTURE CHANGE REINTRODUCES A STRUCT ROUND TRIP.
-// That is only possible if the fixtures would visibly change under one, which is why
-// the fixtures below are what they are and why
-// TestReplayFidelity_FixturesWouldExposeAReMarshal exists to keep them that way. A
-// fixture that round-trips cleanly cannot tell a correct implementation from a broken
-// one, and a test that cannot tell them apart is worse than no test.
-//
-// # NO BROKER IS REQUIRED
-//
-// Everything here runs under `go test -short` with no Kafka anywhere. The transport is
-// substituted through EventDeadLetterService.withTransport, which installs a recording
-// publisher and a recording dead-letter writer, so there is no live broker to guard
-// with testing.Short() and nothing to skip. The recording publisher marshals through
-// the REAL marshalLedgerEvent, so the bytes it captures are the bytes a broker would
-// have received.
-//
-// # SCOPE — what deliberately is NOT here
-//
-//   - No dual-delivery comparison. event_dual_delivery_test.go owns that criterion.
-//   - No ordering or crash-recovery assertions. Their own integration tests own those.
-//   - No HTTP-level assertions on the replay endpoint or its master-key gate.
-//     api/events_api_test.go owns those.
-//   - No consumer implementation beyond the verification above. Blnk ships no consumer
-//     library and no subscriber-side dead-letter management, and nothing here reads
-//     from Kafka.
+// Adjacent criteria live elsewhere: dual delivery in event_dual_delivery_test.go, ordering and
+// crash recovery in their own integration tests, and the replay endpoint with its master-key
+// gate in api/events_api_test.go.
 
-// ---------------------------------------------------------------------------
 // Pinned instants
-//
-// Every timestamp in this file is fixed. The service clock is settable (see
-// replayFidelityClock) so that "the event occurred at X", "we gave up on it at Y" and
-// "an operator replayed it at Z" are three distinguishable instants rather than three
-// readings of time.Now() that happen to be microseconds apart. The assertion that a
-// replay carries the ORIGINAL occurrence time and not the replay time is only
-// meaningful when the two cannot coincide.
-// ---------------------------------------------------------------------------
 
 var (
 	// replayFidelityOccurredAt is the domain instant every fixture event occurred at.
@@ -130,58 +99,9 @@ const replayFidelityMaxAttempts = 5
 // errReplayFidelityBroker is the transient broker failure that exhausts the retry
 // budget. Its text is asserted to survive into FailureMetadata.ErrorReason, so an
 // implementation that discarded the cause and stored an empty or generic reason fails.
-//
-// The name carries the err prefix staticcheck's ST1012 requires for a package-level
-// error value, and keeps the ReplayFidelity discriminator so it cannot collide with a
-// symbol declared by another test file in this package.
 var errReplayFidelityBroker = errors.New("write tcp 10.0.0.4:9092: broken pipe")
 
-// ---------------------------------------------------------------------------
 // THE FIXTURES
-//
-// These payload byte strings are the single most important design decision in this
-// file, so the reasoning is spelled out rather than implied.
-//
-// # They are real production bytes, not invented ones
-//
-// blnk.event_outbox.payload is a JSONB column. Postgres does not store JSONB
-// verbatim: it parses the document and re-renders it on read, ordering members by
-// (key length, then bytewise) and inserting a space after every colon and every
-// comma. The byte strings below are the VERBATIM `::jsonb::text` renderings produced
-// by the Postgres 16 instance this repository develops against, so they are exactly
-// what scanEventOutbox hands the relay after ClaimPendingEventOutbox — not an
-// approximation of it.
-//
-// # Every property below is load-bearing
-//
-// Each fixture is built so that a struct or map round trip is VISIBLE. Remove any one
-// of these and the corresponding class of regression stops being detectable:
-//
-//   - INSIGNIFICANT WHITESPACE (`": "`, `", "`). Any re-marshal runs the bytes through
-//     encoding/json's compactor, which strips it. This is the property that catches
-//     even the most innocent-looking regression — "just re-marshal the LedgerEvent" —
-//     because json.RawMessage is compacted on the way out.
-//   - NON-ALPHABETICAL MEMBER ORDER. Postgres orders by length-then-bytewise; Go
-//     marshals a map with its keys sorted lexicographically. The two never agree here,
-//     so any map round trip reorders members.
-//   - A NUMBER THAT LOSES PRECISION AS A float64: 9007199254740993 is 2^53 + 1 and
-//     comes back as 9007199254740992.
-//   - A NUMBER THAT CHANGES NOTATION: 123456789012345678901234 is re-rendered as
-//     1.2345678901234569e+23. (Note that a merely large integer such as 1000000 does
-//     NOT change under Go's encoder — Go only switches to exponent notation past about
-//     1e21 — so the value has to be this big to make the notation change happen.)
-//   - A HIGH-PRECISION DECIMAL: 0.10000000000000000555 collapses to 0.1.
-//   - A TIMESTAMP STRING IN A FORM GO WOULD RE-RENDER: "…T12:34:56.789000+00:00"
-//     becomes "…T12:34:56.789Z" the moment anything decodes it into a time.Time.
-//   - AN "unmodelled_extension" MEMBER THAT NO GO STRUCT IN THIS REPOSITORY DECLARES,
-//     which a typed round trip drops silently — the failure mode with no error message
-//     and no stack trace, and the reason a byte comparison is the right assertion.
-//
-// No fixture contains `<`, `>` or `&`. Those characters are HTML-escaped by
-// json.Marshal when the producer builds the row, so they are already in escaped form
-// by the time they are stored and are worthless as discriminators; including them
-// would only add noise.
-// ---------------------------------------------------------------------------
 
 // replayFidelityTransactionPayload is a transaction.applied body as read back from the
 // payload column. It routes to the transactions category.
@@ -238,12 +158,6 @@ type replayFidelityFixture struct {
 
 // replayFidelityFixtures returns one fixture per event category, with the four
 // dead-letter topic names written out as LITERALS rather than derived with DLTFor.
-//
-// Spelling them out is the point. Deriving the expected value from the same function
-// the implementation uses would make the assertion tautological: DLTFor could append
-// ".deadletter" and the test would still pass. These four names are a published
-// contract that provisioning scripts, alert rules, subscriber documentation and
-// operator runbooks all depend on, so they are pinned here as text.
 func replayFidelityFixtures() []replayFidelityFixture {
 	return []replayFidelityFixture{
 		{
@@ -300,10 +214,6 @@ func replayFidelityFixtures() []replayFidelityFixture {
 
 // row builds the outbox row the relay would have claimed for this fixture: the
 // envelope columns populated, the retry budget set, and the row still pending.
-//
-// Every subsequent state is reached by exercising the code under test rather than by
-// hand-editing the row, so the transitions this file asserts are the implementation's
-// own.
 func (f replayFidelityFixture) row(id int64) model.EventOutbox {
 	return model.EventOutbox{
 		ID:            id,
@@ -321,15 +231,10 @@ func (f replayFidelityFixture) row(id int64) model.EventOutbox {
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Test doubles
 // ---------------------------------------------------------------------------
 
 // replayFidelityClock is the settable clock installed on the service under test.
-//
-// It exists so that the dead-letter instant and the replay instant are a day apart and
-// therefore distinguishable. Every reading goes through the mutex, so the doubles stay
-// safe under `go test -race` even though the tests themselves are sequential.
 type replayFidelityClock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -352,24 +257,6 @@ func (c *replayFidelityClock) Set(at time.Time) {
 }
 
 // replayFidelityStore is an in-memory eventDeadLetterStore.
-//
-// It implements the five-method repository seam the dead-letter service depends on and
-// applies the SAME state transitions database/event_outbox.go does, which is what lets
-// this file assert the post-replay row state without a database:
-//
-//   - MarkEventDeadLettered sets status to dead_lettered, records dlt_topic and
-//     failure_metadata, and releases the lease.
-//   - MarkEventDispatched sets status to dispatched, stamps dispatched_at and releases
-//     the lease — and deliberately RETAINS dlt_topic and failure_metadata, exactly as
-//     the SQL does, because the history of what went wrong must survive a replay.
-//   - GetEventByID reports a missing row as a typed not-found APIError rather than as
-//     (nil, nil), matching the repository's documented deviation.
-//   - ListDeadLetteredEvents returns only the two terminal failure states, newest
-//     occurrence first with id descending as the tie-break.
-//
-// Reproducing the transitions rather than stubbing them is the difference between
-// asserting that the service asked for the right transition and asserting that the row
-// ends up in the right state. This file wants the latter.
 type replayFidelityStore struct {
 	mu sync.Mutex
 
@@ -532,8 +419,6 @@ func (s *replayFidelityStore) appliedTransitions() []string {
 // byID finds a row by its surrogate primary key. The service's two write transitions
 // address rows by id, whereas the read addresses them by event id, so the store has to
 // support both.
-//
-// The caller must hold s.mu.
 func (s *replayFidelityStore) byID(id int64) *model.EventOutbox {
 	for _, eventID := range s.order {
 		if row := s.rows[eventID]; row != nil && row.ID == id {
@@ -705,15 +590,6 @@ type replayFidelityCapture struct {
 }
 
 // replayFidelityPublisher is a recording TopicEventPublisher.
-//
-// It marshals through the REAL marshalLedgerEvent — the same function the Kafka
-// publisher uses — so the bytes it captures are the bytes a broker would have received.
-// Reimplementing the serialisation here would make every byte assertion in this file a
-// tautology about the double.
-//
-// It is NOT the no-op publisher, deliberately. ReplayDeadLetteredEvent refuses to
-// replay through a no-op and returns ErrKafkaUnavailable, so a double based on
-// NoopEventPublisher could never reach the code this file exists to test.
 type replayFidelityPublisher struct {
 	mu sync.Mutex
 
@@ -785,11 +661,6 @@ func (p *replayFidelityPublisher) Publish(ctx context.Context, event model.Ledge
 
 // PublishToTopic marshals the envelope with the production serialiser, records what
 // would have gone on the wire, and then reports success or the programmed failure.
-//
-// The order matters: the bytes are captured BEFORE the failure is applied, so a failed
-// attempt still yields the message that would have been sent. That is what makes the
-// original bytes observable from attempt one rather than having to be recomputed —
-// recomputing them would be assuming the very equality under test.
 func (p *replayFidelityPublisher) PublishToTopic(
 	_ context.Context,
 	req PublishRequest,
@@ -855,11 +726,6 @@ var _ TopicEventPublisher = (*replayFidelityPublisher)(nil)
 
 // replayFidelityWriter is a recording deadLetterMessageWriter: the one raw Kafka write
 // the dead-letter path performs lands here.
-//
-// It is per-topic, exactly as *kafka.Writer is, and it asserts that contract itself:
-// kafka-go rejects a message that names a topic when the writer already has one, so a
-// message arriving here with Topic set would be a real defect and is captured so a test
-// can say so.
 type replayFidelityWriter struct {
 	mu sync.Mutex
 
@@ -900,18 +766,11 @@ func (w *replayFidelityWriter) written() []kafka.Message {
 // Compile-time proof that the double satisfies the dead-letter write seam.
 var _ deadLetterMessageWriter = (*replayFidelityWriter)(nil)
 
-// ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
 // replayFidelityConfiguration returns a configuration in which event publishing is
 // enabled by the Kafka transport alone.
-//
-// The legacy webhook URL is left empty on purpose, so that nothing in this file can
-// accidentally depend on the legacy transport or POST anywhere. The broker address is
-// never dialled: the transport is substituted before any operation runs, and it is
-// present only because it is what makes event publishing "configured" for
-// PrepareEventOutbox.
 func replayFidelityConfiguration() *config.Configuration {
 	return &config.Configuration{
 		Kafka: config.KafkaConfig{Brokers: []string{"localhost:9092"}},
@@ -921,17 +780,6 @@ func replayFidelityConfiguration() *config.Configuration {
 
 // replayFidelityStoreConfiguration publishes cnf to config.ConfigStore and restores
 // whatever was there before once the test finishes.
-//
-// config.ConfigStore is a process-global atomic.Value, so leaking a Kafka-configured
-// state out of one test produces confusing failures in unrelated ones. The restore is
-// registered with t.Cleanup so it runs even when a test fails or calls t.Fatal, and it
-// is what lets the whole suite be run twice consecutively with the same result.
-//
-// It writes to the store DIRECTLY rather than through config.MockConfig, matching the
-// approach the other event tests take: MockConfig runs validateAndAddDefaults, which
-// refuses to store a configuration lacking a data-source and Redis DSN — the value
-// would be silently dropped — and which would also apply defaults this file needs to
-// control itself.
 func replayFidelityStoreConfiguration(t *testing.T, cnf *config.Configuration) {
 	t.Helper()
 
@@ -953,14 +801,6 @@ func replayFidelityStoreConfiguration(t *testing.T, cnf *config.Configuration) {
 
 // replayFidelityHarness wires a dead-letter service to the recording doubles and owns
 // their lifetimes.
-//
-// The service is built with NO publisher and then has one INSTALLED through
-// withTransport. That sequencing is deliberate: passing the recording publisher to the
-// constructor would have it wrapped by publisherWriterResolver, which resolves a writer
-// only for the real Kafka publisher and rejects anything else — so the dead-letter
-// write would fail with ErrKafkaUnavailable before reaching the composition this file
-// tests. Installing the transport explicitly substitutes both halves at once, which is
-// exactly what withTransport documents itself as being for.
 type replayFidelityHarness struct {
 	// store is the in-memory repository.
 	store *replayFidelityStore
@@ -1062,16 +902,6 @@ func (h *replayFidelityHarness) resolutions() []string {
 
 // exhaustRetryBudget drives the row through its whole retry budget against a failing
 // broker and returns the row as the relay would hold it at exhaustion.
-//
-// It reproduces the relay's per-attempt bookkeeping rather than importing the relay:
-// every attempt goes through PublishRequestFromOutbox and the publisher's own
-// PublishToTopic, the attempt counter advances, the failure reason is recorded, and the
-// attempt window is stamped. Reproducing it keeps this file's subject strictly the
-// dead-letter and replay path — the retry SCHEDULE is asserted by the relay's own test,
-// and a dependency on the relay here would couple two acceptance criteria that must be
-// able to fail independently.
-//
-// No wall-clock time passes: the backoff schedule is not exercised, only the budget.
 func (h *replayFidelityHarness) exhaustRetryBudget(
 	t *testing.T,
 	row model.EventOutbox,
@@ -1108,22 +938,10 @@ func (h *replayFidelityHarness) exhaustRetryBudget(
 	return row, lastErr
 }
 
-// ---------------------------------------------------------------------------
 // Byte-level assertion helpers
-//
-// Every comparison in this file is on RAW BYTES. Nothing here unmarshals both sides
-// into maps and compares those: a map comparison discards member order, which is one of
-// the exact properties a re-marshal destroys, so it would report equality for bytes
-// that are demonstrably different. Decoding is used only to read a single field's
-// VALUE, never to establish equality.
-// ---------------------------------------------------------------------------
 
 // replayFidelityTopLevelKeys returns the top-level member names of a JSON object IN
 // DOCUMENT ORDER.
-//
-// It walks the token stream rather than decoding into a map, because a map has no
-// order. Member values are consumed as raw JSON and discarded, so nesting depth and
-// content are irrelevant.
 func replayFidelityTopLevelKeys(t *testing.T, raw []byte) []string {
 	t.Helper()
 
@@ -1198,11 +1016,6 @@ func replayFidelityEnvelopeRoundTrip(t *testing.T, raw []byte) []byte {
 }
 
 // replayFidelityWebhookRoundTrip returns the payload after a NewWebhook round trip.
-//
-// NewWebhook.Payload is interface{}, so this does NOT drop members — the inner object
-// decodes to a map. What it does do is reorder that map's members and renormalise its
-// numbers, which is precisely the point: even the codebase's own webhook body type
-// cannot be used as a staging post for these bytes without changing them.
 func replayFidelityWebhookRoundTrip(t *testing.T, raw []byte) []byte {
 	t.Helper()
 
@@ -1215,18 +1028,6 @@ func replayFidelityWebhookRoundTrip(t *testing.T, raw []byte) []byte {
 }
 
 // replayFidelityModelledBody stands in for ANY struct-typed view of the webhook body.
-//
-// It declares the outer two-key contract and, inside data, nothing at all. That is not a
-// shortcut: encoding/json silently discards every member of a JSON object that the
-// target struct does not declare, so a struct with no data members demonstrates the
-// failure mode for all of them at once, and does so identically for all four fixtures
-// without needing a different struct per category.
-//
-// The member named "unmodelled_extension" in every fixture is deliberately one that NO
-// Go struct anywhere in this repository declares — it is the vendor-extension case a
-// real payload can genuinely carry. It therefore disappears through any typed view, with
-// no error and no warning, which is exactly why the guarantee has to be asserted on
-// BYTES and not on a decoded document.
 type replayFidelityModelledBody struct {
 	Event string   `json:"event"`
 	Data  struct{} `json:"data"`
@@ -1247,16 +1048,6 @@ func replayFidelityTypedRoundTrip(t *testing.T, raw []byte) []byte {
 
 // replayFidelityAPICode extracts the CANONICAL typed error code from an error, failing
 // the test when the error is not a typed apierror.
-//
-// Both the value and the pointer form are handled because apierror.NewAPIError returns
-// a VALUE, while some layers wrap a pointer, and a helper that handled only one would
-// silently fall through to a confusing failure.
-//
-// The code is normalised because the codebase still constructs legacy generic codes in
-// places — the replay path's own blank-row guard raises INVALID_INPUT rather than
-// GEN_VALIDATION_ERROR — and it is the canonical code a caller is answered with.
-// Asserting the canonical form is therefore both more accurate and immune to a legacy
-// code being replaced by its canonical equivalent later.
 func replayFidelityAPICode(t *testing.T, err error) apierror.ErrorCode {
 	t.Helper()
 
@@ -1277,7 +1068,6 @@ func replayFidelityAPICode(t *testing.T, err error) apierror.ErrorCode {
 	return ""
 }
 
-// ---------------------------------------------------------------------------
 // The scenario
 // ---------------------------------------------------------------------------
 
@@ -1316,11 +1106,6 @@ type replayFidelityScenario struct {
 
 // runScenario takes one fixture from pending row to replayed event and returns the
 // evidence.
-//
-// The sequence is the production one, step for step: the relay spends the retry budget
-// against a failing broker, the exhausted row is dead-lettered to its `<topic>.dlt`
-// sibling with failure metadata attached, the broker recovers, and an operator replays
-// the event a day later.
 func (h *replayFidelityHarness) runScenario(
 	t *testing.T,
 	fixture replayFidelityFixture,
@@ -1393,22 +1178,11 @@ func (h *replayFidelityHarness) runScenario(
 	}
 }
 
-// ---------------------------------------------------------------------------
 // The anti-vacuity guard
 // ---------------------------------------------------------------------------
 
 // TestReplayFidelity_FixturesWouldExposeAReMarshal proves the fixtures can tell a
 // correct implementation from a broken one.
-//
-// THIS TEST IS THE REASON THE REST OF THE FILE IS WORTH ANYTHING. A byte-equality
-// assertion over a fixture that survives a round trip unchanged passes just as happily
-// against an implementation that decodes and re-encodes as against one that splices
-// bytes. It would look like coverage and provide none.
-//
-// So each fixture is checked against the three re-marshals a future change could
-// plausibly introduce, and each must CHANGE the bytes. If one of these assertions ever
-// fails, the fixture has stopped being discriminating and must be rebuilt before the
-// file can be trusted again — the failure message says so.
 func TestReplayFidelity_FixturesWouldExposeAReMarshal(t *testing.T) {
 	for _, fixture := range replayFidelityFixtures() {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -1461,11 +1235,6 @@ func TestReplayFidelity_FixturesWouldExposeAReMarshal(t *testing.T) {
 
 // TestReplayFidelity_EnvelopeWouldExposeAReMarshal proves the ENVELOPE is discriminating
 // too, not just the payload inside it.
-//
-// The payload checks above cannot catch a regression that decodes the envelope into a
-// map: a Go map marshals with its keys sorted, and the envelope's own member order is
-// contractual, so that reordering has to be detectable on its own terms. This asserts
-// both re-marshals of the whole envelope change it.
 func TestReplayFidelity_EnvelopeWouldExposeAReMarshal(t *testing.T) {
 	harness := newReplayFidelityHarness(t)
 	fixture := replayFidelityFixtures()[0]
@@ -1489,18 +1258,11 @@ func TestReplayFidelity_EnvelopeWouldExposeAReMarshal(t *testing.T) {
 	assert.Empty(t, harness.publisher.captures(), "this test publishes nothing")
 }
 
-// ---------------------------------------------------------------------------
 // Criterion V-9: byte-for-byte replay, across every category
 // ---------------------------------------------------------------------------
 
 // TestReplayFidelity_ReplayedMessageIsByteIdenticalToTheOriginal is the acceptance test
 // for criterion V-9.
-//
-// It runs the whole scenario once per event CATEGORY, so a category-specific bug in
-// dead-letter routing or in original-topic recovery is caught rather than hidden behind
-// a single happy-path event, and it pins the four dead-letter topic names as literals.
-//
-// The assertions, in the order they appear:
 //
 //  1. The replayed bytes are byte-identical to the original bytes.
 //  2. The failure metadata is the ONLY difference between the original message and the
@@ -1618,22 +1380,11 @@ func TestReplayFidelity_ReplayedMessageIsByteIdenticalToTheOriginal(t *testing.T
 	}
 }
 
-// ---------------------------------------------------------------------------
 // The failure metadata: the one thing that IS different
 // ---------------------------------------------------------------------------
 
 // TestReplayFidelity_FailureMetadataCarriesEveryDocumentedField asserts the metadata
 // that constitutes the "aside from" in "byte-for-byte aside from the failure metadata".
-//
-// All five documented fields are checked, because the metadata exists to answer an
-// operator's three questions — where was this event meant to go, why did it not get
-// there, and over what window did we try — and a field left at its zero value answers
-// nothing while looking like a successful read.
-//
-// The attempt count is checked against the CONFIGURED MAXIMUM specifically. An exhausted
-// row has spent its whole budget, so a count that disagrees with the maximum means the
-// exhaustion accounting is wrong: too high and something spent an extra attempt against
-// a five-attempt budget, too low and the row was dead-lettered before its budget ran out.
 func TestReplayFidelity_FailureMetadataCarriesEveryDocumentedField(t *testing.T) {
 	for index, fixture := range replayFidelityFixtures() {
 		t.Run(fixture.name, func(t *testing.T) {
@@ -1691,17 +1442,11 @@ func TestReplayFidelity_FailureMetadataCarriesEveryDocumentedField(t *testing.T)
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Post-replay state, and repeat replay
 // ---------------------------------------------------------------------------
 
 // TestReplayFidelity_ReplayedRowLeavesTheDeadLetterInventory asserts the row ends in the
 // state the implementation documents, and that the inventory reflects it.
-//
-// Three properties are asserted together because they are one behaviour: a replayed row
-// becomes dispatched, so it disappears from the triage inventory and stops being
-// presented as needing attention — while retaining dlt_topic and failure_metadata, so
-// the history of what went wrong is not erased by fixing it.
 func TestReplayFidelity_ReplayedRowLeavesTheDeadLetterInventory(t *testing.T) {
 	harness := newReplayFidelityHarness(t)
 	fixture := replayFidelityFixtures()[0]
@@ -1770,16 +1515,6 @@ func TestReplayFidelity_ReplayedRowLeavesTheDeadLetterInventory(t *testing.T) {
 
 // TestReplayFidelity_RepeatReplayIsRejectedRatherThanDuplicating asserts that replaying
 // the same event twice is EXPLICITLY REFUSED and never silently duplicates it.
-//
-// This is the accidental-duplication case the status precondition exists to prevent — an
-// operator working a triage list and replaying the same entry twice. Either documented
-// behaviour would be acceptable, idempotent or rejected, but silence would not: a second
-// publish with no acknowledgement of the repeat is a duplicate the operator did not know
-// they had caused.
-//
-// The implementation refuses, because a successful replay moves the row out of the
-// dead-lettered state and the precondition no longer holds. Both halves are asserted:
-// the typed refusal, AND that no second message was published.
 func TestReplayFidelity_RepeatReplayIsRejectedRatherThanDuplicating(t *testing.T) {
 	harness := newReplayFidelityHarness(t)
 	fixture := replayFidelityFixtures()[0]
@@ -1812,18 +1547,6 @@ func TestReplayFidelity_RepeatReplayIsRejectedRatherThanDuplicating(t *testing.T
 // TestReplayFidelity_ReplayRejectionsCarryTheirDocumentedCodeAndStatus asserts each
 // refusal returns its own typed code, and that each code maps to the status it is meant
 // to.
-//
-// The status half is not incidental. apierror.StatusForCode defaults an UNMAPPED code to
-// 500, so a code added without a statusByCode entry would answer "internal server error"
-// to a caller who asked for an event that does not exist — indistinguishable from a bug
-// in Blnk, and it would send an operator looking in the wrong place. Asserting the
-// mapping here is what stops that from being possible, and each is additionally asserted
-// NOT to be 500 so that a code silently falling through to the default cannot pass.
-//
-// The three refusals are distinct operator situations and must not be conflated:
-//   - a blank id is a malformed request,
-//   - an unknown id is a wrong id,
-//   - a present but not-dead-lettered event is a state error, most often a repeat replay.
 func TestReplayFidelity_ReplayRejectionsCarryTheirDocumentedCodeAndStatus(t *testing.T) {
 	harness := newReplayFidelityHarness(t)
 	ctx := context.Background()
@@ -1888,25 +1611,12 @@ func TestReplayFidelity_ReplayRejectionsCarryTheirDocumentedCodeAndStatus(t *tes
 	assert.Empty(t, harness.store.appliedTransitions())
 }
 
-// ---------------------------------------------------------------------------
 // Where the replay destination comes from
 // ---------------------------------------------------------------------------
 
 // TestReplayFidelity_ReplayTopicComesFromTheStoredFailureMetadata asserts the replay
 // destination is RECOVERED FROM THE STORED METADATA rather than re-derived from the event
 // type.
-//
-// Under the default configuration both routes give the same answer, so an assertion made
-// on a default-prefixed event proves nothing — it would pass against an implementation
-// that re-derived the topic every time. This test therefore constructs the one situation
-// in which the two disagree: an event stored while KAFKA_TOPIC_PREFIX was something else,
-// so its recorded destination is "legacy.transactions" while the event type's CURRENT
-// mapping is "blnk.transactions".
-//
-// It then goes further and removes the row's own topic column after dead-lettering, so
-// that originalTopicOf would fall back to the current mapping. The stored failure
-// metadata becomes the ONLY place the original destination survives, and the replay is
-// asserted to honour it. What was recorded wins.
 func TestReplayFidelity_ReplayTopicComesFromTheStoredFailureMetadata(t *testing.T) {
 	harness := newReplayFidelityHarness(t)
 	ctx := context.Background()
@@ -1966,25 +1676,11 @@ func TestReplayFidelity_ReplayTopicComesFromTheStoredFailureMetadata(t *testing.
 		"a changed destination must not change the partition key either")
 }
 
-// ---------------------------------------------------------------------------
 // The real producer path
 // ---------------------------------------------------------------------------
 
 // TestReplayFidelity_RowFromTheRealProducerPathReplaysFaithfully runs the scenario on a
 // row built by the PRODUCTION producer path rather than by this file's fixture builder.
-//
-// The fixtures above are the bytes as they come back OUT of the JSONB payload column,
-// which is what the relay works from and therefore the right input for a fidelity test.
-// This test closes the loop at the other end: it has PrepareEventOutbox — the function
-// every one of the eight producer call sites reaches through PublishEvent — build the row,
-// asserts the row is pending with the payload the producer marshaled, and then puts THAT
-// row through the same dead-letter and replay sequence.
-//
-// The two renderings are the same JSON document in different byte form, which is asserted
-// with JSONEq. Note carefully that JSONEq is used HERE AND ONLY HERE, to state a
-// deliberate semantic equivalence between what the producer wrote and what the column
-// gives back. Every fidelity assertion in this file is on raw bytes, because a semantic
-// comparison is exactly what would let a re-marshal through.
 func TestReplayFidelity_RowFromTheRealProducerPathReplaysFaithfully(t *testing.T) {
 	harness := newReplayFidelityHarness(t)
 	ctx := context.Background()
@@ -2097,12 +1793,6 @@ func TestReplayFidelity_RowFromTheRealProducerPathReplaysFaithfully(t *testing.T
 }
 
 // replayFidelityDataMember extracts the "data" member of a webhook body as RAW BYTES.
-//
-// It is raw on purpose. Handing PrepareEventOutbox a json.RawMessage is what carries the
-// crafted member order and number literals through the producer's own json.Marshal
-// untouched; decoding the fixture into a map first would re-sort its members and
-// renormalise its numbers before the code under test ever saw them, and the test would
-// then be measuring the fixture builder rather than the implementation.
 func replayFidelityDataMember(t *testing.T, body string) json.RawMessage {
 	t.Helper()
 
@@ -2115,19 +1805,11 @@ func replayFidelityDataMember(t *testing.T, body string) json.RawMessage {
 	return data
 }
 
-// ---------------------------------------------------------------------------
 // Harness hygiene
 // ---------------------------------------------------------------------------
 
 // TestReplayFidelity_LeaksNoConfigurationBetweenTests asserts this file's harness is well
 // behaved.
-//
-// config.ConfigStore is a process-global atomic.Value, and every test above publishes to
-// it. Without the t.Cleanup restore, a Kafka-configured state would leak into unrelated
-// tests in this package and fail them far from their cause — and the suite would stop
-// being repeatable, so running it twice in a row would not give the same answer. This
-// publishes a recognisable configuration through a subtest and then asserts the store no
-// longer carries it, which is only true if the cleanup ran.
 func TestReplayFidelity_LeaksNoConfigurationBetweenTests(t *testing.T) {
 	const sentinelPrefix = "replay-fidelity-leak-sentinel"
 
