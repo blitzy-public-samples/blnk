@@ -19,6 +19,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"math/big"
 	"time"
 
@@ -267,7 +268,28 @@ type eventOutbox interface {
 	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims pending entries FIFO for publishing, taking a lease for lockDuration
 	MarkEventDispatched(ctx context.Context, id int64) error                                                             // Marks an entry dispatched after the broker acknowledges the publish
 	MarkEventFailed(ctx context.Context, id int64, errMsg string) error                                                  // Records a failed publish attempt and its reason against an entry
-	MarkWebhookDispatched(ctx context.Context, id int64) error                                                           // Marks the legacy webhook leg dispatched, so a republished row cannot double-enqueue it
+
+	// MarkEventDeadLettered completes the failure path: it moves an entry whose
+	// retry budget MarkEventFailed already exhausted into the dead_lettered
+	// terminal state, and records the dead-letter topic the event was written to
+	// together with the marshaled failure metadata.
+	//
+	// The two halves are separate methods because they know different things.
+	// MarkEventFailed knows only that a publish attempt failed and whether the
+	// budget is spent, so it can say no more than "failed". Only the dead-letter
+	// publisher knows whether the event actually reached its `<topic>.dlt`
+	// sibling, and only it holds the resolved topic name and the composed
+	// metadata — deriving either inside the repository would duplicate the
+	// topic-naming rules and the metadata schema in a second place, and the two
+	// copies would drift.
+	//
+	// This method is what makes the dead-letter surface work at all: dlt_topic and
+	// failure_metadata are what the dead-letter inventory displays, and
+	// dead_lettered is the state a replay requires before it will re-publish. Left
+	// uncalled, those columns stay NULL and no event is ever replayable.
+	MarkEventDeadLettered(ctx context.Context, id int64, dltTopic string, failureMetadata json.RawMessage) error
+
+	MarkWebhookDispatched(ctx context.Context, id int64) error // Marks the legacy webhook leg dispatched, so a republished row cannot double-enqueue it
 
 	// Dead-letter and reporting reads
 	GetEventByID(ctx context.Context, eventID string) (*model.EventOutbox, error)               // Retrieves an entry by its business event_id UUID, for replay

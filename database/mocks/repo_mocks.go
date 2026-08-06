@@ -18,6 +18,7 @@ package mocks
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"math/big"
 	"time"
 
@@ -743,6 +744,11 @@ func (m *MockDataSource) MarkEventDispatched(ctx context.Context, id int64) erro
 
 func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, errMsg string) error {
 	args := m.Called(ctx, id, errMsg)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) MarkEventDeadLettered(ctx context.Context, id int64, dltTopic string, failureMetadata json.RawMessage) error {
+	args := m.Called(ctx, id, dltTopic, failureMetadata)
 	return args.Error(0)
 }
 

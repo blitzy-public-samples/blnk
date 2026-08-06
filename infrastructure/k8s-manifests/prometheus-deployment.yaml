@@ -26,6 +26,16 @@ spec:
             - name: prometheus-config
               mountPath: /etc/prometheus/prometheus.yml
               subPath: prometheus.yml
+            # Projects the ConfigMap's blnk-kafka-alerts.yml key into the
+            # directory the rule_files glob scans, /etc/prometheus/alerts/*.yml,
+            # which is what actually loads the two Kafka alerts. A second
+            # subPath mount on the SAME volume keeps the scrape-config mount
+            # above untouched. subPath must equal the ConfigMap data key and
+            # mountPath must fall inside that glob: a mismatch loads no rules
+            # and raises no error, surfacing only as an empty /api/v1/rules.
+            - name: prometheus-config
+              mountPath: /etc/prometheus/alerts/blnk-kafka-alerts.yml
+              subPath: blnk-kafka-alerts.yml
       restartPolicy: Always
       volumes:
         - name: prometheus-config
