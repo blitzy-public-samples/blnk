@@ -101,7 +101,15 @@ func TestEventOutboxStatusVocabulary_IsClosedAndAgreesWithItself(t *testing.T) {
 			"%q is in the vocabulary but IsKnownEventOutboxStatus rejects it", status)
 	}
 
-	for _, unknown := range []string{"", " ", "PENDING", "pending ", "done", "dead-lettered", "replay"} {
+	// "dlt_pending" is in this list deliberately. It was a status once, and it was impossible to
+	// reach: nothing in the relay ever wrote it, while the migration's CHECK constraint, two
+	// partial indexes and the dead-letter listing all carried the vocabulary for it. What the
+	// exhaustion arm really writes is 'failed' with dlt_topic still NULL, and that pair is what
+	// the repair claim selects on. Asserting the literal is REJECTED is what keeps the retired
+	// spelling from being reintroduced on one side of that agreement only.
+	for _, unknown := range []string{
+		"", " ", "PENDING", "pending ", "done", "dead-lettered", "replay", "dlt_pending",
+	} {
 		assert.Falsef(t, IsKnownEventOutboxStatus(unknown),
 			"%q is not a status; admitting it would let an unwritable value reach the CHECK constraint", unknown)
 	}
@@ -136,6 +144,7 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
+		"blnk.ledgers",
 		"blnk.system",
 		"blnk.transactions.dlt",
 		"blnk.balances.dlt",
@@ -160,7 +169,7 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 		// somebody created under our prefix is still not a topic we own, and treating it as ours
 		// would let a stray name reach a writer and a dead-letter composition.
 		"blnk.unknown":            "the namespace is right but there is no such category",
-		"blnk.quarantine":         "the catalogue is four categories; quarantine is not one of them, and admitting a name Blnk does not create would let the ACL pruner treat another team's bindings as its own to delete",
+		"blnk.quarantine":         "the catalogue is five categories; quarantine is not one of them, and admitting a name Blnk does not create would let the ACL pruner treat another team's bindings as its own to delete",
 		"blnk.transaction":        "the singular is not the category name",
 		"blnk.orders":             "a category this deployment does not have",
 		"blnk.transactions.other": "a deeper name is not a category topic",
@@ -183,13 +192,19 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 // contract from both directions: exactly what it admits, and everything of Blnk's that it does
 // not.
 //
-// The set is the three TENANT categories the requirement names. blnk.system is excluded even
-// though it carries ledger.created and system.error — two of the thirteen event types the legacy
-// transport delivered — and that exclusion is deliberate rather than an oversight, for the two
-// reasons set out on TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory: the
-// legacy audience for system.error was the operator's single configured URL rather than
+// The set is the three TENANT categories the requirement names PLUS blnk.ledgers. That fourth
+// entry is the point of the list: ledger.created is delivered to every subscriber by the legacy
+// transport today, so a Kafka catalogue in which no subscriber credential can reach it would be
+// a consuming-side regression, and it used to be exactly that — the event shared the internal
+// system category and was therefore published and unreachable at the same time.
+//
+// blnk.system is excluded even though it carries system.error — one of the thirteen event types
+// the legacy transport delivered — and that exclusion is deliberate rather than an oversight, for
+// the two reasons set out on TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory:
+// the legacy audience for system.error was the operator's single configured URL rather than
 // subscribers, and this category is the catalogue's catch-all, so making it grantable would give
-// an unmapped event type an audience that never asked for it.
+// an unmapped event type an audience that never asked for it. With ledger.created moved out, that
+// exclusion costs a subscriber nothing it previously received.
 func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t *testing.T) {
 	const prefix = "blnk"
 
@@ -199,9 +214,11 @@ func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
+		"blnk.ledgers",
 	}, grantable,
-		"a subscriber may be granted exactly the three tenant-facing category topics; every "+
-			"over-grant finding in this area reduces to this one enumerated boundary")
+		"a subscriber may be granted exactly the four tenant-facing category topics; every "+
+			"over-grant finding in this area reduces to this one enumerated boundary, and every "+
+			"under-grant finding reduces to blnk.ledgers being absent from it")
 
 	for _, topic := range grantable {
 		assert.Truef(t, IsSubscriberGrantableTopicName(topic, prefix),
@@ -210,10 +227,11 @@ func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t
 
 	ungrantable := map[string]string{
 		"blnk.system":             "the catalogue's catch-all, and system.error's frozen payload carries raw error text describing the deployment",
-		"blnk.quarantine":         "not a catalogued category at all; the four-category inventory is closed, so it can be neither owned nor granted",
+		"blnk.quarantine":         "not a catalogued category at all; the five-category inventory is closed, so it can be neither owned nor granted",
 		"blnk.transactions.dlt":   "a dead-letter topic is Blnk's own; a subscriber builds its own <topic>.dlt",
 		"blnk.balances.dlt":       "the same, for every category",
 		"blnk.identities.dlt":     "the same",
+		"blnk.ledgers.dlt":        "the same, and a grantable category's dead-letter sibling is no more grantable than an internal one's",
 		"blnk.system.dlt":         "the same",
 		"blnk.quarantine.dlt":     "and neither is its dead-letter form",
 		"*":                       "Kafka reads \"*\" as every resource, turning a per-topic grant cluster-wide",

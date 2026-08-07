@@ -52,22 +52,28 @@
 #     <prefix>.transactions        <prefix>.transactions.dlt
 #     <prefix>.balances            <prefix>.balances.dlt
 #     <prefix>.identities          <prefix>.identities.dlt
+#     <prefix>.ledgers             <prefix>.ledgers.dlt
 #     <prefix>.system              <prefix>.system.dlt
 #
 # Only the CATEGORY names are written down below; each dead-letter name is derived by
 # appending ".dlt", exactly as event_topics.go's DLTFor does. Deriving rather than listing
 # is what structurally prevents the two halves of the catalogue drifting apart.
 #
-# There is one category more than the three named in the requirement because two real
+# There are two categories more than the three named in the requirement because two real
 # event types - ledger.created and system.error - belong to none of transactions, balances
 # or identities, while the requirement also demands that every event formerly delivered by
-# webhook be published. The fourth category resolves that tension following the identical
-# naming convention, so no event type is silently dropped, and it doubles as the catch-all
-# for an event type the catalogue does not recognise. Do not "correct" this to six topics,
-# and do not add a fifth category: model.EventCategory routes events into exactly these
-# four and event_topics.go composes exactly these eight names from them. A name this script
-# does not create is a name the relay cannot publish to, and a name it creates that the
-# code never writes to is dead weight in every environment.
+# webhook be published AND that subscribers can consume what they used to receive. Those
+# are two different questions and one extra topic could not answer both: ledger.created is
+# ordinary ledger data that every webhook subscriber receives today, so it needs a
+# GRANTABLE home, while system.error carries Blnk's own error text and must stay
+# ungrantable. Hence <prefix>.ledgers for the first and <prefix>.system for the second,
+# both following the identical naming convention, so no event type is silently dropped and
+# none is published to a topic no subscriber may be granted. <prefix>.system doubles as the
+# catch-all for an event type the catalogue does not recognise. Do not "correct" this to
+# six or eight topics: model.EventCategory routes events into exactly these five and
+# event_topics.go composes exactly these ten names from them. A name this script does not
+# create is a name the relay cannot publish to, and a name it creates that the code never
+# writes to is dead weight in every environment.
 #
 # ORDERING: BOOTSTRAP, THEN BROKER, THEN THIS
 #
@@ -207,8 +213,6 @@
 #                                                               producer password; off by
 #                                                               default so a re-run does not
 #                                                               stop the running publisher
-#   KAFKA_SKIP_PRODUCER_PRINCIPAL         (unset)               truthy skips the producer
-#                                                               principal and its ACLs
 #   KAFKA_SAMPLE_SUBSCRIBER_USER          blnk-sample-subscriber
 #   KAFKA_SAMPLE_SUBSCRIBER_SECRET        (unset)               supply one, or name a file
 #                                                               below to receive a generated
@@ -234,8 +238,11 @@
 #                                                               then printed exactly once
 #   KAFKA_ROTATE_PRODUCER_SECRET          (unset)               truthy replaces an existing
 #                                                               password
-#   KAFKA_SKIP_PRODUCER                   (unset)               truthy skips the principal
-#                                                               and its ACLs entirely
+#   KAFKA_SKIP_PRODUCER                   (unset)               truthy skips the producer's
+#                                                               validation, principal and
+#                                                               ACLs entirely. The retired
+#                                                               KAFKA_SKIP_PRODUCER_PRINCIPAL
+#                                                               is refused with this name
 #   KAFKA_CONTAINER                       kafka                 for docker exec delegation
 #   KAFKA_COMPOSE_SERVICE                 kafka                 for docker compose exec
 #   KAFKA_PROVISION_CONTAINER_SCRIPT      /scripts/kafka-provision.sh
@@ -473,10 +480,27 @@ KAFKA_SASL_SECRET_FILE="${KAFKA_SASL_SECRET_FILE:-}"
 # new value.
 KAFKA_ROTATE_PRODUCER_SECRET="${KAFKA_ROTATE_PRODUCER_SECRET:-}"
 
-# Escape hatch for a broker where the producer principal is managed elsewhere - a shared
-# cluster with its own identity provisioning, say. Set it truthy and the principal and its
-# ACLs are skipped; the topics are still assured.
-KAFKA_SKIP_PRODUCER_PRINCIPAL="${KAFKA_SKIP_PRODUCER_PRINCIPAL:-}"
+# KAFKA_SKIP_PRODUCER_PRINCIPAL IS RETIRED, and is deliberately NOT declared here.
+#
+# Defaulting it the way every live variable above is defaulted would make it declared on every
+# run, and require_no_retired_variables tests DECLARATION - so the refusal would fire
+# unconditionally and no run could ever provision anything. The check reads the raw
+# environment instead, which is the only place the distinction between "the operator set this"
+# and "the script defaulted this" survives.
+#
+# There were two variables, and they gated DIFFERENT HALVES of the same decision:
+# KAFKA_SKIP_PRODUCER_PRINCIPAL skipped the producer VALIDATION, KAFKA_SKIP_PRODUCER skipped
+# the broker MUTATION. Neither entry point could express "skip the producer" completely,
+# because the forwarding was split too - stack.sh forwarded only the first and the compose
+# kafka-init service only the second. So a compose stack that set the flag had its principal
+# left alone but was still refused for, say, an empty KAFKA_SASL_USER it had no intention of
+# using; and a stack.sh run that set it passed validation and then created the very principal
+# it had asked to be left alone. Both directions are silent, and each looks like a bug in the
+# other half.
+#
+# KAFKA_SKIP_PRODUCER is the survivor: it is the name compose already forwards, the name that
+# gates the actual mutation, and the symmetric partner of KAFKA_SKIP_SAMPLE_SUBSCRIBER. See
+# KAFKA_PROVISION_RETIRED_VARIABLES.
 
 # The sample subscriber principal, its consumer-group namespace, and the topics it may
 # read. See ensure_sample_subscriber and grant_subscriber_acls for the grant shape and for
@@ -523,11 +547,6 @@ KAFKA_PRODUCER_USER="${KAFKA_PRODUCER_USER:-blnk-producer}"
 KAFKA_PRODUCER_SECRET="${KAFKA_PRODUCER_SECRET:-}"
 KAFKA_PRODUCER_SECRET_FILE="${KAFKA_PRODUCER_SECRET_FILE:-}"
 
-# Escape hatch for a broker whose producer principal is managed elsewhere - by a platform
-# team, a secrets operator, or an existing IAM integration. Set it truthy and the principal
-# and its grant are skipped; the topics are still assured.
-KAFKA_SKIP_PRODUCER="${KAFKA_SKIP_PRODUCER:-}"
-
 # Rotate the sample subscriber's password on this run.
 #
 # Off by default, and that default is the whole point. Re-running this script used to mint
@@ -561,9 +580,17 @@ KAFKA_SKIP_SAMPLE_SUBSCRIBER="${KAFKA_SKIP_SAMPLE_SUBSCRIBER:-}"
 # dead-lettering - the worst possible moment to discover a missing binding. It is granted no
 # Read, no Create, no Alter, and nothing at cluster scope. See ensure_producer_principal.
 
-# Escape hatch for a broker where the producer principal is managed elsewhere - by a
+# THE ONE escape hatch for a broker where the producer principal is managed elsewhere - by a
 # platform team, a secrets operator or an existing deployment's own tooling. Set it truthy
-# and the principal and its ACLs are skipped; the topics are still assured.
+# and the producer's VALIDATION, its principal and its ACLs are all skipped; the topics are
+# still assured.
+#
+# One variable, one behaviour, one declaration. It was declared twice in this block and
+# shared its job with a second variable, KAFKA_SKIP_PRODUCER_PRINCIPAL, that gated the
+# validation half - see that name above for what the split cost. Everything that skips
+# anything about the producer now reads THIS name: require_valid_producer,
+# require_rotation_destination, ensure_producer_principal, generate_password's guidance and
+# the closing summary.
 KAFKA_SKIP_PRODUCER="${KAFKA_SKIP_PRODUCER:-}"
 
 # Delegation targets, overridable because a stack may name its broker anything. The
@@ -580,6 +607,119 @@ KAFKA_PROVISION_CONTAINER_SCRIPT="${KAFKA_PROVISION_CONTAINER_SCRIPT:-/scripts/k
 # that a container which somehow also lacks the CLI reports the real problem instead of
 # delegating into itself forever.
 BLNK_KAFKA_PROVISION_IN_CONTAINER="${BLNK_KAFKA_PROVISION_IN_CONTAINER:-}"
+
+# ---------------------------------------------------------------------------------------
+# THE PROVISIONING INTERFACE — ONE DECLARATION, READ BY EVERY INVOKER
+#
+# Every variable an invoker of this script may set, in one list. It is not documentation: it
+# is the list this script forwards when it re-executes itself inside the broker container, it
+# is what "--print-interface" emits, and it is therefore what stack.sh forwards and what the
+# compose kafka-init blocks are asserted against.
+#
+# WHY IT IS DECLARED HERE AND NOWHERE ELSE. There are four invocation paths - this script run
+# directly, this script delegating into the broker container, ./stack.sh running it as the host
+# fallback, and the compose kafka-init one-shot - and each used to carry its OWN hand-written
+# list. They had drifted in every direction at once: stack.sh omitted the CLI timeout pair, the
+# producer secret file and the real skip flag; both compose blocks omitted those plus partition
+# growth, the readiness budget, the subscriber skip and rotation flags, and the client
+# configuration.
+#
+# A NAME MISSING FROM AN INVOKER'S LIST FAILS SILENTLY AND PLAUSIBLY. The delegated or
+# one-shot run does not error on an absent variable; it falls back to a DEFAULT and provisions
+# something slightly different from what was asked for, then reports success. A missing
+# KAFKA_PRODUCER_USER creates the principal under the default name. A missing
+# KAFKA_PRODUCER_SECRET preserves an existing credential instead of applying the supplied one.
+# A missing KAFKA_ALLOW_PARTITION_GROWTH refuses a growth the operator consented to. Which
+# path ran - and therefore which settings survived - depended on whether the host happened to
+# have the Kafka CLI, so the difference was invisible and unreproducible.
+#
+# So the list moved here and the invokers now READ it: stack.sh calls "--print-interface", and
+# TestKafkaProvisionScript_HandsOffEverySupportedSetting compares both compose blocks against
+# the same output. Adding a variable to the configuration block above means adding it here,
+# once, and every invoker picks it up.
+#
+# EXCLUSIONS ARE DELIBERATE AND EACH HAS A REASON:
+#
+#   BLNK_KAFKA_PROVISION_IN_CONTAINER   this script's own already-delegated marker. It is set
+#                                       by the delegation itself; an invoker setting it would
+#                                       tell a host-side run it must not delegate.
+#   KAFKA_BROKERS                       resolved into KAFKA_BOOTSTRAP_SERVER before anything
+#                                       is provisioned, and it is the RESOLVED value that must
+#                                       cross a boundary. Forwarding the raw one would let a
+#                                       stale value win over the decision already made.
+#   KAFKA_CONTAINER                     delegation TARGETS. They name where to delegate TO, so
+#   KAFKA_COMPOSE_SERVICE               they are meaningful to a host-side invoker and
+#   KAFKA_PROVISION_CONTAINER_SCRIPT    meaningless inside the container - see
+#   KAFKA_CLIENT_CONFIG_CONTAINER_PATH  KAFKA_PROVISION_HOST_ONLY_INTERFACE below.
+# ---------------------------------------------------------------------------------------
+readonly KAFKA_PROVISION_INTERFACE=(
+    KAFKA_BOOTSTRAP_SERVER
+    KAFKA_TOPIC_PREFIX
+    KAFKA_MIN_PARTITIONS
+    KAFKA_REPLICATION_FACTOR
+    # Consent to a key-remapping partition growth. It has to cross every boundary or two
+    # invocation contexts answer differently for one .env: run inside the broker container it
+    # would grow a non-empty topic on request, and delegated from the host it would refuse.
+    # Dropping it fails safe rather than open, which is precisely why its absence went
+    # unnoticed.
+    KAFKA_ALLOW_PARTITION_GROWTH
+    KAFKA_SECURITY_PROTOCOL
+    KAFKA_SCRAM_ITERATIONS
+    KAFKA_SASL_ADMIN_USER
+    KAFKA_SASL_ADMIN_SECRET
+    KAFKA_SASL_USER
+    KAFKA_SASL_SECRET
+    # A path, and one an invoker's filesystem may not share. Forwarded anyway, deliberately:
+    # write_secret_file then fails naming that exact directory, which tells the operator to
+    # mount it, whereas dropping the variable fails with the generic "no delivery channel is
+    # configured" and sends them looking for the wrong thing.
+    KAFKA_SASL_SECRET_FILE
+    KAFKA_PRODUCER_USER
+    KAFKA_PRODUCER_SECRET
+    KAFKA_PRODUCER_SECRET_FILE
+    KAFKA_ROTATE_PRODUCER_SECRET
+    KAFKA_SKIP_PRODUCER
+    KAFKA_SAMPLE_SUBSCRIBER_USER
+    KAFKA_SAMPLE_SUBSCRIBER_SECRET
+    KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE
+    KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX
+    KAFKA_SAMPLE_SUBSCRIBER_TOPICS
+    KAFKA_SKIP_SAMPLE_SUBSCRIBER
+    KAFKA_ROTATE_SAMPLE_SUBSCRIBER_SECRET
+    KAFKA_PROVISION_TIMEOUT_SECONDS
+    KAFKA_PROVISION_POLL_INTERVAL_SECONDS
+    KAFKA_CLI_TIMEOUT_SECONDS
+    KAFKA_CLI_KILL_GRACE_SECONDS
+    KAFKA_CLIENT_CONFIG
+)
+
+# The names an invoker running this script ON A HOST may additionally set, and which this
+# script must NOT forward into the container.
+#
+# They are the delegation targets: where to delegate to, and where this script will be found
+# once there. Inside the container they are either meaningless or actively wrong -
+# KAFKA_CLIENT_CONFIG_CONTAINER_PATH is consumed by delegate_client_config on the way in and
+# becomes KAFKA_CLIENT_CONFIG on the other side.
+#
+# Kept as a SEPARATE list rather than folded into the one above so the asymmetry is stated
+# instead of being a discrepancy a reader has to explain. "--print-interface --host" emits
+# both, which is what stack.sh forwards.
+readonly KAFKA_PROVISION_HOST_ONLY_INTERFACE=(
+    KAFKA_CLIENT_CONFIG_CONTAINER_PATH
+    KAFKA_CONTAINER
+    KAFKA_COMPOSE_SERVICE
+    KAFKA_PROVISION_CONTAINER_SCRIPT
+)
+
+# Variables that USED to control something and no longer do.
+#
+# A retired name is not harmless. An operator who set it was asking for a behaviour, and after
+# the rename the value is read by nothing: the request is silently dropped and the run does the
+# opposite of what was asked. require_no_retired_variables refuses instead, naming the
+# replacement, so the migration is a one-line fix rather than a mystery.
+readonly KAFKA_PROVISION_RETIRED_VARIABLES=(
+    "KAFKA_SKIP_PRODUCER_PRINCIPAL=KAFKA_SKIP_PRODUCER"
+)
 
 # Fixed rather than configurable. Blnk standardises on SCRAM-SHA-512: event_admin.go
 # provisions subscriber credentials with kafka.ScramMechanismSha512 and
@@ -667,18 +807,22 @@ readonly REQUIRED_AUTHORIZER="org.apache.kafka.metadata.authorizer.StandardAutho
 # it fixes the order of event_topics.go's AllTopics, AllDeadLetterTopics and
 # AllTopicsWithDeadLetters, which provisioning is compared against.
 #
+# 'ledgers' carries ledger.created - ordinary ledger data, a name and an id and a creation
+# instant, exactly the shape of identity.created - so it is grantable and appears in both
+# lists below. It is a category of its own rather than a member of 'system' precisely
+# because it must be grantable and system must not be.
+#
 # 'system' is INTERNAL and is provisioned anyway, which is not a contradiction. No
 # subscriber may be granted it - it is excluded from SubscriberGrantableEventCategories -
-# but Blnk publishes ledger.created and system.error to it, and it is also where an event
-# type the mapping table does not recognise is routed, precisely so the "every event is
-# published, with zero exceptions" guarantee survives a producer that forgot to extend the
-# table. A topic that does not exist cannot receive one: against a broker with
-# auto.create.topics.enable=false the publish fails, the row retries until its budget is
-# spent, and the dead-letter write then fails too because <prefix>.system.dlt is missing as
-# well - so the very events the internal category exists to keep durable are the ones that
-# get stranded.
+# but Blnk publishes system.error to it, and it is also where an event type the mapping
+# table does not recognise is routed, precisely so the "every event is published, with zero
+# exceptions" guarantee survives a producer that forgot to extend the table. A topic that
+# does not exist cannot receive one: against a broker with auto.create.topics.enable=false
+# the publish fails, the row retries until its budget is spent, and the dead-letter write
+# then fails too because <prefix>.system.dlt is missing as well - so the very events the
+# internal category exists to keep durable are the ones that get stranded.
 # It is asserted against model.AllEventCategories by TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns.
-readonly EVENT_CATEGORIES=(transactions balances identities system)
+readonly EVENT_CATEGORIES=(transactions balances identities ledgers system)
 
 # The categories NO subscriber may be granted, and the reason this list exists separately
 # from the one above.
@@ -686,11 +830,12 @@ readonly EVENT_CATEGORIES=(transactions balances identities system)
 # It is internalEventCategories in model/event.go, and the two must agree because they are
 # the same rule enforced in two places: Go refuses a subscriber DTO or an ACL request naming
 # an internal topic, and this script must refuse the same names or the sample principal ends
-# up holding a grant the API would have rejected. 'system' carries ledger.created,
-# system.error and every event type the mapping table does not recognise - Blnk's own
-# operational traffic and its safety net - so a subscriber able to read it would receive
-# events no subscriber ever asked for, including the internal errors of a ledger it has
-# nothing to do with.
+# up holding a grant the API would have rejected. 'system' carries system.error and every
+# event type the mapping table does not recognise - Blnk's own operational traffic and its
+# safety net - so a subscriber able to read it would receive events no subscriber ever asked
+# for, including the internal errors of a ledger it has nothing to do with. It is the ONLY
+# internal category: ledger.created lives in 'ledgers', which IS grantable, because a
+# subscriber that received it over the legacy webhook must be able to keep receiving it.
 #
 # Asserted against model.SubscriberGrantableEventCategories by
 # TestKafkaProvisionScript_GrantsOnlyTheCategoriesTheCodeAllows.
@@ -711,14 +856,16 @@ readonly INTERNAL_EVENT_CATEGORIES=(system)
 #
 # What is excluded, and why each exclusion is a security boundary rather than a preference:
 #
-#   system   carries ledger.created and system.error. system.error's payload is the FROZEN
-#            legacy body, so it carries Blnk's own error text verbatim — a driver message
-#            naming schema, table and column, a broker error naming internal addresses. The
-#            legacy transport delivered it to ONE globally configured URL, the operator's own
-#            endpoint; a shared topic granted to N subscribers would hand each of them every
-#            other one's failures. It is also the catalogue's CATCH-ALL, where an event type
-#            no mapping recognises is routed, and an uncatalogued event has by definition no
-#            established audience. Read under the master key instead.
+#   system   carries system.error, whose payload is the FROZEN legacy body, so it carries
+#            Blnk's own error text verbatim — a driver message naming schema, table and
+#            column, a broker error naming internal addresses. The legacy transport delivered
+#            it to ONE globally configured URL, the operator's own endpoint; a shared topic
+#            granted to N subscribers would hand each of them every other one's failures. It
+#            is also the catalogue's CATCH-ALL, where an event type no mapping recognises is
+#            routed, and an uncatalogued event has by definition no established audience.
+#            Read under the master key instead. ledger.created is NOT excluded and is not
+#            here: it is ordinary ledger data and lives in the grantable 'ledgers' category
+#            precisely so that excluding 'system' costs a subscriber nothing it used to get.
 #   *.dlt    holds events that already failed, together with failure metadata naming broker
 #            addresses and internal error reasons. Granting one would hand a subscriber every
 #            OTHER subscriber's failed events. Read through GET /events/dead-letter under the
@@ -728,7 +875,7 @@ readonly INTERNAL_EVENT_CATEGORIES=(system)
 # Kept as a separate list rather than derived by filtering EVENT_CATEGORIES because the
 # distinction is a POLICY, not a naming rule — model/event.go states it as a policy too, in the
 # explicit internalEventCategories map.
-readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(transactions balances identities)
+readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(transactions balances identities ledgers)
 
 # The suffix that forms a dead-letter sibling. This is the published <topic>.dlt naming
 # convention and it must equal event_topics.go's DeadLetterTopicSuffix. Blnk owns the .dlt
@@ -861,7 +1008,7 @@ PRODUCER_SECRET_DISPOSITION=""
 PRODUCER_SECRET_DISPOSITION=""
 
 # The resolved producer principal, and what happened to it: "yes" when provisioned,
-# "skipped" when KAFKA_SKIP_PRODUCER_PRINCIPAL is set, and "no-secret" when no secret was
+# "skipped" when KAFKA_SKIP_PRODUCER is set, and "no-secret" when no secret was
 # supplied to provision it with. The last of those is reported prominently rather than
 # quietly, because a deployment whose application is configured with KAFKA_SASL_ADMIN_USER
 # now REFUSES to start without this principal.
@@ -1503,9 +1650,9 @@ is_grantable_topic() {
 # THE DEFAULT IS THE GRANTABLE CATEGORY TOPICS, AND ONLY THOSE. Two exclusions, each for its
 # own reason:
 #
-#   1. NO INTERNAL CATEGORY. The default used to be all four category topics, which handed
-#      the sample principal Read on <prefix>.system - the topic carrying ledger.created,
-#      system.error and every unrecognised event type. Go refuses that grant outright
+#   1. NO INTERNAL CATEGORY. The default used to be every category topic, which handed
+#      the sample principal Read on <prefix>.system - the topic carrying system.error and
+#      every unrecognised event type. Go refuses that grant outright
 #      (model.SubscriberGrantableTopics excludes it, and both the subscriber DTO validation
 #      and the Kafka ACL request check against that list), so the script was minting a grant
 #      the API would have rejected: the same subscriber provisioned through
@@ -1585,7 +1732,10 @@ resolve_subscriber_topics() {
 # Runs before the broker is touched, like every other decision in this group, so a bad value
 # costs nothing. Nothing here needs the network.
 require_valid_producer() {
-    if is_truthy "$KAFKA_SKIP_PRODUCER_PRINCIPAL"; then
+    # THE SAME FLAG ensure_producer_principal reads. It used to be a different one, so a stack
+    # that skipped the mutation could still be refused here for a producer value it was never
+    # going to use, and a stack that skipped this check went on to create the principal anyway.
+    if is_truthy "$KAFKA_SKIP_PRODUCER"; then
         return 0
     fi
 
@@ -1606,7 +1756,7 @@ require_valid_producer() {
             "that has administrative credentials means events are never published at all." \
             "Fix: set KAFKA_SASL_USER to the principal the server and worker will present," \
             "or leave both unset to accept the shipped default of blnk-producer, or set" \
-            "KAFKA_SKIP_PRODUCER_PRINCIPAL=1 if the cluster's owner manages this principal." \
+            "KAFKA_SKIP_PRODUCER=1 if the cluster's owner manages this principal." \
             "Nothing has been provisioned."
     fi
 
@@ -2053,61 +2203,17 @@ delegate_to_container() {
             "KAFKA_COMPOSE_SERVICE."
     fi
 
-    # Only names, never values. Every one of these is propagated only if it is declared here,
-    # so the container falls back to this script's own defaults for the rest.
+    # Only names, never values, and the names come from THE canonical interface rather than
+    # from a copy of it maintained here. See KAFKA_PROVISION_INTERFACE for why a list per
+    # invocation path was the defect: four paths each carried their own, they had drifted in
+    # every direction, and a missing name falls back to a default and reports success.
     #
-    # A NAME MISSING FROM THIS LIST FAILS SILENTLY AND PLAUSIBLY, which is why the list is
-    # exhaustive rather than "the ones that seemed to matter". The delegated run does not
-    # error on an absent variable; it falls back to a DEFAULT and provisions something
-    # slightly different from what was asked for. A missing KAFKA_PRODUCER_USER means the
-    # principal is created under the default name, a missing KAFKA_PRODUCER_SECRET means an
-    # existing credential is preserved instead of the supplied one being applied - and both
-    # runs report success. Every variable declared in the configuration block at the top of
-    # this file belongs here.
+    # The recursion marker is prepended because it is the one name the delegation itself owns.
+    # The host-only names are deliberately absent: they say where to delegate TO and are
+    # meaningless on the far side.
     local passthrough=(
         BLNK_KAFKA_PROVISION_IN_CONTAINER
-        KAFKA_BOOTSTRAP_SERVER
-        KAFKA_TOPIC_PREFIX
-        KAFKA_MIN_PARTITIONS
-        KAFKA_REPLICATION_FACTOR
-        # Consent to a key-remapping partition growth. It has to cross the delegation
-        # boundary or the two invocation contexts answer differently for one .env: run
-        # inside the broker container it would grow a non-empty topic on request, and
-        # delegated from the host it would refuse. Dropping it fails safe rather than
-        # open, which is precisely why its absence would have gone unnoticed.
-        KAFKA_ALLOW_PARTITION_GROWTH
-        KAFKA_SASL_USER
-        KAFKA_SASL_SECRET
-        # A path, and the same caveat as the subscriber's below.
-        KAFKA_SASL_SECRET_FILE
-        KAFKA_ROTATE_PRODUCER_SECRET
-        KAFKA_SKIP_PRODUCER_PRINCIPAL
-        KAFKA_SASL_ADMIN_USER
-        KAFKA_SASL_ADMIN_SECRET
-        KAFKA_SECURITY_PROTOCOL
-        KAFKA_SCRAM_ITERATIONS
-        KAFKA_PROVISION_TIMEOUT_SECONDS
-        KAFKA_PROVISION_POLL_INTERVAL_SECONDS
-        KAFKA_CLI_TIMEOUT_SECONDS
-        KAFKA_CLI_KILL_GRACE_SECONDS
-        KAFKA_SAMPLE_SUBSCRIBER_USER
-        KAFKA_SAMPLE_SUBSCRIBER_SECRET
-        # A PATH, and one the container may well not be able to see. Passed anyway,
-        # deliberately: write_secret_file then fails naming that exact directory, which tells
-        # the operator to mount it, whereas dropping the variable would fail with the generic
-        # "no delivery channel is configured" and send them looking for the wrong thing.
-        KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE
-        KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX
-        KAFKA_SAMPLE_SUBSCRIBER_TOPICS
-        KAFKA_SKIP_SAMPLE_SUBSCRIBER
-        KAFKA_ROTATE_SAMPLE_SUBSCRIBER_SECRET
-        KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE
-        KAFKA_PRODUCER_USER
-        KAFKA_PRODUCER_SECRET
-        KAFKA_PRODUCER_SECRET_FILE
-        KAFKA_SKIP_PRODUCER
-        KAFKA_ROTATE_PRODUCER_SECRET
-        KAFKA_CLIENT_CONFIG
+        "${KAFKA_PROVISION_INTERFACE[@]}"
     )
 
     # An operator-supplied client configuration must NOT be silently dropped.
@@ -2126,27 +2232,20 @@ delegate_to_container() {
     # provisioned, and it is what the delegated run uses. Without it, the delegation refuses.
     delegate_client_config
 
-    # The resolved values are exported so that the bare "-e NAME" form has something to
-    # copy. KAFKA_BOOTSTRAP_SERVER is exported after resolution rather than as it arrived,
-    # so the container provisions the broker this process decided on.
+    # The resolved values are exported so that the bare "-e NAME" form has something to copy,
+    # and the export is DRIVEN BY THE SAME LIST rather than written out beside it. A
+    # hand-written export block is a third copy of the interface and it had already fallen
+    # behind: it exported the retired skip flag and named one variable twice, so a name could
+    # appear in the pass-through and never be exported - which is the silent-default failure
+    # the pass-through exists to prevent, reintroduced one line lower down.
+    #
+    # KAFKA_BOOTSTRAP_SERVER is exported after resolution rather than as it arrived, so the
+    # container provisions the broker this process decided on.
     export BLNK_KAFKA_PROVISION_IN_CONTAINER=1
-    export KAFKA_BOOTSTRAP_SERVER
-    export KAFKA_TOPIC_PREFIX KAFKA_MIN_PARTITIONS KAFKA_REPLICATION_FACTOR
-    export KAFKA_ALLOW_PARTITION_GROWTH
-    export KAFKA_SASL_USER KAFKA_SASL_SECRET KAFKA_SASL_SECRET_FILE
-    export KAFKA_ROTATE_PRODUCER_SECRET KAFKA_SKIP_PRODUCER_PRINCIPAL
-    export KAFKA_SASL_ADMIN_USER KAFKA_SASL_ADMIN_SECRET KAFKA_SECURITY_PROTOCOL
-    export KAFKA_SCRAM_ITERATIONS
-    export KAFKA_PROVISION_TIMEOUT_SECONDS KAFKA_PROVISION_POLL_INTERVAL_SECONDS
-    export KAFKA_CLI_TIMEOUT_SECONDS KAFKA_CLI_KILL_GRACE_SECONDS
-    export KAFKA_SAMPLE_SUBSCRIBER_USER KAFKA_SAMPLE_SUBSCRIBER_SECRET
-    export KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE
-    export KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX KAFKA_SAMPLE_SUBSCRIBER_TOPICS
-    export KAFKA_SKIP_SAMPLE_SUBSCRIBER KAFKA_ROTATE_SAMPLE_SUBSCRIBER_SECRET
-    export KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE
-    export KAFKA_PRODUCER_USER KAFKA_PRODUCER_SECRET KAFKA_PRODUCER_SECRET_FILE
-    export KAFKA_SKIP_PRODUCER KAFKA_ROTATE_PRODUCER_SECRET
-    export KAFKA_CLIENT_CONFIG
+    local exported
+    for exported in "${KAFKA_PROVISION_INTERFACE[@]}"; do
+        export "${exported?}"
+    done
 
     local env_flags=() name
     for name in "${passthrough[@]}"; do
@@ -3207,8 +3306,8 @@ grant_producer_acls() {
     # Literal patterns, one binding per topic, rather than one prefixed pattern on the topic
     # prefix. A prefixed grant on "blnk" would also cover any future topic whose name begins
     # that way, including ones this feature does not own, so the narrower form is used even
-    # though it costs eight bindings instead of one. kafka-acls --add is idempotent, so
-    # re-runs need no existence check.
+    # though it costs one binding per topic instead of one in total. kafka-acls --add is
+    # idempotent, so re-runs need no existence check.
     for topic in "${ALL_TOPICS[@]}"; do
         if ! output="$(kafka_acls --add \
             --allow-principal "$principal" \
@@ -3382,6 +3481,23 @@ ensure_sample_subscriber() {
         if subscriber_credential_exists "$user"; then
             grant_subscriber_acls "$user" "$group_prefix"
         fi
+
+        return 0
+    fi
+
+    # PRESERVED MEANS DO NOT WRITE A CREDENTIAL, and it has to return before the upsert below
+    # rather than fall into it. The branch that sets it leaves $password EMPTY on purpose - the
+    # whole point is that the stored credential is left alone - so continuing would compose
+    # "SCRAM-SHA-512=iterations=4096,password=" and hand that to kafka-configs, which answers
+    # with a hard error. The consequence was not cosmetic: it failed the SECOND provisioning
+    # run against any broker that already held this principal, which is every re-run of
+    # "docker compose --profile kafka up" on a stack whose volume survived, and it failed AFTER
+    # the topics had been assured, so the run looked like a broker problem rather than a script
+    # one. The producer leg has had this guard all along; this is the same guard, and the
+    # asymmetry was the defect.
+    if [[ "$SUBSCRIBER_SECRET_DISPOSITION" == "preserved" ]]; then
+        grant_subscriber_acls "$user" "$group_prefix"
+        SUBSCRIBER_PROVISIONED="yes"
 
         return 0
     fi
@@ -3625,15 +3741,32 @@ ensure_producer_principal() {
         "mechanism  : ${SCRAM_MECHANISM}, ${KAFKA_SCRAM_ITERATIONS} iterations" \
         "password   : ${PRODUCER_SECRET_DISPOSITION}"
 
-    # One variable, one argument, for the reason recorded at the sample subscriber's upsert:
-    # no shell quoting can split it and no partially interpolated command string exists to be
-    # logged by accident. The same honest limitation applies - a secret passed as a
-    # command-line argument is briefly visible in the process table, accepted because the CLI
-    # offers no alternative and this is a local-stack convenience.
-    local scram_config output
-    scram_config="${SCRAM_MECHANISM}=[iterations=${KAFKA_SCRAM_ITERATIONS},password=${password}]"
+    # THROUGH A FILE, NOT THROUGH ARGV - the same remedy the sample subscriber's upsert uses,
+    # and for a credential that matters more than that one.
+    #
+    # This leg used to pass "--add-config SCRAM-SHA-512=[...,password=SECRET]", putting the
+    # password in the CLI's argv where /proc/<pid>/cmdline exposes it for the whole life of the
+    # JVM start - to any process in the same namespace, and to anything that samples the process
+    # table, which is how a credential reaches a log nobody meant to write. The comment here
+    # justified it as "the CLI offers no alternative", and the subscriber leg forty lines above
+    # disproves that in the same file: --add-config-file is available and is described there as
+    # a complete remedy rather than a mitigation. Leaving the STEADY-STATE PRODUCER - the
+    # long-lived identity the server and worker authenticate as - on the weaker of two paths
+    # this file already implements was indefensible.
+    #
+    # No square brackets, for the reason recorded at the subscriber's upsert: in a properties
+    # file everything after the first '=' is the value, so brackets become part of the password
+    # and Kafka answers "Invalid credential property".
+    local scram_file output
+    scram_file="$(new_secret_file scram)"
+    if ! printf '%s\n' \
+        "${SCRAM_MECHANISM}=iterations=${KAFKA_SCRAM_ITERATIONS},password=${password}" \
+        >"$scram_file"; then
+        die "could not write the SCRAM credential file for '${user}'." \
+            "Fix: check that ${TMPDIR:-/tmp} is writable."
+    fi
 
-    if ! output="$(kafka_configs --alter --add-config "$scram_config" \
+    if ! output="$(kafka_configs --alter --add-config-file "$scram_file" \
         --entity-type users --entity-name "$user" 2>&1)"; then
         printf '%s\n' "$output" | redact >&2
         die "could not provision the SCRAM credential for '${user}'." \
@@ -3643,6 +3776,11 @@ ensure_producer_principal() {
             "     principal to the broker's super.users;" \
             "  2. the broker does not have ${SCRAM_MECHANISM} among its enabled mechanisms."
     fi
+
+    # Removed the moment it has been consumed, matching the subscriber leg: the EXIT trap is the
+    # guarantee, and this is the window - which on a run that goes on to grant ACLs and print a
+    # summary would otherwise be the rest of the run.
+    rm -f "$scram_file" || true
 
     grant_producer_acls "$user"
 
@@ -3839,7 +3977,7 @@ print_producer_summary() {
             esac
             ;;
         skipped)
-            printf '%s\n' "  skipped - KAFKA_SKIP_PRODUCER_PRINCIPAL is set. Whatever KAFKA_SASL_USER and"
+            printf '%s\n' "  skipped - KAFKA_SKIP_PRODUCER is set. Whatever KAFKA_SASL_USER and"
             printf '%s\n' "  KAFKA_SASL_SECRET the publisher is configured with must already exist on this"
             printf '%s\n' "  broker with Write and Describe on the topics above; if they are empty it will"
             printf '%s\n' "  authenticate as the administrator and warn about the excess privilege."
@@ -3993,7 +4131,7 @@ print_summary() {
             ;;
         skipped)
             printf '%s\n' "Producer principal:"
-            printf '%s\n' "  skipped - KAFKA_SKIP_PRODUCER_PRINCIPAL is set"
+            printf '%s\n' "  skipped - KAFKA_SKIP_PRODUCER is set"
             ;;
         *)
             printf '%s\n' "Producer principal:"
@@ -4017,13 +4155,18 @@ print_summary() {
 # ---------------------------------------------------------------------------------------
 
 usage() {
-    printf '%s\n' "Usage: scripts/kafka-provision.sh [-h|--help]"
+    printf '%s\n' "Usage: scripts/kafka-provision.sh [-h|--help] [--print-interface[-host]]"
     printf '%s\n' ""
     printf '%s\n' "Provisions a RUNNING Kafka broker for Blnk event streaming: the category topics,"
     printf '%s\n' "their dead-letter siblings, the producer principal Blnk publishes as, and one"
     printf '%s\n' "sample subscriber principal - each with its ACLs. Safe to run on every bring-up."
     printf '%s\n' ""
-    printf '%s\n' "This script takes NO arguments other than the help flags. Everything is"
+    printf '%s\n' "--print-interface emits every environment variable name this script reads, one"
+    printf '%s\n' "per line, and exits without touching anything. It is the machine-readable contract"
+    printf '%s\n' "./stack.sh and the compose kafka-init blocks are built from and checked against."
+    printf '%s\n' "--print-interface-host adds the delegation targets a host-side invoker may set."
+    printf '%s\n' ""
+    printf '%s\n' "Otherwise this script takes NO arguments. Everything is"
     printf '%s\n' "configured through the environment; the header of this file documents every"
     printf '%s\n' "variable at its point of use. In summary, with defaults:"
     printf '%s\n' ""
@@ -4037,7 +4180,6 @@ usage() {
     printf '  %-39s %s\n' "KAFKA_SASL_USER" "blnk-producer (what Blnk publishes as)"
     printf '  %-39s %s\n' "KAFKA_SASL_SECRET" "(unset) generated on first run"
     printf '  %-39s %s\n' "KAFKA_ROTATE_PRODUCER_SECRET" "(unset) truthy replaces an existing password"
-    printf '  %-39s %s\n' "KAFKA_SKIP_PRODUCER_PRINCIPAL" "(unset) truthy skips the principal and ACLs"
     printf '  %-39s %s\n' "KAFKA_SECURITY_PROTOCOL" "SASL_PLAINTEXT"
     printf '  %-39s %s\n' "KAFKA_CLIENT_CONFIG" "(unset) use this properties file verbatim"
     printf '  %-39s %s\n' "KAFKA_CLIENT_CONFIG_CONTAINER_PATH" "(unset) its path inside the broker container"
@@ -4055,11 +4197,70 @@ usage() {
     printf '  %-39s %s\n' "KAFKA_PRODUCER_USER" "blnk-producer (what Blnk publishes as)"
     printf '  %-39s %s\n' "KAFKA_PRODUCER_SECRET" "(unset) generated on first run"
     printf '  %-39s %s\n' "KAFKA_ROTATE_PRODUCER_SECRET" "(unset) truthy replaces an existing password"
-    printf '  %-39s %s\n' "KAFKA_SKIP_PRODUCER" "(unset) truthy skips the principal and ACLs"
+    printf '  %-39s %s\n' "KAFKA_SKIP_PRODUCER" "(unset) truthy skips validation, principal and ACLs"
     printf '  %-39s %s\n' "KAFKA_CONTAINER" "kafka"
     printf '  %-39s %s\n' "KAFKA_COMPOSE_SERVICE" "kafka"
     printf '  %-39s %s\n' "KAFKA_PROVISION_CONTAINER_SCRIPT" "/scripts/kafka-provision.sh"
     printf '%s\n' ""
+}
+
+# Emit the provisioning interface, one variable name per line, and nothing else.
+#
+# THIS IS THE MACHINE-READABLE CONTRACT every other invoker reads, which is why the output is
+# bare names on stdout with no header, no alignment and no colour: ./stack.sh reads it into an
+# array, and TestKafkaProvisionScript_HandsOffEverySupportedSetting compares the compose
+# kafka-init environment blocks against it. usage() is the human form of the same list and is
+# free to stay pretty.
+#
+# It touches nothing. parse_arguments runs before every side effect, so this reads no
+# configuration, contacts no broker and provisions nothing - which is what makes it safe for
+# stack.sh to call on every bring-up and for a test to call with no environment at all.
+#
+# Parameters:
+#   $1: "--host" to include the host-only delegation targets. Omitted, only the names that
+#       cross into a container are emitted.
+print_interface() {
+    printf '%s\n' "${KAFKA_PROVISION_INTERFACE[@]}"
+
+    if [[ "${1:-}" == "--host" ]]; then
+        printf '%s\n' "${KAFKA_PROVISION_HOST_ONLY_INTERFACE[@]}"
+    fi
+}
+
+# Refuse a run that sets a variable this script no longer reads.
+#
+# The alternative is silence, and silence here does the OPPOSITE of what was asked. An operator
+# who sets a retired skip flag is asking for something to be skipped; with the name unread, the
+# thing is done instead - a principal created on a broker whose owner manages principals, or a
+# validation refusal for a value that was never going to be used. Both look like a bug in this
+# script rather than a stale variable name in an .env.
+#
+# It runs among the pure decisions, before the broker is touched, so a stale name costs nothing
+# but the message. The check is on DECLARATION rather than on truthiness, deliberately: a
+# retired name set to an explicit "0" or "" still records an intent that this script can no
+# longer honour, and telling the operator once is cheaper than leaving it in their .env to be
+# rediscovered after the next rename.
+require_no_retired_variables() {
+    local entry retired replacement
+    for entry in "${KAFKA_PROVISION_RETIRED_VARIABLES[@]}"; do
+        retired="${entry%%=*}"
+        replacement="${entry#*=}"
+
+        if [[ -n "${!retired+declared}" ]]; then
+            die "${retired} is set, and this script no longer reads it." \
+                "Use ${replacement} instead - it is the one flag that governs the whole of what" \
+                "${retired} governed half of." \
+                "There were two variables and they gated different halves of the same decision:" \
+                "one skipped the producer's VALIDATION and the other skipped the broker" \
+                "MUTATION, and the forwarding was split too, so no entry point could express" \
+                "'skip the producer' completely." \
+                "Fix: rename ${retired} to ${replacement} wherever it is set - your .env, your" \
+                "shell, your CI configuration or your compose override." \
+                "Refusing rather than ignoring it, because ignoring it would silently do the" \
+                "opposite of what you asked for." \
+                "Nothing has been provisioned."
+        fi
+    done
 }
 
 # Parse the command line before anything else happens.
@@ -4080,12 +4281,20 @@ parse_arguments() {
                 usage
                 exit 0
                 ;;
+            --print-interface)
+                print_interface
+                exit 0
+                ;;
+            --print-interface-host)
+                print_interface --host
+                exit 0
+                ;;
             *)
                 usage >&2
                 die "unexpected argument '${argument}'." \
-                    "This script takes no arguments other than -h/--help; everything is" \
-                    "configured through the environment, and the usage above lists every" \
-                    "variable." \
+                    "This script takes no arguments other than -h/--help and the" \
+                    "--print-interface pair; everything is configured through the environment," \
+                    "and the usage above lists every variable." \
                     "Nothing has been provisioned."
                 ;;
         esac
@@ -4100,6 +4309,10 @@ main() {
 
     # Cheapest possible exit, and the common local case: no Kafka configured at all.
     skip_when_kafka_unconfigured
+
+    # Before any decision that reads a variable: a stale name must be reported as a stale name,
+    # not as whatever the unread value would have prevented.
+    require_no_retired_variables
 
     # Pure decisions, no network.
     #

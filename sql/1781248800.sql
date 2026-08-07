@@ -176,15 +176,13 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- ledger transaction, where a column that could reject its input would let a
     -- notification defect abort a financially valid mutation.
     --
-    -- EVERY READER OF THE EVENT BODY TAKES IT FROM HERE, never from payload: the
-    -- Kafka publish, the legacy webhook leg during the dual-delivery window, the
-    -- dead-letter write and a later dead-letter replay. That is what makes the two
-    -- delivery guarantees structural rather than a matter of careful coding —
-    -- during the window the Kafka message and the legacy webhook body are
-    -- identical because both are read from this one column, and a dead-letter
-    -- replay matches the original byte for byte because it re-publishes these
-    -- stored bytes instead of re-marshalling a struct. Acceptance criteria V-8 and
-    -- V-9 compare exactly these bytes.
+    -- EVERY READER OF THE LEGACY WEBHOOK BODY TAKES IT FROM HERE, never from
+    -- payload: the legacy webhook leg during the dual-delivery window reads these
+    -- bytes, and so does the payload member spliced into the canonical envelope in
+    -- event_raw below. That is what makes the dual-delivery guarantee structural
+    -- rather than a matter of careful coding — during the window the Kafka message
+    -- and the legacy webhook body carry the same payload because both come from
+    -- this one column. Acceptance criterion V-8 compares exactly these bytes.
     --
     -- The two columns cannot drift apart, and that is a property of the write path
     -- rather than a convention: eventOutboxInsertArgs binds both from ONE
@@ -195,6 +193,41 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- Reading it by eye: SELECT convert_from(payload_raw, 'UTF8') renders the
     -- stored body as text without touching what is stored.
     payload_raw         BYTEA                     NOT NULL,
+
+    -- THE CANONICAL EVENT VALUE, and the column the replay guarantee lives in.
+    --
+    -- event_raw holds the COMPLETE LedgerEvent envelope as it goes onto the Kafka
+    -- topic: the six members event_id, event_type, aggregate_id, occurred_at,
+    -- payload and schema_version, in that order, with payload_raw's bytes spliced
+    -- in verbatim. It is produced exactly once, at capture, by
+    -- model.LedgerEvent.CanonicalBytes, and it is what the publish, the
+    -- dead-letter write and a dead-letter replay all put on the wire.
+    --
+    -- # Why the whole envelope is stored rather than rebuilt from the columns
+    --
+    -- Requirement R-5 promises a dead-lettered event replays byte-for-byte apart
+    -- from its failure metadata, and V-9 asserts it. Rebuilding the envelope from
+    -- the columns at publish time satisfies that only while the serialiser never
+    -- changes: add a member, reorder one, or upgrade the encoder, and every row
+    -- already captured replays as DIFFERENT bytes — silently, because the two
+    -- values remain semantically equal, which is the kind of difference a
+    -- reviewer's eye passes over and a byte comparison does not. Storing the value
+    -- the broker was actually given makes the promise a property of the DATA rather
+    -- than of the code's stability across versions.
+    --
+    -- BYTEA for the same reasons payload_raw is: an opaque byte string cannot
+    -- validate, reject, transcode or re-render what it was given, and this INSERT
+    -- runs inside the caller's ledger transaction, where a column that could reject
+    -- its input would let a notification defect abort a financially valid mutation.
+    --
+    -- NOT NULL, and the repository guarantees it rather than merely requiring it:
+    -- prepareEventOutboxEntry derives the value from the row's own envelope fields
+    -- when a caller left it empty, so no write path can produce a row without one.
+    -- A dead-letter message is this value with a failure_metadata member spliced
+    -- on, which is why nothing here ever needs to re-marshal a struct.
+    --
+    -- Reading it by eye: SELECT convert_from(event_raw, 'UTF8').
+    event_raw           BYTEA                     NOT NULL,
 
     -- When the domain action happened; RFC3339 on the wire.
     --
@@ -534,16 +567,22 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- state nothing selects for is a permanently invisible event. The list is the
     -- model.EventOutboxStatus* vocabulary, in state-machine order.
     --
-    -- dlt_pending is the state a row enters the instant its retry budget is spent,
-    -- and it exists because "the budget is spent" and "the event is preserved
-    -- somewhere durable" are two different facts. Moving straight to failed made
-    -- the first imply the second: failed is outside the claim predicate, so a row
-    -- whose dead-letter write then failed — a broker outage, a cancelled context, a
-    -- process killed between the two — was terminal with the event existing NOWHERE
-    -- but this row, and no relay poll and no replay path could ever pick it up
-    -- again. dlt_pending is retryable by design: the hand-off is re-claimable once
-    -- the holder's lease expires, and only MarkEventDeadLettered — which runs after
-    -- the `<topic>.dlt` write is acknowledged — may declare the row terminal.
+    -- "THE BUDGET IS SPENT" AND "THE EVENT IS PRESERVED SOMEWHERE DURABLE" are two
+    -- different facts, and the state machine keeps them apart WITHOUT a status of
+    -- their own: the exhaustion arm writes failed and leaves dlt_topic NULL, and
+    -- that PAIR is the "dead-letter write owed" state. If failed implied preserved,
+    -- a row whose dead-letter write then failed — a broker outage, a cancelled
+    -- context, a process killed between the two — would be terminal with the event
+    -- existing NOWHERE but this row, and no relay poll and no replay path could
+    -- pick it up again.
+    --
+    -- The pair is re-claimable instead: ClaimFailedEventOutboxForDeadLetter selects
+    -- exactly (status = failed AND dlt_topic IS NULL) once the holder's lease has
+    -- expired, and only MarkEventDeadLettered — which runs after the `<topic>.dlt`
+    -- write is acknowledged — may declare the row terminal. An earlier shape of
+    -- this feature named that state 'dlt_pending'; it is absent from this list, was
+    -- never written by any statement, and its vocabulary has been removed rather
+    -- than left to read as live.
     CONSTRAINT event_outbox_status_known
         CHECK (status IN ('pending', 'processing', 'webhook_pending', 'dispatched', 'failed',
                           'dead_lettered', 'replaying'))
@@ -576,13 +615,13 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_pending
 -- The dead-letter inventory behind GET /events/dead-letter, and the operator's
 -- view of stalled events.
 --
--- It covers BOTH terminal failure literals so it stays usable whichever one the
--- repository layer filters on: the planner can prove that status =
--- 'dead_lettered' implies this predicate, and likewise for 'failed'. Restricting
--- it to a single literal would silently drop the other query off the index.
+-- It covers BOTH failure literals so it stays usable whichever one the repository
+-- layer filters on: the planner can prove that status = 'dead_lettered' implies
+-- this predicate, and likewise for 'failed'. Restricting it to a single literal
+-- would silently drop the other query off the index.
 --
 -- IT HAS A SECOND CONSUMER, and narrowing it would take that one off the index
--- too. ClaimExhaustedEventsForDeadLetter sweeps for rows left `failed` with the
+-- too. ClaimFailedEventOutboxForDeadLetter sweeps for rows left `failed` with the
 -- retry budget spent and dlt_topic still NULL — events whose dead-letter write
 -- never completed, which no other claim in the repository can reach — and it
 -- drives this index by (status, occurred_at), taking the remaining columns as a
@@ -591,38 +630,7 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_pending
 -- terminal rows.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_failed
     ON blnk.event_outbox (status, occurred_at)
-    WHERE status IN ('dlt_pending', 'failed', 'dead_lettered');
-
--- The index behind the DEAD-LETTER HAND-OFF RECOVERY claim, which is what makes
--- dlt_pending retryable rather than merely differently-named.
---
--- The query, run once per relay tick:
---
---   UPDATE blnk.event_outbox
---   SET claim_token = $1, locked_until = NOW() + $2::interval, last_attempted_at = NOW()
---   WHERE id IN (
---       SELECT id FROM blnk.event_outbox
---       WHERE status = 'dlt_pending'
---         AND (locked_until IS NULL OR locked_until < NOW())
---       ORDER BY occurred_at ASC
---       LIMIT $3
---       FOR UPDATE SKIP LOCKED
---   )
---   RETURNING <all columns>
---
--- The lease is what stops this claim racing the worker that is still performing the
--- hand-off: a row is only re-claimable once the lease its original claim took has
--- expired, so two workers cannot both write the same event to its dead-letter topic.
--- Without the lease in the predicate, the fresh claim token this claim stamps would
--- invalidate the original worker's token AFTER it had already published, and the
--- duplicate would be undetectable.
---
--- It is partial on a state that is empty in steady state — a dlt_pending row means a
--- dead-letter write is in flight or has just failed — so this index costs almost
--- nothing to maintain and the recovery poll never touches the rest of the table.
-CREATE INDEX IF NOT EXISTS idx_event_outbox_dlt_pending
-    ON blnk.event_outbox (status, locked_until, occurred_at)
-    WHERE status = 'dlt_pending';
+    WHERE status IN ('failed', 'dead_lettered');
 
 -- The index the FIFO claim query drives, and the reason relay polling stays
 -- viable at 500 events per second. The query, run once per poll interval:
@@ -793,7 +801,6 @@ DROP INDEX IF EXISTS blnk.idx_event_outbox_terminal_retention;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_partition_key_inflight;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_aggregate;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_claim;
-DROP INDEX IF EXISTS blnk.idx_event_outbox_dlt_pending;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_failed;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_pending;
 DROP INDEX IF EXISTS blnk.event_outbox_event_id_uidx;

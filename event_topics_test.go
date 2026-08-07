@@ -105,8 +105,8 @@ type eventCatalogueEntry struct {
 }
 
 // eventCatalogue is the complete, independently written statement of the routing
-// contract: all thirteen event strings Blnk emits, the four category topics they route to and their
-// four dead-letter siblings.
+// contract: all thirteen event strings Blnk emits, the five category topics they route to and their
+// five dead-letter siblings.
 //
 // EVERY VALUE HERE IS A LITERAL, and that is the single most important property of this
 // file. Nothing is computed from model.EventCategory, from TopicForEvent, or from the
@@ -117,7 +117,7 @@ type eventCatalogueEntry struct {
 // echo, and it is what makes the file resistant to mutation testing.
 //
 // The order is the order the events are documented in: the transaction family, then
-// balances, then identities, then the two events that motivate the fourth category.
+// balances, then identities, then the two events that motivate the two extra categories.
 var eventCatalogue = []eventCatalogueEntry{
 	// The seven transaction lifecycle events. All seven originate in
 	// getEventFromStatus, which is the transaction event-string vocabulary and which
@@ -209,23 +209,26 @@ var eventCatalogue = []eventCatalogueEntry{
 		category:        "identities",
 	},
 	// The two events that belong to none of the three requirement-named categories, and
-	// which are the entire reason the fourth category exists. If either ever resolves to
+	// which are the entire reason the two extra categories exist. If either ever resolves to
 	// blnk.transactions, blnk.balances or blnk.identities, a category has been "simplified
 	// away" and a subscriber filtering that topic is now receiving events it never
 	// subscribed to.
 	//
-	// They share ONE category on purpose. AMBIGUITY-2 resolves the two uncategorised
-	// event types into a single fourth category, blnk.system, rather than one category
-	// each — and that category is Blnk-internal, so neither topic is grantable to a
-	// subscriber principal. Splitting ledger.created back out into its own topic would
-	// add a fifth category the requirement never names and would make it grantable,
-	// silently widening the subscriber-facing surface.
+	// THEY DO NOT SHARE A CATEGORY, and the reason is an access rule rather than a naming
+	// preference. AMBIGUITY-2 asks how two uncatalogued event types are covered; it is
+	// answered here with one category each, because the two have opposite access
+	// requirements. ledger.created is ordinary ledger data delivered to every subscriber by
+	// the legacy transport, so its topic must be GRANTABLE. system.error carries Blnk's own
+	// error text verbatim in a frozen payload, so its topic must NOT be. One shared category
+	// had to pick one answer, and picking "internal" is what left ledger.created published
+	// and unreachable by every credential Blnk can issue. Merging them back together would
+	// reintroduce exactly that.
 	{
 		eventType:       "ledger.created",
 		vocabularyKey:   "ledger.created",
-		topic:           "blnk.system",
-		deadLetterTopic: "blnk.system.dlt",
-		category:        "system",
+		topic:           "blnk.ledgers",
+		deadLetterTopic: "blnk.ledgers.dlt",
+		category:        "ledgers",
 	},
 	{
 		eventType:       "system.error",
@@ -561,7 +564,7 @@ func TestTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 		})
 	}
 
-	// Coverage of the four topics is asserted from the catalogue's own rows, so an event
+	// Coverage of the category topics is asserted from the catalogue's own rows, so an event
 	// silently rerouted away from a topic — leaving that topic with no producers at all —
 	// fails here as well as in its own subtest.
 	routed := make(map[string][]string, len(eventCatalogue))
@@ -573,9 +576,10 @@ func TestTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 		"the transactions topic carries the seven lifecycle events plus the bulk transaction family")
 	assert.Len(t, routed["blnk.balances"], 2, "the balances topic carries balance.created and balance.monitor")
 	assert.Len(t, routed["blnk.identities"], 1, "the identities topic carries identity.created")
-	assert.Len(t, routed["blnk.system"], 2, "the system topic carries ledger.created and system.error")
-	assert.Len(t, routed, 4,
-		"every EMITTED event must land on one of exactly four category topics — the frozen topic "+
+	assert.Len(t, routed["blnk.ledgers"], 1, "the ledgers topic carries ledger.created, and it carries it alone: it is a category of its own precisely so that a grantable event is not stranded on an ungrantable topic")
+	assert.Len(t, routed["blnk.system"], 1, "the system topic carries system.error and nothing else that is catalogued")
+	assert.Len(t, routed, 5,
+		"every EMITTED event must land on one of exactly five category topics — the frozen topic "+
 			"contract — and the internal system topic is additionally where an event type the "+
 			"mapping table does not recognise is routed")
 }
@@ -826,17 +830,18 @@ func TestTopicForEvent_UnrecognisedEventRoutesToTheInternalSystemTopic(t *testin
 	}
 }
 
-// TestDLTFor_DerivesTheFourDeadLetterTopics asserts the exact dead-letter names for
+// TestDLTFor_DerivesEveryDeadLetterTopic asserts the exact dead-letter names for
 // every category topic.
 //
-// Three of these four strings are the literal names the requirements specify, so they
+// Three of these five strings are the literal names the requirements specify, so they
 // must match byte for byte. They are also the names the local provisioning path creates,
 // the names the alert rules label and the names the operator runbooks tell a human to
 // look at, which is why they are written out here rather than derived.
-func TestDLTFor_DerivesTheFourDeadLetterTopics(t *testing.T) {
+func TestDLTFor_DerivesEveryDeadLetterTopic(t *testing.T) {
 	assert.Equal(t, "blnk.transactions.dlt", DLTFor("blnk.transactions"))
 	assert.Equal(t, "blnk.balances.dlt", DLTFor("blnk.balances"))
 	assert.Equal(t, "blnk.identities.dlt", DLTFor("blnk.identities"))
+	assert.Equal(t, "blnk.ledgers.dlt", DLTFor("blnk.ledgers"))
 	assert.Equal(t, "blnk.system.dlt", DLTFor("blnk.system"))
 
 	// The suffix constant is the published convention. Its value is part of the
@@ -857,6 +862,7 @@ func TestDLTFor_IsIdempotent(t *testing.T) {
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
+		"blnk.ledgers",
 		"blnk.system",
 	} {
 		once := DLTFor(topic)
@@ -915,7 +921,7 @@ func TestDeadLetterTopicForEvent_RoutesEveryEmittedEventString(t *testing.T) {
 	assert.Equal(t, "blnk.balances.dlt", DeadLetterTopicForEvent("balance.created"))
 	assert.Equal(t, "blnk.balances.dlt", DeadLetterTopicForEvent("balance.monitor"))
 	assert.Equal(t, "blnk.identities.dlt", DeadLetterTopicForEvent("identity.created"))
-	assert.Equal(t, "blnk.system.dlt", DeadLetterTopicForEvent("ledger.created"))
+	assert.Equal(t, "blnk.ledgers.dlt", DeadLetterTopicForEvent("ledger.created"))
 	assert.Equal(t, "blnk.system.dlt", DeadLetterTopicForEvent("system.error"))
 
 	// An unrecognised event dead-letters to the catch-all's sibling, so even an event
@@ -955,6 +961,7 @@ func TestIsDeadLetterTopic_DistinguishesTheTwoKindsOfTopic(t *testing.T) {
 	assert.True(t, IsDeadLetterTopic("blnk.transactions.dlt"))
 	assert.True(t, IsDeadLetterTopic("blnk.balances.dlt"))
 	assert.True(t, IsDeadLetterTopic("blnk.identities.dlt"))
+	assert.True(t, IsDeadLetterTopic("blnk.ledgers.dlt"))
 	assert.True(t, IsDeadLetterTopic("blnk.system.dlt"))
 	assert.True(t, IsDeadLetterTopic("  blnk.system.dlt  "),
 		"surrounding whitespace must not change the verdict")
@@ -964,6 +971,7 @@ func TestIsDeadLetterTopic_DistinguishesTheTwoKindsOfTopic(t *testing.T) {
 	assert.False(t, IsDeadLetterTopic("blnk.transactions"))
 	assert.False(t, IsDeadLetterTopic("blnk.balances"))
 	assert.False(t, IsDeadLetterTopic("blnk.identities"))
+	assert.False(t, IsDeadLetterTopic("blnk.ledgers"))
 	assert.False(t, IsDeadLetterTopic("blnk.system"))
 	assert.False(t, IsDeadLetterTopic(""))
 	assert.False(t, IsDeadLetterTopic("   "))
@@ -988,6 +996,7 @@ func TestTopicPrefix_DefaultsToBlnkWhenUnset(t *testing.T) {
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
+		"blnk.ledgers",
 		"blnk.system",
 	}, AllTopics())
 }
@@ -1008,7 +1017,7 @@ func TestTopicPrefix_HonoursAConfiguredOverride(t *testing.T) {
 	assert.Equal(t, "acme.events.transactions", TopicForEvent("bulk_transaction.failed"))
 	assert.Equal(t, "acme.events.balances", TopicForEvent("balance.created"))
 	assert.Equal(t, "acme.events.identities", TopicForEvent("identity.created"))
-	assert.Equal(t, "acme.events.system", TopicForEvent("ledger.created"))
+	assert.Equal(t, "acme.events.ledgers", TopicForEvent("ledger.created"))
 	assert.Equal(t, "acme.events.system", TopicForEvent("system.error"))
 	assert.Equal(t, "acme.events.system", TopicForEvent("totally.unknown"))
 
@@ -1019,6 +1028,7 @@ func TestTopicPrefix_HonoursAConfiguredOverride(t *testing.T) {
 		"acme.events.transactions",
 		"acme.events.balances",
 		"acme.events.identities",
+		"acme.events.ledgers",
 		"acme.events.system",
 	}, AllTopics())
 
@@ -1026,6 +1036,7 @@ func TestTopicPrefix_HonoursAConfiguredOverride(t *testing.T) {
 		"acme.events.transactions.dlt",
 		"acme.events.balances.dlt",
 		"acme.events.identities.dlt",
+		"acme.events.ledgers.dlt",
 		"acme.events.system.dlt",
 	}, AllDeadLetterTopics())
 
@@ -1033,10 +1044,12 @@ func TestTopicPrefix_HonoursAConfiguredOverride(t *testing.T) {
 		"acme.events.transactions",
 		"acme.events.balances",
 		"acme.events.identities",
+		"acme.events.ledgers",
 		"acme.events.system",
 		"acme.events.transactions.dlt",
 		"acme.events.balances.dlt",
 		"acme.events.identities.dlt",
+		"acme.events.ledgers.dlt",
 		"acme.events.system.dlt",
 	}, AllTopicsWithDeadLetters())
 
@@ -1128,6 +1141,7 @@ func TestTopicPrefix_DefaultsWhenConfigurationIsNotLoaded(t *testing.T) {
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
+		"blnk.ledgers",
 		"blnk.system",
 	}, AllTopics())
 }
@@ -1203,6 +1217,7 @@ func TestAllTopics_IsEveryCategoryTopicInCanonicalOrder(t *testing.T) {
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
+		"blnk.ledgers",
 		"blnk.system",
 	}, AllTopics())
 
@@ -1226,6 +1241,7 @@ func TestAllDeadLetterTopics_IsEverySiblingInCanonicalOrder(t *testing.T) {
 		"blnk.transactions.dlt",
 		"blnk.balances.dlt",
 		"blnk.identities.dlt",
+		"blnk.ledgers.dlt",
 		"blnk.system.dlt",
 	}, AllDeadLetterTopics())
 
@@ -1257,10 +1273,12 @@ func TestAllTopicsWithDeadLetters_IsTheProvisionedInventory(t *testing.T) {
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
+		"blnk.ledgers",
 		"blnk.system",
 		"blnk.transactions.dlt",
 		"blnk.balances.dlt",
 		"blnk.identities.dlt",
+		"blnk.ledgers.dlt",
 		"blnk.system.dlt",
 	}, AllTopicsWithDeadLetters())
 
@@ -1386,14 +1404,16 @@ func TestEventCategories_IsTheCanonicalTokenListInOrder(t *testing.T) {
 		"transactions",
 		"balances",
 		"identities",
+		"ledgers",
 		"system",
 	}, EventCategories(),
-		"the topic contract is these four categories and the eight topics composed from them")
+		"the topic contract is these five categories and the ten topics composed from them")
 
 	assert.Equal(t, []string{
 		model.EventCategoryTransactions,
 		model.EventCategoryBalances,
 		model.EventCategoryIdentities,
+		model.EventCategoryLedgers,
 		model.EventCategorySystem,
 	}, EventCategories(),
 		"the enumeration must be built from the model constants, not from re-spelled literals")
@@ -1467,6 +1487,7 @@ func TestTopicForCategory_ComposesAnUnknownCategoryAsGiven(t *testing.T) {
 	assert.Equal(t, "blnk.transactions", TopicForCategory(model.EventCategoryTransactions))
 	assert.Equal(t, "blnk.balances", TopicForCategory(model.EventCategoryBalances))
 	assert.Equal(t, "blnk.identities", TopicForCategory(model.EventCategoryIdentities))
+	assert.Equal(t, "blnk.ledgers", TopicForCategory(model.EventCategoryLedgers))
 	assert.Equal(t, "blnk.system", TopicForCategory(model.EventCategorySystem))
 }
 
@@ -1481,19 +1502,29 @@ func TestTopicForCategory_ComposesAnUnknownCategoryAsGiven(t *testing.T) {
 func TestSubscriberGrantableTopics_ExcludesDeadLettersAndInternalTopics(t *testing.T) {
 	storeKafkaTopicPrefix(t, "")
 
-	// THREE topics, and the system one is absent deliberately. It is the requirement's
-	// three named categories and nothing else: blnk.system carries system.error, whose
-	// payload is the frozen legacy body and therefore still contains the raw error text
-	// verbatim, and it is simultaneously the catch-all for any event type the catalogue
-	// does not recognise. Granting it would both disclose that text to a subscriber and
-	// make an uncatalogued domain event readable by an audience that never asked for it.
+	// FOUR topics, and the system one is absent deliberately. It is the requirement's three
+	// named categories plus blnk.ledgers, and nothing else.
+	//
+	// blnk.ledgers is HERE, and it is the entry that matters: ledger.created is delivered to
+	// every subscriber by the legacy webhook today, so a Kafka allowlist without it would be a
+	// consuming-side regression rather than a tightening. It used to be absent, because
+	// ledger.created shared the internal system category — published and unreachable at the
+	// same time.
+	//
+	// blnk.system is absent because it carries system.error, whose payload is the frozen legacy
+	// body and therefore still contains the raw error text verbatim, and because it is
+	// simultaneously the catch-all for any event type the catalogue does not recognise. Granting
+	// it would both disclose that text to a subscriber and make an uncatalogued domain event
+	// readable by an audience that never asked for it. With ledger.created moved out, that
+	// exclusion costs a subscriber nothing it previously received.
 	assert.Equal(t, []string{
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
+		"blnk.ledgers",
 	}, SubscriberGrantableTopics(),
 		"only the non-internal category topics may be granted to a subscriber, and the "+
-			"system category is internal")
+			"system category is the only internal one")
 
 	for _, topic := range SubscriberGrantableTopics() {
 		assert.True(t, IsSubscriberGrantableTopic(topic),
@@ -1541,6 +1572,7 @@ func TestSubscriberGrantableTopics_ExcludesDeadLettersAndInternalTopics(t *testi
 		"acme.events.transactions",
 		"acme.events.balances",
 		"acme.events.identities",
+		"acme.events.ledgers",
 	}, SubscriberGrantableTopics())
 	assert.True(t, IsSubscriberGrantableTopic("acme.events.transactions"))
 	assert.False(t, IsSubscriberGrantableTopic("blnk.transactions"),
@@ -1579,15 +1611,15 @@ func TestIsBlnkOwnedTopic_CoversTheWholeInventoryAndNothingElse(t *testing.T) {
 	assert.True(t, IsBlnkOwnedTopic("blnk.system.dlt"))
 	assert.False(t, IsSubscriberGrantableTopic("blnk.system.dlt"))
 
-	// THE INVENTORY IS CLOSED AT THE FOUR CATALOGUED CATEGORIES, so a plausible-looking
-	// fifth name is refused rather than tolerated. "blnk.quarantine" is the one to watch:
+	// THE INVENTORY IS CLOSED AT THE FIVE CATALOGUED CATEGORIES, so a plausible-looking
+	// sixth name is refused rather than tolerated. "blnk.quarantine" is the one to watch:
 	// an earlier design routed uncatalogued events to a topic of that name, and admitting
 	// a name Blnk never creates would let the ACL pruner treat another team's bindings on
 	// it as its own to delete.
 	for _, topic := range []string{
 		"", "   ", "*", "blnk", "blnk.", "blnk.orders", "__consumer_offsets",
 		"blnk.transactions.dlt.dlt", "blnk.transactions.replayed", "BLNK.TRANSACTIONS",
-		"blnk.quarantine", "blnk.quarantine.dlt", "blnk.ledgers", "blnk.ledgers.dlt",
+		"blnk.quarantine", "blnk.quarantine.dlt", "blnk.ledger", "blnk.ledgers.dlt.dlt",
 	} {
 		assert.False(t, IsBlnkOwnedTopic(topic),
 			"%q is not in the inventory and must not be writable: a stored or replayed row must not be able to steer the publisher at an arbitrary topic", topic)

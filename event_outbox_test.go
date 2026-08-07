@@ -58,6 +58,7 @@ package blnk
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -486,14 +487,16 @@ func outboxEventFixtures() []outboxEventFixture {
 			partitionKey: outboxIdentityID,
 		},
 
-		// The two events that motivate the fourth category. Neither belongs to the
+		// The two events that motivate the two extra categories. Neither belongs to the
 		// transactions, balances or identities topic, and the coverage requirement
-		// forbids dropping them.
+		// forbids dropping them. They get one category EACH rather than sharing one,
+		// because ledger.created must be reachable by a subscriber and system.error must
+		// not be.
 		{
 			name:         "ledger.created",
 			eventType:    "ledger.created",
 			payload:      outboxSampleLedger(),
-			topic:        "blnk.system",
+			topic:        "blnk.ledgers",
 			aggregateID:  outboxLedgerID,
 			partitionKey: outboxLedgerID,
 		},
@@ -780,28 +783,6 @@ func contextDeadline(ctx context.Context) *time.Time {
 	return &deadline
 }
 
-// standaloneDeadlines returns a copy of the deadlines standalone inserts ran under.
-func (s *outboxSpyDatasource) standaloneDeadlines() []*time.Time {
-	s.guard.Lock()
-	defer s.guard.Unlock()
-
-	deadlines := make([]*time.Time, len(s.standaloneDeadlineValues))
-	copy(deadlines, s.standaloneDeadlineValues)
-
-	return deadlines
-}
-
-// inTransactionDeadlines returns a copy of the deadlines in-transaction inserts ran under.
-func (s *outboxSpyDatasource) inTransactionDeadlines() []*time.Time {
-	s.guard.Lock()
-	defer s.guard.Unlock()
-
-	deadlines := make([]*time.Time, len(s.inTxDeadlineValues))
-	copy(deadlines, s.inTxDeadlineValues)
-
-	return deadlines
-}
-
 // newOutboxSpyDatasource returns a spy wired for use as the Blnk datasource.
 func newOutboxSpyDatasource() *outboxSpyDatasource {
 	return &outboxSpyDatasource{MockDataSource: new(mocks.MockDataSource)}
@@ -842,42 +823,6 @@ func (s *outboxSpyDatasource) standalone() []*model.EventOutbox {
 
 	rows := make([]*model.EventOutbox, len(s.standaloneRows))
 	copy(rows, s.standaloneRows)
-
-	return rows
-}
-
-// standaloneCopies returns VALUE COPIES of the rows inserted outside any transaction.
-//
-// standalone hands back the very pointers a producer passed in, which is what most assertions
-// want: they read fields, and reading alongside the producer is safe. A caller that means to
-// MUTATE a row is different. Stamping the surrogate primary key the INSERT would have returned
-// is a WRITE, and when the producer ran on its own goroutine — notification.NotifyError does —
-// that goroutine still holds the row after the insert returns and reads its id into a span
-// attribute. Writing into the same object is a data race, and the race detector says so.
-//
-// Copying is also the more faithful arrangement: a relay never receives the producer's own
-// object. It reads the row back out of the table.
-//
-// A nil row is copied as a zero value rather than skipped, so the count a caller asserts on
-// still reflects what was recorded and the missing fields fail loudly rather than silently
-// shortening the slice.
-//
-// Returns:
-//   - []model.EventOutbox: one value copy per recorded standalone insert, in call order.
-func (s *outboxSpyDatasource) standaloneCopies() []model.EventOutbox {
-	s.guard.Lock()
-	defer s.guard.Unlock()
-
-	rows := make([]model.EventOutbox, 0, len(s.standaloneRows))
-	for _, row := range s.standaloneRows {
-		if row == nil {
-			rows = append(rows, model.EventOutbox{})
-
-			continue
-		}
-
-		rows = append(rows, *row)
-	}
 
 	return rows
 }
@@ -959,6 +904,51 @@ func outboxLegacyWebhookBody(t *testing.T, event NewWebhook) []byte {
 	require.NoError(t, err, "the legacy webhook body must marshal")
 
 	return body
+}
+
+// outboxEnvelopeCarrying matches the event_raw bound value: the canonical envelope, whose
+// payload member must be the given bytes VERBATIM.
+//
+// It is a matcher rather than a literal expectation because two of the envelope's members —
+// the generated event_id and the construction-time occurred_at — cannot be written down in
+// advance. Matching on structure and on the spliced payload instead is what keeps the
+// assertion meaningful: sqlmock.AnyArg() here would accept an empty column, a re-marshalled
+// payload or a bare `null`, which are precisely the three ways this column can be wrong.
+type outboxEnvelopeCarrying struct {
+	// payload is the legacy webhook body the envelope must splice in unaltered.
+	payload []byte
+}
+
+// Match reports whether value is a canonical envelope carrying the expected payload bytes.
+//
+// Parameters:
+//   - value driver.Value: the bound value sqlmock observed.
+//
+// Returns:
+//   - bool: true only for a valid JSON object that declares all six envelope members and
+//     whose payload member is byte-equal to the expected body.
+func (m outboxEnvelopeCarrying) Match(value driver.Value) bool {
+	raw, isBytes := value.([]byte)
+	if !isBytes || len(raw) == 0 {
+		return false
+	}
+
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return false
+	}
+
+	for _, name := range []string{
+		"event_id", "event_type", "aggregate_id", "occurred_at", "payload", "schema_version",
+	} {
+		if _, present := members[name]; !present {
+			return false
+		}
+	}
+
+	// json.RawMessage keeps the member's bytes exactly as they appeared, which is what makes
+	// this a byte comparison rather than a document comparison.
+	return string(members["payload"]) == string(m.payload)
 }
 
 // outboxTopLevelKeys returns the keys of a JSON object IN DOCUMENT ORDER.
@@ -1500,7 +1490,7 @@ func TestPrepareEventOutbox_EventTypeIsTrimmedWhileThePayloadStaysVerbatim(t *te
 	require.NotNil(t, row)
 
 	assert.Equal(t, "ledger.created", row.EventType, "event_type must be trimmed")
-	assert.Equal(t, "blnk.system", row.Topic, "the trimmed name must be what routing sees")
+	assert.Equal(t, "blnk.ledgers", row.Topic, "the trimmed name must be what routing sees")
 	assert.Equal(t, string(outboxLegacyWebhookBody(t, event)), string(row.Payload),
 		"the payload must remain the legacy body byte for byte, untrimmed")
 	assert.Contains(t, string(row.Payload), `"event":"  ledger.created\t"`,
@@ -2294,7 +2284,7 @@ func TestPrepareEventOutbox_IsConfiguredByKafkaBrokers(t *testing.T) {
 // SendWebhook enqueues through the asynq client and a hand-built instance has none: the
 // enqueue is the observable behaviour, so it has to be real.
 func TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent(t *testing.T) {
-	newLegacyOnlyInstance := func(t *testing.T, webhookURL string) (*Blnk, *outboxSpyDatasource) {
+	newLegacyOnlyInstanceWithSunset := func(t *testing.T, webhookURL, sunset string) (*Blnk, *outboxSpyDatasource) {
 		t.Helper()
 
 		redisServer := miniredis.RunT(t)
@@ -2310,6 +2300,7 @@ func TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent(t *testing
 			Notification: config.Notification{
 				Webhook: config.WebhookConfig{Url: webhookURL},
 			},
+			WebhookDeprecationSunsetDate: sunset,
 		})
 
 		instance, err := NewBlnk(datasource)
@@ -2320,6 +2311,15 @@ func TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent(t *testing
 				"run and therefore what makes the legacy path the only delivery route")
 
 		return instance, datasource
+	}
+
+	// No sunset: the ordinary state of a webhook-only deployment that has not scheduled a
+	// retirement. With no Kafka transport the sunset resolves to "not passed", so the legacy
+	// path keeps working exactly as it did before this feature existed.
+	newLegacyOnlyInstance := func(t *testing.T, webhookURL string) (*Blnk, *outboxSpyDatasource) {
+		t.Helper()
+
+		return newLegacyOnlyInstanceWithSunset(t, webhookURL, "")
 	}
 
 	event := NewWebhook{Event: "transaction.applied", Payload: outboxSampleTransaction(StatusApplied)}
@@ -2383,6 +2383,53 @@ func TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent(t *testing
 					"here would deliver a webhook for a mutation that may still roll back; the "+
 					"caller's post-commit path is what delivers it")
 		}
+	})
+
+	// THE SUNSET GATE, and it is the review's C-1 finding on this path. The legacy-only
+	// branch compared nothing against the retirement instant, so a deployment that had
+	// scheduled the HTTP transport's retirement — and passed it — kept delivering over it,
+	// while the relay and the 410 guard on a Kafka deployment both treated it as gone. Every
+	// legacy enqueue now goes through the one predicate in event_sunset.go.
+	t.Run("nothing is enqueued once the configured sunset has passed", func(t *testing.T) {
+		past := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+		instance, datasource := newLegacyOnlyInstanceWithSunset(t, "https://example.com/webhooks", past)
+
+		require.True(t, WebhookSunsetPassedNow(),
+			"the fixture must actually be past the sunset, or the assertion below proves nothing")
+
+		require.NoError(t, instance.PublishEvent(context.Background(), event),
+			"a retired transport is not an error: the event is simply no longer owed to it")
+
+		datasource.assertWroteNothing(t)
+
+		inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: instance.Config().Redis.Dns})
+		t.Cleanup(func() { assert.NoError(t, inspector.Close()) })
+
+		info, err := inspector.GetQueueInfo("webhook_queue_legacy_only_test")
+		if err == nil {
+			assert.Zero(t, info.Size,
+				"the legacy HTTP transport is retired, so no delivery may be enqueued onto it")
+		}
+	})
+
+	// ... and the boundary on the other side: a sunset still in the future leaves the
+	// transport running. Asserted so the gate cannot be satisfied by refusing everything.
+	t.Run("a sunset still in the future leaves the legacy transport working", func(t *testing.T) {
+		future := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+		instance, datasource := newLegacyOnlyInstanceWithSunset(t, "https://example.com/webhooks", future)
+
+		require.False(t, WebhookSunsetPassedNow(), "the fixture must be inside the window")
+		require.NoError(t, instance.PublishEvent(context.Background(), event))
+
+		datasource.assertWroteNothing(t)
+
+		inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: instance.Config().Redis.Dns})
+		t.Cleanup(func() { assert.NoError(t, inspector.Close()) })
+
+		info, err := inspector.GetQueueInfo("webhook_queue_legacy_only_test")
+		require.NoError(t, err)
+		assert.Equal(t, 1, info.Size,
+			"before the sunset the legacy delivery is still owed and must still be enqueued")
 	})
 }
 
@@ -2518,7 +2565,7 @@ func TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction(t *testing.T) {
 	standalone := datasource.standalone()
 	require.Len(t, standalone, 1, "exactly one standalone insert must have been issued")
 	assert.Equal(t, "ledger.created", standalone[0].EventType)
-	assert.Equal(t, "blnk.system", standalone[0].Topic)
+	assert.Equal(t, "blnk.ledgers", standalone[0].Topic)
 	assert.Equal(t, outboxLedgerID, standalone[0].PartitionKey)
 	assert.Equal(t, outboxLedgerID, standalone[0].LedgerID,
 		"a balance payload DOES carry a ledger, so the ledger column is populated as well as the key")
@@ -2728,6 +2775,12 @@ func TestPublishEvent_IssuesTheOutboxInsertWithThePayloadBytes(t *testing.T) {
 			// expectation would fail here at the SQL boundary rather than silently
 			// producing a JSONB-normalised replay much later.
 			expectedPayload,
+			// event_raw: the canonical envelope, with that same body spliced in
+			// unaltered. It is written ONCE here and read by every later transport, so
+			// the bytes bound at this boundary are the bytes a subscriber eventually
+			// receives — which is why the payload member is compared exactly rather
+			// than the whole column being waved through.
+			outboxEnvelopeCarrying{payload: expectedPayload},
 			sqlmock.AnyArg(), // occurred_at: the domain instant, stamped at construction
 			model.EventOutboxStatusPending,
 			defaultEventMaxAttempts,
@@ -2784,8 +2837,10 @@ func TestPublishEventInTx_IssuesTheInsertInsideTheCallersTransaction(t *testing.
 			nil,
 			"blnk.transactions",
 			model.SchemaVersionV1,
-			expectedPayload,  // payload
-			expectedPayload,  // payload_raw: the same slice bound into both body columns
+			expectedPayload, // payload
+			expectedPayload, // payload_raw: the same slice bound into both body columns
+			// event_raw: the canonical envelope wrapping that same body verbatim.
+			outboxEnvelopeCarrying{payload: expectedPayload},
 			sqlmock.AnyArg(), // occurred_at: the domain instant, stamped at construction
 			model.EventOutboxStatusPending,
 			defaultEventMaxAttempts,
@@ -3375,8 +3430,28 @@ func TestPublishToTopic_AcceptsAnEnvelopeInsideTheCeiling(t *testing.T) {
 
 	publisher := sizeLimitPublisher(t)
 
-	// Sized so the envelope's scaffold and the five sibling keys still fit under the ceiling.
-	event := sizedLedgerEvent(model.MaxEventMessageBytes - (envelopeScaffoldBytes * 2))
+	// Sized so the whole envelope — the payload plus its five sibling members — lands EXACTLY
+	// on the ceiling, which is the largest message the check accepts.
+	//
+	// The overhead is MEASURED from the canonical serialiser rather than approximated by a
+	// scaffold constant, and measured from THE EVENT UNDER TEST rather than from a similar
+	// one. Both matter: the envelope's member names could change, and the RFC3339 rendering
+	// of the timestamp is variable-length because trailing zeros in the fractional second are
+	// trimmed, so an overhead borrowed from another instant can be several bytes wrong. A
+	// fixture that guessed high would prove only that a comfortably small message is
+	// accepted, which is not the boundary this test exists to hold.
+	event := sizedLedgerEvent(1024)
+	probe, err := event.CanonicalBytes()
+	require.NoError(t, err, "the probe envelope must serialise before its overhead can be measured")
+
+	overhead := len(probe) - len(event.Payload)
+	// Two of the payload's bytes are the quotes around the filler, as in sizedLedgerEvent.
+	event.Payload = json.RawMessage(`"` + strings.Repeat("x", model.MaxEventMessageBytes-overhead-2) + `"`)
+
+	atCeiling, err := event.CanonicalBytes()
+	require.NoError(t, err)
+	require.Len(t, atCeiling, model.MaxEventMessageBytes,
+		"the fixture must sit exactly on the ceiling, or it is not testing the boundary")
 
 	// The write is expected to fail — there is no broker this test may rely on — and the
 	// deadline is what keeps that failure fast and identical whether or not something is
@@ -3385,8 +3460,7 @@ func TestPublishToTopic_AcceptsAnEnvelopeInsideTheCeiling(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, err := publisher.PublishToTopic(ctx, PublishRequest{Event: event})
-	if err != nil {
+	if _, err = publisher.PublishToTopic(ctx, PublishRequest{Event: event}); err != nil {
 		assert.NotErrorIs(t, err, ErrEventMessageTooLarge,
 			"an envelope inside the ceiling must not be refused for its size")
 	}
@@ -3689,7 +3763,7 @@ func TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield(t *testing.T) {
 	})
 }
 
-// TestBuildTransactionExecutionWork_CapturesTheEventForTheAtomicWriter is the R-2 test for
+// TestPrepareTransactionEventOutbox_CapturesTheEventForTheAtomicWriter is the R-2 test for
 // the transaction family: it asserts that the event row exists BEFORE persistence and
 // therefore has something to commit inside.
 //
@@ -3702,11 +3776,12 @@ func TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield(t *testing.T) {
 // actually states — the event is in the mutation's own transaction — is a property of WHEN
 // the row is built and WHERE it is passed, so that is what is asserted here.
 //
-// The assertions deliberately reach for the row on the work item rather than for a database
-// effect. The work item is the only place the two facts meet: it is produced before
-// persistence and consumed by the atomic writer, so a row on it is a row that commits with
-// the mutation, and a nil row is post-commit capture by definition.
-func TestBuildTransactionExecutionWork_CapturesTheEventForTheAtomicWriter(t *testing.T) {
+// The builder under test is the one persistSingleTransactionExecutionWork calls immediately
+// before it invokes the atomic writer, and it is the ONLY place a transaction event row is
+// built. Its companion test below proves the row it returns actually reaches that writer; the
+// two are only meaningful together, because preparing a row and dropping it loses exactly as
+// many events as post-commit capture did.
+func TestPrepareTransactionEventOutbox_CapturesTheEventForTheAtomicWriter(t *testing.T) {
 	const ledgerID = "ldg_9c1f4a20"
 
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
@@ -3728,60 +3803,74 @@ func TestBuildTransactionExecutionWork_CapturesTheEventForTheAtomicWriter(t *tes
 		}
 	}
 
-	t.Run("the work item carries the event row", func(t *testing.T) {
-		work, skip := blnk.buildTransactionExecutionWork(context.Background(), newTransaction(), sourceBalance, destinationBalance)
+	prepare := func(t *testing.T, instance *Blnk, source, destination *model.Balance) (*model.EventOutbox, *model.Transaction) {
+		t.Helper()
+
+		// The work builder runs first because it is what finalises the status, and the event
+		// name is derived from the FINAL status. Preparing from the pre-update transaction
+		// would announce transaction.queued for a transaction that committed as APPLIED.
+		work, skip := instance.buildTransactionExecutionWork(context.Background(), newTransaction(), source, destination)
 		require.False(t, skip, "a non-zero amount must be persisted")
-		require.NotNil(t, work.eventOutbox,
+
+		row, err := instance.prepareTransactionEventOutbox(context.Background(), work.transaction, source, destination)
+		require.NoError(t, err, "a well-formed transaction payload must serialise")
+
+		return row, work.transaction
+	}
+
+	t.Run("the row is built before persistence", func(t *testing.T) {
+		row, transaction := prepare(t, blnk, sourceBalance, destinationBalance)
+		require.NotNil(t, row,
 			"the event row must be prepared BEFORE persistence; a nil row here means the event "+
 				"can only be captured after the commit, which is what requirement R-2 forbids")
 
-		assert.Equal(t, getEventFromStatus(work.transaction.Status), work.eventOutbox.EventType,
+		assert.Equal(t, getEventFromStatus(transaction.Status), row.EventType,
 			"the event name must be derived from the FINAL status, after updateTransactionDetails")
-		assert.Equal(t, work.transaction.TransactionID, work.eventOutbox.AggregateID)
-		assert.Equal(t, model.EventOutboxStatusPending, work.eventOutbox.Status)
+		assert.Equal(t, transaction.TransactionID, row.AggregateID)
+		assert.Equal(t, model.EventOutboxStatusPending, row.Status)
 	})
 
 	t.Run("the ledger is resolved from the balances, not supplied by the caller", func(t *testing.T) {
-		work, _ := blnk.buildTransactionExecutionWork(context.Background(), newTransaction(), sourceBalance, destinationBalance)
-		require.NotNil(t, work.eventOutbox)
+		row, _ := prepare(t, blnk, sourceBalance, destinationBalance)
+		require.NotNil(t, row)
 
-		assert.Equal(t, ledgerID, work.eventOutbox.LedgerID,
+		assert.Equal(t, ledgerID, row.LedgerID,
 			"a transaction payload carries no ledger, so the capture path must take it from the "+
 				"loaded source balance; an empty value is requirement R-6 unsatisfied at the producer")
-		assert.Equal(t, ledgerID, work.eventOutbox.PartitionKey,
+		assert.Equal(t, ledgerID, row.PartitionKey,
 			"and it must become the partition key, because that is the Kafka message key")
-		assert.Equal(t, ledgerID, PublishRequestFromOutbox(*work.eventOutbox, 1).Key,
+		assert.Equal(t, ledgerID, PublishRequestFromOutbox(*row, 1).Key,
 			"end to end: the message a subscriber receives must be keyed by the ledger")
 	})
 
 	t.Run("the destination ledger is used when the source names none", func(t *testing.T) {
-		source := &model.Balance{BalanceID: sourceBalance.BalanceID}
+		row, _ := prepare(t, blnk, &model.Balance{BalanceID: sourceBalance.BalanceID}, destinationBalance)
+		require.NotNil(t, row)
 
-		work, _ := blnk.buildTransactionExecutionWork(context.Background(), newTransaction(), source, destinationBalance)
-		require.NotNil(t, work.eventOutbox)
-
-		assert.Equal(t, ledgerID, work.eventOutbox.PartitionKey,
+		assert.Equal(t, ledgerID, row.PartitionKey,
 			"a transfer whose source balance carries no ledger must still be keyed by the ledger "+
 				"the destination names, rather than falling through to a balance id")
 	})
 
-	t.Run("a zero-amount transaction captures nothing", func(t *testing.T) {
+	t.Run("a zero-amount transaction is never persisted, so nothing is prepared for it", func(t *testing.T) {
 		transaction := newTransaction()
 		transaction.PreciseAmount = big.NewInt(0)
 
 		work, skip := blnk.buildTransactionExecutionWork(context.Background(), transaction, sourceBalance, destinationBalance)
 		require.True(t, skip, "a zero-amount transaction is discarded rather than persisted")
-		assert.Nil(t, work.eventOutbox,
-			"there is no mutation for an event to describe, so capturing one would announce a "+
-				"transaction that does not exist")
+
+		// The skip arm returns before the persistence step that prepares the event, so no row
+		// is ever built: there is no mutation for an event to describe, and capturing one
+		// would announce a transaction that does not exist.
+		assert.Nil(t, work.outbox,
+			"nothing at all is prepared for a transaction that is not persisted")
 	})
 
 	t.Run("no brokers configured captures nothing and fails nothing", func(t *testing.T) {
 		unconfigured := newOutboxBlnk(t, &config.Configuration{}, nil)
 
-		work, skip := unconfigured.buildTransactionExecutionWork(context.Background(), newTransaction(), sourceBalance, destinationBalance)
-		require.False(t, skip)
-		assert.Nil(t, work.eventOutbox,
+		row, _ := prepare(t, unconfigured, sourceBalance, destinationBalance)
+		assert.Nil(t, row,
 			"the no-op-when-unconfigured contract inherited from SendWebhook must survive: with no "+
 				"transport there is nothing to capture and nothing to fail")
 	})
@@ -3796,18 +3885,23 @@ func TestBuildTransactionExecutionWork_CapturesTheEventForTheAtomicWriter(t *tes
 // tests are only meaningful together. The mock records the variadic tail rather than
 // forwarding it into m.Called — see TestMockDataSource_CapturesTheEventRowsHandedToTheAtomicWriters
 // for why — so CapturedEventOutboxes is what the assertion reads.
+//
+// The row is NOT injected. This function prepares it itself, immediately before the write, so
+// the assertion reads what production actually hands the writer rather than what a test handed
+// the function.
 func TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter(t *testing.T) {
-	transaction := &model.Transaction{TransactionID: "txn_5b0d7e14", Status: StatusApplied}
-
-	row := &model.EventOutbox{
-		EventID:      "5b0d7e14-3c2a-4f81-9d6b-7e14a5b0d7e1",
-		EventType:    "transaction.applied",
-		AggregateID:  transaction.TransactionID,
-		LedgerID:     "ldg_5b0d7e14",
-		PartitionKey: "ldg_5b0d7e14",
-		Topic:        "blnk.transactions",
-		Payload:      json.RawMessage(`{"event":"transaction.applied","data":{}}`),
+	transaction := &model.Transaction{
+		TransactionID: "txn_5b0d7e14",
+		Source:        "bln_source_5b0d",
+		Destination:   "bln_dest_5b0d",
+		PreciseAmount: big.NewInt(2500),
+		Precision:     100,
+		Currency:      "USD",
+		Status:        StatusApplied,
+		CreatedAt:     time.Now().UTC(),
 	}
+	sourceBalance := &model.Balance{BalanceID: transaction.Source, LedgerID: "ldg_5b0d7e14", Currency: "USD"}
+	destinationBalance := &model.Balance{BalanceID: transaction.Destination, LedgerID: "ldg_5b0d7e14", Currency: "USD"}
 
 	datasource := new(mocks.MockDataSource)
 	datasource.On("RecordTransactionWithBalancesAndOutbox",
@@ -3816,19 +3910,75 @@ func TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter(t *te
 
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
 
-	persisted, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
-		transaction: transaction,
-		eventOutbox: row,
+	persisted, eventCaptured, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
+		transaction:        transaction,
+		sourceBalance:      sourceBalance,
+		destinationBalance: destinationBalance,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, persisted.transaction)
+	assert.True(t, eventCaptured,
+		"the writer committed the event, so the post-commit hook must be told not to capture it "+
+			"again; a second capture is refused by the unique index and reported as a failure of a "+
+			"transaction that in fact succeeded")
 
 	captured := datasource.CapturedEventOutboxes()
 	require.Len(t, captured, 1,
 		"the prepared event row must reach the atomic writer; preparing it and not passing it "+
 			"loses exactly as many events as capturing after the commit did")
-	assert.Equal(t, row.EventID, captured[0].EventID)
-	assert.Equal(t, row.LedgerID, captured[0].LedgerID)
+	assert.Equal(t, "transaction.applied", captured[0].EventType)
+	assert.Equal(t, sourceBalance.LedgerID, captured[0].LedgerID)
+
+	datasource.AssertExpectations(t)
+}
+
+// TestPersistSingleTransactionExecutionWork_RefusesToCommitAnUncapturableEvent is the C-3
+// test: a mutation whose event cannot be prepared must not be written at all.
+//
+// # Why this is the correct answer rather than "log it and carry on"
+//
+// The only way preparation can fail is a payload that will not serialise, which is a producer
+// defect. Committing the balances anyway leaves money moved with no event anywhere and nothing
+// but a log line to say which event was due — and the transaction row alone cannot be used to
+// reconstruct it, because it does not record which event its status change was meant to
+// announce. Failing before the write leaves the caller's retry safe: nothing was persisted, so
+// there is nothing to reconcile.
+//
+// The unserialisable payload is a channel in the transaction's metadata. encoding/json refuses
+// it, which is exactly the failure the production code can encounter, and it is reached without
+// any database or broker being involved.
+func TestPersistSingleTransactionExecutionWork_RefusesToCommitAnUncapturableEvent(t *testing.T) {
+	transaction := &model.Transaction{
+		TransactionID: "txn_c3f1a208",
+		Source:        "bln_source_c3f1",
+		Destination:   "bln_dest_c3f1",
+		PreciseAmount: big.NewInt(1000),
+		Precision:     100,
+		Currency:      "USD",
+		Status:        StatusApplied,
+		CreatedAt:     time.Now().UTC(),
+		MetaData:      map[string]interface{}{"unserialisable": make(chan struct{})},
+	}
+	sourceBalance := &model.Balance{BalanceID: transaction.Source, LedgerID: "ldg_c3f1a208", Currency: "USD"}
+	destinationBalance := &model.Balance{BalanceID: transaction.Destination, LedgerID: "ldg_c3f1a208", Currency: "USD"}
+
+	// No expectation is registered on the writer AT ALL. testify fails an unexpected call, so
+	// this is what proves the mutation was never attempted rather than merely unobserved.
+	datasource := new(mocks.MockDataSource)
+	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
+
+	_, eventCaptured, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
+		transaction:        transaction,
+		sourceBalance:      sourceBalance,
+		destinationBalance: destinationBalance,
+	})
+
+	require.Error(t, err,
+		"a transaction whose event could not be prepared must be refused, not committed with the "+
+			"event silently dropped")
+	assert.False(t, eventCaptured, "nothing was written, so nothing was captured")
+	assert.Empty(t, datasource.CapturedEventOutboxes(),
+		"the atomic writer must not have been reached")
 
 	datasource.AssertExpectations(t)
 }

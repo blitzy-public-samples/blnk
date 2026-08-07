@@ -104,9 +104,9 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 	}
 
 	// THE SYSTEM CATEGORY IS REFUSED, and the argument against refusing it deserves stating
-	// because it is a reasonable one: blnk.system carries ledger.created and system.error, two
-	// of the thirteen event types the legacy HTTP transport delivered, so a subscriber granted
-	// nothing here has no authorized path to either.
+	// because it is a reasonable one: blnk.system carries system.error, one of the thirteen
+	// event types the legacy HTTP transport delivered, so a subscriber granted nothing here has
+	// no authorized path to it.
 	//
 	// It is refused anyway, because THE LEGACY TRANSPORT'S AUDIENCE WAS NOT SUBSCRIBERS. There
 	// was one globally configured webhook URL — the operator's own endpoint — so "the legacy
@@ -119,7 +119,10 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 	//
 	// R-1 is a PUBLISHING requirement and it is met in full: all thirteen event types are
 	// published, and blnk.system is read under the master key like the dead-letter topics.
-	// ledger.created is the honest casualty of sharing a category with operator diagnostics.
+	// The refusal now costs a subscriber NOTHING it used to receive, which is what makes it a
+	// clean boundary rather than a trade: ledger.created used to be the casualty of sharing a
+	// category with operator diagnostics, and it no longer shares one — it has its own
+	// grantable blnk.ledgers, asserted in the exact-set case below.
 	t.Run("refuses the system category", func(t *testing.T) {
 		err := validateGrantableTopics([]string{"blnk.system"}, testTopicPrefix)
 		require.Error(t, err,
@@ -129,17 +132,33 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 		assert.Contains(t, err.Error(), "not grantable")
 	})
 
-	t.Run("the grantable set is exactly the three tenant categories", func(t *testing.T) {
+	t.Run("the grantable set is exactly the four tenant categories", func(t *testing.T) {
 		// Stated as an EXACT set rather than as a series of accept/refuse cases, because
 		// every over-grant finding in this area reduces to the same question — which topics
 		// may a credential ever name — and a boundary is only checkable if it is enumerated
 		// in one place. A new category that is grantable by default would fail here, which is
-		// the point.
+		// the point, and so would a tenant-facing category quietly dropped from the set: the
+		// UNDER-grant direction is what left ledger.created unreachable by every credential
+		// Blnk can issue, so it is asserted here with the same weight as the over-grant one.
 		assert.ElementsMatch(t,
-			[]string{"blnk.transactions", "blnk.balances", "blnk.identities"},
+			[]string{"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers"},
 			model.SubscriberGrantableTopics(testTopicPrefix),
 			"only tenant-facing categories are grantable; system and every dead-letter topic "+
 				"are read under the master key")
+	})
+
+	t.Run("accepts the ledgers category", func(t *testing.T) {
+		// The positive counterpart of "refuses the system category", and the one that would
+		// have caught the arrangement this replaced. ledger.created is delivered to every
+		// subscriber by the legacy webhook today, so a credential must be able to name its
+		// topic; when it shared the internal category, this request was refused and the event
+		// was published to a topic nothing could read.
+		require.NoError(t, validateGrantableTopics([]string{"blnk.ledgers"}, testTopicPrefix),
+			"blnk.ledgers carries ledger.created — ordinary ledger data, the same shape as "+
+				"identity.created — so a subscriber must be able to be granted it")
+
+		assert.Error(t, validateGrantableTopics([]string{"blnk.ledgers.dlt"}, testTopicPrefix),
+			"its dead-letter sibling stays operator-facing, exactly like every other category's")
 	})
 
 	t.Run("refuses an offending topic anywhere in the list", func(t *testing.T) {
@@ -578,10 +597,16 @@ func deadLetteredRow(t *testing.T) model.EventOutbox {
 	require.NoError(t, err)
 
 	return model.EventOutbox{
-		EventID:       "0f6e2c8a-1b4d-4e9f-8a7c-2d5b6e3f1a9c",
-		EventType:     "identity.created",
-		AggregateID:   "idt_9f1c8a72",
-		LedgerID:      "ldg_4b1e7c30",
+		EventID:     "0f6e2c8a-1b4d-4e9f-8a7c-2d5b6e3f1a9c",
+		EventType:   "identity.created",
+		AggregateID: "idt_9f1c8a72",
+		LedgerID:    "ldg_4b1e7c30",
+		// DELIBERATELY DIFFERENT from both AggregateID and LedgerID, and not the value
+		// today's keying would produce for an identity event. It is what a row committed
+		// before a keying change looks like, and it is the only fixture shape that can
+		// tell "the projection read the stored key" apart from "the projection read the
+		// aggregate id, or recomputed one, and happened to agree".
+		PartitionKey:  "bln_legacy_key_51d0",
 		Topic:         "blnk.identities",
 		DLTTopic:      "blnk.identities.dlt",
 		SchemaVersion: 1,
@@ -628,6 +653,14 @@ func TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText(t *testing.T) {
 	assert.NotContains(t, rendered, "failure_metadata")
 	assert.NotContains(t, rendered, `"payload"`)
 
+	// The partition key IS rendered, and belongs in this test as well as in the
+	// keeps-what-triage-needs one: it is an identifier of the same class as aggregate_id
+	// and ledger_id, which are already carried, and asserting it here records that its
+	// inclusion was weighed against DATA-01 rather than overlooked.
+	assert.Contains(t, rendered, `"partition_key":"bln_legacy_key_51d0"`,
+		"the stored partition key must reach the response: it is an identifier of the same class "+
+			"as aggregate_id, and without it no ordering question can be answered from this API")
+
 	for _, field := range []string{"Payload", "LastError", "FailureMetadata"} {
 		_, present := reflect.TypeOf(DeadLetterEvent{}).FieldByName(field)
 		assert.False(t, present, "DeadLetterEvent must have no %s field", field)
@@ -644,6 +677,15 @@ func TestNewDeadLetterEvent_KeepsWhatTriageActuallyNeeds(t *testing.T) {
 	assert.Equal(t, row.EventType, item.EventType)
 	assert.Equal(t, row.AggregateID, item.AggregateID)
 	assert.Equal(t, row.LedgerID, item.LedgerID)
+	// THE STORED KEY, and the assertion that would have caught it being unassigned. It is
+	// the only field on this response an ordering question can be answered from — every
+	// event sharing a key is in one partition and therefore consumed in publish order — and
+	// because the tag is omitempty, leaving it unset did not render an empty field: it
+	// rendered no field, so the answer read as "this event had no key" rather than as a gap.
+	assert.Equal(t, row.PartitionKey, item.PartitionKey,
+		"the projection must carry the STORED partition key, which is what pinned the event to its partition")
+	assert.NotEqual(t, row.AggregateID, item.PartitionKey,
+		"and it must be the stored key rather than the aggregate id: they differ for a row committed before a keying change")
 	assert.Equal(t, row.Topic, item.Topic, "replay targets this topic")
 	assert.Equal(t, row.DLTTopic, item.DLTTopic)
 	assert.Equal(t, row.Status, item.Status)

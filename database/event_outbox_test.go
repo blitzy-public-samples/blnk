@@ -264,6 +264,11 @@ func eventOutboxRow(e model.EventOutbox) []driver.Value {
 		e.Topic,
 		int64(e.SchemaVersion),
 		[]byte(e.Payload),
+		// event_raw is NOT NULL on the table, so it is rendered as plain bytes. A fixture
+		// that rendered NULL here would exercise a row PostgreSQL refuses, and one that
+		// left it empty would make the scanned row fall back to composing its envelope
+		// instead of reading the stored one.
+		e.EventRaw,
 		e.OccurredAt,
 		e.Status,
 		int64(e.Attempts),
@@ -495,7 +500,14 @@ func TestEventOutboxColumns_ProjectsEveryScannedColumnAndNoOthers(t *testing.T) 
 		// bytes, the JSONB column carries PostgreSQL's normalised re-rendering of them,
 		// and every reader of the body — the Kafka publish, the legacy webhook leg and a
 		// dead-letter replay — must get the former.
-		"schema_version", "payload_raw", "occurred_at",
+		// event_raw follows payload_raw because the two are read together and answer
+		// different questions: payload_raw is the legacy webhook body, which the HTTP leg
+		// posts, and event_raw is the whole canonical envelope, which is what goes on a
+		// Kafka topic. It is projected because every publish, dead-letter write and replay
+		// takes the stored value rather than rebuilding the envelope from these columns —
+		// a row read without it would silently fall back to composition and lose the byte
+		// guarantee for events captured under a different serialiser.
+		"schema_version", "payload_raw", "event_raw", "occurred_at",
 		// next_attempt_at is projected because model.EventOutbox carries it and a caller
 		// deciding whether a row is due reads it. It sits between max_attempts and
 		// last_error, matching both the scanner's destination order and the column order
@@ -1130,26 +1142,28 @@ func TestMarkEventFailed_ChoosesRetryOrExhaustionInSQL(t *testing.T) {
 			int64(7),                          // $5 — the row
 			"tok-7",                           // $6 — the claim token
 			model.EventOutboxStatusProcessing, // $7 — the required prior state
+			false,                             // $8 — the caller's permanent-failure verdict
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 			AddRow(model.EventOutboxStatusPending, int64(1)))
 
-	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7", "broker unavailable", 2*time.Second)
+	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7", "broker unavailable", 2*time.Second, false)
 	require.NoError(t, err)
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
 
-	assert.Contains(t, issued, "CASE WHEN attempts + 1 >= max_attempts THEN $1 ELSE $2 END",
-		"the retry-versus-exhaustion decision must be made in SQL, atomically with the attempt increment")
+	assert.Contains(t, issued, "CASE WHEN $8::boolean OR attempts + 1 >= max_attempts THEN $1 ELSE $2 END",
+		"the retry-versus-exhaustion decision must be made in SQL, atomically with the attempt increment, "+
+			"and it must read BOTH inputs: the caller's permanent-failure verdict and the attempt budget")
 	assert.Contains(t, issued, "attempts = attempts + 1",
 		"the attempt counter must be incremented by the same statement that reads it")
 	assert.Contains(t, issued, "locked_until = NULL",
 		"the lease must be released on BOTH arms, otherwise the retry is never picked up")
 	assert.Contains(t, issued, "RETURNING status, attempts",
 		"the decision the UPDATE made must be returned, not re-read: a second read reintroduces the race the in-SQL decision removes")
-	assert.Contains(t, issued, "claim_token = CASE WHEN attempts + 1 >= max_attempts THEN claim_token ELSE NULL END",
+	assert.Contains(t, issued, "claim_token = CASE WHEN $8::boolean OR attempts + 1 >= max_attempts THEN claim_token ELSE NULL END",
 		"the retry arm must release the claim so the row can be re-claimed, and the exhaustion arm must retain it so only this worker may dead-letter")
-	assert.Contains(t, issued, "next_attempt_at = CASE WHEN attempts + 1 >= max_attempts",
+	assert.Contains(t, issued, "next_attempt_at = CASE WHEN $8::boolean OR attempts + 1 >= max_attempts",
 		"the due instant must be advanced on the retry arm only: a terminal row is not waiting for anything, "+
 			"and a future due instant on one would read as though a retry were still coming")
 	assert.Contains(t, issued, "NOW() + $4::interval",
@@ -1181,7 +1195,7 @@ func TestMarkEventFailed_ExhaustionReportsTheHandOffToken(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 			AddRow(model.EventOutboxStatusFailed, int64(5)))
 
-	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7", "final attempt failed", 0)
+	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7", "final attempt failed", 0, false)
 	require.NoError(t, err)
 
 	assert.True(t, outcome.Exhausted, "five of five attempts is exhaustion")
@@ -1189,6 +1203,67 @@ func TestMarkEventFailed_ExhaustionReportsTheHandOffToken(t *testing.T) {
 		"exhaustion produces failed, never dead_lettered: only the dead-letter publisher may declare that")
 	assert.Equal(t, "tok-7", outcome.ClaimToken,
 		"the exhaustion arm must hand the token on, or nothing can perform the dead-letter transition")
+	assert.False(t, outcome.Terminal,
+		"a row that spent its budget on transient failures did not exhaust because the caller called the "+
+			"failure permanent, and the two causes must stay distinguishable in the log")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestMarkEventFailed_ATerminalVerdictExhaustsOnTheFirstAttempt is the other input to the
+// in-SQL decision, and the reason it is an input at all.
+//
+// The publisher classifies every failure. Some are PERMANENT by construction: an envelope over
+// the size ceiling, bytes that are not valid JSON, a destination outside the topic namespace
+// Blnk owns. It reports those as terminal and no retry can change the answer — but the durable
+// state used to disagree, because this statement read only the attempt count. The row went back
+// to pending with four attempts left and spent the whole 31-second backoff schedule
+// rediscovering what the publisher already knew, which delayed preservation by that long, spent
+// four attempts of relay throughput on a message that can never be published, and reported a
+// permanently stuck event as a busy one in the status counter throughout.
+//
+// The verdict is bound as $8 and ORed into all three arms, so status, the due instant and the
+// retained token agree. The token in particular matters: the caller needs it to perform the
+// dead-letter hand-off, and it is retained here on attempt ONE.
+func TestMarkEventFailed_ATerminalVerdictExhaustsOnTheFirstAttempt(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("").
+		WithArgs(
+			model.EventOutboxStatusFailed,
+			model.EventOutboxStatusPending,
+			"the serialised event is over the size ceiling",
+			"0s",
+			int64(7),
+			"tok-7",
+			model.EventOutboxStatusProcessing,
+			true, // $8 — the caller's PERMANENT verdict
+		).
+		// The database resolves the CASE, so the returned row is what a real PostgreSQL would
+		// have produced for a terminal verdict on attempt one: failed, with the count at 1.
+		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
+			AddRow(model.EventOutboxStatusFailed, int64(1)))
+
+	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7",
+		"the serialised event is over the size ceiling", 0, true)
+	require.NoError(t, err)
+	require.Len(t, *captured, 1)
+
+	assert.Contains(t, (*captured)[0], "$8::boolean OR attempts + 1 >= max_attempts",
+		"the verdict must be BOUND and read by the CASE, never applied by a Go-side branch: deciding "+
+			"outside the statement is what lets two instances racing on one row both conclude they were last")
+	assert.NotContains(t, (*captured)[0], "max_attempts = ",
+		"the budget itself must not be rewritten to force exhaustion; that would corrupt the row's own history")
+
+	assert.True(t, outcome.Exhausted,
+		"a permanent failure is exhaustion on whichever attempt it happened")
+	assert.True(t, outcome.Terminal,
+		"and the reason must be reported, or 'attempt 1 of 5, exhausted' reads as a bookkeeping defect")
+	assert.Equal(t, 1, outcome.Attempts,
+		"the attempt count must report the truth — one attempt was made — rather than being inflated to the budget")
+	assert.Equal(t, "tok-7", outcome.ClaimToken,
+		"the token must be handed on for the dead-letter write, exactly as on the budget-driven arm")
+
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -1206,7 +1281,7 @@ func TestMarkEventFailed_LostClaimIsAConflictAndNotASilentSuccess(t *testing.T) 
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WillReturnError(sql.ErrNoRows)
 
-	outcome, err := ds.MarkEventFailed(context.Background(), 7, "stale-token", "boom", 0)
+	outcome, err := ds.MarkEventFailed(context.Background(), 7, "stale-token", "boom", 0, false)
 	require.Error(t, err, "a lost claim must NOT be reported as success")
 	assert.Equal(t, model.EventFailureOutcome{}, outcome,
 		"no decision was made, so no decision may be reported")
@@ -1230,7 +1305,7 @@ func TestEventOutboxTransitions_RefuseABlankClaimToken(t *testing.T) {
 			return ds.MarkEventDispatched(ctx, 1, "   ", model.BrokerRecord{})
 		},
 		"MarkEventFailed": func(ctx context.Context, ds Datasource) error {
-			_, err := ds.MarkEventFailed(ctx, 1, "", "boom", 0)
+			_, err := ds.MarkEventFailed(ctx, 1, "", "boom", 0, false)
 			return err
 		},
 		"MarkEventDeadLettered": func(ctx context.Context, ds Datasource) error {
@@ -1276,11 +1351,11 @@ func TestMarkEventFailed_BelowMaxAttemptsReturnsToPending(t *testing.T) {
 	var retryArm driver.Value
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WithArgs(sqlmock.AnyArg(), captureArg(&retryArm), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 			AddRow(model.EventOutboxStatusPending, int64(1)))
 
-	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "transient", 0)
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "transient", 0, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, model.EventOutboxStatusPending, retryArm,
@@ -1303,11 +1378,11 @@ func TestMarkEventFailed_AtMaxAttemptsBecomesFailedNotDeadLettered(t *testing.T)
 	var exhaustionArm driver.Value
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WithArgs(captureArg(&exhaustionArm), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 			AddRow(model.EventOutboxStatusFailed, int64(5)))
 
-	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "final attempt failed", 0)
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "final attempt failed", 0, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, model.EventOutboxStatusFailed, exhaustionArm,
@@ -1336,7 +1411,7 @@ func TestMarkEventFailed_StampsFirstAttemptedAtOnceAndLastAttemptedAtEveryTime(t
 
 	mock.ExpectQuery("").WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 		AddRow(model.EventOutboxStatusPending, int64(1)))
-	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "boom", 0)
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "boom", 0, false)
 	require.NoError(t, err)
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
@@ -1364,11 +1439,11 @@ func TestMarkEventFailed_RecordsErrorMessageAsABoundParameter(t *testing.T) {
 	hostile := "'; DROP TABLE blnk.event_outbox; --"
 	mock.ExpectQuery("").
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), hostile, sqlmock.AnyArg(), int64(7), "tok",
-			sqlmock.AnyArg()).
+			sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 			AddRow(model.EventOutboxStatusPending, int64(1)))
 
-	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", hostile, 0)
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", hostile, 0, false)
 	require.NoError(t, err)
 	require.Len(t, *captured, 1)
 
@@ -2903,7 +2978,12 @@ func TestInsertEventOutbox_DriverErrorsMapToTypedCodes(t *testing.T) {
 		err  error
 		want apierror.ErrorCode
 	}{
-		{"unique violation", &pq.Error{Code: "23505"}, apierror.ErrConflict},
+		// The unique violation reaches ErrConflict HERE because the fixture's stored row
+		// cannot be re-read — the mock expects only the insert — so nothing about "the event is
+		// already recorded" is established and the original failure stands. That fall-through
+		// is itself the contract: a duplicate is only forgiven when the stored row is proven
+		// identical. The forgiving path has its own tests below.
+		{"unique violation whose stored row cannot be read", &pq.Error{Code: "23505"}, apierror.ErrConflict},
 		{"foreign key violation", &pq.Error{Code: "23503"}, apierror.ErrBadRequest},
 		{"not null violation", &pq.Error{Code: "23502"}, apierror.ErrBadRequest},
 		{"other postgres error", &pq.Error{Code: "42P01"}, apierror.ErrInternalServer},
@@ -2927,6 +3007,95 @@ func TestInsertEventOutbox_DriverErrorsMapToTypedCodes(t *testing.T) {
 			assert.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
+}
+
+// TestInsertEventOutbox_AnIdenticalEventAlreadyRecordedIsIdempotentSuccess is the
+// non-transactional path's idempotency contract.
+//
+// # Why a duplicate here is SUCCESS
+//
+// event_outbox_event_id_uidx exists to make "one event is recorded once" an invariant the
+// database enforces. When it refuses an insert it is reporting that the invariant HOLDS: the
+// event is durable, exactly once, and every guarantee built on it is intact. Reporting that as
+// a failure inverted the constraint's meaning — the caller was told the event was lost, an
+// ERROR line in the log said so, and a retrying caller (the bulk-outcome capture retries three
+// times) kept re-attempting a write that could only ever fail again before finally reporting an
+// outcome that was sitting in the table all along.
+//
+// # The surrogate id must be ADOPTED, not left at zero
+//
+// A first-time insert returns the row fully identified. An idempotent success that left ID at 0
+// would hand the caller a row the dead-letter path explicitly refuses — "a row with no database
+// id cannot be dead-lettered" — so the two outcomes have to be indistinguishable to the caller.
+func TestInsertEventOutbox_AnIdenticalEventAlreadyRecordedIsIdempotentSuccess(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+	ctx := context.Background()
+
+	// Normalised up front so the fixture carries the SAME canonical envelope the insert will
+	// bind, which is what the comparison is made on. The insert's own normalisation is
+	// idempotent, so calling it here changes nothing about what is sent.
+	entry := newEventOutboxFixture("idem-")
+	require.NoError(t, prepareEventOutboxEntry(entry))
+	require.NotEmpty(t, entry.EventRaw, "the fixture must carry its canonical envelope")
+
+	// The row the database already holds: the same event, under the id a previous insert was
+	// given.
+	stored := *entry
+	stored.ID = 4242
+	stored.Status = model.EventOutboxStatusPending
+
+	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO blnk.event_outbox")).
+		WillReturnError(&pq.Error{
+			Code:       "23505",
+			Message:    `duplicate key value violates unique constraint "event_outbox_event_id_uidx"`,
+			Constraint: "event_outbox_event_id_uidx",
+		})
+	mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+		WithArgs(entry.EventID).
+		WillReturnRows(newEventOutboxRows(stored))
+
+	require.NoError(t, ds.InsertEventOutbox(ctx, entry),
+		"an identical event already recorded is the unique index working, not the event being lost")
+	assert.Equal(t, int64(4242), entry.ID,
+		"the stored row's id must be adopted, or the caller holds a row nothing downstream accepts")
+
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"the duplicate must be resolved by RE-READING the stored row, not assumed")
+}
+
+// TestInsertEventOutbox_ADifferentEventUnderTheSameIDStaysAConflict is the boundary of that
+// forgiveness, and the case worth failing over.
+//
+// Two DIFFERENT events sharing one event_id means an id has been reused. Swallowing the second
+// would lose it for real — silently, reported as success — so the comparison is made on the
+// canonical envelope bytes and anything that does not match exactly stays a conflict.
+func TestInsertEventOutbox_ADifferentEventUnderTheSameIDStaysAConflict(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+	ctx := context.Background()
+
+	entry := newEventOutboxFixture("collide-")
+	require.NoError(t, prepareEventOutboxEntry(entry))
+
+	// Same id, DIFFERENT event. Only the stored envelope differs, which is the narrowest
+	// possible difference and therefore the sharpest test of the comparison.
+	stored := *entry
+	stored.ID = 99
+	stored.EventRaw = append([]byte(nil), entry.EventRaw...)
+	stored.EventRaw[len(stored.EventRaw)-1] = ' '
+	require.NotEqual(t, string(entry.EventRaw), string(stored.EventRaw))
+
+	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO blnk.event_outbox")).
+		WillReturnError(&pq.Error{Code: "23505", Constraint: "event_outbox_event_id_uidx"})
+	mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+		WithArgs(entry.EventID).
+		WillReturnRows(newEventOutboxRows(stored))
+
+	requireAPIError(t, ds.InsertEventOutbox(ctx, entry), apierror.ErrConflict)
+	assert.Zero(t, entry.ID,
+		"a genuine collision must not adopt the other event's id")
+	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 // TestInsertEventOutbox_UsesTheConnectionNotATransaction pins the standalone variant.
@@ -4379,7 +4548,7 @@ func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(
 		}
 	}
 	require.NotEmpty(t, earlierToken)
-	outcome, err := ds.MarkEventFailed(ctx, earlier.ID, earlierToken, "transient", 0)
+	outcome, err := ds.MarkEventFailed(ctx, earlier.ID, earlierToken, "transient", 0, false)
 	require.NoError(t, err)
 	require.False(t, outcome.Exhausted)
 
@@ -4437,7 +4606,7 @@ func TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB(
 	insertRealEventOutbox(t, ds, successor)
 
 	token := claimEventOutboxToken(t, ds, doomed)
-	outcome, err := ds.MarkEventFailed(ctx, doomed.ID, token, "permanently undeliverable", 0)
+	outcome, err := ds.MarkEventFailed(ctx, doomed.ID, token, "permanently undeliverable", 0, false)
 	require.NoError(t, err)
 	require.True(t, outcome.Exhausted, "a one-attempt budget is spent by its first failure")
 
@@ -4690,7 +4859,7 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 	strandedToken := tokens[stranded.EventID]
 	require.NotEmpty(t, strandedToken, "the stranded fixture must come back with the token its claim issued")
 
-	strandedOutcome, err := ds.MarkEventFailed(ctx, stranded.ID, strandedToken, "broker refused the publish", 0)
+	strandedOutcome, err := ds.MarkEventFailed(ctx, stranded.ID, strandedToken, "broker refused the publish", 0, false)
 	require.NoError(t, err)
 	require.True(t, strandedOutcome.Exhausted, "a one-attempt budget must be spent by one failure")
 	require.Equal(t, model.EventOutboxStatusFailed, strandedOutcome.Status)
@@ -4698,7 +4867,7 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 	preservedToken := tokens[preserved.EventID]
 	require.NotEmpty(t, preservedToken)
 
-	preservedOutcome, err := ds.MarkEventFailed(ctx, preserved.ID, preservedToken, "broker refused the publish", 0)
+	preservedOutcome, err := ds.MarkEventFailed(ctx, preserved.ID, preservedToken, "broker refused the publish", 0, false)
 	require.NoError(t, err)
 	require.True(t, preservedOutcome.Exhausted)
 
@@ -4951,7 +5120,7 @@ func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T
 		requireAPIError(t, ds.MarkEventDispatched(ctx, entry.ID, staleToken, model.BrokerRecord{}), apierror.ErrConflict)
 	})
 	t.Run("stale failure is refused and does not spend the budget", func(t *testing.T) {
-		_, failErr := ds.MarkEventFailed(ctx, entry.ID, staleToken, "stale attempt", 0)
+		_, failErr := ds.MarkEventFailed(ctx, entry.ID, staleToken, "stale attempt", 0, false)
 		requireAPIError(t, failErr, apierror.ErrConflict)
 
 		got, getErr := ds.GetEventByID(ctx, entry.EventID)
@@ -5086,7 +5255,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 		token := claimEventOutboxToken(t, ds, entry)
 
-		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "broker unavailable", 0)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "broker unavailable", 0, false)
 		require.NoError(t, err)
 		assert.False(t, outcome.Exhausted, "one of three attempts is not exhaustion")
 		assert.Equal(t, model.EventOutboxStatusPending, outcome.Status)
@@ -5125,7 +5294,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 		token := claimEventOutboxToken(t, ds, entry)
 
-		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "broker unavailable", time.Hour)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "broker unavailable", time.Hour, false)
 		require.NoError(t, err)
 		require.False(t, outcome.Exhausted)
 		require.Equal(t, model.EventOutboxStatusPending, outcome.Status)
@@ -5169,7 +5338,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 		token := claimEventOutboxToken(t, ds, entry)
 
-		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "gave up", time.Hour)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "gave up", time.Hour, false)
 		require.NoError(t, err)
 		require.True(t, outcome.Exhausted, "one of one attempt is exhaustion")
 
@@ -5188,7 +5357,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		insertRealEventOutbox(t, ds, entry)
 
 		firstToken := claimEventOutboxToken(t, ds, entry)
-		_, err := ds.MarkEventFailed(ctx, entry.ID, firstToken, "attempt one", 0)
+		_, err := ds.MarkEventFailed(ctx, entry.ID, firstToken, "attempt one", 0, false)
 		require.NoError(t, err)
 		afterFirst, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
@@ -5203,7 +5372,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, firstToken, model.BrokerRecord{}),
 			"the stale token from the previous claim must no longer authorise anything")
 
-		_, err = ds.MarkEventFailed(ctx, entry.ID, secondToken, "attempt two", 0)
+		_, err = ds.MarkEventFailed(ctx, entry.ID, secondToken, "attempt two", 0, false)
 		require.NoError(t, err)
 		afterSecond, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
@@ -5227,7 +5396,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 		// attempts 0 + 1 >= max_attempts 1, so the exhaustion arm fires on the first
 		// failure. This is the CASE boundary, exercised against real SQL.
-		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "final failure", 0)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "final failure", 0, false)
 		require.NoError(t, err)
 		assert.True(t, outcome.Exhausted, "one of one attempt is exhaustion")
 		assert.Equal(t, token, outcome.ClaimToken,
@@ -5287,7 +5456,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		insertRealEventOutbox(t, ds, entry)
 
 		token := claimEventOutboxToken(t, ds, entry)
-		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "gave up", 0)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "gave up", 0, false)
 		require.NoError(t, err)
 		require.True(t, outcome.Exhausted)
 		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, outcome.ClaimToken,
@@ -5473,12 +5642,21 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// partition_key is DISTINCT per row, and deliberately so: the plan under test
 	// includes the earlier-same-key exclusion, and seeding one shared key would give the
 	// planner a wildly unrepresentative selectivity estimate for that subquery.
+	// event_raw is NOT NULL, so the bulk seed must supply it exactly as the repository
+	// would: the canonical envelope with the body spliced in. It is composed in SQL here
+	// only because these rows never leave the table — the plan is the whole subject — and
+	// the alternative is three thousand Go-side round trips.
 	_, err := ds.Conn.ExecContext(ctx, `
 		INSERT INTO blnk.event_outbox
-			(event_id, event_type, aggregate_id, partition_key, ledger_id, topic, payload, payload_raw, occurred_at, status, dispatched_at)
+			(event_id, event_type, aggregate_id, partition_key, ledger_id, topic, payload, payload_raw, event_raw, occurred_at, status, dispatched_at)
 		SELECT $1 || 'cold-' || g, 'transaction.applied', $1 || 'agg', $1 || 'key-' || g, $1 || 'ldg', 'blnk.transactions',
 		       '{"event":"transaction.applied","data":{}}'::jsonb,
 		       convert_to('{"event":"transaction.applied","data":{}}', 'UTF8'),
+		       convert_to('{"event_id":"' || $1 || 'cold-' || g ||
+		                  '","event_type":"transaction.applied","aggregate_id":"' || $1 ||
+		                  'agg","occurred_at":"2026-01-01T00:00:00Z","payload":' ||
+		                  '{"event":"transaction.applied","data":{}}' ||
+		                  ',"schema_version":1}', 'UTF8'),
 		       NOW() - (g || ' seconds')::interval,
 		       'dispatched', NOW()
 		FROM generate_series(1, $2) g
@@ -5487,10 +5665,15 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 
 	_, err = ds.Conn.ExecContext(ctx, `
 		INSERT INTO blnk.event_outbox
-			(event_id, event_type, aggregate_id, partition_key, ledger_id, topic, payload, payload_raw, occurred_at, status)
+			(event_id, event_type, aggregate_id, partition_key, ledger_id, topic, payload, payload_raw, event_raw, occurred_at, status)
 		SELECT $1 || 'warm-' || g, 'transaction.applied', $1 || 'agg', $1 || 'key-w' || g, $1 || 'ldg', 'blnk.transactions',
 		       '{"event":"transaction.applied","data":{}}'::jsonb,
 		       convert_to('{"event":"transaction.applied","data":{}}', 'UTF8'),
+		       convert_to('{"event_id":"' || $1 || 'warm-' || g ||
+		                  '","event_type":"transaction.applied","aggregate_id":"' || $1 ||
+		                  'agg","occurred_at":"2026-01-01T00:00:00Z","payload":' ||
+		                  '{"event":"transaction.applied","data":{}}' ||
+		                  ',"schema_version":1}', 'UTF8'),
 		       NOW() - (g || ' seconds')::interval,
 		       'pending'
 		FROM generate_series(1, $2) g

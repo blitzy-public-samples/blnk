@@ -33,6 +33,7 @@ limitations under the License.
 package model
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -197,6 +198,108 @@ type LedgerEvent struct {
 	SchemaVersion int `json:"schema_version"`
 }
 
+// envelopeScaffoldBytes is a sizing hint for CanonicalBytes: the member names, quotes,
+// separators, braces and encoded scalars of a typical envelope. It only pre-sizes the
+// buffer, so an imprecise value costs at most one reallocation and can never affect the
+// output.
+const envelopeScaffoldBytes = 256
+
+// canonicalNullPayload is what an empty payload serialises to, so the envelope stays
+// parseable JSON rather than carrying an empty member.
+var canonicalNullPayload = []byte("null")
+
+// CanonicalBytes serialises the envelope EXACTLY as it goes on the wire, splicing the
+// payload bytes in VERBATIM.
+//
+// # This is the authoritative event value, and it is meant to be STORED
+//
+// Requirement R-5 asks for a dead-lettered event to be replayable byte-for-byte aside from
+// its failure metadata. That is only achievable if the bytes exist somewhere: reconstructing
+// the envelope from a row's columns at publish time gives byte equality only for as long as
+// this function's output never changes, and any later change — a member added, a member
+// reordered, an encoder upgraded — silently breaks the promise for every row already
+// captured. So the bytes this returns are persisted once, at capture, in
+// blnk.event_outbox.event_raw, and the publish, dead-letter and replay paths reuse THAT value
+// rather than calling this again. This function is the single producer of it.
+//
+// # Why the object is composed member by member rather than marshalled as a struct
+//
+// Handing the struct to encoding/json would route Payload through the encoder's compactor,
+// which strips insignificant whitespace, and — because HTML escaping is on by default —
+// rewrites `<`, `>` and `&` inside the raw payload as escape sequences. Either transformation
+// breaks the byte-identity the dual-delivery and replay guarantees are asserted on, while
+// leaving the two bodies semantically equal, which is exactly the kind of difference a
+// reviewer's eye passes over and a byte comparison does not.
+//
+// The scalar members ARE encoded through encoding/json, so escaping and timestamp formatting
+// stay identical to what a struct marshal would produce. Only the payload bypasses it, and
+// only because it is already JSON.
+//
+// Member order is the order LedgerEvent declares: event_id, event_type, aggregate_id,
+// occurred_at, payload, schema_version. It is part of the stored value and must not change.
+//
+// An EMPTY payload is published as JSON null with no error, matching what a nil
+// json.RawMessage means, and an INVALID payload is refused: splicing bytes that are not JSON
+// would produce a message that breaks every subscriber's parser, and no number of retries
+// makes them valid.
+//
+// Returns:
+//   - []byte: the canonical envelope bytes.
+//   - error: when the payload is present but is not valid JSON, or a scalar member cannot be
+//     encoded.
+func (e LedgerEvent) CanonicalBytes() ([]byte, error) {
+	payload := e.Payload
+	if len(bytes.TrimSpace(payload)) == 0 {
+		payload = canonicalNullPayload
+	} else if !json.Valid(payload) {
+		return nil, fmt.Errorf(
+			"model: the payload of event %s (%s) is not valid JSON and cannot be published",
+			e.EventID, e.EventType,
+		)
+	}
+
+	scalars := [4]struct {
+		key   string
+		value interface{}
+	}{
+		{"event_id", e.EventID},
+		{"event_type", e.EventType},
+		{"aggregate_id", e.AggregateID},
+		{"occurred_at", e.OccurredAt},
+	}
+
+	var buf bytes.Buffer
+	buf.Grow(len(payload) + envelopeScaffoldBytes)
+	buf.WriteByte('{')
+
+	for i, scalar := range scalars {
+		encoded, err := json.Marshal(scalar.value)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"model: encoding %s for event %s (%s): %w",
+				scalar.key, e.EventID, e.EventType, err,
+			)
+		}
+
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+
+		buf.WriteByte('"')
+		buf.WriteString(scalar.key)
+		buf.WriteString(`":`)
+		buf.Write(encoded)
+	}
+
+	buf.WriteString(`,"payload":`)
+	buf.Write(payload)
+	buf.WriteString(`,"schema_version":`)
+	buf.WriteString(strconv.Itoa(e.SchemaVersion))
+	buf.WriteByte('}')
+
+	return buf.Bytes(), nil
+}
+
 // EventOutbox is one row of blnk.event_outbox: a durable record of an event that
 // must reach Kafka, together with the relay state machine that gets it there.
 //
@@ -306,6 +409,44 @@ type EventOutbox struct {
 	// during the dual-delivery window read these same bytes, which is what makes
 	// their payloads identical structurally rather than by careful coding.
 	Payload json.RawMessage `json:"payload"`
+
+	// EventRaw is THE CANONICAL EVENT VALUE: the complete LedgerEvent envelope
+	// bytes, exactly as they go onto the Kafka topic, produced once at capture by
+	// LedgerEvent.CanonicalBytes and persisted in the event_raw BYTEA column.
+	//
+	// # Why the whole envelope is stored and not just the payload
+	//
+	// Requirement R-5 promises that a dead-lettered event replays byte-for-byte
+	// aside from its failure metadata, and R-12 promises that both transports carry
+	// identical bytes during the dual-delivery window. Payload alone cannot deliver
+	// either: the five envelope members around it were re-serialised on every
+	// publish, so byte identity held only for as long as the serialiser never
+	// changed. Add a member, reorder one, or upgrade the encoder, and every row
+	// already captured replays as different bytes — silently, because the two
+	// values stay semantically equal. Storing the value the broker was given makes
+	// the promise a property of the data instead of a property of the code's
+	// stability across versions.
+	//
+	// # What reads it
+	//
+	// Everything that puts an event on a topic. The relay's publish, the
+	// dead-letter write (which splices failure_metadata onto these bytes rather
+	// than rebuilding the envelope), and replay (which republishes them unchanged)
+	// all take this value. Nothing re-marshals from the columns.
+	//
+	// # It is NOT NULL in the schema, and it cannot be forgotten
+	//
+	// The repository derives it from the row's own envelope fields when a caller
+	// leaves it empty — see prepareEventOutboxEntry — so a row cannot exist without
+	// one, and a hand-built row in a test behaves like a production one. The publish
+	// path keeps a documented fallback to composing the envelope for the same
+	// reason: an empty value must degrade to correct behaviour rather than to no
+	// behaviour.
+	//
+	// It is bytes rather than json.RawMessage because it is stored in a BYTEA column
+	// and is never a member of another JSON document: it IS the document.
+	EventRaw []byte `json:"event_raw,omitempty"`
+
 	// OccurredAt is the instant the domain action happened. The relay claims
 	// rows in ascending OccurredAt order, so FIFO holds within a partition key.
 	OccurredAt time.Time `json:"occurred_at"`
@@ -573,6 +714,58 @@ func (r BrokerRecord) String() string {
 // Returns:
 //   - BrokerRecord: the coordinate, zero-valued when the row has none.
 //   - bool: whether the row names a record.
+//
+// CanonicalEvent rebuilds the LedgerEvent this row describes from its envelope columns.
+//
+// It exists for the ONE case that needs a struct rather than bytes: composing a publish
+// request, whose result fields (event id, event type, topic) are read for metrics, logs and
+// the API response. The bytes on the wire come from EventRaw, never from re-serialising what
+// this returns — see CanonicalEventBytes.
+//
+// Returns:
+//   - LedgerEvent: the envelope, with Payload sharing this row's payload bytes.
+func (e EventOutbox) CanonicalEvent() LedgerEvent {
+	return LedgerEvent{
+		EventID:       e.EventID,
+		EventType:     e.EventType,
+		AggregateID:   e.AggregateID,
+		OccurredAt:    e.OccurredAt,
+		Payload:       e.Payload,
+		SchemaVersion: e.SchemaVersion,
+	}
+}
+
+// CanonicalEventBytes returns the STORED canonical envelope, or composes one when the row
+// carries none.
+//
+// The stored value is preferred always, and that preference is the whole of requirement R-5's
+// byte-fidelity guarantee: it is the value the broker was given, so replaying it cannot drift
+// from the original however the serialiser changes afterwards.
+//
+// The fallback exists because degrading to correct behaviour beats degrading to none. A row
+// with no stored envelope is one written before the column existed, or a value assembled in
+// Go by a caller that only filled the envelope fields; composing from those fields yields the
+// same bytes THIS version would have stored, which is right for both cases. The second return
+// value reports which happened, so a caller that cares — the replay-fidelity assertion does —
+// can tell a stored value from a reconstructed one.
+//
+// Returns:
+//   - []byte: the canonical envelope bytes.
+//   - bool: true when the bytes came from the row's stored value.
+//   - error: only from composition, when the payload is not valid JSON.
+func (e EventOutbox) CanonicalEventBytes() ([]byte, bool, error) {
+	if len(bytes.TrimSpace(e.EventRaw)) > 0 {
+		return e.EventRaw, true, nil
+	}
+
+	composed, err := e.CanonicalEvent().CanonicalBytes()
+	if err != nil {
+		return nil, false, err
+	}
+
+	return composed, false, nil
+}
+
 func (e EventOutbox) BrokerRecord() (BrokerRecord, bool) {
 	if e.KafkaPartition == nil || e.KafkaOffset == nil || strings.TrimSpace(e.KafkaTopic) == "" {
 		return BrokerRecord{}, false
@@ -823,21 +1016,6 @@ const (
 	// dual-delivery window — the legacy leg is either done or has been
 	// deliberately abandoned after spending its own budget.
 	EventOutboxStatusDispatched = "dispatched"
-	// EventOutboxStatusDLTPending is a READ-SIDE literal only. NOTHING WRITES IT,
-	// and the status column's CHECK constraint does not permit it.
-	//
-	// It named a distinct "budget spent, dead-letter write owed" state in an earlier
-	// shape of this feature. That shape is not the one that shipped: the owed
-	// hand-off is expressed as EventOutboxStatusFailed with dlt_topic still NULL,
-	// which is exactly what ClaimFailedEventOutboxForDeadLetter selects on, and it
-	// needs no second literal to say the same thing.
-	//
-	// It survives for one narrow purpose: it is accepted as a dead-letter list FILTER
-	// and summed into the awaiting-dead-letter count, so that a row left in it by a
-	// build that did write it is still visible to an operator rather than invisible
-	// to every query. DO NOT WRITE IT — a row carrying it would violate the CHECK
-	// constraint and the transition would fail outright.
-	EventOutboxStatusDLTPending = "dlt_pending"
 	// EventOutboxStatusFailed means the retry budget in max_attempts was
 	// exhausted without a successful publish.
 	//
@@ -997,10 +1175,33 @@ type EventFailureOutcome struct {
 	// number the dead-letter failure metadata reports.
 	Attempts int
 
-	// Exhausted is true when the retry budget is spent and the dead-letter write is
-	// now owed — that is, when Status is EventOutboxStatusFailed. It is derived from
-	// Status rather than computed independently, so the two can never disagree.
+	// Exhausted is true when no further publish attempt will be made and the
+	// dead-letter write is now owed — that is, when Status is
+	// EventOutboxStatusFailed. It is derived from Status rather than computed
+	// independently, so the two can never disagree.
+	//
+	// It becomes true for EITHER of two reasons, and the distinction is Terminal's:
+	// the retry budget ran out, or the publisher reported a failure no retry can
+	// fix.
 	Exhausted bool
+
+	// Terminal reports that the caller declared this failure PERMANENT — the
+	// publisher's own verdict that no further attempt can succeed — rather than the
+	// attempt count having run out.
+	//
+	// It exists so the two causes of exhaustion stay distinguishable in the log and
+	// in the failure metadata. "attempt 1 of 5, exhausted" is otherwise indis-
+	// tinguishable from a bookkeeping defect, when in fact it is the correct and
+	// intended response to a message that can never be published: an oversized
+	// envelope, bytes that are not valid JSON, or a destination outside the topic
+	// namespace Blnk owns. Spending four more attempts to rediscover that would
+	// delay preservation by the whole backoff schedule and report a permanently
+	// stuck event as a busy one throughout.
+	//
+	// It is echoed back from what the caller passed rather than inferred, so a row
+	// that exhausted on its budget alone reports false even when the last attempt
+	// happened to be permanent.
+	Terminal bool
 
 	// ClaimToken is the token to present to MarkEventDeadLettered, and it is set
 	// ONLY when Exhausted is true.
@@ -1184,45 +1385,51 @@ func IsCanonicalUUID(s string) bool {
 //	transactions → blnk.transactions → blnk.transactions.dlt
 //	balances     → blnk.balances     → blnk.balances.dlt
 //	identities   → blnk.identities   → blnk.identities.dlt
+//	ledgers      → blnk.ledgers      → blnk.ledgers.dlt
 //	system       → blnk.system       → blnk.system.dlt         (internal)
 //
-// FOUR CATEGORIES, EIGHT TOPICS, AND THE LIST IS CLOSED. It is the agreed topic
+// FIVE CATEGORIES, TEN TOPICS, AND THE LIST IS CLOSED. It is the agreed topic
 // contract: subscribers, the provisioning script, the Kubernetes configuration and
-// the local stack all enumerate exactly these names, so adding a fifth category here
+// the local stack all enumerate exactly these names, so adding a sixth category here
 // silently obliges every one of them to be changed too. A new category is a
 // deliberate contract change, never an implementation detail.
 //
 // Nothing in this file knows the prefix, builds a topic name, or appends the
 // `.dlt` suffix. Treating a value returned from here as a topic is a bug.
 //
-// # Why there is a fourth category beyond the three the requirements name
+// # Why there are two categories beyond the three the requirements name
 //
 // Two event types that really are emitted belong to none of the three categories
 // the requirements name: "ledger.created", raised by the post-ledger-creation
 // actions, and "system.error", raised through the registered webhook-sender
 // indirection when an internal error is notified. At the same time the coverage
 // requirement is absolute — every event type that reaches the legacy webhook
-// sender must be published, with zero exceptions.
+// sender must be published, with zero exceptions — and so is the migration's
+// promise that a subscriber can consume what the webhook used to deliver it.
 //
-// BOTH GO TO ONE FOURTH CATEGORY, `system`, following the identical naming
-// convention so nothing about the scheme is special-cased. That is AMBIGUITY-2's
-// resolution, and the alternatives are worse: forcing ledger events onto, say, the
-// transactions topic corrupts that topic's semantics for every subscriber that
-// filters on it, and dropping them violates the coverage requirement outright.
+// THEY GET ONE CATEGORY EACH, `ledgers` and `system`, both following the identical
+// naming convention so nothing about the scheme is special-cased. That is
+// AMBIGUITY-2's resolution, and every alternative is worse. Forcing ledger events
+// onto, say, the transactions topic corrupts that topic's semantics for every
+// subscriber that filters on it. Dropping them violates the coverage requirement
+// outright. And putting BOTH into one extra category — which is what this file used
+// to do — is worse than either, because the two have opposite access requirements:
+// system.error must be ungrantable and ledger.created must be grantable, so a shared
+// topic had to choose, and it chose to make ordinary ledger data unreachable by
+// every subscriber credential Blnk can issue.
 //
-// The category is INTERNAL, so no subscriber principal may be granted either
-// topic. That is a deliberate consequence and not an oversight: system.error's
-// payload is the frozen legacy body, so it still carries the error text as it
-// renders, and narrowing it would break the payload-preservation guarantee. The
-// disclosure is therefore contained by audience rather than by redaction. It does
-// leave ledger.created reachable by no subscriber credential; coverage — durable
-// capture, publication, observability and replay — is nonetheless satisfied for it,
-// because what an internal category withholds is an ACL rather than the event.
+// Only `system` is INTERNAL, so no subscriber principal may be granted its topic.
+// That is a deliberate consequence and not an oversight: system.error's payload is
+// the frozen legacy body, so it still carries the error text as it renders, and
+// narrowing it would break the payload-preservation guarantee. The disclosure is
+// therefore contained by audience rather than by redaction, and it costs a
+// subscriber nothing it used to receive, because the only event type left inside
+// the internal category is the one whose audience was always the operator alone.
 //
 // # Where an event type this table does not recognise goes
 //
 // To the SYSTEM category, which is the catch-all as well as the home of
-// ledger.created and system.error. That placement is safe for the one reason that
+// system.error. That placement is safe for the one reason that
 // matters: the system category is INTERNAL, so no subscriber can be granted its
 // topic (see IsInternalEventCategory and SubscriberGrantableEventCategories). An
 // uncatalogued event is therefore published — the coverage guarantee is absolute
@@ -1242,15 +1449,39 @@ const (
 	EventCategoryBalances = "balances"
 	// EventCategoryIdentities covers identity events.
 	EventCategoryIdentities = "identities"
-	// EventCategorySystem covers ledger and internal-error events, and it is also
-	// the CATCH-ALL for an event type EventCategory does not recognise.
+	// EventCategoryLedgers covers ledger events, and it is SUBSCRIBER-FACING.
 	//
-	// It is the fourth category AMBIGUITY-2 resolves the requirement's three named
-	// categories into. `ledger.created` and `system.error` belong to none of
-	// transactions, balances or identities, and the coverage requirement admits no
-	// exceptions, so they need a category of their own rather than being forced into
-	// an unrelated one — which would corrupt that topic's meaning for the
-	// subscribers filtering it — or dropped, which would breach coverage outright.
+	// It exists because `ledger.created` belongs to none of the three categories the
+	// requirement names, and because it is ordinary ledger data that a subscriber has
+	// every right to consume. Its payload is a *model.Ledger — a name, an id, a
+	// creation instant and the caller's own metadata — which is exactly the shape of
+	// `identity.created` and no more sensitive than it.
+	//
+	// # Why it is not the system category, which is where it used to live
+	//
+	// Putting it there made it UNREACHABLE. Every event in this catalogue reached the
+	// legacy webhook, so a subscriber consuming webhooks today receives
+	// `ledger.created`; the system category is internal by design, so no principal can
+	// be granted its topic. A subscriber migrating to Kafka would therefore have LOST
+	// this event at the sunset with nothing offered in its place — a silent regression
+	// in the one direction the migration promises not to regress, and a breach of the
+	// coverage requirement read as it is meant to be read: coverage of a transport
+	// nobody can subscribe to is not coverage.
+	//
+	// Sharing a topic with `system.error` was also the reason it could not simply be
+	// made grantable: that would have exposed internal error detail to every
+	// subscriber granted ledger events. Splitting the two is what lets each get the
+	// audience it should have.
+	EventCategoryLedgers = "ledgers"
+	// EventCategorySystem covers internal-error events, and it is also the CATCH-ALL
+	// for an event type EventCategory does not recognise.
+	//
+	// It is one of the two categories AMBIGUITY-2 resolves the requirement's three
+	// named ones into. `system.error` belongs to none of transactions, balances or
+	// identities, and the coverage requirement admits no exceptions, so it needs a
+	// category of its own rather than being forced into an unrelated one — which would
+	// corrupt that topic's meaning for the subscribers filtering it — or dropped,
+	// which would breach coverage outright.
 	//
 	// # It is INTERNAL: no subscriber principal may be granted it
 	//
@@ -1270,10 +1501,15 @@ const (
 	//     record — to an audience that never asked for it.
 	//
 	// Coverage is still absolute and is not the same question as reachability. Every
-	// event, including these two, is durably captured, published, observable and
+	// event, including this one, is durably captured, published, observable and
 	// replayable; the publisher logs at warning level when it routes an
 	// unrecognised type here so the omission is visible rather than silent. What an
 	// internal category withholds is a subscriber ACL, not the event.
+	//
+	// The ONE event type deliberately left without a subscriber route is system.error,
+	// and that is a security decision rather than an oversight. Every event describing
+	// LEDGER STATE — transactions, balances, identities and now ledgers — has a
+	// grantable topic.
 	EventCategorySystem = "system"
 )
 
@@ -1285,6 +1521,11 @@ const (
 // recognise. Declaring the set here, once, is what lets the subscriber
 // authorization path and the provisioning script apply the same rule without
 // either of them keeping its own list.
+//
+// It is the ONLY internal category, and deliberately narrow. Every event that
+// describes ledger state has a grantable topic: transactions, balances, identities
+// and ledgers. Widening this set is how an event ends up captured, published and
+// unreachable by the subscribers it was captured for.
 var internalEventCategories = map[string]struct{}{
 	EventCategorySystem: {},
 }
@@ -1422,6 +1663,7 @@ var eventCategoryOrder = [...]string{
 	EventCategoryTransactions,
 	EventCategoryBalances,
 	EventCategoryIdentities,
+	EventCategoryLedgers,
 	EventCategorySystem,
 }
 
@@ -1468,8 +1710,11 @@ var eventTypeCategories = map[string]string{
 	"balance.created":       EventCategoryBalances,
 	"balance.monitor":       EventCategoryBalances,
 	"identity.created":      EventCategoryIdentities,
-	"ledger.created":        EventCategorySystem,
-	"system.error":          EventCategorySystem,
+	// ledger.created routes to its OWN grantable category rather than to system, which
+	// is what gives a migrating subscriber a Kafka route to an event it receives over
+	// the legacy webhook today. See EventCategoryLedgers.
+	"ledger.created": EventCategoryLedgers,
+	"system.error":   EventCategorySystem,
 }
 
 // IsCataloguedEventType reports whether an event type is one this repository is known

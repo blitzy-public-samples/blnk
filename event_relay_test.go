@@ -85,6 +85,11 @@ type relayFailRecord struct {
 	reason     string
 	retryAfter time.Duration
 
+	// terminal is the caller's permanent-failure verdict, recorded so a test can assert the
+	// relay FORWARDED the publisher's classification rather than leaving the retry-versus-
+	// exhaustion decision to the attempt count alone.
+	terminal bool
+
 	// record is the broker coordinate the transition was given, empty on a transition that
 	// carries none.
 	record model.BrokerRecord
@@ -124,6 +129,16 @@ type relayFakeStore struct {
 	failedRows  []model.EventOutbox
 	failedTaken bool
 
+	// webhookOwedRows is the LEGACY leg's recovery set: rows whose Kafka leg has reached an
+	// end state — dispatched, failed or dead_lettered — with webhook_dispatched still FALSE.
+	// It is seeded and handed out exactly once, mirroring failedRows, because the pass under
+	// test polls every tick and an unbounded set would loop.
+	webhookOwedRows  []model.EventOutbox
+	webhookOwedTaken bool
+	// legacyAttempts records every MarkEventLegacyWebhookAttempted call, so the recovery
+	// path's own bounded budget can be asserted rather than inferred.
+	legacyAttempts []relayFailRecord
+
 	claimErr          error
 	dispatchErr       error
 	failErr           error
@@ -131,6 +146,8 @@ type relayFakeStore struct {
 	webhookPendingErr error
 	renewErr          error
 	failedClaimErr    error
+	webhookOwedErr    error
+	legacyAttemptErr  error
 
 	tokens int
 
@@ -273,6 +290,7 @@ func (s *relayFakeStore) MarkEventFailed(
 	id int64,
 	claimToken, errMsg string,
 	retryAfter time.Duration,
+	terminal bool,
 ) (model.EventFailureOutcome, error) {
 	if err := ctx.Err(); err != nil {
 		return model.EventFailureOutcome{}, err
@@ -282,7 +300,7 @@ func (s *relayFakeStore) MarkEventFailed(
 	defer s.mu.Unlock()
 
 	s.failures = append(s.failures, relayFailRecord{
-		id: id, claimToken: claimToken, reason: errMsg, retryAfter: retryAfter,
+		id: id, claimToken: claimToken, reason: errMsg, retryAfter: retryAfter, terminal: terminal,
 	})
 
 	if s.failErr != nil {
@@ -298,7 +316,11 @@ func (s *relayFakeStore) MarkEventFailed(
 	row.LastError = errMsg
 	row.LockedUntil = nil
 
-	if row.Attempts >= row.MaxAttempts {
+	// The caller's verdict is ORed into the arithmetic exactly as the real UPDATE's CASE does,
+	// so a permanent failure exhausts the row on whichever attempt it happened. A double that
+	// only counted attempts would report a retry where production reports exhaustion, and the
+	// relay's dead-letter hand-off would go untested for the whole permanent-failure class.
+	if terminal || row.Attempts >= row.MaxAttempts {
 		row.Status = model.EventOutboxStatusFailed
 		s.inflight[id] = row
 		s.terminal[id] = model.EventOutboxStatusFailed
@@ -307,6 +329,7 @@ func (s *relayFakeStore) MarkEventFailed(
 			Status:     row.Status,
 			Attempts:   row.Attempts,
 			Exhausted:  true,
+			Terminal:   terminal,
 			ClaimToken: claimToken,
 		}, nil
 	}
@@ -507,6 +530,115 @@ func (s *relayFakeStore) ClaimFailedEventOutboxForDeadLetter(
 	return claimed, nil
 }
 
+// ClaimPendingWebhookDeliveries hands out the seeded rows whose LEGACY leg is still owed,
+// once, stamping a FRESH token and leaving the status EXACTLY as it is.
+//
+// The untouched status is the property under test rather than a shortcut: the real claim admits
+// dispatched, failed and dead_lettered alike, and a fake that normalised them to processing
+// would hide the whole class of defect this recovery pass exists to prevent — a terminal event
+// handed back to the publisher, or a dead-letter reported as a dispatch.
+func (s *relayFakeStore) ClaimPendingWebhookDeliveries(
+	ctx context.Context,
+	batchSize int,
+	lockDuration time.Duration,
+) ([]model.EventOutbox, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.webhookOwedErr != nil {
+		return nil, s.webhookOwedErr
+	}
+
+	if batchSize <= 0 {
+		return nil, errors.New("relay test: webhook recovery batch size must be greater than zero")
+	}
+
+	if s.webhookOwedTaken || len(s.webhookOwedRows) == 0 {
+		return nil, nil
+	}
+	s.webhookOwedTaken = true
+
+	s.tokens++
+	token := fmt.Sprintf("webhook-recovery-token-%d", s.tokens)
+	lease := s.now().Add(lockDuration)
+
+	claimed := make([]model.EventOutbox, 0, len(s.webhookOwedRows))
+	for _, row := range s.webhookOwedRows {
+		if len(claimed) >= batchSize {
+			break
+		}
+
+		row.ClaimToken = token
+		row.LockedUntil = &lease
+		s.inflight[row.ID] = row
+		claimed = append(claimed, row)
+	}
+
+	return claimed, nil
+}
+
+// MarkEventLegacyWebhookAttempted records one failed legacy enqueue against a row whose Kafka
+// leg has finished, and reproduces the two properties the real statement is built around: the
+// STATUS IS NOT TOUCHED, and abandoned is decided from the incremented count.
+//
+// last_error is likewise left alone, because on a failed or dead-lettered row it holds the
+// Kafka failure reason the dead-letter metadata reports.
+func (s *relayFakeStore) MarkEventLegacyWebhookAttempted(
+	ctx context.Context,
+	id int64,
+	claimToken string,
+	retryAfter time.Duration,
+) (model.EventWebhookOutcome, error) {
+	if err := ctx.Err(); err != nil {
+		return model.EventWebhookOutcome{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.legacyAttempts = append(s.legacyAttempts, relayFailRecord{
+		id: id, claimToken: claimToken, retryAfter: retryAfter,
+	})
+
+	if s.legacyAttemptErr != nil {
+		return model.EventWebhookOutcome{}, s.legacyAttemptErr
+	}
+
+	row, held := s.inflight[id]
+	if !held || row.ClaimToken != claimToken {
+		return model.EventWebhookOutcome{}, fmt.Errorf("relay test: claim lost on row %d", id)
+	}
+
+	row.WebhookAttempts++
+	row.LockedUntil = nil
+	row.ClaimToken = ""
+	row.NextAttemptAt = s.now().Add(retryAfter)
+
+	delete(s.inflight, id)
+
+	return model.EventWebhookOutcome{
+		// THE ROW'S OWN STATUS, unchanged, which is the whole contract.
+		Status:          row.Status,
+		WebhookAttempts: row.WebhookAttempts,
+		Abandoned:       row.WebhookAttempts >= row.MaxAttempts,
+	}, nil
+}
+
+// snapshotLegacyAttempts returns the recorded recovery-path failure transitions.
+func (s *relayFakeStore) snapshotLegacyAttempts() []relayFailRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]relayFailRecord, len(s.legacyAttempts))
+	copy(out, s.legacyAttempts)
+
+	return out
+}
+
 // expireLeases returns every still-claimed row to the claimable set, which is what a relay
 // crash looks like from the database's point of view once the lease has run out.
 func (s *relayFakeStore) expireLeases() {
@@ -681,8 +813,17 @@ type relayFakePublisher struct {
 
 	requests []PublishRequest
 	err      error
-	// failFor fails only the events whose id is listed, so a batch can have one bad row.
+	// failFor fails only the events whose id is listed, so a batch can have one bad row. The
+	// failure is TRANSIENT, which is the ordinary case: a broker briefly unreachable.
 	failFor map[string]bool
+	// permanentFailFor fails the listed events PERMANENTLY, reproducing what the real
+	// publisher reports for a message no retry can deliver — an envelope over the size
+	// ceiling, bytes that are not valid JSON, a destination outside Blnk's namespace.
+	//
+	// The two maps are separate rather than one map with a flag because the distinction is the
+	// subject of a test: the relay must forward the permanent verdict to the durable
+	// transition and must NOT forward it for a transient failure.
+	permanentFailFor map[string]error
 	// beforePublish runs inside the publish, which is how a test observes concurrency.
 	beforePublish func(req PublishRequest)
 
@@ -690,6 +831,24 @@ type relayFakePublisher struct {
 	// reads off Writer.Completion. Absent means the publish reports no coordinate, which is a
 	// legitimate outcome the relay has to record honestly as unconfirmed.
 	coordinates map[string]model.BrokerRecord
+}
+
+// failPermanentlyFor makes one event fail with a failure no retry can fix.
+//
+// The result it produces mirrors kafkaPublisher.fail's permanent arm exactly — Transient and
+// Retryable both false, status dead-lettered — and the error is a real *PublishError classified
+// non-transient, so IsTransientPublishError reads the same verdict off it. A double that only
+// set the boolean would let the relay pass by reading the wrong signal.
+func (p *relayFakePublisher) failPermanentlyFor(eventID string, cause error) *relayFakePublisher {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.permanentFailFor == nil {
+		p.permanentFailFor = make(map[string]error)
+	}
+	p.permanentFailFor[eventID] = cause
+
+	return p
 }
 
 // reporting makes the publisher hand back a coordinate for one event.
@@ -737,6 +896,24 @@ func (p *relayFakePublisher) PublishToTopic(_ context.Context, req PublishReques
 		MaxAttempts:  resolveMaxAttempts(req),
 		Purpose:      resolvePurpose(req),
 		Record:       p.coordinates[req.Event.EventID],
+	}
+
+	// PERMANENT first, because it is the stricter answer: an event listed in both maps is one
+	// the test means to be unpublishable.
+	if cause, permanent := p.permanentFailFor[req.Event.EventID]; permanent {
+		result.Status = model.PublishStatusDeadLettered
+		result.Transient = false
+		result.Retryable = false
+		result.Err = &PublishError{
+			Topic:     result.Topic,
+			EventID:   result.EventID,
+			EventType: result.EventType,
+			Attempt:   result.Attempt,
+			Transient: false,
+			Err:       cause,
+		}
+
+		return result, result.Err
 	}
 
 	failure := p.err
@@ -938,6 +1115,11 @@ func relayConfiguration() *config.Configuration {
 
 // relayRow builds a claimable outbox row whose payload is a real legacy webhook body, so the
 // dual-delivery assertions compare the bytes production would carry.
+//
+// event_raw is populated too, because the column is NOT NULL and PrepareEventOutbox fills it at
+// capture: a row without it is a row the database cannot hold, and every transport reads that
+// column rather than rebuilding the envelope, so a fixture that left it empty would exercise
+// the compatibility fallback instead of the live path.
 func relayRow(id int64, eventID, eventType, partitionKey string, occurredAt time.Time) model.EventOutbox {
 	payload, err := json.Marshal(NewWebhook{
 		Event:   eventType,
@@ -947,7 +1129,7 @@ func relayRow(id int64, eventID, eventType, partitionKey string, occurredAt time
 		panic(err)
 	}
 
-	return model.EventOutbox{
+	row := model.EventOutbox{
 		ID:            id,
 		EventID:       eventID,
 		EventType:     eventType,
@@ -960,6 +1142,14 @@ func relayRow(id int64, eventID, eventType, partitionKey string, occurredAt time
 		Status:        model.EventOutboxStatusPending,
 		MaxAttempts:   5,
 	}
+
+	raw, err := row.CanonicalEvent().CanonicalBytes()
+	if err != nil {
+		panic(err)
+	}
+	row.EventRaw = raw
+
+	return row
 }
 
 // relayTransactionRow is the common case: a transaction event on one ledger.
@@ -1266,6 +1456,75 @@ func TestEventRelayProcessor_RefusesToStartBeforeTheWindowOpens(t *testing.T) {
 	storeDeprecationWindow(t, now.AddDate(0, 0, -60), now.AddDate(0, 0, -30))
 	assert.NoError(t, harness.processor.startupObstacle(),
 		"after the sunset the relay must still run; Kafka is then the only transport")
+}
+
+// TestEventRelayProcessor_RefusesToStartWithAnUnusableWindow is the C-1 finding's relay leg.
+//
+// # The state, and why refusing is the only coherent answer
+//
+// A relay only reaches the window check with a REAL publisher — the no-op is refused above it
+// — so Kafka is configured. For such a process WebhookWindowUnavailable means configuration
+// describes no usable dual-delivery window at all, and the sunset predicate fails closed on
+// that: WebhookSunsetPassed answers true, so the per-row legacy leg is skipped and NO webhooks
+// are enqueued, while nothing in configuration said a retirement had happened. Subscribers who
+// have not migrated stop receiving events with nothing failing to say so — the same silent loss
+// as the not-yet-open case, arrived at from the other end of the window.
+//
+// config.resolveWebhookDeprecationWindow now refuses to LOAD brokers without a usable window,
+// so this arm is a second line of defence. It is reachable only by publishing configuration
+// some other way, which is exactly what the fetchConfiguration seam does here — the global
+// store cannot hold this shape, because validateAndAddDefaults rejects it.
+func TestEventRelayProcessor_RefusesToStartWithAnUnusableWindow(t *testing.T) {
+	restoreFetchConfiguration(t)
+	sunsetParseWarnings.reset()
+
+	harness := newRelayHarness(t)
+	// The real resolution, not the harness's pinned-open stub: the state under test is one
+	// only the production resolver produces.
+	harness.processor.dualDeliveryActive = harness.wiredWindow
+	harness.processor.windowState = WebhookDualDeliveryWindowState
+
+	for name, sunset := range map[string]string{
+		"no sunset at all":      "",
+		"an unparseable sunset": "30 days from now",
+	} {
+		t.Run(name, func(t *testing.T) {
+			sunsetParseWarnings.reset()
+			fetchConfiguration = func() (*config.Configuration, error) {
+				return &config.Configuration{
+					Kafka:                        config.KafkaConfig{Brokers: []string{"broker-1:9092"}},
+					WebhookDeprecationSunsetDate: sunset,
+				}, nil
+			}
+
+			require.Equal(t, WebhookWindowUnavailable, harness.processor.windowStateAt(relayFixedNow),
+				"the fixture must actually produce the unusable state, or this proves nothing")
+
+			err := harness.processor.startupObstacle()
+			require.Error(t, err, "a publishing relay with no usable window must refuse to run")
+			assert.Contains(t, err.Error(), "WEBHOOK_DEPRECATION_SUNSET_DATE",
+				"the error must name the variable an operator has to set, or it is not actionable")
+
+			harness.processor.Start(context.Background())
+			assert.False(t, harness.processor.IsRunning(), "and it must not be running")
+			harness.processor.Stop()
+		})
+	}
+
+	// A USABLE window is admissible, which is what proves the check is about the window being
+	// unusable rather than about the resolver being consulted at all.
+	t.Run("a usable window still starts", func(t *testing.T) {
+		fetchConfiguration = func() (*config.Configuration, error) {
+			return &config.Configuration{
+				Kafka:                        config.KafkaConfig{Brokers: []string{"broker-1:9092"}},
+				WebhookDeprecationStartDate:  relayFixedNow.AddDate(0, 0, -15).Format(time.RFC3339),
+				WebhookDeprecationSunsetDate: relayFixedNow.AddDate(0, 0, 15).Format(time.RFC3339),
+			}, nil
+		}
+
+		assert.NoError(t, harness.processor.startupObstacle(),
+			"inside a configured window the relay must start normally")
+	})
 }
 
 // TestNewEventRelayProcessor_IsNilSafe asserts a processor built from nothing is a value that
@@ -1718,6 +1977,64 @@ func TestProcessBatch_BuildsThePublishRequestFromTheStoredRow(t *testing.T) {
 		"the payload must be the stored bytes, not a re-marshalled struct")
 	assert.Equal(t, []byte(row.Payload), []byte(request.Event.Payload),
 		"and byte-identical, because that is what the dual-delivery guarantee rests on")
+
+	assert.Equal(t, row.EventRaw, request.Raw,
+		"the STORED CANONICAL ENVELOPE must reach the publisher: it is what resolveEventValue "+
+			"puts on the wire, so a retry, the dead-letter copy and a replay of this row are "+
+			"byte-identical by construction rather than by the serialiser happening not to have "+
+			"changed between them")
+	assert.NotEmpty(t, request.Raw,
+		"a claimed row always carries event_raw — the column is NOT NULL — so an empty value here "+
+			"means the relay assembled the envelope itself and the fallback is silently in use")
+}
+
+// TestProcessBatch_PublishesTheStoredEnvelopeAndNeverARebuild is the relay's half of the
+// byte-fidelity guarantee, and it is asserted here because the relay is the PRIMARY publisher:
+// a stored envelope honoured on replay but rebuilt on first delivery would mean subscribers
+// received one byte sequence and the replay of that same event another.
+//
+// The row carries an envelope this build's serialiser could not have produced — a member no
+// version of model.LedgerEvent declares, plus a member order and whitespace layout the
+// canonical composer never emits — so an implementation that rebuilt from the row's columns
+// fails here and only here. Every other assertion in this file would keep passing, because a
+// rebuild agrees with itself.
+func TestProcessBatch_PublishesTheStoredEnvelopeAndNeverARebuild(t *testing.T) {
+	row := relayTransactionRow(11, "evt-stored-envelope")
+
+	rebuilt, err := row.CanonicalEvent().CanonicalBytes()
+	require.NoError(t, err)
+
+	stored := []byte("{\n" +
+		`  "schema_version": 1,` + "\n" +
+		`  "event_id": "` + row.EventID + "\",\n" +
+		`  "event_type": "` + row.EventType + "\",\n" +
+		`  "aggregate_id": "` + row.AggregateID + "\",\n" +
+		`  "occurred_at": "` + row.OccurredAt.Format(time.RFC3339Nano) + "\",\n" +
+		`  "envelope_extension": {"written_by": "a later build of blnk"},` + "\n" +
+		`  "payload": ` + string(row.Payload) + "\n" +
+		"}")
+	require.True(t, json.Valid(stored), "the stored envelope must be valid JSON")
+	require.NotEqual(t, string(rebuilt), string(stored),
+		"the fixture must be UNREACHABLE by composition, or this test proves nothing")
+
+	row.EventRaw = stored
+
+	harness := newRelayHarness(t, row)
+	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+	requests := harness.publisher.snapshotRequests()
+	require.Len(t, requests, 1)
+
+	value, err := resolveEventValue(requests[0])
+	require.NoError(t, err)
+
+	assert.Equal(t, string(stored), string(value),
+		"the relay must publish the bytes the row stores")
+	assert.NotEqual(t, string(rebuilt), string(value),
+		"the relay must not rebuild the envelope from the row's columns")
+	assert.Contains(t, string(value), `"envelope_extension"`,
+		"a member this build does not model must still reach the topic, because the stored value "+
+			"is the record of what a subscriber was sent and not a rendering this build may reinterpret")
 }
 
 // TestProcessBatch_ReturnsQuietlyWhenThereIsNothingToDo asserts an empty backlog is silent,
@@ -3764,6 +4081,267 @@ func TestEventRelay_ARepairClaimFailureIsReportedAndTheTickContinues(t *testing.
 	require.NotEmpty(t, entries, "the failure must be reported")
 	assert.Equal(t, logrus.ErrorLevel, entries[0].Level,
 		"being unable to look for events that exist nowhere else is an error, not a warning")
+
+	assert.Len(t, harness.publisher.snapshotRequests(), 1,
+		"and the tick must still publish the rows that are due")
+	assert.Len(t, harness.store.snapshotDispatched(), 1)
+}
+
+// ---------------------------------------------------------------------------
+// The publisher's permanent-failure verdict reaches the durable state
+// ---------------------------------------------------------------------------
+
+// TestEventRelay_APermanentPublishFailureExhaustsTheRowImmediately is the relay half of the
+// verdict hand-off.
+//
+// The publisher already knows which failures no retry can fix: an envelope over the size
+// ceiling, bytes that are not valid JSON, a destination outside the topic namespace Blnk owns.
+// It reports those as NOT transient and as PublishStatusDeadLettered. That verdict used to be
+// dropped here, so the row went back to pending with its whole budget intact and spent the full
+// 1s + 2s + 4s + 8s + 16s schedule rediscovering it — 31 seconds before the event reached the
+// dead-letter topic where an operator could see it, four attempts of relay throughput spent on
+// a message that can never be published, and a permanently stuck event reported as a busy one
+// in the status counter throughout.
+//
+// The assertions are on both halves of the hand-off: the verdict was FORWARDED to the durable
+// transition, and the row went straight to the dead-letter writer on attempt one.
+func TestEventRelay_APermanentPublishFailureExhaustsTheRowImmediately(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	row := relayTransactionRow(1, "evt-permanent")
+	require.Equal(t, 5, row.MaxAttempts, "the fixture must have budget left, or nothing is being proven")
+
+	harness := newRelayHarness(t, row)
+	harness.publisher.failPermanentlyFor(row.EventID, errors.New("the serialised event is over the size ceiling"))
+
+	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+	failures := harness.store.snapshotFailures()
+	require.Len(t, failures, 1, "exactly one attempt may be recorded")
+	assert.True(t, failures[0].terminal,
+		"the publisher's PERMANENT verdict must be forwarded to the durable transition; discarding it "+
+			"returns a row that can never be published to pending and spends its whole schedule rediscovering that")
+
+	rows := harness.deadLetters.snapshotRows()
+	require.Len(t, rows, 1,
+		"a permanent failure must reach the dead-letter writer on the attempt it happened, so the event "+
+			"is preserved and visible now rather than after the full backoff schedule")
+	assert.Equal(t, row.EventID, rows[0].EventID)
+	assert.Equal(t, 1, rows[0].Attempts,
+		"and the attempt count must report the truth — one attempt — rather than being inflated to the budget")
+
+	assert.Len(t, harness.publisher.snapshotRequests(), 1,
+		"the remaining budget must NOT be spent: no retry can make an unpublishable message publishable")
+
+	entries := relayEntriesWithMessage(hook, "the publish failed PERMANENTLY")
+	require.NotEmpty(t, entries,
+		"the reason for an early exhaustion must be stated, or 'attempt 1 of 5, exhausted' reads as a defect")
+	assert.Equal(t, logrus.WarnLevel, entries[0].Level)
+}
+
+// TestEventRelay_ATransientPublishFailureKeepsItsWholeBudget is the other side of the same
+// decision, and it is what stops the fix above from becoming a regression.
+//
+// A broker being briefly unreachable is the ordinary case, and it MUST still be bounded by
+// max_attempts rather than exhausted on sight. Forwarding "terminal" for every failure would
+// dead-letter every event during a two-second broker blip.
+func TestEventRelay_ATransientPublishFailureKeepsItsWholeBudget(t *testing.T) {
+	row := relayTransactionRow(1, "evt-transient")
+
+	harness := newRelayHarness(t, row)
+	harness.publisher.failFor = map[string]bool{row.EventID: true}
+
+	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+	failures := harness.store.snapshotFailures()
+	require.Len(t, failures, 1)
+	assert.False(t, failures[0].terminal,
+		"a transient failure must NOT be forwarded as permanent, or a momentary broker blip dead-letters "+
+			"every event in flight")
+
+	assert.Empty(t, harness.deadLetters.snapshotRows(),
+		"and the row must keep its budget rather than being preserved on attempt one")
+
+	state, terminal := harness.store.terminalState(row.ID)
+	assert.False(t, terminal, "the row must be back in the claimable set, not terminal")
+	assert.Empty(t, state)
+}
+
+// ---------------------------------------------------------------------------
+// The legacy webhook leg survives a Kafka leg that ended in failure
+// ---------------------------------------------------------------------------
+
+// TestEventRelay_BothLegsFailingOnTheExhaustingAttemptDoesNotDiscardTheWebhook is the
+// acceptance test for the dual-delivery guarantee's worst case.
+//
+// # The loss
+//
+// The relay enqueues the legacy webhook FIRST and publishes to Kafka SECOND. A failed enqueue is
+// deliberately swallowed, because a webhook receiver being down must not consume a Kafka retry
+// attempt or dead-letter an event on the new transport. Three settlements follow a publish, and
+// only two of them used to carry the outstanding webhook forward:
+//
+//   - publish SUCCEEDED → MarkEventWebhookPending, status webhook_pending, inside the claim
+//     predicate. Covered.
+//   - publish FAILED with budget left → back to pending, whole row retried. Covered.
+//   - publish FAILED on the attempt that spent the budget → failed, then dead_lettered.
+//     TERMINAL, token cleared, outside every claim predicate, webhook_dispatched still FALSE.
+//     THE WEBHOOK WAS DISCARDED.
+//
+// The third case is the one that matters most, not least: the broker being unreachable is why
+// the Kafka leg failed, so the webhook may be the only transport still working — and the
+// subscribers it serves are precisely the ones that have not migrated, which is who the 30-day
+// window exists for.
+//
+// # What is asserted
+//
+// That the obligation is DURABLE and INDEPENDENTLY RECLAIMABLE: the row reaches its Kafka
+// terminal state, the recovery claim reaches it there, the webhook is enqueued with the STORED
+// bytes, the marker is recorded — and the Kafka leg's terminal state is not disturbed by any of
+// it.
+func TestEventRelay_BothLegsFailingOnTheExhaustingAttemptDoesNotDiscardTheWebhook(t *testing.T) {
+	// A row on its LAST attempt, so the coming publish failure exhausts it.
+	row := relayTransactionRow(1, "evt-both-legs-failed")
+	row.Attempts = row.MaxAttempts - 1
+
+	harness := newRelayHarness(t, row)
+	harness.publisher.failFor = map[string]bool{row.EventID: true}
+	harness.legacy.err = errors.New("relay test: the webhook queue is unreachable")
+
+	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+	// Both legs did fail, which is the precondition this test is about.
+	assert.Empty(t, harness.legacy.snapshot(), "the enqueue must have failed")
+	require.Len(t, harness.deadLetters.snapshotRows(), 1, "the Kafka leg must have been given up on")
+
+	state, terminal := harness.store.terminalState(row.ID)
+	require.True(t, terminal, "the Kafka leg must be terminal, which is what puts the row out of the ordinary claim")
+	require.Equal(t, model.EventOutboxStatusFailed, state)
+
+	// The recovery pass now finds the row THERE. Seeded as the widened claim would return it:
+	// terminal on the failure path, with the webhook still owed.
+	owed := row
+	owed.Status = model.EventOutboxStatusDeadLettered
+	owed.Attempts = row.MaxAttempts
+	owed.WebhookDispatched = false
+	owed.LastError = "broker unavailable"
+
+	recovery := newRelayHarness(t)
+	recovery.store.webhookOwedRows = []model.EventOutbox{owed}
+
+	recovery.processor.processTick(context.Background())
+
+	enqueued := recovery.legacy.snapshot()
+	require.Len(t, enqueued, 1,
+		"the outstanding webhook must be enqueued by the recovery pass; without it the delivery promised "+
+			"for the migration window is lost with one warning line as the only trace")
+	assert.Equal(t, owed.EventID, enqueued[0].eventID,
+		"the event id is the asynq task identity, which is what makes a re-claim idempotent")
+	assert.Equal(t, []byte(owed.Payload), enqueued[0].body,
+		"and the STORED bytes must be delivered, so payload identity holds on the recovery path too")
+
+	marks := recovery.store.snapshotWebhookMarks()
+	require.Len(t, marks, 1, "the recovered leg must be recorded, or the next pass enqueues it again")
+	assert.Equal(t, owed.ID, marks[0].id)
+	assert.NotEmpty(t, marks[0].claimToken,
+		"the recovery claim must stamp a fresh token: every terminal transition cleared the old one")
+
+	assert.Empty(t, recovery.publisher.snapshotRequests(),
+		"the recovery pass must NEVER publish: this event is dead-lettered, and republishing it would "+
+			"revive a terminal row and duplicate its dead-letter accounting")
+	assert.Empty(t, recovery.store.snapshotFailures(),
+		"and it must not record a Kafka attempt either; the Kafka budget is spent and its state is settled")
+	assert.Empty(t, recovery.store.snapshotLegacyAttempts(),
+		"a successful enqueue records no failure transition")
+}
+
+// TestEventRelay_ARecoveredWebhookThatFailsAgainSpendsOnlyItsOwnBudget asserts the recovery
+// path is bounded, and bounded by the LEGACY leg's own counter.
+//
+// A receiver that is permanently gone must not keep a row in this candidate set for ever, and
+// must not spend a Kafka attempt doing it — a webhook budget that drew on the Kafka one would
+// let the deprecated transport dead-letter events on the new one, which is the inversion the
+// whole two-column split exists to prevent.
+func TestEventRelay_ARecoveredWebhookThatFailsAgainSpendsOnlyItsOwnBudget(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	owed := relayTransactionRow(1, "evt-recovery-failed-again")
+	owed.Status = model.EventOutboxStatusDeadLettered
+	owed.Attempts = owed.MaxAttempts
+	owed.WebhookAttempts = 1
+
+	harness := newRelayHarness(t)
+	harness.store.webhookOwedRows = []model.EventOutbox{owed}
+	harness.legacy.err = errors.New("relay test: the webhook queue is still unreachable")
+
+	harness.processor.processTick(context.Background())
+
+	attempts := harness.store.snapshotLegacyAttempts()
+	require.Len(t, attempts, 1, "the failed recovery must be recorded, or it is unbounded")
+	assert.Equal(t, owed.ID, attempts[0].id)
+	assert.Equal(t, 2*time.Second, attempts[0].retryAfter,
+		"the backoff must be indexed by the WEBHOOK attempt count — one recorded already, so this is "+
+			"attempt two and its delay is 2s on the documented 1s/2s/4s/8s/16s curve")
+
+	assert.Empty(t, harness.store.snapshotFailures(),
+		"a webhook failure must NEVER record a Kafka attempt: that would let the deprecated transport "+
+			"spend the new one's retry budget")
+	assert.Empty(t, harness.store.snapshotWebhookMarks(),
+		"and nothing may be marked delivered")
+
+	state, terminal := harness.store.terminalState(owed.ID)
+	assert.False(t, terminal,
+		"the fake records no NEW terminal transition: the row's status was already dead_lettered and the "+
+			"recovery path must leave it exactly so")
+	assert.Empty(t, state)
+
+	entries := relayEntriesWithMessage(hook, "recovering the legacy webhook leg of this event failed again")
+	require.NotEmpty(t, entries, "a repeated failure must stay visible")
+	assert.Equal(t, logrus.WarnLevel, entries[0].Level)
+}
+
+// TestEventRelay_TheWebhookRecoveryPassIsSilentAfterTheSunset asserts the pass observes the same
+// boundary the inline enqueue does.
+//
+// From the sunset onwards there is no leg to finish: the promise has ended and Kafka is the only
+// transport. A recovery pass that kept enqueuing would deliver webhooks after the date on which
+// the API starts answering 410 Gone, which is the one behaviour the sunset is defined to prevent.
+func TestEventRelay_TheWebhookRecoveryPassIsSilentAfterTheSunset(t *testing.T) {
+	owed := relayTransactionRow(1, "evt-after-sunset")
+	owed.Status = model.EventOutboxStatusDeadLettered
+
+	harness := newRelayHarness(t)
+	harness.store.webhookOwedRows = []model.EventOutbox{owed}
+	harness.processor.dualDeliveryActive = func(time.Time) bool { return false }
+
+	harness.processor.processTick(context.Background())
+
+	assert.Empty(t, harness.legacy.snapshot(),
+		"no webhook may be enqueued once the window has closed")
+	assert.False(t, harness.store.webhookOwedTaken,
+		"and the claim must not even be issued: skipping the query is cheaper than claiming rows and "+
+			"discarding them, and it keeps the boundary in ONE predicate")
+}
+
+// TestEventRelay_AWebhookRecoveryClaimFailureIsReportedAndTheTickContinues asserts the pass
+// cannot cost the tick its publishing.
+//
+// The passes share a database and a tick. A recovery query that fails must not stop the relay
+// delivering the events that are due now.
+func TestEventRelay_AWebhookRecoveryClaimFailureIsReportedAndTheTickContinues(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	harness := newRelayHarness(t, relayTransactionRow(1, "evt-webhook-claim-failed"))
+	harness.store.webhookOwedErr = errors.New("relay test: statement timeout")
+
+	harness.processor.processTick(context.Background())
+
+	entries := relayEntriesWithMessage(hook, "could not claim events whose legacy webhook leg is still owed")
+	require.NotEmpty(t, entries, "the failure must be reported")
+	assert.Equal(t, logrus.ErrorLevel, entries[0].Level)
 
 	assert.Len(t, harness.publisher.snapshotRequests(), 1,
 		"and the tick must still publish the rows that are due")

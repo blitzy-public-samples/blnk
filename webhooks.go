@@ -385,7 +385,9 @@ func processHTTP(ctx context.Context, data NewWebhook, client *http.Client) erro
 		return err
 	}
 
-	return processHTTPRaw(ctx, payloadBytes, client)
+	// No identity: this path was handed a STRUCT, so there is no outbox row and no event id
+	// behind it. The header is omitted rather than invented.
+	return processHTTPRaw(ctx, "", payloadBytes, client)
 }
 
 // processHTTPRaw sends an already-serialised webhook body, signing and posting the exact
@@ -441,7 +443,7 @@ func processHTTP(ctx context.Context, data NewWebhook, client *http.Client) erro
 //
 // Returns:
 //   - error: a configuration, request-construction, transport or non-2xx failure.
-func processHTTPRaw(ctx context.Context, payloadBytes []byte, client *http.Client) error {
+func processHTTPRaw(ctx context.Context, eventID string, payloadBytes []byte, client *http.Client) error {
 	conf, err := config.Fetch()
 	if err != nil {
 		return err
@@ -469,6 +471,18 @@ func processHTTPRaw(ctx context.Context, payloadBytes []byte, client *http.Clien
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+
+	// THE IDENTITY, when the caller has one. Set before the signature so the ordering reads
+	// as "describe the delivery, then sign the body", and set before the configured headers
+	// so applyConfiguredWebhookHeaders can refuse an override of it.
+	//
+	// Empty means the caller genuinely has no identity to offer — SendWebhook takes a struct
+	// and carries none — and the header is OMITTED rather than sent blank. An empty value is
+	// worse than an absent one: a receiver keying on it would treat every such delivery as the
+	// same event and discard all but the first.
+	if trimmedEventID := strings.TrimSpace(eventID); trimmedEventID != "" {
+		req.Header.Set(LegacyWebhookEventIDHeader, trimmedEventID)
+	}
 
 	if secret != "" {
 		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
@@ -551,7 +565,42 @@ var transportOwnedWebhookHeaders = map[string]struct{}{
 	textproto.CanonicalMIMEHeaderKey("Content-Length"):   {},
 	textproto.CanonicalMIMEHeaderKey("X-Blnk-Signature"): {},
 	textproto.CanonicalMIMEHeaderKey("X-Blnk-Timestamp"): {},
+	// The event identity, for the same reason as the signature: it is a statement the
+	// transport makes about THIS delivery, and a receiver deduplicating on it must be able to
+	// trust it. A configured constant here would collapse every event onto one identity and a
+	// receiver would discard all but the first as duplicates — silently, and permanently.
+	textproto.CanonicalMIMEHeaderKey(LegacyWebhookEventIDHeader): {},
 }
+
+// LegacyWebhookEventIDHeader carries the outbox event id to the receiver of a legacy HTTP
+// delivery.
+//
+// # Why the receiver needs it
+//
+// Legacy delivery is AT-LEAST-ONCE with a bounded suppression window — see
+// LegacyWebhookRetention for the bound and why it exists. A receiver that wants
+// exactly-once processing therefore has to deduplicate, and until this header existed it had
+// nothing to deduplicate ON: the body is the frozen legacy envelope, `{"event":…,"data":…}`,
+// which carries no delivery identity, and two deliveries of one event are byte-identical, so
+// hashing the body cannot distinguish a duplicate from a legitimately repeated event.
+//
+// It is the SAME `event_id` that is the Kafka subscriber's idempotency key, deliberately: a
+// subscriber migrating from the webhook to the topic keeps the key it already deduplicates on
+// rather than acquiring a second one, and a subscriber reading both during the dual-delivery
+// window can recognise the two transports' copies of one event as one event.
+//
+// # Why a header rather than a body field
+//
+// The body is FROZEN. Its bytes are asserted equal to the bytes published to Kafka, and the
+// payload-preservation guarantee is that a subscriber's existing parser works unchanged. Adding
+// a member would break both, and it would break them in the migration's final week, for the
+// benefit of a field the receiver can have for free in a header.
+//
+// The signature is unaffected: the HMAC is computed over `timestamp + "." + body`, so headers
+// are outside it. That also means this header is NOT signed and a receiver must not treat it as
+// evidence of origin — it is a correlation and deduplication key, and the signature over the
+// body remains the only proof the delivery came from this deployment.
+const LegacyWebhookEventIDHeader = "X-Blnk-Event-Id"
 
 // applyConfiguredWebhookHeaders copies the operator's configured headers onto an outgoing
 // request, refusing the ones the transport owns.
@@ -890,15 +939,76 @@ func legacyWebhookEventID(taskID string) string {
 	return strings.TrimSpace(eventID)
 }
 
+// legacyWebhookEventIDFromContext recovers the outbox event id for the delivery being handled.
+//
+// The id is not in the task payload — the body is the frozen legacy envelope and carries no
+// delivery identity — so it travels as the asynq task ID, which EnqueueLegacyWebhookDelivery
+// sets to the namespaced event id. This is the read side of that arrangement.
+//
+// Nil-safe and namespace-checked for the same reasons the failure-log helper is: asynq's
+// context accessors dereference the context without a nil check, and the webhook queue is
+// shared with transaction hooks and TypeSense indexing, so a task ID lacking the namespace
+// belongs to another producer and must yield nothing rather than be reported as an event id.
+//
+// Parameters:
+//   - ctx context.Context: the handler context asynq supplied. May be nil.
+//
+// Returns:
+//   - string: the event id, or "" when this task did not come from the relay.
+func legacyWebhookEventIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+
+	taskID, ok := asynq.GetTaskID(ctx)
+	if !ok {
+		return ""
+	}
+
+	return legacyWebhookEventID(taskID)
+}
+
 // LegacyWebhookRetention is how long a completed legacy-delivery task is kept in Redis.
 //
 // It exists solely to give the event-ID task identity a window in which it can actually
 // suppress a duplicate. asynq deletes a task the moment it completes unless a retention is
 // set, and a deleted task's ID is immediately reusable — so without this, a re-enqueue of
 // the same event after the first delivery finished would be accepted, which is precisely
-// the duplicate the identity is there to stop. Twenty-four hours comfortably covers a relay
-// crash, an operator-initiated replay of a claimed batch, and a Redis failover, while
-// bounding what the queue retains.
+// the duplicate the identity is there to stop.
+//
+// # LEGACY DELIVERY IS AT-LEAST-ONCE, AND THIS CONSTANT IS THE BOUND ON THE SUPPRESSION
+//
+// Stating it plainly because the mechanism above reads like exactly-once and is not. Enqueuing
+// the task and recording that the webhook leg was dispatched are two operations against two
+// systems with no transaction spanning them, so a crash in between leaves `webhook_dispatched`
+// FALSE for a delivery that already happened. The next claim of that row re-enqueues it, and
+// whether the receiver sees a second HTTP request turns entirely on whether the completed
+// task's ID is still in Redis:
+//
+//   - WITHIN twenty-four hours of the first delivery completing, the re-enqueue is refused with
+//     ErrTaskIDConflict and the receiver sees one request. This covers a relay crash and
+//     restart, an operator-initiated replay of a claimed batch, and a Redis failover — the
+//     realistic causes, which is why the window is set where it is.
+//   - BEYOND twenty-four hours, the retention has lapsed and the ID is free again, so the
+//     re-enqueue is ACCEPTED and the receiver sees the delivery a SECOND time. A relay outage
+//     longer than a day that straddles an unmarked row produces exactly this, and so does the
+//     owed-leg recovery pass reaching a row whose marking failed more than a day earlier.
+//
+// # Why the window is not simply extended to cover the whole migration
+//
+// Because the cost is unbounded where the alternative is free. Retention keeps the completed
+// task, not a token: covering the full thirty-day dual-delivery window would hold every legacy
+// delivery of those thirty days in Redis, which at the pipeline's target rate is on the order of
+// a billion tasks. That trades a duplicate a receiver can discard in one line for a memory
+// profile that can take the queue — and with it transaction processing and search indexing,
+// which share this Redis — down.
+//
+// The receiver is given the means instead: every delivery carries its event id in
+// LegacyWebhookEventIDHeader, which is the SAME key the Kafka subscriber deduplicates on. A
+// receiver can then hold an idempotency horizon as long as it likes, chosen against its own
+// storage rather than against Blnk's queue, and that is strictly better than any window Blnk
+// could pick on its behalf. docs/webhook-to-kafka-migration.md states the obligation for
+// subscribers; this comment states the mechanism for maintainers.
 const LegacyWebhookRetention = 24 * time.Hour
 
 // EnqueueLegacyWebhookDelivery enqueues the legacy HTTP delivery of ONE outbox event,
@@ -937,11 +1047,18 @@ const LegacyWebhookRetention = 24 * time.Hour
 // them leaves the row not-yet-marked, so the next claim of that row enqueues the delivery
 // again — a duplicate webhook for one event.
 //
-// asynq's TaskID makes that harmless: a second enqueue under an ID already present is
-// refused with ErrTaskIDConflict rather than accepted. That conflict is therefore SUCCESS
-// for this operation's purposes — the task the caller wants enqueued is already enqueued —
-// and it is reported as such rather than as an error, because treating it as a failure would
-// stall the row it belongs to behind a condition that is already satisfied.
+// asynq's TaskID makes that harmless FOR A BOUNDED PERIOD: a second enqueue under an ID
+// already present is refused with ErrTaskIDConflict rather than accepted. That conflict is
+// therefore SUCCESS for this operation's purposes — the task the caller wants enqueued is
+// already enqueued — and it is reported as such rather than as an error, because treating it
+// as a failure would stall the row it belongs to behind a condition that is already satisfied.
+//
+// "Bounded" is the honest word and not a hedge. The ID is only present while the task is,
+// which after completion means for LegacyWebhookRetention — twenty-four hours. Past that the
+// suppression is gone and a re-enqueue of the same event is accepted, so the receiver sees a
+// second HTTP delivery. Read that constant's documentation before reasoning about duplicates;
+// this transport is at-least-once, and every delivery carries LegacyWebhookEventIDHeader so a
+// receiver can close the gap on its own terms.
 //
 // Parameters:
 //   - eventID string: the outbox row's event_id, which is the task's identity. Required:
@@ -1140,7 +1257,10 @@ func (b *Blnk) ProcessWebhook(ctx context.Context, task *asynq.Task) error {
 		return err
 	}
 
-	if err := processHTTPRaw(ctx, task.Payload(), b.httpClient); err != nil {
+	// The identity travels as the TASK ID rather than in the body, so it is recovered from
+	// there — the same inverse pair that lets a failure log name the event. A task from
+	// another producer on the shared queue yields the empty string and the header is omitted.
+	if err := processHTTPRaw(ctx, legacyWebhookEventIDFromContext(ctx), task.Payload(), b.httpClient); err != nil {
 		// ONE record per failed delivery, and this is it. The envelope is available here, so
 		// this is the only place that can name the event alongside the task, queue, retry
 		// count and cause — which is what makes a failure diagnosable rather than merely

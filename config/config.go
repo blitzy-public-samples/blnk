@@ -787,14 +787,17 @@ type Configuration struct {
 	// Refusing to start is the only signal that cannot be overlooked, and it happens
 	// before any traffic is served.
 	//
-	// LEAVING IT UNSET IS A WARNING, not an error, with or without brokers
-	// configured. Nothing has been mis-stated in that case — a retirement date simply
-	// has not been chosen yet — and AAP §0.7.2 requires a deployment to keep starting
-	// and serving as Kafka configuration is introduced. Failing the load would make
-	// adding KAFKA_BROKERS, on its own a safe additive change, an outage, which
-	// pressures an operator to back the migration out rather than finish it. The
-	// consequence of no date is that dual delivery continues, which is the
-	// pre-existing behaviour and is safe for subscribers.
+	// IT IS REQUIRED WHENEVER KAFKA_BROKERS IS SET, and absent one the load FAILS. The
+	// runtime's sunset predicate fails closed on a publishing deployment with no usable
+	// window — it answers "the sunset has already passed", stopping dual delivery and
+	// answering 410 Gone on the deprecated routes — so accepting the combination here
+	// with a warning that promised the opposite let configuration and behaviour
+	// disagree about the one decision R-12 is made of. See
+	// resolveWebhookDeprecationWindow for the full reasoning.
+	//
+	// With NO brokers it stays optional and empty is the norm: there is no transport to
+	// migrate to, so there is no window to describe, and AAP §0.7.2's graceful
+	// degradation is untouched.
 	//
 	// The other end of the window is DERIVED from this one — see
 	// WebhookDeprecationStartDate — so there is no second value to keep in step and
@@ -1168,32 +1171,49 @@ func (cnf *Configuration) validateAndAddDefaults() error {
 //
 // The rules, in the order they are applied:
 //
-//  1. A sunset that will not parse as RFC3339 is a FATAL error. This one stays fatal
-//     deliberately. The date drives two security-relevant behaviours — whether the
-//     legacy HTTP transport still runs, and whether the deprecated webhook management
-//     routes still answer — and a mis-typed value silently resolves to "keep the
-//     legacy behaviour", so a single typo would keep the deprecated, less protected
-//     transport alive indefinitely with nothing failing and nothing to notice. An
-//     operator stated an intent here and got it wrong; refusing to start is the only
-//     signal they cannot overlook, and it happens before any traffic is served.
+//  1. A sunset that will not parse as RFC3339 is a FATAL error, with or without
+//     brokers. The date drives two security-relevant behaviours — whether the legacy
+//     HTTP transport still runs, and whether the deprecated webhook management routes
+//     still answer — and an operator who states a retirement instant and mis-types it
+//     must not have it silently reinterpreted. Refusing to start is the only signal
+//     that cannot be overlooked, and it happens before any traffic is served.
 //
-//  2. A blank sunset is a WARNING, not an error, whether or not brokers are
-//     configured. Refusing to start in this case was wrong for a different reason
-//     than case 1 is right: nothing was mis-stated, the operator simply has not set a
-//     retirement date yet, and AAP §0.7.2 requires a deployment to keep starting and
-//     serving as Kafka configuration is introduced. Failing the load turns adding
-//     KAFKA_BROKERS — on its own a safe, additive change — into an outage, which
-//     makes an operator likelier to back the whole migration out than to complete it.
-//     The consequence of no date is that dual delivery continues, which is the
-//     PRE-EXISTING behaviour and is safe for subscribers; it is loud in the log and
-//     it changes nothing about how traffic is served.
+//  2. A BLANK SUNSET WITH BROKERS CONFIGURED IS ALSO FATAL, and this is the rule the
+//     review's C-1 finding exists to install. It was previously a warning whose text
+//     promised that "legacy HTTP webhook delivery will run alongside Kafka
+//     INDEFINITELY" — and the runtime does the OPPOSITE. blnk.WebhookSunsetPassed
+//     treats "publishing configured, window unusable" as fail-closed: the sunset has
+//     ALREADY passed, so dual delivery stops and the deprecated webhook routes answer
+//     410 Gone. One of the two had to give, and the runtime's reading is the safe one
+//     — carrying on with a deprecated, less protected transport on the strength of an
+//     unset variable is worse than retiring it loudly. So configuration now REFUSES
+//     the combination outright, which is what event_sunset.go's own documentation
+//     already claimed it did, and the fail-closed arm becomes the second line of
+//     defence it is described as rather than a routine outcome.
 //
-//  3. A parseable sunset. Used verbatim and normalised to RFC3339 in UTC, with the
+//     Refusing costs nothing an operator cannot pay before serving traffic: the value
+//     is one RFC3339 instant, and the error below names the variable, the window
+//     length and how to compute it. What it buys is that "dual delivery is running"
+//     and "the webhook routes still answer" can no longer disagree with the
+//     configuration that described them.
+//
+//     This does NOT weaken AAP §0.7.2's graceful degradation, which is about
+//     KAFKA_BROKERS being UNSET: with no brokers the publisher is the no-op, there is
+//     no migration to describe, and case 3 below leaves the window empty without
+//     complaint.
+//
+//  3. A blank sunset with NO brokers is silently accepted and clears the window.
+//     Nothing has been mis-stated: there is no transport to migrate to, so there is no
+//     window, and the deprecated routes keep answering exactly as they did before this
+//     feature existed.
+//
+//  4. A parseable sunset. Used verbatim and normalised to RFC3339 in UTC, with the
 //     start back-filled as sunset minus the window so both ends are available to
 //     describe it.
 //
 // Returns:
-//   - error: non-nil only when the sunset date is present and unparseable.
+//   - error: non-nil when the sunset date is present and unparseable, and when it is
+//     absent while Kafka brokers are configured.
 func (cnf *Configuration) resolveWebhookDeprecationWindow() error {
 	rawSunset := strings.TrimSpace(cnf.WebhookDeprecationSunsetDate)
 
@@ -1204,14 +1224,15 @@ func (cnf *Configuration) resolveWebhookDeprecationWindow() error {
 		cnf.WebhookDeprecationSunsetDate = ""
 
 		if len(cnf.Kafka.Brokers) > 0 {
-			logrus.WithFields(logrus.Fields{
-				"variable":    "WEBHOOK_DEPRECATION_SUNSET_DATE",
-				"window_days": WebhookDualDeliveryWindowDays,
-			}).Warn(
-				"kafka brokers are configured but no webhook deprecation sunset date is set, so " +
-					"legacy HTTP webhook delivery will run alongside Kafka INDEFINITELY and the " +
-					"deprecated webhook routes will keep answering. Set the sunset date to the " +
-					"RFC3339 instant the legacy transport retires",
+			return fmt.Errorf(
+				"webhook_deprecation_sunset_date is required once kafka.brokers is set: the runtime "+
+					"treats a Kafka deployment with no usable dual-delivery window as ALREADY past "+
+					"the sunset, so legacy HTTP webhook delivery would stop and the deprecated "+
+					"webhook management routes would answer 410 Gone — the opposite of continuing "+
+					"dual delivery. Set WEBHOOK_DEPRECATION_SUNSET_DATE to the RFC3339 instant the "+
+					"legacy transport retires, which opens the %d-day window %d days earlier "+
+					"(for example: date -u -d '+%d days' +%%Y-%%m-%%dT%%H:%%M:%%SZ)",
+				WebhookDualDeliveryWindowDays, WebhookDualDeliveryWindowDays, WebhookDualDeliveryWindowDays,
 			)
 		}
 

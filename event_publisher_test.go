@@ -1847,13 +1847,14 @@ func TestEventPublisher_HoldsOneWriterPerOwnedTopic(t *testing.T) {
 		"exactly one writer per owned topic: a missing one forces lazy creation onto the publish "+
 			"path, an extra one holds connections for a destination nothing publishes to")
 
-	// The three category topics requirement R-6 names, the one internal category the ledger,
-	// system-error and unrecognised events made necessary, and the four `.dlt` siblings
-	// requirement R-5 names. Written out as literals so a renamed topic or a dropped
-	// dead-letter sibling fails here.
+	// The three category topics requirement R-6 names, the grantable ledgers category
+	// ledger.created made necessary, the one internal category system-error and
+	// unrecognised events made necessary, and the five `.dlt` siblings requirement R-5
+	// names. Written out as literals so a renamed topic or a dropped dead-letter sibling
+	// fails here.
 	for _, topic := range []string{
-		"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system",
-		"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.system.dlt",
+		"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers", "blnk.system",
+		"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.ledgers.dlt", "blnk.system.dlt",
 	} {
 		writer, present := writers[topic]
 		require.True(t, present, "topic %q must have its own writer", topic)

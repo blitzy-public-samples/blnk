@@ -234,15 +234,22 @@ func TestSampleSubscriberSecret_IsNeverInventedByAnAutomaticProvisioningPath(t *
 	// allowlist tested on DECLARATION, so an operator's value — including a deliberate empty one
 	// — crosses verbatim, and a name left off the list is silently replaced by the script's own
 	// default instead.
-	passthrough := string(stack)
-	passthrough = passthrough[strings.Index(passthrough, "kafka_provision_passthrough=("):]
-	passthrough = passthrough[:strings.Index(passthrough, "\n)")]
+	//
+	// ASSERTED AGAINST THE SCRIPT'S OWN INTERFACE rather than against a literal list in stack.sh,
+	// because stack.sh no longer has one: it reads "--print-interface-host" at startup, so the two
+	// cannot drift and the only meaningful question is whether these two names are IN that
+	// interface. This used to parse a literal array out of stack.sh, which is the sort of
+	// assertion that silently stops testing anything the moment the thing it parses moves.
+	forwarded := kafkaProvisionInterface(t, "--print-interface-host")
 
 	for _, variable := range []string{sampleSubscriberSecretVar, sampleSubscriberSecretFileVar} {
-		assert.Containsf(t, passthrough, variable,
-			"stack.sh's provisioning pass-through must forward %s, or the host fallback runs with the "+
+		assert.Containsf(t, forwarded, variable,
+			"the provisioning interface must include %s, or the host fallback runs with the "+
 				"script's default rather than with what the operator configured", variable)
 	}
+
+	assert.Contains(t, string(stack), "--print-interface-host",
+		"and stack.sh must forward that interface rather than a copy of it")
 
 	assert.NotRegexp(t,
 		regexp.MustCompile(regexp.QuoteMeta(sampleSubscriberSecretVar)+`="\$\{`+

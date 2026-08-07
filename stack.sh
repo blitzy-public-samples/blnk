@@ -70,58 +70,73 @@ declare env_file_mode="600"
 # and the broker never bootstraps. 24 bytes give 32 unpadded characters, which is exactly the
 # 32-character floor both scripts and event_admin.go's MinSCRAMPasswordLength enforce.
 declare kafka_secret_bytes=24
-# EVERY VARIABLE THE PROVISIONING SCRIPT READS, in one list, forwarded to it when the host
-# fallback runs it directly.
+# EVERY VARIABLE THE PROVISIONING SCRIPT READS, forwarded to it when the host fallback runs it
+# directly — READ FROM THE SCRIPT ITSELF rather than restated here.
 #
-# One list rather than a hand-written argument sequence, because the hand-written one had drifted:
-# it carried ten names out of the twenty-odd the script documents, so a stack whose ${env}
-# pinned a sample principal, a consumer-group prefix, a topic grant, a rotation or skip request,
-# an operator-supplied client configuration or a readiness budget got that setting when compose
-# ran the one-shot and SILENTLY LOST IT when this fallback ran instead. The two paths provisioned
-# differently from the same ${env}, and which one ran depended only on whether the host happened
-# to have the Kafka CLI - so the difference was invisible and unreproducible.
+# It used to be a literal list, and before that a hand-written argument sequence, and both had
+# drifted. The literal list carried the wrong producer skip flag and omitted the CLI timeout
+# pair and the producer secret file; the argument sequence before it carried ten names out of
+# the twenty-odd the script documents. Either way a stack whose ${env} pinned one of the missing
+# settings got it when compose ran the one-shot and SILENTLY LOST IT when this fallback ran
+# instead — the two paths provisioning differently from the same ${env}, with which one ran
+# decided by nothing more than whether the host happened to have the Kafka CLI. Invisible, and
+# unreproducible.
 #
-# THIS LIST IS THE SCRIPT'S OWN DELEGATION LIST. scripts/kafka-provision.sh forwards exactly
-# these names when it re-executes itself inside the broker container, so the two are the same
-# interface seen from either side, and TestKafkaProvisionScript_HandsOffEverySupportedSetting
-# asserts they stay in step. Adding a variable to the script means adding it here.
+# "scripts/kafka-provision.sh --print-interface-host" emits one variable name per line and
+# exits without touching anything, so this is not a copy that can fall behind: it IS the
+# script's declaration. --host adds the delegation targets (KAFKA_CONTAINER,
+# KAFKA_PROVISION_CONTAINER_SCRIPT and the client-configuration container path), which a
+# host-side invoker may set and which the script deliberately does not forward into the
+# container.
 #
-# Deliberately absent: BLNK_KAFKA_PROVISION_IN_CONTAINER, which is the script's own
-# already-delegated marker and setting it from here would tell a host-side run it must not
-# delegate. KAFKA_BROKERS and KAFKA_COMPOSE_SERVICE are absent too because provision_kafka
-# computes both - the effective broker list and the service it was asked about - and a stale
-# ${env} value must not win over either.
-declare -a kafka_provision_passthrough=(
-    KAFKA_BOOTSTRAP_SERVER
-    KAFKA_TOPIC_PREFIX
-    KAFKA_MIN_PARTITIONS
-    KAFKA_REPLICATION_FACTOR
-    KAFKA_ALLOW_PARTITION_GROWTH
-    KAFKA_SASL_USER
-    KAFKA_SASL_SECRET
-    KAFKA_SASL_SECRET_FILE
-    KAFKA_PRODUCER_USER
-    KAFKA_PRODUCER_SECRET
-    KAFKA_ROTATE_PRODUCER_SECRET
-    KAFKA_SKIP_PRODUCER_PRINCIPAL
-    KAFKA_SASL_ADMIN_USER
-    KAFKA_SASL_ADMIN_SECRET
-    KAFKA_SECURITY_PROTOCOL
-    KAFKA_SCRAM_ITERATIONS
-    KAFKA_PROVISION_TIMEOUT_SECONDS
-    KAFKA_PROVISION_POLL_INTERVAL_SECONDS
-    KAFKA_SAMPLE_SUBSCRIBER_USER
-    KAFKA_SAMPLE_SUBSCRIBER_SECRET
-    KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE
-    KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX
-    KAFKA_SAMPLE_SUBSCRIBER_TOPICS
-    KAFKA_SKIP_SAMPLE_SUBSCRIBER
-    KAFKA_ROTATE_SAMPLE_SUBSCRIBER_SECRET
-    KAFKA_CLIENT_CONFIG
-    KAFKA_CLIENT_CONFIG_CONTAINER_PATH
-    KAFKA_CONTAINER
-    KAFKA_PROVISION_CONTAINER_SCRIPT
-)
+# Deliberately absent from what the script emits, and therefore from this: KAFKA_BROKERS and
+# KAFKA_COMPOSE_SERVICE, because provision_kafka computes both — the effective broker list and
+# the service it was asked about — and a stale ${env} value must not win over either.
+#
+# Read here at startup rather than inside provision_kafka so that a script that cannot be read
+# is reported once, at the point the list would have been built, rather than as an empty
+# forwarding later. An empty list is treated as fatal by resolve_kafka_provision_interface,
+# because silently forwarding nothing is the exact failure this replaced.
+declare -a kafka_provision_passthrough=()
+
+# Populate kafka_provision_passthrough from the provisioning script's own declaration.
+#
+# Called from main before any Kafka work. It is a function rather than a top-level command
+# substitution so that a failure can be REPORTED with the reason instead of leaving an empty
+# array behind: forwarding no variables at all would provision defaults and report success,
+# which is the silent-divergence failure mode this whole mechanism exists to remove.
+resolve_kafka_provision_interface() {
+    if [ ! -r "${kafka_provision_script}" ]
+    then
+        # Not fatal on its own: provision_kafka already refuses when the script is not
+        # executable, and that message tells the operator what to do. This only notes that the
+        # interface could not be read, so a later "provisioning was skipped" is not a surprise.
+        return 1
+    fi
+
+    local -a names=()
+    # shellcheck disable=SC2312 # the exit status is checked immediately below, on the array
+    while IFS= read -r name
+    do
+        case "${name}" in
+            # Only real variable names. A blank line or anything a future usage change might
+            # print alongside them is ignored rather than forwarded as an assignment.
+            [A-Z]*) names+=("${name}") ;;
+        esac
+    done < <(bash "${kafka_provision_script}" --print-interface-host 2>/dev/null)
+
+    if [ "${#names[@]}" -eq 0 ]
+    then
+        kafka_warn "could not read the provisioning interface from ${kafka_provision_script}." \
+            "The host fallback would forward no settings at all and provision defaults, so it" \
+            "is better to know now. Check that the script is intact and that" \
+            "'${kafka_provision_script} --print-interface-host' prints variable names."
+        return 1
+    fi
+
+    kafka_provision_passthrough=("${names[@]}")
+    return 0
+}
 
 # KAFKA_BROKERS as the SHELL supplied it, captured before anything can overwrite it:
 # showenv() sources ${env} ahead of main(), so an assignment there would replace it. Compose
@@ -671,6 +686,36 @@ effective_kafka_brokers() {
     fi
 }
 
+# Run docker compose with the EFFECTIVE broker list pinned, and with this stack's env file and
+# compose file already applied.
+#
+# EVERY COMPOSE INVOCATION IN THIS FILE GOES THROUGH HERE, and the reason is a cascade that made
+# the script and the containers disagree about the one value that decides whether Blnk publishes
+# at all.
+#
+# showenv() sources ${env} before main() runs. If the caller had already EXPORTED KAFKA_BROKERS,
+# that source does not shadow it - assigning to an exported name keeps the export attribute and
+# replaces the value, so every later child process inherits ${env}'s value. Meanwhile this script
+# decides with KAFKA_BROKERS_FROM_SHELL, captured before the source, which is correct: compose
+# resolves the shell environment ahead of --env-file. The two then differ. "KAFKA_BROKERS=broker-a
+# ./stack.sh -u" against a .env naming broker-b had this script wait for, authenticate to and
+# verify the catalogue on broker-a while the server and worker published to broker-b - and the
+# bring-up reported success.
+#
+# Pinning the value on the invocation removes the disagreement at its source rather than
+# reproducing the precedence rule in two places: compose prefers the invocation environment over
+# --env-file, so what it interpolates is exactly what effective_kafka_brokers decided. An empty
+# result is passed as an explicit empty value, which is the right answer and not an omission -
+# it is how "no brokers for this run" reaches the containers, and the compose files declare
+# ${KAFKA_BROKERS:-} so an empty value selects the documented no-op publisher.
+#
+# Going through one function is also what keeps it true: a compose call added later that forgets
+# the pin is visible as a call that does not use this helper.
+compose() {
+    KAFKA_BROKERS="$(effective_kafka_brokers)" \
+        ${COMPOSE_CL} --env-file "${env}" -f "${COMPOSE_FILE}" "$@"
+}
+
 # The container id backing a compose service, or nothing when that service has no container -
 # because $COMPOSE_FILE does not declare it, or because it was never started.
 #
@@ -682,10 +727,10 @@ effective_kafka_brokers() {
 compose_container_id() {
     local service="${1}" id=""
 
-    id="$(${COMPOSE_CL} --env-file "${env}" -f "${COMPOSE_FILE}" ps -aq "${service}" 2>/dev/null | head -n 1 || true)"
+    id="$(compose ps -aq "${service}" 2>/dev/null | head -n 1 || true)"
     if [ -z "${id}" ]
     then
-        id="$(${COMPOSE_CL} --env-file "${env}" -f "${COMPOSE_FILE}" ps -q "${service}" 2>/dev/null | head -n 1 || true)"
+        id="$(compose ps -q "${service}" 2>/dev/null | head -n 1 || true)"
     fi
 
     printf '%s' "${id}"
@@ -822,11 +867,12 @@ wait_for_kafka_init() {
 # restated - a second implementation is a second thing to drift.
 #
 # That script takes no arguments and reads everything from the environment, so the hand-off
-# below is the entire interface, and kafka_provision_passthrough at the top of this file is the
-# whole of it. Values are ${env}'s, because showenv sourced it before main ran. On a host the
+# below is the entire interface, and kafka_provision_passthrough is the whole of it — read from
+# the script's own "--print-interface-host" at startup rather than restated here, so it cannot
+# fall behind. Values are ${env}'s, because showenv sourced it before main ran. On a host the
 # Kafka CLI is normally absent; the script handles that itself by re-executing inside the broker
 # container over docker, and KAFKA_CONTAINER and KAFKA_PROVISION_CONTAINER_SCRIPT - both in the
-# allowlist - are what tell it where to go.
+# host-only half of that interface - are what tell it where to go.
 #
 # WHY THE FULL LIST MATTERS, with one variable as the illustration.
 # KAFKA_ALLOW_PARTITION_GROWTH is CONSENT to an operation that re-maps keys already written: add
@@ -836,7 +882,7 @@ wait_for_kafka_init() {
 # dropped it would have the same ${env} refuse a growth through one path and answer differently
 # through the other, decided by nothing more than whether this host has the Kafka CLI. Every
 # other name on that list has its own version of the same argument, which is why the list is
-# complete rather than curated.
+# read from the script rather than curated by hand.
 provision_kafka() {
     local brokers="${1}" service="${2}"
 
@@ -853,6 +899,17 @@ provision_kafka() {
     # KAFKA_SAMPLE_SUBSCRIBER_USER= would replace "blnk-sample-subscriber" with nothing and the
     # run would fail on an empty principal it was never given. ${!name+declared} tests
     # declaration rather than content, so an operator's deliberate empty value still crosses.
+    # An empty interface means resolve_kafka_provision_interface could not read the script's
+    # declaration, and it has already said so. Forwarding nothing would provision DEFAULTS and
+    # report success — the silent divergence this mechanism exists to remove — so it refuses.
+    if [ "${#kafka_provision_passthrough[@]}" -eq 0 ]
+    then
+        kafka_warn "the provisioning interface is empty, so nothing would be forwarded." \
+            "Provisioning was skipped rather than run with defaults." \
+            "Re-run once '${kafka_provision_script} --print-interface-host' prints variable names."
+        return 1
+    fi
+
     local assignments=() name
     for name in "${kafka_provision_passthrough[@]}"
     do
@@ -1051,7 +1108,7 @@ kafka_staging_applicable() {
     fi
 
     if ! COMPOSE_PROFILES="$(compose_profiles_with_kafka)" \
-        ${COMPOSE_CL} --env-file "${env}" -f "${COMPOSE_FILE}" config --services 2>/dev/null |
+        compose config --services 2>/dev/null |
         grep -qx "${KAFKA_COMPOSE_SERVICE:-kafka}"
     then
         return 1
@@ -1080,7 +1137,7 @@ stage_kafka() {
     # so only in passing. kafka_staging_applicable has already established that brokers are
     # configured, which is what makes selecting it correct rather than presumptuous.
     if ! COMPOSE_PROFILES="$(compose_profiles_with_kafka)" \
-        ${COMPOSE_CL} --env-file "${env}" -f "${COMPOSE_FILE}" up -d "${service}" "${init_service}"
+        compose up -d "${service}" "${init_service}"
     then
         kafka_error "the broker services could not be started, so nothing was provisioned." \
             "Read compose's own output above."
@@ -1138,7 +1195,7 @@ staged_up() {
     # stack without one does not. Passing nothing here would leave the broker unstarted for a
     # deployment that is publishing to it, and the relay retrying against nothing.
     COMPOSE_PROFILES="$(startup_compose_profiles)" \
-        ${COMPOSE_CL} --env-file "${env}" -f "${COMPOSE_FILE}" up -d "$@" || return 1
+        compose up -d "$@" || return 1
 
     if [ "${staged}" = "no" ]
     then
@@ -1218,23 +1275,29 @@ purge() {
     # actually removed. Without it a profiled service is excluded and the volume this
     # operation exists to discard survives - which is precisely the volume an operator runs
     # --purge to re-bootstrap.
-    COMPOSE_PROFILES="$(teardown_compose_profiles)" ${COMPOSE_CL} --env-file "${env}" -f "${COMPOSE_FILE}" down --volumes
+    COMPOSE_PROFILES="$(teardown_compose_profiles)" compose down --volumes
 }
 
 main() {
+    # Read the provisioning interface from the script that owns it, before any subcommand can
+    # need it. A failure here is reported by the resolver and is not fatal: provision_kafka
+    # refuses with its own message when the script is unusable, and every subcommand that does
+    # not provision is unaffected.
+    resolve_kafka_provision_interface || true
+
     case "${1}" in
         --pull | -p )
             docker image prune -a --force --filter "until=72h"
             # The start-up profile set, not the teardown one: pull what this stack would run.
             # Pulling the broker image for a stack that never starts it would cost several
             # hundred megabytes for nothing.
-            COMPOSE_PROFILES="$(startup_compose_profiles)" ${COMPOSE_CL} --env-file ${env} -f ${COMPOSE_FILE} pull "${@:2}"
+            COMPOSE_PROFILES="$(startup_compose_profiles)" compose pull "${@:2}"
             ;;
         --up | -u )
             staged_up "${@:2}"
             ;;
         --down | -d )
-            COMPOSE_PROFILES="$(teardown_compose_profiles)" ${COMPOSE_CL} --env-file ${env} -f ${COMPOSE_FILE} down
+            COMPOSE_PROFILES="$(teardown_compose_profiles)" compose down
             ;;
         --purge )
             purge "${@:2}"
@@ -1245,7 +1308,7 @@ main() {
         --restart | -r )
             # The teardown profile set, so a broker started by an earlier run is actually
             # stopped rather than left holding its port while the stack comes back up.
-            COMPOSE_PROFILES="$(teardown_compose_profiles)" ${COMPOSE_CL} --env-file ${env} -f ${COMPOSE_FILE} down
+            COMPOSE_PROFILES="$(teardown_compose_profiles)" compose down
             staged_up "${@:2}"
             ;;
         --init | -i )

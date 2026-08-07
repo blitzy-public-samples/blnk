@@ -295,7 +295,23 @@ type eventRelayStore interface {
 	// MarkEventFailed records one failed attempt, schedules the row's next due instant
 	// from retryAfter, and reports — decided in SQL, so two instances cannot both conclude
 	// they were last — whether the budget is now spent.
-	MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration) (model.EventFailureOutcome, error)
+	//
+	// terminal carries the PUBLISHER'S VERDICT that no further attempt can succeed, which is
+	// what makes the durable state agree with what the publisher already reported and
+	// metered. A permanent failure exhausts the row on whichever attempt it happened rather
+	// than spending the remaining budget rediscovering it.
+	MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, terminal bool) (model.EventFailureOutcome, error)
+
+	// ClaimPendingWebhookDeliveries claims rows whose KAFKA leg has finished — successfully
+	// or terminally — and whose LEGACY WEBHOOK leg is still owed, so a leg that failed
+	// alongside a Kafka publish is not lost behind a state the ordinary claim never
+	// revisits. Deleted at the sunset with the leg itself.
+	ClaimPendingWebhookDeliveries(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error)
+
+	// MarkEventLegacyWebhookAttempted records one failed legacy enqueue against a row whose
+	// Kafka leg has already finished, WITHOUT touching that leg's terminal state, and reports
+	// whether the legacy budget is now spent. Deleted at the sunset with the leg itself.
+	MarkEventLegacyWebhookAttempted(ctx context.Context, id int64, claimToken string, retryAfter time.Duration) (model.EventWebhookOutcome, error)
 
 	// MarkWebhookDispatched records the legacy leg of the dual-delivery window. It is
 	// conditional on the claim token, so it must run BEFORE MarkEventDispatched clears it.
@@ -646,7 +662,17 @@ func (p *EventRelayProcessor) startupObstacle() error {
 	// The message is event_sunset.go's, because that file owns the window and the
 	// vocabulary for explaining it; composing it here would put the names of the
 	// configured dates in a second place.
-	if err := WebhookWindowPendingObstacle(p.windowStateAt(p.now())); err != nil {
+	//
+	// BOTH refusable states are checked, not only the pending one. Reaching this line means
+	// a REAL publisher was accepted above — the no-op is refused, so Kafka is configured —
+	// and for such a deployment WebhookWindowUnavailable means the window is missing or
+	// unparseable, which the sunset helper fails closed on: it answers "already sunset", so
+	// the relay would publish to Kafka and enqueue NO legacy webhooks while configuration
+	// claimed a migration was still under way. That is the same silent loss as the pending
+	// case, arrived at from the other end of the window. config.resolveWebhookDeprecationWindow
+	// refuses to LOAD the combination, so this is a second line of defence for configuration
+	// that arrived some other way — a test writing to the store, or a future reload path.
+	if err := WebhookWindowObstacle(p.windowStateAt(p.now())); err != nil {
 		return err
 	}
 
@@ -824,6 +850,12 @@ func (p *EventRelayProcessor) processTick(ctx context.Context) {
 	// urgent work in the tick rather than the least. Putting it after the publish loop would
 	// also mean a sustained backlog — fifty chained batches — starved the repair entirely.
 	p.recoverUnpreservedDeadLetters(ctx)
+
+	// The LEGACY leg's own repair pass, for the same reasons and with the same shape. Its
+	// candidate set is likewise empty in normal operation and index-backed, and when it is not
+	// empty those rows are webhooks promised for the migration window that no other statement
+	// will ever pick up. SUNSET: deleted with the dual-delivery branch.
+	p.recoverOwedLegacyWebhooks(ctx)
 
 	for chained := 0; chained < maxEventRelayBatchesPerTick; chained++ {
 		if !p.shouldClaimAnotherBatch(ctx) {
@@ -1330,6 +1362,183 @@ func (p *EventRelayProcessor) recoverUnpreservedDeadLetters(ctx context.Context)
 	return repaired
 }
 
+// recoverOwedLegacyWebhooks finishes the LEGACY leg of rows whose Kafka leg has finished and
+// whose webhook enqueue never succeeded.
+//
+// SUNSET: deleted with the rest of the dual-delivery branch.
+//
+// # The events this exists for, and why nothing else reaches them
+//
+// The relay enqueues the legacy webhook before it publishes, and a failed enqueue is
+// deliberately swallowed so a webhook receiver being down cannot spend a Kafka retry attempt.
+// The caller then settles the row. Three settlements are possible and only ONE of them used to
+// carry the outstanding webhook forward:
+//
+//   - The publish SUCCEEDED. settleAfterKafkaSuccess routes the row through
+//     MarkEventWebhookPending, which moves it to webhook_pending — inside the main claim
+//     predicate — so the relay comes back for the webhook alone. This case was covered.
+//   - The publish FAILED with budget left. The row returns to pending and the whole row is
+//     retried, webhook included. Also covered.
+//   - The publish FAILED on the attempt that spent the budget. The row goes failed and then
+//     dead_lettered: terminal, token cleared, outside every claim predicate, with
+//     webhook_dispatched still FALSE. THE WEBHOOK WAS DISCARDED, silently, with one warning
+//     line as the only trace — and in the one circumstance where the webhook is the only
+//     transport that might still work, because the broker being unreachable is why the Kafka
+//     leg failed at all.
+//
+// This pass closes the third case. ClaimPendingWebhookDeliveries admits all three Kafka end
+// states, so the legacy obligation is durable and independently reclaimable no matter what the
+// Kafka leg did, which is what "both transports run for thirty days" has to mean to be worth
+// promising.
+//
+// # It does not touch the Kafka leg's state, ever
+//
+// MarkWebhookDispatched sets a flag; MarkEventLegacyWebhookAttempted increments a counter and
+// a due instant. Neither moves the status, so a dead-lettered event stays dead-lettered and
+// replayable, and a dispatched event is never re-published. That separation is the whole
+// reason the two legs have their own columns.
+//
+// # The window is consulted here, exactly as it is per row in deliverLegacyWebhook
+//
+// Outside the window there is no leg to finish: before the start the relay refuses to run, and
+// from the sunset onwards the promise has ended. Skipping the pass entirely is cheaper than
+// claiming rows and discarding them, and it means the sunset silences this pass on the same
+// boundary it silences the inline enqueue.
+//
+// Parameters:
+//   - ctx context.Context: cancels the claim and the enqueues.
+//
+// Returns:
+//   - int: how many outstanding webhook legs were enqueued on this pass.
+func (p *EventRelayProcessor) recoverOwedLegacyWebhooks(ctx context.Context) int {
+	if p.legacy == nil || !p.legacyLegDue(p.now()) {
+		return 0
+	}
+
+	rows, err := p.store.ClaimPendingWebhookDeliveries(
+		ctx, defaultEventRelayDeadLetterRecoveryBatch, p.lockDuration,
+	)
+	if err != nil {
+		logrus.WithError(err).Error(
+			"event relay: could not claim events whose legacy webhook leg is still owed; the legs " +
+				"stay recorded on their rows and are retried on a later poll",
+		)
+
+		return 0
+	}
+
+	if len(rows) == 0 {
+		return 0
+	}
+
+	logrus.WithField("claimed", len(rows)).Info(
+		"event relay: finishing the legacy webhook leg of events whose earlier enqueue failed",
+	)
+
+	delivered := 0
+
+	for _, row := range rows {
+		// Checked before each row rather than only at the top: this pass runs during the
+		// outages that produce its work, which is when a shutdown is most likely. Rows not
+		// yet attempted keep their lease and are re-claimed once it expires.
+		if !publishingMayProceed(ctx) {
+			break
+		}
+
+		if p.recoverOneOwedLegacyWebhook(ctx, row) {
+			delivered++
+		}
+	}
+
+	return delivered
+}
+
+// recoverOneOwedLegacyWebhook enqueues one outstanding legacy delivery and records the outcome.
+//
+// SUNSET: deleted with the rest of the dual-delivery branch.
+//
+// The bytes handed to the transport are row.Payload — the stored bytes, and the same bytes the
+// Kafka leg carried — so payload identity holds on the recovery path exactly as it does on the
+// ordinary one. The enqueue carries the event id as its task identity, so a re-claim after a
+// lost lease is refused by the queue as a duplicate rather than delivered twice.
+//
+// Parameters:
+//   - ctx context.Context: the pass context. The recording transitions run detached, so a
+//     shutdown cannot leave an enqueued webhook unrecorded.
+//   - row model.EventOutbox: the claimed row, carrying its stored payload and a fresh token.
+//
+// Returns:
+//   - bool: true when the delivery was enqueued.
+func (p *EventRelayProcessor) recoverOneOwedLegacyWebhook(ctx context.Context, row model.EventOutbox) bool {
+	// The attempt label is the WEBHOOK's count, not the Kafka one: this row's Kafka leg is
+	// finished and its attempt number would mislead an operator reading the line.
+	fields := p.rowFields(row, row.Attempts)
+	fields["webhook_attempts"] = row.WebhookAttempts
+	fields["webhook_max_attempts"] = p.rowMaxAttempts(row)
+	fields["row_status"] = row.Status
+
+	bookkeeping, cancel := detachedBookkeepingContext(ctx)
+	defer cancel()
+
+	if err := p.legacy.EnqueueLegacyWebhookDelivery(row.EventID, row.Payload); err != nil {
+		// The backoff is indexed by the WEBHOOK attempt count so the two legs walk the same
+		// curve while spending separate budgets, exactly as deferLegacyLeg does.
+		retryAfter := p.retry.backoffFor(row.WebhookAttempts + 1)
+
+		outcome, markErr := p.store.MarkEventLegacyWebhookAttempted(
+			bookkeeping, row.ID, row.ClaimToken, retryAfter,
+		)
+		if markErr != nil {
+			// The row keeps its lease and returns to this pass's candidate set when it
+			// expires. Nothing is lost, and nothing about the Kafka leg is affected.
+			logrus.WithFields(fields).WithError(markErr).Error(
+				"event relay: a failed legacy webhook recovery could not be recorded; the row keeps " +
+					"its lease and the leg is retried when it expires",
+			)
+
+			return false
+		}
+
+		fields["webhook_attempts"] = outcome.WebhookAttempts
+		fields["reason"] = relayFailureReason(err)
+
+		if outcome.Abandoned {
+			logrus.WithFields(fields).Error(
+				"event relay: the legacy webhook leg for this event is ABANDONED after exhausting its " +
+					"own enqueue budget. The webhook will never be delivered; any subscriber still " +
+					"consuming webhooks has missed this event",
+			)
+
+			return false
+		}
+
+		fields["retry_after"] = retryAfter.String()
+		logrus.WithFields(fields).Warn(
+			"event relay: recovering the legacy webhook leg of this event failed again; it is " +
+				"retried once its backoff elapses",
+		)
+
+		return false
+	}
+
+	if err := p.store.MarkWebhookDispatched(bookkeeping, row.ID, row.ClaimToken); err != nil {
+		// The task IS enqueued and will be delivered; only the marker is missing. A later
+		// pass re-enqueues under the same task identity, which the queue refuses as a
+		// duplicate, so this is an observability gap rather than a delivery defect.
+		logrus.WithFields(fields).WithError(err).Warn(
+			"event relay: a recovered legacy webhook was enqueued but the row could not be marked; " +
+				"a re-enqueue is suppressed by the task identity",
+		)
+	}
+
+	logrus.WithFields(fields).Info(
+		"event relay: the legacy webhook leg of an event whose earlier enqueue had failed is now " +
+			"enqueued; the event's Kafka state is untouched",
+	)
+
+	return true
+}
+
 // unpreservedDeadLetterCause reconstructs the failure to report for a row being repaired.
 //
 // The row's last_error is what ended its retry budget, and the failure metadata attached to
@@ -1483,29 +1692,26 @@ func (p *EventRelayProcessor) processRow(
 	publishCtx, cancelPublish := context.WithTimeout(ctx, eventRelayRowPublishBudget)
 	defer cancelPublish()
 
-	result, err := p.publisher.PublishToTopic(publishCtx, PublishRequest{
-		Event: model.LedgerEvent{
-			EventID:       row.EventID,
-			EventType:     row.EventType,
-			AggregateID:   row.AggregateID,
-			OccurredAt:    row.OccurredAt,
-			Payload:       row.Payload,
-			SchemaVersion: row.SchemaVersion,
-		},
-		// The topic and the key come from the ROW, through the publisher's own resolver, so
-		// a stored row is published to the destination it recorded even if the topic-naming
-		// configuration has changed since, and the key on the wire is the same value the
-		// claim serialised dispatch on.
-		Topic:   row.Topic,
-		Key:     resolvePartitionKey(PublishRequestFromOutbox(row, attempt)),
-		Attempt: attempt,
-		// The budget is passed so the publisher can tell a failure that still has attempts
-		// left from the one that spent the last of them, and so its log line reads
-		// "attempt 3 of 5".
-		MaxAttempts: p.rowMaxAttempts(row),
-		Purpose:     PublishPurposeOriginal,
-		ClaimedAt:   claimedAt,
-	})
+	// The request is built by the row-to-request conversion the dead-letter write and the
+	// replay both use, rather than assembled here. That is what puts THE STORED CANONICAL
+	// ENVELOPE on the wire: PublishRequestFromOutbox carries event_raw, so the bytes this
+	// publish sends are the bytes composed once at capture, and a retry, the dead-letter copy
+	// and a replay of the same row are byte-identical by construction rather than by the
+	// serialiser happening not to have changed between them. Assembling the envelope here
+	// re-composed it on every attempt, which produced the same bytes today and silently
+	// different bytes the first time an envelope member was added or reordered.
+	//
+	// It also settles the topic and the key from the ROW, so a stored row is published to the
+	// destination it recorded even if the topic-naming configuration has changed since, and
+	// the key on the wire is the same value the claim serialised dispatch on.
+	request := PublishRequestFromOutbox(row, attempt)
+	// The budget is passed so the publisher can tell a failure that still has attempts left
+	// from the one that spent the last of them, and so its log line reads "attempt 3 of 5".
+	request.MaxAttempts = p.rowMaxAttempts(row)
+	request.Purpose = PublishPurposeOriginal
+	request.ClaimedAt = claimedAt
+
+	result, err := p.publisher.PublishToTopic(publishCtx, request)
 
 	p.logAttempt(row, attempt, result, err)
 
@@ -1516,7 +1722,14 @@ func (p *EventRelayProcessor) processRow(
 		// and one that failed is retried on the next claim without having cost a Kafka
 		// attempt. Recording a webhook failure against a row that is going to be
 		// re-published anyway would spend the legacy budget on a Kafka outage.
-		p.recordFailedAttempt(ctx, row, attempt, err)
+		//
+		// THE PUBLISHER'S OWN VERDICT travels with the failure. It has already decided
+		// whether another attempt could succeed, and a permanent failure — an oversized
+		// envelope, bytes that are not valid JSON, a destination outside the namespace Blnk
+		// owns — must exhaust the row now rather than after the whole backoff schedule has
+		// rediscovered it. A webhook still owed when the row goes terminal is not abandoned
+		// by that: recoverOwedLegacyWebhooks reaches the row in every Kafka end state.
+		p.recordFailedAttempt(ctx, row, attempt, result, err)
 
 		return
 	}
@@ -1733,20 +1946,24 @@ func (p *EventRelayProcessor) rowMaxAttempts(row model.EventOutbox) int {
 //     on a detached context.
 //   - row model.EventOutbox: the claimed row.
 //   - attempt int: the 1-based attempt that just failed.
+//   - result PublishResult: the publisher's report of the attempt, read for its
+//     permanent-versus-transient verdict.
 //   - cause error: the publish failure.
 func (p *EventRelayProcessor) recordFailedAttempt(
 	ctx context.Context,
 	row model.EventOutbox,
 	attempt int,
+	result PublishResult,
 	cause error,
 ) {
 	retryAfter := p.retry.backoffFor(attempt)
 	reason := relayFailureReason(cause)
+	terminal := publishFailureIsTerminal(result, cause)
 
 	bookkeeping, cancel := detachedBookkeepingContext(ctx)
 	defer cancel()
 
-	outcome, err := p.store.MarkEventFailed(bookkeeping, row.ID, row.ClaimToken, reason, retryAfter)
+	outcome, err := p.store.MarkEventFailed(bookkeeping, row.ID, row.ClaimToken, reason, retryAfter, terminal)
 	if err != nil {
 		logrus.WithFields(p.rowFields(row, attempt)).WithError(err).Error(
 			"event relay: recording a failed publish attempt failed; the row keeps its lease and " +
@@ -1768,6 +1985,23 @@ func (p *EventRelayProcessor) recordFailedAttempt(
 		}).Warn("event relay: publish failed and the event is scheduled for another attempt")
 
 		return
+	}
+
+	// WHY the budget is spent, stated on the line rather than left to be inferred from the
+	// numbers. "attempt 1 of 5, exhausted" reads as a bookkeeping defect unless the line also
+	// says the failure was permanent, which is the one case where it is the correct outcome.
+	exhaustionFields := p.rowFields(row, attempt)
+	exhaustionFields["terminal"] = outcome.Terminal
+	exhaustionFields["attempts"] = outcome.Attempts
+	exhaustionFields["max_attempts"] = p.rowMaxAttempts(row)
+	exhaustionFields["error"] = reason
+
+	if outcome.Terminal {
+		logrus.WithFields(exhaustionFields).Warn(
+			"event relay: the publish failed PERMANENTLY, so the remaining retry budget is " +
+				"abandoned and the event goes straight to its dead-letter topic; no retry could " +
+				"change this outcome",
+		)
 	}
 
 	// The budget is spent. The row is already failed, and the claim token MarkEventFailed
@@ -2024,6 +2258,45 @@ func (p *EventRelayProcessor) rowFields(row model.EventOutbox, attempt int) logr
 		"max_attempts": p.rowMaxAttempts(row),
 		"outbox_id":    row.ID,
 	}
+}
+
+// publishFailureIsTerminal reads the publisher's verdict on whether another attempt could
+// succeed, and reports the answer the durable transition needs.
+//
+// # Why the verdict is the publisher's and not the relay's
+//
+// The publisher is the only thing that knows what failed. It classifies a failure at the
+// moment it happens and reports PublishStatusDeadLettered for one no retry can fix — an
+// envelope over the size ceiling, bytes that are not valid JSON, a destination outside the
+// topic namespace Blnk owns. Re-deriving that here would mean re-classifying broker errors in
+// a second place, and the two copies would disagree the first time either changed.
+//
+// # Both signals are read, and "unknown" resolves to TERMINAL
+//
+// The result carries the classification for every publish that came out of this pipeline; the
+// error carries it too, for a caller holding only an error. Either saying "transient" is
+// enough to keep retrying. Neither saying so means the failure is not recognisably
+// recoverable, and this file resolves that to terminal for the reason
+// IsTransientPublishError documents: guessing "retryable" for an unrecognised failure invites
+// an unbounded retry of something that can never succeed.
+//
+// Terminal is a SAFE default here in a way it would not be elsewhere, and that is what makes
+// the choice defensible rather than merely conventional: it does not discard the event. The
+// row goes to failed, the dead-letter write preserves the event on its `<topic>.dlt` sibling
+// with its failure metadata, and it stays listable and replayable through the dead-letter
+// API. The cost of being wrong is an earlier dead-letter and an operator-triggered replay.
+// The cost of the opposite mistake is the whole backoff schedule spent on a message that can
+// never be published, with the event unpreserved and invisible throughout.
+//
+// Parameters:
+//   - result PublishResult: the publisher's report of the attempt. A zero value states
+//     nothing, which is one of the two "unknown" inputs.
+//   - cause error: the failure returned alongside it.
+//
+// Returns:
+//   - bool: true when no further attempt should be made.
+func publishFailureIsTerminal(result PublishResult, cause error) bool {
+	return !result.Transient && !IsTransientPublishError(cause)
 }
 
 // relayFailureReason renders a publish failure as text that is safe to log AND safe to store

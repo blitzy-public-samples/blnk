@@ -542,18 +542,15 @@ type DeadLetterListOptions struct {
 	// having to know the suffix convention.
 	Topic string
 
-	// Status narrows to one failure state. Only the three states the inventory contains
-	// are accepted — model.EventOutboxStatusDeadLettered, model.EventOutboxStatusDLTPending
-	// and model.EventOutboxStatusFailed — and anything else is rejected as a validation
-	// error rather than silently matching nothing, because a filter that quietly returns
-	// an empty page reads as "nothing is stuck" and is exactly the wrong answer to give
-	// an operator.
+	// Status narrows to one failure state. Only the two states the inventory contains are
+	// accepted — model.EventOutboxStatusFailed and model.EventOutboxStatusDeadLettered —
+	// and anything else is rejected as a validation error rather than silently matching
+	// nothing, because a filter that quietly returns an empty page reads as "nothing is
+	// stuck" and is exactly the wrong answer to give an operator.
 	//
-	// failed is the most urgent of the three and is filterable for that reason: the retry
+	// failed is the more urgent of the two and is filterable for that reason: the retry
 	// budget is spent and, while dlt_topic is still NULL, the dead-letter copy has not
-	// landed, so the event exists nowhere but the outbox row. dlt_pending is the literal an
-	// earlier shape of this feature used for the same state; it is accepted so that a row
-	// left in it is still findable, and nothing writes it now.
+	// landed, so the event exists nowhere but the outbox row.
 	Status string
 }
 
@@ -598,9 +595,8 @@ type DeadLetterAgeReport struct {
 	// them into one number makes a broker that is refusing dead-letter writes look exactly
 	// like a busy triage queue.
 	//
-	// It counts BOTH pre-dead-letter literals: failed, which the exhaustion arm sets and in
-	// which the hand-off is still re-claimable while dlt_topic is NULL, and dlt_pending,
-	// the literal an earlier shape of this feature used for the same state. A steadily
+	// It counts the one pre-dead-letter literal: failed, which the exhaustion arm sets and in
+	// which the hand-off stays re-claimable for as long as dlt_topic is NULL. A steadily
 	// non-zero value means dead-letter writes are failing, not that events are momentarily
 	// in flight.
 	FailedAwaitingDeadLetter int64
@@ -1158,9 +1154,10 @@ func (s *EventDeadLetterService) Close() error {
 // the precondition for replaying an event byte-for-byte. Folding the metadata into the
 // envelope and subtracting it later would not survive the round trip through a Go struct.
 //
-// The destination is resolved with DLTFor and never composed here, so the four published
-// names — blnk.transactions.dlt, blnk.balances.dlt, blnk.identities.dlt and
-// blnk.system.dlt under the default prefix — have exactly one source of truth. The
+// The destination is resolved with DLTFor and never composed here, so the five published
+// names — blnk.transactions.dlt, blnk.balances.dlt, blnk.identities.dlt,
+// blnk.ledgers.dlt and blnk.system.dlt under the default prefix — have exactly one
+// source of truth. The
 // message keeps the ORIGINAL PARTITION KEY, so the dead-letter topic preserves the same
 // per-aggregate ordering as the topic the event failed to reach.
 //
@@ -2275,15 +2272,12 @@ func (s *EventDeadLetterService) RefreshDeadLetterAgeGauge(ctx context.Context) 
 	// A status with no rows is absent from the map rather than present with a zero, so
 	// the two-value read is not optional here.
 	//
-	// BOTH pre-dead-letter states are counted. failed with no dlt_topic is where a row waits
-	// for its `<topic>.dlt` write, which is what the exhaustion arm sets; dlt_pending is the
-	// literal an earlier shape of this feature wrote for the same thing and nothing writes
-	// now. Counting only one of them would under-report exactly
-	// the population this figure exists to surface — events whose only copy is the outbox
-	// row — and would leave the age scan below skipped whenever every stuck row was in the
-	// uncounted state.
-	report.FailedAwaitingDeadLetter = counts[model.EventOutboxStatusDLTPending] +
-		counts[model.EventOutboxStatusFailed]
+	// failed WITH NO dlt_topic is where a row waits for its `<topic>.dlt` write, and it is the
+	// only such state: that pair is what the exhaustion arm writes and what
+	// ClaimFailedEventOutboxForDeadLetter selects. This figure exists to surface exactly that
+	// population — events whose only copy is the outbox row — so under-counting it would also
+	// skip the age scan below whenever every stuck row was uncounted.
+	report.FailedAwaitingDeadLetter = counts[model.EventOutboxStatusFailed]
 	report.Outstanding = counts[model.EventOutboxStatusDeadLettered] + report.FailedAwaitingDeadLetter
 
 	if report.Outstanding > 0 {
@@ -2766,10 +2760,15 @@ func ComposeDeadLetterMessage(row model.EventOutbox, metadata json.RawMessage) (
 		)
 	}
 
-	// The publish path's own serialiser, reached through the same row-to-request
-	// conversion the relay uses, so a dead-letter message and the message that failed are
-	// produced by one code path. The attempt argument is not part of the value.
-	envelope, err := marshalLedgerEvent(PublishRequestFromOutbox(row, 1).Event)
+	// THE STORED CANONICAL ENVELOPE, spliced onto rather than rebuilt. These are the bytes
+	// the broker was given — or would have been given — so the dead-letter copy differs from
+	// the message that failed by exactly one member, which is what requirement R-5 asks for
+	// and what a byte comparison in event_replay_fidelity_test.go asserts. Re-serialising
+	// here would make that equality hold only within one build of Blnk.
+	//
+	// The fallback inside CanonicalEventBytes covers a row written before the column
+	// existed; it composes the same bytes this version stores.
+	envelope, _, err := row.CanonicalEventBytes()
 	if err != nil {
 		return nil, apierror.NewAPIError(
 			apierror.ErrInternalServer,
@@ -2887,17 +2886,15 @@ func normalizeDeadLetterListOptions(opts DeadLetterListOptions) (DeadLetterListO
 	switch opts.Status {
 	case "",
 		model.EventOutboxStatusDeadLettered,
-		model.EventOutboxStatusDLTPending,
 		model.EventOutboxStatusFailed:
 		return opts, nil
 	default:
 		return opts, apierror.NewAPIError(
 			apierror.ErrGenValidation,
 			fmt.Sprintf(
-				"A dead-letter status filter must be %q, %q or %q",
-				model.EventOutboxStatusDeadLettered,
-				model.EventOutboxStatusDLTPending,
+				"A dead-letter status filter must be %q or %q",
 				model.EventOutboxStatusFailed,
+				model.EventOutboxStatusDeadLettered,
 			),
 			fmt.Errorf("blnk: unsupported dead-letter status filter %q", opts.Status),
 		)

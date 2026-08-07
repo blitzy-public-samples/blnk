@@ -235,6 +235,25 @@ func (l *Blnk) sendBulkTransactionWebhook(ctx context.Context, batchID, status, 
 			return nil
 		}
 
+		// A CONFLICT IS NOT RETRYABLE, and retrying one is worse than useless. It means the
+		// unique index on event_id refused this insert, and the repository has already
+		// distinguished the two ways that happens: an identical event already recorded is
+		// reported as SUCCESS, so it never reaches here, and anything that does reach here is a
+		// genuine id collision that no number of further attempts can resolve. Spending the
+		// remaining attempts and their backoff on it only delays the error the caller needs.
+		if isConflictError(lastErr) {
+			logrus.WithError(lastErr).WithFields(logrus.Fields{
+				"batch_id": batchID,
+				"status":   status,
+				"attempt":  attempt,
+			}).Error(
+				"the bulk transaction outcome event was refused as a duplicate that is not an " +
+					"identical event; the id has been reused and no retry can resolve it",
+			)
+
+			return lastErr
+		}
+
 		logrus.WithError(lastErr).WithFields(logrus.Fields{
 			"batch_id":     batchID,
 			"status":       status,

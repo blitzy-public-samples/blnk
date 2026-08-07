@@ -84,10 +84,12 @@ var expectedEventTopics = []string{
 	"blnk.transactions",
 	"blnk.balances",
 	"blnk.identities",
+	"blnk.ledgers",
 	"blnk.system",
 	"blnk.transactions.dlt",
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
+	"blnk.ledgers.dlt",
 	"blnk.system.dlt",
 }
 
@@ -932,14 +934,14 @@ func TestEventTopicInventory_MatchesTheSingleSourceOfTruth(t *testing.T) {
 		"the inventory this file asserts against must be exactly the inventory event_topics.go composes, "+
 			"so the test and the implementation share one source of truth")
 
-	const categoryCount = 4
+	const categoryCount = 5
 
 	require.Len(t, expectedEventTopics, categoryCount*2,
-		"four category topics and one dead-letter sibling each")
+		"five category topics and one dead-letter sibling each")
 	assert.Equal(t, expectedEventTopics[:categoryCount], AllTopics(),
-		"the first four entries are the category topics, in canonical provisioning order")
+		"the first five entries are the category topics, in canonical provisioning order")
 	assert.Equal(t, expectedEventTopics[categoryCount:], AllDeadLetterTopics(),
-		"the last four entries are their dead-letter siblings, in the same order")
+		"the last five entries are their dead-letter siblings, in the same order")
 
 	categories := EventCategories()
 	require.Len(t, categories, categoryCount,
@@ -3740,8 +3742,8 @@ func TestNormalizeTopicList_DropsBlanksAndDuplicatesInOrder(t *testing.T) {
 func TestMissingTopics_NamesTheAbsentOnesInRequestedOrder(t *testing.T) {
 	present := map[string][]int{"blnk.transactions": {0}, "blnk.balances": {0}}
 
-	assert.Equal(t, []string{"blnk.identities", "blnk.system"},
-		missingTopics([]string{"blnk.transactions", "blnk.identities", "blnk.balances", "blnk.system"}, present))
+	assert.Equal(t, []string{"blnk.identities", "blnk.ledgers", "blnk.system"},
+		missingTopics([]string{"blnk.transactions", "blnk.identities", "blnk.balances", "blnk.ledgers", "blnk.system"}, present))
 	assert.Nil(t, missingTopics([]string{"blnk.transactions"}, present))
 	assert.Equal(t, []string{"blnk.transactions"}, missingTopics([]string{"blnk.transactions"}, nil))
 }

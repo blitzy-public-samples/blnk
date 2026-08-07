@@ -196,17 +196,6 @@ const (
 	// that is failing to claim.
 	orderingRelayLockDuration = 30 * time.Second
 
-	// relayContentionLease is the lease the two-relay contention test runs on, and it is
-	// deliberately absurd.
-	//
-	// A lease is meant to outlive the work it protects. Two milliseconds cannot: it has
-	// effectively lapsed by the time a produce request returns, so both relays hold a claim on
-	// the same row for most of the row's life and the at-least-once window is open
-	// continuously. That is the point — the ordering guarantee is asserted under the harshest
-	// lease the design admits, not under one that makes contention theoretical. The production
-	// default is orderingRelayLockDuration, four orders of magnitude larger.
-	relayContentionLease = 2 * time.Millisecond
-
 	// orderingDispatchTimeout bounds the wait for every published row to reach its
 	// dispatched terminal state.
 	//
@@ -759,21 +748,10 @@ func newOrderingFixture(t *testing.T) *orderingFixture {
 	}
 
 	// A cluster that authenticates needs a PRODUCER principal, not just an administrative one.
-	// Blnk refuses to publish as the administrator — that principal can create topics, alter
-	// SCRAM credentials and manage ACLs, so a leaked producer credential would compromise the
-	// cluster's authorization state — and construction fails outright rather than quietly
-	// falling back. Skipping here turns that into a shopping list instead of an obscure failure
-	// several hundred lines into the run.
-	if strings.TrimSpace(os.Getenv("KAFKA_SASL_ADMIN_USER")) != "" &&
-		strings.TrimSpace(os.Getenv("KAFKA_SASL_USER")) == "" {
-		t.Skip(
-			"event ordering integration test: KAFKA_SASL_ADMIN_USER is set but KAFKA_SASL_USER is " +
-				"not. Blnk will not publish as the administrative principal, so a dedicated producer " +
-				"principal with Write and Describe on the Blnk-owned topics is required; " +
-				"scripts/kafka-provision.sh creates one for the local stack. Export KAFKA_SASL_USER " +
-				"and KAFKA_SASL_SECRET",
-		)
-	}
+	// Blnk refuses to publish as the administrator, and construction fails outright rather than
+	// quietly falling back, so this is checked here — through the one helper that owns the
+	// predicate — instead of failing several hundred lines into the run.
+	orderingSkipUnlessProducerPrincipal(t)
 
 	dsn := orderingEnvOr("BLNK_DATA_SOURCE_DNS", orderingFallbackPostgresDSN)
 	orderingSkipUnlessReachable(t, orderingHostFromDSN(dsn), "PostgreSQL", "BLNK_DATA_SOURCE_DNS")
@@ -1702,10 +1680,11 @@ func TestEventOrdering_EventsSharingAnAggregateAreConsumedInPublishOrder(t *test
 // ordering rather than per-ledger ordering and puts a value that is not a ledger id in the
 // row's ledger column, while a test that injected the option reported the requirement as met.
 //
-// So this drives buildTransactionExecutionWork — the function the single and the coalesced
-// execution paths BOTH build their work from — and asserts what it produces. It needs no
-// broker and no database: preparing a row is a marshal and no I/O, which is what lets this
-// run everywhere rather than only where the integration fixture is reachable.
+// So this drives prepareTransactionEventOutbox — the SINGLE place a transaction's event row is
+// built, reached both by the atomic writer's caller before the write and by the post-commit
+// fallback — and asserts what it produces. It needs no broker and no database: preparing a row
+// is a marshal and no I/O, which is what lets this run everywhere rather than only where the
+// integration fixture is reachable.
 func TestEventOrdering_ProductionCaptureKeysTransactionEventsByLedgerID(t *testing.T) {
 	// Kafka brokers make event capture configured, and the deprecation window has to be
 	// stated alongside them: the loader refuses brokers without one, so MockConfig would
@@ -1713,10 +1692,15 @@ func TestEventOrdering_ProductionCaptureKeysTransactionEventsByLedgerID(t *testi
 	// reason rather than a keying one. No broker is contacted — preparing a row performs
 	// no I/O at all.
 	config.MockConfig(&config.Configuration{
-		DataSource:                  config.DataSourceConfig{Dns: "postgres://localhost:5432/blnk?sslmode=disable"},
-		Redis:                       config.RedisConfig{Dns: "localhost:6379"},
-		Kafka:                       config.KafkaConfig{Brokers: []string{"localhost:9092"}, TopicPrefix: "blnk"},
-		WebhookDeprecationStartDate: time.Now().UTC().Format(time.RFC3339),
+		DataSource: config.DataSourceConfig{Dns: "postgres://localhost:5432/blnk?sslmode=disable"},
+		Redis:      config.RedisConfig{Dns: "localhost:6379"},
+		Kafka:      config.KafkaConfig{Brokers: []string{"localhost:9092"}, TopicPrefix: "blnk"},
+		// The SUNSET is the only end that is configurable, and it is REQUIRED alongside
+		// brokers: the loader refuses a publishing deployment with no usable window, and
+		// MockConfig runs the same validation, so omitting it would store nothing and every
+		// assertion below would fail for a configuration reason rather than a keying one.
+		// The start is derived from it as sunset minus the 30-day window.
+		WebhookDeprecationSunsetDate: time.Now().UTC().Add(30 * 24 * time.Hour).Format(time.RFC3339),
 	})
 
 	loaded, err := config.Fetch()
@@ -1755,19 +1739,23 @@ func TestEventOrdering_ProductionCaptureKeysTransactionEventsByLedgerID(t *testi
 
 	work, skipped := instance.buildTransactionExecutionWork(ctx, transaction, sourceBalance, destinationBalance)
 	require.False(t, skipped, "a non-zero-amount transaction must produce persistable work")
-	require.NotNil(t, work.eventOutbox,
+	require.NotNil(t, work.transaction, "the work item must carry the finalised transaction")
+
+	eventOutbox, err := instance.prepareTransactionEventOutbox(ctx, work.transaction, sourceBalance, destinationBalance)
+	require.NoError(t, err, "a well-formed transaction payload must serialise")
+	require.NotNil(t, eventOutbox,
 		"the production execution path must PREPARE the transaction's event before the write; a nil row here means the event is captured after the commit again, outside the mutation's transaction")
 
-	assert.Equal(t, ledgerID, work.eventOutbox.PartitionKey,
+	assert.Equal(t, ledgerID, eventOutbox.PartitionKey,
 		"the Kafka message key must be the LEDGER id, which is requirement R-6's partitioning dimension; the source balance id keyed by the old fallback is what this asserts against")
-	assert.Equal(t, ledgerID, work.eventOutbox.LedgerID,
+	assert.Equal(t, ledgerID, eventOutbox.LedgerID,
 		"and the row's ledger column must record that same authoritative ledger rather than NULL or a balance id")
-	assert.NotEqual(t, sourceBalance.BalanceID, work.eventOutbox.PartitionKey,
+	assert.NotEqual(t, sourceBalance.BalanceID, eventOutbox.PartitionKey,
 		"a balance id as the key is the exact defect this test exists to catch")
-	assert.Equal(t, "transaction.applied", work.eventOutbox.EventType,
+	assert.Equal(t, "transaction.applied", eventOutbox.EventType,
 		"the event string is still the status-derived one, unchanged by the keying")
-	assert.False(t, work.eventCaptured,
-		"nothing is captured until an atomic writer has committed it; the flag is set by the writer, not by preparation")
+	assert.Equal(t, model.EventOutboxStatusPending, eventOutbox.Status,
+		"nothing is dispatched until the relay has published it; preparation only ever yields a pending row")
 
 	t.Run("the ledger resolution prefers the source balance and falls back to the destination", func(t *testing.T) {
 		assert.Equal(t, ledgerID, transactionLedgerID(sourceBalance, destinationBalance),

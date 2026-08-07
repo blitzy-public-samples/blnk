@@ -120,41 +120,6 @@ func initializeRedisClients(config *config.Configuration) (redis.UniversalClient
 	return redisClient.Client(), asynqClient, nil
 }
 
-// closeInitializedRedisClients releases the two pooled clients initializeRedisClients built.
-//
-// It exists for the construction error paths in NewBlnk. Both clients own descriptors and
-// background goroutines from the moment they are created, so an error exit that returns without
-// closing them leaks a pair per attempt — and the attempts that reach such an exit are exactly
-// the ones a supervised process repeats, because they are configuration failures.
-//
-// Failures are LOGGED, never returned. The caller is already on its way out with the error the
-// operator has to read, and replacing that with "closing redis failed" would hide the real
-// problem behind cleanup noise. A nil client is skipped, so the helper is safe to call from any
-// point after construction.
-//
-// Parameters:
-//   - redisClient redis.UniversalClient: the client to close. May be nil.
-//   - asynqClient *asynq.Client: the client to close. May be nil.
-func closeInitializedRedisClients(redisClient redis.UniversalClient, asynqClient *asynq.Client) {
-	if asynqClient != nil {
-		if err := asynqClient.Close(); err != nil {
-			logrus.WithError(err).Warn(
-				"blnk: closing the asynq client after a failed initialization; its connections are " +
-					"released when the process exits",
-			)
-		}
-	}
-
-	if redisClient != nil {
-		if err := redisClient.Close(); err != nil {
-			logrus.WithError(err).Warn(
-				"blnk: closing the redis client after a failed initialization; its connections are " +
-					"released when the process exits",
-			)
-		}
-	}
-}
-
 // closeInitializedEventPublisher releases the publisher initializeEventPublisher built.
 //
 // It exists for the ONE construction error path in NewBlnk that now sits after the publisher:
@@ -163,10 +128,10 @@ func closeInitializedRedisClients(redisClient redis.UniversalClient, asynqClient
 // topic, and every writer holds a shared transport with a connection pool and a background
 // goroutine behind it.
 //
-// Failures are LOGGED, never returned, for the same reason closeInitializedRedisClients logs
-// its own: the caller is already on its way out with the error the operator has to read. A nil
-// publisher is skipped, and the no-op publisher's Close is a no-op, so this is safe on every
-// path.
+// Failures are LOGGED, never returned: the caller is already on its way out with the error the
+// operator has to read, and replacing that with "closing the publisher failed" would hide the
+// real problem behind cleanup noise. A nil publisher is skipped, and the no-op publisher's
+// Close is a no-op, so this is safe on every path.
 //
 // The parameter is the MANDATED narrow interface rather than TopicEventPublisher, matching
 // what initializeEventPublisher returns, and Close is reached by assertion. That keeps the

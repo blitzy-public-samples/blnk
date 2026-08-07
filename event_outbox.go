@@ -121,6 +121,44 @@ const defaultEventMaxAttempts = 5
 // trivial to spot in the outbox: `WHERE ledger_id = 'blnk.unkeyed'`.
 const unkeyedEventPartitionKey = "blnk.unkeyed"
 
+// postCommitEventPublishSem bounds how many post-commit event captures may be in
+// flight at once, across every transaction and balance in the process.
+//
+// # What is unbounded without it
+//
+// The post-commit hooks that publish an event spawn one goroutine per occurrence and
+// nothing else limits how many can exist together. That was survivable while such a
+// goroutine only enqueued into Redis, and stopped being survivable once it also had to
+// reach PostgreSQL: at 500 events per second against a database that has begun to
+// stall, the arrival rate is fixed and the completion rate is not, so goroutines
+// accumulate without limit, each holding a connection request, until the process is
+// killed for memory. Nothing in the logs says why, because nothing failed.
+//
+// The balance-monitor fan-out is the worst shape of it. One balance can carry many
+// monitors and many of them can fire on one update, so the number of goroutines is a
+// PRODUCT of two counts rather than one per transaction.
+//
+// # Acquiring in the caller is the point
+//
+// The permit is taken BEFORE the goroutine is spawned, so a saturated database is felt
+// by the producer as backpressure rather than absorbed as unbounded queueing. That is
+// what balanceMonitorSem already does for the monitor checks themselves, for the same
+// reason: the only safe response to work arriving faster than it can be completed is to
+// slow the arrivals down.
+//
+// # Why 64
+//
+// The work behind one permit is a single indexed INSERT — single-digit milliseconds on a
+// healthy system — so 64 in flight clears far more than the 500 events per second
+// requirement V-1 states. It is deliberately larger than balanceMonitorSem's 32 because
+// a monitor check is a read that can be deferred, while this work carries an event
+// capture that must not queue behind unrelated reads.
+//
+// It lives here rather than beside balanceMonitorSem because it belongs to the event
+// pipeline: the transaction pipeline's own files are frozen by AAP §0.6.2, and a bound
+// that this feature introduced belongs in a file this feature owns.
+var postCommitEventPublishSem = make(chan struct{}, 64)
+
 // eventConfiguration reads the configuration this file needs, tolerating both an
 // uninitialised Blnk instance and an unloaded configuration store.
 //
@@ -1006,6 +1044,39 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 		MaxAttempts: eventMaxAttempts(cnf),
 	}
 
+	// THE CANONICAL EVENT VALUE IS PRODUCED ONCE, HERE, and everything downstream reuses
+	// these bytes: the Kafka publish, the dead-letter copy (which splices failure metadata
+	// onto them) and a dead-letter replay. Nothing re-marshals the envelope.
+	//
+	// That is what makes requirement R-5's byte-for-byte replay a property of the DATA
+	// rather than of this serialiser never changing. Rebuilding the envelope at publish time
+	// gave byte equality only within one build: add a member, reorder one, or upgrade the
+	// encoder, and every row already captured would replay as different bytes, silently,
+	// because the two values stay semantically equal.
+	//
+	// It is composed AFTER every envelope field above is final — the derived event id, the
+	// resolved aggregate, the UTC occurrence instant and the schema version are all members
+	// of it — so this line cannot move earlier.
+	//
+	// A failure here is the same failure the payload marshal above reports, on the same
+	// terms: the payload is not valid JSON, which is a producer defect rather than a
+	// transient condition, and the caller must see it.
+	canonical, err := outbox.CanonicalEvent().CanonicalBytes()
+	if err != nil {
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"event_id":   outbox.EventID,
+			"event_type": outbox.EventType,
+		}).Error("event not captured: its canonical envelope could not be composed")
+		span.RecordError(err)
+
+		return nil, apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"The event could not be serialized into its canonical envelope",
+			fmt.Errorf("blnk: composing the canonical envelope of event %q: %w", outbox.EventID, err),
+		)
+	}
+	outbox.EventRaw = canonical
+
 	// AN UNCATALOGUED EVENT TYPE IS A DEFECT SIGNAL, and this is where it is raised.
 	//
 	// model.EventCategory routes an event type it does not recognise to the internal
@@ -1138,10 +1209,10 @@ func (l *Blnk) PublishEventInTx(ctx context.Context, tx *sql.Tx, event NewWebhoo
 // the no-op publisher — so capturing a row there would be capturing a row that nothing
 // can ever drain. Such a deployment is routed straight to SendWebhook, which is the exact
 // call every producer made before this feature existed, so its behaviour is unchanged
-// (AAP §0.5.4, "KAFKA_BROKERS empty → legacy path unchanged"). See
-// legacyWebhookOnlyDelivery and deliverLegacyWebhookOnly.
+// (AAP §0.5.4, "KAFKA_BROKERS empty → legacy path unchanged"), subject to the sunset. The
+// whole of it lives in deliverLegacyWebhookOnly, which this delegates to.
 //
-// The branch is taken ONLY when tx is nil. An enqueue cannot be rolled back with the
+// The delegate delivers ONLY when tx is nil. An enqueue cannot be rolled back with the
 // caller's transaction, so on the in-transaction path this deployment captures nothing and
 // delivers nothing, and the caller's post-commit path delivers instead.
 //
@@ -1186,32 +1257,14 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook, o
 	// the caller's POST-COMMIT path is what delivers the event. That is what
 	// publishEntityEventWhenUncaptured does at the three entity producers, and what the
 	// atomic transaction writers' callers do for the rest.
-	if cnf := l.eventConfiguration(); tx == nil && !eventPublishingConfigured(cnf) && legacyWebhookOnly(cnf) {
-		span.AddEvent("Event delivered over the legacy webhook transport; no Kafka broker is configured")
+	if cnf := l.eventConfiguration(); !eventPublishingConfigured(cnf) && legacyWebhookOnly(cnf) {
+		span.AddEvent("Routed to the legacy webhook transport; no Kafka broker is configured")
 
-		if l == nil {
-			return nil
-		}
-
-		// The queue client is what the legacy transport enqueues onto, and a nil one means
-		// there is no transport at all on a deployment that asked for one. Reported as an
-		// error rather than skipped, for the same reason the missing-datasource arm below
-		// is: every event would be dropped, permanently and invisibly, while every caller
-		// was told it had succeeded.
-		if l.asynqClient == nil {
-			err := apierror.NewAPIError(
-				apierror.ErrInternalServer,
-				"A legacy webhook URL is configured but no queue client is available to deliver the event",
-				fmt.Errorf("blnk: event %q cannot be delivered: the Blnk instance has no asynq client", event.Event),
-			)
-			logrus.WithField("event_type", event.Event).WithError(err).
-				Error("event not delivered: a webhook URL is configured but this Blnk instance has no queue client")
-			span.RecordError(err)
-
-			return err
-		}
-
-		return l.SendWebhook(event)
+		// ONE implementation, reached from here. This branch used to be written out inline
+		// alongside deliverLegacyWebhookOnly, which had no caller — two copies of a
+		// delivery decision, of which only one consulted the sunset. See that function for
+		// the in-transaction skip, the nil-queue arm and the sunset gate.
+		return l.deliverLegacyWebhookOnly(ctx, tx, event)
 	}
 
 	outbox, err := l.PrepareEventOutbox(ctx, event, options...)
@@ -1341,6 +1394,22 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook, o
 // PublishEventInTx, which is why the trace records the skip and why the method's own
 // documentation states it.
 //
+// # THE SUNSET IS CONSULTED HERE, through the same helper every other consumer uses
+//
+// This is a legacy HTTP enqueue, so it is subject to requirement R-12's retirement exactly
+// as the relay's dual-delivery leg is. It previously was not: the branch compared nothing
+// against the sunset, so a deployment with a webhook URL, no brokers and a sunset date long
+// past kept delivering over a transport that was supposed to be gone — while the relay and
+// the 410 guard on a Kafka deployment both treated it as retired. Two callers of one
+// decision, one of which did not ask.
+//
+// The predicate is blnk.WebhookSunsetPassedNow, which reads event_sunset.go's single
+// comparison. It answers false — legacy continues — when no window is configured AND no
+// Kafka transport exists, which is the ordinary state of a webhook-only deployment that has
+// not scheduled a retirement; it answers true once a configured, parseable sunset instant has
+// arrived. So nothing changes for a deployment that never opted into the migration, and the
+// date is honoured for one that did.
+//
 // Every other property of the legacy path is inherited from SendWebhook untouched: it
 // no-ops on an empty URL, it marshals the same NewWebhook value the HTTP body has always
 // been, and asynq owns the delivery retry.
@@ -1353,7 +1422,8 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook, o
 //   - event NewWebhook: the event name and payload object, forwarded verbatim.
 //
 // Returns:
-//   - error: whatever SendWebhook reports, or nil on the in-transaction skip.
+//   - error: whatever SendWebhook reports, or nil on the in-transaction skip and on the
+//     post-sunset skip.
 func (l *Blnk) deliverLegacyWebhookOnly(ctx context.Context, tx *sql.Tx, event NewWebhook) error {
 	_, span := tracer.Start(ctx, "DeliverLegacyWebhookOnly")
 	defer span.End()
@@ -1374,6 +1444,24 @@ func (l *Blnk) deliverLegacyWebhookOnly(ctx context.Context, tx *sql.Tx, event N
 	}
 
 	if l == nil {
+		return nil
+	}
+
+	// RETIRED MEANS RETIRED, on every transport-selecting path rather than only on the
+	// relay's. Skipping is not an error: the event is not lost, it is simply no longer owed
+	// to a transport that no longer exists, and after the sunset a webhook-only deployment
+	// has been told for thirty days that this is what happens.
+	if WebhookSunsetPassedNow() {
+		span.AddEvent("Legacy-only delivery skipped: the webhook sunset has passed")
+		logrus.WithFields(logrus.Fields{
+			"event_type":  event.Event,
+			"legacy_only": true,
+		}).Warn(
+			"the legacy HTTP webhook transport is retired — the configured webhook deprecation " +
+				"sunset has passed — and no Kafka broker is configured, so this event was NOT " +
+				"delivered anywhere. Configure KAFKA_BROKERS to publish it",
+		)
+
 		return nil
 	}
 

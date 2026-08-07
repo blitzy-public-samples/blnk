@@ -48,7 +48,7 @@ import (
 // It is a bound rather than a preference: assurance is a synchronous round trip to a broker
 // that may not be listening yet, and an unbounded one would hold the process short of serving
 // traffic for as long as the broker stayed unreachable. Fifteen seconds is comfortably longer
-// than creating eight topics takes on a healthy cluster and short enough that a broker which
+// than creating the topic catalogue takes on a healthy cluster and short enough that a broker which
 // is not there yet costs one log line instead of a stalled deployment.
 const eventTopicAssuranceTimeout = 15 * time.Second
 

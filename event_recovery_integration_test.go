@@ -2319,8 +2319,11 @@ func TestEventRecovery_AttemptsSurviveRestartAndBoundTheRetryBudget(t *testing.T
 			"attempt %d must see the attempt counter exactly as the previous failure left it: a reset would let a "+
 				"permanently failing event retry for ever, and a jump would dead-letter a healthy one", attempt)
 
+		// terminal=false, because this fixture is simulating a TRANSIENT transport failure:
+		// the whole point is that the budget bounds the retries, so declaring the failure
+		// permanent would exhaust the row on attempt one and the boundary would go untested.
 		outcome, err := fixture.ds.MarkEventFailed(ctx, row.ID, row.ClaimToken,
-			fmt.Sprintf("recovery test: simulated transport failure %d", attempt), retryAfter)
+			fmt.Sprintf("recovery test: simulated transport failure %d", attempt), retryAfter, false)
 		require.NoErrorf(t, err, "recording failed attempt %d", attempt)
 		require.Equalf(t, attempt, outcome.Attempts,
 			"each recorded failure must advance the counter by exactly one (attempt %d)", attempt)

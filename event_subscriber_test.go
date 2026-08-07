@@ -54,7 +54,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1763,4 +1767,182 @@ func TestRevokeSubscriberCredential_LeavesTheRecordAloneWhenTheBrokerRefuses(t *
 
 	assert.False(t, store.fenced(subscriberFixtureID),
 		"a failed revocation must still release its claim")
+}
+
+// ---------------------------------------------------------------------------------------
+// The administrative-client lifetime guarantee
+// ---------------------------------------------------------------------------------------
+
+// TestEventSubscriberService_CloseReleasesOnlyTheClientItOwns is the runtime half of the
+// lifetime guarantee: Close releases a client the service resolved for itself, and never one
+// that was handed to it.
+//
+// Both halves matter, and they fail in opposite directions. A Close that released nothing would
+// leak every administrative client the subscriber surface ever resolves — one per update, one
+// per issuance — until the process ended. A Close that released an INJECTED client would tear
+// down something owned by whoever built it and usually outlives this service, so the next
+// caller would find a closed client. That second failure mode is why the wrappers can close
+// unconditionally without knowing where the client came from.
+func TestEventSubscriberService_CloseReleasesOnlyTheClientItOwns(t *testing.T) {
+	t.Run("an injected client is never closed", func(t *testing.T) {
+		log := newSubscriberCallLog()
+		admin := newSubscriberTestAdmin(log)
+		service := NewEventSubscriberService(newSubscriberTestStore(log), nil).WithKafkaAdmin(admin)
+
+		require.NoError(t, service.Close())
+		require.NoError(t, service.Close(), "Close must be idempotent")
+
+		// The service still holds it, because it never owned it: the injected client is
+		// usable after Close, which is what a caller that built it is entitled to expect.
+		provisioner, err := service.provisioner()
+		require.NoError(t, err)
+		assert.Same(t, admin, provisioner,
+			"an injected client must survive Close: the service does not own it")
+	})
+
+	t.Run("a resolved client is closed and forgotten", func(t *testing.T) {
+		// Resolution reads live configuration, so a Kafka-configured one is installed for the
+		// duration. NewKafkaAdmin performs no I/O at construction, so nothing dials a broker.
+		//
+		// InsecureLocalDev is the acknowledgement the transport requires before it will build a
+		// plaintext client at all; without it construction is refused as a misconfiguration and
+		// nothing would ever be resolved to close. Enabling it here is what makes the test about
+		// LIFETIME rather than about the TLS refusal, which has its own coverage.
+		cnf := subscriberLifecycleConfiguration(t)
+		cnf.Kafka.InsecureLocalDev = true
+		config.MockConfig(cnf)
+
+		service := NewEventSubscriberService(newSubscriberTestStore(newSubscriberCallLog()), nil)
+
+		resolved, err := service.provisioner()
+		require.NoError(t, err, "a configured deployment must resolve an administrative client")
+		require.NotNil(t, resolved)
+
+		require.True(t, service.ownsAdmin,
+			"a client the service built for itself must be recorded as owned, or Close will not release it")
+
+		require.NoError(t, service.Close())
+
+		assert.Nil(t, service.admin,
+			"Close must forget the client it released, so a later call resolves a fresh one rather than using a closed one")
+		assert.False(t, service.ownsAdmin,
+			"ownership must be released with the client, or a second Close would close it twice")
+		require.NoError(t, service.Close(), "Close must be idempotent after releasing an owned client")
+	})
+
+	t.Run("nil is safe", func(t *testing.T) {
+		var service *EventSubscriberService
+		require.NoError(t, service.Close(),
+			"a nil service must be closable, so a deferred close needs no nil check at the call site")
+	})
+}
+
+// TestBlnkSubscriberWrappers_EveryOneClosesTheServiceItBuilds is the STRUCTURAL half, and it is
+// the half that keeps the guarantee true.
+//
+// The runtime test above proves Close works. It cannot prove Close is CALLED, and that is where
+// the leak actually was: UpdateEventSubscriber built a service, reconciled a subscriber's ACL
+// bindings through it — resolving an administrative client twice, once to prune and once to
+// grant — and returned without closing, so every update held those connections for the
+// remaining life of the process.
+//
+// A per-wrapper assertion, rather than a comment saying which wrappers need it, is the only
+// form that survives the next edit. The rule that produced the bug was "close where the broker
+// is touched", which made each wrapper's correctness depend on a fact about a service method
+// hundreds of lines away that no compiler checks: a registry-only operation that later grew a
+// broker touch would start leaking with its own wrapper untouched in the diff. Close is
+// idempotent, nil-safe and a no-op when nothing was resolved, so requiring it everywhere costs
+// nothing and cannot be wrong.
+func TestBlnkSubscriberWrappers_EveryOneClosesTheServiceItBuilds(t *testing.T) {
+	fileSet := token.NewFileSet()
+	path := filepath.Join(moduleRootDir(t), "event_subscriber.go")
+	parsed, err := parser.ParseFile(fileSet, path, nil, parser.ParseComments)
+	require.NoError(t, err, "event_subscriber.go must be parseable to assert its structure")
+
+	// Every *Blnk method that builds a subscriber service, discovered from the file rather
+	// than listed here: a wrapper added later is covered without this test being touched.
+	wrappers := map[string]bool{}
+	for _, declaration := range parsed.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Recv == nil || function.Body == nil {
+			continue
+		}
+
+		if !isBlnkReceiver(function.Recv) {
+			continue
+		}
+
+		buildsService := false
+		closesService := false
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.CallExpr:
+				if selector, ok := typed.Fun.(*ast.SelectorExpr); ok &&
+					selector.Sel.Name == "EventSubscribers" {
+					buildsService = true
+				}
+			case *ast.DeferStmt:
+				if selector, ok := typed.Call.Fun.(*ast.Ident); ok &&
+					selector.Name == "closeEventSubscriberService" {
+					closesService = true
+				}
+			}
+
+			return true
+		})
+
+		if buildsService {
+			wrappers[function.Name.Name] = closesService
+		}
+	}
+
+	// EventSubscribers itself is the constructor, not a wrapper: it hands the service to a
+	// caller, so closing it there would return something already closed.
+	delete(wrappers, "EventSubscribers")
+
+	require.NotEmpty(t, wrappers, "the wrappers must be discoverable, or this test proves nothing")
+
+	// Named explicitly as well, so that a wrapper DELETED or renamed out of the discovery
+	// above is noticed rather than silently reducing the set this test covers.
+	for _, expected := range []string{
+		"RegisterEventSubscriber",
+		"GetEventSubscriber",
+		"ListEventSubscribers",
+		"UpdateEventSubscriber",
+		"DeregisterEventSubscriber",
+		"IssueSubscriberKafkaCredentials",
+		"RevokeSubscriberKafkaCredentials",
+		"RecordSubscriberWebhookSubscription",
+		"ClearSubscriberWebhookSubscription",
+		"MarkEventSubscriberMigrated",
+		"PurgeMigratedSubscriberWebhookURLs",
+	} {
+		require.Contains(t, wrappers, expected,
+			"%s must build its service through EventSubscribers, so its administrative-client "+
+				"lifetime is governed by the same rule as every other wrapper's", expected)
+	}
+
+	for name, closes := range wrappers {
+		assert.Truef(t, closes,
+			"%s builds a subscriber service and must `defer closeEventSubscriberService(service)`: "+
+				"without it, an administrative client the service resolves is held until the process "+
+				"ends, and whether it resolves one is a property of a service method elsewhere that "+
+				"no compiler checks", name)
+	}
+}
+
+// isBlnkReceiver reports whether a method is declared on *Blnk.
+func isBlnkReceiver(receiver *ast.FieldList) bool {
+	if receiver == nil || len(receiver.List) != 1 {
+		return false
+	}
+
+	pointer, isPointer := receiver.List[0].Type.(*ast.StarExpr)
+	if !isPointer {
+		return false
+	}
+
+	identifier, isIdentifier := pointer.X.(*ast.Ident)
+
+	return isIdentifier && identifier.Name == "Blnk"
 }

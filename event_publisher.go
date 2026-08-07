@@ -21,13 +21,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -218,7 +216,7 @@ const (
 // disclosure channel, publishing whatever string was stored to anyone who can read
 // /metrics.
 //
-// A Blnk-owned name is a member of a small, enumerable set — prefix times four categories,
+// A Blnk-owned name is a member of a small, enumerable set — prefix times five categories,
 // times the optional `.dlt` suffix — so it is safe to report verbatim, and reporting it is
 // what makes the dead-letter-rate and per-topic queries in docs/metrics.md work. Anything
 // else collapses to one fixed label: the series count stays bounded, and the anomaly is
@@ -419,7 +417,32 @@ type TopicEventPublisher interface {
 type PublishRequest struct {
 	// Event is the envelope to publish. Its Payload bytes are written through
 	// untransformed; see marshalLedgerEvent.
+	//
+	// It is read for the result fields — event id, event type — and as the SOURCE OF
+	// LAST RESORT for the message value. When Raw below is set, that is what goes on
+	// the wire and this struct is not serialised at all.
 	Event model.LedgerEvent
+
+	// Raw is THE STORED CANONICAL ENVELOPE, and when present it is written to the topic
+	// VERBATIM.
+	//
+	// # Why the bytes travel rather than the struct
+	//
+	// blnk.event_outbox.event_raw holds the envelope produced once at capture. Publishing
+	// those stored bytes — rather than re-serialising Event on every attempt — is what
+	// makes requirement R-5's byte-for-byte replay a property of the data instead of a
+	// property of this file's serialiser never changing. A replay of a dead-lettered event
+	// is then the same bytes the first attempt sent, whatever version of Blnk performs it.
+	//
+	// PublishRequestFromOutbox populates it from the row, so the relay, the dead-letter
+	// writer and replay all get it without asking. It is EMPTY for a request assembled in
+	// Go that never passed through the outbox — the mandated envelope-only Publish — and
+	// for a row written before the column existed; both fall back to composing the envelope
+	// from Event, which yields the bytes this version would have stored.
+	//
+	// It must be a complete JSON object: the dead-letter writer splices a failure_metadata
+	// member onto it, and the size ceiling is enforced against it.
+	Raw []byte
 
 	// Topic is the fully-resolved destination. When empty it is derived with
 	// TopicForEvent from the event type, which is the correct behaviour for an event
@@ -1076,7 +1099,7 @@ var (
 // instance with nothing but a Redis DSN configured, and this must not turn that into a
 // network call, a delay, or an error.
 //
-// The returned publisher owns writers for every topic Blnk owns — the four category topics
+// The returned publisher owns writers for every topic Blnk owns — the five category topics
 // and their five dead-letter siblings, ten in all — enumerated from AllTopicsWithDeadLetters
 // so that this file and the provisioning path work from one list.
 //
@@ -2007,7 +2030,7 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 		return time.Since(req.ClaimedAt)
 	}
 
-	value, err := marshalLedgerEvent(req.Event)
+	value, err := resolveEventValue(req)
 	if err != nil {
 		// A payload that is not valid JSON cannot be spliced into an envelope without
 		// producing a message that breaks every subscriber's parser, so this is
@@ -2325,14 +2348,12 @@ func (p *kafkaPublisher) Close() error {
 //     columns, keyed by the row's partition key and targeted at the row's topic.
 func PublishRequestFromOutbox(row model.EventOutbox, attempt int) PublishRequest {
 	return PublishRequest{
-		Event: model.LedgerEvent{
-			EventID:       row.EventID,
-			EventType:     row.EventType,
-			AggregateID:   row.AggregateID,
-			OccurredAt:    row.OccurredAt,
-			Payload:       row.Payload,
-			SchemaVersion: row.SchemaVersion,
-		},
+		Event: row.CanonicalEvent(),
+		// THE STORED BYTES, carried so the publish does not re-serialise the envelope. A row
+		// that carries none — one written before the column existed — leaves this empty and
+		// the publisher composes, which is the documented fallback rather than a second
+		// source of truth. See PublishRequest.Raw.
+		Raw:   row.EventRaw,
 		Topic: row.Topic,
 		// LEDGER FIRST — requirement R-6 partitions by ledger ID. See the fallback chain above.
 		Key:     firstNonBlank(row.LedgerID, row.PartitionKey),
@@ -2376,70 +2397,39 @@ func PublishRequestFromOutbox(row model.EventOutbox, attempt int) PublishRequest
 //   - error: non-nil when the payload is not valid JSON, or when the timestamp cannot be
 //     rendered as RFC3339 (a year outside the four-digit range).
 func marshalLedgerEvent(event model.LedgerEvent) ([]byte, error) {
-	payload := event.Payload
-	if len(bytes.TrimSpace(payload)) == 0 {
-		logrus.WithFields(logrus.Fields{
-			"event_id":   event.EventID,
-			"event_type": event.EventType,
-		}).Warn("ledger event has an empty payload; publishing it as a JSON null payload")
-
-		payload = jsonNull
-	} else if !json.Valid(payload) {
-		return nil, fmt.Errorf(
-			"blnk: the payload of event %s (%s) is not valid JSON and cannot be published",
-			event.EventID, event.EventType,
-		)
-	}
-
-	// The scalar members, in the order the envelope declares them. Encoding each through
-	// encoding/json is what keeps escaping and timestamp formatting identical to a
-	// struct marshal.
-	scalars := [4]struct {
-		key   string
-		value interface{}
-	}{
-		{"event_id", event.EventID},
-		{"event_type", event.EventType},
-		{"aggregate_id", event.AggregateID},
-		{"occurred_at", event.OccurredAt},
-	}
-
-	var buf bytes.Buffer
-	buf.Grow(len(payload) + envelopeScaffoldBytes)
-	buf.WriteByte('{')
-
-	for i, scalar := range scalars {
-		encoded, err := json.Marshal(scalar.value)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"blnk: encoding %s for event %s (%s): %w",
-				scalar.key, event.EventID, event.EventType, err,
-			)
-		}
-
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-
-		buf.WriteByte('"')
-		buf.WriteString(scalar.key)
-		buf.WriteString(`":`)
-		buf.Write(encoded)
-	}
-
-	buf.WriteString(`,"payload":`)
-	buf.Write(payload)
-	buf.WriteString(`,"schema_version":`)
-	buf.WriteString(strconv.Itoa(event.SchemaVersion))
-	buf.WriteByte('}')
-
-	return buf.Bytes(), nil
+	return event.CanonicalBytes()
 }
 
-// envelopeScaffoldBytes is a sizing hint: the member names, quotes, separators, braces and
-// the encoded scalars of a typical envelope. It only pre-sizes the buffer, so an imprecise
-// value costs at most one reallocation and can never affect the output.
-const envelopeScaffoldBytes = 256
+// resolveEventValue returns the bytes to put on the topic for one request.
+//
+// THE STORED VALUE WINS, ALWAYS. blnk.event_outbox.event_raw is the envelope the broker was
+// given at capture, so publishing it means a retry, a dead-letter copy and a replay all carry
+// the identical bytes — which is requirement R-5's byte fidelity expressed as data rather than
+// as a hope that the serialiser never changes.
+//
+// Composition is the fallback for the two requests that legitimately have no stored value: the
+// mandated envelope-only Publish, whose event never passed through the outbox, and a row
+// written before the column existed. Both get the bytes this version would have stored, and
+// both are still validated, because splicing bytes that are not JSON would produce a message
+// that breaks every subscriber's parser.
+//
+// A stored value is NOT re-validated. It was validated at the persistence boundary, it is the
+// authority, and re-parsing it on every attempt would be a per-publish cost for a check that
+// cannot change its answer.
+//
+// Parameters:
+//   - req PublishRequest: the request to resolve.
+//
+// Returns:
+//   - []byte: the message value.
+//   - error: only from composition, when the payload is not valid JSON.
+func resolveEventValue(req PublishRequest) ([]byte, error) {
+	if len(bytes.TrimSpace(req.Raw)) > 0 {
+		return req.Raw, nil
+	}
+
+	return marshalLedgerEvent(req.Event)
+}
 
 // resolveTopic returns the destination for a request: the topic it names, or the topic the
 // event type routes to when it names none.

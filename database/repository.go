@@ -366,24 +366,17 @@ type eventOutbox interface {
 	// the same key, and because Kafka preserves append order rather than
 	// occurred_at, a subscriber then observes one aggregate's events out of order
 	// with nothing anywhere to show it happened.
-	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error)                   // Claims pending entries FIFO for publishing, one row per partition key, taking a lease and stamping a claim token
-	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error                                 // Marks a claimed entry dispatched after the broker acknowledges the publish, persisting the coordinate the broker assigned
-	MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration) (model.EventFailureOutcome, error) // Records a failed attempt against a claimed entry, schedules its next due instant and reports whether the budget is now spent
-
-	// ClaimEventsOwedDeadLetter reaches the one set nothing else can: an entry whose
-	// retry budget is spent and whose dead-letter write was NOT recorded, because it
-	// failed or because the relay died between the write and the record.
+	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims pending entries FIFO for publishing, one row per partition key, taking a lease and stamping a claim token
+	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error               // Marks a claimed entry dispatched after the broker acknowledges the publish, persisting the coordinate the broker assigned
 	//
-	// Such a row is invisible to ClaimPendingEventOutbox (wrong status, no budget) and
-	// to ClaimEventForReplay (not dead_lettered), and PurgeTerminalEventsBefore
-	// deliberately refuses to delete it because this table is the only copy of the
-	// event in existence. Without this method the event could be neither published,
-	// replayed nor triaged — only rescued by a hand-written UPDATE.
-	//
-	// It does NOT change the row's status, so a row whose dead-letter topic is
-	// unreachable does not re-enter the main claim's blocking set and stall every later
-	// event of its aggregate.
-	ClaimEventsOwedDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims entries whose budget is spent and whose dead-letter write is still owed, so the hand-off can be retried
+	// MarkEventFailed's terminal parameter is the CALLER'S VERDICT that no further
+	// attempt can succeed, and it is one input to the same in-SQL decision the attempt
+	// arithmetic feeds. The publisher already classifies a failure as transient or
+	// permanent; discarding that here returned a permanently unpublishable event to
+	// pending to spend its whole backoff schedule rediscovering it, which delayed
+	// preservation by the length of the schedule and reported a stuck event as a busy
+	// one throughout.
+	MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, terminal bool) (model.EventFailureOutcome, error) // Records a failed attempt against a claimed entry, schedules its next due instant, and reports whether the budget is now spent — exhausting immediately when the caller declares the failure permanent
 
 	// MarkEventDeadLettered completes the failure path: it moves an entry whose
 	// retry budget MarkEventFailed already exhausted into the dead_lettered
@@ -478,9 +471,35 @@ type eventOutbox interface {
 	// an independent way back to that row the outstanding webhook was lost silently,
 	// for precisely the subscribers that have not migrated yet.
 	//
+	// It admits ALL THREE Kafka end states — dispatched, failed and dead_lettered —
+	// because the relay enqueues the webhook BEFORE it publishes, so when both legs fail
+	// on the attempt that spends the retry budget the row goes terminal on the failure
+	// path with its webhook still owed. Restricting the set to dispatched discarded that
+	// webhook in the one circumstance where the webhook is the only transport that might
+	// still work: the broker being unreachable is why the Kafka leg failed.
+	//
 	// It does NOT change the row's status, which is the property that makes it safe:
-	// returning a dispatched row to processing would republish it to Kafka.
-	ClaimPendingWebhookDeliveries(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims dispatched rows whose legacy webhook leg is still owed, taking a lease and stamping a claim token without altering status
+	// returning a dispatched row to processing would republish it to Kafka, and reviving a
+	// dead-lettered one would hand a terminal event back to the publisher.
+	ClaimPendingWebhookDeliveries(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims rows in any Kafka end state whose legacy webhook leg is still owed, taking a lease and stamping a claim token without altering status
+
+	// MarkEventLegacyWebhookAttempted records one FAILED legacy enqueue against a row
+	// whose Kafka leg has already finished, and reports whether the legacy budget is now
+	// spent. DELETED at the webhook sunset with the rest of the legacy leg.
+	//
+	// It is the counterpart to MarkEventWebhookPending for the rows that one cannot
+	// serve. MarkEventWebhookPending may move the status, because it only ever handles a
+	// row whose Kafka publish SUCCEEDED. This one handles a row in any Kafka end state and
+	// therefore must leave the status exactly as it is: marking a dead-lettered row
+	// dispatched would assert a delivery that never happened in the column the zero-loss
+	// audit reads, and moving it to webhook_pending would hand a terminal event back to
+	// the publisher. The row's re-claimability comes from the legacy leg's own columns.
+	//
+	// last_error is NOT overwritten either. On a failed or dead-lettered row it holds the
+	// KAFKA failure reason, which the dead-letter metadata and the API projection read;
+	// replacing it with a transient queue error would destroy the diagnosis of the failure
+	// that actually stranded the event.
+	MarkEventLegacyWebhookAttempted(ctx context.Context, id int64, claimToken string, retryAfter time.Duration) (model.EventWebhookOutcome, error) // Records a failed legacy webhook enqueue against a row whose Kafka leg has finished, without altering that leg's state, and reports whether the legacy budget is spent
 
 	// MarkEventWebhookPending records a Kafka leg that is COMPLETE alongside a
 	// legacy webhook leg that is still OWED, and reports which arm the in-SQL

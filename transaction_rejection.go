@@ -159,41 +159,6 @@ func (l *Blnk) RejectTransaction(ctx context.Context, transaction *model.Transac
 	return transaction, nil
 }
 
-// prepareRejectionEventOutbox builds the transaction.rejected event row for a transaction
-// that is about to be recorded as REJECTED.
-//
-// The event name is derived through getEventFromStatus from the status this function's
-// caller has already set, rather than written as a literal, so the rejection event stays
-// spelled the way every other transaction event is spelled and cannot drift from the
-// status-to-event table.
-//
-// A preparation failure is logged and yields nil, which degrades to post-commit capture
-// rather than refusing the rejection. The transaction has already failed for a business
-// reason; refusing to record that because its notification would not serialise would leave
-// the caller with neither an outcome nor a reason.
-//
-// Parameters:
-//   - ctx context.Context: the context for the operation; used for tracing only.
-//   - transaction *model.Transaction: the transaction, status already set to REJECTED.
-//
-// Returns:
-//   - *model.EventOutbox: the row to commit with the transaction, or nil when publishing is
-//     unconfigured or the row could not be prepared.
-func (l *Blnk) prepareRejectionEventOutbox(ctx context.Context, transaction *model.Transaction) *model.EventOutbox {
-	row, err := l.PrepareEventOutbox(ctx, NewWebhook{
-		Event:   getEventFromStatus(transaction.Status),
-		Payload: transaction,
-	})
-	if err != nil {
-		logrus.WithError(err).WithField("transaction_id", transaction.TransactionID).
-			Error("failed to prepare the rejection event for atomic capture; it will be captured after the commit instead")
-
-		return nil
-	}
-
-	return row
-}
-
 // categorizeRejectionReason maps a free-text rejection reason to a bounded set of metric labels
 // to keep Prometheus cardinality under control.
 func categorizeRejectionReason(reason string) string {

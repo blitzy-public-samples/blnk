@@ -626,6 +626,49 @@ func WebhookDeprecationWindow() (time.Time, time.Time, bool) {
 	return webhookWindowStart(cnf, sunset), sunset, true
 }
 
+// WebhookWindowObstacle describes why a process that publishes to Kafka must not start on
+// the window state the caller resolved, or nil when the state is a legitimate one to run in.
+//
+// SUNSET: goes with the legacy leg.
+//
+// TWO STATES ARE REFUSED and two are accepted, and the asymmetry is the whole point:
+//
+//   - WebhookWindowActive is the dual-delivery window itself. Run.
+//   - WebhookWindowClosed is the intended END state — Kafka is the only transport. Run.
+//   - WebhookWindowPending means the process would publish to Kafka BEFORE the window it
+//     declared has opened, enqueuing no legacy webhooks while claiming a migration has not
+//     started. Refuse; see WebhookWindowPendingObstacle for the message.
+//   - WebhookWindowUnavailable, FOR A PUBLISHING PROCESS, means configuration describes no
+//     usable window at all. The sunset predicate fails closed on it — WebhookSunsetPassed
+//     answers true — so the legacy leg silently stops while configuration says nothing
+//     about a retirement, which is exactly the disagreement the review's C-1 finding names.
+//     Refuse, and name the variable.
+//
+// Callers must only pass a state they resolved for a process that HAS a Kafka transport. A
+// process with no brokers also resolves to WebhookWindowUnavailable, legitimately — there is
+// no window because there is no migration — and it has no reason to consult this function,
+// because it publishes nothing.
+//
+// Parameters:
+//   - state WebhookWindowState: the state the caller resolved.
+//
+// Returns:
+//   - error: non-nil for WebhookWindowPending and WebhookWindowUnavailable.
+func WebhookWindowObstacle(state WebhookWindowState) error {
+	if state == WebhookWindowUnavailable {
+		return fmt.Errorf(
+			"configuration describes no usable dual-delivery window (%s), so the sunset resolves "+
+				"fail-closed to ALREADY PASSED and this process would publish to Kafka while "+
+				"enqueuing no legacy webhooks at all. Set WEBHOOK_DEPRECATION_SUNSET_DATE to the "+
+				"RFC3339 instant the legacy transport retires; the %d-day window opens that many "+
+				"days earlier",
+			state, config.WebhookDualDeliveryWindowDays,
+		)
+	}
+
+	return WebhookWindowPendingObstacle(state)
+}
+
 // WebhookWindowPendingObstacle describes why a process must not begin publishing to Kafka
 // before the dual-delivery window opens, or nil when the state is anything else.
 //

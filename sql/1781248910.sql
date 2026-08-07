@@ -36,11 +36,11 @@
 -- event in existence: the retention purge deliberately refuses to delete it, and
 -- a replay refuses to touch it because a replay requires the dead_lettered state.
 --
--- ClaimEventsOwedDeadLetter reads exactly this set, so the hand-off is retried on
--- the same bounded backoff the publish attempts used. dlt_topic IS NULL is what
--- makes the set self-clearing: once the dead-letter record lands, the row leaves it
--- for good. 'processing' is included because a relay can die between that claim and
--- the record, and the same predicate must recover it.
+-- ClaimFailedEventOutboxForDeadLetter reads this set, so the hand-off is retried
+-- rather than stranded. dlt_topic IS NULL is what makes the set self-clearing: once
+-- the dead-letter record lands, the row leaves it for good. 'processing' is included
+-- because a relay can die between that claim and the record, and the same predicate
+-- must recover it.
 --
 -- The set is read by its OWN statement rather than as an extra arm of the main
 -- claim, and this index is why. A partial index is usable only when its predicate is
@@ -59,25 +59,42 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_dead_letter_owed
 -- Rows whose LEGACY WEBHOOK LEG is still owed.
 --
 -- SUNSET NOTICE: this index exists only for the 30-day dual-delivery window and
--- is DROPPED together with the webhook_dispatched column, MarkWebhookDispatched,
+-- is DROPPED together with the webhook_dispatched and webhook_attempts columns,
+-- MarkWebhookDispatched, MarkEventLegacyWebhookAttempted,
 -- ClaimPendingWebhookDeliveries and the relay's dual-delivery branch when the
 -- webhook sunset arrives. Nothing outside that window depends on it.
 --
 -- During the window the relay enqueues the legacy delivery and publishes to
 -- Kafka from the same claimed row. A failed enqueue is deliberately swallowed —
 -- a webhook receiver being down must not consume a Kafka retry attempt, still
--- less dead-letter an event on the new transport — but the Kafka publish then
--- succeeds, the row goes terminal and its claim token is cleared, so nothing
+-- less dead-letter an event on the new transport — but the row then reaches a
+-- state the main claim never revisits and its claim token is cleared, so nothing
 -- would ever return to the outstanding webhook. ClaimPendingWebhookDeliveries
 -- reclaims this set to finish that leg, for exactly the subscribers the window
 -- exists to protect.
+--
+-- ALL THREE KAFKA END STATES are candidates, not 'dispatched' alone. The relay
+-- enqueues the webhook BEFORE it publishes, so when both legs fail on the attempt
+-- that spends the retry budget the row travels failed → dead_lettered with its
+-- webhook still owed. Restricting this set to 'dispatched' discarded that webhook
+-- silently — in exactly the circumstance where the webhook is the only transport
+-- that might still work, since the broker being unreachable is why the Kafka leg
+-- failed. What the three literals share is the property that matters: the Kafka
+-- leg will not be attempted again, so if this set does not carry the legacy leg
+-- nothing will.
+--
+-- The literals must stay identical to the ones in
+-- claimPendingWebhookDeliveriesQuery. A partial index is usable only when its
+-- predicate is implied by the query's, and the planner proves that by comparing
+-- the literals it can see while planning: a query listing a status this index
+-- omits falls back to a sequential scan.
 --
 -- The partial predicate is what makes it affordable. In a healthy window the set
 -- is empty, while 'dispatched' is the largest status in the table — so an
 -- unindexed poll of it would scan every event ever delivered, once a second.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_webhook_pending
     ON blnk.event_outbox (occurred_at, id)
-    WHERE status = 'dispatched' AND webhook_dispatched = FALSE;
+    WHERE status IN ('dispatched', 'failed', 'dead_lettered') AND webhook_dispatched = FALSE;
 
 -- +migrate Down
 

@@ -178,8 +178,8 @@ var dltCategoryRoutes = []dltCategoryRoute{
 	},
 	{
 		eventType:       "ledger.created",
-		originalTopic:   "blnk.system",
-		deadLetterTopic: "blnk.system.dlt",
+		originalTopic:   "blnk.ledgers",
+		deadLetterTopic: "blnk.ledgers.dlt",
 	},
 	{
 		eventType:       "system.error",
@@ -195,6 +195,10 @@ var dltAllDeadLetterTopics = []string{
 	"blnk.transactions.dlt",
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
+	// The grantable ledgers category's sibling. A dead-letter topic is never grantable, so
+	// this one is as operator-facing as any other; what its category being grantable changes
+	// is only which events can land here.
+	"blnk.ledgers.dlt",
 	// The internal system category's sibling. That category also holds events whose type
 	// the catalogue does not recognise, and those are exactly the events most likely to
 	// fail to publish, so its dead-letter topic must be covered by the age gauge like
@@ -320,8 +324,8 @@ func newDltFakeStore() *dltFakeStore {
 	}
 }
 
-// withRow registers a row for lookup and, when its status is one of the two terminal
-// failure states, appends it to the dead-letter inventory.
+// withRow registers a row for lookup and, when its status is one of the two failure
+// states, appends it to the dead-letter inventory.
 //
 // Callers add rows NEWEST FIRST, which is the order the repository returns them in.
 func (s *dltFakeStore) withRow(row model.EventOutbox) *dltFakeStore {
@@ -331,12 +335,12 @@ func (s *dltFakeStore) withRow(row model.EventOutbox) *dltFakeStore {
 	stored := row
 	s.rows[row.EventID] = &stored
 
-	// EVERY failure state joins the inventory, matching ListDeadLetteredEvents, which covers
-	// dead_lettered, dlt_pending and failed. dlt_pending especially: while a row sits there its
-	// event exists in no topic at all, which makes it the one an operator most needs to see.
+	// BOTH failure states join the inventory, matching ListDeadLetteredEvents, which covers
+	// dead_lettered and failed. failed especially: a failed row whose dlt_topic is still NULL
+	// is the "dead-letter write is owed" state, so while it sits there its event exists in no
+	// topic at all, which makes it the one an operator most needs to see.
 	switch row.Status {
 	case model.EventOutboxStatusDeadLettered,
-		model.EventOutboxStatusDLTPending,
 		model.EventOutboxStatusFailed:
 		s.inventory = append(s.inventory, row.EventID)
 		s.counts[row.Status]++
@@ -1044,15 +1048,15 @@ func dltPinTopicPrefix(t *testing.T) {
 // dltExhaustedRow builds the outbox row of an event that has just spent its entire retry
 // budget — the row the relay hands to the dead-letter path.
 //
-// Its status is DLT_PENDING, and that is the whole point of the state. A row whose budget is
-// spent but whose dead-letter write is still owed is NOT terminal: it keeps its lease so no
-// second worker writes the same event to a .dlt topic, and when the holder dies the recovery
-// pass re-claims it. Seeding `failed` here — the terminal status this fixture used to carry —
-// modelled a hand-off the relay no longer performs, and certified an outcome that would strand
-// the event: recoverDeadLetterHandoffs claims dlt_pending, so nothing would ever retry the
-// write, and replay requires dead_lettered, so nothing could reach it either. The dead-letter
-// listing covers dlt_pending, failed and dead_lettered alike, so an operator sees it in all
-// three.
+// Its status is FAILED with dlt_topic still EMPTY, and that pair is the whole point of the
+// fixture. It is exactly what the relay's exhaustion arm writes, and it is the state that
+// means "the retry budget is spent and the dead-letter write is still owed". The pair is NOT
+// terminal: the row keeps its lease so no second worker writes the same event to a .dlt
+// topic, and once that lease lapses ClaimFailedEventOutboxForDeadLetter re-claims it, which is
+// what keeps a failed dead-letter write recoverable instead of stranding the event. Seeding
+// dead_lettered here would model a hand-off that has already completed and would certify the
+// opposite of what these tests exist to prove. The dead-letter listing covers failed and
+// dead_lettered alike, so an operator sees the row in either state.
 //
 // The attempt window is genuinely SPREAD: the first attempt is 31 seconds before the last,
 // which is what the documented backoff schedule (1s, 2s, 4s, 8s, 16s across five attempts)
@@ -1065,11 +1069,13 @@ func dltPinTopicPrefix(t *testing.T) {
 //   - eventType: the event name, which decides the category and therefore the topic.
 //   - topic: the destination recorded on the row. Pass "" to exercise the fallback that
 //     re-derives it from the event type.
-func dltExhaustedRow(eventID, eventType, topic string) model.EventOutbox {
+func dltExhaustedRow(t *testing.T, eventID, eventType, topic string) model.EventOutbox {
+	t.Helper()
+
 	firstAttempt := dltFixedNow.Add(-1 * time.Minute)
 	lastAttempt := firstAttempt.Add(31 * time.Second)
 
-	return model.EventOutbox{
+	row := model.EventOutbox{
 		ID:          dltRowID(eventID),
 		EventID:     eventID,
 		EventType:   eventType,
@@ -1090,13 +1096,32 @@ func dltExhaustedRow(eventID, eventType, topic string) model.EventOutbox {
 		SchemaVersion:    model.SchemaVersionV1,
 		Payload:          json.RawMessage(dltTrapPayload),
 		OccurredAt:       dltOccurredAt,
-		Status:           model.EventOutboxStatusDLTPending,
+		Status:           model.EventOutboxStatusFailed,
 		Attempts:         dltExhaustedAttempts,
 		MaxAttempts:      dltExhaustedAttempts,
 		LastError:        dltPublishFailureReason,
 		FirstAttemptedAt: &firstAttempt,
 		LastAttemptedAt:  &lastAttempt,
 	}
+
+	dltStampCanonicalEnvelope(t, &row)
+
+	return row
+}
+
+// dltStampCanonicalEnvelope fills event_raw the way PrepareEventOutbox does at capture.
+//
+// The column is NOT NULL and it is what every transport reads, so a fixture without it is a
+// row the database cannot hold and a scenario that exercises the compatibility fallback rather
+// than the live path. It is stamped LAST, after every envelope member is final, because the
+// stored bytes and the columns they were composed from must agree — a fixture that changed
+// occurred_at after stamping would describe a row no writer could produce.
+func dltStampCanonicalEnvelope(t *testing.T, row *model.EventOutbox) {
+	t.Helper()
+
+	raw, err := row.CanonicalEvent().CanonicalBytes()
+	require.NoError(t, err, "the fixture envelope must serialise before it can be stored")
+	row.EventRaw = raw
 }
 
 // dltRowID derives a stable, strictly positive surrogate key from an event id.
@@ -1191,13 +1216,14 @@ func dltCaptureAgeGauge(t *testing.T) *dltRecordedFloatGauge {
 
 // dltOriginalEnvelope returns the bytes the FIRST publish of this row produced.
 //
-// It goes through the production path — the row-to-request conversion and the envelope
-// serialiser the Kafka publisher itself uses — so it is the real message value and not a
-// test's idea of one. Every byte-fidelity assertion in this file is stated against it.
+// It goes through the production path — the row-to-request conversion and the value resolution
+// the Kafka publisher itself performs — so it is the real message value and not a test's idea of
+// one. For a row carrying event_raw, which every fixture here does, that resolution returns the
+// STORED envelope. Every byte-fidelity assertion in this file is stated against it.
 func dltOriginalEnvelope(t *testing.T, row model.EventOutbox) []byte {
 	t.Helper()
 
-	envelope, err := marshalLedgerEvent(PublishRequestFromOutbox(row, 1).Event)
+	envelope, err := resolveEventValue(PublishRequestFromOutbox(row, 1))
 	require.NoError(t, err, "the fixture row must serialise as a publishable envelope")
 
 	return envelope
@@ -1330,7 +1356,7 @@ func TestDeadLetterRouting_SendsEachCategoryToItsOwnDeadLetterTopic(t *testing.T
 
 	for _, route := range dltCategoryRoutes {
 		t.Run(route.eventType, func(t *testing.T) {
-			row := dltExhaustedRow("evt_"+route.eventType, route.eventType, route.originalTopic)
+			row := dltExhaustedRow(t, "evt_"+route.eventType, route.eventType, route.originalTopic)
 			store := newDltFakeStore().withRow(row)
 			transport := &dltFakeTransport{}
 			service := dltNewService(store, &dltFakePublisher{}, transport)
@@ -1374,7 +1400,7 @@ func TestDeadLetterRouting_DerivesTheTopicFromTheEventTypeWhenTheRowRecordsNone(
 
 	for _, route := range dltCategoryRoutes {
 		t.Run(route.eventType, func(t *testing.T) {
-			row := dltExhaustedRow("evt_fallback_"+route.eventType, route.eventType, "")
+			row := dltExhaustedRow(t, "evt_fallback_"+route.eventType, route.eventType, "")
 			store := newDltFakeStore().withRow(row)
 			transport := &dltFakeTransport{}
 			service := dltNewService(store, &dltFakePublisher{}, transport)
@@ -1400,7 +1426,7 @@ func TestDeadLetterRouting_DerivesTheTopicFromTheEventTypeWhenTheRowRecordsNone(
 func TestDeadLetterRouting_RecordsTheDeadLetterTopicOnTheOutboxRow(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_recorded", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_recorded", "transaction.applied", "blnk.transactions")
 	store := newDltFakeStore().withRow(row)
 	transport := &dltFakeTransport{}
 	service := dltNewService(store, &dltFakePublisher{}, transport)
@@ -1525,7 +1551,7 @@ func TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow(t *testing.T) {
 	// And the runtime behaviour agrees: a completed dead-lettering touches exactly one
 	// transition.
 	dltPinTopicPrefix(t)
-	row := dltExhaustedRow("evt_no_extra_attempt", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_no_extra_attempt", "transaction.applied", "blnk.transactions")
 	store := newDltFakeStore().withRow(row)
 	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
 
@@ -1560,7 +1586,7 @@ func TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow(t *testing.T) {
 func TestDeadLetterRouting_RefusesToRecordADeadLetterWithoutABroker(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_no_broker", "balance.created", "blnk.balances")
+	row := dltExhaustedRow(t, "evt_no_broker", "balance.created", "blnk.balances")
 	store := newDltFakeStore().withRow(row)
 
 	noop := NewNoopEventPublisher()
@@ -1581,10 +1607,14 @@ func TestDeadLetterRouting_RefusesToRecordADeadLetterWithoutABroker(t *testing.T
 
 	assert.Empty(t, store.snapshotDeadLettered(),
 		"a row must not be recorded as dead-lettered when no dead-letter message exists")
-	assert.Equal(t, model.EventOutboxStatusDLTPending, store.row(t, row.EventID).Status,
-		"the row keeps the non-terminal status the caller gave it, so it stays visible and completable: "+
-			"dlt_pending is re-claimed by the recovery pass, where a terminal failed row would be stranded "+
-			"with its event on no topic at all")
+	stored := store.row(t, row.EventID)
+	assert.Equal(t, model.EventOutboxStatusFailed, stored.Status,
+		"the row keeps the non-terminal status the caller gave it, so it stays visible and completable")
+	assert.Empty(t, stored.DLTTopic,
+		"and dlt_topic stays unset, which is the half of the pair that makes the row re-claimable: "+
+			"ClaimFailedEventOutboxForDeadLetter selects failed rows whose dlt_topic IS NULL, so the owed "+
+			"write is attempted again once this lease lapses. Recording the coordinate here would retire "+
+			"the row with its event on no topic at all")
 	assert.Zero(t, counter.total(),
 		"the dead-letter counter must not claim a dead-lettering that did not happen")
 }
@@ -1602,7 +1632,7 @@ func TestDeadLetterRouting_RefusesToRecordADeadLetterWithoutABroker(t *testing.T
 func TestDeadLetterRouting_RefusesToRecordADeadLetterWhenConfigurationCannotBeRead(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_no_config", "identity.created", "blnk.identities")
+	row := dltExhaustedRow(t, "evt_no_config", "identity.created", "blnk.identities")
 	store := newDltFakeStore().withRow(row)
 
 	// No injected transport, so the service resolves one from configuration — and the seam
@@ -1624,8 +1654,12 @@ func TestDeadLetterRouting_RefusesToRecordADeadLetterWhenConfigurationCannotBeRe
 	assert.False(t, outcome.Published)
 	assert.Empty(t, store.snapshotDeadLettered(),
 		"an unreadable configuration must not be treated as a deployment without Kafka")
-	assert.Equal(t, model.EventOutboxStatusDLTPending, store.row(t, row.EventID).Status,
+	stored := store.row(t, row.EventID)
+	assert.Equal(t, model.EventOutboxStatusFailed, stored.Status,
 		"an unreadable configuration must leave the write OWED and recoverable, not retired")
+	assert.Empty(t, stored.DLTTopic,
+		"failed with dlt_topic still unset is what the repair claim selects on, so the write is "+
+			"re-attempted once configuration is readable again")
 	assert.Zero(t, counter.total())
 }
 
@@ -1639,7 +1673,7 @@ func TestDeadLetterRouting_RefusesToRecordADeadLetterWhenConfigurationCannotBeRe
 func TestDeadLetterRouting_RefusesAPublisherItCannotComposeAMessageFor(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_wrong_publisher", "identity.created", "blnk.identities")
+	row := dltExhaustedRow(t, "evt_wrong_publisher", "identity.created", "blnk.identities")
 	store := newDltFakeStore().withRow(row)
 
 	unsupported := &dltFakePublisher{}
@@ -1662,7 +1696,7 @@ func TestDeadLetterRouting_RefusesAPublisherItCannotComposeAMessageFor(t *testin
 func TestDeadLetterRouting_RejectsARowWithoutADatabaseIdentity(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_no_id", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_no_id", "transaction.applied", "blnk.transactions")
 	row.ID = 0
 
 	transport := &dltFakeTransport{}
@@ -1683,7 +1717,7 @@ func TestDeadLetterRouting_RejectsARowWithoutADatabaseIdentity(t *testing.T) {
 func TestDeadLetterRouting_ReportsAFailedWriteAndLeavesTheRowInTheInventory(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_write_failed", "transaction.void", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_write_failed", "transaction.void", "blnk.transactions")
 	store := newDltFakeStore().withRow(row)
 	transport := &dltFakeTransport{writeErr: errors.New("broken pipe")}
 	service := dltNewService(store, &dltFakePublisher{}, transport)
@@ -1695,13 +1729,17 @@ func TestDeadLetterRouting_ReportsAFailedWriteAndLeavesTheRowInTheInventory(t *t
 
 	assert.False(t, outcome.Published)
 	assert.Empty(t, store.snapshotDeadLettered(), "the row must not be recorded after a failed write")
-	assert.Equal(t, model.EventOutboxStatusDLTPending, store.row(t, row.EventID).Status,
-		"a failed dead-letter write must leave the row RETRYABLE. dlt_pending is what the recovery "+
-			"pass claims, so the write is re-attempted once this holder's lease lapses; a terminal "+
-			"failed row would never be retried and never be replayable, and the event would exist "+
-			"only in the outbox with no copy on any topic")
-	assert.NotEqual(t, model.EventOutboxStatusFailed, store.row(t, row.EventID).Status,
-		"terminal failed is the outcome this replaced: it reads as a completed hand-off")
+	stored := store.row(t, row.EventID)
+	assert.Equal(t, model.EventOutboxStatusFailed, stored.Status,
+		"a failed dead-letter write must leave the row RETRYABLE: failed with dlt_topic still NULL is "+
+			"what ClaimFailedEventOutboxForDeadLetter claims, so the write is re-attempted once this "+
+			"holder's lease lapses")
+	assert.Empty(t, stored.DLTTopic,
+		"and the coordinate must stay unset, because recording it is what retires the row: a failed row "+
+			"carrying a dlt_topic is outside the repair claim and outside replay, so the event would "+
+			"exist only in the outbox with no copy on any topic")
+	assert.NotEqual(t, model.EventOutboxStatusDeadLettered, stored.Status,
+		"dead_lettered is the outcome this replaced: it reads as a completed hand-off")
 	assert.Zero(t, counter.total(), "nothing was dead-lettered, so nothing may be counted")
 }
 
@@ -1747,7 +1785,7 @@ func TestFailureMetadata_CarriesExactlyTheFiveContractFields(t *testing.T) {
 	// And the serialised document carries precisely those five members — no omitempty
 	// dropping a zero value, and nothing extra.
 	dltPinTopicPrefix(t)
-	row := dltExhaustedRow("evt_metadata_shape", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_metadata_shape", "transaction.applied", "blnk.transactions")
 	service := dltNewService(newDltFakeStore().withRow(row), &dltFakePublisher{}, &dltFakeTransport{})
 
 	outcome, err := service.DeadLetter(context.Background(), row, errors.New(dltPublishFailureReason))
@@ -1775,7 +1813,7 @@ func TestFailureMetadata_CarriesExactlyTheFiveContractFields(t *testing.T) {
 func TestFailureMetadata_AssertsEveryFieldIndividually(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_metadata_fields", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_metadata_fields", "transaction.applied", "blnk.transactions")
 	service := dltNewService(newDltFakeStore().withRow(row), &dltFakePublisher{}, &dltFakeTransport{})
 
 	cause := errors.New(dltPublishFailureReason)
@@ -1817,7 +1855,7 @@ func TestFailureMetadata_AssertsEveryFieldIndividually(t *testing.T) {
 func TestFailureMetadata_ReportsTheConfiguredMaximumAfterExhaustion(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_attempts", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_attempts", "transaction.applied", "blnk.transactions")
 
 	t.Run("caller states nothing", func(t *testing.T) {
 		metadata := BuildFailureMetadata(row, errors.New("boom"), 0, dltFixedNow)
@@ -1876,7 +1914,7 @@ func TestFailureMetadata_ReportsTheConfiguredMaximumAfterExhaustion(t *testing.T
 func TestFailureMetadata_DistinguishesTheFirstAttemptFromTheLast(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_window", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_window", "transaction.applied", "blnk.transactions")
 	service := dltNewService(newDltFakeStore().withRow(row), &dltFakePublisher{}, &dltFakeTransport{})
 
 	outcome, err := service.DeadLetter(context.Background(), row, errors.New(dltPublishFailureReason))
@@ -1952,7 +1990,7 @@ func TestFailureMetadata_DistinguishesTheFirstAttemptFromTheLast(t *testing.T) {
 func TestFailureMetadata_CarriesTheWholePublishErrorText(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_reason", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_reason", "transaction.applied", "blnk.transactions")
 
 	t.Run("the caller's cause wins", func(t *testing.T) {
 		metadata := BuildFailureMetadata(row, errors.New(dltPublishFailureReason), dltExhaustedAttempts, dltFixedNow)
@@ -2002,7 +2040,7 @@ func TestFailureMetadata_CarriesTheWholePublishErrorText(t *testing.T) {
 func TestFailureMetadata_IsAttachedAdditivelySoTheOriginalBytesSurvive(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_additive", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_additive", "transaction.applied", "blnk.transactions")
 	store := newDltFakeStore().withRow(row)
 	transport := &dltFakeTransport{}
 	service := dltNewService(store, &dltFakePublisher{}, transport)
@@ -2069,7 +2107,7 @@ func TestStripFailureMetadata_IsTheExactInverseAndIsIdempotent(t *testing.T) {
 	dltPinTopicPrefix(t)
 
 	t.Run("an ordinary envelope is returned unchanged", func(t *testing.T) {
-		row := dltExhaustedRow("evt_strip_plain", "transaction.applied", "blnk.transactions")
+		row := dltExhaustedRow(t, "evt_strip_plain", "transaction.applied", "blnk.transactions")
 		original := dltOriginalEnvelope(t, row)
 
 		recovered, err := StripFailureMetadata(original)
@@ -2078,7 +2116,7 @@ func TestStripFailureMetadata_IsTheExactInverseAndIsIdempotent(t *testing.T) {
 	})
 
 	t.Run("stripping twice changes nothing the second time", func(t *testing.T) {
-		row := dltExhaustedRow("evt_strip_twice", "transaction.applied", "blnk.transactions")
+		row := dltExhaustedRow(t, "evt_strip_twice", "transaction.applied", "blnk.transactions")
 		service := dltNewService(newDltFakeStore().withRow(row), &dltFakePublisher{}, &dltFakeTransport{})
 
 		outcome, err := service.DeadLetter(context.Background(), row, errors.New("boom"))
@@ -2091,7 +2129,7 @@ func TestStripFailureMetadata_IsTheExactInverseAndIsIdempotent(t *testing.T) {
 	})
 
 	t.Run("a payload naming the member deeper inside is not mistaken for the attachment", func(t *testing.T) {
-		row := dltExhaustedRow("evt_strip_decoy", "transaction.applied", "blnk.transactions")
+		row := dltExhaustedRow(t, "evt_strip_decoy", "transaction.applied", "blnk.transactions")
 		row.Payload = json.RawMessage(
 			`{"event":"transaction.applied","data":{"failure_metadata":"a subscriber's own field"}}`,
 		)
@@ -2119,7 +2157,7 @@ func TestStripFailureMetadata_IsTheExactInverseAndIsIdempotent(t *testing.T) {
 func TestComposeDeadLetterMessage_RefusesMetadataItCannotSpliceSafely(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_compose_guard", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_compose_guard", "transaction.applied", "blnk.transactions")
 
 	for name, metadata := range map[string]json.RawMessage{
 		"absent":  nil,
@@ -2182,7 +2220,7 @@ type dltReplayFixture struct {
 func dltNewReplayFixture(t *testing.T, eventType, topic, metadataTopic string) *dltReplayFixture {
 	t.Helper()
 
-	row := dltExhaustedRow("evt_"+eventType+"_replay", eventType, topic)
+	row := dltExhaustedRow(t, "evt_"+eventType+"_replay", eventType, topic)
 	original := dltOriginalEnvelope(t, row)
 
 	store := newDltFakeStore().withRow(row)
@@ -2219,16 +2257,19 @@ func dltNewReplayFixture(t *testing.T, eventType, topic, metadataTopic string) *
 
 // replayedMessage returns the bytes the recorded replay would have put on the wire.
 //
-// It serialises the captured request through the SAME envelope serialiser the Kafka publisher
-// uses, so the comparison is against the real message value rather than against a
-// reconstruction of it. This is the assertion criterion V-9 is decided by.
+// It resolves the captured request through the SAME function the Kafka publisher resolves its
+// message value with, so the comparison is against the real message value rather than against a
+// reconstruction of it. That means the stored envelope where the request carries one, which is
+// the case for every row read out of the outbox. This is the assertion criterion V-9 is decided
+// by, and resolving rather than re-serialising is what keeps it from being decided between two
+// rebuilt values.
 func (f *dltReplayFixture) replayedMessage(t *testing.T) []byte {
 	t.Helper()
 
 	requests := f.publisher.snapshotRequests()
 	require.Len(t, requests, 1, "exactly one replay publish must have been issued")
 
-	message, err := marshalLedgerEvent(requests[0].Event)
+	message, err := resolveEventValue(requests[0])
 	require.NoError(t, err, "the replayed event must serialise")
 
 	return message
@@ -2677,7 +2718,7 @@ func TestReplayDeadLetteredEvent_RejectsAnEventThatIsNotDeadLettered(t *testing.
 		model.EventOutboxStatusFailed,
 	} {
 		t.Run(status, func(t *testing.T) {
-			row := dltExhaustedRow("evt_state_"+status, "transaction.applied", "blnk.transactions")
+			row := dltExhaustedRow(t, "evt_state_"+status, "transaction.applied", "blnk.transactions")
 			row.Status = status
 
 			store := newDltFakeStore().withRow(row)
@@ -2810,7 +2851,7 @@ func TestReplayDeadLetteredEvent_ReportsAFailedRepublish(t *testing.T) {
 func TestWriteDeadLetterMessage_DoesNotLeakTheBrokerToTheCaller(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_broker_detail", "balance.created", "blnk.balances")
+	row := dltExhaustedRow(t, "evt_broker_detail", "balance.created", "blnk.balances")
 	store := newDltFakeStore().withRow(row)
 
 	transport := &dltFakeTransport{
@@ -2948,7 +2989,7 @@ func TestDeadLetterOperations_ReportAMissingDatasourceLegibly(t *testing.T) {
 func TestDeadLetterMetrics_CountsEachDeadLetteredEventExactlyOnce(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_counted_once", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_counted_once", "transaction.applied", "blnk.transactions")
 	store := newDltFakeStore().withRow(row)
 	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
 
@@ -2969,7 +3010,7 @@ func TestDeadLetterMetrics_CountsEachDeadLetteredEventExactlyOnce(t *testing.T) 
 	assert.Equal(t, "transaction.applied", records[0].attributes[publishAttrEventType])
 
 	t.Run("a second, different event adds exactly one more", func(t *testing.T) {
-		second := dltExhaustedRow("evt_counted_once_again", "balance.created", "blnk.balances")
+		second := dltExhaustedRow(t, "evt_counted_once_again", "balance.created", "blnk.balances")
 		store.withRow(second)
 
 		_, secondErr := service.DeadLetter(context.Background(), second, errors.New("boom"))
@@ -2991,7 +3032,7 @@ func TestDeadLetterMetrics_CountNothingWhenTheDeadLetteringDidNotComplete(t *tes
 	dltPinTopicPrefix(t)
 
 	t.Run("the write failed", func(t *testing.T) {
-		row := dltExhaustedRow("evt_uncounted_write", "transaction.applied", "blnk.transactions")
+		row := dltExhaustedRow(t, "evt_uncounted_write", "transaction.applied", "blnk.transactions")
 		service := dltNewService(
 			newDltFakeStore().withRow(row),
 			&dltFakePublisher{},
@@ -3006,7 +3047,7 @@ func TestDeadLetterMetrics_CountNothingWhenTheDeadLetteringDidNotComplete(t *tes
 	})
 
 	t.Run("the recording failed", func(t *testing.T) {
-		row := dltExhaustedRow("evt_uncounted_record", "transaction.applied", "blnk.transactions")
+		row := dltExhaustedRow(t, "evt_uncounted_record", "transaction.applied", "blnk.transactions")
 		store := newDltFakeStore().withRow(row)
 		store.markDeadLetteredErr = errors.New("deadlock detected")
 		service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
@@ -3041,7 +3082,7 @@ func TestDeadLetterMetrics_RecordsEveryDeadLetterWriteWithItsPurposeAndDuration(
 	dltPinTopicPrefix(t)
 
 	t.Run("an acknowledged write is one dead_lettered attempt with the dead_letter token", func(t *testing.T) {
-		row := dltExhaustedRow("evt_attempt_outcome", "transaction.applied", "blnk.transactions")
+		row := dltExhaustedRow(t, "evt_attempt_outcome", "transaction.applied", "blnk.transactions")
 		service := dltNewService(newDltFakeStore().withRow(row), &dltFakePublisher{}, &dltFakeTransport{})
 
 		attempts := dltCapturePublishAttempts(t)
@@ -3066,7 +3107,7 @@ func TestDeadLetterMetrics_RecordsEveryDeadLetterWriteWithItsPurposeAndDuration(
 	})
 
 	t.Run("a write that did not land is one failed attempt, also measured", func(t *testing.T) {
-		failing := dltExhaustedRow("evt_attempt_outcome_failed", "transaction.applied", "blnk.transactions")
+		failing := dltExhaustedRow(t, "evt_attempt_outcome_failed", "transaction.applied", "blnk.transactions")
 		service := dltNewService(
 			newDltFakeStore().withRow(failing),
 			&dltFakePublisher{},
@@ -3092,7 +3133,7 @@ func TestDeadLetterMetrics_RecordsEveryDeadLetterWriteWithItsPurposeAndDuration(
 	})
 
 	t.Run("a deployment with no transport records the failed attempt too", func(t *testing.T) {
-		orphan := dltExhaustedRow("evt_attempt_outcome_no_transport", "transaction.applied", "blnk.transactions")
+		orphan := dltExhaustedRow(t, "evt_attempt_outcome_no_transport", "transaction.applied", "blnk.transactions")
 		service := dltNewService(
 			newDltFakeStore().withRow(orphan),
 			&dltFakePublisher{},
@@ -3126,11 +3167,11 @@ func TestDeadLetterMetrics_RecordsEveryDeadLetterWriteWithItsPurposeAndDuration(
 func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	oldest := dltAgedRow("evt_age_oldest", "transaction.applied", "blnk.transactions",
+	oldest := dltAgedRow(t, "evt_age_oldest", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 45*time.Minute)
-	newest := dltAgedRow("evt_age_newest", "transaction.applied", "blnk.transactions",
+	newest := dltAgedRow(t, "evt_age_newest", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 2*time.Minute)
-	pendingWrite := dltAgedRow("evt_age_failed", "balance.created", "blnk.balances",
+	pendingWrite := dltAgedRow(t, "evt_age_failed", "balance.created", "blnk.balances",
 		model.EventOutboxStatusFailed, "", 20*time.Minute)
 
 	// Newest first, exactly as the repository orders the inventory.
@@ -3154,6 +3195,7 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	assert.Equal(t, 20*time.Minute, report.OldestByTopic["blnk.balances.dlt"],
 		"a failed row must be attributed to the dead-letter topic it is bound for")
 	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.identities.dlt"])
+	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.ledgers.dlt"])
 	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.system.dlt"])
 	assert.Equal(t, 45*time.Minute, report.OldestAge(),
 		"OldestAge is the single number the 15-minute alert is expressed against")
@@ -3165,6 +3207,7 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	assert.InDelta(t, (45 * time.Minute).Seconds(), values["blnk.transactions.dlt"], 0.0001)
 	assert.InDelta(t, (20 * time.Minute).Seconds(), values["blnk.balances.dlt"], 0.0001)
 	assert.InDelta(t, 0.0, values["blnk.identities.dlt"], 0.0001)
+	assert.InDelta(t, 0.0, values["blnk.ledgers.dlt"], 0.0001)
 	assert.InDelta(t, 0.0, values["blnk.system.dlt"], 0.0001)
 	assert.Greater(t, values["blnk.transactions.dlt"], 900.0,
 		"45 minutes must exceed the 900-second alert threshold, which is what makes the rule fire")
@@ -3185,7 +3228,7 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	})
 
 	t.Run("a future-dated row cannot lower the maximum", func(t *testing.T) {
-		skewed := dltAgedRow("evt_age_skewed", "identity.created", "blnk.identities",
+		skewed := dltAgedRow(t, "evt_age_skewed", "identity.created", "blnk.identities",
 			model.EventOutboxStatusDeadLettered, "blnk.identities.dlt", -10*time.Minute)
 		skewedStore := newDltFakeStore().withRow(skewed)
 		skewedService := dltNewService(skewedStore, &dltFakePublisher{}, &dltFakeTransport{})
@@ -3376,14 +3419,14 @@ func TestDeadLetterAgeGauge_ReducesToTheMaximumRatherThanTheLastRowSeen(t *testi
 
 	// Occurred 50 minutes ago, given up on 45 minutes ago: it has been sitting on the
 	// dead-letter topic ever since, and it is the entry the alert exists for.
-	stale := dltAgedRow("evt_age_stale", "transaction.applied", "blnk.transactions",
+	stale := dltAgedRow(t, "evt_age_stale", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 45*time.Minute)
 	stale.OccurredAt = dltFixedNow.Add(-50 * time.Minute)
 
 	// Occurred 90 minutes ago but sat in a relay backlog, so its final attempt was only two
 	// minutes ago. It occurred EARLIER, so it sorts later in the occurrence-ordered inventory,
 	// yet it is far newer by age.
-	lateRetry := dltAgedRow("evt_age_late_retry", "transaction.applied", "blnk.transactions",
+	lateRetry := dltAgedRow(t, "evt_age_late_retry", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 2*time.Minute)
 	lateRetry.OccurredAt = dltFixedNow.Add(-90 * time.Minute)
 
@@ -3420,7 +3463,7 @@ func TestDeadLetterAgeGauge_ReducesToTheMaximumRatherThanTheLastRowSeen(t *testi
 func TestDeadLetterAgeGauge_IsTheOnlyMaintainerOfTheAgeGauge(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_gauge_untouched", "transaction.applied", "blnk.transactions")
+	row := dltExhaustedRow(t, "evt_gauge_untouched", "transaction.applied", "blnk.transactions")
 	service := dltNewService(newDltFakeStore().withRow(row), &dltFakePublisher{}, &dltFakeTransport{})
 
 	gauge := dltCaptureAgeGauge(t)
@@ -3442,8 +3485,14 @@ func TestDeadLetterAgeGauge_IsTheOnlyMaintainerOfTheAgeGauge(t *testing.T) {
 // holds for such a row and what the listing hands to the API projection. A failed entry carries
 // none — it has not reached a dead-letter topic yet — which is itself a state the inventory has to
 // present.
-func dltAgedRow(eventID, eventType, topic, status, dltTopic string, age time.Duration) model.EventOutbox {
-	row := dltExhaustedRow(eventID, eventType, topic)
+func dltAgedRow(
+	t *testing.T,
+	eventID, eventType, topic, status, dltTopic string,
+	age time.Duration,
+) model.EventOutbox {
+	t.Helper()
+
+	row := dltExhaustedRow(t, eventID, eventType, topic)
 
 	lastAttempt := dltFixedNow.Add(-age)
 	firstAttempt := lastAttempt.Add(-31 * time.Second)
@@ -3452,6 +3501,11 @@ func dltAgedRow(eventID, eventType, topic, status, dltTopic string, age time.Dur
 	row.OccurredAt = firstAttempt.Add(-time.Minute)
 	row.Status = status
 	row.DLTTopic = dltTopic
+
+	// Re-stamped because occurred_at moved: the stored envelope carries that instant, so
+	// leaving the inherited bytes behind would describe a row whose event_raw disagrees with
+	// its own columns — a state no writer produces.
+	dltStampCanonicalEnvelope(t, &row)
 
 	if status == model.EventOutboxStatusDeadLettered {
 		// Produced by the implementation's own builder, so the fixture cannot describe a shape
@@ -3485,7 +3539,7 @@ func dltAgedRow(eventID, eventType, topic, status, dltTopic string, age time.Dur
 func TestListDeadLetterEvents_ReadsTheOutboxTableAndNeverAKafkaTopic(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	entry := dltAgedRow("evt_list_source", "transaction.applied", "blnk.transactions",
+	entry := dltAgedRow(t, "evt_list_source", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 5*time.Minute)
 
 	store := newDltFakeStore().withRow(entry)
@@ -3541,9 +3595,9 @@ func TestListDeadLetterEvents_ReadsTheOutboxTableAndNeverAKafkaTopic(t *testing.
 func TestListDeadLetterEvents_CoversBothTerminalFailureStates(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	deadLettered := dltAgedRow("evt_list_dead", "transaction.applied", "blnk.transactions",
+	deadLettered := dltAgedRow(t, "evt_list_dead", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 3*time.Minute)
-	failed := dltAgedRow("evt_list_failed", "balance.created", "blnk.balances",
+	failed := dltAgedRow(t, "evt_list_failed", "balance.created", "blnk.balances",
 		model.EventOutboxStatusFailed, "", 9*time.Minute)
 
 	service := dltNewService(
@@ -3633,13 +3687,13 @@ func TestListDeadLetterEvents_PagesWithTheDocumentedBounds(t *testing.T) {
 func TestListDeadLetterEvents_AppliesTheExposedFilters(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	applied := dltAgedRow("evt_filter_applied", "transaction.applied", "blnk.transactions",
+	applied := dltAgedRow(t, "evt_filter_applied", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute)
-	void := dltAgedRow("evt_filter_void", "transaction.void", "blnk.transactions",
+	void := dltAgedRow(t, "evt_filter_void", "transaction.void", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 2*time.Minute)
-	appliedAgain := dltAgedRow("evt_filter_applied_again", "transaction.applied", "blnk.transactions",
+	appliedAgain := dltAgedRow(t, "evt_filter_applied_again", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusFailed, "", 3*time.Minute)
-	balance := dltAgedRow("evt_filter_balance", "balance.monitor", "blnk.balances",
+	balance := dltAgedRow(t, "evt_filter_balance", "balance.monitor", "blnk.balances",
 		model.EventOutboxStatusDeadLettered, "blnk.balances.dlt", 4*time.Minute)
 
 	store := newDltFakeStore().withRow(applied).withRow(void).withRow(appliedAgain).withRow(balance)

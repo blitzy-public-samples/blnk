@@ -38,10 +38,12 @@ import (
 //
 // # The access model, stated once
 //
-// THERE ARE NO PER-TENANT TOPICS. Blnk owns four category topics and a `.dlt` sibling for each
-// (event_topics.go); three of those categories are SUBSCRIBER-FACING — transactions, balances
-// and identities — while system is INTERNAL and no subscriber may be granted it, nor any
-// dead-letter topic. A subscriber is granted a SUBSET of the grantable set,
+// THERE ARE NO PER-TENANT TOPICS. Blnk owns five category topics and a `.dlt` sibling for each
+// (event_topics.go); four of those categories are SUBSCRIBER-FACING — transactions, balances,
+// identities and ledgers — while system is INTERNAL and no subscriber may be granted it, nor any
+// dead-letter topic. Every event that describes LEDGER STATE therefore has a grantable route;
+// the one event type without one is system.error, whose frozen body carries verbatim internal
+// error text. A subscriber is granted a SUBSET of the grantable set,
 // whatever its registry row authorises, and isolation comes from four things:
 //
 //  1. The KAFKA PRINCIPAL. Each subscriber is a distinct SASL/SCRAM identity derived
@@ -2969,11 +2971,21 @@ func (s *EventSubscriberService) PurgeMigratedWebhookURLs(
 // These are how the rest of the codebase reaches the subscriber surface: the API handlers
 // hold a *Blnk and call through it, exactly as they do for every other domain operation.
 //
-// The pattern is the one event_dlt.go established. Operations that touch only the registry
-// build a service, use it, and let it go — no administrative client is resolved, so there is
-// nothing to release, and they work with the broker down. Operations that reach the broker
-// build a service, use it, and CLOSE it, so the client such a service resolves for itself is
-// released rather than held until the process ends.
+// The pattern is the one event_dlt.go established, with one rule applied without exception:
+// EVERY wrapper closes the service it builds. Not only the ones that reach the broker today.
+//
+// The narrower rule — close only where an administrative client is resolved — is what this
+// replaced, and it was wrong twice over. It leaked outright at UpdateSubscriber, which resolves
+// a provisioner twice, once to prune the broker-side grant and once to re-grant it, and whose
+// wrapper closed nothing; every update therefore held that client's connections until the
+// process ended. And it made every other wrapper's correctness depend on a fact about a
+// DIFFERENT function, several hundred lines away, that no compiler checks: the moment a
+// registry-only operation grew a broker touch, its wrapper would start leaking silently and
+// the wrapper itself would look untouched in the diff.
+//
+// Closing unconditionally costs nothing to get right. Close is idempotent, nil-safe, a no-op
+// when nothing was resolved, and it never closes an INJECTED client — so a wrapper cannot be
+// wrong by calling it, and cannot be right by omitting it.
 //
 // Nothing caches a service on the Blnk instance, because that would put administrative-client
 // lifetime inside a struct whose Close does not own it.
@@ -2982,9 +2994,13 @@ func (s *EventSubscriberService) PurgeMigratedWebhookURLs(
 // EventSubscribers returns a subscriber service bound to this instance's datasource.
 //
 // The returned service resolves an administrative client from live configuration the first
-// time one is needed, so a CALLER THAT ISSUES OR REVOKES MUST CLOSE IT — `defer
-// service.Close()` — or the connections that client opens are held until the process ends. A
-// caller doing registry work only may ignore Close: nothing is resolved and nothing is held.
+// time one is needed, so EVERY CALLER MUST CLOSE IT — `defer service.Close()` — or the
+// connections that client opens are held until the process ends.
+//
+// The obligation is stated unconditionally on purpose. Close is a no-op when nothing was
+// resolved, so a caller doing registry work only loses nothing by honouring it, while a caller
+// that reasons about which operations touch the broker is relying on a fact about another
+// function that will eventually stop being true. Every Blnk wrapper below closes.
 //
 // It is nil-safe: a nil instance yields a service whose operations report an unavailable
 // registry rather than panicking.
@@ -3003,28 +3019,47 @@ func (b *Blnk) RegisterEventSubscriber(
 	ctx context.Context,
 	registration SubscriberRegistration,
 ) (*model.EventSubscriber, error) {
-	return b.EventSubscribers().RegisterSubscriber(ctx, registration)
+	service := b.EventSubscribers()
+	defer closeEventSubscriberService(service)
+
+	return service.RegisterSubscriber(ctx, registration)
 }
 
 // GetEventSubscriber reads one subscriber. It is the read behind
 // GET /subscribers/:subscriber_id.
 func (b *Blnk) GetEventSubscriber(ctx context.Context, subscriberID string) (*model.EventSubscriber, error) {
-	return b.EventSubscribers().GetSubscriber(ctx, subscriberID)
+	service := b.EventSubscribers()
+	defer closeEventSubscriberService(service)
+
+	return service.GetSubscriber(ctx, subscriberID)
 }
 
 // ListEventSubscribers pages the registry. It is the read behind GET /subscribers.
 func (b *Blnk) ListEventSubscribers(ctx context.Context, limit, offset int) ([]model.EventSubscriber, error) {
-	return b.EventSubscribers().ListSubscribers(ctx, limit, offset)
+	service := b.EventSubscribers()
+	defer closeEventSubscriberService(service)
+
+	return service.ListSubscribers(ctx, limit, offset)
 }
 
 // UpdateEventSubscriber applies the mutable subset of a subscriber. It is the write behind
 // PUT /subscribers/:subscriber_id.
+//
+// It REACHES THE BROKER, which is easy to miss from the name: reconciling authorized_topics
+// means pruning the ACL bindings the new authorization no longer implies and granting the ones
+// it adds, so UpdateSubscriber resolves an administrative client twice. The short-lived client
+// is closed before returning, so the handler needs no lifecycle handling of its own — and
+// before this close existed, every subscriber update held that client's connections for the
+// remaining life of the process.
 func (b *Blnk) UpdateEventSubscriber(
 	ctx context.Context,
 	subscriberID string,
 	changes SubscriberUpdate,
 ) (*model.EventSubscriber, error) {
-	return b.EventSubscribers().UpdateSubscriber(ctx, subscriberID, changes)
+	service := b.EventSubscribers()
+	defer closeEventSubscriberService(service)
+
+	return service.UpdateSubscriber(ctx, subscriberID, changes)
 }
 
 // DeregisterEventSubscriber removes a subscriber and revokes its Kafka access. It is the write
@@ -3081,7 +3116,10 @@ func (b *Blnk) RecordSubscriberWebhookSubscription(
 	ctx context.Context,
 	subscriberID, webhookURL string,
 ) (*model.EventSubscriber, error) {
-	return b.EventSubscribers().RecordLegacyWebhookSubscription(ctx, subscriberID, webhookURL)
+	service := b.EventSubscribers()
+	defer closeEventSubscriberService(service)
+
+	return service.RecordLegacyWebhookSubscription(ctx, subscriberID, webhookURL)
 }
 
 // ClearSubscriberWebhookSubscription removes a subscriber's recorded legacy endpoint. It is
@@ -3092,19 +3130,28 @@ func (b *Blnk) ClearSubscriberWebhookSubscription(
 	ctx context.Context,
 	subscriberID string,
 ) (*model.EventSubscriber, error) {
-	return b.EventSubscribers().ClearLegacyWebhookSubscription(ctx, subscriberID)
+	service := b.EventSubscribers()
+	defer closeEventSubscriberService(service)
+
+	return service.ClearLegacyWebhookSubscription(ctx, subscriberID)
 }
 
 // MarkEventSubscriberMigrated records that a subscriber has completed its move to Kafka
 // consumption.
 func (b *Blnk) MarkEventSubscriberMigrated(ctx context.Context, subscriberID string) (time.Time, error) {
-	return b.EventSubscribers().MarkSubscriberMigrated(ctx, subscriberID)
+	service := b.EventSubscribers()
+	defer closeEventSubscriberService(service)
+
+	return service.MarkSubscriberMigrated(ctx, subscriberID)
 }
 
 // PurgeMigratedSubscriberWebhookURLs forgets the legacy endpoints of subscribers that migrated
 // before a cut-off.
 func (b *Blnk) PurgeMigratedSubscriberWebhookURLs(ctx context.Context, migratedBefore time.Time) (int64, error) {
-	return b.EventSubscribers().PurgeMigratedWebhookURLs(ctx, migratedBefore)
+	service := b.EventSubscribers()
+	defer closeEventSubscriberService(service)
+
+	return service.PurgeMigratedWebhookURLs(ctx, migratedBefore)
 }
 
 // closeEventSubscriberService closes a service built for one operation, logging rather than

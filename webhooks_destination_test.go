@@ -31,12 +31,18 @@ package blnk
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -155,7 +161,7 @@ func TestLegacyWebhookClient_RefusesToFollowARedirect(t *testing.T) {
 
 			storeDestinationConfig(t, subscriber.URL, true)
 
-			err := processHTTPRaw(context.Background(), destinationTestPayload(t), initializeHTTPClient())
+			err := processHTTPRaw(context.Background(), "", destinationTestPayload(t), initializeHTTPClient())
 
 			require.Error(t, err, "a redirected delivery must fail rather than be followed")
 			assert.ErrorIs(t, err, errLegacyWebhookRedirect,
@@ -199,7 +205,7 @@ func TestLegacyWebhookClient_RedirectRefusalIsNotConfigurable(t *testing.T) {
 			// With the assertion unset the delivery is refused before a request is even built,
 			// so the redirect is only reachable with it set. Both arms must fail; the arm that
 			// reaches the redirect must fail BECAUSE of it.
-			err := processHTTPRaw(context.Background(), destinationTestPayload(t), initializeHTTPClient())
+			err := processHTTPRaw(context.Background(), "", destinationTestPayload(t), initializeHTTPClient())
 			require.Error(t, err)
 
 			if allowPrivate {
@@ -397,7 +403,7 @@ func TestLegacyWebhookClient_RefusesARebindingHost(t *testing.T) {
 		return dialer.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", dialPort))
 	}
 
-	deliveryErr := processHTTPRaw(context.Background(), destinationTestPayload(t), client)
+	deliveryErr := processHTTPRaw(context.Background(), "", destinationTestPayload(t), client)
 
 	require.Error(t, deliveryErr, "a name that resolves to loopback must not be delivered to")
 	assert.ErrorIs(t, deliveryErr, errLegacyWebhookDestination,
@@ -496,7 +502,7 @@ func TestProcessHTTPRaw_RejudgesTheDestinationOnEveryDelivery(t *testing.T) {
 	payload := destinationTestPayload(t)
 	client := initializeHTTPClient()
 
-	require.NoError(t, processHTTPRaw(context.Background(), payload, client),
+	require.NoError(t, processHTTPRaw(context.Background(), "", payload, client),
 		"the acceptable destination must deliver, or the negative below proves nothing")
 	require.Len(t, received(), 1)
 
@@ -504,7 +510,7 @@ func TestProcessHTTPRaw_RejudgesTheDestinationOnEveryDelivery(t *testing.T) {
 	cnf.Notification.Webhook.Url = "https://169.254.169.254/latest/meta-data/"
 	config.ConfigStore.Store(cnf)
 
-	err := processHTTPRaw(context.Background(), payload, client)
+	err := processHTTPRaw(context.Background(), "", payload, client)
 	require.Error(t, err, "the destination is re-judged on every delivery, not once at enqueue")
 	assert.ErrorIs(t, err, errLegacyWebhookDestination)
 	assert.Len(t, received(), 1, "no second delivery reached the original receiver either")
@@ -536,7 +542,7 @@ func TestProcessHTTPRaw_ConfiguredHeadersCannotShadowTheSignature(t *testing.T) 
 	}
 	config.ConfigStore.Store(cnf)
 
-	require.NoError(t, processHTTPRaw(context.Background(), destinationTestPayload(t), initializeHTTPClient()))
+	require.NoError(t, processHTTPRaw(context.Background(), "", destinationTestPayload(t), initializeHTTPClient()))
 
 	requests := received()
 	require.Len(t, requests, 1)
@@ -868,7 +874,7 @@ func TestGuardsHoldForEveryDeliveryEntryPoint(t *testing.T) {
 
 	client := initializeHTTPClient()
 
-	rawErr := processHTTPRaw(context.Background(), destinationTestPayload(t), client)
+	rawErr := processHTTPRaw(context.Background(), "", destinationTestPayload(t), client)
 	require.Error(t, rawErr)
 	assert.ErrorIs(t, rawErr, errLegacyWebhookDestination)
 
@@ -880,4 +886,178 @@ func TestGuardsHoldForEveryDeliveryEntryPoint(t *testing.T) {
 	assert.ErrorIs(t, wrapperErr, errLegacyWebhookDestination,
 		"processHTTP delegates to processHTTPRaw, so the guard cannot be bypassed by choosing "+
 			"the other entry point")
+}
+
+// ---------------------------------------------------------------------------
+// The event identity the receiver deduplicates on
+// ---------------------------------------------------------------------------
+
+// TestProcessHTTPRaw_CarriesTheEventIdentityToTheReceiver is the delivery half of the
+// at-least-once contract: the transport is at-least-once with a bounded suppression window, so
+// the receiver has to be able to deduplicate, and until this header existed it had nothing to
+// deduplicate on.
+//
+// The body cannot carry it. It is the FROZEN legacy envelope — `{"event":…,"data":…}` — whose
+// bytes are asserted equal to the bytes published to Kafka, and two deliveries of one event are
+// byte-identical, so hashing the body cannot tell a duplicate from a legitimately repeated
+// event. A header is the only place the identity fits without breaking the payload-preservation
+// guarantee in the migration's final week.
+func TestProcessHTTPRaw_CarriesTheEventIdentityToTheReceiver(t *testing.T) {
+	const eventID = "0f6e2c8a-1b4d-4e9f-8a7c-2d5b6e3f1a9c"
+
+	t.Run("the identity reaches the receiver and the body is untouched", func(t *testing.T) {
+		server, received := newWebhookReceiver(http.StatusOK)
+		defer server.Close()
+
+		storeDestinationConfig(t, server.URL, true)
+		payload := destinationTestPayload(t)
+
+		require.NoError(t, processHTTPRaw(context.Background(), eventID, payload, initializeHTTPClient()))
+
+		requests := received()
+		require.Len(t, requests, 1)
+
+		assert.Equal(t, eventID, requests[0].headers.Get(LegacyWebhookEventIDHeader),
+			"the receiver must be given the event id, which is the SAME key the Kafka subscriber "+
+				"deduplicates on, so a migrating subscriber keeps one idempotency key rather than two")
+
+		// THE BODY IS BYTE-IDENTICAL. This is the assertion that makes the header safe: the
+		// payload-preservation guarantee is that a subscriber's existing parser works unchanged
+		// and that these bytes equal the bytes on the Kafka topic, and a member added to the
+		// envelope would break both.
+		assert.Equal(t, payload, requests[0].body,
+			"adding the identity must not disturb a single byte of the body")
+	})
+
+	t.Run("the identity is outside the signature, which still verifies over the body", func(t *testing.T) {
+		server, received := newWebhookReceiver(http.StatusOK)
+		defer server.Close()
+
+		cnf := storeDestinationConfig(t, server.URL, true)
+		cnf.Server.SecretKey = "destination-test-signing-secret"
+		config.ConfigStore.Store(cnf)
+
+		payload := destinationTestPayload(t)
+		require.NoError(t, processHTTPRaw(context.Background(), eventID, payload, initializeHTTPClient()))
+
+		requests := received()
+		require.Len(t, requests, 1)
+		headers := requests[0].headers
+
+		timestamp := headers.Get("X-Blnk-Timestamp")
+		require.NotEmpty(t, timestamp)
+
+		// Recomputed exactly as a receiver does — over timestamp + "." + body, with no header
+		// material. The identity is therefore NOT signed, which is a property to state rather
+		// than to leave implicit: it is a correlation and deduplication key, and the signature
+		// over the body remains the only evidence the delivery came from this deployment.
+		mac := hmac.New(sha256.New, []byte("destination-test-signing-secret"))
+		_, err := mac.Write([]byte(timestamp + "." + string(requests[0].body)))
+		require.NoError(t, err)
+		assert.Equal(t, hex.EncodeToString(mac.Sum(nil)), headers.Get("X-Blnk-Signature"),
+			"the signature must still verify over the body alone, unaffected by the added header")
+
+		assert.Equal(t, eventID, headers.Get(LegacyWebhookEventIDHeader))
+	})
+
+	t.Run("no identity means no header, never an empty one", func(t *testing.T) {
+		server, received := newWebhookReceiver(http.StatusOK)
+		defer server.Close()
+
+		storeDestinationConfig(t, server.URL, true)
+
+		// SendWebhook's path: a struct, so there is no outbox row and no event id behind it.
+		for name, identity := range map[string]string{
+			"an absent identity":  "",
+			"a blank identity":    "   ",
+			"a tab and a newline": "\t\n",
+		} {
+			require.NoError(t, processHTTPRaw(context.Background(), identity, destinationTestPayload(t), initializeHTTPClient()),
+				"%s must still deliver", name)
+		}
+
+		requests := received()
+		require.Len(t, requests, 3)
+
+		for index, request := range requests {
+			values, present := request.headers[textproto.CanonicalMIMEHeaderKey(LegacyWebhookEventIDHeader)]
+
+			// ABSENT, not empty. A receiver keying on an empty value would treat every such
+			// delivery as the same event and discard all but the first — silently, and for as
+			// long as its idempotency store retained the key.
+			assert.Falsef(t, present,
+				"delivery %d must omit the header entirely rather than send it blank; got %v",
+				index, values)
+		}
+	})
+
+	t.Run("a configured header cannot forge or erase the identity", func(t *testing.T) {
+		server, received := newWebhookReceiver(http.StatusOK)
+		defer server.Close()
+
+		cnf := storeDestinationConfig(t, server.URL, true)
+		cnf.Notification.Webhook.Headers = map[string]string{
+			// Both spellings, because Header.Set canonicalises and a lower-cased key would
+			// otherwise reach the same entry through a different comparison.
+			"X-Blnk-Event-Id": "forged-identity",
+			"x-blnk-event-id": "",
+		}
+		config.ConfigStore.Store(cnf)
+
+		require.NoError(t, processHTTPRaw(context.Background(), eventID, destinationTestPayload(t), initializeHTTPClient()))
+
+		requests := received()
+		require.Len(t, requests, 1)
+
+		// The transport owns this header for the same reason it owns the signature: a receiver
+		// deduplicating on it must be able to trust it. A configured constant would collapse
+		// every event onto one identity, and the receiver would discard all but the first.
+		assert.Equal(t, eventID, requests[0].headers.Get(LegacyWebhookEventIDHeader),
+			"a configured value must not replace the identity the transport computed")
+		assert.NotEqual(t, "forged-identity", requests[0].headers.Get(LegacyWebhookEventIDHeader))
+	})
+}
+
+// TestLegacyWebhookEventIDFromContext_YieldsNothingWithoutARelayTaskIdentity covers the read
+// side of the arrangement that gets the identity to the delivery.
+//
+// The identity travels as the asynq TASK ID, because the body is frozen and carries none. Only
+// the negative half is reachable from a test: asynq builds the handler context inside an
+// internal package with no exported constructor, so a context carrying a task ID cannot be
+// constructed outside the library. The positive half is therefore asserted where it can be —
+// the namespace round trip in TestLegacyWebhookEventID_IsTheExactInverseOfTheTaskIdentity, the
+// header behaviour in the test above, and the WIRING in
+// TestProcessWebhook_PassesTheRecoveredIdentityToTheDelivery.
+func TestLegacyWebhookEventIDFromContext_YieldsNothingWithoutARelayTaskIdentity(t *testing.T) {
+	//nolint:staticcheck // a nil context is exactly the case being asserted
+	assert.Empty(t, legacyWebhookEventIDFromContext(nil),
+		"a nil context must yield nothing rather than panic: asynq's accessors dereference "+
+			"without a nil check, and recovering an identity must never be the reason a worker dies")
+
+	assert.Empty(t, legacyWebhookEventIDFromContext(context.Background()),
+		"a context with no task metadata must yield nothing, so a delivery outside the worker "+
+			"omits the header rather than sending a fabricated one")
+}
+
+// TestProcessWebhook_PassesTheRecoveredIdentityToTheDelivery asserts the WIRING, because no
+// test can assert it by running it.
+//
+// asynq's handler context is built by an internal package with no exported constructor, so a
+// test cannot produce a context carrying a task ID and cannot observe the header on the path
+// production actually takes. The pieces are each covered — the namespace round trip, the
+// context accessor, and the header behaviour given an identity — and this is what proves they
+// are connected. Without it, ProcessWebhook could pass the empty string forever and every other
+// test in this file would still pass.
+func TestProcessWebhook_PassesTheRecoveredIdentityToTheDelivery(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join(moduleRootDir(t), "webhooks.go"))
+	require.NoError(t, err, "webhooks.go must be readable to assert its wiring")
+
+	assert.Contains(t, string(source),
+		"processHTTPRaw(ctx, legacyWebhookEventIDFromContext(ctx), task.Payload(), b.httpClient)",
+		"ProcessWebhook must recover the event id from the task identity and hand it to the "+
+			"delivery, or the receiver never sees the key it deduplicates on")
+
+	// And the struct path must pass nothing rather than invent something.
+	assert.Contains(t, string(source), `processHTTPRaw(ctx, "", payloadBytes, client)`,
+		"processHTTP has only a struct and no outbox row behind it, so it must pass no identity")
 }

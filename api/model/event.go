@@ -343,10 +343,17 @@ func classifyFailureReason(raw string) string {
 //   - DeadLetterEvent: the response item, carrying no payload and no raw failure text.
 func NewDeadLetterEvent(row model.EventOutbox) DeadLetterEvent {
 	item := DeadLetterEvent{
-		EventID:          row.EventID,
-		EventType:        row.EventType,
-		AggregateID:      row.AggregateID,
-		LedgerID:         row.LedgerID,
+		EventID:     row.EventID,
+		EventType:   row.EventType,
+		AggregateID: row.AggregateID,
+		LedgerID:    row.LedgerID,
+		// The STORED key, never a recomputed one — see the field's own documentation. It
+		// is what pinned the event to its partition, so it is the only field on this
+		// response an ordering question can be answered from, and it was declared and
+		// documented here while never being assigned: every dead-letter projection
+		// omitted it (the tag is omitempty), so the answer read as "this event had no
+		// key" rather than as a gap.
+		PartitionKey:     row.PartitionKey,
 		OccurredAt:       row.OccurredAt,
 		SchemaVersion:    row.SchemaVersion,
 		Topic:            row.Topic,

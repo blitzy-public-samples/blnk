@@ -534,6 +534,19 @@ func (h *dualDeliveryHarness) queuedTaskCount() int {
 // relay held in memory, so the legacy body has genuinely round-tripped through the queue and
 // its equality with the Kafka payload cannot be an artefact of two slices sharing a backing
 // array.
+// NOTE ON THE EVENT-ID HEADER, so its absence here is not mistaken for a defect.
+//
+// A real delivery carries LegacyWebhookEventIDHeader, recovered from the asynq TASK ID. asynq
+// builds the handler context inside an internal package with no exported constructor, so the
+// context below carries no task metadata and the header is therefore OMITTED on this path. That
+// is the harness's limitation, not the transport's: the header is covered against a real HTTP
+// receiver in TestProcessHTTPRaw_CarriesTheEventIdentityToTheReceiver, and the wiring that
+// supplies the identity in production is covered in
+// TestProcessWebhook_PassesTheRecoveredIdentityToTheDelivery.
+//
+// Nothing this file asserts is affected, because the header is outside both the body and the
+// signature: the byte-equality guarantee is about the BODY, and the HMAC is computed over
+// timestamp + "." + body.
 func (h *dualDeliveryHarness) runWebhookWorker(task *asynq.TaskInfo) error {
 	h.t.Helper()
 

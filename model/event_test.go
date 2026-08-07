@@ -237,8 +237,8 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 		{
 			name:      "ledger created",
 			eventType: "ledger.created",
-			want:      EventCategorySystem,
-			reason:    "ledger.created belongs to none of the three named categories, so it routes to the deliberate fourth system category rather than being dropped",
+			want:      EventCategoryLedgers,
+			reason:    "ledger.created belongs to none of the three named categories, so it routes to the deliberate ledgers category - GRANTABLE, because it is ordinary ledger data that every webhook subscriber receives today, and putting it in the internal system category would have published it to a topic no subscriber credential can read",
 		},
 		{
 			name:      "system error",
@@ -317,10 +317,31 @@ func TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory(t *tes
 	assert.Contains(t, grantable, EventCategoryTransactions, "transactions is subscriber-facing ledger data")
 	assert.Contains(t, grantable, EventCategoryBalances, "balances is subscriber-facing ledger data")
 	assert.Contains(t, grantable, EventCategoryIdentities, "identities is subscriber-facing data")
+	// GRANTABLE, and this assertion is the one that matters most in this test, because the
+	// arrangement it pins replaced one in which it was false.
+	//
+	// ledger.created used to share the internal system category with system.error, which made
+	// it PUBLISHED AND UNREACHABLE: the event was captured, relayed and observable, and no
+	// subscriber credential Blnk can issue could read it. Coverage was satisfied on the
+	// publishing side and silently broken on the consuming side, in the one direction the
+	// webhook-to-Kafka migration promises not to regress — every subscriber receives
+	// ledger.created over the legacy HTTP transport today.
+	//
+	// It is grantable because its payload earns it, not because coverage demanded a
+	// concession: a *model.Ledger is a name, an id, a creation instant and caller metadata —
+	// exactly the shape of identity.created, which nobody argues about, and no more sensitive.
+	// It needed a category of its OWN rather than simply being made grantable in place,
+	// because the category it shared carries system.error, and grantable and ungrantable are
+	// opposite requirements that one topic cannot hold at once.
+	assert.Contains(t, grantable, EventCategoryLedgers,
+		"ledger.created is ordinary ledger data that every subscriber receives over the legacy "+
+			"transport today, so its category must be grantable: a published-but-unreachable "+
+			"event type is a consuming-side regression the migration promises not to cause")
+
 	// NOT GRANTABLE, and the case for granting it is worth recording because it is a
-	// reasonable one: blnk.system carries ledger.created and system.error, two of the thirteen
-	// event types the legacy HTTP transport delivered, so a subscriber granted nothing here has
-	// no authorized path to either.
+	// reasonable one: blnk.system carries system.error, one of the thirteen event types the
+	// legacy HTTP transport delivered, so a subscriber granted nothing here has no authorized
+	// path to it.
 	//
 	// It stays internal for two independent reasons, either of which is sufficient.
 	//
@@ -338,15 +359,17 @@ func TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory(t *tes
 	// cannot be established. A grantable catch-all is a disclosure by another name, and it is
 	// what makes the containment half of the fallback real rather than nominal.
 	//
-	// R-1 is a PUBLISHING requirement and is met in full: all thirteen types are published, and
-	// this category is read under the master key, as the dead-letter topics are.
+	// The exclusion now costs a subscriber NOTHING it used to receive, which is what makes it a
+	// clean security boundary rather than a trade: system.error is the only catalogued event
+	// type left inside it, and its audience was always the operator alone. It is read under the
+	// master key, as the dead-letter topics are.
 	assert.NotContains(t, grantable, EventCategorySystem,
 		"the system category carries Blnk's own internal error detail, and — as the catalogue's "+
 			"catch-all — events of unknown provenance whose audience cannot be established, so it "+
 			"must never be grantable to a subscriber")
 
-	assert.Len(t, grantable, 3,
-		"exactly three of the four categories are subscriber-facing; a fourth appearing here means an internal category became grantable")
+	assert.Len(t, grantable, 4,
+		"exactly four of the five categories are subscriber-facing; a fifth appearing here means an internal category became grantable")
 
 	for _, category := range grantable {
 		assert.False(t, IsInternalEventCategory(category),
@@ -455,11 +478,13 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 		"the balances token composes blnk.balances and blnk.balances.dlt")
 	assert.Equal(t, "identities", EventCategoryIdentities,
 		"the identities token composes blnk.identities and blnk.identities.dlt")
+	assert.Equal(t, "ledgers", EventCategoryLedgers,
+		"the ledgers token composes blnk.ledgers and blnk.ledgers.dlt — the grantable home of ledger.created, which exists so that an event every subscriber receives over the legacy transport has a Kafka topic a subscriber can actually be granted")
 	assert.Equal(t, "system", EventCategorySystem,
-		"the system token composes blnk.system and blnk.system.dlt — the deliberate fourth category that keeps ledger and system-error events covered, and the catch-all that keeps an unrecognised event type published rather than dropped")
+		"the system token composes blnk.system and blnk.system.dlt — the internal category that keeps system-error events covered, and the catch-all that keeps an unrecognised event type published rather than dropped")
 
-	assert.Len(t, AllEventCategories(), 4,
-		"the topic contract is four categories and eight topics: a fifth would silently oblige the provisioning script, the Kubernetes configuration, the local stack and every subscriber's topic list to change with it")
+	assert.Len(t, AllEventCategories(), 5,
+		"the topic contract is five categories and ten topics: a sixth would silently oblige the provisioning script, the Kubernetes configuration, the local stack and every subscriber's topic list to change with it")
 
 	// Every token must be mutually distinct, or two categories would collapse onto
 	// one topic and a subscriber filtering by topic would receive events it never
@@ -468,6 +493,7 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 		EventCategoryTransactions: {},
 		EventCategoryBalances:     {},
 		EventCategoryIdentities:   {},
+		EventCategoryLedgers:      {},
 		EventCategorySystem:       {},
 	}
 	assert.Len(t, distinct, len(AllEventCategories()),
@@ -1013,7 +1039,15 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 			// the publish-latency histogram includes the queue wait — measuring from
 			// the claim instead lets a relay an hour behind report the same p99 as an
 			// idle one.
-			"topic", "schema_version", "payload", "occurred_at", "created_at",
+			// event_raw is the CANONICAL ENVELOPE, composed once at capture and read by
+			// every later transport. It sits beside payload rather than replacing it
+			// because the two answer different questions: payload is the legacy webhook
+			// body, which the HTTP leg posts and which is spliced into the envelope, and
+			// event_raw is the Kafka message value in full. Storing the envelope is what
+			// makes byte fidelity a property of the DATA — a member added to the envelope
+			// in a later release cannot change the bytes of an event captured before it,
+			// which rebuilding from these columns on every publish could not promise.
+			"topic", "schema_version", "payload", "event_raw", "occurred_at", "created_at",
 			// relay state machine. next_attempt_at is the DURABLE form of the
 			// configured backoff: the claim predicate is next_attempt_at <= NOW(),
 			// which is what keeps a retrying row out of the claimable set for the
@@ -1137,6 +1171,15 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 			// event types that genuinely have no ledger.
 			"partition_key": false, "ledger_id": true,
 			"topic": false, "schema_version": false, "payload": false,
+			// event_raw is the ONE always-populated column that is nevertheless omitted,
+			// and the reason is the Go type rather than the column. It is []byte, so it
+			// renders as BASE64 — an unreadable duplicate of the payload that is already
+			// rendered above as JSON. The dead-letter projection reports payload_bytes
+			// instead of any body, so nothing that a caller reads depends on this key
+			// being present, while every incidental serialisation of a row would carry a
+			// second copy of the whole event. Its NOT NULL guarantee is enforced where it
+			// belongs — the schema, plus validateEventOutboxEntry — and not by a tag.
+			"event_raw": true,
 			// created_at is NOT NULL with a NOW() default, so it always has a value and
 			// is always reported. It is what a reader of a dead-letter response needs to
 			// tell an event that was captured minutes ago from one captured last week.

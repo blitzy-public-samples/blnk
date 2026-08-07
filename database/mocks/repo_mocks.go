@@ -992,8 +992,12 @@ func (m *MockDataSource) MarkEventDispatched(ctx context.Context, id int64, clai
 // that stubs only the error must still supply an outcome, because the caller reads
 // Exhausted to decide whether to dead-letter — returning a zero outcome on the
 // error path is correct and is what the nil check below produces.
-func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration) (model.EventFailureOutcome, error) {
-	args := m.Called(ctx, id, claimToken, errMsg, retryAfter)
+//
+// terminal is part of the expectation rather than swallowed, so a test can pin that the
+// relay forwarded the publisher's permanent-failure verdict to the durable transition
+// instead of leaving the decision to the attempt count.
+func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, terminal bool) (model.EventFailureOutcome, error) {
+	args := m.Called(ctx, id, claimToken, errMsg, retryAfter, terminal)
 	if args.Get(0) == nil {
 		return model.EventFailureOutcome{}, args.Error(1)
 	}
@@ -1018,14 +1022,6 @@ func (m *MockDataSource) ReleaseEventReplay(ctx context.Context, id int64, claim
 	return args.Error(0)
 }
 
-func (m *MockDataSource) ClaimEventsOwedDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
-	args := m.Called(ctx, batchSize, lockDuration)
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
-	}
-	return args.Get(0).([]model.EventOutbox), args.Error(1)
-}
-
 // ClaimPendingWebhookDeliveries and MarkWebhookDispatched mock the legacy leg of the
 // dual-delivery window and are DELETED with it at the webhook sunset.
 func (m *MockDataSource) ClaimPendingWebhookDeliveries(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
@@ -1039,6 +1035,18 @@ func (m *MockDataSource) ClaimPendingWebhookDeliveries(ctx context.Context, batc
 func (m *MockDataSource) MarkWebhookDispatched(ctx context.Context, id int64, claimToken string) error {
 	args := m.Called(ctx, id, claimToken)
 	return args.Error(0)
+}
+
+// MarkEventLegacyWebhookAttempted mocks the recovery path's failure transition, which
+// records a webhook attempt WITHOUT touching the Kafka leg's terminal state. As with
+// MarkEventWebhookPending, a test that stubs only the error must still supply an outcome,
+// because the caller reads Abandoned to decide what the operator is told.
+func (m *MockDataSource) MarkEventLegacyWebhookAttempted(ctx context.Context, id int64, claimToken string, retryAfter time.Duration) (model.EventWebhookOutcome, error) {
+	args := m.Called(ctx, id, claimToken, retryAfter)
+	if args.Get(0) == nil {
+		return model.EventWebhookOutcome{}, args.Error(1)
+	}
+	return args.Get(0).(model.EventWebhookOutcome), args.Error(1)
 }
 
 // MarkEventWebhookPending returns the outcome the real datasource decides in SQL. As

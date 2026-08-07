@@ -799,6 +799,7 @@ func (s *legacyWebhookRelayStore) MarkEventFailed(
 	_ string,
 	errMsg string,
 	_ time.Duration,
+	_ bool,
 ) (model.EventFailureOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -899,6 +900,41 @@ func (s *legacyWebhookRelayStore) ClaimFailedEventOutboxForDeadLetter(
 	_ time.Duration,
 ) ([]model.EventOutbox, error) {
 	return nil, nil
+}
+
+// ClaimPendingWebhookDeliveries claims nothing, for the same reason: this file seeds no rows
+// whose legacy leg was left owed by an earlier pass. The relay's recovery pass runs every tick,
+// so an empty result is the honest answer and keeps these tests' subject the INLINE enqueue.
+//
+// SUNSET: goes with the leg it serves.
+func (s *legacyWebhookRelayStore) ClaimPendingWebhookDeliveries(
+	_ context.Context,
+	_ int,
+	_ time.Duration,
+) ([]model.EventOutbox, error) {
+	return nil, nil
+}
+
+// MarkEventLegacyWebhookAttempted records a recovery-path enqueue failure. Nothing here should
+// reach it — the recovery claim above returns nothing — so the recording lets a test assert its
+// ABSENCE rather than infer it.
+//
+// SUNSET: goes with the leg it serves.
+func (s *legacyWebhookRelayStore) MarkEventLegacyWebhookAttempted(
+	_ context.Context,
+	_ int64,
+	_ string,
+	_ time.Duration,
+) (model.EventWebhookOutcome, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.webhookPendings = append(s.webhookPendings, "legacy webhook recovery attempt recorded")
+
+	return model.EventWebhookOutcome{
+		Status:          model.EventOutboxStatusDispatched,
+		WebhookAttempts: 1,
+	}, nil
 }
 
 // claimCount reports how many claims were served.

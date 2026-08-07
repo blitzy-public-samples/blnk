@@ -79,9 +79,9 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 			// pile-up of goroutines. One balance can carry many monitors and many of them can
 			// fire on one update, so the fan-out here is a product of two counts rather than
 			// one per transaction — the shape most likely to exhaust memory first.
-			postTransactionActionSem <- struct{}{}
+			postCommitEventPublishSem <- struct{}{}
 			go func(monitor model.BalanceMonitor) {
-				defer func() { <-postTransactionActionSem }()
+				defer func() { <-postCommitEventPublishSem }()
 
 				// PRODUCER CALL SITE FOR balance.monitor, and one of the few that legitimately
 				// remains a standalone capture: a monitor fires because a CONDITION was met on

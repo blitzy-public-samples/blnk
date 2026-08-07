@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -40,11 +41,21 @@ import (
 // dead-lettered event carries the same bytes as the original, aside from the failure
 // metadata.
 //
-// What a replay reproduces is the envelope deterministically reconstructed from the stored
-// outbox row. The payload is the stored bytes, spliced in untransformed because
+// What a replay reproduces is THE STORED ENVELOPE. blnk.event_outbox.event_raw holds the
+// canonical bytes composed once at capture, and every later transport — a retry, the
+// dead-letter copy, a replay — reads that column rather than rebuilding the envelope. That is
+// what makes the byte guarantee a property of the data instead of a property of one build of
+// the serialiser: an envelope member added or reordered in a later release cannot change the
+// bytes of an event captured before it.
+//
+// Composition remains the documented fallback for a row written before the column existed,
+// and it is deterministic: the payload is spliced in untransformed because
 // model.LedgerEvent.Payload is json.RawMessage rather than a map or a typed struct, and the
-// five envelope scalars are re-serialised from the same row by marshalLedgerEvent, which
-// composes the object member by member — so one row always yields one byte sequence.
+// five envelope scalars are composed member by member — so one row always yields one byte
+// sequence. TestReplayFidelity_PublishesTheStoredEnvelopeRatherThanARebuild is what separates
+// the two: it stores an envelope the serialiser could not have produced and asserts the stored
+// value is what reaches the wire, so this file cannot pass by having both ends of the
+// comparison rebuild the same thing.
 //
 // ComposeDeadLetterMessage attaches the failure metadata by replacing the envelope's closing
 // brace with `,"failure_metadata":<metadata>}`. Every envelope byte before that brace is
@@ -58,8 +69,9 @@ import (
 //
 // No broker is required. The transport is substituted through
 // EventDeadLetterService.withTransport with a recording publisher and dead-letter writer, and
-// the recording publisher marshals through the real marshalLedgerEvent, so the bytes it
-// captures are the bytes a broker would have received.
+// the recording publisher resolves its message value through the real resolveEventValue, so
+// the bytes it captures are the bytes a broker would have received — the stored envelope where
+// the row has one, and a composed envelope only where it does not.
 //
 // Adjacent criteria live elsewhere: dual delivery in event_dual_delivery_test.go, ordering and
 // crash recovery in their own integration tests, and the replay endpoint with its master-key
@@ -116,10 +128,12 @@ const replayFidelityBalancePayload = `{"data": {"condition": {"field": "debit_ba
 // identities category.
 const replayFidelityIdentityPayload = `{"data": {"dob": "1815-12-10T00:00:00.000000+00:00", "last_name": "Lovelace", "first_name": "Ada", "identity_id": "idt_replay_fidelity_003", "risk_weight": 0.70000000000000006661, "credit_score": 9007199254740993, "email_address": "ada@example.test", "scaled_income": 123456789012345678901234, "unmodelled_extension": {"vendor_flag": true}}, "event": "identity.created"}`
 
-// replayFidelitySystemPayload is a ledger.created body. It routes to the fourth,
-// system category — the one that exists because ledger.created and system.error belong
-// to none of the three categories the requirements name, and coverage is absolute.
-const replayFidelitySystemPayload = `{"data": {"name": "Replay Fidelity Ledger", "ledger_id": "ldg_replay_fidelity_004", "meta_data": {"region": "eu-west-1", "sequence": 9007199254740993, "utilisation": 0.90000000000000002220, "scaled_capacity": 123456789012345678901234}, "created_at": "2024-07-03T22:11:00.250000+00:00", "unmodelled_extension": {"vendor_flag": true}}, "event": "ledger.created"}`
+// replayFidelityLedgerPayload is a ledger.created body. It routes to the ledgers
+// category — one of the two that exist because ledger.created and system.error belong to
+// none of the three categories the requirements name, and coverage is absolute. It is a
+// category of its own rather than sharing the internal one because ledger.created must
+// stay reachable by a subscriber and system.error must not.
+const replayFidelityLedgerPayload = `{"data": {"name": "Replay Fidelity Ledger", "ledger_id": "ldg_replay_fidelity_004", "meta_data": {"region": "eu-west-1", "sequence": 9007199254740993, "utilisation": 0.90000000000000002220, "scaled_capacity": 123456789012345678901234}, "created_at": "2024-07-03T22:11:00.250000+00:00", "unmodelled_extension": {"vendor_flag": true}}, "event": "ledger.created"}`
 
 // replayFidelityFixture is one event, its stored bytes and the destinations it must
 // resolve to. One fixture exists per category so that a category-specific bug in
@@ -156,8 +170,12 @@ type replayFidelityFixture struct {
 	deadLetterTopic string
 }
 
-// replayFidelityFixtures returns one fixture per event category, with the four
+// replayFidelityFixtures returns one fixture per SUBSCRIBER-FACING event category, with the
 // dead-letter topic names written out as LITERALS rather than derived with DLTFor.
+//
+// The internal system category has no fixture because no producer emits a system.error with a
+// ledger-shaped payload to replay; TestReplayFidelityFixtures_AgreeWithProductionRouting is
+// what keeps every fixture that IS here honest about where its event really routes.
 func replayFidelityFixtures() []replayFidelityFixture {
 	return []replayFidelityFixture{
 		{
@@ -197,7 +215,7 @@ func replayFidelityFixtures() []replayFidelityFixture {
 			deadLetterTopic: "blnk.identities.dlt",
 		},
 		{
-			name:        "system",
+			name:        "ledgers",
 			eventType:   "ledger.created",
 			aggregateID: "ldg_replay_fidelity_004",
 			// ledger.created is one of the two shapes that genuinely DO carry a
@@ -205,17 +223,28 @@ func replayFidelityFixtures() []replayFidelityFixture {
 			// "partitioned by ledger ID" is honoured wherever a ledger exists.
 			partitionKey:    "ldg_replay_fidelity_004",
 			ledgerID:        "ldg_replay_fidelity_004",
-			payload:         replayFidelitySystemPayload,
-			topic:           "blnk.system",
-			deadLetterTopic: "blnk.system.dlt",
+			payload:         replayFidelityLedgerPayload,
+			topic:           "blnk.ledgers",
+			deadLetterTopic: "blnk.ledgers.dlt",
 		},
 	}
 }
 
 // row builds the outbox row the relay would have claimed for this fixture: the
 // envelope columns populated, the retry budget set, and the row still pending.
-func (f replayFidelityFixture) row(id int64) model.EventOutbox {
-	return model.EventOutbox{
+//
+// event_raw IS POPULATED, because the column is not optional in a row the relay claims.
+// PrepareEventOutbox writes the canonical envelope once at capture and every later
+// transport reads it back, so a fixture that left it empty would drive the composition
+// fallback through the whole scenario and prove nothing about the value the database
+// actually holds. It is composed here with the same serialiser production uses — this
+// fixture is standing in for the persistence layer, not for the producer — and
+// TestReplayFidelity_PublishesTheStoredEnvelopeRatherThanARebuild is what shows the
+// stored value is genuinely the one on the wire.
+func (f replayFidelityFixture) row(t *testing.T, id int64) model.EventOutbox {
+	t.Helper()
+
+	row := model.EventOutbox{
 		ID:            id,
 		EventID:       fmt.Sprintf("event-replay-fidelity-%s-%d", f.name, id),
 		EventType:     f.eventType,
@@ -229,6 +258,12 @@ func (f replayFidelityFixture) row(id int64) model.EventOutbox {
 		Status:        model.EventOutboxStatusPending,
 		MaxAttempts:   replayFidelityMaxAttempts,
 	}
+
+	raw, err := row.CanonicalEvent().CanonicalBytes()
+	require.NoError(t, err, "the fixture envelope must serialise before it can be stored")
+	row.EventRaw = raw
+
+	return row
 }
 
 // Test doubles
@@ -665,8 +700,15 @@ func (p *replayFidelityPublisher) Publish(ctx context.Context, event model.Ledge
 	return err
 }
 
-// PublishToTopic marshals the envelope with the production serialiser, records what
-// would have gone on the wire, and then reports success or the programmed failure.
+// PublishToTopic resolves the message value exactly as the Kafka publisher does, records
+// what would have gone on the wire, and then reports success or the programmed failure.
+//
+// It calls the production resolveEventValue rather than serialising req.Event, and that
+// distinction is the difference between this file proving something and proving nothing. The
+// real publisher prefers the STORED envelope on the request and composes only when there is
+// none; a double that always composed would report composed bytes for every attempt, so a
+// regression that ignored the stored column would be invisible here — every comparison would
+// still hold, between two rebuilt values.
 func (p *replayFidelityPublisher) PublishToTopic(
 	_ context.Context,
 	req PublishRequest,
@@ -679,7 +721,7 @@ func (p *replayFidelityPublisher) PublishToTopic(
 		Attempt:      resolveAttempt(req),
 	}
 
-	value, err := marshalLedgerEvent(req.Event)
+	value, err := resolveEventValue(req)
 	if err != nil {
 		result.Status = model.PublishStatusRetrying
 		result.Err = &PublishError{
@@ -1122,7 +1164,7 @@ func (h *replayFidelityHarness) runScenario(
 	ctx := context.Background()
 
 	// 1. A pending row, exactly as it was committed alongside the ledger mutation.
-	row := fixture.row(id)
+	row := fixture.row(t, id)
 	require.Equal(t, model.EventOutboxStatusPending, row.Status,
 		"the scenario must start from a pending row")
 	h.store.put(row)
@@ -1187,6 +1229,36 @@ func (h *replayFidelityHarness) runScenario(
 // The anti-vacuity guard
 // ---------------------------------------------------------------------------
 
+// TestReplayFidelityFixtures_AgreeWithProductionRouting ties the literal destinations above
+// back to the routing they are meant to describe.
+//
+// Every other test in this file takes the destination FROM the fixture: the row is built with
+// `Topic: f.topic`, and the dead-letter assertions compare against `f.deadLetterTopic`. That is
+// deliberate — a literal is what stops those assertions being an echo of the implementation —
+// but it also means a fixture can name a topic no producer would ever record and every test
+// here still passes. It happened: the ledger fixture carried "blnk.system" for as long as
+// ledger.created routed there, and kept carrying it after the event moved to its own grantable
+// category, describing a row the relay cannot produce.
+//
+// This is the ONE test that closes the loop, and it is the only place in the file that is
+// allowed to consult TopicForEvent. A stale fixture now fails here instead of quietly
+// certifying replay fidelity for a route that does not exist.
+func TestReplayFidelityFixtures_AgreeWithProductionRouting(t *testing.T) {
+	storeKafkaTopicPrefix(t, "")
+
+	for _, fixture := range replayFidelityFixtures() {
+		t.Run(fixture.name, func(t *testing.T) {
+			assert.Equal(t, TopicForEvent(fixture.eventType), fixture.topic,
+				"%s routes to %s, so a fixture naming %s describes a row no producer creates",
+				fixture.eventType, TopicForEvent(fixture.eventType), fixture.topic)
+			assert.Equal(t, DeadLetterTopicForEvent(fixture.eventType), fixture.deadLetterTopic,
+				"the dead-letter sibling must be the one the event's own category resolves to")
+			assert.Equal(t, DLTFor(fixture.topic), fixture.deadLetterTopic,
+				"and it must be the declared topic's sibling, so the pair cannot be half-updated")
+		})
+	}
+}
+
 // TestReplayFidelity_FixturesWouldExposeAReMarshal proves the fixtures can tell a
 // correct implementation from a broken one.
 func TestReplayFidelity_FixturesWouldExposeAReMarshal(t *testing.T) {
@@ -1245,7 +1317,7 @@ func TestReplayFidelity_EnvelopeWouldExposeAReMarshal(t *testing.T) {
 	harness := newReplayFidelityHarness(t)
 	fixture := replayFidelityFixtures()[0]
 
-	row := fixture.row(1)
+	row := fixture.row(t, 1)
 	envelope, err := marshalLedgerEvent(PublishRequestFromOutbox(row, 1).Event)
 	require.NoError(t, err)
 
@@ -1262,6 +1334,118 @@ func TestReplayFidelity_EnvelopeWouldExposeAReMarshal(t *testing.T) {
 	// The harness is used only so the configured topic prefix is in place while the
 	// envelope is built; nothing is published here.
 	assert.Empty(t, harness.publisher.captures(), "this test publishes nothing")
+}
+
+// TestReplayFidelity_PublishesTheStoredEnvelopeRatherThanARebuild is the guard that keeps
+// every other byte-equality assertion in this file from being able to pass vacuously.
+//
+// # Why the rest of the file is not enough on its own
+//
+// Every other comparison here holds between two values the implementation produced. If the
+// original publish, the dead-letter copy and the replay each REBUILT the envelope from the
+// row's columns, all three would agree — the serialiser is deterministic — and every
+// assertion would pass while the stored bytes were being ignored entirely. The criterion
+// would then be satisfied only for as long as the serialiser never changes: add an envelope
+// member, reorder two, or alter how an instant is rendered, and every event captured before
+// that release would replay as DIFFERENT bytes from the ones its subscribers originally saw,
+// with no test noticing.
+//
+// # How this test separates the two
+//
+// It stores an envelope the serialiser DEMONSTRABLY COULD NOT HAVE PRODUCED — members in a
+// different order, insignificant whitespace, and one member no version of model.LedgerEvent
+// declares — and then asserts that exact byte sequence is what every transport carries. A
+// rebuild cannot reproduce it, so an implementation that rebuilt would fail here and only
+// here.
+//
+// The unmodelled member is the sharpest part of the fixture. It stands in for an envelope
+// written by a FUTURE build of Blnk and read back by this one: the value must survive
+// untouched, because the stored bytes are the record of what a subscriber was actually sent,
+// not a rendering this build is entitled to reinterpret.
+func TestReplayFidelity_PublishesTheStoredEnvelopeRatherThanARebuild(t *testing.T) {
+	harness := newReplayFidelityHarness(t)
+	ctx := context.Background()
+	fixture := replayFidelityFixtures()[0]
+
+	row := fixture.row(t, 1)
+
+	// The stored envelope: same six members with the same values, plus a seventh this build
+	// knows nothing about, in an order and with a whitespace layout the canonical serialiser
+	// never emits.
+	storedEnvelope := []byte("{\n" +
+		`  "schema_version": ` + strconv.Itoa(model.SchemaVersionV1) + ",\n" +
+		`  "event_id": "` + row.EventID + "\",\n" +
+		`  "event_type": "` + fixture.eventType + "\",\n" +
+		`  "aggregate_id": "` + fixture.aggregateID + "\",\n" +
+		`  "occurred_at": "` + replayFidelityOccurredAt.Format(time.RFC3339Nano) + "\",\n" +
+		`  "envelope_extension": {"written_by": "a later build of blnk"},` + "\n" +
+		`  "payload": ` + fixture.payload + "\n" +
+		"}")
+
+	require.True(t, json.Valid(storedEnvelope), "the stored envelope must be valid JSON")
+
+	// THE CONTROL. Without this the test could be satisfied by a fixture the serialiser
+	// happens to reproduce, which would make the equalities below meaningless again.
+	rebuilt, err := row.CanonicalEvent().CanonicalBytes()
+	require.NoError(t, err)
+	require.NotEqual(t, string(storedEnvelope), string(rebuilt),
+		"the fixture must be UNREACHABLE by composition, or this test proves nothing; rebuild it")
+	require.NotContains(t, string(rebuilt), `"envelope_extension"`,
+		"a rebuild necessarily drops the unmodelled member, which is what makes it detectable")
+
+	row.EventRaw = storedEnvelope
+	harness.store.put(row)
+
+	// The whole life of the event, from the first failing attempt to the replay a day later.
+	exhausted, lastErr := harness.exhaustRetryBudget(t, row)
+	require.Error(t, lastErr)
+	harness.store.put(exhausted)
+
+	outcome, err := harness.service.DeadLetter(ctx, exhausted, lastErr)
+	require.NoError(t, err)
+	require.True(t, outcome.Published)
+
+	stored, ok := harness.store.snapshot(exhausted.EventID)
+	require.True(t, ok)
+	require.Equal(t, string(storedEnvelope), string(stored.EventRaw),
+		"dead-lettering must not rewrite the stored envelope")
+
+	harness.publisher.succeed()
+	harness.clock.Set(replayFidelityReplayAt)
+
+	replay, err := harness.service.ReplayDeadLetteredEvent(ctx, stored.EventID)
+	require.NoError(t, err)
+	require.Equal(t, model.PublishStatusDispatched, replay.Status)
+
+	// --- Every transport carried the stored bytes. ---
+	attempts := harness.publisher.captures()
+	require.Len(t, attempts, replayFidelityMaxAttempts+1,
+		"five failing attempts and one successful replay")
+
+	for i, attempt := range attempts {
+		assert.Equal(t, string(storedEnvelope), string(attempt.value),
+			"publish %d carried a rebuilt envelope instead of the stored one", i+1)
+		assert.NotEqual(t, string(rebuilt), string(attempt.value),
+			"publish %d rebuilt the envelope from the row's columns", i+1)
+	}
+
+	written := harness.writerFor(fixture.deadLetterTopic).written()
+	require.Len(t, written, 1)
+
+	expectedDeadLetter := string(storedEnvelope[:len(storedEnvelope)-1]) +
+		`,"failure_metadata":` + string(outcome.MetadataJSON) + `}`
+	assert.Equal(t, expectedDeadLetter, string(written[0].Value),
+		"the dead-letter copy must be the STORED envelope plus one additive member")
+
+	recovered, err := StripFailureMetadata(written[0].Value)
+	require.NoError(t, err)
+	assert.Equal(t, string(storedEnvelope), string(recovered),
+		"stripping the metadata must recover the stored envelope, unmodelled member and all")
+
+	// And the unmodelled member survived every hop, which is the property that makes the
+	// stored value an authority rather than a cache.
+	assert.Contains(t, string(attempts[len(attempts)-1].value), `"envelope_extension"`,
+		"a member this build does not model must still reach the topic on replay")
 }
 
 // Criterion V-9: byte-for-byte replay, across every category
@@ -1559,7 +1743,7 @@ func TestReplayFidelity_ReplayRejectionsCarryTheirDocumentedCodeAndStatus(t *tes
 	fixture := replayFidelityFixtures()[0]
 
 	// A pending row: present, but with no dead-letter message to replay from.
-	pending := fixture.row(1)
+	pending := fixture.row(t, 1)
 	harness.store.put(pending)
 
 	cases := []struct {
@@ -1634,7 +1818,7 @@ func TestReplayFidelity_ReplayTopicComesFromTheStoredFailureMetadata(t *testing.
 	require.NotEqual(t, legacyTopic, TopicForEvent(fixture.eventType),
 		"the test is only meaningful when the recorded topic and the current mapping disagree")
 
-	row := fixture.row(1)
+	row := fixture.row(t, 1)
 	row.Topic = legacyTopic
 	harness.store.put(row)
 

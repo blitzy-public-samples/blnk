@@ -51,7 +51,8 @@ import (
 // model.EventCategory, and this file DELEGATES to it. That split is the whole design:
 //
 //	model.EventCategory  → the bare category token ("transactions", "balances",
-//	                       "identities", "system"). Knows the event vocabulary.
+//	                       "identities", "ledgers", "system"). Knows the event
+//	                       vocabulary.
 //	this file            → "<prefix>.<category>" and "<prefix>.<category>.dlt".
 //	                       Knows the prefix and the separator. Knows no event names.
 //
@@ -61,7 +62,7 @@ import (
 // new event type appears, extend model.EventCategory; this file then routes it with no
 // change at all.
 //
-// # Four categories, not three
+// # Five categories, not three
 //
 // The three category topics named in the requirements — transactions, balances,
 // identities — do not cover every event Blnk actually emits. "ledger.created" (raised
@@ -70,18 +71,35 @@ import (
 // them, while the coverage requirement is absolute: every event type that reached the
 // legacy webhook sender must be published, with zero exceptions.
 //
-// The fourth category, "<prefix>.system", resolves that tension while following the
-// identical naming convention, so nothing about the scheme is special-cased and its
-// dead-letter sibling is derived by the same rule as every other. This is the recorded
-// resolution of the coverage-versus-topic-list ambiguity, and it is a decision, not an
-// oversight.
+// Two further categories resolve that tension while following the identical naming
+// convention, so nothing about the scheme is special-cased and each dead-letter sibling
+// is derived by the same rule as every other. This is the recorded resolution of the
+// coverage-versus-topic-list ambiguity, and it is a decision, not an oversight.
 //
-// Do NOT "tidy" it away. Folding ledger and system-error events into, say, the
-// transactions topic corrupts that topic's semantics for every subscriber filtering on
-// it, and dropping the two events violates the coverage requirement outright. The
-// local stack, the production provisioning path and the operator documentation all
-// provision the whole inventory on this basis; removing the category here would leave
-// two event types publishing to a topic that no longer exists.
+// They are TWO rather than one because coverage and REACHABILITY are different
+// questions, and one topic could not answer both:
+//
+//	"<prefix>.ledgers"  ledger.created. SUBSCRIBER-FACING, because it is ordinary
+//	                    ledger data that a subscriber receives over the legacy webhook
+//	                    today and must be able to keep receiving after the sunset.
+//	"<prefix>.system"   system.error, and anything this catalogue does not recognise.
+//	                    INTERNAL, because the frozen system.error body carries verbatim
+//	                    error text — PostgreSQL schema, table and routine names; broker
+//	                    addresses — and because an internal catch-all is what stops a
+//	                    routing omission delivering a domain payload to an audience that
+//	                    never asked for it.
+//
+// Sharing one topic between them was the earlier arrangement and it was wrong in both
+// directions: keeping it internal made ledger.created unreachable by every subscriber,
+// and making it grantable would have handed internal error detail to anyone granted
+// ledger events.
+//
+// Do NOT "tidy" either away. Folding these events into, say, the transactions topic
+// corrupts that topic's semantics for every subscriber filtering on it, and dropping
+// them violates the coverage requirement outright. The local stack, the production
+// provisioning path and the operator documentation all provision the whole inventory on
+// this basis; removing a category here would leave an event type publishing to a topic
+// that no longer exists.
 //
 // # What this file deliberately does NOT do
 //
@@ -108,7 +126,7 @@ import (
 
 // DefaultTopicPrefix is the topic namespace used when KAFKA_TOPIC_PREFIX is not
 // configured. It yields the documented default topic names: blnk.transactions,
-// blnk.balances, blnk.identities, blnk.system, and their .dlt siblings.
+// blnk.balances, blnk.identities, blnk.ledgers, blnk.system, and their .dlt siblings.
 //
 // It duplicates config's own Kafka default by value, and that is necessary rather than
 // sloppy. The configuration default is applied by setKafkaDefaults, which runs only on
@@ -177,7 +195,7 @@ func eventCategoryOrder() []string {
 }
 
 // EventCategories returns the event category tokens in canonical order:
-// "transactions", "balances", "identities", "system".
+// "transactions", "balances", "identities", "ledgers", "system".
 //
 // These are bare tokens, not topic names. Compose a topic from one with
 // TopicForCategory; treating a returned value as a topic is a bug.
@@ -359,9 +377,9 @@ func TopicPrefix() string {
 
 // TopicForCategory composes the fully-qualified topic name for a category token.
 //
-// The composition is "<prefix>.<category>", so with the default prefix the four
-// category tokens yield blnk.transactions, blnk.balances, blnk.identities and
-// blnk.system.
+// The composition is "<prefix>.<category>", so with the default prefix the five
+// category tokens yield blnk.transactions, blnk.balances, blnk.identities,
+// blnk.ledgers and blnk.system.
 //
 // An empty or blank category resolves to the system category rather than composing
 // "<prefix>." — a name with a trailing separator and an empty final segment, which
@@ -414,8 +432,9 @@ func TopicForCategory(category string) string {
 //	                   transaction.unknown, and any bulk_transaction.<status>
 //	blnk.balances      balance.created, balance.monitor
 //	blnk.identities    identity.created
-//	blnk.system        ledger.created, system.error, and anything this catalogue
-//	                   does not recognise                          (internal)
+//	blnk.ledgers       ledger.created
+//	blnk.system        system.error, and anything this catalogue does not
+//	                   recognise                                   (internal)
 //
 // Two properties of that resolution are easy to get wrong and are worth stating
 // explicitly, because both live in the delegated mapping rather than here:
@@ -465,7 +484,7 @@ func TopicForEvent(eventType string) string {
 //
 // The idempotency rule implies one invariant: NO CATEGORY MAY BE NAMED "dlt". A
 // blnk.dlt category topic would be indistinguishable from an already-derived name and
-// could never get a dead-letter sibling of its own. None of the four categories is, and
+// could never get a dead-letter sibling of its own. None of the five categories is, and
 // a test pins it.
 //
 // An empty or blank topic returns the empty string rather than a bare ".dlt". There is
@@ -532,7 +551,8 @@ func IsDeadLetterTopic(topic string) bool {
 }
 
 // AllTopics returns every category topic in canonical order, with the configured
-// prefix applied: blnk.transactions, blnk.balances, blnk.identities and blnk.system.
+// prefix applied: blnk.transactions, blnk.balances, blnk.identities, blnk.ledgers and
+// blnk.system.
 //
 // These are the topics events are published to, INCLUDING the internal one — Blnk
 // writes to all of them, and all of them must be provisioned. Which of them a
@@ -557,7 +577,7 @@ func AllTopics() []string {
 
 // AllDeadLetterTopics returns every dead-letter topic in canonical order, with the
 // configured prefix applied: blnk.transactions.dlt, blnk.balances.dlt,
-// blnk.identities.dlt and blnk.system.dlt.
+// blnk.identities.dlt, blnk.ledgers.dlt and blnk.system.dlt.
 //
 // Each is the DLTFor sibling of the AllTopics entry at the same index, so the two
 // slices can be zipped safely.
@@ -575,7 +595,7 @@ func AllDeadLetterTopics() []string {
 }
 
 // AllTopicsWithDeadLetters returns every topic Blnk owns: every category topic
-// followed by every dead-letter sibling — eight names with the four categories the
+// followed by every dead-letter sibling — ten names with the five categories the
 // topic contract declares.
 //
 // THIS IS THE SINGLE SOURCE OF TRUTH FOR THE TOPIC INVENTORY. The admin client's topic

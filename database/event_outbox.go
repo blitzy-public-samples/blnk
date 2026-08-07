@@ -85,6 +85,7 @@ limitations under the License.
 package database
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -155,7 +156,7 @@ const (
 // column would silently substitute normalised bytes for the producer's own and break
 // acceptance criteria V-8 and V-9 without any read failing.
 const eventOutboxColumns = `id, event_id, event_type, aggregate_id, partition_key, ledger_id, topic, schema_version, ` +
-	`payload_raw, occurred_at, status, attempts, max_attempts, next_attempt_at, last_error, first_attempted_at, ` +
+	`payload_raw, event_raw, occurred_at, status, attempts, max_attempts, next_attempt_at, last_error, first_attempted_at, ` +
 	`last_attempted_at, dispatched_at, locked_until, claim_token, webhook_dispatched, kafka_dispatched_at, ` +
 	`webhook_attempts, kafka_topic, kafka_partition, kafka_offset, dlt_topic, failure_metadata`
 
@@ -196,6 +197,10 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 		&e.Topic,
 		&e.SchemaVersion,
 		&e.Payload,
+		// The CANONICAL event value, read back as the bytes the broker was given. Every
+		// publish, dead-letter write and replay takes it from here rather than rebuilding
+		// the envelope from the columns around it — see model.EventOutbox.EventRaw.
+		&e.EventRaw,
 		&e.OccurredAt,
 		&e.Status,
 		&e.Attempts,
@@ -287,19 +292,19 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 // Populating one without the other is not an option — a reader takes the body from
 // payload_raw, so a missing payload_raw is a missing event body.
 const eventOutboxInsertColumns = `event_id, event_type, aggregate_id, partition_key, ledger_id, topic, ` +
-	`schema_version, payload, payload_raw, occurred_at, status, max_attempts`
+	`schema_version, payload, payload_raw, event_raw, occurred_at, status, max_attempts`
 
 const eventOutboxInsertQuery = `
 		INSERT INTO blnk.event_outbox
 		(` + eventOutboxInsertColumns + `)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id
 	`
 
 // eventOutboxInsertValueCount is the number of bound values per inserted row. It
 // keeps the batch insert's placeholder arithmetic tied to the column list above
 // rather than to a literal that a later column addition would leave stale.
-const eventOutboxInsertValueCount = 12
+const eventOutboxInsertValueCount = 13
 
 // maxEventOutboxInsertRows bounds how many rows one multi-row INSERT may carry,
 // and it is a hard requirement rather than tuning.
@@ -401,6 +406,31 @@ func validateEventOutboxEntry(e *model.EventOutbox) error {
 	if !json.Valid(e.Payload) {
 		return apierror.NewAPIError(apierror.ErrBadRequest, "Event outbox payload is not valid JSON", nil)
 	}
+
+	// THE CANONICAL ENVELOPE IS REQUIRED, and reaching here without one is a defect in
+	// this file rather than in the caller: normalizeEventOutboxEntry derives it for every
+	// entry it is handed. It is checked anyway because the column is NOT NULL, and a
+	// constraint violation raised inside a caller's ledger transaction is a far worse way
+	// to learn about it than a named failure — the whole reason this function exists.
+	//
+	// The size ceiling applies to the ENVELOPE and not only to the payload: the envelope is
+	// what Kafka is asked to accept, and a dead-letter copy of it is larger still. A row
+	// over the limit could therefore be published on no attempt and dead-lettered on none
+	// either, which is an unbounded backlog from one event. Refusing it at the boundary is
+	// what keeps that out of the table.
+	if len(bytes.TrimSpace(e.EventRaw)) == 0 {
+		return apierror.NewAPIError(apierror.ErrBadRequest,
+			"Event outbox entry requires its canonical event envelope", nil)
+	}
+	if len(e.EventRaw) > model.MaxEventMessageBytes {
+		return apierror.NewAPIError(apierror.ErrBadRequest,
+			fmt.Sprintf("Event outbox canonical envelope exceeds the %d byte maximum", model.MaxEventMessageBytes), nil)
+	}
+	if !json.Valid(e.EventRaw) {
+		return apierror.NewAPIError(apierror.ErrBadRequest,
+			"Event outbox canonical envelope is not valid JSON", nil)
+	}
+
 	return nil
 }
 
@@ -447,7 +477,10 @@ func prepareEventOutboxEntry(e *model.EventOutbox) error {
 	if e == nil {
 		return apierror.NewAPIError(apierror.ErrBadRequest, "Event outbox entry is required", nil)
 	}
-	normalizeEventOutboxEntry(e)
+	if err := normalizeEventOutboxEntry(e); err != nil {
+		return err
+	}
+
 	return validateEventOutboxEntry(e)
 }
 
@@ -460,7 +493,7 @@ func prepareEventOutboxEntry(e *model.EventOutbox) error {
 // A non-positive schema_version is raised to model.SchemaVersionV1 because the
 // envelope version reaches subscribers on the wire, where a zero would be read as
 // an unknown schema.
-func normalizeEventOutboxEntry(e *model.EventOutbox) {
+func normalizeEventOutboxEntry(e *model.EventOutbox) error {
 	if e.OccurredAt.IsZero() {
 		e.OccurredAt = time.Now()
 	}
@@ -471,6 +504,32 @@ func normalizeEventOutboxEntry(e *model.EventOutbox) {
 		e.SchemaVersion = model.SchemaVersionV1
 	}
 	e.Status = model.EventOutboxStatusPending
+
+	// THE CANONICAL ENVELOPE IS DERIVED HERE WHEN A CALLER LEFT IT EMPTY, which is what
+	// makes "every row carries the value the broker was given" an invariant rather than a
+	// convention. The producer sets it (PrepareEventOutbox), and a row assembled anywhere
+	// else — a test fixture, a future caller, a migration backfill — gets the same bytes
+	// this version would have stored, composed from the envelope fields already normalised
+	// above. Deriving it AFTER the schema version and the occurrence instant is not
+	// optional: both are members of the envelope, so composing first would freeze a zero
+	// version or a zero timestamp into the stored value.
+	//
+	// A supplied value is never recomputed. It is the authority, and overwriting it would
+	// defeat the entire purpose of storing it.
+	if len(bytes.TrimSpace(e.EventRaw)) == 0 {
+		canonical, err := e.CanonicalEvent().CanonicalBytes()
+		if err != nil {
+			return apierror.NewAPIError(
+				apierror.ErrBadRequest,
+				"The event payload could not be serialized into its canonical envelope",
+				fmt.Errorf("database: composing the canonical envelope for event %q: %w", e.EventID, err),
+			)
+		}
+
+		e.EventRaw = canonical
+	}
+
+	return nil
 }
 
 // eventOutboxInsertArgs builds the bound values for one row, in eventOutboxInsertColumns order.
@@ -507,6 +566,11 @@ func eventOutboxInsertArgs(e *model.EventOutbox) []interface{} {
 		// replay was compared byte for byte.
 		payload,
 		payload,
+		// THE CANONICAL ENVELOPE, stored rather than rebuilt on every publish. It is
+		// never nil here: prepareEventOutboxEntry derives it from the envelope fields
+		// when a caller left it empty, and validateEventOutboxEntry refuses a row
+		// without one, so this binding cannot violate the column's NOT NULL.
+		[]byte(e.EventRaw),
 		e.OccurredAt,
 		model.EventOutboxStatusPending,
 		e.MaxAttempts,
@@ -575,46 +639,6 @@ func wrapEventOutboxInsertError(err error) error {
 		}
 	}
 	return loggedDatabaseError(apierror.ErrInternalServer, "Failed to insert event outbox entry", "wrap_event_outbox_insert_error", err)
-}
-
-// sqlExecutor is the statement-executing subset shared by *sql.DB, *sql.Tx and *sql.Conn.
-//
-// It exists so that ONE implementation of an entity INSERT can run either on the pooled
-// connection — the plain, non-transactional creation path every existing caller uses — or
-// inside a transaction that also carries the entity's event outbox row. Requirement R-2 needs
-// the second shape; source compatibility needs the first; and writing the statement twice
-// would be two places for the column list, the identifier generation and the
-// unique-violation mapping to drift apart.
-//
-// Deliberately the SMALLEST useful subset. A helper that could Begin or Commit could open a
-// second transaction inside the caller's, and a helper that could Query would invite reads on
-// a path whose whole purpose is a single write.
-type sqlExecutor interface {
-	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-}
-
-// insertEventOutboxRowsInTx inserts every supplied event row inside the caller's transaction.
-//
-// It is the shared tail of the entity creation writers that capture an event atomically —
-// ledgers, identities and balances. Each of them ends with the same three steps (insert the
-// entity, insert its event, commit), and the middle step is here so that the wrapping of the
-// insert failure reads identically wherever it happens.
-//
-// Parameters:
-//   - ctx context.Context: the context for the statements.
-//   - tx *sql.Tx: the caller's open transaction. The rows commit with it or not at all.
-//   - rows []*model.EventOutbox: the rows to insert; already free of nils.
-//
-// Returns:
-//   - error: the first insert failure, wrapped so the caller's rollback can report it.
-func (d Datasource) insertEventOutboxRowsInTx(ctx context.Context, tx *sql.Tx, rows []*model.EventOutbox) error {
-	for _, e := range rows {
-		if err := d.InsertEventOutboxInTx(ctx, tx, e); err != nil {
-			return fmt.Errorf("failed to insert event outbox: %w", err)
-		}
-	}
-
-	return nil
 }
 
 // InsertEventOutboxInTx inserts an event outbox entry within an existing database
@@ -787,6 +811,14 @@ func (d Datasource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox)
 	)
 
 	if err := d.Conn.QueryRowContext(ctx, eventOutboxInsertQuery, eventOutboxInsertArgs(e)...).Scan(&e.ID); err != nil {
+		// AN IDENTICAL EVENT ALREADY RECORDED IS SUCCESS, not loss, and it must be resolved
+		// before anything below runs. See resolveDuplicateEventOutboxInsert.
+		if adopted := d.resolveDuplicateEventOutboxInsert(ctx, e, err); adopted {
+			span.SetAttributes(attribute.Bool("event_outbox.idempotent_insert", true))
+
+			return nil
+		}
+
 		span.RecordError(err)
 		// Loud by design. This is the non-atomic path, so a failure here means the
 		// domain mutation that produced this event is already committed and the event
@@ -813,6 +845,92 @@ func (d Datasource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox)
 		return wrapEventOutboxInsertError(err)
 	}
 	return nil
+}
+
+// resolveDuplicateEventOutboxInsert decides whether a failed insert is actually the event
+// ALREADY BEING RECORDED, and adopts the stored row's identity when it is.
+//
+// # Why a duplicate here is success and not loss
+//
+// event_outbox_event_id_uidx exists to make "one event is recorded once" an invariant the
+// database enforces. When it rejects an insert it is reporting that the invariant HOLDS — the
+// event is durable, exactly once, and every downstream guarantee built on it is intact. Treating
+// that as a failure inverted the meaning of the constraint: the caller was told the event was
+// lost, an ERROR line said so in the log, and a retrying caller — the bulk-outcome capture is
+// one — kept retrying a write that could only ever fail again, then reported the outcome as
+// uncaptured when it was sitting in the table.
+//
+// The stored row's surrogate id is adopted so the caller ends up with the same
+// fully-identified row a first-time insert would have produced. Without that, an idempotent
+// success would hand back a row with ID 0, which the dead-letter path explicitly refuses.
+//
+// # What is NOT accepted
+//
+// Only a unique violation whose stored row is THE SAME EVENT. The comparison is on
+// event_raw — the canonical envelope bytes, which carry every envelope member — so two
+// genuinely different events that collided on one id stay a conflict and stay loud. That is
+// the case worth failing over: it means an id was reused, and silently discarding the second
+// event would lose it for real.
+//
+// A row that cannot be re-read is not accepted either. If the lookup fails, nothing has been
+// established, and the caller falls through to the loud path — reporting a possible loss it
+// could not rule out is the safe direction.
+//
+// # This applies to the NON-TRANSACTIONAL path only, and that is deliberate
+//
+// InsertEventOutboxInTx has no equivalent and must not: PostgreSQL marks a transaction
+// ABORTED after any error, so the re-read below could not run, and — more importantly — a
+// duplicate inside a ledger transaction means the caller is retrying a mutation whose event was
+// already captured. Aborting is then the correct outcome, because the mutation must roll back
+// with it.
+//
+// Parameters:
+//   - ctx context.Context: the insert's context, reused for the lookup.
+//   - e *model.EventOutbox: the row that failed to insert. Its ID is populated on adoption.
+//   - cause error: the driver error the insert returned.
+//
+// Returns:
+//   - bool: true when the event is already recorded identically and the caller may treat the
+//     insert as having succeeded.
+func (d Datasource) resolveDuplicateEventOutboxInsert(
+	ctx context.Context,
+	e *model.EventOutbox,
+	cause error,
+) bool {
+	var pqErr *pq.Error
+	if !errors.As(cause, &pqErr) || pqErr.Code.Name() != "unique_violation" {
+		return false
+	}
+
+	stored, err := d.GetEventByID(ctx, e.EventID)
+	if err != nil || stored == nil {
+		// Nothing established. The caller reports the original failure, which is the safe
+		// direction: a possible loss that could not be ruled out must stay visible.
+		return false
+	}
+
+	// The canonical envelope is the whole event, so byte equality here is identity. Compared as
+	// bytes rather than field by field because that is exactly what a subscriber received, and
+	// because the columns cannot be compared directly — occurred_at comes back truncated to the
+	// microsecond PostgreSQL stores, while these bytes round-trip unchanged.
+	if len(stored.EventRaw) == 0 || !bytes.Equal(stored.EventRaw, e.EventRaw) {
+		return false
+	}
+
+	e.ID = stored.ID
+
+	logrus.WithFields(logrus.Fields{
+		"event_id":          e.EventID,
+		"event_type":        e.EventType,
+		"topic":             e.Topic,
+		"aggregate_id_hash": hashedEventIdentifier(e.AggregateID),
+		"outbox_id":         stored.ID,
+	}).Info(
+		"event outbox insert was already durable: the unique index refused a duplicate of an " +
+			"identical event, so the capture is complete and the insert is idempotent",
+	)
+
+	return true
 }
 
 // insertEventOutboxesInTx inserts a batch of event outbox entries inside an
@@ -996,7 +1114,8 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 // order, because MarkEventFailed's retry arm returns the row to pending, where it
 // blocks its key again.
 //
-// A row that ClaimEventsOwedDeadLetter has taken does not block its key either, and
+// A row that ClaimFailedEventOutboxForDeadLetter has taken does not block its key
+// either, and
 // that is the same trade rather than a new one: such a row will never reach the MAIN
 // topic under any outcome — the only question left is whether its event is preserved
 // on the dead-letter sibling — so a later event of the same aggregate overtaking it
@@ -1032,7 +1151,7 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 //
 // A row whose budget IS spent and whose dead-letter write is still owed is
 // therefore invisible to this query, and it is reached by
-// ClaimEventsOwedDeadLetter instead. Keeping the two sets in two statements is
+// ClaimFailedEventOutboxForDeadLetter instead. Keeping the two sets in two statements is
 // deliberate: folding the second into an OR here made this predicate
 // unsatisfiable by idx_event_outbox_claim's partial index — a partial index is
 // usable only when its predicate is implied by the query's — and the planner fell
@@ -1642,6 +1761,31 @@ func (d Datasource) MarkEventDispatched(
 // attempt. In a SET list every right-hand reference to attempts reads the OLD value,
 // so both arms of the CASE agree on the same arithmetic.
 //
+// # THE CALLER'S VERDICT IS THE OTHER HALF OF THAT DECISION
+//
+// terminal is the publisher's own answer to "can another attempt succeed?", and it
+// short-circuits the arithmetic: a terminal failure exhausts the row on whichever
+// attempt it happened, budget remaining or not.
+//
+// Without it the durable state contradicted what the publisher had already reported
+// and metered. The publisher classifies a failure as transient or permanent and
+// reports PublishStatusDeadLettered for a permanent one — an oversized envelope,
+// bytes that are not valid JSON, a destination outside the topic namespace Blnk owns
+// — because no retry can change the answer. That verdict was then thrown away here,
+// and the row returned to pending to spend its whole schedule rediscovering it. The
+// consequences were all in the same direction: 31 seconds of backoff before the event
+// reached the dead-letter topic where an operator could see it, four extra attempts of
+// relay throughput spent on a message that can never be published, and a permanently
+// stuck event reported as a busy one in the status counter for the whole interval.
+//
+// The decision still happens in SQL, and it must: the parameter is one input to the
+// CASE rather than a Go-side branch, so two instances racing on one row still cannot
+// both conclude they were the last attempt.
+//
+// The arithmetic arm is NOT removed. A transient failure is still bounded by
+// max_attempts, which is what stops an unreachable broker keeping a row claimable for
+// ever, and terminal only ever brings that boundary forward.
+//
 // # Why it returns an outcome instead of just an error
 //
 // The caller has to know which arm was taken, because only the exhaustion arm hands
@@ -1717,12 +1861,22 @@ func (d Datasource) MarkEventDispatched(
 //   - errMsg string: the failure reason, stored in last_error.
 //   - retryAfter time.Duration: how long the row must wait before its next publish
 //     attempt. Applied on the retry arm only. Non-positive means due immediately.
+//   - terminal bool: the caller's verdict that no further attempt can succeed. True
+//     exhausts the row on this attempt whatever the budget says; false leaves the
+//     decision to the attempt arithmetic.
 //
 // Returns:
 //   - model.EventFailureOutcome: the resulting status, the new attempt count, whether
-//     the budget is spent, and the token for the dead-letter hand-off.
+//     the budget is spent, whether the caller declared the failure permanent, and the
+//     token for the dead-letter hand-off.
 //   - error: the typed claim-lost error when no row matched, or a wrapped driver error.
-func (d Datasource) MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration) (model.EventFailureOutcome, error) {
+func (d Datasource) MarkEventFailed(
+	ctx context.Context,
+	id int64,
+	claimToken, errMsg string,
+	retryAfter time.Duration,
+	terminal bool,
+) (model.EventFailureOutcome, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkEventFailed")
 	defer span.End()
 	if retryAfter < 0 {
@@ -1731,6 +1885,7 @@ func (d Datasource) MarkEventFailed(ctx context.Context, id int64, claimToken, e
 	span.SetAttributes(
 		attribute.Int64("event_outbox.id", id),
 		attribute.String("event_outbox.retry_after", retryAfter.String()),
+		attribute.Bool("event_outbox.terminal", terminal),
 	)
 
 	if err := requireEventOutboxClaimToken(claimToken, model.EventOutboxStatusFailed); err != nil {
@@ -1738,21 +1893,25 @@ func (d Datasource) MarkEventFailed(ctx context.Context, id int64, claimToken, e
 		return model.EventFailureOutcome{}, err
 	}
 
+	// $8 is the caller's terminal verdict, ORed into every arm of the decision so the
+	// status, the due instant and the retained token all agree about which arm was taken.
+	// Repeating the condition rather than computing it once is what keeps the whole
+	// decision inside the single statement.
 	var outcome model.EventFailureOutcome
 	err := d.Conn.QueryRowContext(ctx, `
 		UPDATE blnk.event_outbox
-		SET status = CASE WHEN attempts + 1 >= max_attempts THEN $1 ELSE $2 END,
+		SET status = CASE WHEN $8::boolean OR attempts + 1 >= max_attempts THEN $1 ELSE $2 END,
 			attempts = attempts + 1,
 			last_error = $3,
 			first_attempted_at = COALESCE(first_attempted_at, NOW()),
 			last_attempted_at = NOW(),
 			locked_until = NULL,
-			next_attempt_at = CASE WHEN attempts + 1 >= max_attempts THEN next_attempt_at ELSE NOW() + $4::interval END,
-			claim_token = CASE WHEN attempts + 1 >= max_attempts THEN claim_token ELSE NULL END
+			next_attempt_at = CASE WHEN $8::boolean OR attempts + 1 >= max_attempts THEN next_attempt_at ELSE NOW() + $4::interval END,
+			claim_token = CASE WHEN $8::boolean OR attempts + 1 >= max_attempts THEN claim_token ELSE NULL END
 		WHERE id = $5 AND claim_token = $6 AND status = $7
 		RETURNING status, attempts
 	`, model.EventOutboxStatusFailed, model.EventOutboxStatusPending, errMsg, retryAfter.String(), id, claimToken,
-		model.EventOutboxStatusProcessing).Scan(&outcome.Status, &outcome.Attempts)
+		model.EventOutboxStatusProcessing, terminal).Scan(&outcome.Status, &outcome.Attempts)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// No row matched, so the claim was lost or the row is no longer
@@ -1767,6 +1926,13 @@ func (d Datasource) MarkEventFailed(ctx context.Context, id int64, claimToken, e
 	}
 
 	outcome.Exhausted = outcome.Status == model.EventOutboxStatusFailed
+	// Echoed back from what the caller passed rather than inferred from the attempt count,
+	// so a row that exhausted on its budget alone reports false even when its last attempt
+	// happened to be permanent. The two causes need to stay distinguishable in the log:
+	// "attempt 1 of 5, exhausted" reads as a bookkeeping defect unless the line also says
+	// the failure was permanent.
+	outcome.Terminal = terminal
+
 	if outcome.Exhausted {
 		// Retained by the UPDATE above, and returned so the caller need not
 		// remember which arm keeps it.
@@ -1777,147 +1943,9 @@ func (d Datasource) MarkEventFailed(ctx context.Context, id int64, claimToken, e
 		attribute.String("event_outbox.status", outcome.Status),
 		attribute.Int("event_outbox.attempts", outcome.Attempts),
 		attribute.Bool("event_outbox.exhausted", outcome.Exhausted),
+		attribute.Bool("event_outbox.terminal", outcome.Terminal),
 	)
 	return outcome, nil
-}
-
-// claimEventsOwedDeadLetterQuery claims rows whose retry budget is spent and whose
-// dead-letter write has NOT been recorded, taking a lease and stamping a fresh claim
-// token WITHOUT changing their status.
-//
-// It is a package-level constant so tests can assert that FOR UPDATE SKIP LOCKED, the
-// occurred_at ordering, the untouched status and the dlt_topic IS NULL restriction are
-// all still present.
-//
-// # The set, and why it must be reachable at all
-//
-// MarkEventFailed's exhaustion arm records 'failed' and RETAINS the claim token so the
-// worker that spent the last attempt is the only one permitted to write the event to its
-// `<topic>.dlt` sibling. When that write — or the MarkEventDeadLettered that records it —
-// fails, the row is left failed with no dlt_topic, and at that point it was reachable by
-// nothing at all: the main claim excludes it twice over (wrong status, no budget) and
-// ClaimEventForReplay accepts only dead_lettered. This table is the ONLY copy of that
-// event — the retention purge deliberately refuses to delete a failed row for exactly this
-// reason — so an operator's only recourse was a hand-written UPDATE.
-//
-// 'processing' is included alongside 'failed' because a relay can die between this claim
-// and the dead-letter record; such a row is recovered by the same predicate once its lease
-// expires. dlt_topic IS NULL is what makes the set SELF-CLEARING: recording the
-// dead-letter takes the row out of it permanently.
-//
-// # Why the status is deliberately NOT changed
-//
-// Moving the row to 'processing' would put it back into the main claim's blocking set, so
-// a row whose dead-letter topic was unreachable would stall every later event of its
-// aggregate for as long as the outage lasted. Leaving it failed keeps the trade the main
-// claim's anti-join documents: an event that can never reach the main topic must not hold
-// its key back. MarkEventDeadLettered accepts 'failed' as a prior state precisely so this
-// works.
-//
-// # next_attempt_at is the retry pacing
-//
-// MarkEventFailed's exhaustion arm schedules it exactly as its retry arm does, so a
-// dead-letter topic that is unreachable is retried on the same bounded backoff the publish
-// attempts used rather than once per poll interval per stranded row.
-const claimEventsOwedDeadLetterQuery = `
-		WITH claimed AS (
-			UPDATE blnk.event_outbox
-			SET locked_until = NOW() + $1::interval,
-				claim_token = $2,
-				last_attempted_at = NOW()
-			WHERE id IN (
-				SELECT candidate.id FROM blnk.event_outbox candidate
-				WHERE candidate.status IN ('failed', 'processing')
-				  AND candidate.dlt_topic IS NULL
-				  AND candidate.attempts >= candidate.max_attempts
-				  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
-				  AND candidate.next_attempt_at <= NOW()
-				ORDER BY candidate.next_attempt_at ASC, candidate.occurred_at ASC, candidate.id ASC
-				LIMIT $3
-				FOR UPDATE SKIP LOCKED
-			)
-			RETURNING ` + eventOutboxColumns + `
-		)
-		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
-	`
-
-// ClaimEventsOwedDeadLetter claims events whose retry budget is spent and whose
-// dead-letter write is still owed, so the hand-off can be retried instead of the event
-// being stranded in the only table that holds it.
-//
-// In a healthy system this returns nothing: the hand-off happens in the same batch as the
-// attempt that exhausted the budget. It matters when the dead-letter topic is unreachable,
-// when the broker rejects the write, or when the relay dies between the write and the
-// record — and in every one of those cases the alternative is an event that exists nowhere
-// else and can be neither published, replayed nor purged.
-//
-// The returned rows carry a FRESH claim token, which is what authorises
-// MarkEventDeadLettered, and their attempt count still shows the budget spent, which is
-// how a caller knows to retry the hand-off rather than the publish.
-//
-// Parameters:
-//   - ctx context.Context: cancels the claim.
-//   - batchSize int: how many rows to claim. Non-positive is rejected, because a zero LIMIT
-//     claims nothing and returns no error, which is indistinguishable from "nothing is owed".
-//   - lockDuration time.Duration: the lease. Non-positive is normalised to
-//     defaultEventClaimLease, since an expired-on-arrival lease lets two relays write the
-//     same event to the dead-letter topic.
-//
-// Returns:
-//   - []model.EventOutbox: the claimed rows, oldest occurrence first.
-//   - error: a validation error for a non-positive batch, or a wrapped driver error.
-func (d Datasource) ClaimEventsOwedDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
-	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClaimEventsOwedDeadLetter")
-	defer span.End()
-
-	if batchSize <= 0 {
-		err := apierror.NewAPIError(apierror.ErrBadRequest, "Dead-letter hand-off claim batch size must be greater than zero", nil)
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if lockDuration <= 0 {
-		logrus.WithField("requested_lock_duration", lockDuration.String()).
-			Warnf("Non-positive dead-letter hand-off lock duration; falling back to %s", defaultEventClaimLease)
-		lockDuration = defaultEventClaimLease
-	}
-
-	claimToken := uuid.NewString()
-
-	span.SetAttributes(
-		attribute.Int("event_outbox.batch_size", batchSize),
-		attribute.String("event_outbox.lock_duration", lockDuration.String()),
-	)
-
-	rows, err := d.Conn.QueryContext(ctx, claimEventsOwedDeadLetterQuery,
-		lockDuration.String(), claimToken, batchSize)
-	if err != nil {
-		span.RecordError(err)
-		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to claim events owed a dead-letter write", "claim_events_owed_dead_letter", err)
-	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			logrus.Errorf("Error closing rows: %v", closeErr)
-		}
-	}()
-
-	var entries []model.EventOutbox
-	for rows.Next() {
-		entry, scanErr := scanEventOutbox(rows)
-		if scanErr != nil {
-			span.RecordError(scanErr)
-			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event outbox entry", "claim_events_owed_dead_letter", scanErr)
-		}
-		entries = append(entries, entry)
-	}
-
-	if err = rows.Err(); err != nil {
-		span.RecordError(err)
-		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event outbox entries", "claim_events_owed_dead_letter", err)
-	}
-
-	span.SetAttributes(attribute.Int("event_outbox.claimed_count", len(entries)))
-	return entries, nil
 }
 
 // MarkEventDeadLettered records that an entry has been written to its dead-letter
@@ -2153,7 +2181,7 @@ func (d Datasource) ReleaseEventReplay(ctx context.Context, id int64, claimToken
 	return nil
 }
 
-// claimPendingWebhookDeliveriesQuery claims rows whose Kafka leg is complete and
+// claimPendingWebhookDeliveriesQuery claims rows whose Kafka leg has FINISHED and
 // whose LEGACY WEBHOOK leg is still owed, taking a lease and stamping a fresh claim
 // token WITHOUT changing the row's status.
 //
@@ -2161,27 +2189,53 @@ func (d Datasource) ReleaseEventReplay(ctx context.Context, id int64, claimToken
 // assert that FOR UPDATE SKIP LOCKED, the occurred_at ordering and the untouched
 // status are all still present.
 //
+// # "Finished" means all three of its end states, not only the successful one
+//
+// The set was 'dispatched' alone, and that lost events. The relay enqueues the legacy
+// webhook first and publishes to Kafka second, so when BOTH fail on the attempt that
+// spends the retry budget the row travels failed → dead_lettered with
+// webhook_dispatched still FALSE. Neither state was in this predicate, neither is in
+// the main claim's, and the token is cleared — so the outstanding HTTP delivery was
+// discarded silently, in exactly the circumstance where the webhook is the only
+// transport that might still work, because the broker being unreachable is why the
+// Kafka leg failed at all.
+//
+// All three literals are therefore candidates. What they have in common is the
+// property that matters: the Kafka leg will not be attempted again, so no other
+// statement in this file will ever return to the row, and if this one does not carry
+// the legacy leg nothing will.
+//
 // # Why the status must NOT change, and why this is a second query rather than an arm
 //
-// The row is already dispatched — the event IS on its Kafka topic. Returning it to
-// processing would put it back in the main claimable set and publish it to Kafka a
-// second time, so the one thing this claim must not do is exactly what the main claim
-// does. It therefore takes only the two things a conditional transition needs: a lease,
-// so two relays cannot enqueue the same webhook at once, and a claim token, because
-// MarkWebhookDispatched is conditional on one and MarkEventDispatched deliberately
-// cleared the row's previous token as it moved the row to its terminal state.
+// For a dispatched row the event IS on its Kafka topic; returning the row to
+// processing would put it back in the main claimable set and publish it a second time.
+// For a dead-lettered row it would be worse still: the row is terminal by design and
+// the publisher would take it as unpublished work. So this claim takes only the two
+// things a conditional transition needs — a lease, so two relays cannot enqueue the
+// same webhook at once, and a claim token, because MarkWebhookDispatched is conditional
+// on one and every terminal transition deliberately cleared the row's previous token.
 //
-// The candidate status is a LITERAL rather than a bound parameter, exactly as it is in
-// the main claim and the dead-letter hand-off claim. That is not styling: a partial index
+// The candidate statuses are LITERALS rather than bound parameters, exactly as in the
+// main claim and the dead-letter hand-off claim. That is not styling: a partial index
 // is usable only when its predicate is implied by the query's WHERE clause, and the
-// planner can only prove implication from a value it can see while planning. Binding the
-// status would make idx_event_outbox_webhook_pending unusable for any generic plan, and
-// dispatched is the largest status in the table.
+// planner can only prove implication from a value it can see while planning. Binding
+// them would make idx_event_outbox_webhook_pending unusable for any generic plan, and
+// dispatched is the largest status in the table. The index's own predicate lists the
+// same three literals for that reason.
 //
-// SUNSET NOTICE: this query, ClaimPendingWebhookDeliveries, MarkWebhookDispatched, the
-// webhook_dispatched column and its partial index are all DELETED at the webhook
-// sunset, together with webhooks.go and the relay's dual-delivery branch. Nothing else
-// in this file depends on them.
+// # The two bounds
+//
+// webhook_attempts < max_attempts is the legacy leg's own budget, so an abandoned leg
+// leaves this candidate set permanently instead of being re-enqueued for ever against a
+// receiver that is never coming back. next_attempt_at <= NOW() is the backoff
+// MarkEventLegacyWebhookAttempted persisted, so a failing receiver is retried on the
+// configured schedule rather than once per poll interval.
+//
+// SUNSET NOTICE: this query, ClaimPendingWebhookDeliveries, MarkWebhookDispatched,
+// MarkEventLegacyWebhookAttempted, the webhook_dispatched and webhook_attempts columns
+// and the partial index are all DELETED at the webhook sunset, together with
+// webhooks.go and the relay's dual-delivery branch. Nothing else in this file depends
+// on them.
 const claimPendingWebhookDeliveriesQuery = `
 		WITH claimed AS (
 			UPDATE blnk.event_outbox
@@ -2189,9 +2243,11 @@ const claimPendingWebhookDeliveriesQuery = `
 				claim_token = $2
 			WHERE id IN (
 				SELECT candidate.id FROM blnk.event_outbox candidate
-				WHERE candidate.status = 'dispatched'
+				WHERE candidate.status IN ('dispatched', 'failed', 'dead_lettered')
 				  AND candidate.webhook_dispatched = FALSE
+				  AND candidate.webhook_attempts < candidate.max_attempts
 				  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
+				  AND candidate.next_attempt_at <= NOW()
 				ORDER BY candidate.occurred_at ASC, candidate.id ASC
 				LIMIT $3
 				FOR UPDATE SKIP LOCKED
@@ -2201,9 +2257,10 @@ const claimPendingWebhookDeliveriesQuery = `
 		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
 	`
 
-// ClaimPendingWebhookDeliveries claims dispatched rows whose legacy HTTP webhook leg
-// has not been recorded, so the dual-delivery window can finish a leg that failed
-// after the Kafka publish had already succeeded.
+// ClaimPendingWebhookDeliveries claims rows whose Kafka leg has finished and whose legacy
+// HTTP webhook leg has not been recorded, so the dual-delivery window can finish a leg
+// that failed alongside the Kafka publish — whether that publish then succeeded or was
+// itself given up on.
 //
 // # The defect this closes
 //
@@ -2211,11 +2268,16 @@ const claimPendingWebhookDeliveriesQuery = `
 // enqueue was logged and swallowed — correctly, because a webhook receiver being down
 // must not consume a Kafka retry attempt or dead-letter an event on the new transport —
 // and the log line promised the leg would be retried "on the next claim of this row".
-// There was no next claim: the Kafka publish then succeeded, MarkEventDispatched moved
-// the row to its terminal state and cleared its token, and the main claim predicate
-// never looks at a dispatched row again. The legacy leg was lost silently, for exactly
-// the subscribers the 30-day window exists to protect — the ones that have not migrated
-// yet.
+// There was no next claim: the row reached a state the main claim predicate never looks
+// at again — dispatched when the publish succeeded, or failed and then dead_lettered when
+// it did not — and every one of those transitions cleared the token. The legacy leg was
+// lost silently, for exactly the subscribers the 30-day window exists to protect: the ones
+// that have not migrated yet.
+//
+// The both-legs-failed case is the sharper of the two, because it loses the webhook in
+// precisely the situation where the webhook is the only transport that might still work.
+// The broker being unreachable is why the Kafka leg failed; the receiver may be perfectly
+// healthy.
 //
 // This makes the promise true. The rows are durable and independently reclaimable: the
 // webhook_dispatched flag is the outstanding-work marker, the lease serialises two
@@ -2229,9 +2291,17 @@ const claimPendingWebhookDeliveriesQuery = `
 //
 // The lease and token this stamps are left in place once MarkWebhookDispatched succeeds,
 // and that is deliberate: the flag alone removes the row from this query's candidate set
-// permanently, no other predicate in this file admits a dispatched row, and clearing the
-// token here would break MarkWebhookDispatched's documented idempotency for the main
-// dual-delivery path, where the token must survive until MarkEventDispatched consumes it.
+// permanently, and clearing the token here would break MarkWebhookDispatched's documented
+// idempotency for the main dual-delivery path, where the token must survive until
+// MarkEventDispatched consumes it.
+//
+// The one interaction worth stating: a FAILED row can also be claimed by
+// ClaimFailedEventOutboxForDeadLetter, which owes it a dead-letter write. The two cannot
+// hold it at once — both require the lease to be free and both stamp a fresh token — so a
+// claim by either invalidates the other's token and that transition is refused as a lost
+// claim. Nothing is lost by it: both sets are self-clearing on the work they exist for
+// (dlt_topic being recorded, webhook_dispatched being set), so whichever lost simply
+// re-claims once the lease lapses.
 //
 // Parameters:
 //   - ctx context.Context: cancels the claim.
@@ -2499,6 +2569,133 @@ func (d Datasource) MarkEventWebhookPending(
 	// Derived from the status the database chose, never recomputed, so the two cannot
 	// disagree about which arm was taken.
 	outcome.Abandoned = outcome.Status == model.EventOutboxStatusDispatched
+
+	span.SetAttributes(
+		attribute.String("event_outbox.status", outcome.Status),
+		attribute.Int("event_outbox.webhook_attempts", outcome.WebhookAttempts),
+		attribute.Bool("event_outbox.legacy_leg_abandoned", outcome.Abandoned),
+	)
+
+	return outcome, nil
+}
+
+// MarkEventLegacyWebhookAttempted records one failed legacy webhook enqueue against a row
+// whose KAFKA leg has already finished, and decides in the same statement whether another
+// webhook attempt is made or the legacy leg is abandoned.
+//
+// SUNSET: this method goes with the rest of the legacy transport.
+//
+// # Why this exists alongside MarkEventWebhookPending, which looks like the same thing
+//
+// The two cover disjoint halves of one problem, and collapsing them would break whichever
+// half lost. MarkEventWebhookPending handles a row whose Kafka leg SUCCEEDED: it may move
+// the status, because webhook_pending and dispatched are both truthful descriptions of such
+// a row, and the claim predicate includes webhook_pending precisely so the row comes back.
+//
+// This one handles a row whose Kafka leg has reached a state the ordinary claim will never
+// revisit — dispatched, failed, or dead_lettered — and it MUST NOT MOVE THE STATUS. Moving a
+// dead-lettered row to webhook_pending would revive an event that is terminal by design and
+// hand it back to the publisher, and marking it dispatched would assert a Kafka delivery that
+// never happened, in the one column the zero-loss audit reads. So the status is left exactly
+// as it is, and the row's re-claimability comes from the legacy leg's own columns instead:
+// webhook_dispatched FALSE and webhook_attempts < max_attempts, which is what
+// claimPendingWebhookDeliveriesQuery selects on.
+//
+// # THE DEFECT THIS CLOSES
+//
+// The relay enqueues the legacy webhook first and publishes to Kafka second. When BOTH fail
+// on the attempt that spends the retry budget, the row goes to failed and then dead_lettered
+// — terminal, token cleared, outside every claim predicate — while webhook_dispatched is
+// still FALSE. The outstanding HTTP delivery was silently discarded, for exactly the
+// subscribers the 30-day window exists to protect, and in exactly the circumstance where the
+// webhook is the ONLY transport that might still work: the broker being unreachable is why
+// the Kafka leg failed in the first place.
+//
+// # last_error is deliberately NOT overwritten
+//
+// On a failed or dead-lettered row, last_error holds the KAFKA failure reason. It is what
+// BuildFailureMetadata records, what the dead-letter API projection classifies, and what an
+// operator triaging a dead-lettered event reads. Replacing it with a webhook enqueue error
+// would destroy the diagnosis of the failure that actually stranded the event, to record a
+// transient queue problem that is already logged with the row's fields and already counted
+// in webhook_attempts. The durable trail for this leg is the counter; the reason is the log.
+//
+// # The decision is in SQL, and abandoned is RETURNED rather than derived
+//
+// For the reason MarkEventFailed's is: two relay instances working one row must not both
+// conclude they spent the last webhook attempt. And because the status deliberately does not
+// move, the caller cannot infer the arm from it — the comparison is therefore evaluated in
+// the RETURNING clause, against the incremented value, and reported.
+//
+// Parameters:
+//   - ctx context.Context: cancels the update.
+//   - id int64: the row's surrogate key.
+//   - claimToken string: the token ClaimPendingWebhookDeliveries issued; refused without it.
+//   - retryAfter time.Duration: how long before the legacy leg is due again. Applied on the
+//     retry arm only. Non-positive means due immediately.
+//
+// Returns:
+//   - model.EventWebhookOutcome: the row's UNCHANGED status, the new webhook attempt count,
+//     and whether the legacy leg has been abandoned.
+//   - error: the typed claim-lost error when no row matched, or a wrapped driver error.
+func (d Datasource) MarkEventLegacyWebhookAttempted(
+	ctx context.Context,
+	id int64,
+	claimToken string,
+	retryAfter time.Duration,
+) (model.EventWebhookOutcome, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkEventLegacyWebhookAttempted")
+	defer span.End()
+
+	if retryAfter < 0 {
+		retryAfter = 0
+	}
+
+	span.SetAttributes(
+		attribute.Int64("event_outbox.id", id),
+		attribute.String("event_outbox.retry_after", retryAfter.String()),
+	)
+
+	if err := requireEventOutboxClaimToken(claimToken, "legacy_webhook_attempt"); err != nil {
+		span.RecordError(err)
+
+		return model.EventWebhookOutcome{}, err
+	}
+
+	var outcome model.EventWebhookOutcome
+	err := d.Conn.QueryRowContext(ctx, `
+		UPDATE blnk.event_outbox
+		SET webhook_attempts = webhook_attempts + 1,
+			next_attempt_at = CASE
+				WHEN webhook_attempts + 1 >= max_attempts THEN next_attempt_at
+				ELSE NOW() + $1::interval
+			END,
+			locked_until = NULL,
+			claim_token = NULL
+		WHERE id = $2 AND claim_token = $3 AND status IN ($4, $5, $6)
+		RETURNING status, webhook_attempts, webhook_attempts >= max_attempts
+	`,
+		retryAfter.String(),
+		id,
+		claimToken,
+		model.EventOutboxStatusDispatched,
+		model.EventOutboxStatusFailed,
+		model.EventOutboxStatusDeadLettered,
+	).Scan(&outcome.Status, &outcome.WebhookAttempts, &outcome.Abandoned)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			lost := eventOutboxClaimLost(id, "legacy_webhook_attempt")
+			span.RecordError(lost)
+
+			return model.EventWebhookOutcome{}, lost
+		}
+
+		span.RecordError(err)
+
+		return model.EventWebhookOutcome{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to record the legacy webhook attempt for event outbox entry",
+			"mark_event_legacy_webhook_attempted", err)
+	}
 
 	span.SetAttributes(
 		attribute.String("event_outbox.status", outcome.Status),

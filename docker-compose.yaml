@@ -183,7 +183,7 @@ services:
     #   EnsureTopics before starting the relay), so this gate is not what makes the topics
     #   exist; what it buys is that a provisioning FAILURE is visible at bring-up instead
     #   of surfacing minutes later as dead letters, and that only one of the two creators
-    #   is racing to create the eight topics on a cold start.
+    #   is racing to create the topic catalogue on a cold start.
     #
     # The other three keep the semantics the short list form gave them.
     depends_on:
@@ -375,7 +375,7 @@ services:
     #
     # Kafka is not part of the default stack because Blnk's documented steady state is an
     # empty KAFKA_BROKERS and a no-op publisher. Starting a broker, formatting KRaft storage
-    # and provisioning eight topics on every "docker compose up" imposed that cost — and,
+    # and provisioning the topic catalogue on every "docker compose up" imposed that cost — and,
     # through the depends_on conditions on server and worker, that FAILURE MODE — on every
     # deployment, including the ones that never publish an event.
     #
@@ -601,25 +601,26 @@ services:
       start_period: 60s
 
   # One-shot topic and principal provisioning: it runs once against a ready broker,
-  # then exits. There is one category more than the three the requirement names because
-  # every formerly webhooked event must be published: ledger.created and system.error
-  # belong to none of transactions, balances or identities, so both go to blnk.system,
-  # which is also where an event type no mapping recognises lands.
+  # then exits.
   #
   # It creates one topic per event category and a dead-letter sibling for each —
-  # blnk.transactions, blnk.balances, blnk.identities and blnk.system, plus
-  # blnk.transactions.dlt and so on, eight names in total — then the sample
+  # blnk.transactions, blnk.balances, blnk.identities, blnk.ledgers and blnk.system,
+  # plus blnk.transactions.dlt and so on, ten names in total — then the sample
   # subscriber principal and its ACLs. The category list is pinned to
   # model.EventCategory rather than restated, and each .dlt name is derived by
   # appending the suffix, which is what keeps a topic the relay publishes to from
   # ever being a topic nobody created.
   #
-  # There is a fourth category beyond the three the requirement names because every
-  # event formerly delivered by webhook has to be published and two of them belong to
-  # none of transactions, balances or identities: ledger.created and system.error go
-  # to blnk.system, which also catches an event type no mapping recognises, keeping it
-  # durable and replayable without delivering it to an audience that never asked for
-  # it. That category is internal and no subscriber can be granted it.
+  # There are two categories beyond the three the requirement names, because every
+  # event formerly delivered by webhook has to be published AND has to stay
+  # consumable, and two event types belong to none of transactions, balances or
+  # identities. ledger.created is ordinary ledger data that every webhook subscriber
+  # receives today, so it gets blnk.ledgers, which subscribers CAN be granted.
+  # system.error carries Blnk's own error text, so it gets blnk.system, which no
+  # subscriber can be granted and which also catches an event type no mapping
+  # recognises — keeping it durable and replayable without delivering it to an
+  # audience that never asked for it. One shared extra topic could not do both jobs:
+  # grantable and ungrantable are opposite requirements.
   kafka-init:
     # The SAME profile as the kafka service above, and it has to be the same one: provisioning
     # a broker that is not running cannot succeed, and a broker with no topics is one the relay
@@ -719,6 +720,58 @@ services:
       # every entry is checked against the same allowlist, so neither the internal category
       # nor a dead-letter topic can be granted through it.
       KAFKA_SAMPLE_SUBSCRIBER_TOPICS: ${KAFKA_SAMPLE_SUBSCRIBER_TOPICS:-}
+
+      # ---------------------------------------------------------------------------------
+      # THE REST OF THE PROVISIONING INTERFACE
+      #
+      # Everything below is a setting scripts/kafka-provision.sh reads and this one-shot used
+      # to DROP. A dropped name is not an error there — the script defaults each one and
+      # reports success — so the compose path quietly provisioned something other than what
+      # the .env asked for, while ./stack.sh's host fallback, reading the same .env, honoured
+      # it. Which path ran depended on whether the host happened to have the Kafka CLI.
+      #
+      # "scripts/kafka-provision.sh --print-interface" is the canonical list, and
+      # TestKafkaProvisionScript_HandsOffEverySupportedSetting compares this block against it,
+      # so a variable added to the script fails a test here rather than being silently lost.
+      # ---------------------------------------------------------------------------------------
+
+      # CONSENT to adding partitions to a topic that already holds records. It re-maps keys, so
+      # one ledger's events can split across partitions and be consumed out of order with
+      # nothing failing to say so. Dropping it made this path REFUSE a growth the host fallback
+      # would have performed — failing safe, but differently, which is the whole problem.
+      KAFKA_ALLOW_PARTITION_GROWTH: ${KAFKA_ALLOW_PARTITION_GROWTH:-}
+
+      # Where a GENERATED producer password is written, mode 0600. Without it the script has
+      # nowhere to deliver one and skips the principal entirely rather than printing it into
+      # this container's log — so a stack relying on generation got no producer at all, and the
+      # server and worker then refuse to construct their publisher.
+      KAFKA_PRODUCER_SECRET_FILE: ${KAFKA_PRODUCER_SECRET_FILE:-}
+
+      # The two skip and rotate flags for the sample subscriber, symmetric with the producer's
+      # above. Rotation off by default so a routine bring-up does not invalidate the credential
+      # a local consumer is already using; the skip is for a shared broker where minting a
+      # sample credential is exactly the wrong thing to do.
+      KAFKA_SKIP_SAMPLE_SUBSCRIBER: ${KAFKA_SKIP_SAMPLE_SUBSCRIBER:-}
+      KAFKA_ROTATE_SAMPLE_SUBSCRIBER_SECRET: ${KAFKA_ROTATE_SAMPLE_SUBSCRIBER_SECRET:-}
+
+      # How long provisioning waits for the broker to become answerable, and how often it asks.
+      # The healthcheck gate above makes the wait short in the normal case; these bound the
+      # abnormal one instead of leaving it to the container's own patience.
+      KAFKA_PROVISION_TIMEOUT_SECONDS: ${KAFKA_PROVISION_TIMEOUT_SECONDS:-60}
+      KAFKA_PROVISION_POLL_INTERVAL_SECONDS: ${KAFKA_PROVISION_POLL_INTERVAL_SECONDS:-2}
+
+      # The per-CLI-invocation timeout and the grace period before a hung one is killed. Each
+      # Kafka CLI call starts a JVM, so a broker that accepts a connection and then stops
+      # answering hangs the whole one-shot; these are what turn that into a named failure.
+      KAFKA_CLI_TIMEOUT_SECONDS: ${KAFKA_CLI_TIMEOUT_SECONDS:-30}
+      KAFKA_CLI_KILL_GRACE_SECONDS: ${KAFKA_CLI_KILL_GRACE_SECONDS:-5}
+
+      # An operator-managed client properties file, used VERBATIM when set: a custom CA and
+      # truststore, a non-SCRAM mechanism, SSL hostname verification. Dropping it meant the
+      # script assembled SASL_PLAINTEXT SCRAM from the environment instead — which against a
+      # broker that accepts both would SUCCEED while sending the credential unencrypted. The
+      # path must exist inside THIS container, so mount it if it is set.
+      KAFKA_CLIENT_CONFIG: ${KAFKA_CLIENT_CONFIG:-}
     volumes:
       - ./scripts:/scripts:ro
     # Set as a pair: an entrypoint alone would leave the image's CMD in place and pass it
@@ -735,7 +788,7 @@ services:
     # geometry variables — so this gate is not what makes the topics exist. What it buys
     # is that a provisioning failure stops the stack visibly at bring-up rather than
     # appearing minutes later as dead letters, and that only one of the two creators
-    # races to create the eight topics on a cold start.
+    # races to create the topic catalogue on a cold start.
     depends_on:
       kafka:
         condition: service_healthy

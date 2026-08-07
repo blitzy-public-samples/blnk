@@ -36,10 +36,13 @@
 package blnk
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -285,6 +288,68 @@ func TestStackScript_ProvisionsKafkaBeforeStartingTheApplication(t *testing.T) {
 			"database, the queue and the API as well")
 }
 
+// TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation is the M-3 guard: the
+// script and the containers must not disagree about the one value that decides whether Blnk
+// publishes.
+//
+// THE CASCADE. showenv() sources ${env} before main() runs. If the caller had already EXPORTED
+// KAFKA_BROKERS, that source does not shadow it — assigning to an exported name keeps the export
+// attribute and replaces the value — so every later child process inherits ${env}'s value. The
+// script meanwhile decides with KAFKA_BROKERS_FROM_SHELL, captured before the source, which is
+// correct because compose resolves the shell environment ahead of --env-file. The two then
+// differ, and "KAFKA_BROKERS=broker-a ./stack.sh -u" against a .env naming broker-b had the
+// script wait for, authenticate to and verify the catalogue on broker-a while the server and
+// worker published to broker-b — with the bring-up reporting success.
+//
+// The fix is structural: one `compose` function pins the effective value on every invocation, so
+// there is no second place for the precedence rule to be re-derived. This asserts the structure,
+// because that is what makes it hold for a compose call added later.
+func TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation(t *testing.T) {
+	stack := readRepoFile(t, "stack.sh")
+
+	// The helper exists and pins the value it was given by the one resolver.
+	assert.Contains(t, stack, `KAFKA_BROKERS="$(effective_kafka_brokers)" \`,
+		"the compose helper must pin the EFFECTIVE broker list on the invocation, so what compose "+
+			"interpolates is what this script decided rather than whatever survived sourcing .env")
+
+	// EVERY invocation goes through it. Counting raw ${COMPOSE_CL} uses is the assertion that
+	// keeps this true: one is the helper's own, and the rest must be printed advice rather than
+	// executed commands, because an executed one would be a call that skipped the pin.
+	for _, line := range strings.Split(stack, "\n") {
+		if !strings.Contains(line, "${COMPOSE_CL}") {
+			continue
+		}
+
+		trimmed := strings.TrimSpace(line)
+
+		// The helper's own invocation.
+		if strings.HasPrefix(trimmed, "${COMPOSE_CL} --env-file \"${env}\" -f \"${COMPOSE_FILE}\" \"$@\"") {
+			continue
+		}
+
+		// Advice printed to the operator: a quoted fragment inside a message argument, not a
+		// command. These interpolate nothing at runtime.
+		assert.Truef(t, strings.HasPrefix(trimmed, `"`),
+			"stack.sh line %q invokes compose directly. Every invocation must go through the "+
+				"compose() helper, or it receives whichever KAFKA_BROKERS survived sourcing .env "+
+				"instead of the effective one", trimmed)
+	}
+
+	// The two-variable capture that makes the precedence reproducible must survive: "unset" and
+	// "set to empty" are different answers, and compose treats an explicitly empty shell value as
+	// a real value that overrides --env-file.
+	assert.Contains(t, stack, `declare KAFKA_BROKERS_DECLARED_IN_SHELL="${KAFKA_BROKERS+yes}"`,
+		"declaration must be captured separately from value, so an explicit KAFKA_BROKERS= is "+
+			"honoured as 'no brokers for this run' rather than falling back to .env")
+	assert.Contains(t, stack, `declare KAFKA_BROKERS_FROM_SHELL="${KAFKA_BROKERS-}"`,
+		"and the pre-source value must be captured before sourcing .env can replace it")
+
+	// The host fallback pins it too, and did already — it is the precedent this generalises.
+	assert.Contains(t, stack, `KAFKA_BROKERS="${brokers}" \`,
+		"provision_kafka must keep passing the effective list explicitly, so the broker the "+
+			"catalogue is created on is the broker the application publishes to")
+}
+
 // TestStackScript_LeavesTheNonApplicableCasesUnfailed asserts the gate does not invent work.
 //
 // Three situations are not problems and must not be reported as any: no broker list, a compose
@@ -518,21 +583,179 @@ func TestKafkaProvisionScript_ReadsTheProducerIdentityTheApplicationUses(t *test
 		"and KAFKA_SASL_SECRET, for the same reason")
 
 	// Both must survive delegation into the broker container, which is how the compose one-shot
-	// runs. A variable left out of the pass-through is silently replaced by the script's own
+	// runs. A variable left out of the interface is silently replaced by the script's own
 	// default — here, "not configured" — so the producer would be skipped with no diagnosis.
-	passthrough := script[strings.Index(script, "local passthrough=("):]
-	passthrough = passthrough[:strings.Index(passthrough, "\n    )")]
+	interface_ := kafkaProvisionInterface(t)
 
 	for _, variable := range []string{
 		"KAFKA_SASL_USER",
 		"KAFKA_SASL_SECRET",
-		"KAFKA_SKIP_PRODUCER_PRINCIPAL",
+		"KAFKA_SKIP_PRODUCER",
 		"KAFKA_ROTATE_PRODUCER_SECRET",
 	} {
-		assert.Containsf(t, passthrough, variable,
+		assert.Containsf(t, interface_, variable,
 			"%s must be forwarded when this script delegates into the broker container, or the "+
 				"compose one-shot silently falls back to this script's own default", variable)
 	}
+}
+
+// kafkaProvisionInterface returns the provisioning script's own canonical variable list, by
+// asking the script for it.
+//
+// IT EXECUTES THE SCRIPT rather than parsing it, and that is the point: "--print-interface" is
+// the contract ./stack.sh reads at bring-up, so a test that read the array declaration by regex
+// could pass while the flag printed something else entirely — and it is the flag's output that
+// governs what a real run forwards.
+//
+// The call is safe to make from a unit test because parse_arguments runs before every side
+// effect: nothing is read from configuration, no broker is contacted and nothing is provisioned.
+// A pruned environment is passed anyway, so a developer with real Kafka variables exported runs
+// the same test CI does.
+func kafkaProvisionInterface(t *testing.T, flags ...string) []string {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := filepath.Join(moduleRootDir(t), "scripts", "kafka-provision.sh")
+	arguments := append([]string{path}, flags...)
+	if len(flags) == 0 {
+		arguments = append(arguments, "--print-interface")
+	}
+
+	command := exec.CommandContext(ctx, "bash", arguments...)
+	command.Env = []string{"PATH=" + os.Getenv("PATH")}
+
+	output, err := command.Output()
+	require.NoError(t, err,
+		"scripts/kafka-provision.sh --print-interface must succeed with no environment at all: "+
+			"stack.sh calls it on every bring-up, and a failure there means no settings are forwarded")
+
+	names := make([]string, 0, 40)
+	for _, line := range strings.Split(string(output), "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			names = append(names, trimmed)
+		}
+	}
+
+	require.NotEmpty(t, names, "the interface must not be empty, or this test proves nothing")
+
+	return names
+}
+
+// TestKafkaProvisionScript_HandsOffEverySupportedSetting is the static equality assertion the
+// three invocation paths are held to.
+//
+// FOUR PATHS PROVISION THE SAME BROKER: the script run directly, the script re-executing itself
+// inside the broker container, ./stack.sh's host fallback, and the compose kafka-init one-shot.
+// Each used to carry its own hand-written list of variables to forward, and they had drifted in
+// every direction at once — stack.sh omitted the CLI timeout pair, the producer secret file and
+// the real skip flag; both compose blocks omitted those plus partition growth, the readiness
+// budget, the subscriber skip and rotation flags, and the client configuration.
+//
+// A MISSING NAME DOES NOT ERROR, WHICH IS WHY THIS TEST EXISTS. The receiving run defaults the
+// variable and reports success, so the same .env provisioned differently depending on which path
+// ran — and which ran depended on nothing more than whether the host happened to have the Kafka
+// CLI. Invisible, and unreproducible.
+//
+// stack.sh no longer restates the list at all: it reads "--print-interface-host" at startup, so
+// it cannot drift and there is nothing to assert but the absence of a literal copy. The compose
+// files cannot execute anything at parse time, so they must restate — and this is what holds the
+// restatement to the declaration.
+func TestKafkaProvisionScript_HandsOffEverySupportedSetting(t *testing.T) {
+	declared := kafkaProvisionInterface(t)
+
+	t.Run("both compose one-shots set exactly the declared interface", func(t *testing.T) {
+		for _, file := range composeProjections {
+			environment, ok := composeService(t, file, "kafka-init")["environment"].(map[string]interface{})
+			require.Truef(t, ok, "%s: kafka-init must declare an environment map", file)
+
+			set := make([]string, 0, len(environment))
+			for name := range environment {
+				// TZ is the container's own concern and not part of the provisioning contract.
+				if strings.HasPrefix(name, "KAFKA_") {
+					set = append(set, name)
+				}
+			}
+
+			// EQUALITY, in both directions. A missing name is a setting silently lost; an
+			// EXTRA name is a setting compose believes it is passing and the script never
+			// reads, which is just as misleading to whoever maintains the .env.
+			assert.ElementsMatchf(t, declared, set,
+				"%s: kafka-init's environment must be exactly the interface "+
+					"'scripts/kafka-provision.sh --print-interface' declares. A name the script "+
+					"reads and this block omits is defaulted by the one-shot and reported as "+
+					"success, so the compose path provisions something other than what the .env "+
+					"asked for while stack.sh's host fallback honours it", file)
+		}
+	})
+
+	t.Run("stack.sh reads the interface instead of restating it", func(t *testing.T) {
+		stack := readRepoFile(t, "stack.sh")
+
+		assert.Contains(t, stack, "--print-interface-host",
+			"stack.sh must read the interface from the script that owns it, so the two cannot drift")
+		assert.Contains(t, stack, "resolve_kafka_provision_interface",
+			"and it must do so through the resolver, which reports a failure rather than leaving an "+
+				"empty forwarding behind")
+
+		// A literal array would be a second copy, and a second copy is what drifted before.
+		assert.NotContains(t, stack, "declare -a kafka_provision_passthrough=(\n",
+			"stack.sh must not declare a literal pass-through list: reading the script's own "+
+				"declaration is what makes the two the same interface rather than two lists that "+
+				"agree today")
+
+		// The host-only half must reach a host-side invoker, since it is how the script is told
+		// where to delegate. Asserted through the flag, so the split itself is exercised.
+		hostOnly := kafkaProvisionInterface(t, "--print-interface-host")
+		assert.Subset(t, hostOnly, declared,
+			"the host form must be a superset of the container form: it adds delegation targets "+
+				"rather than replacing the interface")
+		assert.Contains(t, hostOnly, "KAFKA_CONTAINER",
+			"a host-side invoker must be able to name the container to delegate into")
+		assert.NotContains(t, declared, "KAFKA_CONTAINER",
+			"and that name must NOT cross into the container, where it is meaningless")
+	})
+
+	t.Run("one skip flag governs the producer, and the retired name is refused", func(t *testing.T) {
+		script := readRepoFile(t, filepath.Join("scripts", "kafka-provision.sh"))
+
+		assert.Contains(t, declared, "KAFKA_SKIP_PRODUCER",
+			"the canonical skip flag must be part of the interface every path forwards")
+		assert.NotContains(t, declared, "KAFKA_SKIP_PRODUCER_PRINCIPAL",
+			"the retired flag must not be forwarded anywhere")
+
+		// It is READ in exactly one place — the retired-variable refusal — and nowhere else.
+		// Two variables used to gate different halves of one decision: one skipped the
+		// producer's VALIDATION and the other skipped the broker MUTATION, and the forwarding
+		// was split the same way, so neither entry point could express "skip the producer"
+		// completely and each half looked like a bug in the other.
+		assert.Contains(t, script, `"KAFKA_SKIP_PRODUCER_PRINCIPAL=KAFKA_SKIP_PRODUCER"`,
+			"the retired name must be declared as retired, with its replacement, so a stack still "+
+				"setting it is told rather than silently losing the skip it asked for")
+		assert.NotContains(t, script, `is_truthy "$KAFKA_SKIP_PRODUCER_PRINCIPAL"`,
+			"nothing may still branch on the retired flag")
+		assert.NotContains(t, script, `KAFKA_SKIP_PRODUCER_PRINCIPAL="${KAFKA_SKIP_PRODUCER_PRINCIPAL:-}"`,
+			"and it must not be defaulted, or the refusal would fire on every run")
+
+		// Declared once. It was declared twice, in one block, with near-identical prose.
+		assert.Equal(t, 1,
+			strings.Count(script, `KAFKA_SKIP_PRODUCER="${KAFKA_SKIP_PRODUCER:-}"`),
+			"the canonical flag must have exactly one declaration")
+
+		for _, gate := range []string{
+			`require_valid_producer() {`,
+			`ensure_producer_principal() {`,
+		} {
+			require.Contains(t, script, gate)
+		}
+
+		// Validation and mutation must read the SAME name. Counting the reads is what proves
+		// they were unified rather than merely renamed in one of the two places.
+		assert.GreaterOrEqual(t, strings.Count(script, `is_truthy "$KAFKA_SKIP_PRODUCER"`), 3,
+			"the validation gate, the rotation-destination check and the mutation gate must all "+
+				"read the one canonical flag")
+	})
 }
 
 // TestCompose_PassesTheProducerIdentityToProvisioning asserts the compose one-shot hands the

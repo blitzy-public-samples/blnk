@@ -722,32 +722,57 @@ func TestLoadConfigFromFile_PrefixedAliasWinsOverBareName(t *testing.T) {
 	}
 }
 
-// TestLoadConfigFromFile_StartsWithKafkaBrokersAndNoWindow carries the missing-window
-// rule through the REAL load pipeline, not just validateAndAddDefaults.
+// TestLoadConfigFromFile_RefusesKafkaBrokersWithNoWindow carries the missing-window rule
+// through the REAL load pipeline, not just validateAndAddDefaults.
 //
-// # Why this must LOAD rather than refuse
+// # Why this must REFUSE rather than load with a warning
 //
-// Adding KAFKA_BROKERS is, on its own, a safe additive change: the publisher starts
-// producing and nothing else about the deployment moves. Refusing to load without a
-// retirement date turned that step into an outage, which is the opposite of what AAP
-// §0.7.2 requires of a deployment adopting Kafka configuration — and an operator whose
-// first attempt at enabling Kafka takes the service down is likelier to back the
-// migration out than to finish it.
+// It used to load, and the warning it emitted said that "legacy HTTP webhook delivery
+// will run alongside Kafka INDEFINITELY". The runtime does the OPPOSITE:
+// blnk.WebhookSunsetPassed fails closed on a publishing deployment with no usable
+// window, answering that the sunset has ALREADY passed — dual delivery stops and the
+// deprecated webhook management routes answer 410 Gone. Configuration and behaviour
+// therefore disagreed about the single decision requirement R-12 is made of, and an
+// operator reading the log was told the safer of the two answers while getting the other.
 //
-// Nothing has been mis-stated in this case, which is the distinction from an
-// unparseable date: the operator has not yet chosen when the legacy transport retires.
-// The consequence is that dual delivery continues, which is the PRE-EXISTING behaviour
-// and is safe for every subscriber. It is warned about loudly and it changes nothing
-// about how traffic is served.
-func TestLoadConfigFromFile_StartsWithKafkaBrokersAndNoWindow(t *testing.T) {
+// The runtime's reading is the one worth keeping: carrying a deprecated, less protected
+// transport indefinitely on the strength of an unset variable is worse than retiring it
+// loudly. So the combination is refused at load, before any traffic is served, which is
+// also what event_sunset.go's own documentation already claimed happened.
+//
+// The refusal must NAME the variable, because "invalid configuration" sends an operator
+// looking through everything.
+func TestLoadConfigFromFile_RefusesKafkaBrokersWithNoWindow(t *testing.T) {
 	clearEventStreamingEnv(t)
 	restoreConfigStore(t)
 
 	configFile := writeTempEventConfigFile(t)
 	t.Setenv("KAFKA_BROKERS", "broker-1:9092")
 
+	err := loadConfigFromFile(configFile)
+	if err == nil {
+		t.Fatal("Expected brokers with no dual-delivery window to be REFUSED at load")
+	}
+	if !strings.Contains(err.Error(), "webhook_deprecation_sunset_date") {
+		t.Errorf("Expected the error to name the missing setting, got %q", err.Error())
+	}
+}
+
+// TestLoadConfigFromFile_LoadsWithNoBrokersAndNoWindow is the other side of that rule, and
+// it is AAP §0.7.2's graceful degradation stated as a test.
+//
+// With KAFKA_BROKERS unset there is no transport to migrate to, so there is no window to
+// describe and nothing has been mis-stated. The service must start and serve exactly as it
+// did before this feature existed, with the publisher resolving to the no-op — which is what
+// protects every deployment that has not adopted Kafka.
+func TestLoadConfigFromFile_LoadsWithNoBrokersAndNoWindow(t *testing.T) {
+	clearEventStreamingEnv(t)
+	restoreConfigStore(t)
+
+	configFile := writeTempEventConfigFile(t)
+
 	if err := loadConfigFromFile(configFile); err != nil {
-		t.Fatalf("Expected brokers with no window to LOAD; got %v", err)
+		t.Fatalf("Expected no brokers and no window to LOAD; got %v", err)
 	}
 
 	loaded, err := Fetch()
@@ -755,8 +780,8 @@ func TestLoadConfigFromFile_StartsWithKafkaBrokersAndNoWindow(t *testing.T) {
 		t.Fatalf("Fetch failed: %v", err)
 	}
 
-	if len(loaded.Kafka.Brokers) != 1 || loaded.Kafka.Brokers[0] != "broker-1:9092" {
-		t.Errorf("Expected the brokers to survive the load, got %v", loaded.Kafka.Brokers)
+	if len(loaded.Kafka.Brokers) != 0 {
+		t.Errorf("Expected no brokers, got %v", loaded.Kafka.Brokers)
 	}
 	if loaded.WebhookDeprecationSunsetDate != "" {
 		t.Errorf("Expected no sunset date, got %q", loaded.WebhookDeprecationSunsetDate)
@@ -1235,29 +1260,35 @@ func TestValidateAndAddDefaults_KafkaConfiguredValuesSurvive(t *testing.T) {
 // TestValidateAndAddDefaults_KafkaSASLPairIsFatalOnlyWithBrokers pins where the pair
 // contract is enforced, which is as important as the contract itself.
 //
-// TestResolveWebhookDeprecationWindow_AnAbsentDateIsWarnedAboutAndNeverInvented pins what
-// happens when Kafka is configured and no retirement instant has been chosen.
+// TestResolveWebhookDeprecationWindow_AnUnusableWindowIsRefusedNeverInvented pins what
+// happens when Kafka is configured and no usable retirement instant has been given.
 //
-// # Why an absent date is a WARNING and not a refusal
+// # Why an absent date with brokers is now a REFUSAL
 //
-// Two remediations of this same case are possible and only one can exist. Refusing to load
-// makes adding KAFKA_BROKERS able to take a running deployment down over a NOTIFICATION
-// scheduling decision, and it is reached by leaving one variable unset — the state every
-// deployment starts in. Nothing has been mis-stated in that case: an operator has not yet
-// chosen a cutover date, dual delivery continues, and that is the pre-migration behaviour,
-// which is safe for every subscriber. A MALFORMED date remains fatal, because that IS a
-// mis-statement and would otherwise resolve silently to "the sunset has not passed".
+// It was a warning, and the warning promised that dual delivery would continue
+// indefinitely. blnk.WebhookSunsetPassed does the opposite: for a deployment that IS
+// publishing, a missing or unparseable window fails closed and answers that the sunset has
+// already passed, so the legacy leg stops and the deprecated management routes answer 410
+// Gone. Two components disagreeing about the single decision requirement R-12 consists of is
+// worse than either answer, and the fail-closed one is the safer of the two to keep — an
+// unset variable must not be able to preserve a deprecated, less protected transport
+// silently. So the combination is refused here, before any traffic is served, which is what
+// event_sunset.go's documentation already said happened.
+//
+// A MALFORMED date remains fatal for the same reason it always was, with or without brokers:
+// that IS a mis-statement, and it would otherwise resolve silently to "the sunset has not
+// passed".
 //
 // # Why no window is derived either
 //
 // Inventing one from "now" would produce a sunset that MOVES ON EVERY RESTART, so the legacy
-// transport's retirement instant would depend on when a pod last happened to start. The
-// warning names the variable instead, which is the outcome an operator can act on.
+// transport's retirement instant would depend on when a pod last happened to start. The error
+// names the variable instead, which is the outcome an operator can act on.
 //
 // The local-dev flag makes NO difference here, and that is asserted rather than assumed: an
 // exception that derived a window under it would be one restart away from being the behaviour
 // a production deployment gets the moment the flag is left set.
-func TestResolveWebhookDeprecationWindow_AnAbsentDateIsWarnedAboutAndNeverInvented(t *testing.T) {
+func TestResolveWebhookDeprecationWindow_AnUnusableWindowIsRefusedNeverInvented(t *testing.T) {
 	clearEventStreamingEnv(t)
 
 	for name, localDev := range map[string]bool{
@@ -1265,36 +1296,24 @@ func TestResolveWebhookDeprecationWindow_AnAbsentDateIsWarnedAboutAndNeverInvent
 		"not local development":  false,
 	} {
 		t.Run("brokers, no window, "+name, func(t *testing.T) {
-			hook := logtest.NewGlobal()
-			defer hook.Reset()
-
 			cnf := eventStreamingBaseConfig()
 			cnf.Kafka.Brokers = []string{"kafka:9092"}
 			cnf.Kafka.InsecureLocalDev = localDev
 
-			if err := cnf.resolveWebhookDeprecationWindow(); err != nil {
-				t.Fatalf("Expected an absent date to load cleanly, got %v", err)
+			err := cnf.resolveWebhookDeprecationWindow()
+			if err == nil {
+				t.Fatal("Expected brokers with no dual-delivery window to be refused")
+			}
+
+			// The refusal must NAME THE VARIABLE. "Invalid configuration" without the key is
+			// a line an operator cannot act on.
+			if !strings.Contains(err.Error(), "webhook_deprecation_sunset_date") {
+				t.Errorf("Expected the error to name the missing setting, got %v", err)
 			}
 
 			if cnf.WebhookDeprecationStartDate != "" || cnf.WebhookDeprecationSunsetDate != "" {
 				t.Errorf("Expected NO window to be invented, got start=%q sunset=%q",
 					cnf.WebhookDeprecationStartDate, cnf.WebhookDeprecationSunsetDate)
-			}
-
-			// WARNED, and the warning must NAME THE VARIABLE. "No sunset date is set" without
-			// the key is a line an operator cannot act on.
-			var warned bool
-			for _, entry := range hook.AllEntries() {
-				if entry.Level != logrus.WarnLevel {
-					continue
-				}
-				if strings.Contains(entry.Message, "sunset date") ||
-					entry.Data["variable"] == "WEBHOOK_DEPRECATION_SUNSET_DATE" {
-					warned = true
-				}
-			}
-			if !warned {
-				t.Error("Expected a warning that legacy delivery will continue until a sunset date is set")
 			}
 		})
 	}
@@ -1302,13 +1321,30 @@ func TestResolveWebhookDeprecationWindow_AnAbsentDateIsWarnedAboutAndNeverInvent
 	t.Run("a half-written window cannot survive with one end", func(t *testing.T) {
 		// A start that arrived from a configuration file with no sunset beside it is not a
 		// window. Keeping it would leave the sunset decision resting on a value nothing
-		// validates and the API's 410 guard reading a date that no longer has a partner.
+		// validates and the API's 410 guard reading a date that no longer has a partner. With
+		// brokers configured the orphan is ALSO a refusal, so both properties are asserted at
+		// once: cleared, and reported.
 		cnf := eventStreamingBaseConfig()
 		cnf.Kafka.Brokers = []string{"kafka:9092"}
 		cnf.WebhookDeprecationStartDate = testWindowStart
 
+		if err := cnf.resolveWebhookDeprecationWindow(); err == nil {
+			t.Fatal("Expected an orphaned start with brokers and no sunset to be refused")
+		}
+		if cnf.WebhookDeprecationStartDate != "" {
+			t.Errorf("Expected the orphaned start to be cleared, got %q",
+				cnf.WebhookDeprecationStartDate)
+		}
+	})
+
+	t.Run("a half-written window with no brokers is cleared and accepted", func(t *testing.T) {
+		// Without a transport there is no window, so an orphaned start is simply discarded:
+		// nothing has been mis-stated about a migration that is not happening.
+		cnf := eventStreamingBaseConfig()
+		cnf.WebhookDeprecationStartDate = testWindowStart
+
 		if err := cnf.resolveWebhookDeprecationWindow(); err != nil {
-			t.Fatalf("Expected an absent sunset to load cleanly, got %v", err)
+			t.Fatalf("Expected an orphaned start with no brokers to load cleanly, got %v", err)
 		}
 		if cnf.WebhookDeprecationStartDate != "" {
 			t.Errorf("Expected the orphaned start to be cleared, got %q",
@@ -2315,38 +2351,31 @@ func TestResolveWebhookDeprecationWindow(t *testing.T) {
 		})
 	})
 
-	// An absent window with brokers configured is WARNED about and accepted. Failing
-	// would make enabling Kafka an outage, and the consequence — dual delivery
-	// continuing — is the pre-existing, subscriber-safe behaviour. The warning is
-	// asserted, not just the absence of an error: an accepted misconfiguration that
-	// says nothing is the failure mode this replaced.
-	t.Run("an absent window is warned about once kafka brokers are configured", func(t *testing.T) {
-		hook := logtest.NewGlobal()
-		defer hook.Reset()
-
+	// An absent window with brokers configured is REFUSED, through the whole
+	// validateAndAddDefaults chain rather than only through the window resolver, because
+	// the chain is what a load actually runs. Accepting it with a warning is what let
+	// configuration promise indefinite dual delivery while the runtime treated the same
+	// state as already past the sunset — see resolveWebhookDeprecationWindow.
+	//
+	// The refusal must NAME the variable and STATE the consequence, so an operator can act
+	// on it without reading the source.
+	t.Run("an absent window is refused once kafka brokers are configured", func(t *testing.T) {
 		cnf := eventStreamingBaseConfig()
 		cnf.Kafka.Brokers = []string{"broker-1:9092"}
 
-		if err := cnf.validateAndAddDefaults(); err != nil {
-			t.Fatalf("Expected brokers with no window to be accepted, got %v", err)
+		err := cnf.validateAndAddDefaults()
+		if err == nil {
+			t.Fatal("Expected brokers with no window to be refused; accepting the configuration " +
+				"is what left dual delivery and the 410 guard disagreeing about the same date")
 		}
-
-		var warned bool
-		for _, entry := range hook.AllEntries() {
-			if entry.Level != logrus.WarnLevel {
-				continue
-			}
-			if strings.Contains(entry.Message, "webhook deprecation sunset date") {
-				warned = true
-
-				if !strings.Contains(entry.Message, "INDEFINITELY") {
-					t.Errorf("Expected the warning to state the consequence, got %q", entry.Message)
-				}
-			}
+		if !strings.Contains(err.Error(), "webhook_deprecation_sunset_date") {
+			t.Errorf("Expected the error to name the missing setting, got %q", err.Error())
 		}
-		if !warned {
-			t.Error("Expected a warning naming the missing sunset date; accepting the " +
-				"configuration silently is what leaves dual delivery running with no end")
+		if !strings.Contains(err.Error(), "WEBHOOK_DEPRECATION_SUNSET_DATE") {
+			t.Errorf("Expected the error to name the environment variable to set, got %q", err.Error())
+		}
+		if !strings.Contains(err.Error(), "410 Gone") {
+			t.Errorf("Expected the error to state the consequence of leaving it unset, got %q", err.Error())
 		}
 
 		if cnf.WebhookDeprecationSunsetDate != "" || cnf.WebhookDeprecationStartDate != "" {

@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -684,6 +685,75 @@ func (c capturedLog) count(needle string) int {
 	return matches
 }
 
+// syncLogBuffer is the buffer captureLogs redirects the standard logger into.
+//
+// IT IS MUTEX-GUARDED BECAUSE THE LOGGING THIS FILE OBSERVES HAPPENS ON ANOTHER GOROUTINE.
+// logrus serialises its own writes behind the logger's mutex, so a plain bytes.Buffer is
+// safe against two concurrent log calls — but nothing in logrus guards a READER, and this
+// file has two of them: countLogEntries polls the buffer every 20ms while an asynq worker is
+// still delivering, and captureLogs renders it the moment fn returns, which for
+// captureLogsUntil is while that worker may still be logging.
+//
+// A bytes.Buffer read concurrently with a logrus write is a data race on the buffer's length
+// and on its backing array. It is reported by `go test -race`, which .github/workflows/go.yml
+// runs across the whole module on every push, so an unguarded buffer here fails the build for
+// the package rather than only for this file. It is not reporting-only noise either:
+// Buffer.grow reallocates mid-Write, so a String taken at the wrong moment can observe a
+// half-copied record and turn "exactly one record" into an undecodable capture — a failure
+// that would read as a defect in the code under test.
+//
+// Every method takes the same mutex, which is what orders the reads against the writes
+// instead of merely making a collision rare.
+type syncLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write appends p under the lock. This is the io.Writer logrus is handed.
+//
+// Parameters:
+//   - p []byte: the rendered record.
+//
+// Returns:
+//   - int: the number of bytes written.
+//   - error: always nil — bytes.Buffer writes do not fail.
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+// String renders everything written so far.
+//
+// countLogEntries reaches the buffer through fmt.Stringer rather than through this type, so
+// this method is also what keeps that indirection working now the buffer is no longer a
+// bytes.Buffer.
+//
+// Returns:
+//   - string: the accumulated rendering.
+func (b *syncLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+// Bytes returns a COPY of everything written so far.
+//
+// The copy is the point. bytes.Buffer.Bytes aliases the live backing array, so decoding
+// straight out of it would read that array after the lock is dropped, while the worker keeps
+// appending — the same race, moved one call away from where it is visible.
+//
+// Returns:
+//   - []byte: an independent snapshot, safe to decode without holding the lock.
+func (b *syncLogBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
 // captureLogs redirects the standard logger for the duration of fn and returns what it wrote.
 //
 // The standard logger is process-global, so the previous output, formatter and level are
@@ -691,6 +761,10 @@ func (c capturedLog) count(needle string) int {
 // inside fn aborts the goroutine, and a deferred restore that never runs would leave every
 // subsequent test in the package logging into a dead buffer. No test in this file calls
 // t.Parallel, which is what makes a global redirect safe here.
+//
+// The output is a syncLogBuffer rather than a bytes.Buffer because fn's logging may land on
+// another goroutine; see that type for why an unguarded buffer is a data race and not merely
+// a tidiness question.
 //
 // Parameters:
 //   - t *testing.T: the test, for cleanup registration and decode failures.
@@ -712,8 +786,8 @@ func captureLogs(t *testing.T, level logrus.Level, fn func()) capturedLog {
 		logger.SetLevel(previousLevel)
 	})
 
-	var buf bytes.Buffer
-	logger.SetOutput(&buf)
+	buf := &syncLogBuffer{}
+	logger.SetOutput(buf)
 	logger.SetFormatter(&logrus.JSONFormatter{})
 	logger.SetLevel(level)
 

@@ -258,8 +258,8 @@ func consumerGroupLagLabel(group string) string {
 
 // topicLagLabel resolves the 'topic' gauge attribute to a bounded value.
 //
-// The permitted set is the topics Blnk itself owns under the configured prefix — the four
-// category topics and their four dead-letter siblings — the same closed set every other
+// The permitted set is the topics Blnk itself owns under the configured prefix — every
+// category topic and every dead-letter sibling — the same closed set every other
 // topic-attributed instrument in this pipeline uses.
 //
 // Parameters:

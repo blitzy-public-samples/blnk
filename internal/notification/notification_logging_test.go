@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,6 +44,69 @@ import (
 type notifyErrorLogCapture struct {
 	entries []map[string]interface{}
 	raw     string
+}
+
+// syncLogBuffer is the buffer captureNotifyErrorLog redirects the standard logger into.
+//
+// IT IS MUTEX-GUARDED BECAUSE NOTIFYERROR LOGS FROM A GOROUTINE IT SPAWNS. logrus serialises
+// its own writes behind the logger's mutex, so a plain bytes.Buffer is safe against two
+// concurrent log calls — but nothing in logrus guards a READER, and captureNotifyErrorLog has
+// two: the arrival poll, which reads the buffer every 5ms while that goroutine is still
+// writing, and the final rendering, which reads it once the settling window closes.
+//
+// An unguarded read alongside a logrus write is a data race on the buffer's length and on its
+// backing array, reported by `go test -race` — which .github/workflows/go.yml runs across the
+// whole module on every push, so the package fails to pass CI rather than merely logging a
+// warning. It is not reporting-only either: Buffer.grow reallocates mid-Write, so a String
+// taken at the wrong moment can observe a half-copied record and fail the JSON decode, which
+// would read as a defect in NotifyError's rendering rather than in this helper.
+//
+// Every method takes the same mutex, which is what orders the reads against the writes
+// instead of merely making a collision rare.
+type syncLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write appends p under the lock. This is the io.Writer logrus is handed.
+//
+// Parameters:
+//   - p []byte: the rendered record.
+//
+// Returns:
+//   - int: the number of bytes written.
+//   - error: always nil — bytes.Buffer writes do not fail.
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+// String renders everything written so far.
+//
+// Returns:
+//   - string: the accumulated rendering.
+func (b *syncLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+// Bytes returns a COPY of everything written so far.
+//
+// The copy is the point. bytes.Buffer.Bytes aliases the live backing array, so decoding
+// straight out of it would read that array after the lock is dropped, while the goroutine may
+// still be appending — the same race, moved one call away from where it is visible.
+//
+// Returns:
+//   - []byte: an independent snapshot, safe to decode without holding the lock.
+func (b *syncLogBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return append([]byte(nil), b.buf.Bytes()...)
 }
 
 // count reports how many captured entries contain needle in their message.
@@ -100,10 +164,12 @@ func captureNotifyErrorLog(t *testing.T, expected int, fn func()) notifyErrorLog
 		logger.SetLevel(previousLevel)
 	})
 
-	// logrus writes through a mutex, so a concurrent goroutine writing into this buffer is
-	// serialised by the logger itself; the buffer is only read after the writes have settled.
-	var buf bytes.Buffer
-	logger.SetOutput(&buf)
+	// logrus serialises the WRITES behind the logger's mutex, but the arrival poll below reads
+	// the buffer while NotifyError's goroutine is still writing into it, so the buffer has to
+	// guard the read side itself. See syncLogBuffer for why a bytes.Buffer here is a data race
+	// rather than a settled-by-then read.
+	buf := &syncLogBuffer{}
+	logger.SetOutput(buf)
 	logger.SetFormatter(&logrus.JSONFormatter{})
 	logger.SetLevel(logrus.DebugLevel)
 

@@ -190,11 +190,6 @@ func (l *Blnk) persistQueuedTransactionBatchLocked(ctx context.Context, span tra
 
 	finalizedTransactions := make([]*model.Transaction, 0, len(transactions))
 	outboxes := make([]*model.LineageOutbox, 0, len(transactions))
-	// The batch's ledger events, prepared by buildTransactionExecutionWork and inserted
-	// inside the same transaction as the balance set below. This is the coalesced half of
-	// the transactional-outbox guarantee: without it the batch's events would be written
-	// after the commit, and a crash in between would lose every one of them.
-	eventOutboxes := make([]*model.EventOutbox, 0, len(transactions))
 	postCommitWork := make([]queuedBatchPostCommitWork, 0, len(transactions))
 	prefetchedReferences, existingReferences, err := l.queuedBatchReferenceSets(ctx, transactions)
 	if err != nil {
@@ -209,42 +204,13 @@ func (l *Blnk) persistQueuedTransactionBatchLocked(ctx context.Context, span tra
 		}
 
 		finalizedTransactions = append(finalizedTransactions, work.transaction)
+		postCommitWork = append(postCommitWork, work)
 		if work.outbox != nil {
 			outboxes = append(outboxes, work.outbox)
 		}
-		if work.eventOutbox != nil {
-			eventOutboxes = append(eventOutboxes, work.eventOutbox)
-			// Marked before the write and safe to mark there only because the write below
-			// is all-or-nothing: on failure this function returns and no post-commit work
-			// runs at all, so there is no path on which a false positive could suppress a
-			// capture that did not happen.
-			work.eventCaptured = true
-		}
-		postCommitWork = append(postCommitWork, work)
 	}
 
-	// ALL-OR-NOTHING, and the batch writer requires it: it refuses a batch whose event
-	// count disagrees with its transaction count, because more rows than transactions is a
-	// duplicate publication and fewer is a batch that publishes one event and loses the
-	// rest. A short count here can only come from one transaction's event failing to be
-	// prepared while the others succeeded — a payload that would not serialise — and the
-	// right answer is to persist the ledger batch and let every event fall back to the
-	// post-commit capture, not to fail a whole batch of financial mutations over a
-	// notification. The atomicity is given up only for the batch that actually hit the
-	// defect, and the failure is already logged where it happened.
-	if len(eventOutboxes) != len(finalizedTransactions) {
-		logrus.WithFields(logrus.Fields{
-			"transactions": len(finalizedTransactions),
-			"events":       len(eventOutboxes),
-		}).Warn("coalesced batch could not capture an event for every transaction; the batch's events will be captured after the commit instead")
-
-		eventOutboxes = nil
-		for i := range postCommitWork {
-			postCommitWork[i].eventCaptured = false
-		}
-	}
-
-	if _, err := l.datasource.RecordTransactionsWithBalanceSetAndOutboxes(ctx, finalizedTransactions, orderedBalances, outboxes, eventOutboxes...); err != nil {
+	if _, err := l.datasource.RecordTransactionsWithBalanceSetAndOutboxes(ctx, finalizedTransactions, orderedBalances, outboxes); err != nil {
 		return queuedBatchPersistResult{}, l.logAndRecordError(span, "failed to persist coalesced transaction batch", err)
 	}
 

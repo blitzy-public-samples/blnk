@@ -5119,7 +5119,7 @@ func (r TopicOffsetReport) Lookup(topic string) (TopicOffsetSnapshot, bool) {
 // as a substitute for it.
 //
 // Called with no topics it measures the whole inventory — every category topic and
-// their four dead-letter siblings — which is what the reconciliation wants and what the
+// their dead-letter siblings — which is what the reconciliation wants and what the
 // statistics endpoint reports. Named topics are measured instead, for narrowing an
 // investigation to one category.
 //

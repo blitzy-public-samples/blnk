@@ -124,11 +124,6 @@ spec:
                 configMapKeyRef:
                   name: blnk-config
                   key: RELAY_EVENT_RETENTION_DAYS
-            - name: WEBHOOK_DEPRECATION_START_DATE
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: WEBHOOK_DEPRECATION_START_DATE
             - name: WEBHOOK_DEPRECATION_SUNSET_DATE
               valueFrom:
                 configMapKeyRef:

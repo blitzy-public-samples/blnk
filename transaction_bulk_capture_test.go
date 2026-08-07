@@ -170,7 +170,8 @@ func TestSendBulkTransactionWebhook_CapturesInsideTheCallersTrace(t *testing.T) 
 	expected := callerSpan.SpanContext().TraceID()
 	require.True(t, expected.IsValid(), "the fixture must have a real trace, or nothing below is exercised")
 
-	blnk.sendBulkTransactionWebhook(callerCtx, "bulk_trace_probe", "applied", "", 3)
+	require.NoError(t, blnk.sendBulkTransactionWebhook(callerCtx, "bulk_trace_probe", "applied", "", 3),
+		"the capture must succeed, or the spans asserted below describe a failure path instead")
 	callerSpan.End()
 
 	insertCtx, row := datasource.captured(t)
@@ -214,7 +215,8 @@ func TestSendBulkTransactionWebhook_CapturesEvenWhenTheCallersContextIsDone(t *t
 	cancel()
 	require.Error(t, callerCtx.Err(), "the fixture's context must already be done, or this asserts nothing")
 
-	blnk.sendBulkTransactionWebhook(callerCtx, "bulk_cancelled_probe", "failed", "rolled back", 0)
+	require.NoError(t, blnk.sendBulkTransactionWebhook(callerCtx, "bulk_cancelled_probe", "failed", "rolled back", 0),
+		"a caller context that is already done must not make the capture fail; that is the whole point")
 
 	insertCtx, row := datasource.captured(t)
 
