@@ -30,8 +30,6 @@ import (
 
 	"github.com/segmentio/kafka-go"
 	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel/attribute"
-	otelmetric "go.opentelemetry.io/otel/metric"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/metrics"
@@ -320,6 +318,17 @@ type KafkaAdmin interface {
 	// idempotent, so it is safe to retry and safe to call on a principal that may not
 	// exist.
 	RevokeSubscriberPrincipal(ctx context.Context, principal string) error
+
+	// PruneSubscriberAccess removes the Blnk-owned bindings a subscriber's RECORDED
+	// authorization no longer implies, and creates nothing. It is the first of the three
+	// steps an authorization change takes; see its documentation for why narrowing must
+	// reach the broker BEFORE the registry records it.
+	PruneSubscriberAccess(ctx context.Context, subscriber *model.EventSubscriber) (SubscriberACLReconciliation, error)
+
+	// GrantSubscriberAccess creates the bindings a subscriber's recorded authorization
+	// implies, and removes nothing. It is the last of those three steps, so a widening
+	// reaches the broker only after the registry records it.
+	GrantSubscriberAccess(ctx context.Context, subscriber *model.EventSubscriber) (SubscriberACLReconciliation, error)
 
 	// AuthorizerActive reports whether the broker enforces ACLs at all.
 	AuthorizerActive(ctx context.Context) (bool, error)
@@ -1975,11 +1984,15 @@ type SubscriberProvisioningRequest struct {
 //
 // PartitionKeyPrefix is deliberately NOT mapped, and cannot be: Kafka's authorizer has
 // no message-key dimension. There is no ACL that restricts a consumer to a slice of a
-// topic by key, so the prefix is application-level metadata that the registry records
-// and the credential response reports for the subscriber's own filtering. Pretending to
-// enforce it here — by, say, binding a prefixed TOPIC pattern instead of a literal one —
-// would be strictly worse than not enforcing it: it would widen the topic grant to every
-// topic sharing that prefix while appearing to narrow it.
+// topic by key. Pretending to enforce it here — by, say, binding a prefixed TOPIC
+// pattern instead of a literal one — would be strictly worse than not enforcing it: it
+// would widen the topic grant to every topic sharing that prefix while appearing to
+// narrow it.
+//
+// Nor is the omission papered over by silence. A row recording a key prefix is refused a
+// credential by EventSubscriberService.IssueSubscriberCredential before this request is
+// ever built, so nothing reaches here carrying an authorization this function cannot
+// honour. That is what makes "not mapped" a fail-closed decision rather than a caveat.
 //
 // Parameters:
 //   - subscriber *model.EventSubscriber: the registry row. A nil row yields a request
@@ -2032,8 +2045,25 @@ type SubscriberProvisioningResult struct {
 	// requested.
 	ConsumerGroupPrefix string
 
-	// ACLBindings is how many bindings were created.
+	// ACLBindings is how many bindings the subscriber's authorization implies, and so how
+	// many the broker holds for it after a successful provisioning.
 	ACLBindings int
+
+	// ACLBindingsRemoved is how many OBSOLETE Blnk-owned bindings reconciliation deleted:
+	// grants from an authorization this subscriber no longer has.
+	//
+	// A non-zero value on an ordinary re-issue is the observable proof that narrowing the
+	// registry actually reached the broker. Before reconciliation existed this was always
+	// zero in effect, and a narrowed subscriber kept reading the topic it had lost.
+	ACLBindingsRemoved int
+
+	// ForeignACLBindings is how many bindings on this principal Blnk does not provision and
+	// deliberately did not touch — a hand-made grant, a DENY, a Write.
+	//
+	// Non-zero means somebody is granting this principal access the registry does not
+	// describe. Reconciliation names each one in a warning rather than deleting it, because
+	// ACL deletion has no undo and an operator's deliberate binding is not Blnk's to remove.
+	ForeignACLBindings int
 
 	// CredentialReplaced is true when the principal already held a SCRAM credential and
 	// this call replaced it. Re-issuing is a supported operation, not an error, and this
@@ -2050,21 +2080,25 @@ type SubscriberProvisioningResult struct {
 	// fact rather than the assumption.
 	AuthorizerActive bool
 
-	// CredentialWritten reports whether the SCRAM credential reached the broker.
+	// CredentialWritten reports whether a SCRAM credential is believed to exist at the
+	// broker when this result was returned.
 	//
 	// It exists for the failure path: a caller handed an error needs to know whether a
 	// credential now exists, because that is the difference between "retry" and "a live
-	// principal is unaccounted for". It is false on a successful compensation, which is the
-	// state the broker is actually left in.
+	// principal is unaccounted for". It is cleared only when compensation CONFIRMED the
+	// revocation, so it describes the state the broker is actually left in rather than the
+	// step that ran.
 	CredentialWritten bool
 
-	// Compensated reports that provisioning failed after the credential was written and the
-	// credential and its attempted bindings were revoked.
+	// Compensated reports that provisioning failed after the credential was written and that
+	// the credential was then successfully revoked.
 	//
-	// True means the broker was left clean; the caller must not persist an issuance record,
-	// and the secret it generated is dead. False alongside an error after CredentialWritten
-	// means revocation itself failed and a principal needs manual attention — the log line
-	// names it.
+	// True means the broker was confirmed clean: the caller must not persist an issuance
+	// record, and the secret it generated is dead. False alongside an error and
+	// CredentialWritten means the revocation ALSO failed, so a principal that can
+	// authenticate is unaccounted for and needs manual attention; the log line names it.
+	// Removal of the attempted ACL bindings is best-effort and is deliberately NOT part of
+	// this flag — inert bindings for a principal that no longer exists grant nothing.
 	Compensated bool
 
 	// ProvisionedAt is when provisioning completed.
@@ -2203,18 +2237,37 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 	}
 	result.CredentialWritten = true
 
+	// AUTH-02: RECONCILED, not merely created. The broker's Blnk-owned bindings for this
+	// principal are made exactly what the row's authorization implies, so a topic removed from
+	// authorized_topics since the last issuance has its Read and Describe bindings DELETED
+	// here. Creating without deleting made a subscriber's broker-side grant the union of every
+	// authorization it had ever held: narrowing the registry left the old access live, and
+	// revocation could not find it either, because revocation derives what to delete from the
+	// row that no longer names the topic.
 	bindings := req.aclEntries()
-	if err := a.createACLBindings(ctx, principal, bindings); err != nil {
+
+	reconciliation, err := a.reconcileSubscriberACLs(ctx, principal, bindings)
+	if err != nil {
 		// AUTH-01: the credential exists and its boundary does not. That combination is the
 		// one state provisioning must never leave behind, because the principal can
 		// authenticate — so it is compensated by revoking the credential before returning.
-		a.compensateFailedProvisioning(ctx, principal, bindings)
-		result.CredentialWritten = false
-		result.Compensated = true
+		//
+		// THE RESULT REPORTS WHAT COMPENSATION ACHIEVED, not that it ran. Only a revocation
+		// the broker confirmed clears CredentialWritten and sets Compensated; a revocation
+		// that itself failed leaves CredentialWritten true and Compensated false, which is
+		// the state the broker is actually left in and the only signal that tells the caller
+		// a live principal needs manual revocation.
+		if cleanupErr := a.compensateFailedProvisioning(ctx, principal, bindings); cleanupErr == nil {
+			result.CredentialWritten = false
+			result.Compensated = true
+		}
 
 		return result, err
 	}
+
 	result.ACLBindings = len(bindings)
+	result.ACLBindingsRemoved = reconciliation.Removed
+	result.ForeignACLBindings = len(reconciliation.Foreign)
 
 	if len(topics) == 0 {
 		logrus.WithFields(logrus.Fields{
@@ -2247,6 +2300,8 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 		"topics":                len(topics),
 		"consumer_group_prefix": sanitizeLogValue(groupPrefix, maxLoggedFilterLength),
 		"acl_bindings":          result.ACLBindings,
+		"acl_bindings_removed":  result.ACLBindingsRemoved,
+		"foreign_acl_bindings":  result.ForeignACLBindings,
 		"credential_replaced":   result.CredentialReplaced,
 		"authorizer_active":     result.AuthorizerActive,
 	}).Info("kafka admin: subscriber principal provisioned")
@@ -2350,7 +2405,7 @@ func (r SubscriberProvisioningRequest) validate() error {
 //   - FOREIGN topics, because a grant over a topic Blnk does not own is a grant into
 //     somebody else's data on a broker Blnk shares.
 //   - DEAD-LETTER and INTERNAL topics, because the DLTs carry failed events with Blnk's own
-//     failure metadata and the system and quarantine categories carry Blnk's internal
+//     failure metadata and the system category carries Blnk's internal
 //     diagnostics and uncatalogued payloads. None of those has a subscriber audience.
 //
 // IsSubscriberGrantableTopic is the single test for all three, so the API layer, this path
@@ -2788,6 +2843,514 @@ func (a *KafkaAdminClient) createACLBindings(ctx context.Context, principal stri
 	return nil
 }
 
+// ---------------------------------------------------------------------------------------
+// ACL RECONCILIATION — AUTH-02
+//
+// Provisioning used to CREATE bindings and never remove any, which made a subscriber's
+// broker-side grant the UNION of every authorization it had ever held. Narrowing
+// authorized_topics updated the registry and left the removed topic's Read and Describe
+// bindings live at the broker: the registry said the access was gone, the subscriber kept
+// consuming, and no request failed to say otherwise. Revocation could not clean it up either,
+// because it derives the bindings to delete from the CURRENT row — the row that no longer
+// names the topic.
+//
+// So the grant is RECONCILED rather than accumulated: the broker is read, the difference
+// against the desired set is computed, and the surplus is deleted as well as the missing
+// created.
+//
+// # What Blnk owns on a principal it minted, and what it will not touch
+//
+// Reconciliation converges exactly the shapes Blnk provisions — Allow Read/Describe on a
+// LITERAL topic, and Allow Read on a PREFIXED group — and only on principals in its own
+// 'blnk-sub-' namespace. Every other binding on such a principal is REPORTED AND LEFT ALONE:
+// a DENY, a Write, a cluster or transactional-id resource, a prefixed topic pattern. Those are
+// an operator's deliberate work, ACL deletion has no undo, and a reconciliation wide enough to
+// tidy them is wide enough to delete something load-bearing that nobody remembers creating.
+//
+// The asymmetry is deliberate and is the safe direction: Blnk removes only what it would
+// itself have created, and names anything else so an operator can decide.
+// ---------------------------------------------------------------------------------------
+
+// SubscriberACLReconciliation reports what one reconciliation of a principal's bindings did.
+//
+// It is returned rather than only logged because the counts are what a caller reports and a
+// test asserts: "narrowing this subscriber removed two bindings" is the observable fact that
+// the registry and the broker now agree, and Foreign is how an operator learns that something
+// outside Blnk's ownership is also granting this principal access.
+type SubscriberACLReconciliation struct {
+	// Principal is the bare SASL username the bindings belong to.
+	Principal string
+
+	// Desired is how many bindings the subscriber's recorded authorization implies.
+	Desired int
+
+	// Managed is how many Blnk-shaped bindings the broker held before reconciliation.
+	Managed int
+
+	// Created is how many bindings were added.
+	Created int
+
+	// Removed is how many surplus Blnk-shaped bindings were deleted.
+	Removed int
+
+	// Foreign describes every binding on this principal that Blnk does not own and did not
+	// touch, one entry per binding, in the broker's own vocabulary. Empty in the ordinary
+	// case; non-empty means somebody granted this principal access by hand.
+	Foreign []string
+}
+
+// describeSubscriberACLs reads every ACL binding the broker currently holds for a principal.
+//
+// The filter is deliberately wide on every dimension except the principal: an empty resource
+// name, an empty host and the Any pattern, operation and permission filters are all encoded as
+// null on the wire and match anything, so what comes back is the principal's COMPLETE grant.
+// That completeness is the point — a reconciliation that could only see the bindings it
+// expected could never discover the ones it had to remove.
+//
+// The principal is re-checked in Go on every returned binding. The broker's own filter is
+// exact, so this is belt and braces rather than necessity; it costs one comparison and it is
+// what stops a broker or client quirk turning a reconciliation into somebody else's
+// revocation.
+//
+// Parameters:
+//   - ctx context.Context: cancels the request.
+//   - principal string: the bare SASL username. Required.
+//
+// Returns:
+//   - []kafka.ACLEntry: every binding held for the principal, in the shape createACLBindings
+//     and deleteACLBindings both speak.
+//   - error: ErrKafkaAdminNotConfigured, a validation error, or a wrapped broker error.
+func (a *KafkaAdminClient) describeSubscriberACLs(ctx context.Context, principal string) ([]kafka.ACLEntry, error) {
+	if err := a.ready(ctx); err != nil {
+		return nil, err
+	}
+
+	principal = strings.TrimSpace(principal)
+	if principal == "" {
+		return nil, errors.New("kafka admin: a principal is required to read its ACL bindings")
+	}
+
+	bound := kafkaPrincipalPrefix + principal
+
+	response, err := a.client.DescribeACLs(ctx, &kafka.DescribeACLsRequest{
+		Filter: kafka.ACLFilter{
+			ResourceTypeFilter:        kafka.ResourceTypeAny,
+			ResourcePatternTypeFilter: kafka.PatternTypeAny,
+			PrincipalFilter:           bound,
+			Operation:                 kafka.ACLOperationTypeAny,
+			PermissionType:            kafka.ACLPermissionTypeAny,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kafka admin: reading the ACL bindings of principal %q: %w", principal, err)
+	}
+
+	if response.Error != nil {
+		// SECURITY_DISABLED reaches here on a broker with no authorizer. It is returned as an
+		// error rather than as "no bindings": reporting an empty grant would let a caller
+		// conclude there was nothing to reconcile on precisely the broker where nothing is
+		// enforced at all.
+		return nil, fmt.Errorf("kafka admin: reading the ACL bindings of principal %q: %w",
+			principal, response.Error)
+	}
+
+	bindings := make([]kafka.ACLEntry, 0, 8)
+	for _, resource := range response.Resources {
+		for _, description := range resource.ACLs {
+			if description.Principal != bound {
+				continue
+			}
+
+			bindings = append(bindings, kafka.ACLEntry{
+				ResourceType:        resource.ResourceType,
+				ResourceName:        resource.ResourceName,
+				ResourcePatternType: resource.PatternType,
+				Principal:           description.Principal,
+				Host:                description.Host,
+				Operation:           description.Operation,
+				PermissionType:      description.PermissionType,
+			})
+		}
+	}
+
+	return bindings, nil
+}
+
+// blnkManagedACLBinding reports whether a binding is one Blnk itself provisions.
+//
+// It is the ownership test the whole reconciliation rests on, so it is written as an
+// allowlist of the two shapes aclEntries produces and nothing else. Anything wider would give
+// reconciliation permission to delete an operator's work; anything narrower — matching on the
+// topic name, say — would fail to recognise a binding from a previous authorization as Blnk's
+// own, which is precisely the binding that has to be removed.
+//
+// Parameters:
+//   - binding kafka.ACLEntry: the observed binding.
+//
+// Returns:
+//   - bool: true when Blnk would have created a binding of this shape.
+func blnkManagedACLBinding(binding kafka.ACLEntry) bool {
+	if binding.PermissionType != kafka.ACLPermissionTypeAllow {
+		return false
+	}
+
+	switch binding.ResourceType {
+	case kafka.ResourceTypeTopic:
+		return binding.ResourcePatternType == kafka.PatternTypeLiteral &&
+			(binding.Operation == kafka.ACLOperationTypeRead ||
+				binding.Operation == kafka.ACLOperationTypeDescribe)
+	case kafka.ResourceTypeGroup:
+		return binding.ResourcePatternType == kafka.PatternTypePrefixed &&
+			binding.Operation == kafka.ACLOperationTypeRead
+	default:
+		return false
+	}
+}
+
+// aclBindingKey renders a binding as the tuple that identifies it, so two bindings can be
+// compared as set members.
+//
+// Every dimension the broker evaluates is included, HOST INCLUDED. A binding that differs only
+// by host is a different grant — it admits a different set of clients — so treating the two as
+// the same member would leave a stale host-scoped grant in place while reporting the set
+// converged.
+func aclBindingKey(binding kafka.ACLEntry) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s",
+		binding.ResourceType, binding.ResourceName, binding.ResourcePatternType,
+		binding.Principal, binding.Host, binding.Operation, binding.PermissionType)
+}
+
+// reconcileSubscriberACLs makes the broker's Blnk-owned bindings for a principal EXACTLY the
+// desired set.
+//
+// # The order is delete-then-create, and it is the safe one
+//
+// Every partial failure must leave the principal with FEWER rights than the registry records,
+// never more — the same rule RevokeSubscriber follows. Deleting first satisfies that: a
+// reconciliation that dies between the two steps has removed access it was going to re-grant,
+// which the next reconciliation restores, whereas creating first and failing to delete leaves
+// live access the registry says is gone.
+//
+// # An empty desired set is a legitimate instruction
+//
+// A subscriber authorised for nothing is the fail-closed default of a fresh registration and
+// the state a caller reaches by clearing the topic list. Reconciling to it removes every
+// Blnk-owned binding, which is exactly what "authorised for nothing" has to mean at the
+// broker. It is NOT treated as "no work to do", because that reading is what let a narrowing
+// to empty silently leave a full grant in place.
+//
+// Parameters:
+//   - ctx context.Context: cancels both round trips.
+//   - principal string: the bare SASL username.
+//   - desired []kafka.ACLEntry: the bindings the subscriber's recorded authorization implies.
+//     May be empty.
+//
+// Returns:
+//   - SubscriberACLReconciliation: what was found, removed and created. Populated as far as
+//     the operation got, even on error.
+//   - error: ErrKafkaAdminNotConfigured, a validation error, or a wrapped broker error.
+func (a *KafkaAdminClient) reconcileSubscriberACLs(
+	ctx context.Context,
+	principal string,
+	desired []kafka.ACLEntry,
+) (SubscriberACLReconciliation, error) {
+	report := SubscriberACLReconciliation{
+		Principal: strings.TrimSpace(principal),
+		Desired:   len(desired),
+	}
+
+	observed, err := a.describeSubscriberACLs(ctx, principal)
+	if err != nil {
+		return report, err
+	}
+
+	wanted := make(map[string]struct{}, len(desired))
+	for _, binding := range desired {
+		wanted[aclBindingKey(binding)] = struct{}{}
+	}
+
+	surplus := make([]kafka.ACLEntry, 0, len(observed))
+	present := make(map[string]struct{}, len(observed))
+
+	for _, binding := range observed {
+		if !blnkManagedACLBinding(binding) {
+			report.Foreign = append(report.Foreign, fmt.Sprintf("%s %s on %s %q (%s, host %s)",
+				binding.PermissionType, binding.Operation, binding.ResourceType,
+				sanitizeLogValue(binding.ResourceName, maxLoggedFilterLength),
+				binding.ResourcePatternType, sanitizeLogValue(binding.Host, maxLoggedFilterLength)))
+
+			continue
+		}
+
+		report.Managed++
+
+		key := aclBindingKey(binding)
+		present[key] = struct{}{}
+
+		if _, keep := wanted[key]; !keep {
+			surplus = append(surplus, binding)
+		}
+	}
+
+	if len(report.Foreign) > 0 {
+		logrus.WithFields(logrus.Fields{
+			"principal": sanitizeLogValue(report.Principal, maxLoggedFilterLength),
+			"bindings":  report.Foreign,
+		}).Warn(
+			"kafka admin: this principal carries ACL bindings Blnk does not provision and will not " +
+				"remove; they grant access the subscriber registry does not describe, so review them " +
+				"by hand",
+		)
+	}
+
+	if len(surplus) > 0 {
+		if err := a.deleteACLBindings(ctx, report.Principal, surplus); err != nil {
+			return report, fmt.Errorf(
+				"kafka admin: removing %d obsolete ACL binding(s) from principal %q: %w",
+				len(surplus), report.Principal, err,
+			)
+		}
+
+		report.Removed = len(surplus)
+	}
+
+	missing := make([]kafka.ACLEntry, 0, len(desired))
+	for _, binding := range desired {
+		if _, already := present[aclBindingKey(binding)]; already {
+			continue
+		}
+
+		missing = append(missing, binding)
+	}
+
+	if len(missing) > 0 {
+		if err := a.createACLBindings(ctx, report.Principal, missing); err != nil {
+			return report, err
+		}
+
+		report.Created = len(missing)
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"principal": sanitizeLogValue(report.Principal, maxLoggedFilterLength),
+		"desired":   report.Desired,
+		"managed":   report.Managed,
+		"created":   report.Created,
+		"removed":   report.Removed,
+		"foreign":   len(report.Foreign),
+	}).Info("kafka admin: subscriber ACL bindings reconciled")
+
+	return report, nil
+}
+
+// PruneSubscriberAccess removes every Blnk-owned binding the broker holds for a subscriber
+// that its RECORDED authorization does not imply, and creates nothing.
+//
+// # Why narrowing is a separate call from granting
+//
+// An authorization change has to be applied in three steps — prune at the broker, persist the
+// row, then grant at the broker — because there is no transaction spanning Blnk and Kafka and
+// only that order leaves every partial failure fail-closed:
+//
+//   - Pruning first means a NARROWING is already in force at the broker before the row claims
+//     it is. If the persist then fails, the subscriber has lost access the registry still
+//     records — recoverable by re-running the update, and safe in the meantime.
+//   - Granting last means a WIDENING reaches the broker only after the row records it. If the
+//     grant then fails, the subscriber has less access than the registry records — again
+//     recoverable, again safe.
+//
+// Doing both around a single persist, or persisting first, makes one of those two cases
+// fail-OPEN: live broker access that the registry says was revoked, which is the defect this
+// whole surface exists to close.
+//
+// Parameters:
+//   - ctx context.Context: cancels the round trips.
+//   - subscriber *model.EventSubscriber: the row carrying the authorization to converge on.
+//     Its principal and consumer group are DERIVED, never taken from the request.
+//
+// Returns:
+//   - SubscriberACLReconciliation: what was found and removed. Created is always zero.
+//   - error: ErrKafkaAdminNotConfigured, a validation error, or a wrapped broker error.
+func (a *KafkaAdminClient) PruneSubscriberAccess(
+	ctx context.Context,
+	subscriber *model.EventSubscriber,
+) (SubscriberACLReconciliation, error) {
+	desired, principal, err := subscriberDesiredBindings(subscriber)
+	if err != nil {
+		return SubscriberACLReconciliation{}, err
+	}
+
+	report := SubscriberACLReconciliation{Principal: principal, Desired: len(desired)}
+
+	observed, err := a.describeSubscriberACLs(ctx, principal)
+	if err != nil {
+		return report, err
+	}
+
+	wanted := make(map[string]struct{}, len(desired))
+	for _, binding := range desired {
+		wanted[aclBindingKey(binding)] = struct{}{}
+	}
+
+	surplus := make([]kafka.ACLEntry, 0, len(observed))
+	for _, binding := range observed {
+		if !blnkManagedACLBinding(binding) {
+			continue
+		}
+
+		report.Managed++
+
+		if _, keep := wanted[aclBindingKey(binding)]; !keep {
+			surplus = append(surplus, binding)
+		}
+	}
+
+	if len(surplus) == 0 {
+		return report, nil
+	}
+
+	if err := a.deleteACLBindings(ctx, principal, surplus); err != nil {
+		return report, fmt.Errorf(
+			"kafka admin: removing %d obsolete ACL binding(s) from principal %q: %w",
+			len(surplus), principal, err,
+		)
+	}
+
+	report.Removed = len(surplus)
+
+	logrus.WithFields(logrus.Fields{
+		"principal": sanitizeLogValue(principal, maxLoggedFilterLength),
+		"removed":   report.Removed,
+		"desired":   report.Desired,
+	}).Info("kafka admin: obsolete subscriber ACL bindings removed")
+
+	return report, nil
+}
+
+// GrantSubscriberAccess creates the bindings a subscriber's recorded authorization implies,
+// and removes nothing.
+//
+// It is the third step of the three PruneSubscriberAccess documents, and it is idempotent:
+// Kafka's CreateAcls accepts a binding that already exists, and the reconciliation skips the
+// ones the broker already holds, so re-running it is a no-op rather than a duplicate.
+//
+// Parameters:
+//   - ctx context.Context: cancels the round trips.
+//   - subscriber *model.EventSubscriber: the row carrying the authorization to grant.
+//
+// Returns:
+//   - SubscriberACLReconciliation: what was found and created. Removed is always zero.
+//   - error: ErrKafkaAdminNotConfigured, a validation error, or a wrapped broker error.
+func (a *KafkaAdminClient) GrantSubscriberAccess(
+	ctx context.Context,
+	subscriber *model.EventSubscriber,
+) (SubscriberACLReconciliation, error) {
+	desired, principal, err := subscriberDesiredBindings(subscriber)
+	if err != nil {
+		return SubscriberACLReconciliation{}, err
+	}
+
+	report := SubscriberACLReconciliation{Principal: principal, Desired: len(desired)}
+
+	if len(desired) == 0 {
+		// Nothing to grant. Reported rather than silently skipped, because "authorised for
+		// nothing" is a real state and an operator reading the log should see it stated.
+		logrus.WithField("principal", sanitizeLogValue(principal, maxLoggedFilterLength)).Info(
+			"kafka admin: the subscriber's recorded authorization grants nothing, so no ACL binding " +
+				"was created",
+		)
+
+		return report, nil
+	}
+
+	observed, err := a.describeSubscriberACLs(ctx, principal)
+	if err != nil {
+		return report, err
+	}
+
+	present := make(map[string]struct{}, len(observed))
+	for _, binding := range observed {
+		present[aclBindingKey(binding)] = struct{}{}
+		if blnkManagedACLBinding(binding) {
+			report.Managed++
+		}
+	}
+
+	missing := make([]kafka.ACLEntry, 0, len(desired))
+	for _, binding := range desired {
+		if _, already := present[aclBindingKey(binding)]; already {
+			continue
+		}
+
+		missing = append(missing, binding)
+	}
+
+	if len(missing) == 0 {
+		return report, nil
+	}
+
+	if err := a.createACLBindings(ctx, principal, missing); err != nil {
+		return report, err
+	}
+
+	report.Created = len(missing)
+
+	logrus.WithFields(logrus.Fields{
+		"principal": sanitizeLogValue(principal, maxLoggedFilterLength),
+		"created":   report.Created,
+		"desired":   report.Desired,
+	}).Info("kafka admin: subscriber ACL bindings granted")
+
+	return report, nil
+}
+
+// subscriberDesiredBindings derives the bindings a registry row implies, and the principal
+// they belong to.
+//
+// It goes through NewSubscriberProvisioningRequest so that the desired set is produced by the
+// SAME code that provisioning binds — a second derivation here would be a second definition of
+// the access boundary, and reconciliation would then converge on a set provisioning never
+// creates, deleting and recreating the same bindings on every call.
+//
+// The request is validated for everything except the password, which plays no part in a
+// binding: a row whose principal or consumer group is not derived from its identifier is
+// refused here exactly as it would be at issuance.
+//
+// Parameters:
+//   - subscriber *model.EventSubscriber: the row. Nil is refused.
+//
+// Returns:
+//   - []kafka.ACLEntry: the desired bindings, possibly empty.
+//   - string: the bare principal.
+//   - error: a validation error when the row cannot yield a boundary.
+func subscriberDesiredBindings(subscriber *model.EventSubscriber) ([]kafka.ACLEntry, string, error) {
+	if subscriber == nil {
+		return nil, "", errors.New(
+			"kafka admin: a subscriber is required to reconcile its ACL bindings",
+		)
+	}
+
+	request := NewSubscriberProvisioningRequest(subscriber, "")
+
+	principal := request.boundPrincipal()
+	if principal == "" {
+		return nil, "", errors.New(
+			"kafka admin: the subscriber has neither a derivable nor a recorded Kafka principal, " +
+				"so its ACL bindings cannot be reconciled",
+		)
+	}
+
+	if err := request.validateTopics(); err != nil {
+		return nil, principal, err
+	}
+
+	if err := request.validateHost(); err != nil {
+		return nil, principal, err
+	}
+
+	return request.aclEntries(), principal, nil
+}
+
 // SubscriberCredentialExists reports whether a principal already holds a SCRAM-SHA-512
 // credential.
 //
@@ -3210,6 +3773,33 @@ func (a *KafkaAdminClient) requireEnforcedAuthorizer(ctx context.Context, princi
 	return nil
 }
 
+// kafkaCleanupBudget bounds a compensating broker operation.
+//
+// It is the admin client's own per-request timeout, shared by the two round trips a
+// compensation makes rather than granted to each: a broker that has stopped answering must cost
+// the caller one budget, not one per call. Ten seconds is enough for two round trips against a
+// broker that is refusing rather than hanging, which is the ordinary shape of the failure being
+// compensated.
+const kafkaCleanupBudget = kafkaAdminRequestTimeout
+
+// kafkaCleanupContext derives the context a compensating operation runs on.
+//
+// It carries the caller's VALUES — trace context above all, so the cleanup appears under the
+// span that caused it — and deliberately NOT the caller's cancellation. See
+// compensateFailedProvisioning for the failure that made the distinction necessary: the
+// commonest reason provisioning fails is its own deadline expiring, and a cleanup that
+// inherited that deadline could never run on the occasion it exists for.
+//
+// Parameters:
+//   - ctx context.Context: the caller's context, used for its values.
+//
+// Returns:
+//   - context.Context: a fresh context bounded by kafkaCleanupBudget.
+//   - context.CancelFunc: must be called, conventionally by defer.
+func kafkaCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), kafkaCleanupBudget)
+}
+
 // compensateFailedProvisioning undoes a half-completed provisioning.
 //
 // # AUTH-01: a credential without its boundary must not survive the failure that created it
@@ -3225,23 +3815,47 @@ func (a *KafkaAdminClient) requireEnforcedAuthorizer(ctx context.Context, princi
 // bindings, because CreateACLs is not atomic across entries and some may have landed before
 // the error; and the credential itself.
 //
-// Failures HERE are logged and not returned, deliberately. The caller is already returning
-// the original error, which is the one that explains what happened, and replacing it with a
-// cleanup error would hide the cause. What the log line guarantees is that an operator can
-// find the principal that needs manual revocation, which is why it names it at error level.
+// EVERY FAILURE IS LOGGED, AND THE CREDENTIAL REVOCATION'S OUTCOME IS RETURNED. The caller
+// still returns the ORIGINAL provisioning error — replacing it with a cleanup error would hide
+// the cause — but it needs to know whether the broker was actually left clean, because
+// "compensated" and "a live principal nobody is tracking" are the two states a caller must
+// answer differently. A binding-removal failure is logged and not returned: inert bindings for
+// a principal that no longer exists grant nothing, so they are untidiness rather than access.
+//
+// # CLEAN-01: the cleanup runs on a FRESH deadline, not the caller's
+//
+// It used to inherit the provisioning context, and that context is the 5-second credential
+// issuance budget — whose EXPIRY is one of the commonest reasons provisioning fails at all. So
+// on the failure this function exists for, both round trips below were attempted against an
+// already-cancelled context and returned immediately: nothing was revoked, `Compensated` was
+// reported anyway, and the credential stayed live at the broker with nothing recording it. The
+// compensation was busiest precisely when it could not work.
+//
+// A fresh context, detached from the caller's cancellation and bounded by its own budget,
+// makes the cleanup possible in exactly that case. It is BOUNDED rather than merely detached
+// for the reason every other detached write in this codebase is: "finish what you owe" must
+// not become "block the request indefinitely on a broker that has gone away". The two round
+// trips share one budget, so a failing broker costs the caller that budget once, not twice.
 //
 // Parameters:
-//   - ctx context.Context: the provisioning context. Note that a cancelled context cannot
-//     revoke anything, which is itself logged.
+//   - ctx context.Context: the provisioning context. It is used for its VALUES only — its
+//     cancellation is deliberately not inherited, see above.
 //   - principal string: the principal to revoke.
 //   - bindings []kafka.ACLEntry: the bindings that were attempted, so exactly those are
 //     deleted rather than everything the principal holds.
+//
+// Returns:
+//   - error: nil only when the credential is confirmed revoked, so the broker holds no
+//     principal that can authenticate; the revocation error otherwise.
 func (a *KafkaAdminClient) compensateFailedProvisioning(
 	ctx context.Context,
 	principal string,
 	bindings []kafka.ACLEntry,
-) {
+) error {
 	logger := logrus.WithField("principal", principal)
+
+	ctx, cancel := kafkaCleanupContext(ctx)
+	defer cancel()
 
 	if err := a.deleteACLBindings(ctx, principal, bindings); err != nil {
 		logger.WithError(err).Error(
@@ -3258,13 +3872,15 @@ func (a *KafkaAdminClient) compensateFailedProvisioning(
 				"--entity-name <principal>",
 		)
 
-		return
+		return err
 	}
 
 	logger.Warn(
 		"kafka admin: provisioning failed after the credential was written; the credential and its " +
 			"attempted ACL bindings have been revoked, so no unbounded principal was left behind",
 	)
+
+	return nil
 }
 
 // RevokeSubscriberPrincipal deletes a subscriber's SCRAM credential.
@@ -3359,10 +3975,21 @@ func (a *KafkaAdminClient) RevokeSubscriberPrincipal(ctx context.Context, princi
 // the credential error is returned, because a principal that can still authenticate is the
 // more serious of the two.
 //
-// The bindings removed are exactly those the registry row describes, derived the same way
-// provisioning derived them. A subscriber whose topics were reduced before revocation may
-// therefore still hold bindings for the topics it lost — which is why a topic reduction must
-// itself go through a reconciliation rather than relying on eventual revocation.
+// # The deletion is BY PRINCIPAL, not by the current grant
+//
+// This used to delete exactly the bindings the registry row describes, derived the way
+// provisioning derived them, on the reasoning that a broad filter could catch a binding an
+// operator had made by hand. That reasoning holds where the principal SURVIVES — it is why
+// compensation and reconciliation still delete precisely — and fails here, because the
+// broker's bindings for a principal are the UNION OF EVERY GRANT IT HAS EVER HELD while the
+// registry row describes only the latest. Deleting by the current grant therefore walks past
+// every binding an earlier, wider grant left behind: a subscriber whose topics were narrowed
+// and then deleted kept a live Read on the topic that was removed, with no row left anywhere
+// to describe the access.
+//
+// The width is bounded by the principal itself. It is 'User:blnk-sub-<subscriber id>', a
+// namespace Blnk issues and owns, so a principal-wide filter cannot reach another system's
+// bindings — and every binding inside it belongs to a subscriber that is being deleted.
 //
 // Parameters:
 //   - ctx context.Context: cancels the requests.
@@ -3390,7 +4017,7 @@ func (a *KafkaAdminClient) RevokeSubscriber(ctx context.Context, subscriber *mod
 		)
 	}
 
-	bindingErr := a.deleteACLBindings(ctx, principal, request.aclEntries())
+	bindingErr := a.deleteAllPrincipalBindings(ctx, principal)
 	credentialErr := a.RevokeSubscriberPrincipal(ctx, principal)
 
 	switch {
@@ -3412,6 +4039,122 @@ func (a *KafkaAdminClient) RevokeSubscriber(ctx context.Context, subscriber *mod
 
 		return nil
 	}
+}
+
+// ReconcileSubscriberACLs brings the broker's ACL bindings for one subscriber into line
+// with the grant recorded on its registry row.
+//
+// # Why this exists at all
+//
+// A subscriber's authorization lives in two places: the authorized_topics column and the
+// broker's ACL bindings. Only the first is a Blnk write. Narrowing the column and stopping
+// there produced the worst possible outcome — the registry said the subscriber could read
+// three topics, the broker still let it read four, and nothing anywhere disagreed out loud.
+// Every reader of the registry, including the subscriber-isolation criterion, was reading a
+// claim rather than the enforced boundary.
+//
+// # The order is not interchangeable
+//
+// REVOCATIONS FIRST, and their failure is fatal to the operation. A caller narrowing a
+// grant must be able to treat success as "the removed topics are no longer readable", and
+// the only way to keep that promise is to fail loudly when the broker refused. Additions
+// come second because a failure there leaves the subscriber with FEWER rights than the
+// registry claims, which over-restricts rather than over-permits — the safe direction.
+//
+// Reapplying the surviving bindings on every reconcile is deliberate: Kafka accepts an
+// identical binding as a no-op, so a full desired-state create is idempotent, and it repairs
+// a binding an earlier partial failure never wrote. Computing a precise additions-only diff
+// would need a DescribeACLs round trip to be correct and would still be wrong the moment a
+// binding was removed out of band.
+//
+// # It never touches the SCRAM credential
+//
+// Reconciling a grant is not a credential operation. The subscriber keeps authenticating
+// with the secret it already holds — which is the entire point, since the alternative is
+// forcing a credential rotation on every topic-list edit — so no password is needed and
+// none is accepted.
+//
+// Parameters:
+//   - ctx context.Context: cancels the broker round trips.
+//   - subscriber *model.EventSubscriber: the registry row AFTER the change, whose
+//     authorized_topics and consumer group describe the desired state.
+//   - revokedTopics []string: the topics removed from the grant, whose bindings must go.
+//     Empty means nothing was removed and only the desired state is reapplied.
+//
+// Returns:
+//   - error: ErrKafkaAdminNotConfigured when no broker is configured; the broker's error
+//     when a revocation or a creation failed. A revocation failure is returned before any
+//     addition is attempted.
+func (a *KafkaAdminClient) ReconcileSubscriberACLs(
+	ctx context.Context,
+	subscriber *model.EventSubscriber,
+	revokedTopics []string,
+) error {
+	if err := a.ready(ctx); err != nil {
+		return err
+	}
+
+	if subscriber == nil {
+		return errors.New("kafka admin: a subscriber is required to reconcile its ACL bindings")
+	}
+
+	// No password: this operation binds and unbinds, it never mints.
+	desired := NewSubscriberProvisioningRequest(subscriber, "")
+	principal := desired.boundPrincipal()
+	if principal == "" {
+		return errors.New(
+			"kafka admin: the subscriber has neither a derivable nor a recorded Kafka principal, " +
+				"so there are no ACL bindings to reconcile",
+		)
+	}
+
+	// The revoked bindings are built from a request carrying ONLY the removed topics, so
+	// aclEntries — the single place a subscriber's binding shape is expressed — produces the
+	// exact filters to delete. Restating the resource type, pattern type, host and operation
+	// list here would be a second copy of that shape, and the two would drift.
+	if revoked := normalizeTopicList(revokedTopics); len(revoked) > 0 {
+		revocation := desired
+		revocation.Topics = revoked
+		// The consumer group namespace is NOT revoked: it is derived from the subscriber's
+		// identity and survives every change to the topic list. Clearing it here would strip
+		// the group binding on an ordinary topic edit and leave the subscriber unable to join
+		// its own group.
+		revocation.ConsumerGroupPrefix = ""
+
+		if err := a.deleteACLBindings(ctx, principal, revocation.aclEntries()); err != nil {
+			return fmt.Errorf(
+				"kafka admin: revoking %d topic binding(s) for principal %q: %w",
+				len(revoked), principal, err)
+		}
+	}
+
+	bindings := desired.aclEntries()
+	if len(bindings) == 0 {
+		logrus.WithFields(logrus.Fields{
+			"subscriber": strings.TrimSpace(subscriber.SubscriberID),
+			"principal":  principal,
+			"revoked":    len(revokedTopics),
+		}).Info(
+			"kafka admin: subscriber ACL bindings reconciled; the grant is now empty, so the " +
+				"principal can authenticate and read nothing",
+		)
+
+		return nil
+	}
+
+	if err := a.createACLBindings(ctx, principal, bindings); err != nil {
+		return err
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"subscriber":  strings.TrimSpace(subscriber.SubscriberID),
+		"principal":   principal,
+		"granted":     len(desired.normalizedTopics()),
+		"revoked":     len(normalizeTopicList(revokedTopics)),
+		"acl_entries": len(bindings),
+	}).Info("kafka admin: subscriber ACL bindings reconciled with the registry grant")
+
+	return nil
 }
 
 // deleteACLBindings removes exactly the bindings it is given.
@@ -3475,6 +4218,90 @@ func (a *KafkaAdminClient) deleteACLBindings(
 		"filters":   len(filters),
 		"removed":   removed,
 	}).Info("kafka admin: subscriber ACL bindings removed")
+
+	return nil
+}
+
+// deleteAllPrincipalBindings removes EVERY ACL binding the broker holds for one principal,
+// with a single match-any filter.
+//
+// It is the deprovisioning counterpart to deleteACLBindings, which deletes an enumerated set.
+// The distinction is which of the two questions is being answered:
+//
+//   - deleteACLBindings answers "remove exactly these". Used by compensation, which is
+//     unwinding bindings it just created, and by reconciliation, which is removing the surplus
+//     it computed against the row. In both the principal SURVIVES, so a binding this process
+//     did not create must be left alone.
+//   - this function answers "remove everything this principal has". Used by revocation, where
+//     the principal is being retired. The registry row names only the latest grant, but the
+//     broker holds the union of every grant the subscriber ever had, so an enumerated delete
+//     leaves the residue of every earlier one live with nothing left to describe it.
+//
+// # The filter's shape is load-bearing in three places
+//
+// THE PRINCIPAL CARRIES THE "User:" PREFIX, because that is how a binding stores it. A filter
+// naming the bare SASL username matches nothing, and Kafka answers that with a success
+// carrying an empty MatchingACLs — so the revocation would report clean while removing
+// nothing at all.
+//
+// THE RESOURCE NAME AND HOST ARE EMPTY STRINGS, not "*". Both fields are nullable in the
+// protocol and an empty string encodes as null, which Kafka reads as match-any. A literal "*"
+// is a resource NAMED "*", which matches only a binding on that name.
+//
+// THE COUNT IS REPORTED. Zero removed for a principal that was provisioned is worth seeing:
+// it means either the bindings were already gone or the filter did not match, and the two are
+// told apart by whether the credential was there.
+//
+// Parameters:
+//   - ctx context.Context: cancels the request.
+//   - principal string: the BARE SASL username, as boundPrincipal returns it. The "User:"
+//     prefix a binding stores is applied here, in one place, so no caller can forget it.
+//     Required.
+//
+// Returns:
+//   - error: nil when the broker holds no binding for the principal afterwards.
+func (a *KafkaAdminClient) deleteAllPrincipalBindings(ctx context.Context, principal string) error {
+	principal = strings.TrimSpace(principal)
+	if principal == "" {
+		return errors.New("kafka admin: a principal is required to delete its ACL bindings")
+	}
+
+	// Applied here rather than expected from the caller. Every other filter field on this
+	// request is a match-any sentinel, so the principal is the ONE exact term the delete turns
+	// on — and the failure mode of getting it wrong is silent: Kafka answers an unmatched
+	// filter with a success carrying an empty MatchingACLs, so the revocation reports clean
+	// while every binding stays live.
+	bound := kafkaPrincipalPrefix + principal
+
+	response, err := a.client.DeleteACLs(ctx, &kafka.DeleteACLsRequest{
+		Filters: []kafka.DeleteACLsFilter{{
+			ResourceTypeFilter:        kafka.ResourceTypeAny,
+			ResourceNameFilter:        "",
+			ResourcePatternTypeFilter: kafka.PatternTypeAny,
+			PrincipalFilter:           bound,
+			HostFilter:                "",
+			Operation:                 kafka.ACLOperationTypeAny,
+			PermissionType:            kafka.ACLPermissionTypeAny,
+		}},
+	})
+	if err != nil {
+		return fmt.Errorf("kafka admin: deleting every ACL binding for principal %q: %w", bound, err)
+	}
+
+	removed := 0
+	for i := range response.Results {
+		if response.Results[i].Error != nil {
+			return fmt.Errorf("kafka admin: deleting every ACL binding for principal %q: %w",
+				bound, response.Results[i].Error)
+		}
+
+		removed += len(response.Results[i].MatchingACLs)
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"principal": bound,
+		"removed":   removed,
+	}).Info("kafka admin: every ACL binding for the subscriber principal removed")
 
 	return nil
 }
@@ -3590,6 +4417,36 @@ func (r ConsumerLagReport) LagByTopic() map[string]int64 {
 	}
 
 	return lags
+}
+
+// LagSamples renders the report as inventory entries for the asynchronous consumer-lag
+// gauges, one per topic measured.
+//
+// It is the bridge between a measurement and its telemetry, and it deliberately does not
+// publish: the observable gauges export the CURRENT INVENTORY, so only the periodic collector
+// — which is the one caller that knows the whole registry — may publish, and it does so once
+// per tick from the samples every subscriber contributed. An ad-hoc lag query therefore
+// measures without perturbing what is exported, which under the previous synchronous gauge it
+// could not do.
+//
+// A topic listed in MissingTopics produces NO sample. It does not exist on the broker, so
+// there is no partition count to report as unmeasured and no lag to withhold; the condition is
+// reported by ConsumerLag's warning and by the MissingTopics field, and the absence of a series
+// is the honest telemetry for a topic that is absent.
+//
+// Returns:
+//   - []metrics.ConsumerLagSample: one entry per measured topic, nil when nothing was measured.
+func (r ConsumerLagReport) LagSamples() []metrics.ConsumerLagSample {
+	if len(r.Topics) == 0 {
+		return nil
+	}
+
+	samples := make([]metrics.ConsumerLagSample, 0, len(r.Topics))
+	for _, topicLag := range r.Topics {
+		samples = append(samples, consumerLagSample(r.SubscriberID, r.GroupID, topicLag))
+	}
+
+	return samples
 }
 
 // ConsumerLag measures how far a consumer group trails the end of the log, in-process.
@@ -3727,7 +4584,25 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 		report.TotalLag += topicLag.TotalLag
 		report.Topics = append(report.Topics, topicLag)
 
-		recordConsumerLag(ctx, report.SubscriberID, report.GroupID, topic, topicLag.TotalLag)
+		// A topic with unreadable partitions is reported LOUDLY, and this is the only place
+		// the condition is stated per topic. The measurement continues — a partial total is
+		// still the best diagnosis available and the caller receives it — but it must not be
+		// mistaken for a complete one, so LagSamples marks it incomplete and the gauge the
+		// alert reads does not receive it. See metrics.ConsumerLagUnmeasuredPartitions.
+		if topicLag.PartitionsUnavailable > 0 {
+			logrus.WithFields(logrus.Fields{
+				"subscriber":             sanitizeLogValue(report.SubscriberID, maxLoggedFilterLength),
+				"group":                  sanitizeLogValue(report.GroupID, maxLoggedFilterLength),
+				"topic":                  topic,
+				"partitions_unavailable": topicLag.PartitionsUnavailable,
+				"partitions":             len(topicLag.Partitions),
+				"partial_lag":            topicLag.TotalLag,
+			}).Warn(
+				"kafka admin: some partitions could not be read, so this topic's lag is a LOWER BOUND and is " +
+					"withheld from the consumer-lag gauge; the unmeasured-partition count is published instead " +
+					"so the degraded measurement alerts rather than reading as healthy",
+			)
+		}
 	}
 
 	logrus.WithFields(logrus.Fields{
@@ -3867,13 +4742,14 @@ func committedOffsetFor(committed map[string]map[int]int64, topic string, partit
 	return -1
 }
 
-// recordConsumerLag publishes one topic's lag on the shared gauge.
+// consumerLagSample renders one topic's measurement as an inventory entry for the
+// asynchronous consumer-lag gauges.
 //
-// The instrument is the one declared in internal/metrics and no other: a second
-// instrument for the same measurement would produce two series with different names, and
-// the alert rule reads exactly one of them. The attribute keys — subscriber, group, topic
-// — are the labels the alert rule's description interpolates, so they are fixed by that
-// contract rather than free.
+// It builds a value rather than recording one, which is the shape the instrument kind
+// requires: SubscriberConsumerLag is an OBSERVABLE gauge, so a measurement is not written
+// when it is taken but read from a published inventory at collection time. See
+// metrics.SubscriberConsumerLag for why the synchronous gauge it replaced could not bound
+// its own series count, and metrics.PublishConsumerLagInventory for who publishes.
 //
 // # Every label value is bounded here, at the last possible moment
 //
@@ -3883,40 +4759,38 @@ func committedOffsetFor(committed map[string]map[int]int64, topic string, partit
 // it is the only one that covers a value which never came from the registry at all. An
 // operator's ad-hoc lag query, a group id read back from the broker, or a future caller
 // assembling a ConsumerLagRequest by hand all arrive here without having passed either of
-// the other two gates.
+// the other two gates. Without it, a consumer group named for its owner would export a
+// customer's name into the monitoring system's retention, onto dashboards and into alert
+// notifications.
 //
-// Two things would go wrong without it, and neither would fail loudly. A group named for
-// its owner would export a customer's name into the monitoring system's retention, onto
-// dashboards and into alert notifications. And because this is a GAUGE that a periodic
-// collector re-records on every cycle, each distinct label tuple is a series held for as
-// long as it is fed, so an unbounded value would make the series count a function of what
-// callers send rather than of how many subscribers are registered.
+// Resolving here rather than at the call site is also what keeps the two gauges' label
+// tuples identical to each other, since both are observed from this one sample.
 //
-// The nil guard costs nothing and keeps a measurement path from panicking a ledger
-// process in a build where the instruments were never created.
+// # LagComplete is decided from the partition count, not from the total
+//
+// A topic with any unreadable partition has a TotalLag that is a LOWER BOUND, because an
+// unavailable partition contributes zero. Marking the sample incomplete is what stops that
+// number reaching the gauge the >10000 rule reads — see
+// metrics.ConsumerLagUnmeasuredPartitions for why publishing it would resolve a firing
+// alert with a figure known to be too small.
 //
 // Parameters:
-//   - ctx context.Context: carries the metric's exemplar context.
-//   - subscriber, group, topic string: the RAW values; each is resolved to a bounded
-//     label here rather than by the caller, so no call site can bypass the bound.
-//   - lag int64: the value, already guaranteed non-negative.
-func recordConsumerLag(ctx context.Context, subscriber, group, topic string, lag int64) {
-	if metrics.SubscriberConsumerLag == nil {
-		return
+//   - subscriber, group string: the RAW values; each is resolved to a bounded label here
+//     rather than by the caller, so no call site can bypass the bound.
+//   - topicLag TopicLag: one topic's measurement, carrying both the total and the count of
+//     partitions that could not be read.
+//
+// Returns:
+//   - metrics.ConsumerLagSample: the entry to publish.
+func consumerLagSample(subscriber, group string, topicLag TopicLag) metrics.ConsumerLagSample {
+	return metrics.ConsumerLagSample{
+		Subscriber:           subscriberLagLabel(subscriber),
+		Group:                consumerGroupLagLabel(group),
+		Topic:                topicLagLabel(topicLag.Topic),
+		Lag:                  topicLag.TotalLag,
+		LagComplete:          topicLag.PartitionsUnavailable == 0,
+		UnmeasuredPartitions: topicLag.PartitionsUnavailable,
 	}
-
-	// Every attribute goes through its RESOLVER, and for two reasons that both matter.
-	// It bounds the cardinality: the three values arrive from registry rows, so an
-	// unconstrained one would mint a new time series on every collection cycle. And it is
-	// what lets a stale series be CLEARED — the collector zeroes a series by writing to
-	// the identical label tuple, so if it resolved labels differently from this function
-	// it would zero a tuple nobody published and leave the real one standing at its last
-	// reading for ever. See event_metrics_support.go.
-	metrics.SubscriberConsumerLag.Record(ctx, lag, otelmetric.WithAttributes(
-		attribute.String("subscriber", subscriberLagLabel(subscriber)),
-		attribute.String("group", consumerGroupLagLabel(group)),
-		attribute.String("topic", topicLagLabel(topic)),
-	))
 }
 
 // partitionOffsetBounds is one partition's offset window: the earliest offset still
@@ -4051,7 +4925,19 @@ func (a *KafkaAdminClient) committedOffsets(
 
 	if response.Error != nil {
 		if errors.Is(response.Error, kafka.GroupIdNotFound) {
-			logrus.WithField("group", sanitizeLogValue(group, maxLoggedFilterLength)).Info(
+			// DEBUG, not Info. This is the NORMAL state of every subscriber that has been
+			// provisioned but has not connected yet, and the periodic collector re-measures
+			// every registered subscriber on every tick — so at Info one un-started
+			// subscriber produced a line per tick, indefinitely, for a condition that is not
+			// a fault. That volume is not free: it is what trains an operator to filter the
+			// logger out, and it takes the genuine warnings from this file with it.
+			//
+			// Nothing is lost by demoting it, because the condition is already MONITORED
+			// rather than merely logged. A group with no commits scores every partition at
+			// full lag, so a subscriber that never starts consuming shows up as a rising
+			// consumer-lag series and trips the >10000 rule — which is a signal an operator
+			// receives rather than one they would have had to be reading logs to notice.
+			logrus.WithField("group", sanitizeLogValue(group, maxLoggedFilterLength)).Debug(
 				"kafka admin: consumer group does not exist yet, so it has committed nothing; " +
 					"its lag is the whole retained log",
 			)
@@ -4362,10 +5248,46 @@ func retainedRecords(firstOffset, endOffset int64) int64 {
 // the comparison can and cannot establish, so no caller has to re-derive it and none can
 // accidentally report "reconciled" from a number that was never going to match.
 type OutboxReconciliation struct {
-	// TerminalEvents is how many outbox rows claim to have been published: dispatched plus
-	// dead-lettered. Each is counted exactly ONCE, which is the property the unique index on
-	// event_id gives.
+	// TerminalEvents is how many outbox rows claim to have been published to the broker.
+	//
+	// It counts every row whose Kafka leg completed — dispatched AND webhook_pending, since a
+	// webhook_pending row IS on its topic and what remains outstanding is the deprecated HTTP
+	// leg — plus every dead-lettered row, whose record is on the dead-letter topic. Each is
+	// counted exactly ONCE, which is the property the unique index on event_id gives.
 	TerminalEvents int64
+
+	// ConfirmedEvents is how many of those rows NAME the record they produced, by carrying the
+	// topic, partition and offset the broker assigned.
+	//
+	// It is the count that makes this reconciliation able to detect loss at all. See
+	// UnconfirmedEvents.
+	ConfirmedEvents int64
+
+	// UnconfirmedEvents is how many rows claim a publication they cannot name a record for.
+	//
+	// # Why this field, and not just the arithmetic
+	//
+	// The comparison below is directional: records are a lower bound on events, so a surplus
+	// is expected. Its weakness — the finding this field closes — is that the surplus is
+	// INDISTINGUISHABLE FROM COMPENSATED LOSS. Ten redeliveries and ten lost events produce
+	// exactly the totals of a healthy pipeline, and a purely arithmetic verdict reads "no
+	// loss" while ten events are missing.
+	//
+	// An unconfirmed row is precisely a claim of publication that nothing corroborates. While
+	// any exist, the verdict is INCONCLUSIVE rather than green: the counting cannot rule out
+	// that they are the losses a surplus is hiding. Zero unconfirmed rows is what makes the
+	// count trustworthy, because then every claim is individually accounted for.
+	UnconfirmedEvents int64
+
+	// DuplicatedRecords is how many confirmed rows share a coordinate with another row.
+	//
+	// It should be zero always: one record is produced by one acknowledged write of one row,
+	// and the partial unique index on the coordinate forbids two rows naming the same one. A
+	// non-zero value therefore means that index is absent or has been dropped — so the field
+	// exists to report a broken schema rather than to tolerate duplicates, and it makes the
+	// verdict inconclusive for the same reason an unconfirmed row does: two rows sharing one
+	// record's corroboration is exactly the double-counting the mapping removes.
+	DuplicatedRecords int64
 
 	// MessagesWritten is how many records the broker has accepted across the measured
 	// topics, from summed end offsets. It counts every redelivery, replay and dead-letter
@@ -4424,19 +5346,32 @@ func (r OutboxReconciliation) Summary() string {
 	default:
 		return fmt.Sprintf(
 			"NO LOSS DETECTED: %d outbox rows against %d broker records, %d of which are redelivery, "+
-				"replay or dead-letter overhead. This establishes that nothing claims a publication that "+
-				"did not happen; proving every event_id is present requires the audit consumer described "+
-				"in docs/kafka-operations.md",
-			r.TerminalEvents, r.MessagesWritten, r.Overhead,
+				"replay or dead-letter overhead. Every one of the %d rows names the distinct broker "+
+				"record it produced, so the surplus cannot be masking an equal number of losses",
+			r.TerminalEvents, r.MessagesWritten, r.Overhead, r.ConfirmedEvents,
 		)
 	}
 }
 
-// ReconcileAgainstOutbox interprets an offset report against the outbox's terminal row count.
+// ReconcileAgainstOutbox interprets an offset report against the outbox's own audit.
 //
 // It is the ONLY sanctioned way to compare the two, and it exists so that the asymmetry is
 // applied in one place: messages are a lower bound on events, never an equality, so the test
 // is a DIRECTIONAL one and the surplus is expected rather than suspicious.
+//
+// # OBS-02: why the audit replaced a bare row count
+//
+// It used to take an int64 — the number of terminal rows — and conclude from arithmetic alone.
+// That conclusion was unsound in one specific and entirely plausible way: THE SURPLUS IS
+// INDISTINGUISHABLE FROM COMPENSATED LOSS. Ten redeliveries and ten lost events produce exactly
+// the totals of a healthy pipeline, so the verdict read "no loss detected" while ten events were
+// genuinely gone, and nothing about the numbers hinted at it.
+//
+// Taking the audit makes the check a MAPPING as well as a comparison. Every row that claims a
+// publication either names the record it produced or it does not, and while any do not the
+// verdict is inconclusive — because those are exactly the rows a surplus could be hiding. A
+// green verdict now means two things together: the broker holds at least as many records as
+// there are claims, AND every claim names a distinct record of its own.
 //
 // Retention is treated as a caveat rather than folded into the arithmetic. A topic whose
 // records have partly aged out has an end offset that still counts them, so the comparison
@@ -4445,22 +5380,58 @@ func (r OutboxReconciliation) Summary() string {
 //
 // Parameters:
 //   - report TopicOffsetReport: the broker-side measurement from TopicEndOffsets.
-//   - terminalEvents int64: dispatched plus dead-lettered outbox rows, from
-//     CountEventOutboxByStatus. Each event counted once.
+//   - audit model.EventOutboxAudit: the outbox-side measurement from
+//     AuditTerminalEventRecords. Each event counted once, by virtue of the unique index on
+//     event_id.
 //
 // Returns:
 //   - OutboxReconciliation: the verdict, always populated.
-func ReconcileAgainstOutbox(report TopicOffsetReport, terminalEvents int64) OutboxReconciliation {
+func ReconcileAgainstOutbox(
+	report TopicOffsetReport,
+	audit model.EventOutboxAudit,
+) OutboxReconciliation {
+	duplicated := audit.ConfirmedRows - audit.DistinctRecords
+	if duplicated < 0 {
+		duplicated = 0
+	}
+
 	verdict := OutboxReconciliation{
-		TerminalEvents:  terminalEvents,
-		MessagesWritten: report.EndOffsetSum,
-		Overhead:        report.EndOffsetSum - terminalEvents,
-		MeasuredAt:      report.MeasuredAt,
+		TerminalEvents:    audit.PublishedRows,
+		ConfirmedEvents:   audit.ConfirmedRows,
+		UnconfirmedEvents: audit.UnconfirmedRows(),
+		DuplicatedRecords: duplicated,
+		MessagesWritten:   report.EndOffsetSum,
+		Overhead:          report.EndOffsetSum - audit.PublishedRows,
+		MeasuredAt:        report.MeasuredAt,
 	}
 
 	verdict.LossDetected = verdict.Overhead < 0
 
-	caveats := make([]string, 0, 3)
+	caveats := make([]string, 0, 5)
+
+	// THE CAVEAT THIS WHOLE CHANGE EXISTS FOR. A row claiming a publication it cannot name a
+	// record for is not evidence of loss — the record may well be there — but it is precisely
+	// what a surplus of redeliveries could be concealing, so no green verdict may be reported
+	// while any remain.
+	if verdict.UnconfirmedEvents > 0 {
+		caveats = append(caveats, fmt.Sprintf(
+			"%d row(s) claim a publication without naming the broker record they produced, so they "+
+				"cannot be matched against the count and a surplus could be masking their loss",
+			verdict.UnconfirmedEvents,
+		))
+	}
+
+	// Impossible while the partial unique index on the coordinate exists, which is why its
+	// appearance is reported as a schema problem rather than absorbed.
+	if verdict.DuplicatedRecords > 0 {
+		caveats = append(caveats, fmt.Sprintf(
+			"%d row(s) name a broker record another row also names, which the unique index on "+
+				"(kafka_topic, kafka_partition, kafka_offset) should make impossible; verify that "+
+				"index still exists before trusting any reconciliation",
+			verdict.DuplicatedRecords,
+		))
+	}
+
 	if len(report.MissingTopics) > 0 {
 		caveats = append(caveats, fmt.Sprintf(
 			"%d measured topic(s) do not exist on the broker (%s), so their records cannot be counted",

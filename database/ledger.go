@@ -32,13 +32,75 @@ import (
 // CreateLedger inserts a new ledger record into the database, ensuring metadata is properly marshaled into JSON format.
 // It assigns a unique ledger ID with a suffix and captures the current timestamp as the creation time.
 //
+// # Atomic event capture (requirement R-2)
+//
+// When a caller supplies an EventPreparer, the ledger INSERT and the ledger.created event
+// row are written inside ONE transaction: the preparer is handed the finished ledger — the
+// only point at which the generated LedgerID and CreatedAt exist — and the row it returns
+// is inserted before the commit. Either both land or neither does, so there is no window in
+// which a ledger exists with no event describing it, and none in which an event describes a
+// ledger that was rolled back.
+//
+// With no preparer the behaviour is EXACTLY as before: one statement, no transaction, no
+// cost. That is what keeps every pre-existing caller — the API layer and a long tail of
+// tests — working untouched, and it is why the parameter is a variadic tail rather than a
+// positional argument.
+//
 // Parameters:
-// - ledger: The ledger data to be inserted into the database.
+//   - ledger: The ledger data to be inserted into the database.
+//   - prepareEvent: Optional. Builds the ledger.created outbox row from the created ledger,
+//     inside the transaction that created it. See EventPreparer for the contract.
 //
 // Returns:
-// - model.Ledger: The created ledger object including the generated LedgerID and creation timestamp.
-// - error: An error if the ledger creation fails, including specific database error handling for conflicts.
-func (d Datasource) CreateLedger(ledger model.Ledger) (model.Ledger, error) {
+//   - model.Ledger: The created ledger object including the generated LedgerID and creation timestamp.
+//   - error: An error if the ledger creation fails, including specific database error handling for
+//     conflicts, or if the event could not be prepared or captured — in which case the ledger
+//     is NOT created.
+func (d Datasource) CreateLedger(ledger model.Ledger, prepareEvent ...EventPreparer[model.Ledger]) (model.Ledger, error) {
+	ctx := context.Background()
+
+	prepare := firstEventPreparer(prepareEvent)
+	if prepare == nil {
+		return d.insertLedger(ctx, d.Conn, ledger)
+	}
+
+	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
+	if err != nil {
+		return model.Ledger{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin transaction", err)
+	}
+	// Rollback on every path that does not commit. It is a no-op after a successful
+	// commit, so the successful path costs nothing and the failing paths cannot leak a
+	// transaction.
+	defer func() { _ = tx.Rollback() }()
+
+	created, err := d.insertLedger(ctx, tx, ledger)
+	if err != nil {
+		return model.Ledger{}, err
+	}
+
+	if err := captureEntityEvent(ctx, d, tx, created, prepare); err != nil {
+		return model.Ledger{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return model.Ledger{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
+	}
+
+	return created, nil
+}
+
+// insertLedger performs the ledger INSERT against either the connection or an open
+// transaction, and is the single statement both CreateLedger paths run.
+//
+// Parameters:
+//   - ctx: The context for the statement.
+//   - execer: The connection or transaction to insert through.
+//   - ledger: The ledger to insert. Its LedgerID and CreatedAt are assigned here.
+//
+// Returns:
+//   - model.Ledger: The created ledger.
+//   - error: A typed conflict error for a unique violation, or a typed internal error.
+func (d Datasource) insertLedger(ctx context.Context, execer sqlExecer, ledger model.Ledger) (model.Ledger, error) {
 	// Marshal the metadata into JSON format
 	metaDataJSON, err := json.Marshal(ledger.MetaData)
 	if err != nil {
@@ -50,7 +112,7 @@ func (d Datasource) CreateLedger(ledger model.Ledger) (model.Ledger, error) {
 	ledger.CreatedAt = time.Now()
 
 	// Insert the ledger into the database
-	_, err = d.Conn.ExecContext(context.Background(), `
+	_, err = execer.ExecContext(ctx, `
 		INSERT INTO blnk.ledgers (meta_data, name, ledger_id)
 		VALUES ($1, $2, $3)
 	`, metaDataJSON, ledger.Name, ledger.LedgerID)

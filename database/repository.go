@@ -45,7 +45,12 @@ type IDataSource interface {
 
 // transaction defines methods for handling transactions.
 type transaction interface {
-	RecordTransaction(cxt context.Context, txn *model.Transaction) (*model.Transaction, error)                                                               // Records a new transaction
+	// RecordTransaction records a new transaction, and — when the caller supplies an event
+	// row — commits that row in the SAME database transaction as the insert. The rejection
+	// path uses that arm so a REJECTED status and the transaction.rejected event announcing
+	// it can no longer be separated by a crash. The tail is variadic so the frozen
+	// transaction-queue callers keep compiling; see the note on the atomic writers below.
+	RecordTransaction(cxt context.Context, txn *model.Transaction, eventOutbox ...*model.EventOutbox) (*model.Transaction, error)
 	RecordTransactionWithBalances(ctx context.Context, txn *model.Transaction, sourceBalance, destinationBalance *model.Balance) (*model.Transaction, error) // Records a transaction with balance updates atomically
 	// The three atomic writers below take their event outbox rows as a VARIADIC
 	// parameter, and that is a deliberate, load-bearing choice rather than a
@@ -101,9 +106,49 @@ type transaction interface {
 	GetAllTransactionsWithFilterAndOptions(ctx context.Context, filters *filter.QueryFilterSet, opts *filter.QueryOptions, limit, offset int) ([]model.Transaction, *int64, error) // Retrieves transactions with filtering, sorting, and count
 }
 
+// LedgerEventCapture builds the event outbox row for a newly created ledger, and is
+// called by CreateLedger with the FINALISED ledger — after the identifier and the
+// creation timestamp have been assigned and before anything is written.
+//
+// # Why a callback rather than a prepared row
+//
+// The three creation writers below assign the entity's identity themselves:
+// CreateLedger generates the ledger id, CreateBalance the balance id, CreateIdentity
+// the identity id, and all three stamp created_at. The event payload is that
+// finalised entity — it is the exact object the HTTP webhook used to carry — so a row
+// prepared by the caller BEFORE the write would name an entity with no identifier and
+// no timestamp, and the payload would no longer match what a subscriber has always
+// received.
+//
+// Inverting the call is what resolves that: the writer assigns identity, hands the
+// finalised entity back through this function, and inserts the returned row inside the
+// same SQL transaction as the entity itself. The event and the mutation then commit or
+// roll back together, which is requirement R-2 at its narrowest.
+//
+// A nil return with a nil error means "capture nothing", which is how a deployment
+// with no transport configured keeps the single-statement path it has always used.
+// An error aborts the whole write, because an event that cannot be built is a defect
+// rather than a transient condition, and committing the entity without it would lose
+// the event permanently.
+type LedgerEventCapture func(ledger model.Ledger) (*model.EventOutbox, error)
+
+// BalanceEventCapture builds the event outbox row for a newly created balance. See
+// LedgerEventCapture for why the call is inverted.
+type BalanceEventCapture func(balance model.Balance) (*model.EventOutbox, error)
+
+// IdentityEventCapture builds the event outbox row for a newly created identity. See
+// LedgerEventCapture for why the call is inverted.
+type IdentityEventCapture func(identity model.Identity) (*model.EventOutbox, error)
+
 // ledger defines methods for handling ledgers.
 type ledger interface {
-	CreateLedger(ledger model.Ledger) (model.Ledger, error)  // Creates a new ledger
+	// CreateLedger creates a new ledger. When the caller supplies an EventPreparer, the
+	// ledger.created event row is built from the CREATED ledger and inserted in the same
+	// database transaction as the ledger itself, which is requirement R-2 for this producer:
+	// the event's aggregate id and payload both depend on the id this method mints, so the
+	// row cannot be prepared before the call and a callback is what makes atomicity
+	// possible. The tail is variadic so every pre-existing caller compiles unchanged.
+	CreateLedger(ledger model.Ledger, prepareEvent ...EventPreparer[model.Ledger]) (model.Ledger, error)
 	GetAllLedgers(limit, offset int) ([]model.Ledger, error) // Retrieves all ledgers (legacy)
 	GetLedgerByID(id string) (*model.Ledger, error)          // Retrieves a ledger by ID
 	UpdateLedger(id, name string) (*model.Ledger, error)     // Updates a ledger's name
@@ -115,7 +160,12 @@ type ledger interface {
 
 // balance defines methods for handling balances.
 type balance interface {
-	CreateBalance(balance model.Balance) (model.Balance, error)                                                            // Creates a new balance
+	// CreateBalance creates a new balance. When the caller supplies an EventPreparer, the
+	// balance.created event row is built from the CREATED balance and inserted in the same
+	// database transaction as the balance itself (requirement R-2). Nothing is captured on
+	// the idempotent indicator-conflict path, where no balance is created; see the method's
+	// own documentation. The tail is variadic so every pre-existing caller compiles unchanged.
+	CreateBalance(balance model.Balance, prepareEvent ...EventPreparer[model.Balance]) (model.Balance, error)
 	GetBalanceByID(id string, include []string, withQueued bool) (*model.Balance, error)                                   // Retrieves a balance by ID with additional data and queued status
 	GetBalanceByIDLite(id string) (*model.Balance, error)                                                                  // Retrieves a balance by ID with minimal data
 	GetBalancesByIDsLite(ctx context.Context, ids []string) (map[string]*model.Balance, error)                             // Retrieves multiple balances by IDs with minimal data (batch query)
@@ -159,7 +209,11 @@ type balanceMonitor interface {
 
 // identity defines methods for handling identities.
 type identity interface {
-	CreateIdentity(identity model.Identity) (model.Identity, error)        // Creates a new identity
+	// CreateIdentity creates a new identity. When the caller supplies an EventPreparer, the
+	// identity.created event row is built from the CREATED identity and inserted in the same
+	// database transaction as the identity itself (requirement R-2). The tail is variadic so
+	// every pre-existing caller compiles unchanged.
+	CreateIdentity(identity model.Identity, prepareEvent ...EventPreparer[model.Identity]) (model.Identity, error)
 	GetIdentityByID(id string) (*model.Identity, error)                    // Retrieves an identity by ID
 	GetAllIdentities() ([]model.Identity, error)                           // Retrieves all identities (legacy)
 	GetAllIdentitiesPaginated(limit, offset int) ([]model.Identity, error) // Retrieves identities with pagination (legacy)
@@ -250,19 +304,49 @@ type lineage interface {
 // key, whereas GetEventByID takes the business event_id UUID; the two are not
 // interchangeable.
 //
-// # The one method with a limited lifetime
+// # The two methods with a limited lifetime
 //
 // MarkWebhookDispatched serves the 30-day window during which Kafka publishing
 // and legacy HTTP webhook delivery run side by side FROM THE SAME CLAIMED ROW —
 // which is what makes the two transports carry byte-identical payloads
 // structurally rather than by careful coding. The relay calls it once it has
 // enqueued the legacy task, so a row republished to Kafka after a crash does not
-// enqueue a second webhook. It is the only member of this contract that the
-// webhook sunset makes redundant; every other method outlives the sunset.
+// enqueue a second webhook.
+//
+// MarkEventWebhookPending serves the same window from the other direction: it
+// records that the Kafka leg is complete while the legacy leg is still owed. It
+// exists because the two legs used to share one terminal state, so a Kafka
+// publish that succeeded marked the row dispatched even when the webhook enqueue
+// beside it had failed — and dispatched is outside the claim predicate, so that
+// webhook was never retried and never delivered.
+//
+// These two are the only members of this contract the webhook sunset makes
+// redundant; every other method outlives the sunset.
 type eventOutbox interface {
 	// Insert methods for atomic event capture
 	InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *model.EventOutbox) error // Inserts an event outbox entry within an existing transaction
 	InsertEventOutbox(ctx context.Context, e *model.EventOutbox) error                 // Inserts an event outbox entry directly, outside any ledger transaction
+
+	// The three entity writers that COMMIT AN EVENT WITH THEIR MUTATION.
+	//
+	// Ledgers, identities and balances are each created by a single INSERT on the
+	// pooled connection, so unlike a transaction there is no existing transaction
+	// for an event to join. These variants open one, write the entity and its event
+	// row together, and commit both or neither — which is what extends requirement
+	// R-2's guarantee to the three creation events (ledger.created,
+	// identity.created and balance.created) instead of leaving them to a
+	// post-commit goroutine that a crash, a cancellation or a failed insert loses
+	// permanently.
+	//
+	// Each takes AT MOST ONE event row as a variadic tail, and each drops nil
+	// entries and falls back to the plain single INSERT when none is supplied. That
+	// is the no-op-when-unconfigured contract inherited from SendWebhook:
+	// PrepareEventOutbox returns nil with no brokers configured, so a caller passes
+	// its result through unconditionally and gets the original behaviour.
+	//
+	// The unprefixed CreateLedger, CreateIdentity and CreateBalance above are
+	// unchanged and share the same INSERT implementation, so neither the SQL nor the
+	// error mapping can drift between the two shapes.
 
 	// Relay state machine: claim a batch, then drive each row to a terminal state.
 	//
@@ -283,8 +367,23 @@ type eventOutbox interface {
 	// occurred_at, a subscriber then observes one aggregate's events out of order
 	// with nothing anywhere to show it happened.
 	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error)                   // Claims pending entries FIFO for publishing, one row per partition key, taking a lease and stamping a claim token
-	MarkEventDispatched(ctx context.Context, id int64, claimToken string) error                                                            // Marks a claimed entry dispatched after the broker acknowledges the publish
+	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error                                 // Marks a claimed entry dispatched after the broker acknowledges the publish, persisting the coordinate the broker assigned
 	MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration) (model.EventFailureOutcome, error) // Records a failed attempt against a claimed entry, schedules its next due instant and reports whether the budget is now spent
+
+	// ClaimEventsOwedDeadLetter reaches the one set nothing else can: an entry whose
+	// retry budget is spent and whose dead-letter write was NOT recorded, because it
+	// failed or because the relay died between the write and the record.
+	//
+	// Such a row is invisible to ClaimPendingEventOutbox (wrong status, no budget) and
+	// to ClaimEventForReplay (not dead_lettered), and PurgeTerminalEventsBefore
+	// deliberately refuses to delete it because this table is the only copy of the
+	// event in existence. Without this method the event could be neither published,
+	// replayed nor triaged — only rescued by a hand-written UPDATE.
+	//
+	// It does NOT change the row's status, so a row whose dead-letter topic is
+	// unreachable does not re-enter the main claim's blocking set and stall every later
+	// event of its aggregate.
+	ClaimEventsOwedDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims entries whose budget is spent and whose dead-letter write is still owed, so the hand-off can be retried
 
 	// MarkEventDeadLettered completes the failure path: it moves an entry whose
 	// retry budget MarkEventFailed already exhausted into the dead_lettered
@@ -311,7 +410,7 @@ type eventOutbox interface {
 	// transition, and the caller that fails it knows not to have published. Publish
 	// to the dead-letter topic FIRST and record it here second, so a row is never
 	// marked dead-lettered without a message behind it.
-	MarkEventDeadLettered(ctx context.Context, id int64, claimToken, dltTopic string, failureMetadata json.RawMessage) error
+	MarkEventDeadLettered(ctx context.Context, id int64, claimToken, dltTopic string, failureMetadata json.RawMessage, record model.BrokerRecord) error
 
 	// ClaimEventForReplay atomically moves a dead-lettered row to replaying and
 	// returns it with a fresh claim token, so a replay is a CLAIM rather than a read
@@ -327,6 +426,11 @@ type eventOutbox interface {
 	// is a conflict naming the state it is actually in, because replaying an
 	// already-dispatched event and replaying a still-pending one are different
 	// operator mistakes that deserve different answers.
+	//
+	// It also takes over a replaying row whose LEASE HAS EXPIRED. Admitting only
+	// dead_lettered left a row stranded by a crash — or by a release that failed on an
+	// already-cancelled request context — permanently unreplayable, with the lease
+	// written down and nothing ever reading it.
 	ClaimEventForReplay(ctx context.Context, eventID string, lockDuration time.Duration) (*model.EventOutbox, error)
 
 	// ReleaseEventReplay returns a replaying row to dead_lettered, recording
@@ -340,7 +444,56 @@ type eventOutbox interface {
 	// MarkEventDispatched or this.
 	ReleaseEventReplay(ctx context.Context, id int64, claimToken, replayErr string) error
 
+	// RenewEventOutboxLease extends the lease on every row still in flight under one
+	// claim token and reports how many it extended.
+	//
+	// It is what makes a large batch safe under a short lease: the fixed lease could
+	// expire while the relay still held and still intended to publish a row, so a second
+	// instance claimed and published it and the first published it again. Every terminal
+	// transition clears the token, so the statement's reach is exactly the unfinished set
+	// and no id list is needed. A zero count is the ordinary end of a batch, not an error.
+	RenewEventOutboxLease(ctx context.Context, claimToken string, lease time.Duration) (int64, error)
+
+	// ClaimFailedEventOutboxForDeadLetter claims rows whose retry budget is spent and
+	// whose dead-letter write has NOT succeeded (status failed, dlt_topic NULL), so the
+	// preservation can be attempted again.
+	//
+	// Without it such a row was a dead end in three directions at once — outside the
+	// ordinary claim predicate, refused by replay, and abandoned by the worker that held
+	// its token — while being the only copy of the event in existence. The status stays
+	// failed so the row remains in the dead-letter inventory throughout and can complete
+	// through MarkEventDeadLettered, which accepts failed as a prior state.
+	ClaimFailedEventOutboxForDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error)
+
 	MarkWebhookDispatched(ctx context.Context, id int64, claimToken string) error // Marks the legacy webhook leg dispatched for a claimed row, so a republished row cannot double-enqueue it
+	// ClaimPendingWebhookDeliveries and MarkWebhookDispatched are the two halves of
+	// the legacy leg of the dual-delivery window, and BOTH ARE DELETED at the
+	// webhook sunset together with webhooks.go and the relay branch that calls
+	// them. Every other method in this interface outlives it.
+	//
+	// The claim exists because the legacy enqueue is deliberately allowed to fail
+	// without failing the Kafka publish — a webhook receiver being down must not
+	// consume a Kafka retry attempt — and the Kafka publish then drives the row to
+	// its terminal state, past everything the main claim predicate looks at. Without
+	// an independent way back to that row the outstanding webhook was lost silently,
+	// for precisely the subscribers that have not migrated yet.
+	//
+	// It does NOT change the row's status, which is the property that makes it safe:
+	// returning a dispatched row to processing would republish it to Kafka.
+	ClaimPendingWebhookDeliveries(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims dispatched rows whose legacy webhook leg is still owed, taking a lease and stamping a claim token without altering status
+
+	// MarkEventWebhookPending records a Kafka leg that is COMPLETE alongside a
+	// legacy webhook leg that is still OWED, and reports which arm the in-SQL
+	// decision took: another webhook attempt (webhook_pending, claimable again
+	// after retryAfter) or the legacy leg abandoned (dispatched, terminal on the
+	// strength of the Kafka delivery alone).
+	//
+	// It increments webhook_attempts and never attempts, because a webhook
+	// receiver being down must not consume a Kafka retry attempt — that would let
+	// the deprecated transport dead-letter events on the new one.
+	//
+	// SUNSET: removed with MarkWebhookDispatched and the rest of the legacy leg.
+	MarkEventWebhookPending(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, record model.BrokerRecord) (model.EventWebhookOutcome, error)
 
 	// Dead-letter and reporting reads
 	GetEventByID(ctx context.Context, eventID string) (*model.EventOutbox, error)               // Retrieves an entry by its business event_id UUID, for replay
@@ -362,6 +515,30 @@ type eventOutbox interface {
 	// no rows is absent from the map rather than present with a zero — callers
 	// must read it with the two-value form or accept the zero value.
 	CountEventOutboxByStatus(ctx context.Context) (map[string]int64, error)
+
+	// AuditTerminalEventRecords is the OUTBOX SIDE of the zero-loss reconciliation,
+	// and it is what makes that reconciliation able to detect loss at all.
+	//
+	// CountEventOutboxByStatus alone cannot. Comparing its terminal counts against
+	// the broker's summed end offsets is a comparison of two totals, and a surplus
+	// of redeliveries is arithmetically indistinguishable from a surplus that is
+	// masking an equal number of losses: ten lost events plus ten redeliveries
+	// produce exactly the totals of a healthy pipeline.
+	//
+	// This method reports the mapping instead. It counts the rows that CLAIM a
+	// record on the broker — every row whose Kafka leg completed, plus every
+	// dead-lettered row — and how many of those NAME the record they produced. A
+	// row that claims a publication without naming a record is reported as
+	// unconfirmed rather than absorbed into the surplus, and
+	// ReconcileAgainstOutbox refuses to call the result conclusive while any
+	// remain.
+	//
+	// The published set is deliberately WIDER than the terminal statuses. A
+	// webhook_pending row has been published to Kafka — its Kafka leg completed;
+	// what is outstanding is the deprecated HTTP leg — so excluding it would leave
+	// its record unaccounted for on the broker side, loosening the reconciliation
+	// during exactly the window it matters most.
+	AuditTerminalEventRecords(ctx context.Context) (model.EventOutboxAudit, error)
 
 	// PurgeTerminalEventsBefore deletes at most limit TERMINAL rows whose
 	// occurrence predates cutoff, and returns how many it removed. A caller sweeps
@@ -387,22 +564,29 @@ type eventOutbox interface {
 //
 // # WHAT IS AND IS NOT AN ACCESS BOUNDARY (SEC-01)
 //
-// The ENFORCED boundary is exactly two things, because these are the two the broker
-// evaluates on every request: the ACL bindings on the topics the subscriber is
+// The BROKER-ENFORCED boundary is exactly two things, because these are the two the
+// broker evaluates on every request: the ACL bindings on the topics the subscriber is
 // authorised for, and the ACL binding on its consumer group, both granted to the
 // Kafka principal on the row. Provisioning translates the row into one SASL/SCRAM
 // credential and those bindings; there are no per-tenant topics, so topic-level and
 // group-level ACLs are the whole of the enforcement.
 //
-// partition_key_prefix is NOT a boundary and must never be described or relied upon
-// as one. Kafka authorises reads at topic and group granularity — there is no ACL
+// partition_key_prefix is the REQUESTED KEY SCOPE, and it is a boundary the broker
+// cannot evaluate: Kafka authorises reads at topic and group granularity, with no ACL
 // operation that restricts a principal to a subset of a topic's partitions or to
 // records bearing a particular key, so a principal that may read a topic may read
-// EVERY record in it regardless of what this column says. The column is an ADVISORY
-// CONSUMER-SIDE FILTER: a hint a well-behaved subscriber may use to discard records
-// it does not care about. Treating it as isolation would mean believing two
-// subscribers on one topic cannot see each other's events, which is false, and
-// would make that belief the basis of a tenancy decision.
+// EVERY record in it regardless of what this column says.
+//
+// So a non-empty value in that column makes the subscriber UNPROVISIONABLE: the
+// service layer refuses to issue a credential for such a row rather than hand out
+// whole-topic access under a registry that describes something narrower. Calling the
+// column an advisory filter, which this contract once did, was the more dangerous
+// framing — a qualification here is not what somebody reads when they read the row to
+// decide who may see what.
+//
+// The grant this contract DOES describe is reconciled rather than accumulated: every
+// issuance and every authorization change deletes the bindings the current
+// authorized_topics no longer implies, so narrowing the column narrows the boundary.
 //
 // # NO METHOD HERE MAY ACCEPT OR RETURN A PLAINTEXT SECRET
 //
@@ -519,6 +703,45 @@ type eventSubscriber interface {
 	// decision. A zero cut-off is refused rather than read as "purge
 	// everything".
 	PurgeMigratedSubscriberWebhookURLs(ctx context.Context, migratedBefore time.Time) (int64, error)
+
+	// MarkSubscriberRevocationPending stamps the revocation tombstone and returns
+	// the row, so deregistration can revoke at the broker BEFORE the row that
+	// names the principal is deleted.
+	//
+	// Deleting first — which is what TakeEventSubscriber alone amounted to —
+	// destroyed the principal and topic list revocation needs whenever that
+	// revocation then failed, leaving live broker access that nothing in Blnk
+	// could see. A tombstoned row is a durable to-do item instead: retrying the
+	// deregistration finds it and finishes the job.
+	//
+	// It is idempotent and KEEPS THE FIRST INSTANT, because the value an operator
+	// needs is how long the revocation has been outstanding.
+	MarkSubscriberRevocationPending(ctx context.Context, subscriberID string, pendingAt time.Time) (*model.EventSubscriber, error)
+
+	// ClaimSubscriberForProvisioning fences a subscriber for one issuance or
+	// revocation and returns the token the claim is held under. A live claim held
+	// by anybody else is reported as a CONFLICT.
+	//
+	// Kafka stores one SCRAM credential per principal, so two overlapping
+	// issuances leave the broker holding one password while this table may hold a
+	// reference derived from the other — and the caller holding the recorded one
+	// cannot authenticate, with no way to find out. The conditional credential
+	// write detects the database half of that race; it cannot decide which
+	// password the BROKER kept. So the broker is only ever touched under this
+	// claim, and the second caller is refused before it generates a secret.
+	//
+	// The claim is LEASED and the token is rotated on every claim, so a process
+	// killed mid-issuance does not fence the subscriber for ever and a caller
+	// whose lease expired cannot complete or release a claim somebody else now
+	// holds.
+	ClaimSubscriberForProvisioning(ctx context.Context, subscriberID string, lease time.Duration) (string, error)
+
+	// ReleaseSubscriberProvisioningFence clears a claim the caller still holds, so
+	// a retry after a fast failure does not have to wait out the whole lease. A
+	// claim that is no longer the caller's is reported as a conflict rather than
+	// swallowed: callers release in a deferred cleanup and log the outcome, and a
+	// fence lost mid-operation is exactly the condition worth knowing about.
+	ReleaseSubscriberProvisioningFence(ctx context.Context, subscriberID string, token string) error
 }
 
 // chain defines the hash-chain (tamper-evidence) operations.

@@ -62,6 +62,20 @@ const WebhookDualDeliveryWindowDays = 30
 // explicitly configured dates really is that far apart.
 const webhookDualDeliveryWindow = WebhookDualDeliveryWindowDays * 24 * time.Hour
 
+// WebhookDualDeliveryWindow returns the window length as a duration.
+//
+// The dual-delivery decision lives in package blnk, which needs the same span this
+// package derives and validates against. Exporting the duration — rather than letting
+// the caller multiply WebhookDualDeliveryWindowDays out for itself — keeps one
+// definition of "exactly 30 days" for both the configuration that refuses a
+// mis-stated window and the predicate that decides whether an event is inside one.
+//
+// Returns:
+//   - time.Duration: WebhookDualDeliveryWindowDays expressed as a duration.
+func WebhookDualDeliveryWindow() time.Duration {
+	return webhookDualDeliveryWindow
+}
+
 // Default values for different configurations
 var (
 	defaultTransaction = TransactionConfig{
@@ -133,10 +147,11 @@ var (
 		ReplicationFactor: 3,
 	}
 
-	// defaultRelay encodes the bounded exponential backoff schedule: five attempts
-	// starting at 1s and doubling (1s, 2s, 4s, 8s, 16s), capped at 30s. The cap is
-	// never reached with these parameters, which is intentional — it only engages
-	// when the configured base or attempt count would exceed it.
+	// defaultRelay encodes the bounded exponential backoff schedule: five publish
+	// attempts separated by four waits — 1s, 2s, 4s and 8s, 15s in total — capped at
+	// 30s. The cap is out of reach with these parameters, which is intentional: the
+	// delay after a fifth failure would be 16s and no sixth attempt consumes it, so
+	// the cap engages only when the configured base or attempt count is raised.
 	defaultRelay = RelayConfig{
 		MaxRetryAttempts:   MaxRelayRetryAttempts,
 		RetryBaseBackoffMS: 1000,
@@ -234,6 +249,36 @@ type SlackWebhook struct {
 type WebhookConfig struct {
 	Url     string            `json:"url"     envconfig:"BLNK_WEBHOOK_URL"`
 	Headers map[string]string `json:"headers" envconfig:"BLNK_WEBHOOK_HEADERS"`
+
+	// AllowPrivateDestination asserts that the configured webhook destination is on a
+	// network the operator owns, permitting http and permitting delivery to loopback and
+	// private addresses (SSRF-01).
+	//
+	// # Why a flag exists at all
+	//
+	// The legacy transport refuses internal destinations at dial time, which is what
+	// stops a redirect or a rebound DNS answer from turning a webhook into a request
+	// against Blnk's own Postgres, Redis, broker or cloud metadata endpoint. But two
+	// entirely legitimate deployments are internal by nature: an on-premise install
+	// delivering to https://webhooks.corp:8443 behind RFC1918, and a developer
+	// delivering to a loopback sink. Refusing those outright would not make anyone safer,
+	// it would make the deny-list something operators route around.
+	//
+	// # What it can and cannot open
+	//
+	// It is NOT a switch that turns the guard off, and it is deliberately not named as
+	// one. It opens exactly the two tiers an operator can plausibly own — loopback and
+	// private/ULA — and it opens http. It CANNOT open the ranges no configuration should
+	// reach: link-local (169.254.169.254), the unspecified address, multicast, the
+	// carrier-grade NAT range, the benchmarking and protocol-assignment ranges, or an
+	// internal address smuggled through the NAT64 well-known prefix. Those stay refused
+	// with this set to true. Redirects likewise stay refused unconditionally, because a
+	// webhook POST has no legitimate reason to be redirected and following one is the
+	// exact vector this closes.
+	//
+	// Default false. Enabling it logs a warning naming what it permitted, so the
+	// assertion is visible in the log of any deployment that made it.
+	AllowPrivateDestination bool `json:"allow_private_destination" envconfig:"BLNK_WEBHOOK_ALLOW_PRIVATE_DESTINATION"`
 }
 
 type Notification struct {
@@ -309,11 +354,71 @@ type QueueConfig struct {
 // there, and a test asserts every field of both structs is covered.
 //
 // Brokers and the four SASL fields have no defaults by design — see defaultKafka.
+//
+// # THE DEPLOYMENT CONTRACT, AND WHAT IS AN ADDITION TO IT
+//
+// Requirement R-10 freezes the deployment contract at EIGHT environment variables. Four
+// of them are declared in this struct and are marked below; the other four are
+// RELAY_MAX_RETRY_ATTEMPTS, RELAY_RETRY_BASE_BACKOFF_MS and RELAY_RETRY_MAX_BACKOFF_MS
+// in RelayConfig, and WEBHOOK_DEPRECATION_SUNSET_DATE on Configuration.
+//
+// Every other variable in this struct is a SUPPLEMENTARY SETTING. The distinction is
+// recorded in the source rather than left to a document because the two have different
+// standing: the eight are a contract with the deployment and must not change name,
+// default or meaning, while a supplementary setting is Blnk's own and may be revised.
+// Each supplementary setting below names the reason it exists, and none of them is
+// required for a working deployment — every one has a safe default or a documented
+// fallback, so the eight remain sufficient on their own.
+//
+// The supplementary settings, and why each is not merely convenience:
+//
+//   - KAFKA_SASL_USER / KAFKA_SASL_SECRET — the least-privilege producer principal.
+//     Without them the publisher must authenticate as the administrator, which puts
+//     topic creation, credential minting and ACL rewriting in the hands of the busiest
+//     process in the deployment.
+//   - KAFKA_TLS_* — transport security. SASL/SCRAM without TLS sends ledger and
+//     identity payloads over a channel an observer can read.
+//   - KAFKA_INSECURE_LOCAL_DEV — the single, explicit acknowledgement that lets the
+//     local stack run without TLS, so that not having it is never the silent default.
+//   - KAFKA_MIN_PARTITIONS / KAFKA_REPLICATION_FACTOR — topic geometry. AAP §0.5.2
+//     sanctions both as fields, and §0.4.5 requires the replication factor in
+//     particular to be configuration-driven: a single-broker local stack cannot
+//     satisfy the production factor of 3, so hardcoding either value breaks one
+//     environment or the other.
+//   - KAFKA_ALLOW_PARTITION_GROWTH — the explicit consent adding partitions to a
+//     non-empty topic requires, because doing so changes which partition a key lands
+//     on and therefore breaks per-aggregate ordering for keys already in flight.
 type KafkaConfig struct {
+	// Brokers and TopicPrefix are R-10 CONTRACT VARIABLES.
 	Brokers     []string `json:"brokers"      envconfig:"KAFKA_BROKERS"`
 	TopicPrefix string   `json:"topic_prefix" envconfig:"KAFKA_TOPIC_PREFIX"`
 
-	// SASLUser and SASLSecret are the STEADY-STATE PRODUCER principal: the identity
+	// SubscriberBrokers is the SUBSCRIBER-FACING bootstrap list, and it is a DIFFERENT
+	// LIST FROM Brokers rather than a convenience alias for it.
+	//
+	// Brokers is what Blnk itself dials, and inside a deployment that is an internal
+	// address: "kafka:9092" on a compose network, a headless or ClusterIP Service name in
+	// Kubernetes. Neither resolves for a subscriber outside the deployment, and Kafka
+	// compounds it — a broker answers every client with the ADVERTISED address of the
+	// listener the connection arrived on, so even an external address that does resolve
+	// leads to a bootstrap that hands back internal ones. A subscriber must therefore be
+	// given the addresses of the externally advertised listener, which only an operator
+	// can know.
+	//
+	// So POST /subscribers/{id}/kafka-credentials reports this list, and when it is empty
+	// issuance is REFUSED with ErrSubscriberBrokersNotConfigured rather than falling back
+	// to Brokers. The fallback is what makes this worth a variable: it returns 200 with an
+	// endpoint the subscriber cannot dial, so the failure surfaces as an unexplained
+	// connection timeout in the subscriber's own logs, days later and nowhere near the
+	// request that caused it — and it publishes Blnk's internal topology to an external
+	// party for good measure.
+	//
+	// A deployment whose subscribers really are in-cluster sets this to the same value as
+	// Brokers, which is one line of configuration and makes the claim explicit.
+	SubscriberBrokers []string `json:"subscriber_brokers" envconfig:"KAFKA_SUBSCRIBER_BROKERS"`
+
+	// SUPPLEMENTARY (least privilege). SASLUser and SASLSecret are the STEADY-STATE
+	// PRODUCER principal: the identity
 	// the event publisher in the server and worker processes authenticates as. It
 	// needs only Write and Describe on the topics Blnk owns.
 	//
@@ -324,20 +429,31 @@ type KafkaConfig struct {
 	// authorization state. Least privilege is the point: configure these two, and the
 	// admin credentials never leave the provisioning path.
 	//
-	// When they are empty the publisher falls back to the administrative principal so
-	// that an existing single-credential deployment keeps working, and it logs an
-	// excess-privilege warning every time it does. Treat that warning as a
-	// configuration defect, not as noise.
+	// There is NO fallback to the administrative principal. When these are empty and
+	// the administrative pair is not, ProducerSASL reports adminOnly and the publisher
+	// REFUSES to build, returning ErrProducerPrincipalRequired. That path used to
+	// downgrade to the administrative pair and log an excess-privilege warning, which
+	// recorded the problem without preventing it — and a warning nobody reads is how a
+	// temporary allowance becomes the permanent configuration. See ProducerSASL.
+	//
+	// Both pairs empty is a different, legitimate case: a broker requiring no
+	// authentication, for which no SASL mechanism is built and no error is raised.
+	//
+	// scripts/kafka-provision.sh creates this principal for the local stack and grants
+	// it Write and Describe on the Blnk-owned topics only.
 	SASLUser   string `json:"sasl_user"   envconfig:"KAFKA_SASL_USER"`
 	SASLSecret string `json:"sasl_secret" envconfig:"KAFKA_SASL_SECRET"`
 
-	// SASLAdminUser and SASLAdminSecret are the ADMINISTRATIVE principal, used only
-	// for topic assurance, subscriber SCRAM credential provisioning, ACL grants and
-	// revocation, and the offset/lag reads behind reconciliation. Keep them out of
-	// every process that only publishes.
+	// SASLAdminUser and SASLAdminSecret are R-10 CONTRACT VARIABLES, and are the
+	// ADMINISTRATIVE principal: used only for topic assurance, subscriber SCRAM
+	// credential provisioning, ACL grants and revocation, and the offset/lag reads
+	// behind reconciliation. Keep them out of every process that only publishes.
 	SASLAdminUser   string `json:"sasl_admin_user"   envconfig:"KAFKA_SASL_ADMIN_USER"`
 	SASLAdminSecret string `json:"sasl_admin_secret" envconfig:"KAFKA_SASL_ADMIN_SECRET"`
 
+	// SUPPLEMENTARY (topic geometry). Sanctioned as fields by AAP §0.5.2; the
+	// replication factor must be configuration-driven per §0.4.5, because a
+	// single-broker local stack cannot satisfy the production factor of 3.
 	MinPartitions     int `json:"min_partitions"     envconfig:"KAFKA_MIN_PARTITIONS"`
 	ReplicationFactor int `json:"replication_factor" envconfig:"KAFKA_REPLICATION_FACTOR"`
 
@@ -358,6 +474,7 @@ type KafkaConfig struct {
 	// SASL_PLAINTEXT, and only for that. Setting it in production defeats the
 	// protection; it is logged as a warning on every configuration load so that its
 	// presence in a real deployment cannot go unnoticed.
+	// SUPPLEMENTARY (explicit local-dev acknowledgement).
 	InsecureLocalDev bool `json:"insecure_local_dev" envconfig:"KAFKA_INSECURE_LOCAL_DEV"`
 
 	// AllowPartitionGrowth permits the topic-assurance pass to raise the partition
@@ -372,7 +489,33 @@ type KafkaConfig struct {
 	//
 	// An EMPTY topic is grown regardless of this flag: with no records written there
 	// is no mapping to preserve.
+	// SUPPLEMENTARY (explicit consent for a reordering-unsafe operation).
 	AllowPartitionGrowth bool `json:"allow_partition_growth" envconfig:"KAFKA_ALLOW_PARTITION_GROWTH"`
+
+	// AllowAdminProducer permits the event publisher to authenticate with the
+	// ADMINISTRATIVE credentials when no dedicated producer principal is configured.
+	//
+	// The publisher's own principal is SASLUser/SASLSecret. When those are empty the
+	// only other credential in the configuration is the administrative pair — the
+	// principal that creates topics, alters SCRAM credentials and grants or revokes
+	// ACLs. Publishing every ledger event as that principal makes a leaked producer
+	// credential a full compromise of the cluster's authorization state rather than
+	// the ability to publish events, and it erases the audit distinction between
+	// routine publishing and administration.
+	//
+	// So the fallback is REFUSED by default: a deployment that has brokers but no
+	// producer principal fails at start-up, naming KAFKA_SASL_USER and
+	// KAFKA_SASL_SECRET, rather than quietly running at maximum privilege. This flag
+	// is the deliberate, documented escape hatch for the one case that justifies it —
+	// an existing deployment mid-upgrade that has not provisioned its producer
+	// principal yet and must keep publishing while it does. It warns on every
+	// publisher construction, because a compatibility path nobody is reminded of
+	// becomes the permanent configuration.
+	//
+	// Default false. It is the least-privilege posture that has to be the default: an
+	// unset variable must not be the thing standing between a deployment and running
+	// its data plane as an administrator.
+	AllowAdminProducer bool `json:"allow_admin_producer" envconfig:"KAFKA_ALLOW_ADMIN_PRODUCER"`
 }
 
 // KafkaTLSConfig configures the TLS client both Kafka transports use.
@@ -390,6 +533,7 @@ type KafkaConfig struct {
 // authenticates, so an interposed broker is indistinguishable from the real one.
 // It is warned about on every configuration load.
 type KafkaTLSConfig struct {
+	// ALL SUPPLEMENTARY (transport security).
 	Enabled            bool   `json:"enabled"              envconfig:"KAFKA_TLS_ENABLED"`
 	CAFile             string `json:"ca_file"              envconfig:"KAFKA_TLS_CA_FILE"`
 	CertFile           string `json:"cert_file"            envconfig:"KAFKA_TLS_CERT_FILE"`
@@ -410,9 +554,37 @@ type KafkaTLSConfig struct {
 // RELAY_* names and the conventional BLNK_RELAY_* names resolve through the same
 // mechanism; see the notes on KafkaConfig and eventStreamingEnvOverride.
 type RelayConfig struct {
+	// ALL THREE ARE R-10 CONTRACT VARIABLES, with the defaults the requirement fixes:
+	// 5 attempts, a 1000 ms base delay and a 30000 ms ceiling. See defaultRelay.
 	MaxRetryAttempts   int `json:"max_retry_attempts"    envconfig:"RELAY_MAX_RETRY_ATTEMPTS"`
 	RetryBaseBackoffMS int `json:"retry_base_backoff_ms" envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
 	RetryMaxBackoffMS  int `json:"retry_max_backoff_ms"  envconfig:"RELAY_RETRY_MAX_BACKOFF_MS"`
+
+	// EventRetentionDays is how long a DELIVERED or DEAD-LETTERED event row is kept
+	// before it is deleted, and it is a data-protection control rather than a storage
+	// tuning knob.
+	//
+	// WHAT THE OUTBOX HOLDS IS SENSITIVE. Each row's payload is the webhook body
+	// verbatim: a transaction event carries amounts and balance identifiers, and an
+	// identity event carries names, email addresses, phone numbers, postal addresses and
+	// dates of birth. Once the event has been delivered none of that has any operational
+	// value, so keeping it indefinitely turns a delivery buffer into an unbounded second
+	// copy of the ledger's most sensitive data — without the access controls the primary
+	// tables have around them, and with a blast radius that only grows.
+	//
+	// Only TERMINAL rows are ever eligible. A pending, processing, replaying or failed row
+	// is still owed a delivery attempt and is never deleted however old it is; a failed
+	// row in particular is excluded because its dead-letter write is still owed, which
+	// makes this table the only copy of that event in existence.
+	//
+	// ZERO DISABLES RETENTION and is the default, deliberately. Deleting ledger-adjacent
+	// records is a decision only an operator can take: a jurisdiction, an audit programme
+	// or a legal hold may require a longer period than any default could guess, and a
+	// default that silently deleted evidence would be worse than one that keeps too much.
+	// So the mechanism ships switched off and the period is an explicit choice. The
+	// resulting storage growth is observable through blnk.outbox.pending and the
+	// statistics endpoint.
+	EventRetentionDays int `json:"event_retention_days" envconfig:"RELAY_EVENT_RETENTION_DAYS"`
 }
 
 // eventStreamingEnvOverride is how the CONVENTIONAL BLNK_-prefixed names for the
@@ -486,6 +658,7 @@ type eventStreamingEnvOverride struct {
 	RelayMaxRetryAttempts   *int `envconfig:"RELAY_MAX_RETRY_ATTEMPTS"`
 	RelayRetryBaseBackoffMS *int `envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
 	RelayRetryMaxBackoffMS  *int `envconfig:"RELAY_RETRY_MAX_BACKOFF_MS"`
+	RelayEventRetentionDays *int `envconfig:"RELAY_EVENT_RETENTION_DAYS"`
 }
 
 // applyEventStreamingEnvOverride resolves the Kafka and relay environment variables
@@ -545,6 +718,9 @@ func applyEventStreamingEnvOverride(cnf *Configuration) error {
 	if override.RelayRetryMaxBackoffMS != nil {
 		cnf.Relay.RetryMaxBackoffMS = *override.RelayRetryMaxBackoffMS
 	}
+	if override.RelayEventRetentionDays != nil {
+		cnf.Relay.EventRetentionDays = *override.RelayEventRetentionDays
+	}
 
 	return nil
 }
@@ -576,33 +752,53 @@ type Configuration struct {
 	Relay                   RelayConfig                   `json:"relay"`
 
 	// WebhookDeprecationStartDate is the RFC3339 instant at which the dual-delivery
-	// window OPENS. It exists so that the window's length is a derived fact rather
-	// than an operator's arithmetic: set it and the sunset is computed as exactly
-	// start + WebhookDualDeliveryWindowDays, which is the only way "exactly 30 days"
-	// can be enforced rather than hoped for.
+	// window OPENS. IT IS DERIVED, NOT CONFIGURED: it is always computed as
+	// WebhookDeprecationSunsetDate minus exactly WebhookDualDeliveryWindowDays, and
+	// any value present on input is overwritten by resolveWebhookDeprecationWindow.
 	//
-	// Set both this and WebhookDeprecationSunsetDate and they must agree to the
-	// second, or configuration is refused. Set only this one and the sunset is
-	// derived. Set only the sunset and it is used as given — an operator who states
-	// the retirement instant directly is not forced to back-calculate a start.
-	WebhookDeprecationStartDate string `json:"webhook_deprecation_start_date" envconfig:"WEBHOOK_DEPRECATION_START_DATE"`
+	// It carries no envconfig tag on purpose. Requirement R-10 freezes the deployment
+	// contract at eight environment variables, of which exactly one describes this
+	// window — WEBHOOK_DEPRECATION_SUNSET_DATE. A second variable for the other end
+	// was a genuine convenience and still a contract violation, and it bought nothing
+	// that could not be derived: the window is exactly
+	// WebhookDualDeliveryWindowDays long by definition, so either end determines the
+	// other and the sunset is the end the requirement names.
+	//
+	// Deriving rather than accepting also removes a whole class of misconfiguration.
+	// Two independently settable ends can disagree, which previously had to be
+	// detected and refused; one settable end cannot, so "exactly 30 days" is a
+	// property of the arithmetic instead of a rule that has to be enforced.
+	//
+	// The field remains exported because the window's opening instant is worth
+	// reading — the migration documentation and the dual-delivery logging both state
+	// it — and because a derived value nobody can see is a value nobody can check.
+	WebhookDeprecationStartDate string `json:"webhook_deprecation_start_date"`
 
+	// AN R-10 CONTRACT VARIABLE, and the ONLY one describing the dual-delivery window.
 	// WebhookDeprecationSunsetDate is the RFC3339 instant at which the legacy HTTP
 	// webhook transport is retired. Before it, Kafka publishing and legacy webhook
 	// delivery run concurrently from the same outbox rows; from it onwards Kafka is
 	// the only transport and the deprecated webhook routes answer 410 Gone.
 	//
-	// IT IS NOT ADVISORY. A value that will not parse is a fatal configuration error,
-	// and so is leaving the whole window unset while Kafka publishing is enabled.
-	// Both used to be warnings, and both were wrong: a mis-typed date meant the
-	// legacy HTTP transport kept running forever with nothing failing, which is the
-	// deprecated, less protected of the two transports and precisely the one a
-	// migration exists to switch off. Refusing to start is loud, immediate and
-	// impossible to overlook, and the operator sees it before any traffic is served.
+	// A VALUE THAT WILL NOT PARSE IS FATAL. An operator who states a retirement
+	// instant and mis-types it would otherwise get the silent resolution "keep the
+	// legacy behaviour", so a single typo keeps the deprecated, less protected of the
+	// two transports alive indefinitely with nothing failing and nothing to notice.
+	// Refusing to start is the only signal that cannot be overlooked, and it happens
+	// before any traffic is served.
 	//
-	// The window may legitimately be left entirely unset on a deployment that has NO
-	// Kafka brokers configured. There is nothing to migrate to there, so there is no
-	// window to describe.
+	// LEAVING IT UNSET IS A WARNING, not an error, with or without brokers
+	// configured. Nothing has been mis-stated in that case — a retirement date simply
+	// has not been chosen yet — and AAP §0.7.2 requires a deployment to keep starting
+	// and serving as Kafka configuration is introduced. Failing the load would make
+	// adding KAFKA_BROKERS, on its own a safe additive change, an outage, which
+	// pressures an operator to back the migration out rather than finish it. The
+	// consequence of no date is that dual delivery continues, which is the
+	// pre-existing behaviour and is safe for subscribers.
+	//
+	// The other end of the window is DERIVED from this one — see
+	// WebhookDeprecationStartDate — so there is no second value to keep in step and
+	// the window is exactly WebhookDualDeliveryWindowDays long by construction.
 	//
 	// Being a top-level field, it accumulates no intermediate prefix segment, so both
 	// the mandated bare WEBHOOK_DEPRECATION_SUNSET_DATE and the house-convention
@@ -846,7 +1042,6 @@ func applyPrefixedEnvAliases(cnf *Configuration) error {
 		"KAFKA_TLS_CERT_FILE":             &cnf.Kafka.TLS.CertFile,
 		"KAFKA_TLS_KEY_FILE":              &cnf.Kafka.TLS.KeyFile,
 		"KAFKA_TLS_SERVER_NAME":           &cnf.Kafka.TLS.ServerName,
-		"WEBHOOK_DEPRECATION_START_DATE":  &cnf.WebhookDeprecationStartDate,
 		"WEBHOOK_DEPRECATION_SUNSET_DATE": &cnf.WebhookDeprecationSunsetDate,
 	}
 	for name, target := range stringAliases {
@@ -861,6 +1056,7 @@ func applyPrefixedEnvAliases(cnf *Configuration) error {
 		"RELAY_MAX_RETRY_ATTEMPTS":    &cnf.Relay.MaxRetryAttempts,
 		"RELAY_RETRY_BASE_BACKOFF_MS": &cnf.Relay.RetryBaseBackoffMS,
 		"RELAY_RETRY_MAX_BACKOFF_MS":  &cnf.Relay.RetryMaxBackoffMS,
+		"RELAY_EVENT_RETENTION_DAYS":  &cnf.Relay.EventRetentionDays,
 	}
 	for name, target := range intAliases {
 		key := envAliasPrefix + name
@@ -880,6 +1076,7 @@ func applyPrefixedEnvAliases(cnf *Configuration) error {
 		"KAFKA_TLS_INSECURE_SKIP_VERIFY": &cnf.Kafka.TLS.InsecureSkipVerify,
 		"KAFKA_INSECURE_LOCAL_DEV":       &cnf.Kafka.InsecureLocalDev,
 		"KAFKA_ALLOW_PARTITION_GROWTH":   &cnf.Kafka.AllowPartitionGrowth,
+		"KAFKA_ALLOW_ADMIN_PRODUCER":     &cnf.Kafka.AllowAdminProducer,
 	}
 	for name, target := range boolAliases {
 		key := envAliasPrefix + name
@@ -944,6 +1141,14 @@ func (cnf *Configuration) validateAndAddDefaults() error {
 
 	cnf.validateRelayRetryWindow()
 	cnf.warnOnInsecureKafkaTransport()
+	cnf.warnOnUnusableSubscriberBrokers()
+
+	// AFTER setDefaultValues, so the default prefix has been filled and this validates
+	// the value that will actually be used, and BEFORE the SASL check so a configuration
+	// with two faults reports the one that would silently swallow events first.
+	if err := cnf.validateKafkaTopicPrefix(); err != nil {
+		return err
+	}
 
 	if err := cnf.validateKafkaSASLCredentials(); err != nil {
 		return err
@@ -952,111 +1157,80 @@ func (cnf *Configuration) validateAndAddDefaults() error {
 	return nil
 }
 
-// resolveWebhookDeprecationWindow validates the dual-delivery window and derives
-// whichever end of it was left out.
+// resolveWebhookDeprecationWindow validates the dual-delivery window and derives its
+// opening instant from its closing one.
 //
-// It FAILS THE CONFIGURATION LOAD rather than warning, and that is the whole point
-// of the function. The sunset date drives two security-relevant behaviours — whether
-// the legacy HTTP transport still runs, and whether the deprecated webhook
-// management routes still answer — and both of them previously defaulted to "keep
-// the legacy behaviour" for an unset or mis-typed value. A single typo therefore
-// kept the deprecated transport alive indefinitely with nothing failing and nothing
-// to notice. Refusing to start is the only signal an operator cannot overlook, and
-// it happens before any traffic is served.
+// There is exactly ONE input: WebhookDeprecationSunsetDate. The window is
+// WebhookDualDeliveryWindowDays long by definition, so the start is arithmetic rather
+// than configuration, and "exactly 30 days" cannot be got wrong because there is no
+// second value to disagree with. Requirement R-10 names the sunset and only the
+// sunset, which is also why the other end carries no environment variable.
 //
 // The rules, in the order they are applied:
 //
-//  1. Both dates blank. Valid ONLY when no Kafka broker is configured: there is no
-//     Kafka to migrate to, so there is no window to describe and the legacy
-//     transport is simply the only transport. With brokers configured this is an
-//     error, because dual delivery would otherwise run forever.
-//  2. A date that will not parse as RFC3339. Always an error, for either end.
-//  3. Only the start given. The sunset is DERIVED as start + exactly
-//     WebhookDualDeliveryWindowDays, which is how "exactly 30 days" becomes a
-//     property of the code instead of an operator's arithmetic.
-//  4. Both given. They must be exactly WebhookDualDeliveryWindowDays apart, to the
-//     second, or the configuration is refused. A window that is silently 14 or 45
-//     days long contradicts what subscribers were told.
-//  5. Only the sunset given. Used verbatim, and the start is back-filled from it so
-//     both ends are available to describe the window.
+//  1. A sunset that will not parse as RFC3339 is a FATAL error. This one stays fatal
+//     deliberately. The date drives two security-relevant behaviours — whether the
+//     legacy HTTP transport still runs, and whether the deprecated webhook management
+//     routes still answer — and a mis-typed value silently resolves to "keep the
+//     legacy behaviour", so a single typo would keep the deprecated, less protected
+//     transport alive indefinitely with nothing failing and nothing to notice. An
+//     operator stated an intent here and got it wrong; refusing to start is the only
+//     signal they cannot overlook, and it happens before any traffic is served.
 //
-// Every value written back is normalised to RFC3339 in UTC, so the stored strings
-// are canonical however they were supplied.
+//  2. A blank sunset is a WARNING, not an error, whether or not brokers are
+//     configured. Refusing to start in this case was wrong for a different reason
+//     than case 1 is right: nothing was mis-stated, the operator simply has not set a
+//     retirement date yet, and AAP §0.7.2 requires a deployment to keep starting and
+//     serving as Kafka configuration is introduced. Failing the load turns adding
+//     KAFKA_BROKERS — on its own a safe, additive change — into an outage, which
+//     makes an operator likelier to back the whole migration out than to complete it.
+//     The consequence of no date is that dual delivery continues, which is the
+//     PRE-EXISTING behaviour and is safe for subscribers; it is loud in the log and
+//     it changes nothing about how traffic is served.
+//
+//  3. A parseable sunset. Used verbatim and normalised to RFC3339 in UTC, with the
+//     start back-filled as sunset minus the window so both ends are available to
+//     describe it.
 //
 // Returns:
-//   - error: non-nil when the window is unparseable, inconsistent, or absent while
-//     Kafka publishing is enabled.
+//   - error: non-nil only when the sunset date is present and unparseable.
 func (cnf *Configuration) resolveWebhookDeprecationWindow() error {
-	rawStart := strings.TrimSpace(cnf.WebhookDeprecationStartDate)
 	rawSunset := strings.TrimSpace(cnf.WebhookDeprecationSunsetDate)
 
-	if rawStart == "" && rawSunset == "" {
-		if len(cnf.Kafka.Brokers) > 0 {
-			return errors.New(
-				"webhook_deprecation_sunset_date is required when kafka brokers are configured: " +
-					"set WEBHOOK_DEPRECATION_SUNSET_DATE to the RFC3339 instant the legacy HTTP webhook " +
-					"transport is retired, or set WEBHOOK_DEPRECATION_START_DATE and let the " +
-					"30-day dual-delivery window derive it. Without one of them the deprecated HTTP " +
-					"transport would run indefinitely alongside Kafka",
-			)
-		}
-
-		// No Kafka, no migration, no window. Both ends stay empty.
+	if rawSunset == "" {
+		// No date, no window. The start is cleared too, so a value that arrived from a
+		// configuration file cannot survive as a window with only one end.
 		cnf.WebhookDeprecationStartDate = ""
 		cnf.WebhookDeprecationSunsetDate = ""
+
+		if len(cnf.Kafka.Brokers) > 0 {
+			logrus.WithFields(logrus.Fields{
+				"variable":    "WEBHOOK_DEPRECATION_SUNSET_DATE",
+				"window_days": WebhookDualDeliveryWindowDays,
+			}).Warn(
+				"kafka brokers are configured but no webhook deprecation sunset date is set, so " +
+					"legacy HTTP webhook delivery will run alongside Kafka INDEFINITELY and the " +
+					"deprecated webhook routes will keep answering. Set the sunset date to the " +
+					"RFC3339 instant the legacy transport retires",
+			)
+		}
 
 		return nil
 	}
 
-	var start, sunset time.Time
-
-	if rawStart != "" {
-		parsed, err := time.Parse(time.RFC3339, rawStart)
-		if err != nil {
-			return fmt.Errorf(
-				"webhook_deprecation_start_date %q is not a valid RFC3339 instant (expected %s): %w",
-				rawStart, time.RFC3339, err,
-			)
-		}
-		start = parsed.UTC()
-	}
-
-	if rawSunset != "" {
-		parsed, err := time.Parse(time.RFC3339, rawSunset)
-		if err != nil {
-			return fmt.Errorf(
-				"webhook_deprecation_sunset_date %q is not a valid RFC3339 instant (expected %s): %w",
-				rawSunset, time.RFC3339, err,
-			)
-		}
-		sunset = parsed.UTC()
-	}
-
-	switch {
-	case rawSunset == "":
-		sunset = start.Add(webhookDualDeliveryWindow)
-		logrus.WithFields(logrus.Fields{
-			"start":       start.Format(time.RFC3339),
-			"sunset":      sunset.Format(time.RFC3339),
-			"window_days": WebhookDualDeliveryWindowDays,
-		}).Info("derived the webhook deprecation sunset from the configured window start")
-
-	case rawStart == "":
-		start = sunset.Add(-webhookDualDeliveryWindow)
-
-	case !sunset.Equal(start.Add(webhookDualDeliveryWindow)):
+	sunset, err := time.Parse(time.RFC3339, rawSunset)
+	if err != nil {
 		return fmt.Errorf(
-			"webhook deprecation window must be exactly %d days: start %s implies sunset %s, "+
-				"but webhook_deprecation_sunset_date is %s. Correct one of the two, or set only "+
-				"webhook_deprecation_start_date and let the sunset be derived",
-			WebhookDualDeliveryWindowDays,
-			start.Format(time.RFC3339),
-			start.Add(webhookDualDeliveryWindow).Format(time.RFC3339),
-			sunset.Format(time.RFC3339),
+			"webhook_deprecation_sunset_date %q is not a valid RFC3339 instant (expected %s): %w",
+			rawSunset, time.RFC3339, err,
 		)
 	}
 
-	cnf.WebhookDeprecationStartDate = start.Format(time.RFC3339)
+	sunset = sunset.UTC()
+
+	// DERIVED, never read as input. Whatever the field held is replaced, which is what
+	// makes the window's length a property of this arithmetic rather than a rule.
+	cnf.WebhookDeprecationStartDate = sunset.Add(-webhookDualDeliveryWindow).Format(time.RFC3339)
 	cnf.WebhookDeprecationSunsetDate = sunset.Format(time.RFC3339)
 
 	return nil
@@ -1092,6 +1266,35 @@ func (cnf *Configuration) warnOnInsecureKafkaTransport() {
 				"indistinguishable from the real one. Configure kafka.tls.ca_file instead.",
 		)
 	}
+}
+
+// warnOnUnusableSubscriberBrokers reports at STARTUP that credential issuance will refuse.
+//
+// KAFKA_SUBSCRIBER_BROKERS is not required for Blnk to run — a deployment may configure Kafka
+// and never issue a subscriber credential — so an absent list cannot be a startup error. But
+// discovering it at the first issuance means discovering it from a 503 during an operator's
+// onboarding of a real subscriber, which is the worst moment to learn about a variable.
+//
+// It is a WARNING and not silence for the same reason the insecure-transport notices are: the
+// setting's absence changes what an endpoint does, and that belongs in the log an operator
+// reads at boot. It says nothing at all when no broker is configured, because then there is no
+// Kafka and no issuance to refuse.
+func (cnf *Configuration) warnOnUnusableSubscriberBrokers() {
+	if len(cnf.Kafka.Brokers) == 0 {
+		return
+	}
+
+	if _, configured := cnf.Kafka.SubscriberFacingBrokers(); configured {
+		return
+	}
+
+	logrus.Warn(
+		"KAFKA_SUBSCRIBER_BROKERS is not configured: POST /subscribers/{id}/kafka-credentials " +
+			"will refuse with 503 rather than report the internal broker addresses Blnk dials, " +
+			"which do not resolve for an external subscriber. Set it to the externally advertised " +
+			"broker addresses subscribers connect to — the same value as KAFKA_BROKERS when " +
+			"subscribers run inside the deployment.",
+	)
 }
 
 // validateKafkaSASLCredentials refuses a half-configured administrative SASL
@@ -1386,6 +1589,13 @@ func (cnf *Configuration) setKafkaDefaults() {
 		cnf.Kafka.ReplicationFactor = defaultKafka.ReplicationFactor
 	}
 	cnf.Kafka.Brokers = normalizeBrokers(cnf.Kafka.Brokers)
+	// NOT DEFAULTED TO Brokers, deliberately. Falling back would hand every subscriber
+	// Blnk's internal broker addresses in a 200 response, which is the failure
+	// SubscriberBrokers exists to prevent; issuance refuses instead. Normalised the same
+	// way so that KAFKA_SUBSCRIBER_BROKERS="" and "," — both of which envconfig parses into
+	// a non-empty slice carrying nothing usable — read as "not configured" rather than as a
+	// list of blank endpoints.
+	cnf.Kafka.SubscriberBrokers = normalizeBrokers(cnf.Kafka.SubscriberBrokers)
 
 	// Credentials are trimmed here rather than in trimWhitespace because a stray
 	// newline from an environment file turns a correct SASL username into one the
@@ -1432,7 +1642,6 @@ func (cnf *Configuration) setKafkaDefaults() {
 	}
 
 	cnf.warnOnUnusableKafkaTopicGeometry()
-	cnf.warnOnIllegalKafkaTopicPrefix()
 }
 
 // warnOnUnusableKafkaTopicGeometry reports a topic geometry that will be silently
@@ -1489,66 +1698,142 @@ const kafkaTopicNameCutset = "abcdefghijklmnopqrstuvwxyz" +
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
 	"0123456789._-"
 
-// warnOnIllegalKafkaTopicPrefix reports a topic prefix that cannot compose a legal Kafka
+// MaxKafkaTopicNameLength is the longest topic name a Kafka broker will accept.
+//
+// It is Kafka's own limit, not a Blnk policy, and it bounds the COMPOSED name rather
+// than the prefix: a broker refuses `CreateTopics` outright for anything longer, so a
+// prefix that fits but whose composed `<prefix>.transactions.dlt` does not would pass
+// configuration and then fail every topic assurance.
+const MaxKafkaTopicNameLength = 249
+
+// maxComposedTopicSuffixLength is the length of the LONGEST suffix event_topics.go
+// appends to the prefix — ".transactions" plus the ".dlt" dead-letter sibling, 17
+// characters. Reserving it here is what makes the prefix budget below correct for
+// every name in the catalogue rather than only for the shortest one.
+//
+// Keep it in step with event_topics.go: a longer category name added there without a
+// matching change here would let a prefix through that composes an over-long topic.
+const maxComposedTopicSuffixLength = len(".transactions") + len(DeadLetterTopicSuffixForValidation)
+
+// DeadLetterTopicSuffixForValidation duplicates event_topics.go's DeadLetterTopicSuffix
+// so that this package can size the prefix budget without importing the root package,
+// which imports this one. It is validated against the real constant by
+// TestKafkaTopicPrefixBudgetMatchesTopicSuffix in the root package's tests.
+const DeadLetterTopicSuffixForValidation = ".dlt"
+
+// MaxKafkaTopicPrefixLength is the longest KAFKA_TOPIC_PREFIX that can compose a legal
+// topic name for every category in the catalogue.
+const MaxKafkaTopicPrefixLength = MaxKafkaTopicNameLength - maxComposedTopicSuffixLength
+
+// validateKafkaTopicPrefix REFUSES a topic prefix that cannot compose a legal Kafka
 // topic name.
 //
-// # What is and is not corrected
+// # Why this is fatal rather than a warning
 //
-// Leading and trailing whitespace and separators are stripped by the topic composer, and a
-// blank prefix falls back to the default, so the realistic accidents — a trailing newline
-// in an environment file, a lone dot — are already handled and are not reported here.
+// It used to warn and then use the value anyway. That is the worst of the three
+// available behaviours, and not a conservative middle ground:
 //
-// An INTERIOR illegal character is different. The composer deliberately leaves it alone,
-// because silently rewriting a prefix would produce topic names the operator never asked
-// for and never sees; the broker then refuses the name loudly at topic creation. That is
-// the correct end state, but it arrives at the moment Kafka is first used, which for a
-// deployment with no event traffic in flight can be long after start-up and a long way from
-// the variable that caused it. Naming the offending characters while configuration is being
-// loaded is what turns "InvalidTopicException" later into an actionable line in the boot
-// log.
+//   - EVENTS ARE LOST-IN-PLACE, not rejected. Producers keep capturing outbox rows
+//     whose `topic` column names a topic the broker will never create, so every one of
+//     them exhausts its retry budget and dead-letters — onto a dead-letter topic whose
+//     name is equally illegal, so the dead-letter write fails too and the row sits in
+//     `failed` forever. A ledger accepts mutations and silently stops notifying anyone.
+//   - THE PREFIX REACHES A LOG LINE UNSANITISED. The warning interpolated the configured
+//     value straight into a structured log message, so a prefix carrying newlines or
+//     ANSI control sequences could forge log records — the classic log-injection sink,
+//     reachable by anyone who can set an environment variable on the process.
+//   - The broker's own refusal, which the warning deferred to, arrives at first Kafka
+//     use. For a deployment with no event traffic at boot that can be hours later and a
+//     long way from the variable that caused it.
 //
-// It stays a WARNING rather than becoming fatal, for the same reason as every other Kafka
-// diagnostic here, and because the broker remains the authority on what it will accept: a
-// future Kafka that widened its character set must not be unreachable because this file
-// refused to boot.
-func (cnf *Configuration) warnOnIllegalKafkaTopicPrefix() {
-	// The composer's own normalisation, applied first so nothing it strips is reported.
+// Refusing at load is therefore strictly better on every axis: nothing is captured that
+// cannot be delivered, no attacker-influenced value is logged, and the failure names the
+// variable at the moment it is read.
+//
+// # What is corrected and what is refused
+//
+// Leading and trailing whitespace and separators are stripped, and a blank prefix falls
+// back to the default, so the realistic accidents — a trailing newline in an environment
+// file, a lone dot — are accepted and normalised. That normalisation is applied to the
+// stored value here, so what this function validates is exactly what event_topics.go will
+// compose from.
+//
+// An INTERIOR character outside Kafka's set, or a prefix too long to leave room for the
+// longest composed suffix, is refused. The message names the offending characters as Go
+// quoted runes, so a control character is reported as `'\x00'` rather than emitted.
+//
+// Returns:
+//   - error: nil when the prefix can compose legal topic names for every category.
+func (cnf *Configuration) validateKafkaTopicPrefix() error {
+	// The composer's own normalisation, applied to the STORED value so that the prefix
+	// this validates is the prefix that will be used. topicPrefixFrom in event_topics.go
+	// trims the same cutset; doing it here as well means the two cannot disagree.
 	prefix := strings.Trim(cnf.Kafka.TopicPrefix, " \t\n\v\f\r.")
 	if prefix == "" {
-		return
+		// Blank resolves to the default downstream. Leaving the field as configured would
+		// make the effective prefix depend on which code path read it, so it is set here.
+		cnf.Kafka.TopicPrefix = defaultKafka.TopicPrefix
+
+		return nil
+	}
+	cnf.Kafka.TopicPrefix = prefix
+
+	if len(prefix) > MaxKafkaTopicPrefixLength {
+		return fmt.Errorf(
+			"KAFKA_TOPIC_PREFIX is %d characters, which is longer than the %d a topic prefix may "+
+				"be: Kafka refuses any topic name over %d characters and the longest name composed "+
+				"from the prefix is \"<prefix>.transactions%s\"",
+			len(prefix), MaxKafkaTopicPrefixLength, MaxKafkaTopicNameLength,
+			DeadLetterTopicSuffixForValidation,
+		)
 	}
 
-	illegal := map[rune]struct{}{}
+	seen := map[rune]struct{}{}
 	var offenders []string
 	for _, char := range prefix {
 		if strings.ContainsRune(kafkaTopicNameCutset, char) {
 			continue
 		}
-		if _, seen := illegal[char]; seen {
+		if _, already := seen[char]; already {
 			continue
 		}
-		illegal[char] = struct{}{}
+		seen[char] = struct{}{}
+		// QuoteRune, never the raw rune: this string reaches an error message and from
+		// there a log record, and the whole point of refusing the value is that it may
+		// carry newlines or terminal control sequences.
 		offenders = append(offenders, strconv.QuoteRune(char))
 	}
 
 	if len(offenders) == 0 {
-		return
+		return nil
 	}
 
-	logrus.WithFields(logrus.Fields{
-		"topic_prefix":       prefix,
-		"illegal_characters": strings.Join(offenders, ", "),
-		"example_topic":      prefix + ".transactions",
-	}).Warn(
-		"KAFKA_TOPIC_PREFIX contains characters Kafka does not permit in a topic name " +
-			"(only letters, digits, '.', '_' and '-' are legal); every topic composed from it " +
-			"will be refused by the broker, so topic assurance, event publishing and subscriber " +
-			"provisioning will all fail",
+	return fmt.Errorf(
+		"KAFKA_TOPIC_PREFIX contains %d character(s) Kafka does not permit in a topic name "+
+			"(%s); only letters, digits, '.', '_' and '-' are legal, and every topic composed "+
+			"from this prefix would be refused by the broker, so events would be captured and "+
+			"never delivered",
+		len(offenders), strings.Join(offenders, ", "),
 	)
 }
 
-// ProducerSASL returns the SASL identity the steady-state event publisher should
-// authenticate as, and reports whether it is the ADMINISTRATIVE identity.
+// ErrProducerPrincipalRequired reports that a deployment configured an ADMINISTRATIVE
+// Kafka principal but no dedicated producer principal.
+//
+// It is exported so the publisher's construction path can classify the failure and so a
+// test can assert on it with errors.Is rather than on message text.
+var ErrProducerPrincipalRequired = errors.New(
+	"a dedicated Kafka producer principal is required: set KAFKA_SASL_USER and " +
+		"KAFKA_SASL_SECRET. The event publisher must not authenticate with " +
+		"KAFKA_SASL_ADMIN_USER, which can create topics, mint SCRAM credentials and " +
+		"rewrite ACLs, because publishing every ledger event as that principal turns a " +
+		"leaked producer credential into full control of the cluster's authorization " +
+		"state. Provision a producer principal with Write and Describe on the Blnk-owned " +
+		"topics only",
+)
+
+// ProducerSASL returns the SASL identity the steady-state event publisher must
+// authenticate as, and reports the one misconfiguration that has no safe answer.
 //
 // It exists so that "which credential does the producer use?" is answered in exactly
 // one place. The publisher and the administrative client used to reach into the
@@ -1556,18 +1841,26 @@ func (cnf *Configuration) warnOnIllegalKafkaTopicPrefix() {
 // administrator: nothing in either call site was wrong on its own, and no single
 // place expressed the intent that they should differ.
 //
-// The fallback to the administrative principal is deliberate and is not silent. An
-// existing deployment that configured only KAFKA_SASL_ADMIN_USER keeps working — no
-// upgrade breaks event publishing — but the caller is told, through the boolean, that
-// it is about to hand cluster-administration authority to a process that only needs
-// to write to four topics, and it warns.
+// # There is NO fallback to the administrative principal (PRIV-01)
+//
+// This method used to return the administrative pair when no producer pair was set, so
+// that an existing deployment kept publishing across an upgrade. That compatibility
+// path was the vulnerability rather than a mitigation of it: the busiest process in the
+// deployment held cluster-administration authority permanently, a leaked producer
+// credential became a full compromise of the authorization model, and the broker's audit
+// trail could not tell routine publishing from administration. A warning does not change
+// any of that — it only records it — and a warning nobody reads is how a temporary
+// allowance becomes the permanent configuration.
+//
+// So the administrative pair is never returned here. When it is the only pair configured,
+// adminOnly is true and the caller must REFUSE to build a producer transport.
 //
 // Returns:
-//   - user, secret string: the credentials to authenticate with. Both empty means no
-//     SASL at all, which is legitimate on a broker that requires none.
-//   - usingAdmin bool: true when the returned pair is the administrative principal
-//     because no dedicated producer principal is configured.
-func (cnf *Configuration) ProducerSASL() (user, secret string, usingAdmin bool) {
+//   - user, secret string: the dedicated producer credentials. Both empty means no SASL
+//     at all, which is legitimate on a broker that requires none.
+//   - adminOnly bool: true when an administrative principal is configured and no producer
+//     principal is. The caller must treat this as fatal, not as a credential to use.
+func (cnf *Configuration) ProducerSASL() (user, secret string, adminOnly bool) {
 	if cnf.Kafka.SASLUser != "" || cnf.Kafka.SASLSecret != "" {
 		return cnf.Kafka.SASLUser, cnf.Kafka.SASLSecret, false
 	}
@@ -1576,7 +1869,7 @@ func (cnf *Configuration) ProducerSASL() (user, secret string, usingAdmin bool) 
 		return "", "", false
 	}
 
-	return cnf.Kafka.SASLAdminUser, cnf.Kafka.SASLAdminSecret, true
+	return "", "", true
 }
 
 // SASLAdminCredentials is THE one reading of the ADMINISTRATIVE SASL/SCRAM
@@ -1626,6 +1919,35 @@ func (k KafkaConfig) SASLAdminCredentials() (user, secret string, enabled bool) 
 	}
 
 	return user, secret, true
+}
+
+// SubscriberFacingBrokers returns the bootstrap list to HAND TO A SUBSCRIBER, and reports
+// whether one is configured at all.
+//
+// It exists so that the single question "what do I tell this subscriber to connect to?" has
+// one answer in one place. The tempting implementation — return SubscriberBrokers when set
+// and Brokers otherwise — is precisely the bug SubscriberBrokers was added to remove: the
+// fallback is silent, so the response is a 200 carrying an address the subscriber cannot
+// resolve, and the diagnosis lands days later in somebody else's logs.
+//
+// The returned slice is a COPY. The configuration is shared through an atomic.Value and read
+// concurrently, so handing out the backing array would let a caller that appends to its
+// result mutate what every later reader sees.
+//
+// Returns:
+//   - brokers []string: a copy of the subscriber-facing list, nil when none is configured.
+//   - configured bool: false when the list is empty, which callers must treat as a refusal
+//     to issue rather than as a reason to substitute the internal list.
+func (k KafkaConfig) SubscriberFacingBrokers() (brokers []string, configured bool) {
+	normalized := normalizeBrokers(k.SubscriberBrokers)
+	if len(normalized) == 0 {
+		return nil, false
+	}
+
+	brokers = make([]string, len(normalized))
+	copy(brokers, normalized)
+
+	return brokers, true
 }
 
 // ValidateSASLAdminCredentials reports a half-configured administrative credential.
@@ -1776,6 +2098,45 @@ func (cnf *Configuration) setRelayDefaults() {
 	if cnf.Relay.RetryMaxBackoffMS == 0 {
 		cnf.Relay.RetryMaxBackoffMS = defaultRelay.RetryMaxBackoffMS
 	}
+
+	// RETENTION IS NOT DEFAULTED, and the asymmetry with the three values above is the
+	// point. Those three have a correct answer that requirement R-4 fixes, so an unset
+	// value is filled in. A retention period has no correct answer this code can know —
+	// it depends on jurisdiction, audit programme and any legal hold in force — and
+	// getting it wrong deletes ledger-adjacent evidence. So zero is left as zero and
+	// means "retention disabled", which is the only safe default for a destructive
+	// operation.
+	//
+	// A NEGATIVE value is refused rather than honoured. Read literally it is a cutoff in
+	// the FUTURE, which would delete every terminal row including ones delivered seconds
+	// ago — the most destructive possible reading of what is almost certainly a typo.
+	if cnf.Relay.EventRetentionDays < 0 {
+		logrus.WithFields(logrus.Fields{
+			"configured": cnf.Relay.EventRetentionDays,
+			"variable":   "RELAY_EVENT_RETENTION_DAYS",
+		}).Warn(
+			"relay event_retention_days is negative, which would place the retention cutoff in the " +
+				"future and delete every delivered event; retention is being disabled instead",
+		)
+		cnf.Relay.EventRetentionDays = 0
+	}
+}
+
+// EventRetentionPeriod returns the configured retention period as a duration, and zero
+// when retention is disabled.
+//
+// It exists so no caller multiplies days by hours itself. Two callers doing that
+// arithmetic separately is how one of them ends up an order of magnitude out, and the
+// consequence here is deleted ledger evidence rather than a wrong number on a dashboard.
+//
+// Returns:
+//   - time.Duration: the retention period, or 0 when retention is disabled.
+func (cnf *Configuration) EventRetentionPeriod() time.Duration {
+	if cnf == nil || cnf.Relay.EventRetentionDays <= 0 {
+		return 0
+	}
+
+	return time.Duration(cnf.Relay.EventRetentionDays) * 24 * time.Hour
 }
 
 func (cnf *Configuration) trimWhitespace() {

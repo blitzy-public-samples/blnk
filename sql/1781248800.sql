@@ -214,7 +214,10 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- DDL is what the repository layer's queries are written against:
     --
     --   pending ──claimed──▶ processing ──broker ack──▶ dispatched
-    --      │                     │                     (dispatched_at set)
+    --      │                     │        │            (dispatched_at set)
+    --      │                     │        └──legacy leg still owed──▶ webhook_pending
+    --      │                     │                                        │
+    --      │                     │            (re-claimed; Kafka NOT republished)
     --      └──budget exhausted───┴──▶ failed ──written to <topic>.dlt──▶ dead_lettered
     --
     -- 'dispatched' and 'dead_lettered' are the terminal states, and only a
@@ -224,11 +227,23 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- terminal is named 'dispatched' rather than lineage's 'completed' so it
     -- matches the dispatched_at column and this pipeline's language;
     -- 'dead_lettered' has no lineage equivalent at all. The Go-side declaration
-    -- site for all five literals is model.EventOutboxStatus*.
+    -- site for every literal is model.EventOutboxStatus*.
     --
-    -- Deliberately NO CHECK constraint. blnk.lineage_outbox has none either, and
-    -- a CHECK would turn every future addition to the state machine into a
-    -- schema migration.
+    -- 'webhook_pending' is the DUAL-DELIVERY state and, like the two columns in
+    -- group 3, it disappears at the sunset. It means: the Kafka leg is published
+    -- and recorded in kafka_dispatched_at, and the legacy HTTP leg is still owed.
+    -- Without it the two legs shared one terminal state, so a row whose Kafka
+    -- publish succeeded was marked dispatched even when its webhook enqueue had
+    -- failed — and because the claim predicate excludes dispatched rows, that
+    -- webhook was never retried and never delivered. The state is claimable and,
+    -- because kafka_dispatched_at is set, a re-claim delivers ONLY the webhook leg.
+    --
+    -- The CHECK below enumerates the vocabulary. It is the one place a typo'd
+    -- literal is caught, and it matters more here than on blnk.lineage_outbox
+    -- because this state machine has more states and every query selects on
+    -- specific ones: a row in an unrecognised state is an event nothing will ever
+    -- look at again. Adding a state means editing the constraint, which is the
+    -- intended friction.
     status              TEXT                      NOT NULL DEFAULT 'pending',
 
     -- Publish attempts made so far, and the budget for them. The default of 5
@@ -332,6 +347,75 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- later migration once no dual-delivery row remains of interest.
     webhook_dispatched  BOOLEAN                   NOT NULL DEFAULT FALSE,
 
+    -- When the BROKER acknowledged the Kafka publish, recorded independently of
+    -- dispatched_at — and the column that makes the two legs' fates independent.
+    --
+    -- dispatched_at means "this row is finished". kafka_dispatched_at means "the
+    -- Kafka leg of this row is finished", which during the dual-delivery window is
+    -- a strictly weaker statement, because the legacy leg may still be owed. They
+    -- were once the same column, and the consequence was severe: a row whose Kafka
+    -- publish succeeded and whose webhook enqueue failed was marked dispatched
+    -- anyway, leaving the webhook leg undeliverable forever with only a warning to
+    -- show for it.
+    --
+    -- Its second job is to make a re-claim safe. A claimed row carrying a non-NULL
+    -- value here has ALREADY been published, so the relay skips the publish and
+    -- delivers only the outstanding webhook — which is what stops the retry of a
+    -- deprecated-transport failure from putting a duplicate on the Kafka topic.
+    --
+    -- Set on the ordinary success path too, not only in the webhook_pending case,
+    -- so the column answers "was this event published to Kafka, and when" for
+    -- every row rather than only for the ones that took the unusual path.
+    --
+    -- Vestigial after the sunset, exactly like webhook_dispatched.
+    kafka_dispatched_at TIMESTAMP WITH TIME ZONE  NULL,
+
+    -- Legacy webhook ENQUEUE attempts made so far, counted separately from
+    -- attempts.
+    --
+    -- Separate because the two legs must not spend each other's budget. A webhook
+    -- receiver being down, or the queue being unreachable, must never consume a
+    -- Kafka retry attempt — that would let the deprecated transport dead-letter
+    -- events on the new one, which is precisely backwards. Bounded by the row's
+    -- own max_attempts so that a permanently unreachable queue cannot keep a row
+    -- claimable indefinitely: once the budget is spent the Kafka delivery is
+    -- recorded as final, the legacy leg is abandoned, and the reason is written to
+    -- last_error where an operator can find it.
+    --
+    -- Vestigial after the sunset, exactly like webhook_dispatched.
+    webhook_attempts    INT                       NOT NULL DEFAULT 0,
+
+    -- ===================================================================
+    -- Group 3b: the broker coordinate (OBS-02)
+    -- WHERE this row's record actually landed. All three are nullable and are
+    -- written and cleared TOGETHER, which the all-or-nothing check below enforces.
+    -- ===================================================================
+
+    -- The topic the record is on. Recorded explicitly rather than inferred from
+    -- status, because the destination differs by outcome: a dispatched row's record
+    -- is on `topic` and a dead-lettered row's is on `dlt_topic`. Storing the name
+    -- makes the coordinate self-describing, so an operator can paste it straight
+    -- into a console consumer.
+    kafka_topic         TEXT                      NULL,
+
+    -- The partition the broker assigned. For a keyed message this is determined by
+    -- partition_key, so it is stable across redeliveries of the same event.
+    kafka_partition     INT                       NULL,
+
+    -- The record's offset within that partition.
+    --
+    -- WHY THE COORDINATE IS STORED AT ALL. The zero-loss criterion (V-2) reconciles
+    -- this table against the broker. Done by COUNTING — records written against rows
+    -- claiming a publication — it cannot detect loss that duplicate surplus happens
+    -- to offset: ten lost events plus ten redeliveries produce exactly the totals of
+    -- a healthy pipeline, and the reconciliation reports no loss while ten events are
+    -- genuinely missing. Storing the coordinate replaces that subtraction with a
+    -- MAPPING: every row that claims a publication names the record it produced, the
+    -- unique index below refuses two rows the same record, and a row claiming a
+    -- publication with no coordinate is visible as unconfirmed rather than absorbed
+    -- into the surplus.
+    kafka_offset        BIGINT                    NULL,
+
     -- ===================================================================
     -- Group 4: the dead-letter record
     -- Both nullable: the overwhelming majority of rows never dead-letter, and
@@ -420,13 +504,49 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
         CHECK (attempts >= 0),
     CONSTRAINT event_outbox_max_attempts_positive
         CHECK (max_attempts >= 1),
+    -- The legacy leg's own counter is bounded by the same per-row budget, so a
+    -- permanently unreachable queue cannot keep a row claimable forever.
+    CONSTRAINT event_outbox_webhook_attempts_non_negative
+        CHECK (webhook_attempts >= 0),
+
+    -- The broker coordinate is all-or-nothing. A half-written coordinate is worse
+    -- than none: a reader testing only the offset would treat a row with no topic as
+    -- confirmed and then have nothing to look the record up with, so the audit's
+    -- confirmed count would include rows it cannot actually match.
+    CONSTRAINT event_outbox_broker_record_complete
+        CHECK (
+            (kafka_topic IS NULL AND kafka_partition IS NULL AND kafka_offset IS NULL)
+            OR (kafka_topic IS NOT NULL AND kafka_partition IS NOT NULL AND kafka_offset IS NOT NULL)
+        ),
+    -- Kafka numbers partitions from zero and offsets from zero, and both are
+    -- assigned by the broker, so a negative value can only come from a bug or from
+    -- one of kafka-go's own sentinels (-1 means "no offset") reaching a write path
+    -- that should have treated it as absent.
+    CONSTRAINT event_outbox_kafka_partition_non_negative
+        CHECK (kafka_partition IS NULL OR kafka_partition >= 0),
+    CONSTRAINT event_outbox_kafka_offset_non_negative
+        CHECK (kafka_offset IS NULL OR kafka_offset >= 0),
+    CONSTRAINT event_outbox_kafka_topic_not_blank_when_present
+        CHECK (kafka_topic IS NULL OR length(btrim(kafka_topic)) > 0),
 
     -- The status column drives the claim predicate, the partial indexes and every
     -- transition, so an unrecognised literal is not a cosmetic problem: a row in a
     -- state nothing selects for is a permanently invisible event. The list is the
     -- model.EventOutboxStatus* vocabulary, in state-machine order.
+    --
+    -- dlt_pending is the state a row enters the instant its retry budget is spent,
+    -- and it exists because "the budget is spent" and "the event is preserved
+    -- somewhere durable" are two different facts. Moving straight to failed made
+    -- the first imply the second: failed is outside the claim predicate, so a row
+    -- whose dead-letter write then failed — a broker outage, a cancelled context, a
+    -- process killed between the two — was terminal with the event existing NOWHERE
+    -- but this row, and no relay poll and no replay path could ever pick it up
+    -- again. dlt_pending is retryable by design: the hand-off is re-claimable once
+    -- the holder's lease expires, and only MarkEventDeadLettered — which runs after
+    -- the `<topic>.dlt` write is acknowledged — may declare the row terminal.
     CONSTRAINT event_outbox_status_known
-        CHECK (status IN ('pending', 'processing', 'dispatched', 'failed', 'dead_lettered', 'replaying'))
+        CHECK (status IN ('pending', 'processing', 'webhook_pending', 'dispatched', 'failed',
+                          'dead_lettered', 'replaying'))
 );
 
 -- The write-side exactly-once guard, load-bearing in two distinct ways.
@@ -460,9 +580,49 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_pending
 -- repository layer filters on: the planner can prove that status =
 -- 'dead_lettered' implies this predicate, and likewise for 'failed'. Restricting
 -- it to a single literal would silently drop the other query off the index.
+--
+-- IT HAS A SECOND CONSUMER, and narrowing it would take that one off the index
+-- too. ClaimExhaustedEventsForDeadLetter sweeps for rows left `failed` with the
+-- retry budget spent and dlt_topic still NULL — events whose dead-letter write
+-- never completed, which no other claim in the repository can reach — and it
+-- drives this index by (status, occurred_at), taking the remaining columns as a
+-- filter. That sweep runs on every relay tick, so an index scan here rather than
+-- a sequential one is what keeps it free on an outbox that has accumulated
+-- terminal rows.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_failed
     ON blnk.event_outbox (status, occurred_at)
-    WHERE status IN ('failed', 'dead_lettered');
+    WHERE status IN ('dlt_pending', 'failed', 'dead_lettered');
+
+-- The index behind the DEAD-LETTER HAND-OFF RECOVERY claim, which is what makes
+-- dlt_pending retryable rather than merely differently-named.
+--
+-- The query, run once per relay tick:
+--
+--   UPDATE blnk.event_outbox
+--   SET claim_token = $1, locked_until = NOW() + $2::interval, last_attempted_at = NOW()
+--   WHERE id IN (
+--       SELECT id FROM blnk.event_outbox
+--       WHERE status = 'dlt_pending'
+--         AND (locked_until IS NULL OR locked_until < NOW())
+--       ORDER BY occurred_at ASC
+--       LIMIT $3
+--       FOR UPDATE SKIP LOCKED
+--   )
+--   RETURNING <all columns>
+--
+-- The lease is what stops this claim racing the worker that is still performing the
+-- hand-off: a row is only re-claimable once the lease its original claim took has
+-- expired, so two workers cannot both write the same event to its dead-letter topic.
+-- Without the lease in the predicate, the fresh claim token this claim stamps would
+-- invalidate the original worker's token AFTER it had already published, and the
+-- duplicate would be undetectable.
+--
+-- It is partial on a state that is empty in steady state — a dlt_pending row means a
+-- dead-letter write is in flight or has just failed — so this index costs almost
+-- nothing to maintain and the recovery poll never touches the rest of the table.
+CREATE INDEX IF NOT EXISTS idx_event_outbox_dlt_pending
+    ON blnk.event_outbox (status, locked_until, occurred_at)
+    WHERE status = 'dlt_pending';
 
 -- The index the FIFO claim query drives, and the reason relay polling stays
 -- viable at 500 events per second. The query, run once per poll interval:
@@ -504,9 +664,13 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_failed
 -- during an outage — the entire backlog is not yet due — so leaving that column
 -- off the index would make the poll read and discard the whole retrying set on
 -- every lap, which is exactly the load the backoff exists to shed.
+-- 'webhook_pending' is in the predicate because it is part of the CLAIMABLE set: a
+-- row whose Kafka leg is done but whose legacy leg is still owed has to be picked up
+-- again, and a claim predicate the index did not cover would degrade the poll into a
+-- sequential scan during exactly the incident that produced those rows.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_claim
     ON blnk.event_outbox (status, locked_until, attempts, next_attempt_at, occurred_at)
-    WHERE status IN ('pending', 'processing');
+    WHERE status IN ('pending', 'processing', 'webhook_pending');
 
 -- Per-aggregate history in occurrence order. This is what makes the ordering
 -- guarantee auditable after the fact: given an aggregate, replay its events in
@@ -544,6 +708,14 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_aggregate
 -- undeliverable event would then stall every subsequent event for that aggregate
 -- indefinitely, which is a worse failure than a gap. Retries DO preserve order,
 -- because a retrying row returns to pending.
+--
+-- 'webhook_pending' is deliberately NOT here, and the asymmetry with the claim index
+-- above is the point. Ordering is a property of the KAFKA topic, and a webhook_pending
+-- row has already been published to it — its position in the partition is fixed and
+-- nothing it does subsequently can change it. Blocking its key would let a failing
+-- LEGACY enqueue stall Kafka delivery for the whole aggregate, which is the deprecated
+-- transport interfering with the new one. So such a row is claimable without being
+-- blocking: the outstanding webhook is retried while later events keep flowing.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_partition_key_inflight
     ON blnk.event_outbox (partition_key, occurred_at, id)
     WHERE status IN ('pending', 'processing');
@@ -572,6 +744,41 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_terminal_retention
     ON blnk.event_outbox (occurred_at)
     WHERE status IN ('dispatched', 'dead_lettered');
 
+-- The broker coordinate is UNIQUE, and that is a correctness guarantee rather
+-- than a performance one (OBS-02).
+--
+-- One record is produced by one acknowledged write of one row, so two rows can
+-- never legitimately name the same coordinate. Making the database refuse it turns
+-- the audit's "confirmed rows equals distinct records" check into a statement about
+-- an enforced invariant rather than a hopeful comparison: a duplicate would
+-- otherwise let two rows share one record's corroboration, which is the same
+-- double-counting the reconciliation exists to eliminate.
+--
+-- PARTIAL, so the overwhelming majority of rows — everything not yet published, and
+-- everything published before this column existed — cost nothing and collide with
+-- nothing. Postgres treats NULLs as distinct in a unique index anyway; the
+-- predicate makes the index small as well as correct.
+CREATE UNIQUE INDEX IF NOT EXISTS event_outbox_broker_record_uidx
+    ON blnk.event_outbox (kafka_topic, kafka_partition, kafka_offset)
+    WHERE kafka_offset IS NOT NULL;
+
+-- The outbox side of the daily zero-loss reconciliation, which counts rows claiming
+-- a Kafka record and how many of those name one.
+--
+-- The predicate is deliberately WIDER than the terminal statuses. A webhook_pending
+-- row HAS been published to Kafka — its Kafka leg completed and kafka_dispatched_at
+-- is stamped; what is outstanding is the deprecated HTTP leg. Counting only
+-- dispatched and dead_lettered rows would leave those records unaccounted for on the
+-- broker side, inflating the apparent surplus and loosening the reconciliation during
+-- exactly the window it matters most.
+--
+-- kafka_offset is carried as an INCLUDE column so the confirmed/unconfirmed split is
+-- answerable from the index alone.
+CREATE INDEX IF NOT EXISTS idx_event_outbox_published_audit
+    ON blnk.event_outbox (kafka_dispatched_at)
+    INCLUDE (kafka_topic, kafka_partition, kafka_offset)
+    WHERE kafka_dispatched_at IS NOT NULL OR status = 'dead_lettered';
+
 -- +migrate Down
 
 -- Indexes first, then the table. Dropping the table would take its indexes with
@@ -580,10 +787,13 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_terminal_retention
 -- exactly what this migration created. Index names are schema-qualified in the
 -- drop even though they are unqualified in the create; that asymmetry is the
 -- house convention.
+DROP INDEX IF EXISTS blnk.idx_event_outbox_published_audit;
+DROP INDEX IF EXISTS blnk.event_outbox_broker_record_uidx;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_terminal_retention;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_partition_key_inflight;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_aggregate;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_claim;
+DROP INDEX IF EXISTS blnk.idx_event_outbox_dlt_pending;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_failed;
 DROP INDEX IF EXISTS blnk.idx_event_outbox_pending;
 DROP INDEX IF EXISTS blnk.event_outbox_event_id_uidx;

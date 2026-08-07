@@ -34,8 +34,37 @@ import (
 // storeNotificationConfig installs a configuration with the given Slack and
 // webhook URLs. DataSource/Redis DNS are required by config validation but are
 // never dialed by the notification package.
+// restoreConfigStoreAfterTest captures the process-global configuration and puts it back on
+// cleanup.
+//
+// config.ConfigStore is an atomic.Value shared by every test in the binary, and MockConfig
+// replaces it outright. Without a restore, the LAST configuration any test stored stays in
+// place for whatever runs next — and the failure that causes is order-dependent, so it appears
+// when a test is added, reordered or run in isolation, and it points at the wrong file.
+//
+// It is one helper used by every config-storing helper in this package precisely so the two
+// cannot diverge: a restore present in one and absent in the other leaks exactly as badly as
+// no restore at all, and is harder to spot.
+//
+// The previous value is restored only if there WAS one. A nil-typed interface stored back into
+// an atomic.Value panics, and an atomic.Value cannot be reset to empty, so "nothing was set
+// before" is correctly left exactly as it was.
+func restoreConfigStoreAfterTest(t *testing.T) {
+	t.Helper()
+
+	previous := config.ConfigStore.Load()
+	t.Cleanup(func() {
+		if previous != nil {
+			config.ConfigStore.Store(previous)
+		}
+	})
+}
+
 func storeNotificationConfig(t *testing.T, slackURL, webhookURL string) {
 	t.Helper()
+
+	restoreConfigStoreAfterTest(t)
+
 	config.MockConfig(&config.Configuration{
 		Redis:      config.RedisConfig{Dns: "localhost:6379"},
 		DataSource: config.DataSourceConfig{Dns: "postgres://postgres:@localhost:5432/blnk?sslmode=disable"},
@@ -250,40 +279,27 @@ func TestNotifyError_WebhookSenderReceivesSystemError(t *testing.T) {
 		payloadMap, ok := got.payload.(map[string]interface{})
 		require.True(t, ok, "payload should be a map, got %T", got.payload)
 
-		// The payload is SANITIZED and carries no error text. This assertion replaces
-		// one that required payloadMap["error"] to equal the raw message, which is the
-		// behaviour the DATA-01 finding identified: Blnk's internal errors render with
-		// the schema, table, constraint, source file and routine that produced them, or
-		// with internal host addresses such as
-		// "write tcp 10.0.0.4:34918->10.0.0.7:9092: broken pipe", and system.error is
-		// published to a durable, replicated, retained Kafka topic and stored in
-		// blnk.event_outbox. The full text is logged instead, correlated by the ID
-		// below.
-		assert.NotContains(t, payloadMap, "error",
-			"the payload must not carry an error key at all")
-		for _, value := range payloadMap {
-			if text, isString := value.(string); isString {
-				assert.NotContains(t, text, "queue worker crashed",
-					"no field may carry the raw error text")
-			}
-		}
-
-		// What replaces it: a classified reason from a fixed vocabulary, and a
-		// correlation ID that is the operator's route to the full error in the log.
-		assert.Equal(t, SystemErrorReasonUnclassified, payloadMap["reason"],
-			"a plain errors.New with no recognisable signature classifies as unclassified")
-		correlationID, ok := payloadMap["correlation_id"].(string)
-		require.True(t, ok, "payload correlation_id should be a string")
-		assert.NotEmpty(t, correlationID,
-			"an empty correlation ID would leave the event unlinkable to any log line")
-
-		// error_code is omitted rather than blank for an untyped error, so that a
-		// recipient can tell "no code" from "the code is empty".
-		assert.NotContains(t, payloadMap, "error_code")
+		// THE PAYLOAD IS THE FROZEN LEGACY CONTRACT, asserted at the dispatch boundary
+		// because this is the exact value that leaves the package. Requirement R-8
+		// requires it to match the webhook body field-for-field, and that body has always
+		// been {"error", "time"}: a subscriber re-points its consumer at a Kafka topic and
+		// its body handling keeps working, which is the whole point of the migration.
+		assert.Equal(t, "queue worker crashed", payloadMap["error"],
+			"the error text is the value subscribers parse; it must be carried verbatim")
 
 		ts, ok := payloadMap["time"].(time.Time)
 		require.True(t, ok, "payload time should be a time.Time")
 		assert.WithinDuration(t, time.Now(), ts, 10*time.Second)
+
+		// Exactly two keys. A third is a change to a published contract and should fail
+		// here rather than reach a subscriber — including the classified reason and the
+		// correlation id an earlier revision published, which belong on the log line
+		// instead.
+		assert.Len(t, payloadMap, 2,
+			"the system.error payload is a published contract: error and time, and nothing else")
+		assert.NotContains(t, payloadMap, "reason")
+		assert.NotContains(t, payloadMap, "correlation_id")
+		assert.NotContains(t, payloadMap, "error_code")
 	case <-time.After(3 * time.Second):
 		t.Fatal("webhook sender was never invoked by NotifyError")
 	}

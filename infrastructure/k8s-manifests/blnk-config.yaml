@@ -4,10 +4,19 @@ metadata:
   name: blnk-config
   namespace: blnk
 data:
-  # Kafka event streaming and outbox relay. Blnk reads these nine keys from its
-  # process environment; they reproduce config.KafkaConfig, config.RelayConfig
-  # and the top-level WebhookDeprecationSunsetDate field of config/config.go,
-  # and the matching block of .env.example, so the three can be diffed by eye.
+  # Kafka event streaming and outbox relay. Blnk reads these SIXTEEN keys from
+  # its process environment; they reproduce config.KafkaConfig, config.RelayConfig
+  # and the two webhook-deprecation date fields of config/config.go, and the
+  # matching block of .env.example, so the three can be diffed by eye.
+  #
+  # THREE OF config.KafkaConfig'S KEYS ARE DELIBERATELY ABSENT, and none of them
+  # should be added here. KAFKA_INSECURE_LOCAL_DEV and
+  # KAFKA_TLS_INSECURE_SKIP_VERIFY each disable a protection this manifest exists
+  # to apply, and both default to false, so their absence IS the production
+  # setting. KAFKA_SASL_SECRET and KAFKA_SASL_ADMIN_SECRET are credentials and
+  # reach the pods from Secrets. KAFKA_TLS_CERT_FILE and KAFKA_TLS_KEY_FILE are
+  # for mutual TLS, which kafka-statefulset.yaml does not require of clients —
+  # add both, and ssl.client.auth on the broker, to require it.
   #
   # They are DISCRETE ConfigMap keys rather than extra settings inside the
   # blnk.json document below, for three reasons: the deployment contract names
@@ -15,16 +24,21 @@ data:
   # blnk.json, so the environment wins and the two sources can never disagree
   # about a value; and blnk.json is projected with subPath, so editing it needs
   # a pod rollout (see the note on that key) while these keys leave the mount
-  # untouched. Do not split the nine across both mechanisms.
+  # untouched. Do not split the ten across both mechanisms.
   #
   # server-deployment.yaml and worker-deployment.yaml surface each key with its
-  # own env entry and a valueFrom.configMapKeyRef. Do NOT collapse those into
+  # own env entry and a valueFrom.configMapKeyRef — every key below, in both
+  # Deployments, with the ONE exception of KAFKA_SASL_ADMIN_USER, which the
+  # server projects and the worker must not: the worker only publishes, and
+  # config/config.go validates the administrative pair as a pair, so a worker
+  # holding the username without the Secret would refuse to start.
+  # Do NOT collapse those into
   # envFrom.configMapRef, which takes EVERY key in this map, blnk.json included.
   # Kubernetes allows a dot in an environment variable name, so it does not skip
   # that key or warn: it injects the whole JSON document — data source DSN and
   # password and all — into every container's environment, where it surfaces in
   # env, in kubectl describe pod, in crash dumps and in every child process.
-  # Naming the nine keys explicitly injects the nine and nothing else.
+  # Naming the ten keys explicitly injects the ten and nothing else.
   # Nor is the answer to move blnk.json elsewhere: both Deployments mount this
   # ConfigMap's blnk.json key at /blnk.json and pass --config /blnk.json, so
   # relocating it breaks both.
@@ -39,61 +53,162 @@ data:
   # the documented exception, and the BLNK_-prefixed alias of each name below
   # resolves as well, winning when both forms are set.
   #
-  # KAFKA_SASL_ADMIN_SECRET IS DELIBERATELY ABSENT AND MUST NEVER BE ADDED
-  # HERE. It is the one event-streaming variable that is a credential, and a
-  # ConfigMap is readable by anything holding get on this namespace, so it
-  # reaches the pods as an env entry with a valueFrom.secretKeyRef against a
-  # Secret the operator provisions out of band. No Secret manifest is committed
-  # to this folder.
+  # NEITHER SASL SECRET IS HERE, AND NEITHER MAY EVER BE ADDED.
+  # KAFKA_SASL_SECRET and KAFKA_SASL_ADMIN_SECRET are the two event-streaming
+  # variables that are credentials, and a ConfigMap is readable by anything
+  # holding get on this namespace, so both reach the pods as env entries with a
+  # valueFrom.secretKeyRef against a Secret the operator provisions out of band.
+  # No Secret manifest is committed to this folder.
 
-  # Empty is a supported steady state, not a missing value: with no brokers
-  # configured, initializeEventPublisher returns the no-op publisher and Blnk
-  # starts, serves and processes transactions exactly as it did before Kafka
-  # existed. That is what lets an existing deployment adopt these manifests
-  # before it adopts Kafka.
+  # Empty is a supported steady state: initializeEventPublisher returns the no-op
+  # publisher and the server and worker start and serve as they did before Kafka
+  # existed. That covers STARTUP only — the outbox relay refuses to run on the
+  # no-op publisher, so nothing drains the event outbox until brokers are set.
   #
-  # TO PUBLISH EVENTS, SET THIS TO kafka:9092 — the client-facing ClusterIP
-  # Service in kafka-service.yaml, named bare within the blnk namespace exactly
-  # as data_source.dns names postgres and redis.dns names redis below. Use
-  # 9092, the SASL client listener; 9093 carries the KRaft controller quorum
-  # and is deliberately absent from that Service, so a client that dials it
-  # fails in a way that reads as a rejected password. Comma-separate several
-  # brokers; surrounding whitespace is trimmed and empty entries are dropped.
+  # TO PUBLISH EVENTS SET THIS TO kafka:9092 — the client-facing ClusterIP
+  # Service in kafka-service.yaml. Use 9092, the SASL client listener; 9093
+  # carries the KRaft controller quorum and is absent from that Service, so a
+  # client that dials it fails in a way that reads as a rejected password.
   #
-  # Setting this key alone is not enough, and what it needs alongside it is
-  # deliberately not in this ConfigMap: WEBHOOK_DEPRECATION_SUNSET_DATE below
-  # becomes mandatory, the SASL credentials belong in a Secret, and the TLS
-  # settings name paths inside a mounted volume. Blnk REFUSES to build a Kafka
-  # client that is neither TLS-protected nor explicitly marked as local
-  # development, so a production cluster sets KAFKA_TLS_ENABLED and
-  # KAFKA_TLS_CA_FILE through the two Deployments' env blocks.
+  # Setting this key alone is not enough: WEBHOOK_DEPRECATION_SUNSET_DATE below
+  # becomes mandatory, the SASL secret belongs in a Secret, and Blnk REFUSES to
+  # build a Kafka client that is neither TLS-protected nor explicitly marked as
+  # local development — so a production cluster also needs KAFKA_TLS_ENABLED and
+  # KAFKA_TLS_CA_FILE, through env blocks the Deployments do not yet have.
   KAFKA_BROKERS: ""
 
-  # The prefix every topic name derives from: the four category topics
-  # blnk.transactions, blnk.balances, blnk.identities and blnk.system, and
-  # their blnk.<category>.dlt dead-letter siblings.
+  # The SUBSCRIBER-FACING bootstrap list, reported by
+  # POST /subscribers/{id}/kafka-credentials. A DIFFERENT LIST from KAFKA_BROKERS
+  # above, and that is the whole reason it exists as its own key.
+  #
+  # KAFKA_BROKERS is a ClusterIP or headless Service name, which resolves only
+  # inside this cluster. A subscriber outside it cannot dial that, and Kafka makes
+  # a fallback worse than useless: a broker answers every client with the
+  # ADVERTISED address of the listener the connection arrived on, so bootstrapping
+  # against an internal name yields internal names for the partition leaders too.
+  # Set this to the address of whatever exposes the broker's external listener —
+  # a LoadBalancer, NodePort or Ingress — which is knowledge only an operator has.
+  #
+  # EMPTY REFUSES ISSUANCE with 503 SUBSCRIBER_BROKERS_NOT_CONFIGURED, and does not
+  # fall back: a 200 carrying an unreachable endpoint turns a clear refusal into a
+  # subscriber-side timeout diagnosed days later, and leaks internal topology. The
+  # refusal is warned about at start-up. A cluster whose subscribers run inside it
+  # sets this to the same value as KAFKA_BROKERS.
+  #
+  # Empty ships here because KAFKA_BROKERS above is empty: with no broker there is
+  # no issuance to refuse.
+  KAFKA_SUBSCRIBER_BROKERS: ""
+
+  # The prefix every topic name derives from: the category topics
+  # blnk.transactions, blnk.balances, blnk.identities and blnk.system, and their
+  # blnk.<category>.dlt dead-letter siblings — eight owned topics. The first three
+  # are grantable to a subscriber; blnk.system carries ledger.created and
+  # system.error and is internal, and no dead-letter topic is ever grantable.
   KAFKA_TOPIC_PREFIX: "blnk"
+
+  # The PRODUCER principal — the identity the server and worker publish ledger
+  # events as, and the one that is REQUIRED once KAFKA_BROKERS is set.
+  #
+  # It needs Write and Describe on every Blnk-owned topic, category and
+  # dead-letter alike: the relay produces to the former and the dead-letter
+  # writer to the latter, so a grant covering only the category topics fails at
+  # exactly the moment an event exhausts its retries. It needs no Read, nothing
+  # at cluster scope, and no consumer-group binding.
+  #
+  # LEAVING THIS EMPTY NO LONGER FALLS BACK TO THE ADMINISTRATIVE PRINCIPAL. It
+  # used to, with a warning, which meant a cluster reached maximum privilege by
+  # leaving two keys unset and the only evidence was a log line. The publisher
+  # now refuses to start and names these keys. KAFKA_ALLOW_ADMIN_PRODUCER below
+  # is the deliberate, temporary way to restore the old behaviour.
+  #
+  # The username is not a credential and belongs here; KAFKA_SASL_SECRET does
+  # not, and is validated with it as a PAIR — a username without a secret is
+  # refused at start-up rather than connecting anonymously while looking
+  # configured. Create that Secret in the same change.
+  KAFKA_SASL_USER: ""
+
+  # Restores the pre-least-privilege behaviour: publish as the administrator
+  # when no producer principal is configured. LEAVE IT FALSE.
+  #
+  # It exists for one migration: a cluster already running on a single Kafka
+  # credential must be able to keep publishing while its producer principal and
+  # Secret are created, rather than fail its next rollout. Every publisher
+  # construction that takes this path logs a security warning naming the flag.
+  #
+  # Running on it means the two highest-volume pods in the deployment hold
+  # unconditional authority over every ACL and SCRAM credential in the cluster.
+  KAFKA_ALLOW_ADMIN_PRODUCER: "false"
 
   # The SASL/SCRAM principal used ONLY for provisioning — topic assurance,
   # subscriber credential and ACL management, and the offset reads behind lag
-  # and reconciliation. Keep it out of anything that merely publishes. The
-  # username is not a credential and belongs here; its secret does not.
+  # and reconciliation. Keep it out of anything that merely publishes; that is
+  # what KAFKA_SASL_USER above is for.
+  #
+  # SET IT ON THE SERVER DEPLOYMENT ONLY. cmd/server.go is the one process that
+  # builds a Kafka admin client; the worker publishes and drains asynq queues
+  # and never does. Because this ConfigMap is consumed by both Deployments, a
+  # cluster that wants the strict split supplies this key and its Secret through
+  # the server Deployment's own env block instead of here — putting the strongest
+  # identity in the cluster into the worker pod too buys nothing it can use.
+  #
+  # The username is not a credential and belongs here; its secret does not.
   # config/config.go validates the two as a PAIR and refuses to start on a
   # username without a secret or a secret without a username, because either
   # half alone would otherwise connect anonymously while looking configured —
   # so fill this in and create that Secret in the same change.
   KAFKA_SASL_ADMIN_USER: ""
 
+  # TLS, and "true" is not a default here — it is a requirement of this
+  # deployment. kafka-statefulset.yaml serves SASL_SSL on 9092 and nothing else,
+  # so a client with TLS off cannot complete a handshake at all. Blnk enforces
+  # the same thing from its side: it REFUSES to build a Kafka client that is
+  # neither TLS-protected nor explicitly marked as local development, so leaving
+  # this "false" without setting KAFKA_INSECURE_LOCAL_DEV fails start-up with a
+  # named error rather than connecting in the clear.
+  #
+  # SASL/SCRAM authenticates a client; it does not encrypt the channel, and the
+  # SCRAM handshake carries material an observer can replay. The two are
+  # complementary and this deployment uses both.
+  KAFKA_TLS_ENABLED: "true"
+
+  # The PEM certificate authority Blnk verifies the brokers against. Both
+  # Deployments project the kafka-tls Secret at /etc/kafka/tls, so this path is
+  # the `ca.crt` key of that Secret.
+  #
+  # PEM, NOT THE JKS TRUSTSTORE the brokers use. Go's crypto/x509 reads PEM and
+  # cannot read a Java keystore, so kafka-tls carries both representations of the
+  # same authority: truststore.jks for the brokers, ca.crt for Blnk. They must be
+  # the same CA — two different ones produce a broker and a client that each
+  # believe they are correctly configured and cannot talk to each other.
+  #
+  # Leaving this empty falls back to the host trust store, which is right for a
+  # broker fronted by a publicly-trusted certificate and wrong for the private CA
+  # a self-managed cluster almost always uses.
+  KAFKA_TLS_CA_FILE: "/etc/kafka/tls/ca.crt"
+
   # Topic geometry applied when topics are created or grown. Six partitions is
   # the required minimum; messages are keyed per aggregate, so a higher count
   # buys parallelism without weakening the ordering guarantee.
   KAFKA_MIN_PARTITIONS: "6"
 
-  # Three for production durability, and this file is the production manifest.
-  # The local single-broker compose stack overrides it to 1 because a
-  # one-broker cluster cannot satisfy 3 and topic creation fails outright.
-  # Keep it in step with the broker count: 3 needs at least three brokers.
+  # Three for production durability; the local single-broker compose stack
+  # overrides it to 1, because a one-broker cluster cannot satisfy 3 and topic
+  # creation fails outright. Keep it in step with the broker count.
   KAFKA_REPLICATION_FACTOR: "3"
+
+  # Whether topic assurance may ADD partitions to a topic that already exists
+  # with fewer than KAFKA_MIN_PARTITIONS. "false" here, and deliberately so:
+  # adding partitions changes which partition a key hashes to, so events for one
+  # ledger that used to land on partition 2 begin landing on partition 5 while
+  # partition 2 still holds their predecessors. Ordering per aggregate — the
+  # guarantee keying by ledger ID exists to provide — is broken for every key
+  # affected, permanently and silently.
+  #
+  # Set it "true" only as a deliberate, announced operation: subscribers must
+  # drain the existing partitions before the growth takes effect, and only then
+  # is the reordering harmless.
+  KAFKA_ALLOW_PARTITION_GROWTH: "false"
+
 
   # Bounded exponential backoff for the outbox-to-Kafka relay: at most five
   # attempts, the first retry after 1000ms and doubling thereafter, never
@@ -109,30 +224,58 @@ data:
   RELAY_RETRY_BASE_BACKOFF_MS: "1000"
   RELAY_RETRY_MAX_BACKOFF_MS: "30000"
 
+  # How many days a dispatched outbox row is kept before the purge removes it.
+  # "0" disables the purge entirely, which is the shipped default because the
+  # right answer is a compliance decision this manifest cannot make: the outbox
+  # is the write-side record that every ledger event was captured, and the daily
+  # zero-loss reconciliation against Kafka offsets reads it.
+  #
+  # Set it once that retention is decided. Leaving it 0 means the table grows for
+  # the life of the deployment; setting it too low means a reconciliation window
+  # that has already been discarded cannot be re-checked. Dead-lettered rows are
+  # never purged by age — they are evidence of an event nobody received.
+  RELAY_EVENT_RETENTION_DAYS: "0"
+
+  # The RFC3339 instant the 30-day dual-delivery window OPENS. Optional: give
+  # only the sunset date below and the window is taken to be already open; give
+  # only this and the sunset is derived as exactly 30 days later; give both and
+  # they must agree to the second or start-up is refused, because two dates that
+  # disagree by a day would have Kafka publishing and webhook delivery stop on
+  # different days with nothing failing anywhere.
+  WEBHOOK_DEPRECATION_START_DATE: ""
+
   # The RFC3339 instant at which the legacy HTTP webhook transport is retired.
-  # Until then Kafka publishing and webhook delivery run concurrently from the
-  # same outbox rows, which is what makes both transports carry an identical
-  # payload; from it onwards Kafka is the only transport and the deprecated
-  # webhook management routes answer 410 Gone. One decision point serves both
-  # behaviours, so they can never disagree about the date.
+  # Until then Kafka publishing and webhook delivery run from the same outbox
+  # rows, which is what makes both transports carry an identical payload; from it
+  # onwards the deprecated webhook management routes answer 410 Gone.
   #
   # Empty ships here because KAFKA_BROKERS above is empty: with nothing to
-  # migrate to there is no window to describe, and that pairing is the only one
-  # in which it may be left blank. IT BECOMES MANDATORY THE MOMENT
-  # KAFKA_BROKERS IS SET — Blnk then refuses to start without it, rather than
-  # letting one typo keep the deprecated transport running indefinitely with
-  # nothing failing anywhere. Set it to an instant such as 2026-09-04T00:00:00Z
-  # (UTC, seconds precision), or add a WEBHOOK_DEPRECATION_START_DATE key and
-  # its own configMapKeyRef and let the sunset be derived as exactly 30 days
-  # later; give both and they must agree to the second or startup is refused.
+  # migrate to there is no window to describe.
+  #
+  # THIS IS THE ONLY KEY DESCRIBING THE WINDOW. Its other end is derived as this
+  # instant minus 30 days and has no key of its own, so the window cannot be
+  # configured to a length other than the one the code guarantees.
+  #
+  # Leaving it empty once KAFKA_BROKERS is set is WARNED about and accepted, not
+  # refused: nothing has been mis-stated, and enabling Kafka must not be able to
+  # take the deployment down. Dual delivery then continues, which is the
+  # pre-existing, subscriber-safe behaviour. A value that will not parse as
+  # RFC3339 IS refused, because a mis-typed retirement instant would otherwise
+  # resolve silently to "not yet" and keep the deprecated transport alive.
+  #
+  # Set it to an instant 30 days after your cutover, computed at deploy time. No
+  # example is given here on purpose: a literal date in a manifest is wrong the
+  # moment it is copied, and one already in the past retires the legacy
+  # transport immediately, cutting off every subscriber that has not migrated.
+  #   kubectl -n blnk create configmap ... \
+  #     --from-literal=WEBHOOK_DEPRECATION_SUNSET_DATE="$(date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)"
   WEBHOOK_DEPRECATION_SUNSET_DATE: ""
 
-  # UPDATING THIS KEY REQUIRES A POD ROLLOUT. Both Deployments project it with
-  # subPath: blnk.json, and Kubernetes does not refresh a subPath-projected
-  # file inside a running container the way it refreshes a whole-volume mount,
-  # so run
+  # UPDATING THIS KEY REQUIRES A POD ROLLOUT: both Deployments project it with
+  # subPath: blnk.json, and Kubernetes does not refresh a subPath-projected file
+  # inside a running container, so run
   #   kubectl -n blnk rollout restart deployment/server deployment/worker
-  # after editing it. The nine keys above arrive as environment variables and
+  # after editing it. The ten keys above arrive as environment variables and
   # leave this mount undisturbed — though a pod likewise only observes a
   # changed environment value once it restarts.
   blnk.json: |
@@ -147,4 +290,4 @@ data:
       "server": {
         "port": "5001"
       }
-    } 
+    }

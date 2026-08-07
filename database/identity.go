@@ -46,11 +46,69 @@ import (
 //   - If identity.IdentityID is empty, a fresh id is generated (existing
 //     behaviour).
 //
+// # Atomic event capture (requirement R-2)
+//
+// When a caller supplies an EventPreparer, the identity INSERT and the identity.created
+// event row are written inside ONE transaction: the preparer is handed the finished identity
+// — the only point at which the resolved IdentityID and CreatedAt exist — and the row it
+// returns is inserted before the commit. Either both land or neither does, so an identity
+// can no longer exist with no event describing it, and no event can describe an identity
+// that was rolled back.
+//
+// With no preparer the behaviour is EXACTLY as before: one statement and no transaction.
+// That is what keeps every pre-existing caller compiling and behaving unchanged, which is
+// why the parameter is a variadic tail rather than a positional argument.
+//
 // Parameters:
-// - identity: The identity object to be inserted.
+//   - identity: The identity object to be inserted.
+//   - prepareEvent: Optional. Builds the identity.created outbox row from the created
+//     identity, inside the transaction that created it. See EventPreparer for the contract.
+//
 // Returns:
-// - The created identity object, or an error if the creation fails.
-func (d Datasource) CreateIdentity(identity model.Identity) (model.Identity, error) {
+//   - The created identity object, or an error if the creation fails — including when the
+//     event could not be prepared or captured, in which case the identity is NOT created.
+func (d Datasource) CreateIdentity(identity model.Identity, prepareEvent ...EventPreparer[model.Identity]) (model.Identity, error) {
+	ctx := context.Background()
+
+	prepare := firstEventPreparer(prepareEvent)
+	if prepare == nil {
+		return d.insertIdentity(ctx, d.Conn, identity)
+	}
+
+	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
+	if err != nil {
+		return identity, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	created, err := d.insertIdentity(ctx, tx, identity)
+	if err != nil {
+		return created, err
+	}
+
+	if err := captureEntityEvent(ctx, d, tx, created, prepare); err != nil {
+		return created, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return created, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
+	}
+
+	return created, nil
+}
+
+// insertIdentity performs the identity INSERT against either the connection or an open
+// transaction, and is the single statement both CreateIdentity paths run.
+//
+// Parameters:
+//   - ctx: The context for the statement.
+//   - execer: The connection or transaction to insert through.
+//   - identity: The identity to insert.
+//
+// Returns:
+//   - The created identity, or a typed error. A caller-supplied id that is not a canonical
+//     idt_<uuid> is a bad request; a duplicate id is a conflict.
+func (d Datasource) insertIdentity(ctx context.Context, execer sqlExecer, identity model.Identity) (model.Identity, error) {
 	// Marshal metadata into JSON format
 	metaDataJSON, err := json.Marshal(identity.MetaData)
 	if err != nil {
@@ -71,7 +129,7 @@ func (d Datasource) CreateIdentity(identity model.Identity) (model.Identity, err
 	identity.CreatedAt = time.Now()
 
 	// Insert the identity record into the database
-	_, err = d.Conn.ExecContext(context.Background(), `
+	_, err = execer.ExecContext(ctx, `
 		INSERT INTO blnk.identity (identity_id, identity_type, first_name, last_name, other_names, gender, dob, email_address, phone_number, nationality, organization_name, category, street, country, state, post_code, city, created_at, meta_data)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 	`, identity.IdentityID, identity.IdentityType, identity.FirstName, identity.LastName, identity.OtherNames, identity.Gender, identity.DOB, identity.EmailAddress, identity.PhoneNumber, identity.Nationality, identity.OrganizationName, identity.Category, identity.Street, identity.Country, identity.State, identity.PostCode, identity.City, identity.CreatedAt, metaDataJSON)

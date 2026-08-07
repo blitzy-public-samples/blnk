@@ -28,6 +28,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	blnk "github.com/blnkfinance/blnk"
 	"github.com/blnkfinance/blnk/api/middleware"
 	apimodel "github.com/blnkfinance/blnk/api/model"
 	"github.com/blnkfinance/blnk/model"
@@ -191,6 +192,7 @@ func TestDeadLetterEvent_WireContract(t *testing.T) {
 		{name: "EventType", jsonKey: "event_type"},
 		{name: "AggregateID", jsonKey: "aggregate_id"},
 		{name: "LedgerID", jsonKey: "ledger_id", omitEmpty: true},
+		{name: "PartitionKey", jsonKey: "partition_key", omitEmpty: true},
 		{name: "OccurredAt", jsonKey: "occurred_at"},
 		{name: "SchemaVersion", jsonKey: "schema_version"},
 		{name: "Topic", jsonKey: "topic"},
@@ -219,8 +221,50 @@ func TestDeadLetterEvent_WireContract(t *testing.T) {
 				"topic", "status", "attempts", "payload_bytes",
 			},
 			keys,
-			"the nine non-optional keys must always be present, and the five optional ones absent "+
+			"the nine non-optional keys must always be present, and the six optional ones absent "+
 				"rather than null, so a client never has to distinguish null from missing")
+	})
+
+	t.Run("the partition key and the ledger id are separate facts", func(t *testing.T) {
+		// The Kafka message key IS the ordering mechanism: every event sharing a key lands
+		// in one partition and is therefore consumed in publish order. This projection used
+		// to carry only ledger_id and to DOCUMENT it as the key, which is wrong in the case
+		// that matters most — a ledger-less event, where the key falls back to the aggregate
+		// so the key is present while the ledger is not. An operator answering "why were
+		// these two events consumed out of order?" from ledger_id would reach the wrong
+		// conclusion for exactly the events whose routing is least obvious.
+		decoded := marshalToKeys(t, apimodel.DeadLetterEvent{
+			EventID:      "8f14e45f-ea8f-4b3a-9c2d-0a7b6c5d4e3f",
+			EventType:    "identity.created",
+			AggregateID:  "idt_7c9",
+			PartitionKey: "idt_7c9",
+			Topic:        "blnk.identities",
+			Status:       model.EventOutboxStatusDeadLettered,
+		})
+
+		require.Contains(t, decoded, "partition_key",
+			"the key the event was published under must be reportable, or no ordering question "+
+				"can be answered from this API at all")
+		assert.Equal(t, `"idt_7c9"`, string(decoded["partition_key"]))
+		assert.NotContains(t, decoded, "ledger_id",
+			"a ledger-less event has no ledger to report, and reporting the key in its place is "+
+				"the conflation this field exists to end")
+
+		// The other direction: a ledgered event reports both, and they are not required to
+		// be equal — the stored key is the key the event was ACTUALLY written with, not one
+		// recomputed from the row today.
+		both := marshalToKeys(t, apimodel.DeadLetterEvent{
+			EventID:      "9a25f56g-fb9g-5c4b-ad3e-1b8c7d6e5f4a",
+			EventType:    "transaction.applied",
+			AggregateID:  "txn_112",
+			LedgerID:     "ldg_003",
+			PartitionKey: "ldg_003",
+			Topic:        "blnk.transactions",
+			Status:       model.EventOutboxStatusDeadLettered,
+		})
+
+		assert.Equal(t, `"ldg_003"`, string(both["ledger_id"]))
+		assert.Equal(t, `"ldg_003"`, string(both["partition_key"]))
 	})
 
 	t.Run("no key can carry a payload or a raw broker error", func(t *testing.T) {
@@ -312,33 +356,68 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 	assertWireContract(t, apimodel.EventOutboxStatsResponse{}, []fieldContract{
 		{name: "Pending", jsonKey: "pending"},
 		{name: "Processing", jsonKey: "processing"},
+		{name: "WebhookPending", jsonKey: "webhook_pending"},
 		{name: "Dispatched", jsonKey: "dispatched"},
 		{name: "Failed", jsonKey: "failed"},
 		{name: "DeadLettered", jsonKey: "dead_lettered"},
+		{name: "Replaying", jsonKey: "replaying"},
 		{name: "TopicEndOffsets", jsonKey: "topic_end_offsets", omitEmpty: true},
 		{name: "OffsetsComplete", jsonKey: "offsets_complete"},
 		{name: "MissingTopics", jsonKey: "missing_topics", omitEmpty: true},
 		{name: "PartitionsUnavailable", jsonKey: "partitions_unavailable"},
 		{name: "OffsetsMeasuredAt", jsonKey: "offsets_measured_at", omitEmpty: true},
 		{name: "GeneratedAt", jsonKey: "generated_at"},
+		{name: "Reconciliation", jsonKey: "reconciliation", omitEmpty: true},
 	})
 
-	t.Run("all five relay states are reported as explicit counts", func(t *testing.T) {
+	// Driven from the model's OWN vocabulary rather than from a list written out here, which
+	// is what makes it a completeness check instead of a restatement. A status added to the
+	// model and not added to this response would otherwise vanish from the reconciliation
+	// silently — and a status that is counted in the table but absent from the response makes
+	// the reported counts sum to less than the row count, so a zero-loss check cannot tell a
+	// short total from a lost event.
+	t.Run("every outbox status in the model is reported as an explicit count", func(t *testing.T) {
 		decoded := marshalToKeys(t, apimodel.EventOutboxStatsResponse{})
 
-		for _, status := range []string{
-			model.EventOutboxStatusPending,
-			model.EventOutboxStatusProcessing,
-			model.EventOutboxStatusDispatched,
-			model.EventOutboxStatusFailed,
-			model.EventOutboxStatusDeadLettered,
-		} {
+		statuses := model.EventOutboxStatuses()
+		require.NotEmpty(t, statuses, "the model must publish its status vocabulary for this to check anything")
+
+		for _, status := range statuses {
 			require.Contains(t, decoded, status,
 				"the reconciliation runbook names every relay state, and a count of zero must read "+
-					"as 'none in that state' rather than as 'no such state'")
+					"as 'none in that state' rather than as 'no such state'. %q is in the model's "+
+					"vocabulary but missing from EventOutboxStatsResponse", status)
 			assert.Equal(t, "0", string(decoded[status]),
 				"a zero count must be an explicit 0, never an omitted key")
 		}
+	})
+
+	// The replaying lease deserves its own subtest because it is the status that was
+	// missing, and because it is the only NON-TERMINAL state a caller can mistake for a
+	// terminal one: a row held by an in-flight replay is neither published nor lost.
+	t.Run("the replaying lease is counted and is not terminal", func(t *testing.T) {
+		decoded := marshalToKeys(t, apimodel.EventOutboxStatsResponse{
+			Dispatched:   40,
+			DeadLettered: 2,
+			Replaying:    3,
+			Reconciliation: &apimodel.OutboxReconciliationResult{
+				TerminalEvents: 42,
+			},
+		})
+
+		require.Contains(t, decoded, "replaying")
+		assert.Equal(t, "3", string(decoded["replaying"]),
+			"a replay in flight must be visible: without it the reported counts sum to less than the "+
+				"table's row count and a shortfall cannot be told apart from loss")
+
+		// 40 + 2, not 45. Rows in pending, processing or replaying make no claim to have
+		// been published, so they must not enter the terminal total the broker side is
+		// compared against.
+		var reconciliation map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(decoded["reconciliation"], &reconciliation))
+		assert.Equal(t, "42", string(reconciliation["terminal_events"]),
+			"terminal events are dispatched plus dead-lettered only; a replay in flight has published "+
+				"nothing and must not be counted as though it had")
 	})
 
 	t.Run("a reading with no offsets cannot be mistaken for a valid reconciliation", func(t *testing.T) {
@@ -392,6 +471,125 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 			"nothing was missing, so an empty list is omitted rather than reported")
 		assert.Equal(t, "0", string(decoded["partitions_unavailable"]),
 			"an explicit zero is the reassuring answer and must never be omitted")
+	})
+}
+
+// TestOutboxReconciliationResult_WireContract pins the verdict acceptance criterion V-2 is
+// scored on, and it exists because the response used to carry the two SIDES of the
+// comparison and no verdict at all.
+//
+// Leaving the verdict to the caller meant every caller re-implemented the arithmetic, the
+// directionality and the retention caveat, and each got its own chance to get them wrong in a
+// way that reads as success. Two specific mistakes are what this shape prevents: a caller
+// that diffs the two totals and alerts on any difference alerts constantly, because
+// redeliveries and replays legitimately make the broker side larger; and a caller that
+// compares for equality reports a green result on a reading retention has already invalidated.
+func TestOutboxReconciliationResult_WireContract(t *testing.T) {
+	assertWireContract(t, apimodel.OutboxReconciliationResult{}, []fieldContract{
+		{name: "TerminalEvents", jsonKey: "terminal_events"},
+		// The three corroboration counts sit here rather than at the end, mirroring the
+		// service type's own declaration order: encoding/json emits keys in declaration
+		// order, so a reader comparing a response against blnk.OutboxReconciliation reads
+		// the two in the same sequence.
+		{name: "ConfirmedEvents", jsonKey: "confirmed_events"},
+		{name: "UnconfirmedEvents", jsonKey: "unconfirmed_events"},
+		{name: "DuplicatedRecords", jsonKey: "duplicated_records"},
+		{name: "MessagesWritten", jsonKey: "messages_written"},
+		{name: "Overhead", jsonKey: "overhead"},
+		{name: "LossDetected", jsonKey: "loss_detected"},
+		{name: "Conclusive", jsonKey: "conclusive"},
+		{name: "Caveats", jsonKey: "caveats", omitEmpty: true},
+		{name: "Summary", jsonKey: "summary"},
+		{name: "MeasuredAt", jsonKey: "measured_at"},
+	})
+
+	t.Run("the field set mirrors the service-layer verdict", func(t *testing.T) {
+		// The API shape and the computed verdict must not drift: a field added to the
+		// service-layer OutboxReconciliation and not surfaced here is a finding the daily
+		// check produces and the API silently withholds. Compared as SETS of names, because
+		// the two types legitimately differ in wire tags and in Summary's form — a method
+		// on one, a field on the other.
+		wire := reflect.TypeOf(apimodel.OutboxReconciliationResult{})
+		service := reflect.TypeOf(blnk.OutboxReconciliation{})
+
+		for i := 0; i < service.NumField(); i++ {
+			name := service.Field(i).Name
+			_, present := wire.FieldByName(name)
+			assert.True(t, present,
+				"OutboxReconciliation.%s is computed by the daily check but has nowhere to go on the "+
+					"API response, so the finding it carries would never reach a caller", name)
+		}
+
+		// Summary is a METHOD on the service type and a FIELD here, deliberately: it is the
+		// one sentence a runbook or an alert annotation quotes, and recomputing it on the
+		// client would mean two descriptions of one verdict.
+		_, hasSummary := service.MethodByName("Summary")
+		assert.True(t, hasSummary,
+			"the wire Summary must be rendered by the service's own method rather than reworded here")
+	})
+
+	t.Run("a healthy result reports positive overhead and no loss", func(t *testing.T) {
+		measuredAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+		decoded := marshalToKeys(t, apimodel.OutboxReconciliationResult{
+			TerminalEvents:  1000,
+			MessagesWritten: 1003,
+			Overhead:        3,
+			LossDetected:    false,
+			Conclusive:      true,
+			Summary:         "1000 outbox rows against 1003 broker records",
+			MeasuredAt:      measuredAt,
+		})
+
+		assert.Equal(t, "3", string(decoded["overhead"]),
+			"a small positive overhead is the HEALTHY state — redeliveries and replays — not a defect")
+		assert.Equal(t, "false", string(decoded["loss_detected"]))
+		assert.Equal(t, "true", string(decoded["conclusive"]))
+		assert.NotContains(t, decoded, "caveats",
+			"a conclusive result has no caveats, so an empty list is omitted rather than reported")
+		assert.Equal(t, `"2026-03-04T05:06:07Z"`, string(decoded["measured_at"]))
+	})
+
+	t.Run("a shortfall is reported as negative overhead rather than clamped", func(t *testing.T) {
+		decoded := marshalToKeys(t, apimodel.OutboxReconciliationResult{
+			TerminalEvents:  1000,
+			MessagesWritten: 996,
+			Overhead:        -4,
+			LossDetected:    true,
+			Conclusive:      true,
+		})
+
+		assert.Equal(t, "-4", string(decoded["overhead"]),
+			"the sign IS the finding: clamping it at zero would erase the only signal this check "+
+				"carries, and the field must therefore be signed on the wire too")
+		assert.Equal(t, "true", string(decoded["loss_detected"]))
+	})
+
+	t.Run("an inconclusive result is never mistaken for a clean one", func(t *testing.T) {
+		decoded := marshalToKeys(t, apimodel.OutboxReconciliationResult{
+			TerminalEvents:  1000,
+			MessagesWritten: 400,
+			Overhead:        -600,
+			LossDetected:    true,
+			Conclusive:      false,
+			Caveats:         []string{"retention has deleted records from blnk.transactions"},
+		})
+
+		require.Contains(t, decoded, "conclusive")
+		assert.Equal(t, "false", string(decoded["conclusive"]),
+			"the key must be present on the inconclusive path: a vanishing key would leave the most "+
+				"dangerous state looking like the healthiest one")
+		assert.Equal(t, `["retention has deleted records from blnk.transactions"]`, string(decoded["caveats"]),
+			"an operator must be told WHY the count cannot be trusted, not merely that it cannot")
+	})
+
+	t.Run("a stats response with no offsets carries no verdict", func(t *testing.T) {
+		// With nothing measured on the broker side there is no verdict to report, and
+		// emitting an empty one would read as "reconciled, nothing written".
+		decoded := marshalToKeys(t, apimodel.EventOutboxStatsResponse{Dispatched: 12})
+
+		assert.NotContains(t, decoded, "reconciliation",
+			"a deployment with no brokers is a legitimate steady state; an absent verdict is honest "+
+				"where a zeroed one would be a false all-clear")
 	})
 }
 
@@ -540,6 +738,7 @@ func TestSubscriberResponse_WireContract(t *testing.T) {
 		{name: "ConsumerGroupID", jsonKey: "consumer_group_id"},
 		{name: "AuthorizedTopics", jsonKey: "authorized_topics"},
 		{name: "PartitionKeyPrefix", jsonKey: "partition_key_prefix", omitEmpty: true},
+		{name: "EnforcedAccess", jsonKey: "enforced_access"},
 		{name: "CredentialFingerprint", jsonKey: "credential_fingerprint", omitEmpty: true},
 		{name: "CredentialIssuedAt", jsonKey: "credential_issued_at", omitEmpty: true},
 		{name: "WebhookURL", jsonKey: "webhook_url", omitEmpty: true},
@@ -626,6 +825,7 @@ func TestKafkaCredentialsResponse_WireContract(t *testing.T) {
 		{name: "BrokerEndpoint", jsonKey: "broker_endpoint", omitEmpty: true},
 		{name: "AuthorizedTopics", jsonKey: "authorized_topics"},
 		{name: "ConsumerGroupID", jsonKey: "consumer_group_id"},
+		{name: "EnforcedAccess", jsonKey: "enforced_access"},
 		{name: "Username", jsonKey: "username"},
 		{name: "Password", jsonKey: "password"},
 		{name: "Mechanism", jsonKey: "mechanism"},
@@ -879,5 +1079,90 @@ func TestScopeResources_CoverTheEventAndSubscriberSurfaces(t *testing.T) {
 			[]string{"events:read"}, []string{"events:read", "subscribers:read"}),
 			"a caller holding only an events scope must not be able to issue a subscriber scope, "+
 				"which would let it grant itself credential issuance")
+	})
+}
+
+// TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces is the API half of
+// the partition-key-prefix hazard.
+//
+// # The hazard
+//
+// A subscriber's record carries three access-shaped values — authorized_topics, a consumer
+// group, and partition_key_prefix — and only the first two are ACL bindings. Kafka's authorizer
+// has no message-key dimension, so there is no ACL that confines a consumer to a slice of a
+// topic by key: a subscriber granted a topic reads EVERY record on it whatever the prefix says.
+// An integrator who reads all three as one access model draws the plausible and dangerous
+// conclusion that two subscribers sharing a topic with different key prefixes cannot see each
+// other's events, and builds a tenancy boundary on it.
+//
+// So the response states the enforced dimensions positively and answers the key question
+// outright. These assertions are what stop that statement being quietly weakened later.
+func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *testing.T) {
+	subscriberID := "acme_prod"
+	topics := []string{"blnk.transactions", "blnk.balances"}
+
+	enforced := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics)
+
+	t.Run("partition key filtering is declared unenforced, in the body", func(t *testing.T) {
+		assert.False(t, enforced.PartitionKeyPrefixEnforced,
+			"this field may never be true: Kafka has no message-key authorization dimension, so a "+
+				"true here would be a false claim that a subscriber is confined to a slice of a topic")
+
+		assert.NotContains(t, enforced.EnforcedBy, "partition_key",
+			"the enforced-dimension list is exhaustive, so a partition-key entry would assert an "+
+				"ACL that cannot exist")
+		assert.NotContains(t, enforced.EnforcedBy, "partition_key_prefix")
+	})
+
+	t.Run("the dimensions that ARE enforced are named", func(t *testing.T) {
+		assert.Equal(t, []string{
+			apimodel.EnforcementDimensionTopic,
+			apimodel.EnforcementDimensionConsumerGroup,
+		}, enforced.EnforcedBy,
+			"topic and consumer group are the two the broker evaluates, and the list must be "+
+				"exactly those: a missing one understates the isolation that exists, an extra one "+
+				"claims isolation that does not")
+
+		assert.Equal(t, topics, enforced.Topics, "the topic set must be reported exactly")
+	})
+
+	t.Run("the consumer group namespace is derived, not restated", func(t *testing.T) {
+		// Derived through the same model helper the ACL binding is built from, so the value
+		// reported cannot describe a namespace different from the one actually reserved.
+		namespace, err := model.CanonicalConsumerGroupNamespace(subscriberID)
+		require.NoError(t, err)
+		assert.Equal(t, namespace, enforced.ConsumerGroupNamespace)
+
+		group, err := model.CanonicalConsumerGroupID(subscriberID)
+		require.NoError(t, err)
+		assert.True(t, strings.HasPrefix(group, enforced.ConsumerGroupNamespace),
+			"the subscriber's default group must lie inside the namespace reported as reserved, or "+
+				"the report describes a boundary the subscriber's own group falls outside")
+	})
+
+	t.Run("an empty grant reports an empty set rather than null", func(t *testing.T) {
+		keys := marshalToKeys(t, apimodel.NewSubscriberEnforcedAccess(subscriberID, nil))
+		assert.NotNil(t, keys["topics"],
+			"a fail-closed empty grant is a state an operator must be able to read; null would "+
+				"force every client to special-case it")
+	})
+
+	t.Run("every subscriber response carries the declaration", func(t *testing.T) {
+		prefix := "ledger-42"
+		response := apimodel.NewSubscriberResponse(model.EventSubscriber{
+			SubscriberID:       subscriberID,
+			AuthorizedTopics:   topics,
+			PartitionKeyPrefix: &prefix,
+		})
+
+		// The advisory prefix is reported AND declared unenforced in the same body. That
+		// adjacency is the point: the two cannot be read apart.
+		assert.Equal(t, prefix, response.PartitionKeyPrefix)
+		assert.False(t, response.EnforcedAccess.PartitionKeyPrefixEnforced)
+
+		keys := marshalToKeys(t, response)
+		require.Contains(t, keys, "enforced_access",
+			"the declaration must be present on every subscriber body, including one that has "+
+				"never been issued a credential — an integrator needs it before wiring a consumer")
 	})
 }

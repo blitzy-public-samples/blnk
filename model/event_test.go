@@ -17,6 +17,7 @@ package model
 
 import (
 	"encoding/json"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
@@ -125,14 +126,19 @@ func decodeObject(t *testing.T, b []byte) map[string]json.RawMessage {
 // "ledger.created", "identity.created", "balance.created", "balance.monitor",
 // and "system.error" raised through the registered webhook-sender indirection.
 //
-// On the fourth `system` category: it is deliberate, not an accident of
-// implementation. "ledger.created" and "system.error" are genuinely emitted yet
-// belong to none of the three categories the requirements name, while the
-// coverage requirement is absolute — every event type that reaches the legacy
-// webhook sender must be published, with zero exceptions. A fourth category
-// following the identical naming convention satisfies both; forcing those two
-// onto an unrelated topic would corrupt that topic's semantics for every
-// subscriber filtering on it, and dropping them would breach coverage outright.
+// On the fourth category beyond the three the requirements name: it is deliberate.
+// "ledger.created" and "system.error" are genuinely emitted yet belong to none of
+// the three named categories, while the coverage requirement is absolute — every
+// event type that reaches the legacy webhook sender must be published, with zero
+// exceptions. Both therefore resolve to `system`, which is also the catch-all.
+//
+// That category is INTERNAL, so neither of its topics is grantable to a subscriber.
+// system.error's payload is the frozen legacy body and still carries the error text
+// as it renders, so the disclosure is contained by audience rather than by
+// redaction; and an internal catch-all is what stops a forgotten mapping delivering
+// a domain payload to an audience that never asked for it. Forcing either event onto
+// an unrelated topic would corrupt that topic's semantics for every subscriber
+// filtering on it, and dropping them would breach coverage outright.
 func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -226,18 +232,19 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 			reason:    "identity events must route to the identities category",
 		},
 
-		// --- system: the two event types outside the three named categories ---
+		// --- the two event types outside the three named categories, in the two
+		// categories they belong to: one grantable, one internal ---
 		{
 			name:      "ledger created",
 			eventType: "ledger.created",
 			want:      EventCategorySystem,
-			reason:    "ledger.created belongs to none of the three named categories, so it routes to the deliberate fourth one rather than being dropped",
+			reason:    "ledger.created belongs to none of the three named categories, so it routes to the deliberate fourth system category rather than being dropped",
 		},
 		{
 			name:      "system error",
 			eventType: "system.error",
 			want:      EventCategorySystem,
-			reason:    "system.error is emitted indirectly through the registered webhook-sender closure, and is covered like every other event type",
+			reason:    "system.error carries Blnk's internal diagnostic detail, so it stays in the internal system category and is covered without being offered to subscribers",
 		},
 	}
 
@@ -256,38 +263,46 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 	assert.Len(t, tests, 15, "the table must cover all thirteen emitted event types, with the runtime-composed bulk name exercised by three suffixes")
 }
 
-// TestEventCategory_UnknownEventFallsBackToQuarantine pins the catch-all arm, and
-// pins WHERE it points.
+// TestEventCategory_UnknownEventFallsBackToTheInternalSystemCategory pins the
+// catch-all arm, and pins WHERE it points.
 //
-// Two properties are being asserted, and they pull in opposite directions:
+// Three properties are asserted, and the third is what a naive reading of the first two
+// would miss:
 //
 //  1. Coverage. An event type nobody mapped must still resolve to a real category, so
 //     a producer added later that forgets to extend the table gets its events
 //     published and observable rather than rejected or dropped. The row is already
 //     committed by the time routing happens, so rejecting would strand a durable
 //     event.
-//  2. Containment. That destination must NOT be a topic real subscribers consume.
-//     The catch-all used to be the system category, which meant a forgotten mapping
-//     delivered whatever the new producer emitted — plausibly a balance or an
-//     identity record — to whoever consumes system events. Quarantine is internal and
-//     cannot be granted to a subscriber, so the omission stays contained.
+//  2. Containment. That destination must not be a topic any subscriber can be granted.
+//     A forgotten mapping would otherwise deliver whatever the new producer emitted —
+//     plausibly a balance or an identity record — to an audience that never asked for
+//     it. The system category satisfies this because it is INTERNAL: no grant can
+//     cover its topic.
 //
-// The explicit not-system assertions are the point of the test: an edit that
-// "simplifies" the catch-all back to EventCategorySystem restores the disclosure, and
-// a coverage-only assertion would not notice.
-func TestEventCategory_UnknownEventFallsBackToQuarantine(t *testing.T) {
-	assert.Equal(t, EventCategoryQuarantine, EventCategory("totally.unknown.event"),
-		"an unrecognised event type must fall back to the quarantine category — dropping it or returning an empty token would breach the zero-exceptions coverage guarantee for event types added later")
-	assert.NotEqual(t, EventCategorySystem, EventCategory("totally.unknown.event"),
-		"the catch-all must NOT be the system category: routing an unmapped payload there exposes it to whoever consumes system events")
+// The internal-category assertion is the point of the test, and it is what a fifth
+// "quarantine" category would have been an alternative way of achieving. The topic
+// contract fixes the catalogue at four categories instead, so containment rests
+// entirely on the system category staying internal; an edit that made it grantable
+// would restore the disclosure, and a coverage-only assertion would not notice.
+func TestEventCategory_UnknownEventFallsBackToTheInternalSystemCategory(t *testing.T) {
+	assert.Equal(t, EventCategorySystem, EventCategory("totally.unknown.event"),
+		"an unrecognised event type must fall back to the internal system category — dropping it or returning an empty token would breach the zero-exceptions coverage guarantee for event types added later")
 
-	assert.Equal(t, EventCategoryQuarantine, EventCategory(""),
+	assert.Equal(t, EventCategorySystem, EventCategory(""),
 		"the empty event type must also resolve to a real category: the resolver is total, so no input can ever produce an empty category token that would then compose a malformed topic name")
-	assert.NotEqual(t, EventCategorySystem, EventCategory(""),
-		"a blank event type is an unclassifiable event, which is exactly what quarantine exists for")
 
-	assert.True(t, IsInternalEventCategory(EventCategoryQuarantine),
-		"quarantine must be internal, or containment is nominal: a grantable quarantine topic is the same disclosure by another name")
+	assert.True(t, IsInternalEventCategory(EventCategorySystem),
+		"the catch-all category must be internal, or containment is nominal: a grantable catch-all topic is a disclosure by another name")
+
+	assert.False(t, IsCataloguedEventType("totally.unknown.event"),
+		"an unrecognised event type must be reported as uncatalogued, which is what makes the fallback observable rather than silent")
+	assert.False(t, IsCataloguedEventType(""),
+		"a blank event type is uncatalogued too")
+	assert.True(t, IsCataloguedEventType("transaction.applied"),
+		"a named member of the catalogue must be reported as catalogued")
+	assert.True(t, IsCataloguedEventType("bulk_transaction.applied"),
+		"a runtime-composed bulk transaction name must be reported as catalogued, because it is matched by prefix rather than enumerated")
 }
 
 // TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory pins the
@@ -302,11 +317,36 @@ func TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory(t *tes
 	assert.Contains(t, grantable, EventCategoryTransactions, "transactions is subscriber-facing ledger data")
 	assert.Contains(t, grantable, EventCategoryBalances, "balances is subscriber-facing ledger data")
 	assert.Contains(t, grantable, EventCategoryIdentities, "identities is subscriber-facing data")
-
+	// NOT GRANTABLE, and the case for granting it is worth recording because it is a
+	// reasonable one: blnk.system carries ledger.created and system.error, two of the thirteen
+	// event types the legacy HTTP transport delivered, so a subscriber granted nothing here has
+	// no authorized path to either.
+	//
+	// It stays internal for two independent reasons, either of which is sufficient.
+	//
+	// FIRST, the legacy transport's audience was not subscribers. There was ONE globally
+	// configured webhook URL — the operator's own endpoint — so "the legacy transport delivered
+	// it" establishes only that the operator received it. system.error's payload is the frozen
+	// legacy body, which carries the raw error text verbatim, and that text describes the
+	// inside of the deployment: a PostgreSQL error names schema, table, column and routine, a
+	// broker error names internal addresses. One shared topic would hand every subscriber every
+	// other subscriber's failures.
+	//
+	// SECOND, this category is the catalogue's CATCH-ALL — see
+	// TestEventCategory_UnknownEventFallsBackToTheInternalSystemCategory. An event type nobody
+	// mapped lands here, plausibly carrying a balance or an identity record, and its audience
+	// cannot be established. A grantable catch-all is a disclosure by another name, and it is
+	// what makes the containment half of the fallback real rather than nominal.
+	//
+	// R-1 is a PUBLISHING requirement and is met in full: all thirteen types are published, and
+	// this category is read under the master key, as the dead-letter topics are.
 	assert.NotContains(t, grantable, EventCategorySystem,
-		"the system category carries Blnk's own internal error detail and must never be grantable to a subscriber")
-	assert.NotContains(t, grantable, EventCategoryQuarantine,
-		"the quarantine category carries events of unknown provenance, so its audience cannot be established and it must never be grantable")
+		"the system category carries Blnk's own internal error detail, and — as the catalogue's "+
+			"catch-all — events of unknown provenance whose audience cannot be established, so it "+
+			"must never be grantable to a subscriber")
+
+	assert.Len(t, grantable, 3,
+		"exactly three of the four categories are subscriber-facing; a fourth appearing here means an internal category became grantable")
 
 	for _, category := range grantable {
 		assert.False(t, IsInternalEventCategory(category),
@@ -347,11 +387,15 @@ func TestEventCategory_PrefixBoundaryIsExact(t *testing.T) {
 	assert.Equal(t, EventCategoryTransactions, EventCategory("bulk_transaction."),
 		"the bare prefix with an empty status must still satisfy the prefix test; requiring a non-empty suffix would be a stricter rule than the producer guarantees")
 
-	assert.Equal(t, EventCategoryQuarantine, EventCategory("bulk_transaction"),
+	assert.Equal(t, EventCategorySystem, EventCategory("bulk_transaction"),
 		"\"bulk_transaction\" without the trailing dot is not an emitted event string and must NOT satisfy the prefix test — the separator is part of the prefix, so dropping it from the constant is caught here")
+	assert.False(t, IsCataloguedEventType("bulk_transaction"),
+		"and it must be reported as uncatalogued, which is how the mis-spelling becomes visible rather than looking like a routed event")
 
-	assert.Equal(t, EventCategoryQuarantine, EventCategory("transaction.applied.v2"),
-		"the transaction arms are exact matches, not prefix matches: a longer string that merely starts with an emitted name must fall through to the catch-all rather than being routed as if it were that event")
+	assert.Equal(t, EventCategorySystem, EventCategory("transaction.applied.v2"),
+		"the transaction entries are exact matches, not prefix matches: a longer string that merely starts with an emitted name must fall through to the catch-all rather than being routed as if it were that event")
+	assert.False(t, IsCataloguedEventType("transaction.applied.v2"),
+		"a near-miss of a catalogued name is uncatalogued")
 }
 
 // TestEventCategory_IsCaseSensitive documents that no case normalisation happens.
@@ -360,11 +404,14 @@ func TestEventCategory_PrefixBoundaryIsExact(t *testing.T) {
 // behavioural benefit that then has to be mutation-tested. Pinning the absence of
 // folding is what catches a mutant — or a well-meaning refactor — that inserts it.
 func TestEventCategory_IsCaseSensitive(t *testing.T) {
-	assert.Equal(t, EventCategoryQuarantine, EventCategory("TRANSACTION.APPLIED"),
+	assert.Equal(t, EventCategorySystem, EventCategory("TRANSACTION.APPLIED"),
 		"comparison is exact and case-sensitive: an upper-cased event type is not an emitted event string and must fall through to the catch-all, not be folded into the transactions category")
 
-	assert.Equal(t, EventCategoryQuarantine, EventCategory("BULK_TRANSACTION.applied"),
+	assert.Equal(t, EventCategorySystem, EventCategory("BULK_TRANSACTION.applied"),
 		"the prefix test is case-sensitive too, for the same reason: producers compose the lower-case prefix literally")
+
+	assert.False(t, IsCataloguedEventType("TRANSACTION.APPLIED"),
+		"case folding is absent from the catalogue membership test as well, or the two readers of eventTypeCategories would disagree about the same input")
 }
 
 // TestBulkTransactionEventPrefix_IsTheProducerLiteral pins the prefix constant to
@@ -409,9 +456,10 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 	assert.Equal(t, "identities", EventCategoryIdentities,
 		"the identities token composes blnk.identities and blnk.identities.dlt")
 	assert.Equal(t, "system", EventCategorySystem,
-		"the system token composes blnk.system and blnk.system.dlt — the deliberate fourth category that keeps ledger and system-error events covered")
-	assert.Equal(t, "quarantine", EventCategoryQuarantine,
-		"the quarantine token composes blnk.quarantine and blnk.quarantine.dlt — the catch-all that keeps an unrecognised event type published rather than dropped, and it is pinned for the same reason as the other four: renaming it renames two real Kafka topics")
+		"the system token composes blnk.system and blnk.system.dlt — the deliberate fourth category that keeps ledger and system-error events covered, and the catch-all that keeps an unrecognised event type published rather than dropped")
+
+	assert.Len(t, AllEventCategories(), 4,
+		"the topic contract is four categories and eight topics: a fifth would silently oblige the provisioning script, the Kubernetes configuration, the local stack and every subscriber's topic list to change with it")
 
 	// Every token must be mutually distinct, or two categories would collapse onto
 	// one topic and a subscriber filtering by topic would receive events it never
@@ -421,7 +469,6 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 		EventCategoryBalances:     {},
 		EventCategoryIdentities:   {},
 		EventCategorySystem:       {},
-		EventCategoryQuarantine:   {},
 	}
 	assert.Len(t, distinct, len(AllEventCategories()),
 		"the category tokens must be mutually distinct: two sharing a value would silently merge two topics into one")
@@ -443,15 +490,21 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 	}
 }
 
-// TestPublishStatus_HasExactlyTheThreeReportedOutcomes pins the per-attempt
-// publish outcome vocabulary.
+// TestPublishStatus_HasExactlyTheFourReportedOutcomes pins the per-attempt
+// publish outcome vocabulary — ALL of it.
 //
 // The metrics layer uses these values verbatim as metric attribute values — the
 // publish-attempts counter is attributed by outcome — so a drift here does not
 // break a build, it breaks the alerting queries that select on those attribute
 // values. Declaring the vocabulary once and pinning it once is what stops the code
 // and the label set from diverging unnoticed.
-func TestPublishStatus_HasExactlyTheThreeReportedOutcomes(t *testing.T) {
+//
+// The FOURTH value is the reason this test is worth reading. It used to assert three
+// outcomes while the code declared four, so "failed" — the outcome a permanently
+// undeliverable event reports — was the one value no test covered, in the very test
+// whose job is to pin the label set an alerting query selects on. A vocabulary test
+// that omits a member is worse than none: it reads as proof of completeness.
+func TestPublishStatus_HasExactlyTheFourReportedOutcomes(t *testing.T) {
 	// PublishStatus is a named string type, so the comparison is made on the
 	// converted value: a typed constant and an untyped string literal are not
 	// deeply equal, and asserting them directly would fail for the wrong reason.
@@ -461,6 +514,8 @@ func TestPublishStatus_HasExactlyTheThreeReportedOutcomes(t *testing.T) {
 		"a failure inside the retry budget is reported as \"retrying\", distinguishing a transient blip from a final give-up in the metrics")
 	assert.Equal(t, "dead_lettered", string(PublishStatusDeadLettered),
 		"retry exhaustion is reported as \"dead_lettered\", the value the dead-letter alerting rule selects on")
+	assert.Equal(t, "failed", string(PublishStatusFailed),
+		"an attempt that failed with nothing further to try — a permanent failure, or the last attempt the budget allowed — is reported as \"failed\", which is what keeps a permanently stuck event distinguishable from a busy one in the attempts counter")
 
 	assert.Equal(t, reflect.String, reflect.TypeOf(PublishStatusDispatched).Kind(),
 		"PublishStatus must remain a string-kinded named type so it can be used directly as a metric attribute value without conversion tables")
@@ -469,9 +524,16 @@ func TestPublishStatus_HasExactlyTheThreeReportedOutcomes(t *testing.T) {
 		PublishStatusDispatched:   {},
 		PublishStatusRetrying:     {},
 		PublishStatusDeadLettered: {},
+		PublishStatusFailed:       {},
 	}
-	assert.Len(t, distinct, 3,
-		"exactly three outcomes are reported, and they must be mutually distinct: collapsing two would make a retry indistinguishable from a success in the metrics")
+	assert.Len(t, distinct, 4,
+		"exactly four outcomes are reported, and they must be mutually distinct: collapsing two would make a retry indistinguishable from a success — or a permanent failure indistinguishable from a retryable one — in the metrics")
+
+	// The outcome vocabulary and the durable row-state vocabulary overlap in spelling
+	// and must not be confused: "failed" is an attempt outcome that is never persisted
+	// as a row status, and a row's terminal failure state is "dead_lettered".
+	assert.NotEqual(t, EventOutboxStatusFailed, string(PublishStatusRetrying),
+		"the attempt outcome and the row state vocabularies are separate; a retrying attempt is not a failed row")
 }
 
 // TestEventOutboxStatus_ValuesAndLineageRelationship pins the durable outbox
@@ -936,14 +998,22 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 	typ := reflect.TypeOf(EventOutbox{})
 
 	t.Run("the complete tag set matches the table columns", func(t *testing.T) {
-		// The four documented groups, in declaration order: the event envelope,
-		// the relay state machine, the dual-delivery marker, and the dead-letter
-		// record. Option suffixes such as ",omitempty" are stripped before
-		// comparing, because the column name is the tag's name portion only.
+		// The five documented groups, in declaration order: the event envelope,
+		// the relay state machine, the dual-delivery marker, the broker coordinate,
+		// and the dead-letter record. Option suffixes such as ",omitempty" are
+		// stripped before comparing, because the column name is the tag's name
+		// portion only.
 		expected := []string{
 			// event envelope
 			"id", "event_id", "event_type", "aggregate_id", "partition_key", "ledger_id",
-			"topic", "schema_version", "payload", "occurred_at",
+			// created_at accompanies occurred_at and is NOT a duplicate of it.
+			// occurred_at is the DOMAIN instant and owns every ordering guarantee;
+			// created_at is when the row became durable, and it is the start of the
+			// interval acceptance criterion V-1 is stated over. The relay reads it so
+			// the publish-latency histogram includes the queue wait — measuring from
+			// the claim instead lets a relay an hour behind report the same p99 as an
+			// idle one.
+			"topic", "schema_version", "payload", "occurred_at", "created_at",
 			// relay state machine. next_attempt_at is the DURABLE form of the
 			// configured backoff: the claim predicate is next_attempt_at <= NOW(),
 			// which is what keeps a retrying row out of the claimable set for the
@@ -951,14 +1021,27 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 			"status", "attempts", "max_attempts", "next_attempt_at", "last_error",
 			"first_attempted_at", "last_attempted_at", "dispatched_at", "locked_until",
 			"claim_token",
-			// dual-delivery marker
-			"webhook_dispatched",
+			// dual-delivery marker. All three go at the sunset. kafka_dispatched_at
+			// records the KAFKA leg independently of dispatched_at, which is what lets a
+			// row whose webhook enqueue failed stay claimable for the webhook alone
+			// instead of being marked finished with that delivery lost; webhook_attempts
+			// is the legacy leg's own budget, separate so a webhook receiver being down
+			// cannot spend a Kafka retry attempt.
+			"webhook_dispatched", "kafka_dispatched_at", "webhook_attempts",
+			// broker coordinate. WHERE this row's record actually landed, which is what
+			// turns "this row claims a publication" into "this row IS that record" and so
+			// what makes the zero-loss reconciliation able to detect loss at all: counting
+			// alone cannot tell a surplus of redeliveries from a surplus that is masking an
+			// equal number of losses. The topic is stored explicitly rather than inferred
+			// from status, because a dispatched row's record is on `topic` and a
+			// dead-lettered row's is on `dlt_topic`.
+			"kafka_topic", "kafka_partition", "kafka_offset",
 			// dead-letter record
 			"dlt_topic", "failure_metadata",
 		}
 
 		assert.Equal(t, expected, jsonTagNames(t, typ),
-			"every json tag must match its event outbox column name, in the four documented groups: the repository scans rows into this struct, so a rename here is a runtime scan failure on a live ledger write rather than a compile error")
+			"every json tag must match its event outbox column name, in the five documented groups: the repository scans rows into this struct, so a rename here is a runtime scan failure on a live ledger write rather than a compile error")
 		assert.Equal(t, len(expected), typ.NumField(),
 			"the row must declare exactly these %d fields — an extra field with no column, or a column with no field, breaks the insert and claim statements at runtime", len(expected))
 	})
@@ -976,6 +1059,11 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 			"LastAttemptedAt":  "nil until the row is first claimed, and is what the retry bookkeeping advances on each attempt",
 			"DispatchedAt":     "nil until the broker acknowledges the publish, and is set together with the dispatched status",
 			"LockedUntil":      "nil while the row is unclaimed; a non-nil expired lease is what makes a crashed relay's in-flight work claimable again rather than stranded",
+			// SUNSET: goes with the legacy leg. nil is load-bearing here — it is what the
+			// relay reads as "the Kafka leg is not done yet", and a zero instant would
+			// instead read as "published in the year 1", so the relay would skip the
+			// publish and the event would never reach its topic.
+			"KafkaDispatchedAt": "nil until the Kafka leg is acknowledged; a non-nil value is what tells the relay to deliver only the outstanding webhook and publish nothing",
 		}
 		for name, why := range nullable {
 			field, ok := typ.FieldByName(name)
@@ -992,13 +1080,26 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 			"OccurredAt must be a plain time.Time, not a pointer: it is always known at insert time, and the relay claims rows in ascending occurred_at order, so a NULL would have no defined position in the FIFO ordering")
 	})
 
+	t.Run("created_at is not nullable and is distinct from occurred_at", func(t *testing.T) {
+		created, ok := typ.FieldByName("CreatedAt")
+		require.True(t, ok,
+			"EventOutbox must declare CreatedAt: it is the durable capture instant acceptance criterion V-1's outbox-to-Kafka latency is measured from, and without it the relay can only time from the claim, which excludes the backlog")
+		assert.Equal(t, reflect.TypeOf(time.Time{}), created.Type,
+			"CreatedAt must be a plain time.Time: its column is NOT NULL with a NOW() default, so it always has a value")
+
+		occurred, ok := typ.FieldByName("OccurredAt")
+		require.True(t, ok)
+		assert.NotEqual(t, created.Index, occurred.Index,
+			"the two must be separate fields: a backfilled or replayed mutation carries an earlier occurred_at than its created_at, and collapsing them would either publish it out of domain order or misreport its latency")
+	})
+
 	t.Run("the state and counter fields have their storage types", func(t *testing.T) {
 		id, ok := typ.FieldByName("ID")
 		require.True(t, ok, "EventOutbox must declare ID")
 		assert.Equal(t, reflect.Int64, id.Type.Kind(),
 			"ID must be int64 to hold a BIGSERIAL surrogate key without overflow")
 
-		for _, name := range []string{"Attempts", "MaxAttempts", "SchemaVersion"} {
+		for _, name := range []string{"Attempts", "MaxAttempts", "SchemaVersion", "WebhookAttempts"} {
 			field, ok := typ.FieldByName(name)
 			require.True(t, ok, "EventOutbox must declare %s", name)
 			assert.Equal(t, reflect.Int, field.Type.Kind(),
@@ -1036,7 +1137,11 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 			// event types that genuinely have no ledger.
 			"partition_key": false, "ledger_id": true,
 			"topic": false, "schema_version": false, "payload": false,
-			"occurred_at": false, "status": false, "attempts": false, "max_attempts": false,
+			// created_at is NOT NULL with a NOW() default, so it always has a value and
+			// is always reported. It is what a reader of a dead-letter response needs to
+			// tell an event that was captured minutes ago from one captured last week.
+			"occurred_at": false, "created_at": false,
+			"status": false, "attempts": false, "max_attempts": false,
 			// next_attempt_at is NOT NULL on the table with a NOW() default, so it
 			// always has a value and is always reported. Omitting it would make "due
 			// now" indistinguishable from "the field was not populated", which is the
@@ -1046,9 +1151,19 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 			"dispatched_at": true, "locked_until": true,
 			// claim_token is empty on an unclaimed row and cleared at a terminal
 			// state, so its absence is meaningful and should not render as a null.
-			"claim_token":        true,
-			"webhook_dispatched": false,
-			"dlt_topic":          true, "failure_metadata": true,
+			"claim_token": true,
+			// webhook_attempts is NOT NULL with a zero default, exactly like attempts, so
+			// it is always reported: a caller triaging a stuck legacy leg needs to see the
+			// zero. kafka_dispatched_at IS omitted while it is nil, because "the Kafka leg
+			// is not done" is genuinely the absence of a value rather than a zero one.
+			"webhook_dispatched": false, "kafka_dispatched_at": true, "webhook_attempts": false,
+			// The broker coordinate is omitted while absent, and its absence is
+			// MEANINGFUL: it is what the zero-loss audit counts as an unconfirmed
+			// publication. Rendering "kafka_partition": 0 for a row that has none would
+			// be worse than omitting it, because partition 0 is a real partition and a
+			// reader would follow it.
+			"kafka_topic": true, "kafka_partition": true, "kafka_offset": true,
+			"dlt_topic": true, "failure_metadata": true,
 		}
 		require.Len(t, omitempty, typ.NumField(), "every field must have a documented omitempty expectation")
 
@@ -1235,14 +1350,18 @@ func TestCredentialFingerprint_IsShortAndDerivedFromTheDigest(t *testing.T) {
 		"two distinct credentials must produce distinct fingerprints, or the fingerprint answers nothing")
 }
 
-// TestEventSubscriber_PartitionKeyPrefixIsNotAnAccessCheck pins the behavioural half of
-// the unenforceable-isolation finding.
+// TestEventSubscriber_PartitionKeyPrefixIsNotAnAccessCheck pins where the key scope is and is
+// not decided.
 //
-// The documentation now says plainly that PartitionKeyPrefix is advisory, but a reader
-// can only trust that if the code agrees. HasTopicAccess must therefore answer purely
-// from the recorded topic grant: a subscriber with a prefix set is not thereby
-// restricted, and a subscriber with no prefix is not thereby widened, because the
-// prefix has no bearing on what the broker will serve.
+// The prefix IS part of the enforced access model, but it is enforced as exclusivity over a
+// topic — a statement about which OTHER subscribers may hold it — and that decision belongs to
+// the service layer, which can see the whole registry. This method answers a different and
+// purely local question: is this topic in this row's grant? So a subscriber with a prefix is
+// not thereby narrowed here, and one without is not thereby widened, because a prefix has no
+// bearing on what the broker will serve to a principal that holds the topic.
+//
+// event_subscriber_test.go covers the other half: that a co-granted key-scoped topic is
+// refused at registration, at update and at issuance.
 func TestEventSubscriber_PartitionKeyPrefixIsNotAnAccessCheck(t *testing.T) {
 	prefix := "acme_"
 	withPrefix := &EventSubscriber{
@@ -1254,7 +1373,7 @@ func TestEventSubscriber_PartitionKeyPrefixIsNotAnAccessCheck(t *testing.T) {
 	}
 
 	assert.True(t, withPrefix.HasTopicAccess("blnk.transactions"),
-		"a recorded topic grant is what HasTopicAccess reports; the key prefix does not narrow it, because Kafka cannot enforce a key restriction")
+		"a recorded topic grant is what HasTopicAccess reports; the key prefix does not narrow it here, because Kafka cannot enforce a key restriction and exclusivity is decided over the whole registry")
 	assert.True(t, withoutPrefix.HasTopicAccess("blnk.transactions"),
 		"the absence of a prefix does not widen the grant either — the two subscribers have identical broker-side access")
 	assert.False(t, withPrefix.HasTopicAccess("blnk.balances"),
@@ -1428,4 +1547,145 @@ func TestIsInSubscriberGroupNamespace_RequiresAProperLeaf(t *testing.T) {
 
 	assert.False(t, IsInSubscriberGroupNamespace(namespace+"default", ""),
 		"an empty namespace must match nothing rather than everything")
+}
+
+// ---------------------------------------------------------------------------
+// Webhook destination policy (SSRF-01)
+// ---------------------------------------------------------------------------
+
+// TestInternalIPReason_RefusesEveryRangeThatCannotBeReachedPublicly is the deny-list, stated
+// as a table.
+//
+// It is a table because the deny-list's whole failure mode is a range quietly falling off it.
+// A prose test that checked "loopback is refused" would pass forever while 100.64.0.0/10 went
+// missing, and 100.64.0.0/10 is the one an attacker on GKE actually uses.
+func TestInternalIPReason_RefusesEveryRangeThatCannotBeReachedPublicly(t *testing.T) {
+	cases := []struct {
+		address string
+		expect  string
+		why     string
+	}{
+		{"127.0.0.1", "loopback", "the canonical loopback address"},
+		{"127.9.9.9", "loopback", "the whole of 127/8 is loopback, not just .0.1"},
+		{"::1", "loopback", "the IPv6 loopback"},
+		{"::ffff:127.0.0.1", "loopback", "the IPv4-mapped spelling of loopback must not read as unfamiliar text"},
+		{"169.254.169.254", "metadata", "the AWS/GCP/Azure instance metadata endpoint"},
+		{"169.254.0.1", "metadata", "all of link-local, not only the metadata address itself"},
+		{"fe80::1", "metadata", "IPv6 link-local"},
+		{"10.0.0.5", "private", "RFC1918 10/8, where Blnk's own Postgres lives"},
+		{"172.16.0.1", "private", "RFC1918 172.16/12"},
+		{"192.168.1.1", "private", "RFC1918 192.168/16"},
+		{"fd00::1", "private", "IPv6 unique-local"},
+		{"0.0.0.0", "unspecified", "the unspecified address routes to a local listener"},
+		{"::", "unspecified", "the IPv6 unspecified address"},
+		{"224.0.0.1", "multicast", "IPv4 multicast, which is ALSO link-local — the reason must name multicast, not the metadata endpoint"},
+		{"ff02::1", "multicast", "IPv6 link-local multicast, same overlap"},
+		{"239.1.2.3", "multicast", "IPv4 administratively-scoped multicast, which is not link-local"},
+		{"100.64.0.1", "carrier-grade NAT", "RFC 6598, where the GKE metadata proxy lives — IsPrivate does not classify it"},
+		{"100.127.255.254", "carrier-grade NAT", "the far end of the /10, to prove the mask is right"},
+		{"192.0.0.1", "protocol-assignment", "RFC 6890 IETF protocol assignments are not publicly routable"},
+		{"198.18.0.1", "benchmarking", "RFC 2544 benchmarking range"},
+		{"198.19.255.255", "benchmarking", "the far end of the /15"},
+		{"64:ff9b::7f00:1", "NAT64", "127.0.0.1 smuggled through the NAT64 well-known prefix"},
+		{"64:ff9b::a00:5", "NAT64", "10.0.0.5 smuggled through the same prefix"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.address, func(t *testing.T) {
+			parsed := net.ParseIP(tc.address)
+			require.NotNil(t, parsed, "the fixture itself must be a parseable address")
+
+			reason := InternalIPReason(parsed)
+			require.NotEmpty(t, reason, "%s must be refused: %s", tc.address, tc.why)
+			assert.Contains(t, reason, tc.expect,
+				"the reason must name the rule that refused it, so an operator reading the log "+
+					"learns what they pointed Blnk at rather than that a policy exists")
+		})
+	}
+}
+
+// TestInternalIPReason_PermitsOrdinaryPublicAddresses is the other half: a deny-list that
+// refuses everything is not a deny-list, it is an outage.
+func TestInternalIPReason_PermitsOrdinaryPublicAddresses(t *testing.T) {
+	for _, address := range []string{
+		"93.184.216.34",        // example.com
+		"1.1.1.1",              // a well-known public resolver
+		"8.8.8.8",              // another
+		"2606:4700:4700::1111", // public IPv6
+		"64:ff9b::5d5c:d822",   // NAT64-wrapped 93.92.216.34 — public, so the wrapper is not itself a reason
+	} {
+		assert.Empty(t, InternalIPReason(net.ParseIP(address)),
+			"%s is publicly routable and must be deliverable", address)
+	}
+}
+
+// TestInternalIPReason_RefusesAnAddressItCouldNotUnderstand pins the fail-closed direction.
+//
+// A nil address reaches this function when a caller could not parse what it was about to
+// dial. Answering "" there would permit exactly the case nobody can reason about, which is
+// how deny-lists come apart.
+func TestInternalIPReason_RefusesAnAddressItCouldNotUnderstand(t *testing.T) {
+	assert.NotEmpty(t, InternalIPReason(nil),
+		"an unparseable address must be refused, not permitted by omission")
+}
+
+// TestOperatorOwnableInternalIP_DrawsTheLineAtWhatAnOperatorCanOwn pins the TIERING, which is
+// the part of this policy a reviewer is most likely to get wrong.
+//
+// The assertion an operator makes is "this network is mine". Loopback and RFC1918 are claims
+// they can truthfully make. The metadata endpoint is not — nobody owns 169.254.169.254 — so no
+// configuration may reach it. This function is what keeps the flag from being an off switch.
+func TestOperatorOwnableInternalIP_DrawsTheLineAtWhatAnOperatorCanOwn(t *testing.T) {
+	t.Run("ranges an operator can plausibly own", func(t *testing.T) {
+		for _, address := range []string{"127.0.0.1", "::1", "10.0.0.5", "172.20.1.1", "192.168.0.9", "fd00::1"} {
+			assert.True(t, OperatorOwnableInternalIP(net.ParseIP(address)),
+				"%s is a network an operator can legitimately run a webhook receiver on", address)
+		}
+	})
+
+	t.Run("ranges no assertion may open", func(t *testing.T) {
+		for _, address := range []string{
+			"169.254.169.254", // the metadata endpoint
+			"fe80::1",         // IPv6 link-local
+			"0.0.0.0",         // unspecified
+			"224.0.0.1",       // multicast
+			"100.64.0.1",      // carrier-grade NAT
+			"198.18.0.1",      // benchmarking
+			"192.0.0.1",       // protocol assignments
+			"64:ff9b::7f00:1", // loopback smuggled through NAT64
+			"64:ff9b::a00:5",  // RFC1918 smuggled through NAT64
+		} {
+			assert.False(t, OperatorOwnableInternalIP(net.ParseIP(address)),
+				"%s must stay refused even when the operator asserts ownership of their network", address)
+		}
+	})
+
+	t.Run("nil", func(t *testing.T) {
+		assert.False(t, OperatorOwnableInternalIP(nil),
+			"an address that could not be parsed is not one anybody can claim to own")
+	})
+}
+
+// TestInternalDestinationReason_JudgesNamesOnShapeAndLiteralsOnAddress pins the two modes.
+func TestInternalDestinationReason_JudgesNamesOnShapeAndLiteralsOnAddress(t *testing.T) {
+	t.Run("names that can only resolve inside the network", func(t *testing.T) {
+		assert.Contains(t, InternalDestinationReason("localhost"), "loopback")
+		assert.Contains(t, InternalDestinationReason("app.localhost"), "loopback")
+		assert.Contains(t, InternalDestinationReason("printer.local"), "internal-only")
+		assert.Contains(t, InternalDestinationReason("metadata.google.internal"), "internal-only")
+		assert.Contains(t, InternalDestinationReason("postgres"), "unqualified")
+		assert.Contains(t, InternalDestinationReason("LOCALHOST"), "loopback",
+			"the name test is case-insensitive, because DNS is")
+	})
+
+	t.Run("literals are decided by the address policy", func(t *testing.T) {
+		assert.Contains(t, InternalDestinationReason("169.254.169.254"), "metadata")
+		assert.Contains(t, InternalDestinationReason("64:ff9b::7f00:1"), "NAT64",
+			"a literal is judged by InternalIPReason, so every range it covers is covered here too")
+	})
+
+	t.Run("ordinary public names and addresses", func(t *testing.T) {
+		assert.Empty(t, InternalDestinationReason("hooks.example.com"))
+		assert.Empty(t, InternalDestinationReason("93.184.216.34"))
+	})
 }

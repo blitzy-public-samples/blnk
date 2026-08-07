@@ -2351,3 +2351,200 @@ func TestUpdateBalanceSet_ReturnsConflictWhenAChunkMissesABalance(t *testing.T) 
 	assert.NoError(t, tx.Rollback())
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
+
+// TestRecordTransaction_CommitsTheEventWithTheTransaction is requirement R-2 for the REJECTION
+// path, which is the one path that persists a status mutation through RecordTransaction.
+//
+// transaction.rejected used to be captured after this insert had committed — twice, in fact, once
+// from the rejection's own post-transaction actions and once from the worker's handler — so a
+// crash in between left a transaction durably recorded as REJECTED with nothing telling any
+// subscriber it had been. Supplying an event row moves this method onto a transaction, and the
+// ordered expectations are what pin that: BEGIN, the transaction INSERT, the event INSERT, COMMIT.
+func TestRecordTransaction_CommitsTheEventWithTheTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	transaction := &model.Transaction{
+		TransactionID: "txn_rejected_atomic",
+		Source:        "bln_source",
+		Destination:   "bln_destination",
+		Reference:     "ref_rejected_atomic",
+		AmountString:  "1000",
+		PreciseAmount: model.Int64ToBigInt(1000),
+		Precision:     100,
+		Currency:      "USD",
+		Status:        "REJECTED",
+		CreatedAt:     time.Now(),
+		ScheduledFor:  time.Now(),
+		MetaData:      map[string]interface{}{"blnk_rejection_reason": "insufficient funds"},
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO blnk.transactions").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery("INSERT INTO blnk.event_outbox").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(99)))
+	mock.ExpectCommit()
+
+	event := &model.EventOutbox{
+		EventID:      "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d",
+		EventType:    "transaction.rejected",
+		AggregateID:  transaction.TransactionID,
+		PartitionKey: transaction.Source,
+		Topic:        "blnk.transactions",
+		Payload:      json.RawMessage(`{"event":"transaction.rejected","data":{}}`),
+	}
+
+	result, err := ds.RecordTransaction(context.Background(), transaction, event)
+
+	assert.NoError(t, err)
+	assert.Equal(t, transaction, result)
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"the transaction and its event must be inserted inside ONE transaction, in that order")
+	assert.NotZero(t, event.ID, "the insert must write the generated id back onto the row")
+}
+
+// TestRecordTransaction_AFailedEventInsertPersistsNothing pins the direction of the guarantee that
+// matters most: the mutation cannot outlive its event.
+//
+// A duplicate event id is the realistic cause — the id is derived from the transaction's identity
+// and status, so a retried rejection presents the same one — and the correct outcome is that the
+// whole attempt fails and nothing is committed, leaving the caller free to retry. Committing the
+// REJECTED row while the event was refused would produce a rejection nobody is told about.
+func TestRecordTransaction_AFailedEventInsertPersistsNothing(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO blnk.transactions").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery("INSERT INTO blnk.event_outbox").
+		WillReturnError(&pq.Error{Code: "23505", Message: "unique_violation"})
+	mock.ExpectRollback()
+
+	transaction := &model.Transaction{
+		TransactionID: "txn_conflict",
+		AmountString:  "1000",
+		PreciseAmount: model.Int64ToBigInt(1000),
+		Status:        "REJECTED",
+		CreatedAt:     time.Now(),
+		ScheduledFor:  time.Now(),
+	}
+
+	result, err := ds.RecordTransaction(context.Background(), transaction, &model.EventOutbox{
+		EventID:      "8b9c0d1e-2f3a-4b4c-8d5e-6f7a8b9c0d1e",
+		EventType:    "transaction.rejected",
+		AggregateID:  transaction.TransactionID,
+		PartitionKey: transaction.TransactionID,
+		Topic:        "blnk.transactions",
+		Payload:      json.RawMessage(`{"event":"transaction.rejected","data":{}}`),
+	})
+
+	assert.Error(t, err)
+	assert.Nil(t, result)
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"the transaction INSERT must be rolled back when its event cannot be recorded")
+}
+
+// TestRecordTransaction_RejectsMoreThanOneEventPerTransaction pins the cardinality invariant at
+// this writer too.
+//
+// Two rows for one transaction is a duplicate publication, and it is undetectable afterwards
+// because the transaction row is there and the extra event looks like any other. resolveEventOutboxes
+// refuses it BEFORE anything is persisted, so the refusal costs nothing.
+func TestRecordTransaction_RejectsMoreThanOneEventPerTransaction(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	row := func(id string) *model.EventOutbox {
+		return &model.EventOutbox{
+			EventID:      id,
+			EventType:    "transaction.rejected",
+			AggregateID:  "txn_two_events",
+			PartitionKey: "txn_two_events",
+			Topic:        "blnk.transactions",
+			Payload:      json.RawMessage(`{"event":"transaction.rejected","data":{}}`),
+		}
+	}
+
+	result, err := ds.RecordTransaction(context.Background(), &model.Transaction{
+		TransactionID: "txn_two_events",
+		AmountString:  "1000",
+		PreciseAmount: model.Int64ToBigInt(1000),
+		Status:        "REJECTED",
+		CreatedAt:     time.Now(),
+		ScheduledFor:  time.Now(),
+	}, row("9c0d1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f"), row("0d1e2f3a-4b5c-4d6e-8f7a-8b9c0d1e2f3a"))
+
+	assert.Error(t, err)
+	assert.Nil(t, result)
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"the refusal must happen before any statement is issued, so no transaction is opened")
+}
+
+// TestRecordTransaction_WithoutAnEventIssuesOneStatement keeps the frozen transaction-queue
+// callers on exactly the path they had.
+//
+// transaction_queue.go and transaction_inflight.go call this method with no event row and belong
+// to the transaction-processing pipeline this change may not edit. A BEGIN appearing here would
+// change their SQL for no benefit, and would break every expectation written against them.
+func TestRecordTransaction_WithoutAnEventIssuesOneStatement(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec("INSERT INTO blnk.transactions").WillReturnResult(sqlmock.NewResult(1, 1))
+
+	transaction := &model.Transaction{
+		TransactionID: "txn_plain",
+		AmountString:  "1000",
+		PreciseAmount: model.Int64ToBigInt(1000),
+		Status:        "QUEUED",
+		CreatedAt:     time.Now(),
+		ScheduledFor:  time.Now(),
+	}
+
+	result, err := ds.RecordTransaction(context.Background(), transaction)
+
+	assert.NoError(t, err)
+	assert.Equal(t, transaction, result)
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"a record with no event must issue exactly one statement and open no transaction")
+}
+
+// TestRecordTransaction_ANilEventIssuesOneStatement covers the unconfigured deployment on the
+// rejection path: PrepareEventOutbox returns nil, RejectTransaction passes it anyway rather than
+// branching, and the writer must treat that as "no event" instead of opening a transaction.
+func TestRecordTransaction_ANilEventIssuesOneStatement(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec("INSERT INTO blnk.transactions").WillReturnResult(sqlmock.NewResult(1, 1))
+
+	transaction := &model.Transaction{
+		TransactionID: "txn_nil_event",
+		AmountString:  "1000",
+		PreciseAmount: model.Int64ToBigInt(1000),
+		Status:        "REJECTED",
+		CreatedAt:     time.Now(),
+		ScheduledFor:  time.Now(),
+	}
+
+	result, err := ds.RecordTransaction(context.Background(), transaction, nil)
+
+	assert.NoError(t, err)
+	assert.Equal(t, transaction, result)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}

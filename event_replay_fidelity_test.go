@@ -506,6 +506,7 @@ func (s *replayFidelityStore) MarkEventDeadLettered(
 	id int64,
 	claimToken, dltTopic string,
 	failureMetadata json.RawMessage,
+	record model.BrokerRecord,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -535,7 +536,12 @@ func (s *replayFidelityStore) MarkEventDeadLettered(
 }
 
 // MarkEventDispatched applies the post-replay transition.
-func (s *replayFidelityStore) MarkEventDispatched(_ context.Context, id int64, claimToken string) error {
+func (s *replayFidelityStore) MarkEventDispatched(
+	_ context.Context,
+	id int64,
+	claimToken string,
+	_ model.BrokerRecord,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

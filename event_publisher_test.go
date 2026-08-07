@@ -14,50 +14,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Tests for the event publisher: the contract it exposes, the settings it publishes with,
-// and the process-wide lifecycle of the instance that does the publishing.
+// Tests for the event publisher: the contract it exposes, the settings it publishes with, and
+// the process-wide lifecycle of the instance that does the publishing.
 //
-// # The two halves of this file, and why they are one file
+// The first half covers the PROCESS-WIDE LIFECYCLE — which instance a caller gets, when it is
+// rebuilt, and who may close it. The second half, from "The mandated contract, the writer
+// settings, and the wire form of one publish", covers ONE PUBLISH. Both rest on the same
+// load-bearing property: construction performs no I/O, so a publisher can be built, inspected
+// and published through in a unit test with no broker anywhere.
 //
-// The first half is the PROCESS-WIDE LIFECYCLE — which instance a caller gets, when it is
-// rebuilt, and who may close it. The second half, beginning at "The mandated contract, the
-// writer settings, and the wire form of one publish", is ONE PUBLISH — the interface it is
-// made through, the three load-bearing writer settings, the key that decides its partition,
-// the bytes that reach the topic, what the publisher reports afterwards, and what it records
-// while doing so. They belong together because they are two views of the same object, and
-// because both rest on the same load-bearing property: construction performs no I/O, so a
-// publisher can be built, inspected and published through in a unit test with no broker
-// anywhere.
+// A publisher is one Kafka writer per owned topic over ONE SHARED TRANSPORT, so the writers
+// share its connection pool and its authentication configuration; connections are established
+// lazily per broker and reused. Constructing it performs no I/O at all — kafka.TCP only
+// canonicalises address strings and a SCRAM mechanism is pure computation — but the FIRST WRITE
+// through the transport dials a broker and authenticates. That asymmetry is the subject of the
+// lifecycle half: a publisher is cheap to build and expensive to use for the first time, so
+// building one per request means continuous connection and authentication churn.
 //
-// # What the lifecycle half defends
+// The lifecycle properties are therefore about IDENTITY and OWNERSHIP: one instance is reused
+// across callers; a configuration change rebuilds it so a rotated SASL credential takes effect;
+// the cache key never carries a credential in the clear; and an INJECTED publisher is never
+// closed or replaced by this package, because the relay's publisher outlives anything that
+// borrows it.
 //
-// A publisher is one Kafka writer per owned topic over one shared transport with one SASL
-// session per broker. Constructing it performs no I/O at all — kafka.TCP only canonicalises
-// address strings and a SCRAM mechanism is pure computation — but the FIRST WRITE on each
-// writer dials a broker and negotiates SASL. That asymmetry is the whole subject here: a
-// publisher is cheap to build and expensive to use for the first time, so building one per
-// request is not a minor inefficiency but continuous connection and SASL churn against the
-// broker, with a fresh principal session per request.
-//
-// The properties asserted are therefore about IDENTITY and OWNERSHIP rather than about
-// publishing:
-//
-//   - One instance is reused across callers, because reuse is the entire point.
-//   - A configuration change rebuilds it, because a rotated SASL credential must take
-//     effect; a publisher still holding the old one authenticates as nobody, and every
-//     publish through it fails for a reason that looks nothing like the real cause.
-//   - The cache key never carries a credential in the clear, matching the repository's
-//     posture of keeping non-reversible references rather than secrets.
-//   - An INJECTED publisher is never closed or replaced by this package. The relay's
-//     publisher outlives anything that borrows it, and closing it would take a live
-//     transport down while every later publish failed on a closed writer.
-//
-// None of the lifecycle tests contact a broker, and none can: every publisher resolved there
-// is either the no-op implementation or a Kafka publisher whose writers are never written to.
-// The publish tests in the second half DO write, but every write is intercepted at
-// kafka.Writer.Transport by an in-memory fake round tripper, so the whole file runs under
-// `go test -short` with no Kafka, no credentials and — as one of its own assertions proves —
-// no name resolution.
+// No lifecycle test contacts a broker. The publish tests DO write, but every write is
+// intercepted at kafka.Writer.Transport by an in-memory fake round tripper, so the whole file
+// runs under `go test -short` with no Kafka, no credentials and — as one of its own assertions
+// proves — no name resolution.
 
 package blnk
 
@@ -69,7 +52,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -81,6 +63,8 @@ import (
 	"github.com/segmentio/kafka-go/protocol"
 	metadataAPI "github.com/segmentio/kafka-go/protocol/metadata"
 	produceAPI "github.com/segmentio/kafka-go/protocol/produce"
+	"github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
@@ -141,12 +125,11 @@ func storeKafkaConfig(t *testing.T, kafka config.KafkaConfig) {
 
 // TestSharedEventPublisher_ReusesOneInstancePerProcess is the connection-reuse property.
 //
-// Building a publisher costs no I/O, but the first write on each of its eight writers dials
-// a broker and negotiates SASL. A caller that builds one per request therefore pays
-// connection setup and a SASL handshake per request and then tears it all down — which under
-// concurrent replays is continuous churn, with the broker opening a fresh principal session
-// every time. Handing back the same instance is what removes that, so identity is the
-// property asserted, not merely "a publisher is returned".
+// Building a publisher costs no I/O, but the first write through its shared transport dials a
+// broker and authenticates. A caller that builds one per request pays that setup per request
+// and then tears it down, which under concurrent replays is continuous churn. Handing back the
+// same instance removes it, so IDENTITY is the property asserted rather than "a publisher is
+// returned".
 func TestSharedEventPublisher_ReusesOneInstancePerProcess(t *testing.T) {
 	sharedPublisherReset(t)
 	storeKafkaConfig(t, config.KafkaConfig{
@@ -217,33 +200,87 @@ func TestSharedEventPublisher_RebuildsWhenTheConfigurationChanges(t *testing.T) 
 // TestSharedEventPublisher_FingerprintCoversEveryFieldThatChangesThePublisher pins what the
 // cache key is derived from.
 //
-// Under-covering is the dangerous direction: a field omitted from the fingerprint is a change
-// that silently keeps the old publisher, and the SASL secret is the case where that is a
-// production incident rather than an inconvenience. Over-covering merely rebuilds more often
-// than necessary, so the equality cases are asserted too.
+// # Under-covering is the dangerous direction, and it was under-covered
+//
+// The fingerprint IS the cache key, so a transport-affecting field omitted from it is a
+// configuration change that never takes effect — silently, for the lifetime of the process,
+// while the configuration file says otherwise. Three groups were missing and each had a
+// concrete cost:
+//
+//   - The PRODUCER pair, which is the credential kafkaTransportCredentials prefers. Rotating
+//     KAFKA_SASL_SECRET was inert, and it was MOST inert on the recommended least-privilege
+//     deployment: one with a producer principal and no administrative credentials in the
+//     publishing process.
+//   - The whole TLS block. A deployment that switched from SASL_PLAINTEXT to SASL_SSL kept
+//     publishing in the clear.
+//   - InsecureSkipVerify and InsecureLocalDev. Turning verification back on did nothing.
+//
+// Over-covering merely rebuilds more often than necessary, so the equality case is asserted
+// too — and the geometry fields, which belong to topic assurance rather than to the writer,
+// are asserted NOT to rebuild a working transport.
+//
+// The base configuration below sets every field to a non-zero value, which is what makes each
+// mutation discriminating: mutating a field that was already zero to another zero-ish value
+// would produce an equal digest for the right reason and hide the wrong one.
 func TestSharedEventPublisher_FingerprintCoversEveryFieldThatChangesThePublisher(t *testing.T) {
 	base := &config.Configuration{Kafka: config.KafkaConfig{
 		Brokers:         []string{"broker-1:9092"},
 		TopicPrefix:     "blnk",
+		SASLUser:        "producer",
+		SASLSecret:      "producer-secret",
 		SASLAdminUser:   "admin",
 		SASLAdminSecret: "secret",
+		TLS: config.KafkaTLSConfig{
+			Enabled:            true,
+			CAFile:             "/etc/blnk/kafka/ca.pem",
+			CertFile:           "/etc/blnk/kafka/client.pem",
+			KeyFile:            "/etc/blnk/kafka/client-key.pem",
+			ServerName:         "kafka.internal.example.com",
+			InsecureSkipVerify: false,
+		},
+		InsecureLocalDev:     false,
+		MinPartitions:        6,
+		ReplicationFactor:    3,
+		AllowPartitionGrowth: false,
 	}}
 	baseline := eventPublisherFingerprint(base)
 
 	t.Run("differs on", func(t *testing.T) {
 		for name, mutate := range map[string]func(*config.KafkaConfig){
-			"the broker list":  func(k *config.KafkaConfig) { k.Brokers = []string{"broker-2:9092"} },
-			"an added broker":  func(k *config.KafkaConfig) { k.Brokers = []string{"broker-1:9092", "broker-2:9092"} },
-			"the topic prefix": func(k *config.KafkaConfig) { k.TopicPrefix = "acme" },
-			"the SASL user":    func(k *config.KafkaConfig) { k.SASLAdminUser = "other" },
-			"the SASL secret":  func(k *config.KafkaConfig) { k.SASLAdminSecret = "rotated" },
+			"the broker list":     func(k *config.KafkaConfig) { k.Brokers = []string{"broker-2:9092"} },
+			"an added broker":     func(k *config.KafkaConfig) { k.Brokers = []string{"broker-1:9092", "broker-2:9092"} },
+			"the topic prefix":    func(k *config.KafkaConfig) { k.TopicPrefix = "acme" },
+			"the admin user":      func(k *config.KafkaConfig) { k.SASLAdminUser = "other" },
+			"the admin secret":    func(k *config.KafkaConfig) { k.SASLAdminSecret = "rotated" },
+			"the producer user":   func(k *config.KafkaConfig) { k.SASLUser = "other-producer" },
+			"the producer secret": func(k *config.KafkaConfig) { k.SASLSecret = "rotated" },
+			"a producer pair removed": func(k *config.KafkaConfig) {
+				// Falling back to the administrative pair is a DIFFERENT transport identity,
+				// and it is the transition an operator makes in the wrong direction by
+				// clearing a variable.
+				k.SASLUser = ""
+				k.SASLSecret = ""
+			},
+			"TLS being disabled":       func(k *config.KafkaConfig) { k.TLS.Enabled = false },
+			"the CA bundle":            func(k *config.KafkaConfig) { k.TLS.CAFile = "/etc/blnk/kafka/rotated-ca.pem" },
+			"the client certificate":   func(k *config.KafkaConfig) { k.TLS.CertFile = "/etc/blnk/kafka/renewed.pem" },
+			"the client key":           func(k *config.KafkaConfig) { k.TLS.KeyFile = "/etc/blnk/kafka/renewed-key.pem" },
+			"the expected server name": func(k *config.KafkaConfig) { k.TLS.ServerName = "kafka.other.example.com" },
+			"skipping certificate verification": func(k *config.KafkaConfig) {
+				k.TLS.InsecureSkipVerify = true
+			},
+			"acknowledged plaintext development": func(k *config.KafkaConfig) {
+				k.InsecureLocalDev = true
+			},
 		} {
 			t.Run(name, func(t *testing.T) {
 				changed := &config.Configuration{Kafka: base.Kafka}
 				mutate(&changed.Kafka)
 
 				assert.NotEqual(t, baseline, eventPublisherFingerprint(changed),
-					"a change to %s must produce a different publisher", name)
+					"a change to %s must produce a different publisher: an unchanged digest means "+
+						"the cached transport — its connections, its SASL session and its TLS "+
+						"configuration — keeps being handed out, so the change never takes effect", name)
 			})
 		}
 	})
@@ -252,6 +289,25 @@ func TestSharedEventPublisher_FingerprintCoversEveryFieldThatChangesThePublisher
 		same := &config.Configuration{Kafka: base.Kafka}
 		assert.Equal(t, baseline, eventPublisherFingerprint(same),
 			"an equivalent configuration must reuse the publisher rather than rebuild it")
+	})
+
+	t.Run("does not rebuild for topic geometry", func(t *testing.T) {
+		// Geometry is the ADMIN client's business — EnsureTopics reads it — and the writer
+		// never does. Rebuilding the publisher for it would discard a working connection pool
+		// and a live SASL session to change a number nothing on this path consults.
+		for name, mutate := range map[string]func(*config.KafkaConfig){
+			"the partition floor":    func(k *config.KafkaConfig) { k.MinPartitions = 12 },
+			"the replication factor": func(k *config.KafkaConfig) { k.ReplicationFactor = 1 },
+			"partition growth":       func(k *config.KafkaConfig) { k.AllowPartitionGrowth = true },
+		} {
+			t.Run(name, func(t *testing.T) {
+				changed := &config.Configuration{Kafka: base.Kafka}
+				mutate(&changed.Kafka)
+
+				assert.Equal(t, baseline, eventPublisherFingerprint(changed),
+					"%s does not affect the transport, so it must not throw one away", name)
+			})
+		}
 	})
 
 	t.Run("does not collide across a field boundary", func(t *testing.T) {
@@ -266,10 +322,16 @@ func TestSharedEventPublisher_FingerprintCoversEveryFieldThatChangesThePublisher
 			"fields must be separated in the digest, or characters shifted across a boundary collide")
 	})
 
-	t.Run("never carries the secret in the clear", func(t *testing.T) {
-		assert.NotContains(t, baseline, "secret",
-			"the fingerprint is held in memory and may be printed in a diagnostic; it must be a non-reversible digest, never the credential")
-		assert.NotContains(t, baseline, "admin")
+	t.Run("never carries a secret in the clear", func(t *testing.T) {
+		// Both pairs, because both are now digested and either would be a credential in a
+		// diagnostic if the digest were ever replaced by concatenation.
+		for _, forbidden := range []string{"secret", "producer-secret", "admin", "producer"} {
+			assert.NotContains(t, baseline, forbidden,
+				"the fingerprint is held in memory and may be printed in a diagnostic; it must be "+
+					"a non-reversible digest, never %q", forbidden)
+		}
+		assert.NotContains(t, baseline, "kafka.internal.example.com",
+			"nor may it carry the deployment's topology in the clear")
 	})
 
 	t.Run("a nil configuration has its own fingerprint", func(t *testing.T) {
@@ -373,7 +435,7 @@ func TestWriterFor_ResolvesTheConstructedInventoryWithoutGrowing(t *testing.T) {
 	// Derived from the category vocabulary rather than hardcoded: the inventory is one
 	// topic plus one dead-letter sibling per category, and a hardcoded count would fail
 	// the moment a category is added — which has already happened once, when the
-	// quarantine category was introduced for blank and uncatalogued event types.
+	// internal system category is the catch-all for blank and uncatalogued event types.
 	require.Len(t, inventory, len(model.AllEventCategories())*2)
 
 	for _, topic := range inventory {
@@ -393,32 +455,18 @@ func TestWriterFor_ResolvesTheConstructedInventoryWithoutGrowing(t *testing.T) {
 
 // TestWriterFor_RefusesATopicThatIsNotAnOwnedForm is the resource-growth half of the fix.
 //
-// Lazy growth exists for one reason — a topic-prefix change, and stored rows from before
-// one — so every name it legitimately has to accept has the owned shape. A name that does
-// not is not a topic Blnk has ever published to, and caching a writer for it would hold
-// connections open for a destination that cannot be right while letting the cache grow with
-// whatever names happened to arrive.
+// Lazy growth exists for one reason — a topic-prefix change, and stored rows from before one —
+// so every name it legitimately has to accept has the owned shape. Caching a writer for a name
+// that does not would hold connections open for a destination that cannot be right, so the
+// assertion that matters is the second in each case: the writer must NOT have been cached.
 //
-// The assertion that matters is the second one in each case: the writer must NOT have been
-// cached. Returning an error while still caching would leave the growth unbounded and the
 // TestWriterFor_KeepsServingTheConstructedInventoryAfterAPrefixChange is the
-// event-is-never-stranded property, expressed through the mechanism that actually delivers
-// it.
-//
-// An outbox row records its destination topic at INSERT time, so a row written before
-// KAFKA_TOPIC_PREFIX changed still names the previous generation's topic. That row must stay
-// publishable — a committed event the relay can never publish would sit in the outbox for
-// ever, and nothing would fail to say so.
-//
-// What makes it publishable is the PRE-CREATED inventory: the publisher builds a writer for
-// every topic of the prefix it was constructed with, so the historical name is served by the
-// map's fast path and never reaches the ownership check. Lazy growth then covers the other
-// direction — the NEW prefix's topics, which the process has never built a writer for.
-//
-// A generation that predates this process is a different case and is deliberately REFUSED:
-// admitting any '<something>.<category>' name would also admit another system's topic at the
-// one point where a topic name becomes an outbound connection. The remedy is an operator
-// action — restore the prefix, or drain the old topics — not a silent admission.
+// event-is-never-stranded property. An outbox row records its destination topic at INSERT time,
+// so a row written before KAFKA_TOPIC_PREFIX changed still names the previous generation's
+// topic and must stay publishable; the PRE-CREATED inventory serves it from the map's fast path,
+// and lazy growth covers the new prefix's topics. A generation that predates this process is
+// deliberately REFUSED, because admitting any '<something>.<category>' name would also admit
+// another system's topic at the point where a topic name becomes an outbound connection.
 func TestWriterFor_KeepsServingTheConstructedInventoryAfterAPrefixChange(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 	publisher := newTestKafkaPublisher(t)
@@ -604,35 +652,109 @@ func TestWriterFor_IsSafeUnderConcurrentGrowth(t *testing.T) {
 // pointless allocations a day, on the very path whose p99 latency is an acceptance
 // criterion.
 //
-// A level guard cannot be observed from behaviour, so this asserts on the SOURCE: the call
-// must sit inside an IsLevelEnabled check. The complementary assertion matters just as much
-// — the FAILURE log must NOT be guarded, because requirement R-4 mandates the attempt
-// number and error reason on every attempt.
+// # What is asserted, and with which instrument
+//
+// The OBSERVABLE half is asserted by running real publishes through the fake transport and
+// reading what reached the logger, which is what makes it robust: it holds whatever the guard
+// is spelled as, and it fails if the guard is right but the log it protects has been lost.
+//
+//	Debug ON,  publish succeeds -> exactly one Debug entry, carrying every field.
+//	Debug OFF, publish fails    -> exactly one Error entry, carrying attempt and reason.
+//
+// That second case is the important one. Requirement R-4 mandates the attempt number and
+// error reason on EVERY attempt, so the failure log must not be behind a level guard of any
+// kind — and driving a failure with the level pinned above Debug proves it directly, for any
+// guard, rather than for one hard-coded spelling of one.
+//
+// The STRUCTURAL half — that the success call is enclosed by an IsLevelEnabled check — is the
+// part behaviour genuinely cannot reach. logrus filters by level inside Entry.Debug, so an
+// unguarded call and a guarded one are indistinguishable from the outside; only the
+// allocation the guard avoids differs, and that is not something to assert by counting
+// allocations through a whole publish path. So it is read from the AST: an if-statement whose
+// condition calls logrus.IsLevelEnabled, CONTAINING the Debug call. That is containment
+// asserted as containment, replacing an earlier byte-distance comparison that changed its
+// verdict whenever a comment was added between the two lines.
 func TestPublishSuccessLog_IsGuardedByTheDebugLevel(t *testing.T) {
-	source, err := os.ReadFile("event_publisher.go")
-	require.NoError(t, err)
+	t.Run("with debug on, a successful publish logs the whole result", func(t *testing.T) {
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+		relayPinLogLevel(t, logrus.DebugLevel)
 
-	body := string(source)
+		publisher := publisherWithFakeTransport(t, newPublisherFakeTransport())
+		event := publisherEvent(model.EventTypeTransactionApplied, "txn_log_guard_ok", publisherPayload)
 
-	successCall := `logrus.WithFields(result.LogFields()).Debug("ledger event published to kafka")`
-	require.Contains(t, body, successCall,
-		"the success log line must still exist; the fix is to guard it, not to remove the observability")
+		_, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+			Event: event,
+			Topic: TopicForEvent(event.EventType),
+			Key:   publisherLedgerID,
+		})
+		require.NoError(t, err)
 
-	guard := "if logrus.IsLevelEnabled(logrus.DebugLevel) {"
-	guardAt := strings.Index(body, guard)
-	require.Positive(t, guardAt, "the success debug log must be guarded by a level check")
+		entries := relayEntriesWithMessage(hook, "ledger event published to kafka")
+		require.Len(t, entries, 1,
+			"the guard must let the line through when Debug IS enabled: the fix was to guard the "+
+				"call, not to remove the observability, and a guard on the wrong level would "+
+				"silence it permanently")
+		assert.Equal(t, logrus.DebugLevel, entries[0].Level)
+		assert.Len(t, entries[0].Data, len(PublishResult{}.LogFields()),
+			"the guarded call must carry the full field set, which is the allocation it defers")
+	})
 
-	callAt := strings.Index(body, successCall)
-	require.Greater(t, callAt, guardAt,
-		"the guard must PRECEDE the success log call, or it guards something else entirely")
-	assert.Less(t, callAt-guardAt, 120,
-		"the guard must immediately enclose the success log call rather than sit somewhere earlier in the file")
+	t.Run("with debug off, a failed publish still logs every attempt", func(t *testing.T) {
+		// The level is pinned ABOVE Debug on purpose. If the failure log were guarded — by the
+		// Debug level, or by any other level above Error — this is where it disappears.
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+		relayPinLogLevel(t, logrus.ErrorLevel)
 
-	// And the per-attempt failure log is deliberately NOT guarded.
-	failureCall := `logrus.WithFields(result.LogFields()).Error("publishing a ledger event to kafka failed")`
-	require.Contains(t, body, failureCall)
-	assert.NotContains(t, body, "if logrus.IsLevelEnabled(logrus.ErrorLevel)",
-		"requirement R-4 mandates the attempt number and error reason on EVERY attempt, so the failure log must never be level-guarded")
+		transport := newPublisherFakeTransport().failProduceWith(kafka.NotLeaderForPartition)
+		publisher := publisherWithFakeTransport(t, transport)
+		event := publisherEvent(model.EventTypeTransactionApplied, "txn_log_guard_fail", publisherPayload)
+
+		_, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+			Event:   event,
+			Topic:   TopicForEvent(event.EventType),
+			Key:     publisherLedgerID,
+			Attempt: 3,
+		})
+		require.Error(t, err, "the fake broker refused the produce request")
+
+		entries := relayEntriesWithMessage(hook, "publishing a ledger event to kafka failed")
+		require.Len(t, entries, 1,
+			"requirement R-4 mandates the attempt number and error reason on EVERY attempt, so "+
+				"the failure log must never sit behind a level guard")
+		assert.Equal(t, logrus.ErrorLevel, entries[0].Level)
+		assert.Equal(t, 3, entries[0].Data["attempt"],
+			"the attempt number is half of what R-4 requires on every attempt")
+		assert.NotEmpty(t, entries[0].Data["error"], "and the error reason is the other half")
+
+		// Silence at Debug is asserted too, so the case above cannot be satisfied by a logger
+		// that simply emits everything at every level.
+		assert.Empty(t, relayEntriesWithMessage(hook, "ledger event published to kafka"),
+			"nothing succeeded, and nothing may be logged as though it had")
+	})
+
+	t.Run("the success call is structurally enclosed by the level guard", func(t *testing.T) {
+		file := parseRepositoryGoFile(t, "event_publisher.go")
+
+		// The call exists at all. Without this the containment assertion below is satisfied by
+		// a file that stopped logging the success case entirely.
+		require.Positive(t, selectorCallNames(file)["Debug"],
+			"the success debug log must still exist; the fix is to guard it, not to delete it")
+
+		guarded := callsGuardedBy(file, "logrus", "IsLevelEnabled")
+		assert.Positive(t, guarded["Debug"],
+			"a Debug call must sit INSIDE an if whose condition calls logrus.IsLevelEnabled. "+
+				"logrus evaluates the WithFields argument before it checks the level, so an "+
+				"unguarded call builds the whole field map per published event and discards it — "+
+				"about 43 million wasted allocations a day at the 500 events/second the "+
+				"throughput target names, on the path whose p99 latency is an acceptance criterion")
+
+		assert.Zero(t, guarded["Error"],
+			"and no Error call may be enclosed by a level guard: R-4 mandates the attempt number "+
+				"and error reason on every attempt, so a guarded failure log would violate the "+
+				"requirement silently whenever the level was raised")
+	})
 }
 
 // TestPublishResultLogFields_CarriesTheFieldsTheGuardDefers confirms the guard defers real
@@ -655,8 +777,26 @@ func TestPublishResultLogFields_CarriesTheFieldsTheGuardDefers(t *testing.T) {
 	assert.Len(t, fields, 7,
 		"the guard defers building a seven-entry map per published event, which is the allocation the fix removes")
 
-	first := result.LogFields()
-	assert.NotSame(t, &fields, &first, "each call allocates a fresh map, which is precisely why it must not be called when Debug is off")
+	// INDEPENDENCE IS PROVEN BY MUTATION, not by comparing addresses.
+	//
+	// This assertion used to be assert.NotSame(&fields, &first), which compares the addresses
+	// of two LOCAL VARIABLES. Two distinct locals never share an address, so it held for every
+	// possible implementation — including one that returned a single package-level map to every
+	// caller, which is the implementation it was written to rule out. That implementation would
+	// make the level guard pointless (there would be no per-event allocation to defer) and,
+	// worse, would let one log line's fields be mutated by the next event.
+	//
+	// Writing into one map and reading the other is the observation that actually distinguishes
+	// them: a shared map shows the write, a fresh one cannot.
+	second := result.LogFields()
+	second["injected_by_the_test"] = true
+
+	assert.NotContains(t, fields, "injected_by_the_test",
+		"each call must allocate a FRESH map: writing into one returned map must not be visible "+
+			"through another, or the deferred allocation the level guard exists to avoid does not "+
+			"exist and concurrent log lines share mutable state")
+	assert.Len(t, fields, 7, "and the first map must be unchanged by the write to the second")
+	assert.Len(t, second, 8, "while the map that was written to carries the extra entry")
 }
 
 // TestMaxLazyTopicWriters_IsTwoPrefixGenerations checks the arithmetic behind the writer
@@ -668,10 +808,10 @@ func TestPublishResultLogFields_CarriesTheFieldsTheGuardDefers(t *testing.T) {
 // sibling per category.
 //
 // A const cannot call a function, so the literal cannot derive itself — which makes it
-// exactly the kind of value that goes stale silently. It was 16 when Blnk owned four
-// categories, and adding a fifth made 16 less than two generations with nothing anywhere
-// failing: lazy writers would then be retired while a previous generation was still in use,
-// costing a reconnection per message rather than per topic.
+// exactly the kind of value that goes stale silently. It has already gone stale once, when a
+// fifth category was added and the literal was left at two four-category generations, with
+// nothing anywhere failing: lazy writers would then be retired while a previous generation
+// was still in use, costing a reconnection per message rather than per topic.
 func TestMaxLazyTopicWriters_IsTwoPrefixGenerations(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 
@@ -688,28 +828,29 @@ func TestMaxLazyTopicWriters_IsTwoPrefixGenerations(t *testing.T) {
 // The outbox-to-message key contract
 // ---------------------------------------------------------------------------
 
-// TestPublishRequestFromOutbox_KeysByTheStoredPartitionKey is the regression test for the
-// defect in which the database and the broker chose DIFFERENT ordering domains.
+// TestPublishRequestFromOutbox_KeysByTheStoredPartitionKey covers the events that have NO
+// LEDGER, where the stored partition key is what carries per-aggregate ordering.
 //
-// # What went wrong
+// # What the two columns are for
 //
-// PublishRequestFromOutbox keyed the message by the row's ledger_id. ledger_id is
-// deliberately NULL for every event whose payload carries no ledger — transactions,
-// bulk batches, balance monitors, identities and system.error, which is eleven of the
-// thirteen event strings — so the key fell through to the aggregate id. Meanwhile
-// ClaimPendingEventOutbox serialises dispatch so that at most one row per PARTITION KEY
-// is in flight, paying for a NOT EXISTS anti-join and a dedicated partial index to do it.
-// Two transactions moving value between the same balances were therefore serialised in the
-// outbox and then routed to different Kafka partitions, and that balance's event sequence
-// was no longer ordered as seen by a consumer. Nothing errored and nothing was logged.
+// Requirement R-6 partitions by ledger ID, and PublishRequestFromOutbox keys on ledger_id
+// first for exactly that reason. The two columns AGREE wherever a ledger exists, because
+// WithEventLedgerID writes the supplied ledger into both and every payload that yields a
+// ledger of its own does the same — so the value ClaimPendingEventOutbox serialises dispatch
+// on is the value Kafka partitions on, and the database's ordering guarantee reaches the
+// consumer intact.
+//
+// The fixtures here are the shapes whose payloads yield no ledger: transactions built without
+// a supplied ledger, bulk batches, balance monitors, identities and system.error. Their
+// ledger_id is legitimately empty, and the stored partition key is the rung that keeps each
+// aggregate's events on one partition. That is what this test pins.
 //
 // # Why this test is shaped the way it is
 //
 // It asserts on rows built by the REAL producer path, PrepareEventOutbox, across the whole
-// event catalogue, because the defect lived exactly in the seam between the producer's two
+// event catalogue, because the risk lives exactly in the seam between the producer's two
 // columns and the publisher's single key. A test that hand-built a row could set the two
-// columns to the same value and pass either way, which is how the divergence survived a
-// suite that already covered both sides in isolation.
+// columns to the same value and pass either way.
 //
 // The shapes where partition_key differs from BOTH ledger_id and aggregate_id are counted
 // and required to be non-empty, so this test cannot quietly degrade into a tautology if
@@ -733,12 +874,21 @@ func TestPublishRequestFromOutbox_KeysByTheStoredPartitionKey(t *testing.T) {
 
 			request := PublishRequestFromOutbox(*row, 1)
 
-			assert.Equal(t, row.PartitionKey, request.Key,
-				"the request must be keyed by the column ClaimPendingEventOutbox serialises on")
-			assert.Equal(t, row.PartitionKey, resolvePartitionKey(request),
-				"and resolution must not fall through to the aggregate when the key is present")
-			assert.Equal(t, []byte(row.PartitionKey), partitionKeyBytes(resolvePartitionKey(request)),
-				"the bytes handed to kafka.Message.Key must be the stored key verbatim")
+			// The ledger takes precedence when the row records one, which for these fixtures
+			// happens only where the payload itself yields a ledger — and there the two
+			// columns hold the same value, so one expectation covers both cases.
+			expected := row.LedgerID
+			if expected == "" {
+				expected = row.PartitionKey
+			}
+
+			assert.Equal(t, expected, request.Key,
+				"the request must be keyed by the ledger, falling back to the column "+
+					"ClaimPendingEventOutbox serialises on")
+			assert.Equal(t, expected, resolvePartitionKey(request),
+				"and resolution must not fall through to the aggregate when a key is present")
+			assert.Equal(t, []byte(expected), partitionKeyBytes(resolvePartitionKey(request)),
+				"the bytes handed to kafka.Message.Key must be the resolved key verbatim")
 		})
 
 		if fixture.partitionKey != fixture.aggregateID {
@@ -751,12 +901,19 @@ func TestPublishRequestFromOutbox_KeysByTheStoredPartitionKey(t *testing.T) {
 			"aggregate, or this test would pass even if the stored key were ignored entirely")
 }
 
-// TestPublishRequestFromOutbox_AppliesTheDocumentedFallbackChain pins the three rungs.
+// TestPublishRequestFromOutbox_AppliesTheDocumentedFallbackChain pins the three rungs, in
+// the order requirement R-6 dictates: ledger_id, then partition_key, then aggregate_id.
 //
-// partition_key is NOT NULL with a not-blank CHECK, so a row read back from PostgreSQL
-// always supplies the first rung. The other two exist for a row assembled in Go — by a
-// caller that set only the ledger, or by neither — and they are asserted because an
-// unkeyed message is the one outcome that silently discards the ordering guarantee.
+// THE LEDGER COMES FIRST, and that is the requirement rather than a preference — "partitioned
+// by ledger ID". The two columns normally agree, because every production capture path
+// supplies the ledger through WithEventLedgerID and that option writes both; the deliberately
+// DISAGREEING row below is what proves the precedence rather than assuming it, and it is the
+// shape a caller that set only the ledger would produce.
+//
+// partition_key is NOT NULL with a not-blank CHECK, so a row read back from PostgreSQL always
+// supplies the second rung for an event that genuinely has no ledger. The third exists for a
+// row assembled in Go with neither, and is asserted because an unkeyed message is the one
+// outcome that silently discards the ordering guarantee.
 func TestPublishRequestFromOutbox_AppliesTheDocumentedFallbackChain(t *testing.T) {
 	base := model.EventOutbox{
 		EventID:       "evt_fallback_chain",
@@ -768,15 +925,17 @@ func TestPublishRequestFromOutbox_AppliesTheDocumentedFallbackChain(t *testing.T
 		SchemaVersion: model.SchemaVersionV1,
 	}
 
-	t.Run("the stored partition key wins", func(t *testing.T) {
-		assert.Equal(t, "bln_fallback_source", resolvePartitionKey(PublishRequestFromOutbox(base, 1)))
+	t.Run("the recorded ledger wins", func(t *testing.T) {
+		assert.Equal(t, "ldg_fallback", resolvePartitionKey(PublishRequestFromOutbox(base, 1)),
+			"requirement R-6 partitions by ledger id, so a row that records one must be keyed on it "+
+				"even when its partition_key column holds a different value")
 	})
 
-	t.Run("a blank partition key falls back to the ledger", func(t *testing.T) {
+	t.Run("a blank ledger falls back to the stored partition key", func(t *testing.T) {
 		row := base
-		row.PartitionKey = "   "
+		row.LedgerID = "   "
 
-		assert.Equal(t, "ldg_fallback", resolvePartitionKey(PublishRequestFromOutbox(row, 1)),
+		assert.Equal(t, "bln_fallback_source", resolvePartitionKey(PublishRequestFromOutbox(row, 1)),
 			"whitespace must read as absence rather than becoming a key made of spaces")
 	})
 
@@ -844,36 +1003,23 @@ func TestPublishRequestFromOutbox_OrdersTwoAggregatesSharingOneKeyOntoOneKey(t *
 // The mandated contract, the writer settings, and the wire form of one publish
 // ---------------------------------------------------------------------------
 
-// Everything below asserts the properties of ONE PUBLISH — the interface it is made
-// through, the three writer settings that decide where a message lands and how durably it
-// lands there, the key that decides its partition, the bytes that reach the topic, and what
-// the publisher reports afterwards — and it does all of that with NO KAFKA ANYWHERE. These
-// are unit tests: they run under `go test -short` on a machine with no broker, no
-// credentials and, as asserted below, no name resolution.
+// Everything below asserts the properties of ONE PUBLISH — the interface it is made through,
+// the three writer settings that decide where a message lands and how durably, the key that
+// decides its partition, the bytes that reach the topic, and what the publisher reports — with
+// NO KAFKA ANYWHERE.
 //
-// # How a publish is observed without a broker
+// kafka-go exposes the seam: kafka.Writer.Transport is an exported kafka.RoundTripper, and a
+// writer falls back to the shared default transport only when it is nil, so a fake round
+// tripper intercepts the only two requests a synchronous write issues — the metadata lookup
+// and the produce request. That is what turns intentions into facts: the acknowledgement mode
+// is asserted as the produce request's Acks, the balancer's decision as the partition it names,
+// and the key and value as the record it carries. Reading the writer's struct fields instead
+// would agree with the implementation by construction and would still pass if the writer never
+// used the field.
 //
-// kafka-go exposes the seam itself. kafka.Writer.Transport is an exported
-// kafka.RoundTripper, and the client behind a writer falls back to the shared default
-// transport only when that field is nil, so substituting a fake round tripper on a
-// constructed writer intercepts the only two requests a synchronous write issues: the
-// metadata lookup that resolves a topic's partition count, and the produce request itself.
-//
-// That substitution is what turns intentions into facts. The acknowledgement mode is
-// asserted as the Acks field of the produce request the broker would have received; the
-// balancer's decision is asserted as the partition that request names; and the key and
-// value are asserted as the record it carries. A test that read the writer's struct fields
-// alone would agree with the implementation by construction — it would still pass if the
-// writer never used the field it set — whereas these assertions fail if the wire form is
-// wrong for any reason, including one the struct does not show.
-//
-// # What is deliberately NOT here
-//
-// The retry schedule and its per-attempt backoff belong to the relay and are covered by
-// event_relay_test.go; dead-letter routing and replay belong to event_dlt_test.go; topic
-// assurance, SCRAM provisioning and ACLs belong to event_admin_test.go; and outbox row
-// construction belongs to event_outbox_test.go. This file asserts what the publisher does
-// with one event, once.
+// Retry and backoff belong to event_relay_test.go, dead-letter routing and replay to
+// event_dlt_test.go, topic assurance and provisioning to event_admin_test.go, and row
+// construction to event_outbox_test.go.
 
 // publisherFakePartitions is the partition count the fake broker reports for every topic.
 //
@@ -1001,21 +1147,12 @@ var _ kafka.RoundTripper = (*publisherFakeTransport)(nil)
 
 // newPublisherFakeTransport returns a transport that reports publisherFakePartitions
 // partitions for every topic and acknowledges every write.
-//
-// Returns:
-//   - *publisherFakeTransport: a ready transport that has captured nothing yet.
 func newPublisherFakeTransport() *publisherFakeTransport {
 	return &publisherFakeTransport{partitions: publisherFakePartitions}
 }
 
 // failProduceWith makes the fake broker refuse every produce request with a Kafka error
 // code, returning the transport so it can be configured inline.
-//
-// Parameters:
-//   - code kafka.Error: the error code the response carries.
-//
-// Returns:
-//   - *publisherFakeTransport: the same transport, for chaining.
 func (f *publisherFakeTransport) failProduceWith(code kafka.Error) *publisherFakeTransport {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1071,12 +1208,6 @@ func (f *publisherFakeTransport) RoundTrip(
 // Every requested topic is reported with publisherFakePartitions partitions, all led by the
 // single fake broker. The writer reads only the partition COUNT from this, which is what it
 // hands to the balancer.
-//
-// Parameters:
-//   - request *metadataAPI.Request: the lookup, naming one topic per write.
-//
-// Returns:
-//   - *metadataAPI.Response: a healthy response for every requested topic.
 func (f *publisherFakeTransport) metadata(request *metadataAPI.Request) *metadataAPI.Response {
 	f.mu.Lock()
 	f.metadataTopics = append(f.metadataTopics, request.TopicNames...)
@@ -1110,13 +1241,6 @@ func (f *publisherFakeTransport) metadata(request *metadataAPI.Request) *metadat
 // The records are drained BEFORE any configured failure is applied, so a failing publish is
 // still observable: the bytes and the acknowledgement mode of a refused write are exactly
 // what a test about failure classification needs to be able to see.
-//
-// Parameters:
-//   - request *produceAPI.Request: the produce request to capture and answer.
-//
-// Returns:
-//   - kafka.Response: the produce response, carrying the configured error code.
-//   - error: a configured transport failure, or a record-reading failure.
 func (f *publisherFakeTransport) produce(request *produceAPI.Request) (kafka.Response, error) {
 	f.mu.Lock()
 	errorCode := f.produceErrorCode
@@ -1204,9 +1328,6 @@ func publisherDrainRecords(reader protocol.RecordReader) ([]publisherProducedRec
 }
 
 // producedBatches returns a copy of everything produced so far.
-//
-// Returns:
-//   - []publisherProducedBatch: the captured batches, in order.
 func (f *publisherFakeTransport) producedBatches() []publisherProducedBatch {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1239,9 +1360,6 @@ func (f *publisherFakeTransport) onlyRecord(t *testing.T) (publisherProducedBatc
 }
 
 // requestedMetadataTopics returns the topics whose partition counts were looked up.
-//
-// Returns:
-//   - []string: the topic names, in request order.
 func (f *publisherFakeTransport) requestedMetadataTopics() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1254,9 +1372,6 @@ func (f *publisherFakeTransport) requestedMetadataTopics() []string {
 
 // unexpectedRequests returns the request types the publish path issued that this double did
 // not expect.
-//
-// Returns:
-//   - []string: the Go type names of any unexpected requests.
 func (f *publisherFakeTransport) unexpectedRequests() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1300,12 +1415,6 @@ func publisherWithFakeTransport(t *testing.T, transport *publisherFakeTransport)
 
 // publisherWriterSnapshot copies the writer inventory out from under the lock, so
 // assertions run without holding it.
-//
-// Parameters:
-//   - publisher *kafkaPublisher: the publisher to read.
-//
-// Returns:
-//   - map[string]*kafka.Writer: the writers, keyed by topic.
 func publisherWriterSnapshot(publisher *kafkaPublisher) map[string]*kafka.Writer {
 	publisher.mu.RLock()
 	defer publisher.mu.RUnlock()
@@ -1320,9 +1429,6 @@ func publisherWriterSnapshot(publisher *kafkaPublisher) map[string]*kafka.Writer
 
 // publisherPartitionIDs is the partition list the writer hands its balancer: every
 // partition of the topic, in ascending order.
-//
-// Returns:
-//   - []int: 0 through publisherFakePartitions-1.
 func publisherPartitionIDs() []int {
 	partitions := make([]int, 0, publisherFakePartitions)
 	for partition := 0; partition < publisherFakePartitions; partition++ {
@@ -1339,12 +1445,6 @@ func publisherPartitionIDs() []int {
 // balancer was configured, and this says where that balancer actually puts the message. A
 // switch to any other stable hash changes this number for at least some keys, so the two
 // assertions together cannot both be satisfied by a different balancer.
-//
-// Parameters:
-//   - key string: the message key.
-//
-// Returns:
-//   - int: the partition Murmur2 selects out of publisherFakePartitions.
 func publisherExpectedPartition(key string) int {
 	balancer := kafka.Murmur2Balancer{}
 
@@ -1384,14 +1484,6 @@ func publisherKeyOnAnotherPartition(t *testing.T, key string) string {
 
 // publisherEvent builds a LedgerEvent with a fresh identifier and a fixed occurrence
 // instant.
-//
-// Parameters:
-//   - eventType string: the event name.
-//   - aggregateID string: the aggregate the event is about.
-//   - payload string: the payload bytes, carried through untransformed.
-//
-// Returns:
-//   - model.LedgerEvent: the envelope.
 func publisherEvent(eventType, aggregateID, payload string) model.LedgerEvent {
 	return model.LedgerEvent{
 		EventID:       uuid.NewString(),
@@ -1514,42 +1606,147 @@ func publisherAttributeMap(set attribute.Set) map[string]string {
 	return attributes
 }
 
-// publisherInstruments is the three instruments one publish records.
+// publisherInstruments is the four instruments one publish records.
+//
+// captureToDispatch is the fourth, and it is the one acceptance criterion V-1 is read from, so
+// a harness that omitted it would leave the criterion's data source untested — which is exactly
+// how it came to be declared, bucketed and documented while nothing recorded it.
 type publisherInstruments struct {
-	published *publisherRecordedCounter
-	attempts  *publisherRecordedCounter
-	duration  *publisherRecordedHistogram
+	published         *publisherRecordedCounter
+	attempts          *publisherRecordedCounter
+	duration          *publisherRecordedHistogram
+	captureToDispatch *publisherRecordedHistogram
 }
 
-// publisherCaptureInstruments swaps the three publish instruments for recorders and
+// publisherCaptureInstruments swaps the four publish instruments for recorders and
 // restores the originals when the test ends.
-//
-// Returns:
-//   - *publisherInstruments: the recorders, empty at first.
 func publisherCaptureInstruments(t *testing.T) *publisherInstruments {
 	t.Helper()
 
 	captured := &publisherInstruments{
-		published: &publisherRecordedCounter{},
-		attempts:  &publisherRecordedCounter{},
-		duration:  &publisherRecordedHistogram{},
+		published:         &publisherRecordedCounter{},
+		attempts:          &publisherRecordedCounter{},
+		duration:          &publisherRecordedHistogram{},
+		captureToDispatch: &publisherRecordedHistogram{},
 	}
 
 	publishedOriginal := metrics.EventsPublishedTotal
 	attemptsOriginal := metrics.EventPublishAttemptsTotal
 	durationOriginal := metrics.EventPublishDuration
+	captureOriginal := metrics.EventCaptureToDispatchDuration
 
 	t.Cleanup(func() {
 		metrics.EventsPublishedTotal = publishedOriginal
 		metrics.EventPublishAttemptsTotal = attemptsOriginal
 		metrics.EventPublishDuration = durationOriginal
+		metrics.EventCaptureToDispatchDuration = captureOriginal
 	})
 
 	metrics.EventsPublishedTotal = captured.published
 	metrics.EventPublishAttemptsTotal = captured.attempts
 	metrics.EventPublishDuration = captured.duration
+	metrics.EventCaptureToDispatchDuration = captured.captureToDispatch
 
 	return captured
+}
+
+// TestRecordPublishAttempt_RecordsTheEndToEndAgeOfAnAcknowledgedEvent is the guard on the
+// instrument acceptance criterion V-1 is read from.
+//
+// V-1 is stated over outbox-to-Kafka latency, and blnk.events.publish.duration cannot answer it:
+// its clock starts at the claim, so it excludes the row waiting for the next poll tick, the poll
+// interval, and the claim query's latency. A relay stalled for a minute would report a
+// five-millisecond publish. blnk.events.capture_to_dispatch.duration is the honest measure — and
+// it was declared, bucketed, described and asserted in the metrics package while NOTHING in the
+// pipeline recorded it, so the criterion had no data source at all and every dashboard built on
+// it would have been empty rather than wrong.
+func TestRecordPublishAttempt_RecordsTheEndToEndAgeOfAnAcknowledgedEvent(t *testing.T) {
+	captured := publisherCaptureInstruments(t)
+
+	capturedAt := time.Now().Add(-3 * time.Second)
+	recordPublishAttempt(context.Background(), PublishResult{
+		Status:     model.PublishStatusDispatched,
+		Topic:      "blnk.transactions",
+		Attempt:    1,
+		Purpose:    PublishPurposeOriginal,
+		Duration:   40 * time.Millisecond,
+		CapturedAt: capturedAt,
+	})
+
+	observations := captured.captureToDispatch.snapshot()
+	require.Len(t, observations, 1, "an acknowledged publish must be observed exactly once")
+
+	assert.GreaterOrEqual(t, observations[0].value, 3.0,
+		"the interval must start at the CAPTURE instant, not at the claim: a figure measured from "+
+			"the claim is what lets a stalled relay report a healthy p99")
+	assert.Less(t, observations[0].value, 60.0,
+		"and it must be the age itself, not a clock difference against the zero time")
+
+	assert.Equal(t, map[string]string{"topic": "blnk.transactions", "attempt": "1"},
+		observations[0].attributes,
+		"topic and attempt only. The first-attempt population is what V-1 is stated over, so the "+
+			"attempt label is what makes the criterion selectable; outcome would be a constant "+
+			"here, since only acknowledged publishes are recorded")
+
+	assert.Len(t, captured.duration.snapshot(), 1,
+		"the per-attempt duration is still recorded as well: their difference is the queue wait, "+
+			"which is what distinguishes a slow broker from an under-provisioned relay")
+}
+
+// TestRecordPublishAttempt_RecordsNoEndToEndAgeForAnUnacknowledgedEvent covers the three cases
+// that must produce NO observation, each of which would corrupt the quantile in a different way.
+func TestRecordPublishAttempt_RecordsNoEndToEndAgeForAnUnacknowledgedEvent(t *testing.T) {
+	capturedAt := time.Now().Add(-3 * time.Second)
+
+	cases := map[string]struct {
+		result PublishResult
+		reason string
+	}{
+		"a retrying attempt": {
+			result: PublishResult{
+				Status: model.PublishStatusRetrying, Topic: "blnk.transactions", Attempt: 2,
+				Purpose: PublishPurposeOriginal, CapturedAt: capturedAt,
+			},
+			reason: "the event has not arrived, so it has no end-to-end latency; recording one " +
+				"credits the histogram with a short duration for an event that is still waiting",
+		},
+		"a dead-lettered attempt": {
+			result: PublishResult{
+				Status: model.PublishStatusDeadLettered, Topic: "blnk.transactions", Attempt: 5,
+				Purpose: PublishPurposeOriginal, CapturedAt: capturedAt,
+			},
+			reason: "a dead-letter write is not a delivery",
+		},
+		"no capture instant": {
+			result: PublishResult{
+				Status: model.PublishStatusDispatched, Topic: "blnk.transactions", Attempt: 1,
+				Purpose: PublishPurposeOriginal,
+			},
+			reason: "the envelope-only path carries no occurred_at, and the zero time would " +
+				"render as an age of several decades",
+		},
+		"a capture stamped in the future": {
+			result: PublishResult{
+				Status: model.PublishStatusDispatched, Topic: "blnk.transactions", Attempt: 1,
+				Purpose: PublishPurposeOriginal, CapturedAt: time.Now().Add(time.Hour),
+			},
+			reason: "clock skew between the capturing process and this one must produce a GAP, " +
+				"not a zero: a zero is indistinguishable from an instant publish and would " +
+				"quietly improve the quantile the criterion is read from",
+		},
+	}
+
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			captured := publisherCaptureInstruments(t)
+
+			recordPublishAttempt(context.Background(), testCase.result)
+
+			assert.Empty(t, captured.captureToDispatch.snapshot(), testCase.reason)
+			assert.Len(t, captured.duration.snapshot(), 1,
+				"the per-attempt duration is recorded for every attempt, successful or not")
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1628,16 +1825,14 @@ func TestEventPublisher_MandatedSignatureIsPinnedByReflection(t *testing.T) {
 // inventory: one writer per topic Blnk owns, no writer for anything else, and one shared
 // transport and address underneath all of them.
 //
-// Both halves matter. A MISSING writer means a publish to that topic takes the lazy-growth
-// path on the hot path instead of the map's fast path, taking the write lock for every event.
-// An EXTRA writer means a connection pool and a SASL session for a destination nothing
-// publishes to. And the sharing is what keeps the connection count proportional to brokers
-// rather than to brokers times topics: per-writer transports would multiply both TCP
-// connections and SASL handshakes by the size of the inventory for no benefit at all.
+// A MISSING writer means a publish to that topic takes the lazy-growth path on the hot path,
+// taking the write lock for every event. An EXTRA writer holds a connection pool for a
+// destination nothing publishes to. The sharing is what keeps the connection count proportional
+// to brokers rather than to brokers times topics.
 //
-// The inventory is taken from AllTopicsWithDeadLetters rather than hardcoded, so this test
-// and event_topics.go work from ONE list and a new category cannot leave a topic without a
-// writer. The eight names requirement R-5 and R-6 state literally are then required
+// The inventory is taken from AllTopicsWithDeadLetters rather than hardcoded, so this test and
+// event_topics.go work from ONE list and a new category cannot leave a topic without a writer.
+// The eight names — four category topics and their four `.dlt` siblings — are then required
 // individually, because deriving the whole expectation from the implementation would let a
 // silently-dropped category pass.
 func TestEventPublisher_HoldsOneWriterPerOwnedTopic(t *testing.T) {
@@ -1652,9 +1847,10 @@ func TestEventPublisher_HoldsOneWriterPerOwnedTopic(t *testing.T) {
 		"exactly one writer per owned topic: a missing one forces lazy creation onto the publish "+
 			"path, an extra one holds connections for a destination nothing publishes to")
 
-	// The three category topics requirement R-6 names, the fourth category the ledger and
-	// system-error events made necessary, and the four `.dlt` siblings requirement R-5 names.
-	// Written out as literals so a renamed topic or a dropped dead-letter sibling fails here.
+	// The three category topics requirement R-6 names, the one internal category the ledger,
+	// system-error and unrecognised events made necessary, and the four `.dlt` siblings
+	// requirement R-5 names. Written out as literals so a renamed topic or a dropped
+	// dead-letter sibling fails here.
 	for _, topic := range []string{
 		"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system",
 		"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.system.dlt",
@@ -1678,7 +1874,8 @@ func TestEventPublisher_HoldsOneWriterPerOwnedTopic(t *testing.T) {
 		transport, isSharedTransport := writer.Transport.(*kafka.Transport)
 		require.True(t, isSharedTransport, "writer for %q must use the publisher's transport", topic)
 		assert.Same(t, publisher.transport, transport,
-			"every writer must draw on ONE connection pool and ONE SASL session per broker")
+			"every writer must draw on ONE transport, and so on one connection pool and one "+
+				"authentication configuration")
 		assert.Equal(t, publisher.addr, writer.Addr,
 			"every writer must address the same bootstrap list the publisher was built with")
 	}
@@ -1820,7 +2017,8 @@ func TestEventPublisher_ProducesTheEventOnTheWireAsConfigured(t *testing.T) {
 
 	// The key, which is the whole ordering mechanism.
 	assert.Equal(t, []byte(publisherLedgerID), record.Key,
-		"the message key must be the resolved partition key — the ledger id — verbatim")
+		"the message key must be the request's stored partition key verbatim; a ledger id is one "+
+			"example of such a key, not the definition")
 
 	// The partition, which is the balancer's decision about that key.
 	assert.Equal(t, publisherExpectedPartition(publisherLedgerID), batch.Partition,
@@ -1916,18 +2114,11 @@ func TestEventPublisher_MessageValueSplicesThePayloadBytesVerbatim(t *testing.T)
 }
 
 // ---------------------------------------------------------------------------
-// Key derivation: the mechanism behind per-aggregate ordering
+// Key derivation: the mechanism behind per-partition-key ordering
 // ---------------------------------------------------------------------------
 
 // publisherMustPublish publishes one request and requires it to succeed, returning the
 // result.
-//
-// Parameters:
-//   - publisher *kafkaPublisher: the publisher to write through.
-//   - request PublishRequest: the request to publish.
-//
-// Returns:
-//   - PublishResult: the successful result.
 func publisherMustPublish(t *testing.T, publisher *kafkaPublisher, request PublishRequest) PublishResult {
 	t.Helper()
 
@@ -1938,25 +2129,25 @@ func publisherMustPublish(t *testing.T, publisher *kafkaPublisher, request Publi
 	return result
 }
 
-// TestEventPublisher_OneLedgerIsOneKeyAndOnePartition is the property acceptance criterion
-// V-6 is decided by, asserted at the only place it is actually decided: the message on the
-// wire.
+// TestEventPublisher_OneLedgerIsOneKeyAndOnePartition is the mechanism acceptance criterion
+// V-6 rests on, asserted where it is actually decided: the message on the wire. A ledger id is
+// the STORED PARTITION KEY used here as an example; the property is about the key, whatever
+// value the outbox row carries.
 //
-// Kafka orders within a PARTITION and nowhere else, so per-aggregate ordering exists only if
-// every event sharing an aggregate shares a partition — which is exactly what a stable hash
-// over a shared key produces. Two events with the same ledger id must therefore carry the
-// same key AND land on the same partition, whatever else differs between them: different
-// event types, different aggregate ids, different payloads.
+// Kafka orders within a PARTITION and nowhere else, so ordering exists only if every event
+// sharing a key shares a partition — which is what a stable hash over a shared key produces.
+// Two requests with the same key must therefore carry the same key bytes AND land on the same
+// partition, whatever else differs: different event types, different aggregate ids, different
+// payloads.
 //
-// The converse is asserted too, and it is not symmetry for its own sake. If different keys
-// could never land on different partitions the first assertion would hold vacuously — a
-// balancer that ignored the key entirely, or a single-partition topic, would satisfy it — so
-// a key known to hash elsewhere is published and required to land elsewhere. That is what
-// makes this a test of the key's INFLUENCE rather than of its constancy.
+// The converse is asserted too, and not for symmetry's sake: if different keys could never land
+// on different partitions the first assertion would hold vacuously — a balancer that ignored
+// the key, or a single-partition topic, would satisfy it — so a key known to hash elsewhere is
+// published and required to land elsewhere. That makes this a test of the key's INFLUENCE
+// rather than of its constancy.
 //
-// It mirrors the precedent the repository already set: the transaction queue shards by
-// hashing the source balance id so that work for one pair stays on one lane. This is the same
-// idea applied to the transport that now carries the events.
+// It mirrors the precedent the repository already set: the transaction queue shards by hashing
+// the source balance id so work for one pair stays on one lane.
 func TestEventPublisher_OneLedgerIsOneKeyAndOnePartition(t *testing.T) {
 	transport := newPublisherFakeTransport()
 	publisher := publisherWithFakeTransport(t, transport)
@@ -2398,7 +2589,7 @@ func TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt(t *testing.T)
 		assert.Equal(t, []byte(publisherLedgerID), record.Key)
 	})
 
-	t.Run("a transient failure on the last permitted attempt is failed", func(t *testing.T) {
+	t.Run("a transient failure on the last permitted attempt is terminal", func(t *testing.T) {
 		transport := newPublisherFakeTransport().failProduceWith(kafka.LeaderNotAvailable)
 		publisher := publisherWithFakeTransport(t, transport)
 
@@ -2411,9 +2602,11 @@ func TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt(t *testing.T)
 		})
 
 		require.Error(t, err)
-		assert.Equal(t, model.PublishStatusFailed, result.Status,
-			"the attempt that spent the budget is failed, not retrying: nothing further will be tried "+
-				"and reporting otherwise hides a stuck event among the busy ones")
+		assert.Equal(t, model.PublishStatusDeadLettered, result.Status,
+			"the attempt that spent the budget reports the terminal state the event is bound for, not "+
+				"retrying: nothing further will be tried and reporting otherwise hides a stuck event "+
+				"among the busy ones. Three outcomes are the whole observable vocabulary, so a "+
+				"terminal attempt names the destination rather than adding a fourth value")
 		assert.True(t, result.Transient,
 			"the failure still LOOKED recoverable, which is a different question from whether "+
 				"anything more will be attempted")
@@ -2421,7 +2614,7 @@ func TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt(t *testing.T)
 		assert.Equal(t, 5, result.MaxAttempts)
 	})
 
-	t.Run("a permanent failure is failed whatever the budget says", func(t *testing.T) {
+	t.Run("a permanent failure is terminal whatever the budget says", func(t *testing.T) {
 		transport := newPublisherFakeTransport().failProduceWith(kafka.TopicAuthorizationFailed)
 		publisher := publisherWithFakeTransport(t, transport)
 
@@ -2434,7 +2627,7 @@ func TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt(t *testing.T)
 		})
 
 		require.Error(t, err)
-		assert.Equal(t, model.PublishStatusFailed, result.Status)
+		assert.Equal(t, model.PublishStatusDeadLettered, result.Status)
 		assert.False(t, result.Transient,
 			"an unauthorised principal is not a condition another attempt can change")
 		assert.False(t, result.Retryable,
@@ -2699,4 +2892,209 @@ func TestEventPublisher_ConcurrentPublishesShareOneWriterPerTopic(t *testing.T) 
 	assert.Zero(t, lazy,
 		"and none of it may be recorded as lazy growth, which would churn the retirement bookkeeping "+
 			"on the hot path")
+}
+
+// ---------------------------------------------------------------------------------------
+// Broker coordinate capture — OBS-02
+// ---------------------------------------------------------------------------------------
+
+// TestPublishAcknowledgement_CarriesTheBrokersCoordinateBackToTheCaller pins the correlation
+// seam the zero-loss reconciliation depends on.
+//
+// # Why a per-message carrier and not a per-writer field
+//
+// kafka-go reports offsets through Writer.Completion, which is a property of the WRITER — and
+// writers are pooled per topic and shared by every concurrent publish to that topic. A callback
+// writing into publisher state could not tell which publish a message belonged to, and one batch
+// legitimately carries messages from several. kafka.Message.WriterData is the library's own
+// correlation seam: it rides with the message, comes back on the completion, and never reaches
+// the wire.
+//
+// This test drives completeWrite exactly as kafka-go does — one call, a batch of messages from
+// several different publishes — and requires each carrier to receive its own coordinate.
+func TestPublishAcknowledgement_CarriesTheBrokersCoordinateBackToTheCaller(t *testing.T) {
+	publisher := &kafkaPublisher{}
+
+	first := &publishAcknowledgement{}
+	second := &publishAcknowledgement{}
+	third := &publishAcknowledgement{}
+
+	// One batch, three publishes, all on the same partition — which is what a batch IS, and
+	// therefore the case that must not cross its coordinates over.
+	publisher.completeWrite([]kafka.Message{
+		{Topic: "blnk.transactions", Partition: 4, Offset: 1_000, WriterData: first},
+		{Topic: "blnk.transactions", Partition: 4, Offset: 1_001, WriterData: second},
+		{Topic: "blnk.transactions", Partition: 4, Offset: 1_002, WriterData: third},
+	}, nil)
+
+	for index, acknowledgement := range []*publishAcknowledgement{first, second, third} {
+		record, confirmed := acknowledgement.coordinate()
+		require.True(t, confirmed, "carrier %d received no coordinate", index)
+		assert.Equal(t, int64(1_000+index), record.Offset,
+			"each publish must receive ITS OWN offset; a shared one would let two rows claim the "+
+				"same record")
+		assert.Equal(t, "blnk.transactions", record.Topic)
+		assert.Equal(t, 4, record.Partition)
+	}
+}
+
+// TestPublishAcknowledgement_CannotBeMadeToPanic is a hard requirement rather than defensive
+// habit.
+//
+// kafka-go documents that a panic in a completion function TERMINATES THE PROGRAM, because the
+// panic bubbles up a writer goroutine that nothing recovers. So the callback has to survive every
+// shape of input the library or a caller could hand it — a nil carrier, a foreign WriterData, no
+// WriterData at all, a nil slice — and a ledger process must not be brought down by a message
+// somebody forgot to attach a carrier to.
+func TestPublishAcknowledgement_CannotBeMadeToPanic(t *testing.T) {
+	publisher := &kafkaPublisher{}
+
+	assert.NotPanics(t, func() {
+		publisher.completeWrite(nil, nil)
+		publisher.completeWrite([]kafka.Message{}, nil)
+		publisher.completeWrite([]kafka.Message{{Topic: "blnk.transactions"}}, nil)
+		publisher.completeWrite([]kafka.Message{{WriterData: nil}}, nil)
+		publisher.completeWrite([]kafka.Message{{WriterData: "not a carrier"}}, nil)
+		publisher.completeWrite([]kafka.Message{{WriterData: (*publishAcknowledgement)(nil)}}, nil)
+		publisher.completeWrite([]kafka.Message{{WriterData: &publishAcknowledgement{}}},
+			errors.New("the batch failed"))
+	})
+}
+
+// TestPublishAcknowledgement_RefusesACoordinateForAWriteThatDidNotLand keeps the mapping honest.
+//
+// A message the broker did not answer for carries no usable coordinate: kafka-go leaves the
+// fields at their zero values and reports the error separately. Accepting that would manufacture
+// "partition 0, offset 0" — a REAL location — for a write that never landed, and the audit would
+// count the row as confirmed while an operator looking there found somebody else's event. Nothing
+// is worse for a mechanism whose whole purpose is auditability.
+func TestPublishAcknowledgement_RefusesACoordinateForAWriteThatDidNotLand(t *testing.T) {
+	publisher := &kafkaPublisher{}
+
+	for name, message := range map[string]kafka.Message{
+		"no topic":            {Partition: 3, Offset: 91},
+		"blank topic":         {Topic: "   ", Offset: 4},
+		"negative offset":     {Topic: "blnk.transactions", Offset: -1},
+		"nothing set at all":  {},
+		"topic but no offset": {Topic: "blnk.transactions", Offset: -1, Partition: 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			acknowledgement := &publishAcknowledgement{}
+			publisher.completeWrite([]kafka.Message{
+				{Topic: message.Topic, Partition: message.Partition, Offset: message.Offset,
+					WriterData: acknowledgement},
+			}, nil)
+
+			_, confirmed := acknowledgement.coordinate()
+			assert.False(t, confirmed,
+				"a coordinate that cannot be looked up must not be recorded as one")
+		})
+	}
+
+	t.Run("the first record on partition zero IS accepted", func(t *testing.T) {
+		// The distinction the whole guard rests on: offset 0 on partition 0 is the first record
+		// on a fresh partition, and refusing it would make the row that produced it count as an
+		// unconfirmed publication forever.
+		acknowledgement := &publishAcknowledgement{}
+		publisher.completeWrite([]kafka.Message{
+			{Topic: "blnk.system", Partition: 0, Offset: 0, WriterData: acknowledgement},
+		}, nil)
+
+		record, confirmed := acknowledgement.coordinate()
+		require.True(t, confirmed)
+		assert.Equal(t, "blnk.system/0@0", record.String())
+	})
+}
+
+// TestPublishAcknowledgement_KeepsTheFirstCoordinateItIsGiven pins the idempotence.
+//
+// kafka-go calls Completion once per batch and a message belongs to exactly one batch, so a
+// second call for the same carrier would mean an internal retry re-reporting the message. The
+// first coordinate is the one the offset series was assigned from, so it is the one kept —
+// overwriting would leave the row naming a record the caller was never told about.
+func TestPublishAcknowledgement_KeepsTheFirstCoordinateItIsGiven(t *testing.T) {
+	publisher := &kafkaPublisher{}
+	acknowledgement := &publishAcknowledgement{}
+
+	publisher.completeWrite([]kafka.Message{
+		{Topic: "blnk.transactions", Partition: 1, Offset: 500, WriterData: acknowledgement},
+	}, nil)
+	publisher.completeWrite([]kafka.Message{
+		{Topic: "blnk.transactions", Partition: 2, Offset: 999, WriterData: acknowledgement},
+	}, nil)
+
+	record, confirmed := acknowledgement.coordinate()
+	require.True(t, confirmed)
+	assert.Equal(t, "blnk.transactions/1@500", record.String())
+}
+
+// TestPublishAcknowledgement_IsSafeUnderConcurrentCompletionAndRead covers the memory model.
+//
+// Completion runs on the writer's own goroutines, so the write and the read genuinely cross
+// goroutine boundaries. With Async false, WriteMessages blocks on Completion — which ORDERS them
+// but does not by itself make the access race-free — so the carrier carries its own mutex, and
+// this test is the one that fails under `-race` if it is ever removed.
+func TestPublishAcknowledgement_IsSafeUnderConcurrentCompletionAndRead(t *testing.T) {
+	publisher := &kafkaPublisher{}
+
+	const carriers = 64
+
+	acknowledgements := make([]*publishAcknowledgement, carriers)
+	for i := range acknowledgements {
+		acknowledgements[i] = &publishAcknowledgement{}
+	}
+
+	var wait sync.WaitGroup
+	for i, acknowledgement := range acknowledgements {
+		wait.Add(2)
+
+		go func(index int, carrier *publishAcknowledgement) {
+			defer wait.Done()
+			publisher.completeWrite([]kafka.Message{
+				{Topic: "blnk.transactions", Partition: index % 6, Offset: int64(index),
+					WriterData: carrier},
+			}, nil)
+		}(i, acknowledgement)
+
+		go func(carrier *publishAcknowledgement) {
+			defer wait.Done()
+			carrier.coordinate()
+		}(acknowledgement)
+	}
+
+	wait.Wait()
+
+	for index, acknowledgement := range acknowledgements {
+		record, confirmed := acknowledgement.coordinate()
+		require.True(t, confirmed, "carrier %d lost its coordinate", index)
+		assert.Equal(t, int64(index), record.Offset)
+	}
+}
+
+// TestNewWriter_InstallsTheCompletionCallback is the wiring assertion.
+//
+// Everything above tests the carrier in isolation, which proves nothing if the writers the
+// publisher actually builds never call it: the coordinate would be absent for every event, every
+// row would count as an unconfirmed publication, and the zero-loss reconciliation would report
+// itself permanently inconclusive with no test failing.
+func TestNewWriter_InstallsTheCompletionCallback(t *testing.T) {
+	publisher := &kafkaPublisher{}
+	writer := publisher.newWriter("blnk.transactions")
+
+	require.NotNil(t, writer.Completion,
+		"without the callback no event can ever name its record")
+	assert.False(t, writer.Async,
+		"Async must stay false, or WriteMessages would return before the completion runs and the "+
+			"coordinate would not be available to the result")
+
+	// Driven through the field the writer actually holds, so the assertion covers the wiring
+	// rather than the method it happens to point at.
+	acknowledgement := &publishAcknowledgement{}
+	writer.Completion([]kafka.Message{
+		{Topic: "blnk.transactions", Partition: 5, Offset: 77, WriterData: acknowledgement},
+	}, nil)
+
+	record, confirmed := acknowledgement.coordinate()
+	require.True(t, confirmed)
+	assert.Equal(t, "blnk.transactions/5@77", record.String())
 }

@@ -1,6 +1,19 @@
 module github.com/blnkfinance/blnk
 
-go 1.25.0
+// The Go language and MINIMUM TOOLCHAIN version, and 1.25.12 is a security floor
+// rather than a preference. 1.25.0 shipped with fixed vulnerabilities that this
+// service is exposed to through code it runs on every request: net/url parsing
+// (every inbound URL and every configured webhook endpoint), crypto/x509 and
+// crypto/tls certificate handling (the Kafka SASL/TLS transport, the outbound
+// webhook client and the PostgreSQL connection), and cmd/go plus cgo in the build
+// itself. 1.25.12 is the current 1.25 maintenance release and carries all of those
+// fixes.
+//
+// Keep this in step with the three go-version pins in .github/workflows/go.yml and
+// with CONTRIBUTING.md. The Dockerfile deliberately tracks the floating
+// golang:1.25-alpine tag, which always resolves to the newest 1.25 patch, so it
+// needs no edit when this floor moves.
+go 1.25.12
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2

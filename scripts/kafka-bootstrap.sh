@@ -220,14 +220,61 @@ readonly REQUIRED_AUTHORIZER="org.apache.kafka.metadata.authorizer.StandardAutho
 # Control characters and non-ASCII are excluded by construction.
 # ---------------------------------------------------------------------------------------
 readonly CREDENTIAL_SAFE_ERE='^[A-Za-z0-9!#%&()*+./:<>?@_{|}~^-]+$'
+
+# The SCRAM secret strength floors, mirrored EXACTLY from event_admin.go's
+# MinSCRAMPasswordLength and MinSCRAMPasswordDistinctChars, and equal to the pair in
+# scripts/kafka-provision.sh.
+#
+# Duplicated because a shell script cannot import a Go constant, and written with the Go names
+# beside them so the pairing is discoverable from either side. What matters is that all three
+# are EQUAL: a floor that differs between paths is a floor an operator can route around by
+# choosing the more permissive one, and before these existed the shell paths were the
+# permissive ones. See require_strong_credential.
+readonly MIN_CREDENTIAL_LENGTH=32
+readonly MIN_CREDENTIAL_DISTINCT_CHARS=16
 readonly PRINCIPAL_SAFE_ERE='^[A-Za-z0-9._@+-]+$'
 readonly CREDENTIAL_SAFE_DESCRIPTION="letters, digits and ! # % & ( ) * + - . / : < > ? @ ^ _ { | } ~"
 readonly PRINCIPAL_SAFE_DESCRIPTION="letters, digits and . _ @ + -"
+
+# ---------------------------------------------------------------------------------------
+# CREDENTIAL STRENGTH FLOOR (S6-07)
+#
+# The alphabet above answers "can Kafka's grammar carry this value", which is a question
+# about SYNTAX and says nothing whatever about strength. A one-character password passes it:
+# "a" is drawn entirely from the allowed set. This script's whole job is to seed the SCRAM
+# credential the brokers and every administrative client authenticate with, so the alphabet
+# check on its own would let it seed that credential with a password brute-forced in one
+# guess - and then report success.
+#
+# TWO NUMBERS RATHER THAN ONE, because length alone is not strength. A 32-character run of
+# one letter is 32 characters and one character of entropy, and a padded or repeated value
+# is exactly what a hurried operator produces. Requiring 16 DISTINCT characters rejects that
+# class without rejecting anything a generator produces: 32 characters drawn uniformly from
+# the 62-character alphanumeric set contain 16 or more distinct characters with overwhelming
+# probability.
+#
+# 32 IS THE SAME FLOOR THE REST OF THE STACK USES. It is what .env.example recommends, what
+# the failure messages here recommend, and what scripts/kafka-provision.sh both enforces and
+# generates - deliberately identical, so that the bootstrap credential a broker is formatted
+# with cannot be weaker than the subscriber credentials provisioned against it. The two
+# scripts hold their own copies rather than sharing a library because they are independent
+# entry points that must each be runnable alone; the values and the reasoning are the same
+# on both sides, and a change to one belongs in the other.
+#
+# A SCRAM-SHA-512 credential derived from fewer than 32 printable characters is the weakest
+# link in a chain whose other end is PBKDF2 at MIN_SCRAM_ITERATIONS (4096) iterations.
+# ---------------------------------------------------------------------------------------
+readonly MIN_SECRET_LENGTH=32
+readonly MIN_SECRET_DISTINCT=16
 
 # Resolved during main; declared here so the data flow between the steps is visible.
 STORAGE_CLI=""
 KRAFT_CONFIG=""
 LOG_DIRS=""
+
+# Every scratch file this script creates that has held, or could hold, a credential.
+# cleanup() removes all of them on any exit path, including a signal.
+SCRATCH_FILES=()
 
 # ---------------------------------------------------------------------------------------
 # Diagnostics
@@ -412,7 +459,12 @@ require_add_scram_support() {
         "credential cannot be seeded into the KRaft metadata log, so the broker can never" \
         "authenticate a SASL client and bring-up fails outright." \
         "CLI in use: ${STORAGE_CLI}" \
-        "Fix: point KAFKA_IMAGE at Kafka 3.5 or later. The stack ships apache/kafka:3.9.1."
+        "Fix: point KAFKA_IMAGE at Kafka 3.5 or later. No specific stack version is named" \
+        "here on purpose - a version written into a diagnostic is correct on the day it is" \
+        "written and misleading from the next image bump onward, and this message said 3.9.1" \
+        "for a while after the compose default moved past it. The floor is what matters, and" \
+        "the version actually running is reported above when it could be detected; the tested" \
+        "pin is KAFKA_IMAGE in docker-compose.yaml and .env.example."
 }
 
 # Refuse a credential that Kafka's SCRAM grammar cannot carry.
@@ -431,7 +483,194 @@ require_safe_credential() {
             "characters would be silently truncated into a credential nobody can" \
             "authenticate with - including you, on the next bring-up." \
             "Fix: generate the secret from the allowed set. For example:" \
-            "  openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 32" \
+            "  openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32" \
+            "No storage has been touched."
+    fi
+
+    require_strong_credential "$name" "$value"
+}
+
+# Refuse a SCRAM secret that is weak, whatever its grammar.
+#
+# # Why the grammar check above is not enough
+#
+# require_safe_credential asks only whether a value can SURVIVE the SCRAM grammar. It says
+# nothing about strength, so this script accepted a ONE-CHARACTER password for the principal
+# it is about to seed into the metadata log - while event_admin.go applies a 32-character and
+# 16-distinct-character floor to every subscriber credential it provisions. The same broker,
+# the same mechanism, and two different standards depending on which path created the
+# credential.
+#
+# The stake here is higher than for a subscriber. This principal is seeded by
+# 'kafka-storage format --add-scram' and is placed in the broker's super.users, so it can
+# create topics, mint and alter every other credential, and rewrite every ACL. A Kafka SASL
+# handshake has no rate limit and no lockout, so a weak password on it is guessable at
+# whatever rate an attacker can open connections.
+#
+# And it is close to UNFIXABLE after the fact: the credential lives in the KRaft metadata log
+# from the moment storage is formatted, so a weak one cannot simply be corrected - see the
+# rotation guidance elsewhere in this script, which comes down to discarding the log. Refusing
+# before formatting is the only cheap moment.
+#
+# # The floors, and why these numbers
+#
+# Mirrored EXACTLY from event_admin.go's MinSCRAMPasswordLength (32) and
+# MinSCRAMPasswordDistinctChars (16), and equal to the floors in kafka-provision.sh. A floor
+# that differs between paths is a floor an operator can route around by choosing the other
+# path.
+#
+# The value is NEVER echoed, and neither is its length - on a short secret, reporting the
+# length narrows the very search space the check exists to widen.
+#
+# Parameters:
+#   $1 - the variable name, for the message. Printed.
+#   $2 - the secret. Never printed.
+require_strong_credential() {
+    local name="$1" value="$2"
+
+    if (( ${#value} < MIN_CREDENTIAL_LENGTH )); then
+        die "${name} is shorter than the ${MIN_CREDENTIAL_LENGTH}-character minimum for a SCRAM secret." \
+            "The value is not echoed, and neither is its length." \
+            "This principal is seeded into the KRaft metadata log and placed in the broker's" \
+            "super.users: it can create topics, mint and alter every other credential and" \
+            "rewrite every ACL. A Kafka SASL handshake has no rate limit and no lockout, so a" \
+            "short password on it is guessable at whatever rate an attacker can open" \
+            "connections - and once storage is formatted the credential is in the metadata log" \
+            "and correcting it means discarding that log." \
+            "This is the same floor event_admin.go applies to every subscriber credential" \
+            "(MinSCRAMPasswordLength), so the standard does not depend on which path created" \
+            "the credential." \
+            "Fix: generate one instead of choosing one:" \
+            "  openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32" \
+            "No storage has been touched."
+    fi
+
+    # Counted with a sorted-unique pass over one character per line rather than with an
+    # associative array, so the check behaves identically under bash 3 - what macOS ships.
+    local distinct
+    distinct="$(printf '%s' "$value" | fold -w1 | sort -u | wc -l | tr -d ' ')"
+
+    if (( distinct < MIN_CREDENTIAL_DISTINCT_CHARS )); then
+        die "${name} uses fewer than ${MIN_CREDENTIAL_DISTINCT_CHARS} distinct characters, so it is long without being unpredictable." \
+            "The value is not echoed." \
+            "Length alone is not strength: thirty-two repetitions of one character clears a" \
+            "length check and is guessed immediately. This is the same floor event_admin.go" \
+            "applies (MinSCRAMPasswordDistinctChars)." \
+            "Fix: generate the secret from the full alphabet rather than padding a shorter one:" \
+            "  openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32" \
+            "No storage has been touched."
+    fi
+}
+
+# ---------------------------------------------------------------------------------------
+# Credential scratch files (Q4-20)
+# ---------------------------------------------------------------------------------------
+
+# Remove every scratch file, on every exit path.
+#
+# Registered for EXIT as well as the signals, so an interrupted or failed run cannot leave a
+# file containing the administrative password behind in the container's filesystem. It is
+# deliberately silent and always succeeds: it runs while an error is already being reported,
+# and a cleanup failure must not replace that error with its own.
+cleanup() {
+    local file
+    for file in ${SCRATCH_FILES[@]+"${SCRATCH_FILES[@]}"}; do
+        [[ -n "$file" ]] && rm -f "$file" 2>/dev/null || true
+    done
+    SCRATCH_FILES=()
+}
+trap cleanup EXIT INT TERM
+
+# Create an empty scratch file that only this user can read, and register it for cleanup.
+#
+# Prints the path. The umask is set BEFORE creation and restored afterwards, so the file is
+# never momentarily world-readable between mktemp and chmod - a window a chmod-after-write
+# approach leaves open. The chmod is belt and braces for a filesystem or a TMPDIR whose
+# behaviour makes the umask ineffective.
+new_scratch_file() {
+    local label="$1" path previous_umask
+    previous_umask="$(umask)"
+    umask 077
+    path="$(mktemp "${TMPDIR:-/tmp}/blnk-kafka-bootstrap-${label}.XXXXXX")" || {
+        umask "$previous_umask"
+        die "could not create a scratch file for the ${label} step." \
+            "Fix: make sure ${TMPDIR:-/tmp} is writable inside this container." \
+            "No storage has been touched."
+    }
+    umask "$previous_umask"
+    chmod 600 "$path" 2>/dev/null || true
+    SCRATCH_FILES+=("$path")
+    printf '%s' "$path"
+}
+
+# Does this CLI expand argparse4j "@file" argument files?
+#
+# This is the whole basis of the Q4-20 remedy, so it is PROBED rather than assumed: support
+# comes from argparse4j's fromFilePrefix, which the Kafka tools enable but which is not
+# guaranteed across every release and repackaging this script may run against.
+#
+# The probe is side-effect free. It writes a file whose only content is "--help" and runs
+# "format @thatfile": if expansion works the parser reads --help from the file and exits 0
+# after printing the usage block; if it does not, "@path" is left as an unrecognised
+# positional argument and the parser exits non-zero. Either way no storage is touched,
+# because --help short-circuits before any formatting decision.
+supports_argument_file() {
+    local probe output
+    probe="$(new_scratch_file argfile-probe)"
+    printf '%s\n' "--help" >"$probe"
+
+    # Failure is an expected outcome here, so the pipeline is guarded against "set -e".
+    output="$("$STORAGE_CLI" format "@${probe}" 2>&1 || true)"
+    rm -f "$probe"
+
+    # The usage block naming --add-scram is the positive signal. Matching on the flag rather
+    # than on an exit code keeps the probe honest: some argparse4j versions print usage to
+    # stderr and still exit 0, and a bare exit code cannot tell "help printed" from
+    # "argument rejected".
+    [[ "$output" == *"--add-scram"* && "$output" != *"unrecognized arguments"* ]]
+}
+
+# Count the distinct characters in a value, without ever printing any of them.
+#
+# fold -w1 puts one character per line, sort -u collapses duplicates, wc -l counts what is
+# left. Every stage is a pipe, so no intermediate ever reaches a command line or a log.
+# LC_ALL=C keeps "distinct" byte-wise rather than locale-dependent, which is what makes the
+# count reproducible across the environments this script runs in.
+count_distinct_characters() {
+    local value="$1"
+    printf '%s' "$value" | LC_ALL=C fold -w1 | LC_ALL=C sort -u | wc -l | tr -d '[:space:]'
+}
+
+# Refuse a secret too short or too repetitive to derive a broker credential from (S6-07).
+#
+# Neither the value nor any part of it is printed - only its LENGTH and its DISTINCT COUNT,
+# which is what the operator needs in order to fix it and is not enough to guess it. A length
+# is not a secret; a prefix would be.
+require_strong_credential() {
+    local name="$1" value="$2" distinct
+
+    if ((${#value} < MIN_SECRET_LENGTH)); then
+        die "${name} is ${#value} characters, below the ${MIN_SECRET_LENGTH}-character minimum." \
+            "The alphabet check alone let a ONE-character password through: a single letter" \
+            "is drawn entirely from the allowed set, so it says nothing about strength. This" \
+            "is the credential the brokers themselves authenticate with." \
+            "The value is not echoed, only its length." \
+            "Fix: generate one from the allowed set. For example:" \
+            "  openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c ${MIN_SECRET_LENGTH}" \
+            "Set the same value in the broker's SCRAM JAAS configuration." \
+            "No storage has been touched."
+    fi
+
+    distinct="$(count_distinct_characters "$value")"
+    if ((distinct < MIN_SECRET_DISTINCT)); then
+        die "${name} uses only ${distinct} distinct characters, below the ${MIN_SECRET_DISTINCT} required." \
+            "It is long enough but not varied enough, which is what a padded or repeated" \
+            "value looks like - a 32-character run of one letter has 32 characters and one" \
+            "character of entropy. A randomly generated secret of ${MIN_SECRET_LENGTH}" \
+            "alphanumerics clears this comfortably; a hand-typed one usually does not." \
+            "Neither the value nor any part of it is echoed." \
+            "Fix: generate one from the allowed set. For example:" \
+            "  openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c ${MIN_SECRET_LENGTH}" \
             "No storage has been touched."
     fi
 }
@@ -465,10 +704,15 @@ require_safe_principal() {
 # state it can act on - it is a request to do nothing, made by running the one command
 # whose only job is to do this.
 #
-# .env.example ships both keys empty - deliberately, since stack.sh --init substitutes
-# {POSTGRES_PASSWORD} and nothing else with a global sed, so any other brace placeholder
-# would survive into .env as a literal password - which makes the empty case the one
-# operators actually hit. The placeholder branch remains as defence in depth for a
+# .env.example ships both keys EMPTY rather than carrying a {PLACEHOLDER}, deliberately:
+# stack.sh --init substitutes {POSTGRES_PASSWORD} and nothing else with a global sed, so any
+# other brace placeholder would survive into .env as a literal password. --init then GENERATES
+# both of these keys - the principal and a random 32-character password - through set_env_value
+# rather than through that sed, which is why they can be empty in the template and still
+# correct in a generated .env.
+#
+# So the empty case reaching this function means .env was hand-written or predates the Kafka
+# keys, and the messages below say so. The placeholder branch remains as defence in depth for a
 # hand-edited .env, because formatting storage with a literal placeholder yields a broker
 # nobody can authenticate against and the failure would surface a long way from its cause.
 require_admin_credentials() {
@@ -486,10 +730,11 @@ require_admin_credentials() {
             "with. Neither has a default - the username used to fall back to 'admin', and" \
             "that silently disagreed with the Go clients, which read the same empty value" \
             "as 'no SASL at all'." \
-            "Fix: create .env with './stack.sh --init' if you have not already, then set" \
-            "BOTH keys in it - .env.example ships them empty and --init generates neither" \
-            "- or export them for this process. 'admin' is the conventional local" \
-            "principal. Use the same values as the broker's SCRAM JAAS configuration." \
+            "Fix: run './stack.sh --init'. It creates .env and GENERATES BOTH of these -" \
+            "the principal 'admin' and a random 32-character password - so the usual cause" \
+            "of seeing this message is that .env was written by hand or predates the Kafka" \
+            "keys. Set them yourself in .env, or export them for this process. Use the same" \
+            "values as the broker's SCRAM JAAS configuration." \
             "If you meant to run a broker with no SASL listener, you do not need this" \
             "script at all: format the storage without --add-scram."
     fi
@@ -508,10 +753,10 @@ require_admin_credentials() {
         die "KAFKA_SASL_ADMIN_USER is set to '${user}' but KAFKA_SASL_ADMIN_SECRET is empty." \
             "The bootstrap SCRAM credential cannot be seeded without it, and there is no" \
             "default by design: a credential must not be guessable from source." \
-            "Fix: create .env with './stack.sh --init' if you have not already, then set" \
-            "KAFKA_SASL_ADMIN_SECRET in it - .env.example ships that key empty and --init" \
-            "does not generate this one - or export the variable for this process. Use the" \
-            "same value as the broker's SCRAM JAAS configuration."
+            "Fix: run './stack.sh --init', which generates this value into .env - .env.example" \
+            "ships the key empty and --init fills it with a random 32-character password. Or" \
+            "set it in .env yourself, or export it for this process. Use the same value as" \
+            "the broker's SCRAM JAAS configuration."
     fi
 
     if [[ "$secret" == "{"*"}" ]]; then
@@ -525,7 +770,11 @@ require_admin_credentials() {
     fi
 
     require_safe_principal "KAFKA_SASL_ADMIN_USER" "$user"
+    # Syntax first, then strength: the alphabet check answers whether Kafka's grammar can
+    # carry the value at all, and the strength check answers whether it is worth carrying.
+    # Both are needed - the alphabet check alone accepts a one-character password.
     require_safe_credential "KAFKA_SASL_ADMIN_SECRET" "$secret"
+    require_strong_credential "KAFKA_SASL_ADMIN_SECRET" "$secret"
 
     # Publish the trimmed values, so that everything downstream - the --add-scram argument,
     # the super.users advisory and every diagnostic - works from exactly what was validated.
@@ -717,40 +966,103 @@ bootstrap_storage() {
     # alphabet check is the only defence against that, and it runs before anything is
     # formatted.
     #
-    # An honest limitation, recorded rather than glossed over: a secret passed as a
-    # command-line argument is briefly visible in the host's process table. It is accepted
-    # here because there is no pre-broker alternative - needing one is the entire reason
-    # this script exists - and because this path serves the local single-broker development
-    # stack. Production subscriber credentials are provisioned in process by the Go admin
-    # client (event_admin.go, via AlterUserScramCredentials) and never reach a command line.
+    # THE SECRET DOES NOT GO INTO argv WHEN THE CLI CAN AVOID IT (Q4-20).
+    #
+    # A value passed as a command-line argument is visible in the process table to every
+    # process in the namespace for as long as the command runs, and "kafka-storage format"
+    # runs long enough to be caught. "format --help" advertises no file-based alternative
+    # for --add-scram, which is what makes this look unavoidable - but the Kafka tools are
+    # built on argparse4j with fromFilePrefix enabled, so ANY argument, including
+    # --add-scram and its value, can be supplied from an "@file" instead. The file is
+    # created mode 0600, holds the credential for the duration of one command, and is
+    # removed immediately afterwards and again by the EXIT trap.
+    #
+    # Verified against apache/kafka 3.9: formatting with "@argfile" carrying --add-scram
+    # produces a 434-byte bootstrap.checkpoint containing the principal, against 249 bytes
+    # and no principal without it, so the flag is genuinely honoured from the file rather
+    # than silently dropped.
+    #
+    # THE FALLBACK IS STILL argv, AND IT WARNS. supports_argument_file() probes rather than
+    # assumes, because fromFilePrefix is not guaranteed across every Kafka repackaging. When
+    # the probe says no, the credential goes on the command line as before - the alternative
+    # would be to refuse to bootstrap at all, which turns a disclosure risk that only
+    # matters to co-tenants of this container into a total bring-up failure. The operator is
+    # told, by name, which path was taken and why.
+    #
+    # WHAT REMAINS EXPOSED EITHER WAY. Nothing here removes the secret from the environment
+    # of this process, which is where it arrived from. That is a different exposure with a
+    # different remedy (a secret store), and it is not this script's to close. Production
+    # subscriber credentials never touch a command line at all: they are provisioned in
+    # process by the Go admin client, event_admin.go via AlterUserScramCredentials.
     local scram_credential
     scram_credential="${SCRAM_MECHANISM}=[name=${KAFKA_SASL_ADMIN_USER},password=${KAFKA_SASL_ADMIN_SECRET},iterations=${KAFKA_SCRAM_ITERATIONS}]"
+
+    # Assemble the format invocation, putting --add-scram and its value behind an argument
+    # file whenever the CLI will read one. Everything else stays on the command line: a
+    # cluster ID, a config path and an idempotency flag are not secrets, and keeping them
+    # visible is what makes the log line above worth reading.
+    #
+    # --ignore-formatted complements the meta.properties probe above: it is Kafka's own
+    # idempotency flag and covers the partially formatted multi-directory case the probe
+    # deliberately declines to treat as done. The CLI's own stdout and stderr are left
+    # attached so that a failure explains itself.
+    local -a format_args=(format --cluster-id "$cluster_id" --config "$KRAFT_CONFIG" --ignore-formatted)
+    local scram_argfile="" delivery="an argument file (mode 0600); the secret is not in argv"
+
+    if supports_argument_file; then
+        scram_argfile="$(new_scratch_file add-scram)"
+        # One argument per line: argparse4j reads an @file that way, so the flag and its
+        # value must not share a line. printf, not echo, so no value is ever interpreted.
+        printf '%s\n' "--add-scram" "$scram_credential" >"$scram_argfile"
+        format_args+=("@${scram_argfile}")
+    else
+        # The credential still HAS to be seeded - a format that silently omitted --add-scram
+        # would succeed and produce a broker no client can ever authenticate against, which is
+        # a far worse outcome than the argv exposure this branch is conceding.
+        format_args+=(--add-scram "$scram_credential")
+        delivery="the command line, because this CLI does not expand @argument-files"
+        warn "this Kafka CLI does not support @argument-files, so the bootstrap SCRAM" \
+            "credential must be passed as a command-line argument, where it is briefly" \
+            "visible in this container's process table." \
+            "CLI in use: ${STORAGE_CLI}" \
+            "This affects only the bootstrap credential for this local broker. It is not" \
+            "how production credentials are issued - those are provisioned in process by" \
+            "event_admin.go and never reach a command line." \
+            "To close it: use an image whose Kafka tools expand @argument-files (verified" \
+            "working on apache/kafka 3.9), or format storage out of band and mount the" \
+            "already-formatted volume."
+    fi
 
     log "formatting KRaft storage" \
         "log dirs   : ${LOG_DIRS}" \
         "cluster ID : ${cluster_id}" \
         "config     : ${KRAFT_CONFIG}" \
         "admin user : ${KAFKA_SASL_ADMIN_USER}" \
-        "mechanism  : ${SCRAM_MECHANISM}, ${KAFKA_SCRAM_ITERATIONS} iterations"
+        "mechanism  : ${SCRAM_MECHANISM}, ${KAFKA_SCRAM_ITERATIONS} iterations" \
+        "credential : delivered via ${delivery}"
 
-    # --ignore-formatted complements the meta.properties probe above: it is Kafka's own
-    # idempotency flag and covers the partially formatted multi-directory case the probe
-    # deliberately declines to treat as done. The CLI's own stdout and stderr are left
-    # attached so that a failure explains itself.
-    if ! "$STORAGE_CLI" format \
-        --cluster-id "$cluster_id" \
-        --config "$KRAFT_CONFIG" \
-        --add-scram "$scram_credential" \
-        --ignore-formatted; then
+    if ! "$STORAGE_CLI" "${format_args[@]}"; then
+        # Remove the credential file before reporting, so the secret is gone from disk even
+        # if the operator spends the next hour reading the diagnosis. The EXIT trap would
+        # also do this; doing it here makes the ordering explicit rather than incidental.
+        [[ -n "$scram_argfile" ]] && rm -f "$scram_argfile"
         die "'kafka-storage format' failed; its own output is above." \
-            "The two usual causes:" \
+            "The three usual causes:" \
             "  1. the image is below the Kafka 3.5 / Confluent Platform 7.5.0 floor, so" \
             "     --add-scram is unsupported - check KAFKA_IMAGE;" \
             "  2. ${KRAFT_CONFIG} is not the file the broker starts with, does not match" \
             "     this image's layout, or holds a value Kafka rejects - it validates the" \
             "     whole configuration before formatting, and the output above names the" \
-            "     offending setting. Set KAFKA_KRAFT_CONFIG to the right file."
+            "     offending setting. Set KAFKA_KRAFT_CONFIG to the right file;" \
+            "  3. the cluster ID disagrees with an existing meta.properties in one of the" \
+            "     log directories, which the output above names. Unset KAFKA_CLUSTER_ID to" \
+            "     reuse the volume's own ID, or remove the volume to start clean." \
+            "The SCRAM credential was delivered via ${delivery}; it is not echoed here and" \
+            "any scratch file holding it has been removed."
     fi
+
+    # The credential has served its purpose; remove it now rather than at exit.
+    [[ -n "$scram_argfile" ]] && rm -f "$scram_argfile"
 
     ok "KRaft storage formatted with cluster ID ${cluster_id}." \
         "The SCRAM principal ${KAFKA_SASL_ADMIN_USER} (${SCRAM_MECHANISM}) is now in the" \

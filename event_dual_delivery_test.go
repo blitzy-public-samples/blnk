@@ -16,65 +16,43 @@
 
 // Dual-delivery payload equivalence — acceptance criterion V-8.
 //
-// The criterion is that, during the 30-day window, the Kafka message and the legacy HTTP
-// webhook carry THE SAME PAYLOAD for the same event, asserted byte for byte.
+// The criterion is that, during the dual-delivery window, the Kafka message and the legacy HTTP
+// webhook carry THE SAME PAYLOAD for the same event, asserted byte for byte. It holds
+// STRUCTURALLY: the relay claims one blnk.event_outbox row and drives both transports from it,
+// so the Kafka message value and the legacy body are the same slice and there is no second
+// serialisation for them to drift apart through.
 //
-// # Why the property holds today, and why this file still has to exist
+// The regression it exists to catch is a future change that REBUILDS THE LEGACY PAYLOAD FROM THE
+// DOMAIN OBJECT instead of from the row: SendWebhook still takes a NewWebhook struct, so "just
+// call SendWebhook from the relay" reads like a simplification. It is not, and the two bodies
+// would stay SEMANTICALLY EQUAL after it — which is why every equality assertion here is on
+// []byte or its string form and never on an unmarshalled map.
 //
-// V-8 passes STRUCTURALLY rather than by careful coding. The relay claims one
-// blnk.event_outbox row and drives both transports from it: the Kafka message's payload is
-// the row's stored bytes, and the legacy webhook body is the same slice, carried into the
-// queue by EnqueueLegacyWebhookDelivery and out of it by ProcessWebhook without either
-// re-serialising anything. There is no second serialisation for the two to drift apart
-// from, so equality is a consequence of the shape of the code and not of anybody
-// remembering to preserve it.
+// # Which seams are real, and which are substituted
 //
-// This file therefore has TWO jobs, and the second is the reason it is worth writing:
+// Real, and each touches the bytes: PublishEvent builds the row, the real EventRelayProcessor
+// claims it, the real EnqueueLegacyWebhookDelivery puts it on a real asynq queue (miniredis), the
+// real ProcessWebhook takes it off again, and the real processHTTPRaw signs and posts it. Because
+// the legacy body is serialised into Redis and read back out, its equality with the Kafka value
+// cannot be an artefact of two slices sharing a backing array.
 //
-//  1. Prove the property holds today, end to end, over the real functions.
-//  2. FAIL LOUDLY IF A FUTURE CHANGE REBUILDS THE LEGACY PAYLOAD FROM THE DOMAIN OBJECT
-//     instead of from the row. That is the realistic regression — SendWebhook still exists
-//     and takes a NewWebhook struct, so "just call SendWebhook from the relay" reads like a
-//     simplification. It is not: decoding the stored bytes into NewWebhook.Payload
-//     interface{} and marshalling again alphabetises every object's keys (Go sorts map
-//     keys) and re-renders every number through float64, so a large integer identifier
-//     comes back rounded and a decimal amount loses its trailing digits.
+// Substituted:
 //
-// The two bodies would remain SEMANTICALLY EQUAL after such a change, which is exactly why
-// this file compares RAW BYTES and never unmarshalled maps. A map comparison discards key
-// order and renormalises numbers — precisely the two differences a re-derivation
-// introduces — so it would keep passing while the guarantee was broken. Every equality
-// assertion below is on []byte or on its string form, deliberately.
+//   - THE BROKER, by a publisher recording the request it was handed, passed through the
+//     production marshalLedgerEvent so assertions are made against the bytes a live writer would
+//     put on the wire. The wire itself is not covered here; a live publish is
+//     event_ordering_integration_test.go's and event_isolation_integration_test.go's subject.
+//   - THE OUTBOX TABLE, by the relay's four-method store seam, which leases out the row
+//     PublishEvent actually produced. So THIS FILE DOES NOT PROVE THAT POSTGRESQL PERSISTS AND
+//     RETURNS THE BYTES UNCHANGED — that link is database/event_outbox_test.go's, in
+//     TestInsertEventOutboxInTx_PayloadBytesPassThroughUnmodified and
+//     TestInsertEventOutbox_PreservesAHostilePayloadSpellingByteForByte, which round-trip a
+//     hostile payload through the payload_raw BYTEA column.
 //
-// # What the harness does and does not fake
-//
-// Everything that touches the bytes is REAL: PublishEvent builds the row, the real
-// EventRelayProcessor claims it, the real EnqueueLegacyWebhookDelivery puts it on a real
-// asynq queue (miniredis, in-process), the real ProcessWebhook takes it off again, and the
-// real processHTTPRaw signs and posts it. Two seams are substituted, and neither carries
-// payload bytes:
-//
-//   - THE BROKER, by a publisher that records the request it was handed. A byte comparison
-//     needs the message value, not a network, and the substitution keeps this file runnable
-//     under `go test -short` with no Kafka at all. The recorded request is also passed
-//     through the production marshalLedgerEvent, so the assertions are made against the
-//     exact bytes a live writer would put on the wire.
-//   - THE OUTBOX TABLE, by the relay's four-method store seam. The row under test is the
-//     one PublishEvent actually produced; the fake only leases it out and records the
-//     transitions, exactly as ClaimPendingEventOutbox and its siblings do.
-//
-// The HTTP body is therefore an INDEPENDENT byte sequence — it was serialised into Redis
-// and read back out — so its equality with the Kafka payload cannot be an artefact of two
-// slices sharing a backing array.
-//
-// # Scope
-//
-// This file owns the CROSS-TRANSPORT comparison and nothing else. The retry schedule and
-// the relay lifecycle belong to event_relay_test.go, the 410 Gone routes to
-// api/webhook_sunset_test.go, replay fidelity to event_replay_fidelity_test.go, and the
-// single-transport behaviour of the legacy path to webhooks_test.go and
-// webhooks_process_test.go. Nothing here duplicates them; the comparison they cannot make
-// is the one made here.
+// Scope is the CROSS-TRANSPORT comparison alone: the retry schedule and relay lifecycle are
+// event_relay_test.go's, the 410 Gone routes api/webhook_sunset_test.go's, replay fidelity
+// event_replay_fidelity_test.go's, and the legacy path's single-transport behaviour
+// webhooks_test.go's and webhooks_process_test.go's.
 package blnk
 
 import (
@@ -84,10 +62,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"go/ast"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,12 +141,6 @@ const dualDeliveryFirstClaimToken = "token-1"
 // FUNCTION MAKES NO DECISION — it only writes a date. Whether that date has passed is
 // event_sunset.go's judgement, taken through the relay, and this file never forms an
 // opinion of its own about it.
-//
-// Parameters:
-//   - offset time.Duration: how far from the pinned clock the sunset sits.
-//
-// Returns:
-//   - string: the instant in RFC3339, ready for the configuration field.
 func dualDeliverySunsetIn(offset time.Duration) string {
 	return dualDeliveryFixedNow.Add(offset).Format(time.RFC3339)
 }
@@ -307,13 +278,6 @@ const dualDeliveryWebhookQueue = "dual_delivery_webhook_queue"
 // is restored, the httpmock transport is deactivated and its counters reset, miniredis is
 // stopped and both asynq connections are closed — so a failing test leaks nothing into the
 // next one.
-//
-// Parameters:
-//   - t *testing.T: the test, used for helper marking and cleanup registration.
-//   - sunsetDate string: the RFC3339 sunset instant, or "" to leave the window unset.
-//
-// Returns:
-//   - *dualDeliveryHarness: ready to capture, relay and deliver.
 func newDualDeliveryHarness(t *testing.T, sunsetDate string) *dualDeliveryHarness {
 	t.Helper()
 
@@ -397,6 +361,18 @@ func newDualDeliveryHarness(t *testing.T, sunsetDate string) *dualDeliveryHarnes
 		asynqClient: asynqClient,
 		httpClient:  httpClient,
 		events:      harness.kafka,
+		// THE HANDLER'S CLOCK, PINNED TO THE SAME INSTANT AS THE RELAY'S. Both legs must judge
+		// the same window, and ProcessWebhook re-reads the sunset at DELIVERY time — correctly,
+		// so that a deployment which has passed its sunset since a task was queued drops it
+		// rather than delivering to a retired transport. Left at the wall clock here, the relay
+		// would enqueue inside the window the configuration describes and the handler would then
+		// drop the task as retired, because the configured date is relative to
+		// dualDeliveryFixedNow and not to today.
+		//
+		// Only the CLOCK is injected. WebhookSunsetPassed stays the single decision point both
+		// the relay and the handler read, so this makes the two agree about the hour without
+		// letting either disagree about the rule.
+		legacyWebhookNow: func() time.Time { return dualDeliveryFixedNow },
 	}
 
 	harness.relay = NewEventRelayProcessor(harness.blnk)
@@ -430,14 +406,6 @@ func newDualDeliveryHarnessInWindow(t *testing.T) *dualDeliveryHarness {
 //
 // It records the request verbatim and answers with the harness's configured status, which is
 // how a receiver-side failure is simulated without changing anything about the request.
-//
-// Parameters:
-//   - request *http.Request: the intercepted delivery.
-//
-// Returns:
-//   - *http.Response: the subscriber's answer.
-//   - error: only when the body cannot be read, which would be a defect in the transport
-//     rather than a subscriber-side condition.
 func (h *dualDeliveryHarness) respond(request *http.Request) (*http.Response, error) {
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
@@ -467,13 +435,6 @@ func (h *dualDeliveryHarness) respond(request *http.Request) (*http.Response, er
 //
 // The surrogate key stands in for the BIGSERIAL the INSERT would have returned; the relay
 // names a row by that id in every transition it drives.
-//
-// Parameters:
-//   - event NewWebhook: the event exactly as a producer emits it.
-//   - options ...EventOption: forwarded verbatim to the capture path.
-//
-// Returns:
-//   - *model.EventOutbox: the captured row, with an id assigned.
 func (h *dualDeliveryHarness) captureEvent(event NewWebhook, options ...EventOption) *model.EventOutbox {
 	h.t.Helper()
 
@@ -494,9 +455,6 @@ func (h *dualDeliveryHarness) captureEvent(event NewWebhook, options ...EventOpt
 //
 // It is separate from captureEvent because the restart test has to make the SAME row
 // claimable a second time, which is what the database does when a lease expires.
-//
-// Parameters:
-//   - rows ...model.EventOutbox: the rows to make claimable, in occurrence order.
 func (h *dualDeliveryHarness) makeClaimable(rows ...model.EventOutbox) {
 	h.store.mu.Lock()
 	defer h.store.mu.Unlock()
@@ -510,9 +468,6 @@ func (h *dualDeliveryHarness) makeClaimable(rows ...model.EventOutbox) {
 // complete when it returns: it waits for its own worker pool, so every publish, every legacy
 // enqueue and every transition has finished by the time the count is returned. A ticker-driven
 // Start would make every assertion below a race against a background goroutine.
-//
-// Returns:
-//   - int: the number of rows claimed.
 func (h *dualDeliveryHarness) relayOneBatch() int {
 	h.t.Helper()
 
@@ -525,9 +480,6 @@ func (h *dualDeliveryHarness) relayOneBatch() int {
 // "Exactly one" is part of the assertion rather than a convenience: two requests for one
 // event would mean the event was published twice, which is a duplicate the subscriber would
 // have to suppress, and none would mean the Kafka leg silently did not run.
-//
-// Returns:
-//   - PublishRequest: the sole recorded request.
 func (h *dualDeliveryHarness) soleKafkaRequest() PublishRequest {
 	h.t.Helper()
 
@@ -537,48 +489,39 @@ func (h *dualDeliveryHarness) soleKafkaRequest() PublishRequest {
 	return requests[0]
 }
 
-// queuedTask reads the legacy task back OUT OF REDIS by its event-derived identity.
+// queuedTask reads the legacy task back OUT OF REDIS by its event-derived identity, which keeps
+// the assertions independent of ordering and states the identity itself: the task is addressable
+// as legacy-webhook:<event_id>, which is what lets asynq refuse a duplicate enqueue after a crash
+// between enqueuing and marking the row.
 //
-// Looking the task up by identity rather than by listing the queue is what makes the
-// assertions independent of ordering, and it is also a statement about the identity itself:
-// the task is addressable as legacy-webhook:<event_id>, which is exactly what lets asynq
-// refuse a duplicate enqueue after a crash between enqueuing and marking the row.
-//
-// A lookup error means the task is not there. That is not glossed over: until the first task
-// lands, the queue itself does not exist in Redis, and asynq reports the missing queue rather
-// than a missing task — so an error and an absent task are the same fact here.
-//
-// Parameters:
-//   - eventID string: the outbox row's event id.
-//
-// Returns:
-//   - *asynq.TaskInfo: the task, when present.
-//   - bool: whether it was found.
+// ONLY a missing task or a missing queue counts as absence — until the first enqueue the queue
+// does not exist in Redis, and asynq reports the queue rather than the task. Any other error is a
+// broken observation, not an absent task, and fails the test rather than being read as "not
+// enqueued".
 func (h *dualDeliveryHarness) queuedTask(eventID string) (*asynq.TaskInfo, bool) {
 	h.t.Helper()
 
 	info, err := h.inspector.GetTaskInfo(h.queueName, legacyWebhookTaskID(eventID))
-	if err != nil {
+	if errors.Is(err, asynq.ErrTaskNotFound) || errors.Is(err, asynq.ErrQueueNotFound) {
 		return nil, false
 	}
+
+	require.NoError(h.t, err, "the webhook queue must be inspectable; an unreadable task proves nothing")
 
 	return info, true
 }
 
-// queuedTaskCount returns how many legacy deliveries are waiting on the webhook queue.
-//
-// A listing error is reported as zero for the same reason queuedTask treats one as absence:
-// the queue does not exist until something is enqueued onto it.
-//
-// Returns:
-//   - int: the number of pending tasks.
+// queuedTaskCount returns how many legacy deliveries are waiting on the webhook queue, treating
+// ONLY a queue that does not exist as empty. Every other listing error fails the test.
 func (h *dualDeliveryHarness) queuedTaskCount() int {
 	h.t.Helper()
 
 	tasks, err := h.inspector.ListPendingTasks(h.queueName)
-	if err != nil {
+	if errors.Is(err, asynq.ErrQueueNotFound) {
 		return 0
 	}
+
+	require.NoError(h.t, err, "the webhook queue must be listable; an unlistable queue proves nothing")
 
 	return len(tasks)
 }
@@ -591,12 +534,6 @@ func (h *dualDeliveryHarness) queuedTaskCount() int {
 // relay held in memory, so the legacy body has genuinely round-tripped through the queue and
 // its equality with the Kafka payload cannot be an artefact of two slices sharing a backing
 // array.
-//
-// Parameters:
-//   - task *asynq.TaskInfo: the task as read back from the queue.
-//
-// Returns:
-//   - error: whatever the handler reported, so a failing subscriber can be asserted on.
 func (h *dualDeliveryHarness) runWebhookWorker(task *asynq.TaskInfo) error {
 	h.t.Helper()
 
@@ -604,9 +541,6 @@ func (h *dualDeliveryHarness) runWebhookWorker(task *asynq.TaskInfo) error {
 }
 
 // httpDeliveries returns a copy of every delivery the subscriber received.
-//
-// Returns:
-//   - []dualDeliveryHTTPCapture: the captures, in arrival order.
 func (h *dualDeliveryHarness) httpDeliveries() []dualDeliveryHTTPCapture {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -616,9 +550,6 @@ func (h *dualDeliveryHarness) httpDeliveries() []dualDeliveryHTTPCapture {
 
 // soleHTTPDelivery returns the one delivery the subscriber received, failing if there is not
 // exactly one.
-//
-// Returns:
-//   - dualDeliveryHTTPCapture: the sole capture.
 func (h *dualDeliveryHarness) soleHTTPDelivery() dualDeliveryHTTPCapture {
 	h.t.Helper()
 
@@ -629,9 +560,6 @@ func (h *dualDeliveryHarness) soleHTTPDelivery() dualDeliveryHTTPCapture {
 }
 
 // failNextDeliveries makes the subscriber answer status for every subsequent delivery.
-//
-// Parameters:
-//   - status int: the HTTP status the subscriber answers with.
 func (h *dualDeliveryHarness) failNextDeliveries(status int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -651,14 +579,6 @@ func (h *dualDeliveryHarness) failNextDeliveries(status int) {
 //
 // It requires both legs to have run, because a test that quietly observed only one of them
 // would report success for a window in which half the guarantee had stopped holding.
-//
-// Parameters:
-//   - event NewWebhook: the event exactly as a producer emits it.
-//   - options ...EventOption: forwarded to the capture path.
-//
-// Returns:
-//   - dualDeliveryObservation: the row, the Kafka request and message, the queued payload,
-//     and the delivery the subscriber received.
 func (h *dualDeliveryHarness) deliver(event NewWebhook, options ...EventOption) dualDeliveryObservation {
 	h.t.Helper()
 
@@ -707,34 +627,16 @@ const dualDeliveryPayloadMarker = `,"payload":`
 // dualDeliverySchemaMarker is the exact byte sequence that follows it.
 const dualDeliverySchemaMarker = `,"schema_version":`
 
-// assertTransportsCarryIdenticalBytes is THE assertion this file exists for.
+// assertTransportsCarryIdenticalBytes is THE assertion this file exists for. It compares four
+// byte sequences that must all be equal, each comparison closing a different way for the
+// guarantee to break: the reference json.Marshal of the originating NewWebhook (the payload
+// contract itself), the stored row's payload column (the capture path), the Kafka message's
+// payload (the relay rebuilding the envelope), and the body the subscriber received after a
+// queue round trip (the legacy leg re-serialising).
 //
-// It compares four byte sequences that must all be the same, and each comparison closes a
-// different way for the guarantee to break:
-//
-//  1. The reference — json.Marshal of the originating NewWebhook, which is precisely what
-//     SendWebhook has always sent as the HTTP body. If this differs, the payload contract
-//     itself moved.
-//  2. The stored row's payload column. If this differs from the reference, the capture path
-//     reshaped the event.
-//  3. The Kafka message's payload. If this differs from the row, the relay rebuilt the
-//     envelope instead of carrying the row's bytes.
-//  4. The body the subscriber received, after a round trip through the queue. If this differs
-//     from the Kafka payload, the legacy leg re-serialised — which is the regression this
-//     file is written to catch.
-//
-// Every comparison is on bytes. Comparing unmarshalled maps instead would discard object key
-// order and renormalise number literals, which are exactly the two differences a re-derivation
-// introduces, so a map comparison would pass while the guarantee was broken.
-//
-// The splice check is the strongest form of the statement: the delivered body appears inside
-// the serialised Kafka envelope as a CONTIGUOUS byte run between the payload and
-// schema_version members, so the HTTP body is literally a slice of the Kafka message.
-//
-// Parameters:
-//   - t *testing.T: the test.
-//   - observation dualDeliveryObservation: the completed journey.
-//   - event NewWebhook: the originating event, for the independent reference marshal.
+// The splice check is the strongest form of the statement: the delivered body appears inside the
+// serialised Kafka envelope as a CONTIGUOUS byte run between the payload and schema_version
+// members, so the HTTP body is literally a slice of the Kafka message.
 func assertTransportsCarryIdenticalBytes(
 	t *testing.T,
 	observation dualDeliveryObservation,
@@ -774,10 +676,6 @@ func assertTransportsCarryIdenticalBytes(
 // Byte equality alone would be satisfied by a message published under a different event id or
 // to a different topic, and a subscriber routes on exactly those fields — so an envelope that
 // disagreed with the row would break routing and idempotency while carrying the right bytes.
-//
-// Parameters:
-//   - t *testing.T: the test.
-//   - observation dualDeliveryObservation: the completed journey.
 func assertKafkaEnvelopeDescribesTheRow(t *testing.T, observation dualDeliveryObservation) {
 	t.Helper()
 
@@ -813,20 +711,15 @@ func dualDeliverySampleEvent() NewWebhook {
 // The byte-equality guarantee across the whole event catalogue
 // ---------------------------------------------------------------------------
 
-// TestDualDelivery_EveryEventTypeCarriesIdenticalBytesOnBothTransports is acceptance
-// criterion V-8.
+// TestDualDelivery_EveryEventTypeCarriesIdenticalBytesOnBothTransports is acceptance criterion
+// V-8, driven for EVERY event type: capture, claim, Kafka publish, legacy enqueue, queue round
+// trip, HTTP delivery.
 //
-// For every event type Blnk emits, it drives the full pipeline — capture, claim, Kafka
-// publish, legacy enqueue, queue round trip, HTTP delivery — and asserts that the Kafka
-// message's payload and the delivered webhook body are the same bytes, and that both are the
-// body SendWebhook would have sent.
-//
-// COVERAGE IS THE POINT, not a bonus. Requirement R-1 is 100% of the event types that reached
-// the legacy webhook sender, so a comparison proved for one event type and assumed for the
-// other twelve would leave the requirement unverified. The catalogue is taken from
-// outboxEventFixtures, which is the repository's single statement of what those types are and
-// of the payload SHAPE each producer passes — pointer where the producer passes a pointer,
-// value where it passes a value, and all three shapes of the runtime-composed bulk family.
+// Coverage is the point rather than a bonus. Requirement R-1 is 100% of the event types that
+// reached the legacy webhook sender, so a comparison proved for one and assumed for the rest
+// would leave it unverified. The catalogue comes from outboxEventFixtures, the repository's
+// single statement of those types and of the payload SHAPE each producer passes — pointer,
+// value, and all three shapes of the runtime-composed bulk family.
 func TestDualDelivery_EveryEventTypeCarriesIdenticalBytesOnBothTransports(t *testing.T) {
 	fixtures := outboxEventFixtures()
 	require.NotEmpty(t, fixtures, "the event catalogue must not be empty")
@@ -933,24 +826,16 @@ func TestDualDelivery_CommitStatusStaysTransactionUnknownOnBothTransports(t *tes
 // The re-serialisation regression this file exists to catch
 // ---------------------------------------------------------------------------
 
-// dualDeliveryNonCanonicalPayload returns an event payload whose BYTES CANNOT SURVIVE a round
-// trip through NewWebhook.Payload interface{}.
+// dualDeliveryNonCanonicalPayload returns an event payload whose BYTES CANNOT SURVIVE a round trip
+// through NewWebhook.Payload interface{}, since a fixture that survives a re-marshal proves
+// nothing: the keys are non-alphabetical (a decode makes the object a map, and Go marshals map keys
+// sorted), precise_amount is 2^53+1 — the smallest positive integer a float64 cannot represent, so
+// a re-marshal renders it off by one in a field naming money — and amount carries a trailing zero
+// that float64 rendering drops.
 //
-// A fixture that survives a re-marshal proves nothing, so every element of this one is chosen
-// to break under it:
-//
-//   - The keys are in deliberately NON-ALPHABETICAL order. Decoding makes the object a
-//     map[string]interface{} and Go marshals map keys sorted, so a re-marshal alphabetises
-//     them.
-//   - precise_amount is 2^53+1, the smallest positive integer a float64 cannot represent.
-//     Decoding makes it a float64 and a re-marshal renders 9007199254740992 — off by one, in a
-//     field that names an amount of money.
-//   - amount carries a TRAILING ZERO. float64 re-rendering drops it, so 150.250 becomes 150.25.
-//
-// It is a json.RawMessage, which json.Marshal writes through verbatim, so the harness controls
-// the exact byte form the producer emits. That is realistic rather than contrived: a real
-// payload is a marshaled domain struct whose fields serialise in declaration order, which is
-// just as non-alphabetical, and model.Transaction.PreciseAmount is a big.Int that marshals as an
+// It is a json.RawMessage, which json.Marshal writes through verbatim, so the harness controls the
+// exact byte form. That is realistic: a real payload is a marshaled struct whose fields serialise
+// in declaration order, and model.Transaction.PreciseAmount is a big.Int marshalling as an
 // unbounded JSON number.
 func dualDeliveryNonCanonicalPayload() json.RawMessage {
 	return json.RawMessage(`{"transaction_id":"txn_dual_delivery_fidelity","amount":150.250,` +
@@ -1066,22 +951,17 @@ func TestDualDelivery_BothLegsAreDrivenFromTheSameClaimedRow(t *testing.T) {
 	t.Logf("kafka envelope: %s", string(observation.kafkaMessage))
 }
 
-// TestDualDelivery_ARelayRestartDeliversTheWebhookExactlyOnce covers the crash window that the
-// row marker alone cannot close.
+// TestDualDelivery_ARelayRestartDeliversTheWebhookExactlyOnce covers the crash window the row
+// marker alone cannot close: enqueuing the legacy delivery and recording that it was enqueued are
+// two operations against two systems with no transaction spanning them, so a crash in between
+// leaves the row unmarked and the next claim enqueues AGAIN.
 //
-// Enqueuing the legacy delivery and recording that it was enqueued are two operations against
-// two systems with no transaction spanning them. A crash in between leaves the row unmarked, so
-// the next claim enqueues the delivery AGAIN — and for a payment notification a duplicate is a
-// real consequence, not untidiness.
-//
-// The event id is the asynq task identity, so the second enqueue is refused rather than
-// accepted, and the refusal is reported as success because the post-condition the relay needs
-// already holds. This drives exactly that sequence: the marker write fails, the row is claimed a
-// second time as the database would offer it, and the subscriber still receives one delivery.
-//
-// The Kafka leg legitimately publishes twice — delivery there is at-least-once and the duplicate
-// is suppressed at the subscriber on event_id — and the two publishes must carry identical
-// bytes, which is asserted rather than assumed.
+// The event id is the asynq task identity, so that second enqueue is refused and the refusal is
+// reported as success — the post-condition the relay needs already holds. The sequence is driven
+// exactly: the marker write fails, the row is claimed again as the database would offer it, and
+// the subscriber still receives one delivery. The Kafka leg legitimately publishes twice (delivery
+// there is at-least-once, deduplicated at the subscriber on event_id), and both publishes must
+// carry identical bytes.
 func TestDualDelivery_ARelayRestartDeliversTheWebhookExactlyOnce(t *testing.T) {
 	harness := newDualDeliveryHarnessInWindow(t)
 	event := dualDeliverySampleEvent()
@@ -1326,18 +1206,13 @@ func TestDualDelivery_SunsetVerdictComesFromConfiguration(t *testing.T) {
 // Isolation between the two transports
 // ---------------------------------------------------------------------------
 
-// TestDualDelivery_ALegacyFailureNeverReachesTheKafkaLeg asserts the one-way isolation the
-// window depends on.
+// TestDualDelivery_ALegacyFailureNeverReachesTheKafkaLeg asserts the one-way isolation the window
+// depends on: letting the DEPRECATED transport influence the Kafka leg would give a down webhook
+// receiver the power to spend Kafka retry attempts and dead-letter events on its replacement.
 //
-// The legacy transport is what unmigrated subscribers are still consuming, and it is the
-// DEPRECATED one. Letting it influence the Kafka leg would give a webhook receiver being down
-// the power to spend Kafka retry attempts and, five failures later, dead-letter events on the
-// new transport — a deprecated transport able to break its replacement.
-//
-// Two failures are exercised, at the two places the legacy leg can fail: the subscriber
-// rejecting the delivery, and the queue being unreachable so the delivery is never enqueued at
-// all. In both, the Kafka publish happens, the row reaches its dispatched terminal state, and no
-// retry attempt is recorded.
+// Both places the legacy leg can fail are exercised — the subscriber rejecting the delivery, and
+// the queue being unreachable so nothing is enqueued. In each, the Kafka publish happens, the row
+// reaches its dispatched terminal state, and no retry attempt is recorded.
 func TestDualDelivery_ALegacyFailureNeverReachesTheKafkaLeg(t *testing.T) {
 	t.Run("the subscriber rejects the delivery", func(t *testing.T) {
 		harness := newDualDeliveryHarnessInWindow(t)
@@ -1392,12 +1267,23 @@ func TestDualDelivery_ALegacyFailureNeverReachesTheKafkaLeg(t *testing.T) {
 		request := harness.soleKafkaRequest()
 		assert.Equal(t, string(row.Payload), string(request.Event.Payload),
 			"an unreachable legacy queue must not stop the Kafka publish")
-		assert.Len(t, harness.store.snapshotDispatched(), 1,
-			"nor stop the row reaching its terminal state")
 		assert.Empty(t, harness.store.snapshotFailures(),
 			"nor spend a Kafka retry attempt")
 		assert.Empty(t, harness.store.snapshotWebhookMarks(),
 			"nothing may be recorded for a leg that never ran")
+
+		// The row is NOT dispatched, because a webhook is still owed and dispatched is
+		// outside the claim predicate. It is recorded as webhook_pending instead: the Kafka
+		// leg is final, the legacy leg is retried on a later claim, and — because the Kafka
+		// leg is recorded separately — that later claim publishes nothing to the topic.
+		assert.Empty(t, harness.store.snapshotDispatched(),
+			"a row whose legacy leg is still owed must not be moved to its terminal state; that "+
+				"is what used to lose the webhook permanently")
+		pendings := harness.store.snapshotWebhookPendings()
+		require.Len(t, pendings, 1, "the outstanding legacy leg must be recorded")
+		assert.Equal(t, row.ID, pendings[0].id)
+		assert.NotEmpty(t, pendings[0].reason,
+			"last_error must say why the enqueue failed, or an operator has nothing to triage")
 		assert.Zero(t, httpmock.GetTotalCallCount(), "and no delivery can have been made")
 
 		entries := relayEntriesWithMessage(hook, "enqueuing the legacy webhook delivery failed")
@@ -1411,26 +1297,35 @@ func TestDualDelivery_ALegacyFailureNeverReachesTheKafkaLeg(t *testing.T) {
 // This file's own discipline
 // ---------------------------------------------------------------------------
 
-// dualDeliveryReadOwnSource reads this file so a test can assert the ABSENCE of something.
+// dualDeliveryParseOwnSource parses THIS FILE so a test can assert the ABSENCE of something in
+// it.
 //
-// Reading the source is the only way to express "this decision is not duplicated here": a second
-// sunset comparison, or a stub over the predicate, would be invisible to a behavioural test for
-// as long as it happened to agree with event_sunset.go — and the whole point of single ownership
-// is that it must keep agreeing after somebody changes one of them.
+// An absence is the one property a behavioural test cannot reach: a second sunset comparison, or
+// a stub over the relay's predicate, is invisible from the outside for exactly as long as it
+// happens to agree with event_sunset.go — and single ownership is worth asserting precisely
+// because it has to keep agreeing after somebody changes one of them.
+//
+// # Why the AST, and not the text
+//
+// This used to read the file as a string, and a self-referential text scan cannot work. The
+// needles appeared in the file's own source — inside the very assertion looking for them — so
+// each one had to be ASSEMBLED FROM CONCATENATED FRAGMENTS to avoid matching itself. At that
+// point the check had become a check on its own obfuscation: it could be defeated by an extra
+// space, and it failed on any comment that happened to name the construct it forbids.
+//
+// Parsing removes the problem at the root. Comments and string literals are not AST nodes, so
+// the file can freely DOCUMENT the rule it obeys, and the needles are written plainly here
+// because a plain identifier in this comment is not an identifier in the tree.
 //
 // Parameters:
 //   - t *testing.T: the test.
 //
 // Returns:
-//   - string: the contents of this file.
-func dualDeliveryReadOwnSource(t *testing.T) string {
+//   - *ast.File: this file, parsed without comments.
+func dualDeliveryParseOwnSource(t *testing.T) *ast.File {
 	t.Helper()
 
-	path := filepath.Join(moduleRootDir(t), "event_dual_delivery_test.go")
-	contents, err := os.ReadFile(path) //nolint:gosec // a fixed, repository-relative path
-	require.NoError(t, err, "%s must be readable to assert its own structure", path)
-
-	return string(contents)
+	return parseRepositoryGoFile(t, "event_dual_delivery_test.go")
 }
 
 // TestDualDelivery_MakesNoSunsetDecisionOfItsOwn keeps this file honest about the boundary it
@@ -1441,48 +1336,45 @@ func dualDeliveryReadOwnSource(t *testing.T) string {
 // by comparing instants itself or by replacing the relay's predicate with a stub, would report
 // the boundary as correct while the production wiring had stopped consulting it.
 //
-// The needles are ASSEMBLED FROM FRAGMENTS on purpose. A literal needle would appear in this
-// file's own source — inside the very check looking for it — and the assertion would fail on
-// itself, which is the classic way a self-referential source scan becomes useless.
+// The needles below are written PLAINLY. They no longer have to be hidden from the assertion
+// that looks for them, because the assertion reads the parsed tree: an identifier inside a
+// comment or a string literal is not an identifier in the AST, so this file can name the very
+// constructs it forbids while still being proved free of them.
 func TestDualDelivery_MakesNoSunsetDecisionOfItsOwn(t *testing.T) {
-	source := dualDeliveryReadOwnSource(t)
+	source := dualDeliveryParseOwnSource(t)
 
-	require.Contains(t, source, "newDualDeliveryHarness",
-		"the scan must have read this file, or every assertion below passes vacuously")
+	require.Positive(t, identifierUses(source, "newDualDeliveryHarness"),
+		"the parse must have read THIS file, or every assertion below passes vacuously")
 
-	forbidden := []struct {
-		needle string
-		why    string
-	}{
-		{
-			needle: "sunsetPassed" + " =",
-			why: "replacing the relay's predicate with a stub would test the branch without testing " +
-				"that the branch still asks event_sunset.go",
-		},
-		{
-			needle: "sunsetPassed" + ":",
-			why:    "the same, assigned as a struct field",
-		},
-		{
-			needle: "." + "Before(",
-			why: "comparing instants here would be a second, independently drifting copy of the " +
-				"sunset decision",
-		},
-		{
-			needle: "." + "After(",
-			why:    "the same, in the other direction",
-		},
+	// No stub over the relay's own decision. Both of the relay's predicate fields are named,
+	// because replacing either one would test the branch without testing that the branch still
+	// asks event_sunset.go — and assignmentTargets sees a plain assignment and a composite-literal
+	// field alike, which is what the two separate text needles used to cover between them.
+	assigned := assignmentTargets(source)
+	for _, field := range []string{"sunsetPassed", "dualDeliveryActive", "windowState"} {
+		assert.Zero(t, assigned[field],
+			"this file must not assign %s: substituting the relay's predicate would exercise the "+
+				"dual-delivery branch while proving nothing about whether that branch still "+
+				"consults event_sunset.go", field)
 	}
 
-	for _, rule := range forbidden {
-		assert.NotContains(t, source, rule.needle,
-			"this file must not contain %q: %s", rule.needle, rule.why)
-	}
+	// No instant comparison of its own. This is the second, independently drifting copy the rule
+	// exists to prevent: a test that decided for itself whether the window was open would report
+	// the boundary as correct while production had stopped asking.
+	calls := selectorCallNames(source)
+	assert.Zero(t, calls["Before"],
+		"comparing instants here would be a second copy of the sunset decision, free to drift")
+	assert.Zero(t, calls["After"], "the same, in the other direction")
+	assert.Zero(t, qualifiedCallCount(source, "time", "Parse"),
+		"nor may it parse a date: event_sunset.go owns what the configured string means")
 
 	// The positive half: the boundary IS driven, and it is driven through configuration, which is
 	// the only input event_sunset.go reads.
-	assert.Contains(t, source, "WebhookDeprecationSunsetDate",
+	assert.Positive(t, identifierUses(source, "WebhookDeprecationSunsetDate"),
 		"the sunset cases must configure the deployment's window and let event_sunset.go judge it")
-	assert.Contains(t, source, "dualDeliveryWindowClosed",
+	assert.Positive(t, identifierUses(source, "dualDeliveryWindowClosed"),
 		"and both sides of the boundary must be exercised")
+	assert.Positive(t, identifierUses(source, "dualDeliveryWindowOpen"),
+		"including the open side, or the closed cases alone would be satisfied by a relay that "+
+			"never dual-delivered at all")
 }

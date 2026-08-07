@@ -35,8 +35,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
+	"go/ast"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,6 +71,11 @@ type relayClaimRecord struct {
 type relayMarkRecord struct {
 	id         int64
 	claimToken string
+
+	// record is the broker coordinate the transition was given. Recorded so a test can
+	// assert that the relay PERSISTS where the broker put the message — the mapping the
+	// zero-loss reconciliation is built on — rather than only that it marked the row.
+	record model.BrokerRecord
 }
 
 // relayFailRecord is one recorded failed attempt.
@@ -80,6 +84,10 @@ type relayFailRecord struct {
 	claimToken string
 	reason     string
 	retryAfter time.Duration
+
+	// record is the broker coordinate the transition was given, empty on a transition that
+	// carries none.
+	record model.BrokerRecord
 }
 
 // relayFakeStore models blnk.event_outbox closely enough to drive multi-attempt sequences:
@@ -106,11 +114,23 @@ type relayFakeStore struct {
 	dispatched   []relayMarkRecord
 	failures     []relayFailRecord
 	webhookMarks []relayMarkRecord
+	// webhookPendings records MarkEventWebhookPending calls — the transition that keeps a
+	// failed legacy enqueue recoverable instead of losing it behind a terminal state.
+	webhookPendings []relayFailRecord
 
-	claimErr    error
-	dispatchErr error
-	failErr     error
-	webhookErr  error
+	// renewals records every lease renewal, and failedClaims every dead-letter repair
+	// claim, so the heartbeat and the repair pass can be asserted rather than inferred.
+	renewals    []relayRenewalRecord
+	failedRows  []model.EventOutbox
+	failedTaken bool
+
+	claimErr          error
+	dispatchErr       error
+	failErr           error
+	webhookErr        error
+	webhookPendingErr error
+	renewErr          error
+	failedClaimErr    error
 
 	tokens int
 
@@ -214,7 +234,12 @@ func (s *relayFakeStore) ClaimPendingEventOutbox(
 // detachedBookkeepingContext exists to prevent would be invisible to every test that used this
 // fake. The check comes before the call is recorded, because a statement a cancelled context
 // never sends leaves nothing behind in the database either.
-func (s *relayFakeStore) MarkEventDispatched(ctx context.Context, id int64, claimToken string) error {
+func (s *relayFakeStore) MarkEventDispatched(
+	ctx context.Context,
+	id int64,
+	claimToken string,
+	record model.BrokerRecord,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -222,7 +247,9 @@ func (s *relayFakeStore) MarkEventDispatched(ctx context.Context, id int64, clai
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.dispatched = append(s.dispatched, relayMarkRecord{id: id, claimToken: claimToken})
+	s.dispatched = append(s.dispatched, relayMarkRecord{
+		id: id, claimToken: claimToken, record: record,
+	})
 
 	if s.dispatchErr != nil {
 		return s.dispatchErr
@@ -320,6 +347,166 @@ func (s *relayFakeStore) MarkWebhookDispatched(ctx context.Context, id int64, cl
 	return nil
 }
 
+// MarkEventWebhookPending reproduces the repository's two arms for a Kafka leg that is done
+// while the legacy leg is still owed: back to the CLAIMABLE set as webhook_pending with the
+// caller's backoff applied, or dispatched with the legacy leg abandoned once the webhook
+// budget is spent.
+//
+// It stamps KafkaDispatchedAt exactly as the COALESCE in the real statement does, because
+// that column is what makes a re-claim publish nothing — a fake that omitted it would let a
+// duplicate-publish regression pass.
+func (s *relayFakeStore) MarkEventWebhookPending(
+	ctx context.Context,
+	id int64,
+	claimToken, errMsg string,
+	retryAfter time.Duration,
+	record model.BrokerRecord,
+) (model.EventWebhookOutcome, error) {
+	if err := ctx.Err(); err != nil {
+		return model.EventWebhookOutcome{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.webhookPendings = append(s.webhookPendings, relayFailRecord{
+		id: id, claimToken: claimToken, reason: errMsg, retryAfter: retryAfter, record: record,
+	})
+
+	if s.webhookPendingErr != nil {
+		return model.EventWebhookOutcome{}, s.webhookPendingErr
+	}
+
+	row, held := s.inflight[id]
+	if !held || row.ClaimToken != claimToken {
+		return model.EventWebhookOutcome{}, fmt.Errorf("relay test: claim lost on row %d", id)
+	}
+
+	row.WebhookAttempts++
+	row.LastError = errMsg
+	row.LockedUntil = nil
+	if row.KafkaDispatchedAt == nil {
+		acknowledged := s.now()
+		row.KafkaDispatchedAt = &acknowledged
+	}
+	// COALESCE semantics, as the real statement has: a webhook-only retry carries no
+	// coordinate and must not erase the one the successful publish recorded.
+	if coordinate, confirmed := record, record.Confirmed(); confirmed && row.KafkaOffset == nil {
+		partition := coordinate.Partition
+		offset := coordinate.Offset
+		row.KafkaTopic = coordinate.Topic
+		row.KafkaPartition = &partition
+		row.KafkaOffset = &offset
+	}
+
+	if row.WebhookAttempts >= row.MaxAttempts {
+		row.Status = model.EventOutboxStatusDispatched
+		row.ClaimToken = ""
+		delete(s.inflight, id)
+		s.terminal[id] = model.EventOutboxStatusDispatched
+
+		return model.EventWebhookOutcome{
+			Status:          row.Status,
+			WebhookAttempts: row.WebhookAttempts,
+			Abandoned:       true,
+		}, nil
+	}
+
+	row.Status = model.EventOutboxStatusWebhookPending
+	row.ClaimToken = ""
+	row.NextAttemptAt = s.now().Add(retryAfter)
+
+	delete(s.inflight, id)
+	s.pending = append(s.pending, row)
+
+	return model.EventWebhookOutcome{Status: row.Status, WebhookAttempts: row.WebhookAttempts}, nil
+}
+
+// RenewEventOutboxLease extends the lease of every row still held under claimToken, exactly as
+// the repository's statement does: rows that have reached a terminal state no longer carry the
+// token, so they are outside its reach and the returned count reports only what is still in
+// flight.
+func (s *relayFakeStore) RenewEventOutboxLease(
+	ctx context.Context,
+	claimToken string,
+	lease time.Duration,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.renewals = append(s.renewals, relayRenewalRecord{claimToken: claimToken, lease: lease})
+
+	if s.renewErr != nil {
+		return 0, s.renewErr
+	}
+
+	var renewed int64
+	expiry := s.now().Add(lease)
+
+	for id, row := range s.inflight {
+		if row.ClaimToken != claimToken || row.Status != model.EventOutboxStatusProcessing {
+			continue
+		}
+
+		row.LockedUntil = &expiry
+		s.inflight[id] = row
+		renewed++
+	}
+
+	return renewed, nil
+}
+
+// ClaimFailedEventOutboxForDeadLetter hands out the seeded unpreserved rows once, stamping a
+// FRESH claim token and leaving the status at failed — which is what the repository does, and
+// what lets MarkEventDeadLettered accept the row afterwards.
+func (s *relayFakeStore) ClaimFailedEventOutboxForDeadLetter(
+	ctx context.Context,
+	batchSize int,
+	lockDuration time.Duration,
+) ([]model.EventOutbox, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.failedClaimErr != nil {
+		return nil, s.failedClaimErr
+	}
+
+	if batchSize <= 0 {
+		return nil, errors.New("relay test: dead-letter recovery batch size must be greater than zero")
+	}
+
+	if s.failedTaken || len(s.failedRows) == 0 {
+		return nil, nil
+	}
+	s.failedTaken = true
+
+	s.tokens++
+	token := fmt.Sprintf("recovery-token-%d", s.tokens)
+	lease := s.now().Add(lockDuration)
+
+	claimed := make([]model.EventOutbox, 0, len(s.failedRows))
+	for _, row := range s.failedRows {
+		if len(claimed) >= batchSize {
+			break
+		}
+
+		row.ClaimToken = token
+		row.LockedUntil = &lease
+		s.inflight[row.ID] = row
+		claimed = append(claimed, row)
+	}
+
+	return claimed, nil
+}
+
 // expireLeases returns every still-claimed row to the claimable set, which is what a relay
 // crash looks like from the database's point of view once the lease has run out.
 func (s *relayFakeStore) expireLeases() {
@@ -337,6 +524,23 @@ func (s *relayFakeStore) expireLeases() {
 		row.NextAttemptAt = time.Time{}
 		s.pending = append(s.pending, row)
 		delete(s.inflight, id)
+	}
+}
+
+// retireInflight drops every claimed row's token, which is what a FINISHED batch looks like
+// from the database's point of view: every terminal transition clears claim_token, so nothing
+// is left under it for a lease renewal to extend.
+//
+// It exists so a test can produce a zero renewal count without waiting for real publishes to
+// complete, which is the condition the heartbeat retires itself on.
+func (s *relayFakeStore) retireInflight() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for id, row := range s.inflight {
+		row.ClaimToken = ""
+		row.Status = model.EventOutboxStatusDispatched
+		s.inflight[id] = row
 	}
 }
 
@@ -431,6 +635,28 @@ func (s *relayFakeStore) snapshotWebhookMarks() []relayMarkRecord {
 	return append([]relayMarkRecord(nil), s.webhookMarks...)
 }
 
+// relayRenewalRecord is one lease renewal.
+type relayRenewalRecord struct {
+	claimToken string
+	lease      time.Duration
+}
+
+// snapshotRenewals returns the lease renewals, in call order.
+func (s *relayFakeStore) snapshotRenewals() []relayRenewalRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]relayRenewalRecord(nil), s.renewals...)
+}
+
+// snapshotWebhookPendings returns the MarkEventWebhookPending calls, in call order.
+func (s *relayFakeStore) snapshotWebhookPendings() []relayFailRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]relayFailRecord(nil), s.webhookPendings...)
+}
+
 func (s *relayFakeStore) snapshotClaims() []relayClaimRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -459,6 +685,24 @@ type relayFakePublisher struct {
 	failFor map[string]bool
 	// beforePublish runs inside the publish, which is how a test observes concurrency.
 	beforePublish func(req PublishRequest)
+
+	// coordinates hands back a broker coordinate per event, modelling what the real publisher
+	// reads off Writer.Completion. Absent means the publish reports no coordinate, which is a
+	// legitimate outcome the relay has to record honestly as unconfirmed.
+	coordinates map[string]model.BrokerRecord
+}
+
+// reporting makes the publisher hand back a coordinate for one event.
+func (p *relayFakePublisher) reporting(eventID string, record model.BrokerRecord) *relayFakePublisher {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.coordinates == nil {
+		p.coordinates = make(map[string]model.BrokerRecord)
+	}
+	p.coordinates[eventID] = record
+
+	return p
 }
 
 var _ TopicEventPublisher = (*relayFakePublisher)(nil)
@@ -492,6 +736,7 @@ func (p *relayFakePublisher) PublishToTopic(_ context.Context, req PublishReques
 		Attempt:      resolveAttempt(req),
 		MaxAttempts:  resolveMaxAttempts(req),
 		Purpose:      resolvePurpose(req),
+		Record:       p.coordinates[req.Event.EventID],
 	}
 
 	failure := p.err
@@ -573,6 +818,15 @@ func (d *relayFakeDeadLetterer) snapshotRows() []model.EventOutbox {
 	return append([]model.EventOutbox(nil), d.rows...)
 }
 
+// snapshotCauses returns the failures the rows were dead-lettered with, in call order. The
+// cause becomes the failure metadata's error_reason, so it is part of what an operator reads.
+func (d *relayFakeDeadLetterer) snapshotCauses() []error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return append([]error(nil), d.causes...)
+}
+
 // relayLegacyEnqueue is one recorded legacy webhook enqueue.
 type relayLegacyEnqueue struct {
 	eventID string
@@ -625,15 +879,15 @@ type relayHarness struct {
 	deadLetters *relayFakeDeadLetterer
 	legacy      *relayFakeLegacy
 
-	// wiredSunset is the sunset predicate NewEventRelayProcessor ACTUALLY INSTALLED, captured
-	// before the harness replaced it with a stub.
+	// wiredWindow is the dual-delivery predicate NewEventRelayProcessor ACTUALLY INSTALLED,
+	// captured before the harness replaced it with a stub.
 	//
 	// A test that needs the production decision must restore this rather than naming
-	// WebhookSunsetPassed again. Naming it again re-derives the right answer even when the
-	// constructor wired the wrong thing — a constructor that hardwired "the sunset has not
-	// passed" would satisfy such a test and then dual-write forever in production, which is
+	// WebhookDualDeliveryActive again. Naming it again re-derives the right answer even when
+	// the constructor wired the wrong thing — a constructor that hardwired "the window is
+	// open" would satisfy such a test and then dual-write forever in production, which is
 	// exactly the mutant worth catching.
-	wiredSunset func(now time.Time) bool
+	wiredWindow func(now time.Time) bool
 }
 
 // newRelayHarness builds a processor over fakes, with the sunset in the future and the clock
@@ -654,9 +908,12 @@ func newRelayHarness(t *testing.T, rows ...model.EventOutbox) *relayHarness {
 	processor.legacy = legacy
 	processor.now = func() time.Time { return relayFixedNow }
 
-	// Captured before it is replaced, so a test can put the real decision back.
-	wiredSunset := processor.sunsetPassed
-	processor.sunsetPassed = func(time.Time) bool { return false }
+	// Captured before it is replaced, so a test can put the real decision back. The
+	// harness's stub says the window is OPEN, which is the state the dual-delivery
+	// assertions are written against.
+	wiredWindow := processor.dualDeliveryActive
+	processor.dualDeliveryActive = func(time.Time) bool { return true }
+	processor.windowState = func(time.Time) WebhookWindowState { return WebhookWindowActive }
 
 	return &relayHarness{
 		processor:   processor,
@@ -664,7 +921,7 @@ func newRelayHarness(t *testing.T, rows ...model.EventOutbox) *relayHarness {
 		publisher:   publisher,
 		deadLetters: deadLetters,
 		legacy:      legacy,
-		wiredSunset: wiredSunset,
+		wiredWindow: wiredWindow,
 	}
 }
 
@@ -710,20 +967,23 @@ func relayTransactionRow(id int64, eventID string) model.EventOutbox {
 	return relayRow(id, eventID, "transaction.applied", "ldg_relay_1", relayFixedNow.Add(time.Duration(id)*time.Second))
 }
 
-// relayReadOwnSource reads event_relay.go so a test can assert the ABSENCE of something.
+// relayParseOwnSource parses event_relay.go so a test can assert the ABSENCE of something.
 //
-// Reading the source is the only way to express "this decision is not duplicated here": a
-// second sunset comparison, or a date parse, would be invisible to a behavioural test as long
-// as it happened to agree with event_sunset.go — and the whole point of single ownership is
-// that it must keep agreeing after somebody changes one of them.
-func relayReadOwnSource(t *testing.T) string {
+// An absence is the one property a behavioural test cannot reach: a second sunset comparison,
+// or a date parse, is invisible from the outside for exactly as long as it happens to agree
+// with event_sunset.go — which is the whole interval before somebody changes one of them, and
+// the entire reason single ownership is worth asserting.
+//
+// IT IS THE AST, NOT THE TEXT, and that is the whole difference. These rules used to be
+// strings.Contains over the file's contents, which failed in both directions: a comment
+// explaining "the relay must never call time.Sleep" violated the rule that forbids it, so the
+// documentation and the check could not coexist; and a substring pins one spelling, so an
+// equivalent written any other way passed. Parsing without comments removes the first, and
+// matching identifiers as identifiers removes the second. See event_ast_test.go.
+func relayParseOwnSource(t *testing.T) *ast.File {
 	t.Helper()
 
-	path := filepath.Join(moduleRootDir(t), "event_relay.go")
-	contents, err := os.ReadFile(path) //nolint:gosec // a fixed, repository-relative path
-	require.NoError(t, err, "%s must be readable to assert its structure", path)
-
-	return string(contents)
+	return parseRepositoryGoFile(t, "event_relay.go")
 }
 
 // relayPinLogLevel sets the standard logger's level for one test and restores whatever was
@@ -902,38 +1162,110 @@ func TestNewEventRelayProcessor_UsesTheHouseDefaults(t *testing.T) {
 	assert.Equal(t, 30*time.Second, processor.retry.maxBackoff)
 }
 
-// TestNewEventRelayProcessor_SunsetDecisionComesFromEventSunsetOnly asserts the relay reads
-// the ONE decision point rather than comparing instants itself. Two comparisons could
+// TestNewEventRelayProcessor_DualDeliveryDecisionComesFromEventSunsetOnly asserts the relay
+// reads the ONE decision point rather than comparing instants itself. Two comparisons could
 // disagree, and the pair that would disagree is "stop dual-writing" and "answer 410 Gone".
-func TestNewEventRelayProcessor_SunsetDecisionComesFromEventSunsetOnly(t *testing.T) {
-	// A sunset date in the PAST, so the expected answer is TRUE. Without it both the real
-	// predicate and a constructor that hardwired "the sunset has not passed" answer false, the
-	// equality below holds for the wrong reason, and the one wiring mistake that would keep the
-	// legacy transport alive forever goes unnoticed. Restored by the helper's t.Cleanup.
-	storeSunsetDate(t, "2020-01-01T00:00:00Z")
+//
+// The decision consulted is the WINDOW predicate, which gates on both ends. A relay reading
+// the sunset alone would keep dual-delivering outside the 30-day span the window declares,
+// which is the discrepancy the start date exists to make impossible.
+func TestNewEventRelayProcessor_DualDeliveryDecisionComesFromEventSunsetOnly(t *testing.T) {
+	// The clock is a fixed instant rather than the wall clock, so the fixture cannot start
+	// meaning something else as time passes.
+	now := relayFixedNow
+
+	// A window that has CLOSED, so the expected answer is FALSE. Both sides of the boundary
+	// are exercised below, which is what stops a constructor that hardwired either constant
+	// from satisfying this test.
+	storeDeprecationWindow(t, now.AddDate(0, 0, -60), now.AddDate(0, 0, -30))
 
 	processor := NewEventRelayProcessor(&Blnk{config: relayConfiguration()})
 
-	require.NotNil(t, processor.sunsetPassed, "the sunset predicate must always be wired")
+	require.NotNil(t, processor.dualDeliveryActive, "the window predicate must always be wired")
+	require.NotNil(t, processor.windowState, "and so must the four-valued resolution")
 
-	now := time.Now()
-	require.True(t, WebhookSunsetPassed(now),
-		"fixture check: with a 2020 sunset date the decision must be 'passed'")
-	assert.Equal(t, WebhookSunsetPassed(now), processor.sunsetPassed(now),
+	require.False(t, WebhookDualDeliveryActive(now),
+		"fixture check: with a window that closed 30 days ago the legacy leg must not run")
+	assert.Equal(t, WebhookDualDeliveryActive(now), processor.dualDeliveryActive(now),
 		"the relay's decision must be event_sunset.go's decision, not a second comparison")
+	assert.Equal(t, WebhookWindowClosed, processor.windowState(now))
 
-	// And the other side of the boundary, so the field cannot be a constant of either value.
-	storeSunsetDate(t, "2099-01-01T00:00:00Z")
-	require.False(t, WebhookSunsetPassed(now),
-		"fixture check: with a 2099 sunset date the decision must be 'not passed'")
-	assert.Equal(t, WebhookSunsetPassed(now), processor.sunsetPassed(now),
+	// And the other side, so neither field can be a constant.
+	storeDeprecationWindow(t, now.AddDate(0, 0, -15), now.AddDate(0, 0, 15))
+	require.True(t, WebhookDualDeliveryActive(now),
+		"fixture check: inside the window both transports must run")
+	assert.Equal(t, WebhookDualDeliveryActive(now), processor.dualDeliveryActive(now),
 		"and it must track configuration in both directions")
+	assert.Equal(t, WebhookWindowActive, processor.windowState(now))
 
-	source := relayReadOwnSource(t)
-	assert.NotContains(t, source, "WebhookDeprecationSunsetDate",
-		"the relay must never read the configured sunset date; event_sunset.go owns it")
-	assert.NotContains(t, source, "time.Parse",
-		"the relay must never parse the sunset date; event_sunset.go owns it")
+	// A window that has not OPENED yet is the third state, and it is distinct from the
+	// closed one: dual delivery is off in both, and only one of them is a misconfiguration
+	// the relay refuses to start in.
+	storeDeprecationWindow(t, now.AddDate(0, 0, 30), now.AddDate(0, 0, 60))
+	assert.False(t, processor.dualDeliveryActive(now))
+	assert.Equal(t, WebhookWindowPending, processor.windowState(now))
+
+	// The structural half: the relay holds no second copy of the decision. Behaviour above
+	// proves the relay's answer AGREES with event_sunset.go's today; this proves there is only
+	// one thing that could answer, so it cannot stop agreeing tomorrow.
+	source := relayParseOwnSource(t)
+	assert.Zero(t, identifierUses(source, "WebhookDeprecationSunsetDate"),
+		"the relay must never read the configured sunset date; event_sunset.go owns it, and a "+
+			"second reader is a second interpretation of the same string")
+	assert.Zero(t, identifierUses(source, "WebhookDeprecationStartDate"),
+		"nor the start date, for the same reason: the window is one decision with two ends")
+	assert.Zero(t, qualifiedCallCount(source, "time", "Parse"),
+		"and it must never parse a date; a second parse is a second chance to disagree about "+
+			"what the configured instant means")
+
+	// The comparison primitives too, so the rule is about the OPERATION rather than about one
+	// spelling of one helper. A relay that compared instants itself would satisfy every
+	// assertion above and still own a second copy of the boundary.
+	calls := selectorCallNames(source)
+	assert.Zero(t, calls["Before"],
+		"the relay must not compare instants itself; that comparison is the sunset decision")
+	assert.Zero(t, calls["After"], "the same, in the other direction")
+}
+
+// TestEventRelayProcessor_RefusesToStartBeforeTheWindowOpens is the other half of gating on
+// both ends of the window, and the reason the hard gate is safe.
+//
+// A relay running before its configured start would publish to Kafka while enqueuing NO
+// legacy webhooks, so subscribers who have not migrated would simply stop receiving events —
+// the same silent-loss shape as a webhook-only deployment writing rows nobody drains.
+// Refusing to start is what turns that into an operator-visible startup failure, and it is
+// why the per-row predicate may fail closed without stranding anybody.
+func TestEventRelayProcessor_RefusesToStartBeforeTheWindowOpens(t *testing.T) {
+	now := relayFixedNow
+	storeDeprecationWindow(t, now.AddDate(0, 0, 30), now.AddDate(0, 0, 60))
+
+	harness := newRelayHarness(t)
+	// The harness pins the window open for the dual-delivery assertions; this test is about
+	// the real resolution, so both seams go back to what the constructor installed.
+	harness.processor.dualDeliveryActive = harness.wiredWindow
+	harness.processor.windowState = WebhookDualDeliveryWindowState
+
+	err := harness.processor.startupObstacle()
+	require.Error(t, err, "a relay whose window has not opened must refuse to run")
+	assert.Contains(t, err.Error(), "has not opened yet")
+	assert.Contains(t, err.Error(), "WEBHOOK_DEPRECATION_START_DATE",
+		"the error must name the variable an operator has to correct, or it is not actionable")
+
+	harness.processor.Start(context.Background())
+	assert.False(t, harness.processor.IsRunning(), "and it must not be running")
+	harness.processor.Stop()
+
+	// An OPEN window is admissible, which is what proves the check is about the window's
+	// state rather than about the window existing at all.
+	storeDeprecationWindow(t, now.AddDate(0, 0, -15), now.AddDate(0, 0, 15))
+	assert.NoError(t, harness.processor.startupObstacle(),
+		"inside the window the relay must start normally")
+
+	// So is a CLOSED one: the sunset having passed is the intended end state, not a
+	// misconfiguration, and the relay is still the thing that publishes to Kafka.
+	storeDeprecationWindow(t, now.AddDate(0, 0, -60), now.AddDate(0, 0, -30))
+	assert.NoError(t, harness.processor.startupObstacle(),
+		"after the sunset the relay must still run; Kafka is then the only transport")
 }
 
 // TestNewEventRelayProcessor_IsNilSafe asserts a processor built from nothing is a value that
@@ -2052,9 +2384,20 @@ func TestProcessRow_DoesNotRetryInProcess(t *testing.T) {
 	assert.Less(t, elapsed, 500*time.Millisecond,
 		"the relay must not sleep the backoff; the schedule is persisted, not waited out")
 
-	source := relayReadOwnSource(t)
-	assert.NotContains(t, source, "time.Sleep",
-		"the relay must never sleep a retry delay in process")
+	// The structural half. The elapsed-time assertion above proves THIS path does not sleep;
+	// this proves no path does, including the ones a fixture does not reach.
+	source := relayParseOwnSource(t)
+	assert.Zero(t, qualifiedCallCount(source, "time", "Sleep"),
+		"the relay must never sleep a retry delay in process: the backoff is persisted as "+
+			"next_attempt_at and waited out by the claim predicate, and a sleep here would "+
+			"outlive the lease and let a second instance republish the row mid-sleep")
+
+	// The equivalent written another way. time.After in a blocking receive, or a Timer, sleeps
+	// just as effectively, so the rule names the operation rather than one function.
+	assert.Zero(t, qualifiedCallCount(source, "time", "After"),
+		"nor block on a timer channel, which is the same wait spelled differently")
+	assert.Zero(t, qualifiedCallCount(source, "time", "NewTimer"),
+		"nor a Timer, for the same reason")
 }
 
 // TestProcessRow_MarkFailureLeavesTheRowClaimable asserts nothing is dropped when the
@@ -2269,7 +2612,8 @@ func TestDualDelivery_EnqueuesTheStoredBytesAndRecordsTheMarker(t *testing.T) {
 // transport, and the decision comes from event_sunset.go.
 func TestDualDelivery_StopsAfterTheSunset(t *testing.T) {
 	harness := newRelayHarness(t, relayTransactionRow(1, "evt-post-sunset"))
-	harness.processor.sunsetPassed = func(time.Time) bool { return true }
+	harness.processor.dualDeliveryActive = func(time.Time) bool { return false }
+	harness.processor.windowState = func(time.Time) WebhookWindowState { return WebhookWindowClosed }
 
 	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
 
@@ -2285,32 +2629,44 @@ func TestDualDelivery_StopsAfterTheSunset(t *testing.T) {
 // TestDualDelivery_FollowsTheConfiguredSunsetDateThroughEventSunset drives the branch from REAL
 // CONFIGURATION rather than from a stub predicate.
 //
-// Every other test in this section pins sunsetPassed so that the boundary is exact. That is the
-// right way to test the branch, and it leaves one thing unproven: that the wired predicate is
-// the one that reads WEBHOOK_DEPRECATION_SUNSET_DATE. A relay whose field defaulted to
-// "never passed" would satisfy every stubbed test in this file and then keep dual-writing
-// forever in production. So this test uses the predicate the CONSTRUCTOR installs —
-// event_sunset.go's WebhookSunsetPassed — and moves the configured date around it.
+// Every other test in this section pins the window predicate so that the boundary is exact.
+// That is the right way to test the branch, and it leaves one thing unproven: that the wired
+// predicate is the one that reads the configured window. A relay whose field defaulted to
+// "the window is open" would satisfy every stubbed test in this file and then keep
+// dual-writing forever in production. So this test uses the predicate the CONSTRUCTOR
+// installs — event_sunset.go's WebhookDualDeliveryActive — and moves the configured window
+// around it.
 //
-// config.ConfigStore is global, so storeSunsetDate snapshots and restores it through t.Cleanup;
-// without that, the sunset date set here would leak into every later test in the package.
+// config.ConfigStore is global, so the helper snapshots and restores it through t.Cleanup;
+// without that, the window set here would leak into every later test in the package.
 func TestDualDelivery_FollowsTheConfiguredSunsetDateThroughEventSunset(t *testing.T) {
 	cases := map[string]struct {
-		sunset       string
+		startOffset  int
+		sunsetOffset int
 		wantLegacy   int
 		wantExplain  string
 		wantMarkings int
 	}{
 		"the window is still open": {
-			sunset:       "2026-06-01T00:00:00Z",
+			startOffset:  -15,
+			sunsetOffset: 15,
 			wantLegacy:   1,
-			wantExplain:  "a sunset date in the future must keep both transports running",
+			wantExplain:  "inside the window both transports must run",
 			wantMarkings: 1,
 		},
 		"the window has closed": {
-			sunset:       "2026-01-01T00:00:00Z",
+			startOffset:  -60,
+			sunsetOffset: -30,
 			wantLegacy:   0,
 			wantExplain:  "a sunset date in the past must leave Kafka as the only transport",
+			wantMarkings: 0,
+		},
+		"the window has not opened": {
+			startOffset:  30,
+			sunsetOffset: 60,
+			wantLegacy:   0,
+			wantExplain: "before the window opens the legacy leg must not run either; the relay " +
+				"refuses to START in this state, which is what stops it stranding subscribers",
 			wantMarkings: 0,
 		},
 	}
@@ -2318,15 +2674,19 @@ func TestDualDelivery_FollowsTheConfiguredSunsetDateThroughEventSunset(t *testin
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
 			// Saved and restored with t.Cleanup by the helper the sunset tests already use.
-			storeSunsetDate(t, testCase.sunset)
+			// The offsets are relative to relayFixedNow, which is where the harness pins the
+			// clock, so each window sits unambiguously on its side of the boundary.
+			storeDeprecationWindow(t,
+				relayFixedNow.AddDate(0, 0, testCase.startOffset),
+				relayFixedNow.AddDate(0, 0, testCase.sunsetOffset),
+			)
 
 			harness := newRelayHarness(t, relayTransactionRow(1, "evt-configured-sunset"))
 			// Put back the predicate THE CONSTRUCTOR INSTALLED — not a fresh reference to
-			// WebhookSunsetPassed, which would re-derive the right answer even if the
-			// constructor had wired something else. The clock stays pinned at relayFixedNow
-			// (2026-03-01T12:00:00Z) so both dates above sit unambiguously on their side of it.
-			require.NotNil(t, harness.wiredSunset, "the constructor must install a predicate")
-			harness.processor.sunsetPassed = harness.wiredSunset
+			// WebhookDualDeliveryActive, which would re-derive the right answer even if the
+			// constructor had wired something else.
+			require.NotNil(t, harness.wiredWindow, "the constructor must install a predicate")
+			harness.processor.dualDeliveryActive = harness.wiredWindow
 
 			require.Equal(t, 1, harness.processor.processBatch(context.Background()))
 
@@ -2396,28 +2756,75 @@ func TestDualDelivery_ARestartDoesNotDoubleEnqueueTheLegacyWebhook(t *testing.T)
 		"a crash in the bookkeeping must not consume a publish retry attempt")
 }
 
-// TestDualDelivery_TakesTheSunsetDecisionOncePerBatch asserts the decision is not re-evaluated
-// per row, which at five hundred events a second would be five hundred decisions for one
-// answer.
-func TestDualDelivery_TakesTheSunsetDecisionOncePerBatch(t *testing.T) {
-	rows := make([]model.EventOutbox, 0, 4)
-	for id := int64(1); id <= 4; id++ {
-		rows = append(rows, relayTransactionRow(id, fmt.Sprintf("evt-%d", id)))
-	}
+// TestDualDelivery_EvaluatesTheBoundaryImmediatelyBeforeEachEnqueue asserts the decision is
+// taken PER ROW, immediately before the enqueue — not once at the top of the batch.
+//
+// # Why the cheaper thing is the wrong thing
+//
+// One decision per batch is obviously less work, and it was what this test used to require.
+// It is also wrong at the only moment that matters. A batch of a hundred rows claimed one
+// second before the sunset takes longer than a second to publish, so a decision taken at the
+// top of it enqueues legacy webhooks AFTER the boundary has passed — the single behaviour the
+// sunset is defined to prevent, on the single day anybody is watching for it.
+//
+// The cost is a comparison of two instants per row against a value already in memory, which
+// at five hundred events a second is nothing next to a broker round trip.
+//
+// The second half of the test is the one that would fail under a batch-level decision: the
+// boundary MOVES mid-batch, and only the rows dispatched before it may have a legacy leg.
+func TestDualDelivery_EvaluatesTheBoundaryImmediatelyBeforeEachEnqueue(t *testing.T) {
+	t.Run("one decision per row", func(t *testing.T) {
+		rows := make([]model.EventOutbox, 0, 4)
+		for id := int64(1); id <= 4; id++ {
+			rows = append(rows, relayTransactionRow(id, fmt.Sprintf("evt-%d", id)))
+		}
 
-	harness := newRelayHarness(t, rows...)
+		harness := newRelayHarness(t, rows...)
 
-	var decisions atomic.Int32
-	harness.processor.sunsetPassed = func(time.Time) bool {
-		decisions.Add(1)
+		var decisions atomic.Int32
+		harness.processor.dualDeliveryActive = func(time.Time) bool {
+			decisions.Add(1)
 
-		return false
-	}
+			return true
+		}
 
-	require.Equal(t, 4, harness.processor.processBatch(context.Background()))
+		require.Equal(t, 4, harness.processor.processBatch(context.Background()))
 
-	assert.Equal(t, int32(1), decisions.Load(), "one decision per batch, not one per row")
-	assert.Len(t, harness.legacy.snapshot(), 4, "every row must still get its legacy leg")
+		assert.Equal(t, int32(4), decisions.Load(),
+			"the boundary must be evaluated once per row, immediately before that row's enqueue")
+		assert.Len(t, harness.legacy.snapshot(), 4, "every row must still get its legacy leg")
+	})
+
+	t.Run("the boundary passing mid-batch stops the remaining legacy legs", func(t *testing.T) {
+		rows := make([]model.EventOutbox, 0, 4)
+		for id := int64(1); id <= 4; id++ {
+			rows = append(rows, relayTransactionRow(id, fmt.Sprintf("evt-crossing-%d", id)))
+		}
+
+		// Concurrency is pinned to one so the batch is processed in claim order and "the
+		// first two rows" is a well-defined set. With the default of eight the rows would
+		// publish in parallel and which two crossed the boundary would be a race.
+		harness := newRelayHarness(t, rows...)
+		harness.processor.WithConcurrency(1)
+
+		var decisions atomic.Int32
+		harness.processor.dualDeliveryActive = func(time.Time) bool {
+			// Open for the first two evaluations, closed from the third: the sunset arriving
+			// while this batch is still being published.
+			return decisions.Add(1) <= 2
+		}
+
+		require.Equal(t, 4, harness.processor.processBatch(context.Background()))
+
+		assert.Equal(t, int32(4), decisions.Load(), "every row must consult the boundary itself")
+		assert.Len(t, harness.legacy.snapshot(), 2,
+			"only the rows dispatched BEFORE the boundary may have a legacy leg; a batch-level "+
+				"decision would have enqueued all four")
+		assert.Len(t, harness.publisher.snapshotRequests(), 4,
+			"the Kafka leg is unaffected by the boundary — it is the transport that remains")
+		assert.Len(t, harness.store.snapshotDispatched(), 4,
+			"and every row still reaches its terminal state")
+	})
 }
 
 // TestDualDelivery_SkipsARowWhoseLegacyLegIsAlreadyDone asserts the flag's purpose: a row
@@ -2450,10 +2857,31 @@ func TestDualDelivery_LegacyFailuresNeverAffectTheKafkaPath(t *testing.T) {
 		require.Equal(t, 1, harness.processor.processBatch(context.Background()))
 
 		assert.Len(t, harness.publisher.snapshotRequests(), 1, "the Kafka publish must still happen")
-		assert.Len(t, harness.store.snapshotDispatched(), 1, "and the row must still be dispatched")
 		assert.Empty(t, harness.store.snapshotFailures(),
 			"a legacy failure must never spend a Kafka retry attempt")
 		assert.Empty(t, harness.deadLetters.snapshotRows())
+
+		// THE ROW IS NOT DISPATCHED, and that is the whole point. dispatched is outside the
+		// claim predicate, so a row marked dispatched with its webhook still owed is a
+		// webhook nobody will ever enqueue again.
+		assert.Empty(t, harness.store.snapshotDispatched(),
+			"a row whose legacy leg is still owed must NOT be moved to its terminal state")
+
+		pendings := harness.store.snapshotWebhookPendings()
+		require.Len(t, pendings, 1,
+			"the outstanding legacy leg must be recorded, which is what keeps the row claimable for it")
+		assert.Equal(t, int64(1), pendings[0].id)
+		assert.Equal(t, "token-1", pendings[0].claimToken,
+			"the transition must be conditional on the claim this pass held")
+		assert.Contains(t, pendings[0].reason, "redis unavailable",
+			"last_error must carry why the enqueue failed, or an operator has nothing to triage")
+		assert.Equal(t, time.Second, pendings[0].retryAfter,
+			"the first webhook retry waits the configured base backoff, indexed by the WEBHOOK "+
+				"attempt count rather than the Kafka one")
+
+		state, terminal := harness.store.terminalState(1)
+		assert.False(t, terminal, "and the row must not be terminal")
+		assert.Empty(t, state)
 
 		entries := relayEntriesWithMessage(hook, "enqueuing the legacy webhook delivery failed")
 		require.NotEmpty(t, entries, "the legacy failure must be logged")
@@ -2478,6 +2906,116 @@ func TestDualDelivery_LegacyFailuresNeverAffectTheKafkaPath(t *testing.T) {
 		assert.Contains(t, entries[0].Message, "suppressed by the task identity",
 			"the log must state why the missing marker is not a delivery defect")
 	})
+}
+
+// TestDualDelivery_AFailedEnqueueIsRetriedWithoutRepublishingToKafka is the positive proof
+// that the two legs are tracked independently, and it is the test the previous behaviour could
+// not have passed.
+//
+// # The full cycle, because each half alone proves nothing
+//
+// The first pass publishes to Kafka and fails to enqueue. The second pass — a REAL re-claim of
+// the same row, not a pre-set flag — must enqueue the webhook and nothing else. Both halves
+// matter:
+//
+//   - if the row were not claimable, the webhook would be lost, which is the defect;
+//   - if the re-claim republished to Kafka, retrying a deprecated-transport failure would put a
+//     duplicate on the topic — paid for by every subscriber's idempotency filter, for the
+//     benefit of a transport being retired.
+//
+// The Kafka publish count is therefore the assertion that matters most here, and it is one
+// across both passes.
+func TestDualDelivery_AFailedEnqueueIsRetriedWithoutRepublishingToKafka(t *testing.T) {
+	harness := newRelayHarness(t, relayTransactionRow(1, "evt-legacy-recovered"))
+	harness.legacy.err = errors.New("relay test: redis unavailable")
+
+	// PASS ONE: Kafka succeeds, the enqueue does not.
+	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+	require.Len(t, harness.publisher.snapshotRequests(), 1, "the Kafka leg must have been published")
+	require.Len(t, harness.store.snapshotWebhookPendings(), 1, "the outstanding leg must be recorded")
+	require.Empty(t, harness.store.snapshotDispatched(), "and the row must not be terminal")
+
+	// The row must be back in the claimable set once its webhook backoff has elapsed. This is
+	// the property the old code did not have: dispatched rows are never claimed again.
+	afterBackoff := relayFixedNow.Add(72 * time.Hour)
+	require.Contains(t, harness.store.claimableIDs(afterBackoff), int64(1),
+		"a row whose legacy leg is owed must return to the claimable set")
+
+	// PASS TWO: the queue is back. The clock moves past the backoff so the row is due.
+	harness.legacy.err = nil
+	harness.store.now = func() time.Time { return afterBackoff }
+	harness.processor.now = func() time.Time { return afterBackoff }
+
+	require.Equal(t, 1, harness.processor.processBatch(context.Background()),
+		"the row must be claimed a second time, for its webhook alone")
+
+	enqueued := harness.legacy.snapshot()
+	require.Len(t, enqueued, 1, "the webhook must be enqueued on the retry")
+	assert.Equal(t, "evt-legacy-recovered", enqueued[0].eventID,
+		"under the same task identity, so a further re-claim cannot double-enqueue")
+
+	assert.Len(t, harness.publisher.snapshotRequests(), 1,
+		"THE KAFKA LEG MUST NOT BE REPUBLISHED: its acknowledgement is recorded on the row, so "+
+			"retrying the webhook costs the topic nothing")
+
+	marks := harness.store.snapshotWebhookMarks()
+	require.Len(t, marks, 1, "the legacy leg must be recorded once it is enqueued")
+	assert.Equal(t, int64(1), marks[0].id)
+
+	dispatched := harness.store.snapshotDispatched()
+	require.Len(t, dispatched, 1, "and NOW the row is terminal, with both legs done")
+
+	state, terminal := harness.store.terminalState(1)
+	assert.True(t, terminal)
+	assert.Equal(t, model.EventOutboxStatusDispatched, state)
+
+	assert.Empty(t, harness.store.snapshotFailures(),
+		"no Kafka retry attempt may have been spent on any of this")
+	assert.Empty(t, harness.deadLetters.snapshotRows(),
+		"and a legacy failure must never dead-letter an event that reached its topic")
+}
+
+// TestDualDelivery_AnUnreachableQueueAbandonsTheLegacyLegLoudly covers the terminal arm of the
+// webhook budget, which exists so a permanently unreachable queue cannot keep a row claimable
+// forever.
+//
+// The row does eventually become dispatched — the Kafka delivery is real and final — but only
+// after the legacy leg has spent its own budget, and the abandonment is logged at ERROR
+// naming the event. That log line is the only notice anybody gets that a webhook promised for
+// the migration window will never arrive, so its level and its content are the assertion.
+func TestDualDelivery_AnUnreachableQueueAbandonsTheLegacyLegLoudly(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	row := relayTransactionRow(1, "evt-legacy-abandoned")
+	// One attempt away from the budget, so this pass is the last one. Reproducing all five
+	// passes would assert the same arithmetic MarkEventWebhookPending's own tests cover.
+	row.WebhookAttempts = row.MaxAttempts - 1
+
+	harness := newRelayHarness(t, row)
+	harness.legacy.err = errors.New("relay test: redis permanently unavailable")
+
+	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+	pendings := harness.store.snapshotWebhookPendings()
+	require.Len(t, pendings, 1)
+
+	state, terminal := harness.store.terminalState(1)
+	require.True(t, terminal,
+		"the legacy budget is spent, so the row must not stay claimable indefinitely")
+	assert.Equal(t, model.EventOutboxStatusDispatched, state,
+		"and it is terminal on the strength of the Kafka delivery, which did happen")
+
+	assert.NotContains(t, harness.store.claimableIDs(relayFixedNow.Add(72*time.Hour)), int64(1),
+		"an abandoned legacy leg must not leave the row cycling through claims forever")
+
+	entries := relayEntriesWithMessage(hook, "ABANDONED")
+	require.NotEmpty(t, entries, "abandoning a promised webhook must be reported")
+	assert.Equal(t, logrus.ErrorLevel, entries[0].Level,
+		"this is the only notice that a webhook will never be delivered, so it is an error")
+	assert.Contains(t, entries[0].Data, "event_id",
+		"and it must name the event, or it is not actionable")
 }
 
 // TestDualDelivery_RunsEvenWhenTheKafkaPublishFails is the failure mode that matters most
@@ -2642,12 +3180,18 @@ func TestEventRelay_NoTransitionLeavesARowPermanentlyUnclaimable(t *testing.T) {
 			wantTerminal: "",
 			because:      "an unrecorded failure must not consume the row",
 		},
+		// NOT terminal, and that is the corrected expectation rather than a relaxed one. A
+		// legacy enqueue failure leaves a webhook OWED, and this test's subject is precisely
+		// that no transition strands a row: the row must come back so the webhook is
+		// retried. It does come back — as webhook_pending, which is inside the claimable set
+		// — and its Kafka leg is recorded, so the re-claim publishes nothing.
 		"the legacy leg fails": {
 			injectFault: func(h *relayHarness) {
 				h.legacy.err = errors.New("relay test: redis unavailable")
 			},
-			wantTerminal: model.EventOutboxStatusDispatched,
-			because:      "a deprecated transport failing must not hold the row back from its terminal state",
+			wantTerminal: "",
+			because: "a webhook is still owed, so the row must return to the claimable set for " +
+				"the legacy leg alone rather than being marked dispatched with the webhook lost",
 		},
 	}
 
@@ -2747,12 +3291,21 @@ func TestEventRelay_DrainsTheBacklogTheOutboxGaugeReports(t *testing.T) {
 			"the relay must not write blnk.outbox.pending; EventMetricsCollector owns it, and a "+
 				"second writer would make the gauge disagree with itself between ticks")
 
-		source := relayReadOwnSource(t)
-		assert.NotContains(t, source, "metrics.OutboxPendingBacklog",
-			"and it must not reference the gauge at all")
-		assert.NotContains(t, source, ".Record(",
-			"the relay records no instrument directly; the publisher owns the per-attempt "+
-				"instruments and the collector owns the gauges")
+		// The structural half. The recorder above proves this batch wrote nothing; this proves
+		// no code path in the file can, which is what "the collector owns the gauge" means.
+		source := relayParseOwnSource(t)
+		assert.Zero(t, identifierUses(source, "OutboxPendingBacklog"),
+			"and it must not reference the gauge at all: a second writer would make the gauge "+
+				"disagree with itself between the collector's ticks")
+		// THE PACKAGE, not a method name, and the difference is worth stating: the relay calls
+		// several legitimate things named Add — sync.WaitGroup.Add, time.Time.Add — so a rule
+		// phrased as "no call named Add" would be a false positive today and satisfied by luck
+		// tomorrow. A file that does not import internal/metrics cannot record ANY instrument,
+		// by any spelling, through any helper, which is exactly the boundary being asserted.
+		assert.False(t, importsPackage(source, "internal/metrics"),
+			"the relay must not import internal/metrics at all: the publisher owns the "+
+				"per-attempt instruments and EventMetricsCollector owns the gauges, and a second "+
+				"writer would make the gauge disagree with itself between the collector's ticks")
 	})
 }
 
@@ -2916,3 +3469,421 @@ func TestDetachedBookkeepingContext_SurvivesCancellationButIsBounded(t *testing.
 
 // relayCtxKey is a private context key for the test above.
 type relayCtxKey struct{}
+
+// ---------------------------------------------------------------------------
+// Lease safety while a batch is in flight
+// ---------------------------------------------------------------------------
+
+// TestEventRelay_RenewsTheLeaseWhileTheBatchIsInFlight is the fix for the arithmetic that
+// made the shipped defaults unsafe.
+//
+// # The arithmetic
+//
+// Batch 100, concurrency 8, and a writer whose produce timeout is 10 seconds: the batch runs
+// in 13 waves and a wave can occupy the whole timeout, so the worst case is well over two
+// minutes against a 30-second lease. The rows in the later waves had their lease expire
+// BEFORE their publish was attempted, while this relay still held them — so another instance
+// claimed and published them, this one published them again, and every transition this one
+// attempted failed as a lost claim. Nothing logged a defect.
+//
+// # What is asserted
+//
+// The heartbeat renews under THIS BATCH'S CLAIM TOKEN and with the configured lease, and it
+// stops when the batch does. The claim token matters more than the count: renewing under the
+// wrong token would extend somebody else's lease and leave this batch's rows to expire, and
+// no throughput or ordering assertion anywhere would notice.
+func TestEventRelay_RenewsTheLeaseWhileTheBatchIsInFlight(t *testing.T) {
+	harness := newRelayHarness(t, relayTransactionRow(1, "evt-renewed"))
+	// A short lease so the renewal interval (lease/3, floored at 250ms) elapses inside the
+	// test rather than in thirty seconds.
+	harness.processor.WithLockDuration(900 * time.Millisecond)
+
+	// The publish blocks until released, which is what keeps the batch in flight long enough
+	// for the heartbeat to tick — the same shape as a slow broker.
+	release := make(chan struct{})
+	harness.publisher.beforePublish = func(PublishRequest) { <-release }
+
+	done := make(chan int, 1)
+	go func() { done <- harness.processor.processBatch(context.Background()) }()
+
+	// Two renewals, so the heartbeat is a repeating ticker rather than a single extension.
+	require.Eventually(t, func() bool {
+		return len(harness.store.snapshotRenewals()) >= 2
+	}, 5*time.Second, 20*time.Millisecond,
+		"the lease must be renewed repeatedly while the batch is in flight; a single extension "+
+			"would still expire under a batch that outlives two intervals")
+
+	close(release)
+
+	select {
+	case claimed := <-done:
+		require.Equal(t, 1, claimed)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the batch did not finish")
+	}
+
+	renewals := harness.store.snapshotRenewals()
+	require.NotEmpty(t, renewals)
+	for i, renewal := range renewals {
+		assert.Equal(t, "token-1", renewal.claimToken,
+			"renewal %d must extend THIS batch's claim; renewing under another token would extend "+
+				"somebody else's lease and let this batch's rows expire", i)
+		assert.Equal(t, 900*time.Millisecond, renewal.lease,
+			"renewal %d must extend by the configured lease, so the extension and the original "+
+				"claim agree about how long a hold lasts", i)
+	}
+
+	// The heartbeat must not outlive the batch. Waiting a few intervals and comparing counts
+	// is what proves the goroutine exited rather than merely that it stopped being observed.
+	settled := len(harness.store.snapshotRenewals())
+	time.Sleep(time.Second)
+	assert.Equal(t, settled, len(harness.store.snapshotRenewals()),
+		"renewals must stop when the batch finishes; a heartbeat that outlived its batch would hold "+
+			"a lease on rows it no longer owns and delay their recovery after a crash")
+}
+
+// TestEventRelay_LeaseRenewalRetiresWhenNothingIsLeftInFlight asserts the heartbeat stops
+// itself when the database reports nothing under the token.
+//
+// Every terminal transition clears claim_token, so a zero count means every row is finished.
+// Continuing to renew on that answer would be a pointless round trip per lease-third for the
+// life of the process — and, worse, it would keep asserting a hold this relay no longer has.
+func TestEventRelay_LeaseRenewalRetiresWhenNothingIsLeftInFlight(t *testing.T) {
+	harness := newRelayHarness(t, relayTransactionRow(1, "evt-renewal-retires"))
+	harness.processor.WithLockDuration(750 * time.Millisecond)
+
+	release := make(chan struct{})
+	harness.publisher.beforePublish = func(PublishRequest) { <-release }
+
+	done := make(chan int, 1)
+	go func() { done <- harness.processor.processBatch(context.Background()) }()
+
+	require.Eventually(t, func() bool {
+		return len(harness.store.snapshotRenewals()) >= 1
+	}, 5*time.Second, 20*time.Millisecond, "the heartbeat must renew at least once")
+
+	// The row is retired out from under the heartbeat, so the next renewal finds nothing.
+	// This is exactly what a finished batch looks like from the database's point of view.
+	harness.store.retireInflight()
+
+	require.Eventually(t, func() bool {
+		before := len(harness.store.snapshotRenewals())
+		time.Sleep(600 * time.Millisecond)
+
+		return len(harness.store.snapshotRenewals()) == before
+	}, 5*time.Second, 100*time.Millisecond,
+		"a renewal that extends nothing means the batch is done, so the heartbeat must retire itself")
+
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the batch did not finish")
+	}
+}
+
+// TestEventRelay_ALeaseRenewalFailureDoesNotAbortTheBatch asserts a failed renewal is
+// reported and stepped past.
+//
+// The batch has publishes in flight. Abandoning them because a bookkeeping round trip failed
+// would strand events that were about to be delivered; carrying on risks the rows being
+// reclaimed and republished, which is the same at-least-once duplicate every other path here
+// accepts and which the subscriber suppresses on event_id. The trade is deliberate, so the
+// warning is the assertion.
+func TestEventRelay_ALeaseRenewalFailureDoesNotAbortTheBatch(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	harness := newRelayHarness(t, relayTransactionRow(1, "evt-renewal-failed"))
+	harness.processor.WithLockDuration(600 * time.Millisecond)
+	harness.store.renewErr = errors.New("relay test: database unavailable")
+
+	release := make(chan struct{})
+	harness.publisher.beforePublish = func(PublishRequest) { <-release }
+
+	done := make(chan int, 1)
+	go func() { done <- harness.processor.processBatch(context.Background()) }()
+
+	require.Eventually(t, func() bool {
+		return len(relayEntriesWithMessage(hook, "renewing the lease on a batch in flight failed")) >= 1
+	}, 5*time.Second, 20*time.Millisecond, "a failed renewal must be reported")
+
+	entries := relayEntriesWithMessage(hook, "renewing the lease on a batch in flight failed")
+	assert.Equal(t, logrus.WarnLevel, entries[0].Level,
+		"a failed renewal is a warning: the duplicate it risks is recoverable at the subscriber, "+
+			"whereas abandoning the batch would strand publishes that are in flight")
+
+	close(release)
+
+	select {
+	case claimed := <-done:
+		assert.Equal(t, 1, claimed, "the batch must complete despite the renewal failure")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the batch did not finish")
+	}
+
+	assert.Len(t, harness.publisher.snapshotRequests(), 1, "the publish must still have happened")
+	assert.Len(t, harness.store.snapshotDispatched(), 1, "and the row must still be dispatched")
+}
+
+// ---------------------------------------------------------------------------
+// Dead-letter preservation recovery
+// ---------------------------------------------------------------------------
+
+// TestEventRelay_RetriesADeadLetterWriteThatFailed is the fix for the only state in this
+// machine from which nothing moved forward.
+//
+// # The limbo
+//
+// When a row exhausts its retry budget it becomes 'failed', and the worker that spent the
+// last attempt writes the event to its `<topic>.dlt` sibling. If that write fails — no
+// transport, a broker outage, a topic that does not exist — the row stays 'failed' with no
+// dlt_topic, and that state was a dead end in three directions at once: the ordinary claim
+// excludes 'failed', replay accepts only 'dead_lettered', and the worker holding the token had
+// moved on. The row was the ONLY copy of the event, and nothing would ever act on it again.
+//
+// # What is asserted
+//
+// The repair pass claims such a row and hands it back to the dead-letter writer, carrying the
+// failure that actually ended its retry budget — the row's last_error, not "recovered" — so
+// the metadata an operator reads says what went wrong. The fresh claim token matters: the
+// original belonged to a worker that may no longer exist, and MarkEventDeadLettered is
+// conditional on the token the caller holds.
+func TestEventRelay_RetriesADeadLetterWriteThatFailed(t *testing.T) {
+	unpreserved := relayTransactionRow(1, "evt-unpreserved")
+	unpreserved.Status = model.EventOutboxStatusFailed
+	unpreserved.Attempts = unpreserved.MaxAttempts
+	unpreserved.LastError = "broker unavailable"
+
+	// Seeded as awaiting preservation, NOT as claimable: the publish claim must not be able
+	// to reach it, which is the whole reason a second claim path exists.
+	harness := newRelayHarness(t)
+	harness.store.failedRows = []model.EventOutbox{unpreserved}
+
+	harness.processor.processTick(context.Background())
+
+	rows := harness.deadLetters.snapshotRows()
+	require.Len(t, rows, 1, "the repair pass must hand the unpreserved row back to the dead-letter writer")
+	assert.Equal(t, "evt-unpreserved", rows[0].EventID)
+	assert.NotEmpty(t, rows[0].ClaimToken,
+		"the row must carry a claim token, or MarkEventDeadLettered cannot be authorised")
+	assert.NotEqual(t, "token-1", rows[0].ClaimToken,
+		"and it must be a FRESH token: the original belonged to a worker that may no longer exist")
+
+	causes := harness.deadLetters.snapshotCauses()
+	require.Len(t, causes, 1)
+	require.Error(t, causes[0])
+	assert.Contains(t, causes[0].Error(), "broker unavailable",
+		"the metadata must report the failure that ended the retry budget, not the fact of the repair")
+
+	assert.Empty(t, harness.publisher.snapshotRequests(),
+		"a repair must not republish to the ORIGINAL topic: the event's retry budget is spent, and "+
+			"the only thing owed is its preservation")
+}
+
+// TestEventRelay_ADeadLetterRepairThatFailsAgainStaysRecoverable asserts the repair is
+// idempotent under continued failure.
+//
+// A broker that is still down must leave the row exactly as it found it — failed, unpreserved,
+// and re-claimable once its lease expires — rather than consuming anything or moving it into a
+// state the next pass cannot reach. Nothing here is bounded by an attempt count on purpose:
+// the dead-letter topic IS the last resort, so abandoning the write would delete the only copy
+// of the event. What bounds it is the lease, and what escalates it is the dead-letter age
+// alert.
+func TestEventRelay_ADeadLetterRepairThatFailsAgainStaysRecoverable(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	unpreserved := relayTransactionRow(1, "evt-still-unpreserved")
+	unpreserved.Status = model.EventOutboxStatusFailed
+	unpreserved.Attempts = unpreserved.MaxAttempts
+	unpreserved.LastError = "broker unavailable"
+
+	harness := newRelayHarness(t)
+	harness.store.failedRows = []model.EventOutbox{unpreserved}
+	harness.deadLetters.err = errors.New("relay test: broker still unavailable")
+
+	harness.processor.processTick(context.Background())
+
+	require.Len(t, harness.deadLetters.snapshotRows(), 1, "the repair must have been attempted")
+
+	state, terminal := harness.store.terminalState(1)
+	assert.False(t, terminal,
+		"a repair that failed must not move the row to a terminal state; the event still exists only here")
+	assert.Empty(t, state)
+
+	entries := relayEntriesWithMessage(hook, "retrying the dead-letter preservation of this event failed again")
+	require.NotEmpty(t, entries, "a repeated failure must stay visible")
+	assert.Equal(t, logrus.WarnLevel, entries[0].Level)
+
+	assert.Empty(t, harness.store.snapshotFailures(),
+		"a preservation retry must not record a publish attempt: the publish budget is already spent")
+}
+
+// TestEventRelay_TheRepairPassIsQuietAndCheapWhenThereIsNothingToRepair asserts the ordinary
+// case, which is the one that runs five hundred times a second's worth of ticks.
+//
+// The pass runs on every tick by design — the rows it looks for are the only copies of events
+// that reached no topic, so delaying the search delays the repair — and that is only
+// affordable if an empty result costs one query and no log line.
+func TestEventRelay_TheRepairPassIsQuietAndCheapWhenThereIsNothingToRepair(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	harness := newRelayHarness(t, relayTransactionRow(1, "evt-ordinary"))
+
+	harness.processor.processTick(context.Background())
+
+	assert.Empty(t, harness.deadLetters.snapshotRows(),
+		"with nothing awaiting preservation the dead-letter writer must not be called")
+	assert.Empty(t, relayEntriesWithMessage(hook, "retrying the dead-letter preservation"),
+		"and the pass must say nothing at all")
+
+	assert.Len(t, harness.publisher.snapshotRequests(), 1,
+		"the ordinary publish path must be unaffected by the repair pass running first")
+	assert.Len(t, harness.store.snapshotDispatched(), 1)
+}
+
+// TestEventRelay_ARepairClaimFailureIsReportedAndTheTickContinues asserts a failure to even
+// LOOK for repair work does not cost the tick its publishing.
+//
+// The two paths share a database and a tick. A repair query that fails — a statement timeout,
+// a connection blip — must not stop the relay publishing the rows that are due, because those
+// are the events currently being delivered.
+func TestEventRelay_ARepairClaimFailureIsReportedAndTheTickContinues(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	harness := newRelayHarness(t, relayTransactionRow(1, "evt-repair-claim-failed"))
+	harness.store.failedClaimErr = errors.New("relay test: statement timeout")
+
+	harness.processor.processTick(context.Background())
+
+	entries := relayEntriesWithMessage(hook, "could not claim events awaiting dead-letter preservation")
+	require.NotEmpty(t, entries, "the failure must be reported")
+	assert.Equal(t, logrus.ErrorLevel, entries[0].Level,
+		"being unable to look for events that exist nowhere else is an error, not a warning")
+
+	assert.Len(t, harness.publisher.snapshotRequests(), 1,
+		"and the tick must still publish the rows that are due")
+	assert.Len(t, harness.store.snapshotDispatched(), 1)
+}
+
+// ---------------------------------------------------------------------------
+// Broker coordinate persistence — OBS-02
+// ---------------------------------------------------------------------------
+
+// TestEventRelay_PersistsTheBrokerCoordinateOfTheRecordItProduced is the relay half of OBS-02.
+//
+// The publisher captures the coordinate (event_publisher_test.go) and the repository stores it
+// (database/event_outbox_test.go). This is the join between them, and it is the join that would
+// silently fail: a relay that dropped the coordinate on the floor would still publish, still mark
+// the row, and still pass every other test in this file — while every row became an unconfirmed
+// publication and the zero-loss reconciliation reported itself permanently inconclusive.
+func TestEventRelay_PersistsTheBrokerCoordinateOfTheRecordItProduced(t *testing.T) {
+	row := relayTransactionRow(1, "evt-coordinate")
+	harness := newRelayHarness(t, row)
+	harness.processor.dualDeliveryActive = func(time.Time) bool { return false }
+
+	record := model.BrokerRecord{Topic: "blnk.transactions", Partition: 2, Offset: 44_101}
+	harness.publisher.reporting(row.EventID, record)
+
+	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+	dispatched := harness.store.snapshotDispatched()
+	require.Len(t, dispatched, 1)
+	assert.Equal(t, record, dispatched[0].record,
+		"the coordinate the broker reported must reach the row, or the event cannot be matched to "+
+			"its record and the zero-loss reconciliation cannot be conclusive")
+}
+
+// TestEventRelay_RecordsAnUnconfirmedPublishHonestly covers the absence.
+//
+// A broker that acknowledges a write while the client reports no coordinate has still published
+// the event — so the publish must NOT fail. What must happen instead is that the row records
+// nothing rather than a fabricated location, and the audit then counts it as an unconfirmed
+// publication. Manufacturing "partition 0, offset 0" would be worse than recording nothing: it
+// is a real location, so an operator would follow it and find somebody else's event.
+func TestEventRelay_RecordsAnUnconfirmedPublishHonestly(t *testing.T) {
+	row := relayTransactionRow(1, "evt-coordinate")
+	harness := newRelayHarness(t, row)
+	harness.processor.dualDeliveryActive = func(time.Time) bool { return false }
+	// No coordinate configured, so the publish reports none.
+
+	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+	dispatched := harness.store.snapshotDispatched()
+	require.Len(t, dispatched, 1)
+	_, confirmed := dispatched[0].record, dispatched[0].record.Confirmed()
+	assert.False(t, confirmed,
+		"an unreported coordinate must be recorded as absent, never as a fabricated location")
+
+	assert.Empty(t, harness.store.snapshotFailures(),
+		"an unreported coordinate is NOT a publish failure: the broker acknowledged the write")
+}
+
+// TestEventRelay_CarriesTheCoordinateThroughAnOutstandingWebhookLeg covers the dual-delivery
+// path, where the row does not reach a terminal state.
+//
+// A webhook_pending row has been published to Kafka — its record is on the topic and the
+// zero-loss audit counts it — so it must name that record too. Dropping the coordinate on this
+// path would make every dual-delivered row an unconfirmed publication, which is exactly the
+// window in which the reconciliation matters most.
+func TestEventRelay_CarriesTheCoordinateThroughAnOutstandingWebhookLeg(t *testing.T) {
+	row := relayTransactionRow(1, "evt-coordinate")
+	harness := newRelayHarness(t, row)
+
+	record := model.BrokerRecord{Topic: "blnk.transactions", Partition: 5, Offset: 8}
+	harness.publisher.reporting(row.EventID, record)
+	harness.legacy.err = errors.New("redis unavailable")
+
+	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+	pendings := harness.store.snapshotWebhookPendings()
+	require.Len(t, pendings, 1,
+		"a failed legacy enqueue must record the Kafka leg separately rather than marking the row done")
+	assert.Equal(t, record, pendings[0].record,
+		"the row waiting on its webhook must still name the record its Kafka leg produced")
+
+	assert.Empty(t, harness.store.snapshotDispatched(),
+		"the row is not terminal yet; the webhook is still owed")
+}
+
+// TestEventRelay_AWebhookOnlyPassCarriesNoCoordinate pins the case COALESCE exists for.
+//
+// A row whose Kafka leg is already recorded is re-claimed ONLY for its outstanding webhook:
+// nothing is published, so there is no new record to name — and the row already carries the
+// coordinate its earlier successful publish produced. Passing a coordinate here would be a lie,
+// and passing the zero value is what lets the statement's COALESCE preserve the stored one.
+func TestEventRelay_AWebhookOnlyPassCarriesNoCoordinate(t *testing.T) {
+	row := relayTransactionRow(1, "evt-coordinate")
+	acknowledged := relayFixedNow.Add(-time.Minute)
+	row.KafkaDispatchedAt = &acknowledged
+
+	// The row already names its record, as a real re-claimed row would.
+	partition := 5
+	offset := int64(8)
+	row.KafkaTopic = "blnk.transactions"
+	row.KafkaPartition = &partition
+	row.KafkaOffset = &offset
+
+	harness := newRelayHarness(t, row)
+	harness.processor.dualDeliveryActive = func(time.Time) bool { return true }
+	// A coordinate IS available from the publisher, so a relay that published anyway would
+	// record it — which is what makes the absence below meaningful rather than vacuous.
+	harness.publisher.reporting(row.EventID,
+		model.BrokerRecord{Topic: "blnk.transactions", Partition: 1, Offset: 999})
+
+	require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+	assert.Empty(t, harness.publisher.snapshotRequests(),
+		"a row whose Kafka leg is recorded must not be republished; that would duplicate a message "+
+			"already on the topic")
+
+	dispatched := harness.store.snapshotDispatched()
+	require.Len(t, dispatched, 1)
+	assert.False(t, dispatched[0].record.Confirmed(),
+		"NO COORDINATE may be supplied on a pass that published nothing; the statement's COALESCE "+
+			"then preserves the one the row already carries")
+}

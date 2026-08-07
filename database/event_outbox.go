@@ -86,7 +86,9 @@ package database
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -154,7 +156,8 @@ const (
 // acceptance criteria V-8 and V-9 without any read failing.
 const eventOutboxColumns = `id, event_id, event_type, aggregate_id, partition_key, ledger_id, topic, schema_version, ` +
 	`payload_raw, occurred_at, status, attempts, max_attempts, next_attempt_at, last_error, first_attempted_at, ` +
-	`last_attempted_at, dispatched_at, locked_until, claim_token, webhook_dispatched, dlt_topic, failure_metadata`
+	`last_attempted_at, dispatched_at, locked_until, claim_token, webhook_dispatched, kafka_dispatched_at, ` +
+	`webhook_attempts, kafka_topic, kafka_partition, kafka_offset, dlt_topic, failure_metadata`
 
 // eventOutboxScanner is the minimum surface scanEventOutbox needs, satisfied by
 // both *sql.Row and *sql.Rows. Sharing one scanner between the single-row and
@@ -177,8 +180,10 @@ type eventOutboxScanner interface {
 // RawMessage rather than becoming the four bytes "null".
 func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 	var e model.EventOutbox
-	var ledgerID, lastError, claimToken, dltTopic sql.NullString
-	var firstAttemptedAt, lastAttemptedAt, dispatchedAt, lockedUntil sql.NullTime
+	var ledgerID, lastError, claimToken, dltTopic, kafkaTopic sql.NullString
+	var firstAttemptedAt, lastAttemptedAt, dispatchedAt, lockedUntil, kafkaDispatchedAt sql.NullTime
+	var kafkaPartition sql.NullInt32
+	var kafkaOffset sql.NullInt64
 	var failureMetadata []byte
 
 	if err := s.Scan(
@@ -203,6 +208,11 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 		&lockedUntil,
 		&claimToken,
 		&e.WebhookDispatched,
+		&kafkaDispatchedAt,
+		&e.WebhookAttempts,
+		&kafkaTopic,
+		&kafkaPartition,
+		&kafkaOffset,
 		&dltTopic,
 		&failureMetadata,
 	); err != nil {
@@ -232,8 +242,25 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 	if dispatchedAt.Valid {
 		e.DispatchedAt = &dispatchedAt.Time
 	}
+	// SUNSET: this field and the column behind it go with the legacy transport. Until
+	// then a non-nil value is what tells the relay this row's Kafka leg is already
+	// done, so a re-claim delivers only the outstanding webhook.
+	if kafkaDispatchedAt.Valid {
+		e.KafkaDispatchedAt = &kafkaDispatchedAt.Time
+	}
 	if lockedUntil.Valid {
 		e.LockedUntil = &lockedUntil.Time
+	}
+	// The broker coordinate is all-or-nothing, which the check constraint enforces in the
+	// schema and this reads back the same way. Assigning the partition or the offset without
+	// the topic would produce a row that looks confirmed to a reader testing only the offset
+	// and has nothing to look the record up with — see model.EventOutbox.BrokerRecord.
+	if kafkaTopic.Valid && kafkaPartition.Valid && kafkaOffset.Valid {
+		partition := int(kafkaPartition.Int32)
+		offset := kafkaOffset.Int64
+		e.KafkaTopic = kafkaTopic.String
+		e.KafkaPartition = &partition
+		e.KafkaOffset = &offset
 	}
 
 	return e, nil
@@ -486,6 +513,37 @@ func eventOutboxInsertArgs(e *model.EventOutbox) []interface{} {
 	}
 }
 
+// eventIdentifierHashLength is how many hex characters of a digest a log line carries.
+//
+// Sixteen is 64 bits, which is far more than enough to keep two distinct identifiers apart
+// in one deployment's logs while being short enough to read and to grep. It matches the
+// producer-side hashLogIdentifier in the root package, so the same identifier produces the
+// same token on both sides and the two lines can be joined.
+const eventIdentifierHashLength = 16
+
+// hashedEventIdentifier turns a financial identifier into a stable, non-reversible token
+// for a log field.
+//
+// It keeps the one property a log needs — the same identifier always produces the same token
+// — and gives up the one it does not need, the identifier itself. An empty input returns an
+// empty string rather than the digest of the empty string, so "no aggregate" and "some
+// aggregate" stay distinguishable.
+//
+// Parameters:
+//   - value string: the identifier. May be empty.
+//
+// Returns:
+//   - string: a short hex token, or "" for an empty input.
+func hashedEventIdentifier(value string) string {
+	if value == "" {
+		return ""
+	}
+
+	sum := sha256.Sum256([]byte(value))
+
+	return hex.EncodeToString(sum[:])[:eventIdentifierHashLength]
+}
+
 // wrapEventOutboxInsertError turns a driver failure into the typed error the rest
 // of the system can act on, following the discrimination UpsertLineageMapping
 // performs on *pq.Error.
@@ -519,6 +577,46 @@ func wrapEventOutboxInsertError(err error) error {
 	return loggedDatabaseError(apierror.ErrInternalServer, "Failed to insert event outbox entry", "wrap_event_outbox_insert_error", err)
 }
 
+// sqlExecutor is the statement-executing subset shared by *sql.DB, *sql.Tx and *sql.Conn.
+//
+// It exists so that ONE implementation of an entity INSERT can run either on the pooled
+// connection — the plain, non-transactional creation path every existing caller uses — or
+// inside a transaction that also carries the entity's event outbox row. Requirement R-2 needs
+// the second shape; source compatibility needs the first; and writing the statement twice
+// would be two places for the column list, the identifier generation and the
+// unique-violation mapping to drift apart.
+//
+// Deliberately the SMALLEST useful subset. A helper that could Begin or Commit could open a
+// second transaction inside the caller's, and a helper that could Query would invite reads on
+// a path whose whole purpose is a single write.
+type sqlExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
+// insertEventOutboxRowsInTx inserts every supplied event row inside the caller's transaction.
+//
+// It is the shared tail of the entity creation writers that capture an event atomically —
+// ledgers, identities and balances. Each of them ends with the same three steps (insert the
+// entity, insert its event, commit), and the middle step is here so that the wrapping of the
+// insert failure reads identically wherever it happens.
+//
+// Parameters:
+//   - ctx context.Context: the context for the statements.
+//   - tx *sql.Tx: the caller's open transaction. The rows commit with it or not at all.
+//   - rows []*model.EventOutbox: the rows to insert; already free of nils.
+//
+// Returns:
+//   - error: the first insert failure, wrapped so the caller's rollback can report it.
+func (d Datasource) insertEventOutboxRowsInTx(ctx context.Context, tx *sql.Tx, rows []*model.EventOutbox) error {
+	for _, e := range rows {
+		if err := d.InsertEventOutboxInTx(ctx, tx, e); err != nil {
+			return fmt.Errorf("failed to insert event outbox: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // InsertEventOutboxInTx inserts an event outbox entry within an existing database
 // transaction, so the event is committed atomically with the ledger mutation that
 // produced it.
@@ -544,6 +642,109 @@ func (d Datasource) InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *mo
 	return nil
 }
 
+// sqlExecer is the minimum surface an entity INSERT needs, satisfied by both *sql.DB
+// and *sql.Tx.
+//
+// It exists so that one insert function serves both the direct path and the
+// transactional path of a create-and-capture writer. Duplicating the statement for the
+// two paths is how the column list, the generated id and the driver-error mapping drift
+// apart, and the drift would show up as a create that behaves differently depending on
+// whether an event was being captured alongside it.
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
+// EventPreparer builds the outbox row for an entity that has JUST BEEN INSERTED, and is
+// called from inside the transaction that inserted it.
+//
+// # Why a create-and-capture writer needs a callback rather than a prepared row
+//
+// The three creation events — ledger.created, identity.created, balance.created — describe
+// an entity whose identity and creation instant are minted INSIDE the repository:
+// CreateLedger assigns ldg_<uuid>, CreateIdentity assigns idt_<uuid> unless the caller
+// supplied one, CreateBalance assigns bln_<uuid>, and each stamps created_at. The event's
+// payload is that finished entity, and its aggregate id and partition key are derived from
+// the very id that does not exist until the insert has run. A row prepared BEFORE the call
+// would therefore describe an entity that does not exist yet, and moving id generation up
+// into the service layer to avoid that would change domain behaviour this change is not
+// permitted to touch.
+//
+// So the caller passes a function instead of a row: the writer inserts the entity, hands
+// the finished value to this function, and inserts whatever row comes back — all inside one
+// transaction, which is requirement R-2 for these three producers.
+//
+// # The contract this function must honour
+//
+// It runs while a database transaction is open, so it must do NO I/O and must not block:
+// blnk's implementation marshals the payload and reads process configuration, and nothing
+// else. Returning (nil, nil) is legitimate and means "no event to capture" — which is what
+// PrepareEventOutbox returns when publishing is not configured, and it leaves the entity
+// insert to commit on its own. Returning an error ABORTS the whole transaction, entity
+// included, because a mutation whose event cannot be built is exactly the half-committed
+// state the outbox exists to rule out.
+type EventPreparer[T any] func(entity T) (*model.EventOutbox, error)
+
+// firstEventPreparer resolves a variadic preparer tail to the single preparer to use, or
+// nil when none was supplied.
+//
+// The tail is variadic so that adding event capture to CreateLedger, CreateIdentity and
+// CreateBalance keeps every pre-existing caller source-compatible — the API layer, the
+// reconciliation and account paths, and a long tail of tests all call them with one
+// argument — which is the same reason the atomic transaction writers take their event rows
+// variadically. Nils are skipped rather than honoured, because a caller assembling the
+// argument conditionally would otherwise take a create down with it.
+//
+// Only the FIRST non-nil preparer is used. One entity produces one creation event; a second
+// preparer would mean two events for one mutation, which is a duplicate publication the
+// subscriber cannot distinguish from a genuine repeat.
+//
+// Parameters:
+//   - preparers []EventPreparer[T]: the caller's variadic tail, possibly empty.
+//
+// Returns:
+//   - EventPreparer[T]: the preparer to run, or nil when there is nothing to capture.
+func firstEventPreparer[T any](preparers []EventPreparer[T]) EventPreparer[T] {
+	for _, prepare := range preparers {
+		if prepare != nil {
+			return prepare
+		}
+	}
+
+	return nil
+}
+
+// captureEntityEvent runs a preparer against a just-inserted entity and inserts the row it
+// returns inside the caller's transaction.
+//
+// It is a free function rather than a method because Go does not permit type parameters on
+// methods; the datasource is passed explicitly so the insert still goes through the one
+// exported in-transaction insert every atomic writer uses.
+//
+// Parameters:
+//   - ctx context.Context: the writer's context.
+//   - d Datasource: the datasource whose InsertEventOutboxInTx performs the insert.
+//   - tx *sql.Tx: the open transaction the entity was inserted in.
+//   - entity T: the finished entity, exactly as it will be returned to the caller.
+//   - prepare EventPreparer[T]: the caller's preparer. Must not be nil.
+//
+// Returns:
+//   - error: the preparer's error, or the insert's error. Either aborts the transaction,
+//     so the entity is not created without its event.
+func captureEntityEvent[T any](ctx context.Context, d Datasource, tx *sql.Tx, entity T, prepare EventPreparer[T]) error {
+	row, err := prepare(entity)
+	if err != nil {
+		return err
+	}
+
+	if row == nil {
+		// Publishing is not configured. The entity insert stands on its own, which is the
+		// no-op-when-unconfigured contract this pipeline inherited from SendWebhook.
+		return nil
+	}
+
+	return d.InsertEventOutboxInTx(ctx, tx, row)
+}
+
 // InsertEventOutbox inserts an event outbox entry directly, outside any ledger
 // transaction.
 //
@@ -557,15 +758,17 @@ func (d Datasource) InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *mo
 // committed and its event does not exist. No amount of retrying here closes that
 // window, because the mutation is already durable.
 //
-// It is used by the producers whose mutation repositories do not accept an event row:
-// ledger creation, identity creation, balance creation, balance monitor alerts, bulk
-// transaction batch progress and system.error. The first three are ordinary domain
-// mutations and therefore genuinely carry the gap described above; the last three
-// have no single mutation to be atomic with in the first place. Closing the gap for
-// the first three requires their repository write paths to accept and insert the
-// event row inside their own transactions, exactly as
-// RecordTransactionWithBalancesAndOutbox does — those files are outside this
-// change's scope, so the gap is documented here rather than described as closed.
+// It is used by the producers that have NO SINGLE MUTATION to be atomic with:
+// balance monitor alerts, bulk transaction batch progress, system.error, and the
+// coalesced transaction batch whose writer is called from a file this change may not
+// edit. For those, there is no transaction to enrol the event in, so this path is the
+// correct one rather than a compromise.
+//
+// The three ordinary creation events NO LONGER COME HERE. Ledger, identity and balance
+// creation each insert their event inside the transaction that inserts the entity —
+// see CreateLedger, CreateIdentity and CreateBalance, which take an EventPreparer for
+// exactly that purpose — so the window described above is closed for them rather than
+// merely documented.
 //
 // A failure is logged at ERROR with the full event identity, not merely returned, so
 // that a lost event is visible in the log even at a call site that discards the
@@ -589,12 +792,22 @@ func (d Datasource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox)
 		// domain mutation that produced this event is already committed and the event
 		// is gone. Returning the error alone would make that invisible at any call
 		// site that logs and continues.
+		//
+		// The aggregate is reported as a HASH rather than in plaintext. It is a ledger,
+		// balance, transaction or identity id — a financial identifier naming whose money
+		// this event describes — and this line is emitted on a failure path that a database
+		// problem can make high-volume, into a log with a wider audience and a longer life
+		// than the database itself. Correlation loses nothing: event_id identifies the event
+		// uniquely and is already here, and the token still lets an operator see that several
+		// failures share one aggregate, which is all the identifier was contributing. The
+		// producer-side log in event_outbox.go hashes the same field for the same reason, so
+		// the two lines can be joined on the token.
 		logrus.WithFields(logrus.Fields{
-			"event_id":     e.EventID,
-			"event_type":   e.EventType,
-			"topic":        e.Topic,
-			"aggregate_id": e.AggregateID,
-			"atomic":       false,
+			"event_id":          e.EventID,
+			"event_type":        e.EventType,
+			"topic":             e.Topic,
+			"aggregate_id_hash": hashedEventIdentifier(e.AggregateID),
+			"atomic":            false,
 		}).WithError(err).Error("event lost: non-atomic outbox insert failed after its mutation was committed")
 
 		return wrapEventOutboxInsertError(err)
@@ -783,6 +996,14 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 // order, because MarkEventFailed's retry arm returns the row to pending, where it
 // blocks its key again.
 //
+// A row that ClaimEventsOwedDeadLetter has taken does not block its key either, and
+// that is the same trade rather than a new one: such a row will never reach the MAIN
+// topic under any outcome — the only question left is whether its event is preserved
+// on the dead-letter sibling — so a later event of the same aggregate overtaking it
+// changes nothing about the main topic's order. Blocking it would stall the
+// aggregate for as long as the dead-letter topic was unreachable, which is precisely
+// the failure this trade exists to avoid.
+//
 // The predicate is index-backed by idx_event_outbox_partition_key_inflight, whose
 // partial WHERE clause is exactly the blocking set. Widening the blocking set here
 // without widening that index turns each candidate check into a scan of the key's
@@ -809,6 +1030,14 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 // exhausted row is left for the dead-letter path rather than being retried
 // forever.
 //
+// A row whose budget IS spent and whose dead-letter write is still owed is
+// therefore invisible to this query, and it is reached by
+// ClaimEventsOwedDeadLetter instead. Keeping the two sets in two statements is
+// deliberate: folding the second into an OR here made this predicate
+// unsatisfiable by idx_event_outbox_claim's partial index — a partial index is
+// usable only when its predicate is implied by the query's — and the planner fell
+// back to a sequential scan of the whole table on every poll.
+//
 // # next_attempt_at <= NOW() is the DUE predicate, and it is what makes the backoff real
 //
 // The lease answers "has whoever claimed this row abandoned it". It does not answer
@@ -831,6 +1060,26 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 // COALESCE pins the first to the first claim and leaves it alone thereafter, while
 // the last moves with every claim; together they bound the retry window that the
 // dead-letter failure metadata reports.
+//
+// # webhook_pending is CLAIMABLE but not BLOCKING — the asymmetry is deliberate
+//
+// SUNSET: this paragraph and the literal it describes go with the legacy transport.
+//
+// A webhook_pending row has been published to Kafka and recorded in
+// kafka_dispatched_at; what it still owes is a legacy webhook enqueue. It is in the
+// claimable set so that outstanding enqueue is actually retried — before it existed,
+// such a row was marked dispatched and the webhook was never delivered — and the
+// caller skips the publish for any claimed row carrying kafka_dispatched_at, so a
+// re-claim cannot put a duplicate on the topic.
+//
+// It is NOT in the blocking set of the NOT EXISTS predicate below. Ordering is a
+// property of the Kafka partition, and such a row's position in that partition is
+// already fixed, so nothing it does subsequently can reorder anything. Blocking its
+// key would instead let a failing LEGACY enqueue stall Kafka delivery for the entire
+// aggregate — the deprecated transport interfering with the new one, which is exactly
+// backwards. idx_event_outbox_claim's partial predicate covers the wider claimable
+// set and idx_event_outbox_partition_key_inflight's covers the narrower blocking one;
+// they must keep matching these two lists respectively.
 const claimPendingEventOutboxQuery = `
 		WITH claimed AS (
 			UPDATE blnk.event_outbox
@@ -841,7 +1090,7 @@ const claimPendingEventOutboxQuery = `
 				last_attempted_at = NOW()
 			WHERE id IN (
 				SELECT candidate.id FROM blnk.event_outbox candidate
-				WHERE candidate.status IN ('pending', 'processing')
+				WHERE candidate.status IN ('pending', 'processing', 'webhook_pending')
 				  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
 				  AND candidate.attempts < candidate.max_attempts
 				  AND candidate.next_attempt_at <= NOW()
@@ -937,6 +1186,192 @@ func (d Datasource) ClaimPendingEventOutbox(ctx context.Context, batchSize int, 
 	return entries, nil
 }
 
+// claimFailedEventOutboxForDeadLetterQuery claims rows whose retry budget is spent and
+// whose dead-letter PRESERVATION has not happened, so it can be attempted again.
+//
+// # The limbo this exists to end
+//
+// The exhaustion arm of MarkEventFailed sets status = 'failed' and hands the claim token to
+// the worker that spent the last attempt, which then writes the event to its `<topic>.dlt`
+// sibling and records the result. When that write fails — no transport, a broker outage, a
+// topic that does not exist yet — the row is left at 'failed' with dlt_topic still NULL, and
+// that state was a dead end in three directions at once: the ordinary claim predicate
+// excludes 'failed', replay accepts only 'dead_lettered', and the worker holding the token
+// had already moved on. The event existed ONLY as that row. It was visible in the
+// dead-letter inventory, which lists both literals precisely so it would be, and nothing in
+// the system would ever act on it again.
+//
+// # What it claims, and what it deliberately leaves alone
+//
+// dlt_topic IS NULL is the whole definition of "not preserved": the column is set by the
+// same statement that moves the row to 'dead_lettered', so its absence on a failed row means
+// the message never reached a topic.
+//
+// THE STATUS IS NOT CHANGED. The row stays 'failed' for two reasons. It keeps the row in
+// the dead-letter inventory for the whole repair attempt, so an operator watching the
+// backlog does not see events flicker out of it; and MarkEventDeadLettered accepts 'failed'
+// as a prior state, so the recovered row can complete through exactly the same transition
+// the original attempt would have used. A fresh claim token IS stamped, because the original
+// token belonged to a worker that may no longer exist and every transition is conditional on
+// the token the caller holds.
+//
+// # Why the retry is not attempt-bounded
+//
+// Every other retry in this table is bounded, and this one is not, because there is nowhere
+// further to fall back to: the dead-letter topic IS the last resort, and abandoning the
+// write would delete the only copy of the event. What bounds it instead is FREQUENCY — a row
+// is re-claimable only once its lease has expired — and VISIBILITY: the row stays in the
+// dead-letter inventory and feeds blnk.dlt.oldest_message_age_seconds, whose 15-minute alert
+// is the escalation path for a preservation that is not succeeding.
+//
+// The ordering columns match the rest of the file (occurred_at, then id) and the predicate is
+// served by idx_event_outbox_failed, whose partial WHERE covers exactly the failed and
+// dead-lettered set. FOR UPDATE SKIP LOCKED is required for the same reason it is on the
+// ordinary claim: several relay instances must be able to repair disjoint subsets.
+const claimFailedEventOutboxForDeadLetterQuery = `
+		WITH claimed AS (
+			UPDATE blnk.event_outbox
+			SET locked_until = NOW() + $1::interval,
+				claim_token = $2,
+				last_attempted_at = NOW()
+			WHERE id IN (
+				SELECT candidate.id FROM blnk.event_outbox candidate
+				WHERE candidate.status = 'failed'
+				  AND candidate.dlt_topic IS NULL
+				  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
+				ORDER BY candidate.occurred_at ASC, candidate.id ASC
+				LIMIT $3
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING ` + eventOutboxColumns + `
+		)
+		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
+	`
+
+// ClaimFailedEventOutboxForDeadLetter claims up to batchSize rows whose retry budget is
+// spent and whose dead-letter write has not yet succeeded, taking a lease on them and
+// stamping one fresh claim token, so the preservation can be attempted again.
+//
+// The returned rows are oldest occurrence first and each carries the token in its ClaimToken
+// field; MarkEventDeadLettered must be presented that token. See the query comment for why
+// the status is deliberately left at 'failed' and why this retry is bounded by frequency
+// rather than by an attempt count.
+//
+// Parameters:
+//   - ctx context.Context: cancels the claim.
+//   - batchSize int: the maximum number of rows to claim. Must be positive — a zero LIMIT
+//     claims nothing and returns no error, which is indistinguishable from an empty repair
+//     backlog and would make a broken caller look healthy.
+//   - lockDuration time.Duration: the lease. Non-positive is normalised to
+//     defaultEventClaimLease rather than rejected, because an expired-on-arrival lease is a
+//     correctness problem while failing the poll would stop the repair entirely.
+//
+// Returns:
+//   - []model.EventOutbox: the claimed rows, oldest first. Empty when nothing needs repair,
+//     which is the normal state.
+//   - error: a bad-request error for a non-positive batch, or a wrapped driver error.
+func (d Datasource) ClaimFailedEventOutboxForDeadLetter(
+	ctx context.Context,
+	batchSize int,
+	lockDuration time.Duration,
+) ([]model.EventOutbox, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClaimFailedEventOutboxForDeadLetter")
+	defer span.End()
+
+	if batchSize <= 0 {
+		err := apierror.NewAPIError(apierror.ErrBadRequest,
+			"Event outbox dead-letter recovery batch size must be greater than zero", nil)
+		span.RecordError(err)
+
+		return nil, err
+	}
+
+	if lockDuration <= 0 {
+		logrus.WithField("requested_lock_duration", lockDuration.String()).
+			Warnf("Non-positive dead-letter recovery lock duration; falling back to %s", defaultEventClaimLease)
+		lockDuration = defaultEventClaimLease
+	}
+
+	claimToken := uuid.NewString()
+
+	span.SetAttributes(
+		attribute.Int("event_outbox.batch_size", batchSize),
+		attribute.String("event_outbox.lock_duration", lockDuration.String()),
+		attribute.String("event_outbox.claim_token", claimToken),
+	)
+
+	rows, err := d.Conn.QueryContext(ctx, claimFailedEventOutboxForDeadLetterQuery,
+		lockDuration.String(), claimToken, batchSize)
+	if err != nil {
+		span.RecordError(err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to claim event outbox entries awaiting dead-letter preservation",
+			"claim_failed_event_outbox_for_dead_letter", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logrus.Errorf("Error closing rows: %v", closeErr)
+		}
+	}()
+
+	var entries []model.EventOutbox
+	for rows.Next() {
+		entry, scanErr := scanEventOutbox(rows)
+		if scanErr != nil {
+			span.RecordError(scanErr)
+
+			return nil, loggedDatabaseError(apierror.ErrInternalServer,
+				"Failed to scan an event outbox entry awaiting dead-letter preservation",
+				"claim_failed_event_outbox_for_dead_letter", scanErr)
+		}
+		entries = append(entries, entry)
+	}
+
+	if err = rows.Err(); err != nil {
+		span.RecordError(err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Error iterating over event outbox entries awaiting dead-letter preservation",
+			"claim_failed_event_outbox_for_dead_letter", err)
+	}
+
+	span.SetAttributes(attribute.Int("event_outbox.claimed_count", len(entries)))
+
+	return entries, nil
+}
+
+// brokerRecordBindings renders a broker coordinate as the three nullable SQL parameters the
+// marking statements bind, so all three transitions agree on one definition.
+//
+// # Why NULL rather than zero
+//
+// Partition 0 and offset 0 are a perfectly ordinary location — the first record on a fresh
+// partition — so binding zeroes for an absent coordinate would write a row that claims to name
+// a record it never produced, and the audit would count it as confirmed while an operator
+// looking there would find somebody else's event. An absent coordinate must therefore be SQL
+// NULL, which is also what the all-or-nothing check constraint requires.
+//
+// An unconfirmed record is a legitimate input, not an error: the broker acknowledged the write
+// and the library reported no coordinate, which leaves the publication real but unnameable. The
+// existing values are left in place by COALESCE at the call sites, so a later confirmed write
+// can still fill them in.
+//
+// Parameters:
+//   - record model.BrokerRecord: the coordinate, possibly unconfirmed.
+//
+// Returns:
+//   - topic any: the topic name, or nil.
+//   - partition any: the partition, or nil.
+//   - offset any: the offset, or nil.
+func brokerRecordBindings(record model.BrokerRecord) (topic, partition, offset any) {
+	if !record.Confirmed() {
+		return nil, nil, nil
+	}
+
+	return strings.TrimSpace(record.Topic), record.Partition, record.Offset
+}
+
 // requireEventOutboxClaimToken rejects a transition attempted without a claim
 // token.
 //
@@ -1016,18 +1451,130 @@ func requireEventOutboxRowAffected(result sql.Result, id int64, transition strin
 	return nil
 }
 
+// RenewEventOutboxLease extends the lease on every row still being worked under one claim
+// token, and reports how many it extended.
+//
+// # The defect it exists to remove
+//
+// The lease was a fixed 30 seconds while a batch could take far longer. At the shipped
+// defaults a claim takes 100 rows and publishes them 8 at a time, so the batch runs in 13
+// waves; a single wave can occupy the writer's whole 10-second produce timeout before it
+// fails. The rows in the last waves therefore had their lease expire BEFORE their publish
+// was even attempted — while this relay still held them and still intended to publish them.
+// A second instance then claimed and published those rows, and this instance published them
+// again afterwards, so the topic received duplicates and every transition this instance
+// attempted failed as a lost claim. Nothing in either process reported a defect.
+//
+// Renewal fixes it without lengthening the recovery latency. The alternatives both cost
+// something real: deriving a lease long enough for the worst-case batch would make a
+// crashed relay's rows unclaimable for minutes, and shrinking the batch to fit the lease
+// would cap throughput below the 500 events per second the pipeline is required to sustain.
+//
+// # Why the claim token alone identifies the work
+//
+// Every terminal and near-terminal transition CLEARS claim_token, so a row that has been
+// dispatched, dead-lettered, returned to pending or moved to webhook_pending is
+// automatically outside this statement's reach. What remains under the token is exactly the
+// set still in flight. That is why no id list is passed: the token IS the batch, and the
+// database already knows which of its rows are unfinished.
+//
+// The status guard is processing only — the state the claim itself set. A row in any other
+// state is either finished or owned by somebody else, and extending a lease on it would be
+// this instance asserting a hold it no longer has.
+//
+// # Reporting rather than failing
+//
+// A renewal that extends nothing is not an error: it is the ordinary end of a batch, where
+// every row has already reached a terminal state. The count is returned so the caller can
+// stop renewing when it reaches zero and can log the difference when it is smaller than the
+// batch it expected.
+//
+// Parameters:
+//   - ctx context.Context: cancels the update.
+//   - claimToken string: the token the claim issued. Required; without it the statement
+//     could only match rows nobody holds.
+//   - lease time.Duration: how long from NOW the extended lease should run. Non-positive is
+//     replaced with defaultEventClaimLease, because an expired-on-arrival renewal is worse
+//     than no renewal at all.
+//
+// Returns:
+//   - int64: how many rows were extended. Zero is a legitimate answer.
+//   - error: a bad-request error for a missing token, or a wrapped driver error.
+func (d Datasource) RenewEventOutboxLease(ctx context.Context, claimToken string, lease time.Duration) (int64, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RenewEventOutboxLease")
+	defer span.End()
+
+	if err := requireEventOutboxClaimToken(claimToken, "renew_lease"); err != nil {
+		span.RecordError(err)
+		return 0, err
+	}
+
+	if lease <= 0 {
+		logrus.WithField("requested_lease", lease.String()).
+			Warnf("Non-positive event outbox lease renewal; falling back to %s", defaultEventClaimLease)
+		lease = defaultEventClaimLease
+	}
+
+	span.SetAttributes(
+		attribute.String("event_outbox.claim_token", claimToken),
+		attribute.String("event_outbox.lease", lease.String()),
+	)
+
+	result, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_outbox
+		SET locked_until = NOW() + $1::interval
+		WHERE claim_token = $2 AND status = $3
+	`, lease.String(), claimToken, model.EventOutboxStatusProcessing)
+	if err != nil {
+		span.RecordError(err)
+		return 0, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to renew the event outbox lease", "renew_event_outbox_lease", err)
+	}
+
+	renewed, err := result.RowsAffected()
+	if err != nil {
+		// The driver could not report a count. The renewal itself succeeded, so this is
+		// reported as zero rather than as a failure: the caller uses the count only to
+		// decide whether to keep renewing, and one uncounted round is harmless.
+		logrus.WithError(err).WithField("claim_token", claimToken).
+			Debug("Could not determine how many event outbox leases were renewed")
+
+		return 0, nil
+	}
+
+	span.SetAttributes(attribute.Int64("event_outbox.renewed_count", renewed))
+
+	return renewed, nil
+}
+
 // MarkEventDispatched marks an entry dispatched once the broker has acknowledged
 // the publish, and does so ONLY IF the caller still holds the claim.
 //
 // The lease and the claim token are released and dispatched_at is stamped in the
 // same statement. dispatched is a terminal state: the row is no longer claimable,
-// because the claim predicate admits only pending and processing rows.
+// because it is outside the claim predicate's status list.
+//
+// kafka_dispatched_at is stamped through COALESCE in the same statement, so the
+// column answers "was this event published to the broker, and when" for EVERY
+// dispatched row rather than only for rows that passed through webhook_pending. The
+// COALESCE is what makes it the FIRST acknowledgement rather than the last write: a
+// row whose Kafka leg completed on an earlier claim keeps that instant, which is the
+// instant the message actually reached the broker.
 //
 // Both processing and replaying are accepted as the prior state. processing is the
 // ordinary relay path; replaying is the successful-replay path, where a
 // dead-lettered row that has just been re-published to its original topic becomes
 // dispatched and so leaves the dead-letter inventory. Nothing else is accepted, so
 // a late call cannot resurrect a row out of a terminal state.
+//
+// # The broker coordinate (OBS-02)
+//
+// The topic, partition and offset the broker assigned are persisted here, which is what turns
+// "this row claims a publication" into "this row IS that record". They are written through
+// COALESCE for the same reason kafka_dispatched_at is: a row whose Kafka leg completed on an
+// earlier claim already names its record, and a later marking must not overwrite that with the
+// nil coordinate a webhook-only pass carries. An unconfirmed coordinate therefore leaves the
+// existing values alone rather than erasing them.
 //
 // A caller that has lost its claim receives ErrConflict and must not treat the
 // publish as recorded — see eventOutboxClaimLost.
@@ -1038,22 +1585,40 @@ func requireEventOutboxRowAffected(result sql.Result, id int64, transition strin
 // again. That duplicate is by design and is suppressed at the consumer's
 // idempotency boundary on event_id; nothing here tries to close it, because closing
 // it would require a distributed transaction with the broker.
-func (d Datasource) MarkEventDispatched(ctx context.Context, id int64, claimToken string) error {
+func (d Datasource) MarkEventDispatched(
+	ctx context.Context,
+	id int64,
+	claimToken string,
+	record model.BrokerRecord,
+) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkEventDispatched")
 	defer span.End()
-	span.SetAttributes(attribute.Int64("event_outbox.id", id))
+	span.SetAttributes(
+		attribute.Int64("event_outbox.id", id),
+		attribute.String("event_outbox.broker_record", record.String()),
+	)
 
 	if err := requireEventOutboxClaimToken(claimToken, model.EventOutboxStatusDispatched); err != nil {
 		span.RecordError(err)
 		return err
 	}
 
+	recordTopic, recordPartition, recordOffset := brokerRecordBindings(record)
+
 	result, err := d.Conn.ExecContext(ctx, `
 		UPDATE blnk.event_outbox
-		SET status = $1, dispatched_at = NOW(), locked_until = NULL, claim_token = NULL
+		SET status = $1,
+			dispatched_at = NOW(),
+			kafka_dispatched_at = COALESCE(kafka_dispatched_at, NOW()),
+			kafka_topic = COALESCE($6, kafka_topic),
+			kafka_partition = COALESCE($7, kafka_partition),
+			kafka_offset = COALESCE($8, kafka_offset),
+			locked_until = NULL,
+			claim_token = NULL
 		WHERE id = $2 AND claim_token = $3 AND status IN ($4, $5)
 	`, model.EventOutboxStatusDispatched, id, claimToken,
-		model.EventOutboxStatusProcessing, model.EventOutboxStatusReplaying)
+		model.EventOutboxStatusProcessing, model.EventOutboxStatusReplaying,
+		recordTopic, recordPartition, recordOffset)
 	if err != nil {
 		span.RecordError(err)
 		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark event outbox entry as dispatched", "mark_event_dispatched", err)
@@ -1132,17 +1697,26 @@ func (d Datasource) MarkEventDispatched(ctx context.Context, id int64, claimToke
 // because a caller that computed a negative delay meant "no delay", and reaching
 // into the past would be indistinguishable from it while looking deliberate.
 //
-// On the EXHAUSTION arm next_attempt_at is deliberately left ALONE: a row whose
-// budget is spent is not waiting for anything, and a future due instant on a
-// terminal row would read as though a retry were still coming.
+// THE EXHAUSTION ARM LEAVES next_attempt_at ALONE, and the CASE expression that does
+// so is the point rather than a flourish.
+//
+// A row whose budget is spent is not waiting for a retry, and nothing reads a due
+// instant on it. The ordinary claim requires attempts < max_attempts, so it can never
+// reach an exhausted row; and the dead-letter repair claim
+// (claimFailedEventOutboxForDeadLetter) selects on status, dlt_topic and the LEASE
+// only — it is throttled by frequency, not by a due instant. Writing a future instant
+// there would therefore be read by exactly one audience, an operator triaging a
+// dead-letter backlog, and it would tell them a retry was still coming when the budget
+// that would have paid for it is gone. Leaving the value as the last retry set it keeps
+// the row's own history readable instead.
 //
 // Parameters:
 //   - ctx context.Context: cancels the update.
 //   - id int64: the row's surrogate key.
 //   - claimToken string: the token the claim issued; the update is refused without it.
 //   - errMsg string: the failure reason, stored in last_error.
-//   - retryAfter time.Duration: how long the row must wait before it is due again.
-//     Applied on the retry arm only. Non-positive means due immediately.
+//   - retryAfter time.Duration: how long the row must wait before its next publish
+//     attempt. Applied on the retry arm only. Non-positive means due immediately.
 //
 // Returns:
 //   - model.EventFailureOutcome: the resulting status, the new attempt count, whether
@@ -1173,8 +1747,7 @@ func (d Datasource) MarkEventFailed(ctx context.Context, id int64, claimToken, e
 			first_attempted_at = COALESCE(first_attempted_at, NOW()),
 			last_attempted_at = NOW(),
 			locked_until = NULL,
-			next_attempt_at = CASE WHEN attempts + 1 >= max_attempts
-				THEN next_attempt_at ELSE NOW() + $4::interval END,
+			next_attempt_at = CASE WHEN attempts + 1 >= max_attempts THEN next_attempt_at ELSE NOW() + $4::interval END,
 			claim_token = CASE WHEN attempts + 1 >= max_attempts THEN claim_token ELSE NULL END
 		WHERE id = $5 AND claim_token = $6 AND status = $7
 		RETURNING status, attempts
@@ -1206,6 +1779,145 @@ func (d Datasource) MarkEventFailed(ctx context.Context, id int64, claimToken, e
 		attribute.Bool("event_outbox.exhausted", outcome.Exhausted),
 	)
 	return outcome, nil
+}
+
+// claimEventsOwedDeadLetterQuery claims rows whose retry budget is spent and whose
+// dead-letter write has NOT been recorded, taking a lease and stamping a fresh claim
+// token WITHOUT changing their status.
+//
+// It is a package-level constant so tests can assert that FOR UPDATE SKIP LOCKED, the
+// occurred_at ordering, the untouched status and the dlt_topic IS NULL restriction are
+// all still present.
+//
+// # The set, and why it must be reachable at all
+//
+// MarkEventFailed's exhaustion arm records 'failed' and RETAINS the claim token so the
+// worker that spent the last attempt is the only one permitted to write the event to its
+// `<topic>.dlt` sibling. When that write — or the MarkEventDeadLettered that records it —
+// fails, the row is left failed with no dlt_topic, and at that point it was reachable by
+// nothing at all: the main claim excludes it twice over (wrong status, no budget) and
+// ClaimEventForReplay accepts only dead_lettered. This table is the ONLY copy of that
+// event — the retention purge deliberately refuses to delete a failed row for exactly this
+// reason — so an operator's only recourse was a hand-written UPDATE.
+//
+// 'processing' is included alongside 'failed' because a relay can die between this claim
+// and the dead-letter record; such a row is recovered by the same predicate once its lease
+// expires. dlt_topic IS NULL is what makes the set SELF-CLEARING: recording the
+// dead-letter takes the row out of it permanently.
+//
+// # Why the status is deliberately NOT changed
+//
+// Moving the row to 'processing' would put it back into the main claim's blocking set, so
+// a row whose dead-letter topic was unreachable would stall every later event of its
+// aggregate for as long as the outage lasted. Leaving it failed keeps the trade the main
+// claim's anti-join documents: an event that can never reach the main topic must not hold
+// its key back. MarkEventDeadLettered accepts 'failed' as a prior state precisely so this
+// works.
+//
+// # next_attempt_at is the retry pacing
+//
+// MarkEventFailed's exhaustion arm schedules it exactly as its retry arm does, so a
+// dead-letter topic that is unreachable is retried on the same bounded backoff the publish
+// attempts used rather than once per poll interval per stranded row.
+const claimEventsOwedDeadLetterQuery = `
+		WITH claimed AS (
+			UPDATE blnk.event_outbox
+			SET locked_until = NOW() + $1::interval,
+				claim_token = $2,
+				last_attempted_at = NOW()
+			WHERE id IN (
+				SELECT candidate.id FROM blnk.event_outbox candidate
+				WHERE candidate.status IN ('failed', 'processing')
+				  AND candidate.dlt_topic IS NULL
+				  AND candidate.attempts >= candidate.max_attempts
+				  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
+				  AND candidate.next_attempt_at <= NOW()
+				ORDER BY candidate.next_attempt_at ASC, candidate.occurred_at ASC, candidate.id ASC
+				LIMIT $3
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING ` + eventOutboxColumns + `
+		)
+		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
+	`
+
+// ClaimEventsOwedDeadLetter claims events whose retry budget is spent and whose
+// dead-letter write is still owed, so the hand-off can be retried instead of the event
+// being stranded in the only table that holds it.
+//
+// In a healthy system this returns nothing: the hand-off happens in the same batch as the
+// attempt that exhausted the budget. It matters when the dead-letter topic is unreachable,
+// when the broker rejects the write, or when the relay dies between the write and the
+// record — and in every one of those cases the alternative is an event that exists nowhere
+// else and can be neither published, replayed nor purged.
+//
+// The returned rows carry a FRESH claim token, which is what authorises
+// MarkEventDeadLettered, and their attempt count still shows the budget spent, which is
+// how a caller knows to retry the hand-off rather than the publish.
+//
+// Parameters:
+//   - ctx context.Context: cancels the claim.
+//   - batchSize int: how many rows to claim. Non-positive is rejected, because a zero LIMIT
+//     claims nothing and returns no error, which is indistinguishable from "nothing is owed".
+//   - lockDuration time.Duration: the lease. Non-positive is normalised to
+//     defaultEventClaimLease, since an expired-on-arrival lease lets two relays write the
+//     same event to the dead-letter topic.
+//
+// Returns:
+//   - []model.EventOutbox: the claimed rows, oldest occurrence first.
+//   - error: a validation error for a non-positive batch, or a wrapped driver error.
+func (d Datasource) ClaimEventsOwedDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClaimEventsOwedDeadLetter")
+	defer span.End()
+
+	if batchSize <= 0 {
+		err := apierror.NewAPIError(apierror.ErrBadRequest, "Dead-letter hand-off claim batch size must be greater than zero", nil)
+		span.RecordError(err)
+		return nil, err
+	}
+
+	if lockDuration <= 0 {
+		logrus.WithField("requested_lock_duration", lockDuration.String()).
+			Warnf("Non-positive dead-letter hand-off lock duration; falling back to %s", defaultEventClaimLease)
+		lockDuration = defaultEventClaimLease
+	}
+
+	claimToken := uuid.NewString()
+
+	span.SetAttributes(
+		attribute.Int("event_outbox.batch_size", batchSize),
+		attribute.String("event_outbox.lock_duration", lockDuration.String()),
+	)
+
+	rows, err := d.Conn.QueryContext(ctx, claimEventsOwedDeadLetterQuery,
+		lockDuration.String(), claimToken, batchSize)
+	if err != nil {
+		span.RecordError(err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to claim events owed a dead-letter write", "claim_events_owed_dead_letter", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logrus.Errorf("Error closing rows: %v", closeErr)
+		}
+	}()
+
+	var entries []model.EventOutbox
+	for rows.Next() {
+		entry, scanErr := scanEventOutbox(rows)
+		if scanErr != nil {
+			span.RecordError(scanErr)
+			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event outbox entry", "claim_events_owed_dead_letter", scanErr)
+		}
+		entries = append(entries, entry)
+	}
+
+	if err = rows.Err(); err != nil {
+		span.RecordError(err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event outbox entries", "claim_events_owed_dead_letter", err)
+	}
+
+	span.SetAttributes(attribute.Int("event_outbox.claimed_count", len(entries)))
+	return entries, nil
 }
 
 // MarkEventDeadLettered records that an entry has been written to its dead-letter
@@ -1242,12 +1954,19 @@ func (d Datasource) MarkEventFailed(ctx context.Context, id int64, claimToken, e
 // An empty dltTopic or empty failureMetadata is stored as SQL NULL rather than as
 // an empty string or an empty JSON document, so "not recorded" stays distinct from
 // "recorded as empty".
-func (d Datasource) MarkEventDeadLettered(ctx context.Context, id int64, claimToken, dltTopic string, failureMetadata json.RawMessage) error {
+func (d Datasource) MarkEventDeadLettered(
+	ctx context.Context,
+	id int64,
+	claimToken, dltTopic string,
+	failureMetadata json.RawMessage,
+	record model.BrokerRecord,
+) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkEventDeadLettered")
 	defer span.End()
 	span.SetAttributes(
 		attribute.Int64("event_outbox.id", id),
 		attribute.String("event_outbox.dlt_topic", dltTopic),
+		attribute.String("event_outbox.broker_record", record.String()),
 	)
 
 	if err := requireEventOutboxClaimToken(claimToken, model.EventOutboxStatusDeadLettered); err != nil {
@@ -1265,12 +1984,22 @@ func (d Datasource) MarkEventDeadLettered(ctx context.Context, id int64, claimTo
 		failureMetadataArg = []byte(failureMetadata)
 	}
 
+	// The coordinate here names the record on the DEAD-LETTER topic, not on the original one:
+	// the original publish is what failed, so there is no record of it to name. It is assigned
+	// rather than COALESCEd, because a dead-letter write supersedes whatever a failed original
+	// attempt may have left behind — a coordinate on the main topic would send an operator
+	// looking for a record the retries never produced.
+	recordTopic, recordPartition, recordOffset := brokerRecordBindings(record)
+
 	result, err := d.Conn.ExecContext(ctx, `
 		UPDATE blnk.event_outbox
-		SET status = $1, dlt_topic = $2, failure_metadata = $3, locked_until = NULL, claim_token = NULL
+		SET status = $1, dlt_topic = $2, failure_metadata = $3,
+			kafka_topic = $8, kafka_partition = $9, kafka_offset = $10,
+			locked_until = NULL, claim_token = NULL
 		WHERE id = $4 AND claim_token = $5 AND status IN ($6, $7)
 	`, model.EventOutboxStatusDeadLettered, dltTopicArg, failureMetadataArg, id, claimToken,
-		model.EventOutboxStatusFailed, model.EventOutboxStatusProcessing)
+		model.EventOutboxStatusFailed, model.EventOutboxStatusProcessing,
+		recordTopic, recordPartition, recordOffset)
 	if err != nil {
 		span.RecordError(err)
 		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark event outbox entry as dead-lettered", "mark_event_dead_lettered", err)
@@ -1304,9 +2033,26 @@ func (d Datasource) MarkEventDeadLettered(ctx context.Context, id int64, claimTo
 // is replaying, because replaying is outside the claim predicate's state set.
 //
 // The lease exists for the same reason it does on an ordinary claim: a process that
-// dies mid-replay must not strand the row in replaying forever. Once the lease
-// expires an operator can see from locked_until that the claim is stale, and
-// ReleaseEventReplay returns the row to dead_lettered so it stays replayable.
+// dies mid-replay must not strand the row in replaying forever. ReleaseEventReplay
+// returns the row to dead_lettered on every failure path, so a replay that merely
+// could not publish stays replayable.
+//
+// # AND AN EXPIRED REPLAY LEASE IS CLAIMABLE TOO, which is what makes that lease mean
+// something
+//
+// Admitting dead_lettered alone left the lease written down and nothing reading it. A
+// process that died mid-replay — or one whose ReleaseEventReplay failed because the
+// request context it was running under had already been cancelled — left the row in
+// replaying for ever: outside the relay's claimable states, outside the dead-letter
+// inventory's terminal state, and refused by every subsequent replay attempt with a
+// conflict naming a status the operator cannot clear. The event was preserved on its
+// dead-letter topic and permanently unreplayable at the same time.
+//
+// So the claim admits a replaying row whose lease has lapsed, on exactly the predicate
+// the ordinary claim uses for the same purpose. The concurrency guarantee is unchanged:
+// a replay holding a LIVE lease is still refused, so two operators triaging one backlog
+// still cannot both publish, and the row is reclaimable only once the holder can no
+// longer be holding it.
 //
 // A failure to match is discriminated rather than collapsed, because the two causes
 // need different answers: an unknown event_id is a not-found, while a row that exists
@@ -1324,10 +2070,14 @@ func (d Datasource) ClaimEventForReplay(ctx context.Context, eventID string, loc
 	}
 	claimToken := uuid.NewString()
 
+	// TWO CLAIMABLE STATES, and $1 appears in both the SET and the WHERE deliberately: it
+	// is the replaying literal, so the second arm reads "a replay whose lease has run out".
 	row := d.Conn.QueryRowContext(ctx, `
 		UPDATE blnk.event_outbox
 		SET status = $1, claim_token = $2, locked_until = NOW() + $3::interval
-		WHERE event_id = $4 AND status = $5
+		WHERE event_id = $4
+		  AND (status = $5
+		       OR status = $1 AND (locked_until IS NULL OR locked_until < NOW()))
 		RETURNING `+eventOutboxColumns, model.EventOutboxStatusReplaying, claimToken,
 		lockDuration.String(), eventID, model.EventOutboxStatusDeadLettered)
 
@@ -1403,6 +2153,153 @@ func (d Datasource) ReleaseEventReplay(ctx context.Context, id int64, claimToken
 	return nil
 }
 
+// claimPendingWebhookDeliveriesQuery claims rows whose Kafka leg is complete and
+// whose LEGACY WEBHOOK leg is still owed, taking a lease and stamping a fresh claim
+// token WITHOUT changing the row's status.
+//
+// It is a package-level constant for the same reason the main claim query is: tests
+// assert that FOR UPDATE SKIP LOCKED, the occurred_at ordering and the untouched
+// status are all still present.
+//
+// # Why the status must NOT change, and why this is a second query rather than an arm
+//
+// The row is already dispatched — the event IS on its Kafka topic. Returning it to
+// processing would put it back in the main claimable set and publish it to Kafka a
+// second time, so the one thing this claim must not do is exactly what the main claim
+// does. It therefore takes only the two things a conditional transition needs: a lease,
+// so two relays cannot enqueue the same webhook at once, and a claim token, because
+// MarkWebhookDispatched is conditional on one and MarkEventDispatched deliberately
+// cleared the row's previous token as it moved the row to its terminal state.
+//
+// The candidate status is a LITERAL rather than a bound parameter, exactly as it is in
+// the main claim and the dead-letter hand-off claim. That is not styling: a partial index
+// is usable only when its predicate is implied by the query's WHERE clause, and the
+// planner can only prove implication from a value it can see while planning. Binding the
+// status would make idx_event_outbox_webhook_pending unusable for any generic plan, and
+// dispatched is the largest status in the table.
+//
+// SUNSET NOTICE: this query, ClaimPendingWebhookDeliveries, MarkWebhookDispatched, the
+// webhook_dispatched column and its partial index are all DELETED at the webhook
+// sunset, together with webhooks.go and the relay's dual-delivery branch. Nothing else
+// in this file depends on them.
+const claimPendingWebhookDeliveriesQuery = `
+		WITH claimed AS (
+			UPDATE blnk.event_outbox
+			SET locked_until = NOW() + $1::interval,
+				claim_token = $2
+			WHERE id IN (
+				SELECT candidate.id FROM blnk.event_outbox candidate
+				WHERE candidate.status = 'dispatched'
+				  AND candidate.webhook_dispatched = FALSE
+				  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
+				ORDER BY candidate.occurred_at ASC, candidate.id ASC
+				LIMIT $3
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING ` + eventOutboxColumns + `
+		)
+		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
+	`
+
+// ClaimPendingWebhookDeliveries claims dispatched rows whose legacy HTTP webhook leg
+// has not been recorded, so the dual-delivery window can finish a leg that failed
+// after the Kafka publish had already succeeded.
+//
+// # The defect this closes
+//
+// The relay enqueues the legacy webhook task and then publishes to Kafka. A failed
+// enqueue was logged and swallowed — correctly, because a webhook receiver being down
+// must not consume a Kafka retry attempt or dead-letter an event on the new transport —
+// and the log line promised the leg would be retried "on the next claim of this row".
+// There was no next claim: the Kafka publish then succeeded, MarkEventDispatched moved
+// the row to its terminal state and cleared its token, and the main claim predicate
+// never looks at a dispatched row again. The legacy leg was lost silently, for exactly
+// the subscribers the 30-day window exists to protect — the ones that have not migrated
+// yet.
+//
+// This makes the promise true. The rows are durable and independently reclaimable: the
+// webhook_dispatched flag is the outstanding-work marker, the lease serialises two
+// relays, and the asynq task identity (the event id) refuses a duplicate even if a
+// lease expires mid-enqueue.
+//
+// In a healthy window this returns nothing: the flag is set microseconds after the
+// enqueue. The partial index idx_event_outbox_webhook_pending is what keeps that cheap —
+// without it this would scan every dispatched row, which is the largest set in the
+// table.
+//
+// The lease and token this stamps are left in place once MarkWebhookDispatched succeeds,
+// and that is deliberate: the flag alone removes the row from this query's candidate set
+// permanently, no other predicate in this file admits a dispatched row, and clearing the
+// token here would break MarkWebhookDispatched's documented idempotency for the main
+// dual-delivery path, where the token must survive until MarkEventDispatched consumes it.
+//
+// Parameters:
+//   - ctx context.Context: cancels the claim.
+//   - batchSize int: how many rows to claim. Non-positive is rejected, because a zero
+//     LIMIT claims nothing and returns no error, which is indistinguishable from "no
+//     webhook legs are outstanding".
+//   - lockDuration time.Duration: the lease. Non-positive is normalised to
+//     defaultEventClaimLease, since an expired-on-arrival lease lets two relays enqueue
+//     the same webhook.
+//
+// Returns:
+//   - []model.EventOutbox: the claimed rows, oldest occurrence first, each carrying the
+//     claim token MarkWebhookDispatched requires.
+//   - error: a validation error for a non-positive batch, or a wrapped driver error.
+func (d Datasource) ClaimPendingWebhookDeliveries(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClaimPendingWebhookDeliveries")
+	defer span.End()
+
+	if batchSize <= 0 {
+		err := apierror.NewAPIError(apierror.ErrBadRequest, "Webhook delivery claim batch size must be greater than zero", nil)
+		span.RecordError(err)
+		return nil, err
+	}
+
+	if lockDuration <= 0 {
+		logrus.WithField("requested_lock_duration", lockDuration.String()).
+			Warnf("Non-positive webhook delivery lock duration; falling back to %s", defaultEventClaimLease)
+		lockDuration = defaultEventClaimLease
+	}
+
+	claimToken := uuid.NewString()
+
+	span.SetAttributes(
+		attribute.Int("event_outbox.batch_size", batchSize),
+		attribute.String("event_outbox.lock_duration", lockDuration.String()),
+	)
+
+	rows, err := d.Conn.QueryContext(ctx, claimPendingWebhookDeliveriesQuery,
+		lockDuration.String(), claimToken, batchSize)
+	if err != nil {
+		span.RecordError(err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to claim pending webhook deliveries", "claim_pending_webhook_deliveries", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logrus.Errorf("Error closing rows: %v", closeErr)
+		}
+	}()
+
+	var entries []model.EventOutbox
+	for rows.Next() {
+		entry, scanErr := scanEventOutbox(rows)
+		if scanErr != nil {
+			span.RecordError(scanErr)
+			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event outbox entry", "claim_pending_webhook_deliveries", scanErr)
+		}
+		entries = append(entries, entry)
+	}
+
+	if err = rows.Err(); err != nil {
+		span.RecordError(err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event outbox entries", "claim_pending_webhook_deliveries", err)
+	}
+
+	span.SetAttributes(attribute.Int("event_outbox.claimed_count", len(entries)))
+	return entries, nil
+}
+
 // MarkWebhookDispatched records that the legacy HTTP webhook leg was dispatched
 // for this entry, and does so ONLY IF the caller still holds the claim.
 //
@@ -1448,6 +2345,168 @@ func (d Datasource) MarkWebhookDispatched(ctx context.Context, id int64, claimTo
 		return affectedErr
 	}
 	return nil
+}
+
+// MarkEventWebhookPending records that this row's KAFKA leg is complete while its
+// LEGACY WEBHOOK leg is still owed, and decides in the same statement whether another
+// webhook attempt is made or the legacy leg is abandoned.
+//
+// SUNSET: this method goes with the rest of the legacy transport.
+//
+// # The defect it exists to remove
+//
+// The two legs of the dual-delivery window used to share one terminal state. A row
+// whose Kafka publish succeeded was marked dispatched even when the webhook enqueue
+// alongside it had failed, and because dispatched is outside the claim predicate that
+// webhook was never retried and never delivered — permanently, for a transport
+// subscribers had been told would keep working until the sunset, with one warning line
+// as the only trace. The relay's own comment claimed the leg "will be retried on the
+// next claim of this row"; there was no next claim.
+//
+// So the two legs are now tracked independently. kafka_dispatched_at records the Kafka
+// leg, this transition moves the row to webhook_pending, and the claim predicate
+// includes that state so the row IS picked up again. The caller skips the publish for
+// any claimed row carrying kafka_dispatched_at, so retrying the webhook cannot put a
+// duplicate on the Kafka topic.
+//
+// # The budget, and why it is a separate one
+//
+// webhook_attempts is incremented here, never attempts. A webhook receiver being down
+// or a queue being unreachable must not consume a KAFKA retry attempt, because that
+// would let the deprecated transport dead-letter events on the new one. The budget
+// ceiling is nonetheless the row's own max_attempts, so one knob governs both legs
+// and a permanently unreachable queue cannot keep a row claimable forever.
+//
+// The decision is taken in SQL, in the CASE, for the same reason MarkEventFailed's is:
+// two relay instances working one row cannot both conclude they spent the last webhook
+// attempt. In a SET list every right-hand reference reads the OLD value, so both arms
+// agree on the same arithmetic.
+//
+// # What each arm does
+//
+// RETRY arm: status becomes webhook_pending, the lease and token are released so the
+// row can be re-claimed, and next_attempt_at becomes NOW() + retryAfter so the backoff
+// is honoured by every instance rather than by a sleeping goroutine.
+//
+// ABANDON arm: the budget is spent, so the row becomes dispatched and terminal on the
+// strength of its Kafka delivery alone. dispatched_at is stamped, the lease and token
+// are released, and last_error carries the reason — this is a webhook that will never
+// be delivered, and last_error plus the caller's error-level log line are the only
+// record of it.
+//
+// Both arms stamp kafka_dispatched_at through COALESCE, so the first acknowledgement
+// instant is preserved across repeated webhook retries.
+//
+// The accepted prior states are processing and webhook_pending. processing is the
+// ordinary path — the claim moves every row it takes to processing, including rows it
+// took out of webhook_pending — and webhook_pending is accepted so that an honest
+// re-call from the claim holder is idempotent rather than reported as a lost claim.
+//
+// Parameters:
+//   - ctx context.Context: cancels the update.
+//   - id int64: the row's surrogate key.
+//   - claimToken string: the token the claim issued; the update is refused without it.
+//   - errMsg string: why the enqueue failed, stored in last_error.
+//   - retryAfter time.Duration: how long before the row is due again. Applied on the
+//     retry arm only. Non-positive means due immediately.
+//
+// Returns:
+//   - model.EventWebhookOutcome: the resulting status, the new webhook attempt count,
+//     and whether the legacy leg has been abandoned.
+//   - error: the typed claim-lost error when no row matched, or a wrapped driver error.
+func (d Datasource) MarkEventWebhookPending(
+	ctx context.Context,
+	id int64,
+	claimToken, errMsg string,
+	retryAfter time.Duration,
+	record model.BrokerRecord,
+) (model.EventWebhookOutcome, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkEventWebhookPending")
+	defer span.End()
+
+	if retryAfter < 0 {
+		retryAfter = 0
+	}
+
+	span.SetAttributes(
+		attribute.Int64("event_outbox.id", id),
+		attribute.String("event_outbox.retry_after", retryAfter.String()),
+		attribute.String("event_outbox.broker_record", record.String()),
+	)
+
+	if err := requireEventOutboxClaimToken(claimToken, model.EventOutboxStatusWebhookPending); err != nil {
+		span.RecordError(err)
+		return model.EventWebhookOutcome{}, err
+	}
+
+	// COALESCEd for the reason MarkEventDispatched documents: this row's Kafka leg may already
+	// have completed on an earlier claim, and a webhook-only retry carries no coordinate. A
+	// straight assignment would erase the record the first successful publish named.
+	recordTopic, recordPartition, recordOffset := brokerRecordBindings(record)
+
+	var outcome model.EventWebhookOutcome
+	err := d.Conn.QueryRowContext(ctx, `
+		UPDATE blnk.event_outbox
+		SET webhook_attempts = webhook_attempts + 1,
+			kafka_dispatched_at = COALESCE(kafka_dispatched_at, NOW()),
+			kafka_topic = COALESCE($9, kafka_topic),
+			kafka_partition = COALESCE($10, kafka_partition),
+			kafka_offset = COALESCE($11, kafka_offset),
+			last_error = $1,
+			status = CASE
+				WHEN webhook_attempts + 1 >= max_attempts THEN $2
+				ELSE $3
+			END,
+			dispatched_at = CASE
+				WHEN webhook_attempts + 1 >= max_attempts THEN NOW()
+				ELSE dispatched_at
+			END,
+			next_attempt_at = CASE
+				WHEN webhook_attempts + 1 >= max_attempts THEN next_attempt_at
+				ELSE NOW() + $4::interval
+			END,
+			locked_until = NULL,
+			claim_token = NULL
+		WHERE id = $5 AND claim_token = $6 AND status IN ($7, $8)
+		RETURNING status, webhook_attempts
+	`,
+		errMsg,
+		model.EventOutboxStatusDispatched,
+		model.EventOutboxStatusWebhookPending,
+		retryAfter.String(),
+		id,
+		claimToken,
+		model.EventOutboxStatusProcessing,
+		model.EventOutboxStatusWebhookPending,
+		recordTopic,
+		recordPartition,
+		recordOffset,
+	).Scan(&outcome.Status, &outcome.WebhookAttempts)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			lost := eventOutboxClaimLost(id, model.EventOutboxStatusWebhookPending)
+			span.RecordError(lost)
+
+			return model.EventWebhookOutcome{}, lost
+		}
+
+		span.RecordError(err)
+
+		return model.EventWebhookOutcome{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to record the pending legacy webhook leg for event outbox entry", "mark_event_webhook_pending", err)
+	}
+
+	// Derived from the status the database chose, never recomputed, so the two cannot
+	// disagree about which arm was taken.
+	outcome.Abandoned = outcome.Status == model.EventOutboxStatusDispatched
+
+	span.SetAttributes(
+		attribute.String("event_outbox.status", outcome.Status),
+		attribute.Int("event_outbox.webhook_attempts", outcome.WebhookAttempts),
+		attribute.Bool("event_outbox.legacy_leg_abandoned", outcome.Abandoned),
+	)
+
+	return outcome, nil
 }
 
 // PurgeTerminalEventsBefore deletes terminal event rows whose occurrence is older
@@ -1704,6 +2763,84 @@ func (d Datasource) CountEventOutboxByStatus(ctx context.Context) (map[string]in
 
 	span.SetAttributes(attribute.Int("event_outbox.status_count", len(counts)))
 	return counts, nil
+}
+
+// AuditTerminalEventRecords reports how many rows claim a Kafka record and how many of those
+// name the record they produced.
+//
+// # Why counting alone could never prove zero loss
+//
+// The reconciliation compares the outbox against the broker's summed end offsets. Records are a
+// LOWER BOUND on events — a redelivery, a replay or a dead-letter copy writes a second record
+// for one event — so the comparison is directional and a surplus is expected. Its weakness is
+// that the surplus is INDISTINGUISHABLE FROM COMPENSATED LOSS: ten lost events plus ten
+// redeliveries produce exactly the totals of a healthy pipeline, and the verdict reads "no loss"
+// while ten events are genuinely missing.
+//
+// This query reports the mapping instead of a total. Every row that claims a publication either
+// names a coordinate or does not, and a row that does not is counted separately rather than
+// being absorbed. ReconcileAgainstOutbox then refuses to call a verdict conclusive while any
+// remain — which is what makes an undetectable loss impossible rather than merely unlikely.
+//
+// # The three counts, and why each is needed
+//
+//   - PublishedRows counts every row whose Kafka leg completed (kafka_dispatched_at is
+//     stamped, which covers dispatched AND webhook_pending) plus every dead-lettered row,
+//     whose record is on the dead-letter topic. The unique index on event_id is what makes
+//     each row exactly one event.
+//   - ConfirmedRows counts the subset naming a coordinate. COUNT(kafka_offset) does this
+//     directly: SQL COUNT of an expression ignores NULLs, and the all-or-nothing check
+//     constraint means a non-NULL offset implies a complete coordinate.
+//   - DistinctRecords counts the DISTINCT coordinates. It equals ConfirmedRows unless two rows
+//     name the same record, which the partial unique index forbids — so a discrepancy means
+//     that index is absent, and the audit reports the fact rather than assuming the schema is
+//     intact. Two rows sharing one record's corroboration is the same double-counting the whole
+//     mechanism exists to remove.
+//
+// # Why the webhook_pending row is included
+//
+// It HAS been published to Kafka; what is outstanding is the deprecated HTTP leg. Its record is
+// on the topic and contributes to the broker's end offsets, so excluding it would inflate the
+// apparent surplus and loosen the reconciliation during exactly the dual-delivery window when it
+// matters most.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//
+// Returns:
+//   - model.EventOutboxAudit: the counts and the instant they were read.
+//   - error: a logged internal error.
+func (d Datasource) AuditTerminalEventRecords(ctx context.Context) (model.EventOutboxAudit, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "AuditTerminalEventRecords")
+	defer span.End()
+
+	audit := model.EventOutboxAudit{MeasuredAt: time.Now().UTC()}
+
+	err := d.Conn.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*)                                                   AS published_rows,
+			COUNT(kafka_offset)                                        AS confirmed_rows,
+			COUNT(DISTINCT (kafka_topic, kafka_partition, kafka_offset)) AS distinct_records
+		FROM blnk.event_outbox
+		WHERE kafka_dispatched_at IS NOT NULL OR status = $1
+	`, model.EventOutboxStatusDeadLettered).Scan(
+		&audit.PublishedRows, &audit.ConfirmedRows, &audit.DistinctRecords,
+	)
+	if err != nil {
+		span.RecordError(err)
+
+		return model.EventOutboxAudit{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to audit the broker records of published event outbox entries",
+			"audit_terminal_event_records", err)
+	}
+
+	span.SetAttributes(
+		attribute.Int64("event_outbox.published_rows", audit.PublishedRows),
+		attribute.Int64("event_outbox.confirmed_rows", audit.ConfirmedRows),
+		attribute.Int64("event_outbox.unconfirmed_rows", audit.UnconfirmedRows()),
+	)
+
+	return audit, nil
 }
 
 // ---------------------------------------------------------------------------------------

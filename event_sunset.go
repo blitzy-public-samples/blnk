@@ -17,6 +17,8 @@ limitations under the License.
 package blnk
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +49,28 @@ import (
 // compares a clock against the configured sunset date. Callers ask it; they never
 // re-derive the answer. Adding a second comparison anywhere else re-opens exactly
 // the divergence this file exists to prevent.
+//
+// # The window has TWO ends, and dual delivery is gated on both
+//
+// The sunset is one end of a window whose other end is
+// WEBHOOK_DEPRECATION_START_DATE, and requirement R-12 is about the SPAN between
+// them: Kafka publishing and legacy HTTP delivery run concurrently for EXACTLY 30
+// days. A predicate that consulted the sunset alone could not express that span, and
+// the start date existed in configuration while no decision read it — so a
+// deployment whose relay began publishing weeks before its declared start ran dual
+// delivery for weeks longer than 30 days, and the configured start said otherwise
+// with nothing reconciling the two.
+//
+// WebhookDualDeliveryActive is therefore the authoritative predicate for the LEGACY
+// LEG, and it consults both ends: the window is the half-open interval
+// [start, sunset). WebhookSunsetPassed remains the authoritative predicate for the
+// HTTP 410 Gone guard, because a route's availability is a function of the sunset
+// alone — a route that answered 410 before the window opened would refuse calls
+// during a period in which webhooks were still being delivered.
+//
+// The asymmetry is not a divergence: both read the same resolved window from the same
+// helper, and neither compares a clock against a raw configuration string. What they
+// differ on is which BOUNDARY governs the behaviour each of them owns.
 //
 // The one other place that touches the raw value is
 // config.Configuration.resolveWebhookDeprecationWindow, which parses it at load time
@@ -347,6 +371,30 @@ func WebhookSunsetDate() (time.Time, bool) {
 func WebhookSunsetPassed(now time.Time) bool {
 	sunset, resolution := resolveWebhookSunset()
 
+	return webhookSunsetPassedFor(sunset, resolution, now)
+}
+
+// webhookSunsetPassedFor is the sunset comparison itself, separated from where the
+// configuration came from.
+//
+// THIS IS THE ONLY PLACE IN THE CODEBASE THAT COMPARES AN INSTANT TO THE SUNSET. It is
+// factored out so that a caller holding a configuration value — the event-capture gate,
+// which must judge the deployment it was handed rather than the global store — reaches
+// the same comparison as a caller reading live configuration, instead of writing a
+// second one that can drift from it.
+//
+// Parameters:
+//   - sunset time.Time: the resolved sunset instant. Meaningful only with sunsetResolved.
+//   - resolution webhookSunsetResolution: which of the three situations applies.
+//   - now time.Time: the instant to evaluate.
+//
+// Returns:
+//   - bool: true when the sunset has passed, including the fail-closed arm.
+func webhookSunsetPassedFor(
+	sunset time.Time,
+	resolution webhookSunsetResolution,
+	now time.Time,
+) bool {
 	switch resolution {
 	case sunsetResolved:
 		return !now.UTC().Before(sunset)
@@ -375,4 +423,256 @@ func WebhookSunsetPassed(now time.Time) bool {
 //     is at or after it.
 func WebhookSunsetPassedNow() bool {
 	return WebhookSunsetPassed(time.Now())
+}
+
+// ---------------------------------------------------------------------------
+// THE DUAL-DELIVERY WINDOW — both ends of it
+// ---------------------------------------------------------------------------
+
+// WebhookWindowState is where a given instant falls relative to the dual-delivery
+// window.
+//
+// It is four states rather than a boolean because the three ways dual delivery can be
+// OFF call for three different operator responses, and collapsing them would make the
+// most dangerous of them look like the most ordinary. "The window has not opened yet"
+// is a misconfiguration to correct; "the window has closed" is the intended end state;
+// "there is no usable window" is a failure that has been failed closed.
+type WebhookWindowState int
+
+const (
+	// WebhookWindowActive means the instant is inside [start, sunset): both transports
+	// run, driven from the same claimed outbox row.
+	WebhookWindowActive WebhookWindowState = iota
+
+	// WebhookWindowPending means the instant is BEFORE the configured start.
+	//
+	// It is a misconfiguration rather than a phase: reaching it means the process is
+	// publishing to Kafka before the window it declared has opened, so the actual
+	// concurrent-delivery period will be longer than the 30 days subscribers were told
+	// about. The relay refuses to START in this state — see its startup obstacle —
+	// which is what keeps the state from silently suppressing legacy deliveries to
+	// subscribers who have not migrated yet.
+	WebhookWindowPending
+
+	// WebhookWindowClosed means the instant is AT OR AFTER the sunset. Kafka is the
+	// only transport, and the deprecated webhook routes answer 410 Gone.
+	WebhookWindowClosed
+
+	// WebhookWindowUnavailable means configuration describes no usable window: either
+	// nothing is configured at all (the graceful-degradation state of a deployment
+	// without Kafka, where there is no window because there is no migration), or
+	// publishing is configured and the window is missing or unparseable, which fails
+	// closed.
+	WebhookWindowUnavailable
+)
+
+// String renders the state for logs and error messages.
+//
+// Returns:
+//   - string: the state's name, lower-case and stable, safe to use as a log field
+//     value and to assert on.
+func (s WebhookWindowState) String() string {
+	switch s {
+	case WebhookWindowActive:
+		return "active"
+	case WebhookWindowPending:
+		return "pending"
+	case WebhookWindowClosed:
+		return "closed"
+	case WebhookWindowUnavailable:
+		return "unavailable"
+	default:
+		return "unknown"
+	}
+}
+
+// webhookWindowStart resolves the instant the dual-delivery window opens.
+//
+// The configured start is used when it is present and parses. When it is absent or
+// malformed the start is DERIVED as sunset minus the 30-day window, which is exactly
+// what config.Configuration.resolveWebhookDeprecationWindow does when only the sunset
+// is supplied. Deriving rather than failing is what makes the window computable from
+// either end alone, and it is why a deployment — or a test — that configures only
+// WEBHOOK_DEPRECATION_SUNSET_DATE still has a fully determined window rather than one
+// with an open beginning.
+//
+// A malformed start is warned about once per distinct value, through the same guard
+// the sunset parse uses, because this is consulted on the relay's hot path.
+//
+// Parameters:
+//   - cnf *config.Configuration: the configuration to read. May be nil.
+//   - sunset time.Time: the already-resolved sunset instant, used to derive the start.
+//
+// Returns:
+//   - time.Time: the window's opening instant in UTC.
+func webhookWindowStart(cnf *config.Configuration, sunset time.Time) time.Time {
+	derived := sunset.Add(-config.WebhookDualDeliveryWindow())
+
+	if cnf == nil {
+		return derived
+	}
+
+	raw := strings.TrimSpace(cnf.WebhookDeprecationStartDate)
+	if raw == "" {
+		return derived
+	}
+
+	parsed, err := time.Parse(webhookSunsetLayout, raw)
+	if err != nil {
+		if startParseWarnings.shouldWarn(raw) {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"value":         raw,
+				"expected":      webhookSunsetLayout,
+				"derived_start": derived.Format(webhookSunsetLayout),
+			}).Warn(
+				"webhook_deprecation_start_date is not a valid RFC3339 instant and is being " +
+					"ignored; the window start is derived from the sunset instead. Correct the value",
+			)
+		}
+
+		return derived
+	}
+
+	return parsed.UTC()
+}
+
+// startParseWarnings guards the malformed-start-date warning, independently of the
+// sunset's guard so that correcting one date does not suppress the warning about the
+// other.
+var startParseWarnings = &sunsetWarnGuard{}
+
+// WebhookDualDeliveryWindowState reports where now falls relative to the window.
+//
+// It is the one resolution both dual-delivery callers share, and it re-reads live
+// configuration on every call for the same reasons WebhookSunsetPassed does.
+//
+// Parameters:
+//   - now time.Time: the instant to place. A parameter rather than an internal clock
+//     read so callers, and the tests that pin the boundaries to the nanosecond,
+//     control it.
+//
+// Returns:
+//   - WebhookWindowState: which of the four states applies.
+func WebhookDualDeliveryWindowState(now time.Time) WebhookWindowState {
+	sunset, resolution := resolveWebhookSunset()
+	if resolution != sunsetResolved {
+		return WebhookWindowUnavailable
+	}
+
+	instant := now.UTC()
+	if !instant.Before(sunset) {
+		return WebhookWindowClosed
+	}
+
+	cnf, err := fetchConfiguration()
+	if err != nil {
+		// The sunset resolved, so configuration was readable a moment ago; this can
+		// only be a store that has since been emptied, which is not a reachable
+		// production state. Deriving the start from the sunset keeps the verdict
+		// determined rather than inventing a failure.
+		cnf = nil
+	}
+
+	if instant.Before(webhookWindowStart(cnf, sunset)) {
+		return WebhookWindowPending
+	}
+
+	return WebhookWindowActive
+}
+
+// WebhookDualDeliveryActive reports whether the LEGACY HTTP LEG must run for an event
+// being dispatched at now.
+//
+// This is the authoritative predicate for the relay's dual-delivery branch, and it is
+// the only one that answers the question requirement R-12 actually asks: are both
+// transports supposed to be running at this instant? It is true only inside
+// [start, sunset) — so it is false before the window opens, false from the sunset
+// instant onwards, and false when no usable window is configured.
+//
+// It must be consulted IMMEDIATELY BEFORE each enqueue rather than once per batch. A
+// batch claimed a second before the sunset takes time to publish, and a decision taken
+// at the top of it would enqueue legacy deliveries after the boundary had passed — the
+// one behaviour the sunset is defined to prevent.
+//
+// Parameters:
+//   - now time.Time: the instant to evaluate.
+//
+// Returns:
+//   - bool: true only when now is inside the configured window.
+func WebhookDualDeliveryActive(now time.Time) bool {
+	return WebhookDualDeliveryWindowState(now) == WebhookWindowActive
+}
+
+// WebhookDeprecationWindow returns the resolved window, for callers that need to
+// DESCRIBE it rather than decide with it — a startup log line, or the error a relay
+// refuses to start with.
+//
+// Returns:
+//   - time.Time: the start instant in UTC.
+//   - time.Time: the sunset instant in UTC.
+//   - bool: true only when a sunset is configured and parses, in which case both
+//     instants are meaningful. When false, both are zero and must not be rendered.
+func WebhookDeprecationWindow() (time.Time, time.Time, bool) {
+	sunset, resolution := resolveWebhookSunset()
+	if resolution != sunsetResolved {
+		return time.Time{}, time.Time{}, false
+	}
+
+	cnf, err := fetchConfiguration()
+	if err != nil {
+		cnf = nil
+	}
+
+	return webhookWindowStart(cnf, sunset), sunset, true
+}
+
+// WebhookWindowPendingObstacle describes why a process must not begin publishing to Kafka
+// before the dual-delivery window opens, or nil when the state is anything else.
+//
+// SUNSET: goes with the legacy leg.
+//
+// # Why this lives here rather than at the call site
+//
+// The message names WEBHOOK_DEPRECATION_START_DATE and quotes both ends of the window, and
+// this file is the single owner of the window — including the vocabulary for explaining it.
+// A relay that composed this message itself would be a second place that knew what the
+// configured dates are called, and the invariant test that keeps every raw read in one file
+// would rightly reject it.
+//
+// # Why the state is a parameter
+//
+// The caller has already resolved it, through whichever seam it uses, and resolving it a
+// second time here could produce a different answer on a clock boundary — so the caller's
+// verdict is the one explained.
+//
+// Parameters:
+//   - state WebhookWindowState: the state the caller resolved.
+//
+// Returns:
+//   - error: non-nil only for WebhookWindowPending. The message names both ends of the
+//     window, the variable to correct, and the two acceptable ways forward.
+func WebhookWindowPendingObstacle(state WebhookWindowState) error {
+	if state != WebhookWindowPending {
+		return nil
+	}
+
+	start, sunset, resolved := WebhookDeprecationWindow()
+	if !resolved {
+		// Unreachable: WebhookWindowPending is only ever returned for a window that
+		// resolved. Reported without dates rather than not reported at all.
+		return errors.New(
+			"the dual-delivery window has not opened yet, so publishing to Kafka now would " +
+				"deliver no legacy webhooks: correct WEBHOOK_DEPRECATION_START_DATE",
+		)
+	}
+
+	return fmt.Errorf(
+		"the dual-delivery window opens at %s and has not opened yet, so publishing to Kafka now "+
+			"would enqueue no legacy webhooks and would run the two transports concurrently for "+
+			"longer than the %d days ending %s. Correct WEBHOOK_DEPRECATION_START_DATE to when "+
+			"this deployment actually begins publishing, or do not publish until then",
+		start.Format(webhookSunsetLayout),
+		config.WebhookDualDeliveryWindowDays,
+		sunset.Format(webhookSunsetLayout),
+	)
 }

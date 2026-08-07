@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-version: "3.8"
 
+# NO top-level "version" key. It has been ignored by every Compose release since
+# v2 and Compose warns that it is obsolete; the file is validated against the
+# Compose Specification, which the presence of a version does not change.
 services:
   server:
     build: .
@@ -22,31 +24,71 @@ services:
       TZ: ${TZ:-Etc/UTC}
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
       # Kafka event publishing and the outbox relay. Every name below is the bare,
-      # un-prefixed form .env.example declares, which is the mandated contract:
-      # envconfig consults the raw tag literal as an alternate key, and
-      # config.applyPrefixedEnvAliases additionally overlays the BLNK_-prefixed
-      # alias, so either spelling resolves and the prefixed one wins. Values are
-      # interpolated from .env and never inlined here.
+      # un-prefixed form .env.example declares, which is the mandated contract.
+      # Values are interpolated from .env and never inlined here.
       #
-      # KAFKA_BROKERS DEFAULTS TO EMPTY, DELIBERATELY. An empty broker list is a
-      # legitimate steady state, not an error: the event publisher resolves to its
-      # no-op implementation and Blnk starts, serves and processes transactions
-      # exactly as it did before Kafka existed, which is what keeps every existing
-      # deployment working after this change. Set KAFKA_BROKERS=kafka:9092 in .env to
-      # publish — and set a webhook deprecation date with it, because Blnk REFUSES TO
-      # START with brokers configured and no dual-delivery window described.
+      # THE BLNK_-PREFIXED ALIASES ARE PASSED SEPARATELY, further down, and they have
+      # to be: config.applyPrefixedEnvAliases decides on PRESENCE, not on
+      # non-emptiness, so writing `BLNK_KAFKA_BROKERS: ${BLNK_KAFKA_BROKERS:-}` here
+      # would set an EMPTY prefixed value in the container and silently override the
+      # bare one below. See the BLNK_ block for the form that avoids that.
+      #
+      # AN EMPTY BROKER LIST IS THE SHIPPED DEFAULT AND A LEGITIMATE STEADY STATE, not
+      # an error: the event publisher resolves to its no-op implementation and Blnk
+      # starts, serves and processes transactions exactly as it did before Kafka
+      # existed. That is what lets this file be the default for every deployment,
+      # including the ones that publish nothing.
+      #
+      # PUBLISHING IS THEREFORE OPT-IN IN TWO HALVES, and both are needed. Select the
+      # "kafka" profile so a broker exists (see the kafka service below), and set
+      # KAFKA_BROKERS=kafka:9092 in .env so the application speaks to it. Selecting the
+      # profile alone gives a provisioned broker Blnk ignores; setting this alone gives
+      # a relay retrying against nothing. Defaulting it to the broker here would make
+      # the second mistake the DEFAULT, which is why it is left empty.
       KAFKA_BROKERS: ${KAFKA_BROKERS:-}
+      # THE SUBSCRIBER-FACING LIST, and deliberately not KAFKA_BROKERS. That one is
+      # "kafka:9092" — reachable on this compose network and nowhere else — so
+      # reporting it to a subscriber would return an endpoint it cannot dial. The
+      # broker advertises its EXTERNAL listener as localhost:9092, published on the
+      # host below, and that is what a subscriber connects to. Issuance refuses with
+      # 503 rather than falling back when this is empty.
+      KAFKA_SUBSCRIBER_BROKERS: ${KAFKA_SUBSCRIBER_BROKERS:-localhost:9092}
       KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-blnk}
-      # Steady-state producer principal. Keep it distinct from the administrative
-      # pair below: a publisher that authenticates as the administrator holds
-      # authority to create topics, mint SCRAM credentials and rewrite ACLs.
-      KAFKA_SASL_USER: ${KAFKA_SASL_USER:-}
-      KAFKA_SASL_SECRET: ${KAFKA_SASL_SECRET:-}
+      # Steady-state producer principal — the identity Blnk publishes ledger events
+      # as, and deliberately NOT the administrator. A publisher authenticating as the
+      # administrator holds authority to create topics, mint SCRAM credentials and
+      # rewrite ACLs, so a leaked producer credential would compromise the cluster's
+      # access model rather than merely permit publishing. The Go publisher REFUSES to
+      # borrow the administrative pair unless KAFKA_ALLOW_ADMIN_PRODUCER is set
+      # deliberately, so this pair is required once KAFKA_BROKERS is non-empty.
+      #
+      # It falls back to KAFKA_PRODUCER_*, the names kafka-init provisions the
+      # principal under, so that .env carries the producer credential exactly ONCE and
+      # the provisioning run, the server and the worker cannot drift apart.
+      KAFKA_SASL_USER: ${KAFKA_SASL_USER:-${KAFKA_PRODUCER_USER:-}}
+      KAFKA_SASL_SECRET: ${KAFKA_SASL_SECRET:-${KAFKA_PRODUCER_SECRET:-}}
       # Administrative principal, used for topic assurance, subscriber credential
-      # provisioning, ACL grants and the offset reads behind reconciliation. The
-      # defaults are the local broker's bootstrap pair (see the kafka service).
-      KAFKA_SASL_ADMIN_USER: ${KAFKA_SASL_ADMIN_USER:-admin}
-      KAFKA_SASL_ADMIN_SECRET: ${KAFKA_SASL_ADMIN_SECRET:-blnk-local-dev-admin-secret}
+      # provisioning, ACL grants and the offset reads behind the consumer-lag metrics.
+      # Given to the SERVER ONLY: cmd/server.go is the one process that builds an admin
+      # client, and the worker below deliberately does not receive this pair.
+      #
+      # The secret has no default. See the kafka service below for why a known
+      # superuser password is not an acceptable local convenience.
+      KAFKA_SASL_ADMIN_USER: ${KAFKA_SASL_ADMIN_USER:-}
+      # NO DEFAULT, DELIBERATELY. A shipped placeholder here would be a Kafka SUPERUSER
+      # password readable in this file, on a broker published to the host. Anyone who
+      # could reach the port could create topics, mint SCRAM credentials for any
+      # principal and rewrite every ACL, including granting themselves Read on every
+      # subscriber's events. A credential that is in the source is not a credential, and
+      # naming the old placeholder even in a comment reintroduces the string a scanner
+      # has to triage.
+      #
+      # Empty is safe rather than convenient: with the kafka profile inactive nothing reads
+      # it, and with the profile active scripts/kafka-bootstrap.sh refuses an empty admin
+      # secret by name, so the failure is loud, immediate and local to the broker instead of
+      # being a silent authentication failure later. Run "./stack.sh --init" to generate a
+      # per-stack pair into a mode-0600 .env.
+      KAFKA_SASL_ADMIN_SECRET: ${KAFKA_SASL_ADMIN_SECRET:-}
       # Transport security. Both Kafka clients refuse to dial unless one of the first
       # two is set explicitly, so a deployment must choose in writing between verified
       # TLS and acknowledged plaintext. The local broker listens on SASL_PLAINTEXT,
@@ -60,37 +102,83 @@ services:
       KAFKA_TLS_ENABLED: ${KAFKA_TLS_ENABLED:-false}
       KAFKA_INSECURE_LOCAL_DEV: ${KAFKA_INSECURE_LOCAL_DEV:-true}
       KAFKA_TLS_INSECURE_SKIP_VERIFY: ${KAFKA_TLS_INSECURE_SKIP_VERIFY:-false}
-      # Topic geometry. Shared with scripts/kafka-provision.sh rather than duplicated,
-      # so assurance at runtime and provisioning at bring-up agree. The replication
-      # factor is 1 here because a single-broker KRaft cluster cannot satisfy 3; the
-      # Kubernetes manifests supply 3 through this same variable.
-      #
-      # Partition growth stays off: raising the count of a topic that already holds
-      # messages re-maps keys to partitions, so one aggregate's history splits across
-      # two and its events can be consumed out of order. Assurance reports instead.
+      # Topic geometry, shared with scripts/kafka-provision.sh. The replication factor
+      # is 1 here because a single-broker KRaft cluster cannot satisfy 3; the Kubernetes
+      # manifests supply 3 through this same variable. Partition growth stays off:
+      # growing a topic that holds messages re-maps keys to partitions, which splits one
+      # aggregate's history across two.
       KAFKA_MIN_PARTITIONS: ${KAFKA_MIN_PARTITIONS:-6}
       KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-1}
       KAFKA_ALLOW_PARTITION_GROWTH: ${KAFKA_ALLOW_PARTITION_GROWTH:-false}
       # The 30-day dual-delivery window. Give either end and the other is derived, so
       # "exactly 30 days" is a property of the code and not of your arithmetic. Both
       # may be left empty only while KAFKA_BROKERS is empty.
-      WEBHOOK_DEPRECATION_START_DATE: ${WEBHOOK_DEPRECATION_START_DATE:-}
       WEBHOOK_DEPRECATION_SUNSET_DATE: ${WEBHOOK_DEPRECATION_SUNSET_DATE:-}
-      # Bounded exponential backoff for the outbox-to-Kafka relay: at most 5 attempts
-      # spaced 1s, 2s, 4s, 8s, 16s, capped at 30s. Every attempt is logged with its
-      # number and error reason; on exhaustion the event is dead-lettered.
+      # Bounded exponential backoff for the outbox-to-Kafka relay: at most 5 publish
+      # attempts, separated by FOUR waits of 1s, 2s, 4s and 8s — 15s of backoff in
+      # total — each persisted as the row's next due instant rather than slept. The
+      # 30s cap is out of reach at these settings (the delay after a fifth failure
+      # would be 16s, and there is no sixth attempt), so it only engages once the base
+      # delay or the attempt count is raised. Every attempt is logged with its number
+      # and error reason; on exhaustion the event is dead-lettered.
       RELAY_MAX_RETRY_ATTEMPTS: ${RELAY_MAX_RETRY_ATTEMPTS:-5}
       RELAY_RETRY_BASE_BACKOFF_MS: ${RELAY_RETRY_BASE_BACKOFF_MS:-1000}
       RELAY_RETRY_MAX_BACKOFF_MS: ${RELAY_RETRY_MAX_BACKOFF_MS:-30000}
+      #
+      # THE BLNK_-PREFIXED ALIASES.
+      #
+      # config/config.go documents every key above as resolvable under a BLNK_ prefix
+      # too, with the prefixed form winning when both are set, and .env.example says the
+      # same. That promise held for a process started directly on a host and NOT for one
+      # started by compose, because nothing here forwarded the prefixed names: a
+      # BLNK_-prefixed value in .env reached no container and the deployment silently got
+      # default behaviour, with no error to explain why nothing was published.
+      #
+      # THE MISSING VALUE AFTER EACH COLON IS THE WHOLE MECHANISM, not an oversight. A
+      # key with no value is compose's pass-through form: the variable is copied from
+      # .env or the shell when it is set there, and is left ENTIRELY ABSENT from the
+      # container when it is not. `${NAME:-}` would instead set it to the empty string,
+      # and because applyPrefixedEnvAliases decides on os.LookupEnv — presence, not
+      # non-emptiness — an empty prefixed value WINS over the bare name and blanks it.
+      # Passing the aliases the obvious way would therefore disable the whole block.
+      #
+      # Do not add a `${...}` to any line below.
+      BLNK_KAFKA_BROKERS:
+      BLNK_KAFKA_TOPIC_PREFIX:
+      BLNK_KAFKA_SASL_USER:
+      BLNK_KAFKA_SASL_SECRET:
+      BLNK_KAFKA_SASL_ADMIN_USER:
+      BLNK_KAFKA_SASL_ADMIN_SECRET:
+      BLNK_KAFKA_TLS_ENABLED:
+      BLNK_KAFKA_INSECURE_LOCAL_DEV:
+      BLNK_KAFKA_TLS_INSECURE_SKIP_VERIFY:
+      BLNK_KAFKA_MIN_PARTITIONS:
+      BLNK_KAFKA_REPLICATION_FACTOR:
+      BLNK_KAFKA_ALLOW_PARTITION_GROWTH:
+      BLNK_WEBHOOK_DEPRECATION_SUNSET_DATE:
+      BLNK_RELAY_MAX_RETRY_ATTEMPTS:
+      BLNK_RELAY_RETRY_BASE_BACKOFF_MS:
+      BLNK_RELAY_RETRY_MAX_BACKOFF_MS:
     ports:
       - "5001:5001"
       - "80:80"
       - "443:443"
-    # The kafka entry is the long map form because only that form can carry a
-    # condition, and the condition is the point: the outbox relay starts with this
-    # process, so a broker that is merely created rather than listening would have the
-    # relay's first publish fail and retry against nothing. The other three keep the
-    # semantics the short list form gave them.
+    # The kafka entries are the long map form because only that form can carry a
+    # condition, and the conditions are the point.
+    #
+    #   kafka: service_healthy — the outbox relay starts with this process, so a broker
+    #   that is merely created rather than listening would have the relay's first publish
+    #   fail and retry against nothing.
+    #
+    #   kafka-init: service_completed_successfully — the topic catalogue and the sample
+    #   subscriber principal exist only once provisioning has run. The application does
+    #   assure its own topics at start-up (startEventRelay in cmd/server.go calls
+    #   EnsureTopics before starting the relay), so this gate is not what makes the topics
+    #   exist; what it buys is that a provisioning FAILURE is visible at bring-up instead
+    #   of surfacing minutes later as dead letters, and that only one of the two creators
+    #   is racing to create the eight topics on a cold start.
+    #
+    # The other three keep the semantics the short list form gave them.
     depends_on:
       redis:
         condition: service_started
@@ -100,6 +188,31 @@ services:
         condition: service_started
       kafka:
         condition: service_healthy
+        # required: false IS WHAT MAKES KAFKA OPT-IN, and it is the other half of the
+        # "profiles" key on the kafka and kafka-init services below.
+        #
+        # These two conditions used to be unconditional, and that broke the steady state
+        # this file documents three paragraphs above: KAFKA_BROKERS defaults to empty, the
+        # publisher resolves to its no-op, and Blnk is meant to start and serve exactly as
+        # it did before Kafka existed — but "docker compose up" still refused to start this
+        # service until a broker it was never going to talk to had passed a SASL healthcheck
+        # and a provisioning one-shot had completed. A deployment that does not publish
+        # events was blocked on infrastructure it does not use.
+        #
+        # With the two services behind the "kafka" profile they are not in the enabled set
+        # unless the profile is selected, and "required: false" tells Compose that a
+        # dependency outside the enabled set is not an error. So:
+        #
+        #   docker compose up                    -> no broker, no gate, Blnk starts no-op
+        #   docker compose --profile kafka up     -> broker starts, BOTH conditions apply
+        #
+        # The conditions are NOT weakened in the second case, which is the point: opting in
+        # still means waiting for a broker that is listening and answering authenticated
+        # requests, and for provisioning to have completed successfully.
+        required: false
+      kafka-init:
+        condition: service_completed_successfully
+        required: false
     volumes:
       - ./blnk.json:/blnk.json
 
@@ -110,31 +223,73 @@ services:
     entrypoint: ["blnk", "workers"]
     environment:
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
-      # The same event-streaming configuration the server receives, and deliberately
-      # the same values: the worker publishes events too — transaction.rejected is
-      # emitted from its rejection handler — and it must resolve the same topics with
-      # the same principal. Both processes read one .env, so they cannot disagree.
-      # See the server service above for what each key does and why the broker list
-      # defaults to empty.
+      # The same event-streaming configuration the server receives, with ONE deliberate
+      # difference: no administrative credential. The worker publishes events too —
+      # transaction.rejected is emitted from its rejection handler — so it needs the
+      # same topics and the same PRODUCER principal, and both processes read one .env
+      # so they cannot disagree about either. See the server service above for what
+      # each key does.
+      #
+      # KAFKA_SASL_ADMIN_USER AND KAFKA_SASL_ADMIN_SECRET ARE ABSENT ON PURPOSE. The
+      # worker performs no administrative work whatsoever: topic assurance, subscriber
+      # credential provisioning, ACL management and the offset reads behind consumer-lag
+      # measurement all run in the SERVER role, which is where the admin client is
+      # built. Handing a process a cluster-superuser credential it never uses only
+      # widens what a compromise of that process is worth. If a future change gives the
+      # worker administrative work, add the pair back in the same change that adds the
+      # work — not in advance.
       KAFKA_BROKERS: ${KAFKA_BROKERS:-}
+      # THE SUBSCRIBER-FACING LIST, and deliberately not KAFKA_BROKERS. That one is
+      # "kafka:9092" — reachable on this compose network and nowhere else — so
+      # reporting it to a subscriber would return an endpoint it cannot dial. The
+      # broker advertises its EXTERNAL listener as localhost:9092, published on the
+      # host below, and that is what a subscriber connects to. Issuance refuses with
+      # 503 rather than falling back when this is empty.
+      KAFKA_SUBSCRIBER_BROKERS: ${KAFKA_SUBSCRIBER_BROKERS:-localhost:9092}
       KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-blnk}
-      KAFKA_SASL_USER: ${KAFKA_SASL_USER:-}
-      KAFKA_SASL_SECRET: ${KAFKA_SASL_SECRET:-}
-      KAFKA_SASL_ADMIN_USER: ${KAFKA_SASL_ADMIN_USER:-admin}
-      KAFKA_SASL_ADMIN_SECRET: ${KAFKA_SASL_ADMIN_SECRET:-blnk-local-dev-admin-secret}
+      # The producer pair, resolved exactly as the server resolves it. The administrative
+      # pair is DELIBERATELY ABSENT from this service: the worker publishes and never
+      # administers, so it needs no authority to create topics, mint credentials or rewrite
+      # ACLs. Only cmd/server.go builds an admin client — for topic assurance before the
+      # relay starts, and for the offset reads behind reconciliation — so handing the
+      # superuser credential to a second process would widen the credential's exposure for
+      # no capability it uses. config.KafkaConfig accepts an empty admin pair; what it
+      # refuses is a HALF-configured one.
+      KAFKA_SASL_USER: ${KAFKA_SASL_USER:-${KAFKA_PRODUCER_USER:-}}
+      KAFKA_SASL_SECRET: ${KAFKA_SASL_SECRET:-${KAFKA_PRODUCER_SECRET:-}}
       KAFKA_TLS_ENABLED: ${KAFKA_TLS_ENABLED:-false}
       KAFKA_INSECURE_LOCAL_DEV: ${KAFKA_INSECURE_LOCAL_DEV:-true}
       KAFKA_TLS_INSECURE_SKIP_VERIFY: ${KAFKA_TLS_INSECURE_SKIP_VERIFY:-false}
       KAFKA_MIN_PARTITIONS: ${KAFKA_MIN_PARTITIONS:-6}
       KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-1}
       KAFKA_ALLOW_PARTITION_GROWTH: ${KAFKA_ALLOW_PARTITION_GROWTH:-false}
-      WEBHOOK_DEPRECATION_START_DATE: ${WEBHOOK_DEPRECATION_START_DATE:-}
       WEBHOOK_DEPRECATION_SUNSET_DATE: ${WEBHOOK_DEPRECATION_SUNSET_DATE:-}
       RELAY_MAX_RETRY_ATTEMPTS: ${RELAY_MAX_RETRY_ATTEMPTS:-5}
       RELAY_RETRY_BASE_BACKOFF_MS: ${RELAY_RETRY_BASE_BACKOFF_MS:-1000}
       RELAY_RETRY_MAX_BACKOFF_MS: ${RELAY_RETRY_MAX_BACKOFF_MS:-30000}
+      # The BLNK_-prefixed aliases, in compose's pass-through form. See the server
+      # service for why there is no `${...}` after these colons and what breaks if one
+      # is added. The administrative pair is absent here for the same reason its bare
+      # form is.
+      BLNK_KAFKA_BROKERS:
+      BLNK_KAFKA_TOPIC_PREFIX:
+      BLNK_KAFKA_SASL_USER:
+      BLNK_KAFKA_SASL_SECRET:
+      BLNK_KAFKA_TLS_ENABLED:
+      BLNK_KAFKA_INSECURE_LOCAL_DEV:
+      BLNK_KAFKA_TLS_INSECURE_SKIP_VERIFY:
+      BLNK_KAFKA_MIN_PARTITIONS:
+      BLNK_KAFKA_REPLICATION_FACTOR:
+      BLNK_KAFKA_ALLOW_PARTITION_GROWTH:
+      BLNK_WEBHOOK_DEPRECATION_SUNSET_DATE:
+      BLNK_RELAY_MAX_RETRY_ATTEMPTS:
+      BLNK_RELAY_RETRY_BASE_BACKOFF_MS:
+      BLNK_RELAY_RETRY_MAX_BACKOFF_MS:
     ports:
       - "5004:5004"
+    # The same two Kafka conditions the server carries, for the same reasons: this process
+    # publishes events too — transaction.rejected comes from its rejection handler — and it
+    # must not start against a broker that has not been provisioned.
     depends_on:
       redis:
         condition: service_started
@@ -144,6 +299,31 @@ services:
         condition: service_started
       kafka:
         condition: service_healthy
+        # required: false IS WHAT MAKES KAFKA OPT-IN, and it is the other half of the
+        # "profiles" key on the kafka and kafka-init services below.
+        #
+        # These two conditions used to be unconditional, and that broke the steady state
+        # this file documents three paragraphs above: KAFKA_BROKERS defaults to empty, the
+        # publisher resolves to its no-op, and Blnk is meant to start and serve exactly as
+        # it did before Kafka existed — but "docker compose up" still refused to start this
+        # service until a broker it was never going to talk to had passed a SASL healthcheck
+        # and a provisioning one-shot had completed. A deployment that does not publish
+        # events was blocked on infrastructure it does not use.
+        #
+        # With the two services behind the "kafka" profile they are not in the enabled set
+        # unless the profile is selected, and "required: false" tells Compose that a
+        # dependency outside the enabled set is not an error. So:
+        #
+        #   docker compose up                    -> no broker, no gate, Blnk starts no-op
+        #   docker compose --profile kafka up     -> broker starts, BOTH conditions apply
+        #
+        # The conditions are NOT weakened in the second case, which is the point: opting in
+        # still means waiting for a broker that is listening and answering authenticated
+        # requests, and for provisioning to have completed successfully.
+        required: false
+      kafka-init:
+        condition: service_completed_successfully
+        required: false
     volumes:
       - ./blnk.json:/blnk.json
 
@@ -156,18 +336,16 @@ services:
     volumes:
       - ./blnk.json:/blnk.json
 
-  # Redis stays, and stays unchanged. It carries TRANSACTION_QUEUE and every other
-  # queue sharing the same asynq server — including the webhook queue, which outlives
-  # the webhook transport because the hooks subsystem and the search indexer enqueue
-  # onto it by name. Nothing about the move to Kafka retires it.
+  # Redis stays, and stays unchanged. It carries TRANSACTION_QUEUE and the webhook
+  # queue, which outlives the webhook transport because the hooks subsystem and the
+  # search indexer enqueue onto it by name.
   redis:
     image: redis:7.2.4
     container_name: redis
 
-  # Single-broker Kafka in KRaft mode with SASL/SCRAM authentication and enforced
-  # ACLs, so the event-publishing pipeline can be exercised locally exactly as it runs
-  # in production: the same topic catalogue, the same mechanism and the same
-  # authorization model, differing only in broker count and in transport encryption.
+  # Single-broker Kafka in KRaft mode with SASL/SCRAM and enforced ACLs, so the event
+  # pipeline runs locally with the production topic catalogue, mechanism and
+  # authorization model.
   #
   # THE IMAGE TAG IS A FLOOR AT BOTH ENDS, NOT A PREFERENCE, AND NEVER "latest".
   #
@@ -177,80 +355,139 @@ services:
   #   can authenticate anyone at all, so an image below that floor cannot be
   #   bootstrapped and local bring-up fails outright rather than degrading.
   #
-  #   SECURITY. Every release from 0.11.0 up to but not including 3.9.2, and 4.0.0, is
-  #   affected by CVE-2026-33558: the NetworkClient renders whole requests and
-  #   responses at DEBUG level, and SASL credentials, SCRAM salts and salted passwords
-  #   are recoverable from a log file. 4.1.0 and 4.1.1 carry CVE-2026-33557 instead, a
-  #   JWT validation bypass, so 3.9.2 is the conservative patched choice for a stack
-  #   that needs only SCRAM. Moving to a 4.x line means 4.0.1 or later than 4.1.1, and
-  #   re-running the SCRAM, KRaft and ACL checks.
+  #   SECURITY. 3.9.2 is the version this stack is TESTED against and is patched for
+  #   CVE-2026-33558, under which the NetworkClient renders whole requests and responses
+  #   at DEBUG level so that SASL credentials, SCRAM salts and salted passwords are
+  #   recoverable from a log file. Every release from 0.11.0 up to but not including
+  #   3.9.2, and 4.0.0, is affected.
+  #
+  # NO "SAFE UPGRADE TARGET" IS NAMED HERE, deliberately. A version written into a
+  # comment as the safe one is correct on the day it is written and wrong from the next
+  # advisory onward, and a stale recommendation is worse than none because it is read as
+  # current: this comment previously named 4.0.1, which a later advisory superseded.
+  # What is durable is the FUNCTIONAL FLOOR above, the tested pin below, and where to
+  # check — https://kafka.apache.org/cve-list. Any move off the pin means re-running the
+  # SCRAM bootstrap, the KRaft formatting and the ACL enforcement checks, because those
+  # are what this stack depends on and what a major version can change.
   #
   # Keep this default in step with KAFKA_IMAGE in .env.example.
   kafka:
+    # OPT-IN, through the same mechanism the prometheus service already uses in this file.
+    #
+    # Kafka is not part of the default stack because Blnk's documented steady state is an
+    # empty KAFKA_BROKERS and a no-op publisher. Starting a broker, formatting KRaft storage
+    # and provisioning eight topics on every "docker compose up" imposed that cost — and,
+    # through the depends_on conditions on server and worker, that FAILURE MODE — on every
+    # deployment, including the ones that never publish an event.
+    #
+    #   docker compose up                                 -> no Kafka at all
+    #   docker compose --profile kafka up                 -> broker + provisioning
+    #   COMPOSE_PROFILES=kafka docker compose up           -> the same, from .env
+    #
+    # Opting in means opting in to both halves: set KAFKA_BROKERS=kafka:9092 so the
+    # application publishes, and select this profile so there is something to publish to.
+    # Selecting the profile without setting KAFKA_BROKERS gives a provisioned broker that
+    # Blnk ignores; setting KAFKA_BROKERS without the profile gives a relay retrying against
+    # nothing. .env.example says so at both keys.
+    profiles: ["kafka"]
     image: ${KAFKA_IMAGE:-apache/kafka:3.9.2}
     container_name: ${KAFKA_CONTAINER:-kafka}
     restart: on-failure
     ports:
-      # The host-facing SASL listener, published on KAFKA_OUTER_PORT so that host-run
-      # tests, a host-run "blnk start" and the k6 event scenario can reach the broker
-      # at localhost:9092 — the address .env.example documents for a host-run binary.
+      # The host-facing SASL listener, bound to loopback, so host-run tests and the k6
+      # scenario reach the broker at localhost:9092.
+      #
+      # BOUND TO 127.0.0.1, NOT TO EVERY INTERFACE. The default host IP for a published
+      # port is 0.0.0.0, which on a laptop on a shared network or a cloud VM with a
+      # public address exposes a broker that authenticates with SCRAM over PLAINTEXT
+      # and whose administrative principal is a cluster superuser. Every legitimate
+      # local consumer of this port runs on the host itself, so the loopback bind costs
+      # nothing and removes the exposure. A deployment that genuinely needs remote
+      # access sets KAFKA_OUTER_HOST — and should be running TLS before it does.
       #
       # The container side is 29092 rather than 9092 because ONE listener cannot
       # advertise two addresses. Kafka answers every client with the advertised address
       # of the listener it connected on, so the in-network listener must advertise
       # kafka:9092 — what server, worker and kafka-init dial — while the host listener
-      # must advertise localhost. Hence two listeners on two ports, of which only the
-      # host one is published. Publishing 9092 straight through would hand a host
+      # must advertise the host address. Hence two listeners on two ports, of which only
+      # the host one is published. Publishing 9092 straight through would hand a host
       # client the unresolvable name "kafka" and the port would be useless.
-      - "${KAFKA_OUTER_PORT:-9092}:29092"
+      #
+      # BOUND TO 127.0.0.1, not to every interface. Published without a host address, a
+      # port is reachable from anywhere that can route to this machine, and this listener
+      # speaks SASL_PLAINTEXT: the SCRAM exchange and every ledger event on it travel
+      # unencrypted. The three consumers of this port — host-run tests, a host-run
+      # "blnk start" and the k6 scenario — are all local, so loopback costs them nothing.
+      - "${KAFKA_OUTER_HOST:-127.0.0.1}:${KAFKA_OUTER_PORT:-9092}:29092"
     environment:
       TZ: ${TZ:-Etc/UTC}
       # The bootstrap SCRAM principal: seeded into the metadata log by
       # scripts/kafka-bootstrap.sh, and thereafter the identity every administrative
       # operation authenticates as.
       #
-      # DEFAULTED HERE even though both scripts deliberately refuse to default it, for
-      # a reason specific to this file: server and worker gate on this broker's
-      # healthcheck, so a broker that cannot bootstrap would leave them waiting for
-      # ever rather than failing visibly. A default keeps "docker compose up" working
-      # with no .env at all, exactly as POSTGRES_PASSWORD:-password already does above.
-      # The value is an obvious local placeholder — supply a real one through .env,
-      # which stack.sh --init creates. Every service needing this pair reads these same
-      # two expressions, so the credential the broker is seeded with and the one its
-      # clients present cannot drift apart.
-      KAFKA_SASL_ADMIN_USER: ${KAFKA_SASL_ADMIN_USER:-admin}
-      KAFKA_SASL_ADMIN_SECRET: ${KAFKA_SASL_ADMIN_SECRET:-blnk-local-dev-admin-secret}
+      # THE SECRET HAS NO DEFAULT, AND MUST NOT ACQUIRE ONE.
+      #
+      # It used to default to a fixed literal, on the reasoning that "docker compose up"
+      # should work with no .env at all, exactly as POSTGRES_PASSWORD:-password does
+      # above. That reasoning does not survive what this particular credential is: the
+      # principal named here goes into super.users below, which in Kafka means
+      # unconditional authority over every ACL and every SCRAM credential in the
+      # cluster, and the SASL listener is published on the host. A password committed to
+      # this repository therefore handed anyone who could reach that port the cluster's
+      # entire access model.
+      #
+      # So it is REQUIRED, with a message that names the fix. "./stack.sh --init"
+      # generates a per-stack value into .env; an operator running compose directly
+      # exports one.
+      #
+      # THE USERNAME IS UNDEFAULTED TOO, and not because a username is a secret. A
+      # defaulted username beside an undefaulted secret is a HALF-CONFIGURED pair, and
+      # a half-configured pair is precisely what config.KafkaConfig refuses — so the
+      # shipped file would fail configuration validation on every deployment that never
+      # set the secret. Shipping both empty makes "unset" a single coherent state that
+      # the bootstrap script names in its refusal.
+      #
+      # Every service needing this pair reads these same two expressions, so the
+      # credential the broker is seeded with and the one its clients present cannot
+      # drift apart.
+      KAFKA_SASL_ADMIN_USER: ${KAFKA_SASL_ADMIN_USER:-}
+      # NO DEFAULT, DELIBERATELY. A shipped placeholder here would be a Kafka SUPERUSER
+      # password readable in this file, on a broker published to the host. Anyone who
+      # could reach the port could create topics, mint SCRAM credentials for any
+      # principal and rewrite every ACL, including granting themselves Read on every
+      # subscriber's events. A credential that is in the source is not a credential, and
+      # naming the old placeholder even in a comment reintroduces the string a scanner
+      # has to triage.
+      #
+      # Empty is safe rather than convenient: with the kafka profile inactive nothing reads
+      # it, and with the profile active scripts/kafka-bootstrap.sh refuses an empty admin
+      # secret by name, so the failure is loud, immediate and local to the broker instead of
+      # being a silent authentication failure later. Run "./stack.sh --init" to generate a
+      # per-stack pair into a mode-0600 .env.
+      KAFKA_SASL_ADMIN_SECRET: ${KAFKA_SASL_ADMIN_SECRET:-}
       # SCRAM-SHA-512 at no fewer than 4096 iterations. Kafka implements only SHA-256
       # and SHA-512 and rejects a lower iteration count; Blnk standardises on SHA-512,
       # which is what event_admin.go mints subscriber credentials with.
       KAFKA_SCRAM_ITERATIONS: ${KAFKA_SCRAM_ITERATIONS:-4096}
-      # Pinned rather than generated, so that re-creating the volume yields the same
-      # cluster identity. It is not a secret, and it has to be a base64url token.
+      # Pinned so re-creating the volume yields the same cluster identity. Not a secret,
+      # and it has to be a base64url token.
       KAFKA_CLUSTER_ID: ${KAFKA_CLUSTER_ID:-blnkLocalKRaftCluster1}
-      # Which configuration scripts/kafka-bootstrap.sh formats against, and which
-      # directories it probes for an existing format. Both are stated explicitly
-      # because the script's own probe list covers image defaults, and this stack
-      # supplies its own broker configuration below.
+      # What scripts/kafka-bootstrap.sh formats against, and where the log directory is.
+      # Explicit because this stack supplies its own broker configuration below.
       KAFKA_KRAFT_CONFIG: /tmp/blnk-kafka/server.properties
       KAFKA_LOG_DIRS: /var/lib/kafka/data
     volumes:
-      # Read-only, and at exactly the path scripts/kafka-provision.sh documents as its
-      # in-container location: KAFKA_PROVISION_CONTAINER_SCRIPT defaults to
-      # /scripts/kafka-provision.sh, which is how "make kafka_provision" and stack.sh
-      # delegate into this container without being told where the scripts live. Neither
-      # script ever writes here.
+      # Read-only, at the in-container path KAFKA_PROVISION_CONTAINER_SCRIPT defaults to,
+      # which is how "make kafka_provision" and stack.sh delegate into this container.
       - ./scripts:/scripts:ro
-      # The KRaft log directory, which holds __cluster_metadata — and therefore the
-      # bootstrapped SCRAM credentials and every ACL, not just message data. Keeping it
-      # in a named volume is what makes "docker compose down && docker compose up"
-      # preserve the topics, the principals and the grants instead of starting over.
+      # The KRaft log directory holds __cluster_metadata — the SCRAM credentials and
+      # every ACL, not just message data — so a named volume is what makes "down && up"
+      # preserve the topics, principals and grants.
       - kafka_data:/var/lib/kafka/data
-    # The image's own entrypoint is deliberately bypassed. It formats storage through
-    # KafkaDockerWrapper WITHOUT --add-scram, which would leave a formatted log
-    # directory holding no SCRAM credential — and because formatting is one-shot, no
-    # credential could be added afterwards and no client could ever authenticate. The
-    # order below is the only one that works: render the configuration, bootstrap, then
-    # start the broker.
+    # The image's own entrypoint is bypassed: it formats storage WITHOUT --add-scram,
+    # and because formatting is one-shot that leaves a log directory with no SCRAM
+    # credential, which no client could authenticate against. Render the configuration,
+    # bootstrap, then start — the only order that works.
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -262,15 +499,10 @@ services:
         mkdir -p /tmp/blnk-kafka
 
         # THE BROKER CONFIGURATION, WRITTEN ONCE AND USED TWICE: kafka-storage format
-        # validates and formats against this file, and the broker then starts with the
-        # very same file. Two documents would let the formatted log directory and the
-        # running broker disagree about log.dirs, and the result of that disagreement
-        # is a broker whose storage holds no SCRAM credential — precisely the failure
-        # this bootstrap exists to prevent.
-        #
-        # $${...} is a Compose escape, so the credentials are expanded by this shell
-        # from the container environment rather than being interpolated into the
-        # rendered Compose configuration.
+        # formats against this file and the broker starts with the same file. Two
+        # documents could disagree about log.dirs, and that disagreement produces a broker
+        # whose storage holds no SCRAM credential. $${...} is a Compose escape, so the
+        # credentials are expanded by this shell rather than into the rendered config.
         cat >/tmp/blnk-kafka/server.properties <<PROPERTIES
         # One process in both roles. A separate controller would need a second
         # container to no local purpose.
@@ -278,20 +510,22 @@ services:
         node.id=1
         controller.quorum.voters=1@localhost:9093
 
-        # Three listeners: BROKER for in-network clients and inter-broker traffic,
-        # EXTERNAL for clients on the host, CONTROLLER for the KRaft quorum. Only the
-        # two client listeners are advertised, because a controller listener never is.
+        # BROKER for in-network clients and inter-broker traffic, EXTERNAL for the host,
+        # CONTROLLER for the KRaft quorum. A controller listener is never advertised.
         listeners=BROKER://:9092,EXTERNAL://:29092,CONTROLLER://:9093
-        advertised.listeners=BROKER://kafka:9092,EXTERNAL://localhost:${KAFKA_OUTER_PORT:-9092}
+        advertised.listeners=BROKER://kafka:9092,EXTERNAL://${KAFKA_OUTER_ADVERTISED_HOST:-localhost}:${KAFKA_OUTER_PORT:-9092}
         listener.security.protocol.map=BROKER:SASL_PLAINTEXT,EXTERNAL:SASL_PLAINTEXT,CONTROLLER:SASL_PLAINTEXT
         inter.broker.listener.name=BROKER
         controller.listener.names=CONTROLLER
 
         # Client and inter-broker authentication: SCRAM-SHA-512, verified against the
-        # credentials in the metadata log that the bootstrap seeded. SASL_PLAINTEXT is
-        # acceptable for a single broker on a private compose network; SCRAM does not
-        # encrypt, so production pairs it with TLS, which is what the Kubernetes
-        # manifests configure and what KAFKA_TLS_ENABLED selects on the client side.
+        # credentials the bootstrap seeded into the metadata log.
+        #
+        # BOTH CLIENT LISTENERS ARE SASL_PLAINTEXT, WHICH IS EXPLICITLY INSECURE AND
+        # LOCAL-ONLY: SCRAM authenticates but does not encrypt, so credentials and
+        # messages travel in clear text. The EXTERNAL listener is published on the host
+        # bound to 127.0.0.1 — keep that loopback binding, and do not reuse this
+        # configuration outside local development. Production pairs SCRAM with TLS.
         sasl.enabled.mechanisms=SCRAM-SHA-512
         sasl.mechanism.inter.broker.protocol=SCRAM-SHA-512
         listener.name.broker.sasl.enabled.mechanisms=SCRAM-SHA-512
@@ -299,34 +533,26 @@ services:
         listener.name.external.sasl.enabled.mechanisms=SCRAM-SHA-512
         listener.name.external.scram-sha-512.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required;
 
-        # The controller listener authenticates with SASL/PLAIN and a static
-        # credential, and it has to. SCRAM credentials live in the metadata log that
-        # the controller itself serves, so a controller cannot authenticate with SCRAM
-        # before that log is readable; a PLAIN credential is static in this file and
-        # breaks the cycle. PLAINTEXT is not an alternative either: an
-        # unauthenticated controller connection is User:ANONYMOUS, which the authorizer
-        # below denies CLUSTER_ACTION, and the broker never finishes starting. The
-        # principal is the same administrative one, so this introduces no second
-        # secret to manage or leak.
+        # The controller listener must use SASL/PLAIN: SCRAM credentials live in the
+        # metadata log the controller itself serves, so it cannot use SCRAM before that
+        # log is readable — and PLAINTEXT would connect as User:ANONYMOUS, which the
+        # authorizer denies CLUSTER_ACTION, so the broker never finishes starting. Same
+        # principal, so no second secret.
         sasl.mechanism.controller.protocol=PLAIN
         listener.name.controller.sasl.enabled.mechanisms=PLAIN
         listener.name.controller.plain.sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="$${KAFKA_SASL_ADMIN_USER}" password="$${KAFKA_SASL_ADMIN_SECRET}" user_$${KAFKA_SASL_ADMIN_USER}="$${KAFKA_SASL_ADMIN_SECRET}";
 
-        # ACLS ARE ENFORCED HERE, AND THAT IS THE ENTIRE POINT OF THESE THREE LINES.
-        # KRaft configures no authorizer by default, and without one the broker ACCEPTS
-        # every ACL and applies none: subscriber isolation would look configured while
-        # every principal could read every topic, and the isolation acceptance test
-        # would pass while proving nothing at all. The third line matters as much as
-        # the first: left at its true default, any resource without a matching ACL is
-        # allowed and the grants become decorative.
+        # ACLS ARE ENFORCED HERE, AND THAT IS THE POINT OF THESE THREE LINES. KRaft
+        # configures no authorizer by default, and without one the broker ACCEPTS every
+        # ACL and applies none — subscriber isolation would look configured while every
+        # principal could read every topic. The third line matters as much as the first:
+        # left at its true default, an unmatched resource is allowed.
         authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
         super.users=User:$${KAFKA_SASL_ADMIN_USER}
         allow.everyone.if.no.acl.found=false
 
-        # Single-broker geometry. Kafka's internal topics cannot be replicated more
-        # widely than the cluster is wide, so these are 1 by construction rather than
-        # by preference; what Blnk REQUESTS for its own topics comes from
-        # KAFKA_REPLICATION_FACTOR, which is 1 here and 3 in the k8s manifests.
+        # Single-broker geometry: internal topics cannot be replicated more widely than
+        # the cluster is wide. Blnk's own topics use KAFKA_REPLICATION_FACTOR instead.
         offsets.topic.replication.factor=1
         transaction.state.log.replication.factor=1
         transaction.state.log.min.isr=1
@@ -337,82 +563,117 @@ services:
         log.dirs=/var/lib/kafka/data
         num.partitions=${KAFKA_MIN_PARTITIONS:-6}
 
-        # A topic created on first use would be created with the wrong partition count
-        # and with no ACL at all, so a mistyped topic name has to fail loudly instead
-        # of quietly producing an unordered, unauthorized topic.
+        # A topic created on first use would get the wrong partition count and no ACL, so
+        # a mistyped topic name has to fail loudly.
         auto.create.topics.enable=false
         PROPERTIES
 
-        # The client configuration the healthcheck authenticates with. It proves the
-        # broker is answering authenticated, authorized requests rather than merely
-        # holding a socket open, which is the only readiness signal worth gating
-        # kafka-init and the two application services on.
+        # The client configuration the healthcheck authenticates with, so readiness means
+        # "answering authenticated, authorized requests".
         cat >/tmp/blnk-kafka/client-admin.properties <<PROPERTIES
         security.protocol=SASL_PLAINTEXT
         sasl.mechanism=SCRAM-SHA-512
         sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="$${KAFKA_SASL_ADMIN_USER}" password="$${KAFKA_SASL_ADMIN_SECRET}";
         PROPERTIES
 
-        # Format the storage and seed the administrative SCRAM credential in one
-        # operation, before the broker starts, because a KRaft broker cannot
-        # authenticate a SASL client until a credential is already in its metadata log
-        # and "kafka-configs" needs an authenticated connection to create one.
-        # Idempotent by design: an already-formatted volume is detected and skipped, so
-        # a restart against existing data is not an error.
+        # Format the storage and seed the administrative SCRAM credential in ONE operation,
+        # before the broker starts: a KRaft broker cannot authenticate a SASL client until
+        # a credential is in its metadata log, and kafka-configs needs an authenticated
+        # connection to create one. Idempotent — an existing format is skipped.
         /scripts/kafka-bootstrap.sh
 
         exec /opt/kafka/bin/kafka-server-start.sh /tmp/blnk-kafka/server.properties
     healthcheck:
-      # A full SCRAM handshake followed by an authorized metadata request, deliberately
-      # not a TCP probe: a listening socket says nothing about whether SASL is usable,
-      # and everything downstream of this gate assumes it is.
+      # A full SCRAM handshake plus an authorized metadata request, not a TCP probe: a
+      # listening socket says nothing about whether SASL is usable.
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --command-config /tmp/blnk-kafka/client-admin.properties --list >/dev/null 2>&1"]
-      # The postgres service's shape above, with a longer start period. KRaft
-      # formatting plus broker startup is an order of magnitude slower than
-      # pg_isready, and every probe pays for a JVM start of its own.
+      # The postgres shape above with a longer start period: KRaft formatting plus broker
+      # startup is far slower than pg_isready, and every probe pays for a JVM start.
       interval: 10s
       timeout: 15s
       retries: 5
       start_period: 60s
 
-  # One-shot topic and principal provisioning, modelled on the migration service in
-  # docker-compose.dev.yaml: it runs once against a ready broker, then exits.
+  # One-shot topic and principal provisioning: it runs once against a ready broker,
+  # then exits. There is one category more than the three the requirement names because
+  # every formerly webhooked event must be published: ledger.created and system.error
+  # belong to none of transactions, balances or identities, so both go to blnk.system,
+  # which is also where an event type no mapping recognises lands.
   #
   # It creates one topic per event category and a dead-letter sibling for each —
-  # blnk.transactions, blnk.balances, blnk.identities, blnk.system and
-  # blnk.quarantine, plus blnk.transactions.dlt and so on — then the sample
+  # blnk.transactions, blnk.balances, blnk.identities and blnk.system, plus
+  # blnk.transactions.dlt and so on, eight names in total — then the sample
   # subscriber principal and its ACLs. The category list is pinned to
   # model.EventCategory rather than restated, and each .dlt name is derived by
   # appending the suffix, which is what keeps a topic the relay publishes to from
   # ever being a topic nobody created.
   #
-  # There are more categories than the three the requirement names because every
+  # There is a fourth category beyond the three the requirement names because every
   # event formerly delivered by webhook has to be published and two of them belong to
   # none of transactions, balances or identities: ledger.created and system.error go
-  # to blnk.system, and blnk.quarantine catches an event type no mapping recognises,
-  # keeping it durable and replayable without delivering it to an audience that never
-  # asked for it. Both of those are internal and no subscriber can be granted either.
+  # to blnk.system, which also catches an event type no mapping recognises, keeping it
+  # durable and replayable without delivering it to an audience that never asked for
+  # it. That category is internal and no subscriber can be granted it.
   kafka-init:
+    # The SAME profile as the kafka service above, and it has to be the same one: provisioning
+    # a broker that is not running cannot succeed, and a broker with no topics is one the relay
+    # cannot publish to. Selecting one without the other is not a configuration this stack
+    # offers. See the kafka service for what the profile buys and how to select it.
+    profiles: ["kafka"]
     image: ${KAFKA_IMAGE:-apache/kafka:3.9.2}
     # restart: on-failure, never "always": the script is idempotent and exits 0 on a
-    # run that changes nothing, so this retries a genuine failure — a broker that
-    # accepted the healthcheck but was still loading metadata, say — without spinning
-    # for ever on success.
+    # run that changes nothing, so this retries a genuine failure without spinning.
     restart: on-failure
     environment:
       TZ: ${TZ:-Etc/UTC}
-      # Explicit, and it must be. KAFKA_BROKERS is empty in the shipped .env so that
-      # the application resolves to its no-op publisher, and the provisioning script
-      # reads that emptiness as "Kafka is not configured" and skips. An explicit
-      # bootstrap server overrides that skip, which is how the local broker still gets
-      # its topics while the application is left un-Kafka'd until an operator opts in.
+      # Explicit, and it must be. The provisioning script reads an empty KAFKA_BROKERS as
+      # "Kafka is not configured" and skips, so a deployment that has deliberately turned
+      # publishing off would otherwise leave the local broker with no catalogue at all. An
+      # explicit bootstrap server overrides that skip, so the topics exist whether or not
+      # the application is publishing to them yet.
       KAFKA_BOOTSTRAP_SERVER: kafka:9092
       KAFKA_SECURITY_PROTOCOL: ${KAFKA_SECURITY_PROTOCOL:-SASL_PLAINTEXT}
       # The same administrative pair the broker was bootstrapped with; these are the
       # only credentials that can authenticate against a freshly formatted cluster.
-      KAFKA_SASL_ADMIN_USER: ${KAFKA_SASL_ADMIN_USER:-admin}
-      KAFKA_SASL_ADMIN_SECRET: ${KAFKA_SASL_ADMIN_SECRET:-blnk-local-dev-admin-secret}
+      # Required, not defaulted, for the reason set out on the kafka service above.
+      KAFKA_SASL_ADMIN_USER: ${KAFKA_SASL_ADMIN_USER:-}
+      # NO DEFAULT, DELIBERATELY. A shipped placeholder here would be a Kafka SUPERUSER
+      # password readable in this file, on a broker published to the host. Anyone who
+      # could reach the port could create topics, mint SCRAM credentials for any
+      # principal and rewrite every ACL, including granting themselves Read on every
+      # subscriber's events. A credential that is in the source is not a credential, and
+      # naming the old placeholder even in a comment reintroduces the string a scanner
+      # has to triage.
+      #
+      # Empty is safe rather than convenient: with the kafka profile inactive nothing reads
+      # it, and with the profile active scripts/kafka-bootstrap.sh refuses an empty admin
+      # secret by name, so the failure is loud, immediate and local to the broker instead of
+      # being a silent authentication failure later. Run "./stack.sh --init" to generate a
+      # per-stack pair into a mode-0600 .env.
+      KAFKA_SASL_ADMIN_SECRET: ${KAFKA_SASL_ADMIN_SECRET:-}
       KAFKA_SCRAM_ITERATIONS: ${KAFKA_SCRAM_ITERATIONS:-4096}
+      # The PRODUCER principal Blnk publishes as: Write and Describe on every Blnk-owned
+      # topic, no Read anywhere, and nothing at cluster scope. Provisioned here and read
+      # by the server and worker above through the same two variables, so the credential
+      # that is minted and the credential that authenticates are one value.
+      #
+      # The secret is generated on the FIRST run and printed once, then preserved. Set it
+      # in .env (stack.sh --init does) to pin a known one, which is what lets the server
+      # and worker read it at all: a generated one exists only in this container's log.
+      KAFKA_PRODUCER_USER: ${KAFKA_PRODUCER_USER:-blnk-producer}
+      KAFKA_PRODUCER_SECRET: ${KAFKA_PRODUCER_SECRET:-}
+      # THE SAME PAIR UNDER THE NAMES THE APPLICATION RESOLVES FIRST, and it must be here
+      # rather than only above. scripts/kafka-provision.sh reads KAFKA_SASL_USER /
+      # KAFKA_SASL_SECRET before falling back to KAFKA_PRODUCER_*, exactly as
+      # config.KafkaConfig and the server and worker services do. Omitting them here would let
+      # a .env that sets only KAFKA_SASL_* mint one principal on the broker while the
+      # application authenticated as another - a SASL handshake failure with two
+      # correct-looking configurations. Empty defaults, so nothing is a shipped credential and
+      # the KAFKA_PRODUCER_* fallback still applies when only that pair is set.
+      KAFKA_SASL_USER: ${KAFKA_SASL_USER:-}
+      KAFKA_SASL_SECRET: ${KAFKA_SASL_SECRET:-}
+      KAFKA_ROTATE_PRODUCER_SECRET: ${KAFKA_ROTATE_PRODUCER_SECRET:-}
+      KAFKA_SKIP_PRODUCER: ${KAFKA_SKIP_PRODUCER:-}
       # Topic naming and geometry, read from the same variables the application reads so
       # that provisioning and runtime assurance cannot disagree about either. The
       # replication factor MUST resolve to 1 here: a one-broker KRaft cluster answers
@@ -423,32 +684,50 @@ services:
       KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-blnk}
       KAFKA_MIN_PARTITIONS: ${KAFKA_MIN_PARTITIONS:-6}
       KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-1}
-      # The sample subscriber a local consumer can use. Its password is generated on the
-      # first run and printed once, then preserved on later runs so that a routine
-      # bring-up does not invalidate the credential a consumer is already holding; set
-      # it here to pin a known one instead.
+      # The sample subscriber a local consumer can use — a convenience, unlike the producer
+      # above: nothing in Blnk needs it, and with the secret empty it is skipped and said so.
+      # A supplied password is applied idempotently and never echoed, and an existing
+      # credential is preserved on later runs so a routine bring-up does not invalidate the
+      # credential a consumer is already holding.
+      #
+      # Its grant is narrower than it looks: Read and Describe on the GRANTABLE category
+      # topics only — not the internal system topic, and not a single .dlt sibling — which is
+      # the same allowlist model.SubscriberGrantableTopics enforces for a real subscriber.
       KAFKA_SAMPLE_SUBSCRIBER_USER: ${KAFKA_SAMPLE_SUBSCRIBER_USER:-blnk-sample-subscriber}
       KAFKA_SAMPLE_SUBSCRIBER_SECRET: ${KAFKA_SAMPLE_SUBSCRIBER_SECRET:-}
+      # THE ONLY CHANNEL A GENERATED CREDENTIAL IS DELIVERED OVER. The script will not print
+      # one: this service's stdout is a container log that retains it for the container's
+      # lifetime, hands it to anyone who can run "docker compose logs" and forwards it to
+      # whatever collects the host's logs. So a generated password is written to the path named
+      # here at mode 0600 and only the PATH is reported; with neither this nor the secret above
+      # set, the sample principal is skipped and the reason is printed instead. Point it at a
+      # writable mount, or leave it empty and let "./stack.sh --init" supply the secret.
+      #
+      # The producer pair's equivalent is passed for the same reason.
+      KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE: ${KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE:-}
+      KAFKA_SASL_SECRET_FILE: ${KAFKA_SASL_SECRET_FILE:-}
       KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX: ${KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX:-blnk-sample-subscriber}
+      # Narrows the sample grant to a subset of the grantable topics. It CANNOT widen it:
+      # every entry is checked against the same allowlist, so neither the internal category
+      # nor a dead-letter topic can be granted through it.
+      KAFKA_SAMPLE_SUBSCRIBER_TOPICS: ${KAFKA_SAMPLE_SUBSCRIBER_TOPICS:-}
     volumes:
       - ./scripts:/scripts:ro
-    # The entrypoint and command are set as a pair, following the server service above.
-    # Setting the entrypoint alone would leave the image's own CMD in place and pass it
-    # to the script as an argument, which the script rejects before doing any work.
+    # Set as a pair: an entrypoint alone would leave the image's CMD in place and pass it
+    # to the script as an argument, which the script rejects.
     entrypoint: ["/bin/bash", "-c"]
     command:
       - "exec /scripts/kafka-provision.sh"
-    # The long map form, because only it can carry a condition. Provisioning speaks an
-    # authenticated SASL protocol to a broker that must already have loaded its
-    # metadata, and against a merely-started broker it would fail in a way that looks
-    # like a wrong password.
+    # The long map form, because only it can carry a condition: provisioning speaks an
+    # authenticated SASL protocol to a broker that must already have loaded its metadata.
     #
-    # The reverse gate is deliberately absent: server and worker wait on the BROKER's
-    # health, not on this service completing. Assuring the topic catalogue is the
-    # application's own job — event_admin.go's EnsureTopics exists for exactly that and
-    # runs with the same geometry variables — so making the API's availability depend on
-    # a one-shot succeeding would duplicate that guarantee and hide it when it is
-    # missing, for a benefit confined to the first seconds of a cold start.
+    # Server and worker gate on this service COMPLETING as well as on the broker's health.
+    # Assuring the topic catalogue is also the application's own job — startEventRelay
+    # calls event_admin.go's EnsureTopics before starting the relay, with the same
+    # geometry variables — so this gate is not what makes the topics exist. What it buys
+    # is that a provisioning failure stops the stack visibly at bring-up rather than
+    # appearing minutes later as dead letters, and that only one of the two creators
+    # races to create the eight topics on a cold start.
     depends_on:
       kafka:
         condition: service_healthy
@@ -513,18 +792,10 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
-      # The rule directory prometheus.yml's rule_files glob resolves against.
-      #
-      # Without this mount the stanza matches nothing and BOTH alert rules are
-      # inert: a dead-letter entry stuck for 15 minutes and a subscriber trailing
-      # by 10,000 messages would never fire, however faithfully the gauges are
-      # published. That failure is silent — the rules are simply absent from
-      # /rules and there is no startup error to notice — which is exactly why the
-      # mount and the glob have to be kept in step.
-      #
-      # Mounted as a DIRECTORY rather than as a single file so a rule file added
-      # to ./alerts later is picked up without another edit here, and read-only
-      # because Prometheus never writes to it.
+      # The rule directory prometheus.yml's rule_files glob resolves against. Without
+      # this mount the stanza matches nothing and BOTH alert rules are inert, with no
+      # startup error to notice, so the mount and the glob have to be kept in step.
+      # Mounted as a directory so a rule file added later needs no edit here.
       - ./alerts:/etc/prometheus/alerts:ro
     depends_on:
       - server
@@ -534,8 +805,7 @@ volumes:
   pg_data:
   typesense_data:
   # The broker's KRaft log directory. It holds __cluster_metadata as well as message
-  # data, so the bootstrapped SCRAM credentials, the sample subscriber's password and
-  # every ACL live here too — removing this volume discards the cluster's whole
-  # authorization state and forces a re-bootstrap, which is exactly what
-  # "make kafka_provision" then has to repair.
+  # data, so removing this volume discards the cluster's whole authorization state —
+  # the SCRAM credentials, the sample subscriber's password and every ACL — and forces
+  # a re-bootstrap.
   kafka_data:

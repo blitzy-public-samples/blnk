@@ -214,14 +214,44 @@ func (l *Blnk) updateTransactionDetails(ctx context.Context, transaction *model.
 
 // postTransactionActions performs post-processing actions for a transaction.
 // It starts a tracing span, queues the transaction and balance data for indexing in dependency order,
-// captures the transaction's event in the transactional outbox, and processes fund lineage if applicable.
+// captures the transaction's event in the transactional outbox when it was not already captured
+// atomically, and processes fund lineage if applicable.
+//
+// # eventCaptured is what keeps the event exactly-once on the write side
+//
+// The transaction's event is normally recorded INSIDE the database transaction that
+// applied the balances — buildTransactionExecutionWork prepares the row and the atomic
+// writers insert it — so by the time this hook runs the event is already durable. Publishing
+// it again here would insert a second row for one business event; the event id is derived
+// from the transaction's own identity, so the second insert is refused by the unique index
+// and the caller is handed a conflict for an operation that actually succeeded.
+//
+// It is therefore published here only when nothing captured it: a path that does not use an
+// atomic writer (a rejection, recorded by RecordTransaction), or a deployment with no Kafka
+// brokers, where PublishEvent routes the event to the legacy webhook transport instead.
+//
+// # Event capture here is the FALLBACK, not the primary path
+//
+// The single-transaction execution path captures the event inside the mutation's own database
+// transaction (see persistSingleTransactionExecutionWork), which is what requirement R-2 asks
+// for. This function still captures it for every OTHER flow that reaches it — a rejection,
+// which persists through RecordTransaction and updates no balances, and the coalesced batch
+// path, which persists through a different writer — because an event that no path captures is
+// an event lost, and that is strictly worse than one captured a moment after its commit.
+//
+// eventAlreadyCaptured is how the two paths avoid capturing the same event twice. A
+// transaction event's id is DERIVED from its identity, so a second capture is not a harmless
+// duplicate: the unique index refuses it, the error propagates to notification.NotifyError,
+// and a transaction that in fact succeeded reports a failure.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
 // - transaction *model.Transaction: The transaction for which to perform post-processing actions.
 // - sourceBalance *model.Balance: The source balance (can be nil for rejected transactions).
 // - destinationBalance *model.Balance: The destination balance (can be nil for rejected transactions).
-func (l *Blnk) postTransactionActions(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance) {
+// - eventCaptured bool: true when the transaction's event was already inserted inside the ledger
+// transaction, in which case no event is published here.
+func (l *Blnk) postTransactionActions(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance, eventCaptured bool) {
 	_, span := tracer.Start(ctx, "Post Transaction Actions")
 	defer span.End()
 	go func() {
@@ -246,33 +276,49 @@ func (l *Blnk) postTransactionActions(ctx context.Context, transaction *model.Tr
 			notification.NotifyError(err)
 		}
 
-		// PRODUCER CALL SITE for the seven status-derived transaction events. Only the
-		// TRANSPORT changed: the event string and the payload object are the same ones
-		// SendWebhook was handed, so the bytes recorded in the outbox are the bytes that
-		// used to be the HTTP body, and the relay delivers that one row over both
-		// transports during the dual-delivery window.
+		// PRODUCER CALL SITE for the seven status-derived transaction events, and the
+		// FALLBACK one: the atomic writers capture this event inside the ledger
+		// transaction, so this branch runs only for a transaction that was not persisted
+		// through one, or for a deployment with no Kafka brokers.
 		//
-		// getEventFromStatus is reused VERBATIM, which is what keeps all seven of its
-		// event names — including its documented fall-through of COMMIT to
-		// transaction.unknown. Do not "correct" that here: the dual-delivery comparison
-		// asserts both transports carry identical bytes, and changing one side of it
-		// would fail for a reason that has nothing to do with the transport.
+		// Only the TRANSPORT changed: the event string and the payload object are the same
+		// ones SendWebhook was handed, so the bytes recorded are the bytes that used to be
+		// the HTTP body, and the relay delivers that one row over both transports during
+		// the dual-delivery window.
+		//
+		// The ledger is supplied from the balances when they are known, exactly as the
+		// atomic path does it, so an event captured here is keyed and recorded
+		// identically to one captured there — both resolve it through transactionLedgerID.
+		// A rejection reaches here with no balances and therefore no ledger, which is
+		// honest: no balance moved, so no ledger is named.
+		//
+		// getEventFromStatus is the sole source of the transaction.* vocabulary, including
+		// its fall-through of COMMIT to transaction.unknown. That fall-through is preserved
+		// deliberately: the event name is a WIRE VALUE subscribers route on, so introducing
+		// a transaction.commit name is a change to the subscriber-facing vocabulary and
+		// belongs in its own deliberate change rather than being smuggled in with a
+		// transport substitution. It would change what BOTH transports carry, not one side
+		// of a comparison.
 		//
 		// context.WithoutCancel mirrors monitorCtx in runTransactionPostCommitWorkWithHooks
 		// and is required, not cosmetic. This goroutine outlives the request or asynq task
 		// that spawned it, and PublishEvent writes the outbox row, so inheriting that
 		// cancellation would abort event capture the instant the response was written and
 		// lose the event. Trace context still propagates, so the capture stays in the trace.
-		err = l.PublishEvent(context.WithoutCancel(ctx), NewWebhook{
-			Event:   getEventFromStatus(transaction.Status),
-			Payload: transaction,
-		})
-		if err != nil {
-			span.RecordError(err)
-			notification.NotifyError(err)
+		if !eventCaptured {
+			err = l.PublishEvent(context.WithoutCancel(ctx), NewWebhook{
+				Event:   getEventFromStatus(transaction.Status),
+				Payload: transaction,
+			}, WithEventLedgerID(transactionLedgerID(sourceBalance, destinationBalance)))
+			if err != nil {
+				span.RecordError(err)
+				notification.NotifyError(err)
+			}
 		}
 
-		span.AddEvent("Post-transaction actions completed")
+		span.AddEvent("Post-transaction actions completed", trace.WithAttributes(
+			attribute.Bool("event.captured_atomically", eventCaptured),
+		))
 	}()
 }
 
@@ -605,7 +651,7 @@ func (l *Blnk) runTransactionPostCommitWorkWithHooks(ctx context.Context, span t
 				logrus.WithError(err).Error("post-transaction hooks failed")
 			}
 		}
-		l.postTransactionActions(ctx, work.transaction, work.sourceBalance, work.destinationBalance)
+		l.postTransactionActions(ctx, work.transaction, work.sourceBalance, work.destinationBalance, work.eventCaptured)
 	}
 }
 
@@ -734,6 +780,31 @@ func (l *Blnk) processBalances(ctx context.Context, transaction *model.Transacti
 
 // buildTransactionExecutionWork converts an in-memory-applied transaction into the shared
 // persistence and post-commit work shape used by both single and batched execution paths.
+//
+// # It is where the transaction's event is CAPTURED, before anything is persisted
+//
+// The event row is prepared here rather than after the commit, and that ordering is the
+// whole of requirement R-2 for the transaction family. The row travels with the work item
+// into the atomic writer, which inserts it inside the same database transaction as the two
+// balance updates and the transaction row, so the mutation and its event commit or roll
+// back together. Capturing after the commit — which is what a post-action goroutine does —
+// leaves a window in which money moved and the event was lost permanently: the process can
+// die, the context can be cancelled, or the insert itself can fail, and nothing afterwards
+// can reconstruct the event because the transaction row alone does not say which event was
+// due.
+//
+// Two properties of the ordering matter and are easy to get wrong:
+//
+//   - updateTransactionDetails RUNS FIRST, so transaction.Status is final. The event name
+//     is derived from the status, and deriving it from the pre-update status would publish
+//     "transaction.queued" for a transaction that committed as APPLIED.
+//   - THE ZERO-AMOUNT ARM PREPARES NOTHING. That transaction is discarded rather than
+//     persisted, so there is no mutation for an event to describe and capturing one would
+//     announce a transaction that does not exist.
+//
+// The event string and the payload object are the ones the legacy webhook transport
+// received — getEventFromStatus reused verbatim, and the *model.Transaction itself — so the
+// bytes stored in the outbox are the bytes that used to be the HTTP body.
 func (l *Blnk) buildTransactionExecutionWork(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance) (queuedBatchPostCommitWork, bool) {
 	transaction = l.updateTransactionDetails(ctx, transaction, sourceBalance, destinationBalance)
 	if transaction.PreciseAmount != nil && transaction.PreciseAmount.Cmp(big.NewInt(0)) == 0 {
@@ -744,33 +815,178 @@ func (l *Blnk) buildTransactionExecutionWork(ctx context.Context, transaction *m
 		}, true
 	}
 
+	// THE LEDGER EVENT IS PREPARED HERE, BEFORE THE WRITE, so that the atomic writers can
+	// insert it inside the very transaction that applies the balances. Preparing it costs
+	// one JSON marshal and no I/O — nothing here contacts a broker or a database — and it
+	// is what turns "the event is published soon after the mutation" into "the event and
+	// the mutation commit together".
+	//
+	// A failure to prepare is deliberately NOT fatal to the transaction. The only way it
+	// can fail is a payload that will not serialise, and a ledger write must not be
+	// rejected because a notification could not be built; the failure is already logged
+	// and traced by PrepareEventOutbox, and eventCaptured stays false so the post-commit
+	// hook attempts the capture again on the standalone path, where the same failure is
+	// reported to the caller through notification.NotifyError.
+	eventOutbox, err := l.prepareTransactionEventOutbox(ctx, transaction, sourceBalance, destinationBalance)
+	if err != nil {
+		logrus.WithError(err).WithField("transaction_id", transaction.TransactionID).
+			Error("failed to prepare the transaction's ledger event for atomic capture; it will be captured after the commit instead")
+	}
+
 	return queuedBatchPostCommitWork{
 		transaction:        transaction,
 		sourceBalance:      sourceBalance,
 		destinationBalance: destinationBalance,
 		outbox:             l.prepareTransactionOutbox(ctx, transaction, sourceBalance, destinationBalance),
+		eventOutbox:        eventOutbox,
 	}, false
 }
 
+// transactionLedgerID resolves THE LEDGER a transaction belongs to, from the balances it
+// moves value between.
+//
+// model.Transaction carries no ledger field: its ledger association is indirect, through
+// those balances. Requirement R-6 partitions the event topics BY LEDGER ID, so without this
+// the partition key falls back to the source balance id — which preserves per-balance
+// ordering rather than per-ledger ordering, and puts a value that is not a ledger id in the
+// event's ledger column. The execution path has already loaded both balances, so the
+// authoritative answer is available at no cost.
+//
+// The SOURCE balance wins and the destination is the fallback, which matters for the one
+// case where they differ: a transfer between two ledgers. Keying on the source keeps every
+// event of one ledger's outbound activity on a single partition, and it agrees with what the
+// transaction queue already shards on (hashBalanceID(transaction.Source) in queue.go), so
+// the Kafka ordering a subscriber observes matches the ordering the ledger itself imposes.
+//
+// Parameters:
+//   - sourceBalance, destinationBalance *model.Balance: the loaded balances. Either may be
+//     nil — a rejected transaction has neither.
+//
+// Returns:
+//   - string: the ledger id, or "" when neither balance is available. An empty result is
+//     ignored by WithEventLedgerID, which leaves the payload-derived key in place.
+func transactionLedgerID(sourceBalance, destinationBalance *model.Balance) string {
+	if sourceBalance != nil && strings.TrimSpace(sourceBalance.LedgerID) != "" {
+		return sourceBalance.LedgerID
+	}
+
+	if destinationBalance != nil {
+		return destinationBalance.LedgerID
+	}
+
+	return ""
+}
+
 // persistSingleTransactionExecutionWork atomically persists one prepared transaction, its
-// updated balances, and any lineage outbox using the shared execution work shape.
+// updated balances, any lineage outbox AND the transaction's Kafka event row, using the
+// shared execution work shape.
+//
+// # This is where requirement R-2 is actually satisfied
+//
+// The event row is prepared here, immediately before the write, and handed to the atomic
+// writer, which inserts it inside the same database transaction as the two balance updates
+// and the transaction record. Before this, the event was captured AFTER the commit through
+// the standalone path: a process failure — or a plain insert failure — in the window between
+// the two left a committed ledger mutation with no event anywhere, undetectably, because the
+// only record that the event should have existed was the row that never got written.
+//
+// Preparing it HERE rather than in buildTransactionExecutionWork is deliberate. That builder
+// is shared with the coalesced batch path, which persists through a different writer and does
+// not thread event rows, so preparing there would marshal a payload per transaction in a
+// batch and then discard it. This function is the only caller of the single-transaction
+// atomic writer, so it is exactly the scope of the change.
+//
+// # Why a preparation failure fails the whole transaction
+//
+// PrepareEventOutbox returns an error only when the payload cannot be serialised, which is a
+// producer defect rather than a transient condition. Returning it here means the mutation is
+// never attempted, which is the same answer the in-transaction insert would give by rolling
+// back — and it is the answer R-2 asks for: a mutation whose event cannot be captured must
+// not commit. A nil row with no error is the unconfigured case and is simply passed through;
+// the writer skips nil entries.
 func (l *Blnk) persistSingleTransactionExecutionWork(ctx context.Context, work queuedBatchPostCommitWork) (queuedBatchPostCommitWork, error) {
 	ctx, span := tracer.Start(ctx, "PersistSingleTransactionExecutionWork")
 	defer span.End()
 
-	transaction, err := l.datasource.RecordTransactionWithBalancesAndOutbox(ctx, work.transaction, work.sourceBalance, work.destinationBalance, work.outbox)
+	// THE EVENT ROW TRAVELS WITH THE MUTATION. The writer inserts it inside the same
+	// database transaction as the two balance updates and the transaction row, so the
+	// event cannot outlive a rollback and the mutation cannot outlive a lost event. A nil
+	// row is skipped by the writer, which is what keeps a deployment with no brokers, and
+	// every existing test, working unchanged.
+	transaction, err := l.datasource.RecordTransactionWithBalancesAndOutbox(ctx, work.transaction, work.sourceBalance, work.destinationBalance, work.outbox, work.eventOutbox)
 	if err != nil {
 		span.RecordError(err)
 		return queuedBatchPostCommitWork{}, l.logAndRecordError(span, "failed to persist transaction with balances", err)
 	}
 
 	work.transaction = transaction
+	// Recorded only on the success path: the commit is what makes the event durable, so a
+	// failed write must leave the post-commit hook free to capture it on the standalone
+	// path rather than believing it is already stored.
+	work.eventCaptured = work.eventOutbox != nil
+
 	span.AddEvent("Transaction and balances persisted atomically", trace.WithAttributes(
 		attribute.String("transaction.id", transaction.TransactionID),
 		attribute.Bool("lineage.outbox_created", work.outbox != nil),
+		attribute.Bool("event.captured_in_transaction", work.eventCaptured),
 	))
 
 	return work, nil
+}
+
+// prepareTransactionEventOutbox builds the outbox row for a transaction's lifecycle event,
+// ready to be inserted inside the mutation's own database transaction.
+//
+// IT IS THE SINGLE PLACE A TRANSACTION EVENT IS BUILT. There were briefly two — this one and
+// an inline PrepareEventOutbox call in buildTransactionExecutionWork — and two builders for
+// one event is how the atomic path and the post-commit fallback come to disagree about the
+// event name, the payload or the partition key while both keep passing their own tests. The
+// event id is derived from the transaction's identity, so a disagreement about the KEY is the
+// worst of the three: the two paths would produce the same id for differently-ordered events.
+//
+// The event name and the payload object are the ones the post-commit hook uses —
+// getEventFromStatus(status) and the transaction itself — so the bytes recorded here are the
+// bytes that used to be the HTTP webhook body, whichever path captures them.
+//
+// # The ledger id is resolved here, and it is the reason this function exists
+//
+// Requirement R-6 partitions by LEDGER, and model.Transaction HAS NO LEDGER FIELD: a
+// transaction's ledger association runs through the balances it moves value between. Those
+// balances are already loaded at this point — validateAndPrepareTransaction fetched them and
+// processBalances has just applied the transaction to them — so the ledger is available for
+// the cost of a field read, with no extra query and no guess.
+//
+// Without it the row stored SQL NULL for the ledger and keyed on the SOURCE BALANCE instead,
+// which spreads one ledger's events across partitions and delivers per-balance rather than
+// per-ledger ordering. When neither balance carries a ledger — a rejected transaction is
+// persisted with no balances at all — the option is simply not applied and the key falls back
+// to the documented chain, so the event is still captured and still ordered.
+//
+// Parameters:
+//   - ctx context.Context: the context for the operation, used for tracing.
+//   - transaction *model.Transaction: the transaction as it will be persisted, with its final
+//     status already assigned by updateTransactionDetails.
+//   - sourceBalance, destinationBalance *model.Balance: the balances this transaction moves
+//     value between. Either may be nil.
+//
+// Returns:
+//   - *model.EventOutbox: the row to insert, or nil when event publishing is not configured.
+//   - error: only when the payload cannot be serialised.
+func (l *Blnk) prepareTransactionEventOutbox(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance) (*model.EventOutbox, error) {
+	if transaction == nil {
+		return nil, nil
+	}
+
+	event := NewWebhook{
+		Event:   getEventFromStatus(transaction.Status),
+		Payload: transaction,
+	}
+
+	// The SAME resolver the post-commit fallback uses, so an event captured atomically and
+	// one captured after the commit are keyed identically. WithEventLedgerID ignores an empty
+	// value, so the rejection case needs no branch of its own.
+	return l.PrepareEventOutbox(ctx, event,
+		WithEventLedgerID(transactionLedgerID(sourceBalance, destinationBalance)))
 }
 
 func (l *Blnk) prepareTransactionOutbox(ctx context.Context, transaction *model.Transaction, sourceBalance, destinationBalance *model.Balance) *model.LineageOutbox {

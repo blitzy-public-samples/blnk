@@ -28,6 +28,7 @@ import (
 	"github.com/blnkfinance/blnk/model"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCreateIdentity_Success(t *testing.T) {
@@ -145,8 +146,8 @@ func TestCreateIdentity_CallerSuppliedID_BadUUID(t *testing.T) {
 	ds := Datasource{Conn: db}
 
 	cases := []string{
-		"idt_",                                       // empty suffix
-		"idt_not-a-uuid",                             // non-UUID suffix
+		"idt_",           // empty suffix
+		"idt_not-a-uuid", // non-UUID suffix
 		"idt_8c5a8e2f-3f1d-5a9b-9c3e-4d8f1e5a7b2",    // truncated UUID
 		"idt_8c5a8e2f-3f1d-5a9b-9c3e-4d8f1e5a7b2cZZ", // trailing garbage
 		"idt_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",   // non-hex chars
@@ -531,4 +532,96 @@ func TestDeleteIdentity_QueryError(t *testing.T) {
 	err = ds.DeleteIdentity("idt123")
 	assert.Error(t, err)
 	assert.Equal(t, apierror.ErrInternalServer, err.(apierror.APIError).Code)
+}
+
+// TestCreateIdentity_CommitsTheEventWithTheIdentity is requirement R-2 for identity creation,
+// and like its ledger counterpart the assertion is the SHAPE OF THE TRANSACTION.
+//
+// identity.created used to be inserted from a goroutine after CreateIdentity had committed, so a
+// crash in between left an identity no subscriber would hear about. The ordered expectations pin
+// the repair — BEGIN, the identity INSERT, the event INSERT, COMMIT — and moving the event
+// insert back out of the transaction breaks only that ordering, which is why it is what is
+// asserted.
+func TestCreateIdentity_CommitsTheEventWithTheIdentity(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO blnk.identity").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery("INSERT INTO blnk.event_outbox").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(77)))
+	mock.ExpectCommit()
+
+	var seen model.Identity
+	created, err := ds.CreateIdentity(model.Identity{FirstName: "Ada", LastName: "Lovelace"},
+		func(entity model.Identity) (*model.EventOutbox, error) {
+			seen = entity
+
+			return &model.EventOutbox{
+				EventID:      "2f6b8c1d-4e7a-4b3c-9d5e-6f7a8b9c0d1e",
+				EventType:    "identity.created",
+				AggregateID:  entity.IdentityID,
+				PartitionKey: entity.IdentityID,
+				Topic:        "blnk.identities",
+				Payload:      json.RawMessage(`{"event":"identity.created","data":{}}`),
+			}, nil
+		})
+
+	require.NoError(t, err)
+	assert.Contains(t, created.IdentityID, "idt_")
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"the identity and its event must be inserted inside ONE transaction, in that order")
+
+	assert.Equal(t, created.IdentityID, seen.IdentityID,
+		"the preparer must be handed the created identity, carrying the resolved id the event's "+
+			"aggregate id is derived from")
+	assert.False(t, seen.CreatedAt.IsZero())
+}
+
+// TestCreateIdentity_APreparerFailureCreatesNoIdentity pins the fail-closed half: an identity
+// whose event cannot be built is not created, rather than created with its event lost.
+func TestCreateIdentity_APreparerFailureCreatesNoIdentity(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectBegin()
+	mock.ExpectExec("INSERT INTO blnk.identity").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectRollback()
+
+	_, err = ds.CreateIdentity(model.Identity{FirstName: "Doomed"},
+		func(model.Identity) (*model.EventOutbox, error) {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "cannot serialise", nil)
+		})
+
+	require.Error(t, err, "the preparer's failure must be reported rather than swallowed")
+	// The returned value is deliberately not asserted to be empty: every error path in this
+	// method returns the identity alongside the error, and a caller must read err. What matters
+	// is that NOTHING WAS COMMITTED, which the rollback expectation below is what proves.
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"the identity INSERT must be rolled back rather than left committed without its event")
+}
+
+// TestCreateIdentity_WithoutAPreparerIssuesOneStatement keeps the unconfigured path free of a
+// transaction, and keeps every pre-existing caller's expectation matching.
+func TestCreateIdentity_WithoutAPreparerIssuesOneStatement(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	assert.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec("INSERT INTO blnk.identity").WillReturnResult(sqlmock.NewResult(1, 1))
+
+	created, err := ds.CreateIdentity(model.Identity{FirstName: "Plain"})
+
+	require.NoError(t, err)
+	assert.Contains(t, created.IdentityID, "idt_")
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"a create with no preparer must issue exactly one statement and open no transaction")
 }

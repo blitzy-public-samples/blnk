@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -41,6 +42,15 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
+
+// eventTopicAssuranceTimeout bounds the Kafka topic assurance performed at start-up.
+//
+// It is a bound rather than a preference: assurance is a synchronous round trip to a broker
+// that may not be listening yet, and an unbounded one would hold the process short of serving
+// traffic for as long as the broker stayed unreachable. Fifteen seconds is comfortably longer
+// than creating eight topics takes on a healthy cluster and short enough that a broker which
+// is not there yet costs one log line instead of a stalled deployment.
+const eventTopicAssuranceTimeout = 15 * time.Second
 
 /*
 serveTLS starts an HTTPS server with TLS enabled using CertMagic for automatic certificate management.
@@ -384,6 +394,134 @@ func startEventMetricsCollector(
 	}
 }
 
+// startEventRelay assures the Kafka topics exist and starts the transactional event outbox
+// relay, returning the function that stops it.
+//
+// # Without this the pipeline has no production driver at all
+//
+// Every producer captures its event into blnk.event_outbox inside the ledger transaction, and
+// the relay is the ONLY thing that publishes those rows to Kafka. Until this call existed the
+// relay was constructible and fully tested and was never constructed by a running process, so
+// a deployment with KAFKA_BROKERS set accumulated outbox rows indefinitely and delivered
+// nothing — with no error anywhere, because capturing the row had succeeded every time.
+//
+// It runs in the SERVER role, beside the lineage outbox processor and the event metrics
+// collector, because that is where this codebase already puts outbox background work. Putting
+// it in the worker role would mean a fourth asynq server and two roles that both had to be
+// deployed for events to flow.
+//
+// # Topic assurance comes FIRST, and a failure does not stop the relay
+//
+// Assurance is what gives the topics their required partition count and replication factor;
+// a topic auto-created by the broker would have neither, and per-aggregate ordering depends on
+// the partition count. So it runs before the first publish can happen.
+//
+// A failure is logged and stepped past rather than fatal, and that is deliberate. The usual
+// cause is a broker that is not listening yet — a compose stack coming up, a rolling restart —
+// and refusing to start the relay would mean events stayed unpublished until somebody
+// restarted the process, converting a transient condition into an outage. The relay retries
+// every publish and dead-letters what it cannot deliver, so a genuinely missing topic surfaces
+// as dead letters and the 15-minute dead-letter alert, not as silence.
+//
+// # No brokers is a legitimate steady state
+//
+// With KAFKA_BROKERS unset there is nothing to relay to and the producers deliver over the
+// legacy webhook transport directly. That is reported at info level once, not treated as a
+// misconfiguration: it is how every deployment runs before it opts into Kafka, and it is what
+// the graceful-degradation contract promises.
+//
+// Parameters:
+//   - ctx context.Context: cancelling it stops the relay.
+//   - instance *blnk.Blnk: the service container, which supplies the datasource, the shared
+//     publisher and the legacy transport.
+//   - cfg *config.Configuration: read for the broker list.
+//
+// Returns:
+//   - func(): stops the relay and closes the admin client. Never nil, so the caller can defer
+//     it unconditionally.
+func startEventRelay(
+	ctx context.Context,
+	instance *blnk.Blnk,
+	cfg *config.Configuration,
+) func() {
+	if cfg == nil || !blnk.KafkaBrokersConfigured(cfg.Kafka.Brokers) {
+		logrus.Info(
+			"no Kafka brokers are configured, so the event outbox relay is not started; ledger events " +
+				"are delivered over the legacy webhook transport, which is the documented steady state " +
+				"for a deployment that has not migrated",
+		)
+
+		return func() {}
+	}
+
+	assureEventTopics(ctx, cfg)
+
+	relay := blnk.NewEventRelayProcessor(instance)
+	relay.Start(ctx)
+
+	return relay.Stop
+}
+
+// assureEventTopics creates or grows the event topics to the configured geometry, logging what
+// it did and what it could not do.
+//
+// It is separated from startEventRelay so the admin client's lifetime is exactly this call:
+// assurance is a one-shot startup operation, and holding its connections open for the process
+// lifetime would keep a SASL session per broker for something that never runs again.
+//
+// Parameters:
+//   - ctx context.Context: bounded here, because assurance must not delay startup indefinitely
+//     against an unreachable broker.
+//   - cfg *config.Configuration: read for the broker list and the topic geometry.
+func assureEventTopics(ctx context.Context, cfg *config.Configuration) {
+	admin, err := blnk.NewKafkaAdmin(cfg)
+	if err != nil {
+		logrus.WithError(err).Error(
+			"the Kafka admin client could not be built, so the event topics were not assured; the relay " +
+				"still starts and publishes, but a topic that does not exist — or one whose partition " +
+				"count or replication factor is wrong — will not be corrected",
+		)
+
+		return
+	}
+	defer func() {
+		if closeErr := admin.Close(); closeErr != nil {
+			logrus.WithError(closeErr).Warn("closing the Kafka admin client after topic assurance failed")
+		}
+	}()
+
+	assurance, cancel := context.WithTimeout(ctx, eventTopicAssuranceTimeout)
+	defer cancel()
+
+	report, err := admin.EnsureTopics(assurance)
+	if err != nil {
+		// The report is populated even on failure, so how far assurance got is reported
+		// alongside the reason it stopped.
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"created":            report.CreatedCount,
+			"grown":              report.GrownCount,
+			"unchanged":          report.UnchangedCount,
+			"growth_refused":     report.GrowthRefusedCount,
+			"partitions":         report.Partitions,
+			"replication_factor": report.ReplicationFactor,
+		}).Error(
+			"assuring the Kafka event topics failed; the relay still starts, so events publish to " +
+				"whatever topics exist and dead-letter what they cannot reach",
+		)
+
+		return
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"topics":             len(report.Topics),
+		"created":            report.CreatedCount,
+		"grown":              report.GrownCount,
+		"unchanged":          report.UnchangedCount,
+		"partitions":         report.Partitions,
+		"replication_factor": report.ReplicationFactor,
+	}).Info("Kafka event topics assured")
+}
+
 // Renamed from initializeObservability to better reflect its purpose
 func initializeTelemetryAndObservability(ctx context.Context, cfg *config.Configuration) (posthog.Client, func(context.Context) error, error) {
 	var phClient posthog.Client
@@ -477,6 +615,32 @@ func serverCommands(b *blnkInstance) *cobra.Command {
 				defer chainProcessor.Stop()
 			}
 
+			// Assure the Kafka topic catalogue, THEN start the event outbox relay. The
+			// order is the point: the relay's first publish must not be the thing that
+			// discovers a missing topic, because auto-creation is disabled and a publish
+			// to a topic that does not exist fails, retries and then fails to
+			// dead-letter for the same reason.
+			//
+			// Both calls are unconditional and both self-guard, which is what keeps this
+			// call site four lines and keeps a Kafka-less deployment working unchanged.
+			// assureEventTopics logs and returns when no broker is configured;
+			// Start refuses, with a named reason, when the publisher is absent or is the
+			// no-op — and refusing there is essential rather than tidy, because running
+			// the relay against the no-op publisher would mark the entire outbox
+			// dispatched while sending nothing, destroying every pending event.
+			//
+			// The relay belongs to the SERVER role, beside the lineage processor and the
+			// event metrics collector, following this repository's convention that outbox
+			// relays live where the outbox background work already is. Starting it in the
+			// worker role as well would have two processes claiming the same rows — which
+			// the FOR UPDATE SKIP LOCKED claim tolerates, but it would double the broker
+			// connections and the dual-delivery enqueues for no gain.
+			assureEventTopics(ctx, cfg)
+
+			eventRelay := blnk.NewEventRelayProcessor(b.blnk)
+			eventRelay.Start(ctx)
+			defer eventRelay.Stop()
+
 			// Start the event metrics collector. It is the ONLY production maintainer of
 			// the event pipeline's three gauges — the outbox backlog, the dead-letter age
 			// and subscriber consumer lag — and without it all three are declared,
@@ -494,6 +658,22 @@ func serverCommands(b *blnkInstance) *cobra.Command {
 			stopEventMetrics := startEventMetricsCollector(ctx, b.blnk, cfg)
 			defer stopEventMetrics()
 
+			// Start the Kafka event outbox relay. It is the ONLY thing that publishes the
+			// rows every producer captures inside its ledger transaction, so without it a
+			// Kafka-configured deployment fills the outbox and delivers nothing. Topic
+			// assurance runs first, inside the helper; see its documentation for why a
+			// failure there does not stop the relay.
+			stopEventRelay := startEventRelay(ctx, b.blnk, cfg)
+			defer stopEventRelay()
+
+			// The retention sweeper runs beside the relay, in the same role and with the same
+			// lifecycle. Without it blnk.event_outbox grows without bound: every delivered and
+			// every dead-lettered row stays for ever, so the table the relay's claim query scans
+			// keeps getting larger and the oldest rows are kept long past any replay window.
+			// It is a no-op unless RELAY_EVENT_RETENTION_DAYS is set.
+			stopEventRetention := startEventRetention(ctx, b.blnk)
+			defer stopEventRetention()
+
 			// Start server
 			if err := startServer(router, cfg.Server.Port); err != nil {
 				logrus.Fatal(err)
@@ -502,4 +682,56 @@ func serverCommands(b *blnkInstance) *cobra.Command {
 	}
 
 	return cmd
+}
+
+// startEventRetention starts the event outbox retention sweeper and returns the function
+// that stops it.
+//
+// # The two obstacles are logged differently, and the difference matters
+//
+// RETENTION DISABLED is the default and is logged at info. It is not a fault: an operator
+// who has not set a retention period has not misconfigured anything, and reporting it as a
+// warning on every start-up would train them to ignore the one message that is a warning.
+// The line still names the variable, because an operator who BELIEVES retention is on needs
+// to be able to discover that it is not.
+//
+// ANYTHING ELSE is logged at warning, because it means retention IS configured and is not
+// running — the control the operator asked for is absent, and the symptom of that is a table
+// that quietly keeps growing.
+//
+// A cleanup FUNCTION rather than a deferred stop, for the reason the other two starters
+// return one: a defer inside this helper would fire on return and stop the sweeper before it
+// ever ticked.
+//
+// Parameters:
+//   - ctx context.Context: cancelling it stops the sweeper.
+//   - instance *blnk.Blnk: the service container, for its datasource and configuration.
+//
+// Returns:
+//   - func(): stops the sweeper and waits for the sweep in flight. Never nil.
+func startEventRetention(ctx context.Context, instance *blnk.Blnk) func() {
+	sweeper := blnk.NewEventRetentionSweeper(instance)
+
+	if obstacle := sweeper.StartupObstacle(); obstacle != nil {
+		if errors.Is(obstacle, blnk.ErrEventRetentionDisabled) {
+			logrus.Info(
+				"event outbox retention is disabled; delivered and dead-lettered event rows are kept " +
+					"indefinitely. Set RELAY_EVENT_RETENTION_DAYS to a positive number of days to have " +
+					"them deleted after that period",
+			)
+
+			return func() {}
+		}
+
+		logrus.WithError(obstacle).Warn(
+			"event outbox retention is configured but the sweeper could not start, so nothing will " +
+				"delete delivered or dead-lettered event rows",
+		)
+
+		return func() {}
+	}
+
+	sweeper.Start(ctx)
+
+	return sweeper.Stop
 }

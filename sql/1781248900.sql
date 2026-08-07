@@ -51,14 +51,25 @@
 -- authorises at topic and group granularity only — no ACL operation restricts a
 -- principal to a subset of a topic's partitions, or to records carrying a
 -- particular key — so a principal permitted to read a topic can read EVERY record
--- in that topic no matter what that column holds. The column is an advisory
--- consumer-side filter and is documented as one where it is declared below.
+-- in that topic no matter what that column holds.
 --
 -- The distinction is not pedantry. Describing the key prefix as isolation would
 -- mean believing that two subscribers authorised for one topic cannot see each
 -- other's events. They can. Anyone making a tenancy decision on the strength of
 -- that belief would be granting a shared topic to parties who must not see one
 -- another's data, and the registry would look correct while they did it.
+--
+-- SO THE COLUMN FAILS CLOSED RATHER THAN DESCRIBING ITSELF AS ADVISORY: a row
+-- carrying a non-empty partition_key_prefix records an authorization narrower than
+-- any credential Blnk can mint, and credential issuance REFUSES for that row. The
+-- column's own declaration below states it again at the point of use.
+--
+-- REVOCATION IS ALSO PART OF THE BOUNDARY, and it is a two-step lifecycle rather
+-- than a delete. revocation_pending_at is the tombstone deregistration sets before
+-- it touches the broker; the row is removed only once broker-side cleanup is
+-- confirmed. provisioning_token and provisioning_until are the fence that stops two
+-- concurrent issuances — or an issuance racing a revocation — from leaving the
+-- broker's credential and this table's reference describing different secrets.
 --
 -- THIS TABLE NEVER STORES A SECRET — see the credential group below, which states
 -- the constraint in full. In short: the SASL password is generated at issuance,
@@ -86,8 +97,16 @@
 --
 -- Finally, this table is deliberately small and read-rarely: it is consulted once
 -- per credential issuance and during migration reporting, and never on the
--- transaction hot path. That is why the three indexes below are enough, and why a
--- fourth would be cost without a reader.
+-- transaction hot path. That is why the four indexes below are enough — the two
+-- uniqueness constraints the access model depends on, plus one each for the
+-- migration report and the registry listing — and why a fifth would be cost
+-- without a reader.
+--
+-- The revocation tombstone and the provisioning fence deliberately get NO index of
+-- their own, and the reasoning is the same one: every read of them is either by
+-- subscriber_id, which rides the unique index already, or an operator's scan of a
+-- registry small enough that a scan is the cheaper plan. An index whose only reader
+-- is a once-in-a-while incident query costs every write and buys nothing.
 CREATE TABLE IF NOT EXISTS blnk.event_subscribers (
     -- Surrogate key, matching blnk.lineage_outbox and the sibling
     -- blnk.event_outbox. The key callers use is subscriber_id below; this one
@@ -173,26 +192,35 @@ CREATE TABLE IF NOT EXISTS blnk.event_subscribers (
     -- them, and each of them is a thing an ACL would otherwise be granted over.
     authorized_topics     TEXT[]                    NOT NULL DEFAULT '{}',
 
-    -- An ADVISORY CONSUMER-SIDE FILTER. NOT an authorization boundary, and nothing
-    -- may treat it as one. See the boundary note above the table.
+    -- A KEY-SCOPED AUTHORIZATION CONSTRAINT THAT KAFKA CANNOT ENFORCE, and
+    -- therefore a column whose non-NULL value makes the subscriber
+    -- UNPROVISIONABLE. See the boundary note above the table.
     --
-    -- Its honest purpose: a hint the subscriber may use to discard records it does
-    -- not care about, and a place to record which slice of a shared topic is
-    -- *intended* for it. Blnk keys every event by ledger ID, so a subscriber
-    -- interested in one ledger can filter on that key rather than processing the
-    -- whole topic.
+    -- What a value here means: the caller has recorded that this subscriber is
+    -- authorised only for records whose key carries this prefix. Blnk keys every
+    -- event by ledger ID, so that is a statement about which ledgers the subscriber
+    -- may see.
     --
-    -- What it CANNOT do: keep the subscriber from reading anything. Kafka has no
-    -- ACL that restricts a principal to a key range or a partition subset, so a
-    -- principal with Read on a topic reads all of it. The filter runs in the
-    -- consumer, on records the broker has already handed over, and a subscriber
-    -- that simply ignores the hint sees everything on every topic it is authorised
-    -- for. Enforcement is topic-level and group-level ACLs; this column has no part
-    -- in it.
+    -- What Kafka can do about it: NOTHING. There is no ACL that restricts a
+    -- principal to a key range or a partition subset, so a principal with Read on a
+    -- topic reads all of it. Any narrowing would have to run in the consumer, on
+    -- records the broker has already handed over, and a subscriber that ignores it
+    -- sees everything on every topic it is authorised for.
     --
-    -- Nullable, and the NULL carries meaning: no advisory narrowing is recorded.
-    -- A reader must treat NULL as "no filter suggested" and never as "filter to the
-    -- empty prefix", which would invert the intent.
+    -- So issuance FAILS CLOSED on this column. EventSubscriberService.
+    -- IssueSubscriberCredential refuses to mint a credential for a row carrying a
+    -- non-empty prefix, and names the two ways forward: clear it to accept
+    -- whole-topic access, or narrow authorized_topics, which IS enforceable. The
+    -- column previously described itself as an "advisory consumer-side filter",
+    -- which was a more dangerous framing however carefully qualified — a reader
+    -- deciding tenancy from this table would grant a shared topic believing the
+    -- prefix confined the subscriber to its own records. A qualification in a
+    -- comment does not survive that reading; a refused issuance does.
+    --
+    -- Nullable, and the NULL carries meaning: no key constraint is recorded, which
+    -- is the only state a credential can be issued in. A reader must treat NULL as
+    -- "no constraint" and never as "constrained to the empty prefix", which would
+    -- invert the intent.
     partition_key_prefix  TEXT                      NULL,
 
     -- ===================================================================
@@ -295,6 +323,71 @@ CREATE TABLE IF NOT EXISTS blnk.event_subscribers (
     -- YET MIGRATED, which is exactly what migration-progress reporting counts and
     -- what idx_event_subscribers_migrated_at below exists to serve.
     migrated_at           TIMESTAMP WITH TIME ZONE  NULL,
+
+    -- ===================================================================
+    -- Group 4b: the revocation lifecycle
+    --
+    -- ENDING A SUBSCRIBER'S ACCESS IS TWO SYSTEMS' WORK AND CANNOT BE ONE
+    -- STATEMENT. The broker holds the SCRAM credential and the ACL bindings; this
+    -- table holds the principal and topic list that say WHICH credential and WHICH
+    -- bindings. There is no transaction spanning the two, so the order matters and
+    -- only one order is safe.
+    --
+    -- Deregistration used to DELETE the row and then revoke. When the revocation
+    -- failed, the principal kept authenticating and kept reading, and the only
+    -- record of which principal that was had just been destroyed — recoverable
+    -- solely from a log line, if anyone read it. The residue was live access that
+    -- nothing in Blnk could see.
+    --
+    -- So the row is TOMBSTONED first, the broker is revoked second, and the row is
+    -- deleted only once that revocation has been confirmed. A row still carrying
+    -- revocation_pending_at is the durable to-do item: it names the principal to
+    -- revoke, and retrying the deregistration finishes the job.
+    -- ===================================================================
+
+    -- When deregistration began taking this subscriber's broker-side access away.
+    --
+    -- NULL for every ordinary subscriber. NON-NULL means "this subscriber is being
+    -- taken out of service and its broker-side access may still be live": it is not
+    -- an active subscriber, credential issuance refuses for it, and it disappears
+    -- only when the revocation has succeeded.
+    revocation_pending_at TIMESTAMP WITH TIME ZONE  NULL,
+
+    -- ===================================================================
+    -- Group 4c: the provisioning fence
+    --
+    -- TWO CONCURRENT ISSUANCES FOR ONE SUBSCRIBER CANNOT BOTH BE RIGHT. Kafka
+    -- stores ONE SCRAM credential per principal, so the second upsert replaces the
+    -- first: after two overlapping issuances the broker holds one password while
+    -- this table may hold a reference derived from the other, and the caller
+    -- holding the recorded one cannot authenticate. The conditional credential
+    -- write catches the case where both observed the same prior reference, but it
+    -- cannot decide which password the BROKER ended up with — that is settled by
+    -- whichever call reached the broker last, independently of who won the
+    -- database.
+    --
+    -- These two columns are the fence that makes the overlap impossible. An
+    -- issuance claims the subscriber before it touches Kafka: the claim is an
+    -- atomic conditional UPDATE that stamps a token and a lease, and it succeeds
+    -- only when no live claim exists. A second issuance is refused as a conflict
+    -- instead of racing. Revocation and deregistration claim it too, so an issuance
+    -- cannot interleave with the removal of the very credential it is writing.
+    --
+    -- This is the SAME claim-token-and-lease shape blnk.event_outbox uses, and for
+    -- the same two reasons: it is cross-process without a lock server, and a
+    -- process that dies mid-issuance does not fence the subscriber for ever —
+    -- the lease expires and the next attempt proceeds.
+    -- ===================================================================
+
+    -- The token of the issuance or revocation currently holding this subscriber.
+    -- NULL when nothing holds it. Rotated on every claim, so a caller whose lease
+    -- expired cannot release or complete a claim that has since been taken over.
+    provisioning_token    TEXT                      NULL,
+
+    -- When the current claim expires. A claim is live only while this is in the
+    -- future, which is what makes a crashed issuance self-healing rather than a
+    -- permanent block.
+    provisioning_until    TIMESTAMP WITH TIME ZONE  NULL,
 
     -- ===================================================================
     -- Group 5: row bookkeeping
@@ -449,6 +542,20 @@ CREATE TABLE IF NOT EXISTS blnk.event_subscribers (
     CONSTRAINT event_subscribers_credential_pair_chk CHECK (
         (credential_reference IS NULL AND credential_issued_at IS NULL)
         OR (credential_reference IS NOT NULL AND credential_issued_at IS NOT NULL)
+    ),
+
+    -- The provisioning fence is ONE claim and must be written or cleared as one,
+    -- for the same reason the credential record is.
+    --
+    -- A token with no expiry is a claim that never lapses: the subscriber would be
+    -- fenced for ever and no issuance could ever proceed again, which is a
+    -- self-inflicted outage that only a hand-written UPDATE could clear. An expiry
+    -- with no token is a lease belonging to nobody — nothing can release or complete
+    -- it, because every conditional transition matches on the token. Both NULL is
+    -- the ordinary state of a subscriber nobody is provisioning.
+    CONSTRAINT event_subscribers_fence_pair_chk CHECK (
+        (provisioning_token IS NULL AND provisioning_until IS NULL)
+        OR (provisioning_token IS NOT NULL AND provisioning_until IS NOT NULL)
     )
 );
 

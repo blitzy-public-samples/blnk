@@ -85,11 +85,11 @@ import (
 //
 // # What this file deliberately does NOT do
 //
-//   - Message keying. Per-aggregate ordering comes from keying each Kafka message by
-//     ledger ID with a stable hash balancer, plus the relay claiming outbox rows in
-//     occurrence order. Topic layout supports that guarantee; it does not implement
-//     it. The key belongs to the publisher, and putting it here would split one
-//     ordering decision across two files.
+//   - Message keying. Ordering comes from keying each Kafka message by the outbox row's
+//     STORED PARTITION KEY with a stable hash balancer, plus the relay claiming rows in
+//     occurrence order. Topic layout supports that guarantee; it does not implement it.
+//     The key belongs to the publisher, and putting it here would split one ordering
+//     decision across two files.
 //   - Partition count and replication factor. Both are configuration
 //     (config.Kafka.MinPartitions, default 6, which is the required minimum; and
 //     config.Kafka.ReplicationFactor, 3 in production and necessarily 1 on the
@@ -99,31 +99,12 @@ import (
 //     environments impossible.
 //   - Topic creation, ACLs, or any other broker-side effect. This file returns strings.
 //
-// ===== SUNSET RELOCATION TARGET =====
-//
-// getEventFromStatus RELOCATES INTO THIS FILE when the legacy HTTP webhook transport
-// is retired. That is step 1 of the ordered sunset procedure documented at the foot of
-// webhooks.go, and this comment is the receiving half of that contract.
-//
-// Why it moves rather than dying with its host file: getEventFromStatus IS the
-// transaction event-string vocabulary. Seven of the thirteen event names Blnk emits
-// originate in it — transaction.queued, transaction.applied, transaction.scheduled,
-// transaction.inflight, transaction.void, transaction.rejected and the
-// transaction.unknown fall-through — and those names are precisely what this file
-// routes to a topic. Deleting webhooks.go without moving it first would delete the
-// vocabulary that the routing consumes. It belongs here for the same reason NewWebhook
-// belongs with the outbox: it is contract, not transport.
-//
-// DO NOT MOVE IT NOW, AND DO NOT DECLARE IT HERE NOW. webhooks.go is its sole
-// declaration site for the whole dual-delivery window; a second declaration in this
-// file is a duplicate declaration in package blnk and the build fails immediately.
-// When the window has closed, the move is a cut-and-paste of the function and its doc
-// comment — including the deliberately preserved StatusCommit fall-through, which must
-// not be "fixed" as part of the move — from webhooks.go into this file. Every root
-// .go file is package blnk, so it is a file move inside one package: no import
-// changes, and transaction_execution.go's call site keeps compiling untouched.
-//
-// ===== END SUNSET RELOCATION TARGET =====
+// getEventFromStatus, which produces the seven transaction.* names this file routes, is
+// declared in webhooks.go for the whole dual-delivery window and must outlive that file:
+// it is the transaction event-string vocabulary, not part of the HTTP transport. The
+// ordered removal procedure — including where the two surviving symbols go — is recorded
+// once, in the sunset block at the foot of webhooks.go, and is operator work rather than
+// anything the runtime date performs.
 
 // DefaultTopicPrefix is the topic namespace used when KAFKA_TOPIC_PREFIX is not
 // configured. It yields the documented default topic names: blnk.transactions,
@@ -186,8 +167,8 @@ const topicPrefixTrimCutset = " \t\n\v\f\r" + topicSeparator
 //
 // The list itself now lives in model.AllEventCategories rather than being re-declared
 // here. It used to be a second copy, and a second copy of an enumeration is a second
-// thing to forget: adding the quarantine category to model without adding it here
-// would have produced a topic that events route to and that nothing provisions.
+// thing to forget: adding a category to model without adding it here would have
+// produced a topic that events route to and that nothing provisions.
 //
 // eventCategoryOrder is the local, immutable snapshot every accessor copies from, so
 // no caller can reorder or truncate the list for everybody else.
@@ -196,7 +177,7 @@ func eventCategoryOrder() []string {
 }
 
 // EventCategories returns the event category tokens in canonical order:
-// "transactions", "balances", "identities", "system", "quarantine".
+// "transactions", "balances", "identities", "system".
 //
 // These are bare tokens, not topic names. Compose a topic from one with
 // TopicForCategory; treating a returned value as a topic is a bug.
@@ -208,8 +189,8 @@ func EventCategories() []string {
 }
 
 // SubscriberGrantableTopics returns the fully-qualified topics a subscriber may be
-// authorised to consume: the category topics of every NON-INTERNAL category, with the
-// configured prefix applied.
+// authorised to consume: every category topic, with the configured prefix applied, and
+// no dead-letter sibling.
 //
 // # This function is an authorization allowlist, not a convenience
 //
@@ -227,8 +208,8 @@ func EventCategories() []string {
 //     topic names. That is operational detail for whoever runs Blnk, not data for the
 //     subscriber whose event failed. Dead letters are triaged through the
 //     master-key-gated dead-letter API instead.
-//   - INTERNAL CATEGORIES. The system topic carries Blnk's own error records and the
-//     quarantine topic carries events of unknown provenance; see
+//   - INTERNAL CATEGORIES. The system topic carries Blnk's own error records and, as
+//     the catalogue's catch-all, events of unknown provenance; see
 //     model.IsInternalEventCategory.
 //   - ANYTHING NOT ON THIS LIST. Including a topic that merely looks Blnk-owned. The
 //     test is membership in this exact set, never a prefix match, because a prefix
@@ -404,13 +385,14 @@ func TopicPrefix() string {
 func TopicForCategory(category string) string {
 	category = strings.Trim(category, topicPrefixTrimCutset)
 	if category == "" {
-		// Quarantine, not the system category. A blank category means the caller
-		// could not classify the event, which is exactly what quarantine is for:
-		// the event still lands on a real topic and stays replayable, but on one
-		// that is internal and that no subscriber can be granted, so a routing
-		// omission cannot deliver a domain payload to the wrong audience. See
-		// model.EventCategoryQuarantine.
-		category = model.EventCategoryQuarantine
+		// The system category, which is model.EventCategory's own catch-all. A
+		// blank category means the caller could not classify the event, and the
+		// system category is where an unclassifiable event belongs for one
+		// concrete reason: it is INTERNAL, so no subscriber can be granted its
+		// topic. The event still lands on a real topic and stays replayable,
+		// while a routing omission cannot deliver a domain payload to an audience
+		// that never asked for it. See model.EventCategorySystem.
+		category = model.EventCategorySystem
 	}
 
 	return TopicPrefix() + topicSeparator + category
@@ -432,8 +414,8 @@ func TopicForCategory(category string) string {
 //	                   transaction.unknown, and any bulk_transaction.<status>
 //	blnk.balances      balance.created, balance.monitor
 //	blnk.identities    identity.created
-//	blnk.system        ledger.created, system.error                (internal)
-//	blnk.quarantine    anything this catalogue does not recognise   (internal)
+//	blnk.system        ledger.created, system.error, and anything this catalogue
+//	                   does not recognise                          (internal)
 //
 // Two properties of that resolution are easy to get wrong and are worth stating
 // explicitly, because both live in the delegated mapping rather than here:
@@ -442,17 +424,16 @@ func TopicForCategory(category string) string {
 //     runtime as "bulk_transaction." + batch status, so the suffix set is open and an
 //     exact-match table would silently route every one of them to the catch-all. Any
 //     status value, including one introduced later, routes to blnk.transactions.
-//   - An UNRECOGNISED event type routes to blnk.quarantine, NOT to blnk.system. It is
-//     never rejected, and this function never returns an empty string: the relay
+//   - An UNRECOGNISED event type routes to blnk.system, the catalogue's catch-all. It
+//     is never rejected, and this function never returns an empty string: the relay
 //     publishes whatever topic it is given, so an empty result would strand a
-//     committed event and dropping it would lose one. What changed is the
-//     DESTINATION. The system topic used to be the catch-all, which meant a producer
-//     added without extending the catalogue delivered its payload — possibly a
-//     balance or an identity record — to whoever consumes system events. Quarantine
-//     is internal and cannot be granted to any subscriber, so the same omission is
-//     contained rather than turned into a disclosure, while the event stays durable,
-//     observable and replayable. Anything landing there is a defect to fix by
-//     extending model.EventCategory.
+//     committed event and dropping it would lose one. The destination is safe because
+//     blnk.system is INTERNAL and cannot be granted to any subscriber, so a producer
+//     added without extending the catalogue cannot deliver its payload — possibly a
+//     balance or an identity record — to an audience that never asked for it, while
+//     the event stays durable, observable and replayable. Anything landing there
+//     under an unrecognised name is a defect to fix by extending
+//     model.EventCategory, and the publisher warns when it happens.
 //
 // Parameters:
 //   - eventType string: the event name, for example "transaction.applied". May be
@@ -551,10 +532,9 @@ func IsDeadLetterTopic(topic string) bool {
 }
 
 // AllTopics returns every category topic in canonical order, with the configured
-// prefix applied: blnk.transactions, blnk.balances, blnk.identities, blnk.system and
-// blnk.quarantine.
+// prefix applied: blnk.transactions, blnk.balances, blnk.identities and blnk.system.
 //
-// These are the topics events are published to, INCLUDING the two internal ones — Blnk
+// These are the topics events are published to, INCLUDING the internal one — Blnk
 // writes to all of them, and all of them must be provisioned. Which of them a
 // subscriber may be granted is a different question, answered by
 // SubscriberGrantableTopics. It excludes the dead-letter siblings; use
@@ -577,7 +557,7 @@ func AllTopics() []string {
 
 // AllDeadLetterTopics returns every dead-letter topic in canonical order, with the
 // configured prefix applied: blnk.transactions.dlt, blnk.balances.dlt,
-// blnk.identities.dlt, blnk.system.dlt and blnk.quarantine.dlt.
+// blnk.identities.dlt and blnk.system.dlt.
 //
 // Each is the DLTFor sibling of the AllTopics entry at the same index, so the two
 // slices can be zipped safely.
@@ -595,8 +575,8 @@ func AllDeadLetterTopics() []string {
 }
 
 // AllTopicsWithDeadLetters returns every topic Blnk owns: every category topic
-// followed by every dead-letter sibling — ten names with the five categories declared
-// today.
+// followed by every dead-letter sibling — eight names with the four categories the
+// topic contract declares.
 //
 // THIS IS THE SINGLE SOURCE OF TRUTH FOR THE TOPIC INVENTORY. The admin client's topic
 // assurance creates and grows exactly this set, and the local provisioning script

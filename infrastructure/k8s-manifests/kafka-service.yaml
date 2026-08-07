@@ -1,15 +1,39 @@
-# The Kafka broker's Service surface, and it is TWO Services in ONE file by
-# design:
+# The Kafka broker's Service surface. It is SEVERAL Services in ONE file by
+# design, and they serve three different audiences:
 #
-#   kafka           the client-facing ClusterIP Service. KAFKA_BROKERS names it
-#                   bare as kafka:9092, exactly as data_source.dns names
-#                   postgres and redis.dns names redis in blnk-config.yaml.
-#   kafka-headless  the headless companion kafka-statefulset.yaml points its
-#                   serviceName at, which is what gives every broker pod a
-#                   stable DNS name of its own.
+#   kafka             the INTERNAL client-facing ClusterIP Service. KAFKA_BROKERS
+#                     names it bare as kafka:9092, exactly as data_source.dns
+#                     names postgres and redis.dns names redis in
+#                     blnk-config.yaml. Blnk's publisher, relay and admin client
+#                     dial this and nothing else.
+#   kafka-headless    the headless companion kafka-statefulset.yaml points its
+#                     serviceName at, which is what gives every broker pod a
+#                     stable DNS name of its own.
+#   kafka-external-N  one per BROKER, carrying the externally advertised listener
+#                     that SUBSCRIBERS connect to. KAFKA_SUBSCRIBER_BROKERS names
+#                     these, never the ClusterIP above.
+#
+# # Why a subscriber cannot be given kafka:9092
+#
+# The ClusterIP Service resolves only inside the cluster, so a credential naming
+# it is valid and unusable from anywhere a subscriber actually runs. That is not
+# merely a DNS detail: a Kafka client bootstraps against any broker, receives the
+# metadata response, and then connects DIRECTLY to the leader of each partition
+# using the ADDRESS THAT BROKER ADVERTISES for the listener the client arrived
+# on. An in-cluster listener advertises an in-cluster name, so an external client
+# that somehow reached it would be redirected straight back to an unresolvable
+# address. External access therefore needs its own listener with its own
+# advertised address — which is why config.KafkaConfig carries two broker lists
+# and the credential endpoint returns only the subscriber-facing one.
+#
+# BOTH SERVICES MUST BE DEPLOYED. Clients resolve the broker through the
+# load-balanced `kafka` name, while the brokers themselves need the per-pod names
+# only the headless Service provides, for their advertised listeners and their
+# KRaft voter set. Whether the two live in one file or two is immaterial; applying
+# only one of them is not.
 #
 # Nothing else belongs here. Consumer lag is measured in-process by
-# event_admin.go, differencing OffsetFetch against ListOffsets over the client
+# event_admin.go, differencing OffsetFetch against ListOffsets over the internal
 # Service below, so this deployment needs no lag-exporter workload and no
 # Service to expose one.
 apiVersion: v1
@@ -50,8 +74,9 @@ spec:
 status:
   loadBalancer: {}
 # --------------------------------------------------------------------------
-# DO NOT SPLIT THIS FILE APART. What follows is a SECOND Service, not a second
-# copy of the first, and both are load-bearing:
+# --------------------------------------------------------------------------
+# WHAT FOLLOWS IS A SECOND SERVICE, not a second copy of the first, and BOTH
+# must be deployed:
 #
 #   * clients — the event publisher, the outbox relay and
 #     scripts/kafka-provision.sh — dial the load-balanced `kafka` above;
@@ -59,11 +84,10 @@ status:
 #     controller.quorum.voters have to name one specific pod each, and only a
 #     headless Service publishes a per-pod name.
 #
-# They share this file because the implementation plan names exactly one
-# Service manifest for this folder, so a separate kafka-headless-service.yaml
-# would be an invented filename. The `---` below is consequently the first
-# document separator in infrastructure/k8s-manifests/; it is deliberate rather
-# than a stray marker left behind by an editor.
+# The `---` below is a document separator, deliberate rather than a stray
+# marker. Splitting the two Services into separate files is harmless as long as
+# both are applied; deploying only one is not.
+# --------------------------------------------------------------------------
 # --------------------------------------------------------------------------
 ---
 apiVersion: v1
@@ -112,7 +136,145 @@ spec:
   # Identical to the client Service's selector, and to the StatefulSet's
   # selector.matchLabels: both Services front the same three broker pods and
   # differ only in how they are addressed.
+  #
+  # THREE PODS MEANS THREE VOLUMES, and it is worth saying here because this is
+  # the file that establishes the broker count. Per-pod identity is what makes
+  # per-pod STORAGE possible: kafka-statefulset.yaml declares a
+  # `volumeClaimTemplates` entry named `kafka-data`, so Kubernetes materialises
+  # kafka-data-kafka-0, -1 and -2 and re-binds each to the same ordinal across
+  # restarts. The standalone kafka-data-persistentvolumeclaim.yaml is the Kompose
+  # companion declaration of that claim's SHAPE — 10Gi, ReadWriteOnce — in the
+  # same way pg-data-persistentvolumeclaim.yaml is for postgres; it is NOT the
+  # storage these pods mount, and it could not be. One ReadWriteOnce claim is
+  # mountable by one node at a time, whereas each broker needs its own KRaft
+  # metadata log, and three brokers writing into one log directory corrupt it
+  # rather than reporting an error. That file's header states the whole contract.
   selector:
     io.kompose.service: kafka
+status:
+  loadBalancer: {}
+# --------------------------------------------------------------------------
+# THE SUBSCRIBER-FACING LISTENER, ONE SERVICE PER BROKER.
+#
+# These three Services are what KAFKA_SUBSCRIBER_BROKERS names, and they are the
+# only addresses POST /subscribers/{id}/kafka-credentials may hand out. Blnk
+# refuses to issue a credential while that variable is empty rather than
+# returning the internal ClusterIP name, so this surface is a PREREQUISITE for
+# subscriber onboarding — not an optional extra.
+#
+# # Why one per broker rather than one load-balanced Service
+#
+# A single Service in front of three brokers is correct for BOOTSTRAP and wrong
+# for everything after it. A client dials any broker to fetch metadata and then
+# talks directly to the leader of each partition at the address that broker
+# advertised. Round-robining every connection across three brokers would send
+# produce and fetch requests to brokers that do not hold the partition, and the
+# advertised address could only ever name one of them — so each broker needs its
+# own externally reachable address, and each must advertise its own.
+#
+# # WHAT THE BROKER MUST BE CONFIGURED WITH (kafka-statefulset.yaml)
+#
+# These Services expose port 29092, which the broker must serve as a SECOND
+# listener beside the internal 9092 — one listener cannot advertise two
+# addresses. The StatefulSet's broker configuration therefore needs, per pod:
+#
+#   listeners=BROKER://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+#   advertised.listeners=BROKER://kafka-<ordinal>.kafka-headless.blnk.svc.cluster.local:9092,\
+#                        EXTERNAL://<the address of that pod's kafka-external-<ordinal>>:29092
+#   listener.security.protocol.map=BROKER:SASL_SSL,EXTERNAL:SASL_SSL,CONTROLLER:SASL_PLAINTEXT
+#   inter.broker.listener.name=BROKER
+#   authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+#
+# SASL_SSL rather than SASL_PLAINTEXT on the external listener is not a
+# preference: SCRAM proves knowledge of a password without encrypting the
+# session, so an unencrypted external listener exposes the ledger and identity
+# payloads this system exists to protect, and the authorizer line is what makes
+# the per-subscriber ACLs actually enforced instead of merely accepted.
+#
+# The EXTERNAL address is deployment-specific and cannot be committed here: it is
+# whatever the provisioned load balancer answers on. Fill it into the
+# StatefulSet's per-pod configuration and into KAFKA_SUBSCRIBER_BROKERS together
+# — a comma-separated list of all three, so a subscriber can bootstrap against
+# any of them.
+#
+# # type: LoadBalancer, and how to change it
+#
+# LoadBalancer is used because it needs no knowledge of node addresses and works
+# on every managed cluster. On a cluster without a load-balancer controller,
+# change each of these to `type: NodePort` with a distinct `nodePort:` per broker
+# and advertise <node-address>:<nodePort> instead. What must NOT change is the
+# one-Service-per-broker shape or the per-pod selector below.
+#
+# # The selector is per POD, not per workload
+#
+# statefulset.kubernetes.io/pod-name is set automatically by the StatefulSet
+# controller on every pod it creates, and it is the only label that identifies
+# ONE broker. Selecting on io.kompose.service like the Services above would put
+# all three brokers behind all three addresses, which is precisely the
+# round-robin failure this surface exists to avoid.
+#
+# ONE SERVICE PER REPLICA: if kafka-statefulset.yaml's replica count changes,
+# this list changes with it. A broker with no external Service is unreachable by
+# subscribers holding partitions it leads, and an external Service with no broker
+# is an address that never answers.
+# --------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: Service
+metadata:
+  creationTimestamp: null
+  labels:
+    io.kompose.service: kafka
+    blnk.finance/kafka-listener: external
+  name: kafka-external-0
+  namespace: blnk
+spec:
+  type: LoadBalancer
+  ports:
+    - name: "29092"
+      port: 29092
+      targetPort: 29092
+  selector:
+    statefulset.kubernetes.io/pod-name: kafka-0
+status:
+  loadBalancer: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  creationTimestamp: null
+  labels:
+    io.kompose.service: kafka
+    blnk.finance/kafka-listener: external
+  name: kafka-external-1
+  namespace: blnk
+spec:
+  type: LoadBalancer
+  ports:
+    - name: "29092"
+      port: 29092
+      targetPort: 29092
+  selector:
+    statefulset.kubernetes.io/pod-name: kafka-1
+status:
+  loadBalancer: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  creationTimestamp: null
+  labels:
+    io.kompose.service: kafka
+    blnk.finance/kafka-listener: external
+  name: kafka-external-2
+  namespace: blnk
+spec:
+  type: LoadBalancer
+  ports:
+    - name: "29092"
+      port: 29092
+      targetPort: 29092
+  selector:
+    statefulset.kubernetes.io/pod-name: kafka-2
 status:
   loadBalancer: {}

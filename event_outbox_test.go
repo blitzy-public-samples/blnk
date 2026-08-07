@@ -71,12 +71,18 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/google/uuid"
+	"github.com/hibiken/asynq"
 	"github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/database"
@@ -622,6 +628,95 @@ func newOutboxBlnk(t *testing.T, cnf *config.Configuration, ds database.IDataSou
 	return &Blnk{config: cnf, datasource: ds}
 }
 
+// outboxLegacyQueueName is the webhook queue the legacy-transport cases enqueue onto.
+//
+// It matches the literal the existing webhook tests use, so the two files describe the same
+// queue rather than two plausible-looking ones.
+const outboxLegacyQueueName = "webhook_queue"
+
+// outboxLegacyWebhookURL is the endpoint the legacy-transport cases configure.
+//
+// The .invalid TLD is reserved by RFC 2606 and never resolves, which is deliberate: these
+// tests assert what is ENQUEUED, and a URL that could resolve would leave open the
+// possibility of an outbound request escaping the test.
+const outboxLegacyWebhookURL = "http://webhook.invalid/blnk"
+
+// outboxLegacyWebhookConfiguration returns the PRE-MIGRATION steady state: a webhook URL, a
+// queue to enqueue onto, and no Kafka broker anywhere.
+//
+// This is the configuration the overwhelming majority of existing deployments are in, and the
+// one every deployment is in before it opts into Kafka. Events must still be delivered in it.
+//
+// Parameters:
+//   - redisAddress string: the address of the Redis the asynq client enqueues into.
+//
+// Returns:
+//   - *config.Configuration: a webhook-only configuration.
+func outboxLegacyWebhookConfiguration(redisAddress string) *config.Configuration {
+	return &config.Configuration{
+		Redis: config.RedisConfig{Dns: redisAddress},
+		Queue: config.QueueConfig{WebhookQueue: outboxLegacyQueueName, NumberOfQueues: 1},
+		Notification: config.Notification{
+			Webhook: config.WebhookConfig{Url: outboxLegacyWebhookURL},
+		},
+	}
+}
+
+// newOutboxLegacyBlnk builds a Blnk whose asynq client enqueues into a real (in-process)
+// Redis, which is what makes the legacy leg OBSERVABLE rather than merely unerroring.
+//
+// The instance is assembled directly rather than through NewBlnk for the same reason
+// newOutboxBlnk is: no search client, hook manager, tokenizer or event publisher belongs on
+// this path, and none of them should be able to make the outcome depend on infrastructure.
+// The asynq client is the one exception, because the enqueue IS the behaviour under test.
+//
+// Parameters:
+//   - t *testing.T: the test, used for the Redis lifecycle and the client's cleanup.
+//   - cnf *config.Configuration: the configuration to cache and publish. Its Redis.Dns must
+//     be the address the returned client enqueues into.
+//   - ds database.IDataSource: the datasource, which the legacy path must never reach.
+//
+// Returns:
+//   - *Blnk: an instance whose SendWebhook enqueues into cnf.Redis.Dns.
+func newOutboxLegacyBlnk(t *testing.T, cnf *config.Configuration, ds database.IDataSource) *Blnk {
+	t.Helper()
+
+	outboxStoreConfiguration(t, cnf)
+
+	client := asynq.NewClient(asynq.RedisClientOpt{Addr: cnf.Redis.Dns})
+	t.Cleanup(func() { _ = client.Close() })
+
+	return &Blnk{config: cnf, datasource: ds, asynqClient: client}
+}
+
+// outboxPendingLegacyTasks returns the tasks waiting on the legacy webhook queue.
+//
+// A queue asynq has never seen is reported by the inspector as ErrQueueNotFound, and that is
+// the shape "nothing was enqueued" takes rather than an error worth failing on — so it is
+// normalised to an empty result. Every other failure is fatal, because a test that could not
+// read the queue has not observed anything and must not report success.
+//
+// Parameters:
+//   - t *testing.T: the test, used for the inspector's cleanup and for fatal failures.
+//   - redisAddress string: the Redis the tasks were enqueued into.
+//
+// Returns:
+//   - []*asynq.TaskInfo: the pending tasks, in queue order. Empty when nothing was enqueued.
+func outboxPendingLegacyTasks(t *testing.T, redisAddress string) []*asynq.TaskInfo {
+	t.Helper()
+
+	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: redisAddress})
+	t.Cleanup(func() { _ = inspector.Close() })
+
+	tasks, err := inspector.ListPendingTasks(outboxLegacyQueueName)
+	if errors.Is(err, asynq.ErrQueueNotFound) {
+		return nil
+	}
+	require.NoError(t, err, "the legacy webhook queue must be readable for this assertion to mean anything")
+
+	return tasks
+}
+
 // outboxSpyDatasource records which outbox insert was called, with which transaction and
 // which row, and is the harness for every path-selection assertion below.
 //
@@ -655,6 +750,56 @@ type outboxSpyDatasource struct {
 	inTxTransactions []*sql.Tx
 	// insertErr is returned by both methods, so a persistence failure can be simulated.
 	insertErr error
+
+	// recordInsertDeadlines opts into recording the DEADLINE each insert ran under.
+	//
+	// It is opt-in because most tests here are about which path was taken and which row
+	// was passed, and recording a deadline they never read would be noise. The tests that
+	// do read it are asserting the fix for an unbounded detached capture: a context with
+	// no deadline can never give up, so an outbox insert on one blocks for as long as the
+	// database stays unresponsive, holding a goroutine and a pool connection, failing
+	// nothing and logging nothing.
+	recordInsertDeadlines bool
+	// standaloneDeadlineValues are the deadlines standalone inserts ran under, in call
+	// order. A nil entry means the context carried none, which is the defect.
+	standaloneDeadlineValues []*time.Time
+	// inTxDeadlineValues are the deadlines in-transaction inserts ran under, in call
+	// order. A nil entry here is CORRECT: the deadline on that path belongs to the
+	// caller's transaction.
+	inTxDeadlineValues []*time.Time
+}
+
+// contextDeadline extracts a context's deadline as a nil-able value, so "carried no
+// deadline" is representable rather than indistinguishable from the zero time.
+func contextDeadline(ctx context.Context) *time.Time {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil
+	}
+
+	return &deadline
+}
+
+// standaloneDeadlines returns a copy of the deadlines standalone inserts ran under.
+func (s *outboxSpyDatasource) standaloneDeadlines() []*time.Time {
+	s.guard.Lock()
+	defer s.guard.Unlock()
+
+	deadlines := make([]*time.Time, len(s.standaloneDeadlineValues))
+	copy(deadlines, s.standaloneDeadlineValues)
+
+	return deadlines
+}
+
+// inTransactionDeadlines returns a copy of the deadlines in-transaction inserts ran under.
+func (s *outboxSpyDatasource) inTransactionDeadlines() []*time.Time {
+	s.guard.Lock()
+	defer s.guard.Unlock()
+
+	deadlines := make([]*time.Time, len(s.inTxDeadlineValues))
+	copy(deadlines, s.inTxDeadlineValues)
+
+	return deadlines
 }
 
 // newOutboxSpyDatasource returns a spy wired for use as the Blnk datasource.
@@ -663,23 +808,29 @@ func newOutboxSpyDatasource() *outboxSpyDatasource {
 }
 
 // InsertEventOutbox records a standalone insert.
-func (s *outboxSpyDatasource) InsertEventOutbox(_ context.Context, e *model.EventOutbox) error {
+func (s *outboxSpyDatasource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox) error {
 	s.guard.Lock()
 	defer s.guard.Unlock()
 
 	s.standaloneRows = append(s.standaloneRows, e)
+	if s.recordInsertDeadlines {
+		s.standaloneDeadlineValues = append(s.standaloneDeadlineValues, contextDeadline(ctx))
+	}
 
 	return s.insertErr
 }
 
 // InsertEventOutboxInTx records an in-transaction insert, keeping the transaction it was
 // given so its identity can be asserted.
-func (s *outboxSpyDatasource) InsertEventOutboxInTx(_ context.Context, tx *sql.Tx, e *model.EventOutbox) error {
+func (s *outboxSpyDatasource) InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *model.EventOutbox) error {
 	s.guard.Lock()
 	defer s.guard.Unlock()
 
 	s.inTxTransactions = append(s.inTxTransactions, tx)
 	s.inTxRows = append(s.inTxRows, e)
+	if s.recordInsertDeadlines {
+		s.inTxDeadlineValues = append(s.inTxDeadlineValues, contextDeadline(ctx))
+	}
 
 	return s.insertErr
 }
@@ -691,6 +842,42 @@ func (s *outboxSpyDatasource) standalone() []*model.EventOutbox {
 
 	rows := make([]*model.EventOutbox, len(s.standaloneRows))
 	copy(rows, s.standaloneRows)
+
+	return rows
+}
+
+// standaloneCopies returns VALUE COPIES of the rows inserted outside any transaction.
+//
+// standalone hands back the very pointers a producer passed in, which is what most assertions
+// want: they read fields, and reading alongside the producer is safe. A caller that means to
+// MUTATE a row is different. Stamping the surrogate primary key the INSERT would have returned
+// is a WRITE, and when the producer ran on its own goroutine — notification.NotifyError does —
+// that goroutine still holds the row after the insert returns and reads its id into a span
+// attribute. Writing into the same object is a data race, and the race detector says so.
+//
+// Copying is also the more faithful arrangement: a relay never receives the producer's own
+// object. It reads the row back out of the table.
+//
+// A nil row is copied as a zero value rather than skipped, so the count a caller asserts on
+// still reflects what was recorded and the missing fields fail loudly rather than silently
+// shortening the slice.
+//
+// Returns:
+//   - []model.EventOutbox: one value copy per recorded standalone insert, in call order.
+func (s *outboxSpyDatasource) standaloneCopies() []model.EventOutbox {
+	s.guard.Lock()
+	defer s.guard.Unlock()
+
+	rows := make([]model.EventOutbox, 0, len(s.standaloneRows))
+	for _, row := range s.standaloneRows {
+		if row == nil {
+			rows = append(rows, model.EventOutbox{})
+
+			continue
+		}
+
+		rows = append(rows, *row)
+	}
 
 	return rows
 }
@@ -711,14 +898,26 @@ func (s *outboxSpyDatasource) inTx() ([]*model.EventOutbox, []*sql.Tx) {
 
 // assertWroteNothing asserts neither insert path was taken. It is the mechanical form of
 // "the event was not captured".
-func (s *outboxSpyDatasource) assertWroteNothing(t *testing.T) {
+//
+// Parameters:
+//   - t *testing.T: the test to fail.
+//   - reasons ...string: optional context appended to the failure message. "Nothing was
+//     written" is expected for several different reasons — unconfigured, legacy-only,
+//     unmarshalable — and a failure that says which one was expected is the difference
+//     between a diagnosable report and a bare "not empty".
+func (s *outboxSpyDatasource) assertWroteNothing(t *testing.T, reasons ...string) {
 	t.Helper()
 
 	standalone := s.standalone()
 	inTxRows, _ := s.inTx()
 
-	assert.Empty(t, standalone, "no standalone insert may have been issued")
-	assert.Empty(t, inTxRows, "no in-transaction insert may have been issued")
+	context := strings.Join(reasons, "; ")
+	if context != "" {
+		context = ": " + context
+	}
+
+	assert.Empty(t, standalone, "no standalone insert may have been issued"+context)
+	assert.Empty(t, inTxRows, "no in-transaction insert may have been issued"+context)
 }
 
 // newOutboxSQLDatasource returns a real database.Datasource over a go-sqlmock connection,
@@ -925,6 +1124,111 @@ func TestPrepareEventOutbox_LedgerCreatedPayloadIsExactlyTheDocumentedObject(t *
 
 	assert.Equal(t, expected, string(row.Payload),
 		"the stored payload must be exactly the documented two-key object")
+}
+
+// TestPrepareEventOutbox_SpanWithholdsTheFinancialIdentifiers is the DATA-01 tracing guard.
+//
+// # Why a span is not a lesser exposure than a log line
+//
+// The prepared-row span event used to export event.aggregate_id, event.partition_key and
+// event.ledger_id IN THE CLEAR, while the log path around it treated the very same values as
+// sensitive: the relay's row fields omit the partition key outright, and the dead-letter log
+// fields carry only a hash of it, both on the stated ground that it is a financial identifier.
+// That inconsistency did not reduce the disclosure, it relocated it — a span leaves the
+// process, is retained by a collector, and is routinely readable by a wider audience than the
+// database it came from.
+//
+// # What is asserted, and why the absence is checked against every attribute
+//
+// The identifiers must not appear ANYWHERE on the span: not as the attribute they used to be,
+// not under a renamed key, and not spliced into a span or event name. So this walks every
+// attribute of every recorded span and every span event and asserts the raw values are absent,
+// rather than asserting that three specific keys are gone — which a rename would satisfy while
+// leaking exactly as before.
+//
+// The partition key is then asserted PRESENT AS A HASH, because dropping it entirely would cost
+// a real diagnostic: the key decides the partition and therefore whether the per-aggregate
+// ordering guarantee holds, and a stable hash groups one aggregate's spans together — the
+// actual tracing question — without publishing the identifier.
+func TestPrepareEventOutbox_SpanWithholdsTheFinancialIdentifiers(t *testing.T) {
+	const (
+		ledgerID    = "ldg_span_disclosure_probe"
+		balanceID   = "bln_span_disclosure_probe"
+		aggregateID = balanceID
+	)
+
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	previousProvider := otel.GetTracerProvider()
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() {
+		otel.SetTracerProvider(previousProvider)
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Logf("failed to shut down the recording tracer provider: %v", err)
+		}
+	})
+
+	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
+
+	row := mustPrepareEventOutbox(t, blnk, NewWebhook{
+		Event:   "balance.created",
+		Payload: &model.Balance{BalanceID: balanceID, LedgerID: ledgerID, Currency: "USD"},
+	}, WithEventLedgerID(ledgerID))
+
+	// The row itself still carries every identifier: this is a TELEMETRY redaction, not a
+	// reduction in what is durably recorded. The outbox row is the authoritative place an
+	// operator looks up what an event belonged to, and it must remain complete.
+	require.Equal(t, ledgerID, row.LedgerID, "the row must still record the ledger")
+	require.Equal(t, ledgerID, row.PartitionKey,
+		"a supplied ledger is the partition key, so the fixture exercises the key that used to be exported")
+	require.Equal(t, aggregateID, row.AggregateID, "the row must still record the aggregate")
+
+	spans := recorder.Ended()
+	require.NotEmpty(t, spans, "the recorder must have captured the PrepareEventOutbox span, or nothing below is exercised")
+
+	prepared := 0
+	partitionKeyHashes := []string{}
+
+	for _, span := range spans {
+		attributeSets := [][]attribute.KeyValue{span.Attributes()}
+		for _, event := range span.Events() {
+			attributeSets = append(attributeSets, event.Attributes)
+
+			assert.NotContains(t, event.Name, ledgerID, "a span event name must not carry the ledger either")
+			assert.NotContains(t, event.Name, aggregateID)
+
+			if event.Name != "Event outbox entry prepared" {
+				continue
+			}
+
+			prepared++
+			for _, kv := range event.Attributes {
+				if kv.Key == "event.partition_key_hash" {
+					partitionKeyHashes = append(partitionKeyHashes, kv.Value.AsString())
+				}
+			}
+		}
+
+		assert.NotContains(t, span.Name(), ledgerID, "a span name must not carry the ledger")
+
+		for _, set := range attributeSets {
+			for _, kv := range set {
+				rendered := kv.Value.Emit()
+				assert.NotContains(t, rendered, ledgerID,
+					"attribute %q exports the ledger id in the clear", kv.Key)
+				assert.NotContains(t, rendered, balanceID,
+					"attribute %q exports the balance id — the aggregate and the partition key — in the clear", kv.Key)
+			}
+		}
+	}
+
+	require.Equal(t, 1, prepared, "exactly one prepared-row span event is expected for one prepared row")
+	require.Len(t, partitionKeyHashes, 1, "the partition key must still be reported, as a hash")
+
+	assert.Equal(t, hashLogIdentifier(row.PartitionKey), partitionKeyHashes[0],
+		"the hash must be the same projection the dead-letter log fields use, so a span and a log line about one event correlate")
+	assert.NotEmpty(t, partitionKeyHashes[0], "a hash of a non-empty key must be non-empty, or correlation is impossible")
+	assert.NotEqual(t, row.PartitionKey, partitionKeyHashes[0], "the hash must not be the identifier itself")
 }
 
 // TestPrepareEventOutbox_BulkTransactionPayloadShapes covers all three shapes the
@@ -1722,10 +2026,10 @@ func TestPrepareEventOutbox_UnkeyableEventGetsTheSentinelPartitionKey(t *testing
 	assert.Equal(t, unkeyedEventPartitionKey, row.AggregateID,
 		"aggregate_id inherits the key once every payload-derived candidate is exhausted")
 	assert.Empty(t, row.EventType, "the event type really is empty; nothing was invented")
-	assert.Equal(t, "blnk.quarantine", row.Topic,
-		"an unrecognised event type is routed to the quarantine catch-all rather than stranded")
-	assert.NotEqual(t, "blnk.system", row.Topic,
-		"and NOT to the system topic, whose consumers expect Blnk's own ledger and error records")
+	assert.Equal(t, "blnk.system", row.Topic,
+		"an unrecognised event type is routed to the internal system catch-all rather than stranded")
+	assert.False(t, IsSubscriberGrantableTopic(row.Topic),
+		"and that destination must be one no subscriber can be granted, so an unclassifiable event is contained rather than disclosed")
 	assert.Equal(t, `{"event":"","data":null}`, string(row.Payload),
 		"the payload is still the two-key envelope, faithfully describing an empty event")
 }
@@ -1895,14 +2199,22 @@ func TestPrepareEventOutbox_ReturnsNilWhenPublishingIsNotConfigured(t *testing.T
 	}
 }
 
-// TestPrepareEventOutbox_IsConfiguredByEitherTransport asserts the positive half of the
-// contract: EITHER transport being configured is enough to capture the event.
+// TestPrepareEventOutbox_IsConfiguredByKafkaBrokers asserts the positive half of the
+// contract: the outbox captures an event when, and only when, KAFKA IS CONFIGURED.
 //
-// That is deliberate rather than lax. The outbox row feeds both transports — during the
-// dual-delivery window the relay publishes it to Kafka and enqueues the legacy webhook task
-// from the same row — so a deployment mid-migration with only a webhook URL still needs its
-// rows captured, and a deployment past the sunset with only brokers obviously does too.
-func TestPrepareEventOutbox_IsConfiguredByEitherTransport(t *testing.T) {
+// # Why a webhook URL alone is NOT enough, having once been treated as enough
+//
+// The outbox is only a destination while something drains it, and the relay refuses to run
+// without Kafka — handed the no-op publisher it would report every publish as dispatched and
+// retire the entire outbox having sent nothing. A webhook-only deployment that captured rows
+// therefore accumulated them and delivered none of them, silently, because the producers had
+// stopped calling SendWebhook themselves.
+//
+// Capture is tied to the transport that can actually be drained, and the webhook-only case
+// keeps the transport it always had: PublishEvent sends it straight down SendWebhook. That
+// path is asserted by TestPublishEvent_WebhookOnlyDeploymentStillDeliversOverTheLegacyTransport;
+// what this test pins is that no unrelayable row is written.
+func TestPrepareEventOutbox_IsConfiguredByKafkaBrokers(t *testing.T) {
 	configured := []struct {
 		name          string
 		configuration *config.Configuration
@@ -1923,14 +2235,6 @@ func TestPrepareEventOutbox_IsConfiguredByEitherTransport(t *testing.T) {
 			name: "a blank entry alongside a real broker",
 			configuration: &config.Configuration{
 				Kafka: config.KafkaConfig{Brokers: []string{"", "localhost:9092"}},
-			},
-		},
-		{
-			name: "the legacy webhook URL only, as a deployment mid-migration has",
-			configuration: &config.Configuration{
-				Notification: config.Notification{
-					Webhook: config.WebhookConfig{Url: "https://example.com/webhooks"},
-				},
 			},
 		},
 		{
@@ -1956,6 +2260,130 @@ func TestPrepareEventOutbox_IsConfiguredByEitherTransport(t *testing.T) {
 			assert.Equal(t, "transaction.applied", row.EventType)
 		})
 	}
+
+	t.Run("a legacy webhook URL alone captures nothing", func(t *testing.T) {
+		datasource := newOutboxSpyDatasource()
+		blnk := newOutboxBlnk(t, &config.Configuration{
+			Notification: config.Notification{
+				Webhook: config.WebhookConfig{Url: "https://example.com/webhooks"},
+			},
+		}, datasource)
+
+		row, err := blnk.PrepareEventOutbox(context.Background(), NewWebhook{
+			Event:   "transaction.applied",
+			Payload: outboxSampleTransaction(StatusApplied),
+		})
+		require.NoError(t, err, "having no broker is a steady state, not a failure")
+		assert.Nil(t, row,
+			"with no Kafka there is no relay to claim the row, so capturing one would strand it "+
+				"forever while the configured webhook went unsent")
+
+		datasource.assertWroteNothing(t)
+	})
+}
+
+// TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent is the other half of
+// F-09's fix: having established that a webhook-only deployment captures nothing, this states
+// what it does INSTEAD.
+//
+// It makes exactly the call every producer made before this feature existed — SendWebhook —
+// so the deployment's behaviour is unchanged, which is what AAP §0.5.4 requires of the
+// KAFKA_BROKERS-empty state. Without this the fix would trade one silent failure for another.
+//
+// The instance is built by NewBlnk against miniredis rather than assembled by hand, because
+// SendWebhook enqueues through the asynq client and a hand-built instance has none: the
+// enqueue is the observable behaviour, so it has to be real.
+func TestPublishEvent_DeliversOverTheLegacyTransportWhenKafkaIsAbsent(t *testing.T) {
+	newLegacyOnlyInstance := func(t *testing.T, webhookURL string) (*Blnk, *outboxSpyDatasource) {
+		t.Helper()
+
+		redisServer := miniredis.RunT(t)
+		datasource := newOutboxSpyDatasource()
+
+		outboxStoreConfiguration(t, &config.Configuration{
+			Redis: config.RedisConfig{Dns: redisServer.Addr()},
+			Queue: config.QueueConfig{
+				WebhookQueue:   "webhook_queue_legacy_only_test",
+				IndexQueue:     "index_queue_legacy_only_test",
+				NumberOfQueues: 1,
+			},
+			Notification: config.Notification{
+				Webhook: config.WebhookConfig{Url: webhookURL},
+			},
+		})
+
+		instance, err := NewBlnk(datasource)
+		require.NoError(t, err)
+		t.Cleanup(func() { assert.NoError(t, instance.Close()) })
+		require.True(t, IsNoopEventPublisher(instance.events),
+			"no brokers must select the no-op publisher, which is what makes the relay refuse to "+
+				"run and therefore what makes the legacy path the only delivery route")
+
+		return instance, datasource
+	}
+
+	event := NewWebhook{Event: "transaction.applied", Payload: outboxSampleTransaction(StatusApplied)}
+
+	t.Run("the legacy task is enqueued and no outbox row is written", func(t *testing.T) {
+		instance, datasource := newLegacyOnlyInstance(t, "https://example.com/webhooks")
+
+		require.NoError(t, instance.PublishEvent(context.Background(), event))
+
+		datasource.assertWroteNothing(t)
+
+		// The enqueue is observed on the queue itself rather than inferred from the absence
+		// of an error, because "returned nil" is exactly what the broken behaviour did too.
+		inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: instance.Config().Redis.Dns})
+		t.Cleanup(func() { assert.NoError(t, inspector.Close()) })
+
+		info, err := inspector.GetQueueInfo("webhook_queue_legacy_only_test")
+		require.NoError(t, err,
+			"the webhook queue must exist, which it only does once something was enqueued onto it")
+		assert.Equal(t, 1, info.Size,
+			"exactly one legacy delivery task must be queued: this is the delivery a webhook-only "+
+				"deployment had before the outbox existed and must still have")
+	})
+
+	t.Run("no webhook URL and no brokers stays a complete no-op", func(t *testing.T) {
+		instance, datasource := newLegacyOnlyInstance(t, "")
+
+		require.NoError(t, instance.PublishEvent(context.Background(), event),
+			"a deployment with no notification sink at all is a legitimate steady state, exactly "+
+				"as SendWebhook returning nil on an empty URL has always made it")
+
+		datasource.assertWroteNothing(t)
+
+		inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: instance.Config().Redis.Dns})
+		t.Cleanup(func() { assert.NoError(t, inspector.Close()) })
+
+		info, err := inspector.GetQueueInfo("webhook_queue_legacy_only_test")
+		if err == nil {
+			assert.Zero(t, info.Size, "nothing may be enqueued when nothing is configured")
+		}
+	})
+
+	t.Run("the in-transaction entry point delivers nothing and reports success", func(t *testing.T) {
+		instance, datasource := newLegacyOnlyInstance(t, "https://example.com/webhooks")
+
+		// A non-nil transaction is what a caller holding an open ledger transaction passes.
+		// A real one is unnecessary — nothing dereferences it on this path — and opening one
+		// would make this test depend on a database it has no business needing.
+		require.NoError(t, instance.PublishEventInTx(context.Background(), new(sql.Tx), event),
+			"an in-transaction capture on a Kafka-less deployment is a documented no-op, not a failure")
+
+		datasource.assertWroteNothing(t)
+
+		inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: instance.Config().Redis.Dns})
+		t.Cleanup(func() { assert.NoError(t, inspector.Close()) })
+
+		info, err := inspector.GetQueueInfo("webhook_queue_legacy_only_test")
+		if err == nil {
+			assert.Zero(t, info.Size,
+				"asynq is backed by Redis and cannot join a PostgreSQL transaction, so enqueuing "+
+					"here would deliver a webhook for a mutation that may still roll back; the "+
+					"caller's post-commit path is what delivers it")
+		}
+	})
 }
 
 // TestPrepareEventOutbox_ReturnsNilOnAnUnmarshalablePayload asserts that a malformed payload
@@ -2058,10 +2486,28 @@ func TestPrepareEventOutbox_ReturnsNilOnAnUnmarshalablePayload(t *testing.T) {
 // TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction asserts the path selection
 // for a caller that has no ledger transaction to enrol in.
 //
-// ledger.created, identity.created, balance.created, balance.monitor,
-// bulk_transaction.<status> and system.error all arrive this way. They still belong in the
-// outbox so they get the same durable retry, dead-letter and replay treatment as every
-// other event; there is simply no wider transaction to join.
+// # Which events actually arrive this way, and which no longer do
+//
+// The standalone path is for events that accompany NO MUTATION OF THEIR OWN. Three kinds
+// reach it:
+//
+//   - balance.monitor, which reports that a condition was met and changes nothing;
+//   - bulk_transaction.<status>, a batch SUMMARY, whose per-transaction mutations have each
+//     already committed under their own transaction — there is no batch-spanning transaction
+//     for it to join;
+//   - system.error, which describes a failure rather than a write.
+//
+// ledger.created, identity.created and balance.created NO LONGER arrive here, and that is
+// the point of requirement R-2: each is now captured inside its entity's creation
+// transaction through the atomic writers in the database package, so a committed ledger,
+// identity or balance always carries its event. Status-derived transaction events go through
+// the atomic transaction writer for the same reason, with the coalesced-batch path — whose
+// writer arguments are assembled in the frozen transaction_coalescing.go — as the one
+// exception that still captures post-commit.
+//
+// The fixture below still uses ledger.created because this test is about PATH SELECTION
+// given no transaction, not about which producer chooses which path: PublishEvent must issue
+// the standalone insert whenever no transaction is supplied, whatever the event is.
 func TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction(t *testing.T) {
 	datasource := newOutboxSpyDatasource()
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
@@ -2081,6 +2527,109 @@ func TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction(t *testing.T) {
 
 	inTxRows, _ := datasource.inTx()
 	assert.Empty(t, inTxRows, "no transaction was supplied, so none may be used")
+}
+
+// TestPublishEvent_WebhookOnlyDeploymentStillDeliversOverTheLegacyTransport is the other
+// half of TestPrepareEventOutbox_IsConfiguredByKafkaBrokers, and together they describe the
+// whole of what a deployment without a broker does.
+//
+// # The regression this exists to prevent
+//
+// Every producer call site used to call SendWebhook itself. They now call PublishEvent, and
+// for a while PublishEvent's only behaviour was to capture a row. On a deployment with a
+// webhook URL and no broker that combination delivered NOTHING: the relay refuses to run
+// without Kafka, so nobody claimed the rows, and no error was raised anywhere because
+// capturing the row had succeeded. The rows accumulated and the notifications simply stopped.
+//
+// So PublishEvent routes such a deployment straight down the transport it has always used.
+// The four cases below are the four states the two transports can be in, and each pins a
+// different half of the decision:
+//
+//   - webhook only — the legacy enqueue happens and NO row is captured, because a row nobody
+//     drains is worse than no row at all;
+//   - both configured — the outbox wins and there is no publish-time enqueue, because during
+//     the dual-delivery window the relay drives BOTH legs from the one claimed row, which is
+//     what makes their bytes identical;
+//   - neither configured — nothing at all, which is the no-op-when-unconfigured contract;
+//   - a webhook URL with no queue client — a typed error, because that deployment asked for a
+//     transport it has not got and dropping the event silently is how it would never find out.
+//
+// The payload assertion is byte equality against the same legacy body every other test in
+// this file compares against, so the legacy leg is held to the same guarantee as the Kafka
+// leg rather than merely to "something was enqueued".
+func TestPublishEvent_WebhookOnlyDeploymentStillDeliversOverTheLegacyTransport(t *testing.T) {
+	event := NewWebhook{Event: "transaction.applied", Payload: outboxSampleTransaction(StatusApplied)}
+
+	t.Run("a webhook URL and no broker delivers over the legacy transport", func(t *testing.T) {
+		redisServer := miniredis.RunT(t)
+		datasource := newOutboxSpyDatasource()
+		instance := newOutboxLegacyBlnk(t, outboxLegacyWebhookConfiguration(redisServer.Addr()), datasource)
+
+		require.NoError(t, instance.PublishEvent(context.Background(), event),
+			"a webhook-only deployment must deliver the event, not fail on it")
+
+		tasks := outboxPendingLegacyTasks(t, redisServer.Addr())
+		require.Len(t, tasks, 1,
+			"exactly one legacy delivery must be enqueued; this is the delivery that silently stopped happening")
+		assert.Equal(t, outboxLegacyQueueName, tasks[0].Type,
+			"the task type and the queue name are deliberately the same string: the mux dispatches on the type")
+		assert.Equal(t, outboxLegacyQueueName, tasks[0].Queue,
+			"the task must land on the configured webhook queue, whose mux has the handler for it")
+		assert.Equal(t, string(outboxLegacyWebhookBody(t, event)), string(tasks[0].Payload),
+			"the enqueued body must be the legacy two-key envelope byte for byte, exactly as the producers sent it before")
+
+		datasource.assertWroteNothing(t,
+			"no relay can drain this deployment's outbox, so capturing a row here would strand it forever")
+	})
+
+	t.Run("a configured broker keeps the outbox as the destination", func(t *testing.T) {
+		redisServer := miniredis.RunT(t)
+		cnf := outboxLegacyWebhookConfiguration(redisServer.Addr())
+		cnf.Kafka = config.KafkaConfig{Brokers: []string{"localhost:9092"}}
+
+		datasource := newOutboxSpyDatasource()
+		instance := newOutboxLegacyBlnk(t, cnf, datasource)
+
+		require.NoError(t, instance.PublishEvent(context.Background(), event))
+
+		standalone := datasource.standalone()
+		require.Len(t, standalone, 1,
+			"with a broker configured the event belongs in the outbox, whichever other transports are also configured")
+		assert.Equal(t, "transaction.applied", standalone[0].EventType)
+
+		assert.Empty(t, outboxPendingLegacyTasks(t, redisServer.Addr()),
+			"the legacy leg is the relay's to drive from the claimed row; enqueuing here as well would deliver the event twice")
+	})
+
+	t.Run("neither transport configured is a no-op", func(t *testing.T) {
+		redisServer := miniredis.RunT(t)
+		cnf := outboxLegacyWebhookConfiguration(redisServer.Addr())
+		cnf.Notification.Webhook.Url = ""
+
+		datasource := newOutboxSpyDatasource()
+		instance := newOutboxLegacyBlnk(t, cnf, datasource)
+
+		require.NoError(t, instance.PublishEvent(context.Background(), event),
+			"being unconfigured is a legitimate steady state, not a failure of the mutation the caller just performed")
+
+		assert.Empty(t, outboxPendingLegacyTasks(t, redisServer.Addr()),
+			"with no webhook URL there is nowhere to deliver to")
+		datasource.assertWroteNothing(t, "with no broker there is nothing to capture for")
+	})
+
+	t.Run("a webhook URL with no queue client is reported rather than dropped", func(t *testing.T) {
+		datasource := newOutboxSpyDatasource()
+		// Built WITHOUT an asynq client on purpose: this is the shape a half-wired
+		// deployment has, and the event has nowhere to go.
+		instance := newOutboxBlnk(t, outboxLegacyWebhookConfiguration("127.0.0.1:6379"), datasource)
+
+		err := instance.PublishEvent(context.Background(), event)
+		requireAPIErrorCode(t, err, apierror.ErrInternalServer)
+		assert.Contains(t, err.Error(), "queue client",
+			"the error must name what is missing, or an operator cannot act on it")
+
+		datasource.assertWroteNothing(t, "the outbox is not a fallback for a missing queue client")
+	})
 }
 
 // TestPublishEventInTx_UsesTheInTransactionInsertWithTheCallersTransaction asserts the
@@ -2800,10 +3349,10 @@ func TestPublishToTopic_RefusesAnOversizedEnvelopeAsPermanent(t *testing.T) {
 
 	assert.ErrorIs(t, err, ErrEventMessageTooLarge,
 		"the refusal must be recognisable without matching message text")
-	assert.Equal(t, model.PublishStatusFailed, result.Status,
-		"a PERMANENT failure is failed and not retrying: reporting it as retrying would make a "+
-			"message that can never fit indistinguishable from a busy broker, in both the logs "+
-			"and the attempts counter")
+	assert.Equal(t, model.PublishStatusDeadLettered, result.Status,
+		"a PERMANENT failure is terminal and not retrying: it reports the state the event is "+
+			"bound for, because reporting it as retrying would make a message that can never fit "+
+			"indistinguishable from a busy broker, in both the logs and the attempts counter")
 	assert.False(t, result.Retryable,
 		"and nothing further will be tried for it, whatever budget the row states")
 	assert.False(t, result.Dispatched(), "nothing was published")
@@ -3138,4 +3687,206 @@ func TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield(t *testing.T) {
 		assert.Equal(t, without.EventID, with.EventID,
 			"supplying the ledger must not change the idempotency key of an event already delivered")
 	})
+}
+
+// TestBuildTransactionExecutionWork_CapturesTheEventForTheAtomicWriter is the R-2 test for
+// the transaction family: it asserts that the event row exists BEFORE persistence and
+// therefore has something to commit inside.
+//
+// # What it replaces
+//
+// The event used to be captured by postTransactionActions, in a goroutine that runs after
+// the mutation has committed. Every test of that arrangement could only observe that an
+// event eventually appeared, which is true of a pipeline that loses events on any crash,
+// cancellation or insert failure between the commit and the goroutine. The guarantee R-2
+// actually states — the event is in the mutation's own transaction — is a property of WHEN
+// the row is built and WHERE it is passed, so that is what is asserted here.
+//
+// The assertions deliberately reach for the row on the work item rather than for a database
+// effect. The work item is the only place the two facts meet: it is produced before
+// persistence and consumed by the atomic writer, so a row on it is a row that commits with
+// the mutation, and a nil row is post-commit capture by definition.
+func TestBuildTransactionExecutionWork_CapturesTheEventForTheAtomicWriter(t *testing.T) {
+	const ledgerID = "ldg_9c1f4a20"
+
+	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
+
+	sourceBalance := &model.Balance{BalanceID: "bln_source_9c1f", LedgerID: ledgerID, Currency: "USD"}
+	destinationBalance := &model.Balance{BalanceID: "bln_dest_9c1f", LedgerID: ledgerID, Currency: "USD"}
+
+	newTransaction := func() *model.Transaction {
+		return &model.Transaction{
+			TransactionID: "txn_9c1f4a20",
+			Source:        sourceBalance.BalanceID,
+			Destination:   destinationBalance.BalanceID,
+			Amount:        25,
+			PreciseAmount: big.NewInt(2500),
+			Precision:     100,
+			Currency:      "USD",
+			Status:        StatusQueued,
+			CreatedAt:     time.Now().UTC(),
+		}
+	}
+
+	t.Run("the work item carries the event row", func(t *testing.T) {
+		work, skip := blnk.buildTransactionExecutionWork(context.Background(), newTransaction(), sourceBalance, destinationBalance)
+		require.False(t, skip, "a non-zero amount must be persisted")
+		require.NotNil(t, work.eventOutbox,
+			"the event row must be prepared BEFORE persistence; a nil row here means the event "+
+				"can only be captured after the commit, which is what requirement R-2 forbids")
+
+		assert.Equal(t, getEventFromStatus(work.transaction.Status), work.eventOutbox.EventType,
+			"the event name must be derived from the FINAL status, after updateTransactionDetails")
+		assert.Equal(t, work.transaction.TransactionID, work.eventOutbox.AggregateID)
+		assert.Equal(t, model.EventOutboxStatusPending, work.eventOutbox.Status)
+	})
+
+	t.Run("the ledger is resolved from the balances, not supplied by the caller", func(t *testing.T) {
+		work, _ := blnk.buildTransactionExecutionWork(context.Background(), newTransaction(), sourceBalance, destinationBalance)
+		require.NotNil(t, work.eventOutbox)
+
+		assert.Equal(t, ledgerID, work.eventOutbox.LedgerID,
+			"a transaction payload carries no ledger, so the capture path must take it from the "+
+				"loaded source balance; an empty value is requirement R-6 unsatisfied at the producer")
+		assert.Equal(t, ledgerID, work.eventOutbox.PartitionKey,
+			"and it must become the partition key, because that is the Kafka message key")
+		assert.Equal(t, ledgerID, PublishRequestFromOutbox(*work.eventOutbox, 1).Key,
+			"end to end: the message a subscriber receives must be keyed by the ledger")
+	})
+
+	t.Run("the destination ledger is used when the source names none", func(t *testing.T) {
+		source := &model.Balance{BalanceID: sourceBalance.BalanceID}
+
+		work, _ := blnk.buildTransactionExecutionWork(context.Background(), newTransaction(), source, destinationBalance)
+		require.NotNil(t, work.eventOutbox)
+
+		assert.Equal(t, ledgerID, work.eventOutbox.PartitionKey,
+			"a transfer whose source balance carries no ledger must still be keyed by the ledger "+
+				"the destination names, rather than falling through to a balance id")
+	})
+
+	t.Run("a zero-amount transaction captures nothing", func(t *testing.T) {
+		transaction := newTransaction()
+		transaction.PreciseAmount = big.NewInt(0)
+
+		work, skip := blnk.buildTransactionExecutionWork(context.Background(), transaction, sourceBalance, destinationBalance)
+		require.True(t, skip, "a zero-amount transaction is discarded rather than persisted")
+		assert.Nil(t, work.eventOutbox,
+			"there is no mutation for an event to describe, so capturing one would announce a "+
+				"transaction that does not exist")
+	})
+
+	t.Run("no brokers configured captures nothing and fails nothing", func(t *testing.T) {
+		unconfigured := newOutboxBlnk(t, &config.Configuration{}, nil)
+
+		work, skip := unconfigured.buildTransactionExecutionWork(context.Background(), newTransaction(), sourceBalance, destinationBalance)
+		require.False(t, skip)
+		assert.Nil(t, work.eventOutbox,
+			"the no-op-when-unconfigured contract inherited from SendWebhook must survive: with no "+
+				"transport there is nothing to capture and nothing to fail")
+	})
+}
+
+// TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter proves the second
+// half of R-2 for the transaction family: the prepared row actually reaches the writer that
+// commits it.
+//
+// Preparing a row and then dropping it on the floor would satisfy every assertion in the
+// test above while losing exactly as many events as post-commit capture did, so the two
+// tests are only meaningful together. The mock records the variadic tail rather than
+// forwarding it into m.Called — see TestMockDataSource_CapturesTheEventRowsHandedToTheAtomicWriters
+// for why — so CapturedEventOutboxes is what the assertion reads.
+func TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter(t *testing.T) {
+	transaction := &model.Transaction{TransactionID: "txn_5b0d7e14", Status: StatusApplied}
+
+	row := &model.EventOutbox{
+		EventID:      "5b0d7e14-3c2a-4f81-9d6b-7e14a5b0d7e1",
+		EventType:    "transaction.applied",
+		AggregateID:  transaction.TransactionID,
+		LedgerID:     "ldg_5b0d7e14",
+		PartitionKey: "ldg_5b0d7e14",
+		Topic:        "blnk.transactions",
+		Payload:      json.RawMessage(`{"event":"transaction.applied","data":{}}`),
+	}
+
+	datasource := new(mocks.MockDataSource)
+	datasource.On("RecordTransactionWithBalancesAndOutbox",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(transaction, nil)
+
+	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
+
+	persisted, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
+		transaction: transaction,
+		eventOutbox: row,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, persisted.transaction)
+
+	captured := datasource.CapturedEventOutboxes()
+	require.Len(t, captured, 1,
+		"the prepared event row must reach the atomic writer; preparing it and not passing it "+
+			"loses exactly as many events as capturing after the commit did")
+	assert.Equal(t, row.EventID, captured[0].EventID)
+	assert.Equal(t, row.LedgerID, captured[0].LedgerID)
+
+	datasource.AssertExpectations(t)
+}
+
+// TestRejectTransaction_CommitsTheRejectionEventWithTheRejection is the R-2 test for the
+// rejection path, which is the one transaction-recording caller with an event to capture and
+// no balance movement to enrol it beside.
+//
+// It also pins the M-2 half of the same defect: the rejection used to be committed and its
+// event published afterwards by the worker's rejection handler, which then returned the
+// publish error as the asynq task's error — so a failed notification re-ran a rejection that
+// had already happened. Committing the event with the rejection removes the failure mode
+// rather than handling it.
+func TestRejectTransaction_CommitsTheRejectionEventWithTheRejection(t *testing.T) {
+	transaction := &model.Transaction{
+		TransactionID: "txn_2e8b3f70",
+		Source:        "bln_source_2e8b",
+		Destination:   "bln_dest_2e8b",
+		PreciseAmount: big.NewInt(1000),
+		Currency:      "USD",
+		Status:        StatusQueued,
+		CreatedAt:     time.Now().UTC(),
+	}
+
+	datasource := new(mocks.MockDataSource)
+	datasource.On("RecordTransaction", mock.Anything, mock.Anything).Return(transaction, nil)
+
+	// A real Blnk rather than the bare struct newOutboxBlnk builds: RejectTransaction runs the
+	// post-commit actions, which index through the queue, so the instance needs a queue and a
+	// Redis to reach. miniredis is what the legacy webhook tests already use for this.
+	redisServer := miniredis.RunT(t)
+	cnf := outboxPublishingConfiguration()
+	// NewBlnk constructs the real Kafka publisher, which refuses to dial an unencrypted broker
+	// unless a deployment says so in writing. This test never contacts a broker — capture only
+	// writes an outbox row — so the acknowledgement is what lets the publisher be constructed.
+	cnf.Kafka.InsecureLocalDev = true
+	cnf.Redis = config.RedisConfig{Dns: redisServer.Addr()}
+	cnf.Queue = config.QueueConfig{WebhookQueue: "webhook_queue", IndexQueue: "index_queue", NumberOfQueues: 1}
+	outboxStoreConfiguration(t, cnf)
+
+	blnk, err := NewBlnk(datasource)
+	require.NoError(t, err)
+
+	rejected, err := blnk.RejectTransaction(context.Background(), transaction, "insufficient funds")
+	require.NoError(t, err)
+	require.NotNil(t, rejected)
+	assert.Equal(t, StatusRejected, rejected.Status)
+
+	captured := datasource.CapturedEventOutboxes()
+	require.Len(t, captured, 1,
+		"the rejection event must be handed to RecordTransaction so it commits with the rejection")
+	assert.Equal(t, "transaction.rejected", captured[0].EventType,
+		"the event name must come from getEventFromStatus rather than a literal, so it cannot "+
+			"drift from the status-to-event table")
+	assert.Equal(t, transaction.TransactionID, captured[0].AggregateID)
+	assert.Equal(t, transaction.Source, captured[0].PartitionKey,
+		"no balance is loaded for a rejection, so the key falls back to the source balance — the "+
+			"same value the transaction queue already shards on — rather than inventing a ledger id")
+
+	datasource.AssertExpectations(t)
 }

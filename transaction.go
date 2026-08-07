@@ -42,6 +42,37 @@ var asyncTxnSemaphore = semaphore.NewWeighted(20)   // max 20 concurrent async t
 // spawned by post-commit work across all transactions.
 var balanceMonitorSem = make(chan struct{}, 32)
 
+// postTransactionActionSem bounds the number of concurrent post-transaction action
+// goroutines across all transactions.
+//
+// # What was unbounded, and what it cost
+//
+// postTransactionActions spawned one goroutine per transaction with nothing limiting
+// how many could exist at once. That was survivable while the goroutine only enqueued
+// an index batch into Redis, and stopped being survivable once it also had to reach the
+// database: at 500 transactions per second against a database that has begun to stall,
+// the arrival rate is fixed and the completion rate is not, so goroutines accumulate
+// without limit, each holding a connection request, until the process is killed for
+// memory. Nothing in the logs says why, because nothing failed.
+//
+// # Why acquiring in the caller is the point
+//
+// The permit is taken BEFORE the goroutine is spawned, so a saturated pool is felt by
+// the producer as backpressure rather than absorbed as unbounded queueing. That is
+// exactly what balanceMonitorSem above already does for monitor checks, and the reason
+// is the same: the only safe response to work arriving faster than it can be completed
+// is to slow the arrivals down.
+//
+// # Why 64
+//
+// The work behind one permit is one Redis enqueue and, on the paths that could not
+// capture their event inside a ledger transaction, one indexed INSERT — single-digit
+// milliseconds together on a healthy system, so 64 in flight clears far more than the
+// 500 events per second requirement V-1 asks for. It is deliberately larger than
+// balanceMonitorSem's 32 because a monitor check is a read that can be deferred, while
+// this work carries an event capture that must not queue behind unrelated reads.
+var postTransactionActionSem = make(chan struct{}, 64)
+
 const (
 	maxQueuedCoalescingBatchSize = 10000
 )
@@ -59,6 +90,34 @@ type queuedBatchPostCommitWork struct {
 	sourceBalance      *model.Balance
 	destinationBalance *model.Balance
 	outbox             *model.LineageOutbox
+
+	// eventOutbox is the transaction's ledger event, prepared BEFORE the write and
+	// inserted INSIDE the same database transaction as the balance updates. That is
+	// what makes the event and the mutation commit or roll back together, which is
+	// the whole of the transactional-outbox guarantee: with a post-commit insert
+	// instead, a crash between the commit and the insert loses the event with nothing
+	// anywhere able to detect it.
+	//
+	// It is nil in exactly two cases, and both are legitimate:
+	//
+	//   - Event publishing is not configured for Kafka, so there is nothing to
+	//     capture; the legacy transport is used directly instead. See PublishEvent.
+	//   - The transaction is not persisted through an atomic writer at all — a
+	//     rejection, for instance, which is recorded by RecordTransaction.
+	//
+	// eventCaptured, not this field, is what the post-commit hook branches on: a nil
+	// row with eventCaptured false means the event still has to be published after
+	// the commit, whereas a nil row with eventCaptured true would be a contradiction.
+	eventOutbox *model.EventOutbox
+
+	// eventCaptured reports that the event row above was handed to an atomic writer,
+	// so the post-commit hook must NOT publish it a second time.
+	//
+	// Two separate fields rather than a nil check because "no row to insert" and "the
+	// row was inserted" must be distinguishable: the first still needs a post-commit
+	// publish, the second must not have one, and a single nilable field cannot say
+	// which of the two it is once the row has been consumed.
+	eventCaptured bool
 }
 
 type queuedBatchPersistResult struct {

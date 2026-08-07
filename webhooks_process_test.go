@@ -55,9 +55,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,6 +72,172 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// ---------------------------------------------------------------------------
+// Test infrastructure: the Redis these tests use, the queues they own, and how a
+// queue listing is allowed to fail
+// ---------------------------------------------------------------------------
+
+// legacyWebhookRedisAddrEnv overrides the Redis address these tests use.
+//
+// The tests below are integration tests by nature: asynq's enqueue path and its Inspector are
+// the subject, not a stand-in for them, so they need a real Redis. The address was hard-coded
+// at every one of a dozen call sites, which made "run this suite against a different Redis"
+// impossible and gave a wrong address a dozen separate ways to fail.
+const legacyWebhookRedisAddrEnv = "BLNK_TEST_REDIS_ADDR"
+
+// legacyWebhookDefaultRedisAddr is the address the local stack publishes.
+const legacyWebhookDefaultRedisAddr = "localhost:6379"
+
+// legacyWebhookRedisDialBudget bounds the reachability probe below.
+const legacyWebhookRedisDialBudget = 2 * time.Second
+
+// legacyWebhookRedisAddr resolves the Redis address and proves something is listening on it.
+//
+// # Why it SKIPS rather than fails
+//
+// An unreachable Redis is a statement about the environment, not about the legacy webhook
+// transport, and it is indistinguishable from it in the failure output: asynq reports a dial
+// error from inside Enqueue, so a dozen tests fail at once with a message that names neither
+// Redis nor the fact that one is required. The probe converts that into one legible skip per
+// test, with the address it tried and the command that provides one.
+//
+// # Why it is a skip and not miniredis
+//
+// asynq's Inspector reads its own Redis data structures through Lua, and several of these
+// tests assert on task IDENTITY and RETENTION — behaviour that lives in those scripts. A
+// stand-in that implements Redis approximately would make those assertions statements about
+// the stand-in. The real broker is the subject here, and the tests that do NOT need one
+// (the whole of webhooks_test.go, and every relay test) already use miniredis or fakes.
+//
+// Parameters:
+//   - t *testing.T: the test to skip when nothing is listening.
+//
+// Returns:
+//   - string: the resolved "host:port".
+func legacyWebhookRedisAddr(t *testing.T) string {
+	t.Helper()
+
+	addr := strings.TrimSpace(os.Getenv(legacyWebhookRedisAddrEnv))
+	if addr == "" {
+		addr = legacyWebhookDefaultRedisAddr
+	}
+
+	connection, err := net.DialTimeout("tcp", addr, legacyWebhookRedisDialBudget)
+	if err != nil {
+		t.Skipf(
+			"no Redis is listening on %s (%v), and these tests assert on asynq's real enqueue "+
+				"and Inspector behaviour rather than a stand-in for it. Start one with "+
+				"'docker compose up -d redis', or point %s at another instance",
+			addr, err, legacyWebhookRedisAddrEnv,
+		)
+	}
+	require.NoError(t, connection.Close())
+
+	return addr
+}
+
+// legacyWebhookUniqueQueueName returns a queue name no other test, and no other clone, can produce.
+//
+// The names were built from time.Now().UnixNano(), which is unique only by luck: two processes
+// that start in the same nanosecond collide, and — more to the point — CLONE_INDEX-separated
+// clones sharing one Redis would silently observe each other's tasks, so a test asserting "the
+// queue is empty" could fail because a sibling clone had just filled it. A UUID plus the clone
+// index removes both, and the prefix keeps the names greppable in Redis.
+//
+// Parameters:
+//   - t *testing.T: the test the queue belongs to; its name is carried for legibility.
+//   - prefix string: a short prefix naming the group of tests the queue serves.
+//
+// Returns:
+//   - string: a unique asynq queue name.
+func legacyWebhookUniqueQueueName(t *testing.T, prefix string) string {
+	t.Helper()
+
+	clone := strings.TrimSpace(os.Getenv("CLONE_INDEX"))
+	if clone == "" {
+		clone = "local"
+	}
+
+	return fmt.Sprintf("%s_%s_%s", prefix, clone, strings.ReplaceAll(gofakeit.UUID(), "-", ""))
+}
+
+// newLegacyWebhookInspector builds an Inspector for queueName and closes it on cleanup.
+//
+// An Inspector holds its own Redis client. Every one of these tests used to create one and
+// leave it open, so a package run leaked one connection per test — enough, on a Redis with a
+// modest maxclients, to make a LATER test fail on connection exhaustion for a reason nothing
+// in its output would explain. The cleanup also empties and removes the queue, so a failed
+// assertion does not leave tasks behind for the next run to trip over.
+//
+// Parameters:
+//   - t *testing.T: the test owning the inspector.
+//   - addr string: the Redis address, from legacyWebhookRedisAddr.
+//   - queueName string: the queue to clean up.
+//
+// Returns:
+//   - *asynq.Inspector: the inspector, closed when the test ends.
+func newLegacyWebhookInspector(t *testing.T, addr, queueName string) *asynq.Inspector {
+	t.Helper()
+
+	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: addr})
+	t.Cleanup(func() {
+		_, _ = inspector.DeleteAllPendingTasks(queueName)
+		_, _ = inspector.DeleteAllCompletedTasks(queueName)
+		_ = inspector.DeleteQueue(queueName, true)
+		assert.NoError(t, inspector.Close(), "the inspector's Redis connection must be released")
+	})
+
+	return inspector
+}
+
+// listLegacyPendingTasks lists a queue's pending tasks, accepting ONLY "the queue does not
+// exist" as a reason for there to be none.
+//
+// # The assertion this replaces could not fail
+//
+// Every "nothing was enqueued" test used to read `tasks, err := ListPendingTasks(q)` and then
+// assert emptiness only `if err == nil`. Under that shape a Redis that was down, a wrong
+// address, a permission error or an asynq API change all satisfied the test silently — the
+// assertion was simply never reached. The tests that mattered most were exactly the ones that
+// could not fail: "no URL configured enqueues nothing" and "past the sunset the relay enqueues
+// nothing" are both proofs of an ABSENCE, and an absence is only evidence when the observation
+// that looked for it is known to have worked.
+//
+// asynq wraps ErrQueueNotFound for a queue that has never held a task, which is a legitimate
+// and expected shape of "empty" here since asynq creates a queue lazily on first enqueue. That
+// one error is translated to an empty slice; every other error fails the test.
+//
+// Parameters:
+//   - t *testing.T: the test, for Helper and failure reporting.
+//   - inspector *asynq.Inspector: the inspector to list through.
+//   - queueName string: the queue to list.
+//
+// Returns:
+//   - []*asynq.TaskInfo: the pending tasks; empty when the queue does not exist.
+func listLegacyPendingTasks(t *testing.T, inspector *asynq.Inspector, queueName string) []*asynq.TaskInfo {
+	t.Helper()
+
+	tasks, err := inspector.ListPendingTasks(queueName)
+	if err != nil {
+		require.ErrorIs(t, err, asynq.ErrQueueNotFound,
+			"listing queue %q failed for a reason other than the queue not existing: an absence "+
+				"of tasks is only evidence when the observation that looked for them worked",
+			queueName)
+
+		return nil
+	}
+
+	return tasks
+}
+
+// requireNoLegacyPendingTasks asserts a queue holds no pending task, failing on any listing
+// error that is not "the queue does not exist".
+func requireNoLegacyPendingTasks(t *testing.T, inspector *asynq.Inspector, queueName string, reason string) {
+	t.Helper()
+
+	assert.Empty(t, listLegacyPendingTasks(t, inspector, queueName), reason)
+}
 
 // receivedWebhook captures everything the webhook receiver saw for one request.
 type receivedWebhook struct {
@@ -106,13 +275,41 @@ func newWebhookReceiver(status int) (*httptest.Server, func() []receivedWebhook)
 	return server, get
 }
 
-// storeWebhookTestConfig stores a configuration pointing the webhook
-// notification at url, with a unique webhook queue per test to avoid
-// cross-test interference on the shared Redis instance.
-func storeWebhookTestConfig(url, secret string, headers map[string]string) (*config.Configuration, string) {
-	queueName := fmt.Sprintf("webhook_q_%d", time.Now().UnixNano())
+// storeWebhookTestConfig stores a configuration pointing the webhook notification at url, with
+// a unique webhook queue per test so that no two tests — and no two clones — can observe each
+// other's tasks.
+//
+// It RESTORES whatever was published before, when the test finishes. config.ConfigStore is a
+// process-global atomic.Value: a webhook URL, a signing secret or a queue name left installed
+// here is read by every later test in the package that calls config.Fetch, and the failure
+// then appears in a test that never mentioned webhooks at all.
+//
+// Parameters:
+//   - t *testing.T: the test whose lifetime the configuration is scoped to.
+//   - url string: the webhook receiver URL, or "" for the unconfigured no-op contract.
+//   - secret string: the signing secret, or "" for unsigned delivery.
+//   - headers map[string]string: extra headers to apply to every delivery.
+//
+// Returns:
+//   - *config.Configuration: the published configuration.
+//   - string: the unique webhook queue name.
+func storeWebhookTestConfig(t *testing.T, url, secret string, headers map[string]string) (*config.Configuration, string) {
+	t.Helper()
+
+	previous := config.ConfigStore.Load()
+	t.Cleanup(func() {
+		if previous != nil {
+			config.ConfigStore.Store(previous)
+
+			return
+		}
+
+		config.ConfigStore.Store(&config.Configuration{})
+	})
+
+	queueName := legacyWebhookUniqueQueueName(t, "webhook_q")
 	cnf := &config.Configuration{
-		Redis: config.RedisConfig{Dns: "localhost:6379"},
+		Redis: config.RedisConfig{Dns: legacyWebhookRedisAddr(t)},
 		Server: config.ServerConfig{
 			SecretKey: secret,
 		},
@@ -122,8 +319,9 @@ func storeWebhookTestConfig(url, secret string, headers map[string]string) (*con
 		},
 		Notification: config.Notification{
 			Webhook: config.WebhookConfig{
-				Url:     url,
-				Headers: headers,
+				Url:                     url,
+				Headers:                 headers,
+				AllowPrivateDestination: true,
 			},
 		},
 	}
@@ -136,7 +334,7 @@ func TestProcessWebhook_DeliversSignedPayload(t *testing.T) {
 	defer server.Close()
 
 	const secret = "webhook-signing-secret"
-	storeWebhookTestConfig(server.URL, secret, map[string]string{
+	storeWebhookTestConfig(t, server.URL, secret, map[string]string{
 		"X-Custom-Tenant": "tenant-42",
 	})
 
@@ -200,7 +398,7 @@ func TestProcessWebhook_DeliversSignedPayload(t *testing.T) {
 func TestProcessWebhook_MalformedTaskPayloadReturnsError(t *testing.T) {
 	server, received := newWebhookReceiver(http.StatusOK)
 	defer server.Close()
-	storeWebhookTestConfig(server.URL, "secret", nil)
+	storeWebhookTestConfig(t, server.URL, "secret", nil)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -212,7 +410,7 @@ func TestProcessWebhook_MalformedTaskPayloadReturnsError(t *testing.T) {
 }
 
 func TestProcessWebhook_NoURLConfiguredIsNoOp(t *testing.T) {
-	storeWebhookTestConfig("", "secret", nil)
+	storeWebhookTestConfig(t, "", "secret", nil)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -230,7 +428,7 @@ func TestProcessWebhook_ConnectionRefusedReturnsError(t *testing.T) {
 	deadURL := server.URL
 	server.Close() // receiver is down
 
-	storeWebhookTestConfig(deadURL, "secret", nil)
+	storeWebhookTestConfig(t, deadURL, "secret", nil)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -250,7 +448,7 @@ func TestProcessWebhook_Non2xxTriggersRetry(t *testing.T) {
 	// retry machinery redelivers.
 	server, received := newWebhookReceiver(http.StatusServiceUnavailable)
 	defer server.Close()
-	storeWebhookTestConfig(server.URL, "secret", nil)
+	storeWebhookTestConfig(t, server.URL, "secret", nil)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -265,13 +463,9 @@ func TestProcessWebhook_Non2xxTriggersRetry(t *testing.T) {
 }
 
 func TestSendWebhook_EnqueuesTaskWithPayloadOnConfiguredQueue(t *testing.T) {
-	cnf, queueName := storeWebhookTestConfig("http://localhost:1/never-called", "secret", nil)
+	cnf, queueName := storeWebhookTestConfig(t, "http://localhost:1/never-called", "secret", nil)
 
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "localhost:6379"})
-	t.Cleanup(func() {
-		_, _ = inspector.DeleteAllPendingTasks(queueName)
-		_ = inspector.DeleteQueue(queueName, true)
-	})
+	inspector := newLegacyWebhookInspector(t, cnf.Redis.Dns, queueName)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -303,12 +497,9 @@ func TestSendWebhook_EnqueuesTaskWithPayloadOnConfiguredQueue(t *testing.T) {
 }
 
 func TestSendWebhook_NoURLConfiguredSkipsEnqueue(t *testing.T) {
-	_, queueName := storeWebhookTestConfig("", "secret", nil)
+	cnf, queueName := storeWebhookTestConfig(t, "", "secret", nil)
 
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "localhost:6379"})
-	t.Cleanup(func() {
-		_ = inspector.DeleteQueue(queueName, true)
-	})
+	inspector := newLegacyWebhookInspector(t, cnf.Redis.Dns, queueName)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -316,20 +507,14 @@ func TestSendWebhook_NoURLConfiguredSkipsEnqueue(t *testing.T) {
 
 	require.NoError(t, b.SendWebhook(NewWebhook{Event: "transaction.applied", Payload: map[string]string{"k": "v"}}))
 
-	tasks, err := inspector.ListPendingTasks(queueName)
-	if err == nil {
-		assert.Empty(t, tasks, "nothing should be enqueued when no webhook URL is configured")
-	}
-	// err != nil means the queue does not exist at all, which is equally correct.
+	requireNoLegacyPendingTasks(t, inspector, queueName,
+		"nothing should be enqueued when no webhook URL is configured")
 }
 
 func TestSendWebhook_UnmarshalablePayloadReturnsError(t *testing.T) {
-	_, queueName := storeWebhookTestConfig("http://localhost:1/never-called", "secret", nil)
+	cnf, queueName := storeWebhookTestConfig(t, "http://localhost:1/never-called", "secret", nil)
 
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "localhost:6379"})
-	t.Cleanup(func() {
-		_ = inspector.DeleteQueue(queueName, true)
-	})
+	inspector := newLegacyWebhookInspector(t, cnf.Redis.Dns, queueName)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -339,10 +524,8 @@ func TestSendWebhook_UnmarshalablePayloadReturnsError(t *testing.T) {
 	err = b.SendWebhook(NewWebhook{Event: "transaction.applied", Payload: make(chan int)})
 	assert.Error(t, err)
 
-	tasks, listErr := inspector.ListPendingTasks(queueName)
-	if listErr == nil {
-		assert.Empty(t, tasks, "nothing should be enqueued when payload serialization fails")
-	}
+	requireNoLegacyPendingTasks(t, inspector, queueName,
+		"nothing should be enqueued when payload serialization fails")
 }
 
 func TestProcessWebhook_NoSignatureHeadersWithEmptySecret(t *testing.T) {
@@ -352,7 +535,7 @@ func TestProcessWebhook_NoSignatureHeadersWithEmptySecret(t *testing.T) {
 	// authentication.
 	server, received := newWebhookReceiver(http.StatusOK)
 	defer server.Close()
-	storeWebhookTestConfig(server.URL, "", nil)
+	storeWebhookTestConfig(t, server.URL, "", nil)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -411,13 +594,9 @@ func nonCanonicalLegacyBody() []byte {
 // the two bodies stay semantically equal — which is exactly why this test asserts bytes and
 // then separately demonstrates that the round trip really would have changed them.
 func TestEnqueueLegacyWebhookDelivery_CarriesTheStoredBytesVerbatim(t *testing.T) {
-	cnf, queueName := storeWebhookTestConfig("http://localhost:1/never-called", "secret", nil)
+	cnf, queueName := storeWebhookTestConfig(t, "http://localhost:1/never-called", "secret", nil)
 
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "localhost:6379"})
-	t.Cleanup(func() {
-		_, _ = inspector.DeleteAllPendingTasks(queueName)
-		_ = inspector.DeleteQueue(queueName, true)
-	})
+	inspector := newLegacyWebhookInspector(t, cnf.Redis.Dns, queueName)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -465,7 +644,7 @@ func TestProcessWebhook_DeliversTheEnqueuedBytesWithoutReserialising(t *testing.
 	defer server.Close()
 
 	const secret = "webhook-signing-secret"
-	storeWebhookTestConfig(server.URL, secret, nil)
+	storeWebhookTestConfig(t, server.URL, secret, nil)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -507,13 +686,9 @@ func TestProcessWebhook_DeliversTheEnqueuedBytesWithoutReserialising(t *testing.
 // — this event's webhook leg is queued exactly once — already holds, and failing would stall
 // the row behind a condition that is already satisfied.
 func TestEnqueueLegacyWebhookDelivery_SuppressesADuplicateForTheSameEvent(t *testing.T) {
-	_, queueName := storeWebhookTestConfig("http://localhost:1/never-called", "secret", nil)
+	cnf, queueName := storeWebhookTestConfig(t, "http://localhost:1/never-called", "secret", nil)
 
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "localhost:6379"})
-	t.Cleanup(func() {
-		_, _ = inspector.DeleteAllPendingTasks(queueName)
-		_ = inspector.DeleteQueue(queueName, true)
-	})
+	inspector := newLegacyWebhookInspector(t, cnf.Redis.Dns, queueName)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -547,13 +722,9 @@ func TestEnqueueLegacyWebhookDelivery_SuppressesADuplicateForTheSameEvent(t *tes
 // delivery with nothing anywhere indicating that the duplicate suppression it was relying on
 // was not in effect.
 func TestEnqueueLegacyWebhookDelivery_RefusesAnUnusableRequest(t *testing.T) {
-	_, queueName := storeWebhookTestConfig("http://localhost:1/never-called", "secret", nil)
+	cnf, queueName := storeWebhookTestConfig(t, "http://localhost:1/never-called", "secret", nil)
 
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "localhost:6379"})
-	t.Cleanup(func() {
-		_, _ = inspector.DeleteAllPendingTasks(queueName)
-		_ = inspector.DeleteQueue(queueName, true)
-	})
+	inspector := newLegacyWebhookInspector(t, cnf.Redis.Dns, queueName)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -571,10 +742,8 @@ func TestEnqueueLegacyWebhookDelivery_RefusesAnUnusableRequest(t *testing.T) {
 	})
 
 	t.Run("nothing was enqueued by either refusal", func(t *testing.T) {
-		tasks, err := inspector.ListPendingTasks(queueName)
-		if err == nil {
-			assert.Empty(t, tasks)
-		}
+		requireNoLegacyPendingTasks(t, inspector, queueName,
+			"a refused request must leave the queue untouched")
 	})
 }
 
@@ -585,12 +754,9 @@ func TestEnqueueLegacyWebhookDelivery_RefusesAnUnusableRequest(t *testing.T) {
 // leg alone, and an error here would fail the relay's dual-delivery branch on every event for
 // a transport the operator deliberately did not configure.
 func TestEnqueueLegacyWebhookDelivery_NoURLConfiguredSkipsEnqueue(t *testing.T) {
-	_, queueName := storeWebhookTestConfig("", "secret", nil)
+	cnf, queueName := storeWebhookTestConfig(t, "", "secret", nil)
 
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "localhost:6379"})
-	t.Cleanup(func() {
-		_ = inspector.DeleteQueue(queueName, true)
-	})
+	inspector := newLegacyWebhookInspector(t, cnf.Redis.Dns, queueName)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -600,10 +766,8 @@ func TestEnqueueLegacyWebhookDelivery_NoURLConfiguredSkipsEnqueue(t *testing.T) 
 	// enqueued rather than a validation failure standing in for it.
 	require.NoError(t, b.EnqueueLegacyWebhookDelivery(gofakeit.UUID(), nonCanonicalLegacyBody()))
 
-	tasks, err := inspector.ListPendingTasks(queueName)
-	if err == nil {
-		assert.Empty(t, tasks, "nothing may be enqueued when no webhook URL is configured")
-	}
+	requireNoLegacyPendingTasks(t, inspector, queueName,
+		"nothing may be enqueued when no webhook URL is configured")
 }
 
 // TestLegacyWebhookTaskID_NamespacesTheEventID guards against a cross-feature collision.
@@ -695,9 +859,9 @@ func storeDualDeliveryWebhookConfig(
 		config.ConfigStore.Store(&config.Configuration{})
 	})
 
-	queueName := fmt.Sprintf("dual_delivery_q_%d", time.Now().UnixNano())
+	queueName := legacyWebhookUniqueQueueName(t, "dual_delivery_q")
 	cnf := &config.Configuration{
-		Redis: config.RedisConfig{Dns: "localhost:6379"},
+		Redis: config.RedisConfig{Dns: legacyWebhookRedisAddr(t)},
 		Server: config.ServerConfig{
 			SecretKey: secret,
 		},
@@ -708,6 +872,12 @@ func storeDualDeliveryWebhookConfig(
 		Notification: config.Notification{
 			Webhook: config.WebhookConfig{
 				Url: url,
+				// The dual-delivery fixtures deliver to an httptest server on loopback over
+				// http, which is exactly the assertion this flag makes: the destination is on
+				// a network the operator owns. It opens loopback and http and nothing else —
+				// the redirect refusal stays unconditional and link-local, metadata,
+				// multicast, unspecified and NAT64-wrapped addresses stay refused with it set.
+				AllowPrivateDestination: true,
 			},
 		},
 		WebhookDeprecationSunsetDate: sunset.Format(time.RFC3339),
@@ -810,14 +980,15 @@ func newDualDeliveryRelay(t *testing.T, b *Blnk, eventID string) *dualDeliveryRe
 	}
 }
 
-// pendingLegacyDeliveries lists the tasks waiting on queueName, treating a queue that cannot be
-// listed as empty.
+// pendingLegacyDeliveries lists the tasks waiting on queueName.
 //
-// asynq creates a queue lazily on the first enqueue, so "the queue does not exist" and "the
-// queue is empty" are the same observation — and the negative cases below are precisely the ones
-// where no enqueue ever happened. Swallowing the error cannot hide a defect, because the
-// positive case of the same table lists the same queue successfully and would fail if listing
-// were broken.
+// It is the dual-delivery tests' name for listLegacyPendingTasks, kept because those tests read
+// better with it. It USED to swallow any listing error as "the queue is empty", on the argument
+// that asynq creates a queue lazily so a missing queue and an empty one are the same
+// observation. That argument is right about a missing queue and wrong about everything else: a
+// Redis that was down, a wrong address or a permission error read as "nothing was enqueued"
+// too, which is the exact conclusion the post-sunset case draws. Only ErrQueueNotFound is
+// accepted now, and every other failure is reported.
 //
 // Parameters:
 //   - t *testing.T: the test, for Helper and diagnostics.
@@ -825,18 +996,11 @@ func newDualDeliveryRelay(t *testing.T, b *Blnk, eventID string) *dualDeliveryRe
 //   - queueName string: the queue to list.
 //
 // Returns:
-//   - []*asynq.TaskInfo: the pending tasks, or nil when the queue does not exist.
+//   - []*asynq.TaskInfo: the pending tasks; empty when the queue does not exist.
 func pendingLegacyDeliveries(t *testing.T, inspector *asynq.Inspector, queueName string) []*asynq.TaskInfo {
 	t.Helper()
 
-	tasks, err := inspector.ListPendingTasks(queueName)
-	if err != nil {
-		t.Logf("queue %q could not be listed (%v); treating it as empty", queueName, err)
-
-		return nil
-	}
-
-	return tasks
+	return listLegacyPendingTasks(t, inspector, queueName)
 }
 
 // TestProcessWebhook_DeliversFromDualDeliveryBranch is the end-to-end proof that the legacy
@@ -867,15 +1031,19 @@ func TestProcessWebhook_DeliversFromDualDeliveryBranch(t *testing.T) {
 	// that TestDualDeliveryBranch_EnqueuesNothingOnceTheSunsetHasPassed owns.
 	cnf, queueName := storeDualDeliveryWebhookConfig(t, server.URL, secret, relayFixedNow.Add(15*24*time.Hour))
 
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "localhost:6379"})
-	t.Cleanup(func() {
-		_, _ = inspector.DeleteAllPendingTasks(queueName)
-		_ = inspector.DeleteQueue(queueName, true)
-	})
+	inspector := newLegacyWebhookInspector(t, cnf.Redis.Dns, queueName)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
 	defer func() { _ = b.Close() }()
+
+	// The HANDLER's clock, pinned to the relay's. ProcessWebhook enforces the sunset at
+	// execution time (Q4-09), and this fixture expresses its window relative to relayFixedNow
+	// — so leaving the handler on the wall clock would have it judge the window closed while
+	// the relay judged it open, and the delivery this test exists to observe would never be
+	// attempted. Both legs reading one instant is also what makes "the handler and the relay
+	// agree" a property of the test rather than an accident of when the suite runs.
+	b.legacyWebhookNow = func() time.Time { return relayFixedNow }
 
 	relay := newDualDeliveryRelay(t, b, gofakeit.UUID())
 
@@ -953,15 +1121,11 @@ func TestProcessWebhook_DeliversFromDualDeliveryBranch(t *testing.T) {
 func TestDualDeliveryBranch_OneClaimedRowFeedsBothTransports(t *testing.T) {
 	// No receiver is needed: this test is about what the relay produces, not about delivery. The
 	// URL only has to be non-empty, because an empty one is the no-op contract.
-	_, queueName := storeDualDeliveryWebhookConfig(
+	cnf, queueName := storeDualDeliveryWebhookConfig(
 		t, "http://localhost:1/never-called", "secret", relayFixedNow.Add(15*24*time.Hour),
 	)
 
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "localhost:6379"})
-	t.Cleanup(func() {
-		_, _ = inspector.DeleteAllPendingTasks(queueName)
-		_ = inspector.DeleteQueue(queueName, true)
-	})
+	inspector := newLegacyWebhookInspector(t, cnf.Redis.Dns, queueName)
 
 	b, err := NewBlnk(nil)
 	require.NoError(t, err)
@@ -1055,15 +1219,11 @@ func TestDualDeliveryBranch_EnqueuesNothingOnceTheSunsetHasPassed(t *testing.T) 
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			_, queueName := storeDualDeliveryWebhookConfig(
+			cnf, queueName := storeDualDeliveryWebhookConfig(
 				t, "http://localhost:1/never-called", "secret", testCase.sunset,
 			)
 
-			inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: "localhost:6379"})
-			t.Cleanup(func() {
-				_, _ = inspector.DeleteAllPendingTasks(queueName)
-				_ = inspector.DeleteQueue(queueName, true)
-			})
+			inspector := newLegacyWebhookInspector(t, cnf.Redis.Dns, queueName)
 
 			b, err := NewBlnk(nil)
 			require.NoError(t, err)

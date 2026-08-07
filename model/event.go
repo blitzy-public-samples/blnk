@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -121,13 +122,22 @@ type LedgerEvent struct {
 	//
 	// Deduplicating on EventID is a subscriber obligation, not an optional
 	// optimisation. The transactional outbox gives exactly-once semantics on
-	// the write side only: the event row is committed atomically with the
-	// ledger mutation, so it can never be lost. Kafka delivery itself remains
-	// at-least-once, and the relay can crash in the window between a
-	// successfully acknowledged publish and the outbox row being marked
-	// dispatched — after which the row is reclaimed and republished. That is
-	// why blnk.event_outbox carries a unique index on event_id (one event is
-	// recorded once) and why the published documentation states the
+	// the WRITE SIDE, and only for a capture that shares the mutation's
+	// transaction: a caller that threads the row through PublishEventInTx or
+	// the atomic writers commits event and mutation together, so neither can
+	// exist without the other. A standalone capture (PublishEvent, which is
+	// what the domain post-action call sites use) commits on its own, after the
+	// mutation, and relies instead on the id being DERIVED from the mutation —
+	// see DeriveEventID — so that a replayed mutation collides on the unique
+	// index rather than admitting a second row. Events with no stable identity
+	// (balance.monitor, system.error) take a random id and have no such
+	// protection, by design: they are repeatable by nature.
+	//
+	// Kafka delivery itself remains at-least-once, and the relay can crash in
+	// the window between a successfully acknowledged publish and the outbox row
+	// being marked dispatched — after which the row is reclaimed and
+	// republished. That is why blnk.event_outbox carries a unique index on
+	// event_id and why the published documentation states the
 	// duplicate-suppression obligation explicitly.
 	EventID string `json:"event_id"`
 
@@ -141,11 +151,13 @@ type LedgerEvent struct {
 	// AggregateID identifies the aggregate the event belongs to — the
 	// transaction, balance, identity or ledger the mutation acted on.
 	//
-	// It is distinct from the Kafka message key: the key is the ledger ID, and
-	// keying by ledger ID with a stable hash balancer is what pins every event
-	// for one ledger to one partition and therefore delivers the per-aggregate
-	// ordering guarantee. AggregateID is what a consumer groups by once the
-	// messages arrive.
+	// It is distinct from the Kafka message key. The key is the row's STORED
+	// PARTITION KEY — a ledger id when the payload yields one, otherwise a
+	// balance, identity, monitor or batch id, or the event type; see
+	// EventOutbox.PartitionKey — and keying with a stable hash balancer is what
+	// pins every event sharing a key to one partition, delivering ordering per
+	// partition key. AggregateID is what a consumer groups by once the messages
+	// arrive.
 	AggregateID string `json:"aggregate_id"`
 
 	// OccurredAt is the instant the domain action happened, RFC3339 on the
@@ -188,20 +200,22 @@ type LedgerEvent struct {
 // EventOutbox is one row of blnk.event_outbox: a durable record of an event that
 // must reach Kafka, together with the relay state machine that gets it there.
 //
-// The row is inserted INSIDE THE SAME DATABASE TRANSACTION as the ledger
-// mutation that produced it (requirement R-2, the transactional-outbox
-// guarantee). The mutation and its event therefore commit or roll back together
-// and can never disagree: there is no window in which a balance moved but the
-// event was lost, and no window in which an event describes a mutation that was
-// rolled back.
+// The row is inserted inside the caller's own database transaction whenever the
+// caller has one to offer: PublishEventInTx and the atomic writers in
+// database/transaction.go take the row and insert it before COMMIT, which is the
+// transactional-outbox guarantee of requirement R-2 — the mutation and its event
+// commit or roll back together. A caller with no transaction to share captures
+// standalone through PublishEvent, which is what the domain post-action call
+// sites do today: the row is then committed on its own, after the mutation, and
+// idempotence rests on the derived event id and the unique index rather than on
+// atomicity.
 //
-// The guarantee this buys is exactly-once ON THE WRITE SIDE ONLY. Each event is
-// recorded exactly once, which is why event_id carries a unique index. Kafka
+// Either way the guarantee is EXACTLY-ONCE ON THE WRITE SIDE ONLY. Kafka
 // delivery downstream remains AT-LEAST-ONCE: a relay that crashes between a
-// successfully acknowledged publish and marking this row dispatched will
-// reclaim the row after its lock expires and publish it again. Duplicate
-// suppression on LedgerEvent.EventID is consequently a documented subscriber
-// obligation rather than an implicit promise.
+// successfully acknowledged publish and marking this row dispatched will reclaim
+// the row after its lock expires and publish it again. Duplicate suppression on
+// LedgerEvent.EventID is consequently a documented subscriber obligation rather
+// than an implicit promise.
 //
 // Construction: callers set the event-envelope fields and MaxAttempts
 // explicitly in Go and leave ID, Status, Attempts and the creation timestamp to
@@ -234,19 +248,19 @@ type EventOutbox struct {
 	// PartitionKey is the Kafka message key, and it is ALWAYS SET.
 	//
 	// Keying with a stable hash balancer pins every event sharing a key to a
-	// single partition, which is what delivers the per-aggregate ordering
-	// guarantee. An empty key would let Kafka scatter the event round-robin and
-	// destroy that ordering with nothing in the data to show it, so the
-	// construction path guarantees a value through a documented fallback chain
-	// and this field is never blank on a persisted row.
+	// single partition, which is what delivers ordering PER PARTITION KEY. An
+	// empty key would let Kafka scatter the event round-robin and destroy that
+	// ordering with nothing in the data to show it, so the construction path
+	// guarantees a value through a documented fallback chain and this field is
+	// never blank on a persisted row.
 	//
 	// It is a SEPARATE FIELD FROM LedgerID, and the separation is the point.
 	// This value is whatever aggregate the event's ordering should follow: a
-	// ledger ID when the payload carries one, otherwise a balance ID, an
-	// identity ID, a monitor ID, a batch ID or the event type. Calling that
-	// "the ledger ID" — which is what this struct used to do — made the name
-	// lie about most of its values, and it made the subscriber-facing claim
-	// that a key prefix identifies a ledger unfounded.
+	// ledger id when the payload carries one, otherwise a balance id, an
+	// identity id, a monitor id, a batch id or the event type. It is therefore
+	// not "the ledger id", and one key may deliberately group several
+	// aggregates — every event of one ledger, for instance — which is why the
+	// guarantee is stated per partition key rather than per aggregate.
 	PartitionKey string `json:"partition_key"`
 
 	// LedgerID is the AUTHORITATIVE ledger this event belongs to, or empty when
@@ -280,15 +294,39 @@ type EventOutbox struct {
 	// SchemaVersion is the envelope version, copied to
 	// LedgerEvent.SchemaVersion on publish.
 	SchemaVersion int `json:"schema_version"`
-	// Payload holds the legacy webhook body bytes verbatim, stored as JSONB and
-	// kept as json.RawMessage so it is neither reordered nor renormalised
-	// between the insert and the publish. Both transports during the
-	// dual-delivery window read these same bytes, which is what makes their
-	// payloads identical structurally rather than by careful coding.
+	// Payload holds the legacy webhook body bytes verbatim, as json.RawMessage
+	// so they are neither reordered nor renormalised between the insert and the
+	// publish.
+	//
+	// The row stores them TWICE, in two columns with two jobs: payload_raw
+	// (BYTEA) is the byte-exact copy and the only column ever projected back
+	// into this field, while payload (JSONB) is a queryable projection for
+	// containment and extraction queries — JSONB is parsed and re-rendered, so
+	// it preserves the object's meaning and not its bytes. Both transports
+	// during the dual-delivery window read these same bytes, which is what makes
+	// their payloads identical structurally rather than by careful coding.
 	Payload json.RawMessage `json:"payload"`
 	// OccurredAt is the instant the domain action happened. The relay claims
 	// rows in ascending OccurredAt order, so FIFO holds within a partition key.
 	OccurredAt time.Time `json:"occurred_at"`
+
+	// CreatedAt is the instant this ROW became durable — when the capturing
+	// transaction committed — as opposed to OccurredAt, which is when the domain
+	// action happened. The two normally coincide and deliberately may not: a
+	// backfilled or replayed mutation carries an earlier OccurredAt than its
+	// CreatedAt.
+	//
+	// It is the START of the interval acceptance criterion V-1 is stated over,
+	// "outbox-to-Kafka publish latency", and it is carried on the row for exactly
+	// that reason. The relay's alternative — timing from the moment it claimed the
+	// row — excludes the poll delay and the backlog, so a relay running an hour
+	// behind reports the same sub-second latency as an idle one. It is never used
+	// for ordering; OccurredAt owns that, and using this instead would publish a
+	// backfilled event out of its domain order.
+	//
+	// It is zero only on a row assembled in Go that has not been read back from the
+	// database, in which case the publisher falls back to the claim instant.
+	CreatedAt time.Time `json:"created_at"`
 
 	// --- Relay state machine ---
 	// These fields track the row's progress from pending to dispatched, failed
@@ -308,9 +346,9 @@ type EventOutbox struct {
 	// predicate is next_attempt_at <= NOW(), so a row inside its backoff window
 	// is not claimed by any relay instance and nothing has to sleep to honour
 	// the delay. Persisting it is what makes the schedule survive a restart:
-	// before it, a failed row was claimable again on the very next poll, so the
-	// 1s/2s/4s/8s/16s schedule collapsed into roughly five seconds of
-	// consecutive attempts against a broker that was already failing.
+	// without it a failed row is claimable again on the very next poll, so the
+	// configured waits — 1s, 2s, 4s and 8s between the five attempts — collapse
+	// into consecutive attempts against a broker that is already failing.
 	//
 	// It is NOT the lease. Lease expiry (locked_until) answers "has whoever
 	// claimed this row abandoned it"; this answers "may anybody claim it yet",
@@ -371,6 +409,82 @@ type EventOutbox struct {
 	// the sunset date the legacy leg is gone and the flag is simply never set.
 	WebhookDispatched bool `json:"webhook_dispatched"`
 
+	// KafkaDispatchedAt is when the broker acknowledged the Kafka publish,
+	// recorded INDEPENDENTLY of DispatchedAt, and the field that keeps the two
+	// legs' fates separate.
+	//
+	// DispatchedAt means "this row is finished". This means "the Kafka leg of
+	// this row is finished", which during the dual-delivery window is a strictly
+	// weaker statement because the legacy leg may still be owed. Collapsing the
+	// two was a real defect and not a tidiness one: a row whose Kafka publish
+	// succeeded and whose webhook enqueue failed was marked dispatched anyway,
+	// and since the claim predicate excludes dispatched rows, the webhook was
+	// never retried and never delivered.
+	//
+	// Its second job is to make a re-claim safe. A claimed row carrying a
+	// non-nil value here has already been published, so the relay skips the
+	// publish and delivers only the outstanding webhook — which is what stops
+	// retrying a deprecated-transport failure from putting a duplicate on the
+	// Kafka topic.
+	//
+	// Set on the ordinary success path too, so it answers "was this published,
+	// and when" for every row rather than only for rows that took the unusual
+	// path. Vestigial after the sunset, exactly like WebhookDispatched.
+	KafkaDispatchedAt *time.Time `json:"kafka_dispatched_at,omitempty"`
+
+	// WebhookAttempts counts legacy webhook ENQUEUE attempts made so far,
+	// separately from Attempts.
+	//
+	// Separate because the two legs must not spend each other's budget: a
+	// webhook receiver being down, or the queue being unreachable, must never
+	// consume a Kafka retry attempt, because that would let the deprecated
+	// transport dead-letter events on the new one. Bounded by this row's own
+	// MaxAttempts so a permanently unreachable queue cannot keep the row
+	// claimable indefinitely — once the budget is spent the Kafka delivery is
+	// recorded as final, the legacy leg is abandoned, and the reason is written
+	// to LastError. Vestigial after the sunset.
+	WebhookAttempts int `json:"webhook_attempts"`
+
+	// --- Broker coordinate (OBS-02) ---
+
+	// KafkaTopic, KafkaPartition and KafkaOffset are WHERE THIS ROW'S RECORD
+	// ACTUALLY LANDED: the coordinate the broker assigned to the write that made
+	// this row's publication real. All three are nil until a write is
+	// acknowledged, and they are set or cleared together.
+	//
+	// # Why the coordinate is stored rather than derived
+	//
+	// The zero-loss criterion (V-2) reconciles the outbox against the broker. Done
+	// by COUNTING — records written against rows claiming a publication — it
+	// cannot detect loss that duplicate surplus happens to offset: ten lost events
+	// and ten redeliveries produce exactly the totals of a healthy system, and the
+	// reconciliation reports no loss while ten events are genuinely missing.
+	//
+	// A stored coordinate replaces that arithmetic with a MAPPING. Every row that
+	// claims a publication names the record it produced, the schema refuses two
+	// rows the same coordinate, and a row claiming a publication with no
+	// coordinate is visible as exactly that — unconfirmed — instead of being
+	// absorbed into a surplus. See AuditTerminalEventRecords and
+	// ReconcileAgainstOutbox.
+	//
+	// # Which topic the coordinate belongs to
+	//
+	// KafkaTopic is recorded explicitly rather than inferred from Status, because
+	// the destination differs by outcome: a dispatched row's record is on Topic
+	// and a dead-lettered row's is on DLTTopic. Storing the name makes the
+	// coordinate self-describing, which is what lets an operator paste it
+	// straight into a console consumer.
+	KafkaTopic string `json:"kafka_topic,omitempty"`
+	// KafkaPartition is the partition the broker assigned. Nil when no write has
+	// been acknowledged. A pointer rather than an int because partition 0 is a
+	// perfectly ordinary partition, and a zero value would be indistinguishable
+	// from "not recorded".
+	KafkaPartition *int `json:"kafka_partition,omitempty"`
+	// KafkaOffset is the offset within that partition. Nil when no write has been
+	// acknowledged, and a pointer for the same reason as KafkaPartition: offset 0
+	// is the first record on a fresh partition.
+	KafkaOffset *int64 `json:"kafka_offset,omitempty"`
+
 	// --- Dead-letter record ---
 
 	// DLTTopic is the dead-letter topic the event was written to once its retry
@@ -381,6 +495,161 @@ type EventOutbox struct {
 	// below. It is kept as raw JSON, not a decoded struct, so the stored bytes
 	// are handed back to the dead-letter API exactly as they were written.
 	FailureMetadata json.RawMessage `json:"failure_metadata,omitempty"`
+}
+
+// BrokerRecord is the coordinate of one record on one Kafka topic: the value that
+// turns "this event was published" into "this event is THAT record".
+//
+// # OBS-02, and why a coordinate rather than a count
+//
+// The zero-loss criterion (V-2) used to be checked by counting: sum the topics' end
+// offsets and compare against the number of outbox rows claiming a publication. That
+// comparison is directional — records are a lower bound on events, because a
+// redelivery or a replay writes a second record for one event — and its weakness is
+// that the surplus is INDISTINGUISHABLE FROM COMPENSATED LOSS. Ten redeliveries and
+// ten lost events produce exactly the totals of a healthy pipeline.
+//
+// A coordinate fixes that by making the relationship a mapping rather than a
+// subtraction. Each row names the record it produced; the schema forbids two rows the
+// same coordinate; and a row claiming a publication with no coordinate is reported as
+// unconfirmed instead of quietly increasing the surplus.
+//
+// It is also the value an operator actually needs during triage: given
+// "blnk.transactions/3@148291" they can read the exact record back with a console
+// consumer, which is a materially different position from knowing only that the event
+// was published at some point.
+type BrokerRecord struct {
+	// Topic is the topic the record is on. For a dispatched event this is the
+	// category topic; for a dead-lettered one it is the `.dlt` sibling.
+	Topic string
+
+	// Partition is the partition the broker assigned, which for a keyed message is
+	// determined by the partition key and is therefore stable across redeliveries of
+	// the same event.
+	Partition int
+
+	// Offset is the record's position within that partition. It is assigned by the
+	// broker and is unique per partition, so the three fields together identify one
+	// record in the cluster.
+	Offset int64
+}
+
+// Confirmed reports whether this coordinate actually names a record.
+//
+// A zero BrokerRecord is what an unacknowledged or unrecorded write leaves behind, and
+// it must not be mistaken for "partition 0, offset 0" — which is a real and very
+// ordinary location, being the first record on a fresh partition. The topic name is
+// what distinguishes them: the broker always reports one, and nothing else sets it.
+//
+// Returns:
+//   - bool: true when the coordinate names a record.
+func (r BrokerRecord) Confirmed() bool {
+	return strings.TrimSpace(r.Topic) != "" && r.Offset >= 0
+}
+
+// String renders the coordinate in the `topic/partition@offset` form used in logs, the
+// dead-letter API and the operations runbook.
+//
+// An unconfirmed coordinate renders as a named absence rather than as
+// "/0@0", because the latter reads as data and would send an operator looking for a
+// record that was never written.
+//
+// Returns:
+//   - string: the coordinate, or "unconfirmed".
+func (r BrokerRecord) String() string {
+	if !r.Confirmed() {
+		return "unconfirmed"
+	}
+
+	return fmt.Sprintf("%s/%d@%d", r.Topic, r.Partition, r.Offset)
+}
+
+// BrokerRecord returns the coordinate this row recorded, and whether it has one.
+//
+// The three columns are written and cleared together, so a row is either fully
+// confirmed or fully unconfirmed; this accessor states that invariant in one place
+// rather than leaving every reader to test three pointers.
+//
+// Returns:
+//   - BrokerRecord: the coordinate, zero-valued when the row has none.
+//   - bool: whether the row names a record.
+func (e EventOutbox) BrokerRecord() (BrokerRecord, bool) {
+	if e.KafkaPartition == nil || e.KafkaOffset == nil || strings.TrimSpace(e.KafkaTopic) == "" {
+		return BrokerRecord{}, false
+	}
+
+	record := BrokerRecord{
+		Topic:     e.KafkaTopic,
+		Partition: *e.KafkaPartition,
+		Offset:    *e.KafkaOffset,
+	}
+
+	return record, record.Confirmed()
+}
+
+// EventOutboxAudit is the outbox side of the zero-loss reconciliation: how many rows
+// claim a Kafka record, and how many of those can actually name the record they
+// produced.
+//
+// # Why "published" is not the same as "terminal"
+//
+// PublishedRows deliberately counts a wider set than the terminal statuses. A row in
+// webhook_pending HAS been published to Kafka — its Kafka leg completed and
+// KafkaDispatchedAt is stamped; what remains outstanding is the deprecated HTTP leg.
+// Counting only dispatched and dead_lettered rows would leave those records
+// unaccounted for on the broker side, inflating the apparent surplus and making the
+// reconciliation looser precisely during the dual-delivery window, which is when it is
+// most needed.
+//
+// # What the split is for
+//
+// ConfirmedRows is the count that can be MATCHED to a record. UnconfirmedRows is the
+// count that cannot, and its existence is the finding this type closes: an unconfirmed
+// row is a claim of publication that nothing corroborates, and under a pure count it
+// was invisible because a redelivery elsewhere could make the totals balance.
+type EventOutboxAudit struct {
+	// PublishedRows is how many rows claim a record on the broker: every row whose
+	// Kafka leg completed, plus every dead-lettered row, each counted exactly once
+	// by virtue of the unique index on event_id.
+	PublishedRows int64
+
+	// ConfirmedRows is how many of those name the record they produced.
+	ConfirmedRows int64
+
+	// DistinctRecords is how many DISTINCT coordinates those rows name. It equals
+	// ConfirmedRows unless two rows claim the same record, which the partial unique
+	// index on the coordinate makes impossible — so a discrepancy here means the
+	// index is missing or has been dropped, and the audit says so rather than
+	// assuming the schema is intact.
+	DistinctRecords int64
+
+	// MeasuredAt is when the outbox side was read.
+	MeasuredAt time.Time
+}
+
+// UnconfirmedRows is how many rows claim a publication they cannot name a record for.
+//
+// Returns:
+//   - int64: never negative.
+func (a EventOutboxAudit) UnconfirmedRows() int64 {
+	if a.ConfirmedRows >= a.PublishedRows {
+		return 0
+	}
+
+	return a.PublishedRows - a.ConfirmedRows
+}
+
+// FullyConfirmed reports whether every row claiming a publication names a distinct
+// record.
+//
+// It is the precondition for a conclusive zero-loss verdict: with it true, a shortfall
+// in broker records cannot be hidden by a surplus, because each claim is individually
+// accounted for.
+//
+// Returns:
+//   - bool: true when nothing is unconfirmed and no two rows share a coordinate.
+func (a EventOutboxAudit) FullyConfirmed() bool {
+	return a.UnconfirmedRows() == 0 && a.DistinctRecords == a.ConfirmedRows
 }
 
 // FailureMetadata is the diagnostic record appended to an event when its retry
@@ -479,8 +748,10 @@ const (
 // # State machine
 //
 //	pending ──claimed by a relay──▶ processing ──broker ack──▶ dispatched
-//	   │                                │                     (dispatched_at set)
-//	   │                                │
+//	   │                                │           │          (dispatched_at set)
+//	   │                                │           └──legacy leg owed──▶ webhook_pending
+//	   │                                │                                      │
+//	   │                                │              (re-claimed; Kafka NOT republished)
 //	   └──────retry budget exhausted────┴──▶ failed ──written to <topic>.dlt──▶ dead_lettered
 //
 // A row is inserted as pending by the database column default. A relay claims it
@@ -488,9 +759,16 @@ const (
 // A broker acknowledgement moves the row to dispatched and stamps dispatched_at.
 // A failed attempt within budget returns the row to the claimable set so it is
 // retried after a backoff; once the budget in max_attempts is spent the row
-// becomes failed, and once the event has additionally been written to its
-// `<topic>.dlt` sibling it becomes dead_lettered. dispatched and dead_lettered
+// becomes failed with dlt_topic still NULL, and once the event has additionally
+// been written to its `<topic>.dlt` sibling it becomes dead_lettered. dispatched and dead_lettered
 // are the terminal states; only a dead_lettered row is eligible for replay.
+//
+// webhook_pending is the one state that exists solely for the dual-delivery
+// window: the Kafka leg is published and recorded in kafka_dispatched_at while
+// the legacy HTTP leg is still owed. It is claimable — so the outstanding
+// webhook is actually retried — and a row re-claimed out of it publishes NOTHING
+// to Kafka, because its Kafka leg is already recorded. It disappears with the
+// rest of the legacy transport at the sunset.
 //
 // # Relationship to the lineage outbox vocabulary
 //
@@ -523,11 +801,55 @@ const (
 	// EventOutboxStatusProcessing means a relay instance has claimed the row and
 	// holds a lease on it in locked_until.
 	EventOutboxStatusProcessing = "processing"
+	// EventOutboxStatusWebhookPending means the Kafka leg is published and
+	// recorded, and only the legacy HTTP webhook leg is still owed.
+	//
+	// It exists because the two legs of the dual-delivery window used to share
+	// one terminal state, so a Kafka publish that succeeded marked the row
+	// dispatched even when the webhook enqueue alongside it had failed — and
+	// dispatched is outside the claim predicate, so that webhook was never
+	// retried. This state is INSIDE the claimable set and outside the
+	// key-blocking set: the outstanding webhook is picked up again, while later
+	// events for the same aggregate keep flowing, because a row that is already
+	// on its Kafka topic can no longer affect Kafka ordering.
+	//
+	// A row claimed out of this state carries a non-nil KafkaDispatchedAt, which
+	// is what tells the relay to deliver only the webhook and publish nothing.
+	//
+	// SUNSET: removed with the rest of the legacy transport.
+	EventOutboxStatusWebhookPending = "webhook_pending"
 	// EventOutboxStatusDispatched is the success terminal state: the broker
-	// acknowledged the publish and dispatched_at is set.
+	// acknowledged the publish, dispatched_at is set, and — during the
+	// dual-delivery window — the legacy leg is either done or has been
+	// deliberately abandoned after spending its own budget.
 	EventOutboxStatusDispatched = "dispatched"
+	// EventOutboxStatusDLTPending is a READ-SIDE literal only. NOTHING WRITES IT,
+	// and the status column's CHECK constraint does not permit it.
+	//
+	// It named a distinct "budget spent, dead-letter write owed" state in an earlier
+	// shape of this feature. That shape is not the one that shipped: the owed
+	// hand-off is expressed as EventOutboxStatusFailed with dlt_topic still NULL,
+	// which is exactly what ClaimFailedEventOutboxForDeadLetter selects on, and it
+	// needs no second literal to say the same thing.
+	//
+	// It survives for one narrow purpose: it is accepted as a dead-letter list FILTER
+	// and summed into the awaiting-dead-letter count, so that a row left in it by a
+	// build that did write it is still visible to an operator rather than invisible
+	// to every query. DO NOT WRITE IT — a row carrying it would violate the CHECK
+	// constraint and the transition would fail outright.
+	EventOutboxStatusDLTPending = "dlt_pending"
 	// EventOutboxStatusFailed means the retry budget in max_attempts was
 	// exhausted without a successful publish.
+	//
+	// IT IS WHAT THE RELAY'S EXHAUSTION ARM WRITES, and a failed row with dlt_topic
+	// still NULL is precisely "the dead-letter write is owed". That pair — the status
+	// and the coordinate's absence — is what ClaimFailedEventOutboxForDeadLetter
+	// claims, so the hand-off is re-claimable after a worker dies or its dead-letter
+	// write fails rather than the event being stranded in a state nothing selects
+	// for. Once the write lands the row moves to EventOutboxStatusDeadLettered.
+	//
+	// It is NOT terminal and NOT purgeable: while a row sits here the event exists
+	// only in this table.
 	EventOutboxStatusFailed = "failed"
 	// EventOutboxStatusDeadLettered is the failure terminal state: the event has
 	// been written to its `<topic>.dlt` sibling with failure metadata attached,
@@ -553,12 +875,13 @@ const (
 // both partial indexes and every transition select on specific literals, so a row
 // in an unrecognised state is an event nothing will ever look at again.
 var eventOutboxStatuses = map[string]struct{}{
-	EventOutboxStatusPending:      {},
-	EventOutboxStatusProcessing:   {},
-	EventOutboxStatusDispatched:   {},
-	EventOutboxStatusFailed:       {},
-	EventOutboxStatusDeadLettered: {},
-	EventOutboxStatusReplaying:    {},
+	EventOutboxStatusPending:        {},
+	EventOutboxStatusProcessing:     {},
+	EventOutboxStatusWebhookPending: {},
+	EventOutboxStatusDispatched:     {},
+	EventOutboxStatusFailed:         {},
+	EventOutboxStatusDeadLettered:   {},
+	EventOutboxStatusReplaying:      {},
 }
 
 // terminalEventOutboxStatuses is the subset of states from which no further
@@ -569,6 +892,9 @@ var eventOutboxStatuses = map[string]struct{}{
 // dead-letter write is still owed, and until it lands the event exists only in
 // this table. Purging a failed row would therefore destroy the only copy.
 // replaying is not terminal for the obvious reason that a publish is in flight.
+// webhook_pending is not terminal because a delivery is still owed on the legacy
+// leg — purging such a row would drop that webhook silently, which is the exact
+// loss the state was introduced to stop.
 var terminalEventOutboxStatuses = map[string]struct{}{
 	EventOutboxStatusDispatched:   {},
 	EventOutboxStatusDeadLettered: {},
@@ -616,6 +942,34 @@ func TerminalEventOutboxStatuses() []string {
 	return []string{EventOutboxStatusDispatched, EventOutboxStatusDeadLettered}
 }
 
+// EventOutboxStatuses returns EVERY state in the outbox state machine, in
+// state-machine order, as a fresh slice the caller may retain or reorder.
+//
+// It exists so that a caller which must account for all of them — the statistics
+// response behind the daily zero-loss reconciliation, and the test that proves
+// that response is complete — enumerates them from this one authoritative place
+// rather than restating the list. A status added here and not added there is
+// exactly the failure the reconciliation cannot survive: the reported per-status
+// counts then sum to less than the table's row count, and a short total is
+// indistinguishable from a lost event.
+//
+// The order is the order a row moves through, not alphabetical, because that is
+// how the runbook reads the counts.
+//
+// Returns:
+//   - []string: pending, processing, dispatched, failed, dead_lettered, replaying.
+func EventOutboxStatuses() []string {
+	return []string{
+		EventOutboxStatusPending,
+		EventOutboxStatusProcessing,
+		EventOutboxStatusWebhookPending,
+		EventOutboxStatusDispatched,
+		EventOutboxStatusFailed,
+		EventOutboxStatusDeadLettered,
+		EventOutboxStatusReplaying,
+	}
+}
+
 // EventFailureOutcome is what a recorded publish failure decided, returned by
 // Datasource.MarkEventFailed.
 //
@@ -635,7 +989,8 @@ func TerminalEventOutboxStatuses() []string {
 // failed.
 type EventFailureOutcome struct {
 	// Status is the state the row is now in: EventOutboxStatusPending when another
-	// attempt is owed, or EventOutboxStatusFailed when the budget is spent.
+	// attempt is owed, or EventOutboxStatusFailed when the budget is spent and the
+	// dead-letter write is owed.
 	Status string
 
 	// Attempts is the attempt count AFTER this failure was recorded, which is the
@@ -643,8 +998,8 @@ type EventFailureOutcome struct {
 	Attempts int
 
 	// Exhausted is true when the retry budget is spent and the dead-letter write is
-	// now owed. It is derived from Status rather than computed independently, so the
-	// two can never disagree.
+	// now owed — that is, when Status is EventOutboxStatusFailed. It is derived from
+	// Status rather than computed independently, so the two can never disagree.
 	Exhausted bool
 
 	// ClaimToken is the token to present to MarkEventDeadLettered, and it is set
@@ -657,6 +1012,41 @@ type EventFailureOutcome struct {
 	// writing the event to the dead-letter topic. It is echoed back here so the
 	// caller does not have to remember which arm keeps it.
 	ClaimToken string
+}
+
+// EventWebhookOutcome is what a recorded LEGACY WEBHOOK enqueue failure decided,
+// returned by Datasource.MarkEventWebhookPending.
+//
+// SUNSET: this type, the transition that returns it and the state it reports go with
+// the rest of the legacy transport.
+//
+// # Why the decision is returned instead of re-read
+//
+// For exactly the reason EventFailureOutcome is: the retry-versus-abandon decision is
+// taken inside the UPDATE, so two relay instances working the same row cannot both
+// conclude they spent the last webhook attempt. Deriving it from a fresh read would
+// reintroduce that race.
+//
+// The caller needs it because the two arms differ in what the operator is told. The
+// retry arm is routine and logs at debug: an enqueue failed, the row stays claimable,
+// the webhook will be attempted again. The ABANDON arm is not routine — a webhook the
+// system promised during the migration window is never going to be delivered — and it
+// is logged at error with the event's identity, because it is the only notice anybody
+// gets.
+type EventWebhookOutcome struct {
+	// Status is the state the row is now in: EventOutboxStatusWebhookPending when
+	// another webhook attempt is owed, or EventOutboxStatusDispatched when the legacy
+	// leg has been abandoned and the row is terminal on the strength of its Kafka
+	// delivery alone.
+	Status string
+
+	// WebhookAttempts is the legacy enqueue count AFTER this failure was recorded.
+	WebhookAttempts int
+
+	// Abandoned is true when the legacy leg's budget is spent and no further webhook
+	// attempt will be made. Derived from Status rather than computed independently, so
+	// the two cannot disagree.
+	Abandoned bool
 }
 
 // eventTopicDLTSuffix is the dead-letter suffix, duplicated from the root
@@ -757,13 +1147,24 @@ const uuidCanonicalLength = 36
 // recorded once" an invariant. Admitting only one spelling is what keeps the key
 // canonical end to end.
 //
+// The CASE check is part of that, and it is not pedantry. uuid.Parse accepts
+// "3F2504E0-..." and "3f2504e0-..." as the same value, but the outbox stores and
+// the unique index compares STRINGS: the two spellings are two rows for one event,
+// and a subscriber deduplicating on event_id sees two keys. RFC 4122 §3 specifies
+// lowercase on output, every id this package mints is lowercase, and admitting the
+// other spelling would let a hand-supplied id defeat the one invariant the column
+// exists to hold.
+//
 // Parameters:
 //   - s string: the candidate identifier.
 //
 // Returns:
-//   - bool: true only for the 36-character hyphenated form.
+//   - bool: true only for the 36-character lowercase hyphenated form.
 func IsCanonicalUUID(s string) bool {
 	if len(s) != uuidCanonicalLength {
+		return false
+	}
+	if s != strings.ToLower(s) {
 		return false
 	}
 	if _, err := uuid.Parse(s); err != nil {
@@ -784,12 +1185,17 @@ func IsCanonicalUUID(s string) bool {
 //	balances     → blnk.balances     → blnk.balances.dlt
 //	identities   → blnk.identities   → blnk.identities.dlt
 //	system       → blnk.system       → blnk.system.dlt         (internal)
-//	quarantine   → blnk.quarantine   → blnk.quarantine.dlt     (internal)
+//
+// FOUR CATEGORIES, EIGHT TOPICS, AND THE LIST IS CLOSED. It is the agreed topic
+// contract: subscribers, the provisioning script, the Kubernetes configuration and
+// the local stack all enumerate exactly these names, so adding a fifth category here
+// silently obliges every one of them to be changed too. A new category is a
+// deliberate contract change, never an implementation detail.
 //
 // Nothing in this file knows the prefix, builds a topic name, or appends the
 // `.dlt` suffix. Treating a value returned from here as a topic is a bug.
 //
-// # Why there is a fourth, `system`, category
+// # Why there is a fourth category beyond the three the requirements name
 //
 // Two event types that really are emitted belong to none of the three categories
 // the requirements name: "ledger.created", raised by the post-ledger-creation
@@ -798,27 +1204,36 @@ func IsCanonicalUUID(s string) bool {
 // requirement is absolute — every event type that reaches the legacy webhook
 // sender must be published, with zero exceptions.
 //
-// The fourth category resolves that tension while following the identical naming
-// convention, so nothing about the scheme is special-cased. Do NOT collapse it
-// into another category: forcing ledger and system-error events onto, say, the
+// BOTH GO TO ONE FOURTH CATEGORY, `system`, following the identical naming
+// convention so nothing about the scheme is special-cased. That is AMBIGUITY-2's
+// resolution, and the alternatives are worse: forcing ledger events onto, say, the
 // transactions topic corrupts that topic's semantics for every subscriber that
 // filters on it, and dropping them violates the coverage requirement outright.
 //
-// # Why there is a fifth, `quarantine`, category
+// The category is INTERNAL, so no subscriber principal may be granted either
+// topic. That is a deliberate consequence and not an oversight: system.error's
+// payload is the frozen legacy body, so it still carries the error text as it
+// renders, and narrowing it would break the payload-preservation guarantee. The
+// disclosure is therefore contained by audience rather than by redaction. It does
+// leave ledger.created reachable by no subscriber credential; coverage — durable
+// capture, publication, observability and replay — is nonetheless satisfied for it,
+// because what an internal category withholds is an ACL rather than the event.
 //
-// Because "every event must be published" and "an unmapped event must not reach
-// the wrong audience" are both true, and one topic cannot satisfy both.
+// # Where an event type this table does not recognise goes
 //
-// The system category used to double as the catch-all for any event type this
-// table did not recognise. That made a forgotten mapping into a disclosure: a new
-// producer emitting, say, a balance or identity payload under a name nobody had
-// added here delivered it to whoever consumes the system topic. Quarantine
-// separates the two jobs — system carries the events that genuinely belong to it,
-// quarantine carries the ones we cannot classify — and both are INTERNAL, so
-// neither can be granted to a subscriber. See IsInternalEventCategory.
+// To the SYSTEM category, which is the catch-all as well as the home of
+// ledger.created and system.error. That placement is safe for the one reason that
+// matters: the system category is INTERNAL, so no subscriber can be granted its
+// topic (see IsInternalEventCategory and SubscriberGrantableEventCategories). An
+// uncatalogued event is therefore published — the coverage guarantee is absolute
+// and the row is already committed by the time routing happens, so it can be
+// neither dropped nor refused — while remaining unreachable by any subscriber.
+// Containment does not need a category of its own; it needs a topic no grant
+// covers, and the system topic already is one.
 //
-// Anything arriving in quarantine is a defect to fix by extending EventCategory,
-// not a state to design around.
+// Anything arriving there under an unrecognised name is a defect to fix by
+// extending EventCategory, not a state to design around, which is why the publisher
+// says so at warning level when it routes one.
 const (
 	// EventCategoryTransactions covers all transaction lifecycle events,
 	// including the runtime-composed bulk transaction events.
@@ -827,53 +1242,51 @@ const (
 	EventCategoryBalances = "balances"
 	// EventCategoryIdentities covers identity events.
 	EventCategoryIdentities = "identities"
-	// EventCategorySystem covers ledger and internal-error events.
+	// EventCategorySystem covers ledger and internal-error events, and it is also
+	// the CATCH-ALL for an event type EventCategory does not recognise.
 	//
-	// It is INTERNAL: system.error carries Blnk's own diagnostic detail, which is
-	// not subscriber-facing data, so this category is not offered to subscribers.
-	// IsInternalEventCategory is the single test for that, and the subscriber
-	// authorization path refuses a grant over its topic.
+	// It is the fourth category AMBIGUITY-2 resolves the requirement's three named
+	// categories into. `ledger.created` and `system.error` belong to none of
+	// transactions, balances or identities, and the coverage requirement admits no
+	// exceptions, so they need a category of their own rather than being forced into
+	// an unrelated one — which would corrupt that topic's meaning for the
+	// subscribers filtering it — or dropped, which would breach coverage outright.
 	//
-	// It is NOT the catch-all. It used to be, and that was the defect: an event
-	// type nobody had mapped landed on a topic whose consumers expect ledger and
-	// error records, so a missing mapping silently exposed a domain payload to the
-	// wrong audience instead of failing where somebody would see it.
+	// # It is INTERNAL: no subscriber principal may be granted it
+	//
+	// Two independent reasons, either of which is sufficient on its own:
+	//
+	//   - system.error's payload is the FROZEN LEGACY BODY, {"error": <text>,
+	//     "time": <now>}, and the <text> is the error as it renders. A PostgreSQL
+	//     error names schema, table, column and routine; a broker error names
+	//     internal addresses. That body cannot be narrowed without breaking the
+	//     payload-preservation guarantee the whole migration rests on, so the
+	//     disclosure is contained by AUDIENCE instead: the bounded, classified
+	//     diagnosis goes to the operator log (see internal/notification), and the
+	//     verbatim body goes to a topic no grant covers.
+	//   - Being internal is exactly what makes it a safe catch-all. An uncatalogued
+	//     event type lands on a topic no subscriber can be granted, so a routing
+	//     omission cannot deliver a domain payload — a balance record, an identity
+	//     record — to an audience that never asked for it.
+	//
+	// Coverage is still absolute and is not the same question as reachability. Every
+	// event, including these two, is durably captured, published, observable and
+	// replayable; the publisher logs at warning level when it routes an
+	// unrecognised type here so the omission is visible rather than silent. What an
+	// internal category withholds is a subscriber ACL, not the event.
 	EventCategorySystem = "system"
-	// EventCategoryQuarantine is where an event type that this table does not
-	// recognise is routed, and it is the catch-all EventCategorySystem used to be.
-	//
-	// # Why a quarantine category rather than the system topic
-	//
-	// The coverage requirement is absolute: every event that reaches the publisher
-	// must be published, with zero exceptions, so an unrecognised type cannot be
-	// dropped and cannot be rejected at the publisher — the row is already
-	// committed by then, and refusing it would strand a durable event.
-	//
-	// But "published somewhere" is not the same as "published to the right
-	// audience". Routing an unknown type to blnk.system meant a new producer that
-	// forgot to extend this table delivered its payload — potentially a balance
-	// or an identity record — to whoever consumes the system topic. Quarantine
-	// keeps the event durable, observable and replayable while sending it to a
-	// topic that is INTERNAL and that no subscriber can be granted, so a routing
-	// omission is contained rather than turned into a disclosure.
-	//
-	// The correct fix for anything landing here is always to add the event type to
-	// EventCategory. A non-empty quarantine topic is a defect signal, which is why
-	// the publisher logs at warning level when it routes there.
-	EventCategoryQuarantine = "quarantine"
 )
 
 // internalEventCategories are the categories no subscriber may be granted access
 // to, keyed by category token.
 //
-// Both entries hold Blnk-internal material rather than subscriber-facing ledger
-// data: the system category carries internal error detail, and quarantine carries
-// events whose audience is by definition unknown. Declaring them here, once, is
-// what lets the subscriber authorization path and the provisioning script apply
-// the same rule without either of them keeping its own list.
+// The system category holds Blnk-internal material rather than subscriber-facing
+// ledger data — internal error detail, and any event type the catalogue does not
+// recognise. Declaring the set here, once, is what lets the subscriber
+// authorization path and the provisioning script apply the same rule without
+// either of them keeping its own list.
 var internalEventCategories = map[string]struct{}{
-	EventCategorySystem:     {},
-	EventCategoryQuarantine: {},
+	EventCategorySystem: {},
 }
 
 // IsInternalEventCategory reports whether a category is Blnk-internal and
@@ -883,7 +1296,7 @@ var internalEventCategories = map[string]struct{}{
 //   - category string: a bare category token, not a topic name.
 //
 // Returns:
-//   - bool: true for the system and quarantine categories.
+//   - bool: true for the system category, which is the only internal one.
 func IsInternalEventCategory(category string) bool {
 	_, internal := internalEventCategories[category]
 
@@ -931,9 +1344,13 @@ func SubscriberGrantableEventCategories() []string {
 //     operational surface, read under the master key through GET /events/dead-letter, and
 //     granting one to a subscriber would hand it every other subscriber's failed events.
 //   - The SYSTEM category, which carries `ledger.created` and `system.error` — Blnk's own
-//     diagnostics, including error text from inside the process.
-//   - The QUARANTINE category, which is where an uncatalogued event type lands precisely
-//     because nothing has yet decided what it contains or who may see it.
+//     diagnostics, including error text from inside the process — and, as the catch-all,
+//     any uncatalogued event type, whose contents and audience nothing has yet decided.
+//
+// What it deliberately INCLUDES is the system category, which carries `ledger.created` and
+// `system.error`. Both were delivered by the legacy webhook transport, so excluding them
+// left two of the thirteen migrated event types with no authorized path — and the payload
+// that motivated the exclusion is sanitized where it is produced rather than withheld here.
 //
 // Parameters:
 //   - prefix string: the namespace this deployment owns. Trimmed; a blank prefix falls back
@@ -997,12 +1414,15 @@ func IsSubscriberGrantableTopicName(topic, prefix string) bool {
 //
 // It lives here rather than in the topic-naming layer because this file owns the
 // category vocabulary; the naming layer composes topic names from it.
+// The grantable categories come first and the internal ones last, so that
+// SubscriberGrantableEventCategories — which filters this list — yields a
+// contiguous prefix of it and a reader can see at a glance where the boundary
+// between subscriber-facing and internal topics falls.
 var eventCategoryOrder = [...]string{
 	EventCategoryTransactions,
 	EventCategoryBalances,
 	EventCategoryIdentities,
 	EventCategorySystem,
-	EventCategoryQuarantine,
 }
 
 // AllEventCategories returns every category token, in canonical order.
@@ -1020,6 +1440,64 @@ func AllEventCategories() []string {
 // name. The full name is composed at runtime as this prefix plus the batch
 // status, so the prefix — and never the whole string — is what can be matched.
 const bulkTransactionEventPrefix = "bulk_transaction."
+
+// eventTypeCategories is THE CATALOGUE: every event type Blnk emits under a fixed
+// name, mapped to the category whose topic it is published to.
+//
+// It is a table rather than a switch so that EventCategory and IsCataloguedEventType
+// read the SAME list. Two copies of this vocabulary would drift, and the drift is not
+// cosmetic: an event type present in one copy and absent from the other is routed to a
+// real category while being reported as unrecognised, or the reverse, so the metric
+// label and the topic would disagree about the same event.
+//
+// The bulk transaction family is deliberately ABSENT. Its names are composed at
+// runtime as bulkTransactionEventPrefix plus the batch status, so the suffix set is
+// open and no table can enumerate it; both readers match it by prefix before
+// consulting this map.
+//
+// "transaction.unknown" is a real, reachable member rather than a placeholder — see
+// EventCategory for why the COMMIT status falls through to it.
+var eventTypeCategories = map[string]string{
+	"transaction.queued":    EventCategoryTransactions,
+	"transaction.applied":   EventCategoryTransactions,
+	"transaction.scheduled": EventCategoryTransactions,
+	"transaction.inflight":  EventCategoryTransactions,
+	"transaction.void":      EventCategoryTransactions,
+	"transaction.rejected":  EventCategoryTransactions,
+	"transaction.unknown":   EventCategoryTransactions,
+	"balance.created":       EventCategoryBalances,
+	"balance.monitor":       EventCategoryBalances,
+	"identity.created":      EventCategoryIdentities,
+	"ledger.created":        EventCategorySystem,
+	"system.error":          EventCategorySystem,
+}
+
+// IsCataloguedEventType reports whether an event type is one this repository is known
+// to emit.
+//
+// It answers a different question from EventCategory, and the difference is the whole
+// point of it existing. EventCategory always returns a category, because every event
+// must be published somewhere; this says whether that category was CHOSEN for the event
+// type or merely inherited from the catch-all. Two callers need the distinction: the
+// publisher, which warns when it routes an event type nobody catalogued, and the metrics
+// layer, which must collapse uncatalogued names to one label rather than let an
+// arbitrary string become a metric dimension.
+//
+// Parameters:
+//   - eventType string: the event name, for example "transaction.applied".
+//
+// Returns:
+//   - bool: true for a named member of the catalogue and for any
+//     bulk_transaction.<status>.
+func IsCataloguedEventType(eventType string) bool {
+	if strings.HasPrefix(eventType, bulkTransactionEventPrefix) {
+		return true
+	}
+
+	_, catalogued := eventTypeCategories[eventType]
+
+	return catalogued
+}
 
 // EventCategory resolves an event type to its category token. It is THE single
 // event-type-to-category mapping table in the repository: the topic-naming layer
@@ -1064,25 +1542,12 @@ func EventCategory(eventType string) string {
 		return EventCategoryTransactions
 	}
 
-	switch eventType {
-	case "transaction.queued",
-		"transaction.applied",
-		"transaction.scheduled",
-		"transaction.inflight",
-		"transaction.void",
-		"transaction.rejected",
-		"transaction.unknown":
-		return EventCategoryTransactions
-	case "balance.created",
-		"balance.monitor":
-		return EventCategoryBalances
-	case "identity.created":
-		return EventCategoryIdentities
-	case "ledger.created",
-		"system.error":
-		return EventCategorySystem
-	default:
-		// The catch-all, and it is QUARANTINE rather than the system category.
+	if category, catalogued := eventTypeCategories[eventType]; catalogued {
+		return category
+	}
+
+	{
+		// THE CATCH-ALL, and it is the system category.
 		//
 		// An unrecognised or empty event type is still routed rather than
 		// rejected or dropped, which is what keeps the "zero exceptions"
@@ -1090,15 +1555,16 @@ func EventCategory(eventType string) string {
 		// is committed before routing happens, so refusing it here would strand
 		// a durable event, and dropping it would lose one.
 		//
-		// Where it goes matters as much as that it goes somewhere. This arm used
-		// to return EventCategorySystem, which meant a new producer that forgot
-		// to extend the table above delivered its payload — a balance record, an
-		// identity record — to whoever consumes the system topic. Quarantine is
-		// internal and cannot be granted to a subscriber, so the same omission
-		// is contained instead of becoming a disclosure, and it stays visible:
-		// events on the quarantine topic are a defect signal, and the publisher
-		// logs at warning level when it routes there.
-		return EventCategoryQuarantine
+		// Where it goes matters as much as that it goes somewhere, and the
+		// system category answers that safely because it is INTERNAL: no
+		// subscriber can be granted its topic, so a producer added without
+		// extending the table above cannot deliver its payload — a balance
+		// record, an identity record — to an audience that never asked for it.
+		// The event stays durable, observable and replayable, and the omission
+		// stays visible: the publisher logs at warning level when it routes an
+		// event type it does not recognise, and the fix is always to add the
+		// type above rather than to design around this arm.
+		return EventCategorySystem
 	}
 }
 
@@ -1265,37 +1731,54 @@ func CredentialFingerprint(reference string) string {
 // topics. Isolation is achieved by making each subscriber a distinct Kafka
 // principal and scoping that principal with ACLs.
 //
-// THE ENFORCED BOUNDARY IS EXACTLY THREE THINGS, and they are all the broker can
-// check:
+// THE BOUNDARY IS EXACTLY THREE SCOPES, and the broker can check only the first
+// two:
 //
 //	Topic  <each entry of AuthorizedTopics>  LITERAL   Read + Describe
 //	Group  <ConsumerGroupID>                 PREFIXED  Read
+//	Key    <PartitionKeyPrefix>              enforced by REFUSAL — see below
 //
-// KafkaPrincipal, ConsumerGroupID and AuthorizedTopics therefore ARE the boundary,
-// and a provisioning call translates them into one SCRAM credential plus that set
-// of ACL bindings. KafkaPrincipal is the join key between a registry row and the
-// broker's own authorization state, because every binding names it.
+// KafkaPrincipal, ConsumerGroupID and AuthorizedTopics are the two broker-checked
+// scopes, and a provisioning call translates them into one SCRAM credential plus
+// that set of ACL bindings. KafkaPrincipal is the join key between a registry row
+// and the broker's own authorization state, because every binding names it.
 //
 // PARTITIONKEYPREFIX IS NOT PART OF THE ENFORCED BOUNDARY, and cannot be. Kafka's
 // authorizer has no message-key dimension: there is no ACL that restricts a
 // consumer to a slice of a topic by key, and no broker-side mechanism of any kind
 // that could apply one. A subscriber granted a category topic can read EVERY
-// record on that topic, whatever its key. The prefix is an advisory filter hint
-// that the registry records and the credential response reports so a subscriber can
-// discard the records it does not care about CLIENT-SIDE — and client-side
-// filtering is not authorization.
+// record on that topic, whatever its key.
 //
-// This is stated at length because the field's mere presence in a struct called
-// "the access model" previously implied an isolation guarantee the system cannot
-// deliver, which is worse than having no field at all: an operator reading it would
-// grant a shared topic believing the key prefix confined the subscriber to its own
-// records. If per-key isolation is genuinely required, it has to come from a
+// SO THE FIELD IS A CONSTRAINT THIS SYSTEM WILL NOT PRETEND TO HONOUR, AND
+// ISSUANCE FAILS CLOSED ON IT. A row carrying a non-nil prefix records an
+// authorization narrower than any credential Blnk could mint, so
+// EventSubscriberService.IssueSubscriberCredential REFUSES to issue for that row
+// rather than handing back a credential whose real scope is the whole topic. The
+// refusal names both ways forward: clear the prefix to accept whole-topic access,
+// or narrow the topic grant, which IS enforceable.
+//
+// Calling it "advisory" — which this documentation and the column comment both
+// once did — was the more dangerous framing, however carefully qualified. The
+// field's presence in a struct describing "the access model" implies an isolation
+// guarantee the system cannot deliver, and an operator reading it would grant a
+// shared topic believing the key prefix confined the subscriber to its own
+// records. A qualification in a comment does not survive that reading; a refused
+// issuance does. If per-key isolation is genuinely required it has to come from a
 // different design — a topic per authorization domain, or a filtering gateway that
 // emits already-isolated streams — and not from this field.
 //
-// Nothing in this package or the provisioning path treats the prefix as
-// authorization: NewSubscriberProvisioningRequest deliberately does not map it onto
-// any binding, and HasTopicAccess ignores it.
+// Nothing in this package or the provisioning path treats the prefix as a grant:
+// NewSubscriberProvisioningRequest deliberately does not map it onto any binding,
+// and HasTopicAccess ignores it.
+//
+// # A deregistration in progress is a state of its own
+//
+// RevocationPendingAt marks a subscriber whose broker-side access is being taken
+// away. The row survives a revocation that failed precisely so the failure stays
+// recoverable: a deregistration that deleted the row first would destroy the only
+// record of which principal still has to be revoked. A pending row is NOT an
+// active subscriber — issuance refuses for it too — and it is removed only once
+// the broker-side cleanup has been confirmed.
 //
 // # No secret is stored here, and none can be
 //
@@ -1316,10 +1799,9 @@ func CredentialFingerprint(reference string) string {
 // Four fields are pointers because for each of them NULL carries information that
 // a zero value would destroy:
 //
-//   - PartitionKeyPrefix nil means the subscriber has asked for no client-side key
-//     filter at all, as opposed to a filter on the empty prefix — which would
-//     invert the intent. It is not a grant either way; see the access-model note
-//     above for why the prefix is advisory.
+//   - PartitionKeyPrefix nil means NO key constraint was recorded, as opposed to a
+//     constraint on the empty prefix — which would invert the intent. Non-nil
+//     blocks credential issuance; see the access-model note above.
 //   - CredentialReference nil is the reliable test for "no credential has ever
 //     been issued", the real "registered, not yet provisioned" state.
 //   - CredentialIssuedAt nil accompanies it; the two are set and overwritten
@@ -1367,14 +1849,14 @@ type EventSubscriber struct {
 	// Describe, and the set the ACLs are granted over. Empty means authorised for
 	// nothing — the registry fails closed.
 	AuthorizedTopics []string `json:"authorized_topics"`
-	// PartitionKeyPrefix is an ADVISORY, CLIENT-SIDE filter hint. It is NOT an
-	// authorization boundary and is not enforced by anything.
+	// PartitionKeyPrefix records a key-scoped authorization constraint that KAFKA
+	// CANNOT ENFORCE, so a non-nil value makes the subscriber UNPROVISIONABLE:
+	// credential issuance refuses rather than mint a credential whose real scope
+	// is every record on every authorised topic.
 	//
-	// Kafka ACLs are topic-level; the broker has no message-key dimension to
-	// restrict on. A subscriber granted a topic can read every record on it
-	// regardless of this value, so nothing may treat a non-nil prefix as
-	// narrowing what the subscriber CAN read — only as describing what it WANTS
-	// to read. Nil means no filter was requested.
+	// Kafka ACLs are topic-level and group-level; the broker has no message-key
+	// dimension to restrict on. Nil means no such constraint was recorded, which
+	// is the only state a credential can be issued in.
 	PartitionKeyPrefix *string `json:"partition_key_prefix,omitempty"`
 
 	// --- The credential record ---
@@ -1389,13 +1871,40 @@ type EventSubscriber struct {
 
 	// --- Dual-run migration tracking (temporary by design) ---
 
-	// WebhookURL is the legacy HTTP webhook URL this subscriber received pushes
-	// on before moving to Kafka. Nil for a subscriber onboarded after the
-	// cutover, which never had one.
+	// WebhookURL is a MIGRATION RECORD, not a delivery destination. NOTHING SENDS
+	// TO IT.
+	//
+	// It records the legacy HTTP webhook URL a subscriber was receiving pushes on
+	// before it moved to Kafka, so that an operator can tell which subscribers are
+	// still to be migrated and confirm which URL each one is coming off. Nil for a
+	// subscriber onboarded after the cutover, which never had one.
+	//
+	// Dual-run delivery does NOT read this column. During the 30-day window the
+	// relay delivers the legacy leg to the single global Notification.Webhook.Url,
+	// which is the entire webhook subscription surface Blnk has ever had — there
+	// was never per-subscriber HTTP delivery to reproduce, and inventing one during
+	// a deprecation window would be building the transport being retired. Anything
+	// that treated a value here as a sink would silently deliver nothing.
 	WebhookURL *string `json:"webhook_url,omitempty"`
 	// MigratedAt is when the subscriber completed its move to Kafka consumption.
 	// Nil means not yet migrated.
 	MigratedAt *time.Time `json:"migrated_at,omitempty"`
+
+	// --- Deregistration in progress ---
+
+	// RevocationPendingAt is when deregistration began taking this subscriber's
+	// broker-side access away. Nil for every ordinary subscriber.
+	//
+	// It is the TOMBSTONE that makes a failed revocation recoverable. Deregistration
+	// marks the row, revokes at the broker, and deletes the row only once the
+	// revocation is confirmed — so a row still carrying this timestamp names a
+	// principal that may still authenticate, and retrying the deregistration
+	// finishes the job. Deleting the row first, as this once did, destroyed the
+	// principal and topic list that revocation needs and left access live with
+	// nothing in Blnk able to see it.
+	//
+	// A pending row is not an active subscriber: credential issuance refuses for it.
+	RevocationPendingAt *time.Time `json:"revocation_pending_at,omitempty"`
 
 	// --- Row bookkeeping ---
 
@@ -1403,14 +1912,43 @@ type EventSubscriber struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// DeclaresUnenforceableIsolation reports whether this subscriber's record asks for an
+// access boundary that nothing in the system can enforce.
+//
+// # The boundary that does not exist
+//
+// A non-nil PartitionKeyPrefix says "this subscriber may see only the records whose
+// partition key starts with this". Kafka has no mechanism for that: an ACL names a
+// topic, and a principal granted a topic reads every record on it. So a credential
+// issued to a subscriber that declares a prefix hands out access strictly wider than
+// the record it was issued against describes — and on a shared category topic that
+// wider access is every other subscriber's transactions, balances and identities.
+//
+// The failure mode is not a missing feature, it is a false assurance. An operator reads
+// the registry row, sees the prefix, and concludes the subscriber is confined to its own
+// records. Nothing anywhere contradicts them, because the value is accepted, stored,
+// echoed back and never enforced.
+//
+// So the value is still STORED — it is a real statement of intent, and erasing it would
+// destroy the record of what an operator asked for — and credential issuance REFUSES
+// while it is present. The remedy is explicit rather than silent: clear the prefix to
+// accept topic-level scope, which is the boundary Kafka ACLs can actually hold, or narrow
+// authorized_topics until topic-level scope IS the isolation required.
+//
+// Returns:
+//   - bool: true when a partition-key prefix is recorded.
+func (s *EventSubscriber) DeclaresUnenforceableIsolation() bool {
+	return s != nil && s.PartitionKeyPrefix != nil && strings.TrimSpace(*s.PartitionKeyPrefix) != ""
+}
+
 // HasTopicAccess reports whether the subscriber's RECORDED GRANT covers the given
 // topic.
 //
 // The comparison is exact and the empty-grant case falls out of it naturally: a
 // subscriber with no authorised topics matches nothing, so the registry fails
-// closed rather than open. PartitionKeyPrefix is deliberately not consulted — it is
-// advisory (see the type documentation) and folding it in here would suggest the
-// system can decide access per key, which it cannot.
+// closed rather than open. PartitionKeyPrefix is deliberately not consulted —
+// folding it in here would suggest the system can decide access per key, which it
+// cannot; a row carrying one is refused a credential outright instead.
 //
 // This is a read over the recorded grant and is NOT a substitute for broker-side
 // ACL enforcement. The broker is the authority; this method exists so the service
@@ -1425,6 +1963,102 @@ func (s *EventSubscriber) HasTopicAccess(topic string) bool {
 	return false
 }
 
+// RequestedKeyScope is the key scope recorded for this subscriber, flattening the
+// nullable column to a plain string.
+//
+// "" means no scope was requested, which is the same thing as "every key on the
+// authorised topics" — the two readings are identical and the empty string is used
+// for both so no caller has to handle a third state.
+//
+// The scope is RECORDED rather than derived, and it must be: message keys on Blnk's
+// topics are the aggregate's ledger partition key, so a scope derived from the
+// subscriber's own identifier would match no record ever produced. Only the caller
+// registering the subscriber knows which ledgers it is entitled to.
+func (s *EventSubscriber) RequestedKeyScope() string {
+	if s == nil || s.PartitionKeyPrefix == nil {
+		return ""
+	}
+
+	return *s.PartitionKeyPrefix
+}
+
+// RequiresKeyScopeEnforcement reports whether this subscriber asked for a boundary
+// narrower than a whole topic.
+//
+// It is the FAIL-CLOSED TEST that credential issuance and provisioning both consult:
+// true means the recorded boundary cannot be expressed as a Kafka ACL, so a direct
+// broker credential must be refused rather than issued with the wider access the
+// broker would really grant. See the access-model note on EventSubscriber.
+//
+// It is deliberately not the negation of "is provisionable": a subscriber can be
+// unprovisionable for other reasons (no authorised topics, no consumer group), and
+// each of those has its own test so a refusal can name its own cause.
+func (s *EventSubscriber) RequiresKeyScopeEnforcement() bool {
+	return s.RequestedKeyScope() != ""
+}
+
+// HasKeyAccess reports whether this subscriber is entitled to a record carrying the
+// given message key.
+//
+// This is the AUTHORIZATION RULE the key scope is expressed in, and it exists so
+// that any component able to see a record's key — a Blnk-controlled filtering layer,
+// a replay path, an administrative export — decides with one authoritative
+// predicate instead of re-deriving prefix logic that could drift from what the
+// registry recorded.
+//
+// With no scope recorded every key is in bounds, which is why an unprovisioned
+// prefix and an explicitly whole-topic entitlement read the same here. With a scope
+// recorded only keys carrying it are in bounds, and the comparison is a byte-exact
+// prefix test: keys are opaque identifiers rather than text, so no case folding, no
+// trimming and no normalisation is applied — a caller whose key differs from the
+// recorded scope by whitespace is asking about a different key.
+//
+// IT IS NOT WHAT THE BROKER CHECKS. Kafka cannot filter by key, which is exactly why
+// a subscriber with a recorded scope is refused a direct credential: until an
+// enforcement layer calls this rule on every record, the only place the scope can be
+// honoured is a refusal.
+func (s *EventSubscriber) HasKeyAccess(key string) bool {
+	scope := s.RequestedKeyScope()
+	if scope == "" {
+		return true
+	}
+
+	return strings.HasPrefix(key, scope)
+}
+
+// SubscriberKeyScopeAllKeys is the effective key scope of every credential Blnk can
+// issue today, and the value the credential contract reports for it: EVERY key on
+// the authorised topics.
+//
+// It is a descriptive word rather than "*" deliberately. "*" is Kafka's own
+// match-anything resource name, so a response field carrying it would read as an ACL
+// pattern a client might send back somewhere, and a client comparing against it
+// would be comparing against a value with a second meaning.
+const SubscriberKeyScopeAllKeys = "all-keys"
+
+// EffectiveKeyScope reports the key scope a credential issued for this subscriber
+// would ACTUALLY carry, together with whether that scope is enforced.
+//
+// The pair exists because the requested scope and the delivered scope are not always
+// the same value, and a contract that reported only one of them would be the defect
+// this method closes: a response echoing a requested prefix beside a credential that
+// can read the whole topic states a boundary that does not exist.
+//
+// Returns:
+//   - scope: SubscriberKeyScopeAllKeys when no scope was requested, which is the
+//     honest description of what a topic ACL grants; otherwise the requested scope,
+//     which is the boundary a credential would have to keep and cannot.
+//   - enforced: true only for the all-keys case. A requested prefix is reported as
+//     UNENFORCED, and that is precisely why issuance refuses it instead of handing
+//     this pair to a subscriber.
+func (s *EventSubscriber) EffectiveKeyScope() (scope string, enforced bool) {
+	if requested := s.RequestedKeyScope(); requested != "" {
+		return requested, false
+	}
+
+	return SubscriberKeyScopeAllKeys, true
+}
+
 // IsProvisioned reports whether a credential has ever been issued to this
 // subscriber.
 //
@@ -1432,15 +2066,52 @@ func (s *EventSubscriber) HasTopicAccess(topic string) bool {
 // the reference is the value the repository writes first and the two are always
 // written together; either would do, and testing the reference keeps the
 // "registered, not yet provisioned" state readable at the call site.
+//
+// A NIL RECEIVER answers false, matching DeclaresUnenforceableIsolation. It has to: the repository's not-found
+// representation for a subscriber is a nil pointer, so every caller that reads a
+// row and then asks a question about it can hold one, and a predicate that
+// panicked there would turn a missing subscriber into a crashed ledger process
+// rather than a 404.
 func (s *EventSubscriber) IsProvisioned() bool {
-	return s.CredentialReference != nil && *s.CredentialReference != ""
+	return s != nil && s.CredentialReference != nil && *s.CredentialReference != ""
 }
 
 // IsMigrated reports whether the subscriber has completed its move from legacy
 // HTTP webhook delivery to Kafka consumption. A nil MigratedAt means not yet
 // migrated, which is what dual-window migration-progress reporting counts.
+//
+// A nil RECEIVER answers false for the same reason IsProvisioned does: a
+// subscriber that does not exist has not migrated, and saying so is better than
+// panicking in a process that moves money.
 func (s *EventSubscriber) IsMigrated() bool {
-	return s.MigratedAt != nil
+	return s != nil && s.MigratedAt != nil
+}
+
+// IsRevocationPending reports whether deregistration has begun taking this
+// subscriber's broker-side access away and has not yet confirmed it.
+//
+// Such a row is not an active subscriber. It exists only so the outstanding
+// revocation stays recoverable, and issuing a credential for it would re-arm a
+// principal that is in the middle of being taken out of service.
+// A nil receiver answers false. Both this predicate and KeyScopeUnenforceable are read as
+// GUARDS on a row that may not have been found, so they must be answerable on nothing: a guard
+// that panics where it is supposed to refuse is worse than no guard at all.
+func (s *EventSubscriber) IsRevocationPending() bool {
+	return s != nil && s.RevocationPendingAt != nil
+}
+
+// KeyScopeUnenforceable reports whether the subscriber records a key-scoped
+// authorization constraint that Kafka cannot enforce.
+//
+// It is the predicate credential issuance fails closed on. A non-empty prefix means
+// the recorded authorization is narrower than any credential Blnk can mint, so the
+// honest answer is to refuse rather than to issue whole-topic access under a row
+// that says otherwise. The empty string is treated as absent for the same reason the
+// column is nullable: "a constraint on the empty prefix" is not an intent anybody
+// has, and reading it as one would refuse a subscriber that asked for nothing.
+// A nil receiver answers false, for the reason given on IsRevocationPending.
+func (s *EventSubscriber) KeyScopeUnenforceable() bool {
+	return s != nil && s.PartitionKeyPrefix != nil && strings.TrimSpace(*s.PartitionKeyPrefix) != ""
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2117,4 +2788,262 @@ func ValidateSubscriberTopics(topics []string) error {
 	}
 
 	return nil
+}
+
+// -----------------------------------------------------------------------------
+// Webhook destination policy (SSRF-01)
+// -----------------------------------------------------------------------------
+//
+// ONE implementation of "is this address somewhere Blnk must not send to", shared by
+// every layer that asks the question.
+//
+// There are two layers, and they ask at different moments about different things:
+//
+//   - ADMISSION TIME, in api/model, about the TEXT an operator supplied. It can only
+//     judge a literal — a hostname's resolution is not knowable when a row is written.
+//   - SEND TIME, in the legacy webhook transport, about the RESOLVED ADDRESS the dialer
+//     is about to connect to. That is the only place DNS rebinding is visible, because
+//     it is the only place the actual address is known.
+//
+// They live in different packages and neither can import the other, so the policy lives
+// here in the package both already depend on. That placement is the whole point: two
+// copies of an address deny-list drift, and the drift is silent. A range added to the
+// admission check and forgotten at send time reads as defence-in-depth and is in fact a
+// hole, because the send-time check is the one an attacker actually has to get past.
+//
+// # What is refused, and why each range is on the list
+//
+// The stdlib predicates cover most of it (loopback, link-local, private, unspecified,
+// multicast — including the IPv4-mapped IPv6 spellings, since net.IP normalises those).
+// Four ranges the stdlib does NOT classify are added explicitly because each is a
+// documented SSRF bypass rather than a theoretical one:
+//
+//   - 100.64.0.0/10 (RFC 6598 carrier-grade NAT). Cloud providers put internal
+//     infrastructure here, notably the GKE metadata proxy, precisely because it is
+//     neither public nor RFC1918 and so slips past deny-lists built from IsPrivate.
+//   - 192.0.0.0/24 (IETF protocol assignments) and 198.18.0.0/15 (benchmarking).
+//     Neither is routable on the public internet, so nothing legitimate is reachable
+//     there and anything answering is inside the network.
+//   - 64:ff9b::/96 (RFC 6052 NAT64 well-known prefix). This EMBEDS an IPv4 address in
+//     the low 32 bits, so 64:ff9b::7f00:1 reaches 127.0.0.1 through a NAT64 gateway
+//     while every IPv6 predicate reports a perfectly ordinary global unicast address.
+//     The embedded address is unwrapped and judged on its own merits.
+//
+// IsGlobalUnicast is then used as a closing backstop, so an address family the list
+// above does not enumerate is refused rather than allowed by omission.
+
+// nat64WellKnownPrefixLen is the length in bytes of the RFC 6052 well-known prefix
+// (64:ff9b::/96 — twelve bytes) after which an embedded IPv4 address begins.
+const nat64WellKnownPrefixLen = 12
+
+// nat64WellKnownPrefix is the first twelve bytes of 64:ff9b::/96.
+var nat64WellKnownPrefix = [nat64WellKnownPrefixLen]byte{
+	0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+}
+
+// extraInternalRanges are the CIDRs the net.IP predicates do not classify but that are
+// nonetheless unreachable on the public internet, each paired with the reason reported
+// when an address falls inside it.
+var extraInternalRanges = []struct {
+	cidr   string
+	reason string
+	parsed *net.IPNet
+}{
+	{
+		cidr: "100.64.0.0/10",
+		reason: "it is in the carrier-grade NAT range, where cloud providers host " +
+			"internal infrastructure such as the metadata proxy",
+	},
+	{cidr: "192.0.0.0/24", reason: "it is in the IETF protocol-assignment range, which is not publicly routable"},
+	{cidr: "198.18.0.0/15", reason: "it is in the benchmarking range, which is not publicly routable"},
+}
+
+// init parses the extra ranges once, at package load, so the hot path never parses a
+// CIDR string. A malformed constant here would be a programming error rather than a
+// runtime condition, so parse failure panics at load rather than degrading the policy
+// silently at send time — a deny-list that quietly stopped covering a range is the one
+// failure mode this whole section exists to prevent.
+func init() {
+	for i := range extraInternalRanges {
+		_, network, err := net.ParseCIDR(extraInternalRanges[i].cidr)
+		if err != nil {
+			panic("model: malformed internal destination CIDR " + extraInternalRanges[i].cidr + ": " + err.Error())
+		}
+
+		extraInternalRanges[i].parsed = network
+	}
+}
+
+// InternalIPReason reports why an IP address is an internal destination, or "" when it
+// is one Blnk may send to.
+//
+// A REASON rather than a boolean, because the caller has to be able to say what it
+// refused: "not allowed" sends an operator hunting for a policy document, while "it is a
+// link-local address, which reaches the cloud instance metadata endpoint" tells them
+// exactly what they just pointed Blnk at.
+//
+// Parameters:
+//   - address net.IP: the address, as parsed. A nil or malformed address is refused,
+//     because a caller that could not parse what it is about to dial must not proceed.
+//
+// Returns:
+//   - string: the reason, or "" when the address is acceptable.
+func InternalIPReason(address net.IP) string {
+	if address == nil {
+		return "it is not a valid IP address"
+	}
+
+	// NAT64 first, and deliberately so: the embedded address is what the packet
+	// ultimately reaches, and every predicate below would describe the wrapper as
+	// ordinary global unicast.
+	if embedded := nat64EmbeddedIPv4(address); embedded != nil {
+		if reason := InternalIPReason(embedded); reason != "" {
+			return "it embeds an internal IPv4 address in the NAT64 well-known prefix, and " + reason
+		}
+	}
+
+	// Ordered so that the reason REPORTED is the accurate one, not merely a refusal. The
+	// pairs overlap: 224.0.0.0/24 and ff02::/16 are both link-local AND multicast, and
+	// describing a multicast group as "the cloud instance metadata endpoint" would send an
+	// operator to investigate the wrong thing. Unicast link-local is checked on its own, and
+	// every remaining multicast form — link-local, interface-local, global — falls to the
+	// multicast arm. Coverage is identical either way; only the diagnosis changes.
+	switch {
+	case address.IsLoopback():
+		return "it is a loopback address"
+	case address.IsLinkLocalUnicast():
+		return "it is a link-local address, which reaches the cloud instance metadata endpoint"
+	case address.IsMulticast():
+		return "it is a multicast address"
+	case address.IsPrivate():
+		return "it is a private address inside Blnk's own network"
+	case address.IsUnspecified():
+		return "it is the unspecified address"
+	}
+
+	for _, candidate := range extraInternalRanges {
+		if candidate.parsed != nil && candidate.parsed.Contains(address) {
+			return candidate.reason
+		}
+	}
+
+	// The backstop. Anything that is not global unicast after the enumerated checks is
+	// refused on the strength of not being an address the public internet can route.
+	if !address.IsGlobalUnicast() {
+		return "it is not a globally routable address"
+	}
+
+	return ""
+}
+
+// nat64EmbeddedIPv4 returns the IPv4 address embedded in an RFC 6052 well-known-prefix
+// NAT64 address, or nil when the address is not one.
+//
+// Parameters:
+//   - address net.IP: the address to unwrap.
+//
+// Returns:
+//   - net.IP: the embedded four-byte address, or nil.
+func nat64EmbeddedIPv4(address net.IP) net.IP {
+	// Only a true 16-byte form can carry the prefix. To4 returning non-nil means the
+	// value is an IPv4 address (or its mapped spelling), which cannot be NAT64.
+	if address.To4() != nil {
+		return nil
+	}
+
+	sixteen := address.To16()
+	if sixteen == nil {
+		return nil
+	}
+
+	for i := 0; i < nat64WellKnownPrefixLen; i++ {
+		if sixteen[i] != nat64WellKnownPrefix[i] {
+			return nil
+		}
+	}
+
+	return net.IPv4(sixteen[12], sixteen[13], sixteen[14], sixteen[15])
+}
+
+// InternalDestinationReason reports why a hostname or IP literal is an internal
+// destination, or "" when it is not.
+//
+// IP literals are decided on the parsed address by InternalIPReason, never on the text,
+// so "::ffff:127.0.0.1" is recognised as loopback rather than passing as an
+// unfamiliar-looking string. Names are decided on the four shapes that can only resolve
+// inside the network Blnk runs in.
+//
+// This is a LITERAL check and is deliberately not sold as more than one: a public
+// hostname resolving to an internal address is not detectable here, which is exactly why
+// the send-time dialer judges the resolved address as well.
+//
+// Parameters:
+//   - host string: the hostname or IP literal, without a port.
+//
+// Returns:
+//   - string: the reason, or "" when the host is acceptable.
+func InternalDestinationReason(host string) string {
+	if address := net.ParseIP(host); address != nil {
+		return InternalIPReason(address)
+	}
+
+	lowered := strings.ToLower(host)
+
+	if lowered == "localhost" || strings.HasSuffix(lowered, ".localhost") {
+		return "it resolves to loopback"
+	}
+
+	// .local is mDNS and .internal is the conventional private zone — and the name
+	// metadata.google.internal is one of the two best-known metadata endpoints.
+	if strings.HasSuffix(lowered, ".local") || strings.HasSuffix(lowered, ".internal") {
+		return "it is an internal-only hostname"
+	}
+
+	// An unqualified single-label name can only resolve through a local search domain,
+	// which is by definition inside the network Blnk runs in.
+	if !strings.Contains(lowered, ".") {
+		return "it is an unqualified hostname that can only resolve inside Blnk's own network"
+	}
+
+	return ""
+}
+
+// OperatorOwnableInternalIP reports whether an internal address is one an operator can
+// plausibly own and legitimately point a webhook at.
+//
+// # Why the deny-list is not uniform
+//
+// Refusing every internal address outright would be simpler and wrong. An on-premise
+// deployment delivering to https://webhooks.corp:8443 behind RFC1918 is a completely
+// legitimate configuration, and so is a developer delivering to a loopback test sink.
+// Those are the operator's own network, and the operator is the one who wrote the
+// configuration.
+//
+// The metadata endpoint is not. Nobody legitimately webhooks to 169.254.169.254, the
+// unspecified address, a multicast group, the benchmarking range or a NAT64-wrapped
+// loopback address — every one of those is either an attack or a mistake. So the
+// destination policy has TWO tiers: ranges an operator may opt back into by asserting
+// ownership of the network, and ranges no configuration can re-enable.
+//
+// This function draws that line. It says nothing about whether the address is allowed;
+// it says whether an operator's explicit assertion is capable of allowing it.
+//
+// Parameters:
+//   - address net.IP: the address already known to be internal.
+//
+// Returns:
+//   - bool: true when an explicit operator assertion may permit this address.
+func OperatorOwnableInternalIP(address net.IP) bool {
+	if address == nil {
+		return false
+	}
+
+	// A NAT64-wrapped internal address is never operator-ownable. An operator who owns
+	// 10.0.0.0/8 writes 10.x.y.z; reaching it through 64:ff9b:: is a bypass attempt
+	// dressed as a global unicast address.
+	if nat64EmbeddedIPv4(address) != nil {
+		return false
+	}
+
+	return address.IsLoopback() || address.IsPrivate()
 }

@@ -99,6 +99,7 @@ import (
 
 	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/model"
+	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
@@ -112,7 +113,8 @@ import (
 // projection or scan order — a drift that would not fail to compile and would
 // instead surface as silently transposed fields.
 const eventSubscriberColumns = `id, subscriber_id, name, kafka_principal, consumer_group_id, authorized_topics, ` +
-	`partition_key_prefix, credential_reference, credential_issued_at, webhook_url, migrated_at, created_at, updated_at`
+	`partition_key_prefix, credential_reference, credential_issued_at, webhook_url, migrated_at, ` +
+	`revocation_pending_at, created_at, updated_at`
 
 // Page-size bounds for the registry listing. The default keeps an unqualified
 // request cheap; the maximum stops a caller turning a management endpoint into a
@@ -153,19 +155,28 @@ type eventSubscriberScanner interface {
 // array trap; the nil normalisation below closes the remaining case so callers
 // never have to distinguish nil from empty.
 //
-// The five nullable columns are preserved AS pointers rather than flattened to
+// The six nullable columns are preserved AS pointers rather than flattened to
 // zero values, because for each of them NULL carries meaning a zero value would
-// destroy: a nil PartitionKeyPrefix means "entitled to whole topics" and NOT
-// "restrict to the empty prefix", which would invert the grant; a nil
-// CredentialReference is the reliable test for "registered, not yet provisioned";
-// a nil MigratedAt means not yet migrated, which is precisely what
-// migration-progress reporting counts. Each value is copied into its own local
-// before its address is taken, so no field aliases a scan destination.
+// destroy: a nil PartitionKeyPrefix means no key constraint is recorded and NOT
+// "constrained to the empty prefix", which would invert the intent and refuse a
+// subscriber that asked for nothing; a nil CredentialReference is the reliable test
+// for "registered, not yet provisioned"; a nil MigratedAt means not yet migrated,
+// which is precisely what migration-progress reporting counts; and a nil
+// RevocationPendingAt means the subscriber is not in the middle of being
+// deregistered. Each value is copied into its own local before its address is
+// taken, so no field aliases a scan destination.
+//
+// The two FENCE columns — provisioning_token and provisioning_until — are
+// deliberately NOT projected. They are the claim an in-flight issuance holds, they
+// live for seconds, and every read of them is a conditional UPDATE inside this file.
+// model.EventSubscriber is serialised into API responses, so carrying a transient
+// internal claim on it would publish operational state that no consumer can act on
+// and that is stale by the time it is read.
 func scanEventSubscriber(s eventSubscriberScanner) (model.EventSubscriber, error) {
 	var sub model.EventSubscriber
 	var authorizedTopics pq.StringArray
 	var partitionKeyPrefix, credentialReference, webhookURL sql.NullString
-	var credentialIssuedAt, migratedAt sql.NullTime
+	var credentialIssuedAt, migratedAt, revocationPendingAt sql.NullTime
 
 	if err := s.Scan(
 		&sub.ID,
@@ -179,6 +190,7 @@ func scanEventSubscriber(s eventSubscriberScanner) (model.EventSubscriber, error
 		&credentialIssuedAt,
 		&webhookURL,
 		&migratedAt,
+		&revocationPendingAt,
 		&sub.CreatedAt,
 		&sub.UpdatedAt,
 	); err != nil {
@@ -212,6 +224,10 @@ func scanEventSubscriber(s eventSubscriberScanner) (model.EventSubscriber, error
 	if migratedAt.Valid {
 		migrated := migratedAt.Time
 		sub.MigratedAt = &migrated
+	}
+	if revocationPendingAt.Valid {
+		pending := revocationPendingAt.Time
+		sub.RevocationPendingAt = &pending
 	}
 
 	return sub, nil
@@ -409,7 +425,7 @@ func grantableTopicPrefixes() map[string]struct{} {
 //   - FOREIGN topics, because a grant over a topic Blnk does not own is a grant into somebody
 //     else's data on a broker Blnk may share.
 //   - DEAD-LETTER and INTERNAL topics, because the DLTs carry failed events with Blnk's own
-//     failure metadata and the system and quarantine categories carry Blnk's internal
+//     failure metadata and the system category carries Blnk's internal
 //     diagnostics and uncatalogued payloads. Neither has a subscriber audience.
 //
 // An EMPTY list is accepted: a subscriber authorised for nothing is the fail-closed default of
@@ -489,7 +505,30 @@ func requireSafeWebhookURL(webhookURL *string) error {
 		return nil
 	}
 
-	raw := strings.TrimSpace(*webhookURL)
+	raw := *webhookURL
+
+	// SURROUNDING WHITESPACE IS REFUSED, not trimmed, and this rule belongs here rather than
+	// only in the request DTO.
+	//
+	// The write paths store this column VERBATIM, so trimming for validation and then storing
+	// the original meant a value could pass a check the stored bytes did not satisfy: " https://
+	// hooks.example.com/blnk " was validated as the trimmed URL and persisted with the spaces,
+	// where it is a different URL to every reader and to whatever eventually sends to it. The
+	// API DTO already refuses it, so trimming here also made a service, CLI or migration caller
+	// subject to a laxer policy than an HTTP caller — one column, two rules.
+	//
+	// An all-whitespace value is NOT refused: the guard above treats it as "clear the record",
+	// which is the same three-way nil/empty/value mapping the service layer applies, and the
+	// nullable column exists to keep those distinguishable.
+	if raw != strings.TrimSpace(raw) {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"The webhook URL must not have surrounding whitespace",
+			errors.New(
+				"a URL differing from another only by whitespace is a copy-paste artefact, and this "+
+					"column is stored verbatim, so trimming it would persist a destination the caller "+
+					"did not supply",
+			))
+	}
 
 	parsed, err := url.Parse(raw)
 	if err != nil {
@@ -1429,6 +1468,306 @@ func (d Datasource) RecordSubscriberCredentialIfUnchanged(
 		attribute.String("subscriber.credential_fingerprint",
 			model.CredentialFingerprint(credentialReference)),
 	))
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------------------
+// The revocation lifecycle and the provisioning fence
+//
+// Two systems hold a subscriber's access — this table holds WHICH principal and WHICH
+// topics, the broker holds the credential and the bindings — and no transaction spans
+// them. Everything below exists because of that, and each piece answers one of the two
+// ways the gap between them can be lost:
+//
+//   - A REVOCATION THAT FAILED must stay recoverable, so deregistration tombstones the row
+//     before it touches the broker and deletes it only once the revocation is confirmed.
+//   - TWO CONCURRENT OPERATIONS on one subscriber must not interleave, so each claims the
+//     subscriber under a leased token before it touches the broker.
+// ---------------------------------------------------------------------------------------
+
+// defaultSubscriberFenceLease is the fence lease used when a caller supplies none.
+//
+// It is three times the credential issuance budget, which is the shape the lease has to have:
+// long enough that a legitimate issuance cannot lose its own claim mid-flight, short enough
+// that a process killed while holding one does not fence the subscriber for materially longer
+// than an operator would wait before retrying.
+const defaultSubscriberFenceLease = 15 * time.Second
+
+// MarkSubscriberRevocationPending stamps the revocation tombstone and returns the row.
+//
+// # Why the tombstone comes before the broker call
+//
+// Deregistration used to delete the row and then revoke. When the revocation failed, the
+// principal kept authenticating and kept reading, and the only record of WHICH principal that
+// was had just been deleted — so the residue was live access that nothing in Blnk could see,
+// recoverable only from a log line if anyone read it.
+//
+// Marking first inverts that. The row survives, it names the principal and the topics
+// revocation needs, and it says plainly that the subscriber is on its way out. A failed
+// revocation therefore leaves a durable to-do item rather than an invisible one, and retrying
+// the deregistration finishes the job.
+//
+// # It is idempotent, and it keeps the FIRST instant
+//
+// A retry re-marks a row that is already marked, and COALESCE keeps the original timestamp
+// rather than refreshing it. That is deliberate: the value an operator needs is how long this
+// revocation has been outstanding, and a timestamp that moved on every retry would report the
+// age of the last attempt instead — always small, however long the row had been stuck.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriberID string: the business key. Required.
+//   - pendingAt time.Time: the instant to record on the FIRST marking.
+//
+// Returns:
+//   - *model.EventSubscriber: the marked row, carrying the principal and topics to revoke.
+//   - error: a typed not-found when no subscriber matches, or a logged internal error.
+func (d Datasource) MarkSubscriberRevocationPending(
+	ctx context.Context,
+	subscriberID string,
+	pendingAt time.Time,
+) (*model.EventSubscriber, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkSubscriberRevocationPending")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		span.RecordError(err)
+
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
+
+	row := d.Conn.QueryRowContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET revocation_pending_at = COALESCE(revocation_pending_at, $1),
+			updated_at = $2
+		WHERE subscriber_id = $3
+		RETURNING `+eventSubscriberColumns,
+		pendingAt, time.Now(), strings.TrimSpace(subscriberID),
+	)
+
+	marked, err := scanEventSubscriber(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			notFound := apierror.NewAPIError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, err)
+			span.RecordError(notFound)
+
+			return nil, notFound
+		}
+
+		span.RecordError(err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to mark the subscriber for revocation",
+			"mark_subscriber_revocation_pending", err)
+	}
+
+	span.AddEvent("Subscriber marked for revocation", trace.WithAttributes(
+		attribute.String("subscriber.id", marked.SubscriberID),
+		attribute.String("subscriber.principal", marked.KafkaPrincipal),
+	))
+
+	return &marked, nil
+}
+
+// ClaimSubscriberForProvisioning fences a subscriber for one issuance or revocation and
+// returns the token that claim is held under.
+//
+// # The interleaving it makes impossible
+//
+// Kafka stores ONE SCRAM credential per principal. Two overlapping issuances therefore both
+// write a credential and the second replaces the first, so the broker ends up holding one
+// password while this table may hold the reference derived from the other — and the caller
+// holding the recorded one cannot authenticate. RecordSubscriberCredentialIfUnchanged detects
+// the case where both callers observed the same prior reference, but it cannot decide which
+// password the BROKER kept: that is settled by whichever call reached the broker last,
+// independently of who won the database.
+//
+// So the broker is only ever touched under this claim. The second caller is refused as a
+// conflict before it generates a secret, which is the whole point — a refused issuance costs
+// a caller one retry, while an interleaved one costs it a credential that does not work and
+// gives it no way to find out.
+//
+// Revocation and deregistration claim it too, so an issuance cannot interleave with the
+// removal of the very credential it is writing.
+//
+// # Why a leased claim token rather than a lock
+//
+// It is the shape blnk.event_outbox already claims rows with, and it is chosen for the same
+// two reasons. It is cross-process without a lock server, so two Blnk instances fence each
+// other. And it EXPIRES: a process killed mid-issuance does not fence the subscriber for
+// ever, which a session-scoped advisory lock would also achieve but only by holding a
+// database connection open across a call to Kafka — a lock whose duration a third party's
+// responsiveness decides.
+//
+// The token is rotated on every claim, so a caller whose lease expired cannot release or
+// complete a claim that has since been taken over.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriberID string: the business key. Required.
+//   - lease time.Duration: how long the claim is held. Non-positive is normalised to
+//     defaultSubscriberFenceLease rather than rejected, because a claim that expires on
+//     arrival fences nothing while failing the call would stop provisioning outright.
+//
+// Returns:
+//   - string: the claim token, which every completion or release must present.
+//   - error: a typed conflict when another operation holds a live claim, a typed not-found
+//     when no subscriber matches, or a logged internal error.
+func (d Datasource) ClaimSubscriberForProvisioning(
+	ctx context.Context,
+	subscriberID string,
+	lease time.Duration,
+) (string, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClaimSubscriberForProvisioning")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		span.RecordError(err)
+
+		return "", err
+	}
+
+	if lease <= 0 {
+		logrus.WithField("requested_lease", lease.String()).
+			Warnf("Non-positive subscriber provisioning fence lease; falling back to %s", defaultSubscriberFenceLease)
+		lease = defaultSubscriberFenceLease
+	}
+
+	token := uuid.NewString()
+
+	span.SetAttributes(
+		attribute.String("subscriber.id", subscriberID),
+		attribute.String("subscriber.fence_lease", lease.String()),
+	)
+
+	var claimed string
+	err := d.Conn.QueryRowContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET provisioning_token = $1,
+			provisioning_until = NOW() + $2::interval,
+			updated_at = $3
+		WHERE subscriber_id = $4
+		  AND (provisioning_until IS NULL OR provisioning_until < NOW())
+		RETURNING provisioning_token
+	`, token, lease.String(), time.Now(), strings.TrimSpace(subscriberID)).Scan(&claimed)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// No row matched, and the two reasons need different answers: the subscriber may
+			// not exist, or it may exist under a live claim. A separate read distinguishes
+			// them, because reporting a conflict for a subscriber that was never registered
+			// would send a caller looking for a race that did not happen.
+			if _, readErr := d.GetEventSubscriberByID(ctx, subscriberID); readErr != nil {
+				span.RecordError(readErr)
+
+				return "", readErr
+			}
+
+			conflict := apierror.NewAPIError(apierror.ErrConflict,
+				"Another credential operation for this subscriber is already in progress",
+				fmt.Errorf("subscriber %q is fenced by a live provisioning claim; retry once it "+
+					"completes or once its lease expires", subscriberID))
+			span.RecordError(conflict)
+
+			return "", conflict
+		}
+
+		span.RecordError(err)
+
+		return "", loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to claim the subscriber for provisioning",
+			"claim_subscriber_for_provisioning", err)
+	}
+
+	span.AddEvent("Subscriber claimed for provisioning", trace.WithAttributes(
+		attribute.String("subscriber.id", subscriberID),
+	))
+
+	return claimed, nil
+}
+
+// ReleaseSubscriberProvisioningFence clears a claim, if the caller still holds it.
+//
+// Releasing early is what keeps the fence from making a retry wait out the whole lease after
+// a fast failure. It is conditional on the token for the same reason every other transition in
+// this schema is: a caller whose lease expired no longer owns the claim, and clearing a claim
+// somebody else has taken would let a third operation start alongside it.
+//
+// A claim that no longer matches is REPORTED, not swallowed. This function's callers run it in
+// a deferred cleanup where the useful response is a log line rather than a failed request, so
+// the policy belongs at the call site; reporting nothing here would hide a fence that had been
+// lost mid-operation, which is exactly the condition worth knowing about.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriberID string: the business key. Required.
+//   - token string: the token the claim was taken under. Required.
+//
+// Returns:
+//   - error: a typed conflict when the claim is no longer the caller's, a typed validation
+//     error for a missing token, or a logged internal error.
+func (d Datasource) ReleaseSubscriberProvisioningFence(
+	ctx context.Context,
+	subscriberID string,
+	token string,
+) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ReleaseSubscriberProvisioningFence")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		span.RecordError(err)
+
+		return err
+	}
+
+	if strings.TrimSpace(token) == "" {
+		err := apierror.NewAPIError(apierror.ErrInvalidInput,
+			"A provisioning claim token is required to release the fence", nil)
+		span.RecordError(err)
+
+		return err
+	}
+
+	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
+
+	result, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET provisioning_token = NULL,
+			provisioning_until = NULL,
+			updated_at = $1
+		WHERE subscriber_id = $2
+		  AND provisioning_token = $3
+	`, time.Now(), strings.TrimSpace(subscriberID), strings.TrimSpace(token))
+	if err != nil {
+		span.RecordError(err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to release the subscriber provisioning fence",
+			"release_subscriber_provisioning_fence", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		// The driver could not report a count. The release itself succeeded, and the caller
+		// only logs this outcome, so reporting success is the honest answer rather than
+		// manufacturing a conflict from a bookkeeping gap.
+		logrus.WithError(err).WithField("subscriber", subscriberID).
+			Debug("Could not determine whether the subscriber provisioning fence was released")
+
+		return nil
+	}
+
+	if affected == 0 {
+		conflict := apierror.NewAPIError(apierror.ErrConflict,
+			"The subscriber provisioning claim is no longer held by this caller",
+			fmt.Errorf("releasing the provisioning fence of subscriber %q matched no row; the claim "+
+				"expired or was taken over while the operation was in flight", subscriberID))
+		span.RecordError(conflict)
+
+		return conflict
+	}
 
 	return nil
 }

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/blnkfinance/blnk/config"
+	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/internal/filter"
 	"github.com/blnkfinance/blnk/internal/metrics"
 	"github.com/blnkfinance/blnk/internal/notification"
@@ -73,17 +74,26 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 	for _, monitor := range monitors {
 		if monitor.CheckCondition(updatedBalance) {
 			span.AddEvent(fmt.Sprintf("Condition met for balance: %s", monitor.MonitorID))
+			// BOUNDED, and acquired here rather than inside the goroutine so a database that
+			// cannot keep up is felt as backpressure instead of absorbed as an unbounded
+			// pile-up of goroutines. One balance can carry many monitors and many of them can
+			// fire on one update, so the fan-out here is a product of two counts rather than
+			// one per transaction — the shape most likely to exhaust memory first.
+			postTransactionActionSem <- struct{}{}
 			go func(monitor model.BalanceMonitor) {
-				// PRODUCER CALL SITE FOR balance.monitor. SendWebhook became PublishEvent
-				// and nothing else changed: the event string and the payload object are the
-				// same ones the legacy transport received, so the outbox stores exactly the
-				// bytes that used to be the HTTP body and the two transports cannot diverge
-				// during the dual-delivery window. The event routes to blnk.balances, keyed
-				// on the monitored balance.
+				defer func() { <-postTransactionActionSem }()
+
+				// PRODUCER CALL SITE FOR balance.monitor, and one of the few that legitimately
+				// remains a standalone capture: a monitor fires because a CONDITION was met on
+				// a balance that some other transaction already committed, so there is no
+				// mutation of its own to enrol the event in. See the note in publishEvent on
+				// which events have no owning mutation.
 				//
-				// The payload stays a model.BalanceMonitor BY VALUE, exactly as the
-				// goroutine parameter delivers it. Taking its address or wrapping it would
-				// re-shape the marshaled body and break that equivalence.
+				// SendWebhook became PublishEvent and nothing else changed: the event string
+				// and the payload object are the same ones the legacy transport received, so
+				// the outbox stores exactly the bytes that used to be the HTTP body and the two
+				// transports cannot diverge during the dual-delivery window. The event routes
+				// to blnk.balances, keyed on the monitored balance.
 				//
 				// ctx is passed through rather than detached because the only caller —
 				// runTransactionPostCommitWorkWithHooks in transaction_execution.go — already
@@ -91,10 +101,17 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 				// monitor goroutines. The publish therefore inherits the trace linkage
 				// without inheriting a cancellation that would abort the outbox insert once
 				// the originating request finished.
+				//
+				// THE LEDGER IS SUPPLIED EXPLICITLY, from the balance whose update triggered
+				// the check. model.BalanceMonitor carries a balance and a condition and no
+				// ledger, so without this the event would be keyed on the monitored balance
+				// and its ledger column would be NULL — requirement R-6 partitions by ledger
+				// id, and the monitored balance's ledger is the authoritative answer this
+				// call site already holds.
 				err := l.PublishEvent(ctx, NewWebhook{
 					Event:   "balance.monitor",
 					Payload: monitor,
-				})
+				}, WithEventLedgerID(updatedBalance.LedgerID))
 				if err != nil {
 					notification.NotifyError(err)
 				}
@@ -207,28 +224,49 @@ func (l *Blnk) getOrCreateBalanceByIndicator(ctx context.Context, indicator, cur
 }
 
 // postBalanceActions performs some actions after a balance has been created.
-// It starts a tracing span, sends the balance to the search index queue, and captures a
-// balance.created event in the transactional outbox.
+// It starts a tracing span and sends the balance to the search index queue.
+//
+// IT NO LONGER CAPTURES THE EVENT, and that is the point rather than an omission. The
+// balance.created row is now inserted INSIDE the transaction that inserts the balance, by the
+// repository, from the preparer balanceCreatedEventPreparer supplies — so the event and the
+// balance commit together instead of the event being written from a goroutine after the fact.
+// Capturing it here as well would publish the same event twice, and event_id is derived from
+// the balance's identity, so the second insert would be refused by the unique index and the
+// only visible result would be a logged conflict on every balance creation.
+//
+// One behaviour changed with that move, deliberately. CreateBalance reports the idempotent
+// indicator conflict as success with an EMPTY balance, and this function used to publish
+// balance.created for it — an event announcing the creation of a balance that has no id, no
+// ledger and no currency. The repository now declines to capture on that path, because it is
+// the only layer that can tell the difference.
+//
+// Indexing stays here because it is genuinely post-commit work: TypeSense is a separate
+// system with its own retry queue, and nothing about it belongs in a ledger transaction.
+//
+// # THE ONE CASE IT STILL PUBLISHES
+//
+// A webhook-only deployment — a webhook URL and no KAFKA_BROKERS — gets NO preparer, because
+// capturing rows no relay can drain is what eventCaptureEnabled exists to avoid. Nothing
+// captures the event on that shape, so the legacy publish is retained here as a fallback for
+// it alone, exactly as postTransactionActions retains one for a transaction its atomic writer
+// did not record. Without it this deployment lost balance.created from BOTH transports.
+//
+// The empty-balance behaviour described above is PRESERVED through that fallback rather than
+// reintroduced by it: publishEntityEventWhenUncaptured declines an empty aggregate id, so the
+// idempotent indicator conflict still announces nothing on either path.
 //
 // Parameters:
-// - ctx context.Context: The context for the operation.
-// - balance *model.Balance: A pointer to the newly created Balance model.
+//   - ctx context.Context: The context for the operation, used for the span and, detached
+//     from cancellation, for the fallback publish.
+//   - balance *model.Balance: A pointer to the newly created Balance model.
 func (l *Blnk) postBalanceActions(ctx context.Context, balance *model.Balance) {
-	_, span := balanceTracer.Start(ctx, "PostBalanceActions")
+	ctx, span := balanceTracer.Start(ctx, "PostBalanceActions")
 	defer span.End()
 
 	// The publish context is DETACHED FROM CANCELLATION but not from the trace, using the
 	// same context.WithoutCancel idiom runTransactionPostCommitWorkWithHooks already applies
-	// to the monitor goroutines in transaction_execution.go.
-	//
-	// It is derived here, outside the goroutine, because ctx is still live at this point.
-	// The goroutine below deliberately outlives this function: CreateBalance is reached from
-	// the API with c.Request.Context(), which net/http cancels the moment the handler
-	// returns, and the outbox insert issues its statement with the context it is given. A
-	// raw request context would therefore abort the insert whenever the response won the
-	// race, losing the event with nothing but a log line to show it — the one failure the
-	// outbox exists to rule out. queueIndexData is unaffected either way; it takes no
-	// context.
+	// to the monitor goroutines in transaction_execution.go. It is derived here, outside the
+	// goroutine, because ctx is still live at this point.
 	publishCtx := context.WithoutCancel(ctx)
 
 	go func() {
@@ -237,16 +275,10 @@ func (l *Blnk) postBalanceActions(ctx context.Context, balance *model.Balance) {
 			span.RecordError(err)
 			notification.NotifyError(err)
 		}
-		// PRODUCER CALL SITE FOR balance.created. SendWebhook became PublishEvent and
-		// nothing else changed: the same *model.Balance the legacy transport marshaled is
-		// the object the outbox row stores, so the payload is preserved field-for-field and
-		// the legacy webhook delivered from that same row during the dual-delivery window
-		// carries identical bytes. The event routes to blnk.balances, keyed on the
-		// balance's ledger.
-		err = l.PublishEvent(publishCtx, NewWebhook{
+		err = l.publishEntityEventWhenUncaptured(publishCtx, balance.BalanceID, NewWebhook{
 			Event:   "balance.created",
 			Payload: balance,
-		})
+		}, WithEventLedgerID(balance.LedgerID))
 		if err != nil {
 			span.RecordError(err)
 			notification.NotifyError(err)
@@ -255,8 +287,61 @@ func (l *Blnk) postBalanceActions(ctx context.Context, balance *model.Balance) {
 	}()
 }
 
+// balanceCreatedEventPreparer returns the preparer that builds the balance.created outbox
+// row, for the repository to insert INSIDE the transaction that inserts the balance.
+//
+// # Why the event is captured through a callback rather than published here
+//
+// It used to be published from postBalanceActions, in a goroutine, after CreateBalance had
+// already committed — so a balance could be durable while the event announcing it was lost to
+// a crash or a failed insert, with nothing left to replay from. Requirement R-2 exists to
+// close exactly that window, and the event now commits with the balance or not at all.
+//
+// The callback shape is forced by where the balance id comes from: the repository mints
+// bln_<uuid> during the insert, stamps CreatedAt, and defaults the six amount fields, and
+// both the payload and the event's aggregate id are derived from the finished balance. See
+// database.EventPreparer.
+//
+// # The payload and the transport substitution are unchanged
+//
+// The event string is still "balance.created" and the payload is still the created
+// *model.Balance, so the bytes recorded in the outbox are the bytes the legacy webhook body
+// carried — which is what makes the dual-delivery equivalence verifiable by reading this
+// diff.
+//
+// WithEventLedgerID states the balance's ledger explicitly. The payload derivation reaches
+// the same value for this event type, and stating it is what makes the R-6 partitioning
+// dimension a property of the call site that knows which ledger the mutation belonged to.
+//
+// Parameters:
+//   - ctx context.Context: the creating request's context, captured for tracing only. The
+//     preparer performs no I/O, so unlike the old post-commit publish it cannot be aborted
+//     by the request finishing first.
+//
+// Returns:
+//   - database.EventPreparer[model.Balance]: the preparer to hand to the repository.
+func (l *Blnk) balanceCreatedEventPreparer(ctx context.Context) database.EventPreparer[model.Balance] {
+	// A NIL PREPARER when nothing is configured, so the repository stays on its
+	// single-statement path instead of opening a transaction to insert no event. See
+	// eventCaptureEnabled.
+	if !l.eventCaptureEnabled() {
+		return nil
+	}
+
+	return func(created model.Balance) (*model.EventOutbox, error) {
+		return l.PrepareEventOutbox(ctx, NewWebhook{
+			Event:   "balance.created",
+			Payload: &created,
+		}, WithEventLedgerID(created.LedgerID))
+	}
+}
+
 // CreateBalance creates a new balance.
 // It starts a tracing span, creates the balance, and performs post-creation actions.
+//
+// The `balance.created` event is captured atomically with the balance row: the capture handed
+// to the datasource is invoked with the finalised balance and its row is inserted inside the
+// same database transaction, so the balance and its event commit or roll back together.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -269,7 +354,7 @@ func (l *Blnk) CreateBalance(ctx context.Context, balance model.Balance) (model.
 	ctx, span := balanceTracer.Start(ctx, "CreateBalance")
 	defer span.End()
 
-	balance, err := l.datasource.CreateBalance(balance)
+	balance, err := l.datasource.CreateBalance(balance, l.balanceCreatedEventPreparer(ctx))
 	if err != nil {
 		span.RecordError(err)
 		return model.Balance{}, err

@@ -242,14 +242,13 @@ func boundedTopicLabel(topic string) string {
 //
 // The catalogue in model.EventCategory is the bound: an event type it recognises is one of
 // a fixed set that this repository emits, so it is reported verbatim. An event type it does
-// not recognise routes to the quarantine category, and those names are exactly the ones
-// that could be arbitrary — a stored row from a producer that was never catalogued, or a
-// value that reached the table before validation existed. They collapse to one label for
-// the same two reasons boundedTopicLabel exists.
+// not recognise is one whose name could be arbitrary — a stored row from a producer that was
+// never catalogued, or a value that reached the table before validation existed. They
+// collapse to one label for the same two reasons boundedTopicLabel exists.
 //
 // Collapsing does not hide the condition. A non-zero count on the unrecognised label is the
-// signal that something is publishing an uncatalogued event, and the quarantine topic plus
-// the publisher's warning name the specific event.
+// signal that something is publishing an uncatalogued event, and the publisher's warning
+// names the specific event.
 //
 // Parameters:
 //   - eventType string: the event type to report.
@@ -258,7 +257,7 @@ func boundedTopicLabel(topic string) string {
 //   - string: the event type verbatim when catalogued, unrecognisedEventTypeLabel
 //     otherwise.
 func boundedEventTypeLabel(eventType string) string {
-	if model.EventCategory(eventType) == model.EventCategoryQuarantine {
+	if !model.IsCataloguedEventType(eventType) {
 		return unrecognisedEventTypeLabel
 	}
 
@@ -353,6 +352,17 @@ var ErrEventPublisherClosed = errors.New("blnk: event publisher is closed")
 // same condition without matching message text, and so that "too large" is provably
 // distinct from a transport failure that happens to mention a size.
 var ErrEventMessageTooLarge = errors.New("blnk: serialised event exceeds the maximum message size")
+
+// ErrKafkaProducerCredentialsRequired is returned when a deployment configures Kafka
+// brokers and administrative SASL credentials but no dedicated producer principal, and
+// has not explicitly opted in to publishing as the administrator.
+//
+// It is a sentinel so that the refusal is provably distinct from the half-configured-pair
+// errors that share the same code path, and so a test can assert the refusal without
+// matching message text.
+var ErrKafkaProducerCredentialsRequired = errors.New(
+	"blnk: a dedicated Kafka producer principal is required; set KAFKA_SASL_USER and KAFKA_SASL_SECRET",
+)
 
 // EventPublisher publishes a canonical ledger event.
 //
@@ -535,6 +545,42 @@ type PublishResult struct {
 	// Duration is how long the attempt took: from PublishRequest.ClaimedAt when it
 	// was set, otherwise the time spent in the write itself.
 	Duration time.Duration
+
+	// CapturedAt is the instant the event was CAPTURED in the transactional outbox, copied
+	// from the envelope's OccurredAt, and it is what makes acceptance criterion V-1
+	// measurable.
+	//
+	// Duration cannot answer V-1. Its clock starts at the claim, so it excludes the row
+	// waiting for the next poll tick, the poll interval itself, and the claim query's
+	// latency — the three intervals that dominate a backlog. A relay stalled for a minute
+	// would report a five-millisecond publish, so the figure would look healthiest exactly
+	// when subscribers were furthest behind. Both are recorded: the difference between them
+	// is the queue wait, which is what tells an operator whether a slow end-to-end figure is
+	// the broker or the relay.
+	//
+	// It spans two clocks by necessity — the capturing process stamped occurred_at, this
+	// process reads the acknowledgement — so a NEGATIVE reading is possible under skew and
+	// is DROPPED rather than clamped. See recordPublishAttempt.
+	//
+	// Zero when the envelope carried no occurred_at, in which case no end-to-end observation
+	// is recorded at all.
+	CapturedAt time.Time
+
+	// Record is WHERE the broker put this event: the topic, partition and offset it
+	// assigned. Confirmed only on a successful attempt, and the zero value on every
+	// failure — a write that was not acknowledged produced no record to name.
+	//
+	// OBS-02. It is captured because the zero-loss reconciliation needs a MAPPING from
+	// each published row to the record it produced, not a count of each side: counting
+	// cannot distinguish a surplus of redeliveries from a surplus that is masking an
+	// equal number of losses. The relay persists this coordinate when it marks the row,
+	// so a row claiming a publication either names its record or is reported as
+	// unconfirmed.
+	//
+	// It is also the value an operator wants during triage — given
+	// "blnk.transactions/3@148291" the exact record can be read back with a console
+	// consumer, which is a different position from knowing only that a publish happened.
+	Record model.BrokerRecord
 
 	// Transient reports whether the failure looks recoverable — a broker that is
 	// down, a leader election in flight, a timeout — as opposed to permanent, such as
@@ -877,9 +923,14 @@ func (p *NoopEventPublisher) Publish(_ context.Context, _ model.LedgerEvent) err
 // Reporting dispatched rather than a failure is the same no-op contract Publish
 // honours: with no broker configured there is nothing to fail against, and a caller
 // that treated the absence of Kafka as an error would break every deployment that runs
-// without it. In practice this method is unreachable from the relay, which is only
-// started when brokers are configured; it is implemented completely regardless so that
-// the contract holds for any caller.
+// without it.
+//
+// THE RELAY NEVER CALLS THIS, and that is enforced rather than assumed. A relay holding the
+// no-op runs in legacy-only mode when a webhook URL is configured — where it drains the
+// outbox over the legacy leg and never touches a publisher — and refuses to start at all when
+// one is not. Either way this method's dispatched result can never become a row marked
+// dispatched, which is precisely the silent loss that refusal exists to prevent. It is
+// implemented completely regardless, so the contract holds for any other caller.
 //
 // The result echoes the request's own topic, key and attempt — resolved through the
 // same fallbacks the Kafka implementation applies — so that a caller logging the result
@@ -962,8 +1013,10 @@ type kafkaPublisher struct {
 	addr net.Addr
 
 	// transport is shared by every writer so that all of them draw on ONE connection
-	// pool and ONE SASL session per broker. Per-writer transports would multiply
-	// connections and SASL handshakes by the number of topics for no benefit.
+	// pool and ONE authentication and TLS configuration; kafka.Transport establishes
+	// connections lazily per broker and reuses them, authenticating each as it is
+	// opened. Per-writer transports would multiply connections and SASL handshakes by
+	// the number of topics for no benefit.
 	transport *kafka.Transport
 
 	// mu guards writers and closed. *kafka.Writer is itself safe for concurrent use;
@@ -1023,10 +1076,9 @@ var (
 // instance with nothing but a Redis DSN configured, and this must not turn that into a
 // network call, a delay, or an error.
 //
-// The returned publisher owns writers for every topic Blnk owns — the four category
-// topics and their four dead-letter siblings — enumerated from
-// AllTopicsWithDeadLetters so that this file and the provisioning path work from one
-// list.
+// The returned publisher owns writers for every topic Blnk owns — the four category topics
+// and their five dead-letter siblings, ten in all — enumerated from AllTopicsWithDeadLetters
+// so that this file and the provisioning path work from one list.
 //
 // The errors it can return both come from the administrative SASL credential: the pair
 // is half-configured (exactly one of KAFKA_SASL_ADMIN_USER and KAFKA_SASL_ADMIN_SECRET
@@ -1349,12 +1401,32 @@ func kafkaTLSConfig(cfg config.KafkaConfig) (*tls.Config, error) {
 // to publish events, and nothing in the broker's audit trail could distinguish routine
 // publishing from administration.
 //
-// The producer role now prefers the DEDICATED pair, KAFKA_SASL_USER / KAFKA_SASL_SECRET.
-// Falling back to the admin pair is retained for one reason only — an existing deployment
-// that has not yet provisioned a producer principal must keep publishing rather than stop
-// dead on an upgrade — and it WARNS every time, naming the variables to set, because a
-// silent fallback is how a temporary compatibility path becomes the permanent
-// configuration.
+// The producer role therefore requires the DEDICATED pair, KAFKA_SASL_USER /
+// KAFKA_SASL_SECRET.
+//
+// # Why the admin fallback is REFUSED rather than warned about
+//
+// This used to fall back to the admin pair with a warning, on the reasoning that an
+// existing deployment mid-upgrade must keep publishing rather than stop dead. That
+// reasoning is sound but the default was backwards: a deployment reaches the fallback by
+// leaving two variables UNSET, which is the state every deployment starts in, so the
+// warning was the only thing standing between an ordinary rollout and running the data
+// plane as the cluster administrator — and a warning changes nothing about what a leaked
+// credential can then do.
+//
+// So the fallback is now gated on KAFKA_ALLOW_ADMIN_PRODUCER, default false. A deployment
+// with brokers and admin credentials but no producer principal FAILS at publisher
+// construction, naming the two variables to set, which is a defect an operator fixes in
+// minutes. The escape hatch remains for the upgrade case that justified it, but it must be
+// asked for, and asking for it is recorded in the configuration where a reviewer can see
+// it rather than inferred from an absence.
+//
+// # What is deliberately still permitted
+//
+// No SASL at all. When neither pair is configured this returns two empty strings and no
+// error: the local single-broker stack can run unauthenticated, and refusing that here
+// would break it. The refusal below is specifically about REACHING FOR THE ADMIN
+// CREDENTIAL, not about the absence of a producer one.
 //
 // Parameters:
 //   - cfg config.KafkaConfig: the Kafka block.
@@ -1363,7 +1435,9 @@ func kafkaTLSConfig(cfg config.KafkaConfig) (*tls.Config, error) {
 // Returns:
 //   - user, secret string: the resolved pair. Both empty means no SASL is configured,
 //     which is legitimate for an unauthenticated local broker.
-//   - error: a half-configured pair, for either role.
+//   - error: a half-configured pair, for either role; or
+//     ErrKafkaProducerCredentialsRequired when the producer role would have to borrow the
+//     administrative credential and that has not been explicitly allowed.
 func kafkaTransportCredentials(cfg config.KafkaConfig, role KafkaTransportRole) (string, string, error) {
 	if role == KafkaTransportRoleAdmin {
 		if err := cfg.ValidateSASLAdminCredentials(); err != nil {
@@ -1387,25 +1461,57 @@ func kafkaTransportCredentials(cfg config.KafkaConfig, role KafkaTransportRole) 
 		return producer, cfg.SASLSecret, nil
 	}
 
+	// No dedicated producer principal. The administrative pair is validated first so
+	// that a half-configured one is reported as the configuration defect it is, rather
+	// than being silently read as "no admin credentials" and turned into the different
+	// diagnosis below.
 	if err := cfg.ValidateSASLAdminCredentials(); err != nil {
 		return "", "", err
 	}
 
-	if admin, adminSecret, enabled := cfg.SASLAdminCredentials(); enabled {
-		logrus.WithField("principal", admin).Warn(
-			"the event publisher is authenticating with the KAFKA ADMIN credentials because " +
-				"KAFKA_SASL_USER and KAFKA_SASL_SECRET are not set. The admin principal can create " +
-				"topics, alter SCRAM credentials and manage ACLs, so publishing every ledger event " +
-				"as that principal turns a leaked producer credential into a full compromise of the " +
-				"cluster's authorization state rather than the ability to publish events. " +
-				"Provision a dedicated producer principal with Write and Describe on the Blnk-owned " +
-				"topics and set KAFKA_SASL_USER and KAFKA_SASL_SECRET",
-		)
-
-		return admin, adminSecret, nil
+	admin, adminSecret, enabled := cfg.SASLAdminCredentials()
+	if !enabled {
+		// Neither role is configured. An unauthenticated broker, which the local stack
+		// is entitled to be.
+		return "", "", nil
 	}
 
-	return "", "", nil
+	if !cfg.AllowAdminProducer {
+		// THE PRINCIPAL IS NAMED AND THE SECRET IS NOT, and the asymmetry is deliberate. A
+		// caller logs this error, so the secret must never be in it — but the principal is an
+		// identifier, and naming it turns the message from "configure a producer" into
+		// "configure a producer INSTEAD OF blnk-kafka-admin", which is what tells an operator
+		// with several credentials in play which one the refusal is about.
+		return "", "", fmt.Errorf(
+			"%w. Kafka brokers and administrative credentials are configured but no producer "+
+				"principal is, and publishing as the administrator %q is refused: that principal "+
+				"can create topics, alter SCRAM credentials and grant or revoke ACLs, so a leaked "+
+				"producer credential would compromise the cluster's authorization state rather "+
+				"than merely permit publishing, and the broker's audit trail could no longer tell "+
+				"routine publishing from administration. Provision a principal with Write and "+
+				"Describe on the Blnk-owned topics — scripts/kafka-provision.sh does this for the "+
+				"local stack — and set KAFKA_SASL_USER and KAFKA_SASL_SECRET. To keep publishing "+
+				"as the administrator while that is arranged, set KAFKA_ALLOW_ADMIN_PRODUCER=true "+
+				"deliberately",
+			ErrKafkaProducerCredentialsRequired, admin,
+		)
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"principal": admin,
+		"setting":   "KAFKA_ALLOW_ADMIN_PRODUCER",
+	}).Warn(
+		"SECURITY: the event publisher is authenticating with the KAFKA ADMIN credentials " +
+			"because KAFKA_ALLOW_ADMIN_PRODUCER is set and no dedicated producer principal is " +
+			"configured. The admin principal can create topics, alter SCRAM credentials and " +
+			"manage ACLs, so every ledger event is being published at the privilege level that " +
+			"controls the cluster's authorization state. This is an upgrade-window compatibility " +
+			"setting, not a configuration to run on: provision a producer principal with Write " +
+			"and Describe on the Blnk-owned topics, set KAFKA_SASL_USER and KAFKA_SASL_SECRET, " +
+			"and clear KAFKA_ALLOW_ADMIN_PRODUCER",
+	)
+
+	return admin, adminSecret, nil
 }
 
 // saslProbeValue is a fixed, non-secret placeholder used ONLY to establish which of the two
@@ -1470,10 +1576,115 @@ func saslCredentialError(role KafkaTransportRole, username string) error {
 //
 // Returns:
 //   - *kafka.Writer: a ready writer that has performed no I/O.
+//
+// publishAcknowledgement receives the broker coordinate of one message.
+//
+// # Why a per-message carrier rather than a per-writer field
+//
+// kafka-go reports offsets through Writer.Completion, which is a property of the WRITER —
+// and writers here are pooled per topic and shared by every concurrent publish to it. A
+// callback writing into publisher state could not tell which publish a message belonged
+// to, and one batch legitimately carries messages from several of them.
+//
+// kafka.Message.WriterData is the library's own correlation seam: it is carried through the
+// write and handed back on the completion, and it never touches the wire. So each publish
+// attaches its own carrier, the callback fills in the one it is given, and no coordination
+// between concurrent publishes is needed at all.
+//
+// The mutex is not ceremony. Completion runs on the writer's own goroutines, so the write
+// and the read genuinely cross goroutine boundaries — with Async false, WriteMessages blocks
+// on Completion, which orders them but does not by itself make the access race-free under
+// the memory model.
+type publishAcknowledgement struct {
+	mu     sync.Mutex
+	record model.BrokerRecord
+	filled bool
+}
+
+// accept records the coordinate the broker assigned.
+//
+// The first completion wins. kafka-go calls Completion once per batch and a message belongs
+// to exactly one batch, so a second call for the same carrier would mean an internal retry
+// re-reporting the message — in which case the first coordinate is the one the offset series
+// was assigned from.
+//
+// Parameters:
+//   - message kafka.Message: the completed message, carrying the broker's topic, partition
+//     and offset.
+func (a *publishAcknowledgement) accept(message kafka.Message) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.filled {
+		return
+	}
+
+	// A message the broker did not answer for carries no usable coordinate. kafka-go leaves
+	// the fields at their zero values in that case and reports the error separately, and
+	// partition 0 / offset 0 is a REAL location — so accepting it would manufacture a
+	// coordinate for a write that never landed, which is worse than recording nothing.
+	if strings.TrimSpace(message.Topic) == "" || message.Offset < 0 {
+		return
+	}
+
+	a.record = model.BrokerRecord{
+		Topic:     message.Topic,
+		Partition: message.Partition,
+		Offset:    message.Offset,
+	}
+	a.filled = true
+}
+
+// coordinate returns the recorded location, and whether one was received.
+//
+// Returns:
+//   - model.BrokerRecord: the coordinate, zero-valued when none arrived.
+//   - bool: whether the broker reported one.
+func (a *publishAcknowledgement) coordinate() (model.BrokerRecord, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return a.record, a.filled
+}
+
+// completeWrite is the writers' shared Completion callback.
+//
+// It fans each completed message out to its own carrier and does nothing else. Keeping it
+// this small is deliberate: kafka-go documents that a panic in a completion function
+// terminates the program, because the panic bubbles up a writer goroutine that nothing
+// recovers — so this function must be incapable of panicking. It therefore performs a
+// checked type assertion, tolerates a nil carrier, and never dereferences anything the
+// caller did not put there.
+//
+// The batch error is IGNORED on purpose. A failed write is reported to the caller by
+// WriteMessages, which is where the failure is classified, logged and counted; the only job
+// here is the coordinate, and a failed batch simply has none to report.
+//
+// Parameters:
+//   - messages []kafka.Message: the batch, with topic, partition and offset set from the
+//     produce response.
+//   - _ error: the batch outcome, handled by the caller instead.
+func (p *kafkaPublisher) completeWrite(messages []kafka.Message, _ error) {
+	for _, message := range messages {
+		acknowledgement, ok := message.WriterData.(*publishAcknowledgement)
+		if !ok || acknowledgement == nil {
+			continue
+		}
+
+		acknowledgement.accept(message)
+	}
+}
+
 func (p *kafkaPublisher) newWriter(topic string) *kafka.Writer {
 	return &kafka.Writer{
 		Addr:  p.addr,
 		Topic: topic,
+
+		// The broker coordinate seam. With Async false, WriteMessages blocks on this
+		// callback, so a coordinate is available by the time the write returns — which is
+		// what lets the result carry it synchronously rather than the relay having to
+		// correlate it afterwards.
+		Completion: p.completeWrite,
 
 		// A STABLE HASH BALANCER. Murmur2 is chosen over kafka-go's other stable
 		// hashes because it reproduces the Java client's default partitioner exactly,
@@ -1764,6 +1975,11 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 		Topic:        resolveTopic(req),
 		PartitionKey: resolvePartitionKey(req),
 		Attempt:      resolveAttempt(req),
+		// Carried from the envelope so that EVERY exit path below reports it, exactly as
+		// the topic and key are. It is the capture instant the relay persisted with the
+		// row; see PublishResult.CapturedAt for why the interval it opens is the one V-1
+		// is stated over.
+		CapturedAt: req.Event.OccurredAt,
 		// RESOLVED HERE, on the same line of reasoning as the topic and the key above, and
 		// for the same reason the no-op resolves them: every one of the five is a request
 		// field with a documented fallback, and a result that omits one silently changes
@@ -1849,12 +2065,17 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 		return failed, failed.Err
 	}
 
+	// The carrier the broker's coordinate comes back on. It rides with the message through
+	// WriterData, which never reaches the wire, and is filled by completeWrite.
+	acknowledgement := &publishAcknowledgement{}
+
 	message := kafka.Message{
 		// Topic is intentionally left empty. kafka-go rejects a message whose topic is
 		// set when the writer already has one, and the writer here is per-topic.
-		Key:   partitionKeyBytes(result.PartitionKey),
-		Value: value,
-		Time:  req.Event.OccurredAt,
+		Key:        partitionKeyBytes(result.PartitionKey),
+		Value:      value,
+		Time:       req.Event.OccurredAt,
+		WriterData: acknowledgement,
 	}
 
 	if err := writer.WriteMessages(ctx, message); err != nil {
@@ -1866,6 +2087,27 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 
 	result.Duration = elapsed()
 	result.Status = model.PublishStatusDispatched
+
+	// The coordinate, read AFTER the write returned. Async is false, so WriteMessages has
+	// already blocked on the completion callback and the carrier is filled.
+	//
+	// Its absence is not an error and does not fail the publish: the broker acknowledged the
+	// write, so the record exists whether or not the library reported where. What it does
+	// mean is that this row will be counted as an UNCONFIRMED publication by the zero-loss
+	// audit, which is the honest outcome — and the log line says so, because a systematic
+	// absence here would quietly render the reconciliation inconclusive for every event.
+	if record, confirmed := acknowledgement.coordinate(); confirmed {
+		result.Record = record
+	} else {
+		logrus.WithFields(logrus.Fields{
+			"event_id": hashLogIdentifier(result.EventID),
+			"topic":    boundedTopicLabel(result.Topic),
+		}).Warn(
+			"the broker acknowledged this event but reported no partition or offset, so the row " +
+				"cannot name the record it produced; it will count as an unconfirmed publication in " +
+				"the zero-loss reconciliation",
+		)
+	}
 
 	// ONLY an original publish increments this counter. It is the denominator of the
 	// dead-letter rate, so a replay or a dead-letter write counted here would make that
@@ -1914,17 +2156,25 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 // Returns:
 //   - PublishResult: the completed result, with Status retrying and Err populated.
 func (p *kafkaPublisher) fail(ctx context.Context, result PublishResult, cause error, transient bool) PublishResult {
-	// RETRYING and FAILED are not the same outcome, and reporting every failure as
+	// RETRYING and DEAD-LETTERED are not the same outcome, and reporting every failure as
 	// retrying made a permanently-stuck event indistinguishable from a busy one in both
 	// the logs and the attempts counter. Another attempt is possible only when the failure
 	// looked transient AND the attempt did not spend the budget the row stated; a
 	// permanent error is terminal whatever the budget says, because no number of further
 	// attempts makes corrupt bytes valid or an oversized message small.
+	//
+	// A terminal attempt reports model.PublishStatusDeadLettered — the destination the
+	// relay takes such a row to — rather than a fourth "failed" value. The observable
+	// vocabulary is exactly three values (see model.PublishStatus): dashboards, alert
+	// rules and the requirement all share that set, so a terminal outcome names the state
+	// the event is bound for instead of widening the contract to describe the step. The
+	// distinction that mattered survives: PublishStatusRetrying still means "this will be
+	// attempted again" and nothing else does.
 	result.Retryable = transient && !attemptBudgetSpent(result.Attempt, result.MaxAttempts)
 	if result.Retryable {
 		result.Status = model.PublishStatusRetrying
 	} else {
-		result.Status = model.PublishStatusFailed
+		result.Status = model.PublishStatusDeadLettered
 	}
 
 	result.Transient = transient
@@ -2005,47 +2255,59 @@ func (p *kafkaPublisher) Close() error {
 
 // PublishRequestFromOutbox builds the publish request for a claimed outbox row.
 //
-// It is THE single place the load-bearing routing rule is applied — the Kafka message key
-// is the row's PARTITION KEY, and the destination is the topic recorded on the row — so
-// that the relay, the dead-letter writer and a replay cannot each apply it slightly
-// differently. A relay that composed the request inline would be one refactor away from
-// dropping the key and silently losing per-aggregate ordering, a defect that no unit test
-// of the relay would notice.
+// It is THE single place the load-bearing routing rule is applied — the Kafka message key is
+// the row's LEDGER, falling back to its partition key, and the destination is the topic
+// recorded on the row — so that the relay, the dead-letter writer and a replay cannot each
+// apply it slightly differently. A relay that composed the request inline would be one
+// refactor away from dropping the key and silently losing per-aggregate ordering, a defect
+// that no unit test of the relay would notice.
 //
-// # Why the key is partition_key and not ledger_id
+// # Why the key is the ledger, and how the claim still composes with it
 //
-// The two are separate columns, and which one is keyed on decides whether the ordering the
-// DATABASE pays for actually reaches a subscriber. ClaimPendingEventOutbox serialises
-// dispatch so that at most ONE row per partition_key is ever in flight — that is the whole
-// purpose of the NOT EXISTS anti-join in claimPendingEventOutboxQuery and of the
-// idx_event_outbox_partition_key_inflight index that backs it. Kafka then orders within a
-// PARTITION. So the two guarantees compose into an end-to-end ordering guarantee only when
-// the partition is a function of the same value the claim serialises on.
+// Requirement R-6 partitions by LEDGER ID, and that is what this function keys on. The reason
+// it composes with the database's ordering work is that the two values AGREE wherever a ledger
+// exists: WithEventLedgerID writes the supplied ledger into ledger_id AND partition_key, and
+// every payload that yields a ledger of its own does the same. So the value
+// ClaimPendingEventOutbox serialises dispatch on — at most ONE row per partition_key in flight,
+// which is the purpose of the NOT EXISTS anti-join in claimPendingEventOutboxQuery and of the
+// idx_event_outbox_partition_key_inflight index behind it — is the same value Kafka partitions
+// on, and the database's ordering guarantee reaches the subscriber intact.
 //
-// Keying by ledger_id instead broke that composition for almost every event, because
-// ledger_id is deliberately NULL wherever the payload carries no ledger: transactions
-// (model.Transaction has no ledger field), balance monitors, identities, bulk batches and
-// system.error. The key then silently fell through to the aggregate id, so two
-// transactions moving value between the same balances — serialised in the outbox at real
-// cost — were routed to different partitions and their event sequence was no longer
-// consumer-visible-ordered. Nothing errored and nothing was logged, which is exactly the
-// failure mode model.EventOutbox.PartitionKey's own documentation warns about.
+// This is why populating the ledger AT CAPTURE TIME is not optional. Transaction payloads carry
+// no ledger field, so the producer must state it: transaction execution takes it from the
+// source balance it has already loaded, and the ledger and balance hooks hold the entity
+// itself. Without that, ledger_id is NULL, the key falls through to partition_key, and
+// whole-ledger affinity is lost silently — which is exactly the failure model
+// model.EventOutbox.PartitionKey's own documentation warns about, in the other direction.
 //
-// Requirement R-6's "partitioned by ledger ID" is preserved rather than abandoned: when a
-// ledger IS known, PrepareEventOutbox stores it in BOTH columns — a ledger.created or
-// balance.created event derives it from the payload, and WithEventLedgerID sets both
-// explicitly — so keying on partition_key keys on the ledger precisely when there is a
-// ledger to key on, and on the next-best aggregate when there is not.
+// Events that genuinely have NO ledger keep their partition-key affinity through the fallback:
+// balance monitors key on the monitored balance, identities on the identity, bulk batches on
+// the batch, and system errors on the event type. Each is stable per aggregate, so per-aggregate
+// ordering holds for all of them.
 //
-// # The fallback chain
+// # The fallback chain, and why ledger_id comes FIRST
 //
-// partition_key is NOT NULL in the schema, has a not-blank CHECK, and PrepareEventOutbox
-// guarantees a value through its own chain, so a row read back from the database always
-// carries one. LedgerID is the next rung for a row assembled in Go by a caller that set
-// only the ledger, and resolvePartitionKey supplies the final rung — the aggregate id — so
-// the effective chain is partition_key → ledger_id → aggregate_id. Every rung is stable
-// per aggregate, so ordering survives all of them; only an event belonging to no aggregate
-// at all ends up unkeyed.
+// The chain is ledger_id → partition_key → aggregate_id, and that order is requirement R-6
+// stated in code: "partitioned by ledger ID". Wherever the row records a ledger, that ledger
+// IS the key, so every event of one ledger lands on one partition and a subscriber reading
+// that partition observes the ledger's whole event sequence in order.
+//
+// Reading partition_key first was the previous order and it was wrong in exactly one case,
+// which is also the most common one. Every production capture path now supplies the ledger
+// through WithEventLedgerID — transaction execution takes it from the loaded source balance,
+// the ledger and balance hooks from the entity itself — and that option sets BOTH columns, so
+// the two agree and the order makes no difference. But a row written by a caller that set only
+// ledger_id, or one whose partition_key was derived from the payload before the ledger was
+// known, would have been keyed on the weaker value with nothing to show it. Preferring the
+// ledger removes that case rather than documenting it.
+//
+// partition_key remains the next rung and is the one that carries the events with NO ledger:
+// balance monitors, identities, bulk batches and system errors. It is NOT NULL in the schema,
+// has a not-blank CHECK, and PrepareEventOutbox guarantees a value through its own chain, so a
+// row read back from the database always carries one. resolvePartitionKey supplies the final
+// rung, the aggregate id, for a request assembled in Go rather than read from a row. Every
+// rung is stable per aggregate, so ordering survives all of them; only an event belonging to
+// no aggregate at all ends up unkeyed.
 //
 // The row's own topic is used rather than re-deriving one from the event type, because the
 // row recorded its destination at insert time precisely so it stays publishable to the
@@ -2071,8 +2333,9 @@ func PublishRequestFromOutbox(row model.EventOutbox, attempt int) PublishRequest
 			Payload:       row.Payload,
 			SchemaVersion: row.SchemaVersion,
 		},
-		Topic:   row.Topic,
-		Key:     firstNonBlank(row.PartitionKey, row.LedgerID),
+		Topic: row.Topic,
+		// LEDGER FIRST — requirement R-6 partitions by ledger ID. See the fallback chain above.
+		Key:     firstNonBlank(row.LedgerID, row.PartitionKey),
 		Attempt: attempt,
 	}
 }
@@ -2201,8 +2464,9 @@ func resolveTopic(req PublishRequest) string {
 
 // resolvePartitionKey returns the Kafka message key for a request.
 //
-// THE KEY IS THE STORED PARTITION KEY — model.EventOutbox.PartitionKey, which is the
-// ledger ID whenever the event has one and the next-best stable aggregate otherwise.
+// THE KEY IS WHAT THE CALLER SUPPLIED — for an outbox-backed publish that is the row's ledger
+// ID, or its stored partition key when the event has no ledger; see PublishRequestFromOutbox,
+// which resolves that precedence in one place.
 // Every event sharing a key hashes to one partition, Kafka orders within a partition,
 // and that is the whole mechanism behind the per-aggregate ordering guarantee. It is the
 // same idea the transaction queue already applies when it shards by hashing the source
@@ -2213,8 +2477,8 @@ func resolveTopic(req PublishRequest) string {
 // The partition key is NOT one of the six envelope fields — the envelope is a fixed
 // subscriber-facing contract and carries the aggregate ID instead — so it reaches this
 // function only when a caller supplies it, which PublishRequestFromOutbox does from the
-// partition-key column of the claimed outbox row. When it is absent, the aggregate ID is
-// used, and the consequences of that fallback are worth stating precisely:
+// ledger-id and partition-key columns of the claimed outbox row. When it is absent, the
+// aggregate ID is used, and the consequences of that fallback are worth stating precisely:
 //
 //   - It PRESERVES per-aggregate ordering, which is the property acceptance requires.
 //     Every event for one aggregate still shares a key and therefore a partition.
@@ -2315,6 +2579,24 @@ func normalizeBrokers(brokers []string) []string {
 	}
 
 	return normalized
+}
+
+// KafkaBrokersConfigured reports whether a broker list holds anything usable.
+//
+// It is the exported form of the same question normalizeBrokers answers, for callers OUTSIDE
+// this package — the server role, deciding whether to start the relay at all. Exporting the
+// predicate rather than the normalisation keeps one definition of "configured": a caller
+// testing len(brokers) > 0 for itself would treat KAFKA_BROKERS="," as configured, because
+// envconfig splits it into a slice of blanks, and would then start a relay that could never
+// connect to an address that is not an address.
+//
+// Parameters:
+//   - brokers []string: the configured list. May be nil.
+//
+// Returns:
+//   - bool: true when at least one entry is a non-blank address.
+func KafkaBrokersConfigured(brokers []string) bool {
+	return len(normalizeBrokers(brokers)) > 0
 }
 
 // classifyTransientPublishError decides whether a write failure looks recoverable.
@@ -2426,6 +2708,60 @@ func recordPublishAttempt(ctx context.Context, result PublishResult) {
 		attribute.String(publishAttrTopic, boundedTopicLabel(result.Topic)),
 		attribute.String(publishAttrAttempt, attemptLabel(result.Purpose, result.Attempt)),
 		attribute.String(publishAttrOutcome, string(result.Status)),
+	))
+
+	recordCaptureToDispatch(ctx, result)
+}
+
+// recordCaptureToDispatch records the END-TO-END age of an ACKNOWLEDGED event: from its
+// capture in the transactional outbox to the broker's acknowledgement.
+//
+// This is the instrument acceptance criterion V-1 is read from, and it is recorded here — beside
+// the per-attempt instruments, in the publisher — rather than in the relay, because the
+// publisher owns every per-attempt instrument write. The relay deliberately does not import
+// internal/metrics at all: the collector owns the gauges, and a second writer would make them
+// disagree with themselves between ticks.
+//
+// It needs nothing from the relay to do this. The envelope the relay hands it already carries
+// occurred_at, so the capture instant travels with the event.
+//
+// # Three rules, each from the instrument's declaration
+//
+// ONLY ACKNOWLEDGED PUBLISHES. A failed or retrying attempt has no end-to-end latency to
+// report — the event has not arrived — and recording one would credit the histogram with a
+// short duration for an event that is still waiting, which lowers the very quantile the
+// criterion is read from.
+//
+// NO CAPTURE INSTANT, NO OBSERVATION. The envelope-only Publish path and any caller that omits
+// occurred_at have no interval to measure, and a zero-valued time would render as an age of
+// several decades.
+//
+// A NEGATIVE READING IS DROPPED, NOT CLAMPED. occurred_at is stamped by the process that
+// captured the event and the acknowledgement is read from this one, so the figure carries
+// whatever clock skew exists between them. Clamping a capture stamped in this process's future
+// to zero would be indistinguishable from a genuinely instant publish and would quietly improve
+// the quantile; a gap is the honest outcome.
+//
+// The attribute set is topic and attempt, and deliberately NOT outcome: only one outcome is
+// ever recorded here, so the label would be a constant that multiplied the series count by
+// nothing.
+//
+// Parameters:
+//   - ctx context.Context: the recording context.
+//   - result PublishResult: the completed attempt.
+func recordCaptureToDispatch(ctx context.Context, result PublishResult) {
+	if result.Status != model.PublishStatusDispatched || result.CapturedAt.IsZero() {
+		return
+	}
+
+	age := time.Since(result.CapturedAt)
+	if age < 0 {
+		return
+	}
+
+	metrics.EventCaptureToDispatchDuration.Record(ctx, age.Seconds(), otelmetric.WithAttributes(
+		attribute.String(publishAttrTopic, boundedTopicLabel(result.Topic)),
+		attribute.String(publishAttrAttempt, attemptLabel(result.Purpose, result.Attempt)),
 	))
 }
 

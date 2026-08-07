@@ -152,8 +152,8 @@ func (l *Blnk) eventConfiguration() *config.Configuration {
 	return cnf
 }
 
-// eventPublishingConfigured reports whether this deployment has asked for events
-// at all.
+// eventPublishingConfigured reports whether this deployment has asked for events to be
+// CAPTURED IN THE OUTBOX at all, which is to say whether Kafka is configured.
 //
 // THE NO-OP-WHEN-UNCONFIGURED CONTRACT LIVES HERE. SendWebhook returns nil the
 // moment it sees an empty webhook URL, which is why Blnk runs perfectly well with
@@ -163,12 +163,24 @@ func (l *Blnk) eventConfiguration() *config.Configuration {
 // convenience; a publisher that errored or blocked when unconfigured would break
 // every such deployment and every such test.
 //
-// Either transport being configured is enough to justify capturing the event,
-// because the outbox row feeds BOTH of them: during the dual-delivery window the
-// relay publishes the row to Kafka and enqueues the legacy webhook task from that
-// same row. A deployment mid-migration with only a webhook URL set still needs its
-// rows captured, and a deployment past the sunset with only brokers set obviously
-// does too.
+// # THE OUTBOX IS ONLY A DESTINATION WHEN A RELAY CAN DRAIN IT
+//
+// This used to answer true when EITHER transport was configured, on the reasoning that
+// the row feeds both. That reasoning is only sound while a relay is running, and the
+// relay REFUSES TO RUN without Kafka: it would otherwise be handed the no-op publisher,
+// report every publish as dispatched and retire the whole outbox having sent nothing.
+//
+// So a webhook-only deployment — a webhook URL, no brokers, which is every deployment
+// that has not started migrating — captured rows that nothing would ever claim, and
+// because the producers no longer call SendWebhook themselves, its notifications simply
+// stopped. Silently: no error, no failed delivery, a growing table.
+//
+// Capture is therefore tied to KAFKA being configured, and the legacy-only case is
+// served by the transport it was always served by. publishEvent routes an event to
+// SendWebhook directly when there are no brokers and a webhook URL is set, which is
+// byte-for-byte the pre-migration behaviour. Once brokers ARE configured the outbox
+// takes over both legs and the relay's dual-delivery branch is the only caller of the
+// legacy transport, which is what keeps the two bodies identical.
 //
 // Brokers are checked for a non-blank entry rather than merely for a non-empty
 // slice. KAFKA_BROKERS is parsed by envconfig as a comma-separated list, so
@@ -180,7 +192,7 @@ func (l *Blnk) eventConfiguration() *config.Configuration {
 //   - cnf *config.Configuration: the configuration to inspect. May be nil.
 //
 // Returns:
-//   - bool: true when Kafka brokers or a legacy webhook URL are configured.
+//   - bool: true when at least one usable Kafka broker is configured.
 func eventPublishingConfigured(cnf *config.Configuration) bool {
 	if cnf == nil {
 		return false
@@ -192,7 +204,128 @@ func eventPublishingConfigured(cnf *config.Configuration) bool {
 		}
 	}
 
+	return false
+}
+
+// legacyWebhookOnly reports that this deployment has a webhook URL and no Kafka broker,
+// which is the pre-migration steady state and the state every deployment is in before it
+// opts in.
+//
+// It is the guard on publishEvent's direct legacy delivery. Kafka being configured is
+// checked FIRST by the caller, so this cannot divert an event away from the outbox on a
+// deployment that has a relay: the outbox always wins when it can be drained.
+//
+// Parameters:
+//   - cnf *config.Configuration: the configuration to inspect. May be nil.
+//
+// Returns:
+//   - bool: true when a legacy webhook URL is configured.
+func legacyWebhookOnly(cnf *config.Configuration) bool {
+	if cnf == nil {
+		return false
+	}
+
 	return strings.TrimSpace(cnf.Notification.Webhook.Url) != ""
+}
+
+// eventCaptureEnabled reports whether this process captures events at all.
+//
+// It exists so a caller can decide NOT TO ASK for atomic capture, rather than asking and
+// receiving nothing. The three creation writers open a database transaction as soon as they are
+// handed an event preparer — that is how the entity and its event commit together — so a
+// deployment with no transport configured would otherwise pay a transaction per ledger,
+// identity and balance creation in order to insert no event at all, and every existing test
+// that asserts the exact statement those writers issue would see a BEGIN it did not expect.
+//
+// Returning false makes the preparer constructors hand back a nil preparer, which
+// database.firstEventPreparer skips, which leaves the writer on its original
+// single-statement path. That is the no-op-when-unconfigured contract this pipeline inherited
+// from SendWebhook, applied one layer earlier than PrepareEventOutbox applies it.
+//
+// Returns:
+//   - bool: true when Kafka brokers or a legacy webhook URL are configured.
+func (l *Blnk) eventCaptureEnabled() bool {
+	if l == nil {
+		return false
+	}
+
+	return eventPublishingConfigured(l.eventConfiguration())
+}
+
+// publishEntityEventWhenUncaptured delivers a ledger, identity or balance creation event
+// from the post-commit path WHEN, AND ONLY WHEN, the repository did not capture it.
+//
+// # WHY THIS FALLBACK EXISTS
+//
+// The three creation events are captured by a preparer that the repository invokes inside
+// the mutation's own transaction, which is how requirement R-2 is met for them. The
+// preparer constructors return nil when eventCaptureEnabled is false, so that a deployment
+// with no broker does not pay a transaction per creation to insert no event.
+//
+// Those two facts together left a hole on the ONE deployment shape that has not opted in
+// yet. A webhook-only deployment — a webhook URL, no KAFKA_BROKERS, which is every
+// deployment before it migrates — has no preparer, so nothing is captured; and the
+// post-commit publish that used to serve it was removed when capture moved into the
+// repository. ledger.created, identity.created and balance.created were consequently
+// delivered by NEITHER transport: no error, no failed delivery, simply gone. Every other
+// producer in the package kept its publish call and therefore kept working, which is why
+// this shows up only for these three.
+//
+// So the publish is restored, as a FALLBACK rather than as the primary path. It is the same
+// arrangement postTransactionActions already uses for the seven status-derived events: the
+// atomic writer is authoritative, and the post-commit call runs only for an event that
+// writer did not record.
+//
+// # WHY IT CANNOT DOUBLE-PUBLISH
+//
+// The guard is the same predicate the preparer constructors branch on, so the two are
+// mutually exclusive by construction: whenever a preparer was supplied this returns before
+// doing anything, and whenever it was not there is no captured row to conflict with. That
+// matters beyond tidiness — event_id is derived from the aggregate's identity, so a second
+// capture would be refused by the unique index and every creation would log a conflict.
+//
+// PublishEvent then applies its own gate: with no brokers and a webhook URL it goes
+// straight down the legacy transport, and with neither configured it is a no-op. This
+// function therefore has no effect at all on a deployment that has no notification sink,
+// which is the contract inherited from SendWebhook.
+//
+// # WHY THE AGGREGATE ID IS CHECKED
+//
+// CreateBalance reports a unique_indicator_currency violation as success with an EMPTY
+// balance — its long-standing idempotent-create contract — and the repository declines to
+// capture on that path precisely because balance.created would otherwise announce a
+// creation that did not happen, with an empty payload. Restoring a publish without this
+// guard would restore that defect along with it. An empty aggregate id means nothing was
+// created, so nothing is announced.
+//
+// Parameters:
+//   - ctx context.Context: the publishing context. Callers detach it from request
+//     cancellation before handing it over; see postBalanceActions.
+//   - aggregateID string: the created entity's identifier. Empty means nothing was created.
+//   - event NewWebhook: the event string and payload object, unchanged from what the legacy
+//     transport was handed.
+//   - options ...EventOption: applied only on the outbox path, which this fallback cannot
+//     reach; passed so the two capture sites read identically.
+//
+// Returns:
+//   - error: SendWebhook's enqueue error, exactly as the pre-migration call site returned
+//     it, or nil when there was nothing to do.
+func (l *Blnk) publishEntityEventWhenUncaptured(ctx context.Context, aggregateID string, event NewWebhook, options ...EventOption) error {
+	if l == nil {
+		return nil
+	}
+
+	// The repository already captured this event inside the mutation's transaction.
+	if l.eventCaptureEnabled() {
+		return nil
+	}
+
+	// Nothing was created, so there is no creation to announce.
+	if strings.TrimSpace(aggregateID) == "" {
+		return nil
+	}
+
+	return l.PublishEvent(ctx, event, options...)
 }
 
 // eventMaxAttempts resolves the per-row retry budget from RELAY_MAX_RETRY_ATTEMPTS.
@@ -873,12 +1006,34 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 		MaxAttempts: eventMaxAttempts(cnf),
 	}
 
+	// AN UNCATALOGUED EVENT TYPE IS A DEFECT SIGNAL, and this is where it is raised.
+	//
+	// model.EventCategory routes an event type it does not recognise to the internal
+	// system category rather than dropping it, which is what keeps the zero-exceptions
+	// coverage guarantee true — but the routing is a fallback, not a decision anybody
+	// made about that event's audience. Saying so here, once per captured row, is what
+	// turns "events are arriving on the system topic" into "this producer was added
+	// without extending model.EventCategory", which is the actual fix.
+	//
+	// It is deliberately at WARNING and deliberately unguarded by a level check: it
+	// cannot fire for any event type this repository catalogues, so a healthy
+	// deployment never emits it at all.
+	if !model.IsCataloguedEventType(outbox.EventType) {
+		logrus.WithFields(logrus.Fields{
+			"event_id":   outbox.EventID,
+			"event_type": outbox.EventType,
+			"topic":      outbox.Topic,
+		}).Warn(
+			"event capture: this event type is not in the event catalogue, so it was routed to " +
+				"the internal system topic, which no subscriber can be granted. Add it to " +
+				"model.EventCategory so it reaches the audience it belongs to",
+		)
+	}
+
 	span.AddEvent("Event outbox entry prepared", trace.WithAttributes(
 		attribute.String("event.id", outbox.EventID),
 		attribute.String("event.type", outbox.EventType),
-		attribute.String("event.aggregate_id", outbox.AggregateID),
-		attribute.String("event.partition_key", outbox.PartitionKey),
-		attribute.String("event.ledger_id", outbox.LedgerID),
+		attribute.String("event.partition_key_hash", hashLogIdentifier(outbox.PartitionKey)),
 		attribute.String("event.topic", outbox.Topic),
 	))
 
@@ -977,6 +1132,19 @@ func (l *Blnk) PublishEventInTx(ctx context.Context, tx *sql.Tx, event NewWebhoo
 //     deployment that DOES have publishing configured a nil datasource means events
 //     are being dropped and an operator needs to know.
 //
+// # The legacy-only branch, taken BEFORE anything is captured
+//
+// A deployment with a webhook URL and no brokers has no outbox reader — the relay refuses
+// the no-op publisher — so capturing a row there would be capturing a row that nothing
+// can ever drain. Such a deployment is routed straight to SendWebhook, which is the exact
+// call every producer made before this feature existed, so its behaviour is unchanged
+// (AAP §0.5.4, "KAFKA_BROKERS empty → legacy path unchanged"). See
+// legacyWebhookOnlyDelivery and deliverLegacyWebhookOnly.
+//
+// The branch is taken ONLY when tx is nil. An enqueue cannot be rolled back with the
+// caller's transaction, so on the in-transaction path this deployment captures nothing and
+// delivers nothing, and the caller's post-commit path delivers instead.
+//
 // Parameters:
 //   - ctx context.Context: the context for the operation.
 //   - tx *sql.Tx: the caller's transaction, or nil for the standalone insert.
@@ -989,6 +1157,62 @@ func (l *Blnk) PublishEventInTx(ctx context.Context, tx *sql.Tx, event NewWebhoo
 func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook, options ...EventOption) error {
 	ctx, span := tracer.Start(ctx, "PublishEvent")
 	defer span.End()
+
+	// THE LEGACY-ONLY PATH, and it is why a webhook-only deployment keeps working.
+	//
+	// With no Kafka broker configured there is no relay — it refuses to start rather than
+	// retire an outbox it cannot publish — so a row captured here would never be claimed
+	// and never be delivered. Before this branch existed that is exactly what happened:
+	// the producers had stopped calling SendWebhook, the rows accumulated, and the
+	// deployment's notifications stopped with nothing failing to say so.
+	//
+	// So when Kafka is absent and a webhook URL is present, the event goes straight down
+	// the transport it has always gone down. This is the pre-migration behaviour restored
+	// verbatim, including its error contract: SendWebhook's enqueue error reaches the
+	// caller exactly where it used to.
+	//
+	// The ORDER of the two checks is the important part. Kafka being configured wins, so a
+	// deployment that has opted in captures to the outbox and lets the relay drive BOTH
+	// legs from that one row — which is what makes the two transports carry identical
+	// bytes during the dual-delivery window. This branch can only be reached when there is
+	// no outbox path at all.
+	//
+	// AND ONLY WHEN THE CALLER HOLDS NO TRANSACTION. asynq is backed by Redis, so an
+	// enqueue cannot join the caller's PostgreSQL transaction and cannot be rolled back
+	// with it: taking this branch from PublishEventInTx would deliver a webhook describing
+	// a mutation that may still roll back, which is the exact hazard the transactional
+	// outbox exists to remove — and it would do it on the one path that promised not to.
+	// So an in-transaction capture on a Kafka-less deployment is a documented no-op, and
+	// the caller's POST-COMMIT path is what delivers the event. That is what
+	// publishEntityEventWhenUncaptured does at the three entity producers, and what the
+	// atomic transaction writers' callers do for the rest.
+	if cnf := l.eventConfiguration(); tx == nil && !eventPublishingConfigured(cnf) && legacyWebhookOnly(cnf) {
+		span.AddEvent("Event delivered over the legacy webhook transport; no Kafka broker is configured")
+
+		if l == nil {
+			return nil
+		}
+
+		// The queue client is what the legacy transport enqueues onto, and a nil one means
+		// there is no transport at all on a deployment that asked for one. Reported as an
+		// error rather than skipped, for the same reason the missing-datasource arm below
+		// is: every event would be dropped, permanently and invisibly, while every caller
+		// was told it had succeeded.
+		if l.asynqClient == nil {
+			err := apierror.NewAPIError(
+				apierror.ErrInternalServer,
+				"A legacy webhook URL is configured but no queue client is available to deliver the event",
+				fmt.Errorf("blnk: event %q cannot be delivered: the Blnk instance has no asynq client", event.Event),
+			)
+			logrus.WithField("event_type", event.Event).WithError(err).
+				Error("event not delivered: a webhook URL is configured but this Blnk instance has no queue client")
+			span.RecordError(err)
+
+			return err
+		}
+
+		return l.SendWebhook(event)
+	}
 
 	outbox, err := l.PrepareEventOutbox(ctx, event, options...)
 	if err != nil {
@@ -1083,6 +1307,111 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook, o
 	span.AddEvent("Event recorded in outbox", trace.WithAttributes(
 		attribute.Int64("event.outbox_id", outbox.ID),
 	))
+
+	return nil
+}
+
+// deliverLegacyWebhookOnly delivers an event over the legacy HTTP transport on a
+// deployment that has no Kafka, by making exactly the call every producer made before
+// this feature existed.
+//
+// # Why this exists rather than an outbox row
+//
+// The outbox has one reader, EventRelayProcessor, and it refuses to run without a real
+// Kafka publisher: the no-op reports every publish as dispatched, so a relay given it
+// would mark the whole outbox dispatched having sent nothing. On a webhook-only
+// deployment there is therefore nothing that can ever claim a captured row. Capturing one
+// anyway is the worst of both worlds — the row accumulates forever AND the webhook the
+// deployment is configured for is never sent — which is precisely the regression this
+// function removes. The AAP's state machine says the legacy path is UNCHANGED when
+// KAFKA_BROKERS is empty (§0.5.4), and SendWebhook is what unchanged means.
+//
+// # The in-transaction path deliberately delivers nothing
+//
+// SendWebhook enqueues an asynq task, and asynq is backed by Redis, which cannot be
+// enrolled in a PostgreSQL transaction. Enqueuing from inside the caller's open
+// transaction would deliver a webhook for a mutation that then rolled back — a webhook
+// asserting money moved when it did not. That is strictly worse than not delivering, so
+// the in-transaction path returns nil and the caller's POST-COMMIT path delivers instead.
+//
+// That is not a gap in this codebase's own flows: the transaction execution path receives
+// a nil row from PrepareEventOutbox on an unconfigured deployment, so eventCaptured stays
+// false and postTransactionActions publishes through the standalone path, which arrives
+// back here with tx == nil and delivers. It IS a constraint on any future caller of
+// PublishEventInTx, which is why the trace records the skip and why the method's own
+// documentation states it.
+//
+// Every other property of the legacy path is inherited from SendWebhook untouched: it
+// no-ops on an empty URL, it marshals the same NewWebhook value the HTTP body has always
+// been, and asynq owns the delivery retry.
+//
+// Parameters:
+//   - ctx context.Context: the context for the operation, used for tracing only —
+//     SendWebhook takes none.
+//   - tx *sql.Tx: the caller's transaction, or nil. Non-nil selects the skip described
+//     above.
+//   - event NewWebhook: the event name and payload object, forwarded verbatim.
+//
+// Returns:
+//   - error: whatever SendWebhook reports, or nil on the in-transaction skip.
+func (l *Blnk) deliverLegacyWebhookOnly(ctx context.Context, tx *sql.Tx, event NewWebhook) error {
+	_, span := tracer.Start(ctx, "DeliverLegacyWebhookOnly")
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.String("event.type", event.Event),
+		attribute.Bool("event.in_transaction", tx != nil),
+		attribute.Bool("event.legacy_only", true),
+	)
+
+	if tx != nil {
+		span.AddEvent(
+			"Legacy-only delivery skipped inside a database transaction; the caller's " +
+				"post-commit path delivers it",
+		)
+
+		return nil
+	}
+
+	if l == nil {
+		return nil
+	}
+
+	// SendWebhook enqueues through l.asynqClient and would panic on a nil one. NewBlnk
+	// always builds it from the Redis DSN, so this is unreachable in a real deployment;
+	// it is reachable from a hand-assembled instance, and a panic inside a post-action
+	// goroutine takes the process down rather than surfacing as an error. The error is
+	// returned rather than swallowed for the same reason the nil-datasource branch above
+	// returns one: the deployment asked for webhooks and is not getting them.
+	if l.asynqClient == nil {
+		err := apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"The legacy webhook transport is configured but no queue client is available to enqueue the delivery",
+			fmt.Errorf("blnk: event %q cannot be delivered: the Blnk instance has no asynq client", event.Event),
+		)
+		logrus.WithFields(logrus.Fields{
+			"event_type":  event.Event,
+			"legacy_only": true,
+		}).WithError(err).Error("event not delivered: the legacy webhook transport has no queue client")
+		span.RecordError(err)
+
+		return err
+	}
+
+	if err := l.SendWebhook(event); err != nil {
+		// Logged and returned, exactly as the outbox branch does, so a call site's
+		// existing routing to notification.NotifyError behaves identically whichever
+		// transport is in use.
+		logrus.WithFields(logrus.Fields{
+			"event_type":  event.Event,
+			"legacy_only": true,
+		}).WithError(err).Error("failed to enqueue the legacy webhook delivery")
+		span.RecordError(err)
+
+		return err
+	}
+
+	span.AddEvent("Event delivered over the legacy webhook transport")
 
 	return nil
 }

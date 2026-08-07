@@ -19,12 +19,16 @@
 //
 // # STATE THE GUARANTEE HONESTLY BEFORE READING AN ASSERTION
 //
-// This is the criterion most easily tested wrongly, so the guarantee is written out here
-// rather than left implicit in the assertions. THREE FACTS, and they are not the same fact:
+// THREE FACTS, and they are not the same fact:
 //
-//  1. The outbox guarantees each event is RECORDED ONCE. The row is committed in the same
-//     database transaction as the ledger mutation that produced it, and event_id carries a
-//     unique index, so an event can never be lost and can never be recorded twice.
+//  1. THE OUTBOX GUARANTEES THE ROW SURVIVES, and event_id carries a unique index so one id is
+//     recorded at most once. How the row and the ledger mutation relate depends on the capture:
+//     an IN-TRANSACTION capture (PublishEventInTx, the atomic writers) commits both together, so
+//     neither can exist without the other; the STANDALONE capture the domain call sites use
+//     commits the row afterwards, so a crash between the two can leave a mutation with no event.
+//     Recapture is idempotent only where the id is DERIVED from the mutation
+//     (model.EventIdentityFor); the repeatable event types that take a random id would be
+//     recorded again under a new id.
 //  2. Kafka delivery is AT-LEAST-ONCE. The relay publishes, the broker acknowledges, and
 //     only then is the row marked dispatched — see processRow, which documents that window
 //     in the code. A relay that dies inside it has published the event without recording
@@ -35,11 +39,10 @@
 //     documented idempotency key (model.LedgerEvent.EventID and docs/event-streaming.md
 //     both state that obligation).
 //
-// So this file asserts NO LOSS, and asserts NO DUPLICATE AT THE CONSUMER'S IDEMPOTENCY
-// BOUNDARY — that is, after de-duplicating on event_id. It deliberately does NOT assert
-// that the broker received each message exactly once. Such an assertion would be testing a
-// promise the system does not make and, worse, would fail on a CORRECT implementation the
-// moment a crash landed inside the publish-to-mark window, which is precisely the window
+// So this file asserts NO LOSS, and NO DUPLICATE AT THE CONSUMER'S IDEMPOTENCY BOUNDARY — after
+// de-duplicating on event_id. It deliberately does NOT assert that the broker received each
+// message exactly once: that promise is not made, and such an assertion would fail on a CORRECT
+// implementation the moment a crash landed inside the publish-to-mark window, which is the window
 // this file exists to exercise. Please do not "strengthen" it into that.
 //
 // What is asserted instead, and what each assertion buys:
@@ -54,6 +57,13 @@
 //     operator — and that is the failure mode these tests are built to catch.
 //   - A lease is honoured while it is live and released when it expires, in both
 //     directions, because that lease IS the recovery mechanism.
+//   - A batch that takes LONGER than its own lease keeps it, and no second instance
+//     republishes those rows. That assertion is deliberately stronger than the ones above:
+//     no crash is staged and no lease is allowed to lapse, so no event may be published
+//     twice BEFORE any idempotency filtering at all.
+//   - An event whose dead-letter write failed is retried until it is preserved. A spent
+//     retry budget with no dead-letter record is the one failure with nothing further to
+//     fall back to, so it is recovered rather than abandoned.
 //   - attempts survives a restart: it neither resets (which would let a permanently
 //     failing event retry for ever) nor jumps (which would dead-letter a healthy event).
 //   - FOR UPDATE SKIP LOCKED lets a second relay instance make progress on other rows
@@ -64,18 +74,26 @@
 // These tests are skipped by `go test -short ./...`, which is what `make test` and CI run,
 // so the default suite stays green with no infrastructure at all. To run them:
 //
-//	docker compose up -d postgres kafka kafka-init   # broker, topics, DLTs, SCRAM principal
+//	docker compose --profile kafka up -d postgres kafka kafka-init  # broker, topics, DLTs, principals
 //	go run ./cmd migrate up                          # creates blnk.event_outbox
 //	go test -run 'TestEventRecovery' -count=1 .
 //
-// Environment, all optional, each defaulting to the local compose stack:
+// Environment: BLNK_DATA_SOURCE_DNS (the DSN holding blnk.event_outbox) and KAFKA_BROKERS both
+// default to the local compose stack. The live-delivery test additionally needs the SCRAM pair
+// KAFKA_SASL_ADMIN_USER and KAFKA_SASL_ADMIN_SECRET, which are never hardcoded here — it skips
+// when the secret is absent, naming what is missing.
 //
 //	BLNK_DATA_SOURCE_DNS     PostgreSQL DSN holding blnk.event_outbox
 //	                         (default postgres://postgres:password@localhost:5432/blnk?sslmode=disable)
 //	KAFKA_BROKERS            broker list for the live-delivery test (default localhost:9092)
-//	KAFKA_SASL_ADMIN_USER    SCRAM principal for the live-delivery test
+//	KAFKA_SASL_ADMIN_USER    administrative SCRAM principal — used ONLY to read topic end
+//	                         offsets in the live-delivery test
 //	KAFKA_SASL_ADMIN_SECRET  its secret. NEVER hardcoded here; the live-delivery test
 //	                         skips when it is absent
+//	KAFKA_SASL_USER          the PRODUCER principal the publisher authenticates as. Blnk
+//	                         refuses to publish as the administrator, so this is required
+//	                         in addition to the administrative pair
+//	KAFKA_SASL_SECRET        its secret, likewise never hardcoded
 //
 // Each test names exactly what is missing when it skips, so a skip is a shopping list
 // rather than a mystery.
@@ -92,6 +110,7 @@ package blnk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -116,7 +135,7 @@ import (
 const (
 	// recoveryEventType is a real event string from the catalogue, chosen because it routes
 	// to blnk.transactions — a topic the provisioning script creates. An unrecognised type
-	// would route to the quarantine topic, which the local stack does not provision, so the
+	// would route to the internal system topic rather than the category under test, so the
 	// live-delivery test would fail for a reason that has nothing to do with recovery.
 	recoveryEventType = "transaction.applied"
 
@@ -157,6 +176,28 @@ const (
 	// nothing can expire while it runs. That is what makes "no row was processed by both" a
 	// statement about FOR UPDATE SKIP LOCKED rather than about how fast the machine is.
 	recoveryNoExpiryLease = 30 * time.Second
+
+	// recoveryLeaseOverrun is how long a batch is deliberately held PAST its lease by the
+	// renewal test, and it is a multiple of the lease rather than a duration in its own right
+	// so the two cannot drift apart.
+	//
+	// Three leases is what makes the assertion unambiguous: a lease taken once and never
+	// renewed would have expired twice over by the time it is read back, so a lease still
+	// live at the end of the overrun was renewed. Nothing about the number is tuning.
+	recoveryLeaseOverrun = 3 * recoveryLease
+
+	// recoveryOversizedBatch is a claim limit larger than any backlog seeded here.
+	//
+	// It is what a test uses when it needs ONE claim, under ONE token, to hold everything it
+	// seeded — regardless of how many other runs' rows share the table and sort ahead of
+	// them. A batch sized to the backlog would take only part of it whenever a stranger row
+	// was older, and the test would then be asserting about a fraction of its own rows.
+	recoveryOversizedBatch = 200
+
+	// recoverySpentBudget is the retry budget given to rows that must reach the dead-letter
+	// hand-off. One attempt spends it, so the row gets there on its first publish failure
+	// instead of after the production schedule's 1s + 2s + 4s + 8s of backoff.
+	recoverySpentBudget = 1
 
 	// recoveryPollInterval keeps the relay responsive without changing what it does.
 	recoveryPollInterval = 100 * time.Millisecond
@@ -205,6 +246,21 @@ const (
 	// relay was running and not yet retired. A real leak is one goroutine per batch
 	// worker over many batches, so it is orders of magnitude larger than this.
 	recoveryGoroutineTolerance = 8
+)
+
+// The two transport refusals these tests inject. They are sentinels rather than fmt.Errorf
+// calls so that an assertion can name the exact failure it expects to see travel all the way
+// into a row's last_error and out again as a dead-letter message's error_reason — which is
+// how the repair path is shown to report what ENDED the event's retry budget rather than
+// describing the repair.
+var (
+	// errRecoveryTransportRefused is a retryable publish failure: the shape of a broker that
+	// is reachable and not accepting writes.
+	errRecoveryTransportRefused = errors.New("the recovery test's Kafka transport refused the publish")
+
+	// errRecoveryDeadLetterRefused is a failed dead-letter WRITE, which is the failure that
+	// strands a row at 'failed' with no dlt_topic — the limbo the repair pass exists to end.
+	errRecoveryDeadLetterRefused = errors.New("the recovery test's dead-letter transport refused the write")
 )
 
 // ---------------------------------------------------------------------------
@@ -303,6 +359,26 @@ func recoveryRequireReachable(t *testing.T, what, address, remedy string) {
 func recoveryKafkaCredentials() (string, string, bool) {
 	user := strings.TrimSpace(os.Getenv("KAFKA_SASL_ADMIN_USER"))
 	secret := strings.TrimSpace(os.Getenv("KAFKA_SASL_ADMIN_SECRET"))
+
+	return user, secret, user != "" && secret != ""
+}
+
+// recoveryProducerCredentials returns the SCRAM principal the PUBLISHER authenticates with,
+// and whether it is available.
+//
+// This is a SECOND, DELIBERATELY DISTINCT principal from the administrative one above, and
+// the separation is the point rather than an inconvenience. The administrative credential can
+// create topics, alter SCRAM credentials and manage ACLs; steady-state publishing needs none
+// of that, so Blnk refuses to publish as the administrator and requires a producer principal
+// with Write and Describe on the Blnk-owned topics. A test that supplied only the admin pair
+// would not be exercising a configuration any deployment is allowed to run.
+//
+// Nothing is defaulted, for the same reason as above: the local stack's producer pair is
+// provisioned by scripts/kafka-provision.sh and read from the environment, never from a
+// literal in a committed file.
+func recoveryProducerCredentials() (string, string, bool) {
+	user := strings.TrimSpace(os.Getenv("KAFKA_SASL_USER"))
+	secret := strings.TrimSpace(os.Getenv("KAFKA_SASL_SECRET"))
 
 	return user, secret, user != "" && secret != ""
 }
@@ -498,12 +574,25 @@ func (f *recoveryFixture) partitionKey(index int) string {
 	return fmt.Sprintf("%s%05d", f.keyPrefix(), index)
 }
 
-// seed inserts count claimable outbox rows and returns their event ids in insertion order.
+// seed inserts count claimable outbox rows carrying the production retry budget, and returns
+// their event ids in insertion order.
+func (f *recoveryFixture) seed(ctx context.Context, count int) []string {
+	f.t.Helper()
+
+	return f.seedWithBudget(ctx, count, recoveryMaxAttempts)
+}
+
+// seedWithBudget inserts count claimable outbox rows whose retry budget is maxAttempts, and
+// returns their event ids in insertion order.
 //
 // The rows are inserted through the production repository method, so they carry exactly the
 // shape the capture path produces: a real legacy webhook envelope as the payload, a
 // Blnk-owned topic, schema version 1, and the run's own partition key.
-func (f *recoveryFixture) seed(ctx context.Context, count int) []string {
+//
+// The budget is a parameter because a test about what happens AFTER the budget is spent should
+// not pay the production schedule's 1s + 2s + 4s + 8s of backoff to get there. Nothing else
+// about the row changes, so the state the row arrives in is the production state.
+func (f *recoveryFixture) seedWithBudget(ctx context.Context, count, maxAttempts int) []string {
 	f.t.Helper()
 
 	occurredAt := time.Now().UTC()
@@ -535,7 +624,7 @@ func (f *recoveryFixture) seed(ctx context.Context, count int) []string {
 			// Ascending by one millisecond so the claim's FIFO ordering has something to be
 			// FIFO about, and so a diagnostic reads in insertion order.
 			OccurredAt:  occurredAt.Add(time.Duration(index) * time.Millisecond),
-			MaxAttempts: recoveryMaxAttempts,
+			MaxAttempts: maxAttempts,
 		}
 
 		require.NoErrorf(f.t, f.ds.InsertEventOutbox(ctx, row), "seeding outbox row %d", index)
@@ -592,7 +681,11 @@ func (f *recoveryFixture) relay(publisher TopicEventPublisher) *EventRelayProces
 		datasource: f.ds,
 		events:     publisher,
 	})
-	processor.sunsetPassed = func(time.Time) bool { return true }
+	// The window is pinned CLOSED so the dual-delivery branch is never taken, and closed
+	// rather than merely absent so the relay is still startable: a window that has not
+	// opened yet is a misconfiguration the startup obstacle refuses.
+	processor.dualDeliveryActive = func(time.Time) bool { return false }
+	processor.windowState = func(time.Time) WebhookWindowState { return WebhookWindowClosed }
 
 	require.NoError(f.t, processor.startupObstacle(),
 		"the relay must be startable: this is the assembly, not the behaviour under test")
@@ -710,6 +803,91 @@ func (f *recoveryFixture) snapshot(ctx context.Context) []recoveryRowState {
 	return states
 }
 
+// recoveryLeaseState is one claimed row's lease as the database records it: who holds it,
+// until when, and whether it is still live.
+//
+// It exists alongside recoveryRowState because the two answer different questions.
+// recoveryRowState asks "is a lease held, and is it live", which is all the terminal-state
+// contract needs. A RENEWAL, though, is only observable as the expiry MOVING FORWARD under an
+// unchanged claim token — so the timestamp itself, and the token it belongs to, are what a
+// renewal assertion has to read.
+type recoveryLeaseState struct {
+	eventID    string
+	status     string
+	claimToken string
+	expiry     time.Time
+	live       bool
+}
+
+// recoveryHeldLeaseQuery reads this run's rows that some worker currently holds a claim on.
+//
+// claim_token IS NOT NULL is the definition of "held": every terminal transition clears the
+// token, and the ordinary claim stamps it, so the predicate selects exactly the rows a batch
+// still owns — which is exactly the set a heartbeat is renewing.
+const recoveryHeldLeaseQuery = `
+	SELECT event_id,
+	       status,
+	       claim_token,
+	       COALESCE(locked_until, TIMESTAMPTZ 'epoch') AS lease_expiry,
+	       COALESCE(locked_until > NOW(), FALSE)       AS lease_live
+	FROM blnk.event_outbox
+	WHERE starts_with(partition_key, $1)
+	  AND claim_token IS NOT NULL
+	ORDER BY occurred_at ASC, id ASC
+`
+
+// heldLeases returns this run's currently claimed rows, keyed by event id.
+func (f *recoveryFixture) heldLeases(ctx context.Context) map[string]recoveryLeaseState {
+	f.t.Helper()
+
+	rows, err := f.ds.Conn.QueryContext(ctx, recoveryHeldLeaseQuery, f.keyPrefix())
+	require.NoError(f.t, err, "reading back the leases held over the seeded outbox rows")
+
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			f.t.Logf("closing the outbox lease cursor: %v", closeErr)
+		}
+	}()
+
+	leases := make(map[string]recoveryLeaseState, 64)
+	for rows.Next() {
+		var lease recoveryLeaseState
+		require.NoError(f.t, rows.Scan(
+			&lease.eventID,
+			&lease.status,
+			&lease.claimToken,
+			&lease.expiry,
+			&lease.live,
+		), "scanning an outbox lease")
+
+		leases[lease.eventID] = lease
+	}
+
+	require.NoError(f.t, rows.Err(), "iterating the leases held over the seeded outbox rows")
+
+	return leases
+}
+
+// recoveryClaimTokens returns the distinct claim tokens across a set of held leases.
+//
+// One token means one claim, which is what "the whole backlog is held by a single batch"
+// reduces to — and what makes a later comparison against the same token meaningful.
+func recoveryClaimTokens(leases map[string]recoveryLeaseState) []string {
+	seen := make(map[string]struct{}, len(leases))
+	tokens := make([]string, 0, len(leases))
+
+	for _, lease := range leases {
+		if _, ok := seen[lease.claimToken]; ok {
+			continue
+		}
+
+		seen[lease.claimToken] = struct{}{}
+		tokens = append(tokens, lease.claimToken)
+	}
+
+	return tokens
+}
+
 // recoveryDescribeStates renders a compact diagnostic: how many rows sit in each status, and
 // a few examples of the ones that have not finished. It is what turns a timeout from "it
 // hung" into "forty rows are still processing behind a live lease".
@@ -771,13 +949,116 @@ func (f *recoveryFixture) waitForTerminalStates(ctx context.Context, expected in
 	}
 }
 
+// awaitRow blocks until one seeded row satisfies a predicate, and returns the state that did.
+//
+// It reports the whole run's outbox state on a timeout rather than a bare deadline, for the
+// same reason waitForTerminalStates does: "the row never reached that shape" is not actionable,
+// whereas "it is still processing behind a live lease" is. The description names the shape in
+// the failure message, so a timeout reads as a sentence.
+//
+// Parameters:
+//   - ctx context.Context: cancels the reads.
+//   - eventID string: the row to watch.
+//   - satisfied func(recoveryRowState) bool: the shape being waited for.
+//   - timeout time.Duration: how long to wait.
+//   - description string: what the shape means, for the failure message.
+//
+// Returns:
+//   - recoveryRowState: the state that satisfied the predicate.
+func (f *recoveryFixture) awaitRow(
+	ctx context.Context,
+	eventID string,
+	satisfied func(recoveryRowState) bool,
+	timeout time.Duration,
+	description string,
+) recoveryRowState {
+	f.t.Helper()
+
+	deadline := time.Now().Add(timeout)
+
+	for {
+		states := f.snapshot(ctx)
+
+		for _, state := range states {
+			if state.eventID == eventID && satisfied(state) {
+				return state
+			}
+		}
+
+		if time.Now().After(deadline) {
+			f.t.Fatalf("timed out after %s waiting for event %s of run %s to %s: %s",
+				timeout, eventID, f.runID, description, recoveryDescribeStates(states))
+
+			return recoveryRowState{}
+		}
+
+		time.Sleep(recoveryStateInterval)
+	}
+}
+
 // assertEveryRowFinishedCleanly is the terminal-state contract, asserted row by row.
 func (f *recoveryFixture) assertEveryRowFinishedCleanly(states []recoveryRowState, expected int) {
 	f.t.Helper()
 
-	require.Len(f.t, states, expected, "every seeded row must still be present in the outbox")
+	f.assertEveryRowReleasedItsClaim(states, expected)
 
 	dispatched := 0
+	for _, state := range states {
+		if state.status == model.EventOutboxStatusDispatched {
+			dispatched++
+		}
+	}
+
+	assert.Equalf(f.t, expected, dispatched,
+		"every seeded event must end up dispatched: the publisher only ever failed while the relay's "+
+			"context was cancelled, and one cancellation cannot spend a five-attempt budget. %s",
+		recoveryDescribeStates(states))
+}
+
+// assertEveryRowWasPreserved is assertEveryRowFinishedCleanly's dead-letter counterpart: the
+// same released-claim contract, for a run whose events were GIVEN UP ON rather than delivered.
+//
+// The two are separate assertions rather than one lenient one on purpose. "Every row finished"
+// is far too weak a statement for either test to rest on: a run that should have dispatched
+// everything and dead-lettered one row instead has lost an event as surely as if the row had
+// been deleted, and a run whose dead-letter write was supposed to be repaired has proved
+// nothing if the row merely dispatched.
+//
+// Parameters:
+//   - states []recoveryRowState: the rows read back after the run.
+//   - expected int: how many rows the run seeded.
+//   - dltTopic string: the dead-letter topic every row must have been preserved on.
+func (f *recoveryFixture) assertEveryRowWasPreserved(
+	states []recoveryRowState,
+	expected int,
+	dltTopic string,
+) {
+	f.t.Helper()
+
+	f.assertEveryRowReleasedItsClaim(states, expected)
+
+	for _, state := range states {
+		assert.Equalf(f.t, model.EventOutboxStatusDeadLettered, state.status,
+			"event %s must have been preserved on its dead-letter topic, got status %q. %s",
+			state.eventID, state.status, recoveryDescribeStates(states))
+
+		assert.Equalf(f.t, dltTopic, state.dltTopic,
+			"event %s must record the dead-letter topic it was preserved on", state.eventID)
+	}
+}
+
+// assertEveryRowReleasedItsClaim is the terminal-state contract both of the above rest on:
+// every seeded row finished, none of them finished in a shape nothing can act on again, and
+// none of them is still holding the lease or the token it worked under.
+//
+// Parameters:
+//   - states []recoveryRowState: the rows read back after the run.
+//   - expected int: how many rows the run seeded.
+func (f *recoveryFixture) assertEveryRowReleasedItsClaim(states []recoveryRowState, expected int) {
+	f.t.Helper()
+
+	require.Len(f.t, states, expected, "every seeded row must still be present in the outbox")
+
 	for _, state := range states {
 		assert.Truef(f.t, state.terminal(),
 			"event %s must have finished, got status %q (attempts %d/%d, lease_live=%t)",
@@ -796,8 +1077,6 @@ func (f *recoveryFixture) assertEveryRowFinishedCleanly(states []recoveryRowStat
 			state.eventID, state.status)
 
 		if state.status == model.EventOutboxStatusDispatched {
-			dispatched++
-
 			assert.Truef(f.t, state.dispatched,
 				"event %s is dispatched, so dispatched_at must be stamped", state.eventID)
 		}
@@ -808,11 +1087,6 @@ func (f *recoveryFixture) assertEveryRowFinishedCleanly(states []recoveryRowStat
 				state.eventID)
 		}
 	}
-
-	assert.Equalf(f.t, expected, dispatched,
-		"every seeded event must end up dispatched: the publisher only ever failed while the relay's "+
-			"context was cancelled, and one cancellation cannot spend a five-attempt budget. %s",
-		recoveryDescribeStates(states))
 }
 
 // mine keeps only the rows this run seeded.
@@ -933,30 +1207,22 @@ func (f *recoveryFixture) awaitDeliveries(publisher *recoveryPublisher, count in
 
 // recoveryPublisher stands where the broker stands, and records what reached it.
 //
-// It is a full TopicEventPublisher, so the relay is the REAL relay driving its real publish
-// path — nothing about claiming, marking, backoff or dead-lettering is stubbed. Only the
-// transport is observable, and that buys the two things a recovery test cannot do without:
+// It is a full TopicEventPublisher, so the relay is the REAL relay driving its real publish path —
+// nothing about claiming, marking, backoff or dead-lettering is stubbed. Only the transport is
+// observable, which buys an EXACT RECORD of every delivery (so "no loss" and "duplicates
+// de-duplicate to the seeded set" are set comparisons rather than inferences) and a DETERMINISTIC
+// INTERRUPTION POINT: after the configured number of deliveries every later publish blocks until
+// released or cancelled.
 //
-//   - AN EXACT RECORD of every delivery, so "no loss" and "duplicates de-duplicate to the
-//     original set" become set comparisons rather than inferences from row states.
-//   - A DETERMINISTIC INTERRUPTION POINT. After the configured number of deliveries the
-//     publisher freezes: every later publish blocks until the test releases it or the
-//     context is cancelled. That is what makes the crash land reliably in the MIDDLE of a
-//     batch. A sleep would not: with a fast publisher a hundred and fifty rows drain in
-//     milliseconds, so a test that slept and hoped would usually interrupt nothing at all
-//     and would then be asserting against a clean shutdown while claiming to test a crash.
+// The freeze reports itself only once a REQUIRED NUMBER OF PUBLISHES ARE PARKED in it. Signalling
+// on the delivery count alone would leave the crash a race between the test's cancel and the
+// relay's next publish — sometimes landing on in-flight publishes, sometimes not. Waiting for the
+// workers to arrive puts the crash inside the publish-to-mark window on every run, which is where
+// the outbox row and the broker disagree, and a sleep-and-hope would usually miss it entirely
+// since a fast publisher drains 150 rows in milliseconds.
 //
-// The freeze reports itself only once a REQUIRED NUMBER OF PUBLISHES ARE PARKED in it, and
-// that second condition is what makes the crash reproducible rather than merely likely.
-// Signalling on the delivery count alone leaves it a race between the test's cancel and the
-// relay's next publish: sometimes several publishes are in flight when the context dies and
-// the in-flight recovery path is exercised, sometimes none are and it is not. Waiting for the
-// workers to arrive guarantees the crash lands ON publishes, every run — which is the whole
-// point of the exercise, since that is the window where the outbox row and the broker
-// disagree.
-//
-// A delegate may be supplied, in which case every publish is forwarded to it — that is how
-// the live-broker test keeps the same instrumentation while writing to a real topic.
+// A delegate may be supplied, in which case every publish is forwarded to it — that is how the
+// live-broker test keeps the same instrumentation while writing to a real topic.
 type recoveryPublisher struct {
 	// name distinguishes instances in diagnostics, which matters for the two-relay test.
 	name string
@@ -972,6 +1238,7 @@ type recoveryPublisher struct {
 	published  []string
 	strangers  int
 	failures   int
+	refuseAll  bool
 	gateAt     int
 	gateParked int
 	gateCount  int
@@ -1024,6 +1291,23 @@ func (p *recoveryPublisher) freezeAfter(deliveries, inFlight int) *recoveryPubli
 	p.gateAt = deliveries
 	p.gateParked = inFlight
 	p.hold = make(chan struct{})
+
+	return p
+}
+
+// refuseEveryPublish makes every publish fail as a RETRYABLE transport failure.
+//
+// It is how a test drives a row all the way to the dead-letter hand-off: retryable is the
+// honest classification of a broker that will not accept a write, and it is the classification
+// that makes the relay spend the row's retry budget rather than giving up on the first attempt.
+// Pair it with a one-attempt budget — see seedWithBudget — so the hand-off happens immediately.
+//
+// Call it before the relay starts.
+func (p *recoveryPublisher) refuseEveryPublish() *recoveryPublisher {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.refuseAll = true
 
 	return p
 }
@@ -1103,6 +1387,11 @@ func (p *recoveryPublisher) PublishToTopic(ctx context.Context, req PublishReque
 		// relay mark a row delivered that no broker ever saw — the one bug that would turn
 		// this suite's "no loss" assertion into a false negative.
 		return p.failed(result, err), err
+	}
+
+	if p.refusesEverything() {
+		// Checked before the delegate, so a refusing publisher never reaches a real broker.
+		return p.failed(result, errRecoveryTransportRefused), errRecoveryTransportRefused
 	}
 
 	if p.delegate != nil {
@@ -1197,6 +1486,14 @@ func (p *recoveryPublisher) record(eventID string) {
 	p.strangers++
 }
 
+// refusesEverything reports whether refuseEveryPublish was called.
+func (p *recoveryPublisher) refusesEverything() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.refuseAll
+}
+
 // recordFailure notes one failed delivery.
 func (p *recoveryPublisher) recordFailure() {
 	p.mu.Lock()
@@ -1233,6 +1530,121 @@ func (p *recoveryPublisher) counts() (int, int, int) {
 	defer p.mu.Unlock()
 
 	return len(p.published), p.strangers, p.failures
+}
+
+// ---------------------------------------------------------------------------
+// The dead-letter transport
+// ---------------------------------------------------------------------------
+
+// recoveryDeadLetterWriter is a dead-letter transport that REFUSES EVERY WRITE until it is
+// released, and records the messages it accepts afterwards.
+//
+// It stands in for the one failure that strands an event with nowhere left to go: the row has
+// spent its retry budget, so no further publish will be attempted, and the dead-letter write
+// that was supposed to preserve it did not happen. Only the raw Kafka write is substituted —
+// the message composition, the routing to `<topic>.dlt` and the transition that records the
+// terminal state are the production ones, running against the real database — so what the
+// repair is proved against is the real state machine and not a model of it.
+type recoveryDeadLetterWriter struct {
+	mu       sync.Mutex
+	attempts int
+	written  []kafka.Message
+	released bool
+}
+
+var _ deadLetterMessageWriter = (*recoveryDeadLetterWriter)(nil)
+
+// WriteMessages counts every attempt and, once released, keeps what it was handed.
+func (w *recoveryDeadLetterWriter) WriteMessages(_ context.Context, msgs ...kafka.Message) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.attempts++
+
+	if !w.released {
+		return errRecoveryDeadLetterRefused
+	}
+
+	w.written = append(w.written, msgs...)
+
+	return nil
+}
+
+// release lets subsequent writes succeed. It is idempotent, so a cleanup may call it after a
+// test already has.
+func (w *recoveryDeadLetterWriter) release() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.released = true
+}
+
+// attemptCount is how many dead-letter writes have been attempted, accepted or refused. A
+// count that keeps CLIMBING while the transport refuses is the observable proof that the
+// repair pass is finding the row again.
+func (w *recoveryDeadLetterWriter) attemptCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.attempts
+}
+
+// messages returns the dead-letter messages that were accepted.
+func (w *recoveryDeadLetterWriter) messages() []kafka.Message {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return append([]kafka.Message(nil), w.written...)
+}
+
+// deadLetterService builds the production dead-letter service over this fixture's database,
+// with writes going to the supplied transport instead of a broker.
+//
+// Parameters:
+//   - publisher TopicEventPublisher: the publisher replays would go through.
+//   - writer deadLetterMessageWriter: the transport dead-letter writes are handed to.
+//
+// Returns:
+//   - *EventDeadLetterService: the real service, wired to the real repository.
+func (f *recoveryFixture) deadLetterService(
+	publisher TopicEventPublisher,
+	writer deadLetterMessageWriter,
+) *EventDeadLetterService {
+	f.t.Helper()
+
+	return NewEventDeadLetterService(f.ds, publisher).
+		withTransport(publisher, func(string) (deadLetterMessageWriter, error) {
+			return writer, nil
+		})
+}
+
+// recoveryDeadLetterEnvelope is the part of a dead-letter message these tests read back: the
+// event it preserves and the failure metadata appended beside it.
+//
+// The envelope's other four LedgerEvent keys are asserted byte-for-byte in
+// event_replay_fidelity_test.go, so they are deliberately not re-asserted here.
+type recoveryDeadLetterEnvelope struct {
+	EventID         string                `json:"event_id"`
+	FailureMetadata model.FailureMetadata `json:"failure_metadata"`
+}
+
+// recoveryDecodeDeadLetters decodes accepted dead-letter messages, keyed by event id.
+func recoveryDecodeDeadLetters(t *testing.T, msgs []kafka.Message) map[string]model.FailureMetadata {
+	t.Helper()
+
+	preserved := make(map[string]model.FailureMetadata, len(msgs))
+
+	for index, msg := range msgs {
+		var envelope recoveryDeadLetterEnvelope
+		require.NoErrorf(t, json.Unmarshal(msg.Value, &envelope),
+			"decoding dead-letter message %d: %s", index, string(msg.Value))
+		require.NotEmptyf(t, envelope.EventID,
+			"dead-letter message %d must carry the event id it preserves", index)
+
+		preserved[envelope.EventID] = envelope.FailureMetadata
+	}
+
+	return preserved
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,16 +1756,13 @@ func recoveryRequireNoGoroutineLeak(t *testing.T, baseline int) {
 // TestEventRecovery_MidBatchRestartLosesNoEventsAndDuplicatesAreDedupableByEventID is
 // acceptance criterion V-7.
 //
-// It interrupts the relay in the MIDDLE of a claimed batch, restarts it, and asserts the two
-// halves of the guarantee separately: nothing was lost, and after de-duplicating on event_id
-// the delivered set is exactly the seeded set. It does NOT assert the broker saw each message
-// once — see the file comment for why that would be testing a promise the system does not
-// make.
+// It interrupts the relay in the MIDDLE of a claimed batch, restarts it, and asserts the two halves
+// separately: nothing was lost, and after de-duplicating on event_id the delivered set is exactly
+// the seeded set. It does NOT assert the broker saw each message once — see the file comment.
 //
-// The interruption is a CONTEXT CANCELLATION, not a Stop. Stop is a graceful drain whose
-// documented promise is to let the claimed batch finish, so a test that only stopped the
-// relay would be asserting against an orderly shutdown while claiming to test a crash.
-// Cancellation abandons the batch exactly as a killed process does.
+// The interruption is a CONTEXT CANCELLATION, not a Stop: Stop is a graceful drain that lets the
+// claimed batch finish, so stopping the relay would assert against an orderly shutdown while
+// claiming to test a crash. Cancellation abandons the batch as a killed process does.
 func TestEventRecovery_MidBatchRestartLosesNoEventsAndDuplicatesAreDedupableByEventID(t *testing.T) {
 	fixture := newRecoveryFixture(t, nil)
 
@@ -1698,19 +2107,176 @@ func TestEventRecovery_ClaimedRowIsReclaimableOnlyAfterItsLeaseExpires(t *testin
 	// must. Without this, a worker whose lease expired could mark an event dispatched that the
 	// instance which took over had not yet published.
 	stale := secondClaim[0]
-	staleErr := fixture.ds.MarkEventDispatched(ctx, stale.ID, firstTokens[stale.EventID])
+	staleErr := fixture.ds.MarkEventDispatched(ctx, stale.ID, firstTokens[stale.EventID], model.BrokerRecord{})
 	require.Error(t, staleErr,
 		"the token of a lost claim must be refused: a stale worker must not be able to mark a row the new owner holds")
 	assert.Contains(t, strings.ToLower(staleErr.Error()), "claim",
 		"the refusal must say the claim was lost rather than fail opaquely: %v", staleErr)
 
 	for _, row := range secondClaim {
-		require.NoErrorf(t, fixture.ds.MarkEventDispatched(ctx, row.ID, row.ClaimToken),
+		require.NoErrorf(t, fixture.ds.MarkEventDispatched(ctx, row.ID, row.ClaimToken, model.BrokerRecord{}),
 			"the CURRENT claim token must be able to finish event %s", row.EventID)
 	}
 
 	states := fixture.snapshot(ctx)
 	fixture.assertEveryRowFinishedCleanly(states, seededEvents)
+}
+
+// TestEventRecovery_ABatchThatOutlivesItsLeaseKeepsItAndIsNotRepublished is the other half of
+// the lease contract, and the half that is easy to get wrong: a lease must not expire under a
+// relay that is STILL HOLDING the rows it covers.
+//
+// # The defect it fails on
+//
+// The lease is taken once, when the batch is claimed. A batch can legitimately take longer than
+// it: at the shipped defaults a claim takes a hundred rows and publishes eight at a time, so it
+// runs in thirteen waves and one wave can occupy the writer's entire produce timeout. The rows
+// in the later waves therefore had their lease expire BEFORE their publish was even attempted,
+// while this relay still held them and still intended to publish them. A second instance then
+// claimed and published exactly those rows, this one published them again afterwards, and every
+// transition this one attempted failed as a lost claim. The topic got duplicates and neither
+// process logged a defect — a silent doubling of every event under a backlog, which is when it
+// matters most.
+//
+// # Why it is not tested by simply asserting a duplicate never happens
+//
+// Duplicates are LEGITIMATE on this pipeline: the file comment explains that a crash inside the
+// publish-to-mark window republishes, and that the duplicate is suppressed at the subscriber on
+// event_id. So the assertion here is deliberately stronger than the one those tests make. No
+// crash is staged, nothing is cancelled, and no lease is allowed to lapse — so a duplicate here
+// has no legitimate source, and NO EVENT MAY BE PUBLISHED TWICE BEFORE ANY IDEMPOTENCY
+// FILTERING AT ALL. That is what makes this a test of the heartbeat rather than of the
+// subscriber's obligation.
+//
+// # The shape
+//
+// Alpha claims the whole backlog in one batch under one token and then cannot finish it: its
+// publisher parks, and its concurrency of one means the rest of the batch waits behind the
+// parked publish. The batch is then held for three times its own lease — long enough that a
+// lease taken once and never renewed would have expired twice over — while beta polls
+// throughout. The assertions are that alpha's lease is still live under the SAME token with a
+// LATER expiry, that beta delivered nothing of this run's, and that once alpha is released every
+// event was published exactly once between them.
+func TestEventRecovery_ABatchThatOutlivesItsLeaseKeepsItAndIsNotRepublished(t *testing.T) {
+	fixture := newRecoveryFixture(t, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	const seededEvents = 12
+
+	seeded := fixture.seed(ctx, seededEvents)
+
+	// Frozen after one delivery with one publish parked, which is all a concurrency of one can
+	// have in flight — and enough, because what the lease is protecting is the rows QUEUED
+	// BEHIND that publish, not the publish itself.
+	alphaPublisher := newRecoveryPublisher("relay-alpha", nil, seeded).freezeAfter(1, 1)
+	betaPublisher := newRecoveryPublisher("relay-beta", nil, seeded)
+
+	baseline := runtime.NumGoroutine()
+
+	// Both relays keep the fixture's SHORT lease, unlike the concurrency test which pins the
+	// production one: here the lease expiring is precisely the hazard, so it must be short
+	// enough that the test can outlive it in seconds.
+	alpha := fixture.relay(alphaPublisher).
+		WithBatchSize(recoveryOversizedBatch).
+		WithConcurrency(1)
+	beta := fixture.relay(betaPublisher).
+		WithBatchSize(recoveryOversizedBatch)
+
+	t.Cleanup(func() {
+		alphaPublisher.release()
+		alpha.Stop()
+		beta.Stop()
+	})
+
+	alpha.Start(ctx)
+
+	_, parked := alphaPublisher.awaitFreeze(t, recoveryGateTimeout)
+	require.GreaterOrEqual(t, parked, 1,
+		"alpha must be parked inside a publish, holding a claimed batch it cannot finish")
+
+	held := fixture.heldLeases(ctx)
+	require.GreaterOrEqualf(t, len(held), 2,
+		"alpha must be holding more of this run's rows than it has published: the batch limit is %d "+
+			"against %d seeded rows, so one claim takes them all and the concurrency of one leaves the "+
+			"rest queued. Held: %d",
+		recoveryOversizedBatch, seededEvents, len(held))
+
+	tokens := recoveryClaimTokens(held)
+	require.Lenf(t, tokens, 1,
+		"the whole backlog must be held under ONE claim token, so that renewing that token renews the "+
+			"whole batch; got %d tokens", len(tokens))
+
+	for eventID, lease := range held {
+		require.Truef(t, lease.live, "event %s must be claimed under a live lease at the freeze", eventID)
+		require.Equalf(t, model.EventOutboxStatusProcessing, lease.status,
+			"event %s must be in flight at the freeze", eventID)
+	}
+
+	// Beta now polls for the whole overrun. Every poll is a claim attempt against rows whose
+	// lease alpha is renewing, and every one of them must come back with nothing of ours.
+	beta.Start(ctx)
+
+	t.Logf("holding alpha's batch of %d rows for %s, which is %.0f times its own %s lease",
+		len(held), recoveryLeaseOverrun, float64(recoveryLeaseOverrun)/float64(recoveryLease), recoveryLease)
+	time.Sleep(recoveryLeaseOverrun)
+
+	renewed := fixture.heldLeases(ctx)
+
+	for eventID, before := range held {
+		after, stillHeld := renewed[eventID]
+		require.Truef(t, stillHeld,
+			"event %s lost its claim while alpha was still holding it: after %s — %.0f leases — the "+
+				"heartbeat must have kept it. A row released here is republished by another instance "+
+				"while this one is still publishing it",
+			eventID, recoveryLeaseOverrun, float64(recoveryLeaseOverrun)/float64(recoveryLease))
+
+		assert.Equalf(t, before.claimToken, after.claimToken,
+			"event %s must still be held by the SAME claim: a different token means the row was "+
+				"re-claimed by somebody, which is the duplicate this test exists to rule out", eventID)
+
+		assert.Truef(t, after.expiry.After(before.expiry),
+			"event %s must have had its lease EXTENDED: it expired at %s and still expires at %s, so "+
+				"nothing renewed it",
+			eventID, before.expiry.UTC().Format(time.RFC3339Nano), after.expiry.UTC().Format(time.RFC3339Nano))
+
+		assert.Truef(t, after.live,
+			"event %s must still be under a live lease after %s: its expiry is %s and now is %s",
+			eventID, recoveryLeaseOverrun,
+			after.expiry.UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano))
+	}
+
+	betaDelivered, betaStrangers, betaFailures := betaPublisher.counts()
+	t.Logf("beta polled throughout the overrun and delivered %d of this run's events "+
+		"(%d other runs', %d failures)", betaDelivered, betaStrangers, betaFailures)
+	require.Zerof(t, betaDelivered,
+		"beta must not publish a single row alpha is still holding: %d of this run's events were "+
+			"published by a second instance while the first had them in flight", betaDelivered)
+
+	alphaPublisher.release()
+
+	states := fixture.waitForTerminalStates(ctx, seededEvents, recoveryDrainTimeout)
+
+	alpha.Stop()
+	beta.Stop()
+
+	fixture.assertEveryRowFinishedCleanly(states, seededEvents)
+
+	everyDelivery := append(append([]string(nil), alphaPublisher.deliveries()...), betaPublisher.deliveries()...)
+
+	// NO DUPLICATE BEFORE IDEMPOTENCY FILTERING. Unlike the restart tests, this run staged no
+	// crash and lapsed no lease, so a repeated publish has no legitimate explanation.
+	duplicated := recoveryRepeated(everyDelivery)
+	assert.Emptyf(t, duplicated,
+		"no event may be published twice when no lease was ever allowed to lapse — a subscriber's "+
+			"event_id filter is the last line of defence, not the first. Duplicated: %v", duplicated)
+
+	// AND NOTHING WAS LOST while the batch was held.
+	assert.ElementsMatch(t, seeded, recoveryUnique(everyDelivery),
+		"every seeded event must have reached the transport exactly once between the two instances")
+
+	recoveryRequireNoGoroutineLeak(t, baseline)
 }
 
 // TestEventRecovery_AttemptsSurviveRestartAndBoundTheRetryBudget walks one row through its
@@ -1766,9 +2332,10 @@ func TestEventRecovery_AttemptsSurviveRestartAndBoundTheRetryBudget(t *testing.T
 			require.Equalf(t, model.EventOutboxStatusPending, outcome.Status,
 				"a retryable failure must return the row to the claimable set (attempt %d)", attempt)
 
-			// THE BACKOFF IS PERSISTED, not slept: an immediate claim must refuse the row
-			// because it is not due yet. Without this the configured 1s/2s/4s/8s/16s schedule
-			// collapses into consecutive attempts against a broker that has barely begun to fail.
+			// THE BACKOFF IS PERSISTED, not slept: an immediate claim must refuse the row because
+			// it is not due yet. Without this the configured schedule — four waits of 1s, 2s, 4s
+			// and 8s between the five attempts — collapses into consecutive attempts against a
+			// broker that has barely begun to fail.
 			early, claimErr := fixture.ds.ClaimPendingEventOutbox(ctx, 100, recoveryLease)
 			require.NoError(t, claimErr)
 			assert.Emptyf(t, fixture.mine(early),
@@ -1816,7 +2383,7 @@ func TestEventRecovery_AttemptsSurviveRestartAndBoundTheRetryBudget(t *testing.T
 		"attempt_count":  failed.Attempts,
 	})
 	require.NoError(t, err)
-	require.NoError(t, fixture.ds.MarkEventDeadLettered(ctx, rowID, exhaustionToken, DLTFor(failed.Topic), metadata),
+	require.NoError(t, fixture.ds.MarkEventDeadLettered(ctx, rowID, exhaustionToken, DLTFor(failed.Topic), metadata, model.BrokerRecord{}),
 		"the worker that spent the last attempt holds the token, so it must be able to complete the hand-off")
 
 	states := fixture.snapshot(ctx)
@@ -1918,13 +2485,144 @@ func TestEventRecovery_ConcurrentRelaysShareTheBacklogWithoutDoubleProcessing(t 
 	recoveryRequireNoGoroutineLeak(t, baseline)
 }
 
+// ---------------------------------------------------------------------------
+// Dead-letter preservation — recovering the last resort
+// ---------------------------------------------------------------------------
+
+// TestEventRecovery_ADeadLetterWriteThatFailedIsRetriedUntilTheEventIsPreserved covers the one
+// recovery path that has no retry budget behind it, because there is nothing further to fall
+// back to.
+//
+// # The limbo it ends
+//
+// When a row spends its retry budget the relay hands it to the dead-letter writer, which writes
+// the event to its `<topic>.dlt` sibling and only then records the terminal state. If that WRITE
+// fails — no transport, a broker outage, a topic that does not exist yet — the row is left at
+// 'failed' with dlt_topic still NULL, and that was a dead end in three directions at once: the
+// ordinary claim predicate admits only attempts < max_attempts, so it will never take the row
+// again; replay accepts only 'dead_lettered', so an operator cannot re-drive it; and the worker
+// holding the claim token had already moved on. The event existed ONLY as that row. It appeared
+// in the dead-letter inventory — the listing covers 'failed' as well as 'dead_lettered' precisely
+// so it would — and absolutely nothing in the system would ever act on it again.
+//
+// # What is real here and what is substituted
+//
+// Only the raw Kafka write is substituted. The exhaustion arm, the claim that finds the stranded
+// row, the message composition, the routing and the transition that records preservation are all
+// the production code paths running against the real database, which is the point of asserting
+// this here rather than only against a fake store: the repair depends on a claim predicate that
+// deliberately admits a status the ordinary claim excludes, and that is a property of SQL.
+//
+// # Why the reproduction is asserted before the repair
+//
+// The limbo state is asserted while the transport is still refusing, because a test that only
+// checked the end state would pass just as happily against a build where the first dead-letter
+// write never failed at all — proving nothing about the repair. The refusal is held open rather
+// than counted down for the same reason: the window would otherwise be a race.
+func TestEventRecovery_ADeadLetterWriteThatFailedIsRetriedUntilTheEventIsPreserved(t *testing.T) {
+	fixture := newRecoveryFixture(t, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	const seededEvents = 2
+
+	seeded := fixture.seedWithBudget(ctx, seededEvents, recoverySpentBudget)
+
+	publisher := newRecoveryPublisher("relay-dead-letter", nil, seeded).refuseEveryPublish()
+	writer := &recoveryDeadLetterWriter{}
+
+	baseline := runtime.NumGoroutine()
+
+	relay := fixture.relay(publisher).WithBatchSize(recoveryOversizedBatch)
+	// The production service over the production repository, with the broker replaced. Assigned
+	// after construction because NewEventRelayProcessor builds its own from the publisher, which
+	// would resolve to no transport at all here and fail the write for the wrong reason.
+	relay.deadLetters = fixture.deadLetterService(publisher, writer)
+
+	t.Cleanup(func() {
+		writer.release()
+		relay.Stop()
+	})
+
+	relay.Start(ctx)
+
+	// STEP 1 — the hazard is reproduced. Every row spends its budget on its first publish and
+	// its dead-letter write is refused, so each one lands in the limbo described above.
+	for _, eventID := range seeded {
+		state := fixture.awaitRow(ctx, eventID, func(state recoveryRowState) bool {
+			return state.status == model.EventOutboxStatusFailed && state.dltTopic == ""
+		}, recoveryGateTimeout, "spend its retry budget with its dead-letter write refused")
+
+		require.Truef(t, state.unclaimable(),
+			"event %s must be in the state this test exists to recover from — a spent budget "+
+				"(%d/%d) with no dead-letter record — or the repair is not being exercised at all",
+			eventID, state.attempts, state.maxAttempts)
+
+		assert.Containsf(t, state.lastError, errRecoveryTransportRefused.Error(),
+			"event %s must record WHY its budget was spent: that reason is what the dead-letter "+
+				"metadata has to report when the preservation is finally retried", eventID)
+	}
+
+	// STEP 2 — the relay keeps coming back for it. More write attempts than there are rows can
+	// only come from the repair pass re-claiming rows the ordinary claim will never admit again.
+	require.Eventuallyf(t, func() bool {
+		return writer.attemptCount() > seededEvents
+	}, recoveryGateTimeout, recoveryStateInterval,
+		"the relay must retry the dead-letter write of a row whose preservation failed: %d rows were "+
+			"handed off and only %d writes have been attempted, so nothing is re-claiming them",
+		seededEvents, writer.attemptCount())
+
+	t.Logf("the dead-letter transport refused %d writes before being released", writer.attemptCount())
+
+	// STEP 3 — with the transport back, the repair completes through the ordinary transition.
+	writer.release()
+
+	states := fixture.waitForTerminalStates(ctx, seededEvents, recoveryDrainTimeout)
+
+	relay.Stop()
+
+	fixture.assertEveryRowWasPreserved(states, seededEvents, DLTFor(fixture.topic))
+
+	// The inventory an operator triages from must still list every one of them, now with a
+	// dead-letter record behind it rather than nothing at all.
+	for _, state := range states {
+		assert.Truef(t, fixture.inDeadLetterInventory(ctx, state.eventID),
+			"event %s must remain in the dead-letter inventory after being preserved", state.eventID)
+	}
+
+	// The metadata must report WHAT ENDED THE EVENT'S RETRY BUDGET, not the repair. The repair
+	// rebuilds the cause from the row's own last_error precisely so that an operator reading the
+	// dead-letter message learns why the event failed rather than that it was recovered.
+	preserved := recoveryDecodeDeadLetters(t, writer.messages())
+
+	for _, eventID := range seeded {
+		metadata, ok := preserved[eventID]
+		require.Truef(t, ok,
+			"event %s must have reached its dead-letter topic; preserved: %d of %d",
+			eventID, len(preserved), seededEvents)
+
+		assert.Containsf(t, metadata.ErrorReason, errRecoveryTransportRefused.Error(),
+			"the dead-letter metadata of event %s must report the publish failure that spent its "+
+				"budget, not the dead-letter write that was retried", eventID)
+		assert.Equalf(t, fixture.topic, metadata.OriginalTopic,
+			"the dead-letter metadata of event %s must name the topic a replay has to send it back to",
+			eventID)
+		assert.Equalf(t, recoverySpentBudget, metadata.AttemptCount,
+			"the dead-letter metadata of event %s must report the attempts the database recorded",
+			eventID)
+	}
+
+	recoveryRequireNoGoroutineLeak(t, baseline)
+}
+
 // TestEventRecovery_EventIDIsUniqueInTheOutbox asserts the index that makes event_id a
 // trustworthy idempotency key.
 //
-// The whole recovery story rests on it: duplicates are permitted on the wire precisely because
-// a subscriber can suppress them on event_id, and that is only sound if one event is recorded
-// once. Were the column merely conventional, a re-captured event could enter the outbox twice
-// with two different ids and no amount of consumer-side de-duplication would help.
+// The index bounds recapture only as far as the ID is stable. A capture whose id is DERIVED from
+// the mutation collides here and is refused; one that mints a random id — the repeatable event
+// types do — enters as a distinct row that no consumer-side de-duplication can collapse. That is
+// why the derived-id rule in model.EventIdentityFor matters as much as this index does.
 func TestEventRecovery_EventIDIsUniqueInTheOutbox(t *testing.T) {
 	fixture := newRecoveryFixture(t, nil)
 
@@ -2000,16 +2698,36 @@ func TestEventRecovery_MidBatchRestartDeliversEveryEventToKafka(t *testing.T) {
 			"provisioning script; no credential is defaulted in this test.")
 	}
 
+	// The publisher authenticates as its OWN principal, never as the administrator, so the
+	// producer pair is required in addition to the administrative one. Skipping rather than
+	// failing keeps the suite green on a machine that has a broker but has not provisioned a
+	// producer, while still refusing to run the test in a configuration no deployment may use.
+	producerUser, producerSecret, producerPresent := recoveryProducerCredentials()
+	if !producerPresent {
+		t.Skip("skipping the live-broker recovery test: KAFKA_SASL_USER and KAFKA_SASL_SECRET must be set. " +
+			"Blnk refuses to publish as the administrative principal, so a dedicated producer principal with " +
+			"Write and Describe on the Blnk-owned topics is required; scripts/kafka-provision.sh creates one " +
+			"for the local stack.")
+	}
+
 	brokers := recoveryBrokers()
 	require.NotEmpty(t, brokers, "KAFKA_BROKERS resolved to nothing")
 	for _, broker := range brokers {
 		recoveryRequireReachable(t, "the Kafka broker", broker,
-			"Start it with `docker compose up -d kafka kafka-init`, or point KAFKA_BROKERS at a reachable broker.")
+			"Start it with `docker compose --profile kafka up -d kafka kafka-init` — the two services sit "+
+				"behind the \"kafka\" profile, so a bare `docker compose up` starts neither — or point "+
+				"KAFKA_BROKERS at a reachable broker.")
 	}
 
 	fixture := newRecoveryFixture(t, &config.KafkaConfig{
-		Brokers:         brokers,
-		TopicPrefix:     DefaultTopicPrefix,
+		Brokers:     brokers,
+		TopicPrefix: DefaultTopicPrefix,
+		// Two principals, and which one is used is decided by the ROLE of the client being
+		// built: the admin client below resolves the administrative pair, the publisher
+		// resolves the producer pair. Supplying both is what lets one configuration drive
+		// both halves of this test exactly as a deployment does.
+		SASLUser:        producerUser,
+		SASLSecret:      producerSecret,
 		SASLAdminUser:   user,
 		SASLAdminSecret: secret,
 		MinPartitions:   6,

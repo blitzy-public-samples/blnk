@@ -33,13 +33,16 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
-// event_subscriber.go is the subscriber registry and the one-time credential issuance
-// behind POST /subscribers/{id}/kafka-credentials (requirement R-7).
+// event_subscriber.go is the subscriber registry and the one-time credential issuance behind
+// POST /subscribers/{id}/kafka-credentials (requirement R-7).
 //
 // # The access model, stated once
 //
-// THERE ARE NO PER-TENANT TOPICS. Every subscriber reads the same four category topics
-// that event_topics.go names, and isolation comes from four things instead:
+// THERE ARE NO PER-TENANT TOPICS. Blnk owns four category topics and a `.dlt` sibling for each
+// (event_topics.go); three of those categories are SUBSCRIBER-FACING — transactions, balances
+// and identities — while system is INTERNAL and no subscriber may be granted it, nor any
+// dead-letter topic. A subscriber is granted a SUBSET of the grantable set,
+// whatever its registry row authorises, and isolation comes from four things:
 //
 //  1. The KAFKA PRINCIPAL. Each subscriber is a distinct SASL/SCRAM identity derived
 //     from its immutable subscriber id, so one subscriber's credential can never
@@ -51,62 +54,65 @@ import (
 //  3. The CONSUMER GROUP namespace, granted with a PREFIXED pattern so the subscriber
 //     may run several groups of its own without an administrative round trip, while
 //     every other subscriber's namespace stays out of reach.
-//  4. The PARTITION-KEY PREFIX, which is ADVISORY ONLY. Kafka's authorizer has no
-//     message-key dimension, so this narrows what a subscriber WANTS to read and never
-//     what it CAN read. Nothing here or anywhere else may treat it as a boundary.
+//
+// Those three are the whole boundary, and each of them is something the broker evaluates
+// on every request. The grant is also RECONCILED rather than accumulated: every issuance
+// and every authorization change reads the principal's live bindings and deletes the ones
+// the current authorization no longer implies, so narrowing a subscriber actually narrows
+// it at the broker instead of leaving the union of everything it was ever granted.
+//
+// THE PARTITION-KEY PREFIX IS NOT A FOURTH MECHANISM. Kafka's authorizer has no
+// message-key dimension, so no ACL can confine a subscriber to a slice of a topic by key.
+// A row that records one is therefore recording an authorization narrower than any
+// credential this service can mint — so ISSUANCE REFUSES for that row rather than handing
+// back whole-topic access under a registry that says otherwise. Calling the field
+// "advisory" was the more dangerous framing: a qualification in a comment does not survive
+// somebody reading the registry to decide who can see what, and a refused issuance does.
 //
 // Creating a topic per subscriber would be the obvious alternative and it is the wrong
 // one: it multiplies the partition count and the ordering guarantee by the number of
 // subscribers, and it makes adding a subscriber a topic-provisioning event rather than a
-// credential one.
+// credential one. It is, however, the answer if per-key isolation is genuinely required —
+// see model.EventSubscriber's documentation, which names it and the filtering-gateway
+// alternative.
 //
 // # SECRET HANDLING IS THE POINT OF THIS FILE
 //
-// The generated SASL password is returned to the caller EXACTLY ONCE, in the
-// SubscriberCredential value that IssueSubscriberCredential produces, and it is
-// persisted NOWHERE. Only a non-reversible reference (model.DeriveCredentialReference)
-// and the issuance instant are stored, which is the same posture as blnk.api_keys where
-// the stored value is a bcrypt hash and the raw key is never kept.
+// The generated SASL password is returned ONLY BY ISSUANCE, in the SubscriberCredential value
+// IssueSubscriberCredential produces, and it is PERSISTED NOWHERE. Only a non-reversible
+// reference (model.DeriveCredentialReference) and the issuance instant are stored — the same
+// posture as blnk.api_keys, where the stored value is a bcrypt hash and the raw key is never
+// kept.
 //
-// There is deliberately NO code path — no getter, no list projection, no log line, no
-// error message, no trace attribute and no metric label — through which the password can
-// be read back. A lost password can only be REPLACED by issuing a new one, never
-// recovered. If a future change adds a "convenience" accessor that returns a stored
-// secret, it is wrong twice over: the value it would read does not exist in the schema
-// (blnk.event_subscribers has no column capable of holding one), and its existence would
-// undo the guarantee this file is written to keep.
+// Password() reads that in-memory value and may be called as often as the caller likes while
+// the value lives; what does not exist is any route to obtain the secret AFTERWARDS. Nothing
+// reads it back from storage, no list projection, log line, error message, trace attribute or
+// metric label carries it, and blnk.event_subscribers has no column capable of holding one. A
+// lost password can only be REPLACED by issuing a new one.
 //
-// # The legacy webhook columns, and what /hooks is not (AMBIGUITY-1)
+// # The legacy webhook columns, and what /hooks is not
 //
-// A subscriber row carries a legacy webhook_url and a migrated_at timestamp FOR THE
-// DUAL-RUN WINDOW ONLY. They exist because the requirement to migrate existing
-// subscribers off "the webhook subscription REST API" meets a repository in which no such
-// API exists: the entire subscription surface today is one global
-// WebhookConfig{Url, Headers} value in the configuration, consumed by processHTTP in
-// webhooks.go, with no per-subscriber URL storage and no registration endpoint anywhere.
-// Recording a legacy URL per subscriber is what gives an already-webhooked subscriber
-// somewhere to be recorded and migrated FROM, and it is what makes the 410 Gone sunset
-// behaviour observable at all — without a subscription surface there is no route on which
-// a 410 could ever be seen.
+// A subscriber row carries a legacy webhook_url and a migrated_at timestamp FOR THE DUAL-RUN
+// WINDOW ONLY: they record where a subscriber used to receive pushes and when it finished
+// moving, which is what gives an already-webhooked subscriber somewhere to be migrated from
+// and what makes the 410 Gone sunset behaviour observable on a route at all.
 //
 // /hooks IS NOT THAT SURFACE AND IS UNTOUCHED. Those are the PRE_TRANSACTION and
-// POST_TRANSACTION request-time callouts in internal/hooks: synchronous interception with
-// a response contract that can influence transaction processing. They remain fully
-// functional, they are out of scope for the sunset, and they have nothing to do with this
-// file.
+// POST_TRANSACTION request-time callouts in internal/hooks — synchronous interception with a
+// response contract that can influence transaction processing. They stay fully functional and
+// have nothing to do with this file.
 //
 // # What is deliberately NOT here
 //
 //   - NO SQL. database/event_subscriber.go owns every statement; this file delegates.
-//   - NO HTTP handling and NO master-key gating. api/subscribers.go owns those, following
-//     the ensureHookManagementAuthorized pattern in api/hooks.go.
-//   - NO direct Kafka admin calls. Everything broker-side goes through event_admin.go so
-//     there is exactly one authenticated administrative client and one place where a
-//     credential or an ACL is written.
+//   - NO HTTP handling and NO master-key gating. api/subscribers.go owns those, following the
+//     ensureHookManagementAuthorized pattern in api/hooks.go.
+//   - NO direct Kafka admin calls. Everything broker-side goes through event_admin.go, so
+//     there is one authenticated administrative client and one place where a credential or an
+//     ACL is written.
 //   - NO CONSUMER of any kind: no consumer library, no consumer error handling and no
-//     subscriber-side dead-lettering. Blnk publishes the `<topic>.dlt` naming convention
-//     in docs/event-streaming.md and stops there; what a subscriber does with a failed
-//     record is the subscriber's own concern.
+//     subscriber-side dead-lettering. Blnk publishes the `<topic>.dlt` naming convention in
+//     docs/event-streaming.md and stops there.
 
 // SubscriberCredentialIssuanceBudget is the hard wall-clock ceiling on one credential
 // issuance, and it is a REQUIREMENT rather than a tuning knob (R-7).
@@ -133,25 +139,14 @@ const SubscriberCredentialIssuanceBudget = 5 * time.Second
 // short secret is open — a Kafka SASL handshake has no rate limit and no lockout.
 const generatedSubscriberPasswordLength = 48
 
-// subscriberPasswordAlphabet is the alphabet a generated secret is drawn from.
+// subscriberPasswordAlphabet is the alphabet a generated secret is drawn from:
+// alphanumerics only, deliberately.
 //
-// It is unreserved printable ASCII — letters and digits only — and each exclusion is a
-// correctness requirement rather than a style preference:
-//
-//   - Nothing outside 0x21-0x7E, because a SCRAM client applies SASLprep to the password
-//     before proving knowledge of it while the broker stores a value derived from the
-//     bytes it was handed. Outside printable ASCII the two can differ, and the result is a
-//     credential that authenticates for nobody with an error indistinguishable from a
-//     wrong password. validateSCRAMPassword in event_admin.go refuses such a value; this
-//     generator cannot produce one.
-//   - No SPACE, no QUOTES and no SHELL METACHARACTERS, because the secret's whole life is
-//     spent being pasted into client configuration: a JAAS sasl.jaas.config string, a
-//     librdkafka property file, a Kubernetes secret, an environment variable, a docker
-//     compose file. Every one of those has a quoting story, and a secret that survives all
-//     of them unquoted is a secret an operator cannot corrupt by accident.
-//
-// The alphabet is 62 characters, which is NOT a power of two, so the draw below must
-// reject modulo bias rather than mask bits — see generateSubscriberPassword.
+// A SASL/SCRAM password travels through several parsers that treat punctuation specially —
+// a JAAS configuration string, a Java properties file, a shell command line in a runbook, a
+// Compose environment file — and a secret containing a quote, a backslash or a dollar sign
+// breaks one of them in a way that reads as a wrong password rather than as a quoting bug.
+// Length carries the entropy instead; see generatedSubscriberPasswordLength.
 const subscriberPasswordAlphabet = "abcdefghijklmnopqrstuvwxyz" +
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
 	"0123456789"
@@ -175,6 +170,87 @@ const subscriberPasswordGenerationAttempts = 8
 var errSubscriberStoreUnavailable = errors.New(
 	"event subscriber: no datasource is configured, so the subscriber registry is unavailable",
 )
+
+// SubscriberErrorDetail is the detail attached to a typed API error whose cause came from
+// outside Blnk — the Kafka client, the database driver, or the TLS material on disk.
+//
+// # DATA-01: a sanitized log is not a boundary if the raw cause is returned anyway
+//
+// The service was already careful with its logs: every failure path builds fields through
+// sanitizeLogValue before writing them. It then handed the RAW cause to
+// apierror.NewAPIError, and that function does two things with what it is given —
+// `logrus.WithField("details", details).Error("API error")` and
+// `Details interface{} \`json:"details,omitempty"\“ on the returned struct. So the raw
+// cause was logged a second time, unsanitized, and serialised into the HTTP RESPONSE. The
+// sanitizer was bypassed on both sides at once, and the response side is the more serious of
+// the two because it leaves the deployment.
+//
+// What those causes actually contain is the reason this matters:
+//
+//   - A KAFKA CLIENT error renders as "write tcp 10.0.0.4:34918->10.0.0.7:9092: broken pipe",
+//     naming internal addresses and broker topology. *net.OpError is a struct with exported
+//     Op, Net and Addr fields, so marshalling one into a JSON response publishes them as
+//     structured data rather than merely as text.
+//   - A POSTGRES error renders with the schema, table, column, constraint, source file and
+//     routine that produced it.
+//   - A TLS MATERIAL error names a filesystem path inside the container.
+//
+// None of that is knowledge an API caller needs, and all of it is a map of the deployment's
+// interior handed to whoever provisioned a subscriber.
+//
+// # What replaces it
+//
+// Fixed wording chosen at the call site, the caller's OWN subscriber identifier — which they
+// supplied and which is therefore not a disclosure — and the small set of state flags that
+// tell the caller what to do next. The cause is not discarded, only redirected: the call site
+// logs it, bounded through sanitizeLogValue, so an operator keeps the broker's exact words
+// while the caller receives the diagnosis and nothing else.
+//
+// This mirrors EventTransportErrorDetail in event_publisher.go, which is the established
+// pattern for the same problem on the publish path.
+type SubscriberErrorDetail struct {
+	// Reason states what failed, in fixed wording. It never interpolates the cause.
+	Reason string `json:"reason"`
+
+	// SubscriberID is the caller's own handle, and what an operator needs to find the
+	// registry row and the log line. Bounded because it reaches a response body.
+	SubscriberID string `json:"subscriber_id,omitempty"`
+
+	// Retryable reports whether repeating the request may succeed, which is the actionable
+	// half of the diagnosis. It is stated by the call site rather than inferred, because
+	// only the call site knows whether the operation is idempotent.
+	Retryable bool `json:"retryable"`
+
+	// CredentialWritten and Compensated describe what reached the BROKER, and they are the
+	// two facts a caller cannot otherwise learn. Together they say whether a secret may
+	// exist that the caller does not hold: written-and-compensated means the broker is
+	// clean, written-and-not-compensated means a principal exists that needs attention.
+	CredentialWritten bool `json:"credential_written,omitempty"`
+	Compensated       bool `json:"compensated,omitempty"`
+}
+
+// NewSubscriberErrorDetail builds a bounded subscriber-failure detail.
+//
+// The cause is deliberately NOT a parameter. Excluding it from the signature is what makes
+// the guarantee structural rather than a matter of care at each call site: there is no way to
+// pass a cause in, so no rendering of the result — as JSON, with %v, or field by field — can
+// contain one.
+//
+// Parameters:
+//   - reason string: fixed wording describing the failure.
+//   - subscriberID string: the caller's identifier. Bounded here so a call site cannot
+//     forget to.
+//   - retryable bool: whether repeating the request may succeed.
+//
+// Returns:
+//   - SubscriberErrorDetail: the safe detail.
+func NewSubscriberErrorDetail(reason, subscriberID string, retryable bool) SubscriberErrorDetail {
+	return SubscriberErrorDetail{
+		Reason:       reason,
+		SubscriberID: sanitizeLogValue(subscriberID, maxLoggedFilterLength),
+		Retryable:    retryable,
+	}
+}
 
 // eventSubscriberStore is the persistence surface this service needs, and nothing more.
 //
@@ -223,6 +299,20 @@ type eventSubscriberStore interface {
 	// PurgeMigratedSubscriberWebhookURLs erases the legacy URL of every subscriber whose
 	// migration completed strictly before the cut-off, returning how many rows changed.
 	PurgeMigratedSubscriberWebhookURLs(ctx context.Context, migratedBefore time.Time) (int64, error)
+
+	// MarkSubscriberRevocationPending stamps the revocation tombstone and returns the row,
+	// so deregistration can revoke at the broker while the row that names the principal
+	// still exists.
+	MarkSubscriberRevocationPending(ctx context.Context, subscriberID string, pendingAt time.Time) (*model.EventSubscriber, error)
+
+	// ClaimSubscriberForProvisioning fences a subscriber for one issuance or revocation,
+	// returning the token the claim is held under and a conflict when somebody else holds
+	// it. Nothing may touch the broker for a subscriber without holding its claim.
+	ClaimSubscriberForProvisioning(ctx context.Context, subscriberID string, lease time.Duration) (string, error)
+
+	// ReleaseSubscriberProvisioningFence clears a claim the caller still holds, so a retry
+	// after a fast failure need not wait out the lease.
+	ReleaseSubscriberProvisioningFence(ctx context.Context, subscriberID string, token string) error
 }
 
 // subscriberPrincipalProvisioner is the administrative surface credential issuance needs.
@@ -252,6 +342,16 @@ type subscriberPrincipalProvisioner interface {
 	// RevokeSubscriber removes a subscriber's ACL bindings and then its SCRAM credential,
 	// ending its access at the broker.
 	RevokeSubscriber(ctx context.Context, subscriber *model.EventSubscriber) error
+
+	// PruneSubscriberAccess removes the broker-side grants a subscriber's recorded
+	// authorization no longer implies. An authorization change calls it BEFORE persisting,
+	// so a narrowing is in force at the broker before the registry claims it is.
+	PruneSubscriberAccess(ctx context.Context, subscriber *model.EventSubscriber) (SubscriberACLReconciliation, error)
+
+	// GrantSubscriberAccess creates the grants the recorded authorization implies. An
+	// authorization change calls it AFTER persisting, so a widening reaches the broker only
+	// once the registry records it.
+	GrantSubscriberAccess(ctx context.Context, subscriber *model.EventSubscriber) (SubscriberACLReconciliation, error)
 
 	// Close releases the client's pooled connections.
 	Close() error
@@ -305,8 +405,9 @@ type SubscriberRegistration struct {
 	// validateSubscriberGrant.
 	AuthorizedTopics []string
 
-	// PartitionKeyPrefix is an ADVISORY consumer-side filter hint, not a restriction on
-	// what the subscriber can read. Nil means none was requested.
+	// PartitionKeyPrefix records a key-scoped constraint Kafka CANNOT enforce, so a
+	// subscriber registered with one is UNPROVISIONABLE: issuance refuses until it is
+	// cleared. Nil, the ordinary case, means no such constraint.
 	PartitionKeyPrefix *string
 
 	// WebhookURL records the legacy HTTP endpoint a migrating subscriber received pushes
@@ -318,10 +419,11 @@ type SubscriberRegistration struct {
 // SubscriberUpdate is the mutable subset of a registered subscriber.
 //
 // Every field is nilable so that "omitted" is distinguishable from "explicitly cleared",
-// which this shape needs rather than merely benefits from: a nil PartitionKeyPrefix means
-// the subscriber is entitled to whole topics, while a present empty string means it has
-// asked to filter on the empty prefix. A plain string cannot express the difference, so it
-// would make silently inverting an operator's intent possible.
+// which this shape needs rather than merely benefits from: an omitted PartitionKeyPrefix
+// leaves whatever the row records, while a present empty string CLEARS the constraint — and
+// clearing it is what makes an unprovisionable subscriber provisionable again. A plain string
+// cannot express the difference, so it would make silently inverting an operator's intent
+// possible.
 //
 // The principal, the consumer group, the credential record and the migration instant are
 // all absent for the reasons api/model.UpdateSubscriber sets out: the first two are derived
@@ -338,17 +440,24 @@ type SubscriberUpdate struct {
 	// A slice is already nilable, so no pointer is needed to tell "omitted" from "set to
 	// empty".
 	//
-	// CHANGING THIS ROW DOES NOT CHANGE WHAT THE SUBSCRIBER CAN READ TODAY. The row is the
-	// record of intent that the NEXT credential issuance provisions from. Widening takes
-	// effect when credentials are re-issued. NARROWING needs more than that: ACL creation
-	// is additive and idempotent, so a binding for a topic that has been removed from this
-	// list stands until it is explicitly deleted — which revocation does. A reduction is
-	// therefore completed by revoking the subscriber's access and re-issuing, never by
-	// editing this list alone.
+	// CHANGING THIS LIST CHANGES WHAT THE SUBSCRIBER CAN READ, and it does so at the broker
+	// as part of the update rather than at the next issuance.
+	//
+	// UpdateSubscriber reconciles the broker-side grant in three steps around the write:
+	// the bindings the new list no longer implies are DELETED first, the row is persisted
+	// second, and the bindings it adds are created third. That order is what keeps every
+	// partial failure fail-closed — a narrowing is in force before the registry claims it,
+	// and a widening reaches the broker only after the registry records it.
+	//
+	// It used to be additive only, so a topic removed from this list kept its Read and
+	// Describe bindings until somebody revoked the whole subscriber: the registry said the
+	// access was gone and the subscriber kept consuming, with nothing failing to say so.
 	AuthorizedTopics []string
 
-	// PartitionKeyPrefix replaces the advisory filter hint when non-nil; a present empty
-	// string clears it. It grants and revokes nothing.
+	// PartitionKeyPrefix replaces the recorded key constraint when non-nil; a present empty
+	// string CLEARS it. It grants and revokes nothing at the broker — what it does is decide
+	// whether a credential can be issued at all, because Kafka cannot enforce a key scope
+	// and this service refuses to pretend otherwise.
 	PartitionKeyPrefix *string
 
 	// WebhookURL replaces the recorded legacy endpoint when non-nil; a present empty
@@ -361,25 +470,22 @@ type SubscriberUpdate struct {
 // needs to start consuming, and the ONLY place in this package where a plaintext SASL
 // secret exists.
 //
-// # The secret is returned once and lives only in this value
+// # The secret is returned by issuance and lives only in this value
 //
-// The plaintext is held in an UNEXPORTED field of the redacting SubscriberSecret type and
-// is reachable through exactly one accessor, Password. That is the one-time hand-over the
-// requirement describes, and it is the only route: nothing persists the value, no reader
-// returns it, and blnk.event_subscribers has no column capable of holding it. A subscriber
-// that loses its password can only be issued a new one.
+// The plaintext is held in an UNEXPORTED field of the redacting SubscriberSecret type and is
+// reachable through one accessor, Password, which reads this in-memory value and may be called
+// as often as the holder likes while the value lives. What does not exist is a route to obtain
+// the secret afterwards: nothing persists it, no reader returns it, and blnk.event_subscribers
+// has no column capable of holding it. A subscriber that loses its password can only be issued
+// a new one.
 //
 // # Why every rendering is redacted
 //
-// Format, String and GoString all render a redacted summary, so `%v`, `%+v`, `%#v`, `%s`
-// and `%q` on this value — the shapes a log line, a test failure message or a panic trace
-// actually take — cannot print the secret. fmt consults a Formatter before it considers
-// descending into fields, which is what makes the guarantee total rather than
-// verb-by-verb: an unexported field of a redacting type would otherwise be printed by
-// `%+v` as its raw contents, because fmt cannot call methods on a field it cannot take the
-// interface of. encoding/json is safe for the same structural reason — it skips unexported
-// fields — so no MarshalJSON is needed here and none should be added, since a hand-rolled
-// one would have to be kept in step with every future field.
+// Format, String and GoString all render a redacted summary, so `%v`, `%+v`, `%#v`, `%s` and
+// `%q` — the shapes a log line, a test failure message or a panic trace actually take — cannot
+// print the secret. fmt consults a Formatter before descending into fields, which is what makes
+// that total rather than verb-by-verb. encoding/json is safe for the same structural reason: it
+// skips unexported fields, so no MarshalJSON is needed here and none should be added.
 //
 // LogFields is the safe way to log an issuance; it is composed of non-secret values only.
 type SubscriberCredential struct {
@@ -429,19 +535,16 @@ type SubscriberCredential struct {
 	password SubscriberSecret
 }
 
-// Password reveals the generated secret, and is the ONE place it can be read.
+// Password reveals the generated secret, and is the ONE place it can be read from.
 //
-// It exists because the credential endpoint has to put the secret in its response body
-// exactly once; there is no other legitimate caller. It reads the value out of this
-// in-memory result — it does NOT read anything back from storage, and it cannot, because
-// nothing was stored.
+// It exists because the credential endpoint has to put the secret in its response body; there
+// is no other legitimate caller. It reads the value out of this in-memory result — it does NOT
+// read anything back from storage, and it cannot, because nothing was stored. Repeated calls
+// return the same value for as long as the result lives; the guarantee is non-persistence and
+// non-retrievability, not a single read.
 //
-// Call it once, hand the value to the response, and let it go. Do not log it, do not put it
-// in an error, do not attach it to a span, and do not keep it: the moment the response is
-// written the plaintext should exist nowhere in the process.
-//
-// Returns:
-//   - string: the plaintext SASL/SCRAM password, or "" on a zero value.
+// Hand the value to the response and let it go. Do not log it, do not put it in an error, do
+// not attach it to a span, and do not keep it.
 func (c SubscriberCredential) Password() string {
 	return c.password.reveal()
 }
@@ -464,9 +567,6 @@ func (c SubscriberCredential) PasswordLength() int {
 // keyed digest, the topics and the group are already public to the subscriber, and the
 // password appears only as its LENGTH. Logging through this rather than the struct is what
 // keeps an issuance auditable without making it disclosable.
-//
-// Returns:
-//   - logrus.Fields: the fields to log an issuance with.
 func (c SubscriberCredential) LogFields() logrus.Fields {
 	return logrus.Fields{
 		"subscriber":              sanitizeLogValue(c.SubscriberID, maxLoggedFilterLength),
@@ -482,9 +582,6 @@ func (c SubscriberCredential) LogFields() logrus.Fields {
 }
 
 // String renders the redacted summary, so a Stringer-aware caller cannot print the secret.
-//
-// Returns:
-//   - string: an identifying, secret-free description.
 func (c SubscriberCredential) String() string {
 	return fmt.Sprintf(
 		"SubscriberCredential{subscriber:%s principal:%s group:%s topics:%d mechanism:%s "+
@@ -496,9 +593,6 @@ func (c SubscriberCredential) String() string {
 
 // GoString renders the same redacted summary for %#v, which would otherwise print the
 // struct literal including the unexported field's contents.
-//
-// Returns:
-//   - string: an identifying, secret-free description.
 func (c SubscriberCredential) GoString() string {
 	return c.String()
 }
@@ -518,9 +612,11 @@ func (c SubscriberCredential) Format(state fmt.State, _ rune) {
 
 // EventSubscriberService owns the subscriber registry and credential issuance.
 //
-// One instance is enough for a process and it is safe for concurrent use: the store, the
-// clock, the generator and the budget are read-only after construction, and the lazily
-// resolved administrative client is guarded by a mutex.
+// One instance is enough for a process. It is safe for concurrent USE once configured: the
+// store, the clock, the generator and the budget are read-only after construction, and the
+// lazily resolved administrative client is guarded by a mutex. The fluent configurators are
+// NOT synchronised, so configuration must be complete before the service is shared — they must
+// not race an operation in flight.
 //
 // The administrative client may be INJECTED or RESOLVED. Inject the process's own client —
 // as the metrics collector's caller does in cmd/server.go — when one already exists, so
@@ -570,24 +666,9 @@ type EventSubscriberService struct {
 
 // NewEventSubscriberService builds the subscriber registry service.
 //
-// A nil store is accepted rather than rejected, following NewEventDeadLetterService:
-// construction is not where that becomes a problem, and every operation reports it with a
-// clear error. That keeps this constructor free of an error return for a case no production
-// caller reaches.
-//
-// A nil admin is likewise accepted and means "resolve one from configuration when
-// issuance first needs it". Registry reads and writes never need one at all, so a
-// deployment with no Kafka can register, list and update subscribers exactly as it can
-// without this feature — only issuance itself reports ErrKafkaUnavailable.
-//
-// Parameters:
-//   - store eventSubscriberStore: the repository. database.IDataSource satisfies it. May
-//     be nil.
-//   - admin subscriberPrincipalProvisioner: the administrative client, or nil to resolve
-//     one lazily. KafkaAdmin satisfies it.
-//
-// Returns:
-//   - *EventSubscriberService: a ready service.
+// The store may be nil — NewBlnk(nil) is a supported construction — and every operation then
+// reports a typed unavailability error rather than dereferencing nil. The administrative client
+// is resolved lazily unless one is injected; see the type's documentation for which to prefer.
 func NewEventSubscriberService(
 	store eventSubscriberStore,
 	admin subscriberPrincipalProvisioner,
@@ -621,13 +702,7 @@ func NewEventSubscriberService(
 // Production must not call this. It exists so a test can assert that the budget is enforced
 // without waiting five seconds, and so an operator running against a deliberately slow
 // staging broker can be given a longer, explicitly chosen ceiling.
-//
-// Parameters:
-//   - budget time.Duration: the new ceiling. Non-positive restores
-//     SubscriberCredentialIssuanceBudget.
-//
-// Returns:
-//   - *EventSubscriberService: the service, for chaining.
+// A non-positive budget restores SubscriberCredentialIssuanceBudget.
 func (s *EventSubscriberService) WithIssuanceBudget(budget time.Duration) *EventSubscriberService {
 	if budget <= 0 {
 		budget = SubscriberCredentialIssuanceBudget
@@ -688,19 +763,42 @@ func (s *EventSubscriberService) provisioner() (subscriberPrincipalProvisioner, 
 
 	cnf, err := fetchConfiguration()
 	if err != nil {
+		// LOGGED HERE AND BOUNDED, RETURNED WITHOUT THE CAUSE. A configuration failure can
+		// quote the offending file content or a path inside the container, and NewAPIError
+		// would both re-log it unsanitized and serialise it into the response. See
+		// SubscriberErrorDetail.
+		logrus.WithField("error", sanitizeLogValue(err.Error(), maxLoggedErrorLength)).Error(
+			"event subscriber: the configuration could not be read, so no Kafka administrative " +
+				"client could be built and no credential can be provisioned",
+		)
+
 		return nil, apierror.NewAPIError(
 			apierror.ErrKafkaUnavailable,
 			"Configuration is unavailable, so Kafka credentials cannot be provisioned",
-			fmt.Errorf("blnk: loading configuration for subscriber provisioning: %w", err),
+			NewSubscriberErrorDetail("The Blnk configuration could not be read", "", false),
 		)
 	}
 
 	admin, err := NewKafkaAdmin(cnf)
 	if err != nil {
+		// The most disclosure-prone cause in this file. Building the administrative client
+		// reads TLS material from disk and prepares a SCRAM mechanism, so the failure can
+		// name a filesystem path inside the container or the administrative principal — and
+		// the transport refuses plaintext by returning an error, so an ordinary
+		// misconfiguration reaches this branch on a normal deployment.
+		logrus.WithField("error", sanitizeLogValue(err.Error(), maxLoggedErrorLength)).Error(
+			"event subscriber: the Kafka administrative client could not be built, so no subscriber " +
+				"credential can be provisioned; check KAFKA_BROKERS, the administrative SASL pair " +
+				"and the TLS settings",
+		)
+
 		return nil, apierror.NewAPIError(
 			apierror.ErrKafkaUnavailable,
 			"Failed to build the Kafka administrative client for subscriber provisioning",
-			err,
+			NewSubscriberErrorDetail(
+				"The Kafka administrative client could not be built from the current configuration",
+				"", false,
+			),
 		)
 	}
 
@@ -771,9 +869,6 @@ func (s *EventSubscriberService) clock() time.Time {
 }
 
 // budget reads the configured issuance ceiling, tolerating a zero-valued service.
-//
-// Returns:
-//   - time.Duration: always positive.
 func (s *EventSubscriberService) budget() time.Duration {
 	if s == nil || s.issuanceBudget <= 0 {
 		return SubscriberCredentialIssuanceBudget
@@ -785,35 +880,25 @@ func (s *EventSubscriberService) budget() time.Duration {
 // ---------------------------------------------------------------------------------------
 // The derivations, and why each is derived rather than chosen
 //
-// A subscriber's KAFKA PRINCIPAL and CONSUMER GROUP NAMESPACE are the two names its entire
-// access boundary is expressed in: the SCRAM credential is minted for the principal, and
-// every ACL binding names the principal and the namespace. Whoever chooses those two strings
-// chooses the boundary — so they are derived, always, from the subscriber's immutable
-// identifier, and never accepted from a request.
-//
-// Both derivations are PURE FUNCTIONS of the identifier, which is what makes them stable
-// across re-issuance: issuing a new credential changes the secret and nothing else, so a
-// subscriber's consumer group survives a rotation and its ACL grant does not have to be
-// re-pointed. It is also what lets an operator reconstruct them by hand while triaging with
-// nothing but a subscriber id:
+// A subscriber's KAFKA PRINCIPAL and CONSUMER GROUP NAMESPACE are the two names its access
+// boundary is expressed in — the SCRAM credential is minted for the principal, and every ACL
+// binding names the principal and the namespace — so whoever chooses those strings chooses the
+// boundary. They are therefore DERIVED from the subscriber's immutable identifier and never
+// accepted from a request. Both derivations are pure functions of it, which is what keeps a
+// subscriber's consumer group and ACL grant intact across a credential rotation and lets an
+// operator reconstruct them from a subscriber id alone:
 //
 //	principal        = "blnk-sub-" + <subscriber_id>
 //	group namespace  = "blnk-sub-" + <subscriber_id> + "."       (the PREFIXED ACL resource)
 //	default group    = "blnk-sub-" + <subscriber_id> + ".default"
 //
-// The trailing terminator on the namespace is the disjointness guarantee: it cannot occur
-// inside a canonical identifier, so "blnk-sub-abc." and "blnk-sub-abcd." can never overlap
-// however the identifiers relate. Without it, a subscriber whose id is a leading substring
-// of another's would reserve the other's namespace and could join its consumer groups and
-// take its partition assignments.
+// The trailing terminator is the disjointness guarantee: it cannot occur inside a canonical
+// identifier, so "blnk-sub-abc." and "blnk-sub-abcd." can never overlap. Without it, a
+// subscriber whose id is a leading substring of another's would reserve the other's namespace
+// and could join its consumer groups.
 //
-// The composition itself lives in model/event.go, not here, because the persistence layer
-// and its CHECK constraints have to agree with it byte for byte and neither can import this
-// package. These wrappers exist so the root package — and, through it, the API and the CLI
-// — reach the derivations by name rather than by re-implementing a string concatenation.
-//
-// docs/kafka-operations.md carries the same three lines in its ACL-model section for
-// operators who are reading a runbook rather than this file.
+// The composition itself lives in model/event.go, because the persistence layer's CHECK
+// constraints have to agree with it byte for byte and cannot import this package.
 // ---------------------------------------------------------------------------------------
 
 // SubscriberKafkaPrincipal derives the SASL/SCRAM username for a subscriber id.
@@ -879,33 +964,38 @@ func SubscriberConsumerGroupNamespace(subscriberID string) (string, error) {
 	return namespace, nil
 }
 
-// SubscriberPartitionKeyPrefix reports the ADVISORY partition-key prefix recorded for a
-// subscriber, flattening the nullable column to a plain string.
+// SubscriberPartitionKeyPrefix reports the key-scoped constraint recorded for a subscriber,
+// flattening the nullable column to a plain string.
 //
-// # It is recorded, not derived, and that is not an omission
+// It is RECORDED, not derived, and that is not an omission. Every other value in the access
+// model is derived from the subscriber's identity; this one cannot be. A Kafka message key on
+// Blnk's topics is the outbox row's STORED PARTITION KEY — a ledger id when the payload yields
+// one, otherwise a balance, identity, monitor or batch id, or the event type — so a prefix
+// derived from the subscriber's own identifier would match no record ever produced, and a
+// subscriber filtering on it would silently discard its entire stream.
 //
 // Every other value in the access model is derived from the subscriber's identity. This one
 // cannot be, and must not be. Kafka message keys on Blnk's topics are LEDGER partition keys
 // — the publisher keys each event by the aggregate's ledger so that one aggregate's events
 // land on one partition — so a prefix derived from the subscriber's own identifier would
-// match no record ever produced, and a subscriber that filtered on it would silently discard
-// its entire stream. The prefix is therefore a statement about which ledgers a subscriber
-// cares about, which only the caller registering it can make.
+// match no record ever produced. The prefix is a statement about which ledgers a subscriber
+// is authorised for, which only the caller registering it can make.
 //
-// # It is ADVISORY and is not an authorization boundary
+// # A NON-EMPTY RESULT MEANS THE SUBSCRIBER CANNOT BE PROVISIONED
 //
-// Kafka's authorizer has no message-key dimension: there is no ACL that restricts a
-// consumer to a slice of a topic by key. A subscriber granted a topic can read every record
-// on it regardless of this value. Nothing may treat a non-empty prefix as narrowing what a
-// subscriber CAN read — only as describing what it WANTS to read. Treating it as isolation
-// would mean believing two subscribers on one topic cannot see each other's events, which is
-// false, and making that belief the basis of a tenancy decision.
+// Kafka's authorizer has no message-key dimension: there is no ACL that restricts a consumer
+// to a slice of a topic by key. A subscriber granted a topic can read every record on it
+// regardless of this value. So a non-empty prefix records an authorization NARROWER than any
+// credential this service can mint, and IssueSubscriberCredential refuses for such a row —
+// see requireProvisionableKeyScope. The alternative, issuing anyway, means believing two
+// subscribers on one topic cannot see each other's events, which is false, and handing out a
+// credential that makes that belief look justified.
 //
 // Parameters:
 //   - subscriber *model.EventSubscriber: the registry row. Nil yields "".
 //
 // Returns:
-//   - string: the recorded prefix, or "" when none was requested.
+//   - string: the recorded constraint, or "" when none was recorded.
 func SubscriberPartitionKeyPrefix(subscriber *model.EventSubscriber) string {
 	if subscriber == nil || subscriber.PartitionKeyPrefix == nil {
 		return ""
@@ -922,12 +1012,6 @@ func SubscriberPartitionKeyPrefix(subscriber *model.EventSubscriber) string {
 // falling through to 500. The cause is carried in the details so the specific rule broken
 // stays visible to the caller; the message names the consequence rather than the rule,
 // because "cannot be used to derive a Kafka identity" is what the caller has to act on.
-//
-// Parameters:
-//   - cause error: the derivation failure.
-//
-// Returns:
-//   - error: a typed apierror carrying the cause.
 func invalidSubscriberIdentifier(cause error) error {
 	return apierror.NewAPIError(
 		apierror.ErrGenValidation,
@@ -938,39 +1022,17 @@ func invalidSubscriberIdentifier(cause error) error {
 
 // generateSubscriberPassword mints a SASL/SCRAM secret with crypto/rand.
 //
-// # Never math/rand
+// crypto/rand and NOT math/rand: this is a credential, and a predictable one is no credential
+// at all. An error from the reader is returned rather than falling back to a weaker source,
+// because a failed issuance is recoverable and a guessable password is not.
 //
-// This value is the whole of a subscriber's authentication. math/rand is seeded
-// deterministically and its output is reconstructible from a handful of observations, so a
-// secret drawn from it is guessable by anyone who has seen another — which, for a service
-// that issues one secret per subscriber, is every subscriber. crypto/rand reads the
-// operating system's CSPRNG and is the only acceptable source here.
-//
-// # The draw is unbiased
-//
-// The alphabet is 62 characters, which is not a power of two, so taking a random byte modulo
-// 62 would make the first four characters of the alphabet measurably more likely than the
-// rest. crypto/rand.Int draws uniformly over [0, n) and handles the rejection internally, so
-// the bias cannot be reintroduced by an arithmetic slip here.
-//
-// # The distinct-character floor is guaranteed, not hoped for
-//
-// event_admin.go refuses a password that is long but repetitive, because thirty-two
-// identical characters clear a length floor while carrying almost no entropy. A 48-character
-// draw from 62 symbols falls below that floor with probability far below one in 10^30, so
-// the loop below is expected to run exactly once — and it exists anyway, because a generator
-// that CAN emit a value the boundary will reject has a failure mode nothing tests. Re-drawing
-// makes the guarantee total at no cost.
-//
-// The final validation is the same function the admin client applies, called here so a
-// generator defect fails at the generator with the secret nowhere in the message, rather
-// than as an obscure rejection one broker round trip later.
+// Indices are drawn with rejection sampling rather than by taking a byte modulo the alphabet
+// length, which would bias the low characters — 256 is not a multiple of 62 — and the bias is
+// measurable rather than theoretical.
 //
 // Returns:
-//   - string: a fresh secret of generatedSubscriberPasswordLength printable ASCII
-//     characters.
-//   - error: when the system CSPRNG is unavailable, or — unreachably — when the draw could
-//     not satisfy the strength floors. Neither message contains any part of a secret.
+//   - string: a password of generatedSubscriberPasswordLength characters.
+//   - error: the reader's error, unwrapped.
 func generateSubscriberPassword() (string, error) {
 	alphabetSize := big.NewInt(int64(len(subscriberPasswordAlphabet)))
 
@@ -1012,36 +1074,19 @@ func generateSubscriberPassword() (string, error) {
 	)
 }
 
-// validateSubscriberGrant checks an authorised-topic list against the REAL topic catalogue.
+// validateSubscriberGrant checks an authorised-topic list against the ALLOWLIST.
 //
-// # Why a grant is validated here as well as at persistence and at provisioning
+// Every entry must be an exact member of event_topics.SubscriberGrantableTopics() — the
+// subscriber-facing category topics under the configured prefix. The test is membership,
+// never a prefix match: a prefix match would accept "blnk.transactions.something-else" and,
+// with a caller-supplied prefix, very nearly anything.
 //
-// A subscriber must not be registered against a topic that does not exist. The ACL grant
-// would then name a resource nothing publishes to, so it would authorise nothing, and — far
-// worse — the subscriber-isolation test would be asserting against a boundary that has no
-// content: it would pass while proving nothing at all.
-//
-// Two checks, and neither subsumes the other:
-//
-//   - model.ValidateSubscriberTopics applies the RESOURCE BOUNDS: cardinality, blank
-//     elements, name length, the character set Kafka permits, and duplicates. These hold
-//     whatever the catalogue contains.
-//   - IsSubscriberGrantableTopic applies the CATALOGUE, resolved from the configured topic
-//     prefix by event_topics.go. It is an exact match against the subscriber-facing category
-//     topics, so a dead-letter topic, an internal category, a foreign topic, a wildcard and a
-//     name differing only in case or whitespace are all refused.
-//
-// An EMPTY grant is VALID and must stay valid: a subscriber authorised for nothing is the
-// fail-closed default of a fresh registration, and refusing it would make registration and
-// authorisation one inseparable step — a subscriber could not exist before its topics were
-// decided.
-//
-// Parameters:
-//   - topics []string: the grant as supplied. Nil and empty are both accepted.
+// An EMPTY LIST IS VALID and means "authorised for nothing", which is the fail-closed default
+// of a newly registered subscriber. A duplicate is rejected rather than folded, because a
+// duplicate in a grant request is a caller error worth reporting.
 //
 // Returns:
-//   - error: a typed validation error naming the first offending topic and the grantable
-//     set, or nil.
+//   - error: a typed validation error naming the offending topic, or nil.
 func validateSubscriberGrant(topics []string) error {
 	if err := model.ValidateSubscriberTopics(topics); err != nil {
 		return apierror.NewAPIError(
@@ -1095,42 +1140,49 @@ func normalizeSubscriberName(name string) (string, error) {
 	return trimmed, nil
 }
 
-// maxAdvisoryPartitionKeyPrefixLength bounds the advisory filter hint.
+// maxSubscriberKeyScopeLength bounds the recorded key-scoped constraint.
 //
 // A partition key on Blnk's topics is a ledger partition key — a "<prefix>_<uuid>" string —
 // so 256 characters is far more than any legitimate prefix of one needs while still refusing
 // an unbounded value. It matches the bound api/model applies to the same field; the number is
 // restated rather than imported because the API package depends on this one and not the other
 // way round.
-const maxAdvisoryPartitionKeyPrefixLength = 256
+const maxSubscriberKeyScopeLength = 256
 
-// normalizeAdvisoryKeyPrefix validates and normalises the ADVISORY partition-key prefix.
+// normalizeSubscriberKeyScope validates and normalises the recorded key-scoped constraint.
 //
 // # Three inputs, three meanings
 //
-//   - NIL means omitted, and stays nil: no filter was requested.
+//   - NIL means omitted, and stays nil: no constraint was recorded.
 //   - A value that is blank or whitespace-only means CLEAR, and becomes nil, so the column
-//     holds NULL — "entitled to whole topics" — rather than the empty string, which would read
-//     as "restricted to the empty prefix". Those are opposite intents and the nullable column
-//     exists to keep them distinguishable.
+//     holds NULL — "no key constraint" — rather than the empty string, which would read as
+//     "constrained to the empty prefix". Those are opposite intents, the nullable column exists
+//     to keep them distinguishable, and the difference decides whether a credential can be
+//     issued at all.
 //   - Anything else is kept verbatim after being checked.
+//
+// # It is still validated even though a value here blocks issuance
+//
+// A recorded constraint is a durable statement about who this subscriber is authorised to see,
+// read by every later report and by whoever eventually decides how to satisfy it. So a
+// malformed one is refused at the boundary rather than stored and puzzled over later: the
+// refusal a caller gets for a control character is more useful than a row nobody can act on.
 //
 // # Why it is checked here and not only in the request DTO
 //
 // The DTO applies the same rules, and that covers HTTP. It does not cover a CLI caller, a
 // migration or a fixture, all of which reach this service directly — and the row outlives any
-// single request, so a value accepted once is read by every later provisioning and every later
-// report. Surrounding whitespace is REFUSED rather than trimmed for the reason a topic name is:
-// a value differing from another only by whitespace is almost always a copy-paste artefact,
-// and quietly rewriting it would store a filter the caller did not ask for.
+// single request. Surrounding whitespace is REFUSED rather than trimmed for the reason a topic
+// name is: a value differing from another only by whitespace is almost always a copy-paste
+// artefact, and quietly rewriting it would store a constraint the caller did not ask for.
 //
 // Parameters:
-//   - prefix *string: the supplied prefix. Nil is accepted.
+//   - prefix *string: the supplied constraint. Nil is accepted.
 //
 // Returns:
-//   - *string: the normalised prefix, or nil for omitted and cleared.
+//   - *string: the normalised value, or nil for omitted and cleared.
 //   - error: a typed validation error naming the rule broken.
-func normalizeAdvisoryKeyPrefix(prefix *string) (*string, error) {
+func normalizeSubscriberKeyScope(prefix *string) (*string, error) {
 	if prefix == nil {
 		return nil, nil
 	}
@@ -1152,13 +1204,13 @@ func normalizeAdvisoryKeyPrefix(prefix *string) (*string, error) {
 		)
 	}
 
-	if len(value) > maxAdvisoryPartitionKeyPrefixLength {
+	if len(value) > maxSubscriberKeyScopeLength {
 		return nil, apierror.NewAPIError(
 			apierror.ErrGenValidation,
 			"The partition key prefix is too long",
 			fmt.Errorf(
 				"event subscriber: partition key prefix is %d characters, above the %d permitted",
-				len(value), maxAdvisoryPartitionKeyPrefixLength,
+				len(value), maxSubscriberKeyScopeLength,
 			),
 		)
 	}
@@ -1181,6 +1233,206 @@ func normalizeAdvisoryKeyPrefix(prefix *string) (*string, error) {
 	normalized := value
 
 	return &normalized, nil
+}
+
+// requireProvisionableKeyScope refuses to provision a subscriber whose row records a
+// key-scoped authorization Kafka cannot enforce. SEC-05.
+//
+// # Why this is a refusal and not a warning
+//
+// Kafka's authorizer has no message-key dimension, so there is no binding, pattern type or
+// operation that confines a consumer to the records whose key carries a given prefix. A row
+// carrying such a prefix therefore records an authorization NARROWER THAN ANY CREDENTIAL THIS
+// SERVICE CAN MINT, and there are only two honest responses to that: issue the wider credential
+// and tell nobody, or refuse.
+//
+// Issuing was the previous behaviour, and it fails in the direction that matters. The registry
+// row says the subscriber may see one ledger's records; the credential it hands out reads every
+// record on every authorised topic. Anybody deciding tenancy from the registry — an operator, a
+// migration report, a support engineer answering "can this subscriber see that ledger?" — gets
+// the wrong answer, and nothing anywhere fails to correct them. Documenting the field as
+// advisory did not fix that, because a comment is not what a person reads when they read a
+// database row.
+//
+// So provisioning fails closed and says exactly what to do about it. Both remedies are real:
+// clearing the prefix accepts whole-topic access explicitly, which is a decision somebody has
+// now made rather than one the system made silently; narrowing authorized_topics is the
+// enforceable form of the same intent whenever the ledgers in question map onto topics.
+//
+// # Why 409 rather than 400 or 503
+//
+// The caller sent no body — POST /subscribers/{id}/kafka-credentials has none — so nothing
+// about the REQUEST is invalid, which rules out 400. Nothing is unavailable and a retry cannot
+// succeed, which rules out 503. What is wrong is the current STATE of the resource being
+// provisioned, which is what 409 means, and the message names the state and the two exits.
+//
+// Parameters:
+//   - subscriber *model.EventSubscriber: the row about to be provisioned.
+//
+// Returns:
+//   - error: a typed conflict when the row records an unenforceable key scope, otherwise nil.
+func requireProvisionableKeyScope(subscriber *model.EventSubscriber) error {
+	if subscriber == nil || !subscriber.KeyScopeUnenforceable() {
+		return nil
+	}
+
+	return apierror.NewAPIError(
+		// The TYPED code, not the generic conflict. Both resolve to 409, but a client
+		// discriminates on the code, and this refusal has a specific remedy that
+		// "CONFLICT" cannot express — see ErrSubscriberIsolationUnenforceable, whose
+		// documentation describes exactly this refusal.
+		apierror.ErrSubscriberIsolationUnenforceable,
+		"This subscriber records a partition key prefix, which Kafka cannot enforce, so no "+
+			"credential will be issued for it. Clear the partition key prefix to accept access to "+
+			"whole topics, or narrow the subscriber's authorized topics, which is enforceable",
+		fmt.Errorf(
+			"event subscriber: subscriber %q records a partition key prefix; Kafka's authorizer has "+
+				"no message-key dimension, so any credential issued would grant every record on every "+
+				"authorised topic and the registry would describe a narrower boundary than exists",
+			sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
+		),
+	)
+}
+
+// requireActiveSubscriber refuses to provision a subscriber that is being deregistered.
+//
+// A row carrying the revocation tombstone is on its way out: its broker-side access is being
+// taken away and may still be live. Minting a credential for it would re-arm a principal
+// mid-removal, and the deregistration that is already in flight would then delete the registry
+// row that records the credential just issued — leaving exactly the orphaned live principal the
+// tombstone exists to prevent.
+//
+// Parameters:
+//   - subscriber *model.EventSubscriber: the row about to be provisioned.
+//
+// Returns:
+//   - error: a typed conflict when the subscriber is being deregistered, otherwise nil.
+func requireActiveSubscriber(subscriber *model.EventSubscriber) error {
+	if subscriber == nil || !subscriber.IsRevocationPending() {
+		return nil
+	}
+
+	return apierror.NewAPIError(
+		apierror.ErrConflict,
+		"This subscriber is being deregistered, so no credential will be issued for it",
+		fmt.Errorf(
+			"event subscriber: subscriber %q carries a revocation tombstone from %s; complete or "+
+				"reverse its deregistration before issuing credentials",
+			sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
+			subscriber.RevocationPendingAt.UTC().Format(time.RFC3339),
+		),
+	)
+}
+
+// SubscriberProvisioningFenceLease is how long an issuance or revocation holds its fence.
+//
+// It is three times the issuance budget, and the ratio is the requirement: long enough that a
+// legitimate operation cannot lose its own claim while it is still working — the fence must
+// outlive the budget it protects, plus the cleanup that follows a failure — and short enough
+// that a process killed while holding one does not fence the subscriber for materially longer
+// than an operator would wait before retrying.
+const SubscriberProvisioningFenceLease = 3 * SubscriberCredentialIssuanceBudget
+
+// fenceSubscriber claims a subscriber for one operation and returns the release function.
+//
+// # What the fence prevents, precisely
+//
+// Kafka stores ONE SCRAM credential per principal, so two overlapping issuances both write a
+// credential and the second replaces the first. The broker then holds one password while the
+// registry may hold the reference derived from the other, and the caller holding the recorded
+// one cannot authenticate — with no way to discover it, because its request returned 200 with a
+// password in it. RecordSubscriberCredentialIfUnchanged detects the DATABASE half of that race;
+// it cannot decide which password the BROKER kept, because that is settled by whichever call
+// reached the broker last, independently of who won the write.
+//
+// So nothing touches the broker for a subscriber without holding its claim, and the second
+// caller is refused with a conflict BEFORE it generates a secret. A refused issuance costs a
+// caller one retry; an interleaved one costs it a credential that does not work.
+//
+// Revocation and deregistration fence too, so an issuance cannot interleave with the removal of
+// the very credential it is writing.
+//
+// # The release runs on a FRESH context
+//
+// A claim taken by an issuance whose budget then expired must still be released, or the
+// subscriber stays fenced until the lease runs out — turning one slow broker call into a
+// minute of refused retries. So the release is bounded by its own budget rather than by the
+// caller's remaining time, exactly as every other cleanup here is. A release that finds the
+// claim gone is logged, not returned: the operation it belonged to has already finished, and
+// the useful record is that the fence was lost, not a second error for the caller to read.
+//
+// Parameters:
+//   - ctx context.Context: the operation's context. Its VALUES are used for the release.
+//   - store eventSubscriberStore: the registry.
+//   - subscriberID string: the subscriber to fence.
+//
+// Returns:
+//   - func(): releases the claim. Never nil, so the caller can defer it unconditionally, and
+//     idempotent.
+//   - error: a typed conflict when another operation holds the claim, a typed not-found when
+//     the subscriber does not exist, or the repository's error.
+func fenceSubscriber(
+	ctx context.Context,
+	store eventSubscriberStore,
+	subscriberID string,
+) (func(), error) {
+	token, err := store.ClaimSubscriberForProvisioning(ctx, subscriberID, SubscriberProvisioningFenceLease)
+	if err != nil {
+		return func() {}, err
+	}
+
+	var once sync.Once
+
+	return func() {
+		once.Do(func() {
+			release, cancel := subscriberCleanupContext(ctx)
+			defer cancel()
+
+			if releaseErr := store.ReleaseSubscriberProvisioningFence(release, subscriberID, token); releaseErr != nil {
+				logrus.WithError(releaseErr).WithField(
+					"subscriber", sanitizeLogValue(subscriberID, maxLoggedFilterLength),
+				).Warn(
+					"event subscriber: releasing the provisioning fence failed; the subscriber stays " +
+						"fenced until its claim lease expires, after which the next attempt proceeds",
+				)
+			}
+		})
+	}, nil
+}
+
+// subscriberCleanupBudget bounds a compensating write after an operation has already failed.
+//
+// It is the issuance budget over again, which is the right size for the one or two round trips
+// a cleanup makes, and it is deliberately its OWN budget rather than the remainder of the
+// caller's — see subscriberCleanupContext.
+const subscriberCleanupBudget = SubscriberCredentialIssuanceBudget
+
+// subscriberCleanupContext derives the context a compensating write runs on. CLEAN-01.
+//
+// # The failure this exists for
+//
+// Every cleanup path in this file — revoking a credential the registry could not record,
+// clearing a credential reference that no longer describes anything, releasing the provisioning
+// fence — used to run on the ISSUANCE context. That context carries the 5-second budget, and
+// its expiry is one of the commonest reasons issuance fails at all. So the cleanups were
+// attempted with an already-cancelled context, returned immediately, and left exactly the
+// residue they exist to remove: a live credential nothing records, or a registry claiming
+// access the broker no longer grants.
+//
+// A fresh context detached from the caller's cancellation fixes that, and it is BOUNDED rather
+// than merely detached for the same reason the relay's bookkeeping context is: finishing what
+// is owed must not become blocking indefinitely on a system that has gone away.
+//
+// The caller's VALUES are kept, so the cleanup appears under the span that caused it.
+//
+// Parameters:
+//   - ctx context.Context: the caller's context, used for its values only.
+//
+// Returns:
+//   - context.Context: a fresh context bounded by subscriberCleanupBudget.
+//   - context.CancelFunc: must be called, conventionally by defer.
+func subscriberCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), subscriberCleanupBudget)
 }
 
 // requireSubscriberIdentifier rejects a blank subscriber id before anything is spent on it.
@@ -1218,38 +1470,26 @@ func requireSubscriberIdentifier(subscriberID string) error {
 
 // RegisterSubscriber records a new subscriber and returns the stored row.
 //
-// # What it does, in order
+// # What is derived and what is supplied
 //
-//  1. Generates a subscriber id when none was supplied, in the repository's
-//     "<prefix>_<uuid>" form via model.GenerateSubscriberID. The module suffix is "sub"
-//     (model.SubscriberIDPrefix), matching the convention ledgers ("ldg"), balances ("bln")
-//     and identities ("idt") already follow. A generated id is canonical by construction,
-//     so it can always be derived from; a SUPPLIED id is checked and refused if it cannot.
-//  2. Requires a name, because an unnamed principal cannot be triaged.
-//  3. Validates the grant against the real topic catalogue, so a subscriber cannot be
-//     registered against a topic that does not exist.
-//  4. Derives the Kafka principal and the default consumer group from the id.
-//  5. Delegates the insert, which validates all of the above again at the persistence
-//     boundary and once more in the schema's CHECK constraints.
+// The KAFKA PRINCIPAL and the CONSUMER GROUP are DERIVED from the subscriber id and are not
+// caller-supplied: they are the two values isolation rests on, so a caller cannot choose a
+// principal that collides with another subscriber's, and the derivation is a pure function of
+// an immutable id. The name, the authorised topics, the advisory key prefix and the legacy
+// webhook URL are the caller's.
 //
-// # It provisions nothing
+// An id is generated only when the caller supplies none. A supplied id is validated as given
+// — surrounding whitespace is a rejection rather than something to fold away — because the id
+// derives the principal and the group namespace, so silently rewriting it would make the
+// stored subscriber differ from the one the caller asked for.
 //
-// Registration touches no broker and mints no credential. A freshly registered subscriber
-// is "registered, not yet provisioned": it has a boundary described but not granted, and it
-// can read nothing until IssueSubscriberCredential is called. That separation is deliberate
-// — registration is a cheap, reversible bookkeeping act, while provisioning writes
-// authorization state to another system.
-//
-// Parameters:
-//   - ctx context.Context: cancels the insert.
-//   - registration SubscriberRegistration: the subscriber to record.
+// The row is fail-closed: with no authorised topics the subscriber can read nothing until it
+// is granted something and credentials are issued.
 //
 // Returns:
-//   - *model.EventSubscriber: the stored row, carrying the database's surrogate key and
-//     bookkeeping timestamps.
-//   - error: a typed validation error for an unusable id, a blank name or an ungrantable
-//     topic; a typed conflict when the id or the derived principal is already taken; the
-//     repository's error otherwise.
+//   - *model.EventSubscriber: the stored row.
+//   - error: a typed validation error, a typed conflict when the id or principal is taken, or
+//     the repository's error.
 func (s *EventSubscriberService) RegisterSubscriber(
 	ctx context.Context,
 	registration SubscriberRegistration,
@@ -1273,7 +1513,7 @@ func (s *EventSubscriberService) RegisterSubscriber(
 		return nil, err
 	}
 
-	keyPrefix, err := normalizeAdvisoryKeyPrefix(registration.PartitionKeyPrefix)
+	keyPrefix, err := normalizeSubscriberKeyScope(registration.PartitionKeyPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -1356,15 +1596,7 @@ func (s *EventSubscriberService) GetSubscriber(
 //
 // No entry carries a secret. The credential reference on a row is a keyed digest; the API
 // layer reduces it further to a fingerprint through api/model.NewSubscriberResponse.
-//
-// Parameters:
-//   - ctx context.Context: cancels the query.
-//   - limit int: page size. Non-positive selects the repository default.
-//   - offset int: page offset. Negative is clamped to zero.
-//
-// Returns:
-//   - []model.EventSubscriber: the page, newest first.
-//   - error: the repository's error.
+// A non-positive limit selects the repository default and a negative offset is clamped to zero.
 func (s *EventSubscriberService) ListSubscribers(
 	ctx context.Context,
 	limit, offset int,
@@ -1386,23 +1618,40 @@ func (s *EventSubscriberService) ListSubscribers(
 // current row is therefore read first and the requested changes applied to it, which is what
 // makes an omitted field mean "leave as stored" rather than "set to empty".
 //
-// # It changes the RECORD of the boundary, not the boundary
+// # AUTH-02: it changes the BOUNDARY, not only the record of it
 //
-// The broker is a separate system of record and is not reconciled here. A widened grant
-// takes effect at the next credential issuance, which binds the new topic set. A NARROWED
-// grant needs more: ACL creation is additive and idempotent, so a binding for a topic that
-// has just been removed from this list stands until it is explicitly deleted. Completing a
-// reduction therefore means revoking the subscriber's access and re-issuing — see
-// DeregisterSubscriber for the revocation half and docs/kafka-operations.md for the runbook.
-// Nothing here can do it silently, and nothing should: shrinking a live grant ends a
-// consumer's access and is an operator-visible act.
+// An authorization change is applied at the broker as part of the update, in three steps
+// around the write, and the ORDER is the whole design:
+//
+//  1. PRUNE at the broker. Every Blnk-owned binding the new authorization no longer implies is
+//     deleted first, so a NARROWING is in force before the registry claims it is.
+//  2. PERSIST the row.
+//  3. GRANT at the broker. The bindings the new authorization adds are created last, so a
+//     WIDENING reaches the broker only once the registry records it.
+//
+// There is no transaction spanning Blnk and Kafka, so some ordering will be observable on a
+// partial failure; this one makes every partial failure fail-CLOSED. The subscriber ends with
+// less access than the registry records, never more, and re-running the update completes it.
+//
+// The alternative — updating the row and leaving the broker alone — was the previous behaviour
+// and it fails open. ACL creation is additive, so a topic removed from the list kept its Read
+// and Describe bindings until somebody revoked the entire subscriber: the registry said the
+// access was gone, the subscriber went on consuming, and nothing failed to say otherwise.
+// Revocation could not clean it up either, because it derives the bindings to delete from the
+// current row — the row that no longer names the topic.
+//
+// The update is FENCED per subscriber, so it cannot interleave with an issuance that is
+// writing the very bindings it is reconciling.
+//
+// A deployment with no broker configured skips both broker steps and updates the registry
+// alone, exactly as registration and listing do.
 //
 // The principal, the consumer group, the credential record and the migration instant are all
 // unchangeable through this call, by construction — SubscriberUpdate has no field for any of
 // them.
 //
 // Parameters:
-//   - ctx context.Context: cancels the read and the write.
+//   - ctx context.Context: cancels the reconciliation, the read and the write.
 //   - subscriberID string: the business key of the row to update.
 //   - changes SubscriberUpdate: the fields to apply. A wholly empty update is legitimate and
 //     rewrites the row with its own values, which is a harmless no-op rather than an error.
@@ -1410,7 +1659,8 @@ func (s *EventSubscriberService) ListSubscribers(
 // Returns:
 //   - *model.EventSubscriber: the row as it now stands.
 //   - error: ErrSubscriberNotFound when no such subscriber exists, a typed validation error
-//     for a blank name or an ungrantable topic, or the repository's error.
+//     for a blank name or an ungrantable topic, ErrSubscriberProvisioningFailed when the
+//     broker-side reconciliation did not complete, or the repository's error.
 func (s *EventSubscriberService) UpdateSubscriber(
 	ctx context.Context,
 	subscriberID string,
@@ -1425,7 +1675,17 @@ func (s *EventSubscriberService) UpdateSubscriber(
 		return nil, err
 	}
 
-	subscriber, err := store.GetEventSubscriberByID(ctx, strings.TrimSpace(subscriberID))
+	subscriberID = strings.TrimSpace(subscriberID)
+
+	// FENCED before anything is read, so the authorization this call reconciles cannot be
+	// changed underneath it by a concurrent issuance writing the same bindings.
+	releaseFence, err := fenceSubscriber(ctx, store, subscriberID)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseFence()
+
+	subscriber, err := store.GetEventSubscriberByID(ctx, subscriberID)
 	if err != nil {
 		return nil, err
 	}
@@ -1450,13 +1710,14 @@ func (s *EventSubscriberService) UpdateSubscriber(
 		subscriber.AuthorizedTopics = changes.AuthorizedTopics
 	}
 
-	// A present empty string CLEARS the advisory prefix, which is why the column is nullable
-	// and why this cannot be a plain string: NULL means "entitled to whole topics" while the
-	// empty string would mean "restricted to the empty prefix", and those are opposite
-	// intents. normalizeAdvisoryKeyPrefix owns that three-way mapping so registration and
-	// update cannot disagree about it.
+	// A present empty string CLEARS the recorded key scope, which is why the column is
+	// nullable and why this cannot be a plain string: NULL means "no key constraint" while the
+	// empty string would mean "constrained to the empty prefix", and those are opposite
+	// intents. normalizeSubscriberKeyScope owns that three-way mapping so registration and
+	// update cannot disagree about it — and clearing it here is what makes an unprovisionable
+	// subscriber provisionable again.
 	if changes.PartitionKeyPrefix != nil {
-		keyPrefix, prefixErr := normalizeAdvisoryKeyPrefix(changes.PartitionKeyPrefix)
+		keyPrefix, prefixErr := normalizeSubscriberKeyScope(changes.PartitionKeyPrefix)
 		if prefixErr != nil {
 			return nil, prefixErr
 		}
@@ -1476,7 +1737,24 @@ func (s *EventSubscriberService) UpdateSubscriber(
 		}
 	}
 
+	// STEP 1 — PRUNE. Whatever the new authorization no longer implies is removed at the broker
+	// BEFORE the row records the narrowing, so a failure of the write below leaves the
+	// subscriber with less access than the registry claims rather than more.
+	pruned, err := s.pruneBrokerAccess(ctx, subscriber)
+	if err != nil {
+		return nil, err
+	}
+
+	// STEP 2 — PERSIST.
 	if err := store.UpdateEventSubscriber(ctx, subscriber); err != nil {
+		return nil, err
+	}
+
+	// STEP 3 — GRANT. Whatever the new authorization adds reaches the broker only now that the
+	// registry records it, so a failure here is again fail-closed. The error is returned, since
+	// a caller told the update succeeded would believe a grant exists that does not.
+	granted, err := s.grantBrokerAccess(ctx, subscriber)
+	if err != nil {
 		return nil, err
 	}
 
@@ -1484,49 +1762,235 @@ func (s *EventSubscriberService) UpdateSubscriber(
 		"subscriber":             sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
 		"authorized_topic_count": len(subscriber.AuthorizedTopics),
 		"legacy_webhook":         subscriber.WebhookURL != nil,
+		"acl_bindings_removed":   pruned,
+		"acl_bindings_created":   granted,
 	}).Info(
-		"event subscriber: registry row updated; the broker-side boundary is unchanged until " +
-			"credentials are re-issued",
+		"event subscriber: registry row updated and its broker-side grant reconciled to match",
 	)
 
 	return subscriber, nil
 }
 
-// DeregisterSubscriber removes a subscriber from the registry and ends its access at the
-// broker.
+// pruneBrokerAccess removes the broker-side grants a subscriber's new authorization no longer
+// implies, and reports how many it removed.
 //
-// # The order is the one event_admin.go prescribes, and it is not interchangeable
+// It is the first of UpdateSubscriber's three steps. A deployment with no broker configured has
+// no broker-side grant, so it is a no-op there; anything else is reported as a provisioning
+// failure, because an update that could not narrow the boundary must not be reported as having
+// narrowed it.
 //
-// Take the row, revoke using it, and — if that fails — name the principal:
+// Parameters:
+//   - ctx context.Context: cancels the round trips.
+//   - subscriber *model.EventSubscriber: the row carrying the NEW authorization.
 //
-//  1. TakeEventSubscriber DELETES the row and RETURNS it. A plain delete would destroy the
-//     principal and topic list that revocation needs; a read followed by a delete would
-//     leave a window in which the row can change, so what got revoked might not be the
-//     boundary that was actually in force. Taking closes both.
-//  2. RevokeSubscriber removes the ACL bindings first and the SCRAM credential second, so a
+// Returns:
+//   - int: how many bindings were removed.
+//   - error: ErrSubscriberProvisioningFailed when the broker refused, or the admin client's
+//     construction error.
+func (s *EventSubscriberService) pruneBrokerAccess(
+	ctx context.Context,
+	subscriber *model.EventSubscriber,
+) (int, error) {
+	admin, err := s.provisioner()
+	if err != nil {
+		return 0, err
+	}
+
+	if !admin.IsConfigured() {
+		return 0, nil
+	}
+
+	report, err := admin.PruneSubscriberAccess(ctx, subscriber)
+	if err != nil {
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"subscriber": sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
+			"principal":  sanitizeLogValue(subscriber.KafkaPrincipal, maxLoggedFilterLength),
+		}).Error(
+			"event subscriber: the obsolete Kafka grants of this subscriber could not be removed, so " +
+				"the registry was NOT updated; the subscriber keeps the access it has and the change " +
+				"can be retried",
+		)
+
+		return 0, apierror.NewAPIError(
+			apierror.ErrSubscriberProvisioningFailed,
+			"Failed to remove the subscriber's obsolete Kafka grants, so its authorization was not changed",
+			fmt.Errorf("blnk: pruning Kafka access for principal %q: %w", subscriber.KafkaPrincipal, err),
+		)
+	}
+
+	return report.Removed, nil
+}
+
+// grantBrokerAccess creates the broker-side grants a subscriber's authorization implies, and
+// reports how many it created.
+//
+// It is the last of UpdateSubscriber's three steps, and it runs AFTER the row is persisted so a
+// widening cannot precede the record of it. A failure here leaves the registry recording more
+// access than the broker grants, which is the safe direction and self-heals: re-running the
+// update, or issuing credentials, creates the missing bindings.
+//
+// Parameters:
+//   - ctx context.Context: cancels the round trips.
+//   - subscriber *model.EventSubscriber: the persisted row.
+//
+// Returns:
+//   - int: how many bindings were created.
+//   - error: ErrSubscriberProvisioningFailed when the broker refused, or the admin client's
+//     construction error.
+func (s *EventSubscriberService) grantBrokerAccess(
+	ctx context.Context,
+	subscriber *model.EventSubscriber,
+) (int, error) {
+	admin, err := s.provisioner()
+	if err != nil {
+		return 0, err
+	}
+
+	if !admin.IsConfigured() {
+		return 0, nil
+	}
+
+	report, err := admin.GrantSubscriberAccess(ctx, subscriber)
+	if err != nil {
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"subscriber": sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
+			"principal":  sanitizeLogValue(subscriber.KafkaPrincipal, maxLoggedFilterLength),
+		}).Error(
+			"event subscriber: the registry was updated but the subscriber's new Kafka grants could " +
+				"not be created, so it currently has LESS access than the registry records; re-run the " +
+				"update or issue credentials to complete it",
+		)
+
+		return 0, apierror.NewAPIError(
+			apierror.ErrSubscriberProvisioningFailed,
+			"The subscriber was updated but its new Kafka grants could not be created",
+			fmt.Errorf("blnk: granting Kafka access for principal %q: %w", subscriber.KafkaPrincipal, err),
+		)
+	}
+
+	return report.Created, nil
+}
+
+// subscriberFacingBrokers resolves the bootstrap list to report to a subscriber, or refuses.
+//
+// # Why this is not admin.Brokers()
+//
+// admin.Brokers() is what BLNK dials. Inside a deployment those addresses are internal —
+// "kafka:9092" on a compose network, a ClusterIP or headless Service in Kubernetes — and they
+// do not resolve for a subscriber outside it. Kafka compounds the problem rather than
+// tolerating it: a broker answers every client with the ADVERTISED address of the listener the
+// connection arrived on, so even an externally reachable bootstrap address hands back internal
+// ones for the actual partition leaders. Only an operator knows the externally advertised
+// list, which is why it is configuration (KAFKA_SUBSCRIBER_BROKERS) and not a derivation.
+//
+// # Why an absent list is a refusal rather than a fallback
+//
+// Falling back to the internal list returns 200 with an endpoint the subscriber cannot use.
+// The credential is real, the topics are real, and the one field that decides whether any of
+// it works is wrong — so the failure appears as a connection timeout in the subscriber's logs,
+// nowhere near this request, with a secret that is not recoverable and must be reissued to
+// diagnose. Refusing costs an operator one variable and makes the requirement explicit; the
+// fallback costs a subscriber a day. A deployment whose subscribers genuinely are in-cluster
+// sets the variable to the same value as KAFKA_BROKERS.
+//
+// Parameters:
+//   - subscriber *model.EventSubscriber: the subscriber being provisioned, named in the error
+//     so an operator knows which request was refused. May be nil.
+//
+// Returns:
+//   - []string: the subscriber-facing bootstrap list, never empty on success.
+//   - error: ErrSubscriberBrokersNotConfigured (503) when no list is configured.
+func (s *EventSubscriberService) subscriberFacingBrokers(
+	subscriber *model.EventSubscriber,
+) ([]string, error) {
+	// Read through fetchConfiguration — the package's configuration seam, declared in
+	// event_sunset.go — for the same reason provisioner does: a test that swaps it sees
+	// consistent behaviour across every event file. A configuration that cannot be read is
+	// treated as "not configured", which refuses rather than falling back.
+	if cnf, err := fetchConfiguration(); err == nil && cnf != nil {
+		if brokers, configured := cnf.Kafka.SubscriberFacingBrokers(); configured {
+			return brokers, nil
+		}
+	}
+
+	identifier := ""
+	if subscriber != nil {
+		identifier = subscriber.SubscriberID
+	}
+
+	logrus.WithField("subscriber", sanitizeLogValue(identifier, maxLoggedFilterLength)).Error(
+		"event subscriber: KAFKA_SUBSCRIBER_BROKERS is not configured, so no credential was " +
+			"issued; set it to the externally advertised broker addresses subscribers connect to " +
+			"(the same value as KAFKA_BROKERS when subscribers run inside the deployment)",
+	)
+
+	return nil, apierror.NewAPIError(
+		apierror.ErrSubscriberBrokersNotConfigured,
+		// The VARIABLE IS NAMED IN THE MESSAGE, not only in the detail and the log. This is
+		// the one string that reaches the operator running the request, and "no broker list is
+		// configured" without the key is a message that cannot be acted on. A configuration
+		// key name discloses nothing: it is documented in .env.example and the manifests.
+		"KAFKA_SUBSCRIBER_BROKERS is not configured, so no subscriber-facing Kafka broker list "+
+			"is available and credentials cannot be issued. Set it to the externally advertised "+
+			"broker addresses subscribers connect to",
+		NewSubscriberErrorDetail(
+			"KAFKA_SUBSCRIBER_BROKERS is not configured", identifier,
+			// Retryable: nothing was written, and the request succeeds unchanged once the
+			// variable is set.
+			true,
+		),
+	)
+}
+
+// DeregisterSubscriber ends a subscriber's access at the broker and then removes it from the
+// registry.
+//
+// # AUTH-03: REVOKE FIRST, DELETE ONLY ONCE THE REVOCATION IS CONFIRMED
+//
+// The order is the whole of this function, and the previous order was wrong. It used to DELETE
+// the row and revoke afterwards. When the revocation then failed, the principal kept
+// authenticating and kept reading — and the only record of WHICH principal that was had just
+// been destroyed. The residue was live broker access that nothing in Blnk could see, and the
+// error message plus a log line were all an operator had to work from.
+//
+// The sequence is now four steps, and each one exists because of the failure it prevents:
+//
+//  1. FENCE the subscriber, so an issuance cannot mint a credential for a principal that is
+//     being taken out of service — and so the deregistration cannot race one that is already
+//     in flight.
+//  2. TOMBSTONE the row. MarkSubscriberRevocationPending stamps revocation_pending_at and
+//     returns the row, so the principal and the topic list revocation needs are in hand while
+//     the row itself SURVIVES. A tombstoned row is not an active subscriber: issuance refuses
+//     for it.
+//  3. REVOKE at the broker. The ACL bindings go first and the SCRAM credential second, so a
 //     partial failure always leaves the principal with FEWER rights rather than more.
-//  3. If revocation fails, the registry no longer describes a principal that may still
-//     authenticate. That is the one residue this sequence can leave, so it is reported as an
-//     error AND logged at error level WITH THE PRINCIPAL, which is the only remaining record
-//     of what an operator has to revoke by hand.
+//  4. DELETE the row, and only now. TakeEventSubscriber removes it and returns it, so the
+//     caller can report exactly what was revoked.
+//
+// A failure at step 3 leaves the tombstoned row in place and returns an error. That row is a
+// DURABLE TO-DO ITEM rather than a lost one: it names the principal, it says how long the
+// revocation has been outstanding, and RETRYING THE DEREGISTRATION FINISHES THE JOB — the
+// tombstone is idempotent, revocation is idempotent, and the delete happens once the revocation
+// finally succeeds.
 //
 // # A deployment with no Kafka deregisters cleanly
 //
-// When no broker is configured there is no broker-side state, so revocation is skipped and
-// the removal succeeds. That keeps the registry usable in a Kafka-less deployment, exactly as
+// When no broker is configured there is no broker-side state, so revocation is skipped and the
+// row is deleted directly. That keeps the registry usable in a Kafka-less deployment, exactly as
 // registration and listing are.
 //
 // Parameters:
-//   - ctx context.Context: cancels the removal and the revocation.
+//   - ctx context.Context: cancels the revocation and the removal.
 //   - subscriberID string: the business key of the subscriber to remove.
 //
 // Returns:
-//   - *model.EventSubscriber: the row that was removed, so the caller can report what it
-//     revoked. Returned even when revocation failed, because it is the only description of
-//     the state left behind.
-//   - error: ErrSubscriberNotFound when no such subscriber exists;
-//     ErrSubscriberProvisioningFailed when the row was removed but the broker-side revocation
-//     did not complete; the repository's error otherwise.
+//   - *model.EventSubscriber: the row that was removed on success, or the TOMBSTONED row when
+//     revocation failed — which is the description of the state left behind and the row a retry
+//     will find.
+//   - error: ErrSubscriberNotFound when no such subscriber exists; a typed conflict when another
+//     operation holds the subscriber's claim; ErrSubscriberProvisioningFailed when the
+//     broker-side revocation did not complete and the row was therefore NOT deleted; the
+//     repository's error otherwise.
 func (s *EventSubscriberService) DeregisterSubscriber(
 	ctx context.Context,
 	subscriberID string,
@@ -1540,28 +2004,48 @@ func (s *EventSubscriberService) DeregisterSubscriber(
 		return nil, err
 	}
 
-	removed, err := store.TakeEventSubscriber(ctx, strings.TrimSpace(subscriberID))
+	subscriberID = strings.TrimSpace(subscriberID)
+
+	// STEP 1 — FENCE. Nothing may issue a credential for a principal that is being taken out of
+	// service, and no second deregistration may run alongside this one.
+	releaseFence, err := fenceSubscriber(ctx, store, subscriberID)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseFence()
+
+	// STEP 2 — TOMBSTONE. The row survives, carrying the principal and topics revocation needs
+	// and saying plainly that this subscriber is on its way out.
+	pending, err := store.MarkSubscriberRevocationPending(ctx, subscriberID, s.clock())
 	if err != nil {
 		return nil, err
 	}
 
 	admin, err := s.provisioner()
 	if err != nil {
-		// The registry row is already gone. Reporting the principal here is what keeps the
-		// residue actionable, and the error is returned so the caller does not read the
-		// removal as complete.
+		// The row is TOMBSTONED, not deleted, so nothing is lost: it names the principal and a
+		// retry finds it. The error is returned so the caller does not read the removal as
+		// complete.
 		logrus.WithError(err).WithFields(logrus.Fields{
-			"subscriber": sanitizeLogValue(removed.SubscriberID, maxLoggedFilterLength),
-			"principal":  sanitizeLogValue(removed.KafkaPrincipal, maxLoggedFilterLength),
+			"subscriber": sanitizeLogValue(pending.SubscriberID, maxLoggedFilterLength),
+			"principal":  sanitizeLogValue(pending.KafkaPrincipal, maxLoggedFilterLength),
 		}).Error(
-			"event subscriber: the registry row was removed but no Kafka administrative client " +
-				"could be built, so the principal may still authenticate; revoke it by hand",
+			"event subscriber: no Kafka administrative client could be built, so this subscriber's " +
+				"access was NOT revoked and its registry row is kept, marked pending revocation; " +
+				"retry the deregistration once the broker is reachable",
 		)
 
-		return removed, err
+		return pending, err
 	}
 
 	if !admin.IsConfigured() {
+		// No broker, so there is no broker-side access and nothing to confirm. The row is
+		// removed directly, which is what keeps the registry usable without Kafka.
+		removed, takeErr := store.TakeEventSubscriber(ctx, subscriberID)
+		if takeErr != nil {
+			return pending, takeErr
+		}
+
 		logrus.WithFields(logrus.Fields{
 			"subscriber": sanitizeLogValue(removed.SubscriberID, maxLoggedFilterLength),
 			"principal":  sanitizeLogValue(removed.KafkaPrincipal, maxLoggedFilterLength),
@@ -1573,32 +2057,67 @@ func (s *EventSubscriberService) DeregisterSubscriber(
 		return removed, nil
 	}
 
-	if err := admin.RevokeSubscriber(ctx, removed); err != nil {
+	// STEP 3 — REVOKE, using the row that still exists.
+	if err := admin.RevokeSubscriber(ctx, pending); err != nil {
 		logrus.WithError(err).WithFields(logrus.Fields{
-			"subscriber":             sanitizeLogValue(removed.SubscriberID, maxLoggedFilterLength),
-			"principal":              sanitizeLogValue(removed.KafkaPrincipal, maxLoggedFilterLength),
-			"authorized_topic_count": len(removed.AuthorizedTopics),
+			"subscriber":             sanitizeLogValue(pending.SubscriberID, maxLoggedFilterLength),
+			"principal":              sanitizeLogValue(pending.KafkaPrincipal, maxLoggedFilterLength),
+			"authorized_topic_count": len(pending.AuthorizedTopics),
+			"revocation_pending_at":  subscriberPendingSince(pending),
 		}).Error(
-			"event subscriber: the registry row was removed but revoking its Kafka access failed, " +
-				"so the principal named here may still authenticate and still read; revoke it by hand",
+			"event subscriber: revoking this subscriber's Kafka access failed, so its registry row " +
+				"was NOT deleted and is kept marked pending revocation; the principal named here may " +
+				"still authenticate until the deregistration is retried",
 		)
 
-		return removed, apierror.NewAPIError(
+		return pending, apierror.NewAPIError(
 			apierror.ErrSubscriberProvisioningFailed,
-			"The subscriber was removed but its Kafka access could not be revoked",
+			"The subscriber's Kafka access could not be revoked, so it was not removed",
 			fmt.Errorf(
-				"blnk: revoking Kafka access for principal %q after removing subscriber %q: %w",
-				removed.KafkaPrincipal, removed.SubscriberID, err,
+				"blnk: revoking Kafka access for principal %q of subscriber %q: %w",
+				pending.KafkaPrincipal, pending.SubscriberID, err,
 			),
 		)
+	}
+
+	// STEP 4 — DELETE, now that the broker-side cleanup is confirmed.
+	removed, err := store.TakeEventSubscriber(ctx, subscriberID)
+	if err != nil {
+		// The access is already gone, so this residue is the harmless direction: a registry row
+		// describing a subscriber that can no longer authenticate. Retrying the deregistration
+		// removes it, and the tombstone is what makes the row identifiable as needing that.
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"subscriber": sanitizeLogValue(pending.SubscriberID, maxLoggedFilterLength),
+			"principal":  sanitizeLogValue(pending.KafkaPrincipal, maxLoggedFilterLength),
+		}).Error(
+			"event subscriber: Kafka access was revoked but the registry row could not be deleted; " +
+				"the subscriber can no longer authenticate and the row remains marked pending " +
+				"revocation until the deregistration is retried",
+		)
+
+		return pending, err
 	}
 
 	logrus.WithFields(logrus.Fields{
 		"subscriber": sanitizeLogValue(removed.SubscriberID, maxLoggedFilterLength),
 		"principal":  sanitizeLogValue(removed.KafkaPrincipal, maxLoggedFilterLength),
-	}).Info("event subscriber: deregistered and Kafka access revoked")
+	}).Info("event subscriber: Kafka access revoked and the subscriber deregistered")
 
 	return removed, nil
+}
+
+// subscriberPendingSince renders the revocation tombstone for a log field.
+//
+// It is what turns "this revocation failed" into "this revocation has been outstanding since
+// 14:02", which is the difference between a line an operator can act on and one they cannot.
+// A row with no tombstone reports the empty string rather than a zero instant, because a
+// formatted year 1 would read as data.
+func subscriberPendingSince(subscriber *model.EventSubscriber) string {
+	if subscriber == nil || subscriber.RevocationPendingAt == nil {
+		return ""
+	}
+
+	return subscriber.RevocationPendingAt.UTC().Format(time.RFC3339)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1609,71 +2128,60 @@ func (s *EventSubscriberService) DeregisterSubscriber(
 // ---------------------------------------------------------------------------------------
 
 // IssueSubscriberCredential mints a subscriber's SASL/SCRAM credential, binds its ACLs, and
-// returns the secret EXACTLY ONCE.
+// returns the secret to the caller.
 //
 // # The 5-second budget is enforced here, explicitly
 //
 // The whole operation runs under context.WithTimeout(ctx, SubscriberCredentialIssuanceBudget)
 // and that derived context is passed into every step, so the ceiling covers the four possible
-// broker round trips AND the database write together. Relying on the admin client's own
-// per-request timeout would not do: four ten-second timeouts serialised is forty seconds
-// while every individual call looks healthy. A broker that accepts a connection and then
-// stops answering therefore fails this call at five seconds instead of holding the request
-// open indefinitely.
-//
-// A caller whose own context expires sooner still wins, because WithTimeout only ever
-// shortens.
+// broker round trips AND the database write together. The admin client's own per-request
+// timeout would not do: four ten-second timeouts serialised is forty seconds while every
+// individual call looks healthy. A caller whose own context expires sooner still wins, because
+// WithTimeout only ever shortens.
 //
 // # Nothing is generated for a request that cannot succeed
 //
-// The broker configuration is checked BEFORE a secret is drawn. With no brokers configured
-// the answer is ErrKafkaUnavailable — 503 — and no random value is generated, no reference is
-// derived and no row is touched. Generating a secret that could never be provisioned would
-// mean the process briefly held a credential nobody could ever use.
+// The broker configuration is checked BEFORE a secret is drawn: with no brokers the answer is
+// ErrKafkaUnavailable (503), and no random value is generated, no reference derived and no row
+// touched.
 //
 // # Re-issuance is supported, defined, and destructive to the previous secret
 //
-// A second call mints a NEW secret and a new reference, and overwrites credential_reference
-// and credential_issued_at. The PREVIOUS SECRET STOPS WORKING IMMEDIATELY: Kafka stores one
-// SCRAM credential per principal, so the upsert replaces it, and a consumer still
-// authenticating with the old one begins failing at its next handshake. That is reported
-// through SubscriberCredential.Replaced so a caller can say so, and logged so an operator can
-// see it. It is never a silent no-op and the old secret is never returned — both would be
-// worse than the disruption, because the caller would believe it held a working credential.
+// A second call mints a NEW secret and reference and overwrites credential_reference and
+// credential_issued_at. THE PREVIOUS SECRET STOPS WORKING IMMEDIATELY — Kafka stores one SCRAM
+// credential per principal, so the upsert replaces it and a consumer still using the old one
+// fails at its next handshake. That is reported through SubscriberCredential.Replaced and
+// logged, never a silent no-op, and the old secret is never returned. The consumer group and
+// the principal are unchanged, both being derived from the immutable subscriber id.
 //
-// The consumer group and the principal are UNCHANGED by a re-issue: both are derived from the
-// immutable subscriber id, so a rotation replaces the secret and nothing else, and the
-// subscriber's existing group offsets and ACL bindings continue to apply.
+// # Partial failure, and what the result can and cannot promise
 //
-// # Partial failure has one documented outcome
-//
-// event_admin.go compensates a failure that lands between the credential and its ACLs: if
-// the bindings cannot be created after the credential was written, it revokes the credential
-// before returning, so the broker is left CLEAN rather than holding a principal that can
-// authenticate with no boundary. This method therefore never records an issuance on any error
-// path, and it distinguishes the two states in its logging — compensated (nothing to do) from
-// compensation-failed (a live principal needs manual revocation, and the log line names it).
-// Both are answered with ErrSubscriberProvisioningFailed, which is 503, because provisioning
-// depends on an external system and the caller's correct response is to retry.
+// event_admin.go compensates a failure that lands between the credential and its ACLs by
+// revoking the credential before returning. THE OUTCOME OF THAT REVOCATION IS REPORTED, not
+// assumed: Compensated is set only when the broker confirmed the deletion, and a revocation
+// that itself failed leaves CredentialWritten true. This method never records an issuance on
+// any error path, and it distinguishes compensated (broker confirmed clean, retry) from
+// compensation-failed (a live principal is unaccounted for, logged at ERROR with the principal
+// named). Removal of the attempted bindings is best-effort and deliberately not part of that
+// flag, because inert bindings for a principal that no longer exists grant nothing. Both
+// answer ErrSubscriberProvisioningFailed (503).
 //
 // # The secret goes to the caller and nowhere else
 //
 // Only a NON-REVERSIBLE reference (model.DeriveCredentialReference: HMAC-SHA-256 keyed by the
 // principal) and the issuance instant are persisted. The plaintext is returned inside
-// SubscriberCredential, is never written to the database, never logged, never placed in an
-// error message and never attached to a span or a metric label. There is no route by which it
-// can be read again; a lost password can only be replaced.
+// SubscriberCredential and is never written to the database, logged, placed in an error
+// message, or attached to a span or a metric label; nothing can read it back afterwards.
 //
 // Parameters:
-//   - ctx context.Context: the caller's context. It is wrapped in the issuance budget, so a
-//     caller supplying no deadline still gets one.
+//   - ctx context.Context: the caller's context, wrapped in the issuance budget.
 //   - subscriberID string: the business key of the subscriber to provision.
 //
 // Returns:
 //   - SubscriberCredential: the connection details and the one-time secret. Zero-valued on
-//     every error path, so a failed issuance cannot hand back a partial credential.
-//   - error: ErrSubscriberNotFound (404) when no such subscriber exists; ErrKafkaUnavailable
-//     (503) when no broker is configured, the client cannot be built, or the budget expired;
+//     every error path.
+//   - error: ErrSubscriberNotFound (404); ErrKafkaUnavailable (503) when no broker is
+//     configured, the client cannot be built, or the budget expired;
 //     ErrSubscriberProvisioningFailed (503) when the broker refused the credential or the
 //     bindings; a typed conflict (409) when a concurrent issuance superseded this one; a
 //     typed validation error (400) for an unusable subscriber id.
@@ -1710,7 +2218,46 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 		)
 	}
 
+	// THE FENCE, taken BEFORE the broker is touched and before a secret is generated.
+	//
+	// Two overlapping issuances cannot both be right: the broker keeps one password and the
+	// registry may record the other. The claim makes the second caller a conflict instead of a
+	// silent loser — see fenceSubscriber. It is taken before the row is read so that everything
+	// this call decides from is read under the claim.
+	releaseFence, err := fenceSubscriber(ctx, store, subscriberID)
+	if err != nil {
+		return SubscriberCredential{}, err
+	}
+	defer releaseFence()
+
 	subscriber, err := store.GetEventSubscriberByID(ctx, subscriberID)
+	if err != nil {
+		return SubscriberCredential{}, err
+	}
+
+	// SEC-05: fail closed on an authorization Kafka cannot enforce. Checked here — after the
+	// row is read, before a secret exists — so a subscriber recording a partition key prefix
+	// never receives a credential whose real scope is wider than the registry describes.
+	if err := requireProvisionableKeyScope(subscriber); err != nil {
+		return SubscriberCredential{}, err
+	}
+
+	// And refuse a subscriber that is on its way out, so an issuance cannot re-arm a principal
+	// whose deregistration is already in flight.
+	if err := requireActiveSubscriber(subscriber); err != nil {
+		return SubscriberCredential{}, err
+	}
+
+	// THE ENDPOINT THE SUBSCRIBER WILL DIAL, resolved before anything is minted.
+	//
+	// Checked HERE — after the row is read, before a secret exists and before the broker is
+	// touched — because the alternative orderings are both worse. Later, and a credential has
+	// been created at the broker and recorded in the registry for a response that cannot be
+	// returned. Never, and the response carries admin.Brokers(): the addresses BLNK dials,
+	// which inside a deployment are internal and do not resolve for the subscriber. That is a
+	// 200 whose failure surfaces as an unexplained connection timeout in somebody else's logs,
+	// and it publishes the internal topology on the way out.
+	subscriberBrokers, err := s.subscriberFacingBrokers(subscriber)
 	if err != nil {
 		return SubscriberCredential{}, err
 	}
@@ -1719,14 +2266,32 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 	// conditional: if another issuance for this subscriber commits in the meantime, this
 	// value no longer matches and the write reports a conflict instead of silently
 	// overwriting a record whose secret is the one that works.
+	//
+	// It is retained even under the fence, and that is not redundancy. The fence is LEASED, so
+	// an issuance whose process stalled past its lease can find itself superseded; the
+	// conditional write is what makes that outcome a reported conflict rather than a silent
+	// overwrite.
 	observedReference := subscriber.CredentialReference
 
 	password, err := s.newPassword()
 	if err != nil {
+		// The cause is not returned, and here that is more than a topology concern: this is
+		// the credential-generation path, so its error is the one most likely to render
+		// something derived from the secret itself. It is logged bounded and the caller
+		// receives the diagnosis only.
+		logrus.WithFields(logrus.Fields{
+			"subscriber": sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
+			"error":      sanitizeLogValue(err.Error(), maxLoggedErrorLength),
+		}).Error("event subscriber: generating a SASL credential failed; nothing was written")
+
 		return SubscriberCredential{}, apierror.NewAPIError(
 			apierror.ErrInternalServer,
 			"Failed to generate a SASL credential for the subscriber",
-			err,
+			// Retryable: generation is local and stateless, so nothing was written and
+			// repeating the request is safe.
+			NewSubscriberErrorDetail(
+				"Generating the SASL credential failed", subscriber.SubscriberID, true,
+			),
 		)
 	}
 
@@ -1734,10 +2299,24 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 	// control, so that what is persisted is a digest and never the value itself.
 	reference, err := model.DeriveCredentialReference(subscriber.KafkaPrincipal, password)
 	if err != nil {
+		// The password is an argument to the call that failed, so its error is the single
+		// most dangerous cause in this file to propagate. It is logged bounded — and the
+		// bounded rendering is of the ERROR, never of the inputs — and the caller receives
+		// no cause at all.
+		logrus.WithFields(logrus.Fields{
+			"subscriber": sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
+			"error":      sanitizeLogValue(err.Error(), maxLoggedErrorLength),
+		}).Error(
+			"event subscriber: deriving the credential reference failed, so nothing was written and " +
+				"the generated secret is dead",
+		)
+
 		return SubscriberCredential{}, apierror.NewAPIError(
 			apierror.ErrInternalServer,
 			"Failed to derive the subscriber credential reference",
-			err,
+			NewSubscriberErrorDetail(
+				"Deriving the credential reference failed", subscriber.SubscriberID, true,
+			),
 		)
 	}
 
@@ -1759,8 +2338,8 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 
 	credential := SubscriberCredential{
 		SubscriberID:     subscriber.SubscriberID,
-		Brokers:          admin.Brokers(),
-		BrokerEndpoint:   strings.Join(admin.Brokers(), ","),
+		Brokers:          subscriberBrokers,
+		BrokerEndpoint:   strings.Join(subscriberBrokers, ","),
 		AuthorizedTopics: result.Topics,
 		ConsumerGroupID:  subscriber.ConsumerGroupID,
 		Username:         subscriber.KafkaPrincipal,
@@ -1785,10 +2364,6 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 // The indirection exists so a test can drive the generator-failure branch, which has no other
 // trigger — the system CSPRNG does not fail on demand. A nil generator falls back to the real
 // one rather than panicking, so a hand-built zero-valued service still behaves.
-//
-// Returns:
-//   - string: the generated secret.
-//   - error: the generator's error.
 func (s *EventSubscriberService) newPassword() (string, error) {
 	if s == nil || s.generatePassword == nil {
 		return generateSubscriberPassword()
@@ -1800,34 +2375,27 @@ func (s *EventSubscriberService) newPassword() (string, error) {
 // provisioningFailure turns a broker-side provisioning failure into the right typed error and
 // records what state the broker was left in.
 //
-// # Four outcomes, and each needs a different answer
+// Four outcomes, each needing a different answer:
 //
-//   - NOT CONFIGURED. The broker list emptied between the check and the call, or an injected
-//     client reports it. 503 ErrKafkaUnavailable, and nothing was written.
-//   - BUDGET EXPIRED or CALLER CANCELLED. 503 ErrKafkaUnavailable, because a broker that did
-//     not answer within the budget is unreachable as far as this request is concerned. What
-//     the broker did or did not write is genuinely unknown, which the log line says: the
-//     remedy is to retry, and a retry re-provisions the same boundary idempotently.
-//   - COMPENSATED. The credential was written, the ACL grant failed, and event_admin.go
-//     revoked the credential — so the broker is clean and the secret generated here is dead.
-//     Logged as a warning, not an error: the system is in a consistent state and a retry is
-//     all that is needed.
-//   - COMPENSATION FAILED. The credential was written, the bindings failed AND the revocation
-//     failed, so a principal exists that can authenticate with no boundary. This is the one
-//     state that needs a human, so it is logged at ERROR with the principal named, which is
-//     the only record of what has to be revoked by hand.
+//   - NOT CONFIGURED. The broker list emptied between the check and the call. 503
+//     ErrKafkaUnavailable, and nothing was written.
+//   - BUDGET EXPIRED or CALLER CANCELLED. 503 ErrKafkaUnavailable. What the broker did or did
+//     not write is genuinely unknown, which the log line says; a retry re-provisions the same
+//     boundary idempotently.
+//   - COMPENSATED. The credential was written, the ACL grant failed, and the revocation was
+//     CONFIRMED — the broker is clean and the generated secret is dead. Logged as a warning.
+//   - COMPENSATION FAILED. The credential was written and the revocation failed too, so a
+//     principal exists that can authenticate with no boundary. Logged at ERROR with the
+//     principal named, which is the only record of what must be revoked by hand.
 //
-// No branch records an issuance, and no branch returns a credential: a caller that receives
-// an error holds no secret, and the registry continues to describe whatever it described
-// before.
-//
-// No message contains the password. The password is not a field of the result and is never
-// passed to this function.
+// No branch records an issuance and no branch returns a credential, so a caller that receives
+// an error holds no secret. No message contains the password: it is not a field of the result
+// and is never passed to this function.
 //
 // Parameters:
 //   - subscriber *model.EventSubscriber: the row being provisioned, for the log fields.
-//   - result SubscriberProvisioningResult: partially populated on failure, and the only
-//     source of truth for what reached the broker.
+//   - result SubscriberProvisioningResult: the only source of truth for what reached the
+//     broker.
 //   - cause error: the provisioning error.
 //
 // Returns:
@@ -1855,7 +2423,13 @@ func (s *EventSubscriberService) provisioningFailure(
 		return apierror.NewAPIError(
 			apierror.ErrKafkaUnavailable,
 			"Kafka is not configured, so subscriber credentials cannot be issued",
-			cause,
+			// Bounded, and the cause stays in the log line above. See
+			// SubscriberErrorDetail: NewAPIError both re-logs its details unsanitized and
+			// serialises them into the response, so passing the cause here undid the
+			// sanitizing this function had just done — on both sides at once.
+			NewSubscriberErrorDetail(
+				"Kafka is not configured", subscriber.SubscriberID, false,
+			),
 		)
 
 	case errors.Is(cause, context.DeadlineExceeded):
@@ -1870,7 +2444,15 @@ func (s *EventSubscriberService) provisioningFailure(
 				"Provisioning Kafka credentials did not complete within %s",
 				s.budget(),
 			),
-			cause,
+			// RETRYABLE, and saying so is the point: a retry re-provisions the same
+			// boundary idempotently, which is exactly what the log line above tells an
+			// operator. The state flags are carried because whether the broker wrote the
+			// credential is genuinely unknown here, and a caller deciding whether to retry
+			// needs to know that a secret may already exist that they do not hold.
+			s.provisioningDetail(
+				"Provisioning the Kafka credential did not complete within the budget",
+				subscriber, result, true,
+			),
 		)
 
 	case errors.Is(cause, context.Canceled):
@@ -1882,7 +2464,10 @@ func (s *EventSubscriberService) provisioningFailure(
 		return apierror.NewAPIError(
 			apierror.ErrKafkaUnavailable,
 			"Provisioning Kafka credentials was cancelled before it completed",
-			cause,
+			s.provisioningDetail(
+				"Provisioning the Kafka credential was cancelled before it completed",
+				subscriber, result, true,
+			),
 		)
 
 	case result.CredentialWritten:
@@ -1907,17 +2492,69 @@ func (s *EventSubscriberService) provisioningFailure(
 		)
 	}
 
+	// The three broker-side outcomes converge here, and the detail is what distinguishes
+	// them for the caller: the state flags say whether a credential reached the broker and
+	// whether it was compensated away, which is the difference between "retry and you are
+	// fine" and "a principal exists that a human has to revoke". The specific cause, and the
+	// principal's name, stay in the log lines above.
+	//
+	// NOT retryable: each of these branches represents a broker that answered and refused,
+	// or a compensation decision already taken, so an immediate retry repeats the same
+	// failure. That is the opposite of the timeout and cancellation branches above, and
+	// stating it is what stops a client retrying into a loop.
 	return apierror.NewAPIError(
 		apierror.ErrSubscriberProvisioningFailed,
 		"Failed to provision Kafka credentials for the subscriber",
-		cause,
+		s.provisioningDetail(
+			"Provisioning the Kafka principal failed at the broker",
+			subscriber, result, false,
+		),
 	)
 }
 
-// recordFailure handles the narrow window in which the broker holds a credential the registry
-// did not manage to record.
+// provisioningDetail builds a bounded provisioning-failure detail carrying what reached the
+// broker.
 //
-// # Three cases, and only two of them may revoke
+// It exists so the four branches of provisioningFailure cannot disagree about which state
+// flags they report: the flags are the only way a caller learns whether a credential they do
+// not hold may exist at the broker, and a branch that omitted them would leave that
+// unanswerable.
+//
+// Parameters:
+//   - reason string: fixed wording describing the failure.
+//   - subscriber *model.EventSubscriber: the row being provisioned, read for its identifier.
+//   - result SubscriberProvisioningResult: the only source of truth for what reached the
+//     broker.
+//   - retryable bool: whether repeating the request may succeed.
+//
+// Returns:
+//   - SubscriberErrorDetail: the safe detail, with the broker-state flags set.
+func (s *EventSubscriberService) provisioningDetail(
+	reason string,
+	subscriber *model.EventSubscriber,
+	result SubscriberProvisioningResult,
+	retryable bool,
+) SubscriberErrorDetail {
+	subscriberID := ""
+	if subscriber != nil {
+		subscriberID = subscriber.SubscriberID
+	}
+
+	detail := NewSubscriberErrorDetail(reason, subscriberID, retryable)
+	detail.CredentialWritten = result.CredentialWritten
+	detail.Compensated = result.Compensated
+
+	return detail
+}
+
+// recordFailure handles the narrow window in which the broker holds a credential the registry
+// could not record.
+//
+// The broker write happened and the database write did not, so the subscriber's principal can
+// authenticate while blnk.event_subscribers still describes the previous state. The secret is
+// NOT returned in that case — handing back a credential whose issuance was not recorded would
+// leave an untracked, working credential in a caller's hands — and the credential is revoked so
+// the broker and the registry agree again.
 //
 //   - SUPERSEDED (conflict). Another issuance for this subscriber committed while this one was
 //     at the broker, so the registry now records ITS reference. REVOCATION IS REFUSED HERE:
@@ -1939,16 +2576,24 @@ func (s *EventSubscriberService) provisioningFailure(
 // an error either way, so a revocation problem is logged with the principal named rather than
 // replacing the error the caller actually needs to see.
 //
+// # CLEAN-01: both cleanups run on a FRESH deadline
+//
+// They used to run on the issuance context, which carries the 5-second budget — and that
+// budget expiring is one of the commonest reasons the recording write fails. So on exactly the
+// occasion this function exists for, the revocation and the record-clearing were attempted
+// against an already-cancelled context, failed instantly, and left the residue they exist to
+// remove: a live credential the registry does not record. A cleanup that is busiest when it
+// cannot work is not a cleanup.
+//
 // Parameters:
-//   - ctx context.Context: the issuance context, already carrying the budget. A revocation
-//     attempted after the budget expired will fail fast, which is logged and tolerated.
+//   - ctx context.Context: the issuance context. Used for its VALUES only; a fresh bounded
+//     context is derived for each cleanup write, so an expired budget no longer prevents them.
 //   - admin subscriberPrincipalProvisioner: the client that provisioned.
 //   - subscriber *model.EventSubscriber: the row being provisioned.
 //   - cause error: the repository's error, already typed.
 //
 // Returns:
-//   - error: the repository's error, unchanged, so its code and message survive to the
-//     response.
+//   - error: the typed error to answer the request with.
 func (s *EventSubscriberService) recordFailure(
 	ctx context.Context,
 	admin subscriberPrincipalProvisioner,
@@ -1973,7 +2618,10 @@ func (s *EventSubscriberService) recordFailure(
 		return cause
 	}
 
-	if err := admin.RevokeSubscriber(ctx, subscriber); err != nil {
+	cleanup, cancelCleanup := subscriberCleanupContext(ctx)
+	defer cancelCleanup()
+
+	if err := admin.RevokeSubscriber(cleanup, subscriber); err != nil {
 		logrus.WithError(err).WithFields(fields).Error(
 			"event subscriber: recording the issuance failed AND revoking the credential it had " +
 				"already written failed, so the principal named here holds a credential that no " +
@@ -1998,7 +2646,7 @@ func (s *EventSubscriberService) recordFailure(
 	// has gone, which every reader of it (an operator, the migration report, a reconciliation)
 	// would otherwise believe. Best-effort, because the write that just failed is the same
 	// connection this one uses.
-	if s.clearCredentialRecord(ctx, subscriber, fields) {
+	if s.clearCredentialRecord(cleanup, subscriber, fields) {
 		logrus.WithFields(fields).Warn(
 			"event subscriber: recording the issuance failed, so the credential written at the " +
 				"broker was revoked and the registry's credential record was cleared; the " +
@@ -2018,7 +2666,9 @@ func (s *EventSubscriberService) recordFailure(
 // correctable.
 //
 // Parameters:
-//   - ctx context.Context: cancels the write.
+//   - ctx context.Context: cancels the write. Callers on a failure path pass a FRESH bounded
+//     context rather than their own — see subscriberCleanupContext — because the deadline that
+//     failed is often the reason they are here.
 //   - subscriber *model.EventSubscriber: the row whose record is being cleared.
 //   - fields logrus.Fields: the caller's log fields, reused so both lines correlate.
 //
@@ -2086,30 +2736,16 @@ func isSubscriberNotFoundError(err error) bool {
 
 // RevokeSubscriberCredential ends a subscriber's Kafka access while leaving it registered.
 //
-// It is the counterpart to IssueSubscriberCredential and the operation to reach for when a
-// secret is suspected of being compromised but the subscriber itself is staying: the
-// credential and its bindings go, the registry row and its topic grant remain, and a single
-// re-issue restores access.
+// It is the operation to reach for when a secret has leaked: the subscriber stays in the
+// registry, its topics and group are unchanged, and a later issuance restores access with a new
+// secret. Deleting the SCRAM credential is what ends access, because that is what the SASL
+// handshake checks; the ACL bindings the row describes are removed with it.
 //
-// # The order over-reports rather than under-reports
-//
-// Broker first, registry second — which is what Datasource.ClearSubscriberCredential's
-// documentation prescribes. Broker-side deletion is what actually ends access, so doing it
-// first means a failure between the two leaves the registry claiming a credential that no
-// longer exists: it over-reports access, which is visible and harmless, instead of hiding a
-// credential that still works.
-//
-// Clearing a subscriber that holds no credential succeeds, because the desired end state is
-// already true. A missing subscriber is still an error.
-//
-// Parameters:
-//   - ctx context.Context: cancels the revocation and the write.
-//   - subscriberID string: the business key.
+// The credential RECORD is cleared only after the broker confirms the revocation, so the
+// registry never says "no credential" while one still authenticates.
 //
 // Returns:
-//   - error: ErrSubscriberNotFound when no such subscriber exists; ErrKafkaUnavailable when no
-//     administrative client can be built; ErrSubscriberProvisioningFailed when the broker
-//     refused the revocation; the repository's error when the record could not be cleared.
+//   - error: ErrSubscriberNotFound, a revocation failure, or the repository's error.
 func (s *EventSubscriberService) RevokeSubscriberCredential(ctx context.Context, subscriberID string) error {
 	store, err := s.requireStore()
 	if err != nil {
@@ -2121,6 +2757,15 @@ func (s *EventSubscriberService) RevokeSubscriberCredential(ctx context.Context,
 	}
 
 	subscriberID = strings.TrimSpace(subscriberID)
+
+	// FENCED, for the same reason issuance is: revoking the credential an issuance is in the
+	// middle of writing would leave the broker and the registry describing different states,
+	// and which one won would depend on the order two network calls happened to complete in.
+	releaseFence, err := fenceSubscriber(ctx, store, subscriberID)
+	if err != nil {
+		return err
+	}
+	defer releaseFence()
 
 	subscriber, err := store.GetEventSubscriberByID(ctx, subscriberID)
 	if err != nil {
@@ -2148,8 +2793,13 @@ func (s *EventSubscriberService) RevokeSubscriberCredential(ctx context.Context,
 			return apierror.NewAPIError(
 				apierror.ErrSubscriberProvisioningFailed,
 				"Failed to revoke the subscriber's Kafka access",
-				fmt.Errorf(
-					"blnk: revoking Kafka access for principal %q: %w", subscriber.KafkaPrincipal, err,
+				// Same treatment as the deregistration path, for the same reason: the
+				// principal and the broker's own words stay in the log, and the caller
+				// receives the diagnosis plus the fact that a retry is safe. Revocation is
+				// idempotent at the broker, so repeating it cannot make things worse.
+				NewSubscriberErrorDetail(
+					"Revoking the subscriber's Kafka access failed at the broker",
+					subscriber.SubscriberID, true,
 				),
 			)
 		}
@@ -2172,22 +2822,17 @@ func (s *EventSubscriberService) RevokeSubscriberCredential(ctx context.Context,
 }
 
 // ---------------------------------------------------------------------------------------
-// The dual-run migration surface (AMBIGUITY-1)
+// The dual-run migration surface
 //
-// These four operations exist ONLY for the 30-day window during which Kafka publishing and
-// legacy HTTP webhook delivery run side by side from the same outbox events. They record
-// where a subscriber used to receive pushes, when it finished moving, and — once a retention
-// period has passed — forget the endpoint.
+// These four operations exist for the window during which Kafka publishing and legacy HTTP
+// webhook delivery run side by side from the same outbox events. They record where a subscriber
+// used to receive pushes, when it finished moving, and — once a retention period has passed —
+// forget the endpoint. They are also what makes the sunset observable: without a per-subscriber
+// record there is no route on which a 410 Gone could be seen after the sunset date.
 //
-// They are the reason the sunset is observable. The requirement to migrate subscribers off
-// "the webhook subscription REST API" meets a repository whose entire subscription surface is
-// one global configuration value, so without a per-subscriber record there is no route on
-// which a 410 Gone could ever be seen after the sunset date.
-//
-// AGAIN, BECAUSE IT IS THE EASIEST THING TO GET WRONG: /hooks is NOT this surface. Those are
-// the PRE_TRANSACTION and POST_TRANSACTION request-time callouts in internal/hooks, they carry
-// a response contract that can influence transaction processing, they stay fully functional,
-// and nothing here touches them.
+// /hooks IS NOT THIS SURFACE. Those are the PRE_TRANSACTION and POST_TRANSACTION request-time
+// callouts in internal/hooks; they carry a response contract that can influence transaction
+// processing, they stay fully functional, and nothing here touches them.
 // ---------------------------------------------------------------------------------------
 
 // RecordLegacyWebhookSubscription records the legacy HTTP endpoint a migrating subscriber
@@ -2233,14 +2878,6 @@ func (s *EventSubscriberService) RecordLegacyWebhookSubscription(
 // an operator correcting a record or honouring a request before the retention period elapses.
 // migrated_at is untouched: it is an audit fact rather than third-party data, and it is what
 // migration-progress reporting counts.
-//
-// Parameters:
-//   - ctx context.Context: cancels the read and the write.
-//   - subscriberID string: the business key.
-//
-// Returns:
-//   - *model.EventSubscriber: the row as it now stands, with no recorded endpoint.
-//   - error: ErrSubscriberNotFound, or the repository's write error.
 func (s *EventSubscriberService) ClearLegacyWebhookSubscription(
 	ctx context.Context,
 	subscriberID string,
@@ -2304,15 +2941,6 @@ func (s *EventSubscriberService) MarkSubscriberMigrated(
 // The cut-off is the CALLER'S, so the retention period stays a policy decision rather than a
 // constant buried in a service. A zero cut-off is refused by the repository rather than read
 // as "purge everything".
-//
-// Parameters:
-//   - ctx context.Context: cancels the write.
-//   - migratedBefore time.Time: purge subscribers whose migration completed strictly before
-//     this instant.
-//
-// Returns:
-//   - int64: how many rows were purged.
-//   - error: the repository's error, including its refusal of a zero cut-off.
 func (s *EventSubscriberService) PurgeMigratedWebhookURLs(
 	ctx context.Context,
 	migratedBefore time.Time,
@@ -2360,9 +2988,6 @@ func (s *EventSubscriberService) PurgeMigratedWebhookURLs(
 //
 // It is nil-safe: a nil instance yields a service whose operations report an unavailable
 // registry rather than panicking.
-//
-// Returns:
-//   - *EventSubscriberService: a ready service the caller owns.
 func (b *Blnk) EventSubscribers() *EventSubscriberService {
 	if b == nil {
 		return NewEventSubscriberService(nil, nil)
@@ -2374,14 +2999,6 @@ func (b *Blnk) EventSubscribers() *EventSubscriberService {
 // RegisterEventSubscriber records a new subscriber. It is the write behind POST /subscribers.
 //
 // No broker is touched: registration describes a boundary, it does not grant one.
-//
-// Parameters:
-//   - ctx context.Context: cancels the insert.
-//   - registration SubscriberRegistration: the subscriber to record.
-//
-// Returns:
-//   - *model.EventSubscriber: the stored row.
-//   - error: as EventSubscriberService.RegisterSubscriber.
 func (b *Blnk) RegisterEventSubscriber(
 	ctx context.Context,
 	registration SubscriberRegistration,
@@ -2391,43 +3008,17 @@ func (b *Blnk) RegisterEventSubscriber(
 
 // GetEventSubscriber reads one subscriber. It is the read behind
 // GET /subscribers/:subscriber_id.
-//
-// Parameters:
-//   - ctx context.Context: cancels the query.
-//   - subscriberID string: the business key.
-//
-// Returns:
-//   - *model.EventSubscriber: the stored row.
-//   - error: as EventSubscriberService.GetSubscriber.
 func (b *Blnk) GetEventSubscriber(ctx context.Context, subscriberID string) (*model.EventSubscriber, error) {
 	return b.EventSubscribers().GetSubscriber(ctx, subscriberID)
 }
 
 // ListEventSubscribers pages the registry. It is the read behind GET /subscribers.
-//
-// Parameters:
-//   - ctx context.Context: cancels the query.
-//   - limit int: page size; non-positive selects the repository default.
-//   - offset int: page offset; negative is clamped.
-//
-// Returns:
-//   - []model.EventSubscriber: the page, newest first.
-//   - error: as EventSubscriberService.ListSubscribers.
 func (b *Blnk) ListEventSubscribers(ctx context.Context, limit, offset int) ([]model.EventSubscriber, error) {
 	return b.EventSubscribers().ListSubscribers(ctx, limit, offset)
 }
 
 // UpdateEventSubscriber applies the mutable subset of a subscriber. It is the write behind
 // PUT /subscribers/:subscriber_id.
-//
-// Parameters:
-//   - ctx context.Context: cancels the read and the write.
-//   - subscriberID string: the business key.
-//   - changes SubscriberUpdate: the fields to apply.
-//
-// Returns:
-//   - *model.EventSubscriber: the row as it now stands.
-//   - error: as EventSubscriberService.UpdateSubscriber.
 func (b *Blnk) UpdateEventSubscriber(
 	ctx context.Context,
 	subscriberID string,
@@ -2441,14 +3032,6 @@ func (b *Blnk) UpdateEventSubscriber(
 //
 // The short-lived administrative client this resolves is closed before returning, so the
 // handler needs no lifecycle handling of its own.
-//
-// Parameters:
-//   - ctx context.Context: cancels the removal and the revocation.
-//   - subscriberID string: the business key.
-//
-// Returns:
-//   - *model.EventSubscriber: the row that was removed.
-//   - error: as EventSubscriberService.DeregisterSubscriber.
 func (b *Blnk) DeregisterEventSubscriber(
 	ctx context.Context,
 	subscriberID string,
@@ -2468,14 +3051,6 @@ func (b *Blnk) DeregisterEventSubscriber(
 //
 // The five-second issuance budget is applied inside the service, so a handler needs no
 // timeout of its own — though a shorter one it already holds is still honoured.
-//
-// Parameters:
-//   - ctx context.Context: the request context.
-//   - subscriberID string: the business key.
-//
-// Returns:
-//   - SubscriberCredential: the connection details and the one-time secret.
-//   - error: as EventSubscriberService.IssueSubscriberCredential.
 func (b *Blnk) IssueSubscriberKafkaCredentials(
 	ctx context.Context,
 	subscriberID string,
@@ -2488,13 +3063,6 @@ func (b *Blnk) IssueSubscriberKafkaCredentials(
 
 // RevokeSubscriberKafkaCredentials ends a subscriber's Kafka access while leaving it
 // registered.
-//
-// Parameters:
-//   - ctx context.Context: cancels the revocation and the write.
-//   - subscriberID string: the business key.
-//
-// Returns:
-//   - error: as EventSubscriberService.RevokeSubscriberCredential.
 func (b *Blnk) RevokeSubscriberKafkaCredentials(ctx context.Context, subscriberID string) error {
 	service := b.EventSubscribers()
 	defer closeEventSubscriberService(service)
@@ -2509,15 +3077,6 @@ func (b *Blnk) RevokeSubscriberKafkaCredentials(ctx context.Context, subscriberI
 // dual-delivery window. Once WEBHOOK_DEPRECATION_SUNSET_DATE has passed every request to
 // those routes is answered with 410 Gone. Use the Kafka event stream and
 // IssueSubscriberKafkaCredentials instead.
-//
-// Parameters:
-//   - ctx context.Context: cancels the read and the write.
-//   - subscriberID string: the business key.
-//   - webhookURL string: the endpoint to record.
-//
-// Returns:
-//   - *model.EventSubscriber: the row as it now stands.
-//   - error: as EventSubscriberService.RecordLegacyWebhookSubscription.
 func (b *Blnk) RecordSubscriberWebhookSubscription(
 	ctx context.Context,
 	subscriberID, webhookURL string,
@@ -2529,14 +3088,6 @@ func (b *Blnk) RecordSubscriberWebhookSubscription(
 // the write behind DELETE /subscribers/:subscriber_id/webhook-subscription.
 //
 // Deprecated: see RecordSubscriberWebhookSubscription.
-//
-// Parameters:
-//   - ctx context.Context: cancels the read and the write.
-//   - subscriberID string: the business key.
-//
-// Returns:
-//   - *model.EventSubscriber: the row as it now stands.
-//   - error: as EventSubscriberService.ClearLegacyWebhookSubscription.
 func (b *Blnk) ClearSubscriberWebhookSubscription(
 	ctx context.Context,
 	subscriberID string,
@@ -2546,28 +3097,12 @@ func (b *Blnk) ClearSubscriberWebhookSubscription(
 
 // MarkEventSubscriberMigrated records that a subscriber has completed its move to Kafka
 // consumption.
-//
-// Parameters:
-//   - ctx context.Context: cancels the write.
-//   - subscriberID string: the business key.
-//
-// Returns:
-//   - time.Time: the instant recorded, in UTC.
-//   - error: as EventSubscriberService.MarkSubscriberMigrated.
 func (b *Blnk) MarkEventSubscriberMigrated(ctx context.Context, subscriberID string) (time.Time, error) {
 	return b.EventSubscribers().MarkSubscriberMigrated(ctx, subscriberID)
 }
 
 // PurgeMigratedSubscriberWebhookURLs forgets the legacy endpoints of subscribers that migrated
 // before a cut-off.
-//
-// Parameters:
-//   - ctx context.Context: cancels the write.
-//   - migratedBefore time.Time: the retention cut-off, chosen by the caller.
-//
-// Returns:
-//   - int64: how many rows were purged.
-//   - error: as EventSubscriberService.PurgeMigratedWebhookURLs.
 func (b *Blnk) PurgeMigratedSubscriberWebhookURLs(ctx context.Context, migratedBefore time.Time) (int64, error) {
 	return b.EventSubscribers().PurgeMigratedWebhookURLs(ctx, migratedBefore)
 }

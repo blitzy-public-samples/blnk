@@ -61,6 +61,20 @@ func TestCreateIdentity(t *testing.T) {
 	}
 	metaDataJSON, _ := json.Marshal(identity.MetaData)
 
+	// NO TRANSACTION IS SCRIPTED, and that is the graceful-degradation criterion rather than
+	// an omission.
+	//
+	// The entity writers open a transaction only when they are HANDED AN EVENT PREPARER, which
+	// the service layer supplies only when event publishing is configured. This instance has no
+	// KAFKA_BROKERS, so no preparer is passed, the writer takes its single-statement path, and
+	// the behaviour is exactly what it was before this feature existed — which is what
+	// §0.7.2's "with KAFKA_BROKERS unset, the service must process transactions exactly as
+	// before" asks for, and what keeps every deployment that never adopts Kafka from paying for
+	// a transaction it has no second statement to put in.
+	//
+	// The transactional path is covered where it can actually be observed: with a preparer
+	// supplied, by event_producer_atomicity_test.go here and by
+	// database/{ledger,identity,balance}_test.go at the repository layer.
 	mock.ExpectExec("INSERT INTO blnk.identity").
 		WithArgs(sqlmock.AnyArg(), identity.IdentityType, identity.FirstName, identity.LastName, identity.OtherNames, identity.Gender, identity.DOB, identity.EmailAddress, identity.PhoneNumber, identity.Nationality, identity.OrganizationName, identity.Category, identity.Street, identity.Country, identity.State, identity.PostCode, identity.City, sqlmock.AnyArg(), metaDataJSON).
 		WillReturnResult(sqlmock.NewResult(1, 1))

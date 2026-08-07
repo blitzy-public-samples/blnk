@@ -20,9 +20,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,47 +38,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file covers the LEGACY HTTP webhook transport, and it is DELETED TOGETHER WITH
-// webhooks.go at the webhook sunset — see the "===== SUNSET =====" procedure at the foot
-// of webhooks.go, whose STEP 2 names this file and webhooks_process_test.go explicitly.
-// Nothing here is deleted before then: the deletion is the terminal step of the Kafka
-// event-streaming feature and is due only once WebhookSunsetPassed (event_sunset.go)
-// answers true for the deployed WEBHOOK_DEPRECATION_SUNSET_DATE, that is only after the
-// full 30-day dual-delivery window has elapsed. Until that date the legacy transport is
-// live in production, so it stays covered here rather than being retired early.
+// This file covers the LEGACY HTTP webhook transport, which stays live for the whole
+// dual-delivery window; webhooks.go records when it is retired. Two narrow subjects:
 //
-// # What this file is responsible for during the dual-delivery window
+//  1. THE LEGACY TRANSPORT'S OWN BEHAVIOUR — the enqueue and the pooled HTTP client, both
+//     unchanged by the move to Kafka. What changed is only WHO CALLS the transport: the
+//     domain post-actions no longer do, the relay's dual-delivery branch does, from a
+//     claimed blnk.event_outbox row. That change of caller is asserted by driving the
+//     relay's processBatch directly against substituted store and Kafka seams.
 //
-// Two things, and they are deliberately narrow.
+//  2. PUBLISHER CONSTRUCTION WITH NO KAFKA. Every test constructs NewBlnk(nil) with a nil
+//     datasource and no Kafka configuration, so what is proven is construction: an
+//     unconfigured broker list selects the no-op publisher, returns a nil error, dials
+//     nothing and blocks on nothing, and the legacy enqueue keeps working when called
+//     directly. A failure or a hang here means initializeEventPublisher in blnk.go is
+//     wrong, not that an assertion needs relaxing.
 //
-//  1. THE LEGACY TRANSPORT'S OWN BEHAVIOUR. The enqueue, the pooled HTTP client and its
-//     connection reuse are the subject; they are unchanged by the move to Kafka, and a
-//     regression in them during the window is a regression in a transport that is still
-//     delivering. What changed is only WHO CALLS the transport: the domain post-actions
-//     no longer do, the relay's dual-delivery branch does, from a claimed
-//     blnk.event_outbox row. That change of caller is asserted here too, because the
-//     legacy path being reachable from the relay is what makes the window work at all.
-//
-//  2. THE GRACEFUL-DEGRADATION GATE. Every test here constructs NewBlnk(nil) with a nil
-//     datasource and NO Kafka configuration whatsoever. That is exactly the shape of
-//     every deployment that does not run Kafka, so these tests are the practical proof
-//     that an unconfigured broker list is a legitimate steady state: publisher
-//     construction must select the no-op implementation, return a nil error, dial
-//     nothing and block on nothing. IF ANY TEST IN THIS FILE STARTS FAILING OR HANGING,
-//     THE PUBLISHER CONSTRUCTION IS WRONG — fix initializeEventPublisher in blnk.go, and
-//     never the assertions here.
-//
-// What this file deliberately does NOT do, so that ownership stays single:
-//
-//   - It does not compare the Kafka message against the webhook body. Payload
-//     equivalence between the two transports is acceptance criterion V-8 and belongs to
-//     event_dual_delivery_test.go; duplicating it here would put one guarantee in two
-//     places that could then disagree.
-//   - It does not parse or reason about the sunset date. The relay tests below pin the
-//     sunset decision to a fixed answer so they exercise the BRANCH; the date
-//     arithmetic itself is event_sunset_test.go's subject.
-//   - It imports no Kafka client. The Kafka-touching tests are event_publisher_test.go,
-//     event_admin_test.go, event_dlt_test.go and the integration tests.
+// Scope deliberately held elsewhere: payload equivalence between the two transports is
+// event_dual_delivery_test.go's subject (acceptance criterion V-8), the sunset date
+// arithmetic is event_sunset_test.go's, and no Kafka client is imported here.
 
 // MockConfigFetcher is a mock for the config fetching
 type MockConfigFetcher struct {
@@ -88,13 +69,12 @@ func (m *MockConfigFetcher) Fetch() (*config.Configuration, error) {
 }
 
 func TestSendWebhook(t *testing.T) {
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("an error '%s' occurred when starting miniredis", err)
-	}
-	defer mr.Close()
+	mr := miniredis.RunT(t)
 
-	cnf := &config.Configuration{
+	// Scoped rather than stored bare. config.ConfigStore is a process-global atomic.Value,
+	// so a configuration left installed here surfaces as a failure in an unrelated test —
+	// with a webhook URL and queue name that test never mentioned.
+	storeLegacyWebhookConfiguration(t, &config.Configuration{
 		Redis: config.RedisConfig{
 			Dns: mr.Addr(),
 		},
@@ -107,56 +87,127 @@ func TestSendWebhook(t *testing.T) {
 				Url: "http://localhost:8080",
 			},
 		},
-	}
-	config.ConfigStore.Store(cnf)
+	})
 
 	testData := NewWebhook{
 		Event:   "transaction.queued",
 		Payload: getTransactionMock(10000, false),
 	}
-	blnk, err := NewBlnk(nil)
-	assert.NoError(t, err)
+	// Closed on cleanup by the helper, so the asynq client's Redis connections do not
+	// outlive the test that opened them.
+	blnk, err := newBlnkWithinLegacyWebhookBudget(t)
+	require.NoError(t, err)
 
-	err = blnk.SendWebhook(testData)
-	assert.NoError(t, err)
+	require.NoError(t, blnk.SendWebhook(testData))
 
 	// Verify that the task was enqueued
-	assert.NoError(t, err)
-	tasks := mr.Keys()
-	assert.NoError(t, err)
-	assert.NotEmpty(t, tasks)
+	assert.NotEmpty(t, mr.Keys(), "the enqueue must have written asynq's keys to Redis")
 }
 
-func TestConnectionReuse(t *testing.T) {
-	// Track unique connections
-	var connectionsMutex sync.Mutex
-	connections := make(map[string]bool)
-	requestCount := 0
+// legacyWebhookConnectionCounter is an httptest server that counts the TCP connections the
+// client actually opened to it.
+//
+// # Why the connection count is measured on the SERVER
+//
+// The property under test is that the pooled client REUSES a connection, and the honest
+// evidence for it is how many connections the receiver saw. The alternative — httptrace on
+// the client — cannot be used here without changing production code: processHTTP and
+// processHTTPRaw build their own requests and take no context, so there is nowhere to attach
+// a ClientTrace without widening a signature the sunset is about to delete.
+//
+// http.Server's ConnState hook fires once per connection with StateNew, which makes "how many
+// connections were opened" an exact integer rather than an inference from remote addresses.
+// The previous version of this test counted distinct r.RemoteAddr values, which is why it
+// could only ever assert `unique <= total` — a statement that is true of every possible
+// outcome, including the zero-reuse one it was written to catch.
+type legacyWebhookConnectionCounter struct {
+	server      *httptest.Server
+	connections atomic.Int64
+	requests    atomic.Int64
 
-	// Create test server that tracks connections
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		connectionsMutex.Lock()
-		defer connectionsMutex.Unlock()
+	mu       sync.Mutex
+	bodies   [][]byte
+	requestS []*http.Request
+}
 
-		// Track unique remote addresses (connections)
-		remoteAddr := r.RemoteAddr
-		connections[remoteAddr] = true
-		requestCount++
+// newLegacyWebhookConnectionCounter starts a receiver that records every request and counts
+// every new connection.
+//
+// The server is UNSTARTED first, because ConnState has to be installed on the underlying
+// http.Server before it begins accepting: setting it after Start races the first connection
+// and can miss it, which would understate the count in exactly the direction that makes a
+// reuse assertion pass when it should fail.
+func newLegacyWebhookConnectionCounter(t *testing.T) *legacyWebhookConnectionCounter {
+	t.Helper()
+
+	counter := &legacyWebhookConnectionCounter{}
+
+	counter.server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err, "the receiver must be able to read the delivered body")
+
+		counter.mu.Lock()
+		counter.bodies = append(counter.bodies, body)
+		counter.requestS = append(counter.requestS, r.Clone(context.Background()))
+		counter.mu.Unlock()
+
+		counter.requests.Add(1)
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}))
-	defer server.Close()
 
-	// Setup miniredis for queue
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("an error '%s' occurred when starting miniredis", err)
+	counter.server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			counter.connections.Add(1)
+		}
 	}
-	defer mr.Close()
 
-	// Configure with test server URL
-	cnf := &config.Configuration{
+	counter.server.Start()
+	t.Cleanup(counter.server.Close)
+
+	return counter
+}
+
+// snapshot returns the bodies and requests received so far.
+func (c *legacyWebhookConnectionCounter) snapshot() ([][]byte, []*http.Request) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return append([][]byte(nil), c.bodies...), append([]*http.Request(nil), c.requestS...)
+}
+
+// TestConnectionReuse proves the pooled client reuses one connection across sequential
+// deliveries.
+//
+// # What this actually establishes, and why it needed rewriting
+//
+// The assertion is that N SEQUENTIAL deliveries open exactly ONE connection. That is not a
+// statement about performance; it is the only observable consequence of two things
+// production depends on:
+//
+//   - the shared transport's idle pool is used rather than a fresh transport per delivery,
+//     which is what initializeHTTPClient's MaxIdleConnsPerHost exists for;
+//   - every response body is DRAINED AND CLOSED. Go returns a connection to the idle pool
+//     only when the body has been read to EOF and closed. A handler that returned early on a
+//     non-2xx status without draining would leak the connection and force a new one — and
+//     processHTTPRaw's non-2xx branch is exactly such a candidate.
+//
+// SEQUENTIAL, not concurrent, and that is the whole reason this can assert anything.
+// Concurrent requests may legitimately each open a connection — the pool has nothing idle to
+// hand out while every request is in flight — so the previous concurrent version had no
+// deterministic expectation available to it and settled for `unique <= total`, which holds
+// even when reuse is completely broken. It reported a real failure as a log line beginning
+// with a warning emoji, and passed.
+//
+// The second burst is not a repetition. It asserts the connection survived being IDLE
+// between bursts, which is the state a real deployment's client is in almost all the time,
+// and it is what an IdleConnTimeout regression would break while a single burst still passed.
+func TestConnectionReuse(t *testing.T) {
+	receiver := newLegacyWebhookConnectionCounter(t)
+	mr := miniredis.RunT(t)
+
+	storeLegacyWebhookConfiguration(t, &config.Configuration{
 		Redis: config.RedisConfig{
 			Dns: mr.Addr(),
 		},
@@ -166,120 +217,133 @@ func TestConnectionReuse(t *testing.T) {
 		},
 		Notification: config.Notification{
 			Webhook: config.WebhookConfig{
-				Url: server.URL,
+				Url: receiver.server.URL,
+				// The receiver is an httptest server, so it is plain http on a loopback
+				// address — which validateLegacyWebhookDestination refuses by default,
+				// deliberately: ledger data and its HMAC must not cross a network in clear
+				// text, and a loopback or link-local destination is the SSRF shape. This is
+				// the documented escape hatch for exactly this case, "a destination on a
+				// network you own", and it is what every other delivery test sets. Nothing
+				// here is about the destination policy; the subject is connection reuse.
+				AllowPrivateDestination: true,
 			},
 		},
-	}
-	config.ConfigStore.Store(cnf)
+	})
 
-	// Create Blnk instance
-	blnk, err := NewBlnk(nil)
-	assert.NoError(t, err)
-	// Discarding the close error matches the idiom used throughout the webhook tests
-	// (see webhooks_process_test.go): the assertion subject is the client's configuration
-	// and its connection reuse, and a shutdown error here would mask that subject rather
-	// than report on it. Behaviour is identical to the bare defer this replaces.
-	defer func() { _ = blnk.Close() }()
+	blnk, err := newBlnkWithinLegacyWebhookBudget(t)
+	require.NoError(t, err)
 
-	// Send multiple webhook requests directly (bypass queue for immediate testing)
-	numRequests := 10
-	testWebhook := NewWebhook{
+	const perBurst = 5
+	webhook := NewWebhook{
 		Event:   "transaction.applied",
 		Payload: map[string]interface{}{"test": "data"},
 	}
 
-	// Send multiple requests concurrently to test connection reuse
-	var wg sync.WaitGroup
-	for i := 0; i < numRequests; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := processHTTP(testWebhook, blnk.httpClient)
-			assert.NoError(t, err)
-		}()
+	for delivery := 0; delivery < perBurst; delivery++ {
+		require.NoError(t, processHTTP(context.Background(), webhook, blnk.httpClient),
+			"delivery %d must succeed", delivery+1)
 	}
-	wg.Wait()
 
-	// Allow some time for all requests to complete
-	time.Sleep(100 * time.Millisecond)
+	require.EqualValues(t, perBurst, receiver.requests.Load(),
+		"every delivery must have reached the receiver")
+	require.EqualValues(t, 1, receiver.connections.Load(),
+		"%d sequential deliveries through the pooled client must open exactly ONE connection; "+
+			"more means the connection is not being returned to the idle pool — the usual cause "+
+			"is a response body that is not drained to EOF and closed", perBurst)
 
-	connectionsMutex.Lock()
-	uniqueConnections := len(connections)
-	totalRequests := requestCount
-	connectionsMutex.Unlock()
-
-	// Verify connection reuse
-	t.Logf("Total requests: %d, Unique connections: %d", totalRequests, uniqueConnections)
-
-	// With connection reuse, we should have fewer unique connections than requests
-	// Allow for some flexibility as the exact number can vary based on timing
-	assert.Equal(t, numRequests, totalRequests, "All requests should have been received")
-	assert.LessOrEqual(t, uniqueConnections, totalRequests, "Should have fewer or equal connections than requests")
-
-	// In most cases with proper connection reuse, we should see significantly fewer connections
-	// This is a more lenient check to account for test environment variations
-	if uniqueConnections < totalRequests {
-		t.Logf("✅ Connection reuse working: %d connections for %d requests", uniqueConnections, totalRequests)
-	} else {
-		t.Logf("⚠️  Connection reuse may not be optimal: %d connections for %d requests", uniqueConnections, totalRequests)
+	// A second burst after the first has fully finished: the pool now holds an IDLE
+	// connection, and it must be the one that is used.
+	for delivery := 0; delivery < perBurst; delivery++ {
+		require.NoError(t, processHTTP(context.Background(), webhook, blnk.httpClient))
 	}
+
+	assert.EqualValues(t, 2*perBurst, receiver.requests.Load())
+	assert.EqualValues(t, 1, receiver.connections.Load(),
+		"the idle connection must be reused across bursts as well as within one; a second "+
+			"connection here means idle connections are being discarded between deliveries")
 }
 
 func TestHTTPClientConfiguration(t *testing.T) {
-	// Setup miniredis
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("an error '%s' occurred when starting miniredis", err)
-	}
-	defer mr.Close()
+	mr := miniredis.RunT(t)
 
-	cnf := &config.Configuration{
+	storeLegacyWebhookConfiguration(t, &config.Configuration{
 		Redis: config.RedisConfig{
 			Dns: mr.Addr(),
 		},
-	}
-	config.ConfigStore.Store(cnf)
+	})
 
-	// Create Blnk instance
-	blnk, err := NewBlnk(nil)
-	assert.NoError(t, err)
-	// Discarding the close error matches the idiom used throughout the webhook tests
-	// (see webhooks_process_test.go): the assertion subject is the client's configuration
-	// and its connection reuse, and a shutdown error here would mask that subject rather
-	// than report on it. Behaviour is identical to the bare defer this replaces.
-	defer func() { _ = blnk.Close() }()
+	blnk, err := newBlnkWithinLegacyWebhookBudget(t)
+	require.NoError(t, err)
 
 	// Verify HTTP client is configured properly
-	assert.NotNil(t, blnk.httpClient, "HTTP client should be initialized")
+	require.NotNil(t, blnk.httpClient, "HTTP client should be initialized")
 	assert.Equal(t, 30*time.Second, blnk.httpClient.Timeout, "Timeout should be 30 seconds")
 
 	// Verify transport configuration
 	transport, ok := blnk.httpClient.Transport.(*http.Transport)
-	assert.True(t, ok, "Transport should be *http.Transport")
+	require.True(t, ok, "Transport should be *http.Transport")
 	assert.Equal(t, 100, transport.MaxIdleConns, "MaxIdleConns should be 100")
 	assert.Equal(t, 10, transport.MaxIdleConnsPerHost, "MaxIdleConnsPerHost should be 10")
 	assert.Equal(t, 90*time.Second, transport.IdleConnTimeout, "IdleConnTimeout should be 90 seconds")
 }
 
+// legacyWebhookCountingTransport wraps a RoundTripper and counts the requests that pass
+// through it.
+//
+// # Why a wrapper is needed to prove which client the handler used
+//
+// Counting connections at the receiver proves REUSE but cannot identify the CLIENT, and the
+// difference matters here. A handler that built `&http.Client{}` per task would still open
+// only one connection, because a client with a nil Transport uses the package-global
+// http.DefaultTransport — which has an idle pool of its own. So the connection count alone
+// cannot distinguish "used the pooled b.httpClient" from "used the default transport", and a
+// test that relied on it would pass for the regression it was written to catch.
+//
+// Wrapping b.httpClient's own transport makes the question directly observable: every request
+// that goes through the field increments the counter, and every request that does not is
+// invisible to it. Delegating to the real transport rather than answering the request itself
+// is what keeps the receiver-side connection assertions meaningful at the same time.
+type legacyWebhookCountingTransport struct {
+	next     http.RoundTripper
+	requests atomic.Int64
+}
+
+func (c *legacyWebhookCountingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	c.requests.Add(1)
+
+	return c.next.RoundTrip(request)
+}
+
+// TestProcessWebhookWithReusedClient proves the asynq HANDLER delivers through the shared
+// pooled client.
+//
+// # What the previous version could not establish
+//
+// It called processHTTP directly, passing blnk.httpClient in as an argument, and then
+// asserted that blnk.httpClient was still the same pointer it had read a moment earlier. Both
+// halves are unfalsifiable: the client under test was supplied by the test rather than chosen
+// by the code, and a field nobody writes to cannot change. ProcessWebhook — the function
+// named in the test, and the only client-selecting code on this path — was never invoked at
+// all, so a regression that gave it http.DefaultClient, or a fresh client per task, would
+// have left this test green.
+//
+// # What it establishes now
+//
+// Two REAL handler invocations, each with the asynq task shape the relay enqueues, and the
+// evidence is taken from the receiver:
+//
+//   - ONE connection for two deliveries. A per-task client, or http.DefaultClient alongside
+//     the pooled one, cannot produce that: each would bring its own idle pool and the second
+//     delivery would open a second connection. This is the assertion that actually pins
+//     "shares the pooled b.httpClient", which is what ProcessWebhook's documentation claims.
+//   - The delivered bodies are the task payloads BYTE FOR BYTE, and each carries the
+//     signature headers. That is what says the handler went through processHTTPRaw with the
+//     configured secret rather than re-marshalling or posting something else.
 func TestProcessWebhookWithReusedClient(t *testing.T) {
-	// Track that the same client instance is used
-	var clientUsed *http.Client
-	var clientMutex sync.Mutex
+	receiver := newLegacyWebhookConnectionCounter(t)
+	mr := miniredis.RunT(t)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	}))
-	defer server.Close()
-
-	// Setup miniredis
-	mr, err := miniredis.Run()
-	if err != nil {
-		t.Fatalf("an error '%s' occurred when starting miniredis", err)
-	}
-	defer mr.Close()
-
-	cnf := &config.Configuration{
+	storeLegacyWebhookConfiguration(t, &config.Configuration{
 		Redis: config.RedisConfig{
 			Dns: mr.Addr(),
 		},
@@ -287,117 +351,123 @@ func TestProcessWebhookWithReusedClient(t *testing.T) {
 			WebhookQueue:   "webhook_queue",
 			NumberOfQueues: 1,
 		},
+		Server: config.ServerConfig{
+			SecretKey: "process-webhook-shared-client-secret",
+		},
 		Notification: config.Notification{
 			Webhook: config.WebhookConfig{
-				Url: server.URL,
+				Url: receiver.server.URL,
+				// The receiver is an httptest server, so it is plain http on a loopback
+				// address — which validateLegacyWebhookDestination refuses by default,
+				// deliberately: ledger data and its HMAC must not cross a network in clear
+				// text, and a loopback or link-local destination is the SSRF shape. This is
+				// the documented escape hatch for exactly this case, "a destination on a
+				// network you own", and it is what every other delivery test sets. Nothing
+				// here is about the destination policy; the subject is connection reuse.
+				AllowPrivateDestination: true,
 			},
 		},
+	})
+
+	blnk, err := newBlnkWithinLegacyWebhookBudget(t)
+	require.NoError(t, err)
+
+	clientBefore := blnk.httpClient
+
+	// Instrument the POOLED transport in place, delegating to the real one. Anything the
+	// handler sends through b.httpClient is counted here; anything it sends through a client
+	// of its own is not.
+	pooled, ok := clientBefore.Transport.(*http.Transport)
+	require.True(t, ok, "the pooled client must carry the configured *http.Transport")
+	counting := &legacyWebhookCountingTransport{next: pooled}
+	clientBefore.Transport = counting
+	t.Cleanup(func() { clientBefore.Transport = pooled })
+
+	// The task shape the relay's dual-delivery branch enqueues: the task type is the
+	// configured queue name and the payload is the legacy body's bytes.
+	firstBody, err := json.Marshal(NewWebhook{Event: "test.event1", Payload: map[string]string{"id": "1"}})
+	require.NoError(t, err)
+	secondBody, err := json.Marshal(NewWebhook{Event: "test.event2", Payload: map[string]string{"id": "2"}})
+	require.NoError(t, err)
+
+	require.NoError(t, blnk.ProcessWebhook(context.Background(), asynq.NewTask("webhook_queue", firstBody)))
+	require.NoError(t, blnk.ProcessWebhook(context.Background(), asynq.NewTask("webhook_queue", secondBody)))
+
+	require.EqualValues(t, 2, receiver.requests.Load(), "both handler calls must have delivered")
+	require.EqualValues(t, 2, counting.requests.Load(),
+		"both deliveries must have gone through b.httpClient: a handler that constructed its "+
+			"own client per task, or reached for http.DefaultClient, would bypass this transport "+
+			"entirely and leave the count at zero while still delivering")
+	assert.EqualValues(t, 1, receiver.connections.Load(),
+		"two ProcessWebhook calls must share ONE connection: a handler that built its own "+
+			"client per task, or used http.DefaultClient, would bring a second idle pool and "+
+			"open a second connection")
+
+	bodies, requests := receiver.snapshot()
+	require.Len(t, bodies, 2)
+	assert.Equal(t, string(firstBody), string(bodies[0]),
+		"the handler must deliver the task payload verbatim, not a re-marshalling of it")
+	assert.Equal(t, string(secondBody), string(bodies[1]))
+
+	for index, request := range requests {
+		assert.Equal(t, "application/json", request.Header.Get("Content-Type"),
+			"delivery %d must be sent as JSON", index+1)
+		assert.NotEmpty(t, request.Header.Get("X-Blnk-Signature"),
+			"delivery %d must be signed with the configured secret, which is what proves it "+
+				"went through processHTTPRaw rather than some other request path", index+1)
+		assert.NotEmpty(t, request.Header.Get("X-Blnk-Timestamp"),
+			"delivery %d must carry the timestamp the signature covers", index+1)
 	}
-	config.ConfigStore.Store(cnf)
 
-	blnk, err := NewBlnk(nil)
-	assert.NoError(t, err)
-	// Discarding the close error matches the idiom used throughout the webhook tests
-	// (see webhooks_process_test.go): the assertion subject is the client's configuration
-	// and its connection reuse, and a shutdown error here would mask that subject rather
-	// than report on it. Behaviour is identical to the bare defer this replaces.
-	defer func() { _ = blnk.Close() }()
-
-	// Store reference to the HTTP client
-	clientMutex.Lock()
-	clientUsed = blnk.httpClient
-	clientMutex.Unlock()
-
-	// Create webhook payloads
-	webhook1 := NewWebhook{Event: "test.event1", Payload: map[string]string{"id": "1"}}
-	webhook2 := NewWebhook{Event: "test.event2", Payload: map[string]string{"id": "2"}}
-
-	// Process webhooks using the same client
-	err1 := processHTTP(webhook1, blnk.httpClient)
-	err2 := processHTTP(webhook2, blnk.httpClient)
-
-	assert.NoError(t, err1)
-	assert.NoError(t, err2)
-
-	// Verify the same client instance was used
-	clientMutex.Lock()
-	assert.Same(t, clientUsed, blnk.httpClient, "Should use the same HTTP client instance")
-	clientMutex.Unlock()
+	assert.Same(t, clientBefore, blnk.httpClient,
+		"the pooled client must not be replaced by handling a task; it is constructed once "+
+			"and shared for the process's lifetime")
 }
 
 // ===========================================================================
-// ADDITIONS FOR THE DUAL-DELIVERY WINDOW — DELETED WITH THIS FILE AT SUNSET
-//
-// Everything below this banner is retired at exactly the same moment as the four tests
-// above, because it has exactly the same subject: a transport that no longer exists has
-// no behaviour to assert and no caller to be reached from. Nothing here needs to be
-// relocated first — unlike NewWebhook and getEventFromStatus in webhooks.go, none of it
-// is contract that outlives the transport.
+// ADDITIONS FOR THE DUAL-DELIVERY WINDOW
 // ===========================================================================
 
-// legacyWebhookConstructionBudget bounds how long NewBlnk may take in this file.
-//
-// The bound IS the assertion, not a convenience. "Publisher construction performs no I/O"
-// is only observable as "construction did not wait": a constructor that dialled a broker,
-// resolved a name or fetched partition metadata could not finish inside two seconds
-// against an unroutable address, and one that blocked outright would hang the whole
-// package until the test binary's timeout killed it rather than failing with a legible
-// message. Two seconds is generous for pure computation and far below any dial timeout.
+// legacyWebhookConstructionBudget bounds how long NewBlnk may take in this file. The bound IS
+// the assertion: "publisher construction performs no I/O" is only observable as "construction
+// did not wait", and a constructor that dialled a broker or fetched metadata could not finish
+// inside two seconds against an unroutable address.
 const legacyWebhookConstructionBudget = 2 * time.Second
 
-// legacyWebhookBlackholeBroker is an address that exists in no routing table.
-//
-// 198.51.100.1 is TEST-NET-2, reserved by RFC 5737 for documentation and guaranteed to be
-// routed nowhere, so a construction that dialled it would stall until the transport's dial
-// timeout — well past legacyWebhookConstructionBudget. Passing the budget with this
-// address configured is therefore evidence of the ABSENCE of a dial, which is the only way
-// to test for an absence.
+// legacyWebhookBlackholeBroker is TEST-NET-2 (RFC 5737), guaranteed to route nowhere, so a
+// construction that dialled it would stall past legacyWebhookConstructionBudget. Passing the
+// budget with it configured is the evidence of the ABSENCE of a dial.
 const legacyWebhookBlackholeBroker = "198.51.100.1:9092"
 
-// legacyWebhookNeverCalledURL is a webhook URL that is configured but never contacted.
-//
-// EnqueueLegacyWebhookDelivery and SendWebhook only ever check that the URL is non-empty —
-// delivery is the worker's job, and no worker runs in these tests — so a port that refuses
-// every connection is the honest way to say "configured, not exercised". Port 1 is
-// privileged and unbound, so an accidental delivery attempt would fail loudly instead of
-// reaching something real.
+// legacyWebhookNeverCalledURL is configured but never contacted: the enqueue paths only check
+// that the URL is non-empty, and no worker runs here. Port 1 is privileged and unbound, so an
+// accidental delivery attempt fails loudly instead of reaching something real.
 const legacyWebhookNeverCalledURL = "http://127.0.0.1:1/never-called"
 
-// legacyWebhookQueueName is deliberately NOT the "webhook_queue" the tests above use, and
-// not any default either.
-//
-// The invariant under test is that the asynq task's type and queue are both the CONFIGURED
-// Queue.WebhookQueue string. A recognisable name would let a regression that hardcoded a
-// default, or that read a different configuration field, still satisfy the assertion. An
-// unmistakable one cannot appear on the queue by accident.
+// legacyWebhookQueueName is deliberately neither "webhook_queue" nor any default: the invariant
+// is that the task's type and queue are both the CONFIGURED Queue.WebhookQueue, and a
+// recognisable name would let a hardcoded default satisfy the assertion anyway.
 const legacyWebhookQueueName = "legacy_webhook_dual_delivery_q"
 
 // legacyWebhookRelayFixedNow pins the relay's clock so the claim instant is deterministic.
 const legacyWebhookRelayFixedNow = "2026-03-01T12:00:00Z"
 
-// legacyWebhookRelayClaimToken is the token the fake store stamps on a claim.
-//
-// Every state transition the relay performs is conditional on the claim token, so asserting
-// the token a transition presented is how these tests prove the transition belonged to the
-// claim that produced the row rather than to a stale worker.
+// legacyWebhookRelayClaimToken is the token the fake store stamps on a claim. Every relay
+// transition is conditional on it, so asserting the token a transition presented proves the
+// transition belonged to the claim that produced the row rather than to a stale worker.
 const legacyWebhookRelayClaimToken = "legacy-webhook-claim-token"
 
 // storeLegacyWebhookConfiguration publishes cnf for the duration of one test and restores
 // whatever was there before.
 //
 // config.ConfigStore is a process-global atomic.Value, so a configuration left behind by one
-// test produces failures in unrelated ones that look nothing like their cause. The four
-// tests above predate this helper and are left exactly as they are; every addition below
-// uses it, so the additions cannot be the source of such a leak.
+// test produces failures in unrelated ones that look nothing like their cause. EVERY test in
+// this file goes through this helper, including the four legacy ones above, which used to
+// store bare and leave a webhook URL and a queue name installed for whatever ran next.
 //
 // It writes DIRECTLY rather than through config.MockConfig because MockConfig runs
-// validateAndAddDefaults, which both refuses a configuration with no data-source DSN — the
-// value would be silently dropped — and supplies the very Kafka defaults some cases here
-// need to observe as absent.
-//
-// Parameters:
-//   - t *testing.T: the test whose lifetime the configuration is scoped to.
-//   - cnf *config.Configuration: the configuration to publish.
+// validateAndAddDefaults, which silently refuses a configuration with no data-source DSN and
+// supplies the very Kafka defaults some cases here need to observe as absent.
 func storeLegacyWebhookConfiguration(t *testing.T, cnf *config.Configuration) {
 	t.Helper()
 
@@ -415,19 +485,9 @@ func storeLegacyWebhookConfiguration(t *testing.T, cnf *config.Configuration) {
 	config.ConfigStore.Store(cnf)
 }
 
-// legacyWebhookConfiguration returns the configuration shape this file's legacy tests use:
-// a Redis DSN, the webhook queue, a configured webhook URL, and NO Kafka block at all.
-//
-// The absent Kafka block is the point rather than an omission. It is the shape of every
-// deployment that does not run Kafka, and it is what the graceful-degradation assertions
-// below are about.
-//
-// Parameters:
-//   - redisDSN string: the miniredis address backing the asynq client.
-//   - webhookURL string: the configured webhook URL; empty disables the legacy transport.
-//
-// Returns:
-//   - *config.Configuration: a configuration ready to store.
+// legacyWebhookConfiguration returns this file's shape: a Redis DSN, the webhook queue, a
+// configured webhook URL, and NO Kafka block. The absent Kafka block is the point — it is the
+// shape of a deployment that does not run Kafka. An empty webhookURL disables the transport.
 func legacyWebhookConfiguration(redisDSN, webhookURL string) *config.Configuration {
 	return &config.Configuration{
 		Redis: config.RedisConfig{
@@ -445,23 +505,10 @@ func legacyWebhookConfiguration(redisDSN, webhookURL string) *config.Configurati
 	}
 }
 
-// newBlnkWithinLegacyWebhookBudget constructs a Blnk instance and fails the test if the
-// constructor has not returned within legacyWebhookConstructionBudget.
-//
-// Running the constructor on its own goroutine is what turns "NewBlnk blocked" from a hang
-// that consumes the package's whole test timeout into a single failing test with a message
-// naming the cause. The instance is closed on cleanup so neither the asynq client's
-// connections nor the publisher's resources outlive the test.
-//
-// It always passes a NIL DATASOURCE, exactly as every test in this file does, because that
-// is the construction whose continued support is being asserted.
-//
-// Parameters:
-//   - t *testing.T: the test to bound and to attach the cleanup to.
-//
-// Returns:
-//   - *Blnk: the constructed instance, or nil when construction failed.
-//   - error: whatever NewBlnk reported.
+// newBlnkWithinLegacyWebhookBudget constructs a Blnk instance with a nil datasource and fails
+// the test if the constructor has not returned within legacyWebhookConstructionBudget. Running
+// it on its own goroutine turns "NewBlnk blocked" from a hang consuming the package's whole
+// test timeout into one failing test naming the cause. The instance is closed on cleanup.
 func newBlnkWithinLegacyWebhookBudget(t *testing.T) (*Blnk, error) {
 	t.Helper()
 
@@ -470,6 +517,8 @@ func newBlnkWithinLegacyWebhookBudget(t *testing.T) (*Blnk, error) {
 		err      error
 	}
 
+	// Buffered, so the constructor goroutine can always deliver its result and exit even
+	// when nobody is left waiting for it.
 	done := make(chan construction, 1)
 
 	go func() {
@@ -487,6 +536,27 @@ func newBlnkWithinLegacyWebhookBudget(t *testing.T) (*Blnk, error) {
 
 		return result.instance, result.err
 	case <-time.After(legacyWebhookConstructionBudget):
+		// The budget was missed, so this test has failed — but the constructor goroutine is
+		// still running, and if it later succeeds it hands back an instance holding an asynq
+		// client and a Redis connection that nobody will ever close. Draining it on cleanup
+		// releases those, bounded so that a genuinely BLOCKED constructor cannot hold the
+		// package's teardown open: leaving the goroutine parked on a full-lifetime block is
+		// unavoidable in that case, and it is reported rather than waited on for ever.
+		t.Cleanup(func() {
+			select {
+			case late := <-done:
+				if late.instance != nil {
+					_ = late.instance.Close()
+				}
+			case <-time.After(legacyWebhookConstructionBudget):
+				t.Logf(
+					"the NewBlnk goroutine had still not returned %s after the budget expired, so "+
+						"whatever it holds could not be released; it is blocked rather than merely slow",
+					legacyWebhookConstructionBudget,
+				)
+			}
+		})
+
 		t.Fatalf(
 			"NewBlnk did not return within %s; publisher construction must dial nothing and "+
 				"block on nothing, or every process start and every test here depends on a "+
@@ -498,27 +568,20 @@ func newBlnkWithinLegacyWebhookBudget(t *testing.T) (*Blnk, error) {
 	}
 }
 
-// TestNewBlnk_NoKafkaConfiguredUsesNoOpPublisher is the graceful-degradation gate for the
-// four legacy tests above.
+// TestNewBlnk_NoKafkaConfiguredUsesNoOpPublisher covers CONSTRUCTION, not delivery: with no
+// brokers, publisher construction selects the no-op implementation, returns a nil error, and
+// reaches neither a resolver nor a socket, while the legacy HTTP client is left intact. It says
+// nothing about whether an event reaches a subscriber — no relay and no worker run here.
 //
-// Every one of them constructs NewBlnk(nil) with no Kafka configuration, so all four depend
-// silently on an unconfigured broker list being a legitimate steady state. This test states
-// that dependency out loud: with no brokers, publisher construction selects the no-op
-// implementation, returns a NIL ERROR, and reaches neither a resolver nor a socket. Were it
-// to return an error instead, or to dial, the four tests above would fail or hang for a
-// reason that had nothing to do with webhooks — and the right fix would be in
-// initializeEventPublisher (blnk.go), never in their assertions.
+// The four legacy tests above all construct NewBlnk(nil) with no Kafka configuration, so they
+// depend silently on that behaviour; were construction to fail or dial, they would break for a
+// reason unrelated to webhooks and the fix would be in initializeEventPublisher (blnk.go). The
+// cases are therefore named after the tests whose input they reproduce; blnk_test.go states the
+// same property generally over its own fixtures.
 //
-// It is scoped deliberately to the two configuration literals THIS FILE actually builds.
-// blnk_test.go asserts the same selection over its own fixtures and is the general
-// statement of the property; this is the specific guard for these four tests, which is why
-// the cases below are named after the tests whose input they reproduce rather than after
-// abstract configuration shapes.
-//
-// The blank-broker case is the interesting one. Treated as an address rather than as
-// absence, "   " would produce a Kafka publisher that can never connect, so every publish
-// would fail against something that is not an address while nothing in the configuration
-// looked wrong.
+// The blank-broker case matters: treated as an address rather than as absence, "   " would
+// produce a Kafka publisher that can never connect while nothing in the configuration looked
+// wrong.
 func TestNewBlnk_NoKafkaConfiguredUsesNoOpPublisher(t *testing.T) {
 	for _, testCase := range []struct {
 		name    string
@@ -581,25 +644,17 @@ func TestNewBlnk_NoKafkaConfiguredUsesNoOpPublisher(t *testing.T) {
 	}
 }
 
-// TestNewBlnk_KafkaConfiguredKeepsTheLegacyTransport is the other half of the gate, and
-// without it the assertions above would be satisfied by a constructor that ALWAYS returned
-// the no-op.
+// TestNewBlnk_KafkaConfiguredKeepsTheLegacyTransport is the other half of the construction
+// gate: without it, a publisher wired to return the no-op UNCONDITIONALLY would pass every
+// assertion in this file, start every process without complaint and publish nothing. So this
+// case configures brokers and requires that the no-op is not selected.
 //
-// That failure mode is not hypothetical: a publisher wired to return the no-op
-// unconditionally would pass every assertion in this file, start every process without
-// complaint, and publish nothing at all. So this case configures brokers and requires that
-// the no-op is NOT selected.
-//
-// It states the dual-delivery wiring claim at the same time: configuring Kafka must leave
-// the legacy transport exactly as it was. During the 30-day window both transports are live
-// together, so the arrival of the new one must not disturb the pooled HTTP client, its
-// timeouts, or the enqueue that feeds the webhook queue — all three are asserted below
-// while Kafka is configured.
+// What it asserts beyond that is still construction-scoped: with Kafka configured, the pooled
+// HTTP client and its timeouts are unchanged and the legacy enqueue still reaches Redis. It does
+// not assert that either transport delivers.
 //
 // No SASL credentials are set and InsecureLocalDev acknowledges the resulting plaintext
-// transport. That is the honest way to reach a constructed Kafka publisher here: nothing is
-// dialled, so there is no credential to protect, and inventing one would put a
-// secret-shaped literal in a test that has no use for it.
+// transport: nothing is dialled here, so there is no credential to protect.
 func TestNewBlnk_KafkaConfiguredKeepsTheLegacyTransport(t *testing.T) {
 	redisServer := miniredis.RunT(t)
 
@@ -647,21 +702,23 @@ func TestNewBlnk_KafkaConfiguredKeepsTheLegacyTransport(t *testing.T) {
 type legacyWebhookRelayMark struct {
 	id         int64
 	claimToken string
+
+	// record is the broker coordinate the transition was given. Recorded so a test can
+	// assert that dual delivery persists the SAME coordinate the Kafka leg reported, which
+	// is what keeps the zero-loss reconciliation able to account for a dual-delivered row.
+	record model.BrokerRecord
 }
 
-// legacyWebhookRelayStore is the eventRelayStore seam, narrowed to what driving one batch
-// needs and nothing more.
+// legacyWebhookRelayStore is the eventRelayStore seam, narrowed to what driving one batch needs.
 //
-// The relay is exercised against this rather than against PostgreSQL because the subject of
-// these tests is THE LEGACY TRANSPORT AND ITS CALLER, not the outbox repository — whose own
-// claim semantics, FIFO ordering and skip-locked concurrency are database/event_outbox_test.go's
-// subject. What must be real here is the legacy leg: processor.legacy is the actual *Blnk,
-// so the enqueue under assertion is the production one, reaching a real asynq client and a
-// real Redis.
+// The relay runs against this rather than PostgreSQL because the subject here is THE LEGACY
+// TRANSPORT AND ITS CALLER, not the outbox repository, whose claim semantics, FIFO ordering and
+// skip-locked concurrency are database/event_outbox_test.go's subject. What is real is the legacy
+// leg: processor.legacy is the actual *Blnk, so the enqueue under assertion is the production one
+// reaching a real asynq client and a real Redis.
 //
-// Every field is mutex-guarded and read back through a snapshot accessor because
-// processBatch publishes partition-key groups on concurrent goroutines, so an unguarded
-// counter would be a data race that -race would rightly fail.
+// Every field is mutex-guarded and read through a snapshot accessor because processBatch
+// publishes partition-key groups on concurrent goroutines.
 type legacyWebhookRelayStore struct {
 	mu sync.Mutex
 
@@ -673,23 +730,19 @@ type legacyWebhookRelayStore struct {
 	dispatched   []legacyWebhookRelayMark
 	webhookMarks []legacyWebhookRelayMark
 	failures     []string
+	// webhookPendings records the reasons MarkEventWebhookPending was called with — the
+	// transition that keeps an outstanding legacy leg claimable instead of losing it behind
+	// a terminal state. Nothing in this file should reach it, because the enqueue here is
+	// the production one against a real Redis, so recording it is what lets a test assert
+	// its ABSENCE rather than infer success.
+	webhookPendings []string
 }
 
-// Compile-time proof that the fake is a faithful subset of the seam the relay drives. It
-// fails the build here, on the line that states the contract, rather than at a call site.
+// Compile-time proof that the fake is a faithful subset of the seam the relay drives.
 var _ eventRelayStore = (*legacyWebhookRelayStore)(nil)
 
 // ClaimPendingEventOutbox hands out the seeded rows once, stamping each with the processing
 // status, the batch's claim token and a lease, exactly as the repository does.
-//
-// Parameters:
-//   - _ context.Context: unused; the fake never blocks.
-//   - _ int: the batch size, unused because the seeded set is always small enough.
-//   - lockDuration time.Duration: the lease the relay asked for, used to stamp LockedUntil.
-//
-// Returns:
-//   - []model.EventOutbox: the claimed rows on the first call, nil thereafter.
-//   - error: always nil.
 func (s *legacyWebhookRelayStore) ClaimPendingEventOutbox(
 	_ context.Context,
 	_ int,
@@ -721,20 +774,25 @@ func (s *legacyWebhookRelayStore) ClaimPendingEventOutbox(
 }
 
 // MarkEventDispatched records the Kafka leg's success terminal transition.
-func (s *legacyWebhookRelayStore) MarkEventDispatched(_ context.Context, id int64, claimToken string) error {
+func (s *legacyWebhookRelayStore) MarkEventDispatched(
+	_ context.Context,
+	id int64,
+	claimToken string,
+	record model.BrokerRecord,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.dispatched = append(s.dispatched, legacyWebhookRelayMark{id: id, claimToken: claimToken})
+	s.dispatched = append(s.dispatched, legacyWebhookRelayMark{
+		id: id, claimToken: claimToken, record: record,
+	})
 
 	return nil
 }
 
-// MarkEventFailed records a failed publish attempt and reports that budget remains.
-//
-// Nothing in this file should reach it — the publisher adopted here accepts every event —
-// so the recording exists so that a test can assert the ABSENCE of failures rather than
-// infer success from the presence of a dispatch.
+// MarkEventFailed records a failed publish attempt and reports that budget remains. Nothing here
+// should reach it, so the recording lets a test assert the ABSENCE of failures rather than infer
+// success from a dispatch.
 func (s *legacyWebhookRelayStore) MarkEventFailed(
 	_ context.Context,
 	_ int64,
@@ -753,6 +811,29 @@ func (s *legacyWebhookRelayStore) MarkEventFailed(
 	}, nil
 }
 
+// MarkEventPermanentlyFailed completes the relay's store contract.
+//
+// As with MarkEventFailed, nothing in this file should reach it — the publisher adopted here
+// accepts every event — so the reason is recorded alongside the budget-driven failures, which
+// lets a test assert the ABSENCE of any failure transition rather than infer success.
+func (s *legacyWebhookRelayStore) MarkEventPermanentlyFailed(
+	_ context.Context,
+	_ int64,
+	_ string,
+	errMsg string,
+) (model.EventFailureOutcome, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.failures = append(s.failures, errMsg)
+
+	return model.EventFailureOutcome{
+		Status:    model.EventOutboxStatusFailed,
+		Attempts:  1,
+		Exhausted: true,
+	}, nil
+}
+
 // MarkWebhookDispatched records the legacy leg of the dual-delivery window. This method,
 // and every assertion on it below, disappears at the sunset with the branch that calls it.
 func (s *legacyWebhookRelayStore) MarkWebhookDispatched(_ context.Context, id int64, claimToken string) error {
@@ -762,6 +843,62 @@ func (s *legacyWebhookRelayStore) MarkWebhookDispatched(_ context.Context, id in
 	s.webhookMarks = append(s.webhookMarks, legacyWebhookRelayMark{id: id, claimToken: claimToken})
 
 	return nil
+}
+
+// MarkEventWebhookPending records an outstanding legacy leg and reports that another webhook
+// attempt is owed. SUNSET: goes with the leg it serves.
+func (s *legacyWebhookRelayStore) MarkEventWebhookPending(
+	_ context.Context,
+	_ int64,
+	_ string,
+	errMsg string,
+	_ time.Duration,
+	_ model.BrokerRecord,
+) (model.EventWebhookOutcome, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.webhookPendings = append(s.webhookPendings, errMsg)
+
+	return model.EventWebhookOutcome{
+		Status:          model.EventOutboxStatusWebhookPending,
+		WebhookAttempts: 1,
+	}, nil
+}
+
+// snapshotWebhookPendings copies the recorded outstanding-leg transitions.
+func (s *legacyWebhookRelayStore) snapshotWebhookPendings() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]string(nil), s.webhookPendings...)
+}
+
+// RenewEventOutboxLease is a no-op that reports one row still in flight.
+//
+// The relay renews the lease of a batch it is holding, and these tests seed exactly one row
+// per batch. Reporting one keeps the relay's heartbeat alive for the life of the batch, which
+// is what production does; reporting zero would retire the heartbeat early and prove nothing
+// either way.
+func (s *legacyWebhookRelayStore) RenewEventOutboxLease(
+	_ context.Context,
+	_ string,
+	_ time.Duration,
+) (int64, error) {
+	return 1, nil
+}
+
+// ClaimFailedEventOutboxForDeadLetter claims nothing.
+//
+// The repair pass runs on every tick, and this file seeds no rows awaiting preservation, so an
+// empty result is the honest answer. Returning rows here would drag the dead-letter writer into
+// tests whose subject is the legacy transport.
+func (s *legacyWebhookRelayStore) ClaimFailedEventOutboxForDeadLetter(
+	_ context.Context,
+	_ int,
+	_ time.Duration,
+) ([]model.EventOutbox, error) {
+	return nil, nil
 }
 
 // claimCount reports how many claims were served.
@@ -796,12 +933,8 @@ func (s *legacyWebhookRelayStore) snapshotFailures() []string {
 	return append([]string(nil), s.failures...)
 }
 
-// legacyWebhookRelayNow is the pinned relay clock, parsed from legacyWebhookRelayFixedNow.
-//
-// It is a function rather than a package variable so the constant above stays the single
-// written form of the instant, and it cannot fail: the literal is a compile-time-visible
-// RFC3339 string, and a malformed one would fail every test in this section immediately and
-// unmistakably rather than subtly.
+// legacyWebhookRelayNow is the pinned relay clock, parsed from legacyWebhookRelayFixedNow. It is
+// a function rather than a variable so the constant stays the single written form of the instant.
 func legacyWebhookRelayNow() time.Time {
 	parsed, err := time.Parse(time.RFC3339, legacyWebhookRelayFixedNow)
 	if err != nil {
@@ -811,21 +944,10 @@ func legacyWebhookRelayNow() time.Time {
 	return parsed
 }
 
-// legacyWebhookOutboxRow builds one pending blnk.event_outbox row whose payload is a REAL
-// legacy webhook body.
-//
-// The payload is the marshaled NewWebhook envelope, both keys included, because that is
-// what the production capture path stores and therefore what the relay hands to the legacy
-// transport verbatim. Building it any other way would make the provenance assertion below
-// compare bytes that production never produces.
-//
-// Parameters:
-//   - t *testing.T: the test, for the marshal assertion.
-//   - eventID string: the row's event_id, which becomes the asynq task identity.
-//   - eventType string: the event name, carried in the envelope and used to resolve the topic.
-//
-// Returns:
-//   - model.EventOutbox: a pending row ready to be claimed.
+// legacyWebhookOutboxRow builds one pending blnk.event_outbox row whose payload is a REAL legacy
+// webhook body: the marshaled NewWebhook envelope, both keys included, because that is what the
+// capture path stores and what the relay hands to the legacy transport verbatim. Building it any
+// other way would make the provenance assertion compare bytes production never produces.
 func legacyWebhookOutboxRow(t *testing.T, eventID, eventType string) model.EventOutbox {
 	t.Helper()
 
@@ -857,8 +979,8 @@ func legacyWebhookOutboxRow(t *testing.T, eventID, eventType string) model.Event
 	}
 }
 
-// legacyWebhookRelay builds a relay whose LEGACY LEG IS THE REAL instance and whose store is
-// the fake above, with the clock and the sunset decision pinned.
+// legacyWebhookRelay builds a relay whose LEGACY LEG IS THE REAL instance and whose store is the
+// fake above, with the clock and the sunset answer pinned. sunsetPassed false is inside the window.
 //
 // The three assertions inside it are the ones that make everything after it meaningful, so
 // they are made here once rather than repeated in each test:
@@ -870,10 +992,10 @@ func legacyWebhookOutboxRow(t *testing.T, eventID, eventType string) model.Event
 //     leg accepts every event and performs no I/O, which is what lets this file assert the
 //     relay's behaviour without a broker and without importing a Kafka client. It is also
 //     why MarkEventDispatched being recorded is a sound proxy for "the Kafka leg completed".
-//   - the sunset decision is a pinned function. WebhookSunsetPassed reads the configured
-//     date, and event_sunset.go owns that arithmetic; pinning the ANSWER is what makes these
-//     tests about the branch rather than about date parsing, and it keeps them independent of
-//     whatever WEBHOOK_DEPRECATION_SUNSET_DATE the ambient environment happens to carry.
+//   - the dual-delivery decision is a pinned function. WebhookDualDeliveryActive reads both
+//     ends of the configured window, and event_sunset.go owns that arithmetic; pinning the
+//     ANSWER is what makes these tests about the branch rather than about date parsing, and it
+//     keeps them independent of whatever deprecation window the ambient environment carries.
 //
 // Parameters:
 //   - t *testing.T: the test.
@@ -884,12 +1006,13 @@ func legacyWebhookOutboxRow(t *testing.T, eventID, eventType string) model.Event
 // Returns:
 //   - *EventRelayProcessor: the processor, ready for processBatch.
 //   - *legacyWebhookRelayStore: the store, for the transition assertions.
+//   - *relayFakePublisher: the Kafka leg, for asserting it ran independently of the legacy one.
 func legacyWebhookRelay(
 	t *testing.T,
 	instance *Blnk,
 	sunsetPassed bool,
 	rows ...model.EventOutbox,
-) (*EventRelayProcessor, *legacyWebhookRelayStore) {
+) (*EventRelayProcessor, *legacyWebhookRelayStore, *relayFakePublisher) {
 	t.Helper()
 
 	store := &legacyWebhookRelayStore{pending: append([]model.EventOutbox(nil), rows...)}
@@ -908,30 +1031,32 @@ func legacyWebhookRelay(
 	require.NotNil(t, processor.publisher,
 		"the relay must adopt the process publisher; without it processBatch could not complete a row")
 	require.True(t, IsNoopEventPublisher(processor.publisher),
-		"with no brokers configured the Kafka leg must be the no-op, which is what lets this file "+
-			"drive the relay without a broker and without a Kafka client import")
+		"with no brokers configured the constructor must adopt the no-op — and a relay holding it "+
+			"drains the outbox over the legacy leg alone, which is NOT the branch under test here")
+
+	publisher := &relayFakePublisher{}
 
 	processor.store = store
+	processor.publisher = publisher
 	processor.now = legacyWebhookRelayNow
-	processor.sunsetPassed = func(time.Time) bool { return sunsetPassed }
+	// Inside the window is the NEGATION of "the sunset has passed": the caller states the
+	// boundary in the sunset's terms because that is what these tests are about, and the
+	// relay's seam is the window predicate.
+	processor.dualDeliveryActive = func(time.Time) bool { return !sunsetPassed }
+	processor.windowState = func(time.Time) WebhookWindowState {
+		if sunsetPassed {
+			return WebhookWindowClosed
+		}
 
-	return processor, store
+		return WebhookWindowActive
+	}
+
+	return processor, store, publisher
 }
 
-// legacyWebhookPendingTasks lists the pending tasks on a queue, treating a queue that does
-// not exist as an empty queue.
-//
-// asynq creates a queue lazily on the first enqueue, so "nothing was enqueued" surfaces as
-// ErrQueueNotFound rather than as an empty list. Both mean the same thing to the assertions
-// below, and collapsing them here keeps the negative test from having to branch on it.
-//
-// Parameters:
-//   - t *testing.T: the test.
-//   - inspector *asynq.Inspector: an inspector bound to the test's Redis.
-//   - queue string: the queue name.
-//
-// Returns:
-//   - []*asynq.TaskInfo: the pending tasks, or nil when the queue was never created.
+// legacyWebhookPendingTasks lists the pending tasks on a queue, treating ONLY ErrQueueNotFound as
+// an empty queue: asynq creates a queue lazily, so "nothing was enqueued" surfaces as that error
+// rather than as an empty list. Every other listing error fails the test.
 func legacyWebhookPendingTasks(t *testing.T, inspector *asynq.Inspector, queue string) []*asynq.TaskInfo {
 	t.Helper()
 
@@ -946,13 +1071,6 @@ func legacyWebhookPendingTasks(t *testing.T, inspector *asynq.Inspector, queue s
 }
 
 // legacyWebhookInspector returns an inspector bound to a Redis address, closed on cleanup.
-//
-// Parameters:
-//   - t *testing.T: the test to attach the cleanup to.
-//   - redisDSN string: the address of the test's Redis.
-//
-// Returns:
-//   - *asynq.Inspector: a ready inspector.
 func legacyWebhookInspector(t *testing.T, redisDSN string) *asynq.Inspector {
 	t.Helper()
 
@@ -964,37 +1082,24 @@ func legacyWebhookInspector(t *testing.T, redisDSN string) *asynq.Inspector {
 	return inspector
 }
 
-// TestSendWebhook_InvokedFromRelayDualDeliveryBranch is the retargeting assertion: the
-// legacy transport is still delivering, but it is no longer the DOMAIN that calls it.
+// TestSendWebhook_InvokedFromRelayDualDeliveryBranch asserts WHO calls the legacy transport: not
+// a domain post-action, but the relay's dual-delivery branch, from a CLAIMED blnk.event_outbox
+// row. Both transports therefore read one row rather than serialising the payload twice.
 //
-// Before this change, a domain post-action called SendWebhook directly. Now the domain writes
-// an event to blnk.event_outbox inside the ledger transaction, and the relay's dual-delivery
-// branch enqueues the legacy delivery from the CLAIMED ROW. That change of caller is the whole
-// mechanism of the 30-day window, and it is what makes the two transports carry the same bytes
-// structurally: both read one row, so there is no second serialisation for them to drift apart
-// through.
+// "A task appeared on the queue" would be satisfied by either caller, so provenance is asserted
+// two ways. The task IDENTITY is derived from the row's event_id — only
+// EnqueueLegacyWebhookDelivery sets an asynq task ID, so a task carrying the event id came from
+// the row, and the identity is also what suppresses a duplicate after a re-claim. The task BODY is
+// the row's stored bytes rather than an equal-looking re-serialisation. Comparing those bytes
+// against what Kafka received is criterion V-8's job in event_dual_delivery_test.go, not this
+// test's.
 //
-// # How the assertions establish provenance rather than merely delivery
+// The queue and the task type must both equal the configured Queue.WebhookQueue AND equal each
+// other: the worker's mux dispatches on the TYPE while asynq.Queue routes to the QUEUE, so a task
+// whose type stopped matching its queue would expire unhandled with nothing failing to say so.
 //
-// "A task appeared on the queue" would be satisfied by either caller. Two properties
-// distinguish them, and both are asserted:
-//
-//   - THE TASK IDENTITY IS DERIVED FROM THE ROW'S event_id. Only
-//     EnqueueLegacyWebhookDelivery sets an asynq task ID, and it derives it from the event id
-//     so that a re-claim after a crash is refused as a duplicate. SendWebhook sets none, so
-//     asynq mints a random UUID that cannot contain the event id. A task whose identity
-//     carries the event id therefore came from the outbox row.
-//   - THE TASK BODY IS THE ROW'S STORED BYTES. Not an equal-looking re-serialisation: the same
-//     bytes. This asserts the row was the SOURCE, which is the provenance claim. It is
-//     deliberately NOT a comparison against what Kafka received — payload equivalence between
-//     the two transports is acceptance criterion V-8 and belongs to event_dual_delivery_test.go,
-//     and duplicating it here would put one guarantee in two places that could disagree.
-//
-// The queue and the task type are asserted to be the configured Queue.WebhookQueue string AND
-// to be the same string as each other, because they are deliberately identical: the worker's
-// mux dispatches on the task TYPE while asynq.Queue routes to the QUEUE, so a task whose type
-// stopped matching its queue would land somewhere with no handler for it and expire unhandled
-// with nothing failing to say so.
+// The store and the Kafka leg are substituted here (the fake above and the no-op publisher), so
+// what is proven is the enqueue and its provenance — not that any subscriber is reached.
 func TestSendWebhook_InvokedFromRelayDualDeliveryBranch(t *testing.T) {
 	redisServer := miniredis.RunT(t)
 
@@ -1006,7 +1111,7 @@ func TestSendWebhook_InvokedFromRelayDualDeliveryBranch(t *testing.T) {
 	require.NotNil(t, instance)
 
 	row := legacyWebhookOutboxRow(t, "evt_relay_dual_delivery_1", "transaction.applied")
-	processor, store := legacyWebhookRelay(t, instance, false, row)
+	processor, store, publisher := legacyWebhookRelay(t, instance, false, row)
 
 	claimed := processor.processBatch(context.Background())
 	require.Equal(t, 1, claimed, "the relay must claim and process the seeded outbox row")
@@ -1048,33 +1153,37 @@ func TestSendWebhook_InvokedFromRelayDualDeliveryBranch(t *testing.T) {
 		"the marker is conditional on the claim token, so it must be presented before "+
 			"MarkEventDispatched clears it")
 
+	published := publisher.snapshotRequests()
+	require.Len(t, published, 1,
+		"the Kafka leg must publish the same row: dual delivery means BOTH transports run off one "+
+			"claim, not one or the other")
+	assert.Equal(t, row.EventID, published[0].Event.EventID)
+	assert.Equal(t, []byte(row.Payload), []byte(published[0].Event.Payload),
+		"and it must carry the row's stored bytes too, which is why the two legs cannot drift")
+
 	dispatched := store.snapshotDispatched()
 	require.Len(t, dispatched, 1,
-		"the Kafka leg must complete for the same row: dual delivery means BOTH transports run off "+
-			"one claim, not one or the other")
+		"and the row must be marked dispatched exactly once for that one claim")
 	assert.Equal(t, row.ID, dispatched[0].id)
 	assert.Equal(t, legacyWebhookRelayClaimToken, dispatched[0].claimToken)
 
 	assert.Empty(t, store.snapshotFailures(),
 		"no publish attempt may be recorded as failed; a legacy enqueue must never consume the "+
 			"Kafka retry budget")
+
+	assert.Empty(t, store.snapshotWebhookPendings(),
+		"and nothing may be recorded as OUTSTANDING: the enqueue succeeded against a real Redis, so "+
+			"the row owes the legacy transport nothing and belongs in its terminal state")
 }
 
-// TestSendWebhook_NotInvokedFromRelayAfterTheSunset is the boundary that makes the test above
-// discriminating rather than merely descriptive.
+// TestSendWebhook_NotInvokedFromRelayAfterTheSunset is what makes the test above discriminating:
+// a relay that enqueued the legacy delivery unconditionally would satisfy every assertion in this
+// file and the 30-day window would silently become permanent. The same harness runs with the
+// sunset PASSED and no enqueue may happen.
 //
-// Without it, a relay that enqueued the legacy delivery unconditionally — ignoring the sunset
-// entirely — would satisfy every assertion in this file, and the 30-day window would silently
-// become permanent. So the same harness is run with the sunset PASSED and the enqueue must not
-// happen at all.
-//
-// The Kafka leg is asserted to complete regardless, because the sunset retires one transport
-// and must not disturb the other: after the date, Kafka is simply the only transport. The
-// relay is also asserted to have claimed and processed the row, so "nothing was enqueued"
-// cannot be passing for the uninteresting reason that nothing ran.
-//
-// This test outlives neither the file nor the branch. At the sunset, when the dual-delivery
-// branch is deleted, its subject ceases to exist along with everything else here.
+// The Kafka leg must still complete, because the sunset retires one transport and must not disturb
+// the other, and the row must still be claimed and processed so that "nothing was enqueued" cannot
+// pass for the uninteresting reason that nothing ran.
 func TestSendWebhook_NotInvokedFromRelayAfterTheSunset(t *testing.T) {
 	redisServer := miniredis.RunT(t)
 
@@ -1086,7 +1195,7 @@ func TestSendWebhook_NotInvokedFromRelayAfterTheSunset(t *testing.T) {
 	require.NotNil(t, instance)
 
 	row := legacyWebhookOutboxRow(t, "evt_relay_after_sunset_1", "transaction.applied")
-	processor, store := legacyWebhookRelay(t, instance, true, row)
+	processor, store, publisher := legacyWebhookRelay(t, instance, true, row)
 
 	claimed := processor.processBatch(context.Background())
 	require.Equal(t, 1, claimed,
@@ -1100,7 +1209,15 @@ func TestSendWebhook_NotInvokedFromRelayAfterTheSunset(t *testing.T) {
 	assert.Empty(t, store.snapshotWebhookMarks(),
 		"and nothing may be recorded as legacy-dispatched, because nothing was dispatched")
 
-	require.Len(t, store.snapshotDispatched(), 1,
+	published := publisher.snapshotRequests()
+	require.Len(t, published, 1,
 		"the Kafka leg is unaffected by the sunset: after the date it is simply the only transport")
+	assert.Equal(t, row.EventID, published[0].Event.EventID)
+
+	require.Len(t, store.snapshotDispatched(), 1,
+		"and the row is still retired on the strength of that publish")
 	assert.Empty(t, store.snapshotFailures())
+	assert.Empty(t, store.snapshotWebhookPendings(),
+		"a leg that is no longer owed must not be recorded as outstanding: after the sunset the "+
+			"promise has ended, so the row is terminal rather than left cycling through claims")
 }

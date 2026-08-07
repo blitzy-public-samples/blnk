@@ -97,6 +97,42 @@ func (m *MockDataSource) ResetCapturedEventOutboxes() {
 	m.capturedEventOutboxes = nil
 }
 
+// runEventPreparer runs the first non-nil preparer from a create writer's variadic tail
+// against the entity that create is about to return, and records the row it produced.
+//
+// It mirrors what the real writers do — database.firstEventPreparer picks one preparer,
+// and the row it returns is inserted inside the create's transaction — so that a service
+// that stops supplying a preparer, or supplies one that builds the wrong event, fails a
+// test here rather than silently losing the event in production. A nil row means
+// publishing is not configured and is recorded as nothing, which is the real
+// no-op-when-unconfigured contract.
+//
+// Parameters:
+//   - entity T: the created entity, exactly as it will be returned to the caller.
+//   - preparers []database.EventPreparer[T]: the writer's variadic tail.
+//
+// Returns:
+//   - error: the preparer's error, which the caller returns as the create's error just as
+//     the real writer aborts its transaction.
+func runEventPreparer[T any](m *MockDataSource, entity T, preparers []database.EventPreparer[T]) error {
+	for _, prepare := range preparers {
+		if prepare == nil {
+			continue
+		}
+
+		row, err := prepare(entity)
+		if err != nil {
+			return err
+		}
+
+		m.captureEventOutboxes([]*model.EventOutbox{row})
+
+		return nil
+	}
+
+	return nil
+}
+
 // Compile-time proof that MockDataSource still satisfies the full IDataSource
 // contract.
 //
@@ -116,8 +152,18 @@ var _ database.IDataSource = (*MockDataSource)(nil)
 
 // Transaction methods
 
-func (m *MockDataSource) RecordTransaction(ctx context.Context, txn *model.Transaction) (*model.Transaction, error) {
+// RecordTransaction accepts the same variadic event outbox tail as the real
+// datasource, records it through captureEventOutboxes, and deliberately does not
+// forward it into m.Called() — for the same reason the atomic writers below do not.
+// Every expectation already written as m.On("RecordTransaction", ctx, txn) keeps
+// matching, while a test can still assert that the rejection path committed its
+// transaction.rejected event with the status mutation.
+func (m *MockDataSource) RecordTransaction(ctx context.Context, txn *model.Transaction, eventOutbox ...*model.EventOutbox) (*model.Transaction, error) {
+	m.captureEventOutboxes(eventOutbox)
 	args := m.Called(ctx, txn)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
 	return args.Get(0).(*model.Transaction), args.Error(1)
 }
 
@@ -314,7 +360,43 @@ func (m *MockDataSource) CountQueuedTransactionsForPairLane(ctx context.Context,
 
 // Ledger methods
 
-func (m *MockDataSource) CreateLedger(ledger model.Ledger) (model.Ledger, error) {
+// CreateLedger accepts the same variadic EventPreparer tail as the real datasource
+// and RUNS the preparer against the ledger it is about to return, recording the row
+// it produced.
+//
+// Running it is what makes the atomic-capture behaviour observable: the preparer is
+// where the event's identity, aggregate id and payload are decided, and a mock that
+// merely accepted and dropped it would let ledger creation stop capturing its event
+// with no test able to notice. The row is passed to the created ledger, not the
+// requested one, because that is what the real writer does — the created value is the
+// only one carrying the generated LedgerID.
+//
+// A preparer error is returned as the create's error, exactly as the real writer
+// aborts its transaction, so the fail-closed contract is exercised too. The preparer
+// is not forwarded into m.Called(), so every existing m.On("CreateLedger", ledger)
+// expectation keeps matching.
+func (m *MockDataSource) CreateLedger(ledger model.Ledger, prepareEvent ...database.EventPreparer[model.Ledger]) (model.Ledger, error) {
+	args := m.Called(ledger)
+	created, err := args.Get(0).(model.Ledger), args.Error(1)
+	if err != nil {
+		return created, err
+	}
+
+	if prepareErr := runEventPreparer(m, created, prepareEvent); prepareErr != nil {
+		return model.Ledger{}, prepareErr
+	}
+
+	return created, nil
+}
+
+// CreateLedgerWithEvent records the variadic event rows through captureEventOutboxes
+// and forwards only the ledger into m.Called, so an expectation written for
+// CreateLedger matches this variant unchanged. The reasoning is the same one
+// documented above RecordTransactionWithBalancesAndOutbox: forwarding a variadic
+// changes the argument count testify matches on, and that breaks at run time rather
+// than at compile time. Assert atomic capture on CapturedEventOutboxes.
+func (m *MockDataSource) CreateLedgerWithEvent(ctx context.Context, ledger model.Ledger, eventOutbox ...*model.EventOutbox) (model.Ledger, error) {
+	m.captureEventOutboxes(eventOutbox)
 	args := m.Called(ledger)
 	return args.Get(0).(model.Ledger), args.Error(1)
 }
@@ -377,7 +459,30 @@ func (m *MockDataSource) UpdateIdentityMetadata(id string, metadata map[string]i
 
 // Balance methods
 
-func (m *MockDataSource) CreateBalance(balance model.Balance) (model.Balance, error) {
+// CreateBalance accepts and RUNS the variadic EventPreparer tail against the balance
+// it is about to return, recording the row it produced. See CreateLedger for why the
+// preparer is run rather than dropped.
+//
+// The empty-balance case is honoured as the real writer honours it: a create reported
+// as successful with no BalanceID created nothing, so nothing is captured.
+func (m *MockDataSource) CreateBalance(balance model.Balance, prepareEvent ...database.EventPreparer[model.Balance]) (model.Balance, error) {
+	args := m.Called(balance)
+	created, err := args.Get(0).(model.Balance), args.Error(1)
+	if err != nil || created.BalanceID == "" {
+		return created, err
+	}
+
+	if prepareErr := runEventPreparer(m, created, prepareEvent); prepareErr != nil {
+		return model.Balance{}, prepareErr
+	}
+
+	return created, nil
+}
+
+// CreateBalanceWithEvent behaves like CreateLedgerWithEvent: the event rows are
+// recorded, not forwarded, so existing CreateBalance expectations keep matching.
+func (m *MockDataSource) CreateBalanceWithEvent(ctx context.Context, balance model.Balance, eventOutbox ...*model.EventOutbox) (model.Balance, error) {
+	m.captureEventOutboxes(eventOutbox)
 	args := m.Called(balance)
 	return args.Get(0).(model.Balance), args.Error(1)
 }
@@ -536,7 +641,27 @@ func (m *MockDataSource) DeleteMonitor(id string) error {
 
 // Identity methods
 
-func (m *MockDataSource) CreateIdentity(identity model.Identity) (model.Identity, error) {
+// CreateIdentity accepts and RUNS the variadic EventPreparer tail against the
+// identity it is about to return, recording the row it produced. See CreateLedger for
+// why the preparer is run rather than dropped.
+func (m *MockDataSource) CreateIdentity(identity model.Identity, prepareEvent ...database.EventPreparer[model.Identity]) (model.Identity, error) {
+	args := m.Called(identity)
+	created, err := args.Get(0).(model.Identity), args.Error(1)
+	if err != nil {
+		return created, err
+	}
+
+	if prepareErr := runEventPreparer(m, created, prepareEvent); prepareErr != nil {
+		return model.Identity{}, prepareErr
+	}
+
+	return created, nil
+}
+
+// CreateIdentityWithEvent behaves like CreateLedgerWithEvent: the event rows are
+// recorded, not forwarded, so existing CreateIdentity expectations keep matching.
+func (m *MockDataSource) CreateIdentityWithEvent(ctx context.Context, identity model.Identity, eventOutbox ...*model.EventOutbox) (model.Identity, error) {
+	m.captureEventOutboxes(eventOutbox)
 	args := m.Called(identity)
 	return args.Get(0).(model.Identity), args.Error(1)
 }
@@ -842,8 +967,24 @@ func (m *MockDataSource) ClaimPendingEventOutbox(ctx context.Context, batchSize 
 	return args.Get(0).([]model.EventOutbox), args.Error(1)
 }
 
-func (m *MockDataSource) MarkEventDispatched(ctx context.Context, id int64, claimToken string) error {
-	args := m.Called(ctx, id, claimToken)
+// RenewEventOutboxLease reports how many in-flight rows had their lease extended. A test
+// that stubs only the error must still supply a count, which the type assertion below
+// requires — a renewal reporting an unexpected zero would look like the end of a batch.
+func (m *MockDataSource) RenewEventOutboxLease(ctx context.Context, claimToken string, lease time.Duration) (int64, error) {
+	args := m.Called(ctx, claimToken, lease)
+	return args.Get(0).(int64), args.Error(1)
+}
+
+func (m *MockDataSource) ClaimFailedEventOutboxForDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
+	args := m.Called(ctx, batchSize, lockDuration)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.EventOutbox), args.Error(1)
+}
+
+func (m *MockDataSource) MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error {
+	args := m.Called(ctx, id, claimToken, record)
 	return args.Error(0)
 }
 
@@ -859,8 +1000,8 @@ func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, claimTok
 	return args.Get(0).(model.EventFailureOutcome), args.Error(1)
 }
 
-func (m *MockDataSource) MarkEventDeadLettered(ctx context.Context, id int64, claimToken, dltTopic string, failureMetadata json.RawMessage) error {
-	args := m.Called(ctx, id, claimToken, dltTopic, failureMetadata)
+func (m *MockDataSource) MarkEventDeadLettered(ctx context.Context, id int64, claimToken, dltTopic string, failureMetadata json.RawMessage, record model.BrokerRecord) error {
+	args := m.Called(ctx, id, claimToken, dltTopic, failureMetadata, record)
 	return args.Error(0)
 }
 
@@ -877,9 +1018,39 @@ func (m *MockDataSource) ReleaseEventReplay(ctx context.Context, id int64, claim
 	return args.Error(0)
 }
 
+func (m *MockDataSource) ClaimEventsOwedDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
+	args := m.Called(ctx, batchSize, lockDuration)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.EventOutbox), args.Error(1)
+}
+
+// ClaimPendingWebhookDeliveries and MarkWebhookDispatched mock the legacy leg of the
+// dual-delivery window and are DELETED with it at the webhook sunset.
+func (m *MockDataSource) ClaimPendingWebhookDeliveries(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
+	args := m.Called(ctx, batchSize, lockDuration)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.EventOutbox), args.Error(1)
+}
+
 func (m *MockDataSource) MarkWebhookDispatched(ctx context.Context, id int64, claimToken string) error {
 	args := m.Called(ctx, id, claimToken)
 	return args.Error(0)
+}
+
+// MarkEventWebhookPending returns the outcome the real datasource decides in SQL. As
+// with MarkEventFailed, a test that stubs only the error must still supply an outcome:
+// the caller reads Abandoned to decide whether the legacy leg is finished or will be
+// retried, and a zero outcome on the error path is what the nil check produces.
+func (m *MockDataSource) MarkEventWebhookPending(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, record model.BrokerRecord) (model.EventWebhookOutcome, error) {
+	args := m.Called(ctx, id, claimToken, errMsg, retryAfter, record)
+	if args.Get(0) == nil {
+		return model.EventWebhookOutcome{}, args.Error(1)
+	}
+	return args.Get(0).(model.EventWebhookOutcome), args.Error(1)
 }
 
 func (m *MockDataSource) PurgeTerminalEventsBefore(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
@@ -909,6 +1080,19 @@ func (m *MockDataSource) CountEventOutboxByStatus(ctx context.Context) (map[stri
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(map[string]int64), args.Error(1)
+}
+
+// AuditTerminalEventRecords returns the outbox side of the zero-loss reconciliation. A test
+// that stubs only the error must still supply an audit, because the caller reads
+// UnconfirmedRows to decide whether the verdict can be conclusive at all — the zero audit the
+// nil check produces reports nothing published, which is the correct reading of a failed
+// measurement.
+func (m *MockDataSource) AuditTerminalEventRecords(ctx context.Context) (model.EventOutboxAudit, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return model.EventOutboxAudit{}, args.Error(1)
+	}
+	return args.Get(0).(model.EventOutboxAudit), args.Error(1)
 }
 
 // Event subscriber methods
@@ -982,4 +1166,22 @@ func (m *MockDataSource) MarkSubscriberMigrated(ctx context.Context, subscriberI
 func (m *MockDataSource) PurgeMigratedSubscriberWebhookURLs(ctx context.Context, migratedBefore time.Time) (int64, error) {
 	args := m.Called(ctx, migratedBefore)
 	return args.Get(0).(int64), args.Error(1)
+}
+
+func (m *MockDataSource) MarkSubscriberRevocationPending(ctx context.Context, subscriberID string, pendingAt time.Time) (*model.EventSubscriber, error) {
+	args := m.Called(ctx, subscriberID, pendingAt)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.EventSubscriber), args.Error(1)
+}
+
+func (m *MockDataSource) ClaimSubscriberForProvisioning(ctx context.Context, subscriberID string, lease time.Duration) (string, error) {
+	args := m.Called(ctx, subscriberID, lease)
+	return args.String(0), args.Error(1)
+}
+
+func (m *MockDataSource) ReleaseSubscriberProvisioningFence(ctx context.Context, subscriberID string, token string) error {
+	args := m.Called(ctx, subscriberID, token)
+	return args.Error(0)
 }

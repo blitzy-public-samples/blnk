@@ -24,6 +24,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -216,4 +218,105 @@ func TestSetupBlnk(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, instance)
 	require.NotNil(t, instance.GetDataSource(), "a real config must produce a wired Blnk instance")
+}
+
+// stopperSymbol names the function a lifecycle starter handed back, resolved from the runtime's
+// own symbol table.
+//
+// It is what lets these tests tell "a relay was constructed and its Stop was returned" from "a
+// local no-op was returned", which is the ONLY externally visible difference between the two
+// branches of startEventRelay: both return a callable func(), and neither exposes the processor.
+// Asserting on the symbol is a statement about the value the caller will defer, not about the
+// source text — a rename of Stop, or a branch that stopped handing the relay's own stopper back,
+// each fail here with the name that was actually returned.
+func stopperSymbol(t *testing.T, stopper func()) string {
+	t.Helper()
+
+	require.NotNil(t, stopper, "a lifecycle starter must always return something the caller can defer")
+
+	fn := runtime.FuncForPC(reflect.ValueOf(stopper).Pointer())
+	require.NotNil(t, fn, "the returned stopper must be resolvable to a symbol")
+
+	return fn.Name()
+}
+
+// TestStartEventRelay_WithoutBrokersStartsNothingAndIsStillStoppable pins the
+// graceful-degradation contract at the process's own entry point.
+//
+// A deployment with no KAFKA_BROKERS is a legitimate steady state, not a misconfiguration: its
+// producers deliver over the legacy webhook transport directly, so there is nothing for a relay
+// to drain. Starting one anyway would be actively harmful — the publisher would be the no-op
+// implementation, which reports every publish as dispatched without sending anything.
+//
+// The blank and comma-only broker lists are here because they are what a half-filled
+// environment variable actually looks like. `KAFKA_BROKERS=","` must mean "no brokers", and a
+// starter that tested only for a nil slice would treat it as configured.
+func TestStartEventRelay_WithoutBrokersStartsNothingAndIsStillStoppable(t *testing.T) {
+	for name, brokers := range map[string][]string{
+		"unset":       nil,
+		"empty":       {},
+		"blank":       {"   "},
+		"comma noise": {"", " ", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := &config.Configuration{Kafka: config.KafkaConfig{Brokers: brokers}}
+
+			// A nil instance is deliberate: it makes the assertion structural. If this branch
+			// ever built a relay, it would be building one from nothing.
+			stop := startEventRelay(context.Background(), nil, cfg)
+
+			assert.NotContains(t, stopperSymbol(t, stop), "EventRelayProcessor",
+				"no relay may be constructed without brokers: its publisher would be the no-op one, "+
+					"which reports every publish as dispatched while sending nothing")
+
+			stop()
+		})
+	}
+
+	t.Run("a nil configuration", func(t *testing.T) {
+		stop := startEventRelay(context.Background(), nil, nil)
+
+		assert.NotContains(t, stopperSymbol(t, stop), "EventRelayProcessor",
+			"an unloaded configuration must not be read as a configured broker list")
+
+		stop()
+	})
+}
+
+// TestStartEventRelay_WithBrokersConstructsTheRelayAndReturnsItsStop is the wiring assertion
+// itself, and the defect it exists for was total.
+//
+// Every producer captures its event into blnk.event_outbox inside the ledger transaction, and
+// the relay is the only thing that publishes those rows. It was constructible, fully unit-tested
+// and NEVER CONSTRUCTED BY A RUNNING PROCESS: a deployment with KAFKA_BROKERS set accumulated
+// outbox rows indefinitely and delivered nothing, with no error anywhere, because capturing each
+// row had succeeded. Nothing in the suite failed, because nothing asserted that production code
+// starts it.
+//
+// The broker is deliberately unreachable, which also exercises the documented decision that a
+// topic-assurance failure is logged and stepped past rather than fatal: assurance against a
+// broker that is not listening yet is a transient condition, and refusing to start would convert
+// it into an outage that only a restart could clear.
+func TestStartEventRelay_WithBrokersConstructsTheRelayAndReturnsItsStop(t *testing.T) {
+	cfg := &config.Configuration{
+		Kafka: config.KafkaConfig{
+			// Reserved discard port on loopback: refused immediately rather than timing out,
+			// so the assurance failure is fast and the test needs no broker and no credential.
+			Brokers:     []string{"127.0.0.1:1"},
+			TopicPrefix: "blnk",
+		},
+	}
+
+	started := time.Now()
+	stop := startEventRelay(context.Background(), nil, cfg)
+
+	assert.Contains(t, stopperSymbol(t, stop), "EventRelayProcessor",
+		"with brokers configured the relay must be constructed and ITS stop returned, so the server's "+
+			"deferred call really shuts the relay down; a local no-op here means nothing drains the outbox")
+
+	stop()
+
+	assert.Less(t, time.Since(started), eventTopicAssuranceTimeout,
+		"an unreachable broker must not hold start-up for the whole assurance budget: it is refused, "+
+			"logged and stepped past")
 }

@@ -195,13 +195,12 @@ var dltAllDeadLetterTopics = []string{
 	"blnk.transactions.dlt",
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
-	"blnk.system.dlt",
-	// The quarantine category's sibling. Quarantine holds events whose type the
-	// catalogue does not recognise, and those are exactly the events most likely to
+	// The internal system category's sibling. That category also holds events whose type
+	// the catalogue does not recognise, and those are exactly the events most likely to
 	// fail to publish, so its dead-letter topic must be covered by the age gauge like
 	// any other — a stalled entry there being invisible would hide the failure of an
 	// event that was already a routing defect.
-	"blnk.quarantine.dlt",
+	"blnk.system.dlt",
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +219,11 @@ type dltMarkRecord struct {
 	claimToken string
 	dltTopic   string
 	metadata   json.RawMessage
+
+	// record is the broker coordinate of the DEAD-LETTER write — where the event's only
+	// surviving copy now is. Recorded so a test can assert it is persisted rather than
+	// discarded, which is what lets an operator read the exact record back.
+	record model.BrokerRecord
 }
 
 // dltPageRequest is one recorded ListDeadLetteredEvents call.
@@ -290,6 +294,10 @@ type dltFakeStore struct {
 type dltDispatchRecord struct {
 	id         int64
 	claimToken string
+
+	// record is the broker coordinate of the REPLAY write, so a replayed row names the new
+	// record rather than the dead-letter one it was read from.
+	record model.BrokerRecord
 }
 
 // dltReleaseRecord is one ReleaseEventReplay call: the rollback that keeps a failed
@@ -323,7 +331,13 @@ func (s *dltFakeStore) withRow(row model.EventOutbox) *dltFakeStore {
 	stored := row
 	s.rows[row.EventID] = &stored
 
-	if row.Status == model.EventOutboxStatusDeadLettered || row.Status == model.EventOutboxStatusFailed {
+	// EVERY failure state joins the inventory, matching ListDeadLetteredEvents, which covers
+	// dead_lettered, dlt_pending and failed. dlt_pending especially: while a row sits there its
+	// event exists in no topic at all, which makes it the one an operator most needs to see.
+	switch row.Status {
+	case model.EventOutboxStatusDeadLettered,
+		model.EventOutboxStatusDLTPending,
+		model.EventOutboxStatusFailed:
 		s.inventory = append(s.inventory, row.EventID)
 		s.counts[row.Status]++
 	}
@@ -422,12 +436,14 @@ func (s *dltFakeStore) MarkEventDeadLettered(
 	id int64,
 	claimToken, dltTopic string,
 	failureMetadata json.RawMessage,
+	record model.BrokerRecord,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.deadLettered = append(s.deadLettered, dltMarkRecord{
 		id: id, claimToken: claimToken, dltTopic: dltTopic, metadata: failureMetadata,
+		record: record,
 	})
 
 	if s.markDeadLetteredErr != nil {
@@ -442,6 +458,13 @@ func (s *dltFakeStore) MarkEventDeadLettered(
 		row.Status = model.EventOutboxStatusDeadLettered
 		row.DLTTopic = dltTopic
 		row.FailureMetadata = failureMetadata
+		if record.Confirmed() {
+			partition := record.Partition
+			offset := record.Offset
+			row.KafkaTopic = record.Topic
+			row.KafkaPartition = &partition
+			row.KafkaOffset = &offset
+		}
 
 		if !dltContainsString(s.inventory, eventID) {
 			// Newest first, matching the repository's ordering.
@@ -457,11 +480,18 @@ func (s *dltFakeStore) MarkEventDeadLettered(
 
 // MarkEventDispatched moves the row to dispatched and removes it from the dead-letter
 // inventory, mirroring the repository's status filter.
-func (s *dltFakeStore) MarkEventDispatched(_ context.Context, id int64, claimToken string) error {
+func (s *dltFakeStore) MarkEventDispatched(
+	_ context.Context,
+	id int64,
+	claimToken string,
+	record model.BrokerRecord,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.dispatched = append(s.dispatched, dltDispatchRecord{id: id, claimToken: claimToken})
+	s.dispatched = append(s.dispatched, dltDispatchRecord{
+		id: id, claimToken: claimToken, record: record,
+	})
 
 	if s.markDispatchedErr != nil {
 		return s.markDispatchedErr
@@ -1014,6 +1044,16 @@ func dltPinTopicPrefix(t *testing.T) {
 // dltExhaustedRow builds the outbox row of an event that has just spent its entire retry
 // budget — the row the relay hands to the dead-letter path.
 //
+// Its status is DLT_PENDING, and that is the whole point of the state. A row whose budget is
+// spent but whose dead-letter write is still owed is NOT terminal: it keeps its lease so no
+// second worker writes the same event to a .dlt topic, and when the holder dies the recovery
+// pass re-claims it. Seeding `failed` here — the terminal status this fixture used to carry —
+// modelled a hand-off the relay no longer performs, and certified an outcome that would strand
+// the event: recoverDeadLetterHandoffs claims dlt_pending, so nothing would ever retry the
+// write, and replay requires dead_lettered, so nothing could reach it either. The dead-letter
+// listing covers dlt_pending, failed and dead_lettered alike, so an operator sees it in all
+// three.
+//
 // The attempt window is genuinely SPREAD: the first attempt is 31 seconds before the last,
 // which is what the documented backoff schedule (1s, 2s, 4s, 8s, 16s across five attempts)
 // produces. Two distinct instants are essential rather than cosmetic — a fixture whose
@@ -1050,7 +1090,7 @@ func dltExhaustedRow(eventID, eventType, topic string) model.EventOutbox {
 		SchemaVersion:    model.SchemaVersionV1,
 		Payload:          json.RawMessage(dltTrapPayload),
 		OccurredAt:       dltOccurredAt,
-		Status:           model.EventOutboxStatusFailed,
+		Status:           model.EventOutboxStatusDLTPending,
 		Attempts:         dltExhaustedAttempts,
 		MaxAttempts:      dltExhaustedAttempts,
 		LastError:        dltPublishFailureReason,
@@ -1116,6 +1156,23 @@ func dltCapturePublishAttempts(t *testing.T) *dltRecordedCounter {
 	original := metrics.EventPublishAttemptsTotal
 	t.Cleanup(func() { metrics.EventPublishAttemptsTotal = original })
 	metrics.EventPublishAttemptsTotal = recorder
+
+	return recorder
+}
+
+// dltCapturePublishDuration swaps the shared publish-duration histogram for a recorder, so
+// the attempt token and the measured duration a dead-letter write records can be asserted.
+//
+// It reuses the recorder declared beside the publisher's own tests rather than redeclaring
+// one: both files exercise the same instrument, and two recorders would let the two files
+// disagree about what a recorded observation looks like.
+func dltCapturePublishDuration(t *testing.T) *publisherRecordedHistogram {
+	t.Helper()
+
+	recorder := &publisherRecordedHistogram{}
+	original := metrics.EventPublishDuration
+	t.Cleanup(func() { metrics.EventPublishDuration = original })
+	metrics.EventPublishDuration = recorder
 
 	return recorder
 }
@@ -1292,13 +1349,13 @@ func TestDeadLetterRouting_SendsEachCategoryToItsOwnDeadLetterTopic(t *testing.T
 			require.Len(t, written, 1, "exactly one dead-letter message must be written")
 			assert.Equal(t, route.deadLetterTopic, written[0].topic,
 				"the writer resolved for %s must be the one that wrote the message", route.deadLetterTopic)
-			assert.Equal(t, []byte(row.PartitionKey), written[0].message.Key,
-				"the dead-letter message must keep the original partition key so the .dlt topic "+
-					"preserves the same per-aggregate ordering as the topic it failed to reach")
-			assert.Equal(t, row.PartitionKey, outcome.PartitionKey)
-			assert.NotEqual(t, row.LedgerID, outcome.PartitionKey,
-				"the key must come from partition_key, which the claim query serialises on, and not "+
-					"from ledger_id, which is NULL for most event types")
+			assert.Equal(t, []byte(row.LedgerID), written[0].message.Key,
+				"the dead-letter message must keep the ORIGINAL key so the .dlt topic preserves the "+
+					"same per-aggregate ordering as the topic it failed to reach, and requirement R-6's "+
+					"key is the ledger the row records")
+			assert.Equal(t, row.LedgerID, outcome.PartitionKey)
+			assert.NotEqual(t, row.AggregateID, outcome.PartitionKey,
+				"the recorded ledger must be used rather than fallen through to the aggregate")
 			assert.True(t, outcome.Published, "a resolved writer that accepted the message means published")
 			assert.Equal(t, model.PublishStatusDeadLettered, outcome.Status)
 		})
@@ -1524,8 +1581,10 @@ func TestDeadLetterRouting_RefusesToRecordADeadLetterWithoutABroker(t *testing.T
 
 	assert.Empty(t, store.snapshotDeadLettered(),
 		"a row must not be recorded as dead-lettered when no dead-letter message exists")
-	assert.Equal(t, model.EventOutboxStatusFailed, store.row(t, row.EventID).Status,
-		"the row keeps the non-terminal status the caller gave it, so it stays visible and completable")
+	assert.Equal(t, model.EventOutboxStatusDLTPending, store.row(t, row.EventID).Status,
+		"the row keeps the non-terminal status the caller gave it, so it stays visible and completable: "+
+			"dlt_pending is re-claimed by the recovery pass, where a terminal failed row would be stranded "+
+			"with its event on no topic at all")
 	assert.Zero(t, counter.total(),
 		"the dead-letter counter must not claim a dead-lettering that did not happen")
 }
@@ -1565,7 +1624,8 @@ func TestDeadLetterRouting_RefusesToRecordADeadLetterWhenConfigurationCannotBeRe
 	assert.False(t, outcome.Published)
 	assert.Empty(t, store.snapshotDeadLettered(),
 		"an unreadable configuration must not be treated as a deployment without Kafka")
-	assert.Equal(t, model.EventOutboxStatusFailed, store.row(t, row.EventID).Status)
+	assert.Equal(t, model.EventOutboxStatusDLTPending, store.row(t, row.EventID).Status,
+		"an unreadable configuration must leave the write OWED and recoverable, not retired")
 	assert.Zero(t, counter.total())
 }
 
@@ -1635,8 +1695,13 @@ func TestDeadLetterRouting_ReportsAFailedWriteAndLeavesTheRowInTheInventory(t *t
 
 	assert.False(t, outcome.Published)
 	assert.Empty(t, store.snapshotDeadLettered(), "the row must not be recorded after a failed write")
-	assert.Equal(t, model.EventOutboxStatusFailed, store.row(t, row.EventID).Status,
-		"the row stays failed, which the dead-letter listing still covers")
+	assert.Equal(t, model.EventOutboxStatusDLTPending, store.row(t, row.EventID).Status,
+		"a failed dead-letter write must leave the row RETRYABLE. dlt_pending is what the recovery "+
+			"pass claims, so the write is re-attempted once this holder's lease lapses; a terminal "+
+			"failed row would never be retried and never be replayable, and the event would exist "+
+			"only in the outbox with no copy on any topic")
+	assert.NotEqual(t, model.EventOutboxStatusFailed, store.row(t, row.EventID).Status,
+		"terminal failed is the outcome this replaced: it reads as a completed hand-off")
 	assert.Zero(t, counter.total(), "nothing was dead-lettered, so nothing may be counted")
 }
 
@@ -2347,9 +2412,10 @@ func TestReplayDeadLetteredEvent_TargetsTheTopicRecordedInTheStoredMetadata(t *t
 // TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged is the ordering guarantee applied to
 // the replay itself.
 //
-// The key is the row's stored partition key, and keying by it with a stable hash balancer is
-// what pins every event sharing that key to one partition. A replay published under a
-// different key — or under none — would land on a different partition, and the replay would
+// The key is whatever the ORIGINAL publish used — the ledger the row records under requirement
+// R-6, falling back to its stored partition key — and keying by it with a stable hash balancer
+// is what pins every event sharing that key to one partition. A replay published under a
+// different key, or under none, would land on a different partition, and the replay would
 // itself violate the per-aggregate ordering the pipeline exists to preserve.
 func TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged(t *testing.T) {
 	dltPinTopicPrefix(t)
@@ -2359,21 +2425,19 @@ func TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged(t *testing.T) {
 	outcome, err := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
 	require.NoError(t, err)
 
-	assert.Equal(t, fixture.row.PartitionKey, outcome.PartitionKey,
-		"the replay must be keyed by the row's partition key, exactly as the original publish was")
-	assert.Equal(t, fixture.row.PartitionKey, fixture.request(t).Key)
+	assert.Equal(t, fixture.row.LedgerID, outcome.PartitionKey,
+		"the replay must be keyed by the row's ledger, exactly as the original publish was")
+	assert.Equal(t, fixture.row.LedgerID, fixture.request(t).Key)
 	assert.Equal(t, fixture.outcome.PartitionKey, outcome.PartitionKey,
 		"the dead-letter write and the replay must use one and the same key")
 	assert.NotEmpty(t, outcome.PartitionKey,
 		"an empty key would spread the event across partitions and give up its ordering")
-	assert.NotEqual(t, fixture.row.LedgerID, outcome.PartitionKey,
-		"partition_key and ledger_id are different columns, and the key is the former")
 	assert.NotEqual(t, fixture.row.AggregateID, outcome.PartitionKey,
-		"the stored key must be used rather than fallen through to the aggregate")
+		"the recorded key must be used rather than fallen through to the aggregate")
 
-	t.Run("a row without a partition key falls back to the ledger", func(t *testing.T) {
+	t.Run("a row without a ledger falls back to the stored partition key", func(t *testing.T) {
 		row := fixture.row
-		row.PartitionKey = ""
+		row.LedgerID = ""
 
 		store := newDltFakeStore().withRow(row)
 		publisher := &dltFakePublisher{}
@@ -2382,8 +2446,9 @@ func TestReplayDeadLetteredEvent_KeepsTheMessageKeyUnchanged(t *testing.T) {
 		replayed, replayErr := service.ReplayDeadLetteredEvent(context.Background(), row.EventID)
 		require.NoError(t, replayErr)
 
-		assert.Equal(t, row.LedgerID, replayed.PartitionKey,
-			"a row assembled without the column still keys by its ledger rather than going unkeyed")
+		assert.Equal(t, row.PartitionKey, replayed.PartitionKey,
+			"an event with no ledger still keys by the column the claim serialises on rather than "+
+				"going unkeyed")
 	})
 
 	t.Run("a row without a partition key or a ledger id falls back to the aggregate", func(t *testing.T) {
@@ -2865,15 +2930,21 @@ func TestDeadLetterOperations_ReportAMissingDatasourceLegibly(t *testing.T) {
 
 // TestDeadLetterMetrics_CountsEachDeadLetteredEventExactlyOnce is what criterion V-3 rests on.
 //
-// The dead-letter RATE is evaluated as the ratio of this counter to the published-events
-// counter, and it must stay under 0.1%. A double count would therefore report twice the real
-// rate and fail a perfectly healthy system; a missing count would hide a genuine incident.
-// "Exactly once" is asserted as exactly one increment of exactly one, not merely as "non-zero".
+// The dead-letter RATE this counter is the numerator of must stay under 0.1%, and its
+// denominator is the SUM of this counter and the published-events counter, not the published
+// counter alone: the two PARTITION a captured event's terminal outcomes — an event is either
+// delivered or dead-lettered, never both — so their sum is the population. Dividing by the
+// successes would report dead-letters as a fraction of successes, overstating the rate and
+// diverging without bound as failures rise.
+//
+// A double count would therefore report twice the real rate and fail a perfectly healthy system;
+// a missing count would hide a genuine incident. "Exactly once" is asserted as exactly one
+// increment of exactly one, not merely as "non-zero".
 //
 // The attribution is asserted at the same time: the counter carries the ORIGINAL category topic,
-// never the `.dlt` sibling, which is what makes it directly comparable with the published-events
-// counter it is divided by. Attributing it to the `.dlt` name would put the numerator and the
-// denominator in different label spaces and make the ratio unreadable.
+// never the `.dlt` sibling, which is what puts it in the same label space as the published-events
+// counter. Attributing it to the `.dlt` name would leave the two terms of that sum in different
+// label spaces and make the ratio uncomputable.
 func TestDeadLetterMetrics_CountsEachDeadLetteredEventExactlyOnce(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -2948,30 +3019,53 @@ func TestDeadLetterMetrics_CountNothingWhenTheDeadLetteringDidNotComplete(t *tes
 	})
 }
 
-// TestDeadLetterMetrics_RecordsTheDeadLetteredOutcomeOnThePublishAttemptCounter pins the third
-// value of the attempts counter's documented label set.
+// TestDeadLetterMetrics_RecordsEveryDeadLetterWriteWithItsPurposeAndDuration pins the
+// contract of the shared attempt instruments for the dead-letter path.
 //
-// The dead-letter write itself is a real publish the broker accepted, so it is recorded as an
-// attempt — but stamped with the DEAD-LETTERED outcome rather than dispatched, because the
-// pipeline-level statement about the event is that it ended its life on a dead-letter topic. That
-// is the value an operator filters on to see retry pressure separately from delivery volume.
-func TestDeadLetterMetrics_RecordsTheDeadLetteredOutcomeOnThePublishAttemptCounter(t *testing.T) {
+// A dead-letter write is a real publish, so it belongs on those instruments — and it belongs
+// there whichever way it ends. Three properties are asserted, and each was a defect:
+//
+//   - EVERY write is recorded, success and failure alike. Recording only successes made the
+//     two signals an operator needs during a dead-letter outage invisible: the attempts
+//     counter showed no failing writes and the histogram had no observations for the path
+//     that was timing out, so "the dead-letter topic is unreachable" looked exactly like
+//     "nothing is being dead-lettered".
+//   - The OUTCOME is dead_lettered for an acknowledged write, because the pipeline-level
+//     statement about the event is that it ended its life on a dead-letter topic, and failed
+//     for a write that did not land.
+//   - The ATTEMPT attribute is the fixed `dead_letter` token, which requires the purpose to
+//     be carried. Without it the token is the attempt count from the ORIGINAL retry sequence,
+//     which both misdescribes the observation and drops dead-letter latency into the
+//     attempt="5" population the first-attempt latency target is read against.
+func TestDeadLetterMetrics_RecordsEveryDeadLetterWriteWithItsPurposeAndDuration(t *testing.T) {
 	dltPinTopicPrefix(t)
 
-	row := dltExhaustedRow("evt_attempt_outcome", "transaction.applied", "blnk.transactions")
-	service := dltNewService(newDltFakeStore().withRow(row), &dltFakePublisher{}, &dltFakeTransport{})
+	t.Run("an acknowledged write is one dead_lettered attempt with the dead_letter token", func(t *testing.T) {
+		row := dltExhaustedRow("evt_attempt_outcome", "transaction.applied", "blnk.transactions")
+		service := dltNewService(newDltFakeStore().withRow(row), &dltFakePublisher{}, &dltFakeTransport{})
 
-	attempts := dltCapturePublishAttempts(t)
+		attempts := dltCapturePublishAttempts(t)
+		duration := dltCapturePublishDuration(t)
 
-	_, err := service.DeadLetter(context.Background(), row, errors.New("boom"))
-	require.NoError(t, err)
+		_, err := service.DeadLetter(context.Background(), row, errors.New("boom"))
+		require.NoError(t, err)
 
-	records := attempts.snapshot()
-	require.Len(t, records, 1, "a successful dead-letter write records exactly one attempt")
-	assert.Equal(t, string(model.PublishStatusDeadLettered), records[0].attributes[publishAttrOutcome],
-		"the attempt must be attributed to the dead-lettered outcome, not to dispatched")
+		records := attempts.snapshot()
+		require.Len(t, records, 1, "one write is one attempt")
+		assert.Equal(t, string(model.PublishStatusDeadLettered), records[0].attributes[publishAttrOutcome],
+			"the attempt must be attributed to the dead-lettered outcome, not to dispatched")
 
-	t.Run("a failed dead-letter write records no attempt", func(t *testing.T) {
+		observations := duration.snapshot()
+		require.Len(t, observations, 1, "the write's latency must be measured, or a slow dead-letter path is invisible")
+		assert.Equal(t, publishAttemptLabelDeadLetter, observations[0].attributes[publishAttrAttempt],
+			"the attempt attribute must be the fixed dead_letter token: a number would come from the "+
+				"original retry sequence and would contaminate the first-attempt latency population")
+		assert.Equal(t, "blnk.transactions.dlt", observations[0].attributes[publishAttrTopic],
+			"the duration is attributed to the topic actually written to")
+		assert.GreaterOrEqual(t, observations[0].value, 0.0, "the duration is recorded in seconds")
+	})
+
+	t.Run("a write that did not land is one failed attempt, also measured", func(t *testing.T) {
 		failing := dltExhaustedRow("evt_attempt_outcome_failed", "transaction.applied", "blnk.transactions")
 		service := dltNewService(
 			newDltFakeStore().withRow(failing),
@@ -2979,11 +3073,42 @@ func TestDeadLetterMetrics_RecordsTheDeadLetteredOutcomeOnThePublishAttemptCount
 			&dltFakeTransport{writeErr: errors.New("broken pipe")},
 		)
 		failedAttempts := dltCapturePublishAttempts(t)
+		failedDuration := dltCapturePublishDuration(t)
 
 		_, writeErr := service.DeadLetter(context.Background(), failing, errors.New("boom"))
 		require.Error(t, writeErr)
-		assert.Empty(t, failedAttempts.snapshot(),
-			"the relay already recorded one attempt per real publish; this must not add another")
+
+		records := failedAttempts.snapshot()
+		require.Len(t, records, 1,
+			"a dead-letter write that failed is still a write this process attempted, and it is the one an "+
+				"operator most needs to see: unrecorded, a broker refusing every dead-letter message is "+
+				"indistinguishable from an empty dead-letter path")
+		assert.Equal(t, string(model.PublishStatusFailed), records[0].attributes[publishAttrOutcome],
+			"the outcome must say the write did not land")
+
+		observations := failedDuration.snapshot()
+		require.Len(t, observations, 1, "a timing-out write is exactly when latency data matters")
+		assert.Equal(t, publishAttemptLabelDeadLetter, observations[0].attributes[publishAttrAttempt])
+	})
+
+	t.Run("a deployment with no transport records the failed attempt too", func(t *testing.T) {
+		orphan := dltExhaustedRow("evt_attempt_outcome_no_transport", "transaction.applied", "blnk.transactions")
+		service := dltNewService(
+			newDltFakeStore().withRow(orphan),
+			&dltFakePublisher{},
+			&dltFakeTransport{noWriter: true},
+		)
+		noTransportAttempts := dltCapturePublishAttempts(t)
+
+		_, writeErr := service.DeadLetter(context.Background(), orphan, errors.New("boom"))
+		require.Error(t, writeErr,
+			"no transport means no dead-letter message, which is a failure and not a silent success")
+
+		records := noTransportAttempts.snapshot()
+		require.Len(t, records, 1,
+			"from the event's point of view this is the same event as a refused write: its dead-letter "+
+				"message did not land")
+		assert.Equal(t, string(model.PublishStatusFailed), records[0].attributes[publishAttrOutcome])
 	})
 }
 
@@ -3699,7 +3824,7 @@ func TestEventDeadLetterSource_BuildsNoConsumerSurface(t *testing.T) {
 	assert.Equal(t, ".dlt", DeadLetterTopicSuffix,
 		"the published suffix is a breaking change to every subscriber, script, alert and runbook")
 	assert.Equal(t, dltAllDeadLetterTopics, AllDeadLetterTopics(),
-		"the four Blnk-owned dead-letter topics are the whole of what Blnk owns")
+		"the Blnk-owned dead-letter topics are the whole of what Blnk owns")
 	for _, topic := range dltAllDeadLetterTopics {
 		assert.True(t, IsDeadLetterTopic(topic))
 		assert.Equal(t, topic, DLTFor(topic),
@@ -3923,22 +4048,79 @@ func TestKafkaTransportCredentials_ProducerPrefersItsOwnPrincipal(t *testing.T) 
 	assert.Equal(t, "admin-secret", adminSecret)
 }
 
-// TestKafkaTransportCredentials_FallsBackToTheAdminPrincipalOnlyWhenNoProducerExists covers the
-// compatibility path.
+// TestKafkaTransportCredentials_NeverFallsBackToTheAdminPrincipal replaces a test that asserted
+// the opposite, because the behaviour it pinned was itself the defect (PRIV-01).
 //
-// It exists for one reason: an existing single-credential deployment must keep publishing across
-// an upgrade rather than stop dead. It is retained deliberately and it is not silent — the
-// fallback warns, naming the variables to set — because a silent compatibility path is how a
-// temporary allowance becomes the permanent configuration.
-func TestKafkaTransportCredentials_FallsBackToTheAdminPrincipalOnlyWhenNoProducerExists(t *testing.T) {
+// The previous version required the producer role to FALL BACK to the admin pair, in the name of
+// letting a single-credential deployment keep publishing across an upgrade. It warned while doing
+// it, and that was the flaw in the reasoning: a warning is advice, the code went on publishing as
+// the principal that can create topics, alter SCRAM credentials and manage ACLs, and so a leaked
+// producer credential compromised the cluster's authorization state rather than merely allowing
+// events to be published.
+//
+// The two failure modes are not symmetric. A deployment that has not provisioned a producer
+// principal loses nothing by failing to start — it is a configuration step away from working —
+// whereas one that quietly publishes as the administrator has already accepted a serious risk
+// without being asked. So the fallback is gone, and its absence is what this test pins.
+//
+// TestKafkaTransportCredentials_RefusesToPublishAsTheAdministrator in event_admin_test.go covers
+// the refusal's message and the three configurations that remain legitimate.
+func TestKafkaTransportCredentials_NeverFallsBackToTheAdminPrincipal(t *testing.T) {
 	cfg := kafkaTransportConfig()
 	cfg.SASLUser, cfg.SASLSecret = "", ""
 	cfg.SASLAdminUser, cfg.SASLAdminSecret = "blnk-admin", "admin-secret"
 
+	require.False(t, cfg.AllowAdminProducer,
+		"the least-privilege posture must be the zero value; an unset variable must not be the "+
+			"only thing preventing the data plane from running as an administrator")
+
 	user, secret, err := kafkaTransportCredentials(cfg, KafkaTransportRoleProducer)
-	require.NoError(t, err)
-	assert.Equal(t, "blnk-admin", user)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrKafkaProducerCredentialsRequired)
+	assert.Contains(t, err.Error(), "KAFKA_SASL_USER")
+	assert.Contains(t, err.Error(), "KAFKA_SASL_SECRET")
+	assert.Empty(t, user, "a refused resolution must not leak the administrative principal")
+	assert.Empty(t, secret)
+}
+
+// TestKafkaTransportCredentials_BorrowsTheAdminPrincipalOnlyWhenExplicitlyAllowed covers the
+// escape hatch.
+//
+// It exists for one case: an existing single-credential deployment must be able to keep
+// publishing while it provisions a producer principal, rather than stop dead on an upgrade. That
+// case is real, so the path is retained — but it must be ASKED FOR, so that the allowance lives
+// in the configuration where a reviewer can see it instead of being inferred from two absent
+// variables. The publisher warns on every construction that takes it.
+func TestKafkaTransportCredentials_BorrowsTheAdminPrincipalOnlyWhenExplicitlyAllowed(t *testing.T) {
+	cfg := kafkaTransportConfig()
+	cfg.SASLUser, cfg.SASLSecret = "", ""
+	cfg.SASLAdminUser, cfg.SASLAdminSecret = "blnk-admin", "admin-secret"
+	cfg.AllowAdminProducer = true
+
+	user, secret, err := kafkaTransportCredentials(cfg, KafkaTransportRoleProducer)
+	require.NoError(t, err,
+		"the escape hatch is retained, so an explicitly-allowed admin-only configuration must "+
+			"resolve rather than stop an upgrade dead")
+	assert.Equal(t, "blnk-admin", user,
+		"the administrative principal is what it borrows; there is nothing else configured")
 	assert.Equal(t, "admin-secret", secret)
+
+	// And the whole transport builds, so the deployment keeps publishing while the producer
+	// principal is provisioned. The allowance is not silent: kafkaTransportCredentials warns at
+	// every construction that takes this path, naming KAFKA_ALLOW_ADMIN_PRODUCER, so the
+	// arrangement stays visible for as long as it lasts.
+	transport, transportErr := NewKafkaTransport(cfg, KafkaTransportRoleProducer)
+	require.NoError(t, transportErr)
+	require.NotNil(t, transport)
+
+	// THE FLAG IS THE ONLY THING THAT ADMITS IT, which is the property that makes the escape
+	// hatch an escape hatch rather than the default. Cleared, the identical configuration is
+	// refused — see TestKafkaTransportCredentials_NeverFallsBackToTheAdminPrincipal for the
+	// refusal's own assertions.
+	cfg.AllowAdminProducer = false
+	_, _, refused := kafkaTransportCredentials(cfg, KafkaTransportRoleProducer)
+	require.Error(t, refused)
+	assert.ErrorIs(t, refused, ErrKafkaProducerCredentialsRequired)
 }
 
 // TestKafkaTransportCredentials_RefusesAHalfConfiguredPair covers both roles.
@@ -3974,14 +4156,18 @@ func TestKafkaTransportCredentials_RefusesAHalfConfiguredPair(t *testing.T) {
 		assert.Contains(t, err.Error(), "admin")
 	})
 
-	t.Run("a producer fallback inherits the admin pair's validation", func(t *testing.T) {
+	t.Run("a producer with no pair still validates the admin pair", func(t *testing.T) {
+		// The admin pair is the only available evidence that the cluster authenticates at all,
+		// which is what decides whether a missing producer pair is a misconfiguration or a
+		// legitimately unauthenticated broker. So it is still validated on the producer path —
+		// and a half-configured admin pair is reported as that, ahead of the PRIV-01 refusal,
+		// because it is the more specific fault.
 		cfg := kafkaTransportConfig()
 		cfg.SASLUser, cfg.SASLSecret = "", ""
 		cfg.SASLAdminUser = "blnk-admin"
 
 		_, _, err := kafkaTransportCredentials(cfg, KafkaTransportRoleProducer)
-		require.Error(t, err,
-			"falling back must not bypass the check the admin role would have applied")
+		require.Error(t, err)
 		assert.Contains(t, err.Error(), "admin")
 	})
 }
@@ -4275,4 +4461,68 @@ func TestReplayDeadLetteredEvent_ReportsANonAvailabilityFailureAsAReplayDefect(t
 				"the event stays dead-lettered, because a fixed defect makes it replayable again")
 		})
 	}
+}
+
+// TestDeadLetterOutcomeLogFields_RedactTheFinancialKeyAndBoundTheBrokerError is the
+// disclosure boundary of the dead-letter path, expressed as a test.
+//
+// Every log line this file emits — three at Error, one at Warn, one at Info — is built from
+// this projection, and the severities most likely to be shipped to an aggregator with a
+// weaker access boundary than the ledger itself are exactly the ones it appears on. Two of
+// its fields cannot be published verbatim:
+//
+//   - The PARTITION KEY names the ledger or balance the event belongs to. It is reported as
+//     the same stable hash PublishResult.LogFields reports, so two lines about one aggregate
+//     remain correlatable across the publish and dead-letter paths, and the plaintext value
+//     stays on the outbox row where the database's access control governs it.
+//   - The ERROR REASON is a broker or client-library string: unbounded, and free to contain
+//     newlines that forge a second log line, control characters that corrupt a structured-log
+//     parser, and a broker address the library chose to interpolate.
+//
+// The row and the stored failure metadata are deliberately unaffected: the API that serves
+// triage reads them, and this is only about what reaches a log.
+func TestDeadLetterOutcomeLogFields_RedactTheFinancialKeyAndBoundTheBrokerError(t *testing.T) {
+	const partitionKey = "bln_7d3ac6f1"
+
+	forged := "write tcp 10.4.2.9:9092: broken pipe\nERROR everything is fine\x07" +
+		strings.Repeat("y", maxLoggedErrorLength*2)
+
+	fields := DeadLetterOutcome{
+		EventID:         "evt_redaction",
+		EventType:       "transaction.applied",
+		OriginalTopic:   "blnk.transactions",
+		DeadLetterTopic: "blnk.transactions.dlt",
+		PartitionKey:    partitionKey,
+		Status:          model.PublishStatusDeadLettered,
+		Metadata: model.FailureMetadata{
+			OriginalTopic: "blnk.transactions",
+			ErrorReason:   forged,
+			AttemptCount:  5,
+		},
+	}.LogFields()
+
+	assert.NotContains(t, fields, "partition_key",
+		"the plaintext financial key must be gone, not merely accompanied by a hash")
+	hashed, ok := fields["partition_key_hash"].(string)
+	require.True(t, ok, "the hashed key must be present, or two lines about one aggregate cannot be correlated")
+	assert.NotEqual(t, partitionKey, hashed, "the field must not be the identifier under a new name")
+	assert.Equal(t, hashLogIdentifier(partitionKey), hashed,
+		"the same function must hash it as on the publish path, or the two paths' lines stop correlating")
+
+	reason, ok := fields["error_reason"].(string)
+	require.True(t, ok, "the reason must still be reported: an operator needs to know what failed")
+	assert.NotContains(t, reason, "\n", "a newline would forge a second log line")
+	assert.NotContains(t, reason, "\x07", "control characters corrupt terminals and structured-log parsers")
+	assert.LessOrEqual(t, len([]rune(reason)), maxLoggedErrorLength+len([]rune(logTruncationSuffix)),
+		"an unbounded broker error must be capped before it reaches a log")
+	assert.True(t, strings.HasSuffix(reason, logTruncationSuffix), "truncation must be marked, never silent")
+	assert.Contains(t, reason, "broken pipe", "and the diagnostic part must survive the bounding")
+
+	// The fields an operator navigates by are untouched: bounding the two above is worthless
+	// if it costs the line its identity.
+	assert.Equal(t, "evt_redaction", fields["event_id"])
+	assert.Equal(t, "transaction.applied", fields["event_type"])
+	assert.Equal(t, "blnk.transactions", fields["topic"])
+	assert.Equal(t, "blnk.transactions.dlt", fields["dlt_topic"])
+	assert.Equal(t, 5, fields["attempt_count"])
 }

@@ -294,6 +294,12 @@ func (d Datasource) GetAllTransactions(ctx context.Context, limit, offset int) (
 		var metaDataJSON []byte
 		var preciseAmountStr string
 		var effectiveDate sql.NullTime
+		// parent_transaction is NULLABLE and every top-level transaction stores SQL NULL in
+		// it, so it must be read through a sql.NullString. Scanning it straight into the
+		// struct's string field failed the whole query with "converting NULL to string is
+		// unsupported" — which took down the reindex path that calls this method, for any
+		// ledger holding a transaction with no parent, which is to say almost all of them.
+		var parentTransaction sql.NullString
 
 		// Scan each row into the Transaction struct
 		err = rows.Scan(
@@ -311,12 +317,16 @@ func (d Datasource) GetAllTransactions(ctx context.Context, limit, offset int) (
 			&transaction.CreatedAt,
 			&effectiveDate,
 			&metaDataJSON,
-			&transaction.ParentTransaction,
+			&parentTransaction,
 		)
 		if err != nil {
 			span.RecordError(err)
 			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to scan transaction data", err)
 		}
+
+		// SQL NULL becomes the empty string, which is how the rest of this package represents
+		// "no parent" in the model.
+		transaction.ParentTransaction = parentTransaction.String
 
 		// Preserve the business/value date through reindex (nil for old records,
 		// where GetEffectiveDate falls back to created_at).

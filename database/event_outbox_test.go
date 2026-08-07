@@ -277,10 +277,51 @@ func eventOutboxRow(e model.EventOutbox) []driver.Value {
 		nullTime(e.DispatchedAt),
 		nullTime(e.LockedUntil),
 		nullText(e.ClaimToken),
+		// The three per-leg delivery columns, in projection order. Both booleans are NOT NULL
+		// with a FALSE default and legacy_attempts is NOT NULL with a 0 default, so all three
+		// are rendered as plain values rather than through the null helpers.
 		e.WebhookDispatched,
+		// kafka_dispatched_at is nullable and its NULL is meaningful: "the Kafka leg of
+		// this row is not done". SUNSET: this column goes with the legacy leg.
+		nullTime(e.KafkaDispatchedAt),
+		int64(e.WebhookAttempts),
+		// The BROKER COORDINATE is rendered all-or-nothing, mirroring the CHECK
+		// constraint that refuses a partial triple on the table. All three NULL means
+		// "no write to this row has been acknowledged yet" — the state the audit counts
+		// as unconfirmed — so a fixture that left, say, kafka_topic populated while the
+		// offset was NULL would exercise a row PostgreSQL would never store.
+		//
+		// The partition and offset are rendered as int64 because that is what a real
+		// driver hands back for INTEGER and BIGINT; the scanner reads them through
+		// sql.NullInt64 and sql.NullInt32-free int64 destinations, so a Go int here
+		// would let a scan pass under the mock that fails against PostgreSQL.
+		nullText(e.KafkaTopic),
+		nullInt64(func() *int64 {
+			if e.KafkaPartition == nil {
+				return nil
+			}
+			p := int64(*e.KafkaPartition)
+			return &p
+		}()),
+		nullInt64(e.KafkaOffset),
 		nullText(e.DLTTopic),
 		failureMetadata,
 	}
+}
+
+// nullInt64 renders an optional integer as the driver value a nullable INTEGER or
+// BIGINT column produces: SQL NULL when absent, an int64 when present.
+//
+// Absence has to be distinguishable from zero here, which is exactly why the model
+// carries pointers: partition 0 and offset 0 are both REAL broker coordinates — the
+// first message on the first partition of a fresh topic has precisely that record —
+// so rendering an absent value as 0 would make the audit count a row as confirmed
+// that the broker never acknowledged.
+func nullInt64(v *int64) driver.Value {
+	if v == nil {
+		return nil
+	}
+	return *v
 }
 
 // indexOfProjectedColumn resolves a column's POSITION in the real projection, so a
@@ -461,7 +502,22 @@ func TestEventOutboxColumns_ProjectsEveryScannedColumnAndNoOthers(t *testing.T) 
 		// in the migration.
 		"status", "attempts", "max_attempts", "next_attempt_at", "last_error",
 		"first_attempted_at", "last_attempted_at", "dispatched_at", "locked_until", "claim_token",
-		"webhook_dispatched", "dlt_topic", "failure_metadata",
+		// kafka_dispatched_at and webhook_attempts are the DUAL-DELIVERY pair, and both are
+		// projected because the relay reads them on every claimed row: the first tells it the
+		// Kafka leg is already done — so the re-claim delivers only the outstanding webhook and
+		// publishes nothing — and the second is the legacy leg's own budget, kept separate so a
+		// webhook receiver being down cannot spend a Kafka retry attempt.
+		//
+		// SUNSET: both go with the legacy transport, along with webhook_dispatched above.
+		"webhook_dispatched", "kafka_dispatched_at", "webhook_attempts",
+		// The BROKER COORDINATE is the triple the broker assigned to the accepted
+		// message, and it is projected because it is the only thing that makes the
+		// zero-loss reconciliation auditable: a terminal row that cannot name its
+		// (topic, partition, offset) is a row whose delivery nobody can confirm, and
+		// the audit counts exactly those. It is written all-or-nothing, so it must be
+		// read all-or-nothing too, which is why the three sit adjacent.
+		"kafka_topic", "kafka_partition", "kafka_offset",
+		"dlt_topic", "failure_metadata",
 	}
 	assert.Equal(t, want, columns,
 		"the projected column list must match scanEventOutbox's destination order exactly")
@@ -729,8 +785,16 @@ func TestClaimPendingEventOutbox_ScansEveryColumnIntoItsField(t *testing.T) {
 		DispatchedAt:      &dispatchedAt,
 		LockedUntil:       &lockedUntil,
 		WebhookDispatched: true,
-		DLTTopic:          "blnk.balances.dlt",
-		FailureMetadata:   json.RawMessage(`{"original_topic":"blnk.balances","attempt_count":5}`),
+		// The broker coordinate is populated with PARTITION 0 AND OFFSET 0 on purpose.
+		// Those are the record of the very first message on the first partition of a
+		// fresh topic — entirely real values — and they are exactly the pair a scanner
+		// that tested truthiness instead of NULL-ness would drop. Asserting a non-nil
+		// pointer holding zero is therefore a stronger claim than any non-zero pair.
+		KafkaTopic:      "blnk.balances",
+		KafkaPartition:  intPtr(0),
+		KafkaOffset:     int64Ptr(0),
+		DLTTopic:        "blnk.balances.dlt",
+		FailureMetadata: json.RawMessage(`{"original_topic":"blnk.balances","attempt_count":5}`),
 	}
 
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnRows(newEventOutboxRows(want))
@@ -762,11 +826,28 @@ func TestClaimPendingEventOutbox_ScansEveryColumnIntoItsField(t *testing.T) {
 	require.NotNil(t, got.LockedUntil)
 	assert.True(t, lockedUntil.Equal(*got.LockedUntil))
 	assert.True(t, got.WebhookDispatched)
+	assert.Equal(t, want.KafkaTopic, got.KafkaTopic)
+	require.NotNil(t, got.KafkaPartition, "partition 0 is a real partition and must scan to a non-nil pointer, not nil")
+	assert.Equal(t, 0, *got.KafkaPartition)
+	require.NotNil(t, got.KafkaOffset, "offset 0 is a real offset and must scan to a non-nil pointer, not nil")
+	assert.Equal(t, int64(0), *got.KafkaOffset)
+	record, named := got.BrokerRecord()
+	assert.True(t, named,
+		"a row carrying a complete triple must report a confirmed record: the zero-loss audit counts exactly these")
+	assert.Equal(t, "blnk.balances/0@0", record.String(),
+		"the accessor must reassemble the coordinate the driver handed back, zeroes included")
 	assert.Equal(t, want.DLTTopic, got.DLTTopic)
 	assert.JSONEq(t, string(want.FailureMetadata), string(got.FailureMetadata))
 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
+
+// intPtr and int64Ptr keep the coordinate fixtures readable. The model carries
+// pointers precisely so absence is distinguishable from zero, which means a literal
+// cannot express a present zero without one of these.
+func intPtr(v int) *int { return &v }
+
+func int64Ptr(v int64) *int64 { return &v }
 
 // TestClaimPendingEventOutbox_NullableColumnsScanCleanly is where a missing sql.Null*
 // wrapper surfaces.
@@ -814,8 +895,67 @@ func TestClaimPendingEventOutbox_NullableColumnsScanCleanly(t *testing.T) {
 	assert.Nil(t, got.DispatchedAt)
 	assert.Nil(t, got.LockedUntil, "a NULL locked_until must be nil: an unleased row is claimable")
 	assert.Empty(t, got.LedgerID, "an empty ledger_id is the documented \"no ledger\" value and must survive the scan")
+	assert.Nil(t, got.KafkaPartition, "a NULL kafka_partition must be nil, never 0: partition 0 is a real partition")
+	assert.Nil(t, got.KafkaOffset, "a NULL kafka_offset must be nil, never 0: offset 0 is a real offset")
+	_, named := got.BrokerRecord()
+	assert.False(t, named,
+		"a row with no coordinate must report an unconfirmed record: that is what the zero-loss audit counts as unaudited")
 
 	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestClaimPendingEventOutbox_APartialBrokerCoordinateScansAsAbsent covers the read
+// side of the all-or-nothing rule.
+//
+// The table's CHECK constraint refuses a partial triple, so PostgreSQL should never
+// hand one back — but the scanner still tests all three columns together, and this is
+// what proves it. A scanner that assigned each column independently would produce a
+// row naming a topic with no partition and no offset, and BrokerRecord would then have
+// to decide what that means at every call site instead of once here.
+//
+// The consequence of getting it wrong is not a crash but a WRONG AUDIT: a half-record
+// looks like evidence of a delivery nobody can actually look up, which is precisely
+// the masking the reconciliation verdict exists to refuse.
+func TestClaimPendingEventOutbox_APartialBrokerCoordinateScansAsAbsent(t *testing.T) {
+	partials := map[string][]driver.Value{
+		"topic without partition or offset": {"blnk.transactions", nil, nil},
+		"topic and partition without offset": {
+			"blnk.transactions", int64(4), nil,
+		},
+		"partition and offset without topic": {
+			nil, int64(4), int64(91),
+		},
+	}
+
+	for name, coordinate := range partials {
+		t.Run(name, func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			values := eventOutboxRow(*newEventOutboxFixture("partial-"))
+			topicAt := indexOfProjectedColumn(t, "kafka_topic")
+			values[topicAt] = coordinate[0]
+			values[topicAt+1] = coordinate[1]
+			values[topicAt+2] = coordinate[2]
+
+			rows := sqlmock.NewRows(eventOutboxProjectedColumns()).AddRow(values...)
+			mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnRows(rows)
+
+			entries, err := ds.ClaimPendingEventOutbox(context.Background(), 1, 30*time.Second)
+			require.NoError(t, err, "a partial coordinate must scan cleanly, not error")
+			require.Len(t, entries, 1)
+
+			assert.Empty(t, entries[0].KafkaTopic,
+				"an incomplete coordinate must leave the topic empty rather than half-report a record")
+			assert.Nil(t, entries[0].KafkaPartition)
+			assert.Nil(t, entries[0].KafkaOffset)
+			_, named := entries[0].BrokerRecord()
+			assert.False(t, named,
+				"an incomplete coordinate is not evidence of a delivery: it must read as unconfirmed")
+
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }
 
 // TestClaimPendingEventOutbox_EmptyBacklogReturnsNoError distinguishes "nothing to
@@ -931,10 +1071,13 @@ func TestMarkEventDispatched_SetsDispatchedStatusStampsTimestampAndClearsLease(t
 
 	mock.ExpectExec("").
 		WithArgs(model.EventOutboxStatusDispatched, int64(42), "tok-42",
-			model.EventOutboxStatusProcessing, model.EventOutboxStatusReplaying).
+			model.EventOutboxStatusProcessing, model.EventOutboxStatusReplaying,
+			// $6-$8: the broker coordinate, NULL here because this case has none.
+			// TestMarkEventDispatched_PersistsTheBrokerCoordinate covers the populated form.
+			nil, nil, nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	require.NoError(t, ds.MarkEventDispatched(context.Background(), 42, "tok-42"))
+	require.NoError(t, ds.MarkEventDispatched(context.Background(), 42, "tok-42", model.BrokerRecord{}))
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
 
@@ -1084,14 +1227,14 @@ func TestMarkEventFailed_LostClaimIsAConflictAndNotASilentSuccess(t *testing.T) 
 func TestEventOutboxTransitions_RefuseABlankClaimToken(t *testing.T) {
 	transitions := map[string]func(ctx context.Context, ds Datasource) error{
 		"MarkEventDispatched": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventDispatched(ctx, 1, "   ")
+			return ds.MarkEventDispatched(ctx, 1, "   ", model.BrokerRecord{})
 		},
 		"MarkEventFailed": func(ctx context.Context, ds Datasource) error {
 			_, err := ds.MarkEventFailed(ctx, 1, "", "boom", 0)
 			return err
 		},
 		"MarkEventDeadLettered": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventDeadLettered(ctx, 1, "", "blnk.transactions.dlt", json.RawMessage(`{}`))
+			return ds.MarkEventDeadLettered(ctx, 1, "", "blnk.transactions.dlt", json.RawMessage(`{}`), model.BrokerRecord{})
 		},
 		"MarkWebhookDispatched": func(ctx context.Context, ds Datasource) error {
 			return ds.MarkWebhookDispatched(ctx, 1, "")
@@ -1260,11 +1403,13 @@ func TestMarkEventDeadLettered_RecordsTerminalStateTopicAndMetadata(t *testing.T
 			"tok-11",
 			model.EventOutboxStatusFailed,
 			model.EventOutboxStatusProcessing,
+			// $8-$10: the dead-letter coordinate, absent in this case.
+			nil, nil, nil,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	require.NoError(t, ds.MarkEventDeadLettered(
-		context.Background(), 11, "tok-11", "blnk.transactions.dlt", metadata))
+		context.Background(), 11, "tok-11", "blnk.transactions.dlt", metadata, model.BrokerRecord{}))
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
 
@@ -1293,10 +1438,11 @@ func TestMarkEventDeadLettered_EmptyTopicAndMetadataBindAsNull(t *testing.T) {
 
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WithArgs(model.EventOutboxStatusDeadLettered, nil, nil, int64(11), "tok-11",
-			model.EventOutboxStatusFailed, model.EventOutboxStatusProcessing).
+			model.EventOutboxStatusFailed, model.EventOutboxStatusProcessing,
+			nil, nil, nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	require.NoError(t, ds.MarkEventDeadLettered(context.Background(), 11, "tok-11", "", nil))
+	require.NoError(t, ds.MarkEventDeadLettered(context.Background(), 11, "tok-11", "", nil, model.BrokerRecord{}))
 	assert.NoError(t, mock.ExpectationsWereMet(),
 		"an empty topic or metadata must be stored as SQL NULL so \"not recorded\" stays distinct from \"recorded as empty\"")
 }
@@ -1336,6 +1482,549 @@ func TestMarkWebhookDispatched_SetsTheDualDeliveryFlag(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
+// TestMarkEventWebhookPending_ChoosesRetryOrAbandonInSQL exercises BOTH arms of the
+// legacy leg's own budget and the boundary between them.
+//
+// # What this transition is for
+//
+// The two legs of the dual-delivery window used to share one terminal state. A row
+// whose Kafka publish succeeded was marked dispatched even when the webhook enqueue
+// beside it had failed — and dispatched is outside the claim predicate, so that
+// webhook was never retried and never delivered. This transition is the fix: it
+// records the Kafka leg in its OWN column and leaves the row claimable for the
+// webhook alone.
+//
+// Four things are asserted about the statement, and each of them is a distinct way to
+// get this wrong:
+//
+//   - webhook_attempts, not attempts, is incremented. Spending a KAFKA retry attempt
+//     on a webhook receiver being down would let the deprecated transport
+//     dead-letter events on the transport replacing it.
+//   - kafka_dispatched_at is stamped through COALESCE, so the FIRST acknowledgement
+//     instant survives every subsequent webhook retry. Overwriting it would report
+//     the last bookkeeping write as the moment the broker accepted the message.
+//   - dispatched_at is stamped on the ABANDON arm only. Stamping it on the retry arm
+//     would say the row is finished while a delivery is still owed.
+//   - the arm is chosen in SQL. Deciding it in Go would let two relay instances
+//     working one row both conclude they spent the last webhook attempt.
+//
+// SUNSET: this test goes with the transition it covers.
+func TestMarkEventWebhookPending_ChoosesRetryOrAbandonInSQL(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("").
+		WithArgs(
+			"redis unavailable",                   // $1 — the reason, stored in last_error
+			model.EventOutboxStatusDispatched,     // $2 — the abandon arm
+			model.EventOutboxStatusWebhookPending, // $3 — the retry arm
+			"1s",                                  // $4 — the backoff the caller computed
+			int64(9),                              // $5 — the row
+			"tok-9",                               // $6 — the claim token
+			model.EventOutboxStatusProcessing,     // $7 — the ordinary prior state
+			model.EventOutboxStatusWebhookPending, // $8 — and an idempotent re-call
+			nil, nil, nil,                         // $9-$11 — the coordinate, absent on this pass
+		).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "webhook_attempts"}).
+			AddRow(model.EventOutboxStatusWebhookPending, int64(1)))
+
+	outcome, err := ds.MarkEventWebhookPending(context.Background(), 9, "tok-9", "redis unavailable", time.Second, model.BrokerRecord{})
+	require.NoError(t, err)
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "webhook_attempts = webhook_attempts + 1",
+		"the LEGACY leg's own counter must be incremented")
+	assert.NotContains(t, issued, "attempts = attempts + 1",
+		"and the KAFKA budget must be untouched: a webhook receiver being down must never spend a "+
+			"Kafka retry attempt, or the deprecated transport can dead-letter events on the new one")
+	assert.Contains(t, issued, "WHEN webhook_attempts + 1 >= max_attempts THEN $2",
+		"the ABANDON arm must be chosen in SQL when the increment spends the budget, atomically with "+
+			"the increment itself, or two instances working one row both conclude they were last")
+	assert.Contains(t, issued, "ELSE $3",
+		"and the retry arm otherwise")
+	assert.Contains(t, issued, "kafka_dispatched_at = COALESCE(kafka_dispatched_at, NOW())",
+		"the Kafka leg must be recorded separately from dispatched_at, and the FIRST acknowledgement kept")
+	assert.Contains(t, issued, "dispatched_at = CASE",
+		"dispatched_at belongs to the abandon arm only: a row with a webhook still owed is not finished")
+	assert.Contains(t, issued, "NOW() + $4::interval",
+		"the backoff must be the caller's bound interval, not arithmetic frozen into this statement")
+	assert.Contains(t, issued, "locked_until = NULL",
+		"the lease must be released on both arms, or the row is not claimable for its webhook")
+	assert.Contains(t, issued, "claim_token = NULL",
+		"and so must the token: unlike the dead-letter hand-off, nothing is owed to THIS worker")
+	assert.Contains(t, issued, "RETURNING status, webhook_attempts",
+		"the decision the UPDATE made must be returned, not re-read")
+
+	assert.Equal(t, model.EventOutboxStatusWebhookPending, outcome.Status)
+	assert.Equal(t, 1, outcome.WebhookAttempts)
+	assert.False(t, outcome.Abandoned, "one failed enqueue against a five-attempt budget is not exhaustion")
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestMarkEventWebhookPending_AbandonArmIsReportedFromTheStatusTheDatabaseChose pins the
+// terminal arm.
+//
+// Abandoned is DERIVED from the returned status rather than computed from the attempt
+// count, so the caller's verdict and the row's state cannot disagree — which they would
+// if the arithmetic were repeated in Go against a possibly different max_attempts.
+//
+// SUNSET: goes with the transition it covers.
+func TestMarkEventWebhookPending_AbandonArmIsReportedFromTheStatusTheDatabaseChose(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "webhook_attempts"}).
+			AddRow(model.EventOutboxStatusDispatched, int64(5)))
+
+	outcome, err := ds.MarkEventWebhookPending(context.Background(), 9, "tok-9", "still unreachable", 0, model.BrokerRecord{})
+	require.NoError(t, err)
+
+	assert.True(t, outcome.Abandoned,
+		"five of five enqueue attempts spends the legacy budget, so no further webhook is attempted")
+	assert.Equal(t, model.EventOutboxStatusDispatched, outcome.Status,
+		"and the row becomes terminal on the strength of its Kafka delivery, which did happen")
+	assert.Equal(t, 5, outcome.WebhookAttempts)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestMarkEventWebhookPending_LostClaimIsAConflict asserts a transition that matched no
+// row is reported rather than swallowed.
+//
+// No row matching means the lease expired and another instance owns this row now.
+// Returning nil would tell the caller its outstanding webhook was recorded when nothing
+// was written, and the row would carry on with a webhook owed and no record of it.
+//
+// SUNSET: goes with the transition it covers.
+func TestMarkEventWebhookPending_LostClaimIsAConflict(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnError(sql.ErrNoRows)
+
+	outcome, err := ds.MarkEventWebhookPending(context.Background(), 9, "tok-9", "unreachable", time.Second, model.BrokerRecord{})
+
+	requireAPIError(t, err, apierror.ErrConflict)
+	assert.Empty(t, outcome.Status, "a conflict must not report a state the row is not in")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestMarkEventWebhookPending_RequiresTheClaimToken asserts the transition refuses to run
+// without the token the claim issued.
+//
+// Every conditional transition matches on (id, claim_token), so an empty token could
+// only ever match a row nobody holds. Naming the omission is the only honest outcome.
+//
+// SUNSET: goes with the transition it covers.
+func TestMarkEventWebhookPending_RequiresTheClaimToken(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	for name, token := range map[string]string{"empty": "", "whitespace": "   "} {
+		t.Run(name, func(t *testing.T) {
+			outcome, err := ds.MarkEventWebhookPending(context.Background(), 9, token, "unreachable", time.Second, model.BrokerRecord{})
+
+			requireAPIError(t, err, apierror.ErrBadRequest)
+			assert.Empty(t, outcome.Status)
+		})
+	}
+
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"no statement may be issued for a transition that cannot be authorised")
+}
+
+// TestMarkEventWebhookPending_NegativeBackoffIsTreatedAsDueImmediately mirrors
+// MarkEventFailed's handling: a caller that computed a negative delay meant "no delay",
+// and reaching into the past would be indistinguishable from it while looking deliberate.
+//
+// SUNSET: goes with the transition it covers.
+func TestMarkEventWebhookPending_NegativeBackoffIsTreatedAsDueImmediately(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+		WithArgs(
+			"unreachable",
+			model.EventOutboxStatusDispatched,
+			model.EventOutboxStatusWebhookPending,
+			"0s",
+			int64(9),
+			"tok-9",
+			model.EventOutboxStatusProcessing,
+			model.EventOutboxStatusWebhookPending,
+			nil, nil, nil,
+		).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "webhook_attempts"}).
+			AddRow(model.EventOutboxStatusWebhookPending, int64(1)))
+
+	_, err := ds.MarkEventWebhookPending(context.Background(), 9, "tok-9", "unreachable", -5*time.Second, model.BrokerRecord{})
+	require.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"a negative delay must be bound as 0s, never as a negative interval")
+}
+
+// TestRenewEventOutboxLease_ExtendsEveryRowStillInFlightUnderOneToken pins the statement the
+// relay's heartbeat issues.
+//
+// # The defect it exists for
+//
+// The lease is taken once, when the batch is claimed, and a batch can legitimately outlive it:
+// a hundred rows published eight at a time run in thirteen waves, and one wave can occupy the
+// writer's whole produce timeout. Rows in the later waves therefore had their lease expire
+// BEFORE their publish was attempted, while the relay still held them — so a second instance
+// claimed and published exactly those rows, this one published them again, and every transition
+// this one attempted failed as a lost claim. Duplicates on the topic, and no error anywhere.
+//
+// # Why the token alone addresses the batch
+//
+// Every terminal and near-terminal transition CLEARS claim_token, so a row that has been
+// dispatched, dead-lettered, returned to pending or moved to webhook_pending is already outside
+// this statement's reach. What is still under the token is exactly what is still in flight —
+// which is why no id list is passed and why the absence of one is asserted rather than assumed.
+//
+// # Why it is not in eventTransitionTable
+//
+// The shared table drives the wrapped-error, lost-claim and undeterminable-count cases for every
+// CONDITIONAL TRANSITION. This is not one: a renewal that extends nothing is the ordinary end of
+// a batch, not a lost claim, so the table's zero-rows-is-a-conflict case would be wrong here.
+// The three cases are therefore written out below with the semantics this method actually has.
+func TestRenewEventOutboxLease_ExtendsEveryRowStillInFlightUnderOneToken(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec("").
+		WithArgs(
+			"45s",                             // $1 — the lease, as an interval string
+			"tok-batch",                       // $2 — the token that IS the batch
+			model.EventOutboxStatusProcessing, // $3 — the only state a lease may be extended in
+		).
+		WillReturnResult(sqlmock.NewResult(0, 7))
+
+	renewed, err := ds.RenewEventOutboxLease(context.Background(), "tok-batch", 45*time.Second)
+	require.NoError(t, err)
+	require.Len(t, *captured, 1, "the renewal must be a single statement per heartbeat, not one per row")
+
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "locked_until = NOW() + $1::interval",
+		"the lease must be extended from NOW in the database's own clock: computing the expiry in Go "+
+			"would extend it by however far the two clocks differ")
+	assert.Contains(t, issued, "WHERE claim_token = $2",
+		"the renewal must be scoped to the claim token, which is what makes it this batch's lease and "+
+			"nobody else's")
+	assert.Contains(t, issued, "status = $3",
+		"and to the processing state: a row in any other state is finished or owned by somebody else, "+
+			"and extending a lease on it would assert a hold this instance no longer has")
+	assert.NotContains(t, issued, "id IN",
+		"no id list may be threaded through: every terminal transition clears claim_token, so the token "+
+			"already selects exactly the rows still in flight")
+	assert.NotContains(t, issued, "attempts",
+		"a renewal must not touch the retry budget: holding a lease longer is not an attempt, and "+
+			"spending one here would dead-letter healthy events under a slow broker")
+	assert.Contains(t, issued, "blnk.event_outbox",
+		"the renewal must target blnk.event_outbox and never the lineage outbox")
+
+	assert.Equal(t, int64(7), renewed,
+		"the count must be reported so the caller can retire the heartbeat when nothing is left to hold")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestRenewEventOutboxLease_RenewingNothingIsNotAnError pins the semantics that make the
+// heartbeat self-retiring.
+//
+// Zero renewals means every row of the batch has reached a terminal state, which is how a batch
+// ordinarily ends. Reporting it as a lost claim — the right answer for every conditional
+// transition — would log an error on every successful batch and give the caller nothing to
+// distinguish a finished batch from a real failure.
+func TestRenewEventOutboxLease_RenewingNothingIsNotAnError(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	renewed, err := ds.RenewEventOutboxLease(context.Background(), "tok-finished", time.Minute)
+
+	require.NoError(t, err, "a batch whose rows have all finished must not be reported as a failure")
+	assert.Zero(t, renewed, "and the count must say so, so the caller can stop renewing")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestRenewEventOutboxLease_RequiresTheClaimToken asserts the guard.
+//
+// Without a token the statement's WHERE clause degenerates to "every row nobody holds", which
+// matches nothing on a healthy table and would be indistinguishable from a finished batch.
+// Naming the omission is the only honest outcome.
+func TestRenewEventOutboxLease_RequiresTheClaimToken(t *testing.T) {
+	for name, token := range map[string]string{"empty": "", "whitespace": "  \t "} {
+		t.Run(name, func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			renewed, err := ds.RenewEventOutboxLease(context.Background(), token, time.Minute)
+
+			requireAPIError(t, err, apierror.ErrBadRequest)
+			assert.Zero(t, renewed)
+			assert.NoError(t, mock.ExpectationsWereMet(),
+				"a renewal that cannot be authorised must not reach the database")
+		})
+	}
+}
+
+// TestRenewEventOutboxLease_NonPositiveLeaseFallsBackToTheDefault mirrors the claim's treatment
+// of a bad lease, and for the same reason.
+//
+// A renewal to an instant already past is worse than no renewal at all: it would look like a
+// heartbeat while leaving every row of the batch immediately claimable by another instance.
+// Normalising keeps the batch protected; failing would stop the heartbeat entirely.
+func TestRenewEventOutboxLease_NonPositiveLeaseFallsBackToTheDefault(t *testing.T) {
+	for _, lease := range []time.Duration{0, -time.Second} {
+		t.Run(lease.String(), func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+				WithArgs(defaultEventClaimLease.String(), "tok", model.EventOutboxStatusProcessing).
+				WillReturnResult(sqlmock.NewResult(0, 3))
+
+			renewed, err := ds.RenewEventOutboxLease(context.Background(), "tok", lease)
+
+			require.NoError(t, err)
+			assert.Equal(t, int64(3), renewed)
+			assert.NoError(t, mock.ExpectationsWereMet(),
+				"a non-positive lease must be bound as the default interval, never as a past instant")
+		})
+	}
+}
+
+// TestRenewEventOutboxLease_FailureBranchesAreReportedHonestly covers the two ways the renewal
+// can go wrong, which are deliberately reported differently.
+//
+// A driver error is a failure: the lease may not have been extended, so the caller must be told
+// and must log it. An UNCOUNTABLE result is not: the statement succeeded, and the count is used
+// only to decide whether to keep renewing, so one uncounted round is harmless and reporting it
+// as an error would abort a heartbeat over a driver's bookkeeping.
+func TestRenewEventOutboxLease_FailureBranchesAreReportedHonestly(t *testing.T) {
+	t.Run("a driver error is wrapped", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+
+		mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+			WillReturnError(errors.New("connection reset by peer"))
+
+		renewed, err := ds.RenewEventOutboxLease(context.Background(), "tok", time.Minute)
+
+		requireAPIError(t, err, apierror.ErrInternalServer)
+		assert.Zero(t, renewed)
+		assert.NotContains(t, err.Error(), "connection reset by peer",
+			"the driver's own text must not travel to a caller; it is logged instead")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("an uncountable result is not an error", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+
+		mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+			WillReturnResult(sqlmock.NewErrorResult(errors.New("rows affected unavailable")))
+
+		renewed, err := ds.RenewEventOutboxLease(context.Background(), "tok", time.Minute)
+
+		require.NoError(t, err,
+			"the renewal itself succeeded: a driver that cannot count must not abort the heartbeat")
+		assert.Zero(t, renewed)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+// TestClaimFailedEventOutboxForDeadLetter_ReachesRowsNoOtherClaimCan pins the predicate that
+// ends the dead-letter limbo.
+//
+// # The limbo
+//
+// A row whose retry budget is spent and whose dead-letter WRITE failed sits at 'failed' with
+// dlt_topic still NULL, and that is a dead end in three directions at once: the ordinary claim
+// admits only attempts < max_attempts, replay accepts only 'dead_lettered', and the worker that
+// held the token has moved on. The event exists only as that row, listed in the dead-letter
+// inventory and acted on by nothing.
+//
+// # The two properties that make the repair work
+//
+// The status is deliberately NOT changed — the row stays in the inventory for the whole repair,
+// and MarkEventDeadLettered accepts 'failed' as a prior state, so a recovered row completes
+// through exactly the transition the first attempt would have used. And the claim is NOT
+// attempt-bounded, because the dead-letter topic IS the last resort: abandoning the write would
+// delete the only copy of the event. Both are asserted here because both are invisible in the
+// method's signature.
+func TestClaimFailedEventOutboxForDeadLetter_ReachesRowsNoOtherClaimCan(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("").WillReturnRows(newEventOutboxRows())
+
+	_, err := ds.ClaimFailedEventOutboxForDeadLetter(context.Background(), 20, 30*time.Second)
+	require.NoError(t, err)
+	require.Len(t, *captured, 1, "the repair claim must be a single statement")
+
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "candidate.status = 'failed'",
+		"the repair must claim exactly the rows the ordinary claim excludes")
+	assert.Contains(t, issued, "candidate.dlt_topic IS NULL",
+		"and only the UNPRESERVED ones: dlt_topic is set by the same statement that records "+
+			"dead_lettered, so its absence on a failed row means the message never reached a topic")
+	assert.NotContains(t, issued, "SET status",
+		"the status must stay 'failed': it keeps the row in the dead-letter inventory for the whole "+
+			"repair, and MarkEventDeadLettered accepts 'failed' as a prior state precisely so the "+
+			"recovered row can finish through the ordinary transition")
+	assert.NotContains(t, issued, "attempts <",
+		"the repair must NOT be attempt-bounded: the dead-letter topic is the last resort, so giving "+
+			"up on the write would delete the only copy of the event. Frequency and the 15-minute "+
+			"dead-letter age alert are what bound it")
+	assert.Contains(t, issued, "claim_token = $2",
+		"a FRESH token must be stamped: the original belonged to a worker that may no longer exist, "+
+			"and every transition is conditional on the token its caller holds")
+	assert.Contains(t, issued, "locked_until = NOW() + $1::interval",
+		"the lease is what stops several instances repairing one row at once, and what makes the "+
+			"retry frequency-bounded")
+	assert.Contains(t, issued, "FOR UPDATE SKIP LOCKED",
+		"several relay instances must be able to repair disjoint subsets, exactly as they claim")
+	assert.Contains(t, issued, "ORDER BY candidate.occurred_at ASC, candidate.id ASC",
+		"the oldest unpreserved event is the most urgent, and the ordering must match the rest of the file")
+	assert.Contains(t, issued, "SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC",
+		"UPDATE ... RETURNING does not preserve the inner ORDER BY, so the outer re-sort is not redundant")
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestClaimFailedEventOutboxForDeadLetter_BindsLeaseTokenAndBatchSize pins the bound values and
+// the freshness of the token.
+func TestClaimFailedEventOutboxForDeadLetter_BindsLeaseTokenAndBatchSize(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	var claimToken driver.Value
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+		WithArgs("30s", captureArg(&claimToken), 20).
+		WillReturnRows(newEventOutboxRows())
+
+	_, err := ds.ClaimFailedEventOutboxForDeadLetter(context.Background(), 20, 30*time.Second)
+	require.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet(),
+		"the repair claim must bind exactly (lease interval string, claim token, batch size) in that order")
+
+	token, ok := claimToken.(string)
+	require.True(t, ok, "the claim token must be bound as text")
+	assert.True(t, model.IsCanonicalUUID(token),
+		"the token must be freshly generated: a predictable or reused one would let the worker whose "+
+			"dead-letter write already failed still move the row")
+}
+
+// TestClaimFailedEventOutboxForDeadLetter_GuardsMatchTheOrdinaryClaim asserts the two guards
+// behave exactly as the ordinary claim's do, because the asymmetry between them is deliberate
+// and easy to get backwards.
+//
+// A non-positive batch is REJECTED: a zero LIMIT claims nothing and raises nothing, which is
+// indistinguishable from an empty repair backlog, so a broken caller would look healthy while
+// events stayed stranded. A non-positive lease is NORMALISED: an expired-on-arrival lease is a
+// correctness problem, but failing the poll would stop the repair altogether.
+func TestClaimFailedEventOutboxForDeadLetter_GuardsMatchTheOrdinaryClaim(t *testing.T) {
+	for _, batchSize := range []int{0, -1} {
+		t.Run(fmt.Sprintf("batch size %d is rejected", batchSize), func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			entries, err := ds.ClaimFailedEventOutboxForDeadLetter(context.Background(), batchSize, time.Minute)
+
+			assert.Nil(t, entries)
+			requireAPIError(t, err, apierror.ErrBadRequest)
+			assert.NoError(t, mock.ExpectationsWereMet(),
+				"a rejected batch size must not reach the database at all")
+		})
+	}
+
+	for _, lease := range []time.Duration{0, -time.Second} {
+		t.Run(fmt.Sprintf("lease %s is normalised", lease), func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+				WithArgs(defaultEventClaimLease.String(), sqlmock.AnyArg(), 20).
+				WillReturnRows(newEventOutboxRows())
+
+			_, err := ds.ClaimFailedEventOutboxForDeadLetter(context.Background(), 20, lease)
+
+			require.NoError(t, err,
+				"a non-positive lease must be normalised, not rejected: failing the poll would stop the repair")
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+// TestClaimFailedEventOutboxForDeadLetter_ErrorsAreWrapped covers the read's three failure
+// branches, so a repair that cannot run is reported rather than read as an empty backlog.
+//
+// That distinction is the whole point: "nothing needs repair" is the normal state, so a silently
+// swallowed error here would be indistinguishable from health while stranded events accumulated.
+func TestClaimFailedEventOutboxForDeadLetter_ErrorsAreWrapped(t *testing.T) {
+	t.Run("the query fails", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+
+		mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+			WillReturnError(errors.New("deadlock detected"))
+
+		entries, err := ds.ClaimFailedEventOutboxForDeadLetter(context.Background(), 20, time.Minute)
+
+		assert.Nil(t, entries)
+		requireAPIError(t, err, apierror.ErrInternalServer)
+		assert.NotContains(t, err.Error(), "deadlock detected",
+			"the driver's own text must not travel to a caller")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("a row cannot be scanned", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+
+		malformed := sqlmock.NewRows(eventOutboxProjectedColumns())
+		values := make([]driver.Value, len(eventOutboxProjectedColumns()))
+		values[0] = "not-an-int64" // id
+		malformed.AddRow(values...)
+
+		mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).WillReturnRows(malformed)
+
+		entries, err := ds.ClaimFailedEventOutboxForDeadLetter(context.Background(), 20, time.Minute)
+
+		assert.Nil(t, entries)
+		requireAPIError(t, err, apierror.ErrInternalServer)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("iteration fails part-way", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+
+		stranded := model.EventOutbox{
+			ID: 1, EventID: uuid.NewString(), EventType: "transaction.applied", AggregateID: "agg",
+			PartitionKey: "agg", LedgerID: "ldg", Topic: "blnk.transactions",
+			SchemaVersion: model.SchemaVersionV1, Payload: json.RawMessage(`{}`),
+			OccurredAt: time.Now().UTC(), Status: model.EventOutboxStatusFailed, MaxAttempts: 5,
+		}
+
+		mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+			WillReturnRows(newEventOutboxRows(stranded).RowError(0, sql.ErrConnDone))
+
+		entries, err := ds.ClaimFailedEventOutboxForDeadLetter(context.Background(), 20, time.Minute)
+
+		assert.Nil(t, entries)
+		requireAPIError(t, err, apierror.ErrInternalServer)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
 // eventTransitionTable is every conditional transition, invoked with a held claim
 // token, reduced to a plain error-returning closure.
 //
@@ -1346,10 +2035,10 @@ func TestMarkWebhookDispatched_SetsTheDualDeliveryFlag(t *testing.T) {
 func eventTransitionTable() map[string]func(context.Context, Datasource) error {
 	return map[string]func(context.Context, Datasource) error{
 		"MarkEventDispatched": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventDispatched(ctx, 1, "tok")
+			return ds.MarkEventDispatched(ctx, 1, "tok", model.BrokerRecord{})
 		},
 		"MarkEventDeadLettered": func(ctx context.Context, ds Datasource) error {
-			return ds.MarkEventDeadLettered(ctx, 1, "tok", "blnk.transactions.dlt", json.RawMessage(`{}`))
+			return ds.MarkEventDeadLettered(ctx, 1, "tok", "blnk.transactions.dlt", json.RawMessage(`{}`), model.BrokerRecord{})
 		},
 		"MarkWebhookDispatched": func(ctx context.Context, ds Datasource) error {
 			return ds.MarkWebhookDispatched(ctx, 1, "tok")
@@ -1431,7 +2120,7 @@ func TestMarkEventTransitions_UndeterminableRowsAffectedIsNotAnError(t *testing.
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WillReturnResult(sqlmock.NewErrorResult(errors.New("rows affected not supported")))
 
-	assert.NoError(t, ds.MarkEventDispatched(context.Background(), 5, "tok"),
+	assert.NoError(t, ds.MarkEventDispatched(context.Background(), 5, "tok", model.BrokerRecord{}),
 		"a driver that cannot report RowsAffected must not fail an UPDATE that already succeeded")
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -1483,8 +2172,14 @@ func TestClaimEventForReplay_TransitionsDeadLetteredToReplayingAndIssuesAToken(t
 
 	assert.Contains(t, issued, "status = $1", "the row must be moved into the replaying state by the claim itself")
 	assert.Contains(t, issued, "claim_token = $2", "the claim must issue a token, or nothing can complete the replay")
-	assert.Contains(t, issued, "WHERE event_id = $4 AND status = $5",
-		"the dead-lettered precondition must be part of the UPDATE, not a separate read")
+	assert.Contains(t, issued, "WHERE event_id = $4",
+		"the precondition must be part of the UPDATE, not a separate read")
+	assert.Contains(t, issued, "status = $5",
+		"a dead-lettered row is claimable")
+	assert.Contains(t, issued, "status = $1 AND (locked_until IS NULL OR locked_until < NOW())",
+		"and so is a replaying row whose LEASE HAS EXPIRED. Admitting dead_lettered alone left a "+
+			"row stranded by a crash — or by a release that failed on an already-cancelled request "+
+			"context — permanently unreplayable, with the lease written down and nothing reading it")
 	assert.Contains(t, issued, "RETURNING", "the claimed row must come back from the same statement")
 
 	assert.Equal(t, "issued-token", row.ClaimToken,
@@ -3214,20 +3909,50 @@ func TestEventSubscriberRepository_NoMethodReturnsPlaintextSecret(t *testing.T) 
 // expiry against the database clock, and the query plan itself.
 // ===========================================================================
 
-// quiesceEventOutbox parks every UNRELATED claimable row behind a future lease so that
-// this test's claim assertions see only its own fixtures, and registers a cleanup that
-// retires those fixtures to a terminal state.
+// quiesceEventOutbox RETIRES every UNRELATED row that is still in a claim-visible state,
+// so that this test's claim assertions see only its own fixtures, and registers a cleanup
+// that retires this test's fixtures the same way.
 //
 // It is not optional hygiene — without it these tests are FLAKY AND POLLUTING. The test
 // database is shared and rows persist between runs, so an unquiesced claim picks up
-// whatever another test or an earlier run left pending and the assertions become
-// non-deterministic. The cleanup half matters just as much: fixtures left pending would
+// whatever another test or an earlier run left behind and the assertions become
+// non-deterministic. The cleanup half matters just as much: fixtures left claimable would
 // be claimed by a later run's assertions, or chewed by a relay started elsewhere.
 //
+// # WHY UNRELATED ROWS ARE RETIRED RATHER THAN PARKED, AND UNCONDITIONALLY
+//
+// This used to park them instead — set locked_until an hour into the future, and only for
+// rows whose lease was already NULL or lapsed. That was measurably not enough: running the
+// database package repeatedly failed roughly one run in three or four, and the failing test
+// rotated between every assertion in this file that reads a GLOBAL claim or a GLOBAL status
+// count — "row was not claimed", "every fixture must be claimed exactly once ... but has 2",
+// "the backlog must drain rather than stall", and status deltas larger than the fixtures
+// inserted. A diagnostic run confirmed the shape directly: immediately after the parking
+// UPDATE returned without error, a foreign row from an earlier test was still sitting in the
+// claimable set.
+//
+// Parking is the weaker instrument for two structural reasons, and retiring is immune to
+// both:
+//
+//   - A LEASE IS A TIME WINDOW AND A STATUS IS NOT. Parking asserts nothing about the row
+//     after the hour, and it silently declines to touch a row whose lease has not yet
+//     lapsed — the exact rows a crashed or interrupted earlier test leaves behind. Moving
+//     the row to a terminal status removes it from the claim by the one predicate the claim
+//     cannot ignore.
+//   - THE CLAIM READS MORE THAN THE LEASE. It orders the whole claimable set by occurred_at
+//     and takes the first batch, and it excludes a row when an EARLIER row shares its
+//     partition key and is still pending or processing. A foreign row that survives parking
+//     can therefore starve a fixture out of the batch or block its key, and both read as a
+//     product defect in the claim rather than as pollution in the table.
+//
+// Retiring an unrelated row is safe because it is, by construction, a leftover: the test
+// that created it has finished, so nothing is still asserting on it. It is exactly what that
+// test's own cleanup was supposed to do.
+//
 // It mirrors quiesceOutbox, which does the same job for blnk.lineage_outbox, with two
-// differences that follow from this table's state machine: the claimable set here spans
-// pending AND processing rather than pending alone, and the terminal state used to retire
-// fixtures is dispatched rather than completed.
+// differences that follow from this table's state machine: the claim-visible set here spans
+// pending, processing AND replaying rather than pending alone, and the terminal state used
+// to retire rows is dispatched rather than completed.
 func quiesceEventOutbox(t *testing.T, ds Datasource, markerPrefix string) {
 	t.Helper()
 
@@ -3237,12 +3962,25 @@ func quiesceEventOutbox(t *testing.T, ds Datasource, markerPrefix string) {
 	// is unconstrained and carries the marker instead.
 	_, err := ds.Conn.Exec(`
 		UPDATE blnk.event_outbox
-		SET locked_until = NOW() + interval '1 hour'
-		WHERE status IN ('pending', 'processing')
-		  AND (locked_until IS NULL OR locked_until < NOW())
+		SET status = 'dispatched', dispatched_at = NOW(), locked_until = NULL, claim_token = NULL
+		WHERE status IN ('pending', 'processing', 'replaying')
 		  AND aggregate_id NOT LIKE $1
 	`, markerPrefix+"%")
 	require.NoError(t, err, "failed to quiesce unrelated event outbox rows")
+
+	// Proof rather than hope. A quiesce that silently matched nothing — a mistyped
+	// status, a marker predicate that inverted — leaves every claim assertion below
+	// reading a shared table, which is the failure this helper exists to prevent and the
+	// one that reads as a defect in the claim instead of as pollution here.
+	var stragglers int
+	require.NoError(t, ds.Conn.QueryRow(`
+		SELECT COUNT(*) FROM blnk.event_outbox
+		WHERE status IN ('pending', 'processing', 'replaying')
+		  AND aggregate_id NOT LIKE $1
+	`, markerPrefix+"%").Scan(&stragglers))
+	require.Zero(t, stragglers,
+		"the event outbox must hold no claim-visible row outside this test's marker once quiesced; "+
+			"a straggler starves this test's fixtures out of the claim batch or blocks their partition key")
 
 	t.Cleanup(func() {
 		_, cleanupErr := ds.Conn.Exec(`
@@ -3561,7 +4299,7 @@ func TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB(t *testing.T) {
 		require.NotEmpty(t, entry.ClaimToken, "a claimed row must carry the token the claim issued")
 
 		drained = append(drained, entry.EventID)
-		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, entry.ClaimToken))
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, entry.ClaimToken, model.BrokerRecord{}))
 	}
 
 	wantOccurrenceOrder := []string{
@@ -3660,7 +4398,7 @@ func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(
 		}
 	}
 	require.NotEmpty(t, retryToken)
-	require.NoError(t, ds.MarkEventDispatched(ctx, earlier.ID, retryToken))
+	require.NoError(t, ds.MarkEventDispatched(ctx, earlier.ID, retryToken, model.BrokerRecord{}))
 
 	released, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
 	require.NoError(t, err)
@@ -3709,6 +4447,329 @@ func TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB(
 		"a failed row is out of the claimable set: it belongs to the dead-letter path")
 	assert.True(t, containsEventID(claimed, successor.EventID),
 		"a failed predecessor must NOT stall its key: one undeliverable event stalling an aggregate forever is worse than a gap in its sequence")
+}
+
+// TestMarkEventWebhookPending_LeavesTheRowClaimableWithoutBlockingItsKey_RealDB is the
+// property no mock can give, and the one the two-leg design rests on.
+//
+// SUNSET: this test goes with the legacy leg.
+//
+// # Two facts, and they pull in opposite directions
+//
+// A webhook_pending row must be CLAIMABLE — otherwise its outstanding webhook is never
+// enqueued, which is the defect the state exists to fix — and it must NOT BLOCK its
+// partition key, because it has already been published to Kafka and its position in the
+// partition is fixed. Blocking would let a failing legacy enqueue stall Kafka delivery
+// for the whole aggregate: the deprecated transport interfering with the one replacing
+// it.
+//
+// The two facts live in two different SQL predicates — the claim's status list and the
+// NOT EXISTS blocking list — backed by two different partial indexes whose WHERE clauses
+// must match them. Only a real database evaluates all four together.
+//
+// The re-claimed row is additionally asserted to carry kafka_dispatched_at, because that
+// is what tells the relay to publish nothing: without it, retrying the webhook would put
+// a duplicate on the topic.
+func TestMarkEventWebhookPending_LeavesTheRowClaimableWithoutBlockingItsKey_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("whpending")
+	quiesceEventOutbox(t, ds, marker)
+
+	base := dbTimestamp(time.Now().Add(-time.Hour))
+	sharedKey := marker + "webhook-pending-key"
+
+	published := newEventOutboxFixture(marker)
+	published.PartitionKey = sharedKey
+	published.OccurredAt = base
+	insertRealEventOutbox(t, ds, published)
+
+	successor := newEventOutboxFixture(marker)
+	successor.PartitionKey = sharedKey
+	successor.OccurredAt = base.Add(time.Minute)
+	insertRealEventOutbox(t, ds, successor)
+
+	// The Kafka leg succeeds and the legacy enqueue fails: the transition under test.
+	token := claimEventOutboxToken(t, ds, published)
+	outcome, err := ds.MarkEventWebhookPending(ctx, published.ID, token, "queue unreachable", 0, model.BrokerRecord{})
+	require.NoError(t, err)
+	require.Equal(t, model.EventOutboxStatusWebhookPending, outcome.Status)
+	require.False(t, outcome.Abandoned, "the default budget is not spent by one failure")
+
+	stored, err := ds.GetEventByID(ctx, published.EventID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.NotNil(t, stored.KafkaDispatchedAt,
+		"the Kafka leg must be recorded, which is what makes the re-claim publish nothing")
+	assert.Nil(t, stored.DispatchedAt,
+		"and the row must NOT be dispatched: a delivery is still owed")
+	assert.Equal(t, 1, stored.WebhookAttempts)
+	assert.Equal(t, 0, stored.Attempts, "no Kafka attempt may have been spent")
+
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	require.NoError(t, err)
+
+	assert.True(t, containsEventID(claimed, published.EventID),
+		"a webhook_pending row MUST be claimable, or its outstanding webhook is never enqueued — "+
+			"which is exactly what marking it dispatched used to do")
+	assert.True(t, containsEventID(claimed, successor.EventID),
+		"and it must NOT block its key: the row is already on its Kafka topic, so holding the key "+
+			"would let a failing legacy enqueue stall Kafka delivery for the whole aggregate")
+
+	for _, row := range claimed {
+		if row.EventID != published.EventID {
+			continue
+		}
+
+		assert.NotNil(t, row.KafkaDispatchedAt,
+			"the re-claimed row must carry its Kafka acknowledgement, or the relay republishes it")
+		assert.Equal(t, 1, row.WebhookAttempts,
+			"and its legacy budget, so the next failure is the second attempt rather than the first")
+	}
+}
+
+// TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB is the renewal proof
+// a mock cannot give: sqlmock has no clock, so it can show the statement is issued but never that
+// the row is still unclaimable after the lease it was claimed under would have expired.
+//
+// Four properties are asserted, and each rules out a different way of getting this wrong:
+//
+//   - The renewal EXTENDS the rows still in flight, so a batch that outlives its own lease keeps
+//     it and no second instance can claim those rows out from under it.
+//   - It leaves FINISHED rows alone. A dispatched row has had its token cleared, so it is outside
+//     the statement's reach — and it must be, or a terminal row would be handed a live lease and
+//     appear to an operator as work in progress.
+//   - The count reports what was extended, which is what lets the heartbeat retire itself when
+//     the batch is done rather than renewing an empty set for ever.
+//   - ANOTHER instance's token extends nothing, which is what makes the token an ownership claim
+//     rather than a shared handle.
+func TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("renew")
+	quiesceEventOutbox(t, ds, marker)
+
+	// A lease short enough to expire during the test, which is what makes "still held" mean
+	// something. Production uses thirty seconds; the mechanism is identical, only the period.
+	const originalLease = 900 * time.Millisecond
+
+	base := dbTimestamp(time.Now().Add(-time.Hour))
+
+	finished := newEventOutboxFixture(marker)
+	finished.OccurredAt = base
+	insertRealEventOutbox(t, ds, finished)
+
+	inFlight := make([]*model.EventOutbox, 0, 2)
+	for index := 1; index <= 2; index++ {
+		row := newEventOutboxFixture(marker)
+		row.OccurredAt = base.Add(time.Duration(index) * time.Minute)
+		inFlight = append(inFlight, insertRealEventOutbox(t, ds, row))
+	}
+
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, originalLease)
+	require.NoError(t, err)
+
+	mine := make(map[string]model.EventOutbox, 3)
+	for _, row := range claimed {
+		if isMarkedEventOutbox(row, marker) {
+			mine[row.EventID] = row
+		}
+	}
+	require.Len(t, mine, 3, "all three fixtures must be claimed in one batch, under one token")
+
+	token := mine[finished.EventID].ClaimToken
+	require.NotEmpty(t, token)
+	for eventID, row := range mine {
+		require.Equalf(t, token, row.ClaimToken,
+			"one claim issues ONE token; event %s came back with a different one, which would make the "+
+				"heartbeat unable to address the batch", eventID)
+	}
+
+	// One row finishes, exactly as the first wave of a real batch does.
+	require.NoError(t, ds.MarkEventDispatched(ctx, finished.ID, token, model.BrokerRecord{}))
+
+	renewed, err := ds.RenewEventOutboxLease(ctx, token, 10*time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(inFlight)), renewed,
+		"the renewal must extend exactly the rows still in flight — %d of the %d claimed — so the "+
+			"heartbeat can tell a batch still working from one that has finished",
+		len(inFlight), len(mine))
+
+	// Past the ORIGINAL lease. Without the renewal every one of these rows would be claimable now.
+	time.Sleep(originalLease + 200*time.Millisecond)
+
+	afterExpiry, err := ds.ClaimPendingEventOutbox(ctx, 100, time.Minute)
+	require.NoError(t, err)
+
+	for _, row := range inFlight {
+		assert.Falsef(t, containsEventID(afterExpiry, row.EventID),
+			"event %s must NOT be claimable %s after a %s lease was taken on it: the renewal extended "+
+				"it, and a row reclaimed here is published a second time while this instance is still "+
+				"publishing it", row.EventID, originalLease+200*time.Millisecond, originalLease)
+
+		stored, storedErr := ds.GetEventByID(ctx, row.EventID)
+		require.NoError(t, storedErr)
+		require.NotNil(t, stored)
+		require.NotNil(t, stored.LockedUntil, "a renewed row must still hold a lease")
+		assert.Truef(t, stored.LockedUntil.After(time.Now().Add(5*time.Minute)),
+			"event %s must carry the EXTENDED expiry, not the original one: locked_until is %s",
+			row.EventID, stored.LockedUntil.UTC().Format(time.RFC3339Nano))
+		assert.Equal(t, token, stored.ClaimToken,
+			"and it must still be held by the same claim")
+	}
+
+	// The finished row was untouched by the renewal.
+	settled, err := ds.GetEventByID(ctx, finished.EventID)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, model.EventOutboxStatusDispatched, settled.Status)
+	assert.Nil(t, settled.LockedUntil,
+		"a dispatched row must not be handed a lease by a renewal: it is finished, and a live lease on "+
+			"it would read as work in progress")
+	assert.Empty(t, settled.ClaimToken)
+
+	// A different instance's token owns nothing here.
+	stranger, err := ds.RenewEventOutboxLease(ctx, uuid.NewString(), 10*time.Minute)
+	require.NoError(t, err, "an unknown token is not an error; it simply holds nothing")
+	assert.Zero(t, stranger,
+		"another instance's token must extend nothing: the token is an ownership claim, not a shared handle")
+}
+
+// TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElseCanReach_RealDB is
+// the F14 limbo, walked end to end against the real table.
+//
+// The sequence is the production one: a row spends its retry budget, its dead-letter write fails,
+// and it is left at 'failed' with dlt_topic NULL. What is asserted is that this row —
+//
+//   - is INVISIBLE to the ordinary claim, because that predicate admits only attempts <
+//     max_attempts, which is exactly why the repair pass has to exist;
+//   - IS reachable by the repair claim, which leaves the status at 'failed' and stamps a fresh
+//     token;
+//   - is protected by its new lease from being repaired twice at once;
+//   - can then complete through the ORDINARY MarkEventDeadLettered transition, which accepts
+//     'failed' as a prior state precisely so no second code path is needed; and
+//   - fences the token the failed worker was holding, so a straggler cannot preserve a row the
+//     repair has taken over.
+//
+// A row that WAS preserved is seeded alongside it and must never be claimed, because a repair
+// pass that re-claimed dead-lettered rows would rewrite their dead-letter records for ever.
+func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElseCanReach_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("dltrepair")
+	quiesceEventOutbox(t, ds, marker)
+
+	base := dbTimestamp(time.Now().Add(-time.Hour))
+
+	// A one-attempt budget: the first failure spends it, which is what routes the row to the
+	// dead-letter hand-off without walking the whole production backoff schedule.
+	stranded := newEventOutboxFixture(marker)
+	stranded.OccurredAt = base
+	stranded.MaxAttempts = 1
+	insertRealEventOutbox(t, ds, stranded)
+
+	preserved := newEventOutboxFixture(marker)
+	preserved.OccurredAt = base.Add(time.Minute)
+	preserved.MaxAttempts = 1
+	insertRealEventOutbox(t, ds, preserved)
+
+	// Both rows fail their only attempt. They are claimed in ONE batch — their partition keys
+	// differ, so nothing serialises them — and the tokens are captured together, because a second
+	// claim would find them already leased under the first one.
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	require.NoError(t, err)
+
+	tokens := make(map[string]string, 2)
+	for _, row := range claimed {
+		if isMarkedEventOutbox(row, marker) {
+			tokens[row.EventID] = row.ClaimToken
+		}
+	}
+	require.Len(t, tokens, 2, "both fixtures must be claimed before either can be failed")
+
+	strandedToken := tokens[stranded.EventID]
+	require.NotEmpty(t, strandedToken, "the stranded fixture must come back with the token its claim issued")
+
+	strandedOutcome, err := ds.MarkEventFailed(ctx, stranded.ID, strandedToken, "broker refused the publish", 0)
+	require.NoError(t, err)
+	require.True(t, strandedOutcome.Exhausted, "a one-attempt budget must be spent by one failure")
+	require.Equal(t, model.EventOutboxStatusFailed, strandedOutcome.Status)
+
+	preservedToken := tokens[preserved.EventID]
+	require.NotEmpty(t, preservedToken)
+
+	preservedOutcome, err := ds.MarkEventFailed(ctx, preserved.ID, preservedToken, "broker refused the publish", 0)
+	require.NoError(t, err)
+	require.True(t, preservedOutcome.Exhausted)
+
+	// Only the second one's dead-letter write succeeded.
+	require.NoError(t, ds.MarkEventDeadLettered(ctx, preserved.ID, preservedOutcome.ClaimToken,
+		"blnk.transactions.dlt", json.RawMessage(`{"original_topic":"blnk.transactions"}`), model.BrokerRecord{}))
+
+	// THE LIMBO. The ordinary claim will never take the stranded row again.
+	ordinary, err := ds.ClaimPendingEventOutbox(ctx, 100, time.Minute)
+	require.NoError(t, err)
+	require.False(t, containsEventID(ordinary, stranded.EventID),
+		"a row whose retry budget is spent must be outside the ordinary claim: if it were not, this "+
+			"test would be exercising the retry path rather than the repair")
+
+	// THE WAY OUT.
+	repair, err := ds.ClaimFailedEventOutboxForDeadLetter(ctx, 20, time.Minute)
+	require.NoError(t, err)
+
+	require.True(t, containsEventID(repair, stranded.EventID),
+		"the repair claim must reach a failed row with no dead-letter record; without it the event is "+
+			"the only copy of itself and nothing will ever act on it again")
+	assert.False(t, containsEventID(repair, preserved.EventID),
+		"a row already preserved on its dead-letter topic must NOT be re-claimed: repairing it again "+
+			"would rewrite its dead-letter record on every poll for ever")
+
+	var claimedStranded model.EventOutbox
+	for _, row := range repair {
+		if row.EventID == stranded.EventID {
+			claimedStranded = row
+		}
+	}
+
+	assert.Equal(t, model.EventOutboxStatusFailed, claimedStranded.Status,
+		"the repair must LEAVE the status at 'failed': it keeps the row in the dead-letter inventory "+
+			"for the whole attempt, and MarkEventDeadLettered accepts 'failed' as a prior state")
+	assert.Equal(t, 1, claimedStranded.Attempts,
+		"and must not spend or reset the retry budget: the metadata reports the attempts that were made")
+	require.NotEmpty(t, claimedStranded.ClaimToken)
+	assert.NotEqual(t, strandedToken, claimedStranded.ClaimToken,
+		"a FRESH token must be stamped: the original belonged to a worker whose write already failed")
+
+	// The new lease is what makes the retry frequency-bounded rather than a hot loop.
+	again, err := ds.ClaimFailedEventOutboxForDeadLetter(ctx, 20, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, containsEventID(again, stranded.EventID),
+		"a row under a live repair lease must not be claimed again, or several instances write the same "+
+			"dead-letter message at once")
+
+	// FENCING: the worker whose dead-letter write failed can no longer finish the row.
+	staleErr := ds.MarkEventDeadLettered(ctx, stranded.ID, strandedToken,
+		"blnk.transactions.dlt", json.RawMessage(`{"original_topic":"blnk.transactions"}`), model.BrokerRecord{})
+	require.Error(t, staleErr,
+		"the superseded token must be refused: a straggler must not preserve a row the repair has taken over")
+
+	// AND THE ORDINARY TRANSITION FINISHES IT.
+	require.NoError(t, ds.MarkEventDeadLettered(ctx, stranded.ID, claimedStranded.ClaimToken,
+		"blnk.transactions.dlt", json.RawMessage(`{"original_topic":"blnk.transactions","error_reason":"broker refused the publish"}`), model.BrokerRecord{}),
+		"the repair's own token must be able to record the preservation through the ordinary transition")
+
+	repaired, err := ds.GetEventByID(ctx, stranded.EventID)
+	require.NoError(t, err)
+	require.NotNil(t, repaired)
+	assert.Equal(t, model.EventOutboxStatusDeadLettered, repaired.Status)
+	assert.Equal(t, "blnk.transactions.dlt", repaired.DLTTopic)
+	assert.Nil(t, repaired.LockedUntil, "a preserved row holds no lease")
+	assert.Empty(t, repaired.ClaimToken, "and no token: it is nobody's to hold")
+
+	settled, err := ds.ClaimFailedEventOutboxForDeadLetter(ctx, 20, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, containsEventID(settled, stranded.EventID),
+		"once preserved, the row must leave the repair backlog for good")
 }
 
 // TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB is the FOR UPDATE SKIP
@@ -3887,7 +4948,7 @@ func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T
 
 	// Everything relay A now attempts must be refused.
 	t.Run("stale dispatch is refused", func(t *testing.T) {
-		requireAPIError(t, ds.MarkEventDispatched(ctx, entry.ID, staleToken), apierror.ErrConflict)
+		requireAPIError(t, ds.MarkEventDispatched(ctx, entry.ID, staleToken, model.BrokerRecord{}), apierror.ErrConflict)
 	})
 	t.Run("stale failure is refused and does not spend the budget", func(t *testing.T) {
 		_, failErr := ds.MarkEventFailed(ctx, entry.ID, staleToken, "stale attempt", 0)
@@ -3902,7 +4963,7 @@ func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T
 	})
 	t.Run("stale dead-letter is refused", func(t *testing.T) {
 		requireAPIError(t, ds.MarkEventDeadLettered(ctx, entry.ID, staleToken,
-			entry.Topic+".dlt", json.RawMessage(`{"attempt_count":1}`)), apierror.ErrConflict)
+			entry.Topic+".dlt", json.RawMessage(`{"attempt_count":1}`), model.BrokerRecord{}), apierror.ErrConflict)
 	})
 	t.Run("stale webhook marker is refused", func(t *testing.T) {
 		requireAPIError(t, ds.MarkWebhookDispatched(ctx, entry.ID, staleToken), apierror.ErrConflict)
@@ -3914,7 +4975,7 @@ func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T
 	})
 
 	// And the LIVE holder is unaffected throughout.
-	require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, liveToken),
+	require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, liveToken, model.BrokerRecord{}),
 		"the live claim holder must still be able to complete its work")
 
 	final, err := ds.GetEventByID(ctx, entry.EventID)
@@ -4000,7 +5061,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		}
 		require.NotEmpty(t, token, "the claim must issue a token, or no transition can be authorised")
 
-		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token))
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token, model.BrokerRecord{}))
 
 		got, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
@@ -4009,7 +5070,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		assert.Nil(t, got.LockedUntil, "the lease must be released")
 		assert.Empty(t, got.ClaimToken, "a terminal state releases the claim token")
 
-		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, token),
+		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, token, model.BrokerRecord{}),
 			"replaying the same transition with the same token must be refused: the row is terminal and the token has been released")
 
 		again, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
@@ -4139,7 +5200,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		secondToken := claimEventOutboxToken(t, ds, entry)
 		require.NotEqual(t, firstToken, secondToken,
 			"each claim must issue its own token, or a stale worker's token would still authorise a write")
-		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, firstToken),
+		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, firstToken, model.BrokerRecord{}),
 			"the stale token from the previous claim must no longer authorise anything")
 
 		_, err = ds.MarkEventFailed(ctx, entry.ID, secondToken, "attempt two", 0)
@@ -4204,7 +5265,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt", metadata))
+		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt", metadata, model.BrokerRecord{}))
 
 		deadLettered, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
@@ -4216,7 +5277,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 			"the failure metadata must round-trip: it is what the dead-letter inventory displays and what a replay reads its origin topic from")
 		assert.Empty(t, deadLettered.ClaimToken, "a terminal state releases the claim")
 
-		assert.Error(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt", metadata),
+		assert.Error(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt", metadata, model.BrokerRecord{}),
 			"a second dead-letter of the same row must be refused, or two workers each put a copy on the .dlt topic")
 	})
 
@@ -4230,7 +5291,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, outcome.Exhausted)
 		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, outcome.ClaimToken,
-			entry.Topic+".dlt", json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":1}`)))
+			entry.Topic+".dlt", json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":1}`), model.BrokerRecord{}))
 
 		claimed, err := ds.ClaimEventForReplay(ctx, entry.EventID, time.Minute)
 		require.NoError(t, err)
@@ -4263,7 +5324,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		reclaimed, err := ds.ClaimEventForReplay(ctx, entry.EventID, time.Minute)
 		require.NoError(t, err)
 		require.NotNil(t, reclaimed)
-		require.NoError(t, ds.MarkEventDispatched(ctx, reclaimed.ID, reclaimed.ClaimToken))
+		require.NoError(t, ds.MarkEventDispatched(ctx, reclaimed.ID, reclaimed.ClaimToken, model.BrokerRecord{}))
 
 		done, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
@@ -4328,13 +5389,13 @@ func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testin
 	// last, so nothing claims them.
 	for i := 0; i < wantDispatched; i++ {
 		entry := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
-		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, claimEventOutboxToken(t, ds, entry)))
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, claimEventOutboxToken(t, ds, entry), model.BrokerRecord{}))
 	}
 	for i := 0; i < wantDeadLettered; i++ {
 		entry := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, claimEventOutboxToken(t, ds, entry),
 			entry.Topic+".dlt",
-			json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`)))
+			json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`), model.BrokerRecord{}))
 	}
 	for i := 0; i < wantPending; i++ {
 		insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
@@ -4530,8 +5591,35 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	planText := plan.String()
 	require.NotEmpty(t, planText, "EXPLAIN returned no plan")
 
-	assert.Contains(t, planText, "idx_event_outbox_claim",
-		"the claim must be driven by idx_event_outbox_claim. Its partial predicate is what confines the scan to the claimable working set and keeps the cold history out of the index entirely; without it the relay's per-poll cost grows with the table until it cannot keep up with 500 events/sec, and no unit test would ever reveal it.\nPlan was:\n"+planText)
+	// THE CANDIDATE SIDE MUST REACH THE TABLE THROUGH A BLOCKING-STATE PARTIAL INDEX, which
+	// is the guarantee, rather than through one named index, which is a plan detail.
+	//
+	// This assertion used to pin "idx_event_outbox_claim" by name and it failed roughly one
+	// package run in six, always on a plan that honours the guarantee completely: PostgreSQL
+	// reached the candidate rows through a Bitmap Index Scan on
+	// idx_event_outbox_partition_key_inflight instead. Both indexes are PARTIAL on exactly
+	// the blocking states, so under either plan the cold history of terminal rows is never
+	// read and the poll's cost stays independent of how large the outbox has grown — which
+	// is the entire reason the migration's index exists. Which of the two the planner picks
+	// is a cost decision that moves with heap compaction, statistics freshness and host
+	// load, and pinning it made this assertion report a defect that was not one. The
+	// anti-join half of this test already learned that lesson; this half had not.
+	//
+	// Asserted on the ONE plan line that reaches the candidate relation, for the same reason
+	// the earlier-same-key assertion below is: "the plan mentions an index somewhere" is
+	// nearly vacuous, whereas "the line reaching `event_outbox candidate` is an index scan
+	// through a blocking-state partial index" says exactly what it means. The
+	// sequential-scan prohibition further down closes the same failure mode across every
+	// other node in the plan.
+	candidateScan := planLineReferencing(planText, "event_outbox candidate")
+	require.NotEmpty(t, candidateScan,
+		"the plan must reach the candidate relation explicitly.\nPlan was:\n"+planText)
+	assert.Contains(t, candidateScan, "Index",
+		"the claim's candidate selection must be index-driven. Read through a scan instead, the relay's per-poll cost grows with the whole table until it cannot keep up with 500 events/sec, and no unit test would ever reveal it.\nPlan line was: "+candidateScan)
+	assert.True(t,
+		strings.Contains(candidateScan, "idx_event_outbox_claim") ||
+			strings.Contains(candidateScan, "idx_event_outbox_partition_key_inflight"),
+		"the claim's candidate selection must be served by a partial index whose predicate is the blocking-state set, so the cold history is excluded from the index entirely. Anything else reads terminal rows on every poll.\nPlan line was: "+candidateScan+"\nPlan was:\n"+planText)
 
 	// The earlier-same-key exclusion must be INDEX-DRIVEN and confined to the blocking
 	// states. What it must never be is a scan of each key's entire history, which would buy
@@ -4616,6 +5704,122 @@ func planLineReferencing(planText, needle string) string {
 	return ""
 }
 
+// TestPlanIndexesUsed_NamesEveryIndexAnExplainPlanReads covers the plan parser directly.
+//
+// It exists because the assertion that depends on it lives in a _RealDB test that SKIPS
+// when the shared outbox holds too many unrelated claimable rows for a plan to be
+// meaningful. A parser that silently returned nothing would make that assertion vacuous
+// on the runs where it does execute — require.NotEmpty is what stops that, and this test
+// is what proves the parser feeds it real names rather than luck.
+func TestPlanIndexesUsed_NamesEveryIndexAnExplainPlanReads(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		plan string
+		want []string
+	}{
+		{
+			name: "bitmap index scan names the index after on",
+			plan: "Bitmap Heap Scan on event_outbox candidate\n" +
+				"  ->  Bitmap Index Scan on idx_event_outbox_partition_key_inflight  (cost=0.00..40.24 rows=20 width=0)\n",
+			want: []string{"idx_event_outbox_partition_key_inflight"},
+		},
+		{
+			name: "index scan names the index after using and stops before on",
+			plan: "Index Scan using idx_event_outbox_claim on event_outbox  (cost=0.28..7.63 rows=1 width=22)\n",
+			want: []string{"idx_event_outbox_claim"},
+		},
+		{
+			name: "every index in a multi node plan is reported in plan order",
+			plan: "Sort  (cost=204.17..204.19 rows=6 width=458)\n" +
+				"  ->  Bitmap Index Scan on idx_event_outbox_claim\n" +
+				"  ->  Index Scan using idx_event_outbox_partition_key_inflight on event_outbox earlier\n" +
+				"  ->  Index Scan using event_outbox_pkey on event_outbox\n",
+			want: []string{"idx_event_outbox_claim", "idx_event_outbox_partition_key_inflight", "event_outbox_pkey"},
+		},
+		{
+			name: "index only scan and backward scan are recognised",
+			plan: "Index Only Scan using idx_event_outbox_pending on event_outbox\n" +
+				"Index Scan Backward using idx_event_outbox_aggregate on event_outbox\n",
+			want: []string{"idx_event_outbox_pending", "idx_event_outbox_aggregate"},
+		},
+		{
+			// The case the assertion turns on: a plan that reads no index at all must
+			// report none, so require.NotEmpty fails rather than passing on an empty set.
+			name: "a sequential scan plan reports no index",
+			plan: "Seq Scan on event_outbox candidate  (cost=0.00..105.50 rows=6 width=53)\n" +
+				"  Filter: (status = ANY ('{pending,processing}'::text[]))\n",
+			want: nil,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, test.want, planIndexesUsed(test.plan))
+		})
+	}
+}
+
+// planIndexNodePrefixes are the EXPLAIN node prefixes that name the index they read,
+// each ending immediately before the index name.
+//
+// Declared once rather than inline so a new access method is added in one place, and
+// ordered longest-first so "Bitmap Index Scan on " is matched before a prefix that is a
+// suffix of it could shadow it.
+var planIndexNodePrefixes = []string{
+	"Bitmap Index Scan on ",
+	"Index Only Scan using ",
+	"Index Scan Backward using ",
+	"Index Scan using ",
+}
+
+// planIndexesUsed returns the names of every index an EXPLAIN plan reads, in the order the
+// plan names them and without de-duplication.
+//
+// It exists so a plan assertion can be made about WHICH indexes serve a query without
+// pinning the plan's shape. PostgreSQL chooses freely between correct plans on cost, and on
+// a shared test database no single test controls the statistics that decide it — so an
+// assertion naming one expected index fails on plans that honour the guarantee completely.
+// The set of indexes touched is the durable property: it says whether the query reached the
+// table through something that excludes the cold history, whatever shape the plan took.
+//
+// Parameters:
+//   - planText string: the EXPLAIN output, newline separated.
+//
+// Returns:
+//   - []string: the index names read, or nil when the plan reads none.
+func planIndexesUsed(planText string) []string {
+	var indexes []string
+
+	for _, line := range strings.Split(planText, "\n") {
+		for _, prefix := range planIndexNodePrefixes {
+			position := strings.Index(line, prefix)
+			if position < 0 {
+				continue
+			}
+
+			// The index name runs to the next space or to the end of the line: EXPLAIN
+			// writes "Index Scan using <index> on <relation>" and "Bitmap Index Scan on
+			// <index>", so the name is the first field after the prefix in both.
+			name := strings.TrimSpace(line[position+len(prefix):])
+			if end := strings.IndexByte(name, ' '); end >= 0 {
+				name = name[:end]
+			}
+
+			if name != "" {
+				indexes = append(indexes, name)
+			}
+
+			break
+		}
+	}
+
+	return indexes
+}
+
 // TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB asserts the LIMIT
 // is honoured against a real table, and that repeated bounded claims DRAIN the backlog in
 // occurrence order.
@@ -4661,7 +5865,7 @@ func TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB(t *tes
 		// does once the broker acknowledges.
 		for _, entry := range claimed {
 			if isMarkedEventOutbox(entry, marker) {
-				require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, entry.ClaimToken))
+				require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, entry.ClaimToken, model.BrokerRecord{}))
 			}
 		}
 	}
@@ -4692,7 +5896,7 @@ func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
 		insertRealEventOutbox(t, ds, entry)
 		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, claimEventOutboxToken(t, ds, entry),
 			entry.Topic+".dlt",
-			json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`)))
+			json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`), model.BrokerRecord{}))
 		oldestFirst = append(oldestFirst, entry.EventID)
 	}
 
@@ -4869,13 +6073,35 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 		"a foreign topic":           "attacker.transactions",
 		"a dead-letter topic":       "blnk.transactions.dlt",
 		"the system category":       "blnk.system",
-		"the quarantine category":   "blnk.quarantine",
+		"the system dead-letter":    "blnk.system.dlt",
 	}
 	for name, topic := range refused {
 		t.Run("refuses "+name, func(t *testing.T) {
 			requireAPIError(t, requireGrantableTopics([]string{topic}), apierror.ErrInvalidInput)
 		})
 	}
+
+	// THE SYSTEM CATEGORY IS REFUSED, and it is in the table above rather than here for a
+	// reason worth stating, because the opposite reading is tempting: `blnk.system` carries
+	// `ledger.created` and `system.error`, two of the thirteen event types the legacy webhook
+	// transport delivered, so refusing a grant on it does leave a migrating subscriber with no
+	// authorized path to either.
+	//
+	// That cost is accepted, because the migration changes the AUDIENCE and not only the
+	// transport. The webhook transport had exactly one recipient — the single URL in
+	// notification.webhook.url, an endpoint the operator owns — while Kafka has one principal
+	// per subscriber. `system.error`'s payload is the FROZEN legacy body, so it still carries
+	// the error text as it renders: a PostgreSQL error names schema, table, column and
+	// routine, a broker error names internal addresses. Granting that to third-party
+	// principals to preserve "everything reaches everyone" would WIDEN the disclosure the
+	// webhook made, not preserve it — and the body cannot be narrowed without breaking the
+	// payload-preservation guarantee the whole migration rests on.
+	//
+	// Coverage is unaffected: both event types are captured in the outbox, published to the
+	// topic, counted by the metrics and replayable from the dead-letter inventory. What an
+	// internal category withholds is an ACL, not the event — and a broker administrator can
+	// still grant one out of band, which Blnk's own provisioning deliberately will not do.
+	// See model.EventCategorySystem, which is the single source of this decision.
 
 	t.Run("refuses an offending topic in any position", func(t *testing.T) {
 		requireAPIError(t,
@@ -4907,6 +6133,9 @@ func TestRequireSafeWebhookURL_AppliesTheDestinationPolicy(t *testing.T) {
 
 	assert.NoError(t, requireSafeWebhookURL(nil), "no URL recorded is legitimate")
 	assert.NoError(t, requireSafeWebhookURL(safeURL("")), "a present empty URL clears the record")
+	assert.NoError(t, requireSafeWebhookURL(safeURL("   ")),
+		"an all-whitespace URL is the same instruction as an empty one — clear the record — which is "+
+			"why it is accepted while a real URL carrying surrounding whitespace is not")
 	assert.NoError(t, requireSafeWebhookURL(safeURL("https://hooks.example.com/blnk")))
 
 	refused := map[string]string{
@@ -4919,6 +6148,15 @@ func TestRequireSafeWebhookURL_AppliesTheDestinationPolicy(t *testing.T) {
 		"a private address":       "https://10.0.0.7:9092/blnk",
 		"an internal zone name":   "https://metadata.google.internal/blnk",
 		"an unqualified hostname": "https://postgres/blnk",
+		// SURROUNDING WHITESPACE, and it belongs in this list rather than being trimmed away.
+		// The column is written VERBATIM, so trimming for validation and storing the original
+		// would persist a destination that passed a check the stored bytes do not satisfy — and
+		// the API DTO already refuses these, so tolerating them here would give a service, CLI
+		// or migration caller a laxer policy than an HTTP caller for the same column.
+		"a leading space":    " https://hooks.example.com/blnk",
+		"a trailing space":   "https://hooks.example.com/blnk ",
+		"a trailing newline": "https://hooks.example.com/blnk\n",
+		"a leading tab":      "\thttps://hooks.example.com/blnk",
 	}
 	for name, raw := range refused {
 		t.Run("refuses "+name, func(t *testing.T) {
@@ -5027,11 +6265,18 @@ func TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace(t *testing.T) {
 		mock.ExpectExec("UPDATE blnk.event_subscribers").
 			WillReturnResult(sqlmock.NewResult(0, 0))
 		// ...and the subscriber does exist, so this is a race and not a 404.
-		mock.ExpectQuery("SELECT").WillReturnRows(
-			sqlmock.NewRows(strings.Split(eventSubscriberColumns, ", ")).
-				AddRow(int64(1), "acme_prod", "Acme", "blnk-sub-acme_prod",
-					"blnk-sub-acme_prod.default", pq.Array([]string{"blnk.transactions"}),
-					nil, previous, time.Now(), nil, nil, time.Now(), time.Now()))
+		mock.ExpectQuery("SELECT").WillReturnRows(newEventSubscriberRows(t, map[string]driver.Value{
+			"id":                   int64(1),
+			"subscriber_id":        "acme_prod",
+			"name":                 "Acme",
+			"kafka_principal":      "blnk-sub-acme_prod",
+			"consumer_group_id":    "blnk-sub-acme_prod.default",
+			"authorized_topics":    pq.Array([]string{"blnk.transactions"}),
+			"credential_reference": previous,
+			"credential_issued_at": time.Now(),
+			"created_at":           time.Now(),
+			"updated_at":           time.Now(),
+		}))
 
 		err := source.RecordSubscriberCredentialIfUnchanged(
 			context.Background(), "acme_prod", &previous, reference, time.Now())
@@ -5112,6 +6357,44 @@ func TestClearSubscriberCredential_NullsBothHalvesTogether(t *testing.T) {
 	})
 }
 
+// newEventSubscriberRows builds a sqlmock row set over the FULL registry projection.
+//
+// It exists because two tests used to spell the row out as a positional literal, and adding a
+// column to eventSubscriberColumns then made them panic on an arity mismatch rather than fail on
+// the behaviour they were about. Here the projection decides the width: named values are placed
+// by column, and every other column is NULL.
+//
+// Parameters:
+//   - t *testing.T: for the fatal on an unknown column name.
+//   - values map[string]driver.Value: the columns this test cares about, by name.
+//
+// Returns:
+//   - *sqlmock.Rows: one row, exactly as wide as the projection.
+func newEventSubscriberRows(t *testing.T, values map[string]driver.Value) *sqlmock.Rows {
+	t.Helper()
+
+	columns := strings.Split(eventSubscriberColumns, ", ")
+
+	known := make(map[string]bool, len(columns))
+	for _, column := range columns {
+		known[column] = true
+	}
+
+	for name := range values {
+		if !known[name] {
+			t.Fatalf("newEventSubscriberRows: %q is not a column of the registry projection (%v)",
+				name, columns)
+		}
+	}
+
+	row := make([]driver.Value, 0, len(columns))
+	for _, column := range columns {
+		row = append(row, values[column])
+	}
+
+	return sqlmock.NewRows(columns).AddRow(row...)
+}
+
 // TestTakeEventSubscriber_ReturnsTheRowItDeleted is the AUTH-01 deletion-propagation
 // guard.
 //
@@ -5125,11 +6408,16 @@ func TestTakeEventSubscriber_ReturnsTheRowItDeleted(t *testing.T) {
 		source := Datasource{Conn: db}
 
 		mock.ExpectQuery("DELETE FROM blnk.event_subscribers").WillReturnRows(
-			sqlmock.NewRows(strings.Split(eventSubscriberColumns, ", ")).
-				AddRow(int64(7), "acme_prod", "Acme", "blnk-sub-acme_prod",
-					"blnk-sub-acme_prod.default",
-					pq.Array([]string{"blnk.transactions", "blnk.balances"}),
-					nil, nil, nil, nil, nil, time.Now(), time.Now()))
+			newEventSubscriberRows(t, map[string]driver.Value{
+				"id":                int64(7),
+				"subscriber_id":     "acme_prod",
+				"name":              "Acme",
+				"kafka_principal":   "blnk-sub-acme_prod",
+				"consumer_group_id": "blnk-sub-acme_prod.default",
+				"authorized_topics": pq.Array([]string{"blnk.transactions", "blnk.balances"}),
+				"created_at":        time.Now(),
+				"updated_at":        time.Now(),
+			}))
 
 		deleted, err := source.TakeEventSubscriber(context.Background(), "acme_prod")
 		require.NoError(t, err)
@@ -5294,4 +6582,343 @@ func assertNoDatabaseDetailLeak(t *testing.T, err error) {
 		assert.NotContains(t, rendered, forbidden,
 			"the driver's %q must not reach a caller; it belongs in the log", forbidden)
 	}
+}
+
+// ---------------------------------------------------------------------------------------
+// The broker coordinate and the zero-loss audit — OBS-02
+// ---------------------------------------------------------------------------------------
+
+// eventOutboxBrokerRecord builds a coordinate that is unique to one test run.
+//
+// The topic is per-run because the coordinate carries a PARTIAL UNIQUE INDEX: two rows naming
+// the same (topic, partition, offset) is refused by the database, which is the guarantee the
+// audit rests on — and which would otherwise make two tests, or two runs of one test, collide
+// on a shared literal.
+func eventOutboxBrokerRecord(markerPrefix string, partition int, offset int64) model.BrokerRecord {
+	return model.BrokerRecord{
+		Topic:     "blnk.transactions." + markerPrefix,
+		Partition: partition,
+		Offset:    offset,
+	}
+}
+
+// TestMarkEventDispatched_PersistsTheBrokerCoordinate is the OBS-02 write-side guard.
+//
+// Every marking transition binds the coordinate, and the SQL is asserted directly because the
+// column list and the COALESCE are the whole mechanism: a transition that assigned instead of
+// COALESCEd would erase the record a webhook-only retry pass has no coordinate for, and one that
+// bound nothing would leave every row an unconfirmed publication with nothing failing to say so.
+func TestMarkEventDispatched_PersistsTheBrokerCoordinate(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	var topic, partition, offset driver.Value
+
+	mock.ExpectExec("").
+		WithArgs(model.EventOutboxStatusDispatched, int64(42), "tok-42",
+			model.EventOutboxStatusProcessing, model.EventOutboxStatusReplaying,
+			captureArg(&topic), captureArg(&partition), captureArg(&offset)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	record := model.BrokerRecord{Topic: "blnk.transactions", Partition: 3, Offset: 148_291}
+	require.NoError(t, ds.MarkEventDispatched(context.Background(), 42, "tok-42", record))
+
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "kafka_topic = COALESCE($6, kafka_topic)")
+	assert.Contains(t, issued, "kafka_partition = COALESCE($7, kafka_partition)")
+	assert.Contains(t, issued, "kafka_offset = COALESCE($8, kafka_offset)",
+		"COALESCE, not assignment: a webhook-only pass carries no coordinate and must not erase "+
+			"the one the successful publish recorded")
+
+	assert.Equal(t, "blnk.transactions", topic)
+	assert.EqualValues(t, 3, partition)
+	assert.EqualValues(t, 148_291, offset)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestMarkEventDispatched_BindsNullForAnUnconfirmedCoordinate pins the absence case.
+//
+// Partition 0 and offset 0 are an ordinary location — the first record on a fresh partition — so
+// binding zeroes for an absent coordinate would write a row claiming to name a record it never
+// produced, and an operator following it would find somebody else's event. An absent coordinate
+// must be SQL NULL, which is also what the all-or-nothing check constraint requires.
+func TestMarkEventDispatched_BindsNullForAnUnconfirmedCoordinate(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	var topic, partition, offset driver.Value
+
+	mock.ExpectExec("UPDATE blnk.event_outbox").
+		WithArgs(model.EventOutboxStatusDispatched, int64(42), "tok-42",
+			model.EventOutboxStatusProcessing, model.EventOutboxStatusReplaying,
+			captureArg(&topic), captureArg(&partition), captureArg(&offset)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	require.NoError(t, ds.MarkEventDispatched(
+		context.Background(), 42, "tok-42", model.BrokerRecord{},
+	))
+
+	assert.Nil(t, topic, "an absent coordinate must bind NULL, never a zero")
+	assert.Nil(t, partition)
+	assert.Nil(t, offset)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestMarkEventDeadLettered_AssignsTheDeadLetterCoordinate covers the asymmetry.
+//
+// A dead-lettered row's record is on the `.dlt` topic, and the original publish is what FAILED —
+// so there is no record of it to name. The coordinate is therefore ASSIGNED rather than
+// COALESCEd: a stale coordinate on the main topic would send an operator looking for a record
+// the retries never produced.
+func TestMarkEventDeadLettered_AssignsTheDeadLetterCoordinate(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	var topic, partition, offset driver.Value
+
+	mock.ExpectExec("").
+		WithArgs(model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", sqlmock.AnyArg(),
+			int64(11), "tok-11",
+			model.EventOutboxStatusFailed, model.EventOutboxStatusProcessing,
+			captureArg(&topic), captureArg(&partition), captureArg(&offset)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	record := model.BrokerRecord{Topic: "blnk.transactions.dlt", Partition: 1, Offset: 7}
+	require.NoError(t, ds.MarkEventDeadLettered(
+		context.Background(), 11, "tok-11", "blnk.transactions.dlt",
+		json.RawMessage(`{"error_reason":"broker unavailable"}`), record,
+	))
+
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "kafka_topic = $8")
+	assert.Contains(t, issued, "kafka_partition = $9")
+	assert.Contains(t, issued, "kafka_offset = $10")
+	assert.NotContains(t, issued, "kafka_topic = COALESCE",
+		"the dead-letter write supersedes whatever a failed original attempt left behind")
+
+	assert.Equal(t, "blnk.transactions.dlt", topic)
+	assert.EqualValues(t, 7, offset)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestMarkEventWebhookPending_CoalescesTheCoordinate covers the third transition.
+//
+// A webhook-only retry pass publishes NOTHING — the row's Kafka leg is already done — so it
+// carries no coordinate, and the statement must leave the stored one intact. This is the exact
+// case COALESCE exists for, and an assignment here would erase the record of a row that is
+// otherwise perfectly healthy.
+func TestMarkEventWebhookPending_CoalescesTheCoordinate(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("").WillReturnRows(
+		sqlmock.NewRows([]string{"status", "webhook_attempts"}).
+			AddRow(model.EventOutboxStatusWebhookPending, 1))
+
+	_, err := ds.MarkEventWebhookPending(
+		context.Background(), 9, "tok-9", "redis unavailable", time.Second, model.BrokerRecord{},
+	)
+	require.NoError(t, err)
+
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "kafka_topic = COALESCE($9, kafka_topic)")
+	assert.Contains(t, issued, "kafka_partition = COALESCE($10, kafka_partition)")
+	assert.Contains(t, issued, "kafka_offset = COALESCE($11, kafka_offset)")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestAuditTerminalEventRecords_CountsClaimsAndTheirCorroboration pins the audit query.
+//
+// The three counts and the predicate ARE the finding's resolution, so each is asserted against
+// the SQL rather than only against a result:
+//
+//   - COUNT(kafka_offset) is what separates a claim that names a record from one that does not.
+//     SQL COUNT of an expression ignores NULLs, which is why the confirmed count needs no CASE.
+//   - COUNT(DISTINCT (…)) is the schema-integrity check: two rows naming one record would make
+//     it lower than the confirmed count, which the partial unique index should make impossible.
+//   - The predicate must include webhook_pending rows through kafka_dispatched_at. Restricting
+//     it to the terminal statuses would leave their records unaccounted for on the broker side
+//     and loosen the reconciliation during exactly the dual-delivery window it matters most in.
+func TestAuditTerminalEventRecords_CountsClaimsAndTheirCorroboration(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("").
+		WithArgs(model.EventOutboxStatusDeadLettered).
+		WillReturnRows(sqlmock.NewRows([]string{"published_rows", "confirmed_rows", "distinct_records"}).
+			AddRow(int64(1_000), int64(990), int64(990)))
+
+	audit, err := ds.AuditTerminalEventRecords(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(1_000), audit.PublishedRows)
+	assert.Equal(t, int64(990), audit.ConfirmedRows)
+	assert.Equal(t, int64(10), audit.UnconfirmedRows())
+	assert.False(t, audit.FullyConfirmed(),
+		"ten rows claim a publication nothing corroborates, so the count cannot be trusted")
+	assert.WithinDuration(t, time.Now(), audit.MeasuredAt, time.Minute)
+
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "COUNT(kafka_offset)")
+	assert.Contains(t, issued, "COUNT(DISTINCT (kafka_topic, kafka_partition, kafka_offset))")
+	assert.Contains(t, issued, "kafka_dispatched_at IS NOT NULL OR status = $1",
+		"a webhook_pending row IS on its topic; excluding it would inflate the apparent surplus")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestAuditTerminalEventRecords_ReportsAFailureRatherThanAnEmptyAudit keeps the verdict honest.
+//
+// A zero audit reads as "nothing has been published", which is a legitimate state on a fresh
+// deployment — so returning one on a failed read would let a reconciliation conclude that
+// everything is accounted for precisely when it could not measure.
+func TestAuditTerminalEventRecords_ReportsAFailureRatherThanAnEmptyAudit(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("FROM blnk.event_outbox").WillReturnError(sql.ErrConnDone)
+
+	audit, err := ds.AuditTerminalEventRecords(context.Background())
+	requireAPIError(t, err, apierror.ErrInternalServer)
+	assert.Zero(t, audit.PublishedRows)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestBrokerCoordinate_RoundTripsThroughTheProjection_RealDB proves the coordinate survives the
+// write and the read, against the real schema.
+//
+// The mock tests above assert the statements; only the real database can show that the columns
+// exist, that the check constraint accepts a complete coordinate, and that the projection and
+// scanner agree on where the three columns sit — a scan-order mistake no compiler catches and
+// that surfaces only as mis-assigned field values.
+func TestBrokerCoordinate_RoundTripsThroughTheProjection_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	marker := newRealEventOutboxMarker("coord")
+	t.Cleanup(func() { quiesceEventOutbox(t, ds, marker) })
+
+	entry := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	token := claimEventOutboxToken(t, ds, entry)
+
+	record := eventOutboxBrokerRecord(marker, 4, 9_182)
+	require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token, record))
+
+	stored, err := ds.GetEventByID(ctx, entry.EventID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+
+	readBack, confirmed := stored.BrokerRecord()
+	require.True(t, confirmed, "the coordinate must survive the round trip")
+	assert.Equal(t, record, readBack,
+		"a mismatch here is a projection/scanner ordering fault, which no compiler catches")
+	assert.Equal(t, model.EventOutboxStatusDispatched, stored.Status)
+}
+
+// TestBrokerCoordinate_TwoRowsCannotNameTheSameRecord_RealDB proves the guarantee the audit's
+// integrity check rests on.
+//
+// One record is produced by one acknowledged write of one row, so two rows naming the same
+// coordinate is impossible in reality — and the partial unique index is what makes it impossible
+// in the schema too. Without it, two rows could share one record's corroboration, which is the
+// same double-counting the whole mapping exists to remove.
+func TestBrokerCoordinate_TwoRowsCannotNameTheSameRecord_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	marker := newRealEventOutboxMarker("coorddup")
+	t.Cleanup(func() { quiesceEventOutbox(t, ds, marker) })
+
+	first := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	second := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	require.NoError(t, err)
+
+	tokens := make(map[string]string, 2)
+	for _, row := range claimed {
+		if isMarkedEventOutbox(row, marker) {
+			tokens[row.EventID] = row.ClaimToken
+		}
+	}
+	require.Len(t, tokens, 2, "both fixture rows must be claimed in one pass")
+
+	record := eventOutboxBrokerRecord(marker, 2, 555)
+	require.NoError(t, ds.MarkEventDispatched(ctx, first.ID, tokens[first.EventID], record))
+
+	// The SAME coordinate for a different row. The database must refuse it.
+	err = ds.MarkEventDispatched(ctx, second.ID, tokens[second.EventID], record)
+	require.Error(t, err,
+		"THE UNIQUE INDEX IS THE GUARANTEE: two rows sharing one record's corroboration would let "+
+			"the audit count one record twice, which is the double-counting the mapping removes")
+}
+
+// TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB is the audit's own round trip.
+//
+// It builds each of the three shapes the predicate has to cover — a dispatched row that names its
+// record, a webhook_pending row whose Kafka leg completed, and a dispatched row with no
+// coordinate — and requires the audit to count them the way the reconciliation depends on. The
+// webhook_pending case is the one most easily got wrong: it is not terminal, but it IS on the
+// topic.
+func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	marker := newRealEventOutboxMarker("audit")
+	t.Cleanup(func() { quiesceEventOutbox(t, ds, marker) })
+
+	before, err := ds.AuditTerminalEventRecords(ctx)
+	require.NoError(t, err)
+
+	confirmed := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	pending := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	unconfirmed := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	// A row that has NOT been published at all, which must not be counted by either total.
+	untouched := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	require.NoError(t, err)
+
+	tokens := make(map[string]string, 4)
+	for _, row := range claimed {
+		if isMarkedEventOutbox(row, marker) {
+			tokens[row.EventID] = row.ClaimToken
+		}
+	}
+	require.Len(t, tokens, 4)
+
+	require.NoError(t, ds.MarkEventDispatched(ctx, confirmed.ID, tokens[confirmed.EventID],
+		eventOutboxBrokerRecord(marker, 0, 1)))
+
+	// Kafka leg done, HTTP leg outstanding. Not terminal, but on the topic — so it counts.
+	_, err = ds.MarkEventWebhookPending(ctx, pending.ID, tokens[pending.EventID],
+		"queue unreachable", time.Minute, eventOutboxBrokerRecord(marker, 1, 2))
+	require.NoError(t, err)
+
+	// Published, acknowledged, but the library reported no coordinate.
+	require.NoError(t, ds.MarkEventDispatched(ctx, unconfirmed.ID, tokens[unconfirmed.EventID],
+		model.BrokerRecord{}))
+
+	after, err := ds.AuditTerminalEventRecords(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(3), after.PublishedRows-before.PublishedRows,
+		"the dispatched, the webhook_pending and the unconfirmed rows all claim a record; the "+
+			"untouched row (%d) does not", untouched.ID)
+	assert.Equal(t, int64(2), after.ConfirmedRows-before.ConfirmedRows,
+		"only the two rows carrying a coordinate name a record")
+	assert.Equal(t, int64(2), after.DistinctRecords-before.DistinctRecords,
+		"and those two coordinates are distinct")
+
+	// The verdict this produces is the whole point: an unconfirmed claim makes it inconclusive
+	// rather than green, however favourable the totals look.
+	assert.False(t, after.FullyConfirmed(),
+		"one row claims a publication it cannot name a record for, so the count is not trustworthy")
 }

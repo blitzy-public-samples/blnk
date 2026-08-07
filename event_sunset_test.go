@@ -56,7 +56,46 @@ func storeSunsetDate(t *testing.T, raw string) {
 	})
 
 	sunsetParseWarnings.reset()
+	startParseWarnings.reset()
 	config.ConfigStore.Store(&config.Configuration{WebhookDeprecationSunsetDate: raw})
+}
+
+// storeDeprecationWindow publishes BOTH ends of the dual-delivery window for one test and
+// restores whatever was there before.
+//
+// It exists because the window predicate reads both ends, so a test that set only the sunset
+// would be asserting against a start DERIVED as sunset minus 30 days — which is correct
+// behaviour and a confusing fixture: a sunset far in the future then places "now" BEFORE the
+// window rather than inside it, and a test meaning "the window is open" would silently be
+// testing "the window has not opened".
+//
+// The pair is written verbatim rather than validated here. config refuses a window that is
+// not exactly 30 days when it LOADS one; this writes to the store directly, exactly as
+// storeSunsetDate does, so a test can also pin a deliberately inconsistent pair.
+//
+// Parameters:
+//   - t *testing.T: the test, for the restore.
+//   - start time.Time: the instant the window opens.
+//   - sunset time.Time: the instant it closes.
+func storeDeprecationWindow(t *testing.T, start, sunset time.Time) {
+	t.Helper()
+
+	previous := config.ConfigStore.Load()
+	t.Cleanup(func() {
+		if previous != nil {
+			config.ConfigStore.Store(previous)
+
+			return
+		}
+		config.ConfigStore.Store(&config.Configuration{})
+	})
+
+	sunsetParseWarnings.reset()
+	startParseWarnings.reset()
+	config.ConfigStore.Store(&config.Configuration{
+		WebhookDeprecationStartDate:  start.UTC().Format(time.RFC3339),
+		WebhookDeprecationSunsetDate: sunset.UTC().Format(time.RFC3339),
+	})
 }
 
 // restoreFetchConfiguration snapshots the package's configuration seam and puts it
@@ -521,9 +560,11 @@ func TestWebhookSunsetPassed_BothConsumersFlipAtTheSameInstant(t *testing.T) {
 
 	sunset := mustParseSunset(t, raw)
 
-	// The relay's dual-delivery branch: legacy delivery continues for exactly as long
-	// as the sunset has not passed.
-	relayDualDelivers := func(now time.Time) bool { return !WebhookSunsetPassed(now) }
+	// The relay's dual-delivery branch, through the predicate the relay ACTUALLY calls
+	// rather than a negation composed here. Only the sunset is configured, so the window
+	// start is derived as sunset minus 30 days — which is why the earliest probe below sits
+	// exactly on the start rather than before it.
+	relayDualDelivers := WebhookDualDeliveryActive
 	// The API guard's decision: the deprecated webhook routes answer 410 Gone from the
 	// sunset instant onwards.
 	webhookRoutesAreGone := func(now time.Time) bool { return WebhookSunsetPassed(now) }
@@ -656,15 +697,25 @@ var sunsetRawDateReaders = map[string]struct{}{
 	"config/config.go": {},
 }
 
-// sunsetRawDateFieldIdent is the configuration field holding the raw value.
-const sunsetRawDateFieldIdent = "WebhookDeprecationSunsetDate"
+// sunsetRawDateFieldIdents are the configuration fields holding the raw window values.
+//
+// BOTH ends are covered, not only the sunset. The window is a span, and requirement R-12
+// is about its length: a file that read the start date and compared it itself would be a
+// second decision about when dual delivery runs, which is the same divergence single
+// ownership of the sunset exists to prevent.
+var sunsetRawDateFieldIdents = []string{
+	"WebhookDeprecationSunsetDate",
+	"WebhookDeprecationStartDate",
+}
 
-// sunsetRawDateLiterals are the string spellings through which the raw value can be
-// reached without naming the field: the environment variable, and the JSON key a
+// sunsetRawDateLiterals are the string spellings through which the raw values can be
+// reached without naming the fields: the environment variables, and the JSON keys a
 // hand-rolled decode of blnk.json would use.
 var sunsetRawDateLiterals = []string{
 	"WEBHOOK_DEPRECATION_SUNSET_DATE",
 	"webhook_deprecation_sunset_date",
+	"WEBHOOK_DEPRECATION_START_DATE",
+	"webhook_deprecation_start_date",
 }
 
 // sunsetScanSkipDirs are directories holding no first-party source.
@@ -746,11 +797,13 @@ func TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead(t *testing.T) {
 		ast.Inspect(parsed, func(node ast.Node) bool {
 			switch typed := node.(type) {
 			case *ast.Ident:
-				if typed.Name == sunsetRawDateFieldIdent {
-					findings[relative] = append(findings[relative], fmt.Sprintf(
-						"reads the %s field at line %d",
-						sunsetRawDateFieldIdent, fset.Position(typed.Pos()).Line,
-					))
+				for _, field := range sunsetRawDateFieldIdents {
+					if typed.Name == field {
+						findings[relative] = append(findings[relative], fmt.Sprintf(
+							"reads the %s field at line %d",
+							field, fset.Position(typed.Pos()).Line,
+						))
+					}
 				}
 			case *ast.BasicLit:
 				if typed.Kind != token.STRING {
@@ -779,11 +832,256 @@ func TestWebhookSunsetDecision_IsTheOnlyPlaceTheRawDateIsRead(t *testing.T) {
 
 	for file, places := range findings {
 		t.Errorf(
-			"%s reads the raw webhook sunset date (%s). The sunset is a single decision "+
-				"point: call WebhookSunsetPassed, WebhookSunsetPassedNow or WebhookSunsetDate "+
-				"instead, so the relay's dual-delivery branch and the API's 410 Gone guard "+
-				"can never disagree about when the sunset happens.",
+			"%s reads a raw webhook deprecation date (%s). The window is a single decision "+
+				"point: call WebhookSunsetPassed, WebhookSunsetPassedNow, WebhookSunsetDate, "+
+				"WebhookDualDeliveryActive or WebhookDualDeliveryWindowState instead, so the "+
+				"relay's dual-delivery branch and the API's 410 Gone guard can never disagree "+
+				"about when the window opens or closes.",
 			file, strings.Join(places, "; "),
 		)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The dual-delivery window — both ends of it
+// ---------------------------------------------------------------------------
+
+// TestWebhookDualDeliveryWindowState_PlacesAnInstantInTheWindow pins all four states and
+// both boundaries.
+//
+// The window is the half-open interval [start, sunset): the start instant is INSIDE and the
+// sunset instant is OUTSIDE. That asymmetry is what makes the span exactly the configured
+// number of days rather than a day either side of it, and both edges are asserted to the
+// nanosecond because an off-by-one here is a day of the wrong behaviour on the one day
+// anybody is watching.
+func TestWebhookDualDeliveryWindowState_PlacesAnInstantInTheWindow(t *testing.T) {
+	start := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	sunset := start.Add(config.WebhookDualDeliveryWindow())
+	storeDeprecationWindow(t, start, sunset)
+
+	for _, probe := range []struct {
+		name  string
+		now   time.Time
+		want  WebhookWindowState
+		about string
+	}{
+		{
+			name:  "long before the start",
+			now:   start.Add(-30 * 24 * time.Hour),
+			want:  WebhookWindowPending,
+			about: "a window that has not opened is a misconfiguration, not a phase",
+		},
+		{
+			name:  "one nanosecond before the start",
+			now:   start.Add(-time.Nanosecond),
+			want:  WebhookWindowPending,
+			about: "the start boundary must be exact",
+		},
+		{
+			name:  "at the start instant",
+			now:   start,
+			want:  WebhookWindowActive,
+			about: "the start instant is INSIDE the window: the interval is half-open at the far end only",
+		},
+		{
+			name:  "midway through",
+			now:   start.Add(15 * 24 * time.Hour),
+			want:  WebhookWindowActive,
+			about: "the ordinary state during the migration",
+		},
+		{
+			name:  "one nanosecond before the sunset",
+			now:   sunset.Add(-time.Nanosecond),
+			want:  WebhookWindowActive,
+			about: "dual delivery runs up to, but not including, the sunset instant",
+		},
+		{
+			name:  "at the sunset instant",
+			now:   sunset,
+			want:  WebhookWindowClosed,
+			about: "the sunset instant is the first moment of the post-sunset era",
+		},
+		{
+			name:  "long after the sunset",
+			now:   sunset.Add(30 * 24 * time.Hour),
+			want:  WebhookWindowClosed,
+			about: "and it stays closed",
+		},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			assert.Equal(t, probe.want, WebhookDualDeliveryWindowState(probe.now), probe.about)
+			assert.Equal(t, probe.want == WebhookWindowActive, WebhookDualDeliveryActive(probe.now),
+				"the boolean predicate must agree with the four-valued one; two answers could diverge")
+		})
+	}
+}
+
+// TestWebhookDualDeliveryActive_ConsumesTheConfiguredStartDate is the regression guard on the
+// defect this predicate exists to fix.
+//
+// WEBHOOK_DEPRECATION_START_DATE was resolved and validated by configuration and then read by
+// NOTHING: every decision looked at the sunset alone. A deployment whose relay began
+// publishing weeks before its declared start therefore ran both transports for weeks longer
+// than the 30 days its own configuration described, and no code disagreed with it.
+//
+// The two windows below share a sunset and differ only in their start, so the verdict can
+// only differ if the start is genuinely consulted.
+func TestWebhookDualDeliveryActive_ConsumesTheConfiguredStartDate(t *testing.T) {
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	sunset := now.Add(15 * 24 * time.Hour)
+
+	storeDeprecationWindow(t, now.Add(-15*24*time.Hour), sunset)
+	require.True(t, WebhookDualDeliveryActive(now),
+		"a start already past, with the sunset ahead, is the middle of the window")
+
+	// SAME sunset, a start that has not arrived. If the start were ignored this would still
+	// answer true, which is exactly the behaviour being guarded against.
+	storeDeprecationWindow(t, now.Add(24*time.Hour), sunset)
+	assert.False(t, WebhookDualDeliveryActive(now),
+		"the configured start must be consulted, or the window is not the 30 days it claims to be")
+	assert.Equal(t, WebhookWindowPending, WebhookDualDeliveryWindowState(now))
+
+	// And the sunset predicate is unaffected: a route's availability is a function of the
+	// sunset alone, so a window that has not opened must NOT make the routes answer 410 —
+	// they are still serving webhook management calls for a transport still in use.
+	assert.False(t, WebhookSunsetPassed(now),
+		"the 410 guard must key on the sunset alone; refusing calls before the window opened "+
+			"would break a transport that is still live")
+}
+
+// TestWebhookDualDeliveryWindowState_DerivesTheStartWhenOnlyTheSunsetIsConfigured asserts the
+// window is computable from either end alone.
+//
+// config.Configuration back-fills the start from the sunset when only the sunset is supplied,
+// and this reproduces that rule for a configuration published some other way — a test, or a
+// future reload path. Without the derivation such a configuration would have a window with no
+// beginning, and the state of any instant in it would be undefined.
+func TestWebhookDualDeliveryWindowState_DerivesTheStartWhenOnlyTheSunsetIsConfigured(t *testing.T) {
+	sunset := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	storeSunsetDate(t, sunset.Format(time.RFC3339))
+
+	derivedStart := sunset.Add(-config.WebhookDualDeliveryWindow())
+
+	assert.Equal(t, WebhookWindowActive, WebhookDualDeliveryWindowState(derivedStart),
+		"the derived start must be inside the window, exactly as a configured one is")
+	assert.Equal(t, WebhookWindowPending, WebhookDualDeliveryWindowState(derivedStart.Add(-time.Nanosecond)),
+		"and one nanosecond earlier must be outside it")
+	assert.Equal(t, WebhookWindowClosed, WebhookDualDeliveryWindowState(sunset))
+
+	start, resolvedSunset, ok := WebhookDeprecationWindow()
+	require.True(t, ok, "a configured sunset must resolve a describable window")
+	assert.Equal(t, derivedStart, start, "the described start must be the derived one")
+	assert.Equal(t, sunset, resolvedSunset)
+}
+
+// TestWebhookDualDeliveryWindowState_MalformedOrAbsentWindowIsUnavailable covers the state
+// that is neither inside nor outside a window, because there is no usable window at all.
+//
+// Both spellings resolve the same way and both fail closed for the legacy leg: an
+// unparseable window cannot be trusted to say the sunset has not passed, and enqueuing onto a
+// transport that may already be retired is worse than not enqueuing.
+func TestWebhookDualDeliveryWindowState_MalformedOrAbsentWindowIsUnavailable(t *testing.T) {
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+
+	for name, raw := range map[string]string{
+		"no window at all":      "",
+		"an unparseable sunset": "definitely-not-a-date",
+	} {
+		t.Run(name, func(t *testing.T) {
+			storeSunsetDate(t, raw)
+
+			assert.Equal(t, WebhookWindowUnavailable, WebhookDualDeliveryWindowState(now))
+			assert.False(t, WebhookDualDeliveryActive(now),
+				"with no usable window the legacy leg must not run")
+
+			_, _, ok := WebhookDeprecationWindow()
+			assert.False(t, ok, "and there is nothing to describe")
+		})
+	}
+}
+
+// TestWebhookDualDeliveryWindowState_MalformedStartFallsBackToTheDerivedStart asserts a
+// mis-typed start date does not take the window with it.
+//
+// A malformed START is recoverable in a way a malformed SUNSET is not: the sunset determines
+// the window's length, so the start can be re-derived from it exactly as configuration does.
+// Falling back is therefore strictly better than failing closed here — it keeps delivering to
+// unmigrated subscribers — and the warning is what stops it being silent.
+func TestWebhookDualDeliveryWindowState_MalformedStartFallsBackToTheDerivedStart(t *testing.T) {
+	hook := logtest.NewGlobal()
+	defer hook.Reset()
+
+	sunset := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	previous := config.ConfigStore.Load()
+	t.Cleanup(func() {
+		if previous != nil {
+			config.ConfigStore.Store(previous)
+
+			return
+		}
+		config.ConfigStore.Store(&config.Configuration{})
+	})
+	sunsetParseWarnings.reset()
+	startParseWarnings.reset()
+	config.ConfigStore.Store(&config.Configuration{
+		WebhookDeprecationStartDate:  "the-first-of-march",
+		WebhookDeprecationSunsetDate: sunset.Format(time.RFC3339),
+	})
+
+	derivedStart := sunset.Add(-config.WebhookDualDeliveryWindow())
+
+	assert.Equal(t, WebhookWindowActive, WebhookDualDeliveryWindowState(derivedStart.Add(time.Hour)),
+		"a malformed start must fall back to the derived one rather than voiding the window")
+
+	var warned bool
+	for _, entry := range hook.AllEntries() {
+		if entry.Level == logrus.WarnLevel &&
+			strings.Contains(entry.Message, "webhook_deprecation_start_date is not a valid RFC3339 instant") {
+			warned = true
+
+			break
+		}
+	}
+	assert.True(t, warned, "the malformed start must be warned about, or the fallback is silent")
+}
+
+// TestWebhookWindowPendingObstacle_ExplainsOnlyThePendingState asserts the refusal message a
+// process starts up with, and that it is produced for that state only.
+//
+// The message lives in this file because this file owns the window's vocabulary; a caller
+// composing it would be a second place that knew what the configured dates are called, which
+// the raw-read invariant rightly rejects.
+func TestWebhookWindowPendingObstacle_ExplainsOnlyThePendingState(t *testing.T) {
+	start := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	sunset := start.Add(config.WebhookDualDeliveryWindow())
+	storeDeprecationWindow(t, start, sunset)
+
+	err := WebhookWindowPendingObstacle(WebhookWindowPending)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), start.Format(time.RFC3339),
+		"the message must name when the window opens")
+	assert.Contains(t, err.Error(), sunset.Format(time.RFC3339),
+		"and when it closes, so an operator can see the span they configured")
+	assert.Contains(t, err.Error(), "WEBHOOK_DEPRECATION_START_DATE",
+		"and the variable to correct, or the message is not actionable")
+
+	for _, state := range []WebhookWindowState{
+		WebhookWindowActive, WebhookWindowClosed, WebhookWindowUnavailable,
+	} {
+		assert.NoError(t, WebhookWindowPendingObstacle(state),
+			"%s is not an obstacle: only a window that has not opened is", state)
+	}
+}
+
+// TestWebhookWindowState_StringNamesEveryState keeps the log-field spellings stable.
+//
+// The value is written into the relay's batch log line and into assertions, so a rename
+// would silently change what operators grep for.
+func TestWebhookWindowState_StringNamesEveryState(t *testing.T) {
+	assert.Equal(t, "active", WebhookWindowActive.String())
+	assert.Equal(t, "pending", WebhookWindowPending.String())
+	assert.Equal(t, "closed", WebhookWindowClosed.String())
+	assert.Equal(t, "unavailable", WebhookWindowUnavailable.String())
+	assert.Equal(t, "unknown", WebhookWindowState(99).String(),
+		"an unforeseen value must render legibly rather than as a bare integer")
 }

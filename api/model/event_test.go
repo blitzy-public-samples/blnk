@@ -64,6 +64,11 @@ func derivedReference(t *testing.T) string {
 // unintended grant, and the wildcard case is the one that matters most: Kafka reads
 // the resource name "*" as matching every resource, so a single such entry converts
 // a per-topic grant into a cluster-wide one.
+//
+// The three TENANT category topics are accepted. What is refused is every DEAD-LETTER
+// name — those carry failure metadata and other subscribers' failed events, and are read
+// under the master key instead — and blnk.system, for the reason set out at the system
+// subtest below.
 func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *testing.T) {
 	grantable := model.SubscriberGrantableTopics(testTopicPrefix)
 	require.NotEmpty(t, grantable, "there must be at least one grantable topic to test against")
@@ -84,9 +89,7 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 		"a prefixed wildcard":           "blnk.transactions*",
 		"a foreign topic of same shape": "attacker.transactions",
 		"a dead-letter topic":           "blnk.transactions.dlt",
-		"the system category":           "blnk.system",
 		"the system dead-letter topic":  "blnk.system.dlt",
-		"the quarantine category":       "blnk.quarantine",
 		"a topic under another prefix":  "acme.transactions",
 		"an untrimmed grantable name":   " blnk.transactions ",
 		"an uppercased category":        "blnk.TRANSACTIONS",
@@ -99,6 +102,45 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 				"the error must say why, so an operator is not left guessing")
 		})
 	}
+
+	// THE SYSTEM CATEGORY IS REFUSED, and the argument against refusing it deserves stating
+	// because it is a reasonable one: blnk.system carries ledger.created and system.error, two
+	// of the thirteen event types the legacy HTTP transport delivered, so a subscriber granted
+	// nothing here has no authorized path to either.
+	//
+	// It is refused anyway, because THE LEGACY TRANSPORT'S AUDIENCE WAS NOT SUBSCRIBERS. There
+	// was one globally configured webhook URL — the operator's own endpoint — so "the legacy
+	// transport delivered it" says only that the OPERATOR received it. Granting blnk.system to
+	// a credential is a different act entirely: system.error's payload is the frozen legacy
+	// body, which carries the raw error text verbatim, and that text describes the inside of
+	// the deployment — a PostgreSQL error names schema, table, column and routine; a broker
+	// error names internal addresses. On a topic shared by every subscriber, each one would
+	// receive every other one's failures, in a category no per-tenant boundary applies to.
+	//
+	// R-1 is a PUBLISHING requirement and it is met in full: all thirteen event types are
+	// published, and blnk.system is read under the master key like the dead-letter topics.
+	// ledger.created is the honest casualty of sharing a category with operator diagnostics.
+	t.Run("refuses the system category", func(t *testing.T) {
+		err := validateGrantableTopics([]string{"blnk.system"}, testTopicPrefix)
+		require.Error(t, err,
+			"blnk.system is internal: its system.error payload carries raw error text describing "+
+				"the deployment, and one shared topic would hand every subscriber every other "+
+				"subscriber's failures")
+		assert.Contains(t, err.Error(), "not grantable")
+	})
+
+	t.Run("the grantable set is exactly the three tenant categories", func(t *testing.T) {
+		// Stated as an EXACT set rather than as a series of accept/refuse cases, because
+		// every over-grant finding in this area reduces to the same question — which topics
+		// may a credential ever name — and a boundary is only checkable if it is enumerated
+		// in one place. A new category that is grantable by default would fail here, which is
+		// the point.
+		assert.ElementsMatch(t,
+			[]string{"blnk.transactions", "blnk.balances", "blnk.identities"},
+			model.SubscriberGrantableTopics(testTopicPrefix),
+			"only tenant-facing categories are grantable; system and every dead-letter topic "+
+				"are read under the master key")
+	})
 
 	t.Run("refuses an offending topic anywhere in the list", func(t *testing.T) {
 		// A loop that returned on the first valid entry, or that only checked
@@ -132,26 +174,30 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 }
 
 // ---------------------------------------------------------------------------
-// SEC-01 / SEC-03 — the advisory key prefix
+// SEC-01 / SEC-03 — the recorded key-scoped authorization
 // ---------------------------------------------------------------------------
 
-// TestValidateAdvisoryKeyPrefix_RefusesUnstorableValues covers the filter hint.
+// TestValidateSubscriberKeyScope_RefusesUnstorableValues covers the recorded key scope.
 //
-// The value grants nothing, so these rules are about what the string does after it
-// is stored: it is echoed into API responses, log lines and trace attributes, and a
-// newline in it forges a second log entry.
-func TestValidateAdvisoryKeyPrefix_RefusesUnstorableValues(t *testing.T) {
-	assert.NoError(t, validateAdvisoryKeyPrefix(""), "no filter suggested is legitimate")
-	assert.NoError(t, validateAdvisoryKeyPrefix("ldg_9f1c8a72"))
+// The value grants nothing at the broker — Kafka's authorizer has no message-key
+// dimension, so recording one makes the subscriber UNPROVISIONABLE and issuance
+// refuses it. These rules are therefore about the string being storable and
+// displayable, not about isolation: it is echoed into API responses, log lines and
+// trace attributes, and a newline in it forges a second log entry.
+func TestValidateSubscriberKeyScope_RefusesUnstorableValues(t *testing.T) {
+	assert.NoError(t, validateSubscriberKeyScope(""),
+		"recording no key scope is the only state a credential can be issued in")
+	assert.NoError(t, validateSubscriberKeyScope("ldg_9f1c8a72"),
+		"a storable value is accepted here; issuance is what refuses it")
 
-	assert.Error(t, validateAdvisoryKeyPrefix("ldg_9f1c\n8a72"), "a newline forges a log entry")
-	assert.Error(t, validateAdvisoryKeyPrefix("ldg\r8a72"), "a carriage return overwrites a line")
-	assert.Error(t, validateAdvisoryKeyPrefix("ldg\x008a72"), "a NUL truncates C-side consumers")
-	assert.Error(t, validateAdvisoryKeyPrefix("ldg\x7f"), "DEL is a control character too")
-	assert.Error(t, validateAdvisoryKeyPrefix(" ldg_9f1c "),
-		"surrounding whitespace makes a consumer's prefix comparison match nothing, invisibly")
-	assert.Error(t, validateAdvisoryKeyPrefix(strings.Repeat("k", maxAdvisoryKeyPrefixLen+1)))
-	assert.NoError(t, validateAdvisoryKeyPrefix(strings.Repeat("k", maxAdvisoryKeyPrefixLen)),
+	assert.Error(t, validateSubscriberKeyScope("ldg_9f1c\n8a72"), "a newline forges a log entry")
+	assert.Error(t, validateSubscriberKeyScope("ldg\r8a72"), "a carriage return overwrites a line")
+	assert.Error(t, validateSubscriberKeyScope("ldg\x008a72"), "a NUL truncates C-side consumers")
+	assert.Error(t, validateSubscriberKeyScope("ldg\x7f"), "DEL is a control character too")
+	assert.Error(t, validateSubscriberKeyScope(" ldg_9f1c "),
+		"surrounding whitespace makes a prefix comparison match nothing, invisibly")
+	assert.Error(t, validateSubscriberKeyScope(strings.Repeat("k", maxSubscriberKeyScopeLen+1)))
+	assert.NoError(t, validateSubscriberKeyScope(strings.Repeat("k", maxSubscriberKeyScopeLen)),
 		"the bound itself must be accepted, or the limit is off by one")
 }
 
@@ -239,14 +285,14 @@ func TestValidateLegacyWebhookURL_EnforcesTheDestinationPolicy(t *testing.T) {
 // "not allowed" sends an operator looking for a policy document; naming the metadata
 // endpoint tells them what they just pointed Blnk at.
 func TestInternalWebhookDestinationReason_ExplainsRatherThanRefuses(t *testing.T) {
-	assert.Contains(t, internalWebhookDestinationReason("169.254.169.254"), "metadata")
-	assert.Contains(t, internalWebhookDestinationReason("127.0.0.1"), "loopback")
-	assert.Contains(t, internalWebhookDestinationReason("10.1.2.3"), "private")
-	assert.Contains(t, internalWebhookDestinationReason("postgres"), "unqualified")
+	assert.Contains(t, model.InternalDestinationReason("169.254.169.254"), "metadata")
+	assert.Contains(t, model.InternalDestinationReason("127.0.0.1"), "loopback")
+	assert.Contains(t, model.InternalDestinationReason("10.1.2.3"), "private")
+	assert.Contains(t, model.InternalDestinationReason("postgres"), "unqualified")
 
-	assert.Empty(t, internalWebhookDestinationReason("hooks.example.com"),
+	assert.Empty(t, model.InternalDestinationReason("hooks.example.com"),
 		"an external name must produce no reason at all")
-	assert.Empty(t, internalWebhookDestinationReason("93.184.216.34"))
+	assert.Empty(t, model.InternalDestinationReason("93.184.216.34"))
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +397,7 @@ func TestCreateSubscriber_Validate(t *testing.T) {
 		assert.Error(t, request.Validate(testTopicPrefix))
 	})
 
-	t.Run("refuses a hostile advisory prefix", func(t *testing.T) {
+	t.Run("refuses an unstorable key scope", func(t *testing.T) {
 		request := valid
 		request.PartitionKeyPrefix = "ldg\n_9f1c"
 		assert.Error(t, request.Validate(testTopicPrefix))

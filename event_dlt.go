@@ -261,23 +261,204 @@ type DeadLetterOutcome struct {
 // large and is already durable in the outbox row, so logging it would bloat the log
 // without adding anything an operator cannot fetch.
 //
+// # Two fields are deliberately not what the outcome holds
+//
+// THE PARTITION KEY IS HASHED. It is derived from a balance, transaction or identity
+// identifier, so emitting it raw copies a financial identifier into the log stream —
+// which is shipped off the host, retained on its own schedule and readable by a wider
+// set of people than may query the ledger. What a log needs from the key is that the
+// same key always renders the same token, so two lines can be recognised as belonging to
+// one aggregate; hashLogIdentifier keeps exactly that. The same treatment the publisher
+// already applies to its own log line, and for the same reason.
+//
+// THE FAILURE REASON IS CLASSIFIED **AND** BOUNDED, and both fields are present because
+// they answer different questions.
+//
+// failure_class is one value from a fixed vocabulary. It is what a log query groups on and
+// what turns "dead letters are rising" into "look at the cluster" or "look at the
+// principal's grants", and being closed it can do that without unbounded cardinality.
+//
+// error_reason is the broker's or the driver's own words, and removing it entirely was the
+// wrong trade: "broker_unavailable" does not distinguish a broken pipe from a leaderless
+// partition, so an operator reading the class alone still has to go and fetch the text
+// before they can act — at exactly the moment the broker they would fetch it through is the
+// thing that is broken. What made the raw value unsuitable is real, though: a kafka-go error
+// surfaces broker hostnames and ports through *net.OpError, its length is bounded by
+// nothing, and a newline in it forges a second entry in a line-oriented aggregator.
+//
+// So it is SANITIZED rather than dropped — control characters removed, newlines folded to
+// spaces, and the result capped with a visible truncation marker — which is the same
+// treatment internal/notification applies to a system error's text for the same reasons.
+// The verbatim, unbounded value stays where it is already protected and where triage can
+// still reach it: the dead-lettered message's failure_metadata, which the dead-letter API
+// returns, and the row's last_error.
+//
 // Returns:
 //   - logrus.Fields: a fresh map the caller may extend.
 func (o DeadLetterOutcome) LogFields() logrus.Fields {
 	return logrus.Fields{
-		"event_id":          o.EventID,
-		"event_type":        o.EventType,
-		"topic":             o.OriginalTopic,
-		"dlt_topic":         o.DeadLetterTopic,
-		"partition_key":     o.PartitionKey,
-		"attempt_count":     o.Metadata.AttemptCount,
-		"error_reason":      o.Metadata.ErrorReason,
-		"published":         o.Published,
-		"status":            string(o.Status),
-		"message_bytes":     len(o.Message),
-		"first_attempted":   o.Metadata.FirstAttemptedAt.Format(time.RFC3339Nano),
-		"last_attempted_at": o.Metadata.LastAttemptedAt.Format(time.RFC3339Nano),
+		"event_id":           o.EventID,
+		"event_type":         o.EventType,
+		"topic":              o.OriginalTopic,
+		"dlt_topic":          o.DeadLetterTopic,
+		"partition_key_hash": hashLogIdentifier(o.PartitionKey),
+		"attempt_count":      o.Metadata.AttemptCount,
+		"failure_class":      classifyDeadLetterFailure(o.Metadata.ErrorReason),
+		"error_reason":       sanitizeLogValue(o.Metadata.ErrorReason, maxLoggedErrorLength),
+		"published":          o.Published,
+		"status":             string(o.Status),
+		"message_bytes":      len(o.Message),
+		"first_attempted":    o.Metadata.FirstAttemptedAt.Format(time.RFC3339Nano),
+		"last_attempted_at":  o.Metadata.LastAttemptedAt.Format(time.RFC3339Nano),
 	}
+}
+
+// The dead-letter failure vocabulary. It is FIXED and small, which is what makes it
+// loggable: every value is bounded in length, contains no data from the failure itself,
+// and can be grouped on in a log query or turned into a metric label without unbounded
+// cardinality.
+//
+// The classes are chosen to answer the only question a log line has to answer, which is
+// where to look next. Broker, authorisation, size and serialisation failures each send
+// an operator somewhere different, and that is the whole value of the distinction — the
+// exact text belongs in the dead-letter record, not here.
+const (
+	// deadLetterFailureClassBroker is the common case: the broker was unreachable,
+	// leaderless, under-replicated, or timed out. Look at the cluster.
+	deadLetterFailureClassBroker = "broker_unavailable"
+
+	// deadLetterFailureClassAuth is a credential or ACL rejection. Look at the
+	// principal's grants, not at the cluster's health.
+	deadLetterFailureClassAuth = "authorization_denied"
+
+	// deadLetterFailureClassTooLarge is a message the broker or Blnk refused on size.
+	// Look at the producer's payload; retrying will not help.
+	deadLetterFailureClassTooLarge = "message_too_large"
+
+	// deadLetterFailureClassSerialization is a payload that would not serialise, or a
+	// topic that could not be resolved. A defect, not a transient condition.
+	deadLetterFailureClassSerialization = "serialization"
+
+	// deadLetterFailureClassClosed is a publish attempted through a closed transport,
+	// which means the process was shutting down.
+	deadLetterFailureClassClosed = "transport_closed"
+
+	// deadLetterFailureClassNone is "no reason was recorded". Distinct from
+	// unclassified: it means the row carried nothing, which is itself a defect worth
+	// seeing rather than a reason this function failed to place.
+	deadLetterFailureClassNone = "unrecorded"
+
+	// deadLetterFailureClassOther is everything else. It exists so the vocabulary stays
+	// closed; a rising count here is the signal that a class is missing.
+	deadLetterFailureClassOther = "other"
+)
+
+// deadLetterFailureSignatures maps a lower-cased substring of a recorded reason onto its
+// class, in priority order.
+//
+// Substring matching, because the reason is a STRING by the time it reaches here — the
+// error value itself was consumed when the failure was recorded, possibly in another
+// process on an earlier claim, so errors.As is not available. The order matters: the
+// authorisation signatures are tested before the generic connection ones, because a
+// SASL failure reported as a connection error would otherwise be filed as a broker
+// outage and send an operator to the wrong place entirely.
+var deadLetterFailureSignatures = []struct {
+	signature string
+	class     string
+}{
+	{"sasl", deadLetterFailureClassAuth},
+	{"authentication", deadLetterFailureClassAuth},
+	{"authorization", deadLetterFailureClassAuth},
+	{"unauthorized", deadLetterFailureClassAuth},
+	{"not authorized", deadLetterFailureClassAuth},
+	{"topic authorization failed", deadLetterFailureClassAuth},
+	{"group authorization failed", deadLetterFailureClassAuth},
+	{"cluster authorization failed", deadLetterFailureClassAuth},
+
+	{"too large", deadLetterFailureClassTooLarge},
+	{"message size", deadLetterFailureClassTooLarge},
+	{"record too large", deadLetterFailureClassTooLarge},
+
+	{"marshal", deadLetterFailureClassSerialization},
+	{"unmarshal", deadLetterFailureClassSerialization},
+	{"serial", deadLetterFailureClassSerialization},
+	// encoding/json prefixes every one of its errors with "json: ", and a JSON error is by
+	// definition a serialisation failure however it is worded. The prefix is a far more
+	// reliable signal than any of its individual messages, none of which contains the word
+	// "marshal" — "json: unsupported type: chan int" being the one that made this obvious.
+	{"json:", deadLetterFailureClassSerialization},
+	{"unsupported type", deadLetterFailureClassSerialization},
+	{"invalid topic", deadLetterFailureClassSerialization},
+	{"unknown topic", deadLetterFailureClassSerialization},
+
+	{"publisher is closed", deadLetterFailureClassClosed},
+	{"closed", deadLetterFailureClassClosed},
+
+	{"connection refused", deadLetterFailureClassBroker},
+	{"no such host", deadLetterFailureClassBroker},
+	{"timeout", deadLetterFailureClassBroker},
+	{"timed out", deadLetterFailureClassBroker},
+	{"deadline exceeded", deadLetterFailureClassBroker},
+	{"broken pipe", deadLetterFailureClassBroker},
+	{"reset by peer", deadLetterFailureClassBroker},
+	{"leader", deadLetterFailureClassBroker},
+	{"not available", deadLetterFailureClassBroker},
+	{"unavailable", deadLetterFailureClassBroker},
+	{"broker", deadLetterFailureClassBroker},
+	{"i/o", deadLetterFailureClassBroker},
+	{"eof", deadLetterFailureClassBroker},
+	{"network", deadLetterFailureClassBroker},
+	{"dial", deadLetterFailureClassBroker},
+	{"refused", deadLetterFailureClassBroker},
+}
+
+// errorText renders an error for classification, and NOTHING ELSE reads its result.
+//
+// It exists so the classifier can be given a live error value on the paths that hold one,
+// without any caller being tempted to log the string it produces. The distinction matters:
+// classifyDeadLetterFailure returns no part of its input, so passing raw error text
+// through it is safe, while passing that same text to a log field would be exactly the
+// exposure this section removes.
+//
+// Parameters:
+//   - err error: the error to render. May be nil.
+//
+// Returns:
+//   - string: the error's message, or "" when there is no error.
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	return err.Error()
+}
+
+// classifyDeadLetterFailure reduces a recorded failure reason to one value from the fixed
+// vocabulary above.
+//
+// It returns a CLASS and never any part of its input, which is the property that makes it
+// safe to log: whatever the broker or the driver wrote — an address, a schema name, a
+// constraint, an arbitrarily long chain of wrapped errors — cannot reach the log stream
+// through this function's return value.
+//
+// Parameters:
+//   - reason string: the recorded failure reason. May be empty.
+//
+// Returns:
+//   - string: one of the deadLetterFailureClass* constants.
+func classifyDeadLetterFailure(reason string) string {
+	if strings.TrimSpace(reason) == "" {
+		return deadLetterFailureClassNone
+	}
+
+	lowered := strings.ToLower(reason)
+	for _, candidate := range deadLetterFailureSignatures {
+		if strings.Contains(lowered, candidate.signature) {
+			return candidate.class
+		}
+	}
+
+	return deadLetterFailureClassOther
 }
 
 // ReplayOutcome is the record of one replay: which event went back to which topic, under
@@ -361,12 +542,18 @@ type DeadLetterListOptions struct {
 	// having to know the suffix convention.
 	Topic string
 
-	// Status narrows to one terminal failure state. Only the two states the inventory
-	// contains are accepted — model.EventOutboxStatusDeadLettered and
-	// model.EventOutboxStatusFailed — and anything else is rejected as a validation
+	// Status narrows to one failure state. Only the three states the inventory contains
+	// are accepted — model.EventOutboxStatusDeadLettered, model.EventOutboxStatusDLTPending
+	// and model.EventOutboxStatusFailed — and anything else is rejected as a validation
 	// error rather than silently matching nothing, because a filter that quietly returns
 	// an empty page reads as "nothing is stuck" and is exactly the wrong answer to give
 	// an operator.
+	//
+	// failed is the most urgent of the three and is filterable for that reason: the retry
+	// budget is spent and, while dlt_topic is still NULL, the dead-letter copy has not
+	// landed, so the event exists nowhere but the outbox row. dlt_pending is the literal an
+	// earlier shape of this feature used for the same state; it is accepted so that a row
+	// left in it is still findable, and nothing writes it now.
 	Status string
 }
 
@@ -410,6 +597,12 @@ type DeadLetterAgeReport struct {
 	// state is on no topic at all, because the dead-letter WRITE itself failed. Collapsing
 	// them into one number makes a broker that is refusing dead-letter writes look exactly
 	// like a busy triage queue.
+	//
+	// It counts BOTH pre-dead-letter literals: failed, which the exhaustion arm sets and in
+	// which the hand-off is still re-claimable while dlt_topic is NULL, and dlt_pending,
+	// the literal an earlier shape of this feature used for the same state. A steadily
+	// non-zero value means dead-letter writes are failing, not that events are momentarily
+	// in flight.
 	FailedAwaitingDeadLetter int64
 
 	// Scanned is how many rows were examined.
@@ -472,13 +665,13 @@ type eventDeadLetterStore interface {
 	// to its dead-lettered terminal state, CONDITIONAL on the caller still holding the
 	// row's claim token. It returns a conflict when the claim has been lost, which is
 	// what stops two workers each writing the event to the dead-letter topic.
-	MarkEventDeadLettered(ctx context.Context, id int64, claimToken, dltTopic string, failureMetadata json.RawMessage) error
+	MarkEventDeadLettered(ctx context.Context, id int64, claimToken, dltTopic string, failureMetadata json.RawMessage, record model.BrokerRecord) error
 
 	// MarkEventDispatched is the post-replay transition: a successfully replayed row
 	// becomes dispatched, which removes it from the dead-letter inventory and makes a
 	// second replay attempt fail closed. It too is conditional on the claim token —
 	// here, the one ClaimEventForReplay issued.
-	MarkEventDispatched(ctx context.Context, id int64, claimToken string) error
+	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error
 
 	// ClaimEventForReplay atomically moves a dead-lettered row to replaying and returns
 	// it with a fresh claim token, so a replay is a CLAIM rather than a read followed by
@@ -747,17 +940,29 @@ func publisherWriterResolver(publisher TopicEventPublisher) deadLetterWriterReso
 // SASL credentials or TLS material cannot be prepared. That is a fatal misconfiguration and
 // must not be silently downgraded to publishing nothing either.
 //
+// # THE MUTEX IS NOT HELD ACROSS CONSTRUCTION
+//
+// NewEventPublisher reads configuration, resolves the SASL mechanism and prepares TLS
+// material — it opens files and can block. Holding the service mutex across that serialised
+// every concurrent caller behind one construction, so a slow or hanging build stalled the
+// relay's dead-letter hand-off, the inventory endpoint's replay and the age-gauge refresh
+// together, on a lock none of them needed.
+//
+// The lock is therefore taken twice and released in between, with a DOUBLE CHECK on the
+// second acquisition. Two callers arriving at once may both build a publisher; the first to
+// install wins and the loser CLOSES the one it built, so nothing is leaked and no caller
+// receives a publisher that is not the service's. That trade — a rare redundant build for a
+// lock that is never held across I/O — is the standard one, and it is the only arrangement
+// in which a hanging build cannot take the rest of the service with it.
+//
 // Returns:
 //   - TopicEventPublisher: the publisher, never nil when the error is nil.
 //   - deadLetterWriterResolver: the resolver, never nil when the error is nil.
 //   - error: a typed ErrKafkaUnavailable when configuration cannot be read or the
 //     publisher cannot be built.
 func (s *EventDeadLetterService) transport() (TopicEventPublisher, deadLetterWriterResolver, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.publisher != nil && s.resolveWriter != nil {
-		return s.publisher, s.resolveWriter, nil
+	if publisher, resolver, ready := s.installedTransport(); ready {
+		return publisher, resolver, nil
 	}
 
 	// fetchConfiguration is the package's configuration seam (declared in
@@ -778,6 +983,7 @@ func (s *EventDeadLetterService) transport() (TopicEventPublisher, deadLetterWri
 		)
 	}
 
+	// Built with NO LOCK HELD. This is the call that can block.
 	publisher, err := NewEventPublisher(cnf)
 	if err != nil {
 		return nil, nil, apierror.NewAPIError(
@@ -791,7 +997,10 @@ func (s *EventDeadLetterService) transport() (TopicEventPublisher, deadLetterWri
 	if !ok {
 		// Unreachable with the implementations in event_publisher.go, both of which
 		// satisfy the fuller contract, and asserted rather than assumed so that a future
-		// implementation which does not cannot fail obscurely at the write.
+		// implementation which does not cannot fail obscurely at the write. Closed here
+		// because this function built it and is not going to install it.
+		closeEventPublisher(publisher)
+
 		return nil, nil, apierror.NewAPIError(
 			apierror.ErrKafkaUnavailable,
 			"The configured event publisher cannot target a dead-letter topic",
@@ -799,11 +1008,98 @@ func (s *EventDeadLetterService) transport() (TopicEventPublisher, deadLetterWri
 		)
 	}
 
-	s.publisher = topicPublisher
-	s.resolveWriter = publisherWriterResolver(topicPublisher)
+	return s.installTransport(topicPublisher)
+}
+
+// closeEventPublisher releases a publisher that was built and then not installed.
+//
+// It exists because construction now happens OUTSIDE the service mutex, which means two
+// callers can legitimately build one at the same time and exactly one of them must throw its
+// away. A publisher that is merely dropped keeps its connection pool and its SASL session for
+// the lifetime of the process, so the discard has to be explicit.
+//
+// Close is only reachable through TopicEventPublisher, so the type assertion is the honest
+// way to attempt it: a publisher that does not expose Close holds nothing to release. The
+// error is logged rather than returned, because the caller is on its way to reporting a
+// different, more informative outcome and a failed close on a publisher nobody will use again
+// must not displace it.
+//
+// Parameters:
+//   - publisher EventPublisher: the publisher to release. May be nil.
+func closeEventPublisher(publisher EventPublisher) {
+	closer, ok := publisher.(interface{ Close() error })
+	if !ok || publisher == nil {
+		return
+	}
+
+	if err := closer.Close(); err != nil {
+		logrus.WithError(err).Warn(
+			"closing a redundantly built dead-letter publisher failed; another caller's publisher " +
+				"is in use and this one is discarded",
+		)
+	}
+}
+
+// installedTransport reports the transport if one is already installed.
+//
+// It is a separate method purely so that the fast path holds the lock for a field read and
+// nothing else, which is what makes "the mutex is never held across construction" a property
+// of the code rather than a comment about it.
+//
+// Returns:
+//   - TopicEventPublisher, deadLetterWriterResolver: the installed transport, or nil.
+//   - bool: true when both are installed and the caller may use them.
+func (s *EventDeadLetterService) installedTransport() (TopicEventPublisher, deadLetterWriterResolver, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.publisher != nil && s.resolveWriter != nil {
+		return s.publisher, s.resolveWriter, true
+	}
+
+	return nil, nil, false
+}
+
+// installTransport publishes a freshly built publisher as the service's, or discards it in
+// favour of one another caller installed first.
+//
+// The double check is the whole point. Between the fast-path read and this call another
+// goroutine may have installed its own, and returning the caller's instead would leave two
+// live publishers with only one of them tracked by Close — a connection-pool and SASL-session
+// leak for the lifetime of the process. The loser is closed here, immediately, while the lock
+// is NOT held for the close: releasing before closing keeps the promise that this mutex never
+// covers I/O.
+//
+// Parameters:
+//   - candidate TopicEventPublisher: the publisher this caller built. Never nil.
+//
+// Returns:
+//   - TopicEventPublisher, deadLetterWriterResolver: the installed transport, which may be
+//     another caller's.
+//   - error: always nil; the signature matches transport's so the caller is one line.
+func (s *EventDeadLetterService) installTransport(
+	candidate TopicEventPublisher,
+) (TopicEventPublisher, deadLetterWriterResolver, error) {
+	s.mu.Lock()
+
+	if s.publisher != nil && s.resolveWriter != nil {
+		installed, resolver := s.publisher, s.resolveWriter
+		s.mu.Unlock()
+
+		// Another caller won. Close ours outside the lock.
+		closeEventPublisher(candidate)
+
+		return installed, resolver, nil
+	}
+
+	s.publisher = candidate
+	s.resolveWriter = publisherWriterResolver(candidate)
 	s.ownsPublisher = true
 
-	return s.publisher, s.resolveWriter, nil
+	installed, resolver := s.publisher, s.resolveWriter
+	s.mu.Unlock()
+
+	return installed, resolver, nil
 }
 
 // Close releases a publisher this service built for itself.
@@ -1040,9 +1336,10 @@ func (s *EventDeadLetterService) PublishToDeadLetter(
 		attribute.Int("event.attempts", metadata.AttemptCount),
 	)
 
-	if err = s.writeDeadLetterMessage(ctx, outcome); err != nil {
+	record, err := s.writeDeadLetterMessage(ctx, outcome)
+	if err != nil {
 		span.RecordError(err)
-		logrus.WithFields(outcome.LogFields()).WithError(err).
+		logrus.WithFields(outcome.LogFields()).WithField("failure_detail_class", classifyDeadLetterFailure(errorText(err))).
 			Error("writing a ledger event to its dead-letter topic failed")
 
 		// The row is deliberately left alone: not marked, not counted. Its status is
@@ -1057,9 +1354,11 @@ func (s *EventDeadLetterService) PublishToDeadLetter(
 	// The claim token travels on the row: the relay put it there when it claimed the
 	// row, and MarkEventFailed retained it on its exhaustion arm precisely so that this
 	// step remains the exclusive property of the worker that spent the last attempt.
-	if err = s.store.MarkEventDeadLettered(ctx, row.ID, row.ClaimToken, dltTopic, metadataJSON); err != nil {
+	if err = s.store.MarkEventDeadLettered(
+		ctx, row.ID, row.ClaimToken, dltTopic, metadataJSON, record,
+	); err != nil {
 		span.RecordError(err)
-		logrus.WithFields(outcome.LogFields()).WithError(err).
+		logrus.WithFields(outcome.LogFields()).WithField("failure_detail_class", classifyDeadLetterFailure(errorText(err))).
 			Error("recording a dead-lettered ledger event on its outbox row failed")
 
 		return outcome, err
@@ -1122,15 +1421,48 @@ func (s *EventDeadLetterService) DeadLetter(
 func (s *EventDeadLetterService) writeDeadLetterMessage(
 	ctx context.Context,
 	outcome DeadLetterOutcome,
-) error {
+) (model.BrokerRecord, error) {
+	// STARTED BEFORE ANY RESOLUTION, so every exit below can be measured. The three failure
+	// exits are the ones an operator most needs on the instruments: a broker refusing every
+	// dead-letter message, or a deployment with no transport at all, must not look like an
+	// empty dead-letter path.
+	started := s.now()
+
+	// EVERY EXIT RECORDS ONE ATTEMPT, and it is attributed to this write rather than to the
+	// retry sequence that led here.
+	//
+	// PublishPurposeDeadLetter is what fixes the attempt label at the `dead_letter` token.
+	// Without the purpose the label is the ORIGINAL attempt count — "5" — which both
+	// misdescribes the observation and drops dead-letter latency into the numeric population
+	// the first-attempt latency target is read against.
+	//
+	// There is no double counting to worry about: the relay's own attempts carry a NUMBER in
+	// that attribute, so a dead-letter write is a distinct label tuple however it turns out.
+	record := func(status model.PublishStatus) {
+		recordPublishAttempt(ctx, PublishResult{
+			Status:       status,
+			Purpose:      PublishPurposeDeadLetter,
+			EventID:      outcome.EventID,
+			EventType:    outcome.EventType,
+			Topic:        outcome.DeadLetterTopic,
+			PartitionKey: outcome.PartitionKey,
+			Attempt:      outcome.Metadata.AttemptCount,
+			Duration:     s.now().Sub(started),
+		})
+	}
+
 	_, resolveWriter, err := s.transport()
 	if err != nil {
-		return err
+		record(model.PublishStatusFailed)
+
+		return model.BrokerRecord{}, err
 	}
 
 	writer, err := resolveWriter(outcome.DeadLetterTopic)
 	if err != nil {
-		return err
+		record(model.PublishStatusFailed)
+
+		return model.BrokerRecord{}, err
 	}
 
 	if writer == nil {
@@ -1153,7 +1485,9 @@ func (s *EventDeadLetterService) writeDeadLetterMessage(
 				"dead-lettering that did not happen",
 		)
 
-		return apierror.NewAPIError(
+		record(model.PublishStatusFailed)
+
+		return model.BrokerRecord{}, apierror.NewAPIError(
 			apierror.ErrKafkaUnavailable,
 			"No Kafka transport is configured, so the event cannot be dead-lettered",
 			fmt.Errorf(
@@ -1163,12 +1497,20 @@ func (s *EventDeadLetterService) writeDeadLetterMessage(
 		)
 	}
 
-	started := s.now()
+	// The carrier the broker's coordinate comes back on. The writers this resolver hands
+	// back are the publisher's own, so completeWrite is already installed on them and fills
+	// this in before WriteMessages returns; a test double that does not call Completion
+	// simply leaves it unconfirmed, which the row then records honestly as unconfirmed.
+	acknowledgement := &publishAcknowledgement{}
+
 	writeErr := writer.WriteMessages(ctx, kafka.Message{
 		// Topic is left empty on purpose: kafka-go rejects a message that names a topic
 		// when the writer already has one, and every writer here is per-topic.
 		Key:   partitionKeyBytes(outcome.PartitionKey),
 		Value: outcome.Message,
+		// Correlates the completion back to THIS write. It never reaches the wire, so byte
+		// fidelity is untouched.
+		WriterData: acknowledgement,
 		// The instant the event was GIVEN UP ON, not the instant it occurred. A
 		// dead-letter message is a new message on a different topic, and its broker
 		// timestamp should say when it arrived there: stamping it with an original
@@ -1183,11 +1525,13 @@ func (s *EventDeadLetterService) writeDeadLetterMessage(
 		// DATA-01: the cause is a KAFKA CLIENT error — quite possibly a *net.OpError naming
 		// the broker's address — so it is logged here and a bounded detail is attached to
 		// the error instead of the cause itself. See EventTransportErrorDetail.
-		logrus.WithFields(outcome.LogFields()).WithError(writeErr).Error(
+		logrus.WithFields(outcome.LogFields()).WithField("failure_detail_class", classifyDeadLetterFailure(errorText(writeErr))).Error(
 			"the Kafka broker did not acknowledge a dead-letter message",
 		)
 
-		return apierror.NewAPIError(
+		record(model.PublishStatusFailed)
+
+		return model.BrokerRecord{}, apierror.NewAPIError(
 			apierror.ErrKafkaUnavailable,
 			"Failed to publish the event to its dead-letter topic",
 			NewEventTransportErrorDetail(
@@ -1197,24 +1541,18 @@ func (s *EventDeadLetterService) writeDeadLetterMessage(
 		)
 	}
 
-	// Recorded only for a write that succeeded, and stamped with the DEAD-LETTERED
-	// outcome rather than dispatched: the broker did accept this message, but the
-	// pipeline-level statement about the event is that it ended its life on a dead-letter
-	// topic. PublishResult.DeadLettered exists for exactly this conversion. A failed
-	// dead-letter write is not recorded as an attempt — the relay already recorded one
-	// attempt per real publish, and the row it leaves in the failed state is what the
-	// inventory and the statistics endpoint report.
-	recordPublishAttempt(ctx, PublishResult{
-		Status:       model.PublishStatusDispatched,
-		EventID:      outcome.EventID,
-		EventType:    outcome.EventType,
-		Topic:        outcome.DeadLetterTopic,
-		PartitionKey: outcome.PartitionKey,
-		Attempt:      outcome.Metadata.AttemptCount,
-		Duration:     s.now().Sub(started),
-	}.DeadLettered())
+	// Stamped with the DEAD-LETTERED outcome rather than dispatched: the broker did accept
+	// this message, but the pipeline-level statement about the event is that it ended its
+	// life on a dead-letter topic.
+	record(model.PublishStatusDeadLettered)
 
-	return nil
+	// The coordinate names the record on the DEAD-LETTER topic, which is where this event's
+	// only surviving copy now lives. Persisting it is what lets an operator triaging the
+	// inventory read the exact record back, and what lets the zero-loss audit account for a
+	// dead-lettered event on the broker side rather than treating its record as surplus.
+	brokerRecord, _ := acknowledgement.coordinate()
+
+	return brokerRecord, nil
 }
 
 // ListDeadLetterEvents pages the dead-letter inventory an operator triages from.
@@ -1580,7 +1918,7 @@ func (s *EventDeadLetterService) ReplayDeadLetteredEvent(
 
 		err = apierror.NewAPIError(code, message, detail)
 		span.RecordError(err)
-		logrus.WithFields(outcome.LogFields()).WithError(publishErr).
+		logrus.WithFields(outcome.LogFields()).WithField("failure_detail_class", classifyDeadLetterFailure(errorText(publishErr))).
 			Error("replaying a dead-lettered ledger event failed")
 		// The publish failed, so the row is owed nothing further and must go back to
 		// dead_lettered — otherwise a failed replay would cost the event its
@@ -1590,7 +1928,9 @@ func (s *EventDeadLetterService) ReplayDeadLetteredEvent(
 		return outcome, err
 	}
 
-	if markErr := s.store.MarkEventDispatched(ctx, row.ID, row.ClaimToken); markErr != nil {
+	if markErr := s.store.MarkEventDispatched(
+		ctx, row.ID, row.ClaimToken, result.Record,
+	); markErr != nil {
 		// The event HAS been republished. The bookkeeping has not, so the row is still
 		// listed as dead-lettered and can be replayed again — a duplicate that the
 		// subscriber's idempotency on the unchanged event id absorbs. An error is returned
@@ -1603,7 +1943,7 @@ func (s *EventDeadLetterService) ReplayDeadLetteredEvent(
 			fmt.Errorf("blnk: marking replayed event %q dispatched: %w", eventID, markErr),
 		)
 		span.RecordError(err)
-		logrus.WithFields(outcome.LogFields()).WithError(markErr).
+		logrus.WithFields(outcome.LogFields()).WithField("failure_detail_class", classifyDeadLetterFailure(errorText(markErr))).
 			Error("a replayed ledger event could not be marked dispatched")
 		// The event IS on the topic but the success transition did not land, so the row
 		// is returned to dead_lettered rather than left in replaying. That keeps the
@@ -1791,16 +2131,43 @@ func (s *EventDeadLetterService) describeUnreplayableEvent(ctx context.Context, 
 // already returning a failure to the caller, and replacing that failure with this
 // one — "the replay failed, and also the rollback failed" collapsed into a single
 // error value — would hide the reason the replay failed in the first place. The
-// rollback failure is logged at error level with the event identity instead, which is
-// what an operator needs to notice a row that may be stuck in replaying until its
-// lease expires.
+// rollback failure is logged at error level with the event identity instead.
+//
+// # It runs on a DETACHED, BOUNDED context
+//
+// The rollback is work the service already owes: the row is held in replaying and the
+// replay is over. Running it on the caller's context makes the most common failure the
+// least recoverable — a request cancelled or timed out mid-replay cancels the rollback
+// too, so the very path most likely to need it is the one where it cannot run.
+//
+// The row is not lost when the rollback fails: the replay claim reclaims a row whose
+// lease has expired, atomically and with a fresh fencing token, so an abandoned claim
+// clears itself. That recovery is the reason this can afford to swallow the error —
+// before the claim enforced the lease it could not, because a failed rollback made the
+// event permanently unreplayable.
+//
+// # IT RUNS ON A DETACHED CONTEXT, and that is what makes it work at all
+//
+// The commonest way a replay fails is the caller's context being cancelled — an operator
+// closing the browser tab, a proxy timing the request out, a rolling deploy taking the
+// process down mid-replay. Running the release on that same context meant the release
+// failed for exactly the reason the replay did, every time, so the row was left in
+// replaying with a token nobody held. The claim's lease was written down and, until
+// ClaimEventForReplay and ReclaimStaleEventReplays began enforcing it, nothing read it.
+//
+// The release is bookkeeping this service already owes, so it is completed on a context
+// detached from the caller's cancellation and bounded by its own timeout — the same
+// treatment the relay gives its own transitions, for the same reason.
 //
 // Parameters:
-//   - ctx context.Context: cancels the release.
+//   - ctx context.Context: used only for its values; cancellation is deliberately not
+//     inherited.
 //   - row *model.EventOutbox: the claimed row, carrying its claim token.
 //   - reason error: why the replay did not complete; recorded in last_error when it
 //     has a message, so the next operator sees the most recent cause rather than the
-//     original publish failure.
+//     original publish failure. It is sanitized and bounded before it is persisted,
+//     because a driver error can carry a broker address, a payload fragment or many
+//     kilobytes of nested detail, and last_error is read back into an API response.
 func (s *EventDeadLetterService) releaseReplayClaim(ctx context.Context, row *model.EventOutbox, reason error) {
 	if row == nil {
 		return
@@ -1808,17 +2175,29 @@ func (s *EventDeadLetterService) releaseReplayClaim(ctx context.Context, row *mo
 
 	var replayErr string
 	if reason != nil {
-		replayErr = reason.Error()
+		replayErr = sanitizeLogValue(reason.Error(), maxLoggedErrorLength)
 	}
 
-	if err := s.store.ReleaseEventReplay(ctx, row.ID, row.ClaimToken, replayErr); err != nil {
+	release, cancel := context.WithTimeout(context.WithoutCancel(ctx), replayReleaseTimeout)
+	defer cancel()
+
+	if err := s.store.ReleaseEventReplay(release, row.ID, row.ClaimToken, replayErr); err != nil {
 		logrus.WithError(err).WithFields(logrus.Fields{
 			"event_id":   row.EventID,
 			"event_type": row.EventType,
 			"dlt_topic":  row.DLTTopic,
-		}).Error("a claimed replay could not be returned to the dead-lettered state; it will clear when its claim lease expires")
+		}).Error(
+			"a claimed replay could not be returned to the dead-lettered state; it clears when its " +
+				"claim lease expires, because the replay claim reclaims an expired claim atomically",
+		)
 	}
 }
+
+// replayReleaseTimeout bounds the detached rollback of a replay claim. One UPDATE, so it
+// matches the relay's bookkeeping budget: long enough for a healthy database, short enough
+// that a database that has gone away cannot hold a request open on work whose failure the
+// claim's own lease recovery already covers.
+const replayReleaseTimeout = 5 * time.Second
 
 // RefreshDeadLetterAgeGauge recomputes and publishes the dead-letter age gauge.
 //
@@ -1895,7 +2274,16 @@ func (s *EventDeadLetterService) RefreshDeadLetterAgeGauge(ctx context.Context) 
 
 	// A status with no rows is absent from the map rather than present with a zero, so
 	// the two-value read is not optional here.
-	report.FailedAwaitingDeadLetter = counts[model.EventOutboxStatusFailed]
+	//
+	// BOTH pre-dead-letter states are counted. failed with no dlt_topic is where a row waits
+	// for its `<topic>.dlt` write, which is what the exhaustion arm sets; dlt_pending is the
+	// literal an earlier shape of this feature wrote for the same thing and nothing writes
+	// now. Counting only one of them would under-report exactly
+	// the population this figure exists to surface — events whose only copy is the outbox
+	// row — and would leave the age scan below skipped whenever every stuck row was in the
+	// uncounted state.
+	report.FailedAwaitingDeadLetter = counts[model.EventOutboxStatusDLTPending] +
+		counts[model.EventOutboxStatusFailed]
 	report.Outstanding = counts[model.EventOutboxStatusDeadLettered] + report.FailedAwaitingDeadLetter
 
 	if report.Outstanding > 0 {
@@ -2191,22 +2579,43 @@ func deadLetterAgedFrom(row model.EventOutbox) time.Time {
 	return row.OccurredAt.UTC()
 }
 
-// deadLetterReason returns the error reason recorded on a dead-lettered event.
+// deadLetterReason returns the error reason recorded on a dead-lettered event, SANITIZED AND
+// BOUNDED.
+//
+// # Why this one is bounded at the point of construction rather than at the point of logging
+//
+// This value does not merely reach a log line. It goes into the failure metadata that is
+// marshaled into the dead-letter MESSAGE on the `<topic>.dlt` topic, and into the row's
+// persisted failure_metadata column that the dead-letter API reads back. So an unbounded value
+// is written three times and kept indefinitely, and a driver error is exactly the shape that
+// abuses that: kafka-go's WriteErrors aggregates one error per message in a batch, so a failed
+// batch of a hundred produces a hundred concatenated errors, and a TLS or DNS failure can carry
+// a broker address and a certificate chain.
+//
+// Three consequences, all of which the bound removes: a dead-letter message that a topic's
+// max.message.bytes could reject — losing the event at precisely the moment it most needed
+// keeping — an API response carrying kilobytes of driver text per entry, and control characters
+// reaching a log aggregator inside a field that came from a remote system.
+//
+// Truncation is safe here because the reason is DIAGNOSTIC. The event's own bytes are preserved
+// verbatim and separately; nothing about replay fidelity depends on this string, and the first
+// few hundred characters of a driver error are where its meaning is.
 //
 // Parameters:
 //   - row model.EventOutbox: the row, whose last_error is the fallback.
 //   - cause error: the caller's failure. May be nil.
 //
 // Returns:
-//   - string: a non-empty reason.
+//   - string: a non-empty, control-character-free reason no longer than
+//     maxLoggedErrorLength.
 func deadLetterReason(row model.EventOutbox, cause error) string {
 	if cause != nil {
-		if reason := strings.TrimSpace(cause.Error()); reason != "" {
+		if reason := sanitizeLogValue(cause.Error(), maxLoggedErrorLength); reason != "" {
 			return reason
 		}
 	}
 
-	if reason := strings.TrimSpace(row.LastError); reason != "" {
+	if reason := sanitizeLogValue(row.LastError, maxLoggedErrorLength); reason != "" {
 		return reason
 	}
 
@@ -2476,14 +2885,19 @@ func normalizeDeadLetterListOptions(opts DeadLetterListOptions) (DeadLetterListO
 	opts.Status = strings.TrimSpace(opts.Status)
 
 	switch opts.Status {
-	case "", model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed:
+	case "",
+		model.EventOutboxStatusDeadLettered,
+		model.EventOutboxStatusDLTPending,
+		model.EventOutboxStatusFailed:
 		return opts, nil
 	default:
 		return opts, apierror.NewAPIError(
 			apierror.ErrGenValidation,
 			fmt.Sprintf(
-				"A dead-letter status filter must be %q or %q",
-				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				"A dead-letter status filter must be %q, %q or %q",
+				model.EventOutboxStatusDeadLettered,
+				model.EventOutboxStatusDLTPending,
+				model.EventOutboxStatusFailed,
 			),
 			fmt.Errorf("blnk: unsupported dead-letter status filter %q", opts.Status),
 		)

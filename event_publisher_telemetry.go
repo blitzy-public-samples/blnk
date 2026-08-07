@@ -78,16 +78,16 @@ const logIdentifierHashLength = 16
 // arriving for the previous name — and one further change on top of it, without a restart.
 //
 // The number is a literal because a const cannot call a function, which makes it exactly the
-// kind of value that goes stale when a category is added: it was 16 when there were four
-// categories, and adding the quarantine category made 16 less than two generations without
-// anything failing. TestMaxLazyTopicWriters_IsTwoPrefixGenerations ties it back to the
-// inventory so the arithmetic is checked rather than trusted.
+// kind of value that goes stale when a category is added or removed — a fifth category would
+// make 16 less than two generations without anything failing.
+// TestMaxLazyTopicWriters_IsTwoPrefixGenerations ties it back to the inventory so the
+// arithmetic is checked rather than trusted.
 //
 // Past the bound the oldest lazily-created writer is retired. Retirement is an eviction and
 // never a refusal: a retired topic published to again simply gets a new writer, so bounding
 // this cache costs at most one reconnection for a topic that has not been used recently, and
 // prevents a pool of connections that only ever grows.
-const maxLazyTopicWriters = 20
+const maxLazyTopicWriters = 16
 
 // PublishPurpose distinguishes the three reasons a message is written, so that one event's
 // telemetry cannot be confused with another's.
@@ -95,10 +95,14 @@ const maxLazyTopicWriters = 20
 // It exists because all three go through the same writer and would otherwise be
 // indistinguishable in the metrics, with two concrete consequences:
 //
-//   - The dead-letter RATE is dead-lettered events over published events, so both have to
-//     count the same population. An operator replaying fifty dead-lettered events would
-//     otherwise add fifty to the published denominator and make the rate depend on how much
-//     triage happened that day.
+//   - The dead-letter RATE divides dead-lettered events by the TOTAL TERMINAL OUTCOMES —
+//     dead-lettered plus published — so both counters have to count the same population,
+//     each event once. An operator replaying fifty dead-lettered events would otherwise add
+//     fifty to the published side of that sum and make the rate depend on how much triage
+//     happened that day. (The denominator is the sum rather than the published count alone
+//     because the two counters are DISJOINT: dividing by successes would report
+//     dead-letters as a fraction of successes, which overstates the rate and diverges
+//     without bound as failures rise. See metrics.EventsPublishedTotal.)
 //   - The latency TARGET is stated for first-attempt original publishes. A replay is attempt
 //     N+1 of an event that already failed five times, and a dead-letter write is not part of
 //     any retry sequence at all; giving either of them a numeric attempt label would extend
@@ -338,9 +342,37 @@ var sharedEventPublisher struct {
 
 // eventPublisherFingerprint digests the configuration a publisher would be built from.
 //
-// Only the fields that change the transport are included, because those are the only ones a
-// rebuild would act on. A separator byte between fields prevents two different
-// configurations from colliding by shifting characters across a boundary.
+// # Every field that changes the TRANSPORT, and why omitting one is a security defect
+//
+// The fingerprint is the cache key: an unchanged digest means the cached publisher — with its
+// existing connections, its existing SASL session and its existing TLS configuration — keeps
+// being handed out. So a transport-affecting field left out of the digest is not merely an
+// optimisation gone wrong; it is a configuration change that NEVER TAKES EFFECT, silently, for
+// the lifetime of the process.
+//
+// Three of the groups below were missing, and each has a concrete cost:
+//
+//   - THE PRODUCER PAIR (SASLUser / SASLSecret) is the credential the publisher PREFERS — see
+//     kafkaTransportCredentials, which reads it before the administrative pair. Only the
+//     administrative pair was digested, so rotating the producer secret left every publish
+//     authenticating with the old one until a restart. The recommended least-privilege
+//     deployment — a producer principal and no administrative credentials in the publishing
+//     process — was the one where rotation was completely inert.
+//   - THE TLS BLOCK. Enabling TLS, changing the CA bundle, adding a client certificate for
+//     mutual TLS, or correcting a server name all rebuild the transport. Without them in the
+//     digest, a deployment that switched from SASL_PLAINTEXT to SASL_SSL kept publishing IN
+//     THE CLEAR, which is the failure mode a reader would least expect to be silent.
+//   - InsecureSkipVerify and InsecureLocalDev, both of which decide whether the transport
+//     will dial at all and under what verification. Turning verification back ON must take
+//     effect; leaving it out means it does not.
+//
+// What is deliberately NOT here: MinPartitions, ReplicationFactor and AllowPartitionGrowth.
+// Those are TOPIC GEOMETRY, consumed by the admin client's topic assurance rather than by the
+// writer, so a change to them must not throw away a working transport and its connections.
+//
+// A separator byte between fields prevents two different configurations from colliding by
+// shifting characters across a boundary, and booleans are written as distinct bytes so that
+// false is a value rather than an absence.
 //
 // Parameters:
 //   - cnf *config.Configuration: the configuration snapshot. May be nil.
@@ -358,12 +390,33 @@ func eventPublisherFingerprint(cnf *config.Configuration) string {
 		digest.Write([]byte{0})
 	}
 
-	digest.Write([]byte{1})
-	digest.Write([]byte(cnf.Kafka.TopicPrefix))
-	digest.Write([]byte{1})
-	digest.Write([]byte(cnf.Kafka.SASLAdminUser))
-	digest.Write([]byte{1})
-	digest.Write([]byte(cnf.Kafka.SASLAdminSecret))
+	// Written through one helper so that no field can be added without its separator.
+	writeField := func(value string) {
+		digest.Write([]byte{1})
+		digest.Write([]byte(value))
+	}
+	writeBool := func(value bool) {
+		digest.Write([]byte{1})
+		if value {
+			digest.Write([]byte{'t'})
+
+			return
+		}
+		digest.Write([]byte{'f'})
+	}
+
+	writeField(cnf.Kafka.TopicPrefix)
+	writeField(cnf.Kafka.SASLAdminUser)
+	writeField(cnf.Kafka.SASLAdminSecret)
+	writeField(cnf.Kafka.SASLUser)
+	writeField(cnf.Kafka.SASLSecret)
+	writeBool(cnf.Kafka.TLS.Enabled)
+	writeField(cnf.Kafka.TLS.CAFile)
+	writeField(cnf.Kafka.TLS.CertFile)
+	writeField(cnf.Kafka.TLS.KeyFile)
+	writeField(cnf.Kafka.TLS.ServerName)
+	writeBool(cnf.Kafka.TLS.InsecureSkipVerify)
+	writeBool(cnf.Kafka.InsecureLocalDev)
 
 	return hex.EncodeToString(digest.Sum(nil))
 }

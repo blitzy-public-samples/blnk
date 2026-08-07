@@ -59,6 +59,27 @@ run:
 run_workers:
 	./${PROJECT} workers
 
+# Run the process that hosts the EVENT OUTBOX RELAY.
+#
+# There is deliberately no separate relay binary. The relay is started by the server role,
+# beside the fund-lineage outbox processor it is modelled on, which is the repository's
+# established home for an outbox relay and avoids standing up a fourth asynq server for one
+# poll loop. So this target runs the server — and exists because "where does the relay run"
+# is otherwise answerable only by reading cmd/server.go.
+#
+# KAFKA_BROKERS is checked FIRST because the failure it prevents is silent: with no brokers
+# the publisher resolves to the no-op, the relay refuses to start, and the server comes up
+# looking entirely healthy while every captured event stays pending in blnk.event_outbox.
+# A missing variable is worth one line of refusal here rather than a backlog discovered later.
+run_relay:
+	@if [ -z "$${KAFKA_BROKERS}" ]; then \
+		echo "KAFKA_BROKERS is not set, so the relay would not start and every captured event would"; \
+		echo "stay pending in blnk.event_outbox. Set it (and the KAFKA_SASL_USER/KAFKA_SASL_SECRET"; \
+		echo "producer pair) first — './stack.sh --init' writes them to a 0600 .env."; \
+		exit 1; \
+	fi
+	./${PROJECT} start
+
 build_run:
 	make build
 	make run
@@ -67,6 +88,29 @@ build_test_run:
 	make build
 	make test
 	make run
+
+# Provision a RUNNING Kafka broker for event streaming: the category topics and their
+# dead-letter siblings, the steady-state producer principal, the sample subscriber principal,
+# and both principals' ACLs.
+#
+# Idempotent, so re-running it after a bring-up is safe and is the normal way to repair a
+# drifted topic geometry or ACL.
+#
+# NEITHER CREDENTIAL IS GENERATED. Both principals are provisioned only from a secret you
+# supply, because a generated one has to be printed to be usable and this script's usual home
+# is the compose kafka-init one-shot, whose stdout Docker captures into a container log. So:
+#
+#     KAFKA_PRODUCER_SECRET=<secret> make kafka_provision
+#     KAFKA_SAMPLE_SUBSCRIBER_SECRET=<secret> make kafka_provision
+#
+# `./stack.sh --init` generates KAFKA_SASL_SECRET into a 0600 .env, and the script reads that
+# variable directly as the producer secret — so after --init the producer principal needs no
+# extra argument, and the application and the broker are configured from one value.
+#
+# The script finds the Kafka CLI or delegates into the broker container itself, so this works
+# whether or not a Kafka distribution is installed on the host.
+kafka_provision:
+	@set -a; [ -f .env ] && . ./.env; set +a; ./scripts/kafka-provision.sh
 
 migrate_up:
 	./${PROJECT} migrate up

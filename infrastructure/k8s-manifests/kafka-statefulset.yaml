@@ -1,0 +1,450 @@
+# The Kafka broker workload, and the manifest both Services in kafka-service.yaml
+# select. Without it those Services front nothing: a client resolves kafka:9092,
+# gets no endpoint, and every publish fails with a connection error that reads
+# like a network fault rather than a missing Deployment.
+#
+# WHY A StatefulSet AND NOT A Deployment. Three properties a Deployment cannot
+# give, each of which Kafka needs:
+#
+#   * A STABLE IDENTITY. A KRaft broker's node.id and its controller-quorum
+#     membership are part of the cluster's persistent metadata. A pod that came
+#     back with a different name would be a different voter, and the quorum
+#     would neither recognise it nor release the identity it replaced.
+#   * A STABLE ADDRESS. advertised.listeners must name the one pod that holds a
+#     partition's leadership, because that is the address the metadata response
+#     hands to producers. Only a StatefulSet behind a headless Service publishes
+#     a per-pod DNS name.
+#   * PER-POD STORAGE. Each broker owns its own log directory. A shared
+#     ReadWriteOnce claim across three pods cannot be mounted by more than one
+#     node, and a shared log directory would corrupt the cluster if it could.
+#
+# THIS IS THE PRODUCTION SHAPE, and it deliberately differs from the local
+# single-broker compose stack in the three places durability is decided:
+# replicas is 3 rather than 1, every internal topic's replication factor is 3
+# rather than 1, and min.insync.replicas is 2 rather than 1. Those three move
+# together with KAFKA_REPLICATION_FACTOR: "3" in blnk-config.yaml. Changing one
+# without the others produces a cluster that either cannot create a topic or
+# acknowledges a write no second broker holds.
+#
+# TWO SECRETS MUST EXIST BEFORE THIS APPLIES, and neither is committed to this
+# folder — the same rule blnk-config.yaml states for KAFKA_SASL_ADMIN_SECRET:
+#
+#   kafka-credentials   key `admin-secret`: the SCRAM password of the principal
+#                       named by the KAFKA_SASL_ADMIN_USER key of blnk-config.
+#                       The broker's storage is formatted with it, the broker's
+#                       own inter-broker and controller logins present it, and
+#                       Blnk's provisioning path authenticates with it. One
+#                       value in three places, so it lives in one Secret.
+#
+#                       key `producer-secret`: the SCRAM password of the
+#                       principal named by KAFKA_SASL_USER, which the server and
+#                       worker publish with. A SEPARATE value from admin-secret,
+#                       and it must stay separate: config.ProducerSASL refuses to
+#                       let a publisher authenticate as the administrator, so
+#                       reusing one password here would not merely be weak, it
+#                       would be a configuration Blnk declines to start with.
+#                       The brokers themselves never read this key; the principal
+#                       is created against the running cluster by
+#                       scripts/kafka-provision.sh.
+#
+#   kafka-tls           keys `keystore.jks`, `truststore.jks`,
+#                       `keystore-password`, `truststore-password`, `key-password`
+#                       and `ca.crt`. SASL/SCRAM authenticates a client but does
+#                       not encrypt the channel, and the SCRAM handshake carries
+#                       material an observer can replay. TLS is therefore not
+#                       optional here.
+#
+#                       `ca.crt` IS THE SAME AUTHORITY AS truststore.jks, in the
+#                       other representation. The brokers read a Java keystore;
+#                       Blnk is Go and crypto/x509 reads PEM, so both forms of
+#                       one CA live in this Secret and KAFKA_TLS_CA_FILE in
+#                       blnk-config.yaml points at the PEM. Two different CAs
+#                       produce a broker and a client that are each internally
+#                       consistent and cannot talk to each other.
+#
+#                       The app Deployments project `ca.crt` ALONE from this
+#                       Secret. They have no use for the keystore, and mounting
+#                       it would put the brokers' private key inside the
+#                       most network-exposed process in the deployment.
+#
+# Create them, in the blnk namespace, before applying this file:
+#
+#   kubectl -n blnk create secret generic kafka-credentials \
+#     --from-literal=admin-secret="$(openssl rand -base64 24)"
+#
+#   kubectl -n blnk create secret generic kafka-tls \
+#     --from-file=keystore.jks=./kafka.keystore.jks \
+#     --from-file=truststore.jks=./kafka.truststore.jks \
+#     --from-file=ca.crt=./ca.crt \
+#     --from-literal=keystore-password=... \
+#     --from-literal=truststore-password=... \
+#     --from-literal=key-password=...
+#
+# A missing Secret leaves the broker pods waiting rather than starting an
+# unauthenticated or unencrypted broker, which is the correct failure: an event
+# stream carrying ledger mutations must not come up open. An absent kafka-tls
+# holds them in ContainerCreating with an event naming the Secret; an empty
+# KAFKA_SASL_ADMIN_USER makes the container exit 1 with the reason on stderr.
+#
+# WHAT THAT MEANS FOR `kubectl apply -f k8s-manifests/`. Applying the folder
+# without those Secrets leaves THESE pods not running and every other workload
+# healthy — Blnk included, because blnk-config.yaml ships KAFKA_BROKERS empty and
+# the event publisher then resolves to its no-op implementation. So a deployment
+# that has not adopted Kafka is not broken by this file; it has a broker workload
+# it is not using yet. Adopt Kafka in one change: create both Secrets, fill in
+# KAFKA_BROKERS, KAFKA_SASL_USER, KAFKA_SASL_ADMIN_USER and
+# WEBHOOK_DEPRECATION_SUNSET_DATE in
+# blnk-config.yaml, and once the brokers are Ready run
+# scripts/kafka-provision.sh against them to create the topic catalogue, the
+# producer principal and its Write/Describe grants.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  annotations:
+    kompose.cmd: kompose convert -f docker-compose.yaml -o k8s-manifests/
+    kompose.version: 1.26.1 (a9d05d509)
+  creationTimestamp: null
+  labels:
+    io.kompose.service: kafka
+  name: kafka
+  namespace: blnk
+spec:
+  # Three brokers, because KAFKA_REPLICATION_FACTOR is 3. A topic cannot be
+  # created with a replication factor above the broker count — the controller
+  # answers INVALID_REPLICATION_FACTOR — so a smaller number here makes topic
+  # assurance fail at start-up rather than degrade.
+  replicas: 3
+  selector:
+    matchLabels:
+      io.kompose.service: kafka
+  # MUST be the headless Service, not the client-facing one. See the long note
+  # in kafka-service.yaml: per-pod DNS records exist only for the headless
+  # Service a StatefulSet names here, and both the quorum voters below and every
+  # advertised listener are per-pod names.
+  serviceName: kafka-headless
+  # Brokers come up one at a time and each waits for its predecessor to be
+  # Ready. Parallel would let all three format storage and contest quorum
+  # election simultaneously, which is survivable but produces a cold start whose
+  # failures are hard to attribute. Ordered start-up costs a minute and makes
+  # the sequence in the logs readable.
+  podManagementPolicy: OrderedReady
+  template:
+    metadata:
+      annotations:
+        kompose.cmd: kompose convert -f docker-compose.yaml -o k8s-manifests/
+        kompose.version: 1.26.1 (a9d05d509)
+      creationTimestamp: null
+      labels:
+        io.kompose.service: kafka
+    spec:
+      # Long enough for a broker to flush and leave the ISR cleanly. The default
+      # 30s can cut a shutdown short mid-flush, which costs an unclean-shutdown
+      # log recovery on the next start.
+      terminationGracePeriodSeconds: 120
+      # Spread the brokers across nodes where the cluster can. Three replicas on
+      # one node is three replicas of nothing: the node is a single point of
+      # failure and min.insync.replicas=2 would be satisfied by two copies that
+      # die together. ScheduleAnyway rather than DoNotSchedule so a small or
+      # single-node cluster still comes up — it is a durability preference this
+      # manifest cannot enforce on infrastructure it does not control.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              io.kompose.service: kafka
+      containers:
+        - name: kafka
+          # The same floor the compose stack pins, for the same two reasons:
+          # "kafka-storage format --add-scram" arrived in Kafka 3.5, and 3.9.2 is
+          # the lowest release free of CVE-2026-33558, whose DEBUG-level
+          # NetworkClient logging makes SASL credentials, SCRAM salts and salted
+          # passwords recoverable from a log file. See .env.example for the full
+          # per-advisory floor table, including why no 4.x tag at or below 4.3.0
+          # is clean.
+          image: apache/kafka:3.9.2
+          ports:
+            - name: "9092"
+              containerPort: 9092
+            - name: "9093"
+              containerPort: 9093
+          env:
+            - name: TZ
+              value: Etc/UTC
+            # The pod's own name, which is what makes one manifest serve three
+            # brokers: the ordinal suffix becomes node.id and the full name
+            # becomes the advertised host.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # A principal name, not a credential, so it comes from the ConfigMap
+            # — and from the SAME key Blnk reads, so the principal the broker
+            # trusts and the principal Blnk presents cannot drift apart.
+            - name: KAFKA_SASL_ADMIN_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SASL_ADMIN_USER
+            - name: KAFKA_SASL_ADMIN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-credentials
+                  key: admin-secret
+            - name: KAFKA_TLS_KEYSTORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-tls
+                  key: keystore-password
+            - name: KAFKA_TLS_TRUSTSTORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-tls
+                  key: truststore-password
+            - name: KAFKA_TLS_KEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-tls
+                  key: key-password
+            # Read from the ConfigMap so the broker's default partition count and
+            # the count event_admin.go's EnsureTopics requests are one number.
+            - name: KAFKA_MIN_PARTITIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_MIN_PARTITIONS
+          command:
+            - /bin/bash
+            - -c
+            # The broker configuration is generated in the container rather than
+            # projected from a ConfigMap because three of its values are per-pod
+            # (node.id and both advertised listeners) and two are secret (the
+            # inter-broker and controller JAAS logins). A ConfigMap cannot hold
+            # either kind.
+            #
+            # WHY THE CREDENTIALS NEVER REACH A COMMAND LINE. umask 077 before
+            # anything is written, so both generated files are private from
+            # creation rather than chmod'ed afterwards; the storage format reads
+            # --add-scram from an argument file rather than from argv, which is
+            # the same remedy scripts/kafka-bootstrap.sh applies and which is
+            # verified to be honoured on apache/kafka 3.9; and the argument file
+            # is removed the moment the command that consumed it returns.
+            #
+            # $$ escapes are absent on purpose: this is a Kubernetes manifest, so
+            # nothing pre-substitutes ${...} the way Compose interpolation does.
+            # Every expansion below is the container shell's own.
+            - |
+              set -euo pipefail
+              umask 077
+
+              if [ -z "${KAFKA_SASL_ADMIN_USER}" ] || [ -z "${KAFKA_SASL_ADMIN_SECRET}" ]; then
+                echo "kafka: KAFKA_SASL_ADMIN_USER (blnk-config) and the kafka-credentials" >&2
+                echo "kafka: admin-secret must BOTH be set. Refusing to start a broker with" >&2
+                echo "kafka: no administrative principal: it could authenticate nobody, and" >&2
+                echo "kafka: Blnk's topic assurance and credential issuance would both fail" >&2
+                echo "kafka: against it while the pod reported Ready." >&2
+                exit 1
+              fi
+
+              CONF_DIR=/tmp/blnk-kafka
+              mkdir -p "${CONF_DIR}"
+
+              # node.id from the pod ordinal, which a StatefulSet guarantees is
+              # stable across restarts and unique across the set. It must agree
+              # with the voter list below or the pod is not a member of the
+              # quorum it is trying to join.
+              NODE_ID="${POD_NAME##*-}"
+              POD_FQDN="${POD_NAME}.kafka-headless.${POD_NAMESPACE}.svc.cluster.local"
+
+              # Every replica, named explicitly. A KRaft voter list is static
+              # configuration: it cannot be discovered, and it must be identical
+              # on all three brokers. Raising `replicas` above means extending
+              # this list in the same change.
+              VOTERS="0@kafka-0.kafka-headless.${POD_NAMESPACE}.svc.cluster.local:9093"
+              VOTERS="${VOTERS},1@kafka-1.kafka-headless.${POD_NAMESPACE}.svc.cluster.local:9093"
+              VOTERS="${VOTERS},2@kafka-2.kafka-headless.${POD_NAMESPACE}.svc.cluster.local:9093"
+
+              cat >"${CONF_DIR}/server.properties" <<PROPERTIES
+              process.roles=broker,controller
+              node.id=${NODE_ID}
+              controller.quorum.voters=${VOTERS}
+
+              listeners=BROKER://:9092,CONTROLLER://:9093
+              advertised.listeners=BROKER://${POD_FQDN}:9092
+              listener.security.protocol.map=BROKER:SASL_SSL,CONTROLLER:SASL_SSL
+              inter.broker.listener.name=BROKER
+              controller.listener.names=CONTROLLER
+
+              ssl.keystore.location=/etc/kafka/tls/keystore.jks
+              ssl.keystore.password=${KAFKA_TLS_KEYSTORE_PASSWORD}
+              ssl.key.password=${KAFKA_TLS_KEY_PASSWORD}
+              ssl.truststore.location=/etc/kafka/tls/truststore.jks
+              ssl.truststore.password=${KAFKA_TLS_TRUSTSTORE_PASSWORD}
+              ssl.endpoint.identification.algorithm=https
+
+              sasl.enabled.mechanisms=SCRAM-SHA-512
+              sasl.mechanism.inter.broker.protocol=SCRAM-SHA-512
+              listener.name.broker.sasl.enabled.mechanisms=SCRAM-SHA-512
+              listener.name.broker.scram-sha-512.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="${KAFKA_SASL_ADMIN_USER}" password="${KAFKA_SASL_ADMIN_SECRET}";
+
+              sasl.mechanism.controller.protocol=PLAIN
+              listener.name.controller.sasl.enabled.mechanisms=PLAIN
+              listener.name.controller.plain.sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="${KAFKA_SASL_ADMIN_USER}" password="${KAFKA_SASL_ADMIN_SECRET}" user_${KAFKA_SASL_ADMIN_USER}="${KAFKA_SASL_ADMIN_SECRET}";
+
+              authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+              super.users=User:${KAFKA_SASL_ADMIN_USER}
+              allow.everyone.if.no.acl.found=false
+
+              offsets.topic.replication.factor=3
+              transaction.state.log.replication.factor=3
+              transaction.state.log.min.isr=2
+              default.replication.factor=3
+              min.insync.replicas=2
+
+              log.dirs=/var/lib/kafka/data
+              num.partitions=${KAFKA_MIN_PARTITIONS}
+              auto.create.topics.enable=false
+              PROPERTIES
+
+              # The client properties the readiness probe authenticates with.
+              # Written here rather than in the probe so the probe carries no
+              # credential of its own and no secret reaches a probe command line.
+              cat >"${CONF_DIR}/client-admin.properties" <<PROPERTIES
+              security.protocol=SASL_SSL
+              sasl.mechanism=SCRAM-SHA-512
+              ssl.truststore.location=/etc/kafka/tls/truststore.jks
+              ssl.truststore.password=${KAFKA_TLS_TRUSTSTORE_PASSWORD}
+              sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="${KAFKA_SASL_ADMIN_USER}" password="${KAFKA_SASL_ADMIN_SECRET}";
+              PROPERTIES
+
+              # Format only on a genuinely empty log directory. meta.properties
+              # is Kafka's own marker that storage has been bootstrapped, and
+              # therefore that the SCRAM credential is already in the metadata
+              # log. Re-formatting a populated directory is refused by Kafka
+              # anyway; skipping it here keeps a restart quiet.
+              #
+              # THE CONTROLLER LISTENER'S JAAS ENTRY IS WHY THIS WORKS AT ALL. In
+              # KRaft the SCRAM credential lives in the metadata log, and the
+              # quorum has to form before that log is readable — so the
+              # controller listener authenticates with PLAIN against the static
+              # user list written above, while every client and inter-broker
+              # connection uses the SCRAM credential seeded here.
+              if [ ! -f /var/lib/kafka/data/meta.properties ]; then
+                ARGS="$(mktemp "${CONF_DIR}/add-scram.XXXXXX")"
+                printf '%s\n' \
+                  "--add-scram" \
+                  "SCRAM-SHA-512=[name=${KAFKA_SASL_ADMIN_USER},password=${KAFKA_SASL_ADMIN_SECRET},iterations=4096]" \
+                  >"${ARGS}"
+
+                # Every broker formats with the SAME cluster ID. A generated one
+                # would give each pod its own cluster and the quorum would never
+                # form, each broker reporting the others as unknown.
+                if /opt/kafka/bin/kafka-storage.sh format \
+                    --cluster-id "blnkProductionKRaftCluster" \
+                    --config "${CONF_DIR}/server.properties" \
+                    --ignore-formatted \
+                    "@${ARGS}"; then
+                  rm -f "${ARGS}"
+                else
+                  rm -f "${ARGS}"
+                  echo "kafka: storage format failed; the output above names the cause." >&2
+                  echo "kafka: a cluster-id mismatch against an existing volume and a" >&2
+                  echo "kafka: rejected configuration value are the two usual ones." >&2
+                  exit 1
+                fi
+              fi
+
+              exec /opt/kafka/bin/kafka-server-start.sh "${CONF_DIR}/server.properties"
+          # READINESS is an AUTHENTICATED, AUTHORIZED request — the same check
+          # the compose healthcheck makes, and for the same reason: a broker that
+          # has bound its port but cannot authenticate anyone is not ready, and a
+          # plain TCP check would call it ready and let the relay publish into a
+          # cluster that rejects every connection.
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - >-
+                  /opt/kafka/bin/kafka-topics.sh
+                  --bootstrap-server localhost:9092
+                  --command-config /tmp/blnk-kafka/client-admin.properties
+                  --list >/dev/null 2>&1
+            initialDelaySeconds: 45
+            periodSeconds: 15
+            timeoutSeconds: 20
+            failureThreshold: 6
+          # LIVENESS is deliberately WEAKER than readiness, and the asymmetry is
+          # the point. A liveness probe that authenticated would restart every
+          # broker in the cluster the moment a credential was rotated wrongly —
+          # turning a configuration mistake into an outage, and a restart loop
+          # cannot fix a wrong password. So liveness asks only whether the JVM
+          # still holds its port, and an authentication failure shows up as
+          # NotReady, which removes the pod from the Service without killing it.
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 90
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # Formatting and quorum formation happen before readiness, and on a
+          # cold cluster the first broker waits for peers that are still being
+          # scheduled. Without this, a slow node fails liveness mid-bootstrap and
+          # the pod is killed and restarted for being slow rather than broken.
+          startupProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          # `{}` throughout this folder, and left that way deliberately: the
+          # other workloads set no requests or limits either, and a broker's
+          # heap and page-cache budget depend on the cluster's message volume and
+          # node size. Set them per environment. A Kafka broker with a memory
+          # limit below its heap is OOM-killed under load, which reads as a
+          # broker that fails only when it matters.
+          resources: {}
+          volumeMounts:
+            - name: kafka-data
+              mountPath: /var/lib/kafka/data
+            # Read-only: the broker reads its keystore and truststore and must
+            # never write them.
+            - name: kafka-tls
+              mountPath: /etc/kafka/tls
+              readOnly: true
+      restartPolicy: Always
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
+            # Private to the container's user. A keystore readable by every
+            # process in the pod is a private key readable by every process in
+            # the pod.
+            defaultMode: 0400
+  # PER-POD storage, which is why this is a volumeClaimTemplate rather than the
+  # single shared claim in kafka-data-persistentvolumeclaim.yaml. Kubernetes
+  # provisions kafka-data-kafka-0, -1 and -2 from this template, each bound to
+  # its own broker for the life of that broker's identity. A ReadWriteOnce claim
+  # shared by three pods could not be mounted by more than one node, and a log
+  # directory shared by three brokers would corrupt the cluster if it could be.
+  volumeClaimTemplates:
+    - metadata:
+        name: kafka-data
+        labels:
+          io.kompose.service: kafka-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            # Matches kafka-data-persistentvolumeclaim.yaml. Size this for the
+            # retention window: the four category topics and their four
+            # dead-letter siblings, at six partitions each, times the segment
+            # retention the cluster is configured for.
+            storage: 10Gi

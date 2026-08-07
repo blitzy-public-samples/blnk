@@ -485,6 +485,7 @@ var eventStreamingEnvKeys = []string{
 	"KAFKA_TLS_INSECURE_SKIP_VERIFY", "BLNK_KAFKA_KAFKA_TLS_INSECURE_SKIP_VERIFY", "BLNK_KAFKA_TLS_INSECURE_SKIP_VERIFY",
 	"KAFKA_INSECURE_LOCAL_DEV", "BLNK_KAFKA_KAFKA_INSECURE_LOCAL_DEV", "BLNK_KAFKA_INSECURE_LOCAL_DEV",
 	"KAFKA_ALLOW_PARTITION_GROWTH", "BLNK_KAFKA_KAFKA_ALLOW_PARTITION_GROWTH", "BLNK_KAFKA_ALLOW_PARTITION_GROWTH",
+	"KAFKA_ALLOW_ADMIN_PRODUCER", "BLNK_KAFKA_KAFKA_ALLOW_ADMIN_PRODUCER", "BLNK_KAFKA_ALLOW_ADMIN_PRODUCER",
 	"RELAY_MAX_RETRY_ATTEMPTS", "BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS", "BLNK_RELAY_MAX_RETRY_ATTEMPTS",
 	"RELAY_RETRY_BASE_BACKOFF_MS", "BLNK_RELAY_RELAY_RETRY_BASE_BACKOFF_MS", "BLNK_RELAY_RETRY_BASE_BACKOFF_MS",
 	"RELAY_RETRY_MAX_BACKOFF_MS", "BLNK_RELAY_RELAY_RETRY_MAX_BACKOFF_MS", "BLNK_RELAY_RETRY_MAX_BACKOFF_MS",
@@ -721,25 +722,126 @@ func TestLoadConfigFromFile_PrefixedAliasWinsOverBareName(t *testing.T) {
 	}
 }
 
-// TestLoadConfigFromFile_RefusesKafkaBrokersWithoutAWindow carries the required-window
+// TestLoadConfigFromFile_StartsWithKafkaBrokersAndNoWindow carries the missing-window
 // rule through the REAL load pipeline, not just validateAndAddDefaults.
 //
-// This is what a deployment actually experiences: brokers supplied by the environment,
-// no window anywhere, and a process that refuses to start rather than one that runs
-// with dual delivery it can never end.
-func TestLoadConfigFromFile_RefusesKafkaBrokersWithoutAWindow(t *testing.T) {
+// # Why this must LOAD rather than refuse
+//
+// Adding KAFKA_BROKERS is, on its own, a safe additive change: the publisher starts
+// producing and nothing else about the deployment moves. Refusing to load without a
+// retirement date turned that step into an outage, which is the opposite of what AAP
+// §0.7.2 requires of a deployment adopting Kafka configuration — and an operator whose
+// first attempt at enabling Kafka takes the service down is likelier to back the
+// migration out than to finish it.
+//
+// Nothing has been mis-stated in this case, which is the distinction from an
+// unparseable date: the operator has not yet chosen when the legacy transport retires.
+// The consequence is that dual delivery continues, which is the PRE-EXISTING behaviour
+// and is safe for every subscriber. It is warned about loudly and it changes nothing
+// about how traffic is served.
+func TestLoadConfigFromFile_StartsWithKafkaBrokersAndNoWindow(t *testing.T) {
 	clearEventStreamingEnv(t)
 	restoreConfigStore(t)
 
 	configFile := writeTempEventConfigFile(t)
 	t.Setenv("KAFKA_BROKERS", "broker-1:9092")
 
+	if err := loadConfigFromFile(configFile); err != nil {
+		t.Fatalf("Expected brokers with no window to LOAD; got %v", err)
+	}
+
+	loaded, err := Fetch()
+	if err != nil {
+		t.Fatalf("Fetch failed: %v", err)
+	}
+
+	if len(loaded.Kafka.Brokers) != 1 || loaded.Kafka.Brokers[0] != "broker-1:9092" {
+		t.Errorf("Expected the brokers to survive the load, got %v", loaded.Kafka.Brokers)
+	}
+	if loaded.WebhookDeprecationSunsetDate != "" {
+		t.Errorf("Expected no sunset date, got %q", loaded.WebhookDeprecationSunsetDate)
+	}
+	if loaded.WebhookDeprecationStartDate != "" {
+		t.Errorf("Expected no derived window start either, got %q", loaded.WebhookDeprecationStartDate)
+	}
+}
+
+// TestLoadConfigFromFile_RefusesAnUnparseableSunsetDate is the case that stays fatal.
+//
+// An operator who states a retirement instant and mis-types it must not be given the
+// silent resolution "keep the legacy behaviour": that keeps the deprecated, less
+// protected transport alive indefinitely with nothing failing. This is the distinction
+// from an absent date, where nothing was stated at all.
+func TestLoadConfigFromFile_RefusesAnUnparseableSunsetDate(t *testing.T) {
+	clearEventStreamingEnv(t)
+	restoreConfigStore(t)
+
+	configFile := writeTempEventConfigFile(t)
+	t.Setenv("KAFKA_BROKERS", "broker-1:9092")
+	t.Setenv("WEBHOOK_DEPRECATION_SUNSET_DATE", "2026-13-45")
+
 	err := loadConfigFromFile(configFile)
 	if err == nil {
-		t.Fatal("Expected loadConfigFromFile to refuse brokers with no dual-delivery window")
+		t.Fatal("Expected loadConfigFromFile to refuse an unparseable sunset date")
 	}
-	if !strings.Contains(err.Error(), "webhook_deprecation_sunset_date is required") {
-		t.Errorf("Expected the error to say the sunset is required, got %q", err.Error())
+	if !strings.Contains(err.Error(), "webhook_deprecation_sunset_date") {
+		t.Errorf("Expected the error to name the offending setting, got %q", err.Error())
+	}
+}
+
+// TestWebhookDeprecationStartDate_IsNotAnEnvironmentVariable pins the R-10 contract
+// surface.
+//
+// Requirement R-10 freezes the deployment contract at eight environment variables, of
+// which exactly ONE describes this window. A second variable for the other end was a
+// real convenience and still a contract violation, and it bought nothing derivable:
+// the window is exactly WebhookDualDeliveryWindowDays long, so the sunset determines
+// the start.
+//
+// The assertion is that setting the retired name has NO EFFECT, in either its bare or
+// its prefixed form. A test that merely checked the struct tag would pass while the
+// alias table still honoured the name.
+func TestWebhookDeprecationStartDate_IsNotAnEnvironmentVariable(t *testing.T) {
+	for _, name := range []string{
+		"WEBHOOK_DEPRECATION_START_DATE",
+		"BLNK_WEBHOOK_DEPRECATION_START_DATE",
+	} {
+		t.Run(name+" is ignored", func(t *testing.T) {
+			clearEventStreamingEnv(t)
+			restoreConfigStore(t)
+
+			configFile := writeTempEventConfigFile(t)
+			t.Setenv("KAFKA_BROKERS", "broker-1:9092")
+			t.Setenv("WEBHOOK_DEPRECATION_SUNSET_DATE", testWindowSunset)
+
+			// A start that is nowhere near one window before the sunset, so honouring it
+			// would be unmistakable.
+			t.Setenv(name, "2001-01-01T00:00:00Z")
+
+			if err := loadConfigFromFile(configFile); err != nil {
+				t.Fatalf("loadConfigFromFile failed: %v", err)
+			}
+			loaded, err := Fetch()
+			if err != nil {
+				t.Fatalf("Fetch failed: %v", err)
+			}
+
+			if loaded.WebhookDeprecationStartDate == "2001-01-01T00:00:00Z" {
+				t.Fatalf("%s was honoured; it must not be part of the deployment contract", name)
+			}
+
+			// And the derived value is the only one that can appear.
+			sunset, err := time.Parse(time.RFC3339, loaded.WebhookDeprecationSunsetDate)
+			if err != nil {
+				t.Fatalf("parsing the loaded sunset: %v", err)
+			}
+
+			want := sunset.Add(-WebhookDualDeliveryWindowDays * 24 * time.Hour).Format(time.RFC3339)
+			if loaded.WebhookDeprecationStartDate != want {
+				t.Errorf("Expected the window start to be derived as %q, got %q",
+					want, loaded.WebhookDeprecationStartDate)
+			}
+		})
 	}
 }
 
@@ -785,6 +887,7 @@ func TestApplyPrefixedEnvAliases_RejectsMalformedValues(t *testing.T) {
 		{name: "a non-numeric partition count", key: "BLNK_KAFKA_MIN_PARTITIONS", value: "six"},
 		{name: "a non-boolean tls switch", key: "BLNK_KAFKA_TLS_ENABLED", value: "yeah"},
 		{name: "a non-boolean local-dev switch", key: "BLNK_KAFKA_INSECURE_LOCAL_DEV", value: "sometimes"},
+		{name: "a non-boolean admin-producer allowance", key: "BLNK_KAFKA_ALLOW_ADMIN_PRODUCER", value: "maybe"},
 	}
 
 	for _, tc := range cases {
@@ -849,8 +952,9 @@ func TestValidateSASLPair(t *testing.T) {
 // The finding it guards: the steady-state publisher authenticated with the
 // ADMINISTRATIVE principal, so compromising the busiest process in the deployment
 // handed over authority to create topics, mint SCRAM credentials and rewrite ACLs.
-// A dedicated producer principal is now preferred, and the fallback is reported so the
-// caller can warn.
+// A dedicated producer principal is now REQUIRED — there is no fallback, because a
+// fallback that warns leaves the excess privilege in place and only records it — so the
+// administrative pair is never returned here and the caller is told to refuse instead.
 func TestProducerSASL(t *testing.T) {
 	t.Run("a dedicated producer principal is preferred and is not the admin", func(t *testing.T) {
 		cnf := eventStreamingBaseConfig()
@@ -859,35 +963,35 @@ func TestProducerSASL(t *testing.T) {
 		cnf.Kafka.SASLAdminUser = "blnk-admin"
 		cnf.Kafka.SASLAdminSecret = "admin-secret"
 
-		user, secret, usingAdmin := cnf.ProducerSASL()
+		user, secret, adminOnly := cnf.ProducerSASL()
 		if user != "blnk-producer" || secret != "producer-secret" {
 			t.Errorf("Expected the producer principal, got user %q", user)
 		}
-		if usingAdmin {
-			t.Error("Expected usingAdmin to be false when a producer principal is configured")
+		if adminOnly {
+			t.Error("Expected adminOnly to be false when a producer principal is configured")
 		}
 	})
 
-	t.Run("the admin principal is the reported fallback", func(t *testing.T) {
+	t.Run("an admin-only configuration yields no credential and is reported as fatal", func(t *testing.T) {
 		cnf := eventStreamingBaseConfig()
 		cnf.Kafka.SASLAdminUser = "blnk-admin"
 		cnf.Kafka.SASLAdminSecret = "admin-secret"
 
-		user, secret, usingAdmin := cnf.ProducerSASL()
-		if user != "blnk-admin" || secret != "admin-secret" {
-			t.Errorf("Expected the admin principal as the fallback, got user %q", user)
+		user, secret, adminOnly := cnf.ProducerSASL()
+		if user != "" || secret != "" {
+			t.Errorf("The administrative principal must never be offered to a producer, got user %q", user)
 		}
-		if !usingAdmin {
-			t.Error("Expected usingAdmin to be true so the caller can warn about excess privilege")
+		if !adminOnly {
+			t.Error("Expected adminOnly to be true so the caller refuses to build a producer transport")
 		}
 	})
 
 	t.Run("no credential at all yields no SASL", func(t *testing.T) {
 		cnf := eventStreamingBaseConfig()
 
-		user, secret, usingAdmin := cnf.ProducerSASL()
-		if user != "" || secret != "" || usingAdmin {
-			t.Errorf("Expected no credentials, got user %q usingAdmin %t", user, usingAdmin)
+		user, secret, adminOnly := cnf.ProducerSASL()
+		if user != "" || secret != "" || adminOnly {
+			t.Errorf("Expected no credentials, got user %q adminOnly %t", user, adminOnly)
 		}
 	})
 }
@@ -954,6 +1058,22 @@ func TestValidateAndAddDefaults_KafkaAndRelayDefaults(t *testing.T) {
 		t.Errorf("Expected Relay.RetryMaxBackoffMS to be 30000, got %d", cnf.Relay.RetryMaxBackoffMS)
 	}
 
+	// EVENT RETENTION IS NOT DEFAULTED, and the asymmetry with the three values above is
+	// asserted rather than assumed. Those three have a correct answer that requirement R-4
+	// fixes, so an unset value is filled in. A retention period has no correct answer this
+	// code can know — it depends on jurisdiction, audit programme and any legal hold in force
+	// — and getting it wrong DELETES ledger-adjacent evidence irreversibly. Zero means
+	// retention is disabled, which is the only safe default for a destructive operation, and a
+	// future change that "helpfully" supplied one would start deleting on every deployment
+	// that upgraded.
+	if cnf.Relay.EventRetentionDays != 0 {
+		t.Errorf("Expected Relay.EventRetentionDays to default to 0 (retention disabled), got %d",
+			cnf.Relay.EventRetentionDays)
+	}
+	if period := cnf.EventRetentionPeriod(); period != 0 {
+		t.Errorf("Expected EventRetentionPeriod to be 0 while retention is disabled, got %s", period)
+	}
+
 	// Topic naming and geometry.
 	if cnf.Kafka.TopicPrefix != "blnk" {
 		t.Errorf("Expected Kafka.TopicPrefix to be 'blnk', got '%s'", cnf.Kafka.TopicPrefix)
@@ -973,6 +1093,19 @@ func TestValidateAndAddDefaults_KafkaAndRelayDefaults(t *testing.T) {
 	}
 	if cnf.Kafka.SASLAdminSecret != "" {
 		t.Errorf("Expected Kafka.SASLAdminSecret to stay empty, got a value of %d characters", len(cnf.Kafka.SASLAdminSecret))
+	}
+
+	// The admin-producer allowance must default to FALSE, and this assertion is the
+	// guard on that. It permits the event publisher to authenticate with the
+	// administrative credentials when no producer principal is configured — the
+	// principal that creates topics, mints SCRAM credentials and rewrites ACLs. A
+	// deployment reaches that state by leaving KAFKA_SASL_USER and KAFKA_SASL_SECRET
+	// unset, which is where every deployment starts, so a default of true would mean an
+	// ordinary rollout ran its whole data plane at maximum privilege with nothing but a
+	// log line to say so. Defaulting it on would not look like a security change in a
+	// diff, which is exactly why it is asserted here.
+	if cnf.Kafka.AllowAdminProducer {
+		t.Error("Expected Kafka.AllowAdminProducer to default to false; publishing as the Kafka administrator must be opted into explicitly")
 	}
 
 	// An unset sunset date means the sunset has not passed, so no date is invented.
@@ -1102,12 +1235,164 @@ func TestValidateAndAddDefaults_KafkaConfiguredValuesSurvive(t *testing.T) {
 // TestValidateAndAddDefaults_KafkaSASLPairIsFatalOnlyWithBrokers pins where the pair
 // contract is enforced, which is as important as the contract itself.
 //
+// TestResolveWebhookDeprecationWindow_AnAbsentDateIsWarnedAboutAndNeverInvented pins what
+// happens when Kafka is configured and no retirement instant has been chosen.
+//
+// # Why an absent date is a WARNING and not a refusal
+//
+// Two remediations of this same case are possible and only one can exist. Refusing to load
+// makes adding KAFKA_BROKERS able to take a running deployment down over a NOTIFICATION
+// scheduling decision, and it is reached by leaving one variable unset — the state every
+// deployment starts in. Nothing has been mis-stated in that case: an operator has not yet
+// chosen a cutover date, dual delivery continues, and that is the pre-migration behaviour,
+// which is safe for every subscriber. A MALFORMED date remains fatal, because that IS a
+// mis-statement and would otherwise resolve silently to "the sunset has not passed".
+//
+// # Why no window is derived either
+//
+// Inventing one from "now" would produce a sunset that MOVES ON EVERY RESTART, so the legacy
+// transport's retirement instant would depend on when a pod last happened to start. The
+// warning names the variable instead, which is the outcome an operator can act on.
+//
+// The local-dev flag makes NO difference here, and that is asserted rather than assumed: an
+// exception that derived a window under it would be one restart away from being the behaviour
+// a production deployment gets the moment the flag is left set.
+func TestResolveWebhookDeprecationWindow_AnAbsentDateIsWarnedAboutAndNeverInvented(t *testing.T) {
+	clearEventStreamingEnv(t)
+
+	for name, localDev := range map[string]bool{
+		"local dev acknowledged": true,
+		"not local development":  false,
+	} {
+		t.Run("brokers, no window, "+name, func(t *testing.T) {
+			hook := logtest.NewGlobal()
+			defer hook.Reset()
+
+			cnf := eventStreamingBaseConfig()
+			cnf.Kafka.Brokers = []string{"kafka:9092"}
+			cnf.Kafka.InsecureLocalDev = localDev
+
+			if err := cnf.resolveWebhookDeprecationWindow(); err != nil {
+				t.Fatalf("Expected an absent date to load cleanly, got %v", err)
+			}
+
+			if cnf.WebhookDeprecationStartDate != "" || cnf.WebhookDeprecationSunsetDate != "" {
+				t.Errorf("Expected NO window to be invented, got start=%q sunset=%q",
+					cnf.WebhookDeprecationStartDate, cnf.WebhookDeprecationSunsetDate)
+			}
+
+			// WARNED, and the warning must NAME THE VARIABLE. "No sunset date is set" without
+			// the key is a line an operator cannot act on.
+			var warned bool
+			for _, entry := range hook.AllEntries() {
+				if entry.Level != logrus.WarnLevel {
+					continue
+				}
+				if strings.Contains(entry.Message, "sunset date") ||
+					entry.Data["variable"] == "WEBHOOK_DEPRECATION_SUNSET_DATE" {
+					warned = true
+				}
+			}
+			if !warned {
+				t.Error("Expected a warning that legacy delivery will continue until a sunset date is set")
+			}
+		})
+	}
+
+	t.Run("a half-written window cannot survive with one end", func(t *testing.T) {
+		// A start that arrived from a configuration file with no sunset beside it is not a
+		// window. Keeping it would leave the sunset decision resting on a value nothing
+		// validates and the API's 410 guard reading a date that no longer has a partner.
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.Brokers = []string{"kafka:9092"}
+		cnf.WebhookDeprecationStartDate = testWindowStart
+
+		if err := cnf.resolveWebhookDeprecationWindow(); err != nil {
+			t.Fatalf("Expected an absent sunset to load cleanly, got %v", err)
+		}
+		if cnf.WebhookDeprecationStartDate != "" {
+			t.Errorf("Expected the orphaned start to be cleared, got %q",
+				cnf.WebhookDeprecationStartDate)
+		}
+	})
+
+	t.Run("a malformed date is still fatal", func(t *testing.T) {
+		// The other half of the decision above: an absent date is a choice not yet made, a
+		// malformed one is a choice mis-stated, and only the second can silently mean
+		// "the sunset has not passed" forever.
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.Brokers = []string{"kafka:9092"}
+		cnf.Kafka.InsecureLocalDev = true
+		cnf.WebhookDeprecationSunsetDate = "30 days from now"
+
+		err := cnf.resolveWebhookDeprecationWindow()
+		if err == nil {
+			t.Fatal("Expected a malformed sunset date to refuse to load")
+		}
+		if !strings.Contains(err.Error(), "webhook_deprecation_sunset_date") {
+			t.Errorf("Expected the error to name the offending field, got %v", err)
+		}
+	})
+
+	t.Run("no brokers and local dev set: no window is invented", func(t *testing.T) {
+		// There is nothing to migrate to, so there is no window to describe. Deriving
+		// one here would make the deprecated transport look scheduled for retirement on
+		// a deployment that never enabled Kafka.
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.InsecureLocalDev = true
+
+		if err := cnf.resolveWebhookDeprecationWindow(); err != nil {
+			t.Fatalf("Expected no brokers to load cleanly, got %v", err)
+		}
+		if cnf.WebhookDeprecationStartDate != "" || cnf.WebhookDeprecationSunsetDate != "" {
+			t.Errorf("Expected no window with no brokers, got start=%q sunset=%q",
+				cnf.WebhookDeprecationStartDate, cnf.WebhookDeprecationSunsetDate)
+		}
+	})
+
+	t.Run("an explicit window is honoured and its start is derived", func(t *testing.T) {
+		// The configured sunset is authoritative and the start is arithmetic, so "exactly
+		// 30 days" is a property of the code rather than of the configuration.
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.Brokers = []string{"kafka:9092"}
+		cnf.Kafka.InsecureLocalDev = true
+		cnf.WebhookDeprecationStartDate = testWindowStart
+		cnf.WebhookDeprecationSunsetDate = testWindowSunset
+
+		if err := cnf.resolveWebhookDeprecationWindow(); err != nil {
+			t.Fatalf("Expected an explicit window to be accepted, got %v", err)
+		}
+
+		wantSunset, err := time.Parse(time.RFC3339, testWindowSunset)
+		if err != nil {
+			t.Fatalf("the fixture sunset is not RFC3339: %v", err)
+		}
+		gotSunset, err := time.Parse(time.RFC3339, cnf.WebhookDeprecationSunsetDate)
+		if err != nil {
+			t.Fatalf("Resolved sunset is not RFC3339: %v", err)
+		}
+		if !gotSunset.Equal(wantSunset) {
+			t.Errorf("Expected the configured sunset %s to be preserved, got %s",
+				wantSunset.Format(time.RFC3339), gotSunset.Format(time.RFC3339))
+		}
+
+		gotStart, err := time.Parse(time.RFC3339, cnf.WebhookDeprecationStartDate)
+		if err != nil {
+			t.Fatalf("Resolved start is not RFC3339: %v", err)
+		}
+		if got := gotSunset.Sub(gotStart); got != WebhookDualDeliveryWindowDays*24*time.Hour {
+			t.Errorf("Expected a window of exactly %d days, got %s",
+				WebhookDualDeliveryWindowDays, got)
+		}
+	})
+}
+
 // Two properties are in tension and both must hold. A half-configured credential has
 // to stop a deployment that actually uses Kafka, because it cannot be honoured and
 // fails much later as a wrong-password or authorization error. But it must NOT stop a
 // deployment with no brokers, because nothing reads it there and the graceful
 // degradation that lets Blnk run entirely without Kafka is a shipped guarantee — the
-// .env.example that ships an empty KAFKA_BROKERS would otherwise fail to load the
+// .env.example that leaves KAFKA_BROKERS unset would otherwise fail to load the
 // moment an operator filled in one SASL key.
 func TestValidateAndAddDefaults_KafkaSASLPairIsFatalOnlyWithBrokers(t *testing.T) {
 	clearEventStreamingEnv(t)
@@ -1311,6 +1596,26 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			assert: func(t *testing.T, loaded *Configuration) {
 				if loaded.Kafka.SASLUser != "blnk-producer" {
 					t.Errorf("Expected Kafka.SASLUser to be 'blnk-producer', got '%s'", loaded.Kafka.SASLUser)
+				}
+			},
+		},
+		{
+			name:   "the bare KAFKA_ALLOW_ADMIN_PRODUCER resolves",
+			envKey: "KAFKA_ALLOW_ADMIN_PRODUCER",
+			value:  "true",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if !loaded.Kafka.AllowAdminProducer {
+					t.Error("Expected Kafka.AllowAdminProducer to be true")
+				}
+			},
+		},
+		{
+			name:   "the prefixed BLNK_KAFKA_ALLOW_ADMIN_PRODUCER alias resolves",
+			envKey: "BLNK_KAFKA_ALLOW_ADMIN_PRODUCER",
+			value:  "true",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if !loaded.Kafka.AllowAdminProducer {
+					t.Error("Expected Kafka.AllowAdminProducer to be true")
 				}
 			},
 		},
@@ -1889,19 +2194,29 @@ func TestKafkaBrokersParsing(t *testing.T) {
 	}
 }
 
-// TestResolveWebhookDeprecationWindow covers the dual-delivery window, and above
-// all that it FAILS CLOSED.
+// TestResolveWebhookDeprecationWindow covers the dual-delivery window, whose surface is
+// exactly ONE setting.
 //
-// The previous behaviour of this check was advisory: a malformed sunset date was
-// warned about and then ignored, and an absent one was treated as "the sunset has
-// not passed". Both defaults kept the deprecated HTTP webhook transport running
-// indefinitely, and neither produced a failure anybody would notice — a single
-// mis-typed environment variable silently cancelled the retirement of the transport
-// this whole feature exists to replace. So the check now refuses the configuration,
-// and every case below asserts the error rather than the warning.
+// # The two failure modes are deliberately treated differently
 //
-// The one case that legitimately has no window is a deployment with NO Kafka
-// brokers: there is nothing to migrate to, so there is nothing to describe.
+// A date that will not parse is FATAL. An operator stated a retirement instant and got
+// it wrong, and the silent resolution would be "keep the legacy behaviour" — so a
+// single mis-typed variable would cancel the retirement of the very transport this
+// feature exists to replace, with nothing failing and nothing to notice.
+//
+// An ABSENT date is a warning. Nothing was mis-stated; a retirement instant simply has
+// not been chosen yet, and AAP §0.7.2 requires a deployment to keep starting and serving
+// as Kafka configuration is introduced. Failing here would make adding KAFKA_BROKERS —
+// on its own a safe additive change — an outage, and the consequence of no date is that
+// dual delivery continues, which is the pre-existing, subscriber-safe behaviour.
+//
+// # There is only one input, so the window cannot be inconsistent
+//
+// The start is DERIVED as sunset minus WebhookDualDeliveryWindowDays and carries no
+// environment variable, per the eight-variable R-10 contract. With one settable end
+// there is no second value to disagree with, so "exactly 30 days" is a property of the
+// arithmetic rather than a rule that has to be enforced — which is why the cases that
+// used to assert a mismatched pair being refused are gone rather than relaxed.
 func TestResolveWebhookDeprecationWindow(t *testing.T) {
 	clearEventStreamingEnv(t)
 
@@ -1922,76 +2237,42 @@ func TestResolveWebhookDeprecationWindow(t *testing.T) {
 		}
 	})
 
-	t.Run("a start alone derives a sunset exactly one window later", func(t *testing.T) {
+	t.Run("a start present on the struct is overwritten by the derived value", func(t *testing.T) {
+		// The field is output-only. A value that reached it from a configuration file, or
+		// from a caller assembling the struct directly, must not be able to describe a
+		// window of a different length than the code guarantees.
 		cnf := eventStreamingBaseConfig()
-		cnf.WebhookDeprecationStartDate = testWindowStart
+		cnf.WebhookDeprecationSunsetDate = testWindowSunset
+		cnf.WebhookDeprecationStartDate = "2001-01-01T00:00:00Z"
 
 		if err := cnf.validateAndAddDefaults(); err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
-		if cnf.WebhookDeprecationSunsetDate != testWindowSunset {
-			t.Errorf("Expected the derived sunset to be %q, got %q", testWindowSunset, cnf.WebhookDeprecationSunsetDate)
+
+		if cnf.WebhookDeprecationStartDate == "2001-01-01T00:00:00Z" {
+			t.Fatal("The window start was honoured as an input; it must always be derived")
+		}
+		if cnf.WebhookDeprecationStartDate != testWindowStart {
+			t.Errorf("Expected the derived window start to be %q, got %q",
+				testWindowStart, cnf.WebhookDeprecationStartDate)
 		}
 
-		// Asserted as arithmetic as well as as a literal, so that changing
+		// And the interval is computed rather than trusted, so a change to
 		// WebhookDualDeliveryWindowDays cannot leave this test agreeing with itself.
 		start, err := time.Parse(time.RFC3339, cnf.WebhookDeprecationStartDate)
 		if err != nil {
-			t.Fatalf("Expected the window start to parse, got %v", err)
+			t.Fatalf("parsing the derived start: %v", err)
 		}
 		sunset, err := time.Parse(time.RFC3339, cnf.WebhookDeprecationSunsetDate)
 		if err != nil {
-			t.Fatalf("Expected the sunset to parse, got %v", err)
+			t.Fatalf("parsing the sunset: %v", err)
 		}
 		if got := sunset.Sub(start); got != WebhookDualDeliveryWindowDays*24*time.Hour {
-			t.Errorf("Expected the window to be exactly %d days, got %s", WebhookDualDeliveryWindowDays, got)
+			t.Errorf("Expected the window to be exactly %d days, got %s",
+				WebhookDualDeliveryWindowDays, got)
 		}
 	})
 
-	t.Run("a matching start and sunset pair is accepted", func(t *testing.T) {
-		cnf := eventStreamingBaseConfig()
-		cnf.WebhookDeprecationStartDate = testWindowStart
-		cnf.WebhookDeprecationSunsetDate = testWindowSunset
-
-		if err := cnf.validateAndAddDefaults(); err != nil {
-			t.Fatalf("Expected no error, got %v", err)
-		}
-	})
-
-	// The exact-window rule. A window silently shortened to 14 days, or stretched to
-	// 45, contradicts the deprecation notice subscribers were given, and nothing else
-	// in the system can detect the discrepancy.
-	t.Run("a start and sunset that are not exactly one window apart are refused", func(t *testing.T) {
-		mismatched := []struct {
-			name   string
-			start  string
-			sunset string
-		}{
-			{name: "too short by half", start: testWindowStart, sunset: "2026-08-20T00:00:00Z"},
-			{name: "too long", start: testWindowStart, sunset: "2026-09-19T00:00:00Z"},
-			{name: "one second short", start: testWindowStart, sunset: "2026-09-03T23:59:59Z"},
-			{name: "one second long", start: testWindowStart, sunset: "2026-09-04T00:00:01Z"},
-			{name: "sunset before start", start: testWindowSunset, sunset: testWindowStart},
-		}
-
-		for _, tc := range mismatched {
-			t.Run(tc.name, func(t *testing.T) {
-				cnf := eventStreamingBaseConfig()
-				cnf.WebhookDeprecationStartDate = tc.start
-				cnf.WebhookDeprecationSunsetDate = tc.sunset
-
-				err := cnf.validateAndAddDefaults()
-				if err == nil {
-					t.Fatalf("Expected an error for the %s window %s..%s", tc.name, tc.start, tc.sunset)
-				}
-				if !strings.Contains(err.Error(), "exactly") {
-					t.Errorf("Expected the error to state the exact-window rule, got %q", err.Error())
-				}
-			})
-		}
-	})
-
-	// The finding this test exists for: a malformed date must NOT be ignored.
 	t.Run("a malformed date is refused rather than ignored", func(t *testing.T) {
 		malformed := []string{
 			"04/09/2026",
@@ -2003,47 +2284,74 @@ func TestResolveWebhookDeprecationWindow(t *testing.T) {
 
 		for _, value := range malformed {
 			t.Run(value, func(t *testing.T) {
-				t.Run("as the sunset", func(t *testing.T) {
-					cnf := eventStreamingBaseConfig()
-					cnf.WebhookDeprecationSunsetDate = value
+				cnf := eventStreamingBaseConfig()
+				cnf.WebhookDeprecationSunsetDate = value
 
-					err := cnf.validateAndAddDefaults()
-					if err == nil {
-						t.Fatalf("Expected an error for the malformed sunset %q", value)
-					}
-					if !strings.Contains(err.Error(), "webhook_deprecation_sunset_date") {
-						t.Errorf("Expected the error to name the field, got %q", err.Error())
-					}
-				})
-
-				t.Run("as the start", func(t *testing.T) {
-					cnf := eventStreamingBaseConfig()
-					cnf.WebhookDeprecationStartDate = value
-
-					err := cnf.validateAndAddDefaults()
-					if err == nil {
-						t.Fatalf("Expected an error for the malformed start %q", value)
-					}
-					if !strings.Contains(err.Error(), "webhook_deprecation_start_date") {
-						t.Errorf("Expected the error to name the field, got %q", err.Error())
-					}
-				})
+				err := cnf.validateAndAddDefaults()
+				if err == nil {
+					t.Fatalf("Expected an error for the malformed sunset %q", value)
+				}
+				if !strings.Contains(err.Error(), "webhook_deprecation_sunset_date") {
+					t.Errorf("Expected the error to name the field, got %q", err.Error())
+				}
 			})
 		}
+
+		// A malformed value on the DERIVED field cannot fail, because it is not read.
+		// This is asserted rather than assumed: an operator or a stale configuration file
+		// supplying nonsense for a value the code owns must not be able to fail the load.
+		t.Run("a malformed value on the derived start cannot fail the load", func(t *testing.T) {
+			cnf := eventStreamingBaseConfig()
+			cnf.WebhookDeprecationSunsetDate = testWindowSunset
+			cnf.WebhookDeprecationStartDate = "not-a-date"
+
+			if err := cnf.validateAndAddDefaults(); err != nil {
+				t.Fatalf("Expected the derived start to be ignored, got %v", err)
+			}
+			if cnf.WebhookDeprecationStartDate != testWindowStart {
+				t.Errorf("Expected the start to be replaced with %q, got %q",
+					testWindowStart, cnf.WebhookDeprecationStartDate)
+			}
+		})
 	})
 
-	// The second half of the finding: an ABSENT window is just as fail-open as a
-	// malformed one once Kafka is publishing, because dual delivery then has no end.
-	t.Run("an absent window is refused once kafka brokers are configured", func(t *testing.T) {
+	// An absent window with brokers configured is WARNED about and accepted. Failing
+	// would make enabling Kafka an outage, and the consequence — dual delivery
+	// continuing — is the pre-existing, subscriber-safe behaviour. The warning is
+	// asserted, not just the absence of an error: an accepted misconfiguration that
+	// says nothing is the failure mode this replaced.
+	t.Run("an absent window is warned about once kafka brokers are configured", func(t *testing.T) {
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
 		cnf := eventStreamingBaseConfig()
 		cnf.Kafka.Brokers = []string{"broker-1:9092"}
 
-		err := cnf.validateAndAddDefaults()
-		if err == nil {
-			t.Fatal("Expected an error when brokers are configured with no dual-delivery window")
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected brokers with no window to be accepted, got %v", err)
 		}
-		if !strings.Contains(err.Error(), "webhook_deprecation_sunset_date is required") {
-			t.Errorf("Expected the error to say the sunset is required, got %q", err.Error())
+
+		var warned bool
+		for _, entry := range hook.AllEntries() {
+			if entry.Level != logrus.WarnLevel {
+				continue
+			}
+			if strings.Contains(entry.Message, "webhook deprecation sunset date") {
+				warned = true
+
+				if !strings.Contains(entry.Message, "INDEFINITELY") {
+					t.Errorf("Expected the warning to state the consequence, got %q", entry.Message)
+				}
+			}
+		}
+		if !warned {
+			t.Error("Expected a warning naming the missing sunset date; accepting the " +
+				"configuration silently is what leaves dual delivery running with no end")
+		}
+
+		if cnf.WebhookDeprecationSunsetDate != "" || cnf.WebhookDeprecationStartDate != "" {
+			t.Errorf("Expected both ends to stay empty, got start %q sunset %q",
+				cnf.WebhookDeprecationStartDate, cnf.WebhookDeprecationSunsetDate)
 		}
 	})
 
@@ -2564,22 +2872,24 @@ func TestBareEnvNameFrom(t *testing.T) {
 	}
 }
 
-// TestValidateAndAddDefaults_KafkaGeometryAndPrefixWarnings covers the two load-time
-// diagnostics for values that are silently corrected, or silently rejected, later on.
+// TestValidateAndAddDefaults_KafkaGeometryWarnings covers the load-time diagnostics for
+// GEOMETRY values that are silently corrected later on.
 //
-// Both exist because the correction happens somewhere the operator is not looking. A
-// negative partition count is raised to the required minimum by topic assurance, and a
-// prefix carrying an illegal character composes a topic name the broker refuses — in both
-// cases at the moment Kafka is first used, which for a deployment with no event traffic in
-// flight can be long after start-up and a long way from the variable that caused it.
+// A negative partition count or replication factor is raised to a usable value by topic
+// assurance, at the moment Kafka is first used — which for a deployment with no event
+// traffic in flight can be long after start-up and a long way from the variable that
+// caused it. Naming it at load turns a silent correction into a line in the boot log.
 //
-// They stay WARNINGS: validateRequiredFields requires only the two DSNs, and a deployment
-// that does not use Kafka must not be stopped from booting by a stray variable.
-func TestValidateAndAddDefaults_KafkaGeometryAndPrefixWarnings(t *testing.T) {
+// These stay WARNINGS, and the distinction from the topic prefix is deliberate rather than
+// inconsistent. A corrected geometry still delivers every event: six partitions instead of
+// minus four is a different shape, not a lost message. An illegal PREFIX loses events
+// outright — the rows are captured naming a topic the broker will never create, and their
+// dead-letter names are illegal too — so it is fatal, and
+// TestValidateKafkaTopicPrefix_RefusesAPrefixThatCannotComposeALegalTopicName owns it.
+func TestValidateAndAddDefaults_KafkaGeometryWarnings(t *testing.T) {
 	const (
 		negativePartitionsWarning = "KAFKA_MIN_PARTITIONS is negative"
 		negativeReplicationWarn   = "KAFKA_REPLICATION_FACTOR is negative"
-		illegalPrefixWarning      = "KAFKA_TOPIC_PREFIX contains characters Kafka does not permit"
 	)
 
 	cases := []struct {
@@ -2592,45 +2902,33 @@ func TestValidateAndAddDefaults_KafkaGeometryAndPrefixWarnings(t *testing.T) {
 			name:     "a negative partition count warns",
 			kafka:    KafkaConfig{MinPartitions: -4},
 			want:     []string{negativePartitionsWarning},
-			unwanted: []string{negativeReplicationWarn, illegalPrefixWarning},
+			unwanted: []string{negativeReplicationWarn},
 		},
 		{
 			name:     "a negative replication factor warns",
 			kafka:    KafkaConfig{ReplicationFactor: -1},
 			want:     []string{negativeReplicationWarn},
-			unwanted: []string{negativePartitionsWarning, illegalPrefixWarning},
+			unwanted: []string{negativePartitionsWarning},
 		},
 		{
-			name:     "an interior space in the prefix warns",
-			kafka:    KafkaConfig{TopicPrefix: "with space"},
-			want:     []string{illegalPrefixWarning},
-			unwanted: []string{negativePartitionsWarning, negativeReplicationWarn},
-		},
-		{
-			name:     "an interior slash in the prefix warns",
-			kafka:    KafkaConfig{TopicPrefix: "tenant/one"},
-			want:     []string{illegalPrefixWarning},
-			unwanted: []string{negativePartitionsWarning, negativeReplicationWarn},
-		},
-		{
-			// Trimmed by the topic composer, so reporting it would be noise about
-			// something that is already handled correctly.
+			// Trimmed by the topic composer and by the prefix validation, so there is
+			// nothing to report about something that is already handled correctly.
 			name:     "surrounding whitespace and dots are not reported",
 			kafka:    KafkaConfig{TopicPrefix: "  .blnk. \n"},
 			want:     nil,
-			unwanted: []string{illegalPrefixWarning},
+			unwanted: []string{negativePartitionsWarning, negativeReplicationWarn},
 		},
 		{
 			name:     "a legal prefix with every permitted character warns about nothing",
 			kafka:    KafkaConfig{TopicPrefix: "blnk-2_prod.eu"},
 			want:     nil,
-			unwanted: []string{illegalPrefixWarning, negativePartitionsWarning, negativeReplicationWarn},
+			unwanted: []string{negativePartitionsWarning, negativeReplicationWarn},
 		},
 		{
 			name:     "an unset geometry warns about nothing",
 			kafka:    KafkaConfig{},
 			want:     nil,
-			unwanted: []string{negativePartitionsWarning, negativeReplicationWarn, illegalPrefixWarning},
+			unwanted: []string{negativePartitionsWarning, negativeReplicationWarn},
 		},
 	}
 
@@ -2645,7 +2943,7 @@ func TestValidateAndAddDefaults_KafkaGeometryAndPrefixWarnings(t *testing.T) {
 			cnf.Kafka = tc.kafka
 
 			if err := cnf.validateAndAddDefaults(); err != nil {
-				t.Fatalf("Expected a Kafka geometry or prefix problem to warn, not to fail; got %v", err)
+				t.Fatalf("Expected a Kafka geometry problem to warn, not to fail; got %v", err)
 			}
 
 			for _, warning := range tc.want {
@@ -2677,6 +2975,257 @@ func TestValidateAndAddDefaults_KafkaGeometryAndPrefixWarnings(t *testing.T) {
 		if cnf.Kafka.MinPartitions != -4 {
 			t.Errorf("Expected the configured value to be preserved for the warning to describe, got %d",
 				cnf.Kafka.MinPartitions)
+		}
+	})
+}
+
+// TestValidateKafkaTopicPrefix_RefusesAPrefixThatCannotComposeALegalTopicName is the
+// configuration-load half of the fix for the prefix that only warned.
+//
+// The behaviour it replaces was the worst of the three available: the illegal value was
+// reported and then USED, so producers kept writing outbox rows naming a topic the broker
+// would never create. Every one of those rows exhausted its retry budget and then failed
+// its dead-letter write too, because the dead-letter name was composed from the same
+// illegal prefix — a ledger accepting mutations and silently notifying nobody. The warning
+// also interpolated the configured value straight into a log message, which is a
+// log-injection sink reachable by anyone who can set an environment variable.
+//
+// So the load now fails, and these are the cases it must fail on and the cases it must
+// still accept.
+func TestValidateKafkaTopicPrefix_RefusesAPrefixThatCannotComposeALegalTopicName(t *testing.T) {
+	t.Run("an interior illegal character is fatal and is reported as a quoted rune", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.TopicPrefix = "blnk prod"
+
+		err := cnf.validateAndAddDefaults()
+		if err == nil {
+			t.Fatal("Expected an interior space to fail the configuration load")
+		}
+		if !strings.Contains(err.Error(), "KAFKA_TOPIC_PREFIX") {
+			t.Errorf("Expected the error to name the variable, got %q", err.Error())
+		}
+		if !strings.Contains(err.Error(), `' '`) {
+			t.Errorf("Expected the offending character quoted, got %q", err.Error())
+		}
+	})
+
+	t.Run("a control character is quoted rather than emitted", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.TopicPrefix = "blnk\nfake-log-record"
+
+		err := cnf.validateAndAddDefaults()
+		if err == nil {
+			t.Fatal("Expected a newline in the prefix to fail the configuration load")
+		}
+		if strings.Contains(err.Error(), "\n") {
+			t.Errorf("The error must not carry the raw control character: %q", err.Error())
+		}
+		if !strings.Contains(err.Error(), `'\n'`) {
+			t.Errorf("Expected the newline quoted, got %q", err.Error())
+		}
+	})
+
+	t.Run("a prefix too long to compose the longest topic name is fatal", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.TopicPrefix = strings.Repeat("a", MaxKafkaTopicPrefixLength+1)
+
+		err := cnf.validateAndAddDefaults()
+		if err == nil {
+			t.Fatal("Expected an over-long prefix to fail the configuration load")
+		}
+		if !strings.Contains(err.Error(), "KAFKA_TOPIC_PREFIX") {
+			t.Errorf("Expected the error to name the variable, got %q", err.Error())
+		}
+	})
+
+	t.Run("the longest legal prefix is accepted", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.TopicPrefix = strings.Repeat("a", MaxKafkaTopicPrefixLength)
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected the longest legal prefix to be accepted, got %v", err)
+		}
+	})
+
+	t.Run("legal separators and mixed case are accepted unchanged", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.TopicPrefix = "Blnk_prod-eu.1"
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected a legal prefix to be accepted, got %v", err)
+		}
+		if cnf.Kafka.TopicPrefix != "Blnk_prod-eu.1" {
+			t.Errorf("A legal prefix must survive validation unchanged, got %q", cnf.Kafka.TopicPrefix)
+		}
+	})
+
+	t.Run("the realistic accidents are normalised rather than refused", func(t *testing.T) {
+		for _, configured := range []string{" blnk\n", ".blnk.", "\tblnk\r\n"} {
+			cnf := kafkaEnabledConfig("localhost:9092")
+			cnf.Kafka.TopicPrefix = configured
+
+			if err := cnf.validateAndAddDefaults(); err != nil {
+				t.Fatalf("Expected %q to be normalised rather than refused, got %v", configured, err)
+			}
+			if cnf.Kafka.TopicPrefix != "blnk" {
+				t.Errorf("Expected %q to normalise to \"blnk\", got %q", configured, cnf.Kafka.TopicPrefix)
+			}
+		}
+	})
+
+	t.Run("a whitespace-only prefix falls back to the default and is stored", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.TopicPrefix = " . "
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected a blank prefix to resolve to the default, got %v", err)
+		}
+		if cnf.Kafka.TopicPrefix != defaultKafka.TopicPrefix {
+			t.Errorf("Expected the stored prefix to be the default %q, got %q",
+				defaultKafka.TopicPrefix, cnf.Kafka.TopicPrefix)
+		}
+	})
+
+	t.Run("the prefix is validated even when no broker is configured", func(t *testing.T) {
+		// A deployment can configure the prefix before the brokers. Refusing only when
+		// brokers are present would let the illegal value sit unnoticed until the day
+		// someone switched publishing on.
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.TopicPrefix = "blnk prod"
+
+		if err := cnf.validateAndAddDefaults(); err == nil {
+			t.Fatal("Expected the prefix to be validated independently of the broker list")
+		}
+	})
+}
+
+// TestEventRetentionPeriod_ConvertsDaysAndRefusesANegativePeriod covers the conversion and the
+// one input that would be catastrophic to honour.
+//
+// The configured value is DAYS and every consumer needs a duration, so the conversion is where
+// an order-of-magnitude error hides — hours instead of days would delete rows an operator
+// expected to keep for a month, irreversibly and with no error to notice. A NEGATIVE value is
+// worse still: read literally it places the cutoff in the FUTURE, which makes every terminal
+// row eligible including ones delivered seconds ago. It is almost certainly a typo, and the
+// most destructive possible reading of a typo is not the one to take, so it is refused and
+// retention is disabled instead.
+func TestEventRetentionPeriod_ConvertsDaysAndRefusesANegativePeriod(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		days     int
+		want     time.Duration
+		wantDays int
+	}{
+		"disabled by default":   {days: 0, want: 0, wantDays: 0},
+		"a single day":          {days: 1, want: 24 * time.Hour, wantDays: 1},
+		"thirty days":           {days: 30, want: 720 * time.Hour, wantDays: 30},
+		"ninety days":           {days: 90, want: 2160 * time.Hour, wantDays: 90},
+		"a negative period":     {days: -30, want: 0, wantDays: 0},
+		"a negative single day": {days: -1, want: 0, wantDays: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearEventStreamingEnv(t)
+
+			cnf := eventStreamingBaseConfig()
+			cnf.Relay.EventRetentionDays = testCase.days
+			if err := cnf.validateAndAddDefaults(); err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+
+			if cnf.Relay.EventRetentionDays != testCase.wantDays {
+				t.Errorf("Expected Relay.EventRetentionDays to be %d, got %d",
+					testCase.wantDays, cnf.Relay.EventRetentionDays)
+			}
+			if period := cnf.EventRetentionPeriod(); period != testCase.want {
+				t.Errorf("Expected EventRetentionPeriod to be %s, got %s", testCase.want, period)
+			}
+		})
+	}
+
+	t.Run("a nil configuration reports retention as disabled rather than panicking", func(t *testing.T) {
+		var cnf *Configuration
+		if period := cnf.EventRetentionPeriod(); period != 0 {
+			t.Errorf("Expected 0 for a nil configuration, got %s", period)
+		}
+	})
+}
+
+// TestEventRetentionDays_ResolvesFromBothEnvironmentVariableForms asserts the retention
+// variable follows the same dual-name contract as the other eight.
+//
+// The bare RELAY_EVENT_RETENTION_DAYS is the documented name, and the BLNK_-prefixed form is
+// the repository's own convention. Both must resolve, or an operator following either the
+// documentation or the surrounding convention would find retention silently switched off —
+// and the symptom of that is a table that just keeps growing.
+func TestEventRetentionDays_ResolvesFromBothEnvironmentVariableForms(t *testing.T) {
+	for name, variable := range map[string]string{
+		"the documented bare name":             "RELAY_EVENT_RETENTION_DAYS",
+		"the repository's prefixed convention": "BLNK_RELAY_EVENT_RETENTION_DAYS",
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearEventStreamingEnv(t)
+			t.Setenv(variable, "45")
+
+			cnf := eventStreamingBaseConfig()
+			if err := applyEventStreamingEnvOverride(&cnf); err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+			if err := cnf.validateAndAddDefaults(); err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+
+			if cnf.Relay.EventRetentionDays != 45 {
+				t.Errorf("Expected %s to set Relay.EventRetentionDays to 45, got %d",
+					variable, cnf.Relay.EventRetentionDays)
+			}
+			if period := cnf.EventRetentionPeriod(); period != 45*24*time.Hour {
+				t.Errorf("Expected a 45-day period, got %s", period)
+			}
+		})
+	}
+}
+
+// TestWebhookConfig_AllowPrivateDestinationDefaultsToRefusing pins the SAFE default of the
+// legacy transport's destination policy (SSRF-01).
+//
+// # Why this deserves its own test
+//
+// Every test that needs internal delivery sets this flag explicitly, so a change that made
+// it default to true would break nothing and be caught by nothing — while silently opening
+// loopback, RFC1918 and plain http on every deployment that never mentions it. The default is
+// the security property; the flag is only the exception to it.
+//
+// It is asserted after validateAndAddDefaults rather than on a bare literal, because a
+// default setter is exactly where such a change would be introduced.
+func TestWebhookConfig_AllowPrivateDestinationDefaultsToRefusing(t *testing.T) {
+	cnf := Configuration{
+		ProjectName: "Test Project",
+		DataSource:  DataSourceConfig{Dns: "some-dns"},
+		Redis:       RedisConfig{Dns: "localhost:6379"},
+		Notification: Notification{
+			Webhook: WebhookConfig{Url: "https://hooks.example.com/blnk"},
+		},
+	}
+
+	if err := cnf.validateAndAddDefaults(); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if cnf.Notification.Webhook.AllowPrivateDestination {
+		t.Error("notification.webhook.allow_private_destination must default to false: an " +
+			"operator who has not asserted that their destination is internal must not have " +
+			"http, loopback and RFC1918 opened on their behalf")
+	}
+
+	t.Run("an explicit assertion survives the default setters", func(t *testing.T) {
+		asserted := cnf
+		asserted.Notification.Webhook.AllowPrivateDestination = true
+
+		if err := asserted.validateAndAddDefaults(); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		if !asserted.Notification.Webhook.AllowPrivateDestination {
+			t.Error("a default setter must not overwrite an assertion the operator made")
 		}
 	})
 }

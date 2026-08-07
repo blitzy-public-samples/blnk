@@ -65,6 +65,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/embedded"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -88,10 +89,21 @@ var (
 	_ metric.Int64Counter     = EventsPublishedTotal
 	_ metric.Int64Counter     = EventPublishAttemptsTotal
 	_ metric.Float64Histogram = EventPublishDuration
+	_ metric.Float64Histogram = EventCaptureToDispatchDuration
 	_ metric.Int64Counter     = EventsDeadLetteredTotal
 	_ metric.Float64Gauge     = DLTOldestMessageAgeSeconds
-	_ metric.Int64Gauge       = SubscriberConsumerLag
 	_ metric.Int64Gauge       = OutboxPendingBacklog
+
+	// The two lag instruments are ASYNCHRONOUS, and the distinction this guard enforces
+	// is the whole cardinality fix rather than a stylistic preference. A synchronous
+	// Int64Gauge is a write whose aggregator retains every attribute set it has ever
+	// been written with, and it has no delete — so with a dynamic label set, subscriber
+	// churn grows the series count without bound and no zero written afterwards can
+	// retire a series. An Int64ObservableGauge exports exactly what its callback observes
+	// per collection, so the series set IS the current inventory. The two kinds are not
+	// mutually assignable, so reverting either declaration fails to compile here.
+	_ metric.Int64ObservableGauge = SubscriberConsumerLag
+	_ metric.Int64ObservableGauge = ConsumerLagUnmeasuredPartitions
 )
 
 // publishOutcomes is the complete vocabulary of the "outcome" attribute carried by
@@ -141,7 +153,7 @@ type namedInstrument struct {
 	value any
 }
 
-// eventStreamingInstruments returns the seven instruments added for the Kafka
+// eventStreamingInstruments returns the eight instruments added for the Kafka
 // event-publishing pipeline, each labelled with its variable name.
 //
 // This is a FUNCTION and not a package-level table for a load-bearing reason. Go
@@ -157,9 +169,11 @@ func eventStreamingInstruments() []namedInstrument {
 		{"EventsPublishedTotal", EventsPublishedTotal},
 		{"EventPublishAttemptsTotal", EventPublishAttemptsTotal},
 		{"EventPublishDuration", EventPublishDuration},
+		{"EventCaptureToDispatchDuration", EventCaptureToDispatchDuration},
 		{"EventsDeadLetteredTotal", EventsDeadLetteredTotal},
 		{"DLTOldestMessageAgeSeconds", DLTOldestMessageAgeSeconds},
 		{"SubscriberConsumerLag", SubscriberConsumerLag},
+		{"ConsumerLagUnmeasuredPartitions", ConsumerLagUnmeasuredPartitions},
 		{"OutboxPendingBacklog", OutboxPendingBacklog},
 	}
 }
@@ -297,9 +311,11 @@ func TestEventStreamingInstruments_DeclaredKindsMatchTheirInstrumentType(t *test
 		{"EventsPublishedTotal", EventsPublishedTotal, (*metric.Int64Counter)(nil)},
 		{"EventPublishAttemptsTotal", EventPublishAttemptsTotal, (*metric.Int64Counter)(nil)},
 		{"EventPublishDuration", EventPublishDuration, (*metric.Float64Histogram)(nil)},
+		{"EventCaptureToDispatchDuration", EventCaptureToDispatchDuration, (*metric.Float64Histogram)(nil)},
 		{"EventsDeadLetteredTotal", EventsDeadLetteredTotal, (*metric.Int64Counter)(nil)},
 		{"DLTOldestMessageAgeSeconds", DLTOldestMessageAgeSeconds, (*metric.Float64Gauge)(nil)},
-		{"SubscriberConsumerLag", SubscriberConsumerLag, (*metric.Int64Gauge)(nil)},
+		{"SubscriberConsumerLag", SubscriberConsumerLag, (*metric.Int64ObservableGauge)(nil)},
+		{"ConsumerLagUnmeasuredPartitions", ConsumerLagUnmeasuredPartitions, (*metric.Int64ObservableGauge)(nil)},
 		{"OutboxPendingBacklog", OutboxPendingBacklog, (*metric.Int64Gauge)(nil)},
 	}
 
@@ -360,6 +376,19 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 		})
 	})
 
+	t.Run("EventCaptureToDispatchDuration", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			// 1.75 seconds: an event that waited for a poll tick and then published,
+			// which is the shape this instrument exists to measure and the per-write
+			// histogram above cannot see. No outcome attribute — only an acknowledged
+			// publish has an end-to-end age at all.
+			EventCaptureToDispatchDuration.Record(ctx, 1.75, metric.WithAttributes(
+				attribute.String("topic", "blnk.transactions"),
+				attribute.String("attempt", "1"),
+			))
+		})
+	})
+
 	t.Run("EventsDeadLetteredTotal", func(t *testing.T) {
 		require.NotPanics(t, func() {
 			// The topic attribute deliberately carries the ORIGINAL category
@@ -385,15 +414,45 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 		})
 	})
 
-	t.Run("SubscriberConsumerLag", func(t *testing.T) {
+	t.Run("the asynchronous lag gauges", func(t *testing.T) {
+		// These two are OBSERVABLE, so there is no Record to drive. The equivalent
+		// operation is publishing an inventory and letting the registered callback
+		// observe it, which is what this exercises: 10001 messages is just past the
+		// 10000-message alerting threshold, and the second sample is the incomplete
+		// case whose lag must be withheld.
 		require.NotPanics(t, func() {
-			// 10001 messages is just past the 10000-message alerting threshold.
-			SubscriberConsumerLag.Record(ctx, 10001, metric.WithAttributes(
-				attribute.String("subscriber", "sub_01HZX9K2Q4"),
-				attribute.String("group", "blnk-sub-01HZX9K2Q4"),
-				attribute.String("topic", "blnk.transactions"),
-			))
+			PublishConsumerLagInventory([]ConsumerLagSample{
+				{
+					Subscriber:  "sub_01HZX9K2Q4",
+					Group:       "blnk-sub-01HZX9K2Q4",
+					Topic:       "blnk.transactions",
+					Lag:         10001,
+					LagComplete: true,
+				},
+				{
+					Subscriber:           "sub_01HZX9K2Q4",
+					Group:                "blnk-sub-01HZX9K2Q4",
+					Topic:                "blnk.balances",
+					Lag:                  7,
+					LagComplete:          false,
+					UnmeasuredPartitions: 2,
+				},
+			})
+
+			observer := &capturingObserver{}
+			require.NoError(t, observeConsumerLagInventory(ctx, observer))
+
+			// THE WITHHOLDING CONTRACT, asserted at the layer that decides it. Both samples
+			// contribute an unmeasured-partition reading, and only the complete one
+			// contributes a lag — because a partial sum is a lower bound and exporting it
+			// would resolve the >10000 alert with a figure known to be too small.
+			assert.Equal(t, []int64{10001}, observer.int64For(SubscriberConsumerLag),
+				"only the completely measured topic may export a lag")
+			assert.Equal(t, []int64{0, 2}, observer.int64For(ConsumerLagUnmeasuredPartitions),
+				"every measured topic reports its unmeasured-partition count, zero included")
 		})
+
+		t.Cleanup(func() { PublishConsumerLagInventory(nil) })
 	})
 
 	t.Run("OutboxPendingBacklog", func(t *testing.T) {
@@ -403,6 +462,101 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 			// ChainBacklog.
 			OutboxPendingBacklog.Record(ctx, 42)
 		})
+	})
+}
+
+// TestPublishConsumerLagInventory_ReplacesRatherThanMerges pins the property the whole
+// cardinality fix rests on.
+//
+// A merging publication would reproduce the exact defect the asynchronous gauges were adopted
+// to remove: series would accumulate across ticks and the count would become the union of every
+// inventory the process had ever seen. REPLACEMENT is what makes the exported series set equal
+// to the current one, and it is why the collector must pass its whole measured set on every tick
+// rather than a delta.
+func TestPublishConsumerLagInventory_ReplacesRatherThanMerges(t *testing.T) {
+	t.Cleanup(func() { PublishConsumerLagInventory(nil) })
+
+	first := []ConsumerLagSample{
+		{Subscriber: "sub_a", Group: "blnk-sub-sub_a", Topic: "blnk.transactions", Lag: 11, LagComplete: true},
+		{Subscriber: "sub_b", Group: "blnk-sub-sub_b", Topic: "blnk.balances", Lag: 22, LagComplete: true},
+	}
+	PublishConsumerLagInventory(first)
+	require.Len(t, ConsumerLagInventory(), 2)
+
+	// sub_b is gone. After replacement it must be absent, not present at zero: a zero stops an
+	// alert but leaves the series in existence, which is what grew the count without bound.
+	PublishConsumerLagInventory([]ConsumerLagSample{first[0]})
+
+	remaining := ConsumerLagInventory()
+	require.Len(t, remaining, 1, "the inventory is the current set and nothing else")
+	assert.Equal(t, "sub_a", remaining[0].Subscriber)
+
+	observer := &capturingObserver{}
+	require.NoError(t, observeConsumerLagInventory(context.Background(), observer))
+	assert.Equal(t, []int64{11}, observer.int64For(SubscriberConsumerLag),
+		"only the surviving subscriber may be observed, so only its series is exported")
+
+	t.Run("an empty publication retires everything", func(t *testing.T) {
+		PublishConsumerLagInventory(nil)
+		assert.Empty(t, ConsumerLagInventory())
+
+		empty := &capturingObserver{}
+		require.NoError(t, observeConsumerLagInventory(context.Background(), empty))
+		assert.Empty(t, empty.int64For(SubscriberConsumerLag),
+			"no registry, no broker or no subscribers must export no lag at all")
+		assert.Empty(t, empty.int64For(ConsumerLagUnmeasuredPartitions))
+	})
+
+	t.Run("the published slice is copied, so a caller may reuse its buffer", func(t *testing.T) {
+		buffer := []ConsumerLagSample{
+			{Subscriber: "sub_c", Group: "blnk-sub-sub_c", Topic: "blnk.identities", Lag: 5, LagComplete: true},
+		}
+		PublishConsumerLagInventory(buffer)
+
+		// The collector reuses its accumulator between ticks, so aliasing here would let a
+		// later tick rewrite telemetry that has already been published.
+		buffer[0].Lag = 999_999
+		buffer[0].Subscriber = "mutated"
+
+		published := ConsumerLagInventory()
+		require.Len(t, published, 1)
+		assert.Equal(t, int64(5), published[0].Lag, "a mutation after publication must not reach the export")
+		assert.Equal(t, "sub_c", published[0].Subscriber)
+
+		// And the reader copies too, for the same reason in the other direction.
+		published[0].Lag = -1
+		assert.Equal(t, int64(5), ConsumerLagInventory()[0].Lag,
+			"ConsumerLagInventory must copy, or a reader could rewrite what is exported")
+	})
+
+	t.Run("publishing concurrently with observation is safe", func(t *testing.T) {
+		// The SDK invokes the callback on its own collection goroutine, which is concurrent
+		// with the collector's tick by construction. Under -race this is the assertion.
+		var wg sync.WaitGroup
+		for worker := range 8 {
+			wg.Add(2)
+
+			go func(worker int) {
+				defer wg.Done()
+
+				PublishConsumerLagInventory([]ConsumerLagSample{{
+					Subscriber:  "sub_concurrent",
+					Group:       "blnk-sub-sub_concurrent",
+					Topic:       "blnk.transactions",
+					Lag:         int64(worker),
+					LagComplete: true,
+				}})
+			}(worker)
+
+			go func() {
+				defer wg.Done()
+
+				assert.NoError(t, observeConsumerLagInventory(context.Background(), &capturingObserver{}))
+			}()
+		}
+		wg.Wait()
+
+		assert.Len(t, ConsumerLagInventory(), 1, "every publication replaces the whole inventory")
 	})
 }
 
@@ -571,6 +725,69 @@ func installSDKReader(t *testing.T) *sdkmetric.ManualReader {
 	return sharedReader
 }
 
+// capturingObserver is a metric.Observer that keeps what a callback observed, so the
+// asynchronous gauges' contract can be asserted without an SDK.
+//
+// It is the asynchronous counterpart of a fake instrument: an observable gauge has no Record
+// to intercept, so the interception point is the OBSERVER the callback is handed. What matters
+// operationally is not only the values but WHICH instrument received them — a sample whose lag
+// is withheld still observes its unmeasured-partition count — and that is a distinction only an
+// observer-level capture can make.
+//
+// embedded.Observer is embedded, not implemented: that is how the OpenTelemetry API intends
+// third-party implementations of its interfaces to be written.
+type capturingObserver struct {
+	embedded.Observer
+
+	int64Observations   []observedInt64
+	float64Observations []observedFloat64
+}
+
+// observedInt64 is one int64 observation and the instrument it was made against.
+type observedInt64 struct {
+	instrument metric.Int64Observable
+	value      int64
+}
+
+// observedFloat64 is one float64 observation and the instrument it was made against.
+type observedFloat64 struct {
+	instrument metric.Float64Observable
+	value      float64
+}
+
+var _ metric.Observer = (*capturingObserver)(nil)
+
+func (o *capturingObserver) ObserveInt64(
+	instrument metric.Int64Observable,
+	value int64,
+	_ ...metric.ObserveOption,
+) {
+	o.int64Observations = append(o.int64Observations, observedInt64{instrument: instrument, value: value})
+}
+
+func (o *capturingObserver) ObserveFloat64(
+	instrument metric.Float64Observable,
+	value float64,
+	_ ...metric.ObserveOption,
+) {
+	o.float64Observations = append(o.float64Observations, observedFloat64{instrument: instrument, value: value})
+}
+
+// int64For returns the values observed against one instrument, in observation order.
+//
+// Returns:
+//   - []int64: the values; empty when the instrument was never observed.
+func (o *capturingObserver) int64For(instrument metric.Int64Observable) []int64 {
+	values := []int64{}
+	for _, observation := range o.int64Observations {
+		if observation.instrument == instrument {
+			values = append(values, observation.value)
+		}
+	}
+
+	return values
+}
+
 // recordEveryEventInstrument drives one representative measurement through each of the
 // seven event-streaming instruments, using the attribute keys their declarations
 // document.
@@ -591,6 +808,10 @@ func recordEveryEventInstrument(ctx context.Context) {
 		attribute.String("attempt", "1"),
 		attribute.String("outcome", "dispatched"),
 	))
+	EventCaptureToDispatchDuration.Record(ctx, 1.75, metric.WithAttributes(
+		attribute.String("topic", "blnk.transactions"),
+		attribute.String("attempt", "1"),
+	))
 	EventsDeadLetteredTotal.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("topic", "blnk.transactions"),
 		attribute.String("event_type", "transaction.applied"),
@@ -598,11 +819,18 @@ func recordEveryEventInstrument(ctx context.Context) {
 	DLTOldestMessageAgeSeconds.Record(ctx, 901, metric.WithAttributes(
 		attribute.String("topic", "blnk.transactions.dlt"),
 	))
-	SubscriberConsumerLag.Record(ctx, 10001, metric.WithAttributes(
-		attribute.String("subscriber", "sub_0f6e2c8a"),
-		attribute.String("group", "blnk-grp-0f6e2c8a1b944106b4d6793e838afcbf"),
-		attribute.String("topic", "blnk.transactions"),
-	))
+	// The two lag gauges are ASYNCHRONOUS: publishing the inventory is the measurement, and
+	// the registered callback observes it when the reader collects. Both instruments are fed
+	// from this one sample, so a single complete entry produces a lag point and a zero
+	// unmeasured-partition point.
+	PublishConsumerLagInventory([]ConsumerLagSample{{
+		Subscriber:  "sub_0f6e2c8a",
+		Group:       "blnk-grp-0f6e2c8a1b944106b4d6793e838afcbf",
+		Topic:       "blnk.transactions",
+		Lag:         10001,
+		LagComplete: true,
+	}})
+
 	OutboxPendingBacklog.Record(ctx, 7)
 }
 
@@ -654,7 +882,7 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 		{
 			name:        "blnk.events.published.total",
 			unit:        "{event}",
-			description: "Total number of ledger events acknowledged by Kafka by topic and event type",
+			description: "Total number of ledger events durably recorded as dispatched by topic and event type",
 		},
 		{
 			name:        "blnk.events.publish.attempts.total",
@@ -662,9 +890,24 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 			description: "Total number of event publish attempts by outcome, retries included",
 		},
 		{
+			// THE CLAIM is the start of this interval, and the description says so. It is
+			// the broker write in relative isolation, which is the useful thing for it to
+			// be: subtracted from the end-to-end figure below, the difference is the queue
+			// wait, and that is what distinguishes a slow cluster from an under-provisioned
+			// relay. Either instrument alone sends an operator to the wrong system.
 			name:        "blnk.events.publish.duration",
 			unit:        "s",
 			description: "Duration of a single event publish attempt, from outbox claim to broker acknowledgement",
+		},
+		{
+			// THE ACCEPTANCE CRITERION IS READ FROM THIS ONE. V-1 is stated over
+			// "outbox-to-Kafka publish latency", and only this instrument starts its clock
+			// at the durable capture: timing from the claim excludes the poll delay and the
+			// backlog, so a relay an hour behind would report the same sub-second p99 as an
+			// idle one and would certify a target the system was missing.
+			name:        "blnk.events.capture_to_dispatch.duration",
+			unit:        "s",
+			description: "End-to-end age of a published event, from its capture in the transactional outbox to broker acknowledgement",
 		},
 		{
 			name:        "blnk.events.dead_lettered.total",
@@ -674,12 +917,17 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 		{
 			name:        "blnk.dlt.oldest_message_age_seconds",
 			unit:        "s",
-			description: "Seconds since the oldest unresolved dead-letter message was dead-lettered",
+			description: "Seconds the oldest unresolved dead-letter entry has been waiting, over rows in the failed or dead_lettered state, measured from the last publish attempt",
 		},
 		{
 			name:        "blnk.kafka.consumer_lag",
 			unit:        "{message}",
-			description: "Number of messages a subscriber consumer group trails the log end offset by",
+			description: "Number of messages a subscriber consumer group trails the log end offset by, for completely measured topics only",
+		},
+		{
+			name:        "blnk.kafka.consumer_lag_unmeasured_partitions",
+			unit:        "{partition}",
+			description: "Number of partitions whose offsets could not be read when a subscriber's lag was last measured",
 		},
 		{
 			name:        "blnk.outbox.pending",
@@ -768,6 +1016,71 @@ func TestEventPublishDuration_UsesExplicitSubTwoSecondBuckets(t *testing.T) {
 		"a 0.42s measurement must fall in the bucket ending at 0.5s")
 }
 
+// TestEventCaptureToDispatchDuration_BracketsTheTargetAndKeepsABacklogOnScale is the
+// bucket assertion for the instrument acceptance criterion V-1 is ACTUALLY read from.
+//
+// The per-write histogram cannot answer V-1 — its clock starts after the outbox claim, so it
+// excludes the pending wait and the poll interval, and a relay stalled for a minute still
+// reported a five-millisecond publish. This instrument spans capture to acknowledgement, and
+// its boundaries therefore have to do two things the per-write set does not: put an edge
+// exactly at the two-second target, and keep a genuinely backlogged pipeline on the scale
+// instead of collapsing every stalled event into +Inf, where one minute behind and five are
+// indistinguishable.
+func TestEventCaptureToDispatchDuration_BracketsTheTargetAndKeepsABacklogOnScale(t *testing.T) {
+	reader := installSDKReader(t)
+
+	// A topic of this test's own: the shared reader is cumulative, so a data point keyed on a
+	// topic another test also uses would carry its measurements into the placement assertion.
+	const scopedTopic = "blnk.capture-to-dispatch.test"
+
+	EventCaptureToDispatchDuration.Record(context.Background(), 1.75, metric.WithAttributes(
+		attribute.String("topic", scopedTopic),
+		attribute.String("attempt", "1"),
+	))
+
+	collected := collectScopeMetrics(t, reader)
+
+	metricData, ok := collected["blnk.events.capture_to_dispatch.duration"]
+	require.True(t, ok, "the capture-to-dispatch histogram was not exported")
+
+	histogram, ok := metricData.Data.(metricdata.Histogram[float64])
+	require.True(t, ok,
+		"blnk.events.capture_to_dispatch.duration must aggregate as a float64 histogram, got %T", metricData.Data)
+	require.NotEmpty(t, histogram.DataPoints, "the histogram reported no data points")
+
+	var point metricdata.HistogramDataPoint[float64]
+	var found bool
+	for _, candidate := range histogram.DataPoints {
+		if topic, ok := candidate.Attributes.Value("topic"); ok && topic.AsString() == scopedTopic {
+			point = candidate
+			found = true
+
+			break
+		}
+	}
+	require.True(t, found, "the scoped measurement produced no data point")
+
+	assert.Equal(t, EventCaptureToDispatchDurationBuckets, point.Bounds,
+		"the histogram is not using its declared explicit boundaries, so the p99 the acceptance "+
+			"criterion is read from would be interpolated across a five-second default bucket")
+	assert.Contains(t, point.Bounds, float64(2),
+		"2 must be a bucket EDGE so the two-second target is answered from counts rather than interpolated")
+	assert.Contains(t, point.Bounds, float64(31),
+		"31s is the whole configured retry schedule (1+2+4+8+16), so an event that spent its entire "+
+			"budget must land on an edge rather than be blended into a neighbour")
+	assert.Contains(t, point.Bounds, float64(300),
+		"a backlogged pipeline must stay on the scale: without a long edge, one minute behind and five "+
+			"are indistinguishable in +Inf")
+
+	// 1.75s must fall in the bucket ending at 2s: the cheapest possible proof that the
+	// boundaries are seconds and that the target edge is where the target is.
+	require.Len(t, point.BucketCounts, len(point.Bounds)+1, "bucket counts must be boundaries+1")
+	edge := indexOfBound(point.Bounds, 2)
+	require.GreaterOrEqual(t, edge, 0, "2 must be a boundary")
+	assert.Equal(t, uint64(1), point.BucketCounts[edge],
+		"a 1.75s end-to-end age must fall in the bucket ending at 2s, which is the bucket the target reads")
+}
+
 // indexOfBound returns the index of bound in bounds, or -1.
 func indexOfBound(bounds []float64, bound float64) int {
 	for i, candidate := range bounds {
@@ -799,9 +1112,20 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 		{metric: "blnk.events.published.total", keys: []string{"topic", "event_type"}},
 		{metric: "blnk.events.publish.attempts.total", keys: []string{"outcome"}},
 		{metric: "blnk.events.publish.duration", keys: []string{"topic", "attempt", "outcome"}},
+		// No outcome: only an acknowledged publish has an end-to-end age to report, so the
+		// attribute would carry one value on every series and add nothing.
+		{metric: "blnk.events.capture_to_dispatch.duration", keys: []string{"topic", "attempt"}},
 		{metric: "blnk.events.dead_lettered.total", keys: []string{"topic", "event_type"}},
 		{metric: "blnk.dlt.oldest_message_age_seconds", keys: []string{"topic"}},
 		{metric: "blnk.kafka.consumer_lag", keys: []string{"subscriber", "group", "topic"}},
+		// The measurement-health gauge shares the lag gauge's label tuple exactly, because
+		// the two are observed from ONE sample: an operator correlating "this subscriber's
+		// lag vanished" with "because two of its partitions are unreadable" joins on these
+		// three labels, and a divergence would make that join impossible.
+		{
+			metric: "blnk.kafka.consumer_lag_unmeasured_partitions",
+			keys:   []string{"subscriber", "group", "topic"},
+		},
 		// Deliberately unattributed: one process has one outbox backlog, so a label
 		// would add cardinality without adding information.
 		{metric: "blnk.outbox.pending", keys: nil},

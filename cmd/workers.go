@@ -151,17 +151,30 @@ func (b *blnkInstance) processTransaction(ctx context.Context, t *asynq.Task) er
 	return nil
 }
 
+// handleTransactionRejection rejects a transaction that has exhausted its retries or hit a
+// terminal processing error.
+//
+// # There is exactly ONE producer of transaction.rejected, and it is not here
+//
+// This function used to publish the event itself, immediately after RejectTransaction
+// returned. That was a DUPLICATE: RejectTransaction runs postTransactionActions, whose
+// status-derived producer already emits transaction.rejected for the very transaction being
+// rejected here.
+//
+// Under the legacy HTTP transport a duplicate merely meant two pushes. Under the outbox it
+// is worse than redundant. The event id is DERIVED from the transaction's identity, so both
+// captures compute the same id, the unique index on event_id refuses the second insert, and
+// the conflict was returned from here as the task's error — failing an asynq task whose
+// rejection had already committed, which then retried and failed again on the same conflict.
+//
+// Removing the second publish keeps coverage intact (the remaining producer runs on every
+// rejection, from every caller, not only from this worker) and removes the failure mode. Do
+// not reinstate it: if the rejection event ever needs enriching, enrich the single producer
+// in postTransactionActions.
 func handleTransactionRejection(ctx context.Context, b *blnkInstance, txn *model.Transaction, err error) error {
 	_, rejectErr := b.blnk.RejectTransaction(ctx, txn, err.Error())
-	if rejectErr != nil {
-		return rejectErr
-	}
 
-	publishErr := b.blnk.PublishEvent(ctx, blnk.NewWebhook{
-		Event:   "transaction.rejected",
-		Payload: *txn,
-	})
-	return publishErr
+	return rejectErr
 }
 
 func hasReachedMaxRetryAttempt(cfg *config.Configuration, retryCount int) bool {

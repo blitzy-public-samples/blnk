@@ -30,6 +30,121 @@ spec:
             - --config
             - /blnk.json
           env:
+            # ---------------------------------------------------------------------
+            # Kafka event streaming, outbox relay and webhook deprecation.
+            #
+            # EVERY KEY IS NAMED EXPLICITLY, and envFrom.configMapRef is NOT used —
+            # blnk-config.yaml explains why at length: that ConfigMap also holds the
+            # blnk.json document, and envFrom would inject the whole JSON file, data
+            # source DSN and password included, into this container's environment,
+            # where it surfaces in `env`, in `kubectl describe pod`, in crash dumps
+            # and in every child process. Kubernetes permits a dot in a variable
+            # name, so it neither skips that key nor warns.
+            #
+            # WITH KAFKA_BROKERS EMPTY — as blnk-config.yaml ships it — every key
+            # below is inert: NewEventPublisher selects the no-op publisher before it
+            # reads any of them, and Blnk serves and processes transactions exactly
+            # as it did before Kafka existed. Setting KAFKA_BROKERS is what activates
+            # them, and blnk-config.yaml lists what must be set in the same change.
+            # ---------------------------------------------------------------------
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_BROKERS
+            # The subscriber-facing bootstrap list, which is NOT KAFKA_BROKERS: that
+            # one is a Service name resolvable only inside this cluster, so
+            # reporting it to an external subscriber returns an endpoint it cannot
+            # dial. Empty refuses credential issuance with 503 rather than falling
+            # back to it. See blnk-config.yaml.
+            - name: KAFKA_SUBSCRIBER_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SUBSCRIBER_BROKERS
+            - name: KAFKA_TOPIC_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_TOPIC_PREFIX
+            - name: KAFKA_SASL_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_SASL_USER
+            - name: KAFKA_TLS_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_TLS_ENABLED
+            - name: KAFKA_TLS_CA_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_TLS_CA_FILE
+            - name: KAFKA_MIN_PARTITIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_MIN_PARTITIONS
+            - name: KAFKA_REPLICATION_FACTOR
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_REPLICATION_FACTOR
+            - name: KAFKA_ALLOW_PARTITION_GROWTH
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_ALLOW_PARTITION_GROWTH
+            - name: RELAY_MAX_RETRY_ATTEMPTS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: RELAY_MAX_RETRY_ATTEMPTS
+            - name: RELAY_RETRY_BASE_BACKOFF_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: RELAY_RETRY_BASE_BACKOFF_MS
+            - name: RELAY_RETRY_MAX_BACKOFF_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: RELAY_RETRY_MAX_BACKOFF_MS
+            - name: RELAY_EVENT_RETENTION_DAYS
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: RELAY_EVENT_RETENTION_DAYS
+            - name: WEBHOOK_DEPRECATION_START_DATE
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: WEBHOOK_DEPRECATION_START_DATE
+            - name: WEBHOOK_DEPRECATION_SUNSET_DATE
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: WEBHOOK_DEPRECATION_SUNSET_DATE
+            # The PRODUCER password. A credential, so it comes from a Secret rather
+            # than from the ConfigMap, and it is the only Kafka credential this role
+            # needs: publishing requires Write and Describe on the Blnk-owned topics
+            # and nothing more.
+            - name: KAFKA_SASL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-credentials
+                  key: producer-secret
+                  # optional so a deployment that has not adopted Kafka still
+                  # starts. A required reference would hold every pod in
+                  # CreateContainerConfigError until the Secret existed, which is
+                  # both wrong for the shipped state — KAFKA_BROKERS is empty, so
+                  # there is nothing to authenticate to — and a worse failure
+                  # than the alternative: unset, config/config.go names the
+                  # missing variable in the boot log and the construction path
+                  # refuses to dial anything half-authenticated.
+                  optional: true
             - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
               value: http://jaeger:4318/v1/traces
           image: jerryenebeli/blnk:0.13.3
@@ -41,8 +156,31 @@ spec:
             - name: blnk-config
               mountPath: /blnk.json
               subPath: blnk.json
+            # The certificate authority Blnk verifies the brokers against, at the
+            # path KAFKA_TLS_CA_FILE names.
+            #
+            # ONLY ca.crt is projected, not the whole Secret. kafka-tls also holds the
+            # brokers' keystore and its passwords, and this container has no use for
+            # either — mounting them would put a private key inside the process most
+            # exposed to the network in the deployment.
+            #
+            # optional: true so a deployment that has not adopted Kafka still starts.
+            # With KAFKA_BROKERS empty there is no broker to verify, and a required
+            # Secret would hold every pod in ContainerCreating waiting for material
+            # nothing reads.
+            - name: kafka-tls
+              mountPath: /etc/kafka/tls
+              readOnly: true
       restartPolicy: Always
       volumes:
         - name: blnk-config
           configMap:
             name: blnk-config
+        - name: kafka-tls
+          secret:
+            secretName: kafka-tls
+            optional: true
+            items:
+              - key: ca.crt
+                path: ca.crt
+            defaultMode: 0444

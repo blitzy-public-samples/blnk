@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/internal/filter"
 	"github.com/blnkfinance/blnk/internal/notification"
 	"github.com/blnkfinance/blnk/internal/tokenization"
@@ -30,43 +31,44 @@ import (
 )
 
 // postIdentityActions performs actions after an identity has been created.
-// It sends the newly created identity to the search index queue and captures an
-// identity.created event in the transactional outbox.
+// It sends the newly created identity to the search index queue.
 //
-// PRODUCER CALL SITE FOR identity.created — one of the eight sites that used to call
-// SendWebhook. Only the TRANSPORT changed here: the event string and the payload object
-// below are the same ones the legacy HTTP webhook carried, so the bytes recorded in
-// blnk.event_outbox.payload are the bytes that would have been the HTTP body. That
-// identity is what makes the dual-delivery payload-equivalence guarantee verifiable by
-// reading this diff rather than by trusting a description of it. PublishEvent does not
-// talk to a broker; it writes one pending row and returns, and the event relay publishes
-// it to blnk.identities — identity.created is the only event type routed there — with
-// bounded retry, dead-lettering and, while the window is open, legacy HTTP delivery from
-// that same row.
+// IT NO LONGER CAPTURES THE EVENT, and that is the point rather than an omission. The
+// identity.created row is now inserted INSIDE the transaction that inserts the identity, by
+// the repository, from the preparer identityCreatedEventPreparer supplies — so the event and
+// the identity commit together instead of the event being written from a goroutine after the
+// fact. Capturing it here as well would publish the same event twice, and event_id is derived
+// from the identity's own identity, so the second insert would be refused by the unique index
+// and the only visible result would be a logged conflict on every identity creation.
 //
-// The payload is FORWARDED VERBATIM, and that is deliberate despite model.Identity
-// carrying PII fields. Redacting, detokenizing or filtering it here would change what
-// subscribers receive relative to the HTTP era and break the equivalence the transport
-// substitution is measured by. The exposure is a pre-existing property of the webhook
-// contract, and narrowing it is a separate, deliberate change to that contract — not a
-// side effect of moving transports.
+// Indexing stays here because it is genuinely post-commit work: TypeSense is a separate
+// system with its own retry queue, and nothing about it belongs in a ledger transaction.
 //
-// Failures still route to notification.NotifyError unchanged: PublishEvent returns a
-// persistence error exactly where SendWebhook returned an enqueue error, and returns nil
-// for every no-op — including the unconfigured case, so a deployment with neither Kafka
-// brokers nor a webhook URL keeps creating identities with no notification sink, as before.
+// # THE ONE CASE IT STILL PUBLISHES
 //
-// The context parameter was previously discarded. It is named now because PublishEvent
-// needs one for tracing and for the datasource call; the signature's arity is unchanged
-// and the sole caller, CreateIdentity, already supplies context.Background(), so the
-// goroutine below cannot inherit a request scope that is cancelled out from under it.
+// A webhook-only deployment — a webhook URL and no KAFKA_BROKERS — gets NO preparer, because
+// capturing rows no relay can drain is what eventCaptureEnabled exists to avoid. Nothing
+// captures the event on that shape, so the legacy publish is retained here as a fallback for
+// it alone, exactly as postTransactionActions retains one for a transaction its atomic writer
+// did not record. Without it this deployment lost identity.created from BOTH transports.
+//
+// publishEntityEventWhenUncaptured owns that decision and returns immediately whenever a
+// preparer was supplied, so the atomic capture and this call can never both run.
+//
+// Parameters:
+//   - ctx context.Context: the creating request's context. Detached from cancellation before
+//     it is handed to the publish, which outlives the request that spawned it.
+//   - identity *model.Identity: A pointer to the newly created Identity model.
 func (l *Blnk) postIdentityActions(ctx context.Context, identity *model.Identity) {
+	// Derived outside the goroutine, while ctx is still live. See postLedgerActions.
+	publishCtx := context.WithoutCancel(ctx)
+
 	go func() {
 		err := l.queue.queueIndexData(identity.IdentityID, "identities", identity)
 		if err != nil {
 			notification.NotifyError(err)
 		}
-		err = l.PublishEvent(ctx, NewWebhook{
+		err = l.publishEntityEventWhenUncaptured(publishCtx, identity.IdentityID, NewWebhook{
 			Event:   "identity.created",
 			Payload: identity,
 		})
@@ -76,20 +78,94 @@ func (l *Blnk) postIdentityActions(ctx context.Context, identity *model.Identity
 	}()
 }
 
-// CreateIdentity creates a new identity in the database.
+// identityCreatedEventPreparer returns the preparer that builds the identity.created outbox
+// row, for the repository to insert INSIDE the transaction that inserts the identity.
+//
+// # Why the event is captured through a callback rather than published here
+//
+// It used to be published from postIdentityActions, in a goroutine, after CreateIdentity had
+// already committed — so an identity could be durable while the event announcing it was
+// lost to a crash or a failed insert, with nothing left to replay from. Requirement R-2
+// exists to close exactly that window, and the event now commits with the identity or not at
+// all.
+//
+// The callback shape is forced by where the identity id comes from: the repository resolves
+// it during the insert — minting idt_<uuid> unless the caller supplied a canonical one — and
+// stamps CreatedAt, and both the payload and the event's aggregate id are derived from the
+// finished identity. See database.EventPreparer.
+//
+// # The payload is forwarded VERBATIM, PII included
+//
+// The event string is still "identity.created" and the payload is still the created
+// *model.Identity, unredacted, exactly as the HTTP webhook carried it. Filtering or
+// detokenizing it here would change what subscribers receive relative to the HTTP era and
+// break the equivalence the transport substitution is measured by; narrowing that exposure
+// is a separate, deliberate change to the contract rather than a side effect of moving
+// transports.
+//
+// An identity has NO ledger — it is not a ledger-scoped entity — so no WithEventLedgerID is
+// supplied and ledger_id is stored as SQL NULL. The partition key falls back to the identity
+// id through the documented chain in PrepareEventOutbox, which gives one identity's events a
+// stable partition and therefore a total order among themselves.
+//
+// The `identity.created` event is captured atomically with the identity row: the capture
+// handed to the datasource is invoked with the finalised identity and its row is inserted
+// inside the same database transaction, so the identity and its event commit or roll back
+// together.
 //
 // Parameters:
+//   - ctx context.Context: the creating request's context, captured for tracing only. The
+//     preparer performs no I/O.
+//
+// Returns:
+//   - database.EventPreparer[model.Identity]: the preparer to hand to the repository.
+func (l *Blnk) identityCreatedEventPreparer(ctx context.Context) database.EventPreparer[model.Identity] {
+	// A NIL PREPARER when nothing is configured, so the repository stays on its
+	// single-statement path instead of opening a transaction to insert no event. See
+	// eventCaptureEnabled.
+	if !l.eventCaptureEnabled() {
+		return nil
+	}
+
+	return func(created model.Identity) (*model.EventOutbox, error) {
+		return l.PrepareEventOutbox(ctx, NewWebhook{
+			Event:   "identity.created",
+			Payload: &created,
+		})
+	}
+}
+
+// CreateIdentity creates a new identity together with its identity.created event, atomically.
+//
+// The event preparer is handed to the repository, which inserts the identity and the event
+// row in one transaction (requirement R-2). A failure to prepare or insert the event
+// therefore fails the creation, and the caller sees no identity — which is the correct
+// outcome: an identity whose event was lost is one no subscriber knows exists, and the
+// alternative trades a visible failure for an invisible one.
+//
+// postIdentityActions then performs the remaining post-commit work, which is indexing only.
+//
+// Parameters:
+// # This is requirement R-2 applied to identity creation
+//
+// The identity row and its identity.created event are written in ONE database transaction:
+// the event builder is invoked inside it with the created identity, so the payload carries
+// the generated id the legacy webhook body carried, and an event that cannot be recorded
+// rolls the identity back rather than leaving it committed and unannounced.
+//
 // - identity model.Identity: The Identity model to be created.
 //
 // Returns:
 // - model.Identity: The created Identity model.
-// - error: An error if the identity could not be created.
+// - error: An error if the identity could not be created, or if its event could not be captured.
 func (l *Blnk) CreateIdentity(identity model.Identity) (model.Identity, error) {
-	identity, err := l.datasource.CreateIdentity(identity)
+	ctx := context.Background()
+
+	identity, err := l.datasource.CreateIdentity(identity, l.identityCreatedEventPreparer(ctx))
 	if err != nil {
 		return model.Identity{}, err
 	}
-	l.postIdentityActions(context.Background(), &identity)
+	l.postIdentityActions(ctx, &identity)
 	return identity, nil
 }
 

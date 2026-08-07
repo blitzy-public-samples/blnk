@@ -23,23 +23,41 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// This file guards the system.error sanitizer.
+// This file guards the system.error PAYLOAD CONTRACT and the bounded classification that is
+// logged beside it.
 //
-// It is a new file rather than an addition to the two existing test files here,
-// because both of those are upstream tests of the notification transport and this
-// covers a different subject: what a system.error payload is permitted to contain.
-// Keeping it separate leaves the upstream files untouched apart from the single
-// assertion that pinned the raw-error payload the DATA-01 finding identified.
+// It is a separate file from the two upstream notification tests because those cover the
+// transport — Slack delivery, sender registration, the dispatch gate — and this covers a
+// different subject: what a system.error payload must contain, and what it must not.
+//
+// The subject changed once already, which is why the reasoning is written down here. An
+// earlier revision reshaped the payload into a classified reason, a correlation id and an
+// optional error code, to keep Blnk's internal error text off a durable, retained topic. The
+// concern is legitimate; the remedy was not, because requirement R-8 freezes this payload to
+// the webhook body it has always been and substituting one shape for another under the same
+// event name breaks every subscriber parser with nothing announcing it. The payload is back
+// to {"error", "time"}; the classification survives as the LOG line's diagnosis, where it
+// costs no contract anything.
 
-// hostileErrors are the error shapes Blnk actually produces, each carrying something
-// that must never reach a published payload. They are used by several tests below, so
-// they are declared once with the reason each one is dangerous.
+// hostileErrors are the error shapes Blnk actually produces, each carrying deployment
+// detail. They are used by several tests below, so they are declared once with a note
+// on what each one reveals.
+//
+// They are NOT a list of values the payload must suppress. The payload carries the
+// error text verbatim because that is the contract subscribers already parse, and
+// because the legacy webhook delivered exactly this text to exactly this audience;
+// narrowing it is a versioned schema change, not a transport detail. What these shapes
+// prove here is that the CLASSIFIER never echoes them — the reason it returns is drawn
+// from a fixed vocabulary whatever it is handed, so the log line — and any future
+// versioned schema that chooses to carry a summary instead of the error — has a safe
+// value to use.
 func hostileErrors() map[string]struct {
 	err     error
 	secrets []string
@@ -82,77 +100,93 @@ func hostileErrors() map[string]struct {
 	}
 }
 
-// TestSanitizedSystemErrorPayload_CarriesNoErrorText is the DATA-01 guard, and it is
-// the assertion that matters most in this file.
+// TestSystemErrorPayload_IsTheFrozenLegacyContract is the R-8 guard on the one payload in
+// the catalogue that a well-intentioned change had already altered.
 //
-// system.error is published to a Kafka topic, which is replicated and retained, and it
-// is also stored in blnk.event_outbox and copied to a dead-letter topic if it fails. So
-// anything in the payload is durable in several places at once. The payload used to be
-// {"error": systemError.Error(), "time": now}.
-func TestSanitizedSystemErrorPayload_CarriesNoErrorText(t *testing.T) {
+// Requirement R-8 requires a LedgerEvent's payload to match today's webhook body
+// FIELD-FOR-FIELD, and the webhook body for system.error has always been {"error", "time"}.
+// Every subscriber's parser reads those two keys. A revision of this function replaced them
+// with a classified reason, a correlation id and an optional code — a strictly better payload
+// to design from scratch, and a BREAKING CHANGE to a published contract when substituted
+// under the same event name as a side effect of a transport migration.
+//
+// So this test asserts the legacy shape exactly, including the key COUNT: a third key is a
+// contract change and must fail here rather than reach a subscriber.
+func TestSystemErrorPayload_IsTheFrozenLegacyContract(t *testing.T) {
+	systemError := errors.New("queue worker crashed")
+
+	payload := systemErrorPayload(systemError)
+
+	require.Len(t, payload, 2,
+		"the system.error payload is a published contract: exactly error and time")
+	assert.Equal(t, "queue worker crashed", payload["error"],
+		"the error text is the value subscribers parse; it must be carried verbatim")
+
+	ts, ok := payload["time"].(time.Time)
+	require.True(t, ok, "time must remain a time.Time, as the legacy payload carried it")
+	assert.WithinDuration(t, time.Now(), ts, 10*time.Second)
+
+	assert.NotContains(t, payload, "reason",
+		"a diagnosis belongs in the log, not in a frozen payload")
+	assert.NotContains(t, payload, "correlation_id")
+	assert.NotContains(t, payload, "error_code")
+}
+
+// TestSystemErrorPayload_CarriesEveryErrorTextVerbatim covers the payload against the same
+// hostile errors the sanitizing revision was written for.
+//
+// It asserts the OPPOSITE of what those tests asserted, and deliberately: the error text IS
+// the contract, so it reaches the payload intact however awkward its content. The concern the
+// hostile fixtures encode is real and is addressed by the ACL model — system.error routes to
+// the internal blnk.system category, which model.SubscriberGrantableTopics excludes, so no
+// subscriber can be granted it at all — and by keeping the raw text off the structured log
+// lines. It is NOT addressed by silently reshaping a published payload.
+func TestSystemErrorPayload_CarriesEveryErrorTextVerbatim(t *testing.T) {
 	for name, hostile := range hostileErrors() {
 		t.Run(name, func(t *testing.T) {
-			payload := sanitizedSystemErrorPayload(hostile.err, "a-correlation-id")
+			payload := systemErrorPayload(hostile.err)
 
-			// Checked through the JSON a subscriber would actually receive, not only
-			// field by field: a value nested inside a map or a struct is invisible to a
-			// field-by-field check and fully visible once marshalled.
+			assert.Equal(t, hostile.err.Error(), payload["error"],
+				"the payload must carry the rendered error exactly, as the webhook body did")
+
+			// Round-tripped through the JSON a subscriber would actually receive, so the
+			// assertion is about what arrives on the wire rather than about a Go map.
+			// DECODED rather than string-matched, because the encoder escapes quotes and
+			// backslashes — several of these fixtures quote their input — and a raw
+			// substring check would fail on the escaping rather than on the content.
 			marshalled, err := json.Marshal(payload)
 			require.NoError(t, err)
-			rendered := string(marshalled)
 
-			for _, secret := range hostile.secrets {
-				assert.NotContains(t, rendered, secret,
-					"the payload must not carry %q; the full error belongs in the log", secret)
-			}
-
-			assert.NotContains(t, payload, "error",
-				"the payload must not carry an error key at all")
-			assert.NotContains(t, rendered, hostile.err.Error(),
-				"the payload must not carry the rendered error")
+			var decoded map[string]interface{}
+			require.NoError(t, json.Unmarshal(marshalled, &decoded))
+			assert.Equal(t, hostile.err.Error(), decoded["error"],
+				"the error text must survive the round trip a subscriber performs")
 		})
 	}
 }
 
-// TestSanitizedSystemErrorPayload_CarriesADiagnosisAndAHandle is the other half:
-// sanitizing must not leave the notification useless.
-func TestSanitizedSystemErrorPayload_CarriesADiagnosisAndAHandle(t *testing.T) {
-	payload := sanitizedSystemErrorPayload(
-		errors.New("dial tcp: connection refused"), "0f6e2c8a-1b4d-4e9f-8a7c-2d5b6e3f1a9c")
-
-	assert.Equal(t, SystemErrorReasonTransport, payload["reason"],
-		"the recipient must learn WHERE the fault is, which is the only thing it can act on")
-	assert.Equal(t, "0f6e2c8a-1b4d-4e9f-8a7c-2d5b6e3f1a9c", payload["correlation_id"],
-		"the correlation ID is the operator's route to the full error")
-	assert.Contains(t, payload, "time")
-}
-
-// TestSanitizedSystemErrorPayload_PublishesATypedCodeWhenThereIsOne checks that a
-// typed apierror contributes its code.
+// TestClassifySystemError_RemainsTheLoggedDiagnosis pins what the classification is FOR now
+// that it is not in the payload.
 //
-// The code is safe and worth publishing: it is a fixed vocabulary from
-// internal/apierror and it is the same value the HTTP API already returns for the same
-// condition, so it tells a recipient nothing it could not learn by making a request.
-func TestSanitizedSystemErrorPayload_PublishesATypedCodeWhenThereIsOne(t *testing.T) {
+// It is the bounded value logged at the dispatch site beside the correlation id, which is how
+// an operator gets a diagnosis without the raw error text being duplicated into a second
+// structured record. Both vocabularies stay fixed, and the tests below still hold them to
+// that, because a classifier that could echo its input would put deployment detail into the
+// log fields it was introduced to keep clean.
+func TestClassifySystemError_RemainsTheLoggedDiagnosis(t *testing.T) {
+	assert.Equal(t, SystemErrorReasonTransport,
+		classifySystemError(errors.New("dial tcp: connection refused")),
+		"the logged diagnosis must still answer WHERE the fault is")
+
 	typed := apierror.NewAPIError(apierror.ErrKafkaUnavailable, "Kafka is unavailable", nil)
-
-	payload := sanitizedSystemErrorPayload(typed, "a-correlation-id")
-
-	assert.Equal(t, string(apierror.ErrKafkaUnavailable), payload["error_code"])
-	assert.Equal(t, SystemErrorReasonTransport, payload["reason"],
-		"a 503 code classifies as a transport failure")
-}
-
-// TestSanitizedSystemErrorPayload_OmitsTheCodeWhenThereIsNone — omitted rather than
-// blank, so a recipient can tell "no code" from "the code is empty".
-func TestSanitizedSystemErrorPayload_OmitsTheCodeWhenThereIsNone(t *testing.T) {
-	payload := sanitizedSystemErrorPayload(errors.New("something went wrong"), "a-correlation-id")
-
-	assert.NotContains(t, payload, "error_code")
+	assert.Equal(t, string(apierror.ErrKafkaUnavailable), systemErrorCode(typed),
+		"a typed error still contributes its code to the log line")
+	assert.Empty(t, systemErrorCode(errors.New("untyped")),
+		"an untyped error contributes no code, so the field reads as absent rather than blank")
 }
 
 // TestClassifySystemError_AlwaysReturnsVocabulary is the property that makes the
-// classifier a sanitizer rather than a formatter: no error, however constructed, can
+// classifier a bounded projection rather than a formatter: no error, however constructed, can
 // produce output that describes the deployment.
 func TestClassifySystemError_AlwaysReturnsVocabulary(t *testing.T) {
 	vocabulary := map[string]struct{}{
@@ -272,7 +306,7 @@ func TestNewCorrelationID_IsUniquePerCall(t *testing.T) {
 // TestSystemErrorEventType_MatchesTheCatalogue pins the event name.
 //
 // It is one of the thirteen event strings the catalogue routes on, and a typo would
-// route the event to the quarantine category instead of the system category with
+// route the event to the catch-all instead of the system category deliberately, with
 // nothing failing anywhere.
 func TestSystemErrorEventType_MatchesTheCatalogue(t *testing.T) {
 	assert.Equal(t, "system.error", systemErrorEventType)

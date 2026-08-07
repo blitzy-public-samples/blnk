@@ -194,13 +194,87 @@ func scanRow(row *sql.Row, include []string) (*model.Balance, error) {
 // CreateBalance inserts a new balance record into the `blnk.balances` table in the database.
 // It handles the generation of a unique balance ID, default values for fields, and any necessary error handling.
 //
+// # Atomic event capture (requirement R-2)
+//
+// When a caller supplies an EventPreparer, the balance INSERT and the balance.created event
+// row are written inside ONE transaction: the preparer is handed the finished balance — the
+// only point at which the generated BalanceID, the defaulted amounts and CreatedAt exist —
+// and the row it returns is inserted before the commit. Either both land or neither does.
+//
+// ONE CASE DELIBERATELY CAPTURES NOTHING. A unique violation on unique_indicator_currency
+// is reported as success with an EMPTY balance, which is this method's long-standing
+// idempotent-create contract: the balance the caller asked for already exists under that
+// indicator, and no new balance was created. No event is captured on that path, because
+// balance.created would then announce a creation that did not happen — which is what the
+// non-atomic post-commit capture used to do, publishing an event whose payload was an empty
+// balance.
+//
+// With no preparer the behaviour is EXACTLY as before: one statement and no transaction,
+// which keeps every pre-existing caller compiling and behaving unchanged.
+//
 // Parameters:
-// - balance: A model.Balance object containing the balance information to be created.
+//   - balance: A model.Balance object containing the balance information to be created.
+//   - prepareEvent: Optional. Builds the balance.created outbox row from the created balance,
+//     inside the transaction that created it. See EventPreparer for the contract.
 //
 // Returns:
-// - model.Balance: The created balance with its ID and timestamp populated.
-// - error: Returns an APIError in case of failures such as database conflicts or other issues.
-func (d Datasource) CreateBalance(balance model.Balance) (model.Balance, error) {
+//   - model.Balance: The created balance with its ID and timestamp populated, or the zero
+//     value on the idempotent indicator-conflict path.
+//   - error: Returns an APIError in case of failures such as database conflicts or other
+//     issues, or when the event could not be prepared or captured — in which case the
+//     balance is NOT created.
+func (d Datasource) CreateBalance(balance model.Balance, prepareEvent ...EventPreparer[model.Balance]) (model.Balance, error) {
+	ctx := context.Background()
+
+	prepare := firstEventPreparer(prepareEvent)
+	if prepare == nil {
+		return d.insertBalance(ctx, d.Conn, balance)
+	}
+
+	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
+	if err != nil {
+		return model.Balance{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	created, err := d.insertBalance(ctx, tx, balance)
+	if err != nil {
+		return model.Balance{}, err
+	}
+
+	// The idempotent indicator-conflict path: nothing was created, so there is nothing to
+	// commit and no creation to announce. The deferred rollback discards the aborted
+	// statement and the caller sees the same empty balance and nil error as always.
+	if created.BalanceID == "" {
+		return created, nil
+	}
+
+	if err := captureEntityEvent(ctx, d, tx, created, prepare); err != nil {
+		return model.Balance{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return model.Balance{}, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
+	}
+
+	return created, nil
+}
+
+// insertBalance performs the balance INSERT against either the connection or an open
+// transaction, and is the single statement both CreateBalance paths run.
+//
+// Parameters:
+//   - ctx: The context for the statement.
+//   - execer: The connection or transaction to insert through.
+//   - balance: The balance to insert. Its BalanceID, CreatedAt and defaulted amounts are
+//     assigned here.
+//
+// Returns:
+//   - model.Balance: The created balance, or the zero value together with a nil error on the
+//     idempotent unique_indicator_currency path.
+//   - error: A typed error for a genuine conflict, an invalid ledger reference, or a
+//     driver failure.
+func (d Datasource) insertBalance(ctx context.Context, execer sqlExecer, balance model.Balance) (model.Balance, error) {
 	// Marshal metadata into JSON
 	metaDataJSON, err := json.Marshal(balance.MetaData)
 	if err != nil {
@@ -249,7 +323,7 @@ func (d Datasource) CreateBalance(balance model.Balance) (model.Balance, error) 
 	}
 
 	// Insert the balance into the database
-	_, err = d.Conn.ExecContext(context.Background(), `
+	_, err = execer.ExecContext(ctx, `
 		INSERT INTO blnk.balances (balance_id, balance, credit_balance, debit_balance, currency, ledger_id, identity_id, indicator, created_at, meta_data, track_fund_lineage, allocation_strategy)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 	`, balance.BalanceID, balance.Balance.String(), balance.CreditBalance.String(), balance.DebitBalance.String(), balance.Currency, balance.LedgerID, identityID, indicator, balance.CreatedAt, &metaDataJSON, balance.TrackFundLineage, allocationStrategy)

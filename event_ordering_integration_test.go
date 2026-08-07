@@ -22,18 +22,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/url"
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/database"
+	"github.com/blnkfinance/blnk/internal/cache"
 	"github.com/blnkfinance/blnk/model"
+	"github.com/lib/pq"
 	"github.com/segmentio/kafka-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -66,26 +70,41 @@ import (
 // It is an INTEGRATION test: it needs PostgreSQL with the migrations applied and a Kafka
 // broker with the Blnk topics provisioned. Both come from the local stack:
 //
-//	docker compose up -d postgres kafka kafka-init   # scripts/kafka-bootstrap.sh formats KRaft
+//	docker compose --profile kafka up -d postgres kafka kafka-init
 //	                                                 # storage with the bootstrap SCRAM admin
 //	                                                 # credential; scripts/kafka-provision.sh
 //	                                                 # then creates the topics and their DLTs
 //	blnk migrate up                                  # creates blnk.event_outbox
 //
 //	export KAFKA_BROKERS=localhost:9092
-//	export KAFKA_SASL_ADMIN_USER=admin
+//	export KAFKA_SASL_ADMIN_USER=admin               # the VERIFICATION consumer's principal
 //	export KAFKA_SASL_ADMIN_SECRET=...               # never hard-coded here; read from the env
+//	export KAFKA_SASL_USER=blnk-producer             # the PRODUCER principal the publisher
+//	export KAFKA_SASL_SECRET=...                     # authenticates as. Blnk refuses to publish
+//	                                                 # as the administrator, so this pair is
+//	                                                 # required whenever the admin pair is set
 //	export KAFKA_INSECURE_LOCAL_DEV=true             # the local broker is SASL_PLAINTEXT
 //	export BLNK_DATA_SOURCE_DNS=postgres://postgres:password@localhost:5432/blnk?sslmode=disable
 //
 //	go test -run TestEventOrdering -v .
 //	go test -run TestEventOrdering -count=5 .        # an ordering test must not be flaky
 //
+// TWO PRINCIPALS, NOT ONE, and they are not interchangeable. The publisher authenticates as
+// the least-privileged PRODUCER principal, holding Write and Describe and nothing else; the
+// verification consumer at the bottom of this file authenticates as the ADMINISTRATIVE one,
+// because reading a topic needs Read and the producer deliberately does not have it. Handing
+// the administrative pair to the publisher is refused outright rather than downgraded — see
+// config.ErrProducerPrincipalRequired — so a run that exports only the administrative pair
+// SKIPS here with that as the stated reason instead of failing several hundred lines later.
+// scripts/kafka-provision.sh mints both principals and prints where it wrote each secret.
+//
 // Every one of those variables is OPTIONAL except KAFKA_BROKERS, which is what selects the
 // broker and therefore what decides whether this test runs at all. With it unset — the
 // state of `make test`, of `go test -short ./...` and of CI — the test SKIPS and says what
 // is missing. That is deliberate: the repository's test suite must stay green on a machine
-// with no broker, so this file never fails for want of infrastructure.
+// with no broker, so this file never fails for want of infrastructure. The Kafka acceptance
+// job in .github/workflows/go.yml is what stops a skip from hiding: it exports every variable
+// above and FAILS if any test in this selection skips rather than runs.
 //
 // # The consumer in this file is a VERIFICATION INSTRUMENT, not product code
 //
@@ -177,14 +196,36 @@ const (
 	// that is failing to claim.
 	orderingRelayLockDuration = 30 * time.Second
 
+	// relayContentionLease is the lease the two-relay contention test runs on, and it is
+	// deliberately absurd.
+	//
+	// A lease is meant to outlive the work it protects. Two milliseconds cannot: it has
+	// effectively lapsed by the time a produce request returns, so both relays hold a claim on
+	// the same row for most of the row's life and the at-least-once window is open
+	// continuously. That is the point — the ordering guarantee is asserted under the harshest
+	// lease the design admits, not under one that makes contention theoretical. The production
+	// default is orderingRelayLockDuration, four orders of magnitude larger.
+	relayContentionLease = 2 * time.Millisecond
+
 	// orderingDispatchTimeout bounds the wait for every published row to reach its
 	// dispatched terminal state.
-	orderingDispatchTimeout = 90 * time.Second
+	//
+	// FOUR MINUTES, NOT NINETY SECONDS, AND THE MARGIN IS DELIBERATE. On a healthy stack this
+	// whole test finishes in about a second, so the bound is patience rather than a budget —
+	// it exists only so a stuck relay reports the outbox state instead of hanging until the
+	// test binary is killed. Ninety seconds was not patience enough under `go test -race`,
+	// which CI runs: the detector instruments every publish and every consume, and on a
+	// contended machine the 288 events of a full run genuinely need longer than that. A
+	// timeout that trips on a slow-but-correct run reports a defect that is not one, which is
+	// worse than a stuck run taking four minutes to say so — and the diagnostic it prints is
+	// what makes a real stall diagnosable either way.
+	orderingDispatchTimeout = 4 * time.Minute
 
 	// orderingConsumeTimeout bounds the fetch loop. Exceeding it FAILS the test with the
 	// offsets reached and the count observed, rather than hanging until the go test binary
-	// is killed and reports nothing useful.
-	orderingConsumeTimeout = 90 * time.Second
+	// is killed and reports nothing useful. Four minutes for the same reason as the dispatch
+	// bound above.
+	orderingConsumeTimeout = 4 * time.Minute
 
 	// orderingFetchMaxWait is how long one fetch parks on an empty partition before
 	// returning. It is the loop's pacing: short enough that six empty partitions cost a
@@ -355,6 +396,31 @@ func orderingEnvOr(key, fallback string) string {
 	return fallback
 }
 
+// orderingReplicationFactor resolves the replication factor the fixture assures topics with.
+//
+// It defaults to ONE rather than to the production three because the factor a test should ask
+// for is the factor its broker can honour. A single-node development broker cannot place three
+// replicas, so asking for three guarantees a refusal on every topic — and the refusal is not
+// even actionable from a test, since raising the factor of an existing topic requires a
+// partition reassignment. Reading the variable still allows a multi-broker cluster to be
+// exercised at its real factor.
+//
+// Returns:
+//   - int: KAFKA_REPLICATION_FACTOR when it parses as a positive integer, otherwise 1.
+func orderingReplicationFactor() int {
+	raw := strings.TrimSpace(os.Getenv("KAFKA_REPLICATION_FACTOR"))
+	if raw == "" {
+		return 1
+	}
+
+	factor, err := strconv.Atoi(raw)
+	if err != nil || factor < 1 {
+		return 1
+	}
+
+	return factor
+}
+
 // orderingBrokersFromEnv parses KAFKA_BROKERS the way the configuration loader does: a
 // comma-separated list, trimmed, with empty entries dropped.
 //
@@ -401,6 +467,139 @@ func orderingHostFromDSN(dsn string) string {
 	}
 
 	return parsed.Host
+}
+
+// orderingRelayOutboxColumns are the blnk.event_outbox columns the relay path READS that a
+// database migrated to an earlier revision of this feature will not have.
+//
+// claim_token is what makes a claim's ownership provable across relay instances, and
+// kafka_dispatched_at is what lets the two delivery legs reach their terminal state
+// independently during the dual-delivery window. Every claim the relay issues names them, so
+// a database missing either one answers the claim with SQLSTATE 42703 and nothing is ever
+// dispatched — which would otherwise surface as an ordering failure rather than as the schema
+// problem it is.
+var orderingRelayOutboxColumns = []string{"claim_token", "kafka_dispatched_at"}
+
+// orderingSkipUnlessOutboxSchemaIsCurrent skips the test when the connection the datasource
+// handed back does not carry this feature's migrations.
+//
+// # Why a table-exists probe is not enough
+//
+// The probe above asks whether blnk.event_outbox is QUERYABLE, and a database migrated to an
+// earlier revision of this feature answers yes: the table is there, and only two columns the
+// relay's claim names are missing. The claim then fails with "column \"claim_token\" does
+// not exist" on every tick, the rows stay pending, and the test spends its whole drain budget
+// before failing with hundreds of unreadable rows — a report that describes the symptom and
+// hides the cause.
+//
+// # What the message reports, and why
+//
+// The database and port the connection actually landed on, alongside the DSN that was asked
+// for. The fixture owns its pool, so the two agree — but a DSN is a string and a `blnk`
+// database on one port is easily mistaken for the `blnk` database on another when several are
+// running, which is exactly the situation a partially-migrated schema arises in. Naming both
+// makes the remedy unambiguous about WHICH database to migrate.
+//
+// Parameters:
+//   - t *testing.T: the test. Skipped, never failed — an unmigrated database is missing
+//     infrastructure, which is how the probe above already treats it, and the Kafka acceptance
+//     job fails on any skip so this cannot quietly stop proving anything.
+//   - ds database.IDataSource: the datasource just opened.
+//   - dsn string: the DSN this fixture ASKED for, reported alongside what it actually got.
+func orderingSkipUnlessOutboxSchemaIsCurrent(t *testing.T, ds database.IDataSource, dsn string) {
+	t.Helper()
+
+	// Only the concrete datasource exposes the pool, and the probe is a diagnostic rather than
+	// a requirement: a fake or wrapped implementation is left to the assertions below.
+	source, exposesPool := ds.(*database.Datasource)
+	if !exposesPool || source.Conn == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), orderingClientTimeout)
+	defer cancel()
+
+	// Reported, not asserted on. inet_server_port() is NULL over a unix socket, hence COALESCE.
+	var connectedDatabase string
+	var connectedPort int
+	if err := source.Conn.QueryRowContext(ctx,
+		"SELECT current_database(), COALESCE(inet_server_port(), 0)",
+	).Scan(&connectedDatabase, &connectedPort); err != nil {
+		t.Skipf(
+			"event ordering integration test: the datasource is not answering queries (%v). Start "+
+				"PostgreSQL and apply the migrations with `blnk migrate up`",
+			err,
+		)
+	}
+
+	// THE COLUMN LIST IS BOUND, not spelled a second time in the SQL. It was, and the two
+	// spellings drifted: the statement asked after two names that are STATUS LITERALS rather
+	// than columns, so the count was always zero, the comparison below always failed, and
+	// every Kafka-backed assertion in this file reported a skip on a perfectly migrated
+	// database. A skip is the one outcome that looks like success, so the drift survived.
+	var present int
+	if err := source.Conn.QueryRowContext(ctx,
+		"SELECT count(*) FROM information_schema.columns "+
+			"WHERE table_schema = 'blnk' AND table_name = 'event_outbox' "+
+			"AND column_name = ANY($1)",
+		pq.Array(orderingRelayOutboxColumns),
+	).Scan(&present); err != nil {
+		t.Skipf(
+			"event ordering integration test: blnk.event_outbox's columns are not readable (%v). "+
+				"Apply the migrations with `blnk migrate up`",
+			err,
+		)
+	}
+
+	if present != len(orderingRelayOutboxColumns) {
+		t.Skipf(
+			"event ordering integration test: blnk.event_outbox is missing %d of the %v columns the "+
+				"relay's claim names, so no row could ever be dispatched and this test would spend "+
+				"its whole drain budget before failing. The connection is on database %q at port %d; "+
+				"this fixture asked for %q. Apply the migrations to THAT database with "+
+				"`blnk migrate up`",
+			len(orderingRelayOutboxColumns)-present, orderingRelayOutboxColumns,
+			connectedDatabase, connectedPort, dsn,
+		)
+	}
+}
+
+// orderingSkipUnlessProducerPrincipal skips the test when the environment carries an
+// ADMINISTRATIVE Kafka credential but no dedicated PRODUCER credential.
+//
+// That combination is refused by the product, not merely discouraged: the event publisher
+// returns config.ErrProducerPrincipalRequired rather than authenticating as a principal that
+// can create topics, mint SCRAM credentials and rewrite ACLs. So a run configured that way
+// cannot build a service container at all, and without this guard the whole file fails at
+// NewBlnk with an error about credentials — which reads as a product defect when it is an
+// unfinished environment.
+//
+// The predicate mirrors config.Configuration.ProducerSASL exactly: a producer pair that is
+// entirely absent, with at least one administrative value present. Neither pair set is a
+// legitimate unauthenticated broker and is left to run; both set is the provisioned stack and
+// is what this file is meant to exercise.
+//
+// Parameters:
+//   - t *testing.T: the test. Skipped, never failed: an incomplete environment is missing
+//     infrastructure, exactly like an unreachable broker, and the CI job that exports both
+//     pairs fails on any skip so this cannot quietly stop proving anything.
+func orderingSkipUnlessProducerPrincipal(t *testing.T) {
+	t.Helper()
+
+	producerConfigured := strings.TrimSpace(os.Getenv("KAFKA_SASL_USER")) != "" ||
+		strings.TrimSpace(os.Getenv("KAFKA_SASL_SECRET")) != ""
+	adminConfigured := strings.TrimSpace(os.Getenv("KAFKA_SASL_ADMIN_USER")) != "" ||
+		strings.TrimSpace(os.Getenv("KAFKA_SASL_ADMIN_SECRET")) != ""
+
+	if adminConfigured && !producerConfigured {
+		t.Skip(
+			"event ordering integration test: the environment carries KAFKA_SASL_ADMIN_USER/" +
+				"KAFKA_SASL_ADMIN_SECRET but no KAFKA_SASL_USER/KAFKA_SASL_SECRET. The event " +
+				"publisher REFUSES to authenticate as the administrative principal, so no service " +
+				"container can be built. Run scripts/kafka-provision.sh, which mints the dedicated " +
+				"producer principal, then export KAFKA_SASL_USER and KAFKA_SASL_SECRET",
+		)
+	}
 }
 
 // orderingSkipUnlessReachable skips the test when a dependency cannot be dialled.
@@ -495,12 +694,20 @@ func orderingConfiguration(brokers []string, dsn string) *config.Configuration {
 			IndexQueuePrefix: "ordering_test_index",
 		},
 		Kafka: config.KafkaConfig{
-			Brokers:         brokers,
-			TopicPrefix:     strings.TrimSpace(os.Getenv("KAFKA_TOPIC_PREFIX")),
-			SASLUser:        strings.TrimSpace(os.Getenv("KAFKA_SASL_USER")),
-			SASLSecret:      os.Getenv("KAFKA_SASL_SECRET"),
-			SASLAdminUser:   strings.TrimSpace(os.Getenv("KAFKA_SASL_ADMIN_USER")),
-			SASLAdminSecret: os.Getenv("KAFKA_SASL_ADMIN_SECRET"),
+			Brokers:     brokers,
+			TopicPrefix: strings.TrimSpace(os.Getenv("KAFKA_TOPIC_PREFIX")),
+			// The replication factor is read from the environment and defaults to ONE, which
+			// is the only factor a single-broker development stack can satisfy. Leaving it at
+			// the production default of three made topic assurance report every one of the ten
+			// topics as under-replicated on every run — twenty error lines that were pure
+			// noise, since a factor cannot be raised by re-running assurance and the test's own
+			// broker has one node. The relay proceeds either way, so this changes nothing about
+			// what is under test; it stops the fixture manufacturing a fault it then ignores.
+			ReplicationFactor: orderingReplicationFactor(),
+			SASLUser:          strings.TrimSpace(os.Getenv("KAFKA_SASL_USER")),
+			SASLSecret:        os.Getenv("KAFKA_SASL_SECRET"),
+			SASLAdminUser:     strings.TrimSpace(os.Getenv("KAFKA_SASL_ADMIN_USER")),
+			SASLAdminSecret:   os.Getenv("KAFKA_SASL_ADMIN_SECRET"),
 			TLS: config.KafkaTLSConfig{
 				Enabled:    tlsEnabled,
 				CAFile:     strings.TrimSpace(os.Getenv("KAFKA_TLS_CA_FILE")),
@@ -551,6 +758,23 @@ func newOrderingFixture(t *testing.T) *orderingFixture {
 		)
 	}
 
+	// A cluster that authenticates needs a PRODUCER principal, not just an administrative one.
+	// Blnk refuses to publish as the administrator — that principal can create topics, alter
+	// SCRAM credentials and manage ACLs, so a leaked producer credential would compromise the
+	// cluster's authorization state — and construction fails outright rather than quietly
+	// falling back. Skipping here turns that into a shopping list instead of an obscure failure
+	// several hundred lines into the run.
+	if strings.TrimSpace(os.Getenv("KAFKA_SASL_ADMIN_USER")) != "" &&
+		strings.TrimSpace(os.Getenv("KAFKA_SASL_USER")) == "" {
+		t.Skip(
+			"event ordering integration test: KAFKA_SASL_ADMIN_USER is set but KAFKA_SASL_USER is " +
+				"not. Blnk will not publish as the administrative principal, so a dedicated producer " +
+				"principal with Write and Describe on the Blnk-owned topics is required; " +
+				"scripts/kafka-provision.sh creates one for the local stack. Export KAFKA_SASL_USER " +
+				"and KAFKA_SASL_SECRET",
+		)
+	}
+
 	dsn := orderingEnvOr("BLNK_DATA_SOURCE_DNS", orderingFallbackPostgresDSN)
 	orderingSkipUnlessReachable(t, orderingHostFromDSN(dsn), "PostgreSQL", "BLNK_DATA_SOURCE_DNS")
 
@@ -581,8 +805,41 @@ func newOrderingFixture(t *testing.T) *orderingFixture {
 	require.NotEmpty(t, cnf.Kafka.Brokers,
 		"config.MockConfig dropped the broker list; NewBlnk would then select the no-op publisher")
 
-	ds, err := database.NewDataSource(cnf)
-	require.NoError(t, err, "could not open the datasource at the configured DSN")
+	// # The connection pool is opened HERE rather than through database.NewDataSource
+	//
+	// database.GetDBConnection memoises ONE datasource per process behind a sync.Once, so
+	// whichever test in this binary connects first fixes the pool for every test after it and
+	// any DSN passed later is silently ignored. Several tests in this package hardcode
+	// postgres://…@localhost:5432/blnk, so in a whole-package run this fixture would be handed
+	// THAT server no matter what BLNK_DATA_SOURCE_DNS says — and it would then seed hundreds of
+	// rows into a database it never named, drain none of them, and report the symptom rather
+	// than the cause.
+	//
+	// So this file owns its connection, exactly as event_recovery_integration_test.go does and
+	// for the same reason. Nothing is faked by it: ConnectDB is the exported production
+	// connector, database.Datasource is the production type, and the cache is the one
+	// GetDBConnection itself builds — the test simply refuses to share a pool it cannot address.
+	pool, err := database.ConnectDB(cnf.DataSource)
+	require.NoError(t, err, "could not open a connection pool at the configured DSN")
+
+	sharedCache, err := cache.NewCache()
+	require.NoError(t, err,
+		"could not build the cache the datasource carries in production; it needs the configured Redis")
+
+	ds := &database.Datasource{Conn: pool, Cache: sharedCache}
+	t.Cleanup(func() {
+		// sql.DB.Close is idempotent, so this stands even though closing the Blnk instance
+		// below may already have released the same pool.
+		assert.NoError(t, ds.Close(), "the ordering test's connection pool should close cleanly")
+	})
+
+	// The one thing database.NewDataSource does beyond connecting, reproduced verbatim so this
+	// fixture's connection behaves exactly like a production one.
+	searchPathCtx, cancelSearchPath := context.WithTimeout(context.Background(), orderingClientTimeout)
+	defer cancelSearchPath()
+
+	_, err = pool.ExecContext(searchPathCtx, "SET search_path TO blnk")
+	require.NoError(t, err, "could not set the blnk search path on the pool")
 
 	// blnk.event_outbox is created by a migration, so its absence means the schema was never
 	// migrated — a missing dependency exactly like an unreachable broker or an unprovisioned
@@ -598,6 +855,12 @@ func newOrderingFixture(t *testing.T) *orderingFixture {
 			probeErr,
 		)
 	}
+
+	// The table existing is not the same as the table being CURRENT, and the difference is a
+	// ninety-second false failure. Checked here, one line after the table probe, because both
+	// answer the same question — is this database ready — and a reader looking for that question
+	// should find both answers together.
+	orderingSkipUnlessOutboxSchemaIsCurrent(t, ds, dsn)
 
 	instance, err := NewBlnk(ds)
 	require.NoError(t, err, "could not build the Blnk service container")
@@ -889,8 +1152,17 @@ func (f *orderingFixture) fetchPartition(t *testing.T, partition int, offset int
 //   - want int: how many distinct events of this run to wait for.
 //
 // Returns:
-//   - []orderingObservation: exactly want observations, in the order they were read.
-func (f *orderingFixture) consumeRun(t *testing.T, from map[int]int64, want int) []orderingObservation {
+//   - []orderingObservation: exactly want observations, in the order they were read. The FIRST
+//     appearance of each event, deduplicated on event_id.
+//   - int: how many redeliveries were swallowed to produce that slice. Returned rather than
+//     only logged because a caller asserting on at-least-once behaviour cannot recover the
+//     number from the deduplicated slice — it is zero there by construction — and a test that
+//     reported it from the slice would claim "no duplicates" on a run that had them.
+func (f *orderingFixture) consumeRun(
+	t *testing.T,
+	from map[int]int64,
+	want int,
+) ([]orderingObservation, int) {
 	t.Helper()
 
 	cursors := make(map[int]int64, len(from))
@@ -934,10 +1206,42 @@ func (f *orderingFixture) consumeRun(t *testing.T, from map[int]int64, want int)
 	require.Len(t, observed, want,
 		"timed out after %s waiting for this run's events: observed %d of %d on %s, "+
 			"partition cursors %v. The relay publishes one event per aggregate per claim, so a "+
-			"shortfall means rows were not claimed, not published, or not decodable",
-		orderingConsumeTimeout, len(observed), want, f.topic, cursors)
+			"shortfall means rows were not claimed, not published, or not decodable.%s",
+		orderingConsumeTimeout, len(observed), want, f.topic, cursors,
+		f.describeTopicSharing())
 
-	return observed
+	return observed, duplicates
+}
+
+// describeTopicSharing reports whether this topic is shared with anything else, for the
+// shortfall message to include.
+//
+// It exists because of a diagnosis that cost real time and would have cost it again. A
+// shortfall here has two causes that look identical — an event the relay never published, and
+// an event published to a topic another process is also driving — and the second one is the
+// likely one whenever the topic prefix is left at its default while parallel workspaces share
+// one broker. Sibling traffic does not corrupt the count directly, since every record is
+// filtered on this run's marker, but it does share the partitions and the fetch budget, and a
+// run competing with a heavy neighbour can fail to observe a record that is genuinely there.
+// Naming the prefix in the failure turns "the relay lost an event" into a question the reader
+// can answer in one command.
+//
+// Returns:
+//   - string: a leading-newline note about the topic namespace, or the empty string when the
+//     prefix is already clone-scoped.
+func (f *orderingFixture) describeTopicSharing() string {
+	prefix := "(unreadable)"
+	if cnf, err := config.Fetch(); err == nil {
+		prefix = cnf.Kafka.TopicPrefix
+	}
+
+	return fmt.Sprintf(
+		"\n\nThe topic namespace in use is %q (topic %s). If a broker is shared with other "+
+			"workspaces, set KAFKA_TOPIC_PREFIX to a value unique to this one and provision it "+
+			"with scripts/kafka-provision.sh, so this run's partitions carry only its own "+
+			"traffic. Verify with: kafka-topics --list",
+		prefix, f.topic,
+	)
 }
 
 // orderingEventName is the event this test publishes, derived from the transaction status the
@@ -1052,14 +1356,22 @@ func orderingTransaction(runID, ledgerID string, aggregate, sequence int) *model
 	}
 }
 
-// publishRun captures the whole schedule through the PRODUCTION path: PublishEvent, which
-// writes one pending outbox row per event and never touches the broker.
+// publishRun captures the whole schedule through the PRODUCTION capture path for a
+// transaction event: prepareTransactionEventOutbox, the function the single-transaction
+// execution path calls immediately before it hands the row to the atomic writer.
 //
 // WithEventLedgerID is what makes this test about requirement R-6. A transaction payload
-// carries no ledger of its own, so the ledger is supplied by the caller — as the production
-// call sites do — and a supplied ledger becomes both the row's ledger_id and its PARTITION
-// KEY. That single value is then the Kafka message key, which is why the observed key can be
-// asserted to equal the ledger id.
+// carries no ledger of its own, so the ledger is supplied by the caller, and a supplied
+// ledger becomes both the row's ledger_id and its PARTITION KEY. That single value is then
+// the Kafka message key, which is why the observed key can be asserted to equal the ledger id.
+//
+// THIS HARNESS SUPPLYING IT PROVES NOTHING ABOUT PRODUCTION, and it must not be read as
+// doing so: it seeds many ledgers directly rather than executing many transactions. That
+// production supplies the ledger — buildTransactionExecutionWork resolving it from the
+// loaded balances — is proved separately and without a broker by
+// TestEventOrdering_ProductionCaptureKeysTransactionEventsByLedgerID. The two together are
+// the requirement: production keys by ledger, and a ledger-keyed stream is consumed in
+// order.
 //
 // Parameters:
 //   - ctx context.Context: the context for the operation.
@@ -1079,20 +1391,41 @@ func (f *orderingFixture) publishRun(
 ) []string {
 	t.Helper()
 
-	eventName := orderingEventName()
 	eventIDs := make([]string, 0, len(schedule))
 
 	for _, slot := range schedule {
 		ledgerID := ledgers[slot.aggregate]
 		transaction := orderingTransaction(f.runID, ledgerID, slot.aggregate, slot.sequence)
 
-		err := f.blnk.PublishEvent(ctx, NewWebhook{
-			Event:   eventName,
-			Payload: transaction,
-		}, WithEventLedgerID(ledgerID))
+		// One ledger, a different balance pair per event. The balances are what production
+		// reads the ledger from, and their ids are what a payload-derived key would have
+		// used instead.
+		sourceBalance := &model.Balance{
+			BalanceID: fmt.Sprintf("bln_%s_a%02d_s%03d_source", f.runID, slot.aggregate, slot.sequence),
+			LedgerID:  ledgerID,
+		}
+		destinationBalance := &model.Balance{
+			BalanceID: fmt.Sprintf("bln_%s_a%02d_s%03d_destination", f.runID, slot.aggregate, slot.sequence),
+			LedgerID:  ledgerID,
+		}
+
+		row, err := f.blnk.prepareTransactionEventOutbox(ctx, transaction, sourceBalance, destinationBalance)
 		require.NoError(t, err,
-			"capturing event %d of aggregate %d (transaction %s) in the outbox failed",
+			"preparing event %d of aggregate %d (transaction %s) failed",
 			slot.sequence, slot.aggregate, transaction.TransactionID)
+		require.NotNil(t, row,
+			"event publishing must be configured for this fixture, or there is nothing to order")
+
+		eventName := row.EventType
+		require.Equal(t, orderingEventName(), eventName,
+			"the production path must derive the event name from the transaction status")
+		require.Equal(t, ledgerID, row.LedgerID,
+			"the production path must record the ledger it resolved from the balances")
+		require.Equal(t, ledgerID, row.PartitionKey,
+			"and that ledger must be the ordering key, not the source balance id: keying on the balance would split one ledger's events across partitions")
+
+		require.NoError(t, f.ds.InsertEventOutbox(ctx, row),
+			"persisting the prepared event row for transaction %s failed", transaction.TransactionID)
 
 		eventIDs = append(eventIDs, model.DeriveEventID(transaction.TransactionID, eventName, model.SchemaVersionV1))
 	}
@@ -1357,6 +1690,97 @@ func TestEventOrdering_EventsSharingAnAggregateAreConsumedInPublishOrder(t *test
 	})
 }
 
+// TestEventOrdering_ProductionCaptureKeysTransactionEventsByLedgerID is the proof that
+// requirement R-6's partitioning dimension is supplied by PRODUCTION CODE and not by a test.
+//
+// # Why this test exists separately from the Kafka one
+//
+// The delivery subtest above proves that a message keyed by ledger id is consumed in
+// per-aggregate order. It could not prove where that key came from, because its harness
+// supplied the ledger itself — and for a while nothing in production did. Every real
+// transaction event was therefore keyed on its SOURCE BALANCE, which preserves per-balance
+// ordering rather than per-ledger ordering and puts a value that is not a ledger id in the
+// row's ledger column, while a test that injected the option reported the requirement as met.
+//
+// So this drives buildTransactionExecutionWork — the function the single and the coalesced
+// execution paths BOTH build their work from — and asserts what it produces. It needs no
+// broker and no database: preparing a row is a marshal and no I/O, which is what lets this
+// run everywhere rather than only where the integration fixture is reachable.
+func TestEventOrdering_ProductionCaptureKeysTransactionEventsByLedgerID(t *testing.T) {
+	// Kafka brokers make event capture configured, and the deprecation window has to be
+	// stated alongside them: the loader refuses brokers without one, so MockConfig would
+	// silently store nothing and the assertions below would fail for a configuration
+	// reason rather than a keying one. No broker is contacted — preparing a row performs
+	// no I/O at all.
+	config.MockConfig(&config.Configuration{
+		DataSource:                  config.DataSourceConfig{Dns: "postgres://localhost:5432/blnk?sslmode=disable"},
+		Redis:                       config.RedisConfig{Dns: "localhost:6379"},
+		Kafka:                       config.KafkaConfig{Brokers: []string{"localhost:9092"}, TopicPrefix: "blnk"},
+		WebhookDeprecationStartDate: time.Now().UTC().Format(time.RFC3339),
+	})
+
+	loaded, err := config.Fetch()
+	require.NoError(t, err, "the mocked configuration must publish, or nothing below is exercising event capture")
+	require.NotEmpty(t, loaded.Kafka.Brokers, "event capture is only configured when brokers are")
+
+	instance := &Blnk{}
+	ctx := context.Background()
+
+	ledgerID := model.GenerateUUIDWithSuffix("ldg")
+	otherLedgerID := model.GenerateUUIDWithSuffix("ldg")
+
+	sourceBalance := &model.Balance{
+		BalanceID: model.GenerateUUIDWithSuffix("bln"),
+		LedgerID:  ledgerID,
+		Currency:  "USD",
+	}
+	destinationBalance := &model.Balance{
+		BalanceID: model.GenerateUUIDWithSuffix("bln"),
+		LedgerID:  otherLedgerID,
+		Currency:  "USD",
+	}
+
+	transaction := &model.Transaction{
+		TransactionID: model.GenerateUUIDWithSuffix("txn"),
+		Reference:     "ref_" + model.GenerateUUIDWithSuffix("ord"),
+		Source:        sourceBalance.BalanceID,
+		Destination:   destinationBalance.BalanceID,
+		Amount:        10,
+		Precision:     100,
+		PreciseAmount: big.NewInt(1000),
+		Currency:      "USD",
+		Status:        StatusApplied,
+		CreatedAt:     time.Now().UTC(),
+	}
+
+	work, skipped := instance.buildTransactionExecutionWork(ctx, transaction, sourceBalance, destinationBalance)
+	require.False(t, skipped, "a non-zero-amount transaction must produce persistable work")
+	require.NotNil(t, work.eventOutbox,
+		"the production execution path must PREPARE the transaction's event before the write; a nil row here means the event is captured after the commit again, outside the mutation's transaction")
+
+	assert.Equal(t, ledgerID, work.eventOutbox.PartitionKey,
+		"the Kafka message key must be the LEDGER id, which is requirement R-6's partitioning dimension; the source balance id keyed by the old fallback is what this asserts against")
+	assert.Equal(t, ledgerID, work.eventOutbox.LedgerID,
+		"and the row's ledger column must record that same authoritative ledger rather than NULL or a balance id")
+	assert.NotEqual(t, sourceBalance.BalanceID, work.eventOutbox.PartitionKey,
+		"a balance id as the key is the exact defect this test exists to catch")
+	assert.Equal(t, "transaction.applied", work.eventOutbox.EventType,
+		"the event string is still the status-derived one, unchanged by the keying")
+	assert.False(t, work.eventCaptured,
+		"nothing is captured until an atomic writer has committed it; the flag is set by the writer, not by preparation")
+
+	t.Run("the ledger resolution prefers the source balance and falls back to the destination", func(t *testing.T) {
+		assert.Equal(t, ledgerID, transactionLedgerID(sourceBalance, destinationBalance),
+			"the source ledger wins, matching what the transaction queue already shards on")
+		assert.Equal(t, otherLedgerID, transactionLedgerID(nil, destinationBalance),
+			"a credit-only transaction is keyed by its destination's ledger")
+		assert.Equal(t, otherLedgerID, transactionLedgerID(&model.Balance{LedgerID: "  "}, destinationBalance),
+			"a blank source ledger is not a ledger: it would hash to its own partition and split one ledger's events across two")
+		assert.Empty(t, transactionLedgerID(nil, nil),
+			"a rejected transaction has no balances, and an empty result leaves the payload-derived key in place rather than inventing one")
+	})
+}
+
 // orderingAssertDeliveryPreservesPerAggregateOrder drives the FULL path — PublishEvent, a
 // pending outbox row, a real relay claiming and publishing it, the row marked dispatched — and
 // then reads the topic back.
@@ -1412,7 +1836,7 @@ func orderingAssertDeliveryPreservesPerAggregateOrder(t *testing.T, f *orderingF
 		"the relay refused to start; startupObstacle logs which precondition was missing")
 
 	f.requireAllDispatched(ctx, t, eventIDs)
-	observed := f.consumeRun(t, startOffsets, len(eventIDs))
+	observed, _ := f.consumeRun(t, startOffsets, len(eventIDs))
 
 	relay.Stop()
 	assert.False(t, relay.IsRunning(), "IsRunning must report false once Stop has returned")
@@ -1602,6 +2026,33 @@ func orderingAssertClaimYieldsOccurrenceOrder(t *testing.T, f *orderingFixture) 
 	claimed := make([]string, 0, orderingClaimRows)
 
 	for round := 0; round*orderingClaimBatchSize < orderingClaimRows; round++ {
+		// THE PREMISE HAS TO HOLD BEFORE THE CLAIM MEANS ANYTHING.
+		//
+		// This subtest asserts that a batch of three over six backdated rows hands back a
+		// PREFIX of the occurrence order, and that claim is only about this claim: it presumes
+		// nothing else takes these rows. On a database shared with the rest of the package
+		// that presumption can fail — the subtest above runs a real relay against the same
+		// table, and a relay whose final tick overlaps this seeding leases rows out from under
+		// it. The observable symptom is a batch that skips positions rather than one that
+		// reorders them, which is exactly what a foreign lease produces and exactly what
+		// nothing in the claim query is doing wrong.
+		//
+		// So the precondition is checked and a violation SKIPS. Failing there would report a
+		// defect that is not one, while a skip states plainly that the premise could not be
+		// established — and a skip cannot pass vacuously. The FIFO property itself is
+		// separately and hermetically asserted in database/event_outbox_test.go against a
+		// quiesced table, so nothing is lost when this guard trips.
+		// Only the rows this subtest has NOT yet claimed. Earlier rounds deliberately leave
+		// their rows dispatched, so probing the whole seeded set would report this subtest's
+		// own progress as a foreign hold and skip every run after the first round.
+		start := round * orderingClaimBatchSize
+		if foreign := f.foreignlyClaimedSeededRows(ctx, t, expected[start:]); foreign != "" {
+			t.Skipf(
+				"a concurrent claimer holds seeded rows before claim %d, so this claim would be "+
+					"asserted against a table this subtest did not shape: %s",
+				round+1, foreign)
+		}
+
 		batch, err := f.ds.ClaimPendingEventOutbox(ctx, orderingClaimBatchSize, orderingClaimLease)
 		require.NoError(t, err, "claiming batch %d failed", round+1)
 
@@ -1612,7 +2063,6 @@ func orderingAssertClaimYieldsOccurrenceOrder(t *testing.T, f *orderingFixture) 
 			}
 		}
 
-		start := round * orderingClaimBatchSize
 		want := expected[start : start+orderingClaimBatchSize]
 
 		got := make([]string, 0, len(mine))
@@ -1636,7 +2086,7 @@ func orderingAssertClaimYieldsOccurrenceOrder(t *testing.T, f *orderingFixture) 
 			require.NotEmpty(t, row.ClaimToken,
 				"a claimed row must carry the claim token every subsequent transition is conditional on")
 
-			require.NoError(t, f.ds.MarkEventDispatched(ctx, row.ID, row.ClaimToken),
+			require.NoError(t, f.ds.MarkEventDispatched(ctx, row.ID, row.ClaimToken, model.BrokerRecord{}),
 				"marking event %s dispatched failed", row.EventID)
 			claimed = append(claimed, row.EventID)
 		}
@@ -1659,6 +2109,58 @@ func orderingAssertClaimYieldsOccurrenceOrder(t *testing.T, f *orderingFixture) 
 // status, attempt count, lease and claim token separate them at a glance, which is the
 // difference between a diagnosable failure and a re-run.
 //
+// foreignlyClaimedSeededRows reports whether any of the given rows has already left the
+// pending state, which means something other than the caller has claimed it.
+//
+// It exists to separate a claim-ordering DEFECT from a shared-table ACCIDENT. Both surface as
+// a batch that is not the expected prefix, and only one of them is worth failing a build for.
+// A row this subtest seeded and has not yet claimed must be pending with no lease; anything
+// else — processing under another claim token, already dispatched, or leased into the future —
+// says a concurrent claimer got there first.
+//
+// It returns a DESCRIPTION rather than a boolean so the skip message names what it found. An
+// empty string means the premise holds.
+//
+// Parameters:
+//   - ctx context.Context: the context for the query.
+//   - t *testing.T: fails the test if the probe itself cannot run — an unreadable table is a
+//     real failure, not a reason to skip.
+//   - eventIDs []string: the seeded events that should still be pending and unleased.
+//
+// Returns:
+//   - string: a human-readable account of the first few foreign holds, or "" when there are
+//     none.
+func (f *orderingFixture) foreignlyClaimedSeededRows(ctx context.Context, t *testing.T, eventIDs []string) string {
+	t.Helper()
+
+	if len(eventIDs) == 0 {
+		return ""
+	}
+
+	var report strings.Builder
+
+	for _, eventID := range eventIDs {
+		row, err := f.ds.GetEventByID(ctx, eventID)
+		require.NoError(t, err, "probing seeded event %s for a foreign claim must succeed", eventID)
+		require.NotNil(t, row, "seeded event %s must still be in the outbox", eventID)
+
+		if row.Status == model.EventOutboxStatusPending && row.ClaimToken == "" {
+			continue
+		}
+
+		if report.Len() > 0 {
+			report.WriteString("; ")
+		}
+
+		report.WriteString(fmt.Sprintf("%s is %s", eventID, row.Status))
+		if row.ClaimToken != "" {
+			report.WriteString(fmt.Sprintf(" under claim token %q", row.ClaimToken))
+		}
+	}
+
+	return report.String()
+}
+
 // The output is CAPPED. Dumping all 288 rows of a full run produces a wall of text nobody
 // reads, so a handful of rows plus the total is what actually gets looked at.
 //
@@ -1702,4 +2204,143 @@ func (f *orderingFixture) describeEventRows(ctx context.Context, eventIDs []stri
 	}
 
 	return "\n" + strings.Join(lines, "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Production wiring (Q4-28)
+// ---------------------------------------------------------------------------
+
+// orderingProducerWiring is one production call site and the ledger it must supply.
+//
+// The delivery test above asserts that events sharing a ledger arrive in publish order,
+// and it earns that assertion by calling PublishEvent with WithEventLedgerID — because a
+// supplied ledger becomes the outbox row's partition key and therefore the Kafka message
+// key, and a stable key is what pins an aggregate to one partition.
+//
+// Which means the test's assurance rests entirely on PRODUCTION doing the same thing. If a
+// producer stopped supplying the ledger, its events would fall back to the next-best
+// partition key, spread across partitions, and lose their ordering guarantee — while this
+// file's delivery test carried on passing, because it supplies the ledger itself.
+type orderingProducerWiring struct {
+	// file is the production source read verbatim.
+	file string
+
+	// what names the emitting path, so a failure says which producer regressed rather
+	// than which line number moved.
+	what string
+
+	// supplies is the exact WithEventLedgerID call expected in that file.
+	supplies string
+}
+
+// orderingProducerWirings is every production path that emits an event for an aggregate
+// whose ledger is knowable at the call site.
+//
+// The list is deliberately explicit rather than derived from a grep for the option: a
+// derived list would shrink silently as producers were removed, which is the regression it
+// exists to catch.
+//
+// Two production emitters are ABSENT and their absence is correct, not an omission:
+//
+//   - identity.go emits identity.created, and an identity belongs to no ledger. Its
+//     partition key falls back to the aggregate, which is the identity itself — the
+//     strongest key available and stable for that aggregate.
+//   - transaction_bulk.go emits bulk_transaction.<status> for a BATCH, which spans
+//     transactions in different ledgers. There is no single ledger to name, and inventing
+//     one would key a batch event to a ledger it only partly concerns.
+//
+// cmd/workers.go's rejection handler is likewise absent: it publishes through the same
+// transaction path this list already covers, from a transaction whose ledger it does not
+// resolve independently.
+var orderingProducerWirings = []orderingProducerWiring{
+	{
+		file: "transaction_execution.go",
+		what: "transaction execution (the status-derived event)",
+		// Both capture paths in that file — the atomic builder and the post-commit fallback —
+		// resolve the ledger through this one call, which is why the snippet names the resolver
+		// rather than a local variable: a producer that stopped supplying the ledger would have
+		// to remove this call, and one that started resolving it differently would too.
+		supplies: "WithEventLedgerID(transactionLedgerID(sourceBalance, destinationBalance))",
+	},
+	{
+		file:     "ledger.go",
+		what:     "ledger creation (ledger.created)",
+		supplies: "WithEventLedgerID(created.LedgerID)",
+	},
+	{
+		file:     "balance.go",
+		what:     "balance creation (balance.created)",
+		supplies: "WithEventLedgerID(created.LedgerID)",
+	},
+	{
+		file:     "balance.go",
+		what:     "balance monitoring (balance.monitor)",
+		supplies: "WithEventLedgerID(updatedBalance.LedgerID)",
+	},
+}
+
+// TestEventOrdering_ProductionSuppliesTheLedgerAtEveryKnowableCallSite is a STATIC
+// assertion about the wiring the delivery test above depends on.
+//
+// It reads no broker and no database, so it runs in every environment including short
+// mode and CI without infrastructure — which matters, because the test it protects skips
+// without a broker and would then protect nothing.
+//
+// WHY A SOURCE-TEXT ASSERTION RATHER THAN A BEHAVIOURAL ONE. The property is "the
+// production call site passes this option", and the only way to observe that behaviourally
+// is to drive each producer end to end with a real ledger, a real balance and a real
+// database, then read the partition key back off the row — five integration tests to prove
+// one line each, every one of which skips without infrastructure. Reading the source
+// proves the same thing unconditionally. It is coarse: renaming the local variable holding
+// the ledger id breaks this test without breaking the code. That is the intended
+// trade — the failure message says exactly what to update, and a test that goes red when
+// the wiring it describes changes is doing its job.
+func TestEventOrdering_ProductionSuppliesTheLedgerAtEveryKnowableCallSite(t *testing.T) {
+	for _, wiring := range orderingProducerWirings {
+		source, err := os.ReadFile(wiring.file)
+		require.NoErrorf(t, err, "reading the production source %s", wiring.file)
+
+		assert.Containsf(t, string(source), wiring.supplies,
+			"%s (%s) MUST supply the ledger with %q.\n\n"+
+				"Without it the event's partition key falls back to the aggregate, its events "+
+				"spread across partitions, and the per-aggregate ordering guarantee of "+
+				"requirement R-6 is lost for that producer — while "+
+				"TestEventOrdering_EventsSharingAnAggregateAreConsumedInPublishOrder keeps "+
+				"passing, because it supplies the ledger itself and would be proving the test "+
+				"harness rather than the system.\n\n"+
+				"If the call site legitimately changed shape, update orderingProducerWirings in "+
+				"this file to match — and if a producer legitimately has no ledger, move it to "+
+				"the documented exceptions above rather than deleting the row.",
+			wiring.what, wiring.file, wiring.supplies)
+	}
+}
+
+// TestEventOrdering_ProductionStartsTheRelayThatDrainsTheOutbox asserts the OTHER half of
+// the wiring this file's delivery test stands in for.
+//
+// PublishEvent only writes a pending outbox row; nothing reaches a broker until a relay
+// claims that row. The delivery test starts a relay itself, so it would pass unchanged
+// against a deployment whose server role started none — and on such a deployment every
+// ledger mutation would be captured correctly and no subscriber would ever receive
+// anything, which is the most expensive way for a passing test suite to be wrong.
+//
+// cmd/server_test.go asserts the server role's own wiring in detail — the call, the
+// deferred stop, and topic assurance ordered before it. This asserts only that the relay
+// constructor is reached from the server command at all, from the perspective of the file
+// that depends on it, so that deleting that wiring fails HERE too and the failure names
+// the ordering guarantee it costs.
+func TestEventOrdering_ProductionStartsTheRelayThatDrainsTheOutbox(t *testing.T) {
+	source, err := os.ReadFile("cmd/server.go")
+	require.NoError(t, err, "reading cmd/server.go")
+
+	body := string(source)
+
+	assert.Contains(t, body, "blnk.NewEventRelayProcessor(instance)",
+		"the server role MUST construct the event relay. Without it blnk.event_outbox is "+
+			"written and never drained: every event is captured, none is delivered, and the "+
+			"delivery test in this file still passes because it starts a relay of its own.")
+
+	assert.Contains(t, body, "relay.Start(ctx)",
+		"constructing the relay is not enough — it must be started. See cmd/server_test.go "+
+			"for the full assertion, including that topic assurance precedes it.")
 }

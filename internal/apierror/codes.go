@@ -147,6 +147,48 @@ const (
 	// retryable by the caller rather than a server defect.
 	ErrSubscriberNotFound           ErrorCode = "SUBSCRIBER_NOT_FOUND"
 	ErrSubscriberProvisioningFailed ErrorCode = "SUBSCRIBER_PROVISIONING_FAILED"
+
+	// ErrSubscriberIsolationUnenforceable is the refusal to issue a credential whose
+	// record claims an access boundary nothing can enforce.
+	//
+	// It resolves to 409 CONFLICT rather than 400 or 422, and the distinction carries
+	// meaning the caller needs: the REQUEST is well formed and would be honoured
+	// against a different registry row. What conflicts is the STATE — the subscriber
+	// records a partition-key prefix, and Kafka ACLs are topic-level, so any credential
+	// issued would grant strictly wider access than the row describes. 409 is the
+	// status that says "fix the resource, then repeat this request unchanged", which is
+	// exactly the remedy: clear the prefix, or narrow authorized_topics until
+	// topic-level scope is the isolation actually required.
+	ErrSubscriberIsolationUnenforceable ErrorCode = "SUBSCRIBER_ISOLATION_UNENFORCEABLE"
+
+	// ErrSubscriberBrokersNotConfigured is the refusal to issue a credential when no
+	// SUBSCRIBER-FACING broker list is configured.
+	//
+	// KAFKA_BROKERS is what Blnk dials, and inside a deployment that address is internal:
+	// a compose service name, a ClusterIP. Reporting it to an external subscriber returns
+	// an endpoint that does not resolve for them — and Kafka makes it worse, because a
+	// broker answers each client with the advertised address of the listener the
+	// connection arrived on, so even a reachable bootstrap redirects to internal names.
+	// KAFKA_SUBSCRIBER_BROKERS is the externally advertised list, and only an operator
+	// knows it.
+	//
+	// It resolves to 503 SERVICE UNAVAILABLE rather than 500, for the same reason
+	// ErrSubscriberProvisioningFailed does: nothing about the request is wrong and no
+	// server defect is implied. A dependency of issuance is not configured, the caller
+	// can do nothing but retry once it is, and the alternative — succeeding with an
+	// unusable endpoint — turns a clear refusal into a subscriber-side connection
+	// timeout diagnosed days later.
+	ErrSubscriberBrokersNotConfigured ErrorCode = "SUBSCRIBER_BROKERS_NOT_CONFIGURED"
+
+	// ErrSubscriberDeprovisioning is the refusal to act on a subscriber whose
+	// broker-side access is being torn down.
+	//
+	// Also 409, for the same reason and with a different remedy: complete or abandon
+	// the deregistration first. Issuing a credential against a row in this state would
+	// provision a boundary that the deregistration it is racing is halfway through
+	// deleting, and the result would be indistinguishable from a successful issuance
+	// to everything except the broker.
+	ErrSubscriberDeprovisioning ErrorCode = "SUBSCRIBER_DEPROVISIONING"
 )
 
 // statusByCode is the single source of truth for the default HTTP status of
@@ -253,6 +295,13 @@ var statusByCode = map[ErrorCode]int{
 	// SUBSCRIBER — 503 on provisioning failure is deliberate for the same reason.
 	ErrSubscriberNotFound:           http.StatusNotFound,
 	ErrSubscriberProvisioningFailed: http.StatusServiceUnavailable,
+	// Also 503: a dependency of issuance is unconfigured, not a malformed request.
+	ErrSubscriberBrokersNotConfigured: http.StatusServiceUnavailable,
+
+	// 409 for both refusals below: the request is well formed and it is the registry
+	// row's state that has to change before it can be honoured.
+	ErrSubscriberIsolationUnenforceable: http.StatusConflict,
+	ErrSubscriberDeprovisioning:         http.StatusConflict,
 
 	// Legacy codes — same statuses MapErrorToHTTPStatus implied, with the
 	// BAD_REQUEST omission fixed (it previously fell through to 500).

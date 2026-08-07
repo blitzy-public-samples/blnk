@@ -20,10 +20,13 @@ import (
 	"context"
 	"embed"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"time"
 
 	"github.com/hibiken/asynq"
+	"github.com/sirupsen/logrus"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/database"
@@ -54,6 +57,34 @@ type Blnk struct {
 	config      *config.Configuration
 	cache       cache.Cache
 	hotPairs    *hotpairs.Manager
+
+	// legacyWebhookNow is the clock ProcessWebhook evaluates the webhook sunset against.
+	//
+	// nil in every production construction, where it resolves to time.Now. It exists so a
+	// test can pin the sunset boundary to the nanosecond, in exactly the shape
+	// EventRelayProcessor already uses for the same purpose — and only the CLOCK is
+	// injectable, never the predicate. WebhookSunsetPassed remains the single decision
+	// point both the relay and the handler read, so the two cannot disagree about the rule
+	// even while a test disagrees with the wall clock about the hour.
+	legacyWebhookNow func() time.Time
+}
+
+// legacyWebhookClock returns the clock the legacy transport reads, defaulting to the wall
+// clock.
+//
+// Nil-guarded rather than assigned in NewBlnk, because the harness in
+// event_dual_delivery_test.go assembles a Blnk literal directly to keep TypeSense, the hook
+// manager and the cache off the path under test. A field that had to be initialised by a
+// constructor would be nil there and panic.
+//
+// Returns:
+//   - time.Time: the instant to evaluate the sunset against.
+func (b *Blnk) legacyWebhookClock() time.Time {
+	if b == nil || b.legacyWebhookNow == nil {
+		return time.Now()
+	}
+
+	return b.legacyWebhookNow()
 }
 
 const (
@@ -89,6 +120,79 @@ func initializeRedisClients(config *config.Configuration) (redis.UniversalClient
 	return redisClient.Client(), asynqClient, nil
 }
 
+// closeInitializedRedisClients releases the two pooled clients initializeRedisClients built.
+//
+// It exists for the construction error paths in NewBlnk. Both clients own descriptors and
+// background goroutines from the moment they are created, so an error exit that returns without
+// closing them leaks a pair per attempt — and the attempts that reach such an exit are exactly
+// the ones a supervised process repeats, because they are configuration failures.
+//
+// Failures are LOGGED, never returned. The caller is already on its way out with the error the
+// operator has to read, and replacing that with "closing redis failed" would hide the real
+// problem behind cleanup noise. A nil client is skipped, so the helper is safe to call from any
+// point after construction.
+//
+// Parameters:
+//   - redisClient redis.UniversalClient: the client to close. May be nil.
+//   - asynqClient *asynq.Client: the client to close. May be nil.
+func closeInitializedRedisClients(redisClient redis.UniversalClient, asynqClient *asynq.Client) {
+	if asynqClient != nil {
+		if err := asynqClient.Close(); err != nil {
+			logrus.WithError(err).Warn(
+				"blnk: closing the asynq client after a failed initialization; its connections are " +
+					"released when the process exits",
+			)
+		}
+	}
+
+	if redisClient != nil {
+		if err := redisClient.Close(); err != nil {
+			logrus.WithError(err).Warn(
+				"blnk: closing the redis client after a failed initialization; its connections are " +
+					"released when the process exits",
+			)
+		}
+	}
+}
+
+// closeInitializedEventPublisher releases the publisher initializeEventPublisher built.
+//
+// It exists for the ONE construction error path in NewBlnk that now sits after the publisher:
+// the publisher is built first, deliberately, so that a configuration refusal unwinds nothing —
+// but a later failure must still not drop it. A Kafka-backed publisher owns one writer per
+// topic, and every writer holds a shared transport with a connection pool and a background
+// goroutine behind it.
+//
+// Failures are LOGGED, never returned, for the same reason closeInitializedRedisClients logs
+// its own: the caller is already on its way out with the error the operator has to read. A nil
+// publisher is skipped, and the no-op publisher's Close is a no-op, so this is safe on every
+// path.
+//
+// The parameter is the MANDATED narrow interface rather than TopicEventPublisher, matching
+// what initializeEventPublisher returns, and Close is reached by assertion. That keeps the
+// helper correct for a publisher supplied by a test double that implements only Publish:
+// there is then nothing to close, and nothing to panic over either.
+//
+// Parameters:
+//   - publisher EventPublisher: the publisher to close. May be nil, and need not be closeable.
+func closeInitializedEventPublisher(publisher EventPublisher) {
+	if publisher == nil {
+		return
+	}
+
+	closer, closeable := publisher.(io.Closer)
+	if !closeable {
+		return
+	}
+
+	if err := closer.Close(); err != nil {
+		logrus.WithError(err).Warn(
+			"blnk: closing the event publisher after a failed initialization; its connections are " +
+				"released when the process exits",
+		)
+	}
+}
+
 // initializeTokenizationService creates and configures the tokenization service
 func initializeTokenizationService(config *config.Configuration) *tokenization.TokenizationService {
 	if config.TokenizationSecret == "" {
@@ -103,48 +207,58 @@ func initializeTokenizationService(config *config.Configuration) *tokenization.T
 func initializeHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: 30 * time.Second,
+		// The redirect refusal and the dial guard are the two halves of the legacy
+		// transport's destination policy: a 3xx must not be able to walk a delivery onto an
+		// address the URL check approved of, and a hostname must be judged by what it
+		// actually resolves to rather than by how it is spelled. See the destination-guard
+		// section of webhooks.go.
+		CheckRedirect: refuseLegacyWebhookRedirect,
 		Transport: &http.Transport{
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     90 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+				Control:   guardLegacyWebhookDial,
+			}).DialContext,
 		},
 	}
 }
 
 // initializeEventPublisher creates and configures the Kafka event publisher for this
-// process, in the same shape as initializeHTTPClient does for the legacy transport: ONE
-// instance, built once here and shared for the process lifetime.
+// process: ONE instance, built once and shared for the process lifetime, in the same shape
+// as initializeHTTPClient.
 //
-// That sharing is the point rather than an economy. The publisher owns one kafka.Writer
-// per topic over a single transport, so every writer draws on one connection pool and one
-// SASL session per broker. Building a publisher per publish would give each event an empty
-// partition-metadata cache and an empty connection pool, so it would pay a metadata round
-// trip plus a TCP and SASL handshake before it could produce anything.
+// The sharing is load-bearing. The publisher owns one kafka.Writer per topic over a SINGLE
+// SHARED TRANSPORT, so every writer draws on that transport's connection pool and its one
+// authentication and TLS configuration, and connections are established lazily per broker
+// and then reused. Building a publisher per publish would give each event an empty
+// partition-metadata cache and an empty pool, paying a metadata round trip plus a TCP and
+// SASL handshake before it could produce anything.
 //
 // # An empty broker list is a legitimate steady state, not an error
 //
-// With no brokers configured this returns the NO-OP publisher and a NIL ERROR. It never
-// reports a problem, because there is none: a Blnk deployment has always been able to run
-// with no notification sink, exactly as SendWebhook returns nil without enqueuing when no
-// webhook URL is configured (webhooks.go). Every deployment that does not run Kafka, and
-// every existing test that constructs a Blnk instance with nothing but a Redis DSN, must
-// keep working unchanged — so a whitespace-only entry left by a stray separator in an
-// environment file resolves the same way as an unset KAFKA_BROKERS.
+// With no brokers configured this returns the NO-OP publisher and a NIL ERROR: a Blnk
+// deployment has always been able to run with no notification sink, exactly as SendWebhook
+// returns nil without enqueuing when no webhook URL is configured. Every deployment that
+// does not run Kafka, and every existing test that constructs a Blnk instance with nothing
+// but a Redis DSN, keeps working — so a whitespace-only entry left by a stray separator
+// resolves the same way as an unset KAFKA_BROKERS.
 //
 // # It performs no I/O
 //
-// Nothing here dials a broker, resolves a name, fetches metadata, or blocks, on either
-// path. NewEventPublisher documents and enforces that property; writers connect lazily on
-// their first write. It is load-bearing: NewBlnk runs on every process's startup path and
-// throughout the existing test suite, so a network call, a delay or an error here would
-// make both depend on a broker being reachable.
+// Nothing here dials a broker, resolves a name, fetches metadata or blocks, on either path;
+// writers connect on their first write. NewBlnk runs on every process's startup path and
+// throughout the test suite, so a network call, a delay or an error here would make both
+// depend on a broker being reachable.
 //
-// The one error it can surface comes from preparing the SASL/SCRAM credentials or the TLS
-// material for a broker list that IS configured — a malformed credential, unreadable TLS
-// material, or plaintext without the explicit local-development acknowledgement. That is a
-// fatal misconfiguration and is returned rather than downgraded to the no-op, because
-// silently publishing nothing is the failure mode the loud error exists to prevent. The
-// error is propagated unwrapped, matching initializeRedisClients above.
+// The one error it can surface comes from ASSEMBLING the transport for a broker list that
+// IS configured — a malformed credential, unreadable TLS material, or plaintext without the
+// explicit local-development acknowledgement. That is a fatal misconfiguration and is
+// returned rather than downgraded to the no-op, because silently publishing nothing is the
+// failure mode the loud error exists to prevent. It is propagated unwrapped, matching
+// initializeRedisClients above.
 //
 // # Ownership
 //
@@ -160,8 +274,8 @@ func initializeHTTPClient() *http.Client {
 // Returns:
 //   - EventPublisher: the Kafka-backed publisher when brokers are configured, otherwise the
 //     no-op. Never nil when the error is nil.
-//   - error: non-nil only when a configured broker list cannot be dialled securely or its
-//     credentials cannot be prepared.
+//   - error: non-nil only when a configured broker list's transport, credentials or TLS
+//     material cannot be assembled securely.
 func initializeEventPublisher(configuration *config.Configuration) (EventPublisher, error) {
 	publisher, err := NewEventPublisher(configuration)
 	if err != nil {
@@ -194,8 +308,34 @@ func NewBlnk(db database.IDataSource) (*Blnk, error) {
 		return nil, err
 	}
 
+	// THE EVENT PUBLISHER IS BUILT FIRST, BEFORE ANY POOLED RESOURCE. RES-01.
+	//
+	// The Redis client and the asynq client below are both POOLED CONNECTION OWNERS: each
+	// holds file descriptors and a background goroutine set from the moment it is built.
+	// Constructing them first and validating the publisher afterwards leaked BOTH on every
+	// failed construction, and this is not a theoretical path — initializeEventPublisher
+	// fails on a malformed CA bundle, a SASL credential SASLprep rejects, or TLS disabled
+	// without the local-development acknowledgement, all of which are configuration mistakes
+	// that a supervised process retries. Each retry leaked another pair, so a misconfigured
+	// deployment exhausted descriptors rather than failing cleanly on the first attempt.
+	//
+	// Closing them on that error path would also have worked. Ordering is the better fix
+	// because it removes the class rather than one instance of it: the publisher validates
+	// PURE CONFIGURATION and opens no connection, so there is nothing to unwind if it
+	// refuses, and no future resource added between here and there can reintroduce the leak.
+	eventPublisher, err := initializeEventPublisher(configuration)
+	if err != nil {
+		return nil, err
+	}
+
 	redisClient, asynqClient, err := initializeRedisClients(configuration)
 	if err != nil {
+		// The publisher above owns per-topic writers, so it is closed rather than dropped:
+		// each writer holds a shared transport that keeps a connection pool and a background
+		// goroutine. The close error is LOGGED rather than returned, because the Redis failure
+		// is what the caller needs to read.
+		closeInitializedEventPublisher(eventPublisher)
+
 		return nil, err
 	}
 
@@ -211,10 +351,6 @@ func NewBlnk(db database.IDataSource) (*Blnk, error) {
 	hookManager := hooks.NewHookManager(redisClient, asynqClient)
 	tokenizer := initializeTokenizationService(configuration)
 	httpClient := initializeHTTPClient()
-	eventPublisher, err := initializeEventPublisher(configuration)
-	if err != nil {
-		return nil, err
-	}
 
 	newCache := cache.NewCacheWithClient(redisClient)
 
@@ -238,22 +374,22 @@ func NewBlnk(db database.IDataSource) (*Blnk, error) {
 	// than a direct emission. internal/notification cannot import this package, so it holds
 	// a registered WebhookSender instead and NotifyError calls through it.
 	//
-	// Only the CLOSURE BODY changes here: the event now goes to the transactional outbox
-	// instead of straight onto the legacy webhook queue, so system.error gets the same
-	// durable retry, dead-letter and replay treatment as every other event, and — during
-	// the dual-delivery window — is delivered over both transports from that one row. The
-	// closure's signature, notification.WebhookSender and NotifyError's signature are all
-	// untouched, which is why capturing the event costs the notification package no import
-	// churn at all.
+	// Routing it through PublishEvent is what gives system.error the same durable retry,
+	// dead-letter and replay treatment as every other event type, and — during the
+	// dual-delivery window — delivery over both transports from one outbox row.
+	// notification.WebhookSender and NotifyError's signature are untouched, so capturing
+	// this event costs the notification package no import churn.
 	//
-	// context.Background() is deliberate. WebhookSender supplies no context and must not
+	// context.Background() is deliberate: WebhookSender supplies no context and must not
 	// grow one, and NotifyError already runs this on its own goroutine detached from any
 	// request, so there is no caller context to inherit and no deadline to respect.
 	//
-	// The payload is FORWARDED VERBATIM and must stay that way. NotifyError has already
-	// sanitized it — the raw error text is logged against a correlation id rather than put
-	// on the wire — so re-deriving or enriching it here would undo that deliberately and
-	// invisibly.
+	// The payload is FORWARDED VERBATIM and must stay that way. NotifyError builds the
+	// LEGACY system.error body — exactly {"error", "time"}, the two keys the HTTP push has
+	// always carried — and its classification, typed code and correlation id go to the log
+	// line instead. Re-deriving or enriching the payload here would change the schema a
+	// subscriber parses while looking like a harmless addition, which is the one thing the
+	// payload-preservation guarantee forbids.
 	//
 	// COUPLING TO WATCH — notification.NotifyError guards this call on the event transports
 	// being configured (`len(conf.Kafka.Brokers) > 0 || conf.Notification.Webhook.Url != ""`
@@ -273,12 +409,12 @@ func NewBlnk(db database.IDataSource) (*Blnk, error) {
 
 // Close properly closes all connections and resources used by the Blnk instance.
 //
-// The event publisher is released first. Its writers hold pooled broker connections and a
-// SASL session per broker, and closing a writer flushes whatever it has batched, so
-// skipping it would both leak the connections and lose events that were accepted but not
-// yet produced. Both publisher implementations are idempotent and nil-safe on Close, so
-// this stays as simple as the nil-guarded asynq close it sits beside — the no-op publisher
-// releases nothing because it acquired nothing.
+// The event publisher is released first. Its writers share a transport holding pooled
+// broker connections, and closing a writer flushes whatever it has batched, so skipping it
+// would both leak the connections and lose events that were accepted but not yet produced.
+// Both publisher implementations are idempotent and nil-safe on Close, so this stays as
+// simple as the nil-guarded asynq close it sits beside — the no-op publisher releases
+// nothing because it acquired nothing.
 //
 // The type assertion is how the narrow mandated EventPublisher contract, which has no
 // Close, reaches the fuller TopicEventPublisher one that does. Both implementations satisfy

@@ -19,7 +19,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.0
+          go-version: 1.25.12
 
       - name: Tidy
         run: go mod tidy
@@ -74,7 +74,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.0
+          go-version: 1.25.12
 
       - name: Tidy
         run: go mod tidy
@@ -137,7 +137,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.0
+          go-version: 1.25.12
 
       - name: Tidy
         run: go mod tidy
@@ -152,3 +152,181 @@ jobs:
         run: go test -race -p 1 ./...
         env:
           BLNK_TYPESENSE_DNS: http://localhost:8108
+
+  # =====================================================================================
+  # Kafka event streaming — security, isolation, ordering and crash-recovery acceptance
+  #
+  # WHY THIS JOB IS SEPARATE FROM `test`, AND WHY IT IS MANDATORY (Q4-34)
+  #
+  # The suites below prove acceptance criteria V-5 (subscriber isolation), V-6 (per-aggregate
+  # ordering) and V-7 (crash recovery). Every one of them needs a live Kafka broker running
+  # the KRaft StandardAuthorizer, and every one of them SKIPS when that broker is absent —
+  # which it is in the `test` job, deliberately, because Blnk must build and pass its ordinary
+  # suite with no broker in sight.
+  #
+  # The consequence was that the security proofs never actually ran anywhere. A skipped test
+  # is reported as a pass by every CI summary, so the pipeline was green on a claim nobody had
+  # checked: an isolation test that skips is indistinguishable, in the only place people look,
+  # from one that proves credentials cannot read each other's topics.
+  #
+  # So this job provisions the broker and then FAILS IF ANY SELECTED TEST SKIPS. That check is
+  # the point of the job. Without it, a broken broker, a missing credential or a renamed
+  # environment variable would quietly return the pipeline to reporting a security property it
+  # was not testing — the exact state this job exists to leave behind.
+  #
+  # It runs the REPOSITORY'S OWN scripts to get there, rather than an inline broker
+  # configuration, so `kafka-bootstrap.sh` and `kafka-provision.sh` are themselves exercised
+  # on every push: their credential-strength floors, their grant validation, their file-based
+  # SCRAM delivery and their refusal to mint a credential on an unknown probe result.
+  # =====================================================================================
+  kafka:
+    name: Kafka event streaming acceptance
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:latest
+        env:
+          POSTGRES_DB: blnk
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:latest
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # The broker is reached on the compose stack's EXTERNAL listener, published to the
+      # runner's localhost. The tests run on the host, not in a container, so they cannot use
+      # the in-network kafka:9092 name.
+      KAFKA_BROKERS: localhost:9092
+      KAFKA_TOPIC_PREFIX: blnk
+      KAFKA_MIN_PARTITIONS: "6"
+      # One broker, so one replica. A hard-coded 3 would make topic creation fail outright
+      # with INVALID_REPLICATION_FACTOR; the production manifests set 3.
+      KAFKA_REPLICATION_FACTOR: "1"
+      # SASL_PLAINTEXT on a single-broker throwaway inside the runner. The application refuses
+      # a Kafka client that is neither TLS-protected nor explicitly marked as local
+      # development, and this acknowledges that rather than silently connecting in the clear.
+      KAFKA_INSECURE_LOCAL_DEV: "true"
+      # The broker really is configured with allow.everyone.if.no.acl.found=false — see the
+      # kafka service in docker-compose.yaml — and Kafka reports that setting as sensitive
+      # with an empty value, so it cannot be read back and has to be attested. Attesting it
+      # here is truthful; the isolation suite FAILS rather than skips if the broker turns out
+      # not to enforce, so a false attestation could not make this job pass.
+      KAFKA_DENY_BY_DEFAULT_ATTESTED: "true"
+      BLNK_DATA_SOURCE_DNS: postgres://postgres@localhost:5432/blnk?sslmode=disable
+      BLNK_REDIS_DNS: localhost:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.12
+
+      # Generated per run rather than committed. A credential in a workflow file is a
+      # credential in the repository (CWE-798), and these scripts enforce a 32-character,
+      # 16-distinct-character floor that a placeholder would not clear anyway.
+      #
+      # 24 raw bytes give exactly 32 unpadded base64 characters. The byte count must stay a
+      # multiple of three: base64 pads a remainder with '=', which is outside the credential
+      # alphabet Kafka's SCRAM value grammar can carry, and the scripts refuse it.
+      - name: Generate the broker credentials for this run
+        run: |
+          echo "KAFKA_SASL_ADMIN_USER=admin" >> "$GITHUB_ENV"
+          echo "KAFKA_SASL_ADMIN_SECRET=$(openssl rand -base64 24)" >> "$GITHUB_ENV"
+          echo "KAFKA_SASL_USER=blnk-producer" >> "$GITHUB_ENV"
+          echo "KAFKA_SASL_SECRET=$(openssl rand -base64 24)" >> "$GITHUB_ENV"
+
+      # The real compose services, named explicitly so the application containers stay down:
+      # the tests under test ARE the application, and a second copy publishing into the same
+      # topics would corrupt every ordering and recovery assertion below.
+      - name: Start the Kafka broker and provision the topic catalogue
+        run: |
+          docker compose -f docker-compose.yaml --profile kafka up -d --wait kafka
+          docker compose -f docker-compose.yaml --profile kafka up kafka-init
+
+      # A CONFIGURED-BUT-BROKEN BROKER MUST FAIL THE JOB, NOT SKIP IT.
+      #
+      # kafka-init is a one-shot: it exits 0 when the topics, the producer principal and the
+      # sample subscriber are all in place, and non-zero with a named reason otherwise. Reading
+      # its exit code is what turns a provisioning failure into a red build instead of a suite
+      # that skips its way to green.
+      - name: Require provisioning to have succeeded
+        run: |
+          set -euo pipefail
+          status="$(docker compose -f docker-compose.yaml --profile kafka ps -a \
+            --format '{{.Service}} {{.ExitCode}}' | awk '$1 == "kafka-init" { print $2 }')"
+          if [ -z "${status}" ]; then
+            echo "::error::the kafka-init one-shot did not run at all, so the topic catalogue is unprovisioned"
+            docker compose -f docker-compose.yaml --profile kafka logs kafka
+            exit 1
+          fi
+          if [ "${status}" != "0" ]; then
+            echo "::error::kafka-init exited ${status}; the topic catalogue and subscriber principals are not provisioned"
+            docker compose -f docker-compose.yaml --profile kafka logs kafka-init
+            exit 1
+          fi
+          echo "kafka-init completed successfully"
+
+      - name: Tidy
+        run: go mod tidy
+
+      - name: Migrate Database
+        run: go run ./cmd migrate up
+
+      # -json so the skip check below has machine-readable output, and tee so a human reading
+      # the log still sees the run. -p 1 because these suites share one broker and one outbox.
+      - name: Kafka acceptance suites
+        run: |
+          set -euo pipefail
+          go test -json -count=1 -p 1 \
+            -run 'TestEventIsolation_|TestEventRecovery_|TestEventOrdering_|TestDeadLetterRouting_|TestDualDelivery_|TestEventReplay' \
+            . ./database ./api 2>&1 | tee kafka-tests.json | \
+            jq -r 'select(.Action == "output") | .Output' | sed -e 's/[[:space:]]*$//'
+
+      # THE CHECK THIS JOB EXISTS FOR.
+      #
+      # Every selected test must have RUN. A skip here means the broker, a credential or an
+      # environment variable name changed and the suite quietly stopped proving anything —
+      # which is precisely the failure mode that let the security criteria go unverified, and
+      # it is invisible in a summary that counts a skip as a pass.
+      - name: Fail if any Kafka acceptance test skipped
+        run: |
+          set -euo pipefail
+          skipped="$(jq -r 'select(.Action == "skip" and .Test != null) | .Test' kafka-tests.json | sort -u)"
+          if [ -n "${skipped}" ]; then
+            echo "::error::these Kafka acceptance tests SKIPPED instead of running:"
+            printf '  %s\n' ${skipped}
+            echo ""
+            echo "A skipped acceptance test is reported as a pass by every CI summary, so this job"
+            echo "fails on it deliberately. The usual cause is that the broker did not come up, or"
+            echo "that one of KAFKA_BROKERS, KAFKA_SASL_ADMIN_USER, KAFKA_SASL_ADMIN_SECRET or"
+            echo "KAFKA_DENY_BY_DEFAULT_ATTESTED is not reaching the test process under the name it"
+            echo "reads. Each skip message above names what it could not find."
+            exit 1
+          fi
+          echo "every selected Kafka acceptance test ran"
+
+      - name: Broker logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.yaml --profile kafka logs --no-color kafka kafka-init
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.yaml --profile kafka down -v

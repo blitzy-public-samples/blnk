@@ -91,8 +91,6 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel/attribute"
-	otelmetric "go.opentelemetry.io/otel/metric"
 
 	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/internal/metrics"
@@ -490,11 +488,18 @@ type EventMetricsReport struct {
 	// which is a legitimate state and not a failure.
 	SubscribersSkipped int
 
-	// LagSeriesPublished is how many lag series this tick wrote.
+	// LagSeriesPublished is how many lag series this tick published to the inventory the
+	// asynchronous gauges observe.
 	LagSeriesPublished int
 
-	// LagSeriesCleared is how many series from the previous tick were zeroed because
-	// their subject is gone.
+	// LagSeriesCleared is how many series from the previous tick are absent from this
+	// one, and so stop being exported because their subject is gone.
+	//
+	// It is a CHURN measurement rather than a description of work done. Retiring a series
+	// takes no action under the asynchronous gauges — a series that is not observed is
+	// simply not exported — so this counts what disappeared, which is the operationally
+	// interesting figure and the one the previous synchronous implementation had to do
+	// real work to achieve.
 	LagSeriesCleared int
 
 	// BudgetReached is true when the subscriber budget stopped the enumeration, meaning
@@ -629,45 +634,56 @@ func (c *EventMetricsCollector) collectDeadLetterAge(ctx context.Context, report
 	report.DeadLetterAge = ageReport
 }
 
-// collectSubscriberLag measures consumer lag for every registered subscriber, then clears
-// the series of any subscriber that has gone.
+// collectSubscriberLag measures consumer lag for every registered subscriber and publishes
+// the result as the complete current inventory.
 //
 // # Why enumeration belongs here
 //
 // ConsumerLag measures ONE group when asked. Nothing asks it on a schedule, so without this
-// the lag gauge only ever holds whatever an operator's ad-hoc query happened to record —
+// the lag gauge only ever held whatever an operator's ad-hoc query happened to record —
 // which is to say the consumer-lag alert could not fire for a subscriber nobody had thought
-// to query. Enumerating the registry is what turns a diagnostic into a monitored quantity.
+// to query. Enumerating the registry is what turns a diagnostic into a monitored quantity,
+// and it is why this collector, alone, is allowed to publish: it is the only caller that
+// knows the whole registry, and a whole-inventory publication from a caller that knows only
+// part of it would retire every series it had not looked at.
 //
-// # Why clearing matters as much as measuring
+// # Retirement is now a property of publishing, not a separate step
 //
-// A gauge series is retained until it is written again. Delete a subscriber, revoke its
-// grant, or narrow its topic list, and the series for what it used to have is never written
-// again — so it keeps its last value, and if that value was above the threshold it alerts
-// forever with no way to clear it. Every series published on the previous tick and absent
-// from this one is therefore explicitly zeroed. Zero is a truthful reading for a subscriber
-// that no longer exists: it is behind by nothing, because it is consuming nothing.
+// The lag gauges are ASYNCHRONOUS: the SDK exports exactly the label tuples the callback
+// observes on each collection, so publishing this tick's set is simultaneously the retirement
+// of everything absent from it. A deleted subscriber, a narrowed grant or a reissued consumer
+// group stops being observed and its series stops being exported — with nothing retained, no
+// zero to write, and a series count equal to the current inventory rather than the union of
+// every inventory the process has ever seen.
+//
+// That replaces an explicit zeroing pass. Zeroing stopped a departed subscriber's series
+// ALERTING but could not stop it EXISTING, because a synchronous gauge has no delete and its
+// aggregator retains every attribute set it has ever been written with. See
+// metrics.SubscriberConsumerLag.
+//
+// An empty publication is meaningful and is made deliberately in every early return below: no
+// registry, no broker, or no subscribers all mean nothing is currently measurable, and
+// publishing nothing retires everything rather than leaving a deployment that has just lost
+// its broker alerting on the last lag it happened to see.
 func (c *EventMetricsCollector) collectSubscriberLag(ctx context.Context, report *EventMetricsReport) {
 	if c.subscribers == nil {
-		// No registry: nothing to enumerate. Anything published previously is still
-		// cleared, so a registry that becomes unreachable does not leave stale series
-		// alerting.
-		report.LagSeriesCleared = c.clearStaleLagSeries(ctx, map[lagSeries]struct{}{})
+		// No registry: nothing to enumerate, so the inventory is empty and every previously
+		// exported series is retired.
+		report.LagSeriesCleared = c.publishLagInventory(nil)
 
 		return
 	}
 
 	if c.admin == nil || !c.admin.IsConfigured() {
-		// No broker means no offsets to difference. This is the legitimate
-		// no-Kafka steady state, not a failure — but the previously published series
-		// must still be cleared, or a deployment that has just lost its broker would
-		// keep alerting on the last lag it happened to see.
-		report.LagSeriesCleared = c.clearStaleLagSeries(ctx, map[lagSeries]struct{}{})
+		// No broker means no offsets to difference. This is the legitimate no-Kafka steady
+		// state, not a failure — and the empty inventory is what stops a deployment that has
+		// just lost its broker from continuing to export a stale lag.
+		report.LagSeriesCleared = c.publishLagInventory(nil)
 
 		return
 	}
 
-	published := map[lagSeries]struct{}{}
+	samples := []metrics.ConsumerLagSample{}
 
 	// The budget bounds rows EXAMINED, not rows successfully measured. Counting only
 	// successes would let a registry whose every measurement fails page through itself
@@ -694,7 +710,7 @@ func (c *EventMetricsCollector) collectSubscriberLag(ctx context.Context, report
 
 		for i := range page {
 			examined++
-			c.measureSubscriber(ctx, page[i], published, report)
+			samples = c.measureSubscriber(ctx, page[i], samples, report)
 		}
 
 		if len(page) < limit {
@@ -717,11 +733,67 @@ func (c *EventMetricsCollector) collectSubscriberLag(ctx context.Context, report
 		)
 	}
 
-	report.LagSeriesPublished = len(published)
-	report.LagSeriesCleared = c.clearStaleLagSeries(ctx, published)
+	// PUBLISHED ONCE, AFTER THE WHOLE SWEEP, and unconditionally — including when the sweep
+	// broke early on a listing failure or stopped at the budget. A partial inventory retires
+	// the series it did not reach, which is the correct trade: an un-refreshed series would
+	// otherwise be exported at a reading that is no longer being verified, and a missing
+	// series is visibly missing while a stale one is not.
+	report.LagSeriesPublished = len(samples)
+	report.LagSeriesCleared = c.publishLagInventory(samples)
 }
 
-// measureSubscriber measures one subscriber's lag and records the series it produced.
+// publishLagInventory replaces the exported consumer-lag inventory and reports the churn.
+//
+// It is the ONE place the inventory is published, so the whole-set semantics cannot be
+// bypassed by a caller that holds only part of the registry, and the previous set is tracked
+// here so the churn figure and the publication cannot disagree.
+//
+// Parameters:
+//   - samples []metrics.ConsumerLagSample: the complete measured set for this tick. Nil or
+//     empty retires every series, which is the correct reading when nothing is measurable.
+//
+// Returns:
+//   - int: how many series from the previous inventory are absent from this one, and so stop
+//     being exported.
+func (c *EventMetricsCollector) publishLagInventory(samples []metrics.ConsumerLagSample) int {
+	current := make(map[lagSeries]struct{}, len(samples))
+	for _, sample := range samples {
+		current[lagSeries{
+			subscriber: sample.Subscriber,
+			group:      sample.Group,
+			topic:      sample.Topic,
+		}] = struct{}{}
+	}
+
+	c.mu.Lock()
+	previous := c.publishedLagSeries
+	c.publishedLagSeries = current
+	c.mu.Unlock()
+
+	metrics.PublishConsumerLagInventory(samples)
+
+	retired := 0
+	for series := range previous {
+		if _, still := current[series]; !still {
+			retired++
+		}
+	}
+
+	if retired > 0 {
+		logrus.WithField("series", retired).Debug(
+			"event metrics: consumer-lag series whose subscriber is no longer measured were retired; " +
+				"an unobserved asynchronous gauge series stops being exported, so nothing is left alerting",
+		)
+	}
+
+	return retired
+}
+
+// measureSubscriber measures one subscriber's lag and appends the samples it produced.
+//
+// It APPENDS to the caller's accumulator and returns it, rather than publishing, because the
+// inventory the asynchronous gauges observe is replaced as a whole: publishing per subscriber
+// would retire every other subscriber's series on each call. See collectSubscriberLag.
 //
 // A subscriber with no authorised topics is SKIPPED rather than measured. That is the
 // fail-closed default of a freshly registered row — authorised for nothing — and measuring
@@ -731,16 +803,26 @@ func (c *EventMetricsCollector) collectSubscriberLag(ctx context.Context, report
 // A subscriber whose identifiers are not registry-issued is also skipped, and its skip is
 // LOUD. The gauge would collapse such a value to a token anyway, so measuring it would merge
 // several unrelated subscribers into one series; the row itself is the thing to fix.
+//
+// Parameters:
+//   - ctx context.Context
+//   - subscriber model.EventSubscriber: the registry row to measure.
+//   - samples []metrics.ConsumerLagSample: the accumulator so far.
+//   - report *EventMetricsReport: updated with the measured, skipped and failure tallies.
+//
+// Returns:
+//   - []metrics.ConsumerLagSample: the accumulator, with this subscriber's samples appended.
+//     Returned unchanged when the row was skipped or its measurement failed.
 func (c *EventMetricsCollector) measureSubscriber(
 	ctx context.Context,
 	subscriber model.EventSubscriber,
-	published map[lagSeries]struct{},
+	samples []metrics.ConsumerLagSample,
 	report *EventMetricsReport,
-) {
+) []metrics.ConsumerLagSample {
 	if len(subscriber.AuthorizedTopics) == 0 {
 		report.SubscribersSkipped++
 
-		return
+		return samples
 	}
 
 	if !isRegistrySubscriberIdentifier(subscriber.SubscriberID) ||
@@ -755,7 +837,7 @@ func (c *EventMetricsCollector) measureSubscriber(
 				"measuring it would merge it with every other non-conforming row into one series",
 		)
 
-		return
+		return samples
 	}
 
 	lagReport, err := c.admin.ConsumerLag(ctx, ConsumerLagRequest{
@@ -764,77 +846,22 @@ func (c *EventMetricsCollector) measureSubscriber(
 		Topics:       subscriber.AuthorizedTopics,
 	})
 	if err != nil {
+		// NO SAMPLES from a failed measurement, which is deliberate: the series is retired
+		// rather than left standing at its last reading. A lag nobody could verify this tick
+		// is not evidence of anything, and a missing series is visibly missing where a stale
+		// one reads as current.
 		report.Failures = append(report.Failures, fmt.Errorf(
 			"measuring consumer lag for subscriber %s: %w", subscriber.SubscriberID, err,
 		))
 
-		return
+		return samples
 	}
 
 	report.SubscribersMeasured++
 
-	// ConsumerLag records the gauge itself, once per topic it measured. What is recorded
-	// here is only the BOOKKEEPING of which series that produced, resolved through the same
-	// label helpers the recording used so the two cannot disagree about what to clear.
-	for _, topicLag := range lagReport.Topics {
-		published[lagSeries{
-			subscriber: subscriberLagLabel(lagReport.SubscriberID),
-			group:      consumerGroupLagLabel(lagReport.GroupID),
-			topic:      topicLagLabel(topicLag.Topic),
-		}] = struct{}{}
-	}
-}
-
-// clearStaleLagSeries zeroes every lag series that was published on the previous tick and
-// is absent from this one, then remembers this tick's set.
-//
-// This is the half of gauge maintenance that is easy to omit and impossible to notice. A
-// series is retained by the exporter until it is written again, so a subscriber that is
-// deleted — or whose grant is narrowed, or whose group is reissued — leaves its last
-// reading standing. If that reading was above 10,000 the alert fires indefinitely for a
-// subscriber that no longer exists, and no amount of correct behaviour afterwards clears it,
-// because nothing ever writes that label tuple again.
-//
-// Zero rather than "delete": the OpenTelemetry synchronous gauge API has no delete
-// operation, and zero is in any case the truthful reading — a subscriber that is consuming
-// nothing is behind by nothing.
-//
-// Parameters:
-//   - ctx context.Context: carries the metric's exemplar context.
-//   - published map[lagSeries]struct{}: the series this tick wrote.
-//
-// Returns:
-//   - int: how many stale series were zeroed.
-func (c *EventMetricsCollector) clearStaleLagSeries(ctx context.Context, published map[lagSeries]struct{}) int {
-	c.mu.Lock()
-	previous := c.publishedLagSeries
-	c.publishedLagSeries = published
-	c.mu.Unlock()
-
-	if metrics.SubscriberConsumerLag == nil {
-		return 0
-	}
-
-	cleared := 0
-	for series := range previous {
-		if _, still := published[series]; still {
-			continue
-		}
-
-		metrics.SubscriberConsumerLag.Record(ctx, 0, otelmetric.WithAttributes(
-			attribute.String("subscriber", series.subscriber),
-			attribute.String("group", series.group),
-			attribute.String("topic", series.topic),
-		))
-		cleared++
-	}
-
-	if cleared > 0 {
-		logrus.WithField("series", cleared).Info(
-			"event metrics: consumer-lag series whose subscriber is no longer measured were zeroed; " +
-				"an unwritten gauge series keeps its last value and would alert indefinitely",
-		)
-	}
-
-	return cleared
+	// The report renders its own samples, resolving every label through the same helpers the
+	// instrument contract requires — so the collector cannot label a series differently from
+	// the way ConsumerLag would have. A topic whose partitions could not all be read yields a
+	// sample marked incomplete, which contributes measurement health and NO lag reading.
+	return append(samples, lagReport.LagSamples()...)
 }

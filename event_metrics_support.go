@@ -178,14 +178,46 @@ func isRegistryConsumerGroupID(group string) bool {
 	return ok
 }
 
-// subscriberLagLabel resolves the 'subscriber' gauge attribute to a bounded value.
+// subscriberLagLabel resolves the 'subscriber' gauge attribute to a bounded, PSEUDONYMOUS
+// value.
+//
+// # Why a tenant's own identifier must not be the label
+//
+// A metric label is the most widely readable thing this process emits. It is scraped into a
+// time-series database, rendered on dashboards, quoted in alert notifications and forwarded to
+// wherever those notifications go — a chat channel, an on-call phone, a paging vendor. A
+// subscriber identifier is a TENANT NAME: "acme-payments-eu" on a lag alert discloses to
+// everyone with dashboard access that Acme is a customer, roughly how much volume it consumes
+// and when its integration is unhealthy. None of those readers was granted access to the
+// ledger, and none of them needs the tenant's name to act.
+//
+// What monitoring actually needs from the label is that ONE SUBSCRIBER IS ONE SERIES: that
+// its lag can be tracked over time, alerted on, and told apart from every other
+// subscriber's. A stable hash gives exactly that. Correlating a series back to a tenant stays
+// possible for whoever holds the registry — hash the identifier and match — which is the right
+// place for that capability to live.
+//
+// # The two collapse tokens are NOT hashed
+//
+// "unattributed" and "unregistered" are classifications rather than identifiers: they say the
+// measurement had no subject, or a subject the registry does not admit. Hashing them would
+// turn two meaningful, greppable states into two opaque tokens and disclose nothing in
+// exchange, since neither is anyone's name.
+//
+// # This function is the SINGLE resolver, and that is a correctness requirement
+//
+// The collector clears a stale series by writing zero to the identical label tuple. If the
+// publish path and the clear path resolved a label differently, the clear would zero a tuple
+// nobody published and leave the real series standing at its last reading for ever — an alert
+// firing about a subscriber that no longer exists, which nothing could clear. Both paths call
+// this.
 //
 // Parameters:
 //   - subscriber string: the raw subscriber id.
 //
 // Returns:
-//   - string: the id itself when the registry's canonical form admits it, otherwise one of
-//     the two collapse tokens.
+//   - string: a stable pseudonymous token for a registry-admissible id, otherwise one of the
+//     two collapse tokens.
 func subscriberLagLabel(subscriber string) string {
 	trimmed := strings.TrimSpace(subscriber)
 	if trimmed == "" {
@@ -196,7 +228,7 @@ func subscriberLagLabel(subscriber string) string {
 		return lagLabelUnregistered
 	}
 
-	return trimmed
+	return hashLogIdentifier(trimmed)
 }
 
 // consumerGroupLagLabel resolves the 'group' gauge attribute to a bounded value.
@@ -213,7 +245,12 @@ func consumerGroupLagLabel(group string) string {
 	}
 
 	if root, ok := consumerGroupRoot(trimmed); ok {
-		return root
+		// PSEUDONYMISED for the reason the subscriber label is: a consumer group id is derived
+		// from the subscriber id, so publishing the group root publishes the tenant's name by
+		// another route and would defeat hashing the subscriber label beside it. The root is
+		// hashed rather than the raw group, so every group a subscriber runs still collapses to
+		// ONE series — which is what bounds the cardinality — and that series is stable.
+		return hashLogIdentifier(root)
 	}
 
 	return lagLabelUnregistered

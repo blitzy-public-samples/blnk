@@ -14,7 +14,10 @@ By participating in this project, you agree to follow the [Code of Conduct](./CO
 
 ## Development Prerequisites
 
-- Go `1.25.0` or newer (this repo requires Go `1.25.0` in `go.mod`)
+- Go `1.25.12` or newer (this repo requires Go `1.25.12` in `go.mod`). The floor is a
+  security one: earlier 1.25 patches carry fixed `net/url`, `crypto/x509`/`crypto/tls`
+  and `cmd/go`/cgo vulnerabilities that Blnk is exposed to through URL parsing, its
+  TLS transports and its own build.
 - Docker and Docker Compose
 - PostgreSQL and Redis (you can run both via Docker Compose)
 

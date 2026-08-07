@@ -110,55 +110,94 @@ func (l *Blnk) logRollbackResult(batchID string, action string, err error) {
 
 // sendBulkTransactionWebhook captures the bulk_transaction.<status> event for a batch result.
 //
-// This is the producer call site for the bulk_transaction.* family, and the transport
-// beneath it is now the transactional outbox rather than the legacy webhook queue:
-// PublishEvent replaces SendWebhook and nothing else here changes. The relay claims the
-// row it writes, publishes it to blnk.transactions with bounded retry, dead-letters it to
-// blnk.transactions.dlt if the retry budget is spent, and — during the dual-delivery
-// window — enqueues the legacy webhook task from that same row. The event therefore still
-// reaches a webhook subscriber while the window lasts, which is why this function keeps
+// This is the producer call site for the bulk_transaction.* family. The relay claims the row
+// it writes, publishes it to blnk.transactions with bounded retry, dead-letters it to
+// blnk.transactions.dlt if the retry budget is spent, and — during the dual-delivery window
+// — enqueues the legacy webhook task from that same row, which is why this function keeps
 // its name and its log message.
 //
-// THE PAYLOAD MAP IS PASSED THROUGH UNCHANGED, and every line of it above the call is
-// deliberately untouched. It is the reason this function reads as a transport
-// substitution: the same map value that used to be marshaled into the HTTP body is the
-// one PrepareEventOutbox marshals into the outbox payload column, so the two bodies
-// cannot differ. Re-shaping it into a struct, normalising its keys, or replacing
-// time.Now() with an injected clock would each break that equivalence — and the
-// dual-delivery byte-comparison that verifies it — while leaving the payload looking
-// perfectly reasonable.
-//
-// The map has THREE shapes, not one, and all three are part of the contract:
+// THE PAYLOAD MAP IS PASSED THROUGH UNCHANGED. The same map value is what is marshaled into
+// the outbox payload, so re-shaping it into a struct or normalising its keys would change
+// what subscribers receive. It has THREE shapes, not one, and all three are part of the
+// contract:
 //
 //	status != "failed"                   → batch_id, status, timestamp, transaction_count
 //	status == "failed", errorMsg != ""   → batch_id, status, timestamp, error
 //	status == "failed", errorMsg == ""   → batch_id, status, timestamp
 //
-// batch_id is what makes the family coherent downstream: it is the aggregate id the
-// outbox derives for a map payload, so the sequence of events describing one batch's
-// progress groups and orders by the batch it belongs to.
+// batch_id is what makes the family coherent downstream: it is the aggregate id the outbox
+// derives for a map payload, so the events describing one batch's progress group and order
+// by the batch they belong to.
 //
 // The event string stays a RUNTIME CONCATENATION of "bulk_transaction." and the status.
 // This is the only event name in the catalogue with an open suffix set, and it is routed
 // by prefix in model.EventCategory precisely for that reason; spelling it as a lookup or
 // a format string would invite a literal that no longer shares the prefix, which would
-// misroute the event to the quarantine topic with nothing failing to say so.
+// misroute the event to the internal system topic with nothing failing to say so.
 //
-// context.Background() is deliberate, and it is not laziness about threading a parameter.
-// Both callers run inside the async batch goroutine's 30-minute context, and the failure
-// caller reaches this line only AFTER a full batch rollback has run; inheriting a context
-// that a long rollback may have exhausted would abandon the durable capture of an outcome
-// that has already happened. The row must be written on the strength of the batch being
-// finished, not of its context still being alive.
+// THE CALLER'S CONTEXT IS THREADED IN AND ITS CANCELLATION IS DROPPED — both halves,
+// through the context.WithoutCancel idiom postBalanceActions and
+// runTransactionPostCommitWorkWithHooks already apply.
+//
+// Threading it is what keeps the capture attached to the operation. Two of the four paths
+// that reach this function arrive from a live traced operation — transaction_rejection.go
+// rejecting an atomic member, and transaction_queue.go failing to record a split
+// transaction — and both hold a context carrying that operation's span. Publishing under
+// context.Background() severed the outbox span from the batch it describes, so the one
+// event that says a batch failed appeared in no trace at all, which is precisely the
+// event an operator goes looking for.
+//
+// Dropping the cancellation is what keeps the capture durable, and it is the reason a
+// bare ctx will not do. PublishEvent writes the outbox row with the context it is given,
+// and the failure path reaches this line only AFTER a full batch rollback has run; a
+// context that a long rollback exhausted, or that the API request behind it has already
+// abandoned, would abort the insert and lose the event with nothing but a log line to
+// show it — the single failure mode the outbox exists to rule out. The row must be
+// written on the strength of the batch being finished, not of its context still being
+// alive.
+//
+// # This is the ONE event that cannot be enrolled in its mutation's transaction, and why
+//
+// Requirement R-2 puts every event in the same database transaction as the ledger mutation
+// that produced it, and every other producer in this codebase now does exactly that. This one
+// cannot, because THERE IS NO BATCH-SPANNING TRANSACTION for it to join. A bulk request is
+// executed one transaction at a time through QueueTransaction, with compensating void or
+// refund as its rollback — see processBulkTransactions and rollbackBatchTransactions — so at
+// the moment the batch's outcome becomes known, every mutation it describes has already
+// committed under its own transaction. There is no row this event could be atomic with.
+//
+// The per-transaction events ARE atomic: each transaction in the batch carries its own
+// status-derived event, inserted inside its own persistence transaction by
+// persistSingleTransactionExecutionWork. What this event adds is the BATCH SUMMARY, which
+// belongs to no single mutation. Creating a batch-spanning transaction would mean restructuring
+// the transaction-processing pipeline, which this change is explicitly forbidden to modify
+// (AAP §0.6.2 freezes queue.go, transaction_queue.go and transaction_coalescing.go).
+//
+// So the guarantee available here is a weaker one, and it is made as strong as it can be
+// rather than left as a log line:
+//
+//   - The capture is SYNCHRONOUS. The caller does not return believing the outcome was
+//     recorded while the write is still in flight.
+//   - It is RETRIED with bounded backoff, because the realistic failure is a transient
+//     database error and a single attempt turned that into permanent loss of the outcome.
+//   - Exhaustion is reported as an ERROR RETURN, so callers can act on it, in addition to
+//     being logged at error level with the batch id — which is the only handle an operator
+//     has for reconstructing the outcome by hand.
 //
 // Parameters:
+//   - ctx context.Context: the caller's context, used for the retry sleeps only. The insert
+//     itself uses a detached context for the reason given above.
 //   - batchID string: the parent transaction id of the batch, and the event's aggregate.
 //   - status string: the batch outcome — "applied", "inflight" or "failed" today. It is
 //     both a payload field and the event name's suffix.
 //   - errorMsg string: the failure detail, including rollback status. Empty on success.
 //   - transactionCount int: the number of transactions in the batch. Omitted from the
 //     payload on the failure path, where callers pass 0.
-func (l *Blnk) sendBulkTransactionWebhook(batchID, status, errorMsg string, transactionCount int) {
+//
+// Returns:
+//   - error: the last persistence error when every attempt failed; nil on success and on
+//     every no-op, including the unconfigured case.
+func (l *Blnk) sendBulkTransactionWebhook(ctx context.Context, batchID, status, errorMsg string, transactionCount int) error {
 	// Create payload with or without error info depending on status
 	payload := map[string]interface{}{
 		"batch_id":  batchID,
@@ -176,14 +215,74 @@ func (l *Blnk) sendBulkTransactionWebhook(batchID, status, errorMsg string, tran
 		payload["error"] = errorMsg
 	}
 
-	err := l.PublishEvent(context.Background(), NewWebhook{
+	event := NewWebhook{
 		Event:   "bulk_transaction." + status,
 		Payload: payload,
-	})
-	if err != nil {
-		logrus.WithError(err).WithField("batch_id", batchID).Error("failed to send webhook notification")
 	}
+
+	// DETACHED FROM CANCELLATION, NOT FROM THE TRACE, and derived once so every attempt
+	// shares it. The outcome has already happened, so its capture must not be abandoned
+	// because a long rollback exhausted the caller's deadline — and context.Background()
+	// would buy that at the cost of the trace, leaving the outbox span an unparented root.
+	// The one event that says a batch FAILED would then appear in no trace at all, which is
+	// precisely the batch an operator goes looking for.
+	publishCtx := context.WithoutCancel(ctx)
+
+	var lastErr error
+	for attempt := 1; attempt <= bulkOutcomeCaptureAttempts; attempt++ {
+		lastErr = l.PublishEvent(publishCtx, event)
+		if lastErr == nil {
+			return nil
+		}
+
+		logrus.WithError(lastErr).WithFields(logrus.Fields{
+			"batch_id":     batchID,
+			"status":       status,
+			"attempt":      attempt,
+			"max_attempts": bulkOutcomeCaptureAttempts,
+		}).Warn("failed to capture the bulk transaction outcome event; retrying")
+
+		if attempt == bulkOutcomeCaptureAttempts {
+			break
+		}
+
+		// Cancellation is honoured BETWEEN attempts. The caller going away is a reason to
+		// stop retrying, not a reason to keep sleeping; the failure is still reported.
+		select {
+		case <-ctx.Done():
+			logrus.WithError(lastErr).WithField("batch_id", batchID).Error(
+				"the bulk transaction outcome event was not captured and the context was cancelled " +
+					"before the retry budget was spent; this batch's outcome is not in the outbox",
+			)
+
+			return lastErr
+		case <-time.After(bulkOutcomeCaptureBackoff * time.Duration(attempt)):
+		}
+	}
+
+	logrus.WithError(lastErr).WithFields(logrus.Fields{
+		"batch_id": batchID,
+		"status":   status,
+		"attempts": bulkOutcomeCaptureAttempts,
+	}).Error(
+		"the bulk transaction outcome event could not be captured after every attempt; this " +
+			"batch's outcome is NOT in the outbox and will not be published to any subscriber",
+	)
+
+	return lastErr
 }
+
+// The retry budget for the bulk outcome capture.
+//
+// Three attempts at 200ms, 400ms is deliberately far smaller than the relay's own budget and
+// is not trying to be it. This is one INSERT against the local database, retried to survive a
+// transient error — a momentary connection reset, a brief pool exhaustion — and nothing more.
+// A budget large enough to ride out a real outage would hold the batch goroutine open for
+// minutes without improving the outcome, since a database that is down will still be down.
+const (
+	bulkOutcomeCaptureAttempts = 3
+	bulkOutcomeCaptureBackoff  = 200 * time.Millisecond
+)
 
 // handleAsyncBulkTransactionFailure handles failures in asynchronous processing
 // and builds a detailed error message including rollback status
@@ -211,7 +310,10 @@ func (l *Blnk) handleAsyncBulkTransactionFailure(ctx context.Context, err error,
 	}
 
 	// Send webhook with the complete error message including rollback status
-	l.sendBulkTransactionWebhook(batchID, "failed", errorMessage, 0) // 0 count for failed batch
+	// The error is logged inside the capture and deliberately not propagated here: this
+	// function's callers are handling a batch failure that has already happened, and a
+	// failure to RECORD it must not mask the failure itself.
+	_ = l.sendBulkTransactionWebhook(ctx, batchID, "failed", errorMessage, 0) // 0 count for failed batch
 }
 
 // CreateBulkTransactions handles the creation of multiple transactions in a batch.
@@ -264,7 +366,13 @@ func (l *Blnk) CreateBulkTransactions(ctx context.Context, req *model.BulkTransa
 				if !req.Inflight {
 					status = "applied"
 				}
-				l.sendBulkTransactionWebhook(batchID, status, "", len(req.Transactions))
+				if captureErr := l.sendBulkTransactionWebhook(bgCtx, batchID, status, "", len(req.Transactions)); captureErr != nil {
+					// Logged inside the capture with the batch id. The batch itself
+					// succeeded and its per-transaction events were captured atomically, so
+					// this is a missing SUMMARY rather than a missing outcome, and the
+					// goroutine has nobody to return an error to.
+					span.RecordError(captureErr)
+				}
 				logrus.Infof("Completed async bulk transaction batch %s successfully", batchID)
 			}
 		}()

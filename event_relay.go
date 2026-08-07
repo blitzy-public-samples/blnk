@@ -14,69 +14,51 @@
 	limitations under the License.
 */
 
-// This file holds the RELAY half of the ledger event pipeline: the background
-// processor that drains blnk.event_outbox to Kafka.
+// This file holds the RELAY half of the ledger event pipeline: the background processor that
+// drains blnk.event_outbox to Kafka.
 //
-// The pipeline splits in two on purpose, and the split is what makes the whole thing
-// reliable:
-//
-//	domain action ─┬─▶ ledger mutation  ┐
-//	               └─▶ event outbox row ┴─ ONE database transaction (event_outbox.go)
+//	domain action ─┬─▶ ledger mutation
+//	               └─▶ event outbox row   (event_outbox.go — inside the mutation's
+//	                                       transaction when the caller shares one,
+//	                                       otherwise its own committed insert)
 //	                                        │
 //	                        EventRelayProcessor claims the row, publishes it to Kafka,
 //	                        marks it dispatched — and, during the dual-delivery window,
 //	                        enqueues the legacy HTTP webhook from the SAME row.
 //
-// The capture half cannot publish, because a publish inside a ledger transaction would
-// either hold the transaction open across a network round trip or lose the event when
-// the transaction rolled back. The relay half cannot capture, because it runs on its own
-// clock long after the mutation committed. This file is only ever the second half.
-//
 // # The guarantee, stated honestly
 //
-// The outbox gives EXACTLY-ONCE SEMANTICS ON THE WRITE SIDE: the mutation and its event
-// commit together or not at all, and blnk.event_outbox.event_id is uniquely indexed, so
-// one domain action can never record two events.
+// EXACTLY-ONCE APPLIES TO THE WRITE SIDE, and its strength depends on the capture. A caller
+// that threads the row through PublishEventInTx or an atomic writer commits mutation and event
+// together. A standalone capture — PublishEvent, which the domain post-action call sites use —
+// commits on its own afterwards and depends instead on model.DeriveEventID making the id a
+// function of the mutation, so a replayed mutation collides on the unique index on event_id.
+// Events with no stable identity (balance.monitor, system.error) take a random id and have no
+// such protection, by design: they are repeatable.
 //
-// DELIVERY REMAINS AT-LEAST-ONCE, and nothing in this file pretends otherwise. The relay
-// publishes and then marks the row dispatched, and those are two operations against two
-// systems with no transaction spanning them: a crash in between leaves a row that was
-// published but not marked, and the next claim publishes it again. That window is
-// deliberately not closed, because the alternative — marking first — would lose events
-// instead of duplicating them, and a duplicate is recoverable at the subscriber while a
-// loss is recoverable nowhere.
+// DELIVERY REMAINS AT-LEAST-ONCE either way. The relay publishes and then marks the row
+// dispatched — two systems, no transaction spanning them — so a crash in between leaves a row
+// published but not marked, and the next claim publishes it again. Marking first would lose
+// events instead, and a duplicate is recoverable at the subscriber on event_id while a loss is
+// recoverable nowhere.
 //
-// The recovery mechanism for the subscriber is event_id: it is the message's idempotency
-// key, unique per event and stable across redeliveries. docs/event-streaming.md states
-// that obligation explicitly rather than implying end-to-end exactly-once.
-//
-// # Crash recovery
+// # Crash recovery, and durable retry
 //
 // A claim takes a LEASE (locked_until) rather than removing the row, so a relay that dies
-// mid-batch strands nothing: once the lease expires the rows re-enter the claimable set
-// and another instance — or the same one after a restart — picks them up. Every transition
-// this file drives leaves the row in a state it can leave again, so there is no state from
-// which a row becomes permanently unclaimable:
+// mid-batch strands nothing: processing with a live lease becomes claimable when the lease
+// expires, pending after a failed attempt becomes claimable when next_attempt_at arrives, and
+// dispatched or dead_lettered is terminal only once the event exists somewhere durable.
 //
-//   - processing with a live lease  → claimable again when the lease expires
-//   - pending after a failed attempt → claimable again when next_attempt_at arrives
-//   - dispatched / dead_lettered     → terminal, and terminal only after the event exists
-//     somewhere durable (the category topic, or its `<topic>.dlt` sibling)
-//
-// # Retry is DURABLE, not a sleep
-//
-// The configured schedule (base 1s, doubling, capped at 30s, five attempts) is applied by
-// persisting the next due instant, not by sleeping. One claim performs ONE publish
-// attempt; a failed attempt records now + the computed delay in next_attempt_at and
-// releases the lease, and the claim predicate refuses the row until it is due. See
-// relayRetryPolicy and processRow for why the in-process alternative is not merely slower
-// but incorrect.
+// Retry is applied by PERSISTING the next due instant, not by sleeping: one claim performs one
+// publish attempt, and a failed attempt records now + the computed delay and releases the
+// lease. See relayRetryPolicy and processRow.
 package blnk
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -89,62 +71,99 @@ import (
 )
 
 const (
-	// defaultEventRelayBatchSize is how many outbox rows one claim takes. It matches
-	// LineageOutboxProcessor's batch size, and the two are the same number for the same
-	// reason: a batch large enough to amortise the claim round trip, small enough that a
-	// crash mid-batch leaves little to redo, and small enough that the whole batch
-	// comfortably finishes inside the lease.
+	// defaultEventRelayBatchSize is how many outbox rows one claim takes, matching
+	// LineageOutboxProcessor: large enough to amortise the claim round trip, small enough
+	// that a crash mid-batch leaves little to redo.
 	defaultEventRelayBatchSize = 100
 
-	// defaultEventRelayPollInterval is how often the relay looks for work when it has
-	// none. It matches LineageOutboxProcessor. It is NOT the throughput limit — see
-	// maxEventRelayBatchesPerTick, which is what lets one tick drain a backlog rather
-	// than one batch per second.
+	// defaultEventRelayPollInterval is how often the relay looks for work when it has none,
+	// matching LineageOutboxProcessor. It is NOT the throughput limit — see
+	// maxEventRelayBatchesPerTick, which lets one tick drain a backlog.
 	defaultEventRelayPollInterval = 1 * time.Second
 
 	// defaultEventRelayLockDuration is the lease a claim takes on its rows, matching
-	// LineageOutboxProcessor.
+	// LineageOutboxProcessor. It is the recovery latency after a crash: rows a dead relay
+	// held become claimable again this long after it stopped.
 	//
-	// It is the recovery latency after a crash: rows a dead relay was holding become
-	// claimable again this long after it stopped. Thirty seconds is comfortably longer
-	// than a batch takes (the writer's own produce timeout is 10s per attempt) and short
-	// enough that a restart does not look like an outage.
+	// IT IS NOT A CERTIFICATE THAT A BATCH FITS INSIDE IT, and there is no lease renewal. A
+	// default batch of 100 rows across 8 concurrent groups, each attempt bounded by the
+	// writer's 10s produce timeout, can in the worst case need appreciably longer than 30s —
+	// a broker that is slow rather than down is exactly that case. The consequence is
+	// bounded but real: another instance may reclaim a row this one is still publishing,
+	// producing a redelivery the subscriber suppresses on event_id, while the late
+	// MarkEventDispatched finds its claim token gone and logs rather than corrupting the row.
+	// A deployment that sees that should lengthen the lease or shorten the batch.
 	defaultEventRelayLockDuration = 30 * time.Second
 
 	// defaultEventRelayConcurrency is how many partition-key groups of one batch are
 	// published at once.
 	//
-	// Sequential publishing cannot meet the throughput requirement, and the arithmetic is
-	// not close: a publish waits for every in-sync replica to acknowledge, so at a
-	// realistic 10ms per acknowledgement one goroutine sustains about 100 events per
-	// second, against a requirement of 500. Eight goroutines over the publisher's SHARED
-	// writers reach it with headroom, which is exactly the usage kafka-go's own
-	// documentation recommends — one writer, many callers — rather than more writers.
+	// Sequential publishing cannot meet the throughput requirement: a publish waits for
+	// every in-sync replica to acknowledge, so at a realistic 10ms per acknowledgement one
+	// goroutine sustains about 100 events per second against a requirement of 500. Eight
+	// goroutines over the publisher's SHARED writers and their shared transport reach it
+	// with headroom, which is the usage kafka-go documents — one writer, many callers.
 	//
-	// ORDERING IS NOT AT RISK, and it is worth being precise about why, because
-	// "concurrent publishing" and "ordered delivery" sound incompatible. Kafka orders
-	// within a PARTITION, the partition is chosen by the message key, and the key is the
-	// row's partition key. Two events that must stay ordered therefore share a key — and
-	// this file never publishes two rows with the same key at the same time. See
-	// groupEventRowsByPartitionKey for the two independent reasons that holds.
+	// ORDERING IS NOT AT RISK. Kafka orders within a PARTITION, the partition is chosen by
+	// the message key, and the key is the row's stored partition key; two events that must
+	// stay ordered therefore share a key, and this file never publishes two rows with the
+	// same key at the same time. See groupEventRowsByPartitionKey for the two independent
+	// reasons that holds.
 	defaultEventRelayConcurrency = 8
 
 	// maxEventRelayBatchesPerTick bounds how many batches one tick chains, so a large
-	// backlog drains promptly without a single tick starving the stop signal or the
-	// ticker itself. Modelled on ChainProcessor's maxBatchesPerTick, which exists for the
-	// same reason.
-	//
-	// Without chaining the relay's ceiling is batchSize per pollInterval — 100 events per
-	// second at the defaults — regardless of how fast the broker is, and a backlog of a
-	// million rows would take nearly three hours to clear no matter how idle the process
-	// was. With it, the ceiling is what the broker and the concurrency limit allow, and
-	// the tick becomes what it reads like: a poll for work, not a quota.
+	// backlog drains promptly without starving the stop signal. Modelled on
+	// ChainProcessor's maxBatchesPerTick. Without chaining the ceiling would be batchSize
+	// per pollInterval — 100 events per second at the defaults — however fast the broker is.
 	maxEventRelayBatchesPerTick = 50
+
+	// eventRelayRowPublishBudget is the WORST-CASE wall time ONE row's publish attempt may
+	// take, and it is the only thing that bounds a publish by arithmetic.
+	//
+	// It is eventWriterWriteTimeout — the writer's own produce timeout, 10s — because that is
+	// the longest a single PublishToTopic can block before it gives up. Expressing it here as
+	// well is belt to that brace: an EventTransport is an interface, and one that ignored its
+	// own timeout would otherwise park a semaphore permit for the life of the process.
+	//
+	// It is deliberately NOT derived from the lease. See leaseDeadline for why a lease-derived
+	// publish deadline causes the duplicate it is meant to prevent once the lease is renewed.
+	//
+	// Keep it in step with eventWriterWriteTimeout: a writer allowed to block longer than this
+	// would be cut off mid-produce by a bound that claims to be its worst case.
+	eventRelayRowPublishBudget = eventWriterWriteTimeout
 
 	// eventRelayBackoffMultiplier is the factor the retry delay grows by on each attempt.
 	// Requirement R-4 fixes it at 2, so it is a constant rather than configuration: the
 	// base delay, the cap and the attempt count are all tunable, the doubling is not.
 	eventRelayBackoffMultiplier = 2
+
+	// eventRelayLeaseRenewalDivisor sets how often an in-flight batch renews its lease, as
+	// a fraction of the lease itself.
+	//
+	// A third is the standard choice for a heartbeat and the reason is arithmetic: two
+	// consecutive renewals may be missed — one to a slow database round trip, one to
+	// scheduling — and the lease still has a third of its life left when the third
+	// succeeds. Renewing at half the lease survives one miss; renewing at the lease itself
+	// survives none.
+	eventRelayLeaseRenewalDivisor = 3
+
+	// eventRelayMinLeaseRenewalInterval floors the renewal interval so a very short lease
+	// cannot turn the heartbeat into a busy loop against the database.
+	//
+	// A test lease of a few hundred milliseconds is legitimate — the recovery tests use one
+	// to make expiry observable — and dividing it by three would produce renewals tens of
+	// times a second for no benefit.
+	eventRelayMinLeaseRenewalInterval = 250 * time.Millisecond
+
+	// defaultEventRelayDeadLetterRecoveryBatch bounds how many unpreserved dead letters one
+	// tick tries to repair.
+	//
+	// Deliberately far smaller than the publish batch. This is a REPAIR path over a set
+	// that is empty in normal operation, and every row in it needs a Kafka write of its
+	// own; a large batch would turn a broker outage into a long, pointless burst of writes
+	// on every tick. Twenty is enough to clear a realistic backlog within a few polls
+	// while costing one indexed query per tick when there is nothing to do.
+	defaultEventRelayDeadLetterRecoveryBatch = 20
 
 	// eventRelayBookkeepingTimeout bounds the bookkeeping transitions the relay performs
 	// on a DETACHED context. See detachedBookkeepingContext for why they are detached at
@@ -152,33 +171,23 @@ const (
 	// that has gone away during shutdown".
 	eventRelayBookkeepingTimeout = 5 * time.Second
 
-	// The two fallback delays below mirror config's relay defaults, and they are stated
-	// here rather than read from it because the config package keeps its default block
-	// unexported. That is a mirror of the REQUIREMENT rather than of an implementation
-	// detail: R-4 fixes the base delay at one second and the cap at thirty, and
-	// config.setRelayDefaults encodes the same two numbers. They are reached only by a
-	// Configuration built directly, which is how the existing test suite constructs one —
-	// the loader has always defaulted these before the relay sees them.
-	//
-	// The attempt-count fallback is NOT mirrored: config.MaxRelayRetryAttempts is exported
-	// and is both the default and the ceiling, so the real value is used.
+	// The two fallback delays below mirror config's relay defaults, which are unexported.
+	// They mirror the REQUIREMENT rather than an implementation detail: R-4 fixes the base
+	// delay at one second and the cap at thirty. They are reached only by a Configuration
+	// built directly, which is how the existing test suite constructs one. The attempt-count
+	// fallback is not mirrored: config.MaxRelayRetryAttempts is exported.
 	fallbackRelayRetryBaseBackoff = 1000 * time.Millisecond
 	fallbackRelayRetryMaxBackoff  = 30000 * time.Millisecond
 )
 
 // relayRetryPolicy is the bounded exponential backoff schedule of requirement R-4,
-// resolved once from configuration into a value that can be reasoned about on its own.
-//
-// It is a plain value with a pure method rather than logic inlined in the relay, because
-// the schedule is the part of this file most worth testing exactly — the mutation gate
-// will not accept "roughly increasing" — and a pure function is testable without a
-// database, a broker or a clock.
+// resolved once from configuration into a value with a pure method, so the part of this file
+// most worth testing exactly is testable without a database, a broker or a clock.
 type relayRetryPolicy struct {
-	// maxAttempts is the retry budget: how many publish attempts an event gets before it
-	// is dead-lettered. It is informational HERE — the budget is enforced in SQL by
-	// MarkEventFailed, which is what stops two relay instances both concluding they were
-	// the last attempt — and it is carried so the relay can report "attempt 3 of 5" and
-	// populate the request's MaxAttempts for the publisher's own telemetry.
+	// maxAttempts is the retry budget: how many publish attempts an event gets before it is
+	// dead-lettered. It is informational HERE — the budget is enforced in SQL by
+	// MarkEventFailed, which is what stops two instances both concluding they were the last
+	// attempt — and is carried so the relay can report "attempt 3 of 5".
 	maxAttempts int
 
 	// baseBackoff is the delay after the FIRST failed attempt, and the value every later
@@ -192,22 +201,15 @@ type relayRetryPolicy struct {
 // newRelayRetryPolicy resolves the schedule from the relay configuration block.
 //
 // Configuration has already defaulted and clamped these values (config.setRelayDefaults,
-// bounded by config.MaxRelayRetryAttempts). The fallbacks here are therefore a second line
-// of defence for a Configuration built directly — which is how the whole existing test
-// suite constructs one — rather than a duplicate of that logic: a zero or negative value
-// becomes the documented default instead of a schedule of zero-length delays, which would
-// spend the entire retry budget in one poll interval and dead-letter an event during a
-// broker restart that would have cleared on its own.
+// bounded by config.MaxRelayRetryAttempts); the fallbacks here are a second line of defence
+// for a Configuration built directly. A zero or negative value becomes the documented
+// default rather than a schedule of zero-length delays, which would spend the whole retry
+// budget in one poll interval and dead-letter an event during a broker restart that would
+// have cleared on its own.
 //
-// An inverted window (base above cap) is not rejected. backoffFor applies the cap last, so
-// a base of 60s against a cap of 30s yields 30s on every attempt: the operator gets the
-// slower schedule they asked for, bounded as configured, rather than a refusal to start.
-//
-// Parameters:
-//   - cfg config.RelayConfig: the resolved relay configuration block.
-//
-// Returns:
-//   - relayRetryPolicy: the schedule, with every value positive.
+// An inverted window (base above cap) is not rejected: backoffFor applies the cap last, so a
+// base of 60s against a cap of 30s yields 30s on every attempt — the slower schedule the
+// operator asked for, bounded as configured, rather than a refusal to start.
 func newRelayRetryPolicy(cfg config.RelayConfig) relayRetryPolicy {
 	policy := relayRetryPolicy{
 		maxAttempts: cfg.MaxRetryAttempts,
@@ -230,28 +232,20 @@ func newRelayRetryPolicy(cfg config.RelayConfig) relayRetryPolicy {
 
 // backoffFor returns the delay to wait before the attempt AFTER the given one.
 //
-// attempt is 1-based and names the attempt that just failed, so backoffFor(1) is the
-// pause after the first failure. With the configured defaults — base 1s, multiplier 2,
-// cap 30s, five attempts — the schedule is exactly:
+// attempt is 1-based and names the attempt that just failed. With the configured defaults —
+// base 1s, multiplier 2, cap 30s, five attempts — FIVE PUBLISHES ARE SEPARATED BY FOUR WAITS:
+// 1s after attempt 1, then 2s, 4s and 8s, which is 15 seconds of backoff in total.
+// backoffFor(5) evaluates to 16s but nothing consumes it: a fifth failure exhausts the budget
+// and dead-letters the row instead of scheduling a sixth attempt.
 //
-//	attempt 1 → 1s    attempt 2 → 2s    attempt 3 → 4s
-//	attempt 4 → 8s    attempt 5 → 16s
+// THE 30-SECOND CAP IS THEREFORE OUT OF REACH at the mandated parameters, which is correct
+// rather than a bug: the cap bounds a schedule whose configured base or attempt count would
+// otherwise exceed it. Neither the multiplier nor the cap may be "corrected" to make it
+// engage.
 //
-// THE 30-SECOND CAP IS NEVER REACHED WITHIN FIVE ATTEMPTS, and that is correct rather
-// than a bug to fix. The cap bounds a schedule whose configured base or attempt count
-// would otherwise exceed it; with the mandated parameters the sixth delay would be the
-// first to be capped, and there is no sixth attempt. Neither the multiplier nor the cap
-// may be "corrected" to make the cap engage.
-//
-// Growth is computed by repeated doubling with an early return at the cap rather than by
-// exponentiation, so there is no overflow to reason about: the value can never double
-// past the cap, let alone past the range of a Duration, however large an attempt number
-// arrives from a row whose max_attempts was raised directly in the database.
-//
-// Parameters:
-//   - attempt int: the 1-based number of the attempt that failed. Values below 1 are
-//     treated as 1, because there is no delay before the first attempt to describe and
-//     silently returning zero would collapse the schedule.
+// Growth is repeated doubling with an early return at the cap rather than exponentiation, so
+// there is no overflow to reason about however large an attempt number arrives from a row whose
+// max_attempts was raised directly in the database. An attempt below 1 is treated as 1.
 //
 // Returns:
 //   - time.Duration: the delay, always positive and never above maxBackoff.
@@ -279,16 +273,14 @@ func (p relayRetryPolicy) backoffFor(attempt int) time.Duration {
 // eventRelayStore is the repository surface the relay needs, and deliberately no more of
 // it.
 //
-// Depending on a four-method interface rather than on the whole ten-sub-interface
-// IDataSource is what makes every path in this file testable without a database, and it
-// documents the blast radius precisely: the relay claims rows and drives them to a
-// terminal state. It cannot insert an event (that belongs inside the ledger transaction,
-// in event_outbox.go), cannot read the dead-letter inventory, and cannot replay — so it
-// cannot accidentally take part in anybody else's job.
+// Depending on a four-method interface rather than on the whole IDataSource is what makes
+// every path in this file testable without a database, and it documents the blast radius:
+// the relay claims rows and drives them to a terminal state. It cannot insert an event (that
+// belongs to event_outbox.go), cannot read the dead-letter inventory, and cannot replay.
 //
-// MarkEventDeadLettered is POINTEDLY ABSENT. Recording a dead-letter is only legitimate
-// once the event is actually on its `<topic>.dlt` sibling, and only the dead-letter writer
-// knows whether it got there; the relay hands off instead. See eventRelayDeadLetterer.
+// MarkEventDeadLettered is POINTEDLY ABSENT. Recording a dead-letter is only legitimate once
+// the event is actually on its `<topic>.dlt` sibling, and only the dead-letter writer knows
+// whether it got there; the relay hands off instead. See eventRelayDeadLetterer.
 type eventRelayStore interface {
 	// ClaimPendingEventOutbox claims a batch, oldest occurrence first, taking a lease and
 	// stamping every row with a claim token. It returns at most one row per partition key
@@ -298,7 +290,7 @@ type eventRelayStore interface {
 	// MarkEventDispatched moves a claimed row to its success terminal state. It is
 	// conditional on the claim token and CLEARS it, so it must be the last transition the
 	// relay performs on a row.
-	MarkEventDispatched(ctx context.Context, id int64, claimToken string) error
+	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error
 
 	// MarkEventFailed records one failed attempt, schedules the row's next due instant
 	// from retryAfter, and reports — decided in SQL, so two instances cannot both conclude
@@ -309,17 +301,29 @@ type eventRelayStore interface {
 	// conditional on the claim token, so it must run BEFORE MarkEventDispatched clears it.
 	// This method disappears at the webhook sunset along with the branch that calls it.
 	MarkWebhookDispatched(ctx context.Context, id int64, claimToken string) error
+
+	// MarkEventWebhookPending records a Kafka leg that is DONE alongside a legacy webhook
+	// leg that is still OWED, and reports whether another webhook attempt is owed or the
+	// leg has been abandoned. It is what keeps a failed enqueue recoverable instead of
+	// being lost behind a terminal state. Deleted at the sunset with the leg itself.
+	MarkEventWebhookPending(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, record model.BrokerRecord) (model.EventWebhookOutcome, error)
+
+	// RenewEventOutboxLease extends the lease on every row still in flight under one claim
+	// token. It is what lets a batch outlive its lease safely instead of having rows
+	// reclaimed and published twice while this instance was still working on them.
+	RenewEventOutboxLease(ctx context.Context, claimToken string, lease time.Duration) (int64, error)
+
+	// ClaimFailedEventOutboxForDeadLetter claims rows whose retry budget is spent and whose
+	// dead-letter write did not succeed, so the preservation can be retried. Without it such
+	// a row is unclaimable, unreplayable and the only copy of the event.
+	ClaimFailedEventOutboxForDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error)
 }
 
 // eventRelayDeadLetterer is the hand-off the relay makes when a row has spent its retry
-// budget.
-//
-// It is one method wide because that is the whole of the relay's involvement in
-// dead-lettering: the relay decides that an event is FINISHED, and the dead-letter writer
-// decides everything else — which `<topic>.dlt` sibling it goes to, what the failure
-// metadata says, how the message is composed so the original bytes stay recoverable, and
-// when the row may be recorded as dead-lettered. None of that is reimplemented here, and
-// the interface is narrow precisely so it cannot be.
+// budget. The relay decides that an event is FINISHED; the dead-letter writer decides
+// everything else — which `<topic>.dlt` sibling, what the failure metadata says, how the
+// message keeps the original bytes recoverable, and when the terminal state is recorded. The
+// interface is one method wide so none of that can be reimplemented here.
 type eventRelayDeadLetterer interface {
 	// DeadLetter writes the exhausted row to its dead-letter topic with failure metadata
 	// attached and records the terminal state. It requires the row to carry the claim
@@ -329,8 +333,8 @@ type eventRelayDeadLetterer interface {
 
 // eventRelayLegacyTransport is the legacy HTTP webhook leg of the dual-delivery window.
 //
-// SUNSET NOTICE — this interface and every use of it are DELETED at the webhook sunset.
-// See deliverLegacyWebhook for the full description of what goes and what must stay.
+// It exists only for the dual-delivery window; see deliverLegacyWebhook for what the window
+// guarantees, and the sunset block at the foot of webhooks.go for the removal procedure.
 type eventRelayLegacyTransport interface {
 	// EnqueueLegacyWebhookDelivery enqueues the legacy delivery of one event, carrying the
 	// stored bytes VERBATIM and using the event id as the task identity so a re-claim
@@ -348,28 +352,22 @@ var (
 
 // EventRelayProcessor drains the transactional event outbox to Kafka.
 //
-// It polls blnk.event_outbox for rows that are due, publishes each one to its category
-// topic, marks it dispatched, dead-letters it when its retry budget is spent, and — until
-// the webhook sunset — additionally enqueues the legacy HTTP delivery from the same row.
-//
-// # It is LineageOutboxProcessor's shape, deliberately
+// It polls blnk.event_outbox for rows that are due, publishes each to its category topic, marks
+// it dispatched, dead-letters it when its retry budget is spent, and — until the webhook sunset
+// — additionally enqueues the legacy HTTP delivery from the same row.
 //
 // The struct fields, the defaults, the fluent configurators and the whole Start / Stop /
-// IsRunning / run / processBatch lifecycle are the ones LineageOutboxProcessor
-// established and ChainProcessor already reuses — read the three side by side and they are
-// recognisably the same processor. Blnk operates two transactional outboxes over two
-// separate tables served by two separate relays, and they are not merged; what they share
-// is the pattern, not the state.
+// IsRunning / run / processBatch lifecycle are LineageOutboxProcessor's, which ChainProcessor
+// already reuses; Blnk operates two outboxes over two tables served by two relays, sharing the
+// pattern and not the state. Two additions earn their place and are documented where they are
+// declared: concurrency across partition-key groups, and collaborators resolved once at
+// construction.
 //
-// Two additions earn their place, and both are documented where they are declared:
-// concurrency across partition-key groups, without which the throughput requirement is
-// arithmetically unreachable, and collaborator fields resolved once at construction so
-// that the hot path never rebuilds a publisher or a dead-letter service.
-//
-// One instance per process. It is safe for concurrent use — the lifecycle state is
-// mutex-guarded and the collaborators are read-only after construction — and several
-// instances across several processes are safe too, which is the point of claiming with
-// FOR UPDATE SKIP LOCKED.
+// CONFIGURE FIRST, THEN USE. The fluent With* setters write their fields WITHOUT
+// synchronisation, so they must be called before Start and never while the relay is running.
+// Once configured the lifecycle is safe for concurrent use — the running state is mutex-guarded
+// and the collaborators are read-only — and several instances across several processes are safe
+// too, which is the point of claiming with FOR UPDATE SKIP LOCKED.
 type EventRelayProcessor struct {
 	// blnk is the service container. It is held for the same reason
 	// LineageOutboxProcessor holds it — configuration and the datasource — and the
@@ -394,8 +392,8 @@ type EventRelayProcessor struct {
 
 	// publisher is the SHARED Kafka publisher this process built at start-up. The relay is
 	// the only production caller of a kafka.Writer, and it borrows the process publisher
-	// rather than building one so that every write reuses one connection pool and one SASL
-	// session per broker.
+	// rather than building one so that every write reuses the publisher's writers and their
+	// one shared transport, with its connection pool and its authentication configuration.
 	publisher TopicEventPublisher
 
 	// deadLetters is built ONCE with the publisher above and kept for the relay's
@@ -410,12 +408,23 @@ type EventRelayProcessor struct {
 	// retry is the resolved backoff schedule.
 	retry relayRetryPolicy
 
-	// sunsetPassed is THE sunset decision, and it is a function field only so a test can
-	// pin the clock. In production it is event_sunset.go's WebhookSunsetPassed and nothing
-	// else: this file never parses the configured date and never compares instants itself.
-	// Two comparisons could disagree, and the pair that would then disagree is "stop
-	// dual-writing" and "answer 410 Gone" — a system that had done one but not the other.
-	sunsetPassed func(now time.Time) bool
+	// dualDeliveryActive is THE dual-delivery decision, and it is a function field only
+	// so a test can pin the clock. In production it is event_sunset.go's
+	// WebhookDualDeliveryActive and nothing else: this file never parses a configured
+	// date and never compares instants itself. Two comparisons could disagree, and the
+	// pair that would then disagree is "stop dual-writing" and "answer 410 Gone" — a
+	// system that had done one but not the other.
+	//
+	// It consults BOTH ends of the window, not only the sunset. Requirement R-12 is
+	// about the span between them: the legacy leg runs for exactly the 30 days of
+	// [start, sunset), and a predicate reading the sunset alone could not express that.
+	dualDeliveryActive func(now time.Time) bool
+
+	// windowState is the same resolution in its four-valued form, used where the REASON
+	// dual delivery is off changes what happens: the startup obstacle refuses to run a
+	// relay whose window has not opened yet, which is a misconfiguration, while it starts
+	// happily after the sunset, which is the intended end state.
+	windowState func(now time.Time) WebhookWindowState
 
 	// now is the clock, replaceable in-package so the sunset boundary is exact in tests.
 	// It follows EventDeadLetterService's now field.
@@ -424,15 +433,14 @@ type EventRelayProcessor struct {
 
 // NewEventRelayProcessor creates the event outbox relay for a Blnk instance.
 //
-// Everything the relay needs is derived from the instance here, once: the datasource, the
+// Everything the relay needs is derived from the instance once: the datasource, the
 // process-wide Kafka publisher, a dead-letter service bound to both, the legacy webhook
-// transport, and the retry schedule from configuration. That is what makes the start-up
-// call site in the server role three lines — construct, start, defer stop — with no
-// additional wiring and nothing for a caller to remember to pass.
+// transport, and the retry schedule from configuration. That is what makes the server-role
+// start-up three lines — construct, start, defer stop.
 //
 // It performs NO I/O and never fails. A nil instance, a missing datasource or a publisher
-// that is absent or is the no-op yields a processor that refuses to start and says why,
-// rather than a constructor error the call site would have to handle. See Start.
+// that is absent or is the no-op yields a processor that refuses to start and says why. See
+// Start.
 //
 // Parameters:
 //   - blnk *Blnk: the service container. May be nil.
@@ -448,8 +456,10 @@ func NewEventRelayProcessor(blnk *Blnk) *EventRelayProcessor {
 		lockDuration: defaultEventRelayLockDuration,
 		concurrency:  defaultEventRelayConcurrency,
 		stopCh:       make(chan struct{}),
-		sunsetPassed: WebhookSunsetPassed,
 		now:          time.Now,
+
+		dualDeliveryActive: WebhookDualDeliveryActive,
+		windowState:        WebhookDualDeliveryWindowState,
 	}
 
 	if blnk == nil {
@@ -487,18 +497,11 @@ func NewEventRelayProcessor(blnk *Blnk) *EventRelayProcessor {
 	return processor
 }
 
-// WithBatchSize sets how many outbox rows one claim takes.
+// WithBatchSize sets how many outbox rows one claim takes. Call it before Start.
 //
-// A non-positive size is ignored with a warning rather than applied. The repository
-// rejects a non-positive batch outright, so applying one would turn every poll into a
-// logged error and publish nothing at all — a relay that looks alive and delivers nothing
-// is the one failure mode worth guarding against explicitly.
-//
-// Parameters:
-//   - size int: the number of rows to claim per batch.
-//
-// Returns:
-//   - *EventRelayProcessor: the processor, for chaining.
+// A non-positive size is ignored with a warning: the repository rejects one outright, so
+// applying it would turn every poll into a logged error and publish nothing — a relay that
+// looks alive and delivers nothing.
 func (p *EventRelayProcessor) WithBatchSize(size int) *EventRelayProcessor {
 	if size <= 0 {
 		logrus.WithField("requested_batch_size", size).
@@ -512,16 +515,10 @@ func (p *EventRelayProcessor) WithBatchSize(size int) *EventRelayProcessor {
 	return p
 }
 
-// WithPollInterval sets how often the relay looks for work.
+// WithPollInterval sets how often the relay looks for work. Call it before Start.
 //
 // A non-positive interval is ignored with a warning: time.NewTicker panics on one, and a
-// panic in a background loop takes the whole process down.
-//
-// Parameters:
-//   - interval time.Duration: the poll interval.
-//
-// Returns:
-//   - *EventRelayProcessor: the processor, for chaining.
+// panic in a background loop takes the process down.
 func (p *EventRelayProcessor) WithPollInterval(interval time.Duration) *EventRelayProcessor {
 	if interval <= 0 {
 		logrus.WithField("requested_poll_interval", interval.String()).
@@ -535,11 +532,16 @@ func (p *EventRelayProcessor) WithPollInterval(interval time.Duration) *EventRel
 	return p
 }
 
-// WithLockDuration sets the lease a claim takes on its rows.
+// WithLockDuration sets the lease a claim takes on its rows, and the period it is renewed by.
+//
+// The duration is honoured exactly as given, and is also the crash-recovery latency: rows a
+// dead relay was holding become claimable again this long after it stopped. A short lease is
+// therefore a legitimate choice rather than a mistake, and it is never silently lengthened.
+// A batch that needs longer than one lease RENEWS it — see renewLeaseWhileInFlight — so a
+// batch can never outlive the claim it is running under, whatever the lease is set to.
 //
 // A non-positive duration is ignored with a warning. An expired-on-arrival lease is a
-// correctness problem rather than a tuning mistake: a second relay instance could reclaim
-// and republish a row this one is still publishing.
+// correctness problem rather than a tuning mistake.
 //
 // Parameters:
 //   - duration time.Duration: the lease duration.
@@ -559,18 +561,12 @@ func (p *EventRelayProcessor) WithLockDuration(duration time.Duration) *EventRel
 	return p
 }
 
-// WithConcurrency sets how many partition-key groups of one batch publish at once.
+// WithConcurrency sets how many partition-key groups of one batch publish at once. Call it
+// before Start.
 //
-// One means fully sequential, which is a legitimate configuration — it is the right choice
-// for a single-broker development stack — and anything above one is bounded by the
-// semaphore in processBatch. A non-positive value is ignored with a warning, because zero
-// would acquire a permit that never exists and stall the relay silently.
-//
-// Parameters:
-//   - workers int: the maximum number of concurrent publishes.
-//
-// Returns:
-//   - *EventRelayProcessor: the processor, for chaining.
+// One means fully sequential, which is the right choice for a single-broker development
+// stack; anything above one is bounded by the semaphore in processBatch. A non-positive value
+// is ignored with a warning, because zero would wait for a permit that never exists.
 func (p *EventRelayProcessor) WithConcurrency(workers int) *EventRelayProcessor {
 	if workers <= 0 {
 		logrus.WithField("requested_concurrency", workers).
@@ -586,31 +582,15 @@ func (p *EventRelayProcessor) WithConcurrency(workers int) *EventRelayProcessor 
 
 // startupObstacle reports why the relay cannot run, or nil when it can.
 //
-// It exists because the ONE thing this processor must never do is drain the outbox
-// without publishing anything. Two of the three conditions below would do exactly that:
+// Three of the four refusals are absences — no instance, no datasource, no publisher that
+// accepts a destination topic — and the fourth is the important one: THE NO-OP PUBLISHER IS
+// REFUSED. It reports every publish as dispatched without sending anything, so running the
+// relay on it would mark the whole outbox dispatched and lose every event. An empty broker
+// list is a legitimate steady state for the PRODUCER side, and never a legitimate transport
+// for the relay.
 //
-//   - NO PUBLISHER AT ALL, or one that cannot be given a destination topic. Every publish
-//     would fail, every event would burn its retry budget against a transport that does
-//     not exist, and a whole backlog would be dead-lettered by a deployment that was
-//     simply misconfigured.
-//   - THE NO-OP PUBLISHER, which is far worse and is the reason this check is not merely
-//     defensive. The no-op reports every publish as dispatched, so the relay would mark
-//     every row dispatched having sent nothing at all: an entire outbox silently retired
-//     with no error, no dead letter and nothing left to replay from. The no-op is a
-//     legitimate steady state for the PRODUCER side — a deployment with no brokers
-//     captures events and publishes none, exactly as SendWebhook no-ops without a URL —
-//     and it is never a legitimate transport for the relay. The publisher's own
-//     documentation states that this path is unreachable from the relay; this is what
-//     makes that true.
-//   - NO DATASOURCE, which cannot claim and so would log an error every poll forever.
-//
-// Refusing in Start rather than returning an error from the constructor is what keeps the
-// server-role call site three lines: the caller may start the relay unconditionally and
-// this decides, so the conditional in cmd/server.go is a second line of defence rather
-// than the only one.
-//
-// Returns:
-//   - error: the reason the relay must not run, or nil.
+// Refusing in Start rather than from the constructor is what keeps the server-role call site
+// three lines: the caller may start the relay unconditionally and this decides.
 func (p *EventRelayProcessor) startupObstacle() error {
 	if p == nil {
 		return errors.New("the event relay processor is nil")
@@ -646,25 +626,46 @@ func (p *EventRelayProcessor) startupObstacle() error {
 		)
 	}
 
+	// THE WINDOW HAS NOT OPENED YET — a misconfiguration, and refusing is what stops it
+	// becoming a silent one.
+	//
+	// SUNSET: this check goes with the legacy leg.
+	//
+	// The dual-delivery decision gates on both ends of the window, so a relay running
+	// before the configured start would publish to Kafka while enqueuing NO legacy
+	// webhooks — subscribers who have not migrated would simply stop receiving events,
+	// with nothing failing to say so. That is the same class of failure as the
+	// webhook-only deployment that captured undrainable rows.
+	//
+	// The alternative — dual-delivering anyway and warning — would mean the concurrent
+	// period ran longer than the 30 days published to subscribers while the configured
+	// start claimed otherwise. Neither behaviour is acceptable silently, so the process
+	// refuses and names the two ways out. Time only moves forwards, so this can be
+	// reached only at start-up or after a configuration reload, never mid-run.
+	//
+	// The message is event_sunset.go's, because that file owns the window and the
+	// vocabulary for explaining it; composing it here would put the names of the
+	// configured dates in a second place.
+	if err := WebhookWindowPendingObstacle(p.windowStateAt(p.now())); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 // Start begins draining the event outbox in the background.
 //
-// The processor polls for due rows at the configured interval until the context is
-// cancelled or Stop is called. It is idempotent: a second Start while running is ignored
-// rather than spawning a second loop, and stopCh is RE-CREATED here, which is what makes
-// Start after Stop work rather than returning immediately on a channel that is already
-// closed.
+// The processor polls for due rows at the configured interval until the context is cancelled
+// or Stop is called. It is idempotent: a second Start while running is ignored rather than
+// spawning a second loop, and stopCh is RE-CREATED here, which is what makes Start after
+// Stop work rather than returning immediately on a closed channel.
 //
-// It refuses to start when it could not publish — see startupObstacle — logging the
-// reason. IsRunning then stays false and Stop remains safe, so an unconditional call site
-// is correct.
+// It refuses to start when it could not publish — see startupObstacle — logging the reason;
+// IsRunning then stays false and Stop remains safe, so an unconditional call site is correct.
 //
 // Parameters:
-//   - ctx context.Context: the context for the operation. When cancelled, processing
-//     stops; rows already claimed keep their lease and become claimable again when it
-//     expires.
+//   - ctx context.Context: when cancelled, processing stops; rows already claimed keep their
+//     lease and become claimable again when it expires.
 func (p *EventRelayProcessor) Start(ctx context.Context) {
 	if err := p.startupObstacle(); err != nil {
 		logrus.WithError(err).Error("Event outbox relay not started")
@@ -685,6 +686,15 @@ func (p *EventRelayProcessor) Start(ctx context.Context) {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+		// The running flag is cleared on EVERY exit from the loop, not only the one Stop
+		// takes. run returns on parent-context cancellation too, and leaving the flag set
+		// there made IsRunning report a relay that had already stopped and made a later
+		// Start refuse to spawn a new loop — a process that cancelled its context and then
+		// restarted the relay silently ran without one. Clearing it here, under the mutex,
+		// covers both paths from one place; Stop's own clear stays because it must take
+		// effect before the loop notices the closed channel.
+		defer p.markStopped()
+
 		p.run(ctx)
 	}()
 
@@ -738,6 +748,22 @@ func (p *EventRelayProcessor) IsRunning() bool {
 	return p.running
 }
 
+// markStopped clears the running flag, whatever ended the loop.
+//
+// It is deferred by the goroutine Start spawns, so it runs for the stop signal, for parent
+// context cancellation, and for a panic that unwinds the loop. Stop also clears the flag,
+// before closing the channel, so the two overlap by design: Stop needs the flag down at the
+// instant it decides to close, and this needs it down for every exit Stop was not involved
+// in. Clearing an already-clear flag is a no-op, so the overlap costs nothing.
+//
+// Start re-creates stopCh, which is what makes a restart after either kind of exit work
+// rather than returning immediately on a channel that is already closed.
+func (p *EventRelayProcessor) markStopped() {
+	p.mu.Lock()
+	p.running = false
+	p.mu.Unlock()
+}
+
 // run is the main processing loop: LineageOutboxProcessor's ticker and select, with an
 // informative line on each exit path so a stopped relay always says why it stopped.
 //
@@ -775,13 +801,30 @@ func (p *EventRelayProcessor) run(ctx context.Context) {
 // how idle the process was. Without the bound a large backfill would keep one tick
 // running indefinitely, starving the ticker and delaying the stop signal.
 //
+// Chaining is what makes the batch size a throughput lever rather than a ceiling, which is
+// why the lease race is answered by bounding each PUBLISH to the lease rather than by
+// shrinking the batch to fit it: the batch stays at whatever the operator configured, and
+// this loop claims again until the backlog is drained.
+//
 // Between batches it re-checks cancellation and the stop signal, so a shutdown is honoured
 // promptly instead of after up to fifty more batches.
+//
+// Each tick also runs the dead-letter REPAIR pass, which retries the preservation of events
+// whose dead-letter write failed. Those rows are outside the publish claim's reach by
+// design — their retry budget is spent — and before the pass existed nothing ever acted on
+// them again, even though each was the only copy of an event that reached no topic at all.
 //
 // Parameters:
 //   - ctx context.Context: cancelling it abandons the remaining batches; claimed rows keep
 //     their lease and become claimable again when it expires.
 func (p *EventRelayProcessor) processTick(ctx context.Context) {
+	// The REPAIR pass first, and deliberately so. It queries a set that is empty in normal
+	// operation, so it costs one indexed query; and when the set is NOT empty those rows are
+	// the only copies of events that reached no topic at all, which makes them the most
+	// urgent work in the tick rather than the least. Putting it after the publish loop would
+	// also mean a sustained backlog — fifty chained batches — starved the repair entirely.
+	p.recoverUnpreservedDeadLetters(ctx)
+
 	for chained := 0; chained < maxEventRelayBatchesPerTick; chained++ {
 		if !p.shouldClaimAnotherBatch(ctx) {
 			return
@@ -798,17 +841,8 @@ func (p *EventRelayProcessor) processTick(ctx context.Context) {
 
 // shouldClaimAnotherBatch reports whether the relay may CLAIM MORE WORK.
 //
-// It answers no to either shutdown signal, because claiming a new batch while stopping is
-// pointless in both cases: the rows would be leased and then left.
-//
-// The select is non-blocking on purpose: it asks "has anything asked me to stop?" without
-// waiting for anything to.
-//
-// Parameters:
-//   - ctx context.Context: the loop context.
-//
-// Returns:
-//   - bool: false when the context is done or Stop has been called.
+// It answers no to either shutdown signal, because claiming a new batch while stopping would
+// only lease rows and leave them. The select is non-blocking on purpose.
 func (p *EventRelayProcessor) shouldClaimAnotherBatch(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
@@ -821,45 +855,84 @@ func (p *EventRelayProcessor) shouldClaimAnotherBatch(ctx context.Context) bool 
 }
 
 // publishingMayProceed reports whether the relay may keep publishing rows it has ALREADY
-// CLAIMED. It consults the CONTEXT ONLY, and the asymmetry with
-// shouldClaimAnotherBatch is deliberate.
+// CLAIMED. It consults the CONTEXT ONLY, and the asymmetry with shouldClaimAnotherBatch is
+// deliberate:
 //
-// The two shutdown signals mean different things, and treating them alike gets one of them
-// wrong:
-//
-//   - Stop is a GRACEFUL DRAIN. Its documented promise is to wait for work in flight, and a
-//     batch this relay has already leased is exactly that. Abandoning it would strand those
-//     events until their lease expired — thirty seconds of avoidable delivery latency, paid
-//     on every deploy — so Stop stops the relay claiming more and lets the claimed batch
-//     finish. The wait it costs is bounded by the batch, and the batch is bounded by the
-//     writer's own produce timeout.
-//   - Context cancellation is an ABORT. The process is going away, so starting another
-//     publish is not something to insist on: the rows keep their lease and the next
-//     instance picks them up, which is the same mechanism that recovers a crash.
-//
-// Parameters:
-//   - ctx context.Context: the batch context.
-//
-// Returns:
-//   - bool: false once the context is done.
+//   - Stop is a GRACEFUL DRAIN. Its documented promise is to wait for work in flight, and an
+//     already-leased batch is exactly that; abandoning it would strand those events until
+//     their lease expired — 30 seconds of avoidable latency on every deploy.
+//   - Context cancellation is an ABORT. The rows keep their lease and the next instance picks
+//     them up, which is the mechanism that recovers a crash.
 func publishingMayProceed(ctx context.Context) bool {
 	return ctx.Err() == nil
+}
+
+// leaseDeadline is the instant this batch's claim lapses if nothing renews it, and its rows
+// become claimable by anyone else.
+//
+// It is the plain expiry of the configured lease. The lease is honoured exactly as configured
+// — it is also the crash-recovery latency, so lengthening it to suit the relay's own
+// convenience would strand a dead relay's rows for longer than the operator asked for.
+//
+// # Why nothing derives a publish deadline from it
+//
+// A claim takes ONE lease over a whole batch and the rows are published concurrency-at-a-time,
+// so a batch can outlast this instant: at the house defaults a hundred rows over eight workers
+// is thirteen rounds of a produce call that may block for the writer's full ten-second timeout,
+// against a thirty-second lease. A row still queued when the lease lapsed would be reclaimed by
+// another instance and published by BOTH — a duplicate that arrives with no error recorded
+// anywhere, suppressed only if the subscriber is doing its own idempotency. Three answers to
+// that present themselves and only one of them holds.
+//
+// LENGTHENING THE LEASE to cover the worst-case batch is wrong twice over: the lease is the
+// crash-recovery latency, so sizing it to a full batch strands a dead relay's rows for minutes
+// instead of the configured seconds, and it silently overrules an operator who chose a short
+// lease precisely to get fast reclaim.
+//
+// BOUNDING THE CLAIM SIZE to what one lease can publish is equally wrong: it makes throughput a
+// function of the lease, and at concurrency 1 a thirty-second lease would permit two rows per
+// claim — a hundred events per second against a requirement of five hundred.
+//
+// DEADLINING EACH PUBLISH at this instant looks like the answer and is not, because the lease
+// does not stand still: renewLeaseWhileInFlight extends it for as long as the batch is in
+// flight, so a deadline computed from claimedAt is stale as soon as the first renewal lands. A
+// publish that would have completed safely is then cut short with a deadline error, its row
+// returns to the claimable set, and another instance publishes it — the same duplicate, reached
+// from the opposite direction, and now caused by the guard rather than prevented by it.
+//
+// So this instant SEEDS the heartbeat and bounds nothing directly. One produce round trip is
+// bounded by eventRelayRowPublishBudget — the writer's own produce timeout, the honest worst
+// case for a single publish — and the claim is watched rather than computed: the heartbeat is
+// the only part of the relay that knows how long the batch has really been held, so it is what
+// stops the batch publishing when the hold ends.
+//
+// Parameters:
+//   - claimedAt time.Time: when the batch was claimed and its lease began.
+//
+// Returns:
+//   - time.Time: the instant the lease lapses if it is never renewed.
+func (p *EventRelayProcessor) leaseDeadline(claimedAt time.Time) time.Time {
+	return claimedAt.Add(p.lockDuration)
 }
 
 // processBatch claims one batch of due outbox rows and publishes every one of them.
 //
 // The claim is FIFO by occurrence — the repository orders by occurred_at ascending, and
 // re-sorts the rows the UPDATE returned because `UPDATE … RETURNING` does not preserve the
-// inner ORDER BY — and it takes a lease plus one claim token for the batch. Nothing is
-// deleted and nothing is read outside that claim: FOR UPDATE SKIP LOCKED is what lets
-// several relay instances work disjoint batches without blocking each other, and no
-// additional lock is taken here, because an external lock would serialise the very
-// instances that exist to run in parallel.
+// inner ORDER BY — and it takes a lease plus one claim token for the batch. FOR UPDATE SKIP
+// LOCKED is what lets several relay instances work disjoint batches without blocking each
+// other, and no additional lock is taken here.
 //
-// The dual-delivery decision is taken ONCE per batch rather than per row. It comes from
-// event_sunset.go either way; taking it once means a batch of five hundred events costs one
-// decision instead of five hundred, and the sub-second imprecision that introduces at the
-// boundary of a thirty-day window is not a distinction anything can observe.
+// The lease is RENEWED for as long as the batch is in flight. A batch may legitimately take
+// longer than its own lease, and a lease that lapses under a relay still holding the rows
+// invites a second instance to publish them again — see renewLeaseWhileInFlight.
+//
+// The dual-delivery decision is taken PER ROW, immediately before each legacy enqueue, by
+// deliverLegacyWebhook. What is read here is only the window's state at the claim instant, and
+// only so the batch log line says which regime the relay believes it is in. Deciding once for
+// the whole batch would be wrong at the boundary: a batch claimed a second before the sunset
+// takes time to publish, and every legacy enqueue after that instant would then be made on a
+// decision that had already expired.
 //
 // Parameters:
 //   - ctx context.Context: cancels the claim and, between rows, the rest of the batch.
@@ -886,12 +959,53 @@ func (p *EventRelayProcessor) processBatch(ctx context.Context) int {
 	// clocks: subtracting a database timestamp from a local one reports the skew between
 	// them as latency.
 	claimedAt := p.now()
-	dualDelivery := !p.sunsetPassed(claimedAt)
+
+	// REPORTED, NOT DECIDED. This is the window's state at the moment the batch was
+	// claimed, and it exists so the batch log line says which regime the relay believes
+	// it is in. The DECISION is taken per row, immediately before each enqueue, by
+	// deliverLegacyWebhook — see F12's reasoning there. A batch claimed one second
+	// before the sunset takes time to publish, so a decision taken here would enqueue
+	// legacy deliveries after the boundary had passed.
+	windowAtClaim := p.windowStateAt(claimedAt)
 
 	logrus.WithFields(logrus.Fields{
-		"claimed":       len(rows),
-		"dual_delivery": dualDelivery,
+		"claimed":      len(rows),
+		"window_state": windowAtClaim.String(),
 	}).Infof("Processing %d event outbox entries", len(rows))
+
+	// THE LEASE IS RENEWED WHILE THE BATCH IS IN FLIGHT, and this is not an optimisation.
+	//
+	// At the shipped defaults a claim takes 100 rows and publishes 8 at a time, so the batch
+	// runs in 13 waves and one wave can occupy the writer's entire 10-second produce timeout.
+	// The rows in the later waves therefore had their 30-second lease expire BEFORE their
+	// publish was attempted — while this relay still held them and still intended to publish
+	// them. Another instance claimed and published those rows, this one published them again
+	// afterwards, and every transition this one attempted failed as a lost claim. The topic
+	// got duplicates and neither process logged a defect.
+	//
+	// Renewal is preferred over the two alternatives because neither is free: a lease long
+	// enough for the worst-case batch would leave a crashed relay's rows unclaimable for
+	// minutes, and a batch small enough for the lease would cap throughput below the required
+	// 500 events per second. A heartbeat keeps both.
+	//
+	// Recovery latency is UNCHANGED by it. Renewal stops the instant this batch finishes, and
+	// a process that dies stops renewing by definition, so a crashed relay's rows still
+	// become claimable one lease after it stopped.
+	//
+	// AND THE HEARTBEAT IS ALSO THE STOP SIGNAL. A renewal that keeps failing until the lease
+	// has actually lapsed means these rows now belong to whoever claims them next, so the
+	// publishing context below is cancelled and this batch stops mid-flight. Deriving a
+	// deadline per publish from the lease instead cannot work once the lease is renewed: it
+	// is computed before the renewals happen, so it aborts the very publishes the heartbeat
+	// is keeping safe and hands their rows to another instance — the duplicate, reached from
+	// the other side. See renewLeaseWhileInFlight.
+	publishing, stopPublishing := context.WithCancel(ctx)
+	defer stopPublishing()
+
+	stopRenewals := p.renewLeaseWhileInFlight(
+		ctx, rows[0].ClaimToken, len(rows), p.leaseDeadline(claimedAt), stopPublishing,
+	)
+	defer stopRenewals()
 
 	groups := groupEventRowsByPartitionKey(rows)
 	permits := semaphore.NewWeighted(int64(p.concurrency))
@@ -908,7 +1022,7 @@ func (p *EventRelayProcessor) processBatch(ctx context.Context) int {
 		// The semaphore also fails an acquisition on a cancelled context, but only as a
 		// race against a permit becoming free at the same instant; this check is what makes
 		// the behaviour deterministic rather than a coin flip.
-		if !publishingMayProceed(ctx) {
+		if !publishingMayProceed(publishing) {
 			logrus.WithField("event_id", group[0].EventID).
 				Debug("event relay: stopped dispatching this batch; the remaining rows keep their lease")
 
@@ -917,7 +1031,7 @@ func (p *EventRelayProcessor) processBatch(ctx context.Context) int {
 
 		// Acquire before spawning, so the number of in-flight publishes is bounded by the
 		// permit count rather than by the number of groups.
-		if acquireErr := permits.Acquire(ctx, 1); acquireErr != nil {
+		if acquireErr := permits.Acquire(publishing, 1); acquireErr != nil {
 			logrus.WithError(acquireErr).WithField("event_id", group[0].EventID).
 				Debug("event relay: stopped dispatching this batch; the remaining rows keep their lease")
 
@@ -931,17 +1045,17 @@ func (p *EventRelayProcessor) processBatch(ctx context.Context) int {
 			defer permits.Release(1)
 
 			// SEQUENTIALLY WITHIN THE GROUP. Every row here shares one partition key, so
-			// this loop is the per-aggregate ordering guarantee in code.
+			// this loop is the per-partition-key ordering guarantee in code.
 			for _, row := range rows {
 				// Cancellation is honoured BETWEEN rows as well as between groups. A group
 				// is normally one row — the claim returns at most one per partition key — but
 				// it is not bounded to one, and a group that kept publishing through an abort
 				// would be the one place cancellation did not reach.
-				if !publishingMayProceed(ctx) {
+				if !publishingMayProceed(publishing) {
 					return
 				}
 
-				p.processRow(ctx, row, claimedAt, dualDelivery)
+				p.processRow(publishing, row, claimedAt)
 			}
 		}(group)
 	}
@@ -953,38 +1067,305 @@ func (p *EventRelayProcessor) processBatch(ctx context.Context) int {
 	return len(rows)
 }
 
-// groupEventRowsByPartitionKey partitions a claimed batch into per-partition-key groups,
-// preserving the claim's order both within each group and between groups.
+// renewLeaseWhileInFlight starts the heartbeat that keeps a claimed batch's lease alive, and
+// returns the function that stops it.
 //
-// # Why grouping is what makes concurrency safe
+// # What it is for
 //
-// Kafka orders messages within a PARTITION only, the partition is chosen from the message
-// key, and the key is the row's partition key. Two events whose relative order matters
-// therefore share a partition key — so ordering survives concurrency exactly as long as no
-// two rows with the same key are ever published at the same time, or out of occurrence
-// order.
+// See the call site for the failure it removes. In short: a batch can legitimately take
+// longer than its lease, and a lease that expires under a relay still holding the rows
+// invites a second instance to publish them a second time.
 //
-// That holds here for TWO INDEPENDENT REASONS, and the redundancy is deliberate:
+// # Why it stops rather than being cancelled by the context
 //
-//  1. The claim already guarantees it. ClaimPendingEventOutbox returns at most one row per
-//     partition key — across every concurrent relay instance, not just this one — because a
-//     candidate is claimable only when no earlier row sharing its key is still pending or
-//     processing. So in practice every group returned here has exactly one row.
-//  2. This function guarantees it locally. If a future claim ever returned two rows sharing
-//     a key, they would land in the same group and be published in claim order by one
-//     goroutine, rather than racing in two.
+// The batch context is honoured too — a cancelled context ends the loop — but the returned
+// stop function is what guarantees the goroutine cannot outlive the batch even on the paths
+// where the context stays live for the rest of the process's life. It is idempotent, so the
+// deferred call is safe however the batch ended.
 //
-// Relying on the first alone would put the ordering guarantee in a SQL predicate in another
-// package, where a well-intentioned change to that query could break message ordering with
-// nothing in this file to show it. Rows are never round-robined across workers, which is
-// the one arrangement that would break ordering outright.
+// # Why the count matters
+//
+// A renewal that extends nothing means every row has reached a terminal state, so there is
+// nothing left to protect and the heartbeat retires itself. That is the ordinary end of a
+// batch, and stopping on it means the common case costs exactly one renewal round trip per
+// lease-third rather than one per tick forever.
+//
+// A renewal FAILURE is logged at warning and the loop continues. One failure means nothing:
+// the interval is a third of the lease, so two consecutive misses still leave a third of it to
+// recover in. Aborting the batch on the first would abandon publishes that are in flight for
+// what is usually a slow round trip.
+//
+// # Why it also decides when the claim is LOST
+//
+// The heartbeat is the only part of the relay that knows how long this batch has actually been
+// held, so it is also the only part that can say when the hold has ended. Once the lease this
+// relay last secured has elapsed, the rows are claimable by anyone and a publish still in
+// flight would put a second copy of an event on the topic that another instance has already
+// published — with no error recorded anywhere, because the bookkeeping is conditional on the
+// claim token and simply fails.
+//
+// So on the tick where the held-until instant has passed with no successful renewal behind it,
+// the heartbeat cancels the batch's publishing context and retires. In-flight publishes stop,
+// no further rows are dispatched from that batch, and the rows return to the claimable set on
+// their own. That is strictly better than the alternative of computing a deadline per publish
+// from the lease, which cannot see the renewals and therefore aborts publishes the heartbeat is
+// successfully protecting.
+//
+// The held-until instant is sampled BEFORE each renewal round trip rather than after, so the
+// round trip's own latency shortens what this relay believes it holds instead of lengthening
+// it. The database stamps locked_until from its own clock, which is at or after that sample.
 //
 // Parameters:
-//   - rows []model.EventOutbox: the claimed batch, in occurrence order.
+//   - ctx context.Context: the batch context. Cancellation ends the heartbeat.
+//   - claimToken string: the token the claim issued — the identity of the whole batch, since
+//     every terminal transition clears it from the rows that are done.
+//   - claimed int: how many rows the batch started with, for the log line only.
+//   - heldUntil time.Time: the instant the claim's ORIGINAL lease lapses, from leaseDeadline.
+//     Each successful renewal moves it forward.
+//   - onLeaseLost func(): called once, when the claim can no longer be held, to stop this
+//     batch publishing. Must be safe to call from another goroutine; a context cancel is.
 //
 // Returns:
-//   - [][]model.EventOutbox: one slice per distinct partition key, each in claim order,
-//     ordered by the first appearance of the key so the overall FIFO shape is kept.
+//   - func(): stops the heartbeat and waits for its goroutine to exit. Never nil, and safe to
+//     call more than once.
+func (p *EventRelayProcessor) renewLeaseWhileInFlight(
+	ctx context.Context,
+	claimToken string,
+	claimed int,
+	heldUntil time.Time,
+	onLeaseLost func(),
+) func() {
+	if strings.TrimSpace(claimToken) == "" {
+		// Nothing to renew against. Reachable only from a store that returned rows without
+		// a token, which the repository never does; a no-op stop keeps the call site
+		// unconditional.
+		return func() {}
+	}
+
+	interval := p.lockDuration / eventRelayLeaseRenewalDivisor
+	if interval < eventRelayMinLeaseRenewalInterval {
+		interval = eventRelayMinLeaseRenewalInterval
+	}
+
+	done := make(chan struct{})
+
+	var (
+		stopOnce sync.Once
+		finished sync.WaitGroup
+	)
+
+	finished.Add(1)
+
+	go func() {
+		defer finished.Done()
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				// Sampled before the round trip, so its latency shortens rather than
+				// lengthens the hold this relay claims to have.
+				issuedAt := p.now()
+
+				// A detached context, for the same reason every other bookkeeping write
+				// uses one: a renewal is work the relay already owes on rows it is holding,
+				// and a shutdown mid-batch must not be the reason those rows lose their
+				// lease early.
+				renewal, cancel := detachedBookkeepingContext(ctx)
+				renewed, err := p.store.RenewEventOutboxLease(renewal, claimToken, p.lockDuration)
+				cancel()
+
+				if err != nil {
+					logrus.WithError(err).WithFields(logrus.Fields{
+						"claim_token": claimToken,
+						"claimed":     claimed,
+						"lease":       p.lockDuration.String(),
+						"held_until":  heldUntil.UTC().Format(time.RFC3339Nano),
+					}).Warn(
+						"event relay: renewing the lease on a batch in flight failed; the rows may be " +
+							"reclaimed and republished by another instance, which is suppressed at the " +
+							"subscriber on event_id",
+					)
+
+					if remaining := heldUntil.Sub(p.now()); remaining > 0 {
+						// Still inside the lease this relay last secured, so the rows are
+						// still its own and there are further ticks to recover in.
+						//
+						// Written as a subtraction rather than Before/After on purpose. This
+						// file compares no instants the way a boundary decision does, so that
+						// the one boundary in this pipeline — the deprecation window — keeps
+						// exactly one home in event_sunset.go and cannot acquire a second
+						// reading here. A lease is arithmetic on a duration this relay owns
+						// outright, not a boundary anything else also decides.
+						continue
+					}
+
+					logrus.WithFields(logrus.Fields{
+						"claim_token": claimToken,
+						"claimed":     claimed,
+						"lease":       p.lockDuration.String(),
+						"held_until":  heldUntil.UTC().Format(time.RFC3339Nano),
+					}).Warn(
+						"event relay: the lease on a batch in flight could not be held and has lapsed; " +
+							"publishing is being stopped so this instance cannot put a second copy on " +
+							"the topic behind whoever reclaims the rows",
+					)
+
+					onLeaseLost()
+
+					return
+				}
+
+				if renewed == 0 {
+					// Every row is terminal. Nothing is left to hold.
+					return
+				}
+
+				heldUntil = issuedAt.Add(p.lockDuration)
+			}
+		}
+	}()
+
+	return func() {
+		stopOnce.Do(func() { close(done) })
+		finished.Wait()
+	}
+}
+
+// recoverUnpreservedDeadLetters retries the dead-letter write for rows whose retry budget is
+// spent and whose preservation did not succeed, and reports how many it repaired.
+//
+// # The limbo this ends
+//
+// When the dead-letter write fails — no transport, a broker outage, a topic that does not
+// exist yet — the row is left at 'failed' with no dlt_topic. That state was a dead end in
+// three directions at once: the ordinary claim excludes 'failed', replay accepts only
+// 'dead_lettered', and the worker holding the claim token had already moved on. The event
+// existed only as that row, listed in the dead-letter inventory and acted on by nothing.
+//
+// This pass is the route forward. It re-claims such rows with a fresh token and hands each one
+// back to the dead-letter writer, which composes the same message and records the same
+// terminal state it would have on the first attempt.
+//
+// # The cause it reports
+//
+// The row's own last_error, which the exhaustion arm recorded, wrapped so the metadata says
+// what actually ended the event's retry budget rather than "recovered". A row with no recorded
+// error — which should not happen, since the exhaustion arm always writes one — reports that
+// its preservation is being retried, which is at least true.
+//
+// # Why it runs every tick
+//
+// The set it queries is empty in normal operation and the predicate is index-backed, so the
+// cost of an idle pass is one cheap query per poll. Running it on a longer cycle would only
+// delay the repair, and the delay is what the 15-minute dead-letter age alert measures.
+//
+// Parameters:
+//   - ctx context.Context: cancels the claim and the writes.
+//
+// Returns:
+//   - int: how many rows were successfully preserved on this pass.
+func (p *EventRelayProcessor) recoverUnpreservedDeadLetters(ctx context.Context) int {
+	if p.deadLetters == nil {
+		return 0
+	}
+
+	rows, err := p.store.ClaimFailedEventOutboxForDeadLetter(
+		ctx, defaultEventRelayDeadLetterRecoveryBatch, p.lockDuration,
+	)
+	if err != nil {
+		logrus.WithError(err).Error(
+			"event relay: could not claim events awaiting dead-letter preservation; they stay in the " +
+				"dead-letter inventory and are retried on a later poll",
+		)
+
+		return 0
+	}
+
+	if len(rows) == 0 {
+		return 0
+	}
+
+	logrus.WithField("claimed", len(rows)).Info(
+		"event relay: retrying the dead-letter preservation of events whose earlier write failed",
+	)
+
+	repaired := 0
+
+	for _, row := range rows {
+		// Checked before each row, not only at the top: a repair burst during a broker
+		// outage is exactly when a shutdown is likely, and the rows not yet attempted keep
+		// their lease and are re-claimed after it expires.
+		if !publishingMayProceed(ctx) {
+			break
+		}
+
+		outcome, dltErr := p.deadLetters.DeadLetter(ctx, row, unpreservedDeadLetterCause(row))
+		if dltErr != nil {
+			logrus.WithFields(p.rowFields(row, row.Attempts)).WithError(dltErr).Warn(
+				"event relay: retrying the dead-letter preservation of this event failed again; it " +
+					"stays in the dead-letter inventory and is retried once its lease expires",
+			)
+
+			continue
+		}
+
+		repaired++
+
+		logrus.WithFields(p.rowFields(row, row.Attempts)).WithFields(logrus.Fields{
+			"dlt_topic": outcome.DeadLetterTopic,
+			"attempts":  outcome.Metadata.AttemptCount,
+		}).Warn(
+			"event relay: an event whose dead-letter write had failed is now preserved on its " +
+				"dead-letter topic and is replayable",
+		)
+	}
+
+	return repaired
+}
+
+// unpreservedDeadLetterCause reconstructs the failure to report for a row being repaired.
+//
+// The row's last_error is what ended its retry budget, and the failure metadata attached to
+// the dead-letter message must say that rather than describing the repair. The error is
+// rebuilt from the stored text because the original error value is long gone — this row may
+// have been recorded by a different process entirely.
+//
+// Parameters:
+//   - row model.EventOutbox: the row being repaired.
+//
+// Returns:
+//   - error: never nil, so the metadata always states a reason.
+func unpreservedDeadLetterCause(row model.EventOutbox) error {
+	if reason := strings.TrimSpace(row.LastError); reason != "" {
+		return errors.New(reason)
+	}
+
+	return errors.New("the retry budget was exhausted and the dead-letter write is being retried")
+}
+
+// groupEventRowsByPartitionKey partitions a claimed batch into per-partition-key groups,
+// preserving the claim's order within each group and between groups.
+//
+// Kafka orders messages within a PARTITION only, and the partition is chosen from the message
+// key, so two events whose relative order matters share a partition key. Ordering therefore
+// survives concurrency exactly as long as no two rows with the same key are published at the
+// same time or out of occurrence order — which holds here for TWO INDEPENDENT REASONS:
+//
+//  1. The claim already guarantees it. ClaimPendingEventOutbox returns at most one row per
+//     partition key, across every concurrent instance, so in practice each group has one row.
+//  2. This function guarantees it locally. Two rows sharing a key would land in the same group
+//     and be published in claim order by one goroutine rather than racing in two.
+//
+// The redundancy is deliberate: relying on the first alone would put the ordering guarantee in
+// a SQL predicate in another package, where a well-intentioned change could break it with
+// nothing in this file to show it.
 func groupEventRowsByPartitionKey(rows []model.EventOutbox) [][]model.EventOutbox {
 	groups := make([][]model.EventOutbox, 0, len(rows))
 	indexByKey := make(map[string]int, len(rows))
@@ -1015,39 +1396,48 @@ func groupEventRowsByPartitionKey(rows []model.EventOutbox) [][]model.EventOutbo
 
 // processRow performs ONE publish attempt for one claimed row and records the outcome.
 //
-// # One attempt per claim, and why the retry is not a loop here
+// There is no retry loop here, by design: a failed attempt records now + the computed backoff
+// in next_attempt_at and releases the lease, and the claim predicate refuses the row until it
+// is due, so the next attempt is a later claim by this instance or another. Sleeping the delay
+// instead would hold a semaphore permit and half the 30-second lease doing nothing, and a
+// longer configured schedule would outlive the lease and let a second instance reclaim the row
+// mid-sleep and publish it twice.
 //
-// There is no retry loop in this function, and that is the design rather than an omission.
-// A failed attempt records now + the computed backoff in the row's next_attempt_at and
-// releases the lease; the claim predicate then refuses the row until it is due, so the
-// NEXT attempt is a later claim — by this instance or another.
+// THE LEGACY WEBHOOK LEG GOES FIRST, for two reasons. It needs the claim token, which
+// MarkEventDispatched clears as it moves the row to its terminal state. And it must not be
+// conditional on the Kafka publish succeeding: during the window the legacy transport is what
+// unmigrated subscribers are consuming, so suppressing it during a broker outage would turn a
+// Kafka problem into an outage for them.
 //
-// Sleeping the delay in process instead would be worse than having no backoff at all. The
-// configured schedule sums to 31 seconds, which outlives the 30-second lease, so a second
-// instance would reclaim the row mid-sleep and publish it twice; and the sleeping goroutine
-// would hold a permit while doing nothing. Persisting the decision applies it to every
-// instance at once and costs nothing while it waits.
+// # THE TWO LEGS REACH THEIR TERMINAL STATE INDEPENDENTLY
 //
-// # The order of the three steps
+// A row is finished when BOTH legs are, and the two can finish on different claims. Three
+// combinations are possible after one pass, and each has its own transition:
 //
-// The legacy webhook leg goes FIRST, and both reasons matter. It needs the claim token,
-// which MarkEventDispatched deliberately clears as it moves the row to its terminal state.
-// And it must not be conditional on the Kafka publish succeeding: during the dual-delivery
-// window the legacy transport is still the one existing subscribers are consuming, so
-// suppressing it during a broker outage would turn a Kafka problem into an outage for
-// subscribers who have not migrated yet — the exact failure the window exists to prevent.
+//   - Kafka ok, legacy ok (or not owed) → MarkEventDispatched. Terminal.
+//   - Kafka ok, legacy enqueue FAILED → MarkEventWebhookPending. The Kafka leg is recorded
+//     in kafka_dispatched_at, the row stays claimable, and the next claim delivers ONLY
+//     the webhook because that column tells this function to skip the publish. Before this
+//     existed the row was marked dispatched regardless, and since dispatched is outside
+//     the claim predicate the webhook was never retried and never delivered — silently,
+//     for a transport subscribers had been told would keep working.
+//   - Kafka FAILED → recordFailedAttempt, whatever the legacy leg did. The legacy leg is
+//     retried on the next claim through webhook_dispatched, and it costs no Kafka attempt.
+//
+// A row whose kafka_dispatched_at is already set publishes NOTHING: its position in the
+// partition is fixed, and republishing to retry a deprecated-transport failure would put a
+// duplicate on the topic for no benefit.
 //
 // Parameters:
-//   - ctx context.Context: cancels the publish. Bookkeeping the relay already owes is
-//     completed on a detached context — see detachedBookkeepingContext.
+//   - ctx context.Context: the batch's PUBLISHING context. It cancels on shutdown and on the
+//     heartbeat losing the claim, and either way the publish stops. Bookkeeping the relay
+//     already owes runs on a detached context — see detachedBookkeepingContext.
 //   - row model.EventOutbox: the claimed row, carrying its claim token.
 //   - claimedAt time.Time: when the batch was claimed, for the publish-duration histogram.
-//   - dualDelivery bool: whether the webhook sunset is still in the future.
 func (p *EventRelayProcessor) processRow(
 	ctx context.Context,
 	row model.EventOutbox,
 	claimedAt time.Time,
-	dualDelivery bool,
 ) {
 	// The attempt this publish represents. attempts counts the failures RECORDED so far —
 	// the claim does not increment it, MarkEventFailed does — so the attempt now under way
@@ -1055,11 +1445,45 @@ func (p *EventRelayProcessor) processRow(
 	// attempt metric label together.
 	attempt := row.Attempts + 1
 
-	if dualDelivery {
-		p.deliverLegacyWebhook(ctx, row)
+	// The legacy leg first, and its outcome kept: whether the webhook is still owed
+	// decides which terminal transition this row takes below. The sunset boundary is
+	// evaluated inside, per row, immediately before the enqueue.
+	legacyLeg, legacyErr := p.deliverLegacyWebhook(ctx, row)
+
+	// A row whose Kafka leg is already recorded is here ONLY for its outstanding webhook.
+	// Republishing it would duplicate a message that is already on the topic — the whole
+	// reason the two legs are tracked separately — so the publish is skipped and the row
+	// is driven straight to its terminal decision.
+	if row.KafkaDispatchedAt != nil {
+		// NO COORDINATE is supplied on this pass, and that is deliberate: nothing was
+		// published, so there is no new record to name — and the row already carries the
+		// coordinate of the record its earlier successful publish produced. Both marking
+		// transitions COALESCE the coordinate for exactly this case, so passing the zero
+		// value leaves the stored one intact rather than erasing it.
+		p.settleAfterKafkaSuccess(ctx, row, attempt, legacyLeg, legacyErr, model.BrokerRecord{})
+
+		return
 	}
 
-	result, err := p.publisher.PublishToTopic(ctx, PublishRequest{
+	// The publish is bounded so it cannot complete on a claim this relay no longer holds, and
+	// the bound has TWO parts because there are two different questions to answer.
+	//
+	// The timeout here is the worst case for ONE produce round trip, and nothing more. It is
+	// deliberately NOT derived from the lease: the lease is renewed for as long as the batch is
+	// in flight (renewLeaseWhileInFlight), so a lease-derived deadline computed once at the
+	// start of a publish is stale the moment the first renewal lands — and it would abort
+	// exactly the publish the heartbeat exists to protect, releasing the row for another
+	// instance to publish a second time. That is the duplicate, arrived at from the opposite
+	// direction.
+	//
+	// The other part is the claim itself, and it is WATCHED rather than computed: ctx is the
+	// batch's publishing context, which the heartbeat cancels the moment it can no longer hold
+	// the lease. So a relay that loses its claim stops publishing within a renewal interval,
+	// whatever the lease is set to, and one that keeps it publishes for as long as it takes.
+	publishCtx, cancelPublish := context.WithTimeout(ctx, eventRelayRowPublishBudget)
+	defer cancelPublish()
+
+	result, err := p.publisher.PublishToTopic(publishCtx, PublishRequest{
 		Event: model.LedgerEvent{
 			EventID:       row.EventID,
 			EventType:     row.EventType,
@@ -1086,21 +1510,68 @@ func (p *EventRelayProcessor) processRow(
 	p.logAttempt(row, attempt, result, err)
 
 	if err != nil {
+		// The Kafka leg failed, so this row keeps its Kafka retry budget and is retried as
+		// a whole. Whatever the legacy leg did is deliberately NOT settled here: an
+		// enqueue that succeeded is recorded by webhook_dispatched and will not repeat,
+		// and one that failed is retried on the next claim without having cost a Kafka
+		// attempt. Recording a webhook failure against a row that is going to be
+		// re-published anyway would spend the legacy budget on a Kafka outage.
 		p.recordFailedAttempt(ctx, row, attempt, err)
 
 		return
 	}
 
-	// AT-LEAST-ONCE, EXPLICITLY. The broker has the event; the row does not yet say so. A
-	// crash here — or a failure of this single statement — leaves the row claimable once its
-	// lease expires, and the event is published a second time. That duplicate is suppressed
-	// at the subscriber on event_id, which is unique per event and is the documented
-	// idempotency key. The reverse order would lose events instead, which nothing can
-	// recover.
+	p.settleAfterKafkaSuccess(ctx, row, attempt, legacyLeg, legacyErr, result.Record)
+}
+
+// settleAfterKafkaSuccess drives a row whose KAFKA leg is complete to the right state,
+// which depends entirely on what the legacy leg did.
+//
+// SUNSET: this function collapses to a single MarkEventDispatched call when the legacy leg
+// is deleted, and the legacyLegOutcome parameter goes with it.
+//
+// # AT-LEAST-ONCE, EXPLICITLY
+//
+// The broker has the event; the row does not yet say so. A crash here — or a failure of
+// the single statement below — leaves the row claimable once its lease expires and the
+// event is published a second time. That duplicate is suppressed at the subscriber on
+// event_id, which is unique per event and is the documented idempotency key. The reverse
+// order would lose events instead, which nothing can recover.
+//
+// # Why an owed webhook does not simply mark the row dispatched
+//
+// dispatched is outside the claim predicate. A row marked dispatched with its webhook
+// still owed is a webhook nobody will ever enqueue again, and the only trace is one
+// warning line. MarkEventWebhookPending instead records the Kafka leg separately and
+// leaves the row claimable for the webhook alone, with its own bounded budget.
+//
+// Parameters:
+//   - ctx context.Context: the batch context; the transition itself runs detached.
+//   - row model.EventOutbox: the claimed row, carrying its claim token.
+//   - attempt int: the 1-based Kafka attempt this pass represents, for the log fields.
+//   - legacyLeg legacyLegOutcome: what the legacy enqueue did on this pass.
+//   - legacyErr error: why it failed, when it did. Recorded in last_error.
+//   - record model.BrokerRecord: where the broker put the message, persisted so the row names
+//     the record it produced (OBS-02). The zero value on a webhook-only pass, where nothing
+//     was published and the row already carries its coordinate.
+func (p *EventRelayProcessor) settleAfterKafkaSuccess(
+	ctx context.Context,
+	row model.EventOutbox,
+	attempt int,
+	legacyLeg legacyLegOutcome,
+	legacyErr error,
+	record model.BrokerRecord,
+) {
 	bookkeeping, cancel := detachedBookkeepingContext(ctx)
 	defer cancel()
 
-	if markErr := p.store.MarkEventDispatched(bookkeeping, row.ID, row.ClaimToken); markErr != nil {
+	if legacyLeg == legacyLegOwed {
+		p.deferLegacyLeg(bookkeeping, row, attempt, legacyErr, record)
+
+		return
+	}
+
+	if markErr := p.store.MarkEventDispatched(bookkeeping, row.ID, row.ClaimToken, record); markErr != nil {
 		logrus.WithFields(p.rowFields(row, attempt)).WithError(markErr).Error(
 			"event relay: the event was published but its outbox row could not be marked dispatched; " +
 				"it will be republished when its lease expires and must be suppressed on event_id",
@@ -1108,18 +1579,132 @@ func (p *EventRelayProcessor) processRow(
 	}
 }
 
-// rowMaxAttempts returns the retry budget in force for a row.
+// deferLegacyLeg records a Kafka leg that is done alongside a legacy webhook leg that is
+// still owed, and reports the arm the datasource chose.
 //
-// The ROW's own budget wins, because it is what MarkEventFailed's in-SQL exhaustion
-// decision is measured against — reporting the configured value while the database enforced
-// a different one would make the logs and the metric label disagree with the actual
-// outcome. The configured value is the fallback for a row that states none.
+// SUNSET: deleted with the legacy leg.
+//
+// The backoff reuses the Kafka retry schedule, indexed by the WEBHOOK attempt count rather
+// than the Kafka one, so the two legs back off on the same curve while spending separate
+// budgets. Reusing the curve is deliberate: a queue that is unreachable and a broker that
+// is unreachable fail for the same kinds of reason and recover on the same kinds of
+// timescale, and a second configurable schedule for a transport that is being retired
+// would be a knob nobody should have to learn.
+//
+// The abandon arm is logged at ERROR because it is the only notice that a webhook promised
+// for the migration window will never be delivered. The retry arm is a warning, matching
+// the enqueue failure it follows.
 //
 // Parameters:
-//   - row model.EventOutbox: the claimed row.
+//   - ctx context.Context: the detached bookkeeping context.
+//   - row model.EventOutbox: the claimed row, carrying its claim token.
+//   - attempt int: the Kafka attempt number, for the log fields.
+//   - cause error: the enqueue failure. May be nil, in which case the reason is unstated.
+//   - record model.BrokerRecord: where the broker put the message. Persisted alongside the
+//     Kafka leg's completion, so a row waiting on its webhook still names its record and the
+//     zero-loss audit can account for it.
+func (p *EventRelayProcessor) deferLegacyLeg(
+	ctx context.Context,
+	row model.EventOutbox,
+	attempt int,
+	cause error,
+	record model.BrokerRecord,
+) {
+	reason := "the legacy webhook enqueue failed"
+	if cause != nil {
+		reason = relayFailureReason(cause)
+	}
+
+	// row.WebhookAttempts is the count BEFORE this failure, so the attempt now being
+	// recorded is one past it — the same relationship attempt has to row.Attempts.
+	retryAfter := p.retry.backoffFor(row.WebhookAttempts + 1)
+
+	outcome, err := p.store.MarkEventWebhookPending(
+		ctx, row.ID, row.ClaimToken, reason, retryAfter, record,
+	)
+	if err != nil {
+		// The row keeps its lease and returns to the claimable set when it expires, so
+		// nothing is lost: the Kafka publish is not repeated, because kafka_dispatched_at
+		// was already stamped by whichever earlier pass succeeded, or will be stamped by
+		// the next pass's own success.
+		logrus.WithFields(p.rowFields(row, attempt)).WithError(err).Error(
+			"event relay: the event was published to Kafka but its outstanding legacy webhook " +
+				"leg could not be recorded; the row keeps its lease and is retried when it expires",
+		)
+
+		return
+	}
+
+	fields := p.rowFields(row, attempt)
+	fields["webhook_attempts"] = outcome.WebhookAttempts
+	fields["webhook_max_attempts"] = p.rowMaxAttempts(row)
+	fields["reason"] = reason
+
+	if outcome.Abandoned {
+		logrus.WithFields(fields).Error(
+			"event relay: the legacy webhook leg for this event is ABANDONED after exhausting its " +
+				"own enqueue budget. The event IS on its Kafka topic; the webhook will never be " +
+				"delivered. Any subscriber still consuming webhooks has missed this event",
+		)
+
+		return
+	}
+
+	fields["retry_after"] = retryAfter.String()
+	logrus.WithFields(fields).Warn(
+		"event relay: the event is published to Kafka and its legacy webhook leg is still owed; " +
+			"the row stays claimable for the webhook alone and will not be republished",
+	)
+}
+
+// legacyLegDue reports whether the legacy webhook leg must run for an event being
+// dispatched at instant, through the injectable seam so a test can pin the clock.
+//
+// A nil seam resolves to FALSE — no dual delivery — rather than panicking. That is the
+// fail-closed answer: a processor with no window decision cannot be trusted to know
+// whether the sunset has passed, and enqueuing onto a retired transport is worse than
+// not enqueuing onto a live one, which the relay's startup obstacle already prevents.
+//
+// SUNSET: deleted with the legacy leg.
+//
+// Parameters:
+//   - instant time.Time: the instant to evaluate.
 //
 // Returns:
-//   - int: the budget, at least 1.
+//   - bool: true only when the instant is inside the configured window.
+func (p *EventRelayProcessor) legacyLegDue(instant time.Time) bool {
+	if p == nil || p.dualDeliveryActive == nil {
+		return false
+	}
+
+	return p.dualDeliveryActive(instant)
+}
+
+// windowStateAt resolves where an instant falls relative to the dual-delivery window,
+// through the injectable seam so a test can pin it.
+//
+// A nil seam resolves to WebhookWindowUnavailable rather than panicking: a processor built
+// as a struct literal — which several tests do — must still be able to log a batch.
+//
+// Parameters:
+//   - instant time.Time: the instant to place.
+//
+// Returns:
+//   - WebhookWindowState: the window's state at that instant.
+func (p *EventRelayProcessor) windowStateAt(instant time.Time) WebhookWindowState {
+	if p == nil || p.windowState == nil {
+		return WebhookWindowUnavailable
+	}
+
+	return p.windowState(instant)
+}
+
+// rowMaxAttempts returns the retry budget in force for a row.
+//
+// The ROW's own budget wins, because it is what MarkEventFailed's in-SQL exhaustion decision
+// is measured against; reporting the configured value while the database enforced another
+// would make the logs and the metric label disagree with the outcome. The configured value is
+// the fallback for a row that states none.
 func (p *EventRelayProcessor) rowMaxAttempts(row model.EventOutbox) int {
 	if row.MaxAttempts > 0 {
 		return row.MaxAttempts
@@ -1132,22 +1717,20 @@ func (p *EventRelayProcessor) rowMaxAttempts(row model.EventOutbox) int {
 	return 1
 }
 
-// recordFailedAttempt records one failed publish attempt, schedules the retry, and hands
-// off to the dead-letter path when the budget is spent.
+// recordFailedAttempt records one failed publish attempt, schedules the retry, and hands off
+// to the dead-letter path when the budget is spent.
 //
-// The retry-versus-exhaustion decision is NOT taken here. MarkEventFailed takes it inside
-// its UPDATE and reports it back, which is what stops two relay instances racing on one row
-// from both concluding they were the last attempt — a race that would put two copies of the
-// event on the dead-letter topic. This function supplies the delay and acts on the answer.
+// The retry-versus-exhaustion decision is NOT taken here: MarkEventFailed takes it inside its
+// UPDATE and reports it back, which is what stops two instances racing on one row from both
+// concluding they were the last attempt and putting two copies on the dead-letter topic.
 //
-// A row whose claim was lost is abandoned rather than retried: another instance owns it now,
-// and touching it further would overwrite state that is no longer ours. A row whose
-// bookkeeping simply failed keeps its lease and returns to the claimable set when it
-// expires, so nothing is dropped in either case.
+// A row whose claim was lost is abandoned rather than retried — another instance owns it now —
+// and a row whose bookkeeping merely failed keeps its lease and returns to the claimable set
+// when it expires, so nothing is dropped either way.
 //
 // Parameters:
-//   - ctx context.Context: used for the dead-letter publish. The bookkeeping transition
-//     runs on a detached context.
+//   - ctx context.Context: used for the dead-letter publish. The bookkeeping transition runs
+//     on a detached context.
 //   - row model.EventOutbox: the claimed row.
 //   - attempt int: the 1-based attempt that just failed.
 //   - cause error: the publish failure.
@@ -1202,21 +1785,10 @@ func (p *EventRelayProcessor) recordFailedAttempt(
 
 // deadLetter hands an exhausted row to the dead-letter writer.
 //
-// Nothing about dead-lettering is implemented here: the destination `<topic>.dlt`, the
-// failure metadata, the additive message composition that keeps the original bytes
-// recoverable, and the transition that records the terminal state all belong to
-// event_dlt.go. This function exists so the relay's exhaustion branch reads as one call and
-// so a failure to preserve the event is reported at the right severity.
-//
-// A failed hand-off leaves the row in the failed state, which the dead-letter inventory
-// covers deliberately: the event stays visible to an operator instead of being reported as
-// safely dead-lettered when its message never left the process.
-//
-// Parameters:
-//   - ctx context.Context: cancels the dead-letter publish.
-//   - row model.EventOutbox: the exhausted row, carrying the retained claim token.
-//   - attempt int: the attempt that exhausted the budget, for the log line.
-//   - cause error: the final publish failure.
+// Nothing about dead-lettering is implemented here — destination, failure metadata, message
+// composition and the terminal transition all belong to event_dlt.go. A failed hand-off
+// leaves the row in the failed state deliberately, so the event stays visible to an operator
+// instead of being reported as safely dead-lettered when its message never left the process.
 func (p *EventRelayProcessor) deadLetter(
 	ctx context.Context,
 	row model.EventOutbox,
@@ -1252,43 +1824,34 @@ func (p *EventRelayProcessor) deadLetter(
 }
 
 // ---------------------------------------------------------------------------
-// DUAL-DELIVERY BRANCH — DELETED AT THE WEBHOOK SUNSET
+// DUAL-DELIVERY BRANCH — temporary by design
 //
-// Everything between this banner and its closing one is temporary by design. It exists for
-// the 30-day window in which Kafka publishing and legacy HTTP webhook delivery run side by
-// side, and it is removed on the sunset date together with:
+// Everything between this banner and its closing one exists for the 30-day window in which
+// Kafka publishing and legacy HTTP webhook delivery run side by side from the same outbox
+// row. Retiring it is operator work rather than something the configured date performs: the
+// ordered procedure — what must be relocated before anything is deleted, and which parts of
+// the shared webhook queue must survive because transaction hooks and search indexing use
+// it — is recorded once, in the sunset block at the foot of webhooks.go.
 //
-//   - webhooks.go itself, and with it SendWebhook, processHTTP, ProcessWebhook and
-//     EnqueueLegacyWebhookDelivery — but ONLY AFTER NewWebhook and getEventFromStatus have
-//     been relocated into the event package. Those two symbols are not part of the legacy
-//     transport: NewWebhook IS the payload contract that outlives it, and
-//     getEventFromStatus defines seven of the event-type strings. Deleting them would break
-//     the payload guarantee the sunset is supposed to leave standing.
-//   - the WebhookQueue → ProcessWebhook HANDLER MAPPING in cmd/workers.go, and nothing else
-//     from that file. THE QUEUE ITSELF MUST SURVIVE: conf.Queue.WebhookQueue,
-//     initializeWebhookQueues and the webhook worker server are shared with the transaction
-//     hooks subsystem, which enqueues onto that queue by name, and with the two TypeSense
-//     index handlers registered on the same mux. Removing the queue would silently disable
-//     hooks and search indexing, neither of which has anything to do with webhooks.
-//   - MarkWebhookDispatched and the webhook_dispatched column, whose only purpose is this
-//     branch.
-//
-// What must NOT be removed with it is everything above: claiming, publishing, the retry
-// schedule, dead-lettering and replay all outlive the sunset unchanged.
+// Nothing above this banner is part of it: claiming, publishing, the retry schedule,
+// dead-lettering and replay all outlive the sunset unchanged.
 // ---------------------------------------------------------------------------
 
 // deliverLegacyWebhook enqueues the legacy HTTP delivery of one claimed row.
 //
-// # This is what makes payload identity STRUCTURAL rather than procedural
+// PAYLOAD IDENTITY IS STRUCTURAL HERE, not procedural. The bytes handed to the legacy transport
+// are row.Payload — the stored bytes, and the same bytes published to Kafka — so there is no
+// second serialisation to drift from. A round trip through NewWebhook.Payload interface{} would
+// look identical and not be: object keys come back alphabetised and every number comes back as
+// a float64. Hence EnqueueLegacyWebhookDelivery, the byte-oriented entry point, rather than
+// SendWebhook.
 //
-// The bytes handed to the legacy transport are row.Payload — the exact bytes recorded in
-// the ledger transaction and the exact bytes published to Kafka. Nothing is rebuilt from the
-// original domain object and nothing is re-marshalled, so the two transports cannot drift
-// apart: there is no second serialisation to drift from. A round trip through
-// NewWebhook.Payload interface{} would look identical and not be — object keys come back
-// alphabetised and every number comes back as a float64 — which is exactly the difference a
-// reviewer's eye passes over and a byte comparison does not. That is why this calls
-// EnqueueLegacyWebhookDelivery and not SendWebhook.
+// NOT DELIVERING TWICE takes two mechanisms. The row's webhook_dispatched flag skips a row
+// whose legacy leg is done, so a row republished to Kafka after a crash does not enqueue a
+// second webhook; and because enqueuing and recording are two operations with no transaction
+// spanning them, the enqueue carries the event id as its asynq task identity, which the queue
+// refuses as a duplicate. The flag makes the common case cheap, the identity makes the crash
+// case correct.
 //
 // # Idempotency, twice over
 //
@@ -1299,34 +1862,65 @@ func (p *EventRelayProcessor) deadLetter(
 // present is refused by the queue rather than accepted. The flag makes the common case
 // cheap; the task identity makes the crash case correct.
 //
-// # A legacy failure never fails the Kafka path
+// # A legacy failure never fails the KAFKA path — but it is no longer forgotten
 //
-// Every failure here is logged and swallowed. The Kafka publish, the row's dispatched state
-// and the retry budget are all unaffected, because the legacy leg has its own retry
-// machinery — asynq owns HTTP retry and always has — and because letting a webhook receiver
-// being down consume a Kafka retry attempt would make the deprecated transport able to
-// dead-letter events on the new one.
+// A failure here never touches the Kafka publish, the Kafka retry budget or the dead-letter
+// decision: letting a webhook receiver being down consume a Kafka retry attempt would make
+// the deprecated transport able to dead-letter events on the new one. What it DOES do is
+// report the failure to the caller, which used to be missing and was the whole defect. The
+// failure was logged and swallowed, the caller then marked the row dispatched, and because
+// dispatched is outside the claim predicate the "will be retried on the next claim" the log
+// line promised never happened. The caller now records the outstanding leg instead — see
+// settleAfterKafkaSuccess.
+//
+// # The window is evaluated HERE, per row, immediately before the enqueue
+//
+// Not once per batch, which is what it used to be. A batch of a hundred rows claimed one
+// second before the sunset takes longer than a second to publish, so a decision taken at
+// the top of the batch enqueues legacy deliveries AFTER the boundary — the one behaviour
+// the sunset is defined to prevent. The predicate consulted is the authoritative one in
+// event_sunset.go, which gates on both ends of the window; this file never compares a
+// clock against a configured date itself.
 //
 // Parameters:
 //   - ctx context.Context: the batch context. The recording transition runs on a detached
 //     context so a shutdown cannot leave an enqueued webhook unrecorded.
 //   - row model.EventOutbox: the claimed row, carrying its stored payload and claim token.
-func (p *EventRelayProcessor) deliverLegacyWebhook(ctx context.Context, row model.EventOutbox) {
+//
+// Returns:
+//   - legacyLegOutcome: whether the legacy leg is settled or still owed.
+//   - error: the enqueue failure, when the outcome is legacyLegOwed. Recorded in the row's
+//     last_error by the caller.
+func (p *EventRelayProcessor) deliverLegacyWebhook(
+	ctx context.Context,
+	row model.EventOutbox,
+) (legacyLegOutcome, error) {
 	if p.legacy == nil {
-		return
+		return legacyLegSettled, nil
 	}
 
+	// Already enqueued on an earlier claim. The flag makes the common case cheap; the task
+	// identity carried by the enqueue makes the crash case correct.
 	if row.WebhookDispatched {
-		return
+		return legacyLegSettled, nil
+	}
+
+	// The boundary, immediately before the enqueue and no earlier. Outside the window the
+	// leg is not owed at all: before the start because the relay refuses to run there
+	// (see startupObstacle), and from the sunset onwards because Kafka is then the only
+	// transport. A row that reaches the sunset with its webhook still owed is settled
+	// rather than stranded — the window has ended, and the promise with it.
+	if !p.legacyLegDue(p.now()) {
+		return legacyLegSettled, nil
 	}
 
 	if err := p.legacy.EnqueueLegacyWebhookDelivery(row.EventID, row.Payload); err != nil {
 		logrus.WithFields(p.rowFields(row, row.Attempts+1)).WithError(err).Warn(
 			"event relay: enqueuing the legacy webhook delivery failed; the Kafka publish is " +
-				"unaffected and the legacy leg will be retried on the next claim of this row",
+				"unaffected and the row stays claimable for the webhook leg alone",
 		)
 
-		return
+		return legacyLegOwed, err
 	}
 
 	bookkeeping, cancel := detachedBookkeepingContext(ctx)
@@ -1335,42 +1929,56 @@ func (p *EventRelayProcessor) deliverLegacyWebhook(ctx context.Context, row mode
 	if err := p.store.MarkWebhookDispatched(bookkeeping, row.ID, row.ClaimToken); err != nil {
 		// The task is enqueued and will be delivered; only the marker is missing. A later
 		// claim re-enqueues under the same task identity, which the queue refuses as a
-		// duplicate, so this is an observability gap rather than a delivery defect.
+		// duplicate, so this is an observability gap rather than a delivery defect — and
+		// the leg is reported as SETTLED, because it is: the webhook is on the queue.
 		logrus.WithFields(p.rowFields(row, row.Attempts+1)).WithError(err).Warn(
 			"event relay: the legacy webhook was enqueued but the row could not be marked; " +
 				"a re-enqueue is suppressed by the task identity",
 		)
 	}
+
+	return legacyLegSettled, nil
 }
 
+// legacyLegOutcome is what one pass of the legacy webhook leg achieved.
+//
+// SUNSET: deleted with the leg it describes.
+//
+// It is two states rather than three because the caller only ever needs to know whether a
+// webhook is STILL OWED. "Not applicable", "already done on an earlier claim", "outside the
+// window" and "enqueued just now" are all the same thing to the transition that follows:
+// this row owes nothing more to the legacy transport.
+type legacyLegOutcome int
+
+const (
+	// legacyLegSettled means no webhook is owed: none was applicable, one was already
+	// enqueued, the window has closed, or the enqueue just succeeded.
+	legacyLegSettled legacyLegOutcome = iota
+
+	// legacyLegOwed means the enqueue was attempted and FAILED, so this row still owes a
+	// webhook delivery and must stay claimable for it.
+	legacyLegOwed
+)
+
 // ---------------------------------------------------------------------------
-// END OF THE DUAL-DELIVERY BRANCH — DELETED AT THE WEBHOOK SUNSET
+// END OF THE DUAL-DELIVERY BRANCH
 // ---------------------------------------------------------------------------
 
 // logAttempt logs EVERY publish attempt, not only the last one.
 //
-// Requirement R-4 is explicit about this, and about the field set: the attempt number, the
-// maximum attempts, the error, the event id and the topic. All five are present on a failed
-// attempt, which is the line an operator reads when an event is not arriving — "attempt 2 of
-// 5, connection refused, event X, topic blnk.transactions" answers what happened, how much
-// budget is left and where to look, from one line.
+// Requirement R-4 names the field set: the attempt number, the maximum attempts, the error,
+// the event id and the topic. All five are present on a failed attempt, which is the line an
+// operator reads when an event is not arriving — "attempt 2 of 5, connection refused, event X,
+// topic blnk.transactions" answers what happened, how much budget is left and where to look.
 //
-// The levels are chosen so the requirement is met without drowning the log at 500 events per
-// second. A FAILURE is logged unconditionally at warning: it is rare, it is what the
-// requirement is about, and losing it to a level filter would defeat the purpose. A SUCCESS
-// is logged at debug and the fields are built only if debug is enabled, because a line per
-// published event is a line five hundred times a second whose content is "it worked".
+// The levels keep the requirement met without drowning the log at 500 events per second: a
+// FAILURE is logged unconditionally at warning, a SUCCESS at debug with its fields built only
+// if debug is enabled, because a line per published event is five hundred lines a second
+// saying "it worked".
 //
-// This is the relay's own line and it is deliberately not the publisher's. The publisher
-// reports the transport's view — duration, transient classification, hashed partition key —
-// while this reports the RELAY's: which attempt of which budget, and what the retry decision
-// will be. Both are wanted, and neither is a substitute for the other.
-//
-// Parameters:
-//   - row model.EventOutbox: the row that was published.
-//   - attempt int: the 1-based attempt number.
-//   - result PublishResult: the publisher's record of the attempt.
-//   - err error: the publish failure, or nil.
+// This is the RELAY's line and deliberately not the publisher's: the publisher reports the
+// transport's view (duration, transient classification, hashed partition key) while this
+// reports which attempt of which budget, and what the retry decision will be.
 func (p *EventRelayProcessor) logAttempt(
 	row model.EventOutbox,
 	attempt int,
@@ -1401,22 +2009,12 @@ func (p *EventRelayProcessor) logAttempt(
 
 // rowFields renders the identity of a row and its attempt as logrus fields.
 //
-// It is one function so that every line this file emits about one event carries the SAME
-// field names, which is what makes the log searchable — and so that the four fields
-// requirement R-4 names besides the error reason cannot be omitted from one line by
-// accident.
+// One function, so every line this file emits about one event carries the SAME field names —
+// which is what makes the log searchable — and so the fields requirement R-4 names cannot be
+// omitted from one line by accident.
 //
-// The partition key is deliberately ABSENT rather than printed: it is a financial
-// identifier, and the publisher already reports a hash of it for correlation. The event type
-// is present because it costs nothing and answers "which producer is failing" without a
-// second lookup.
-//
-// Parameters:
-//   - row model.EventOutbox: the row to describe.
-//   - attempt int: the 1-based attempt number.
-//
-// Returns:
-//   - logrus.Fields: a fresh map the caller may extend.
+// The partition key is deliberately ABSENT rather than printed: it is a financial identifier,
+// and the publisher already reports a hash of it for correlation.
 func (p *EventRelayProcessor) rowFields(row model.EventOutbox, attempt int) logrus.Fields {
 	return logrus.Fields{
 		"event_id":     row.EventID,
@@ -1431,23 +2029,14 @@ func (p *EventRelayProcessor) rowFields(row model.EventOutbox, attempt int) logr
 // relayFailureReason renders a publish failure as text that is safe to log AND safe to store
 // in the row's last_error column.
 //
-// Both destinations need the same treatment, which is why there is one function. The string
-// comes from a broker or a client library, so its length and its content are not this
-// codebase's to choose: newlines would forge log structure, control characters corrupt
-// structured-log parsers, and an unbounded value written once per attempt per event —
-// multiplied by the retry budget and the event rate — is how a log pipeline gets throttled
-// and a text column grows without limit. sanitizeLogValue is shared with the rest of the
-// event pipeline so the bounds are identical wherever the same error surfaces.
+// The string comes from a broker or a client library, so neither its length nor its content
+// is this codebase's to choose: newlines would forge log structure, control characters corrupt
+// structured-log parsers, and an unbounded value written once per attempt per event is how a
+// log pipeline gets throttled and a text column grows without limit. sanitizeLogValue is
+// shared with the rest of the event pipeline so the bounds are identical everywhere.
 //
-// A nil error yields a fixed, non-empty string rather than "": last_error is what an
-// operator reads to find out what went wrong, and an empty reason recorded against a failed
-// attempt is indistinguishable from a row nobody has tried yet.
-//
-// Parameters:
-//   - cause error: the failure. May be nil.
-//
-// Returns:
-//   - string: bounded, single-line, never empty.
+// A nil error yields a fixed, non-empty string rather than "": an empty reason recorded
+// against a failed attempt is indistinguishable from a row nobody has tried yet.
 func relayFailureReason(cause error) string {
 	if cause == nil {
 		return "the publish failed without reporting a reason"
@@ -1461,24 +2050,19 @@ func relayFailureReason(cause error) string {
 	return reason
 }
 
-// detachedBookkeepingContext derives a short-lived context for a transition the relay
-// ALREADY OWES, so that a shutdown cannot leave the database disagreeing with what has
-// already happened on the wire.
+// detachedBookkeepingContext derives a short-lived context for a transition the relay ALREADY
+// OWES, so a shutdown cannot leave the database disagreeing with what has already happened on
+// the wire.
 //
-// The three transitions it covers — marked dispatched, marked failed, webhook marked
-// dispatched — all describe work that is already complete: the broker has the message, or
-// the queue has the task. Cancelling them would not undo any of it; it would only leave the
-// row saying otherwise, and a row that says otherwise is republished on its next claim. So
-// on a graceful shutdown the caller's context is cancelled precisely at the moment when
-// abandoning the bookkeeping converts a clean stop into a batch of duplicates.
+// The three transitions it covers — marked dispatched, marked failed, webhook marked dispatched
+// — all describe completed work: the broker has the message, or the queue has the task.
+// Cancelling them would not undo any of it, only leave the row saying otherwise, and a row that
+// says otherwise is republished on its next claim.
 //
-// It is BOUNDED rather than simply detached, because "finish what you owe" must not become
-// "block shutdown indefinitely on a database that has gone away". If the timeout is reached
-// the transition fails, it is logged, and the row's lease expiry brings it back — the
-// ordinary at-least-once path.
-//
-// The claim and the publishes deliberately keep the CALLER's context: they are work not yet
-// started, and a shutdown should stop starting work.
+// It is BOUNDED rather than simply detached, so "finish what you owe" cannot become "block
+// shutdown on a database that has gone away": on timeout the transition fails, is logged, and
+// the row's lease expiry brings it back. The claim and the publishes deliberately keep the
+// CALLER's context, being work not yet started.
 //
 // Parameters:
 //   - ctx context.Context: the batch context, used only for its values.
@@ -1493,27 +2077,20 @@ func detachedBookkeepingContext(ctx context.Context) (context.Context, context.C
 // ---------------------------------------------------------------------------
 // A NOTE ON THE METRICS THIS FILE DOES NOT RECORD
 //
-// The relay records no instrument directly, and that is deliberate on both counts:
+// The relay records no instrument directly, on both counts deliberately. The PER-ATTEMPT
+// instruments (blnk.events.published.total, blnk.events.publish.attempts.total,
+// blnk.events.publish.duration) are recorded inside the publisher, on the attempt itself; the
+// relay's contribution is to populate the fields they are attributed by — Attempt and
+// MaxAttempts, ClaimedAt so the duration measures claim to acknowledgement, and Purpose so a
+// replay never contaminates the first-delivery population. Recording them here too would double
+// every count.
 //
-//   - The three PER-ATTEMPT instruments — blnk.events.published.total,
-//     blnk.events.publish.attempts.total and blnk.events.publish.duration — are recorded
-//     inside the publisher, on the attempt itself. The relay's contribution is to populate
-//     the request fields those recordings are attributed BY: Attempt and MaxAttempts, so the
-//     sub-two-second p99 target can be read from first-attempt publishes alone, ClaimedAt,
-//     so the duration measures claim to acknowledgement rather than just the write, and
-//     Purpose, so an operator-triggered replay never contaminates the first-delivery
-//     population. Recording them here as well would double every count.
-//   - The three GAUGES — blnk.outbox.pending, blnk.dlt.oldest_message_age_seconds and
-//     blnk.kafka.consumer_lag — have exactly one owner, the periodic EventMetricsCollector
-//     in event_metrics.go, and internal/metrics documents that single ownership as a
-//     correctness requirement rather than tidiness. A gauge retains its last value, so each
-//     must be re-recorded from authoritative state on every tick INCLUDING an explicit zero
-//     — zero is the measurement that clears the alert — and a gauge written from the code
-//     path that causes the condition measures the wrong thing. The dead-letter age is the
-//     clearest case: recorded where an event is dead-lettered it would report the age of
-//     something that just happened, always near zero, and the "stuck for 15 minutes" alert
-//     could never fire while looking healthy throughout. The collector also needs the Kafka
-//     admin client to difference committed offsets against end offsets for consumer lag,
-//     which the relay does not hold; the server role builds both and starts the collector
-//     beside this processor.
+// The GAUGES (blnk.outbox.pending, blnk.dlt.oldest_message_age_seconds,
+// blnk.kafka.consumer_lag) have one owner, the periodic EventMetricsCollector in
+// event_metrics.go, because a gauge retains its last value and must be re-recorded from
+// authoritative state on every tick, including the explicit zero that clears an alert.
+// Dead-letter age is the clearest case: recorded where an event is dead-lettered it would
+// always report something that just happened, and the "stuck for 15 minutes" alert could never
+// fire. The collector also needs the admin client for consumer lag, which the relay does not
+// hold.
 // ---------------------------------------------------------------------------

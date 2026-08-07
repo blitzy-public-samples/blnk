@@ -383,13 +383,36 @@ func TestSanitizeLogValue_BoundsLengthAndStripsLineForgery(t *testing.T) {
 // path and the clearing path. A collapse token is therefore not merely a tidy default: it
 // is a real, writable series that a stale non-conforming subscriber can be zeroed on.
 func TestLagLabelResolvers_BoundTheGaugeCardinalityAndStayClearable(t *testing.T) {
-	t.Run("a generated subscriber identifier passes through", func(t *testing.T) {
+	t.Run("a generated subscriber identifier becomes a stable pseudonym", func(t *testing.T) {
 		identifier := model.GenerateSubscriberID()
+		label := subscriberLagLabel(identifier)
 
-		assert.Equal(t, identifier, subscriberLagLabel(identifier),
-			"the identifier an operator sees in the alert must be the one in the registry")
-		assert.Equal(t, identifier, subscriberLagLabel("  "+identifier+"  "),
+		// PSEUDONYMOUS, not the identifier. A metric label is scraped into a time-series
+		// database, rendered on dashboards and quoted into alert notifications, none of which
+		// carries access control, so the registry identifier is withheld and a stable hash of
+		// it published instead. One subscriber is still exactly one series, which is all
+		// monitoring needs; correlating a series back to a tenant stays possible for whoever
+		// holds the registry.
+		assert.NotEqual(t, identifier, label,
+			"the registry identifier must not be published as a label value")
+		assert.NotContains(t, label, identifier)
+		assert.NotEmpty(t, label, "a resolvable subscriber must still produce a series")
+		assert.NotEqual(t, lagLabelUnattributed, label,
+			"a registry-issued identifier is attributable, so it must not collapse")
+		assert.NotEqual(t, lagLabelUnregistered, label,
+			"and it must not read as one the registry could not have issued")
+
+		// STABLE, which is the property alerting depends on: the same subscriber must land on
+		// the same series across collection cycles, or its lag history is a new series each
+		// time and no `for:` duration can ever elapse.
+		assert.Equal(t, label, subscriberLagLabel(identifier),
+			"the same identifier must always resolve to the same label")
+		assert.Equal(t, label, subscriberLagLabel("  "+identifier+"  "),
 			"surrounding whitespace is not a different subscriber")
+
+		// DISTINCT, so two subscribers are two series rather than one aggregate.
+		assert.NotEqual(t, label, subscriberLagLabel(model.GenerateSubscriberID()),
+			"two subscribers must not share a series")
 	})
 
 	t.Run("an absent subscriber is attributed to no one, not to the empty string", func(t *testing.T) {
@@ -416,16 +439,30 @@ func TestLagLabelResolvers_BoundTheGaugeCardinalityAndStayClearable(t *testing.T
 		require.NoError(t, err)
 
 		root := model.SubscriberPrincipalNamespace + identifier
-		assert.Equal(t, root, consumerGroupLagLabel(group))
+		label := consumerGroupLagLabel(group)
+
+		// The root is collapsed to FIRST and then hashed. Publishing the root itself would
+		// publish the subscriber identifier by another route, since the group id is derived
+		// from it, and would defeat pseudonymising the subscriber label beside it.
+		assert.NotContains(t, label, identifier,
+			"the group label must not carry the subscriber identifier it is derived from")
+		assert.NotEqual(t, root, label)
+		assert.NotEmpty(t, label)
 
 		// Every group inside one subscriber's namespace resolves to the SAME series. This
 		// is the property that keeps a subscriber running many consumer groups from
 		// multiplying the alert into one firing instance per group.
 		for _, leaf := range []string{"default", "recon", "replay-2026-03", "a"} {
-			assert.Equal(t, root,
+			assert.Equal(t, label,
 				consumerGroupLagLabel(root+model.SubscriberGroupTerminator+leaf),
 				"leaf %q must not open a new series", leaf)
 		}
+
+		// And two subscribers' namespaces must not collide onto one series.
+		other := model.SubscriberPrincipalNamespace + model.GenerateSubscriberID()
+		assert.NotEqual(t, label,
+			consumerGroupLagLabel(other+model.SubscriberGroupTerminator+"default"),
+			"two subscribers' group namespaces must be two series")
 	})
 
 	t.Run("a group outside the derived shape collapses", func(t *testing.T) {
@@ -491,7 +528,7 @@ func TestLagLabelResolvers_BoundTheGaugeCardinalityAndStayClearable(t *testing.T
 // place it actually protects.
 func TestPublishResultLogFields_TruncatesADependencyErrorString(t *testing.T) {
 	fields := PublishResult{
-		Status:      model.PublishStatusFailed,
+		Status:      model.PublishStatusDeadLettered,
 		EventID:     "3f1d6b0e-6d3c-4f21-9c8a-6a1f0c1d2e3b",
 		EventType:   "transaction.applied",
 		Topic:       "blnk.transactions",
@@ -656,20 +693,30 @@ func (r *collectorFakeRegistry) snapshotPages() []collectorPage {
 	return out
 }
 
-// collectorFakeAdmin measures lag without a broker, recording every request and feeding the
-// REAL shared gauge through the real recordConsumerLag, so the label resolution under test
-// is the production one.
+// collectorFakeAdmin measures lag without a broker, recording every request and returning a
+// report the collector then projects through the REAL ConsumerLagReport.LagSamples — so the
+// label resolution and the withholding rule under test are the production ones.
 type collectorFakeAdmin struct {
 	mu sync.Mutex
 
 	configured bool
 	lagByTopic map[string]int64
-	err        error
-	requests   []ConsumerLagRequest
+
+	// unavailableByTopic makes a topic's measurement INCOMPLETE: that many of its
+	// partitions could not be read, so its lag is a lower bound and must be withheld from
+	// the gauge the alert reads. See metrics.ConsumerLagUnmeasuredPartitions.
+	unavailableByTopic map[string]int
+
+	err      error
+	requests []ConsumerLagRequest
 }
 
 func newCollectorFakeAdmin() *collectorFakeAdmin {
-	return &collectorFakeAdmin{configured: true, lagByTopic: map[string]int64{}}
+	return &collectorFakeAdmin{
+		configured:         true,
+		lagByTopic:         map[string]int64{},
+		unavailableByTopic: map[string]int{},
+	}
 }
 
 func (a *collectorFakeAdmin) IsConfigured() bool {
@@ -690,6 +737,10 @@ func (a *collectorFakeAdmin) ConsumerLag(
 	for topic, lag := range a.lagByTopic {
 		lags[topic] = lag
 	}
+	unavailable := make(map[string]int, len(a.unavailableByTopic))
+	for topic, count := range a.unavailableByTopic {
+		unavailable[topic] = count
+	}
 	a.mu.Unlock()
 
 	if err != nil {
@@ -703,14 +754,18 @@ func (a *collectorFakeAdmin) ConsumerLag(
 	}
 	for _, topic := range req.Topics {
 		lag := lags[topic]
-		report.Topics = append(report.Topics, TopicLag{Topic: topic, TotalLag: lag})
+		report.Topics = append(report.Topics, TopicLag{
+			Topic:                 topic,
+			TotalLag:              lag,
+			PartitionsUnavailable: unavailable[topic],
+		})
 		report.TotalLag += lag
-
-		// The production recording path, so the series this test observes are the series
-		// production would publish — including the label resolution.
-		recordConsumerLag(ctx, req.SubscriberID, req.GroupID, topic, lag)
 	}
 
+	// NOTHING IS RECORDED HERE, and that is the production shape. The lag gauges are
+	// asynchronous, so a measurement is not written when it is taken: the collector publishes
+	// the whole inventory once per tick from every subscriber's samples. A fake that published
+	// per measurement would retire every other subscriber's series on each call.
 	return report, nil
 }
 
@@ -795,20 +850,17 @@ func (g *collectorRecordedInt64Gauge) snapshot() []collectorGaugeRecord {
 }
 
 // values returns the recorded values in order, for a gauge with no attributes.
+//
+// This recorder now serves ONLY the outbox-backlog gauge, which is the last synchronous
+// Int64Gauge in the event pipeline and is deliberately unattributed — one process has one
+// backlog, so a label would add cardinality without adding information. A companion that
+// indexed records by label tuple existed for the consumer-lag gauge and was removed with it:
+// the lag gauges are asynchronous now, so their telemetry is read from the published inventory
+// (see captureLagInventory) rather than intercepted as writes.
 func (g *collectorRecordedInt64Gauge) values() []int64 {
 	out := []int64{}
 	for _, record := range g.snapshot() {
 		out = append(out, record.value)
-	}
-
-	return out
-}
-
-// last returns the final value per label tuple, which is how a gauge is actually read.
-func (g *collectorRecordedInt64Gauge) last() map[string]int64 {
-	out := map[string]int64{}
-	for _, record := range g.snapshot() {
-		out[record.attributes["subscriber"]+"|"+record.attributes["group"]+"|"+record.attributes["topic"]] = record.value
 	}
 
 	return out
@@ -826,16 +878,80 @@ func captureBacklogGauge(t *testing.T) *collectorRecordedInt64Gauge {
 	return recorder
 }
 
-// captureLagGauge swaps the shared consumer-lag gauge for a recorder.
-func captureLagGauge(t *testing.T) *collectorRecordedInt64Gauge {
+// lagInventoryView is the exported consumer-lag telemetry, keyed by series.
+//
+// It has three fields because the two gauges answer different questions and their difference
+// is the whole point of the separation: lag carries only COMPLETE measurements, which is what
+// the >10000 rule reads, while unmeasured is reported for every measured topic including as
+// zero. series lists everything present so that an ABSENCE can be asserted — under the
+// asynchronous gauges a retired series is absent rather than zero, so a test that looked only
+// at values could not tell "retired" from "reported as zero".
+type lagInventoryView struct {
+	lag        map[string]int64
+	unmeasured map[string]int
+	series     []string
+}
+
+// has reports whether a series is present in the inventory at all.
+func (v lagInventoryView) has(series string) bool {
+	_, present := v.unmeasured[series]
+
+	return present
+}
+
+// exportsLag reports whether a series exports a lag reading, as opposed to being present with
+// its lag withheld.
+func (v lagInventoryView) exportsLag(series string) bool {
+	_, present := v.lag[series]
+
+	return present
+}
+
+// captureLagInventory isolates the process-wide consumer-lag inventory for one test and
+// returns a reader for it.
+//
+// The inventory is package-level state in internal/metrics — it has to be, because the SDK
+// reads it from a collection callback that no test controls — so it is saved and restored
+// rather than swapped for a fake. That replaces a fake INSTRUMENT, which an asynchronous gauge
+// cannot have: an observable gauge exposes no Record to intercept, because a measurement is
+// read at collection time rather than written when taken.
+//
+// Reading the inventory is strictly closer to what is exported than intercepting writes was.
+// A fake instrument could only show what was written to it, and the defect this replaced
+// existed precisely because writing was not the same as exporting: a zero written to a
+// departed subscriber's tuple stopped it alerting while leaving the series in existence for
+// ever.
+func captureLagInventory(t *testing.T) func() lagInventoryView {
 	t.Helper()
 
-	recorder := &collectorRecordedInt64Gauge{}
-	original := metrics.SubscriberConsumerLag
-	t.Cleanup(func() { metrics.SubscriberConsumerLag = original })
-	metrics.SubscriberConsumerLag = recorder
+	original := metrics.ConsumerLagInventory()
+	t.Cleanup(func() { metrics.PublishConsumerLagInventory(original) })
+	metrics.PublishConsumerLagInventory(nil)
 
-	return recorder
+	return func() lagInventoryView {
+		samples := metrics.ConsumerLagInventory()
+
+		view := lagInventoryView{
+			lag:        map[string]int64{},
+			unmeasured: map[string]int{},
+			series:     make([]string, 0, len(samples)),
+		}
+
+		for _, sample := range samples {
+			key := sample.Subscriber + "|" + sample.Group + "|" + sample.Topic
+			view.series = append(view.series, key)
+			view.unmeasured[key] = sample.UnmeasuredPartitions
+
+			// Recorded only when the measurement is complete, mirroring
+			// observeConsumerLagInventory: a withheld sample must not be readable as a
+			// value, or a test could assert on a number the alert can never see.
+			if sample.LagComplete {
+				view.lag[key] = sample.Lag
+			}
+		}
+
+		return view
+	}
 }
 
 // collectorSubscriber returns a registry row with canonical identifiers and the given
@@ -1020,7 +1136,7 @@ func TestEventMetricsCollector_EnumeratesTheRegistryAndMeasuresEverySubscriber(t
 	admin.lagByTopic["blnk.balances"] = 3
 	admin.lagByTopic["blnk.identities"] = 0
 
-	gauge := captureLagGauge(t)
+	inventory := captureLagInventory(t)
 	collector := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, admin)
 
 	report, err := collector.Collect(context.Background())
@@ -1039,17 +1155,26 @@ func TestEventMetricsCollector_EnumeratesTheRegistryAndMeasuresEverySubscriber(t
 		"a subscriber's own authorised topics are the ones measured, not every topic Blnk owns")
 	assert.Equal(t, second.ConsumerGroupID, requests[1].GroupID)
 
-	published := gauge.last()
+	published := inventory()
+	assert.Len(t, published.series, 3, "the exported inventory is exactly this tick's measured set")
 	assert.Equal(t, int64(12_500),
-		published[lagSeriesKey(first, "blnk.transactions")])
+		published.lag[lagSeriesKey(first, "blnk.transactions")])
 	assert.Equal(t, int64(3),
-		published[lagSeriesKey(first, "blnk.balances")])
+		published.lag[lagSeriesKey(first, "blnk.balances")])
 	assert.Equal(t, int64(0),
-		published[lagSeriesKey(second, "blnk.identities")],
+		published.lag[lagSeriesKey(second, "blnk.identities")],
 		"a caught-up subscriber must publish zero rather than no series at all")
 
+	// Every fixture topic was fully readable, so all three are complete and all three report
+	// zero unmeasured partitions. Zero is exported rather than omitted: it is the reading that
+	// says the lag beside it can be trusted.
+	for _, series := range published.series {
+		assert.True(t, published.exportsLag(series), "a completely measured topic must export its lag")
+		assert.Zero(t, published.unmeasured[series])
+	}
+
 	t.Run("the value the alert reads crosses its threshold", func(t *testing.T) {
-		assert.Greater(t, published[lagSeriesKey(first, "blnk.transactions")],
+		assert.Greater(t, published.lag[lagSeriesKey(first, "blnk.transactions")],
 			int64(10_000), "the rule is blnk_kafka_consumer_lag > 10000")
 	})
 
@@ -1057,7 +1182,7 @@ func TestEventMetricsCollector_EnumeratesTheRegistryAndMeasuresEverySubscriber(t
 		// Authorised for nothing is the fail-closed default of a freshly registered row.
 		// Publishing a zero for it would render as a consumer that is keeping up.
 		empty := collectorSubscriber()
-		emptyGauge := captureLagGauge(t)
+		emptyInventory := captureLagInventory(t)
 
 		emptyReport, emptyErr := NewEventMetricsCollector(
 			newCollectorFakeOutbox(),
@@ -1068,7 +1193,7 @@ func TestEventMetricsCollector_EnumeratesTheRegistryAndMeasuresEverySubscriber(t
 		require.NoError(t, emptyErr)
 		assert.Zero(t, emptyReport.SubscribersMeasured)
 		assert.Equal(t, 1, emptyReport.SubscribersSkipped)
-		assert.Empty(t, emptyGauge.snapshot(),
+		assert.Empty(t, emptyInventory().series,
 			"a subscriber authorised for nothing must publish no series at all")
 	})
 
@@ -1140,15 +1265,28 @@ func TestEventMetricsCollector_EnumeratesTheRegistryAndMeasuresEverySubscriber(t
 	})
 }
 
-// TestEventMetricsCollector_ZeroesTheSeriesOfASubscriberThatIsGone is the half of gauge
+// TestEventMetricsCollector_RetiresTheSeriesOfASubscriberThatIsGone is the half of gauge
 // maintenance that is easy to omit and impossible to notice afterwards.
 //
-// A gauge series is retained by the exporter until it is written again. Delete a subscriber,
-// revoke its grant, or narrow its topic list, and the series for what it used to have is
-// never written again — so it keeps its last value. If that value was above 10,000 the alert
-// fires INDEFINITELY for a subscriber that no longer exists, and no amount of correct
-// behaviour afterwards clears it, because nothing ever writes that label tuple again.
-func TestEventMetricsCollector_ZeroesTheSeriesOfASubscriberThatIsGone(t *testing.T) {
+// # What the failure was, and why zeroing was not enough
+//
+// A gauge series is retained until it is refreshed. Delete a subscriber, revoke its grant, or
+// narrow its topic list, and the series for what it used to have is never refreshed — so it
+// keeps its last value. If that value was above 10,000 the alert fires INDEFINITELY for a
+// subscriber that no longer exists.
+//
+// The previous implementation answered that by WRITING A ZERO to the departed tuple, and the
+// zero did stop the alert. What it could not do was stop the series EXISTING: a synchronous
+// gauge has no delete, and its aggregator retains every attribute set it has ever been written
+// with, so each departed subscriber left a permanent zero-valued series behind. Subscriber
+// churn therefore grew the series count and the SDK's memory without bound, with no cardinality
+// limit anywhere to stop it.
+//
+// So the assertions here changed shape with the instrument. A retired series is now ABSENT
+// from the exported inventory rather than present at zero, which is why every check below is
+// an absence check — and absence is the stronger property, since it is the one that bounds the
+// series count to the current inventory.
+func TestEventMetricsCollector_RetiresTheSeriesOfASubscriberThatIsGone(t *testing.T) {
 	departing := collectorSubscriber("blnk.transactions")
 	staying := collectorSubscriber("blnk.balances")
 
@@ -1157,7 +1295,7 @@ func TestEventMetricsCollector_ZeroesTheSeriesOfASubscriberThatIsGone(t *testing
 	admin.lagByTopic["blnk.transactions"] = 55_000 // well past the alert threshold
 	admin.lagByTopic["blnk.balances"] = 12
 
-	gauge := captureLagGauge(t)
+	inventory := captureLagInventory(t)
 	collector := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, admin)
 
 	firstTick, err := collector.Collect(context.Background())
@@ -1166,7 +1304,7 @@ func TestEventMetricsCollector_ZeroesTheSeriesOfASubscriberThatIsGone(t *testing
 	require.Zero(t, firstTick.LagSeriesCleared, "nothing was published before, so nothing is stale")
 
 	departingSeries := lagSeriesKey(departing, "blnk.transactions")
-	require.Equal(t, int64(55_000), gauge.last()[departingSeries],
+	require.Equal(t, int64(55_000), inventory().lag[departingSeries],
 		"the departing subscriber must be alerting before it is removed, or the test proves nothing")
 
 	// The subscriber is deleted from the registry.
@@ -1179,21 +1317,27 @@ func TestEventMetricsCollector_ZeroesTheSeriesOfASubscriberThatIsGone(t *testing
 
 	assert.Equal(t, 1, secondTick.LagSeriesPublished)
 	assert.Equal(t, 1, secondTick.LagSeriesCleared,
-		"the departed subscriber's series must be explicitly zeroed")
-	assert.Equal(t, int64(0), gauge.last()[departingSeries],
-		"a series left unwritten would keep alerting on 55,000 messages forever")
-	assert.Equal(t, int64(12), gauge.last()[lagSeriesKey(staying, "blnk.balances")],
-		"the remaining subscriber must keep its real reading")
+		"the departed subscriber's series must be reported as retired")
 
-	t.Run("a series is cleared once and not re-cleared forever", func(t *testing.T) {
-		// Re-zeroing a departed series on every tick would keep a dead label tuple alive in
-		// the exporter indefinitely — the opposite of the intent.
+	afterRemoval := inventory()
+	assert.False(t, afterRemoval.has(departingSeries),
+		"the departed series must be ABSENT from the inventory, not present at zero: a zero stops the alert "+
+			"but leaves the series in existence, which is what grew the series count without bound")
+	assert.Equal(t, int64(12), afterRemoval.lag[lagSeriesKey(staying, "blnk.balances")],
+		"the remaining subscriber must keep its real reading")
+	assert.Len(t, afterRemoval.series, 1, "the inventory is the current set and nothing else")
+
+	t.Run("a retired series is reported once and not re-reported forever", func(t *testing.T) {
+		// The churn figure describes what LEFT this tick. A departed series that is already
+		// gone did not leave again, so re-counting it would misreport a stable registry as
+		// churning indefinitely.
 		thirdTick, err := collector.Collect(context.Background())
 		require.NoError(t, err)
 		assert.Zero(t, thirdTick.LagSeriesCleared)
+		assert.False(t, inventory().has(departingSeries), "and it must stay absent")
 	})
 
-	t.Run("narrowing a grant clears the topic that was dropped", func(t *testing.T) {
+	t.Run("narrowing a grant retires the topic that was dropped", func(t *testing.T) {
 		narrowed := staying
 		narrowed.AuthorizedTopics = []string{"blnk.identities"}
 
@@ -1206,10 +1350,10 @@ func TestEventMetricsCollector_ZeroesTheSeriesOfASubscriberThatIsGone(t *testing
 
 		assert.Equal(t, 1, narrowedTick.LagSeriesCleared,
 			"the topic removed from the grant must stop reporting a lag it can no longer have")
-		assert.Equal(t, int64(0), gauge.last()[lagSeriesKey(staying, "blnk.balances")])
+		assert.False(t, inventory().has(lagSeriesKey(staying, "blnk.balances")))
 	})
 
-	t.Run("losing the broker clears every series rather than freezing them", func(t *testing.T) {
+	t.Run("losing the broker retires every series rather than freezing them", func(t *testing.T) {
 		// A broker outage must not leave the last pre-outage lag standing and alerting: the
 		// truthful statement is that lag is no longer being measured.
 		admin.mu.Lock()
@@ -1220,6 +1364,9 @@ func TestEventMetricsCollector_ZeroesTheSeriesOfASubscriberThatIsGone(t *testing
 		require.NoError(t, err)
 		assert.Equal(t, 1, outageTick.LagSeriesCleared)
 		assert.Zero(t, outageTick.LagSeriesPublished)
+		assert.Empty(t, inventory().series,
+			"an empty publication retires everything, which is the honest telemetry for a deployment "+
+				"that can no longer measure lag at all")
 	})
 }
 
@@ -1606,7 +1753,10 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 		for _, instrument := range []string{
 			"blnk.dlt.oldest_message_age_seconds",
 			"blnk.kafka.consumer_lag",
+			"blnk.kafka.consumer_lag_unmeasured_partitions",
 			"blnk.outbox.pending",
+			"blnk.subscribers.revocation_pending",
+			"blnk.subscribers.oldest_revocation_age_seconds",
 		} {
 			exported[strings.ReplaceAll(instrument, ".", "_")] = struct{}{}
 		}
@@ -1640,8 +1790,150 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 				found++
 			}
 		}
-		assert.Equal(t, 2, found, "both event-streaming alerts must be present")
+		// FOUR, and two of them are counted here precisely because their absence is invisible.
+		//
+		// The MEASUREMENT-HEALTH rule: without it, an incompletely measured topic publishes no
+		// lag — correctly, since a partial sum is a lower bound — and nothing at all would then
+		// alert on the subscriber, which reads exactly like a healthy one.
+		//
+		// The REVOCATION rule: a subscriber deleted from the registry whose broker-side SCRAM
+		// credential and ACLs were not removed still authenticates and still reads. Nothing in
+		// the API surface shows it, so the outstanding revocation is only ever visible as this
+		// gauge and this alert.
+		assert.Equal(t, 4, found, "every event-streaming alert must be present")
 	})
+}
+
+// TestDeadLetterAlert_RemediationIsStatusAware is the alerting-usability requirement.
+//
+// # What was wrong
+//
+// The gauge this rule reads covers outbox rows in BOTH the dead_lettered and failed states,
+// deliberately — an event whose dead-letter write itself failed is the most stranded an event can
+// be, out of the relay's claimable set with nothing on any topic behind it, and excluding it would
+// have let it age indefinitely while the alert reported health. But the remediation told the
+// operator to replay, unconditionally, and replay accepts ONLY a dead_lettered row: on a failed
+// row it refuses with EVENT_NOT_DEAD_LETTERED. So the instruction sent an operator to an endpoint
+// that would reject them, on the more urgent of the two states it fires for, at the moment they
+// were following a page.
+//
+// # What is asserted
+//
+// The remediation has to name both states and give each its own action, and it has to tell the
+// operator to establish the status BEFORE acting. Each element is asserted separately so a
+// partial rewrite — naming the states without the second action, say — still fails.
+//
+// It is asserted against the KUBERNETES copy specifically, for the reason the parity test exists:
+// the two files each look correct alone, and a deployment reading the un-updated one would page
+// operators with the misleading instruction.
+func TestDeadLetterAlert_RemediationIsStatusAware(t *testing.T) {
+	data := prometheusConfigMapData(t)
+
+	embeddedText, ok := data["blnk-kafka-alerts.yml"].(string)
+	require.True(t, ok, "the ConfigMap must carry the alert rules")
+
+	var rules map[string]interface{}
+	require.NoError(t, yaml.Unmarshal([]byte(embeddedText), &rules))
+
+	description := alertAnnotation(t, rules, "DeadLetterMessageStuck", "description")
+
+	// BOTH populations named, because an operator cannot choose an action without knowing which
+	// one they are looking at.
+	assert.Contains(t, description, "dead_lettered",
+		"the replayable state must be named, so the operator knows which entries the replay endpoint accepts")
+	assert.Contains(t, description, "failed",
+		"the non-replayable state must be named too; the alert fires for it and it is the more urgent of the two")
+
+	// The DIAGNOSIS STEP, before either action.
+	assert.Contains(t, description, "GET /events/dead-letter",
+		"the remediation must direct the operator to read the entry's status first")
+
+	// TWO ACTIONS, and specifically the refusal the wrong one produces.
+	assert.Contains(t, description, "POST /events/dead-letter/:event_id/replay",
+		"the replay action must still be given for the state that accepts it")
+	assert.Contains(t, description, "EVENT_NOT_DEAD_LETTERED",
+		"naming the typed refusal is what stops an operator diagnosing the rejection as a second fault")
+	assert.Contains(t, description, "NOT replayable",
+		"the failed state must be stated as not replayable rather than left for the operator to discover")
+
+	t.Run("the age gauge's declaration documents the same two populations", func(t *testing.T) {
+		// The rule's remediation is only correct because of what the gauge measures, so the two
+		// have to agree. The declaration used to describe a persisted dead_lettered_at over
+		// dead-letter rows only — a column that does not exist and a population narrower than
+		// the real one — which is precisely why the remediation was written for one state.
+		declaration, err := os.ReadFile(
+			filepath.Join(moduleRootDir(t), "internal", "metrics", "metrics.go"),
+		)
+		require.NoError(t, err)
+
+		body := string(declaration)
+		assert.NotContains(t, body, "persisted dead_lettered_at",
+			"there is no dead_lettered_at column; documenting one sends a reader looking for it")
+		assert.Contains(t, body, "last_attempted_at",
+			"the declaration must name the timestamp the age is actually measured from")
+		assert.Contains(t, body, "occurred_at",
+			"and the fallback, which is what makes a row with no attempt timestamp still age")
+	})
+}
+
+// prometheusConfigMapData returns the data map of the Prometheus ConfigMap manifest.
+//
+// Returns:
+//   - map[string]interface{}: the manifest's data section.
+func prometheusConfigMapData(t *testing.T) map[string]interface{} {
+	t.Helper()
+
+	manifest := readYAMLFile(t, filepath.Join(
+		moduleRootDir(t), "infrastructure", "k8s-manifests", "prometheus-configmap.yaml",
+	))
+
+	data, ok := manifest["data"].(map[string]interface{})
+	require.True(t, ok, "the Prometheus manifest must be a ConfigMap with a data section")
+
+	return data
+}
+
+// alertAnnotation returns one annotation of one named alert from a parsed rules document.
+//
+// It fails the test when the alert or the annotation is absent, so a renamed alert cannot make an
+// assertion about its annotation pass vacuously.
+//
+// Returns:
+//   - string: the annotation's value.
+func alertAnnotation(t *testing.T, rules map[string]interface{}, alert, annotation string) string {
+	t.Helper()
+
+	groups, ok := rules["groups"].([]interface{})
+	require.True(t, ok, "the rules document must carry groups")
+
+	for _, group := range groups {
+		entries, ok := group.(map[string]interface{})
+		require.True(t, ok)
+
+		ruleList, ok := entries["rules"].([]interface{})
+		require.True(t, ok)
+
+		for _, rule := range ruleList {
+			declared, ok := rule.(map[string]interface{})
+			require.True(t, ok)
+
+			if declared["alert"] != alert {
+				continue
+			}
+
+			annotations, ok := declared["annotations"].(map[string]interface{})
+			require.True(t, ok, "alert %s must carry annotations", alert)
+
+			value, ok := annotations[annotation].(string)
+			require.True(t, ok, "alert %s must carry a %s annotation", alert, annotation)
+
+			return value
+		}
+	}
+
+	t.Fatalf("no alert named %s is declared", alert)
+
+	return ""
 }
 
 // stripScrapeAuthorization removes the authorization block from every scrape job in a
