@@ -782,6 +782,17 @@ func captureEntityEvent[T any](ctx context.Context, d Datasource, tx *sql.Tx, en
 // committed and its event does not exist. No amount of retrying here closes that
 // window, because the mutation is already durable.
 //
+// Retrying does, however, remove the FAR MORE LIKELY failure inside that window — a
+// momentary connection reset, a brief pool exhaustion, a statement error — and the
+// producers whose mutation is already committed therefore call this through a bounded
+// retry rather than once: PublishEventDurably in event_outbox.go for balance.monitor,
+// and sendBulkTransactionWebhook for the bulk outcome. Both re-send the SAME prepared
+// row, which is why the retry cannot duplicate the event: an identical stored row is
+// adopted as success below (see resolveDuplicateEventOutboxInsert) instead of being
+// inserted a second time under a second id. The residual at-most-once behaviour that
+// remains after the budget is spent is documented as the single explicit exception to
+// requirement R-2 in docs/event-streaming.md.
+//
 // It is used by the producers that have NO SINGLE MUTATION to be atomic with:
 // balance monitor alerts, bulk transaction batch progress, system.error, and the
 // coalesced transaction batch whose writer is called from a file this change may not

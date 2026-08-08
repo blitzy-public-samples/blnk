@@ -53,7 +53,10 @@ func NewBalanceTracker() *model.BalanceTracker {
 
 // checkBalanceMonitors checks the balance monitors for a given updated balance.
 // It starts a tracing span, fetches the monitors, and checks each monitor's condition.
-// If a condition is met, it captures a balance.monitor event in the transactional outbox.
+// If a condition is met, it captures a balance.monitor event in the outbox through the
+// DURABLE standalone path, because the balance movement that satisfied the condition has
+// already been committed by the time this runs and the capture is therefore the alert's
+// only chance. See the call site below and PublishEventDurably.
 //
 // Parameters:
 // - ctx context.Context: The context for the operation.
@@ -95,6 +98,25 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 				// transports cannot diverge during the dual-delivery window. The event routes
 				// to blnk.balances, keyed on the monitored balance.
 				//
+				// THE DURABLE VARIANT IS USED, and the distinction matters here more than
+				// anywhere else in the package. Every other producer either enrols its event in
+				// the mutation's own transaction — where a failed insert correctly rolls the
+				// mutation back — or has no mutation at all. This one sits between the two: the
+				// balance movement that satisfied the condition is ALREADY COMMITTED, and this
+				// insert is the alert's only chance. With a single attempt, a momentary
+				// connection reset or a statement error destroyed the alert outright: the
+				// balance had moved, the threshold had been crossed, and the notification an
+				// operator relies on for a low-balance or overdraft warning simply ceased to
+				// exist. PublishEventDurably spends a small bounded budget on that insert and
+				// logs every attempt, so a transient database fault no longer costs the alert.
+				//
+				// It does not make the capture atomic and does not claim to — the mutation is
+				// durable before the first attempt, so a process that dies in the window still
+				// loses the alert. That residual at-most-once behaviour is the single
+				// documented exception to requirement R-2 and is written down as such in
+				// docs/event-streaming.md, along with the system.error escalation that makes an
+				// exhausted budget visible rather than silent.
+				//
 				// ctx is passed through rather than detached because the only caller —
 				// runTransactionPostCommitWorkWithHooks in transaction_execution.go — already
 				// hands this function a context.WithoutCancel context before spawning its
@@ -108,7 +130,7 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 				// and its ledger column would be NULL — requirement R-6 partitions by ledger
 				// id, and the monitored balance's ledger is the authoritative answer this
 				// call site already holds.
-				err := l.PublishEvent(ctx, NewWebhook{
+				err := l.PublishEventDurably(ctx, NewWebhook{
 					Event:   "balance.monitor",
 					Payload: monitor,
 				}, WithEventLedgerID(updatedBalance.LedgerID))

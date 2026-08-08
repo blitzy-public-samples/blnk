@@ -20,10 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/big"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -31,6 +34,8 @@ import (
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/database/mocks"
+	"github.com/blnkfinance/blnk/internal/apierror"
+	"github.com/blnkfinance/blnk/internal/cache"
 	"github.com/blnkfinance/blnk/model"
 )
 
@@ -521,6 +526,303 @@ func TestSendBulkTransactionWebhook_StopsRetryingOnCancellation(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, 1, attempts,
 		"a cancelled caller is a reason to stop retrying, not a reason to keep sleeping")
+}
+
+// ---------------------------------------------------------------------------
+// balance.monitor — the one event whose mutation is committed before it exists
+//
+// A monitor fires because a condition was met on a balance a transaction has ALREADY
+// committed, so there is no transaction left to enrol the event in and R-2's atomicity is
+// genuinely unavailable to it (AAP §0.4.1 and §0.6.2 both freeze monitor condition
+// evaluation, which is what would have to move for it to be available). What IS available is
+// making the one insert it gets survive a transient fault instead of losing the alert on the
+// first try, and that is what the tests below pin. The residual at-most-once window is
+// documented as the single explicit exception to R-2 in docs/event-streaming.md.
+// ---------------------------------------------------------------------------
+
+// monitorCaptureBlnk returns an instance wired for the balance.monitor producer site.
+//
+// It adds a CACHE to the atomicity mock, which is required rather than incidental:
+// getBalanceMonitorsCached reads l.cache before it reaches the datasource, so an instance
+// without one panics inside the monitor goroutine and takes the test binary down instead of
+// failing one test. The cache is backed by an in-process Redis so the assertions do not
+// depend on any external service.
+func monitorCaptureBlnk(t *testing.T) (*Blnk, *mocks.MockDataSource) {
+	t.Helper()
+
+	instance, datasource := producerAtomicityMock(t)
+
+	redisServer := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	instance.cache = cache.NewCacheWithClient(client)
+
+	return instance, datasource
+}
+
+// monitoredBalance returns a balance whose stored value satisfies crossedMonitor's condition.
+func monitoredBalance() *model.Balance {
+	balance := &model.Balance{BalanceID: "bln_monitored", LedgerID: "ldg_monitored"}
+	balance.InitializeBalanceFields()
+	balance.Balance = big.NewInt(700)
+
+	return balance
+}
+
+// crossedMonitor returns a monitor whose condition the balance above meets, so the producer
+// under test reaches its publish rather than its guard.
+func crossedMonitor() model.BalanceMonitor {
+	return model.BalanceMonitor{
+		MonitorID: "mon_crossed",
+		BalanceID: "bln_monitored",
+		Condition: model.AlertCondition{
+			Field:        "balance",
+			Operator:     ">=",
+			Value:        1,
+			Precision:    100,
+			PreciseValue: big.NewInt(100),
+		},
+	}
+}
+
+// monitorEvent is the event the producer publishes, used by the tests that call the durable
+// path directly rather than through checkBalanceMonitors.
+func monitorEvent() NewWebhook {
+	return NewWebhook{Event: "balance.monitor", Payload: crossedMonitor()}
+}
+
+// captureSpy records what the standalone insert was offered.
+//
+// It is mutex-guarded because checkBalanceMonitors publishes from a goroutine, so the
+// recording and the assertion happen on different goroutines and an unguarded counter would
+// be a data race that -race fails.
+type captureSpy struct {
+	guard    sync.Mutex
+	attempts int
+	rows     []*model.EventOutbox
+}
+
+// record is the mock's Run callback.
+func (s *captureSpy) record(args mock.Arguments) {
+	s.guard.Lock()
+	defer s.guard.Unlock()
+
+	s.attempts++
+	if row, ok := args.Get(1).(*model.EventOutbox); ok {
+		s.rows = append(s.rows, row)
+	}
+}
+
+// count returns how many insert attempts were made.
+func (s *captureSpy) count() int {
+	s.guard.Lock()
+	defer s.guard.Unlock()
+
+	return s.attempts
+}
+
+// captured returns a copy of the rows the insert was offered, in order.
+func (s *captureSpy) captured() []*model.EventOutbox {
+	s.guard.Lock()
+	defer s.guard.Unlock()
+
+	rows := make([]*model.EventOutbox, len(s.rows))
+	copy(rows, s.rows)
+
+	return rows
+}
+
+// scriptStandaloneInsert makes the standalone insert return the supplied results in order,
+// repeating the last one once they run out, and returns the spy that observed it.
+//
+// The rows matter as much as the count: a retry that re-prepared the event would offer a
+// DIFFERENT row each time, which is the failure mode
+// TestPublishEventDurably_RetriesTheSameEventIDSoARetryCannotDuplicate exists to catch.
+func scriptStandaloneInsert(datasource *mocks.MockDataSource, results ...error) *captureSpy {
+	spy := &captureSpy{rows: make([]*model.EventOutbox, 0, len(results))}
+
+	for _, result := range results {
+		datasource.On("InsertEventOutbox", mock.Anything, mock.Anything).
+			Run(spy.record).Return(result).Once()
+	}
+
+	// A catch-all repeating the last scripted result, so a test asserting that a budget is
+	// spent does not have to enumerate every attempt of it.
+	datasource.On("InsertEventOutbox", mock.Anything, mock.Anything).
+		Run(spy.record).Return(results[len(results)-1])
+
+	return spy
+}
+
+// TestPublishEventDurably_RetriesATransientCaptureFailure is the F-1 regression guard.
+//
+// Before this, one failed insert destroyed the alert outright: the balance had moved, the
+// threshold had been crossed, and the notification simply ceased to exist — with nothing to
+// retry it, because the only record that it should have existed was the row that never got
+// written.
+func TestPublishEventDurably_RetriesATransientCaptureFailure(t *testing.T) {
+	instance, datasource := monitorCaptureBlnk(t)
+	spy := scriptStandaloneInsert(datasource, errors.New("connection reset"), nil)
+
+	err := instance.PublishEventDurably(context.Background(), monitorEvent())
+
+	require.NoError(t, err, "a transient database fault must not cost the event")
+	assert.Equal(t, 2, spy.count(), "the first attempt failed and the second succeeded")
+}
+
+// TestPublishEventDurably_RetriesTheSameEventIDSoARetryCannotDuplicate is why the retry sits
+// beneath PrepareEventOutbox rather than above it.
+//
+// A balance.monitor event id is a fresh UUID by design, because a derived id would collapse a
+// monitor that fires repeatedly into one event. Retrying by re-entering PublishEvent would
+// therefore mint a NEW id per attempt, and an attempt whose insert committed but whose
+// acknowledgement was lost would be followed by a second, differently-identified row: one
+// business event delivered twice, with nothing at a subscriber able to collapse the pair,
+// because duplicate suppression keys on event_id.
+func TestPublishEventDurably_RetriesTheSameEventIDSoARetryCannotDuplicate(t *testing.T) {
+	instance, datasource := monitorCaptureBlnk(t)
+	spy := scriptStandaloneInsert(datasource, errors.New("connection reset"), nil)
+
+	require.NoError(t, instance.PublishEventDurably(context.Background(), monitorEvent()))
+	require.Equal(t, 2, spy.count())
+
+	rows := spy.captured()
+	require.Len(t, rows, 2)
+
+	first, second := rows[0], rows[1]
+	require.NotEmpty(t, first.EventID)
+	assert.Equal(t, first.EventID, second.EventID,
+		"the retry must re-send the SAME prepared row, so the repository can adopt it as an "+
+			"identical duplicate instead of recording the event twice")
+	assert.Equal(t, first.Payload, second.Payload, "and the same bytes with it")
+}
+
+// TestPublishEventDurably_DoesNotRetryAGenuineConflict asserts the budget is not spent on a
+// failure no further attempt can resolve.
+//
+// An identical event already recorded is reported as SUCCESS by the repository, so a conflict
+// reaching the producer is a genuine id collision. Retrying it only delays the error.
+func TestPublishEventDurably_DoesNotRetryAGenuineConflict(t *testing.T) {
+	instance, datasource := monitorCaptureBlnk(t)
+	spy := scriptStandaloneInsert(datasource,
+		apierror.NewAPIError(apierror.ErrConflict, "Event outbox entry already exists", nil))
+
+	err := instance.PublishEventDurably(context.Background(), monitorEvent())
+
+	require.Error(t, err, "a collision must be reported rather than retried into the same wall")
+	assert.Equal(t, 1, spy.count(), "the remaining attempts are not spent on a conflict")
+}
+
+// TestPublishEventDurably_DoesNotRetryARefusedValue is the same argument for a value the
+// schema refuses: a not-null, foreign-key or CHECK violation answers identically every time.
+func TestPublishEventDurably_DoesNotRetryARefusedValue(t *testing.T) {
+	instance, datasource := monitorCaptureBlnk(t)
+	spy := scriptStandaloneInsert(datasource,
+		apierror.NewAPIError(apierror.ErrBadRequest, "Event outbox entry violates a field constraint", nil))
+
+	err := instance.PublishEventDurably(context.Background(), monitorEvent())
+
+	require.Error(t, err)
+	assert.Equal(t, 1, spy.count(), "a refused value is permanent, so the budget stays unspent")
+}
+
+// TestPublishEventDurably_ReportsAnExhaustedBudget asserts the failure is RETURNED and not
+// merely logged, so the call site's notification.NotifyError still escalates a lost alert as
+// system.error. That escalation is what makes the residual R-2 exception observable rather
+// than silent.
+func TestPublishEventDurably_ReportsAnExhaustedBudget(t *testing.T) {
+	instance, datasource := monitorCaptureBlnk(t)
+	spy := scriptStandaloneInsert(datasource, errors.New("outbox unavailable"))
+
+	err := instance.PublishEventDurably(context.Background(), monitorEvent())
+
+	require.Error(t, err,
+		"an event that could not be captured must be reported, not swallowed into a log line")
+	assert.Equal(t, standaloneEventCaptureAttempts, spy.count(), "the whole budget is spent first")
+}
+
+// TestPublishEventDurably_StopsRetryingOnCancellation asserts cancellation is honoured
+// BETWEEN attempts: the caller going away stops the retry rather than the sleep, and the
+// failure is still reported.
+func TestPublishEventDurably_StopsRetryingOnCancellation(t *testing.T) {
+	instance, datasource := monitorCaptureBlnk(t)
+	spy := scriptStandaloneInsert(datasource, errors.New("outbox unavailable"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := instance.PublishEventDurably(ctx, monitorEvent())
+
+	require.Error(t, err)
+	assert.Equal(t, 1, spy.count(),
+		"a cancelled caller is a reason to stop retrying, not a reason to keep sleeping")
+}
+
+// TestPublishEvent_MakesASingleCaptureAttempt pins the OTHER half of the change: the budget
+// belongs to the durable entry point alone.
+//
+// Every producer whose event is enrolled in its mutation's transaction keeps one attempt on
+// purpose, because for them a failed insert must fail the mutation rather than be retried
+// past it. A budget applied to PublishEvent generally would have changed all of them.
+func TestPublishEvent_MakesASingleCaptureAttempt(t *testing.T) {
+	instance, datasource := monitorCaptureBlnk(t)
+	spy := scriptStandaloneInsert(datasource, errors.New("outbox unavailable"))
+
+	err := instance.PublishEvent(context.Background(), monitorEvent())
+
+	require.Error(t, err)
+	assert.Equal(t, 1, spy.count(), "PublishEvent's behaviour is unchanged")
+}
+
+// TestCheckBalanceMonitors_CapturesTheMonitorEventDurably drives the REAL producer site.
+//
+// The tests above prove the durable path retries; this one proves the monitor producer USES
+// it. A site that reverted to PublishEvent would leave every assertion above green while the
+// alert was lost on the first transient fault again, which is exactly the defect F-1 reported.
+func TestCheckBalanceMonitors_CapturesTheMonitorEventDurably(t *testing.T) {
+	instance, datasource := monitorCaptureBlnk(t)
+	datasource.On("GetBalanceMonitors", "bln_monitored").
+		Return([]model.BalanceMonitor{crossedMonitor()}, nil)
+	spy := scriptStandaloneInsert(datasource, errors.New("connection reset"), nil)
+
+	instance.checkBalanceMonitors(context.Background(), monitoredBalance())
+
+	require.Eventually(t, func() bool { return spy.count() == 2 }, waitForPostActions, pollPostActions,
+		"the monitor producer must retry a transient capture failure rather than lose the alert")
+
+	rows := spy.captured()
+	require.Len(t, rows, 2)
+
+	captured := rows[1]
+	assert.Equal(t, "balance.monitor", captured.EventType)
+	assert.Equal(t, "ldg_monitored", captured.LedgerID,
+		"the ledger is still supplied from the monitored balance, so the event is keyed on the "+
+			"aggregate requirement R-6 partitions by")
+
+	event, data := capturedEventPayload(t, captured)
+	assert.Equal(t, "balance.monitor", event)
+	assert.Equal(t, "mon_crossed", data["monitor_id"],
+		"the payload is the monitor object the legacy transport carried, unchanged")
+}
+
+// TestCheckBalanceMonitors_PublishesNothingWhenNoConditionIsMet keeps the substitution inside
+// the CheckCondition guard.
+//
+// Monitor condition evaluation is frozen domain logic (AAP §0.6.2). A publish that escaped the
+// guard would announce a threshold crossing that never happened, to every subscriber.
+func TestCheckBalanceMonitors_PublishesNothingWhenNoConditionIsMet(t *testing.T) {
+	instance, datasource := monitorCaptureBlnk(t)
+
+	unmet := crossedMonitor()
+	unmet.Condition.Operator = "<"
+	datasource.On("GetBalanceMonitors", "bln_monitored").
+		Return([]model.BalanceMonitor{unmet}, nil)
+	spy := scriptStandaloneInsert(datasource, nil)
+
+	instance.checkBalanceMonitors(context.Background(), monitoredBalance())
+
+	assert.Never(t, func() bool { return spy.count() > 0 }, waitForPostActions, pollPostActions,
+		"a condition that was not met must publish nothing at all")
 }
 
 // TestPostTransactionActions_DoesNotRecaptureAnAlreadyCapturedEvent is the guard on the

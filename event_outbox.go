@@ -54,6 +54,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -1144,7 +1145,67 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 // Returns:
 //   - error: nil on success and on every no-op; the persistence error otherwise.
 func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...EventOption) error {
-	return l.publishEvent(ctx, nil, event, options...)
+	return l.publishEvent(ctx, nil, singleEventCaptureAttempt, event, options...)
+}
+
+// PublishEventDurably captures a domain event on the standalone path and RETRIES a
+// transient persistence failure, for the producers whose mutation is already committed
+// by the time the event exists.
+//
+// # The window this closes, and the one it cannot
+//
+// PublishEvent makes exactly one insert attempt. That is the right budget for a caller
+// that can still fail its own operation — the three entity creations and the single
+// transaction path enrol their event in the mutation's transaction, so a failed insert
+// rolls the mutation back and nothing is lost. It is the WRONG budget for a caller whose
+// mutation has already committed: there the insert is the event's only chance, and a
+// momentary connection reset, a brief pool exhaustion or a statement error destroyed the
+// event outright, permanently, on the first try. `balance.monitor` was lost that way — the
+// balance advanced and its threshold alert simply ceased to exist.
+//
+// Retrying does not make the capture atomic and this method does not pretend otherwise.
+// The mutation is durable before the first attempt, so the window between the commit and
+// a successful insert cannot be closed by any number of attempts; a process that dies in
+// that window still loses the event. What retrying removes is the far more likely failure:
+// a transient database fault. The residual at-most-once behaviour is documented as an
+// explicit, narrow exception to requirement R-2 in docs/event-streaming.md, rather than
+// left for an operator to discover.
+//
+// # Why the row is prepared once and the INSERT is what retries
+//
+// The retry lives beneath PrepareEventOutbox, not above it, and that is load-bearing
+// rather than tidy. A `balance.monitor` event id is a fresh UUID by design — a derived id
+// would collapse a monitor that fires repeatedly into one event — so re-entering
+// PrepareEventOutbox per attempt would mint a NEW id each time. An attempt whose insert
+// committed but whose acknowledgement was lost would then be followed by an attempt that
+// inserts a SECOND, differently-identified row: one business event delivered twice, with
+// nothing at any subscriber able to collapse the pair, because duplicate suppression keys
+// on event_id. Retrying the SAME prepared row instead makes the retry idempotent — the
+// repository recognises an identical stored row and reports success (see
+// resolveDuplicateEventOutboxInsert).
+//
+// # Which producers use this, and which deliberately do not
+//
+//   - `balance.monitor` uses it. A monitor fires because a condition was met on a balance
+//     another transaction already committed, so it has no mutation of its own to enrol in.
+//   - `bulk_transaction.<status>` has its own equivalent loop in sendBulkTransactionWebhook,
+//     which additionally carries batch context in its log fields; it is left as it is.
+//   - Every producer whose event IS captured inside its mutation's transaction keeps
+//     PublishEvent, because for them a failed insert correctly fails the mutation.
+//
+// Parameters:
+//   - ctx context.Context: the context for the operation. Cancellation is honoured
+//     BETWEEN attempts, so a caller going away stops the retry rather than the sleep.
+//   - event NewWebhook: the event name and payload object, unchanged from the producer
+//     call site.
+//   - options ...EventOption: caller-supplied facts the payload cannot yield, forwarded
+//     verbatim to PrepareEventOutbox.
+//
+// Returns:
+//   - error: nil on success and on every no-op; the last persistence error when the
+//     retry budget is spent or the failure is not retryable.
+func (l *Blnk) PublishEventDurably(ctx context.Context, event NewWebhook, options ...EventOption) error {
+	return l.publishEvent(ctx, nil, standaloneEventCaptureAttempts, event, options...)
 }
 
 // PublishEventInTx captures a domain event inside an existing database transaction,
@@ -1180,7 +1241,7 @@ func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...Ev
 // Returns:
 //   - error: nil on success and on every no-op; the persistence error otherwise.
 func (l *Blnk) PublishEventInTx(ctx context.Context, tx *sql.Tx, event NewWebhook, options ...EventOption) error {
-	return l.publishEvent(ctx, tx, event, options...)
+	return l.publishEvent(ctx, tx, singleEventCaptureAttempt, event, options...)
 }
 
 // publishEvent is the single implementation behind PublishEvent and
@@ -1216,16 +1277,28 @@ func (l *Blnk) PublishEventInTx(ctx context.Context, tx *sql.Tx, event NewWebhoo
 // caller's transaction, so on the in-transaction path this deployment captures nothing and
 // delivers nothing, and the caller's post-commit path delivers instead.
 //
+// # The capture budget applies to the STANDALONE insert only
+//
+// captureAttempts is how many times the standalone insert of the PREPARED row may be
+// attempted. It is singleEventCaptureAttempt for PublishEvent and PublishEventInTx, which
+// is why their behaviour is unchanged, and standaloneEventCaptureAttempts for
+// PublishEventDurably. It is deliberately ignored on the in-transaction path: PostgreSQL
+// marks a transaction ABORTED after any statement error, so a second attempt inside the
+// caller's transaction could not succeed, and the correct response there is the rollback
+// the returned error produces.
+//
 // Parameters:
 //   - ctx context.Context: the context for the operation.
 //   - tx *sql.Tx: the caller's transaction, or nil for the standalone insert.
+//   - captureAttempts int: the standalone insert budget. Values below one are treated as
+//     one, so a miswired caller still attempts the capture once.
 //   - event NewWebhook: the event to capture.
 //   - options ...EventOption: caller-supplied facts the payload cannot yield, forwarded
 //     verbatim to PrepareEventOutbox.
 //
 // Returns:
 //   - error: nil on success and on every no-op; the persistence error otherwise.
-func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook, options ...EventOption) error {
+func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, captureAttempts int, event NewWebhook, options ...EventOption) error {
 	ctx, span := tracer.Start(ctx, "PublishEvent")
 	defer span.End()
 
@@ -1331,7 +1404,11 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook, o
 		// system.error all arrive here. They still belong in the outbox so they get
 		// the same durable retry, dead-letter and replay treatment as every other
 		// event; there is simply no wider transaction to enrol them in.
-		err = l.datasource.InsertEventOutbox(ctx, outbox)
+		//
+		// The budget is what distinguishes a caller that can still fail its own
+		// operation from one whose mutation is already committed; see
+		// insertEventOutboxWithRetry and PublishEventDurably.
+		err = l.insertEventOutboxWithRetry(ctx, outbox, captureAttempts)
 	}
 	if err != nil {
 		// Logged here for immediate operator visibility, and returned so the caller's
@@ -1362,6 +1439,224 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, event NewWebhook, o
 	))
 
 	return nil
+}
+
+// The capture budgets for the standalone insert.
+//
+// singleEventCaptureAttempt is the budget every caller had before PublishEventDurably
+// existed, and it remains correct for a caller that can still fail its own operation: the
+// entity creations and the single transaction path enrol their event in the mutation's
+// transaction, so one failed attempt correctly becomes a rollback rather than a retry.
+//
+// standaloneEventCaptureAttempts is for the caller whose mutation is already durable, where
+// the insert is the event's only chance. Three attempts at 200ms then 400ms is DELIBERATELY
+// the same budget sendBulkTransactionWebhook already spends on the same kind of work
+// (bulkOutcomeCaptureAttempts), so the two standalone producers behave alike rather than
+// each inventing a schedule. It is not trying to be the relay's budget: this is one indexed
+// INSERT against the local database, retried to survive a momentary connection reset or a
+// brief pool exhaustion. A budget large enough to ride out a real outage would hold a
+// post-commit goroutine open for minutes without improving the outcome, because a database
+// that is down will still be down — and it would do so while holding a
+// postCommitEventPublishSem permit that other events need.
+const (
+	singleEventCaptureAttempt      = 1
+	standaloneEventCaptureAttempts = 3
+	standaloneEventCaptureBackoff  = 200 * time.Millisecond
+)
+
+// insertEventOutboxWithRetry persists an already-prepared row on the standalone path,
+// spending up to attempts tries on a transient failure.
+//
+// # What it retries, and what it refuses to retry
+//
+// The repository maps every driver failure onto a typed error before it gets here
+// (wrapEventOutboxInsertError), and that classification is what decides:
+//
+//   - A CONFLICT is not retried. It means the unique index on event_id refused this row,
+//     and the repository has already separated the two ways that happens: an identical
+//     event already recorded is reported as SUCCESS and never reaches here, so anything
+//     that does is a genuine id collision that no further attempt can resolve. Spending
+//     the budget on it only delays the error the caller needs to see.
+//   - A BAD REQUEST is not retried. A not-null, foreign-key or CHECK violation is a value
+//     the schema refuses; re-sending the identical row cannot change that answer.
+//   - Everything else is retried. That is the transient class this function exists for, and
+//     it is where a connection reset, a pool timeout, a statement timeout and a
+//     server-side error all land.
+//
+// # What is logged, and what is deliberately not
+//
+// A retry that succeeds is invisible in the outcome, which is exactly when an operator most
+// needs to know the database is struggling: a monitor alert that took three tries is a
+// signal, not a non-event. So every attempt that will be followed by another is logged, and
+// so is a recovery on a later attempt. The fields carry the event identity, the attempt and
+// the budget, and the aggregate is HASHED for the same reason it is hashed everywhere else on
+// this path — it names whose money the event is about, and this line is emitted on a failure
+// path a database problem can make high-volume.
+//
+// Nothing is logged when the budget is one, which is what keeps every pre-existing caller's
+// output unchanged: with no retry to announce there is nothing here to say, and publishEvent
+// and the repository each already log the failure with the same event identity. For the same
+// reason the terminal failure of a spent budget is not logged here either — a third copy
+// would triple one incident in the log.
+//
+// Parameters:
+//   - ctx context.Context: the insert's context. Cancellation is honoured BETWEEN
+//     attempts — a caller going away is a reason to stop retrying, not a reason to keep
+//     sleeping — and the failure is still returned.
+//   - outbox *model.EventOutbox: the PREPARED row. The same row, and therefore the same
+//     event_id, is re-sent on every attempt, which is what makes a retry idempotent rather
+//     than a second event.
+//   - attempts int: the budget. Anything below one is treated as one.
+//
+// Returns:
+//   - error: nil once the row is recorded; otherwise the last failure.
+func (l *Blnk) insertEventOutboxWithRetry(ctx context.Context, outbox *model.EventOutbox, attempts int) error {
+	if attempts < singleEventCaptureAttempt {
+		attempts = singleEventCaptureAttempt
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		lastErr = l.datasource.InsertEventOutbox(ctx, outbox)
+		if lastErr == nil {
+			if attempt > 1 {
+				logrus.WithFields(eventCaptureLogFields(outbox, attempt, attempts)).Warn(
+					"the event was recorded in the outbox on a later attempt; an earlier attempt " +
+						"failed and the mutation it describes was already committed",
+				)
+			}
+
+			return nil
+		}
+
+		// Attempts REMAIN but will not be spent, which is the only case worth a line of its
+		// own: a conflict or a refused value answers identically however many times it is
+		// asked, so stopping early is the correct behaviour rather than a shortfall.
+		if !standaloneEventCaptureRetryable(lastErr) {
+			if attempt < attempts {
+				logrus.WithError(lastErr).WithFields(eventCaptureLogFields(outbox, attempt, attempts)).Error(
+					"the event could not be recorded in the outbox and the failure is not " +
+						"retryable; the remaining attempts are not spent",
+				)
+			}
+
+			return lastErr
+		}
+
+		// The budget is spent. publishEvent's error branch and the repository both log this
+		// failure with the same event identity, so it is not logged a third time here.
+		if attempt == attempts {
+			break
+		}
+
+		logrus.WithError(lastErr).WithFields(eventCaptureLogFields(outbox, attempt, attempts)).Warn(
+			"failed to record the event in the outbox; retrying",
+		)
+
+		select {
+		case <-ctx.Done():
+			logrus.WithError(lastErr).WithFields(eventCaptureLogFields(outbox, attempt, attempts)).Error(
+				"the event was not recorded in the outbox and the context was cancelled before " +
+					"the retry budget was spent; the mutation it describes is committed",
+			)
+
+			return lastErr
+		case <-time.After(standaloneEventCaptureBackoff * time.Duration(attempt)):
+		}
+	}
+
+	return lastErr
+}
+
+// eventCaptureLogFields is the field set every capture-attempt line carries, so the
+// attempts of one event join on the same keys.
+//
+// Parameters:
+//   - outbox *model.EventOutbox: the row being captured.
+//   - attempt int: the attempt just made, one-based.
+//   - attempts int: the budget.
+//
+// Returns:
+//   - logrus.Fields: the structured context for the line.
+func eventCaptureLogFields(outbox *model.EventOutbox, attempt, attempts int) logrus.Fields {
+	return logrus.Fields{
+		"event_id":          outbox.EventID,
+		"event_type":        outbox.EventType,
+		"topic":             outbox.Topic,
+		"aggregate_id_hash": hashLogIdentifier(outbox.AggregateID),
+		"attempt":           attempt,
+		"max_attempts":      attempts,
+		"atomic":            false,
+	}
+}
+
+// standaloneEventCaptureRetryable reports whether a failed standalone insert is worth
+// attempting again.
+//
+// It reads the TYPED code the repository attached rather than matching on driver strings,
+// so it classifies the same way the API layer does and cannot be defeated by a wrapped
+// error: isConflictError already covers the id-collision case for the dead-letter path, and
+// the bad-request case is read through apierror.Normalize so the legacy and canonical codes
+// are the same answer.
+//
+// An error carrying NO api code is treated as retryable. That is the conservative
+// direction: an unclassified failure is most often a connection- or driver-level fault,
+// which is precisely the transient class, and the cost of being wrong is two wasted
+// attempts against the cost of losing an event.
+//
+// Parameters:
+//   - err error: the insert failure. nil answers false, because there is nothing to retry.
+//
+// Returns:
+//   - bool: true when another attempt could plausibly succeed.
+func standaloneEventCaptureRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// The unique index refused this event id, and an identical stored row would have been
+	// reported as success. No further attempt can resolve a genuine collision.
+	if isConflictError(err) {
+		return false
+	}
+
+	// A value the schema or the validator refuses. Re-sending the identical row cannot
+	// change the answer.
+	return !eventCaptureBadRequest(err)
+}
+
+// eventCaptureBadRequest reports whether an error carries the generic bad-request code.
+//
+// It mirrors isConflictError and isInternalServerError: the code is read through
+// apierror.Normalize so the legacy BAD_REQUEST the database layer still constructs and the
+// canonical GEN_BAD_REQUEST classify identically, and errors.As is used rather than a type
+// assertion so a wrapped error classifies the same as a bare one.
+//
+// Parameters:
+//   - err error: the error to classify. May be nil.
+//
+// Returns:
+//   - bool: true when the error is a bad request.
+func eventCaptureBadRequest(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	isBadRequestCode := func(code apierror.ErrorCode) bool {
+		return apierror.Normalize(code) == apierror.ErrGenBadRequest
+	}
+
+	var apiErr apierror.APIError
+	if errors.As(err, &apiErr) {
+		return isBadRequestCode(apiErr.Code)
+	}
+
+	var apiErrPtr *apierror.APIError
+	if errors.As(err, &apiErrPtr) && apiErrPtr != nil {
+		return isBadRequestCode(apiErrPtr.Code)
+	}
+
+	return false
 }
 
 // deliverLegacyWebhookOnly delivers an event over the legacy HTTP transport on a
