@@ -147,6 +147,38 @@ func (a Api) Router() *gin.Engine {
 	router.GET("/api-keys", a.ListAPIKeys)
 	router.DELETE("/api-keys/:id", a.RevokeAPIKey)
 
+	// Event streaming routes.
+	// Operational surface over the Kafka publishing pipeline's dead-letter
+	// inventory and its outbox statistics. Both segments below "/events" are
+	// static on purpose: no route parameter is ever registered directly under
+	// "/events", so the dead-letter and stats subtrees can never be shadowed.
+	router.GET("/events/dead-letter", a.ListDeadLetterEvents)
+	router.POST("/events/dead-letter/:event_id/replay", a.ReplayDeadLetterEvent)
+	router.GET("/events/stats", a.GetEventOutboxStats)
+
+	// Subscriber routes.
+	// The registry of Kafka principals, plus the credential-issuance endpoint
+	// that returns the broker endpoint, topic list, consumer group and SASL
+	// credentials for a subscriber.
+	router.POST("/subscribers", a.CreateSubscriber)
+	router.GET("/subscribers", a.ListSubscribers)
+	router.GET("/subscribers/:subscriber_id", a.GetSubscriber)
+	router.PUT("/subscribers/:subscriber_id", a.UpdateSubscriber)
+	router.DELETE("/subscribers/:subscriber_id", a.DeleteSubscriber)
+	router.POST("/subscribers/:subscriber_id/kafka-credentials", a.IssueKafkaCredentials)
+
+	// Deprecated webhook-subscription management routes.
+	// Retained only for the dual-delivery window; the sunset guard answers
+	// 410 Gone on every one of them once WEBHOOK_DEPRECATION_SUNSET_DATE has passed.
+	// The guard is attached per route, never with router.Use and never to a group,
+	// so no healthy route can be retired by accident — in particular the /hooks
+	// routes above, which are the PRE_TRANSACTION and POST_TRANSACTION request-time
+	// callouts of a different, fully supported feature, are deliberately unguarded.
+	router.POST("/subscribers/:subscriber_id/webhook-subscription", middleware.WebhookSunsetGuard(), a.RegisterWebhookSubscription)
+	router.GET("/subscribers/:subscriber_id/webhook-subscription", middleware.WebhookSunsetGuard(), a.GetWebhookSubscription)
+	router.PUT("/subscribers/:subscriber_id/webhook-subscription", middleware.WebhookSunsetGuard(), a.UpdateWebhookSubscription)
+	router.DELETE("/subscribers/:subscriber_id/webhook-subscription", middleware.WebhookSunsetGuard(), a.DeleteWebhookSubscription)
+
 	return a.router
 }
 
