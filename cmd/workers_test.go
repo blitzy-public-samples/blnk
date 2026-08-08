@@ -148,7 +148,11 @@ func TestHandleTransactionRejection_CapturesTheEventExactlyOnce(t *testing.T) {
 	// The instance is assembled here rather than through newCmdTestInstance because that helper
 	// re-installs the plain configuration, and the capture decision is read from the
 	// configuration the instance was BUILT with — so the brokers have to be set before setupBlnk.
-	cfg.Kafka.Brokers = []string{"localhost:9092"}
+	//
+	// The list comes from the environment rather than being hardcoded. Nothing here dials it,
+	// but a hardcoded endpoint describes this deployment as running on localhost:9092 when it
+	// does not, and that is the kind of statement a reader later trusts.
+	cfg.Kafka.Brokers = cmdTestKafkaBrokers()
 	// The publisher refuses a plaintext broker unless the deployment says out loud that it is
 	// a development one. Saying so is correct here — nothing is dialled, and the alternative
 	// would be a TLS configuration this test has no use for.
@@ -157,6 +161,13 @@ func TestHandleTransactionRejection_CapturesTheEventExactlyOnce(t *testing.T) {
 	newBlnk, err := setupBlnk(cfg)
 	require.NoError(t, err, "Postgres and Redis must be running for the cmd test suite")
 	instance := &blnkInstance{blnk: newBlnk, cnf: cfg}
+
+	// The assertions below read blnk.event_outbox, so a database whose event_outbox does not
+	// match what the capture path writes cannot answer them. That is an environment problem
+	// and is reported as one: without this guard a foreign schema surfaces as
+	// "the rejection event must exist exactly once" or as a raw pq constraint violation
+	// returned by the handler, both of which read as a defect in the handler.
+	skipUnlessEventOutboxSchemaMatches(t, newBlnk.GetDataSource(), cfg.DataSource.Dns)
 
 	source, destination := createBalancePair(t, instance)
 

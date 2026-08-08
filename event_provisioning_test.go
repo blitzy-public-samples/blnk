@@ -363,3 +363,130 @@ func readProvisioningScript(t *testing.T) string {
 // sampleSubscriberSecretFileVar is the mode-0600 destination a generated sample credential is
 // written to. It is the only channel the script will deliver a generated password over.
 const sampleSubscriberSecretFileVar = "KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE"
+
+// TestKafkaProvisionScript_CredentialProbeIsAPredicate pins the shape of the probe that
+// decides whether an existing SCRAM password may be preserved.
+//
+// It was written to PRINT its answer — "exists", "absent" or "unknown" on stdout — and to
+// return 0 in every case, while both call sites used it as the condition of an `elif`. Every
+// caller therefore read "yes" whatever the broker had said, and the answer itself was emitted
+// into the operator's console in the middle of a sentence.
+//
+// The two callers failed differently and both were worse than an error:
+//
+//   - the producer arm took its `preserved` short-circuit, granted ACLs and reported SUCCESS
+//     with no credential on the broker at all. Bring-up was green and the server and worker
+//     then failed SASL authentication with nothing in the provisioning output to explain it;
+//   - the subscriber arm had no such short-circuit, so it fell through to the credential
+//     upsert with an EMPTY password. The broker refuses that, so the one run an operator makes
+//     to repair a drifted ACL failed on a principal and a broker that were both healthy.
+//
+// It also made two subscriber arms unreachable, so the documented one-time secret-file
+// delivery never happened on a first run.
+//
+// The assertion is on the CONTRACT rather than on the implementation: nothing is written to
+// stdout, and there is a path that returns non-zero. A probe that cannot say "no" is not a
+// probe.
+func TestKafkaProvisionScript_CredentialProbeIsAPredicate(t *testing.T) {
+	script := readProvisioningScript(t)
+
+	body := shellFunctionBody(t, script, "scram_credential_exists")
+
+	for _, printed := range []string{`printf '%s' "exists"`, `printf '%s' "absent"`, `printf '%s' "unknown"`} {
+		assert.NotContainsf(t, body, printed,
+			"scram_credential_exists must not print its answer (%s): its callers use it as the condition "+
+				"of an `elif`, so a printed answer is read as `true` whatever the broker said — and it "+
+				"lands in the operator's output mid-sentence", printed)
+	}
+
+	assert.Contains(t, body, "return 1",
+		"scram_credential_exists must be able to answer NO. Returning 0 unconditionally made the "+
+			"producer report a credential it never created and made the subscriber upsert an empty password")
+
+	// One round-trip, not two. The original issued the describe twice and discarded the first
+	// answer, which doubled an administrative call on every bring-up for nothing.
+	assert.Equal(t, 1, strings.Count(body, "kafka_configs --describe"),
+		"scram_credential_exists must ask the broker exactly once; the discarded first describe was "+
+			"pure duplication")
+
+	// `status` must be function-local. As a global it leaked this probe's exit status into
+	// every later reader of the name.
+	assert.Regexp(t, regexp.MustCompile(`local [^\n]*\bstatus\b`), body,
+		"scram_credential_exists must declare `status` local, or the probe's exit status escapes into "+
+			"whatever else reads that name")
+
+	// The subscriber arm must carry the same short-circuit the producer arm always had.
+	subscriber := shellFunctionBody(t, script, "ensure_sample_subscriber")
+
+	assert.Contains(t, subscriber, `if [[ "$SUBSCRIBER_SECRET_DISPOSITION" == "preserved" ]]; then`,
+		"the sample subscriber arm must short-circuit on a PRESERVED credential — assert the ACLs and "+
+			"return — instead of falling through to the upsert with an empty password, which is what the "+
+			"broker rejected")
+
+	assert.NotContains(t, subscriber, "subscriber_credential_exists",
+		"the ACL-repair guard must call a function that exists. `subscriber_credential_exists` was never "+
+			"defined, so under `set -e` inside an `if` condition it evaluated as false after printing "+
+			"`command not found`, and the repair silently never happened")
+}
+
+// TestKafkaProvisionScript_NoSCRAMPasswordReachesACommandLine holds the rule for BOTH
+// principals, which is the whole point of it.
+//
+// The subscriber's upsert used `--add-config-file` and documented it as "a complete remedy
+// rather than a mitigation". The producer's built
+// `SCRAM-SHA-512=[iterations=N,password=SECRET]` and passed it to the CLI as an argument, with
+// a comment claiming the CLI offered no alternative — contradicted two hundred lines earlier
+// in the same script against the same image. So the asymmetry protected the local convenience
+// credential and exposed the one the server and worker authenticate with in every environment:
+// argv is readable through /proc/<pid>/cmdline for the life of the JVM start, by anything that
+// samples the process table.
+//
+// The bracketed form is asserted specifically because it is the form that only exists to
+// survive an OPTION parser. Its presence anywhere in this script means a credential is being
+// passed as an argument.
+func TestKafkaProvisionScript_NoSCRAMPasswordReachesACommandLine(t *testing.T) {
+	script := readProvisioningScript(t)
+
+	for _, function := range []string{"ensure_sample_subscriber", "ensure_producer_principal"} {
+		body := shellFunctionBody(t, script, function)
+
+		assert.Containsf(t, body, "--add-config-file",
+			"%s must upsert the credential from a mode-0600 file: a password passed as a command-line "+
+				"argument is readable in the process table for the life of the JVM start", function)
+
+		assert.NotContainsf(t, body, "--add-config \"",
+			"%s must not pass a credential-bearing --add-config value as an argument", function)
+
+		assert.NotContainsf(t, body, "password=${password}]",
+			"%s must not build the bracketed --add-config value: the brackets exist only to survive the "+
+				"OPTION parser, so their presence means the secret is on a command line", function)
+	}
+}
+
+// shellFunctionBody returns the text of one shell function, from its `name() {` header to the
+// closing brace in column one.
+//
+// Scoped rather than whole-file, because every assertion above is about ONE function's
+// behaviour and the script documents the rejected alternatives in prose: a whole-file
+// `NotContains` would fail on a comment explaining the defect it forbids.
+//
+// Parameters:
+//   - t *testing.T: failed when the function is not found.
+//   - script string: the script's text.
+//   - name string: the function name, without parentheses.
+//
+// Returns:
+//   - string: the function body, comments included.
+func shellFunctionBody(t *testing.T, script, name string) string {
+	t.Helper()
+
+	header := "\n" + name + "() {\n"
+	start := strings.Index(script, header)
+	require.GreaterOrEqualf(t, start, 0, "scripts/kafka-provision.sh must define %s()", name)
+
+	rest := script[start+len(header):]
+	end := strings.Index(rest, "\n}\n")
+	require.GreaterOrEqualf(t, end, 0, "%s() must be closed by a brace in column one", name)
+
+	return rest[:end]
+}

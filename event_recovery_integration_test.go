@@ -109,6 +109,7 @@ package blnk
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -124,6 +125,7 @@ import (
 	"github.com/google/uuid"
 	kafka "github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/sasl/scram"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -532,11 +534,187 @@ func newRecoveryFixture(t *testing.T, kafka *config.KafkaConfig) *recoveryFixtur
 	})
 
 	fixture.requireOutboxMigrated()
+
+	// EXCLUSIVE USE OF blnk.event_outbox for the duration of this test. See
+	// lockEventOutboxTier: this tier claims from the whole table and another package's live
+	// tier retires the whole table, so the two cannot run at once.
+	lockEventOutboxTier(t, fixture.ds.Conn)
+
 	t.Cleanup(fixture.deleteSeededRows)
 
 	t.Logf("event recovery run %s: outbox at %s, topic %s", fixture.runID, dsn, fixture.topic)
 
 	return fixture
+}
+
+// ---------------------------------------------------------------------------
+// Exclusive use of the shared blnk.event_outbox
+//
+// Two test tiers in two different PACKAGES work the same table, and neither can be scoped to
+// its own rows:
+//
+//   - This tier and the ordering tier CLAIM. ClaimPendingEventOutbox takes the oldest pending
+//     rows in the table, whoever wrote them, because that is what the relay does in production
+//     and a claim narrowed to a test's own rows would not be the code under test.
+//   - database/event_outbox_test.go's quiesceEventOutbox RETIRES every claim-visible row that
+//     is not its own, and then asserts there are none, so that its claim assertions read a
+//     table it controls.
+//
+// Run in the same process they would still collide, and they do not run in the same process:
+// `go test ./...` runs one package's binary per CPU, so an in-process mutex is not even
+// available. What was observed is exactly what the two descriptions predict — the root tier
+// timing out claiming rows the database tier had retired ("ANOTHER PROCESS is draining or
+// purging the same outbox", the diagnostic this tier already prints), and the database tier's
+// straggler assertion tripping on a row the root tier inserted a moment after the retire. It
+// failed 3/3 at default parallelism and passed 2/2 under -p 1, which is why CI only escapes it
+// by happening to pass -p 1.
+//
+// A POSTGRES ADVISORY LOCK is the one mechanism that reaches across processes without changing
+// the production claim query, and it is held in the same database whose table is being
+// protected — so it cannot get out of step with what it guards. It serialises the tiers instead
+// of letting them corrupt each other; the total time is what -p 1 already costs.
+// ---------------------------------------------------------------------------
+
+// eventOutboxTierLockKey identifies the advisory lock the live outbox tiers share.
+//
+// It is an arbitrary constant, and it MUST BE THE SAME VALUE in database/event_outbox_test.go —
+// two different keys are two different locks and would protect nothing. Both sides name each
+// other so a future change to one is not made without the other.
+const eventOutboxTierLockKey int64 = 0x424c4e4b4f5542 // "BLNKOUB"
+
+// eventOutboxTierLockBudget bounds how long a tier waits for the lock.
+//
+// It is longer than the slowest live test in either package and shorter than `go test`'s
+// ten-minute default timeout, so a genuinely stuck holder is reported by NAME here rather than
+// as a package-level timeout with no explanation.
+const eventOutboxTierLockBudget = 8 * time.Minute
+
+// eventOutboxTierLockPoll is how often the lock is re-attempted.
+const eventOutboxTierLockPoll = 200 * time.Millisecond
+
+// eventOutboxTierLock holds the process's side of the advisory lock.
+//
+// The DEDICATED CONNECTION is the load-bearing part. A Postgres advisory lock belongs to a
+// SESSION, and database/sql hands out an arbitrary pooled connection per statement, so taking
+// the lock on a pool would release it the moment that connection was recycled — a lock that
+// looks held and is not. MaxOpenConns(1) pins one session for the lock's whole lifetime.
+//
+// The refcount makes acquisition REENTRANT within the process. Tests in a package are serial,
+// so in practice one holder at a time — but a test that built two fixtures would otherwise take
+// the lock twice on two sessions and deadlock against itself, which is a far worse failure than
+// the one being fixed.
+var eventOutboxTierLock struct {
+	mu       sync.Mutex
+	holders  int
+	conn     *sql.DB
+	acquired bool
+}
+
+// lockEventOutboxTier takes exclusive use of blnk.event_outbox until the test finishes.
+//
+// Parameters:
+//   - t *testing.T: the test, for cleanup registration and for failing when the lock cannot be
+//     taken.
+//   - pool *sql.DB: a pool on the database holding the outbox; only its DSN is used, because
+//     the lock needs a session of its own.
+func lockEventOutboxTier(t *testing.T, pool *sql.DB) {
+	t.Helper()
+
+	require.NotNil(t, pool, "the outbox tier lock needs a live pool to derive its session from")
+
+	eventOutboxTierLock.mu.Lock()
+	defer eventOutboxTierLock.mu.Unlock()
+
+	if eventOutboxTierLock.holders == 0 {
+		acquireEventOutboxTierLock(t, pool)
+	}
+
+	eventOutboxTierLock.holders++
+
+	t.Cleanup(releaseEventOutboxTierLock)
+}
+
+// acquireEventOutboxTierLock opens the lock session and blocks until the lock is held.
+func acquireEventOutboxTierLock(t *testing.T, pool *sql.DB) {
+	t.Helper()
+
+	conf, err := config.Fetch()
+	require.NoError(t, err, "the outbox tier lock needs the configured DSN")
+
+	conn, err := sql.Open("postgres", conf.DataSource.Dns)
+	require.NoError(t, err, "opening the outbox tier lock session")
+
+	// ONE session, for the reason in the type's comment.
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	conn.SetConnMaxLifetime(0)
+
+	deadline := time.Now().Add(eventOutboxTierLockBudget)
+	for {
+		var held bool
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		queryErr := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`,
+			eventOutboxTierLockKey).Scan(&held)
+		cancel()
+
+		if queryErr != nil {
+			_ = conn.Close()
+			require.NoError(t, queryErr, "taking the outbox tier advisory lock")
+		}
+
+		if held {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			_ = conn.Close()
+			t.Fatalf(
+				"another live outbox tier has held the blnk.event_outbox advisory lock (%d) for %s. "+
+					"The root and database live tiers claim from and retire the whole table, so they take "+
+					"this lock to run one at a time; a holder this long means a test in another package "+
+					"is stuck rather than slow",
+				eventOutboxTierLockKey, eventOutboxTierLockBudget,
+			)
+		}
+
+		time.Sleep(eventOutboxTierLockPoll)
+	}
+
+	eventOutboxTierLock.conn = conn
+	eventOutboxTierLock.acquired = true
+}
+
+// releaseEventOutboxTierLock drops one hold and, when it was the last, the lock itself.
+func releaseEventOutboxTierLock() {
+	eventOutboxTierLock.mu.Lock()
+	defer eventOutboxTierLock.mu.Unlock()
+
+	if eventOutboxTierLock.holders == 0 {
+		return
+	}
+
+	eventOutboxTierLock.holders--
+	if eventOutboxTierLock.holders > 0 || !eventOutboxTierLock.acquired {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Unlocked explicitly AND the session closed. Closing alone would release it — a session
+	// ending drops its advisory locks — but an explicit unlock releases it at a known instant
+	// rather than whenever the pool decides to close the connection.
+	if _, err := eventOutboxTierLock.conn.ExecContext(ctx,
+		`SELECT pg_advisory_unlock($1)`, eventOutboxTierLockKey); err != nil {
+		logrus.WithError(err).Warn("releasing the event outbox tier advisory lock")
+	}
+
+	if err := eventOutboxTierLock.conn.Close(); err != nil {
+		logrus.WithError(err).Warn("closing the event outbox tier advisory lock session")
+	}
+
+	eventOutboxTierLock.conn = nil
+	eventOutboxTierLock.acquired = false
 }
 
 // requireOutboxMigrated skips unless blnk.event_outbox exists, because "table does not

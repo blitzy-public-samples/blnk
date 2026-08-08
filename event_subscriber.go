@@ -460,6 +460,13 @@ type SubscriberUpdate struct {
 	// string CLEARS it. It grants and revokes nothing at the broker — what it does is decide
 	// whether a credential can be issued at all, because Kafka cannot enforce a key scope
 	// and this service refuses to pretend otherwise.
+	//
+	// SETTING IT ON A SUBSCRIBER THAT ALREADY HOLDS A CREDENTIAL IS REFUSED, with
+	// apierror.ErrSubscriberIsolationUnenforceable — see requireRecordableKeyScope. Accepting
+	// it was the defect: the credential keeps Read on whole topics while the row starts
+	// announcing that the subscriber sees only one prefix, so the registry states a boundary
+	// that does not exist and every reader of it is misled. Clearing the prefix is always
+	// allowed, whatever the row holds, because clearing narrows nothing.
 	PartitionKeyPrefix *string
 
 	// WebhookURL replaces the recorded legacy endpoint when non-nil; a present empty
@@ -1240,6 +1247,10 @@ func normalizeSubscriberKeyScope(prefix *string) (*string, error) {
 // requireProvisionableKeyScope refuses to provision a subscriber whose row records a
 // key-scoped authorization Kafka cannot enforce. SEC-05.
 //
+// It guards ONE of the two orders in which the forbidden state can be reached — record the
+// prefix, then ask for a credential. requireRecordableKeyScope guards the other, and both are
+// needed: on its own, either can be walked around by approaching the state from the far side.
+//
 // # Why this is a refusal and not a warning
 //
 // Kafka's authorizer has no message-key dimension, so there is no binding, pattern type or
@@ -1291,6 +1302,151 @@ func requireProvisionableKeyScope(subscriber *model.EventSubscriber) error {
 			"event subscriber: subscriber %q records a partition key prefix; Kafka's authorizer has "+
 				"no message-key dimension, so any credential issued would grant every record on every "+
 				"authorised topic and the registry would describe a narrower boundary than exists",
+			sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
+		),
+	)
+}
+
+// requireRecordableKeyScope refuses to RECORD a key scope on a subscriber that already holds a
+// credential. It is the other half of SEC-05, and without it the first half is decorative.
+//
+// # The hole this closes
+//
+// requireProvisionableKeyScope guards the order "record a key prefix, then ask for a
+// credential". It says nothing about the reverse order, and the reverse order is one ordinary
+// API call: register, issue — which succeeds, because no prefix is recorded — and then update
+// the row with a prefix. That update used to be accepted silently. The result is precisely the
+// state the refusal exists to prevent, reached by a path that never touches the refusal: a live
+// SASL credential with Read on whole topics, under a registry row announcing that the
+// subscriber may see only the records whose key carries one prefix. Nothing failed, nothing was
+// logged, and the credential kept working — so anybody answering "can this subscriber see that
+// ledger?" from the registry answered it wrongly, which is the entire defect SEC-05 was written
+// about.
+//
+// So the two guards are now SYMMETRIC. Issuance refuses "prefix recorded, credential about to
+// exist"; this refuses "credential exists, prefix about to be recorded". Between them the state
+// is unreachable through the service, and blnk.event_subscribers'
+// event_subscribers_key_scope_chk makes it unrepresentable in the database as well — three
+// independent barriers, because the state is one a reader of the registry cannot detect.
+//
+// # Why the check is on the RESULTING row and not on the request
+//
+// A prefix on a row that holds NO credential is legitimate and must stay legitimate: it is the
+// state a caller reaches by registering with a prefix, and requireProvisionableKeyScope handles
+// it — at issuance, with a message naming both exits. Refusing every update that leaves a
+// prefix in place would break unrelated edits to such a row, including the rename an operator
+// makes while deciding what to do about it. What must be refused is the COMBINATION, so the
+// predicate reads the row as it would be written.
+//
+// # Why refuse rather than revoke
+//
+// Revoking the credential as a side effect of accepting the prefix would also keep the registry
+// honest, and it was considered. It destroys a working credential — the subscriber stops
+// consuming — in response to a request that said nothing about revocation, and the secret
+// cannot be recovered: somebody must reissue and redistribute it. A refusal costs the caller one
+// decision and takes nothing away. Whoever does want the credential gone can revoke it and then
+// record the prefix, which is the same outcome asked for explicitly.
+//
+// Parameters:
+//   - subscriber *model.EventSubscriber: the row as it WOULD be written, with the requested
+//     changes already applied.
+//
+// Returns:
+//   - error: a typed conflict when the row would record a key scope while holding a
+//     credential, otherwise nil.
+func requireRecordableKeyScope(subscriber *model.EventSubscriber) error {
+	if subscriber == nil || !subscriber.KeyScopeUnenforceable() || !subscriber.IsProvisioned() {
+		return nil
+	}
+
+	return apierror.NewAPIError(
+		// The same typed code issuance refuses with. One state, one code: a client that
+		// handles SUBSCRIBER_ISOLATION_UNENFORCEABLE from the credential endpoint needs no
+		// second case to handle it here, and the remedies are the same two plus revocation.
+		apierror.ErrSubscriberIsolationUnenforceable,
+		"This subscriber already holds a Kafka credential, and Kafka cannot enforce a partition "+
+			"key prefix, so recording one would describe a narrower boundary than the credential "+
+			"actually has. Revoke the credential first if the prefix is what you want, or narrow "+
+			"the subscriber's authorized topics, which is enforceable",
+		fmt.Errorf(
+			"event subscriber: subscriber %q holds a credential issued at %s; recording a partition "+
+				"key prefix on it would leave a live principal with Read on whole topics under a row "+
+				"claiming key-scoped access, which is the state SEC-05 refuses at issuance",
+			sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
+			subscriberCredentialIssuedAt(subscriber),
+		),
+	)
+}
+
+// subscriberCredentialIssuedAt renders a subscriber's issuance instant for a diagnostic, or
+// "an unrecorded time" when the row carries none.
+//
+// The schema's event_subscribers_credential_pair_chk keeps the reference and the instant
+// written or cleared together, so a provisioned row always has one — but this runs inside an
+// error path, and dereferencing a pointer that "cannot" be nil is how an error path becomes a
+// panic in a process that moves money.
+//
+// Parameters:
+//   - subscriber *model.EventSubscriber: the row. May be nil.
+//
+// Returns:
+//   - string: an RFC3339 instant, or a fixed phrase.
+func subscriberCredentialIssuedAt(subscriber *model.EventSubscriber) string {
+	if subscriber == nil || subscriber.CredentialIssuedAt == nil {
+		return "an unrecorded time"
+	}
+
+	return subscriber.CredentialIssuedAt.UTC().Format(time.RFC3339)
+}
+
+// requireGrantedTopics refuses to mint a credential for a subscriber authorised for nothing.
+//
+// # Why an empty grant is refused at issuance but accepted everywhere else
+//
+// An empty authorized_topics list is a real registry state and stays one. It is the fail-closed
+// default of a newly registered subscriber, and setting the list back to empty is the only way
+// to say "authorised for nothing" about a row that currently holds topics — a narrowing
+// UpdateSubscriber must be able to express, and does, by withdrawing every binding at the
+// broker. Neither registration nor update is touched here.
+//
+// Issuing against that state is a different matter. The credential is minted, the SASL principal
+// authenticates, and it holds no topic binding whatsoever: it can list nothing and read nothing.
+// The RESPONSE, though, is shaped exactly like a working one — a secret returned once, a broker
+// endpoint, a consumer group — so what the caller receives is indistinguishable at a glance from
+// access. They hand it to a consumer, the consumer sees an empty topic list, and the silence is
+// diagnosed as a delivery problem in the pipeline rather than as an authorization the registry
+// never granted. Meanwhile the broker holds a live principal that no ACL describes and that
+// somebody must remember to revoke.
+//
+// The admin layer already warns when it provisions an empty grant, and that warning stays: it
+// covers the paths that legitimately reconcile a row with no topics. A warning in a log is the
+// wrong instrument for a request that can simply be answered, which is what this does — naming
+// the missing grant and the one step that fixes it.
+//
+// Parameters:
+//   - subscriber *model.EventSubscriber: the row about to be provisioned.
+//
+// Returns:
+//   - error: a typed conflict when the subscriber has no authorised topic, otherwise nil.
+func requireGrantedTopics(subscriber *model.EventSubscriber) error {
+	if subscriber == nil {
+		return nil
+	}
+
+	for _, topic := range subscriber.AuthorizedTopics {
+		if strings.TrimSpace(topic) != "" {
+			return nil
+		}
+	}
+
+	return apierror.NewAPIError(
+		apierror.ErrSubscriberGrantEmpty,
+		"This subscriber is authorized for no topics, so a credential for it could read nothing. "+
+			"Grant it at least one authorized topic, then request the credential again",
+		fmt.Errorf(
+			"event subscriber: subscriber %q has an empty authorized topic list; issuing would mint a "+
+				"live SASL principal holding no topic binding, and the response would be "+
+				"indistinguishable from working access",
 			sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
 		),
 	)
@@ -1501,6 +1657,18 @@ func (s *EventSubscriberService) RegisterSubscriber(
 		return nil, err
 	}
 
+	// An ABSENT identifier is generated rather than refused, which is the house convention
+	// every other Blnk resource follows — ledgers, balances, identities and API keys all mint
+	// their own business key when the caller supplies none. The generated form is
+	// "sub_<uuid>", so it satisfies the canonical identifier rule the schema's CHECK
+	// constraints and the principal derivation share, and it is recognisable on sight in a
+	// broker ACL listing.
+	//
+	// It is worth stating because the alternative reads as safer and is not: a caller who
+	// omits the field has expressed no preference, and refusing would only push identifier
+	// invention out to every client, where nothing checks it against that rule. A BLANK-BUT-
+	// PRESENT value is a different matter and is still refused everywhere it counts — see
+	// requireSubscriberIdentifier, which guards every operation that acts on an existing row.
 	subscriberID := strings.TrimSpace(registration.SubscriberID)
 	if subscriberID == "" {
 		subscriberID = model.GenerateSubscriberID()
@@ -1739,6 +1907,18 @@ func (s *EventSubscriberService) UpdateSubscriber(
 		}
 	}
 
+	// SEC-05, THE OTHER HALF: refuse to record a key scope on a row that already holds a
+	// credential.
+	//
+	// Checked on the row AS IT WOULD BE WRITTEN and before anything reaches the broker or the
+	// database, so a refusal changes nothing at all. Issuance refuses the same combination
+	// approached from the other direction; between them, "prefix recorded AND credential live"
+	// is unreachable through this service, and the schema's key-scope CHECK makes it
+	// unrepresentable even to a caller that bypasses the service.
+	if err := requireRecordableKeyScope(subscriber); err != nil {
+		return nil, err
+	}
+
 	// STEP 1 — PRUNE. Whatever the new authorization no longer implies is removed at the broker
 	// BEFORE the row records the narrowing, so a failure of the write below leaves the
 	// subscriber with less access than the registry claims rather than more.
@@ -1804,9 +1984,16 @@ func (s *EventSubscriberService) pruneBrokerAccess(
 
 	report, err := admin.PruneSubscriberAccess(ctx, subscriber)
 	if err != nil {
-		logrus.WithError(err).WithFields(logrus.Fields{
+		logrus.WithFields(logrus.Fields{
 			"subscriber": sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
 			"principal":  sanitizeLogValue(subscriber.KafkaPrincipal, maxLoggedFilterLength),
+			// SANITIZED AND BOUNDED, not logrus.WithError. A refused administrative request
+			// comes back from the Kafka client with the whole request appended to it —
+			// hundreds of lines carrying broker addresses, listener names and every field of
+			// the call — and an unbounded value with newlines in it can also forge log
+			// structure. sanitizeLogValue keeps the broker's own words, which are what an
+			// operator needs, and drops the dump.
+			"error": sanitizeLogValue(err.Error(), maxLoggedErrorLength),
 		}).Error(
 			"event subscriber: the obsolete Kafka grants of this subscriber could not be removed, so " +
 				"the registry was NOT updated; the subscriber keeps the access it has and the change " +
@@ -1816,7 +2003,15 @@ func (s *EventSubscriberService) pruneBrokerAccess(
 		return 0, apierror.NewAPIError(
 			apierror.ErrSubscriberProvisioningFailed,
 			"Failed to remove the subscriber's obsolete Kafka grants, so its authorization was not changed",
-			fmt.Errorf("blnk: pruning Kafka access for principal %q: %w", subscriber.KafkaPrincipal, err),
+			// THE BOUNDED DETAIL, never the cause. NewAPIError does two things with what it
+			// is given: it re-logs it through logrus unsanitized, and it serialises it into
+			// the response body's `details` member. Passing the wrapped broker error here
+			// therefore undid the sanitizing done immediately above AND published whatever
+			// the client chose to put in that error. Retryable: the registry was not
+			// touched, so repeating the update starts from the state this attempt found.
+			NewSubscriberErrorDetail(
+				"Removing the subscriber's obsolete Kafka grants failed", subscriber.SubscriberID, true,
+			),
 		)
 	}
 
@@ -1854,9 +2049,11 @@ func (s *EventSubscriberService) grantBrokerAccess(
 
 	report, err := admin.GrantSubscriberAccess(ctx, subscriber)
 	if err != nil {
-		logrus.WithError(err).WithFields(logrus.Fields{
+		logrus.WithFields(logrus.Fields{
 			"subscriber": sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
 			"principal":  sanitizeLogValue(subscriber.KafkaPrincipal, maxLoggedFilterLength),
+			// Sanitized and bounded, for the reason given in pruneBrokerAccess.
+			"error": sanitizeLogValue(err.Error(), maxLoggedErrorLength),
 		}).Error(
 			"event subscriber: the registry was updated but the subscriber's new Kafka grants could " +
 				"not be created, so it currently has LESS access than the registry records; re-run the " +
@@ -1866,7 +2063,12 @@ func (s *EventSubscriberService) grantBrokerAccess(
 		return 0, apierror.NewAPIError(
 			apierror.ErrSubscriberProvisioningFailed,
 			"The subscriber was updated but its new Kafka grants could not be created",
-			fmt.Errorf("blnk: granting Kafka access for principal %q: %w", subscriber.KafkaPrincipal, err),
+			// The bounded detail, never the cause — see pruneBrokerAccess. Retryable, and
+			// safely so: the registry already records the intended authorization, and both
+			// re-running the update and issuing credentials create the missing bindings.
+			NewSubscriberErrorDetail(
+				"Creating the subscriber's new Kafka grants failed", subscriber.SubscriberID, true,
+			),
 		)
 	}
 
@@ -2061,11 +2263,13 @@ func (s *EventSubscriberService) DeregisterSubscriber(
 
 	// STEP 3 — REVOKE, using the row that still exists.
 	if err := admin.RevokeSubscriber(ctx, pending); err != nil {
-		logrus.WithError(err).WithFields(logrus.Fields{
+		logrus.WithFields(logrus.Fields{
 			"subscriber":             sanitizeLogValue(pending.SubscriberID, maxLoggedFilterLength),
 			"principal":              sanitizeLogValue(pending.KafkaPrincipal, maxLoggedFilterLength),
 			"authorized_topic_count": len(pending.AuthorizedTopics),
 			"revocation_pending_at":  subscriberPendingSince(pending),
+			// Sanitized and bounded, for the reason given in pruneBrokerAccess.
+			"error": sanitizeLogValue(err.Error(), maxLoggedErrorLength),
 		}).Error(
 			"event subscriber: revoking this subscriber's Kafka access failed, so its registry row " +
 				"was NOT deleted and is kept marked pending revocation; the principal named here may " +
@@ -2075,9 +2279,13 @@ func (s *EventSubscriberService) DeregisterSubscriber(
 		return pending, apierror.NewAPIError(
 			apierror.ErrSubscriberProvisioningFailed,
 			"The subscriber's Kafka access could not be revoked, so it was not removed",
-			fmt.Errorf(
-				"blnk: revoking Kafka access for principal %q of subscriber %q: %w",
-				pending.KafkaPrincipal, pending.SubscriberID, err,
+			// The bounded detail, matching RevokeSubscriberCredential's treatment of the same
+			// failure: the principal and the broker's own words stay in the log line above,
+			// and the caller receives the diagnosis plus the fact that a retry is safe.
+			// Revocation is idempotent at the broker, so repeating it cannot make things
+			// worse — and the tombstone on the row is what makes it findable.
+			NewSubscriberErrorDetail(
+				"Revoking the subscriber's Kafka access failed", pending.SubscriberID, true,
 			),
 		)
 	}
@@ -2228,13 +2436,21 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 	// this call decides from is read under the claim.
 	releaseFence, err := fenceSubscriber(ctx, store, subscriberID)
 	if err != nil {
-		return SubscriberCredential{}, err
+		// A budget spent on the claim is a TIMEOUT, not a server fault, and this is the
+		// commonest place for it to be spent: the claim is the first write of the request.
+		// A conflict — another operation holds the claim — passes through unchanged, because
+		// it is true whether or not the deadline also expired.
+		return SubscriberCredential{}, s.classifyIssuanceTimeout(
+			ctx, subscriberID, "claiming the subscriber for provisioning", err,
+		)
 	}
 	defer releaseFence()
 
 	subscriber, err := store.GetEventSubscriberByID(ctx, subscriberID)
 	if err != nil {
-		return SubscriberCredential{}, err
+		return SubscriberCredential{}, s.classifyIssuanceTimeout(
+			ctx, subscriberID, "reading the subscriber's registry row", err,
+		)
 	}
 
 	// SEC-05: fail closed on an authorization Kafka cannot enforce. Checked here — after the
@@ -2247,6 +2463,14 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 	// And refuse a subscriber that is on its way out, so an issuance cannot re-arm a principal
 	// whose deregistration is already in flight.
 	if err := requireActiveSubscriber(subscriber); err != nil {
+		return SubscriberCredential{}, err
+	}
+
+	// And refuse a subscriber authorised for nothing, so a live principal that can read
+	// nothing is never handed out looking like one that can. Checked in the same place and for
+	// the same reason as the two above: before a secret exists and before the broker is
+	// touched, so the refusal leaves no residue anywhere.
+	if err := requireGrantedTopics(subscriber); err != nil {
 		return SubscriberCredential{}, err
 	}
 
@@ -2335,7 +2559,14 @@ func (s *EventSubscriberService) IssueSubscriberCredential(
 	if err := store.RecordSubscriberCredentialIfUnchanged(
 		ctx, subscriberID, observedReference, reference, issuedAt,
 	); err != nil {
-		return SubscriberCredential{}, s.recordFailure(ctx, admin, subscriber, err)
+		// recordFailure owns the compensation and its own logging; the classification then
+		// re-reports a spent budget here as the timeout it was, exactly as on the two paths
+		// above. It runs on the OUTSIDE so the compensation happens first either way, and it
+		// leaves recordFailure's typed conflict — a superseded issuance — untouched.
+		return SubscriberCredential{}, s.classifyIssuanceTimeout(
+			ctx, subscriberID, "recording the issuance in the registry",
+			s.recordFailure(ctx, admin, subscriber, err),
+		)
 	}
 
 	credential := SubscriberCredential{
@@ -2549,6 +2780,135 @@ func (s *EventSubscriberService) provisioningDetail(
 	return detail
 }
 
+// classifyIssuanceTimeout re-reports a registry failure that was really the issuance budget
+// running out, or the caller going away, as the timeout it was.
+//
+// # The defect
+//
+// Issuance shares ONE deadline across the fence claim, the row read, up to four broker round
+// trips and the issuance record. The broker half already distinguishes a timeout: see
+// provisioningFailure, which answers a spent deadline or a cancelled caller with a retryable
+// error rather than a server fault. The REGISTRY half did not. Both reads happen before the
+// broker is touched, and both report through the repository's generic internal-server code, so a
+// five-second budget spent waiting on a slow database arrived at the caller as HTTP 500 —
+// indistinguishable from a defect in this service, and the correct reaction to the two is
+// opposite: a defect must not be retried into a loop, while this should be retried and safely
+// can be, because nothing has been written when it happens here.
+//
+// # Why the CONTEXT is consulted rather than the error
+//
+// loggedDatabaseError builds apierror.APIError{Code, Message} and deliberately does not carry
+// the driver error, so the cause never reaches this function and errors.Is(err,
+// context.DeadlineExceeded) cannot answer. What is reliable is the context: if it is done, the
+// deadline this function's own caller installed has expired or the caller cancelled, and any
+// failure of a call made under it is that expiry until something more specific says otherwise.
+//
+// # What it must NOT rewrite
+//
+// Only a generic internal-server failure is reclassified. A not-found, a conflict — the fence
+// held by another operation, a superseded issuance — or a validation error each carry a meaning
+// the caller needs, and each remains true whether or not the context also expired: the fence
+// WAS held, the subscriber IS absent. Rewriting those to a timeout would send a client to retry
+// something that will never succeed, which is the same class of mistake as the one being fixed,
+// pointing the other way.
+//
+// Parameters:
+//   - ctx context.Context: the issuance context, consulted for expiry.
+//   - subscriberID string: named in the diagnostic so a spent budget is attributable.
+//   - stage string: fixed wording for the step that was in flight, so an operator can tell a
+//     slow fence claim from a slow row read.
+//   - cause error: the error as the repository reported it.
+//
+// Returns:
+//   - error: a typed timeout when the context expired and the cause was generic, otherwise
+//     cause unchanged.
+func (s *EventSubscriberService) classifyIssuanceTimeout(
+	ctx context.Context,
+	subscriberID string,
+	stage string,
+	cause error,
+) error {
+	if cause == nil {
+		return nil
+	}
+
+	expiry := ctx.Err()
+	if expiry == nil || !isInternalServerError(cause) {
+		return cause
+	}
+
+	cancelled := errors.Is(expiry, context.Canceled)
+
+	logrus.WithFields(logrus.Fields{
+		"subscriber": sanitizeLogValue(subscriberID, maxLoggedFilterLength),
+		"stage":      stage,
+		"budget":     s.budget().String(),
+		"cancelled":  cancelled,
+		"error":      sanitizeLogValue(cause.Error(), maxLoggedErrorLength),
+	}).Warn(
+		"event subscriber: credential issuance ran out of time at the registry rather than failing; " +
+			"the provisioning claim is released and a retry is safe, because issuance re-provisions " +
+			"the same boundary idempotently",
+	)
+
+	message := fmt.Sprintf(
+		"Provisioning Kafka credentials did not complete within %s", s.budget(),
+	)
+	reason := "The registry did not answer within the issuance budget while " + stage
+
+	if cancelled {
+		message = "Provisioning Kafka credentials was cancelled before it completed"
+		reason = "The request was cancelled while " + stage
+	}
+
+	return apierror.NewAPIError(
+		apierror.ErrSubscriberProvisioningTimeout,
+		message,
+		// RETRYABLE, and true rather than optimistic: these paths run before a secret is
+		// generated and before the broker is touched, so a retry starts from the same state
+		// the first attempt found. The broker-state flags provisioningDetail carries are
+		// deliberately absent — no credential can have been written this early, and reporting
+		// flags that are structurally false would invite a caller to check for residue that
+		// cannot exist.
+		NewSubscriberErrorDetail(reason, subscriberID, true),
+	)
+}
+
+// isInternalServerError reports whether an error carries the generic internal-server code.
+//
+// It exists so classifyIssuanceTimeout can tell "the repository had no better answer" from a
+// typed domain outcome, and it mirrors isNotFoundError and isConflictError: the code is read
+// through apierror.Normalize, so the legacy INTERNAL_SERVER_ERROR the database layer still
+// constructs and the canonical GEN_INTERNAL are the same answer. errors.As is used rather than a
+// type assertion so a wrapped error classifies identically.
+//
+// Parameters:
+//   - err error: the error to classify. May be nil.
+//
+// Returns:
+//   - bool: true when the error is a generic internal-server failure.
+func isInternalServerError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	isInternalCode := func(code apierror.ErrorCode) bool {
+		return apierror.Normalize(code) == apierror.ErrGenInternal
+	}
+
+	var apiErr apierror.APIError
+	if errors.As(err, &apiErr) {
+		return isInternalCode(apiErr.Code)
+	}
+
+	var apiErrPtr *apierror.APIError
+	if errors.As(err, &apiErrPtr) && apiErrPtr != nil {
+		return isInternalCode(apiErrPtr.Code)
+	}
+
+	return false
+}
+
 // recordFailure handles the narrow window in which the broker holds a credential the registry
 // could not record.
 //
@@ -2624,7 +2984,10 @@ func (s *EventSubscriberService) recordFailure(
 	defer cancelCleanup()
 
 	if err := admin.RevokeSubscriber(cleanup, subscriber); err != nil {
-		logrus.WithError(err).WithFields(fields).Error(
+		logrus.WithFields(fields).WithField(
+			// Bounded: a refused administrative request carries the broker's whole request dump.
+			"revocation_error", sanitizeLogValue(err.Error(), maxLoggedErrorLength),
+		).Error(
 			"event subscriber: recording the issuance failed AND revoking the credential it had " +
 				"already written failed, so the principal named here holds a credential that no " +
 				"registry row records; revoke it by hand",
@@ -2784,9 +3147,11 @@ func (s *EventSubscriberService) RevokeSubscriberCredential(ctx context.Context,
 	// decision.
 	if admin.IsConfigured() {
 		if err := admin.RevokeSubscriber(ctx, subscriber); err != nil {
-			logrus.WithError(err).WithFields(logrus.Fields{
+			logrus.WithFields(logrus.Fields{
 				"subscriber": sanitizeLogValue(subscriber.SubscriberID, maxLoggedFilterLength),
 				"principal":  sanitizeLogValue(subscriber.KafkaPrincipal, maxLoggedFilterLength),
+				// Bounded, for the reason given in pruneBrokerAccess.
+				"error": sanitizeLogValue(err.Error(), maxLoggedErrorLength),
 			}).Error(
 				"event subscriber: revoking the subscriber's Kafka access failed, so the registry " +
 					"record was left untouched and the credential may still work; retry the revocation",

@@ -27,6 +27,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/embedded"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/blnkfinance/blnk/database/mocks"
 	"github.com/blnkfinance/blnk/model"
@@ -118,26 +120,143 @@ func newBulkCaptureBlnk(t *testing.T) (*Blnk, *bulkCaptureDatasource) {
 	return newOutboxBlnk(t, outboxPublishingConfiguration(), datasource), datasource
 }
 
-// recordingTracerProvider installs a span-recording provider for the test and returns the
-// recorder.
+// ---------------------------------------------------------------------------
+// Span recording for the whole package
 //
-// otel.SetTracerProvider is process-global and the package's tracer resolves through it, so
-// the previous provider is restored — and the recording one shut down — through t.Cleanup
-// rather than a defer, so a require failure cannot leave the package tracing into a provider
-// that has been torn down.
+// OpenTelemetry INSTALLS A GLOBAL TRACER PROVIDER EXACTLY ONCE, and that single fact is why
+// this facility exists rather than each test installing its own provider.
+//
+// transaction.go resolves the package's tracer at package-init time — `var tracer =
+// otel.Tracer("blnk.transactions")` — which is the idiomatic pattern and is used elsewhere in
+// this repository. The tracer it yields is the API's DELEGATING tracer, and the global
+// machinery upgrades every delegating tracer to a real one under a sync.Once
+// (delegateTraceOnce): the FIRST otel.SetTracerProvider reaches them, and no later one ever
+// does. otel.GetTracerProvider is still replaced, so a test that installs a provider and
+// reads it back sees its own — but the tracer the code under test holds stays bound to
+// whichever provider arrived first.
+//
+// The consequence was that whichever of the package's two span tests ran SECOND recorded
+// nothing. It passed at -count=1 in declaration order and failed at -count=2, failed under
+// -shuffle=on for every seed that reversed the pair, and would fail for any third span test
+// added later. That is a property of the global, not of either test, so it cannot be fixed
+// inside one of them.
+//
+// The fix is to install ONE provider for the process — a switchboard that forwards to whatever
+// the currently running test registered — and let each test register and deregister its own
+// recorder. Registration is what -count=N and -shuffle=on then exercise, and registration is
+// repeatable.
+//
+// WHY THE IDLE DELEGATE IS THE NOOP PROVIDER. With nothing registered the switchboard forwards
+// to noop.NewTracerProvider(), which is byte-for-byte the behaviour the package had before any
+// provider existed: non-recording spans with a zero span context. So no test outside this
+// facility can observe that the switchboard is installed at all — no sampling decisions
+// change, no trace ids appear where there were none, and nothing accumulates in a recorder
+// nobody is reading.
+// ---------------------------------------------------------------------------
+
+// spanSwitchboard is the one TracerProvider this package ever installs globally.
+//
+// embedded.TracerProvider is EMBEDDED rather than implemented: that is how the OpenTelemetry
+// API intends third-party implementations of its interfaces to be written, and it is the same
+// convention internal/metrics/metrics_test.go follows for its observer.
+type spanSwitchboard struct {
+	embedded.TracerProvider
+
+	mu       sync.Mutex
+	delegate trace.TracerProvider
+}
+
+// Tracer returns a tracer that resolves through the switchboard on every span it starts.
+//
+// The name and options are captured and replayed against the current delegate rather than
+// resolved once, because a tracer handed out while nothing was registered must still record
+// once a test registers — which is exactly the situation transaction.go's package-level
+// variable creates.
+func (s *spanSwitchboard) Tracer(name string, options ...trace.TracerOption) trace.Tracer {
+	return &switchboardTracer{switchboard: s, name: name, options: options}
+}
+
+// register makes recorder the destination for spans until deregister is called.
+func (s *spanSwitchboard) register(delegate trace.TracerProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.delegate = delegate
+}
+
+// current returns the registered delegate, or the noop provider when none is registered.
+func (s *spanSwitchboard) current() trace.TracerProvider {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.delegate == nil {
+		return noop.NewTracerProvider()
+	}
+
+	return s.delegate
+}
+
+// switchboardTracer is one instrumentation scope, resolved late.
+type switchboardTracer struct {
+	embedded.Tracer
+
+	switchboard *spanSwitchboard
+	name        string
+	options     []trace.TracerOption
+}
+
+// Start resolves the current delegate and starts the span on it.
+func (t *switchboardTracer) Start(
+	ctx context.Context,
+	spanName string,
+	options ...trace.SpanStartOption,
+) (context.Context, trace.Span) {
+	return t.switchboard.current().Tracer(t.name, t.options...).Start(ctx, spanName, options...)
+}
+
+var (
+	// packageSpanSwitchboard is installed once and never replaced.
+	packageSpanSwitchboard     = &spanSwitchboard{}
+	packageSpanSwitchboardOnce sync.Once
+)
+
+// recordingTracerProvider routes the package's spans into a fresh recorder for the duration of
+// the test and returns it.
+//
+// The switchboard is installed globally on first use and left installed; only the REGISTRATION
+// is per-test, which is what makes this safe to call from any number of tests, in any order,
+// any number of times. Deregistration and the recording provider's shutdown happen through
+// t.Cleanup rather than a defer, so a require failure inside the test cannot leave the package
+// tracing into a provider that has been torn down.
+//
+// The tests using it must not call t.Parallel: the registration is process-wide, so two
+// concurrent tests would record into each other's recorders. No test in this package does.
 //
 // Returns:
 //   - *tracetest.SpanRecorder: the recorder holding every span ended during the test.
 func recordingTracerProvider(t *testing.T) *tracetest.SpanRecorder {
 	t.Helper()
 
+	packageSpanSwitchboardOnce.Do(func() {
+		otel.SetTracerProvider(packageSpanSwitchboard)
+	})
+
+	// Proof rather than assumption. If anything else in the test binary installed a provider
+	// first, the switchboard was never delegated to and every assertion below would read an
+	// empty recorder — a silent pass on tests that exercise nothing. Saying so here names the
+	// cause instead.
+	require.Same(t, packageSpanSwitchboard, otel.GetTracerProvider(),
+		"the package's span switchboard must be the installed global provider; OpenTelemetry "+
+			"delegates the global tracer only ONCE, so a provider installed elsewhere in this test "+
+			"binary would leave transaction.go's package-level tracer bound to it and every span "+
+			"assertion in this package reading an empty recorder")
+
 	recorder := tracetest.NewSpanRecorder()
 	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
 
-	previous := otel.GetTracerProvider()
-	otel.SetTracerProvider(provider)
+	packageSpanSwitchboard.register(provider)
 	t.Cleanup(func() {
-		otel.SetTracerProvider(previous)
+		packageSpanSwitchboard.register(nil)
 		if err := provider.Shutdown(context.Background()); err != nil {
 			t.Logf("failed to shut down the recording tracer provider: %v", err)
 		}
@@ -170,6 +289,9 @@ func TestSendBulkTransactionWebhook_CapturesInsideTheCallersTrace(t *testing.T) 
 	expected := callerSpan.SpanContext().TraceID()
 	require.True(t, expected.IsValid(), "the fixture must have a real trace, or nothing below is exercised")
 
+	// The error is checked rather than discarded: the capture is asserted on below, so a
+	// producer that failed outright would otherwise be reported as a missing span or a missing
+	// row instead of as the failure it was.
 	require.NoError(t, blnk.sendBulkTransactionWebhook(callerCtx, "bulk_trace_probe", "applied", "", 3),
 		"the capture must succeed, or the spans asserted below describe a failure path instead")
 	callerSpan.End()
@@ -215,6 +337,9 @@ func TestSendBulkTransactionWebhook_CapturesEvenWhenTheCallersContextIsDone(t *t
 	cancel()
 	require.Error(t, callerCtx.Err(), "the fixture's context must already be done, or this asserts nothing")
 
+	// The error is checked for the same reason as above, and it carries the point of this test:
+	// a cancelled CALLER context must not make the capture fail, because the capture is
+	// deliberately detached from it.
 	require.NoError(t, blnk.sendBulkTransactionWebhook(callerCtx, "bulk_cancelled_probe", "failed", "rolled back", 0),
 		"a caller context that is already done must not make the capture fail; that is the whole point")
 

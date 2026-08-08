@@ -327,6 +327,16 @@ func TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation(t *test
 			continue
 		}
 
+		// A TEST of the variable, not an invocation of it. resolve_compose_cl has to read
+		// COMPOSE_CL to honour an explicit pin — exported by the caller or set in ${env} — before
+		// it probes the host for a Compose implementation, and COMPOSE_CL now starts EMPTY rather
+		// than assuming the legacy "docker-compose" binary. Reading the variable interpolates no
+		// command and so cannot skip the broker pin; an executed call still fails below.
+		if strings.HasPrefix(trimmed, `if [ -n "${COMPOSE_CL}" ]`) ||
+			strings.HasPrefix(trimmed, `if [ -z "${COMPOSE_CL}" ]`) {
+			continue
+		}
+
 		// Advice printed to the operator: a quoted fragment inside a message argument, not a
 		// command. These interpolate nothing at runtime.
 		assert.Truef(t, strings.HasPrefix(trimmed, `"`),
@@ -443,6 +453,76 @@ func TestCompose_PublishesTheBrokerOnLoopbackByDefault(t *testing.T) {
 		assert.Containsf(t, readRepoFile(t, file), "${KAFKA_OUTER_ADVERTISED_HOST:-localhost}",
 			"%s: the advertised host must be overridable with the binding, or exposing the broker "+
 				"deliberately produces a broker that authenticates and then cannot be read", file)
+	}
+}
+
+// TestCompose_ShipsNoSampleSubscriberGroupPrefix asserts the shipped stack can actually
+// provision itself.
+//
+// # The defect
+//
+// The sample subscriber's consumer-group namespace is DERIVED by kafka-provision.sh as
+// "<principal>." — terminated, because a PREFIXED group grant on an unterminated
+// "blnk-sample-subscriber" also matches "blnk-sample-subscriber-evil" — and the script refuses
+// any override that disagrees with the derivation, printing what it derived and provisioning
+// nothing.
+//
+// Both compose files defaulted the variable to the unterminated "blnk-sample-subscriber", which
+// is precisely the value the guard rejects, and .env.example shipped the same. So a stock
+// `docker compose --profile kafka up kafka kafka-init` — the exact command the isolation test's
+// own skip message tells an operator to run — exited 1 with nothing provisioned: no topics, no
+// principals, and therefore a broker against which the V-5 acceptance suite can only skip. The
+// remedy the script printed, "unset the variable", could not be applied through Compose either,
+// because `:-` re-supplied the default on every run.
+//
+// The trailing-terminator rule is CORRECT security behaviour and must not be relaxed to make
+// the default work. The defaults are what change, and this test is what keeps them changed: the
+// only acceptable shipped value is empty, which is how the script is told to derive.
+func TestCompose_ShipsNoSampleSubscriberGroupPrefix(t *testing.T) {
+	const variable = "KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX"
+
+	for _, file := range composeProjections {
+		marker := "${" + variable + ":-"
+		found := false
+
+		for _, line := range strings.Split(readRepoFile(t, file), "\n") {
+			index := strings.Index(line, marker)
+			if index < 0 {
+				continue
+			}
+
+			found = true
+			remainder := line[index+len(marker):]
+			closing := strings.Index(remainder, "}")
+			require.Positivef(t, closing+1, "%s: malformed interpolation of %s: %s", file, variable, line)
+
+			assert.Emptyf(t, remainder[:closing],
+				"%s: %s must interpolate with an EMPTY default. Any value here is passed to "+
+					"kafka-provision.sh, which derives the namespace from the principal and REFUSES a "+
+					"disagreeing override — so a non-empty default makes kafka-init exit 1 and "+
+					"provision nothing on a stock bring-up, and Compose re-supplies it however many "+
+					"times an operator unsets it.\n  %s",
+				file, variable, strings.TrimSpace(line))
+		}
+
+		assert.Truef(t, found,
+			"%s must still pass %s through to kafka-init: the script reads it to DETECT a stale "+
+				"override and say it is no longer honoured, and dropping it would make a stale value "+
+				"in an operator's environment silently ignored instead", file, variable)
+	}
+
+	// The template has to agree, or an operator who copies it to .env reintroduces the failure
+	// through --env-file even though the compose default is now empty.
+	for _, line := range strings.Split(readRepoFile(t, ".env.example"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, variable+"=") {
+			continue
+		}
+
+		assert.Equalf(t, variable+"=", trimmed,
+			".env.example must ship %s empty: Compose reads --env-file as well as the shell, so a "+
+				"value here fails the provisioning script's derivation guard exactly as the compose "+
+				"default used to", variable)
 	}
 }
 

@@ -507,17 +507,26 @@ type PublishRequest struct {
 // layer is keyed on the outcome vocabulary it carries.
 //
 // The status vocabulary is model.PublishStatus, reused rather than redeclared so the
-// code and the metric label set cannot drift. The publisher itself only ever reports
-// two of the three values:
+// code and the metric label set cannot drift. The publisher itself reports exactly
+// three of the four values:
 //
 //   - PublishStatusDispatched when the broker acknowledged the write.
-//   - PublishStatusRetrying when the attempt failed. "Retrying" describes what the
-//     attempt makes possible, not a decision this file took: whether another attempt
-//     actually happens is the relay's call, made against its own budget.
+//   - PublishStatusRetrying when the attempt failed and another attempt is possible:
+//     the failure looked transient and the stated budget is not spent. "Retrying"
+//     describes what the attempt makes possible, not a decision this file took —
+//     whether another attempt actually happens is the relay's call, made against the
+//     row's own budget in SQL.
+//   - PublishStatusFailed when the attempt failed and nothing further will be tried:
+//     the failure is permanent, or it was the last attempt the budget allowed. The
+//     relay READS this and takes the row straight to its terminal state rather than
+//     spending the remaining budget establishing what is already known.
 //
-// PublishStatusDeadLettered is never produced here, because retry exhaustion is not
-// something a single attempt can observe. The dead-letter writer stamps it with the
-// DeadLettered method below.
+// PublishStatusDeadLettered is never produced here, because dead-lettering is an
+// acknowledged write to a `<topic>.dlt` sibling and this file never performs one.
+// Reporting it from a failed original publish claimed a preservation that had not
+// happened — and for an event whose destination is outside the topic catalogue, never
+// would. The dead-letter writer stamps it with the DeadLettered method below, on the
+// strength of a write the broker actually acknowledged.
 type PublishResult struct {
 	// Status is the outcome of this attempt, and the value the publish-attempts
 	// counter is attributed by.
@@ -563,6 +572,15 @@ type PublishResult struct {
 	// success and false for a terminal failure, so it answers exactly one question and is
 	// not a synonym for Transient — a transient failure on the last permitted attempt is
 	// not retryable.
+	//
+	// It is ADVICE THE RELAY ACTS ON, not a field only the log reads. The relay reads it
+	// through TerminalFailure and, when it is false on a failed attempt, records the row's
+	// terminal state and hands it to the dead-letter writer immediately instead of
+	// scheduling a retry. It used to be computed, logged and then ignored, which produced
+	// a log that contradicted itself one line later — "retryable=false" followed by
+	// "scheduled for another attempt" — and cost five broker round trips and seventeen
+	// seconds of backoff per event on a condition no attempt could change, such as a
+	// principal that is not authorised for the topic.
 	Retryable bool
 
 	// Duration is how long the attempt took: from PublishRequest.ClaimedAt when it
@@ -626,6 +644,34 @@ type PublishResult struct {
 //   - bool: true when the event reached the broker durably.
 func (r PublishResult) Dispatched() bool {
 	return r.Status == model.PublishStatusDispatched
+}
+
+// PermanentFailure reports whether this attempt failed for a reason NO FURTHER ATTEMPT
+// COULD CHANGE: an unauthorised principal, a destination outside the topic catalogue,
+// bytes that will never parse, a message over the size limit.
+//
+// It is the signal the relay's retry decision reads, and it answers a different question
+// from "will there be another attempt". A transient failure on the last permitted attempt
+// is also terminal, but it is terminal because the BUDGET ran out — a fact the database
+// owns and decides inside MarkEventFailed's UPDATE, so that two instances racing on one
+// row cannot both conclude they were last. That decision is deliberately left where it is;
+// this predicate covers only the case the database cannot see.
+//
+// It is AFFIRMATIVE rather than a negation, and that is a safety property rather than a
+// style: `!Retryable` and `!Transient` are both true on a result nobody populated, so a
+// publisher implementation that returned a bare error with an empty result would have every
+// failure treated as permanent and dead-lettered on the first attempt. The publisher is an
+// interface seam — the relay borrows whichever implementation the process built — so
+// "no verdict" must read as "not permanent". Requiring all three facts (an error, the
+// failed status this file only sets after classifying, and a non-transient classification)
+// means only a publisher that actually classified the failure can end an event's life
+// early. Anything else falls through to the budgeted retry.
+//
+// Returns:
+//   - bool: true when no further attempt can succeed, so the relay must take the row to its
+//     terminal state now instead of scheduling a retry.
+func (r PublishResult) PermanentFailure() bool {
+	return r.Err != nil && r.Status == model.PublishStatusFailed && !r.Transient
 }
 
 // DeadLettered returns a copy of the result with its status set to dead-lettered.
@@ -2076,14 +2122,24 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 	if err != nil {
 		result.Duration = elapsed()
 
-		// A closed publisher is permanent for this attempt: this instance will not
-		// accept another write. The event is safe, because its row is only marked
-		// dispatched on success and becomes claimable again when the lease expires.
+		// THE TWO WRITER FAILURES ARE CLASSIFIED DIFFERENTLY, and the difference is the
+		// event's prospects rather than this attempt's.
 		//
-		// A refused topic (ErrTopicNotOwned) is permanent for a different and stronger
-		// reason: the destination itself is not one Blnk may write to, so no retry and no
-		// broker state can make the write legitimate.
-		failed := p.fail(ctx, result, err, false)
+		// A CLOSED PUBLISHER is permanent for this INSTANCE and fully recoverable for the
+		// EVENT: the process is shutting down, and the next attempt — in this process
+		// after a restart, or in another replica right now — has a live transport and will
+		// publish it. So it is reported RECOVERABLE. Reporting it permanent was safe only
+		// while the relay ignored the verdict and retried everything within budget; now
+		// that the relay acts on it, "permanent" here would mean a shutdown landing
+		// mid-batch dead-lettered perfectly deliverable events, which is the opposite of
+		// what a graceful shutdown must do. IsBrokerUnavailableError already answers true
+		// for this error at the API boundary, so this brings the two into agreement.
+		//
+		// A REFUSED TOPIC (ErrTopicNotOwned) is permanent for the event itself: the
+		// destination is not one Blnk may write to, so no retry and no broker state can
+		// make the write legitimate, and the row belongs in the dead-letter inventory
+		// where an operator can see it now rather than in five attempts' time.
+		failed := p.fail(ctx, result, err, errors.Is(err, ErrEventPublisherClosed))
 
 		return failed, failed.Err
 	}
@@ -2179,25 +2235,39 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 // Returns:
 //   - PublishResult: the completed result, with Status retrying and Err populated.
 func (p *kafkaPublisher) fail(ctx context.Context, result PublishResult, cause error, transient bool) PublishResult {
-	// RETRYING and DEAD-LETTERED are not the same outcome, and reporting every failure as
-	// retrying made a permanently-stuck event indistinguishable from a busy one in both
-	// the logs and the attempts counter. Another attempt is possible only when the failure
-	// looked transient AND the attempt did not spend the budget the row stated; a
-	// permanent error is terminal whatever the budget says, because no number of further
-	// attempts makes corrupt bytes valid or an oversized message small.
+	// RETRYING and FAILED are not the same outcome, and reporting every failure as retrying
+	// made a permanently-stuck event indistinguishable from a busy one in both the logs and
+	// the attempts counter. Another attempt is possible only when the failure looked
+	// transient AND the attempt did not spend the budget the row stated; a permanent error
+	// is terminal whatever the budget says, because no number of further attempts makes
+	// corrupt bytes valid or an oversized message small.
 	//
-	// A terminal attempt reports model.PublishStatusDeadLettered — the destination the
-	// relay takes such a row to — rather than a fourth "failed" value. The observable
-	// vocabulary is exactly three values (see model.PublishStatus): dashboards, alert
-	// rules and the requirement all share that set, so a terminal outcome names the state
-	// the event is bound for instead of widening the contract to describe the step. The
-	// distinction that mattered survives: PublishStatusRetrying still means "this will be
-	// attempted again" and nothing else does.
+	// A terminal attempt reports model.PublishStatusFailed, and NOT
+	// model.PublishStatusDeadLettered. The two describe different events and conflating them
+	// corrupted the one counter operations reads to answer "how much are we dead-lettering":
+	//
+	//   - failed is an ATTEMPT outcome. It says this attempt failed and nothing further will
+	//     be tried for it. That is all this function can know.
+	//   - dead_lettered is an acknowledged WRITE to a `<topic>.dlt` sibling, which is a
+	//     publish this function never performs. Only the dead-letter writer knows whether
+	//     that write happened, so only it may declare it — see PublishResult.DeadLettered
+	//     and event_dlt.go.
+	//
+	// Reporting dead_lettered here claimed a preservation that had not occurred, and
+	// sometimes never would: an event whose destination is outside the topic catalogue has
+	// no `.dlt` sibling to be written to, so the row ends failed with no dead letter
+	// anywhere while the attempts counter reported one per attempt. The
+	// {outcome="failed"} selections the instrument documentation spells out were
+	// simultaneously always empty for original publishes.
+	//
+	// The vocabulary is model.PublishStatus and all four of its values are observable; see
+	// its declaration for why "failed" is not a widening of the contract but the value that
+	// makes the other three mean what they say.
 	result.Retryable = transient && !attemptBudgetSpent(result.Attempt, result.MaxAttempts)
 	if result.Retryable {
 		result.Status = model.PublishStatusRetrying
 	} else {
-		result.Status = model.PublishStatusDeadLettered
+		result.Status = model.PublishStatusFailed
 	}
 
 	result.Transient = transient

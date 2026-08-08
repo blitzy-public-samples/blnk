@@ -51,6 +51,17 @@ var eventStreamingCodeCases = []struct {
 	{ErrKafkaUnavailable, http.StatusServiceUnavailable, "EVENT_KAFKA_UNAVAILABLE"},
 	{ErrSubscriberNotFound, http.StatusNotFound, "SUBSCRIBER_NOT_FOUND"},
 	{ErrSubscriberProvisioningFailed, http.StatusServiceUnavailable, "SUBSCRIBER_PROVISIONING_FAILED"},
+	// A dependency of issuance being unconfigured is not a malformed request, so 503
+	// and never 400: only an operator can supply the externally advertised list.
+	{ErrSubscriberBrokersNotConfigured, http.StatusServiceUnavailable, "SUBSCRIBER_BROKERS_NOT_CONFIGURED"},
+	// The three STATE refusals. All 409, because the request is well formed and it is
+	// the registry row that has to change before the identical request can succeed.
+	{ErrSubscriberIsolationUnenforceable, http.StatusConflict, "SUBSCRIBER_ISOLATION_UNENFORCEABLE"},
+	{ErrSubscriberDeprovisioning, http.StatusConflict, "SUBSCRIBER_DEPROVISIONING"},
+	{ErrSubscriberGrantEmpty, http.StatusConflict, "SUBSCRIBER_GRANT_EMPTY"},
+	// 504, not 503 and emphatically not the 500 a missing entry would produce: the
+	// dependency answered too slowly, or the caller went away.
+	{ErrSubscriberProvisioningTimeout, http.StatusGatewayTimeout, "SUBSCRIBER_PROVISIONING_TIMEOUT"},
 }
 
 // TestStatusForCode_EventStreamingCodes states the mapping positively;
@@ -59,8 +70,14 @@ var eventStreamingCodeCases = []struct {
 func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 	// Guard the inventory itself: a table that no longer holds one row per code in
 	// codes.go means a code was added or removed without its assertions.
-	if len(eventStreamingCodeCases) != 7 {
-		t.Fatalf("eventStreamingCodeCases has %d rows, want 7 (one per new code in codes.go)", len(eventStreamingCodeCases))
+	//
+	// The count is stated literally rather than derived, because deriving it from the
+	// catalog is what the guard exists to prevent: a code that arrives with neither a
+	// status entry nor a row here would then satisfy a self-referential comparison and
+	// resolve to the unknown-code 500 in production. Adding a code is a deliberate edit
+	// of this number.
+	if len(eventStreamingCodeCases) != 12 {
+		t.Fatalf("eventStreamingCodeCases has %d rows, want 12 (one per new code in codes.go)", len(eventStreamingCodeCases))
 	}
 	for _, tt := range eventStreamingCodeCases {
 		t.Run(string(tt.code), func(t *testing.T) {
@@ -173,6 +190,63 @@ func TestMapErrorToHTTPStatus_GenGone(t *testing.T) {
 	}
 	if got := StatusForCode(Normalize(resp.Error.Code)); got != http.StatusGone {
 		t.Errorf("StatusForCode(Normalize(%s)) = %d, want %d", resp.Error.Code, got, http.StatusGone)
+	}
+}
+
+// TestMapErrorToHTTPStatus_PointerShapedAPIError covers the *APIError branch of
+// MapErrorToHTTPStatus, which nothing else in this package reached.
+//
+// # Why the branch exists at all
+//
+// APIError declares Error() on its VALUE receiver, so both APIError and *APIError
+// satisfy the error interface, and errors.As only matches a target whose element
+// type the concrete type is assignable to. A handler returning &APIError{...} —
+// or any layer that took an address along the way — therefore misses the value
+// target entirely and is resolved by the second lookup. Without it such an error
+// would fall through to 500, and a deprecated surface past its sunset would answer
+// 500 instead of the 410 acceptance criterion V-10 requires.
+//
+// # Why this test was written
+//
+// The mutation gate found it. `internal/apierror` scores one viable mutant, the
+// `apiErrPtr != nil` guard on this branch, and it LIVED: the branch was covered but
+// no assertion depended on its answer, so negating the guard — which sends every
+// pointer-shaped API error to 500 — changed nothing any test could see. Both halves
+// of the guard are now asserted, so a mutation of either is caught.
+func TestMapErrorToHTTPStatus_PointerShapedAPIError(t *testing.T) {
+	// A pointer-shaped error must resolve to its mapped status, not to 500. This is
+	// the half that fails if the nil guard is negated.
+	pointer := &APIError{Code: ErrGenGone, Message: "webhook management is gone"}
+	if got := MapErrorToHTTPStatus(pointer); got != http.StatusGone {
+		t.Errorf("MapErrorToHTTPStatus(*APIError %s) = %d, want %d", ErrGenGone, got, http.StatusGone)
+	}
+
+	// And through a wrapping layer, because that is how it reaches the middleware.
+	if got := MapErrorToHTTPStatus(fmt.Errorf("sunset guard: %w", pointer)); got != http.StatusGone {
+		t.Errorf("MapErrorToHTTPStatus(wrapped *APIError) = %d, want %d", got, http.StatusGone)
+	}
+
+	// Every event-streaming code resolves the same way when carried by a pointer, so
+	// the branch is not correct for one code by accident.
+	for _, tt := range eventStreamingCodeCases {
+		t.Run(string(tt.code), func(t *testing.T) {
+			carried := &APIError{Code: tt.code, Message: "event streaming failure"}
+			if got := MapErrorToHTTPStatus(carried); got != tt.status {
+				t.Errorf("MapErrorToHTTPStatus(*APIError %s) = %d, want %d", tt.code, got, tt.status)
+			}
+		})
+	}
+
+	// A TYPED NIL is the half that fails if the guard is removed rather than
+	// negated. errors.As succeeds against a nil *APIError — the type matches — so
+	// without the guard the next line would dereference nil and take down the
+	// process that was merely trying to choose a status code. 500 is the right
+	// answer: an error carrying no code is exactly the unclassified case.
+	var absent *APIError
+	var carried error = absent
+	if got := MapErrorToHTTPStatus(carried); got != http.StatusInternalServerError {
+		t.Errorf("MapErrorToHTTPStatus(typed-nil *APIError) = %d, want %d",
+			got, http.StatusInternalServerError)
 	}
 }
 

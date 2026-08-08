@@ -148,6 +148,16 @@ type eventMetricsOutboxStore interface {
 type eventMetricsSubscriberStore interface {
 	// ListEventSubscribers pages the registry.
 	ListEventSubscribers(ctx context.Context, limit, offset int) ([]model.EventSubscriber, error)
+
+	// CountSubscriberRevocationsPending returns the outstanding-revocation backlog as two
+	// scalars.
+	//
+	// An AGGREGATE and not a second walk of the registry, for the reason the backlog gauge is
+	// a count: observing how much is owed must not cost more as more is owed. It also keeps
+	// this measurement independent of the lag sweep's cardinality budget and skip rules,
+	// which exist for a different question — a subscriber with no authorised topics is
+	// skipped for lag and still matters here.
+	CountSubscriberRevocationsPending(ctx context.Context) (model.SubscriberRevocationBacklog, error)
 }
 
 // eventMetricsLagMeasurer is the broker surface the lag gauge needs: one method of
@@ -506,6 +516,15 @@ type EventMetricsReport struct {
 	// some registered subscribers were not measured this tick.
 	BudgetReached bool
 
+	// RevocationsPending is how many subscribers still owe a broker-side credential
+	// revocation — the value published to the revocation-count gauge.
+	RevocationsPending int64
+
+	// OldestRevocationAge is how long the OLDEST outstanding revocation has been owed, and
+	// the value published to the revocation-age gauge. Zero when nothing is outstanding,
+	// which is a reading rather than an absence.
+	OldestRevocationAge time.Duration
+
 	// Failures are the per-collection errors. A non-empty slice accompanies the error
 	// Collect returns.
 	Failures []error
@@ -527,6 +546,8 @@ func (r EventMetricsReport) LogFields() logrus.Fields {
 		"lag_series_published":  r.LagSeriesPublished,
 		"lag_series_cleared":    r.LagSeriesCleared,
 		"subscriber_budget_hit": r.BudgetReached,
+		"revocations_pending":   r.RevocationsPending,
+		"oldest_revocation_age": r.OldestRevocationAge.String(),
 		"failures":              len(r.Failures),
 	}
 }
@@ -560,6 +581,7 @@ func (c *EventMetricsCollector) Collect(ctx context.Context) (EventMetricsReport
 
 	c.collectOutboxBacklog(ctx, &report)
 	c.collectDeadLetterAge(ctx, &report)
+	c.collectSubscriberRevocations(ctx, &report)
 	c.collectSubscriberLag(ctx, &report)
 
 	if len(report.Failures) > 0 {
@@ -632,6 +654,68 @@ func (c *EventMetricsCollector) collectDeadLetterAge(ctx context.Context, report
 	}
 
 	report.DeadLetterAge = ageReport
+}
+
+// collectSubscriberRevocations publishes how much broker-side credential revocation is
+// outstanding and how old the oldest obligation is.
+//
+// # Why the collector, and why these were unreachable before
+//
+// Deregistration revokes at the broker and only then deletes the registry row, so a row still
+// carrying revocation_pending_at is a principal that may still authenticate while nothing in
+// Blnk records an issuance for it. Both gauges describing that were declared, initialised and
+// NEVER RECORDED, which made the alert on the age of the oldest one permanently inactive with
+// a healthy-looking rule — the precise failure mode where an alert that cannot fire is
+// indistinguishable from a system with nothing wrong.
+//
+// Recording them here rather than in the deregistration path is what makes them true rather
+// than merely written. A gauge maintained by the code that creates the obligation reports only
+// what that code observed on its way past; the obligation persists in a row and outlives the
+// request, so the reading has to come from the row. It is also the reading that survives a
+// restart: the marker is durable and the gauge is not.
+//
+// # INDEPENDENT OF THE BROKER, deliberately
+//
+// Unlike consumer lag this needs no broker and is not skipped when none is configured. A
+// marker is created by a deregistration whose revocation failed, and the commonest reason for
+// that failure is precisely that the broker was unreachable — so refusing to measure it
+// without a broker would hide the backlog exactly when it is growing.
+//
+// # A failed read publishes NOTHING
+//
+// Zero is published when the count really is zero, so that "nothing owed" is distinguishable
+// from "the collector stopped". It is NOT published when the query failed, because a zero
+// would then assert that everything is settled on the strength of a reading that does not
+// exist. The failure is reported instead, and the previous value stands until the next tick.
+func (c *EventMetricsCollector) collectSubscriberRevocations(ctx context.Context, report *EventMetricsReport) {
+	if c.subscribers == nil {
+		// No registry surface: there is nothing to read, and a zero would be an invention.
+		return
+	}
+
+	backlog, err := c.subscribers.CountSubscriberRevocationsPending(ctx)
+	if err != nil {
+		report.Failures = append(report.Failures,
+			fmt.Errorf("counting outstanding subscriber revocations: %w", err))
+
+		return
+	}
+
+	report.RevocationsPending = backlog.Pending
+	report.OldestRevocationAge = backlog.OldestAge(report.CollectedAt)
+
+	if metrics.SubscriberRevocationsPending != nil {
+		metrics.SubscriberRevocationsPending.Record(ctx, backlog.Pending)
+	}
+
+	if metrics.OldestSubscriberRevocationAgeSeconds != nil {
+		// Seconds, matching the instrument's declared unit and the alert expression's
+		// threshold. The age is zero when nothing is outstanding — see
+		// SubscriberRevocationBacklog.OldestAge for why the zero instant is tested rather
+		// than subtracted, which would otherwise publish an age of fifty-odd years and pin
+		// the alert permanently.
+		metrics.OldestSubscriberRevocationAgeSeconds.Record(ctx, report.OldestRevocationAge.Seconds())
+	}
 }
 
 // collectSubscriberLag measures consumer lag for every registered subscriber and publishes

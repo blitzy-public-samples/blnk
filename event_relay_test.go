@@ -114,11 +114,17 @@ type relayFakeStore struct {
 	// terminal records rows that reached a terminal state, by row id.
 	terminal map[int64]string
 
-	claims       []relayClaimRecord
-	claimed      [][]model.EventOutbox
-	dispatched   []relayMarkRecord
-	failures     []relayFailRecord
-	webhookMarks []relayMarkRecord
+	claims     []relayClaimRecord
+	claimed    [][]model.EventOutbox
+	dispatched []relayMarkRecord
+	failures   []relayFailRecord
+	// terminalFailures records MarkEventPermanentlyFailed calls — the transition the relay
+	// takes when the publisher reports a failure no further attempt can change. It is kept
+	// SEPARATE from failures so a test can tell "recorded a permanent failure once" from
+	// "recorded five ordinary attempts", which is the whole distinction the terminal gate
+	// introduces.
+	terminalFailures []relayFailRecord
+	webhookMarks     []relayMarkRecord
 	// webhookPendings records MarkEventWebhookPending calls — the transition that keeps a
 	// failed legacy enqueue recoverable instead of losing it behind a terminal state.
 	webhookPendings []relayFailRecord
@@ -142,6 +148,7 @@ type relayFakeStore struct {
 	claimErr          error
 	dispatchErr       error
 	failErr           error
+	terminalFailErr   error
 	webhookErr        error
 	webhookPendingErr error
 	renewErr          error
@@ -342,6 +349,55 @@ func (s *relayFakeStore) MarkEventFailed(
 	s.pending = append(s.pending, row)
 
 	return model.EventFailureOutcome{Status: row.Status, Attempts: row.Attempts}, nil
+}
+
+// MarkEventPermanentlyFailed reproduces the permanent-failure transition: the attempt is
+// counted, the row becomes failed on THIS attempt whatever budget remained, and the claim
+// token is retained for the dead-letter hand-off.
+//
+// The budget is deliberately NOT consulted, exactly as the real statement does not consult it.
+// A fake that fell back to the max_attempts test would make the terminal gate indistinguishable
+// from the exhaustion arm and the regression this covers — five attempts spent on an
+// unauthorised principal — would pass unnoticed.
+func (s *relayFakeStore) MarkEventPermanentlyFailed(
+	ctx context.Context,
+	id int64,
+	claimToken, errMsg string,
+) (model.EventFailureOutcome, error) {
+	if err := ctx.Err(); err != nil {
+		return model.EventFailureOutcome{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.terminalFailures = append(s.terminalFailures, relayFailRecord{
+		id: id, claimToken: claimToken, reason: errMsg,
+	})
+
+	if s.terminalFailErr != nil {
+		return model.EventFailureOutcome{}, s.terminalFailErr
+	}
+
+	row, held := s.inflight[id]
+	if !held || row.ClaimToken != claimToken {
+		return model.EventFailureOutcome{}, fmt.Errorf("relay test: claim lost on row %d", id)
+	}
+
+	row.Attempts++
+	row.LastError = errMsg
+	row.LockedUntil = nil
+	row.Status = model.EventOutboxStatusFailed
+
+	s.inflight[id] = row
+	s.terminal[id] = model.EventOutboxStatusFailed
+
+	return model.EventFailureOutcome{
+		Status:     row.Status,
+		Attempts:   row.Attempts,
+		Exhausted:  true,
+		ClaimToken: claimToken,
+	}, nil
 }
 
 // MarkWebhookDispatched records the dual-delivery marker on the claimed row.
@@ -753,6 +809,17 @@ func (s *relayFakeStore) snapshotFailures() []relayFailRecord {
 	return append([]relayFailRecord(nil), s.failures...)
 }
 
+// snapshotTerminalFailures returns the MarkEventPermanentlyFailed calls. It is separate from
+// snapshotFailures so a test can assert "one permanent record and no budgeted attempts", which
+// is the exact shape the terminal gate produces and the exact shape the previous behaviour did
+// not.
+func (s *relayFakeStore) snapshotTerminalFailures() []relayFailRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]relayFailRecord(nil), s.terminalFailures...)
+}
+
 func (s *relayFakeStore) snapshotDispatched() []relayMarkRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -831,6 +898,31 @@ type relayFakePublisher struct {
 	// reads off Writer.Completion. Absent means the publish reports no coordinate, which is a
 	// legitimate outcome the relay has to record honestly as unconfirmed.
 	coordinates map[string]model.BrokerRecord
+
+	// permanent makes every failure this publisher reports a PERMANENT one, which is the
+	// classification the real publisher applies to an unauthorised principal, a destination
+	// outside the topic catalogue, bytes that will never parse and a message over the size
+	// limit. It is how a test drives the relay's terminal gate, which reads
+	// PublishResult.PermanentFailure and must NOT spend the retry budget on any of those.
+	permanent bool
+
+	// unclassified makes the publisher return a bare error with an EMPTY result, which is what
+	// an implementation that does no classification produces. The relay must read that as
+	// retryable: the publisher is an interface seam, so "no verdict" cannot be allowed to mean
+	// "give up on this event".
+	unclassified bool
+}
+
+// failingPermanently makes the publisher report its failures as permanent rather than
+// transient. The error itself is set separately, because what the relay branches on is the
+// CLASSIFICATION and not the error value.
+func (p *relayFakePublisher) failingPermanently() *relayFakePublisher {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.permanent = true
+
+	return p
 }
 
 // failPermanentlyFor makes one event fail with a failure no retry can fix.
@@ -922,9 +1014,22 @@ func (p *relayFakePublisher) PublishToTopic(_ context.Context, req PublishReques
 	}
 
 	if failure != nil {
-		result.Status = model.PublishStatusRetrying
-		result.Transient = true
-		result.Retryable = true
+		if p.unclassified {
+			return PublishResult{}, failure
+		}
+
+		// The two classifications the real publisher produces, and the relay takes a
+		// different path for each: retrying goes to the budgeted retry whose exhaustion the
+		// database decides, failed goes straight to the dead-letter hand-off.
+		if p.permanent {
+			result.Status = model.PublishStatusFailed
+			result.Transient = false
+			result.Retryable = false
+		} else {
+			result.Status = model.PublishStatusRetrying
+			result.Transient = true
+			result.Retryable = true
+		}
 		result.Err = failure
 
 		return result, failure
@@ -4464,4 +4569,134 @@ func TestEventRelay_AWebhookOnlyPassCarriesNoCoordinate(t *testing.T) {
 	assert.False(t, dispatched[0].record.Confirmed(),
 		"NO COORDINATE may be supplied on a pass that published nothing; the statement's COALESCE "+
 			"then preserves the one the row already carries")
+}
+
+// TestProcessRow_HonoursAPermanentFailureInsteadOfSpendingTheBudget is the relay half of the
+// defect where a publish verdict was computed, logged and then ignored.
+//
+// The publisher classifies each failure, and for a permanent one — an unauthorised principal, a
+// destination outside the topic catalogue, bytes that will never parse, a message over the size
+// limit — it reports failed with retryable=false. The relay recorded an ordinary attempt anyway,
+// so every such event made FIVE broker round trips separated by 1s, 2s, 4s and 8s of backoff
+// before reaching the dead-letter topic it was always going to reach. The log was worse than the
+// waste: each attempt line carried "retryable=false" and was immediately followed by "publish
+// failed and the event is scheduled for another attempt", so the two lines contradicted each
+// other about the decision that had just been taken.
+//
+// The assertions are therefore about WHICH transition ran, how many times, and what the log
+// said. The dead-letter hand-off is asserted to happen on the first attempt, because "eventually
+// dead-lettered" was already true before the fix and is not what was wrong.
+func TestProcessRow_HonoursAPermanentFailureInsteadOfSpendingTheBudget(t *testing.T) {
+	t.Run("a permanent failure is terminal on the first attempt", func(t *testing.T) {
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		row := relayTransactionRow(1, "evt-permanent")
+		harness := newRelayHarness(t, row)
+		harness.publisher.failingPermanently().err = errors.New("relay test: topic authorization failed")
+
+		require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+		terminal := harness.store.snapshotTerminalFailures()
+		require.Len(t, terminal, 1,
+			"a permanent failure must be recorded through the permanent transition exactly once")
+		assert.Equal(t, row.ID, terminal[0].id)
+		assert.Contains(t, terminal[0].reason, "topic authorization failed",
+			"the reason must reach last_error so an operator sees why the event stopped")
+
+		assert.Empty(t, harness.store.snapshotFailures(),
+			"and NOT through the budgeted transition: recording an ordinary attempt is what spent "+
+				"five round trips and ~17 seconds proving the broker meant it")
+
+		require.Len(t, harness.deadLetters.rows, 1,
+			"the row must reach the dead-letter writer on this attempt, not after the schedule")
+
+		// The claim token has to survive onto the row handed off, or the dead-letter write and
+		// the transition that records it are not exclusive to this worker and two workers can
+		// put two copies of one event on the topic.
+		assert.NotEmpty(t, harness.deadLetters.rows[0].ClaimToken,
+			"the terminal transition must retain the claim token for the hand-off")
+		assert.Equal(t, 1, harness.deadLetters.rows[0].Attempts,
+			"the failure metadata must report the ONE attempt that was really made, which is what "+
+				"tells an operator the event never had a chance rather than that it fought for 17s")
+
+		// Only one publish, which is the cost this fix removes.
+		assert.Len(t, harness.publisher.snapshotRequests(), 1,
+			"exactly one broker round trip for a condition no further round trip can change")
+	})
+
+	t.Run("the log no longer contradicts the decision it just took", func(t *testing.T) {
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		harness := newRelayHarness(t, relayTransactionRow(2, "evt-permanent-log"))
+		harness.publisher.failingPermanently().err = errors.New("relay test: not authorised")
+
+		require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+		assert.Empty(t, relayEntriesWithMessage(hook, "scheduled for another attempt"),
+			"nothing may announce a retry for an attempt it has just reported as non-retryable")
+
+		permanent := relayEntriesWithMessage(hook, "publish failed permanently")
+		require.Len(t, permanent, 1, "the terminal decision must be stated once, in its own line")
+		assert.Equal(t, logrus.WarnLevel, permanent[0].Level)
+		assert.Equal(t, 1, permanent[0].Data["attempt"],
+			"and it must name the attempt it happened on")
+
+		dead := relayEntriesWithMessage(hook, "event dead-lettered")
+		require.Len(t, dead, 1)
+		assert.Equal(t, "permanent_failure", dead[0].Data["terminal_reason"],
+			"the dead-letter line must say WHY the event is terminal: 'after exhausting its retry "+
+				"budget' sends an operator looking for a broker outage that never happened")
+		assert.Contains(t, dead[0].Message, "permanent publish failure")
+	})
+
+	t.Run("a transient failure still goes through the budgeted path", func(t *testing.T) {
+		harness := newRelayHarness(t, relayTransactionRow(3, "evt-transient"))
+		harness.publisher.err = errRelayTransient
+
+		require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+		assert.Len(t, harness.store.snapshotFailures(), 1,
+			"a recoverable failure keeps its budget, and the exhaustion decision stays in SQL "+
+				"where two racing instances cannot both conclude they were last")
+		assert.Empty(t, harness.store.snapshotTerminalFailures(),
+			"the terminal transition must not be reachable from a recoverable failure")
+		assert.Empty(t, harness.deadLetters.rows, "and nothing is dead-lettered while budget remains")
+	})
+
+	t.Run("a publisher that classifies nothing is retried, not abandoned", func(t *testing.T) {
+		// The publisher is an interface seam. A result with no status and no classification
+		// must fall through to the budgeted path: reading "no verdict" as "give up" would
+		// dead-letter every event a bare-error publisher failed on, on its first attempt.
+		harness := newRelayHarness(t, relayTransactionRow(4, "evt-unclassified"))
+		harness.publisher.unclassified = true
+		harness.publisher.err = errors.New("relay test: bare failure with no verdict")
+
+		require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+		assert.Len(t, harness.store.snapshotFailures(), 1,
+			"an unclassified failure must be treated as retryable, which is the conservative "+
+				"reading and the one that cannot lose a deliverable event")
+		assert.Empty(t, harness.store.snapshotTerminalFailures())
+	})
+
+	t.Run("a lost claim abandons the row instead of dead-lettering it twice", func(t *testing.T) {
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		harness := newRelayHarness(t, relayTransactionRow(5, "evt-permanent-claim-lost"))
+		harness.publisher.failingPermanently().err = errors.New("relay test: not authorised")
+		harness.store.terminalFailErr = errors.New("relay test: claim lost on row 5")
+
+		require.Equal(t, 1, harness.processor.processBatch(context.Background()))
+
+		assert.Empty(t, harness.deadLetters.rows,
+			"a worker that could not record the terminal state must not dead-letter: another "+
+				"instance owns the row now and would write the same event a second time")
+
+		entries := relayEntriesWithMessage(hook, "recording a permanently failed publish attempt failed")
+		require.Len(t, entries, 1, "and the abandonment must be reported")
+		assert.Equal(t, logrus.ErrorLevel, entries[0].Level)
+	})
 }

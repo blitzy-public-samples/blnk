@@ -80,10 +80,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/database"
@@ -1147,16 +1144,13 @@ func TestPrepareEventOutbox_SpanWithholdsTheFinancialIdentifiers(t *testing.T) {
 		aggregateID = balanceID
 	)
 
-	recorder := tracetest.NewSpanRecorder()
-	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
-	previousProvider := otel.GetTracerProvider()
-	otel.SetTracerProvider(provider)
-	t.Cleanup(func() {
-		otel.SetTracerProvider(previousProvider)
-		if err := provider.Shutdown(context.Background()); err != nil {
-			t.Logf("failed to shut down the recording tracer provider: %v", err)
-		}
-	})
+	// Through the package's shared span facility rather than by installing a provider here.
+	// OpenTelemetry delegates the global tracer exactly once, so a provider installed directly
+	// reached transaction.go's package-level tracer only if this test happened to be the FIRST
+	// span test to run: it passed at -count=1 in declaration order and recorded nothing at
+	// -count=2 or under any -shuffle seed that ran the bulk-capture span test first. See
+	// recordingTracerProvider for why the switchboard is the fix and not a workaround.
+	recorder := recordingTracerProvider(t)
 
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
@@ -3404,12 +3398,18 @@ func TestPublishToTopic_RefusesAnOversizedEnvelopeAsPermanent(t *testing.T) {
 
 	assert.ErrorIs(t, err, ErrEventMessageTooLarge,
 		"the refusal must be recognisable without matching message text")
-	assert.Equal(t, model.PublishStatusDeadLettered, result.Status,
-		"a PERMANENT failure is terminal and not retrying: it reports the state the event is "+
-			"bound for, because reporting it as retrying would make a message that can never fit "+
-			"indistinguishable from a busy broker, in both the logs and the attempts counter")
+	assert.Equal(t, model.PublishStatusFailed, result.Status,
+		"a PERMANENT failure reports failed and not retrying: reporting it as retrying would make "+
+			"a message that can never fit indistinguishable from a busy broker, in both the logs "+
+			"and the attempts counter. It reports failed and not dead_lettered either — nothing "+
+			"has been written to a `.dlt` sibling at this point, and for an oversized event the "+
+			"strictly larger dead-letter copy may never be writable at all, so claiming it here "+
+			"would count a preservation that never happened")
 	assert.False(t, result.Retryable,
 		"and nothing further will be tried for it, whatever budget the row states")
+	assert.True(t, result.PermanentFailure(),
+		"the relay reads this predicate to take the row straight to its terminal state: an "+
+			"oversized message must not spend five broker round trips proving it cannot shrink")
 	assert.False(t, result.Dispatched(), "nothing was published")
 	assert.False(t, result.Transient,
 		"an oversized message is permanent: no retry and no broker state can make it fit")

@@ -469,11 +469,30 @@ func startEventRelay(
 // assurance is a one-shot startup operation, and holding its connections open for the process
 // lifetime would keep a SASL session per broker for something that never runs again.
 //
+// # It self-guards on an unconfigured broker list
+//
+// There is nothing to assure without brokers, and asking anyway is not harmless: the admin
+// client answers "no brokers are configured", which this function would report at ERROR as an
+// assurance failure — on the shipped default, in a supported steady state, and alongside a
+// claim that "the relay still starts" which is not true on that path either. Its caller
+// already declines to run in that state; the guard is here as well so a future call site
+// cannot reintroduce the same misreport. Debug rather than info, because startEventRelay says
+// it once at info and two lines for one condition is how a log stops being read.
+//
 // Parameters:
 //   - ctx context.Context: bounded here, because assurance must not delay startup indefinitely
 //     against an unreachable broker.
 //   - cfg *config.Configuration: read for the broker list and the topic geometry.
 func assureEventTopics(ctx context.Context, cfg *config.Configuration) {
+	if cfg == nil || !blnk.KafkaBrokersConfigured(cfg.Kafka.Brokers) {
+		logrus.Debug(
+			"no Kafka brokers are configured, so there are no event topics to assure; the relay is not " +
+				"started either, which startEventRelay reports once at info",
+		)
+
+		return
+	}
+
 	admin, err := blnk.NewKafkaAdmin(cfg)
 	if err != nil {
 		logrus.WithError(err).Error(
@@ -615,32 +634,6 @@ func serverCommands(b *blnkInstance) *cobra.Command {
 				defer chainProcessor.Stop()
 			}
 
-			// Assure the Kafka topic catalogue, THEN start the event outbox relay. The
-			// order is the point: the relay's first publish must not be the thing that
-			// discovers a missing topic, because auto-creation is disabled and a publish
-			// to a topic that does not exist fails, retries and then fails to
-			// dead-letter for the same reason.
-			//
-			// Both calls are unconditional and both self-guard, which is what keeps this
-			// call site four lines and keeps a Kafka-less deployment working unchanged.
-			// assureEventTopics logs and returns when no broker is configured;
-			// Start refuses, with a named reason, when the publisher is absent or is the
-			// no-op — and refusing there is essential rather than tidy, because running
-			// the relay against the no-op publisher would mark the entire outbox
-			// dispatched while sending nothing, destroying every pending event.
-			//
-			// The relay belongs to the SERVER role, beside the lineage processor and the
-			// event metrics collector, following this repository's convention that outbox
-			// relays live where the outbox background work already is. Starting it in the
-			// worker role as well would have two processes claiming the same rows — which
-			// the FOR UPDATE SKIP LOCKED claim tolerates, but it would double the broker
-			// connections and the dual-delivery enqueues for no gain.
-			assureEventTopics(ctx, cfg)
-
-			eventRelay := blnk.NewEventRelayProcessor(b.blnk)
-			eventRelay.Start(ctx)
-			defer eventRelay.Stop()
-
 			// Start the event metrics collector. It is the ONLY production maintainer of
 			// the event pipeline's three gauges — the outbox backlog, the dead-letter age
 			// and subscriber consumer lag — and without it all three are declared,
@@ -660,9 +653,32 @@ func serverCommands(b *blnkInstance) *cobra.Command {
 
 			// Start the Kafka event outbox relay. It is the ONLY thing that publishes the
 			// rows every producer captures inside its ledger transaction, so without it a
-			// Kafka-configured deployment fills the outbox and delivers nothing. Topic
-			// assurance runs first, inside the helper; see its documentation for why a
-			// failure there does not stop the relay.
+			// Kafka-configured deployment fills the outbox and delivers nothing.
+			//
+			// EXACTLY ONE CALL, and this is it. The relay used also to be constructed and
+			// started inline a few lines above, which meant one process ran TWO relays: two
+			// topic-assurance passes, two sets of broker connections, two dual-delivery
+			// enqueue paths, and a duplicated start/stop pair in the log that made the
+			// lifecycle unreadable during incident triage. Worse, the inline copy did not
+			// guard on the broker list, so the shipped Kafka-less default — a legitimate
+			// steady state — reported itself twice at ERROR level while the guarded helper
+			// reported the same condition at info. A second call here is not redundancy; it
+			// is a second relay.
+			//
+			// Topic assurance runs first, INSIDE the helper, and the order is the point: the
+			// relay's first publish must not be the thing that discovers a missing topic,
+			// because auto-creation is disabled and a publish to a topic that does not exist
+			// fails, retries, and then fails to dead-letter for the same reason. See the
+			// helper's documentation for why a failure there is logged and stepped past
+			// rather than fatal, and for why no brokers at all is answered with a single
+			// info line and no relay.
+			//
+			// The relay belongs to the SERVER role, beside the lineage processor and the
+			// event metrics collector, following this repository's convention that outbox
+			// relays live where the outbox background work already is. Starting it in the
+			// worker role as well would have two processes claiming the same rows — which
+			// the FOR UPDATE SKIP LOCKED claim tolerates, but it would double the broker
+			// connections and the dual-delivery enqueues for no gain.
 			stopEventRelay := startEventRelay(ctx, b.blnk, cfg)
 			defer stopEventRelay()
 

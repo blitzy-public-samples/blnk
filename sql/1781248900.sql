@@ -221,6 +221,15 @@ CREATE TABLE IF NOT EXISTS blnk.event_subscribers (
     -- is the only state a credential can be issued in. A reader must treat NULL as
     -- "no constraint" and never as "constrained to the empty prefix", which would
     -- invert the intent.
+    --
+    -- ENFORCED IN THE SCHEMA TOO, by event_subscribers_key_scope_chk — which lives in
+    -- sql/1781248920.sql rather than in the CHECK block below, because that migration
+    -- was added after this file had already been applied. It forbids this column being
+    -- non-NULL at the same time as credential_reference, so "records a key scope AND
+    -- holds a credential" is unrepresentable rather than merely refused by the service.
+    -- The service refuses it from both directions — requireProvisionableKeyScope at
+    -- issuance, requireRecordableKeyScope on update — and the constraint is what also
+    -- covers a psql session, a data migration and a restored backup.
     partition_key_prefix  TEXT                      NULL,
 
     -- ===================================================================

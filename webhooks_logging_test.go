@@ -128,6 +128,10 @@ func captureLogsUntil(t *testing.T, level logrus.Level, want int, fn func()) cap
 // which keeps captureLogsUntil a thin wrapper over captureLogs instead of a second copy of
 // its redirect-and-restore logic.
 //
+// It is called on the test goroutine while a delivery may still be logging from an asynq
+// worker, so the read is only safe because captureLogs installs a lock-guarded buffer; the
+// fmt.Stringer assertion below is what proves the redirect is in place before reading it.
+//
 // Returns:
 //   - int: the number of complete records written so far.
 func countLogEntries(t *testing.T) int {
@@ -793,8 +797,14 @@ func captureLogs(t *testing.T, level logrus.Level, fn func()) capturedLog {
 
 	fn()
 
-	captured := capturedLog{raw: buf.String()}
-	decoder := json.NewDecoder(bytes.NewReader(buf.Bytes()))
+	// ONE snapshot, read once and then decoded, rather than String() followed by Bytes(): two
+	// reads of a sink a goroutine may still be writing to could disagree, and the raw rendering
+	// quoted in a failure message would then describe different bytes from the entries asserted
+	// on.
+	written := buf.Bytes()
+
+	captured := capturedLog{raw: string(written)}
+	decoder := json.NewDecoder(bytes.NewReader(written))
 	for decoder.More() {
 		entry := map[string]interface{}{}
 		require.NoError(t, decoder.Decode(&entry), "the captured log must be decodable JSON")

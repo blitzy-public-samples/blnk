@@ -1199,30 +1199,71 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 // backwards. idx_event_outbox_claim's partial predicate covers the wider claimable
 // set and idx_event_outbox_partition_key_inflight's covers the narrower blocking one;
 // they must keep matching these two lists respectively.
+// AS MATERIALIZED IS WHAT MAKES THE LIMIT BINDING. It is not a hint and not an
+// optimisation, and removing it reintroduces a defect that is invisible in a small
+// table.
+//
+// Written as `WHERE id IN (SELECT … LIMIT $4 FOR UPDATE SKIP LOCKED)` — which is the
+// shape the fund-lineage claim this file is modelled on still uses — the planner is
+// free to implement the semi-join as a NESTED LOOP that RE-EXECUTES the subquery once
+// per candidate row of the outer scan. EXPLAIN ANALYZE against a six-row backlog with
+// a batch size of two showed exactly that:
+//
+//	Update on blnk.event_outbox (actual rows=6 loops=1)
+//	  -> Nested Loop Semi Join (actual rows=6 loops=1)
+//	       -> Seq Scan on blnk.event_outbox (actual rows=7 loops=1)
+//	       -> Subquery Scan on "ANY_subquery" (actual rows=1 loops=7)
+//	            -> Limit (actual rows=1 loops=7)
+//
+// Seven executions of a LIMIT 2 subquery, each returning a DIFFERENT row because the
+// previous execution had already locked its own, so a claim for two rows leased and
+// stamped six. The bound the caller asked for was silently discarded.
+//
+// That is not a cosmetic overshoot. The relay sizes its batch so one poll's work fits
+// inside one lease and one process's memory; an unbounded claim leases the entire
+// pending backlog under a single claim token, and every row it cannot publish before
+// the lease expires is republished by whoever claims it next. It is also PLAN
+// DEPENDENT, so it appears and disappears with table statistics — which is why it
+// surfaced as an intermittent test failure rather than as an outage.
+//
+// A MATERIALIZED CTE is evaluated exactly once (PostgreSQL 12+; this schema requires
+// 14+), so the candidate set is fixed before the UPDATE runs. The same plan then reads:
+//
+//	CTE candidates -> Limit (actual rows=2 loops=1)
+//	CTE claimed    -> Update on event_outbox (actual rows=2 loops=1)
+//
+// The CTE scan is still re-scanned by the semi-join, but it returns the same two rows
+// every time, so the UPDATE matches exactly those two.
+//
+// Nothing else about the candidate selection changes: the WHERE clause, the literal
+// status list, the ordering and FOR UPDATE SKIP LOCKED are all preserved verbatim, so
+// every partial index this query depends on remains usable and the plan assertions in
+// the tests still hold.
 const claimPendingEventOutboxQuery = `
-		WITH claimed AS (
+		WITH candidates AS MATERIALIZED (
+			SELECT candidate.id FROM blnk.event_outbox candidate
+			WHERE candidate.status IN ('pending', 'processing', 'webhook_pending')
+			  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
+			  AND candidate.attempts < candidate.max_attempts
+			  AND candidate.next_attempt_at <= NOW()
+			  AND NOT EXISTS (
+				SELECT 1 FROM blnk.event_outbox earlier
+				WHERE earlier.partition_key = candidate.partition_key
+				  AND earlier.status IN ('pending', 'processing')
+				  AND (earlier.occurred_at, earlier.id) < (candidate.occurred_at, candidate.id)
+			  )
+			ORDER BY candidate.occurred_at ASC, candidate.id ASC
+			LIMIT $4
+			FOR UPDATE SKIP LOCKED
+		),
+		claimed AS (
 			UPDATE blnk.event_outbox
 			SET status = $1,
 				locked_until = NOW() + $2::interval,
 				claim_token = $3,
 				first_attempted_at = COALESCE(first_attempted_at, NOW()),
 				last_attempted_at = NOW()
-			WHERE id IN (
-				SELECT candidate.id FROM blnk.event_outbox candidate
-				WHERE candidate.status IN ('pending', 'processing', 'webhook_pending')
-				  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
-				  AND candidate.attempts < candidate.max_attempts
-				  AND candidate.next_attempt_at <= NOW()
-				  AND NOT EXISTS (
-					SELECT 1 FROM blnk.event_outbox earlier
-					WHERE earlier.partition_key = candidate.partition_key
-					  AND earlier.status IN ('pending', 'processing')
-					  AND (earlier.occurred_at, earlier.id) < (candidate.occurred_at, candidate.id)
-				  )
-				ORDER BY candidate.occurred_at ASC, candidate.id ASC
-				LIMIT $4
-				FOR UPDATE SKIP LOCKED
-			)
+			WHERE id IN (SELECT id FROM candidates)
 			RETURNING ` + eventOutboxColumns + `
 		)
 		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
@@ -1347,21 +1388,28 @@ func (d Datasource) ClaimPendingEventOutbox(ctx context.Context, batchSize int, 
 // served by idx_event_outbox_failed, whose partial WHERE covers exactly the failed and
 // dead-lettered set. FOR UPDATE SKIP LOCKED is required for the same reason it is on the
 // ordinary claim: several relay instances must be able to repair disjoint subsets.
+// The candidate selection is a MATERIALIZED CTE for the reason given at length on
+// claimPendingEventOutboxQuery: inside an IN subquery the LIMIT can be re-executed per
+// outer row and the batch bound becomes advisory. All four claims in this file share
+// the shape, so all four take the same precaution — fixing one and leaving the others
+// would mean the bound holds for the ordinary claim and not for the repair paths, which
+// are the ones that run when the system is already unhealthy.
 const claimFailedEventOutboxForDeadLetterQuery = `
-		WITH claimed AS (
+		WITH candidates AS MATERIALIZED (
+			SELECT candidate.id FROM blnk.event_outbox candidate
+			WHERE candidate.status = 'failed'
+			  AND candidate.dlt_topic IS NULL
+			  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
+			ORDER BY candidate.occurred_at ASC, candidate.id ASC
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		),
+		claimed AS (
 			UPDATE blnk.event_outbox
 			SET locked_until = NOW() + $1::interval,
 				claim_token = $2,
 				last_attempted_at = NOW()
-			WHERE id IN (
-				SELECT candidate.id FROM blnk.event_outbox candidate
-				WHERE candidate.status = 'failed'
-				  AND candidate.dlt_topic IS NULL
-				  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
-				ORDER BY candidate.occurred_at ASC, candidate.id ASC
-				LIMIT $3
-				FOR UPDATE SKIP LOCKED
-			)
+			WHERE id IN (SELECT id FROM candidates)
 			RETURNING ` + eventOutboxColumns + `
 		)
 		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
@@ -1948,6 +1996,252 @@ func (d Datasource) MarkEventFailed(
 	return outcome, nil
 }
 
+// MarkEventPermanentlyFailed records a publish attempt that failed PERMANENTLY: the row
+// becomes failed on this attempt, whatever budget it had left, and the dead-letter write
+// is owed immediately.
+//
+// # Why a separate transition rather than a flag on MarkEventFailed
+//
+// The two answer different questions and one of them is decided in a different place.
+// MarkEventFailed asks the DATABASE whether the budget is spent, because two relay
+// instances racing on one row must not both conclude they were the last attempt. This one
+// carries a decision the PUBLISHER already made — the broker refused the write for a
+// reason no further attempt can change: an unauthorised principal, a destination outside
+// the topic catalogue, bytes that are not valid JSON, a message over the size limit.
+// Bolting that onto the same method would mean one statement whose exhaustion test is
+// sometimes SQL and sometimes a parameter, which is how the atomicity the other arm
+// depends on gets lost in a later edit.
+//
+// Before this existed the relay had no way to act on that verdict. A topic-authorisation
+// failure spent all five attempts and ~17 seconds of backoff proving the broker meant it,
+// five times per event, at whatever rate events were being produced — and the log said
+// "retryable=false" on each attempt and then "scheduled for another attempt" immediately
+// after, which is a log contradicting itself about the decision it just took.
+//
+// # What it does, and what it deliberately leaves alone
+//
+// attempts is INCREMENTED, so the failure metadata reports the number of attempts that
+// were really made — 1 for a permanent failure on the first attempt, which is the honest
+// figure and is what tells an operator triaging the dead-letter topic that this event
+// never had a chance rather than that it fought for thirty seconds.
+//
+// The row may therefore end up failed with attempts < max_attempts, and that is correct
+// and safe: ClaimPendingEventOutbox filters on status IN ('pending','processing',
+// 'webhook_pending'), so an unspent budget cannot make a failed row claimable again, while
+// ClaimFailedEventOutboxForDeadLetter selects on status, dlt_topic IS NULL and the lease
+// alone — so the dead-letter repair path still reaches it if the write below it fails.
+//
+// The CLAIM TOKEN IS RETAINED, exactly as MarkEventFailed's exhaustion arm retains it and
+// for exactly the same reason: the dead-letter write and the MarkEventDeadLettered that
+// records it are still owed, and only the worker that took this decision may perform them.
+// That is what stops two workers putting two copies of one event on a dead-letter topic.
+//
+// The LEASE is released, which is harmless because failed is outside the claimable set,
+// and next_attempt_at is left as the last retry set it — there is no next attempt to
+// describe, and writing a future instant would tell an operator a retry was still coming.
+//
+// Parameters:
+//   - ctx context.Context: cancels the update.
+//   - id int64: the row's surrogate key.
+//   - claimToken string: the token the claim issued; the update is refused without it.
+//   - errMsg string: the failure reason, stored in last_error.
+//
+// Returns:
+//   - model.EventFailureOutcome: Status failed, the new attempt count, Exhausted true —
+//     because no further attempt will be made whatever the count says — and the token for
+//     the dead-letter hand-off.
+//   - error: the typed claim-lost error when no row matched, or a wrapped driver error.
+func (d Datasource) MarkEventPermanentlyFailed(ctx context.Context, id int64, claimToken, errMsg string) (model.EventFailureOutcome, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkEventPermanentlyFailed")
+	defer span.End()
+	span.SetAttributes(attribute.Int64("event_outbox.id", id))
+
+	if err := requireEventOutboxClaimToken(claimToken, model.EventOutboxStatusFailed); err != nil {
+		span.RecordError(err)
+		return model.EventFailureOutcome{}, err
+	}
+
+	var outcome model.EventFailureOutcome
+	err := d.Conn.QueryRowContext(ctx, `
+		UPDATE blnk.event_outbox
+		SET status = $1,
+			attempts = attempts + 1,
+			last_error = $2,
+			first_attempted_at = COALESCE(first_attempted_at, NOW()),
+			last_attempted_at = NOW(),
+			locked_until = NULL
+		WHERE id = $3 AND claim_token = $4 AND status = $5
+		RETURNING status, attempts
+	`, model.EventOutboxStatusFailed, errMsg, id, claimToken,
+		model.EventOutboxStatusProcessing).Scan(&outcome.Status, &outcome.Attempts)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// The claim was lost, or the row is no longer processing. Reachable as
+			// ErrNoRows rather than as a zero affected count because of RETURNING.
+			lost := eventOutboxClaimLost(id, model.EventOutboxStatusFailed)
+			span.RecordError(lost)
+			return model.EventFailureOutcome{}, lost
+		}
+		span.RecordError(err)
+		return model.EventFailureOutcome{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to mark event outbox entry as permanently failed", "mark_event_permanently_failed", err)
+	}
+
+	// Always true on this path: the caller established that no further attempt is
+	// possible, which is what Exhausted means to the caller — "the dead-letter write is
+	// now owed" — rather than "the counter reached max_attempts".
+	outcome.Exhausted = true
+	outcome.ClaimToken = claimToken
+
+	span.SetAttributes(
+		attribute.String("event_outbox.status", outcome.Status),
+		attribute.Int("event_outbox.attempts", outcome.Attempts),
+		attribute.Bool("event_outbox.exhausted", outcome.Exhausted),
+	)
+	return outcome, nil
+}
+
+// claimEventsOwedDeadLetterQuery claims rows whose retry budget is spent and whose
+// dead-letter write has NOT been recorded, taking a lease and stamping a fresh claim
+// token WITHOUT changing their status.
+//
+// It is a package-level constant so tests can assert that FOR UPDATE SKIP LOCKED, the
+// occurred_at ordering, the untouched status and the dlt_topic IS NULL restriction are
+// all still present.
+//
+// # The set, and why it must be reachable at all
+//
+// MarkEventFailed's exhaustion arm records 'failed' and RETAINS the claim token so the
+// worker that spent the last attempt is the only one permitted to write the event to its
+// `<topic>.dlt` sibling. When that write — or the MarkEventDeadLettered that records it —
+// fails, the row is left failed with no dlt_topic, and at that point it was reachable by
+// nothing at all: the main claim excludes it twice over (wrong status, no budget) and
+// ClaimEventForReplay accepts only dead_lettered. This table is the ONLY copy of that
+// event — the retention purge deliberately refuses to delete a failed row for exactly this
+// reason — so an operator's only recourse was a hand-written UPDATE.
+//
+// 'processing' is included alongside 'failed' because a relay can die between this claim
+// and the dead-letter record; such a row is recovered by the same predicate once its lease
+// expires. dlt_topic IS NULL is what makes the set SELF-CLEARING: recording the
+// dead-letter takes the row out of it permanently.
+//
+// # Why the status is deliberately NOT changed
+//
+// Moving the row to 'processing' would put it back into the main claim's blocking set, so
+// a row whose dead-letter topic was unreachable would stall every later event of its
+// aggregate for as long as the outage lasted. Leaving it failed keeps the trade the main
+// claim's anti-join documents: an event that can never reach the main topic must not hold
+// its key back. MarkEventDeadLettered accepts 'failed' as a prior state precisely so this
+// works.
+//
+// # next_attempt_at is the retry pacing
+//
+// MarkEventFailed's exhaustion arm schedules it exactly as its retry arm does, so a
+// dead-letter topic that is unreachable is retried on the same bounded backoff the publish
+// attempts used rather than once per poll interval per stranded row.
+// MATERIALIZED for the reason given on claimPendingEventOutboxQuery.
+const claimEventsOwedDeadLetterQuery = `
+		WITH candidates AS MATERIALIZED (
+			SELECT candidate.id FROM blnk.event_outbox candidate
+			WHERE candidate.status IN ('failed', 'processing')
+			  AND candidate.dlt_topic IS NULL
+			  AND candidate.attempts >= candidate.max_attempts
+			  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
+			  AND candidate.next_attempt_at <= NOW()
+			ORDER BY candidate.next_attempt_at ASC, candidate.occurred_at ASC, candidate.id ASC
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		),
+		claimed AS (
+			UPDATE blnk.event_outbox
+			SET locked_until = NOW() + $1::interval,
+				claim_token = $2,
+				last_attempted_at = NOW()
+			WHERE id IN (SELECT id FROM candidates)
+			RETURNING ` + eventOutboxColumns + `
+		)
+		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
+	`
+
+// ClaimEventsOwedDeadLetter claims events whose retry budget is spent and whose
+// dead-letter write is still owed, so the hand-off can be retried instead of the event
+// being stranded in the only table that holds it.
+//
+// In a healthy system this returns nothing: the hand-off happens in the same batch as the
+// attempt that exhausted the budget. It matters when the dead-letter topic is unreachable,
+// when the broker rejects the write, or when the relay dies between the write and the
+// record — and in every one of those cases the alternative is an event that exists nowhere
+// else and can be neither published, replayed nor purged.
+//
+// The returned rows carry a FRESH claim token, which is what authorises
+// MarkEventDeadLettered, and their attempt count still shows the budget spent, which is
+// how a caller knows to retry the hand-off rather than the publish.
+//
+// Parameters:
+//   - ctx context.Context: cancels the claim.
+//   - batchSize int: how many rows to claim. Non-positive is rejected, because a zero LIMIT
+//     claims nothing and returns no error, which is indistinguishable from "nothing is owed".
+//   - lockDuration time.Duration: the lease. Non-positive is normalised to
+//     defaultEventClaimLease, since an expired-on-arrival lease lets two relays write the
+//     same event to the dead-letter topic.
+//
+// Returns:
+//   - []model.EventOutbox: the claimed rows, oldest occurrence first.
+//   - error: a validation error for a non-positive batch, or a wrapped driver error.
+func (d Datasource) ClaimEventsOwedDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClaimEventsOwedDeadLetter")
+	defer span.End()
+
+	if batchSize <= 0 {
+		err := apierror.NewAPIError(apierror.ErrBadRequest, "Dead-letter hand-off claim batch size must be greater than zero", nil)
+		span.RecordError(err)
+		return nil, err
+	}
+
+	if lockDuration <= 0 {
+		logrus.WithField("requested_lock_duration", lockDuration.String()).
+			Warnf("Non-positive dead-letter hand-off lock duration; falling back to %s", defaultEventClaimLease)
+		lockDuration = defaultEventClaimLease
+	}
+
+	claimToken := uuid.NewString()
+
+	span.SetAttributes(
+		attribute.Int("event_outbox.batch_size", batchSize),
+		attribute.String("event_outbox.lock_duration", lockDuration.String()),
+	)
+
+	rows, err := d.Conn.QueryContext(ctx, claimEventsOwedDeadLetterQuery,
+		lockDuration.String(), claimToken, batchSize)
+	if err != nil {
+		span.RecordError(err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to claim events owed a dead-letter write", "claim_events_owed_dead_letter", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logrus.Errorf("Error closing rows: %v", closeErr)
+		}
+	}()
+
+	var entries []model.EventOutbox
+	for rows.Next() {
+		entry, scanErr := scanEventOutbox(rows)
+		if scanErr != nil {
+			span.RecordError(scanErr)
+			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event outbox entry", "claim_events_owed_dead_letter", scanErr)
+		}
+		entries = append(entries, entry)
+	}
+
+	if err = rows.Err(); err != nil {
+		span.RecordError(err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event outbox entries", "claim_events_owed_dead_letter", err)
+	}
+
+	span.SetAttributes(attribute.Int("event_outbox.claimed_count", len(entries)))
+	return entries, nil
+}
+
 // MarkEventDeadLettered records that an entry has been written to its dead-letter
 // topic, moving it to the dead_lettered terminal state and storing the dead-letter
 // record — and does so ONLY IF the caller still holds the claim.
@@ -2236,22 +2530,25 @@ func (d Datasource) ReleaseEventReplay(ctx context.Context, id int64, claimToken
 // and the partial index are all DELETED at the webhook sunset, together with
 // webhooks.go and the relay's dual-delivery branch. Nothing else in this file depends
 // on them.
+//
+// MATERIALIZED for the reason given on claimPendingEventOutboxQuery.
 const claimPendingWebhookDeliveriesQuery = `
-		WITH claimed AS (
+		WITH candidates AS MATERIALIZED (
+			SELECT candidate.id FROM blnk.event_outbox candidate
+			WHERE candidate.status IN ('dispatched', 'failed', 'dead_lettered')
+			  AND candidate.webhook_dispatched = FALSE
+			  AND candidate.webhook_attempts < candidate.max_attempts
+			  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
+			  AND candidate.next_attempt_at <= NOW()
+			ORDER BY candidate.occurred_at ASC, candidate.id ASC
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		),
+		claimed AS (
 			UPDATE blnk.event_outbox
 			SET locked_until = NOW() + $1::interval,
 				claim_token = $2
-			WHERE id IN (
-				SELECT candidate.id FROM blnk.event_outbox candidate
-				WHERE candidate.status IN ('dispatched', 'failed', 'dead_lettered')
-				  AND candidate.webhook_dispatched = FALSE
-				  AND candidate.webhook_attempts < candidate.max_attempts
-				  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
-				  AND candidate.next_attempt_at <= NOW()
-				ORDER BY candidate.occurred_at ASC, candidate.id ASC
-				LIMIT $3
-				FOR UPDATE SKIP LOCKED
-			)
+			WHERE id IN (SELECT id FROM candidates)
 			RETURNING ` + eventOutboxColumns + `
 		)
 		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
@@ -2768,6 +3065,20 @@ func (d Datasource) PurgeTerminalEventsBefore(ctx context.Context, cutoff time.T
 		attribute.Int("event_outbox.retention_limit", limit),
 	)
 
+	// This is the one IN-subquery LIMIT in this file that is NOT wrapped in a
+	// MATERIALIZED CTE, and the omission is deliberate rather than an oversight.
+	//
+	// The hazard the four claims guard against — documented at length on
+	// claimPendingEventOutboxQuery — is that the planner may re-execute the subquery
+	// once per outer row, and that each execution then returns a DIFFERENT row because
+	// FOR UPDATE SKIP LOCKED has already taken the previous one. What makes the bound
+	// slip is the locking, not the re-execution.
+	//
+	// There is no locking here. Every execution runs in one statement snapshot over a
+	// candidate set nothing is removing, with the same plan and the same ORDER BY, so
+	// it returns the same rows and the LIMIT holds however many times it is evaluated.
+	// Add FOR UPDATE or FOR UPDATE SKIP LOCKED to this statement and that stops being
+	// true, at which point it needs the CTE too.
 	result, err := d.Conn.ExecContext(ctx, `
 		DELETE FROM blnk.event_outbox
 		WHERE id IN (
@@ -2988,11 +3299,12 @@ func (d Datasource) CountEventOutboxByStatus(ctx context.Context) (map[string]in
 //   - ConfirmedRows counts the subset naming a coordinate. COUNT(kafka_offset) does this
 //     directly: SQL COUNT of an expression ignores NULLs, and the all-or-nothing check
 //     constraint means a non-NULL offset implies a complete coordinate.
-//   - DistinctRecords counts the DISTINCT coordinates. It equals ConfirmedRows unless two rows
-//     name the same record, which the partial unique index forbids — so a discrepancy means
-//     that index is absent, and the audit reports the fact rather than assuming the schema is
-//     intact. Two rows sharing one record's corroboration is the same double-counting the whole
-//     mechanism exists to remove.
+//   - DistinctRecords counts the DISTINCT coordinates, FILTERED to the rows that name one. It
+//     equals ConfirmedRows unless two rows name the same record, which the partial unique index
+//     forbids — so a discrepancy means that index is absent, and the audit reports the fact
+//     rather than assuming the schema is intact. Two rows sharing one record's corroboration is
+//     the same double-counting the whole mechanism exists to remove. The filter is what makes
+//     that equality true at all; see the query for why.
 //
 // # Why the webhook_pending row is included
 //
@@ -3013,11 +3325,27 @@ func (d Datasource) AuditTerminalEventRecords(ctx context.Context) (model.EventO
 
 	audit := model.EventOutboxAudit{MeasuredAt: time.Now().UTC()}
 
+	// THE FILTER ON THE DISTINCT COUNT IS REQUIRED, not defensive.
+	//
+	// COUNT(DISTINCT expr) ignores a NULL expr, but a ROW CONSTRUCTOR whose every field is NULL
+	// is not itself NULL in PostgreSQL — so without the filter every row that completed its
+	// Kafka leg WITHOUT a coordinate collapsed into one extra "record", (NULL, NULL, NULL), and
+	// was counted. A publication the library reported no coordinate for is precisely a row that
+	// names NO record, which is what ConfirmedRows already excludes it from.
+	//
+	// The consequence was not cosmetic. DistinctRecords could EXCEED ConfirmedRows for a reason
+	// that has nothing to do with duplication, which breaks both readers of this audit:
+	// FullyConfirmed requires the two to be equal and would report an inconclusive verdict on a
+	// perfectly healthy outbox, and ReconcileAgainstOutbox derives duplication from their
+	// difference and had to clamp a negative it should never have been able to see. The
+	// documented contract — DistinctRecords equals ConfirmedRows unless two rows name the same
+	// record — is only true with the filter in place.
 	err := d.Conn.QueryRowContext(ctx, `
 		SELECT
-			COUNT(*)                                                   AS published_rows,
-			COUNT(kafka_offset)                                        AS confirmed_rows,
-			COUNT(DISTINCT (kafka_topic, kafka_partition, kafka_offset)) AS distinct_records
+			COUNT(*)            AS published_rows,
+			COUNT(kafka_offset) AS confirmed_rows,
+			COUNT(DISTINCT (kafka_topic, kafka_partition, kafka_offset))
+				FILTER (WHERE kafka_offset IS NOT NULL) AS distinct_records
 		FROM blnk.event_outbox
 		WHERE kafka_dispatched_at IS NOT NULL OR status = $1
 	`, model.EventOutboxStatusDeadLettered).Scan(

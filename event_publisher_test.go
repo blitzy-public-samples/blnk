@@ -2603,15 +2603,19 @@ func TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt(t *testing.T)
 		})
 
 		require.Error(t, err)
-		assert.Equal(t, model.PublishStatusDeadLettered, result.Status,
-			"the attempt that spent the budget reports the terminal state the event is bound for, not "+
-				"retrying: nothing further will be tried and reporting otherwise hides a stuck event "+
-				"among the busy ones. Three outcomes are the whole observable vocabulary, so a "+
-				"terminal attempt names the destination rather than adding a fourth value")
+		assert.Equal(t, model.PublishStatusFailed, result.Status,
+			"the attempt that spent the budget reports failed, not retrying: nothing further will "+
+				"be tried and reporting otherwise hides a stuck event among the busy ones. It is "+
+				"NOT dead_lettered either — that value means an acknowledged write to a `.dlt` "+
+				"sibling, which this attempt did not perform and may never lead to")
 		assert.True(t, result.Transient,
 			"the failure still LOOKED recoverable, which is a different question from whether "+
 				"anything more will be attempted")
 		assert.False(t, result.Retryable)
+		assert.False(t, result.PermanentFailure(),
+			"and it is not PERMANENT: the budget ran out, which the database decides inside "+
+				"MarkEventFailed so that two instances cannot both conclude they were last. The "+
+				"relay must reach that decision through the ordinary path, not short-circuit it")
 		assert.Equal(t, 5, result.MaxAttempts)
 	})
 
@@ -2628,11 +2632,19 @@ func TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt(t *testing.T)
 		})
 
 		require.Error(t, err)
-		assert.Equal(t, model.PublishStatusDeadLettered, result.Status)
+		assert.Equal(t, model.PublishStatusFailed, result.Status,
+			"a permanent failure is an attempt outcome of failed. dead_lettered is reserved for an "+
+				"acknowledged write to a `.dlt` sibling, so reporting it here made the attempts "+
+				"counter assert one dead letter per attempt for a single real one — and five for "+
+				"events that produced none at all")
 		assert.False(t, result.Transient,
 			"an unauthorised principal is not a condition another attempt can change")
 		assert.False(t, result.Retryable,
 			"so the whole budget must not be spent establishing what is already known")
+		assert.True(t, result.PermanentFailure(),
+			"and the relay reads exactly this to act on it: the verdict used to be computed, "+
+				"logged and ignored, so the log said retryable=false and then announced another "+
+				"attempt on the next line")
 		assert.False(t, IsTransientPublishError(err))
 	})
 }
@@ -3098,4 +3110,119 @@ func TestNewWriter_InstallsTheCompletionCallback(t *testing.T) {
 	record, confirmed := acknowledgement.coordinate()
 	require.True(t, confirmed)
 	assert.Equal(t, "blnk.transactions/5@77", record.String())
+}
+
+// TestPublishToTopic_ClassifiesTheTwoWriterFailuresDifferently pins a distinction that only
+// became load-bearing once the relay started ACTING on the classification.
+//
+// Both failures come from the same line — writerFor could not hand back a writer — and both are
+// permanent for the ATTEMPT. They are opposite for the EVENT:
+//
+//   - A CLOSED PUBLISHER is the process shutting down. The next attempt, in this process after a
+//     restart or in another replica right now, has a live transport and publishes the event
+//     normally. Classifying it permanent was harmless while the relay retried everything within
+//     budget; now that the relay dead-letters a permanent failure immediately, it would mean a
+//     shutdown landing mid-batch dead-lettered perfectly deliverable events — the opposite of
+//     what a graceful shutdown is for.
+//   - A REFUSED TOPIC is permanent for the event itself. The destination is not one Blnk may
+//     write to, so no retry and no broker state makes the write legitimate, and the event
+//     belongs in the dead-letter inventory now rather than in five attempts' time.
+func TestPublishToTopic_ClassifiesTheTwoWriterFailuresDifferently(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	event := publisherEvent(model.EventTypeTransactionApplied, "txn_writer_failure", publisherPayload)
+
+	t.Run("a closed publisher is recoverable, so the event is not abandoned", func(t *testing.T) {
+		publisher := publisherWithFakeTransport(t, newPublisherFakeTransport())
+		require.NoError(t, publisher.Close())
+
+		result, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+			Event:       event,
+			Topic:       TopicForEvent(event.EventType),
+			Key:         publisherLedgerID,
+			Attempt:     1,
+			MaxAttempts: 5,
+		})
+
+		require.ErrorIs(t, err, ErrEventPublisherClosed)
+		assert.True(t, result.Transient,
+			"a shutdown says nothing about the event: another attempt in a live process publishes it")
+		assert.Equal(t, model.PublishStatusRetrying, result.Status)
+		assert.True(t, result.Retryable, "and the budget is untouched, so a retry is available")
+		assert.False(t, result.PermanentFailure(),
+			"the relay must NOT take this row to its terminal state: a shutdown mid-batch would "+
+				"otherwise dead-letter every event the batch was still holding")
+		assert.True(t, IsBrokerUnavailableError(err),
+			"and the API boundary already answered 503 for this error, so the two now agree")
+	})
+
+	t.Run("a refused topic is permanent, so the event stops here", func(t *testing.T) {
+		publisher := publisherWithFakeTransport(t, newPublisherFakeTransport())
+
+		result, err := publisher.PublishToTopic(context.Background(), PublishRequest{
+			Event:       event,
+			Topic:       "attacker.transactions",
+			Key:         publisherLedgerID,
+			Attempt:     1,
+			MaxAttempts: 5,
+		})
+
+		require.ErrorIs(t, err, ErrTopicNotOwned)
+		assert.False(t, result.Transient,
+			"a destination outside Blnk's namespace is not a condition another attempt can change")
+		assert.Equal(t, model.PublishStatusFailed, result.Status)
+		assert.False(t, result.Retryable)
+		assert.True(t, result.PermanentFailure(),
+			"so the relay takes the row straight to its terminal state on this attempt")
+	})
+}
+
+// TestPublishResult_PermanentFailureIsAffirmative covers the predicate the relay's retry
+// decision reads, and the case it exists to be safe about.
+//
+// `!Retryable` and `!Transient` are both true on a result NOBODY POPULATED. The relay borrows
+// whichever publisher the process built, so a bare error with an empty result has to read as
+// "not permanent" — otherwise the first failure of any such implementation would dead-letter
+// an event that a retry would have delivered. The predicate therefore requires all three
+// facts, and the zero value is the row of the table that matters most.
+func TestPublishResult_PermanentFailureIsAffirmative(t *testing.T) {
+	cause := errors.New("publisher test: refused")
+
+	for name, testCase := range map[string]struct {
+		result PublishResult
+		want   bool
+	}{
+		"a classified permanent failure": {
+			result: PublishResult{Status: model.PublishStatusFailed, Transient: false, Err: cause},
+			want:   true,
+		},
+		"a transient failure that spent the budget": {
+			result: PublishResult{Status: model.PublishStatusFailed, Transient: true, Err: cause},
+			want:   false,
+		},
+		"a retryable failure": {
+			result: PublishResult{Status: model.PublishStatusRetrying, Transient: true, Err: cause},
+			want:   false,
+		},
+		"a success": {
+			result: PublishResult{Status: model.PublishStatusDispatched},
+			want:   false,
+		},
+		"the zero value, which is what an unclassifying publisher produces": {
+			result: PublishResult{},
+			want:   false,
+		},
+		"a bare error with no status": {
+			result: PublishResult{Err: cause},
+			want:   false,
+		},
+		"a dead-letter write's own result": {
+			result: PublishResult{Status: model.PublishStatusDeadLettered, Err: cause},
+			want:   false,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, testCase.want, testCase.result.PermanentFailure())
+		})
+	}
 }

@@ -226,7 +226,12 @@
 #                                                               password; off by default so
 #                                                               re-runs do not break the
 #                                                               consumer already using it
-#   KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX  blnk-sample-subscriber
+#   KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX  (derived)             leave it unset: the namespace
+#                                                               follows the principal. A
+#                                                               supplied value is only
+#                                                               cross-checked against it,
+#                                                               with or without the trailing
+#                                                               '.' delimiter
 #   KAFKA_SAMPLE_SUBSCRIBER_TOPICS        (the grantable category topics)
 #   KAFKA_SKIP_SAMPLE_SUBSCRIBER          (unset)               truthy skips the principal
 #                                                               and its ACLs entirely
@@ -1856,17 +1861,45 @@ require_valid_subscriber() {
     # side; the two now express the same rule.
     SUBSCRIBER_GROUP_PREFIX="${SUBSCRIBER_USER}${SUBSCRIBER_GROUP_TERMINATOR}"
 
-    if [[ -n "$(trim "$KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX")" ]] &&
-        [[ "$(trim "$KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX")" != "$SUBSCRIBER_GROUP_PREFIX" ]]; then
-        die "KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX is set to '$(trim "$KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX")', which is not the namespace derived from the principal." \
-            "Derived: ${SUBSCRIBER_GROUP_PREFIX}" \
+    # A SUPPLIED VALUE IS A CROSS-CHECK, NOT A CHOICE - AND THE TERMINATOR IS OPTIONAL IN IT.
+    #
+    # The variable is kept only so that an operator who believes they are choosing the
+    # namespace is told they are not, instead of watching their value be ignored. So the
+    # comparison has to answer one question - "does this name the same principal's
+    # namespace?" - and nothing else.
+    #
+    # It used to compare for exact equality against the TERMINATED form, which made the
+    # trailing '.' a required part of a value no shipped surface carried: .env.example, both
+    # compose files' kafka-init fallbacks, this script's own usage output and its comment
+    # table all named the bare principal. Every default local bring-up therefore died here,
+    # kafka-init restarted on a loop, and because server and worker gate on that service
+    # completing, the whole stack stayed at "created" with zero topics on a healthy broker
+    # (auto-creation is off, so the relay would have had nothing to publish to either). The
+    # remedy the message offered - "unset the variable" - could not work: Compose re-injected
+    # the same rejected literal through its own ${VAR:-default}.
+    #
+    # Stripping ONE optional trailing terminator before comparing accepts both spellings of
+    # the derived namespace and nothing else. The security property is untouched: the value
+    # is discarded either way, SUBSCRIBER_GROUP_PREFIX stays derived, and every other
+    # value - another principal's namespace, a broadening prefix like "blnk" - still stops
+    # the run here. "blnk-sample-subscriber.." is rejected too, because only one terminator
+    # is removed and the remainder must equal the principal exactly.
+    local supplied_group_prefix
+    supplied_group_prefix="$(trim "$KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX")"
+
+    if [[ -n "$supplied_group_prefix" ]] &&
+        [[ "${supplied_group_prefix%"$SUBSCRIBER_GROUP_TERMINATOR"}" != "$SUBSCRIBER_USER" ]]; then
+        die "KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX is set to '${supplied_group_prefix}', which is not the namespace derived from the principal." \
+            "Derived: ${SUBSCRIBER_GROUP_PREFIX} (the principal '${SUBSCRIBER_USER}' is also accepted," \
+            "with or without the trailing '${SUBSCRIBER_GROUP_TERMINATOR}')" \
             "The consumer-group namespace is no longer chosen. It is granted as a PREFIXED" \
             "pattern, so choosing it means choosing how far the grant reaches - a value" \
             "naming another principal's namespace would let this one join their groups and" \
             "take their partition assignments. api/model/event.go removed the same field" \
             "from the real API for the same reason." \
-            "Fix: unset the variable. If you need a different namespace, rename the" \
-            "principal with KAFKA_SAMPLE_SUBSCRIBER_USER and the namespace follows it." \
+            "Fix: unset the variable, or leave it empty - the namespace follows the" \
+            "principal. If you need a different namespace, rename the principal with" \
+            "KAFKA_SAMPLE_SUBSCRIBER_USER and the namespace follows it." \
             "Nothing has been provisioned."
     fi
 
@@ -1943,8 +1976,9 @@ require_valid_subscriber() {
             "COMMITS OFFSETS into it, so the sample principal would advance a real" \
             "subscriber's position past events that subscriber never received - silent," \
             "unrecoverable data loss for them, with nothing in either system to indicate it." \
-            "Fix: unset KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX to accept the default of" \
-            "blnk-sample-subscriber, or choose a prefix that names this principal alone." \
+            "Fix: leave KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX empty so the namespace is" \
+            "derived from the principal, or rename the principal so its derived namespace" \
+            "covers it alone." \
             "Nothing has been provisioned."
     fi
 
@@ -3248,32 +3282,82 @@ write_secret_file() {
 # mints - the sample subscriber and the producer - preserve an existing credential through
 # it.
 #
+# IT IS A PREDICATE, AND IT HAS TO BE ONE, because both call sites use it as the condition
+# of an `elif`. It printed its answer to STDOUT as "exists" / "absent" / "unknown" and
+# returned 0 unconditionally, so every caller read "yes" whatever the broker said, and the
+# word itself was emitted into the operator's console mid-sentence. The consequences differed
+# by caller and both were bad: the producer branch took its `preserved` short-circuit and the
+# run reported SUCCESS with no credential on the broker at all - a green bring-up followed by
+# a SASL failure the server and worker could not explain - while the subscriber branch fell
+# through to the credential upsert with an EMPTY password, which the broker refuses, failing
+# a run that had nothing wrong with it. It also made two of the subscriber branches
+# unreachable, so the documented one-time secret-file delivery never happened on a first run.
+#
+# So: no stdout, one return code, and ONE round-trip to the broker (the original issued the
+# describe twice and discarded the first answer). `status` is declared local, because as a
+# global it leaked this probe's exit status into every later caller of it.
+#
 # Returns 0 when the credential exists, 1 when it does not or cannot be determined.
 scram_credential_exists() {
-    local user="$1" output
-    output="$(kafka_configs --describe --entity-type users --entity-name "$user" 2>/dev/null || true)"
+    local user="$1" output status
 
-    # Not discarded: stderr is folded in so a failure can be reported to the operator with the
-    # broker's own words, redacted, instead of as a bare "unknown".
+    # stderr is folded into the capture rather than discarded, so a probe that failed for an
+    # administrative reason can be reported to the operator in the broker's own words, with
+    # credential-bearing lines removed, instead of vanishing into a bare "no".
     output="$(kafka_configs --describe --entity-type users --entity-name "$user" 2>&1)" && status=0 || status=$?
 
     if ((status != 0)); then
         printf '%s\n' "$output" | redact >&2
-        printf '%s' "unknown"
+        warn "could not determine whether '${user}' already holds a ${SCRAM_MECHANISM} credential" \
+            "The broker's own answer is above, with credential-bearing lines removed. This run" \
+            "treats the credential as ABSENT, which is the safe direction: it provisions one if" \
+            "it has a password to use and skips the principal if it does not, rather than" \
+            "reporting a credential it never saw."
 
-        return 0
+        return 1
     fi
 
     # Matching on the MECHANISM rather than on the presence of any output is what keeps a
     # principal holding only a SHA-256 credential from being mistaken for one that can
     # authenticate here: Blnk standardises on SHA-512 and the broker needs exactly that one.
     if [[ "$output" == *"${SCRAM_MECHANISM}"* ]]; then
-        printf '%s' "exists"
-    else
-        printf '%s' "absent"
+        return 0
     fi
 
-    return 0
+    return 1
+}
+
+# Report whether the broker knows this principal at all.
+#
+# A DELIBERATELY WEAKER QUESTION than scram_credential_exists, and the difference is the
+# point. That one asks "can this principal authenticate the way Blnk needs?"; this one asks
+# "does the broker hold any configuration for this name?" - a SHA-256-only credential, a
+# quota, or a SHA-512 credential. Both matter, in different places: the credential probe
+# decides whether a password may be preserved, and this decides whether a bindings-only
+# repair is worth making for a principal that cannot currently authenticate.
+#
+# "kafka-configs --describe --entity-type users --entity-name <user>" prints nothing at all
+# for a name the broker has never heard of, so a non-blank answer is the test. A failed
+# describe is reported as "not known", which keeps the caller from granting bindings on the
+# strength of a probe that told it nothing; the credential probe has already surfaced the
+# broker's own words by the time this runs, so it stays quiet rather than repeating them.
+#
+# Returns 0 when the broker holds configuration for the principal, 1 when it does not or
+# cannot be determined.
+principal_is_known() {
+    local user="$1" output status
+
+    output="$(kafka_configs --describe --entity-type users --entity-name "$user" 2>/dev/null)" && status=0 || status=$?
+
+    if ((status != 0)); then
+        return 1
+    fi
+
+    if [[ -n "$(trim "$output")" ]]; then
+        return 0
+    fi
+
+    return 1
 }
 
 # Grant the producer exactly Write and Describe, on every topic Blnk publishes to.
@@ -3475,10 +3559,19 @@ ensure_sample_subscriber() {
             "Real subscriber credentials are issued by" \
             "POST /subscribers/{id}/kafka-credentials and never by this script."
 
-        # The ACLs are still asserted for a principal that already exists. They are
-        # idempotent and carry no secret, so a run that provisions no credential still
-        # repairs a drifted grant - which is exactly the run an operator makes to do that.
-        if subscriber_credential_exists "$user"; then
+        # The ACLs are still asserted for a principal that already EXISTS on the broker, and
+        # existence here means "the broker knows this user", not "it can authenticate with
+        # SCRAM-SHA-512" - by construction it cannot, or this branch would not have been
+        # reached. That is why it asks principal_is_known rather than the SHA-512 probe: a
+        # principal holding only a SHA-256 credential, or one whose credential was deleted
+        # while its grant survived, is exactly the case where a bindings-only repair is worth
+        # making. The bindings are idempotent and carry no secret.
+        #
+        # (This called an undefined function, which under `set -u`/`set -e` in an `if`
+        # condition evaluated as false after printing "command not found" - so the repair
+        # never happened and the run said nothing about it. It was unreachable at the time,
+        # because the credential probe above always answered "yes".)
+        if principal_is_known "$user"; then
             grant_subscriber_acls "$user" "$group_prefix"
         fi
 
@@ -3770,11 +3863,16 @@ ensure_producer_principal() {
         --entity-type users --entity-name "$user" 2>&1)"; then
         printf '%s\n' "$output" | redact >&2
         die "could not provision the SCRAM credential for '${user}'." \
-            "The broker's own output is above, with credential-bearing lines removed. The two" \
-            "usual causes:" \
+            "The broker's own output is above, with credential-bearing lines removed. The" \
+            "three usual causes:" \
             "  1. $(admin_identity_label) lacks Alter authority on the cluster - add the" \
             "     principal to the broker's super.users;" \
-            "  2. the broker does not have ${SCRAM_MECHANISM} among its enabled mechanisms."
+            "  2. the broker does not have ${SCRAM_MECHANISM} among its enabled mechanisms." \
+            "     Kafka implements SCRAM-SHA-256 and SCRAM-SHA-512 only, and Blnk" \
+            "     standardises on SHA-512 so the broker needs exactly one enabled;" \
+            "  3. the CLI is older than Kafka 3.5 and has no '--add-config-file'. That flag" \
+            "     is how the password is kept out of the process table, and there is no" \
+            "     older equivalent - upgrade KAFKA_IMAGE rather than passing it inline."
     fi
 
     # Removed the moment it has been consumed, matching the subscriber leg: the EXIT trap is the
@@ -4191,7 +4289,7 @@ usage() {
     printf '  %-39s %s\n' "KAFKA_SAMPLE_SUBSCRIBER_USER" "blnk-sample-subscriber"
     printf '  %-39s %s\n' "KAFKA_SAMPLE_SUBSCRIBER_SECRET" "(unset) generated on first run"
     printf '  %-39s %s\n' "KAFKA_ROTATE_SAMPLE_SUBSCRIBER_SECRET" "(unset) truthy replaces an existing password"
-    printf '  %-39s %s\n' "KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX" "blnk-sample-subscriber"
+    printf '  %-39s %s\n' "KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX" "(derived) leave unset; only cross-checked"
     printf '  %-39s %s\n' "KAFKA_SAMPLE_SUBSCRIBER_TOPICS" "(the grantable category topics)"
     printf '  %-39s %s\n' "KAFKA_SKIP_SAMPLE_SUBSCRIBER" "(unset) truthy skips the principal and ACLs"
     printf '  %-39s %s\n' "KAFKA_PRODUCER_USER" "blnk-producer (what Blnk publishes as)"

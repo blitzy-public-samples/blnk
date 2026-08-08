@@ -138,6 +138,21 @@ const (
 	uniqueViolationPostgresCode = "unique_violation"
 )
 
+// The key-scope CHECK constraint (sql/1781248920.sql) and the driver's name for a
+// CHECK failure.
+//
+// The constraint forbids a row recording a partition key prefix while it also holds a
+// credential reference, because Kafka cannot enforce a key scope and such a row states
+// a boundary that does not exist. EventSubscriberService refuses that combination from
+// both directions, so reaching the constraint means something bypassed the service — a
+// data migration, a hand-written UPDATE, a future code path. It is named here for the
+// same reason the two unique indexes are: so the classifier answers with the meaning
+// the schema intends instead of reporting a server fault for a caller error.
+const (
+	keyScopeCheckConstraint    = "event_subscribers_key_scope_chk"
+	checkViolationPostgresCode = "check_violation"
+)
+
 // eventSubscriberScanner is the minimum surface scanEventSubscriber needs,
 // satisfied by both *sql.Row and *sql.Rows. It lets the single-row read and the
 // listing share one decoder instead of maintaining two scan orders.
@@ -629,6 +644,27 @@ func classifySubscriberWriteError(err error, internalMessage string) error {
 			return loggedDatabaseError(apierror.ErrConflict, "Subscriber already exists", "classify_subscriber_write_error", err)
 		}
 	}
+
+	// The key-scope CHECK is the schema's half of SEC-05, and a write that trips it is a
+	// caller problem with a named remedy rather than a server fault. Answering 500 would
+	// tell whoever reads it to look for a defect in Blnk, when what happened is that the
+	// row would have recorded a key-scoped authorization alongside a live credential —
+	// the state the service refuses and the database now cannot hold. The typed code
+	// carries that remedy; only THIS constraint is mapped, so any other CHECK failure
+	// stays an internal error rather than being mislabelled as an isolation refusal.
+	if errors.As(err, &pqErr) &&
+		pqErr.Code.Name() == checkViolationPostgresCode &&
+		pqErr.Constraint == keyScopeCheckConstraint {
+		return loggedDatabaseError(
+			apierror.ErrSubscriberIsolationUnenforceable,
+			"A subscriber cannot record a partition key prefix while it holds a Kafka credential, "+
+				"because Kafka cannot enforce a key scope and the row would describe a narrower "+
+				"boundary than the credential has",
+			"classify_subscriber_write_error",
+			err,
+		)
+	}
+
 	return loggedDatabaseError(apierror.ErrInternalServer, internalMessage, "classify_subscriber_write_error", err)
 }
 
@@ -1318,6 +1354,77 @@ func (d Datasource) PurgeMigratedSubscriberWebhookURLs(
 	span.SetAttributes(attribute.Int64("subscriber.webhook_urls_purged", purged))
 
 	return purged, nil
+}
+
+// CountSubscriberRevocationsPending reports how many subscribers still owe a broker-side
+// credential revocation, and when the oldest of those obligations was recorded.
+//
+// # Why this exists
+//
+// The two gauges that describe outstanding revocation — and the alert rule that fires on the
+// age of the oldest one — had nothing recording them. They were declared, initialised and
+// never written, so the rule's health read as fine and its state as permanently inactive:
+// the exact failure mode where an alert that cannot fire is indistinguishable from a system
+// with nothing wrong. This is the read that gives them a value.
+//
+// # An AGGREGATE and not a scan
+//
+// Two scalars from one statement, for the same reason the outbox backlog is a COUNT rather
+// than a walk of the rows: the cost of observing a backlog must not grow with the backlog.
+// Enumerating the registry every fifteen seconds to count a column would also duplicate the
+// consumer-lag sweep's paging, its cardinality budget and its skip rules — a second thing to
+// keep correct, for a figure that needs none of them.
+//
+// No index is required and none is added. blnk.event_subscribers is documented as small and
+// read-rarely; the aggregate touches a few hundred rows at most and returns two values, so a
+// partial index would cost a migration to save nothing measurable.
+//
+// # Zero is a reading, not an absence
+//
+// COUNT returns 0 and MIN returns NULL when nothing is outstanding, which is the healthy
+// steady state and must be reported as such — the caller publishes an explicit zero so that
+// "nothing owed" is distinguishable from "the collector stopped". The NULL is scanned through
+// a nullable time so it becomes the zero instant rather than a scan error.
+//
+// Parameters:
+//   - ctx context.Context: cancels the read.
+//
+// Returns:
+//   - model.SubscriberRevocationBacklog: the count and the oldest instant. The instant is the
+//     zero value when the count is zero.
+//   - error: a logged internal error when the read failed. The caller must publish nothing in
+//     that case rather than publishing a zero, which would read as "all settled".
+func (d Datasource) CountSubscriberRevocationsPending(
+	ctx context.Context,
+) (model.SubscriberRevocationBacklog, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CountSubscriberRevocationsPending")
+	defer span.End()
+
+	var (
+		backlog model.SubscriberRevocationBacklog
+		oldest  sql.NullTime
+	)
+
+	err := d.Conn.QueryRowContext(ctx, `
+		SELECT COUNT(*), MIN(revocation_pending_at)
+		FROM blnk.event_subscribers
+		WHERE revocation_pending_at IS NOT NULL
+	`).Scan(&backlog.Pending, &oldest)
+	if err != nil {
+		span.RecordError(err)
+
+		return model.SubscriberRevocationBacklog{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to count outstanding subscriber revocations",
+			"count_subscriber_revocations_pending", err)
+	}
+
+	if oldest.Valid {
+		backlog.OldestPendingAt = oldest.Time.UTC()
+	}
+
+	span.SetAttributes(attribute.Int64("subscriber.revocations_pending", backlog.Pending))
+
+	return backlog, nil
 }
 
 // RecordSubscriberCredentialIfUnchanged persists an issuance ONLY IF the subscriber still

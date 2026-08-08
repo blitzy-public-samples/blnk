@@ -313,6 +313,13 @@ type eventRelayStore interface {
 	// whether the legacy budget is now spent. Deleted at the sunset with the leg itself.
 	MarkEventLegacyWebhookAttempted(ctx context.Context, id int64, claimToken string, retryAfter time.Duration) (model.EventWebhookOutcome, error)
 
+	// MarkEventPermanentlyFailed records an attempt whose failure was PERMANENT, taking the
+	// row to failed on this attempt whatever budget remained and retaining the claim token
+	// for the dead-letter hand-off. It is what lets the relay act on the publisher's
+	// verdict instead of spending four more attempts on a condition none of them can
+	// change.
+	MarkEventPermanentlyFailed(ctx context.Context, id int64, claimToken, errMsg string) (model.EventFailureOutcome, error)
+
 	// MarkWebhookDispatched records the legacy leg of the dual-delivery window. It is
 	// conditional on the claim token, so it must run BEFORE MarkEventDispatched clears it.
 	// This method disappears at the webhook sunset along with the branch that calls it.
@@ -1931,11 +1938,28 @@ func (p *EventRelayProcessor) rowMaxAttempts(row model.EventOutbox) int {
 }
 
 // recordFailedAttempt records one failed publish attempt, schedules the retry, and hands off
-// to the dead-letter path when the budget is spent.
+// to the dead-letter path when nothing further will be tried.
 //
-// The retry-versus-exhaustion decision is NOT taken here: MarkEventFailed takes it inside its
-// UPDATE and reports it back, which is what stops two instances racing on one row from both
-// concluding they were the last attempt and putting two copies on the dead-letter topic.
+// # TWO GATES, in this order, answering different questions
+//
+// The FIRST gate is the publisher's verdict, read through PublishResult.PermanentFailure. It
+// answers "can any further attempt succeed?", which only the code that saw the broker's answer
+// can know: an unauthorised principal, a destination outside the topic catalogue, bytes that
+// will never parse, a message over the size limit. None of those change with time, so the row
+// goes straight to its terminal state and the event appears in the dead-letter inventory now
+// rather than after the whole backoff schedule. This gate used to be MISSING: the verdict was
+// computed, logged and then ignored, so a permanent failure cost five broker round trips and
+// ~17 seconds per event while the log said "retryable=false" on one line and "scheduled for
+// another attempt" on the next.
+//
+// The SECOND gate is MarkEventFailed's in-SQL budget check, unchanged and still authoritative
+// for a retryable failure: the retry-versus-exhaustion decision is taken inside its UPDATE,
+// which is what stops two instances racing on one row from both concluding they were the last
+// attempt and putting two copies on the dead-letter topic.
+//
+// The order is the point. The first gate is about the event's PROSPECTS and the second about
+// its BUDGET, and a failure that can never succeed must not have to exhaust a budget before it
+// is recognised as one.
 //
 // A row whose claim was lost is abandoned rather than retried — another instance owns it now —
 // and a row whose bookkeeping merely failed keeps its lease and returns to the claimable set
@@ -1946,8 +1970,10 @@ func (p *EventRelayProcessor) rowMaxAttempts(row model.EventOutbox) int {
 //     on a detached context.
 //   - row model.EventOutbox: the claimed row.
 //   - attempt int: the 1-based attempt that just failed.
-//   - result PublishResult: the publisher's report of the attempt, read for its
-//     permanent-versus-transient verdict.
+//   - result PublishResult: the attempt's observability record, read ONLY for its permanence
+//     verdict. A zero value — which is what a publisher that classifies nothing produces —
+//     falls through to the budgeted path, and that conservative default is deliberate: the
+//     publisher is an interface seam, so "no verdict" must never be read as "give up".
 //   - cause error: the publish failure.
 func (p *EventRelayProcessor) recordFailedAttempt(
 	ctx context.Context,
@@ -1956,6 +1982,12 @@ func (p *EventRelayProcessor) recordFailedAttempt(
 	result PublishResult,
 	cause error,
 ) {
+	if result.PermanentFailure() {
+		p.recordPermanentFailure(ctx, row, attempt, cause)
+
+		return
+	}
+
 	retryAfter := p.retry.backoffFor(attempt)
 	reason := relayFailureReason(cause)
 	terminal := publishFailureIsTerminal(result, cause)
@@ -2014,26 +2046,147 @@ func (p *EventRelayProcessor) recordFailedAttempt(
 	row.Attempts = outcome.Attempts
 	row.Status = outcome.Status
 
-	p.deadLetter(ctx, row, attempt, cause)
+	p.deadLetter(ctx, row, attempt, cause, relayTerminalBudgetSpent)
 }
 
-// deadLetter hands an exhausted row to the dead-letter writer.
+// recordPermanentFailure records an attempt whose failure can never succeed and hands the row
+// to the dead-letter writer on that attempt.
 //
-// Nothing about dead-lettering is implemented here — destination, failure metadata, message
-// composition and the terminal transition all belong to event_dlt.go. A failed hand-off
-// leaves the row in the failed state deliberately, so the event stays visible to an operator
-// instead of being reported as safely dead-lettered when its message never left the process.
-func (p *EventRelayProcessor) deadLetter(
+// It is the first of recordFailedAttempt's two gates. The transition is a different one from
+// the retryable path's — MarkEventPermanentlyFailed rather than MarkEventFailed — because the
+// decision was taken by the publisher against the broker's answer rather than by the database
+// against a counter. Its documentation in database/event_outbox.go covers why the row may end
+// failed with budget to spare and why that is safe.
+//
+// The log line names the reason the event stopped, because "permanent" and "out of attempts"
+// send an operator to different places: the first to an ACL, a topic that does not exist or a
+// message that is too large, the second to a broker that was unreachable for the whole
+// schedule. It reports what the row's own history now says — the attempt number and the
+// attempt count the database recorded — so the line and the row cannot disagree.
+//
+// Parameters:
+//   - ctx context.Context: used for the dead-letter publish; the transition runs detached.
+//   - row model.EventOutbox: the claimed row.
+//   - attempt int: the 1-based attempt that just failed permanently.
+//   - cause error: the publish failure, recorded in last_error and in the failure metadata.
+func (p *EventRelayProcessor) recordPermanentFailure(
 	ctx context.Context,
 	row model.EventOutbox,
 	attempt int,
 	cause error,
 ) {
+	reason := relayFailureReason(cause)
+
+	bookkeeping, cancel := detachedBookkeepingContext(ctx)
+	defer cancel()
+
+	outcome, err := p.store.MarkEventPermanentlyFailed(bookkeeping, row.ID, row.ClaimToken, reason)
+	if err != nil {
+		logrus.WithFields(p.rowFields(row, attempt)).WithError(err).Error(
+			"event relay: recording a permanently failed publish attempt failed; the row keeps its " +
+				"lease and becomes claimable again when it expires",
+		)
+
+		return
+	}
+
+	logrus.WithFields(p.rowFields(row, attempt)).WithFields(logrus.Fields{
+		"attempts":   outcome.Attempts,
+		"error":      reason,
+		"row_status": outcome.Status,
+	}).Warn(
+		"event relay: publish failed permanently, so the remaining retry budget is not spent and " +
+			"the event goes straight to its dead-letter topic",
+	)
+
+	// Exactly as the exhaustion arm does: the retained claim token, the recorded attempt
+	// count and the new status travel on the row, so the dead-letter write and the
+	// transition that records it stay the exclusive property of this worker and the failure
+	// metadata reports the attempt count the database actually holds.
+	row.ClaimToken = outcome.ClaimToken
+	row.Attempts = outcome.Attempts
+	row.Status = outcome.Status
+
+	p.deadLetter(ctx, row, attempt, cause, relayTerminalPermanentFailure)
+}
+
+// relayTerminalReason says WHY a row reached the dead-letter hand-off, and it exists so the
+// two log lines that describe the hand-off cannot claim the wrong one.
+//
+// Before the relay honoured a permanent failure there was only one way to get here, so every
+// line said "after exhausting its retry budget". That sentence is now false for the commonest
+// terminal case — a permanent failure spends one attempt, not the budget — and an operator
+// reading it would look for a broker outage that never happened.
+type relayTerminalReason int
+
+const (
+	// relayTerminalBudgetSpent means the row used every attempt its budget allowed.
+	relayTerminalBudgetSpent relayTerminalReason = iota
+
+	// relayTerminalPermanentFailure means the publisher reported a failure no further
+	// attempt could change, so the budget was deliberately left unspent.
+	relayTerminalPermanentFailure
+)
+
+// String renders the reason as the bounded log-field value, so the two terminal paths are
+// separable with a field match rather than by parsing a message.
+//
+// Returns:
+//   - string: "budget_spent" or "permanent_failure". An unrecognised value renders as
+//     "unspecified" rather than a number, because a log field that reads "2" tells a reader
+//     nothing at all.
+func (r relayTerminalReason) String() string {
+	switch r {
+	case relayTerminalBudgetSpent:
+		return "budget_spent"
+	case relayTerminalPermanentFailure:
+		return "permanent_failure"
+	default:
+		return "unspecified"
+	}
+}
+
+// description renders the clause the dead-letter log line ends with, so the sentence an
+// operator reads matches what actually happened to the event.
+//
+// Returns:
+//   - string: the reason clause, always non-empty.
+func (r relayTerminalReason) description() string {
+	switch r {
+	case relayTerminalBudgetSpent:
+		return "after exhausting its retry budget"
+	case relayTerminalPermanentFailure:
+		return "after a permanent publish failure, with its retry budget deliberately unspent"
+	default:
+		return "for an unspecified terminal reason"
+	}
+}
+
+// deadLetter hands a terminal row to the dead-letter writer.
+//
+// Nothing about dead-lettering is implemented here — destination, failure metadata, message
+// composition and the terminal transition all belong to event_dlt.go. A failed hand-off
+// leaves the row in the failed state deliberately, so the event stays visible to an operator
+// instead of being reported as safely dead-lettered when its message never left the process.
+//
+// Parameters:
+//   - ctx context.Context: cancels the dead-letter publish.
+//   - row model.EventOutbox: the row, carrying the claim token its terminal transition retained.
+//   - attempt int: the 1-based attempt that ended the event's life.
+//   - cause error: the publish failure.
+//   - reason relayTerminalReason: why the row is terminal, which selects the log wording.
+func (p *EventRelayProcessor) deadLetter(
+	ctx context.Context,
+	row model.EventOutbox,
+	attempt int,
+	cause error,
+	reason relayTerminalReason,
+) {
 	if p.deadLetters == nil {
 		// Unreachable: Start refuses without a dead-letter service. Logged rather than
 		// dereferenced, because the alternative is a nil panic in a ledger process.
-		logrus.WithFields(p.rowFields(row, attempt)).Error(
-			"event relay: the retry budget is spent but no dead-letter service is configured; " +
+		logrus.WithFields(p.rowFields(row, attempt)).WithField("terminal_reason", reason.String()).Error(
+			"event relay: the event is terminal but no dead-letter service is configured; " +
 				"the row stays failed and remains in the dead-letter inventory",
 		)
 
@@ -2042,19 +2195,21 @@ func (p *EventRelayProcessor) deadLetter(
 
 	outcome, err := p.deadLetters.DeadLetter(ctx, row, cause)
 	if err != nil {
-		logrus.WithFields(p.rowFields(row, attempt)).WithError(err).Error(
-			"event relay: the event exhausted its retry budget but could not be written to its " +
-				"dead-letter topic; the row stays failed and remains in the dead-letter inventory",
+		logrus.WithFields(p.rowFields(row, attempt)).WithError(err).
+			WithField("terminal_reason", reason.String()).Error(
+			"event relay: the event is terminal but could not be written to its dead-letter topic; " +
+				"the row stays failed and remains in the dead-letter inventory",
 		)
 
 		return
 	}
 
 	logrus.WithFields(p.rowFields(row, attempt)).WithFields(logrus.Fields{
-		"dlt_topic": outcome.DeadLetterTopic,
-		"attempts":  outcome.Metadata.AttemptCount,
-		"error":     relayFailureReason(cause),
-	}).Warn("event relay: event dead-lettered after exhausting its retry budget")
+		"dlt_topic":       outcome.DeadLetterTopic,
+		"attempts":        outcome.Metadata.AttemptCount,
+		"error":           relayFailureReason(cause),
+		"terminal_reason": reason.String(),
+	}).Warn("event relay: event dead-lettered " + reason.description())
 }
 
 // ---------------------------------------------------------------------------

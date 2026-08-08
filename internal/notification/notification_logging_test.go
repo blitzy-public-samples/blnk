@@ -188,8 +188,13 @@ func captureNotifyErrorLog(t *testing.T, expected int, fn func()) notifyErrorLog
 	// then finding none is evidence rather than a race.
 	time.Sleep(150 * time.Millisecond)
 
-	captured := notifyErrorLogCapture{raw: buf.String()}
-	decoder := json.NewDecoder(bytes.NewReader(buf.Bytes()))
+	// ONE snapshot, decoded from the same bytes the failure message quotes. Reading the sink
+	// twice could return two different renderings if a straggler arrived between them, and the
+	// assertions and the diagnostic would then be describing different logs.
+	written := buf.Bytes()
+
+	captured := notifyErrorLogCapture{raw: string(written)}
+	decoder := json.NewDecoder(bytes.NewReader(written))
 	for decoder.More() {
 		entry := map[string]interface{}{}
 		require.NoError(t, decoder.Decode(&entry), "the captured log must be decodable JSON")

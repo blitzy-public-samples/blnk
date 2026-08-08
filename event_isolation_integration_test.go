@@ -144,6 +144,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -218,6 +219,32 @@ const (
 	// eventIsolationFetchWait bounds how long a fetch waits for records. The fetches here
 	// assert authorization, not delivery, so they must not block for data.
 	eventIsolationFetchWait = 500 * time.Millisecond
+
+	// eventIsolationSettleTimeout bounds every wait for BROKER STATE TO CATCH UP, as opposed
+	// to a wait for an answer.
+	//
+	// A KRaft broker holds SCRAM credentials and group coordination in its metadata log, and
+	// both become usable slightly after the administrative call that created them returns.
+	// Three things in this file were racing that gap and failing on a COLD broker while
+	// passing on a warm one — the worst possible shape, because CI always starts cold:
+	//
+	//   - The FIRST authenticated request made with a just-minted credential answered
+	//     [58] SASL Authentication Failed.
+	//   - The first consumer-group request answered [16] Not Coordinator For Group, because
+	//     with auto.create.topics.enable=false the internal __consumer_offsets topic does
+	//     not exist until some client performs group activity, and provisioning creates only
+	//     the eight blnk.* topics.
+	//   - Teardown read the credential list immediately after revoking and reported a LEAK
+	//     that the same run's own log showed had been revoked.
+	//
+	// It is deliberately much larger than the propagation actually takes. Nothing waits the
+	// whole window unless something is wrong, and when something IS wrong the diagnostic is
+	// the same either way — so the cost of being generous is zero and the cost of being tight
+	// is a flake.
+	eventIsolationSettleTimeout = 30 * time.Second
+
+	// eventIsolationSettleInterval is how often a settle wait re-probes.
+	eventIsolationSettleInterval = 250 * time.Millisecond
 )
 
 // eventIsolationMaxFetchBytes caps a verification fetch. The bytes are never inspected —
@@ -1171,11 +1198,88 @@ func eventIsolationProvision(
 		require.NoError(t, err, "issuing a Kafka credential for subscriber %q", subscriberID)
 	}
 
+	client := eventIsolationClient(t, fixture.env, credential)
+
+	// The credential exists in the broker's metadata log; it is not necessarily USABLE yet.
+	// Waiting for it here, once, is what keeps every assertion in every test from having to
+	// know that — and the wait is registered AFTER `elapsed` is taken, so the five-second
+	// issuance budget is still measured on issuance alone.
+	eventIsolationAwaitAuthenticable(t, ctx, subscriberID, client)
+
 	return &eventIsolationPrincipal{
 		subscriber:       subscriber,
 		credential:       credential,
-		client:           eventIsolationClient(t, fixture.env, credential),
+		client:           client,
 		issuanceDuration: elapsed,
+	}
+}
+
+// eventIsolationAwaitAuthenticable blocks until a freshly minted credential can authenticate.
+//
+// # What was wrong
+//
+// AlterUserScramCredentials returns once the credential is in the KRaft metadata log, and the
+// broker's authenticator picks it up a moment later. The first authenticated request a test made
+// with a new credential therefore answered [58] SASL Authentication Failed on a COLD broker —
+// and the failure landed on the POSITIVE half of an assertion, the half that establishes the
+// credential works at all, so it read as "isolation is broken" when the credential was merely
+// new. It passed on a warm broker, which is the shape that makes CI red and a developer's
+// machine green.
+//
+// # Why only error 58 is retried, and why a timeout is a FAILURE and not a skip
+//
+// [58] is the one code that propagation explains. Anything else — an authorization refusal, a
+// transport error, a broker that is not there — returns immediately, so nothing about the
+// boundary under test is softened.
+//
+// And if the window elapses the credential genuinely does not work: the issuance path reported
+// success and produced something that cannot authenticate, which is a defect in exactly the
+// thing requirement R-7 promises. So this fails, loudly, naming the principal.
+//
+// The probe is Metadata with no topics, which every principal may issue: it is an
+// AUTHENTICATION probe, and using anything that could also be refused on AUTHORIZATION grounds
+// would conflate the two.
+func eventIsolationAwaitAuthenticable(
+	t *testing.T,
+	ctx context.Context,
+	subscriberID string,
+	client *kafka.Client,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(eventIsolationSettleTimeout)
+	started := time.Now()
+
+	for {
+		err := eventIsolationBoundedProbe(ctx, func(attemptCtx context.Context) error {
+			_, probeErr := client.Metadata(attemptCtx, &kafka.MetadataRequest{})
+
+			return probeErr
+		})
+		if !errors.Is(err, kafka.SASLAuthenticationFailed) {
+			// Any other outcome, error or not, means authentication is settled: the broker
+			// either accepted the credential or refused the request for a reason that has
+			// nothing to do with it.
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"the credential just issued for subscriber %q still cannot AUTHENTICATE after %s, so "+
+					"issuance reported success and produced an unusable credential: %v\n"+
+					"This is not a propagation delay at this point — it is the credential itself.",
+				subscriberID, time.Since(started).Round(time.Millisecond), err,
+			)
+		}
+
+		select {
+		case <-ctx.Done():
+			t.Fatalf(
+				"the context was cancelled while waiting for subscriber %q's new credential to become "+
+					"usable: %v", subscriberID, ctx.Err(),
+			)
+		case <-time.After(eventIsolationSettleInterval):
+		}
 	}
 }
 
@@ -1251,6 +1355,44 @@ func eventIsolationClient(
 	return client
 }
 
+// eventIsolationAdminClient builds a kafka-go client authenticated as the ADMINISTRATOR.
+//
+// It exists for exactly one job the product's KafkaAdminClient has no reason to do: deleting the
+// consumer groups this fixture's assertions create. Blnk never deletes a subscriber's groups —
+// a group belongs to the consumer, not to the ledger — so adding the capability to
+// event_admin.go to serve a test would put an operation in production code that production has
+// no caller for. The raw client keeps it where it belongs.
+//
+// The transport mirrors eventIsolationClient's exactly, including the TLS posture, so an
+// administrative operation cannot succeed or fail for a transport reason a subscriber operation
+// would not have hit.
+func eventIsolationAdminClient(t *testing.T, env eventIsolationEnvironment) *kafka.Client {
+	t.Helper()
+
+	mechanism, err := scram.Mechanism(
+		scram.SHA512, env.kafka.SASLAdminUser, env.kafka.SASLAdminSecret,
+	)
+	require.NoError(t, err, "preparing SCRAM-SHA-512 for the administrative principal")
+
+	transport := &kafka.Transport{
+		SASL:        mechanism,
+		DialTimeout: eventIsolationDialTimeout,
+		ClientID:    "blnk-isolation-teardown",
+	}
+
+	tlsConfig, err := eventIsolationTLSConfig(env.kafka)
+	require.NoError(t, err, "building the administrative client's TLS configuration")
+	transport.TLS = tlsConfig
+
+	t.Cleanup(transport.CloseIdleConnections)
+
+	return &kafka.Client{
+		Addr:      kafka.TCP(env.kafka.Brokers...),
+		Timeout:   eventIsolationOperationTimeout,
+		Transport: transport,
+	}
+}
+
 // eventIsolationTeardown revokes a provisioned principal at the broker and removes its
 // registry row.
 //
@@ -1294,7 +1436,21 @@ func eventIsolationTeardown(
 		}
 	}
 
-	exists, err := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
+	// The consumer groups the assertions created, before the credential check, because
+	// deleting a group is authorized as the ADMINISTRATOR and does not depend on the
+	// subscriber's credential still existing.
+	eventIsolationDeleteSubscriberGroups(t, ctx, fixture, subscriber)
+
+	// POLLED, not read once. Revocation is applied to the KRaft metadata log and the
+	// credential list catches up a moment later, so reading it immediately reported a LEAK in
+	// the same run whose own log said "subscriber SCRAM credential revoked" — an accusation
+	// against the product for something that had not happened. An independent
+	// kafka-configs --describe afterwards showed nothing leaked.
+	//
+	// The polarity matters: this waits for the credential to be GONE and reports a leak only if
+	// it is still there when the window elapses. A credential that really did leak is therefore
+	// still reported, just one settle window later.
+	exists, err := eventIsolationAwaitCredentialRevoked(ctx, fixture, subscriber.KafkaPrincipal)
 	if err != nil {
 		t.Logf("teardown: confirming principal %q was revoked: %v", subscriber.KafkaPrincipal, err)
 
@@ -1303,12 +1459,156 @@ func eventIsolationTeardown(
 
 	if exists {
 		t.Errorf(
-			"teardown LEAKED a live Kafka principal: %q still holds a SCRAM credential. Revoke it by "+
-				"hand — a leaked principal accumulates in the broker's metadata log and a stale grant "+
-				"can make a later isolation run pass for the wrong reason",
-			subscriber.KafkaPrincipal,
+			"teardown LEAKED a live Kafka principal: %q still holds a SCRAM credential %s after "+
+				"revocation. Revoke it by hand — a leaked principal accumulates in the broker's "+
+				"metadata log and a stale grant can make a later isolation run pass for the wrong "+
+				"reason",
+			subscriber.KafkaPrincipal, eventIsolationSettleTimeout,
 		)
 	}
+}
+
+// eventIsolationAwaitCredentialRevoked polls the broker until the principal holds no SCRAM
+// credential, or the settle window elapses.
+//
+// Returns:
+//   - bool: whether the credential still exists.
+//   - error: a describe failure, in which case the boolean is meaningless.
+func eventIsolationAwaitCredentialRevoked(
+	ctx context.Context,
+	fixture *eventIsolationFixture,
+	principal string,
+) (bool, error) {
+	deadline := time.Now().Add(eventIsolationSettleTimeout)
+
+	for {
+		exists, err := fixture.admin.SubscriberCredentialExists(ctx, principal)
+		if err != nil || !exists || time.Now().After(deadline) {
+			return exists, err
+		}
+
+		select {
+		case <-ctx.Done():
+			return exists, ctx.Err()
+		case <-time.After(eventIsolationSettleInterval):
+		}
+	}
+}
+
+// eventIsolationDeleteSubscriberGroups removes every consumer group inside a subscriber's own
+// namespace, and reports a leak if any survives.
+//
+// # Why the fixture owns this
+//
+// The assertions in this file COMMIT OFFSETS to prove a subscriber may use its own group
+// namespace, and committing an offset to a simple consumer group CREATES that group at the
+// broker. Teardown revoked the principal, its ACLs and its registry row but never the groups, so
+// a broker accumulated a `<principal>.default` and a `<principal>.replay` per run — 42 after
+// eight runs, and every one of them a durable entry in the metadata log.
+//
+// It matters for the same reason the file already argues about principals: a namespace left
+// behind is state a later run can pass on. It is also simply the checkpoint's requirement that
+// cleanup removes topics, groups AND rows.
+//
+// # Why it deletes by NAMESPACE rather than by a recorded list
+//
+// The namespace is derived from the subscriber id and the group terminator, and the subscriber
+// id is unique per run, so the namespace contains exactly this run's groups and nothing else.
+// Listing and filtering by it therefore also collects a group a FUTURE assertion in this file
+// creates, which a hand-maintained list of two names would not — and a cleanup that silently
+// stops covering new state is worse than none.
+func eventIsolationDeleteSubscriberGroups(
+	t *testing.T,
+	ctx context.Context,
+	fixture *eventIsolationFixture,
+	subscriber *model.EventSubscriber,
+) {
+	t.Helper()
+
+	namespace, err := SubscriberConsumerGroupNamespace(subscriber.SubscriberID)
+	if err != nil {
+		t.Logf("teardown: deriving the consumer group namespace of %q: %v", subscriber.SubscriberID, err)
+
+		return
+	}
+
+	client := eventIsolationAdminClient(t, fixture.env)
+
+	groups, err := eventIsolationGroupsUnder(ctx, client, namespace)
+	if err != nil {
+		t.Logf("teardown: listing the consumer groups under %q: %v", namespace, err)
+
+		return
+	}
+
+	if len(groups) == 0 {
+		return
+	}
+
+	response, err := client.DeleteGroups(ctx, &kafka.DeleteGroupsRequest{
+		Addr:     client.Addr,
+		GroupIDs: groups,
+	})
+	if err != nil {
+		t.Logf("teardown: deleting the consumer groups under %q: %v", namespace, err)
+
+		return
+	}
+
+	for group, groupErr := range response.Errors {
+		if groupErr != nil {
+			t.Logf("teardown: deleting consumer group %q: %v", group, groupErr)
+		}
+	}
+
+	// Confirmed rather than assumed, and as an error rather than a log line: a group this
+	// fixture created and did not remove is exactly the residue the check above refuses to
+	// tolerate for a principal.
+	remaining, err := eventIsolationGroupsUnder(ctx, client, namespace)
+	if err != nil {
+		t.Logf("teardown: confirming the consumer groups under %q were deleted: %v", namespace, err)
+
+		return
+	}
+
+	assert.Emptyf(t, remaining,
+		"teardown LEAKED consumer groups inside %q: %v. The assertions in this file create a group "+
+			"by committing an offset to it, so every one of them is this fixture's to remove; left "+
+			"behind they accumulate in the broker's metadata log run after run",
+		namespace, remaining)
+}
+
+// eventIsolationGroupsUnder returns the ids of every consumer group whose name begins with
+// namespace.
+func eventIsolationGroupsUnder(
+	ctx context.Context,
+	client *kafka.Client,
+	namespace string,
+) ([]string, error) {
+	listCtx, cancel := context.WithTimeout(ctx, eventIsolationOperationTimeout)
+	defer cancel()
+
+	response, err := client.ListGroups(listCtx, &kafka.ListGroupsRequest{Addr: client.Addr})
+	if err != nil {
+		return nil, err
+	}
+
+	if response == nil {
+		return nil, errors.New("the broker returned no ListGroups response")
+	}
+
+	if response.Error != nil {
+		return nil, response.Error
+	}
+
+	matched := []string{}
+	for _, group := range response.Groups {
+		if strings.HasPrefix(group.GroupID, namespace) {
+			matched = append(matched, group.GroupID)
+		}
+	}
+
+	return matched, nil
 }
 
 // eventIsolationTLSConfig mirrors the transport security posture the service dials with.
@@ -1540,22 +1840,84 @@ func eventIsolationOffsetFetch(
 	group string,
 	topic string,
 ) error {
-	ctx, cancel := context.WithTimeout(ctx, eventIsolationOperationTimeout)
+	return eventIsolationAwaitGroupCoordinator(ctx, func(attemptCtx context.Context) error {
+		response, err := client.OffsetFetch(attemptCtx, &kafka.OffsetFetchRequest{
+			GroupID: group,
+			Topics:  map[string][]int{topic: {0}},
+		})
+		if err != nil {
+			return err
+		}
+
+		if response == nil {
+			return errors.New("the broker returned no OffsetFetch response")
+		}
+
+		return response.Error
+	})
+}
+
+// eventIsolationAwaitGroupCoordinator runs a consumer-group probe, retrying only while the
+// broker says it has no coordinator to answer with.
+//
+// # Why retrying here cannot weaken any assertion
+//
+// The three retried codes are statements about the broker's own state, never about this
+// principal's rights:
+//
+//   - [14] GroupLoadInProgress — the coordinator is loading its state.
+//   - [15] GroupCoordinatorNotAvailable — __consumer_offsets has no leader yet, or does not
+//     exist at all. On a freshly provisioned broker it does not: auto.create.topics.enable is
+//     false and kafka-provision.sh creates only the eight blnk.* topics, so the internal topic
+//     is materialised by the first client that needs group coordination.
+//   - [16] NotCoordinatorForGroup — this broker is not the coordinator for this group.
+//
+// An authorization decision is [30] GroupAuthorizationFailed, which is NOT in that set and
+// therefore returns on the first attempt, unchanged and immediately. So a refusal is still a
+// refusal, an allow is still an allow, and the only thing that changes is that a cold broker
+// gets the moment it needs to elect a coordinator instead of failing the criterion.
+//
+// # Why not materialise the coordinator during setup instead
+//
+// A setup-time warm-up would have to perform group activity as some principal, and doing it as
+// the ADMINISTRATOR would create the internal topic on a broker where the test then asserts
+// what a SUBSCRIBER can see. Retrying at the probe keeps the fixture's footprint to exactly the
+// groups the assertions name.
+func eventIsolationAwaitGroupCoordinator(ctx context.Context, probe func(context.Context) error) error {
+	deadline := time.Now().Add(eventIsolationSettleTimeout)
+
+	for {
+		err := eventIsolationBoundedProbe(ctx, probe)
+		if !eventIsolationIsCoordinatorUnready(err) || time.Now().After(deadline) {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(eventIsolationSettleInterval):
+		}
+	}
+}
+
+// eventIsolationBoundedProbe runs one probe under the operation deadline.
+func eventIsolationBoundedProbe(ctx context.Context, probe func(context.Context) error) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, eventIsolationOperationTimeout)
 	defer cancel()
 
-	response, err := client.OffsetFetch(ctx, &kafka.OffsetFetchRequest{
-		GroupID: group,
-		Topics:  map[string][]int{topic: {0}},
-	})
-	if err != nil {
-		return err
+	return probe(attemptCtx)
+}
+
+// eventIsolationIsCoordinatorUnready reports whether err says the broker has no group
+// coordinator ready, rather than saying anything about authorization.
+func eventIsolationIsCoordinatorUnready(err error) bool {
+	if err == nil {
+		return false
 	}
 
-	if response == nil {
-		return errors.New("the broker returned no OffsetFetch response")
-	}
-
-	return response.Error
+	return errors.Is(err, kafka.GroupLoadInProgress) ||
+		errors.Is(err, kafka.GroupCoordinatorNotAvailable) ||
+		errors.Is(err, kafka.NotCoordinatorForGroup)
 }
 
 // eventIsolationOffsetCommit commits an offset to a consumer group as the given principal.
@@ -1570,34 +1932,33 @@ func eventIsolationOffsetCommit(
 	group string,
 	topic string,
 ) error {
-	ctx, cancel := context.WithTimeout(ctx, eventIsolationOperationTimeout)
-	defer cancel()
+	return eventIsolationAwaitGroupCoordinator(ctx, func(attemptCtx context.Context) error {
+		response, err := client.OffsetCommit(attemptCtx, &kafka.OffsetCommitRequest{
+			GroupID:      group,
+			GenerationID: -1,
+			MemberID:     "",
+			Topics: map[string][]kafka.OffsetCommit{
+				topic: {{Partition: 0, Offset: 0}},
+			},
+		})
+		if err != nil {
+			return err
+		}
 
-	response, err := client.OffsetCommit(ctx, &kafka.OffsetCommitRequest{
-		GroupID:      group,
-		GenerationID: -1,
-		MemberID:     "",
-		Topics: map[string][]kafka.OffsetCommit{
-			topic: {{Partition: 0, Offset: 0}},
-		},
-	})
-	if err != nil {
-		return err
-	}
+		if response == nil {
+			return errors.New("the broker returned no OffsetCommit response")
+		}
 
-	if response == nil {
-		return errors.New("the broker returned no OffsetCommit response")
-	}
-
-	for _, partitions := range response.Topics {
-		for _, partition := range partitions {
-			if partition.Error != nil {
-				return partition.Error
+		for _, partitions := range response.Topics {
+			for _, partition := range partitions {
+				if partition.Error != nil {
+					return partition.Error
+				}
 			}
 		}
-	}
 
-	return nil
+		return nil
+	})
 }
 
 // eventIsolationVisibleTopics lists every topic the broker is willing to disclose to the
@@ -2185,9 +2546,39 @@ func TestEventIsolation_CredentialIssuanceReturnsTheSecretOnceWithinTheBudget(t 
 		assert.Equal(t, principal.subscriber.KafkaPrincipal, credential.Username)
 		assert.Equal(t, []string{granted}, credential.AuthorizedTopics)
 		assert.Equal(t, principal.subscriber.ConsumerGroupID, credential.ConsumerGroupID)
-		assert.Equal(t, fixture.env.kafka.Brokers, credential.Brokers,
-			"the credential must hand back the broker list the admin client actually dialled")
-		assert.Equal(t, strings.Join(fixture.env.kafka.Brokers, ","), credential.BrokerEndpoint)
+		// THE SUBSCRIBER-FACING LIST, and asserting the other one was a defect in this test
+		// rather than in the service.
+		//
+		// A credential names the addresses the SUBSCRIBER will dial, which are the broker's
+		// external listener — KAFKA_SUBSCRIBER_BROKERS. KAFKA_BROKERS is what Blnk's own admin
+		// client and relay dial, and inside a deployment those are internal names that do not
+		// resolve for a subscriber; Kafka makes it worse, because a broker answers each client
+		// with the advertised address of the listener the connection arrived on, so even a
+		// reachable internal bootstrap hands back internal names for the partition leaders.
+		// subscriberFacingBrokers therefore reports the external list and REFUSES issuance when
+		// it is unset, rather than falling back — see ErrSubscriberBrokersNotConfigured.
+		//
+		// This assertion named fixture.env.kafka.Brokers, so it only held while the two lists
+		// happened to be equal, and it failed the moment they were configured differently — the
+		// exact split the separate variable exists for, and the one .env.example ships. The
+		// failure was in the acceptance suite that guards subscriber isolation, which is the
+		// worst place for a false alarm: it trains a reader to discount a red V-5 run.
+		//
+		// The fixture keeps the two values DIFFERENT on purpose (see
+		// eventIsolationResolveEnvironment), so this assertion now fails if the service ever
+		// reports the internal list — which is the property worth having covered.
+		assert.Equal(t, fixture.env.kafka.SubscriberBrokers, credential.Brokers,
+			"the credential must hand back the SUBSCRIBER-FACING broker list (%s), not the "+
+				"addresses the admin client dialled (%s)",
+			eventIsolationSubscriberBrokersEnv, eventIsolationBrokersEnv)
+		assert.Equal(t, strings.Join(fixture.env.kafka.SubscriberBrokers, ","), credential.BrokerEndpoint,
+			"and the single-string rendering must describe the same list, or a client configured "+
+				"from it reaches a different endpoint than one configured from the array")
+		if !slices.Equal(fixture.env.kafka.Brokers, fixture.env.kafka.SubscriberBrokers) {
+			assert.NotEqual(t, fixture.env.kafka.Brokers, credential.Brokers,
+				"the two lists are configured differently here precisely so that reporting the "+
+					"internal one cannot pass")
+		}
 		assert.False(t, credential.IssuedAt.IsZero(), "the credential records no issuance instant")
 		assert.NotEmpty(t, credential.Fingerprint, "the credential carries no reference fingerprint")
 		assert.False(t, credential.Replaced,
@@ -2425,6 +2816,12 @@ func TestEventIsolation_ASubscriberRecordingAKeyPrefixIsRefusedACredential(t *te
 		assert.Nil(t, stored.CredentialIssuedAt)
 	})
 
+	// provisioned is the credential the recovery subtest below mints. The subtest that follows
+	// it needs a subscriber that HOLDS one, so the two run in order and share it rather than
+	// provisioning a second principal for the same row — which Kafka could not hold anyway,
+	// since it keeps one credential per principal.
+	var provisioned SubscriberCredential
+
 	t.Run("clearing the key prefix restores provisionability", func(t *testing.T) {
 		// The refusal has to be RECOVERABLE, or the design is a trap rather than a
 		// fail-closed default. Clearing the prefix is the caller accepting that access is
@@ -2440,6 +2837,7 @@ func TestEventIsolation_ASubscriberRecordingAKeyPrefixIsRefusedACredential(t *te
 		require.NoError(t, issueErr,
 			"once the unenforceable constraint is gone the subscriber must be provisionable")
 		require.NotEmpty(t, issued.Password())
+		provisioned = issued
 
 		// And the credential it now holds really works, on the topic it was granted — so the
 		// recovery path is proven end to end rather than only at the registry.
@@ -2449,6 +2847,73 @@ func TestEventIsolation_ASubscriberRecordingAKeyPrefixIsRefusedACredential(t *te
 			fmt.Sprintf("reading the granted topic %q after clearing the key prefix", granted),
 			outcome.any())
 		assert.NotEmpty(t, disclosed)
+	})
+
+	// THE REVERSE ORDER, which is where SEC-05 was walked around.
+	//
+	// Everything above guards "record a prefix, then ask for a credential". This guards
+	// "hold a credential, then record a prefix" — one ordinary update, which used to be
+	// accepted silently, with no warning and no revocation. The state it produced is the exact
+	// state the refusal exists to prevent, and it was demonstrated against a real broker: a live
+	// credential read eight records from its granted topic, six of them outside the prefix its
+	// own row advertised, two keyed for unrelated tenants. Nothing failed, so nobody could
+	// discover it from the outside; only the registry lied.
+	//
+	// It runs against the real broker for the same reason the refusal above does. The assertion
+	// that matters is not that an error came back — it is that the boundary did not move: the
+	// same principal, the same bindings, the same access as a moment earlier, and a row that
+	// still describes them truthfully.
+	t.Run("recording a key prefix on a provisioned subscriber is refused too", func(t *testing.T) {
+		require.NotEmpty(t, provisioned.Password(),
+			"this subtest needs the credential the previous one issued")
+
+		before, beforeErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
+		require.NoError(t, beforeErr)
+		require.True(t, before, "the premise is a subscriber that already holds a live credential")
+
+		latePrefix := "ldg_late_" + uuid.NewString()
+		updated, updateErr := fixture.service.UpdateSubscriber(ctx, subscriberID, SubscriberUpdate{
+			PartitionKeyPrefix: &latePrefix,
+		})
+		require.Error(t, updateErr,
+			"recording a key prefix on a subscriber that holds a credential must be refused: the "+
+				"credential cannot be narrowed to match it, so the row would describe a boundary "+
+				"that does not exist")
+		assert.Nil(t, updated)
+
+		var updateAPIErr apierror.APIError
+		require.ErrorAs(t, updateErr, &updateAPIErr)
+		assert.Equal(t, apierror.ErrSubscriberIsolationUnenforceable, updateAPIErr.Code,
+			"the same typed code the issuance refusal uses: one impossible state, one code, "+
+				"whichever direction a caller approaches it from")
+		assert.Equal(t, http.StatusConflict, apierror.StatusForCode(updateAPIErr.Code))
+
+		stored, readErr := fixture.service.GetSubscriber(ctx, subscriberID)
+		require.NoError(t, readErr)
+		assert.Nil(t, stored.PartitionKeyPrefix,
+			"THE REGISTRY MUST NOT RECORD THE CLAIM. A stored prefix here is the whole defect: it "+
+				"outlives the request, and every operator, migration report and support answer "+
+				"derived from this row would state a tenancy boundary the credential does not have")
+		assert.False(t, stored.KeyScopeUnenforceable())
+		require.NotNil(t, stored.CredentialReference,
+			"and the refusal must not revoke the working credential either — it takes nothing away")
+
+		after, afterErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
+		require.NoError(t, afterErr)
+		assert.True(t, after,
+			"the refused update must leave the broker untouched, credential included")
+
+		// And the access itself is unchanged: still allowed on the granted topic, still refused
+		// everywhere else. A refusal that quietly widened or narrowed the boundary would be its
+		// own defect, and only the broker can answer that.
+		client := eventIsolationClient(t, fixture.env, provisioned)
+
+		allowed, disclosed := eventIsolationListOffsets(ctx, client, granted)
+		eventIsolationAssertAllowed(t,
+			fmt.Sprintf("reading the granted topic %q after the refused key-prefix update", granted),
+			allowed.any())
+		assert.NotEmpty(t, disclosed,
+			"the credential must still read what it could read before the refused update")
 	})
 }
 

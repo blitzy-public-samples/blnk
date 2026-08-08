@@ -1004,6 +1004,19 @@ func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, claimTok
 	return args.Get(0).(model.EventFailureOutcome), args.Error(1)
 }
 
+// MarkEventPermanentlyFailed returns the outcome the real datasource produces for a
+// permanent failure. As with MarkEventFailed a test that stubs only the error must still
+// supply an outcome, because the caller reads Exhausted and ClaimToken to perform the
+// dead-letter hand-off — and a zero outcome on the error path is what the nil check below
+// produces.
+func (m *MockDataSource) MarkEventPermanentlyFailed(ctx context.Context, id int64, claimToken, errMsg string) (model.EventFailureOutcome, error) {
+	args := m.Called(ctx, id, claimToken, errMsg)
+	if args.Get(0) == nil {
+		return model.EventFailureOutcome{}, args.Error(1)
+	}
+	return args.Get(0).(model.EventFailureOutcome), args.Error(1)
+}
+
 func (m *MockDataSource) MarkEventDeadLettered(ctx context.Context, id int64, claimToken, dltTopic string, failureMetadata json.RawMessage, record model.BrokerRecord) error {
 	args := m.Called(ctx, id, claimToken, dltTopic, failureMetadata, record)
 	return args.Error(0)
@@ -1174,6 +1187,18 @@ func (m *MockDataSource) MarkSubscriberMigrated(ctx context.Context, subscriberI
 func (m *MockDataSource) PurgeMigratedSubscriberWebhookURLs(ctx context.Context, migratedBefore time.Time) (int64, error) {
 	args := m.Called(ctx, migratedBefore)
 	return args.Get(0).(int64), args.Error(1)
+}
+
+// CountSubscriberRevocationsPending returns the outstanding-revocation backlog. A test that
+// stubs only the error must still supply a backlog value, and the nil check below turns that
+// into the zero backlog — which callers must NOT publish as a gauge, because a zero would
+// read as "everything is settled" when the truth is that nothing could be read.
+func (m *MockDataSource) CountSubscriberRevocationsPending(ctx context.Context) (model.SubscriberRevocationBacklog, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return model.SubscriberRevocationBacklog{}, args.Error(1)
+	}
+	return args.Get(0).(model.SubscriberRevocationBacklog), args.Error(1)
 }
 
 func (m *MockDataSource) MarkSubscriberRevocationPending(ctx context.Context, subscriberID string, pendingAt time.Time) (*model.EventSubscriber, error) {

@@ -1373,7 +1373,14 @@ func (s *EventDeadLetterService) PublishToDeadLetter(
 		attribute.String(publishAttrEventType, boundedEventTypeLabel(outcome.EventType)),
 	))
 
-	logrus.WithFields(outcome.LogFields()).Warn("ledger event dead-lettered after exhausting its retry budget")
+	// The message says WHAT happened and not WHY, because the why is not this file's to know.
+	// It used to read "after exhausting its retry budget", which was true while exhaustion was
+	// the only route here; the relay now also arrives on a permanent failure, having
+	// deliberately left the budget unspent, and that line would send an operator looking for a
+	// broker outage that never happened. The relay states the reason in its own line, where the
+	// decision was taken, and the attempt count in these fields is the honest number either
+	// way.
+	logrus.WithFields(outcome.LogFields()).Warn("ledger event dead-lettered and preserved on its dead-letter topic")
 
 	return outcome, nil
 }

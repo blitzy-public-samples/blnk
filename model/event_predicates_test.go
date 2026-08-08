@@ -470,6 +470,32 @@ func TestEventIdentityAndDerivation_MakeACaptureIdempotent(t *testing.T) {
 		identity, ok = EventIdentityFor("ledger.created", ledger)
 		require.True(t, ok, "a ledger payload carries an identity")
 		assert.Equal(t, "ldg_identity", identity)
+
+		// The remaining two POINTER shapes, which are the shapes the producers
+		// actually pass: identity.created carries *Identity and balance.created
+		// carries *Balance. Both arms went unexercised here, so the mutation gate
+		// reported them NOT COVERED — and an id derived from the wrong field, or not
+		// derived at all, is a duplicate-suppression key that stops working, which
+		// is the one failure the derived id exists to prevent.
+		subject := &Identity{IdentityID: "idt_identity"}
+		identity, ok = EventIdentityFor("identity.created", subject)
+		require.True(t, ok, "an identity payload carries an identity")
+		assert.Equal(t, "idt_identity", identity)
+
+		balance := &Balance{BalanceID: "bln_identity"}
+		identity, ok = EventIdentityFor("balance.created", balance)
+		require.True(t, ok, "a balance payload carries an identity")
+		assert.Equal(t, "bln_identity", identity)
+
+		// And by value, because each arm has a value twin that must agree with it —
+		// two spellings of one rule are how the two arms drift apart.
+		identity, ok = EventIdentityFor("identity.created", *subject)
+		require.True(t, ok)
+		assert.Equal(t, "idt_identity", identity)
+
+		identity, ok = EventIdentityFor("balance.created", *balance)
+		require.True(t, ok)
+		assert.Equal(t, "bln_identity", identity)
 	})
 
 	t.Run("no identity is invented when the payload has none", func(t *testing.T) {

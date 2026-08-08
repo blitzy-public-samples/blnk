@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/internal/filter"
 	"github.com/blnkfinance/blnk/model"
@@ -546,44 +545,50 @@ func TestGetTotalCommittedTransactions_Error(t *testing.T) {
 	assert.Equal(t, apierror.ErrInternalServer, apiErr.Code)
 }
 
+// atomicWriterDatasource opens the datasource for the two integration tests below,
+// which are the only coverage RecordTransactionWithBalances' real atomicity has.
+//
+// # Why it does not go through NewDataSource
+//
+// NewDataSource calls GetDBConnection, which memoises its result in a package-level
+// sync.Once. On a FAILED first attempt that function records the error locally,
+// leaves `instance` nil, and CONSUMES the once — so every later call returns
+// (nil, nil), and NewDataSource then dereferences the nil to run `SET search_path`.
+// TestGetDBConnection_Failure in db_test.go deliberately connects to `invalid-dns`,
+// and db_test.go sorts before transactions_test.go, so by the time these two tests
+// ran the singleton was already poisoned and NewDataSource panicked on every
+// invocation. Each test wrapped itself in `recover()` and turned that panic into
+// `t.Skipf("...likely database connection issue...")`, so the two tests reported a
+// skip on every run of the suite and had NEVER executed a single assertion — while
+// the database was up and healthy the whole time.
+//
+// openRealTestDB constructs the Datasource directly and shares no state with the
+// singleton, which is why the rest of this package's real-database tests already use
+// it. It also honours TEST_DATABASE_URL, so this tier relocates with the others, and
+// it skips only when the database genuinely does not answer a ping — the one
+// condition a skip should ever mean here.
+//
+// # What is deliberately NOT restored
+//
+// No configuration is installed. The removed preamble stored a Configuration into
+// the process-wide config.ConfigStore and never put the previous value back, which
+// would have leaked a fixture DSN into every test that ran afterwards. Nothing on
+// these paths reads the store: CreateLedger and CreateBalance are called without an
+// EventPreparer so no event is captured, and config.Fetch is reached only from the
+// event-outbox writer. The other real-database tests in this package install nothing
+// either.
+func atomicWriterDatasource(t *testing.T) Datasource {
+	t.Helper()
+	return openRealTestDB(t)
+}
+
 func TestRecordTransactionWithBalances_AtomicSuccess_Integration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Skipf("Skipping test: recovered from panic (likely database connection issue): %v", r)
-		}
-	}()
-
 	ctx := context.Background()
-	cnf := &config.Configuration{
-		Redis: config.RedisConfig{
-			Dns: "localhost:6379",
-		},
-		DataSource: config.DataSourceConfig{
-			Dns: "postgres://postgres:password@localhost:5432/blnk?sslmode=disable",
-		},
-		Queue: config.QueueConfig{
-			WebhookQueue:     "webhook_queue_test",
-			IndexQueue:       "index_queue_test",
-			TransactionQueue: "transaction_queue_test",
-			NumberOfQueues:   1,
-		},
-		Server: config.ServerConfig{
-			SecretKey: "test-secret",
-		},
-	}
-	config.ConfigStore.Store(cnf)
-
-	ds, err := NewDataSource(cnf)
-	if err != nil {
-		t.Skipf("Skipping test: could not connect to database: %v", err)
-	}
-	if ds == nil {
-		t.Skip("Skipping test: database connection returned nil")
-	}
+	ds := atomicWriterDatasource(t)
 
 	ledger, err := ds.CreateLedger(model.Ledger{Name: "test-ledger-atomicity-" + model.GenerateUUIDWithSuffix("ldg")})
 	if err != nil {
@@ -665,36 +670,8 @@ func TestRecordTransactionWithBalances_DuplicateTxnID_Rollback_Integration(t *te
 		t.Skip("Skipping integration test in short mode")
 	}
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Skipf("Skipping test: recovered from panic (likely database connection issue): %v", r)
-		}
-	}()
-
 	ctx := context.Background()
-	cnf := &config.Configuration{
-		Redis: config.RedisConfig{
-			Dns: "localhost:6379",
-		},
-		DataSource: config.DataSourceConfig{
-			Dns: "postgres://postgres:password@localhost:5432/blnk?sslmode=disable",
-		},
-		Queue: config.QueueConfig{
-			WebhookQueue:     "webhook_queue_test",
-			IndexQueue:       "index_queue_test",
-			TransactionQueue: "transaction_queue_test",
-			NumberOfQueues:   1,
-		},
-		Server: config.ServerConfig{
-			SecretKey: "test-secret",
-		},
-	}
-	config.ConfigStore.Store(cnf)
-
-	ds, err := NewDataSource(cnf)
-	if err != nil {
-		t.Skipf("Skipping test: could not connect to database: %v", err)
-	}
+	ds := atomicWriterDatasource(t)
 
 	ledger, err := ds.CreateLedger(model.Ledger{Name: "test-ledger-rollback-" + model.GenerateUUIDWithSuffix("ldg")})
 	if err != nil {

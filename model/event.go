@@ -832,6 +832,73 @@ func (a EventOutboxAudit) UnconfirmedRows() int64 {
 	return a.PublishedRows - a.ConfirmedRows
 }
 
+// SubscriberRevocationBacklog is how much broker-side credential revocation is still
+// OWED, and for how long the oldest debt has been outstanding.
+//
+// # What is being counted
+//
+// Deregistration revokes at the broker and only then deletes the registry row, so a row
+// still carrying RevocationPendingAt is a principal that may still be able to
+// authenticate and read while nothing in Blnk records an issuance for it. It is a durable
+// to-do item rather than a lost one — a retried deregistration finishes the job — but
+// until it is finished it is live access nobody is watching.
+//
+// # Why the two figures, and why the age is the one to alert on
+//
+// Pending answers "how much", which is what tells an operator whether they are looking at
+// one stuck subscriber or a broker that has been unreachable for an hour. OldestPendingAt
+// answers "for how long", and that is the alertable quantity: a marker cleared within a
+// minute by a retry is routine, while one outstanding for an hour means the automatic
+// settlement paths are not running and a human has to revoke by hand.
+//
+// The age is measured from when the obligation was FIRST recorded and is deliberately not
+// reset by a later failed attempt, so it reports the age of the EXPOSURE rather than the
+// age of the last try.
+//
+// # No per-subscriber breakdown
+//
+// Deliberately absent. Subscriber identifiers are unbounded in cardinality and would
+// export a tenant identifier into every metric series and every alert notification. The
+// question these two answer is how much is outstanding and for how long, not which; the
+// rows themselves are the per-subscriber detail, listed through the registry.
+type SubscriberRevocationBacklog struct {
+	// Pending is how many subscribers carry an unsettled revocation marker. Zero is the
+	// healthy steady state and is a meaningful reading rather than an absent one.
+	Pending int64
+
+	// OldestPendingAt is when the OLDEST outstanding marker was recorded. It is the zero
+	// value when nothing is outstanding, which is why callers must test it rather than
+	// subtracting blindly — an epoch-zero instant would otherwise render as an age of
+	// fifty-odd years and pin every alert on it.
+	OldestPendingAt time.Time
+}
+
+// OldestAge is how long the oldest outstanding revocation has been owed, measured
+// against the supplied instant.
+//
+// It returns ZERO when nothing is outstanding, and zero rather than a negative value when
+// the marker is stamped in the future — which spans two clocks by necessity, since the
+// deregistering process stamps the marker and the collecting process reads it.
+//
+// Parameters:
+//   - now time.Time: the instant to measure against, supplied so a caller can use its own
+//     clock and a test can be exact.
+//
+// Returns:
+//   - time.Duration: never negative.
+func (b SubscriberRevocationBacklog) OldestAge(now time.Time) time.Duration {
+	if b.OldestPendingAt.IsZero() {
+		return 0
+	}
+
+	age := now.Sub(b.OldestPendingAt)
+	if age < 0 {
+		return 0
+	}
+
+	return age
+}
+
 // FullyConfirmed reports whether every row claiming a publication names a distinct
 // record.
 //
@@ -1871,6 +1938,32 @@ var ErrInvalidCredentialReference = errors.New(
 // and non-reversible, and a keyed digest gives both. The principal is mixed in as
 // the HMAC key so that two subscribers who happen to be issued the same generated
 // secret still derive different references.
+//
+// # The HMAC key is PUBLIC, deliberately, and what that does and does not buy
+//
+// The key is the Kafka principal, which is derived from the subscriber's identifier
+// and appears in API responses, broker ACL listings and logs. So this is a keyed
+// digest whose key is known — it is domain separation, not secrecy, and it is worth
+// stating plainly because a reader who assumes otherwise would over-trust the value.
+//
+// What the public key buys is exactly the property named above: two principals
+// issued the same secret derive different references, so a reference collision
+// cannot be read as "these two subscribers hold the same credential". What it does
+// NOT buy is resistance to an offline guessing attack by someone holding the
+// database — and that resistance comes instead from the secret itself.
+// generateSubscriberPassword draws 48 characters uniformly from a 62-symbol
+// alphabet through the system CSPRNG, which is roughly 285 bits of entropy: a
+// salted, iterated KDF, or an additional server-side pepper, would multiply an
+// already unreachable search space and would add a real failure mode — a
+// configuration value whose loss or rotation changes every future derivation. The
+// reference is also never returned to a client; only CredentialFingerprint's
+// twelve-character fragment is.
+//
+// This is therefore a considered choice rather than an omission. If the posture ever
+// has to change — because the secret's generation weakens, or because a compliance
+// regime requires a KDF regardless of the arithmetic — the scheme prefix on the
+// stored value is what makes that a versioned migration rather than a guess: see
+// credentialReferenceScheme, whose "-v1" exists for this.
 //
 // # What the caller must do
 //

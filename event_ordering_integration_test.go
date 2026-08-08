@@ -18,6 +18,7 @@ package blnk
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -196,6 +197,9 @@ const (
 	// that is failing to claim.
 	orderingRelayLockDuration = 30 * time.Second
 
+	// relayContentionLease is the lease the two-relay contention test runs on, and it is
+	// deliberately absurd.
+	//
 	// orderingDispatchTimeout bounds the wait for every published row to reach its
 	// dispatched terminal state.
 	//
@@ -311,9 +315,14 @@ const (
 // the shared Kafka publisher, the verification client, the topic under test and its
 // partitions, and the per-run identifier every assertion filters on.
 type orderingFixture struct {
-	cfg        *config.Configuration
-	ds         database.IDataSource
-	blnk       *Blnk
+	cfg  *config.Configuration
+	ds   database.IDataSource
+	blnk *Blnk
+	// pool is the same connection this fixture's datasource wraps, kept as the concrete type
+	// so cleanup can issue the one statement IDataSource has no method for: deleting this
+	// run's own rows. Adding a purge to the repository interface to serve a test would put an
+	// operation in production code that production has no caller for.
+	pool       *sql.DB
 	client     *kafka.Client
 	topic      string
 	partitions []int
@@ -748,9 +757,16 @@ func newOrderingFixture(t *testing.T) *orderingFixture {
 	}
 
 	// A cluster that authenticates needs a PRODUCER principal, not just an administrative one.
-	// Blnk refuses to publish as the administrator, and construction fails outright rather than
-	// quietly falling back, so this is checked here — through the one helper that owns the
-	// predicate — instead of failing several hundred lines into the run.
+	// Blnk refuses to publish as the administrator — that principal can create topics, alter
+	// SCRAM credentials and manage ACLs, so a leaked producer credential would compromise the
+	// cluster's authorization state — and construction fails outright rather than quietly
+	// falling back. Skipping here turns that into a shopping list instead of an obscure failure
+	// several hundred lines into the run.
+	//
+	// Through the named helper rather than inline: this check existed twice, once here and once
+	// as orderingSkipUnlessProducerPrincipal, and the helper's condition is the more complete of
+	// the two — it also catches an environment carrying only the administrative SECRET, or only
+	// the producer secret, which the inline copy read as fully configured.
 	orderingSkipUnlessProducerPrincipal(t)
 
 	dsn := orderingEnvOr("BLNK_DATA_SOURCE_DNS", orderingFallbackPostgresDSN)
@@ -866,6 +882,7 @@ func newOrderingFixture(t *testing.T) *orderingFixture {
 	fixture := &orderingFixture{
 		cfg:  cnf,
 		ds:   ds,
+		pool: pool,
 		blnk: instance,
 		client: &kafka.Client{
 			Addr:      kafka.TCP(brokers...),
@@ -881,10 +898,76 @@ func newOrderingFixture(t *testing.T) *orderingFixture {
 	}
 	fixture.partitions = fixture.discoverPartitions(t)
 
+	// EXCLUSIVE USE OF blnk.event_outbox for the duration of this test. This tier starts a
+	// relay, and a relay claims the oldest pending rows in the whole table — so it drains
+	// another package's live fixtures, and another package's quiesce retires its own rows out
+	// from under it. lockEventOutboxTier in event_recovery_integration_test.go documents the
+	// collision and why an advisory lock is what fixes it.
+	lockEventOutboxTier(t, pool)
+
+	// Registered AFTER the lock, so it runs BEFORE the lock is released: cleanup is LIFO, and
+	// deleting this run's rows while still holding the table is what stops the next tier from
+	// seeing them at all.
+	t.Cleanup(func() { fixture.deleteSeededRows(t) })
+
 	t.Logf("event ordering fixture ready: brokers=%v topic=%s partitions=%v run=%s",
 		brokers, fixture.topic, fixture.partitions, fixture.runID)
 
 	return fixture
+}
+
+// deleteSeededRows removes the outbox rows this run wrote.
+//
+// # Why a fixture that only writes terminal rows still has to clean up
+//
+// This tier left every row it created behind — 24 per aggregate, hundreds per run, thousands
+// after a few runs. Three costs follow, and the third is the one that actually broke a run:
+//
+//  1. The tier gets slower and more order-sensitive as the table grows, because every claim
+//     reads past the residue.
+//  2. A row left non-terminal is claimable for ever, so the next relay any test starts picks it
+//     up and reports work it did not seed.
+//  3. A DISPATCHED row records the broker coordinate it was written to, under a unique index on
+//     (kafka_topic, kafka_partition, kafka_offset). Reset the broker — which the local stack
+//     does, and which any operator does with `docker compose down -v` — and topic offsets
+//     restart at zero, so the next run's publishes collide with the stale rows' coordinates and
+//     the relay cannot mark them dispatched. That was observed as 165 rows stuck in `processing`
+//     and a four-minute timeout, with the real cause three commands earlier.
+//
+// Scoped by this run's transaction-id prefix, so no other run's rows are touched, and no topic
+// is deleted because sibling tests share the broker.
+func (f *orderingFixture) deleteSeededRows(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), orderingClientTimeout)
+	defer cancel()
+
+	result, err := f.pool.ExecContext(ctx,
+		`DELETE FROM blnk.event_outbox WHERE starts_with(aggregate_id, $1)`,
+		orderingTransactionIDPrefix(f.runID))
+	if err != nil {
+		t.Logf("could not clean up the outbox rows of ordering run %s: %v", f.runID, err)
+
+		return
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		t.Logf("cleaned up the outbox rows of ordering run %s (count unavailable: %v)", f.runID, err)
+
+		return
+	}
+
+	t.Logf("cleaned up %d outbox rows for ordering run %s", affected, f.runID)
+}
+
+// orderingTransactionIDPrefix is the prefix every transaction id this run mints begins with,
+// and therefore the prefix of every aggregate id its events carry.
+//
+// It is derived from the same format string orderingTransaction uses, so the two cannot drift
+// into a cleanup that silently matches nothing.
+func orderingTransactionIDPrefix(runID string) string {
+	return fmt.Sprintf("txn_%s_", runID)
 }
 
 // discoverPartitions reads the topic's partition ids from broker metadata.

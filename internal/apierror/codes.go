@@ -189,6 +189,45 @@ const (
 	// deleting, and the result would be indistinguishable from a successful issuance
 	// to everything except the broker.
 	ErrSubscriberDeprovisioning ErrorCode = "SUBSCRIBER_DEPROVISIONING"
+
+	// ErrSubscriberGrantEmpty is the refusal to mint a credential for a subscriber
+	// whose authorized-topic list is empty.
+	//
+	// An empty list is a LEGITIMATE registry state — it is the fail-closed default of a
+	// newly registered subscriber, and setting it back to empty is the only way to
+	// express "authorised for nothing" on a row that currently holds topics. What it is
+	// not is something to issue a credential against: the SASL principal would
+	// authenticate, hold no topic binding at all, and read nothing. The response would
+	// nonetheless carry a secret, a broker endpoint and a consumer group, which is
+	// indistinguishable at a glance from working access, so whoever received it would
+	// hand it to a consumer and diagnose the resulting silence as a delivery fault.
+	//
+	// 409 rather than 400 or 422 for the same reason as the two refusals above: the
+	// request carries no body and nothing about it is malformed. It is the STATE of the
+	// resource that has to change — grant at least one topic — after which the identical
+	// request succeeds.
+	ErrSubscriberGrantEmpty ErrorCode = "SUBSCRIBER_GRANT_EMPTY"
+
+	// ErrSubscriberProvisioningTimeout is a credential issuance that ran out of time
+	// rather than one that failed.
+	//
+	// Issuance runs under a single deadline (requirement R-7's five-second budget), and
+	// the registry reads it makes before the broker is touched — claiming the
+	// provisioning fence, then reading the row — share it. Those reads used to report a
+	// spent budget or a cancelled caller through the repository's generic internal-server
+	// code, so a pure timeout arrived as HTTP 500: a client cannot tell that from a
+	// defect in this service, and the correct reaction to the two is opposite. A defect
+	// must not be retried into a loop; a timeout should be retried, and safely can be,
+	// because nothing has been written when it happens on these paths.
+	//
+	// 504 rather than 503, and the distinction is the dependency: 503 (as used by
+	// ErrKafkaUnavailable and ErrSubscriberProvisioningFailed) says a dependency is
+	// unreachable or unconfigured, while 504 says one was reached and did not answer
+	// inside the time allowed. A caller cancelling its own request resolves here too —
+	// it is not a server fault either, and the status a caller that has gone away never
+	// reads matters far less than the typed code its retry logic and this deployment's
+	// logs discriminate on.
+	ErrSubscriberProvisioningTimeout ErrorCode = "SUBSCRIBER_PROVISIONING_TIMEOUT"
 )
 
 // statusByCode is the single source of truth for the default HTTP status of
@@ -298,10 +337,15 @@ var statusByCode = map[ErrorCode]int{
 	// Also 503: a dependency of issuance is unconfigured, not a malformed request.
 	ErrSubscriberBrokersNotConfigured: http.StatusServiceUnavailable,
 
-	// 409 for both refusals below: the request is well formed and it is the registry
-	// row's state that has to change before it can be honoured.
+	// 409 for the three refusals below: the request is well formed and it is the
+	// registry row's state that has to change before it can be honoured.
 	ErrSubscriberIsolationUnenforceable: http.StatusConflict,
 	ErrSubscriberDeprovisioning:         http.StatusConflict,
+	ErrSubscriberGrantEmpty:             http.StatusConflict,
+	// 504 rather than 503: the dependency answered too slowly, or the caller went
+	// away, and neither is a defect in this service. Without this entry a spent
+	// issuance budget resolves to the unknown-code 500 default.
+	ErrSubscriberProvisioningTimeout: http.StatusGatewayTimeout,
 
 	// Legacy codes — same statuses MapErrorToHTTPStatus implied, with the
 	// BAD_REQUEST omission fixed (it previously fell through to 500).

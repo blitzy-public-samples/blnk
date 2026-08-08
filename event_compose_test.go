@@ -17,10 +17,15 @@ limitations under the License.
 package blnk
 
 import (
+	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -314,4 +319,233 @@ func composeStringList(t *testing.T, raw interface{}) []string {
 
 		return nil
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The shipped defaults must be defaults scripts/kafka-provision.sh ACCEPTS
+// ---------------------------------------------------------------------------
+
+// kafkaProvisionScript is the provisioning entrypoint both the compose kafka-init service and
+// the makefile's kafka_provision target run.
+const kafkaProvisionScript = "scripts/kafka-provision.sh"
+
+// kafkaProvisionValidationComplete is the line the script logs once every PURE decision has
+// been made — geometry, iterations, the topic catalogue, and all three principals — and before
+// it touches the network. Reaching it means every value it was handed was accepted; failing to
+// reach it means one of them was refused.
+//
+// It is the only synchronisation point in the script that separates "the configuration is
+// usable" from "the broker is reachable", which is what lets the assertion below run in CI
+// with no Docker and no Kafka CLI.
+const kafkaProvisionValidationComplete = "resolved the topic catalogue"
+
+// TestCompose_EveryShippedKafkaDefaultIsAcceptedByTheProvisioningScript closes the gap that let
+// the local stack ship unprovisionable.
+//
+// # What was wrong
+//
+// Both compose files passed the kafka-init service
+// `KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX: ${KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX:-blnk-sample-subscriber}`
+// and .env.example set the same unterminated value uncommented. The script DERIVES that
+// namespace as the principal plus the group terminator — "blnk-sample-subscriber." — and
+// refuses any explicit value that differs, because the namespace is granted as a PREFIXED ACL
+// and choosing it means choosing how far the grant reaches. So
+// `docker compose --profile kafka up -d kafka kafka-init` and `make kafka_provision` BOTH
+// exited 1 with "Nothing has been provisioned", every time, on a clean checkout — and because
+// compose resolves `${VAR:-default}` for an empty value as well as an unset one, no value an
+// operator could export would suppress it.
+//
+// # Why the existing tests could not catch it
+//
+// event_compose_test.go and event_stack_test.go read the kafka-init environment block and
+// assert things ABOUT it — that no secret carries a literal default, that the worker holds no
+// administrative credential. event_provisioning_test.go asserts the script's own credential
+// floors. Nothing compared the two: no test asked whether the values one side SENDS are values
+// the other side ACCEPTS. That is a whole class of defect, not one variable, and it is
+// invisible to both halves read alone.
+//
+// # What this asserts, and why by execution
+//
+// The compose defaults and .env.example's assignments are collected exactly as a plain
+// bring-up would resolve them, and the real script is then RUN against them. Everything up to
+// the log line above is pure decision-making, so the assertion is that the script reaches it:
+// any refusal of any shipped value happens before it and is reported here with the script's own
+// words. Re-implementing the script's validators in Go would only assert that the copy agrees
+// with itself.
+//
+// Only the CREDENTIALS are supplied by the test, because they are the values the repository
+// deliberately does NOT ship (see TestCompose_NoKafkaCredentialIsKnownFromSource and
+// TestEnvExample_ShipsTheKafkaCredentialsEmpty) and without them the script skips the
+// principals whose validation is most of the point. Everything else is exactly what a clean
+// checkout sends.
+func TestCompose_EveryShippedKafkaDefaultIsAcceptedByTheProvisioningScript(t *testing.T) {
+	root := moduleRootDir(t)
+
+	script := filepath.Join(root, kafkaProvisionScript)
+	if _, err := os.Stat(script); err != nil {
+		require.NoErrorf(t, err, "%s must exist: it is what kafka-init runs", kafkaProvisionScript)
+	}
+
+	// A secret long enough to clear the script's own strength floor, and obviously synthetic.
+	const testSecret = "blnk-compose-guard-secret-0123456789abcdef"
+
+	envExample := envExampleAssignments(t, root)
+
+	for _, composeFile := range composeFiles {
+		t.Run(composeFile, func(t *testing.T) {
+			services := composeServices(t, filepath.Join(root, composeFile), composeFile)
+
+			initService, declared := services["kafka-init"].(map[string]interface{})
+			require.Truef(t, declared, "%s must declare a kafka-init service", composeFile)
+
+			environment, isMap := initService["environment"].(map[string]interface{})
+			require.True(t, isMap, "kafka-init must declare an environment block")
+
+			// A DERIVED value must never arrive with a LITERAL default. Compose substitutes
+			// `${VAR:-default}` for an empty value as well as an unset one, so a non-empty default
+			// here is not a default — it is a value that always arrives, and the only spelling the
+			// script derives is built from another variable in this same block. The key is still
+			// passed, with an empty default, because that is what lets the script SEE a stale
+			// override an operator is still exporting and say it is no longer honoured; dropping
+			// the key would make such a value silently ignored instead. Empty means "derive".
+			if declaredPrefix, passed := environment["KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX"]; passed {
+				assert.Equal(t, "${KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX:-}", declaredPrefix,
+					"%s must pass KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX to kafka-init with an EMPTY "+
+						"default: the consumer-group namespace is DERIVED from the principal by %s, "+
+						"which refuses any namespace it did not derive, and compose has no way to send "+
+						"\"unset\" — so any literal here always arrives and fails provisioning",
+					composeFile, kafkaProvisionScript)
+			}
+
+			// The whole shipped surface, resolved the way a bring-up resolves it: compose's own
+			// defaults first, then .env.example, which is what `make kafka_provision` sources.
+			resolved := composeResolvedDefaults(t, environment)
+			for key, value := range envExample {
+				if strings.HasPrefix(key, "KAFKA_") {
+					resolved[key] = value
+				}
+			}
+
+			// The credentials the repository deliberately ships empty. The administrative
+			// PRINCIPAL is one of them: it is never defaulted, precisely so that no identity is
+			// invented for an operator, so a guard that supplied only the secrets would be
+			// stopped by the half-configured-pair check before reaching anything it is testing.
+			resolved["KAFKA_SASL_ADMIN_USER"] = "admin"
+			resolved["KAFKA_SASL_ADMIN_SECRET"] = testSecret
+			resolved["KAFKA_PRODUCER_SECRET"] = testSecret
+			resolved["KAFKA_SAMPLE_SUBSCRIBER_SECRET"] = testSecret
+
+			// Bounded, and pointed nowhere: the subject is the validation phase, so the network
+			// phase must cost as little as possible whether or not this host has a Kafka CLI.
+			resolved["KAFKA_BOOTSTRAP_SERVER"] = "127.0.0.1:1"
+			resolved["KAFKA_CONTAINER"] = "blnk-provision-guard-no-such-container"
+			resolved["KAFKA_PROVISION_TIMEOUT_SECONDS"] = "1"
+			resolved["KAFKA_PROVISION_POLL_INTERVAL_SECONDS"] = "1"
+			resolved["KAFKA_CLI_TIMEOUT_SECONDS"] = "2"
+
+			output, err := runKafkaProvisionValidation(t, root, resolved)
+
+			assert.Containsf(t, output, kafkaProvisionValidationComplete,
+				"%s refused a value %s ships to kafka-init, so the documented local bring-up cannot "+
+					"provision the broker. The script stopped during validation, before it reached %q. "+
+					"Its own words:\n%s\n(exit: %v)",
+				kafkaProvisionScript, composeFile, kafkaProvisionValidationComplete, output, err)
+		})
+	}
+}
+
+// envExampleAssignments returns the uncommented assignments .env.example makes.
+//
+// `make kafka_provision` sources .env, and .env is a copy of this template, so a value here is
+// a value the script receives. Commented lines are excluded because they are documentation
+// until an operator uncomments them.
+func envExampleAssignments(t *testing.T, root string) map[string]string {
+	t.Helper()
+
+	contents, err := os.ReadFile(filepath.Join(root, ".env.example"))
+	require.NoError(t, err, ".env.example must be readable")
+
+	assignments := map[string]string{}
+	for _, line := range strings.Split(string(contents), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		key, value, found := strings.Cut(trimmed, "=")
+		if !found {
+			continue
+		}
+
+		assignments[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+
+	return assignments
+}
+
+// composeResolvedDefaults renders a compose environment block the way a bring-up with an empty
+// environment renders it: `${VAR:-default}` becomes the default, `${VAR}` and `${VAR:-}` become
+// empty, and a literal stays as written.
+//
+// Nested references are not resolved. The one place they appear is the publishing services'
+// producer pair, not kafka-init, so leaving such a value empty here reproduces what an operator
+// who set nothing would get — which is the case under test.
+func composeResolvedDefaults(t *testing.T, environment map[string]interface{}) map[string]string {
+	t.Helper()
+
+	interpolation := regexp.MustCompile(`^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?-(.*))?\}$`)
+
+	resolved := make(map[string]string, len(environment))
+	for key, raw := range environment {
+		value, isString := raw.(string)
+		if !isString {
+			// A numeric or boolean scalar, which YAML gives us untyped; render it the way
+			// compose passes it to the process.
+			resolved[key] = fmt.Sprintf("%v", raw)
+
+			continue
+		}
+
+		if match := interpolation.FindStringSubmatch(value); match != nil {
+			resolved[key] = match[2]
+
+			continue
+		}
+
+		resolved[key] = value
+	}
+
+	return resolved
+}
+
+// runKafkaProvisionValidation runs the provisioning script with exactly the supplied
+// environment and returns its combined output.
+//
+// The environment is REPLACED rather than extended, so a KAFKA_* variable that happens to be
+// exported in the developer's or CI runner's shell cannot mask a bad shipped default — the
+// value under test must be the one the repository ships. PATH is minimal for the same reason:
+// it keeps a host that has a Kafka distribution installed from wandering into the network phase
+// on a longer timeout than the bounded one above.
+//
+// A non-zero exit is expected and is not asserted on: the script cannot finish without a
+// broker. The caller asserts on how FAR it got.
+func runKafkaProvisionValidation(t *testing.T, root string, environment map[string]string) (string, error) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	command := exec.CommandContext(ctx, "bash", kafkaProvisionScript)
+	command.Dir = root
+	command.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir()}
+	for key, value := range environment {
+		command.Env = append(command.Env, key+"="+value)
+	}
+
+	output, err := command.CombinedOutput()
+	require.NotErrorIsf(t, ctx.Err(), context.DeadlineExceeded,
+		"%s did not finish inside the guard's budget; its output so far:\n%s",
+		kafkaProvisionScript, output)
+
+	return string(output), err
 }

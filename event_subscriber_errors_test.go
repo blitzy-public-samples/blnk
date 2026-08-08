@@ -297,6 +297,99 @@ func TestNewSubscriberErrorDetail_CannotCarryACause(t *testing.T) {
 	})
 }
 
+// TestSubscriberBrokerReconciliation_ReturnsABoundedDetailForEveryPath covers the three
+// AUTHORIZATION-RECONCILIATION paths, which kept the defect after provisioningFailure was fixed.
+//
+// # Why these three were missed
+//
+// provisioningFailure is the path a credential ISSUANCE fails on, and it was the finding's cited
+// site. The three below fail on the same kind of call — an administrative request to the broker —
+// but from UpdateSubscriber and DeregisterSubscriber, and each passed the wrapped cause straight
+// into apierror.NewAPIError. That function logs what it is given through logrus AND serialises it
+// into the response's `details` member, so a single argument defeated the sanitizing done on the
+// line immediately above it, twice over.
+//
+// The cause here is not a tidy sentence. A refused administrative request comes back from the
+// Kafka client with the whole request appended to it, and a transport failure arrives as a
+// *net.OpError — a struct with exported Op, Net and Addr fields, so marshalling one publishes
+// broker topology as structured JSON rather than merely as text. subscriberHostileCause is
+// exactly that value, and the assertion is made against the MARSHALLED bytes because those are
+// what a caller receives.
+//
+// Every one of the three is reported RETRYABLE, and that is a claim about state rather than
+// optimism: the prune runs before the registry is written, the grant runs after it and is
+// additive, and revocation is idempotent at the broker with a tombstone left on the row.
+func TestSubscriberBrokerReconciliation_ReturnsABoundedDetailForEveryPath(t *testing.T) {
+	renamed := "reconciliation probe"
+
+	cases := []struct {
+		name           string
+		failingMethod  string
+		invoke         func(*subscriberLifecycle) error
+		reasonFragment string
+	}{
+		{
+			name:          "pruning the obsolete grants",
+			failingMethod: "PruneSubscriberAccess",
+			invoke: func(run *subscriberLifecycle) error {
+				_, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
+					SubscriberUpdate{AuthorizedTopics: []string{"blnk.transactions"}})
+
+				return err
+			},
+			reasonFragment: "obsolete Kafka grants",
+		},
+		{
+			name:          "creating the new grants",
+			failingMethod: "GrantSubscriberAccess",
+			invoke: func(run *subscriberLifecycle) error {
+				_, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
+					SubscriberUpdate{Name: &renamed})
+
+				return err
+			},
+			reasonFragment: "new Kafka grants",
+		},
+		{
+			name:          "revoking during deregistration",
+			failingMethod: "RevokeSubscriber",
+			invoke: func(run *subscriberLifecycle) error {
+				_, err := run.service.DeregisterSubscriber(context.Background(), subscriberFixtureID)
+
+				return err
+			},
+			reasonFragment: "Revoking the subscriber's Kafka access",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := newSubscriberLifecycle(t)
+			run.admin.failing(tc.failingMethod, subscriberHostileCause())
+
+			err := tc.invoke(run)
+			require.Error(t, err, "a broker refusal must not be reported as success")
+
+			var apiErr apierror.APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, apierror.ErrSubscriberProvisioningFailed, apiErr.Code)
+
+			detail, ok := apiErr.Details.(SubscriberErrorDetail)
+			require.True(t, ok,
+				"the detail must be the bounded type, not the cause; got %T", apiErr.Details)
+			assert.Contains(t, detail.Reason, tc.reasonFragment,
+				"the reason must say which reconciliation step failed, in fixed wording")
+			assert.Equal(t, subscriberFixtureID, detail.SubscriberID)
+			assert.True(t, detail.Retryable,
+				"each of these three leaves a state a repeat of the same request completes")
+
+			body := requireNoHostileFragments(t, err)
+			assert.NotContains(t, body, "blnk-sub-"+subscriberFixtureID,
+				"the response must not name the Kafka principal whose reconciliation just failed")
+		})
+	}
+}
+
 // TestSubscriberService_AdminConstructionFailureWithholdsTheCause covers the
 // administrative-client path, which is the most disclosure-prone in the file.
 //

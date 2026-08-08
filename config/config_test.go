@@ -194,6 +194,12 @@ func TestLoadConfigFromFile(t *testing.T) {
 	// load then correctly refuses. The refusal is the intended behaviour; inheriting the
 	// variable is not.
 	clearEventStreamingEnv(t)
+	// And the BLNK_-prefixed forms, for the same reason applied to the rest of the
+	// configuration tree: the assertions below say a value came out of the FILE, and
+	// an exported BLNK_DATA_SOURCE_DNS — the ordinary way to point this suite at a
+	// relocated Postgres — overlays it, so without this sweep the DataSource.Dns
+	// assertion fails while the loader is behaving exactly as designed.
+	clearBlnkPrefixedEnv(t)
 
 	// Create a temporary file
 	tmpFile, err := os.CreateTemp("", "blnk.json")
@@ -266,6 +272,12 @@ func TestLoadConfigFromFileMonitoringDSN(t *testing.T) {
 	// deprecation window, so an inherited KAFKA_BROKERS would make the load refuse and the
 	// monitoring DSN assertion never run.
 	clearEventStreamingEnv(t)
+	// The BLNK_ sweep is here for the same reason as in TestLoadConfigFromFile, and it is
+	// load-bearing for THIS test specifically: BLNK_MONITORING_DSN and
+	// BLNK_ENABLE_OBSERVABILITY are exactly the two variables a deployment exports, and
+	// either one would make the assertions below read the environment's value while
+	// claiming to read the file's.
+	clearBlnkPrefixedEnv(t)
 
 	tmpFile, err := os.CreateTemp("", "blnk.json")
 	if err != nil {
@@ -312,6 +324,10 @@ func TestInitConfig(t *testing.T) {
 	// same load pipeline, so an inherited KAFKA_BROKERS with no window in the fixture would
 	// make it refuse.
 	clearEventStreamingEnv(t)
+	// InitConfig goes through envconfig too, so the BLNK_ sweep applies unchanged: both
+	// assertions below name a value written into the fixture, and an ambient
+	// BLNK_PROJECT_NAME or BLNK_DATA_SOURCE_DNS would answer them from the environment.
+	clearBlnkPrefixedEnv(t)
 
 	// Create a temporary file
 	tmpFile, err := os.CreateTemp("", "blnk.json")
@@ -523,6 +539,86 @@ func clearEventStreamingEnv(t *testing.T) {
 				}
 				continue
 			}
+			if err := os.Setenv(key, value); err != nil {
+				t.Errorf("Unable to restore %s during cleanup: %v", key, err)
+			}
+		}
+	})
+}
+
+// blnkEnvPrefix is the prefix envconfig.Process("blnk", …) prepends to every
+// primary key it derives, and therefore the prefix of every variable that can
+// overlay a value read from a configuration file.
+const blnkEnvPrefix = "BLNK_"
+
+// clearBlnkPrefixedEnv unsets every BLNK_-prefixed variable present in the
+// environment and restores exactly those when the test finishes.
+//
+// # Why the tests that load a FILE need this
+//
+// loadConfigFromFile decodes the file and then hands the struct to
+// envconfig.Process("blnk", …), so any BLNK_-prefixed variable exported by the
+// surrounding shell wins over the file. A test that writes a fixture and then
+// asserts a value came out of that fixture is therefore asserting a property of
+// the machine it runs on, not of the loader: exporting BLNK_DATA_SOURCE_DNS —
+// which a developer pointing the suite at a relocated Postgres does as a matter
+// of course, and which the project's own test guidance discusses — made
+// TestLoadConfigFromFile and TestInitConfig fail on the DataSource.Dns
+// assertion while the loader was behaving exactly as designed.
+//
+// # Why the sweep is by prefix rather than by an enumerated key list
+//
+// eventStreamingEnvKeys can be enumerated because those keys are a closed,
+// deliberately-designed set with three spellings each. The Configuration tree is
+// not: every exported field of every nested struct yields a key, and a field
+// added later would silently re-open the same hole in a list that looked
+// complete. Sweeping the prefix covers the whole tree by construction, including
+// the BLNK_KAFKA_* forms, and cannot rot.
+//
+// # Why unset rather than set-to-empty
+//
+// envconfig applies an EMPTY value as a real override — it checks whether the
+// variable is present, not whether it is non-blank — so t.Setenv(key, "") would
+// blank the field instead of leaving the file's value alone, and for the two
+// required fields that turns a hermeticity fix into a validation failure. The
+// variables must genuinely be absent, which only os.Unsetenv achieves.
+//
+// # Composition with clearEventStreamingEnv
+//
+// Both helpers save what they find and restore only that, so calling them
+// together is safe in either order: whichever runs first takes ownership of the
+// keys they share, the second finds them already absent, and t.Cleanup's LIFO
+// ordering hands the original values back. A variable the TEST sets for itself
+// afterwards — BLNK_PROJECT_NAME in TestLoadConfigFromFile — is unaffected,
+// because this sweep has already run by then.
+//
+// Parameters:
+//   - t *testing.T: the test. A variable that can be neither unset nor restored
+//     fails the test rather than being ignored, because either one silently
+//     re-opens the hole this closes.
+func clearBlnkPrefixedEnv(t *testing.T) {
+	t.Helper()
+
+	saved := make(map[string]string)
+	for _, entry := range os.Environ() {
+		// os.Environ returns KEY=VALUE; a value may itself contain '=', so the
+		// split is on the FIRST separator only.
+		separator := strings.Index(entry, "=")
+		if separator <= 0 {
+			continue
+		}
+		key := entry[:separator]
+		if !strings.HasPrefix(key, blnkEnvPrefix) {
+			continue
+		}
+		saved[key] = entry[separator+1:]
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("Unable to unset %s: %v", key, err)
+		}
+	}
+
+	t.Cleanup(func() {
+		for key, value := range saved {
 			if err := os.Setenv(key, value); err != nil {
 				t.Errorf("Unable to restore %s during cleanup: %v", key, err)
 			}
@@ -3255,6 +3351,294 @@ func TestWebhookConfig_AllowPrivateDestinationDefaultsToRefusing(t *testing.T) {
 
 		if !asserted.Notification.Webhook.AllowPrivateDestination {
 			t.Error("a default setter must not overwrite an assertion the operator made")
+		}
+	})
+}
+
+// TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable is the test for the defect that
+// the event pipeline's designed diagnostics could not be switched on in a deployed binary.
+//
+// The relay's successful-publish line, the publisher's equivalent, the metrics collector's
+// per-tick summary and the consumer-lag retirement notice are all emitted at debug on
+// purpose — they are per-event or per-tick, and at 500 events a second a line saying "it
+// worked" is volume rather than observability. Nothing in the codebase called
+// logrus.SetLevel, though, so every built binary sat at logrus's default of info and those
+// lines were unreachable without recompiling: a delivery investigation had only failure
+// lines and batch counts to work from.
+//
+// Each sub-test below is one of the three outcomes the resolution has, and the third is the
+// one with teeth: BLANK MUST NOT TOUCH THE LOGGER. This runs from validateAndAddDefaults,
+// which MockConfig also calls, and several tests in the root package pin the level to
+// capture a debug-only line. An unconditional SetLevel here would undo those pins from
+// inside the configuration layer, and the failure would appear in an unrelated package.
+func TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable(t *testing.T) {
+	pinLevel := func(t *testing.T, level logrus.Level) {
+		t.Helper()
+
+		previous := logrus.GetLevel()
+		t.Cleanup(func() { logrus.SetLevel(previous) })
+		logrus.SetLevel(level)
+	}
+
+	t.Run("a stated level is applied and normalised", func(t *testing.T) {
+		for stated, want := range map[string]logrus.Level{
+			"debug":   logrus.DebugLevel,
+			"DEBUG":   logrus.DebugLevel,
+			" trace ": logrus.TraceLevel,
+			"warn":    logrus.WarnLevel,
+			"warning": logrus.WarnLevel,
+			"error":   logrus.ErrorLevel,
+		} {
+			t.Run(stated, func(t *testing.T) {
+				pinLevel(t, logrus.InfoLevel)
+
+				cnf := eventStreamingBaseConfig()
+				cnf.LogLevel = stated
+
+				if err := cnf.validateAndAddDefaults(); err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+
+				if logrus.GetLevel() != want {
+					t.Errorf("Expected the logger at %s, got %s — a configured level that is not "+
+						"applied leaves the pipeline's debug diagnostics as unreachable as they were "+
+						"with no setting at all", want, logrus.GetLevel())
+				}
+				if cnf.LogLevel != want.String() {
+					t.Errorf("Expected the field normalised to %q so it reports what the logger is "+
+						"actually set to, got %q", want.String(), cnf.LogLevel)
+				}
+			})
+		}
+	})
+
+	t.Run("an unparseable level warns and keeps the level in force", func(t *testing.T) {
+		pinLevel(t, logrus.InfoLevel)
+
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		cnf := eventStreamingBaseConfig()
+		cnf.LogLevel = "verbose"
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("a typo in a diagnostic control must not stop the process starting, got %v", err)
+		}
+
+		if logrus.GetLevel() != logrus.InfoLevel {
+			t.Errorf("Expected the level in force to be kept, got %s", logrus.GetLevel())
+		}
+		if cnf.LogLevel != logrus.InfoLevel.String() {
+			t.Errorf("Expected the field to report the level actually in force rather than the "+
+				"rejected text, got %q", cnf.LogLevel)
+		}
+
+		var warned bool
+		for _, entry := range hook.AllEntries() {
+			if strings.Contains(entry.Message, "not a level logrus recognises") {
+				warned = true
+				if !strings.Contains(entry.Message, "BLNK_LOG_LEVEL") {
+					t.Error("the warning must name the variable an operator has to correct")
+				}
+			}
+		}
+		if !warned {
+			t.Error("an unparseable level must be reported: silently keeping the default is how an " +
+				"operator concludes the pipeline has no diagnostics rather than that they mistyped")
+		}
+	})
+
+	t.Run("a blank level fills the field and leaves the logger untouched", func(t *testing.T) {
+		pinLevel(t, logrus.DebugLevel)
+
+		cnf := eventStreamingBaseConfig()
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+
+		if logrus.GetLevel() != logrus.DebugLevel {
+			t.Errorf("a configuration that states no level must not reach into the logger: the "+
+				"root package pins the level to capture debug-only lines and MockConfig runs this "+
+				"code, so an unconditional SetLevel breaks those tests from here. Got %s",
+				logrus.GetLevel())
+		}
+		if cnf.LogLevel != DEFAULT_LOG_LEVEL {
+			t.Errorf("Expected the field defaulted to %q so the effective level is readable, got %q",
+				DEFAULT_LOG_LEVEL, cnf.LogLevel)
+		}
+	})
+
+	t.Run("MockConfig resolves the level like any other setting", func(t *testing.T) {
+		pinLevel(t, logrus.InfoLevel)
+
+		cnf := eventStreamingBaseConfig()
+		cnf.LogLevel = "debug"
+		MockConfig(&cnf)
+
+		if logrus.GetLevel() != logrus.DebugLevel {
+			t.Errorf("Expected MockConfig to apply a stated level, got %s", logrus.GetLevel())
+		}
+	})
+}
+
+// TestLoadConfigFromFile_LogLevelResolvesFromTheEnvironment pins the deployment surface of
+// the setting: an operator turning debug on does so with an environment variable, on a
+// running deployment, without editing blnk.json.
+//
+// Both the file value and the environment value are exercised, and the environment must WIN,
+// because that is the whole point of the variable — the file records what the deployment
+// normally runs at and the variable is how an investigation temporarily overrides it.
+func TestLoadConfigFromFile_LogLevelResolvesFromTheEnvironment(t *testing.T) {
+	previous := logrus.GetLevel()
+	t.Cleanup(func() { logrus.SetLevel(previous) })
+
+	writeConfig := func(t *testing.T, level string) string {
+		t.Helper()
+
+		body := map[string]interface{}{
+			"project_name": "Test Project",
+			"data_source":  map[string]string{"dns": "some-dns"},
+			"redis":        map[string]string{"dns": "localhost:6379"},
+		}
+		if level != "" {
+			body["log_level"] = level
+		}
+
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("Unable to encode the configuration: %v", err)
+		}
+
+		path := t.TempDir() + "/blnk.json"
+		if err := os.WriteFile(path, encoded, 0o600); err != nil {
+			t.Fatalf("Unable to write the configuration: %v", err)
+		}
+
+		return path
+	}
+
+	// The variable is cleared explicitly rather than through clearEventStreamingEnv, which
+	// covers the Kafka block only. A value leaking in from the surrounding environment would
+	// satisfy the file-only assertion for the wrong reason.
+	clearLogLevelEnv := func(t *testing.T) {
+		t.Helper()
+
+		saved, existed := os.LookupEnv("BLNK_LOG_LEVEL")
+		if err := os.Unsetenv("BLNK_LOG_LEVEL"); err != nil {
+			t.Fatalf("Unable to unset BLNK_LOG_LEVEL: %v", err)
+		}
+
+		t.Cleanup(func() {
+			if !existed {
+				return
+			}
+			if err := os.Setenv("BLNK_LOG_LEVEL", saved); err != nil {
+				t.Errorf("Unable to restore BLNK_LOG_LEVEL: %v", err)
+			}
+		})
+	}
+
+	t.Run("from the file", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+		clearLogLevelEnv(t)
+		logrus.SetLevel(logrus.InfoLevel)
+
+		if err := loadConfigFromFile(writeConfig(t, "debug")); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+
+		cnf, err := Fetch()
+		if err != nil {
+			t.Fatalf("Expected the configuration to load, got %v", err)
+		}
+		if cnf.LogLevel != "debug" || logrus.GetLevel() != logrus.DebugLevel {
+			t.Errorf("Expected log_level from blnk.json to be applied, got field %q and level %s",
+				cnf.LogLevel, logrus.GetLevel())
+		}
+	})
+
+	t.Run("the environment overrides the file", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+		logrus.SetLevel(logrus.InfoLevel)
+		t.Setenv("BLNK_LOG_LEVEL", "trace")
+
+		if err := loadConfigFromFile(writeConfig(t, "error")); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+
+		cnf, err := Fetch()
+		if err != nil {
+			t.Fatalf("Expected the configuration to load, got %v", err)
+		}
+		if cnf.LogLevel != "trace" || logrus.GetLevel() != logrus.TraceLevel {
+			t.Errorf("Expected BLNK_LOG_LEVEL to win over the file value, got field %q and level %s",
+				cnf.LogLevel, logrus.GetLevel())
+		}
+	})
+
+	t.Run("neither states one, so the shipped default stands", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+		clearLogLevelEnv(t)
+		logrus.SetLevel(logrus.InfoLevel)
+
+		if err := loadConfigFromFile(writeConfig(t, "")); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+
+		cnf, err := Fetch()
+		if err != nil {
+			t.Fatalf("Expected the configuration to load, got %v", err)
+		}
+		if cnf.LogLevel != DEFAULT_LOG_LEVEL || logrus.GetLevel() != logrus.InfoLevel {
+			t.Errorf("Expected %q and an unchanged logger, got field %q and level %s",
+				DEFAULT_LOG_LEVEL, cnf.LogLevel, logrus.GetLevel())
+		}
+	})
+}
+
+// TestLogger_AppliesTheLevelBeforeTheConfigurationIsRead covers the window InitConfig opens:
+// it calls logger() and THEN loads the file, and loading the file logs.
+//
+// Without the environment read inside logger(), the warnings emitted while a configuration is
+// being validated would be filtered by the PREVIOUS level — which is exactly backwards for
+// the run in which somebody has just turned debug on to find out what happens at start-up.
+func TestLogger_AppliesTheLevelBeforeTheConfigurationIsRead(t *testing.T) {
+	previous := logrus.GetLevel()
+	t.Cleanup(func() { logrus.SetLevel(previous) })
+
+	t.Run("a parseable variable takes effect immediately", func(t *testing.T) {
+		logrus.SetLevel(logrus.InfoLevel)
+		t.Setenv("BLNK_LOG_LEVEL", "debug")
+
+		logger()
+
+		if logrus.GetLevel() != logrus.DebugLevel {
+			t.Errorf("Expected debug before any configuration was read, got %s", logrus.GetLevel())
+		}
+	})
+
+	t.Run("an unparseable variable is left for the configuration layer to report", func(t *testing.T) {
+		logrus.SetLevel(logrus.InfoLevel)
+		t.Setenv("BLNK_LOG_LEVEL", "chatty")
+
+		logger()
+
+		if logrus.GetLevel() != logrus.InfoLevel {
+			t.Errorf("Expected the level unchanged, got %s", logrus.GetLevel())
+		}
+	})
+
+	t.Run("no variable changes nothing", func(t *testing.T) {
+		logrus.SetLevel(logrus.WarnLevel)
+		if err := os.Unsetenv("BLNK_LOG_LEVEL"); err != nil {
+			t.Fatalf("Unable to unset BLNK_LOG_LEVEL: %v", err)
+		}
+
+		logger()
+
+		if logrus.GetLevel() != logrus.WarnLevel {
+			t.Errorf("Expected the level unchanged, got %s", logrus.GetLevel())
 		}
 	})
 }

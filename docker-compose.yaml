@@ -628,9 +628,20 @@ services:
     # offers. See the kafka service for what the profile buys and how to select it.
     profiles: ["kafka"]
     image: ${KAFKA_IMAGE:-apache/kafka:3.9.2}
-    # restart: on-failure, never "always": the script is idempotent and exits 0 on a
-    # run that changes nothing, so this retries a genuine failure without spinning.
-    restart: on-failure
+    # restart: on-failure WITH A BOUND, never "always" and never uncapped: the script is
+    # idempotent and exits 0 on a run that changes nothing, so a retry is worth having
+    # for the transient case - a broker that passed its healthcheck a moment before it
+    # finished loading metadata, a controller election still settling.
+    #
+    # THE CAP IS WHAT MAKES A PERMANENT FAILURE TERMINAL. Uncapped, a misconfiguration
+    # this script refuses - a bad credential, an impossible replication factor, a
+    # rejected variable - restarted for ever, and because server and worker gate on
+    # this service COMPLETING, "docker compose up" never returned and never reported
+    # anything either: the stack sat in a pending state with the real reason buried in a
+    # log that grew a fresh copy of itself every few seconds. Three attempts is enough
+    # for anything transient; past that the container stays Exited(1), the dependency
+    # gate fails fast, and the operator gets one error and one log to read.
+    restart: on-failure:3
     environment:
       TZ: ${TZ:-Etc/UTC}
       # Explicit, and it must be. The provisioning script reads an empty KAFKA_BROKERS as
@@ -715,7 +726,26 @@ services:
       # The producer pair's equivalent is passed for the same reason.
       KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE: ${KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE:-}
       KAFKA_SASL_SECRET_FILE: ${KAFKA_SASL_SECRET_FILE:-}
-      KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX: ${KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX:-blnk-sample-subscriber}
+      # DERIVED, NOT DEFAULTED, which is why the fallback is empty. The consumer-group
+      # namespace is "<principal>." and the script builds it from
+      # KAFKA_SAMPLE_SUBSCRIBER_USER above; a PREFIXED group grant reaches as far as
+      # whoever names it decides, so the name is not an independent input.
+      #
+      # It defaulted to the bare principal here, and that ONE MISSING DELIMITER blocked
+      # every default bring-up: the script cross-checks a supplied value against the
+      # terminated namespace, so kafka-init died, restarted on a loop, and server and
+      # worker - which gate on this service completing - never left "created". Unsetting
+      # the key in .env could not help either, because this expression re-injected the
+      # rejected literal. The key is still PASSED so an operator can supply the
+      # cross-check deliberately (with or without the trailing '.'), and empty means
+      # "follow the principal".
+      #
+      # The delimiter is what stops the grant widening: an UNTERMINATED
+      # "blnk-sample-subscriber" would also match "blnk-sample-subscriber-evil".
+      #
+      # event_compose_test.go resolves this block the way a bring-up does and runs the real
+      # script against it, so the empty default is asserted rather than merely intended.
+      KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX: ${KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX:-}
       # Narrows the sample grant to a subset of the grantable topics. It CANNOT widen it:
       # every entry is checked against the same allowlist, so neither the internal category
       # nor a dead-letter topic can be granted through it.

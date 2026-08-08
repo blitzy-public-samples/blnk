@@ -2222,7 +2222,10 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return result, err
 	default:
-		logrus.WithError(err).WithField("principal", principal).Debug(
+		logrus.WithFields(logrus.Fields{
+			"principal": sanitizeLogValue(principal, maxLoggedFilterLength),
+			"error":     sanitizeLogValue(err.Error(), maxLoggedErrorLength),
+		}).Debug(
 			"kafka admin: could not determine whether the principal already holds a credential; provisioning anyway",
 		)
 	}
@@ -3739,7 +3742,10 @@ func (a *KafkaAdminClient) requireEnforcedAuthorizer(ctx context.Context, princi
 	// is unchanged: an unanswerable probe is still treated as an absent boundary.
 	active, err := a.authorizerActiveCached(ctx)
 	if err != nil {
-		logrus.WithError(err).WithField("principal", principal).Error(
+		logrus.WithFields(logrus.Fields{
+			"principal": sanitizeLogValue(principal, maxLoggedFilterLength),
+			"error":     sanitizeLogValue(err.Error(), maxLoggedErrorLength),
+		}).Error(
 			"kafka admin: refusing to issue a subscriber credential because the broker's ACL enforcement " +
 				"could not be confirmed. Confirm the broker runs " +
 				"authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer and that the " +
@@ -3858,14 +3864,14 @@ func (a *KafkaAdminClient) compensateFailedProvisioning(
 	defer cancel()
 
 	if err := a.deleteACLBindings(ctx, principal, bindings); err != nil {
-		logger.WithError(err).Error(
+		logger.WithField("error", sanitizeLogValue(err.Error(), maxLoggedErrorLength)).Error(
 			"kafka admin: could not remove the ACL bindings of a failed provisioning; " +
 				"remove them manually with kafka-acls before reissuing",
 		)
 	}
 
 	if err := a.RevokeSubscriberPrincipal(ctx, principal); err != nil {
-		logger.WithError(err).Error(
+		logger.WithField("error", sanitizeLogValue(err.Error(), maxLoggedErrorLength)).Error(
 			"kafka admin: A SCRAM CREDENTIAL WAS WRITTEN AND COULD NOT BE REVOKED after provisioning " +
 				"failed. The principal can authenticate and is not recorded in the registry. Delete it " +
 				"manually: kafka-configs --alter --delete-config SCRAM-SHA-512 --entity-type users " +
@@ -4023,7 +4029,10 @@ func (a *KafkaAdminClient) RevokeSubscriber(ctx context.Context, subscriber *mod
 	switch {
 	case credentialErr != nil:
 		if bindingErr != nil {
-			logrus.WithError(bindingErr).WithField("principal", principal).Error(
+			logrus.WithFields(logrus.Fields{
+				"principal": sanitizeLogValue(principal, maxLoggedFilterLength),
+				"error":     sanitizeLogValue(bindingErr.Error(), maxLoggedErrorLength),
+			}).Error(
 				"kafka admin: removing a subscriber's ACL bindings also failed; both need manual attention",
 			)
 		}
@@ -4871,7 +4880,9 @@ func (a *KafkaAdminClient) offsetBounds(
 					"end_offset": offset.LastOffset,
 				})
 				if offset.Error != nil {
-					entry = entry.WithError(offset.Error)
+					entry = entry.WithField(
+						"error", sanitizeLogValue(offset.Error.Error(), maxLoggedErrorLength),
+					)
 				}
 				entry.Warn(
 					"kafka admin: could not read offsets for this partition; it is excluded from the measurement " +
@@ -4956,10 +4967,11 @@ func (a *KafkaAdminClient) committedOffsets(
 
 		for _, offset := range offsets {
 			if offset.Error != nil {
-				logrus.WithError(offset.Error).WithFields(logrus.Fields{
+				logrus.WithFields(logrus.Fields{
 					"group":     sanitizeLogValue(group, maxLoggedFilterLength),
 					"topic":     topic,
 					"partition": offset.Partition,
+					"error":     sanitizeLogValue(offset.Error.Error(), maxLoggedErrorLength),
 				}).Debug("kafka admin: no committed offset available for this partition; treating it as uncommitted")
 
 				continue

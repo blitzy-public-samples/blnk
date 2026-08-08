@@ -213,6 +213,21 @@ services:
       kafka-init:
         condition: service_completed_successfully
         required: false
+      # THE SCHEMA MUST EXIST BEFORE THIS PROCESS READS IT. This file runs migrations as
+      # their own one-shot service, and nothing used to wait for it - a cold boot against an
+      # empty pg_data started serving roughly a second and a half BEFORE "Applied 40
+      # migrations!". That was benign while every reader was request-driven, because the first
+      # request arrived after migration had finished. It stopped being benign when the event
+      # metrics collector began taking its first reading at start-up rather than on a tick:
+      # blnk.event_outbox did not exist yet, so every cold boot logged
+      # `relation "blnk.event_outbox" does not exist` at ERROR twice, plus a collection
+      # warning, and then healed itself - which is exactly the shape of log noise that teaches
+      # an operator to ignore error records.
+      #
+      # The published compose file needs no equivalent: its server entrypoint is
+      # "blnk migrate up && blnk start", which serialises the same ordering in one process.
+      migration:
+        condition: service_completed_successfully
     volumes:
       - ./blnk.json:/blnk.json
 
@@ -324,15 +339,44 @@ services:
       kafka-init:
         condition: service_completed_successfully
         required: false
+      # THE SCHEMA MUST EXIST BEFORE THIS PROCESS READS IT. This file runs migrations as
+      # their own one-shot service, and nothing used to wait for it - a cold boot against an
+      # empty pg_data started serving roughly a second and a half BEFORE "Applied 40
+      # migrations!". That was benign while every reader was request-driven, because the first
+      # request arrived after migration had finished. It stopped being benign when the event
+      # metrics collector began taking its first reading at start-up rather than on a tick:
+      # blnk.event_outbox did not exist yet, so every cold boot logged
+      # `relation "blnk.event_outbox" does not exist` at ERROR twice, plus a collection
+      # warning, and then healed itself - which is exactly the shape of log noise that teaches
+      # an operator to ignore error records.
+      #
+      # The published compose file needs no equivalent: its server entrypoint is
+      # "blnk migrate up && blnk start", which serialises the same ordering in one process.
+      migration:
+        condition: service_completed_successfully
     volumes:
       - ./blnk.json:/blnk.json
 
   migration:
     build: .
     entrypoint: ["blnk", "migrate", "up"]
-    restart: on-failure
+    # BOUNDED, for the same reason kafka-init is: server and worker now wait for this service
+    # to COMPLETE, so an uncapped retry on a permanent failure - a wrong password, a migration
+    # that cannot apply - would leave "docker compose up" waiting for ever with the reason
+    # buried in a log that reprints itself every few seconds. Three attempts covers the
+    # transient case, and the gate below already removes the common one; past that the
+    # container stays Exited(1) and the dependency failure is reported.
+    restart: on-failure:3
+    # HEALTHY, not merely started, now that server and worker gate on this service
+    # COMPLETING. The short list form waits only for the container to exist, so on a cold
+    # boot this one raced PostgreSQL's initdb, exited non-zero, and was restarted until the
+    # database happened to be accepting connections. That was invisible while nothing
+    # depended on it; with the application services waiting for a clean exit it would turn
+    # every cold boot into a restart loop of unpredictable length before anything started.
+    # postgres already declares a pg_isready healthcheck - this waits for it.
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     volumes:
       - ./blnk.json:/blnk.json
 
@@ -622,9 +666,20 @@ services:
     # offers. See the kafka service for what the profile buys and how to select it.
     profiles: ["kafka"]
     image: ${KAFKA_IMAGE:-apache/kafka:3.9.2}
-    # restart: on-failure, never "always": the script is idempotent and exits 0 on a
-    # run that changes nothing, so this retries a genuine failure without spinning.
-    restart: on-failure
+    # restart: on-failure WITH A BOUND, never "always" and never uncapped: the script is
+    # idempotent and exits 0 on a run that changes nothing, so a retry is worth having
+    # for the transient case - a broker that passed its healthcheck a moment before it
+    # finished loading metadata, a controller election still settling.
+    #
+    # THE CAP IS WHAT MAKES A PERMANENT FAILURE TERMINAL. Uncapped, a misconfiguration
+    # this script refuses - a bad credential, an impossible replication factor, a
+    # rejected variable - restarted for ever, and because server and worker gate on
+    # this service COMPLETING, "docker compose up" never returned and never reported
+    # anything either: the stack sat in a pending state with the real reason buried in a
+    # log that grew a fresh copy of itself every few seconds. Three attempts is enough
+    # for anything transient; past that the container stays Exited(1), the dependency
+    # gate fails fast, and the operator gets one error and one log to read.
+    restart: on-failure:3
     environment:
       TZ: ${TZ:-Etc/UTC}
       # Explicit, and it must be. The provisioning script reads an empty KAFKA_BROKERS as
@@ -707,7 +762,26 @@ services:
       # The producer pair's equivalent is passed for the same reason.
       KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE: ${KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE:-}
       KAFKA_SASL_SECRET_FILE: ${KAFKA_SASL_SECRET_FILE:-}
-      KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX: ${KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX:-blnk-sample-subscriber}
+      # DERIVED, NOT DEFAULTED, which is why the fallback is empty. The consumer-group
+      # namespace is "<principal>." and the script builds it from
+      # KAFKA_SAMPLE_SUBSCRIBER_USER above; a PREFIXED group grant reaches as far as
+      # whoever names it decides, so the name is not an independent input.
+      #
+      # It defaulted to the bare principal here, and that ONE MISSING DELIMITER blocked
+      # every default bring-up: the script cross-checks a supplied value against the
+      # terminated namespace, so kafka-init died, restarted on a loop, and server and
+      # worker - which gate on this service completing - never left "created". Unsetting
+      # the key in .env could not help either, because this expression re-injected the
+      # rejected literal. The key is still PASSED so an operator can supply the
+      # cross-check deliberately (with or without the trailing '.'), and empty means
+      # "follow the principal".
+      #
+      # The delimiter is what stops the grant widening: an UNTERMINATED
+      # "blnk-sample-subscriber" would also match "blnk-sample-subscriber-evil".
+      #
+      # event_compose_test.go resolves this block the way a bring-up does and runs the real
+      # script against it, so the empty default is asserted rather than merely intended.
+      KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX: ${KAFKA_SAMPLE_SUBSCRIBER_GROUP_PREFIX:-}
       # Narrows the sample grant to a subset of the grantable topics. It CANNOT widen it:
       # every entry is checked against the same allowlist, so neither the internal category
       # nor a dead-letter topic can be granted through it.

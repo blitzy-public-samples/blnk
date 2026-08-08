@@ -647,6 +647,15 @@ type collectorFakeRegistry struct {
 	rows  []model.EventSubscriber
 	err   error
 	pages []collectorPage
+
+	// revocations is the outstanding-revocation backlog the aggregate read returns, and
+	// revocationErr makes that read fail. They are SEPARATE from rows and err because the two
+	// reads are separate: the revocation backlog is an aggregate that ignores the paging
+	// budget and the lag sweep's skip rules, so a test must be able to fail one without the
+	// other.
+	revocations    model.SubscriberRevocationBacklog
+	revocationErr  error
+	revocationCall int
 }
 
 // collectorPage is one recorded enumeration request, so the paging and the budget can be
@@ -654,6 +663,24 @@ type collectorFakeRegistry struct {
 type collectorPage struct {
 	limit  int
 	offset int
+}
+
+// CountSubscriberRevocationsPending returns the seeded backlog and counts its calls, so a test
+// can assert that the collector reads it ONCE per tick — an aggregate consulted per subscriber
+// would defeat the reason it is an aggregate.
+func (r *collectorFakeRegistry) CountSubscriberRevocationsPending(
+	_ context.Context,
+) (model.SubscriberRevocationBacklog, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.revocationCall++
+
+	if r.revocationErr != nil {
+		return model.SubscriberRevocationBacklog{}, r.revocationErr
+	}
+
+	return r.revocations, nil
 }
 
 func (r *collectorFakeRegistry) ListEventSubscribers(
@@ -2019,4 +2046,191 @@ func readYAMLFile(t *testing.T, path string) map[string]interface{} {
 	require.NoError(t, yaml.Unmarshal(contents, &parsed), "%s must be valid YAML", path)
 
 	return parsed
+}
+
+// collectorRecordedFloat64Gauge records Float64Gauge measurements, so the revocation-age gauge
+// can be asserted by value — including the explicit zero a settled backlog must publish.
+type collectorRecordedFloat64Gauge struct {
+	embedded.Float64Gauge
+
+	mu      sync.Mutex
+	records []float64
+}
+
+var _ otelmetric.Float64Gauge = (*collectorRecordedFloat64Gauge)(nil)
+
+func (g *collectorRecordedFloat64Gauge) Record(_ context.Context, value float64, _ ...otelmetric.RecordOption) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	g.records = append(g.records, value)
+}
+
+func (g *collectorRecordedFloat64Gauge) Enabled(context.Context) bool { return true }
+
+func (g *collectorRecordedFloat64Gauge) values() []float64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return append([]float64(nil), g.records...)
+}
+
+// captureRevocationGauges swaps both outstanding-revocation gauges for recorders.
+//
+// Both, together, because they are published as a pair and a fix that recorded only the count
+// would leave the alert — which reads the AGE — as un-fireable as it was before.
+func captureRevocationGauges(t *testing.T) (*collectorRecordedInt64Gauge, *collectorRecordedFloat64Gauge) {
+	t.Helper()
+
+	count := &collectorRecordedInt64Gauge{}
+	age := &collectorRecordedFloat64Gauge{}
+
+	originalCount := metrics.SubscriberRevocationsPending
+	originalAge := metrics.OldestSubscriberRevocationAgeSeconds
+	t.Cleanup(func() {
+		metrics.SubscriberRevocationsPending = originalCount
+		metrics.OldestSubscriberRevocationAgeSeconds = originalAge
+	})
+
+	metrics.SubscriberRevocationsPending = count
+	metrics.OldestSubscriberRevocationAgeSeconds = age
+
+	return count, age
+}
+
+// TestEventMetricsCollector_PublishesTheOutstandingRevocationBacklog is the fix for two gauges
+// that were declared, initialised and NEVER RECORDED.
+//
+// Deregistration revokes at the broker and only then deletes the registry row, so a row still
+// carrying revocation_pending_at is a principal that may still authenticate while nothing in
+// Blnk records an issuance for it. The alert on the age of the oldest such marker
+// (SubscriberRevocationOutstanding, blnk_subscribers_oldest_revocation_age_seconds > 3600)
+// therefore had no series to evaluate: its rule health read as fine and its state as
+// permanently inactive — the failure mode where an alert that cannot fire is indistinguishable
+// from a system with nothing wrong.
+func TestEventMetricsCollector_PublishesTheOutstandingRevocationBacklog(t *testing.T) {
+	t.Run("an outstanding backlog is published as a count and an age", func(t *testing.T) {
+		count, age := captureRevocationGauges(t)
+
+		registry := &collectorFakeRegistry{}
+		registry.revocations = model.SubscriberRevocationBacklog{
+			Pending:         3,
+			OldestPendingAt: time.Now().UTC().Add(-90 * time.Minute),
+		}
+
+		collector := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, nil)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Equal(t, []int64{3}, count.values(),
+			"the count must be published so an operator can tell one stuck subscriber from a "+
+				"broker that has been unreachable for an hour")
+
+		require.Len(t, age.values(), 1, "the AGE is the alertable quantity and must be published")
+		assert.InDelta(t, (90 * time.Minute).Seconds(), age.values()[0], 5,
+			"the age must be in SECONDS, matching the instrument's declared unit and the 3600 "+
+				"threshold in alerts/blnk-kafka-alerts.yml")
+		assert.Greater(t, age.values()[0], 3600.0,
+			"and a 90-minute-old marker must therefore be able to cross that threshold")
+
+		assert.Equal(t, int64(3), report.RevocationsPending)
+		assert.InDelta(t, (90 * time.Minute).Seconds(), report.OldestRevocationAge.Seconds(), 5)
+		assert.Equal(t, 1, registry.revocationCall,
+			"one aggregate read per tick: consulting it per subscriber would defeat the reason it "+
+				"is an aggregate rather than a walk of the registry")
+	})
+
+	t.Run("a settled backlog publishes an explicit zero", func(t *testing.T) {
+		count, age := captureRevocationGauges(t)
+
+		// The zero instant is what the repository returns when MIN() is NULL. Subtracting it
+		// blindly would publish an age of fifty-odd years and pin the alert permanently.
+		registry := &collectorFakeRegistry{}
+		registry.revocations = model.SubscriberRevocationBacklog{}
+
+		_, err := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, nil).
+			Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Equal(t, []int64{0}, count.values(),
+			"zero must be published explicitly, so 'nothing owed' is distinguishable from 'the "+
+				"collector stopped'")
+		assert.Equal(t, []float64{0}, age.values(),
+			"and the age must be zero rather than the age of the epoch")
+	})
+
+	t.Run("a failed read publishes nothing and is reported", func(t *testing.T) {
+		count, age := captureRevocationGauges(t)
+
+		registry := &collectorFakeRegistry{}
+		registry.revocationErr = errors.New("dial tcp: connection refused")
+
+		_, err := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, nil).
+			Collect(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "counting outstanding subscriber revocations")
+
+		assert.Empty(t, count.values(),
+			"a zero on a failed read would assert that everything is settled on the strength of a "+
+				"reading that does not exist")
+		assert.Empty(t, age.values())
+	})
+
+	t.Run("it is measured with no broker configured", func(t *testing.T) {
+		// The commonest reason a marker exists at all is that the broker was unreachable when
+		// the deregistration tried to revoke. Skipping the measurement without a broker — as
+		// the consumer-lag sweep correctly does — would hide the backlog exactly while it grew.
+		count, age := captureRevocationGauges(t)
+
+		registry := &collectorFakeRegistry{}
+		registry.revocations = model.SubscriberRevocationBacklog{
+			Pending:         1,
+			OldestPendingAt: time.Now().UTC().Add(-2 * time.Minute),
+		}
+
+		_, err := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, nil).
+			Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Equal(t, []int64{1}, count.values())
+		require.Len(t, age.values(), 1)
+		assert.Positive(t, age.values()[0])
+	})
+
+	t.Run("a collector with no registry publishes nothing rather than a zero", func(t *testing.T) {
+		count, age := captureRevocationGauges(t)
+
+		_, err := NewEventMetricsCollector(newCollectorFakeOutbox(), nil, nil, nil).
+			Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Empty(t, count.values(), "with no registry surface a zero would be an invention")
+		assert.Empty(t, age.values())
+	})
+}
+
+// TestSubscriberRevocationBacklog_OldestAgeIsNeverNegativeOrEpochal covers the two readings
+// that would each break the alert in a different direction.
+//
+// The zero instant means "nothing outstanding" and must produce a zero age, not the age of the
+// epoch — which would exceed every threshold for ever. A marker stamped in the FUTURE is
+// possible because the deregistering process stamps it and the collecting process reads it, two
+// clocks with independent skew, and a negative age would be nonsense on a gauge measuring how
+// long something has been owed.
+func TestSubscriberRevocationBacklog_OldestAgeIsNeverNegativeOrEpochal(t *testing.T) {
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+
+	assert.Zero(t, model.SubscriberRevocationBacklog{}.OldestAge(now),
+		"nothing outstanding is an age of zero, not fifty-six years")
+
+	assert.Zero(t, model.SubscriberRevocationBacklog{
+		Pending:         1,
+		OldestPendingAt: now.Add(time.Minute),
+	}.OldestAge(now), "clock skew must clamp to zero rather than report a negative age")
+
+	assert.Equal(t, 45*time.Minute, model.SubscriberRevocationBacklog{
+		Pending:         1,
+		OldestPendingAt: now.Add(-45 * time.Minute),
+	}.OldestAge(now))
 }

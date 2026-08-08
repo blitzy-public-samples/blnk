@@ -368,7 +368,24 @@ type eventOutbox interface {
 	// with nothing anywhere to show it happened.
 	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) // Claims pending entries FIFO for publishing, one row per partition key, taking a lease and stamping a claim token
 	MarkEventDispatched(ctx context.Context, id int64, claimToken string, record model.BrokerRecord) error               // Marks a claimed entry dispatched after the broker acknowledges the publish, persisting the coordinate the broker assigned
+
+	// MarkEventPermanentlyFailed records an attempt that failed PERMANENTLY, so the row
+	// becomes failed on this attempt whatever budget remained and the dead-letter write
+	// is owed at once.
 	//
+	// It is separate from MarkEventFailed because the decision is taken somewhere else.
+	// MarkEventFailed asks the DATABASE whether the budget is spent, which is what stops
+	// two racing instances both concluding they were the last attempt; this one carries a
+	// verdict the PUBLISHER reached about the broker's answer — an unauthorised principal,
+	// a destination outside the topic catalogue, bytes that will never parse, a message
+	// over the size limit. Spending four more attempts on any of those establishes
+	// nothing and delays the operator's sight of the event by the whole backoff schedule.
+	//
+	// It retains the claim token for the same reason MarkEventFailed's exhaustion arm
+	// does: the dead-letter write and the transition that records it are still owed, and
+	// only the worker holding the token may perform them.
+	MarkEventPermanentlyFailed(ctx context.Context, id int64, claimToken, errMsg string) (model.EventFailureOutcome, error)
+
 	// MarkEventFailed's terminal parameter is the CALLER'S VERDICT that no further
 	// attempt can succeed, and it is one input to the same in-SQL decision the attempt
 	// arithmetic feeds. The publisher already classifies a failure as transient or
@@ -736,6 +753,16 @@ type eventSubscriber interface {
 	// It is idempotent and KEEPS THE FIRST INSTANT, because the value an operator
 	// needs is how long the revocation has been outstanding.
 	MarkSubscriberRevocationPending(ctx context.Context, subscriberID string, pendingAt time.Time) (*model.EventSubscriber, error)
+
+	// CountSubscriberRevocationsPending reports how many subscribers still owe a
+	// broker-side credential revocation and when the oldest obligation was recorded.
+	//
+	// It is an AGGREGATE rather than a listing, matching CountEventOutboxByStatus: the
+	// cost of observing a backlog must not grow with the backlog, and the two gauges it
+	// feeds — plus the alert on the age of the oldest — need a number, not the rows.
+	// Without it those gauges were declared, initialised and never recorded, so their
+	// alert rule read as healthy and could never fire.
+	CountSubscriberRevocationsPending(ctx context.Context) (model.SubscriberRevocationBacklog, error)
 
 	// ClaimSubscriberForProvisioning fences a subscriber for one issuance or
 	// revocation and returns the token the claim is held under. A live claim held

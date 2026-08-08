@@ -81,6 +81,7 @@ import (
 	"go/parser"
 	"go/token"
 	"math/big"
+	"os"
 	"reflect"
 	"regexp"
 	"strings"
@@ -94,6 +95,7 @@ import (
 	"github.com/brianvoe/gofakeit/v6"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1306,6 +1308,10 @@ func TestEventOutboxTransitions_RefuseABlankClaimToken(t *testing.T) {
 		},
 		"MarkEventFailed": func(ctx context.Context, ds Datasource) error {
 			_, err := ds.MarkEventFailed(ctx, 1, "", "boom", 0, false)
+			return err
+		},
+		"MarkEventPermanentlyFailed": func(ctx context.Context, ds Datasource) error {
+			_, err := ds.MarkEventPermanentlyFailed(ctx, 1, " ", "boom")
 			return err
 		},
 		"MarkEventDeadLettered": func(ctx context.Context, ds Datasource) error {
@@ -4125,6 +4131,12 @@ func TestEventSubscriberRepository_NoMethodReturnsPlaintextSecret(t *testing.T) 
 func quiesceEventOutbox(t *testing.T, ds Datasource, markerPrefix string) {
 	t.Helper()
 
+	// EXCLUSIVE USE OF THE TABLE FIRST, before anything is retired. Retiring is a whole-table
+	// write and the straggler assertion below is a whole-table read, and the root package's live
+	// tiers claim from the same table in another PROCESS — so without this the two corrupt each
+	// other in both directions. lockEventOutboxTier documents it in full.
+	lockEventOutboxTier(t, ds.Conn)
+
 	// Keyed on AGGREGATE_ID and not on event_id. event_id must now be a canonical
 	// UUID — it is the subscriber's idempotency key, so the persistence layer refuses
 	// any other spelling — which leaves no room for a test marker in it. aggregate_id
@@ -4151,15 +4163,31 @@ func quiesceEventOutbox(t *testing.T, ds Datasource, markerPrefix string) {
 		"the event outbox must hold no claim-visible row outside this test's marker once quiesced; "+
 			"a straggler starves this test's fixtures out of the claim batch or blocks their partition key")
 
+	// DELETED, not retired. Retiring took the fixtures out of the claim, which is all the
+	// assertions in this file need, and left every row in the table for ever: one narrow subset
+	// of this tier left 301 rows behind, and four full runs left 5,698. That residue is not
+	// inert. It makes every subsequent claim read past it, it is what made a shared database a
+	// cross-test hazard, and a retired row records the broker coordinate it was dispatched to
+	// under a unique index on (kafka_topic, kafka_partition, kafka_offset) — so after a broker
+	// reset, when topic offsets restart at zero, a stale row's coordinate collides with a live
+	// publish and the relay cannot mark the new row dispatched at all.
+	//
+	// Both the aggregate id and the partition key are matched: newEventOutboxFixture derives
+	// both from the marker, but a test that is ABOUT same-key behaviour sets the aggregate id
+	// itself, and a cleanup that silently stopped covering those rows is the state this replaces.
 	t.Cleanup(func() {
-		_, cleanupErr := ds.Conn.Exec(`
-			UPDATE blnk.event_outbox
-			SET status = 'dispatched', dispatched_at = NOW(), locked_until = NULL, claim_token = NULL
-			WHERE aggregate_id LIKE $1
-			  AND status IN ('pending', 'processing', 'replaying')
+		result, cleanupErr := ds.Conn.Exec(`
+			DELETE FROM blnk.event_outbox
+			WHERE aggregate_id LIKE $1 OR partition_key LIKE $1
 		`, markerPrefix+"%")
 		if cleanupErr != nil {
-			t.Logf("failed to retire event outbox fixtures: %v", cleanupErr)
+			t.Logf("failed to remove event outbox fixtures: %v", cleanupErr)
+
+			return
+		}
+
+		if affected, affectedErr := result.RowsAffected(); affectedErr == nil {
+			t.Logf("removed %d event outbox fixture rows for marker %q", affected, markerPrefix)
 		}
 	})
 }
@@ -4226,7 +4254,7 @@ func claimEventOutboxToken(t *testing.T, ds Datasource, entry *model.EventOutbox
 // projection that returned the normalised bytes — which is precisely the defect the second
 // column removes, and precisely what acceptance criteria V-8 and V-9 compare.
 func TestInsertEventOutbox_RoundTripsThroughTheDatabase_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("roundtrip")
 	quiesceEventOutbox(t, ds, marker)
@@ -4278,7 +4306,7 @@ func TestInsertEventOutbox_RoundTripsThroughTheDatabase_RealDB(t *testing.T) {
 //
 // If the read ever goes back to the JSONB column, this test fails on the first of them.
 func TestInsertEventOutbox_PreservesAHostilePayloadSpellingByteForByte(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("hostile")
 	quiesceEventOutbox(t, ds, marker)
@@ -4318,7 +4346,7 @@ func TestInsertEventOutbox_PreservesAHostilePayloadSpellingByteForByte(t *testin
 // event_outbox_event_id_uidx is what makes event_id usable as the subscriber idempotency
 // key: a consumer can only deduplicate on it if it is genuinely unique in the first place.
 func TestInsertEventOutbox_DuplicateEventIDIsRejectedByTheUniqueIndex_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("dup")
 	quiesceEventOutbox(t, ds, marker)
@@ -4341,7 +4369,7 @@ func TestInsertEventOutbox_DuplicateEventIDIsRejectedByTheUniqueIndex_RealDB(t *
 // the guarantee from both ends: an event cannot outlive a rolled-back mutation, and it
 // cannot go missing from a committed one.
 func TestInsertEventOutboxInTx_RolledBackWithLedgerTransaction_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("r2")
 	quiesceEventOutbox(t, ds, marker)
@@ -4403,7 +4431,7 @@ func TestInsertEventOutboxInTx_RolledBackWithLedgerTransaction_RealDB(t *testing
 // share one aggregate and one ledger, so they would all be pinned to a single Kafka
 // partition and this claim order becomes the order a consumer observes.
 func TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("fifo")
 	quiesceEventOutbox(t, ds, marker)
@@ -4500,7 +4528,7 @@ func TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB(t *testing.T) {
 // The independent row proves the predicate is scoped to the key rather than serialising
 // the whole table, which would have destroyed throughput while passing the ordering test.
 func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("onekey")
 	quiesceEventOutbox(t, ds, marker)
@@ -4586,7 +4614,7 @@ func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(
 // cannot be "tightened" into a stall by someone who reads the predicate and assumes the
 // narrower state list was an oversight.
 func TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("nostall")
 	quiesceEventOutbox(t, ds, marker)
@@ -4640,7 +4668,7 @@ func TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB(
 // is what tells the relay to publish nothing: without it, retrying the webhook would put
 // a duplicate on the topic.
 func TestMarkEventWebhookPending_LeavesTheRowClaimableWithoutBlockingItsKey_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("whpending")
 	quiesceEventOutbox(t, ds, marker)
@@ -4713,7 +4741,7 @@ func TestMarkEventWebhookPending_LeavesTheRowClaimableWithoutBlockingItsKey_Real
 //   - ANOTHER instance's token extends nothing, which is what makes the token an ownership claim
 //     rather than a shared handle.
 func TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("renew")
 	quiesceEventOutbox(t, ds, marker)
@@ -4823,7 +4851,7 @@ func TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB(t
 // A row that WAS preserved is seeded alongside it and must never be claimed, because a repair
 // pass that re-claimed dead-lettered rows would rewrite their dead-letter records for ever.
 func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElseCanReach_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("dltrepair")
 	quiesceEventOutbox(t, ds, marker)
@@ -4955,7 +4983,7 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 //     500-events-per-second target depends on, and asserting the full set was claimed is
 //     what rules that out.
 func TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("conc")
 	quiesceEventOutbox(t, ds, marker)
@@ -5033,7 +5061,7 @@ func TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB(t *testing.T
 // The lease is expired on the DATABASE clock rather than by sleeping: it makes the test
 // fast and immune to any skew between the test process's clock and the server's.
 func TestClaimPendingEventOutbox_ReclaimsAfterLockExpiry_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("expiry")
 	quiesceEventOutbox(t, ds, marker)
@@ -5094,7 +5122,7 @@ func TestClaimPendingEventOutbox_ReclaimsAfterLockExpiry_RealDB(t *testing.T) {
 // every transition A attempts matches no row and is reported as a lost claim. A learns to
 // stop, which is the correct behaviour and the one the old code made impossible.
 func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("stale")
 	quiesceEventOutbox(t, ds, marker)
@@ -5166,7 +5194,7 @@ func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T
 // predicate written as `attempts != max_attempts` would pass the boundary test and let an
 // over-budget row through.
 func TestClaimPendingEventOutbox_SkipsRowsAtMaxAttempts_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("budget")
 	quiesceEventOutbox(t, ds, marker)
@@ -5209,7 +5237,7 @@ func TestClaimPendingEventOutbox_SkipsRowsAtMaxAttempts_RealDB(t *testing.T) {
 //	                              -> dead_lettered (written to the .dlt sibling)
 //	pending -> processing (claim) -> dispatched (broker ack)
 func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("machine")
 	quiesceEventOutbox(t, ds, marker)
@@ -5535,7 +5563,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 // inserted, because the table is shared and holds other tests' rows. An absolute
 // comparison would be wrong even when the code is right.
 func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("count")
 	quiesceEventOutbox(t, ds, marker)
@@ -5613,7 +5641,7 @@ func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testin
 // matters, because the partial predicate confines that sort's input to the claimable
 // working set rather than the whole table. What must NOT appear is a sequential scan.
 func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("plan")
 	quiesceEventOutbox(t, ds, marker)
@@ -6003,6 +6031,62 @@ func planIndexesUsed(planText string) []string {
 	return indexes
 }
 
+// eventOutboxClaimQueries are the four statements that lease rows, named so the
+// invariant below covers all of them rather than whichever one a reader remembers.
+var eventOutboxClaimQueries = map[string]string{
+	"pending claim":            claimPendingEventOutboxQuery,
+	"failed dead-letter claim": claimFailedEventOutboxForDeadLetterQuery,
+	"owed dead-letter claim":   claimEventsOwedDeadLetterQuery,
+	"webhook delivery claim":   claimPendingWebhookDeliveriesQuery,
+}
+
+// TestEventOutboxClaims_KeepTheBatchBoundBindingWithAMaterializedCandidateSet is a
+// STRUCTURAL guard on a defect whose behavioural symptom is plan-dependent.
+//
+// Every one of these statements leases rows and every one bounds the lease with a LIMIT.
+// Written as `WHERE id IN (SELECT … LIMIT $n FOR UPDATE SKIP LOCKED)`, the planner may
+// implement the semi-join as a nested loop that re-executes the subquery once per outer
+// row — and because each execution skips the rows the previous one locked, each returns a
+// different row and the claim leases far more than it asked for. Measured on a six-row
+// backlog with a batch size of two, the pending claim leased all six.
+//
+// The behavioural assertion for that lives in the batch-bound test below, and it is the
+// assertion that caught this. But it only catches it when the planner HAPPENS to choose
+// the nested-loop shape, which depends on table statistics — the defect shipped
+// undetected precisely because on a small table the planner usually chooses a hash
+// semi-join and the bound appears to hold. So the guard here is on the STATEMENT rather
+// than on one execution of it: a MATERIALIZED CTE is evaluated exactly once, which makes
+// the bound a property of the query instead of a property of the plan.
+//
+// Nothing about this test needs a database, which is the point — it holds on every
+// machine and in every run, including the ones where the planner would hide the bug.
+func TestEventOutboxClaims_KeepTheBatchBoundBindingWithAMaterializedCandidateSet(t *testing.T) {
+	for name, query := range eventOutboxClaimQueries {
+		t.Run(name, func(t *testing.T) {
+			require.Contains(t, query, "AS MATERIALIZED",
+				"the candidate selection must be a MATERIALIZED CTE so it is evaluated exactly "+
+					"once; without it the planner may re-execute the LIMIT per outer row and the "+
+					"claim leases more rows than the caller asked for")
+
+			require.Contains(t, query, "WHERE id IN (SELECT id FROM candidates)",
+				"the UPDATE must select its rows from the materialised candidate set rather than "+
+					"from an inline subquery, which is the form that can be re-executed")
+
+			// The precautions the CTE must not have quietly cost: skip-locked concurrency
+			// between relay instances, and the LIMIT itself.
+			require.Contains(t, query, "FOR UPDATE SKIP LOCKED",
+				"several relay instances must still be able to claim disjoint subsets")
+			require.Contains(t, query, "LIMIT $",
+				"the batch size must still be bound rather than inlined or dropped")
+
+			// And the inline shape must be gone rather than merely joined by a CTE: leaving
+			// both would mean the bound holds only for whichever the planner used.
+			assert.NotContains(t, query, "WHERE id IN (\n",
+				"no inline multi-line IN subquery may remain in a claim")
+		})
+	}
+}
+
 // TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB asserts the LIMIT
 // is honoured against a real table, and that repeated bounded claims DRAIN the backlog in
 // occurrence order.
@@ -6012,7 +6096,7 @@ func planIndexesUsed(planText string) []string {
 // batches, not merely within one. Sorting only inside a batch would let a later-occurring
 // event in batch one overtake an earlier-occurring event stranded in batch two.
 func TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("batch")
 	quiesceEventOutbox(t, ds, marker)
@@ -6065,7 +6149,7 @@ func TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB(t *tes
 // row can appear on two pages or on none, and an operator working through a dead-letter
 // backlog would silently skip events.
 func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("dlt")
 	quiesceEventOutbox(t, ds, marker)
@@ -6982,7 +7066,7 @@ func TestAuditTerminalEventRecords_ReportsAFailureRatherThanAnEmptyAudit(t *test
 // scanner agree on where the three columns sit — a scan-order mistake no compiler catches and
 // that surfaces only as mis-assigned field values.
 func TestBrokerCoordinate_RoundTripsThroughTheProjection_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 
 	marker := newRealEventOutboxMarker("coord")
@@ -7013,7 +7097,7 @@ func TestBrokerCoordinate_RoundTripsThroughTheProjection_RealDB(t *testing.T) {
 // in the schema too. Without it, two rows could share one record's corroboration, which is the
 // same double-counting the whole mapping exists to remove.
 func TestBrokerCoordinate_TwoRowsCannotNameTheSameRecord_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 
 	marker := newRealEventOutboxMarker("coorddup")
@@ -7051,7 +7135,7 @@ func TestBrokerCoordinate_TwoRowsCannotNameTheSameRecord_RealDB(t *testing.T) {
 // webhook_pending case is the one most easily got wrong: it is not terminal, but it IS on the
 // topic.
 func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T) {
-	ds := openRealTestDB(t)
+	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 
 	marker := newRealEventOutboxMarker("audit")
@@ -7100,8 +7184,326 @@ func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T)
 	assert.Equal(t, int64(2), after.DistinctRecords-before.DistinctRecords,
 		"and those two coordinates are distinct")
 
+	// THE COORDINATE-LESS ROW MUST NOT COUNT AS A RECORD, and this is the assertion that says
+	// so unconditionally.
+	//
+	// The delta above used to be 3 on an EMPTY table and 2 on a polluted one, because
+	// COUNT(DISTINCT (topic, partition, offset)) counts the all-NULL row constructor as a
+	// distinct value: the unconfirmed row contributed one, unless some earlier test had already
+	// left a coordinate-less published row that contributed it first. So the test passed on
+	// residue and failed the moment fixtures started cleaning up after themselves.
+	//
+	// Stated as an INVARIANT rather than a delta because that is the contract both readers of
+	// this audit rely on: FullyConfirmed requires the two to be equal, and
+	// ReconcileAgainstOutbox derives duplication from their difference, so DistinctRecords
+	// exceeding ConfirmedRows is not a smaller version of the same answer — it is a
+	// wrong one.
+	assert.LessOrEqual(t, after.DistinctRecords, after.ConfirmedRows,
+		"a row that names no coordinate names no record: DistinctRecords may never exceed "+
+			"ConfirmedRows, or FullyConfirmed reports an inconclusive verdict on a healthy outbox "+
+			"and ReconcileAgainstOutbox derives a negative duplication count")
+
 	// The verdict this produces is the whole point: an unconfirmed claim makes it inconclusive
 	// rather than green, however favourable the totals look.
 	assert.False(t, after.FullyConfirmed(),
 		"one row claims a publication it cannot name a record for, so the count is not trustworthy")
+}
+
+// TestMarkEventPermanentlyFailed_EndsTheEventOnThisAttempt covers the transition the relay
+// takes when the publisher reports a failure NO FURTHER ATTEMPT CAN CHANGE — an unauthorised
+// principal, a destination outside the topic catalogue, bytes that will never parse, a message
+// over the size limit.
+//
+// It is a separate statement from MarkEventFailed rather than a flag on it, because the two
+// decisions are taken in different places. MarkEventFailed asks the DATABASE whether the budget
+// is spent, which is what stops two racing instances both concluding they were last; this one
+// carries a verdict the publisher already reached about the broker's answer. Before it existed
+// the relay had nowhere to put that verdict, so a topic-authorisation failure spent all five
+// attempts and ~17 seconds of backoff per event proving the broker meant it.
+//
+// The three properties asserted are the ones the dead-letter hand-off depends on: no budget
+// test in the statement, the attempt counted honestly, and the claim token retained.
+func TestMarkEventPermanentlyFailed_EndsTheEventOnThisAttempt(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("").
+		WithArgs(
+			model.EventOutboxStatusFailed,     // $1 — the only arm there is
+			"topic authorization failed",      // $2 — the reason
+			int64(11),                         // $3 — the row
+			"tok-11",                          // $4 — the claim token
+			model.EventOutboxStatusProcessing, // $5 — the required prior state
+		).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
+			AddRow(model.EventOutboxStatusFailed, int64(1)))
+
+	outcome, err := ds.MarkEventPermanentlyFailed(
+		context.Background(), 11, "tok-11", "topic authorization failed")
+	require.NoError(t, err)
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "SET status = $1",
+		"the row becomes failed unconditionally: the caller established that no further attempt "+
+			"can succeed, so there is no budget arm to choose between")
+	assert.NotContains(t, issued, "max_attempts",
+		"and the statement must NOT consult the budget. Falling back to the max_attempts test "+
+			"would make this transition indistinguishable from the exhaustion arm and reinstate "+
+			"the five wasted attempts it exists to remove")
+	assert.Contains(t, issued, "attempts = attempts + 1",
+		"the attempt is still counted, so the failure metadata reports the number of attempts "+
+			"really made — 1 for a permanent failure, which tells an operator the event never "+
+			"had a chance rather than that it fought for the whole schedule")
+	assert.Contains(t, issued, "first_attempted_at = COALESCE(first_attempted_at, NOW())",
+		"the retry window must still be bounded at both ends for the failure metadata")
+	assert.Contains(t, issued, "locked_until = NULL",
+		"the lease is released; failed is outside the claimable set so nothing re-claims it")
+	// The SET list is inspected on its own, because the WHERE clause legitimately mentions
+	// claim_token and a whole-statement match would pass whatever the assignment said.
+	assignments, _, split := strings.Cut(issued, "WHERE")
+	require.True(t, split, "the statement must be conditional")
+	assert.NotContains(t, assignments, "claim_token",
+		"the claim token must be RETAINED, exactly as the exhaustion arm retains it: the "+
+			"dead-letter write and the transition that records it are still owed and only this "+
+			"worker may perform them, which is what stops two copies reaching one .dlt topic")
+	assert.NotContains(t, assignments, "next_attempt_at",
+		"there is no next attempt to describe, and a future instant on a terminal row would tell "+
+			"an operator triaging the dead-letter backlog that a retry was still coming")
+	assert.Contains(t, issued, "WHERE id = $3 AND claim_token = $4 AND status = $5",
+		"and it stays conditional on the claim, so a worker whose lease expired cannot overwrite "+
+			"the newer state of a row another instance has taken")
+	assert.Contains(t, issued, "RETURNING status, attempts")
+
+	assert.Equal(t, model.EventOutboxStatusFailed, outcome.Status)
+	assert.Equal(t, 1, outcome.Attempts,
+		"one attempt was made, and the outcome must not inflate it to the budget")
+	assert.True(t, outcome.Exhausted,
+		"Exhausted means 'the dead-letter write is now owed' to the caller, which is true here "+
+			"however much budget the row had left")
+	assert.Equal(t, "tok-11", outcome.ClaimToken,
+		"the token must be handed on, or nothing can perform the dead-letter transition")
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestMarkEventPermanentlyFailed_LostClaimIsAConflict mirrors the guard on every other
+// conditional transition.
+//
+// Matching no row means the lease expired and another instance owns the row. Reporting that as
+// success would let the stale worker go on to write the event to the dead-letter topic — a
+// second copy of an event the new owner is also working on, which is precisely the outcome the
+// retained claim token exists to prevent.
+func TestMarkEventPermanentlyFailed_LostClaimIsAConflict(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
+		WillReturnError(sql.ErrNoRows)
+
+	outcome, err := ds.MarkEventPermanentlyFailed(context.Background(), 11, "stale-token", "boom")
+	require.Error(t, err, "a lost claim must NOT be reported as success")
+	assert.Equal(t, model.EventFailureOutcome{}, outcome,
+		"no decision was made, so no decision may be reported — and no dead letter may follow")
+
+	var apiErr apierror.APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, apierror.ErrConflict, apiErr.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// ---------------------------------------------------------------------------
+// Exclusive use of the shared blnk.event_outbox
+//
+// This is the DATABASE-package half of a pair. Its twin is lockEventOutboxTier in the root
+// package's event_recovery_integration_test.go, which carries the full explanation; the short
+// version is that two live tiers in two packages work this one table and neither can be scoped
+// to its own rows:
+//
+//   - The ROOT tiers CLAIM. ClaimPendingEventOutbox takes the oldest pending rows in the whole
+//     table, whoever wrote them, because that is what the relay does in production.
+//   - THIS tier RETIRES every claim-visible row that is not its own and then asserts there are
+//     none, so that its claim assertions read a table it controls.
+//
+// Each therefore breaks the other, and they do not share a process: `go test ./...` runs one
+// binary per package, in parallel, so an in-process mutex is not even available. Observed
+// directly — the root tier timing out on rows this tier had retired, and this tier's straggler
+// assertion tripping on a row the root tier inserted a moment after the retire — failing 3/3 at
+// default parallelism and passing 2/2 under -p 1.
+//
+// A POSTGRES ADVISORY LOCK, held in the same database as the table it protects, is the one
+// mechanism that reaches across processes without changing the production claim query.
+// ---------------------------------------------------------------------------
+
+// eventOutboxTierLockKey identifies the advisory lock the live outbox tiers share.
+//
+// It MUST BE THE SAME VALUE as the constant of the same name in the root package's
+// event_recovery_integration_test.go: two different keys are two different locks and would
+// protect nothing at all.
+const eventOutboxTierLockKey int64 = 0x424c4e4b4f5542 // "BLNKOUB"
+
+// eventOutboxTierLockBudget bounds how long this tier waits for the lock. Longer than the
+// slowest live test in either package, shorter than `go test`'s ten-minute default, so a stuck
+// holder is named here rather than surfacing as an unexplained package timeout.
+const eventOutboxTierLockBudget = 8 * time.Minute
+
+// eventOutboxTierLockPoll is how often the lock is re-attempted.
+const eventOutboxTierLockPoll = 200 * time.Millisecond
+
+// eventOutboxTierLock holds this process's side of the advisory lock.
+//
+// The DEDICATED CONNECTION is load-bearing: a Postgres advisory lock belongs to a SESSION, and
+// database/sql hands out an arbitrary pooled connection per statement, so a lock taken on a pool
+// is released the moment that connection is recycled — a lock that looks held and is not.
+// MaxOpenConns(1) pins one session for the lock's lifetime.
+//
+// The refcount makes acquisition REENTRANT within the process: every _RealDB test in this file
+// calls quiesceEventOutbox, and a test that quiesced twice would otherwise take the lock on two
+// sessions and deadlock against itself.
+var eventOutboxTierLock struct {
+	mu       sync.Mutex
+	holders  int
+	conn     *sql.DB
+	acquired bool
+}
+
+// lockEventOutboxTier takes exclusive use of blnk.event_outbox until the test finishes.
+//
+// Parameters:
+//   - t *testing.T: the test, for cleanup registration and for failing when the lock cannot be
+//     taken.
+//   - pool *sql.DB: the pool whose database holds the outbox. Its DSN is reused for the lock's
+//     own session; the pool itself is never locked on.
+func lockEventOutboxTier(t *testing.T, pool *sql.DB) {
+	t.Helper()
+
+	require.NotNil(t, pool, "the outbox tier lock needs a live pool to derive its session from")
+
+	eventOutboxTierLock.mu.Lock()
+	defer eventOutboxTierLock.mu.Unlock()
+
+	if eventOutboxTierLock.holders == 0 {
+		acquireEventOutboxTierLock(t)
+	}
+
+	eventOutboxTierLock.holders++
+
+	t.Cleanup(releaseEventOutboxTierLock)
+}
+
+// acquireEventOutboxTierLock opens the lock session and blocks until the lock is held.
+//
+// The DSN comes from the same resolution openRealTestDB uses — TEST_DATABASE_URL, falling back
+// to defaultRealTestDSN — so the lock is always taken in the database the tier is working, not
+// in whichever one a configuration store happens to hold.
+func acquireEventOutboxTierLock(t *testing.T) {
+	t.Helper()
+
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = defaultRealTestDSN
+	}
+
+	conn, err := sql.Open("postgres", dsn)
+	require.NoError(t, err, "opening the outbox tier lock session")
+
+	// ONE session, for the reason in the type's comment.
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	conn.SetConnMaxLifetime(0)
+
+	deadline := time.Now().Add(eventOutboxTierLockBudget)
+	for {
+		var held bool
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		queryErr := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`,
+			eventOutboxTierLockKey).Scan(&held)
+		cancel()
+
+		if queryErr != nil {
+			_ = conn.Close()
+			require.NoError(t, queryErr, "taking the outbox tier advisory lock")
+		}
+
+		if held {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			_ = conn.Close()
+			t.Fatalf(
+				"another live outbox tier has held the blnk.event_outbox advisory lock (%d) for %s. "+
+					"The root and database live tiers claim from and retire the whole table, so they take "+
+					"this lock to run one at a time; a holder this long means a test in another package "+
+					"is stuck rather than slow",
+				eventOutboxTierLockKey, eventOutboxTierLockBudget,
+			)
+		}
+
+		time.Sleep(eventOutboxTierLockPoll)
+	}
+
+	eventOutboxTierLock.conn = conn
+	eventOutboxTierLock.acquired = true
+}
+
+// releaseEventOutboxTierLock drops one hold and, when it was the last, the lock itself.
+func releaseEventOutboxTierLock() {
+	eventOutboxTierLock.mu.Lock()
+	defer eventOutboxTierLock.mu.Unlock()
+
+	if eventOutboxTierLock.holders == 0 {
+		return
+	}
+
+	eventOutboxTierLock.holders--
+	if eventOutboxTierLock.holders > 0 || !eventOutboxTierLock.acquired {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Unlocked explicitly AND the session closed. Closing alone would release it — a session
+	// ending drops its advisory locks — but an explicit unlock releases it at a known instant
+	// rather than whenever the pool decides to close the connection.
+	if _, err := eventOutboxTierLock.conn.ExecContext(ctx,
+		`SELECT pg_advisory_unlock($1)`, eventOutboxTierLockKey); err != nil {
+		logrus.WithError(err).Warn("releasing the event outbox tier advisory lock")
+	}
+
+	if err := eventOutboxTierLock.conn.Close(); err != nil {
+		logrus.WithError(err).Warn("closing the event outbox tier advisory lock session")
+	}
+
+	eventOutboxTierLock.conn = nil
+	eventOutboxTierLock.acquired = false
+}
+
+// openLockedEventOutboxDB opens the real test database AND takes exclusive use of
+// blnk.event_outbox for the test's duration.
+//
+// Every _RealDB test in this file goes through it rather than through openRealTestDB directly,
+// and the reason is that the lock has to be held for the WHOLE test, not for the part that
+// happens to quiesce.
+//
+// The audit tests are what made that concrete. They take a GLOBAL before-count, insert their
+// fixtures, transition them, take a global after-count and assert on the DELTA — and they
+// quiesce only in cleanup, so with the lock taken by quiesceEventOutbox alone they ran their
+// whole body unprotected. The root package's relay dispatched one row inside that window and
+// the delta came back as 3 where 2 was asserted: a real defect report about a count that was
+// correct.
+//
+// Acquisition is refcounted, so a test that also quiesces takes the lock once and releases it
+// once.
+//
+// Returns:
+//   - Datasource: the real-database datasource, with the outbox exclusively this test's.
+func openLockedEventOutboxDB(t *testing.T) Datasource {
+	t.Helper()
+
+	ds := openRealTestDB(t)
+	lockEventOutboxTier(t, ds.Conn)
+
+	return ds
 }

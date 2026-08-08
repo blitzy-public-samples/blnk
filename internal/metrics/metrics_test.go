@@ -613,9 +613,17 @@ func TestEventPublishDuration_AcceptsEveryAttemptInTheRetryBudget(t *testing.T) 
 		label := strconv.Itoa(attempt)
 		t.Run("attempt="+label, func(t *testing.T) {
 			require.NotPanics(t, func() {
+				// The WHOLE declared tuple, outcome included, even though this test asserts
+				// only that the attempt label is legal. Recording a subset would put a series
+				// with two of the instrument's three keys into the process, and once a
+				// MeterProvider is installed — which the tests below the SDK line do, once, for
+				// the lifetime of the binary — that series is a second, off-contract shape of
+				// an instrument whose attribute keys are a published contract. It is also what
+				// the exported-attribute-keys assertion used to trip over.
 				EventPublishDuration.Record(ctx, float64(attempt)*0.25, metric.WithAttributes(
 					attribute.String("topic", "blnk.transactions"),
 					attribute.String("attempt", label),
+					attribute.String("outcome", "dispatched"),
 				))
 			})
 		})
@@ -696,8 +704,43 @@ var (
 	installOnce  sync.Once
 )
 
+// perTestTemporality makes the shared reader report DELTA sums and histograms and cumulative
+// gauges.
+//
+// # Why the shared reader cannot be cumulative
+//
+// A shared reader is forced on this file by the once-only meter delegation above, and a
+// CUMULATIVE one accumulates for the lifetime of the process. Every assertion of the form "this
+// measurement landed in exactly one bucket" therefore held only on the FIRST iteration:
+// `go test -count=2` doubled the bucket counts and the file failed with `expected: 0x1, actual:
+// 0x2`, and `-count=3` tripled them. Scoping a data point by a topic value of the test's own —
+// which these tests already did — separates them from EACH OTHER but not from the previous
+// iteration of THEMSELVES, so it could not fix this.
+//
+// Delta resets the accumulation on every collect and drops the series that had no measurements
+// in the interval, which combined with the drain in installSDKReader gives each test a
+// collection containing exactly what that test recorded. That is repeat-safe and
+// order-independent by construction rather than by convention.
+//
+// # Why gauges stay cumulative
+//
+// A gauge reports a LAST VALUE, and delta would retire it from the collection as soon as it had
+// been read once. The descriptor and attribute-key assertions need the gauge present, and its
+// value is not an accumulation, so there is nothing for delta to fix.
+func perTestTemporality(kind sdkmetric.InstrumentKind) metricdata.Temporality {
+	switch kind {
+	case sdkmetric.InstrumentKindCounter,
+		sdkmetric.InstrumentKindUpDownCounter,
+		sdkmetric.InstrumentKindHistogram:
+		return metricdata.DeltaTemporality
+	default:
+		return metricdata.CumulativeTemporality
+	}
+}
+
 // installSDKReader returns the shared SDK-backed manual reader, installing the provider
-// and rebuilding every instrument through it on first use.
+// and rebuilding every instrument through it on first use, and DRAINING whatever was recorded
+// before this test began.
 //
 // Init() is called AFTER the provider is installed, which is what makes the instruments
 // real SDK instruments rather than delegating no-ops: an instrument created before
@@ -705,22 +748,37 @@ var (
 // for the replay to lose an option — and the option that matters most here, the explicit
 // bucket boundaries, is exactly the kind of thing a replay could drop.
 //
-// The reader accumulates cumulatively across the tests that share it, so a test asserting
-// on SERIES COUNTS must scope itself with an attribute value of its own rather than
-// counting everything present.
+// # The drain is the isolation
+//
+// Every test above the SDK line records measurements too, and once the provider is installed
+// those land in this reader as well — TestEventPublishDuration_AcceptsEveryAttemptInTheRetryBudget
+// in particular records the publish-duration histogram with only two of its three attribute
+// keys. From the second iteration onwards, or under any -shuffle order that ran it later, those
+// measurements were still in the reader when a contract assertion collected, and a test reading
+// "the exported attribute keys" could pick up that shape instead of its own.
+//
+// Discarding one collection here draws a line: everything before this test is gone, so the next
+// collection holds this test's measurements and nothing else. Combined with delta temporality
+// above, that makes the file idempotent across iterations.
 //
 // Returns:
-//   - *sdkmetric.ManualReader: the reader to collect from.
+//   - *sdkmetric.ManualReader: the reader to collect from, drained.
 func installSDKReader(t *testing.T) *sdkmetric.ManualReader {
 	t.Helper()
 
 	installOnce.Do(func() {
-		sharedReader = sdkmetric.NewManualReader()
+		sharedReader = sdkmetric.NewManualReader(
+			sdkmetric.WithTemporalitySelector(perTestTemporality),
+		)
 		otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(sharedReader)))
 	})
 
 	require.NoError(t, Init(), "Init must rebuild every instrument through the installed provider")
 	require.NotNil(t, sharedReader, "the shared manual reader was not installed")
+
+	var discarded metricdata.ResourceMetrics
+	require.NoError(t, sharedReader.Collect(context.Background(), &discarded),
+		"draining the shared reader before the test records into it")
 
 	return sharedReader
 }
@@ -1143,7 +1201,20 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 	}
 }
 
-// attributeKeysOf returns the attribute keys of a collected metric's first data point.
+// attributeKeysOf returns the attribute keys a collected metric's data points carry, and
+// requires that EVERY data point agrees on them.
+//
+// The agreement is asserted rather than assumed. Reading the first data point and trusting it
+// was the original shape of this helper, and the order of data points in a collection is not
+// defined — so with more than one series present the answer was whichever the SDK happened to
+// emit first. That made the attribute-key contract assertions nondeterministic the moment
+// anything else had recorded the same instrument with a different key set, which is exactly what
+// happened from the second `-count` iteration onwards.
+//
+// Requiring one key set across every point is also the stronger statement. These keys are a
+// PUBLISHED contract — the alert rules interpolate them and the latency queries select on them —
+// and a second series of the same instrument carrying a different tuple means one of the two
+// producers is off-contract. A helper that reads one point cannot see that at all.
 //
 // The four aggregation shapes are handled explicitly rather than through reflection so
 // that an instrument whose KIND changed — a counter declared as a gauge, say — fails
@@ -1151,24 +1222,46 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 func attributeKeysOf(t *testing.T, m metricdata.Metrics) []string {
 	t.Helper()
 
-	var set attribute.Set
+	var sets []attribute.Set
 	switch data := m.Data.(type) {
 	case metricdata.Sum[int64]:
 		require.NotEmpty(t, data.DataPoints, "%s reported no data points", m.Name)
-		set = data.DataPoints[0].Attributes
+		for _, point := range data.DataPoints {
+			sets = append(sets, point.Attributes)
+		}
 	case metricdata.Gauge[int64]:
 		require.NotEmpty(t, data.DataPoints, "%s reported no data points", m.Name)
-		set = data.DataPoints[0].Attributes
+		for _, point := range data.DataPoints {
+			sets = append(sets, point.Attributes)
+		}
 	case metricdata.Gauge[float64]:
 		require.NotEmpty(t, data.DataPoints, "%s reported no data points", m.Name)
-		set = data.DataPoints[0].Attributes
+		for _, point := range data.DataPoints {
+			sets = append(sets, point.Attributes)
+		}
 	case metricdata.Histogram[float64]:
 		require.NotEmpty(t, data.DataPoints, "%s reported no data points", m.Name)
-		set = data.DataPoints[0].Attributes
+		for _, point := range data.DataPoints {
+			sets = append(sets, point.Attributes)
+		}
 	default:
 		t.Fatalf("%s aggregated as an unexpected shape %T", m.Name, m.Data)
 	}
 
+	keys := attributeSetKeys(sets[0])
+	for _, set := range sets[1:] {
+		require.ElementsMatchf(t, keys, attributeSetKeys(set),
+			"%s exported two series with DIFFERENT attribute keys, %v and %v. The keys are a "+
+				"published contract the alert rules and latency queries name, so two producers "+
+				"disagreeing about them means one of them is off-contract",
+			m.Name, keys, attributeSetKeys(set))
+	}
+
+	return keys
+}
+
+// attributeSetKeys returns the keys of an attribute set, in the set's own order.
+func attributeSetKeys(set attribute.Set) []string {
 	keys := make([]string, 0, set.Len())
 	for _, kv := range set.ToSlice() {
 		keys = append(keys, string(kv.Key))

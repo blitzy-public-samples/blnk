@@ -26,11 +26,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/gin-gonic/gin"
+	"github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -319,4 +322,97 @@ func TestStartEventRelay_WithBrokersConstructsTheRelayAndReturnsItsStop(t *testi
 	assert.Less(t, time.Since(started), eventTopicAssuranceTimeout,
 		"an unreachable broker must not hold start-up for the whole assurance budget: it is refused, "+
 			"logged and stepped past")
+}
+
+// TestAssureEventTopics_WithoutBrokersReportsNothingAtErrorLevel pins the log level of the
+// no-broker steady state, which is a contract rather than a cosmetic preference.
+//
+// KAFKA_BROKERS is empty in the shipped configuration. The publisher resolves to its no-op,
+// producers deliver over the legacy webhook transport, and Blnk serves exactly as it did before
+// Kafka existed — a documented steady state and a validation gate, not a degraded mode.
+//
+// This function asked the admin client to assure topics anyway. The client answered "no brokers
+// are configured", and the answer was logged at ERROR alongside the claim that "the relay still
+// starts" — which was not true on that path. So a default deployment printed two error records
+// that contradicted each other and the info line that followed, and anyone alerting on error
+// severity was paged by a healthy stack. The remedy is to ask the question only when it has an
+// answer.
+func TestAssureEventTopics_WithoutBrokersReportsNothingAtErrorLevel(t *testing.T) {
+	for name, cfg := range map[string]*config.Configuration{
+		"unset":       {Kafka: config.KafkaConfig{Brokers: nil}},
+		"empty":       {Kafka: config.KafkaConfig{Brokers: []string{}}},
+		"blank":       {Kafka: config.KafkaConfig{Brokers: []string{"   "}}},
+		"comma noise": {Kafka: config.KafkaConfig{Brokers: []string{"", " ", ""}}},
+		"unloaded":    nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			hook := logtest.NewGlobal()
+			defer hook.Reset()
+
+			assureEventTopics(context.Background(), cfg)
+
+			for _, entry := range hook.AllEntries() {
+				assert.NotContainsf(t, []logrus.Level{logrus.ErrorLevel, logrus.WarnLevel, logrus.FatalLevel, logrus.PanicLevel},
+					entry.Level,
+					"the no-broker steady state must not report a fault; got %s: %q", entry.Level, entry.Message)
+			}
+		})
+	}
+}
+
+// TestServerCommand_StartsExactlyOneEventRelay is the regression test for a duplicated
+// lifecycle, and the duplication was not cosmetic.
+//
+// The server command used to construct and start a relay INLINE and then call
+// startEventRelay as well, so one process ran two relays: two topic-assurance passes, two
+// sets of broker connections, two dual-delivery enqueue paths, and start and stop lines that
+// each appeared twice — which makes the lifecycle unreadable at exactly the moment somebody
+// is reading it, during an incident. The FOR UPDATE SKIP LOCKED claim tolerated the second
+// claimant, which is precisely why nothing failed and nothing noticed.
+//
+// It was worse on the shipped default. The inline copy did not guard on the broker list, so a
+// deployment with no KAFKA_BROKERS — a legitimate steady state under the graceful-degradation
+// contract — logged the condition twice at ERROR while the guarded helper reported the same
+// condition at info. The identical state was reported simultaneously as a fault and as normal.
+//
+// # Why this is asserted against the source text
+//
+// serverCommands cannot be executed in a unit test: its Run blocks in startServer, needs a
+// database, a router and a TypeSense client, and takes over the process. The two things that
+// went wrong are both STRUCTURAL — how many times a constructor is reached, and whether the
+// unguarded helper is called at all — so the source is the artefact that carries the answer.
+// TestStartEventRelay_* above covers the helper's behaviour; this covers how many times the
+// server command asks for it.
+func TestServerCommand_StartsExactlyOneEventRelay(t *testing.T) {
+	source, err := os.ReadFile("server.go")
+	require.NoError(t, err, "reading cmd/server.go")
+
+	body := string(source)
+
+	assert.Equal(t, 1, strings.Count(body, "startEventRelay(ctx, b.blnk, cfg)"),
+		"the server command must start the relay exactly once, through the guarded helper. A "+
+			"second call is not redundancy — it is a second relay, with its own broker "+
+			"connections, its own assurance pass and its own dual-delivery enqueues.")
+
+	assert.Equal(t, 1, strings.Count(body, "blnk.NewEventRelayProcessor("),
+		"the relay constructor must be reached from exactly one place, and that place is "+
+			"startEventRelay. Constructing one anywhere else bypasses the broker-list guard that "+
+			"keeps a Kafka-less deployment from starting a relay over the no-op publisher.")
+
+	assert.Equal(t, 1, strings.Count(body, "assureEventTopics(ctx, cfg)"),
+		"topic assurance must run exactly once per process, from inside startEventRelay. A "+
+			"second pass costs a full admin connection and, with no brokers configured, logs a "+
+			"failure for a state the guarded path reports as normal.")
+
+	// The guard itself, named rather than implied: assurance and the relay must both sit behind
+	// the broker-list check, which is what makes the no-Kafka steady state quiet.
+	relayIndex := strings.Index(body, "func startEventRelay(")
+	require.Positive(t, relayIndex, "startEventRelay must exist")
+
+	guardIndex := strings.Index(body[relayIndex:], "blnk.KafkaBrokersConfigured(")
+	require.Positive(t, guardIndex,
+		"startEventRelay must guard on the broker list before assuring topics or starting a relay")
+	assert.Less(t, guardIndex, strings.Index(body[relayIndex:], "assureEventTopics(ctx, cfg)"),
+		"the broker-list guard must precede topic assurance, or a deployment with no brokers "+
+			"reports its documented steady state as an error")
 }

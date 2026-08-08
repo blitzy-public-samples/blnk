@@ -963,6 +963,301 @@ func TestIssueSubscriberCredential_SucceedsOnceTheKeyScopeIsCleared(t *testing.T
 			"an endpoint that does not resolve for it")
 }
 
+// subscriberProvisionedRow builds a subscriber that already holds a credential.
+//
+// The credential record is TWO columns written together — the schema's
+// event_subscribers_credential_pair_chk enforces it — so a helper is used rather than letting
+// each test set one and forget the other, which would seed a row the real registry could not
+// hold and quietly change what IsProvisioned answers.
+func subscriberProvisionedRow(t *testing.T) model.EventSubscriber {
+	t.Helper()
+
+	row := subscriberFixtureRow(t)
+	reference, err := model.DeriveCredentialReference(row.KafkaPrincipal, "a-secret-that-was-returned-once")
+	require.NoError(t, err, "deriving the fixture's credential reference")
+
+	issued := time.Now().UTC().Add(-time.Hour)
+	row.CredentialReference = &reference
+	row.CredentialIssuedAt = &issued
+
+	return row
+}
+
+// TestUpdateSubscriber_RefusesAKeyScopeOnASubscriberThatHoldsACredential is the second half of
+// SEC-05, and the half whose absence made the first half decorative.
+//
+// # The defect
+//
+// requireProvisionableKeyScope refuses the order "record a prefix, then ask for a credential".
+// Nothing refused the reverse, and the reverse is one ordinary API call: register, issue — which
+// succeeds, because no prefix is recorded — then update the row with a prefix. That update was
+// accepted silently, with no warning and no revocation, and the result is exactly the state the
+// refusal exists to prevent: a live SASL credential holding Read on whole topics beneath a
+// registry row announcing that the subscriber sees only the records carrying one key prefix.
+//
+// It was demonstrated end to end against a real broker: the credential read eight records from
+// its granted topic, six of them outside the prefix its own row advertised, two of those keyed
+// for unrelated tenants. Nothing failed, so nobody could discover it — which is why the fix is a
+// refusal rather than a warning, and why this test asserts that the row is not written and the
+// broker is not touched, rather than merely that an error came back.
+func TestUpdateSubscriber_RefusesAKeyScopeOnASubscriberThatHoldsACredential(t *testing.T) {
+	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
+	store, service := run.store, run.service
+
+	prefix := "ldg_k_83f61ccabf29"
+	updated, err := service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
+		PartitionKeyPrefix: &prefix,
+	})
+	require.Error(t, err,
+		"recording a key scope on a subscriber that already holds a credential must be refused: "+
+			"the credential cannot be narrowed to match it")
+	assert.Nil(t, updated, "a refused update must return no row for a caller to believe")
+
+	var apiErr apierror.APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, apierror.ErrSubscriberIsolationUnenforceable, apiErr.Code,
+		"the SAME typed code issuance refuses with: one state, one code, so a client needs no "+
+			"second case to handle the same impossibility reached from the other direction")
+	assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
+		"409: the request is well formed and it is the row's state that has to change first")
+	assert.Contains(t, err.Error(), "Revoke the credential first",
+		"the message must name the exit, or a caller can only guess")
+
+	stored, ok := store.row(subscriberFixtureID)
+	require.True(t, ok)
+	assert.Nil(t, stored.PartitionKeyPrefix,
+		"THE ROW MUST BE UNCHANGED. A stored prefix is the false claim itself, and it would "+
+			"outlive the request that made it")
+	assert.False(t, stored.KeyScopeUnenforceable())
+	require.NotNil(t, stored.CredentialReference,
+		"and the refusal must not take the working credential away either")
+
+	assert.Zero(t, run.log.count("UpdateEventSubscriber"),
+		"the refusal is taken before the write, so nothing is persisted")
+	assert.Zero(t, run.log.count("PruneSubscriberAccess"),
+		"and before the broker is touched: a refused update must change no boundary")
+	assert.Zero(t, run.log.count("GrantSubscriberAccess"))
+
+	assert.False(t, store.fenced(subscriberFixtureID),
+		"a refused update must still release its provisioning claim")
+}
+
+// TestUpdateSubscriber_KeepsTheLegitimateKeyScopeStatesLegitimate is the other side of the
+// guard, and it is what stops the fix becoming a trap.
+//
+// Three states must survive, and each is reachable through the documented API:
+//
+//   - A prefix on a subscriber that holds NO credential. This is what a caller records when it
+//     registers with a key scope, and requireProvisionableKeyScope answers it at issuance with a
+//     message naming both exits. A guard that refused it here would move the refusal to the
+//     wrong request and take away the state the issuance refusal is written about.
+//   - CLEARING a prefix, whatever the row holds. Clearing narrows nothing and widens nothing at
+//     the broker; it makes the row describe the access that exists. It is also the documented
+//     remedy, so refusing it would leave no way out.
+//   - An unrelated edit — a rename — on a provisioned row with no prefix. The guard reads the
+//     row as it would be WRITTEN, so an update that never mentions a prefix must be unaffected.
+func TestUpdateSubscriber_KeepsTheLegitimateKeyScopeStatesLegitimate(t *testing.T) {
+	t.Run("a key scope on a subscriber with no credential is accepted", func(t *testing.T) {
+		run := newSubscriberLifecycle(t)
+
+		prefix := "ldg_9f1c8a72"
+		updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
+			PartitionKeyPrefix: &prefix,
+		})
+		require.NoError(t, err,
+			"a row that holds no credential can still record a key scope; issuance is where that "+
+				"is answered")
+		require.NotNil(t, updated.PartitionKeyPrefix)
+		assert.Equal(t, prefix, *updated.PartitionKeyPrefix)
+
+		// And the state it produces is still unprovisionable, which is the point of allowing it.
+		credential, issueErr := run.service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+		require.Error(t, issueErr)
+		assert.Empty(t, credential.Password())
+	})
+
+	t.Run("clearing a key scope on a provisioned subscriber is accepted", func(t *testing.T) {
+		row := subscriberProvisionedRow(t)
+		// A row that already carries both, as a database predating
+		// event_subscribers_key_scope_chk can. Clearing must be the way out of it.
+		row.PartitionKeyPrefix = stringPointer("ldg_legacy_row")
+
+		run := newSubscriberLifecycle(t).seeded(row)
+
+		cleared := ""
+		updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
+			PartitionKeyPrefix: &cleared,
+		})
+		require.NoError(t, err,
+			"clearing the prefix is how an existing row is repaired, so it must never be refused")
+		assert.Nil(t, updated.PartitionKeyPrefix)
+		require.NotNil(t, updated.CredentialReference,
+			"and the repair must not revoke the credential the row already holds")
+	})
+
+	t.Run("an unrelated edit to a provisioned subscriber is accepted", func(t *testing.T) {
+		run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
+
+		renamed := "settlement consumer"
+		updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
+			Name: &renamed,
+		})
+		require.NoError(t, err,
+			"the guard reads the row as it would be written, so an update that mentions no prefix "+
+				"is untouched by it")
+		assert.Equal(t, renamed, updated.Name)
+		assert.Nil(t, updated.PartitionKeyPrefix)
+		assert.Positive(t, run.log.count("UpdateEventSubscriber"), "and the write still happens")
+	})
+}
+
+// TestIssueSubscriberCredential_RefusesASubscriberAuthorizedForNothing covers the empty grant.
+//
+// An empty authorized_topics list is a legitimate registry state — the fail-closed default of a
+// new subscriber, and the only way to say "authorised for nothing" about a row that holds
+// topics — and neither registration nor update is changed by this. Issuing against it is what is
+// refused, because the credential minted is inert and the response is not: a secret returned
+// once, a broker endpoint and a consumer group are indistinguishable at a glance from working
+// access, so whoever receives it hands it to a consumer and diagnoses the resulting silence as a
+// delivery fault. Meanwhile the broker holds a live principal that no ACL describes and somebody
+// must remember to revoke.
+func TestIssueSubscriberCredential_RefusesASubscriberAuthorizedForNothing(t *testing.T) {
+	row := subscriberFixtureRow(t)
+	row.AuthorizedTopics = nil
+
+	run := newSubscriberLifecycle(t).seeded(row)
+	store, service := run.store, run.service
+
+	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	require.Error(t, err, "a credential that could read nothing must not be minted")
+
+	var apiErr apierror.APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, apierror.ErrSubscriberGrantEmpty, apiErr.Code)
+	assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
+		"409: nothing about the request is malformed — it carries no body at all — and the "+
+			"identical request succeeds once a topic is granted")
+	assert.Contains(t, err.Error(), "authorized for no topics",
+		"the message must name the missing grant")
+
+	assert.Empty(t, credential.Password(),
+		"NO SECRET MAY EXIST: the refusal is taken before one is generated")
+	assert.Zero(t, run.log.count("ProvisionSubscriberPrincipal"),
+		"and no SCRAM principal may be created at the broker for a subscriber that can read nothing")
+	assert.Zero(t, run.log.count("RecordSubscriberCredentialIfUnchanged"))
+
+	stored, ok := store.row(subscriberFixtureID)
+	require.True(t, ok)
+	assert.Nil(t, stored.CredentialReference)
+	assert.False(t, store.fenced(subscriberFixtureID),
+		"a refused issuance must still release its claim")
+
+	// The remedy works, and stating it here is what proves the refusal is a step rather than a
+	// dead end.
+	_, err = service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
+		AuthorizedTopics: []string{"blnk.transactions"},
+	})
+	require.NoError(t, err)
+
+	granted, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	require.NoError(t, err, "granting a topic must restore provisionability")
+	assert.NotEmpty(t, granted.Password())
+	assert.Equal(t, []string{"blnk.transactions"}, granted.AuthorizedTopics)
+}
+
+// TestIssueSubscriberCredential_ReportsASpentBudgetAsATimeoutRatherThanAServerFault covers the
+// error SEMANTICS of a deadline, which decide whether a client retries.
+//
+// Issuance shares one deadline across the fence claim, the row read, the broker round trips and
+// the issuance record. The broker half already distinguished a timeout from a failure. The
+// registry half did not: both reads report through the repository's generic internal-server
+// code, so a budget spent waiting on a slow database arrived as HTTP 500 — indistinguishable
+// from a defect in Blnk, and the correct reaction to the two is opposite. A defect must not be
+// retried into a loop; this must be retried, and safely can be, because nothing has been
+// written when it happens here.
+//
+// The context is what is consulted, not the error, and that is forced rather than chosen:
+// loggedDatabaseError deliberately does not carry the driver's error, so
+// errors.Is(err, context.DeadlineExceeded) cannot answer at this layer.
+func TestIssueSubscriberCredential_ReportsASpentBudgetAsATimeoutRatherThanAServerFault(t *testing.T) {
+	// The two registry steps that run before the broker is touched, each failing the way the
+	// real repository fails when its query runs on a dead context.
+	for _, tt := range []struct {
+		method string
+		reason string
+	}{
+		{method: "ClaimSubscriberForProvisioning", reason: "claiming the subscriber for provisioning"},
+		{method: "GetEventSubscriberByID", reason: "reading the subscriber's registry row"},
+	} {
+		t.Run(tt.method, func(t *testing.T) {
+			run := newSubscriberLifecycle(t)
+			run.store.failing(tt.method, apierror.NewAPIError(
+				apierror.ErrInternalServer,
+				"Failed to reach the registry",
+				nil,
+			))
+
+			// A budget this small is spent before the first call arrives, which is what the
+			// classification reads. QA reproduced the defect with a one-millisecond budget
+			// against a real database and with a caller that cancelled mid-flight; both land
+			// on the same two paths.
+			service := run.service.WithIssuanceBudget(time.Nanosecond)
+
+			credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+			require.Error(t, err)
+
+			var apiErr apierror.APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, apierror.ErrSubscriberProvisioningTimeout, apiErr.Code,
+				"a spent deadline is not a server fault, and a client cannot discriminate on 500")
+			assert.Equal(t, http.StatusGatewayTimeout, apierror.StatusForCode(apiErr.Code),
+				"504: the dependency was reached and did not answer in the time allowed")
+			assert.NotEqual(t, http.StatusInternalServerError, apierror.StatusForCode(apiErr.Code))
+
+			detail, ok := apiErr.Details.(SubscriberErrorDetail)
+			require.True(t, ok, "the detail must be the bounded struct, never the cause")
+			assert.True(t, detail.Retryable,
+				"and it must say so: nothing was generated, nothing reached the broker and "+
+					"nothing was recorded, so the retry starts from the state the first attempt found")
+			assert.Contains(t, detail.Reason, tt.reason,
+				"the detail must name the step that ran out of time, so a slow claim is "+
+					"distinguishable from a slow read")
+
+			assert.Empty(t, credential.Password())
+			assert.True(t, run.log.arrivedExpired(tt.method),
+				"the premise of this test is that the call arrived on a dead context")
+			assert.Zero(t, run.log.count("ProvisionSubscriberPrincipal"),
+				"a timeout at the registry must never reach the broker")
+		})
+	}
+}
+
+// TestIssueSubscriberCredential_KeepsATypedOutcomeWhenTheBudgetAlsoExpired is the limit of the
+// reclassification, and it matters as much as the reclassification itself.
+//
+// Only a GENERIC internal-server failure becomes a timeout. A conflict — another operation holds
+// the provisioning claim — remains true whether or not the deadline also expired: the fence WAS
+// held, and it will be held again on the next attempt until that operation finishes. Rewriting
+// it to a timeout would send a client to retry immediately against a state that has not
+// changed, which is the same class of mistake as reporting a timeout as a server fault, pointing
+// the other way.
+func TestIssueSubscriberCredential_KeepsATypedOutcomeWhenTheBudgetAlsoExpired(t *testing.T) {
+	run := newSubscriberLifecycle(t)
+	run.store.holdFence(subscriberFixtureID, SubscriberProvisioningFenceLease)
+
+	service := run.service.WithIssuanceBudget(time.Nanosecond)
+
+	_, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	require.Error(t, err)
+
+	var apiErr apierror.APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
+		"the fence conflict must survive an expired budget: it is the accurate answer, and the "+
+			"remedy for it is to wait rather than to retry at once")
+	assert.NotEqual(t, apierror.ErrSubscriberProvisioningTimeout, apiErr.Code)
+}
+
 // TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers is the guard on the one
 // field that decides whether everything else in the response is usable.
 //

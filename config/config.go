@@ -45,6 +45,15 @@ const (
 	// upload may spend fetching the remote body, preventing a slow or stalled
 	// upstream from hanging the handler.
 	DEFAULT_UPLOAD_URL_TIMEOUT_SEC = 30
+	// DEFAULT_LOG_LEVEL is the verbosity a deployment runs at when it states none,
+	// and it is logrus's own default spelled out rather than a new choice: filling
+	// the field is about making the effective level READABLE, not about changing it.
+	//
+	// Info is the right production level because the level below it is used by the
+	// event pipeline for per-event diagnostics — one line per published event, which
+	// is five hundred lines a second at the throughput this feature is built for.
+	// Those lines exist to be turned on for an investigation, not to be shipped.
+	DEFAULT_LOG_LEVEL = "info"
 )
 
 // WebhookDualDeliveryWindowDays is the exact length of the window in which Kafka
@@ -751,6 +760,38 @@ type Configuration struct {
 	Kafka                   KafkaConfig                   `json:"kafka"`
 	Relay                   RelayConfig                   `json:"relay"`
 
+	// LogLevel is the verbosity of the standard logger: one of trace, debug, info,
+	// warn/warning, error, fatal or panic, matched case-insensitively by
+	// logrus.ParseLevel.
+	//
+	// # Why this exists at all
+	//
+	// Several of the event pipeline's diagnostics are deliberately emitted at DEBUG,
+	// because they are per-event and the pipeline is built for 500 events a second:
+	// the successful-publish line in the relay and in the publisher, the metrics
+	// collector's per-tick summary, and the consumer-lag series retirement notice.
+	// Suppressing them by default is correct — a line per published event whose
+	// content is "it worked" is not observability, it is volume. Having NO WAY TO
+	// TURN THEM ON was the defect: nothing in the codebase called logrus.SetLevel, so
+	// every deployed binary sat at logrus's default of info and a delivery
+	// investigation had only failure lines and batch counts to work from. Those
+	// diagnostics were unreachable without recompiling.
+	//
+	// # An unparseable value warns rather than refusing to start
+	//
+	// Deliberately different from WebhookDeprecationSunsetDate, which is fatal. A
+	// mis-typed sunset silently keeps the deprecated transport alive, so the only
+	// safe response is to refuse; a mis-typed log level silently keeps the SAFE
+	// default, changes nothing about how traffic is served, and is announced by the
+	// warning itself. Failing the load would turn a typo in a diagnostic control into
+	// an outage.
+	//
+	// Blank means "leave the logger alone", which is info. That distinction matters
+	// beyond tidiness: an unconditional SetLevel here would reach into every process
+	// that loads a configuration, including a test that has pinned the level to
+	// capture a debug line.
+	LogLevel string `json:"log_level" envconfig:"BLNK_LOG_LEVEL"`
+
 	// WebhookDeprecationStartDate is the RFC3339 instant at which the dual-delivery
 	// window OPENS. IT IS DERIVED, NOT CONFIGURED: it is always computed as
 	// WebhookDeprecationSunsetDate minus exactly WebhookDualDeliveryWindowDays, and
@@ -1443,6 +1484,7 @@ func (cnf *Configuration) setDefaultValues() {
 	}
 
 	// Set module defaults
+	cnf.setLogLevelDefaults()
 	cnf.setRedisDefaults()
 	cnf.setDatabaseDefaults()
 	cnf.setTransactionDefaults()
@@ -1566,6 +1608,58 @@ func (cnf *Configuration) setQueueDefaults() {
 	if cnf.Queue.TransactionWorkerConcurrency == 0 {
 		cnf.Queue.TransactionWorkerConcurrency = defaultQueue.TransactionWorkerConcurrency
 	}
+}
+
+// setLogLevelDefaults resolves LogLevel onto the standard logger.
+//
+// It runs FIRST among the module default setters, so the level an operator asked for is
+// already in force for the warnings the other setters emit. Resolving it last would mean
+// the very lines that report a defaulted configuration were filtered by the previous
+// level.
+//
+// # Three inputs, three outcomes
+//
+//   - A PARSEABLE value is applied and normalised, so the field afterwards reads exactly
+//     what the logger is set to. logrus.ParseLevel accepts trace, debug, info, warn,
+//     warning, error, fatal and panic, case-insensitively, and it is the only parser used
+//     here: a second spelling of the level vocabulary would be a second thing to keep in
+//     step with the library.
+//
+//   - An UNPARSEABLE value warns, names the accepted values, and leaves the logger as it
+//     is. The field is then set to the level actually in force rather than to the rejected
+//     text, because a configuration that reports a level the process is not running at is
+//     worse than one that reports the truth. Refusing to start would turn a typo in a
+//     diagnostic control into an outage; see the LogLevel field's documentation for why
+//     that is the opposite trade-off from the sunset date's.
+//
+//   - BLANK leaves the logger UNTOUCHED and fills the field with the default. Not calling
+//     SetLevel is the whole point rather than an optimisation: this function runs from
+//     validateAndAddDefaults, which MockConfig also calls, and several tests pin the level
+//     with logrus.SetLevel in order to capture a debug-only line. An unconditional
+//     SetLevel here would silently undo those pins from inside the configuration layer.
+//     logrus already defaults to info, so filling the field is a statement of fact.
+func (cnf *Configuration) setLogLevelDefaults() {
+	raw := strings.TrimSpace(cnf.LogLevel)
+	if raw == "" {
+		cnf.LogLevel = DEFAULT_LOG_LEVEL
+
+		return
+	}
+
+	level, err := logrus.ParseLevel(strings.ToLower(raw))
+	if err != nil {
+		logrus.WithField("log_level", raw).Warn(
+			"the configured log level is not a level logrus recognises, so the current level is kept; " +
+				"use one of trace, debug, info, warn, error, fatal or panic (BLNK_LOG_LEVEL, or " +
+				"\"log_level\" in blnk.json)",
+		)
+		cnf.LogLevel = logrus.GetLevel().String()
+
+		return
+	}
+
+	cnf.LogLevel = level.String()
+	logrus.SetLevel(level)
 }
 
 func (cnf *Configuration) setRedisDefaults() {
@@ -2251,9 +2345,34 @@ func MockConfig(mockConfig *Configuration) {
 	ConfigStore.Store(mockConfig)
 }
 
+// logger configures the standard logger before any configuration has been read.
+//
+// The formatter is unconditional, as it always was. The LEVEL is read straight from the
+// environment here, ahead of the configuration file, because InitConfig calls this and then
+// loads the file — and loading the file logs. Without this, the warnings emitted while the
+// configuration is being validated would be filtered by the previous level rather than by
+// the one the operator asked for, which is exactly backwards for the run in which somebody
+// has just turned debug on to find out what is happening at start-up.
+//
+// Only the environment is consulted, because that is the only source available yet. The
+// value in blnk.json — and the environment again, since envconfig overlays it — is applied
+// by setLogLevelDefaults once the configuration exists, and that later application is
+// authoritative. An absent or unparseable variable is ignored in silence here: the
+// configuration layer reports the same condition properly, with the accepted values named,
+// and duplicating the warning at a point where nothing has been loaded would only make it
+// look like two separate faults.
 func logger() {
 	// Configure logrus defaults
 	logrus.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp: true,
 	})
+
+	raw, ok := os.LookupEnv(envAliasPrefix + "LOG_LEVEL")
+	if !ok {
+		return
+	}
+
+	if level, err := logrus.ParseLevel(strings.ToLower(strings.TrimSpace(raw))); err == nil {
+		logrus.SetLevel(level)
+	}
 }
