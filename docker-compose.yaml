@@ -341,6 +341,18 @@ services:
     image: redis:7.2.4
     container_name: redis
     restart: on-failure
+    # Published for the SAME reason postgres and typesense are, and its absence was an
+    # inconsistency rather than a policy: BLNK_REDIS_DNS is one of only two REQUIRED
+    # configuration values, `make test` and `make run` execute on the HOST, and dozens of
+    # test files hardcode localhost:6379 — exactly as the redis service in
+    # .github/workflows/go.yml publishes it. Without a mapping the ledger cannot start and
+    # the suite cannot run outside a container, while the containerised server and worker
+    # keep reaching this service by name over the compose network either way.
+    #
+    # Bound to loopback by default, following the kafka service's KAFKA_OUTER_HOST rather
+    # than binding 0.0.0.0: an unauthenticated Redis must not be reachable off the host.
+    ports:
+      - "${REDIS_OUTER_HOST:-127.0.0.1}:${REDIS_OUTER_PORT:-6379}:6379"
 
   # Single-broker Kafka in KRaft mode with SASL/SCRAM and enforced ACLs, so the event
   # pipeline runs locally with the production topic catalogue, mechanism and
@@ -827,13 +839,31 @@ services:
     image: ${POSTGRES_IMAGE:-postgres:16}
     container_name: ${POSTGRES_CONTAINER:-postgres}
     restart: on-failure
+    # The bind address is parameterised so a stack that enables trust authentication below
+    # can also stop publishing the port to every interface. The DEFAULT IS UNCHANGED
+    # (0.0.0.0), so nothing about an existing stack moves unless it opts in.
     ports:
-      - "${POSTGRES_OUTER_PORT:-5432}:5432"
+      - "${POSTGRES_OUTER_HOST:-0.0.0.0}:${POSTGRES_OUTER_PORT:-5432}:5432"
     environment:
       TZ: ${TZ:-Etc/UTC}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
       POSTGRES_DB: ${POSTGRES_DB:-blnk}
+      # EMPTY BY DEFAULT, so this stack keeps requiring a password exactly as before.
+      #
+      # It exists because the test suite cannot run against a password-only server: the
+      # suite hardcodes BOTH `postgres://postgres:password@localhost:5432/blnk` and
+      # `postgres://postgres:@localhost:5432/blnk`, and the second form authenticates only
+      # under `trust`. That is not an accident of the tests — the postgres service in
+      # .github/workflows/go.yml sets POSTGRES_HOST_AUTH_METHOD: trust for the same reason,
+      # so without this passthrough a local `make test` fails 26 assertions across four
+      # packages with "password authentication failed for user postgres" while CI is green.
+      #
+      # Set it to `trust` in .env for local development ONLY, together with
+      # POSTGRES_OUTER_HOST=127.0.0.1 above so the unauthenticated server is not reachable
+      # off the host. Note the variable is read by initdb, so it only takes effect on a
+      # volume that has not been initialised yet: `docker compose down -v` first.
+      POSTGRES_HOST_AUTH_METHOD: ${POSTGRES_HOST_AUTH_METHOD:-}
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -854,10 +884,31 @@ services:
     logging:
       driver: "none"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8108/health"]
-      interval: 30s
+      # typesense/typesense:29.0 ships NEITHER curl NOR wget, and its /usr/bin/sh is dash,
+      # which has no /dev/tcp. A `curl -f` probe therefore could not run at all: every check
+      # failed with `exec: "curl": executable file not found in $PATH`, so the container was
+      # reported unhealthy for its whole life even though it answers {"ok":true} on 8108.
+      # The consequences were real rather than cosmetic — `docker compose up --wait` exited 1,
+      # and any `condition: service_healthy` on this service could never be satisfied.
+      #
+      # bash IS in the image, so this is the same /dev/tcp probe the typesense service in
+      # .github/workflows/go.yml already uses. Exec form (CMD) and not CMD-SHELL, because
+      # CMD-SHELL would hand the script to dash and reintroduce the failure.
+      test:
+        - CMD
+        - bash
+        - -c
+        # Folded (>-) so the probe stays inside a sane line length: the lines below are joined
+        # with single spaces into one command. Backslashes are literal in a folded scalar, so
+        # printf — not YAML — interprets the \r\n that HTTP requires.
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8108
+          && printf "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3
+          && grep -q "200 OK" <&3
+      interval: 10s
       timeout: 10s
       retries: 5
+      start_period: 30s
 
   jaeger:
     image: jaegertracing/all-in-one:latest
