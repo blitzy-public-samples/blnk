@@ -661,16 +661,27 @@ func orderingConfiguration(brokers []string, dsn string) *config.Configuration {
 	// alongside it, and the loader refuses that outright. So the window is stated here even
 	// though this file asserts nothing about deprecation or dual delivery.
 	//
-	// Whichever end the environment supplies is passed through untouched and the loader derives
-	// the other, because the two must be exactly the window apart and computing the second here
-	// would only risk contradicting it. With neither supplied the start is now, which puts the
-	// run INSIDE the dual-delivery window — the state a deployment is in today, and therefore
-	// the one the relay should be exercised in. The legacy leg is a no-op either way, since no
-	// notification webhook URL is configured.
+	// THE SUNSET IS THE ONLY END THAT MAY BE SUPPLIED, and the fallback below therefore derives
+	// the SUNSET rather than the start. config.Configuration.resolveWebhookDeprecationWindow
+	// takes exactly one input — the sunset — and OVERWRITES the start with "sunset minus the
+	// window", so a configuration carrying only a start reaches the loader as a blank sunset
+	// with brokers configured, which it refuses outright: "webhook_deprecation_sunset_date is
+	// required once kafka.brokers is set". This fixture previously back-filled the START, so
+	// following this file's own documented run recipe — which exports no deprecation variable
+	// at all — produced a hard failure at config.Fetch rather than a running test. Deriving the
+	// sunset is what makes the documented recipe work, and it cannot contradict the start
+	// because the start is arithmetic the loader performs.
+	//
+	// One day INSIDE the window rather than exactly on its edge, so the derived start lands in
+	// the past and the run is unambiguously within the dual-delivery window — the state a
+	// deployment is in today, and therefore the one the relay should be exercised in. The
+	// legacy leg is a no-op either way, since no notification webhook URL is configured.
 	deprecationStart := strings.TrimSpace(os.Getenv("WEBHOOK_DEPRECATION_START_DATE"))
 	deprecationSunset := strings.TrimSpace(os.Getenv("WEBHOOK_DEPRECATION_SUNSET_DATE"))
-	if deprecationStart == "" && deprecationSunset == "" {
-		deprecationStart = time.Now().UTC().Format(time.RFC3339)
+	if deprecationSunset == "" {
+		deprecationSunset = time.Now().UTC().
+			Add(time.Duration(config.WebhookDualDeliveryWindowDays-1) * 24 * time.Hour).
+			Format(time.RFC3339)
 	}
 
 	return &config.Configuration{

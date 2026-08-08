@@ -74,6 +74,30 @@ spec:
                 configMapKeyRef:
                   name: blnk-config
                   key: KAFKA_SASL_USER
+            # The upgrade-window escape hatch that lets this pod keep publishing as
+            # the ADMINISTRATIVE principal while its own producer principal is being
+            # provisioned. It ships "false" in blnk-config.yaml and belongs at
+            # "false"; every publisher built on it logs a security warning.
+            #
+            # IT IS PROJECTED BECAUSE THE REFUSAL IT RELEASES IS FATAL IN THIS ROLE.
+            # With brokers and the administrative pair set but KAFKA_SASL_USER still
+            # empty, the publisher refuses to authenticate as the administrator and
+            # NewBlnk fails, so the container exits and this Deployment enters
+            # CrashLoopBackOff. That refusal names KAFKA_ALLOW_ADMIN_PRODUCER as the
+            # deliberate way out, and an operator who sets it in the ConfigMap can
+            # only be obeyed if the variable actually reaches this process — so
+            # omitting this entry would leave the ConfigMap key inert and the
+            # documented remedy unreachable from inside a crash-looping pod.
+            #
+            # worker-deployment.yaml does not project it, which is correct rather
+            # than inconsistent: the flag only chooses BETWEEN credentials, and the
+            # worker is given no administrative pair to fall back to, so it cannot
+            # change what the worker does.
+            - name: KAFKA_ALLOW_ADMIN_PRODUCER
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: KAFKA_ALLOW_ADMIN_PRODUCER
             - name: KAFKA_SASL_ADMIN_USER
               valueFrom:
                 configMapKeyRef:
