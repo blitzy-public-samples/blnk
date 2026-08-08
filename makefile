@@ -136,11 +136,20 @@ run_workers:
 
 # Run the process that hosts the EVENT OUTBOX RELAY.
 #
-# There is deliberately no separate relay binary. The relay is started by the server role,
-# beside the fund-lineage outbox processor it is modelled on, which is the repository's
-# established home for an outbox relay and avoids standing up a fourth asynq server for one
-# poll loop. So this target runs the server — and exists because "where does the relay run"
-# is otherwise answerable only by reading cmd/server.go.
+# There is deliberately no separate relay binary, and therefore no relay SUBCOMMAND for this
+# target to invoke: cmd/main.go registers exactly start, workers, migrate and verify-chain, so
+# `./${PROJECT} start` is not a stand-in for a relay command, it IS how the relay is run. The
+# relay is started by the SERVER role — cmd/server.go calls startEventRelay immediately after
+# the outbox background work it is modelled on, the fund-lineage outbox processor, which is
+# this repository's established home for an outbox relay and avoids standing up a fourth asynq
+# server for one poll loop. That call is CONDITIONAL ON BROKERS BEING CONFIGURED: with an empty
+# broker list it logs one info line and starts nothing.
+#
+# So this target is an alias for the server role, and it exists for two reasons. It answers
+# "where does the relay run" without reading cmd/server.go, and it is the entry point for
+# running the relay in ISOLATION — a local operator watching a backlog drain, or a load test
+# measuring publish throughput — both of which want the publishing process up and nothing else
+# claiming the outbox rows they are measuring.
 #
 # KAFKA_BROKERS is checked FIRST because the failure it prevents is silent: with no brokers
 # the publisher resolves to the no-op, the relay refuses to start, and the server comes up
@@ -168,8 +177,50 @@ build_test_run:
 # dead-letter siblings, the steady-state producer principal, the sample subscriber principal,
 # and both principals' ACLs.
 #
+# WHAT IT CREATES, spelled out here so the shipped geometry is legible at the invocation site
+# rather than only inside a four-thousand-line script. Every name derives from
+# KAFKA_TOPIC_PREFIX (default "blnk"), and every dead-letter name is its category plus ".dlt",
+# exactly as event_topics.go's DLTFor composes it:
+#
+#     blnk.transactions      blnk.balances      blnk.identities
+#     blnk.ledgers           blnk.system
+#     blnk.transactions.dlt  blnk.balances.dlt  blnk.identities.dlt
+#     blnk.ledgers.dlt       blnk.system.dlt
+#
+# Ten owned topics, each at KAFKA_MIN_PARTITIONS partitions — 6 is the required minimum. An
+# EMPTY topic below that count is grown to it; one that already holds messages is reported and
+# left alone, because adding partitions re-maps keys and would split an aggregate's history
+# across two of them, so that growth needs a deliberate KAFKA_ALLOW_PARTITION_GROWTH and a
+# planned migration.
+#
+# Then two principals. The steady-state PRODUCER (KAFKA_PRODUCER_USER, default blnk-producer) is
+# granted Write and Describe on those topics and nothing else — no Read, no consumer group, no
+# cluster operation. One sample SUBSCRIBER (KAFKA_SAMPLE_SUBSCRIBER_USER, default
+# blnk-sample-subscriber) is granted the mirror image: Read and Describe on the topics it may
+# consume, and Read on its own prefixed consumer-group namespace. Those ACLs are what the
+# subscriber-isolation test asserts against, and they are only enforced because the broker runs
+# the KRaft StandardAuthorizer — without it ACLs are accepted and ignored.
+#
+# FIVE categories, not the three the requirement names, because ledger.created and system.error
+# belong to none of transactions, balances and identities while every event formerly delivered
+# by webhook must still be published. ledger.created is ordinary ledger data a webhook
+# subscriber receives today, so it needs a GRANTABLE home; system.error carries Blnk's own error
+# text and must stay ungrantable. Hence blnk.ledgers and blnk.system. model.EventCategory routes
+# events into exactly these five and event_topics.go composes exactly these ten names, so do not
+# "correct" the count here without changing both.
+#
+# REPLICATION FACTOR IS 1 LOCALLY AND 3 IN PRODUCTION, which is the whole reason it is a
+# variable. A single-broker KRaft cluster cannot satisfy 3 — topic creation fails outright — so
+# a hardcoded 3 would make local bring-up impossible, while a hardcoded 1 would silently ship
+# unreplicated topics onto a multi-broker cluster, where losing one broker loses events. So
+# KAFKA_REPLICATION_FACTOR carries it: 1 below and in .env.example, 3 in the Go default
+# (config/config.go) and in the Kubernetes manifests. The script reads every topic's factor back
+# from the broker and fails the run if one is below the configured value, so a local 1 cannot
+# quietly survive a promotion to production.
+#
 # Idempotent, so re-running it after a bring-up is safe and is the normal way to repair a
-# drifted topic geometry or ACL.
+# drifted topic geometry or ACL. It only ever adds: no topic is deleted, no partition count is
+# reduced, and no existing credential is replaced unless a KAFKA_ROTATE_* variable asks for it.
 #
 # NEITHER CREDENTIAL IS GENERATED. Both principals are provisioned only from a secret you
 # supply, because a generated one has to be printed to be usable and this script's usual home
@@ -205,10 +256,47 @@ build_test_run:
 # A deliberately EMPTY value from the caller wins too, because `export -p` records a set-but-
 # empty variable: `KAFKA_SKIP_SAMPLE_SUBSCRIBER= make kafka_provision` means "not set", not
 # "fall back to .env".
+#
+# THE THREE `${VAR:-default}` FALLBACKS BELOW ARE THE LAST RESORT, and their position in the
+# recipe is what makes them one: they run AFTER the snapshot is replayed, so they fill only what
+# neither the caller nor .env supplied. Full precedence, highest first: the command line, then
+# .env, then these. They pin the geometry this comment block claims — prefix, the 6-partition
+# minimum and the local replication factor — at the invocation site, so a bare
+# `make kafka_provision` provisions the documented local shape whether or not an .env exists.
+#
+# WHAT IS DELIBERATELY NOT DEFAULTED HERE, because in both cases a default would be a bug:
+#
+#   The BROKER LIST. Left entirely to KAFKA_BROKERS and the script's own resolution. Defaulting
+#   it would mean writing KAFKA_BOOTSTRAP_SERVER, which the script reads as an explicit override
+#   of its "KAFKA_BROKERS is declared but empty, so Kafka is not configured here" skip — the
+#   check that answers a Kafka-less deployment instantly and with an explanation. Overriding it
+#   would replace that with a sixty-second readiness timeout against a broker nobody started, on
+#   every checkout that has not opted in. Opting into the local Kafka stack means setting
+#   KAFKA_BROKERS (and selecting the `kafka` compose profile — .env.example says so at both
+#   keys), so once an operator has opted in, the bare form already reaches their broker. To
+#   provision one broker without configuring the application for it, name it for the one run:
+#   `KAFKA_BOOTSTRAP_SERVER=localhost:9092 make kafka_provision`.
+#
+#   The ADMIN PRINCIPAL AND SECRET. KAFKA_SASL_ADMIN_USER and KAFKA_SASL_ADMIN_SECRET are
+#   forwarded, never defaulted. That principal is a broker super-user — it mints SCRAM
+#   credentials and rewrites every ACL — and the SASL listener is published on the host, so a
+#   default committed here would hand anyone who can reach that port the cluster's entire
+#   authorization model. `./stack.sh --init` generates both into a mode-0600 .env, which is
+#   exactly where the sourcing above picks them up; without them the script refuses before
+#   touching the broker and names the remedy.
+#
+# Everything else the script accepts is forwarded by inheritance rather than enumerated, because
+# the script publishes its own interface: `scripts/kafka-provision.sh --print-interface-host`
+# prints every variable it reads, which is how stack.sh builds its passthrough list. A list
+# copied into this recipe would be a second copy to keep in step, and a name missing from it
+# would fail silently and plausibly.
 kafka_provision:
 	@caller_environment="$$(export -p)"; \
 	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
 	eval "$$caller_environment"; \
+	export KAFKA_TOPIC_PREFIX="$${KAFKA_TOPIC_PREFIX:-blnk}"; \
+	export KAFKA_MIN_PARTITIONS="$${KAFKA_MIN_PARTITIONS:-6}"; \
+	export KAFKA_REPLICATION_FACTOR="$${KAFKA_REPLICATION_FACTOR:-1}"; \
 	./scripts/kafka-provision.sh
 
 migrate_up:

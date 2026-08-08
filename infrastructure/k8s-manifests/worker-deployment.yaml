@@ -126,6 +126,22 @@ spec:
             # than from the ConfigMap, and it is the only Kafka credential this role
             # needs: publishing requires Write and Describe on the Blnk-owned topics
             # and nothing more.
+            #
+            # THE OPERATOR PROVISIONS THIS SECRET OUT OF BAND. The reference
+            # below expects a Secret named kafka-credentials — resolved in this
+            # pod's own namespace, blnk — carrying the key producer-secret,
+            # whose value is the SCRAM password of the principal named by
+            # KAFKA_SASL_USER above. It must be a DIFFERENT value from that
+            # Secret's admin-secret key: config.ProducerSASL declines to let a
+            # publisher authenticate as the administrator, so reusing one
+            # password is a configuration Blnk refuses to start with rather than
+            # merely a weak one.
+            #
+            # NO SECRET MANIFEST IS COMMITTED TO THIS FOLDER, deliberately — a
+            # committed Secret is a credential in version control, and
+            # blnk-config.yaml states the same rule. kafka-statefulset.yaml's
+            # header lists both Secrets this deployment needs, every key in
+            # each, and the kubectl commands that create them.
             - name: KAFKA_SASL_SECRET
               valueFrom:
                 secretKeyRef:
@@ -140,6 +156,40 @@ spec:
                   # missing variable in the boot log and the construction path
                   # refuses to dial anything half-authenticated.
                   optional: true
+            # THREE KAFKA VARIABLES ARE DELIBERATELY ABSENT FROM THIS ROLE and
+            # none of them may be added: KAFKA_SASL_ADMIN_USER,
+            # KAFKA_SASL_ADMIN_SECRET and KAFKA_ALLOW_ADMIN_PRODUCER.
+            # server-deployment.yaml projects all three, so the difference
+            # between the two Deployments is a decision rather than drift. It is
+            # recorded on this side too, because a manifest is read one workload
+            # at a time and an unexplained omission reads as an oversight to
+            # whoever is comparing them.
+            #
+            # THE SERVER ADMINISTERS AND THIS POD DOES NOT. cmd/server.go is the
+            # only process that builds a Kafka admin client: topic assurance,
+            # subscriber SCRAM provisioning, ACL grants and revocation, and the
+            # offset reads behind consumer lag and reconciliation all live
+            # there. This pod publishes ledger events and drains asynq queues,
+            # so the administrative principal would give it standing authority
+            # to create topics, mint credentials and rewrite ACLs that it never
+            # exercises — and a compromised worker would carry that authority
+            # with it. blnk-config.yaml states the rule at the key itself:
+            # supply the administrative pair ON THE SERVER DEPLOYMENT ONLY.
+            #
+            # PROJECTING THE USERNAME ALONE WOULD BREAK THIS POD, which is why
+            # the ConfigMap key is skipped here rather than merely left unused.
+            # Its Secret is not delivered to this container, and
+            # config/config.go validates the administrative pair AS A PAIR: with
+            # KAFKA_BROKERS set, a username without a secret is fatal at
+            # configuration load. So the moment an operator filled that
+            # ConfigMap key in for the server, every pod of this Deployment
+            # would fail to start.
+            #
+            # KAFKA_ALLOW_ADMIN_PRODUCER is inert here for the same reason. It
+            # only chooses BETWEEN credentials, and ProducerSASL reports
+            # adminOnly only when an administrative pair is configured; with
+            # neither half present this pod publishes as the producer principal
+            # above, or without SASL when that pair is empty too.
             - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
               value: http://jaeger:4318/v1/traces
           image: jerryenebeli/blnk:0.13.3

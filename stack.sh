@@ -1352,6 +1352,71 @@ resolve_compose_cl() {
     exit 1
 }
 
+# =======================================================================================
+# The Compose command line
+# =======================================================================================
+
+# Decide how to invoke Compose, once, before any command runs.
+#
+# WHY THIS IS DETECTED. Docker ships two spellings of the same tool: "docker compose", the v2+
+# plugin bundled with every current Docker, and "docker-compose", the standalone v1 script that
+# newer installations do not include. This script pinned the standalone one and ${example}
+# shipped that pin uncommented, so on a Compose-v2-only host every call here died with
+# "docker-compose: command not found" - the ledger never came up, and the Kafka staging this
+# file now owns never ran. Detecting costs one probe and removes a whole class of "it does not
+# work on my machine".
+#
+# PRECEDENCE, and it matters. An explicit COMPOSE_CL - exported by the caller or pinned in
+# ${env}, which showenv has already sourced by the time this runs - is used verbatim and is
+# never probed: an operator who names a wrapper, a remote context or an absolute path has said
+# something this function has no business second-guessing. Only an empty value is resolved, and
+# the plugin is preferred because it is the supported one.
+#
+# WHY IT CAN REFUSE. With neither spelling present, every command in this script would fail
+# anyway, one confusing message at a time. Saying so once, by name, is the difference between a
+# missing prerequisite and a broken script. --init and the help text are exempt because neither
+# touches Compose, and an operator's first act on a fresh checkout is usually --init.
+#
+# Parameters:
+#   - $1: the subcommand being run, so the Compose-free ones are not held to this requirement.
+resolve_compose_cl() {
+    # Named for what it is rather than "command", which would read as the shell builtin used
+    # two probes below.
+    local subcommand="${1:-}"
+
+    if [ -n "${COMPOSE_CL}" ]
+    then
+        return 0
+    fi
+
+    if docker compose version >/dev/null 2>&1
+    then
+        COMPOSE_CL="docker compose"
+        return 0
+    fi
+
+    if command -v docker-compose >/dev/null 2>&1
+    then
+        COMPOSE_CL="docker-compose"
+        return 0
+    fi
+
+    case "${subcommand}" in
+        --init | -i | --help | -h | "" )
+            # Nothing here speaks to Compose. Leave the value empty rather than refusing, so a
+            # fresh checkout can still be initialised on a host where Docker is not installed
+            # yet, and let the first command that needs Compose be the one that reports it.
+            return 0
+            ;;
+    esac
+
+    printf '%b\n' " ${RED}Neither 'docker compose' nor 'docker-compose' is available on this host.${NC}"
+    printf '%b\n' " Every command in this script drives Compose, so none of them can run."
+    printf '%b\n' " Install Docker with the Compose plugin, or set ${BLU}COMPOSE_CL${NC} in ${BLU}${env}${NC} to"
+    printf '%b\n' " the command that starts Compose here."
+    exit 1
+}
+
 main() {
     # Resolve the Compose command line first: COMPOSE_CL now starts EMPTY rather than assuming
     # the legacy "docker-compose" binary, so every later compose call depends on this having
