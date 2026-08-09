@@ -14,105 +14,73 @@
 
 -- +migrate Up
 
--- SEC-05, THIRD BARRIER: make "records a key scope AND holds a credential"
--- unrepresentable in blnk.event_subscribers.
+-- Ensure event_subscribers_key_scope_chk is absent.
 --
--- # The state, and why a comment could not prevent it
+-- # This migration used to CREATE that constraint, and creating it was the defect
 --
--- partition_key_prefix records that a subscriber is authorised only for the records
--- whose key carries that prefix. Kafka's authorizer has NO message-key dimension:
--- an ACL grants Read on a TOPIC, so a principal holding one reads all of it. A row
--- carrying a prefix therefore describes an authorization NARROWER THAN ANY
--- CREDENTIAL BLNK CAN MINT, and the two facts together — prefix recorded, credential
--- live — mean the registry states a tenancy boundary that does not exist.
+-- As first written, this file cleared every partition_key_prefix on a row that also held a
+-- credential and then added a CHECK forbidding the combination
+-- "partition_key_prefix IS NOT NULL AND credential_reference IS NOT NULL". Two service
+-- guards refused the same combination from either direction, so the state was
+-- unrepresentable in the database and unreachable through the API.
 --
--- EventSubscriberService refuses that combination from both directions:
--- requireProvisionableKeyScope refuses to issue against a row that records a prefix,
--- and requireRecordableKeyScope refuses to record a prefix on a row that holds a
--- credential. The second of those was missing, and its absence was reachable by one
--- ordinary API call — register, issue, then update with a prefix — which is how a
--- live credential came to read six records outside the prefix its row advertised.
+-- The reasoning went as far as it went: partition_key_prefix looks like an authorization,
+-- Kafka's authorizer has no message-key dimension, and so a row carrying a prefix appears
+-- to describe a narrower boundary than any credential Blnk can mint. Rather than issue a
+-- wider credential silently, the state was forbidden.
 --
--- Two service guards are the right place to answer a caller, and they are still not
--- enough on their own, because this state is UNDETECTABLE by anyone reading the
--- registry: nothing fails, nothing is logged, and each column looks correct alone. A
--- CHECK is the only barrier that also covers a psql session, a data migration, a
--- restored backup and any future code path that writes these columns without
--- knowing the rule. It is the same reasoning as
--- event_subscribers_credential_pair_chk and event_subscribers_fence_pair_chk, which
--- make their own two-column invariants unrepresentable rather than merely intended.
+-- What that actually did was withdraw a REQUIRED capability.
+-- `POST /subscribers/{id}/kafka-credentials` is mandatory, and blnk.event_subscribers is
+-- explicitly designed to hold a partition key prefix — so between them, a subscriber could
+-- be registered into a state from which it could never obtain credentials at all,
+-- permanently, with the endpoint answering 409 forever. A refusal is fail-closed only when
+-- a narrower grant exists to insist upon. Kafka has five ACL resource types — Topic, Group,
+-- Cluster, TransactionalId and DelegationToken — and none is a message key, and a topic per
+-- key space is ruled out, so no narrower credential was being withheld. None exists.
 --
--- # Why this is a separate migration rather than an edit of 1781248900.sql
+-- The prefix is therefore a ROUTING HINT and not an access boundary, and the API states
+-- that where a client cannot miss it: every credential response and every subscriber read
+-- carries enforced_access with the two dimensions the broker really keeps,
+-- partition_key_prefix_enforced = false, the echoed prefix, and
+-- client_side_key_filtering_required = true. sql/1781248900.sql documents the column in
+-- those terms.
 --
--- That file has already been applied wherever this feature has been exercised, and
--- sql-migrate records a migration by filename: editing its body would leave every
--- existing database without the constraint while reporting the migration as applied.
--- 1781248910.sql was added for the same reason and says so. This migration is
--- additive and idempotent: it touches no column, no index and no other constraint,
--- so it is safe on a database that already carries 1781248900.sql and a no-op on one
--- created after it.
-
--- STEP 1 — REPAIR the rows that already hold the combination, or the constraint
--- below cannot be added at all.
+-- # Why the file is retained rather than deleted, and why it is now a DROP
 --
--- The PREFIX is cleared and the credential record is deliberately left alone, and
--- the direction is the whole point. Clearing the prefix makes the row describe the
--- access that ACTUALLY EXISTS: a live credential with Read on whole topics. Clearing
--- credential_reference instead would make the registry report "registered, never
--- provisioned" while a principal that authenticates is still live at the broker —
--- the registry would then UNDER-report real access, which is the dangerous direction
--- and the opposite of what SEC-05 is for.
+-- Deleting it is not available. sql-migrate plans against the ledger in
+-- blnk.gorp_migrations, and an id recorded there with no corresponding source file aborts
+-- the whole run with "unknown migration in database" — so removing this file would leave
+-- every database that already applied it unable to migrate at all, which is far worse than
+-- the constraint it created.
 --
--- An operator who wanted the narrower boundary still has the two enforceable
--- remedies the service names: narrow authorized_topics, or revoke the credential and
--- then record the prefix. Neither is silently chosen here — what is chosen is that
--- the row stops making a claim nothing backs.
-UPDATE blnk.event_subscribers
-SET partition_key_prefix = NULL,
-    updated_at           = NOW()
-WHERE partition_key_prefix IS NOT NULL
-  AND credential_reference IS NOT NULL;
-
--- STEP 2 — the constraint.
+-- So the file stays and its content is corrected. The destructive UPDATE is gone: it
+-- existed only to make the constraint's validating scan pass, and clearing a prefix an
+-- operator deliberately recorded is data loss with nothing to show for it. What remains is
+-- the inverse of what this migration used to do, which also makes it idempotent and safe on
+-- a database that never created the constraint.
 --
--- Added through a guarded DO block because PostgreSQL has no ADD CONSTRAINT IF NOT
--- EXISTS, and a bare ALTER would fail the whole migration on any database that
--- already carries the constraint — including one restored from a dump taken after
--- this migration ran.
---
--- NOT declared NOT VALID. Step 1 has just removed every violating row, so the
--- validating scan cannot fail, and a NOT VALID constraint would leave the existing
--- rows permanently unchecked for a table whose whole purpose is to be read as an
--- authoritative statement about access.
---
--- The StatementBegin/StatementEnd markers are required, not decorative: sql-migrate
--- splits a migration on semicolons and knows nothing about dollar quoting, so without
--- them the block is cut at its first internal semicolon and the migration fails with
--- "unterminated dollar-quoted string". sql/1780963300.sql brackets its function bodies
--- the same way for the same reason.
--- +migrate StatementBegin
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conname = 'event_subscribers_key_scope_chk'
-          AND conrelid = 'blnk.event_subscribers'::regclass
-    ) THEN
-        ALTER TABLE blnk.event_subscribers
-            ADD CONSTRAINT event_subscribers_key_scope_chk
-            CHECK (partition_key_prefix IS NULL OR credential_reference IS NULL);
-    END IF;
-END
-$$;
--- +migrate StatementEnd
+-- A database that applied the ORIGINAL version of this file still carries the constraint
+-- and will never run this file again, because its id is already in the ledger.
+-- sql/1781248930.sql is what converges those databases; the two together cover both
+-- populations.
+ALTER TABLE blnk.event_subscribers
+    DROP CONSTRAINT IF EXISTS event_subscribers_key_scope_chk;
 
 -- +migrate Down
 
--- Dropping the constraint restores the state the service still refuses, which is the
--- correct asymmetry for a down migration: it undoes what this file did to the schema
--- and nothing else. The repaired rows are NOT restored — the prefixes cleared above
--- were claims about access that never existed, and re-inventing them on the way down
--- would recreate the defect deliberately.
-ALTER TABLE blnk.event_subscribers
-    DROP CONSTRAINT IF EXISTS event_subscribers_key_scope_chk;
+-- Deliberately a NO-OP.
+--
+-- The state this migration's up direction finds is "the constraint is absent" — on a fresh
+-- database because nothing creates it, and on a database that applied the original version
+-- because the up direction has just removed it. Re-adding it on the way down would not
+-- restore a previous state; it would reinstate the defect described above on any database
+-- that rolled back.
+--
+-- It could not run cleanly either. Rows recording both a prefix and a credential are
+-- legitimate once this migration is applied, so ADD CONSTRAINT would fail its validating
+-- scan on exactly the databases that exercised the restored capability — and clearing those
+-- prefixes to make it pass is the data loss removed above.
+--
+-- The statement below keeps the section explicit, so a reader can tell an intentional
+-- no-op from a forgotten one.
+SELECT 1;

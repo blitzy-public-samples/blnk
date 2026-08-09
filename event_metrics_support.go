@@ -19,6 +19,9 @@ package blnk
 import (
 	"strings"
 
+	"github.com/sirupsen/logrus"
+
+	"github.com/blnkfinance/blnk/internal/logsafe"
 	"github.com/blnkfinance/blnk/model"
 )
 
@@ -30,20 +33,26 @@ import (
 // resolved labels differently the collector would zero a series nobody ever published and
 // leave the real one standing at its last reading for ever.
 
+// These three are the package-local names for the caps and the truncation marker. They
+// are ALIASES of the canonical values in internal/logsafe rather than second copies,
+// because package api needs the identical bounds for the request log and a second
+// declaration is how two log sinks come to disagree about how much of an error they
+// keep. The names stay because more than a hundred call sites in this package read
+// better with them.
 const (
 	// maxLoggedErrorLength caps an error string from a dependency. Generous enough to keep
 	// the diagnostic part of a real broker error — which leads with the useful text — and
 	// short enough that no single line can dominate a log.
-	maxLoggedErrorLength = 512
+	maxLoggedErrorLength = logsafe.MaxErrorLength
 
 	// maxLoggedFilterLength caps a caller-supplied value echoed back into a log line.
 	// Shorter than an error cap because these are identifiers and topic names, where
 	// anything long is malformed input rather than detail.
-	maxLoggedFilterLength = 128
+	maxLoggedFilterLength = logsafe.MaxValueLength
 
 	// logTruncationSuffix marks a value the cap shortened, so a truncated line is never
 	// mistaken for a complete one.
-	logTruncationSuffix = "…[truncated]"
+	logTruncationSuffix = logsafe.TruncationSuffix
 )
 
 const (
@@ -79,32 +88,77 @@ const (
 //   - value string: the untrusted text.
 //   - max int: the maximum number of runes to keep. Values below 1 yield an empty string.
 //
+// The implementation lives in internal/logsafe so that package api sanitizes request
+// values by exactly the same rules; this remains the name package blnk calls.
+//
 // Returns:
 //   - string: the sanitized, bounded text.
 func sanitizeLogValue(value string, max int) string {
-	if value == "" || max < 1 {
-		return ""
+	return logsafe.Value(value, max)
+}
+
+// loggableCause renders an error for an operational log line at a normal level: control
+// characters stripped, NETWORK TOPOLOGY REDACTED, and length bounded.
+//
+// It exists as a distinct helper from sanitizeLogValue because the two protect against
+// different things and the difference is easy to lose. sanitizeLogValue makes a value's
+// FORM safe; a Kafka or database error whose form is perfectly safe still names the
+// broker's address, the resolver's address, or the connection string it failed on. That
+// is reconnaissance for anybody who can read the log, and it is not needed to know that
+// the broker is unreachable.
+//
+// Every operational log line in the event pipeline that carries a dependency's error
+// goes through here, and the verbatim text is reachable through the debug-level
+// companion field that withLoggableCause attaches. See internal/logsafe for the
+// redaction rules.
+//
+// Parameters:
+//   - err error: the error to render. A nil error yields an empty string, so a caller
+//     can attach the field without first inventing a word for "no error".
+//
+// Returns:
+//   - string: the redacted, sanitized, bounded rendering.
+func loggableCause(err error) string {
+	return logsafe.Cause(err)
+}
+
+// withLoggableCause attaches a dependency error to a log entry in the two renderings an
+// operator needs, and it is the ONLY way this package should put an error into a line.
+//
+// The "cause" field is the redacted rendering, which is what a deployment writes at
+// info, warn and error. The "cause_verbatim" field carries the unredacted text and is
+// attached ONLY when the standard logger is at debug — the restricted sink. That
+// asymmetry is the whole design: redacting unconditionally would trade an information
+// disclosure risk for a longer outage, since the address that failed is exactly what a
+// broker investigation needs, so the detail stays reachable behind an explicit,
+// auditable act (BLNK_LOG_LEVEL=debug) instead of being on by default.
+//
+// Using logrus.WithError instead is the defect this replaces: it renders err.Error()
+// verbatim into the "error" field at whatever level the line is emitted at.
+//
+// Parameters:
+//   - entry *logrus.Entry: the entry to extend. A nil entry is treated as a fresh one so
+//     a caller never has to guard.
+//   - err error: the error to attach. A nil error leaves the entry untouched.
+//
+// Returns:
+//   - *logrus.Entry: the entry with the cause fields attached.
+func withLoggableCause(entry *logrus.Entry, err error) *logrus.Entry {
+	if entry == nil {
+		entry = logrus.NewEntry(logrus.StandardLogger())
 	}
 
-	cleaned := strings.Map(func(r rune) rune {
-		switch {
-		case r == '\n' || r == '\r' || r == '\t':
-			return ' '
-		case r < 0x20 || r == 0x7f:
-			return -1
-		default:
-			return r
-		}
-	}, value)
-
-	cleaned = strings.TrimSpace(cleaned)
-
-	runes := []rune(cleaned)
-	if len(runes) <= max {
-		return cleaned
+	if err == nil {
+		return entry
 	}
 
-	return string(runes[:max]) + logTruncationSuffix
+	entry = entry.WithField("cause", logsafe.Cause(err))
+
+	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+		entry = entry.WithField("cause_verbatim", logsafe.CauseVerbatim(err))
+	}
+
+	return entry
 }
 
 // isRegistrySubscriberIdentifier reports whether a subscriber business identifier is one the
@@ -256,6 +310,77 @@ func consumerGroupLagLabel(group string) string {
 	return lagLabelUnregistered
 }
 
+// ---------------------------------------------------------------------------------------
+// OBS-16: a log line must carry the SAME pseudonym the metric carries
+//
+// The two resolvers above pseudonymise the subscriber and the group for a metric label, for
+// the reasons documented on subscriberLagLabel. Log lines about the same measurements carried
+// the identifiers IN PLAINTEXT, length-bounded and nothing more — so every reason the label
+// was hashed applied verbatim to the log, and the log is the more widely shipped of the two.
+// Worse than merely leaking, the asymmetry made the two UNJOINABLE: a lag alert names a hash
+// and the log line explaining it named a tenant, so nothing tied the alert to its cause
+// without the registry in hand.
+//
+// The two functions below are what a log line uses. They resolve to the same token as the
+// metric label for every identifier the registry admits, which is the only case a pivot has
+// to work for, and they differ deliberately in one case:
+//
+//   - AN IDENTIFIER THE REGISTRY WOULD NOT ADMIT is HASHED here and collapsed to
+//     "unregistered" on the metric. The metric collapses it to bound cardinality — an
+//     unadmitted id is caller-shaped data and could take unbounded values — while a log line
+//     has no cardinality budget and does have to keep two different rogue identifiers apart,
+//     which one shared collapse token would destroy. Nothing is lost for the pivot, because
+//     an id the registry does not admit is not in the registry to be resolved.
+//
+// The pivot itself is published rather than described: SubscriberResponse carries
+// subscriber_id_hash, so GET /subscribers resolves a token from a log or an alert to the
+// subscriber, and docs/kafka-operations.md publishes the shell one-liner that computes the
+// same token from an identifier. See HashLogIdentifier for the rule.
+// ---------------------------------------------------------------------------------------
+
+// subscriberLogLabel resolves a subscriber identifier to the pseudonym a LOG FIELD carries.
+//
+// Parameters:
+//   - subscriber string: the raw subscriber id. May be empty.
+//
+// Returns:
+//   - string: "unattributed" for an empty id, otherwise the same stable token
+//     subscriberLagLabel publishes for a registry-admissible id.
+func subscriberLogLabel(subscriber string) string {
+	trimmed := strings.TrimSpace(subscriber)
+	if trimmed == "" {
+		return lagLabelUnattributed
+	}
+
+	return hashLogIdentifier(trimmed)
+}
+
+// consumerGroupLogLabel resolves a consumer group identifier to the pseudonym a LOG FIELD
+// carries.
+//
+// The subscriber-scoped ROOT is hashed when the group has one, exactly as the metric label
+// does, so every group a subscriber runs resolves to one token and that token is the same on
+// both sides. A group with no recognisable root is hashed whole rather than collapsed, for the
+// reason OBS-16 documents above.
+//
+// Parameters:
+//   - group string: the raw, possibly suffixed group id. May be empty.
+//
+// Returns:
+//   - string: "unattributed" for an empty id, otherwise a stable token.
+func consumerGroupLogLabel(group string) string {
+	trimmed := strings.TrimSpace(group)
+	if trimmed == "" {
+		return lagLabelUnattributed
+	}
+
+	if root, ok := consumerGroupRoot(trimmed); ok {
+		return hashLogIdentifier(root)
+	}
+
+	return hashLogIdentifier(trimmed)
+}
+
 // topicLagLabel resolves the 'topic' gauge attribute to a bounded value.
 //
 // The permitted set is the topics Blnk itself owns under the configured prefix — every
@@ -273,7 +398,12 @@ func topicLagLabel(topic string) string {
 		return lagLabelOtherTopic
 	}
 
-	for _, owned := range AllTopicsWithDeadLetters() {
+	// Across every owned prefix. A subscriber authorised before a topic-prefix rename is
+	// still consuming the previous generation's topic while its rows drain, and collapsing
+	// that name would hide exactly the lag an operator managing the migration needs to see.
+	// The set stays bounded because the historical allowlist is bounded by
+	// config.MaxHistoricalTopicPrefixes.
+	for _, owned := range AllOwnedTopicsAcrossPrefixes() {
 		if trimmed == owned {
 			return trimmed
 		}

@@ -34,6 +34,10 @@ declare example=".env.example"      # name of the sample environment file
 # installation, every compose call in this script failed with "command not found": the ledger
 # never started, and the Kafka stages this file now owns could not run at all. A default that
 # names a binary the host may not have is not a default.
+#
+# The v1 script is no longer accepted at all, by detection or by an explicit pin: the compose
+# files need Compose ${COMPOSE_MINIMUM_VERSION} or newer for depends_on.required, and v1 cannot
+# parse them. resolve_compose_cl version-checks whatever it ends up with.
 declare COMPOSE_CL=""
 
 # The provisioning script this stack delegates topic and principal creation to. Path is
@@ -170,7 +174,7 @@ declare KAFKA_BROKERS_FROM_SHELL="${KAFKA_BROKERS-}"
 
 help() {
     printf "\n \
-    Usage:${BLU} ${0} ${GRN}parameters${NC}\n \
+    Usage:${BLU} %s ${GRN}parameters${NC}\n \
     ${GRN}--pull, -p${NC}\t\t Pull the repo from registry\n \
     ${GRN}--up,-u${NC}\t\t Provision Kafka, then spin the stack up\n \
     ${GRN}--build,-b${NC}\t\t Provision Kafka, then build and spin the stack up\n \
@@ -190,10 +194,10 @@ help() {
     Teardown always includes the profile, so nothing is left behind.\n \
     \n \
     Examples:
-    ${BLU} ${0} ${GRN}-u${NC}\n\
-    ${BLU} ${0} ${GRN}--purge --yes${NC}\n\
+    ${BLU} %s ${GRN}-u${NC}\n\
+    ${BLU} %s ${GRN}--purge --yes${NC}\n\
     \n\
-    "
+    " "${0}" "${0}" "${0}"
 }
 
 showenv() {
@@ -208,17 +212,17 @@ showenv() {
         source "${env}"
     fi
     printf "\n ==== Environment ====\n"
-    printf "      Stack name : ${YEL}$COMPOSE_PROJECT_NAME${NC}\n"
-    printf "    Compose file : ${BLU}$COMPOSE_FILE${NC}\n"
-    printf "  CL parameter 0 : ${BLU}${0}${NC}\n"
-    printf "  CL parameter 1 : ${BLU}${1}${NC}\n"
-    printf "  CL parameter 2 : ${BLU}${2}${NC}\n"
-    printf "  CL parameter 3 : ${BLU}${3}${NC}\n"
+    printf "      Stack name : ${YEL}%s${NC}\n" "${COMPOSE_PROJECT_NAME}"
+    printf "    Compose file : ${BLU}%s${NC}\n" "${COMPOSE_FILE}"
+    printf "  CL parameter 0 : ${BLU}%s${NC}\n" "${0}"
+    printf "  CL parameter 1 : ${BLU}%s${NC}\n" "${1}"
+    printf "  CL parameter 2 : ${BLU}%s${NC}\n" "${2}"
+    printf "  CL parameter 3 : ${BLU}%s${NC}\n" "${3}"
     if [ -r ${env} ]
     then
-      printf "             env : ${BLU}${env}${NC}\n"
+      printf "             env : ${BLU}%s${NC}\n" "${env}"
     else
-      printf "             env : ${RED}${env}${NC} not found. You may want to initialize the stack with -i parameter\n"
+      printf "             env : ${RED}%s${NC} not found. You may want to initialize the stack with -i parameter\n" "${env}"
     fi
     printf " =====================\n"
 }
@@ -708,7 +712,7 @@ effective_kafka_brokers() {
 # decides with KAFKA_BROKERS_FROM_SHELL, captured before the source, which is correct: compose
 # resolves the shell environment ahead of --env-file. The two then differ. "KAFKA_BROKERS=broker-a
 # ./stack.sh -u" against a .env naming broker-b had this script wait for, authenticate to and
-# verify the catalogue on broker-a while the server and worker published to broker-b - and the
+# verify the catalogue on broker-a while the server published to broker-b - and the
 # bring-up reported success.
 #
 # Pinning the value on the invocation removes the disagreement at its source rather than
@@ -1291,113 +1295,164 @@ purge() {
 # The Compose command line
 # =======================================================================================
 
-# Decide how to invoke Compose, once, before any command runs.
+# The lowest Compose release that can read this repository's compose files.
 #
-# WHY THIS IS DETECTED. Docker ships two spellings of the same tool: "docker compose", the v2+
-# plugin bundled with every current Docker, and "docker-compose", the standalone v1 script that
-# newer installations do not include. This script pinned the standalone one and ${example}
-# shipped that pin uncommented, so on a Compose-v2-only host every call here died with
-# "docker-compose: command not found" - the ledger never came up, and the Kafka staging this
-# file now owns never ran. Detecting costs one probe and removes a whole class of "it does not
-# work on my machine".
+# It is not a preference. Both docker-compose.yaml and docker-compose.dev.yaml declare
+# "depends_on: <service>: required: false" on the Kafka dependency, and that field is what makes
+# the broker OPT-IN: without it a profiled service that was never started is a hard dependency
+# failure and the default bring-up cannot start at all. Compose added "required" in 2.20.0, so a
+# host below that version does not merely lose a feature - it cannot parse the file, and the
+# error it prints names a field rather than a version.
+declare -r COMPOSE_MINIMUM_VERSION="2.20.0"
+
+# The version of a Compose invocation, as "MAJOR.MINOR.PATCH", or nothing when it cannot be
+# determined.
 #
-# PRECEDENCE, and it matters. An explicit COMPOSE_CL - exported by the caller or pinned in
-# ${env}, which showenv has already sourced by the time this runs - is used verbatim and is
-# never probed: an operator who names a wrapper, a remote context or an absolute path has said
-# something this function has no business second-guessing. Only an empty value is resolved, and
-# the plugin is preferred because it is the supported one.
+# "version --short" is used rather than parsing the human-readable banner, because the banner's
+# wording has changed across releases while --short has always printed the bare number. A
+# leading "v" is stripped and any pre-release or build suffix is discarded, so "v2.20.0-rc.1"
+# reads as 2.20.0 - the field this requirement is about landed in the release, and a release
+# candidate of it has the field.
 #
-# WHY IT CAN REFUSE. With neither spelling present, every command in this script would fail
-# anyway, one confusing message at a time. Saying so once, by name, is the difference between a
-# missing prerequisite and a broken script. --init and the help text are exempt because neither
-# touches Compose, and an operator's first act on a fresh checkout is usually --init.
+# Every failure is swallowed and reported as an empty string: a wrapper that does not implement
+# "version --short" is a legitimate thing for an operator to point COMPOSE_CL at, and errexit
+# must not turn "cannot tell" into an aborted bring-up.
 #
 # Parameters:
-#   - $1: the subcommand being run, so the Compose-free ones are not held to this requirement.
-resolve_compose_cl() {
-    # Named for what it is rather than "command", which would read as the shell builtin used
-    # two probes below.
-    local subcommand="${1:-}"
+#   - $1: the Compose invocation to interrogate, word-split on purpose because "docker compose"
+#     is two words.
+compose_version_of() {
+    local invocation="${1}" raw=""
 
-    if [ -n "${COMPOSE_CL}" ]
-    then
-        return 0
-    fi
+    # shellcheck disable=SC2086
+    raw="$(${invocation} version --short 2>/dev/null | head -n 1 || true)"
+    raw="${raw#v}"
 
-    if docker compose version >/dev/null 2>&1
-    then
-        COMPOSE_CL="docker compose"
-        return 0
-    fi
-
-    if command -v docker-compose >/dev/null 2>&1
-    then
-        COMPOSE_CL="docker-compose"
-        return 0
-    fi
-
-    case "${subcommand}" in
-        --init | -i | --help | -h | "" )
-            # Nothing here speaks to Compose. Leave the value empty rather than refusing, so a
-            # fresh checkout can still be initialised on a host where Docker is not installed
-            # yet, and let the first command that needs Compose be the one that reports it.
-            return 0
+    case "${raw}" in
+        [0-9]*.[0-9]*)
+            printf '%s' "${raw%%[!0-9.]*}"
             ;;
     esac
+}
 
-    printf '%b\n' " ${RED}Neither 'docker compose' nor 'docker-compose' is available on this host.${NC}"
+# Whether a "MAJOR.MINOR.PATCH" string is at least COMPOSE_MINIMUM_VERSION.
+#
+# Compared field by field as integers rather than lexically, because "2.9.0" sorts after
+# "2.20.0" as text and that is exactly the comparison this repository needs to get right.
+#
+# Parameters:
+#   - $1: the version to test. An empty or unparseable value answers "no".
+compose_version_at_least() {
+    local candidate="${1}" required="${COMPOSE_MINIMUM_VERSION}"
+    local c_major c_minor c_patch r_major r_minor r_patch
+
+    if [ -z "${candidate}" ]
+    then
+        return 1
+    fi
+
+    IFS='.' read -r c_major c_minor c_patch <<< "${candidate}"
+    IFS='.' read -r r_major r_minor r_patch <<< "${required}"
+
+    c_major="${c_major:-0}"; c_minor="${c_minor:-0}"; c_patch="${c_patch:-0}"
+    r_major="${r_major:-0}"; r_minor="${r_minor:-0}"; r_patch="${r_patch:-0}"
+
+    if [ "${c_major}" -ne "${r_major}" ]
+    then
+        [ "${c_major}" -gt "${r_major}" ]
+        return $?
+    fi
+
+    if [ "${c_minor}" -ne "${r_minor}" ]
+    then
+        [ "${c_minor}" -gt "${r_minor}" ]
+        return $?
+    fi
+
+    [ "${c_patch}" -ge "${r_patch}" ]
+}
+
+# Print the refusal an unusable Compose earns, then leave.
+#
+# Parameters:
+#   - $1: what was found, phrased for the operator.
+refuse_compose_cl() {
+    printf '%b\n' " ${RED}${1}${NC}"
     printf '%b\n' " Every command in this script drives Compose, so none of them can run."
-    printf '%b\n' " Install Docker with the Compose plugin, or set ${BLU}COMPOSE_CL${NC} in ${BLU}${env}${NC} to"
-    printf '%b\n' " the command that starts Compose here."
+    printf '%b\n' " This repository's compose files use ${BLU}depends_on.required${NC}, which Compose"
+    printf '%b\n' " added in ${BLU}${COMPOSE_MINIMUM_VERSION}${NC} and which is what makes the Kafka broker opt-in."
+    printf '%b\n' " Install Docker with a Compose plugin at ${COMPOSE_MINIMUM_VERSION} or newer, or set"
+    printf '%b\n' " ${BLU}COMPOSE_CL${NC} in ${BLU}${env}${NC} to a command that starts one here."
     exit 1
 }
 
-# =======================================================================================
-# The Compose command line
-# =======================================================================================
-
 # Decide how to invoke Compose, once, before any command runs.
 #
-# WHY THIS IS DETECTED. Docker ships two spellings of the same tool: "docker compose", the v2+
-# plugin bundled with every current Docker, and "docker-compose", the standalone v1 script that
-# newer installations do not include. This script pinned the standalone one and ${example}
-# shipped that pin uncommented, so on a Compose-v2-only host every call here died with
-# "docker-compose: command not found" - the ledger never came up, and the Kafka staging this
-# file now owns never ran. Detecting costs one probe and removes a whole class of "it does not
-# work on my machine".
+# WHY THIS IS DETECTED. Docker ships the Compose v2+ plugin with every current release, invoked
+# as "docker compose". This script used to pin the standalone "docker-compose" script and
+# ${example} shipped that pin uncommented, so on a host without it every call here died with
+# "docker-compose: command not found" - the ledger never came up, and the Kafka staging this file
+# owns never ran. Detecting costs one probe and removes a whole class of "it does not work on my
+# machine".
+#
+# WHY THERE IS NO v1 FALLBACK. The standalone script is Compose v1, it is end-of-life, and it
+# cannot read this repository's compose files at all: depends_on.required arrived in v2.20.0.
+# Falling back to it would replace a clear "install a newer Compose" with a parse error naming a
+# field, on a host that was never going to work - so the version is checked and the fallback is
+# gone.
 #
 # PRECEDENCE, and it matters. An explicit COMPOSE_CL - exported by the caller or pinned in
-# ${env}, which showenv has already sourced by the time this runs - is used verbatim and is
-# never probed: an operator who names a wrapper, a remote context or an absolute path has said
-# something this function has no business second-guessing. Only an empty value is resolved, and
-# the plugin is preferred because it is the supported one.
+# ${env}, which showenv has already sourced by the time this runs - is used verbatim and is never
+# replaced: an operator who names a wrapper, a remote context or an absolute path has said
+# something this function has no business second-guessing. It is still VERSION-CHECKED, which is
+# a different act: the requirement belongs to the compose files rather than to the invocation, so
+# it holds however Compose is reached. A wrapper whose version cannot be read is warned about and
+# then trusted, because refusing there would break the very indirection the override exists for.
 #
-# WHY IT CAN REFUSE. With neither spelling present, every command in this script would fail
-# anyway, one confusing message at a time. Saying so once, by name, is the difference between a
-# missing prerequisite and a broken script. --init and the help text are exempt because neither
-# touches Compose, and an operator's first act on a fresh checkout is usually --init.
+# WHY IT CAN REFUSE. With no usable Compose, every command in this script would fail anyway, one
+# confusing message at a time. Saying so once, by name and with the version required, is the
+# difference between a missing prerequisite and a broken script. --init and the help text are
+# exempt because neither touches Compose, and an operator's first act on a fresh checkout is
+# usually --init.
 #
 # Parameters:
 #   - $1: the subcommand being run, so the Compose-free ones are not held to this requirement.
 resolve_compose_cl() {
     # Named for what it is rather than "command", which would read as the shell builtin used
-    # two probes below.
+    # in the probe below.
     local subcommand="${1:-}"
+    local found=""
 
     if [ -n "${COMPOSE_CL}" ]
     then
+        found="$(compose_version_of "${COMPOSE_CL}")"
+        if [ -z "${found}" ]
+        then
+            printf '%b\n' " ${YEL}COMPOSE_CL is set to '${COMPOSE_CL}', whose version could not be read.${NC}"
+            printf '%b\n' " Continuing with it. This repository needs Compose ${COMPOSE_MINIMUM_VERSION} or newer:"
+            printf '%b\n' " if bring-up fails on ${BLU}depends_on.required${NC}, that is the reason."
+
+            return 0
+        fi
+
+        if ! compose_version_at_least "${found}"
+        then
+            refuse_compose_cl "COMPOSE_CL is set to '${COMPOSE_CL}', which is Compose ${found}."
+        fi
+
         return 0
     fi
 
     if docker compose version >/dev/null 2>&1
     then
         COMPOSE_CL="docker compose"
-        return 0
-    fi
+        found="$(compose_version_of "${COMPOSE_CL}")"
 
-    if command -v docker-compose >/dev/null 2>&1
-    then
-        COMPOSE_CL="docker-compose"
+        if [ -n "${found}" ] && ! compose_version_at_least "${found}"
+        then
+            refuse_compose_cl "The Docker Compose plugin on this host is version ${found}."
+        fi
+
         return 0
     fi
 
@@ -1410,11 +1465,7 @@ resolve_compose_cl() {
             ;;
     esac
 
-    printf '%b\n' " ${RED}Neither 'docker compose' nor 'docker-compose' is available on this host.${NC}"
-    printf '%b\n' " Every command in this script drives Compose, so none of them can run."
-    printf '%b\n' " Install Docker with the Compose plugin, or set ${BLU}COMPOSE_CL${NC} in ${BLU}${env}${NC} to"
-    printf '%b\n' " the command that starts Compose here."
-    exit 1
+    refuse_compose_cl "The Docker Compose plugin is not available on this host."
 }
 
 main() {
@@ -1459,7 +1510,7 @@ main() {
     	    #checking if .env is available:
             if [ -r ${env} ]
             then
-                printf "The environment file ${RED}${env}${NC} is already available. If you want to start from scratch, delete it and restart.\n"
+                printf "The environment file ${RED}%s${NC} is already available. If you want to start from scratch, delete it and restart.\n" "${env}"
                 # An existing file is not left as found. Its permissions are still repaired
                 # and any missing Kafka credential is still generated, because the two
                 # defects this guards against are exactly the ones an ALREADY-EXISTING file
@@ -1485,7 +1536,7 @@ main() {
                 # its mode from the umask, not from the file it is replacing - so without it
                 # the secrets would appear world-readable in that temporary copy even though
                 # the final file was private.
-                printf "Creating file: ${YEL}${env}${NC} with secrets... Check it before you spin up the stack.\n"
+                printf "Creating file: ${YEL}%s${NC} with secrets... Check it before you spin up the stack.\n" "${env}"
 
                 # THE MODE IS SET BEFORE THE FIRST SECRET EXISTS, and that ordering is the
                 # whole of this fix.
@@ -1602,7 +1653,7 @@ main() {
                 #checking if .env created successfully:
                 if [ ! -r ${env} ]
                 then
-                    printf "Error creating environment file ${RED}${env}${NC}. Please, check if an ${BLU}.env${NC} file available, resolve and restart.\n"
+                    printf "Error creating environment file ${RED}%s${NC}. Please, check if an ${BLU}.env${NC} file available, resolve and restart.\n" "${env}"
                     exit 1
                 fi
             fi

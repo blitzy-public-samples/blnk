@@ -25,8 +25,75 @@ spec:
         io.kompose.service: redis
     spec:
       containers:
-        - image: redis:7.2.4
+        # THE TAG IS A SECURITY FLOOR, NOT A PREFERENCE.
+        #
+        #   7.2.4 is vulnerable to CVE-2025-49844 ("RediShell", CVSS 10.0): a
+        #   use-after-free in the Lua interpreter's garbage collector that lets a client
+        #   holding credentials escape the Lua sandbox and run arbitrary code in this
+        #   container. The 7.2 line was fixed in 7.2.11; 7.2.15 is the newest release on
+        #   it, so the delta from the previous pin is fixes only.
+        #
+        #   The usual mitigation — denying EVAL and EVALSHA by ACL — is not available to
+        #   Blnk: asynq drives every queue operation through Lua scripts and
+        #   internal/lock is an EVAL'd compare-and-delete, so denying Lua would break
+        #   TRANSACTION_QUEUE and the lock. Upgrading is the only remediation.
+        #
+        #   Pinned by digest as well as tag so a repushed tag cannot change what runs
+        #   here. Re-pin both together.
+        - image: redis:7.2.15@sha256:82aaa7644735e54d290a34e5eb9b1b97c4cf99c84d0250a794cc021f544c069f
           name: redis
+          # AUTHENTICATION IS NOT OPTIONAL IN A CLUSTER, EVEN THOUGH THIS KEY IS.
+          #
+          # docker-compose.yaml can ship without a password because it binds Redis to
+          # 127.0.0.1, and that loopback bind is the compensating control. THERE IS NO
+          # EQUIVALENT HERE: the redis Service resolves from every pod that can reach
+          # this namespace, so an unauthenticated Redis is write access to
+          # TRANSACTION_QUEUE — the ledger's work queue — for anything running in the
+          # cluster.
+          #
+          # Provision the Secret and set both sides in the same change.
+          #
+          # BY FILE, NOT --from-literal, for the reason kafka-statefulset.yaml
+          # states at length: a --from-literal value is a command ARGUMENT,
+          # world-readable in /proc/<pid>/cmdline for the life of the process
+          # and recorded verbatim by the shell's history and by any audit or CI
+          # tooling that logs command lines. A secret manager delivering the
+          # value as a file or through an API is better still.
+          #
+          #   umask 077
+          #   printf '%s' '<generated>' > /tmp/redis-password
+          #   printf 'redis://:%s@redis:6379' '<generated>' > /tmp/redis-dns
+          #   kubectl -n blnk create secret generic blnk-redis \
+          #     --from-file=password=/tmp/redis-password \
+          #     --from-file=dns=/tmp/redis-dns
+          #   shred -u /tmp/redis-password /tmp/redis-dns
+          #
+          # The password below and BLNK_REDIS_DNS on the server and worker have to carry
+          # the SAME value: internal/redis-db's ParseRedisURL reads the password out of
+          # the DSN's userinfo, so setting one without the other locks Blnk out of its
+          # own queue. See the Redis section of blnk-config.yaml.
+          #
+          # optional: true keeps an existing cluster from crash-looping the moment this
+          # manifest is applied, before its Secret exists. It is a migration affordance,
+          # not the intended end state.
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: blnk-redis
+                  key: password
+                  optional: true
+          # `exec` so redis-server is PID 1 and receives SIGTERM on pod termination
+          # rather than having the shell absorb it. The branch is what keeps an
+          # unconfigured cluster behaving exactly as it did before this change instead of
+          # failing to start on a missing password.
+          command:
+            - sh
+            - -c
+          args:
+            - >-
+              if [ -n "$REDIS_PASSWORD" ]; then exec redis-server --requirepass
+              "$REDIS_PASSWORD"; else exec redis-server; fi
           resources: {}
       restartPolicy: Always
 status: {}

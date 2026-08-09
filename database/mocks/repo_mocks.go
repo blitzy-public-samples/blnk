@@ -19,14 +19,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"math/big"
-	"sync"
-	"time"
-
 	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/internal/filter"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/stretchr/testify/mock"
+	"math/big"
+	"sync"
+	"time"
 )
 
 // MockDataSource is a mock implementation of the IDataSource interface
@@ -149,8 +148,6 @@ func runEventPreparer[T any](m *MockDataSource, entity T, preparers []database.E
 // It belongs in this package and NOT in the database package: database does not
 // import mocks, and adding the assertion there would create an import cycle.
 var _ database.IDataSource = (*MockDataSource)(nil)
-
-// Transaction methods
 
 // RecordTransaction accepts the same variadic event outbox tail as the real
 // datasource, records it through captureEventOutboxes, and deliberately does not
@@ -358,8 +355,6 @@ func (m *MockDataSource) CountQueuedTransactionsForPairLane(ctx context.Context,
 	return args.Int(0), args.Error(1)
 }
 
-// Ledger methods
-
 // CreateLedger accepts the same variadic EventPreparer tail as the real datasource
 // and RUNS the preparer against the ledger it is about to return, recording the row
 // it produced.
@@ -457,8 +452,6 @@ func (m *MockDataSource) UpdateIdentityMetadata(id string, metadata map[string]i
 	return args.Error(0)
 }
 
-// Balance methods
-
 // CreateBalance accepts and RUNS the variadic EventPreparer tail against the balance
 // it is about to return, recording the row it produced. See CreateLedger for why the
 // preparer is run rather than dropped.
@@ -555,8 +548,6 @@ func (m *MockDataSource) GetBalanceAtTime(ctx context.Context, balanceID string,
 	return args.Get(0).(*model.Balance), args.Error(1)
 }
 
-// Account methods
-
 func (m *MockDataSource) CreateAccount(account model.Account) (model.Account, error) {
 	args := m.Called(account)
 	return args.Get(0).(model.Account), args.Error(1)
@@ -607,8 +598,6 @@ func (m *MockDataSource) DeleteAccount(id string) error {
 	return args.Error(0)
 }
 
-// BalanceMonitor methods
-
 func (m *MockDataSource) CreateMonitor(monitor model.BalanceMonitor) (model.BalanceMonitor, error) {
 	args := m.Called(monitor)
 	return args.Get(0).(model.BalanceMonitor), args.Error(1)
@@ -638,8 +627,6 @@ func (m *MockDataSource) DeleteMonitor(id string) error {
 	args := m.Called(id)
 	return args.Error(0)
 }
-
-// Identity methods
 
 // CreateIdentity accepts and RUNS the variadic EventPreparer tail against the
 // identity it is about to return, recording the row it produced. See CreateLedger for
@@ -710,8 +697,6 @@ func (m *MockDataSource) DeleteIdentity(id string) error {
 	args := m.Called(id)
 	return args.Error(0)
 }
-
-// Reconciliation methods
 
 func (m *MockDataSource) RecordReconciliation(ctx context.Context, rec *model.Reconciliation) error {
 	args := m.Called(ctx, rec)
@@ -853,8 +838,6 @@ func (m *MockDataSource) GetTransactionsByCriteria(ctx context.Context, minAmoun
 	return args.Get(0).([]*model.Transaction), args.Error(1)
 }
 
-// Lineage methods
-
 func (m *MockDataSource) UpsertLineageMapping(ctx context.Context, mapping model.LineageMapping) error {
 	args := m.Called(ctx, mapping)
 	return args.Error(0)
@@ -877,8 +860,6 @@ func (m *MockDataSource) DeleteLineageMapping(ctx context.Context, id int64) err
 	args := m.Called(ctx, id)
 	return args.Error(0)
 }
-
-// Lineage Outbox methods
 
 func (m *MockDataSource) InsertLineageOutboxInTx(ctx context.Context, tx *sql.Tx, outbox *model.LineageOutbox) error {
 	args := m.Called(ctx, tx, outbox)
@@ -947,8 +928,6 @@ func (m *MockDataSource) CountUnchainedTransactions(ctx context.Context, cutoff 
 	return args.Get(0).(int64), args.Error(1)
 }
 
-// Event outbox methods
-
 func (m *MockDataSource) InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *model.EventOutbox) error {
 	args := m.Called(ctx, tx, e)
 	return args.Error(0)
@@ -993,11 +972,13 @@ func (m *MockDataSource) MarkEventDispatched(ctx context.Context, id int64, clai
 // Exhausted to decide whether to dead-letter — returning a zero outcome on the
 // error path is correct and is what the nil check below produces.
 //
-// terminal is part of the expectation rather than swallowed, so a test can pin that the
-// relay forwarded the publisher's permanent-failure verdict to the durable transition
-// instead of leaving the decision to the attempt count.
-func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, terminal bool) (model.EventFailureOutcome, error) {
-	args := m.Called(ctx, id, claimToken, errMsg, retryAfter, terminal)
+// terminal and deadLetterLease are both part of the expectation rather than swallowed, so a
+// test can pin that the relay forwarded the publisher's permanent-failure verdict to the
+// durable transition instead of leaving the decision to the attempt count, AND that it supplied
+// a hand-off lease — a zero lease reintroduces the duplicate dead-letter race, and a mock that
+// dropped the argument could not tell one from the other.
+func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, terminal bool, deadLetterLease time.Duration) (model.EventFailureOutcome, error) {
+	args := m.Called(ctx, id, claimToken, errMsg, retryAfter, terminal, deadLetterLease)
 	if args.Get(0) == nil {
 		return model.EventFailureOutcome{}, args.Error(1)
 	}
@@ -1009,8 +990,11 @@ func (m *MockDataSource) MarkEventFailed(ctx context.Context, id int64, claimTok
 // supply an outcome, because the caller reads Exhausted and ClaimToken to perform the
 // dead-letter hand-off — and a zero outcome on the error path is what the nil check below
 // produces.
-func (m *MockDataSource) MarkEventPermanentlyFailed(ctx context.Context, id int64, claimToken, errMsg string) (model.EventFailureOutcome, error) {
-	args := m.Called(ctx, id, claimToken, errMsg)
+//
+// deadLetterLease is likewise part of the expectation: this transition holds the row for the
+// hand-off, and a caller that passed nothing would leave the row re-claimable at once.
+func (m *MockDataSource) MarkEventPermanentlyFailed(ctx context.Context, id int64, claimToken, errMsg string, deadLetterLease time.Duration) (model.EventFailureOutcome, error) {
+	args := m.Called(ctx, id, claimToken, errMsg, deadLetterLease)
 	if args.Get(0) == nil {
 		return model.EventFailureOutcome{}, args.Error(1)
 	}
@@ -1087,40 +1071,111 @@ func (m *MockDataSource) GetEventByID(ctx context.Context, eventID string) (*mod
 	return args.Get(0).(*model.EventOutbox), args.Error(1)
 }
 
-func (m *MockDataSource) ListDeadLetteredEvents(ctx context.Context, limit, offset int) ([]model.EventOutbox, error) {
-	args := m.Called(ctx, limit, offset)
+func (m *MockDataSource) MarkEventDeadLetterResolved(ctx context.Context, eventID string, note string, at time.Time) (*model.EventOutbox, error) {
+	args := m.Called(ctx, eventID, note, at)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*model.EventOutbox), args.Error(1)
+}
+
+func (m *MockDataSource) CountDeadLetteredEvents(ctx context.Context, query model.DeadLetterQuery) (int64, error) {
+	args := m.Called(ctx, query)
+	return args.Get(0).(int64), args.Error(1)
+}
+
+func (m *MockDataSource) ListDeadLetteredEvents(ctx context.Context, query model.DeadLetterQuery) ([]model.EventOutbox, error) {
+	args := m.Called(ctx, query)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
 	return args.Get(0).([]model.EventOutbox), args.Error(1)
 }
 
-func (m *MockDataSource) CountEventOutboxByStatus(ctx context.Context) (map[string]int64, error) {
-	args := m.Called(ctx)
+func (m *MockDataSource) ListDeadLetteredEventsFiltered(ctx context.Context, filter model.DeadLetterInventoryFilter, limit, offset int) ([]model.EventOutbox, error) {
+	args := m.Called(ctx, filter, limit, offset)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.EventOutbox), args.Error(1)
+}
+
+func (m *MockDataSource) ListDeadLetterInventory(ctx context.Context, query model.DeadLetterInventoryQuery) (model.DeadLetterInventoryPage, error) {
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return model.DeadLetterInventoryPage{}, args.Error(1)
+	}
+	return args.Get(0).(model.DeadLetterInventoryPage), args.Error(1)
+}
+
+func (m *MockDataSource) OldestDeadLetterAgeByTopic(ctx context.Context, topicPrefix string) ([]model.DeadLetterTopicAge, error) {
+	args := m.Called(ctx, topicPrefix)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.DeadLetterTopicAge), args.Error(1)
+}
+
+func (m *MockDataSource) CountDeadLetterInventory(ctx context.Context, query model.DeadLetterQuery) (int64, error) {
+	args := m.Called(ctx, query)
+	return args.Get(0).(int64), args.Error(1)
+}
+
+func (m *MockDataSource) CountEventOutboxByStatus(ctx context.Context, since time.Time) (map[string]int64, error) {
+	args := m.Called(ctx, since)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(map[string]int64), args.Error(1)
 }
 
-// AuditTerminalEventRecords returns the outbox side of the zero-loss reconciliation. A test
-// that stubs only the error must still supply an audit, because the caller reads
-// UnconfirmedRows to decide whether the verdict can be conclusive at all — the zero audit the
-// nil check produces reports nothing published, which is the correct reading of a failed
-// measurement.
-func (m *MockDataSource) AuditTerminalEventRecords(ctx context.Context) (model.EventOutboxAudit, error) {
-	args := m.Called(ctx)
+// AuditEventRecordsInIntervals returns the outbox side of the zero-loss reconciliation,
+// classified against the measured broker windows. The intervals are part of the expectation
+// so a test can assert that the windows actually reached the audit — an audit run against no
+// windows classifies every row as unmeasured, which is a different verdict entirely.
+//
+// A test that stubs only the error may leave the audit nil: the zero audit the nil check
+// produces reports nothing published, which is the correct reading of a failed measurement.
+func (m *MockDataSource) AuditEventRecordsInIntervals(ctx context.Context, intervals []model.PartitionOffsetInterval) (model.EventRecordIntervalAudit, error) {
+	args := m.Called(ctx, intervals)
 	if args.Get(0) == nil {
-		return model.EventOutboxAudit{}, args.Error(1)
+		return model.EventRecordIntervalAudit{}, args.Error(1)
 	}
-	return args.Get(0).(model.EventOutboxAudit), args.Error(1)
+	return args.Get(0).(model.EventRecordIntervalAudit), args.Error(1)
 }
 
-// Event subscriber methods
-//
-// None of these carries a plaintext secret, mirroring the real repository: the
-// credential method takes an already-derived, non-reversible reference and an
-// issuance instant, and no getter hands one back.
+// AuditEventRecordCoordinates returns the per-partition broker coordinates the outbox
+// claims, which the reconciliation checks against the broker's live bounds.
+func (m *MockDataSource) AuditEventRecordCoordinates(ctx context.Context) (model.EventRecordCoordinateAudit, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return model.EventRecordCoordinateAudit{}, args.Error(1)
+	}
+	return args.Get(0).(model.EventRecordCoordinateAudit), args.Error(1)
+}
+
+// SumPurgedTerminalEvents returns what retention has removed, which is the reconciliation's
+// matched baseline.
+func (m *MockDataSource) SumPurgedTerminalEvents(ctx context.Context) (model.EventOutboxPurgeTotals, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return model.EventOutboxPurgeTotals{}, args.Error(1)
+	}
+	return args.Get(0).(model.EventOutboxPurgeTotals), args.Error(1)
+}
+
+// ListUndrainedEventTopics returns the per-topic backlog behind the stranded-prefix audit. A
+// nil first argument yields an empty slice rather than a nil one, so a caller ranging over the
+// result reads "no topic owes anything" — the correct reading of a failed measurement, and the
+// one that keeps the audit from reporting a stranded generation it never saw.
+func (m *MockDataSource) ListUndrainedEventTopics(ctx context.Context) ([]model.EventTopicBacklog, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return []model.EventTopicBacklog{}, args.Error(1)
+	}
+	return args.Get(0).([]model.EventTopicBacklog), args.Error(1)
+}
 
 func (m *MockDataSource) CreateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber) (*model.EventSubscriber, error) {
 	args := m.Called(ctx, subscriber)
@@ -1138,16 +1193,21 @@ func (m *MockDataSource) GetEventSubscriberByID(ctx context.Context, subscriberI
 	return args.Get(0).(*model.EventSubscriber), args.Error(1)
 }
 
-func (m *MockDataSource) ListEventSubscribers(ctx context.Context, limit, offset int) ([]model.EventSubscriber, error) {
-	args := m.Called(ctx, limit, offset)
+func (m *MockDataSource) ListEventSubscribers(ctx context.Context, query model.SubscriberPageQuery) (model.SubscriberPage, error) {
+	args := m.Called(ctx, query)
 	if args.Get(0) == nil {
-		return nil, args.Error(1)
+		return model.SubscriberPage{}, args.Error(1)
 	}
-	return args.Get(0).([]model.EventSubscriber), args.Error(1)
+	return args.Get(0).(model.SubscriberPage), args.Error(1)
 }
 
-func (m *MockDataSource) UpdateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber) error {
-	args := m.Called(ctx, subscriber)
+func (m *MockDataSource) CountEventSubscribers(ctx context.Context) (int64, error) {
+	args := m.Called(ctx)
+	return args.Get(0).(int64), args.Error(1)
+}
+
+func (m *MockDataSource) UpdateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber, fenceToken string) error {
+	args := m.Called(ctx, subscriber, fenceToken)
 	return args.Error(0)
 }
 
@@ -1161,26 +1221,96 @@ func (m *MockDataSource) RecordSubscriberCredential(ctx context.Context, subscri
 	return args.Error(0)
 }
 
-func (m *MockDataSource) RecordSubscriberCredentialIfUnchanged(ctx context.Context, subscriberID string, expected *string, credentialReference string, issuedAt time.Time) error {
-	args := m.Called(ctx, subscriberID, expected, credentialReference, issuedAt)
+func (m *MockDataSource) RecordSubscriberCredentialIfUnchanged(ctx context.Context, subscriberID string, expected *string, credentialReference string, issuedAt time.Time, claimToken string) error {
+	args := m.Called(ctx, subscriberID, expected, credentialReference, issuedAt, claimToken)
 	return args.Error(0)
 }
 
-func (m *MockDataSource) TakeEventSubscriber(ctx context.Context, subscriberID string) (*model.EventSubscriber, error) {
-	args := m.Called(ctx, subscriberID)
+func (m *MockDataSource) TakeEventSubscriber(ctx context.Context, subscriberID string, claimToken string) (*model.EventSubscriber, error) {
+	args := m.Called(ctx, subscriberID, claimToken)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(*model.EventSubscriber), args.Error(1)
 }
 
-func (m *MockDataSource) ClearSubscriberCredential(ctx context.Context, subscriberID string) error {
+func (m *MockDataSource) ClearSubscriberCredential(ctx context.Context, subscriberID, fenceToken string) error {
+	args := m.Called(ctx, subscriberID, fenceToken)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) RecordSubscriberWebhookURL(ctx context.Context, subscriberID, webhookURL string) error {
+	args := m.Called(ctx, subscriberID, webhookURL)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) ClearSubscriberWebhookURL(ctx context.Context, subscriberID string) error {
 	args := m.Called(ctx, subscriberID)
 	return args.Error(0)
 }
 
 func (m *MockDataSource) MarkSubscriberMigrated(ctx context.Context, subscriberID string, migratedAt time.Time) error {
 	args := m.Called(ctx, subscriberID, migratedAt)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) CompleteSubscriberWebhookMigration(ctx context.Context, subscriberID string, migratedAt time.Time) (*model.EventSubscriber, error) {
+	args := m.Called(ctx, subscriberID, migratedAt)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.EventSubscriber), args.Error(1)
+}
+
+func (m *MockDataSource) RecordSubscriberGrantReconcilePending(ctx context.Context, subscriberID string, pendingAt time.Time, fenceToken string) error {
+	args := m.Called(ctx, subscriberID, pendingAt, fenceToken)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) ClearSubscriberGrantReconcilePending(ctx context.Context, subscriberID, fenceToken string) error {
+	args := m.Called(ctx, subscriberID, fenceToken)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) RecordSubscriberCredentialCleanupPending(ctx context.Context, subscriberID string, pendingAt time.Time, fenceToken string) error {
+	args := m.Called(ctx, subscriberID, pendingAt, fenceToken)
+	return args.Error(0)
+}
+
+// CountSubscriberSettlementObligations returns the settlement backlog. A test that stubs only
+// the error must still supply a backlog value, and the nil check below turns that into the zero
+// backlog — which callers must NOT publish as a gauge, because a zero would read as "everything
+// is settled" when the truth is that nothing could be read.
+func (m *MockDataSource) CountSubscriberSettlementObligations(ctx context.Context) (model.SubscriberSettlementBacklog, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return model.SubscriberSettlementBacklog{}, args.Error(1)
+	}
+	return args.Get(0).(model.SubscriberSettlementBacklog), args.Error(1)
+}
+
+func (m *MockDataSource) GetSubscriberSettlementObligation(ctx context.Context, subscriberID string) (model.SubscriberSettlementObligation, error) {
+	args := m.Called(ctx, subscriberID)
+	if args.Get(0) == nil {
+		return model.SubscriberSettlementObligation{}, args.Error(1)
+	}
+	return args.Get(0).(model.SubscriberSettlementObligation), args.Error(1)
+}
+
+// ListSubscriberSettlementObligations returns the settlement backlog. A test that stubs only
+// the error must still supply a slice, and the nil check below turns that into an EMPTY
+// backlog — which a settlement pass must not read as "nothing is owed", because the truth is
+// that nothing could be read.
+func (m *MockDataSource) ListSubscriberSettlementObligations(ctx context.Context, limit int, notBefore time.Time) ([]model.SubscriberSettlementObligation, error) {
+	args := m.Called(ctx, limit, notBefore)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.SubscriberSettlementObligation), args.Error(1)
+}
+
+func (m *MockDataSource) MarkSubscriberSettlementAttempt(ctx context.Context, subscriberID string, attemptedAt time.Time, failure string) error {
+	args := m.Called(ctx, subscriberID, attemptedAt, failure)
 	return args.Error(0)
 }
 
@@ -1201,8 +1331,30 @@ func (m *MockDataSource) CountSubscriberRevocationsPending(ctx context.Context) 
 	return args.Get(0).(model.SubscriberRevocationBacklog), args.Error(1)
 }
 
-func (m *MockDataSource) MarkSubscriberRevocationPending(ctx context.Context, subscriberID string, pendingAt time.Time) (*model.EventSubscriber, error) {
-	args := m.Called(ctx, subscriberID, pendingAt)
+// CountSubscriberAccessResidue returns the unaccounted-access aggregate. A test that stubs only
+// the error must still supply a residue value, and the nil check below turns that into the zero
+// residue — which callers must NOT publish as a gauge, because a zero would read as "nothing
+// outstanding" when the truth is that nothing could be read.
+func (m *MockDataSource) CountSubscriberAccessResidue(ctx context.Context) (model.SubscriberAccessResidue, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return model.SubscriberAccessResidue{}, args.Error(1)
+	}
+	return args.Get(0).(model.SubscriberAccessResidue), args.Error(1)
+}
+
+func (m *MockDataSource) MarkSubscriberCredentialOrphaned(ctx context.Context, subscriberID string, orphanedAt time.Time) error {
+	args := m.Called(ctx, subscriberID, orphanedAt)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) MarkSubscriberRevocationFailed(ctx context.Context, subscriberID string, failedAt time.Time) error {
+	args := m.Called(ctx, subscriberID, failedAt)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) MarkSubscriberRevocationPending(ctx context.Context, subscriberID string, pendingAt time.Time, claimToken string) (*model.EventSubscriber, error) {
+	args := m.Called(ctx, subscriberID, pendingAt, claimToken)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
@@ -1214,7 +1366,100 @@ func (m *MockDataSource) ClaimSubscriberForProvisioning(ctx context.Context, sub
 	return args.String(0), args.Error(1)
 }
 
+func (m *MockDataSource) RenewSubscriberProvisioningFence(ctx context.Context, subscriberID string, token string, lease time.Duration) error {
+	args := m.Called(ctx, subscriberID, token, lease)
+	return args.Error(0)
+}
+
 func (m *MockDataSource) ReleaseSubscriberProvisioningFence(ctx context.Context, subscriberID string, token string) error {
 	args := m.Called(ctx, subscriberID, token)
 	return args.Error(0)
+}
+
+// ClaimPendingBalanceMonitorHandoffs mocks the FIFO lease over
+// blnk.balance_monitor_handoff. A nil first return yields an empty slice rather than a
+// nil one, so a test that stubs only the error still drives the caller's "nothing to do"
+// branch instead of tripping a nil dereference in it.
+func (m *MockDataSource) ClaimPendingBalanceMonitorHandoffs(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.BalanceMonitorHandoff, error) {
+	args := m.Called(ctx, batchSize, lockDuration)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]model.BalanceMonitorHandoff), args.Error(1)
+}
+
+// CompleteBalanceMonitorHandoffWithEvents mocks the ONE transaction that writes the
+// alerts and the completion together.
+func (m *MockDataSource) CompleteBalanceMonitorHandoffWithEvents(ctx context.Context, handoffID string, events []*model.EventOutbox) error {
+	args := m.Called(ctx, handoffID, events)
+	return args.Error(0)
+}
+
+// MarkBalanceMonitorHandoffFailed mocks recording an evaluation failure.
+func (m *MockDataSource) MarkBalanceMonitorHandoffFailed(ctx context.Context, handoffID, reason string, permanent bool) error {
+	args := m.Called(ctx, handoffID, reason, permanent)
+	return args.Error(0)
+}
+
+// CountBalanceMonitorHandoffByStatus mocks the handoff status census.
+func (m *MockDataSource) CountBalanceMonitorHandoffByStatus(ctx context.Context) (map[string]int64, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(map[string]int64), args.Error(1)
+}
+
+// InsertBulkTransactionBatch mocks recording that a bulk batch began.
+func (m *MockDataSource) InsertBulkTransactionBatch(ctx context.Context, batch *model.BulkTransactionBatch) error {
+	args := m.Called(ctx, batch)
+	return args.Error(0)
+}
+
+// FinalizeBulkTransactionBatchWithEvent mocks the atomic outcome-and-event write. The
+// boolean is the "this call performed the transition" answer, which is what tells a
+// retrying caller to stop rather than record a second event for one outcome.
+func (m *MockDataSource) FinalizeBulkTransactionBatchWithEvent(ctx context.Context, batchID string, outcome *model.BulkTransactionBatch, event *model.EventOutbox) (bool, error) {
+	args := m.Called(ctx, batchID, outcome, event)
+	return args.Bool(0), args.Error(1)
+}
+
+// CountUnfinalizedBulkTransactionBatches mocks the stuck-batch census. The timestamp is
+// returned as nil when the stub supplies nil, which is the "there are none" answer the
+// caller distinguishes from a zero time.
+func (m *MockDataSource) CountUnfinalizedBulkTransactionBatches(ctx context.Context, olderThan time.Duration) (int64, *time.Time, error) {
+	args := m.Called(ctx, olderThan)
+	var oldest *time.Time
+	if args.Get(1) != nil {
+		oldest = args.Get(1).(*time.Time)
+	}
+	return int64(args.Int(0)), oldest, args.Error(2)
+}
+
+// ExistingEventIDs mocks the batched durability lookup the post-commit path uses to decide
+// whether a transaction's event still has to be captured.
+//
+// Reached only when event publishing is CONFIGURED — durableTransactionEvents short-circuits
+// on an unconfigured publisher — so the many tests that build a broker-less configuration never
+// call it and need no expectation for it.
+func (m *MockDataSource) ExistingEventIDs(ctx context.Context, eventIDs []string) (map[string]struct{}, error) {
+	args := m.Called(ctx, eventIDs)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(map[string]struct{}), args.Error(1)
+}
+
+// AuditTerminalEventRecords returns the outbox side of the zero-loss reconciliation. A test
+// that stubs only the error must still supply an audit, because the caller reads
+// UnconfirmedRows to decide whether the verdict can be conclusive at all — the zero audit the
+// nil check produces reports nothing published, which is the correct reading of a failed
+// measurement.
+func (m *MockDataSource) AuditTerminalEventRecords(ctx context.Context) (model.EventOutboxAudit, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return model.EventOutboxAudit{}, args.Error(1)
+	}
+	return args.Get(0).(model.EventOutboxAudit), args.Error(1)
 }

@@ -62,12 +62,16 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/sync/semaphore"
+
+	"github.com/sirupsen/logrus"
+	otelmetric "go.opentelemetry.io/otel/metric"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/database"
+	"github.com/blnkfinance/blnk/internal/metrics"
 	"github.com/blnkfinance/blnk/model"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -230,18 +234,32 @@ func newRelayRetryPolicy(cfg config.RelayConfig) relayRetryPolicy {
 	return policy
 }
 
-// backoffFor returns the delay to wait before the attempt AFTER the given one.
+// backoffFor returns the delay recorded against the attempt AFTER the given one.
 //
-// attempt is 1-based and names the attempt that just failed. With the configured defaults —
-// base 1s, multiplier 2, cap 30s, five attempts — FIVE PUBLISHES ARE SEPARATED BY FOUR WAITS:
-// 1s after attempt 1, then 2s, 4s and 8s, which is 15 seconds of backoff in total.
-// backoffFor(5) evaluates to 16s but nothing consumes it: a fifth failure exhausts the budget
-// and dead-letters the row instead of scheduling a sixth attempt.
+// attempt is 1-based and names the attempt that just failed. With the mandated parameters —
+// base 1s, multiplier 2, cap 30s, five attempts — the schedule is exactly
 //
-// THE 30-SECOND CAP IS THEREFORE OUT OF REACH at the mandated parameters, which is correct
-// rather than a bug: the cap bounds a schedule whose configured base or attempt count would
-// otherwise exceed it. Neither the multiplier nor the cap may be "corrected" to make it
-// engage.
+//	1s, 2s, 4s, 8s, 16s
+//
+// and THE LIVE PATH PRODUCES EVERY ONE OF THOSE FIVE VALUES. recordFailedAttempt calls this
+// for each failed attempt from the first through the fifth and hands the result to
+// MarkEventFailed, which stamps it onto the row's next_attempt_at in the same statement that
+// decides whether the budget is spent. So the fifth delay, 16s, is computed and durably
+// recorded exactly like the other four; it is observable on the row and in the
+// scheduling log line, and event_relay_test.go asserts the whole sequence against a live
+// processor rather than against this function in isolation.
+//
+// The one thing the fifth delay does NOT do is separate two publishes. Five attempts have
+// four gaps between them, so 1s, 2s, 4s and 8s — 15 seconds in total — are the delays a
+// retried event actually waits, and the fifth failure spends the budget and dead-letters the
+// row rather than scheduling a sixth publish. Both facts matter and neither replaces the
+// other: the SCHEDULE is five values, the WAITS a five-attempt event experiences are the
+// first four of them, and a deployment that raises RELAY_MAX_RETRY_ATTEMPTS is what turns the
+// fifth into a wait as well.
+//
+// THE 30-SECOND CAP IS OUT OF REACH at the mandated parameters, which is correct rather than a
+// bug: the cap bounds a schedule whose configured base or attempt count would otherwise
+// exceed it. Neither the multiplier nor the cap may be "corrected" to make it engage.
 //
 // Growth is repeated doubling with an early return at the cap rather than exponentiation, so
 // there is no overflow to reason about however large an attempt number arrives from a row whose
@@ -300,7 +318,13 @@ type eventRelayStore interface {
 	// what makes the durable state agree with what the publisher already reported and
 	// metered. A permanent failure exhausts the row on whichever attempt it happened rather
 	// than spending the remaining budget rediscovering it.
-	MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, terminal bool) (model.EventFailureOutcome, error)
+	//
+	// deadLetterLease is how long the EXHAUSTION ARM holds the row for the dead-letter
+	// hand-off. The relay passes its own lockDuration, so the hand-off is owned for exactly
+	// the window every other claim uses. It is not a detail: the repair claim selects on the
+	// lease alone, so a released lease lets it stamp a fresh token over a hand-off that is
+	// still in flight and two workers write the same event to the same .dlt topic.
+	MarkEventFailed(ctx context.Context, id int64, claimToken, errMsg string, retryAfter time.Duration, terminal bool, deadLetterLease time.Duration) (model.EventFailureOutcome, error)
 
 	// ClaimPendingWebhookDeliveries claims rows whose KAFKA leg has finished — successfully
 	// or terminally — and whose LEGACY WEBHOOK leg is still owed, so a leg that failed
@@ -315,10 +339,10 @@ type eventRelayStore interface {
 
 	// MarkEventPermanentlyFailed records an attempt whose failure was PERMANENT, taking the
 	// row to failed on this attempt whatever budget remained and retaining the claim token
-	// for the dead-letter hand-off. It is what lets the relay act on the publisher's
-	// verdict instead of spending four more attempts on a condition none of them can
-	// change.
-	MarkEventPermanentlyFailed(ctx context.Context, id int64, claimToken, errMsg string) (model.EventFailureOutcome, error)
+	// AND THE LEASE for the dead-letter hand-off. It is what lets the relay act on the
+	// publisher's verdict instead of spending four more attempts on a condition none of them
+	// can change.
+	MarkEventPermanentlyFailed(ctx context.Context, id int64, claimToken, errMsg string, deadLetterLease time.Duration) (model.EventFailureOutcome, error)
 
 	// MarkWebhookDispatched records the legacy leg of the dual-delivery window. It is
 	// conditional on the claim token, so it must run BEFORE MarkEventDispatched clears it.
@@ -452,6 +476,26 @@ type EventRelayProcessor struct {
 	// now is the clock, replaceable in-package so the sunset boundary is exact in tests.
 	// It follows EventDeadLetterService's now field.
 	now func() time.Time
+
+	// catalogue gates CLAIMING on the destination topics actually existing. Nil means
+	// ungated, which is what every existing test and every construction without
+	// WithCatalogueGate gets — those relays publish to a broker a test controls, and gating
+	// them on a real metadata read would be a dependency they do not have.
+	//
+	// In production cmd/server.go always supplies one. See WithCatalogueGate for why a gate
+	// on the CLAIM is the right shape rather than a gate on Start.
+	catalogue eventRelayCatalogueGate
+}
+
+// eventRelayCatalogueGate answers whether the relay may claim work yet.
+//
+// One method, so a test can gate a relay with a closure and so the relay's dependency on the
+// Kafka admin surface stays exactly this wide.
+type eventRelayCatalogueGate interface {
+	// Ready returns nil when every topic the relay may need is known to exist. A non-nil
+	// error means the relay must not claim, and the gate has already reported why — the
+	// relay stays silent so a 1-second poll cannot turn one condition into a log flood.
+	Ready(ctx context.Context) error
 }
 
 // NewEventRelayProcessor creates the event outbox relay for a Blnk instance.
@@ -518,6 +562,47 @@ func NewEventRelayProcessor(blnk *Blnk) *EventRelayProcessor {
 	}
 
 	return processor
+}
+
+// WithCatalogueGate makes the relay refuse to CLAIM until every topic it may need is known to
+// exist. Call it before Start.
+//
+// # Why claiming is what is gated, rather than starting
+//
+// The topics are assured once at boot, and that pass was allowed to fail and be stepped past —
+// deliberately, because the usual cause is a broker that is not listening yet (a compose stack
+// coming up, a rolling restart), and refusing to start the relay would turn a transient
+// condition into an outage that needs a human to end.
+//
+// But starting anyway had its own cost, and it is not small. Claiming a row LEASES it, and the
+// relay then publishes to a topic that does not exist. Auto-creation is disabled, so the
+// publish fails; it retries on the schedule and burns the row's whole attempt budget; and when
+// the budget is spent the dead-letter write fails FOR THE SAME REASON, because the dead-letter
+// sibling is missing too. The row ends failed with no dead-letter topic recorded — the state
+// the repair pass exists to mop up — and a boot against an unprovisioned broker could spend
+// every pending row's budget before anybody noticed the topics were absent.
+//
+// Gating the CLAIM instead keeps both properties. The relay starts, so recovery is automatic
+// the moment the broker answers; and until then it leases nothing, so no row spends an attempt
+// on a destination that cannot accept it. The rows stay exactly where they are, which is the
+// one thing the outbox is for.
+//
+// A nil gate is ignored rather than treated as closed: an ungated relay is the pre-existing
+// behaviour and is what tests against a controlled broker need.
+//
+// Parameters:
+//   - gate eventRelayCatalogueGate: the readiness gate. Nil leaves the relay ungated.
+//
+// Returns:
+//   - *EventRelayProcessor: the same processor, for chaining.
+func (p *EventRelayProcessor) WithCatalogueGate(gate eventRelayCatalogueGate) *EventRelayProcessor {
+	if p == nil {
+		return p
+	}
+
+	p.catalogue = gate
+
+	return p
 }
 
 // WithBatchSize sets how many outbox rows one claim takes. Call it before Start.
@@ -701,7 +786,7 @@ func (p *EventRelayProcessor) startupObstacle() error {
 //     lease and become claimable again when it expires.
 func (p *EventRelayProcessor) Start(ctx context.Context) {
 	if err := p.startupObstacle(); err != nil {
-		logrus.WithError(err).Error("Event outbox relay not started")
+		withLoggableCause(nil, err).Error("Event outbox relay not started")
 
 		return
 	}
@@ -851,6 +936,23 @@ func (p *EventRelayProcessor) run(ctx context.Context) {
 //   - ctx context.Context: cancelling it abandons the remaining batches; claimed rows keep
 //     their lease and become claimable again when it expires.
 func (p *EventRelayProcessor) processTick(ctx context.Context) {
+	// THE CATALOGUE GATE COMES FIRST, before the repair passes and before any claim.
+	//
+	// Every piece of work in this tick ends in a write to a Blnk-owned topic: the publish
+	// loop to the category topics, and BOTH repair passes to the dead-letter siblings. If
+	// those topics do not exist, none of it can succeed — and each attempt is not free, it
+	// spends a row's retry budget and leaves the row worse off than untouched. So the tick
+	// does nothing at all rather than doing something harmful.
+	//
+	// Silent on refusal, deliberately: the gate owns the reporting and rate-limits its own
+	// broker probes, whereas this runs every poll interval — a log line here would be one per
+	// second for as long as a broker was unprovisioned.
+	if p.catalogue != nil {
+		if err := p.catalogue.Ready(ctx); err != nil {
+			return
+		}
+	}
+
 	// The REPAIR pass first, and deliberately so. It queries a set that is empty in normal
 	// operation, so it costs one indexed query; and when the set is NOT empty those rows are
 	// the only copies of events that reached no topic at all, which makes them the most
@@ -983,7 +1085,7 @@ func (p *EventRelayProcessor) leaseDeadline(claimedAt time.Time) time.Time {
 func (p *EventRelayProcessor) processBatch(ctx context.Context) int {
 	rows, err := p.store.ClaimPendingEventOutbox(ctx, p.batchSize, p.lockDuration)
 	if err != nil {
-		logrus.WithError(err).Error("failed to claim event outbox entries")
+		withLoggableCause(nil, err).Error("failed to claim event outbox entries")
 
 		return 0
 	}
@@ -1071,7 +1173,7 @@ func (p *EventRelayProcessor) processBatch(ctx context.Context) int {
 		// Acquire before spawning, so the number of in-flight publishes is bounded by the
 		// permit count rather than by the number of groups.
 		if acquireErr := permits.Acquire(publishing, 1); acquireErr != nil {
-			logrus.WithError(acquireErr).WithField("event_id", group[0].EventID).
+			withLoggableCause(logrus.WithField("event_id", group[0].EventID), acquireErr).
 				Debug("event relay: stopped dispatching this batch; the remaining rows keep their lease")
 
 			break
@@ -1221,12 +1323,12 @@ func (p *EventRelayProcessor) renewLeaseWhileInFlight(
 				cancel()
 
 				if err != nil {
-					logrus.WithError(err).WithFields(logrus.Fields{
+					withLoggableCause(logrus.WithFields(logrus.Fields{
 						"claim_token": claimToken,
 						"claimed":     claimed,
 						"lease":       p.lockDuration.String(),
 						"held_until":  heldUntil.UTC().Format(time.RFC3339Nano),
-					}).Warn(
+					}), err).Warn(
 						"event relay: renewing the lease on a batch in flight failed; the rows may be " +
 							"reclaimed and republished by another instance, which is suppressed at the " +
 							"subscriber on event_id",
@@ -1292,6 +1394,19 @@ func (p *EventRelayProcessor) renewLeaseWhileInFlight(
 // back to the dead-letter writer, which composes the same message and records the same
 // terminal state it would have on the first attempt.
 //
+// # It WAITS for the hand-off lease, and that wait is the correctness property (PERF-P27)
+//
+// A row arrives here in one of two states that look identical in the table and are not: its
+// hand-off has been ABANDONED, or its hand-off is IN FLIGHT in another replica right now.
+// Nothing in the row distinguishes them — the claim token this pass replaces is the same token
+// the live worker is holding — so the only thing that can tell them apart is the LEASE. The
+// terminal transitions therefore retain one for a bounded hand-off window
+// (deadLetterHandOffLease), and this claim's predicate skips a leased row. Without that, this
+// pass raced the very worker it exists to replace: both published the same event to the same
+// dead-letter topic, and the loser's MarkEventDeadLettered then failed on a superseded token,
+// which reads in the log as a lost claim rather than as the duplicate it was. Waiting one lease
+// costs a bounded delay on a genuinely abandoned hand-off and removes the duplicate entirely.
+//
 // # The cause it reports
 //
 // The row's own last_error, which the exhaustion arm recorded, wrapped so the metadata says
@@ -1319,7 +1434,7 @@ func (p *EventRelayProcessor) recoverUnpreservedDeadLetters(ctx context.Context)
 		ctx, defaultEventRelayDeadLetterRecoveryBatch, p.lockDuration,
 	)
 	if err != nil {
-		logrus.WithError(err).Error(
+		withLoggableCause(nil, err).Error(
 			"event relay: could not claim events awaiting dead-letter preservation; they stay in the " +
 				"dead-letter inventory and are retried on a later poll",
 		)
@@ -1347,7 +1462,7 @@ func (p *EventRelayProcessor) recoverUnpreservedDeadLetters(ctx context.Context)
 
 		outcome, dltErr := p.deadLetters.DeadLetter(ctx, row, unpreservedDeadLetterCause(row))
 		if dltErr != nil {
-			logrus.WithFields(p.rowFields(row, row.Attempts)).WithError(dltErr).Warn(
+			withLoggableCause(logrus.WithFields(p.rowFields(row, row.Attempts)), dltErr).Warn(
 				"event relay: retrying the dead-letter preservation of this event failed again; it " +
 					"stays in the dead-letter inventory and is retried once its lease expires",
 			)
@@ -1426,7 +1541,7 @@ func (p *EventRelayProcessor) recoverOwedLegacyWebhooks(ctx context.Context) int
 		ctx, defaultEventRelayDeadLetterRecoveryBatch, p.lockDuration,
 	)
 	if err != nil {
-		logrus.WithError(err).Error(
+		withLoggableCause(nil, err).Error(
 			"event relay: could not claim events whose legacy webhook leg is still owed; the legs " +
 				"stay recorded on their rows and are retried on a later poll",
 		)
@@ -1498,7 +1613,7 @@ func (p *EventRelayProcessor) recoverOneOwedLegacyWebhook(ctx context.Context, r
 		if markErr != nil {
 			// The row keeps its lease and returns to this pass's candidate set when it
 			// expires. Nothing is lost, and nothing about the Kafka leg is affected.
-			logrus.WithFields(fields).WithError(markErr).Error(
+			withLoggableCause(logrus.WithFields(fields), markErr).Error(
 				"event relay: a failed legacy webhook recovery could not be recorded; the row keeps " +
 					"its lease and the leg is retried when it expires",
 			)
@@ -1507,7 +1622,7 @@ func (p *EventRelayProcessor) recoverOneOwedLegacyWebhook(ctx context.Context, r
 		}
 
 		fields["webhook_attempts"] = outcome.WebhookAttempts
-		fields["reason"] = relayFailureReason(err)
+		fields["reason"] = relayLogReason(err)
 
 		if outcome.Abandoned {
 			logrus.WithFields(fields).Error(
@@ -1532,7 +1647,7 @@ func (p *EventRelayProcessor) recoverOneOwedLegacyWebhook(ctx context.Context, r
 		// The task IS enqueued and will be delivered; only the marker is missing. A later
 		// pass re-enqueues under the same task identity, which the queue refuses as a
 		// duplicate, so this is an observability gap rather than a delivery defect.
-		logrus.WithFields(fields).WithError(err).Warn(
+		withLoggableCause(logrus.WithFields(fields), err).Warn(
 			"event relay: a recovered legacy webhook was enqueued but the row could not be marked; " +
 				"a re-enqueue is suppressed by the task identity",
 		)
@@ -1655,11 +1770,40 @@ func (p *EventRelayProcessor) processRow(
 	row model.EventOutbox,
 	claimedAt time.Time,
 ) {
+	// THE RELAY'S OWN SPAN over everything one claimed row costs: the legacy leg, the Kafka
+	// publish, the retry decision, the dead-letter hand-off and the durable transition. The
+	// publisher's producer span nests inside it, so a trace shows the publish in the context of
+	// the row handling around it rather than on its own.
+	//
+	// It is LINKED to the trace that captured the event, not parented by it, for the reasons
+	// linkToCapturedTrace sets out — chiefly that this work happens a poll interval and up to
+	// five backoff waits after the request ended, so parenting would report a millisecond
+	// request as a half-minute one.
+	//
+	// Named for the operation rather than the destination, unlike the producer span: this row
+	// may reach two transports and may reach neither, so naming it after the topic would
+	// describe only part of what the span covers.
+	ctx, span := tracer.Start(ctx, "relay.process_event_outbox_row", linkToCapturedTrace(row)...)
+	defer span.End()
+
 	// The attempt this publish represents. attempts counts the failures RECORDED so far —
 	// the claim does not increment it, MarkEventFailed does — so the attempt now under way
 	// is one past it. Getting this wrong would misreport the backoff schedule and the
 	// attempt metric label together.
 	attempt := row.Attempts + 1
+
+	// Bounded and hashed on the same terms as the producer span's: the topic through the
+	// bounded label, the event type through its own, the event id in full because it is
+	// Blnk-generated and is what an operator searches by. The attempt number makes a retry
+	// distinguishable from a first delivery without opening the row.
+	span.SetAttributes(
+		attribute.String("messaging.system", "kafka"),
+		attribute.String("messaging.destination.name", boundedTopicLabel(row.Topic)),
+		attribute.String("messaging.message.id", row.EventID),
+		attribute.String("blnk.event.type", boundedEventTypeLabel(row.EventType)),
+		attribute.Int("blnk.publish.attempt", attempt),
+		attribute.Int("blnk.publish.max_attempts", p.rowMaxAttempts(row)),
+	)
 
 	// The legacy leg first, and its outcome kept: whether the webhook is still owed
 	// decides which terminal transition this row takes below. The sunset boundary is
@@ -1676,7 +1820,12 @@ func (p *EventRelayProcessor) processRow(
 		// coordinate of the record its earlier successful publish produced. Both marking
 		// transitions COALESCE the coordinate for exactly this case, so passing the zero
 		// value leaves the stored one intact rather than erasing it.
-		p.settleAfterKafkaSuccess(ctx, row, attempt, legacyLeg, legacyErr, model.BrokerRecord{})
+		//
+		// published is FALSE for the same reason, and it is what keeps EventsPublishedTotal
+		// at one increment per event: this row's Kafka delivery was counted on the pass that
+		// recorded it, and counting it again on the pass that finally settles the webhook
+		// would report one event twice. See recordDurableEventDelivery.
+		p.settleAfterKafkaSuccess(ctx, row, attempt, legacyLeg, legacyErr, model.BrokerRecord{}, false)
 
 		return
 	}
@@ -1741,7 +1890,7 @@ func (p *EventRelayProcessor) processRow(
 		return
 	}
 
-	p.settleAfterKafkaSuccess(ctx, row, attempt, legacyLeg, legacyErr, result.Record)
+	p.settleAfterKafkaSuccess(ctx, row, attempt, legacyLeg, legacyErr, result.Record, true)
 }
 
 // settleAfterKafkaSuccess drives a row whose KAFKA leg is complete to the right state,
@@ -1774,6 +1923,10 @@ func (p *EventRelayProcessor) processRow(
 //   - record model.BrokerRecord: where the broker put the message, persisted so the row names
 //     the record it produced (OBS-02). The zero value on a webhook-only pass, where nothing
 //     was published and the row already carries its coordinate.
+//   - published bool: whether THIS pass published to Kafka. True from the publishing path,
+//     false on a webhook-only pass. It decides one thing only — whether the durable transition
+//     below counts a delivered event — and it is what keeps EventsPublishedTotal at exactly
+//     one increment per event across a row that finishes its two legs on different claims.
 func (p *EventRelayProcessor) settleAfterKafkaSuccess(
 	ctx context.Context,
 	row model.EventOutbox,
@@ -1781,22 +1934,65 @@ func (p *EventRelayProcessor) settleAfterKafkaSuccess(
 	legacyLeg legacyLegOutcome,
 	legacyErr error,
 	record model.BrokerRecord,
+	published bool,
 ) {
 	bookkeeping, cancel := detachedBookkeepingContext(ctx)
 	defer cancel()
 
 	if legacyLeg == legacyLegOwed {
-		p.deferLegacyLeg(bookkeeping, row, attempt, legacyErr, record)
+		p.deferLegacyLeg(bookkeeping, row, attempt, legacyErr, record, published)
 
 		return
 	}
 
 	if markErr := p.store.MarkEventDispatched(bookkeeping, row.ID, row.ClaimToken, record); markErr != nil {
-		logrus.WithFields(p.rowFields(row, attempt)).WithError(markErr).Error(
+		withLoggableCause(logrus.WithFields(p.rowFields(row, attempt)), markErr).Error(
 			"event relay: the event was published but its outbox row could not be marked dispatched; " +
 				"it will be republished when its lease expires and must be suppressed on event_id",
 		)
+
+		// NOT COUNTED. The broker has the event but nothing durable says so, and this row is
+		// going to be published again when its lease expires — counting here and again after
+		// that republish would report one event twice. See recordDurableEventDelivery.
+		return
 	}
+
+	// THE DURABLE TRANSITION HAS COMMITTED, which is the moment the delivery is recorded and
+	// therefore the only moment it may be counted. Conditional on this pass having actually
+	// published, so a webhook-only pass settling an earlier delivery does not count it twice.
+	if published {
+		recordDurableEventDelivery(bookkeeping, row.Topic, row.EventType)
+	}
+
+	// THE ONE PER-EVENT DELIVERY COUNT (PERF-P21), recorded here and only here for this arm.
+	//
+	// After the transition, never before it: the transition is conditional on the claim token
+	// and clears it, so it succeeds for one worker once in an event's whole life. A republish
+	// after a crash writes to the broker again — and increments EventsPublishedTotal again —
+	// but cannot reach this line, because the row it would have to move is already dispatched.
+	// Incrementing before the transition, or on the broker acknowledgement, is exactly what
+	// made the published counter a count of writes rather than of events.
+	recordEventDispatched(bookkeeping, row)
+}
+
+// recordEventDispatched increments the per-event delivery count for a row that has just
+// reached the dispatched state.
+//
+// It exists as one function called from the two arms that reach that state — the ordinary
+// MarkEventDispatched and MarkEventWebhookPending's abandon arm — so the attribute set and the
+// once-per-event rule are stated once. A third caller would be a second increment for one
+// event and would silently restore the defect this counter exists to fix; there is deliberately
+// no other.
+//
+// Parameters:
+//   - ctx context.Context: the detached bookkeeping context, so the increment is not lost to a
+//     cancelled batch context after the row has already been moved.
+//   - row model.EventOutbox: the row that reached dispatched, read for its topic and type.
+func recordEventDispatched(ctx context.Context, row model.EventOutbox) {
+	metrics.EventsDispatchedTotal.Add(ctx, 1, otelmetric.WithAttributes(
+		attribute.String(publishAttrTopic, boundedTopicLabel(row.Topic)),
+		attribute.String(publishAttrEventType, boundedEventTypeLabel(row.EventType)),
+	))
 }
 
 // deferLegacyLeg records a Kafka leg that is done alongside a legacy webhook leg that is
@@ -1823,12 +2019,18 @@ func (p *EventRelayProcessor) settleAfterKafkaSuccess(
 //   - record model.BrokerRecord: where the broker put the message. Persisted alongside the
 //     Kafka leg's completion, so a row waiting on its webhook still names its record and the
 //     zero-loss audit can account for it.
+//   - published bool: whether THIS pass published to Kafka. This arm is a durable transition
+//     that records the Kafka leg, so a delivered event is counted here as well as on the
+//     dispatched arm — an event whose webhook is still owed HAS been delivered to Kafka, and a
+//     counter that waited for the webhook would under-report every event during a queue
+//     outage, and never count one whose webhook is ultimately abandoned.
 func (p *EventRelayProcessor) deferLegacyLeg(
 	ctx context.Context,
 	row model.EventOutbox,
 	attempt int,
 	cause error,
 	record model.BrokerRecord,
+	published bool,
 ) {
 	reason := "the legacy webhook enqueue failed"
 	if cause != nil {
@@ -1847,12 +2049,21 @@ func (p *EventRelayProcessor) deferLegacyLeg(
 		// nothing is lost: the Kafka publish is not repeated, because kafka_dispatched_at
 		// was already stamped by whichever earlier pass succeeded, or will be stamped by
 		// the next pass's own success.
-		logrus.WithFields(p.rowFields(row, attempt)).WithError(err).Error(
+		withLoggableCause(logrus.WithFields(p.rowFields(row, attempt)), err).Error(
 			"event relay: the event was published to Kafka but its outstanding legacy webhook " +
 				"leg could not be recorded; the row keeps its lease and is retried when it expires",
 		)
 
+		// NOT COUNTED: nothing durable records this delivery yet, and the row will be
+		// re-settled on a later claim which is where the increment belongs.
 		return
+	}
+
+	// THE DURABLE TRANSITION HAS COMMITTED. kafka_dispatched_at now names this delivery, so
+	// the event is counted here — once — whether the webhook that follows it succeeds, is
+	// retried or is ultimately abandoned.
+	if published {
+		recordDurableEventDelivery(ctx, row.Topic, row.EventType)
 	}
 
 	fields := p.rowFields(row, attempt)
@@ -1861,6 +2072,13 @@ func (p *EventRelayProcessor) deferLegacyLeg(
 	fields["reason"] = reason
 
 	if outcome.Abandoned {
+		// THE SECOND ARM THAT REACHES dispatched (PERF-P21). The abandon arm moves the row to
+		// dispatched with the webhook given up on, so this event's delivery is now durably
+		// recorded and it must be counted — omitting it here would under-report deliveries by
+		// exactly the number of events whose legacy leg was abandoned, and make the
+		// dead-letter rate look higher than it is.
+		recordEventDispatched(ctx, row)
+
 		logrus.WithFields(fields).Error(
 			"event relay: the legacy webhook leg for this event is ABANDONED after exhausting its " +
 				"own enqueue budget. The event IS on its Kafka topic; the webhook will never be " +
@@ -1973,7 +2191,9 @@ func (p *EventRelayProcessor) rowMaxAttempts(row model.EventOutbox) int {
 //   - result PublishResult: the attempt's observability record, read ONLY for its permanence
 //     verdict. A zero value — which is what a publisher that classifies nothing produces —
 //     falls through to the budgeted path, and that conservative default is deliberate: the
-//     publisher is an interface seam, so "no verdict" must never be read as "give up".
+//     publisher is an interface seam, so "no verdict" must never be read as "give up". Both
+//     gates below enforce that: PermanentFailure and publishFailureIsTerminal are each
+//     affirmative, so neither can be satisfied by an unpopulated result.
 //   - cause error: the publish failure.
 func (p *EventRelayProcessor) recordFailedAttempt(
 	ctx context.Context,
@@ -1995,9 +2215,14 @@ func (p *EventRelayProcessor) recordFailedAttempt(
 	bookkeeping, cancel := detachedBookkeepingContext(ctx)
 	defer cancel()
 
-	outcome, err := p.store.MarkEventFailed(bookkeeping, row.ID, row.ClaimToken, reason, retryAfter, terminal)
+	// THE RELAY'S OWN LOCK DURATION IS THE HAND-OFF LEASE. On the exhaustion arm the row is
+	// held under it while this worker writes the event to its `<topic>.dlt` sibling, so the
+	// repair pass cannot reclaim the row and write a second copy; on the retry arm it is
+	// ignored and the lease is released. Using the same duration the claim uses keeps one
+	// value governing the whole ownership window.
+	outcome, err := p.store.MarkEventFailed(bookkeeping, row.ID, row.ClaimToken, reason, retryAfter, terminal, p.lockDuration)
 	if err != nil {
-		logrus.WithFields(p.rowFields(row, attempt)).WithError(err).Error(
+		withLoggableCause(logrus.WithFields(p.rowFields(row, attempt)), err).Error(
 			"event relay: recording a failed publish attempt failed; the row keeps its lease and " +
 				"becomes claimable again when it expires",
 		)
@@ -2010,7 +2235,7 @@ func (p *EventRelayProcessor) recordFailedAttempt(
 			"attempts":       outcome.Attempts,
 			"retry_after":    retryAfter.String(),
 			"next_attempt":   p.now().UTC().Add(retryAfter).Format(time.RFC3339),
-			"error":          reason,
+			"error":          relayLogReason(cause),
 			"row_status":     outcome.Status,
 			"max_attempts":   p.rowMaxAttempts(row),
 			"backoff_capped": retryAfter >= p.retry.maxBackoff,
@@ -2022,17 +2247,39 @@ func (p *EventRelayProcessor) recordFailedAttempt(
 	// WHY the budget is spent, stated on the line rather than left to be inferred from the
 	// numbers. "attempt 1 of 5, exhausted" reads as a bookkeeping defect unless the line also
 	// says the failure was permanent, which is the one case where it is the correct outcome.
+	//
+	// retry_after IS REPORTED ON THIS ARM TOO, and it is not noise. It is the delay the
+	// schedule produced for the attempt that spent the budget — 16s at the mandated
+	// parameters, the fifth value of 1s/2s/4s/8s/16s — and it is the same value
+	// MarkEventFailed has just stamped on the row. Omitting it made the exhausting attempt
+	// the one attempt whose scheduled delay never appeared anywhere, which is precisely
+	// what made the full mandated sequence look as though the live path never produced it.
+	// The line says plainly that nothing waits it: the budget is spent and the row is
+	// dead-lettered instead of being published a sixth time.
 	exhaustionFields := p.rowFields(row, attempt)
 	exhaustionFields["terminal"] = outcome.Terminal
+	exhaustionFields["retry_after"] = retryAfter.String()
+	exhaustionFields["retry_after_waited"] = false
 	exhaustionFields["attempts"] = outcome.Attempts
 	exhaustionFields["max_attempts"] = p.rowMaxAttempts(row)
-	exhaustionFields["error"] = reason
+	exhaustionFields["error"] = relayLogReason(cause)
 
+	// ONE line on BOTH arms, with the wording selected by the verdict. The permanent arm
+	// already had one; the budget-spent arm had none at all, so the attempt that ended a
+	// retried event's life was the one attempt the relay said nothing about — the schedule's
+	// final delay went unreported and the transition itself was only visible indirectly,
+	// through the dead-letter write that followed it.
 	if outcome.Terminal {
 		logrus.WithFields(exhaustionFields).Warn(
 			"event relay: the publish failed PERMANENTLY, so the remaining retry budget is " +
 				"abandoned and the event goes straight to its dead-letter topic; no retry could " +
 				"change this outcome",
+		)
+	} else {
+		logrus.WithFields(exhaustionFields).Warn(
+			"event relay: publish failed on the last attempt this row's budget allowed, so the " +
+				"schedule's final delay is recorded on the row but never waited and the event is " +
+				"handed to its dead-letter topic instead of being published again",
 		)
 	}
 
@@ -2080,9 +2327,10 @@ func (p *EventRelayProcessor) recordPermanentFailure(
 	bookkeeping, cancel := detachedBookkeepingContext(ctx)
 	defer cancel()
 
-	outcome, err := p.store.MarkEventPermanentlyFailed(bookkeeping, row.ID, row.ClaimToken, reason)
+	// The hand-off lease, for the same reason it is passed on the exhaustion arm above.
+	outcome, err := p.store.MarkEventPermanentlyFailed(bookkeeping, row.ID, row.ClaimToken, reason, p.lockDuration)
 	if err != nil {
-		logrus.WithFields(p.rowFields(row, attempt)).WithError(err).Error(
+		withLoggableCause(logrus.WithFields(p.rowFields(row, attempt)), err).Error(
 			"event relay: recording a permanently failed publish attempt failed; the row keeps its " +
 				"lease and becomes claimable again when it expires",
 		)
@@ -2092,7 +2340,7 @@ func (p *EventRelayProcessor) recordPermanentFailure(
 
 	logrus.WithFields(p.rowFields(row, attempt)).WithFields(logrus.Fields{
 		"attempts":   outcome.Attempts,
-		"error":      reason,
+		"error":      relayLogReason(cause),
 		"row_status": outcome.Status,
 	}).Warn(
 		"event relay: publish failed permanently, so the remaining retry budget is not spent and " +
@@ -2195,10 +2443,13 @@ func (p *EventRelayProcessor) deadLetter(
 
 	outcome, err := p.deadLetters.DeadLetter(ctx, row, cause)
 	if err != nil {
-		logrus.WithFields(p.rowFields(row, attempt)).WithError(err).
-			WithField("terminal_reason", reason.String()).Error(
+		withLoggableCause(
+			logrus.WithFields(p.rowFields(row, attempt)).
+				WithField("terminal_reason", reason.String()), err).Error(
 			"event relay: the event is terminal but could not be written to its dead-letter topic; " +
-				"the row stays failed and remains in the dead-letter inventory",
+				"the row stays failed, remains in the dead-letter inventory, and its hand-off is " +
+				"retried by recoverUnpreservedDeadLetters once the lease the terminal transition " +
+				"retained has lapsed",
 		)
 
 		return
@@ -2207,7 +2458,7 @@ func (p *EventRelayProcessor) deadLetter(
 	logrus.WithFields(p.rowFields(row, attempt)).WithFields(logrus.Fields{
 		"dlt_topic":       outcome.DeadLetterTopic,
 		"attempts":        outcome.Metadata.AttemptCount,
-		"error":           relayFailureReason(cause),
+		"error":           relayLogReason(cause),
 		"terminal_reason": reason.String(),
 	}).Warn("event relay: event dead-lettered " + reason.description())
 }
@@ -2304,7 +2555,7 @@ func (p *EventRelayProcessor) deliverLegacyWebhook(
 	}
 
 	if err := p.legacy.EnqueueLegacyWebhookDelivery(row.EventID, row.Payload); err != nil {
-		logrus.WithFields(p.rowFields(row, row.Attempts+1)).WithError(err).Warn(
+		withLoggableCause(logrus.WithFields(p.rowFields(row, row.Attempts+1)), err).Warn(
 			"event relay: enqueuing the legacy webhook delivery failed; the Kafka publish is " +
 				"unaffected and the row stays claimable for the webhook leg alone",
 		)
@@ -2320,7 +2571,7 @@ func (p *EventRelayProcessor) deliverLegacyWebhook(
 		// claim re-enqueues under the same task identity, which the queue refuses as a
 		// duplicate, so this is an observability gap rather than a delivery defect — and
 		// the leg is reported as SETTLED, because it is: the webhook is on the queue.
-		logrus.WithFields(p.rowFields(row, row.Attempts+1)).WithError(err).Warn(
+		withLoggableCause(logrus.WithFields(p.rowFields(row, row.Attempts+1)), err).Warn(
 			"event relay: the legacy webhook was enqueued but the row could not be marked; " +
 				"a re-enqueue is suppressed by the task identity",
 		)
@@ -2353,47 +2604,64 @@ const (
 // END OF THE DUAL-DELIVERY BRANCH
 // ---------------------------------------------------------------------------
 
-// logAttempt logs EVERY publish attempt, not only the last one.
+// logAttempt logs a SUCCESSFUL publish attempt at debug, and deliberately says nothing at all
+// about a failed one.
 //
-// Requirement R-4 names the field set: the attempt number, the maximum attempts, the error,
-// the event id and the topic. All five are present on a failed attempt, which is the line an
-// operator reads when an event is not arriving — "attempt 2 of 5, connection refused, event X,
-// topic blnk.transactions" answers what happened, how much budget is left and where to look.
+// # Why the failure arm was removed (OBS-15)
 //
-// The levels keep the requirement met without drowning the log at 500 events per second: a
-// FAILURE is logged unconditionally at warning, a SUCCESS at debug with its fields built only
-// if debug is enabled, because a line per published event is five hundred lines a second
-// saying "it worked".
+// It used to log every failed attempt at warning, immediately after the publisher had already
+// logged the same attempt at error. One attempt, two lines, two levels, two field
+// vocabularies. That is not redundancy an operator can ignore:
 //
-// This is the RELAY's line and deliberately not the publisher's: the publisher reports the
-// transport's view (duration, transient classification, hashed partition key) while this
-// reports which attempt of which budget, and what the retry decision will be.
+//   - It DOUBLES the log volume of an incident, on the path whose volume is already the
+//     reason the success arm is level-guarded. A broker outage at 500 events per second
+//     produced two lines per attempt for every event in flight.
+//   - It makes LINE COUNTING WRONG. "How many publish attempts failed" is the question the
+//     log is read for during triage, and grep produced twice the answer — while an operator
+//     who deduplicated by message text got the right number from either line and had no way
+//     to know the other existed.
+//   - The two lines DISAGREED ON SEVERITY for the same event, so a level-filtered view showed
+//     the failure and a slightly stricter one showed it as merely a warning.
+//
+// Requirement R-4 — the attempt number and the error reason on EVERY attempt, not only the
+// last — is met by the PUBLISHER'S line, which is unconditional, carries the attempt number,
+// the budget, the error reason, the topic and the transient classification, and is structurally
+// pinned unguarded by an assertion in event_publisher_test.go. Keeping one canonical
+// per-attempt record is what makes that requirement verifiable rather than merely satisfied
+// twice.
+//
+// What the relay still logs about a failure is the part the publisher cannot know, and each of
+// those is a DURABLE state change rather than a restatement of the attempt:
+//
+//   - "scheduled for another attempt", carrying the delay the schedule produced and the
+//     instant the row is next due — see recordFailedAttempt.
+//   - the exhausting attempt, on both its arms, carrying the final delay and why nothing waits
+//     it.
+//   - the dead-letter write, carrying the destination and the terminal reason — see deadLetter.
+//
+// The success arm stays here because there is no other candidate: the publisher's success line
+// is also debug-guarded, and this one adds the row's attempt-of-budget view.
 func (p *EventRelayProcessor) logAttempt(
 	row model.EventOutbox,
 	attempt int,
 	result PublishResult,
 	err error,
 ) {
-	if err == nil {
-		if !logrus.IsLevelEnabled(logrus.DebugLevel) {
-			return
-		}
+	if err != nil {
+		// Silence, by design. The publisher has already emitted the canonical per-attempt
+		// record for this failure; the durable consequences are logged by the transitions
+		// that perform them.
+		return
+	}
 
-		logrus.WithFields(p.rowFields(row, attempt)).WithFields(logrus.Fields{
-			"status":      string(result.Status),
-			"duration_ms": result.Duration.Milliseconds(),
-		}).Debug("event relay: published a ledger event")
-
+	if !logrus.IsLevelEnabled(logrus.DebugLevel) {
 		return
 	}
 
 	logrus.WithFields(p.rowFields(row, attempt)).WithFields(logrus.Fields{
-		"error":       relayFailureReason(err),
 		"status":      string(result.Status),
-		"transient":   result.Transient,
-		"retryable":   result.Retryable,
 		"duration_ms": result.Duration.Milliseconds(),
-	}).Warn("event relay: publishing a ledger event failed")
+	}).Debug("event relay: published a ledger event")
 }
 
 // rowFields renders the identity of a row and its attempt as logrus fields.
@@ -2426,42 +2694,91 @@ func (p *EventRelayProcessor) rowFields(row model.EventOutbox, attempt int) logr
 // topic namespace Blnk owns. Re-deriving that here would mean re-classifying broker errors in
 // a second place, and the two copies would disagree the first time either changed.
 //
-// # Both signals are read, and "unknown" resolves to TERMINAL
+// # Both signals are read, and BOTH ARE AFFIRMATIVE. "Unknown" is NOT terminal
 //
 // The result carries the classification for every publish that came out of this pipeline; the
-// error carries it too, for a caller holding only an error. Either saying "transient" is
-// enough to keep retrying. Neither saying so means the failure is not recognisably
-// recoverable, and this file resolves that to terminal for the reason
-// IsTransientPublishError documents: guessing "retryable" for an unrecognised failure invites
-// an unbounded retry of something that can never succeed.
+// error carries it too, for a caller holding only an error. Terminal is reported only when one
+// of them SAYS SO — PublishResult.PermanentFailure, which requires an error, the failed status
+// this pipeline sets only after classifying, and a non-transient classification; or
+// IsPermanentPublishError, which requires the error to be a PublishError that was classified
+// as non-recoverable. Anything else is unknown, and unknown falls through to the budgeted
+// retry that MarkEventFailed owns.
 //
-// Terminal is a SAFE default here in a way it would not be elsewhere, and that is what makes
-// the choice defensible rather than merely conventional: it does not discard the event. The
-// row goes to failed, the dead-letter write preserves the event on its `<topic>.dlt` sibling
-// with its failure metadata, and it stays listable and replayable through the dead-letter
-// API. The cost of being wrong is an earlier dead-letter and an operator-triggered replay.
-// The cost of the opposite mistake is the whole backoff schedule spent on a message that can
-// never be published, with the event unpreserved and invisible throughout.
+// This used to be `!result.Transient && !IsTransientPublishError(cause)`, and the double
+// negation was the defect. Both halves report "not transient" for input they never
+// classified: a zero-valued PublishResult — which is exactly what a publisher that classifies
+// nothing produces — and any error that did not come out of this file's publish path. So a
+// bare error from a borrowed writer, a wrapped context expiry, or a substitute publisher in a
+// test was read as "no further attempt can succeed" and the row was dead-lettered on ATTEMPT
+// ONE with four attempts unspent. The log said so too, one line claiming the event was
+// scheduled for another attempt and the next recording it terminal, which is how a semantic
+// defect hides in a system whose observability is otherwise good.
+//
+// The publisher is an INTERFACE SEAM — the relay borrows whichever implementation the process
+// built — so "no verdict" is a normal input rather than a defect to punish, and it must read
+// as "not permanent". That is the judgement PublishResult.PermanentFailure already documents
+// and enforces for its own three facts; this predicate now agrees with it instead of
+// contradicting it two hundred lines away.
+//
+// # Why erring toward RETRY is right here, having previously erred the other way
+//
+// Neither direction loses the event: the row is durable either way, and both a dead-letter and
+// an exhausted budget end with the event preserved on its `<topic>.dlt` sibling, listable and
+// replayable. What differs is which mistake is recoverable WITHOUT AN OPERATOR. Spending the
+// budget on a failure that can never succeed costs four more attempts and about seventeen
+// seconds, after which the event dead-letters exactly as it would have; dead-lettering a
+// TRANSIENT failure on the first attempt turns a broker hiccup into an operator-triggered
+// replay for every event in flight during it. The first mistake is absorbed by the retry
+// schedule. The second becomes a queue of manual work, at exactly the moment the system is
+// least healthy.
 //
 // Parameters:
 //   - result PublishResult: the publisher's report of the attempt. A zero value states
-//     nothing, which is one of the two "unknown" inputs.
-//   - cause error: the failure returned alongside it.
+//     nothing and is therefore NOT terminal.
+//   - cause error: the failure returned alongside it. An error this pipeline did not classify
+//     is likewise not terminal.
 //
 // Returns:
-//   - bool: true when no further attempt should be made.
+//   - bool: true only when the publisher or its error affirmatively reports that no further
+//     attempt can succeed.
 func publishFailureIsTerminal(result PublishResult, cause error) bool {
-	return !result.Transient && !IsTransientPublishError(cause)
+	// The result's own verdict, which requires an affirmative Classified marker.
+	if result.PermanentFailure() {
+		return true
+	}
+
+	// The error's verdict, for a caller holding only an error. A *PublishError is the
+	// only carrier of a classification, so its absence is the "nobody classified this"
+	// case and must NOT be read as permanent.
+	var publishErr *PublishError
+	if errors.As(cause, &publishErr) {
+		return !publishErr.Transient
+	}
+
+	return false
 }
 
-// relayFailureReason renders a publish failure as text that is safe to log AND safe to store
-// in the row's last_error column.
+// relayFailureReason renders a publish failure as text safe to STORE in the row's
+// last_error column and in the dead-letter failure metadata.
 //
 // The string comes from a broker or a client library, so neither its length nor its content
-// is this codebase's to choose: newlines would forge log structure, control characters corrupt
-// structured-log parsers, and an unbounded value written once per attempt per event is how a
-// log pipeline gets throttled and a text column grows without limit. sanitizeLogValue is
-// shared with the rest of the event pipeline so the bounds are identical everywhere.
+// is this codebase's to choose: newlines would forge structure in anything that later renders
+// the column, control characters corrupt parsers, and an unbounded value written once per
+// attempt per event is how a text column grows without limit. sanitizeLogValue is shared with
+// the rest of the event pipeline so the bounds are identical everywhere.
+//
+// # This is the DURABLE rendering, and it deliberately keeps the broker's own words
+//
+// It is NOT what goes into a log line — relayLogReason is — and the difference is the reader.
+// This value is reachable in exactly two places, and both are already privileged: the
+// last_error column and the failure_metadata written to a `<topic>.dlt` sibling. Dead-letter
+// topics are not grantable to subscribers (IsSubscriberGrantableTopic excludes every `.dlt`
+// name), and the dead-letter inventory API is gated on the master key, so the audience for
+// this string is an operator who is already entitled to the deployment's internals.
+//
+// For that audience the address that failed is the most useful part of the message, and
+// redacting it would make a dead-letter triage — the one workflow this column exists for —
+// strictly harder while protecting nothing that is not already exposed to the reader.
 //
 // A nil error yields a fixed, non-empty string rather than "": an empty reason recorded
 // against a failed attempt is indistinguishable from a row nobody has tried yet.
@@ -2471,6 +2788,40 @@ func relayFailureReason(cause error) string {
 	}
 
 	reason := sanitizeLogValue(cause.Error(), maxLoggedErrorLength)
+	if reason == "" {
+		return "the publish failed without reporting a reason"
+	}
+
+	return reason
+}
+
+// relayLogReason renders a publish failure as text safe to write to a LOG at a normal level:
+// everything relayFailureReason does, plus network topology redacted.
+//
+// The split from relayFailureReason exists because the two sinks have different readers. A log
+// is read by whoever can reach the log aggregator, which in most deployments is a far wider
+// group than the holders of the master key, and it is retained and shipped onwards. A broker
+// error names the broker's address and port, a resolver failure names the internal DNS server,
+// and a wrapped database error can quote its connection string; none of that is needed to know
+// that a publish failed, and all of it is reconnaissance once it is sitting in a log.
+//
+// The diagnosis survives. Redaction removes address-shaped tokens and secret values only, so
+// "connection refused", "i/o timeout" and "Cluster Authorization Failed" still reach the line —
+// and the unredacted text is one debug level away, both through the cause_verbatim field
+// withLoggableCause attaches and through the row's own last_error column.
+//
+// Parameters:
+//   - cause error: the failure. A nil error yields the same fixed string relayFailureReason
+//     uses, so the two renderings agree about the absence of a reason.
+//
+// Returns:
+//   - string: the redacted, sanitized, bounded rendering.
+func relayLogReason(cause error) string {
+	if cause == nil {
+		return "the publish failed without reporting a reason"
+	}
+
+	reason := loggableCause(cause)
 	if reason == "" {
 		return "the publish failed without reporting a reason"
 	}

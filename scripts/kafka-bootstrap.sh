@@ -221,17 +221,6 @@ readonly REQUIRED_AUTHORIZER="org.apache.kafka.metadata.authorizer.StandardAutho
 # ---------------------------------------------------------------------------------------
 readonly CREDENTIAL_SAFE_ERE='^[A-Za-z0-9!#%&()*+./:<>?@_{|}~^-]+$'
 
-# The SCRAM secret strength floors, mirrored EXACTLY from event_admin.go's
-# MinSCRAMPasswordLength and MinSCRAMPasswordDistinctChars, and equal to the pair in
-# scripts/kafka-provision.sh.
-#
-# Duplicated because a shell script cannot import a Go constant, and written with the Go names
-# beside them so the pairing is discoverable from either side. What matters is that all three
-# are EQUAL: a floor that differs between paths is a floor an operator can route around by
-# choosing the more permissive one, and before these existed the shell paths were the
-# permissive ones. See require_strong_credential.
-readonly MIN_CREDENTIAL_LENGTH=32
-readonly MIN_CREDENTIAL_DISTINCT_CHARS=16
 readonly PRINCIPAL_SAFE_ERE='^[A-Za-z0-9._@+-]+$'
 readonly CREDENTIAL_SAFE_DESCRIPTION="letters, digits and ! # % & ( ) * + - . / : < > ? @ ^ _ { | } ~"
 readonly PRINCIPAL_SAFE_DESCRIPTION="letters, digits and . _ @ + -"
@@ -490,78 +479,6 @@ require_safe_credential() {
     require_strong_credential "$name" "$value"
 }
 
-# Refuse a SCRAM secret that is weak, whatever its grammar.
-#
-# # Why the grammar check above is not enough
-#
-# require_safe_credential asks only whether a value can SURVIVE the SCRAM grammar. It says
-# nothing about strength, so this script accepted a ONE-CHARACTER password for the principal
-# it is about to seed into the metadata log - while event_admin.go applies a 32-character and
-# 16-distinct-character floor to every subscriber credential it provisions. The same broker,
-# the same mechanism, and two different standards depending on which path created the
-# credential.
-#
-# The stake here is higher than for a subscriber. This principal is seeded by
-# 'kafka-storage format --add-scram' and is placed in the broker's super.users, so it can
-# create topics, mint and alter every other credential, and rewrite every ACL. A Kafka SASL
-# handshake has no rate limit and no lockout, so a weak password on it is guessable at
-# whatever rate an attacker can open connections.
-#
-# And it is close to UNFIXABLE after the fact: the credential lives in the KRaft metadata log
-# from the moment storage is formatted, so a weak one cannot simply be corrected - see the
-# rotation guidance elsewhere in this script, which comes down to discarding the log. Refusing
-# before formatting is the only cheap moment.
-#
-# # The floors, and why these numbers
-#
-# Mirrored EXACTLY from event_admin.go's MinSCRAMPasswordLength (32) and
-# MinSCRAMPasswordDistinctChars (16), and equal to the floors in kafka-provision.sh. A floor
-# that differs between paths is a floor an operator can route around by choosing the other
-# path.
-#
-# The value is NEVER echoed, and neither is its length - on a short secret, reporting the
-# length narrows the very search space the check exists to widen.
-#
-# Parameters:
-#   $1 - the variable name, for the message. Printed.
-#   $2 - the secret. Never printed.
-require_strong_credential() {
-    local name="$1" value="$2"
-
-    if (( ${#value} < MIN_CREDENTIAL_LENGTH )); then
-        die "${name} is shorter than the ${MIN_CREDENTIAL_LENGTH}-character minimum for a SCRAM secret." \
-            "The value is not echoed, and neither is its length." \
-            "This principal is seeded into the KRaft metadata log and placed in the broker's" \
-            "super.users: it can create topics, mint and alter every other credential and" \
-            "rewrite every ACL. A Kafka SASL handshake has no rate limit and no lockout, so a" \
-            "short password on it is guessable at whatever rate an attacker can open" \
-            "connections - and once storage is formatted the credential is in the metadata log" \
-            "and correcting it means discarding that log." \
-            "This is the same floor event_admin.go applies to every subscriber credential" \
-            "(MinSCRAMPasswordLength), so the standard does not depend on which path created" \
-            "the credential." \
-            "Fix: generate one instead of choosing one:" \
-            "  openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32" \
-            "No storage has been touched."
-    fi
-
-    # Counted with a sorted-unique pass over one character per line rather than with an
-    # associative array, so the check behaves identically under bash 3 - what macOS ships.
-    local distinct
-    distinct="$(printf '%s' "$value" | fold -w1 | sort -u | wc -l | tr -d ' ')"
-
-    if (( distinct < MIN_CREDENTIAL_DISTINCT_CHARS )); then
-        die "${name} uses fewer than ${MIN_CREDENTIAL_DISTINCT_CHARS} distinct characters, so it is long without being unpredictable." \
-            "The value is not echoed." \
-            "Length alone is not strength: thirty-two repetitions of one character clears a" \
-            "length check and is guessed immediately. This is the same floor event_admin.go" \
-            "applies (MinSCRAMPasswordDistinctChars)." \
-            "Fix: generate the secret from the full alphabet rather than padding a shorter one:" \
-            "  openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32" \
-            "No storage has been touched."
-    fi
-}
-
 # ---------------------------------------------------------------------------------------
 # Credential scratch files (Q4-20)
 # ---------------------------------------------------------------------------------------
@@ -574,8 +491,15 @@ require_strong_credential() {
 # and a cleanup failure must not replace that error with its own.
 cleanup() {
     local file
+    # An explicit conditional rather than '[[ -n $file ]] && rm ... || true'. In that form
+    # the '||' binds to the whole '&&' chain, so it fires both when the name is empty AND
+    # when the removal fails - one branch standing for two unrelated conditions. It happened
+    # to behave correctly, but it read as though the '|| true' guarded only the rm, and the
+    # next person to add a step to this loop would have had to work that out from scratch.
     for file in ${SCRATCH_FILES[@]+"${SCRATCH_FILES[@]}"}; do
-        [[ -n "$file" ]] && rm -f "$file" 2>/dev/null || true
+        if [[ -n "$file" ]]; then
+            rm -f "$file" 2>/dev/null || true
+        fi
     done
     SCRATCH_FILES=()
 }
@@ -643,9 +567,35 @@ count_distinct_characters() {
 
 # Refuse a secret too short or too repetitive to derive a broker credential from (S6-07).
 #
-# Neither the value nor any part of it is printed - only its LENGTH and its DISTINCT COUNT,
-# which is what the operator needs in order to fix it and is not enough to guess it. A length
-# is not a secret; a prefix would be.
+# # Why this credential in particular
+#
+# It is not one account among many. This principal is seeded into the KRaft metadata log by
+# 'kafka-storage format --add-scram' and placed in the broker's super.users, so it can create
+# topics, mint and alter every other credential, and rewrite every ACL. A Kafka SASL
+# handshake has no rate limit and no lockout, so a weak password on it is guessable at
+# whatever rate an attacker can open connections.
+#
+# It is also close to UNFIXABLE after the fact. The credential lives in the metadata log from
+# the moment storage is formatted, so a weak one cannot simply be corrected later - see the
+# rotation guidance elsewhere in this script, which comes down to discarding the log.
+# Refusing before formatting is the only cheap moment, which is why this runs where it does.
+#
+# # The floors
+#
+# MIN_SECRET_LENGTH and MIN_SECRET_DISTINCT mirror event_admin.go's MinSCRAMPasswordLength
+# and MinSCRAMPasswordDistinctChars, and match the pair in scripts/kafka-provision.sh. All
+# three being EQUAL is the point: a floor that differs between paths is a floor an operator
+# can route around by choosing the more permissive path, and the shell paths used to be the
+# permissive ones. A change to any one of the three belongs in the other two.
+#
+# # What is printed
+#
+# Neither the value nor any part of it - only its LENGTH and its DISTINCT COUNT, which is
+# what the operator needs in order to fix it and is not enough to guess it. A length is not a
+# secret; a prefix would be. (An earlier duplicate of this function withheld the length too,
+# on the reasoning that reporting it narrows the search space. It does, but only for a value
+# that is being REFUSED and therefore never used, and withholding it leaves an operator
+# guessing at which of two floors they failed.)
 require_strong_credential() {
     local name="$1" value="$2" distinct
 

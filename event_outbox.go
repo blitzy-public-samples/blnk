@@ -119,7 +119,7 @@ const defaultEventMaxAttempts = 5
 // event type to fall back to, which in practice means a caller passed a
 // zero-valued NewWebhook. Routing those to one fixed key keeps them ordered
 // amongst themselves and keeps them visible, and the distinctive value makes them
-// trivial to spot in the outbox: `WHERE ledger_id = 'blnk.unkeyed'`.
+// trivial to spot in the outbox: `WHERE partition_key = 'blnk.unkeyed'`.
 const unkeyedEventPartitionKey = "blnk.unkeyed"
 
 // postCommitEventPublishSem bounds how many post-commit event captures may be in
@@ -233,17 +233,13 @@ func (l *Blnk) eventConfiguration() *config.Configuration {
 // Returns:
 //   - bool: true when at least one usable Kafka broker is configured.
 func eventPublishingConfigured(cnf *config.Configuration) bool {
-	if cnf == nil {
-		return false
-	}
-
-	for _, broker := range cnf.Kafka.Brokers {
-		if strings.TrimSpace(broker) != "" {
-			return true
-		}
-	}
-
-	return false
+	// Delegated rather than reimplemented. The database layer asks the SAME question
+	// when it decides whether to write a balance-monitor handoff inside a ledger
+	// transaction, and the two answers must be identical: a disagreement would either
+	// write handoffs nothing drains, or leave a movement whose monitors neither the
+	// handoff nor the post-commit path evaluates. One implementation makes that
+	// unrepresentable. See config.Configuration.EventPublishingConfigured.
+	return cnf.EventPublishingConfigured()
 }
 
 // legacyWebhookOnly reports that this deployment has a webhook URL and no Kafka broker,
@@ -514,74 +510,112 @@ func eventAggregateID(payload interface{}) string {
 	}
 }
 
-// eventPartitionKey derives the KAFKA MESSAGE KEY for an event.
+// eventPartitionKey derives the KAFKA MESSAGE KEY for an event FROM ITS PAYLOAD ALONE.
 //
-// # IT IS NOT THE LEDGER ID, and it used to be called one
+// # IT IS THE FALLBACK, not the contract
 //
-// This function was named eventLedgerID and its result was stored in a column called
-// ledger_id, which was wrong for most of the values it actually produced: depending
-// on the event it returns a ledger id, a source or destination BALANCE id, an
-// IDENTITY id, a MONITOR id, a BATCH id, or the event type itself. Two things
-// followed from the misnaming, and both were real rather than cosmetic. Anything
-// reading ledger_id to learn which ledger an event belonged to got a balance id for
-// every transaction event and had no way to tell. And any subscriber-facing claim
-// that a message-key prefix identifies a ledger was simply unfounded, because for
-// the highest-volume event type in the system the key is not a ledger id at all.
+// The contract is one rule — requirement R-6 partitions by LEDGER ID, and
+// PrepareEventOutbox keys every ledger-scoped event on its ledger. That ledger arrives
+// through WithEventLedgerID, supplied by the producer, and it OVERRIDES whatever this
+// function returns. Every ledger-scoped producer supplies it: transaction execution
+// (resolved from the loaded source balance, falling back to the destination), the
+// balance post-action and monitor check, and the ledger post-action. So for
+// transaction.*, balance.created, balance.monitor and ledger.created the wire key is
+// the ledger, and this function's answer for those payloads is never what ships.
 //
-// The authoritative ledger now lives in its own column, populated by eventLedgerID,
-// which returns a value ONLY when the payload genuinely carries one. The two
-// functions answer different questions and must not be conflated again:
-// eventPartitionKey answers "where does this message go", eventLedgerID answers
-// "which ledger is this about".
+// What this function is for is the events that genuinely have NO ledger, and the one
+// case where a ledger-scoped event cannot resolve one:
 //
-// This value is the single most consequential field this file computes. The key is
-// hashed by a stable balancer to select a partition, so every event sharing a key
-// lands on one partition and is consumed in publish order, while events with
-// different keys carry no ordering relationship at all. Per-aggregate ordering is
-// therefore not a property of the broker or of the relay — it is a property of THIS
-// FUNCTION returning a stable value for every event belonging to one aggregate.
+//   - identity.created — an identity is not scoped to a ledger in this model.
+//   - bulk_transaction.<status> — a batch is a runtime grouping, not a ledger object.
+//   - system.error — no aggregate of any kind; it reaches the caller's chain and keys
+//     on the event type, giving the error stream a single partition and a total order.
+//   - A REJECTED transaction, persisted with no balances at all: no balance moved, so
+//     the producer supplies no ledger and the derivation below is what keys it.
 //
-// Derivation, and the reasoning behind each choice:
+// It is therefore ALSO the guarantee of last resort. A producer that forgets the
+// option, or a payload whose ledger is unpopulated, still gets a stable, deterministic
+// key rather than an empty one — and an empty key would let Kafka scatter the message
+// round-robin and destroy ordering with nothing in the data to show it.
+//
+// # It is NOT the ledger column, and the two must never be conflated again
+//
+// This function was once named eventLedgerID and its result was stored in a column
+// called ledger_id, which was wrong for most of the values it produced: anything
+// reading ledger_id to learn which ledger an event belonged to got a BALANCE id for
+// every transaction event and had no way to tell. The authoritative ledger now lives
+// in its own column, populated by eventLedgerID or by the producer's option, and
+// returns a value ONLY when the event genuinely has one. eventPartitionKey answers
+// "where does this message go"; eventLedgerID answers "which ledger is this about".
+//
+// The key is hashed by a stable balancer to select a partition, so every event sharing
+// a key lands on one partition and is consumed in publish order, while events with
+// different keys carry no ordering relationship at all. Ordering is therefore not a
+// property of the broker or of the relay — it is a property of the key being stable
+// for every event belonging to one aggregate.
+//
+// Some events genuinely have no ledger, and for those the key is the event's OWN
+// AGGREGATE. Nothing is fabricated: a ledger id that was not established is never
+// invented, here or in the ledger_id column, because a plausible-looking ledger is worse
+// than an absent one for everything that reads it afterwards.
 //
 //	*model.Ledger / model.Ledger
-//	    LedgerID. The event is about the ledger itself, so the ledger is the key.
+//	    LedgerID — the event is about the ledger itself, so the two answers coincide.
 //
 //	*model.Balance / model.Balance
-//	    LedgerID, falling back to BalanceID. A balance belongs to exactly one
-//	    ledger, so keying by the ledger co-locates every balance event of that
-//	    ledger on one partition and orders them against each other. The fallback
-//	    covers a balance whose ledger is not populated on the payload.
+//	    LedgerID, falling back to BalanceID. A balance belongs to exactly one ledger,
+//	    so the ledger arm above answers first; the fallback covers a balance payload
+//	    whose ledger field is not populated.
 //
 //	model.BalanceMonitor / *model.BalanceMonitor
 //	    BalanceID, falling back to MonitorID. BalanceMonitor carries no ledger
-//	    field, and the balance it watches is the closest stable aggregate: every
-//	    alert for one balance stays ordered, which is what an alert consumer needs.
+//	    field, so this is the fallback for a monitor alert whose triggering
+//	    balance had no ledger recorded — checkBalanceMonitors normally supplies
+//	    the watched balance's ledger, and that is what ships. The watched balance
+//	    is the closest stable aggregate otherwise: every alert for one balance
+//	    stays ordered, which is what an alert consumer needs.
 //
 //	*model.Identity / model.Identity
-//	    IdentityID. Identity carries no ledger field either — an identity is not
-//	    scoped to a ledger in this model — so the identity is its own aggregate.
+//	    IdentityID. An identity is not scoped to a ledger in this model — model.Identity
+//	    has no ledger field and an identity may be referenced by balances in several
+//	    ledgers — so the identity is its own aggregate and ordering is per identity.
 //
 //	*model.Transaction / model.Transaction
 //	    Source, falling back to Destination, then TransactionID.
-//	    model.Transaction HAS NO LEDGER FIELD; its ledger association is indirect,
-//	    through the balances it moves value between. The source balance is used
-//	    because it is exactly what the existing transaction queue shards on —
-//	    hashBalanceID(transaction.Source) in queue.go — so Kafka partitioning and
-//	    queue sharding agree, and the ordering guarantee subscribers observe
-//	    matches the ordering the ledger itself already imposes on that balance.
-//	    Source is also stable across a transaction's whole lifecycle, so
-//	    transaction.queued, .inflight and .applied for one transaction share a
-//	    partition and can never be observed out of order. Destination covers a
-//	    credit-only transaction; TransactionID is the last resort for a multi-source
-//	    parent whose own Source and Destination are unset.
+//	    REACHED ONLY WHEN THE PRODUCER SUPPLIED NO LEDGER, which in practice means a
+//	    rejected transaction persisted with no balances — every other transaction
+//	    event is keyed on its ledger by WithEventLedgerID, per R-6. The source
+//	    balance is the fallback because it is exactly what the existing transaction
+//	    queue shards on — hashBalanceID(transaction.Source) in queue.go — so a
+//	    fallback-keyed event still agrees with the ordering the ledger already
+//	    imposes on that balance, and Source is stable across a transaction's whole
+//	    lifecycle. Destination covers a credit-only transaction; TransactionID is
+//	    the last resort for a multi-source parent whose own Source and Destination
+//	    are unset.
 //
 //	map[string]interface{}
-//	    batch_id. A bulk batch is the natural aggregate, so a batch's progress
-//	    events stay ordered relative to one another.
+//	    batch_id, for the bulk_transaction.<status> batch summaries. A batch is a
+//	    RUNTIME GROUPING rather than a ledger object and its members may span ledgers, so
+//	    no single ledger is authoritative for the summary and choosing one would be a
+//	    fabrication. The batch is the aggregate the summary describes, so keying by it is
+//	    what keeps one batch's progress events ordered relative to one another. The
+//	    batch's MEMBER transactions each carry their own ledger-keyed transaction.*
+//	    event, so nothing about per-ledger ordering is lost.
 //
 // system.error and anything else reach the caller's fallback chain, which is
 // documented at PrepareEventOutbox. NOTHING here returns a key that would leave the
 // partition assignment to chance.
+//
+// # eventLedgerID answers a different question and must not be conflated with this one
+//
+// eventPartitionKey answers "which partition does this message go to"; eventLedgerID
+// answers "which ledger is this event about", and it returns a value ONLY when the
+// payload genuinely carries one. The two agree whenever a ledger is known — that is the
+// R-6 rule above — and diverge only on the fallback, where this function still has to
+// produce a stable key and the ledger column must stay NULL rather than hold a
+// balance, identity or batch id. Storing one in the other was a real defect once: the
+// ledger column held a source balance id for every transaction event, and nothing
+// downstream could tell.
 //
 // Parameters:
 //   - payload interface{}: the NewWebhook payload object. May be nil or of any type.
@@ -589,6 +623,12 @@ func eventAggregateID(payload interface{}) string {
 // Returns:
 //   - string: the partition key, or "" when the payload carries none.
 func eventPartitionKey(payload interface{}) string {
+	// THE R-6 RULE, applied before any per-type fallback: an event that knows its
+	// ledger is keyed by its ledger, whatever its category.
+	if ledger := eventLedgerID(payload); ledger != "" {
+		return ledger
+	}
+
 	switch typed := payload.(type) {
 	case *model.Transaction:
 		if typed == nil {
@@ -601,9 +641,9 @@ func eventPartitionKey(payload interface{}) string {
 		if typed == nil {
 			return ""
 		}
-		return firstNonBlank(typed.LedgerID, typed.BalanceID)
+		return strings.TrimSpace(typed.BalanceID)
 	case model.Balance:
-		return firstNonBlank(typed.LedgerID, typed.BalanceID)
+		return strings.TrimSpace(typed.BalanceID)
 	case *model.BalanceMonitor:
 		if typed == nil {
 			return ""
@@ -611,13 +651,6 @@ func eventPartitionKey(payload interface{}) string {
 		return firstNonBlank(typed.BalanceID, typed.MonitorID)
 	case model.BalanceMonitor:
 		return firstNonBlank(typed.BalanceID, typed.MonitorID)
-	case *model.Ledger:
-		if typed == nil {
-			return ""
-		}
-		return strings.TrimSpace(typed.LedgerID)
-	case model.Ledger:
-		return strings.TrimSpace(typed.LedgerID)
 	case *model.Identity:
 		if typed == nil {
 			return ""
@@ -822,10 +855,49 @@ func firstNonBlank(candidates ...string) string {
 // updates, so the mutation and its event commit or roll back together. Callers with
 // no ledger transaction to enrol in use PublishEvent instead.
 //
+// # WHAT THE PARTITION KEY RESOLVES TO, PER EVENT TYPE
+//
+// This is the authoritative statement of the resolution, because this function is where the
+// two inputs meet: eventPartitionKey derives a key from the payload, and a ledger supplied
+// through WithEventLedgerID overrides it. Reading either input alone gives the wrong answer,
+// which is exactly how the documented table came to disagree with the code — it described the
+// derivation and not the override.
+//
+// THE RULE IS ONE SENTENCE: every event that belongs to a ledger is keyed on that ledger, and
+// requirement R-6 names the ledger as the partitioning dimension. The three event types that
+// carry no key of that kind are keyed on the aggregate they describe, which is the only
+// ordering domain they have — not a degraded fallback.
+//
+//	Event type                    Partition key                         ledger_id column
+//	───────────────────────────── ───────────────────────────────────── ──────────────────
+//	transaction.* (all seven)     the ledger, supplied by the producer  the same ledger
+//	                              from the loaded source balance,
+//	                              falling back to the destination's
+//	bulk_transaction.<status>     the BATCH id                          SQL NULL
+//	balance.created               the ledger                            the same ledger
+//	balance.monitor               the ledger of the balance whose       the same ledger
+//	                              update met the condition
+//	identity.created              the IDENTITY id                       SQL NULL
+//	ledger.created                the ledger id                         the same ledger
+//	system.error                  the EVENT TYPE, so the whole error    SQL NULL
+//	                              stream is one partition
+//
+// Why those three carry no ledger, in one line each: a bulk batch may name transactions whose
+// balances sit in DIFFERENT ledgers, so "the ledger of this batch" is not a value that exists;
+// model.Identity has no ledger field because the same party may hold balances in many ledgers
+// or none; and system.error has no aggregate of any kind. See transaction_bulk.go, identity.go
+// and the fallback chain below respectively.
+//
+// The table is mirrored in docs/event-streaming.md and pinned against the real function by
+// TestPartitionKeyContract_MatchesTheDocumentedTable, which drives every row through this
+// function rather than restating its logic — so the three statements cannot drift again.
+//
 // Parameters:
 //   - ctx context.Context: the context for the operation, used for tracing only.
 //   - event NewWebhook: the event name and payload object, passed through unchanged
 //     from the producer call site.
+//   - options ...EventOption: facts the payload cannot yield. WithEventLedgerID is the only
+//     one, and it sets BOTH the ledger_id column and the partition key; see the table above.
 //
 // Returns:
 //   - *model.EventOutbox: the row to persist, or nil when publishing is unconfigured.
@@ -851,6 +923,10 @@ type eventAttributes struct {
 	// ledgerID is the ledger the mutation belonged to, as supplied by the caller.
 	// Empty means "not supplied", which sends the derivation on to the payload.
 	ledgerID string
+	// identity is a caller-supplied stable identity for the event, used to DERIVE its
+	// id. Empty means "not supplied", which sends the decision on to
+	// model.EventIdentityFor. See WithEventIdentity.
+	identity string
 }
 
 // WithEventLedgerID supplies THE LEDGER THE MUTATION BELONGED TO.
@@ -868,24 +944,37 @@ type eventAttributes struct {
 // execution has already loaded the source and destination balances, each of which carries
 // LedgerID, and the balance and ledger post-action hooks hold the entity itself.
 //
-// # It becomes the PARTITION KEY as well as the recorded ledger, and what that costs
+// # It becomes the PARTITION KEY as well as the recorded ledger, and that IS the contract
 //
-// Requirement R-6 partitions by ledger id, and eventPartitionKey already keys by the ledger
-// for every payload that yields one — a ledger event by its own id, a balance event by its
-// ledger. A caller supplying the ledger is supplying exactly what the payload could not, so
-// it takes the same precedence; doing otherwise would make one rule apply to balances and a
-// different one to transactions.
+// Requirement R-6 partitions by ledger id. eventPartitionKey already keys by the ledger for
+// every payload that yields one — a ledger event by its own id, a balance event by its
+// ledger — and a caller supplying the ledger is supplying exactly what the payload could
+// not, so it takes the same precedence. Doing otherwise would make one rule apply to
+// balances and a different one to transactions, which is precisely the divergence between
+// the published contract and the wire key that this documentation now rules out.
 //
-// THE CONSEQUENCE IS EXPLICIT, not a side effect: every event of one ledger then lands on
-// ONE partition. That is the strongest ordering guarantee available and it is what R-6 asks
+// THE CONSEQUENCE IS EXPLICIT, not a side effect: every event of one ledger lands on ONE
+// partition. That is the strongest ordering guarantee available and it is what R-6 asks
 // for, and it also means a deployment whose volume is concentrated in a single ledger reads
-// that topic through a single partition however many the topic has. Omitting the option
-// leaves a transaction event keyed on its source balance, which matches what the
-// transaction queue already shards on (hashBalanceID(transaction.Source) in queue.go),
-// spreads load across partitions, and preserves per-BALANCE rather than per-LEDGER
-// ordering — strictly weaker for the ledger, strictly better for parallelism. Neither is
-// wrong; the choice belongs to whoever wires the call site, which is why this is an option
-// and not a derivation.
+// that topic through a single partition however many the topic has.
+//
+// AND IT IS THE DELIVERED BEHAVIOUR, not merely an available one, which is why the
+// subscriber-facing documentation states ledger keying as the RULE. Every ledger-scoped
+// producer supplies the option: postTransactionActions and prepareTransactionEventOutbox for
+// the status-derived transaction events, postLedgerActions and CreateLedger for
+// ledger.created, postBalanceActions and CreateBalance for balance.created, and
+// checkBalanceMonitors for balance.monitor. RejectTransaction is the one production site that
+// deliberately does not, because a rejected transaction never loaded its balances and no
+// ledger is known.
+//
+// Omitting the option leaves a transaction event keyed on its source balance, which matches
+// what the transaction queue already shards on (hashBalanceID(transaction.Source) in
+// queue.go), spreads load across partitions, and preserves per-BALANCE rather than
+// per-LEDGER ordering — strictly weaker for the ledger, strictly better for parallelism.
+// Neither is wrong; the choice belongs to whoever wires the call site, which is why this is
+// an option and not a derivation. But a NEW ledger-scoped producer that omits it changes what
+// docs/event-streaming.md promises, so add it there too rather than silently widening the
+// fallback.
 //
 // A blank or whitespace-only value is IGNORED rather than stored, because a whitespace key
 // hashes to a different partition from an empty one and would split one ledger's events
@@ -900,6 +989,57 @@ func WithEventLedgerID(ledgerID string) EventOption {
 	return func(attributes *eventAttributes) {
 		if trimmed := strings.TrimSpace(ledgerID); trimmed != "" {
 			attributes.ledgerID = trimmed
+		}
+	}
+}
+
+// WithEventIdentity supplies A STABLE IDENTITY THE PAYLOAD CANNOT YIELD, so the event's
+// id is derived rather than random.
+//
+// # Why an option rather than a rule in the derivation table
+//
+// model.EventIdentityFor decides derivability from the event type and its payload alone,
+// and for two event types it correctly answers "no". balance.monitor is one of them: a
+// monitor fires every time its condition is met, so deriving from the monitor id would
+// collapse every firing after the first into a duplicate the unique index rejects, and
+// the alerts would silently stop. That answer is right for everything the payload knows.
+//
+// A CALLER can know more. The balance-monitor handoff mints an id per balance movement,
+// so the pair (handoff, monitor) names exactly one alert — distinct across firings
+// because each firing has its own handoff, and stable across re-evaluations of one
+// handoff because the handoff id does not change. That is a genuine identity, and it is
+// only available at the call site. Hard-coding it into the table would require the table
+// to know about handoffs; supplying it here does not.
+//
+// # What it buys: duplicate suppression by the schema instead of by a lock
+//
+// A claim lease can lapse and let two processors evaluate one handoff, and a retry can
+// re-run one whose commit was acknowledged too late. With a derived id both produce the
+// SAME event_id, so the second insert collides with the unique index and the repository
+// reports the existing row as success. The duplicate is absorbed structurally, which also
+// covers a restart and a replay — none of which a lease would catch.
+//
+// # It takes precedence, and the precedence is the point
+//
+// A supplied identity wins over model.EventIdentityFor, including over its refusal to
+// derive. That is the whole purpose: the caller is asserting an identity the payload
+// could not express. It cannot make a derivable event LESS derivable, because a
+// supplied identity is still an identity.
+//
+// A blank or whitespace-only value is IGNORED rather than used, so a caller that
+// computes an identity conditionally and comes up empty falls back to the payload rule
+// instead of deriving every such event from the same empty string — which would give
+// them all one id and suppress all but the first.
+//
+// Parameters:
+//   - identity string: the stable identity of this logical event.
+//
+// Returns:
+//   - EventOption: applied by PrepareEventOutbox and the PublishEvent family.
+func WithEventIdentity(identity string) EventOption {
+	return func(attributes *eventAttributes) {
+		if trimmed := strings.TrimSpace(identity); trimmed != "" {
+			attributes.identity = trimmed
 		}
 	}
 }
@@ -941,7 +1081,7 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 	// re-keyed.
 	payloadBytes, err := json.Marshal(event)
 	if err != nil {
-		logrus.WithError(err).WithField("event_type", event.Event).
+		withLoggableCause(logrus.WithField("event_type", event.Event), err).
 			Error("event not captured: its payload could not be marshaled")
 		span.RecordError(err)
 
@@ -955,9 +1095,13 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 	eventType := strings.TrimSpace(event.Event)
 	aggregateID := eventAggregateID(event.Payload)
 
-	// TWO DIFFERENT VALUES, resolved from two different functions, stored in two
-	// different columns. Conflating them is the defect this split exists to fix; see
-	// eventPartitionKey and eventLedgerID.
+	// TWO COLUMNS, ONE RULE. The key is the ledger wherever a ledger is known — that is
+	// requirement R-6 and eventPartitionKey applies it before any per-type fallback — so
+	// these two agree by construction for every ledger-bearing event. They are resolved
+	// by two functions and stored in two columns because they diverge on the FALLBACK: an
+	// event with no ledger still needs a stable key, while its ledger column must stay
+	// NULL rather than hold a balance, identity or batch id. Conflating them is the defect
+	// this split exists to fix; see eventPartitionKey and eventLedgerID.
 	partitionKey := eventPartitionKey(event.Payload)
 	ledgerID := eventLedgerID(event.Payload)
 
@@ -967,7 +1111,8 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 	// it is the R-6 partitioning dimension, so it takes the same precedence for the
 	// key that a ledger derived FROM the payload already takes: see WithEventLedgerID
 	// for the ordering-versus-parallelism trade this makes explicit.
-	if supplied := applyEventOptions(options).ledgerID; supplied != "" {
+	attributes := applyEventOptions(options)
+	if supplied := attributes.ledgerID; supplied != "" {
 		ledgerID = supplied
 		partitionKey = supplied
 	}
@@ -1017,8 +1162,16 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 	// condition is met, and system.error is emitted per occurrence, so deriving either
 	// would collapse every later occurrence into a duplicate the index rejects and the
 	// pipeline would stop delivering them with no error anywhere.
+	//
+	// A CALLER MAY SUPPLY AN IDENTITY THE PAYLOAD CANNOT EXPRESS, and it takes
+	// precedence — including over the refusal above. That is how balance.monitor becomes
+	// derivable once the handoff exists: the pair (handoff, monitor) names one alert,
+	// distinct across firings and stable across re-evaluations of one handoff. See
+	// WithEventIdentity for why this belongs at the call site rather than in the table.
 	eventID := model.NewEventID()
-	if identity, derivable := model.EventIdentityFor(eventType, event.Payload); derivable {
+	if attributes.identity != "" {
+		eventID = model.DeriveEventID(attributes.identity, eventType, model.SchemaVersionV1)
+	} else if identity, derivable := model.EventIdentityFor(eventType, event.Payload); derivable {
 		eventID = model.DeriveEventID(identity, eventType, model.SchemaVersionV1)
 	}
 
@@ -1029,8 +1182,17 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 		PartitionKey: partitionKey,
 		LedgerID:     ledgerID,
 		// Resolved once, at construction, and stored on the row. The relay never
-		// re-derives it, so a row stays replayable to its ORIGINAL destination even
-		// if KAFKA_TOPIC_PREFIX changes afterwards.
+		// re-derives it, so a row stays bound to its ORIGINAL destination even if
+		// KAFKA_TOPIC_PREFIX changes afterwards.
+		//
+		// STAYING BOUND IS NOT THE SAME AS STAYING PUBLISHABLE, and the difference is
+		// one variable. The publisher refuses a topic outside the namespaces the
+		// deployment declares, so after a rename these rows are publishable only while
+		// the previous prefix is listed in KAFKA_HISTORICAL_TOPIC_PREFIXES. Without it
+		// they are stranded: safe in the table, refused by the transport, and their
+		// dead-letter writes and replays refused with them. AuditStrandedTopicPrefixes
+		// is what makes that state visible, and cmd/server.go reports each finding at
+		// start-up naming the prefix to declare.
 		Topic:         TopicForEvent(eventType),
 		SchemaVersion: model.SchemaVersionV1,
 		Payload:       payloadBytes,
@@ -1064,10 +1226,10 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 	// transient condition, and the caller must see it.
 	canonical, err := outbox.CanonicalEvent().CanonicalBytes()
 	if err != nil {
-		logrus.WithError(err).WithFields(logrus.Fields{
+		withLoggableCause(logrus.WithFields(logrus.Fields{
 			"event_id":   outbox.EventID,
 			"event_type": outbox.EventType,
-		}).Error("event not captured: its canonical envelope could not be composed")
+		}), err).Error("event not captured: its canonical envelope could not be composed")
 		span.RecordError(err)
 
 		return nil, apierror.NewAPIError(
@@ -1077,6 +1239,26 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 		)
 	}
 	outbox.EventRaw = canonical
+
+	// THE TRACE THAT CAPTURED THIS EVENT IS WRITTEN ONTO THE ROW.
+	//
+	// This is the only moment at which it can be. The capture and the publish are decoupled by
+	// design — the caller's transaction commits and returns, and the relay claims the row up to
+	// a poll interval later, possibly in another process — so there is no in-memory context to
+	// hand over and no way to recover the trace afterwards from anything but the row itself.
+	// Without this, every request and database trace ENDED at the outbox insert and publishing,
+	// retrying, dead-lettering and replaying one event each produced spans in unrelated traces.
+	//
+	// It is captured DELIBERATELY OUTSIDE the canonical envelope, after EventRaw is composed.
+	// The envelope is the subscriber-facing contract and the basis of the byte-equality
+	// guarantees (V-8 and V-9): adding a member that varies per request would change the stored
+	// bytes for every event and break both. The trace travels on its own columns and reaches
+	// subscribers as Kafka record HEADERS instead, which is where the OpenTelemetry messaging
+	// conventions put it and which leaves the message body untouched.
+	//
+	// captureTraceContext yields empty strings when nothing is being traced, which is a
+	// legitimate and common state rather than a fault.
+	outbox.Traceparent, outbox.Tracestate = captureTraceContext(ctx)
 
 	// AN UNCATALOGUED EVENT TYPE IS A DEFECT SIGNAL, and this is where it is raised.
 	//
@@ -1148,6 +1330,81 @@ func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...Ev
 	return l.publishEvent(ctx, nil, singleEventCaptureAttempt, event, options...)
 }
 
+// PostCommitEventCaptureContract is the SINGLE place the post-commit producers are described,
+// and it exists because the alternative was three files each claiming to hold the only one.
+//
+// # What requirement R-2 actually binds
+//
+// R-2 requires an event to be written to the outbox INSIDE THE SAME DATABASE TRANSACTION AS THE
+// LEDGER MUTATION THAT PRODUCED IT. Read the antecedent: the guarantee attaches an event to the
+// transaction of its producing mutation. Every event produced BY a ledger mutation is captured
+// that way, with no exceptions — the three entity creations through their repositories'
+// EventPreparer, and every transaction lifecycle event inside the transaction that records the
+// transaction and moves the balances.
+//
+// # The three producers that have NO producing mutation
+//
+// Three event types are produced by an OBSERVATION OVER STATE THAT IS ALREADY COMMITTED rather
+// than by a mutation. For them R-2's antecedent does not hold: there is no open transaction at
+// the moment the event comes into existence, so there is nothing for it to be atomic WITH.
+//
+//	balance.monitor            A monitor's condition is met by a balance that some other
+//	                           transaction has already committed. The condition is evaluated
+//	                           after that commit, by design, and the alert exists only once it
+//	                           has been evaluated.
+//	bulk_transaction.<status>  A batch summary. Every transaction the batch describes has
+//	                           already committed under its own transaction; a bulk request is
+//	                           executed one transaction at a time, with compensating void or
+//	                           refund as its rollback, so there is no batch-spanning transaction
+//	                           at all. The per-transaction events ARE atomic; this one adds the
+//	                           summary, which belongs to no single mutation.
+//	system.error               An internal-error notification. It describes a fault in the
+//	                           process, not a change to the ledger, so it has no mutation of any
+//	                           kind. It is the one of the three that does NOT retry its insert;
+//	                           see the entry-point list below for why.
+//
+// THIS IS NOT A LIST OF EXCEPTIONS TO R-2, and describing it as one was wrong in two ways at
+// once. It named the wrong number — balance.monitor and the bulk summary were each documented,
+// separately, as "the one exception", two claims that cannot both hold — and it named the wrong
+// thing, because an event with no producing transaction is outside R-2's scope rather than a
+// carve-out from it. Any wording that presents this as one lone carve-out from R-2 is stale.
+//
+// # What these three DO guarantee, and the window that remains
+//
+// The two that describe LEDGER STATE are captured through a bounded, retried insert of the SAME
+// prepared row — PublishEventDurably here for balance.monitor, and the equivalent loop in
+// sendBulkTransactionWebhook for the batch summary. Retrying the same prepared row is what makes
+// the retry idempotent rather than duplicating: an identical stored row is adopted as success by
+// the repository instead of being inserted again under a second id.
+//
+// Once captured, the event is indistinguishable from any other: the same relay, the same bounded
+// retry, the same dead-lettering, the same replay, the same metrics.
+//
+// The window that CANNOT be closed here is the one between the mutation's commit and a successful
+// insert. The mutation is durable before the first attempt, so no number of attempts closes it: a
+// process that dies inside that window loses the event, and there is nothing to replay because no
+// row was ever written. That is AT-MOST-ONCE behaviour for these three event types, stated plainly
+// rather than implied, and it is escalated rather than silent — an exhausted budget is logged at
+// error level with the event id and raised through notification.NotifyError, on both the monitor
+// and the bulk path.
+//
+// # Why the window is not closed, and what closing it would take
+//
+// It is not a coding oversight. Closing it for balance.monitor requires evaluating monitor
+// conditions INSIDE the balance mutation's transaction, and monitor condition evaluation is
+// explicitly excluded from modification by this change's plan (AAP §0.6.2, and §0.4.1 which
+// scopes the balance.go edit to substituting the transport with "monitor condition evaluation is
+// untouched"). Closing it for the bulk summary requires a batch-spanning transaction, which means
+// restructuring the transaction-processing pipeline that the same section freezes. Both are
+// contract-level changes for whoever owns that plan, not decisions this file may take.
+//
+// docs/event-streaming.md states the same three in subscriber-facing terms. If you change this
+// set, change that section in the same commit.
+//
+// It is a documentation anchor and deliberately carries no behaviour: a const so that a reader
+// grepping for the contract lands on prose rather than on one of the three call sites.
+const PostCommitEventCaptureContract = "balance.monitor, bulk_transaction.<status>, system.error"
+
 // PublishEventDurably captures a domain event on the standalone path and RETRIES a
 // transient persistence failure, for the producers whose mutation is already committed
 // by the time the event exists.
@@ -1167,9 +1424,25 @@ func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...Ev
 // The mutation is durable before the first attempt, so the window between the commit and
 // a successful insert cannot be closed by any number of attempts; a process that dies in
 // that window still loses the event. What retrying removes is the far more likely failure:
-// a transient database fault. The residual at-most-once behaviour is documented as an
-// explicit, narrow exception to requirement R-2 in docs/event-streaming.md, rather than
-// left for an operator to discover.
+// a transient database fault.
+//
+// # This is no longer the primary path for either event that used it
+//
+// Both events that were captured this way now have a durable intent written INSIDE a
+// transaction, which is what closes the crash window this method cannot:
+//
+//   - `balance.monitor` is captured by BalanceMonitorHandoffProcessor, from a handoff row
+//     written inside the balance's own transaction. checkBalanceMonitors — the caller
+//     below — is reached only on a deployment with NO Kafka broker, where there is no
+//     handoff processor and the alert goes straight down the legacy webhook transport.
+//   - `bulk_transaction.<status>` is captured by finalizeBulkBatchOutcome, in one
+//     transaction with the batch coordinator's terminal transition. It falls back to this
+//     method when the coordinator row is absent, which is where the retry budget below
+//     still earns its place.
+//
+// So the residual at-most-once behaviour is now confined to two narrow, named shapes — a
+// broker-less deployment and a batch whose coordinator write failed — rather than being the
+// standing behaviour of two event families. docs/event-streaming.md states which.
 //
 // # Why the row is prepared once and the INSERT is what retries
 //
@@ -1184,14 +1457,50 @@ func (l *Blnk) PublishEvent(ctx context.Context, event NewWebhook, options ...Ev
 // repository recognises an identical stored row and reports success (see
 // resolveDuplicateEventOutboxInsert).
 //
-// # Which producers use this, and which deliberately do not
+// # THE THREE CALLERS OF THIS METHOD, and why system.error is not one of them
 //
-//   - `balance.monitor` uses it. A monitor fires because a condition was met on a balance
-//     another transaction already committed, so it has no mutation of its own to enrol in.
-//   - `bulk_transaction.<status>` has its own equivalent loop in sendBulkTransactionWebhook,
-//     which additionally carries batch context in its log fields; it is left as it is.
-//   - Every producer whose event IS captured inside its mutation's transaction keeps
-//     PublishEvent, because for them a failed insert correctly fails the mutation.
+// TWO SETS OF THREE live in this area and they are NOT the same three. Conflating them is how
+// the repository came to carry two different, equally confident claims about which producer the
+// third member is. Both sets are stated here, and each is declared in exactly one place.
+//
+// SET A — the standalone capture SITES, which is what this method serves. Three producers hold
+// a mutation that has already committed and no open transaction, so each spends this bounded
+// budget on its insert. The set is declared once as postCommitCaptureSites in
+// event_producer_atomicity_test.go, which pins each site's budgeted call by source text:
+//
+//  1. `balance.monitor` — checkBalanceMonitors in balance.go, through this method. Reached only
+//     on a deployment with no broker; with one configured the alert is captured inside the
+//     balance's own transaction — evaluated before the write, or through the durable handoff —
+//     and that site returns early.
+//  2. `bulk_transaction.<status>` — sendBulkTransactionWebhook in transaction_bulk.go, which
+//     spends the same budget through its own equivalent loop so that it can additionally
+//     carry batch context in its log fields. Reached only when the batch coordinator row is
+//     absent; normally the summary commits with the coordinator's terminal transition.
+//  3. The status-derived `transaction.*` events of a COALESCED batch — postTransactionActions in
+//     transaction_execution.go, through this method. The coalescing writer is driven from
+//     transaction_coalescing.go, which AAP §0.6.2 freezes, so its caller cannot thread event
+//     rows into it.
+//
+// SET B — the AT-MOST-ONCE EVENT TYPES, which is what a SUBSCRIBER has to plan for. Declared
+// once as PostCommitEventCaptureContract: `balance.monitor`, `bulk_transaction.<status>` and
+// `system.error`. docs/event-streaming.md publishes the same three.
+//
+// The two sets differ on their third member, in both directions, and each difference is a fact
+// rather than an inconsistency:
+//
+//   - `system.error` is in SET B and NOT in SET A. It describes no mutation at all, so there is
+//     no ledger state behind it that a retry would protect, and it captures through PublishEvent
+//     in a single attempt.
+//   - The coalesced batch's `transaction.*` events are in SET A and NOT in SET B. The batch
+//     writer now DERIVES those rows from the registered capture and inserts them inside its own
+//     transaction (see resolveBatchEventOutboxes), so they are atomic after all. The post-commit
+//     copy above still runs, and the derived event id means the repository recognises the
+//     identical stored row and reports success, so it is suppressed rather than duplicating.
+//
+// Every OTHER producer keeps PublishEvent, because its event IS captured inside its
+// mutation's transaction and there a failed insert correctly fails the mutation: the three
+// entity creations through their repository writers, and the single-transaction and
+// rejection paths through theirs.
 //
 // Parameters:
 //   - ctx context.Context: the context for the operation. Cancellation is honoured
@@ -1276,6 +1585,44 @@ func (l *Blnk) PublishEventInTx(ctx context.Context, tx *sql.Tx, event NewWebhoo
 // The delegate delivers ONLY when tx is nil. An enqueue cannot be rolled back with the
 // caller's transaction, so on the in-transaction path this deployment captures nothing and
 // delivers nothing, and the caller's post-commit path delivers instead.
+//
+// # WHICH CAPTURES HAVE NO OPEN TRANSACTION TO JOIN, exhaustively
+//
+// Requirement R-2 puts the event row inside the same database transaction as the ledger
+// mutation that produced it, and PublishEventInTx is how nearly every producer does that.
+// The STANDALONE path — tx nil — exists for the captures that have no open transaction to
+// join. There are exactly FOUR, and the fourth is the one most easily missed:
+//
+//  1. balance.monitor. The alert fires because a condition was met on a balance some other
+//     transaction has ALREADY committed. Reached only on a broker-less deployment, where the
+//     alert is delivered over the legacy transport rather than captured at all; with a broker
+//     configured the alert commits inside the balance's own transaction and
+//     checkBalanceMonitors returns early.
+//  2. The COALESCED transaction batch. Its persistence writer is driven from
+//     transaction_coalescing.go, which AAP §0.6.2 freezes, so its caller cannot thread event
+//     rows into it. postTransactionActions captures them here instead — durably, and normally
+//     redundantly, because the batch writer derives the same rows under its own transaction
+//     and the derived event id makes this copy a recognised duplicate rather than a second
+//     event.
+//  3. The bulk batch SUMMARY, bulk_transaction.<status>. A bulk request executes one
+//     transaction at a time with compensating void or refund as its rollback, so by the
+//     moment the outcome is known every mutation it describes has already committed under
+//     its own transaction: there is no row the summary could be atomic with. The
+//     per-transaction events inside the batch ARE atomic — only the summary is not, and only
+//     when the batch coordinator row is absent.
+//  4. system.error. It describes no mutation of any kind — it reports that something failed —
+//     so there has never been a transaction it could have joined. It is the only one of the
+//     four that makes a single attempt rather than spending a retry budget.
+//
+// WHICH OF THOSE CAN ACTUALLY LOSE AN EVENT is a different question with a different answer,
+// and PostCommitEventCaptureContract declares that set once. Nothing here may be described as
+// the only capture that can lose an event: three of the four can, and each was separately
+// documented as the lone case before this was written down.
+//
+// Everything else — every single-transaction status event, ledger.created, balance.created,
+// identity.created — reaches this function with tx non-nil and commits with its mutation.
+// A standalone capture of a mutation-derived event outside those four is a defect, not a
+// convenience: it converts an exactly-once write into a post-commit window.
 //
 // # The capture budget applies to the STANDALONE insert only
 //
@@ -1388,7 +1735,9 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, captureAttempts int
 			"event_id":   outbox.EventID,
 			"event_type": outbox.EventType,
 			"topic":      outbox.Topic,
-		}).WithError(err).Error("event not captured: publishing is configured but this Blnk instance has no datasource")
+		}).
+			WithField("cause", loggableCause(err)).
+			Error("event not captured: publishing is configured but this Blnk instance has no datasource")
 		span.RecordError(err)
 
 		return err
@@ -1399,11 +1748,23 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, captureAttempts int
 		// mutation or not at all.
 		err = l.datasource.InsertEventOutboxInTx(ctx, tx, outbox)
 	} else {
-		// No accompanying ledger mutation — ledger.created, identity.created,
-		// balance.created, balance.monitor, bulk_transaction.<status> and
-		// system.error all arrive here. They still belong in the outbox so they get
-		// the same durable retry, dead-letter and replay treatment as every other
-		// event; there is simply no wider transaction to enrol them in.
+		// No transaction was offered. Three kinds of caller arrive here, and they are
+		// not equivalent:
+		//
+		//   - A POST-COMMIT capture, whose mutation is already durable and whose
+		//     insert is therefore the event's only chance: balance.monitor,
+		//     bulk_transaction.<status> and a coalesced batch's transaction.* events.
+		//     These are the three documented exceptions to requirement R-2; see
+		//     PublishEventDurably, which is the budget they use.
+		//   - system.error, which describes no mutation at all, so there is nothing it
+		//     could have been atomic with.
+		//   - ledger.created, identity.created and balance.created ON A DEPLOYMENT WITH
+		//     NO PREPARER, i.e. one whose repository writer was given no event row.
+		//     Where a preparer exists these are captured inside the creation
+		//     transaction and never reach this branch.
+		//
+		// All of them still belong in the outbox, so they get the same relay retry,
+		// dead-letter and replay treatment as every other event once the row is in.
 		//
 		// The budget is what distinguishes a caller that can still fail its own
 		// operation from one whose mutation is already committed; see
@@ -1428,7 +1789,9 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, captureAttempts int
 			"topic":             outbox.Topic,
 			"aggregate_id_hash": hashLogIdentifier(outbox.AggregateID),
 			"in_transaction":    tx != nil,
-		}).WithError(err).Error("failed to record event in the outbox")
+		}).
+			WithField("cause", loggableCause(err)).
+			Error("failed to record event in the outbox")
 		span.RecordError(err)
 
 		return err
@@ -1451,8 +1814,8 @@ func (l *Blnk) publishEvent(ctx context.Context, tx *sql.Tx, captureAttempts int
 // standaloneEventCaptureAttempts is for the caller whose mutation is already durable, where
 // the insert is the event's only chance. Three attempts at 200ms then 400ms is DELIBERATELY
 // the same budget sendBulkTransactionWebhook already spends on the same kind of work
-// (bulkOutcomeCaptureAttempts), so the two standalone producers behave alike rather than
-// each inventing a schedule. It is not trying to be the relay's budget: this is one indexed
+// (bulkOutcomeCaptureAttempts), so all THREE post-commit captures enumerated on
+// PublishEventDurably behave alike rather than each inventing a schedule. It is not trying to be the relay's budget: this is one indexed
 // INSERT against the local database, retried to survive a momentary connection reset or a
 // brief pool exhaustion. A budget large enough to ride out a real outage would hold a
 // post-commit goroutine open for minutes without improving the outcome, because a database
@@ -1534,7 +1897,8 @@ func (l *Blnk) insertEventOutboxWithRetry(ctx context.Context, outbox *model.Eve
 		// asked, so stopping early is the correct behaviour rather than a shortfall.
 		if !standaloneEventCaptureRetryable(lastErr) {
 			if attempt < attempts {
-				logrus.WithError(lastErr).WithFields(eventCaptureLogFields(outbox, attempt, attempts)).Error(
+				withLoggableCause(
+					logrus.WithFields(eventCaptureLogFields(outbox, attempt, attempts)), lastErr).Error(
 					"the event could not be recorded in the outbox and the failure is not " +
 						"retryable; the remaining attempts are not spent",
 				)
@@ -1549,13 +1913,15 @@ func (l *Blnk) insertEventOutboxWithRetry(ctx context.Context, outbox *model.Eve
 			break
 		}
 
-		logrus.WithError(lastErr).WithFields(eventCaptureLogFields(outbox, attempt, attempts)).Warn(
+		withLoggableCause(
+			logrus.WithFields(eventCaptureLogFields(outbox, attempt, attempts)), lastErr).Warn(
 			"failed to record the event in the outbox; retrying",
 		)
 
 		select {
 		case <-ctx.Done():
-			logrus.WithError(lastErr).WithFields(eventCaptureLogFields(outbox, attempt, attempts)).Error(
+			withLoggableCause(
+				logrus.WithFields(eventCaptureLogFields(outbox, attempt, attempts)), lastErr).Error(
 				"the event was not recorded in the outbox and the context was cancelled before " +
 					"the retry budget was spent; the mutation it describes is committed",
 			)
@@ -1775,7 +2141,9 @@ func (l *Blnk) deliverLegacyWebhookOnly(ctx context.Context, tx *sql.Tx, event N
 		logrus.WithFields(logrus.Fields{
 			"event_type":  event.Event,
 			"legacy_only": true,
-		}).WithError(err).Error("event not delivered: the legacy webhook transport has no queue client")
+		}).
+			WithField("cause", loggableCause(err)).
+			Error("event not delivered: the legacy webhook transport has no queue client")
 		span.RecordError(err)
 
 		return err
@@ -1788,7 +2156,9 @@ func (l *Blnk) deliverLegacyWebhookOnly(ctx context.Context, tx *sql.Tx, event N
 		logrus.WithFields(logrus.Fields{
 			"event_type":  event.Event,
 			"legacy_only": true,
-		}).WithError(err).Error("failed to enqueue the legacy webhook delivery")
+		}).
+			WithField("cause", loggableCause(err)).
+			Error("failed to enqueue the legacy webhook delivery")
 		span.RecordError(err)
 
 		return err

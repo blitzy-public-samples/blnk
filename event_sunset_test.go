@@ -330,8 +330,14 @@ func TestWebhookSunsetPassed_MalformedDateWarnsThroughThePublicPath(t *testing.T
 		"the warning must name the offending value")
 	assert.Equal(t, webhookSunsetLayout, warning.Data["expected"],
 		"the warning must name the layout the value failed to match")
-	assert.NotNil(t, warning.Data[logrus.ErrorKey],
-		"the warning must carry the parse error itself")
+	// The parse error travels in "cause" rather than logrus's own "error" key, because
+	// every dependency error in this package is logged through withLoggableCause: it
+	// sanitizes and bounds the text and redacts network topology, and it attaches the
+	// verbatim rendering only when the logger is at debug. WithError does none of that.
+	assert.NotEmpty(t, warning.Data["cause"],
+		"the warning must carry the parse error itself, through the sanitized cause field")
+	assert.Nil(t, warning.Data[logrus.ErrorKey],
+		"logrus's raw error field is what rendered a dependency error verbatim; it must not return")
 	// The consequence, which is what an operator acts on. With no Kafka broker
 	// configured there is no dual-delivery window to end, so the stated consequence is
 	// that the deprecated routes keep answering. The Kafka-configured case states the
@@ -537,6 +543,87 @@ func TestWebhookSunsetDate_UnsetDateIsNotConfigured(t *testing.T) {
 
 	assert.False(t, configured)
 	assert.True(t, date.IsZero())
+}
+
+// TestWebhookSunsetSnapshotAt_AnswersBothQuestionsFromOneResolution is C-14.
+//
+// # The defect
+//
+// The HTTP guard needs two things — a Sunset header advertising the date, and a verdict
+// deciding whether to answer 410 — and it obtained them from two independent calls,
+// WebhookSunsetDate then WebhookSunsetPassed. Each re-reads the live configuration store,
+// which is replaced wholesale on reload, so a reload landing between them produced a single
+// response advertising date A while refusing under date B. A client reading the header was
+// told it had until A by the very response that had already applied B.
+//
+// The window is narrow, which is exactly why it must be closed structurally: it cannot be
+// reproduced on demand and would never be observed by watching for it.
+func TestWebhookSunsetSnapshotAt_AnswersBothQuestionsFromOneResolution(t *testing.T) {
+	const raw = "2026-06-15T12:30:45Z"
+	sunset := mustParseSunset(t, raw)
+	storeSunsetDate(t, raw)
+
+	t.Run("the date and the verdict describe the same instant", func(t *testing.T) {
+		before := WebhookSunsetSnapshotAt(sunset.Add(-time.Nanosecond))
+		require.True(t, before.DateConfigured)
+		assert.True(t, sunset.Equal(before.Date), "the resolved instant is reported as itself")
+		assert.False(t, before.Passed, "one nanosecond before, the window is still open")
+
+		at := WebhookSunsetSnapshotAt(sunset)
+		assert.True(t, sunset.Equal(at.Date), "the same date")
+		assert.True(t, at.Passed,
+			"and the verdict flips AT the instant, inclusively — the same boundary "+
+				"WebhookSunsetPassed applies, because it is the same comparison")
+	})
+
+	t.Run("it agrees with the two predicates it replaces", func(t *testing.T) {
+		// The point is not that a third answer exists, but that it is the SAME answer
+		// obtained once. Any divergence here would mean the guard had begun deciding on a
+		// rule of its own.
+		for _, probe := range []time.Time{
+			sunset.Add(-time.Hour), sunset.Add(-time.Nanosecond), sunset, sunset.Add(time.Hour),
+		} {
+			snapshot := WebhookSunsetSnapshotAt(probe)
+
+			assert.Equal(t, WebhookSunsetPassed(probe), snapshot.Passed,
+				"the verdict must be the authoritative predicate's, at %s", probe)
+
+			date, configured := WebhookSunsetDate()
+			assert.Equal(t, configured, snapshot.DateConfigured)
+			assert.True(t, date.Equal(snapshot.Date))
+		}
+	})
+
+	t.Run("an unset window is renderable-as-nothing and has not passed", func(t *testing.T) {
+		// No transport and no window: a legitimate steady state, so the routes keep
+		// answering and there is no date to advertise.
+		storeSunsetDate(t, "")
+
+		snapshot := WebhookSunsetSnapshotAt(time.Now())
+		assert.False(t, snapshot.DateConfigured, "there is no instant to render")
+		assert.True(t, snapshot.Date.IsZero())
+		assert.False(t, snapshot.Passed)
+	})
+
+	t.Run("DateConfigured is not the verdict, and the fail-closed state proves it", func(t *testing.T) {
+		// THE PAIR THAT MUST NOT BE CONFLATED. A deployment publishing to Kafka with an
+		// unusable window has NO instant to advertise and IS past the sunset, because that
+		// state fails closed. A guard that took its verdict from DateConfigured would keep
+		// the retired surface answering on exactly the deployment that had already moved.
+		restoreFetchConfiguration(t)
+		sunsetParseWarnings.reset()
+
+		fetchConfiguration = func() (*config.Configuration, error) {
+			return &config.Configuration{
+				Kafka:                        config.KafkaConfig{Brokers: []string{"broker-1:9092"}},
+				WebhookDeprecationSunsetDate: "not-a-date",
+			}, nil
+		}
+
+		snapshot := WebhookSunsetSnapshotAt(time.Now())
+		assert.False(t, snapshot.DateConfigured, "nothing renderable")
+		assert.True(t, snapshot.Passed, "and yet the sunset has passed")
+	})
 }
 
 // TestWebhookSunsetPassedNow_DelegatesToTheParameterisedPredicate confirms the
@@ -1062,8 +1149,11 @@ func TestWebhookWindowPendingObstacle_ExplainsOnlyThePendingState(t *testing.T) 
 		"the message must name when the window opens")
 	assert.Contains(t, err.Error(), sunset.Format(time.RFC3339),
 		"and when it closes, so an operator can see the span they configured")
-	assert.Contains(t, err.Error(), "WEBHOOK_DEPRECATION_START_DATE",
-		"and the variable to correct, or the message is not actionable")
+	assert.Contains(t, err.Error(), "WEBHOOK_DEPRECATION_SUNSET_DATE",
+		"and the ONE variable that moves the window, or the message is not actionable")
+	assert.NotContains(t, err.Error(), "WEBHOOK_DEPRECATION_START_DATE",
+		"the opening instant is derived and has no environment variable, so a message naming "+
+			"one sends an operator to set a key that does not exist")
 
 	for _, state := range []WebhookWindowState{
 		WebhookWindowActive, WebhookWindowClosed, WebhookWindowUnavailable,

@@ -1,0 +1,74 @@
+# Availability bounds for VOLUNTARY disruption. PERF-P20.
+#
+# A rolling update is not the only thing that removes pods. A node drain for a kernel patch,
+# a cluster autoscaler consolidating underused nodes, or `kubectl drain` during maintenance
+# will evict every pod on a node at once — and none of those consult a Deployment's
+# maxUnavailable, which governs rollouts alone. Without a budget, a single drain can take
+# every replica of a role that happens to be co-located, and the update strategies next door
+# will not have prevented it.
+#
+# These three budgets are what the eviction API consults. They constrain only VOLUNTARY
+# disruption: a node that fails outright, an OOM kill or a crash is involuntary and no budget
+# can stop it, which is why they are an availability floor for planned work rather than a
+# reliability guarantee.
+#
+# maxUnavailable rather than minAvailable throughout, and deliberately: the server and worker
+# are autoscaled between 2 and 10 replicas, so a fixed minAvailable would either be too weak
+# at 10 replicas or block every drain at 2. maxUnavailable: 1 means the same thing at every
+# position the autoscaler can reach — one at a time, whatever the count.
+#
+# The selectors MUST match the workloads' pod labels exactly. A budget whose selector matches
+# nothing is not an error: it is admitted, reports zero expected pods, and protects nothing.
+# Verify with `kubectl -n blnk get pdb` and check that ALLOWED DISRUPTIONS and EXPECTED PODS
+# are populated rather than 0 and 0.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    io.kompose.service: server
+  name: server
+  namespace: blnk
+spec:
+  # The ledger's only HTTP surface. One replica out at a time, matching the rollout's
+  # maxSurge, so a drain cannot do what the rollout was configured never to do.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      io.kompose.service: server
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    io.kompose.service: worker
+  name: worker
+  namespace: blnk
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      io.kompose.service: worker
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    io.kompose.service: kafka
+  name: kafka
+  namespace: blnk
+spec:
+  # THE MOST CONSEQUENTIAL OF THE THREE, and the one whose absence is least survivable.
+  # kafka-statefulset.yaml runs three brokers as three KRaft voters with
+  # min.insync.replicas=2, so losing TWO brokers simultaneously does two things at once: the
+  # controller quorum loses its majority and can elect no leader, and every partition falls
+  # below its in-sync minimum so every produce with acks=all is rejected. The relay then
+  # cannot publish, cannot dead-letter, and retries until the cluster returns.
+  #
+  # One at a time is therefore not a preference, it is the cluster's tolerance. A drain that
+  # would take a second broker is blocked until the first is back and in-sync — which is
+  # exactly what the eviction API is for, since nothing else in this folder can express it:
+  # a StatefulSet's ordered replacement governs rollouts, not evictions.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      io.kompose.service: kafka

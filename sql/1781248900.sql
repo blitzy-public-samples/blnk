@@ -59,10 +59,19 @@
 -- that belief would be granting a shared topic to parties who must not see one
 -- another's data, and the registry would look correct while they did it.
 --
--- SO THE COLUMN FAILS CLOSED RATHER THAN DESCRIBING ITSELF AS ADVISORY: a row
--- carrying a non-empty partition_key_prefix records an authorization narrower than
--- any credential Blnk can mint, and credential issuance REFUSES for that row. The
--- column's own declaration below states it again at the point of use.
+-- SO THE COLUMN IS STATED RATHER THAN DESCRIBING ITSELF AS ADVISORY. A row carrying
+-- a non-empty partition_key_prefix records a narrowing NO credential Blnk can mint
+-- will apply, so the API declares it as the subscriber's own obligation: every
+-- credential response and every subscriber read carries enforced_access naming the two
+-- dimensions above, partition_key_prefix_enforced = false, the echoed prefix, and
+-- client_side_key_filtering_required = true.
+--
+-- Issuance does NOT refuse such a row, and an earlier revision that did was wrong to.
+-- Kafka can express no narrower grant, so refusing withheld the only credential that
+-- can exist for a state this table is designed to hold, permanently — a required
+-- endpoint answering 409 forever. A refusal is fail-closed only when a narrower grant
+-- exists to insist upon. The column's own declaration below states this again at the
+-- point of use.
 --
 -- REVOCATION IS ALSO PART OF THE BOUNDARY, and it is a two-step lifecycle rather
 -- than a delete. revocation_pending_at is the tombstone deregistration sets before
@@ -192,44 +201,47 @@ CREATE TABLE IF NOT EXISTS blnk.event_subscribers (
     -- them, and each of them is a thing an ACL would otherwise be granted over.
     authorized_topics     TEXT[]                    NOT NULL DEFAULT '{}',
 
-    -- A KEY-SCOPED AUTHORIZATION CONSTRAINT THAT KAFKA CANNOT ENFORCE, and
-    -- therefore a column whose non-NULL value makes the subscriber
-    -- UNPROVISIONABLE. See the boundary note above the table.
+    -- A ROUTING HINT THAT KAFKA CANNOT ENFORCE — NOT AN ACCESS BOUNDARY. See the
+    -- boundary note above the table.
+    --
+    -- READ THIS BEFORE DECIDING TENANCY FROM THIS TABLE. A value here does NOT
+    -- confine the subscriber to the records it names. Two subscribers sharing a
+    -- topic with different prefixes recorded here CAN read each other's events.
     --
     -- What a value here means: the caller has recorded that this subscriber is
-    -- authorised only for records whose key carries this prefix. Blnk keys every
+    -- interested only in records whose key carries this prefix. Blnk keys every
     -- event by ledger ID, so that is a statement about which ledgers the subscriber
-    -- may see.
+    -- intends to consume.
     --
-    -- What Kafka can do about it: NOTHING. There is no ACL that restricts a
-    -- principal to a key range or a partition subset, so a principal with Read on a
-    -- topic reads all of it. Any narrowing would have to run in the consumer, on
-    -- records the broker has already handed over, and a subscriber that ignores it
-    -- sees everything on every topic it is authorised for.
+    -- What Kafka can do about it: NOTHING. Its authorizer has five resource types —
+    -- Topic, Group, Cluster, TransactionalId and DelegationToken — and none is a
+    -- message key, so no ACL restricts a principal to a key range or a partition
+    -- subset and a principal with Read on a topic reads all of it. The narrowing can
+    -- only run in the CONSUMER, on records the broker has already handed over.
     --
-    -- So issuance FAILS CLOSED on this column. EventSubscriberService.
-    -- IssueSubscriberCredential refuses to mint a credential for a row carrying a
-    -- non-empty prefix, and names the two ways forward: clear it to accept
-    -- whole-topic access, or narrow authorized_topics, which IS enforceable. The
-    -- column previously described itself as an "advisory consumer-side filter",
-    -- which was a more dangerous framing however carefully qualified — a reader
-    -- deciding tenancy from this table would grant a shared topic believing the
-    -- prefix confined the subscriber to its own records. A qualification in a
-    -- comment does not survive that reading; a refused issuance does.
+    -- So this column is STATED, not enforced, and it is stated where a client cannot
+    -- miss it rather than in a comment. Every credential response and every
+    -- subscriber read carries enforced_access: the dimensions the broker really keeps
+    -- (topic and consumer group), partition_key_prefix_enforced = false, the echoed
+    -- prefix, and client_side_key_filtering_required = true — which is the field a
+    -- client branches on, and it says the narrowing is the subscriber's own to apply.
     --
-    -- Nullable, and the NULL carries meaning: no key constraint is recorded, which
-    -- is the only state a credential can be issued in. A reader must treat NULL as
-    -- "no constraint" and never as "constrained to the empty prefix", which would
-    -- invert the intent.
+    -- An earlier revision instead made a non-NULL value here UNPROVISIONABLE, refused
+    -- from both directions by the service and forbidden outright by a CHECK. That
+    -- withdrew a required capability for a state this table is designed to hold: a
+    -- subscriber registered with a prefix could never obtain credentials at all. Both
+    -- guards and the constraint are gone — sql/1781248930.sql drops the constraint on
+    -- databases that already created it — because a refusal is only fail-closed when a
+    -- narrower grant exists to insist upon, and here none does.
     --
-    -- ENFORCED IN THE SCHEMA TOO, by event_subscribers_key_scope_chk — which lives in
-    -- sql/1781248920.sql rather than in the CHECK block below, because that migration
-    -- was added after this file had already been applied. It forbids this column being
-    -- non-NULL at the same time as credential_reference, so "records a key scope AND
-    -- holds a credential" is unrepresentable rather than merely refused by the service.
-    -- The service refuses it from both directions — requireProvisionableKeyScope at
-    -- issuance, requireRecordableKeyScope on update — and the constraint is what also
-    -- covers a psql session, a data migration and a restored backup.
+    -- Nullable, and the NULL carries meaning: no key narrowing is recorded, so the
+    -- subscriber owns no client-side filtering obligation. A reader must treat NULL as
+    -- "no narrowing" and never as "narrowed to the empty prefix", which would invert
+    -- the intent.
+    --
+    -- NOT constrained against credential_reference. The combination "records a key
+    -- prefix AND holds a credential" is legitimate and reachable from either
+    -- direction, and the enforced_access declaration above is what keeps it honest.
     partition_key_prefix  TEXT                      NULL,
 
     -- ===================================================================

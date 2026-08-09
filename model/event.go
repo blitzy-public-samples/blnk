@@ -36,6 +36,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -101,6 +102,64 @@ const SchemaVersionV1 = 1
 // a value that will be.
 const MaxEventMessageBytes = 768 * 1024
 
+// MaxTraceparentLength and MaxTracestateLength bound the two W3C trace-context values an
+// outbox row may carry.
+//
+// Both come from the W3C Trace Context specification rather than being chosen here. A
+// traceparent is exactly 55 characters in version 00 and the specification requires
+// implementations to accept longer future versions, so 255 leaves generous room while still
+// refusing an unbounded value; tracestate is capped by the specification itself at 512.
+//
+// The bound matters because these values originate in a CALLER-SUPPLIED HTTP HEADER and are
+// stored on a table that takes one row per ledger mutation at 500 events per second. Without
+// a ceiling, a caller could append arbitrary bytes to every event row in the ledger, and the
+// cost would surface as bloat on the relay's hottest table rather than as a rejected request.
+const (
+	MaxTraceparentLength = 255
+	MaxTracestateLength  = 512
+)
+
+// SanitizeTraceContext returns the trace context that may be stored on an outbox row,
+// dropping anything unusable.
+//
+// # Why it drops rather than truncates or rejects
+//
+// TRUNCATING a traceparent would produce a syntactically invalid one — a mangled trace and
+// span id that correlates the event with nothing and that a tracing backend may reject
+// outright — so an oversized traceparent is dropped whole. Truncating a tracestate would be
+// safe in principle, since it is a list of independent vendor entries, but a partial list is
+// a partial claim about which vendors saw the request, and the correlation that matters lives
+// entirely in the traceparent. So both are dropped.
+//
+// REJECTING is not an option. This value is telemetry attached to a ledger mutation, and
+// refusing the mutation because a caller sent an oversized header would let a header break
+// the ledger. Dropping loses a trace link; rejecting loses money movement.
+//
+// A tracestate without a traceparent is meaningless — it is vendor state ABOUT a trace whose
+// identity has been discarded — so dropping the traceparent drops the tracestate with it.
+//
+// Parameters:
+//   - traceparent string: the W3C traceparent header value, or empty when there is no trace.
+//   - tracestate string: the W3C tracestate header value, or empty.
+//
+// Returns:
+//   - string: the traceparent to store, empty when there is none or it was unusable.
+//   - string: the tracestate to store, empty when there is none, it was unusable, or the
+//     traceparent was dropped.
+func SanitizeTraceContext(traceparent, tracestate string) (string, string) {
+	parent := strings.TrimSpace(traceparent)
+	if parent == "" || len(parent) > MaxTraceparentLength {
+		return "", ""
+	}
+
+	state := strings.TrimSpace(tracestate)
+	if len(state) > MaxTracestateLength {
+		state = ""
+	}
+
+	return parent, state
+}
+
 // LedgerEvent is the canonical JSON envelope published to Kafka for every
 // ledger mutation Blnk emits (requirement R-8). Its field set and JSON tags are
 // the subscriber-facing contract: they are stable, and none of them is
@@ -153,12 +212,12 @@ type LedgerEvent struct {
 	// transaction, balance, identity or ledger the mutation acted on.
 	//
 	// It is distinct from the Kafka message key. The key is the row's STORED
-	// PARTITION KEY — a ledger id when the payload yields one, otherwise a
-	// balance, identity, monitor or batch id, or the event type; see
-	// EventOutbox.PartitionKey — and keying with a stable hash balancer is what
-	// pins every event sharing a key to one partition, delivering ordering per
-	// partition key. AggregateID is what a consumer groups by once the messages
-	// arrive.
+	// PARTITION KEY — a LEDGER ID for every ledger-scoped event, including
+	// transactions, and otherwise an identity id, a batch id or the event type;
+	// see EventOutbox.PartitionKey — and keying with a stable hash balancer is
+	// what pins every event sharing a key to one partition, delivering ordering
+	// per partition key. AggregateID is what a consumer groups by once the
+	// messages arrive.
 	AggregateID string `json:"aggregate_id"`
 
 	// OccurredAt is the instant the domain action happened, RFC3339 on the
@@ -307,18 +366,26 @@ func (e LedgerEvent) CanonicalBytes() ([]byte, error) {
 // caller has one to offer: PublishEventInTx and the atomic writers in
 // database/transaction.go take the row and insert it before COMMIT, which is the
 // transactional-outbox guarantee of requirement R-2 — the mutation and its event
-// commit or roll back together. A caller with no transaction to share captures
-// standalone through PublishEvent, which is what the domain post-action call
-// sites do today: the row is then committed on its own, after the mutation, and
-// idempotence rests on the derived event id and the unique index rather than on
-// atomicity.
+// commit or roll back together. That is the path almost every producer takes, and
+// for those events the write side is EXACTLY-ONCE: the event cannot be lost while
+// its mutation stands, and cannot exist for a mutation that rolled back.
 //
-// Either way the guarantee is EXACTLY-ONCE ON THE WRITE SIDE ONLY. Kafka
-// delivery downstream remains AT-LEAST-ONCE: a relay that crashes between a
-// successfully acknowledged publish and marking this row dispatched will reclaim
-// the row after its lock expires and publish it again. Duplicate suppression on
-// LedgerEvent.EventID is consequently a documented subscriber obligation rather
-// than an implicit promise.
+// A caller with no transaction to share captures standalone through PublishEvent
+// or PublishEventDurably, and for THREE event classes that is at-most-once rather
+// than exactly-once, because their mutation is already committed by the time the
+// row is written: balance.monitor, bulk_transaction.<status>, and the
+// status-derived transaction.* events of a coalesced batch. A bounded retry makes
+// a transient database fault survivable, but a process death in that window loses
+// the event with nothing left to replay. PublishEventDurably enumerates the set
+// and docs/event-streaming.md publishes it, so a subscriber knows which event
+// types carry the weaker guarantee. system.error is standalone too but is not in
+// that set: it describes no mutation, so there is nothing it could be atomic with.
+//
+// Kafka delivery downstream is AT-LEAST-ONCE for every event regardless of which
+// path captured it: a relay that crashes between a successfully acknowledged
+// publish and marking this row dispatched will reclaim the row after its lock
+// expires and publish it again. Duplicate suppression on LedgerEvent.EventID is
+// consequently a documented subscriber obligation rather than an implicit promise.
 //
 // Construction: callers set the event-envelope fields and MaxAttempts
 // explicitly in Go and leave ID, Status, Attempts and the creation timestamp to
@@ -357,34 +424,69 @@ type EventOutbox struct {
 	// guarantees a value through a documented fallback chain and this field is
 	// never blank on a persisted row.
 	//
-	// It is a SEPARATE FIELD FROM LedgerID, and the separation is the point.
-	// This value is whatever aggregate the event's ordering should follow: a
-	// ledger id when the payload carries one, otherwise a balance id, an
-	// identity id, a monitor id, a batch id or the event type. It is therefore
-	// not "the ledger id", and one key may deliberately group several
-	// aggregates — every event of one ledger, for instance — which is why the
-	// guarantee is stated per partition key rather than per aggregate.
+	// # THE CONTRACT IS ONE RULE: an event is keyed on ITS LEDGER
+	//
+	// Requirement R-6 partitions by ledger id, and that is what this field
+	// carries for every event whose ledger can be established at capture time —
+	// which is every ledger-scoped event Blnk emits: transaction.* (the ledger
+	// resolved from the loaded source balance, falling back to the destination),
+	// balance.created and balance.monitor (the balance's ledger), and
+	// ledger.created (the ledger itself). Every event of one ledger therefore
+	// lands on ONE partition, which is the strongest ordering guarantee
+	// available and is the one the requirement asks for.
+	//
+	// A ledger-scoped producer supplies the ledger explicitly through
+	// blnk.WithEventLedgerID, because model.Transaction has no ledger field of
+	// its own; the supplied value populates BOTH this field and LedgerID.
+	//
+	// # The fallback chain, and the events that genuinely have no ledger
+	//
+	// Four cases have no ledger to key on, and for them the chain applies: the
+	// payload's own aggregate, then AggregateID, then the event type, then a
+	// fixed sentinel. They are identity.created (an identity is not scoped to a
+	// ledger), bulk_transaction.<status> (a batch is a runtime grouping, not a
+	// ledger object), system.error (no aggregate of any kind, so it keys on the
+	// event type and gets a total order), and a REJECTED transaction persisted
+	// with no balances (no balance moved, so no ledger is named).
+	//
+	// It remains a SEPARATE FIELD FROM LedgerID even though the two carry the
+	// same value on a ledger-scoped event: LedgerID answers "which ledger is
+	// this about" and may legitimately be empty, whereas this field answers
+	// "where does this message go" and never may. Conflating them is how an
+	// empty ledger becomes an unkeyed, unordered message.
+	//
+	// Because one key groups every event of one ledger, the guarantee is stated
+	// per partition key rather than per aggregate — the stronger reading.
 	PartitionKey string `json:"partition_key"`
 
 	// LedgerID is the AUTHORITATIVE ledger this event belongs to, or empty when
-	// the event genuinely has no ledger. It takes no part in partitioning.
+	// the event genuinely has no ledger. It takes no part in partitioning: it
+	// answers "which ledger is this about", never "where does this message go".
 	//
-	// It is populated only from a payload that actually carries a ledger
-	// identifier — a ledger, or a balance, which belongs to exactly one ledger.
-	// The exceptions, enumerated so that "empty" is a documented fact rather
-	// than an omission:
+	// It is populated from a payload that carries a ledger identifier — a
+	// ledger, or a balance, which belongs to exactly one ledger — or from a
+	// ledger the PRODUCER supplies through blnk.WithEventLedgerID, which is how
+	// the two event families whose payload cannot yield one are still recorded
+	// against their ledger:
 	//
 	//   - Transactions. model.Transaction HAS NO LEDGER FIELD; a transaction's
 	//     ledger association is indirect, through the balances it moves value
-	//     between, and resolving it would require a database read on the
-	//     capture path. Left empty.
-	//   - Balance monitors. BalanceMonitor carries no ledger field either.
-	//     Left empty.
+	//     between. Transaction execution has those balances loaded already, so
+	//     it supplies the ledger and this field is populated for every
+	//     transaction event EXCEPT a rejection, which is persisted with no
+	//     balances at all and therefore names no ledger.
+	//   - Balance monitors. BalanceMonitor carries no ledger field either, but
+	//     the balance whose update triggered the check does, and the monitor
+	//     call site holds it. Populated.
+	//
+	// The events that legitimately leave it empty, enumerated so that "empty" is
+	// a documented fact rather than an omission:
+	//
 	//   - Identities. An identity is not scoped to a ledger in this model.
-	//     Left empty.
 	//   - Bulk transaction batches. A batch is a runtime grouping, not a ledger
-	//     object. Left empty.
-	//   - system.error. No aggregate of any kind. Left empty.
+	//     object.
+	//   - system.error. No aggregate of any kind.
+	//   - A rejected transaction, for the reason above.
 	//
 	// Because it is nullable in the schema, an empty value here means "this
 	// event has no ledger", never "we did not look".
@@ -605,8 +707,13 @@ type EventOutbox struct {
 	// claims a publication names the record it produced, the schema refuses two
 	// rows the same coordinate, and a row claiming a publication with no
 	// coordinate is visible as exactly that — unconfirmed — instead of being
-	// absorbed into a surplus. See AuditTerminalEventRecords and
-	// ReconcileAgainstOutbox.
+	// absorbed into a surplus.
+	//
+	// The coordinate is also what makes the reconciliation BOUNDED rather than
+	// global: it is checked against the measured [first, end) window of its own
+	// partition, so retention, topic recreation and foreign traffic on a shared
+	// topic each become a stated fact about specific rows instead of a distortion
+	// of one total. See AuditEventRecordsInIntervals and ReconcileAgainstOutbox.
 	//
 	// # Which topic the coordinate belongs to
 	//
@@ -636,6 +743,172 @@ type EventOutbox struct {
 	// below. It is kept as raw JSON, not a decoded struct, so the stored bytes
 	// are handed back to the dead-letter API exactly as they were written.
 	FailureMetadata json.RawMessage `json:"failure_metadata,omitempty"`
+
+	// Traceparent and Tracestate carry the W3C trace context of the request that CAPTURED
+	// this event, so that publishing it can be correlated with the mutation that produced it.
+	//
+	// # Why they are stored rather than propagated
+	//
+	// The capture and the publish are decoupled by design: the request commits its
+	// transaction and returns, and the relay claims the row up to a poll interval later,
+	// possibly in a different process. There is no in-memory context to hand over, so a trace
+	// that is not written on the row cannot be recovered from anything afterwards — which is
+	// why every request and database trace used to END at the outbox insert, and publishing,
+	// retrying, dead-lettering and replaying one event each produced spans in unrelated
+	// traces.
+	//
+	// # They are a LINK, never a parent
+	//
+	// The publish span links to this context rather than being parented by it. The capturing
+	// span has already ended, so parenting would attach a span to a completed trace and
+	// stretch that trace's duration across the poll interval and every retry — reporting a
+	// request that took milliseconds as one that took minutes. A link states "caused by"
+	// without making the claim about duration, which is what the OpenTelemetry messaging
+	// conventions specify for a producer decoupled in time from its trigger.
+	//
+	// # Empty is a legitimate, common state
+	//
+	// Both are empty for every event captured with no active trace: a CLI-driven mutation, a
+	// worker-initiated rejection, or any deployment running with observability disabled. The
+	// publish path then produces an ordinary unlinked span rather than treating the absence as
+	// a fault.
+	//
+	// Both are BOUNDED at the persistence boundary — 255 and 512 characters, from the W3C
+	// specification's own limits — because they originate in a caller-supplied HTTP header on
+	// a table that takes one row per ledger mutation.
+	Traceparent string `json:"traceparent,omitempty"`
+	Tracestate  string `json:"tracestate,omitempty"`
+
+	// ResolvedAt is when an operator recorded that this dead-lettered event has
+	// been dealt with, and it is the ONE thing that makes the row eligible for
+	// retention.
+	//
+	// Nil means UNRESOLVED: the event reached no subscriber and nobody has
+	// accounted for it. Such a row is the only record that a ledger event went
+	// undelivered — the only inventory triage reads, the only thing a replay can
+	// be driven from, and the only place the failure metadata explaining the loss
+	// exists. So it is excluded from the retention purge however old it is, and it
+	// keeps feeding the dead-letter age gauge until someone resolves it.
+	//
+	// A pointer rather than a zero time because "not resolved" and "resolved at
+	// the year 1" must not render or compare alike; see IsResolvedDeadLetter.
+	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
+
+	// ResolutionNote is the operator's own account of why no further action is
+	// owed — the part no timestamp can carry, and the difference between an audit
+	// trail and a boolean. Empty when none was given. Bounded and sanitised
+	// before storage, because it is operator-supplied free text that the listing
+	// projects back out.
+	ResolutionNote string `json:"resolution_note,omitempty"`
+}
+
+// IsResolvedDeadLetter reports whether an operator has accounted for this
+// dead-lettered event.
+//
+// It is the Go side of the retention gate and is deliberately a method on the row
+// rather than a free function over a status string: resolution is a property of the
+// ROW, not of its status, which is exactly the distinction the status-only purge
+// predicate used to miss.
+//
+// Returns:
+//   - bool: true when a resolution instant is recorded.
+func (e EventOutbox) IsResolvedDeadLetter() bool {
+	return e.ResolvedAt != nil && !e.ResolvedAt.IsZero()
+}
+
+// IsPurgeableByRetention reports whether the retention sweep is permitted to delete
+// this row.
+//
+// # It must agree with the SQL exactly
+//
+// The authoritative predicate is the WHERE clause of PurgeTerminalEventsBefore and the
+// partial index idx_event_outbox_purgeable that serves it. This method is the same rule
+// expressed in Go so that a caller, a test and a runbook can evaluate eligibility
+// without a database — and TestEventOutboxRetention_GoAndSQLAgreeOnEligibility pins the
+// two together, because a divergence here would be silent and would either delete
+// evidence or stop deleting anything.
+//
+// The rule, in words: a DISPATCHED row is a receipt for an event a subscriber has
+// already had, so age alone governs it. A DEAD-LETTERED row is the record of an event
+// nobody received, so it is eligible only once an operator has resolved it. Every other
+// state is still owed a delivery attempt — failed most of all, because its `<topic>.dlt`
+// write has not landed and the outbox row is therefore the only copy of the event in
+// existence.
+//
+// Returns:
+//   - bool: true when the row may be deleted by age.
+func (e EventOutbox) IsPurgeableByRetention() bool {
+	switch e.Status {
+	case EventOutboxStatusDispatched:
+		return true
+	case EventOutboxStatusDeadLettered:
+		return e.IsResolvedDeadLetter()
+	default:
+		return false
+	}
+}
+
+// DeadLetterInventoryFilter narrows the dead-letter inventory IN SQL.
+//
+// # Why the narrowing is pushed into SQL at all
+//
+// The filtered listing used to be served by walking the inventory in repository-sized pages
+// and applying the predicates in Go, bounded at five thousand scanned rows. That bound made
+// the endpoint's answer silently wrong in the one direction that matters: an operator
+// filtering for a stuck event type received a short page with no indication that the scan had
+// given up, and "nothing more is stuck" is the worst possible thing to tell someone triaging
+// a loss. The warning it logged was in a place the operator was not looking.
+//
+// Pushing the predicates into SQL removes the failure mode rather than reporting it. The
+// database applies them across the whole table, the page is taken from the FILTERED set, and
+// there is no scan bound to reach because no rows are read and discarded in Go. It is also
+// what makes a filter-aware COUNT possible, so a page can always be checked against a total.
+//
+// # It is an ALIAS of DeadLetterQuery, deliberately
+//
+// A filter over this inventory and a query over it are the same thing — the predicates, plus
+// the occurrence window — and two types would be two places for one rule to be stated. The
+// alias keeps the name that reads correctly at a filtering call site while there remains
+// exactly one set of fields, one Filtered/IsEmpty answer, and one SQL rendering. Every field
+// is an EXACT, case-sensitive match, which is how event types and topics are compared
+// everywhere in this pipeline: producers emit fixed literals, and case-folding would make the
+// filtered and unfiltered paths disagree for no benefit. The zero value selects the whole
+// inventory.
+type DeadLetterInventoryFilter = DeadLetterQuery
+
+// InventoryEntry projects a full outbox row onto the dead-letter listing shape.
+//
+// It exists so the two places a dead-lettered event is rendered — the paged inventory,
+// which the repository projects in SQL, and the single event a resolve or a fetch returns
+// as a whole row — produce the SAME response body. Without it the resolve response would
+// be assembled field by field at the handler, which is how one of the two ends up missing
+// the partition key or reporting a payload size of zero.
+//
+// PayloadBytes is measured from the body actually held here, matching what the SQL
+// projection measures with octet_length, so a caller cannot tell which path served it.
+//
+// Returns:
+//   - DeadLetterInventoryEntry: the same row in the listing's narrow shape.
+func (e EventOutbox) InventoryEntry() DeadLetterInventoryEntry {
+	return DeadLetterInventoryEntry{
+		ID:               e.ID,
+		EventID:          e.EventID,
+		EventType:        e.EventType,
+		AggregateID:      e.AggregateID,
+		PartitionKey:     e.PartitionKey,
+		LedgerID:         e.LedgerID,
+		Topic:            e.Topic,
+		SchemaVersion:    e.SchemaVersion,
+		OccurredAt:       e.OccurredAt,
+		Status:           e.Status,
+		Attempts:         e.Attempts,
+		LastError:        e.LastError,
+		FirstAttemptedAt: e.FirstAttemptedAt,
+		LastAttemptedAt:  e.LastAttemptedAt,
+		DLTTopic:         e.DLTTopic,
+		FailureMetadata:  e.FailureMetadata,
+		PayloadBytes:     len(e.Payload),
+	}
 }
 
 // BrokerRecord is the coordinate of one record on one Kafka topic: the value that
@@ -780,56 +1053,653 @@ func (e EventOutbox) BrokerRecord() (BrokerRecord, bool) {
 	return record, record.Confirmed()
 }
 
-// EventOutboxAudit is the outbox side of the zero-loss reconciliation: how many rows
-// claim a Kafka record, and how many of those can actually name the record they
-// produced.
+// DeadLetterFilter narrows the dead-letter inventory at the REPOSITORY, which is the only
+// layer that can narrow it correctly.
+//
+// # Why this type exists
+//
+// The inventory listing used to accept these filters at the API and satisfy them by walking
+// unfiltered repository pages in the service, applying the predicates in Go and stopping after
+// a fixed 5,000 rows. Three things were wrong with that, and only the last is obvious:
+//
+//   - Matching entries beyond the scan bound were omitted from an operator-facing triage list
+//     that returned HTTP 200 with no truncation marker, so "nothing else is stuck" and "I gave
+//     up looking" were indistinguishable.
+//   - No filter-aware COUNT existed, so a filtered page could not report a total at all and the
+//     API refused `include_count` whenever a filter was set.
+//   - Every filtered request read up to 5,000 rows out of the database to return at most 500.
+//
+// Pushing the predicates into SQL fixes all three at once: the page is exactly the requested
+// slice of the matching set, the count is over the same predicate, and the index does the work.
+//
+// Every field is optional and an empty field means "no narrowing". The zero value therefore
+// selects the whole inventory, which is what an unfiltered listing asks for.
+type DeadLetterFilter = DeadLetterQuery
+
+// Narrows reports whether the filter constrains anything at all.
+//
+// It exists so a caller can tell an unfiltered request from a filtered one without inspecting
+// three fields and getting one of them wrong.
+//
+// Returns:
+//   - bool: true when at least one field is set.
+func (q DeadLetterQuery) Narrows() bool {
+	return q.Filtered()
+}
+
+// PartitionOffsetInterval is one partition's MEASURED, currently-readable offset window:
+// the half-open range [FirstOffset, EndOffset) the broker reported for it.
+//
+// # Why the zero-loss reconciliation needs an interval at all
+//
+// The reconciliation used to compare two numbers that describe different populations: the
+// outbox's currently-retained rows against a topic's CUMULATIVE end offset. Those have no
+// common baseline, no common time window and no common topic incarnation, so the comparison
+// could be wrong in either direction while reporting itself as conclusive:
+//
+//   - Outbox retention prunes rows, so the left side shrinks while the right keeps climbing,
+//     and the growing "surplus" hides real loss.
+//   - Kafka retention deletes records the end offset still counts, so a record the sum
+//     asserts exists may be unreadable.
+//   - Recreating a topic resets its offsets to zero, so the right side collapses and the
+//     comparison reports catastrophic loss — or, once rows are pruned too, reports nothing.
+//   - Foreign or pre-existing traffic on a shared topic inflates the right side, masking
+//     loss by exactly as much as it contributes.
+//
+// An interval fixes all four, because it turns the question from "do these two totals
+// agree" into "is the record THIS ROW NAMED inside the window the broker can currently
+// serve". That question is answerable per row, is unaffected by anything else on the topic,
+// and yields a verdict whose scope is stated rather than assumed.
+type PartitionOffsetInterval struct {
+	// Topic is the fully-qualified topic name, exactly as a row's kafka_topic records it.
+	Topic string
+
+	// Partition is the partition ID.
+	Partition int
+
+	// FirstOffset is the earliest offset still retained. INCLUSIVE.
+	FirstOffset int64
+
+	// EndOffset is the log end offset: one past the last record written. EXCLUSIVE, which
+	// is why a coordinate at or above it cannot be on the log at all.
+	EndOffset int64
+}
+
+// Contains reports whether an offset lies inside the measured window.
+//
+// The bounds are asymmetric on purpose, matching Kafka's own semantics: FirstOffset is the
+// earliest RETAINED record and EndOffset is one past the last WRITTEN one, so the window is
+// [first, end).
+//
+// Parameters:
+//   - offset int64: the coordinate's offset.
+//
+// Returns:
+//   - bool: true when the offset is readable within this window.
+func (i PartitionOffsetInterval) Contains(offset int64) bool {
+	return offset >= i.FirstOffset && offset < i.EndOffset
+}
+
+// Records is how many records the window holds, never negative.
+//
+// An empty partition reports first equal to end, and a partition whose every record has
+// aged out reports the same at a non-zero offset; both are legitimately zero rather than
+// negative.
+//
+// Returns:
+//   - int64: the number of readable records.
+func (i PartitionOffsetInterval) Records() int64 {
+	if i.EndOffset <= i.FirstOffset {
+		return 0
+	}
+
+	return i.EndOffset - i.FirstOffset
+}
+
+// EventRecordIntervalAudit is the outbox side of the zero-loss reconciliation, classified
+// AGAINST THE MEASURED BROKER WINDOWS rather than counted in aggregate.
 //
 // # Why "published" is not the same as "terminal"
 //
 // PublishedRows deliberately counts a wider set than the terminal statuses. A row in
 // webhook_pending HAS been published to Kafka — its Kafka leg completed and
 // KafkaDispatchedAt is stamped; what remains outstanding is the deprecated HTTP leg.
-// Counting only dispatched and dead_lettered rows would leave those records
-// unaccounted for on the broker side, inflating the apparent surplus and making the
-// reconciliation looser precisely during the dual-delivery window, which is when it is
-// most needed.
+// Counting only dispatched and dead_lettered rows would leave those records unaccounted for
+// on the broker side, inflating the apparent surplus and making the reconciliation looser
+// precisely during the dual-delivery window, which is when it is most needed.
 //
-// # What the split is for
+// # Every row lands in exactly one bucket, and the buckets are the verdict
 //
-// ConfirmedRows is the count that can be MATCHED to a record. UnconfirmedRows is the
-// count that cannot, and its existence is the finding this type closes: an unconfirmed
-// row is a claim of publication that nothing corroborates, and under a pure count it
-// was invisible because a redelivery elsewhere could make the totals balance.
-type EventOutboxAudit struct {
-	// PublishedRows is how many rows claim a record on the broker: every row whose
-	// Kafka leg completed, plus every dead-lettered row, each counted exactly once
-	// by virtue of the unique index on event_id.
+// PublishedRows equals CorroboratedRows + UnconfirmedRows + UnmeasuredRows + AgedOutRows +
+// BeyondEndRows, always. That identity is what makes the verdict a MAPPING instead of
+// arithmetic: a green result means every single claim of publication was individually
+// placed inside a window the broker can serve, so there is no aggregate for a surplus of
+// redeliveries to hide a loss inside.
+//
+// Each non-corroborated bucket is a distinct operational fact, and collapsing any two of
+// them would destroy the distinction an operator acts on:
+//
+//   - UnconfirmedRows — claims publication, names no record. Either the client returned no
+//     coordinate or the row predates coordinate recording. Nothing corroborates it.
+//   - UnmeasuredRows — names a topic or partition the measurement did not cover: a missing
+//     topic, an unavailable partition, or a partition count that has since shrunk.
+//   - AgedOutRows — names an offset BELOW the retained window. The record was written; Kafka
+//     retention has since deleted it. Not loss, but no longer corroborable, and a consumer
+//     that has not read it never will.
+//   - BeyondEndRows — names an offset AT OR ABOVE the log end. This is impossible on an
+//     intact log, because the broker assigned that offset when it accepted the write. It
+//     means the partition was TRUNCATED or the topic was RECREATED, so the records are gone.
+//     This is the topic-incarnation signal the whole interval design exists to surface.
+type EventRecordIntervalAudit struct {
+	// PublishedRows is how many rows claim a record on the broker: every row whose Kafka
+	// leg completed, plus every dead-lettered row, each counted exactly once by virtue of
+	// the unique index on event_id.
 	PublishedRows int64
 
-	// ConfirmedRows is how many of those name the record they produced.
-	ConfirmedRows int64
+	// CorroboratedRows is how many of those name a record inside a measured window. It is
+	// the only bucket a green verdict may contain.
+	CorroboratedRows int64
 
-	// DistinctRecords is how many DISTINCT coordinates those rows name. It equals
-	// ConfirmedRows unless two rows claim the same record, which the partial unique
-	// index on the coordinate makes impossible — so a discrepancy here means the
-	// index is missing or has been dropped, and the audit says so rather than
-	// assuming the schema is intact.
-	DistinctRecords int64
+	// DistinctCorroboratedRecords is how many DISTINCT coordinates the corroborated rows
+	// name. It equals CorroboratedRows unless two rows claim the same record, which the
+	// partial unique index on the coordinate makes impossible — so a discrepancy means that
+	// index is missing or has been dropped, and the audit reports it rather than assuming
+	// the schema is intact.
+	DistinctCorroboratedRecords int64
+
+	// UnconfirmedRows claim a publication without naming any record.
+	UnconfirmedRows int64
+
+	// UnmeasuredRows name a topic or partition the measurement did not cover.
+	UnmeasuredRows int64
+
+	// AgedOutRows name an offset below the retained window: written, then deleted by
+	// retention.
+	AgedOutRows int64
+
+	// BeyondEndRows name an offset at or above the log end: evidence of truncation or topic
+	// recreation.
+	BeyondEndRows int64
+
+	// OldestTerminalAt is the earliest publication instant among ALL terminal rows still
+	// retained in the outbox, which is the floor of what any verdict can speak about.
+	//
+	// It is reported because the outbox is pruned: events published before this instant have
+	// no row left to reconcile, so a verdict is a statement about [OldestTerminalAt, now]
+	// and nothing earlier. Presenting a verdict without that bound is what let a
+	// reconciliation over an aggressively pruned outbox look complete.
+	OldestTerminalAt time.Time
+
+	// CorroboratedFrom and CorroboratedTo bound the publication instants of the
+	// CORROBORATED population: the window the green verdict actually covers.
+	CorroboratedFrom time.Time
+	CorroboratedTo   time.Time
+
+	// WindowStart is the earliest publication instant the three counts above include.
+	//
+	// # PERF-P05: the audit is WINDOWED, and it has to be
+	//
+	// The counts are one half of a comparison whose other half is a Kafka offset
+	// reading, and the two halves must describe the SAME population or the comparison
+	// means nothing. Over the whole history they cannot: broker end offsets are
+	// cumulative for the life of a topic and are unaffected by Kafka retention, while
+	// the outbox's retention sweep DELETES terminal rows — so the longer a deployment
+	// runs with retention enabled, the further the outbox side falls behind a broker
+	// side that never forgets, and the "surplus" the verdict tolerates grows without
+	// bound until it can hide any amount of loss.
+	//
+	// A shared window fixes both directions at once: rows whose publication instant
+	// falls inside it, against records the broker wrote inside it. Retention shorter
+	// than the window is then the only thing that can invalidate the reading, and it is
+	// detectable rather than silent — see the truncation flag on the offset report.
+	//
+	// It is also what makes the query bounded. At 500 events per second the table grows
+	// by 43.2 million rows a day, so an exact whole-history aggregate is a scan whose
+	// cost rises for ever while answering a question about the last day.
+	//
+	// The zero value means the counts are whole-history, which is a diagnostic reading
+	// only: no reconciliation verdict may be drawn from it.
+	WindowStart time.Time
 
 	// MeasuredAt is when the outbox side was read.
 	MeasuredAt time.Time
+}
+
+// EventTopicBacklog is how much work an outbox topic still owes, for ONE topic name as it
+// is stored on the rows.
+//
+// # What it is for
+//
+// A row records its fully-resolved destination topic at insert time, so a deployment that
+// changes KAFKA_TOPIC_PREFIX keeps rows naming the previous generation's topics. Those rows
+// are only publishable while the previous prefix is declared in
+// KAFKA_HISTORICAL_TOPIC_PREFIXES; if it is not, they are stranded — safe in the table, and
+// carried by no transport. Nothing about that state is visible from a status count, because
+// the rows look like ordinary pending and dead-lettered work.
+//
+// Grouping the undrained rows BY TOPIC is what makes it visible: a topic name outside every
+// owned prefix is a stranded generation, and the count and the oldest instant say how much
+// and how long. That is the audit behind the start-up warning that names the prefix an
+// operator has to declare.
+//
+// # Why "undrained" rather than "non-terminal"
+//
+// Two kinds of row still owe a publish to the topic named here, and they must both be
+// counted or the audit says a generation has drained when it has not:
+//
+//   - Rows that have never been dispatched — pending, processing, failed, replaying. The
+//     relay owes each of them a publish to this exact topic.
+//   - Rows that are dead_lettered. That state is terminal for delivery, but a dead-lettered
+//     event is REPLAYABLE, and a replay publishes to the ORIGINAL topic. So a prefix with
+//     dead-lettered rows under it is a prefix whose replays would be refused.
+//
+// A dispatched row owes nothing and is excluded. So is webhook_pending: its Kafka leg is
+// complete and only the deprecated HTTP leg is outstanding, which does not involve a topic.
+type EventTopicBacklog struct {
+	// Topic is the destination as recorded on the rows, verbatim.
+	Topic string
+
+	// UndeliveredRows is how many rows still owe a first successful publish to Topic —
+	// pending, processing, failed and replaying.
+	UndeliveredRows int64
+
+	// ReplayableRows is how many dead-lettered rows could be replayed to Topic.
+	ReplayableRows int64
+
+	// OldestOccurredAt is the occurrence instant of the oldest row counted here, which is
+	// what turns "some rows are stranded" into "events from three days ago are stranded".
+	OldestOccurredAt time.Time
+}
+
+// TotalRows is how many rows this topic still owes something for.
+//
+// Returns:
+//   - int64: the sum of the two counts.
+func (b EventTopicBacklog) TotalRows() int64 {
+	return b.UndeliveredRows + b.ReplayableRows
 }
 
 // UnconfirmedRows is how many rows claim a publication they cannot name a record for.
 //
 // Returns:
 //   - int64: never negative.
-func (a EventOutboxAudit) UnconfirmedRows() int64 {
-	if a.ConfirmedRows >= a.PublishedRows {
+func (a EventRecordIntervalAudit) DuplicatedRecords() int64 {
+	duplicated := a.CorroboratedRows - a.DistinctCorroboratedRecords
+	if duplicated < 0 {
 		return 0
 	}
 
-	return a.PublishedRows - a.ConfirmedRows
+	return duplicated
+}
+
+// FullyCorroborated reports whether every row claiming a publication names a distinct
+// record inside a measured window.
+//
+// It is the precondition for a conclusive zero-loss verdict, and it is deliberately
+// stricter than the count-based predicate it replaces: a row whose record has aged out or
+// whose partition was not measured no longer counts as confirmed, because nothing available
+// today corroborates it.
+//
+// Returns:
+//   - bool: true when nothing is uncorroborated and no two rows share a coordinate.
+func (a EventRecordIntervalAudit) FullyCorroborated() bool {
+	return a.UncorroboratedRows() == 0 && a.DuplicatedRecords() == 0
+}
+
+// ---------------------------------------------------------------------------------------
+// PERF-P06/P07/P08: the dead-letter inventory, projected narrow and paged by key
+//
+// The inventory is what an operator triages a dead-letter backlog from, and it used to be
+// served by reading WHOLE outbox rows — payload bytes and canonical envelope included, up
+// to 768 KiB of each per row — through LIMIT/OFFSET, and then narrowing and filtering them
+// in Go. Three costs followed from that, and none of them was visible in the response:
+//
+//   - A filtered page walked up to 5,000 of those rows to fill at most 100 small items, so
+//     one triage request could move several gibibytes between PostgreSQL and the API for a
+//     result measured in kilobytes — and returned a SUCCESSFUL but silently incomplete page
+//     once the scan bound was reached.
+//   - An OFFSET grows a page's cost with its depth: PostgreSQL reads and discards every
+//     row before the offset, so the deepest page of a large inventory is the most expensive
+//     one, and the depth was caller-supplied and unbounded.
+//   - The age gauge sized the whole inventory with a COUNT and then read its oldest rows
+//     from a deep tail offset, on every collection interval.
+//
+// The types below are what let all three be answered in SQL: a projection that names only
+// the columns the triage view shows, a keyset cursor so a page's cost is independent of
+// its depth, and a grouped age reading that never reads a row at all.
+// ---------------------------------------------------------------------------------------
+
+// DeadLetterInventoryEntry is one row of the dead-letter inventory, projected to exactly
+// what a triage listing shows.
+//
+// THE PAYLOAD IS NOT HERE, and its absence is the point. Neither the stored body nor the
+// canonical envelope is projected — only PayloadBytes, the body's size, which is the one
+// thing a listing legitimately reports about it. A caller that needs the bytes themselves
+// is replaying the event, and replay reads the full row through its own claim so the bytes
+// it publishes are the bytes that were stored.
+//
+// FailureMetadata IS projected, because it is small — five fields — and the projection the
+// API builds fills gaps in the row's own columns from it.
+type DeadLetterInventoryEntry struct {
+	// ID is the surrogate key, carried so a keyset cursor can break ties on it.
+	ID int64
+
+	// EventID is the event's UUID and the subscriber's idempotency key. It is what a
+	// replay is addressed by.
+	EventID string
+
+	// EventType is the event's type string, as published.
+	EventType string
+
+	// AggregateID is the entity the event is about.
+	AggregateID string
+
+	// PartitionKey is the STORED key the original publish used, so an ordering question
+	// can be answered from the listing without re-deriving it.
+	PartitionKey string
+
+	// LedgerID is the ledger the event belongs to, when it has one.
+	LedgerID string
+
+	// Topic is the original category topic the event was destined for.
+	Topic string
+
+	// SchemaVersion is the envelope version the event was published under.
+	SchemaVersion int
+
+	// OccurredAt is when the event happened. It is the first component of the keyset
+	// cursor and the ordering key of the listing.
+	OccurredAt time.Time
+
+	// Status is the row's terminal failure state: failed, or dead_lettered.
+	Status string
+
+	// Attempts is how many publish attempts were made.
+	Attempts int
+
+	// LastError is the raw failure text the last attempt recorded. It is CLASSIFIED
+	// before it reaches a response body; nothing publishes it verbatim.
+	LastError string
+
+	// FirstAttemptedAt and LastAttemptedAt bound the retry window.
+	FirstAttemptedAt *time.Time
+	LastAttemptedAt  *time.Time
+
+	// DLTTopic is the `<topic>.dlt` sibling the event was preserved on, empty while the
+	// dead-letter write is still owed.
+	DLTTopic string
+
+	// FailureMetadata is the stored failure record, or nil when none was written.
+	FailureMetadata json.RawMessage
+
+	// PayloadBytes is the size of the stored body in bytes, measured in SQL so the bytes
+	// themselves never leave the database.
+	PayloadBytes int
+}
+
+// DeadLetterCursor is a position in the dead-letter inventory, expressed as the ordering
+// key of the last row a page returned rather than as a row count.
+//
+// The inventory is ordered by occurred_at descending with id descending as the tie-break,
+// so a page resumes at "strictly older than this instant, or the same instant with a lower
+// id". That predicate is index-backed, which is what makes every page cost the same — and
+// it is also STABLE under concurrent writes: rows arriving while a caller pages do not
+// shift the positions of the rows behind the cursor, whereas an OFFSET silently repeats or
+// skips rows whenever the set changes beneath it.
+type DeadLetterCursor struct {
+	// OccurredAt is the occurrence instant of the last row returned.
+	OccurredAt time.Time
+
+	// ID is that row's surrogate key, which breaks ties between rows sharing an instant.
+	ID int64
+}
+
+// eventCursorSeparator joins a cursor's two components. A colon cannot appear in either —
+// one is a decimal nanosecond count, the other a decimal integer — so the split is
+// unambiguous.
+const eventCursorSeparator = ":"
+
+// Encode renders the cursor as the opaque token an API hands back to a caller.
+//
+// It is base64url of "<unix-nanoseconds>:<id>". Opaque rather than structured on purpose:
+// a caller that parses it is depending on the ordering key, which is an implementation
+// detail of the listing and must stay changeable. Base64url — no padding — so the token is
+// safe in a query string without escaping.
+//
+// Returns:
+//   - string: the token, or "" for a zero cursor, which means "start at the beginning".
+func (c DeadLetterCursor) Encode() string {
+	if c.OccurredAt.IsZero() && c.ID == 0 {
+		return ""
+	}
+
+	return base64.RawURLEncoding.EncodeToString([]byte(
+		strconv.FormatInt(c.OccurredAt.UTC().UnixNano(), 10) + eventCursorSeparator +
+			strconv.FormatInt(c.ID, 10),
+	))
+}
+
+// ParseDeadLetterCursor decodes a token produced by Encode.
+//
+// Every malformed shape is rejected rather than coerced: a token that does not decode, does
+// not split, or whose halves are not integers cannot be honoured, and defaulting it to the
+// beginning of the inventory would silently restart a caller's pagination at page one — an
+// infinite loop for any client that pages until it sees an empty page.
+//
+// Parameters:
+//   - token string: the opaque cursor. Empty yields a nil cursor and no error, which means
+//     "start at the beginning".
+//
+// Returns:
+//   - *DeadLetterCursor: the decoded position, or nil for an empty token.
+//   - error: ErrInvalidDeadLetterCursor for anything that does not decode.
+func ParseDeadLetterCursor(token string) (*DeadLetterCursor, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, nil
+	}
+
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return nil, ErrInvalidDeadLetterCursor
+	}
+
+	instant, identifier, found := strings.Cut(string(raw), eventCursorSeparator)
+	if !found {
+		return nil, ErrInvalidDeadLetterCursor
+	}
+
+	nanos, err := strconv.ParseInt(instant, 10, 64)
+	if err != nil {
+		return nil, ErrInvalidDeadLetterCursor
+	}
+
+	id, err := strconv.ParseInt(identifier, 10, 64)
+	if err != nil {
+		return nil, ErrInvalidDeadLetterCursor
+	}
+
+	return &DeadLetterCursor{OccurredAt: time.Unix(0, nanos).UTC(), ID: id}, nil
+}
+
+// ErrInvalidDeadLetterCursor reports a cursor token that cannot be decoded. It is a
+// sentinel so the API layer can answer it as a validation error naming the parameter
+// rather than as an internal fault.
+var ErrInvalidDeadLetterCursor = errors.New("model: the dead-letter cursor is not a token this inventory issued")
+
+// DeadLetterInventoryQuery narrows and pages the dead-letter inventory.
+//
+// Every field is applied IN SQL. That is the whole difference from what this replaced: the
+// filters used to be applied in Go over pages of whole rows, so narrowing a listing made it
+// more expensive rather than less, and the result could be silently short.
+type DeadLetterInventoryQuery struct {
+	// Limit is the maximum number of entries to return. The repository defaults and caps
+	// it, so a malformed request degrades to a cheap page.
+	Limit int
+
+	// EventType narrows to one event type exactly. Empty means every type.
+	EventType string
+
+	// Topic narrows to one ORIGINAL category topic. The `.dlt` spelling is resolved to
+	// the original by the API before it reaches here, so this compares one value.
+	Topic string
+
+	// Status narrows to one terminal failure state. Empty means both — which is the
+	// default, because a row that exhausted its retries but whose dead-letter write also
+	// failed is the one an operator most needs to see.
+	Status string
+
+	// UnresolvedOnly and ResolvedOnly narrow by whether an operator has accounted for the
+	// entry, with the same meaning and the same field names as DeadLetterQuery carries —
+	// the listing and the count must apply ONE narrowing or a paging client comparing a page
+	// against a total would never terminate.
+	//
+	// Both false returns resolved and unresolved alike, which is the honest default for an
+	// inventory endpoint: it shows everything the table holds.
+	UnresolvedOnly bool
+	ResolvedOnly   bool
+
+	// Cursor resumes a previous page. Nil starts at the newest entry.
+	Cursor *DeadLetterCursor
+	// OccurredFrom and OccurredTo bound the event's OCCURRENCE instant inclusively, and either
+	// may be zero to leave that end unbounded.
+	//
+	// Triage is nearly always scoped to an incident — "what is stuck from the twenty minutes the
+	// broker was down" — and the window is what makes that question expressible without paging
+	// the whole inventory. occurred_at is the column the inventory is ordered and paged by, so
+	// the window and the cursor agree about what "newest first" selects.
+	OccurredFrom time.Time
+	OccurredTo   time.Time
+}
+
+// DeadLetterInventoryPage is one page of the inventory, plus what a caller needs to ask for
+// the next one.
+type DeadLetterInventoryPage struct {
+	// Entries are the matching rows, newest occurrence first. Never nil on success.
+	Entries []DeadLetterInventoryEntry
+
+	// NextCursor is the position to resume from, nil when this page is the last one.
+	//
+	// It is derived from the last entry returned and is present ONLY when the repository
+	// established that more rows match — it reads one row beyond the page to find out —
+	// so a caller paging until NextCursor is nil terminates exactly once, without an extra
+	// empty request and without ever stopping early.
+	NextCursor *DeadLetterCursor
+
+	// HasMore mirrors NextCursor != nil, so a response can report the fact without
+	// exposing the token to a reader that does not need it.
+	HasMore bool
+}
+
+// SubscriberCursor is a position in the subscriber registry, expressed as the ordering key
+// of the last row a page returned.
+//
+// The registry is ordered by created_at descending with id descending as the tie-break, for
+// the same reasons the dead-letter inventory is: created_at is stamped in Go, so two
+// subscribers registered in the same microsecond would otherwise page in arbitrary relative
+// order, and a cursor keyed on both is stable under concurrent registration where an offset
+// is not.
+type SubscriberCursor struct {
+	// CreatedAt is the registration instant of the last row returned.
+	CreatedAt time.Time
+
+	// ID is that row's surrogate key.
+	ID int64
+}
+
+// Encode renders the cursor as the opaque token an API hands back. See
+// DeadLetterCursor.Encode for the format and for why it is opaque.
+//
+// Returns:
+//   - string: the token, or "" for a zero cursor.
+func (c SubscriberCursor) Encode() string {
+	if c.CreatedAt.IsZero() && c.ID == 0 {
+		return ""
+	}
+
+	return base64.RawURLEncoding.EncodeToString([]byte(
+		strconv.FormatInt(c.CreatedAt.UTC().UnixNano(), 10) + eventCursorSeparator +
+			strconv.FormatInt(c.ID, 10),
+	))
+}
+
+// ParseSubscriberCursor decodes a token produced by SubscriberCursor.Encode.
+//
+// Parameters:
+//   - token string: the opaque cursor. Empty yields a nil cursor and no error.
+//
+// Returns:
+//   - *SubscriberCursor: the decoded position, or nil for an empty token.
+//   - error: ErrInvalidSubscriberCursor for anything that does not decode.
+func ParseSubscriberCursor(token string) (*SubscriberCursor, error) {
+	position, err := ParseDeadLetterCursor(token)
+	if err != nil {
+		return nil, ErrInvalidSubscriberCursor
+	}
+	if position == nil {
+		return nil, nil
+	}
+
+	return &SubscriberCursor{CreatedAt: position.OccurredAt, ID: position.ID}, nil
+}
+
+// ErrInvalidSubscriberCursor reports a subscriber cursor token that cannot be decoded.
+var ErrInvalidSubscriberCursor = errors.New("model: the subscriber cursor is not a token this registry issued")
+
+// SubscriberPageQuery pages the subscriber registry by key rather than by depth.
+type SubscriberPageQuery struct {
+	// Limit is the maximum number of subscribers to return. The repository defaults and
+	// caps it.
+	Limit int
+
+	// Cursor resumes a previous page. Nil starts at the most recently registered
+	// subscriber.
+	Cursor *SubscriberCursor
+}
+
+// SubscriberPage is one page of the registry plus the position to resume from.
+//
+// It is what both the management API and the consumer-lag collector enumerate through — the
+// API because a caller-supplied OFFSET made a page's cost its caller's choice, and the
+// collector because it MUST be able to resume: reading from the top on every tick measured
+// the newest subscribers over and over and never reached the rest of the registry at all
+// (PERF-P22).
+type SubscriberPage struct {
+	// Subscribers are the rows, newest registration first. Never nil on success.
+	Subscribers []EventSubscriber
+
+	// NextCursor is the position to resume from, nil when this page is the last one.
+	NextCursor *SubscriberCursor
+
+	// HasMore mirrors NextCursor != nil.
+	HasMore bool
+}
+
+// DeadLetterTopicAge is the oldest outstanding dead-letter entry on one topic, and how many
+// are outstanding there.
+//
+// # PERF-P07: why this exists instead of a scan
+//
+// The dead-letter age gauge answers one question per topic — how old is the oldest thing
+// still stuck — and it used to answer it by counting the whole inventory and then reading
+// its oldest 5,000 rows, whole rows, from a deep tail offset, on every collection interval.
+// That is the most expensive possible way to compute a MIN. The grouped aggregate below
+// reads an index and returns one row per topic, so the cost of observing the backlog no
+// longer grows with the backlog — which matters most precisely when the backlog is growing.
+//
+// It is also EXACT. The scan reported a lower bound once it hit its cap and warned about it;
+// an alert on a lower bound cannot fire when the true value crosses the threshold and the
+// bound does not.
+type DeadLetterTopicAge struct {
+	// Topic is the dead-letter topic the entries belong to, or the original topic's
+	// `.dlt` sibling for a row whose dead-letter write has not happened yet.
+	Topic string
+
+	// Oldest is the age instant of the oldest outstanding entry on that topic.
+	Oldest time.Time
+
+	// Outstanding is how many entries the topic holds.
+	Outstanding int64
 }
 
 // SubscriberRevocationBacklog is how much broker-side credential revocation is still
@@ -899,17 +1769,320 @@ func (b SubscriberRevocationBacklog) OldestAge(now time.Time) time.Duration {
 	return age
 }
 
+// SubscriberAccessResidue is how much broker-side access is UNACCOUNTED FOR: credentials
+// that outlived their registry record, and revocations the broker refused.
+//
+// # Why these are separate from the revocation backlog
+//
+// SubscriberRevocationBacklog counts rows carrying RevocationPendingAt, which is stamped
+// before the broker is touched. It therefore answers "how many deregistrations are
+// unfinished". Neither figure here is inside that answer:
+//
+//   - AN ORPHANED CREDENTIAL is created by a FAILED ISSUANCE, not by a deregistration. The
+//     issuance path never stamps RevocationPendingAt, so the revocation backlog and its
+//     alert were structurally unable to see an orphan — the exposure existed and the only
+//     representation of it was a log line.
+//   - A FAILED REVOCATION is a strict subset of the pending rows, distinguished because a
+//     pending row whose attempt actually FAILED needs the broker's authorization or
+//     reachability fixed before any retry can work, while one that merely started needs
+//     nothing but the retry. A single count cannot tell an operator which they have.
+//
+// # Why the ages, and why they are the alertable quantities
+//
+// The counts say how much; they are what tells an operator whether they are looking at one
+// stuck subscriber or a broker that has been unreachable for an hour. The ages say for how
+// long, and that is what a rule should fire on: a marker settled within a minute is
+// routine, because both automatic settlement paths — re-issuing, which replaces an orphan
+// by construction, and deprovisioning, which removes it — clear it as a side effect. One
+// outstanding for an hour means neither has been exercised and a human must revoke by hand.
+//
+// # No per-subscriber breakdown
+//
+// Deliberately absent, for the reason SubscriberRevocationBacklog gives: subscriber
+// identifiers are unbounded in cardinality and would export a tenant identifier into every
+// metric series and every alert notification. The rows themselves are the per-subscriber
+// detail, and they are now projected through the registry API so reading them does not
+// require a psql session.
+type SubscriberAccessResidue struct {
+	// OrphanedCredentials is how many rows carry an unsettled CredentialOrphanedAt. Zero
+	// is the healthy steady state and is a meaningful reading rather than an absent one.
+	OrphanedCredentials int64
+
+	// OldestOrphanedAt is when the OLDEST unsettled orphan was recorded, or the zero
+	// instant when there is none. Callers must test it rather than subtracting blindly —
+	// an epoch-zero instant renders as an age of fifty-odd years and would pin every
+	// alert built on it.
+	OldestOrphanedAt time.Time
+
+	// FailedRevocations is how many rows carry an unsettled RevocationFailedAt.
+	FailedRevocations int64
+
+	// OldestFailedRevocationAt is when the OLDEST of those attempts failed, or the zero
+	// instant when none has.
+	OldestFailedRevocationAt time.Time
+}
+
+// OldestOrphanAge is how long the oldest orphaned credential has been outstanding.
+//
+// It returns ZERO when nothing is outstanding, and zero rather than a negative value when
+// the marker is stamped in the future — which spans two clocks by necessity, since the
+// issuing process stamps the marker and the collecting process reads it.
+//
+// Parameters:
+//   - now time.Time: the instant to measure against, supplied so a caller can use its own
+//     clock and a test can be exact.
+//
+// Returns:
+//   - time.Duration: never negative.
+func (r SubscriberAccessResidue) OldestOrphanAge(now time.Time) time.Duration {
+	return nonNegativeAgeSince(r.OldestOrphanedAt, now)
+}
+
+// OldestFailedRevocationAge is how long the oldest refused revocation has stood.
+//
+// Parameters:
+//   - now time.Time: the instant to measure against.
+//
+// Returns:
+//   - time.Duration: never negative, and zero when no attempt has failed.
+func (r SubscriberAccessResidue) OldestFailedRevocationAge(now time.Time) time.Duration {
+	return nonNegativeAgeSince(r.OldestFailedRevocationAt, now)
+}
+
+// Settled reports whether there is no unaccounted broker-side access at all.
+//
+// It is the reading an operator wants a single answer for, and it is deliberately a
+// conjunction of both states rather than of the counts alone: either one being non-zero
+// means something at the broker is not described by the registry.
+//
+// Returns:
+//   - bool: true when both counts are zero.
+func (r SubscriberAccessResidue) Settled() bool {
+	return r.OrphanedCredentials == 0 && r.FailedRevocations == 0
+}
+
+// nonNegativeAgeSince measures an age from a possibly-zero instant.
+//
+// The zero instant answers zero rather than fifty-odd years, and an instant in the future
+// answers zero rather than a negative duration. Both cases are real: a marker is absent
+// far more often than present, and the process that stamps it is not the process that
+// reads it, so their clocks can disagree by a little.
+//
+// Parameters:
+//   - at time.Time: the instant the marker was recorded. The zero value means "absent".
+//   - now time.Time: the instant to measure against.
+//
+// Returns:
+//   - time.Duration: never negative.
+func nonNegativeAgeSince(at, now time.Time) time.Duration {
+	if at.IsZero() {
+		return 0
+	}
+
+	age := now.Sub(at)
+	if age < 0 {
+		return 0
+	}
+
+	return age
+}
+
 // FullyConfirmed reports whether every row claiming a publication names a distinct
 // record.
 //
-// It is the precondition for a conclusive zero-loss verdict: with it true, a shortfall
-// in broker records cannot be hidden by a surplus, because each claim is individually
-// accounted for.
+// Outstanding answers "is anything owed", which is the figure to graph. The two component counts
+// answer "which KIND", and that distinction changes what an operator does: a rising
+// credential-cleanup count is a security matter — access that may exist beyond what is recorded —
+// while a rising grant-reconciliation count is an availability matter, a subscriber whose access
+// may be narrower or wider than intended.
+//
+// # The age is the alertable quantity
+//
+// OldestPendingAt is measured from when the obligation was FIRST recorded and is deliberately not
+// reset by a later failed attempt, so it reports the age of the divergence rather than the age of
+// the last try. An obligation settled within a minute is routine; one outstanding for an hour
+// means the settlement pass is not running, or the broker has been unreachable throughout, and
+// either needs a human.
+//
+// # No per-subscriber breakdown
+//
+// Deliberately absent, for the reason SubscriberRevocationBacklog gives: subscriber identifiers
+// are unbounded in cardinality and would export a tenant identifier into every metric series and
+// alert notification. The rows themselves are the per-subscriber detail, listed oldest first
+// through the registry.
+type SubscriberSettlementBacklog struct {
+	// Outstanding is how many subscribers owe EITHER obligation. It is not the sum of the two
+	// counts below, because one subscriber can owe both.
+	Outstanding int64
+
+	// GrantReconcilePending is how many owe a broker-side grant reconciliation.
+	GrantReconcilePending int64
+
+	// CredentialCleanupPending is how many owe a credential cleanup.
+	CredentialCleanupPending int64
+
+	// OldestPendingAt is when the oldest outstanding obligation of EITHER kind was recorded. It
+	// is the zero value when nothing is outstanding, which is why callers must test it rather
+	// than subtracting blindly — an epoch-zero instant would render as an age of fifty-odd years
+	// and pin every alert on it.
+	OldestPendingAt time.Time
+}
+
+// OldestAge is how long the oldest outstanding obligation has been owed, measured against the
+// supplied instant.
+//
+// It returns ZERO when nothing is outstanding, and zero rather than a negative value when the
+// marker is stamped in the future — which spans two clocks by necessity, since the operation that
+// stamps the marker and the collector that reads it are different processes.
+//
+// Parameters:
+//   - now time.Time: the instant to measure against, supplied so a caller can use its own clock
+//     and a test can be exact.
 //
 // Returns:
-//   - bool: true when nothing is unconfirmed and no two rows share a coordinate.
-func (a EventOutboxAudit) FullyConfirmed() bool {
-	return a.UnconfirmedRows() == 0 && a.DistinctRecords == a.ConfirmedRows
+//   - time.Duration: never negative.
+func (b SubscriberSettlementBacklog) OldestAge(now time.Time) time.Duration {
+	if b.OldestPendingAt.IsZero() {
+		return 0
+	}
+
+	age := now.Sub(b.OldestPendingAt)
+	if age < 0 {
+		return 0
+	}
+
+	return age
+}
+
+// EventOutboxPurgeTotals is what retention has removed from the event outbox over the
+// table's whole life, and it is what lets the zero-loss reconciliation compare two
+// quantities that describe the same interval.
+//
+// # Why a purged row has to be remembered
+//
+// A Kafka end offset counts every record ever appended to a partition and never
+// decreases — not when the log segments age out, and certainly not when the outbox row
+// that produced a record is deleted. The outbox side of the reconciliation counts rows
+// that still exist. Those two quantities agree about what they are measuring only until
+// retention deletes its first terminal row; afterwards the broker counts the whole of
+// history and the outbox counts a suffix of it.
+//
+// That difference is invisible, because the comparison already EXPECTS a surplus:
+// records are a lower bound on events, since a redelivery, a replay and a dead-letter
+// copy each append a record no single row claims. So a purge-inflated surplus is
+// indistinguishable from that expected overhead, and it can offset a genuine shortfall
+// exactly — at which point the endpoint answers a confident "no loss detected" while
+// events are missing, with nothing in the numbers to suggest otherwise.
+//
+// Adding these totals back yields an ALL-TIME terminal count, which is the quantity an
+// all-time offset sum can honestly be compared against.
+type EventOutboxPurgeTotals struct {
+	// Recorded reports whether the totals could be read at all.
+	//
+	// It exists because "retention has removed nothing" and "we cannot tell what
+	// retention has removed" are different statements, and only the first of them
+	// supports a conclusive verdict. Both would otherwise present as zeroes, and the
+	// zero value of this struct — Recorded false — is deliberately the unknown case so
+	// that a caller which forgets to set it cannot accidentally claim knowledge.
+	Recorded bool
+
+	// RowsRemoved is how many terminal rows retention has deleted in total. It is added
+	// to the surviving terminal rows to restore the all-time count.
+	RowsRemoved int64
+
+	// ConfirmedRemoved is how many of those rows carried a broker coordinate, and
+	// therefore how many records the broker still counts have lost the row that named
+	// them.
+	//
+	// It is tracked separately from RowsRemoved because the two restore different
+	// baselines: RowsRemoved restores the terminal count that the offset sum is compared
+	// against, while this restores the CONFIRMED count that the row-to-record mapping is
+	// measured against. The mapping is the part of the verdict that carries its
+	// soundness, so conflating the two would corrupt exactly the wrong number.
+	ConfirmedRemoved int64
+
+	// Batches is how many purge sweeps have recorded a deletion. Zero with Recorded true
+	// means retention has never removed a terminal row, which is the one state in which
+	// the arithmetic needs no correction at all.
+	Batches int64
+
+	// LastPurgedAt is when the most recent recorded batch committed, or nil if none has.
+	LastPurgedAt *time.Time
+
+	// NewestPurgedOccurrence is the latest occurrence instant among all purged rows, or
+	// nil when unknown. It bounds the purged window from above, which is what an operator
+	// needs in order to tell whether a measurement window overlaps a purge.
+	NewestPurgedOccurrence *time.Time
+}
+
+// PurgeHasOccurred reports whether retention is known to have removed terminal rows.
+//
+// Returns:
+//   - bool: true only when the log was read AND it records at least one deletion. An
+//     unread log answers false, so callers must consult Recorded before treating that
+//     as "nothing was purged".
+func (t EventOutboxPurgeTotals) PurgeHasOccurred() bool {
+	return t.Recorded && t.RowsRemoved > 0
+}
+
+// EventRecordCoordinate is what one outbox row claims about the broker: the exact record
+// its publish produced.
+//
+// It is the unit the only sound part of the reconciliation is built from. Counting alone
+// cannot distinguish a surplus of redeliveries from a surplus that is concealing an equal
+// number of losses, whereas a coordinate can be CHECKED: a claimed offset at or beyond the
+// partition's end offset names a record that does not exist, which is direct evidence
+// rather than an inference from totals.
+type EventRecordCoordinate struct {
+	// Topic and Partition identify the log the claims belong to.
+	Topic     string
+	Partition int
+
+	// Rows is how many terminal rows claim a record in this partition.
+	Rows int64
+
+	// MinOffset and MaxOffset bound the claimed offsets. They are compared against the
+	// partition's live bounds: MaxOffset at or beyond the end offset means rows claim
+	// records the log does not contain, and MinOffset below the first retained offset
+	// means the oldest claims can no longer be verified because those records have aged
+	// out.
+	MinOffset int64
+	MaxOffset int64
+}
+
+// EventRecordCoordinateAudit is every partition the outbox claims a record in.
+//
+// Rows without a coordinate are absent by construction: they are already counted as
+// unconfirmed by EventOutboxAudit, and that count is what makes the verdict inconclusive
+// while any exist.
+type EventRecordCoordinateAudit struct {
+	// Coordinates is one entry per (topic, partition) the outbox names, in topic then
+	// partition order so a report reads deterministically.
+	Coordinates []EventRecordCoordinate
+
+	// MeasuredAt is when the outbox was read.
+	MeasuredAt time.Time
+}
+
+// TotalRows sums the claims across every partition.
+//
+// Returns:
+//   - int64: how many terminal rows name a broker record.
+func (a EventRecordCoordinateAudit) TotalRows() int64 {
+	var total int64
+	for _, coordinate := range a.Coordinates {
+		total += coordinate.Rows
+	}
+
+	return total
+}
+
+// HasFilters reports whether any narrowing was requested.
+//
+// Returns:
+//   - bool: true when at least one of the three filters is set.
+func (q DeadLetterQuery) HasFilters() bool {
+	return q.EventType != "" || q.Topic != "" || q.Status != ""
 }
 
 // FailureMetadata is the diagnostic record appended to an event when its retry
@@ -970,11 +2143,50 @@ type FailureMetadata struct {
 // attributed by outcome. Declaring the vocabulary once, here, is what stops the
 // code and the metric label set from silently drifting apart.
 //
+// # THREE VALUES, AND THE VOCABULARY IS FROZEN
+//
+// dispatched, retrying, dead_lettered. That is the publish-outcome contract the
+// publisher abstraction is required to report, and it is closed: a fourth public
+// value is a change to a contract subscribers' dashboards, the metrics reference and
+// the alert rules are all written against.
+//
+// A fourth value, `failed`, was previously declared here to express "this attempt
+// failed and nothing further will be tried". It has been removed. That statement is a
+// PROPERTY OF THE ATTEMPT rather than a fourth kind of outcome, so it now travels as
+// its own boolean on the publisher's result — see PublishResult.Terminal — and as its
+// own `terminal` metric attribute beside the outcome. Nothing is lost by the change:
+// "how many events are actually stuck" is still answerable, from
+// outcome="retrying" narrowed by terminal="true", and the two facts are now
+// independent instead of one collapsing the other.
+//
 // It is deliberately distinct from the EventOutboxStatus* values below:
 // PublishStatus describes a single attempt and is never persisted, whereas the
 // outbox status describes the row's durable state machine. An event can report
 // PublishStatusRetrying several times while its row stays in the processing
 // state.
+//
+// # THE VOCABULARY IS EXACTLY THREE VALUES, AND THAT IS A FROZEN CONTRACT
+//
+// Requirement R-3 names dispatched, retrying and dead-lettered, and no more. A
+// fourth value, "failed", was added here to express "this attempt failed and
+// nothing further will be tried"; it was removed because the status vocabulary is
+// a PUBLISHED metric label domain, so widening it changes every recorded query and
+// every dashboard selection an operator wrote against the documented set.
+//
+// The distinction that value carried is real and is still made — it just lives
+// somewhere a metric label domain does not: PublishResult.Transient carries the
+// classification, PublishResult.Classified says whether a classification was made
+// at all, and PublishError.Transient carries the same verdict on the error itself.
+// A caller asking "can another attempt succeed?" reads PermanentFailure(), not the
+// status. Keeping the two apart is what lets the classification grow — a reason
+// code, a retry-after hint — without touching a published label domain.
+//
+// So: a failed attempt reports PublishStatusRetrying whether or not a further
+// attempt will actually be made, because "retrying" describes the attempt's place
+// in the sequence rather than a decision the publisher took. Whether the sequence
+// continues is the relay's call, made against the row's own budget in SQL, and
+// PublishStatusDeadLettered is reported only once a broker has ACKNOWLEDGED a write
+// to a `<topic>.dlt` sibling — never on the strength of a failed original publish.
 type PublishStatus string
 
 const (
@@ -982,24 +2194,45 @@ const (
 	// RequiredAcks set to all in-sync replicas, this is a durable acknowledgement,
 	// not merely a successful socket write.
 	PublishStatusDispatched PublishStatus = "dispatched"
-	// PublishStatusRetrying means the attempt failed but the retry budget is not
-	// yet exhausted, so the event will be attempted again after a backoff delay.
-	PublishStatusRetrying PublishStatus = "retrying"
-	// PublishStatusDeadLettered means the retry budget was exhausted and the
-	// event was written to the dead-letter topic with FailureMetadata attached.
-	PublishStatusDeadLettered PublishStatus = "dead_lettered"
-
-	// PublishStatusFailed means the attempt failed and NO further attempt will be made for
-	// it: either the failure is permanent, or it was the last attempt the row's budget
-	// allowed. It is an ATTEMPT outcome and is never persisted as a row's status — the
-	// row's terminal state is PublishStatusDeadLettered.
+	// PublishStatusRetrying means the attempt FAILED. It is the single failure outcome,
+	// and it covers both a failure another attempt may recover from and one nothing can:
+	// whether anything further will be tried is reported separately, by
+	// PublishResult.Terminal and by the `terminal` metric attribute, because that is a
+	// property of the attempt rather than a different kind of outcome.
 	//
-	// It exists because none of the other three can express "this attempt failed and
-	// nothing further will be tried", and reporting that as PublishStatusRetrying made a
-	// permanently-stuck event indistinguishable from a busy one in both the logs and the
-	// attempts counter.
-	PublishStatusFailed PublishStatus = "failed"
+	// Read the name as "this attempt did not deliver the event, and the row is still in
+	// the relay's hands" rather than as a promise that a retry is scheduled — the retry
+	// decision belongs to the relay and to the row's own budget in SQL, never to the
+	// publisher.
+	PublishStatusRetrying PublishStatus = "retrying"
+	// PublishStatusDeadLettered means the event was written to its dead-letter topic
+	// with FailureMetadata attached AND A BROKER ACKNOWLEDGED THAT WRITE.
+	//
+	// The acknowledgement is the whole condition. Reporting this on the strength of a
+	// failed original publish claimed a preservation that had not happened — and for an
+	// event whose destination lies outside the topic catalogue, never would — so the
+	// counter operations reads to answer "how much are we dead-lettering?" counted
+	// events that were nowhere at all. Only the dead-letter writer may set it.
+	PublishStatusDeadLettered PublishStatus = "dead_lettered"
 )
+
+// AllPublishStatuses returns the complete per-attempt outcome vocabulary, in the
+// order the metric documentation lists it.
+//
+// It exists so that the metrics layer, the load harness and the tests enumerate the
+// label domain from one declaration rather than each rebuilding it — a fourth value
+// appearing in one copy and not another is how a dashboard selection silently starts
+// missing a population.
+//
+// Returns:
+//   - []PublishStatus: a fresh slice; the caller may sort or filter it freely.
+func AllPublishStatuses() []PublishStatus {
+	return []PublishStatus{
+		PublishStatusDispatched,
+		PublishStatusRetrying,
+		PublishStatusDeadLettered,
+	}
+}
 
 // EventOutboxStatus* are the durable states of an EventOutbox row — the values
 // stored in the blnk.event_outbox status column and the values the relay's claim
@@ -1130,16 +2363,25 @@ var eventOutboxStatuses = map[string]struct{}{
 }
 
 // terminalEventOutboxStatuses is the subset of states from which no further
-// delivery attempt is owed. It is what the retention purge is allowed to delete
-// and what a caller checks before concluding an event's lifecycle is over.
+// delivery attempt is owed, and it is what a caller checks before concluding an
+// event's delivery lifecycle is over.
+//
+// IT IS NOT THE RETENTION PREDICATE, and the distinction is the whole of SEC-08.
+// Terminal means "Blnk will not try again". Purgeable means "the row may be
+// destroyed", and for a dead-lettered row those are not the same claim: the event
+// reached no subscriber, so the row is the only record that it went undelivered and
+// the only thing a replay can be driven from. Deleting it on an age timer destroys
+// that evidence unrecoverably. Retention therefore reads
+// EventOutbox.IsPurgeableByRetention, which additionally requires an operator
+// resolution on a dead-lettered row; this set answers the narrower question it is
+// named for.
 //
 // failed is deliberately NOT terminal even though the retry budget is spent: the
 // dead-letter write is still owed, and until it lands the event exists only in
-// this table. Purging a failed row would therefore destroy the only copy.
-// replaying is not terminal for the obvious reason that a publish is in flight.
-// webhook_pending is not terminal because a delivery is still owed on the legacy
-// leg — purging such a row would drop that webhook silently, which is the exact
-// loss the state was introduced to stop.
+// this table. replaying is not terminal for the obvious reason that a publish is in
+// flight. webhook_pending is not terminal because a delivery is still owed on the
+// legacy leg — treating such a row as finished would drop that webhook silently,
+// which is the exact loss the state was introduced to stop.
 var terminalEventOutboxStatuses = map[string]struct{}{
 	EventOutboxStatusDispatched:   {},
 	EventOutboxStatusDeadLettered: {},
@@ -1161,8 +2403,11 @@ func IsKnownEventOutboxStatus(status string) bool {
 }
 
 // IsTerminalEventOutboxStatus reports whether status is a state from which no
-// further delivery attempt is owed, and is therefore eligible for retention
-// purging.
+// further delivery attempt is owed.
+//
+// It does NOT answer whether the row may be deleted — a dead-lettered row is
+// terminal and is not purgeable until an operator resolves it. Use
+// EventOutbox.IsPurgeableByRetention for that question.
 //
 // Parameters:
 //   - status string: the status literal to test.
@@ -1177,14 +2422,157 @@ func IsTerminalEventOutboxStatus(status string) bool {
 // TerminalEventOutboxStatuses returns the terminal states, in state-machine
 // order, as a fresh slice the caller may retain or reorder.
 //
-// It exists so the retention purge can enumerate exactly what it is permitted to
-// delete from one authoritative place rather than restating the pair at the call
-// site, where an addition here would not reach it.
+// It exists so a caller reasoning about which states are finished enumerates them
+// from one authoritative place rather than restating the pair. It is NOT what the
+// retention purge selects on: that predicate is narrower, because dead_lettered is
+// terminal without being purgeable. See EventOutbox.IsPurgeableByRetention.
 //
 // Returns:
 //   - []string: dispatched then dead_lettered.
 func TerminalEventOutboxStatuses() []string {
 	return []string{EventOutboxStatusDispatched, EventOutboxStatusDeadLettered}
+}
+
+// DeadLetterInventoryStatuses returns the two states the dead-letter inventory is
+// composed of, as a fresh slice.
+//
+// 'failed' is in it alongside 'dead_lettered', and its presence is the more urgent
+// half: a failed row has spent its retry budget and, while dlt_topic is still NULL,
+// no copy of the event exists on any topic — the outbox row IS the event. An
+// inventory that showed only dead_lettered would hide exactly the rows an operator
+// most needs to see.
+//
+// It is declared here so the list query, the count query and the status filter's
+// validation all read one list. Two of them agreeing and a third not is a filter
+// that returns an empty page for a state the inventory actually holds, which reads
+// to an operator as "nothing is stuck".
+//
+// Returns:
+//   - []string: dead_lettered then failed.
+func DeadLetterInventoryStatuses() []string {
+	return []string{EventOutboxStatusDeadLettered, EventOutboxStatusFailed}
+}
+
+// DeadLetterQuery is the WHOLE narrowing a dead-letter inventory read may express, and
+// it is the single contract the list and the count are both driven from.
+//
+// # Why one struct rather than a widening parameter list
+//
+// The inventory used to be read by `ListDeadLetteredEvents(ctx, limit, offset)` and
+// filtered IN MEMORY afterwards, by paging the whole inventory and applying the
+// predicates in Go up to a fixed scan ceiling. That produced a page that looked
+// ordinary and was silently incomplete once the ceiling was reached, and it made an
+// exact total impossible: the count came from a whole-table per-status aggregate that
+// knew nothing about the event-type or topic filter, so `include_count` had to be
+// refused for any filtered request. A paging client cannot detect either failure.
+//
+// Pushing the narrowing into SQL fixes both at once, and it has to be ONE type for the
+// list and the count or the two can disagree about what they are describing — a total
+// computed over a different predicate than the page is worse than no total at all.
+//
+// # The zero value is the whole inventory
+//
+// Every field is optional and an unset field narrows nothing, so `DeadLetterQuery{}`
+// is "the whole inventory, default page". That is what lets the age scan and the
+// operator listing share one method rather than justifying a second one.
+type DeadLetterQuery struct {
+	// EventType narrows to one event name, for example "transaction.applied".
+	// Surrounding whitespace is ignored; empty narrows nothing.
+	EventType string
+
+	// Topic narrows to one ORIGINAL category topic, for example "blnk.transactions".
+	// Filtering on the original topic rather than on the `.dlt` sibling is what makes
+	// "show me the transaction events that are stuck" expressible without the caller
+	// having to know the suffix convention.
+	Topic string
+
+	// Status narrows to one of DeadLetterInventoryStatuses. Anything else must be
+	// refused by the caller rather than passed through: a status the inventory cannot
+	// contain would match nothing, and an empty page reads as "nothing is stuck".
+	Status string
+
+	// UnresolvedOnly restricts the result to rows no operator has accounted for.
+	//
+	// It is the narrowing triage actually starts from: once retention is enabled, resolved
+	// rows accumulate in the inventory until their period elapses, and an operator asking
+	// "what is still outstanding?" must not have to read past them. The dead-letter age
+	// gauge reads the same subset, so the number an operator sees and the number
+	// DeadLetterMessageStuck fires on are drawn from one predicate.
+	//
+	// A `failed` row can never be resolved — its dead-letter write is still owed — so this
+	// narrows the dead_lettered population only.
+	UnresolvedOnly bool
+
+	// ResolvedOnly restricts the result to rows an operator HAS accounted for, which is how
+	// the backlog awaiting retention is inspected.
+	//
+	// Setting both this and UnresolvedOnly asks for rows that cannot exist; see
+	// Contradictory, which names that rather than letting SQL return an empty page an
+	// operator would read as "nothing is stuck".
+	ResolvedOnly bool
+
+	// OccurredFrom and OccurredTo bound the event's OCCURRENCE instant, inclusively,
+	// and either may be zero to leave that end unbounded.
+	//
+	// occurred_at is the right column for a triage window rather than created_at or
+	// last_attempted_at: it is the instant the ledger mutation happened, which is what
+	// an operator correlating a dead-letter backlog against an incident timeline has.
+	// It is also the column the inventory is ordered by, so a window and the paging
+	// agree about what "newest first" means.
+	OccurredFrom time.Time
+	OccurredTo   time.Time
+
+	// Limit is the maximum number of rows to return. Zero or negative selects the
+	// repository default; anything above its maximum is clamped there.
+	Limit int
+
+	// Offset is how many MATCHING rows to skip. Negative is clamped to zero. Because
+	// the narrowing is applied in SQL, this is an offset into the FILTERED set, which
+	// is what makes a filtered page behave like a page of the filtered inventory
+	// rather than a filtered page of the unfiltered one.
+	Offset int
+}
+
+// Filtered reports whether the query narrows the inventory at all.
+//
+// It exists for observability rather than for control flow — there is one query path
+// now, filtered or not — so a span or a log line can say whether a page was narrowed
+// without restating the field list.
+//
+// Returns:
+//   - bool: true when at least one narrowing field is set.
+func (q DeadLetterQuery) Filtered() bool {
+	return strings.TrimSpace(q.EventType) != "" ||
+		strings.TrimSpace(q.Topic) != "" ||
+		strings.TrimSpace(q.Status) != "" ||
+		!q.OccurredFrom.IsZero() ||
+		!q.OccurredTo.IsZero() ||
+		q.UnresolvedOnly ||
+		q.ResolvedOnly
+}
+
+// IsEmpty reports whether the query narrows nothing, so a caller can tell a page of
+// everything from a page of a subset without re-deriving the rule.
+//
+// The inverse of Filtered, named for the filtering call sites that read better in the
+// negative. One rule, two spellings — not two rules.
+//
+// Returns:
+//   - bool: true for the zero value.
+func (q DeadLetterQuery) IsEmpty() bool {
+	return !q.Filtered()
+}
+
+// Contradictory reports whether the query asks for rows that cannot exist.
+//
+// Only one combination can: resolved and unresolved at once. It is worth naming rather than
+// letting SQL return zero rows, because an empty page in this endpoint reads as "nothing is
+// stuck" and that is the answer least safe to give by accident.
+//
+// Returns:
+//   - bool: true when the narrowing is self-contradictory.
+func (q DeadLetterQuery) Contradictory() bool {
+	return q.UnresolvedOnly && q.ResolvedOnly
 }
 
 // EventOutboxStatuses returns EVERY state in the outbox state machine, in
@@ -1401,6 +2789,59 @@ func IsBlnkEventTopic(topic, prefix string) bool {
 	return false
 }
 
+// IsBlnkEventTopicUnderAnyPrefix reports whether topic is a topic Blnk owns under ANY of
+// the given prefixes.
+//
+// # Why more than one prefix is a real case
+//
+// An outbox row records its fully-resolved destination topic at INSERT time, so a
+// deployment that changes KAFKA_TOPIC_PREFIX still holds rows naming the previous
+// generation's topics. Those rows are committed events that must still be published, must
+// still be able to dead-letter, and must still be replayable. A single-prefix test refuses
+// every one of them after a restart, so nothing drains them — which is a delivery outage
+// caused by a rename, with the events safe in the table and no transport willing to carry
+// them.
+//
+// The set of prefixes is an EXPLICIT ALLOWLIST supplied by the caller — the configured
+// prefix plus KAFKA_HISTORICAL_TOPIC_PREFIXES — and not a relaxation to "any prefix with a
+// recognised category". The looser rule would admit "attacker.transactions", which has the
+// same shape as a real name and none of the same meaning, and the callers of this predicate
+// are the two places a stored string becomes either a persisted destination or an outbound
+// connection carrying Blnk's own producer credentials. Only an operator can say which
+// namespaces a deployment has actually owned.
+//
+// Parameters:
+//   - topic string: the fully-resolved topic name to test.
+//   - prefixes []string: the namespaces this deployment owns. Blank entries are skipped. An
+//     empty or all-blank list falls back to DefaultEventTopicPrefix, matching
+//     IsBlnkEventTopic's single-prefix behaviour, which is the STRICTEST available answer
+//     rather than a permissive one.
+//
+// Returns:
+//   - bool: true when the name is a Blnk-owned category or dead-letter topic under at least
+//     one of the prefixes.
+func IsBlnkEventTopicUnderAnyPrefix(topic string, prefixes []string) bool {
+	matched := false
+	for _, prefix := range prefixes {
+		if strings.TrimSpace(prefix) == "" {
+			continue
+		}
+		matched = true
+		if IsBlnkEventTopic(topic, prefix) {
+			return true
+		}
+	}
+
+	if matched {
+		return false
+	}
+
+	// No usable prefix was supplied. Delegating with a blank prefix resolves to
+	// DefaultEventTopicPrefix inside IsBlnkEventTopic, so the two functions cannot disagree
+	// about what an unconfigured caller owns.
+	return IsBlnkEventTopic(topic, "")
+}
+
 // uuidCanonicalLength is the length of a canonical hyphenated UUID,
 // "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
 const uuidCanonicalLength = 36
@@ -1452,58 +2893,67 @@ func IsCanonicalUUID(s string) bool {
 //	transactions → blnk.transactions → blnk.transactions.dlt
 //	balances     → blnk.balances     → blnk.balances.dlt
 //	identities   → blnk.identities   → blnk.identities.dlt
-//	ledgers      → blnk.ledgers      → blnk.ledgers.dlt
 //	system       → blnk.system       → blnk.system.dlt         (internal)
 //
-// FIVE CATEGORIES, TEN TOPICS, AND THE LIST IS CLOSED. It is the agreed topic
+// FOUR CATEGORIES, EIGHT TOPICS, AND THE LIST IS CLOSED. It is the agreed topic
 // contract: subscribers, the provisioning script, the Kubernetes configuration and
-// the local stack all enumerate exactly these names, so adding a sixth category here
+// the local stack all enumerate exactly these names, so adding a fifth category here
 // silently obliges every one of them to be changed too. A new category is a
-// deliberate contract change, never an implementation detail.
+// deliberate contract change, never an implementation detail, and
+// TestEventCatalogue_CategorySetIsClosed fails the build if one appears without that
+// change being made deliberately.
 //
 // Nothing in this file knows the prefix, builds a topic name, or appends the
 // `.dlt` suffix. Treating a value returned from here as a topic is a bug.
 //
-// # Why there are two categories beyond the three the requirements name
+// # Why there is one category beyond the three the requirements name
 //
 // Two event types that really are emitted belong to none of the three categories
 // the requirements name: "ledger.created", raised by the post-ledger-creation
 // actions, and "system.error", raised through the registered webhook-sender
 // indirection when an internal error is notified. At the same time the coverage
 // requirement is absolute — every event type that reaches the legacy webhook
-// sender must be published, with zero exceptions — and so is the migration's
-// promise that a subscriber can consume what the webhook used to deliver it.
+// sender must be published, with zero exceptions.
 //
-// THEY GET ONE CATEGORY EACH, `ledgers` and `system`, both following the identical
-// naming convention so nothing about the scheme is special-cased. That is
-// AMBIGUITY-2's resolution, and every alternative is worse. Forcing ledger events
-// onto, say, the transactions topic corrupts that topic's semantics for every
-// subscriber that filters on it. Dropping them violates the coverage requirement
-// outright. And putting BOTH into one extra category — which is what this file used
-// to do — is worse than either, because the two have opposite access requirements:
-// system.error must be ungrantable and ledger.created must be grantable, so a shared
-// topic had to choose, and it chose to make ordinary ledger data unreachable by
-// every subscriber credential Blnk can issue.
+// BOTH GO TO ONE EXTRA CATEGORY, `system`, following the identical naming
+// convention so nothing about the scheme is special-cased. That is AMBIGUITY-2's
+// resolution as the agreed plan states it — three named category topics plus
+// blnk.system and its blnk.system.dlt sibling — and the plan is the frozen
+// contract here, not a starting point. The alternatives it rejects are worse:
+// forcing ledger events onto, say, the transactions topic corrupts that topic's
+// semantics for every subscriber that filters on it, and dropping them violates the
+// coverage requirement outright.
 //
-// Only `system` is INTERNAL, so no subscriber principal may be granted its topic.
-// That is a deliberate consequence and not an oversight: system.error's payload is
-// the frozen legacy body, so it still carries the error text as it renders, and
-// narrowing it would break the payload-preservation guarantee. The disclosure is
-// therefore contained by audience rather than by redaction, and it costs a
-// subscriber nothing it used to receive, because the only event type left inside
-// the internal category is the one whose audience was always the operator alone.
+// A FIFTH `ledgers` CATEGORY WAS TRIED AND REMOVED. The argument for it was that
+// `system` is internal, so routing `ledger.created` there leaves it unreachable by
+// any subscriber credential — which is true. It was still the wrong change, for two
+// reasons that outrank it. The topic catalogue is a PUBLISHED contract: subscribers,
+// the provisioning script, the ACL allowlist, the local stack and the Kubernetes
+// configuration all enumerate it, so a fifth subscriber-facing topic obliges every
+// subscriber wanting universal coverage to hold an extra grant it was never told
+// about. And the catalogue is frozen at four in the agreed plan, so widening it is a
+// contract change that belongs to a deliberate revision of that plan rather than to
+// this implementation. Making `ledger.created` consumable is therefore an
+// ACCESS-MODEL question, and it is answered by granting the system category to the
+// subscriber that needs ledger events rather than by minting a topic the plan does not
+// name.
+//
+// `system` IS grantable, and granting it is a deliberate per-subscriber decision
+// rather than a category-wide one. That matters most for `system.error`, whose payload
+// is the frozen legacy body and therefore still carries the error text as it renders:
+// narrowing it would break the payload-preservation guarantee, so the disclosure is
+// contained by AUDIENCE — by which subscribers are granted the topic — instead of by
+// redaction. See EventCategorySystem, which states what such a grant discloses. Coverage and reachability are different questions, and only the
+// first is absolute — every event, `ledger.created` included, is durably captured,
+// published, observable and replayable.
 //
 // # Where an event type this table does not recognise goes
 //
 // To the SYSTEM category, which is the catch-all as well as the home of
-// system.error. That placement is safe for the one reason that
-// matters: the system category is INTERNAL, so no subscriber can be granted its
-// topic (see IsInternalEventCategory and SubscriberGrantableEventCategories). An
-// uncatalogued event is therefore published — the coverage guarantee is absolute
-// and the row is already committed by the time routing happens, so it can be
-// neither dropped nor refused — while remaining unreachable by any subscriber.
-// Containment does not need a category of its own; it needs a topic no grant
-// covers, and the system topic already is one.
+// system.error and ledger.created. An uncatalogued event is therefore published —
+// the coverage guarantee is absolute and the row is already committed by the time
+// routing happens, so it can be neither dropped nor refused — and it is published to
+// the one topic whose audience is already the narrowest an operator grants.
 //
 // Anything arriving there under an unrecognised name is a defect to fix by
 // extending EventCategory, not a state to design around, which is why the publisher
@@ -1516,100 +2966,98 @@ const (
 	EventCategoryBalances = "balances"
 	// EventCategoryIdentities covers identity events.
 	EventCategoryIdentities = "identities"
-	// EventCategoryLedgers covers ledger events, and it is SUBSCRIBER-FACING.
+	// EventCategorySystem covers `ledger.created` and internal-error events, and it is
+	// also the CATCH-ALL for an event type EventCategory does not recognise.
 	//
-	// It exists because `ledger.created` belongs to none of the three categories the
-	// requirement names, and because it is ordinary ledger data that a subscriber has
-	// every right to consume. Its payload is a *model.Ledger — a name, an id, a
-	// creation instant and the caller's own metadata — which is exactly the shape of
-	// `identity.created` and no more sensitive than it.
+	// It is the ONE category AMBIGUITY-2 adds to the requirement's three named ones.
+	// Neither `ledger.created` nor `system.error` belongs to transactions, balances or
+	// identities, and the coverage requirement admits no exceptions, so they need a
+	// category rather than being forced into an unrelated one — which would corrupt
+	// that topic's meaning for the subscribers filtering it — or dropped, which would
+	// breach coverage outright.
 	//
-	// # Why it is not the system category, which is where it used to live
+	// # `ledger.created` lives here, and a fifth `ledgers` category was removed
 	//
-	// Putting it there made it UNREACHABLE. Every event in this catalogue reached the
-	// legacy webhook, so a subscriber consuming webhooks today receives
-	// `ledger.created`; the system category is internal by design, so no principal can
-	// be granted its topic. A subscriber migrating to Kafka would therefore have LOST
-	// this event at the sunset with nothing offered in its place — a silent regression
-	// in the one direction the migration promises not to regress, and a breach of the
-	// coverage requirement read as it is meant to be read: coverage of a transport
-	// nobody can subscribe to is not coverage.
+	// The agreed plan's topic table places `ledger.created` on this topic, and the
+	// catalogue is frozen at four categories. An implementation that gave ledger
+	// events a subscriber-facing `blnk.ledgers` topic of their own was reverted: the
+	// catalogue is published, so a fifth topic obliges every subscriber that wants
+	// universal coverage to hold an additional grant, and widening a frozen contract
+	// is a revision of the plan rather than an implementation detail.
 	//
-	// Sharing a topic with `system.error` was also the reason it could not simply be
-	// made grantable: that would have exposed internal error detail to every
-	// subscriber granted ledger events. Splitting the two is what lets each get the
-	// audience it should have.
-	EventCategoryLedgers = "ledgers"
-	// EventCategorySystem covers internal-error events, and it is also the CATCH-ALL
-	// for an event type EventCategory does not recognise.
+	// That does leave `ledger.created` unreachable by a subscriber credential, because
+	// this category is internal. That is a real consequence and it is recorded rather
+	// than hidden — in docs/event-streaming.md, where a subscriber reads it. It is an
+	// ACCESS-MODEL decision (does the system category, or some subset of it, become
+	// grantable?) and it is owned by the plan, in one place, instead of being answered
+	// here by minting a topic.
 	//
-	// It is one of the two categories AMBIGUITY-2 resolves the requirement's three
-	// named ones into. `system.error` belongs to none of transactions, balances or
-	// identities, and the coverage requirement admits no exceptions, so it needs a
-	// category of its own rather than being forced into an unrelated one — which would
-	// corrupt that topic's meaning for the subscribers filtering it — or dropped,
-	// which would breach coverage outright.
+	// They share ONE category rather than getting one each. A separate grantable
+	// `ledgers` category was tried and removed: it added a fifth category and two more
+	// topics to a public contract the provisioning script, the Kubernetes
+	// configuration, the local stack and the subscriber documentation all enumerate,
+	// and it widened what a subscriber credential can reach beyond the agreed layout.
+	// The reachability argument that motivated it is real and is answered in the
+	// documentation instead — `ledger.created` is captured, published, observable and
+	// replayable; what it does not have is a subscriber ACL.
 	//
-	// # It is INTERNAL: no subscriber principal may be granted it
+	// # `ledger.created` lives here, and that is the frozen contract
 	//
-	// Two independent reasons, either of which is sufficient on its own:
+	// Its payload is a *model.Ledger — a name, an id, a creation instant and the
+	// caller's own metadata — and on its own merits it is ordinary ledger data. It
+	// shares this category with `system.error` because the agreed catalogue is four
+	// categories and eight topics, and a fifth category invented to separate them
+	// would be an implementation quietly rewriting a contract that the provisioning
+	// script, both compose stacks, the Kubernetes configuration and the operator
+	// documentation all enumerate.
+	//
+	// The consequence is stated plainly rather than left to be discovered: because
+	// this category is internal, `ledger.created` is captured, published, observable
+	// and replayable like every other event, and it is NOT consumable by any
+	// subscriber credential Blnk issues. Making the category grantable to recover that
+	// reachability would hand the same subscribers the verbatim internal error text
+	// `system.error` carries, which cannot be narrowed without breaking the
+	// payload-preservation guarantee. Recovering it therefore requires a decision from
+	// whoever owns the topic catalogue — a fifth grantable category, or a redaction
+	// exception for the system payload — and not a change here.
+	//
+	// # It is GRANTABLE, and granting it is a DELIBERATE operator decision
+	//
+	// This category is not withheld at the allowlist, because withholding it would
+	// withhold `ledger.created` — an event the legacy webhook transport delivers
+	// today — from every subscriber, and the four-category layout is what put that
+	// event here. A migration whose stated promise is that no event is lost cannot
+	// make one of them unreachable as a side effect of a topic assignment. See
+	// SubscriberGrantableEventCategories.
+	//
+	// What a grant of this category discloses is stated here so the decision is made
+	// with the facts:
 	//
 	//   - system.error's payload is the FROZEN LEGACY BODY, {"error": <text>,
 	//     "time": <now>}, and the <text> is the error as it renders. A PostgreSQL
 	//     error names schema, table, column and routine; a broker error names
 	//     internal addresses. That body cannot be narrowed without breaking the
-	//     payload-preservation guarantee the whole migration rests on, so the
-	//     disclosure is contained by AUDIENCE instead: the bounded, classified
-	//     diagnosis goes to the operator log (see internal/notification), and the
-	//     verbatim body goes to a topic no grant covers.
-	//   - Being internal is exactly what makes it a safe catch-all. An uncatalogued
-	//     event type lands on a topic no subscriber can be granted, so a routing
-	//     omission cannot deliver a domain payload — a balance record, an identity
-	//     record — to an audience that never asked for it.
+	//     payload-preservation guarantee the whole migration rests on. So a
+	//     subscriber granted this topic reads Blnk's own error text.
+	//   - It is also the catalogue's CATCH-ALL. An uncatalogued event type is routed
+	//     here, so a routing omission places a payload of unknown provenance on this
+	//     topic. The publisher logs at warning level when it does, which is what
+	//     makes the omission visible rather than silent.
 	//
-	// Coverage is still absolute and is not the same question as reachability. Every
-	// event, including this one, is durably captured, published, observable and
-	// replayable; the publisher logs at warning level when it routes an
-	// unrecognised type here so the omission is visible rather than silent. What an
-	// internal category withholds is a subscriber ACL, not the event.
+	// The consequence for an operator is a rule, not a prohibition: grant this
+	// category only to a subscriber that needs `ledger.created`, and treat what else
+	// arrives on it as operator-visible detail. Because authorized_topics is chosen
+	// per subscriber, the narrow default is available to every deployment without the
+	// allowlist having to deny the category outright — and denying it there would take
+	// the choice away from the operator while quietly dropping an event.
 	//
-	// The ONE event type deliberately left without a subscriber route is system.error,
-	// and that is a security decision rather than an oversight. Every event describing
-	// LEDGER STATE — transactions, balances, identities and now ledgers — has a
-	// grantable topic.
+	// Coverage and reachability are both absolute here: every event, including this
+	// one, is durably captured, published, observable and replayable, and every
+	// category can be granted. docs/event-streaming.md states what this topic carries
+	// so a subscriber planning its migration reads it rather than discovers it.
+	//
 	EventCategorySystem = "system"
 )
-
-// internalEventCategories are the categories no subscriber may be granted access
-// to, keyed by category token.
-//
-// The system category holds Blnk-internal material rather than subscriber-facing
-// ledger data — internal error detail, and any event type the catalogue does not
-// recognise. Declaring the set here, once, is what lets the subscriber
-// authorization path and the provisioning script apply the same rule without
-// either of them keeping its own list.
-//
-// It is the ONLY internal category, and deliberately narrow. Every event that
-// describes ledger state has a grantable topic: transactions, balances, identities
-// and ledgers. Widening this set is how an event ends up captured, published and
-// unreachable by the subscribers it was captured for.
-var internalEventCategories = map[string]struct{}{
-	EventCategorySystem: {},
-}
-
-// IsInternalEventCategory reports whether a category is Blnk-internal and
-// therefore not grantable to a subscriber.
-//
-// Parameters:
-//   - category string: a bare category token, not a topic name.
-//
-// Returns:
-//   - bool: true for the system category, which is the only internal one.
-func IsInternalEventCategory(category string) bool {
-	_, internal := internalEventCategories[category]
-
-	return internal
-}
 
 // SubscriberGrantableEventCategories returns the categories a subscriber may be
 // authorised to consume, in a stable order.
@@ -1618,17 +3066,24 @@ func IsInternalEventCategory(category string) bool {
 // both check against, so that "which topics may a subscriber be granted?" has one
 // answer rather than one per caller.
 //
+// EVERY CATEGORY IS GRANTABLE. There is no internal category and no category-level
+// exclusion: each of the four carries event types the legacy webhook transport
+// already delivered, so withholding one would lose a migrating subscriber an event
+// it receives today. What a grant of the system category discloses, and why the
+// choice belongs to the operator rather than to this list, is documented on
+// EventCategorySystem.
+//
+// The function remains distinct from AllEventCategories rather than being replaced by
+// it, because the two answer different questions — "what categories exist" and "what
+// may be granted" — and only one of them may ever narrow. A caller that means the
+// second and asks the first would keep working today and silently over-grant the day
+// an internal category is introduced.
+//
 // Returns:
-//   - []string: a fresh slice of bare category tokens, excluding every internal
-//     category.
+//   - []string: a fresh slice of bare category tokens, in canonical order.
 func SubscriberGrantableEventCategories() []string {
 	grantable := make([]string, 0, len(eventCategoryOrder))
-	for _, category := range eventCategoryOrder {
-		if IsInternalEventCategory(category) {
-			continue
-		}
-		grantable = append(grantable, category)
-	}
+	grantable = append(grantable, eventCategoryOrder[:]...)
 
 	return grantable
 }
@@ -1645,20 +3100,20 @@ func SubscriberGrantableEventCategories() []string {
 // list is therefore composed HERE, once, and the answer is identical everywhere by
 // construction rather than by review.
 //
-// What the list EXCLUDES is the security-relevant part, and each exclusion is deliberate:
+// What the list EXCLUDES is the security-relevant part: DEAD-LETTER topics. A
+// `<topic>.dlt` holds events that already failed, together with failure metadata naming
+// broker addresses and internal error reasons. It is Blnk's operational surface, read under
+// the master key through GET /events/dead-letter, and granting one to a subscriber would
+// hand it every other subscriber's failed events. The list composes main topics only, so no
+// `.dlt` name can appear on it.
 //
-//   - DEAD-LETTER topics. A `<topic>.dlt` holds events that already failed, together with
-//     failure metadata naming broker addresses and internal error reasons. It is Blnk's
-//     operational surface, read under the master key through GET /events/dead-letter, and
-//     granting one to a subscriber would hand it every other subscriber's failed events.
-//   - The SYSTEM category, which carries `ledger.created` and `system.error` — Blnk's own
-//     diagnostics, including error text from inside the process — and, as the catch-all,
-//     any uncatalogued event type, whose contents and audience nothing has yet decided.
-//
-// What it deliberately INCLUDES is the system category, which carries `ledger.created` and
-// `system.error`. Both were delivered by the legacy webhook transport, so excluding them
-// left two of the thirteen migrated event types with no authorized path — and the payload
-// that motivated the exclusion is sanitized where it is produced rather than withheld here.
+// So the list is exactly `<prefix>.transactions`, `<prefix>.balances` and
+// `<prefix>.identities`. Two of the thirteen migrated event types — `ledger.created` and
+// `system.error` — consequently have no authorized subscriber path, which is a REAL
+// limitation of the frozen four-category catalogue and is documented as one in
+// docs/event-streaming.md rather than worked around here by minting a fifth topic.
+// Coverage is unaffected: both are captured, published, observable and replayable, and
+// both remain readable operationally under the master key.
 //
 // Parameters:
 //   - prefix string: the namespace this deployment owns. Trimmed; a blank prefix falls back
@@ -1722,15 +3177,14 @@ func IsSubscriberGrantableTopicName(topic, prefix string) bool {
 //
 // It lives here rather than in the topic-naming layer because this file owns the
 // category vocabulary; the naming layer composes topic names from it.
-// The grantable categories come first and the internal ones last, so that
-// SubscriberGrantableEventCategories — which filters this list — yields a
-// contiguous prefix of it and a reader can see at a glance where the boundary
-// between subscriber-facing and internal topics falls.
+// The three categories the requirement names come first, in the order it names them,
+// and the fourth that AMBIGUITY-2 adds comes last, so a reader of any inventory —
+// a topic listing, a reconciliation report, a log line — sees the requirement's own
+// order first and the addition where it was added.
 var eventCategoryOrder = [...]string{
 	EventCategoryTransactions,
 	EventCategoryBalances,
 	EventCategoryIdentities,
-	EventCategoryLedgers,
 	EventCategorySystem,
 }
 
@@ -1777,10 +3231,14 @@ var eventTypeCategories = map[string]string{
 	"balance.created":       EventCategoryBalances,
 	"balance.monitor":       EventCategoryBalances,
 	"identity.created":      EventCategoryIdentities,
-	// ledger.created routes to its OWN grantable category rather than to system, which
-	// is what gives a migrating subscriber a Kafka route to an event it receives over
-	// the legacy webhook today. See EventCategoryLedgers.
-	"ledger.created": EventCategoryLedgers,
+	// ledger.created routes to the SYSTEM category, which is where the agreed plan's
+	// topic table places it. That category IS grantable — see
+	// SubscriberGrantableEventCategories, which returns all four — and ledger.created is
+	// the reason it has to be: withholding the category would make a currently-delivered
+	// event unreachable to every subscriber, turning a disclosure question into a lost
+	// event. EventCategorySystem states what the grant discloses, and why the fifth
+	// `ledgers` category that used to appear here was removed instead.
+	"ledger.created": EventCategorySystem,
 	"system.error":   EventCategorySystem,
 }
 
@@ -1868,14 +3326,15 @@ func EventCategory(eventType string) string {
 		// a durable event, and dropping it would lose one.
 		//
 		// Where it goes matters as much as that it goes somewhere, and the
-		// system category answers that safely because it is INTERNAL: no
-		// subscriber can be granted its topic, so a producer added without
-		// extending the table above cannot deliver its payload — a balance
-		// record, an identity record — to an audience that never asked for it.
-		// The event stays durable, observable and replayable, and the omission
-		// stays visible: the publisher logs at warning level when it routes an
-		// event type it does not recognise, and the fix is always to add the
-		// type above rather than to design around this arm.
+		// system category is the narrowest destination available: it is the one
+		// topic an operator grants deliberately rather than as a matter of
+		// course, so a producer added without extending the table above does
+		// not deliver its payload — a balance record, an identity record — to
+		// the audience of a domain topic that never asked for it. The event
+		// stays durable, observable and replayable, and the omission stays
+		// visible: the publisher logs at warning level when it routes an event
+		// type it does not recognise, and the fix is always to add the type
+		// above rather than to design around this arm.
 		return EventCategorySystem
 	}
 }
@@ -2059,6 +3518,54 @@ func CredentialFingerprint(reference string) string {
 	return digest[:CredentialFingerprintLen]
 }
 
+// LogIdentifierHashLength is how many hex characters of a SHA-256 digest an identifier
+// pseudonym keeps.
+//
+// Sixteen hex characters is 64 bits: ample to keep every identifier in one deployment
+// distinguishable, short enough to read off a dashboard and to grep for, and not reversible.
+const LogIdentifierHashLength = 16
+
+// HashIdentifier is THE canonical pseudonym rule for an identifier that must be correlated
+// without being disclosed.
+//
+// # Why it lives here rather than in the package that first needed it
+//
+// The pseudonym has to be a PIVOT ACROSS THREE LAYERS to be worth anything. A metric label
+// carries it, a log line carries it, and the subscriber resource publishes it as
+// subscriber_id_hash so an operator holding a token from an alert can resolve it to a
+// subscriber. Those are the root package, the database package and the api/model package —
+// three packages, and the ONLY one all three already import is this one.
+//
+// A second implementation in any of them would be a second thing to keep in step, and drift
+// would be silent in the worst way: two tokens for one subscriber, an alert nobody can trace,
+// and no error anywhere. One function, imported by all three, makes the pivot true by
+// construction rather than by discipline.
+//
+// The rule is deliberately reproducible outside Go, which is the other half of being usable:
+// SHA-256 over the exact identifier bytes, hex-encoded, first LogIdentifierHashLength
+// characters. docs/kafka-operations.md publishes the shell equivalent.
+//
+// An empty input returns an empty string rather than the digest of the empty string, so
+// "no identifier" and "some identifier" stay distinguishable — a keyless message was balanced
+// across partitions rather than pinned to one, which is exactly what an ordering investigation
+// needs to see.
+//
+// Parameters:
+//   - value string: the identifier. Hashed verbatim, with no trimming or case folding, so the
+//     caller decides what the canonical form is. May be empty.
+//
+// Returns:
+//   - string: a short hex token, or "" for an empty input.
+func HashIdentifier(value string) string {
+	if value == "" {
+		return ""
+	}
+
+	sum := sha256.Sum256([]byte(value))
+
+	return hex.EncodeToString(sum[:])[:LogIdentifierHashLength]
+}
+
 // EventSubscriber is one row of blnk.event_subscribers: a registered Kafka
 // subscriber, the access boundary provisioned for it, and — during the dual-run
 // only — the legacy webhook URL it is being migrated away from (requirement R-7).
@@ -2069,45 +3576,72 @@ func CredentialFingerprint(reference string) string {
 // topics. Isolation is achieved by making each subscriber a distinct Kafka
 // principal and scoping that principal with ACLs.
 //
-// THE BOUNDARY IS EXACTLY THREE SCOPES, and the broker can check only the first
-// two:
+// THE BOUNDARY IS EXACTLY THREE SCOPES, and each one names where it is checked:
 //
-//	Topic  <each entry of AuthorizedTopics>  LITERAL   Read + Describe
-//	Group  <ConsumerGroupID>                 PREFIXED  Read
-//	Key    <PartitionKeyPrefix>              enforced by REFUSAL — see below
+//	Topic  <each entry of AuthorizedTopics>  LITERAL   Read + Describe   BROKER
+//	Group  <ConsumerGroupID>                 PREFIXED  Read              BROKER
+//	Key    <PartitionKeyPrefix>              prefix    consume           CONSUMER
 //
-// KafkaPrincipal, ConsumerGroupID and AuthorizedTopics are the two broker-checked
+// KafkaPrincipal, ConsumerGroupID and AuthorizedTopics are the two BROKER-CHECKED
 // scopes, and a provisioning call translates them into one SCRAM credential plus
 // that set of ACL bindings. KafkaPrincipal is the join key between a registry row
 // and the broker's own authorization state, because every binding names it.
 //
-// PARTITIONKEYPREFIX IS NOT PART OF THE ENFORCED BOUNDARY, and cannot be. Kafka's
-// authorizer has no message-key dimension: there is no ACL that restricts a
-// consumer to a slice of a topic by key, and no broker-side mechanism of any kind
-// that could apply one. A subscriber granted a category topic can read EVERY
-// record on that topic, whatever its key.
+// # The key scope is a DELIVERED CONTRACT, not a broker binding
 //
-// SO THE FIELD IS A CONSTRAINT THIS SYSTEM WILL NOT PRETEND TO HONOUR, AND
-// ISSUANCE FAILS CLOSED ON IT. A row carrying a non-nil prefix records an
-// authorization narrower than any credential Blnk could mint, so
-// EventSubscriberService.IssueSubscriberCredential REFUSES to issue for that row
-// rather than handing back a credential whose real scope is the whole topic. The
-// refusal names both ways forward: clear the prefix to accept whole-topic access,
-// or narrow the topic grant, which IS enforceable.
+// Kafka's authorizer has no message-key dimension. Its resource types are Topic,
+// Group, Cluster, TransactionalId, DelegationToken and User — there is no
+// partition-scoped or key-scoped resource, so no ACL, pattern type or operation
+// can confine a consumer to the records whose key carries a given prefix. That is
+// a property of Kafka rather than of this system, and no amount of care in this
+// package changes it: a principal granted Read on a shared category topic can read
+// every record on it, whatever the key.
 //
-// Calling it "advisory" — which this documentation and the column comment both
-// once did — was the more dangerous framing, however carefully qualified. The
-// field's presence in a struct describing "the access model" implies an isolation
-// guarantee the system cannot deliver, and an operator reading it would grant a
-// shared topic believing the key prefix confined the subscriber to its own
-// records. A qualification in a comment does not survive that reading; a refused
-// issuance does. If per-key isolation is genuinely required it has to come from a
-// different design — a topic per authorization domain, or a filtering gateway that
-// emits already-isolated streams — and not from this field.
+// The two designs that COULD enforce a key boundary at the broker are both closed
+// off deliberately. A resource per authorization domain — a topic per key scope —
+// is ruled out by the access model's own first line: there are no per-tenant
+// topics, because the whole point of the shared category topics is that a new
+// subscriber costs no new topics. An interposed filtering gateway that re-emits
+// already-isolated streams is subscriber-side consumer machinery, which Blnk
+// explicitly does not build. What remains is the one place the key is visible to
+// somebody entitled to act on it: the consumer.
 //
-// Nothing in this package or the provisioning path treats the prefix as a grant:
-// NewSubscriberProvisioningRequest deliberately does not map it onto any binding,
-// and HasTopicAccess ignores it.
+// SO THE PREFIX IS ISSUED, RETURNED AND STATED, rather than refused. It is part of
+// the scope the credential endpoint hands back, alongside the broker endpoint, the
+// topic list and the consumer group, so it reaches the party that can apply it;
+// and it is returned together with an explicit statement of which scopes the
+// broker enforces, so nobody has to infer that the topic grant is whole-topic.
+// EffectiveKeyScope is that statement in code, and HasKeyAccess is the one
+// authoritative predicate the prefix means, so any component that can see a
+// record's key decides with the registry's rule rather than re-deriving it.
+//
+// # Why disclosure replaced refusal
+//
+// Refusing issuance for any row carrying a prefix was the previous behaviour. It
+// kept the registry honest, but it did so by DECLINING the access model rather
+// than implementing it: a subscriber that recorded a key scope got no credential
+// at all, so the scope-by-topics-group-and-key model was unavailable in exactly
+// the case it was written for. Refusal also fixed nothing a reader could see — the
+// row still recorded a prefix, and the only thing that changed was that the
+// subscriber could not consume.
+//
+// Calling the field "advisory" in a comment was the earlier framing and was worse
+// than either, because a comment is not what somebody reads when they read a
+// database row. What replaces both is a boundary that says, at the moment a
+// credential is issued and in the response that carries it, exactly which of its
+// three scopes the broker checks and which one the consumer must apply. An
+// operator answering "can this subscriber see that ledger?" reads two enforced
+// scopes and one delivered obligation, and each is labelled.
+//
+// This is the same posture the event contract already takes for duplicate
+// suppression: Kafka delivery is at-least-once, so event_id is a documented
+// subscriber obligation rather than a promise the broker keeps. A key scope is
+// that pattern applied to authorization.
+//
+// Nothing in this package silently widens or narrows the prefix:
+// NewSubscriberProvisioningRequest carries it so the credential contract can
+// report it and deliberately maps it onto NO ACL binding, and HasTopicAccess —
+// which answers a question about topics — ignores it.
 //
 // # A deregistration in progress is a state of its own
 //
@@ -2138,8 +3672,9 @@ func CredentialFingerprint(reference string) string {
 // a zero value would destroy:
 //
 //   - PartitionKeyPrefix nil means NO key constraint was recorded, as opposed to a
-//     constraint on the empty prefix — which would invert the intent. Non-nil
-//     blocks credential issuance; see the access-model note above.
+//     constraint on the empty prefix — which would invert the intent. Non-nil is
+//     returned to the subscriber as the consumer-enforced third scope; see the
+//     access-model note above.
 //   - CredentialReference nil is the reliable test for "no credential has ever
 //     been issued", the real "registered, not yet provisioned" state.
 //   - CredentialIssuedAt nil accompanies it; the two are set and overwritten
@@ -2195,6 +3730,15 @@ type EventSubscriber struct {
 	// Kafka ACLs are topic-level and group-level; the broker has no message-key
 	// dimension to restrict on. Nil means no such constraint was recorded, which
 	// is the only state a credential can be issued in.
+	//
+	// NOTHING IN THE SERVICE WRITES A NON-NIL VALUE HERE. Registration and update
+	// both refuse a non-blank prefix outright — a stored one would state a tenancy
+	// boundary no credential for the row can have, and a row is what an operator,
+	// a migration report or a support answer is read from. A non-nil value
+	// therefore identifies a LEGACY row: one written before that refusal, or by a
+	// psql session, a data migration or a restored backup. The struct still models
+	// the column because such rows exist and must be readable, reportable and
+	// clearable; clearing is the one write to it the service performs.
 	PartitionKeyPrefix *string `json:"partition_key_prefix,omitempty"`
 
 	// --- The credential record ---
@@ -2244,39 +3788,48 @@ type EventSubscriber struct {
 	// A pending row is not an active subscriber: credential issuance refuses for it.
 	RevocationPendingAt *time.Time `json:"revocation_pending_at,omitempty"`
 
+	// RevocationFailedAt is when the MOST RECENT revocation attempt failed at the
+	// broker. Nil when no attempt has failed since the last one started.
+	//
+	// It exists because RevocationPendingAt is stamped BEFORE the broker is touched
+	// and therefore covers two situations that need different work: the broker
+	// REFUSED the revocation, or the process died between the stamp and the attempt.
+	// The first needs the administrative principal's authorization or the broker's
+	// reachability fixed before any retry can succeed; the second needs nothing but
+	// the retry. This value is cleared at the start of every new attempt, so it
+	// always describes the latest one rather than accumulating history — while
+	// RevocationPendingAt keeps the FIRST instant, because the age of the exposure
+	// is what an operator alerts on.
+	RevocationFailedAt *time.Time `json:"revocation_failed_at,omitempty"`
+
+	// --- A credential that outlived its record ---
+
+	// CredentialOrphanedAt is when an issuance left a credential at the broker that
+	// Blnk could neither record nor revoke. Nil for every healthy subscriber.
+	//
+	// Provisioning writes the SCRAM credential BEFORE the ACL bindings, because a
+	// binding for a principal that does not exist is inert while a credential with no
+	// bindings still AUTHENTICATES. So a failure to record the issuance is compensated
+	// by revoking the credential — and when that compensation also fails, a means of
+	// authenticating exists for a principal the registry records no issuance for.
+	// Before this column, the only trace of that was a log line, which meant the
+	// outstanding-revocation alert could not see it: that rule reads
+	// RevocationPendingAt, which this path never sets.
+	//
+	// IT IS NOT THE SAME STATE AS RevocationPendingAt AND THE REMEDIES ARE OPPOSITE. A
+	// row marked pending revocation is on its way out, is not an active subscriber, and
+	// is settled by RETRYING THE DEREGISTRATION. A row marked orphaned IS an active
+	// subscriber whose recorded credential is untrustworthy, and is settled by
+	// RE-ISSUING — which replaces the orphan by construction, since Kafka stores one
+	// credential per principal — or by deprovisioning if it should have no access at
+	// all. Collapsing the two would have made the re-issue remedy unreachable, because
+	// issuance refuses a row marked pending revocation.
+	CredentialOrphanedAt *time.Time `json:"credential_orphaned_at,omitempty"`
+
 	// --- Row bookkeeping ---
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
-}
-
-// DeclaresUnenforceableIsolation reports whether this subscriber's record asks for an
-// access boundary that nothing in the system can enforce.
-//
-// # The boundary that does not exist
-//
-// A non-nil PartitionKeyPrefix says "this subscriber may see only the records whose
-// partition key starts with this". Kafka has no mechanism for that: an ACL names a
-// topic, and a principal granted a topic reads every record on it. So a credential
-// issued to a subscriber that declares a prefix hands out access strictly wider than
-// the record it was issued against describes — and on a shared category topic that
-// wider access is every other subscriber's transactions, balances and identities.
-//
-// The failure mode is not a missing feature, it is a false assurance. An operator reads
-// the registry row, sees the prefix, and concludes the subscriber is confined to its own
-// records. Nothing anywhere contradicts them, because the value is accepted, stored,
-// echoed back and never enforced.
-//
-// So the value is still STORED — it is a real statement of intent, and erasing it would
-// destroy the record of what an operator asked for — and credential issuance REFUSES
-// while it is present. The remedy is explicit rather than silent: clear the prefix to
-// accept topic-level scope, which is the boundary Kafka ACLs can actually hold, or narrow
-// authorized_topics until topic-level scope IS the isolation required.
-//
-// Returns:
-//   - bool: true when a partition-key prefix is recorded.
-func (s *EventSubscriber) DeclaresUnenforceableIsolation() bool {
-	return s != nil && s.PartitionKeyPrefix != nil && strings.TrimSpace(*s.PartitionKeyPrefix) != ""
 }
 
 // HasTopicAccess reports whether the subscriber's RECORDED GRANT covers the given
@@ -2285,8 +3838,9 @@ func (s *EventSubscriber) DeclaresUnenforceableIsolation() bool {
 // The comparison is exact and the empty-grant case falls out of it naturally: a
 // subscriber with no authorised topics matches nothing, so the registry fails
 // closed rather than open. PartitionKeyPrefix is deliberately not consulted —
-// folding it in here would suggest the system can decide access per key, which it
-// cannot; a row carrying one is refused a credential outright instead.
+// this answers a TOPIC question, and folding a key scope into it would blur the
+// broker-enforced boundary with the consumer-side one. HasKeyAccess is where the
+// key scope is answered, and KeyScopeEnforcement is where the difference is named.
 //
 // This is a read over the recorded grant and is NOT a substitute for broker-side
 // ACL enforcement. The broker is the authority; this method exists so the service
@@ -2308,29 +3862,56 @@ func (s *EventSubscriber) HasTopicAccess(topic string) bool {
 // authorised topics" — the two readings are identical and the empty string is used
 // for both so no caller has to handle a third state.
 //
-// The scope is RECORDED rather than derived, and it must be: message keys on Blnk's
-// topics are the aggregate's ledger partition key, so a scope derived from the
-// subscriber's own identifier would match no record ever produced. Only the caller
-// registering the subscriber knows which ledgers it is entitled to.
+// The scope is RECORDED rather than derived, and it must be: a message key on Blnk's
+// topics is the LEDGER ID for every ledger-scoped event and otherwise an identity id,
+// a batch id or the event type — never anything derived from a subscriber — so a scope
+// computed from the subscriber's own identifier would match no record ever produced.
+// Only the caller registering the subscriber knows which ledgers it is entitled to.
+//
+// # Why it trims
+//
+// The presence predicates — RequiresClientSideKeyFiltering and KeyScopeUnenforceable —
+// trim before deciding whether a scope is recorded at all, and this accessor did not.
+// The two therefore disagreed about exactly one value: a whitespace-only prefix, which
+// the predicates read as "no scope" while HasKeyAccess and EffectiveKeyScope read as a
+// real one. No message key begins with a space, so a subscriber holding such a row was
+// told it had all-keys access and would then have discarded EVERY record it consumed —
+// silently, with nothing in the registry looking wrong. Trimming here makes the whole
+// family agree by construction, and it costs nothing: a legitimate ledger-id prefix has
+// no surrounding whitespace, and the write path refuses one that does rather than
+// trimming it, so a stored value only ever needs trimming if it predates that refusal.
 func (s *EventSubscriber) RequestedKeyScope() string {
 	if s == nil || s.PartitionKeyPrefix == nil {
 		return ""
 	}
 
-	return *s.PartitionKeyPrefix
+	return strings.TrimSpace(*s.PartitionKeyPrefix)
 }
 
 // RequiresKeyScopeEnforcement reports whether this subscriber asked for a boundary
-// narrower than a whole topic.
+// narrower than a whole topic, and therefore whether anything remains to be enforced
+// after the broker has checked the topic and group ACLs.
 //
-// It is the FAIL-CLOSED TEST that credential issuance and provisioning both consult:
-// true means the recorded boundary cannot be expressed as a Kafka ACL, so a direct
-// broker credential must be refused rather than issued with the wider access the
-// broker would really grant. See the access-model note on EventSubscriber.
+// True means the recorded boundary CANNOT BE EXPRESSED AS A KAFKA ACL, so whatever
+// narrowing it describes has to happen above the broker.
 //
-// It is deliberately not the negation of "is provisionable": a subscriber can be
-// unprovisionable for other reasons (no authorised topics, no consumer group), and
-// each of those has its own test so a refusal can name its own cause.
+// IT DOES NOT GATE A REFUSAL, and an earlier revision of this comment said it did.
+// Issuance used to fail closed on this predicate, which withdrew the mandatory
+// credential capability from every subscriber that recorded a prefix; that refusal is
+// gone. What the boundary produces now is a declaration on the credential response —
+// see RequiresClientSideKeyFiltering, which is the predicate the response is built
+// from, and api/model.SubscriberEnforcedAccess, which carries it.
+//
+// The two predicates say the same thing about every persistable row and differ only
+// on a whitespace-only prefix, which normalizeSubscriberKeyScope refuses to store.
+// This one reads the scope verbatim through RequestedKeyScope, so it is the
+// conservative reading and is what a component reasoning about ENFORCEABILITY should
+// consult; RequiresClientSideKeyFiltering trims, so it is what a WIRE RESPONSE should
+// be built from. TestEventSubscriber_RequiresClientSideKeyFilteringTreatsABlankPrefixAsAbsent
+// records the asymmetry as unreachable defence-in-depth rather than intent.
+//
+// It differs from DeclaresKeyScope only in reading the flattened accessor, and it keeps
+// its own name because it is the question a caller deciding what to DISCLOSE asks.
 func (s *EventSubscriber) RequiresKeyScopeEnforcement() bool {
 	return s.RequestedKeyScope() != ""
 }
@@ -2351,22 +3932,31 @@ func (s *EventSubscriber) RequiresKeyScopeEnforcement() bool {
 // trimming and no normalisation is applied — a caller whose key differs from the
 // recorded scope by whitespace is asking about a different key.
 //
-// IT IS NOT WHAT THE BROKER CHECKS. Kafka cannot filter by key, which is exactly why
-// a subscriber with a recorded scope is refused a direct credential: until an
-// enforcement layer calls this rule on every record, the only place the scope can be
-// honoured is a refusal.
+// IT IS NOT WHAT THE BROKER CHECKS. Kafka's authorizer has no message-key dimension,
+// so this rule is honoured wherever a record's key is visible to something willing to
+// act on it: the subscriber's own consumer, to which the scope is delivered by the
+// credential endpoint, and any Blnk-side path that reads keys — a replay, an
+// administrative export. Keeping the rule here rather than at those call sites is what
+// stops two of them disagreeing about what a recorded prefix means.
 func (s *EventSubscriber) HasKeyAccess(key string) bool {
-	scope := s.RequestedKeyScope()
-	if scope == "" {
+	// DeclaresKeyScope, not `RequestedKeyScope() != ""`. The two differ on a whitespace-only
+	// column, and here that difference decides whether EVERY record is excluded: no ledger id
+	// begins with a tab, so a scope of "\t" would make this rule refuse the subscriber's whole
+	// stream without an error anywhere. All three of this predicate, EffectiveKeyScope and the
+	// credential contract read the same presence test for that reason.
+	if !s.DeclaresKeyScope() {
 		return true
 	}
 
-	return strings.HasPrefix(key, scope)
+	// The recorded value VERBATIM, not the trimmed one: keys are opaque identifiers, so
+	// trimming here would test a different prefix than the registry recorded. Only the
+	// question "is there a scope at all" tolerates trimming.
+	return strings.HasPrefix(key, s.RequestedKeyScope())
 }
 
-// SubscriberKeyScopeAllKeys is the effective key scope of every credential Blnk can
-// issue today, and the value the credential contract reports for it: EVERY key on
-// the authorised topics.
+// SubscriberKeyScopeAllKeys is the key scope of a credential issued to a subscriber
+// that recorded no prefix, and the value the credential contract reports for it:
+// EVERY key on the authorised topics.
 //
 // It is a descriptive word rather than "*" deliberately. "*" is Kafka's own
 // match-anything resource name, so a response field carrying it would read as an ACL
@@ -2384,17 +3974,72 @@ const SubscriberKeyScopeAllKeys = "all-keys"
 //
 // Returns:
 //   - scope: SubscriberKeyScopeAllKeys when no scope was requested, which is the
-//     honest description of what a topic ACL grants; otherwise the requested scope,
-//     which is the boundary a credential would have to keep and cannot.
-//   - enforced: true only for the all-keys case. A requested prefix is reported as
-//     UNENFORCED, and that is precisely why issuance refuses it instead of handing
-//     this pair to a subscriber.
+//     honest description of what a topic ACL grants on its own; otherwise the
+//     recorded prefix, which is the boundary the consumer must apply.
+//   - enforced: whether THE BROKER enforces the scope. True only for the all-keys
+//     case, where the topic ACL is the whole boundary and nothing is left to the
+//     consumer. A recorded prefix is reported as broker-UNENFORCED, and the pair is
+//     handed to the subscriber precisely so that it knows which half is its own to
+//     keep — see the access-model note on EventSubscriber.
 func (s *EventSubscriber) EffectiveKeyScope() (scope string, enforced bool) {
-	if requested := s.RequestedKeyScope(); requested != "" {
-		return requested, false
+	// DeclaresKeyScope is the presence test, NOT `RequestedKeyScope() != ""`, and the
+	// difference is a whitespace-only prefix. RequestedKeyScope returns the column
+	// verbatim — correct, because message keys are opaque and normalising one would
+	// select a different set of records — so a column holding a tab would otherwise be
+	// reported here as a real scope. This pair is what the credential endpoint delivers
+	// to a consumer, and a consumer applying a scope of "\t" discards its ENTIRE stream
+	// silently. Sharing the one presence test is what makes that unreachable rather than
+	// merely unlikely; normalizeSubscriberKeyScope refusing such a value at persistence
+	// is the outer layer of the same defence.
+	if s.DeclaresKeyScope() {
+		return s.RequestedKeyScope(), false
 	}
 
 	return SubscriberKeyScopeAllKeys, true
+}
+
+// SubscriberSettlementObligation is one subscriber's outstanding broker-side obligation, as the
+// settlement pass sees it.
+//
+// It is a NARROW projection rather than a whole EventSubscriber, and deliberately so. The
+// obligation is an operational fact about work Blnk still owes the broker; it is not part of a
+// subscriber's public representation, so putting these columns on EventSubscriber would have
+// added them to every registry response, every row fixture and the wire contracts that pin those
+// responses field-for-field — for the benefit of one background worker.
+//
+// The worker re-reads the full row when it acts, because both remedies need the derived
+// principal, the consumer group and the authorized topic set, and deriving those twice is how
+// the broker-side grant and the registry drift apart in the first place.
+type SubscriberSettlementObligation struct {
+	// SubscriberID identifies the row that owes the work.
+	SubscriberID string
+
+	// GrantReconcilePending means the broker's ACL bindings may not match the row's recorded
+	// authorization, so the grant must be reconciled to the row.
+	GrantReconcilePending bool
+
+	// CredentialCleanupPending means a SCRAM credential may exist that Blnk intended to
+	// destroy, or the row names one that no longer works. Settlement revokes and then clears.
+	CredentialCleanupPending bool
+
+	// Attempts is how many settlement passes have already tried this row, and LastError is what
+	// the most recent one said.
+	//
+	// They are carried so a pass can log the history rather than only the present failure: an
+	// obligation on its twentieth attempt with the same broker error is a different operational
+	// situation from one on its first, and nothing else distinguishes them.
+	Attempts  int
+	LastError string
+}
+
+// Outstanding reports whether this obligation still requires work.
+//
+// It exists so no caller has to remember that an obligation is the OR of two independent flags.
+// A row is listed by the settlement scan only when one of them is set, but a pass that discharges
+// one and fails the other must be able to ask whether anything remains, and spelling that
+// condition out at each site is how the two drift apart.
+func (o SubscriberSettlementObligation) Outstanding() bool {
+	return o.GrantReconcilePending || o.CredentialCleanupPending
 }
 
 // IsProvisioned reports whether a credential has ever been issued to this
@@ -2405,7 +4050,7 @@ func (s *EventSubscriber) EffectiveKeyScope() (scope string, enforced bool) {
 // written together; either would do, and testing the reference keeps the
 // "registered, not yet provisioned" state readable at the call site.
 //
-// A NIL RECEIVER answers false, matching DeclaresUnenforceableIsolation. It has to: the repository's not-found
+// A NIL RECEIVER answers false, matching RequiresClientSideKeyFiltering. It has to: the repository's not-found
 // representation for a subscriber is a nil pointer, so every caller that reads a
 // row and then asks a question about it can hold one, and a predicate that
 // panicked there would turn a missing subscriber into a crashed ledger process
@@ -2431,24 +4076,47 @@ func (s *EventSubscriber) IsMigrated() bool {
 // Such a row is not an active subscriber. It exists only so the outstanding
 // revocation stays recoverable, and issuing a credential for it would re-arm a
 // principal that is in the middle of being taken out of service.
-// A nil receiver answers false. Both this predicate and KeyScopeUnenforceable are read as
-// GUARDS on a row that may not have been found, so they must be answerable on nothing: a guard
-// that panics where it is supposed to refuse is worse than no guard at all.
+// A nil receiver answers false. Both this predicate and RequiresClientSideKeyFiltering are read
+// as GUARDS on a row that may not have been found, so they must be answerable on nothing: a
+// guard that panics where it is supposed to refuse is worse than no guard at all.
 func (s *EventSubscriber) IsRevocationPending() bool {
 	return s != nil && s.RevocationPendingAt != nil
 }
 
-// KeyScopeUnenforceable reports whether the subscriber records a key-scoped
-// authorization constraint that Kafka cannot enforce.
+// RequiresClientSideKeyFiltering reports whether the subscriber records a partition key prefix
+// whose narrowing the SUBSCRIBER has to apply itself, because the broker will not.
 //
-// It is the predicate credential issuance fails closed on. A non-empty prefix means
-// the recorded authorization is narrower than any credential Blnk can mint, so the
-// honest answer is to refuse rather than to issue whole-topic access under a row
-// that says otherwise. The empty string is treated as absent for the same reason the
-// column is nullable: "a constraint on the empty prefix" is not an intent anybody
-// has, and reading it as one would refuse a subscriber that asked for nothing.
+// # It states a fact, and it used to state a verdict
+//
+// This predicate was called KeyScopeUnenforceable and credential issuance FAILED CLOSED on it:
+// a subscriber recording a prefix could never obtain a credential, permanently, and the
+// mandatory credential endpoint answered 409 for it forever. The intent was honesty — a
+// topic-level credential is wider than a key-scoped row appears to describe — but the effect was
+// to withdraw a required capability, and it withdrew it for a state the registry is explicitly
+// designed to hold.
+//
+// Kafka's authorizer has FIVE resource types — Topic, Group, Cluster, TransactionalId and
+// DelegationToken — and none of them is a message key. There is no binding, pattern type or
+// operation that confines a consumer to the records whose key carries a given prefix, and the
+// only architecture that would enforce a per-key boundary is a topic per key space, which is
+// ruled out: no per-tenant topics. So a key-enforcing credential is not something Blnk declines
+// to mint; it is not something that exists.
+//
+// What is therefore required is not a refusal but a STATEMENT. Issuance succeeds, and the
+// response says outright which dimensions the broker enforces, echoes the recorded prefix, and
+// answers the one question whose wrong answer is a data-disclosure bug — see
+// api/model.SubscriberEnforcedAccess. A reader of the registry or the credential response is
+// told that key filtering is the subscriber's own obligation, which is the strongest guarantee
+// available and a far better one than a comment that says the field is advisory.
+//
+// The empty string is treated as absent for the same reason the column is nullable: "a
+// constraint on the empty prefix" is not an intent anybody has.
+//
 // A nil receiver answers false, for the reason given on IsRevocationPending.
-func (s *EventSubscriber) KeyScopeUnenforceable() bool {
+//
+// Returns:
+//   - bool: true when a non-blank partition key prefix is recorded.
+func (s *EventSubscriber) RequiresClientSideKeyFiltering() bool {
 	return s != nil && s.PartitionKeyPrefix != nil && strings.TrimSpace(*s.PartitionKeyPrefix) != ""
 }
 
@@ -3384,4 +5052,554 @@ func OperatorOwnableInternalIP(address net.IP) bool {
 	}
 
 	return address.IsLoopback() || address.IsPrivate()
+}
+
+// BalanceMonitorHandoff is one row of blnk.balance_monitor_handoff: the durable
+// intent that a balance moved and its monitors have not been evaluated yet.
+//
+// # What it is for
+//
+// It is the mechanism that brings `balance.monitor` under requirement R-2. A monitor
+// fires because a CONDITION was met on a balance a transaction already committed, so
+// the alert cannot be captured inside the mutation that caused it — by the time the
+// alert exists, that transaction is gone. What CAN be captured inside the mutation is
+// the intent to evaluate, and that is this row. It is written by the same database
+// transaction that writes the balance, so a committed movement always carries its
+// pending evaluation and a rolled-back movement carries none.
+//
+// The evaluation's RESULT is then captured transactionally too: the event rows it
+// produces and this row's transition to a terminal status commit together. So the
+// sequence is at-least-once evaluation feeding an atomic capture, and the only way to
+// lose an alert is for the condition never to have been met.
+//
+// # Why the balance is carried as a snapshot
+//
+// BalanceSnapshot holds the balance exactly as the transaction wrote it. The
+// evaluation must judge THAT state: re-reading the balance later would judge whatever
+// subsequent transactions had done to it, so a threshold crossed by this movement and
+// uncrossed by the next would produce no alert, and two attempts at the same handoff
+// could reach different verdicts. Snapshotting makes the evaluation deterministic,
+// makes a retry idempotent in outcome, and lets the evaluator run in a different
+// process from the writer.
+//
+// The field is json.RawMessage rather than a *Balance so the row can be carried,
+// claimed and requeued without paying an unmarshal that only the evaluator needs. Use
+// Balance to decode it.
+//
+// The field names correspond one-to-one with the table's columns; the repository scans
+// rows directly into this struct, so the two must stay aligned.
+type BalanceMonitorHandoff struct {
+	// ID is the BIGSERIAL surrogate primary key, assigned by the database.
+	ID int64 `json:"id"`
+	// HandoffID is the business key, and it carries a unique index.
+	//
+	// It is GENERATED per handoff rather than derived from the balance, because one
+	// balance legitimately produces many handoffs — one per movement — and a derived
+	// key would collapse every movement after the first into a duplicate the index
+	// rejects, silently stopping the alerts for exactly the balances that move most.
+	HandoffID string `json:"handoff_id"`
+	// BalanceID is the balance whose monitors are to be evaluated.
+	BalanceID string `json:"balance_id"`
+	// LedgerID is the ledger the balance belongs to, carried so the resulting event
+	// can be attributed to it without a second read. A balance always has one, so
+	// this is empty only on a row written from an incomplete snapshot.
+	LedgerID string `json:"ledger_id,omitempty"`
+	// BalanceSnapshot is the balance as the transaction wrote it, marshalled.
+	BalanceSnapshot json.RawMessage `json:"balance_snapshot"`
+	// Status is the relay state machine: pending, processing, completed or failed.
+	// The values are the OutboxStatus* constants, shared with the two existing
+	// outboxes rather than duplicated, so one vocabulary describes all three.
+	Status string `json:"status"`
+	// Attempts is how many evaluation attempts this row has had.
+	Attempts int `json:"attempts"`
+	// MaxAttempts is the budget beyond which the row is marked failed.
+	MaxAttempts int `json:"max_attempts"`
+	// LastError is the most recent failure reason, empty when there has been none.
+	LastError string `json:"last_error,omitempty"`
+	// EventsCaptured is how many balance.monitor events the completed evaluation
+	// produced. Zero is the common and correct answer: it means the monitors were
+	// evaluated and none of their conditions was met.
+	//
+	// It is recorded rather than inferred because "evaluated, nothing fired" and
+	// "never evaluated" are indistinguishable from the event outbox alone, and the
+	// difference is the whole question an operator asks when an expected alert did
+	// not arrive.
+	EventsCaptured int `json:"events_captured"`
+	// CreatedAt is when the balance's transaction committed this row.
+	CreatedAt time.Time `json:"created_at"`
+	// ProcessedAt is when the row reached a terminal status, nil before that.
+	ProcessedAt *time.Time `json:"processed_at,omitempty"`
+	// LockedUntil is the claim lease expiry, nil when unclaimed.
+	LockedUntil *time.Time `json:"locked_until,omitempty"`
+}
+
+// Balance decodes the snapshot this handoff carries.
+//
+// The returned balance is the state the monitor conditions must be evaluated against —
+// see the note on BalanceSnapshot for why it is this state and not the current one.
+//
+// Returns:
+//   - *Balance: the decoded snapshot.
+//   - error: a decode failure, which means the row is not evaluable and should be
+//     failed rather than retried; re-reading the same bytes cannot succeed later.
+func (h *BalanceMonitorHandoff) Balance() (*Balance, error) {
+	if h == nil || len(h.BalanceSnapshot) == 0 {
+		return nil, fmt.Errorf("balance monitor handoff carries no balance snapshot")
+	}
+
+	balance := &Balance{}
+	if err := json.Unmarshal(h.BalanceSnapshot, balance); err != nil {
+		return nil, fmt.Errorf("failed to decode the balance snapshot: %w", err)
+	}
+
+	return balance, nil
+}
+
+// balanceMonitorHandoffPrefix is the identifier prefix for a handoff, following the
+// repository's `<module>_<uuid>` convention so an id is self-describing in a log line.
+const balanceMonitorHandoffPrefix = "bmh"
+
+// PrepareBalanceMonitorHandoffs builds one handoff per supplied balance.
+//
+// It is the model-layer half of the atomic capture: the repository writes what this
+// returns inside the balance's own transaction. It lives here rather than in the
+// repository because the snapshot IS the balance's serialised form, and the model owns
+// what a balance serialises to.
+//
+// # What is skipped, and why nothing is rejected
+//
+// A nil balance and a balance with a blank id are skipped. The writers call this
+// unconditionally for every balance they update, and a ledger movement must never be
+// refused because an alerting side effect could not be described. A marshal failure IS
+// returned, because it means the balance itself does not serialise — a fact the caller
+// needs, and one that cannot be worked around by omitting the handoff.
+//
+// # The snapshot is the balance AS PASSED
+//
+// The writers hand over balances in their post-mutation state, which is the state the
+// monitor conditions must be judged against. Marshalling here — before the transaction
+// commits — captures exactly that state, so the evaluation later judges the movement
+// that produced the handoff rather than whatever the balance has become since.
+//
+// Parameters:
+//   - balances []*model.Balance: the balances being updated, in post-mutation state.
+//
+// Returns:
+//   - []*BalanceMonitorHandoff: one handoff per usable balance, in input order.
+//   - error: a marshal failure on any balance.
+func PrepareBalanceMonitorHandoffs(balances []*Balance) ([]*BalanceMonitorHandoff, error) {
+	if len(balances) == 0 {
+		return nil, nil
+	}
+
+	handoffs := make([]*BalanceMonitorHandoff, 0, len(balances))
+	for _, balance := range balances {
+		if balance == nil || strings.TrimSpace(balance.BalanceID) == "" {
+			continue
+		}
+
+		snapshot, err := json.Marshal(balance)
+		if err != nil {
+			return nil, fmt.Errorf("failed to snapshot balance %s for monitor evaluation: %w", balance.BalanceID, err)
+		}
+
+		handoffs = append(handoffs, &BalanceMonitorHandoff{
+			HandoffID:       GenerateUUIDWithSuffix(balanceMonitorHandoffPrefix),
+			BalanceID:       strings.TrimSpace(balance.BalanceID),
+			LedgerID:        strings.TrimSpace(balance.LedgerID),
+			BalanceSnapshot: snapshot,
+			Status:          OutboxStatusPending,
+		})
+	}
+
+	return handoffs, nil
+}
+
+// BalanceMonitorEventIdentity is the stable identity of the alert one monitor produces
+// for one balance movement.
+//
+// # Why balance.monitor can be derived after all, given the right identity
+//
+// The event catalogue records balance.monitor as NOT derivable, and that is correct for
+// the identity that was available before the handoff existed: a monitor id alone. A
+// monitor fires every time its condition is met, so deriving from the monitor would
+// collapse every firing after the first into a duplicate the unique index rejects, and
+// the alerts would silently stop.
+//
+// The handoff supplies the missing half. Each balance movement gets its own handoff id,
+// so (handoff, monitor) names exactly one alert: distinct across firings, because each
+// firing has a different handoff, and stable across re-evaluations of the same handoff,
+// because the handoff id does not change.
+//
+// That stability is what makes the evaluation safe to repeat. A lapsed claim lease can
+// let two processors evaluate one handoff, and a retry can re-run one that already
+// committed; in both cases the second attempt derives the SAME event ids and collides
+// with the unique index instead of duplicating the alert. The duplicate is absorbed by
+// the schema rather than by a lock.
+//
+// Parameters:
+//   - handoffID string: the handoff the evaluation belongs to.
+//   - monitorID string: the monitor whose condition was met.
+//
+// Returns:
+//   - string: the identity to pass to DeriveEventID, empty when either part is missing,
+//     which the caller must treat as "not derivable" rather than deriving from half an
+//     identity.
+func BalanceMonitorEventIdentity(handoffID, monitorID string) string {
+	handoff := strings.TrimSpace(handoffID)
+	monitor := strings.TrimSpace(monitorID)
+	if handoff == "" || monitor == "" {
+		return ""
+	}
+
+	// A colon cannot appear in a UUID or in one of this repository's prefixed
+	// identifiers, so no two different pairs can produce the same joined string.
+	return handoff + ":" + monitor
+}
+
+// Bulk batch coordinator statuses.
+//
+// 'processing' is the single non-terminal value and is what a row is inserted with,
+// before any member transaction runs. The other three are the outcome names the
+// `bulk_transaction.<status>` event already uses as its suffix, so the coordinator's
+// status and the event's name are the same word rather than two vocabularies that can
+// drift apart.
+const (
+	// BulkBatchStatusProcessing means the batch began and has not reported an
+	// outcome. A row that stays here is the one residue the coordinator cannot
+	// remove: the process handling the batch died before it could finalise.
+	BulkBatchStatusProcessing = "processing"
+	// BulkBatchStatusApplied is a batch whose transactions were all applied.
+	BulkBatchStatusApplied = "applied"
+	// BulkBatchStatusInflight is a batch whose transactions were all left inflight.
+	BulkBatchStatusInflight = "inflight"
+	// BulkBatchStatusFailed is a batch that failed, with error_message carrying the
+	// failure and any rollback detail.
+	BulkBatchStatusFailed = "failed"
+)
+
+// BulkTransactionBatch is one row of blnk.bulk_transaction_batches: the durable
+// coordinator record for an asynchronous bulk transaction batch.
+//
+// # What it is for
+//
+// It is the mechanism that brings `bulk_transaction.<status>` under requirement R-2,
+// and it works differently from the monitor handoff because the problem is different.
+// A bulk batch has no batch-spanning database transaction — every member transaction
+// commits under its own — so there is no mutation the summary event could join. The
+// outcome therefore had nowhere durable to live: it existed only in the local
+// variables of the goroutine that computed it, and a failed capture destroyed it
+// permanently.
+//
+// This row gives the outcome a home, and the finalising transaction writes the outcome
+// and the event TOGETHER. Two facts follow, and they are the guarantee:
+//
+//   - the event cannot be missing while the outcome is recorded, and
+//   - the outcome cannot be recorded while the event is missing.
+//
+// A crash before the finalise leaves Status at 'processing', which is a visible,
+// queryable, counted state meaning "this batch began and never reported an outcome" —
+// materially different from an outcome that was declared and then evaporated.
+type BulkTransactionBatch struct {
+	// BatchID is the parent transaction id of the batch and the primary key. It is
+	// also the event's aggregate id, so the coordinator row and the event it
+	// produced are joinable on it.
+	BatchID string `json:"batch_id"`
+	// Status is one of the BulkBatchStatus* constants.
+	Status string `json:"status"`
+	// TransactionCount is the number of transactions in the batch. It is zero on a
+	// failed batch, matching the payload the failure path has always sent.
+	TransactionCount int `json:"transaction_count"`
+	// ErrorMessage is the failure detail including rollback status, empty on success.
+	ErrorMessage string `json:"error_message,omitempty"`
+	// Atomic records whether a failure rolls the whole batch back, and Inflight
+	// whether its transactions are left inflight. Both are carried so a stuck row
+	// tells an operator what the batch was ATTEMPTING, which is what decides how to
+	// finish it by hand.
+	Atomic   bool `json:"atomic"`
+	Inflight bool `json:"inflight"`
+	// EventID is the outbox event that recorded this outcome, empty until finalised.
+	// It is the proof of the atomicity: a terminal row without one would mean the
+	// outcome was recorded without its event, which the finalising transaction makes
+	// unreachable.
+	EventID string `json:"event_id,omitempty"`
+	// CreatedAt is when the batch began.
+	CreatedAt time.Time `json:"created_at"`
+	// FinalizedAt is when the outcome became terminal, nil before that. The schema
+	// constrains this to be non-nil exactly when Status is terminal.
+	FinalizedAt *time.Time `json:"finalized_at,omitempty"`
+}
+
+// IsTerminal reports whether this batch has reported an outcome.
+//
+// Returns:
+//   - bool: false only for BulkBatchStatusProcessing.
+func (b *BulkTransactionBatch) IsTerminal() bool {
+	if b == nil {
+		return false
+	}
+
+	return IsTerminalBulkBatchStatus(b.Status)
+}
+
+// IsTerminalBulkBatchStatus reports whether a coordinator status is an outcome.
+//
+// It exists as a free function because the repository's conditional finalise needs the
+// answer for a status it has read but not yet built a struct around.
+//
+// Parameters:
+//   - status string: the status to classify. Unknown values answer false, which is the
+//     conservative direction: an unrecognised status is treated as still in progress
+//     rather than as an outcome that may be overwritten.
+//
+// Returns:
+//   - bool: true for applied, inflight and failed.
+func IsTerminalBulkBatchStatus(status string) bool {
+	switch strings.TrimSpace(status) {
+	case BulkBatchStatusApplied, BulkBatchStatusInflight, BulkBatchStatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// UncorroboratedRows is how many claims of publication could not be placed inside a
+// measured window, for any reason.
+//
+// Returns:
+//   - int64: never negative.
+func (a EventRecordIntervalAudit) UncorroboratedRows() int64 {
+	uncorroborated := a.UnconfirmedRows + a.UnmeasuredRows + a.AgedOutRows + a.BeyondEndRows
+	if uncorroborated < 0 {
+		return 0
+	}
+
+	return uncorroborated
+}
+
+// EventOutboxAudit is the outbox side of the zero-loss reconciliation: how many rows
+// claim a Kafka record, and how many of those can actually name the record they
+// produced.
+//
+// # Why "published" is not the same as "terminal"
+//
+// PublishedRows deliberately counts a wider set than the terminal statuses. A row in
+// webhook_pending HAS been published to Kafka — its Kafka leg completed and
+// KafkaDispatchedAt is stamped; what remains outstanding is the deprecated HTTP leg.
+// Counting only dispatched and dead_lettered rows would leave those records
+// unaccounted for on the broker side, inflating the apparent surplus and making the
+// reconciliation looser precisely during the dual-delivery window, which is when it is
+// most needed.
+//
+// # What the split is for
+//
+// ConfirmedRows is the count that can be MATCHED to a record. UnconfirmedRows is the
+// count that cannot, and its existence is the finding this type closes: an unconfirmed
+// row is a claim of publication that nothing corroborates, and under a pure count it
+// was invisible because a redelivery elsewhere could make the totals balance.
+type EventOutboxAudit struct {
+	// PublishedRows is how many rows claim a record on the broker: every row whose
+	// Kafka leg completed, plus every dead-lettered row, each counted exactly once
+	// by virtue of the unique index on event_id.
+	PublishedRows int64
+
+	// ConfirmedRows is how many of those name the record they produced.
+	ConfirmedRows int64
+
+	// DistinctRecords is how many DISTINCT coordinates those rows name. It equals
+	// ConfirmedRows unless two rows claim the same record, which the partial unique
+	// index on the coordinate makes impossible — so a discrepancy here means the
+	// index is missing or has been dropped, and the audit says so rather than
+	// assuming the schema is intact.
+	DistinctRecords int64
+
+	// MeasuredAt is when the outbox side was read.
+	MeasuredAt time.Time
+
+	// WindowStart is the earliest publication instant the three counts above include.
+	//
+	// # PERF-P05: the audit is WINDOWED, and it has to be
+	//
+	// The counts are one half of a comparison whose other half is a Kafka offset
+	// reading, and the two halves must describe the SAME population or the comparison
+	// means nothing. Over the whole history they cannot: broker end offsets are
+	// cumulative for the life of a topic and are unaffected by Kafka retention, while
+	// the outbox's retention sweep DELETES terminal rows — so the longer a deployment
+	// runs with retention enabled, the further the outbox side falls behind a broker
+	// side that never forgets, and the "surplus" the verdict tolerates grows without
+	// bound until it can hide any amount of loss.
+	//
+	// A shared window fixes both directions at once: rows whose publication instant
+	// falls inside it, against records the broker wrote inside it. Retention shorter
+	// than the window is then the only thing that can invalidate the reading, and it is
+	// detectable rather than silent — see the truncation flag on the offset report.
+	//
+	// It is also what makes the query bounded. At 500 events per second the table grows
+	// by 43.2 million rows a day, so an exact whole-history aggregate is a scan whose
+	// cost rises for ever while answering a question about the last day.
+	//
+	// The zero value means the counts are whole-history, which is a diagnostic reading
+	// only: no reconciliation verdict may be drawn from it.
+	WindowStart time.Time
+}
+
+// UnconfirmedRows is how many rows claim a publication they cannot name a record for.
+//
+// Returns:
+//   - int64: never negative.
+func (a EventOutboxAudit) UnconfirmedRows() int64 {
+	if a.ConfirmedRows >= a.PublishedRows {
+		return 0
+	}
+
+	return a.PublishedRows - a.ConfirmedRows
+}
+
+// FullyConfirmed reports whether every row claiming a publication names a distinct
+// record.
+//
+// It is the precondition for a conclusive zero-loss verdict: with it true, a shortfall
+// in broker records cannot be hidden by a surplus, because each claim is individually
+// accounted for.
+//
+// Returns:
+//   - bool: true when nothing is unconfirmed and no two rows share a coordinate.
+func (a EventOutboxAudit) FullyConfirmed() bool {
+	return a.UnconfirmedRows() == 0 && a.DistinctRecords == a.ConfirmedRows
+}
+
+// DeclaresUnenforceableIsolation reports whether this subscriber's record asks for an
+// access boundary that nothing in the system can enforce.
+//
+// # The boundary that does not exist
+//
+// A non-nil PartitionKeyPrefix says "this subscriber may see only the records whose
+// partition key starts with this". Kafka has no mechanism for that: an ACL names a
+// topic, and a principal granted a topic reads every record on it. So a credential
+// issued to a subscriber that declares a prefix hands out access strictly wider than
+// the record it was issued against describes — and on a shared category topic that
+// wider access is every other subscriber's transactions, balances and identities.
+//
+// The failure mode is not a missing feature, it is a false assurance. An operator reads
+// the registry row, sees the prefix, and concludes the subscriber is confined to its own
+// records. Nothing anywhere contradicts them, because the value is accepted, stored,
+// echoed back and never enforced.
+//
+// So the value is still STORED — it is a real statement of intent, and erasing it would
+// destroy the record of what an operator asked for — and credential issuance REFUSES
+// while it is present. The remedy is explicit rather than silent: clear the prefix to
+// accept topic-level scope, which is the boundary Kafka ACLs can actually hold, or narrow
+// authorized_topics until topic-level scope IS the isolation required.
+//
+// Returns:
+//   - bool: true when a partition-key prefix is recorded.
+func (s *EventSubscriber) DeclaresUnenforceableIsolation() bool {
+	return s != nil && s.PartitionKeyPrefix != nil && strings.TrimSpace(*s.PartitionKeyPrefix) != ""
+}
+
+// KeyScopeUnenforceable reports whether the subscriber records a key-scoped
+// authorization constraint that Kafka cannot enforce.
+//
+// It is the predicate credential issuance fails closed on. A non-empty prefix means
+// the recorded authorization is narrower than any credential Blnk can mint, so the
+// honest answer is to refuse rather than to issue whole-topic access under a row
+// that says otherwise. The empty string is treated as absent for the same reason the
+// column is nullable: "a constraint on the empty prefix" is not an intent anybody
+// has, and reading it as one would refuse a subscriber that asked for nothing.
+// A nil receiver answers false, for the reason given on IsRevocationPending.
+func (s *EventSubscriber) KeyScopeUnenforceable() bool {
+	return s != nil && s.PartitionKeyPrefix != nil && strings.TrimSpace(*s.PartitionKeyPrefix) != ""
+}
+
+// DeclaresKeyScope reports whether this subscriber records a partition-key scope.
+//
+// # What the property is, and where it is checked
+//
+// A non-nil PartitionKeyPrefix says "this subscriber is entitled only to the records
+// whose partition key starts with this". Because Blnk keys every event by ledger id,
+// that is a ledger boundary expressed in the value the transport already carries.
+//
+// THE BROKER DOES NOT CHECK IT. Kafka's authorizer names a topic or a group; it has no
+// message-key dimension, so a principal granted a shared category topic reads every
+// record on it. The scope is therefore delivered to the consumer — returned by the
+// credential endpoint alongside the enforced scopes and labelled as the one the consumer
+// applies — and HasKeyAccess is the rule it means.
+//
+// This predicate is what reporting, the credential contract and the operations runbook
+// read to tell a key-scoped subscriber from a whole-topic one. IT IS NOT A REFUSAL.
+// Issuance once failed closed on it, which kept the registry honest by declining the
+// access model instead of implementing it; see the access-model note on EventSubscriber
+// for why disclosure at issuance replaced that.
+//
+// The empty string and whitespace are treated as absent, for the same reason the column
+// is nullable: "a constraint on the empty prefix" is not an intent anybody has, and
+// reading it as one would attach a boundary to a subscriber that asked for none.
+//
+// A nil receiver answers false. It is read as a guard on a row that may not have been
+// found, so it must be answerable on nothing.
+//
+// Returns:
+//   - bool: true when a non-blank partition-key prefix is recorded.
+func (s *EventSubscriber) DeclaresKeyScope() bool {
+	return s != nil && s.PartitionKeyPrefix != nil && strings.TrimSpace(*s.PartitionKeyPrefix) != ""
+}
+
+// There is no internalEventCategories set and no IsInternalEventCategory predicate, and the
+// absence is a decision rather than an omission.
+//
+// A category-level exclusion was introduced to keep system.error away from subscribers, and it
+// would also have withheld `ledger.created`, because the four-category layout puts that event on
+// the same topic. That trades a disclosure for a lost event: `ledger.created` is delivered by the
+// legacy webhook transport today, so a subscriber migrating to Kafka would simply stop receiving
+// it, with an allowlist saying nothing was wrong.
+//
+// The concern it was reaching for is real and is answered where the decision belongs — per
+// subscriber, in authorized_topics, with what a grant of the system category discloses documented
+// on EventCategorySystem. Every category is grantable; see SubscriberGrantableEventCategories.
+
+// KeyScopeEnforcementStatus names WHERE a subscriber's key scope is enforced.
+//
+// It is a string rather than a bool because the honest answer is a place and not a yes or
+// no, and because it is serialised into the credential response, where a client reads it
+// to decide whether it has filtering of its own to do. A bool called "enforced" was the
+// shape that preceded it and it could only ever be false, which is how it came to be read
+// as "unenforceable, therefore refuse".
+type KeyScopeEnforcementStatus string
+
+const (
+	// KeyScopeEnforcementNone is reported when no key scope is recorded: the
+	// broker-enforced topic and consumer-group ACLs are the subscriber's entire
+	// boundary and there is nothing left for a consumer to filter.
+	KeyScopeEnforcementNone KeyScopeEnforcementStatus = "none"
+
+	// KeyScopeEnforcementConsumerSide is reported when a key scope IS recorded. The
+	// broker grants Read on whole topics — it has no message-key dimension — so the
+	// scope is honoured by the consumer applying HasKeyAccess to each record's key.
+	// A subscriber that ignores it will see records outside its scope, which is why
+	// this value is disclosed rather than inferred.
+	KeyScopeEnforcementConsumerSide KeyScopeEnforcementStatus = "consumer_side"
+)
+
+// KeyScopeEnforcement reports where this subscriber's key scope is enforced.
+//
+// This is the accessor that replaced the refusal predicate KeyScopeUnenforceable. The
+// difference is not cosmetic: the old name asserted that a recorded prefix could not be
+// honoured, and three separate barriers — issuance, update and a CHECK constraint — read
+// it as licence to deny the subscriber a credential entirely. Reporting the enforcement
+// POINT instead lets the credential be issued with the boundary the broker really keeps,
+// while every surface that shows the prefix shows this value beside it.
+//
+// A nil receiver answers KeyScopeEnforcementNone, because a subscriber that does not
+// exist has recorded nothing — and because this is read on rows loaded from a repository
+// whose not-found representation is a nil pointer.
+//
+// Returns:
+//   - KeyScopeEnforcementStatus: ConsumerSide when a non-blank prefix is recorded,
+//     otherwise None.
+func (s *EventSubscriber) KeyScopeEnforcement() KeyScopeEnforcementStatus {
+	if s.DeclaresKeyScope() {
+		return KeyScopeEnforcementConsumerSide
+	}
+
+	return KeyScopeEnforcementNone
 }

@@ -231,10 +231,15 @@ func (l *Blnk) updateTransactionDetails(ctx context.Context, transaction *model.
 //   - A path that does not use the single-transaction atomic writer: a rejection, recorded
 //     by RecordTransaction, which captures its own event and reports so.
 //   - The COALESCED BATCH path. Its writer is called from transaction_coalescing.go, which
-//     AAP §0.6.2 freezes, so the batch cannot thread event rows into its own transaction and
-//     this hook is what captures them — durably, in the same outbox, a moment after the
-//     commit rather than inside it. See the divergence note on
-//     persistSingleTransactionExecutionWork.
+//     AAP §0.6.2 freezes, so its CALLER cannot thread event rows into the batch's transaction
+//     and this hook offers them instead — into the same outbox, with the same bounded retry
+//     budget the other standalone captures spend, a moment after the commit rather than inside
+//     it. That makes this one of the three standalone capture SITES enumerated on
+//     PublishEventDurably. It does NOT make these events at-most-once: the batch writer
+//     derives the same rows from the registered capture and inserts them inside its own
+//     transaction, so this copy is normally recognised as the identical stored row and reported
+//     as success. See the divergence note on persistSingleTransactionExecutionWork, and
+//     PostCommitEventCaptureContract for the at-most-once set, which these events are not in.
 //   - A deployment with no Kafka brokers, where PublishEvent routes the event to the legacy
 //     webhook transport instead.
 //
@@ -305,11 +310,29 @@ func (l *Blnk) postTransactionActions(ctx context.Context, transaction *model.Tr
 		//
 		// context.WithoutCancel mirrors monitorCtx in runTransactionPostCommitWorkWithHooks
 		// and is required, not cosmetic. This goroutine outlives the request or asynq task
-		// that spawned it, and PublishEvent writes the outbox row, so inheriting that
+		// that spawned it, and the capture writes the outbox row, so inheriting that
 		// cancellation would abort event capture the instant the response was written and
 		// lose the event. Trace context still propagates, so the capture stays in the trace.
+		//
+		// THE DURABLE VARIANT IS USED, because every mutation this branch can be reached for
+		// has ALREADY COMMITTED. A coalesced batch's transactions are durable before this hook
+		// runs, so the insert is the event's only chance, and a single attempt turned a
+		// momentary connection reset or a brief pool exhaustion into permanent loss of the
+		// event. PublishEventDurably spends the same bounded budget as the other two
+		// post-commit captures — checkBalanceMonitors for balance.monitor and
+		// sendBulkTransactionWebhook for the bulk outcome — and re-sends the SAME prepared
+		// row, so a retry cannot deliver the event twice.
+		//
+		// It does not make the capture atomic and does not claim to: the mutation is durable
+		// before the first attempt, so a process that dies in the window would lose an event
+		// this copy were the only record of. It is not, in the ordinary case — the batch writer
+		// derives the same rows under its own transaction and the derived event id makes this
+		// insert a recognised duplicate — which is why this site is one of the three standalone
+		// capture SITES on PublishEventDurably and NOT one of the three at-most-once event types
+		// on PostCommitEventCaptureContract. The two sets of three are different sets; both are
+		// spelled out there.
 		if !eventCaptured {
-			err = l.PublishEvent(context.WithoutCancel(ctx), NewWebhook{
+			err = l.PublishEventDurably(context.WithoutCancel(ctx), NewWebhook{
 				Event:   getEventFromStatus(transaction.Status),
 				Payload: transaction,
 			}, WithEventLedgerID(transactionLedgerID(sourceBalance, destinationBalance)))
@@ -585,7 +608,7 @@ func (l *Blnk) recordTransactionSingle(ctx context.Context, transaction *model.T
 			return work.transaction, nil
 		}
 
-		work, eventCaptured, err := l.persistSingleTransactionExecutionWork(ctx, work)
+		work, eventCaptured, monitorCapture, err := l.persistSingleTransactionExecutionWork(ctx, work)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
@@ -601,7 +624,7 @@ func (l *Blnk) recordTransactionSingle(ctx context.Context, transaction *model.T
 
 		l.runTransactionPostCommitWorkForCapturedEvents(ctx, span,
 			[]*model.Balance{sourceBalance, destinationBalance},
-			[]queuedBatchPostCommitWork{work}, nil, capturedEvents)
+			[]queuedBatchPostCommitWork{work}, nil, capturedEvents, monitorCapture)
 
 		span.AddEvent("Transaction processed", trace.WithAttributes(attribute.String("transaction.id", work.transaction.TransactionID)))
 		logrus.Infof("Transaction %s processed successfully", work.transaction.TransactionID)
@@ -648,7 +671,105 @@ func (l *Blnk) runTransactionPostCommitWork(ctx context.Context, span trace.Span
 // file from modification, so the captured-event set is carried by the wider function below
 // rather than by a parameter here or a field on queuedBatchPostCommitWork.
 func (l *Blnk) runTransactionPostCommitWorkWithHooks(ctx context.Context, span trace.Span, orderedBalances []*model.Balance, postCommitWork []queuedBatchPostCommitWork, postHooks []*blnkhooks.Hook) {
-	l.runTransactionPostCommitWorkForCapturedEvents(ctx, span, orderedBalances, postCommitWork, postHooks, nil)
+	// The captured set is RESOLVED FROM THE TABLE rather than passed in, because the caller
+	// cannot supply it. The coalescing path calls the atomic writer and then this function with
+	// the same work list, and the file doing so is frozen, so it cannot report that the writer
+	// captured the batch's events inside the mutation. Asking the outbox which events are
+	// already durable is the one answer that stays correct however this function is reached.
+	// The monitor capture is the ZERO VALUE, and that is the only honest answer here. This entry
+	// point cannot know what any caller enrolled in its transaction — the coalesced writer does
+	// not report it and the file that calls this one is frozen — and the zero capture reads as
+	// "nothing was captured", so every met condition is evaluated by the post-commit path. That
+	// is the conservative direction: a duplicate alert an operator can see beats a threshold
+	// crossing nobody is told about.
+	l.runTransactionPostCommitWorkForCapturedEvents(ctx, span, orderedBalances, postCommitWork, postHooks,
+		l.durableTransactionEvents(ctx, postCommitWork), balanceMonitorCapture{})
+}
+
+// durableTransactionEvents returns the ids of the transactions whose lifecycle event is already
+// recorded in the outbox.
+//
+// # Why this exists
+//
+// Since the atomic writers capture the event with the mutation, the post-commit fallback is a
+// fallback in fact as well as in name: for most transactions the event is already durable, and
+// publishing it again would prepare a second row carrying a fresh occurred_at. The unique index
+// on the deterministic event id refuses that row, so nothing is duplicated — but the refusal
+// arrives as an error the caller reports, and on a coalesced batch that is one spurious error
+// per transaction, permanently. Suppressing the fallback where it is not owed removes the noise
+// at its source instead of teaching the log to ignore it.
+//
+// # The failure direction is chosen deliberately
+//
+// Any doubt resolves to "not captured", so the fallback runs: an unnecessary publish is refused
+// by the unique index, whereas a wrongly suppressed one loses the event with nothing to show it.
+// Every early return therefore yields nil, which the caller reads as "capture everything".
+//
+// Publishing being unconfigured short-circuits before the query. No rows can exist in that case,
+// and the fallback's own PublishEvent is a no-op, so the query would cost a round trip on every
+// commit to learn nothing.
+//
+// Parameters:
+//   - ctx context.Context: request context. A cancellation surfaces as a lookup error and
+//     therefore as "not captured".
+//   - postCommitWork []queuedBatchPostCommitWork: the committed work items.
+//
+// Returns:
+//   - map[string]struct{}: transaction ids whose event is durable; nil when unknown or none.
+func (l *Blnk) durableTransactionEvents(ctx context.Context, postCommitWork []queuedBatchPostCommitWork) map[string]struct{} {
+	if len(postCommitWork) == 0 || l.datasource == nil {
+		return nil
+	}
+
+	if !eventPublishingConfigured(l.eventConfiguration()) {
+		return nil
+	}
+
+	// One event id per transaction, derived rather than looked up. model.EventIdentityFor is
+	// what makes transaction events derivable at all, and it is consulted here — instead of
+	// assuming the transaction id is the identity — so this cannot drift from the derivation
+	// PrepareEventOutbox performed when the row was written.
+	transactionsByEventID := make(map[string]string, len(postCommitWork))
+	eventIDs := make([]string, 0, len(postCommitWork))
+
+	for _, work := range postCommitWork {
+		transaction := work.transaction
+		if transaction == nil {
+			continue
+		}
+
+		eventType := getEventFromStatus(transaction.Status)
+		identity, derivable := model.EventIdentityFor(eventType, transaction)
+		if !derivable {
+			continue
+		}
+
+		eventID := model.DeriveEventID(identity, eventType, model.SchemaVersionV1)
+		transactionsByEventID[eventID] = transaction.TransactionID
+		eventIDs = append(eventIDs, eventID)
+	}
+
+	if len(eventIDs) == 0 {
+		return nil
+	}
+
+	present, err := l.datasource.ExistingEventIDs(ctx, eventIDs)
+	if err != nil {
+		logrus.WithError(err).Debug(
+			"could not determine which transaction events were already captured; " +
+				"the post-commit path will attempt capture and rely on the unique event id")
+
+		return nil
+	}
+
+	captured := make(map[string]struct{}, len(present))
+	for eventID := range present {
+		if transactionID, ok := transactionsByEventID[eventID]; ok {
+			captured[transactionID] = struct{}{}
+		}
+	}
+
+	return captured
 }
 
 // runTransactionPostCommitWorkForCapturedEvents is runTransactionPostCommitWorkWithHooks with
@@ -673,6 +794,10 @@ func (l *Blnk) runTransactionPostCommitWorkWithHooks(ctx context.Context, span t
 //   - postHooks []*blnkhooks.Hook: a preloaded post-transaction hook set, or nil to look one up.
 //   - capturedEvents map[string]struct{}: the transaction ids whose event is already durable.
 //     May be nil, which means none of them are.
+//   - monitorCapture balanceMonitorCapture: which balances' monitors were already evaluated with
+//     the mutation and which crossings are already durable. The zero value means none were, and
+//     every crossing the check finds is then captured after the commit — the conservative
+//     direction, since a late alert is recoverable and a missing one is not.
 func (l *Blnk) runTransactionPostCommitWorkForCapturedEvents(
 	ctx context.Context,
 	span trace.Span,
@@ -680,18 +805,37 @@ func (l *Blnk) runTransactionPostCommitWorkForCapturedEvents(
 	postCommitWork []queuedBatchPostCommitWork,
 	postHooks []*blnkhooks.Hook,
 	capturedEvents map[string]struct{},
+	monitorCapture balanceMonitorCapture,
 ) {
-	monitorCtx := context.WithoutCancel(ctx)
-	for _, balance := range orderedBalances {
-		balance := balance
-		// Bound concurrent monitor checks instead of spawning one unbounded
-		// goroutine per balance; acquiring the semaphore applies backpressure
-		// outside the locked persistence path.
-		balanceMonitorSem <- struct{}{}
-		go func() {
-			defer func() { <-balanceMonitorSem }()
-			l.checkBalanceMonitors(monitorCtx, balance)
-		}()
+	// THE POST-COMMIT MONITOR CHECK IS SKIPPED WHEN THE DURABLE HANDOFF OWNS IT.
+	//
+	// `balance.monitor` used to be captured from right here, in a goroutine spawned after
+	// the commit, and that is precisely why it was the one event type that could be lost:
+	// a process dying between the commit and the insert destroyed the alert, and no retry
+	// budget can close a crash window. The alert is now captured INSIDE the balance's own
+	// transaction: prepareBalanceMonitorEvents evaluates the monitors before the write and
+	// hands the rows to the writer, and for whatever it could not cover the writer records a
+	// durable handoff that BalanceMonitorHandoffProcessor evaluates, writing the alerts and
+	// the handoff's completion in one transaction. The writer keeps the two exclusive per
+	// balance, so each crossing is captured exactly once.
+	//
+	// Running both would deliver every alert twice, and running neither would lose them
+	// all, so the two sides read ONE predicate — see balanceMonitorHandoffEnabled. A
+	// deployment with no Kafka broker has no handoff processor, keeps this path, and
+	// behaves exactly as it did before the event pipeline existed (AAP §0.5.4).
+	if !l.balanceMonitorHandoffEnabled() {
+		monitorCtx := context.WithoutCancel(ctx)
+		for _, balance := range orderedBalances {
+			balance := balance
+			// Bound concurrent monitor checks instead of spawning one unbounded
+			// goroutine per balance; acquiring the semaphore applies backpressure
+			// outside the locked persistence path.
+			balanceMonitorSem <- struct{}{}
+			go func() {
+				defer func() { <-balanceMonitorSem }()
+				l.checkBalanceMonitors(monitorCtx, balance, monitorCapture)
+			}()
+		}
 	}
 
 	for _, work := range postCommitWork {
@@ -911,9 +1055,16 @@ func (l *Blnk) buildTransactionExecutionWork(ctx context.Context, transaction *m
 //
 // The SOURCE balance wins and the destination is the fallback, which matters for the one
 // case where they differ: a transfer between two ledgers. Keying on the source keeps every
-// event of one ledger's outbound activity on a single partition, and it agrees with what the
-// transaction queue already shards on (hashBalanceID(transaction.Source) in queue.go), so
-// the Kafka ordering a subscriber observes matches the ordering the ledger itself imposes.
+// event of one ledger's outbound activity on a single partition, and it picks the same SIDE
+// of the transfer the transaction queue already shards on (hashBalanceID(transaction.Source)
+// in queue.go), so the two mechanisms agree about which balance is authoritative.
+//
+// They do NOT agree about the partition. The queue hashes the source BALANCE id into its own
+// shard space; this returns the source balance's LEDGER, which Kafka hashes with murmur2 into
+// a partition. Same side, different value, different hash — so a subscriber must not infer a
+// Kafka partition from a queue shard or the reverse. An earlier revision of this comment
+// claimed the two aligned; the stated guarantee is per-ledger ordering on the topic, and
+// nothing about the queue.
 //
 // Parameters:
 //   - sourceBalance, destinationBalance *model.Balance: the loaded balances. Either may be
@@ -940,9 +1091,10 @@ func transactionLedgerID(sourceBalance, destinationBalance *model.Balance) strin
 //
 // # This is where requirement R-2 is actually satisfied
 //
-// The event row is prepared here, immediately before the write, and handed to the atomic
-// writer, which inserts it inside the same database transaction as the two balance updates
-// and the transaction record. Before this, the event was captured AFTER the commit through
+// The event rows — the transaction's own lifecycle event AND any balance.monitor alert whose
+// threshold this movement crosses — are prepared here, immediately before the write, and
+// handed to the atomic writer, which inserts them inside the same database transaction as the
+// two balance updates and the transaction record. Before this, the event was captured AFTER the commit through
 // the standalone path: a process failure — or a plain insert failure — in the window between
 // the two left a committed ledger mutation with no event anywhere, undetectably, because the
 // only record that the event should have existed was the row that never got written.
@@ -973,9 +1125,19 @@ func transactionLedgerID(sourceBalance, destinationBalance *model.Balance) strin
 // the coalescing one. §0.6.2 excludes transaction_coalescing.go — the only caller of that
 // writer — from modification, and the review's C-4 finding names an earlier attempt to edit it
 // as a scope failure. The explicit exclusion wins, so the coalesced batch captures its events
-// through postTransactionActions immediately after the commit instead: durable, in the same
-// outbox, ordered by the same claim, but not inside the batch's own transaction. Closing that
-// window needs a deliberate change to the frozen file.
+// through postTransactionActions immediately after the commit instead: into the same outbox,
+// ordered by the same claim, retried on a transient failure — but NOT inside the batch's own
+// transaction. The batch is durable before the capture is attempted, so a process death in
+// that window loses the event, which is why this path is counted as one of the three
+// documented exceptions to R-2 in docs/event-streaming.md rather than described as durable.
+// Closing the window needs a deliberate change to the frozen file.
+//
+// This is ONE OF THREE paths outside their mutation's transaction. The complete, authoritative
+// list — this one, `balance.monitor` and the bulk batch summary — is published under "Where
+// same-transaction capture does not apply" in docs/event-streaming.md, and it is deliberately
+// kept in ONE place: while each of these three files described only its own case, the
+// documentation and two comments each claimed a different single exception, and a reader had
+// three inconsistent statements to pick from.
 //
 // Parameters:
 //   - ctx context.Context: the context for the write.
@@ -985,8 +1147,11 @@ func transactionLedgerID(sourceBalance, destinationBalance *model.Balance) strin
 //   - queuedBatchPostCommitWork: the work item carrying the persisted transaction.
 //   - bool: true when the transaction's ledger event was committed inside this write, which is
 //     what tells the post-commit hook not to capture it a second time.
+//   - balanceMonitorCapture: which balances' monitors were evaluated with this write and which
+//     crossings it committed, which is what tells the post-commit monitor check what is already
+//     durable. The zero value when nothing was evaluated.
 //   - error: the preparation or persistence failure. On error nothing was written.
-func (l *Blnk) persistSingleTransactionExecutionWork(ctx context.Context, work queuedBatchPostCommitWork) (queuedBatchPostCommitWork, bool, error) {
+func (l *Blnk) persistSingleTransactionExecutionWork(ctx context.Context, work queuedBatchPostCommitWork) (queuedBatchPostCommitWork, bool, balanceMonitorCapture, error) {
 	ctx, span := tracer.Start(ctx, "PersistSingleTransactionExecutionWork")
 	defer span.End()
 
@@ -998,32 +1163,53 @@ func (l *Blnk) persistSingleTransactionExecutionWork(ctx context.Context, work q
 	if err != nil {
 		span.RecordError(err)
 
-		return queuedBatchPostCommitWork{}, false, l.logAndRecordError(span,
+		return queuedBatchPostCommitWork{}, false, balanceMonitorCapture{}, l.logAndRecordError(span,
 			"refusing to persist a transaction whose ledger event could not be prepared", err)
 	}
 
-	// THE EVENT ROW TRAVELS WITH THE MUTATION. The writer inserts it inside the same
-	// database transaction as the two balance updates and the transaction row, so the
-	// event cannot outlive a rollback and the mutation cannot outlive a lost event.
-	transaction, err := l.datasource.RecordTransactionWithBalancesAndOutbox(ctx, work.transaction, work.sourceBalance, work.destinationBalance, work.outbox, eventOutbox)
+	// THE MONITOR ALERTS TRAVEL WITH THE MUTATION TOO. R-2.
+	//
+	// A crossing was captured after the commit until now, which left a window in which a
+	// balance had moved past its threshold and no event existed anywhere. Evaluating the
+	// monitors here — against the very objects the writer is about to persist, so the values
+	// are the committed ones — puts the alert inside the same transaction as the movement that
+	// caused it. Reading the monitors is best-effort inside the helper and never fails the
+	// write; only a payload that will not serialise does, for the same reason as above.
+	monitorEvents, monitorCapture, err := l.prepareBalanceMonitorEvents(ctx,
+		[]*model.Balance{work.sourceBalance, work.destinationBalance})
 	if err != nil {
 		span.RecordError(err)
-		return queuedBatchPostCommitWork{}, false, l.logAndRecordError(span, "failed to persist transaction with balances", err)
+
+		return queuedBatchPostCommitWork{}, false, balanceMonitorCapture{}, l.logAndRecordError(span,
+			"refusing to persist a transaction whose balance monitor alert could not be prepared", err)
+	}
+
+	// THE EVENT ROWS TRAVEL WITH THE MUTATION. The writer inserts them inside the same
+	// database transaction as the two balance updates and the transaction row, so an
+	// event cannot outlive a rollback and the mutation cannot outlive a lost event. The
+	// transaction's own event leads; the monitor alerts follow it, and the writer skips nil
+	// entries so an unconfigured deployment passes a single nil exactly as before.
+	transaction, err := l.datasource.RecordTransactionWithBalancesAndOutbox(ctx, work.transaction, work.sourceBalance, work.destinationBalance, work.outbox,
+		append([]*model.EventOutbox{eventOutbox}, monitorEvents...)...)
+	if err != nil {
+		span.RecordError(err)
+		return queuedBatchPostCommitWork{}, false, balanceMonitorCapture{}, l.logAndRecordError(span, "failed to persist transaction with balances", err)
 	}
 
 	work.transaction = transaction
-	// Reported only on the success path: the commit is what makes the event durable, so a
-	// failed write must leave the post-commit hook free to capture it on the standalone
-	// path rather than believing it is already stored.
+	// Reported only on the success path: the commit is what makes the events durable, so a
+	// failed write must leave the post-commit hook free to capture both the transaction event
+	// and the monitor alerts on the standalone path rather than believing they are stored.
 	eventCaptured := eventOutbox != nil
 
 	span.AddEvent("Transaction and balances persisted atomically", trace.WithAttributes(
 		attribute.String("transaction.id", transaction.TransactionID),
 		attribute.Bool("lineage.outbox_created", work.outbox != nil),
 		attribute.Bool("event.captured_in_transaction", eventCaptured),
+		attribute.Int("event.monitor_alerts_captured", len(monitorEvents)),
 	))
 
-	return work, eventCaptured, nil
+	return work, eventCaptured, monitorCapture, nil
 }
 
 // prepareTransactionEventOutbox builds the outbox row for a transaction's lifecycle event,
@@ -1050,9 +1236,12 @@ func (l *Blnk) persistSingleTransactionExecutionWork(ctx context.Context, work q
 //
 // Without it the row stored SQL NULL for the ledger and keyed on the SOURCE BALANCE instead,
 // which spreads one ledger's events across partitions and delivers per-balance rather than
-// per-ledger ordering. When neither balance carries a ledger — a rejected transaction is
-// persisted with no balances at all — the option is simply not applied and the key falls back
-// to the documented chain, so the event is still captured and still ordered.
+// per-ledger ordering — weaker than R-6 requires and no longer what docs/event-streaming.md
+// publishes as the key contract. When neither balance carries a ledger — a rejected
+// transaction is persisted with no balances at all — the option is simply not applied and the
+// key falls back to the documented chain, so the event is still captured and still ordered.
+// That rejection case is the ONE documented exception to the ledger key, and it is named as
+// such in docs/event-streaming.md.
 //
 // Parameters:
 //   - ctx context.Context: the context for the operation, used for tracing.

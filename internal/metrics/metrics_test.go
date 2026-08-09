@@ -21,7 +21,7 @@ package metrics
 // business logic — there is none here.
 //
 // metrics.go is deliberately flat: one package-level meter, an init() that calls
-// Init() and log.Fatalf's if it returns an error, twenty-three exported instrument
+// Init() and log.Fatalf's if it returns an error, a flat set of exported instrument
 // variables, and an Init() that assigns every one of them in declaration order and
 // returns on the first error. Two consequences follow, and both are what the tests
 // below assert:
@@ -37,8 +37,13 @@ package metrics
 //     nil forever. Nothing catches that: the variable exists, the package builds
 //     cleanly, and the first production call site panics on a nil interface. The
 //     non-nil tests are the only mechanical defence against such an orphaned
-//     declaration — precisely the mistake that appending seven new instruments to
-//     a list of sixteen invites.
+//     declaration — precisely the mistake that appending new instruments to an
+//     existing list invites.
+//
+//     The two inventory functions below, preExistingInstruments and
+//     eventStreamingInstruments, ARE that defence, and they are hand-maintained: an
+//     instrument absent from both has no orphan guard at all. Adding an instrument
+//     to metrics.go therefore means adding it to one of them.
 //
 // The tests are in package metrics (an internal test package) rather than
 // metrics_test, so the unexported meter every instrument is built from is in
@@ -56,14 +61,23 @@ package metrics
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/expfmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	promexporter "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/embedded"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -87,6 +101,8 @@ import (
 // or not Init() has run.
 var (
 	_ metric.Int64Counter     = EventsPublishedTotal
+	_ metric.Int64Counter     = EventBrokerAcknowledgementsTotal
+	_ metric.Int64Counter     = EventsDispatchedTotal
 	_ metric.Int64Counter     = EventPublishAttemptsTotal
 	_ metric.Float64Histogram = EventPublishDuration
 	_ metric.Float64Histogram = EventCaptureToDispatchDuration
@@ -104,6 +120,25 @@ var (
 	// mutually assignable, so reverting either declaration fails to compile here.
 	_ metric.Int64ObservableGauge = SubscriberConsumerLag
 	_ metric.Int64ObservableGauge = ConsumerLagUnmeasuredPartitions
+
+	// The COLLECTION-HEALTH pair is asynchronous for a different reason from the lag
+	// gauges, and it is the reason the kind matters most here: their subject is the
+	// collector itself, which may have STOPPED. A synchronous gauge can only be written by
+	// the component being observed, so a stalled collector would freeze its own freshness
+	// gauge at whatever age it last reported and the series would read as permanently
+	// current — the single failure these two instruments exist to make visible. Observed
+	// from a stored timestamp at collection time, the age instead rises on every scrape
+	// with no participation from the stalled component.
+	_ metric.Float64ObservableGauge = EventMetricsLastCollectionAgeSeconds
+	_ metric.Float64ObservableGauge = EventMetricsLastSuccessAgeSeconds
+
+	_ metric.Int64Counter = EventMetricsCollectionFailuresTotal
+
+	// Synchronous, deliberately: both describe the last SWEEP and each has exactly one
+	// series (the unmeasured gauge's reason domain is closed and every value is written
+	// every tick), so there is no churn for an observable gauge to bound.
+	_ metric.Int64Gauge = ConsumerLagInventoryComplete
+	_ metric.Int64Gauge = SubscribersUnmeasured
 )
 
 // publishOutcomes is the complete vocabulary of the "outcome" attribute carried by
@@ -114,16 +149,30 @@ var (
 // "dead-lettered" with a hyphen; that is not the attribute value, and a metric
 // consumer filtering on the hyphenated spelling would match nothing.
 //
-// "failed" is here because it is a DISTINCT outcome from "retrying" and not a
-// synonym for it: an attempt that failed permanently, or that spent the last of the
-// retry budget, will never be retried, and reporting it as retrying would report
-// retry pressure that does not exist. The four values are mutually exclusive and
-// exhaustive, so their sum is the total number of attempted writes.
+// The vocabulary is THREE values. "failed" is NOT one of them: a fourth outcome once
+// carried "this attempt will not be retried", and it was removed because it widened
+// the three-value publish-status vocabulary that model.PublishStatus, the API
+// responses and docs/event-streaming.md all state. That fact is now reported on the
+// separate `terminal` dimension below, so the three values remain mutually exclusive
+// and exhaustive and their sum is still the total number of attempted writes.
 //
 // Spelled as literals deliberately: this test file stays as dependency-free as the
-// package it covers, so it does not import the model package merely to obtain four
+// package it covers, so it does not import the model package merely to obtain three
 // strings.
-var publishOutcomes = []string{"dispatched", "retrying", "failed", "dead_lettered"}
+var publishOutcomes = []string{"dispatched", "retrying", "dead_lettered"}
+
+// publishTerminalValues is the closed domain of the "terminal" attribute that
+// accompanies the outcome on EventPublishAttemptsTotal.
+//
+// It exists because the outcome vocabulary is frozen at three values, which makes a
+// failure that will be retried and one that never will BOTH outcome="retrying". This
+// dimension is what keeps "how many events are actually stuck" answerable —
+// {outcome="retrying",terminal="true"} — and it is the reason the attempts counter's
+// series count is the PRODUCT of two domains rather than the outcome domain alone.
+//
+// Two literals and no more. The values are the strings the publisher emits, not Go
+// bools rendered by fmt, so that a query written against the exporter matches.
+var publishTerminalValues = []string{"true", "false"}
 
 // maxRelayRetryAttempts is the relay's attempt budget CEILING
 // (config.MaxRelayRetryAttempts, which RELAY_MAX_RETRY_ATTEMPTS is clamped to),
@@ -153,8 +202,16 @@ type namedInstrument struct {
 	value any
 }
 
-// eventStreamingInstruments returns the eight instruments added for the Kafka
+// eventStreamingInstruments returns EVERY instrument added for the Kafka
 // event-publishing pipeline, each labelled with its variable name.
+//
+// It is exhaustive by intent, and the count is deliberately not stated in this comment: a
+// number here would go stale the first time an instrument was added, and the assertions that
+// matter — that every declared instrument is assigned in Init() and exported under the name an
+// alert rule matches — are only true if this list is complete. An instrument omitted here is one
+// nothing checks, which is the exact failure mode the event pipeline has already hit twice:
+// gauges declared, initialised and never recorded, leaving a rule permanently inactive with
+// healthy-looking rule health.
 //
 // This is a FUNCTION and not a package-level table for a load-bearing reason. Go
 // initialises every package-level variable before it runs any init() function, and
@@ -167,6 +224,7 @@ type namedInstrument struct {
 func eventStreamingInstruments() []namedInstrument {
 	return []namedInstrument{
 		{"EventsPublishedTotal", EventsPublishedTotal},
+		{"EventsDispatchedTotal", EventsDispatchedTotal},
 		{"EventPublishAttemptsTotal", EventPublishAttemptsTotal},
 		{"EventPublishDuration", EventPublishDuration},
 		{"EventCaptureToDispatchDuration", EventCaptureToDispatchDuration},
@@ -175,6 +233,27 @@ func eventStreamingInstruments() []namedInstrument {
 		{"SubscriberConsumerLag", SubscriberConsumerLag},
 		{"ConsumerLagUnmeasuredPartitions", ConsumerLagUnmeasuredPartitions},
 		{"OutboxPendingBacklog", OutboxPendingBacklog},
+		{"EventsPurgedTotal", EventsPurgedTotal},
+		{"SubscriberRevocationsPending", SubscriberRevocationsPending},
+		{"OldestSubscriberRevocationAgeSeconds", OldestSubscriberRevocationAgeSeconds},
+		{"SubscriberSettlementOutstanding", SubscriberSettlementOutstanding},
+		{"SubscriberGrantReconcilePending", SubscriberGrantReconcilePending},
+		{"SubscriberCredentialCleanupPending", SubscriberCredentialCleanupPending},
+		{"OldestSubscriberSettlementAgeSeconds", OldestSubscriberSettlementAgeSeconds},
+		{"SubscriberObligationsSettledTotal", SubscriberObligationsSettledTotal},
+		{"EventBrokerAcknowledgementsTotal", EventBrokerAcknowledgementsTotal},
+		{"SubscriberCredentialOrphans", SubscriberCredentialOrphans},
+		{"OldestSubscriberCredentialOrphanAgeSeconds", OldestSubscriberCredentialOrphanAgeSeconds},
+		{"SubscriberRevocationFailures", SubscriberRevocationFailures},
+		{"OldestSubscriberRevocationFailureAgeSeconds", OldestSubscriberRevocationFailureAgeSeconds},
+		{"SubscribersUnmeasured", SubscribersUnmeasured},
+		{"SubscribersRegistered", SubscribersRegistered},
+		{"ConsumerLagInventoryComplete", ConsumerLagInventoryComplete},
+		{"SubscriberLagPassAgeSeconds", SubscriberLagPassAgeSeconds},
+		{"SubscriberLagCoveredSubscribers", SubscriberLagCoveredSubscribers},
+		{"EventMetricsCollectionFailuresTotal", EventMetricsCollectionFailuresTotal},
+		{"EventMetricsLastCollectionAgeSeconds", EventMetricsLastCollectionAgeSeconds},
+		{"EventMetricsLastSuccessAgeSeconds", EventMetricsLastSuccessAgeSeconds},
 	}
 }
 
@@ -208,8 +287,8 @@ func preExistingInstruments() []namedInstrument {
 }
 
 // TestInit_ReturnsNilForEveryInstrument asserts that Init() walks its whole
-// assignment chain — all twenty-three instruments, the sixteen original ones and
-// the seven event-streaming additions — without the meter refusing to build one.
+// assignment chain — every instrument, the sixteen that predate the event pipeline and
+// every event-streaming addition — without the meter refusing to build one.
 //
 // Init() has ALREADY run once, from the package's own init(), before this function
 // was reached. Calling it a second time here is intentional and is not a bug:
@@ -244,7 +323,7 @@ func TestInit_ReturnsNilForEveryInstrument(t *testing.T) {
 }
 
 // TestEventStreamingInstruments_AreNonNilAfterPackageLoad asserts that importing
-// this package is by itself enough to leave all seven event-streaming instruments
+// this package is by itself enough to leave EVERY event-streaming instrument
 // usable.
 //
 // This test deliberately does NOT call Init(). Its entire subject is the state the
@@ -266,7 +345,7 @@ func TestEventStreamingInstruments_AreNonNilAfterPackageLoad(t *testing.T) {
 }
 
 // TestPreExistingInstruments_RemainNonNilAfterEventStreamingAppend asserts that
-// the seven event-streaming additions did not disturb any of the sixteen
+// the event-streaming additions did not disturb any of the sixteen
 // instruments that came before them.
 //
 // Init() is a single linear chain of assignments, each followed by an early return
@@ -309,6 +388,7 @@ func TestEventStreamingInstruments_DeclaredKindsMatchTheirInstrumentType(t *test
 		expectedKind any
 	}{
 		{"EventsPublishedTotal", EventsPublishedTotal, (*metric.Int64Counter)(nil)},
+		{"EventsDispatchedTotal", EventsDispatchedTotal, (*metric.Int64Counter)(nil)},
 		{"EventPublishAttemptsTotal", EventPublishAttemptsTotal, (*metric.Int64Counter)(nil)},
 		{"EventPublishDuration", EventPublishDuration, (*metric.Float64Histogram)(nil)},
 		{"EventCaptureToDispatchDuration", EventCaptureToDispatchDuration, (*metric.Float64Histogram)(nil)},
@@ -317,6 +397,79 @@ func TestEventStreamingInstruments_DeclaredKindsMatchTheirInstrumentType(t *test
 		{"SubscriberConsumerLag", SubscriberConsumerLag, (*metric.Int64ObservableGauge)(nil)},
 		{"ConsumerLagUnmeasuredPartitions", ConsumerLagUnmeasuredPartitions, (*metric.Int64ObservableGauge)(nil)},
 		{"OutboxPendingBacklog", OutboxPendingBacklog, (*metric.Int64Gauge)(nil)},
+		{"EventsPurgedTotal", EventsPurgedTotal, (*metric.Int64Counter)(nil)},
+		{"SubscriberRevocationsPending", SubscriberRevocationsPending, (*metric.Int64Gauge)(nil)},
+		{
+			"OldestSubscriberRevocationAgeSeconds",
+			OldestSubscriberRevocationAgeSeconds,
+			(*metric.Float64Gauge)(nil),
+		},
+		{"SubscriberSettlementOutstanding", SubscriberSettlementOutstanding, (*metric.Int64Gauge)(nil)},
+		{"SubscriberGrantReconcilePending", SubscriberGrantReconcilePending, (*metric.Int64Gauge)(nil)},
+		{
+			"SubscriberCredentialCleanupPending",
+			SubscriberCredentialCleanupPending,
+			(*metric.Int64Gauge)(nil),
+		},
+		{
+			"OldestSubscriberSettlementAgeSeconds",
+			OldestSubscriberSettlementAgeSeconds,
+			(*metric.Float64Gauge)(nil),
+		},
+		{
+			// A COUNTER, and the kind is the point: SubscriberSettlementNotProgressing takes a
+			// rate over it, and rate() over a gauge is arithmetically meaningless — it would
+			// produce a plausible-looking series that could never distinguish a stuck pass from
+			// a busy one, which is the only question the instrument exists to answer.
+			"SubscriberObligationsSettledTotal",
+			SubscriberObligationsSettledTotal,
+			(*metric.Int64Counter)(nil),
+		},
+		{
+			"EventBrokerAcknowledgementsTotal",
+			EventBrokerAcknowledgementsTotal,
+			(*metric.Int64Counter)(nil),
+		},
+		{"SubscriberCredentialOrphans", SubscriberCredentialOrphans, (*metric.Int64Gauge)(nil)},
+		{
+			"OldestSubscriberCredentialOrphanAgeSeconds",
+			OldestSubscriberCredentialOrphanAgeSeconds,
+			(*metric.Float64Gauge)(nil),
+		},
+		{"SubscriberRevocationFailures", SubscriberRevocationFailures, (*metric.Int64Gauge)(nil)},
+		{
+			"OldestSubscriberRevocationFailureAgeSeconds",
+			OldestSubscriberRevocationFailureAgeSeconds,
+			(*metric.Float64Gauge)(nil),
+		},
+		{"SubscribersUnmeasured", SubscribersUnmeasured, (*metric.Int64Gauge)(nil)},
+		{"SubscribersRegistered", SubscribersRegistered, (*metric.Int64Gauge)(nil)},
+		{"ConsumerLagInventoryComplete", ConsumerLagInventoryComplete, (*metric.Int64Gauge)(nil)},
+		{"SubscriberLagPassAgeSeconds", SubscriberLagPassAgeSeconds, (*metric.Float64Gauge)(nil)},
+		{
+			"SubscriberLagCoveredSubscribers",
+			SubscriberLagCoveredSubscribers,
+			(*metric.Int64Gauge)(nil),
+		},
+		{
+			"EventMetricsCollectionFailuresTotal",
+			EventMetricsCollectionFailuresTotal,
+			(*metric.Int64Counter)(nil),
+		},
+		{
+			// ASYNCHRONOUS, and the kind is the point: the subject is a component that may have
+			// STOPPED, and a synchronous gauge can only be written by the collector itself — so
+			// it would freeze at its last reading and report a dead collector as permanently
+			// fresh, which is the one state these two exist to detect.
+			"EventMetricsLastCollectionAgeSeconds",
+			EventMetricsLastCollectionAgeSeconds,
+			(*metric.Float64ObservableGauge)(nil),
+		},
+		{
+			"EventMetricsLastSuccessAgeSeconds",
+			EventMetricsLastSuccessAgeSeconds,
+			(*metric.Float64ObservableGauge)(nil),
+		},
 	}
 
 	require.Len(t, tests, len(eventStreamingInstruments()),
@@ -355,6 +508,19 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 			EventsPublishedTotal.Add(ctx, 1, metric.WithAttributes(
 				attribute.String("topic", "blnk.transactions"),
 				attribute.String("event_type", "transaction.applied"),
+			))
+		})
+	})
+
+	t.Run("EventBrokerAcknowledgementsTotal", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			// The purpose attribute is what keeps a replay and a dead-letter write separable
+			// from a first delivery here, since unlike EventsPublishedTotal this counter
+			// records every acknowledgement the broker gave.
+			EventBrokerAcknowledgementsTotal.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("topic", "blnk.transactions"),
+				attribute.String("event_type", "transaction.applied"),
+				attribute.String("purpose", "original"),
 			))
 		})
 	})
@@ -463,6 +629,26 @@ func TestEventStreamingInstruments_RecordWithoutPanic(t *testing.T) {
 			OutboxPendingBacklog.Record(ctx, 42)
 		})
 	})
+
+	t.Run("EventsPurgedTotal", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			// Unattributed, matching event_retention.go: the sweep reports how many rows
+			// it deleted, and it deletes across every topic in one pass, so there is no
+			// per-topic number to attribute.
+			EventsPurgedTotal.Add(ctx, 5)
+		})
+	})
+
+	t.Run("the revocation backlog gauges", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			// Both unattributed, matching event_metrics.go: the backlog is a single
+			// global pair, and attributing it per subscriber would publish a series per
+			// subscriber ever revoked — unbounded cardinality for a number whose only
+			// consumer is one alert threshold.
+			SubscriberRevocationsPending.Record(ctx, 4)
+			OldestSubscriberRevocationAgeSeconds.Record(ctx, 7200)
+		})
+	})
 }
 
 // TestPublishConsumerLagInventory_ReplacesRatherThanMerges pins the property the whole
@@ -569,32 +755,39 @@ func TestPublishConsumerLagInventory_ReplacesRatherThanMerges(t *testing.T) {
 // particular is easy to get wrong: the hyphenated "dead-lettered" reads more
 // naturally in prose and matches nothing at query time.
 //
-// The vocabulary is FOUR values, not three. "retrying" and "failed" are separate
-// outcomes because a failure that will be retried and a failure that will not are
-// different operational states: labelling a permanent failure, or the one that spent
-// the last of the retry budget, as "retrying" reports retry pressure that no longer
-// exists and hides the events that are actually stuck. Any change to this list is a
-// change to a published attribute domain and has to be made deliberately here, on the
-// instrument's declaration, and in anything querying it.
+// The vocabulary is THREE values, and the accompanying `terminal` dimension is what
+// carries the fourth fact the retired outcome used to carry. Both domains are pinned
+// together here, because they are only meaningful as a pair: a failure that will be
+// retried and one that never will are different operational states, and after the
+// fourth outcome was removed the ONLY thing distinguishing them is `terminal`. Any
+// change to either list is a change to a published attribute domain and has to be made
+// deliberately here, on the instrument's declaration, and in anything querying it.
 func TestEventPublishAttemptsTotal_AcceptsEveryPublishOutcome(t *testing.T) {
 	ctx := context.Background()
 
-	require.Len(t, publishOutcomes, 4,
-		"the outcome vocabulary is dispatched, retrying, failed and dead_lettered; "+
-			"a fifth publish outcome needs a deliberate decision here and in the alerting rules")
+	require.Len(t, publishOutcomes, 3,
+		"the outcome vocabulary is dispatched, retrying and dead_lettered; "+
+			"a fourth publish outcome needs a deliberate decision here and in the alerting rules")
 	require.Contains(t, publishOutcomes, "dead_lettered",
 		"the dead-letter outcome is spelled with an underscore, not a hyphen")
-	require.Contains(t, publishOutcomes, "failed",
-		"a terminal failure must be distinguishable from one that will be retried")
+	require.NotContains(t, publishOutcomes, "failed",
+		"`failed` was retired because it widened the documented three-value publish-status "+
+			"vocabulary; a terminal failure is {outcome=\"retrying\",terminal=\"true\"}")
+
+	require.Len(t, publishTerminalValues, 2,
+		"the terminal domain is exactly true and false, so it multiplies the series count by two")
 
 	for _, outcome := range publishOutcomes {
-		t.Run(outcome, func(t *testing.T) {
-			require.NotPanics(t, func() {
-				EventPublishAttemptsTotal.Add(ctx, 1, metric.WithAttributes(
-					attribute.String("outcome", outcome),
-				))
+		for _, terminal := range publishTerminalValues {
+			t.Run(outcome+"/terminal="+terminal, func(t *testing.T) {
+				require.NotPanics(t, func() {
+					EventPublishAttemptsTotal.Add(ctx, 1, metric.WithAttributes(
+						attribute.String("outcome", outcome),
+						attribute.String("terminal", terminal),
+					))
+				})
 			})
-		})
+		}
 	}
 }
 
@@ -847,7 +1040,7 @@ func (o *capturingObserver) int64For(instrument metric.Int64Observable) []int64 
 }
 
 // recordEveryEventInstrument drives one representative measurement through each of the
-// seven event-streaming instruments, using the attribute keys their declarations
+// event-streaming instruments, using the attribute keys their declarations
 // document.
 //
 // It exists so the descriptor assertions below have something to collect: the SDK
@@ -858,8 +1051,19 @@ func recordEveryEventInstrument(ctx context.Context) {
 		attribute.String("topic", "blnk.transactions"),
 		attribute.String("event_type", "transaction.applied"),
 	))
+	EventsDispatchedTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("topic", "blnk.transactions"),
+		attribute.String("event_type", "transaction.applied"),
+	))
+
+	EventBrokerAcknowledgementsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("topic", "blnk.transactions"),
+		attribute.String("event_type", "transaction.applied"),
+		attribute.String("purpose", "original"),
+	))
 	EventPublishAttemptsTotal.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("outcome", "dispatched"),
+		attribute.String("terminal", "false"),
 	))
 	EventPublishDuration.Record(ctx, 0.42, metric.WithAttributes(
 		attribute.String("topic", "blnk.transactions"),
@@ -890,6 +1094,47 @@ func recordEveryEventInstrument(ctx context.Context) {
 	}})
 
 	OutboxPendingBacklog.Record(ctx, 7)
+
+	EventsPurgedTotal.Add(ctx, 3)
+
+	SubscriberRevocationsPending.Record(ctx, 2)
+	OldestSubscriberRevocationAgeSeconds.Record(ctx, 3601)
+
+	// The four settlement gauges are recorded together because they are published together, as
+	// one reading of one aggregate. Recording only some of them here would let a rename of the
+	// others past the descriptor assertions below.
+	SubscriberSettlementOutstanding.Record(ctx, 3)
+	SubscriberGrantReconcilePending.Record(ctx, 2)
+	SubscriberCredentialCleanupPending.Record(ctx, 2)
+	OldestSubscriberSettlementAgeSeconds.Record(ctx, 3601)
+	SubscriberObligationsSettledTotal.Add(ctx, 5)
+
+	// The credential-orphan and revocation-failure pairs. Each is a marker plus the age the
+	// age-based alert is stated over, so both halves are recorded together: a rename of the age
+	// alone would otherwise slip past the descriptor assertions.
+	SubscriberCredentialOrphans.Record(ctx, 1)
+	OldestSubscriberCredentialOrphanAgeSeconds.Record(ctx, 3601)
+	SubscriberRevocationFailures.Record(ctx, 1)
+	OldestSubscriberRevocationFailureAgeSeconds.Record(ctx, 3601)
+
+	// Lag-sweep COVERAGE, which is what says whether the lag alert can fire at all. The
+	// unmeasured gauge is attributed by reason, because the reason decides the remediation.
+	SubscribersUnmeasured.Record(ctx, 1, metric.WithAttributes(
+		attribute.String("reason", "budget"),
+	))
+	SubscribersRegistered.Record(ctx, 3)
+	ConsumerLagInventoryComplete.Record(ctx, 0)
+	SubscriberLagPassAgeSeconds.Record(ctx, 12)
+	SubscriberLagCoveredSubscribers.Record(ctx, 2)
+
+	// The collector's own health. The counter is synchronous; the two ages are ASYNCHRONOUS and
+	// are published by observeEventMetricsCollectionAges, which returns nothing at all until a
+	// collection has been recorded — so this call is what makes those two series exist for the
+	// descriptor and series-name assertions to find.
+	EventMetricsCollectionFailuresTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("collection", "outbox_backlog"),
+	))
+	RecordEventMetricsCollection(time.Now().Add(-30*time.Second), true)
 }
 
 // collectScopeMetrics collects one snapshot and returns the metrics of the "blnk"
@@ -938,9 +1183,40 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 		description string
 	}{
 		{
-			name:        "blnk.events.published.total",
-			unit:        "{event}",
-			description: "Total number of ledger events durably recorded as dispatched by topic and event type",
+			// UNIT {event}, NOT {write}, and the description says events. The unit is part of
+			// the exported name, so this pairing is a published contract.
+			//
+			// The increment is on the token-fenced transition that records the Kafka leg, NOT on
+			// the broker acknowledgement — so a republish after a crash cannot count one event
+			// twice, and this stays the per-event measure the V-1 throughput verdict and the
+			// V-3 dead-letter rate are read from. The write-side signal has its own instrument
+			// two entries below; it once shared this one, and the description promised a
+			// contract the increment did not keep.
+			name: "blnk.events.published.total",
+			unit: "{event}",
+			description: "Total original ledger events whose Kafka leg is durably recorded, " +
+				"counted once each by topic and event type",
+		},
+		{
+			// ALSO PER-EVENT, and deliberately not a second opinion on the row above. This one
+			// is incremented at the terminal dispatched state, which for a row still owing a
+			// legacy webhook happens on a later pass — so it answers "how many events are
+			// completely settled" rather than "how many are on their topic". The two converge
+			// at the sunset, when the webhook_pending state is removed.
+			name: "blnk.events.dispatched.total",
+			unit: "{event}",
+			description: "Total ledger events whose delivery is durably recorded, counted once " +
+				"each by topic and event type",
+		},
+		{
+			// THE WRITE-SIDE SIGNAL, and the unit says so: {write}, not {event}. It counts what
+			// the broker accepted, for EVERY purpose — original, replay, dead-letter — so a
+			// republished event is counted again, which is the whole point. The gap between it
+			// and published.total is rows that reached Kafka and could not be marked, which is
+			// the leading indicator of duplicate delivery.
+			name:        "blnk.events.broker_acknowledgements.total",
+			unit:        "{write}",
+			description: "Total event publishes acknowledged by the broker, by topic, event type and purpose",
 		},
 		{
 			name:        "blnk.events.publish.attempts.total",
@@ -991,6 +1267,122 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 			name:        "blnk.outbox.pending",
 			unit:        "{event}",
 			description: "Number of event outbox rows not yet published to Kafka",
+		},
+		{
+			name:        "blnk.events.purged.total",
+			unit:        "{event}",
+			description: "Terminal event outbox rows deleted by the retention sweep",
+		},
+		{
+			name:        "blnk.subscribers.revocation_pending",
+			unit:        "{subscriber}",
+			description: "Subscribers whose broker-side credential revocation is still owed",
+		},
+		{
+			// THE ALERT READS THIS ONE. SubscriberRevocationOutstanding matches
+			// blnk_subscribers_oldest_revocation_age_seconds against 3600, and the "seconds"
+			// suffix comes from the unit below — so a unit change is a rename that silently
+			// leaves the rule evaluating nothing.
+			name:        "blnk.subscribers.oldest_revocation_age_seconds",
+			unit:        "s",
+			description: "Age of the oldest outstanding subscriber credential revocation",
+		},
+		{
+			name:        "blnk.subscribers.settlement_outstanding",
+			unit:        "{subscriber}",
+			description: "Subscribers owing broker-side reconciliation of either kind",
+		},
+		{
+			name:        "blnk.subscribers.grant_reconcile_pending",
+			unit:        "{subscriber}",
+			description: "Subscribers whose broker-side ACL grant may not match the registry",
+		},
+		{
+			name:        "blnk.subscribers.credential_cleanup_pending",
+			unit:        "{subscriber}",
+			description: "Subscribers owing a broker-side credential cleanup",
+		},
+		{
+			// SubscriberSettlementOutstanding matches
+			// blnk_subscribers_oldest_settlement_age_seconds against 3600, so the same
+			// unit-is-a-rename caution applies here.
+			name:        "blnk.subscribers.oldest_settlement_age_seconds",
+			unit:        "s",
+			description: "Age of the oldest outstanding subscriber settlement obligation",
+		},
+		{
+			// SubscriberSettlementNotProgressing takes a rate over this counter, which is what
+			// separates a stuck settlement pass from a busy one — a distinction the four gauges
+			// above cannot make, because a flat backlog looks identical either way.
+			name:        "blnk.subscribers.obligations_settled.total",
+			unit:        "{obligation}",
+			description: "Broker-side subscriber obligations discharged by the settlement pass",
+		},
+		{
+			name:        "blnk.subscribers.credential_orphans",
+			unit:        "{subscriber}",
+			description: "Subscribers holding a Kafka credential Blnk could neither record nor revoke",
+		},
+		{
+			name:        "blnk.subscribers.oldest_credential_orphan_age_seconds",
+			unit:        "s",
+			description: "Age of the oldest unaccounted subscriber Kafka credential",
+		},
+		{
+			name:        "blnk.subscribers.revocation_failures",
+			unit:        "{subscriber}",
+			description: "Subscribers whose most recent broker-side revocation attempt was refused",
+		},
+		{
+			name:        "blnk.subscribers.oldest_revocation_failure_age_seconds",
+			unit:        "s",
+			description: "Age of the oldest refused subscriber revocation attempt",
+		},
+		{
+			// ATTRIBUTED BY REASON, which is why the aggregate alone is not enough: only the
+			// 'budget' reason is answered by configuration.
+			name:        "blnk.kafka.subscribers_unmeasured",
+			unit:        "{subscriber}",
+			description: "Registered subscribers the last lag sweep did not publish a complete reading for, by reason",
+		},
+		{
+			name: "blnk.subscribers.registered",
+			unit: "{subscriber}",
+			description: "Subscribers the registry holds, so the unmeasured count can be read as a proportion " +
+				"and the measurement budget's headroom is visible before it is exhausted",
+		},
+		{
+			name:        "blnk.kafka.consumer_lag_inventory_complete",
+			unit:        "{status}",
+			description: "1 when the last lag sweep measured every registered subscriber, 0 when it did not",
+		},
+		{
+			name:        "blnk.kafka.consumer_lag.pass_age_seconds",
+			unit:        "s",
+			description: "Age of the in-progress pass over the subscriber registry for lag measurement",
+		},
+		{
+			name:        "blnk.kafka.consumer_lag.covered_subscribers",
+			unit:        "{subscriber}",
+			description: "Subscribers with a currently exported consumer-lag series",
+		},
+		{
+			name:        "blnk.event_metrics.collection_failures.total",
+			unit:        "{failure}",
+			description: "Failures inside the periodic event-metrics collector, by which collection failed",
+		},
+		{
+			// THE COLLECTOR'S OWN LIVENESS. EventMetricsCollectionStale matches
+			// blnk_event_metrics_last_collection_age_seconds, so the "seconds" suffix comes from
+			// this unit and a unit change is a rename that leaves the rule evaluating nothing.
+			name:        "blnk.event_metrics.last_collection_age_seconds",
+			unit:        "s",
+			description: "Seconds since the periodic event-metrics collector last finished a collection",
+		},
+		{
+			name:        "blnk.event_metrics.last_success_age_seconds",
+			unit:        "s",
+			description: "Seconds since the periodic event-metrics collector last completed a collection with no failures",
 		},
 	}
 
@@ -1168,7 +1560,15 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 		keys   []string
 	}{
 		{metric: "blnk.events.published.total", keys: []string{"topic", "event_type"}},
-		{metric: "blnk.events.publish.attempts.total", keys: []string{"outcome"}},
+		// The terminal counter, attributed exactly as the published counter is. The pair is what
+		// makes "how many events are still mid-flight" a subtraction rather than a guess, and a
+		// divergence in labels would make the two unsubtractable.
+		{metric: "blnk.events.dispatched.total", keys: []string{"topic", "event_type"}},
+		// Both dimensions. `terminal` is not decoration: with the outcome vocabulary frozen at
+		// three values it is the ONLY thing separating a failure that will be retried from one
+		// that never will, so a counter that lost it could no longer answer the question the
+		// dead-letter triage runbook opens with.
+		{metric: "blnk.events.publish.attempts.total", keys: []string{"outcome", "terminal"}},
 		{metric: "blnk.events.publish.duration", keys: []string{"topic", "attempt", "outcome"}},
 		// No outcome: only an acknowledged publish has an end-to-end age to report, so the
 		// attribute would carry one value on every series and add nothing.
@@ -1187,7 +1587,67 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 		// Deliberately unattributed: one process has one outbox backlog, so a label
 		// would add cardinality without adding information.
 		{metric: "blnk.outbox.pending", keys: nil},
+		// The coverage boolean is one fact about one sweep, so it carries nothing. A
+		// per-subscriber breakdown would defeat its purpose: the whole reason it exists is
+		// that an unmeasured subscriber has no series of its own to attribute anything to.
+		{metric: "blnk.kafka.consumer_lag_inventory_complete", keys: nil},
+		// The reason is the entire value of this gauge — SubscriberLagCoverageIncomplete's
+		// remediation branches on it, naming each value and its own action — so the key is a
+		// published contract and not an incidental label.
+		{metric: "blnk.kafka.subscribers_unmeasured", keys: []string{"reason"}},
+		// Which collection failed, for the same reason: EventMetricsCollectionFailing's
+		// remediation reads this attribute to separate a database fault from a broker one.
+		{metric: "blnk.event_metrics.collection_failures.total", keys: []string{"collection"}},
+		// The collection-health pair describes the collector itself, of which a process has
+		// exactly one, so both are unattributed. EventMetricsCollectionAbsent selects on the
+		// SCRAPE job label rather than on anything the instrument carries, which is why no
+		// attribute is needed to scope it to the server role.
+		{metric: "blnk.event_metrics.last_collection_age_seconds", keys: nil},
+		{metric: "blnk.event_metrics.last_success_age_seconds", keys: nil},
+		// PURPOSE, and only this instrument carries it. It is what separates an original
+		// publish from a replay and from a dead-letter write, so a comparison against
+		// published.total has to filter on it — an unfiltered comparison counts triage as
+		// re-delivery.
+		{
+			metric: "blnk.events.broker_acknowledgements.total",
+			keys:   []string{"topic", "event_type", "purpose"},
+		},
+		// The four unsettled-state markers describe the registry as a whole, of which a
+		// deployment has one, so none of them carries a label. Their per-subscriber detail is
+		// read from GET /subscribers, which is where a triage runbook sends an operator.
+		{metric: "blnk.subscribers.credential_orphans", keys: nil},
+		{metric: "blnk.subscribers.oldest_credential_orphan_age_seconds", keys: nil},
+		{metric: "blnk.subscribers.revocation_failures", keys: nil},
+		{metric: "blnk.subscribers.oldest_revocation_failure_age_seconds", keys: nil},
+		// The registry size, unattributed, so the unmeasured count above reads as a
+		// proportion of it.
+		{metric: "blnk.subscribers.registered", keys: nil},
+		// The lag sweep's own progress, one pass per process, so neither carries a label.
+		{metric: "blnk.kafka.consumer_lag.pass_age_seconds", keys: nil},
+		{metric: "blnk.kafka.consumer_lag.covered_subscribers", keys: nil},
+		// The retention sweep's own count, unattributed: one process runs one sweep over one
+		// table, and it is read against eligibility rather than broken down.
+		{metric: "blnk.events.purged.total", keys: nil},
+		// The revocation and settlement aggregates, each a marker paired with the age its
+		// age-based alert is stated over. All unattributed for the same reason as the orphan
+		// pair above: they describe the registry, and the per-subscriber detail is read from
+		// GET /subscribers.
+		{metric: "blnk.subscribers.revocation_pending", keys: nil},
+		{metric: "blnk.subscribers.oldest_revocation_age_seconds", keys: nil},
+		{metric: "blnk.subscribers.settlement_outstanding", keys: nil},
+		{metric: "blnk.subscribers.grant_reconcile_pending", keys: nil},
+		{metric: "blnk.subscribers.credential_cleanup_pending", keys: nil},
+		{metric: "blnk.subscribers.oldest_settlement_age_seconds", keys: nil},
+		// A COUNTER, and unattributed: SubscriberSettlementNotProgressing takes a rate over it
+		// to separate a stuck pass from a busy one, and that question has no per-subject
+		// breakdown.
+		{metric: "blnk.subscribers.obligations_settled.total", keys: nil},
 	}
+
+	require.Len(t, cases, len(eventStreamingInstruments()),
+		"every event-streaming instrument must have its attribute keys asserted here; this "+
+			"table had drifted five instruments behind the declarations, and an unasserted "+
+			"instrument is one whose labels can be renamed without anything noticing")
 
 	for _, tc := range cases {
 		t.Run(tc.metric, func(t *testing.T) {
@@ -1300,9 +1760,12 @@ func TestEventPublishTelemetry_LabelDomainsStayClosed(t *testing.T) {
 		}
 	}
 	for _, outcome := range publishOutcomes {
-		EventPublishAttemptsTotal.Add(ctx, 1, metric.WithAttributes(
-			attribute.String("outcome", outcome),
-		))
+		for _, terminal := range publishTerminalValues {
+			EventPublishAttemptsTotal.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("outcome", outcome),
+				attribute.String("terminal", terminal),
+			))
+		}
 	}
 
 	collected := collectScopeMetrics(t, reader)
@@ -1323,7 +1786,386 @@ func TestEventPublishTelemetry_LabelDomainsStayClosed(t *testing.T) {
 
 	attempts, ok := collected["blnk.events.publish.attempts.total"].Data.(metricdata.Sum[int64])
 	require.True(t, ok, "the attempts counter was not exported as an int64 sum")
-	assert.Len(t, attempts.DataPoints, len(publishOutcomes),
-		"the attempts counter carries only the outcome attribute, so its series count is the outcome domain")
+	// The PRODUCT of the two domains, not the outcome domain alone. The counter carries
+	// `terminal` beside the outcome, so its budget is 3 x 2; asserting the smaller number
+	// would understate the exporter's real series count by half and pass while a third
+	// dimension crept in.
+	assert.Len(t, attempts.DataPoints, len(publishOutcomes)*len(publishTerminalValues),
+		"the attempts counter carries outcome AND terminal, so its series count is the product "+
+			"of the two closed domains: %d outcomes x %d terminal values",
+		len(publishOutcomes), len(publishTerminalValues))
 	assert.True(t, attempts.IsMonotonic, "an attempts counter must be monotonic")
+}
+
+// TestSubscriberUnmeasuredReasons_IsAClosedNonDegenerateVocabulary pins the domain of the one
+// attribute an alert's REMEDIATION branches on.
+//
+// SubscriberLagCoverageIncomplete does not tell an operator to go and investigate; it names each
+// reason and gives each its own action, because the five mean five different faults in five
+// different places — the budget, the registry row, the broker, the registry query and the topic
+// provisioning. That makes this vocabulary a published contract rather than a set of log-ish
+// strings, and it has two failure modes worth mechanically excluding.
+//
+// A reason ADDED here and not added to the remediation leaves an operator holding a series with a
+// reason the runbook does not explain. A reason RENAMED leaves the remediation describing a value
+// that no longer exists while saying nothing about the one that does. Neither breaks a build,
+// neither fails promtool, and both are only ever discovered mid-incident — so the enumeration is
+// asserted exactly, and event_metrics_test.go asserts that the alert text still names every
+// member of it.
+//
+// The duplicate and empty checks are not padding. The collector writes the gauge once per value
+// returned here, so a duplicate would record the same series twice per tick — the second write
+// silently overwriting the first with a different number — and an empty string would export a
+// series whose reason cannot be read at all.
+func TestSubscriberUnmeasuredReasons_IsAClosedNonDegenerateVocabulary(t *testing.T) {
+	reasons := SubscriberUnmeasuredReasons()
+
+	assert.Equal(t, []string{
+		SubscribersUnmeasuredReasonBudget,
+		SubscribersUnmeasuredReasonUnprovisioned,
+		SubscribersUnmeasuredReasonMeasureFailed,
+		SubscribersUnmeasuredReasonRegistryFailed,
+		SubscribersUnmeasuredReasonTopicMissing,
+	}, reasons,
+		"the reason domain is a published contract: SubscriberLagCoverageIncomplete's remediation "+
+			"branches on every one of these values, so adding or renaming one without updating that "+
+			"rule leaves an operator with a series the runbook cannot explain")
+
+	seen := make(map[string]struct{}, len(reasons))
+	for _, reason := range reasons {
+		assert.NotEmpty(t, reason, "an empty reason exports a series nobody can interpret")
+
+		_, duplicate := seen[reason]
+		assert.False(t, duplicate,
+			"reason %q appears twice, so the collector would record the same series twice per tick "+
+				"and the second write would silently replace the first", reason)
+		seen[reason] = struct{}{}
+	}
+
+	// A FRESH SLICE, so a caller cannot mutate the vocabulary for every other caller in the
+	// process. The collector iterates this on every tick; a handler that sorted or truncated the
+	// returned slice in place would change what is published from then on.
+	first := SubscriberUnmeasuredReasons()
+	first[0] = "mutated-by-a-caller"
+	assert.Equal(t, reasons, SubscriberUnmeasuredReasons(),
+		"the vocabulary must be returned as a copy; a caller mutating it would change what every "+
+			"later tick publishes")
+}
+
+// TestEventStreamingInstruments_ExportedPrometheusSeriesNames asserts the names the ALERT RULES
+// actually match on, as the Prometheus exporter produces them.
+//
+// # Why the OTel name is not enough
+//
+// Every other test in this file checks the OTel instrument name. The rules do not use that name:
+// they use the exporter's translation of it, and the translation is not a mechanical
+// dot-to-underscore substitution. The exporter also appends a suffix DERIVED FROM THE UNIT — a
+// unit of "1" becomes "_ratio", "s" becomes "_seconds", a monotonic counter gains "_total" — so
+// a unit is part of a series name whether or not anybody intended it to be.
+//
+// That is not hypothetical here. blnk.kafka.consumer_lag_inventory_complete was declared with the
+// UCUM unit "1", which is correct for a dimensionless value and which the exporter renders as
+// blnk_kafka_consumer_lag_inventory_complete_ratio. SubscriberLagCoverageIncomplete matched the
+// unsuffixed name, so it evaluated against a series that did not exist — and a rule over a
+// missing series cannot fire and is indistinguishable from a system with nothing wrong. The Go
+// build passed, every OTel-name assertion passed, and promtool validated the rule.
+//
+// So the exporter is run for real and the exposition text is searched for the exact names the
+// rule files use. A unit or name change that moves a series now fails HERE, at the boundary the
+// alerting depends on, rather than silently in production.
+func TestEventStreamingInstruments_ExportedPrometheusSeriesNames(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	exporter, err := promexporter.New(promexporter.WithRegisterer(registry))
+	require.NoError(t, err, "building the Prometheus exporter")
+
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
+	t.Cleanup(func() {
+		require.NoError(t, provider.Shutdown(context.Background()))
+	})
+
+	// A meter from THIS provider, and every instrument rebuilt on it: the package-level
+	// instruments belong to whatever provider was installed at import time, so recording through
+	// them would not reach this exporter.
+	restore := swapMeter(t, provider.Meter("blnk"))
+	defer restore()
+
+	require.NoError(t, Init(), "re-initialising the instruments against the Prometheus exporter")
+	recordEveryEventInstrument(context.Background())
+
+	exposition := scrapeRegistry(t, registry)
+
+	// Exactly the names alerts/blnk-kafka-alerts.yml and docs/metrics.md use. Written out as
+	// literals rather than derived from the instrument names, because deriving them would
+	// reproduce the very assumption that broke.
+	for _, series := range []string{
+		"blnk_events_published_total",
+		"blnk_events_broker_acknowledgements_total",
+		"blnk_events_dispatched_total",
+		"blnk_events_publish_attempts_total",
+		// HISTOGRAMS ARE ASSERTED ON THEIR _bucket SERIES, because that is the series the
+		// documented p99 queries feed to histogram_quantile — a histogram exports
+		// _bucket, _sum and _count and no bare sample at all, so asserting the bare name
+		// would fail for a correctly exported instrument.
+		"blnk_events_publish_duration_seconds_bucket",
+		"blnk_events_capture_to_dispatch_duration_seconds_bucket",
+		"blnk_events_dead_lettered_total",
+		"blnk_dlt_oldest_message_age_seconds",
+		"blnk_kafka_consumer_lag",
+		"blnk_kafka_consumer_lag_unmeasured_partitions",
+		"blnk_kafka_consumer_lag_inventory_complete",
+		"blnk_kafka_subscribers_unmeasured",
+		"blnk_outbox_pending",
+		"blnk_events_purged_total",
+		"blnk_subscribers_revocation_pending",
+		"blnk_subscribers_oldest_revocation_age_seconds",
+		"blnk_event_metrics_last_collection_age_seconds",
+		"blnk_event_metrics_last_success_age_seconds",
+		"blnk_event_metrics_collection_failures_total",
+	} {
+		t.Run(series, func(t *testing.T) {
+			assert.True(t, expositionHasSeries(exposition, series),
+				"no exported sample is named %q. The alert rules and the documented queries match on "+
+					"this exact name, so if the exporter renamed it — most likely by appending a unit "+
+					"suffix — every rule over it silently evaluates nothing and can never fire",
+				series)
+		})
+	}
+
+	t.Run("the success age is published even when no collection has ever succeeded", func(t *testing.T) {
+		// The worst state there is, and the one absence would hide: failing since start-up. The
+		// gauge must still carry a value, or EventMetricsCollectionFailing has no series to
+		// evaluate for precisely the collector that has never worked.
+		resetEventMetricsCollectionHealth(t)
+		RecordEventMetricsCollection(time.Now().Add(-10*time.Minute), false)
+
+		text := scrapeRegistry(t, registry)
+		assert.True(t, expositionHasSeries(text, "blnk_event_metrics_last_success_age_seconds"),
+			"a collector that has never completed a clean collection must still report a success age, "+
+				"measured from when it started; reporting nothing makes the most degraded state the one "+
+				"state a threshold rule cannot detect")
+	})
+}
+
+// swapMeter points the package meter at a different one for the duration of a test.
+//
+// Returns:
+//   - func(): restores the original meter. Also registered with t.Cleanup, so a test that
+//     forgets to call it still cannot leak the swap into another test.
+func swapMeter(t *testing.T, replacement metric.Meter) func() {
+	t.Helper()
+
+	original := meter
+	restore := func() { meter = original }
+	t.Cleanup(restore)
+	meter = replacement
+
+	return restore
+}
+
+// resetEventMetricsCollectionHealth clears the recorded collection timestamps.
+//
+// Necessary because they are process-global and monotonic: a success recorded by an earlier test
+// cannot be undone by recording an older failure, so the "never succeeded" case is only reachable
+// from a cleared state.
+func resetEventMetricsCollectionHealth(t *testing.T) {
+	t.Helper()
+
+	eventMetricsCollectionHealth.mu.Lock()
+	defer eventMetricsCollectionHealth.mu.Unlock()
+
+	eventMetricsCollectionHealth.firstAttempt = time.Time{}
+	eventMetricsCollectionHealth.lastAttempt = time.Time{}
+	eventMetricsCollectionHealth.lastSuccess = time.Time{}
+}
+
+// scrapeRegistry gathers a Prometheus registry and renders it as exposition text.
+//
+// Returns:
+//   - string: the exposition body, one sample per line.
+func scrapeRegistry(t *testing.T, registry *prometheus.Registry) string {
+	t.Helper()
+
+	families, err := registry.Gather()
+	require.NoError(t, err, "gathering the Prometheus registry")
+	require.NotEmpty(t, families, "the registry produced no metric families")
+
+	var rendered strings.Builder
+	encoder := expfmt.NewEncoder(&rendered, expfmt.NewFormat(expfmt.TypeTextPlain))
+	for _, family := range families {
+		require.NoError(t, encoder.Encode(family), "encoding %s", family.GetName())
+	}
+
+	return rendered.String()
+}
+
+// expositionHasSeries reports whether exposition text carries a sample with the given name.
+//
+// Matched on the sample line's leading token so that a name which is a PREFIX of another cannot
+// satisfy the assertion — which is the whole failure mode being guarded, since the suffix the
+// exporter appends is what moves a series.
+func expositionHasSeries(exposition, series string) bool {
+	for _, line := range strings.Split(exposition, "\n") {
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		name := line
+		if index := strings.IndexAny(line, "{ "); index >= 0 {
+			name = line[:index]
+		}
+		if name == series {
+			return true
+		}
+	}
+
+	return false
+}
+
+// declaredInstrumentNames parses metrics.go and returns the name of every EXPORTED
+// package-level variable whose declared type comes from the otel metric package.
+//
+// It reads the source rather than using reflection because the property under test is a
+// property of the DECLARATIONS, not of the values. Reflection can only see variables a
+// test already names, which is precisely the blind spot this helper exists to remove: an
+// instrument nobody enumerated is invisible to a reflective walk for the same reason it is
+// invisible to the enumeration tables.
+func declaredInstrumentNames(t *testing.T) []string {
+	t.Helper()
+
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, "metrics.go", nil, parser.SkipObjectResolution)
+	require.NoError(t, err, "metrics.go must be parseable for the declaration inventory to be trustworthy")
+
+	names := make([]string, 0, 32)
+
+	for _, declaration := range parsed.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || general.Tok != token.VAR {
+			continue
+		}
+
+		for _, spec := range general.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok || value.Type == nil {
+				continue
+			}
+
+			selector, ok := value.Type.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+
+			pkg, ok := selector.X.(*ast.Ident)
+			if !ok || pkg.Name != "metric" {
+				continue
+			}
+
+			for _, name := range value.Names {
+				if name.IsExported() {
+					names = append(names, name.Name)
+				}
+			}
+		}
+	}
+
+	require.NotEmpty(t, names, "no instrument declarations were found, so this guard would pass vacuously")
+	sort.Strings(names)
+
+	return names
+}
+
+// TestInstrumentTables_CoverEveryDeclaredInstrumentExactlyOnce is the guard that keeps the
+// two enumeration tables — and every count stated in this file's prose — honest.
+//
+// Both tables are written out by hand on purpose: that is what makes every non-nil
+// assertion above a real assertion rather than a tautology against the thing under test.
+// The cost of a hand-written table is that it can fall behind the code, and it did: an
+// instrument was declared, assigned in Init() and used in production while appearing in
+// NEITHER table, so the orphan guard silently covered one fewer instrument than its own
+// documentation claimed. Nothing failed, because a table that omits an entry cannot notice
+// the omission.
+//
+// This test closes that loop from the other direction. It derives the truth from the
+// declarations in metrics.go and asserts a bidirectional match:
+//
+//   - every declared instrument appears in exactly one table, so a newly declared
+//     instrument cannot be added without being brought under the non-nil guard, and
+//   - every table entry corresponds to a real declaration, so a removed instrument cannot
+//     leave a stale name behind that would fail to compile only after someone else's change.
+//
+// The failure messages name the specific instrument and the specific table to update,
+// because "the counts disagree" is not actionable at the moment the test goes red.
+func TestInstrumentTables_CoverEveryDeclaredInstrumentExactlyOnce(t *testing.T) {
+	declared := declaredInstrumentNames(t)
+
+	enumerated := make(map[string]int, len(declared))
+	for _, instrument := range preExistingInstruments() {
+		enumerated[instrument.name]++
+	}
+
+	for _, instrument := range eventStreamingInstruments() {
+		enumerated[instrument.name]++
+	}
+
+	for _, name := range declared {
+		assert.Equalf(t, 1, enumerated[name],
+			"instrument %s is declared in metrics.go but appears %d times across preExistingInstruments() and "+
+				"eventStreamingInstruments(); every declared instrument must appear in exactly one of them or it "+
+				"is not covered by the non-nil orphan guard", name, enumerated[name])
+	}
+
+	declaredSet := make(map[string]struct{}, len(declared))
+	for _, name := range declared {
+		declaredSet[name] = struct{}{}
+	}
+
+	for name := range enumerated {
+		_, ok := declaredSet[name]
+		assert.Truef(t, ok,
+			"%s is enumerated by a table in this file but is no longer declared as an otel instrument in "+
+				"metrics.go; remove it from the table", name)
+	}
+
+	// The totals are asserted separately from the membership check so that a red test says
+	// which of the two went wrong: a miscount, or a genuine mismatch.
+	assert.Equalf(t, len(declared), len(preExistingInstruments())+len(eventStreamingInstruments()),
+		"metrics.go declares %d instruments but the tables enumerate %d in total (%d pre-existing + %d "+
+			"event-streaming); the prose counts in this file's header are derived from these numbers and must "+
+			"be updated with them", len(declared), len(preExistingInstruments())+len(eventStreamingInstruments()),
+		len(preExistingInstruments()), len(eventStreamingInstruments()))
+
+	// A declaration that is never assigned stays nil forever and panics at its first
+	// production call site. The tables above are what defend against that, so a table
+	// entry naming a variable Init() never touches is itself a defect worth reporting.
+	source, err := parser.ParseFile(token.NewFileSet(), "metrics.go", nil, parser.SkipObjectResolution)
+	require.NoError(t, err)
+
+	var initBody strings.Builder
+	for _, declaration := range source.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "Init" || function.Body == nil {
+			continue
+		}
+
+		for _, statement := range function.Body.List {
+			assignment, ok := statement.(*ast.AssignStmt)
+			if !ok {
+				continue
+			}
+
+			for _, target := range assignment.Lhs {
+				if identifier, ok := target.(*ast.Ident); ok {
+					initBody.WriteString(identifier.Name)
+					initBody.WriteString("\n")
+				}
+			}
+		}
+	}
+
+	assigned := initBody.String()
+	for _, name := range declared {
+		assert.Containsf(t, assigned, name+"\n",
+			"%s is declared as an instrument but Init() never assigns it, so it stays nil and the first "+
+				"production call site panics on a nil interface", name)
+	}
 }

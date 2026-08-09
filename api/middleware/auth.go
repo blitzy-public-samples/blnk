@@ -26,6 +26,7 @@ import (
 	"github.com/blnkfinance/blnk"
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/apierror"
+	"github.com/blnkfinance/blnk/internal/logsafe"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 )
@@ -271,7 +272,12 @@ func (m *AuthMiddleware) Authenticate() gin.HandlerFunc {
 		// For POST requests, inject the API key ID into the metadata
 		if c.Request.Method == "POST" && c.Request.Body != nil {
 			if err := injectAPIKeyToMetadata(c, apiKey.APIKeyID); err != nil {
-				logrus.Error("Failed to inject API key ID into metadata:", err)
+				// The cause is sanitized, bounded and redacted rather than concatenated
+				// raw: this runs on an authenticated request, and the error comes from
+				// reading and rewriting a caller-supplied body, so its text is partly
+				// the caller's own. See internal/logsafe.
+				logrus.WithField("cause", logsafe.Cause(err)).
+					Error("failed to inject the API key id into the request metadata")
 			}
 		}
 

@@ -132,11 +132,12 @@ func decodeObject(t *testing.T, b []byte) map[string]json.RawMessage {
 // event type that reaches the legacy webhook sender must be published, with zero
 // exceptions. Both therefore resolve to `system`, which is also the catch-all.
 //
-// That category is INTERNAL, so neither of its topics is grantable to a subscriber.
-// system.error's payload is the frozen legacy body and still carries the error text
-// as it renders, so the disclosure is contained by audience rather than by
-// redaction; and an internal catch-all is what stops a forgotten mapping delivering
-// a domain payload to an audience that never asked for it. Forcing either event onto
+// That category is the narrowest in the catalogue: it is granted per subscriber, and
+// only to one that needs ledger events. system.error's payload is the frozen legacy
+// body and still carries the error text as it renders, so the disclosure is contained
+// by audience rather than by redaction; and routing a forgotten mapping here rather
+// than to a broadly-held category is what keeps its payload away from every
+// subscriber at once. Forcing either event onto
 // an unrelated topic would corrupt that topic's semantics for every subscriber
 // filtering on it, and dropping them would breach coverage outright.
 func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
@@ -232,19 +233,19 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 			reason:    "identity events must route to the identities category",
 		},
 
-		// --- the two event types outside the three named categories, in the two
-		// categories they belong to: one grantable, one internal ---
+		// --- the two event types outside the three named categories, both in the one
+		// extra category the frozen catalogue adds for them ---
 		{
 			name:      "ledger created",
 			eventType: "ledger.created",
-			want:      EventCategoryLedgers,
-			reason:    "ledger.created belongs to none of the three named categories, so it routes to the deliberate ledgers category - GRANTABLE, because it is ordinary ledger data that every webhook subscriber receives today, and putting it in the internal system category would have published it to a topic no subscriber credential can read",
+			want:      EventCategorySystem,
+			reason:    "ledger.created belongs to none of the three named categories, and the agreed topic contract is FOUR categories, so it routes to blnk.system - which is internal, meaning the event is captured, published and replayable but not consumable by a subscriber credential. A fifth grantable 'ledgers' category was implemented to close that gap and removed again: the catalogue is a published contract and widening it obliges every subscriber to hold a grant it was never told about",
 		},
 		{
 			name:      "system error",
 			eventType: "system.error",
 			want:      EventCategorySystem,
-			reason:    "system.error carries Blnk's internal diagnostic detail, so it stays in the internal system category and is covered without being offered to subscribers",
+			reason:    "system.error carries Blnk's internal diagnostic detail, so it routes to the internal system category and is covered without being offered to subscribers",
 		},
 	}
 
@@ -263,37 +264,31 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 	assert.Len(t, tests, 15, "the table must cover all thirteen emitted event types, with the runtime-composed bulk name exercised by three suffixes")
 }
 
-// TestEventCategory_UnknownEventFallsBackToTheInternalSystemCategory pins the
-// catch-all arm, and pins WHERE it points.
+// TestEventCategory_UnknownEventFallsBackToTheSystemCategory pins the catch-all arm,
+// and pins WHERE it points.
 //
-// Three properties are asserted, and the third is what a naive reading of the first two
-// would miss:
+// Two properties are asserted:
 //
 //  1. Coverage. An event type nobody mapped must still resolve to a real category, so
 //     a producer added later that forgets to extend the table gets its events
 //     published and observable rather than rejected or dropped. The row is already
 //     committed by the time routing happens, so rejecting would strand a durable
 //     event.
-//  2. Containment. That destination must not be a topic any subscriber can be granted.
-//     A forgotten mapping would otherwise deliver whatever the new producer emitted —
-//     plausibly a balance or an identity record — to an audience that never asked for
-//     it. The system category satisfies this because it is INTERNAL: no grant can
-//     cover its topic.
+//  2. A named destination. The fallback must land on the system category specifically,
+//     not on a domain topic whose subscribers filter it expecting ledger data, and not
+//     on an invented fifth topic the agreed inventory does not contain.
 //
-// The internal-category assertion is the point of the test, and it is what a fifth
+// The internal-category assertion is the point of the test, and it is what a separate
 // "quarantine" category would have been an alternative way of achieving. The topic
 // contract fixes the catalogue at four categories instead, so containment rests
 // entirely on the system category staying internal; an edit that made it grantable
 // would restore the disclosure, and a coverage-only assertion would not notice.
 func TestEventCategory_UnknownEventFallsBackToTheInternalSystemCategory(t *testing.T) {
 	assert.Equal(t, EventCategorySystem, EventCategory("totally.unknown.event"),
-		"an unrecognised event type must fall back to the internal system category — dropping it or returning an empty token would breach the zero-exceptions coverage guarantee for event types added later")
+		"an unrecognised event type must fall back to the system category — dropping it or returning an empty token would breach the zero-exceptions coverage guarantee for event types added later")
 
 	assert.Equal(t, EventCategorySystem, EventCategory(""),
 		"the empty event type must also resolve to a real category: the resolver is total, so no input can ever produce an empty category token that would then compose a malformed topic name")
-
-	assert.True(t, IsInternalEventCategory(EventCategorySystem),
-		"the catch-all category must be internal, or containment is nominal: a grantable catch-all topic is a disclosure by another name")
 
 	assert.False(t, IsCataloguedEventType("totally.unknown.event"),
 		"an unrecognised event type must be reported as uncatalogued, which is what makes the fallback observable rather than silent")
@@ -305,88 +300,49 @@ func TestEventCategory_UnknownEventFallsBackToTheInternalSystemCategory(t *testi
 		"a runtime-composed bulk transaction name must be reported as catalogued, because it is matched by prefix rather than enumerated")
 }
 
-// TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory pins the
-// allowlist the subscriber authorization path and the ACL provisioning both consult.
+// TestSubscriberGrantableEventCategories_CoversEveryCategory pins the allowlist the
+// subscriber authorization path and the ACL provisioning both consult.
 //
-// It asserts the exclusions by NAME rather than by count, because a count-only
+// It asserts the membership by NAME rather than by count, because a count-only
 // assertion passes just as happily when a category is swapped for another as when the
 // list is correct.
-func TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory(t *testing.T) {
+func TestSubscriberGrantableEventCategories_CoversEveryCategory(t *testing.T) {
 	grantable := SubscriberGrantableEventCategories()
 
 	assert.Contains(t, grantable, EventCategoryTransactions, "transactions is subscriber-facing ledger data")
 	assert.Contains(t, grantable, EventCategoryBalances, "balances is subscriber-facing ledger data")
 	assert.Contains(t, grantable, EventCategoryIdentities, "identities is subscriber-facing data")
-	// GRANTABLE, and this assertion is the one that matters most in this test, because the
-	// arrangement it pins replaced one in which it was false.
-	//
-	// ledger.created used to share the internal system category with system.error, which made
-	// it PUBLISHED AND UNREACHABLE: the event was captured, relayed and observable, and no
-	// subscriber credential Blnk can issue could read it. Coverage was satisfied on the
-	// publishing side and silently broken on the consuming side, in the one direction the
-	// webhook-to-Kafka migration promises not to regress — every subscriber receives
-	// ledger.created over the legacy HTTP transport today.
-	//
-	// It is grantable because its payload earns it, not because coverage demanded a
-	// concession: a *model.Ledger is a name, an id, a creation instant and caller metadata —
-	// exactly the shape of identity.created, which nobody argues about, and no more sensitive.
-	// It needed a category of its OWN rather than simply being made grantable in place,
-	// because the category it shared carries system.error, and grantable and ungrantable are
-	// opposite requirements that one topic cannot hold at once.
-	assert.Contains(t, grantable, EventCategoryLedgers,
-		"ledger.created is ordinary ledger data that every subscriber receives over the legacy "+
-			"transport today, so its category must be grantable: a published-but-unreachable "+
-			"event type is a consuming-side regression the migration promises not to cause")
 
-	// NOT GRANTABLE, and the case for granting it is worth recording because it is a
-	// reasonable one: blnk.system carries system.error, one of the thirteen event types the
-	// legacy HTTP transport delivered, so a subscriber granted nothing here has no authorized
-	// path to it.
+	// GRANTABLE, and this is the assertion that matters most here, because it is the one
+	// a reader is most likely to expect the opposite of.
 	//
-	// It stays internal for two independent reasons, either of which is sufficient.
+	// blnk.system carries ledger.created and system.error, and BOTH were delivered by the
+	// legacy HTTP transport. Withholding the category would leave those two event types
+	// published and unreachable: captured, relayed and observable, with no credential Blnk
+	// can issue able to read them. That is coverage satisfied on the publishing side and
+	// broken on the consuming side, in the one direction the webhook-to-Kafka migration
+	// promises not to regress.
 	//
-	// FIRST, the legacy transport's audience was not subscribers. There was ONE globally
-	// configured webhook URL — the operator's own endpoint — so "the legacy transport delivered
-	// it" establishes only that the operator received it. system.error's payload is the frozen
-	// legacy body, which carries the raw error text verbatim, and that text describes the
-	// inside of the deployment: a PostgreSQL error names schema, table, column and routine, a
-	// broker error names internal addresses. One shared topic would hand every subscriber every
-	// other subscriber's failures.
-	//
-	// SECOND, this category is the catalogue's CATCH-ALL — see
-	// TestEventCategory_UnknownEventFallsBackToTheInternalSystemCategory. An event type nobody
-	// mapped lands here, plausibly carrying a balance or an identity record, and its audience
-	// cannot be established. A grantable catch-all is a disclosure by another name, and it is
-	// what makes the containment half of the fallback real rather than nominal.
-	//
-	// The exclusion now costs a subscriber NOTHING it used to receive, which is what makes it a
-	// clean security boundary rather than a trade: system.error is the only catalogued event
-	// type left inside it, and its audience was always the operator alone. It is read under the
-	// master key, as the dead-letter topics are.
-	assert.NotContains(t, grantable, EventCategorySystem,
-		"the system category carries Blnk's own internal error detail, and — as the catalogue's "+
-			"catch-all — events of unknown provenance whose audience cannot be established, so it "+
-			"must never be grantable to a subscriber")
+	// What a grant of it discloses is real and is not glossed over: system.error's payload
+	// is the frozen legacy body, so it carries the error text as it renders — a PostgreSQL
+	// error names schema, table, column and routine; a broker error names internal
+	// addresses. The containment is therefore an AUDIENCE decision, made per subscriber by
+	// whoever chooses authorized_topics, which is the same decision an operator already
+	// made when they pointed one webhook URL at the same text. This list says what MAY be
+	// granted; it never says what any subscriber IS granted.
+	assert.Contains(t, grantable, EventCategorySystem,
+		"blnk.system carries ledger.created and system.error, both of which the legacy transport "+
+			"delivered, so the category must be grantable or those two event types are published "+
+			"and unreachable — a consuming-side regression the migration promises not to cause")
 
 	assert.Len(t, grantable, 4,
-		"exactly four of the five categories are subscriber-facing; a fifth appearing here means an internal category became grantable")
+		"all four categories of the agreed topic contract are grantable; a fifth entry means a category was added without the contract being changed")
 
-	for _, category := range grantable {
-		assert.False(t, IsInternalEventCategory(category),
-			"category %q is offered to subscribers, so it must not be internal", category)
-	}
-
-	// Every category is either grantable or internal — there is no third state a new
-	// category could quietly fall into.
-	for _, category := range AllEventCategories() {
-		if IsInternalEventCategory(category) {
-			assert.NotContains(t, grantable, category)
-
-			continue
-		}
-		assert.Contains(t, grantable, category,
-			"category %q is not internal, so it must appear in the grantable list; a category that is neither is unreachable for subscribers with nothing to say so", category)
-	}
+	// Every category is grantable. The equality is asserted in BOTH directions, so neither
+	// a category that exists without being grantable nor a grantable token that is not a
+	// category can slip through.
+	assert.ElementsMatch(t, AllEventCategories(), grantable,
+		"the grantable list and the category list must contain exactly the same tokens: a category missing from the grantable list is unreachable for subscribers with nothing to say so, and a grantable token that is not a category would compose a topic nothing publishes to")
 
 	// The accessors must hand back copies, or one caller's sort reorders every other
 	// caller's view.
@@ -478,13 +434,11 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 		"the balances token composes blnk.balances and blnk.balances.dlt")
 	assert.Equal(t, "identities", EventCategoryIdentities,
 		"the identities token composes blnk.identities and blnk.identities.dlt")
-	assert.Equal(t, "ledgers", EventCategoryLedgers,
-		"the ledgers token composes blnk.ledgers and blnk.ledgers.dlt — the grantable home of ledger.created, which exists so that an event every subscriber receives over the legacy transport has a Kafka topic a subscriber can actually be granted")
 	assert.Equal(t, "system", EventCategorySystem,
-		"the system token composes blnk.system and blnk.system.dlt — the internal category that keeps system-error events covered, and the catch-all that keeps an unrecognised event type published rather than dropped")
+		"the system token composes blnk.system and blnk.system.dlt — the internal category that carries ledger.created and system.error, and the catch-all that keeps an unrecognised event type published rather than dropped")
 
-	assert.Len(t, AllEventCategories(), 5,
-		"the topic contract is five categories and ten topics: a sixth would silently oblige the provisioning script, the Kubernetes configuration, the local stack and every subscriber's topic list to change with it")
+	assert.Len(t, AllEventCategories(), 4,
+		"the topic contract is four categories and eight topics: a fifth would silently oblige the provisioning script, the Kubernetes configuration, the local stack and every subscriber's topic list to change with it")
 
 	// Every token must be mutually distinct, or two categories would collapse onto
 	// one topic and a subscriber filtering by topic would receive events it never
@@ -493,7 +447,6 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 		EventCategoryTransactions: {},
 		EventCategoryBalances:     {},
 		EventCategoryIdentities:   {},
-		EventCategoryLedgers:      {},
 		EventCategorySystem:       {},
 	}
 	assert.Len(t, distinct, len(AllEventCategories()),
@@ -516,7 +469,79 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 	}
 }
 
-// TestPublishStatus_HasExactlyTheFourReportedOutcomes pins the per-attempt
+// TestEventCatalogue_CategorySetIsClosed is the guard against the topic catalogue
+// growing a category that the rest of the repository does not know about.
+//
+// # Why an exact-set assertion rather than a count
+//
+// The topic catalogue is a FROZEN FOUR-CATEGORY CONTRACT, and a fifth category is not
+// an implementation detail: `scripts/kafka-provision.sh` provisions one topic pair per
+// category, `docker-compose.yaml` and `docker-compose.dev.yaml` document the inventory,
+// `infrastructure/k8s-manifests/blnk-config.yaml` and `.env.example` enumerate it, the
+// `makefile`'s provisioning target prints it, `docs/event-streaming.md` publishes it to
+// subscribers, and `docs/kafka-operations.md` builds the daily zero-loss reconciliation
+// out of it. A category added here without those changes yields a topic that events
+// route to and that nothing creates — and with `auto.create.topics.enable=false` the
+// publish fails, the retry budget is spent, and the dead-letter write fails too because
+// the `.dlt` sibling is missing as well. Nothing in the build would have said so.
+//
+// A fifth category HAS existed here: `ledgers`, added so that `ledger.created` had a
+// grantable topic of its own. It was removed because the contract does not have one, and
+// this test is what stops it — or any successor — reappearing silently. Growing the
+// catalogue is a deliberate change that starts by editing the expectation below.
+//
+// The assertion is on the exact SET rather than the length, because a length assertion
+// passes just as happily when one category is swapped for another as when the list is
+// correct, and a swap is a renamed topic: every subscriber consuming the old name is
+// orphaned and every message already on it is stranded.
+func TestEventCatalogue_CategorySetIsClosed(t *testing.T) {
+	require.ElementsMatch(t,
+		[]string{"transactions", "balances", "identities", "system"},
+		AllEventCategories(),
+		"the topic catalogue is a frozen four-category contract. A fifth category here is a "+
+			"topic that events route to and that scripts/kafka-provision.sh, both compose "+
+			"stacks, blnk-config.yaml, .env.example, the makefile and the operator docs do "+
+			"not create. Change all of them, then change this expectation",
+	)
+
+	// The canonical order is asserted separately from membership, because the ORDER fixes
+	// the order of AllTopics, AllDeadLetterTopics and AllTopicsWithDeadLetters, and
+	// operators diff those listings against the provisioning script's output.
+	assert.Equal(t,
+		[]string{"transactions", "balances", "identities", "system"},
+		AllEventCategories(),
+		"the canonical category order is what makes topic inventories, reports and their "+
+			"diffs against provisioning comparable; reordering it silently changes every "+
+			"listing the operator runbooks tell an operator to compare",
+	)
+
+	// EVERY CATALOGUED EVENT TYPE MUST LAND IN THAT SET. This is the half that makes the
+	// closure meaningful in the other direction: a category could be removed from the
+	// order above while an event type still mapped to it, which would leave the event
+	// routing to a topic nothing provisions — the same failure, reached from the far side.
+	catalogued := map[string]struct{}{}
+	for _, category := range AllEventCategories() {
+		catalogued[category] = struct{}{}
+	}
+
+	for eventType, category := range eventTypeCategories {
+		assert.Containsf(t, catalogued, category,
+			"event type %q maps to category %q, which is not in the canonical catalogue; the "+
+				"event would publish to a topic nothing provisions", eventType, category)
+	}
+
+	// And the runtime-composed bulk family, which is matched by prefix and therefore
+	// absent from the table above.
+	assert.Contains(t, catalogued, EventCategory("bulk_transaction.applied"),
+		"the bulk transaction family must route into the canonical catalogue")
+
+	// The catch-all included: an unrecognised event type must land on a catalogued topic,
+	// or the never-drop-an-event guarantee would publish to a name nothing created.
+	assert.Contains(t, catalogued, EventCategory("something.nobody.mapped"),
+		"the catch-all must resolve to a catalogued category")
+}
+
+// TestPublishStatus_HasExactlyTheThreeReportedOutcomes pins the per-attempt
 // publish outcome vocabulary — ALL of it.
 //
 // The metrics layer uses these values verbatim as metric attribute values — the
@@ -525,41 +550,58 @@ func TestEventCategoryConstants_HaveWireValues(t *testing.T) {
 // values. Declaring the vocabulary once and pinning it once is what stops the code
 // and the label set from diverging unnoticed.
 //
-// The FOURTH value is the reason this test is worth reading. It used to assert three
-// outcomes while the code declared four, so "failed" — the outcome a permanently
-// undeliverable event reports — was the one value no test covered, in the very test
-// whose job is to pin the label set an alerting query selects on. A vocabulary test
-// that omits a member is worse than none: it reads as proof of completeness.
-func TestPublishStatus_HasExactlyTheFourReportedOutcomes(t *testing.T) {
+// THE COUNT IS THE ASSERTION THAT MATTERS. Requirement R-3 names exactly three
+// outcomes, and this vocabulary is a published label domain rather than an internal
+// enum: widening it silently changes what every existing dashboard selection and
+// alert rule matches. A fourth value, "failed", was added here to express "this
+// attempt failed and nothing further will be tried"; it was removed, and the
+// closed-set assertion below is what stops it — or any successor — reappearing.
+//
+// The distinction it carried still exists, on PublishResult.Transient,
+// PublishResult.Classified and PublishResult.Retryable, read through
+// PermanentFailure(). Nothing decides an event's fate from the status.
+func TestPublishStatus_HasExactlyTheThreeReportedOutcomes(t *testing.T) {
 	// PublishStatus is a named string type, so the comparison is made on the
 	// converted value: a typed constant and an untyped string literal are not
 	// deeply equal, and asserting them directly would fail for the wrong reason.
 	assert.Equal(t, "dispatched", string(PublishStatusDispatched),
 		"a broker acknowledgement is reported as \"dispatched\" — the value the publish-attempts counter carries as its outcome attribute")
 	assert.Equal(t, "retrying", string(PublishStatusRetrying),
-		"a failure inside the retry budget is reported as \"retrying\", distinguishing a transient blip from a final give-up in the metrics")
+		"every failed attempt is reported as \"retrying\"; whether another attempt follows is the relay's decision against the row's budget, not a value in this domain")
 	assert.Equal(t, "dead_lettered", string(PublishStatusDeadLettered),
-		"retry exhaustion is reported as \"dead_lettered\", the value the dead-letter alerting rule selects on")
-	assert.Equal(t, "failed", string(PublishStatusFailed),
-		"an attempt that failed with nothing further to try — a permanent failure, or the last attempt the budget allowed — is reported as \"failed\", which is what keeps a permanently stuck event distinguishable from a busy one in the attempts counter")
+		"an ACKNOWLEDGED write to a <topic>.dlt sibling is reported as \"dead_lettered\", the value the dead-letter alerting rule selects on")
 
 	assert.Equal(t, reflect.String, reflect.TypeOf(PublishStatusDispatched).Kind(),
 		"PublishStatus must remain a string-kinded named type so it can be used directly as a metric attribute value without conversion tables")
 
-	distinct := map[PublishStatus]struct{}{
-		PublishStatusDispatched:   {},
-		PublishStatusRetrying:     {},
-		PublishStatusDeadLettered: {},
-		PublishStatusFailed:       {},
+	// THE SET IS CLOSED, asserted as an exact set rather than a count so that swapping
+	// one value for another fails too — a swap renames a metric label an operator's
+	// dashboard selects on, which is a silent break rather than a loud one.
+	require.ElementsMatch(t,
+		[]PublishStatus{PublishStatusDispatched, PublishStatusRetrying, PublishStatusDeadLettered},
+		AllPublishStatuses(),
+		"requirement R-3 fixes the per-attempt outcome vocabulary at three values, and it is a "+
+			"published metric label domain: a fourth here silently changes what every existing "+
+			"dashboard selection and alert rule matches. Carry a new distinction on "+
+			"PublishResult instead")
+
+	distinct := map[PublishStatus]struct{}{}
+	for _, status := range AllPublishStatuses() {
+		distinct[status] = struct{}{}
 	}
-	assert.Len(t, distinct, 4,
-		"exactly four outcomes are reported, and they must be mutually distinct: collapsing two would make a retry indistinguishable from a success — or a permanent failure indistinguishable from a retryable one — in the metrics")
+	assert.Len(t, distinct, 3,
+		"exactly three outcomes are reported, and they must be mutually distinct: collapsing two would make a retry indistinguishable from a success in the metrics")
 
 	// The outcome vocabulary and the durable row-state vocabulary overlap in spelling
-	// and must not be confused: "failed" is an attempt outcome that is never persisted
-	// as a row status, and a row's terminal failure state is "dead_lettered".
+	// and must not be confused: no attempt outcome is persisted as a row status, and a
+	// row's terminal failure state is "dead_lettered".
 	assert.NotEqual(t, EventOutboxStatusFailed, string(PublishStatusRetrying),
 		"the attempt outcome and the row state vocabularies are separate; a retrying attempt is not a failed row")
+	for _, status := range AllPublishStatuses() {
+		assert.NotEqual(t, EventOutboxStatusFailed, string(status),
+			"no per-attempt outcome may share the spelling of the failed row state, which would "+
+				"let a metric label be mistaken for a durable status")
+	}
 }
 
 // TestEventOutboxStatus_ValuesAndLineageRelationship pins the durable outbox
@@ -579,22 +621,25 @@ func TestEventOutboxStatus_ValuesAndLineageRelationship(t *testing.T) {
 		// indistinguishable from an ordinary state and the conditional transition
 		// would match rows it must not touch.
 		for name, value := range map[string]string{
-			"pending":       EventOutboxStatusPending,
-			"processing":    EventOutboxStatusProcessing,
-			"dispatched":    EventOutboxStatusDispatched,
-			"failed":        EventOutboxStatusFailed,
-			"dead_lettered": EventOutboxStatusDeadLettered,
+			"pending":         EventOutboxStatusPending,
+			"processing":      EventOutboxStatusProcessing,
+			"webhook_pending": EventOutboxStatusWebhookPending,
+			"dispatched":      EventOutboxStatusDispatched,
+			"failed":          EventOutboxStatusFailed,
+			"dead_lettered":   EventOutboxStatusDeadLettered,
 		} {
 			assert.NotEqual(t, value, EventOutboxStatusReplaying,
 				"replaying must be distinct from %s, or the replay claim's conditional UPDATE would match rows in that state too", name)
 		}
 	})
 
-	t.Run("the five durable states have their stored values", func(t *testing.T) {
+	t.Run("the six non-replay durable states have their stored values", func(t *testing.T) {
 		assert.Equal(t, "pending", EventOutboxStatusPending,
 			"pending is the initial state set by the column default when the row is inserted alongside the ledger mutation, and the value the pending partial index filters on")
 		assert.Equal(t, "processing", EventOutboxStatusProcessing,
 			"processing means a relay holds a lease on the row, and is one of the two values the composite claim index is restricted to")
+		assert.Equal(t, "webhook_pending", EventOutboxStatusWebhookPending,
+			"webhook_pending is the dual-delivery state: the Kafka leg is published and only the legacy webhook is still owed. Its literal value is what the relay's claim predicate filters on, so a rename here silently strands outstanding webhooks rather than failing to compile")
 		assert.Equal(t, "dispatched", EventOutboxStatusDispatched,
 			"dispatched is the success terminal state, named to match the dispatched_at column")
 		assert.Equal(t, "failed", EventOutboxStatusFailed,
@@ -603,14 +648,15 @@ func TestEventOutboxStatus_ValuesAndLineageRelationship(t *testing.T) {
 			"dead_lettered is the failure terminal state and the only state eligible for replay, so the dead-letter listing query selects exactly this value")
 
 		distinct := map[string]struct{}{
-			EventOutboxStatusPending:      {},
-			EventOutboxStatusProcessing:   {},
-			EventOutboxStatusDispatched:   {},
-			EventOutboxStatusFailed:       {},
-			EventOutboxStatusDeadLettered: {},
+			EventOutboxStatusPending:        {},
+			EventOutboxStatusProcessing:     {},
+			EventOutboxStatusWebhookPending: {},
+			EventOutboxStatusDispatched:     {},
+			EventOutboxStatusFailed:         {},
+			EventOutboxStatusDeadLettered:   {},
 		}
-		assert.Len(t, distinct, 5,
-			"the five states must be mutually distinct: two sharing a value would make the state machine ambiguous and the claim query non-deterministic")
+		assert.Len(t, distinct, 6,
+			"the six states must be mutually distinct: two sharing a value would make the state machine ambiguous and the claim query non-deterministic")
 	})
 
 	t.Run("three values are shared with the lineage outbox vocabulary", func(t *testing.T) {
@@ -1024,9 +1070,10 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 	typ := reflect.TypeOf(EventOutbox{})
 
 	t.Run("the complete tag set matches the table columns", func(t *testing.T) {
-		// The five documented groups, in declaration order: the event envelope,
+		// The six documented groups, in declaration order: the event envelope,
 		// the relay state machine, the dual-delivery marker, the broker coordinate,
-		// and the dead-letter record. Option suffixes such as ",omitempty" are
+		// the dead-letter record, and the captured trace context. Option suffixes
+		// such as ",omitempty" are
 		// stripped before comparing, because the column name is the tag's name
 		// portion only.
 		expected := []string{
@@ -1072,10 +1119,26 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 			"kafka_topic", "kafka_partition", "kafka_offset",
 			// dead-letter record
 			"dlt_topic", "failure_metadata",
+			// TRACE CONTEXT — the sixth group, and the only one that carries no ledger fact.
+			// It is the W3C trace of the request that CAPTURED the event, written here because
+			// the capture and the publish are decoupled: the request commits and returns, and
+			// the relay claims the row later, so there is no in-memory context to hand over
+			// and a trace not written on the row cannot be recovered from anything afterwards.
+			// It sits OUTSIDE the canonical envelope deliberately — a member that varied per
+			// request would change the stored bytes of every event and break both byte-equality
+			// guarantees — and reaches subscribers as Kafka record headers instead.
+			"traceparent", "tracestate",
+			// OPERATOR RESOLUTION — the seventh group, and the only one written by a human
+			// rather than by the pipeline. A dead-lettered row is terminal without being
+			// purgeable: the event reached no subscriber, so the row is the only record that
+			// it went undelivered, and deleting it on an age timer destroys that evidence.
+			// resolved_at is what makes such a row eligible for retention at all, and the
+			// note is the operator's account of why no further action is owed.
+			"resolved_at", "resolution_note",
 		}
 
 		assert.Equal(t, expected, jsonTagNames(t, typ),
-			"every json tag must match its event outbox column name, in the five documented groups: the repository scans rows into this struct, so a rename here is a runtime scan failure on a live ledger write rather than a compile error")
+			"every json tag must match its event outbox column name, in the six documented groups: the repository scans rows into this struct, so a rename here is a runtime scan failure on a live ledger write rather than a compile error")
 		assert.Equal(t, len(expected), typ.NumField(),
 			"the row must declare exactly these %d fields — an extra field with no column, or a column with no field, breaks the insert and claim statements at runtime", len(expected))
 	})
@@ -1207,6 +1270,19 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 			// reader would follow it.
 			"kafka_topic": true, "kafka_partition": true, "kafka_offset": true,
 			"dlt_topic": true, "failure_metadata": true,
+			// Both trace values are omitted while absent, and absence is the COMMON case
+			// rather than an edge one: every event captured without an active trace — a CLI
+			// mutation, a worker-initiated rejection, a deployment with observability off —
+			// has neither. Rendering "traceparent": "" would state that a trace was recorded
+			// and was empty, which is not a state that exists, and a reader would try to
+			// resolve it.
+			"traceparent": true, "tracestate": true,
+			// Both resolution fields are omitted while absent, and the absence of resolved_at
+			// is the load-bearing state: NIL MEANS UNRESOLVED, which is what excludes the row
+			// from the retention purge and keeps it feeding the dead-letter age gauge.
+			// Rendering "resolved_at": "0001-01-01T00:00:00Z" would assert a resolution at the
+			// year one, which is the one reading a retention sweep must never act on.
+			"resolved_at": true, "resolution_note": true,
 		}
 		require.Len(t, omitempty, typ.NumField(), "every field must have a documented omitempty expectation")
 
@@ -1731,4 +1807,186 @@ func TestInternalDestinationReason_JudgesNamesOnShapeAndLiteralsOnAddress(t *tes
 		assert.Empty(t, InternalDestinationReason("hooks.example.com"))
 		assert.Empty(t, InternalDestinationReason("93.184.216.34"))
 	})
+}
+
+// TestEventCategory_UnknownEventFallsBackToTheSystemCategory pins the catch-all arm,
+// and pins WHERE it points.
+//
+// Two properties are asserted:
+//
+//  1. Coverage. An event type nobody mapped must still resolve to a real category, so
+//     a producer added later that forgets to extend the table gets its events
+//     published and observable rather than rejected or dropped. The row is already
+//     committed by the time routing happens, so rejecting would strand a durable
+//     event.
+//  2. A named destination. The fallback must land on the system category specifically,
+//     not on a domain topic whose subscribers filter it expecting ledger data, and not
+//     on an invented fifth topic the agreed inventory does not contain.
+//
+// The uncatalogued arm is also asserted to be OBSERVABLE — IsCataloguedEventType reports
+// false — because that is what makes a routing omission a visible defect the publisher
+// warns about rather than a silent one. The remedy for an event type arriving here is to
+// extend the catalogue, and the audience of the system topic in the meantime is whichever
+// subscribers the operator granted it to.
+func TestEventCategory_UnknownEventFallsBackToTheSystemCategory(t *testing.T) {
+	assert.Equal(t, EventCategorySystem, EventCategory("totally.unknown.event"),
+		"an unrecognised event type must fall back to the system category — dropping it or returning an empty token would breach the zero-exceptions coverage guarantee for event types added later")
+
+	assert.Equal(t, EventCategorySystem, EventCategory(""),
+		"the empty event type must also resolve to a real category: the resolver is total, so no input can ever produce an empty category token that would then compose a malformed topic name")
+
+	assert.False(t, IsCataloguedEventType("totally.unknown.event"),
+		"an unrecognised event type must be reported as uncatalogued, which is what makes the fallback observable rather than silent")
+	assert.False(t, IsCataloguedEventType(""),
+		"a blank event type is uncatalogued too")
+	assert.True(t, IsCataloguedEventType("transaction.applied"),
+		"a named member of the catalogue must be reported as catalogued")
+	assert.True(t, IsCataloguedEventType("bulk_transaction.applied"),
+		"a runtime-composed bulk transaction name must be reported as catalogued, because it is matched by prefix rather than enumerated")
+}
+
+// TestSubscriberGrantableEventCategories_IsEveryCategoryInTheCatalogue pins the grant surface at
+// ALL FOUR categories, and the "all" is the assertion rather than an incidental count.
+//
+// # Why every category is grantable
+//
+// AAP §0.5.2 and AMBIGUITY-2 fix the catalogue at four category topics and route BOTH
+// ledger.created and system.error to blnk.system. An ungrantable system category therefore does
+// not merely withhold Blnk's internal error detail — it makes ledger.created unreachable to every
+// subscriber, which is a regression against the transport being replaced: the legacy webhook
+// delivered ledger.created and system.error to the single configured URL alongside everything
+// else. Withholding a category the frozen contract routes ordinary ledger data through is a
+// larger fault than the disclosure it avoids, and the disclosure has its own remedy: a subscriber
+// is granted a SUBSET, and what granting blnk.system exposes is documented in
+// docs/event-streaming.md so the decision is made deliberately per subscriber.
+//
+// Nothing here says every subscriber SHOULD be granted the system topic. authorized_topics is an
+// explicit per-subscriber list; this test pins only which names may appear in it.
+func TestSubscriberGrantableEventCategories_IsEveryCategoryInTheCatalogue(t *testing.T) {
+	grantable := SubscriberGrantableEventCategories()
+
+	assert.Equal(t, AllEventCategories(), grantable,
+		"the grantable set IS the catalogue, in catalogue order: a category the contract routes "+
+			"events to but no subscriber may be granted is a topic nothing can consume")
+	assert.Contains(t, grantable, EventCategorySystem,
+		"blnk.system CARRIES ledger.created under the frozen four-category contract, so excluding "+
+			"it would withhold ordinary ledger data every webhook subscriber receives today")
+	assert.Len(t, grantable, 4,
+		"four categories, four grantable names; a fifth here means the catalogue grew a category "+
+			"AAP §0.5.2 does not have")
+
+	// The accessors must hand back copies, or one caller's sort reorders every other caller's view.
+	grantable[0] = "mutated"
+	assert.NotContains(t, SubscriberGrantableEventCategories(), "mutated",
+		"SubscriberGrantableEventCategories must return a fresh slice")
+}
+
+// TestSubscriberGrantableEventCategories_CoversEveryCategoryTopic pins the allowlist the
+// subscriber authorization path and the ACL provisioning both consult.
+//
+// It asserts the members by NAME rather than by count alone, because a count-only
+// assertion passes just as happily when a category is swapped for another as when the
+// list is correct.
+//
+// # Every category topic is grantable, and which ones a subscriber holds is per subscriber
+//
+// The topic design is four category topics, and this list is all four of them. It is an
+// allowlist of what MAY be granted, not a description of what any particular subscriber
+// has: a subscriber's authorized_topics names the subset it is entitled to, and its ACL
+// covers nothing else. Dead-letter topics are outside the list entirely, which
+// SubscriberGrantableTopics enforces structurally by composing only `<prefix>.<category>`
+// names.
+//
+// The system topic is on the list for a reason worth recording, because it replaced an
+// arrangement in which it was not. Both of its catalogued event types — ledger.created and
+// system.error — are delivered by the legacy HTTP transport today, so withholding them
+// here made two of the thirteen migrated event types PUBLISHED AND UNREACHABLE: captured,
+// relayed and observable, with no subscriber credential Blnk can issue able to read them.
+// That is a consuming-side regression in the one direction the migration promises not to
+// regress. Granting the topic is a deliberate operator decision per subscriber, and the
+// documentation states at the point of the grant that system.error carries verbatim
+// internal error text.
+func TestSubscriberGrantableEventCategories_CoversEveryCategoryTopic(t *testing.T) {
+	grantable := SubscriberGrantableEventCategories()
+
+	assert.Contains(t, grantable, EventCategoryTransactions, "transactions is subscriber-facing ledger data")
+	assert.Contains(t, grantable, EventCategoryBalances, "balances is subscriber-facing ledger data")
+	assert.Contains(t, grantable, EventCategoryIdentities, "identities is subscriber-facing data")
+	assert.Contains(t, grantable, EventCategorySystem,
+		"the system category carries ledger.created and system.error, both delivered by the legacy "+
+			"transport today, so it must be grantable: a published-but-unreachable event type is a "+
+			"consuming-side regression the migration promises not to cause")
+
+	assert.Len(t, grantable, 4,
+		"the topic design is four category topics and every one of them is grantable; a fifth entry here means a category was added without the provisioning script, the Kubernetes configuration and the subscriber documentation being changed with it")
+
+	assert.Equal(t, AllEventCategories(), grantable,
+		"the grantable list must be the whole category list in canonical order, so no layer has to reconstruct a subset")
+
+	// No dead-letter token can appear, whatever the category list becomes.
+	for _, category := range grantable {
+		assert.NotContains(t, category, ".dlt",
+			"category %q must be a bare token: a dead-letter name reaching the grantable list would hand a subscriber every other subscriber's failed events", category)
+	}
+
+	// The accessors must hand back copies, or one caller's sort reorders every other
+	// caller's view.
+	grantable[0] = "mutated"
+	assert.NotContains(t, SubscriberGrantableEventCategories(), "mutated",
+		"SubscriberGrantableEventCategories must return a fresh slice")
+
+	all := AllEventCategories()
+	all[0] = "mutated"
+	assert.NotContains(t, AllEventCategories(), "mutated",
+		"AllEventCategories must return a fresh slice")
+}
+
+// TestSubscriberGrantableEventCategories_OffersEveryCategoryByName pins the allowlist the
+// subscriber authorization path and the ACL provisioning both consult.
+//
+// It asserts membership by NAME rather than by count, because a count-only assertion passes just
+// as happily when one category is swapped for another as when the list is correct.
+//
+// # Why the system category is IN the list
+//
+// An exclusion was written here, to keep system.error's verbatim error text away from
+// subscribers, and the concern behind it is real: that payload is the frozen legacy body and the
+// text inside it describes the inside of the deployment.
+//
+// It is nevertheless not the right place to act on it, because `ledger.created` rides the same
+// topic under the agreed four-category catalogue. Excluding the category would therefore have
+// withheld an event the legacy webhook transport delivers TODAY from every subscriber, and the
+// allowlist would have reported nothing wrong — a lost event traded for a disclosure.
+//
+// The decision belongs one level down, in each subscriber's authorized_topics, where an operator
+// grants the system category only to a subscriber that needs ledger events. What such a grant
+// discloses is documented on EventCategorySystem, so the operator making it has the facts. This
+// test therefore pins the WIDEST set that may be granted, not what any particular subscriber is
+// granted.
+func TestSubscriberGrantableEventCategories_OffersEveryCategoryByName(t *testing.T) {
+	grantable := SubscriberGrantableEventCategories()
+
+	assert.Contains(t, grantable, EventCategoryTransactions, "transactions is subscriber-facing ledger data")
+	assert.Contains(t, grantable, EventCategoryBalances, "balances is subscriber-facing ledger data")
+	assert.Contains(t, grantable, EventCategoryIdentities, "identities is subscriber-facing data")
+	assert.Contains(t, grantable, EventCategorySystem,
+		"the system category carries ledger.created, which the legacy transport delivers today, so "+
+			"it must be grantable to the subscriber that needs it")
+
+	assert.Len(t, grantable, 4,
+		"all four categories are grantable; a shorter list means a category became unreachable for "+
+			"every subscriber, which loses whichever catalogued events it carries")
+
+	// No category may be missing from the allowlist. Every category that exists must be
+	// offerable, or an event is captured, published and reachable by nobody.
+	for _, category := range AllEventCategories() {
+		assert.Contains(t, grantable, category,
+			"category %q exists, so it must be grantable; a category that is neither granted nor "+
+				"documented as internal is unreachable for subscribers with nothing to say so", category)
+	}
+
+	// The accessors must hand back copies, or one caller's sort reorders every other caller's view.
+	grantable[0] = "mutated"
+	assert.NotContains(t, SubscriberGrantableEventCategories(), "mutated",
+		"SubscriberGrantableEventCategories must return a fresh slice")
 }

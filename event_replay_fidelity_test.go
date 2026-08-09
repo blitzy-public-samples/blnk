@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -128,7 +129,7 @@ const replayFidelityBalancePayload = `{"data": {"condition": {"field": "debit_ba
 // identities category.
 const replayFidelityIdentityPayload = `{"data": {"dob": "1815-12-10T00:00:00.000000+00:00", "last_name": "Lovelace", "first_name": "Ada", "identity_id": "idt_replay_fidelity_003", "risk_weight": 0.70000000000000006661, "credit_score": 9007199254740993, "email_address": "ada@example.test", "scaled_income": 123456789012345678901234, "unmodelled_extension": {"vendor_flag": true}}, "event": "identity.created"}`
 
-// replayFidelityLedgerPayload is a ledger.created body. It routes to the ledgers
+// replayFidelityLedgerPayload is a ledger.created body. It routes to the system
 // category — one of the two that exist because ledger.created and system.error belong to
 // none of the three categories the requirements name, and coverage is absolute. It is a
 // category of its own rather than sharing the internal one because ledger.created must
@@ -215,17 +216,19 @@ func replayFidelityFixtures() []replayFidelityFixture {
 			deadLetterTopic: "blnk.identities.dlt",
 		},
 		{
-			name:        "ledgers",
+			name:        "ledger_created",
 			eventType:   "ledger.created",
 			aggregateID: "ldg_replay_fidelity_004",
 			// ledger.created is one of the two shapes that genuinely DO carry a
 			// ledger, so both columns hold it — which is how requirement R-6's
-			// "partitioned by ledger ID" is honoured wherever a ledger exists.
+			// "partitioned by ledger ID" is honoured wherever a ledger exists. It
+			// routes to the system category, which is where both event types outside
+			// the three named categories are published.
 			partitionKey:    "ldg_replay_fidelity_004",
 			ledgerID:        "ldg_replay_fidelity_004",
 			payload:         replayFidelityLedgerPayload,
-			topic:           "blnk.ledgers",
-			deadLetterTopic: "blnk.ledgers.dlt",
+			topic:           "blnk.system",
+			deadLetterTopic: "blnk.system.dlt",
 		},
 	}
 }
@@ -269,14 +272,26 @@ func (f replayFidelityFixture) row(t *testing.T, id int64) model.EventOutbox {
 // Test doubles
 // ---------------------------------------------------------------------------
 
-// replayFidelityClock is the settable clock installed on the service under test.
-type replayFidelityClock struct {
+// movableTestClock is a settable, RACE-SAFE clock for a test that installs its own `now`.
+//
+// The mutex is not ceremony. A `func() time.Time { return now }` closure over a plain local
+// variable is perfectly correct while only the test goroutine reads it — and three gate tests in
+// event_admin_test.go do exactly that, legitimately, because they call Ready() themselves. It
+// becomes a data race the moment the code under test reads the clock on a goroutine of its own,
+// which the event relay does: `-race` caught precisely that in
+// TestEventRelayProcessor_DoesNotClaimUntilTheCatalogueGateOpens, where the test advanced the
+// instant while the relay's run loop was reading it through the gate.
+//
+// So: use this whenever anything the test starts reads the clock. It is named for the capability
+// rather than for its first caller, because the replay-fidelity suite is no longer the only one
+// that needs it.
+type movableTestClock struct {
 	mu  sync.Mutex
 	now time.Time
 }
 
 // Now reports the current pinned instant.
-func (c *replayFidelityClock) Now() time.Time {
+func (c *movableTestClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -284,7 +299,7 @@ func (c *replayFidelityClock) Now() time.Time {
 }
 
 // Set moves the clock to at.
-func (c *replayFidelityClock) Set(at time.Time) {
+func (c *movableTestClock) Set(at time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -486,18 +501,138 @@ func (s *replayFidelityStore) GetEventByID(_ context.Context, eventID string) (*
 	return &found, nil
 }
 
+// inventoryLocked was a second narrowing on this same store. It is RETIRED in favour of
+// matchingLocked below, which every listing and count on this double already calls.
+//
+// The two took THE SAME PARAMETER: model.DeadLetterFilter is a type alias for
+// model.DeadLetterQuery (model/event.go), so this was not a narrower or a wider shape, it was
+// another name for one. matchingLocked is also the faithful one of the pair. It trims the three
+// string predicates and it constrains the population to the two terminal failure states when no
+// status is named — both of which deadLetterFilterClause does in SQL, and neither of which this
+// one and its dltFilterMatches matcher did. The claim in the comment it carried, that a
+// zero-valued filter selects the terminal states, was true of matchingLocked and not of itself.
+//
+// ListDeadLetterInventory pages the same matching rows as the NARROW projection the operator
+// listing reads, keyed by cursor. The replay path itself reads full rows through
+// ListDeadLetteredEvents above — this exists so the store satisfies the whole seam, and so a
+// listing taken before a replay is drawn from the same inventory the replay mutates.
+func (s *replayFidelityStore) ListDeadLetterInventory(
+	_ context.Context,
+	query model.DeadLetterInventoryQuery,
+) (model.DeadLetterInventoryPage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	matches := s.matchingLocked(model.DeadLetterQuery{
+		EventType:    query.EventType,
+		Topic:        query.Topic,
+		Status:       query.Status,
+		OccurredFrom: query.OccurredFrom,
+		OccurredTo:   query.OccurredTo,
+	})
+
+	limit := query.Limit
+	if limit <= 0 {
+		limit = len(matches)
+	}
+
+	page := model.DeadLetterInventoryPage{Entries: make([]model.DeadLetterInventoryEntry, 0, limit)}
+	passedCursor := query.Cursor == nil
+
+	for i := range matches {
+		if !passedCursor {
+			if matches[i].OccurredAt.Equal(query.Cursor.OccurredAt) && matches[i].ID == query.Cursor.ID {
+				passedCursor = true
+			}
+
+			continue
+		}
+
+		if len(page.Entries) == limit {
+			page.HasMore = true
+
+			break
+		}
+
+		row := matches[i]
+		page.Entries = append(page.Entries, model.DeadLetterInventoryEntry{
+			ID:               row.ID,
+			EventID:          row.EventID,
+			EventType:        row.EventType,
+			AggregateID:      row.AggregateID,
+			PartitionKey:     row.PartitionKey,
+			LedgerID:         row.LedgerID,
+			Topic:            row.Topic,
+			SchemaVersion:    row.SchemaVersion,
+			OccurredAt:       row.OccurredAt,
+			Status:           row.Status,
+			Attempts:         row.Attempts,
+			LastError:        row.LastError,
+			FirstAttemptedAt: row.FirstAttemptedAt,
+			LastAttemptedAt:  row.LastAttemptedAt,
+			DLTTopic:         row.DLTTopic,
+			FailureMetadata:  row.FailureMetadata,
+			PayloadBytes:     len(row.Payload),
+		})
+	}
+
+	if page.HasMore && len(page.Entries) > 0 {
+		last := page.Entries[len(page.Entries)-1]
+		page.NextCursor = &model.DeadLetterCursor{OccurredAt: last.OccurredAt, ID: last.ID}
+	}
+
+	return page, nil
+}
+
 // ListDeadLetteredEvents pages the two terminal failure states, newest first.
 func (s *replayFidelityStore) ListDeadLetteredEvents(
 	_ context.Context,
-	limit, offset int,
+	query model.DeadLetterQuery,
 ) ([]model.EventOutbox, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	inventory := s.matchingLocked(query)
+
+	offset := query.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(inventory) {
+		return []model.EventOutbox{}, nil
+	}
+	inventory = inventory[offset:]
+	if query.Limit > 0 && query.Limit < len(inventory) {
+		inventory = inventory[:query.Limit]
+	}
+
+	return inventory, nil
+}
+
+// CountDeadLetteredEvents counts what the same narrowing matches, ignoring the page. It
+// shares matchingLocked with the listing so the two cannot describe different sets.
+func (s *replayFidelityStore) CountDeadLetteredEvents(
+	_ context.Context,
+	query model.DeadLetterQuery,
+) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return int64(len(s.matchingLocked(query))), nil
+}
+
+// matchingLocked returns the inventory rows the query admits, newest first. The caller
+// must hold the mutex.
+//
+// Reverse insertion order approximates the repository's "occurred_at DESC, id DESC": every
+// fixture row shares one occurrence instant, so id descending is the operative clause, and
+// rows are inserted in ascending id order.
+func (s *replayFidelityStore) matchingLocked(query model.DeadLetterQuery) []model.EventOutbox {
+	eventType := strings.TrimSpace(query.EventType)
+	topic := strings.TrimSpace(query.Topic)
+	status := strings.TrimSpace(query.Status)
+
 	var inventory []model.EventOutbox
-	// Reverse insertion order approximates the repository's "occurred_at DESC, id
-	// DESC": every fixture row shares one occurrence instant, so id descending is the
-	// operative clause, and rows are inserted in ascending id order.
 	for i := len(s.order) - 1; i >= 0; i-- {
 		row := s.rows[s.order[i]]
 		if row == nil {
@@ -507,23 +642,140 @@ func (s *replayFidelityStore) ListDeadLetteredEvents(
 			row.Status != model.EventOutboxStatusFailed {
 			continue
 		}
+		if eventType != "" && row.EventType != eventType {
+			continue
+		}
+		if topic != "" && row.Topic != topic {
+			continue
+		}
+		if status != "" && row.Status != status {
+			continue
+		}
+		if !query.OccurredFrom.IsZero() && row.OccurredAt.Before(query.OccurredFrom) {
+			continue
+		}
+		if !query.OccurredTo.IsZero() && row.OccurredAt.After(query.OccurredTo) {
+			continue
+		}
 		inventory = append(inventory, *row)
 	}
 
-	if offset >= len(inventory) {
-		return []model.EventOutbox{}, nil
-	}
-	inventory = inventory[offset:]
-	if limit > 0 && limit < len(inventory) {
-		inventory = inventory[:limit]
+	return inventory
+}
+
+// deadLetterInventoryLocked builds the terminal-failure inventory a query matches, newest
+// first. The caller holds the lock.
+//
+// The predicate mirrors the repository's SQL exactly — case-sensitive equality on the
+// stored columns, with no derivation of a missing topic — because the service now delegates
+// all narrowing to the database, and a looser fake would let it pass here while the real
+// query returned a different set.
+func (s *replayFidelityStore) deadLetterInventoryLocked(
+	query model.DeadLetterQuery,
+) []model.EventOutbox {
+	var inventory []model.EventOutbox
+	// Reverse insertion order approximates the repository's "occurred_at DESC, id DESC",
+	// as above.
+	for i := len(s.order) - 1; i >= 0; i-- {
+		row := s.rows[s.order[i]]
+		if row == nil {
+			continue
+		}
+		if row.Status != model.EventOutboxStatusDeadLettered &&
+			row.Status != model.EventOutboxStatusFailed {
+			continue
+		}
+		if query.Status != "" && row.Status != query.Status {
+			continue
+		}
+		if query.EventType != "" && row.EventType != query.EventType {
+			continue
+		}
+		if query.Topic != "" && row.Topic != query.Topic {
+			continue
+		}
+		if !query.OccurredFrom.IsZero() && row.OccurredAt.Before(query.OccurredFrom) {
+			continue
+		}
+		if !query.OccurredTo.IsZero() && row.OccurredAt.After(query.OccurredTo) {
+			continue
+		}
+
+		inventory = append(inventory, *row)
 	}
 
-	return inventory, nil
+	return inventory
 }
+
+// OldestDeadLetterAgeByTopic groups the inventory by dead-letter topic, as the repository's
+// aggregate does (PERF-P07).
+func (s *replayFidelityStore) OldestDeadLetterAgeByTopic(
+	_ context.Context,
+	deadLetterSuffix string,
+) ([]model.DeadLetterTopicAge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	grouped := make(map[string]model.DeadLetterTopicAge)
+	for _, row := range s.rows {
+		if row == nil {
+			continue
+		}
+		if row.Status != model.EventOutboxStatusDeadLettered &&
+			row.Status != model.EventOutboxStatusFailed {
+			continue
+		}
+
+		topic := row.DLTTopic
+		if topic == "" {
+			topic = row.Topic + deadLetterSuffix
+		}
+
+		aged := row.OccurredAt
+		if row.LastAttemptedAt != nil {
+			aged = *row.LastAttemptedAt
+		}
+
+		entry, seen := grouped[topic]
+		entry.Topic = topic
+		entry.Outstanding++
+		if !seen || aged.Before(entry.Oldest) {
+			entry.Oldest = aged
+		}
+		grouped[topic] = entry
+	}
+
+	ages := make([]model.DeadLetterTopicAge, 0, len(grouped))
+	for _, entry := range grouped {
+		ages = append(ages, entry)
+	}
+
+	return ages, nil
+}
+
+// CountDeadLetterInventory counts matches, ignoring the page.
+func (s *replayFidelityStore) CountDeadLetterInventory(
+	_ context.Context,
+	query model.DeadLetterQuery,
+) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return int64(len(s.deadLetterInventoryLocked(query))), nil
+}
+
+// The map-shaped CountDeadLetteredEvents this double also carried is GONE.
+//
+// It answered "how many rows per terminal status inside this occurrence window" from a
+// positional pair of bounds. The repository interface expresses exactly that through
+// model.DeadLetterQuery — whose OccurredFrom/OccurredTo are bound as SQL index conditions
+// and whose Status narrows to one state — so the double declared two methods of the same
+// name for one capability and the package stopped compiling. The DeadLetterQuery form
+// above is the one the interface declares and the one every caller uses.
 
 // CountEventOutboxByStatus returns a status-keyed count of every row. A status with no
 // rows is absent from the map, matching the repository's GROUP BY semantics.
-func (s *replayFidelityStore) CountEventOutboxByStatus(_ context.Context) (map[string]int64, error) {
+func (s *replayFidelityStore) CountEventOutboxByStatus(_ context.Context, _ time.Time) (map[string]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -855,7 +1107,7 @@ type replayFidelityHarness struct {
 	// publisher records replays and the failing original attempts.
 	publisher *replayFidelityPublisher
 	// clock is the service's settable clock.
-	clock *replayFidelityClock
+	clock *movableTestClock
 	// service is the system under test.
 	service *EventDeadLetterService
 
@@ -885,7 +1137,7 @@ func newReplayFidelityHarness(t *testing.T) *replayFidelityHarness {
 	harness := &replayFidelityHarness{
 		store:     newReplayFidelityStore(),
 		publisher: newReplayFidelityPublisher(),
-		clock:     &replayFidelityClock{now: replayFidelityDeadLetterAt},
+		clock:     &movableTestClock{now: replayFidelityDeadLetterAt},
 		writers:   make(map[string]*replayFidelityWriter),
 	}
 
@@ -1691,13 +1943,13 @@ func TestReplayFidelity_ReplayedRowLeavesTheDeadLetterInventory(t *testing.T) {
 
 	inventory, err := harness.service.ListDeadLetterEvents(ctx, DeadLetterListOptions{})
 	require.NoError(t, err)
-	for _, entry := range inventory {
+	for _, entry := range inventory.Entries {
 		assert.NotEqual(t, scenario.row.EventID, entry.EventID,
 			"a replayed event must no longer be listed as dead-lettered")
 	}
-	assert.Empty(t, inventory, "the only entry in this store has been replayed")
+	assert.Empty(t, inventory.Entries, "the only entry in this store has been replayed")
 
-	counts, err := harness.store.CountEventOutboxByStatus(ctx)
+	counts, err := harness.store.CountEventOutboxByStatus(ctx, time.Time{})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), counts[model.EventOutboxStatusDispatched])
 	assert.Zero(t, counts[model.EventOutboxStatusDeadLettered])
@@ -2018,4 +2270,68 @@ func TestReplayFidelity_LeaksNoConfigurationBetweenTests(t *testing.T) {
 		"the configuration store must be restored exactly as the subtest found it")
 	assert.NotEqual(t, sentinelPrefix, TopicPrefix(),
 		"no test may leave its own topic prefix in the process-global configuration store")
+}
+
+// replayFidelityClock was this file's settable clock. It is RETIRED: movableTestClock above
+// is the same type under the name the capability earned once a second suite needed it, and
+// its doc comment carries the race-safety argument this one had lost. The harness field is a
+// *movableTestClock, so this was the copy nothing installed.
+//
+// ListDeadLetteredEventsFiltered pages the two terminal failure states, newest first,
+// applying the filter to the whole population BEFORE the page is taken — which is what
+// SQL does, and therefore the only faithful order for a double to apply it in.
+func (s *replayFidelityStore) ListDeadLetteredEventsFiltered(
+	_ context.Context,
+	filter model.DeadLetterInventoryFilter,
+	limit, offset int,
+) ([]model.EventOutbox, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	inventory := s.matchingLocked(filter)
+
+	if offset >= len(inventory) {
+		return []model.EventOutbox{}, nil
+	}
+	inventory = inventory[offset:]
+	if limit > 0 && limit < len(inventory) {
+		inventory = inventory[:limit]
+	}
+
+	return inventory, nil
+}
+
+// MarkEventDeadLetterResolved records an operator resolution on a dead-lettered row.
+//
+// Replay fidelity is what this file is about, and a resolution deliberately does NOT
+// affect it: the row keeps its status and its stored bytes, so a resolved event is still
+// replayable and still replays byte for byte. This method exists so that property is
+// reachable from here rather than only asserted in prose.
+func (s *replayFidelityStore) MarkEventDeadLetterResolved(
+	_ context.Context,
+	eventID string,
+	note string,
+	at time.Time,
+) (*model.EventOutbox, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	row := s.rows[eventID]
+	if row == nil {
+		return nil, apierror.NewAPIError(apierror.ErrNotFound, "Event not found", errors.New("no rows in result set"))
+	}
+	if row.IsResolvedDeadLetter() {
+		return nil, apierror.NewAPIError(apierror.ErrEventAlreadyResolved, "Already resolved", nil)
+	}
+	if row.Status != model.EventOutboxStatusDeadLettered {
+		return nil, apierror.NewAPIError(apierror.ErrEventNotDeadLettered, "Not dead-lettered", nil)
+	}
+
+	resolvedAt := at.UTC()
+	row.ResolvedAt = &resolvedAt
+	row.ResolutionNote = note
+
+	found := *row
+
+	return &found, nil
 }

@@ -29,13 +29,48 @@ import (
 
 	"github.com/kelseyhightower/envconfig"
 	"github.com/sirupsen/logrus"
+
+	"github.com/blnkfinance/blnk/internal/logsafe"
 )
 
 // Default constants
 const (
-	DEFAULT_PORT               = "5001"
-	DEFAULT_CLEANUP_SEC        = 10800 // 3 hours in seconds
-	DEFAULT_TYPESENSE_KEY      = "blnk-api-key"
+	DEFAULT_PORT        = "5001"
+	DEFAULT_CLEANUP_SEC = 10800 // 3 hours in seconds
+	// DEFAULT_TYPESENSE_KEY is the api-key a LOCAL TypeSense is started with, and it is
+	// applied only when secure mode is off. It is emphatically NOT a secret — it is published
+	// in this repository's compose files and README — which is why resolveSearchCredential
+	// refuses to substitute it in a production posture. See SEC-07 there.
+	DEFAULT_TYPESENSE_KEY = "blnk-api-key"
+	// DEFAULT_RATE_LIMIT_RPS and DEFAULT_RATE_LIMIT_BURST are the PER-CLIENT request rate a
+	// deployment that configures none is held to. SEC-14.
+	//
+	// # Why the previous numbers were not a limit
+	//
+	// They were 5,000,000 requests per second with a burst of 10,000,000. tollbooth keys its
+	// limiter per client address, and no single client can issue five million requests a second
+	// against one Blnk instance, so the limiter never engaged: rate limiting was configured,
+	// reported as configured, and had no effect. That is CWE-770 — a control that exists on
+	// paper only, which is worse than none, because it reads as present in every review.
+	//
+	// # Where these numbers come from
+	//
+	// 2,000 per second is FOUR TIMES the throughput the project's own acceptance criterion
+	// states (AAP V-1: 500 events per second sustained), so it cannot throttle a deployment
+	// operating at the volume Blnk is specified for, nor the k6 harness that measures it. The
+	// burst is twice the rate, which is the same relationship this function already applies
+	// when only one of the pair is supplied — so a reader finds one rule rather than two.
+	//
+	// # Why not tighter
+	//
+	// The limit is per CLIENT ADDRESS, and a ledger's callers are usually backend services
+	// behind a proxy or NAT. Unless BLNK_SERVER_TRUSTED_PROXIES is set, every request keys to
+	// the proxy's address, so a per-client limit behaves as a GLOBAL one — and a tight default
+	// would then throttle an entire deployment rather than one abusive caller. Finite and
+	// generous is the correct default; the operator tightens it once the client identity is
+	// resolvable.
+	DEFAULT_RATE_LIMIT_RPS     = 2000.0
+	DEFAULT_RATE_LIMIT_BURST   = 4000
 	DEFAULT_MONITORING_PORT    = "5004"
 	DEFAULT_MAX_UPLOAD_SIZE_MB = 256 // caps reconciliation file uploads
 	// DEFAULT_MAX_REQUEST_BODY_SIZE_MB caps non-upload request bodies so a large
@@ -54,6 +89,50 @@ const (
 	// is five hundred lines a second at the throughput this feature is built for.
 	// Those lines exist to be turned on for an investigation, not to be shipped.
 	DEFAULT_LOG_LEVEL = "info"
+
+	// MINIMUM_LOG_LEVEL is the LEAST verbose level Blnk will actually run at,
+	// whatever a deployment configures. A quieter request is honoured as far as this
+	// and no further.
+	//
+	// # Why a floor exists at all
+	//
+	// One class of record in this codebase is mandatory rather than discretionary.
+	// The event relay must log the attempt count and the error reason on EVERY failed
+	// publish attempt — not only on the last one — because that per-attempt trail is
+	// the only evidence of why an event was delayed or eventually dead-lettered, and
+	// the retry schedule is otherwise invisible: a row that succeeds on its fourth
+	// attempt looks identical afterwards to one that succeeded on its first.
+	//
+	// Those records are warnings, which is the correct severity for "this failed and
+	// will be retried". logrus emits an entry only when the logger's level is at
+	// least as verbose as the entry's, so a deployment setting error, fatal or panic
+	// discards every one of them. The requirement and the configuration surface were
+	// therefore in direct contradiction: the quiet levels did not reduce noise, they
+	// deleted the audit trail, silently and with no indication in the logs that
+	// anything had been withheld.
+	//
+	// # Why the floor rather than a separate sink
+	//
+	// The alternative is a dedicated logger whose level cannot be configured. It was
+	// rejected: logrus fires hooks only AFTER the level check, so a second logger does
+	// not escape level gating, it merely moves it — and it would take the mandatory
+	// records out of the standard logger that every hook, formatter and log-capturing
+	// test in this repository is attached to. The result would be a compliance record
+	// that no existing tooling could see, which is a worse failure than the one being
+	// fixed.
+	//
+	// # What is actually given up
+	//
+	// Exactly three settings — error, fatal and panic — and only their effect on
+	// warnings. Every level from warn upwards behaves precisely as before, and warn
+	// itself still suppresses the per-event info and debug diagnostics that make up
+	// almost all of the pipeline's volume. A deployment wanting less than warn is
+	// asking not to be told that its event delivery is failing.
+	//
+	// Spelled "warning" rather than "warn" because that is what logrus.Level.String()
+	// returns, and this constant is compared against the normalised LogLevel field.
+	// logrus.ParseLevel accepts both spellings, so an operator may write either.
+	MINIMUM_LOG_LEVEL = "warning"
 )
 
 // WebhookDualDeliveryWindowDays is the exact length of the window in which Kafka
@@ -154,18 +233,60 @@ var (
 		TopicPrefix:       "blnk",
 		MinPartitions:     6,
 		ReplicationFactor: 3,
+		// Far above any plausible subscriber count for a single ledger deployment and far
+		// below the point at which either cost it bounds — tick duration and exported series
+		// — begins to matter. See KafkaConfig.MetricsSubscriberBudget.
+		MetricsSubscriberBudget: 200,
 	}
 
-	// defaultRelay encodes the bounded exponential backoff schedule: five publish
-	// attempts separated by four waits — 1s, 2s, 4s and 8s, 15s in total — capped at
-	// 30s. The cap is out of reach with these parameters, which is intentional: the
-	// delay after a fifth failure would be 16s and no sixth attempt consumes it, so
-	// the cap engages only when the configured base or attempt count is raised.
+	// defaultRelay encodes the bounded exponential backoff schedule requirement R-4
+	// mandates: five publish attempts and the delay sequence 1s, 2s, 4s, 8s, 16s,
+	// capped at 30s.
+	//
+	// The relay produces and durably records EVERY ONE of those five delays — each is
+	// stamped on the row's next_attempt_at by the same statement that decides whether
+	// the budget is spent. Five attempts have four gaps between them, so the delays a
+	// retried event actually WAITS are the first four, 15s in total, and the fifth is
+	// recorded on the attempt that spends the budget rather than separating two
+	// publishes. Raising MaxRetryAttempts is what turns it into a wait as well.
+	//
+	// The 30s cap is out of reach with these parameters, which is intentional: it
+	// engages only when the configured base or attempt count is raised.
 	defaultRelay = RelayConfig{
 		MaxRetryAttempts:   MaxRelayRetryAttempts,
 		RetryBaseBackoffMS: 1000,
 		RetryMaxBackoffMS:  30000,
+
+		EventRetentionBatchSize:          DefaultEventRetentionBatchSize,
+		EventRetentionMaxBatchesPerSweep: DefaultEventRetentionMaxBatchesPerSweep,
+
+		// Deliberately the same number as defaultKafka.MetricsSubscriberBudget, and kept in
+		// step with blnk.DefaultSubscriberMetricsBudget, which is the value the collector
+		// falls back to when it cannot read a configuration at all. These are two published
+		// spellings of ONE ceiling; setRelayDefaults reconciles them onto a single value.
+		SubscriberMetricsBudget: 200,
 	}
+)
+
+// The shipped purge capacity, EXPORTED because the sweeper in the root package needs the same
+// two numbers as its fallback for a configuration it cannot read, and two copies of a default
+// are two numbers that can disagree. Which one a deployment ran at would then depend on
+// start-up ordering, and nothing would report the difference.
+//
+// PERF-P23: 2,000 x 1,000 = 2,000,000 rows an hour, which EXCEEDS the 1,800,000 an hour that
+// 500 events a second produces. Capacity below ingestion does not slow the table's growth, it
+// permits it, and the retention period is then never actually enforced however short it is. So
+// the default has to clear peak rather than approach it. See RelayConfig for the full
+// arithmetic and for why the previous fixed ceiling of 100 batches failed it.
+const (
+	// DefaultEventRetentionBatchSize is how many rows one DELETE statement removes by default.
+	// It is the lock-footprint factor: small keeps each statement's row locks and WAL
+	// contribution light on a table the relay is concurrently claiming from.
+	DefaultEventRetentionBatchSize = 1000
+
+	// DefaultEventRetentionMaxBatchesPerSweep is how many such statements one sweep issues by
+	// default. It is the throughput factor, and it is the safer of the two to raise.
+	DefaultEventRetentionMaxBatchesPerSweep = 2000
 )
 
 // MaxRelayRetryAttempts is the CEILING on RELAY_MAX_RETRY_ATTEMPTS, not merely its
@@ -190,6 +311,21 @@ var (
 // whose per-row max_attempts was raised directly in the database.
 const MaxRelayRetryAttempts = 5
 
+// EventRetentionUnboundedSweep is the value of RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP
+// that removes the per-sweep batch ceiling entirely. PERF-P23.
+//
+// It exists because zero cannot carry that meaning. An unset int field IS zero, so a zero
+// ceiling is indistinguishable from a deployment that never mentioned the setting, and only
+// one of those two readings can be honoured. The bound is taken as the safe reading — it is
+// what stops the first sweep after retention is enabled from attempting the entire historical
+// backlog in one pass on a table the relay is claiming from — so zero defaults and "no
+// ceiling" needs a value of its own.
+//
+// A sweep with no ceiling is still bounded by the sweep timeout, so this means "delete as much
+// as you can in one sweep" rather than "run for as long as it takes". It is the setting for a
+// deliberate one-off catch-up, not a steady state.
+const EventRetentionUnboundedSweep = -1
+
 var ConfigStore atomic.Value
 
 type ServerConfig struct {
@@ -212,6 +348,54 @@ type ServerConfig struct {
 	// UploadURLTimeoutSec caps the HTTP GET issued for a URL-based upload
 	// (BLNK_UPLOAD_URL_TIMEOUT_SEC). Defaults to DEFAULT_UPLOAD_URL_TIMEOUT_SEC.
 	UploadURLTimeoutSec int `json:"upload_url_timeout_sec" envconfig:"BLNK_UPLOAD_URL_TIMEOUT_SEC"`
+
+	// TrustForwardedProto declares that every request reaching this process has
+	// passed through a proxy — an ingress controller, a load balancer, a service
+	// mesh sidecar — that TERMINATED TLS and that sets X-Forwarded-Proto,
+	// overwriting any value a client supplied
+	// (BLNK_SERVER_TRUST_FORWARDED_PROTO).
+	//
+	// It exists because one endpoint returns a secret: POST
+	// /subscribers/{id}/kafka-credentials answers with a one-time SASL password,
+	// and the request carrying it is the only chance to disclose that password to
+	// anything watching the wire. When Blnk terminates TLS itself (SSL above) the
+	// process can see that for itself. When TLS terminates in front of it — the
+	// normal Kubernetes shape, where the hop from ingress to pod is plaintext — it
+	// cannot, and X-Forwarded-Proto is a header any client can set, so believing it
+	// unconditionally would let a caller assert its own confidentiality. This flag
+	// is the deployment stating, once and explicitly, that the header is now under
+	// the proxy's control and may be believed.
+	//
+	// Default false, which is deny-by-default: with no in-process TLS and no
+	// declaration, credential issuance refuses with
+	// SUBSCRIBER_INSECURE_TRANSPORT rather than putting a password on a channel
+	// nobody has established as confidential. A loopback caller is still served,
+	// because those bytes never leave the host.
+	//
+	// SETTING THIS WITHOUT SUCH A PROXY IS UNSAFE: it re-enables exactly the
+	// disclosure the default prevents, and it does so silently. Nothing else in
+	// Blnk's behaviour depends on it.
+	TrustForwardedProto bool `json:"trust_forwarded_proto" envconfig:"BLNK_SERVER_TRUST_FORWARDED_PROTO"`
+	// TrustedProxies is a comma-separated list of CIDR blocks or bare IP literals whose
+	// X-Forwarded-For and X-Real-IP headers may be BELIEVED
+	// (BLNK_SERVER_TRUSTED_PROXIES).
+	//
+	// Empty/unset means trust NOTHING, which is the safe default and the one this
+	// repository's manifests deploy: the client address resolves to the peer that
+	// actually opened the connection, which a caller cannot forge. It is deliberately
+	// the same deny-by-default posture as UploadDomainWhitelist above.
+	//
+	// # Why the default has to be "trust nothing" rather than "trust everything"
+	//
+	// Gin's own default is to trust every proxy, which means it believes the leftmost
+	// X-Forwarded-For value on any request. Any client can then choose the address that
+	// appears in the access log and in anything built on it, so a log becomes evidence of
+	// what the caller claimed rather than of what happened. Setting this to a real proxy
+	// range is what makes a forwarded address trustworthy again.
+	//
+	// Set it ONLY to the addresses of proxies you operate. Listing 0.0.0.0/0 restores the
+	// forgeable behaviour and defeats the point.
+	TrustedProxies string `json:"trusted_proxies" envconfig:"BLNK_SERVER_TRUSTED_PROXIES"`
 }
 
 type DataSourceConfig struct {
@@ -355,12 +539,23 @@ type QueueConfig struct {
 // BOTH FORMS RESOLVE ANYWAY. The house convention across this file is that a
 // setting also answers to its BLNK_-prefixed name, and a deployment that writes
 // BLNK_KAFKA_BROKERS out of habit must not silently select default behaviour. So
-// after envconfig has run, applyPrefixedEnvAliases overlays the ordinary
-// BLNK_-prefixed alias of every variable in this struct and in RelayConfig, and the
-// prefixed form wins when both are set — the same precedence the top-level
-// WebhookDeprecationSunsetDate already has, where envconfig itself provides it.
-// The alias table lives beside that function; adding a field here means adding it
-// there, and a test asserts every field of both structs is covered.
+// after envconfig has run, the ordinary BLNK_-prefixed alias of EVERY variable in
+// this struct and in RelayConfig is overlaid, and the prefixed form wins when both
+// are set — the same precedence the top-level WebhookDeprecationSunsetDate already
+// has, where envconfig itself provides it.
+//
+// TWO MECHANISMS DO THAT OVERLAY, split by type rather than by policy, and adding a
+// field here means adding it to whichever one fits:
+//
+//   - eventStreamingEnvOverride, a flat struct envconfig processes a second time.
+//     Everything it carries is resolved by the library, so a LIST splits on commas and
+//     a number is parsed and reported by the library naming the variable. Lists belong
+//     here; so do the contract variables.
+//   - applyPrefixedEnvAliases, three explicit string/int/bool tables. Everything else.
+//
+// A field in NEITHER answers only to its bare name and to envconfig's own
+// BLNK_KAFKA_<TAG> artefact, which is the gap this comment used to describe as covered
+// when it was not.
 //
 // Brokers and the four SASL fields have no defaults by design — see defaultKafka.
 //
@@ -402,6 +597,53 @@ type KafkaConfig struct {
 	Brokers     []string `json:"brokers"      envconfig:"KAFKA_BROKERS"`
 	TopicPrefix string   `json:"topic_prefix" envconfig:"KAFKA_TOPIC_PREFIX"`
 
+	// HistoricalTopicPrefixes lists topic namespaces this deployment USED TO OWN and
+	// must still be able to publish to. It is empty in every deployment that has never
+	// renamed its namespace, which is almost all of them.
+	//
+	// # Why renaming the prefix needs this, and what happened without it
+	//
+	// An outbox row records its fully-resolved destination topic at INSERT time, so that
+	// a committed event stays bound to the topic it was always meant for. Change
+	// KAFKA_TOPIC_PREFIX from "blnk" to "acme" and the rows already in the table still
+	// name blnk.transactions, while the publisher, the topic-assurance pass and the
+	// ownership test all now speak of acme.transactions.
+	//
+	// A running process survived that, because it had pre-created a writer for every
+	// blnk.* topic at start-up and served those rows from that inventory. A RESTART did
+	// not: the new process pre-created acme.* only, and every stored blnk.* row then
+	// failed the ownership test at writer resolution. Those rows are not lost — they stay
+	// claimable and each failure names the topic — but nothing drains them, and the same
+	// refusal strands the dead-letter write of a failing row and the replay of an already
+	// dead-lettered one. A prefix rename plus a rolling restart is an ordinary
+	// maintenance operation, and it silently stopped delivery of every event captured
+	// before it.
+	//
+	// # What listing a prefix here does
+	//
+	// Every name in this list is treated as owned, exactly as TopicPrefix is: writers are
+	// pre-created for its whole topic inventory, the ownership test admits it, topic
+	// assurance keeps its topics present, and the metrics layer reports its topic names
+	// verbatim instead of collapsing them to the "unowned" label. It does NOT change
+	// where NEW events go — TopicPrefix alone decides that — so the list is drained
+	// rather than accumulated: once no non-terminal and no replayable row names a prefix,
+	// remove it.
+	//
+	// It is an explicit allowlist rather than a blanket "any prefix with a known
+	// category" rule on purpose. That looser rule would also admit
+	// "attacker.transactions", which has precisely the same shape as a real topic name,
+	// and writer resolution is the one place a stored string turns into an outbound
+	// connection carrying Blnk's own producer credentials. An operator naming the
+	// namespaces this deployment actually owned is the only source that can tell the two
+	// apart.
+	//
+	// Blank entries are dropped and duplicates — including a repeat of TopicPrefix — are
+	// collapsed, so a trailing comma or a value left in place after the rename completed
+	// is harmless. The count is bounded by MaxHistoricalTopicPrefixes, because each
+	// prefix multiplies the pre-created writer inventory and an unbounded list would be a
+	// memory cost paid on every process start for topics nothing writes to.
+	HistoricalTopicPrefixes []string `json:"historical_topic_prefixes" envconfig:"KAFKA_HISTORICAL_TOPIC_PREFIXES"`
+
 	// SubscriberBrokers is the SUBSCRIBER-FACING bootstrap list, and it is a DIFFERENT
 	// LIST FROM Brokers rather than a convenience alias for it.
 	//
@@ -414,16 +656,17 @@ type KafkaConfig struct {
 	// given the addresses of the externally advertised listener, which only an operator
 	// can know.
 	//
-	// So POST /subscribers/{id}/kafka-credentials reports this list, and when it is empty
-	// issuance is REFUSED with ErrSubscriberBrokersNotConfigured rather than falling back
-	// to Brokers. The fallback is what makes this worth a variable: it returns 200 with an
-	// endpoint the subscriber cannot dial, so the failure surfaces as an unexplained
-	// connection timeout in the subscriber's own logs, days later and nowhere near the
-	// request that caused it — and it publishes Blnk's internal topology to an external
-	// party for good measure.
+	// So POST /subscribers/{id}/kafka-credentials reports this list when it is set. It is an
+	// OPTIONAL OVERRIDE rather than a prerequisite: with it empty, issuance reports Brokers
+	// and logs that it did. Requirement R-10 fixes the mandatory configuration surface at
+	// eight variables, and this is not one of them — making it mandatory meant a deployment
+	// satisfying the entire documented contract could run the relay and still receive 503
+	// from every issuance request, which is a required endpoint disabled by an undocumented
+	// setting.
 	//
-	// A deployment whose subscribers really are in-cluster sets this to the same value as
-	// Brokers, which is one line of configuration and makes the claim explicit.
+	// The warning is what the refusal used to be. An in-cluster subscriber needs no override
+	// at all; an external one needs this variable, and both the start-up log and every
+	// issuance say so while the endpoint keeps working. See SubscriberFacingBrokers.
 	SubscriberBrokers []string `json:"subscriber_brokers" envconfig:"KAFKA_SUBSCRIBER_BROKERS"`
 
 	// SUPPLEMENTARY (least privilege). SASLUser and SASLSecret are the STEADY-STATE
@@ -500,6 +743,28 @@ type KafkaConfig struct {
 	// is no mapping to preserve.
 	// SUPPLEMENTARY (explicit consent for a reordering-unsafe operation).
 	AllowPartitionGrowth bool `json:"allow_partition_growth" envconfig:"KAFKA_ALLOW_PARTITION_GROWTH"`
+
+	// MetricsSubscriberBudget caps how many registry rows ONE consumer-lag sweep examines.
+	//
+	// # Why it is a knob and not a constant
+	//
+	// The periodic collector measures each subscriber's lag with two broker round trips per
+	// authorised topic, so an unbounded registry could make one tick outlast the collection
+	// interval; and each subscriber-topic pair is an exported gauge series, so the registry's
+	// size is also the series count. A budget is therefore necessary. Hard-coding it is not:
+	// a deployment with more subscribers than the budget had every one beyond it measured on a
+	// LATER tick at best, and the only remedy was a rebuild.
+	//
+	// The sweep resumes from a rotating cursor rather than restarting at the newest row, so a
+	// registry larger than the budget is covered across successive ticks instead of leaving a
+	// permanent hole. Raising this value is what compresses that coverage into a single tick —
+	// set it above the registry size and every subscriber is measured every tick, which is what
+	// blnk.kafka.consumer_lag_inventory_complete reports.
+	//
+	// Defaulted to 200 by setKafkaDefaults and clamped to MaxMetricsSubscriberBudget, because
+	// the two costs it bounds are real: the value is not a preference about strictness but a
+	// limit on tick duration and exported series.
+	MetricsSubscriberBudget int `json:"metrics_subscriber_budget" envconfig:"EVENT_METRICS_SUBSCRIBER_BUDGET"`
 
 	// AllowAdminProducer permits the event publisher to authenticate with the
 	// ADMINISTRATIVE credentials when no dedicated producer principal is configured.
@@ -581,10 +846,23 @@ type RelayConfig struct {
 	// copy of the ledger's most sensitive data — without the access controls the primary
 	// tables have around them, and with a blast radius that only grows.
 	//
-	// Only TERMINAL rows are ever eligible. A pending, processing, replaying or failed row
-	// is still owed a delivery attempt and is never deleted however old it is; a failed
-	// row in particular is excluded because its dead-letter write is still owed, which
-	// makes this table the only copy of that event in existence.
+	// TWO POPULATIONS, TWO LIFECYCLES, and the distinction is what makes any finite value
+	// here safe to set.
+	//
+	// A DISPATCHED row is a receipt: the event reached the broker, a subscriber has had it,
+	// and after this period the row says nothing anyone needs. Age alone governs it.
+	//
+	// A DEAD-LETTERED row is the opposite — the record of an event NO SUBSCRIBER EVER
+	// RECEIVED, together with the failure metadata explaining why and the bytes a replay is
+	// driven from. It is NOT deleted by this period. It becomes eligible only once an
+	// operator has explicitly resolved it through POST /events/dead-letter/:id/resolve, and
+	// then this period applies from its occurrence. An unresolved failure therefore stays,
+	// however old, and keeps the DeadLetterMessageStuck alert firing until somebody
+	// accounts for it.
+	//
+	// Every other state is still owed a delivery attempt and is never deleted however old
+	// it is; a failed row in particular is excluded because its dead-letter write is still
+	// owed, which makes this table the only copy of that event in existence.
 	//
 	// ZERO DISABLES RETENTION and is the default, deliberately. Deleting ledger-adjacent
 	// records is a decision only an operator can take: a jurisdiction, an audit programme
@@ -594,6 +872,80 @@ type RelayConfig struct {
 	// resulting storage growth is observable through blnk.outbox.pending and the
 	// statistics endpoint.
 	EventRetentionDays int `json:"event_retention_days" envconfig:"RELAY_EVENT_RETENTION_DAYS"`
+
+	// EventRetentionBatchSize is how many rows ONE delete statement removes. PERF-P23.
+	//
+	// This is the lock-footprint knob, not the throughput knob. Each statement takes row
+	// locks and writes WAL for the rows it removes, and the sweeper runs beside a live relay
+	// claiming from the same table, so a large single delete trades a brief pause for the
+	// relay against fewer statements. The default keeps each statement small and reaches
+	// throughput through the batch COUNT below instead, which is the safer of the two ways to
+	// buy capacity.
+	EventRetentionBatchSize int `json:"event_retention_batch_size" envconfig:"RELAY_EVENT_RETENTION_BATCH_SIZE"`
+
+	// EventRetentionMaxBatchesPerSweep is how many delete statements one sweep may issue, and
+	// with the batch size it is what sets the sweeper's CAPACITY. PERF-P23.
+	//
+	// # The arithmetic, because the previous default failed it
+	//
+	// Capacity is batches x batch size per sweep, and the sweep runs hourly, so:
+	//
+	//	rows per hour = EventRetentionMaxBatchesPerSweep x EventRetentionBatchSize
+	//
+	// The old fixed ceiling was 100 batches of 1,000 rows — 100,000 rows an hour — while the
+	// throughput this system is specified for, 500 events a second, ARRIVES at 1,800,000 rows
+	// an hour. A sweeper eighteen times slower than ingestion does not slow growth down; the
+	// table grows unboundedly anyway and the retention period is never actually enforced. The
+	// bound was documented as overtaking "any realistic arrival rate", which was true of the
+	// deployments it was written for and false of the one the acceptance criteria describe.
+	//
+	// The default is therefore set ABOVE peak ingestion rather than below it, and it is
+	// configurable so an operator whose ingestion is higher still can raise it, and one who
+	// would rather protect a small database can lower it.
+	//
+	// # Zero means UNSET, and unbounded has its own value
+	//
+	// An unset int field is indistinguishable from a deliberate zero, so the two readings of
+	// zero — "I did not configure this" and "I want no ceiling" — cannot both be honoured.
+	// Zero is taken as UNSET and defaulted, because that is the safe reading: the per-sweep
+	// bound is what stops the first sweep after retention is enabled from trying to delete an
+	// entire historical backlog in one pass, holding locks on a table the relay is claiming
+	// from, and a deployment that never mentions this setting must keep that protection.
+	//
+	// EventRetentionUnboundedSweep (-1) is the explicit way to ask for no ceiling, which is
+	// what a deliberate one-off catch-up wants.
+	EventRetentionMaxBatchesPerSweep int `json:"event_retention_max_batches_per_sweep" envconfig:"RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP"`
+
+	// TWO SPELLINGS, ONE KNOB. This is the same ceiling as Kafka.MetricsSubscriberBudget:
+	// RELAY_SUBSCRIBER_METRICS_BUDGET and EVENT_METRICS_SUBSCRIBER_BUDGET are both accepted
+	// because both were published, and setRelayDefaults reconciles them so the two fields can
+	// never disagree about the value the collector actually uses.
+	// SubscriberMetricsBudget caps how many subscribers ONE metrics collection measures
+	// consumer lag for, and it is a MONITORING COVERAGE control.
+	//
+	// # What the budget costs when it is reached
+	//
+	// A subscriber past the budget is not measured approximately — it gets NO
+	// consumer-lag series at all. blnk_kafka_consumer_lag is simply absent for it, so the
+	// SubscriberConsumerLagHigh rule has nothing to evaluate and the subscriber can fall
+	// arbitrarily far behind while every dashboard reads clean. Silence and health become
+	// indistinguishable, which is why the shortfall is published on
+	// blnk.subscribers.lag_unmeasured and alerted on rather than only logged.
+	//
+	// # Why there is a budget at all
+	//
+	// It bounds two scarce things at once. Each subscriber costs an OffsetFetch and a
+	// ListOffsets round trip per authorised topic, so an unbounded registry could make one
+	// collection longer than the interval between collections. And each subscriber-topic
+	// pair is a retained gauge series, so the registry's size is also the exported series
+	// count. Neither cost is a reason to leave subscribers unmeasured silently; both are
+	// reasons to make the ceiling an explicit, observable, operator-set number.
+	//
+	// ZERO TAKES THE DEFAULT of 200, which is far above any plausible subscriber count for
+	// one ledger deployment. Raise it when blnk_subscribers_lag_unmeasured is non-zero and
+	// the collection is comfortably inside its interval; that gauge and
+	// blnk.subscribers.registered together say whether there is headroom.
+	SubscriberMetricsBudget int `json:"subscriber_metrics_budget" envconfig:"RELAY_SUBSCRIBER_METRICS_BUDGET"`
 }
 
 // eventStreamingEnvOverride is how the CONVENTIONAL BLNK_-prefixed names for the
@@ -657,17 +1009,26 @@ type RelayConfig struct {
 // resolves both WEBHOOK_DEPRECATION_SUNSET_DATE and its BLNK_-prefixed form. Adding it
 // here would be redundant.
 type eventStreamingEnvOverride struct {
-	KafkaBrokers           *[]string `envconfig:"KAFKA_BROKERS"`
+	KafkaBrokers *[]string `envconfig:"KAFKA_BROKERS"`
+	// KafkaSubscriberBrokers belongs HERE rather than in applyPrefixedEnvAliases for one
+	// mechanical reason: it is a LIST, and that function's three alias tables are typed
+	// string, int and bool. Resolving it through this struct also means the library performs
+	// the comma splitting, so the prefixed alias splits exactly as the bare name does
+	// instead of through a second, hand-written parse.
+	KafkaSubscriberBrokers *[]string `envconfig:"KAFKA_SUBSCRIBER_BROKERS"`
 	KafkaTopicPrefix       *string   `envconfig:"KAFKA_TOPIC_PREFIX"`
 	KafkaSASLAdminUser     *string   `envconfig:"KAFKA_SASL_ADMIN_USER"`
 	KafkaSASLAdminSecret   *string   `envconfig:"KAFKA_SASL_ADMIN_SECRET"`
 	KafkaMinPartitions     *int      `envconfig:"KAFKA_MIN_PARTITIONS"`
 	KafkaReplicationFactor *int      `envconfig:"KAFKA_REPLICATION_FACTOR"`
 
-	RelayMaxRetryAttempts   *int `envconfig:"RELAY_MAX_RETRY_ATTEMPTS"`
-	RelayRetryBaseBackoffMS *int `envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
-	RelayRetryMaxBackoffMS  *int `envconfig:"RELAY_RETRY_MAX_BACKOFF_MS"`
-	RelayEventRetentionDays *int `envconfig:"RELAY_EVENT_RETENTION_DAYS"`
+	RelayMaxRetryAttempts                 *int `envconfig:"RELAY_MAX_RETRY_ATTEMPTS"`
+	RelayRetryBaseBackoffMS               *int `envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
+	RelayRetryMaxBackoffMS                *int `envconfig:"RELAY_RETRY_MAX_BACKOFF_MS"`
+	RelaySubscriberMetricsBudget          *int `envconfig:"RELAY_SUBSCRIBER_METRICS_BUDGET"`
+	RelayEventRetentionDays               *int `envconfig:"RELAY_EVENT_RETENTION_DAYS"`
+	RelayEventRetentionBatchSize          *int `envconfig:"RELAY_EVENT_RETENTION_BATCH_SIZE"`
+	RelayEventRetentionMaxBatchesPerSweep *int `envconfig:"RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP"`
 }
 
 // applyEventStreamingEnvOverride resolves the Kafka and relay environment variables
@@ -702,6 +1063,9 @@ func applyEventStreamingEnvOverride(cnf *Configuration) error {
 	if override.KafkaBrokers != nil {
 		cnf.Kafka.Brokers = *override.KafkaBrokers
 	}
+	if override.KafkaSubscriberBrokers != nil {
+		cnf.Kafka.SubscriberBrokers = *override.KafkaSubscriberBrokers
+	}
 	if override.KafkaTopicPrefix != nil {
 		cnf.Kafka.TopicPrefix = *override.KafkaTopicPrefix
 	}
@@ -727,8 +1091,17 @@ func applyEventStreamingEnvOverride(cnf *Configuration) error {
 	if override.RelayRetryMaxBackoffMS != nil {
 		cnf.Relay.RetryMaxBackoffMS = *override.RelayRetryMaxBackoffMS
 	}
+	if override.RelaySubscriberMetricsBudget != nil {
+		cnf.Relay.SubscriberMetricsBudget = *override.RelaySubscriberMetricsBudget
+	}
 	if override.RelayEventRetentionDays != nil {
 		cnf.Relay.EventRetentionDays = *override.RelayEventRetentionDays
+	}
+	if override.RelayEventRetentionBatchSize != nil {
+		cnf.Relay.EventRetentionBatchSize = *override.RelayEventRetentionBatchSize
+	}
+	if override.RelayEventRetentionMaxBatchesPerSweep != nil {
+		cnf.Relay.EventRetentionMaxBatchesPerSweep = *override.RelayEventRetentionMaxBatchesPerSweep
 	}
 
 	return nil
@@ -867,6 +1240,47 @@ func (cnf *Configuration) RemoteMonitoringDSN() string {
 		return cnf.MonitoringDSN
 	}
 	return ""
+}
+
+// EventPublishingConfigured reports whether this deployment has at least one usable
+// Kafka broker, and therefore whether the event pipeline captures anything at all.
+//
+// # Why the predicate lives on the configuration
+//
+// Two packages need this same answer and MUST NOT disagree about it. The root package
+// decides whether to capture an event and whether the legacy transport is the one to
+// use; the database package decides whether to write a balance-monitor handoff inside a
+// ledger transaction. If those two answers ever differed, one of two silent faults
+// would follow: handoffs written that nothing drains, or a movement whose monitors are
+// evaluated by neither the handoff nor the post-commit path — an alert lost with nothing
+// failing to say so.
+//
+// Putting the predicate here makes the disagreement unrepresentable rather than
+// unlikely. The root package's eventPublishingConfigured delegates to it, and the
+// database layer calls it directly.
+//
+// # What counts as configured
+//
+// A broker list containing only blank entries is NOT configured. A whitespace-only
+// entry survives environment-variable splitting and list parsing but cannot be dialled,
+// so treating it as a broker would arm the whole pipeline against an endpoint that
+// cannot exist.
+//
+// Returns:
+//   - bool: true when at least one broker address is non-blank. A nil receiver answers
+//     false, because a process with no configuration cannot publish.
+func (cnf *Configuration) EventPublishingConfigured() bool {
+	if cnf == nil {
+		return false
+	}
+
+	for _, broker := range cnf.Kafka.Brokers {
+		if strings.TrimSpace(broker) != "" {
+			return true
+		}
+	}
+
+	return false
 }
 
 func loadConfigFromFile(file string) error {
@@ -1095,12 +1509,16 @@ func applyPrefixedEnvAliases(cnf *Configuration) error {
 	}
 
 	intAliases := map[string]*int{
-		"KAFKA_MIN_PARTITIONS":        &cnf.Kafka.MinPartitions,
-		"KAFKA_REPLICATION_FACTOR":    &cnf.Kafka.ReplicationFactor,
-		"RELAY_MAX_RETRY_ATTEMPTS":    &cnf.Relay.MaxRetryAttempts,
-		"RELAY_RETRY_BASE_BACKOFF_MS": &cnf.Relay.RetryBaseBackoffMS,
-		"RELAY_RETRY_MAX_BACKOFF_MS":  &cnf.Relay.RetryMaxBackoffMS,
-		"RELAY_EVENT_RETENTION_DAYS":  &cnf.Relay.EventRetentionDays,
+		"KAFKA_MIN_PARTITIONS":                        &cnf.Kafka.MinPartitions,
+		"KAFKA_REPLICATION_FACTOR":                    &cnf.Kafka.ReplicationFactor,
+		"RELAY_MAX_RETRY_ATTEMPTS":                    &cnf.Relay.MaxRetryAttempts,
+		"RELAY_RETRY_BASE_BACKOFF_MS":                 &cnf.Relay.RetryBaseBackoffMS,
+		"RELAY_RETRY_MAX_BACKOFF_MS":                  &cnf.Relay.RetryMaxBackoffMS,
+		"RELAY_EVENT_RETENTION_DAYS":                  &cnf.Relay.EventRetentionDays,
+		"RELAY_EVENT_RETENTION_BATCH_SIZE":            &cnf.Relay.EventRetentionBatchSize,
+		"RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP": &cnf.Relay.EventRetentionMaxBatchesPerSweep,
+		"EVENT_METRICS_SUBSCRIBER_BUDGET":             &cnf.Kafka.MetricsSubscriberBudget,
+		"RELAY_SUBSCRIBER_METRICS_BUDGET":             &cnf.Relay.SubscriberMetricsBudget,
 	}
 	for name, target := range intAliases {
 		key := envAliasPrefix + name
@@ -1168,6 +1586,14 @@ func (cnf *Configuration) validateAndAddDefaults() error {
 	cnf.trimWhitespace()
 	cnf.setupRateLimiting()
 
+	// AFTER trimWhitespace, so a key of nothing but spaces is treated as absent rather than
+	// accepted as a credential, and BEFORE the secure-mode warning below, so a production
+	// deployment that would authenticate to its search index with a publicly known key is
+	// refused rather than warned about among other warnings.
+	if err := cnf.resolveSearchCredential(); err != nil {
+		return err
+	}
+
 	if !cnf.Server.Secure {
 		logrus.Warn(
 			"SECURITY: server.secure is false — API authentication is DISABLED. Do not use this configuration in production.",
@@ -1198,7 +1624,124 @@ func (cnf *Configuration) validateAndAddDefaults() error {
 		return err
 	}
 
+	// AFTER the SASL pair check, so the identities validated here are ones that could
+	// actually be presented, and last because it is the check whose failure is a
+	// privilege-escalation risk rather than a connection failure.
+	if err := cnf.validateKafkaPrincipalSeparation(); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// ReservedSubscriberPrincipalNamespace is the principal prefix Blnk reserves for the
+// subscriber identities it mints.
+//
+// # It is a PINNED COPY, and it must equal model.SubscriberPrincipalNamespace
+//
+// This package cannot import the model package: model already depends on config, and an
+// import here would close the cycle. So the value is restated, and a test in each package
+// asserts the two are equal — which is the only thing that keeps them from drifting. If you
+// change one, change the other; the test will tell you if you forget.
+//
+// It is exported so that test, and any operator tooling validating a deployment, can read the
+// same value the check below applies.
+const ReservedSubscriberPrincipalNamespace = "blnk-sub-"
+
+// validateKafkaPrincipalSeparation refuses a Kafka identity configuration in which Blnk's own
+// principals could be mistaken for — or could overwrite — a subscriber's.
+//
+// # The escalation this closes
+//
+// Blnk mints a subscriber principal by prefixing the subscriber's identifier with the reserved
+// namespace, and issuing credentials for it performs a SCRAM UPSERT: an existing credential for
+// that principal is REPLACED with a freshly generated password, which is then returned to the
+// caller in the response body.
+//
+// Nothing previously stopped the administrative or producer username from living inside that
+// same reserved namespace. A deployment whose KAFKA_SASL_ADMIN_USER was, say,
+// "blnk-sub-admin" could therefore be made to rotate and hand out its own Kafka superuser
+// credential: register a subscriber whose identifier derives that exact principal, call the
+// credential endpoint, and the response contains a working administrative password. The same
+// applies to the producer principal, which holds Write on every Blnk-owned topic.
+//
+// Two rules close it, and both are checked here:
+//
+//  1. NEITHER Blnk principal may sit inside the reserved subscriber namespace. The namespace is
+//     documented as Blnk's own and is derived, not chosen, so an identity inside it is
+//     reachable by an ordinary authorized API call.
+//  2. The administrative and producer principals must be DISTINCT from each other. They exist
+//     precisely to separate publishing from administration — one holds Write on the topics, the
+//     other can mint credentials and grant ACLs — and collapsing them onto one identity gives
+//     every process that only publishes the ability to provision. It also makes the excess
+//     privilege invisible, because each pair looks correctly configured on its own.
+//
+// # Severity follows whether Kafka is in use, matching validateKafkaSASLCredentials
+//
+// With brokers configured this is FATAL: the credential endpoint is reachable and the
+// escalation is live, so refusing to start is the only signal that cannot be overlooked. With
+// no brokers configured nothing reads these identities and no credential can be issued, so the
+// defect is a warning and start-up continues — the same posture the half-configured-pair check
+// takes, for the same reason.
+//
+// Comparison is case-SENSITIVE and on the trimmed value, because Kafka principals are
+// case-sensitive: "blnk-sub-x" and "BLNK-SUB-X" are two different identities at the broker, and
+// folding case here would refuse a configuration that is in fact safe while telling the
+// operator something untrue about why.
+//
+// Returns:
+//   - error: non-nil only when a rule is broken on a deployment that has brokers configured.
+//     No message contains a secret — only usernames, which are not secrets.
+func (cnf *Configuration) validateKafkaPrincipalSeparation() error {
+	admin := strings.TrimSpace(cnf.Kafka.SASLAdminUser)
+	producer := strings.TrimSpace(cnf.Kafka.SASLUser)
+
+	var faults []string
+
+	if admin != "" && strings.HasPrefix(admin, ReservedSubscriberPrincipalNamespace) {
+		faults = append(faults, fmt.Sprintf(
+			"KAFKA_SASL_ADMIN_USER (%q) is inside the reserved subscriber principal namespace %q, so "+
+				"issuing credentials for a subscriber that derives it would rotate and return the "+
+				"administrative credential",
+			admin, ReservedSubscriberPrincipalNamespace,
+		))
+	}
+
+	if producer != "" && strings.HasPrefix(producer, ReservedSubscriberPrincipalNamespace) {
+		faults = append(faults, fmt.Sprintf(
+			"KAFKA_SASL_USER (%q) is inside the reserved subscriber principal namespace %q, so issuing "+
+				"credentials for a subscriber that derives it would rotate and return the producer "+
+				"credential",
+			producer, ReservedSubscriberPrincipalNamespace,
+		))
+	}
+
+	if admin != "" && admin == producer {
+		faults = append(faults, fmt.Sprintf(
+			"KAFKA_SASL_ADMIN_USER and KAFKA_SASL_USER are the same principal (%q); they must be "+
+				"distinct, because one holds Write on every Blnk-owned topic and the other can mint "+
+				"subscriber credentials and grant ACLs",
+			admin,
+		))
+	}
+
+	if len(faults) == 0 {
+		return nil
+	}
+
+	reason := strings.Join(faults, "; ")
+
+	if len(cnf.Kafka.Brokers) == 0 {
+		logrus.WithField("reason", reason).Warn(
+			"kafka: the configured Kafka principals are not separated as required. No broker is " +
+				"configured, so no credential can be issued today and start-up continues; it must be " +
+				"fixed before KAFKA_BROKERS is set",
+		)
+
+		return nil
+	}
+
+	return fmt.Errorf("kafka: reserved principal identities must be disjoint: %s", reason)
 }
 
 // resolveWebhookDeprecationWindow validates the dual-delivery window and derives its
@@ -1330,32 +1873,31 @@ func (cnf *Configuration) warnOnInsecureKafkaTransport() {
 	}
 }
 
-// warnOnUnusableSubscriberBrokers reports at STARTUP that credential issuance will refuse.
+// warnOnUnusableSubscriberBrokers reports at STARTUP which broker list subscribers will be given.
 //
-// KAFKA_SUBSCRIBER_BROKERS is not required for Blnk to run — a deployment may configure Kafka
-// and never issue a subscriber credential — so an absent list cannot be a startup error. But
-// discovering it at the first issuance means discovering it from a 503 during an operator's
-// onboarding of a real subscriber, which is the worst moment to learn about a variable.
+// KAFKA_SUBSCRIBER_BROKERS is an OPTIONAL OVERRIDE: without it credential issuance reports
+// KAFKA_BROKERS, which is right when subscribers run inside the deployment and wrong when they
+// do not. Only an operator knows which, so the absence cannot be an error and must not be
+// silence either — an unnoticed internal address reaches the subscriber as an unexplained
+// connection timeout days later, nowhere near the request that produced it.
 //
-// It is a WARNING and not silence for the same reason the insecure-transport notices are: the
-// setting's absence changes what an endpoint does, and that belongs in the log an operator
-// reads at boot. It says nothing at all when no broker is configured, because then there is no
-// Kafka and no issuance to refuse.
+// It is a WARNING for the same reason the insecure-transport notices are: the setting's absence
+// changes what an endpoint reports, and that belongs in the log an operator reads at boot. It
+// says nothing when no broker is configured, because then there is no Kafka and no issuance.
 func (cnf *Configuration) warnOnUnusableSubscriberBrokers() {
 	if len(cnf.Kafka.Brokers) == 0 {
 		return
 	}
 
-	if _, configured := cnf.Kafka.SubscriberFacingBrokers(); configured {
+	if _, advertised := cnf.Kafka.SubscriberFacingBrokers(); advertised {
 		return
 	}
 
 	logrus.Warn(
 		"KAFKA_SUBSCRIBER_BROKERS is not configured: POST /subscribers/{id}/kafka-credentials " +
-			"will refuse with 503 rather than report the internal broker addresses Blnk dials, " +
-			"which do not resolve for an external subscriber. Set it to the externally advertised " +
-			"broker addresses subscribers connect to — the same value as KAFKA_BROKERS when " +
-			"subscribers run inside the deployment.",
+			"will report the internal broker addresses Blnk dials (KAFKA_BROKERS), which is correct " +
+			"only when subscribers run inside this deployment. Set it to the externally advertised " +
+			"broker addresses subscribers connect to if they do not.",
 	)
 }
 
@@ -1479,10 +2021,14 @@ func (cnf *Configuration) setDefaultValues() {
 		cnf.Server.UploadURLTimeoutSec = DEFAULT_UPLOAD_URL_TIMEOUT_SEC
 	}
 
-	if cnf.TypeSenseKey == "" {
-		cnf.TypeSenseKey = DEFAULT_TYPESENSE_KEY
-	}
-
+	// THE SEARCH CREDENTIAL IS DELIBERATELY NOT DEFAULTED HERE. SEC-07.
+	//
+	// It used to be, unconditionally, to the literal DEFAULT_TYPESENSE_KEY — and that
+	// substitution is what made the misconfiguration invisible. Once it had run, TypeSenseKey
+	// was non-empty, so no later check could tell a value the operator supplied from one this
+	// code invented. resolveSearchCredential makes the decision instead, from
+	// validateAndAddDefaults, where it can still see the difference and can refuse.
+	//
 	// Set module defaults
 	cnf.setLogLevelDefaults()
 	cnf.setRedisDefaults()
@@ -1638,6 +2184,46 @@ func (cnf *Configuration) setQueueDefaults() {
 //     with logrus.SetLevel in order to capture a debug-only line. An unconditional
 //     SetLevel here would silently undo those pins from inside the configuration layer.
 //     logrus already defaults to info, so filling the field is a statement of fact.
+//
+// minimumVisibleLogLevel is MINIMUM_LOG_LEVEL as a logrus level.
+//
+// It is parsed from the constant rather than written as logrus.WarnLevel so that the
+// name an operator sets and the level the code enforces cannot drift apart. Parsing a
+// compile-time constant cannot fail; if it somehow did, warn is the answer anyway.
+func minimumVisibleLogLevel() logrus.Level {
+	level, err := logrus.ParseLevel(MINIMUM_LOG_LEVEL)
+	if err != nil {
+		return logrus.WarnLevel
+	}
+
+	return level
+}
+
+// clampLogLevel raises a requested level to the floor that keeps mandatory records
+// visible, reporting whether it had to.
+//
+// logrus orders its levels from panic (0) to trace (6) and emits an entry only when the
+// logger's level is numerically at least the entry's, so "quieter" means a SMALLER
+// value and the floor is a minimum rather than a maximum. Getting that comparison
+// backwards would clamp away trace and debug — the exact diagnostics the LogLevel field
+// was added to make reachable — so the direction is asserted by
+// TestClampLogLevel_RaisesOnlyTheLevelsThatSuppressMandatoryRecords.
+//
+// Parameters:
+//   - requested: the level the deployment asked for.
+//
+// Returns:
+//   - logrus.Level: the level that will actually be applied.
+//   - bool: true when the request was quieter than the floor and has been raised.
+func clampLogLevel(requested logrus.Level) (logrus.Level, bool) {
+	floor := minimumVisibleLogLevel()
+	if requested < floor {
+		return floor, true
+	}
+
+	return requested, false
+}
+
 func (cnf *Configuration) setLogLevelDefaults() {
 	raw := strings.TrimSpace(cnf.LogLevel)
 	if raw == "" {
@@ -1658,8 +2244,31 @@ func (cnf *Configuration) setLogLevelDefaults() {
 		return
 	}
 
-	cnf.LogLevel = level.String()
-	logrus.SetLevel(level)
+	// A level quieter than the floor is honoured as far as the floor and no further.
+	// The warning is emitted AFTER the level is applied, which is what guarantees it is
+	// itself visible: it is a warning, and the level it is announcing is the one that
+	// makes warnings emit. Announcing before applying could discard the announcement.
+	effective, clamped := clampLogLevel(level)
+
+	// The field records the level the process is RUNNING at, not the one it was asked
+	// for. This follows the same rule as the unparseable branch above: a configuration
+	// that reports a level the logger is not set to is worse than one that reports the
+	// truth, and /metrics and support bundles read this field.
+	cnf.LogLevel = effective.String()
+	logrus.SetLevel(effective)
+
+	if clamped {
+		logrus.WithFields(logrus.Fields{
+			"requested_log_level": level.String(),
+			"effective_log_level": effective.String(),
+		}).Warn(
+			"the configured log level would suppress the event relay's mandatory per-attempt " +
+				"publish-failure records, so it has been raised to the minimum Blnk runs at; " +
+				"those records are the only evidence of why an event was retried or " +
+				"dead-lettered, and discarding them is not a supported configuration " +
+				"(BLNK_LOG_LEVEL, or \"log_level\" in blnk.json)",
+		)
+	}
 }
 
 func (cnf *Configuration) setRedisDefaults() {
@@ -1686,6 +2295,16 @@ func (cnf *Configuration) setDatabaseDefaults() {
 	}
 }
 
+// MaxMetricsSubscriberBudget is the supported ceiling on how many subscribers one metrics
+// collection tick may measure.
+//
+// The ceiling is real rather than cautious: each subscriber-topic pair is an exported gauge
+// series, and each subscriber costs two broker round trips per authorised topic, so an
+// unbounded budget makes a single tick unbounded in both duration and cardinality. A
+// configured value above it is clamped and logged rather than rejected, because a
+// misconfigured metrics budget must never stop the ledger from serving.
+const MaxMetricsSubscriberBudget = 5000
+
 // setKafkaDefaults fills only the unset Kafka topic-geometry values. Brokers,
 // SASLAdminUser and SASLAdminSecret are never defaulted: an empty broker list
 // selects the no-op event publisher, and the two SASL fields are credentials.
@@ -1702,6 +2321,29 @@ func (cnf *Configuration) setKafkaDefaults() {
 	}
 	if cnf.Kafka.ReplicationFactor == 0 {
 		cnf.Kafka.ReplicationFactor = defaultKafka.ReplicationFactor
+	}
+	// The lag-sweep budget: defaulted when unset or nonsensical, and CLAMPED above.
+	//
+	// Clamped rather than refused, matching how every other bad value in this file is
+	// handled — a misconfigured metrics budget must never stop the ledger from serving — and
+	// the correction is logged loudly so it cannot be mistaken for the value taking effect.
+	// The ceiling is real rather than cautious: each subscriber-topic pair is an exported
+	// gauge series and each subscriber costs two broker round trips per topic, so a budget of
+	// a million would make one collection tick unbounded in both time and cardinality.
+	if cnf.Kafka.MetricsSubscriberBudget <= 0 {
+		cnf.Kafka.MetricsSubscriberBudget = defaultKafka.MetricsSubscriberBudget
+	}
+	if cnf.Kafka.MetricsSubscriberBudget > MaxMetricsSubscriberBudget {
+		logrus.WithFields(logrus.Fields{
+			"configured": cnf.Kafka.MetricsSubscriberBudget,
+			"applied":    MaxMetricsSubscriberBudget,
+		}).Warn(
+			"EVENT_METRICS_SUBSCRIBER_BUDGET is above the supported ceiling and has been clamped; " +
+				"each subscriber measured costs two broker round trips per authorised topic and one " +
+				"exported gauge series per topic, so an unbounded budget makes a single collection " +
+				"tick unbounded in both duration and cardinality",
+		)
+		cnf.Kafka.MetricsSubscriberBudget = MaxMetricsSubscriberBudget
 	}
 	cnf.Kafka.Brokers = normalizeBrokers(cnf.Kafka.Brokers)
 	// NOT DEFAULTED TO Brokers, deliberately. Falling back would hand every subscriber
@@ -1743,14 +2385,14 @@ func (cnf *Configuration) setKafkaDefaults() {
 	// not use Kafka at all from booting because of a stray variable. The construction path
 	// remains the fail-closed one.
 	if err := cnf.Kafka.ValidateSASLAdminCredentials(); err != nil {
-		logrus.WithError(err).Warn(
+		logrus.WithField("cause", logsafe.Cause(err)).Warn(
 			"the Kafka administrative SASL credential is half-configured; topic assurance, " +
 				"subscriber provisioning and the offset reads behind reconciliation will all be " +
 				"refused rather than run unauthenticated",
 		)
 	}
 	if err := ValidateSASLPair("producer", cnf.Kafka.SASLUser, cnf.Kafka.SASLSecret); err != nil {
-		logrus.WithError(err).Warn(
+		logrus.WithField("cause", logsafe.Cause(err)).Warn(
 			"the Kafka producer SASL credential is half-configured; event publishing will be " +
 				"refused rather than run unauthenticated",
 		)
@@ -1840,6 +2482,17 @@ const DeadLetterTopicSuffixForValidation = ".dlt"
 // topic name for every category in the catalogue.
 const MaxKafkaTopicPrefixLength = MaxKafkaTopicNameLength - maxComposedTopicSuffixLength
 
+// MaxHistoricalTopicPrefixes bounds KAFKA_HISTORICAL_TOPIC_PREFIXES.
+//
+// The bound is a resource bound, not a taste one. Each declared prefix has a Kafka writer
+// pre-created for every topic in its inventory — two per event category — on every process
+// start, and those writers exist for the sole purpose of draining rows captured before a
+// rename. Four is generous for what the list is for: a deployment that has renamed its
+// topic namespace four times without ever draining the previous generation has an
+// operational problem the allowlist cannot fix, and unbounded growth would let one stale
+// environment variable multiply the writer inventory indefinitely.
+const MaxHistoricalTopicPrefixes = 4
+
 // validateKafkaTopicPrefix REFUSES a topic prefix that cannot compose a legal Kafka
 // topic name.
 //
@@ -1888,17 +2541,41 @@ func (cnf *Configuration) validateKafkaTopicPrefix() error {
 		// Blank resolves to the default downstream. Leaving the field as configured would
 		// make the effective prefix depend on which code path read it, so it is set here.
 		cnf.Kafka.TopicPrefix = defaultKafka.TopicPrefix
+	} else {
+		cnf.Kafka.TopicPrefix = prefix
 
-		return nil
+		if err := validateKafkaTopicPrefixValue("KAFKA_TOPIC_PREFIX", prefix); err != nil {
+			return err
+		}
 	}
-	cnf.Kafka.TopicPrefix = prefix
 
+	return cnf.validateKafkaHistoricalTopicPrefixes()
+}
+
+// validateKafkaTopicPrefixValue applies the length and character rules a topic prefix must
+// satisfy, whatever variable it arrived in.
+//
+// It exists because KAFKA_TOPIC_PREFIX is no longer the only prefix a deployment declares:
+// KAFKA_HISTORICAL_TOPIC_PREFIXES names the namespaces it used to own and must still be
+// able to publish to, and a historical prefix composes topic names through exactly the same
+// composer. Validating the two with one function is what stops a value being accepted in
+// one variable and refused in the other.
+//
+// Parameters:
+//   - variable string: the environment variable name to quote in any error, so the message
+//     names the value an operator has to change.
+//   - prefix string: the already-trimmed, non-empty prefix to check.
+//
+// Returns:
+//   - error: nil when every topic composed from the prefix would be a legal Kafka topic
+//     name; otherwise an error naming the variable and what is wrong with it.
+func validateKafkaTopicPrefixValue(variable, prefix string) error {
 	if len(prefix) > MaxKafkaTopicPrefixLength {
 		return fmt.Errorf(
-			"KAFKA_TOPIC_PREFIX is %d characters, which is longer than the %d a topic prefix may "+
+			"%s is %d characters, which is longer than the %d a topic prefix may "+
 				"be: Kafka refuses any topic name over %d characters and the longest name composed "+
 				"from the prefix is \"<prefix>.transactions%s\"",
-			len(prefix), MaxKafkaTopicPrefixLength, MaxKafkaTopicNameLength,
+			variable, len(prefix), MaxKafkaTopicPrefixLength, MaxKafkaTopicNameLength,
 			DeadLetterTopicSuffixForValidation,
 		)
 	}
@@ -1924,12 +2601,90 @@ func (cnf *Configuration) validateKafkaTopicPrefix() error {
 	}
 
 	return fmt.Errorf(
-		"KAFKA_TOPIC_PREFIX contains %d character(s) Kafka does not permit in a topic name "+
+		"%s contains %d character(s) Kafka does not permit in a topic name "+
 			"(%s); only letters, digits, '.', '_' and '-' are legal, and every topic composed "+
 			"from this prefix would be refused by the broker, so events would be captured and "+
 			"never delivered",
-		len(offenders), strings.Join(offenders, ", "),
+		variable, len(offenders), strings.Join(offenders, ", "),
 	)
+}
+
+// validateKafkaHistoricalTopicPrefixes normalises and checks the historical-prefix
+// allowlist, and rewrites the field so every reader sees the normalised list.
+//
+// # Why it is validated rather than just trimmed
+//
+// Every prefix in this list is treated as OWNED: writers are pre-created for its whole
+// topic inventory, the publisher's ownership test admits it, and topic assurance keeps its
+// topics present. A malformed entry would therefore be a silent failure of exactly the
+// stranding this list exists to prevent — the operator declares the old namespace, the
+// value is unusable, and the old rows still never drain. Refusing it at load, by name, is
+// what makes the declaration mean something.
+//
+// # What is normalised away rather than refused
+//
+// Blank entries and duplicates, including a repeat of TopicPrefix. Both are ordinary in an
+// allowlist that is meant to be DRAINED: a trailing comma, or the current prefix left in
+// place after a rename completed, describes the same set of owned topics either way. The
+// current prefix is removed rather than kept so that every consumer can treat this list as
+// "the prefixes BESIDES the configured one", which is what makes a topic inventory
+// composed from current-plus-historical free of duplicates.
+//
+// Returns:
+//   - error: non-nil when an entry could not compose legal topic names, or when more than
+//     MaxHistoricalTopicPrefixes distinct prefixes are declared.
+func (cnf *Configuration) validateKafkaHistoricalTopicPrefixes() error {
+	if len(cnf.Kafka.HistoricalTopicPrefixes) == 0 {
+		cnf.Kafka.HistoricalTopicPrefixes = nil
+
+		return nil
+	}
+
+	current := strings.Trim(cnf.Kafka.TopicPrefix, " \t\n\v\f\r.")
+	if current == "" {
+		current = defaultKafka.TopicPrefix
+	}
+
+	seen := map[string]struct{}{current: {}}
+	normalised := make([]string, 0, len(cnf.Kafka.HistoricalTopicPrefixes))
+
+	for _, raw := range cnf.Kafka.HistoricalTopicPrefixes {
+		prefix := strings.Trim(raw, " \t\n\v\f\r.")
+		if prefix == "" {
+			continue
+		}
+		if _, already := seen[prefix]; already {
+			continue
+		}
+
+		if err := validateKafkaTopicPrefixValue("KAFKA_HISTORICAL_TOPIC_PREFIXES", prefix); err != nil {
+			return err
+		}
+
+		seen[prefix] = struct{}{}
+		normalised = append(normalised, prefix)
+	}
+
+	if len(normalised) > MaxHistoricalTopicPrefixes {
+		return fmt.Errorf(
+			"KAFKA_HISTORICAL_TOPIC_PREFIXES declares %d distinct prefixes, which is more than "+
+				"the %d permitted: every prefix in the list has a writer pre-created for each of "+
+				"its topics on every process start, so an unbounded list is memory spent on "+
+				"topics nothing writes to. This list is meant to be DRAINED — remove a prefix "+
+				"once no non-terminal and no replayable outbox row still names it",
+			len(normalised), MaxHistoricalTopicPrefixes,
+		)
+	}
+
+	if len(normalised) == 0 {
+		cnf.Kafka.HistoricalTopicPrefixes = nil
+
+		return nil
+	}
+
+	cnf.Kafka.HistoricalTopicPrefixes = normalised
+
+	return nil
 }
 
 // ErrProducerPrincipalRequired reports that a deployment configured an ADMINISTRATIVE
@@ -2036,25 +2791,101 @@ func (k KafkaConfig) SASLAdminCredentials() (user, secret string, enabled bool) 
 	return user, secret, true
 }
 
+// OwnedTopicPrefixes returns every topic namespace this deployment owns: the configured
+// prefix first, then each historical prefix in declared order.
+//
+// # Why the order matters
+//
+// The configured prefix is where NEW events go, so it leads: a caller that composes a
+// topic inventory from this list builds the live generation's names first, which is the
+// order the provisioning script and the documentation both use, and a caller that is
+// resolving one topic name finds the common case on the first comparison.
+//
+// # What it guarantees
+//
+// Non-empty, distinct, and free of blanks. A configuration that has not been through the
+// validate-and-default path can still hold a blank prefix, and rather than return a list
+// with a hole in it this falls back to the default prefix — the same answer every other
+// prefix reader gives for an unconfigured deployment, and the STRICTEST one available,
+// since an unconfigured caller must not accidentally widen the owned namespace.
+//
+// The returned slice is freshly allocated. The configuration is shared through an
+// atomic.Value and read concurrently, so handing out the backing array would let a caller
+// that appends to its result mutate what every later reader sees.
+//
+// Returns:
+//   - []string: one or more distinct, non-blank prefixes, configured prefix first.
+func (k KafkaConfig) OwnedTopicPrefixes() []string {
+	current := strings.Trim(k.TopicPrefix, " \t\n\v\f\r.")
+	if current == "" {
+		current = defaultKafka.TopicPrefix
+	}
+
+	prefixes := make([]string, 0, 1+len(k.HistoricalTopicPrefixes))
+	prefixes = append(prefixes, current)
+
+	seen := map[string]struct{}{current: {}}
+	for _, raw := range k.HistoricalTopicPrefixes {
+		prefix := strings.Trim(raw, " \t\n\v\f\r.")
+		if prefix == "" {
+			continue
+		}
+		if _, already := seen[prefix]; already {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		prefixes = append(prefixes, prefix)
+	}
+
+	return prefixes
+}
+
 // SubscriberFacingBrokers returns the bootstrap list to HAND TO A SUBSCRIBER, and reports
-// whether one is configured at all.
+// whether that list is the operator's ADVERTISED one or the internal fallback.
 //
 // It exists so that the single question "what do I tell this subscriber to connect to?" has
-// one answer in one place. The tempting implementation — return SubscriberBrokers when set
-// and Brokers otherwise — is precisely the bug SubscriberBrokers was added to remove: the
-// fallback is silent, so the response is a 200 carrying an address the subscriber cannot
-// resolve, and the diagnosis lands days later in somebody else's logs.
+// one answer in one place.
+//
+// # KAFKA_BROKERS is the fallback, and the fallback is REQUIRED rather than optional
+//
+// SubscriberBrokers used to be a hard prerequisite: absent it, issuance refused with 503 so
+// that a subscriber could never be handed an address it cannot resolve. That made a NINTH
+// variable mandatory for the credential endpoint, and requirement R-10 fixes the mandatory
+// configuration surface at eight. A deployment satisfying the whole documented contract could
+// therefore run the relay, publish every event, and still receive 503 from every issuance
+// request — a required endpoint made unusable by a setting the contract never mentions.
+//
+// So the resolution order is: the advertised list when one is configured, the internal list
+// otherwise, and "nothing configured" only when Kafka itself is unconfigured. The advertised
+// list keeps its whole reason for existing — inside a deployment "kafka:9092" or a ClusterIP
+// Service name does not resolve for an outside subscriber, and a broker answers every client
+// with the ADVERTISED address of the listener the connection arrived on — but that reason is
+// now carried by the second return value and by the warning the caller logs, rather than by
+// refusing to answer at all. An operator whose subscribers run outside the deployment sees the
+// warning at start-up and at every issuance; one whose subscribers run inside it needs no
+// extra variable to make a documented endpoint work.
 //
 // The returned slice is a COPY. The configuration is shared through an atomic.Value and read
 // concurrently, so handing out the backing array would let a caller that appends to its
 // result mutate what every later reader sees.
 //
 // Returns:
-//   - brokers []string: a copy of the subscriber-facing list, nil when none is configured.
-//   - configured bool: false when the list is empty, which callers must treat as a refusal
-//     to issue rather than as a reason to substitute the internal list.
-func (k KafkaConfig) SubscriberFacingBrokers() (brokers []string, configured bool) {
-	normalized := normalizeBrokers(k.SubscriberBrokers)
+//   - brokers []string: a copy of the list to report, nil only when neither
+//     KAFKA_SUBSCRIBER_BROKERS nor KAFKA_BROKERS is configured.
+//   - advertised bool: true when the list came from KAFKA_SUBSCRIBER_BROKERS. False with a
+//     non-empty list means the internal bootstrap list is being reported, which callers must
+//     warn about — it is correct only when subscribers run inside the deployment.
+func (k KafkaConfig) SubscriberFacingBrokers() (brokers []string, advertised bool) {
+	if normalized := normalizeBrokers(k.SubscriberBrokers); len(normalized) > 0 {
+		brokers = make([]string, len(normalized))
+		copy(brokers, normalized)
+
+		return brokers, true
+	}
+
+	// THE REQUIRED FALLBACK. Empty here means no Kafka at all, which the caller answers with
+	// the same "Kafka is not configured" refusal every other Kafka-dependent operation gives.
+	normalized := normalizeBrokers(k.Brokers)
 	if len(normalized) == 0 {
 		return nil, false
 	}
@@ -2062,7 +2893,7 @@ func (k KafkaConfig) SubscriberFacingBrokers() (brokers []string, configured boo
 	brokers = make([]string, len(normalized))
 	copy(brokers, normalized)
 
-	return brokers, true
+	return brokers, false
 }
 
 // ValidateSASLAdminCredentials reports a half-configured administrative credential.
@@ -2235,6 +3066,116 @@ func (cnf *Configuration) setRelayDefaults() {
 		)
 		cnf.Relay.EventRetentionDays = 0
 	}
+
+	// PURGE CAPACITY (PERF-P23). Unlike the retention PERIOD above, these two DO have a
+	// correct answer this code can supply, so an unset value is filled in rather than left to
+	// mean "off": a batch size of zero would delete nothing at all, which is a silently broken
+	// sweeper rather than a disabled one. Retention is switched off by the period, in one
+	// place, and these only decide how fast it is enforced.
+	if cnf.Relay.EventRetentionBatchSize <= 0 {
+		cnf.Relay.EventRetentionBatchSize = defaultRelay.EventRetentionBatchSize
+	}
+
+	// The batch CEILING distinguishes unset from unbounded, because an unset int is zero and
+	// both readings of zero cannot be honoured. Zero DEFAULTS — the per-sweep bound is what
+	// protects a live relay from a single sweep attempting an entire historical backlog, and a
+	// deployment that never mentioned this setting must keep that protection. Asking for no
+	// ceiling is spelled EventRetentionUnboundedSweep, and any negative is normalised onto it
+	// so a reader downstream has one value to recognise rather than a sign to test.
+	switch {
+	case cnf.Relay.EventRetentionMaxBatchesPerSweep == 0:
+		cnf.Relay.EventRetentionMaxBatchesPerSweep = defaultRelay.EventRetentionMaxBatchesPerSweep
+	case cnf.Relay.EventRetentionMaxBatchesPerSweep < 0:
+		cnf.Relay.EventRetentionMaxBatchesPerSweep = EventRetentionUnboundedSweep
+	}
+
+	// Reported when retention is ON, because capacity only matters if something is deleting,
+	// and reported as ROWS PER HOUR rather than as its two factors — that is the number an
+	// operator has to compare against their arrival rate, and making them multiply it
+	// themselves is how the previous default went eighteen times under peak unnoticed.
+	if cnf.Relay.EventRetentionDays > 0 {
+		fields := logrus.Fields{
+			"batch_size":  cnf.Relay.EventRetentionBatchSize,
+			"max_batches": cnf.Relay.EventRetentionMaxBatchesPerSweep,
+		}
+
+		if cnf.Relay.EventRetentionMaxBatchesPerSweep > 0 {
+			fields["purge_capacity_rows_per_hour"] =
+				cnf.Relay.EventRetentionMaxBatchesPerSweep * cnf.Relay.EventRetentionBatchSize
+		} else {
+			fields["purge_capacity_rows_per_hour"] = "unbounded"
+		}
+
+		logrus.WithFields(fields).Info(
+			"event outbox retention is enabled; compare the purge capacity against your event " +
+				"arrival rate, because capacity below arrivals means the table grows without bound " +
+				"however short the retention period is",
+		)
+	}
+	// TWO PUBLISHED SPELLINGS OF ONE CEILING. RELAY_SUBSCRIBER_METRICS_BUDGET and
+	// EVENT_METRICS_SUBSCRIBER_BUDGET both name how many registry rows ONE consumer-lag
+	// sweep is allowed to measure. Both are honoured because both were documented, and
+	// both are reconciled onto a single value HERE — after setKafkaDefaults has defaulted
+	// and clamped its side — because two fields holding one knob is how the budget that
+	// actually took effect comes to depend on which construction path ran: the collector
+	// reads Kafka.MetricsSubscriberBudget directly, while the server's collector wiring
+	// passes Relay.SubscriberMetricsBudget.
+	//
+	// A NEGATIVE value is refused rather than honoured. Read literally it would measure
+	// nothing at all, which would leave every subscriber's lag unmeasured — the exact
+	// condition the budget's own gauge exists to make visible, arrived at by
+	// configuration instead of by scale.
+	if cnf.Relay.SubscriberMetricsBudget < 0 {
+		logrus.WithFields(logrus.Fields{
+			"configured": cnf.Relay.SubscriberMetricsBudget,
+			"variable":   "RELAY_SUBSCRIBER_METRICS_BUDGET",
+			"using":      defaultRelay.SubscriberMetricsBudget,
+		}).Warn(
+			"relay subscriber_metrics_budget is negative, which would leave every subscriber's " +
+				"consumer lag unmeasured; the default is being used instead",
+		)
+		cnf.Relay.SubscriberMetricsBudget = 0
+	}
+
+	switch {
+	case cnf.Relay.SubscriberMetricsBudget == 0:
+		// Unset under this spelling: adopt whatever setKafkaDefaults settled on, which is
+		// either the operator's EVENT_METRICS_SUBSCRIBER_BUDGET or the shipped default.
+		cnf.Relay.SubscriberMetricsBudget = cnf.Kafka.MetricsSubscriberBudget
+	case cnf.Kafka.MetricsSubscriberBudget != defaultKafka.MetricsSubscriberBudget &&
+		cnf.Kafka.MetricsSubscriberBudget != cnf.Relay.SubscriberMetricsBudget:
+		// Both spellings were set, to different values. Neither can be silently discarded,
+		// so the disagreement is reported naming both variables, and the value the
+		// collector reads directly wins so that the clamp it is subject to always applies.
+		logrus.WithFields(logrus.Fields{
+			"relay_subscriber_metrics_budget": cnf.Relay.SubscriberMetricsBudget,
+			"event_metrics_subscriber_budget": cnf.Kafka.MetricsSubscriberBudget,
+			"applied":                         cnf.Kafka.MetricsSubscriberBudget,
+		}).Warn(
+			"RELAY_SUBSCRIBER_METRICS_BUDGET and EVENT_METRICS_SUBSCRIBER_BUDGET name the same " +
+				"consumer-lag sweep ceiling and were set to different values; " +
+				"EVENT_METRICS_SUBSCRIBER_BUDGET has been applied to both, because that is the " +
+				"value the metrics collector reads and the one the supported ceiling clamps",
+		)
+		cnf.Relay.SubscriberMetricsBudget = cnf.Kafka.MetricsSubscriberBudget
+	default:
+		// Set here and either agreeing with the other spelling or the only one set: this is
+		// the value that must reach the collector, clamped by the same ceiling.
+		if cnf.Relay.SubscriberMetricsBudget > MaxMetricsSubscriberBudget {
+			logrus.WithFields(logrus.Fields{
+				"configured": cnf.Relay.SubscriberMetricsBudget,
+				"applied":    MaxMetricsSubscriberBudget,
+				"variable":   "RELAY_SUBSCRIBER_METRICS_BUDGET",
+			}).Warn(
+				"relay subscriber_metrics_budget is above the supported ceiling and has been " +
+					"clamped; each subscriber measured costs two broker round trips per authorised " +
+					"topic and one exported gauge series per topic",
+			)
+			cnf.Relay.SubscriberMetricsBudget = MaxMetricsSubscriberBudget
+		}
+		cnf.Kafka.MetricsSubscriberBudget = cnf.Relay.SubscriberMetricsBudget
+	}
+
 }
 
 // EventRetentionPeriod returns the configured retention period as a duration, and zero
@@ -2302,11 +3243,57 @@ func (cnf *Configuration) UploadDomainWhitelistHosts() []string {
 	return hosts
 }
 
+// TrustedProxyCIDRs returns the parsed, trimmed, de-duplicated list of proxy addresses
+// whose forwarded-for headers the HTTP layer may believe.
+//
+// A NIL result means "trust nothing", and that is what an empty or unset value yields.
+// The distinction is load-bearing: the router hands this straight to gin's
+// SetTrustedProxies, where nil disables forwarded-header handling altogether and the
+// client address becomes the connection's own peer. Returning an empty non-nil slice
+// would not be the same thing to a future reader, so nil is returned deliberately.
+//
+// Entries are NOT validated here. gin parses them and reports a malformed entry, which
+// is the only place that can say authoritatively what it accepts; validating twice would
+// mean two definitions of a valid CIDR, and the stricter one would silently reject a
+// value the router would have taken.
+//
+// Returns:
+//   - []string: the proxy addresses, or nil to trust none.
+func (cnf *Configuration) TrustedProxyCIDRs() []string {
+	raw := strings.TrimSpace(cnf.Server.TrustedProxies)
+	if raw == "" {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	proxies := make([]string, 0, 4)
+
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+
+		if _, duplicate := seen[entry]; duplicate {
+			continue
+		}
+
+		seen[entry] = struct{}{}
+		proxies = append(proxies, entry)
+	}
+
+	if len(proxies) == 0 {
+		return nil
+	}
+
+	return proxies
+}
+
 func (cnf *Configuration) setupRateLimiting() {
 
 	if cnf.RateLimit.RequestsPerSecond == nil && cnf.RateLimit.Burst == nil {
-		defaultRPS := 5000000.0
-		defaultBurst := 10000000
+		defaultRPS := DEFAULT_RATE_LIMIT_RPS
+		defaultBurst := DEFAULT_RATE_LIMIT_BURST
 
 		cnf.RateLimit.RequestsPerSecond = &defaultRPS
 		cnf.RateLimit.Burst = &defaultBurst
@@ -2314,7 +3301,12 @@ func (cnf *Configuration) setupRateLimiting() {
 		logrus.WithFields(logrus.Fields{
 			"rps":   defaultRPS,
 			"burst": defaultBurst,
-		}).Info("rate limiting not configured, using defaults")
+		}).Info(
+			"rate limiting not configured, using defaults. These are PER-CLIENT limits: set " +
+				"BLNK_RATE_LIMIT_RPS and BLNK_RATE_LIMIT_BURST if your callers legitimately exceed " +
+				"them, and set BLNK_SERVER_TRUSTED_PROXIES so each caller is limited separately " +
+				"rather than all of them sharing your proxy's address",
+		)
 	}
 
 	if cnf.RateLimit.RequestsPerSecond != nil && cnf.RateLimit.Burst == nil {
@@ -2373,6 +3365,96 @@ func logger() {
 	}
 
 	if level, err := logrus.ParseLevel(strings.ToLower(strings.TrimSpace(raw))); err == nil {
-		logrus.SetLevel(level)
+		// Clamped here as well as in setLogLevelDefaults, and for the same reason: this
+		// is the level in force for the whole of start-up, including the configuration
+		// load itself. Applying an unclamped quiet level here would discard start-up
+		// warnings that the later clamp can no longer bring back, since by then they
+		// have already been emitted and dropped.
+		//
+		// The clamp is silent at this point. Nothing has been loaded yet, and
+		// setLogLevelDefaults reports the same condition properly once it can name both
+		// the requested and the effective level; warning twice would read as two
+		// separate faults.
+		effective, _ := clampLogLevel(level)
+		logrus.SetLevel(effective)
 	}
+}
+
+// resolveSearchCredential decides what the TypeSense API key becomes when the operator
+// supplied none, and REFUSES the one case in which the historical answer was a hard-coded
+// credential in a production deployment. SEC-07.
+//
+// # What was wrong
+//
+// setDefaultValues substituted the literal DEFAULT_TYPESENSE_KEY — "blnk-api-key" —
+// unconditionally, whenever no key was configured. That literal is not a secret by any
+// measure: it is the key in this repository's own compose files, it is in every clone, and it
+// is the value a local TypeSense is started with. So a production deployment that had simply
+// forgotten BLNK_TYPESENSE_KEY authenticated to its search index — which holds indexed
+// transaction, balance and identity records — with a credential anybody can read from GitHub.
+// That is CWE-798, and the substitution is also what made it UNDETECTABLE: once it had run,
+// the field was non-empty, so nothing downstream could distinguish a key the operator chose
+// from one this function invented.
+//
+// # The three outcomes, and why it is not simply "require it"
+//
+// The posture is read from Server.Secure, which is this codebase's own production signal —
+// the same flag whose falsity already announces that API authentication is disabled. The
+// three arms are deliberately different, because a single rule gets one of them wrong:
+//
+//  1. NOT SECURE — the historical default is applied, exactly as before. This is the posture
+//     of the compose stack, the makefile targets and the whole test suite, and a local
+//     TypeSense is started with that very key, so refusing here would break every local
+//     bring-up to protect a credential that is doing no work.
+//  2. SECURE, and no TypeSense host configured — the key is left EMPTY and the condition is
+//     reported. Search is optional in Blnk: an unset host means no indexing is in use, and
+//     failing to start over a credential for a subsystem the deployment does not run would be
+//     a worse defect than the one being fixed.
+//  3. SECURE, with a TypeSense host configured — REFUSED. Search is genuinely in use, the
+//     operator has supplied no key, and the only remaining options are to invent a public one
+//     or to stop. Stopping is correct: the alternative silently indexes ledger data behind a
+//     credential that grants anyone who knows it full access to the collection.
+//
+// Note what this does NOT do. It does not touch search behaviour, the TypeSense client or any
+// indexing code — the AAP excludes that feature (§0.6.2) and none of its files are modified.
+// It removes a hard-coded credential from the configuration layer, which §0.6.1 puts in scope.
+//
+// Returns:
+//   - error: non-nil only in case 3, carrying the variable to set and the reason.
+func (cnf *Configuration) resolveSearchCredential() error {
+	// TrimSpace rather than a bare comparison: a variable set to whitespace is an operator
+	// who meant to supply a value and did not, and treating it as a credential would let the
+	// search client authenticate with " " and fail somewhere far less legible.
+	if strings.TrimSpace(cnf.TypeSenseKey) != "" {
+		return nil
+	}
+
+	if !cnf.Server.Secure {
+		cnf.TypeSenseKey = DEFAULT_TYPESENSE_KEY
+
+		return nil
+	}
+
+	if strings.TrimSpace(cnf.TypeSense.Dns) == "" {
+		// Left EMPTY on purpose. An empty key with an empty host is an honest description of
+		// a deployment that does not use search, and it is what keeps this from being an
+		// invented credential sitting in memory waiting for a host to be configured later.
+		logrus.Warn(
+			"BLNK_TYPESENSE_KEY is not set and secure mode is enabled, so no search credential " +
+				"has been assumed. No TypeSense host is configured either, so search is not in use " +
+				"and this is not a fault. Set BLNK_TYPESENSE_KEY before configuring " +
+				"BLNK_TYPESENSE_DNS: the public default this used to fall back to is not a secret.",
+		)
+
+		return nil
+	}
+
+	return errors.New(
+		"BLNK_TYPESENSE_KEY is required when secure mode is enabled and a TypeSense host is " +
+			"configured. It used to fall back to a built-in default, but that default is the " +
+			"literal published in this repository's compose files and README, so it is known to " +
+			"everyone and grants full access to the search collection holding indexed transaction, " +
+			"balance and identity records. Set BLNK_TYPESENSE_KEY to the api-key your TypeSense " +
+			"deployment was started with, or unset BLNK_TYPESENSE_DNS if you are not using search",
+	)
 }

@@ -1,12 +1,43 @@
 global:
   scrape_interval: 15s
 
+  # external_labels are attached to every scraped series AND are readable from an
+  # alerting rule's annotations as $externalLabels, which is what makes them the
+  # supported way to inject a per-deployment value into a rule file that is
+  # otherwise identical everywhere.
+  #
+  # runbook_base_url is the documentation base every rule's runbook_url resolves
+  # against. Each rule renders
+  #     {{ with $externalLabels.runbook_base_url }}{{ . }}{{ else }}<public docs>{{ end }}#<rule>
+  # so an unset label yields the public copy of docs/kafka-operations.md and a set
+  # one yields this deployment's own copy — in both cases with the fragment naming
+  # the rule that fired, so the link opens that rule's procedure rather than the top
+  # of a 1,200-line document.
+  #
+  # UNCOMMENT AND POINT IT AT YOUR OWN RUNBOOK if you publish one. Leave it commented
+  # to use the public documentation; the rules work either way, which is why this is
+  # not required configuration.
+  # Left fully commented rather than declared empty, deliberately: an
+  # `external_labels:` key with every entry commented out parses as null, and a
+  # null where a mapping is expected is the kind of change that breaks a
+  # configuration load for a value nobody is using yet.
+  # external_labels:
+  #   runbook_base_url: 'https://runbooks.internal.example/blnk/kafka'
+
 # Alerting rules to evaluate. A rule file is inert unless it is listed here,
-# so this stanza — not the mere presence of the file — is what arms
-# alerts/blnk-kafka-alerts.yml: a dead-letter entry unresolved for more than
-# 15 minutes, and a subscriber consumer group trailing by more than 10,000
-# messages. Those rules match on the Prometheus forms of the OTel instrument
-# names declared in internal/metrics/metrics.go, dots becoming underscores.
+# so this stanza — not the mere presence of the file — is what arms the EIGHT
+# rules in alerts/blnk-kafka-alerts.yml: three CONDITION rules (a dead-letter
+# entry unresolved for more than 15 minutes, a subscriber consumer group
+# trailing by more than 10,000 messages, and a credential awaiting revocation
+# for over an hour) and five MEASURABILITY rules that fire when Blnk cannot
+# tell whether a condition rule should. Those rules match on the Prometheus
+# forms of the OTel instrument names declared in internal/metrics/metrics.go,
+# dots becoming underscores.
+#
+# NONE OF THEM CAN FIRE UNLESS /metrics EXISTS, which takes
+# BLNK_ENABLE_OBSERVABILITY=true on the scraped role — both Compose files now
+# default it to true, and blnk-config.yaml ships it true for Kubernetes.
+# Without it neither role registers the endpoint and every scrape below 404s.
 #
 # The pattern below is a path INSIDE the Prometheus container, not a
 # repository path: the prometheus service bind-mounts this repository's
@@ -50,7 +81,7 @@ rule_files:
 #      as written.
 #   2. metrics_bearer_token SET                      -> every request without
 #      `Authorization: Bearer <token>` is refused. The jobs below then collect
-#      NOTHING, every series the alert rules match on is absent, and the two
+#      NOTHING, every series the alert rules match on is absent, and all four
 #      Kafka alerts sit permanently unable to fire. Prometheus shows the target
 #      as down; the rules report no error. An alert that cannot fire looks
 #      exactly like a system with nothing wrong.

@@ -506,6 +506,148 @@ func TestWriterFor_KeepsServingTheConstructedInventoryAfterAPrefixChange(t *test
 	}
 }
 
+// newTestKafkaPublisherForPrefixes builds a publisher as a RESTARTED PROCESS would build it:
+// from a configuration that is already the post-rename one.
+//
+// The distinction from newTestKafkaPublisher matters and is the whole point of the tests
+// below. That helper always constructs under DefaultTopicPrefix, which models a process that
+// was running BEFORE a rename and therefore pre-created the old generation's writers. Nothing
+// it can assert says anything about the process that starts AFTER the rename, whose inventory
+// is built from the new configuration alone — and that was precisely the gap.
+//
+// The configuration is published before construction, because the constructor composes its
+// inventory from the live store.
+func newTestKafkaPublisherForPrefixes(t *testing.T, current string, historical ...string) *kafkaPublisher {
+	t.Helper()
+
+	kafkaConfig := config.KafkaConfig{
+		TopicPrefix:             current,
+		HistoricalTopicPrefixes: historical,
+		InsecureLocalDev:        true,
+	}
+	storeKafkaConfig(t, kafkaConfig)
+
+	publisher, err := newKafkaPublisher([]string{"broker-1:9092"}, kafkaConfig)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if closeErr := publisher.Close(); closeErr != nil {
+			t.Logf("failed to close the test publisher: %v", closeErr)
+		}
+	})
+
+	return publisher
+}
+
+// TestWriterFor_ARestartAfterAPrefixChangeStrandsRowsUntilThePrefixIsDeclared is the
+// RESTART half of the event-is-never-stranded property, and it is the case the pre-existing
+// prefix-change test could not reach.
+//
+// # What was wrong
+//
+// An outbox row records its fully-resolved destination topic at insert time, so a deployment
+// that changes KAFKA_TOPIC_PREFIX keeps committed rows naming the previous generation's
+// topics. A RUNNING process published them fine — it had pre-created a writer for every one
+// before the change. A RESTARTED process pre-created the new generation only, and the
+// ownership test was pinned to the configured prefix alone, so every stored old-prefix row
+// was refused at writer resolution. The rows were not lost, and each attempt logged a
+// refusal, but nothing drained them and their dead-letter writes and replays were refused
+// with them. A rename plus a rolling restart is ordinary maintenance, and it silently stopped
+// delivery of everything captured before it.
+//
+// # What this asserts, in the order an operator meets it
+//
+// First the refusal, from a publisher built exactly as the restarted process builds one, so
+// the failure this fix exists for is pinned rather than described. Then the remedy: with the
+// previous prefix declared in KAFKA_HISTORICAL_TOPIC_PREFIXES, every one of those topics —
+// category AND dead-letter, since a failing old row must still be able to dead-letter — is
+// served, and served from the PRE-CREATED inventory rather than by lazy growth, which is what
+// keeps the drain off the write lock and out of the retirement bound.
+func TestWriterFor_ARestartAfterAPrefixChangeStrandsRowsUntilThePrefixIsDeclared(t *testing.T) {
+	stored := AllTopicsWithDeadLettersForPrefix(DefaultTopicPrefix)
+	require.NotEmpty(t, stored)
+
+	t.Run("undeclared: every stored topic of the previous generation is refused", func(t *testing.T) {
+		publisher := newTestKafkaPublisherForPrefixes(t, "renamed")
+
+		for _, topic := range stored {
+			_, err := publisher.writerFor(topic)
+			assert.ErrorIsf(t, err, ErrTopicNotOwned,
+				"%q must be refused while no historical prefix is declared: admitting it on form "+
+					"alone would also admit another system's topic at the one point a stored name "+
+					"becomes an outbound connection carrying Blnk's producer credentials", topic)
+		}
+	})
+
+	t.Run("declared: every stored topic is served from the pre-created inventory", func(t *testing.T) {
+		publisher := newTestKafkaPublisherForPrefixes(t, "renamed", DefaultTopicPrefix)
+
+		for _, topic := range stored {
+			writer, err := publisher.writerFor(topic)
+			require.NoErrorf(t, err,
+				"%q names a declared historical namespace and must publish, or every event "+
+					"captured before the rename is stranded", topic)
+			require.NotNil(t, writer)
+			assert.Equal(t, topic, writer.Topic)
+		}
+
+		// The new generation is present too: declaring a historical prefix must not displace
+		// the configured one, which is where every NEW event goes.
+		for _, topic := range AllTopicsWithDeadLettersForPrefix("renamed") {
+			writer, err := publisher.writerFor(topic)
+			require.NoErrorf(t, err, "%q is the live generation and must publish", topic)
+			require.NotNil(t, writer)
+		}
+
+		publisher.mu.RLock()
+		lazy := len(publisher.lazyTopics)
+		publisher.mu.RUnlock()
+		assert.Zero(t, lazy,
+			"a declared prefix's topics are PRE-CREATED, so draining the previous generation "+
+				"must not take the write lock per topic or consume the lazy-growth bound that "+
+				"exists for prefixes declared after this process started")
+
+		// And the boundary still holds: declaring one namespace does not admit any other.
+		for _, refused := range []string{"attacker.transactions", "legacy.transactions"} {
+			_, err := publisher.writerFor(refused)
+			assert.ErrorIsf(t, err, ErrTopicNotOwned,
+				"%q was never declared and must stay refused", refused)
+		}
+	})
+}
+
+// TestWriterFor_ADeclaredHistoricalPrefixIsExactRatherThanAPattern is the boundary of the
+// remedy above.
+//
+// The allowlist is what makes a stored old-prefix topic publishable, so its width is a
+// security property: an entry must admit that one namespace and nothing that merely resembles
+// it. A prefix comparison rather than an exact one would turn "blnk" into a licence for
+// "blnkfinance.transactions", and a name that shares a category token is not the same topic.
+func TestWriterFor_ADeclaredHistoricalPrefixIsExactRatherThanAPattern(t *testing.T) {
+	publisher := newTestKafkaPublisherForPrefixes(t, "renamed", "blnk")
+
+	admitted, err := publisher.writerFor("blnk.transactions")
+	require.NoError(t, err, "the exact declared namespace must be admitted")
+	require.NotNil(t, admitted)
+
+	for _, refused := range []string{
+		// A longer name that starts with the declared prefix.
+		"blnkfinance.transactions",
+		// A name the declared prefix starts with.
+		"bln.transactions",
+		// The declared prefix as a SEGMENT rather than the whole namespace.
+		"acme.blnk.transactions",
+		// The declared namespace with an unknown category.
+		"blnk.ledgers",
+		// A dead-letter topic's dead-letter topic.
+		"blnk.transactions.dlt.dlt",
+	} {
+		_, err := publisher.writerFor(refused)
+		assert.ErrorIsf(t, err, ErrTopicNotOwned,
+			"%q is not the declared namespace's category or dead-letter topic and must be refused",
+			refused)
+	}
+}
+
 // TestWriterFor_BoundsAndRetiresLazilyCreatedWriters is the bound itself.
 //
 // Without it the cache only ever grows: every distinct historical topic name keeps a writer,
@@ -808,10 +950,11 @@ func TestPublishResultLogFields_CarriesTheFieldsTheGuardDefers(t *testing.T) {
 // sibling per category.
 //
 // A const cannot call a function, so the literal cannot derive itself — which makes it
-// exactly the kind of value that goes stale silently. It has already gone stale once, when a
-// fifth category was added and the literal was left at two four-category generations, with
-// nothing anywhere failing: lazy writers would then be retired while a previous generation
-// was still in use, costing a reconnection per message rather than per topic.
+// exactly the kind of value that goes stale silently, and it has gone stale in both
+// directions. Left too LOW, lazy writers are retired while a previous generation is still in
+// use, costing a reconnection per message rather than per topic; left too HIGH, the bound no
+// longer describes what it claims to. Neither fails at build or run time, which is why the
+// arithmetic is asserted here instead.
 func TestMaxLazyTopicWriters_IsTwoPrefixGenerations(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 
@@ -961,6 +1104,119 @@ func TestPublishRequestFromOutbox_AppliesTheDocumentedFallbackChain(t *testing.T
 	})
 }
 
+// TestPublishRequestFromOutbox_PinsThePublishedKeyContractPerEventFamily is the machine-checked
+// form of the ordering-key table in docs/event-streaming.md.
+//
+// # Why the table needs a test rather than a careful author
+//
+// The documented contract had drifted from the code and the drift was invisible: the guide told
+// subscribers the key for a transaction was its SOURCE BALANCE and specifically warned them not
+// to assume it was the ledger, while PublishRequestFromOutbox resolves ledger_id first and every
+// ledger-scoped producer supplies it. Both statements were locally defensible — the balance
+// answer describes the outbox row's stored partition key, which is real — and nothing failed,
+// because no test connected the published claim to the resolved key.
+//
+// A consumer designing around the wrong answer does not get an error either. It gets a
+// partitioning model that disagrees with the broker's, which surfaces later as "ordering is
+// broken" with nothing in the data to explain it.
+//
+// So each row below is one row of the published table, asserting the KEY THE MESSAGE IS WRITTEN
+// WITH — not the column it came from. A future producer that stops supplying its ledger, or a
+// resolution order that stops preferring it, fails here and the guide is corrected with it.
+func TestPublishRequestFromOutbox_PinsThePublishedKeyContractPerEventFamily(t *testing.T) {
+	const (
+		ledger      = "ldg_key_contract"
+		balance     = "bln_key_contract_source"
+		transaction = "txn_key_contract"
+		identity    = "idt_key_contract"
+		batch       = "bulk_key_contract"
+	)
+
+	for name, testCase := range map[string]struct {
+		row  model.EventOutbox
+		want string
+		why  string
+	}{
+		// --- LEDGER-SCOPED: the key is the ledger, which is the whole of requirement R-6 ---
+		"a transaction captured with its ledger": {
+			row: model.EventOutbox{
+				EventType: "transaction.applied", AggregateID: transaction,
+				LedgerID: ledger, PartitionKey: ledger, Topic: "blnk.transactions",
+			},
+			want: ledger,
+			why:  "transaction execution resolves the ledger from the balances it has already loaded and states it at capture time",
+		},
+		"a balance event": {
+			row: model.EventOutbox{
+				EventType: "balance.created", AggregateID: balance,
+				LedgerID: ledger, PartitionKey: ledger, Topic: "blnk.balances",
+			},
+			want: ledger,
+			why:  "a balance belongs to exactly one ledger, so every balance event in that ledger is co-located",
+		},
+		"a balance monitor alert": {
+			row: model.EventOutbox{
+				EventType: "balance.monitor", AggregateID: "mon_key_contract",
+				LedgerID: ledger, PartitionKey: balance, Topic: "blnk.balances",
+			},
+			want: ledger,
+			why:  "the monitored balance's ledger is supplied explicitly, and the ledger rung wins over the stored key",
+		},
+		"a ledger creation": {
+			row: model.EventOutbox{
+				EventType: "ledger.created", AggregateID: ledger,
+				LedgerID: ledger, PartitionKey: ledger, Topic: "blnk.system",
+			},
+			want: ledger,
+			why:  "the event announces the ledger it is keyed on",
+		},
+
+		// --- NO LEDGER: the approved fallback, one row per documented family ---
+		"a rejected transaction, which never loaded its balances": {
+			row: model.EventOutbox{
+				EventType: "transaction.rejected", AggregateID: transaction,
+				PartitionKey: balance, Topic: "blnk.transactions",
+			},
+			want: balance,
+			why: "the rejection path knows no ledger — frequently that is why the transaction was " +
+				"rejected — so the stored source-balance key carries per-aggregate ordering instead",
+		},
+		"an identity, which is not ledger-scoped": {
+			row: model.EventOutbox{
+				EventType: "identity.created", AggregateID: identity,
+				PartitionKey: identity, Topic: "blnk.identities",
+			},
+			want: identity,
+			why:  "one identity can be referenced by balances in several ledgers, so it has no single ledger",
+		},
+		"a bulk batch summary, which may span several ledgers": {
+			row: model.EventOutbox{
+				EventType: "bulk_transaction.applied", AggregateID: batch,
+				PartitionKey: batch, Topic: "blnk.transactions",
+			},
+			want: batch,
+			why:  "the batch id is what makes one batch's progress events mutually ordered",
+		},
+		"a system error, which has no aggregate at all": {
+			row: model.EventOutbox{
+				EventType: "system.error", AggregateID: "system.error",
+				PartitionKey: "system.error", Topic: "blnk.system",
+			},
+			want: "system.error",
+			why:  "keying on the event type gives the error stream one partition and therefore a total order",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := PublishRequestFromOutbox(testCase.row, 1)
+
+			assert.Equal(t, testCase.want, resolvePartitionKey(request), testCase.why)
+			assert.NotEmpty(t, partitionKeyBytes(resolvePartitionKey(request)),
+				"no published family may be written unkeyed: an absent key is scattered round-robin "+
+					"and destroys ordering with nothing in the data to show it")
+		})
+	}
+}
+
 // TestPublishRequestFromOutbox_OrdersTwoAggregatesSharingOneKeyOntoOneKey is the property
 // requirement V-6 is decided by, expressed at the seam this file owns.
 //
@@ -996,7 +1252,8 @@ func TestPublishRequestFromOutbox_OrdersTwoAggregatesSharingOneKeyOntoOneKey(t *
 		"two events serialised against each other in the outbox must be keyed identically, or the "+
 			"broker places them independently and the ordering the claim query paid for is lost")
 	assert.Equal(t, outboxSourceBalanceID, firstKey,
-		"and the shared key is the source balance, matching the transaction queue's own sharding")
+		"and the shared key is the source balance, which is what a transaction payload yields on "+
+			"its own; production supplies the ledger and keys on that")
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,12 +1300,31 @@ const publisherConstructionBudget = 2 * time.Second
 // documentation and routed nowhere. A dial to it hangs until it times out rather than
 // failing fast, which is precisely what makes it a useful probe: if construction dialled,
 // the construction budget above would be exceeded.
-const publisherBlackholeBroker = "198.51.100.1:9092"
+//
+// RFC 1918 PRIVATE SPACE RATHER THAN RFC 5737 TEST-NET, and the change is not cosmetic.
+// This was 198.51.100.1, which is a PUBLIC address — and plaintext to a broker outside
+// Blnk's own network is now refused outright by requireLocalBrokersForPlaintext, because
+// KAFKA_INSECURE_LOCAL_DEV asserts the broker is local and nothing used to check that.
+// A test that reached a constructed publisher over an acknowledged-plaintext transport to
+// a public address was therefore exercising a configuration the transport must reject.
+//
+// 10.255.255.1 keeps every property this constant was chosen for — it is routed nowhere
+// in a default environment, so a dial hangs rather than failing fast — while being inside
+// private space, which is what the locality check recognises. The probe is unchanged; only
+// the address family is.
+const publisherBlackholeBroker = "10.255.255.1:9092"
 
-// publisherUnresolvableBroker uses the .invalid top-level domain, which RFC 2606 reserves
-// so that it is guaranteed never to resolve. If construction resolved names, this address
-// would either fail construction outright or make it wait on a DNS timeout.
-const publisherUnresolvableBroker = "broker.publisher-test.invalid:9092"
+// publisherUnresolvableBroker is a single-label name that no search domain resolves. If
+// construction resolved names, this address would either fail construction outright or
+// make it wait on a resolver timeout.
+//
+// It was broker.publisher-test.invalid, using the RFC 2606 .invalid TLD. That guaranteed
+// non-resolution but is a QUALIFIED name outside Blnk's network, which acknowledged
+// plaintext no longer reaches — see publisherBlackholeBroker above. An unqualified
+// single-label name is what a Compose service name and an in-cluster Kubernetes Service
+// name both are, so the locality check treats it as internal, and one that deliberately
+// names nothing still fails to resolve. Both properties the constant needs, retained.
+const publisherUnresolvableBroker = "broker-publisher-test-does-not-exist:9092"
 
 // publisherLedgerID and publisherOtherLedgerID are two ledger identifiers, which are the
 // values the message key carries. Requirement R-6 partitions by ledger, and
@@ -1091,6 +1367,12 @@ type publisherProducedRecord struct {
 	Key   []byte
 	Value []byte
 	Time  time.Time
+
+	// Headers are captured because the TRACE CONTEXT travels as record headers rather than in
+	// the value — deliberately, so the byte-equality guarantees over the value are unaffected.
+	// A double that dropped them would let the header injection be removed with every existing
+	// assertion still passing.
+	Headers []publisherProducedHeader
 }
 
 // publisherProducedBatch is one produce request as the broker would have received it.
@@ -1323,8 +1605,43 @@ func publisherDrainRecords(reader protocol.RecordReader) ([]publisherProducedRec
 			return nil, err
 		}
 
-		records = append(records, publisherProducedRecord{Key: key, Value: value, Time: record.Time})
+		headers := make([]publisherProducedHeader, 0, len(record.Headers))
+		for _, header := range record.Headers {
+			headers = append(headers, publisherProducedHeader{
+				Key:   header.Key,
+				Value: string(header.Value),
+			})
+		}
+
+		records = append(records, publisherProducedRecord{
+			Key:     key,
+			Value:   value,
+			Time:    record.Time,
+			Headers: headers,
+		})
 	}
+}
+
+// publisherProducedHeader is one record header as the transport saw it, with the value rendered
+// as a string because every header this pipeline sets is W3C ASCII text.
+type publisherProducedHeader struct {
+	Key   string
+	Value string
+}
+
+// headerValue returns the value of a captured record header, and whether it was present.
+//
+// Presence is returned separately from the value because ABSENT and EMPTY are different
+// outcomes here: an untraced publish must set no header at all, and an empty header value
+// would give a consumer an invalid span context to extract rather than nothing to extract.
+func (r publisherProducedRecord) headerValue(key string) (string, bool) {
+	for _, header := range r.Headers {
+		if header.Key == key {
+			return header.Value, true
+		}
+	}
+
+	return "", false
 }
 
 // producedBatches returns a copy of everything produced so far.
@@ -1606,43 +1923,55 @@ func publisherAttributeMap(set attribute.Set) map[string]string {
 	return attributes
 }
 
-// publisherInstruments is the four instruments one publish records.
+// publisherInstruments is the five instruments a publish can reach.
 //
-// captureToDispatch is the fourth, and it is the one acceptance criterion V-1 is read from, so
-// a harness that omitted it would leave the criterion's data source untested — which is exactly
-// how it came to be declared, bucketed and documented while nothing recorded it.
+// captureToDispatch is the one acceptance criterion V-1 is read from, so a harness that omitted
+// it would leave the criterion's data source untested — which is exactly how it came to be
+// declared, bucketed and documented while nothing recorded it.
+//
+// published is captured even though the PUBLISHER never records it, and that is the point: it is
+// how "the acknowledgement is not the delivery" is asserted rather than assumed. The publisher
+// used to increment it on the broker's acknowledgement, one step ahead of its own contract; the
+// relay owns it now, after the transition that makes the delivery durable. Capturing it here
+// means a regression that moves the increment back would fail a test instead of quietly
+// double-counting republished events.
 type publisherInstruments struct {
 	published         *publisherRecordedCounter
+	acknowledgements  *publisherRecordedCounter
 	attempts          *publisherRecordedCounter
 	duration          *publisherRecordedHistogram
 	captureToDispatch *publisherRecordedHistogram
 }
 
-// publisherCaptureInstruments swaps the four publish instruments for recorders and
+// publisherCaptureInstruments swaps the five publish instruments for recorders and
 // restores the originals when the test ends.
 func publisherCaptureInstruments(t *testing.T) *publisherInstruments {
 	t.Helper()
 
 	captured := &publisherInstruments{
 		published:         &publisherRecordedCounter{},
+		acknowledgements:  &publisherRecordedCounter{},
 		attempts:          &publisherRecordedCounter{},
 		duration:          &publisherRecordedHistogram{},
 		captureToDispatch: &publisherRecordedHistogram{},
 	}
 
 	publishedOriginal := metrics.EventsPublishedTotal
+	acknowledgementsOriginal := metrics.EventBrokerAcknowledgementsTotal
 	attemptsOriginal := metrics.EventPublishAttemptsTotal
 	durationOriginal := metrics.EventPublishDuration
 	captureOriginal := metrics.EventCaptureToDispatchDuration
 
 	t.Cleanup(func() {
 		metrics.EventsPublishedTotal = publishedOriginal
+		metrics.EventBrokerAcknowledgementsTotal = acknowledgementsOriginal
 		metrics.EventPublishAttemptsTotal = attemptsOriginal
 		metrics.EventPublishDuration = durationOriginal
 		metrics.EventCaptureToDispatchDuration = captureOriginal
 	})
 
 	metrics.EventsPublishedTotal = captured.published
+	metrics.EventBrokerAcknowledgementsTotal = captured.acknowledgements
 	metrics.EventPublishAttemptsTotal = captured.attempts
 	metrics.EventPublishDuration = captured.duration
 	metrics.EventCaptureToDispatchDuration = captured.captureToDispatch
@@ -1847,14 +2176,14 @@ func TestEventPublisher_HoldsOneWriterPerOwnedTopic(t *testing.T) {
 		"exactly one writer per owned topic: a missing one forces lazy creation onto the publish "+
 			"path, an extra one holds connections for a destination nothing publishes to")
 
-	// The three category topics requirement R-6 names, the grantable ledgers category
+	// The three category topics requirement R-6 names, the internal system category
 	// ledger.created made necessary, the one internal category system-error and
 	// unrecognised events made necessary, and the five `.dlt` siblings requirement R-5
 	// names. Written out as literals so a renamed topic or a dropped dead-letter sibling
 	// fails here.
 	for _, topic := range []string{
-		"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers", "blnk.system",
-		"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.ledgers.dlt", "blnk.system.dlt",
+		"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system",
+		"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.system.dlt",
 	} {
 		writer, present := writers[topic]
 		require.True(t, present, "topic %q must have its own writer", topic)
@@ -2386,9 +2715,9 @@ func TestNoOpPublisher_IsSelectedWhenNoBrokersAreConfigured(t *testing.T) {
 //
 // The two broker addresses are chosen so that eagerness cannot hide. broker.publisher-test.invalid
 // uses the .invalid TLD, which RFC 2606 guarantees never resolves, so a construction that
-// resolved names would fail or wait on a resolver timeout. 198.51.100.1 is TEST-NET-2 from RFC
-// 5737, routed nowhere, so a construction that dialled would hang until the transport's
-// five-second dial timeout — well past the budget asserted here. The writer statistics are then
+// resolved names would fail or wait on a resolver timeout. publisherBlackholeBroker is RFC 1918
+// private space, routed nowhere in a default environment, so a construction that dialled would
+// hang until the transport's five-second dial timeout — well past the budget asserted here. The writer statistics are then
 // read as a direct statement of the same fact: zero dials, zero writes, zero errors.
 func TestEventPublisher_ConstructionPerformsNoDialAndNoNameResolution(t *testing.T) {
 	kafkaConfig := config.KafkaConfig{
@@ -2603,11 +2932,11 @@ func TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt(t *testing.T)
 		})
 
 		require.Error(t, err)
-		assert.Equal(t, model.PublishStatusFailed, result.Status,
-			"the attempt that spent the budget reports failed, not retrying: nothing further will "+
-				"be tried and reporting otherwise hides a stuck event among the busy ones. It is "+
-				"NOT dead_lettered either — that value means an acknowledged write to a `.dlt` "+
-				"sibling, which this attempt did not perform and may never lead to")
+		assert.Equal(t, model.PublishStatusRetrying, result.Status,
+			"every failed attempt reports retrying: requirement R-3 fixes the outcome vocabulary "+
+				"at three values and it is a published metric label domain. It is NOT dead_lettered "+
+				"— that value means an acknowledged write to a `.dlt` sibling, which this attempt "+
+				"did not perform and may never lead to")
 		assert.True(t, result.Transient,
 			"the failure still LOOKED recoverable, which is a different question from whether "+
 				"anything more will be attempted")
@@ -2632,11 +2961,15 @@ func TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt(t *testing.T)
 		})
 
 		require.Error(t, err)
-		assert.Equal(t, model.PublishStatusFailed, result.Status,
-			"a permanent failure is an attempt outcome of failed. dead_lettered is reserved for an "+
-				"acknowledged write to a `.dlt` sibling, so reporting it here made the attempts "+
-				"counter assert one dead letter per attempt for a single real one — and five for "+
-				"events that produced none at all")
+		assert.Equal(t, model.PublishStatusRetrying, result.Status,
+			"the status stays inside the three-value vocabulary even for a permanent failure; the "+
+				"permanence is carried on Classified and Transient, asserted below. dead_lettered "+
+				"is reserved for an acknowledged write to a `.dlt` sibling, so reporting it here "+
+				"made the attempts counter assert one dead letter per attempt for a single real "+
+				"one — and five for events that produced none at all")
+		assert.True(t, result.Classified,
+			"the publisher reached a verdict, and that marker is what authorises PermanentFailure "+
+				"to end this event's life early")
 		assert.False(t, result.Transient,
 			"an unauthorised principal is not a condition another attempt can change")
 		assert.False(t, result.Retryable,
@@ -2661,9 +2994,12 @@ func TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt(t *testing.T)
 // defect as a missing one, since a histogram multiplies its label cardinality by its bucket
 // count:
 //
-//   - EventsPublishedTotal is the DENOMINATOR of the dead-letter rate that acceptance criterion
-//     V-3 is stated against (dead-lettered over published, under 0.1%). If it is not incremented
-//     on a successful publish, that rate is undefined while every dashboard still renders.
+//   - EventBrokerAcknowledgementsTotal is ACKNOWLEDGED BROKER WRITE THROUGHPUT. It is
+//     incremented here, on the acknowledgement, which is before the outbox row is moved — so a
+//     redelivery after a crash increments it a second time for one event. That is the right
+//     reading of write throughput and the wrong reading of delivery, which is why the per-event
+//     counts live at the relay's durable transitions. It also carries PURPOSE, because a replay
+//     and a dead-letter write are real acknowledgements and only this instrument counts them.
 //   - EventPublishAttemptsTotal makes retry pressure visible independently of delivery volume,
 //     and its outcome vocabulary is the model.PublishStatus values, reused rather than
 //     redeclared so the code and the label set cannot drift.
@@ -2671,6 +3007,16 @@ func TestEventPublisher_PublishResultReportsTheOutcomeOfTheAttempt(t *testing.T)
 //     instrument's declaration states that query as {attempt="1",outcome="dispatched"}. Both
 //     attributes must therefore be present, or the population the target is stated over cannot
 //     be selected at all.
+//
+// EventsPublishedTotal and EventsDispatchedTotal are deliberately NOT among them, and their
+// absence is asserted rather than merely unmentioned. That counter's contract — stated on its declaration in internal/metrics and
+// published in docs/metrics.md — is one increment per ORIGINAL event whose delivery is DURABLY
+// RECORDED, and a broker acknowledgement is not that: the outbox row can still fail to be marked,
+// in which case the same original event is published again. Counting here made the series a count
+// of broker WRITES, which inflated the V-1 throughput figure and understated the V-3 dead-letter
+// rate on exactly the runs where both matter. The increment therefore belongs to the relay's
+// dispatched transition, which is conditional on the claim token and so succeeds once per event;
+// TestEventRelay_CountsOneSettledPublicationPerOriginalEvent covers it there.
 //
 // The envelope-only Publish method is used deliberately: it submits a request with no topic, no
 // key, no attempt and no purpose, so the recorded attributes are the ones the fallbacks produce
@@ -2683,22 +3029,38 @@ func TestEventPublisher_RecordsThePublishInstruments(t *testing.T) {
 	event := publisherEvent(model.EventTypeTransactionApplied, "txn_publisher_metrics", publisherPayload)
 	require.NoError(t, publisher.Publish(context.Background(), event))
 
-	published := instruments.published.snapshot()
-	require.Len(t, published, 1,
-		"a successful publish must increment the published-events counter exactly once; without it "+
-			"the dead-letter rate has no denominator")
-	assert.EqualValues(t, 1, published[0].value)
+	acknowledgements := instruments.acknowledgements.snapshot()
+	require.Len(t, acknowledgements, 1,
+		"an acknowledged write must increment the write counter exactly once; without it there is "+
+			"no measure of broker throughput and no numerator for the redelivery factor")
+	assert.EqualValues(t, 1, acknowledgements[0].value)
 	assert.Equal(t, map[string]string{
 		"topic":      "blnk.transactions",
 		"event_type": "transaction.applied",
-	}, published[0].attributes,
-		"published events are attributed by topic and event type, and by nothing else")
+		"purpose":    string(PublishPurposeOriginal),
+	}, acknowledgements[0].attributes,
+		"writes are attributed by topic, event type and purpose — topic and event type being the "+
+			"SAME pair EventsPublishedTotal carries, which is what makes the two joinable into the "+
+			"redelivery factor, and purpose being what keeps a replay or a dead-letter write out of "+
+			"that division")
+
+	assert.Zero(t, instruments.published.total(),
+		"and the PER-EVENT counter is not touched here. Its contract is one increment per original "+
+			"event whose Kafka leg is durably recorded, which is a fact only the relay's marking "+
+			"transition establishes — counting it on the acknowledgement is what made it a count of "+
+			"writes")
 
 	attempts := instruments.attempts.snapshot()
 	require.Len(t, attempts, 1, "exactly one attempt was made, so exactly one is counted")
 	assert.EqualValues(t, 1, attempts[0].value)
-	assert.Equal(t, map[string]string{"outcome": string(model.PublishStatusDispatched)}, attempts[0].attributes,
-		"the outcome vocabulary is model.PublishStatus, reused rather than redeclared")
+	assert.Equal(t, map[string]string{
+		"outcome":  string(model.PublishStatusDispatched),
+		"terminal": publishTerminalFalse,
+	}, attempts[0].attributes,
+		"the outcome vocabulary is model.PublishStatus, reused rather than redeclared, and the "+
+			"terminal dimension accompanies it on every attempt — a success is never terminal, and "+
+			"recording the pair unconditionally is what keeps {outcome=\"retrying\",terminal=\"true\"} "+
+			"a complete answer to \"which events are stuck\"")
 
 	duration := instruments.duration.snapshot()
 	require.Len(t, duration, 1)
@@ -2725,9 +3087,9 @@ func TestEventPublisher_RecordsThePublishInstruments(t *testing.T) {
 //     separable.
 //   - A REPLAY is an operator-triggered re-publication of a dead-lettered event. It is not part
 //     of any retry sequence — the sequence it belonged to ended — so it carries the fixed
-//     "replay" token instead of a number, and it must NOT increment the published-events
-//     counter: doing so would make the dead-letter rate depend on how much triage happened that
-//     day rather than on how the pipeline behaved.
+//     "replay" token instead of a number. It must never reach the published-events counter
+//     either, which it cannot: no publish increments that counter, and the relay's settlement
+//     is the only writer.
 //   - A FAILED attempt is recorded on the duration histogram too, under its own outcome. A broker
 //     that times out is precisely when latency data matters, and the outcome attribute is what
 //     keeps those observations out of the success population.
@@ -2747,11 +3109,14 @@ func TestEventPublisher_KeepsRetriedAndReplayedPublishesOutOfTheFirstAttemptPopu
 		require.Len(t, duration, 1)
 		assert.Equal(t, "3", duration[0].attributes["attempt"],
 			"a third attempt must be reported as such, so first-attempt latency stays readable alone")
-		assert.EqualValues(t, 1, instruments.published.total(),
-			"a retried delivery is still a first delivery of the event, so it counts once")
+		assert.Zero(t, instruments.published.total(),
+			"a retried delivery is still a first delivery of the event and is counted exactly once — "+
+				"but on the relay's durable transition, not here. An acknowledgement whose "+
+				"bookkeeping then fails is followed by another publish, and counting both is how "+
+				"one event became two")
 	})
 
-	t.Run("a replay is neither counted as a delivery nor labelled with an attempt number", func(t *testing.T) {
+	t.Run("a replay is neither counted as original throughput nor labelled with an attempt number", func(t *testing.T) {
 		instruments := publisherCaptureInstruments(t)
 		publisher := publisherWithFakeTransport(t, newPublisherFakeTransport())
 
@@ -2763,7 +3128,8 @@ func TestEventPublisher_KeepsRetriedAndReplayedPublishesOutOfTheFirstAttemptPopu
 		})
 
 		assert.Zero(t, instruments.published.total(),
-			"a replay must not inflate the denominator of the dead-letter rate")
+			"a replay is triage, not throughput: counting it here would make measured write "+
+				"throughput depend on how much dead-letter triage happened that day")
 
 		duration := instruments.duration.snapshot()
 		require.Len(t, duration, 1)
@@ -2776,7 +3142,7 @@ func TestEventPublisher_KeepsRetriedAndReplayedPublishesOutOfTheFirstAttemptPopu
 				"re-delivery belongs")
 	})
 
-	t.Run("a dead-letter write is kept out of the delivery count as well", func(t *testing.T) {
+	t.Run("a dead-letter write is kept out of the throughput count as well", func(t *testing.T) {
 		instruments := publisherCaptureInstruments(t)
 		publisher := publisherWithFakeTransport(t, newPublisherFakeTransport())
 
@@ -2789,7 +3155,15 @@ func TestEventPublisher_KeepsRetriedAndReplayedPublishesOutOfTheFirstAttemptPopu
 		})
 
 		assert.Zero(t, instruments.published.total(),
-			"counting a dead-letter write as a delivery would count one event twice")
+			"a dead-letter write is the same event's second trip to a broker, so counting it as "+
+				"original throughput would count one event's arrival twice")
+
+		acknowledgements := instruments.acknowledgements.snapshot()
+		require.Len(t, acknowledgements, 1,
+			"the `.dlt` write was acknowledged, and that is traffic the broker accepted")
+		assert.Equal(t, string(PublishPurposeDeadLetter), acknowledgements[0].attributes["purpose"])
+		assert.Equal(t, "blnk.transactions.dlt", acknowledgements[0].attributes["topic"],
+			"attributed to the sibling it actually landed on, not the topic it came from")
 
 		duration := instruments.duration.snapshot()
 		require.Len(t, duration, 1)
@@ -2809,7 +3183,8 @@ func TestEventPublisher_KeepsRetriedAndReplayedPublishesOutOfTheFirstAttemptPopu
 		})
 		require.Error(t, err)
 
-		assert.Zero(t, instruments.published.total(), "nothing was delivered, so nothing is counted as delivered")
+		assert.Zero(t, instruments.published.total(),
+			"no write was acknowledged, so no write is counted")
 
 		attempts := instruments.attempts.snapshot()
 		require.Len(t, attempts, 1)
@@ -2892,8 +3267,11 @@ func TestEventPublisher_ConcurrentPublishesShareOneWriterPerTopic(t *testing.T) 
 	assert.Len(t, transport.producedBatches(), goroutines*perGoroutine,
 		"every publish must reach the broker exactly once: a lost one is a lost event and a "+
 			"duplicated one is a double delivery")
-	assert.EqualValues(t, goroutines*perGoroutine, instruments.published.total(),
-		"and each must be counted once, which also exercises the shared instruments under load")
+	assert.EqualValues(t, goroutines*perGoroutine, instruments.attempts.total(),
+		"and each must be counted once on the ATTEMPTS counter, which also exercises the shared "+
+			"instruments under load. The published-events counter is deliberately not read here: "+
+			"the publisher does not touch it, because a delivery is counted on the relay's durable "+
+			"transition rather than at the acknowledgement")
 
 	publisher.mu.RLock()
 	writers := len(publisher.writers)
@@ -3170,7 +3548,9 @@ func TestPublishToTopic_ClassifiesTheTwoWriterFailuresDifferently(t *testing.T) 
 		require.ErrorIs(t, err, ErrTopicNotOwned)
 		assert.False(t, result.Transient,
 			"a destination outside Blnk's namespace is not a condition another attempt can change")
-		assert.Equal(t, model.PublishStatusFailed, result.Status)
+		assert.Equal(t, model.PublishStatusRetrying, result.Status,
+			"the status stays inside the three-value vocabulary; the permanence is on Classified")
+		assert.True(t, result.Classified)
 		assert.False(t, result.Retryable)
 		assert.True(t, result.PermanentFailure(),
 			"so the relay takes the row straight to its terminal state on this attempt")
@@ -3185,6 +3565,13 @@ func TestPublishToTopic_ClassifiesTheTwoWriterFailuresDifferently(t *testing.T) 
 // "not permanent" — otherwise the first failure of any such implementation would dead-letter
 // an event that a retry would have delivered. The predicate therefore requires all three
 // facts, and the zero value is the row of the table that matters most.
+//
+// The third fact is PublishResult.Classified. It used to be `Status ==
+// model.PublishStatusFailed`, which tied this safety check to a published metric label domain
+// that requirement R-3 fixes at three values; the check is unchanged and only the field it
+// reads moved. The "a failed attempt with no classification" row below is the one that pins
+// the difference: it carries the same status a classified permanent failure now carries, and
+// must still read as non-permanent.
 func TestPublishResult_PermanentFailureIsAffirmative(t *testing.T) {
 	cause := errors.New("publisher test: refused")
 
@@ -3193,15 +3580,23 @@ func TestPublishResult_PermanentFailureIsAffirmative(t *testing.T) {
 		want   bool
 	}{
 		"a classified permanent failure": {
-			result: PublishResult{Status: model.PublishStatusFailed, Transient: false, Err: cause},
+			result: PublishResult{Status: model.PublishStatusRetrying, Classified: true, Transient: false, Err: cause},
 			want:   true,
 		},
 		"a transient failure that spent the budget": {
-			result: PublishResult{Status: model.PublishStatusFailed, Transient: true, Err: cause},
+			result: PublishResult{Status: model.PublishStatusRetrying, Classified: true, Transient: true, Err: cause},
+			want:   false,
+		},
+		"a failed attempt with no classification, which is the unsafe reading this guards": {
+			// The SAME status a classified permanent failure carries, and the same
+			// zero-valued Transient — so only the missing Classified marker separates the
+			// two. Without that marker, an implementation returning a bare error and an
+			// otherwise-empty result would have every failure dead-lettered on attempt one.
+			result: PublishResult{Status: model.PublishStatusRetrying, Err: cause},
 			want:   false,
 		},
 		"a retryable failure": {
-			result: PublishResult{Status: model.PublishStatusRetrying, Transient: true, Err: cause},
+			result: PublishResult{Status: model.PublishStatusRetrying, Classified: true, Transient: true, Err: cause},
 			want:   false,
 		},
 		"a success": {
@@ -3220,9 +3615,163 @@ func TestPublishResult_PermanentFailureIsAffirmative(t *testing.T) {
 			result: PublishResult{Status: model.PublishStatusDeadLettered, Err: cause},
 			want:   false,
 		},
+		"a classification with no error, which states nothing about a failure": {
+			result: PublishResult{Status: model.PublishStatusRetrying, Classified: true, Transient: false},
+			want:   false,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			assert.Equal(t, testCase.want, testCase.result.PermanentFailure())
 		})
 	}
+}
+
+// TestIsPermanentPublishError_IsAffirmativeAndNotTheNegationOfTransient pins the property that
+// makes the relay's terminal decision safe: an error nothing classified is NEITHER transient
+// nor permanent.
+//
+// The two predicates are deliberately not exhaustive, and the third state is the one every
+// unrecognised failure occupies. Asserting the negation relationship is exactly what this test
+// must NOT do — `!IsTransientPublishError(err)` is true for a bare error, and reading that as
+// permanence is what dead-lettered events on their first attempt with four attempts unspent.
+// So the bare-error rows below assert false on BOTH predicates, which is the invariant a future
+// refactor would have to break in order to reintroduce the defect.
+func TestIsPermanentPublishError_IsAffirmativeAndNotTheNegationOfTransient(t *testing.T) {
+	cause := errors.New("publisher test: the underlying failure")
+
+	for name, testCase := range map[string]struct {
+		err           error
+		wantPermanent bool
+		wantTransient bool
+	}{
+		"a PublishError classified as permanent": {
+			err:           &PublishError{Topic: "blnk.transactions", Err: cause, Transient: false},
+			wantPermanent: true,
+			wantTransient: false,
+		},
+		"a PublishError classified as transient": {
+			err:           &PublishError{Topic: "blnk.transactions", Err: cause, Transient: true},
+			wantPermanent: false,
+			wantTransient: true,
+		},
+		"a permanent PublishError reached through a wrapper": {
+			err: fmt.Errorf("relaying: %w",
+				&PublishError{Topic: "blnk.balances", Err: cause, Transient: false}),
+			wantPermanent: true,
+			wantTransient: false,
+		},
+		"a bare error this pipeline never classified": {
+			err:           cause,
+			wantPermanent: false,
+			wantTransient: false,
+		},
+		"a wrapped bare error": {
+			err:           fmt.Errorf("relaying: %w", cause),
+			wantPermanent: false,
+			wantTransient: false,
+		},
+		"a context deadline that did not come through the publish path": {
+			err:           context.DeadlineExceeded,
+			wantPermanent: false,
+			wantTransient: false,
+		},
+		"no error at all": {
+			err:           nil,
+			wantPermanent: false,
+			wantTransient: false,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, testCase.wantPermanent, IsPermanentPublishError(testCase.err),
+				"permanence must be affirmative: only a PublishError classified as "+
+					"non-recoverable reports true")
+			assert.Equal(t, testCase.wantTransient, IsTransientPublishError(testCase.err))
+
+			if !testCase.wantPermanent && !testCase.wantTransient && testCase.err != nil {
+				assert.False(t,
+					IsPermanentPublishError(testCase.err) == !IsTransientPublishError(testCase.err),
+					"an unclassified error must be neither, so the two predicates must NOT be "+
+						"each other's negation; treating them as such is what dead-letters a "+
+						"retryable event on its first attempt")
+			}
+		})
+	}
+}
+
+// KAFKA_INSECURE_LOCAL_DEV asserts that the broker is a local development broker.
+// Nothing used to check that, so the flag disabled encryption to ANY broker — and the
+// local stack defaulted it on, which meant repointing KAFKA_BROKERS at a remote host
+// was enough to put ledger amounts, identity records and the SASL/SCRAM handshake on
+// the public internet in cleartext, with a log warning as the only trace.
+//
+// The local cases matter as much as the remote ones here. A guard that refused the
+// values the local stack actually uses would be reverted within a day, so
+// "kafka:29092" — a Compose service name, and the same single-label shape an in-cluster
+// Kubernetes Service has — is pinned alongside the loopback forms.
+func TestRequireLocalBrokersForPlaintext_ScopesTheAcknowledgementToLocalBrokers(t *testing.T) {
+	t.Parallel()
+
+	t.Run("local brokers are permitted", func(t *testing.T) {
+		t.Parallel()
+
+		for _, tc := range []struct {
+			name    string
+			brokers []string
+		}{
+			{"the host-side loopback name the .env uses", []string{"localhost:9092"}},
+			{"an IPv4 loopback literal", []string{"127.0.0.1:9092"}},
+			{"an IPv6 loopback literal", []string{"[::1]:9092"}},
+			{"an IPv4-mapped loopback literal", []string{"[::ffff:127.0.0.1]:9092"}},
+			{"the Compose service name", []string{"kafka:29092"}},
+			{"a bare host with no port", []string{"kafka"}},
+			{"an .internal zone name", []string{"kafka.internal:9092"}},
+			{"an mDNS .local name", []string{"broker.local:9092"}},
+			{"several local brokers", []string{"localhost:9092", "kafka:29092"}},
+			{"no brokers at all", nil},
+			{"a blank entry", []string{"  "}},
+		} {
+			tc := tc
+
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				assert.NoError(t, requireLocalBrokersForPlaintext(tc.brokers),
+					"%v is local, so the acknowledgement covers it; refusing it would break "+
+						"the local stack and get this guard reverted", tc.brokers)
+			})
+		}
+	})
+
+	t.Run("remote brokers are refused", func(t *testing.T) {
+		t.Parallel()
+
+		for _, tc := range []struct {
+			name    string
+			brokers []string
+		}{
+			{"a public FQDN", []string{"kafka.example.com:9092"}},
+			{"a public IPv4 literal", []string{"203.0.113.10:9092"}},
+			{"a managed-Kafka endpoint", []string{"b-1.msk.us-east-1.amazonaws.com:9096"}},
+			{"one remote among locals", []string{"localhost:9092", "kafka.example.com:9092"}},
+		} {
+			tc := tc
+
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				err := requireLocalBrokersForPlaintext(tc.brokers)
+				require.Error(t, err,
+					"%v is not local, so plaintext must be refused rather than warned about",
+					tc.brokers)
+
+				// The message has to name the offending broker: an operator reading
+				// "plaintext refused" with a multi-broker list has no way to tell which
+				// entry is the problem.
+				assert.Contains(t, err.Error(), "KAFKA_INSECURE_LOCAL_DEV",
+					"the refusal must name the setting whose claim was not met")
+				assert.Contains(t, err.Error(), "KAFKA_TLS_ENABLED",
+					"the refusal must name the remedy, not only the problem")
+			})
+		}
+	})
 }

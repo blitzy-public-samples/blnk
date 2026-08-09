@@ -21,8 +21,6 @@ import (
 	"go/parser"
 	"go/token"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -162,6 +160,44 @@ func qualifiedCallCount(file *ast.File, qualifier, name string) int {
 	return count
 }
 
+// qualifiedSelections returns every name the file selects off one package qualifier, whether
+// or not the selection is itself a call.
+//
+// It answers a question the two helpers above cannot: "which members of this package does
+// this file touch at all?". selectorCallNames sees `metrics.EventsDispatchedTotal.Add(...)`
+// as a call named Add, because that is what it is, and qualifiedCallCount would need the
+// forbidden name spelled out one at a time. Enumerating the selections instead lets a rule be
+// stated as an ALLOWLIST — this file may reference exactly these members and no others —
+// which is the only phrasing that stays correct when a new instrument is added to the package.
+//
+// A name in a comment or a string is not a selection and is absent from the map, for the same
+// reason it is absent from selectorCallNames.
+//
+// Parameters:
+//   - file *ast.File: the parsed file.
+//   - qualifier string: the identifier before the dot, e.g. "metrics".
+//
+// Returns:
+//   - map[string]int: reference count keyed by the selected name. Empty, never nil.
+func qualifiedSelections(file *ast.File, qualifier string) map[string]int {
+	names := make(map[string]int)
+
+	ast.Inspect(file, func(node ast.Node) bool {
+		selector, isSelector := node.(*ast.SelectorExpr)
+		if !isSelector {
+			return true
+		}
+
+		if base, isIdent := selector.X.(*ast.Ident); isIdent && base.Name == qualifier {
+			names[selector.Sel.Name]++
+		}
+
+		return true
+	})
+
+	return names
+}
+
 // identifierUses returns how many times the file REFERS to an identifier of the given name,
 // in any position — a selector's field name, a bare identifier, a key.
 //
@@ -282,44 +318,6 @@ func callsGuardedBy(file *ast.File, guardQualifier, guardName string) map[string
 	})
 
 	return guarded
-}
-
-// importsPackage reports whether the file imports a package whose path ends in the given
-// suffix.
-//
-// This is the sharpest instrument available for "this file owns none of that", and it is
-// preferred over a name match wherever the rule is about a whole package. A file that does not
-// import internal/metrics cannot record an instrument at all — no spelling, no alias, no
-// helper — whereas a rule phrased as "no call named Add" is satisfied by luck and violated by
-// sync.WaitGroup.Add, time.Time.Add and errgroup alike. Naming the package instead makes the
-// assertion both complete and incapable of a false positive.
-//
-// A suffix rather than a full path so a caller writes "internal/metrics" instead of repeating
-// the module path, which would then have to change with it.
-//
-// Parameters:
-//   - file *ast.File: the parsed file.
-//   - suffix string: the trailing portion of the import path, without quotes.
-//
-// Returns:
-//   - bool: true when some import path ends with the suffix.
-func importsPackage(file *ast.File, suffix string) bool {
-	for _, specification := range file.Imports {
-		if specification.Path == nil {
-			continue
-		}
-
-		path, err := strconv.Unquote(specification.Path.Value)
-		if err != nil {
-			continue
-		}
-
-		if path == suffix || strings.HasSuffix(path, "/"+suffix) {
-			return true
-		}
-	}
-
-	return false
 }
 
 // wrapStatementsAsDecl puts a block into a throwaway function declaration so it can be

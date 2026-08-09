@@ -114,7 +114,7 @@ import (
 // instead surface as silently transposed fields.
 const eventSubscriberColumns = `id, subscriber_id, name, kafka_principal, consumer_group_id, authorized_topics, ` +
 	`partition_key_prefix, credential_reference, credential_issued_at, webhook_url, migrated_at, ` +
-	`revocation_pending_at, created_at, updated_at`
+	`revocation_pending_at, revocation_failed_at, credential_orphaned_at, created_at, updated_at`
 
 // Page-size bounds for the registry listing. The default keeps an unqualified
 // request cheap; the maximum stops a caller turning a management endpoint into a
@@ -138,18 +138,36 @@ const (
 	uniqueViolationPostgresCode = "unique_violation"
 )
 
-// The key-scope CHECK constraint (sql/1781248920.sql) and the driver's name for a
-// CHECK failure.
+// The retired key-scope CHECK constraint (added by sql/1781248920.sql, dropped by
+// sql/1781248930.sql) and the driver's name for a CHECK failure.
 //
-// The constraint forbids a row recording a partition key prefix while it also holds a
-// credential reference, because Kafka cannot enforce a key scope and such a row states
-// a boundary that does not exist. EventSubscriberService refuses that combination from
-// both directions, so reaching the constraint means something bypassed the service — a
-// data migration, a hand-written UPDATE, a future code path. It is named here for the
-// same reason the two unique indexes are: so the classifier answers with the meaning
-// the schema intends instead of reporting a server fault for a caller error.
+// The constraint forbade a row recording a partition key prefix while it also held a
+// credential reference. That has been reversed deliberately: a recorded prefix is a
+// boundary the CONSUMER keeps, so forbidding the combination denied the subscriber a
+// mandatory capability instead of narrowing what it could read. The service now permits
+// it, and the migration removes the constraint — so on a migrated database the branch
+// that reads these two names is unreachable.
+//
+// They are named here anyway, and mapped deliberately, for the database that has NOT been
+// migrated: there the write is refused by a constraint no request can satisfy, and the
+// error has to name the migration rather than look like a defect in Blnk.
 const (
-	keyScopeCheckConstraint    = "event_subscribers_key_scope_chk"
+	keyScopeCheckConstraint = "event_subscribers_key_scope_chk"
+
+	// subscriberFenceLostMarker is the phrase EVERY lost-fence conflict raised by this
+	// repository must carry in its wrapped detail.
+	//
+	// It is not decoration. blnk.subscriberFenceWasLost renders the detail and matches this
+	// substring to decide whether an issuance has to COMPENSATE — revoke the credential it
+	// already wrote at the broker — or may simply abandon itself as the loser of a race. A
+	// lost-fence error that does not carry it is routed as an ordinary conflict, and the
+	// credential stays at the broker with nothing in the registry pointing at it.
+	//
+	// Three producers raise this conflict and only one of them used to spell the phrase, each
+	// having written its own wording. The constant exists so the routing predicate and the
+	// producers cannot drift again; blnk.subscriberFenceLostMarker holds the identical literal
+	// on the service side, and the two are pinned together by test.
+	subscriberFenceLostMarker  = "the provisioning claim was no longer held"
 	checkViolationPostgresCode = "check_violation"
 )
 
@@ -192,6 +210,7 @@ func scanEventSubscriber(s eventSubscriberScanner) (model.EventSubscriber, error
 	var authorizedTopics pq.StringArray
 	var partitionKeyPrefix, credentialReference, webhookURL sql.NullString
 	var credentialIssuedAt, migratedAt, revocationPendingAt sql.NullTime
+	var revocationFailedAt, credentialOrphanedAt sql.NullTime
 
 	if err := s.Scan(
 		&sub.ID,
@@ -206,6 +225,8 @@ func scanEventSubscriber(s eventSubscriberScanner) (model.EventSubscriber, error
 		&webhookURL,
 		&migratedAt,
 		&revocationPendingAt,
+		&revocationFailedAt,
+		&credentialOrphanedAt,
 		&sub.CreatedAt,
 		&sub.UpdatedAt,
 	); err != nil {
@@ -239,6 +260,14 @@ func scanEventSubscriber(s eventSubscriberScanner) (model.EventSubscriber, error
 	if migratedAt.Valid {
 		migrated := migratedAt.Time
 		sub.MigratedAt = &migrated
+	}
+	if revocationFailedAt.Valid {
+		failed := revocationFailedAt.Time
+		sub.RevocationFailedAt = &failed
+	}
+	if credentialOrphanedAt.Valid {
+		orphaned := credentialOrphanedAt.Time
+		sub.CredentialOrphanedAt = &orphaned
 	}
 	if revocationPendingAt.Valid {
 		pending := revocationPendingAt.Time
@@ -372,10 +401,18 @@ func requireSubscriberFields(subscriber *model.EventSubscriber) error {
 	}
 
 	if subscriber.KafkaPrincipal != principal {
+		// NO DETAILS, and the rule stated in full in the message instead.
+		//
+		// The rejected and expected values are both DERIVED FROM THE SUBSCRIBER ID, so
+		// naming either of them names the subscriber — and apierror.NewAPIError logs its
+		// details at ERROR, which would put a tenant identifier in an indexed log on every
+		// malformed request, a volume a caller controls. The message carries the whole rule
+		// instead, which is more actionable than a value comparison: it says what to send,
+		// or that the field can simply be omitted.
 		return apierror.NewAPIError(apierror.ErrInvalidInput,
-			"The Kafka principal must be the one derived from the subscriber ID",
-			fmt.Errorf("subscriber %q may only hold principal %q, not %q",
-				canonicalID, principal, subscriber.KafkaPrincipal))
+			"The Kafka principal must be exactly the one derived from the subscriber ID — the "+
+				"\"blnk-sub-\" namespace followed by the identifier — or omitted so that it is "+
+				"derived", nil)
 	}
 
 	// An absent group is likewise derived, to the default leaf. Deriving the DEFAULT rather
@@ -389,10 +426,12 @@ func requireSubscriberFields(subscriber *model.EventSubscriber) error {
 	// the prefixed ACL grant is for — but never a value outside it, which a prefixed grant
 	// would turn into a reach into another subscriber's groups.
 	if !model.IsInSubscriberGroupNamespace(subscriber.ConsumerGroupID, namespace) {
+		// No details, for the reason the principal check above documents: the namespace and
+		// the default leaf are both derived from the subscriber id.
 		return apierror.NewAPIError(apierror.ErrInvalidInput,
-			"The consumer group must lie inside the subscriber's own namespace",
-			fmt.Errorf("subscriber %q may use any group under %q (for example %q), not %q",
-				canonicalID, namespace, group, subscriber.ConsumerGroupID))
+			"The consumer group must lie inside the subscriber's own namespace — the "+
+				"\"blnk-sub-\" namespace, the identifier, then \".\" and any leaf — or be "+
+				"omitted so that the default leaf is derived", nil)
 	}
 
 	if err := requireGrantableTopics(subscriber.AuthorizedTopics); err != nil {
@@ -416,9 +455,15 @@ func requireSubscriberFields(subscriber *model.EventSubscriber) error {
 // category is covered without an edit and an INTERNAL category is excluded automatically.
 // The repository cannot call into the root package — the root imports database — so the
 // prefix is read from configuration the same way the outbox's topic validation reads it.
+//
+// THE CONFIGURED PREFIX ONLY, and not the historical allowlist the outbox validates against.
+// A historical namespace exists to be drained by the publisher, so granting a subscriber
+// Read on it would keep alive the generation the allowlist is there to retire — and a
+// subscriber authorised for a topic that stops being written to is a subscriber whose feed
+// goes quiet with nothing to show why.
 func grantableTopicPrefixes() map[string]struct{} {
 	grantable := make(map[string]struct{})
-	for _, topic := range model.SubscriberGrantableTopics(expectedEventTopicPrefix()) {
+	for _, topic := range model.SubscriberGrantableTopics(configuredEventTopicPrefix()) {
 		grantable[topic] = struct{}{}
 	}
 
@@ -439,9 +484,11 @@ func grantableTopicPrefixes() map[string]struct{} {
 //     resource, so one such entry turns a per-topic grant into a cluster-wide one.
 //   - FOREIGN topics, because a grant over a topic Blnk does not own is a grant into somebody
 //     else's data on a broker Blnk may share.
-//   - DEAD-LETTER and INTERNAL topics, because the DLTs carry failed events with Blnk's own
-//     failure metadata and the system category carries Blnk's internal
-//     diagnostics and uncatalogued payloads. Neither has a subscriber audience.
+//   - DEAD-LETTER topics, because every DLT carries other subscribers' failed events
+//     together with Blnk's own failure metadata, so it has no subscriber audience. This is
+//     the only owned-name class excluded: all four categories are grantable, and the
+//     exclusion is structural, since the grantable set is composed of
+//     "<prefix>.<category>" names and a ".dlt" name can never be one.
 //
 // An EMPTY list is accepted: a subscriber authorised for nothing is the fail-closed default of
 // a fresh registration, and refusing it would make registration and authorisation one
@@ -473,7 +520,7 @@ func requireGrantableTopics(topics []string) error {
 
 		if _, ok := grantable[trimmed]; !ok {
 			return apierror.NewAPIError(apierror.ErrInvalidInput,
-				"Authorized topics must be Blnk-owned subscriber-facing category topics",
+				"Authorized topics must be Blnk-owned category topics",
 				fmt.Errorf("topic %q is not grantable; the grantable topics are %s",
 					trimmed, strings.Join(allowed, ", ")))
 		}
@@ -645,21 +692,27 @@ func classifySubscriberWriteError(err error, internalMessage string) error {
 		}
 	}
 
-	// The key-scope CHECK is the schema's half of SEC-05, and a write that trips it is a
-	// caller problem with a named remedy rather than a server fault. Answering 500 would
-	// tell whoever reads it to look for a defect in Blnk, when what happened is that the
-	// row would have recorded a key-scoped authorization alongside a live credential —
-	// the state the service refuses and the database now cannot hold. The typed code
-	// carries that remedy; only THIS constraint is mapped, so any other CHECK failure
-	// stays an internal error rather than being mislabelled as an isolation refusal.
+	// THE KEY-SCOPE CHECK MEANS THE SCHEMA IS BEHIND THE CODE, and that is the only thing
+	// it can mean now. event_subscribers_key_scope_chk forbade "partition_key_prefix
+	// recorded AND credential_reference recorded"; sql/1781248930.sql drops it, because a
+	// subscriber's boundary includes its key prefix and refusing the combination denied the
+	// subscriber a credential rather than narrowing what it could read. The service permits
+	// the combination, so on a migrated database this branch is unreachable.
+	//
+	// It is kept, and mapped deliberately, for the database that has NOT been migrated: the
+	// write is refused by a constraint no request can satisfy, and no change the caller makes
+	// will help. A bare internal error would send whoever reads it looking for a defect in
+	// Blnk; this one names the migration to apply. Only THIS constraint is mapped, so any
+	// other CHECK failure stays a plain internal error rather than being mislabelled.
 	if errors.As(err, &pqErr) &&
 		pqErr.Code.Name() == checkViolationPostgresCode &&
 		pqErr.Constraint == keyScopeCheckConstraint {
 		return loggedDatabaseError(
-			apierror.ErrSubscriberIsolationUnenforceable,
-			"A subscriber cannot record a partition key prefix while it holds a Kafka credential, "+
-				"because Kafka cannot enforce a key scope and the row would describe a narrower "+
-				"boundary than the credential has",
+			apierror.ErrInternalServer,
+			"This database still carries the event_subscribers_key_scope_chk constraint, which "+
+				"forbids recording a partition key prefix on a subscriber that holds a Kafka "+
+				"credential. Apply the pending migrations (sql/1781248930.sql removes it) and "+
+				"repeat the request",
 			"classify_subscriber_write_error",
 			err,
 		)
@@ -697,6 +750,250 @@ func assertSubscriberRowAffected(result sql.Result, internalMessage string) erro
 	return nil
 }
 
+// requireFenceToken rejects a blank provisioning-fence token before a statement runs.
+//
+// # Why every mutation is fenced, and why the token is REQUIRED rather than optional
+//
+// The fence is LEASED. An operation that stalls past its lease — a slow broker round trip, a
+// paused process, a long garbage-collection pause — no longer owns the subscriber, and another
+// operation may legitimately have claimed it. Without the token in the predicate, that stale
+// operation's remaining writes still land: it can persist an authorization the new owner has
+// already replaced, clear a credential the new owner has just issued, or delete a row the new
+// owner is provisioning. Each of those is a silent divergence between the registry and the
+// broker, and each reports success to a caller.
+//
+// An OPTIONAL token would defeat the purpose entirely, because the code path that forgot to
+// pass one would be exactly the unfenced write the predicate exists to prevent. Every caller
+// of these methods already holds a fence — the service takes one before it reads the row — so
+// requiring it costs nothing legitimate and makes an unfenced mutation impossible to express.
+//
+// Parameters:
+//   - token string: the token the caller's claim was issued under.
+//
+// Returns:
+//   - error: a typed invalid-input error when the token is blank.
+func requireFenceToken(token string) error {
+	if strings.TrimSpace(token) == "" {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"A provisioning claim token is required to modify this subscriber",
+			errors.New("event subscriber: a fenced write was attempted with no provisioning claim token"))
+	}
+
+	return nil
+}
+
+// subscriberFenceMiss names WHY a fenced write matched no row.
+//
+// It exists because the four reasons need four different answers and one of them is not an
+// error at all from the calling statement's point of view. A write that carries its own extra
+// predicate — the credential CAS is the one that does — has to be able to tell "I no longer
+// own this subscriber" from "I still own it and my other condition stopped holding", because
+// only the first means the operation must be abandoned.
+type subscriberFenceMiss int
+
+const (
+	// subscriberFenceMissOther: the row exists, the claim IS the caller's, and no revocation is
+	// pending — so one of the statement's own additional conditions stopped holding. For a
+	// statement whose only predicates are the key and the claim this is unreachable; for one
+	// that adds a compare-and-set it is the ordinary superseded case.
+	subscriberFenceMissOther subscriberFenceMiss = iota
+
+	// subscriberFenceMissRowGone: no row carries the subscriber ID any more.
+	subscriberFenceMissRowGone
+
+	// subscriberFenceMissClaimLost: the row exists but the provisioning claim is not the
+	// caller's. This is the outcome the token predicate exists to produce.
+	subscriberFenceMissClaimLost
+
+	// subscriberFenceMissRevocationPending: the row carries the revocation tombstone, so its
+	// authorization is deliberately frozen.
+	subscriberFenceMissRevocationPending
+)
+
+// describeFencedWriteMiss reads the two facts that decide why a fenced write missed.
+//
+// The two facts are read in ONE statement rather than through GetEventSubscriberByID, because
+// the provisioning token is deliberately NOT a field of the read model — exposing it would put
+// a concurrency-control secret on every API response — so it cannot be inspected from a row
+// struct.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriberID string: the business key.
+//   - token string: the token the caller presented.
+//   - internalMessage string: the message a driver failure is reported under.
+//
+// Returns:
+//   - subscriberFenceMiss: the reason, meaningful only when the error is nil.
+//   - error: non-nil only when the read itself failed, in which case it is already logged.
+func (d Datasource) describeFencedWriteMiss(
+	ctx context.Context,
+	subscriberID, token, internalMessage string,
+) (subscriberFenceMiss, error) {
+	var (
+		holdsClaim        bool
+		revocationPending bool
+	)
+
+	err := d.Conn.QueryRowContext(ctx, `
+		SELECT provisioning_token IS NOT DISTINCT FROM $2,
+		       revocation_pending_at IS NOT NULL
+		FROM blnk.event_subscribers
+		WHERE subscriber_id = $1
+	`, strings.TrimSpace(subscriberID), strings.TrimSpace(token)).Scan(&holdsClaim, &revocationPending)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return subscriberFenceMissRowGone, nil
+		}
+
+		return subscriberFenceMissOther, loggedDatabaseError(apierror.ErrInternalServer,
+			internalMessage, "describe_fenced_write_miss", err)
+	}
+
+	switch {
+	case !holdsClaim:
+		return subscriberFenceMissClaimLost, nil
+	case revocationPending:
+		return subscriberFenceMissRevocationPending, nil
+	default:
+		return subscriberFenceMissOther, nil
+	}
+}
+
+// fencedWriteMissError turns a miss reason into the typed error its remedy calls for.
+//
+// The four remedies are genuinely different — re-register, retry under a fresh claim, finish or
+// reverse the deregistration, or re-read and re-attempt — and collapsing them, which a bare
+// "not found" does, sends an operator to the wrong one. The fence-lost case is the worst to
+// collapse: it is a concurrency outcome, and reporting it as a missing subscriber hides it
+// behind a message that reads like a mistyped identifier.
+//
+// Parameters:
+//   - subscriberID string: the business key, named in the internal detail only.
+//   - miss subscriberFenceMiss: the reason.
+//
+// Returns:
+//   - error: always non-nil; a typed not-found or a typed conflict naming the reason.
+func fencedWriteMissError(subscriberID string, miss subscriberFenceMiss) error {
+	id := strings.TrimSpace(subscriberID)
+
+	switch miss {
+	case subscriberFenceMissRowGone:
+		return apierror.NewAPIError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, nil)
+
+	case subscriberFenceMissClaimLost:
+		// The detail carries subscriberFenceLostMarker, and it must: this is the general
+		// fenced-write miss, so it is the path most credential writes take when their claim
+		// lapses, and without the marker the service treats it as an ordinary conflict and skips
+		// the broker-side compensation.
+		return apierror.NewAPIError(apierror.ErrConflict,
+			"The subscriber provisioning claim is no longer held by this caller, so the change was not applied",
+			fmt.Errorf("event subscriber: a fenced write for subscriber %q matched no row because "+
+				subscriberFenceLostMarker+"; the claim expired or was taken over while the "+
+				"operation was in flight; nothing was written, and the operation must be retried "+
+				"under a fresh claim", id))
+
+	case subscriberFenceMissRevocationPending:
+		return apierror.NewAPIError(apierror.ErrConflict,
+			"This subscriber is being deregistered, so its access model can no longer be changed",
+			fmt.Errorf("event subscriber: subscriber %q carries a revocation tombstone, so its "+
+				"authorization is frozen; complete or reverse its deregistration first", id))
+
+	default:
+		return apierror.NewAPIError(apierror.ErrConflict,
+			"The subscriber changed while this operation was in flight, so the change was not applied",
+			fmt.Errorf("event subscriber: a fenced write for subscriber %q matched no row while the claim "+
+				"was still held and no revocation was pending, so one of the statement's other "+
+				"conditions stopped holding", id))
+	}
+}
+
+// classifyFencedWriteMiss explains why a fenced write matched no row, as a typed error.
+//
+// It is the whole answer for a statement whose only predicates are the business key, the
+// provisioning claim and the revocation tombstone. A statement carrying an ADDITIONAL predicate
+// calls describeFencedWriteMiss instead, so it can recognise subscriberFenceMissOther as its
+// own condition failing rather than as a lost fence.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriberID string: the business key.
+//   - token string: the token the caller presented.
+//   - internalMessage string: the message a driver failure is reported under.
+//
+// Returns:
+//   - error: always non-nil.
+func (d Datasource) classifyFencedWriteMiss(
+	ctx context.Context,
+	subscriberID, token, internalMessage string,
+) error {
+	miss, err := d.describeFencedWriteMiss(ctx, subscriberID, token, internalMessage)
+	if err != nil {
+		return err
+	}
+
+	return fencedWriteMissError(subscriberID, miss)
+}
+
+// requireFencedWriteLanded turns "the statement matched no row" into the typed error that says
+// WHY, for a fenced write whose only predicates are the business key and the provisioning claim.
+//
+// The three settlement writes share this because they share exactly that predicate shape, and
+// three hand-copied RowsAffected blocks would be three places for the classification to drift.
+// A statement carrying an additional predicate must not use it — subscriberFenceMissOther would
+// then be that predicate failing rather than a lost fence — which is why the sequence-checking
+// writes still inspect the miss themselves.
+//
+// Parameters:
+//   - ctx context.Context: cancels the follow-up classification read.
+//   - result sql.Result: the executed statement's result.
+//   - subscriberID string: the business key the statement addressed.
+//   - fenceToken string: the token the caller presented.
+//   - operation string: the operation name a driver failure is logged under.
+//
+// Returns:
+//   - error: nil when at least one row was written; otherwise the classified miss, or an
+//     internal error when the driver could not report the row count.
+func (d Datasource) requireFencedWriteLanded(
+	ctx context.Context,
+	result sql.Result,
+	subscriberID, fenceToken, operation string,
+) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to confirm the subscriber settlement write", operation, err)
+	}
+
+	if affected == 0 {
+		return d.classifyFencedWriteMiss(ctx, subscriberID, fenceToken,
+			"Failed to confirm the subscriber settlement write")
+	}
+
+	return nil
+}
+
+// nullableTime renders a time as a driver value that is SQL NULL when the time is unset.
+//
+// The settlement scan needs this because its retry pacing is expressed as "attempted before this
+// instant OR never attempted", and a caller that wants every obligation regardless of pacing
+// passes a zero time. Passing Go's zero time through as a literal would compare against year 1
+// rather than meaning "no bound", so it is turned into NULL and the predicate admits NULL
+// explicitly.
+//
+// Parameters:
+//   - value time.Time: the instant, or the zero value for none.
+//
+// Returns:
+//   - interface{}: the time, or nil for SQL NULL.
+func nullableTime(value time.Time) interface{} {
+	if value.IsZero() {
+		return nil
+	}
+
+	return value
+}
+
 // CreateEventSubscriber registers a subscriber and returns the stored row.
 //
 // The row is read back through RETURNING rather than reconstructed in Go, so the
@@ -719,7 +1016,7 @@ func (d Datasource) CreateEventSubscriber(ctx context.Context, subscriber *model
 	defer span.End()
 
 	if err := requireSubscriberFields(subscriber); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, err
 	}
 	span.SetAttributes(attribute.String("subscriber.id", subscriber.SubscriberID))
@@ -747,7 +1044,7 @@ func (d Datasource) CreateEventSubscriber(ctx context.Context, subscriber *model
 
 	stored, err := scanEventSubscriber(row)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, classifySubscriberWriteError(err, "Failed to create event subscriber")
 	}
 
@@ -775,7 +1072,7 @@ func (d Datasource) GetEventSubscriberByID(ctx context.Context, subscriberID str
 	defer span.End()
 
 	if err := requireSubscriberID(subscriberID); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, err
 	}
 	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
@@ -788,7 +1085,7 @@ func (d Datasource) GetEventSubscriberByID(ctx context.Context, subscriberID str
 
 	subscriber, err := scanEventSubscriber(row)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, loggedDatabaseError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, "get_event_subscriber_by_id", err)
 		}
@@ -803,79 +1100,190 @@ func (d Datasource) GetEventSubscriberByID(ctx context.Context, subscriberID str
 	return &subscriber, nil
 }
 
-// ListEventSubscribers pages the registry NEWEST FIRST, ordered by created_at
-// descending and tie-broken by the surrogate key.
+// ListEventSubscribers returns one page of the registry, NEWEST FIRST, resuming from the
+// caller's cursor.
 //
-// The tie-break is what makes the order deterministic rather than merely sorted:
-// created_at is stamped in Go and two subscribers registered in the same
-// microsecond would otherwise page in arbitrary relative order, which can both
-// repeat and skip a row across pages. Ordering by the monotonic id as the second
-// key removes that.
+// # Why a cursor and not an offset
 //
-// The limit is normalised and bounded, and a negative offset is clamped, so a
-// malformed page request degrades to a cheap query instead of a full table scan.
-func (d Datasource) ListEventSubscribers(ctx context.Context, limit, offset int) ([]model.EventSubscriber, error) {
+// Two callers page this registry and both are better served by a position than by a depth.
+// The management API gets a page whose cost does not depend on how deep it is and does not
+// silently repeat or skip rows when a subscriber is registered mid-pagination. The
+// consumer-lag collector gets something it could not express at all before: the ability to
+// RESUME. It reads a bounded number of subscribers per tick, and reading from the top every
+// time measured the newest ones repeatedly while never reaching the rest of the registry —
+// so older subscribers had no lag series at all and the lag alert could not fire for them
+// (PERF-P22).
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - query model.SubscriberPageQuery: the page size and the position to resume from. The
+//     zero value returns the newest default-sized page.
+//
+// Returns:
+//   - model.SubscriberPage: the page and the cursor for the next one, which is nil when this
+//     page is the last. Subscribers is never nil on success.
+//
+// listEventSubscribersQuery pages the registry newest first, resuming from a KEYSET.
+//
+// A package-level constant so a test can assert the keyset predicate and the ordering, which
+// are the substance of the fix and are invisible from the rows a small fixture returns.
+//
+// # PERF-P08: the keyset, and what it replaced
+//
+// This used to be `ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2` with the offset
+// supplied by the caller and bounded by nothing. An OFFSET makes a page's cost proportional
+// to its depth — PostgreSQL reads and discards every row before it — so the deepest page a
+// caller asked for was the most expensive one the server ran, and nothing capped the depth.
+// The predicate below is a range scan from the index entry the cursor names, so every page
+// costs the same.
+//
+// The tie-break on id is what makes the order deterministic rather than merely sorted:
+// created_at is stamped in Go, so two subscribers registered in the same microsecond would
+// otherwise page in arbitrary relative order, which can both repeat and skip a row across
+// pages.
+//
+// The cursor is bound as a nullable pair so that "no cursor" and "the zero instant" are the
+// same request — the first page — rather than a predicate excluding every row.
+const listEventSubscribersQuery = `
+		SELECT ` + eventSubscriberColumns + `
+		FROM blnk.event_subscribers
+		WHERE $1::timestamptz IS NULL OR (created_at, id) < ($1::timestamptz, $2::bigint)
+		ORDER BY created_at DESC, id DESC
+		LIMIT $3
+	`
+
+// - error: a logged internal error.
+func (d Datasource) ListEventSubscribers(
+	ctx context.Context,
+	query model.SubscriberPageQuery,
+) (model.SubscriberPage, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ListEventSubscribers")
 	defer span.End()
 
+	limit := query.Limit
 	if limit <= 0 {
 		limit = defaultSubscriberPageSize
 	}
 	if limit > maxSubscriberPageSize {
 		limit = maxSubscriberPageSize
 	}
-	if offset < 0 {
-		offset = 0
+
+	var cursorInstant interface{}
+	var cursorID int64
+	if query.Cursor != nil {
+		cursorInstant = query.Cursor.CreatedAt.UTC()
+		cursorID = query.Cursor.ID
 	}
+
 	span.SetAttributes(
 		attribute.Int("subscriber.page_limit", limit),
-		attribute.Int("subscriber.page_offset", offset),
+		attribute.Bool("subscriber.cursor_present", query.Cursor != nil),
 	)
 
-	rows, err := d.Conn.QueryContext(ctx, `
-		SELECT `+eventSubscriberColumns+`
-		FROM blnk.event_subscribers
-		ORDER BY created_at DESC, id DESC
-		LIMIT $1 OFFSET $2
-	`, limit, offset)
+	// limit+1: the extra row establishes that another page exists and is discarded, which
+	// answers "is there more" without counting the registry.
+	rows, err := d.Conn.QueryContext(ctx, listEventSubscribersQuery, cursorInstant, cursorID, limit+1)
 	if err != nil {
-		span.RecordError(err)
-		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to list event subscribers", "list_event_subscribers", err)
+		failDatabaseSpan(span, err)
+		return model.SubscriberPage{}, loggedDatabaseError(apierror.ErrInternalServer, "Failed to list event subscribers", "list_event_subscribers", err)
 	}
 	defer func() {
 		if closeErr := rows.Close(); closeErr != nil {
 			// Logged rather than returned. The rows have already been read by the
 			// time this runs, so surfacing a close failure would discard a correct
 			// result the caller needs in favour of a condition it cannot act on.
-			logrus.WithError(closeErr).Error("failed to close event subscriber rows")
+			withLoggableCause(nil, closeErr).Error("failed to close event subscriber rows")
 		}
 	}()
 
 	// Non-nil so an empty page serialises as [] rather than null, and pre-sized to
 	// the bounded page so a full page does not repeatedly regrow the slice.
-	subscribers := make([]model.EventSubscriber, 0, limit)
+	page := model.SubscriberPage{Subscribers: make([]model.EventSubscriber, 0, limit)}
 	for rows.Next() {
 		subscriber, scanErr := scanEventSubscriber(rows)
 		if scanErr != nil {
-			span.RecordError(scanErr)
-			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event subscriber", "list_event_subscribers", scanErr)
+			failDatabaseSpan(span, scanErr)
+			return model.SubscriberPage{}, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event subscriber", "list_event_subscribers", scanErr)
 		}
-		subscribers = append(subscribers, subscriber)
+
+		if len(page.Subscribers) == limit {
+			// The probe row: read to learn that a further page exists, never returned.
+			page.HasMore = true
+
+			break
+		}
+
+		page.Subscribers = append(page.Subscribers, subscriber)
 	}
 
 	if err = rows.Err(); err != nil {
-		span.RecordError(err)
-		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event subscribers", "list_event_subscribers", err)
+		failDatabaseSpan(span, err)
+		return model.SubscriberPage{}, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event subscribers", "list_event_subscribers", err)
+	}
+
+	if page.HasMore && len(page.Subscribers) > 0 {
+		last := page.Subscribers[len(page.Subscribers)-1]
+		page.NextCursor = &model.SubscriberCursor{CreatedAt: last.CreatedAt, ID: last.ID}
 	}
 
 	span.AddEvent("Event subscribers listed", trace.WithAttributes(
-		attribute.Int("subscriber.count", len(subscribers)),
+		attribute.Int("subscriber.count", len(page.Subscribers)),
+		attribute.Bool("subscriber.has_more", page.HasMore),
 	))
-	return subscribers, nil
+	return page, nil
+}
+
+// CountEventSubscribers reports how many rows the registry holds.
+//
+// # Why the count is a query rather than a page length
+//
+// GET /subscribers accepts include_count, and that option used to be REFUSED
+// outright because no layer could answer it. Returning the length of the page
+// instead would be worse than refusing: a paging client that treats the total as
+// the size of the set would read a full page of 20 as "20 subscribers exist" and
+// stop, or loop forever comparing a page length against itself.
+//
+// It counts the WHOLE table, with no page bounds and no ORDER BY, which is what
+// makes it comparable with the page rather than a description of it. There is no
+// filter to honour: the listing narrows by nothing, so the total and the page
+// describe the same set by construction — if a filter is ever added to the
+// listing it must be added here in the same change, or the two will describe
+// different sets.
+//
+// int64 rather than int, matching CountDeadLetteredEvents and every other count in
+// this package, so a caller never has to know which width a given count returned.
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//
+// Returns:
+//   - int64: the number of registered subscribers, zero when none are.
+//   - error: a wrapped internal error when the query fails.
+func (d Datasource) CountEventSubscribers(ctx context.Context) (int64, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CountEventSubscribers")
+	defer span.End()
+
+	var total int64
+	if err := d.Conn.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM blnk.event_subscribers
+	`).Scan(&total); err != nil {
+		failDatabaseSpan(span, err)
+		return 0, loggedDatabaseError(
+			apierror.ErrInternalServer,
+			"Failed to count event subscribers",
+			"count_event_subscribers",
+			err,
+		)
+	}
+
+	span.SetAttributes(attribute.Int64("subscriber.total", total))
+	return total, nil
 }
 
 // UpdateEventSubscriber updates a subscriber's access model and its legacy webhook
-// URL.
+// URL, CONDITIONAL on the caller still holding the provisioning fence and on the row
+// not being tombstoned for deregistration.
 //
 // Only the mutable columns are written. subscriber_id locates the row rather than
 // being changed — it is the business key an issued credential and a live consumer
@@ -890,12 +1298,49 @@ func (d Datasource) ListEventSubscribers(ctx context.Context, limit, offset int)
 // access boundary. The broker is a separate system of record and is not reconciled
 // by this call: the service layer must re-provision the ACLs, or the registry and
 // the broker will disagree about what the subscriber may read.
-func (d Datasource) UpdateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber) error {
+//
+// # THE TWO PREDICATES, AND WHAT EACH PREVENTS
+//
+// The statement used to match on subscriber_id alone, and both additions close a real
+// fail-OPEN path rather than tightening a correct one:
+//
+//   - provisioning_token. The fence is leased, so an operation that stalled past its lease no
+//     longer owns the subscriber. Without this predicate its write still lands, overwriting the
+//     authorization the new owner just reconciled with the broker — leaving the registry
+//     describing one boundary while Kafka enforces another, and reporting success.
+//   - revocation_pending_at IS NULL. A row carrying the tombstone is being deregistered: its
+//     principal is on its way out and its ACLs are being removed. An update accepted on such a
+//     row can WIDEN authorized_topics, and the service's grant step then re-creates bindings
+//     for a principal whose revocation is in flight — access regained by a subscriber that was
+//     supposed to be losing it, with the registry showing an ordinary edit.
+//
+// A miss on either is explained by classifyFencedWriteMiss rather than reported as "not found",
+// because "your claim expired" and "this subscriber does not exist" call for opposite responses.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriber *model.EventSubscriber: the row as it should be written.
+//   - fenceToken string: the provisioning claim the caller holds. Required.
+//
+// Returns:
+//   - error: a typed conflict when the claim is lost or the row is tombstoned, a typed
+//     not-found when the row is gone, a typed conflict for a principal collision, or a logged
+//     internal error.
+func (d Datasource) UpdateEventSubscriber(
+	ctx context.Context,
+	subscriber *model.EventSubscriber,
+	fenceToken string,
+) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "UpdateEventSubscriber")
 	defer span.End()
 
 	if err := requireSubscriberFields(subscriber); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
+		return err
+	}
+
+	if err := requireFenceToken(fenceToken); err != nil {
+		failDatabaseSpan(span, err)
 		return err
 	}
 	span.SetAttributes(attribute.String("subscriber.id", subscriber.SubscriberID))
@@ -910,6 +1355,8 @@ func (d Datasource) UpdateEventSubscriber(ctx context.Context, subscriber *model
 			webhook_url = $6,
 			updated_at = $7
 		WHERE subscriber_id = $8
+		  AND provisioning_token = $9
+		  AND revocation_pending_at IS NULL
 	`,
 		subscriber.Name,
 		subscriber.KafkaPrincipal,
@@ -919,17 +1366,29 @@ func (d Datasource) UpdateEventSubscriber(ctx context.Context, subscriber *model
 		subscriber.WebhookURL,
 		time.Now(),
 		subscriber.SubscriberID,
+		strings.TrimSpace(fenceToken),
 	)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		// Reachable through the principal index: moving a principal onto one another
 		// subscriber already holds is a conflict, not a server fault.
 		return classifySubscriberWriteError(err, "Failed to update event subscriber")
 	}
 
-	if err := assertSubscriberRowAffected(result, "Failed to update event subscriber"); err != nil {
-		span.RecordError(err)
-		return err
+	affected, err := result.RowsAffected()
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to update event subscriber", "update_event_subscriber", err)
+	}
+
+	if affected == 0 {
+		miss := d.classifyFencedWriteMiss(ctx, subscriber.SubscriberID, fenceToken,
+			"Failed to update event subscriber")
+		failDatabaseSpan(span, miss)
+
+		return miss
 	}
 
 	span.AddEvent("Event subscriber updated", trace.WithAttributes(
@@ -960,7 +1419,7 @@ func (d Datasource) DeleteEventSubscriber(ctx context.Context, subscriberID stri
 	defer span.End()
 
 	if err := requireSubscriberID(subscriberID); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return err
 	}
 	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
@@ -970,12 +1429,12 @@ func (d Datasource) DeleteEventSubscriber(ctx context.Context, subscriberID stri
 		WHERE subscriber_id = $1
 	`, subscriberID)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to delete event subscriber", "delete_event_subscriber", err)
 	}
 
 	if err := assertSubscriberRowAffected(result, "Failed to delete event subscriber"); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return err
 	}
 
@@ -1039,12 +1498,12 @@ func (d Datasource) RecordSubscriberCredential(ctx context.Context, subscriberID
 	defer span.End()
 
 	if err := requireSubscriberID(subscriberID); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return err
 	}
 	if strings.TrimSpace(credentialReference) == "" {
 		err := apierror.NewAPIError(apierror.ErrBadRequest, "Credential reference is required", nil)
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return err
 	}
 	if err := model.ValidateCredentialReference(credentialReference); err != nil {
@@ -1053,7 +1512,7 @@ func (d Datasource) RecordSubscriberCredential(ctx context.Context, subscriberID
 		// exists to prevent.
 		err = apierror.NewAPIError(apierror.ErrInvalidInput,
 			"The credential reference is not a reference derived by the issuance service", nil)
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return err
 	}
@@ -1073,12 +1532,12 @@ func (d Datasource) RecordSubscriberCredential(ctx context.Context, subscriberID
 		WHERE subscriber_id = $4
 	`, credentialReference, issuedAt, time.Now(), subscriberID)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to record subscriber credential", "record_subscriber_credential", err)
 	}
 
 	if err := assertSubscriberRowAffected(result, "Failed to record subscriber credential"); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return err
 	}
 
@@ -1088,6 +1547,163 @@ func (d Datasource) RecordSubscriberCredential(ctx context.Context, subscriberID
 		attribute.String("subscriber.id", subscriberID),
 		attribute.String("subscriber.credential_issued_at", issuedAt.UTC().Format(time.RFC3339)),
 	))
+	return nil
+}
+
+// RecordSubscriberWebhookURL records a subscriber's legacy HTTP endpoint AND clears
+// migrated_at, in one statement.
+//
+// # Why the two columns move together
+//
+// They are one fact, not two. migrated_at means "this subscriber no longer receives
+// legacy HTTP pushes"; webhook_url means "this is the legacy endpoint it receives them
+// on". A row holding both asserts the opposite of itself, and every reader of the
+// registry then disagrees: the migration report counts it as done, the retention purge
+// treats its URL as forgettable, and an operator reading the row sees a live endpoint
+// on a subscriber that has supposedly finished migrating.
+//
+// Recording a URL used to go through the service's general UpdateSubscriber, which
+// writes webhook_url and leaves migrated_at exactly as it was. So an operator
+// correcting a migrated subscriber's endpoint — a legitimate action, since the record
+// exists to be corrected — produced precisely that self-contradicting row, with no
+// error and nothing to notice.
+//
+// Clearing migrated_at is the correct direction of the two available. A subscriber that
+// has an endpoint recorded again has, by that act, been put back into the population
+// awaiting migration; refusing the write instead would leave an operator unable to
+// correct a record whose correction is the entire purpose of the column.
+//
+// The schema enforces the same invariant through event_subscribers_webhook_migration_chk,
+// so a row breaking it cannot be written by any path — this method, a psql session, or a
+// restored backup.
+//
+// The URL is VALIDATED here, at the persistence boundary, because the column is a future
+// request sink: nothing sends to it today, and the moment anything does, whatever is
+// stored becomes a request Blnk makes from inside its own network.
+//
+// Parameters:
+//   - ctx context.Context: cancels the write.
+//   - subscriberID string: the business key.
+//   - webhookURL string: the endpoint to record, stored verbatim. Must be non-blank and
+//     free of surrounding whitespace; use ClearSubscriberWebhookURL to remove one.
+//
+// Returns:
+//   - error: a typed validation error for a blank or unacceptable URL,
+//     ErrSubscriberNotFound when no such subscriber exists, or a wrapped write error.
+func (d Datasource) RecordSubscriberWebhookURL(ctx context.Context, subscriberID, webhookURL string) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RecordSubscriberWebhookURL")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		failDatabaseSpan(span, err)
+		return err
+	}
+
+	if strings.TrimSpace(webhookURL) == "" {
+		err := apierror.NewAPIError(
+			apierror.ErrGenValidation,
+			"A webhook URL is required",
+			errors.New(
+				"database: the webhook url is blank; clear the subscription instead of recording "+
+					"an empty one",
+			),
+		)
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+
+	// Validated and stored VERBATIM, never trimmed here. requireSafeWebhookURL refuses
+	// surrounding whitespace outright for the reason documented on it: this column is
+	// stored as given, so validating a trimmed copy and persisting the original would let
+	// bytes reach the row that the check never saw.
+	if err := requireSafeWebhookURL(&webhookURL); err != nil {
+		failDatabaseSpan(span, err)
+		return err
+	}
+
+	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
+
+	// ONE STATEMENT. Two would leave a window in which the row holds both values, and a
+	// crash inside that window would make the window permanent.
+	result, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET webhook_url  = $1,
+			migrated_at  = NULL,
+			updated_at   = $2
+		WHERE subscriber_id = $3
+	`, webhookURL, time.Now(), subscriberID)
+	if err != nil {
+		failDatabaseSpan(span, err)
+		return classifySubscriberWriteError(err, "Failed to record subscriber webhook subscription")
+	}
+
+	if err := assertSubscriberRowAffected(result, "Failed to record subscriber webhook subscription"); err != nil {
+		failDatabaseSpan(span, err)
+		return err
+	}
+
+	// The URL itself is not recorded on the span: it is a third-party address, and a
+	// trace is a wider audience than the registry.
+	span.AddEvent("Subscriber webhook subscription recorded")
+
+	return nil
+}
+
+// ClearSubscriberWebhookURL forgets one subscriber's recorded legacy endpoint WITHOUT
+// stamping a migration.
+//
+// It is the one-row form of the retention rule PurgeMigratedWebhookURLs applies in bulk,
+// for an operator correcting a record or honouring an erasure request before the
+// retention period elapses. migrated_at is untouched: whether the subscriber migrated is
+// an audit fact that forgetting an address does not change, and CLEARING a URL cannot
+// break event_subscribers_webhook_migration_chk from either starting state.
+//
+// It is deliberately NOT CompleteSubscriberWebhookMigration. Deleting an address is not
+// evidence that a subscriber moved to Kafka, and conflating the two would let a purge
+// report migrations that never happened.
+//
+// Parameters:
+//   - ctx context.Context: cancels the write.
+//   - subscriberID string: the business key.
+//
+// Returns:
+//   - error: ErrSubscriberNotFound when no such subscriber exists, or a wrapped write
+//     error.
+func (d Datasource) ClearSubscriberWebhookURL(ctx context.Context, subscriberID string) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClearSubscriberWebhookURL")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		failDatabaseSpan(span, err)
+		return err
+	}
+
+	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
+
+	result, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET webhook_url = NULL,
+			updated_at  = $1
+		WHERE subscriber_id = $2
+	`, time.Now(), subscriberID)
+	if err != nil {
+		failDatabaseSpan(span, err)
+		return loggedDatabaseError(
+			apierror.ErrInternalServer,
+			"Failed to clear subscriber webhook subscription",
+			"clear_subscriber_webhook_url",
+			err,
+		)
+	}
+
+	if err := assertSubscriberRowAffected(result, "Failed to clear subscriber webhook subscription"); err != nil {
+		failDatabaseSpan(span, err)
+		return err
+	}
+
+	span.AddEvent("Subscriber webhook subscription cleared")
+
 	return nil
 }
 
@@ -1108,7 +1724,7 @@ func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID str
 	defer span.End()
 
 	if err := requireSubscriberID(subscriberID); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return err
 	}
 	if migratedAt.IsZero() {
@@ -1126,12 +1742,12 @@ func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID str
 		WHERE subscriber_id = $3
 	`, migratedAt, time.Now(), subscriberID)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark subscriber migrated", "mark_subscriber_migrated", err)
 	}
 
 	if err := assertSubscriberRowAffected(result, "Failed to mark subscriber migrated"); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return err
 	}
 
@@ -1139,6 +1755,651 @@ func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID str
 		attribute.String("subscriber.id", subscriberID),
 		attribute.String("subscriber.migrated_at", migratedAt.UTC().Format(time.RFC3339)),
 	))
+	return nil
+}
+
+// CompleteSubscriberWebhookMigration forgets a subscriber's legacy endpoint and records that it
+// has finished moving to Kafka — in ONE statement.
+//
+// # The split write this replaces, and the row it stranded
+//
+// The cutover used to be two writes with no transaction spanning them: clear webhook_url, then
+// stamp migrated_at. The ordering was chosen so that a failure in between could not OVER-claim
+// progress, and that much was true. What it did instead was strand the row permanently:
+//
+//   - webhook_url is NULL, so the subscriber no longer appears in "still receiving HTTP pushes"
+//     — there is no endpoint left to migrate it FROM.
+//   - migrated_at is NULL, so it is not counted in "migrated" either.
+//
+// The row is therefore absent from BOTH sides of the migration report, which under-reports
+// progress for the rest of the dual-run window. And nothing prompts the repeat that would fix
+// it: the caller received an error about a write it can no longer distinguish from one that
+// never started, and the row itself no longer carries the URL that would identify it as owing a
+// migration. "Repeat the request" is only a remedy for a caller that knows to, and this one has
+// been given no way to know.
+//
+// One statement removes the window rather than choosing which side of it to fail on. Either both
+// columns move or neither does, so the row is always on exactly one side of the report.
+//
+// # migrated_at is OVERWRITTEN, matching MarkSubscriberMigrated
+//
+// Not COALESCE'd. The two writers of this column must agree, and MarkSubscriberMigrated's
+// documented semantic is that re-stamping corrects the instant rather than failing, because the
+// useful question is "has it moved?" and a correction is a legitimate answer to "when?". The
+// revocation tombstone keeps its first instant for the opposite reason — there, the value IS the
+// age of an outstanding obligation.
+//
+// # IT IS DELIBERATELY NOT FENCED, unlike the five writes that are
+//
+// The provisioning claim guards the writes whose state the BROKER also holds: the access model
+// and the credential record. Neither column here has a broker counterpart — webhook_url is a
+// third-party address and migrated_at is an audit fact — so there is no second system for a
+// stale caller to make disagree, and requiring a claim would mean fencing a subscriber, and
+// making two Kafka round trips, to erase a URL.
+//
+// # AND NOT PREDICATED ON THE REVOCATION TOMBSTONE, also deliberately
+//
+// Every write that can GRANT or WIDEN access refuses a row being deregistered. This one grants
+// nothing: it ERASES third-party data Blnk has a retention obligation for, and blocking that
+// because the subscriber happens to be mid-deregistration would put the obligation behind
+// somebody else's stuck operation. PurgeMigratedSubscriberWebhookURLs, the bulk form of the same
+// erasure, carries no such predicate either, and the two forms must not disagree about when the
+// data may go.
+//
+// This is a deliberate change from the behaviour the endpoint inherited by routing its clear
+// through the fenced authorization update, which refused a tombstoned row as a side effect of
+// sharing that path rather than by intent.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriberID string: the business key. Required.
+//   - migratedAt time.Time: the instant to record. A zero value is replaced with the current
+//     time rather than stored, because a zero timestamp is still NOT NULL and would read back
+//     as "migrated in year 1" — quietly corrupting progress reporting instead of leaving the row
+//     counted as unmigrated.
+//
+// Returns:
+//   - *model.EventSubscriber: the row as it now stands, so a caller can report the instant and
+//     confirm the URL is gone without re-reading.
+//   - error: a typed not-found error when no subscriber matches, or a logged internal error.
+func (d Datasource) CompleteSubscriberWebhookMigration(
+	ctx context.Context,
+	subscriberID string,
+	migratedAt time.Time,
+) (*model.EventSubscriber, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CompleteSubscriberWebhookMigration")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		failDatabaseSpan(span, err)
+
+		return nil, err
+	}
+
+	if migratedAt.IsZero() {
+		migratedAt = time.Now()
+	}
+	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
+
+	row := d.Conn.QueryRowContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET webhook_url = NULL,
+			migrated_at = $1,
+			updated_at = $2
+		WHERE subscriber_id = $3
+		RETURNING `+eventSubscriberColumns,
+		migratedAt, time.Now(), strings.TrimSpace(subscriberID),
+	)
+
+	migrated, err := scanEventSubscriber(row)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, apierror.NewAPIError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, nil)
+		}
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to complete the subscriber's webhook migration",
+			"complete_subscriber_webhook_migration", err)
+	}
+
+	span.AddEvent("Subscriber webhook migration completed", trace.WithAttributes(
+		attribute.String("subscriber.id", migrated.SubscriberID),
+		attribute.String("subscriber.migrated_at", migratedAt.UTC().Format(time.RFC3339)),
+		attribute.Bool("subscriber.legacy_webhook_retained", migrated.WebhookURL != nil),
+	))
+
+	return &migrated, nil
+}
+
+// ---------------------------------------------------------------------------------------
+// DURABLE SETTLEMENT OBLIGATIONS
+//
+// Everything below exists because a broker-side obligation can outlive the request that
+// created it, and the only previous record of that was a log line. A log line cannot be
+// queried per subscriber, retried, or alerted on, so a registry that had drifted from the
+// broker stayed drifted until somebody read the right line.
+//
+// The writes are FENCED, like the five other mutations on this table. Settlement obligations are
+// raised from inside operations that hold the provisioning claim, and an unfenced write would
+// let an operation whose lease had expired raise or clear an obligation about work a newer owner
+// is now doing — which is the same class of bug the claim predicates were added to close.
+// ---------------------------------------------------------------------------------------
+
+// RecordSubscriberGrantReconcilePending marks a subscriber as owing a broker-side grant
+// reconciliation.
+//
+// It is written BEFORE the broker work an authorization change performs, not after a failure,
+// and that ordering is the entire point. A marker written after a failure cannot be written by
+// the failure that matters most — the process disappearing mid-change — because there is nothing
+// left to write it. Recording the intent first means the obligation survives any outcome,
+// including no outcome at all.
+//
+// The write is idempotent: re-marking a row that already owes a reconciliation leaves the
+// original instant, so the age of the obligation reflects when the divergence began rather than
+// when it was last noticed.
+//
+// Parameters:
+//   - ctx context.Context: cancels the write.
+//   - subscriberID string: the row to mark. Required.
+//   - pendingAt time.Time: the instant to record. A zero value becomes time.Now().
+//   - fenceToken string: the caller's provisioning claim. Required.
+//
+// Returns:
+//   - error: ErrSubscriberNotFound, a claim-lost conflict, a validation error, or a wrapped
+//     write failure.
+func (d Datasource) RecordSubscriberGrantReconcilePending(
+	ctx context.Context,
+	subscriberID string,
+	pendingAt time.Time,
+	fenceToken string,
+) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RecordSubscriberGrantReconcilePending")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+
+	if err := requireFenceToken(fenceToken); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+
+	if pendingAt.IsZero() {
+		pendingAt = time.Now()
+	}
+
+	// COALESCE keeps the FIRST instant. Overwriting it on every retry would make an obligation
+	// that has been outstanding for a day look freshly raised, which is precisely the signal an
+	// age-based alert reads.
+	result, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET grant_reconcile_pending_at = COALESCE(grant_reconcile_pending_at, $1),
+			updated_at = $2
+		WHERE subscriber_id = $3
+		  AND provisioning_token = $4
+	`, pendingAt, time.Now(), strings.TrimSpace(subscriberID), fenceToken)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to record the subscriber's pending grant reconciliation",
+			"record_subscriber_grant_reconcile_pending", err)
+	}
+
+	return d.requireFencedWriteLanded(ctx, result, subscriberID, fenceToken,
+		"record_subscriber_grant_reconcile_pending")
+}
+
+// ClearSubscriberGrantReconcilePending discharges the grant-reconciliation obligation.
+//
+// It is called only once the broker and the row are known to agree, so it also resets the
+// settlement counters: an obligation raised again later starts its own history rather than
+// inheriting the attempts of one that was successfully discharged.
+//
+// Parameters:
+//   - ctx context.Context: cancels the write.
+//   - subscriberID string: the row to clear. Required.
+//   - fenceToken string: the caller's provisioning claim. Required.
+//
+// Returns:
+//   - error: ErrSubscriberNotFound, a claim-lost conflict, a validation error, or a wrapped
+//     write failure.
+func (d Datasource) ClearSubscriberGrantReconcilePending(
+	ctx context.Context,
+	subscriberID string,
+	fenceToken string,
+) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClearSubscriberGrantReconcilePending")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+
+	if err := requireFenceToken(fenceToken); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+
+	// The counters are reset only when NOTHING remains owed. A row that still owes the
+	// credential cleanup keeps its history, because that history belongs to the obligation still
+	// outstanding rather than to the one just discharged.
+	result, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET grant_reconcile_pending_at = NULL,
+			settlement_attempts = CASE
+				WHEN credential_cleanup_pending_at IS NULL THEN 0
+				ELSE settlement_attempts
+			END,
+			settlement_last_error = CASE
+				WHEN credential_cleanup_pending_at IS NULL THEN NULL
+				ELSE settlement_last_error
+			END,
+			updated_at = $1
+		WHERE subscriber_id = $2
+		  AND provisioning_token = $3
+	`, time.Now(), strings.TrimSpace(subscriberID), fenceToken)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to clear the subscriber's pending grant reconciliation",
+			"clear_subscriber_grant_reconcile_pending", err)
+	}
+
+	return d.requireFencedWriteLanded(ctx, result, subscriberID, fenceToken,
+		"clear_subscriber_grant_reconcile_pending")
+}
+
+// RecordSubscriberCredentialCleanupPending marks a subscriber as owing a credential cleanup:
+// a SCRAM credential may exist that Blnk intended to destroy, or the row names one that no
+// longer works.
+//
+// It is raised on the two failure paths that leave those states behind — a compensation that
+// itself failed, and a confirmed compensation whose registry clear-up then failed — so that the
+// live-credential-with-no-boundary case stops being a log line somebody has to read.
+//
+// Like the grant marker it keeps the FIRST instant, so the obligation's age is the age of the
+// divergence.
+//
+// Parameters:
+//   - ctx context.Context: cancels the write. Callers on a failure path pass a FRESH bounded
+//     context, because the deadline that failed is often why they are here.
+//   - subscriberID string: the row to mark. Required.
+//   - pendingAt time.Time: the instant to record. A zero value becomes time.Now().
+//   - fenceToken string: the caller's provisioning claim. Required.
+//
+// Returns:
+//   - error: ErrSubscriberNotFound, a claim-lost conflict, a validation error, or a wrapped
+//     write failure.
+func (d Datasource) RecordSubscriberCredentialCleanupPending(
+	ctx context.Context,
+	subscriberID string,
+	pendingAt time.Time,
+	fenceToken string,
+) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RecordSubscriberCredentialCleanupPending")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+
+	if err := requireFenceToken(fenceToken); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+
+	if pendingAt.IsZero() {
+		pendingAt = time.Now()
+	}
+
+	result, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET credential_cleanup_pending_at = COALESCE(credential_cleanup_pending_at, $1),
+			updated_at = $2
+		WHERE subscriber_id = $3
+		  AND provisioning_token = $4
+	`, pendingAt, time.Now(), strings.TrimSpace(subscriberID), fenceToken)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to record the subscriber's pending credential cleanup",
+			"record_subscriber_credential_cleanup_pending", err)
+	}
+
+	return d.requireFencedWriteLanded(ctx, result, subscriberID, fenceToken,
+		"record_subscriber_credential_cleanup_pending")
+}
+
+// CountSubscriberSettlementObligations reports how many subscribers owe broker-side
+// reconciliation, split by kind, and when the oldest of those obligations was recorded.
+//
+// # Why an AGGREGATE and not a scan
+//
+// Four scalars from one statement, for the same reason CountSubscriberRevocationsPending is an
+// aggregate: the cost of observing a backlog must not grow with the backlog. Enumerating the
+// registry every collection interval to count two columns would also duplicate the settlement
+// pass's own paging and bounds — a second thing to keep correct, for a figure that needs none of
+// it.
+//
+// # Outstanding is not the sum
+//
+// A single subscriber can owe both obligations at once — a credential cleanup and a grant
+// reconciliation are raised by different failures and cleared by different remedies — so the total
+// is counted with an OR rather than added, and the two component counts are reported alongside it
+// so an operator can see which kind is accumulating.
+//
+// # Zero is a reading, not an absence
+//
+// COUNT returns 0 and LEAST-of-MINs returns NULL when nothing is outstanding, which is the healthy
+// steady state and must be reported as such — the caller publishes an explicit zero so that
+// "nothing owed" is distinguishable from "the collector stopped". The NULL is scanned through a
+// nullable time so it becomes the zero instant rather than a scan error.
+//
+// Parameters:
+//   - ctx context.Context: cancels the read.
+//
+// Returns:
+//   - model.SubscriberSettlementBacklog: the counts and the oldest instant. The instant is the
+//     zero value when nothing is outstanding.
+//   - error: a logged internal error when the read failed. The caller must publish nothing in that
+//     case rather than publishing a zero, which would read as "all settled".
+func (d Datasource) CountSubscriberSettlementObligations(
+	ctx context.Context,
+) (model.SubscriberSettlementBacklog, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CountSubscriberSettlementObligations")
+	defer span.End()
+
+	var (
+		backlog model.SubscriberSettlementBacklog
+		oldest  sql.NullTime
+	)
+
+	// LEAST over the two MINs rather than MIN over a coalesce: LEAST ignores NULL arguments, so a
+	// deployment owing only one kind of obligation still reports that kind's oldest instant
+	// instead of NULL.
+	err := d.Conn.QueryRowContext(ctx, `
+		SELECT COUNT(*) FILTER (
+				   WHERE grant_reconcile_pending_at IS NOT NULL
+					  OR credential_cleanup_pending_at IS NOT NULL
+			   ),
+			   COUNT(*) FILTER (WHERE grant_reconcile_pending_at IS NOT NULL),
+			   COUNT(*) FILTER (WHERE credential_cleanup_pending_at IS NOT NULL),
+			   LEAST(MIN(grant_reconcile_pending_at), MIN(credential_cleanup_pending_at))
+		FROM blnk.event_subscribers
+	`).Scan(
+		&backlog.Outstanding,
+		&backlog.GrantReconcilePending,
+		&backlog.CredentialCleanupPending,
+		&oldest,
+	)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return model.SubscriberSettlementBacklog{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to count outstanding subscriber settlement obligations",
+			"count_subscriber_settlement_obligations", err)
+	}
+
+	if oldest.Valid {
+		backlog.OldestPendingAt = oldest.Time.UTC()
+	}
+
+	span.SetAttributes(attribute.Int64("subscriber.settlement_outstanding", backlog.Outstanding))
+
+	return backlog, nil
+}
+
+// GetSubscriberSettlementObligation reads what ONE subscriber currently owes.
+//
+// # Why the flags are re-read rather than carried from the scan
+//
+// A settlement pass finds an obligation, then takes the subscriber's provisioning claim, and time
+// passes in between. Within it a successful re-issuance can DISCHARGE the credential-cleanup
+// obligation, because provisioning upserts the principal's SCRAM credential and so replaces the
+// orphan the obligation was about. Acting on the flag the scan returned would then revoke a
+// credential that had just been issued and handed to a subscriber — destroying working access on
+// the strength of a marker for a credential that no longer exists.
+//
+// So the flags are re-read once the claim is held, which is the first moment at which they cannot
+// change underneath the remedy.
+//
+// It is a NARROW PROJECTION rather than a whole row on purpose. The obligation columns are
+// operational bookkeeping for one background worker; putting them on model.EventSubscriber would
+// place them in every registry API response, every row fixture and every wire-contract assertion
+// for the benefit of a single caller.
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - subscriberID string: the row to read. Required.
+//
+// Returns:
+//   - model.SubscriberSettlementObligation: what the subscriber owes. Outstanding() reports
+//     whether that is anything at all.
+//   - error: ErrSubscriberNotFound when no such subscriber exists, a validation error, or a
+//     wrapped read failure.
+func (d Datasource) GetSubscriberSettlementObligation(
+	ctx context.Context,
+	subscriberID string,
+) (model.SubscriberSettlementObligation, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "GetSubscriberSettlementObligation")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		failDatabaseSpan(span, err)
+
+		return model.SubscriberSettlementObligation{}, err
+	}
+
+	obligation := model.SubscriberSettlementObligation{}
+
+	err := d.Conn.QueryRowContext(ctx, `
+		SELECT subscriber_id,
+			   grant_reconcile_pending_at IS NOT NULL,
+			   credential_cleanup_pending_at IS NOT NULL,
+			   settlement_attempts,
+			   COALESCE(settlement_last_error, '')
+		FROM blnk.event_subscribers
+		WHERE subscriber_id = $1
+	`, strings.TrimSpace(subscriberID)).Scan(
+		&obligation.SubscriberID,
+		&obligation.GrantReconcilePending,
+		&obligation.CredentialCleanupPending,
+		&obligation.Attempts,
+		&obligation.LastError,
+	)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		notFound := apierror.NewAPIError(apierror.ErrSubscriberNotFound,
+			"Subscriber not found", err)
+		failDatabaseSpan(span, notFound)
+
+		return model.SubscriberSettlementObligation{}, notFound
+	case err != nil:
+		failDatabaseSpan(span, err)
+
+		return model.SubscriberSettlementObligation{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to read the subscriber's settlement obligation",
+			"get_subscriber_settlement_obligation", err)
+	}
+
+	return obligation, nil
+}
+
+// ListSubscriberSettlementObligations returns the subscribers that owe broker-side work, oldest
+// attempt first.
+//
+// It is UNFENCED and deliberately so: the settlement worker owns no subscriber, and a scan that
+// required a claim could never find the obligations left behind by an owner that died holding
+// one. The worker takes its own claim before it acts on a row; this call only decides where to
+// look.
+//
+// # notBefore is what paces the retries
+//
+// Settlement talks to the same broker that just failed, so a worker retrying every poll would
+// hammer it and bury the log in one subscriber. Rows whose last attempt is more recent than
+// notBefore are skipped, and a row never attempted is always eligible — which is why the
+// comparison is written to admit NULL explicitly rather than relying on a NULL comparison, since
+// `settlement_last_attempt_at < $1` is NULL, not true, for a row that has never been tried.
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - limit int: the maximum number of obligations to return. Bounded to the registry page
+//     maximum; a non-positive value takes the default.
+//   - notBefore time.Time: skip rows attempted at or after this instant. A zero value returns
+//     every outstanding obligation regardless of when it was last tried.
+//
+// Returns:
+//   - []model.SubscriberSettlementObligation: the outstanding obligations, oldest attempt first.
+//   - error: a wrapped read failure.
+func (d Datasource) ListSubscriberSettlementObligations(
+	ctx context.Context,
+	limit int,
+	notBefore time.Time,
+) ([]model.SubscriberSettlementObligation, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ListSubscriberSettlementObligations")
+	defer span.End()
+
+	if limit <= 0 {
+		limit = defaultSubscriberPageSize
+	}
+	if limit > maxSubscriberPageSize {
+		limit = maxSubscriberPageSize
+	}
+
+	// The WHERE clause repeats the partial index's predicate EXACTLY. A partial index is usable
+	// only when the query's condition implies the index's, and the planner proves that by
+	// comparing the expressions it can see — so spelling this differently would silently turn
+	// every poll into a sequential scan of the whole registry.
+	rows, err := d.Conn.QueryContext(ctx, `
+		SELECT subscriber_id,
+			   grant_reconcile_pending_at IS NOT NULL,
+			   credential_cleanup_pending_at IS NOT NULL,
+			   settlement_attempts,
+			   COALESCE(settlement_last_error, '')
+		FROM blnk.event_subscribers
+		WHERE (grant_reconcile_pending_at IS NOT NULL
+			   OR credential_cleanup_pending_at IS NOT NULL)
+		  AND ($1::timestamptz IS NULL
+			   OR settlement_last_attempt_at IS NULL
+			   OR settlement_last_attempt_at < $1)
+		ORDER BY settlement_last_attempt_at ASC NULLS FIRST, id ASC
+		LIMIT $2
+	`, nullableTime(notBefore), limit)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to list the subscribers owing broker-side settlement",
+			"list_subscriber_settlement_obligations", err)
+	}
+	// The house form in this package: the error is discarded explicitly rather than silently.
+	// A Close failure after a successful scan tells the caller nothing actionable — the rows are
+	// already read — but discarding it in writing is what distinguishes a deliberate choice from
+	// an oversight, and it is what every other paged read here does.
+	defer func() { _ = rows.Close() }()
+
+	obligations := make([]model.SubscriberSettlementObligation, 0, limit)
+
+	for rows.Next() {
+		var obligation model.SubscriberSettlementObligation
+		if scanErr := rows.Scan(
+			&obligation.SubscriberID,
+			&obligation.GrantReconcilePending,
+			&obligation.CredentialCleanupPending,
+			&obligation.Attempts,
+			&obligation.LastError,
+		); scanErr != nil {
+			failDatabaseSpan(span, scanErr)
+
+			return nil, loggedDatabaseError(apierror.ErrInternalServer,
+				"Failed to read a subscriber settlement obligation",
+				"list_subscriber_settlement_obligations", scanErr)
+		}
+
+		obligations = append(obligations, obligation)
+	}
+
+	if err := rows.Err(); err != nil {
+		failDatabaseSpan(span, err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to read the subscriber settlement obligations",
+			"list_subscriber_settlement_obligations", err)
+	}
+
+	return obligations, nil
+}
+
+// MarkSubscriberSettlementAttempt records that a settlement pass tried this row and what
+// happened.
+//
+// It is UNFENCED, for the same reason the scan is: the worker records the attempt whether or not
+// it could take the row's claim, and an attempt it could not record would be an attempt that
+// never paced the next one — turning the retry interval into a busy loop against a broker that
+// is already failing.
+//
+// It does NOT clear either obligation. Discharging is a separate, deliberate write, so a pass
+// that logged its attempt and then crashed cannot be mistaken for one that succeeded.
+//
+// Parameters:
+//   - ctx context.Context: cancels the write.
+//   - subscriberID string: the row attempted. Required.
+//   - attemptedAt time.Time: when. A zero value becomes time.Now().
+//   - failure string: the sanitized failure text, or "" when the pass succeeded.
+//
+// Returns:
+//   - error: a validation error or a wrapped write failure. A row that no longer exists is NOT
+//     an error: a subscriber deregistered between the scan and the attempt owes nothing.
+func (d Datasource) MarkSubscriberSettlementAttempt(
+	ctx context.Context,
+	subscriberID string,
+	attemptedAt time.Time,
+	failure string,
+) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkSubscriberSettlementAttempt")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+
+	if attemptedAt.IsZero() {
+		attemptedAt = time.Now()
+	}
+
+	if _, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET settlement_attempts = settlement_attempts + 1,
+			settlement_last_attempt_at = $1,
+			settlement_last_error = NULLIF($2, ''),
+			updated_at = $3
+		WHERE subscriber_id = $4
+	`, attemptedAt, failure, time.Now(), strings.TrimSpace(subscriberID)); err != nil {
+		failDatabaseSpan(span, err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to record the subscriber's settlement attempt",
+			"mark_subscriber_settlement_attempt", err)
+	}
+
 	return nil
 }
 
@@ -1165,18 +2426,39 @@ func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID str
 // MISSING SUBSCRIBER is still an error, for the same reason every other write here reports one
 // — silently succeeding would let a caller believe it had cleaned up a row that does not exist.
 //
+// # It is CONDITIONAL on the provisioning claim
+//
+// Clearing runs at the END of a fenced operation, after broker work whose duration a third
+// party decides. If that operation's lease had expired and another issuance had already
+// completed, an unconditional clear would blank the credential record the NEW issuance just
+// wrote — leaving the registry reporting "registered, not yet provisioned" for a subscriber
+// holding a working credential. That is the one direction this method must never move in: it
+// under-reports access, so nothing downstream has any reason to look at it.
+//
+// So the caller presents the claim it holds and a miss is refused. The refusal is the correct
+// outcome rather than an obstacle — the record that is present belongs to whoever owns the
+// subscriber now, and it is the accurate one.
+//
 // Parameters:
 //   - ctx context.Context: cancels the statement.
 //   - subscriberID string: the business key. Required.
+//   - fenceToken string: the provisioning claim the caller holds. Required.
 //
 // Returns:
-//   - error: a typed not-found error when no subscriber matches, or a logged internal error.
-func (d Datasource) ClearSubscriberCredential(ctx context.Context, subscriberID string) error {
+//   - error: a typed conflict when the claim is no longer the caller's, a typed not-found
+//     error when no subscriber matches, or a logged internal error.
+func (d Datasource) ClearSubscriberCredential(ctx context.Context, subscriberID, fenceToken string) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClearSubscriberCredential")
 	defer span.End()
 
 	if err := requireSubscriberID(subscriberID); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+
+	if err := requireFenceToken(fenceToken); err != nil {
+		failDatabaseSpan(span, err)
 
 		return err
 	}
@@ -1186,20 +2468,55 @@ func (d Datasource) ClearSubscriberCredential(ctx context.Context, subscriberID 
 		UPDATE blnk.event_subscribers
 		SET credential_reference = NULL,
 			credential_issued_at = NULL,
+			credential_cleanup_pending_at = NULL,
+			-- AND THE REVOCATION MARKERS, in the same statement. F14: revocation_pending_at is
+			-- stamped BEFORE the broker is touched, so it means "a principal may still
+			-- authenticate". Every caller of this statement reaches it only once the broker has
+			-- CONFIRMED the revocation, at which point that sentence is false — and a row that
+			-- kept the stamp meant the opposite of what the column says.
+			--
+			-- It costs more than tidiness. CountSubscriberRevocationsPending counts tombstoned
+			-- rows and blnk_subscribers_oldest_revocation_age_seconds raises a CRITICAL alert
+			-- whose runbook tells an operator to delete a SCRAM credential by hand; counting a
+			-- confirmed-clean row sent them after a principal that no longer exists, and made a
+			-- row where a credential really was unaccounted for indistinguishable from inert
+			-- residue. The failure marker goes with it because it describes the latest ATTEMPT,
+			-- and the latest attempt succeeded.
+			revocation_pending_at = NULL,
+			revocation_failed_at = NULL,
+			settlement_attempts = CASE
+				WHEN grant_reconcile_pending_at IS NULL THEN 0
+				ELSE settlement_attempts
+			END,
+			settlement_last_error = CASE
+				WHEN grant_reconcile_pending_at IS NULL THEN NULL
+				ELSE settlement_last_error
+			END,
 			updated_at = $1
 		WHERE subscriber_id = $2
-	`, time.Now(), strings.TrimSpace(subscriberID))
+		  AND provisioning_token = $3
+	`, time.Now(), strings.TrimSpace(subscriberID), strings.TrimSpace(fenceToken))
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to clear subscriber credential", "clear_subscriber_credential", err)
 	}
 
-	if err := assertSubscriberRowAffected(result, "Failed to clear subscriber credential"); err != nil {
-		span.RecordError(err)
+	affected, err := result.RowsAffected()
+	if err != nil {
+		failDatabaseSpan(span, err)
 
-		return err
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to clear subscriber credential", "clear_subscriber_credential", err)
+	}
+
+	if affected == 0 {
+		miss := d.classifyFencedWriteMiss(ctx, subscriberID, fenceToken,
+			"Failed to clear subscriber credential")
+		failDatabaseSpan(span, miss)
+
+		return miss
 	}
 
 	span.AddEvent("Subscriber credential cleared", trace.WithAttributes(
@@ -1230,19 +2547,45 @@ func (d Datasource) ClearSubscriberCredential(ctx context.Context, subscriberID 
 // A missing subscriber is a typed not-found error rather than a nil row, so "already gone" and
 // "just removed" cannot be confused, and a caller cannot skip the broker-side work by mistake.
 //
+// # It is CONDITIONAL on the provisioning claim
+//
+// This is the LAST write of a deregistration, taken after a broker revocation whose duration
+// the broker decides. If the lease had expired in the meantime and another operation had
+// claimed the subscriber, an unconditional delete would remove a row that operation is
+// actively working on — most damagingly an issuance, which would then hold a live broker
+// principal with no registry row naming it, the exact residue the tombstone-first ordering
+// above was written to make impossible.
+//
+// So the caller presents the claim it holds. A miss is classified rather than reported as
+// not-found, because "somebody else owns this subscriber now" and "this subscriber is gone"
+// call for opposite responses: the first must be retried after re-reading, the second is
+// already the desired end state.
+//
 // Parameters:
 //   - ctx context.Context: cancels the statement.
 //   - subscriberID string: the business key. Required.
+//   - fenceToken string: the provisioning claim the caller holds. Required.
 //
 // Returns:
 //   - *model.EventSubscriber: the row as it was immediately before deletion.
-//   - error: a typed not-found error when no subscriber matched, or a logged internal error.
-func (d Datasource) TakeEventSubscriber(ctx context.Context, subscriberID string) (*model.EventSubscriber, error) {
+//   - error: a typed conflict when the claim is no longer the caller's, a typed not-found
+//     error when no subscriber matched, or a logged internal error.
+func (d Datasource) TakeEventSubscriber(
+	ctx context.Context,
+	subscriberID string,
+	fenceToken string,
+) (*model.EventSubscriber, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "TakeEventSubscriber")
 	defer span.End()
 
 	if err := requireSubscriberID(subscriberID); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
+
+		return nil, err
+	}
+
+	if err := requireFenceToken(fenceToken); err != nil {
+		failDatabaseSpan(span, err)
 
 		return nil, err
 	}
@@ -1251,16 +2594,19 @@ func (d Datasource) TakeEventSubscriber(ctx context.Context, subscriberID string
 	row := d.Conn.QueryRowContext(ctx, `
 		DELETE FROM blnk.event_subscribers
 		WHERE subscriber_id = $1
+		  AND provisioning_token = $2
 		RETURNING `+eventSubscriberColumns,
 		strings.TrimSpace(subscriberID),
+		strings.TrimSpace(fenceToken),
 	)
 
 	deleted, err := scanEventSubscriber(row)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, apierror.NewAPIError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, nil)
+			return nil, d.classifyFencedWriteMiss(ctx, subscriberID, fenceToken,
+				"Failed to delete event subscriber")
 		}
 
 		return nil, loggedDatabaseError(apierror.ErrInternalServer,
@@ -1314,7 +2660,7 @@ func (d Datasource) PurgeMigratedSubscriberWebhookURLs(
 	if migratedBefore.IsZero() {
 		err := apierror.NewAPIError(apierror.ErrInvalidInput,
 			"A retention cut-off is required to purge migrated subscriber webhook URLs", nil)
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return 0, err
 	}
@@ -1328,7 +2674,7 @@ func (d Datasource) PurgeMigratedSubscriberWebhookURLs(
 		  AND migrated_at < $2
 	`, time.Now(), migratedBefore.UTC())
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return 0, loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to purge migrated subscriber webhook URLs",
@@ -1337,7 +2683,7 @@ func (d Datasource) PurgeMigratedSubscriberWebhookURLs(
 
 	purged, err := result.RowsAffected()
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return 0, loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to purge migrated subscriber webhook URLs",
@@ -1411,7 +2757,7 @@ func (d Datasource) CountSubscriberRevocationsPending(
 		WHERE revocation_pending_at IS NOT NULL
 	`).Scan(&backlog.Pending, &oldest)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return model.SubscriberRevocationBacklog{}, loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to count outstanding subscriber revocations",
@@ -1425,6 +2771,208 @@ func (d Datasource) CountSubscriberRevocationsPending(
 	span.SetAttributes(attribute.Int64("subscriber.revocations_pending", backlog.Pending))
 
 	return backlog, nil
+}
+
+// CountSubscriberAccessResidue reports how much broker-side access is UNACCOUNTED FOR: SCRAM
+// credentials that outlived their registry record, and revocations the broker refused.
+//
+// # Why it is not folded into CountSubscriberRevocationsPending
+//
+// That aggregate counts rows carrying revocation_pending_at, which is stamped before the broker
+// is touched by a DEREGISTRATION. An orphaned credential is created by a failed ISSUANCE, which
+// never stamps that column — so the revocation backlog and the alert built on it were
+// structurally incapable of seeing an orphan, and the exposure's only representation was a log
+// line. Extending the existing struct would have made "revocation backlog" mean two things; a
+// second aggregate keeps each figure's meaning exact.
+//
+// # One statement, four scalars
+//
+// Both markers are read in a single round trip with FILTER clauses rather than two queries,
+// because a collector that ticks every fifteen seconds should cost one round trip and because
+// two statements would observe two instants — enough for the counts and the ages to disagree
+// with each other in a way an operator would have to explain.
+//
+// The predicates match the two partial indexes sql/1781248950.sql creates, so in the healthy
+// steady state both indexes are empty and the aggregate reads nothing.
+//
+// # Zero is a reading, not an absence
+//
+// COUNT returns 0 and MIN returns NULL when nothing is outstanding, which is the healthy state
+// and must be reported as such — the caller publishes an explicit zero so that "nothing owed" is
+// distinguishable from "the collector stopped". A failed read returns the zero struct AND an
+// error, and the caller must publish nothing on that path.
+//
+// Parameters:
+//   - ctx context.Context: cancels the read.
+//
+// Returns:
+//   - model.SubscriberAccessResidue: the two counts and the two oldest instants. Each instant is
+//     the zero value when its count is zero.
+//   - error: a logged internal error when the read failed.
+func (d Datasource) CountSubscriberAccessResidue(
+	ctx context.Context,
+) (model.SubscriberAccessResidue, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CountSubscriberAccessResidue")
+	defer span.End()
+
+	var (
+		residue                 model.SubscriberAccessResidue
+		oldestOrphan, oldestBad sql.NullTime
+	)
+
+	err := d.Conn.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*) FILTER (WHERE credential_orphaned_at IS NOT NULL),
+			MIN(credential_orphaned_at),
+			COUNT(*) FILTER (WHERE revocation_failed_at IS NOT NULL),
+			MIN(revocation_failed_at)
+		FROM blnk.event_subscribers
+	`).Scan(
+		&residue.OrphanedCredentials,
+		&oldestOrphan,
+		&residue.FailedRevocations,
+		&oldestBad,
+	)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return model.SubscriberAccessResidue{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to count unaccounted subscriber access",
+			"count_subscriber_access_residue", err)
+	}
+
+	if oldestOrphan.Valid {
+		residue.OldestOrphanedAt = oldestOrphan.Time.UTC()
+	}
+	if oldestBad.Valid {
+		residue.OldestFailedRevocationAt = oldestBad.Time.UTC()
+	}
+
+	span.SetAttributes(
+		attribute.Int64("subscriber.credential_orphans", residue.OrphanedCredentials),
+		attribute.Int64("subscriber.revocation_failures", residue.FailedRevocations),
+	)
+
+	return residue, nil
+}
+
+// MarkSubscriberCredentialOrphaned records that a credential exists at the broker which Blnk
+// could neither record nor revoke.
+//
+// # THIS WRITE IS DELIBERATELY NOT FENCED
+//
+// Every other write on a provisioning path carries the claim token so a lapsed lease cannot
+// publish stale state. This one must not, and the asymmetry is the point: it is reached only
+// when an issuance has ALREADY failed and its compensation has ALSO failed, and one of the ways
+// that happens is precisely that the claim lapsed. Conditioning the marker on the claim would
+// mean the exposure went unrecorded exactly in the case that produced it — which is the defect
+// being fixed, restated one layer down.
+//
+// It is safe unfenced because it can only ADD a warning. It never grants, revokes, or changes
+// an authorization; the worst outcome of a stale write is a marker on a row that has since been
+// settled, and both settlement paths clear it as a side effect on their next run.
+//
+// It is idempotent and keeps the FIRST instant, because the quantity an operator alerts on is
+// how long the exposure has stood, not when it was last re-observed.
+//
+// A row that has since been deleted is NOT an error: the subscriber was deregistered while the
+// issuance was in flight, which is one of the documented causes, and the deregistration revoked
+// the principal on its way out. Reporting not-found here would replace the caller's real error
+// with a bookkeeping one.
+//
+// Parameters:
+//   - ctx context.Context: bounds the write. Callers pass a compensation context, not the
+//     issuance context, because the issuance deadline expiring is a common reason to be here.
+//   - subscriberID string: the row to mark. Required.
+//   - orphanedAt time.Time: the instant to record on the FIRST marking.
+//
+// Returns:
+//   - error: nil when the marker is in place or the row is gone; a logged internal error when
+//     the write itself failed.
+func (d Datasource) MarkSubscriberCredentialOrphaned(
+	ctx context.Context,
+	subscriberID string,
+	orphanedAt time.Time,
+) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkSubscriberCredentialOrphaned")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
+
+	if _, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET credential_orphaned_at = COALESCE(credential_orphaned_at, $1),
+			updated_at = $2
+		WHERE subscriber_id = $3
+	`, orphanedAt, time.Now(), strings.TrimSpace(subscriberID)); err != nil {
+		failDatabaseSpan(span, err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to record an orphaned subscriber credential",
+			"mark_subscriber_credential_orphaned", err)
+	}
+
+	span.AddEvent("Subscriber credential marked orphaned")
+
+	return nil
+}
+
+// MarkSubscriberRevocationFailed records that the most recent revocation attempt was refused by
+// the broker.
+//
+// It is unfenced for the same reason MarkSubscriberCredentialOrphaned is: it is reached on a
+// failure path, one cause of which is a lapsed claim, and it can only add a warning. It does not
+// keep the first instant — unlike revocation_pending_at it describes the LATEST attempt, and
+// every new attempt clears it — so an operator can tell "the broker refused, just now" from "a
+// deregistration started at some point and never got as far as the broker".
+//
+// A row that has since been deleted is not an error: the deregistration succeeded on another
+// attempt, which is the outcome this marker exists to be superseded by.
+//
+// Parameters:
+//   - ctx context.Context: bounds the write. Callers pass a compensation context.
+//   - subscriberID string: the row to mark. Required.
+//   - failedAt time.Time: when the attempt failed.
+//
+// Returns:
+//   - error: nil when the marker is in place or the row is gone; a logged internal error
+//     otherwise.
+func (d Datasource) MarkSubscriberRevocationFailed(
+	ctx context.Context,
+	subscriberID string,
+	failedAt time.Time,
+) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkSubscriberRevocationFailed")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
+
+	if _, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET revocation_failed_at = $1,
+			updated_at = $2
+		WHERE subscriber_id = $3
+	`, failedAt, time.Now(), strings.TrimSpace(subscriberID)); err != nil {
+		failDatabaseSpan(span, err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to record a failed subscriber revocation",
+			"mark_subscriber_revocation_failed", err)
+	}
+
+	span.AddEvent("Subscriber revocation marked failed")
+
+	return nil
 }
 
 // RecordSubscriberCredentialIfUnchanged persists an issuance ONLY IF the subscriber still
@@ -1457,6 +3005,35 @@ func (d Datasource) CountSubscriberRevocationsPending(
 // issuance budget — a lock whose duration is set by a third party's responsiveness. The CAS
 // costs one predicate and holds nothing.
 //
+// # THE CAS ALONE IS NOT SUFFICIENT, WHICH IS WHY THE CLAIM IS ALSO CHECKED
+//
+// The reference CAS catches two callers that observed the same prior reference. It does NOT
+// catch a caller whose provisioning claim expired: while the rightful new owner is still
+// provisioning at the broker and has not recorded anything yet, the stored reference is
+// STILL the old one, so the stale caller's CAS matches and its write lands. The new owner
+// then records, finds the reference changed, and is refused — the fence is inverted, and the
+// caller that lost the subscriber wins the registry.
+//
+// Adding the claim predicate closes that: the write requires BOTH that the observed
+// reference is unchanged AND that the caller still owns the subscriber. The two predicates
+// answer different questions and neither substitutes for the other — the reference detects a
+// superseding issuance that also held the claim, the token detects a caller that no longer
+// holds it at all.
+//
+// # A SUCCESSFUL ISSUANCE ALSO DISCHARGES A PENDING CREDENTIAL CLEANUP
+//
+// A credential-cleanup obligation says "a SCRAM credential may exist that Blnk meant to destroy,
+// or the row names one that no longer works". Provisioning UPSERTS the principal's SCRAM
+// credential, so an issuance that reaches this write has REPLACED whatever the obligation was
+// about: the orphan is gone, overwritten by a credential the registry is now recording. The
+// obligation is satisfied, not merely stale.
+//
+// Clearing it in the SAME statement is what makes that safe. Left outstanding, the next
+// settlement pass would revoke the principal's credential and blank the row — destroying a
+// credential that was just issued and handed to a subscriber, on the strength of a marker about
+// a credential that no longer exists. Two statements would leave a window in which exactly that
+// could happen.
+//
 // Parameters:
 //   - ctx context.Context: cancels the statement.
 //   - subscriberID string: the business key. Required.
@@ -1466,23 +3043,31 @@ func (d Datasource) CountSubscriberRevocationsPending(
 //   - credentialReference string: the new non-reversible reference. Validated, and never a
 //     secret.
 //   - issuedAt time.Time: the issuance instant.
+//   - fenceToken string: the provisioning claim the caller holds. Required.
 //
 // Returns:
-//   - error: a typed conflict when the stored reference no longer matches expected, a typed
-//     not-found when no subscriber matches, an invalid-input error when the reference is not
-//     a derived reference, or a logged internal error.
+//   - error: a typed conflict when the stored reference no longer matches expected or the
+//     claim is no longer the caller's, a typed not-found when no subscriber matches, an
+//     invalid-input error when the reference is not a derived reference, or a logged internal
+//     error.
 func (d Datasource) RecordSubscriberCredentialIfUnchanged(
 	ctx context.Context,
 	subscriberID string,
 	expected *string,
 	credentialReference string,
 	issuedAt time.Time,
+	claimToken string,
 ) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RecordSubscriberCredentialIfUnchanged")
 	defer span.End()
 
 	if err := requireSubscriberID(subscriberID); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+	if err := requireFenceToken(claimToken); err != nil {
+		failDatabaseSpan(span, err)
 
 		return err
 	}
@@ -1494,9 +3079,15 @@ func (d Datasource) RecordSubscriberCredentialIfUnchanged(
 	if err := model.ValidateCredentialReference(credentialReference); err != nil {
 		wrapped := apierror.NewAPIError(apierror.ErrInvalidInput,
 			"Credential reference must be a reference derived by model.DeriveCredentialReference", nil)
-		span.RecordError(wrapped)
+		failDatabaseSpan(span, wrapped)
 
 		return wrapped
+	}
+
+	if err := requireFenceToken(claimToken); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
 	}
 
 	span.SetAttributes(
@@ -1513,27 +3104,78 @@ func (d Datasource) RecordSubscriberCredentialIfUnchanged(
 		err    error
 		now    = time.Now()
 	)
+	// BOTH conditions, and each guards a different race.
+	//
+	// The credential comparison guards against a concurrent issuance having already recorded a
+	// different secret: this operation must not overwrite a reference it did not read, because
+	// the secret it is about to hand its own caller would then not be the one that works.
+	//
+	// The FENCE condition guards against this operation no longer being entitled to write at
+	// all. The claim is deliberately short and this write happens AFTER a multi-round-trip call
+	// to the broker, so an operation that stalled can arrive here with its lease already
+	// expired and another issuance in flight. Without the token in the predicate the two writes
+	// are ordered only by chance, and the loser's secret can be the one the broker accepts
+	// while the registry describes the winner's — a credential nobody can use and a reference
+	// that corroborates the wrong one.
 	if expected == nil {
 		result, err = d.Conn.ExecContext(ctx, `
 			UPDATE blnk.event_subscribers
 			SET credential_reference = $1,
 				credential_issued_at = $2,
+				credential_cleanup_pending_at = NULL,
+				-- AND THE ORPHAN MARKER, in the same statement. Kafka stores ONE SCRAM
+				-- credential per principal, so the issuance being recorded here REPLACED
+				-- whatever was orphaned: the orphaned secret stopped authenticating the moment
+				-- this one was written. A marker left standing would keep a critical alert
+				-- firing on an exposure that no longer exists, which is how an alert stops
+				-- being believed — and it is why the documented remedy for an orphan is to
+				-- issue once more rather than to clear a column by hand.
+				credential_orphaned_at = NULL,
+				settlement_attempts = CASE
+					WHEN grant_reconcile_pending_at IS NULL THEN 0
+					ELSE settlement_attempts
+				END,
+				settlement_last_error = CASE
+					WHEN grant_reconcile_pending_at IS NULL THEN NULL
+					ELSE settlement_last_error
+				END,
 				updated_at = $3
 			WHERE subscriber_id = $4
 			  AND credential_reference IS NULL
-		`, credentialReference, issuedAt, now, strings.TrimSpace(subscriberID))
+			  AND provisioning_token = $5
+		`, credentialReference, issuedAt, now, strings.TrimSpace(subscriberID),
+			strings.TrimSpace(claimToken))
 	} else {
 		result, err = d.Conn.ExecContext(ctx, `
 			UPDATE blnk.event_subscribers
 			SET credential_reference = $1,
 				credential_issued_at = $2,
+				credential_cleanup_pending_at = NULL,
+				-- AND THE ORPHAN MARKER, in the same statement. Kafka stores ONE SCRAM
+				-- credential per principal, so the issuance being recorded here REPLACED
+				-- whatever was orphaned: the orphaned secret stopped authenticating the moment
+				-- this one was written. A marker left standing would keep a critical alert
+				-- firing on an exposure that no longer exists, which is how an alert stops
+				-- being believed — and it is why the documented remedy for an orphan is to
+				-- issue once more rather than to clear a column by hand.
+				credential_orphaned_at = NULL,
+				settlement_attempts = CASE
+					WHEN grant_reconcile_pending_at IS NULL THEN 0
+					ELSE settlement_attempts
+				END,
+				settlement_last_error = CASE
+					WHEN grant_reconcile_pending_at IS NULL THEN NULL
+					ELSE settlement_last_error
+				END,
 				updated_at = $3
 			WHERE subscriber_id = $4
 			  AND credential_reference = $5
-		`, credentialReference, issuedAt, now, strings.TrimSpace(subscriberID), *expected)
+			  AND provisioning_token = $6
+		`, credentialReference, issuedAt, now, strings.TrimSpace(subscriberID), *expected,
+			strings.TrimSpace(claimToken))
 	}
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to record subscriber credential",
@@ -1542,7 +3184,7 @@ func (d Datasource) RecordSubscriberCredentialIfUnchanged(
 
 	affected, err := result.RowsAffected()
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to record subscriber credential",
@@ -1550,22 +3192,31 @@ func (d Datasource) RecordSubscriberCredentialIfUnchanged(
 	}
 
 	if affected == 0 {
-		// No row matched, and the two reasons need different answers: the subscriber may not
-		// exist, or it may exist holding a different reference. A separate read distinguishes
-		// them, because reporting a conflict for a subscriber that was never registered
-		// would send an operator looking for a race that did not happen.
-		if _, readErr := d.GetEventSubscriberByID(ctx, subscriberID); readErr != nil {
-			span.RecordError(readErr)
+		// No row matched, and the reasons need different answers: the subscriber may be gone,
+		// the claim may no longer be the caller's, or the row may exist under this claim
+		// holding a different reference. One read settles the first two; only when the claim
+		// is found intact is this the superseding-issuance case.
+		miss, readErr := d.describeFencedWriteMiss(ctx, subscriberID, claimToken,
+			"Failed to record subscriber credential")
+		if readErr != nil {
+			failDatabaseSpan(span, readErr)
 
 			return readErr
 		}
 
+		if miss != subscriberFenceMissOther {
+			classified := fencedWriteMissError(subscriberID, miss)
+			failDatabaseSpan(span, classified)
+
+			return classified
+		}
+
 		conflict := apierror.NewAPIError(apierror.ErrConflict,
 			"The subscriber's credential changed while this issuance was in flight",
-			fmt.Errorf("subscriber %q no longer holds the expected credential reference; "+
+			fmt.Errorf("subscriber %s no longer holds the expected credential reference; "+
 				"a concurrent issuance superseded this one, and the secret it returned is the "+
-				"one that works", subscriberID))
-		span.RecordError(conflict)
+				"one that works", hashedEventIdentifier(strings.TrimSpace(subscriberID))))
+		failDatabaseSpan(span, conflict)
 
 		return conflict
 	}
@@ -1622,24 +3273,40 @@ const defaultSubscriberFenceLease = 15 * time.Second
 // revocation has been outstanding, and a timestamp that moved on every retry would report the
 // age of the last attempt instead — always small, however long the row had been stuck.
 //
+// # It is CONDITIONAL on the provisioning claim
+//
+// This is the FIRST durable write of a deregistration, and it is still fenced. The tombstone
+// freezes the subscriber's authorization for every other operation, so a caller that has lost
+// its claim must not be able to apply it: doing so would freeze a subscriber somebody else is
+// mid-way through issuing a credential for, and that issuance would then fail at its own
+// tombstone check having already written a credential to the broker.
+//
 // Parameters:
 //   - ctx context.Context: cancels the statement.
 //   - subscriberID string: the business key. Required.
 //   - pendingAt time.Time: the instant to record on the FIRST marking.
+//   - fenceToken string: the provisioning claim the caller holds. Required.
 //
 // Returns:
 //   - *model.EventSubscriber: the marked row, carrying the principal and topics to revoke.
-//   - error: a typed not-found when no subscriber matches, or a logged internal error.
+//   - error: a typed conflict when the claim is no longer the caller's, a typed not-found when
+//     no subscriber matches, or a logged internal error.
 func (d Datasource) MarkSubscriberRevocationPending(
 	ctx context.Context,
 	subscriberID string,
 	pendingAt time.Time,
+	fenceToken string,
 ) (*model.EventSubscriber, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkSubscriberRevocationPending")
 	defer span.End()
 
 	if err := requireSubscriberID(subscriberID); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
+
+		return nil, err
+	}
+	if err := requireFenceToken(fenceToken); err != nil {
+		failDatabaseSpan(span, err)
 
 		return nil, err
 	}
@@ -1649,22 +3316,35 @@ func (d Datasource) MarkSubscriberRevocationPending(
 	row := d.Conn.QueryRowContext(ctx, `
 		UPDATE blnk.event_subscribers
 		SET revocation_pending_at = COALESCE(revocation_pending_at, $1),
-			updated_at = $2
+			updated_at = $2,
+			-- EVERY NEW ATTEMPT CLEARS THE LAST ONE'S FAILURE. revocation_failed_at means
+			-- "the most recent attempt was refused by the broker", which is a different fact
+			-- from revocation_pending_at's "a deregistration began" — and the two are only
+			-- readable together if this one describes the LATEST attempt rather than
+			-- accumulating history. Clearing it here, at the start of the attempt, is what
+			-- makes "pending set, failed NULL" mean "in flight or awaiting deletion" and
+			-- "pending set, failed set" mean "the broker refused; fix the broker side".
+			--
+			-- revocation_pending_at deliberately keeps its FIRST value through the COALESCE
+			-- above, because the quantity an operator alerts on is the age of the exposure.
+			revocation_failed_at = NULL
 		WHERE subscriber_id = $3
+		  AND provisioning_token = $4
 		RETURNING `+eventSubscriberColumns,
-		pendingAt, time.Now(), strings.TrimSpace(subscriberID),
+		pendingAt, time.Now(), strings.TrimSpace(subscriberID), strings.TrimSpace(fenceToken),
 	)
 
 	marked, err := scanEventSubscriber(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			notFound := apierror.NewAPIError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, err)
-			span.RecordError(notFound)
+			miss := d.classifyFencedWriteMiss(ctx, subscriberID, fenceToken,
+				"Failed to mark the subscriber for revocation")
+			failDatabaseSpan(span, miss)
 
-			return nil, notFound
+			return nil, miss
 		}
 
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return nil, loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to mark the subscriber for revocation",
@@ -1732,7 +3412,7 @@ func (d Datasource) ClaimSubscriberForProvisioning(
 	defer span.End()
 
 	if err := requireSubscriberID(subscriberID); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return "", err
 	}
@@ -1767,21 +3447,22 @@ func (d Datasource) ClaimSubscriberForProvisioning(
 			// them, because reporting a conflict for a subscriber that was never registered
 			// would send a caller looking for a race that did not happen.
 			if _, readErr := d.GetEventSubscriberByID(ctx, subscriberID); readErr != nil {
-				span.RecordError(readErr)
+				failDatabaseSpan(span, readErr)
 
 				return "", readErr
 			}
 
 			conflict := apierror.NewAPIError(apierror.ErrConflict,
 				"Another credential operation for this subscriber is already in progress",
-				fmt.Errorf("subscriber %q is fenced by a live provisioning claim; retry once it "+
-					"completes or once its lease expires", subscriberID))
-			span.RecordError(conflict)
+				fmt.Errorf("subscriber %s is fenced by a live provisioning claim; retry once it "+
+					"completes or once its lease expires",
+					hashedEventIdentifier(strings.TrimSpace(subscriberID))))
+			failDatabaseSpan(span, conflict)
 
 			return "", conflict
 		}
 
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return "", loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to claim the subscriber for provisioning",
@@ -1793,6 +3474,127 @@ func (d Datasource) ClaimSubscriberForProvisioning(
 	))
 
 	return claimed, nil
+}
+
+// RenewSubscriberProvisioningFence extends a live claim, if the caller still holds it.
+//
+// # Why a leased fence needs a renewal at all
+//
+// The lease has to be SHORT, because it is also the recovery time: a process killed while
+// holding a claim fences that subscriber until the lease runs out, and nothing shortens that
+// wait. But the work done under the claim is a sequence of Kafka administrative round trips,
+// each with its own request timeout, and the number of them is not fixed — reconciling an
+// access model prunes the bindings that are no longer authorised and then grants the ones
+// that are, so the work grows with the size of the change.
+//
+// A single fixed lease cannot satisfy both. Sized for the worst case it becomes a long
+// outage after a crash; sized for recovery it expires mid-operation, and the operation then
+// keeps going with a claim it no longer owns — which is the failure this method exists to
+// remove. Renewal separates the two concerns: the lease stays short, and a caller that is
+// still making progress says so and gets more time.
+//
+// # It is CONDITIONAL, and a miss is fatal to the caller rather than retryable
+//
+// Renewal matches on the token, so it cannot revive a claim that has already been taken
+// over. That is the entire value of calling it: a caller that renews successfully has
+// PROVEN it still owns the subscriber at that instant, so the broker call it is about to
+// make cannot be interleaved with another operation's. A caller whose renewal is refused has
+// learned that it does not own the subscriber, and it must abandon the operation instead of
+// continuing — continuing is precisely how a stale owner comes to overwrite the state a new
+// owner has just established.
+//
+// It deliberately does NOT re-claim. Taking the subscriber back would defeat the fence: the
+// new owner is mid-flight against the broker, and a stale caller that could reclaim would
+// interleave with it while both believed they held exclusive access.
+//
+// The token is NOT rotated. Rotating on renewal would invalidate the token the caller still
+// holds and turn every renewal into a hand-off it then had to be told about; the token
+// identifies the CLAIM, and renewing extends that claim rather than replacing it.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriberID string: the business key. Required.
+//   - token string: the token the claim was taken under. Required.
+//   - lease time.Duration: how much longer the claim is held FROM NOW. Non-positive is
+//     normalised to defaultSubscriberFenceLease, matching the claim path.
+//
+// Returns:
+//   - error: a typed conflict when the claim is no longer the caller's, a typed not-found
+//     when the row is gone, a typed validation error for a missing token, or a logged
+//     internal error.
+func (d Datasource) RenewSubscriberProvisioningFence(
+	ctx context.Context,
+	subscriberID string,
+	token string,
+	lease time.Duration,
+) error {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "RenewSubscriberProvisioningFence")
+	defer span.End()
+
+	if err := requireSubscriberID(subscriberID); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+
+	if err := requireFenceToken(token); err != nil {
+		failDatabaseSpan(span, err)
+
+		return err
+	}
+
+	if lease <= 0 {
+		logrus.WithField("requested_lease", lease.String()).
+			Warnf("Non-positive subscriber provisioning fence renewal; falling back to %s",
+				defaultSubscriberFenceLease)
+		lease = defaultSubscriberFenceLease
+	}
+
+	span.SetAttributes(
+		attribute.String("subscriber.id", subscriberID),
+		attribute.String("subscriber.fence_lease", lease.String()),
+	)
+
+	// provisioning_until is recomputed from NOW() rather than added to its current value, so a
+	// renewal grants exactly one lease of headroom however late it arrives. Extending the
+	// stored value instead would let a caller that renewed often accumulate a fence far longer
+	// than the lease, which is the long-outage-after-a-crash case the short lease exists to
+	// avoid.
+	result, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.event_subscribers
+		SET provisioning_until = NOW() + $1::interval,
+			updated_at = $2
+		WHERE subscriber_id = $3
+		  AND provisioning_token = $4
+	`, lease.String(), time.Now(), strings.TrimSpace(subscriberID), strings.TrimSpace(token))
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to renew the subscriber provisioning fence",
+			"renew_subscriber_provisioning_fence", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to renew the subscriber provisioning fence",
+			"renew_subscriber_provisioning_fence", err)
+	}
+
+	if affected == 0 {
+		// Unlike the release path, a failed renewal is NOT merely logged: the caller is about
+		// to touch the broker and must not, so the reason is classified and returned.
+		miss := d.classifyFencedWriteMiss(ctx, subscriberID, token,
+			"Failed to renew the subscriber provisioning fence")
+		failDatabaseSpan(span, miss)
+
+		return miss
+	}
+
+	return nil
 }
 
 // ReleaseSubscriberProvisioningFence clears a claim, if the caller still holds it.
@@ -1824,7 +3626,7 @@ func (d Datasource) ReleaseSubscriberProvisioningFence(
 	defer span.End()
 
 	if err := requireSubscriberID(subscriberID); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return err
 	}
@@ -1832,7 +3634,7 @@ func (d Datasource) ReleaseSubscriberProvisioningFence(
 	if strings.TrimSpace(token) == "" {
 		err := apierror.NewAPIError(apierror.ErrInvalidInput,
 			"A provisioning claim token is required to release the fence", nil)
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return err
 	}
@@ -1848,7 +3650,7 @@ func (d Datasource) ReleaseSubscriberProvisioningFence(
 		  AND provisioning_token = $3
 	`, time.Now(), strings.TrimSpace(subscriberID), strings.TrimSpace(token))
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to release the subscriber provisioning fence",
@@ -1860,8 +3662,12 @@ func (d Datasource) ReleaseSubscriberProvisioningFence(
 		// The driver could not report a count. The release itself succeeded, and the caller
 		// only logs this outcome, so reporting success is the honest answer rather than
 		// manufacturing a conflict from a bookkeeping gap.
-		logrus.WithError(err).WithField("subscriber", subscriberID).
-			Debug("Could not determine whether the subscriber provisioning fence was released")
+		logrus.WithFields(logrus.Fields{
+			"subscriber_id_hash": hashedEventIdentifier(strings.TrimSpace(subscriberID)),
+			"error_class":        databaseErrorClass(err),
+			"sqlstate":           postgresSQLState(err),
+		}).Debug("Could not determine whether the subscriber provisioning fence was released")
+		logDatabaseDiagnostic("release_subscriber_provisioning_fence", err)
 
 		return nil
 	}
@@ -1869,12 +3675,36 @@ func (d Datasource) ReleaseSubscriberProvisioningFence(
 	if affected == 0 {
 		conflict := apierror.NewAPIError(apierror.ErrConflict,
 			"The subscriber provisioning claim is no longer held by this caller",
-			fmt.Errorf("releasing the provisioning fence of subscriber %q matched no row; the claim "+
-				"expired or was taken over while the operation was in flight", subscriberID))
-		span.RecordError(conflict)
+			fmt.Errorf("releasing the provisioning fence of subscriber %s matched no row because "+
+				subscriberFenceLostMarker+"; the claim expired or was taken over while the "+
+				"operation was in flight",
+				hashedEventIdentifier(strings.TrimSpace(subscriberID))))
+		failDatabaseSpan(span, conflict)
 
 		return conflict
 	}
 
 	return nil
 }
+
+// FIVE FENCE HELPERS WERE RETIRED FROM HERE. Each one's work is now done elsewhere, and this
+// note is the map, because the names read as though the ownership checks had been removed.
+//
+//   * requireProvisioningToken was a SECOND NAME for requireFenceToken. Every fenced write in
+//     this file rejects a blank token before any statement runs — a blank one would compare the
+//     ownership condition against the empty string, matching nothing and presenting as a
+//     spurious lost fence — and three of them word the refusal for their own operation, which
+//     the tests pin. One guard, one implementation, several messages.
+//   * subscriberFenceState read (exists, held) as two columns and subscriberHoldsClaim reduced it
+//     to a boolean. describeFencedWriteMiss replaced both with ONE read of the two facts that
+//     actually decide the answer — whether the claim is still held, and whether a revocation is
+//     pending — and returns a miss REASON rather than a pair a caller has to interpret. That
+//     matters because one of the reasons, subscriberFenceMissOther, deliberately carries no
+//     lost-fence marker: the claim IS still held and the miss has another cause, which a
+//     (exists, held) pair cannot express.
+//   * assertFencedSubscriberRowAffected turned a row count into an error by re-reading the fence.
+//     requireFencedWriteLanded and classifyFencedWriteMiss do that, on the same one read.
+//   * subscriberFenceLost built the typed lost-fence error. Its two live counterparts build the
+//     identical error, and both carry subscriberFenceLostMarker — the phrase every producer of
+//     this conflict must spell identically, because the service branches on it to decide whether
+//     to abandon an operation and compensate.

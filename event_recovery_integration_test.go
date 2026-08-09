@@ -134,6 +134,13 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
+// testSettlementLease held the production hand-off window of thirty seconds. It is RETIRED,
+// because this file deliberately does not use that period: recoveryDeadLetterHandoffLease is the
+// hand-off lease these tests pass, shortened to two seconds so that waiting for it to lapse is an
+// assertion rather than a stall, and recoveryHandOffRaceLease is the ninety-second one used where
+// the window must NOT lapse mid-assertion. Both say so in full below. Wiring a thirty-second
+// constant in here would have quietly reversed those two decisions.
+
 const (
 	// recoveryEventType is a real event string from the catalogue, chosen because it routes
 	// to blnk.transactions — a topic the provisioning script creates. An unrecognised type
@@ -166,6 +173,27 @@ const (
 	// make every restart assertion here a thirty-second wait, so it is shortened rather
 	// than worked around — the mechanism under test is unchanged, only its period.
 	recoveryLease = 2 * time.Second
+
+	// recoveryDeadLetterHandoffLease is the lease a terminal transition holds the row under
+	// while its dead-letter write is owed. It is the same short period as recoveryLease and for
+	// the same reason: it is the delay before the dead-letter repair pass may adopt a row whose
+	// owner died mid-hand-off, so the production default of 30 seconds would turn an assertion
+	// into a wait.
+	//
+	// It is DELIBERATELY NON-ZERO. A zero lease resolves to an instant that has already passed,
+	// which would make the retained claim token advisory rather than exclusive and would let a
+	// second worker dead-letter the same event.
+	recoveryDeadLetterHandoffLease = 2 * time.Second
+
+	// recoveryHandOffRaceLease is the hand-off lease used by the test that races the repair
+	// pass against a dead-letter write in flight, and it is deliberately LONG.
+	//
+	// Every other lease here is short because the test is waiting for it to expire. This one is
+	// the opposite: the assertion is that the window is CLOSED while it holds, so the window
+	// must not be able to lapse mid-assertion. Ninety seconds is far longer than the handful of
+	// database round trips between the hand-off and the last assertion, so a slow or loaded
+	// host cannot turn a correct build into a failure.
+	recoveryHandOffRaceLease = 90 * time.Second
 
 	// recoveryHeldLease is the lease taken by tests that must OBSERVE a row while it is still
 	// held — the "not re-claimable while the lease is live" side of the contract, and the
@@ -829,19 +857,44 @@ func (f *recoveryFixture) deleteSeededRows() {
 	result, err := f.ds.Conn.ExecContext(ctx,
 		`DELETE FROM blnk.event_outbox WHERE starts_with(partition_key, $1)`, f.keyPrefix())
 	if err != nil {
-		f.t.Logf("could not clean up the seeded outbox rows of run %s: %v", f.runID, err)
+		// FAILS the test. This file's own comment above states why the rows matter — a row left
+		// pending is claimable for ever, so the next relay any test starts picks it up — and a
+		// logged line does not stop the run that caused it from reporting success.
+		f.t.Errorf("could not clean up the seeded outbox rows of run %s: %v", f.runID, err)
+	} else if affected, countErr := result.RowsAffected(); countErr != nil {
+		f.t.Logf("cleaned up the seeded outbox rows of run %s (count unavailable: %v)",
+			f.runID, countErr)
+	} else {
+		f.t.Logf("cleaned up %d seeded outbox rows for run %s", affected, f.runID)
+	}
+
+	f.verifySeededRowsGone()
+}
+
+// verifySeededRowsGone asserts this run left no outbox rows behind.
+//
+// Checked even when the delete errored, because "the statement succeeded" and "the table is
+// clean" are different claims and only the second one matters to the next test.
+func (f *recoveryFixture) verifySeededRowsGone() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var remaining int
+	if err := f.ds.Conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM blnk.event_outbox WHERE starts_with(partition_key, $1)`,
+		f.keyPrefix(),
+	).Scan(&remaining); err != nil {
+		f.t.Errorf("could not confirm the seeded outbox rows of run %s were removed: %v",
+			f.runID, err)
 
 		return
 	}
 
-	affected, err := result.RowsAffected()
-	if err != nil {
-		f.t.Logf("cleaned up the seeded outbox rows of run %s (count unavailable: %v)", f.runID, err)
-
-		return
-	}
-
-	f.t.Logf("cleaned up %d seeded outbox rows for run %s", affected, f.runID)
+	assert.Zerof(f.t, remaining,
+		"recovery run %s left %d seeded outbox rows behind under key prefix %q. A pending row "+
+			"stays claimable, so the next relay to start publishes it and some later test's "+
+			"assertions are made against rows it never seeded.",
+		f.runID, remaining, f.keyPrefix())
 }
 
 // relay builds a relay over this fixture's database and the supplied publisher.
@@ -1326,25 +1379,37 @@ func (f *recoveryFixture) claimMine(ctx context.Context, want int, lease time.Du
 // operator API pages through, covering both `failed` and `dead_lettered`.
 //
 // It pages rather than reading the first page, because a shared database holds other runs'
-// dead-lettered events and this run's row is not guaranteed to be on page one.
+// dead-lettered events and this run's row is not guaranteed to be on page one. It pages by
+// CURSOR (PERF-P08), which is what the operator API does now — an offset walk would have cost
+// more per page the deeper this run's row happened to sit.
 func (f *recoveryFixture) inDeadLetterInventory(ctx context.Context, eventID string) bool {
 	f.t.Helper()
 
-	const pageSize = 200
+	const (
+		pageSize = 200
+		maxPages = 10
+	)
 
-	for offset := 0; offset < 10*pageSize; offset += pageSize {
-		page, err := f.ds.ListDeadLetteredEvents(ctx, pageSize, offset)
+	var cursor *model.DeadLetterCursor
+
+	for range maxPages {
+		page, err := f.ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+			Limit:  pageSize,
+			Cursor: cursor,
+		})
 		require.NoError(f.t, err, "paging the dead-letter inventory")
 
-		for _, row := range page {
+		for _, row := range page.Entries {
 			if row.EventID == eventID {
 				return true
 			}
 		}
 
-		if len(page) < pageSize {
+		if !page.HasMore || page.NextCursor == nil {
 			return false
 		}
+
+		cursor = page.NextCursor
 	}
 
 	return false
@@ -1769,6 +1834,107 @@ func (w *recoveryDeadLetterWriter) attemptCount() int {
 
 // messages returns the dead-letter messages that were accepted.
 func (w *recoveryDeadLetterWriter) messages() []kafka.Message {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return append([]kafka.Message(nil), w.written...)
+}
+
+// recoveryBarrierDeadLetterWriter is a dead-letter transport that HOLDS ITS FIRST WRITE OPEN
+// until it is told to proceed, and accepts every write.
+//
+// It exists to make an in-flight dead-letter write observable. The duplicate-dead-letter race
+// this file covers occupies the interval between the exhaustion arm handing a row's
+// dead-letter write to one worker and that worker completing it — an interval with no natural
+// duration, so a test that merely ran two workers concurrently would almost always miss it.
+// Blocking inside WriteMessages pins the interval open for as long as the assertions need,
+// which turns a probabilistic race into a deterministic one.
+//
+// It differs from recoveryDeadLetterWriter deliberately: that one REFUSES writes to strand a
+// row, this one DELAYS one to keep a hand-off in progress. Refusing would settle the row and
+// close the very window under test.
+type recoveryBarrierDeadLetterWriter struct {
+	mu       sync.Mutex
+	attempts int
+	written  []kafka.Message
+
+	// entered is closed when the first write arrives, so a test can wait for the hand-off to
+	// be genuinely in flight rather than sleeping and hoping.
+	entered   chan struct{}
+	enterOnce sync.Once
+
+	// proceed is closed to let the held write complete. Closing is idempotent through
+	// proceedOnce, so a cleanup may release a writer a test already released.
+	proceed     chan struct{}
+	proceedOnce sync.Once
+}
+
+var _ deadLetterMessageWriter = (*recoveryBarrierDeadLetterWriter)(nil)
+
+// newRecoveryBarrierDeadLetterWriter builds a writer whose first write blocks.
+func newRecoveryBarrierDeadLetterWriter() *recoveryBarrierDeadLetterWriter {
+	return &recoveryBarrierDeadLetterWriter{
+		entered: make(chan struct{}),
+		proceed: make(chan struct{}),
+	}
+}
+
+// WriteMessages records the attempt, announces that it has arrived, and waits for permission
+// before accepting the message.
+//
+// The lock is NOT held across the wait. Holding it would make attemptCount block on the
+// barrier too, and the test's proof that the SECOND worker never wrote depends on being able
+// to read the count while the first write is still parked here.
+func (w *recoveryBarrierDeadLetterWriter) WriteMessages(ctx context.Context, msgs ...kafka.Message) error {
+	w.mu.Lock()
+	w.attempts++
+	w.mu.Unlock()
+
+	w.enterOnce.Do(func() { close(w.entered) })
+
+	select {
+	case <-w.proceed:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.written = append(w.written, msgs...)
+
+	return nil
+}
+
+// awaitEntered blocks until a dead-letter write has arrived at the barrier, and fails rather
+// than hanging when none does.
+func (w *recoveryBarrierDeadLetterWriter) awaitEntered(t *testing.T, timeout time.Duration) {
+	t.Helper()
+
+	select {
+	case <-w.entered:
+	case <-time.After(timeout):
+		require.FailNow(t, "no dead-letter write reached the transport",
+			"the hand-off must be IN FLIGHT before the race can be observed; nothing arrived within %s", timeout)
+	}
+}
+
+// release lets the held write complete. It is idempotent.
+func (w *recoveryBarrierDeadLetterWriter) release() {
+	w.proceedOnce.Do(func() { close(w.proceed) })
+}
+
+// attemptCount is how many dead-letter writes have been attempted, including one parked at the
+// barrier. It is the count that has to be exactly one.
+func (w *recoveryBarrierDeadLetterWriter) attemptCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.attempts
+}
+
+// messages returns the dead-letter messages that were accepted.
+func (w *recoveryBarrierDeadLetterWriter) messages() []kafka.Message {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -2500,8 +2666,13 @@ func TestEventRecovery_AttemptsSurviveRestartAndBoundTheRetryBudget(t *testing.T
 		// terminal=false, because this fixture is simulating a TRANSIENT transport failure:
 		// the whole point is that the budget bounds the retries, so declaring the failure
 		// permanent would exhaust the row on attempt one and the boundary would go untested.
+		// The trailing argument is the dead-letter hand-off lease. It only governs the
+		// exhaustion arm, which the final attempt in this loop does take, so a real duration is
+		// supplied rather than zero: on that attempt the row keeps its claim token, and the
+		// lease is what keeps the token exclusive until the dead-letter write lands.
 		outcome, err := fixture.ds.MarkEventFailed(ctx, row.ID, row.ClaimToken,
-			fmt.Sprintf("recovery test: simulated transport failure %d", attempt), retryAfter, false)
+			fmt.Sprintf("recovery test: simulated transport failure %d", attempt), retryAfter, false,
+			recoveryDeadLetterHandoffLease)
 		require.NoErrorf(t, err, "recording failed attempt %d", attempt)
 		require.Equalf(t, attempt, outcome.Attempts,
 			"each recorded failure must advance the counter by exactly one (attempt %d)", attempt)
@@ -2797,6 +2968,179 @@ func TestEventRecovery_ADeadLetterWriteThatFailedIsRetriedUntilTheEventIsPreserv
 	recoveryRequireNoGoroutineLeak(t, baseline)
 }
 
+// TestEventRecovery_ARepairPassRacingTheHandOffProducesExactlyOneDeadLetterWrite is the
+// duplicate-dead-letter race, driven deterministically against the real table.
+//
+// # The defect this covers
+//
+// Two statements hand a dead-letter write to one worker: MarkEventFailed's exhaustion arm and
+// MarkEventPermanentlyFailed. Both RETAIN the row's claim token, and the retained token is
+// documented as what stops two workers each putting a copy of one event on one `<topic>.dlt`
+// topic. Both also used to RELEASE the row's lease in the same statement — `locked_until =
+// NULL` — on the stated reasoning that a failed row is outside the claimable set.
+//
+// It is not. claimFailedEventOutboxForDeadLetter, the repair pass this file already covers,
+// admits exactly `status = failed AND dlt_topic IS NULL AND (locked_until IS NULL OR
+// locked_until < NOW())`. A released lease satisfies that predicate IMMEDIATELY, so the row
+// whose dead-letter write had just been handed to one worker was re-claimable by the very next
+// poll of any other relay instance — with a FRESH token, which is what makes the second write
+// pass its own MarkEventDeadLettered. The retained token did not prevent the duplicate; it only
+// decided which of the two workers got to record it. One event, two copies on one dead-letter
+// topic, and an operator replaying from an inventory that now double-counts.
+//
+// # Why the assertion is a WRITE count and not a database state
+//
+// The duplicate lands in KAFKA, not in PostgreSQL. Whichever worker loses the
+// MarkEventDeadLettered race reports a lost claim and logs it — but its message is already on
+// the topic. So the property is counted at the transport: exactly one write attempt, ever, for
+// one event. A test that asserted only the final row state would have passed against the
+// defect.
+//
+// # Why the window is held open rather than raced for
+//
+// The interval between the hand-off and the write completing has no natural duration, so two
+// workers started together would miss it almost every time and the test would be
+// non-deterministic in the direction that matters — passing while the defect is present. The
+// barrier transport parks the first write inside WriteMessages, which makes the interval last
+// exactly as long as the assertions need.
+//
+// The second worker is driven through recoverUnpreservedDeadLetters, the production caller, and
+// the raw claim is exercised beside it: the pass proves the relay does not adopt the row, and
+// the claim proves the SQL predicate is why.
+func TestEventRecovery_ARepairPassRacingTheHandOffProducesExactlyOneDeadLetterWrite(t *testing.T) {
+	fixture := newRecoveryFixture(t, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	// One row with a one-attempt budget: its first failure spends the budget, which is the
+	// transition that hands the dead-letter write to the worker recording it.
+	seeded := fixture.seedWithBudget(ctx, 1, recoverySpentBudget)
+	eventID := seeded[0]
+
+	claimed := fixture.claimMine(ctx, 1, recoveryHandOffRaceLease)
+	require.Len(t, claimed, 1)
+
+	row := claimed[0]
+	require.NotEmpty(t, row.ClaimToken, "the claim must issue a token; the hand-off is expressed through it")
+
+	// WORKER A spends the budget. The exhaustion arm must retain the token AND hold the lease.
+	outcome, err := fixture.ds.MarkEventFailed(ctx, row.ID, row.ClaimToken,
+		errRecoveryTransportRefused.Error(), 0, false, recoveryHandOffRaceLease)
+	require.NoError(t, err)
+	require.True(t, outcome.Exhausted, "a one-attempt budget must be spent by one failure")
+	require.Equal(t, model.EventOutboxStatusFailed, outcome.Status)
+	require.NotEmpty(t, outcome.ClaimToken,
+		"the exhaustion arm must hand the dead-letter write to this worker by retaining its token")
+
+	// The row worker A carries into the dead-letter write is the one the database now holds, so
+	// the service composes its message and takes its transition from real state.
+	handedOff, err := fixture.ds.GetEventByID(ctx, eventID)
+	require.NoError(t, err)
+	require.NotNil(t, handedOff)
+	require.Equal(t, outcome.ClaimToken, handedOff.ClaimToken)
+
+	// THE LEASE IS THE PRECONDITION OF THE WHOLE TEST, so it is asserted rather than assumed: a
+	// released lease here means the fix under test is absent and every assertion below would be
+	// measuring the wrong thing.
+	preRace := fixture.snapshot(ctx)
+	require.Len(t, preRace, 1)
+	require.True(t, preRace[0].leaseHeld,
+		"the exhaustion arm must HOLD a lease over a row whose dead-letter write it just handed off")
+	require.True(t, preRace[0].leaseLive,
+		"and that lease must still be live: an already-expired lease is the race, not protection from it")
+
+	// Worker A's dead-letter write, parked inside the transport.
+	barrier := newRecoveryBarrierDeadLetterWriter()
+	t.Cleanup(barrier.release)
+
+	publisherA := newRecoveryPublisher("hand-off-owner", nil, seeded).refuseEveryPublish()
+	serviceA := fixture.deadLetterService(publisherA, barrier)
+
+	handOff := make(chan error, 1)
+
+	go func() {
+		_, dltErr := serviceA.DeadLetter(ctx, *handedOff, errRecoveryTransportRefused)
+		handOff <- dltErr
+	}()
+
+	barrier.awaitEntered(t, recoveryGateTimeout)
+
+	// ------------------------------------------------------------------
+	// THE RACE, with worker A's write demonstrably in flight.
+	// ------------------------------------------------------------------
+
+	// The production caller first. Its transport is released, so if the repair claimed the row
+	// it would write immediately and the count below would be 1 rather than 0.
+	publisherB := newRecoveryPublisher("repair-pass", nil, seeded).refuseEveryPublish()
+	writerB := &recoveryDeadLetterWriter{}
+	writerB.release()
+
+	relayB := fixture.relay(publisherB)
+	relayB.deadLetters = fixture.deadLetterService(publisherB, writerB)
+
+	repaired := relayB.recoverUnpreservedDeadLetters(ctx)
+	assert.Zero(t, repaired,
+		"the repair pass must not adopt a row whose dead-letter write is still owed by a live worker: "+
+			"adopting it stamps a fresh token, and the fresh token is what lets a SECOND copy of one "+
+			"event onto one .dlt topic")
+	assert.Zero(t, writerB.attemptCount(),
+		"and it must therefore not have written anything: this count is the duplicate, and it is the "+
+			"assertion that fails when the hand-off lease is released")
+
+	// The predicate underneath it, so a future change that made the pass skip the row for some
+	// other reason cannot silently replace the protection being asserted.
+	contended, err := fixture.ds.ClaimFailedEventOutboxForDeadLetter(ctx, recoveryOversizedBatch, time.Minute)
+	require.NoError(t, err)
+	assert.Emptyf(t, fixture.mine(contended),
+		"the repair CLAIM must exclude the row on the lease alone: its predicate admits failed rows "+
+			"with no dead-letter record whose locked_until is NULL or past, so the held lease is the "+
+			"only thing standing between this event and a duplicate (claim returned %d rows)",
+		len(contended))
+
+	// ------------------------------------------------------------------
+	// The hand-off completes. Exactly one write, and it is worker A's.
+	// ------------------------------------------------------------------
+	barrier.release()
+	require.NoError(t, <-handOff,
+		"the worker holding the token must be able to complete the hand-off it was given")
+
+	assert.Equal(t, 1, barrier.attemptCount(),
+		"exactly one dead-letter write may ever be attempted for one event")
+	assert.Len(t, barrier.messages(), 1,
+		"and exactly one message may reach the dead-letter topic")
+	assert.Zero(t, writerB.attemptCount(),
+		"the repair pass must still have written nothing after the hand-off completed")
+
+	preserved := recoveryDecodeDeadLetters(t, barrier.messages())
+	metadata, ok := preserved[eventID]
+	require.Truef(t, ok, "the one dead-letter message must preserve event %s", eventID)
+	assert.Equal(t, fixture.topic, metadata.OriginalTopic,
+		"the preserved message must name the topic a replay sends it back to")
+
+	// The terminal transition releases what the hand-off held. Left held, the row would sit
+	// un-repairable until the clock passed it — harmless here, because dlt_topic is now set and
+	// the repair predicate excludes it, but the release is what keeps those two defences
+	// independent.
+	states := fixture.snapshot(ctx)
+	require.Len(t, states, 1)
+	assert.Equal(t, model.EventOutboxStatusDeadLettered, states[0].status,
+		"the event must end preserved on its dead-letter topic")
+	assert.Equal(t, DLTFor(fixture.topic), states[0].dltTopic)
+	assert.False(t, states[0].leaseHeld,
+		"the dead-letter transition must release the lease it was protected by; nothing is owed any more")
+	assert.Empty(t, states[0].claimToken,
+		"and it must release the token: a terminal row belongs to nobody")
+
+	// And nothing comes back for it. This is the second, independent defence: dlt_topic is no
+	// longer NULL, so the repair predicate excludes the row whatever its lease says.
+	after, err := fixture.ds.ClaimFailedEventOutboxForDeadLetter(ctx, recoveryOversizedBatch, time.Minute)
+	require.NoError(t, err)
+	assert.Empty(t, fixture.mine(after),
+		"a preserved row must never be re-claimed: repairing it again would rewrite its dead-letter "+
+			"record and put another copy on the topic on every poll for ever")
+}
+
 // TestEventRecovery_EventIDIsUniqueInTheOutbox asserts the index that makes event_id a
 // trustworthy idempotency key.
 //
@@ -3032,7 +3376,9 @@ func (f *recoveryFixture) topicEndOffsets(ctx context.Context, admin *KafkaAdmin
 
 	admin.InvalidateOffsetSnapshot()
 
-	report, err := admin.TopicEndOffsets(ctx, f.topic)
+	// A zero instant asks for end offsets only (PERF-P05): this reads where the log HEAD is,
+	// and a window would add a round trip whose answer nothing here reads.
+	report, err := admin.TopicEndOffsets(ctx, time.Time{}, f.topic)
 	if err != nil {
 		f.t.Skipf("skipping: could not read the end offsets of %s (%v). Provision the topics with "+
 			"`docker compose up kafka-init`.", f.topic, err)

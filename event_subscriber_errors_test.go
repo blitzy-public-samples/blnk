@@ -162,17 +162,27 @@ func TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch(t *testing.T) {
 			// RETRYABLE, and the flag is the whole answer: the log says a retry
 			// re-provisions the same boundary idempotently, so the detail has to say the
 			// same thing or the caller cannot act on it.
+			//
+			// SLA-01: THE TIMEOUT CODE, not EVENT_KAFKA_UNAVAILABLE. This branch used to
+			// answer 503 while the registry half of the SAME issuance answered
+			// SUBSCRIBER_PROVISIONING_TIMEOUT (504) for the identical condition — one wall
+			// clock running out — so a client had to know which internal dependency was slow
+			// in order to recognise a timeout. A 503 additionally asserts that a dependency is
+			// DOWN, which is a different fact and invites a different retry policy.
 			cause:              fmt.Errorf("provisioning: %w", context.DeadlineExceeded),
 			result:             SubscriberProvisioningResult{CredentialWritten: true},
-			wantCode:           apierror.ErrKafkaUnavailable,
+			wantCode:           apierror.ErrSubscriberProvisioningTimeout,
 			wantRetryable:      true,
 			wantCredential:     true,
 			wantReasonFragment: "did not complete within the budget",
 		},
 		{
-			name:               "caller cancelled",
+			name: "caller cancelled",
+			// Also the timeout code. The partial broker state stays in the DETAIL, which is
+			// where it always was and the only place it could be — a status code cannot say
+			// whether a credential the caller does not hold may already exist.
 			cause:              fmt.Errorf("provisioning: %w", context.Canceled),
-			wantCode:           apierror.ErrKafkaUnavailable,
+			wantCode:           apierror.ErrSubscriberProvisioningTimeout,
 			wantRetryable:      true,
 			wantReasonFragment: "cancelled",
 		},
@@ -210,7 +220,15 @@ func TestProvisioningFailure_ReturnsABoundedDetailForEveryBranch(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			service, subscriber := newSubscriberErrorFixture(t)
 
-			err := service.provisioningFailure(subscriber, tc.result, tc.cause)
+			// ctx and a claim token are threaded in because provisioningFailure now SETTLES
+			// what the broker was left holding before it classifies the failure. The fixture's
+			// store has no claim on this row, so the settlement write is refused — which is
+			// deliberate here: this table is about the typed error each outcome produces, and
+			// the settlement behaviour has its own tests. A refused settlement must not change
+			// the answer the caller receives, and that is exactly what this asserts.
+			err := service.provisioningFailure(
+				context.Background(), subscriber, "settlement-fence-token", tc.result, tc.cause,
+			)
 			require.Error(t, err)
 
 			var apiErr apierror.APIError
@@ -343,8 +361,16 @@ func TestSubscriberBrokerReconciliation_ReturnsABoundedDetailForEveryPath(t *tes
 			name:          "creating the new grants",
 			failingMethod: "GrantSubscriberAccess",
 			invoke: func(run *subscriberLifecycle) error {
+				// AN AUTHORIZATION CHANGE, not a rename. ADMIN-02 means the broker is touched
+				// only when the recorded authorization could have moved, so a rename no longer
+				// reaches the grant step at all — see
+				// TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved.
+				// Supplying the topic list is what puts this case on the path it is testing.
 				_, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
-					SubscriberUpdate{Name: &renamed})
+					SubscriberUpdate{
+						Name:             &renamed,
+						AuthorizedTopics: []string{"blnk.transactions", "blnk.balances"},
+					})
 
 				return err
 			},

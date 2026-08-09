@@ -203,6 +203,15 @@ func TestDeadLetterEvent_WireContract(t *testing.T) {
 		{name: "FirstAttemptedAt", jsonKey: "first_attempted_at", omitEmpty: true},
 		{name: "LastAttemptedAt", jsonKey: "last_attempted_at", omitEmpty: true},
 		{name: "PayloadBytes", jsonKey: "payload_bytes"},
+		// The RETENTION GATE. Both are optional and their ABSENCE is the load-bearing
+		// state: no resolved_at means the failure is still outstanding, which is what keeps
+		// the row out of the retention purge and inside the dead-letter age gauge. They are
+		// on the wire because they change what the reader should do about the entry —
+		// without them an operator paging the inventory once retention is enabled cannot
+		// tell the failures still needing attention from the ones already closed, which is
+		// the distinction triage is entirely about.
+		{name: "ResolvedAt", jsonKey: "resolved_at", omitEmpty: true},
+		{name: "ResolutionNote", jsonKey: "resolution_note", omitEmpty: true},
 	})
 
 	t.Run("a bare entry omits every optional key and keeps the mandatory ones", func(t *testing.T) {
@@ -221,7 +230,7 @@ func TestDeadLetterEvent_WireContract(t *testing.T) {
 				"topic", "status", "attempts", "payload_bytes",
 			},
 			keys,
-			"the nine non-optional keys must always be present, and the six optional ones absent "+
+			"the nine non-optional keys must always be present, and the eight optional ones absent "+
 				"rather than null, so a client never has to distinguish null from missing")
 	})
 
@@ -361,11 +370,24 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 		{name: "Failed", jsonKey: "failed"},
 		{name: "DeadLettered", jsonKey: "dead_lettered"},
 		{name: "Replaying", jsonKey: "replaying"},
+		{name: "ProducerAtomicity", jsonKey: "producer_atomicity", omitEmpty: true},
 		{name: "TopicEndOffsets", jsonKey: "topic_end_offsets", omitEmpty: true},
 		{name: "OffsetsComplete", jsonKey: "offsets_complete"},
 		{name: "MissingTopics", jsonKey: "missing_topics", omitEmpty: true},
 		{name: "PartitionsUnavailable", jsonKey: "partitions_unavailable"},
+		// The measured windows are part of the published contract because the verdict is a
+		// statement ABOUT them: each row's stored coordinate is checked for membership in the
+		// window of its own partition. A verdict reported without its windows cannot be
+		// audited by the reader, which is how the unbounded comparison this replaced came to
+		// present itself as conclusive.
+		{name: "MeasuredWindows", jsonKey: "measured_windows", omitEmpty: true},
 		{name: "OffsetsMeasuredAt", jsonKey: "offsets_measured_at", omitEmpty: true},
+		// PERF-P04/PERF-P05: the window the two unbounded figures were measured over. It is
+		// part of the published contract because the dispatched count and the reconciliation
+		// mean different things over different windows, and a caller that could not read the
+		// window would be comparing yesterday's figure against today's.
+		{name: "WindowStart", jsonKey: "window_start", omitEmpty: true},
+		{name: "WindowSeconds", jsonKey: "window_seconds", omitEmpty: true},
 		{name: "GeneratedAt", jsonKey: "generated_at"},
 		{name: "Reconciliation", jsonKey: "reconciliation", omitEmpty: true},
 	})
@@ -472,33 +494,164 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 		assert.Equal(t, "0", string(decoded["partitions_unavailable"]),
 			"an explicit zero is the reassuring answer and must never be omitted")
 	})
+
+	// The owed-event side of the reconciliation. The per-status counts above can only see
+	// events that were CAPTURED, and two families are captured from an intent recorded
+	// earlier, so a reading that omitted them would report a consistent table while alerts
+	// and batch summaries were still owed.
+	t.Run("outstanding producer intents are reported, and an unread reading is omitted rather than zeroed", func(t *testing.T) {
+		unread := marshalToKeys(t, apimodel.EventOutboxStatsResponse{Dispatched: 7})
+
+		assert.NotContains(t, unread, "producer_atomicity",
+			"a failed read must omit the object: zero means 'nothing is owed', which is the one "+
+				"answer a zero-loss check must not be given when the truth is 'we could not tell'")
+
+		began := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+		read := marshalToKeys(t, apimodel.EventOutboxStatsResponse{
+			Dispatched: 7,
+			ProducerAtomicity: &apimodel.ProducerAtomicityStats{
+				MonitorHandoffPending:    2,
+				MonitorHandoffFailed:     1,
+				UnfinalizedBatches:       3,
+				OldestUnfinalizedBatchAt: &began,
+			},
+		})
+
+		require.Contains(t, read, "producer_atomicity",
+			"a successful read must be reported even when everything in it is zero")
+
+		var atomicity map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(read["producer_atomicity"], &atomicity))
+
+		assert.Equal(t, "2", string(atomicity["monitor_handoff_pending"]))
+		assert.Equal(t, "0", string(atomicity["monitor_handoff_processing"]),
+			"a zero count is an explicit 0 here for the same reason it is above: an omitted key "+
+				"reads as 'no such state'")
+		assert.Equal(t, "1", string(atomicity["monitor_handoff_failed"]),
+			"a spent evaluation budget is a monitor alert that will never exist, and it is the "+
+				"number an operator alerts on")
+		assert.Equal(t, "3", string(atomicity["unfinalized_batches"]))
+		assert.Equal(t, `"2026-03-04T05:06:07Z"`, string(atomicity["oldest_unfinalized_batch_at"]),
+			"age is what separates a large batch still running from an abandoned one, so the count "+
+				"alone is not actionable and this is")
+	})
+}
+
+// TestProducerAtomicityStats_WireContract pins the owed-event projection reported inside
+// GET /events/stats.
+//
+// It is contracted separately from the response that carries it because it answers a
+// different question. The per-status counts are a census of rows that EXIST; this object
+// counts intents recorded atomically with a mutation from which an event has not been
+// captured yet — events that are owed and are in no status at all. A reconciliation that
+// read only the census would find it internally consistent while alerts and batch summaries
+// were still pending, which is precisely the blind spot requirement R-2 closes.
+func TestProducerAtomicityStats_WireContract(t *testing.T) {
+	assertWireContract(t, apimodel.ProducerAtomicityStats{}, []fieldContract{
+		{name: "MonitorHandoffPending", jsonKey: "monitor_handoff_pending"},
+		{name: "MonitorHandoffProcessing", jsonKey: "monitor_handoff_processing"},
+		{name: "MonitorHandoffCompleted", jsonKey: "monitor_handoff_completed"},
+		{name: "MonitorHandoffFailed", jsonKey: "monitor_handoff_failed"},
+		{name: "UnfinalizedBatches", jsonKey: "unfinalized_batches"},
+		{name: "OldestUnfinalizedBatchAt", jsonKey: "oldest_unfinalized_batch_at", omitEmpty: true},
+	})
+
+	// Driven from the handoff's OWN status vocabulary rather than from a list restated here,
+	// for the same reason the per-status census is: the handoff reuses the lineage outbox
+	// statuses, and one of them left uncounted would make the reported handoff totals sum to
+	// less than the table's row count — a shortfall a zero-loss check cannot tell apart from
+	// an evaluation that was silently dropped.
+	t.Run("every handoff status is reported as an explicit count", func(t *testing.T) {
+		decoded := marshalToKeys(t, apimodel.ProducerAtomicityStats{})
+
+		for _, status := range []string{
+			model.OutboxStatusPending,
+			model.OutboxStatusProcessing,
+			model.OutboxStatusCompleted,
+			model.OutboxStatusFailed,
+		} {
+			key := "monitor_handoff_" + status
+			require.Contains(t, decoded, key,
+				"the handoff moves through the lineage outbox statuses, and %q must be counted or "+
+					"the reported totals sum to less than the table's row count", status)
+			assert.Equal(t, "0", string(decoded[key]),
+				"a zero count must be an explicit 0, never an omitted key")
+		}
+	})
+
+	// The one window the coordinator cannot close, and the reason the timestamp is not
+	// decoration: a batch that began and never reported is indistinguishable from a large
+	// batch still running until you know how long ago it started.
+	t.Run("no outstanding batch omits the age but still reports the count", func(t *testing.T) {
+		decoded := marshalToKeys(t, apimodel.ProducerAtomicityStats{})
+
+		assert.Equal(t, "0", string(decoded["unfinalized_batches"]),
+			"an explicit zero is the reassuring answer: nothing began without reporting")
+		assert.NotContains(t, decoded, "oldest_unfinalized_batch_at",
+			"there is no oldest outstanding batch, so there is no instant to report — and a null "+
+				"would make a client parse a timestamp that does not exist")
+	})
 }
 
 // TestOutboxReconciliationResult_WireContract pins the verdict acceptance criterion V-2 is
 // scored on, and it exists because the response used to carry the two SIDES of the
 // comparison and no verdict at all.
 //
-// Leaving the verdict to the caller meant every caller re-implemented the arithmetic, the
-// directionality and the retention caveat, and each got its own chance to get them wrong in a
-// way that reads as success. Two specific mistakes are what this shape prevents: a caller
-// that diffs the two totals and alerts on any difference alerts constantly, because
-// redeliveries and replays legitimately make the broker side larger; and a caller that
-// compares for equality reports a green result on a reading retention has already invalidated.
+// Leaving the verdict to the caller meant every caller re-implemented the comparison, and each
+// got its own chance to get it wrong in a way that reads as success. The comparison itself was
+// then rebuilt, because the only one available from two totals was unsound: whole-topic
+// cumulative end offsets and currently-retained outbox rows share no baseline, no readability
+// guarantee, no topic incarnation and no producer. So the wire shape carries a BOUNDED MAPPING
+// — how many claims were placed inside a measured offset window, and one count per reason the
+// rest could not be — plus the window the verdict covers.
 func TestOutboxReconciliationResult_WireContract(t *testing.T) {
 	assertWireContract(t, apimodel.OutboxReconciliationResult{}, []fieldContract{
 		{name: "TerminalEvents", jsonKey: "terminal_events"},
-		// The three corroboration counts sit here rather than at the end, mirroring the
-		// service type's own declaration order: encoding/json emits keys in declaration
-		// order, so a reader comparing a response against blnk.OutboxReconciliation reads
-		// the two in the same sequence.
-		{name: "ConfirmedEvents", jsonKey: "confirmed_events"},
+		// The corroboration counts sit here rather than at the end, mirroring the service
+		// type's own declaration order: encoding/json emits keys in declaration order, so a
+		// reader comparing a response against blnk.OutboxReconciliation reads the two in the
+		// same sequence.
+		{name: "CorroboratedEvents", jsonKey: "corroborated_events"},
 		{name: "UnconfirmedEvents", jsonKey: "unconfirmed_events"},
+		{name: "UnmeasuredEvents", jsonKey: "unmeasured_events"},
+		{name: "AgedOutEvents", jsonKey: "aged_out_events"},
+		{name: "BeyondEndEvents", jsonKey: "beyond_end_events"},
 		{name: "DuplicatedRecords", jsonKey: "duplicated_records"},
 		{name: "MessagesWritten", jsonKey: "messages_written"},
+		// records_retained and blnk_record_share are the SHARED-TOPIC correction, and they are
+		// on the wire because without them a shared log cannot be reconciled at all. An end
+		// offset counts every record the topic ever accepted from every producer; retention
+		// then deletes an arbitrary prefix of them. Measuring Blnk's surplus against the whole
+		// retained log therefore compares Blnk's events against somebody else's traffic, and
+		// the answer moves whenever that traffic does. blnk_record_share is the part of the
+		// retained log this reconciliation actually attributed to Blnk's own published events,
+		// which is the only denominator the surplus means anything against. Neither is the
+		// verdict — that is what conclusive and loss_detected are for — and both are reported
+		// so an operator reading a surplus can see which log it was drawn from.
+		{name: "RecordsRetained", jsonKey: "records_retained"},
+		{name: "BlnkRecordShare", jsonKey: "blnk_record_share"},
+		// FIVE FIELDS WERE RETIRED FROM BETWEEN THESE TWO, and their absence is the point.
+		// purged_events, all_time_terminal_events, verified_records, unverifiable_records and
+		// missing_records belonged to a whole-history reconciliation that corrected for retention
+		// with a purge log and checked each claimed coordinate against the broker in Go. Both
+		// mechanisms were replaced by drawing the comparison INSIDE the per-partition windows the
+		// offsets were measured in and classifying every claim in SQL over those same windows,
+		// which is what corroborated / aged_out / beyond_end / unmeasured above report. Their
+		// service-layer counterparts went with the rewrite; leaving the wire half behind meant
+		// five documented fields that could only ever be zero, and a reconciliation script
+		// reading verified_records: 0 beside a green verdict concludes nothing was verified.
 		{name: "Overhead", jsonKey: "overhead"},
 		{name: "LossDetected", jsonKey: "loss_detected"},
 		{name: "Conclusive", jsonKey: "conclusive"},
+		// PERF-P05: the population the verdict compared. Windowed is NOT omitempty — a
+		// diagnostic-only verdict must say so explicitly, and an omitted false would read as
+		// a field the server forgot rather than as a comparison it declined to conclude from.
+		{name: "WindowStart", jsonKey: "window_start", omitEmpty: true},
+		{name: "Windowed", jsonKey: "windowed"},
 		{name: "Caveats", jsonKey: "caveats", omitEmpty: true},
+		{name: "CoveredFrom", jsonKey: "covered_from", omitEmpty: true},
+		{name: "CoveredTo", jsonKey: "covered_to", omitEmpty: true},
+		{name: "OldestTerminalAt", jsonKey: "oldest_terminal_at", omitEmpty: true},
 		{name: "Summary", jsonKey: "summary"},
 		{name: "MeasuredAt", jsonKey: "measured_at"},
 	})
@@ -507,8 +660,9 @@ func TestOutboxReconciliationResult_WireContract(t *testing.T) {
 		// The API shape and the computed verdict must not drift: a field added to the
 		// service-layer OutboxReconciliation and not surfaced here is a finding the daily
 		// check produces and the API silently withholds. Compared as SETS of names, because
-		// the two types legitimately differ in wire tags and in Summary's form — a method
-		// on one, a field on the other.
+		// the two types legitimately differ in wire tags, in Summary's form — a method on one,
+		// a field on the other — and in the time fields' nullability, which the wire needs and
+		// the computation does not.
 		wire := reflect.TypeOf(apimodel.OutboxReconciliationResult{})
 		service := reflect.TypeOf(blnk.OutboxReconciliation{})
 
@@ -528,61 +682,108 @@ func TestOutboxReconciliationResult_WireContract(t *testing.T) {
 			"the wire Summary must be rendered by the service's own method rather than reworded here")
 	})
 
-	t.Run("a healthy result reports positive overhead and no loss", func(t *testing.T) {
+	t.Run("a healthy result states what it corroborated and over which window", func(t *testing.T) {
 		measuredAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+		from := measuredAt.Add(-24 * time.Hour)
 		decoded := marshalToKeys(t, apimodel.OutboxReconciliationResult{
-			TerminalEvents:  1000,
-			MessagesWritten: 1003,
-			Overhead:        3,
-			LossDetected:    false,
-			Conclusive:      true,
-			Summary:         "1000 outbox rows against 1003 broker records",
-			MeasuredAt:      measuredAt,
+			TerminalEvents:     1000,
+			CorroboratedEvents: 1000,
+			MessagesWritten:    1003,
+			RecordsRetained:    1003,
+			BlnkRecordShare:    1000,
+			LossDetected:       false,
+			Conclusive:         true,
+			CoveredFrom:        &from,
+			CoveredTo:          &measuredAt,
+			OldestTerminalAt:   &from,
+			Summary:            "every one of the 1000 outbox rows names a distinct record",
+			MeasuredAt:         measuredAt,
 		})
 
-		assert.Equal(t, "3", string(decoded["overhead"]),
-			"a small positive overhead is the HEALTHY state — redeliveries and replays — not a defect")
+		assert.Equal(t, "1000", string(decoded["corroborated_events"]),
+			"the corroborated count IS the green verdict; a caller must be able to see it rather "+
+				"than infer it from a difference of totals")
+		assert.Equal(t, "1000", string(decoded["blnk_record_share"]),
+			"how much of a shared topic's traffic the verdict accounts for is not derivable from "+
+				"messages_written, so it is reported")
 		assert.Equal(t, "false", string(decoded["loss_detected"]))
 		assert.Equal(t, "true", string(decoded["conclusive"]))
+		assert.Equal(t, `"2026-03-03T05:06:07Z"`, string(decoded["covered_from"]),
+			"a green verdict must state the window it covers, or a reconciliation over a pruned "+
+				"outbox looks complete")
 		assert.NotContains(t, decoded, "caveats",
 			"a conclusive result has no caveats, so an empty list is omitted rather than reported")
 		assert.Equal(t, `"2026-03-04T05:06:07Z"`, string(decoded["measured_at"]))
 	})
 
-	t.Run("a shortfall is reported as negative overhead rather than clamped", func(t *testing.T) {
+	t.Run("a record beyond the log end is reported as loss with its own count", func(t *testing.T) {
 		decoded := marshalToKeys(t, apimodel.OutboxReconciliationResult{
-			TerminalEvents:  1000,
-			MessagesWritten: 996,
-			Overhead:        -4,
-			LossDetected:    true,
-			Conclusive:      true,
+			TerminalEvents:     1000,
+			CorroboratedEvents: 960,
+			BeyondEndEvents:    40,
+			MessagesWritten:    40,
+			LossDetected:       true,
+			Conclusive:         false,
+			Caveats: []string{
+				"40 row(s) name an offset at or beyond the end of their partition's log",
+			},
 		})
 
-		assert.Equal(t, "-4", string(decoded["overhead"]),
-			"the sign IS the finding: clamping it at zero would erase the only signal this check "+
-				"carries, and the field must therefore be signed on the wire too")
+		assert.Equal(t, "40", string(decoded["beyond_end_events"]),
+			"the count that SETS loss_detected must be on the wire: without it a caller cannot "+
+				"tell a recreated topic from any other inconclusive reading")
 		assert.Equal(t, "true", string(decoded["loss_detected"]))
+	})
+
+	t.Run("each reason a claim could not be placed has its own key", func(t *testing.T) {
+		// Collapsing any two of these would destroy the distinction an operator acts on:
+		// retention is routine, an unmeasured partition is a broker problem, an unconfirmed
+		// row is a relay problem, and a beyond-end offset is a recreated topic.
+		decoded := marshalToKeys(t, apimodel.OutboxReconciliationResult{
+			TerminalEvents:     100,
+			CorroboratedEvents: 60,
+			UnconfirmedEvents:  10,
+			UnmeasuredEvents:   12,
+			AgedOutEvents:      15,
+			BeyondEndEvents:    3,
+			Conclusive:         false,
+		})
+
+		for key, want := range map[string]string{
+			"unconfirmed_events": "10",
+			"unmeasured_events":  "12",
+			"aged_out_events":    "15",
+			"beyond_end_events":  "3",
+		} {
+			assert.Equal(t, want, string(decoded[key]),
+				"%s must be reported on its own, and never omitted: a zero is the reassuring "+
+					"answer and an absent key reads as one", key)
+		}
 	})
 
 	t.Run("an inconclusive result is never mistaken for a clean one", func(t *testing.T) {
 		decoded := marshalToKeys(t, apimodel.OutboxReconciliationResult{
-			TerminalEvents:  1000,
-			MessagesWritten: 400,
-			Overhead:        -600,
-			LossDetected:    true,
-			Conclusive:      false,
-			Caveats:         []string{"retention has deleted records from blnk.transactions"},
+			TerminalEvents:     1000,
+			CorroboratedEvents: 400,
+			AgedOutEvents:      600,
+			MessagesWritten:    1000,
+			LossDetected:       false,
+			Conclusive:         false,
+			Caveats: []string{
+				"600 row(s) name a record Kafka retention has already deleted",
+			},
 		})
 
 		require.Contains(t, decoded, "conclusive")
 		assert.Equal(t, "false", string(decoded["conclusive"]),
 			"the key must be present on the inconclusive path: a vanishing key would leave the most "+
 				"dangerous state looking like the healthiest one")
-		assert.Equal(t, `["retention has deleted records from blnk.transactions"]`, string(decoded["caveats"]),
-			"an operator must be told WHY the count cannot be trusted, not merely that it cannot")
+		assert.Equal(t, `["600 row(s) name a record Kafka retention has already deleted"]`,
+			string(decoded["caveats"]),
+			"an operator must be told WHY the mapping is incomplete, not merely that it is")
 	})
 
-	t.Run("a stats response with no offsets carries no verdict", func(t *testing.T) {
+	t.Run("a stats response with no offsets carries no verdict and no windows", func(t *testing.T) {
 		// With nothing measured on the broker side there is no verdict to report, and
 		// emitting an empty one would read as "reconciled, nothing written".
 		decoded := marshalToKeys(t, apimodel.EventOutboxStatsResponse{Dispatched: 12})
@@ -590,6 +791,59 @@ func TestOutboxReconciliationResult_WireContract(t *testing.T) {
 		assert.NotContains(t, decoded, "reconciliation",
 			"a deployment with no brokers is a legitimate steady state; an absent verdict is honest "+
 				"where a zeroed one would be a false all-clear")
+		assert.NotContains(t, decoded, "measured_windows",
+			"no windows were measured, so none are reported rather than an empty array that reads "+
+				"as 'the broker has no partitions'")
+	})
+}
+
+// TestMeasuredOffsetWindow_WireContract pins the windows the verdict is computed against.
+//
+// They are on the response because the verdict is a statement ABOUT them: each outbox row's
+// stored coordinate is checked for membership in the window of its own partition. A verdict
+// reported without its windows cannot be audited by the reader — which is exactly how the
+// unbounded comparison this replaced came to present itself as conclusive.
+func TestMeasuredOffsetWindow_WireContract(t *testing.T) {
+	assertWireContract(t, apimodel.MeasuredOffsetWindow{}, []fieldContract{
+		{name: "Topic", jsonKey: "topic"},
+		{name: "Partition", jsonKey: "partition"},
+		{name: "FirstOffset", jsonKey: "first_offset"},
+		{name: "EndOffset", jsonKey: "end_offset"},
+		{name: "Records", jsonKey: "records"},
+	})
+
+	t.Run("the projection carries every measured window, in order", func(t *testing.T) {
+		windows := apimodel.NewMeasuredOffsetWindows([]model.PartitionOffsetInterval{
+			{Topic: "blnk.transactions", Partition: 0, FirstOffset: 0, EndOffset: 500},
+			{Topic: "blnk.transactions", Partition: 1, FirstOffset: 120, EndOffset: 640},
+			{Topic: "blnk.balances", Partition: 0, FirstOffset: 9_000, EndOffset: 9_000},
+		})
+
+		require.Len(t, windows, 3)
+		assert.Equal(t, apimodel.MeasuredOffsetWindow{
+			Topic: "blnk.transactions", Partition: 0, FirstOffset: 0, EndOffset: 500, Records: 500,
+		}, windows[0])
+		assert.Equal(t, int64(520), windows[1].Records,
+			"the width is reported so a reader does not have to subtract")
+		assert.Zero(t, windows[2].Records,
+			"a partition every record of which has aged out is a real, measured window of zero "+
+				"records, not a missing one")
+	})
+
+	t.Run("partition zero and offset zero survive the projection", func(t *testing.T) {
+		// The first record on a fresh partition is at 0/0, so no field here may be omitempty:
+		// a response that dropped them would describe a window starting nowhere.
+		decoded := marshalToKeys(t, apimodel.MeasuredOffsetWindow{Topic: "blnk.system"})
+
+		assert.Equal(t, "0", string(decoded["partition"]))
+		assert.Equal(t, "0", string(decoded["first_offset"]))
+		assert.Equal(t, "0", string(decoded["end_offset"]))
+		assert.Equal(t, "0", string(decoded["records"]))
+	})
+
+	t.Run("nothing measured projects to nothing", func(t *testing.T) {
+		assert.Nil(t, apimodel.NewMeasuredOffsetWindows(nil),
+			"a nil projection lets the response omit the key rather than report an empty array")
 	})
 }
 
@@ -601,10 +855,18 @@ func TestOutboxReconciliationResult_WireContract(t *testing.T) {
 func TestCreateSubscriber_RequestContract(t *testing.T) {
 	assertWireContract(t, apimodel.CreateSubscriber{}, []fieldContract{
 		{name: "SubscriberID", jsonKey: "subscriber_id"},
-		{name: "Name", jsonKey: "name", binding: "required"},
+		// NO binding:"required" on Name. The requirement is real and is enforced by
+		// Validate; the tag made a missing name a BINDER failure, answering
+		// GEN_MALFORMED_REQUEST where the endpoint's contract and every other rule this
+		// DTO applies answer GEN_VALIDATION_ERROR. It also split one rule across two
+		// mechanisms, so an omitted name and a whitespace-only one produced different
+		// codes for the same broken rule.
+		{name: "Name", jsonKey: "name"},
 		{name: "AuthorizedTopics", jsonKey: "authorized_topics", binding: "max=16,dive,max=249"},
 		{name: "PartitionKeyPrefix", jsonKey: "partition_key_prefix", omitEmpty: true},
-		{name: "WebhookURL", jsonKey: "webhook_url", omitEmpty: true},
+		// NO WebhookURL. C-01: this route is not deprecated and is not fronted by the
+		// sunset guard, so accepting legacy webhook state here left a write path open
+		// after the four guarded routes had begun answering 410 Gone.
 	})
 
 	t.Run("the principal and the consumer group are not accepted from a client", func(t *testing.T) {
@@ -624,14 +886,16 @@ func TestCreateSubscriber_RequestContract(t *testing.T) {
 		}
 	})
 
-	t.Run("name is the only mandatory field", func(t *testing.T) {
+	t.Run("no field is mandatory at the BINDER, name included", func(t *testing.T) {
+		// C-24. name IS required, and the requirement now lives in Validate rather than in
+		// a binding tag, so a missing one answers GEN_VALIDATION_ERROR like every other
+		// broken rule this DTO applies instead of the binder's GEN_MALFORMED_REQUEST. The
+		// binder keeps only what it is the right layer for: TYPE errors, and the bounds
+		// below.
 		subjectType := reflect.TypeOf(apimodel.CreateSubscriber{})
 
 		for index := 0; index < subjectType.NumField(); index++ {
 			field := subjectType.Field(index)
-			if field.Name == "Name" {
-				continue
-			}
 
 			// A field may carry BOUNDS without being mandatory, and the distinction is the
 			// point: authorized_topics is bounded so an oversized grant is refused at the
@@ -639,9 +903,10 @@ func TestCreateSubscriber_RequestContract(t *testing.T) {
 			// entirely is still legal and yields the fail-closed empty grant.
 			binding := field.Tag.Get("binding")
 			assert.NotContains(t, strings.Split(binding, ","), "required",
-				"%s must stay optional: the service derives the id when it is omitted, and an "+
-					"empty topic grant is the deliberate fail-closed default rather than a "+
-					"missing value", field.Name)
+				"%s must not be binder-mandatory: the service derives the id when it is omitted, "+
+					"an empty topic grant is the deliberate fail-closed default rather than a "+
+					"missing value, and name's requirement belongs to Validate so that an omitted "+
+					"and a blank name answer the same code", field.Name)
 		}
 	})
 
@@ -663,7 +928,7 @@ func TestCreateSubscriber_RequestContract(t *testing.T) {
 // point is telling "omitted" from "set to empty".
 func TestUpdateSubscriber_RequestContract(t *testing.T) {
 	assertWireContract(t, apimodel.UpdateSubscriber{}, []fieldContract{
-		{name: "Name", jsonKey: "name", omitEmpty: true},
+		{name: "Name", jsonKey: "name", omitEmpty: true, binding: "omitempty,max=1024"},
 		{
 			name:      "AuthorizedTopics",
 			jsonKey:   "authorized_topics",
@@ -671,13 +936,15 @@ func TestUpdateSubscriber_RequestContract(t *testing.T) {
 			binding:   "omitempty,max=16,dive,max=249",
 		},
 		{name: "PartitionKeyPrefix", jsonKey: "partition_key_prefix", omitEmpty: true},
-		{name: "WebhookURL", jsonKey: "webhook_url", omitEmpty: true},
+		// NO WebhookURL, for the reason given on CreateSubscriber. PUT
+		// /subscribers/:subscriber_id/webhook-subscription is the guarded write path, and
+		// the destination policy it applies is unchanged.
 	})
 
 	t.Run("every scalar is a pointer so absent and empty stay distinguishable", func(t *testing.T) {
 		subjectType := reflect.TypeOf(apimodel.UpdateSubscriber{})
 
-		for _, name := range []string{"Name", "PartitionKeyPrefix", "WebhookURL"} {
+		for _, name := range []string{"Name", "PartitionKeyPrefix"} {
 			field, ok := subjectType.FieldByName(name)
 			require.True(t, ok, "UpdateSubscriber must declare %s", name)
 			assert.Equal(t, reflect.Ptr, field.Type.Kind(),
@@ -733,18 +1000,53 @@ func TestUpdateSubscriber_RequestContract(t *testing.T) {
 func TestSubscriberResponse_WireContract(t *testing.T) {
 	assertWireContract(t, apimodel.SubscriberResponse{}, []fieldContract{
 		{name: "SubscriberID", jsonKey: "subscriber_id"},
+		// Not omitempty, and that is the contract rather than an oversight: the pseudonym is
+		// the ONLY way to resolve a token read off a lag alert or a log line back to a
+		// subscriber, so a response that omitted it for some rows would leave those rows
+		// unreachable from the observability surface. It is derived from subscriber_id, which
+		// is never blank, so there is no legitimate empty case to omit.
+		{name: "SubscriberIDHash", jsonKey: "subscriber_id_hash"},
 		{name: "Name", jsonKey: "name"},
 		{name: "KafkaPrincipal", jsonKey: "kafka_principal"},
 		{name: "ConsumerGroupID", jsonKey: "consumer_group_id"},
 		{name: "AuthorizedTopics", jsonKey: "authorized_topics"},
 		{name: "PartitionKeyPrefix", jsonKey: "partition_key_prefix", omitEmpty: true},
 		{name: "EnforcedAccess", jsonKey: "enforced_access"},
+		// Present unconditionally, and both of them deliberately. A client that had to infer
+		// "no credential will be issued for this row" from the ABSENCE of a field would infer
+		// it wrong, and the state was previously discoverable only by triggering the refusal on
+		// a later call.
+		{name: "CredentialIssuanceBlocked", jsonKey: "credential_issuance_blocked"},
+		{name: "CredentialIssuanceBlockedReason", jsonKey: "credential_issuance_blocked_reason", omitEmpty: true},
 		{name: "CredentialFingerprint", jsonKey: "credential_fingerprint", omitEmpty: true},
 		{name: "CredentialIssuedAt", jsonKey: "credential_issued_at", omitEmpty: true},
-		{name: "WebhookURL", jsonKey: "webhook_url", omitEmpty: true},
+		// NO WebhookURL. C-01: the recorded endpoint is disclosed by GET
+		// /subscribers/:subscriber_id/webhook-subscription alone, which the sunset guard
+		// fronts, so it stops being readable at the retirement instant. Echoing it here
+		// as well kept it readable through an unguarded route afterwards, and the two
+		// reads then disagreed about whether the legacy surface still existed.
+		//
+		// MigratedAt STAYS: it is migration progress about this deployment rather than
+		// legacy state — no endpoint and no third-party data — and a progress report
+		// needs it on both sides of the sunset.
 		{name: "MigratedAt", jsonKey: "migrated_at", omitEmpty: true},
+		// ORPHAN-01: the three unsettled-state markers. They are PROJECTED rather than
+		// database-only because both alerts that fire on them tell an operator to find the
+		// affected rows through this API, and before this the answer was "read the table" — a
+		// marker an operator cannot see through the registry is a marker they cannot triage.
+		// All three are omitempty: present always means something needs attention.
+		{name: "RevocationPendingAt", jsonKey: "revocation_pending_at", omitEmpty: true},
+		{name: "RevocationFailedAt", jsonKey: "revocation_failed_at", omitEmpty: true},
+		{name: "CredentialOrphanedAt", jsonKey: "credential_orphaned_at", omitEmpty: true},
 		{name: "CreatedAt", jsonKey: "created_at"},
 		{name: "UpdatedAt", jsonKey: "updated_at"},
+		// The revocation pair, at the end because it was added last. The boolean is present
+		// unconditionally for the same reason CredentialIssuanceBlocked is — a client inferring
+		// it from an absent field would infer it wrong — and the reason accompanies it because
+		// docs/metrics.md answers the revocation alert with "find the affected subscribers with
+		// GET /subscribers", so the response has to carry the remedy and not only the state.
+		{name: "RevocationPending", jsonKey: "revocation_pending"},
+		{name: "RevocationPendingReason", jsonKey: "revocation_pending_reason", omitEmpty: true},
 	})
 
 	t.Run("a registered subscriber with no credential is representable", func(t *testing.T) {
@@ -1095,13 +1397,17 @@ func TestScopeResources_CoverTheEventAndSubscriberSurfaces(t *testing.T) {
 // conclusion that two subscribers sharing a topic with different key prefixes cannot see each
 // other's events, and builds a tenancy boundary on it.
 //
-// So the response states the enforced dimensions positively and answers the key question
-// outright. These assertions are what stop that statement being quietly weakened later.
+// So the response states the enforced dimensions positively, answers the key question outright,
+// AND names where the key scope is enforced instead. These assertions are what stop that
+// statement being quietly weakened later — in either direction: claiming the prefix is a broker
+// boundary, or withholding it altogether, which is what happened while credential issuance
+// refused a subscriber that recorded one.
 func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *testing.T) {
 	subscriberID := "acme_prod"
 	topics := []string{"blnk.transactions", "blnk.balances"}
+	const keyScope = "ldg_9f1c8a72"
 
-	enforced := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics)
+	enforced := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, keyScope)
 
 	t.Run("partition key filtering is declared unenforced, in the body", func(t *testing.T) {
 		assert.False(t, enforced.PartitionKeyPrefixEnforced,
@@ -1112,6 +1418,41 @@ func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *
 			"the enforced-dimension list is exhaustive, so a partition-key entry would assert an "+
 				"ACL that cannot exist")
 		assert.NotContains(t, enforced.EnforcedBy, "partition_key_prefix")
+	})
+
+	t.Run("the key scope is reported together with where it IS enforced", func(t *testing.T) {
+		// Both fields or neither. The prefix alone reads as a limit on the credential, which is
+		// why it was once withheld from this response entirely — and withholding it left the
+		// subscriber unable to apply the one scope it was expected to keep.
+		assert.Equal(t, keyScope, enforced.PartitionKeyPrefix,
+			"the recorded scope must reach the client that has to apply it")
+		assert.Equal(t, model.KeyScopeEnforcementConsumerSide, enforced.PartitionKeyPrefixEnforcedBy,
+			"and it must say WHERE, or the prefix is indistinguishable from a broker boundary")
+
+		keys := marshalToKeys(t, enforced)
+		require.Contains(t, keys, "partition_key_prefix_enforced_by",
+			"the enforcement point must be in the BODY, not only in documentation")
+	})
+
+	t.Run("with no key scope the enforcement point is reported as none", func(t *testing.T) {
+		// Always present, so a client can branch on it without first testing whether the
+		// prefix is empty.
+		unscoped := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "")
+		assert.Empty(t, unscoped.PartitionKeyPrefix, "nothing recorded means nothing echoed")
+		assert.Equal(t, model.KeyScopeEnforcementNone, unscoped.PartitionKeyPrefixEnforcedBy)
+
+		keys := marshalToKeys(t, unscoped)
+		require.Contains(t, keys, "partition_key_prefix_enforced_by")
+		assert.NotContains(t, keys, "partition_key_prefix",
+			"an absent scope is omitted rather than reported as an empty string")
+	})
+
+	t.Run("a whitespace-only key scope is reported as absent", func(t *testing.T) {
+		// It agrees with model.EventSubscriber.DeclaresKeyScope, which reads whitespace as
+		// absent for the same reason: a scope on nothing is not an intent anybody has.
+		blank := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "   \t ")
+		assert.Empty(t, blank.PartitionKeyPrefix)
+		assert.Equal(t, model.KeyScopeEnforcementNone, blank.PartitionKeyPrefixEnforcedBy)
 	})
 
 	t.Run("the dimensions that ARE enforced are named", func(t *testing.T) {
@@ -1141,13 +1482,58 @@ func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *
 	})
 
 	t.Run("an empty grant reports an empty set rather than null", func(t *testing.T) {
-		keys := marshalToKeys(t, apimodel.NewSubscriberEnforcedAccess(subscriberID, nil))
+		keys := marshalToKeys(t, apimodel.NewSubscriberEnforcedAccess(subscriberID, nil, ""))
 		assert.NotNil(t, keys["topics"],
 			"a fail-closed empty grant is a state an operator must be able to read; null would "+
 				"force every client to special-case it")
 	})
 
+	// AUTH-03: the declaration used to describe what Blnk ASKED FOR and nothing else, so a
+	// principal carrying a hand-made ALLOW binding was issued a credential whose response
+	// declared this exact boundary while the broker enforced a wider one. Issuance now reads
+	// the principal's complete grant and refuses a broader one, and the response says so — but
+	// only on the path where the reading actually happened.
+	t.Run("the exclusivity claim is only made where it was verified", func(t *testing.T) {
+		assert.False(t, enforced.ExclusiveGrantVerified,
+			"a projection built from a registry row makes no broker round trip, so it must not "+
+				"claim the grant was observed to be exclusive")
+
+		// THE SAME key scope the unverified fixture was built with. The two constructors are
+		// compared field by field below, so passing a different scope here would make them
+		// differ in three fields and the comparison would pass for the wrong reason — it is
+		// asserting that they differ in exactly ONE.
+		verified := apimodel.NewVerifiedSubscriberEnforcedAccess(subscriberID, topics, keyScope)
+		assert.True(t, verified.ExclusiveGrantVerified,
+			"issuance reads the principal's complete ACL grant and refuses a broader one, so the "+
+				"credential response may state that it verified exclusivity")
+
+		// Identical in every other respect: the two constructors must not be able to drift
+		// into describing different boundaries.
+		verified.ExclusiveGrantVerified = false
+		assert.Equal(t, enforced, verified,
+			"the verified form must differ from the unverified one in exactly one field")
+	})
+
+	t.Run("the exclusivity claim is always present in the body", func(t *testing.T) {
+		// No omitempty: false must be transmitted rather than dropped. A client that reads a
+		// missing key as "verified" would draw exactly the wrong conclusion, and false is the
+		// value on the path where nothing was verified.
+		keys := marshalToKeys(t, apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, ""))
+		assert.Contains(t, keys, "exclusive_grant_verified",
+			"an absent key would be indistinguishable from a verified boundary")
+
+		assert.Contains(t,
+			marshalToKeys(t, apimodel.NewVerifiedSubscriberEnforcedAccess(subscriberID, topics, "")),
+			"exclusive_grant_verified")
+	})
+
 	t.Run("every subscriber response carries the declaration", func(t *testing.T) {
+		// A LEGACY ROW, and the projection is built from the model directly for that reason. The
+		// service now REFUSES to record a partition key prefix — 409
+		// SUBSCRIBER_ISOLATION_UNENFORCEABLE at registration and at update — so no subscriber
+		// created through the API carries one. What can still carry one is a row written before
+		// that refusal existed, and this asserts such a row reads honestly rather than that
+		// recording a prefix is a supported operation.
 		prefix := "ledger-42"
 		response := apimodel.NewSubscriberResponse(model.EventSubscriber{
 			SubscriberID:       subscriberID,
@@ -1155,14 +1541,125 @@ func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *
 			PartitionKeyPrefix: &prefix,
 		})
 
-		// The advisory prefix is reported AND declared unenforced in the same body. That
-		// adjacency is the point: the two cannot be read apart.
+		// A row carrying a prefix can now only be a LEGACY row — registration and update
+		// both refuse one — and it is still reported, next to the declaration that it is
+		// unenforced, in the same body. That adjacency is the point: the two cannot be read
+		// apart, so whoever finds such a row also reads what it does not mean.
 		assert.Equal(t, prefix, response.PartitionKeyPrefix)
 		assert.False(t, response.EnforcedAccess.PartitionKeyPrefixEnforced)
+		assert.Equal(t, prefix, response.EnforcedAccess.PartitionKeyPrefix,
+			"the declaration echoes the same value the top-level field carries, so a client reading "+
+				"either one reads the same contract")
+		assert.Equal(t, model.KeyScopeEnforcementConsumerSide,
+			response.EnforcedAccess.PartitionKeyPrefixEnforcedBy)
 
 		keys := marshalToKeys(t, response)
 		require.Contains(t, keys, "enforced_access",
 			"the declaration must be present on every subscriber body, including one that has "+
 				"never been issued a credential — an integrator needs it before wiring a consumer")
+	})
+}
+
+// TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs is C-02's API half.
+//
+// # Why this field exists rather than a refusal
+//
+// Credential issuance used to REFUSE any subscriber recording a partition key prefix, with the
+// typed code SUBSCRIBER_ISOLATION_UNENFORCEABLE and a 409, permanently. The intent was to avoid
+// handing over a credential whose real reach exceeded what the row appeared to describe. The
+// effect was to withdraw a mandatory capability for a state the registry is designed to hold: a
+// subscriber registered with a prefix could never obtain credentials at all, from either
+// direction, and a database CHECK constraint made the combination unrepresentable as well.
+//
+// Refusing is only fail-closed when a narrower grant exists to insist upon. Kafka's authorizer
+// names five resource types and none is a message key, and a topic per key space is excluded, so
+// there is no narrower credential being withheld — there is no such credential.
+//
+// So the boundary is STATED instead, and this is where. The three fields below are the whole of
+// the guarantee, and the third is the one a client branches on. They are asserted as a group
+// because their VALUE is in their agreement: any one of them alone is either ambiguous or
+// ignorable.
+func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testing.T) {
+	subscriberID := "acme_prod"
+	topics := []string{"blnk.transactions"}
+
+	t.Run("a recorded prefix declares a client-side obligation", func(t *testing.T) {
+		declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "ldg_9f2c")
+
+		assert.Equal(t, "ldg_9f2c", declared.PartitionKeyPrefix,
+			"the prefix is echoed, because a subscriber cannot apply a narrowing it was not told")
+		assert.False(t, declared.PartitionKeyPrefixEnforced,
+			"and it is stated as unenforced in the same object, so the two cannot be read apart")
+		assert.True(t, declared.ClientSideKeyFilteringRequired,
+			"and the branchable field says outright that the narrowing is the holder's own to "+
+				"apply — this is the field whose wrong answer is a disclosure bug, because a client "+
+				"reading false here would consume a shared topic believing the broker filtered it")
+	})
+
+	t.Run("no prefix declares no obligation", func(t *testing.T) {
+		// The mutant this kills is the one that hard-codes true. A flag that is always true
+		// teaches a client nothing and gets ignored, which returns the contract to the state
+		// where the boundary was implied rather than stated.
+		declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "")
+
+		assert.Empty(t, declared.PartitionKeyPrefix)
+		assert.False(t, declared.ClientSideKeyFilteringRequired,
+			"a whole-topic entitlement leaves nothing for the holder to filter")
+		assert.False(t, declared.PartitionKeyPrefixEnforced,
+			"still false rather than absent: there is no prefix, so there is no enforced prefix")
+	})
+
+	t.Run("the flag is DERIVED from the prefix, so the two cannot disagree", func(t *testing.T) {
+		// Passing the flag alongside the value would allow a caller to send a prefix with no
+		// instruction attached, or an instruction with no prefix to apply. Either is worse than
+		// neither, so the constructor computes one from the other.
+		for name, prefix := range map[string]string{
+			"padded":     "  ldg_9f2c  ",
+			"whitespace": "   ",
+			"empty":      "",
+			"plain":      "ldg_9f2c",
+		} {
+			t.Run(name, func(t *testing.T) {
+				declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, prefix)
+				assert.Equal(t, declared.PartitionKeyPrefix != "", declared.ClientSideKeyFilteringRequired,
+					"the obligation is declared exactly when a prefix survives normalisation")
+				assert.Equal(t, strings.TrimSpace(prefix), declared.PartitionKeyPrefix,
+					"and the echoed prefix is trimmed, because storage padding is not part of the "+
+						"key a subscriber compares against")
+			})
+		}
+	})
+
+	t.Run("both declarations are always present in the body", func(t *testing.T) {
+		// No omitempty on either boolean. An absent client_side_key_filtering_required reads as
+		// "not applicable", and this one has to read as a definite yes or no.
+		for name, prefix := range map[string]string{"with a prefix": "ldg_9f2c", "without one": ""} {
+			t.Run(name, func(t *testing.T) {
+				keys := marshalToKeys(t, apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, prefix))
+				assert.Contains(t, keys, "client_side_key_filtering_required",
+					"an absent key would be indistinguishable from no obligation")
+				assert.Contains(t, keys, "partition_key_prefix_enforced")
+			})
+		}
+	})
+
+	t.Run("a subscriber read declares the same obligation as its credential", func(t *testing.T) {
+		// The credential is delivered ONCE, so every later reader — an operator, a migration
+		// report, an onboarding script — learns the obligation from the subscriber projection
+		// instead. If the two could differ, whichever was read second would be believed.
+		prefix := "ldg_9f2c"
+		response := apimodel.NewSubscriberResponse(model.EventSubscriber{
+			SubscriberID:       subscriberID,
+			AuthorizedTopics:   topics,
+			PartitionKeyPrefix: &prefix,
+		})
+
+		assert.Equal(t, prefix, response.PartitionKeyPrefix)
+		assert.Equal(t, prefix, response.EnforcedAccess.PartitionKeyPrefix,
+			"the declaration resolves the prefix from the same row the top-level field does")
+		assert.True(t, response.EnforcedAccess.ClientSideKeyFilteringRequired,
+			"so a reader of the registry is told what a holder of the credential was told")
+		assert.False(t, response.EnforcedAccess.ExclusiveGrantVerified,
+			"and still claims no verified exclusivity: reading a row observes no broker grant")
 	})
 }

@@ -17,6 +17,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -206,12 +208,12 @@ func TestLoadConfigFromFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create temporary file: %v", err)
 	}
-	// t.Cleanup rather than a bare defer, and the error is reported: a temp file that
-	// cannot be removed leaks into /tmp on every run, and silently discarding the reason
-	// is what let it go unnoticed.
+	// t.Cleanup rather than a bare defer, and the failure fails the test: removing a file
+	// this test just created cannot fail for a benign reason, and a run that leaks a temp
+	// file into /tmp on every execution should not be able to report itself as clean.
 	t.Cleanup(func() {
 		if err := os.Remove(tmpFile.Name()); err != nil {
-			t.Logf("unable to remove the temporary config file: %v", err)
+			t.Errorf("unable to remove the temporary config file %q: %v", tmpFile.Name(), err)
 		}
 	})
 
@@ -283,7 +285,14 @@ func TestLoadConfigFromFileMonitoringDSN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create temporary file: %v", err)
 	}
-	defer func() { _ = os.Remove(tmpFile.Name()) }()
+	// t.Cleanup rather than a bare defer, and the failure fails the test: removing a file
+	// this test just created cannot fail for a benign reason, and a run that leaks a temp
+	// file into /tmp on every execution should not be able to report itself as clean.
+	t.Cleanup(func() {
+		if err := os.Remove(tmpFile.Name()); err != nil {
+			t.Errorf("unable to remove the temporary config file %q: %v", tmpFile.Name(), err)
+		}
+	})
 
 	sampleConfig := Configuration{
 		ProjectName:         "Monitoring DSN Test",
@@ -334,12 +343,12 @@ func TestInitConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create temporary file: %v", err)
 	}
-	// t.Cleanup rather than a bare defer, and the error is reported: a temp file that
-	// cannot be removed leaks into /tmp on every run, and silently discarding the reason
-	// is what let it go unnoticed.
+	// t.Cleanup rather than a bare defer, and the failure fails the test: removing a file
+	// this test just created cannot fail for a benign reason, and a run that leaks a temp
+	// file into /tmp on every execution should not be able to report itself as clean.
 	t.Cleanup(func() {
 		if err := os.Remove(tmpFile.Name()); err != nil {
-			t.Logf("unable to remove the temporary config file: %v", err)
+			t.Errorf("unable to remove the temporary config file %q: %v", tmpFile.Name(), err)
 		}
 	})
 
@@ -486,6 +495,7 @@ func TestUploadWhitelistHostsParsing(t *testing.T) {
 // assertion for the wrong reason.
 var eventStreamingEnvKeys = []string{
 	"KAFKA_BROKERS", "BLNK_KAFKA_KAFKA_BROKERS", "BLNK_KAFKA_BROKERS",
+	"KAFKA_SUBSCRIBER_BROKERS", "BLNK_KAFKA_KAFKA_SUBSCRIBER_BROKERS", "BLNK_KAFKA_SUBSCRIBER_BROKERS",
 	"KAFKA_TOPIC_PREFIX", "BLNK_KAFKA_KAFKA_TOPIC_PREFIX", "BLNK_KAFKA_TOPIC_PREFIX",
 	"KAFKA_SASL_USER", "BLNK_KAFKA_KAFKA_SASL_USER", "BLNK_KAFKA_SASL_USER",
 	"KAFKA_SASL_SECRET", "BLNK_KAFKA_KAFKA_SASL_SECRET", "BLNK_KAFKA_SASL_SECRET",
@@ -493,6 +503,7 @@ var eventStreamingEnvKeys = []string{
 	"KAFKA_SASL_ADMIN_SECRET", "BLNK_KAFKA_KAFKA_SASL_ADMIN_SECRET", "BLNK_KAFKA_SASL_ADMIN_SECRET",
 	"KAFKA_MIN_PARTITIONS", "BLNK_KAFKA_KAFKA_MIN_PARTITIONS", "BLNK_KAFKA_MIN_PARTITIONS",
 	"KAFKA_REPLICATION_FACTOR", "BLNK_KAFKA_KAFKA_REPLICATION_FACTOR", "BLNK_KAFKA_REPLICATION_FACTOR",
+	"EVENT_METRICS_SUBSCRIBER_BUDGET", "BLNK_KAFKA_EVENT_METRICS_SUBSCRIBER_BUDGET", "BLNK_EVENT_METRICS_SUBSCRIBER_BUDGET",
 	"KAFKA_TLS_ENABLED", "BLNK_KAFKA_KAFKA_TLS_ENABLED", "BLNK_KAFKA_TLS_ENABLED",
 	"KAFKA_TLS_CA_FILE", "BLNK_KAFKA_KAFKA_TLS_CA_FILE", "BLNK_KAFKA_TLS_CA_FILE",
 	"KAFKA_TLS_CERT_FILE", "BLNK_KAFKA_KAFKA_TLS_CERT_FILE", "BLNK_KAFKA_TLS_CERT_FILE",
@@ -505,6 +516,11 @@ var eventStreamingEnvKeys = []string{
 	"RELAY_MAX_RETRY_ATTEMPTS", "BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS", "BLNK_RELAY_MAX_RETRY_ATTEMPTS",
 	"RELAY_RETRY_BASE_BACKOFF_MS", "BLNK_RELAY_RELAY_RETRY_BASE_BACKOFF_MS", "BLNK_RELAY_RETRY_BASE_BACKOFF_MS",
 	"RELAY_RETRY_MAX_BACKOFF_MS", "BLNK_RELAY_RELAY_RETRY_MAX_BACKOFF_MS", "BLNK_RELAY_RETRY_MAX_BACKOFF_MS",
+	"RELAY_EVENT_RETENTION_DAYS", "BLNK_RELAY_RELAY_EVENT_RETENTION_DAYS", "BLNK_RELAY_EVENT_RETENTION_DAYS",
+	"RELAY_EVENT_RETENTION_BATCH_SIZE", "BLNK_RELAY_RELAY_EVENT_RETENTION_BATCH_SIZE",
+	"BLNK_RELAY_EVENT_RETENTION_BATCH_SIZE",
+	"RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP", "BLNK_RELAY_RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP",
+	"BLNK_RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP",
 	"WEBHOOK_DEPRECATION_START_DATE", "BLNK_WEBHOOK_DEPRECATION_START_DATE",
 	"WEBHOOK_DEPRECATION_SUNSET_DATE", "BLNK_WEBHOOK_DEPRECATION_SUNSET_DATE",
 }
@@ -639,6 +655,145 @@ func restoreConfigStore(t *testing.T) {
 	t.Cleanup(func() {
 		if previous != nil {
 			ConfigStore.Store(previous)
+		}
+	})
+}
+
+// TestMain seeds ConfigStore before any test runs, and that is what makes
+// restoreConfigStore able to do its job.
+//
+// # The gap this closes
+//
+// ConfigStore is an atomic.Value, and atomic.Value CANNOT BE RESET TO NIL — Store(nil) panics.
+// So restoreConfigStore, which snapshots the previous value and puts it back, is powerless in
+// exactly one case: when the store was EMPTY when the test began. It has nothing to put back,
+// and the test's own fixture is left in place for the rest of the process. Whichever mutating
+// test happened to run first therefore decided the package's steady state, and under
+// `-shuffle=on` that is a different test on every run.
+//
+// Seeding here removes the case rather than working around it. Every restoreConfigStore call
+// now has a real previous value, so the store returns to THIS known baseline between tests
+// instead of to whichever fixture got there first.
+//
+// The baseline is deliberately recognisable. Nothing should read it — every test that depends
+// on configuration installs its own — so if a value from here ever shows up in a failure
+// message, the test that produced it was reading the store when it meant to populate it.
+func TestMain(m *testing.M) {
+	baseline := Configuration{
+		ProjectName: "config-package-test-baseline",
+		DataSource:  DataSourceConfig{Dns: "postgres://baseline.invalid/never-connected"},
+		Redis:       RedisConfig{Dns: "baseline.invalid:6379"},
+	}
+	ConfigStore.Store(&baseline)
+
+	os.Exit(m.Run())
+}
+
+// TestProcessGlobalRestoration_ReturnsEveryMutatedGlobalToItsPriorValue is the guard for the
+// three process globals this package's tests move: ConfigStore, the logrus level and
+// BLNK_LOG_LEVEL.
+//
+// It asserts the MECHANISM rather than any particular test's tidiness, which is what makes it
+// order-independent: it mutates each global inside a nested subtest through the same helper the
+// real tests use, and checks the value is back once that subtest has finished. A helper that
+// stopped restoring would fail here immediately instead of surfacing as an unrelated test
+// failing under a shuffle seed nobody can reproduce.
+func TestProcessGlobalRestoration_ReturnsEveryMutatedGlobalToItsPriorValue(t *testing.T) {
+	t.Run("the configuration store", func(t *testing.T) {
+		before := ConfigStore.Load()
+		require.NotNil(t, before,
+			"TestMain seeds the store precisely so restoreConfigStore always has something to "+
+				"put back: atomic.Value cannot be reset to nil, so a store that starts empty "+
+				"keeps whichever fixture reached it first")
+
+		t.Run("mutating subtest", func(t *testing.T) {
+			restoreConfigStore(t)
+
+			fixture := eventStreamingBaseConfig()
+			fixture.ProjectName = "restoration-probe"
+			MockConfig(&fixture)
+
+			current, ok := ConfigStore.Load().(*Configuration)
+			require.True(t, ok)
+			require.Equal(t, "restoration-probe", current.ProjectName,
+				"the mutation must actually have happened, or this proves nothing")
+		})
+
+		assert.Same(t, before, ConfigStore.Load(),
+			"the store must hold the SAME configuration pointer it held before the subtest ran")
+	})
+
+	t.Run("the logger level", func(t *testing.T) {
+		before := logrus.GetLevel()
+
+		t.Run("mutating subtest", func(t *testing.T) {
+			pinLevel(t, logrus.PanicLevel)
+			require.Equal(t, logrus.PanicLevel, logrus.GetLevel())
+		})
+
+		assert.Equal(t, before, logrus.GetLevel(),
+			"the level is process global and the root package pins it to capture debug-only "+
+				"lines, so a leak from here breaks tests in another package")
+	})
+
+	t.Run("the ambient BLNK_LOG_LEVEL", func(t *testing.T) {
+		t.Setenv("BLNK_LOG_LEVEL", "warn")
+
+		t.Run("mutating subtest", func(t *testing.T) {
+			clearLogLevelEnv(t)
+
+			_, present := os.LookupEnv("BLNK_LOG_LEVEL")
+			require.False(t, present, "the helper must actually clear it")
+		})
+
+		value, present := os.LookupEnv("BLNK_LOG_LEVEL")
+		assert.True(t, present,
+			"a bare os.Unsetenv strips the variable for the REST OF THE PROCESS; the helper "+
+				"saves and restores it instead")
+		assert.Equal(t, "warn", value)
+	})
+}
+
+// pinLevel sets the global logrus level for one test and puts the previous one back.
+//
+// It is package level rather than a closure inside a single test because the level is PROCESS
+// GLOBAL and three separate tests in this file move it. A subtest that sets the level and
+// relies on its parent's single cleanup leaves the level changed for every sibling that runs
+// after it — which is invisible while the file runs in source order and becomes a failure the
+// moment `-shuffle=on`, or a future `t.Parallel()`, reorders them. Worse, the root package
+// pins the level to capture debug-only lines, so a leak from here breaks tests in another
+// package entirely.
+//
+// Every mutating subtest calls this, so the restore is local to the mutation.
+func pinLevel(t *testing.T, level logrus.Level) {
+	t.Helper()
+
+	previous := logrus.GetLevel()
+	t.Cleanup(func() { logrus.SetLevel(previous) })
+	logrus.SetLevel(level)
+}
+
+// clearLogLevelEnv unsets BLNK_LOG_LEVEL for one test and restores whatever was there.
+//
+// The variable is cleared explicitly rather than through clearEventStreamingEnv, which covers
+// the Kafka block only: a value leaking in from the surrounding environment would satisfy a
+// file-only assertion for the wrong reason. The save-and-restore matters as much as the unset —
+// a bare os.Unsetenv strips the variable for the REST OF THE PROCESS, so a later test that
+// expects the ambient value silently sees nothing.
+func clearLogLevelEnv(t *testing.T) {
+	t.Helper()
+
+	saved, existed := os.LookupEnv("BLNK_LOG_LEVEL")
+	if err := os.Unsetenv("BLNK_LOG_LEVEL"); err != nil {
+		t.Fatalf("Unable to unset BLNK_LOG_LEVEL: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if !existed {
+			return
+		}
+		if err := os.Setenv("BLNK_LOG_LEVEL", saved); err != nil {
+			t.Errorf("Unable to restore BLNK_LOG_LEVEL: %v", err)
 		}
 	})
 }
@@ -1179,6 +1334,15 @@ func TestValidateAndAddDefaults_KafkaAndRelayDefaults(t *testing.T) {
 		t.Errorf("Expected Relay.RetryMaxBackoffMS to be 30000, got %d", cnf.Relay.RetryMaxBackoffMS)
 	}
 
+	// SEC-10: the subscriber measurement budget IS defaulted, and the value is asserted
+	// because it decides how much of the consumer-lag signal exists. A subscriber past the
+	// budget has no lag series at all, so a silent change here would silently shrink
+	// monitoring coverage — the one kind of regression that makes the system look healthier
+	// rather than worse.
+	if cnf.Relay.SubscriberMetricsBudget != 200 {
+		t.Errorf("Expected Relay.SubscriberMetricsBudget to be 200, got %d", cnf.Relay.SubscriberMetricsBudget)
+	}
+
 	// EVENT RETENTION IS NOT DEFAULTED, and the asymmetry with the three values above is
 	// asserted rather than assumed. Those three have a correct answer that requirement R-4
 	// fixes, so an unset value is filled in. A retention period has no correct answer this
@@ -1204,6 +1368,15 @@ func TestValidateAndAddDefaults_KafkaAndRelayDefaults(t *testing.T) {
 	}
 	if cnf.Kafka.ReplicationFactor != 3 {
 		t.Errorf("Expected Kafka.ReplicationFactor to be 3, got %d", cnf.Kafka.ReplicationFactor)
+	}
+
+	// The consumer-lag sweep budget. A zero default would be indistinguishable from
+	// "measure nothing", and the collector would publish an empty lag inventory on a
+	// registry of any size — so the number the shipped binary uses is asserted here
+	// rather than left to whatever the collector happens to fall back to.
+	if cnf.Kafka.MetricsSubscriberBudget != 200 {
+		t.Errorf("Expected Kafka.MetricsSubscriberBudget to be 200, got %d",
+			cnf.Kafka.MetricsSubscriberBudget)
 	}
 
 	// No broker list and no credentials are ever invented. A shipped default for
@@ -1309,6 +1482,19 @@ func TestValidateAndAddDefaults_KafkaConfiguredValuesSurvive(t *testing.T) {
 		}
 	})
 
+	t.Run("a configured lag-sweep budget below the ceiling survives", func(t *testing.T) {
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.MetricsSubscriberBudget = 750
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		if cnf.Kafka.MetricsSubscriberBudget != 750 {
+			t.Errorf("Expected Kafka.MetricsSubscriberBudget to remain 750, got %d",
+				cnf.Kafka.MetricsSubscriberBudget)
+		}
+	})
+
 	t.Run("a configured relay retry window survives", func(t *testing.T) {
 		cnf := eventStreamingBaseConfig()
 		cnf.Relay = RelayConfig{MaxRetryAttempts: 3, RetryBaseBackoffMS: 250, RetryMaxBackoffMS: 5000}
@@ -1351,6 +1537,75 @@ func TestValidateAndAddDefaults_KafkaConfiguredValuesSurvive(t *testing.T) {
 			t.Errorf("Expected Kafka.SASLAdminSecret to be preserved verbatim, got '%s'", cnf.Kafka.SASLAdminSecret)
 		}
 	})
+}
+
+// TestSetKafkaDefaults_MetricsSubscriberBudgetIsCorrectedNeverRefused pins both ends of the
+// consumer-lag sweep budget's domain, and pins that a bad value is CORRECTED rather than
+// fatal.
+//
+// # Why the budget needs a floor as well as a default
+//
+// The collector reads Kafka.MetricsSubscriberBudget to decide how many registry rows one lag
+// sweep examines. A zero or negative value there does not mean "no limit" to the collector —
+// it means the sweep window is empty, so no subscriber is ever measured, blnk.kafka.consumer_lag
+// is published for nothing, and SubscriberConsumerLagHigh can never fire. That failure is
+// silent by construction: the metric endpoint still answers, the series is simply absent. So
+// every non-positive value has to resolve to the shipped default, not to itself.
+//
+// # Why the ceiling clamps instead of refusing
+//
+// A budget above MaxMetricsSubscriberBudget is a real operational hazard rather than a typo to
+// reject: each subscriber measured costs an OffsetFetch and a ListOffsets round trip per
+// authorised topic, and each subscriber-topic pair is an exported gauge series. So an
+// unbounded budget makes one collection tick unbounded in both duration and cardinality, and a
+// tick that outlasts the collection interval stops EVERY event gauge refreshing on schedule —
+// including the dead-letter age that V-4's alert reads.
+//
+// It is clamped rather than fatal because that is how every other out-of-range value in this
+// file is handled: a misconfigured metrics budget must never stop the ledger from serving. The
+// correction is asserted to be LOGGED, because a silent clamp would leave an operator who
+// asked for 50,000 believing they had it.
+func TestSetKafkaDefaults_MetricsSubscriberBudgetIsCorrectedNeverRefused(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		configured  int
+		want        int
+		wantClamped bool
+	}{
+		"unset falls back to the shipped default":    {configured: 0, want: 200},
+		"a negative budget falls back":               {configured: -1, want: 200},
+		"a large negative budget falls back":         {configured: -5000, want: 200},
+		"one is honoured, small but not nonsensical": {configured: 1, want: 1},
+		"the ceiling itself is not clamped":          {configured: MaxMetricsSubscriberBudget, want: MaxMetricsSubscriberBudget},
+		"one above the ceiling is clamped": {
+			configured: MaxMetricsSubscriberBudget + 1, want: MaxMetricsSubscriberBudget, wantClamped: true,
+		},
+		"a wildly oversized budget is clamped": {
+			configured: 1_000_000, want: MaxMetricsSubscriberBudget, wantClamped: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearEventStreamingEnv(t)
+			hook := logtest.NewGlobal()
+			defer hook.Reset()
+
+			cnf := eventStreamingBaseConfig()
+			cnf.Kafka.MetricsSubscriberBudget = testCase.configured
+
+			if err := cnf.validateAndAddDefaults(); err != nil {
+				t.Fatalf("A bad metrics budget must never stop configuration loading, got %v", err)
+			}
+			if cnf.Kafka.MetricsSubscriberBudget != testCase.want {
+				t.Errorf("Expected Kafka.MetricsSubscriberBudget %d for a configured %d, got %d",
+					testCase.want, testCase.configured, cnf.Kafka.MetricsSubscriberBudget)
+			}
+
+			clamped := warnedAbout(hook, "above the supported ceiling")
+			if clamped != testCase.wantClamped {
+				t.Errorf("Expected the clamp warning to be logged=%t for a configured %d, got %t",
+					testCase.wantClamped, testCase.configured, clamped)
+			}
+		})
+	}
 }
 
 // TestValidateAndAddDefaults_KafkaSASLPairIsFatalOnlyWithBrokers pins where the pair
@@ -1682,6 +1937,39 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
+			// The three forms of the subscriber-facing list, for the same reason the
+			// three above exist. This one answered to its bare name and to envconfig's
+			// BLNK_KAFKA_KAFKA_SUBSCRIBER_BROKERS artefact, but NOT to the ordinary
+			// prefixed spelling — while config.go claimed every field of the struct was
+			// aliased. A deployment writing the documented convention therefore got no
+			// subscriber-facing brokers, and credential issuance refused with 503 and
+			// nothing to explain why.
+			name:   "the mandated bare KAFKA_SUBSCRIBER_BROKERS resolves",
+			envKey: "KAFKA_SUBSCRIBER_BROKERS",
+			value:  "public-1:9092,public-2:9092",
+			assert: func(t *testing.T, loaded *Configuration) {
+				assertBrokerList(t, loaded.Kafka.SubscriberBrokers, []string{"public-1:9092", "public-2:9092"})
+			},
+		},
+		{
+			name:   "the prefixed BLNK_KAFKA_KAFKA_SUBSCRIBER_BROKERS primary key resolves",
+			envKey: "BLNK_KAFKA_KAFKA_SUBSCRIBER_BROKERS",
+			value:  "public-3:9092",
+			assert: func(t *testing.T, loaded *Configuration) {
+				assertBrokerList(t, loaded.Kafka.SubscriberBrokers, []string{"public-3:9092"})
+			},
+		},
+		{
+			name:   "the ordinary BLNK_KAFKA_SUBSCRIBER_BROKERS alias resolves",
+			envKey: "BLNK_KAFKA_SUBSCRIBER_BROKERS",
+			value:  "public-4:9092,public-5:9092",
+			assert: func(t *testing.T, loaded *Configuration) {
+				// Split by the library, so the alias is a genuine equivalent of the bare
+				// name rather than a single-value special case.
+				assertBrokerList(t, loaded.Kafka.SubscriberBrokers, []string{"public-4:9092", "public-5:9092"})
+			},
+		},
+		{
 			name:   "the ordinary BLNK_KAFKA_TOPIC_PREFIX alias resolves",
 			envKey: "BLNK_KAFKA_TOPIC_PREFIX",
 			value:  "acme",
@@ -1698,6 +1986,33 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			assert: func(t *testing.T, loaded *Configuration) {
 				if loaded.Kafka.MinPartitions != 12 {
 					t.Errorf("Expected Kafka.MinPartitions to be 12, got %d", loaded.Kafka.MinPartitions)
+				}
+			},
+		},
+		{
+			// The lag-sweep budget is the newest variable in the table, so both of its
+			// forms are exercised: the bare name the deployment documentation gives, and
+			// the BLNK_-prefixed name a reader of config.go would write. An operator who
+			// raised the budget through the form that resolved to nothing would find the
+			// lag inventory still truncated with no error to explain it.
+			name:   "the documented bare EVENT_METRICS_SUBSCRIBER_BUDGET resolves",
+			envKey: "EVENT_METRICS_SUBSCRIBER_BUDGET",
+			value:  "1500",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.MetricsSubscriberBudget != 1500 {
+					t.Errorf("Expected Kafka.MetricsSubscriberBudget to be 1500, got %d",
+						loaded.Kafka.MetricsSubscriberBudget)
+				}
+			},
+		},
+		{
+			name:   "the ordinary BLNK_EVENT_METRICS_SUBSCRIBER_BUDGET alias resolves",
+			envKey: "BLNK_EVENT_METRICS_SUBSCRIBER_BUDGET",
+			value:  "1250",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.MetricsSubscriberBudget != 1250 {
+					t.Errorf("Expected Kafka.MetricsSubscriberBudget to be 1250, got %d",
+						loaded.Kafka.MetricsSubscriberBudget)
 				}
 			},
 		},
@@ -1908,6 +2223,41 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			assert: func(t *testing.T, loaded *Configuration) {
 				if loaded.Relay.RetryBaseBackoffMS != 250 {
 					t.Errorf("Expected Relay.RetryBaseBackoffMS to be 250, got %d", loaded.Relay.RetryBaseBackoffMS)
+				}
+			},
+		},
+		{
+			// SEC-10's variable, in all three forms. It is exercised here rather than
+			// trusted because a budget that silently fails to resolve leaves the default
+			// 200 in place — and an operator who raised it to cover a larger registry
+			// would believe coverage was complete while it was not, which is the precise
+			// failure this variable was added to end.
+			name:   "the bare RELAY_SUBSCRIBER_METRICS_BUDGET resolves",
+			envKey: "RELAY_SUBSCRIBER_METRICS_BUDGET",
+			value:  "750",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Relay.SubscriberMetricsBudget != 750 {
+					t.Errorf("Expected Relay.SubscriberMetricsBudget to be 750, got %d", loaded.Relay.SubscriberMetricsBudget)
+				}
+			},
+		},
+		{
+			name:   "the prefixed BLNK_RELAY_RELAY_SUBSCRIBER_METRICS_BUDGET primary key resolves",
+			envKey: "BLNK_RELAY_RELAY_SUBSCRIBER_METRICS_BUDGET",
+			value:  "750",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Relay.SubscriberMetricsBudget != 750 {
+					t.Errorf("Expected Relay.SubscriberMetricsBudget to be 750, got %d", loaded.Relay.SubscriberMetricsBudget)
+				}
+			},
+		},
+		{
+			name:   "the ordinary BLNK_RELAY_SUBSCRIBER_METRICS_BUDGET alias resolves",
+			envKey: "BLNK_RELAY_SUBSCRIBER_METRICS_BUDGET",
+			value:  "750",
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Relay.SubscriberMetricsBudget != 750 {
+					t.Errorf("Expected Relay.SubscriberMetricsBudget to be 750, got %d", loaded.Relay.SubscriberMetricsBudget)
 				}
 			},
 		},
@@ -2336,11 +2686,24 @@ func TestKafkaBrokersParsing(t *testing.T) {
 // single mis-typed variable would cancel the retirement of the very transport this
 // feature exists to replace, with nothing failing and nothing to notice.
 //
-// An ABSENT date is a warning. Nothing was mis-stated; a retirement instant simply has
-// not been chosen yet, and AAP §0.7.2 requires a deployment to keep starting and serving
-// as Kafka configuration is introduced. Failing here would make adding KAFKA_BROKERS —
-// on its own a safe additive change — an outage, and the consequence of no date is that
-// dual delivery continues, which is the pre-existing, subscriber-safe behaviour.
+// An ABSENT date depends on whether the deployment publishes, and the two cases are
+// genuinely different rather than one rule with an exception.
+//
+// With NO brokers, it is accepted quietly. Nothing was mis-stated, there is no Kafka
+// transport to migrate to and therefore no window to state, and AAP §0.7.2 requires a
+// deployment to keep starting and serving as Kafka configuration is introduced. The
+// legacy webhook path keeps behaving exactly as it did before this feature existed —
+// which is not "dual delivery continues", because with no brokers there is no second
+// transport for anything to be dual about.
+//
+// With brokers, it is REFUSED, and KAFKA_INSECURE_LOCAL_DEV is the only acknowledgement
+// that lifts the refusal. This is the case TestResolveWebhookDeprecationWindow_AnUnusable
+// WindowIsRefusedNeverInvented covers, and the reasoning is recorded there: it was once a
+// warning that promised dual delivery would continue indefinitely, but
+// blnk.WebhookSunsetPassed fails CLOSED on a publishing deployment with no usable window,
+// so the promise and the behaviour pointed in opposite directions. An unset variable must
+// not be able to preserve a deprecated transport silently, so the combination is rejected
+// before any traffic is served.
 //
 // # There is only one input, so the window cannot be inconsistent
 //
@@ -2678,9 +3041,133 @@ func TestMockConfig_KafkaAndRelayDefaultsApplied(t *testing.T) {
 	if loaded.Relay.RetryMaxBackoffMS != 30000 {
 		t.Errorf("Expected Relay.RetryMaxBackoffMS to be 30000, got %d", loaded.Relay.RetryMaxBackoffMS)
 	}
+	if loaded.Relay.SubscriberMetricsBudget != 200 {
+		t.Errorf("Expected Relay.SubscriberMetricsBudget to be 200, got %d", loaded.Relay.SubscriberMetricsBudget)
+	}
 
 	// A bare fixture stays Kafka-less, which is what selects the no-op publisher.
 	assertBrokerList(t, loaded.Kafka.Brokers, nil)
+}
+
+// TestSetRelayDefaults_SubscriberMetricsBudgetRefusesAnUnmeasurableValue pins the two
+// values that would silently switch consumer-lag measurement off.
+//
+// # Why a zero or negative budget cannot be honoured
+//
+// The budget bounds how many subscribers ONE collection tick examines. Read literally, zero
+// examines none and a negative value examines none — and a subscriber the collector does not
+// examine has NO blnk_kafka_consumer_lag series, so SubscriberConsumerLagHigh cannot fire for
+// it however far behind it falls. Honouring either value would therefore reach the exact
+// condition blnk_subscribers_lag_unmeasured exists to expose, by configuration rather than by
+// scale, and it would do so while reporting no error at all.
+//
+// Zero additionally arrives by accident: an operator who writes RELAY_SUBSCRIBER_METRICS_BUDGET=
+// with no value, or a ConfigMap key whose value was templated away, both produce it. There is no
+// deployment for which "measure nobody" is the intent, so the default is substituted in both
+// cases and a negative value — which can only be a mistake — is additionally warned about.
+func TestSetRelayDefaults_SubscriberMetricsBudgetRefusesAnUnmeasurableValue(t *testing.T) {
+	clearEventStreamingEnv(t)
+
+	for _, tc := range []struct {
+		name       string
+		configured int
+		wantWarn   bool
+	}{
+		{name: "unset falls back to the default", configured: 0, wantWarn: false},
+		{name: "explicit zero falls back to the default", configured: 0, wantWarn: false},
+		{name: "a negative budget is refused and warned about", configured: -1, wantWarn: true},
+		{name: "a large negative budget is refused too", configured: -5000, wantWarn: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hook := logtest.NewGlobal()
+			defer hook.Reset()
+
+			cnf := eventStreamingBaseConfig()
+			cnf.Relay.SubscriberMetricsBudget = tc.configured
+
+			if err := cnf.validateAndAddDefaults(); err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+
+			if cnf.Relay.SubscriberMetricsBudget != 200 {
+				t.Errorf("Expected the budget to resolve to the default 200, got %d",
+					cnf.Relay.SubscriberMetricsBudget)
+			}
+
+			warned := false
+			for _, entry := range hook.AllEntries() {
+				if strings.Contains(entry.Message, "subscriber_metrics_budget is negative") {
+					warned = true
+
+					// The variable name has to be on the entry, because that is what an
+					// operator greps for to find the key they need to change.
+					if entry.Data["variable"] != "RELAY_SUBSCRIBER_METRICS_BUDGET" {
+						t.Errorf("Expected the warning to name the variable, got %v", entry.Data["variable"])
+					}
+				}
+			}
+			if warned != tc.wantWarn {
+				t.Errorf("Expected warning=%v, got %v", tc.wantWarn, warned)
+			}
+		})
+	}
+
+	t.Run("a positive budget below the ceiling is honoured verbatim", func(t *testing.T) {
+		// Honoured, not adjusted: the only cost of a larger budget within the supported range
+		// is broker round trips an operator has chosen to spend, and quietly capping coverage
+		// is the failure the whole variable exists to prevent.
+		cnf := eventStreamingBaseConfig()
+		cnf.Relay.SubscriberMetricsBudget = 2500
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		if cnf.Relay.SubscriberMetricsBudget != 2500 {
+			t.Errorf("Expected 2500 to be honoured verbatim, got %d", cnf.Relay.SubscriberMetricsBudget)
+		}
+		if cnf.Kafka.MetricsSubscriberBudget != 2500 {
+			t.Errorf("Expected the other spelling of the same knob to agree, got %d",
+				cnf.Kafka.MetricsSubscriberBudget)
+		}
+	})
+
+	t.Run("a budget beyond the supported ceiling is clamped and SAID SO", func(t *testing.T) {
+		// The ceiling is real rather than cautious: every measured subscriber-topic pair is a
+		// retained gauge series, so an unbounded budget makes one collection tick unbounded in
+		// cardinality as well as in duration — and a metrics pipeline that falls over takes
+		// every alert this feature added with it.
+		//
+		// What answers the objection to capping is that it is LOUD. The warning names the
+		// configured value and the applied one, so coverage is never capped silently, which
+		// is the only property that made a ceiling unacceptable.
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		cnf := eventStreamingBaseConfig()
+		cnf.Relay.SubscriberMetricsBudget = 25000
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		if cnf.Relay.SubscriberMetricsBudget != MaxMetricsSubscriberBudget {
+			t.Errorf("Expected the budget to be clamped to %d, got %d",
+				MaxMetricsSubscriberBudget, cnf.Relay.SubscriberMetricsBudget)
+		}
+		if cnf.Kafka.MetricsSubscriberBudget != MaxMetricsSubscriberBudget {
+			t.Errorf("Expected both spellings to hold the clamped value, got %d",
+				cnf.Kafka.MetricsSubscriberBudget)
+		}
+
+		clamped := false
+		for _, entry := range hook.AllEntries() {
+			if strings.Contains(entry.Message, "above the supported ceiling") {
+				clamped = true
+			}
+		}
+		if !clamped {
+			t.Error("Expected the clamp to be reported, so coverage is never capped silently")
+		}
+	})
 }
 
 // TestKafkaConfig_SASLAdminCredentialsContract pins the SINGLE reading of the
@@ -3224,6 +3711,186 @@ func TestValidateKafkaTopicPrefix_RefusesAPrefixThatCannotComposeALegalTopicName
 	})
 }
 
+// TestValidateKafkaHistoricalTopicPrefixes_NormalisesTheAllowlistAndRefusesAnUnusableEntry
+// covers KAFKA_HISTORICAL_TOPIC_PREFIXES.
+//
+// # Why the list has to be validated rather than merely trimmed
+//
+// Every prefix in it is treated as OWNED: writers are pre-created for its whole topic
+// inventory, the publisher's ownership test admits it, and topic assurance keeps its topics
+// present. That is what keeps rows captured before a KAFKA_TOPIC_PREFIX rename publishable
+// after a restart — so a malformed entry is a silent failure of exactly the stranding the
+// list exists to prevent: the operator declares the old namespace, the value is unusable,
+// and the old rows still never drain. Refusing it at load, by name, is what makes the
+// declaration mean something.
+//
+// # Why the normalisations are normalisations rather than refusals
+//
+// The list is meant to be DRAINED. A trailing comma, or the current prefix left in place
+// after the rename completed, describes the same set of owned topics either way, so both are
+// collapsed. Removing the current prefix in particular is what lets every consumer treat the
+// field as "the prefixes BESIDES the configured one" and compose a duplicate-free inventory
+// from current-plus-historical.
+func TestValidateKafkaHistoricalTopicPrefixes_NormalisesTheAllowlistAndRefusesAnUnusableEntry(t *testing.T) {
+	t.Run("the ordinary case is an empty list", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected a configuration with no historical prefix to load, got %v", err)
+		}
+		if cnf.Kafka.HistoricalTopicPrefixes != nil {
+			t.Errorf("Expected no historical prefixes, got %v", cnf.Kafka.HistoricalTopicPrefixes)
+		}
+		if owned := cnf.Kafka.OwnedTopicPrefixes(); len(owned) != 1 || owned[0] != "blnk" {
+			t.Errorf("Expected the owned set to be the configured prefix alone, got %v", owned)
+		}
+	})
+
+	t.Run("entries are trimmed, deduplicated and stripped of the configured prefix", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.TopicPrefix = "acme"
+		cnf.Kafka.HistoricalTopicPrefixes = []string{
+			" blnk\n", ".legacy.", "", "   ", "blnk", "acme",
+		}
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected the realistic accidents to be normalised, got %v", err)
+		}
+
+		want := []string{"blnk", "legacy"}
+		if len(cnf.Kafka.HistoricalTopicPrefixes) != len(want) {
+			t.Fatalf("Expected %v, got %v", want, cnf.Kafka.HistoricalTopicPrefixes)
+		}
+		for i, prefix := range want {
+			if cnf.Kafka.HistoricalTopicPrefixes[i] != prefix {
+				t.Errorf("Expected entry %d to be %q, got %q",
+					i, prefix, cnf.Kafka.HistoricalTopicPrefixes[i])
+			}
+		}
+
+		// The configured prefix leads the owned set, because that is where new events go.
+		owned := cnf.Kafka.OwnedTopicPrefixes()
+		wantOwned := []string{"acme", "blnk", "legacy"}
+		if len(owned) != len(wantOwned) {
+			t.Fatalf("Expected the owned set %v, got %v", wantOwned, owned)
+		}
+		for i, prefix := range wantOwned {
+			if owned[i] != prefix {
+				t.Errorf("Expected owned prefix %d to be %q, got %q", i, prefix, owned[i])
+			}
+		}
+	})
+
+	t.Run("a list of nothing but blanks resolves to no historical prefix", func(t *testing.T) {
+		// KAFKA_HISTORICAL_TOPIC_PREFIXES="" and "," both parse into a non-empty slice
+		// carrying nothing usable, and both must read as "none declared" rather than as a
+		// list of blank namespaces.
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.HistoricalTopicPrefixes = []string{"", " ", "."}
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected an all-blank list to normalise away, got %v", err)
+		}
+		if cnf.Kafka.HistoricalTopicPrefixes != nil {
+			t.Errorf("Expected no historical prefixes, got %v", cnf.Kafka.HistoricalTopicPrefixes)
+		}
+	})
+
+	t.Run("an entry that cannot compose a legal topic name is fatal and names the variable", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.TopicPrefix = "acme"
+		cnf.Kafka.HistoricalTopicPrefixes = []string{"blnk prod"}
+
+		err := cnf.validateAndAddDefaults()
+		if err == nil {
+			t.Fatal("Expected an interior space in a historical prefix to fail the load")
+		}
+		if !strings.Contains(err.Error(), "KAFKA_HISTORICAL_TOPIC_PREFIXES") {
+			t.Errorf("Expected the error to name the historical variable, got %q", err.Error())
+		}
+		if !strings.Contains(err.Error(), `' '`) {
+			t.Errorf("Expected the offending character quoted, got %q", err.Error())
+		}
+	})
+
+	t.Run("a control character in an entry is quoted rather than emitted", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.TopicPrefix = "acme"
+		cnf.Kafka.HistoricalTopicPrefixes = []string{"blnk\nfake-log-record"}
+
+		err := cnf.validateAndAddDefaults()
+		if err == nil {
+			t.Fatal("Expected a newline in a historical prefix to fail the load")
+		}
+		if strings.Contains(err.Error(), "\n") {
+			t.Errorf("The error must not carry the raw control character: %q", err.Error())
+		}
+	})
+
+	t.Run("more than the permitted number of distinct prefixes is fatal", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.TopicPrefix = "acme"
+		cnf.Kafka.HistoricalTopicPrefixes = make([]string, 0, MaxHistoricalTopicPrefixes+1)
+		for i := 0; i <= MaxHistoricalTopicPrefixes; i++ {
+			cnf.Kafka.HistoricalTopicPrefixes = append(
+				cnf.Kafka.HistoricalTopicPrefixes, fmt.Sprintf("gen%d", i))
+		}
+
+		err := cnf.validateAndAddDefaults()
+		if err == nil {
+			t.Fatal("Expected an over-long allowlist to fail the load: each prefix pre-creates a " +
+				"writer per topic on every process start")
+		}
+		if !strings.Contains(err.Error(), "KAFKA_HISTORICAL_TOPIC_PREFIXES") {
+			t.Errorf("Expected the error to name the variable, got %q", err.Error())
+		}
+	})
+
+	t.Run("exactly the permitted number is accepted", func(t *testing.T) {
+		cnf := kafkaEnabledConfig("localhost:9092")
+		cnf.Kafka.TopicPrefix = "acme"
+		for i := 0; i < MaxHistoricalTopicPrefixes; i++ {
+			cnf.Kafka.HistoricalTopicPrefixes = append(
+				cnf.Kafka.HistoricalTopicPrefixes, fmt.Sprintf("gen%d", i))
+		}
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected the maximum allowlist to be accepted, got %v", err)
+		}
+		if len(cnf.Kafka.HistoricalTopicPrefixes) != MaxHistoricalTopicPrefixes {
+			t.Errorf("Expected %d prefixes, got %d",
+				MaxHistoricalTopicPrefixes, len(cnf.Kafka.HistoricalTopicPrefixes))
+		}
+	})
+
+	t.Run("the allowlist is validated even when no broker is configured", func(t *testing.T) {
+		cnf := eventStreamingBaseConfig()
+		cnf.Kafka.HistoricalTopicPrefixes = []string{"blnk prod"}
+
+		if err := cnf.validateAndAddDefaults(); err == nil {
+			t.Fatal("Expected the allowlist to be validated independently of the broker list")
+		}
+	})
+
+	t.Run("OwnedTopicPrefixes answers for an unvalidated configuration too", func(t *testing.T) {
+		// Reached from a test or a tool that builds a KafkaConfig literal without running
+		// the validate-and-default path. A hole in the list would be worse than a fallback:
+		// the strictest available answer is the default prefix.
+		unvalidated := KafkaConfig{HistoricalTopicPrefixes: []string{" ", "legacy", "legacy"}}
+
+		owned := unvalidated.OwnedTopicPrefixes()
+		want := []string{"blnk", "legacy"}
+		if len(owned) != len(want) {
+			t.Fatalf("Expected %v, got %v", want, owned)
+		}
+		for i, prefix := range want {
+			if owned[i] != prefix {
+				t.Errorf("Expected owned prefix %d to be %q, got %q", i, prefix, owned[i])
+			}
+		}
+	})
+}
+
 // TestEventRetentionPeriod_ConvertsDaysAndRefusesANegativePeriod covers the conversion and the
 // one input that would be catastrophic to honour.
 //
@@ -3309,6 +3976,164 @@ func TestEventRetentionDays_ResolvesFromBothEnvironmentVariableForms(t *testing.
 	}
 }
 
+// TestEventRetentionPurgeCapacity_DefaultsAboveArrivalsAndResolvesFromBothEnvForms covers the
+// two settings PERF-P23 introduced, and covers them as CAPACITY rather than as two integers.
+//
+// # Why the default value is the assertion
+//
+// Purge capacity used to be a compile-time constant of 100 batches of 1,000 rows — 100,000 rows
+// an hour — whose own comment claimed it "overtakes any realistic arrival rate". At the rate
+// this system is validated against, 500 events a second, rows arrive at 1,800,000 an hour:
+// eighteen times faster. Capacity below arrivals does not slow growth, it permits it, and the
+// configured retention period is then never actually enforced however short it is set. So the
+// first subtest is arithmetic against that arrival rate, not a restatement of a literal — a
+// future change that lowered either factor back under peak would fail it.
+//
+// # Why zero defaults and unbounded has its own value
+//
+// An unset int field IS zero, so "I did not configure this" and "I want no ceiling" cannot both
+// be read from it. Zero is taken as unset and defaulted, because the bound is what stops the
+// first sweep after retention is enabled from attempting an entire historical backlog in one
+// pass beside a live relay — a deployment that never mentions the setting must keep that
+// protection. Asking for no ceiling is spelled EventRetentionUnboundedSweep, and every negative
+// normalises onto it so a reader downstream recognises one value rather than testing a sign.
+//
+// The batch SIZE has no such ambiguity and is simply defaulted: zero there would delete nothing
+// while still reporting healthy sweeps. Retention is switched off by its period, in one place,
+// and never by a capacity value.
+func TestEventRetentionPurgeCapacity_DefaultsAboveArrivalsAndResolvesFromBothEnvForms(t *testing.T) {
+	t.Run("the shipped defaults exceed the specified peak arrival rate", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+
+		cnf := eventStreamingBaseConfig()
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+
+		if cnf.Relay.EventRetentionBatchSize != defaultRelay.EventRetentionBatchSize {
+			t.Errorf("Expected Relay.EventRetentionBatchSize to default to %d, got %d",
+				defaultRelay.EventRetentionBatchSize, cnf.Relay.EventRetentionBatchSize)
+		}
+		if cnf.Relay.EventRetentionMaxBatchesPerSweep != defaultRelay.EventRetentionMaxBatchesPerSweep {
+			t.Errorf("Expected Relay.EventRetentionMaxBatchesPerSweep to default to %d, got %d",
+				defaultRelay.EventRetentionMaxBatchesPerSweep, cnf.Relay.EventRetentionMaxBatchesPerSweep)
+		}
+
+		// One sweep an hour, so capacity per sweep IS capacity per hour.
+		const peakRowsPerHour = 500 * 60 * 60
+
+		capacity := cnf.Relay.EventRetentionMaxBatchesPerSweep * cnf.Relay.EventRetentionBatchSize
+		if capacity <= peakRowsPerHour {
+			t.Errorf(
+				"Expected default purge capacity to EXCEED peak arrivals of %d rows/hour, got %d; "+
+					"at or below the arrival rate the retention period is not enforced at all",
+				peakRowsPerHour, capacity)
+		}
+	})
+
+	t.Run("a non-positive batch size is defaulted because zero would delete nothing", func(t *testing.T) {
+		for name, configured := range map[string]int{"zero": 0, "negative": -250} {
+			t.Run(name, func(t *testing.T) {
+				clearEventStreamingEnv(t)
+
+				cnf := eventStreamingBaseConfig()
+				cnf.Relay.EventRetentionBatchSize = configured
+				if err := cnf.validateAndAddDefaults(); err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+
+				if cnf.Relay.EventRetentionBatchSize != defaultRelay.EventRetentionBatchSize {
+					t.Errorf("Expected a %s batch size to be defaulted to %d, got %d",
+						name, defaultRelay.EventRetentionBatchSize, cnf.Relay.EventRetentionBatchSize)
+				}
+			})
+		}
+	})
+
+	t.Run("an unset ceiling is defaulted rather than read as unbounded", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+
+		cnf := eventStreamingBaseConfig()
+		cnf.Relay.EventRetentionDays = 30
+		cnf.Relay.EventRetentionMaxBatchesPerSweep = 0
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+
+		if cnf.Relay.EventRetentionMaxBatchesPerSweep != DefaultEventRetentionMaxBatchesPerSweep {
+			t.Errorf(
+				"Expected an unset ceiling to default to %d, got %d; reading zero as unbounded "+
+					"would silently remove the bound from every deployment that never sets it",
+				DefaultEventRetentionMaxBatchesPerSweep, cnf.Relay.EventRetentionMaxBatchesPerSweep)
+		}
+	})
+
+	t.Run("every negative normalises onto the unbounded sentinel", func(t *testing.T) {
+		for name, configured := range map[string]int{
+			"the sentinel itself": EventRetentionUnboundedSweep,
+			"another negative":    -9,
+		} {
+			t.Run(name, func(t *testing.T) {
+				clearEventStreamingEnv(t)
+
+				cnf := eventStreamingBaseConfig()
+				cnf.Relay.EventRetentionDays = 30
+				cnf.Relay.EventRetentionMaxBatchesPerSweep = configured
+				if err := cnf.validateAndAddDefaults(); err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+
+				if cnf.Relay.EventRetentionMaxBatchesPerSweep != EventRetentionUnboundedSweep {
+					t.Errorf(
+						"Expected %d to normalise onto EventRetentionUnboundedSweep (%d), got %d; "+
+							"one recognisable value downstream beats a sign to test",
+						configured, EventRetentionUnboundedSweep,
+						cnf.Relay.EventRetentionMaxBatchesPerSweep)
+				}
+			})
+		}
+	})
+
+	t.Run("both settings resolve from either environment variable form", func(t *testing.T) {
+		for name, form := range map[string]struct {
+			batchSize  string
+			maxBatches string
+		}{
+			"the documented bare names": {
+				batchSize:  "RELAY_EVENT_RETENTION_BATCH_SIZE",
+				maxBatches: "RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP",
+			},
+			"the repository's prefixed convention": {
+				batchSize:  "BLNK_RELAY_EVENT_RETENTION_BATCH_SIZE",
+				maxBatches: "BLNK_RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP",
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				clearEventStreamingEnv(t)
+				t.Setenv(form.batchSize, "750")
+				t.Setenv(form.maxBatches, "3000")
+
+				cnf := eventStreamingBaseConfig()
+				if err := applyEventStreamingEnvOverride(&cnf); err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+				if err := cnf.validateAndAddDefaults(); err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+
+				if cnf.Relay.EventRetentionBatchSize != 750 {
+					t.Errorf("Expected %s to set the batch size to 750, got %d",
+						form.batchSize, cnf.Relay.EventRetentionBatchSize)
+				}
+				if cnf.Relay.EventRetentionMaxBatchesPerSweep != 3000 {
+					t.Errorf("Expected %s to set the ceiling to 3000, got %d",
+						form.maxBatches, cnf.Relay.EventRetentionMaxBatchesPerSweep)
+				}
+			})
+		}
+	})
+}
+
 // TestWebhookConfig_AllowPrivateDestinationDefaultsToRefusing pins the SAFE default of the
 // legacy transport's destination policy (SSRF-01).
 //
@@ -3372,14 +4197,6 @@ func TestWebhookConfig_AllowPrivateDestinationDefaultsToRefusing(t *testing.T) {
 // capture a debug-only line. An unconditional SetLevel here would undo those pins from
 // inside the configuration layer, and the failure would appear in an unrelated package.
 func TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable(t *testing.T) {
-	pinLevel := func(t *testing.T, level logrus.Level) {
-		t.Helper()
-
-		previous := logrus.GetLevel()
-		t.Cleanup(func() { logrus.SetLevel(previous) })
-		logrus.SetLevel(level)
-	}
-
 	t.Run("a stated level is applied and normalised", func(t *testing.T) {
 		for stated, want := range map[string]logrus.Level{
 			"debug":   logrus.DebugLevel,
@@ -3387,7 +4204,10 @@ func TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable(t *testing.T) {
 			" trace ": logrus.TraceLevel,
 			"warn":    logrus.WarnLevel,
 			"warning": logrus.WarnLevel,
-			"error":   logrus.ErrorLevel,
+			// "error", "fatal" and "panic" are deliberately absent. They are not
+			// applied verbatim, because each of them suppresses the event relay's
+			// mandatory per-attempt records; they are raised to the floor instead, and
+			// TestSetLogLevelDefaults_KeepsMandatoryRecordsVisible covers them.
 		} {
 			t.Run(stated, func(t *testing.T) {
 				pinLevel(t, logrus.InfoLevel)
@@ -3471,6 +4291,10 @@ func TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable(t *testing.T) {
 
 	t.Run("MockConfig resolves the level like any other setting", func(t *testing.T) {
 		pinLevel(t, logrus.InfoLevel)
+		// MockConfig publishes into the process-global ConfigStore, so without this the store
+		// is left pointing at this subtest's fixture and the next Fetch() anywhere in the
+		// package reads it.
+		restoreConfigStore(t)
 
 		cnf := eventStreamingBaseConfig()
 		cnf.LogLevel = "debug"
@@ -3480,6 +4304,184 @@ func TestSetLogLevelDefaults_MakesTheDebugDiagnosticsReachable(t *testing.T) {
 			t.Errorf("Expected MockConfig to apply a stated level, got %s", logrus.GetLevel())
 		}
 	})
+}
+
+// AAP R-4 requires the event relay to log the attempt count and error reason on EVERY
+// failed publish attempt. Those records are warnings, and logrus discards warnings
+// whenever the logger sits at error, fatal or panic — so three of the seven configurable
+// levels used to delete a mandatory audit trail, silently, with nothing in the log to
+// say anything had been withheld.
+//
+// These assertions pin the floor that closes that gap. They are written against the
+// EFFECTIVE level rather than against the configuration string alone, because the string
+// is only a report: what decides whether the record survives is logrus.GetLevel().
+func TestSetLogLevelDefaults_KeepsMandatoryRecordsVisible(t *testing.T) {
+	pinLevel := func(t *testing.T, level logrus.Level) {
+		t.Helper()
+
+		previous := logrus.GetLevel()
+		t.Cleanup(func() { logrus.SetLevel(previous) })
+		logrus.SetLevel(level)
+	}
+
+	t.Run("a level that would suppress the relay's per-attempt records is raised", func(t *testing.T) {
+		for _, stated := range []string{"error", "fatal", "panic", "ERROR", " panic "} {
+			t.Run(stated, func(t *testing.T) {
+				pinLevel(t, logrus.InfoLevel)
+
+				cnf := eventStreamingBaseConfig()
+				cnf.LogLevel = stated
+
+				if err := cnf.validateAndAddDefaults(); err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+
+				if logrus.GetLevel() != logrus.WarnLevel {
+					t.Errorf("Expected %q to be raised to warn so the relay's mandatory "+
+						"per-attempt publish-failure records still emit, got %s",
+						stated, logrus.GetLevel())
+				}
+
+				// The field must report the level in force, not the one asked for.
+				// /metrics and support bundles read it, and a field claiming "error"
+				// while the logger runs at warn misleads exactly the person trying to
+				// work out why they can see more than they configured.
+				if cnf.LogLevel != MINIMUM_LOG_LEVEL {
+					t.Errorf("Expected the field to report the effective level %q, got %q",
+						MINIMUM_LOG_LEVEL, cnf.LogLevel)
+				}
+
+				// The proof that matters: a warning emitted at this level is not
+				// discarded. This is the R-4 record's severity, exercised directly.
+				hook := logtest.NewGlobal()
+				defer hook.Reset()
+
+				logrus.Warn("a mandatory per-attempt record")
+
+				if len(hook.AllEntries()) == 0 {
+					t.Errorf("a warning was discarded at effective level %s, which means "+
+						"the relay's mandatory per-attempt records would be lost",
+						logrus.GetLevel())
+				}
+			})
+		}
+	})
+
+	t.Run("the clamp announces itself", func(t *testing.T) {
+		pinLevel(t, logrus.InfoLevel)
+
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		cnf := eventStreamingBaseConfig()
+		cnf.LogLevel = "error"
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+
+		// Silently overriding an operator's setting is its own defect: the next person
+		// to wonder why they are seeing warnings at "error" has nothing to read. The
+		// warning must also name BOTH levels, so the override is legible without
+		// consulting the source.
+		var found bool
+		for _, entry := range hook.AllEntries() {
+			if strings.Contains(entry.Message, "mandatory per-attempt") {
+				found = true
+
+				if entry.Data["requested_log_level"] != "error" {
+					t.Errorf("Expected the announcement to name the requested level, got %v",
+						entry.Data["requested_log_level"])
+				}
+				if entry.Data["effective_log_level"] != MINIMUM_LOG_LEVEL {
+					t.Errorf("Expected the announcement to name the effective level, got %v",
+						entry.Data["effective_log_level"])
+				}
+			}
+		}
+
+		if !found {
+			t.Error("raising the configured level must be announced; a silent override " +
+				"leaves an operator with no way to learn their setting was not honoured")
+		}
+	})
+
+	t.Run("levels at or above the floor are untouched", func(t *testing.T) {
+		// The floor must not become a ceiling. trace and debug are the levels the
+		// LogLevel setting exists to make reachable, so clamping in the wrong direction
+		// would defeat the feature it was added for while still passing every
+		// assertion above.
+		for stated, want := range map[string]logrus.Level{
+			"warn":  logrus.WarnLevel,
+			"info":  logrus.InfoLevel,
+			"debug": logrus.DebugLevel,
+			"trace": logrus.TraceLevel,
+		} {
+			t.Run(stated, func(t *testing.T) {
+				pinLevel(t, logrus.InfoLevel)
+
+				cnf := eventStreamingBaseConfig()
+				cnf.LogLevel = stated
+
+				if err := cnf.validateAndAddDefaults(); err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+
+				if logrus.GetLevel() != want {
+					t.Errorf("Expected %q to be applied unchanged, got %s — the floor must "+
+						"raise quiet levels, never lower verbose ones", stated, logrus.GetLevel())
+				}
+			})
+		}
+	})
+}
+
+// clampLogLevel's comparison direction is the one thing about it that can be wrong while
+// still looking right, because logrus orders its levels with the QUIET end at zero.
+// Reversing the test would clamp trace and debug away instead of error and panic.
+func TestClampLogLevel_RaisesOnlyTheLevelsThatSuppressMandatoryRecords(t *testing.T) {
+	// The constant is compared directly against the normalised LogLevel field, so it
+	// has to be the spelling logrus itself reports. logrus.ParseLevel accepts both
+	// "warn" and "warning" but String() only ever returns the latter, which makes
+	// "warn" a constant that parses correctly and then never equals the field it is
+	// meant to describe.
+	t.Run("the constant is the spelling logrus reports", func(t *testing.T) {
+		if got := minimumVisibleLogLevel().String(); got != MINIMUM_LOG_LEVEL {
+			t.Errorf("MINIMUM_LOG_LEVEL is %q but the level it parses to reports %q; the "+
+				"constant must match so it can be compared against a normalised field",
+				MINIMUM_LOG_LEVEL, got)
+		}
+	})
+
+	for _, tc := range []struct {
+		requested logrus.Level
+		want      logrus.Level
+		clamped   bool
+	}{
+		{logrus.PanicLevel, logrus.WarnLevel, true},
+		{logrus.FatalLevel, logrus.WarnLevel, true},
+		{logrus.ErrorLevel, logrus.WarnLevel, true},
+		{logrus.WarnLevel, logrus.WarnLevel, false},
+		{logrus.InfoLevel, logrus.InfoLevel, false},
+		{logrus.DebugLevel, logrus.DebugLevel, false},
+		{logrus.TraceLevel, logrus.TraceLevel, false},
+	} {
+		t.Run(tc.requested.String(), func(t *testing.T) {
+			got, clamped := clampLogLevel(tc.requested)
+
+			if got != tc.want || clamped != tc.clamped {
+				t.Errorf("clampLogLevel(%s) = (%s, %v), want (%s, %v)",
+					tc.requested, got, clamped, tc.want, tc.clamped)
+			}
+
+			// Whatever comes out must be able to carry a warning, which is the whole
+			// purpose of the floor.
+			if got < logrus.WarnLevel {
+				t.Errorf("clampLogLevel(%s) returned %s, which suppresses warnings",
+					tc.requested, got)
+			}
+		})
+	}
 }
 
 // TestLoadConfigFromFile_LogLevelResolvesFromTheEnvironment pins the deployment surface of
@@ -3518,31 +4520,11 @@ func TestLoadConfigFromFile_LogLevelResolvesFromTheEnvironment(t *testing.T) {
 		return path
 	}
 
-	// The variable is cleared explicitly rather than through clearEventStreamingEnv, which
-	// covers the Kafka block only. A value leaking in from the surrounding environment would
-	// satisfy the file-only assertion for the wrong reason.
-	clearLogLevelEnv := func(t *testing.T) {
-		t.Helper()
-
-		saved, existed := os.LookupEnv("BLNK_LOG_LEVEL")
-		if err := os.Unsetenv("BLNK_LOG_LEVEL"); err != nil {
-			t.Fatalf("Unable to unset BLNK_LOG_LEVEL: %v", err)
-		}
-
-		t.Cleanup(func() {
-			if !existed {
-				return
-			}
-			if err := os.Setenv("BLNK_LOG_LEVEL", saved); err != nil {
-				t.Errorf("Unable to restore BLNK_LOG_LEVEL: %v", err)
-			}
-		})
-	}
-
 	t.Run("from the file", func(t *testing.T) {
 		clearEventStreamingEnv(t)
 		clearLogLevelEnv(t)
-		logrus.SetLevel(logrus.InfoLevel)
+		restoreConfigStore(t)
+		pinLevel(t, logrus.InfoLevel)
 
 		if err := loadConfigFromFile(writeConfig(t, "debug")); err != nil {
 			t.Fatalf("Expected no error, got %v", err)
@@ -3560,7 +4542,8 @@ func TestLoadConfigFromFile_LogLevelResolvesFromTheEnvironment(t *testing.T) {
 
 	t.Run("the environment overrides the file", func(t *testing.T) {
 		clearEventStreamingEnv(t)
-		logrus.SetLevel(logrus.InfoLevel)
+		restoreConfigStore(t)
+		pinLevel(t, logrus.InfoLevel)
 		t.Setenv("BLNK_LOG_LEVEL", "trace")
 
 		if err := loadConfigFromFile(writeConfig(t, "error")); err != nil {
@@ -3580,7 +4563,8 @@ func TestLoadConfigFromFile_LogLevelResolvesFromTheEnvironment(t *testing.T) {
 	t.Run("neither states one, so the shipped default stands", func(t *testing.T) {
 		clearEventStreamingEnv(t)
 		clearLogLevelEnv(t)
-		logrus.SetLevel(logrus.InfoLevel)
+		restoreConfigStore(t)
+		pinLevel(t, logrus.InfoLevel)
 
 		if err := loadConfigFromFile(writeConfig(t, "")); err != nil {
 			t.Fatalf("Expected no error, got %v", err)
@@ -3608,7 +4592,7 @@ func TestLogger_AppliesTheLevelBeforeTheConfigurationIsRead(t *testing.T) {
 	t.Cleanup(func() { logrus.SetLevel(previous) })
 
 	t.Run("a parseable variable takes effect immediately", func(t *testing.T) {
-		logrus.SetLevel(logrus.InfoLevel)
+		pinLevel(t, logrus.InfoLevel)
 		t.Setenv("BLNK_LOG_LEVEL", "debug")
 
 		logger()
@@ -3619,7 +4603,7 @@ func TestLogger_AppliesTheLevelBeforeTheConfigurationIsRead(t *testing.T) {
 	})
 
 	t.Run("an unparseable variable is left for the configuration layer to report", func(t *testing.T) {
-		logrus.SetLevel(logrus.InfoLevel)
+		pinLevel(t, logrus.InfoLevel)
 		t.Setenv("BLNK_LOG_LEVEL", "chatty")
 
 		logger()
@@ -3630,15 +4614,238 @@ func TestLogger_AppliesTheLevelBeforeTheConfigurationIsRead(t *testing.T) {
 	})
 
 	t.Run("no variable changes nothing", func(t *testing.T) {
-		logrus.SetLevel(logrus.WarnLevel)
-		if err := os.Unsetenv("BLNK_LOG_LEVEL"); err != nil {
-			t.Fatalf("Unable to unset BLNK_LOG_LEVEL: %v", err)
-		}
+		pinLevel(t, logrus.WarnLevel)
+		// Save-and-restore, not a bare Unsetenv: the ambient value belongs to whatever runs
+		// next, and stripping it for the rest of the process is a leak in the other direction.
+		clearLogLevelEnv(t)
 
 		logger()
 
 		if logrus.GetLevel() != logrus.WarnLevel {
 			t.Errorf("Expected the level unchanged, got %s", logrus.GetLevel())
+		}
+	})
+}
+
+// TestResolveSearchCredential_NeverAssumesAPublicKeyInProduction is SEC-07's configuration half.
+//
+// # What was wrong
+//
+// setDefaultValues substituted DEFAULT_TYPESENSE_KEY — the literal "blnk-api-key" — whenever no
+// key was configured, in every posture. That literal is published in this repository's compose
+// files and README, so it is known to everyone, and it grants full access to the search
+// collection holding indexed transaction, balance and identity records. A production deployment
+// that had merely forgotten BLNK_TYPESENSE_KEY therefore authenticated with a public credential.
+//
+// The substitution also destroyed the evidence: once applied, the field was non-empty, so no
+// later check could distinguish an operator's key from an invented one. That is why the fix is a
+// change of DECISION SITE and not just a change of value.
+//
+// # Why three arms rather than "require it"
+//
+// Each arm is a different deployment and a single rule gets one of them wrong. The local posture
+// must keep working — a local TypeSense is started with that very key and the whole test suite
+// runs there. A secure deployment that does not use search at all must not be refused startup
+// over a subsystem it never calls. A secure deployment that DOES use search must be refused,
+// because the only alternatives are a public credential or a stop, and a stop is correct.
+func TestResolveSearchCredential_NeverAssumesAPublicKeyInProduction(t *testing.T) {
+	t.Run("an operator-supplied key is never touched, in either posture", func(t *testing.T) {
+		for _, secure := range []bool{false, true} {
+			cnf := eventStreamingBaseConfig()
+			cnf.Server.Secure = secure
+			cnf.TypeSense = TypeSenseConfig{Dns: "http://typesense:8108"}
+			cnf.TypeSenseKey = "an-operators-own-key"
+
+			if err := cnf.validateAndAddDefaults(); err != nil {
+				t.Fatalf("secure=%v: expected no error, got %v", secure, err)
+			}
+			if cnf.TypeSenseKey != "an-operators-own-key" {
+				t.Errorf("secure=%v: the supplied key must survive verbatim, got %q", secure, cnf.TypeSenseKey)
+			}
+		}
+	})
+
+	t.Run("the local posture keeps the historical default", func(t *testing.T) {
+		// Unchanged behaviour, deliberately. The compose stack starts TypeSense with this key,
+		// the makefile targets rely on it and every test in this repository runs here; refusing
+		// would break all of them to protect a credential doing no work.
+		cnf := eventStreamingBaseConfig()
+		cnf.Server.Secure = false
+		cnf.TypeSense = TypeSenseConfig{Dns: "http://localhost:8108"}
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		if cnf.TypeSenseKey != DEFAULT_TYPESENSE_KEY {
+			t.Errorf("Expected the local default %q, got %q", DEFAULT_TYPESENSE_KEY, cnf.TypeSenseKey)
+		}
+	})
+
+	t.Run("a secure deployment using search is REFUSED rather than given the public key", func(t *testing.T) {
+		cnf := eventStreamingBaseConfig()
+		cnf.Server.Secure = true
+		cnf.TypeSense = TypeSenseConfig{Dns: "http://typesense:8108"}
+
+		err := cnf.validateAndAddDefaults()
+		if err == nil {
+			t.Fatal("Expected a refusal: a production deployment with search configured and no key " +
+				"must not be handed a credential published in this repository")
+		}
+
+		// The message has to name the variable and say why, because the operator's next action is
+		// to set it and they need to know the fallback was not merely missing but unsafe.
+		for _, fragment := range []string{"BLNK_TYPESENSE_KEY", "secure mode", "BLNK_TYPESENSE_DNS"} {
+			if !strings.Contains(err.Error(), fragment) {
+				t.Errorf("Expected the refusal to mention %q, got: %v", fragment, err)
+			}
+		}
+
+		// AND the public literal must not have been left in the field on the way out. A refused
+		// configuration that still carries the credential would hand it to any caller that
+		// ignored the error.
+		if cnf.TypeSenseKey != "" {
+			t.Errorf("Expected the key to stay empty on refusal, got %q", cnf.TypeSenseKey)
+		}
+	})
+
+	t.Run("a secure deployment not using search starts, with no key assumed", func(t *testing.T) {
+		// Search is optional in Blnk — an unset host means no indexing — so refusing here would
+		// stop every production deployment that does not run search, which is a worse defect
+		// than the one being fixed.
+		hook := logtest.NewGlobal()
+		defer hook.Reset()
+
+		cnf := eventStreamingBaseConfig()
+		cnf.Server.Secure = true
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error when search is not in use, got %v", err)
+		}
+		if cnf.TypeSenseKey != "" {
+			t.Errorf("Expected no key to be assumed, got %q", cnf.TypeSenseKey)
+		}
+
+		warned := false
+		for _, entry := range hook.AllEntries() {
+			if strings.Contains(entry.Message, "no search credential") {
+				warned = true
+			}
+		}
+		if !warned {
+			t.Error("Expected the condition to be reported: silently empty and silently public are " +
+				"equally hard to notice")
+		}
+	})
+
+	t.Run("whitespace is not a credential", func(t *testing.T) {
+		// A variable set to spaces is an operator who meant to supply a value and did not.
+		// Accepting it would let the search client authenticate with " " and fail somewhere far
+		// less legible than here.
+		cnf := eventStreamingBaseConfig()
+		cnf.Server.Secure = true
+		cnf.TypeSense = TypeSenseConfig{Dns: "http://typesense:8108"}
+		cnf.TypeSenseKey = "   "
+
+		if err := cnf.validateAndAddDefaults(); err == nil {
+			t.Error("Expected a whitespace-only key to be refused exactly like an absent one")
+		}
+	})
+}
+
+// TestSetupRateLimiting_DefaultsToAFiniteProductionSafeLimit is SEC-14.
+//
+// # What was wrong
+//
+// The shipped defaults were 5,000,000 requests per second with a burst of 10,000,000, PER
+// CLIENT ADDRESS — tollbooth keys its limiter that way. No client can issue five million
+// requests a second against one instance, so the limiter never engaged. Rate limiting was
+// configured, was reported as configured, and did nothing: CWE-770, and worse than having no
+// limiter at all because it reads as present in every review of the configuration.
+//
+// # What is asserted
+//
+// That the default is FINITE and reachable — which is the whole property — and that it sits
+// above the throughput this project specifies for itself, so closing the security gap cannot
+// throttle a deployment operating at the volume Blnk is built for. The relationship between
+// burst and rate is asserted too, because this function applies the same 2× rule when only one
+// of the pair is supplied, and two different ratios in one function is how the next reader
+// concludes the numbers are arbitrary.
+func TestSetupRateLimiting_DefaultsToAFiniteProductionSafeLimit(t *testing.T) {
+	cnf := eventStreamingBaseConfig()
+
+	if err := cnf.validateAndAddDefaults(); err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if cnf.RateLimit.RequestsPerSecond == nil || cnf.RateLimit.Burst == nil {
+		t.Fatal("Both halves must be defaulted: the middleware disables the limiter entirely when " +
+			"either is nil, so a half-default is no limit at all")
+	}
+
+	rps := *cnf.RateLimit.RequestsPerSecond
+	burst := *cnf.RateLimit.Burst
+
+	if rps != DEFAULT_RATE_LIMIT_RPS || burst != DEFAULT_RATE_LIMIT_BURST {
+		t.Errorf("Expected the declared defaults %v/%v, got %v/%v",
+			DEFAULT_RATE_LIMIT_RPS, DEFAULT_RATE_LIMIT_BURST, rps, burst)
+	}
+
+	// THE REGRESSION GUARD. Stated as a ceiling rather than as an equality so that a future
+	// tuning change is free, while a return to a number no client could ever reach is not.
+	if rps > 100000 {
+		t.Errorf("A per-client default of %v requests/second is not a limit: no client can reach it, "+
+			"so the limiter never engages and the control exists on paper only", rps)
+	}
+
+	// AND it must not throttle the throughput the project specifies for itself. AAP V-1 fixes
+	// 500 events per second sustained, and the k6 harness drives exactly that from one host —
+	// which is one client address.
+	const specifiedThroughput = 500.0
+	if rps < specifiedThroughput {
+		t.Errorf("A per-client default of %v requests/second is below the %v events/second this "+
+			"project's own acceptance criterion states, so the security fix would fail the "+
+			"throughput criterion", rps, specifiedThroughput)
+	}
+
+	if float64(burst) != 2*rps {
+		t.Errorf("The burst must be twice the rate, matching the ratio this function already applies "+
+			"when only one of the pair is supplied; got %v for a rate of %v", burst, rps)
+	}
+
+	t.Run("an operator's own values are never overridden", func(t *testing.T) {
+		configuredRPS := 25.0
+		configuredBurst := 50
+
+		cnf := eventStreamingBaseConfig()
+		cnf.RateLimit.RequestsPerSecond = &configuredRPS
+		cnf.RateLimit.Burst = &configuredBurst
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		if *cnf.RateLimit.RequestsPerSecond != configuredRPS || *cnf.RateLimit.Burst != configuredBurst {
+			t.Errorf("Expected %v/%v to survive, got %v/%v", configuredRPS, configuredBurst,
+				*cnf.RateLimit.RequestsPerSecond, *cnf.RateLimit.Burst)
+		}
+	})
+
+	t.Run("a tighter limit than the default is honoured, which is what makes the default a default", func(t *testing.T) {
+		// The point of asserting this: the fix must not have turned a default into a floor. An
+		// operator whose client identity IS resolvable should be able to go far tighter than
+		// 2,000, and nothing here may prevent it.
+		tight := 10.0
+
+		cnf := eventStreamingBaseConfig()
+		cnf.RateLimit.RequestsPerSecond = &tight
+
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+		if *cnf.RateLimit.RequestsPerSecond != tight {
+			t.Errorf("Expected the tight rate %v to survive, got %v", tight, *cnf.RateLimit.RequestsPerSecond)
+		}
+		if *cnf.RateLimit.Burst != 20 {
+			t.Errorf("Expected the burst to be derived as twice the rate, got %v", *cnf.RateLimit.Burst)
 		}
 	})
 }

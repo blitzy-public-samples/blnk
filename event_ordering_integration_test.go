@@ -676,7 +676,10 @@ func orderingConfiguration(brokers []string, dsn string) *config.Configuration {
 	// the past and the run is unambiguously within the dual-delivery window — the state a
 	// deployment is in today, and therefore the one the relay should be exercised in. The
 	// legacy leg is a no-op either way, since no notification webhook URL is configured.
-	deprecationStart := strings.TrimSpace(os.Getenv("WEBHOOK_DEPRECATION_START_DATE"))
+	// NO START DATE IS READ. WebhookDeprecationStartDate is derived by the loader from the
+	// sunset, and any value supplied on input is overwritten, so reading an environment
+	// variable for it would look like a supported override and be silently discarded. The
+	// retired WEBHOOK_DEPRECATION_START_DATE key is not consulted anywhere.
 	deprecationSunset := strings.TrimSpace(os.Getenv("WEBHOOK_DEPRECATION_SUNSET_DATE"))
 	if deprecationSunset == "" {
 		deprecationSunset = time.Now().UTC().
@@ -726,7 +729,6 @@ func orderingConfiguration(brokers []string, dsn string) *config.Configuration {
 			},
 			InsecureLocalDev: !tlsEnabled,
 		},
-		WebhookDeprecationStartDate:  deprecationStart,
 		WebhookDeprecationSunsetDate: deprecationSunset,
 		// Relay retry settings are left unset on purpose so config.MockConfig fills in the
 		// production defaults (five attempts, 1s base, 30s cap). The schedule is not under
@@ -853,7 +855,9 @@ func newOrderingFixture(t *testing.T) *orderingFixture {
 	probeCtx, cancelProbe := context.WithTimeout(context.Background(), orderingClientTimeout)
 	defer cancelProbe()
 
-	if _, probeErr := ds.CountEventOutboxByStatus(probeCtx); probeErr != nil {
+	// A zero instant takes the repository's default count window (PERF-P04). This is a
+	// reachability probe, so any answer at all is the answer it wants.
+	if _, probeErr := ds.CountEventOutboxByStatus(probeCtx, time.Time{}); probeErr != nil {
 		t.Skipf(
 			"event ordering integration test: blnk.event_outbox is not queryable (%v). Apply the "+
 				"migrations with `blnk migrate up` before running this test",
@@ -957,19 +961,51 @@ func (f *orderingFixture) deleteSeededRows(t *testing.T) {
 		`DELETE FROM blnk.event_outbox WHERE starts_with(aggregate_id, $1)`,
 		orderingTransactionIDPrefix(f.runID))
 	if err != nil {
-		t.Logf("could not clean up the outbox rows of ordering run %s: %v", f.runID, err)
+		// FAILS the test rather than logging. A row this run seeded and could not delete is
+		// left in a shared table: a non-terminal one is claimable for ever, so the next relay
+		// any test starts picks it up and that test's assertions are made against rows it
+		// never created. A green test that leaves that behind reports success for the run and
+		// hands the failure to somebody else, in a different file, with no way back to here.
+		t.Errorf("could not clean up the outbox rows of ordering run %s: %v", f.runID, err)
+	} else if affected, countErr := result.RowsAffected(); countErr != nil {
+		t.Logf("cleaned up the outbox rows of ordering run %s (count unavailable: %v)",
+			f.runID, countErr)
+	} else {
+		t.Logf("cleaned up %d outbox rows for ordering run %s", affected, f.runID)
+	}
+
+	// The delete reporting success is not the same as the rows being gone, so the state is
+	// CONFIRMED rather than assumed. This also catches the case the delete cannot: a row whose
+	// aggregate id does not carry the prefix the cleanup matches on, which the delete would
+	// report as a cheerful zero.
+	f.verifySeededRowsGone(t)
+}
+
+// verifySeededRowsGone asserts this run left nothing behind in the shared outbox.
+//
+// Separate from the delete so that a cleanup which errored is still checked: the two answer
+// different questions — whether the statement succeeded, and whether the table is clean.
+func (f *orderingFixture) verifySeededRowsGone(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), orderingClientTimeout)
+	defer cancel()
+
+	var remaining int
+	if err := f.pool.QueryRowContext(ctx,
+		`SELECT count(*) FROM blnk.event_outbox WHERE starts_with(aggregate_id, $1)`,
+		orderingTransactionIDPrefix(f.runID),
+	).Scan(&remaining); err != nil {
+		t.Errorf("could not confirm the outbox rows of ordering run %s were removed: %v",
+			f.runID, err)
 
 		return
 	}
 
-	affected, err := result.RowsAffected()
-	if err != nil {
-		t.Logf("cleaned up the outbox rows of ordering run %s (count unavailable: %v)", f.runID, err)
-
-		return
-	}
-
-	t.Logf("cleaned up %d outbox rows for ordering run %s", affected, f.runID)
+	assert.Zerof(t, remaining,
+		"ordering run %s left %d outbox rows behind. They are in a table every other test "+
+			"shares, and a non-terminal one stays claimable, so the next relay to start will "+
+			"publish them as if they were its own.", f.runID, remaining)
 }
 
 // orderingTransactionIDPrefix is the prefix every transaction id this run mints begins with,
@@ -2425,4 +2461,94 @@ func TestEventOrdering_ProductionStartsTheRelayThatDrainsTheOutbox(t *testing.T)
 	assert.Contains(t, body, "relay.Start(ctx)",
 		"constructing the relay is not enough — it must be started. See cmd/server_test.go "+
 			"for the full assertion, including that topic assurance precedes it.")
+}
+
+// ---------------------------------------------------------------------------
+// The published partition-key contract must describe the keying the code performs
+//
+// The static assertion above proves PRODUCTION supplies the ledger, so transaction, balance,
+// monitor and ledger events are all keyed on a LEDGER ID. docs/event-streaming.md is what a
+// subscriber reads to decide how to shard its consumer group and what ordering it may rely
+// on, and it said the opposite: a section headed "The key is not simply the ledger id" told
+// readers that for "the highest-volume event type in the system — transactions — that is a
+// balance id, not a ledger id", and a table repeated it row by row.
+//
+// That inversion is not a cosmetic one. A consumer built on it sizes its group by balance
+// cardinality, assumes two transactions against one balance are mutually ordered across
+// ledgers (they are not), and does not expect a ledger's whole event stream to arrive through
+// a single partition (it does). The description of the fallback had been promoted to the rule,
+// and only prose can carry that mistake — which is why the guard below reads the prose.
+// ---------------------------------------------------------------------------
+
+// invertedPartitionKeyClaims are the phrasings that present the payload-derived fallback as
+// the partitioning rule. Each was published.
+var invertedPartitionKeyClaims = []string{
+	"The key is not simply",
+	"that is a **balance** id, not a ledger id",
+	"A transaction keys on its source balance",
+}
+
+// TestEventOrdering_PublishedKeyContractStatesLedgerKeyingAsTheRule guards the subscriber-
+// facing description of the key against the wiring the test above pins.
+//
+// It reads no broker and no database, so unlike the delivery test it runs everywhere —
+// which matters, because a document that contradicts the system is wrong in every
+// environment, not only in one that has Kafka.
+func TestEventOrdering_PublishedKeyContractStatesLedgerKeyingAsTheRule(t *testing.T) {
+	published, err := os.ReadFile("docs/event-streaming.md")
+	require.NoError(t, err, "reading the published event documentation")
+	text := string(published)
+
+	require.Contains(t, text, "### The key is the ledger id wherever a ledger exists",
+		"the published partitioning section must state ledger keying as the RULE. "+
+			"docs/kafka-operations.md links to it by anchor, so renaming the heading breaks "+
+			"that link as well as the contract.")
+
+	for _, claim := range invertedPartitionKeyClaims {
+		// Falsef rather than NotContains so a failure prints the sentence to fix rather
+		// than the whole document.
+		assert.Falsef(t, strings.Contains(text, claim),
+			"docs/event-streaming.md presents the payload-derived FALLBACK as the "+
+				"partitioning rule with %q.\n\n"+
+				"Every ledger-scoped producer supplies the ledger through WithEventLedgerID "+
+				"(see orderingProducerWirings in this file), and a supplied ledger becomes the "+
+				"partition key — so transaction, balance, monitor and ledger events are keyed "+
+				"on a LEDGER ID. Only identity.created, bulk_transaction.*, system.error and a "+
+				"rejected transaction reach the fallback. A consumer built on the inverted "+
+				"claim shards on the wrong cardinality and assumes ordering it does not have.",
+			claim)
+	}
+
+	// The classes that genuinely have no ledger must still be named, or a reader is told
+	// the rule is universal and is surprised by the four cases where it is not.
+	for _, unkeyed := range []string{"identity.created", "bulk_transaction.*", "system.error", "transaction.rejected"} {
+		assert.Containsf(t, text, unkeyed,
+			"the published section must name %s as reaching the fallback, since the ledger "+
+				"rule does not apply to it", unkeyed)
+	}
+}
+
+// TestEventOrdering_OperationsGuideAgreesWithThePublishedKeyContract closes the last place the
+// inverted claim was repeated.
+//
+// docs/kafka-operations.md justified recording the subscriber partition-key prefix rather than
+// deriving it, and its justification rested on the same false premise — that a key is "a
+// balance id rather than a ledger id". The conclusion happens to be right for a different
+// reason (a key comes from Blnk's aggregate namespace, never from a subscriber identifier), so
+// the error survived being read as correct. Two documents disagreeing about the key is how an
+// operator ends up setting a prefix that matches nothing.
+func TestEventOrdering_OperationsGuideAgreesWithThePublishedKeyContract(t *testing.T) {
+	operations, err := os.ReadFile("docs/kafka-operations.md")
+	require.NoError(t, err, "reading the operations runbook")
+	text := string(operations)
+
+	assert.Falsef(t, strings.Contains(text, "is a *balance* id rather than a ledger id"),
+		"docs/kafka-operations.md repeats the inverted key claim. The partition key is the "+
+			"LEDGER ID for every ledger-scoped event; the reason a prefix cannot be derived "+
+			"from the subscriber is that keys come from Blnk's aggregate namespace, not that "+
+			"they are balance ids.")
+
+	assert.Contains(t, text, "event-streaming.md#the-key-is-the-ledger-id-wherever-a-ledger-exists",
+		"the runbook must link to the corrected section, so the two documents cannot describe "+
+			"the key differently")
 }

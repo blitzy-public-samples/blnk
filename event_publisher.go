@@ -35,7 +35,9 @@ import (
 	"github.com/segmentio/kafka-go/sasl/scram"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	otelmetric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/metrics"
@@ -184,14 +186,55 @@ const (
 
 // Metric attribute keys, declared once so the publisher, its tests and the metrics
 // reference cannot drift apart. They match the attribute sets documented on the
-// instruments in internal/metrics: published events are attributed by topic and event
-// type, attempts by outcome, and duration by topic and attempt number.
+// instruments in internal/metrics: published events and broker acknowledgements are
+// attributed by topic and event type, acknowledgements additionally by purpose, attempts by
+// outcome, and duration by topic and attempt number.
 const (
 	publishAttrTopic     = "topic"
 	publishAttrEventType = "event_type"
 	publishAttrOutcome   = "outcome"
 	publishAttrAttempt   = "attempt"
+
+	// publishAttrPurpose separates an original publish from a replay and from a dead-letter
+	// write on EventBrokerAcknowledgementsTotal. The value set is PublishPurpose's, which is
+	// fixed and small, so it bounds cardinality by construction.
+	publishAttrPurpose = "purpose"
+
+	// publishAttrTerminal reports whether a failed attempt was the LAST one for its
+	// event. It is a separate dimension rather than a fourth `outcome` value because the
+	// publish-outcome vocabulary is a frozen three-value contract — dispatched, retrying,
+	// dead_lettered — and "nothing further will be tried" is a property of the attempt,
+	// not a different kind of outcome.
+	//
+	// Its domain is closed at "true" and "false", so it adds no unbounded dimension, and
+	// it keeps "how many events are actually stuck" answerable as
+	// {outcome="retrying",terminal="true"} — the selection that used to be
+	// {outcome="failed"}.
+	publishAttrTerminal = "terminal"
 )
+
+// The closed domain of publishAttrTerminal, spelled as constants so the publisher, the
+// dead-letter writer, the tests and docs/metrics.md cannot disagree about the literals.
+const (
+	publishTerminalTrue  = "true"
+	publishTerminalFalse = "false"
+)
+
+// terminalAttributeValue renders a result's terminal classification as its metric label.
+//
+// Parameters:
+//   - result PublishResult: the completed attempt.
+//
+// Returns:
+//   - string: publishTerminalTrue when no further attempt will be made, otherwise
+//     publishTerminalFalse. A success is never terminal, so it reports false.
+func terminalAttributeValue(result PublishResult) string {
+	if result.Terminal {
+		return publishTerminalTrue
+	}
+
+	return publishTerminalFalse
+}
 
 // The two replacement labels below bound metric cardinality. See boundedTopicLabel and
 // boundedEventTypeLabel for why an unbounded label is a defect rather than a detail.
@@ -216,7 +259,7 @@ const (
 // disclosure channel, publishing whatever string was stored to anyone who can read
 // /metrics.
 //
-// A Blnk-owned name is a member of a small, enumerable set — prefix times five categories,
+// A Blnk-owned name is a member of a small, enumerable set — prefix times four categories,
 // times the optional `.dlt` suffix — so it is safe to report verbatim, and reporting it is
 // what makes the dead-letter-rate and per-topic queries in docs/metrics.md work. Anything
 // else collapses to one fixed label: the series count stays bounded, and the anomaly is
@@ -229,7 +272,14 @@ const (
 // Returns:
 //   - string: the topic verbatim when Blnk owns it, unownedTopicLabel otherwise.
 func boundedTopicLabel(topic string) string {
-	if model.IsBlnkEventTopic(topic, TopicPrefix()) {
+	// Every owned prefix, not only the configured one. A row captured before a prefix rename
+	// still names the previous generation's topic and is still published, so collapsing its
+	// name to the "unowned" label would report a legitimate delivery as an anomaly — and
+	// would hide, behind one shared series, exactly the traffic an operator draining that
+	// generation needs to watch. The set stays bounded because the allowlist is bounded by
+	// config.MaxHistoricalTopicPrefixes: at most (1 + 4) prefixes times four categories
+	// times the optional `.dlt` suffix.
+	if IsOwnedTopicUnderAnyConfiguredPrefix(topic) {
 		return topic
 	}
 
@@ -499,6 +549,20 @@ type PublishRequest struct {
 	// it zero — as the envelope-only path does — and the duration covers the write
 	// alone.
 	ClaimedAt time.Time
+
+	// Traceparent and Tracestate are the W3C trace context recorded on the outbox row at
+	// capture, carried here so the publish span can LINK back to the request that produced the
+	// event.
+	//
+	// They are plain strings rather than a context or a trace.SpanContext deliberately: this
+	// struct is a data carrier that a test builds by hand and that the no-op publisher accepts
+	// unchanged, and a tracing type in it would make both of those depend on the tracing
+	// packages. The publisher turns them into a link; see linkToCapturedTrace.
+	//
+	// Both are empty for an event captured with no active trace, which is a legitimate and
+	// common state — the publish then produces an unlinked span rather than reporting a fault.
+	Traceparent string
+	Tracestate  string
 }
 
 // PublishResult is the observability record of ONE publish attempt. It exists because
@@ -507,19 +571,24 @@ type PublishRequest struct {
 // layer is keyed on the outcome vocabulary it carries.
 //
 // The status vocabulary is model.PublishStatus, reused rather than redeclared so the
-// code and the metric label set cannot drift. The publisher itself reports exactly
-// three of the four values:
+// code and the metric label set cannot drift. It is exactly three values, and the
+// publisher itself reports two of them:
 //
 //   - PublishStatusDispatched when the broker acknowledged the write.
-//   - PublishStatusRetrying when the attempt failed and another attempt is possible:
-//     the failure looked transient and the stated budget is not spent. "Retrying"
-//     describes what the attempt makes possible, not a decision this file took —
-//     whether another attempt actually happens is the relay's call, made against the
-//     row's own budget in SQL.
-//   - PublishStatusFailed when the attempt failed and nothing further will be tried:
-//     the failure is permanent, or it was the last attempt the budget allowed. The
-//     relay READS this and takes the row straight to its terminal state rather than
-//     spending the remaining budget establishing what is already known.
+//   - PublishStatusRetrying for EVERY failed attempt. "Retrying" describes the
+//     attempt's place in the sequence, not a decision this file took — whether
+//     another attempt actually happens is the relay's call, made against the row's
+//     own budget in SQL.
+//
+// # WHERE "nothing further will be tried" LIVES, now that it is not a status
+//
+// On three fields of this struct, never on Status: Transient carries the
+// classification, Classified says a classification was made at all, and Retryable
+// says whether the stated budget also permits another attempt. PermanentFailure()
+// combines them, and it is what the relay reads. Requirement R-3 fixes the status
+// vocabulary at three values and the vocabulary is a published metric label domain,
+// so the distinction is kept as a property — where it can gain a reason code or a
+// retry-after hint later — rather than as a fourth label nobody's dashboard selects.
 //
 // PublishStatusDeadLettered is never produced here, because dead-lettering is an
 // acknowledged write to a `<topic>.dlt` sibling and this file never performs one.
@@ -537,8 +606,10 @@ type PublishResult struct {
 	// operator has to go and look at.
 	EventID string
 
-	// EventType is the event name, and the value the published-events counter is
-	// attributed by alongside the topic.
+	// EventType is the event name, and the value the broker-acknowledgement counter is
+	// attributed by alongside the topic. The relay attributes the durable
+	// published-events counter by the same pair, read off the outbox row, so the two are
+	// directly comparable.
 	EventType string
 
 	// Topic is the resolved destination this attempt targeted, after the fallback in
@@ -583,6 +654,26 @@ type PublishResult struct {
 	// principal that is not authorised for the topic.
 	Retryable bool
 
+	// Terminal states that this attempt failed and NO FURTHER ATTEMPT WILL BE MADE for the
+	// event: the failure is permanent, or it was the last attempt the stated budget allowed.
+	// It is false on every success and false on a failure another attempt may recover from.
+	//
+	// It exists because the publish-outcome vocabulary is a frozen three-value contract —
+	// dispatched, retrying, dead_lettered — and none of those three can carry this fact.
+	// Widening the vocabulary with a fourth `failed` value was how it used to be carried,
+	// and that put an implementation detail into a contract that subscribers' dashboards,
+	// the metrics reference and the alert rules are all written against. A boolean beside the
+	// status says the same thing without touching the contract.
+	//
+	// It is ALSO the affirmative verdict the relay's retry decision reads, through
+	// PermanentFailure. That affirmativeness is a safety property: a result nobody populated
+	// has Terminal false, so a publisher implementation that classifies nothing can never
+	// end an event's life on its first attempt. "No verdict" must read as "not permanent".
+	//
+	// Distinguish it from Retryable, which is its near-complement but not its negation:
+	// Retryable is false on a SUCCESS too, whereas Terminal describes failures only.
+	Terminal bool
+
 	// Duration is how long the attempt took: from PublishRequest.ClaimedAt when it
 	// was set, otherwise the time spent in the write itself.
 	Duration time.Duration
@@ -626,9 +717,27 @@ type PublishResult struct {
 	// Transient reports whether the failure looks recoverable — a broker that is
 	// down, a leader election in flight, a timeout — as opposed to permanent, such as
 	// a message that exceeds the topic's size limit or a principal that is not
-	// authorised. It is meaningful only when Err is non-nil, and it is advice for the
-	// relay's retry decision, never a decision taken here.
+	// authorised. It is meaningful only when Err is non-nil and Classified is true,
+	// and it is advice for the relay's retry decision, never a decision taken here.
 	Transient bool
+
+	// Classified states that a publisher actually REACHED A VERDICT about Transient,
+	// as opposed to leaving it at its zero value.
+	//
+	// It is the safety property that keeps a bare error from ending an event's life on
+	// its first attempt, and it exists because `!Transient` is true on a result nobody
+	// populated. The publisher is an interface seam — the relay borrows whichever
+	// implementation the process built, and a double or a future implementation may
+	// return an error with an empty result — so "no verdict" must read as "not
+	// permanent" and fall through to the budgeted retry.
+	//
+	// It replaces the role model.PublishStatusFailed used to play in that test. Using
+	// the status for it tied a safety check to a metric label domain: the check could
+	// not be strengthened without widening a published label set, and requirement R-3
+	// fixes that set at three values. A dedicated boolean says the same thing without
+	// that coupling, and it is set in exactly one place — kafkaPublisher.fail, after
+	// classifyTransientPublishError has run.
+	Classified bool
 
 	// Err is the failure, or nil on success. It is the same value PublishToTopic
 	// returns as its error, and it wraps the underlying broker or library error so
@@ -662,16 +771,22 @@ func (r PublishResult) Dispatched() bool {
 // publisher implementation that returned a bare error with an empty result would have every
 // failure treated as permanent and dead-lettered on the first attempt. The publisher is an
 // interface seam — the relay borrows whichever implementation the process built — so
-// "no verdict" must read as "not permanent". Requiring all three facts (an error, the
-// failed status this file only sets after classifying, and a non-transient classification)
-// means only a publisher that actually classified the failure can end an event's life
-// early. Anything else falls through to the budgeted retry.
+// "no verdict" must read as "not permanent". Requiring all three facts (an error, an
+// explicit Classified verdict, and a non-transient classification) means only a publisher
+// that actually classified the failure can end an event's life early. Anything else falls
+// through to the budgeted retry.
+//
+// Classified is what carries that third fact. It used to be carried by the status —
+// `Status == model.PublishStatusFailed` — which tied this safety check to a published
+// metric label domain that requirement R-3 fixes at three values. The check is identical;
+// only the field it reads changed, and it now reads a field that exists for this purpose
+// alone and can be strengthened without touching a label set.
 //
 // Returns:
 //   - bool: true when no further attempt can succeed, so the relay must take the row to its
 //     terminal state now instead of scheduling a retry.
 func (r PublishResult) PermanentFailure() bool {
-	return r.Err != nil && r.Status == model.PublishStatusFailed && !r.Transient
+	return r.Err != nil && r.Classified && !r.Transient
 }
 
 // DeadLettered returns a copy of the result with its status set to dead-lettered.
@@ -739,16 +854,24 @@ func (r PublishResult) LogFields() logrus.Fields {
 	}
 
 	if r.Err != nil {
-		// BOUNDED, because this string came from a broker or a library rather than from
-		// this codebase: its length is not ours to choose, and it is emitted once per
-		// attempt per event, so an unbounded value multiplied by the retry budget and the
-		// event rate is how a log pipeline gets throttled for being over quota.
-		fields["error"] = sanitizeLogValue(r.Err.Error(), maxLoggedErrorLength)
+		// BOUNDED AND REDACTED, because this string came from a broker or a library rather
+		// than from this codebase. Bounded: its length is not ours to choose, and it is
+		// emitted once per attempt per event, so an unbounded value multiplied by the retry
+		// budget and the event rate is how a log pipeline gets throttled for being over
+		// quota. Redacted: a client error renders with the broker's address and port, and a
+		// log is read by a wider audience than the deployment's operators. The verbatim text
+		// stays reachable at debug through withLoggableCause's companion field.
+		fields["error"] = loggableCause(r.Err)
 		fields["transient"] = r.Transient
 		// transient says what the failure LOOKED like; retryable says whether anything
 		// further will actually be tried. They differ on the last permitted attempt, and
 		// that is the case an operator most needs to be able to see.
 		fields["retryable"] = r.Retryable
+		// terminal is what the STATUS no longer carries. The publish-outcome vocabulary is
+		// frozen at three values, so every failure logs status=retrying; this field is how
+		// "and nothing further will be tried" reaches the log at all, and it is the field to
+		// grep for when the question is "which events are actually stuck".
+		fields["terminal"] = r.Terminal
 	}
 
 	return fields
@@ -827,6 +950,44 @@ func IsTransientPublishError(err error) bool {
 	var publishErr *PublishError
 	if errors.As(err, &publishErr) {
 		return publishErr.Transient
+	}
+
+	return false
+}
+
+// IsPermanentPublishError reports whether an error from a publish was AFFIRMATIVELY
+// classified as one no further attempt could succeed.
+//
+// # It is not the negation of IsTransientPublishError, and that is the whole point
+//
+// `!IsTransientPublishError(err)` is true for an error this file never saw — a bare error
+// from a borrowed writer, a wrapped context expiry, anything a caller constructed itself —
+// because that function reports "not transient" for everything it does not recognise. Using
+// the negation as a terminal verdict therefore reads "unclassified" as "give up", and the
+// cost of that mistake is an event dead-lettered on its FIRST attempt with its whole retry
+// budget unspent. That is the same trap PublishResult.PermanentFailure documents and avoids
+// by requiring three positive facts rather than one negation.
+//
+// So this requires the error to have come out of this file's publish path — where
+// classifyTransientPublishError made a decision against the broker's real answer — and to
+// have been classified there as NOT recoverable. Anything else is "unknown", which is
+// reported as false so the caller falls through to its budgeted retry.
+//
+// The two predicates are therefore deliberately NOT exhaustive: an error can be neither
+// transient nor permanent, and that third state is the one every unrecognised failure
+// occupies. A caller wanting a two-way split must choose which side "unknown" falls on, and
+// the safe side is the budgeted one.
+//
+// Parameters:
+//   - err error: the error returned by Publish or PublishToTopic. May be nil.
+//
+// Returns:
+//   - bool: true only when err is (or wraps) a PublishError that was classified as
+//     non-transient. False for nil, for an unrecognised error, and for a transient one.
+func IsPermanentPublishError(err error) bool {
+	var publishErr *PublishError
+	if errors.As(err, &publishErr) {
+		return !publishErr.Transient
 	}
 
 	return false
@@ -1145,8 +1306,8 @@ var (
 // instance with nothing but a Redis DSN configured, and this must not turn that into a
 // network call, a delay, or an error.
 //
-// The returned publisher owns writers for every topic Blnk owns — the five category topics
-// and their five dead-letter siblings, ten in all — enumerated from AllTopicsWithDeadLetters
+// The returned publisher owns writers for every topic Blnk owns — the four category topics
+// and their four dead-letter siblings, eight in all — enumerated from AllTopicsWithDeadLetters
 // so that this file and the provisioning path work from one list.
 //
 // The errors it can return both come from the administrative SASL credential: the pair
@@ -1197,16 +1358,22 @@ func NewEventPublisher(cnf *config.Configuration) (EventPublisher, error) {
 		// Unreachable: newKafkaPublisher resolved the same pair a moment ago and would
 		// have returned the error. Logged rather than ignored so a future divergence
 		// between the two calls is visible instead of silent.
-		logrus.WithError(credErr).Warn(
+		withLoggableCause(nil, credErr).Warn(
 			"could not re-resolve the producer SASL principal for the initialisation log",
 		)
 	}
 
+	// broker_count and auth_mode rather than the endpoint list and the principal. The
+	// address list is topology: it tells a reader of the log where to aim, and it tells an
+	// operator nothing they cannot get from their own configuration. The principal is the
+	// other half of a SCRAM credential whose mechanism this same line publishes, so naming
+	// it at info narrows a guess to one unknown. Both are available at debug below, which
+	// is the sink for detail an operator has explicitly asked for.
 	logrus.WithFields(logrus.Fields{
-		"brokers":         brokers,
+		"broker_count":    len(brokers),
 		"topics":          len(publisher.writers),
 		"sasl":            producerUser != "",
-		"sasl_principal":  producerUser,
+		"auth_mode":       publisherAuthMode(cnf.Kafka),
 		"dedicated_sasl":  cnf.Kafka.SASLUser != "",
 		"tls":             cnf.Kafka.TLS.Enabled,
 		"required_acks":   "all",
@@ -1215,6 +1382,16 @@ func NewEventPublisher(cnf *config.Configuration) (EventPublisher, error) {
 		"internal_retry":  false,
 		"max_event_bytes": model.MaxEventMessageBytes,
 	}).Info("kafka event publisher initialised")
+
+	// The identity-confirmation detail, at the level an operator turns on when they are
+	// confirming exactly this. sanitizeLogValue because both values come from configuration
+	// and neither their length nor their content is this codebase's to assume.
+	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+		logrus.WithFields(logrus.Fields{
+			"brokers":        sanitizeLogValue(strings.Join(brokers, ","), maxLoggedErrorLength),
+			"sasl_principal": sanitizeLogValue(producerUser, maxLoggedFilterLength),
+		}).Debug("kafka event publisher endpoints and principal")
+	}
 
 	return publisher, nil
 }
@@ -1261,7 +1438,17 @@ func newKafkaPublisher(brokers []string, cfg config.KafkaConfig) (*kafkaPublishe
 	// admin path and the provisioning script also work from. Pre-creating costs
 	// nothing — a writer performs no I/O until its first write — and it means the
 	// steady-state publish path never takes the write lock.
-	for _, topic := range AllTopicsWithDeadLetters() {
+	//
+	// ACROSS EVERY OWNED PREFIX, not only the configured one. An outbox row records its
+	// destination at insert time, so a deployment that changed KAFKA_TOPIC_PREFIX still
+	// holds rows naming the previous generation's topics. Building the inventory from the
+	// configured prefix alone meant those rows were served by a RUNNING process (which had
+	// pre-created them before the change) and refused by a RESTARTED one — so a rename plus
+	// a rolling restart silently stopped draining every event captured before it, and
+	// stranded their dead-letter writes and replays with them. Each prefix an operator lists
+	// in KAFKA_HISTORICAL_TOPIC_PREFIXES contributes its inventory here, which puts those
+	// rows back on the fast path.
+	for _, topic := range AllOwnedTopicsAcrossPrefixes() {
 		publisher.writers[topic] = publisher.newWriter(topic)
 	}
 
@@ -1369,6 +1556,80 @@ func NewKafkaTransport(cfg config.KafkaConfig, role KafkaTransportRole) (*kafka.
 	return transport, nil
 }
 
+// requireLocalBrokersForPlaintext refuses plaintext to any broker that is not local.
+//
+// It is the enforcement half of KAFKA_INSECURE_LOCAL_DEV. That variable is an assertion
+// about the ENVIRONMENT — "this broker is a local development broker" — and an assertion
+// nobody checks is indistinguishable from a switch that disables encryption outright.
+//
+// # What counts as local, and why the list is not longer
+//
+// model.InternalDestinationReason decides, and it recognises exactly the shapes that
+// cannot resolve outside the network Blnk runs in: loopback IP literals (including
+// IPv4-mapped and NAT64-wrapped forms, which is why the decision is made on the parsed
+// address rather than on the text), localhost and its subdomains, the .local and
+// .internal zones, and unqualified single-label names. That last shape is what makes
+// the local stack work unchanged — a Compose service name like "kafka" and an in-cluster
+// Kubernetes Service name are both single-label — while "kafka.example.com" and a public
+// IP are not.
+//
+// An unrecognised host is treated as REMOTE. That is deliberate: the cost of wrongly
+// refusing an exotic local address is a clear error message and one configuration
+// change, and the cost of wrongly permitting a remote one is ledger data and SASL
+// credentials on the wire in cleartext.
+//
+// # Why this does not weaken the production path
+//
+// It runs only on the branch where TLS is already disabled AND the operator has already
+// acknowledged local development. A deployment with TLS enabled never reaches it, so
+// nothing about a TLS-enabled cluster's broker naming is constrained by this.
+//
+// Parameters:
+//   - brokers: the configured broker list, each entry host:port or a bare host.
+//
+// Returns:
+//   - error: naming every remote broker found, or nil when all are local.
+func requireLocalBrokersForPlaintext(brokers []string) error {
+	var remote []string
+
+	for _, broker := range brokers {
+		candidate := strings.TrimSpace(broker)
+		if candidate == "" {
+			continue
+		}
+
+		// SplitHostPort fails on a bare host, which is a legitimate way to write a
+		// broker, so fall back to the whole value rather than rejecting it.
+		host, _, err := net.SplitHostPort(candidate)
+		if err != nil {
+			host = candidate
+		}
+
+		// A non-empty reason means the classifier recognised the host as internal,
+		// which is what this branch requires. An empty reason means it did not, and
+		// that is the refusal.
+		if model.InternalDestinationReason(host) == "" {
+			remote = append(remote, candidate)
+		}
+	}
+
+	if len(remote) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"blnk: KAFKA_INSECURE_LOCAL_DEV asserts that Kafka is a local development broker, but "+
+			"%s not local: %s. Plaintext is refused. Ledger amounts, identity records and the "+
+			"SASL/SCRAM handshake would all travel unencrypted to a remote host, and no later "+
+			"rotation undoes a credential that has already crossed the network in the clear. "+
+			"Either set KAFKA_TLS_ENABLED=true and configure KAFKA_TLS_CA_FILE for this broker, "+
+			"or point KAFKA_BROKERS back at the local stack. KAFKA_INSECURE_LOCAL_DEV is not a "+
+			"way to disable TLS for a remote cluster",
+		map[bool]string{true: "this broker is", false: "these brokers are"}[len(remote) == 1],
+		strings.Join(remote, ", "),
+	)
+}
+
 // kafkaTLSConfig builds the verified TLS configuration, or returns nil when plaintext has
 // been explicitly permitted.
 //
@@ -1388,6 +1649,32 @@ func kafkaTLSConfig(cfg config.KafkaConfig) (*tls.Config, error) {
 					"would travel in the clear. Enable TLS, or set KAFKA_INSECURE_LOCAL_DEV=true to " +
 					"acknowledge that this is a local development broker",
 			)
+		}
+
+		// THE ACKNOWLEDGEMENT IS SCOPED TO WHAT IT CLAIMS TO BE (F-24).
+		//
+		// KAFKA_INSECURE_LOCAL_DEV says "this is a local development broker". Until
+		// now nothing checked that it was, so the flag permitted plaintext to ANY
+		// broker — and because the local compose stack defaulted it to true, pointing
+		// KAFKA_BROKERS at a remote host was enough to send every ledger amount, every
+		// identity record and the SASL/SCRAM handshake itself across the public
+		// internet in the clear. The only trace was a warning in a log, which is not a
+		// control.
+		//
+		// A warning cannot be the control here because of WHERE the mistake happens:
+		// the flag is set once, correctly, for local development, and the broker list
+		// is changed later by someone doing something else entirely. Nobody re-reads
+		// the flag at that moment, and nothing else in the stack objects.
+		//
+		// So the claim is now verified against the broker list it is being used to
+		// reach. model.InternalDestinationReason is the same literal classifier the
+		// webhook destination guard uses — loopback addresses, localhost, .local and
+		// .internal zones, and unqualified single-label names, which is what a Docker
+		// Compose service name and an in-cluster Kubernetes Service name both are. A
+		// host it does not recognise as internal is treated as remote, which is the
+		// safe direction for an unrecognised value.
+		if err := requireLocalBrokersForPlaintext(cfg.Brokers); err != nil {
+			return nil, err
 		}
 
 		logrus.Warn(
@@ -1810,24 +2097,30 @@ var ErrTopicNotOwned = errors.New("blnk: refusing to publish to a topic Blnk doe
 //   - THE PRE-CREATED SET, built at construction from AllTopicsWithDeadLetters — that is,
 //     from BLNK'S OWN CONFIGURATION. Under a fixed prefix this is already every owned name,
 //     since the owned namespace is exactly prefix.<category> and its `.dlt` sibling for the
-//     five known categories. These are served from the fast path with no membership test,
+//     four known categories. These are served from the fast path with no membership test,
 //     which is safe precisely because stored data had no say in which ones exist.
 //   - LAZILY GROWN NAMES, which are the only ones a stored row can influence, and the only
-//     ones the membership test governs. It uses model.IsBlnkEventTopic against the CURRENTLY
-//     CONFIGURED prefix, so a name is admitted only if it is prefix.<known-category>
-//     optionally suffixed `.dlt`. Nothing else is.
+//     ones the membership test governs. It uses IsOwnedTopicUnderAnyConfiguredPrefix, so a
+//     name is admitted only if it is <declared-prefix>.<known-category> optionally suffixed
+//     `.dlt`. Nothing else is.
 //
-// Growth is reachable in exactly one situation: a TOPIC PREFIX CHANGE. The prefix is re-read
+// Growth is reachable in exactly one situation: a PREFIX SET CHANGE. The prefixes are re-read
 // from live configuration on every naming call, so a reload starts resolving events to names
-// this publisher was not constructed with; those names are owned under the new prefix and are
+// this publisher was not constructed with; those names are owned under the new set and are
 // admitted and cached.
 //
-// A STORED ROW FROM BEFORE SUCH A CHANGE keeps working, because its topic is in the
-// pre-created set — the process built a writer for it at startup, from the prefix that was in
-// force then. So the committed event still reaches the topic it was always bound for, which
-// is what the row recorded its destination for in the first place. A row naming a prefix this
-// process never had is the one case that is refused, and refusing it loses nothing: the row
-// stays claimable, its failure names the reason, and an operator can re-point it.
+// A STORED ROW FROM BEFORE A PREFIX RENAME keeps working, provided the previous prefix is
+// DECLARED. That declaration is the whole mechanism, and it was the gap here: the pre-created
+// set used to be the configured prefix alone, so such a row was served by a RUNNING process —
+// which had built a writer for it before the change — and refused by a RESTARTED one, whose
+// inventory held only the new generation. A rename plus a rolling restart therefore stopped
+// draining every event captured before it, and stranded its dead-letter writes and replays
+// too. With the previous prefix listed, the inventory spans both generations and the committed
+// event still reaches the topic it was always bound for.
+//
+// A row naming a prefix nobody declared is the one case that is refused, and refusing it loses
+// nothing: the row stays claimable, its failure names the topic and the owned namespaces, and
+// AuditStrandedTopicPrefixes reports the prefix at start-up with the variable to set.
 //
 // The fast path takes only a read lock, so concurrent publishes to the pre-created topics
 // never serialise, and no membership test is paid on it. Growth double-checks under the
@@ -1858,26 +2151,36 @@ func (p *kafkaPublisher) writerFor(topic string) (*kafka.Writer, error) {
 
 	// Checked BEFORE the write lock is taken, so a rejected topic never contends with
 	// live publishes and never enters the map.
-	// Pinned to the CONFIGURED prefix, deliberately, and not to the owned FORM. A form test
-	// would also admit '<someone else>.transactions', and this is the one place a topic name
-	// turns into an outbound connection, so the narrower test is the right one here.
 	//
-	// It does not strand an event stored before a KAFKA_TOPIC_PREFIX change: the publisher
-	// pre-creates the whole inventory of the prefix it was BUILT with, so such a row names a
-	// topic already in the map and is served by the fast path above without reaching this
-	// check at all. What is refused is a generation that predates this process, which is an
-	// operator action — restore the prefix, or drain the old topics — rather than something
-	// to admit silently. IsOwnedTopicForm is the wider form test, for callers that need it.
-	if !model.IsBlnkEventTopic(topic, TopicPrefix()) {
+	// Pinned to the DECLARED prefixes, deliberately, and not to the owned FORM. A form test
+	// would also admit '<someone else>.transactions', and this is the one place a topic name
+	// turns into an outbound connection carrying Blnk's own producer credentials, so the
+	// narrower test is the right one here. IsOwnedTopicForm is the wider form test, for
+	// callers that need it.
+	//
+	// The declared set is the configured prefix plus KAFKA_HISTORICAL_TOPIC_PREFIXES, which
+	// is what keeps a row captured before a prefix rename publishable. Those rows are
+	// normally served by the fast path above — the pre-created inventory now spans every
+	// owned prefix — and reach this check only when a prefix was declared after this process
+	// started, which a configuration reload can do. What is still refused is a generation
+	// nobody declared: an operator adds it to the allowlist, or drains and re-points the
+	// rows. Refusing loses nothing in the meantime, because the row stays claimable and each
+	// failure names the topic and the namespaces that were owned.
+	if !IsOwnedTopicUnderAnyConfiguredPrefix(topic) {
+		owned := OwnedTopicPrefixes()
 		logrus.WithFields(logrus.Fields{
 			"topic":          topic,
-			"owned_prefix":   TopicPrefix(),
+			"owned_prefix":   owned[0],
+			"owned_prefixes": owned,
 			"owned_topics":   len(p.writers),
 			"refusal_reason": "topic is not in the Blnk-owned namespace",
+			"remedy": "if this names a namespace this deployment used to own, add it to " +
+				"KAFKA_HISTORICAL_TOPIC_PREFIXES so the rows captured under it can drain",
 		}).Error("refusing to create a Kafka writer for a topic Blnk does not own")
 
-		return nil, fmt.Errorf("%w: %q is not %s.<category> or %s.<category>.dlt",
-			ErrTopicNotOwned, topic, TopicPrefix(), TopicPrefix())
+		return nil, fmt.Errorf("%w: %q is not <prefix>.<category> or <prefix>.<category>.dlt "+
+			"for any owned prefix (%s)",
+			ErrTopicNotOwned, topic, strings.Join(owned, ", "))
 	}
 
 	p.mu.Lock()
@@ -1913,7 +2216,7 @@ func (p *kafkaPublisher) writerFor(topic string) (*kafka.Writer, error) {
 		// known topics, which have nothing to do with this retirement.
 		go func() {
 			if err := retired.Close(); err != nil {
-				logrus.WithError(err).WithField("topic", retiredTopic).Warn(
+				withLoggableCause(logrus.WithField("topic", retiredTopic), err).Warn(
 					"failed to close a retired Kafka writer while bounding the writer cache",
 				)
 			}
@@ -2007,12 +2310,20 @@ func (p *kafkaPublisher) Publish(ctx context.Context, event model.LedgerEvent) e
 // bytes through untransformed. That is what makes the dual-delivery and replay
 // byte-equality guarantees achievable rather than approximate.
 //
-// Observability. Three instruments are recorded on every call: the attempt counter
-// attributed by outcome, the duration histogram attributed by topic and attempt, and —
-// on success only — the published-events counter attributed by topic and event type.
-// Recording the duration for failures as well as successes is deliberate: a broker that
-// times out is exactly the case where latency data matters, and the attempt attribute
-// keeps first-attempt latency readable on its own.
+// Observability. Four instruments are recorded here. On EVERY call: the attempt counter
+// attributed by outcome, and the per-attempt duration histogram attributed by topic,
+// attempt and outcome. On SUCCESS only: the broker-acknowledgement counter attributed by
+// topic, event type and purpose, and the end-to-end capture-to-dispatch histogram the V-1
+// latency target is read from. Recording the per-attempt duration for failures as well as
+// successes is deliberate: a broker that times out is exactly the case where latency data
+// matters, and the outcome attribute keeps those observations out of the success
+// population while the attempt attribute keeps first-attempt latency readable on its own.
+//
+// What is NOT recorded here is the published-events counter. An acknowledgement is not a
+// delivery: delivery is at-least-once, so an event acknowledged by the broker and then
+// left unmarked by a dying relay is published again, and a counter incremented here
+// counted it twice. The relay increments it once, after the transition that makes the
+// delivery durable — see EventRelayProcessor.recordDurableEventPublication.
 //
 // Parameters:
 //   - ctx context.Context: cancels the metadata lookup and the acknowledgement wait.
@@ -2024,6 +2335,29 @@ func (p *kafkaPublisher) Publish(ctx context.Context, event model.LedgerEvent) e
 func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest) (PublishResult, error) {
 	started := time.Now()
 
+	// THE PRODUCER SPAN, and the point at which a request's trace resumes after the outbox.
+	//
+	// It is opened before anything else so that every exit below — an unserialisable payload, an
+	// oversized envelope, a refused topic, a closed publisher, a broker that will not answer —
+	// is inside it. A span that covered only the successful path would be absent from exactly
+	// the traces an operator opens.
+	//
+	// The link, not the parent, is what ties it to the capture: see linkToCapturedTrace for why
+	// parenting would misreport the request's duration, attach spans to an exported trace and
+	// collapse a coalesced fan-out into one span. traceRequestLinks reads the two carried
+	// strings and yields nothing when the event was captured untraced.
+	//
+	// The span name is bounded by construction. It carries the topic, which is what makes a
+	// trace list readable, and the topic is passed through the same bounded label the metrics
+	// use — so an event addressed to a topic Blnk does not own cannot mint a new span name.
+	ctx, span := tracer.Start(ctx, "publish "+boundedTopicLabel(resolveTopic(req)),
+		append(
+			traceRequestLinks(req),
+			trace.WithSpanKind(trace.SpanKindProducer),
+		)...,
+	)
+	defer span.End()
+
 	// EVERY field is resolved through the same helpers the no-op uses, and the last two
 	// are not decoration: they are read by code below and in recordPublishAttempt.
 	//
@@ -2032,12 +2366,12 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 	// retrying and failed on the attempts counter. Left unset it is always zero, so a
 	// terminal failure is reported as retry pressure that no longer exists.
 	//
-	// Purpose is read twice: the published-events counter below increments only for an
-	// ORIGINAL publish, and attemptLabel turns a replay or a dead-letter write into its
-	// own fixed attempt token. Left unset it is the empty string, which is neither
-	// PublishPurposeOriginal nor either of the other two — so the counter that is the
-	// denominator of the dead-letter rate would never increment at all, and a replay
-	// would be labelled with a retry-sequence attempt number it does not belong to.
+	// Purpose is read twice: it is an attribute of the broker-acknowledgement counter
+	// below, which counts every purpose and keeps them separable, and attemptLabel turns
+	// a replay or a dead-letter write into its own fixed attempt token. Left unset it is
+	// the empty string — which resolvePurpose normalises to PublishPurposeOriginal, so an
+	// acknowledgement is never attributed to an empty label and a replay is never given a
+	// retry-sequence attempt number it does not belong to.
 	result := PublishResult{
 		EventID:      req.Event.EventID,
 		EventType:    req.Event.EventType,
@@ -2054,16 +2388,38 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 		// field with a documented fallback, and a result that omits one silently changes
 		// what the pipeline reports.
 		//
-		// These two in particular are load-bearing rather than cosmetic. The PURPOSE gates
-		// the EventsPublishedTotal increment below, which is the DENOMINATOR of the
-		// dead-letter rate; left at its zero value it never equals PublishPurposeOriginal,
-		// so the counter would never move and the rate would be undefined. The BUDGET is
+		// These two in particular are load-bearing rather than cosmetic. The PURPOSE selects
+		// the ATTEMPT LABEL on both latency histograms — a replay carries the fixed "replay"
+		// token rather than a number, because it belongs to no retry sequence — so leaving it
+		// at its zero value would file every replay into the first-attempt population the
+		// V-1 p99 is read from and lower that quantile with re-deliveries. The BUDGET is
 		// what lets fail() tell a failure that still has attempts left from the one that
 		// spent the last of them, and it is the "of 5" in the "attempt 3 of 5" that
 		// requirement R-4 requires on every attempt.
 		MaxAttempts: resolveMaxAttempts(req),
 		Purpose:     resolvePurpose(req),
 	}
+
+	// THE SEMANTIC MESSAGING ATTRIBUTES, set once from the resolved result rather than from the
+	// request, so the span describes what was actually attempted — the resolved topic and key —
+	// and not what the caller asked for.
+	//
+	// Every value is BOUNDED or HASHED. The topic goes through the same bounded label the
+	// metrics use, so a span cannot carry an arbitrary destination name; the partition key is
+	// hashed, because it is a ledger, balance or identity identifier and a span attribute is
+	// rendered into trace viewers and incident tickets the same way a metric label is. The event
+	// id is carried in full, matching the capture span in event_outbox.go: it is Blnk-generated,
+	// it is the subscriber idempotency key, and it is the value an operator searches by.
+	span.SetAttributes(
+		attribute.String("messaging.system", "kafka"),
+		attribute.String("messaging.operation", "publish"),
+		attribute.String("messaging.destination.name", boundedTopicLabel(result.Topic)),
+		attribute.String("messaging.message.id", result.EventID),
+		attribute.String("messaging.kafka.message.key_hash", hashLogIdentifier(result.PartitionKey)),
+		attribute.String("blnk.event.type", boundedEventTypeLabel(result.EventType)),
+		attribute.String("blnk.publish.purpose", string(result.Purpose)),
+		attribute.Int("blnk.publish.attempt", result.Attempt),
+	)
 
 	// elapsed measures from the outbox claim when the relay supplied that instant, so
 	// the histogram reports what its documentation promises: claim to acknowledgement.
@@ -2076,6 +2432,19 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 		return time.Since(req.ClaimedAt)
 	}
 
+	// recordSpanFailure marks the span failed with a BOUNDED class rather than the error text.
+	//
+	// span.RecordError(err) is deliberately not used. A Kafka or driver error carries broker
+	// hostnames, internal addresses and library internals, and a span attribute is exported to
+	// whatever backend is configured and rendered into incident tickets — so the raw cause would
+	// leave infrastructure detail somewhere it cannot be recalled from. The class plus the
+	// transient verdict is what an operator acts on; the full cause stays on the outbox row's
+	// last_error and in the publisher's own log line, which are both access-controlled.
+	recordSpanFailure := func(cause error, transient bool) {
+		span.SetAttributes(attribute.Bool("blnk.publish.transient", transient))
+		span.SetStatus(codes.Error, publishSpanErrorClass(cause))
+	}
+
 	value, err := resolveEventValue(req)
 	if err != nil {
 		// A payload that is not valid JSON cannot be spliced into an envelope without
@@ -2086,6 +2455,7 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 		// problem for triage.
 		result.Duration = elapsed()
 		failed := p.fail(ctx, result, err, false)
+		recordSpanFailure(failed.Err, false)
 
 		return failed, failed.Err
 	}
@@ -2114,6 +2484,7 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 				"retrying cannot shrink it and a dead-letter copy would be larger still",
 			ErrEventMessageTooLarge, len(value), model.MaxEventMessageBytes,
 		), false)
+		recordSpanFailure(failed.Err, false)
 
 		return failed, failed.Err
 	}
@@ -2139,7 +2510,9 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 		// destination is not one Blnk may write to, so no retry and no broker state can
 		// make the write legitimate, and the row belongs in the dead-letter inventory
 		// where an operator can see it now rather than in five attempts' time.
-		failed := p.fail(ctx, result, err, errors.Is(err, ErrEventPublisherClosed))
+		transient := errors.Is(err, ErrEventPublisherClosed)
+		failed := p.fail(ctx, result, err, transient)
+		recordSpanFailure(failed.Err, transient)
 
 		return failed, failed.Err
 	}
@@ -2151,15 +2524,31 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 	message := kafka.Message{
 		// Topic is intentionally left empty. kafka-go rejects a message whose topic is
 		// set when the writer already has one, and the writer here is per-topic.
-		Key:        partitionKeyBytes(result.PartitionKey),
-		Value:      value,
-		Time:       req.Event.OccurredAt,
+		Key:   partitionKeyBytes(result.PartitionKey),
+		Value: value,
+		Time:  req.Event.OccurredAt,
+		// THE TRACE TRAVELS AS RECORD HEADERS, and never in the value.
+		//
+		// Headers are where the OpenTelemetry messaging conventions put trace context, and
+		// keeping it out of the value is what preserves the byte-equality guarantees: dual
+		// delivery (V-8) compares the Kafka payload against the legacy webhook body, and a
+		// replay (V-9) compares against the stored envelope. A trace member inside the
+		// envelope would differ between the original publish and its replay by construction,
+		// so both comparisons would fail on telemetry rather than on anything that matters.
+		//
+		// Injected from the PRODUCER SPAN's context, not from the captured one: a subscriber
+		// that continues this trace should attach to the publish it consumed, and the publish
+		// is in turn linked to the capture — so the whole chain is reachable while each span
+		// has the parent that reflects real causality.
+		Headers:    kafkaTraceHeaders(ctx),
 		WriterData: acknowledgement,
 	}
 
 	if err := writer.WriteMessages(ctx, message); err != nil {
 		result.Duration = elapsed()
-		failed := p.fail(ctx, result, err, classifyTransientPublishError(err))
+		transient := classifyTransientPublishError(err)
+		failed := p.fail(ctx, result, err, transient)
+		recordSpanFailure(failed.Err, transient)
 
 		return failed, failed.Err
 	}
@@ -2177,6 +2566,13 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 	// absence here would quietly render the reconciliation inconclusive for every event.
 	if record, confirmed := acknowledgement.coordinate(); confirmed {
 		result.Record = record
+		// The coordinate on the span is what turns "this event was published" into "this event
+		// is THAT record" for someone reading a trace rather than the outbox row. Both values
+		// are broker-assigned integers, so neither is caller data and neither needs bounding.
+		span.SetAttributes(
+			attribute.Int("messaging.kafka.destination.partition", record.Partition),
+			attribute.Int64("messaging.kafka.message.offset", record.Offset),
+		)
 	} else {
 		logrus.WithFields(logrus.Fields{
 			"event_id": hashLogIdentifier(result.EventID),
@@ -2188,16 +2584,43 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 		)
 	}
 
-	// ONLY an original publish increments this counter. It is the denominator of the
-	// dead-letter rate, so a replay or a dead-letter write counted here would make that
-	// rate depend on how much triage happened that day rather than on how the pipeline is
-	// behaving.
-	if result.Purpose == PublishPurposeOriginal {
-		metrics.EventsPublishedTotal.Add(ctx, 1, otelmetric.WithAttributes(
-			attribute.String(publishAttrTopic, boundedTopicLabel(result.Topic)),
-			attribute.String(publishAttrEventType, boundedEventTypeLabel(result.EventType)),
-		))
-	}
+	// EventsPublishedTotal IS NOT INCREMENTED HERE, and its absence is the point (OBS-05).
+	//
+	// This line is the BROKER ACKNOWLEDGEMENT, which is one step short of the delivery being
+	// recorded. Delivery is at-least-once by construction: the relay publishes, then marks the
+	// outbox row dispatched, and a crash or a failed bookkeeping statement between the two
+	// deliberately leaves the row claimable so the event is published AGAIN — losing it is
+	// unrecoverable while a duplicate is suppressed at the subscriber on event_id. Counted
+	// here, that second publish increments the counter a second time for ONE event, so a
+	// counter documented as "one per event" silently becomes "one per successful write"
+	// exactly when the pipeline is having trouble. It is the denominator of the dead-letter
+	// rate acceptance criterion V-3 is stated over, so over-counting it understates that rate
+	// precisely during an incident.
+	//
+	// The increment lives on the DURABLE TRANSITION instead, in event_relay.go: the
+	// claim-token-conditional statement that records the Kafka leg succeeds for one worker
+	// once per event, which is what makes the increment unique. See
+	// recordDurableEventDelivery and metrics.EventsPublishedTotal's own declaration, which
+	// documents that contract. The acknowledgement is counted on
+	// metrics.EventBrokerAcknowledgementsTotal below, so nothing about the wire is lost.
+	//
+	// The ACK itself is not lost from the telemetry: it is counted RIGHT HERE, on its own
+	// instrument, and recordPublishAttempt below additionally counts this attempt under
+	// outcome="dispatched" and records both latency histograms. So
+	// acknowledged-writes-per-second remains readable and is simply no longer conflated with
+	// unique delivered events.
+	//
+	// EVERY purpose is counted here, unlike EventsPublishedTotal: this measures traffic the
+	// broker accepted, so a replay and a dead-letter write are both real acknowledgements. The
+	// purpose attribute keeps them separable, and its domain is PublishPurpose's — fixed and
+	// small — so it adds no cardinality risk. The gap between this counter and
+	// EventsPublishedTotal is the leading indicator of duplicate delivery: acks running ahead
+	// of durable deliveries means rows are not being marked and will be republished.
+	metrics.EventBrokerAcknowledgementsTotal.Add(ctx, 1, otelmetric.WithAttributes(
+		attribute.String(publishAttrTopic, boundedTopicLabel(result.Topic)),
+		attribute.String(publishAttrEventType, boundedEventTypeLabel(result.EventType)),
+		attribute.String(publishAttrPurpose, string(result.Purpose)),
+	))
 
 	recordPublishAttempt(ctx, result)
 
@@ -2233,44 +2656,65 @@ func (p *kafkaPublisher) PublishToTopic(ctx context.Context, req PublishRequest)
 //   - transient bool: whether the failure looks recoverable.
 //
 // Returns:
-//   - PublishResult: the completed result, with Status retrying and Err populated.
+//   - PublishResult: the completed result, with Status retrying, Terminal set from the
+//     classification, and Err populated.
 func (p *kafkaPublisher) fail(ctx context.Context, result PublishResult, cause error, transient bool) PublishResult {
-	// RETRYING and FAILED are not the same outcome, and reporting every failure as retrying
-	// made a permanently-stuck event indistinguishable from a busy one in both the logs and
-	// the attempts counter. Another attempt is possible only when the failure looked
-	// transient AND the attempt did not spend the budget the row stated; a permanent error
-	// is terminal whatever the budget says, because no number of further attempts makes
-	// corrupt bytes valid or an oversized message small.
+	// EVERY FAILED ATTEMPT REPORTS RETRYING, and the terminal distinction is carried on
+	// the result's classification fields instead of on its status.
 	//
-	// A terminal attempt reports model.PublishStatusFailed, and NOT
-	// model.PublishStatusDeadLettered. The two describe different events and conflating them
-	// corrupted the one counter operations reads to answer "how much are we dead-lettering":
+	// Requirement R-3 fixes the status vocabulary at dispatched, retrying and
+	// dead-lettered, and that vocabulary is a PUBLISHED METRIC LABEL DOMAIN: the
+	// instrument documentation, the alert rules, the load harness and every operator
+	// dashboard select on those three values. A fourth value ("failed") briefly lived here
+	// to express "this attempt failed and nothing further will be tried"; it was removed
+	// because widening the domain silently changes what every existing selection matches,
+	// and because the distinction does not need to be a label to be made.
 	//
-	//   - failed is an ATTEMPT outcome. It says this attempt failed and nothing further will
-	//     be tried for it. That is all this function can know.
-	//   - dead_lettered is an acknowledged WRITE to a `<topic>.dlt` sibling, which is a
-	//     publish this function never performs. Only the dead-letter writer knows whether
-	//     that write happened, so only it may declare it — see PublishResult.DeadLettered
-	//     and event_dlt.go.
+	// So the three facts are recorded where a consumer of them actually looks:
 	//
-	// Reporting dead_lettered here claimed a preservation that had not occurred, and
-	// sometimes never would: an event whose destination is outside the topic catalogue has
-	// no `.dlt` sibling to be written to, so the row ends failed with no dead letter
-	// anywhere while the attempts counter reported one per attempt. The
-	// {outcome="failed"} selections the instrument documentation spells out were
-	// simultaneously always empty for original publishes.
+	//   - Retryable — another attempt is possible: the failure looked transient AND the
+	//     attempt did not spend the budget the row stated.
+	//   - Transient — the classification itself, from classifyTransientPublishError.
+	//   - Classified — that a classification was reached at all, which is what stops a
+	//     bare error from an unclassifying implementation reading as permanent. This is
+	//     the ONLY place it is set.
 	//
-	// The vocabulary is model.PublishStatus and all four of its values are observable; see
-	// its declaration for why "failed" is not a widening of the contract but the value that
-	// makes the other three mean what they say.
+	// PermanentFailure() combines them and is what the relay reads; nothing reads the
+	// status to decide an event's fate.
+	//
+	// model.PublishStatusDeadLettered is likewise NOT reported here, and for a reason that
+	// outlasts the vocabulary question: dead-lettering is an acknowledged WRITE to a
+	// `<topic>.dlt` sibling, which is a publish this function never performs. Reporting it
+	// here claimed a preservation that had not occurred, and sometimes never would — an
+	// event whose destination lies outside the topic catalogue has no `.dlt` sibling to be
+	// written to, so the row ended failed with no dead letter anywhere while the
+	// dead-letter counter reported one per attempt. Only the dead-letter writer knows
+	// whether that write happened, so only it may declare it: see
+	// PublishResult.DeadLettered and event_dlt.go.
 	result.Retryable = transient && !attemptBudgetSpent(result.Attempt, result.MaxAttempts)
-	if result.Retryable {
-		result.Status = model.PublishStatusRetrying
-	} else {
-		result.Status = model.PublishStatusFailed
-	}
+	result.Status = model.PublishStatusRetrying
 
 	result.Transient = transient
+	result.Classified = true
+
+	// TERMINAL IS THE COMPLEMENT OF RETRYABLE ON A FAILURE, and it is set here because this is
+	// the only place that knows both halves of it: the classification, and whether the attempt
+	// spent the budget the row stated. Both of Terminal's documented cases fall out of the one
+	// expression — a non-transient failure is not retryable, and neither is a transient one on
+	// the last permitted attempt.
+	//
+	// It is affirmative rather than inferred, which is the safety property the field exists for:
+	// Classified is true on this line, so nothing an unclassifying publisher returns can arrive
+	// here and read as terminal.
+	//
+	// Leaving it unassigned was not harmless. The field is read by the `terminal` metric
+	// attribute and by the publisher's own log fields, so every failed attempt — permanent ones
+	// and the budget-spending one included — was reported as terminal=false, which made
+	// {outcome="retrying",terminal="true"} an empty series and therefore a silent answer to
+	// "which events are stuck". The relay's retry decision reads PermanentFailure rather than
+	// this field, so the routing was correct throughout; what was wrong was everything an
+	// operator could see.
+	result.Terminal = !result.Retryable
 	result.Err = &PublishError{
 		Topic:     result.Topic,
 		EventID:   result.EventID,
@@ -2374,9 +2818,12 @@ func (p *kafkaPublisher) Close() error {
 // model.EventOutbox.PartitionKey's own documentation warns about, in the other direction.
 //
 // Events that genuinely have NO ledger keep their partition-key affinity through the fallback:
-// balance monitors key on the monitored balance, identities on the identity, bulk batches on
-// the batch, and system errors on the event type. Each is stable per aggregate, so per-aggregate
-// ordering holds for all of them.
+// identities key on the identity, bulk batches on the batch, system errors on the event type,
+// and a rejected transaction whose balances were never loaded on its own source, destination or
+// id. Each is stable per aggregate, so per-aggregate ordering holds for all of them. Balance
+// MONITORS are not in that list: checkBalanceMonitors supplies the ledger of the balance whose
+// update fired the condition, so a monitor event is ledger-keyed like the balance event beside
+// it.
 //
 // # The fallback chain, and why ledger_id comes FIRST
 //
@@ -2395,7 +2842,7 @@ func (p *kafkaPublisher) Close() error {
 // ledger removes that case rather than documenting it.
 //
 // partition_key remains the next rung and is the one that carries the events with NO ledger:
-// balance monitors, identities, bulk batches and system errors. It is NOT NULL in the schema,
+// identities, bulk batches, system errors and rejected transactions. It is NOT NULL in the schema,
 // has a not-blank CHECK, and PrepareEventOutbox guarantees a value through its own chain, so a
 // row read back from the database always carries one. resolvePartitionKey supplies the final
 // rung, the aggregate id, for a request assembled in Go rather than read from a row. Every
@@ -2428,6 +2875,13 @@ func PublishRequestFromOutbox(row model.EventOutbox, attempt int) PublishRequest
 		// LEDGER FIRST — requirement R-6 partitions by ledger ID. See the fallback chain above.
 		Key:     firstNonBlank(row.LedgerID, row.PartitionKey),
 		Attempt: attempt,
+		// THE CAPTURED TRACE, carried from the row so the publish span links to the request
+		// that produced the event. This conversion is used by the relay, the dead-letter write
+		// and the replay alike, so all three inherit the link from one place — which is the
+		// same reason the canonical bytes and the topic are resolved here rather than at each
+		// call site.
+		Traceparent: row.Traceparent,
+		Tracestate:  row.Tracestate,
 	}
 }
 
@@ -2747,23 +3201,33 @@ func classifyTransientPublishError(err error) bool {
 //   - ctx context.Context: the recording context.
 //   - result PublishResult: the completed attempt.
 func recordPublishAttempt(ctx context.Context, result PublishResult) {
+	// THE TERMINAL DIMENSION ACCOMPANIES THE OUTCOME, and it has to. The outcome
+	// vocabulary is frozen at three values, so a failed attempt that will never be retried
+	// and one that will are both outcome="retrying"; without this attribute the counter
+	// could no longer answer "how many events are actually stuck", which is the question the
+	// dead-letter triage runbook opens with. Its domain is closed at two literals, so it
+	// multiplies the series count by two and nothing more.
 	metrics.EventPublishAttemptsTotal.Add(ctx, 1, otelmetric.WithAttributes(
 		attribute.String(publishAttrOutcome, string(result.Status)),
+		attribute.String(publishAttrTerminal, terminalAttributeValue(result)),
 	))
 
 	// attemptLabel and not strconv: the attribute sits on a HISTOGRAM, so its cardinality
 	// is multiplied by the bucket count and the domain has to stay closed at its eight
 	// declared values. See attemptLabel for the three inputs that would otherwise widen it.
 	//
-	// The OUTCOME accompanies the attempt, because the latency target is stated over
-	// first-attempt SUCCESSFUL publishes and the instrument's declaration in
-	// internal/metrics spells that query out as
-	// {attempt="1",outcome="dispatched"}. Recording the attempt alone would leave that
-	// query matching nothing at all, so the p99 the acceptance criterion is read from
-	// would be unreadable — while every dashboard still looked populated, because the
-	// series exist under a shorter label set. Its domain is the same closed
-	// model.PublishStatus vocabulary the attempts counter uses, so it adds no unbounded
-	// dimension.
+	// The OUTCOME accompanies the attempt because this instrument's usable population is
+	// first-attempt SUCCESSFUL writes, which its declaration in internal/metrics spells out
+	// as {attempt="1",outcome="dispatched"}: that is the broker write in isolation, and the
+	// second term of the queue-wait split. Recording the attempt alone would leave that
+	// query matching nothing at all — while every dashboard still looked populated, because
+	// the series exist under a shorter label set.
+	//
+	// It is NOT the series acceptance criterion V-1 is read from. V-1 spans outbox capture
+	// to acknowledgement and is read from EventCaptureToDispatchDuration, recorded below;
+	// this clock starts at the claim and so omits the queue wait. Its domain is the same
+	// closed model.PublishStatus vocabulary the attempts counter uses, so it adds no
+	// unbounded dimension.
 	metrics.EventPublishDuration.Record(ctx, result.Duration.Seconds(), otelmetric.WithAttributes(
 		attribute.String(publishAttrTopic, boundedTopicLabel(result.Topic)),
 		attribute.String(publishAttrAttempt, attemptLabel(result.Purpose, result.Attempt)),
@@ -2771,6 +3235,66 @@ func recordPublishAttempt(ctx context.Context, result PublishResult) {
 	))
 
 	recordCaptureToDispatch(ctx, result)
+}
+
+// recordDurableEventDelivery increments EventsPublishedTotal for ONE event whose delivery is
+// now DURABLY RECORDED: the broker acknowledged the write AND the claim-token-conditional
+// statement that records the Kafka leg has committed.
+//
+// # Why the relay calls this and the publisher does not (OBS-05)
+//
+// The increment used to sit immediately after the broker acknowledgement. That reads as the
+// natural place and is the wrong one, because acknowledgement is not the last step:
+//
+//	publish → ack → mark the row's Kafka leg recorded
+//
+// Delivery is at-least-once by design. A crash, a cancelled context or a failed statement
+// between the second and third steps leaves the row claimable so the event is published
+// AGAIN — losing it is unrecoverable, a duplicate is suppressed at the subscriber on event_id.
+// Counted at the ack, that republish increments the counter a SECOND TIME for one event. The
+// counter is documented as one increment per delivered event and is the denominator acceptance
+// criterion V-3's dead-letter rate is stated over, so over-counting it understates the rate
+// exactly when the pipeline is struggling and the rate is being read.
+//
+// The transitions that record the Kafka leg — MarkEventDispatched and MarkEventWebhookPending —
+// are both conditional on the claim token and both clear or consume it, so each succeeds for
+// one worker once per event. Counting there is what makes the increment unique. The cost is
+// that this counter LAGS THE WIRE by one bookkeeping statement, and an event on the topic whose
+// row could not be marked is not counted until the republish completes. That is the correct
+// trade: the alternative over-counts, and the acknowledged-write rate remains readable on
+// EventPublishAttemptsTotal{outcome="dispatched"}.
+//
+// # It counts ORIGINAL first deliveries only
+//
+// The relay is the only caller and it publishes only originals, so replays and dead-letter
+// writes cannot reach here. That is deliberate rather than incidental: both are visible on the
+// per-attempt instruments under their own fixed attempt attribute, and counting them here would
+// make the dead-letter rate depend on how much triage happened that day.
+//
+// It lives in this file, beside the other metrics writes for the publish pipeline, so that
+// event_relay.go still imports no instrument package of its own — the collector owns the gauges
+// and a second writer would make them disagree between ticks.
+//
+// Parameters:
+//   - ctx context.Context: the recording context. A cancelled one is harmless; the OpenTelemetry
+//     synchronous counter does not block on it.
+//   - topic string: the CATEGORY topic the event was published to. Bounded to the closed topic
+//     vocabulary here, so a row carrying an unexpected destination cannot mint a label value.
+//   - eventType string: the event name, bounded to the closed event-type vocabulary.
+func recordDurableEventDelivery(ctx context.Context, topic, eventType string) {
+	if metrics.EventsPublishedTotal == nil {
+		// Observability is optional, and this is the one metric write on the relay's
+		// BOOKKEEPING path rather than on a publish path. Every other writer in this file
+		// runs after a publish that already required the instruments; this one runs after
+		// the row has already been moved, so a nil instrument must not take a settled
+		// event's bookkeeping down with it.
+		return
+	}
+
+	metrics.EventsPublishedTotal.Add(ctx, 1, otelmetric.WithAttributes(
+		attribute.String(publishAttrTopic, boundedTopicLabel(topic)),
+		attribute.String(publishAttrEventType, boundedEventTypeLabel(eventType)),
+	))
 }
 
 // recordCaptureToDispatch records the END-TO-END age of an ACKNOWLEDGED event: from its

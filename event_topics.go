@@ -17,11 +17,23 @@ limitations under the License.
 package blnk
 
 import (
+	"context"
+	"errors"
 	"strings"
+	"time"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/model"
 )
+
+// eventTopicBacklogStore is the one repository method the stranded-prefix audit needs.
+//
+// Declared as its own interface rather than taking database.IDataSource so the audit is
+// reachable from a test with a few lines of fake, and so this file's dependency on
+// persistence stays exactly one method wide.
+type eventTopicBacklogStore interface {
+	ListUndrainedEventTopics(ctx context.Context) ([]model.EventTopicBacklog, error)
+}
 
 // This file is the topic-naming layer of the Kafka event pipeline. It answers
 // exactly two questions and owns nothing else:
@@ -51,7 +63,7 @@ import (
 // model.EventCategory, and this file DELEGATES to it. That split is the whole design:
 //
 //	model.EventCategory  → the bare category token ("transactions", "balances",
-//	                       "identities", "ledgers", "system"). Knows the event
+//	                       "identities", "system"). Knows the event
 //	                       vocabulary.
 //	this file            → "<prefix>.<category>" and "<prefix>.<category>.dlt".
 //	                       Knows the prefix and the separator. Knows no event names.
@@ -62,7 +74,7 @@ import (
 // new event type appears, extend model.EventCategory; this file then routes it with no
 // change at all.
 //
-// # Five categories, not three
+// # Four categories, not three
 //
 // The three category topics named in the requirements — transactions, balances,
 // identities — do not cover every event Blnk actually emits. "ledger.created" (raised
@@ -71,28 +83,26 @@ import (
 // them, while the coverage requirement is absolute: every event type that reached the
 // legacy webhook sender must be published, with zero exceptions.
 //
-// Two further categories resolve that tension while following the identical naming
+// ONE further category resolves that tension while following the identical naming
 // convention, so nothing about the scheme is special-cased and each dead-letter sibling
 // is derived by the same rule as every other. This is the recorded resolution of the
-// coverage-versus-topic-list ambiguity, and it is a decision, not an oversight.
+// coverage-versus-topic-list ambiguity, and it is a decision, not an oversight:
 //
-// They are TWO rather than one because coverage and REACHABILITY are different
-// questions, and one topic could not answer both:
+//	"<prefix>.system"   ledger.created, system.error, and anything this catalogue does
+//	                    not recognise. INTERNAL, because the frozen system.error body
+//	                    carries verbatim error text — PostgreSQL schema, table and
+//	                    routine names; broker addresses — and because an internal
+//	                    catch-all is what stops a routing omission delivering a domain
+//	                    payload to an audience that never asked for it.
 //
-//	"<prefix>.ledgers"  ledger.created. SUBSCRIBER-FACING, because it is ordinary
-//	                    ledger data that a subscriber receives over the legacy webhook
-//	                    today and must be able to keep receiving after the sunset.
-//	"<prefix>.system"   system.error, and anything this catalogue does not recognise.
-//	                    INTERNAL, because the frozen system.error body carries verbatim
-//	                    error text — PostgreSQL schema, table and routine names; broker
-//	                    addresses — and because an internal catch-all is what stops a
-//	                    routing omission delivering a domain payload to an audience that
-//	                    never asked for it.
-//
-// Sharing one topic between them was the earlier arrangement and it was wrong in both
-// directions: keeping it internal made ledger.created unreachable by every subscriber,
-// and making it grantable would have handed internal error detail to anyone granted
-// ledger events.
+// The topic being internal means `ledger.created` has no subscriber route, which is a
+// real cost and is documented as one on model.EventCategorySystem and in
+// docs/event-streaming.md. A fifth `ledgers` category was implemented here to avoid it
+// and has been removed: the catalogue is a published contract that the provisioning
+// script, both Compose files, the Kubernetes manifests and every subscriber's topic
+// list enumerate identically, so a fifth name on this side of it names a topic the
+// broker was never told to create. Changing the catalogue is a deliberate change made
+// once and everywhere, not a constant added here.
 //
 // Do NOT "tidy" either away. Folding these events into, say, the transactions topic
 // corrupts that topic's semantics for every subscriber filtering on it, and dropping
@@ -126,7 +136,7 @@ import (
 
 // DefaultTopicPrefix is the topic namespace used when KAFKA_TOPIC_PREFIX is not
 // configured. It yields the documented default topic names: blnk.transactions,
-// blnk.balances, blnk.identities, blnk.ledgers, blnk.system, and their .dlt siblings.
+// blnk.balances, blnk.identities, blnk.system, and their .dlt siblings.
 //
 // It duplicates config's own Kafka default by value, and that is necessary rather than
 // sloppy. The configuration default is applied by setKafkaDefaults, which runs only on
@@ -195,7 +205,7 @@ func eventCategoryOrder() []string {
 }
 
 // EventCategories returns the event category tokens in canonical order:
-// "transactions", "balances", "identities", "ledgers", "system".
+// "transactions", "balances", "identities", "system".
 //
 // These are bare tokens, not topic names. Compose a topic from one with
 // TopicForCategory; treating a returned value as a topic is a bug.
@@ -215,24 +225,26 @@ func EventCategories() []string {
 // It is the single answer to "may this subscriber be granted this topic?", and both the
 // request-validation layer and the Kafka ACL provisioning check against it. Before it
 // existed each of them trimmed the caller's topic list and granted whatever remained,
-// so an authorized request could name the literal wildcard, a dead-letter topic, an
-// internal topic, or a topic belonging to another system entirely, and receive a real
-// ACL binding over it.
+// so an authorized request could name the literal wildcard, a dead-letter topic, or a
+// topic belonging to another system entirely, and receive a real ACL binding over it.
 //
-// Three exclusions, each deliberate:
+// Two exclusions, each deliberate:
 //
 //   - DEAD-LETTER TOPICS. A `<topic>.dlt` record carries the original payload PLUS
 //     Blnk's failure metadata — the broker error text, the attempt window, internal
 //     topic names. That is operational detail for whoever runs Blnk, not data for the
 //     subscriber whose event failed. Dead letters are triaged through the
 //     master-key-gated dead-letter API instead.
-//   - INTERNAL CATEGORIES. The system topic carries Blnk's own error records and, as
-//     the catalogue's catch-all, events of unknown provenance; see
-//     model.IsInternalEventCategory.
 //   - ANYTHING NOT ON THIS LIST. Including a topic that merely looks Blnk-owned. The
 //     test is membership in this exact set, never a prefix match, because a prefix
 //     match would accept "blnk.transactions.something-else" and, with a
 //     caller-supplied prefix, very nearly anything.
+//
+// All FOUR category topics are on the list, the system one included: every category
+// carries event types the legacy webhook delivered, so withholding one would cost a
+// migrating subscriber an event it receives today. Which of the four a given subscriber
+// actually holds is the subset recorded on that subscriber, and granting the system
+// topic discloses system.error's verbatim body — see model.EventCategorySystem.
 //
 // Returns:
 //   - []string: a fresh slice of fully-qualified topic names, in canonical category
@@ -251,15 +263,14 @@ func SubscriberGrantableTopics() []string {
 // The comparison is exact against SubscriberGrantableTopics. It is deliberately NOT a
 // prefix test and NOT a normalising test: the caller-supplied value is compared as
 // given, after trimming surrounding whitespace only, so "BLNK.TRANSACTIONS",
-// "blnk.transactions ", "blnk.transactions.dlt", "*" and "blnk.system" are all
-// refused. Being strict here is the whole value of the function — every leniency is a
+// "blnk.transactions ", "blnk.transactions.dlt" and "*" are all refused. Being strict here is the whole value of the function — every leniency is a
 // way for an unintended grant to slip through.
 //
 // Parameters:
 //   - topic string: the candidate topic. Surrounding whitespace is ignored.
 //
 // Returns:
-//   - bool: true only for an exact match against a non-internal category topic.
+//   - bool: true only for an exact match against one of the four category topics.
 func IsSubscriberGrantableTopic(topic string) bool {
 	topic = strings.TrimSpace(topic)
 	if topic == "" {
@@ -278,12 +289,17 @@ func IsSubscriberGrantableTopic(topic string) bool {
 // IsBlnkOwnedTopic reports whether a topic is one of the names Blnk itself publishes
 // to — a category topic or one of their dead-letter siblings.
 //
-// It is the check the publisher applies before creating a writer and the repository
-// applies before storing a destination, so that neither can be steered at an arbitrary
-// topic by a stored or replayed value. It is BROADER than
-// IsSubscriberGrantableTopic — it includes the internal and dead-letter names, because
-// Blnk legitimately writes to all of them — and the two must not be confused: this one
-// answers "may WE write here?", the other answers "may a SUBSCRIBER read here?".
+// It answers "is this a name in the CURRENT generation's inventory?" — an exact match
+// against AllTopicsWithDeadLetters, under the configured prefix. It is BROADER than
+// IsSubscriberGrantableTopic, because it includes the internal and dead-letter names that
+// Blnk legitimately writes to and a subscriber may never read, and the two must not be
+// confused: this one answers "may WE write here?", the other "may a SUBSCRIBER read here?".
+//
+// IT IS NOT THE TEST FOR A STORED TOPIC NAME. A row records its destination at insert time,
+// so a row captured before a KAFKA_TOPIC_PREFIX rename names a topic that is owned and is
+// deliberately absent from the current inventory. Use IsOwnedTopicUnderAnyConfiguredPrefix
+// wherever the name came out of the table — resolving a writer, labelling a metric,
+// validating a destination read back — or a rename strands every event captured before it.
 //
 // Parameters:
 //   - topic string: the candidate topic. Surrounding whitespace is ignored.
@@ -377,9 +393,9 @@ func TopicPrefix() string {
 
 // TopicForCategory composes the fully-qualified topic name for a category token.
 //
-// The composition is "<prefix>.<category>", so with the default prefix the five
-// category tokens yield blnk.transactions, blnk.balances, blnk.identities,
-// blnk.ledgers and blnk.system.
+// The composition is "<prefix>.<category>", so with the default prefix the four
+// category tokens yield blnk.transactions, blnk.balances, blnk.identities and
+// blnk.system.
 //
 // An empty or blank category resolves to the system category rather than composing
 // "<prefix>." — a name with a trailing separator and an empty final segment, which
@@ -405,11 +421,12 @@ func TopicForCategory(category string) string {
 	if category == "" {
 		// The system category, which is model.EventCategory's own catch-all. A
 		// blank category means the caller could not classify the event, and the
-		// system category is where an unclassifiable event belongs for one
-		// concrete reason: it is INTERNAL, so no subscriber can be granted its
-		// topic. The event still lands on a real topic and stays replayable,
-		// while a routing omission cannot deliver a domain payload to an audience
-		// that never asked for it. See model.EventCategorySystem.
+		// system category is where an unclassifiable event belongs: it is a real,
+		// provisioned topic with a dead-letter sibling and gauge coverage, so the
+		// event stays durable and replayable, and it is the topic an operator
+		// grants deliberately rather than as a matter of course, so a routing
+		// omission does not reach a domain topic's audience. See
+		// model.EventCategorySystem.
 		category = model.EventCategorySystem
 	}
 
@@ -432,9 +449,8 @@ func TopicForCategory(category string) string {
 //	                   transaction.unknown, and any bulk_transaction.<status>
 //	blnk.balances      balance.created, balance.monitor
 //	blnk.identities    identity.created
-//	blnk.ledgers       ledger.created
-//	blnk.system        system.error, and anything this catalogue does not
-//	                   recognise                                   (internal)
+//	blnk.system        ledger.created, system.error, and anything this catalogue
+//	                   does not recognise                          (internal)
 //
 // Two properties of that resolution are easy to get wrong and are worth stating
 // explicitly, because both live in the delegated mapping rather than here:
@@ -446,13 +462,13 @@ func TopicForCategory(category string) string {
 //   - An UNRECOGNISED event type routes to blnk.system, the catalogue's catch-all. It
 //     is never rejected, and this function never returns an empty string: the relay
 //     publishes whatever topic it is given, so an empty result would strand a
-//     committed event and dropping it would lose one. The destination is safe because
-//     blnk.system is INTERNAL and cannot be granted to any subscriber, so a producer
-//     added without extending the catalogue cannot deliver its payload — possibly a
-//     balance or an identity record — to an audience that never asked for it, while
-//     the event stays durable, observable and replayable. Anything landing there
-//     under an unrecognised name is a defect to fix by extending
-//     model.EventCategory, and the publisher warns when it happens.
+//     committed event and dropping it would lose one. blnk.system is provisioned,
+//     monitored and has a dead-letter sibling, so the event stays durable, observable
+//     and replayable, and it is the topic an operator grants deliberately rather than
+//     as a matter of course, so a producer added without extending the catalogue does
+//     not deliver its payload — possibly a balance or an identity record — to a domain
+//     topic's audience. Anything landing there under an unrecognised name is a defect
+//     to fix by extending model.EventCategory, and the publisher warns when it happens.
 //
 // Parameters:
 //   - eventType string: the event name, for example "transaction.applied". May be
@@ -484,7 +500,7 @@ func TopicForEvent(eventType string) string {
 //
 // The idempotency rule implies one invariant: NO CATEGORY MAY BE NAMED "dlt". A
 // blnk.dlt category topic would be indistinguishable from an already-derived name and
-// could never get a dead-letter sibling of its own. None of the five categories is, and
+// could never get a dead-letter sibling of its own. None of the four categories is, and
 // a test pins it.
 //
 // An empty or blank topic returns the empty string rather than a bare ".dlt". There is
@@ -551,13 +567,13 @@ func IsDeadLetterTopic(topic string) bool {
 }
 
 // AllTopics returns every category topic in canonical order, with the configured
-// prefix applied: blnk.transactions, blnk.balances, blnk.identities, blnk.ledgers and
+// prefix applied: blnk.transactions, blnk.balances, blnk.identities and
 // blnk.system.
 //
-// These are the topics events are published to, INCLUDING the internal one — Blnk
-// writes to all of them, and all of them must be provisioned. Which of them a
-// subscriber may be granted is a different question, answered by
-// SubscriberGrantableTopics. It excludes the dead-letter siblings; use
+// These are the topics events are published to, and all of them must be provisioned.
+// Which of them a given subscriber HOLDS is a different question — the subset recorded
+// on that subscriber — and which of them a subscriber MAY hold is answered by
+// SubscriberGrantableTopics. This list excludes the dead-letter siblings; use
 // AllTopicsWithDeadLetters for everything Blnk owns.
 //
 // Returns:
@@ -575,9 +591,163 @@ func AllTopics() []string {
 	return topics
 }
 
+// HistoricalTopicPrefixes returns the topic namespaces this deployment USED TO own and
+// must still be able to publish to, from KAFKA_HISTORICAL_TOPIC_PREFIXES.
+//
+// Empty for every deployment that has never renamed its namespace, which is almost all of
+// them. See config.KafkaConfig.HistoricalTopicPrefixes for what listing a prefix does and
+// why the list is meant to be drained rather than accumulated.
+//
+// Returns:
+//   - []string: a fresh slice of distinct, non-blank prefixes, none equal to TopicPrefix().
+//     Nil when none is configured or configuration has not been loaded.
+func HistoricalTopicPrefixes() []string {
+	owned := OwnedTopicPrefixes()
+	if len(owned) <= 1 {
+		return nil
+	}
+
+	return owned[1:]
+}
+
+// OwnedTopicPrefixes returns every topic namespace this deployment owns: TopicPrefix()
+// first, then each historical prefix.
+//
+// This is the answer to "which namespaces may we write to?", and it is the list the
+// publisher's ownership test, the pre-created writer inventory, topic assurance and the
+// bounded metric labels all work from. Composing a topic inventory from it is what keeps a
+// row captured before a prefix rename publishable after a restart.
+//
+// It is re-read from live configuration on every call for the same reason TopicPrefix() is:
+// the configuration store is an atomic value re-published whenever configuration is
+// (re)loaded, so a cached list would keep answering from configuration that no longer
+// exists.
+//
+// Returns:
+//   - []string: one or more distinct, non-blank prefixes, the configured one first. Falls
+//     back to a single-element list holding DefaultTopicPrefix when configuration has not
+//     been loaded, which is the strictest available answer.
+func OwnedTopicPrefixes() []string {
+	cnf, err := fetchConfiguration()
+	if err != nil || cnf == nil {
+		return []string{DefaultTopicPrefix}
+	}
+
+	// The configured prefix is resolved through topicPrefixFrom rather than through the
+	// config accessor's own trim, so that a blank or separator-only value resolves to
+	// DefaultTopicPrefix exactly as every other name in this file does.
+	current := topicPrefixFrom(cnf)
+
+	prefixes := []string{current}
+	seen := map[string]struct{}{current: {}}
+
+	for _, raw := range cnf.Kafka.HistoricalTopicPrefixes {
+		prefix := strings.Trim(raw, topicPrefixTrimCutset)
+		if prefix == "" {
+			continue
+		}
+		if _, already := seen[prefix]; already {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		prefixes = append(prefixes, prefix)
+	}
+
+	return prefixes
+}
+
+// AllTopicsWithDeadLettersForPrefix returns every topic Blnk owns under ONE given prefix:
+// every category topic followed by every dead-letter sibling.
+//
+// It is the prefix-parameterised form of AllTopicsWithDeadLetters, and it exists so that
+// the inventory of a HISTORICAL namespace can be composed without changing configuration.
+// The category list and the ordering are shared with the configured-prefix form, so the two
+// cannot drift.
+//
+// Parameters:
+//   - prefix string: the namespace to compose under. Trimmed; a blank value resolves to
+//     DefaultTopicPrefix, matching every other prefix reader here.
+//
+// Returns:
+//   - []string: a fresh slice of fully-qualified topic names, two per category.
+func AllTopicsWithDeadLettersForPrefix(prefix string) []string {
+	prefix = strings.Trim(prefix, topicPrefixTrimCutset)
+	if prefix == "" {
+		prefix = DefaultTopicPrefix
+	}
+
+	categories := eventCategoryOrder()
+
+	topics := make([]string, 0, len(categories)*2)
+	for _, category := range categories {
+		topics = append(topics, prefix+topicSeparator+category)
+	}
+	for _, category := range categories {
+		topics = append(topics, prefix+topicSeparator+category+DeadLetterTopicSuffix)
+	}
+
+	return topics
+}
+
+// AllOwnedTopicsAcrossPrefixes returns every topic Blnk owns across every owned prefix: the
+// configured generation's inventory first, then each historical generation's.
+//
+// # What it is for
+//
+// Two callers need the whole set rather than the current generation:
+//
+//   - The publisher pre-creates a writer for each, so a row captured before a prefix rename
+//     is served from the fast path after a restart instead of being refused. A writer
+//     performs no I/O until its first write, so an inventory for a namespace nothing writes
+//     to costs a struct.
+//   - Topic assurance keeps every one of them present, so a historical topic that was
+//     deleted — or never existed on a broker restored from elsewhere — is recreated rather
+//     than failing every publish of the rows that name it.
+//
+// Names are distinct: the prefixes OwnedTopicPrefixes returns are distinct, and no topic
+// name can belong to two different prefixes.
+//
+// Returns:
+//   - []string: a fresh slice of fully-qualified topic names. Identical to
+//     AllTopicsWithDeadLetters when no historical prefix is configured, which is the
+//     ordinary case.
+func AllOwnedTopicsAcrossPrefixes() []string {
+	prefixes := OwnedTopicPrefixes()
+
+	topics := make([]string, 0, len(prefixes)*len(eventCategoryOrder())*2)
+	for _, prefix := range prefixes {
+		topics = append(topics, AllTopicsWithDeadLettersForPrefix(prefix)...)
+	}
+
+	return topics
+}
+
+// IsOwnedTopicUnderAnyConfiguredPrefix reports whether a topic lies inside a namespace this
+// deployment owns — the configured prefix or any historical one.
+//
+// This is the ownership test to apply wherever a STORED topic name is about to be acted on:
+// resolving a writer for an outbox row, deciding whether a name is safe to report verbatim
+// as a metric label, or validating a destination read back out of the table. It is exact on
+// both segments for each candidate prefix, so it admits nothing that
+// model.IsBlnkEventTopic would refuse under one of them.
+//
+// It is NOT the test for creating or granting a topic. A new topic is created under the
+// configured prefix only, and a subscriber is granted from SubscriberGrantableTopics, both
+// of which are narrower on purpose — a historical namespace is something to drain, not
+// something to keep provisioning into or hand out.
+//
+// Parameters:
+//   - topic string: the fully-resolved candidate name.
+//
+// Returns:
+//   - bool: true when the name is a category or dead-letter topic under an owned prefix.
+func IsOwnedTopicUnderAnyConfiguredPrefix(topic string) bool {
+	return model.IsBlnkEventTopicUnderAnyPrefix(topic, OwnedTopicPrefixes())
+}
+
 // AllDeadLetterTopics returns every dead-letter topic in canonical order, with the
 // configured prefix applied: blnk.transactions.dlt, blnk.balances.dlt,
-// blnk.identities.dlt, blnk.ledgers.dlt and blnk.system.dlt.
+// blnk.identities.dlt and blnk.system.dlt.
 //
 // Each is the DLTFor sibling of the AllTopics entry at the same index, so the two
 // slices can be zipped safely.
@@ -595,7 +765,7 @@ func AllDeadLetterTopics() []string {
 }
 
 // AllTopicsWithDeadLetters returns every topic Blnk owns: every category topic
-// followed by every dead-letter sibling — ten names with the five categories the
+// followed by every dead-letter sibling — eight names with the four categories the
 // topic contract declares.
 //
 // THIS IS THE SINGLE SOURCE OF TRUTH FOR THE TOPIC INVENTORY. The admin client's topic
@@ -682,4 +852,197 @@ func IsOwnedTopicForm(topic string) bool {
 	}
 
 	return false
+}
+
+// StrandedTopicPrefix is one topic namespace that outbox rows still name but this
+// deployment no longer owns.
+//
+// It is the finding of AuditStrandedTopicPrefixes, and it carries everything the
+// remedy needs: the prefix to add to KAFKA_HISTORICAL_TOPIC_PREFIXES, how many rows are
+// waiting behind it, and how old the oldest one is.
+type StrandedTopicPrefix struct {
+	// Prefix is the namespace, as parsed from the stored topic names. This is the exact
+	// value to add to KAFKA_HISTORICAL_TOPIC_PREFIXES.
+	Prefix string
+
+	// Topics are the stored destination names under Prefix, in the order the audit read
+	// them — oldest outstanding occurrence first.
+	Topics []string
+
+	// UndeliveredRows is how many rows under Prefix still owe a first successful publish.
+	UndeliveredRows int64
+
+	// ReplayableRows is how many dead-lettered rows under Prefix could be replayed.
+	ReplayableRows int64
+
+	// OldestOccurredAt is the occurrence instant of the oldest row counted here.
+	OldestOccurredAt time.Time
+}
+
+// TotalRows is how many rows are stranded behind this prefix.
+//
+// Returns:
+//   - int64: the sum of the two counts.
+func (s StrandedTopicPrefix) TotalRows() int64 {
+	return s.UndeliveredRows + s.ReplayableRows
+}
+
+// AuditStrandedTopicPrefixes reports the topic namespaces that outbox rows still name and
+// this deployment no longer owns.
+//
+// # The failure it makes visible
+//
+// A row records its fully-resolved destination topic at INSERT time, so that a committed
+// event stays bound to the topic it was always meant for. Change KAFKA_TOPIC_PREFIX and the
+// rows already in the table keep naming the previous generation's topics. They are still
+// publishable — but only while that previous prefix is declared in
+// KAFKA_HISTORICAL_TOPIC_PREFIXES. Declare nothing, and the publisher refuses each of those
+// topics, so the rows stay claimable for ever and their replays are refused too.
+//
+// Nothing else can see this. The rows look like ordinary pending, failed and dead-lettered
+// work in every status count, the relay reports a publish failure per attempt rather than a
+// configuration problem, and the events are perfectly safe in the table the whole time. What
+// is missing is delivery, and the only evidence is the topic name on rows nobody is reading.
+//
+// This turns that into a prefix an operator can act on. Whoever calls it decides how loudly
+// to say so; cmd/server.go reports each finding at start-up, naming the variable to set.
+//
+// # Why it does not refuse to start
+//
+// Refusing would be the other sanctioned answer — block a prefix change until the old rows
+// drain — and it is the wrong one for a running ledger. The prefix is read from the process
+// environment, so the refusal would land on a rolling restart, taking down a server whose
+// ledger and API are entirely healthy, for a condition that affects event delivery alone and
+// is fixed by adding one variable. It also cannot be enforced where the change is made: the
+// operator edits configuration, and the first process to notice is the next one to start.
+//
+// So the audit reports and the deployment keeps serving. The rows are not lost, no event is
+// dropped, and the finding names the remedy.
+//
+// Parameters:
+//   - ctx context.Context: cancels the underlying query.
+//   - store eventTopicBacklogStore: the outbox repository.
+//
+// Returns:
+//   - []StrandedTopicPrefix: one entry per unowned prefix, oldest outstanding occurrence
+//     first. Empty — never nil — when every stored destination is owned, which is the
+//     ordinary case and the case for every deployment that has never renamed its namespace.
+//   - error: the repository error, unwrapped, so a caller can log it as the measurement
+//     failure it is rather than reporting a stranded prefix it never saw.
+func AuditStrandedTopicPrefixes(
+	ctx context.Context, store eventTopicBacklogStore,
+) ([]StrandedTopicPrefix, error) {
+	if store == nil {
+		return nil, errors.New("blnk: an outbox repository is required to audit stranded topic prefixes")
+	}
+
+	backlogs, err := store.ListUndrainedEventTopics(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Insertion-ordered, so the "oldest outstanding occurrence first" ordering the query
+	// established survives the grouping. A map alone would randomise it, and the ordering is
+	// what puts the most overdue generation at the top of the log.
+	order := make([]string, 0, len(backlogs))
+	found := make(map[string]*StrandedTopicPrefix, len(backlogs))
+
+	for _, backlog := range backlogs {
+		if IsOwnedTopicUnderAnyConfiguredPrefix(backlog.Topic) {
+			continue
+		}
+
+		// A name that is not even the owned FORM — no recognised category, or no prefix at
+		// all — is not a stranded generation. It is a row that should never have been
+		// storable, and reporting it as "add this to the allowlist" would be advice that
+		// widens the namespace on the strength of one malformed row. The relay's own
+		// per-attempt refusal already names it.
+		prefix, ok := topicPrefixOf(backlog.Topic)
+		if !ok {
+			continue
+		}
+
+		entry, seen := found[prefix]
+		if !seen {
+			order = append(order, prefix)
+			found[prefix] = &StrandedTopicPrefix{
+				Prefix:           prefix,
+				Topics:           []string{backlog.Topic},
+				UndeliveredRows:  backlog.UndeliveredRows,
+				ReplayableRows:   backlog.ReplayableRows,
+				OldestOccurredAt: backlog.OldestOccurredAt,
+			}
+
+			continue
+		}
+
+		entry.Topics = append(entry.Topics, backlog.Topic)
+		entry.UndeliveredRows += backlog.UndeliveredRows
+		entry.ReplayableRows += backlog.ReplayableRows
+		if !backlog.OldestOccurredAt.IsZero() &&
+			(entry.OldestOccurredAt.IsZero() || backlog.OldestOccurredAt.Before(entry.OldestOccurredAt)) {
+			entry.OldestOccurredAt = backlog.OldestOccurredAt
+		}
+	}
+
+	stranded := make([]StrandedTopicPrefix, 0, len(order))
+	for _, prefix := range order {
+		stranded = append(stranded, *found[prefix])
+	}
+
+	return stranded, nil
+}
+
+// topicPrefixOf extracts the namespace from a topic name that has the Blnk-owned FORM.
+//
+// It reports failure rather than guessing for a name that is not of that form, because the
+// only caller uses the result to tell an operator which prefix to declare as owned, and a
+// prefix parsed out of a name that is not one of Blnk's own topics would be advice to widen
+// the owned namespace on the strength of a malformed row.
+//
+// Parameters:
+//   - topic string: the candidate topic name.
+//
+// Returns:
+//   - string: the prefix, with the category and any dead-letter suffix removed.
+//   - bool: false when topic does not have the owned form, in which case the string is empty.
+func topicPrefixOf(topic string) (string, bool) {
+	if !IsOwnedTopicForm(topic) {
+		return "", false
+	}
+
+	name := strings.TrimSuffix(strings.TrimSpace(topic), DeadLetterTopicSuffix)
+
+	separator := strings.LastIndex(name, ".")
+	if separator <= 0 {
+		return "", false
+	}
+
+	return name[:separator], true
+}
+
+// AuditStrandedTopicPrefixes reports the topic namespaces this instance's outbox rows still
+// name and this deployment no longer owns.
+//
+// It is the method form of the package function, bound to the instance's datasource, so a
+// caller holding a *Blnk — cmd/server.go at start-up — does not reach into the repository
+// itself. See AuditStrandedTopicPrefixes for the failure it makes visible and why it reports
+// rather than refusing to start.
+//
+// Parameters:
+//   - ctx context.Context: cancels the underlying query.
+//
+// Returns:
+//   - []StrandedTopicPrefix: one entry per unowned prefix, oldest outstanding occurrence
+//     first. Empty when every stored destination is owned.
+//   - error: when the instance has no datasource, or the query failed.
+func (b *Blnk) AuditStrandedTopicPrefixes(ctx context.Context) ([]StrandedTopicPrefix, error) {
+	if b == nil || b.datasource == nil {
+		return nil, errors.New(
+			"blnk: no datasource is configured, so the event outbox cannot be audited for stranded " +
+				"topic prefixes",
+		)
+	}
+
+	return AuditStrandedTopicPrefixes(ctx, b.datasource)
 }

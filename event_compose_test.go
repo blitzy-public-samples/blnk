@@ -105,35 +105,60 @@ func TestCompose_KafkaIsOptInSoTheNoBrokerSteadyStateStarts(t *testing.T) {
 				}
 			})
 
-			t.Run("the publishing services depend on them optionally", func(t *testing.T) {
-				// The server AND the worker: the worker publishes too — transaction.rejected
-				// comes from its rejection handler — so a fix applied to one leaves the other
-				// unable to start without a broker.
-				for _, consumer := range []string{"server", "worker"} {
-					service, declared := services[consumer].(map[string]interface{})
-					require.True(t, declared, "%s must declare a %q service", composeFile, consumer)
+			t.Run("the server depends on them optionally", func(t *testing.T) {
+				// THE SERVER ONLY, and that is the whole point of this sub-test's name. The
+				// server hosts the outbox relay and the dead-letter writer, so it is the one
+				// process that dials a broker and the one that must not start against a broker
+				// which is not listening or a catalogue which was never provisioned.
+				const consumer = "server"
 
-					dependencies, isMap := service["depends_on"].(map[string]interface{})
-					require.True(t, isMap,
-						"%s's depends_on must be the long map form: only that form can carry a "+
-							"condition and a required flag, and both are load-bearing here", consumer)
+				service, declared := services[consumer].(map[string]interface{})
+				require.True(t, declared, "%s must declare a %q service", composeFile, consumer)
 
-					for name, wantCondition := range wantConditions {
-						entry, present := dependencies[name].(map[string]interface{})
-						require.True(t, present,
-							"%s must still declare its %q dependency: dropping it entirely would let "+
-								"the relay start against a broker that is not listening", consumer, name)
+				dependencies, isMap := service["depends_on"].(map[string]interface{})
+				require.True(t, isMap,
+					"%s's depends_on must be the long map form: only that form can carry a "+
+						"condition and a required flag, and both are load-bearing here", consumer)
 
-						assert.Equal(t, false, entry["required"],
-							"%s's %q dependency must be `required: false`, or the profile does not "+
-								"make Kafka optional — Compose refuses to start a service whose "+
-								"dependency is outside the enabled set", consumer, name)
+				for name, wantCondition := range wantConditions {
+					entry, present := dependencies[name].(map[string]interface{})
+					require.True(t, present,
+						"%s must still declare its %q dependency: dropping it entirely would let "+
+							"the relay start against a broker that is not listening", consumer, name)
 
-						assert.Equal(t, wantCondition, entry["condition"],
-							"%s's %q dependency must KEEP its condition: opting in to Kafka means "+
-								"waiting for a broker that authenticates and for provisioning that "+
-								"succeeded, not merely for a container that exists", consumer, name)
-					}
+					assert.Equal(t, false, entry["required"],
+						"%s's %q dependency must be `required: false`, or the profile does not "+
+							"make Kafka optional — Compose refuses to start a service whose "+
+							"dependency is outside the enabled set", consumer, name)
+
+					assert.Equal(t, wantCondition, entry["condition"],
+						"%s's %q dependency must KEEP its condition: opting in to Kafka means "+
+							"waiting for a broker that authenticates and for provisioning that "+
+							"succeeded, not merely for a container that exists", consumer, name)
+				}
+			})
+
+			t.Run("the worker depends on neither", func(t *testing.T) {
+				// THE WORKER NEVER DIALS A BROKER, so gating its start-up on one made an
+				// unrelated dependency into a reason this process could not come up. It writes
+				// outbox rows; the relay in the server role publishes them. While the two
+				// conditions were here, an unhealthy broker or a failed provisioning one-shot
+				// stopped transaction processing, transaction hooks and search indexing — none
+				// of which involve Kafka at all.
+				//
+				// Asserted as an ABSENCE rather than left untested because the previous shape of
+				// this file required the dependency on both services, so restoring it would
+				// otherwise look like a correction.
+				worker, declared := services["worker"].(map[string]interface{})
+				require.True(t, declared, "%s must declare a worker service", composeFile)
+
+				dependencies, isMap := worker["depends_on"].(map[string]interface{})
+				require.True(t, isMap, "the worker must declare a depends_on map")
+
+				for name := range wantConditions {
+					assert.NotContains(t, dependencies, name,
+						"the worker must not depend on %q: it publishes nothing, so a broker it "+
+							"never dials must not be able to keep it from starting", name)
 				}
 			})
 		})
@@ -152,8 +177,10 @@ func TestCompose_KafkaIsOptInSoTheNoBrokerSteadyStateStarts(t *testing.T) {
 // subscriber's events and revoking every real subscriber's credential. A credential that is in
 // the source is not a credential.
 //
-// Worse, that same default was injected into the WORKER, a process that only publishes and has
-// no administrative work to do at all.
+// Worse, that same default was injected into the WORKER — a process that turned out to publish
+// nothing at all, so it held the strongest identity in the cluster for no capability whatsoever.
+// The worker's Kafka credentials are gone entirely now; the sub-test below asserts their absence
+// rather than their shape.
 //
 // # Why an empty default is the right answer rather than a required one
 //
@@ -214,51 +241,100 @@ func TestCompose_NoKafkaCredentialIsKnownFromSource(t *testing.T) {
 				}
 			})
 
-			t.Run("the worker holds no administrative credential", func(t *testing.T) {
-				// The worker publishes and never administers. Only cmd/server.go builds an admin
-				// client — for topic assurance before the relay starts, and for the offset reads
-				// behind reconciliation — so a second copy of the superuser credential widens the
-				// credential's exposure for no capability the process uses.
+			t.Run("the worker holds no Kafka credential at all", func(t *testing.T) {
+				// THE WORKER PUBLISHES NOTHING, so it needs no broker credential of any kind —
+				// not the administrative pair, and not the producer pair either.
+				//
+				// This assertion used to be the opposite for the producer pair: the worker was
+				// REQUIRED to receive it, on the belief that transaction.rejected was published
+				// from its rejection handler. It is not. That handler's post-transaction actions
+				// insert an outbox row inside the ledger transaction, and the relay — which
+				// cmd/server.go starts and only the server role runs — is what publishes it.
+				// Nothing in this process ever produced a Kafka message, so the credential bought
+				// standing Write and Describe authority over every Blnk-owned topic, dead-letter
+				// siblings included, for a capability that was never exercised. A compromise of
+				// the worker could forge any ledger event onto any topic, and a subscriber cannot
+				// tell a forged event from a real one when both arrive under valid producer
+				// credentials.
+				//
+				// blnk.NewBlnkForRole is the enforcement in code — `blnk workers` resolves to
+				// ProcessRoleWorker, which selects the no-op publisher before the broker list is
+				// read — and this is the environment half of the same decision: a credential that
+				// is not in the container's environment is not in `docker inspect`, not in
+				// /proc/<pid>/environ, and not in a crash dump.
 				worker, declared := services["worker"].(map[string]interface{})
 				require.True(t, declared, "%s must declare a worker service", composeFile)
 
 				environment, isMap := worker["environment"].(map[string]interface{})
 				require.True(t, isMap, "the worker must declare an environment block")
 
-				for _, key := range []string{"KAFKA_SASL_ADMIN_USER", "KAFKA_SASL_ADMIN_SECRET"} {
+				forbidden := []string{
+					// Credentials: this role writes nothing and administers nothing.
+					"KAFKA_SASL_USER", "KAFKA_SASL_SECRET",
+					"KAFKA_SASL_ADMIN_USER", "KAFKA_SASL_ADMIN_SECRET",
+					"KAFKA_ALLOW_ADMIN_PRODUCER",
+					// TLS material: it opens no broker connection, so it verifies no certificate.
+					"KAFKA_TLS_ENABLED", "KAFKA_TLS_CA_FILE",
+					"KAFKA_TLS_INSECURE_SKIP_VERIFY", "KAFKA_INSECURE_LOCAL_DEV",
+					// Credential issuance is a server endpoint.
+					"KAFKA_SUBSCRIBER_BROKERS",
+					// Topic geometry is applied only by the server's topic assurance.
+					"KAFKA_MIN_PARTITIONS", "KAFKA_REPLICATION_FACTOR",
+					"KAFKA_ALLOW_PARTITION_GROWTH",
+					// Only the relay waits, and only the server runs one.
+					"RELAY_RETRY_BASE_BACKOFF_MS", "RELAY_RETRY_MAX_BACKOFF_MS",
+				}
+				for _, key := range forbidden {
 					assert.NotContains(t, environment, key,
-						"the worker must not receive %s: it publishes and never administers, and "+
-							"config.KafkaConfig accepts an EMPTY administrative pair — what it "+
-							"refuses is a half-configured one", key)
+						"the worker must not receive %s: it captures events into the outbox and "+
+							"publishes none, so this key gives it either authority or material it "+
+							"cannot use. Add it back only in the same change that gives this "+
+							"process a write path to justify it", key)
+					assert.NotContains(t, environment, "BLNK_"+key,
+						"the worker must not receive BLNK_%s either: the prefixed alias resolves "+
+							"exactly as the bare name does, so passing one and not the other only "+
+							"hides the credential from a reader of this file", key)
 				}
 
-				// And it must still receive the producer pair, or it cannot publish at all: with
-				// an administrative pair configured elsewhere and no producer pair here, the event
-				// publisher refuses to construct and this process does not start.
-				for _, key := range []string{"KAFKA_SASL_USER", "KAFKA_SASL_SECRET"} {
+				// WHAT IT MUST STILL RECEIVE. Capture is gated on the broker list rather than on
+				// the publisher, and the row's topic and retry budget are decided where the row
+				// is written — so these four are configuration this role genuinely applies, and
+				// removing any of them would make the worker's events diverge from the server's.
+				for _, key := range []string{
+					"KAFKA_BROKERS",
+					"KAFKA_TOPIC_PREFIX",
+					"RELAY_MAX_RETRY_ATTEMPTS",
+					"WEBHOOK_DEPRECATION_SUNSET_DATE",
+				} {
 					assert.Contains(t, environment, key,
-						"the worker must receive %s: it publishes transaction.rejected from its "+
-							"rejection handler, and Blnk will not publish as the administrator", key)
+						"the worker must still receive %s: capture is gated on the broker list, "+
+							"the row's topic and max_attempts are resolved at capture time, and the "+
+							"legacy webhook handler runs in this role during the dual-delivery "+
+							"window. Drop it and this role's events take a different path from the "+
+							"server's for the same event type", key)
 				}
 			})
 
-			t.Run("the publishing services default their producer pair from one source", func(t *testing.T) {
+			t.Run("the publishing service defaults its producer pair from one source", func(t *testing.T) {
 				// One value in .env both mints the principal on the broker (KAFKA_PRODUCER_*, read
-				// by scripts/kafka-provision.sh) and is presented by the publishing processes
+				// by scripts/kafka-provision.sh) and is presented by the publishing process
 				// (KAFKA_SASL_*). Two independent values would drift, and the symptom of drift is
 				// a SASL handshake failure that reads exactly like a wrong password.
-				for _, consumer := range []string{"server", "worker"} {
-					service := services[consumer].(map[string]interface{})
-					environment := service["environment"].(map[string]interface{})
+				//
+				// One service, not two: the worker presents no credential at all, which the
+				// sub-test above asserts.
+				const consumer = "server"
 
-					assert.Contains(t, environment["KAFKA_SASL_USER"], "KAFKA_PRODUCER_USER",
-						"%s's KAFKA_SASL_USER must default from KAFKA_PRODUCER_USER, the key "+
-							"scripts/kafka-provision.sh creates the principal from", consumer)
-					assert.Contains(t, environment["KAFKA_SASL_SECRET"], "KAFKA_PRODUCER_SECRET",
-						"%s's KAFKA_SASL_SECRET must default from KAFKA_PRODUCER_SECRET, so the "+
-							"credential the broker holds and the one this process presents are one "+
-							"line of .env", consumer)
-				}
+				service := services[consumer].(map[string]interface{})
+				environment := service["environment"].(map[string]interface{})
+
+				assert.Contains(t, environment["KAFKA_SASL_USER"], "KAFKA_PRODUCER_USER",
+					"%s's KAFKA_SASL_USER must default from KAFKA_PRODUCER_USER, the key "+
+						"scripts/kafka-provision.sh creates the principal from", consumer)
+				assert.Contains(t, environment["KAFKA_SASL_SECRET"], "KAFKA_PRODUCER_SECRET",
+					"%s's KAFKA_SASL_SECRET must default from KAFKA_PRODUCER_SECRET, so the "+
+						"credential the broker holds and the one this process presents are one "+
+						"line of .env", consumer)
 			})
 
 			t.Run("the broker still enforces ACLs", func(t *testing.T) {
@@ -548,4 +624,1111 @@ func runKafkaProvisionValidation(t *testing.T, root string, environment map[stri
 		kafkaProvisionScript, output)
 
 	return string(output), err
+}
+
+// composeImageRef returns a service's raw, uninterpolated image reference.
+//
+// Raw rather than rendered on purpose: the interpolation DEFAULT is the thing under test in
+// two of the guards below, and `docker compose config` would have already collapsed it into
+// whatever the ambient environment happened to say.
+func composeImageRef(t *testing.T, services map[string]interface{}, service, label string) string {
+	t.Helper()
+
+	declared, isMap := services[service].(map[string]interface{})
+	require.Truef(t, isMap, "%s must declare a %q service", label, service)
+
+	image, isString := declared["image"].(string)
+	require.Truef(t, isString, "%s: service %q must declare an image", label, service)
+
+	return strings.TrimSpace(image)
+}
+
+// TestCompose_ThirdPartyImagesArePinnedByTagAndDigest is the supply-chain guard.
+//
+// # What was wrong
+//
+// The jaeger and prometheus services were pinned to `latest`. A floating tag means the image
+// a rebuilt stack runs is whatever the registry resolved to that morning, which defeats the
+// point of having a tested stack: the next `docker compose pull` can change the Prometheus
+// major version — Prometheus 3 rejected some Prometheus 2 configuration outright — or move
+// Jaeger under a collector whose defaults differ, with nothing in the repository recording
+// that anything moved.
+//
+// # Why the digest and not just the tag
+//
+// A tag is a mutable pointer. The same `v3.13.2` can be repushed over a different image, so a
+// version tag alone records intent rather than identity. The digest is what makes a rebuild
+// byte-identical to the tested stack, and pinning both means a mismatch fails the pull instead
+// of resolving quietly.
+//
+// # Why "latest" is asserted absent everywhere, not just on these two
+//
+// The two services that carried it are fixed, but the defect is a habit rather than an
+// incident. Asserting across every service is what stops the next one arriving.
+func TestCompose_ThirdPartyImagesArePinnedByTagAndDigest(t *testing.T) {
+	root := moduleRootDir(t)
+
+	// Third-party services whose image must name a version AND a digest. The Blnk services
+	// are excluded deliberately and covered by their own guard: their reference is an
+	// operator input with no shipped default, so there is no digest to assert here.
+	wantPinned := []string{"jaeger", "prometheus", "redis"}
+
+	digestPin := regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
+
+	for _, composeFile := range composeFiles {
+		t.Run(composeFile, func(t *testing.T) {
+			services := composeServices(t, filepath.Join(root, composeFile), composeFile)
+
+			t.Run("no service floats on a mutable tag", func(t *testing.T) {
+				for name, raw := range services {
+					declared, isMap := raw.(map[string]interface{})
+					if !isMap {
+						continue
+					}
+
+					image, isString := declared["image"].(string)
+					if !isString {
+						continue // built from source rather than pulled
+					}
+
+					assert.NotContainsf(t, image, ":latest",
+						"%s: service %q pins :latest, so the image a rebuilt stack runs is "+
+							"whatever the registry resolved to that morning", composeFile, name)
+				}
+			})
+
+			for _, name := range wantPinned {
+				t.Run(name+" names a version and a digest", func(t *testing.T) {
+					image := composeImageRef(t, services, name, composeFile)
+
+					assert.Regexpf(t, digestPin, image,
+						"%s: service %q must be pinned by digest (…@sha256:<64 hex>), not by "+
+							"tag alone — a tag can be repushed over a different image; got %q",
+						composeFile, name, image)
+
+					tag := image
+					if at := strings.Index(image, "@"); at >= 0 {
+						tag = image[:at]
+					}
+					assert.Containsf(t, tag, ":",
+						"%s: service %q must keep a human-readable version tag alongside the "+
+							"digest, so a reader can tell WHICH release is pinned; got %q",
+						composeFile, name, image)
+				})
+			}
+
+			t.Run("jaeger is on the supported v2 line", func(t *testing.T) {
+				image := composeImageRef(t, services, "jaeger", composeFile)
+
+				// jaegertracing/all-in-one is Jaeger v1, which reached end-of-life on
+				// 31 December 2025 and receives no further security patches — the image
+				// says so itself on startup. Pinning its digest would have frozen a
+				// knowingly unpatched image, so the pin has to be on the v2 repository.
+				assert.NotContainsf(t, image, "jaegertracing/all-in-one",
+					"%s: jaeger must not pin the v1 all-in-one image, which is end-of-life "+
+						"and unpatched; use the v2 jaegertracing/jaeger image", composeFile)
+				assert.Containsf(t, image, "jaegertracing/jaeger:2.",
+					"%s: jaeger must pin a v2 release; got %q", composeFile, image)
+			})
+
+			t.Run("no v1-only Jaeger switch is left behind", func(t *testing.T) {
+				declared, isMap := services["jaeger"].(map[string]interface{})
+				require.Truef(t, isMap, "%s must declare a jaeger service", composeFile)
+
+				// COLLECTOR_OTLP_ENABLED was the v1 switch for OTLP ingest. v2 enables OTLP
+				// by default and ignores the variable, so leaving it set would read as
+				// load-bearing configuration while doing nothing at all.
+				rendered := fmt.Sprintf("%v", declared["environment"])
+				assert.NotContainsf(t, rendered, "COLLECTOR_OTLP_ENABLED",
+					"%s: COLLECTOR_OTLP_ENABLED is a Jaeger v1 switch that v2 ignores — remove "+
+						"it rather than carry it as configuration that does nothing", composeFile)
+			})
+		})
+	}
+}
+
+// TestCompose_RedisIsPatchedAndCanBeAuthenticated is the CVE-2025-49844 guard.
+//
+// # What was wrong
+//
+// Both Compose files pinned redis:7.2.4 with no authentication. 7.2.4 is vulnerable to
+// CVE-2025-49844 ("RediShell", CVSS 10.0), a use-after-free in the Lua interpreter's garbage
+// collector that lets a client holding credentials escape the Lua sandbox and execute
+// arbitrary code on the host; the 7.2 line was fixed in 7.2.11. With no password, "holding
+// credentials" is satisfied by anyone who can reach the port, so the two halves compounded.
+//
+// # Why the version assertion is a floor and not an equality
+//
+// Pinning the exact string would make this test the thing that has to be edited on every
+// future upgrade, and a test that must be edited to allow a patch is a test that gets edited
+// carelessly. The floor is the property that matters: on the 7.2 line, at or above the patch
+// that carries the fix.
+//
+// # Why authentication is asserted as WIRED rather than as ON
+//
+// It is off by default, deliberately: 37 Go test files dial an unauthenticated localhost:6379
+// as a literal and the CI workflow publishes its redis service the same way, so requiring a
+// password unconditionally would break `make test` for a defect that lives in the image. What
+// must hold is that setting one variable turns it on — and that the compensating control for
+// the default, the loopback bind, is still there.
+func TestCompose_RedisIsPatchedAndCanBeAuthenticated(t *testing.T) {
+	root := moduleRootDir(t)
+
+	// The 7.2 line's fix for CVE-2025-49844. Everything from 7.2.0 to 7.2.10 is vulnerable.
+	const (
+		wantMajor = 7
+		wantMinor = 2
+		fixPatch  = 11
+	)
+
+	for _, composeFile := range composeFiles {
+		t.Run(composeFile, func(t *testing.T) {
+			services := composeServices(t, filepath.Join(root, composeFile), composeFile)
+			redis, isMap := services["redis"].(map[string]interface{})
+			require.Truef(t, isMap, "%s must declare a redis service", composeFile)
+
+			t.Run("the image carries the CVE-2025-49844 fix", func(t *testing.T) {
+				image := composeImageRef(t, services, "redis", composeFile)
+
+				var major, minor, patch int
+				_, err := fmt.Sscanf(strings.TrimPrefix(image, "redis:"), "%d.%d.%d",
+					&major, &minor, &patch)
+				require.NoErrorf(t, err,
+					"%s: the redis image must name an explicit x.y.z version so the guard can "+
+						"compare it against the CVE fix floor; got %q", composeFile, image)
+
+				assert.Equalf(t, wantMajor, major,
+					"%s: redis must stay on the %d.x line the stack is built against; got %q",
+					composeFile, wantMajor, image)
+				assert.Equalf(t, wantMinor, minor,
+					"%s: redis must stay on the %d.%d line, so an upgrade is fixes only and "+
+						"carries no changed defaults; got %q",
+					composeFile, wantMajor, wantMinor, image)
+				assert.GreaterOrEqualf(t, patch, fixPatch,
+					"%s: redis %d.%d.%d is vulnerable to CVE-2025-49844 (CVSS 10.0, Lua sandbox "+
+						"escape to RCE); the %d.%d line was fixed in %d.%d.%d. Blnk cannot apply "+
+						"the usual EVAL/EVALSHA denial mitigation because asynq and internal/lock "+
+						"both require Lua, so the upgrade is the only remediation available",
+					composeFile, major, minor, patch, wantMajor, wantMinor,
+					wantMajor, wantMinor, fixPatch)
+			})
+
+			t.Run("one variable turns authentication on at the server", func(t *testing.T) {
+				command := strings.Join(composeStringList(t, redis["command"]), " ")
+
+				assert.Containsf(t, command, "--requirepass",
+					"%s: the redis command must pass --requirepass when REDIS_PASSWORD is set, "+
+						"or there is no way to authenticate the server at all", composeFile)
+				assert.Containsf(t, command, "REDIS_PASSWORD",
+					"%s: --requirepass must read REDIS_PASSWORD, the one variable .env.example "+
+						"documents alongside the matching BLNK_REDIS_DNS form", composeFile)
+
+				// The unset case has to reproduce the image default rather than approximate
+				// it, because that default is what 37 test files and CI depend on.
+				assert.Containsf(t, command, "else exec redis-server",
+					"%s: with REDIS_PASSWORD empty the service must exec plain redis-server, "+
+						"which is what keeps the unauthenticated localhost:6379 contract the "+
+						"test suite and .github/workflows/go.yml rely on", composeFile)
+
+				// `exec` and not a wrapping shell: redis-server must be PID 1 so
+				// `docker stop` delivers SIGTERM to Redis rather than to sh.
+				assert.NotContainsf(t, command, "; redis-server",
+					"%s: redis-server must be exec'd so it is PID 1 and receives SIGTERM",
+					composeFile)
+
+				environment, isMap := redis["environment"].(map[string]interface{})
+				require.Truef(t, isMap,
+					"%s: the redis service must declare a mapping-form environment carrying "+
+						"REDIS_PASSWORD", composeFile)
+				password, declared := environment["REDIS_PASSWORD"]
+				require.Truef(t, declared,
+					"%s: the redis service must pass REDIS_PASSWORD through, or the command's "+
+						"branch can never see it", composeFile)
+				assert.Containsf(t, fmt.Sprintf("%v", password), "REDIS_PASSWORD",
+					"%s: REDIS_PASSWORD must be interpolated from the environment rather than "+
+						"inlined, so no password is ever committed here", composeFile)
+			})
+
+			t.Run("the healthcheck authenticates when a password is set", func(t *testing.T) {
+				test, isMap := redis["healthcheck"].(map[string]interface{})
+				require.Truef(t, isMap, "%s: the redis service must declare a healthcheck",
+					composeFile)
+
+				probe := strings.Join(composeStringList(t, test["test"]), " ")
+				assert.Containsf(t, probe, "REDIS_PASSWORD",
+					"%s: the healthcheck must authenticate when a password is set, or it reports "+
+						"NOAUTH and marks a healthy Redis unhealthy", composeFile)
+				assert.Containsf(t, probe, "ping",
+					"%s: the healthcheck must still be a PING", composeFile)
+			})
+
+			t.Run("the default stays bound to loopback", func(t *testing.T) {
+				ports := composeStringList(t, redis["ports"])
+				require.Lenf(t, ports, 1, "%s: redis must publish exactly one port mapping",
+					composeFile)
+
+				// The loopback bind is the compensating control for shipping without a
+				// password. Losing it while authentication is still opt-in would put an
+				// unauthenticated Redis holding TRANSACTION_QUEUE on the network.
+				assert.Containsf(t, ports[0], "REDIS_OUTER_HOST:-127.0.0.1",
+					"%s: redis must default to a 127.0.0.1 bind; authentication is opt-in, so "+
+						"the loopback default is what keeps the shipped stack safe", composeFile)
+			})
+		})
+	}
+}
+
+// TestCompose_ApplicationImageHasNoStaleDefault is the SEC-03 guard.
+//
+// # What was wrong
+//
+// docker-compose.yaml defaulted both the server and the worker to a published Blnk release.
+// Because that image really exists, `docker compose up` SUCCEEDED and handed the operator a
+// ledger built from code older than their checkout: no Kafka publishing, no outbox relay, no
+// /events endpoints, no subscriber registry, and no error explaining the absence. Every CVE
+// fixed after that release was present too.
+//
+// # Why the fix is "no default" rather than "a newer default"
+//
+// There is no digest that would be correct, because the image for the commit in the working
+// tree is not published. Any default at all reintroduces the same class of defect one release
+// later. So the image is an operator input, and the shipped fallback is a reference that
+// cannot resolve — `docker compose up server` stops with a message naming the variable
+// instead of running the wrong code.
+//
+// # Why interpolation must still succeed
+//
+// The `${VAR:?message}` form would have been the obvious way to demand a value, but Compose
+// interpolates the whole file for every command: it breaks `docker compose config` and the
+// infrastructure-only paths this project depends on, including `make kafka_provision` and
+// bringing up postgres or the broker alone. An unresolvable default gates starting the
+// application without gating anything else, which is why the guard asserts both halves.
+func TestCompose_ApplicationImageHasNoStaleDefault(t *testing.T) {
+	root := moduleRootDir(t)
+
+	// Both roles run the same binary. A default on one and not the other would give an
+	// operator two process roles from two different builds.
+	const composeFile = "docker-compose.yaml"
+
+	services := composeServices(t, filepath.Join(root, composeFile), composeFile)
+
+	for _, service := range []string{"server", "worker"} {
+		t.Run(service, func(t *testing.T) {
+			image := composeImageRef(t, services, service, composeFile)
+
+			assert.Truef(t, strings.HasPrefix(image, "${BLNK_IMAGE"),
+				"%s: service %q must take its image from BLNK_IMAGE, so both roles come from "+
+					"one operator-chosen build; got %q", composeFile, service, image)
+
+			assert.NotContainsf(t, image, "jerryenebeli/blnk:",
+				"%s: service %q must not fall back to a published release. That fallback "+
+					"resolves, so `docker compose up` succeeds and silently runs a build older "+
+					"than the checkout — with no Kafka publishing, no relay and no /events",
+				composeFile, service)
+
+			// The fallback must be present (so interpolation succeeds and infrastructure-only
+			// commands keep working) and must not be pullable (so starting the app fails
+			// closed). The sentinel is both.
+			assert.Containsf(t, image, ":-set-blnk-image-explicitly",
+				"%s: service %q must keep an unresolvable sentinel default. `${BLNK_IMAGE:?…}` "+
+					"would break `docker compose config` and every infrastructure-only command, "+
+					"because Compose interpolates the whole file whichever service you name; "+
+					"got %q", composeFile, service, image)
+			assert.NotContainsf(t, image, "/",
+				"%s: service %q sentinel must not look like a real repository path, or it could "+
+					"one day resolve to somebody's image; got %q", composeFile, service, image)
+		})
+	}
+
+	t.Run("the variable is documented where an operator will look", func(t *testing.T) {
+		assignments := envExampleAssignments(t, root)
+
+		value, declared := assignments["BLNK_IMAGE"]
+		require.True(t, declared,
+			".env.example must declare BLNK_IMAGE: it is now required to start the application, "+
+				"and a required variable that appears in no template is one an operator meets "+
+				"only as a pull failure")
+		assert.Empty(t, value,
+			".env.example must leave BLNK_IMAGE empty rather than suggest a release, which is "+
+				"the whole point of removing the default")
+	})
+
+	t.Run("the Redis password is documented with its DSN counterpart", func(t *testing.T) {
+		assignments := envExampleAssignments(t, root)
+
+		for _, key := range []string{"REDIS_PASSWORD", "REDIS_OUTER_HOST", "REDIS_OUTER_PORT"} {
+			_, declared := assignments[key]
+			assert.Truef(t, declared,
+				".env.example must declare %s: Compose reads it, and REDIS_PASSWORD only works "+
+					"when BLNK_REDIS_DNS carries the same value in its userinfo, so the two have "+
+					"to be documented together", key)
+		}
+
+		// The coupling is the part an operator gets wrong, so it must be stated in the file
+		// and not only in the compose comment.
+		template, err := os.ReadFile(filepath.Join(root, ".env.example"))
+		require.NoError(t, err)
+		assert.Contains(t, string(template), "redis://:",
+			".env.example must show the authenticated DSN form; a password set on the server "+
+				"without the matching BLNK_REDIS_DNS locks Blnk out of its own queue")
+	})
+}
+
+// k8sManifestContainer returns a named container from a Kubernetes workload manifest.
+//
+// The nested type assertions live here, once, rather than at each call site: written inline
+// they form a chain gofmt refuses to wrap, and an unreadable assertion is one nobody checks.
+func k8sManifestContainer(t *testing.T, root, manifest, container string) map[string]interface{} {
+	t.Helper()
+
+	document := readYAMLFile(t, filepath.Join(root, "infrastructure", "k8s-manifests", manifest))
+
+	spec, isMap := document["spec"].(map[string]interface{})
+	require.Truef(t, isMap, "%s must declare a spec", manifest)
+	template, isMap := spec["template"].(map[string]interface{})
+	require.Truef(t, isMap, "%s must declare spec.template", manifest)
+	podSpec, isMap := template["spec"].(map[string]interface{})
+	require.Truef(t, isMap, "%s must declare spec.template.spec", manifest)
+	containers, isList := podSpec["containers"].([]interface{})
+	require.Truef(t, isList, "%s must declare containers", manifest)
+
+	// initContainers are searched too: the server's migration runs as one, and a caller
+	// asking for it by name should not have to know which list it lives in.
+	if initContainers, declared := podSpec["initContainers"].([]interface{}); declared {
+		containers = append(containers, initContainers...)
+	}
+
+	for _, raw := range containers {
+		declared, isMap := raw.(map[string]interface{})
+		if isMap && declared["name"] == container {
+			return declared
+		}
+	}
+
+	require.FailNowf(t, "container not found", "%s declares no container named %q", manifest,
+		container)
+
+	return nil
+}
+
+// k8sManifestImage returns the image of a named container in a Kubernetes workload manifest.
+func k8sManifestImage(t *testing.T, root, manifest, container string) string {
+	t.Helper()
+
+	declared := k8sManifestContainer(t, root, manifest, container)
+
+	image, isString := declared["image"].(string)
+	require.Truef(t, isString, "%s: container %q must declare an image", manifest, container)
+
+	return strings.TrimSpace(image)
+}
+
+// TestKubernetesManifests_CarryTheSamePinsAsCompose is the projection-drift guard.
+//
+// # What was wrong
+//
+// The manifests under infrastructure/k8s-manifests are kompose projections of
+// docker-compose.yaml — their own annotations say so — so every image defect in the Compose
+// file was reproduced there. redis-deployment.yaml pinned the same CVE-2025-49844-vulnerable
+// redis:7.2.4 and jaeger-deployment.yaml the same end-of-life `all-in-one:latest`. Fixing the
+// Compose file alone would have left the cluster, which is the deployment that actually faces
+// a network, running the vulnerable images.
+//
+// # Why parity is the assertion rather than a second literal
+//
+// Restating the digest here would make two places to edit and one to forget. Comparing the
+// manifest against the Compose file it is derived from is the invariant that actually needs to
+// hold, and it fails whichever side is upgraded alone.
+//
+// # Scope
+//
+// redis, jaeger and prometheus — every service that appears in both projections. The Blnk
+// server and worker are excluded because their image is an operator input with no shipped
+// default on either side, so there is no pin to compare; TestKubernetesWorkloads_AreHardened
+// asserts their placeholder instead.
+func TestKubernetesManifests_CarryTheSamePinsAsCompose(t *testing.T) {
+	root := moduleRootDir(t)
+
+	// manifest -> the compose service whose pin it must match, keyed by container name.
+	projections := []struct {
+		manifest  string
+		container string
+		service   string
+	}{
+		{manifest: "redis-deployment.yaml", container: "redis", service: "redis"},
+		{manifest: "jaeger-deployment.yaml", container: "jaeger", service: "jaeger"},
+		{manifest: "prometheus-deployment.yaml", container: "prometheus", service: "prometheus"},
+	}
+
+	services := composeServices(t, filepath.Join(root, "docker-compose.yaml"),
+		"docker-compose.yaml")
+
+	for _, projection := range projections {
+		t.Run(projection.manifest, func(t *testing.T) {
+			manifestImage := k8sManifestImage(t, root, projection.manifest, projection.container)
+			composeImage := composeImageRef(t, services, projection.service,
+				"docker-compose.yaml")
+
+			assert.Equalf(t, composeImage, manifestImage,
+				"%s must pin the same image as the %q service in docker-compose.yaml. These "+
+					"manifests are kompose projections of that file, so a pin upgraded on one "+
+					"side and not the other leaves the cluster on the old image — and the "+
+					"cluster is the deployment that faces a network",
+				projection.manifest, projection.service)
+		})
+	}
+
+	t.Run("the cluster Redis can be authenticated from a Secret", func(t *testing.T) {
+		redis := k8sManifestContainer(t, root, "redis-deployment.yaml", "redis")
+
+		// A Service resolves from every pod that can reach the namespace, so the loopback
+		// bind that makes the Compose default safe has no equivalent here. The password
+		// must be reachable, and it must come from a Secret rather than this manifest.
+		rendered := fmt.Sprintf("%v", redis["env"])
+		assert.Containsf(t, rendered, "REDIS_PASSWORD",
+			"redis-deployment.yaml must accept a REDIS_PASSWORD; there is no loopback bind in "+
+				"a cluster, and Redis holds TRANSACTION_QUEUE")
+		assert.Containsf(t, rendered, "secretKeyRef",
+			"redis-deployment.yaml must read the password from a Secret, not from a literal or "+
+				"a ConfigMap")
+
+		args := strings.Join(composeStringList(t, redis["args"]), " ")
+		assert.Containsf(t, args, "--requirepass",
+			"redis-deployment.yaml must pass --requirepass when REDIS_PASSWORD is set")
+		assert.Containsf(t, args, "else exec redis-server",
+			"redis-deployment.yaml must still start plain redis-server when no password is "+
+				"provisioned, so applying this manifest to a cluster that has no Secret yet "+
+				"does not crash-loop it")
+	})
+
+	t.Run("no v1-only Jaeger switch survives in the cluster manifest", func(t *testing.T) {
+		jaeger := k8sManifestContainer(t, root, "jaeger-deployment.yaml", "jaeger")
+
+		rendered := fmt.Sprintf("%v", jaeger["env"])
+		assert.NotContains(t, rendered, "COLLECTOR_OTLP_ENABLED",
+			"COLLECTOR_OTLP_ENABLED is a Jaeger v1 switch that v2 ignores; carrying it forward "+
+				"reads as load-bearing configuration while doing nothing")
+	})
+}
+
+// k8sPodSpec returns the pod spec of a Kubernetes workload manifest.
+func k8sPodSpec(t *testing.T, root, manifest string) map[string]interface{} {
+	t.Helper()
+
+	document := readYAMLFile(t, filepath.Join(root, "infrastructure", "k8s-manifests", manifest))
+
+	spec, isMap := document["spec"].(map[string]interface{})
+	require.Truef(t, isMap, "%s must declare a spec", manifest)
+	template, isMap := spec["template"].(map[string]interface{})
+	require.Truef(t, isMap, "%s must declare spec.template", manifest)
+	podSpec, isMap := template["spec"].(map[string]interface{})
+	require.Truef(t, isMap, "%s must declare spec.template.spec", manifest)
+
+	return podSpec
+}
+
+// TestKubernetesWorkloads_AreHardened is the workload-hardening guard.
+//
+// # What was wrong
+//
+// Every application workload ran with the Kubernetes defaults, which are permissive by
+// design: root, a writable root filesystem, every capability the runtime grants, a mounted
+// ServiceAccount token, no resource requests or limits, and no probes. The Blnk image declares
+// no USER, so root was not a choice anyone made — it was what happened.
+//
+// # Why resources are the least obvious of these and not the least important
+//
+// With no requests the pods were BestEffort, so they were first to be evicted under node
+// pressure — the server owns the event relay and the worker drains TRANSACTION_QUEUE, so the
+// two most important processes were the two the kubelet would kill first. Requests also make
+// the existing HPAs work: server-hpa.yaml and worker-hpa.yaml scale on `Utilization`, which is
+// a percentage OF THE REQUEST, so with no request the autoscalers reported <unknown> and never
+// scaled. They were configured and inert.
+//
+// # Why the probes are asserted per workload rather than generically
+//
+// Each has a different correct target and getting it wrong is silent. The server answers GET /
+// unauthenticated. The worker's /health is registered directly on its monitoring mux and is
+// deliberately NOT wrapped in MetricsAuthHandler, so it is the only path there that does not
+// need a bearer token — probing /metrics would start reporting 401 as unhealthy the moment
+// secure mode was switched on. Prometheus distinguishes /-/ready from /-/healthy.
+func TestKubernetesWorkloads_AreHardened(t *testing.T) {
+	root := moduleRootDir(t)
+
+	workloads := []struct {
+		manifest  string
+		container string
+		probePath string
+		uid       int
+	}{
+		{manifest: "server-deployment.yaml", container: "server", probePath: "/", uid: 10001},
+		{manifest: "worker-deployment.yaml", container: "worker", probePath: "/health", uid: 10001},
+		{manifest: "prometheus-deployment.yaml", container: "prometheus", probePath: "/-/",
+			uid: 65534},
+	}
+
+	for _, workload := range workloads {
+		t.Run(workload.manifest, func(t *testing.T) {
+			podSpec := k8sPodSpec(t, root, workload.manifest)
+			container := k8sManifestContainer(t, root, workload.manifest, workload.container)
+
+			t.Run("runs as a non-root user under a restricted profile", func(t *testing.T) {
+				security, isMap := podSpec["securityContext"].(map[string]interface{})
+				require.Truef(t, isMap,
+					"%s must declare a pod securityContext; the image declares no USER, so "+
+						"without one the workload runs as root", workload.manifest)
+
+				assert.Equalf(t, true, security["runAsNonRoot"],
+					"%s must set runAsNonRoot, so an image later rebuilt as root fails to "+
+						"start rather than quietly gaining privilege", workload.manifest)
+				assert.EqualValuesf(t, workload.uid, security["runAsUser"],
+					"%s must pin runAsUser", workload.manifest)
+				assert.EqualValuesf(t, workload.uid, security["fsGroup"],
+					"%s must set fsGroup to the same id, or projected Secret material stays "+
+						"root-owned and unreadable to the process that needs it",
+					workload.manifest)
+
+				seccomp, isMap := security["seccompProfile"].(map[string]interface{})
+				require.Truef(t, isMap, "%s must declare a seccompProfile", workload.manifest)
+				assert.Equalf(t, "RuntimeDefault", seccomp["type"],
+					"%s must use the RuntimeDefault seccomp profile", workload.manifest)
+			})
+
+			t.Run("drops privilege at the container level", func(t *testing.T) {
+				security, isMap := container["securityContext"].(map[string]interface{})
+				require.Truef(t, isMap, "%s: container %q must declare a securityContext",
+					workload.manifest, workload.container)
+
+				assert.Equalf(t, false, security["allowPrivilegeEscalation"],
+					"%s must set allowPrivilegeEscalation: false", workload.manifest)
+				assert.Equalf(t, true, security["readOnlyRootFilesystem"],
+					"%s must set readOnlyRootFilesystem: true; every runtime write these "+
+						"workloads make has an explicit writable volume", workload.manifest)
+
+				capabilities, isMap := security["capabilities"].(map[string]interface{})
+				require.Truef(t, isMap, "%s must declare capabilities", workload.manifest)
+				assert.Equalf(t, []interface{}{"ALL"}, capabilities["drop"],
+					"%s must drop ALL capabilities; none of these processes needs one",
+					workload.manifest)
+			})
+
+			t.Run("mounts no ServiceAccount token", func(t *testing.T) {
+				// None of these workloads calls the Kubernetes API. The server is the
+				// process most exposed to the network and the worker processes untrusted
+				// transaction payloads off a queue, so a namespace-scoped credential is
+				// exactly what should not be sitting in either filesystem.
+				assert.Equalf(t, false, podSpec["automountServiceAccountToken"],
+					"%s must set automountServiceAccountToken: false", workload.manifest)
+			})
+
+			t.Run("declares requests and limits", func(t *testing.T) {
+				resources, isMap := container["resources"].(map[string]interface{})
+				require.Truef(t, isMap,
+					"%s: container %q must declare resources. Without requests the pod is "+
+						"BestEffort and first to be evicted, and the Utilization-based HPA "+
+						"cannot compute a percentage so it never scales",
+					workload.manifest, workload.container)
+
+				for _, field := range []string{"requests", "limits"} {
+					budget, isMap := resources[field].(map[string]interface{})
+					require.Truef(t, isMap, "%s must declare resources.%s",
+						workload.manifest, field)
+					assert.NotEmptyf(t, budget["cpu"], "%s: resources.%s.cpu must be set",
+						workload.manifest, field)
+					assert.NotEmptyf(t, budget["memory"],
+						"%s: resources.%s.memory must be set", workload.manifest, field)
+				}
+
+				// Equal on purpose: a Go heap or a TSDB given a limit above its request is
+				// OOMKilled under exactly the burst the request was sized for.
+				assert.Equalf(t,
+					resources["requests"].(map[string]interface{})["memory"],
+					resources["limits"].(map[string]interface{})["memory"],
+					"%s must request and limit the same memory", workload.manifest)
+			})
+
+			t.Run("declares all three probes against a reachable path", func(t *testing.T) {
+				for _, probe := range []string{"startupProbe", "readinessProbe",
+					"livenessProbe"} {
+					declared, isMap := container[probe].(map[string]interface{})
+					require.Truef(t, isMap, "%s: container %q must declare a %s",
+						workload.manifest, workload.container, probe)
+
+					get, isMap := declared["httpGet"].(map[string]interface{})
+					require.Truef(t, isMap, "%s: %s must be an httpGet probe",
+						workload.manifest, probe)
+
+					path, isString := get["path"].(string)
+					require.True(t, isString, "%s: %s must name a path",
+						workload.manifest, probe)
+					assert.Truef(t, strings.HasPrefix(path, workload.probePath),
+						"%s: %s must probe an UNAUTHENTICATED path under %q, or it reports "+
+							"401 as unhealthy once secure mode is on; got %q",
+						workload.manifest, probe, workload.probePath, path)
+
+					// A named port survives a renumbering; a literal does not.
+					assert.IsTypef(t, "", get["port"],
+						"%s: %s must target the port by NAME", workload.manifest, probe)
+				}
+
+				// Liveness must be the most forgiving of the three: readiness drains a
+				// stalled pod from its Service, and only a truly wedged one should be
+				// restarted — restarting the server discards the relay lease it holds.
+				liveness := container["livenessProbe"].(map[string]interface{})
+				readiness := container["readinessProbe"].(map[string]interface{})
+				assert.Greaterf(t, liveness["failureThreshold"], readiness["failureThreshold"],
+					"%s: livenessProbe.failureThreshold must exceed readinessProbe's, so "+
+						"traffic drains before the process is killed", workload.manifest)
+			})
+		})
+	}
+
+	t.Run("the Blnk workloads exec the binary directly", func(t *testing.T) {
+		// PID 1 has to be blnk. The server container previously started as
+		// `/bin/sh -c "blnk migrate up ... && blnk start ..."`, and sh does not forward
+		// signals: the SIGTERM Kubernetes sends on every rollout went to the shell, so
+		// cmd/server.go's handler — which drains the lineage and event relays and closes
+		// the database pool — never ran and the process was SIGKILLed at the end of the
+		// grace period.
+		for _, workload := range []struct{ manifest, container string }{
+			{manifest: "server-deployment.yaml", container: "server"},
+			{manifest: "worker-deployment.yaml", container: "worker"},
+		} {
+			container := k8sManifestContainer(t, root, workload.manifest, workload.container)
+			command := composeStringList(t, container["command"])
+
+			require.NotEmptyf(t, command, "%s: container %q must declare a command",
+				workload.manifest, workload.container)
+			assert.Equalf(t, "blnk", command[0],
+				"%s: container %q must exec blnk directly so it is PID 1 and receives "+
+					"SIGTERM; a /bin/sh -c wrapper swallows the signal and the graceful "+
+					"shutdown never runs", workload.manifest, workload.container)
+			assert.NotContainsf(t, strings.Join(command, " "), "&&",
+				"%s: chaining with && requires a shell, which reintroduces the swallowed "+
+					"signal. Run migrations in an init container instead",
+				workload.manifest, workload.container)
+		}
+
+		// The migration still has to happen, and before the server serves.
+		podSpec := k8sPodSpec(t, root, "server-deployment.yaml")
+		initContainers, isList := podSpec["initContainers"].([]interface{})
+		require.Truef(t, isList,
+			"server-deployment.yaml must run the migration as an init container, which is "+
+				"both what frees the server container to exec directly and what stops a "+
+				"server serving against a half-migrated schema")
+
+		migrate := initContainers[0].(map[string]interface{})
+		assert.Contains(t, composeStringList(t, migrate["command"]), "migrate",
+			"the init container must run the migration")
+
+		// Two builds would migrate to one schema and serve against another.
+		server := k8sManifestContainer(t, root, "server-deployment.yaml", "server")
+		assert.Equal(t, server["image"], migrate["image"],
+			"the migration init container and the server must run the SAME image; different "+
+				"builds would migrate to one schema and serve against another")
+	})
+
+	t.Run("the application image is an operator input with no stale default", func(t *testing.T) {
+		// Same defect and same resolution as docker-compose.yaml: the manifests deployed
+		// jerryenebeli/blnk:0.13.3, a real published image built before this
+		// implementation, so `kubectl apply` succeeded and the cluster ran a binary with
+		// no relay and no /events beside a ConfigMap full of KAFKA_* keys it had never
+		// heard of.
+		for _, workload := range []struct{ manifest, container string }{
+			{manifest: "server-deployment.yaml", container: "server"},
+			{manifest: "server-deployment.yaml", container: "migrate"},
+			{manifest: "worker-deployment.yaml", container: "worker"},
+		} {
+			image := k8sManifestImage(t, root, workload.manifest, workload.container)
+
+			assert.NotContainsf(t, image, "jerryenebeli/blnk:",
+				"%s: container %q must not deploy a published release built before this "+
+					"implementation", workload.manifest, workload.container)
+			assert.Containsf(t, image, "REPLACE_WITH_PINNED_DIGEST",
+				"%s: container %q must carry a placeholder an operator has to replace with "+
+					"this commit's digest; got %q",
+				workload.manifest, workload.container, image)
+		}
+	})
+}
+
+// TestKubernetesConfig_ProjectsCredentialsFromSecrets is the SEC-01 and SEC-07 guard.
+//
+// # What was wrong
+//
+// Two defects that compounded. The manifests projected no authentication settings at all, and
+// api/middleware/auth.go calls c.Next() BEFORE looking for a credential whenever
+// Server.Secure is false — so a cluster deployed from these files served the whole ledger API
+// to anyone who could reach it: create transactions, read every identity, mint API keys. And
+// the ConfigMap carried the PostgreSQL password in plaintext with sslmode=disable, in an object
+// stored unencrypted, readable by anything with get-configmap, and printed in full by
+// `kubectl describe`.
+//
+// # Why the assertions are split between "in a Secret" and "not in the ConfigMap"
+//
+// Adding a Secret reference does not remove a committed credential. Both halves have to hold
+// or the credential is simply in two places, and the ConfigMap copy is the readable one.
+func TestKubernetesConfig_ProjectsCredentialsFromSecrets(t *testing.T) {
+	root := moduleRootDir(t)
+
+	configMap := readYAMLFile(t, filepath.Join(root, "infrastructure", "k8s-manifests",
+		"blnk-config.yaml"))
+	data, isMap := configMap["data"].(map[string]interface{})
+	require.True(t, isMap, "blnk-config.yaml must declare a data map")
+
+	t.Run("secure mode is on, so authentication is actually enforced", func(t *testing.T) {
+		// This single key decides whether the API asks for a credential at all.
+		assert.Equal(t, "true", data["BLNK_SERVER_SECURE"],
+			"blnk-config.yaml must set BLNK_SERVER_SECURE to \"true\". false is the zero "+
+				"value, and auth.go admits every request unauthenticated when it is false")
+	})
+
+	t.Run("the ConfigMap carries no credential", func(t *testing.T) {
+		rendered := fmt.Sprintf("%v", data)
+
+		assert.NotContains(t, rendered, "sslmode=disable",
+			"blnk-config.yaml must not ship sslmode=disable: that is not a weak cipher, it "+
+				"is no cipher — every ledger row, and the password on the first exchange, "+
+				"crosses the pod network in cleartext")
+		assert.Contains(t, rendered, "sslmode=verify-full",
+			"the committed DSN must use verify-full, the only mode that also verifies the "+
+				"server certificate matches the host being dialled")
+		assert.NotContains(t, rendered, ":password@",
+			"blnk-config.yaml must not embed a database password; a ConfigMap is stored "+
+				"unencrypted and printed in full by `kubectl describe`")
+		assert.NotContains(t, rendered, "blnk-api-key",
+			"blnk-config.yaml must not embed the published TypeSense literal")
+
+		// Absence is required rather than merely tolerated: an authenticated Redis DSN
+		// carries its password in the userinfo, so the DSN itself is a credential.
+		_, declared := data["BLNK_REDIS_DNS"]
+		assert.False(t, declared,
+			"BLNK_REDIS_DNS must not be a ConfigMap key; it is Secret-projected in both "+
+				"Deployments because an authenticated DSN carries its password inline")
+	})
+
+	t.Run("the Deployments project every credential from a Secret", func(t *testing.T) {
+		// key -> the workloads that must project it. The master key is server-only on
+		// purpose: nothing in the worker role authenticates an inbound API caller, so the
+		// key would be an unused credential in a pod that processes untrusted payloads.
+		wantSecretEnv := map[string][]string{
+			"BLNK_SERVER_SECRET_KEY":    {"server"},
+			"BLNK_METRICS_BEARER_TOKEN": {"server", "worker"},
+			"BLNK_DATA_SOURCE_DNS":      {"server", "worker"},
+			"BLNK_REDIS_DNS":            {"server", "worker"},
+			"BLNK_TYPESENSE_KEY":        {"server", "worker"},
+		}
+
+		for key, roles := range wantSecretEnv {
+			for _, role := range roles {
+				container := k8sManifestContainer(t, root, role+"-deployment.yaml", role)
+
+				entries, isList := container["env"].([]interface{})
+				require.Truef(t, isList, "%s must declare env", role)
+
+				var found map[string]interface{}
+				for _, raw := range entries {
+					entry, isMap := raw.(map[string]interface{})
+					if isMap && entry["name"] == key {
+						found = entry
+
+						break
+					}
+				}
+				require.NotNilf(t, found, "the %s must project %s", role, key)
+
+				from, isMap := found["valueFrom"].(map[string]interface{})
+				require.Truef(t, isMap, "%s: %s must use valueFrom, never an inline value",
+					role, key)
+				_, fromSecret := from["secretKeyRef"]
+				assert.Truef(t, fromSecret,
+					"%s: %s must come from a secretKeyRef, not a ConfigMap — it is a "+
+						"credential, and a ConfigMap is readable by anything holding "+
+						"get-configmap in the namespace", role, key)
+			}
+		}
+
+		// The master key must NOT reach the worker, and that asymmetry is deliberate.
+		worker := k8sManifestContainer(t, root, "worker-deployment.yaml", "worker")
+		assert.NotContains(t, fmt.Sprintf("%v", worker["env"]), "BLNK_SERVER_SECRET_KEY",
+			"the worker must not receive the master key: it authenticates no inbound API "+
+				"caller, so the key would be an unused credential inside the pod that "+
+				"processes untrusted transaction payloads")
+	})
+
+	t.Run("the server is not published in plaintext", func(t *testing.T) {
+		service := readYAMLFile(t, filepath.Join(root, "infrastructure", "k8s-manifests",
+			"server-service.yaml"))
+		spec, isMap := service["spec"].(map[string]interface{})
+		require.True(t, isMap, "server-service.yaml must declare a spec")
+
+		// Blnk terminates no TLS — cmd/server.go always uses plain ListenAndServe and
+		// serveTLS is unreachable dead code — so a LoadBalancer on this Service published
+		// unencrypted HTTP straight to the internet, carrying the master key in a header
+		// and one-time SCRAM passwords in response bodies.
+		assert.Equal(t, "ClusterIP", spec["type"],
+			"server-service.yaml must be ClusterIP. Blnk terminates no TLS, so exposing it "+
+				"directly publishes plaintext HTTP; terminate at an Ingress instead")
+
+		ports, isList := spec["ports"].([]interface{})
+		require.True(t, isList, "server-service.yaml must declare ports")
+		for _, raw := range ports {
+			port := raw.(map[string]interface{})
+			assert.NotContainsf(t, []interface{}{80, 443}, port["port"],
+				"server-service.yaml must not publish port %v: nothing listens on it, "+
+					"because the CertMagic path those ports were for is dead code",
+				port["port"])
+		}
+	})
+}
+
+// mebibytes parses the subset of Kubernetes and JVM size suffixes these manifests use.
+//
+// Returning bytes-as-MiB rather than a resource.Quantity keeps the comparison below
+// dependency-free: the guard needs to know whether one number is smaller than another, not to
+// reimplement quantity arithmetic.
+func mebibytes(t *testing.T, value string) int {
+	t.Helper()
+
+	var size int
+	var suffix string
+	_, err := fmt.Sscanf(value, "%d%s", &size, &suffix)
+	require.NoErrorf(t, err, "cannot read %q as a size", value)
+
+	switch strings.ToLower(suffix) {
+	case "mi", "m":
+		return size
+	case "gi", "g":
+		return size * 1024
+	default:
+		require.Failf(t, "unsupported size suffix", "%q in %q", suffix, value)
+
+		return 0
+	}
+}
+
+// TestKafkaStatefulSet_CanColdStartAndIsHardened guards the four defects that made the broker
+// set unable to start, unable to read its own keystore, and unbounded.
+//
+// # SEC-04, and why OrderedReady was a deadlock rather than a preference
+//
+// OrderedReady creates kafka-1 only after kafka-0 is READY, and kafka-0's readiness probe is an
+// authenticated kafka-topics.sh --list, which needs a metadata response, which needs the KRaft
+// controller quorum to have elected a leader. The voter list enumerates all three replicas, so
+// a majority is two — and with only kafka-0 running there is one voter of three. No majority,
+// no leader, no readiness, so kafka-1 is never created and the quorum can never reach two. The
+// set never starts and never explains why.
+//
+// # SEC-05, and why the keystore mode and the fsGroup are one assertion
+//
+// A Secret volume's files are owned by root with their group taken from the pod's fsGroup.
+// Mode 0400 is owner-read-only, and the apache/kafka image runs as uid 1000 — so the broker
+// could not open its own keystore. Both listeners are SASL_SSL, so that is not degradation: TLS
+// initialisation fails and no listener binds. Group-readable mode without an fsGroup is equally
+// useless, and an fsGroup without group-readable mode likewise, which is why neither is
+// asserted alone.
+//
+// # SEC-11
+//
+// Neither container declared a security context or a resource budget, and the heap was an
+// invisible 1G default from kafka-server-start.sh. A memory limit chosen without reference to
+// that default is an OOMKill under load, so the two are asserted against each other rather than
+// merely asserted present.
+//
+// # SEC-17
+//
+// The hard half is enforced here: required hostname anti-affinity, so three replicas of a
+// replication-factor-3 cluster cannot land on one node and be lost together. Dedicated
+// controllers remain a documented scaling step rather than a guarded property, because that is
+// a multi-manifest topology change.
+func TestKafkaStatefulSet_CanColdStartAndIsHardened(t *testing.T) {
+	root := moduleRootDir(t)
+
+	const manifest = "kafka-statefulset.yaml"
+
+	document := readYAMLFile(t, filepath.Join(root, "infrastructure", "k8s-manifests", manifest))
+	spec, isMap := document["spec"].(map[string]interface{})
+	require.True(t, isMap, "kafka-statefulset.yaml must declare a spec")
+
+	podSpec := k8sPodSpec(t, root, manifest)
+	bootstrap := k8sManifestContainer(t, root, manifest, "kafka-bootstrap")
+	broker := k8sManifestContainer(t, root, manifest, "kafka")
+
+	t.Run("a multi-voter quorum can cold-start", func(t *testing.T) {
+		replicas, isInt := spec["replicas"].(int)
+		require.True(t, isInt, "kafka-statefulset.yaml must declare replicas")
+
+		if replicas > 1 {
+			assert.Equal(t, "Parallel", spec["podManagementPolicy"],
+				"with more than one replica the pods MUST be created in parallel. Under "+
+					"OrderedReady, kafka-0's readiness probe needs a KRaft quorum majority "+
+					"that cannot exist until kafka-1 is created, and kafka-1 is not created "+
+					"until kafka-0 is Ready — the set never starts")
+		}
+
+		// The startup probe is what buys formatting and election their time; without it,
+		// parallel start would be killed by liveness mid-bootstrap.
+		startup, isMap := broker["startupProbe"].(map[string]interface{})
+		require.True(t, isMap,
+			"the broker must keep a startupProbe: on a cold cluster it is not listening "+
+				"until storage is formatted and a leader elected, and without one liveness "+
+				"restarts it for being slow rather than broken")
+		assert.GreaterOrEqual(t, startup["failureThreshold"], 12,
+			"the startup budget must be generous enough for quorum formation")
+	})
+
+	t.Run("replicas cannot be co-located", func(t *testing.T) {
+		affinity, isMap := podSpec["affinity"].(map[string]interface{})
+		require.True(t, isMap,
+			"kafka-statefulset.yaml must declare anti-affinity. Three replicas on one node "+
+				"is three replicas of nothing: min.insync.replicas=2 is satisfied by copies "+
+				"that die together, and the node loss takes the whole controller quorum with "+
+				"the data")
+
+		anti, isMap := affinity["podAntiAffinity"].(map[string]interface{})
+		require.True(t, isMap, "podAntiAffinity is required")
+		required, isList := anti["requiredDuringSchedulingIgnoredDuringExecution"].([]interface{})
+		require.Truef(t, isList,
+			"the anti-affinity must be requiredDuringScheduling, not preferred: a preference "+
+				"the scheduler may ignore is the defect, not the fix")
+
+		rule := required[0].(map[string]interface{})
+		assert.Equal(t, "kubernetes.io/hostname", rule["topologyKey"],
+			"the anti-affinity must key on hostname, which every node carries")
+
+		// The spread constraint has to agree with the anti-affinity rather than tolerate
+		// what it forbids.
+		constraints, isList := podSpec["topologySpreadConstraints"].([]interface{})
+		require.True(t, isList, "the topology spread constraint must survive")
+		constraint := constraints[0].(map[string]interface{})
+		assert.Equal(t, "DoNotSchedule", constraint["whenUnsatisfiable"],
+			"the spread constraint must be DoNotSchedule so it agrees with the hard "+
+				"anti-affinity; ScheduleAnyway only ever protected a single-node cluster "+
+				"that could not honour replication factor 3 in the first place")
+	})
+
+	t.Run("the broker can read its own keystore", func(t *testing.T) {
+		security, isMap := podSpec["securityContext"].(map[string]interface{})
+		require.True(t, isMap, "kafka-statefulset.yaml must declare a pod securityContext")
+
+		assert.Equal(t, true, security["runAsNonRoot"], "the broker must not run as root")
+		// 1000 is the apache/kafka image's own appuser, so the PVC and the pre-existing
+		// log directory keep their ownership across an upgrade.
+		assert.EqualValues(t, 1000, security["runAsUser"],
+			"runAsUser must be the image's appuser uid (1000), or the persistent volume's "+
+				"existing ownership stops matching the process")
+		assert.EqualValues(t, security["runAsUser"], security["fsGroup"],
+			"fsGroup must equal runAsUser: it is what gives the projected Secret files a "+
+				"group the broker belongs to")
+
+		volumes, isList := podSpec["volumes"].([]interface{})
+		require.True(t, isList, "volumes must be declared")
+
+		var tlsMode int
+		for _, raw := range volumes {
+			volume := raw.(map[string]interface{})
+			if volume["name"] != "kafka-tls" {
+				continue
+			}
+			secret := volume["secret"].(map[string]interface{})
+			mode, isInt := secret["defaultMode"].(int)
+			require.True(t, isInt, "the kafka-tls volume must pin a defaultMode")
+			tlsMode = mode
+		}
+		require.NotZero(t, tlsMode, "the kafka-tls volume must be declared")
+
+		// YAML parses a leading-zero literal as octal, so 0440 arrives as 288.
+		assert.NotZerof(t, tlsMode&0o040,
+			"the kafka-tls material must be GROUP-readable (mode & 040). Secret files are "+
+				"owned by root with the group taken from fsGroup, so an owner-only mode like "+
+				"0400 leaves the broker unable to open its keystore — and because both "+
+				"listeners are SASL_SSL, it then binds no listener at all. Got %#o", tlsMode)
+		assert.Zerof(t, tlsMode&0o004,
+			"the kafka-tls material must NOT be world-readable: a private key readable by "+
+				"any uid in the pod defeats the point of projecting it. Got %#o", tlsMode)
+	})
+
+	t.Run("both containers are restricted and bounded", func(t *testing.T) {
+		assert.Equal(t, false, podSpec["automountServiceAccountToken"],
+			"the broker never calls the Kubernetes API — its peers come from the static "+
+				"KRaft voter list — so the token must not be mounted")
+
+		for name, container := range map[string]map[string]interface{}{
+			"kafka-bootstrap": bootstrap,
+			"kafka":           broker,
+		} {
+			security, isMap := container["securityContext"].(map[string]interface{})
+			require.Truef(t, isMap, "%s must declare a securityContext", name)
+			assert.Equalf(t, false, security["allowPrivilegeEscalation"],
+				"%s must set allowPrivilegeEscalation: false", name)
+			assert.Equalf(t, true, security["readOnlyRootFilesystem"],
+				"%s must set readOnlyRootFilesystem: true", name)
+			assert.Equalf(t, []interface{}{"ALL"},
+				security["capabilities"].(map[string]interface{})["drop"],
+				"%s must drop ALL capabilities", name)
+
+			resources, isMap := container["resources"].(map[string]interface{})
+			require.Truef(t, isMap,
+				"%s must declare resources. A pod's QoS class is computed across ALL its "+
+					"containers including init ones, so an unbounded init container makes "+
+					"the broker BestEffort however the broker itself is sized", name)
+			for _, field := range []string{"requests", "limits"} {
+				budget, isMap := resources[field].(map[string]interface{})
+				require.Truef(t, isMap, "%s must declare resources.%s", name, field)
+				assert.NotEmptyf(t, budget["cpu"], "%s: resources.%s.cpu", name, field)
+				assert.NotEmptyf(t, budget["memory"], "%s: resources.%s.memory", name, field)
+			}
+
+			// kafka-run-class.sh writes log4j output to /opt/kafka/logs inside the image,
+			// which a read-only root filesystem forbids. kafka-authorizer.log in
+			// particular is the record of every StandardAuthorizer denial — the evidence
+			// a subscriber-isolation investigation reads.
+			var logDirMounted bool
+			for _, raw := range container["volumeMounts"].([]interface{}) {
+				if raw.(map[string]interface{})["mountPath"] == "/opt/kafka/logs" {
+					logDirMounted = true
+				}
+			}
+			assert.Truef(t, logDirMounted,
+				"%s must mount a writable volume at /opt/kafka/logs; kafka-run-class.sh "+
+					"mkdir -p's it and writes there, which a read-only root forbids", name)
+		}
+	})
+
+	t.Run("the heap fits inside the memory limit", func(t *testing.T) {
+		var heap string
+		for _, raw := range broker["env"].([]interface{}) {
+			entry := raw.(map[string]interface{})
+			if entry["name"] == "KAFKA_HEAP_OPTS" {
+				heap, _ = entry["value"].(string)
+			}
+		}
+		require.NotEmptyf(t, heap,
+			"the broker must state KAFKA_HEAP_OPTS. kafka-server-start.sh exports "+
+				"-Xmx1G -Xms1G when it is unset, so the heap is 1G whether or not anyone "+
+				"chose it — and a memory limit set without reference to that is an OOMKill "+
+				"under load")
+
+		var xmx string
+		for _, option := range strings.Fields(heap) {
+			if strings.HasPrefix(option, "-Xmx") {
+				xmx = strings.TrimPrefix(option, "-Xmx")
+			}
+		}
+		require.NotEmptyf(t, xmx, "KAFKA_HEAP_OPTS must set -Xmx; got %q", heap)
+
+		limit := broker["resources"].(map[string]interface{})["limits"].(map[string]interface{})
+		limitMiB := mebibytes(t, limit["memory"].(string))
+		heapMiB := mebibytes(t, xmx)
+
+		assert.Lessf(t, heapMiB, limitMiB,
+			"the JVM heap (%dMiB) must be smaller than the container memory limit (%dMiB), "+
+				"or the kernel kills the broker before the heap is full", heapMiB, limitMiB)
+		// Off-heap is not a rounding error for a broker: metaspace, thread stacks and the
+		// direct byte buffers every network and log read allocates all live outside -Xmx.
+		assert.LessOrEqualf(t, heapMiB*2, limitMiB,
+			"the memory limit (%dMiB) must be at least twice the heap (%dMiB) to leave room "+
+				"for metaspace, thread stacks, direct byte buffers and page cache",
+			limitMiB, heapMiB)
+	})
 }

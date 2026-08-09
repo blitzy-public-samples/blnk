@@ -26,7 +26,7 @@ generate:
 test:
 	go test -short  ./...
 
-# Mutation testing on the money-critical fast packages.
+# Mutation testing on the money-critical fast packages (model, filter).
 # Plants hundreds of one-line bugs and re-runs the tests against each one;
 # a "LIVED" mutant is a bug the test suite would not catch. Fails when test
 # efficacy (killed/viable mutants) drops below the threshold. Takes ~10 min.
@@ -47,13 +47,37 @@ test:
 # 500, so the mapping is exactly the kind of one-line fact a mutant can flip
 # without any test noticing.
 #
-# The ROOT package's event_*.go files are DELIBERATELY NOT a target, and the
-# reason is arithmetic rather than preference. gremlins re-runs the covering
-# test binary once per mutant; the root package's suite takes ~90 seconds, and
-# the event files carry several hundred mutants, so one pass would run for many
-# hours. A gate documented as taking ten minutes cannot host it. Those files are
-# covered instead by the unit, live-broker and real-database tests beside them,
-# and their behavioural coverage is asserted there rather than scored here.
+# The EVENT AND OUTBOX code IS scored, at this same threshold, by the separate
+# `mutate_events` target. The AAP requires it (§0.7.2: new code in the event and
+# outbox paths must meet the same bar as existing money-critical packages), and
+# it is a separate target for a measured reason rather than an excuse. A dry run
+# of the two event scopes reports:
+#
+#   .        1,140 runnable, 147 not covered, 88.58% mutator coverage
+#            (event_admin 408, event_subscriber 197, event_dlt 165,
+#            event_relay 137, event_publisher 114, event_outbox 72,
+#            event_metrics 49, event_sunset 38, event_retention 30,
+#            event_topics 28, event_metrics_support 26,
+#            event_publisher_telemetry 23)
+#   database 218 runnable, 66 not covered, 76.76% mutator coverage
+#            (event_outbox 180, event_subscriber 104 planted)
+#
+# gremlins re-runs the mutated file's PACKAGE test binary once per mutant. On a
+# 4-CPU machine the root suite takes ~46s under -short and ~120s without it, and
+# database's ~33s and ~45s. 1,358 runnable mutants at those rates is hours, not
+# minutes, however many workers are used.
+#
+# So the split is by RUNTIME, not by importance: `mutate` stays the ten-minute
+# gate it documents itself as, `mutate_events` is the long-running one, and
+# `mutate_all` runs both so that neither is silently skipped. The event target
+# scores ONLY the event and outbox files — every other file in those two packages
+# is excluded — so its runtime buys event coverage rather than re-scoring code
+# already covered above.
+#
+# THE GATE LOGIC EXISTS EXACTLY ONCE, in the `mutation_gate` recipe below, which
+# the three targets reach through a target-specific SCOPES variable. A second
+# copy specialised for the event scopes is how the two would drift until only one
+# of them enforced the threshold.
 #
 # A statement whose ONLY coverage comes from another package is reported
 # NOT COVERED and is never scored, because gremlins scores a package by running
@@ -73,10 +97,17 @@ test:
 # COVERED even though the line is evaluated on every call. Those arms ARE tested,
 # behaviourally, in model/event_predicates_test.go; they just cannot be scored.
 #
-# One mutant in model LIVES and always will: the `>=` in
-# EventOutboxAudit.UnconfirmedRows. Weakening it to `>` produces identical
-# behaviour, because when the two counts are equal the fall-through subtraction
-# returns zero anyway. It is a semantically equivalent mutant, not a missing test.
+# Three mutants in model/event.go LIVE and always will, and all three sit on the
+# same shape: a guard that clamps an arithmetic result at zero, in
+# PartitionOffsetInterval.Records, EventRecordIntervalAudit.UncorroboratedRows and
+# EventRecordIntervalAudit.DuplicatedRecords. Each reads `if <value> < 0 { return 0 }`
+# (or `<=` against the interval's own lower bound), and relaxing the comparison by
+# one produces identical behaviour, because in the single case the mutation newly
+# admits the value is exactly zero and the fall-through returns zero anyway. They are
+# semantically equivalent mutants, not missing tests, so no boundary test can kill
+# them: the two branches compute the same answer. The clamps are kept because they
+# state the invariant the callers rely on — none of the three quantities can be
+# negative — where a reader looks for it.
 #
 # GOFLAGS=-p=1 IS LOAD-BEARING, not tidiness. Before scoring anything gremlins
 # gathers coverage by running the WHOLE module's test suite, and this repository's
@@ -88,10 +119,71 @@ test:
 # (.github/workflows/go.yml runs `go test -race -p 1 ./...`), and it costs about
 # two minutes of a ten-minute gate.
 MUTATION_THRESHOLD=80
-MUTATION_PACKAGES=model internal/filter internal/apierror
-mutate:
+
+# A SCOPE is "directory:filter".
+#
+#   filter=all   score every file gremlins finds from that directory down
+#   filter=event score only that directory's OWN event/outbox files
+#
+# `-E /` IS LOAD-BEARING, and it is the whole reason filter=event is not simply a
+# list of files to skip. `gremlins unleash` walks the directory tree DOWNWARD from
+# where it runs, not just the package it was pointed at — run from the repository
+# root it plants mutants in api/, cmd/, database/, internal/ and model/ too, and a
+# scope that only listed the root's own non-event files would silently score the
+# entire module. Excluding any filepath containing a slash confines the run to the
+# directory's own files, and the per-file excludes then narrow that to the event
+# ones. This is invisible for the three filter=all scopes because none of them has
+# a subpackage.
+#
+# The filter exists because the event code lives in two packages it shares with a
+# great deal of other code — the repository root and database/ — and the AAP fixes
+# those paths (§0.5.1 lists event_publisher.go, event_relay.go, event_dlt.go and
+# the rest at the repository ROOT, and database/event_outbox.go alongside the
+# other repositories). Extracting them into packages of their own to make them
+# separately scorable is therefore not available: it would move files the AAP
+# places. Filtering the mutant set is how they get scored where they are.
+MUTATION_FAST_SCOPES=model:all internal/filter:all internal/apierror:all
+MUTATION_EVENT_SCOPES=.:event database:event
+
+# Per-mutant test timeout, as a multiple of the measured baseline. 8 for every
+# scope, and raising it for the event scopes was TRIED AND REJECTED on evidence.
+#
+# database:event at coefficient 8 completes in 13 minutes and reports Killed 32,
+# Lived 0, Not covered 66, TIMED OUT 186. The timeouts are not a tight-timeout
+# artefact: at coefficient 40 the same scope had not reported a single mutant after
+# 40 minutes. They are genuine hangs — this scope mutates the outbox claim query and
+# the retry loops, against a REAL PostgreSQL, so a mutant that inverts a loop
+# condition or a lock predicate blocks on a row lock rather than failing. Five times
+# the patience buys five times the waiting and the same verdict.
+#
+# So 8 is the operating point, and the honest consequence is reported rather than
+# hidden: see the inconclusive-mutant report in the recipe. A TIMED OUT mutant is
+# EXCLUDED from gremlins' efficacy ratio rather than counted as survived, so a green
+# efficacy line on this scope describes the CONCLUSIVE subset and the recipe says so
+# in as many words. What still fails the build is what should: an efficacy below the
+# threshold, and a run that produced no score at all.
+MUTATION_TIMEOUT_COEFFICIENT=8
+
+mutate: SCOPES=${MUTATION_FAST_SCOPES}
+mutate: mutation_gate
+
+# Score the event and outbox surface at the same threshold. Long-running by
+# construction — see the note above the threshold for the measured numbers.
+mutate_events: SCOPES=${MUTATION_EVENT_SCOPES}
+mutate_events: mutation_gate
+
+# Everything the repository gates on, in one run.
+mutate_all: SCOPES=${MUTATION_FAST_SCOPES} ${MUTATION_EVENT_SCOPES}
+mutate_all: mutation_gate
+
+mutation_gate:
 	@command -v gremlins >/dev/null 2>&1 || go install github.com/go-gremlins/gremlins/cmd/gremlins@latest
 	@set -e; \
+	if [ -z "${SCOPES}" ]; then \
+		echo "mutation_gate is not a target to invoke directly: it scores whatever SCOPES names,"; \
+		echo "and nothing named any. Use 'make mutate', 'make mutate_events' or 'make mutate_all'."; \
+		exit 1; \
+	fi; \
 	gremlins_bin=$$(command -v gremlins 2>/dev/null || true); \
 	if [ -z "$$gremlins_bin" ]; then gremlins_bin="$$(go env GOPATH)/bin/gremlins"; fi; \
 	if [ ! -x "$$gremlins_bin" ]; then \
@@ -102,24 +194,56 @@ mutate:
 	fi; \
 	echo "using gremlins at $$gremlins_bin"; \
 	export GOFLAGS="-p=1 $$GOFLAGS"; \
-	for pkg in ${MUTATION_PACKAGES}; do \
-		echo "==> mutation testing $$pkg (threshold ${MUTATION_THRESHOLD}%)"; \
-		log=/tmp/gremlins-$$(basename $$pkg).log; \
+	for scope in ${SCOPES}; do \
+		pkg=$${scope%%:*}; \
+		filter=$${scope##*:}; \
+		excludes=""; \
+		coefficient=${MUTATION_TIMEOUT_COEFFICIENT}; \
+		if [ "$$filter" = "event" ]; then \
+			excludes="-E /"; \
+			for f in $$(cd $$pkg && ls *.go | grep -v '_test\.go$$' | grep -v '^event_'); do \
+				excludes="$$excludes -E $$f"; \
+			done; \
+			if [ -z "$$(cd $$pkg && ls event_*.go 2>/dev/null | grep -v '_test\.go$$')" ]; then \
+				echo "MUTATION GATE FAILED: scope $$scope asks for event files in $$pkg and there"; \
+				echo "are none. A renamed or relocated event file would otherwise make this scope"; \
+				echo "score nothing and report success."; \
+				exit 1; \
+			fi; \
+		fi; \
+		echo "==> mutation testing $$pkg [$$filter] (threshold ${MUTATION_THRESHOLD}%, timeout x$$coefficient)"; \
+		log=/tmp/gremlins-$$(echo $$pkg-$$filter | tr '/.' '_').log; \
 		status=0; \
-		(cd $$pkg && "$$gremlins_bin" unleash --workers 2 --timeout-coefficient 8) > $$log 2>&1 || status=$$?; \
+		(cd $$pkg && "$$gremlins_bin" unleash --workers 2 --timeout-coefficient $$coefficient $$excludes) > $$log 2>&1 || status=$$?; \
 		cat $$log; \
-		eff=$$(grep -o 'Test efficacy: [0-9.]*' $$log | grep -o '[0-9.]*'); \
+		eff=$$(grep -o 'Test efficacy: [0-9.]*' $$log | grep -o '[0-9.]*' || true); \
 		if [ -z "$$eff" ]; then \
-			echo "MUTATION GATE FAILED: gremlins did not report a score for $$pkg (exit $$status)."; \
+			echo "MUTATION GATE FAILED: gremlins did not report a score for $$pkg [$$filter] (exit $$status)."; \
+			echo "(The '|| true' on the score extraction above is what lets you read this at all:"; \
+			echo "under 'set -e' a grep that matches nothing fails the assignment and kills the"; \
+			echo "recipe before it can explain itself.)"; \
 			echo "This is a RUN failure, not a low score — the run above did not complete. The"; \
 			echo "usual cause is that coverage gathering failed because some package's tests are"; \
 			echo "red: gremlins runs the whole module's suite to gather coverage, so \`go test ./...\`"; \
 			echo "must be green before the gate can score anything. See $$log."; \
 			exit 1; \
 		fi; \
+		killed=$$(grep -oE 'Killed: [0-9]+' $$log | grep -oE '[0-9]+' || true); \
+		lived=$$(grep -oE 'Lived: [0-9]+' $$log | grep -oE '[0-9]+' || true); \
+		timedout=$$(grep -oE 'Timed out: [0-9]+' $$log | grep -oE '[0-9]+' || true); \
+		conclusive=$$(( $${killed:-0} + $${lived:-0} )); \
+		if [ "$${timedout:-0}" -gt 0 ]; then \
+			echo "NOTE: $$pkg [$$filter] reached a verdict on $$conclusive mutants (killed $${killed:-0},"; \
+			echo "lived $${lived:-0}) and TIMED OUT on $${timedout}. gremlins EXCLUDES a timed-out mutant from"; \
+			echo "the efficacy ratio rather than counting it as survived, so the percentage below"; \
+			echo "describes the conclusive subset and not the whole mutant set. Read it that way."; \
+			echo "On this repository's event scopes the timeouts are genuine hangs, not impatience:"; \
+			echo "mutating the outbox claim query or a retry loop against a real PostgreSQL blocks on"; \
+			echo "a row lock. Survivors (LIVED) are the signal to act on; see $$log."; \
+		fi; \
 		awk -v e="$$eff" -v t="${MUTATION_THRESHOLD}" 'BEGIN { exit (e+0 < t+0) ? 1 : 0 }' \
-			|| { echo "MUTATION GATE FAILED: $$pkg efficacy $$eff% is below ${MUTATION_THRESHOLD}% — see LIVED lines in $$log"; exit 1; }; \
-		echo "PASS: $$pkg efficacy $$eff%"; \
+			|| { echo "MUTATION GATE FAILED: $$pkg [$$filter] efficacy $$eff% is below ${MUTATION_THRESHOLD}% — see LIVED lines in $$log"; exit 1; }; \
+		echo "PASS: $$pkg [$$filter] efficacy $$eff%"; \
 	done
 
 build:
@@ -134,35 +258,95 @@ run:
 run_workers:
 	./${PROJECT} workers
 
-# Run the process that hosts the EVENT OUTBOX RELAY.
+# Start the SERVER PROCESS ROLE, which is what hosts the event outbox relay.
 #
-# There is deliberately no separate relay binary, and therefore no relay SUBCOMMAND for this
-# target to invoke: cmd/main.go registers exactly start, workers, migrate and verify-chain, so
-# `./${PROJECT} start` is not a stand-in for a relay command, it IS how the relay is run. The
-# relay is started by the SERVER role — cmd/server.go calls startEventRelay immediately after
-# the outbox background work it is modelled on, the fund-lineage outbox processor, which is
-# this repository's established home for an outbox relay and avoids standing up a fourth asynq
-# server for one poll loop. That call is CONDITIONAL ON BROKERS BEING CONFIGURED: with an empty
-# broker list it logs one info line and starts nothing.
+# THE NAME SAYS SERVER BECAUSE A SERVER IS WHAT STARTS. This target runs `./${PROJECT} start`,
+# which brings up the whole HTTP API, the lineage outbox processor, the metrics collector and
+# the event relay together. It is NOT isolated relay execution, and an earlier version of this
+# comment claimed it was — which mattered, because an operator who believes only a relay is
+# running will not expect the API to be listening on its port, will not expect the other
+# background workers to be claiming rows, and will read a load test taken against it as
+# measuring the relay alone.
 #
-# So this target is an alias for the server role, and it exists for two reasons. It answers
-# "where does the relay run" without reading cmd/server.go, and it is the entry point for
-# running the relay in ISOLATION — a local operator watching a backlog drain, or a load test
-# measuring publish throughput — both of which want the publishing process up and nothing else
-# claiming the outbox rows they are measuring.
+# There is deliberately no separate relay binary and no relay SUBCOMMAND to invoke instead:
+# cmd/main.go registers exactly start, workers, migrate and verify-chain, and AAP §0.4.4 places
+# the relay in the server role beside the fund-lineage outbox processor it is modelled on —
+# this repository's established home for an outbox relay, which also avoids standing up a
+# fourth asynq server for one poll loop. AAP §0.3.2 records a standalone relay command as
+# OPTIONAL, so adding one would be a new process role rather than a fix to this target. Hence
+# `./${PROJECT} start` is not a stand-in for a relay command; it IS how the relay is run.
 #
-# KAFKA_BROKERS is checked FIRST because the failure it prevents is silent: with no brokers
-# the publisher resolves to the no-op, the relay refuses to start, and the server comes up
-# looking entirely healthy while every captured event stays pending in blnk.event_outbox.
-# A missing variable is worth one line of refusal here rather than a backlog discovered later.
-run_relay:
-	@if [ -z "$${KAFKA_BROKERS}" ]; then \
-		echo "KAFKA_BROKERS is not set, so the relay would not start and every captured event would"; \
-		echo "stay pending in blnk.event_outbox. Set it (and the KAFKA_SASL_USER/KAFKA_SASL_SECRET"; \
-		echo "producer pair) first — './stack.sh --init' writes them to a 0600 .env."; \
+# `run_relay` remains as an alias because AAP §0.5.1 Group 7 names that target, and because it
+# is the name the operations runbook documents. It answers "where does the relay run" without
+# reading cmd/server.go. Both spellings print what is actually starting.
+#
+# # Why the guard exists, and what it does NOT claim
+#
+# startEventRelay is CONDITIONAL ON BROKERS BEING CONFIGURED: with an empty broker list it logs
+# a single info line and starts nothing, so the server comes up looking entirely healthy while
+# every captured event stays pending in blnk.event_outbox. That silence is the only failure this
+# guard is here to convert into a refusal.
+#
+# It deliberately does NOT re-validate the configuration. The application owns that, and owns it
+# in more depth than a shell test can: config.validateKafkaTopicPrefix refuses a prefix that
+# cannot compose a legal topic name, config.validateKafkaSASLCredentials refuses a
+# half-configured administrative principal, and blnk.KafkaBrokersConfigured normalises the list
+# before judging it — all of them on the same load `./${PROJECT} start` performs seconds later.
+# A guard that duplicated any of that would drift from it, and a guard that pronounced a value
+# "valid" that the application then rejected would be worse than no guard at all.
+#
+# # Why FOUR sources are consulted, not one
+#
+# The check used to read $${KAFKA_BROKERS} alone and refuse when it was empty, which refused
+# correctly-configured deployments — a false negative that blocks the operator it was written to
+# help. The application accepts brokers from four places, and this now looks at all of them:
+#
+#   KAFKA_BROKERS              the R-10 contract name; envconfig's alternate key
+#   BLNK_KAFKA_KAFKA_BROKERS   the key envconfig actually derives, since Kafka is a prefix segment
+#   BLNK_KAFKA_BROKERS         the house-convention alias applyPrefixedEnvAliases overlays, which
+#                              WINS over the bare name when both are set
+#   kafka.brokers in ${CONFIG_FILE}  the config file, which envconfig then overlays
+#
+# The config file is tested only for the PRESENCE of a brokers key, with grep rather than a JSON
+# parser, and that asymmetry is deliberate: the result is used solely to STAND DOWN, never to
+# assert that brokers are configured. Read that way a crude match is safe, because a false
+# positive costs one info line from the application and a false negative would resurrect exactly
+# the bug being fixed. Requiring jq for a decision this coarse would add a dependency to a
+# target that needs none.
+CONFIG_FILE?=blnk.json
+
+run_server_relay:
+	@brokers=""; \
+	for candidate in "$${KAFKA_BROKERS}" "$${BLNK_KAFKA_KAFKA_BROKERS}" "$${BLNK_KAFKA_BROKERS}"; do \
+		if [ -n "$$candidate" ]; then brokers="$$candidate"; break; fi; \
+	done; \
+	source_name="the environment"; \
+	if [ -z "$$brokers" ] && [ -f "${CONFIG_FILE}" ] && grep -q '"brokers"' "${CONFIG_FILE}"; then \
+		brokers="(declared in ${CONFIG_FILE})"; \
+		source_name="${CONFIG_FILE}"; \
+	fi; \
+	if [ -z "$$brokers" ]; then \
+		echo "No Kafka brokers are configured in any source this deployment reads, so the event"; \
+		echo "outbox relay would not start and every captured event would stay pending in"; \
+		echo "blnk.event_outbox — with the server otherwise looking healthy. Set brokers in one of:"; \
+		echo "  KAFKA_BROKERS             (the deployment contract name)"; \
+		echo "  BLNK_KAFKA_KAFKA_BROKERS  (envconfig's derived key)"; \
+		echo "  BLNK_KAFKA_BROKERS        (the BLNK_-prefixed alias, which wins over the bare name)"; \
+		echo "  \"kafka\": { \"brokers\": [...] } in ${CONFIG_FILE}"; \
+		echo "and set the KAFKA_SASL_USER/KAFKA_SASL_SECRET producer pair — './stack.sh --init'"; \
+		echo "writes all of them to a 0600 .env."; \
 		exit 1; \
-	fi
+	fi; \
+	echo "Starting the SERVER role from $$source_name: HTTP API, lineage outbox processor,"; \
+	echo "event metrics collector and the event outbox relay. This is not the relay alone —"; \
+	echo "the API will be listening and the other background workers will be running."; \
+	echo "The application validates the Kafka configuration itself and will refuse to start"; \
+	echo "if it is malformed."
 	./${PROJECT} start
+
+# The AAP-named alias. Identical behaviour, including the announcement above, so neither
+# spelling can leave an operator believing a bare relay is what came up.
+run_relay: run_server_relay
 
 build_run:
 	make build
@@ -182,12 +366,16 @@ build_test_run:
 # KAFKA_TOPIC_PREFIX (default "blnk"), and every dead-letter name is its category plus ".dlt",
 # exactly as event_topics.go's DLTFor composes it:
 #
-#     blnk.transactions      blnk.balances      blnk.identities
-#     blnk.ledgers           blnk.system
-#     blnk.transactions.dlt  blnk.balances.dlt  blnk.identities.dlt
-#     blnk.ledgers.dlt       blnk.system.dlt
+#     blnk.transactions      blnk.balances      blnk.identities      blnk.system
+#     blnk.transactions.dlt  blnk.balances.dlt  blnk.identities.dlt  blnk.system.dlt
 #
-# Ten owned topics, each at KAFKA_MIN_PARTITIONS partitions — 6 is the required minimum. An
+# EIGHT owned topics, from FOUR categories. The fourth exists because two real event types —
+# ledger.created and system.error — belong to none of the three the requirement names, while the
+# coverage rule admits no exceptions; blnk.system takes both and is created but never granted.
+# There is deliberately no fifth blnk.ledgers category: one was implemented and reverted, and
+# model/event.go's catalogue is frozen at four.
+#
+# Each topic is created at KAFKA_MIN_PARTITIONS partitions — 6 is the required minimum. An
 # EMPTY topic below that count is grown to it; one that already holds messages is reported and
 # left alone, because adding partitions re-maps keys and would split an aggregate's history
 # across two of them, so that growth needs a deliberate KAFKA_ALLOW_PARTITION_GROWTH and a
@@ -201,13 +389,18 @@ build_test_run:
 # subscriber-isolation test asserts against, and they are only enforced because the broker runs
 # the KRaft StandardAuthorizer — without it ACLs are accepted and ignored.
 #
-# FIVE categories, not the three the requirement names, because ledger.created and system.error
-# belong to none of transactions, balances and identities while every event formerly delivered
-# by webhook must still be published. ledger.created is ordinary ledger data a webhook
-# subscriber receives today, so it needs a GRANTABLE home; system.error carries Blnk's own error
-# text and must stay ungrantable. Hence blnk.ledgers and blnk.system. model.EventCategory routes
-# events into exactly these five and event_topics.go composes exactly these ten names, so do not
-# "correct" the count here without changing both.
+# FOUR categories, not the three the requirement names, because ledger.created and system.error
+# belong to none of transactions, balances and identities while every event formerly delivered by
+# webhook must still be published. Both go to blnk.system, which follows the identical naming
+# convention so nothing about the scheme is special-cased. model.EventCategory routes events into
+# exactly these four and event_topics.go composes exactly these eight names, so do not "correct"
+# the count here without changing both.
+#
+# There is no fifth blnk.ledgers category. One was implemented, on the reasoning that
+# ledger.created is ordinary ledger data a webhook subscriber receives today and therefore needs
+# a GRANTABLE home; it was reverted because the catalogue is frozen at four, and blnk.system is
+# never granted. A subscriber that needs ledger.created is served by the migration path rather
+# than by a topic of its own.
 #
 # REPLICATION FACTOR IS 1 LOCALLY AND 3 IN PRODUCTION, which is the whole reason it is a
 # variable. A single-broker KRaft cluster cannot satisfy 3 — topic creation fails outright — so
@@ -222,36 +415,38 @@ build_test_run:
 # drifted topic geometry or ACL. It only ever adds: no topic is deleted, no partition count is
 # reduced, and no existing credential is replaced unless a KAFKA_ROTATE_* variable asks for it.
 #
-# NEITHER CREDENTIAL IS GENERATED. Both principals are provisioned only from a secret you
-# supply, because a generated one has to be printed to be usable and this script's usual home
-# is the compose kafka-init one-shot, whose stdout Docker captures into a container log. So:
+# TWO WAYS TO SUPPLY THE PRINCIPAL SECRETS, and neither of them prints one.
 #
-#     KAFKA_PRODUCER_SECRET=<secret> make kafka_provision
-#     KAFKA_SAMPLE_SUBSCRIBER_SECRET=<secret> make kafka_provision
+# SUPPLIED. Put the value in the 0600 .env this recipe sources — KAFKA_PRODUCER_SECRET and
+# KAFKA_SAMPLE_SUBSCRIBER_SECRET — or export it from a secret manager in the calling shell.
+# Do NOT write it inline on the command line: an assignment there is visible in /proc for the
+# life of the process and lands in shell history.
 #
-# `./stack.sh --init` generates KAFKA_SASL_SECRET into a 0600 .env, and the script reads that
-# variable directly as the producer secret — so after --init the producer principal needs no
-# extra argument, and the application and the broker are configured from one value.
+# GENERATED TO A FILE. `./stack.sh --init` generates KAFKA_SASL_SECRET into a 0600 .env, and
+# the script reads that variable directly as the producer secret — so after --init the producer
+# principal needs no extra argument and the application and the broker are configured from one
+# value. Failing that, scripts/kafka-provision.sh will generate a missing secret itself, but
+# only into a mode-0600 file you nominate through KAFKA_SASL_SECRET_FILE or
+# KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE; it reports the PATH and never the value.
+#
+# What is never done is printing a generated secret, because this script's usual home is the
+# compose kafka-init one-shot, whose stdout Docker captures into a container log that anyone
+# who can read logs can read.
 #
 # The script finds the Kafka CLI or delegates into the broker container itself, so this works
 # whether or not a Kafka distribution is installed on the host.
-# .env SUPPLIES DEFAULTS; THE COMMAND LINE WINS. That ordering is the whole of this recipe.
+# .env SUPPLIES DEFAULTS; THE CALLER'S ENVIRONMENT WINS. That ordering is the whole of this
+# recipe, and it is Compose's own precedence (the shell wins over --env-file) as well as the
+# rule stack.sh applies.
 #
-# It used to be `set -a; [ -f .env ] && . ./.env; set +a`, which sources .env AFTER the caller's
-# environment already exists - so every key .env declares silently overwrote the value the
-# caller had just passed. `KAFKA_BROKERS=localhost:29092 make kafka_provision` against a .env
-# that leaves KAFKA_BROKERS empty reported "KAFKA_BROKERS is declared but empty, so Kafka is not
-# configured here" and did nothing, while the comment block above advertises exactly that form
-# for the two secrets. Only keys absent from .env got through, which is the most confusing
-# possible half of the behaviour.
-#
-# The snapshot-and-restore is what fixes it without giving up on sourcing. Sourcing is worth
-# keeping: .env is shell-quoted data (values with spaces, quoted assignments) and hand-parsing
-# it would get those wrong. So the caller's exported environment is captured in re-inputtable
-# form first, .env is sourced with allexport, and the snapshot is then replayed on top - which
-# restores the caller's value for every key that appears in both and leaves .env-only keys
-# alone. This is Compose's own precedence (the shell wins over --env-file) and the same rule
-# stack.sh applies to the value it captures before sourcing.
+# THE SNAPSHOT-AND-RESTORE IS WHAT ENFORCES IT. A plain `set -a; . ./.env; set +a` sources .env
+# after the caller's environment already exists, so every key .env declares overwrites the value
+# the caller just passed - and only keys absent from .env get through, which is the most
+# confusing possible half of the behaviour. Sourcing is still worth keeping, because .env is
+# shell-quoted data (values with spaces, quoted assignments) that hand-parsing would get wrong.
+# So the caller's exported environment is captured in re-inputtable form FIRST, .env is sourced
+# with allexport, and the snapshot is replayed on top - restoring the caller's value for every
+# key present in both and leaving .env-only keys alone.
 #
 # A deliberately EMPTY value from the caller wins too, because `export -p` records a set-but-
 # empty variable: `KAFKA_SKIP_SAMPLE_SUBSCRIBER= make kafka_provision` means "not set", not

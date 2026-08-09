@@ -142,13 +142,19 @@ spec:
   # per-pod STORAGE possible: kafka-statefulset.yaml declares a
   # `volumeClaimTemplates` entry named `kafka-data`, so Kubernetes materialises
   # kafka-data-kafka-0, -1 and -2 and re-binds each to the same ordinal across
-  # restarts. The standalone kafka-data-persistentvolumeclaim.yaml is the Kompose
-  # companion declaration of that claim's SHAPE — 10Gi, ReadWriteOnce — in the
-  # same way pg-data-persistentvolumeclaim.yaml is for postgres; it is NOT the
-  # storage these pods mount, and it could not be. One ReadWriteOnce claim is
+  # restarts.
+  #
+  # THERE IS NO STANDALONE KAFKA PVC MANIFEST, deliberately. This folder used to
+  # carry a Kompose-generated kafka-data-persistentvolumeclaim.yaml declaring one
+  # 10Gi ReadWriteOnce claim named kafka-data, and it was removed rather than kept
+  # as documentation: nothing mounted it, so applying the folder provisioned a
+  # tenth of a terabyte-hour of storage nobody read, and its name collided
+  # confusingly with the per-ordinal claims the template really creates. It could
+  # never have been the brokers' storage either — one ReadWriteOnce claim is
   # mountable by one node at a time, whereas each broker needs its own KRaft
   # metadata log, and three brokers writing into one log directory corrupt it
-  # rather than reporting an error. That file's header states the whole contract.
+  # rather than reporting an error. The claim's shape now lives in exactly one
+  # place, the volumeClaimTemplates entry itself.
   selector:
     io.kompose.service: kafka
 status:

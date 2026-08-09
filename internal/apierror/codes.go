@@ -136,8 +136,16 @@ const (
 	// third one holding a single code. It resolves to 503 and not to the 500 used
 	// by the other *_FAILED codes because an unreachable broker is a retryable
 	// upstream condition, not a defect in this service — do not "correct" it.
+	//
+	// ErrEventAlreadyResolved is its own code rather than a generic conflict for one
+	// operational reason: resolving a dead-lettered event is the action an operator
+	// most naturally repeats — two people triaging the same backlog, or one retrying
+	// a request whose response was lost — and a script has to be able to treat "it
+	// was already resolved" as success while treating "it cannot be resolved" as a
+	// problem. A shared 409 makes those indistinguishable without parsing prose.
 	ErrEventNotFound        ErrorCode = "EVENT_NOT_FOUND"
 	ErrEventNotDeadLettered ErrorCode = "EVENT_NOT_DEAD_LETTERED"
+	ErrEventAlreadyResolved ErrorCode = "EVENT_ALREADY_RESOLVED"
 	ErrEventReplayFailed    ErrorCode = "EVENT_REPLAY_FAILED"
 	ErrKafkaUnavailable     ErrorCode = "EVENT_KAFKA_UNAVAILABLE"
 
@@ -148,29 +156,36 @@ const (
 	ErrSubscriberNotFound           ErrorCode = "SUBSCRIBER_NOT_FOUND"
 	ErrSubscriberProvisioningFailed ErrorCode = "SUBSCRIBER_PROVISIONING_FAILED"
 
-	// ErrSubscriberIsolationUnenforceable is the refusal to issue a credential whose
-	// record claims an access boundary nothing can enforce.
+	// ErrSubscriberAccessExceedsAuthorization is the refusal to issue a credential to a
+	// principal the broker would grant MORE access than the registry records.
 	//
-	// It resolves to 409 CONFLICT rather than 400 or 422, and the distinction carries
-	// meaning the caller needs: the REQUEST is well formed and would be honoured
-	// against a different registry row. What conflicts is the STATE — the subscriber
-	// records a partition-key prefix, and Kafka ACLs are topic-level, so any credential
-	// issued would grant strictly wider access than the row describes. 409 is the
-	// status that says "fix the resource, then repeat this request unchanged", which is
-	// exactly the remedy: clear the prefix, or narrow authorized_topics until
-	// topic-level scope is the isolation actually required.
-	ErrSubscriberIsolationUnenforceable ErrorCode = "SUBSCRIBER_ISOLATION_UNENFORCEABLE"
+	// It shares its 409 with the other state refusals, and it is a separate code because the
+	// remedy is somewhere else entirely. Every other 409 here names something about the
+	// registry ROW that has to change, and the fix is to edit the row. Here the row is
+	// perfectly expressible and already enforced — what exceeds it is an ACL
+	// binding on the principal that Blnk did not create and will not delete, so the fix is at
+	// the BROKER. A caller told only "conflict" would edit the subscriber and watch the
+	// identical request fail again.
+	//
+	// It is emphatically not SUBSCRIBER_PROVISIONING_FAILED, whose 503 advertises a retryable
+	// upstream condition. Nothing here is retryable: the broker answered, provisioning
+	// completed, and the refusal is a deliberate judgement about the resulting boundary. 409
+	// carries the right instruction — change the state, then repeat this request unchanged.
+	ErrSubscriberAccessExceedsAuthorization ErrorCode = "SUBSCRIBER_ACCESS_EXCEEDS_AUTHORIZATION"
 
-	// ErrSubscriberBrokersNotConfigured is the refusal to issue a credential when no
-	// SUBSCRIBER-FACING broker list is configured.
+	// ErrSubscriberBrokersNotConfigured is the refusal to issue a credential when NO Kafka
+	// broker list is configured at all.
 	//
-	// KAFKA_BROKERS is what Blnk dials, and inside a deployment that address is internal:
-	// a compose service name, a ClusterIP. Reporting it to an external subscriber returns
-	// an endpoint that does not resolve for them — and Kafka makes it worse, because a
-	// broker answers each client with the advertised address of the listener the
-	// connection arrived on, so even a reachable bootstrap redirects to internal names.
-	// KAFKA_SUBSCRIBER_BROKERS is the externally advertised list, and only an operator
-	// knows it.
+	// KAFKA_SUBSCRIBER_BROKERS is the externally advertised list and is an OPTIONAL
+	// OVERRIDE: without it, issuance reports KAFKA_BROKERS and logs that it did, because
+	// the eight variables the configuration contract requires must be enough to run every
+	// documented endpoint. Reporting the internal list is right when subscribers run inside
+	// the deployment and wrong when they do not — and Kafka compounds a wrong answer,
+	// because a broker replies to each client with the advertised address of the listener
+	// the connection arrived on — so the fallback is warned about rather than silent.
+	//
+	// This code is therefore reached only when neither list is set, which means Kafka is
+	// unconfigured and no credential could work whatever endpoint was reported.
 	//
 	// It resolves to 503 SERVICE UNAVAILABLE rather than 500, for the same reason
 	// ErrSubscriberProvisioningFailed does: nothing about the request is wrong and no
@@ -207,6 +222,33 @@ const (
 	// resource that has to change — grant at least one topic — after which the identical
 	// request succeeds.
 	ErrSubscriberGrantEmpty ErrorCode = "SUBSCRIBER_GRANT_EMPTY"
+
+	// ErrSubscriberInsecureTransport is the refusal to return a one-time SASL password
+	// over a channel this deployment has not declared confidential.
+	//
+	// Credential issuance is the only endpoint in Blnk that returns a secret in a
+	// response body, and it returns it exactly once — so the request that carries it is
+	// the single opportunity to disclose it to anybody watching the wire. Blnk's own
+	// listener is plaintext unless BLNK_SERVER_SSL is set, and in a Kubernetes
+	// deployment TLS is normally terminated at an ingress with a plaintext hop to the
+	// pod, so "the caller used https" is a claim the process cannot verify from the
+	// request alone. Answering anyway is what turns a correctly authenticated,
+	// correctly authorised request into a credential leak.
+	//
+	// The endpoint therefore requires one of three confidential channels, each of which
+	// the process can establish rather than assume: TLS terminated in-process, a
+	// deployment-declared proxy boundary (BLNK_SERVER_TRUST_FORWARDED_PROTO) reporting
+	// X-Forwarded-Proto: https, or a loopback peer whose bytes never leave the host.
+	// See api.ensureCredentialTransportConfidential, which is where each is checked.
+	//
+	// 403 rather than 400 or 426: the request is well formed and the caller is
+	// authenticated and authorised, and the server is refusing to fulfil it — which is
+	// what 403 means. It shares that status with ErrAuthMasterKeyRequired, so a test
+	// distinguishing "the transport was refused" from "the caller was refused" must
+	// assert on error_detail.code and never on the status alone. 426 was considered and
+	// rejected: it mandates an Upgrade header describing an in-band protocol switch,
+	// which is not what a deployment behind an ingress needs to do about this.
+	ErrSubscriberInsecureTransport ErrorCode = "SUBSCRIBER_INSECURE_TRANSPORT"
 
 	// ErrSubscriberProvisioningTimeout is a credential issuance that ran out of time
 	// rather than one that failed.
@@ -328,6 +370,7 @@ var statusByCode = map[ErrorCode]int{
 	// upstream condition); every other *_FAILED code in this map is 500.
 	ErrEventNotFound:        http.StatusNotFound,
 	ErrEventNotDeadLettered: http.StatusConflict,
+	ErrEventAlreadyResolved: http.StatusConflict,
 	ErrEventReplayFailed:    http.StatusInternalServerError,
 	ErrKafkaUnavailable:     http.StatusServiceUnavailable,
 
@@ -339,9 +382,20 @@ var statusByCode = map[ErrorCode]int{
 
 	// 409 for the three refusals below: the request is well formed and it is the
 	// registry row's state that has to change before it can be honoured.
-	ErrSubscriberIsolationUnenforceable: http.StatusConflict,
-	ErrSubscriberDeprovisioning:         http.StatusConflict,
-	ErrSubscriberGrantEmpty:             http.StatusConflict,
+	ErrSubscriberDeprovisioning: http.StatusConflict,
+	ErrSubscriberGrantEmpty:     http.StatusConflict,
+	// Also 409, and NOT the 503 of SUBSCRIBER_PROVISIONING_FAILED: the broker answered and
+	// the boundary it would enforce is wider than the row records, which a retry cannot
+	// change. Without this entry the refusal would resolve to the unknown-code 500 — which is
+	// exactly what it did: the code was declared and returned from IssueSubscriberCredential
+	// while its row here was absent, so a deliberate 409 judgement reached the caller as a
+	// server defect.
+	ErrSubscriberAccessExceedsAuthorization: http.StatusConflict,
+	// 403: the request is well formed and the caller is authorised; the server is
+	// refusing to put a one-time secret on a channel it cannot establish as
+	// confidential. Without this entry the refusal would resolve to the unknown-code
+	// 500 default and read as a defect in this service.
+	ErrSubscriberInsecureTransport: http.StatusForbidden,
 	// 504 rather than 503: the dependency answered too slowly, or the caller went
 	// away, and neither is a defect in this service. Without this entry a spent
 	// issuance budget resolves to the unknown-code 500 default.

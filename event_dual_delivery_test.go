@@ -118,7 +118,13 @@ const (
 // Its only job is to make eventPublishingConfigured answer true, which is what enables
 // event capture at all. Nothing in this file connects to it: the publisher seam is
 // substituted, and the publisher construction path performs no I/O in any case.
-const dualDeliveryKafkaBroker = "kafka.dual-delivery.invalid:9092"
+//
+// An unqualified single-label name, not the qualified .invalid name it used to be. Both
+// fail to resolve, which is all this constant needs, but a qualified name outside Blnk's
+// own network is no longer reachable over acknowledged plaintext — see
+// requireLocalBrokersForPlaintext. A single-label name is what a Compose service name is,
+// so the locality check treats it as internal while it still names nothing.
+const dualDeliveryKafkaBroker = "kafka-dual-delivery-does-not-exist:9092"
 
 // dualDeliveryOutboxRowID is the surrogate key the harness stamps on a captured row.
 //

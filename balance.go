@@ -56,14 +56,38 @@ func NewBalanceTracker() *model.BalanceTracker {
 // If a condition is met, it captures a balance.monitor event in the outbox through the
 // DURABLE standalone path, because the balance movement that satisfied the condition has
 // already been committed by the time this runs and the capture is therefore the alert's
-// only chance. See the call site below and PublishEventDurably.
+// only chance. See the call site below, PublishEventDurably, and
+// PostCommitEventCaptureContract — which is where the three producers with no producing
+// mutation, and the at-most-once window they share, are described once for all of them.
 //
 // Parameters:
-// - ctx context.Context: The context for the operation.
-// - updatedBalance *model.Balance: A pointer to the updated Balance model.
-func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.Balance) {
+//   - ctx context.Context: The context for the operation.
+//   - updatedBalance *model.Balance: A pointer to the updated Balance model.
+//   - capture balanceMonitorCapture: what the pre-commit evaluation already covered. The zero
+//     value means nothing was, which is the conservative direction: every met condition is then
+//     captured here, and a duplicate an operator can see beats silence.
+func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.Balance, capture balanceMonitorCapture) {
 	_, span := balanceTracer.Start(ctx, "CheckBalanceMonitors")
 	defer span.End()
+
+	// THIS IS NOW THE LEGACY-ONLY PATH, and the guard is what keeps it that way.
+	//
+	// When Kafka is configured, `balance.monitor` is captured inside the balance's own
+	// transaction by one of two routes — prepareBalanceMonitorEvents before the write, or
+	// the durable handoff the writer records and BalanceMonitorHandoffProcessor drains —
+	// which is what brings the event under requirement R-2. Both are transactional and the
+	// writer makes them mutually exclusive per balance; publishing from here as well would
+	// add a third copy of every alert.
+	//
+	// The caller in transaction_execution.go already applies the same predicate and does
+	// not even spawn the goroutine, so in the normal flow this guard is never reached. It
+	// is here anyway because this function is reachable on its own, and a second caller
+	// added later would otherwise reintroduce the duplicate silently. Both sides read ONE
+	// predicate — balanceMonitorHandoffEnabled — so they cannot disagree.
+	if l.balanceMonitorHandoffEnabled() {
+		span.AddEvent("Monitor evaluation deferred to the durable handoff")
+		return
+	}
 
 	// Fetch monitors using cache (avoids DB query on every transaction)
 	monitors, err := l.getBalanceMonitorsCached(ctx, updatedBalance.BalanceID)
@@ -77,6 +101,15 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 	for _, monitor := range monitors {
 		if monitor.CheckCondition(updatedBalance) {
 			span.AddEvent(fmt.Sprintf("Condition met for balance: %s", monitor.MonitorID))
+
+			// ALREADY DURABLE, so nothing to do. The alert was enrolled in the very
+			// transaction that moved the balance across the threshold, which is what
+			// requirement R-2 asks for; capturing it again here would publish the same
+			// crossing twice under two different event ids, and duplicate suppression at a
+			// subscriber keys on event_id, so nothing downstream could collapse them.
+			if capture.holds(updatedBalance.BalanceID, monitor.MonitorID) {
+				continue
+			}
 			// BOUNDED, and acquired here rather than inside the goroutine so a database that
 			// cannot keep up is felt as backpressure instead of absorbed as an unbounded
 			// pile-up of goroutines. One balance can carry many monitors and many of them can
@@ -86,36 +119,66 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 			go func(monitor model.BalanceMonitor) {
 				defer func() { <-postCommitEventPublishSem }()
 
-				// PRODUCER CALL SITE FOR balance.monitor, and one of the few that legitimately
-				// remains a standalone capture: a monitor fires because a CONDITION was met on
-				// a balance that some other transaction already committed, so there is no
-				// mutation of its own to enrol the event in. See the note in publishEvent on
-				// which events have no owning mutation.
+				// PRODUCER CALL SITE FOR balance.monitor — THE FALLBACK ONE.
+				//
+				// The primary route is atomic: PrepareBalanceMonitorEvents evaluates these same
+				// monitors against the same in-memory balances BEFORE the write, and the
+				// transaction's own writer inserts the resulting rows inside the very database
+				// transaction that moves the balance across the threshold. Those alerts arrive
+				// here already in `captured` and are skipped above.
+				//
+				// This path remains for the crossings the atomic route cannot own: a balance
+				// updated through a writer this feature may not thread event rows into (the
+				// coalesced batch path, whose only caller is frozen by AAP §0.6.2), a monitor
+				// that appeared between the pre-commit snapshot and this check, and a monitor
+				// whose read failed before the write. For those the mutation is ALREADY
+				// COMMITTED, so this insert is the alert's only chance and it is made durable
+				// rather than single-shot.
 				//
 				// SendWebhook became PublishEvent and nothing else changed: the event string
 				// and the payload object are the same ones the legacy transport received, so
 				// the outbox stores exactly the bytes that used to be the HTTP body and the two
 				// transports cannot diverge during the dual-delivery window. The event routes
-				// to blnk.balances, keyed on the monitored balance.
+				// to blnk.balances, keyed on the monitored balance's LEDGER — see the
+				// WithEventLedgerID note at the bottom of this comment, which is what makes it
+				// the ledger rather than the balance.
 				//
 				// THE DURABLE VARIANT IS USED, and the distinction matters here more than
-				// anywhere else in the package. Every other producer either enrols its event in
-				// the mutation's own transaction — where a failed insert correctly rolls the
-				// mutation back — or has no mutation at all. This one sits between the two: the
-				// balance movement that satisfied the condition is ALREADY COMMITTED, and this
-				// insert is the alert's only chance. With a single attempt, a momentary
-				// connection reset or a statement error destroyed the alert outright: the
-				// balance had moved, the threshold had been crossed, and the notification an
-				// operator relies on for a low-balance or overdraft warning simply ceased to
-				// exist. PublishEventDurably spends a small bounded budget on that insert and
-				// logs every attempt, so a transient database fault no longer costs the alert.
+				// anywhere else in the package. Most producers enrol their event in the
+				// mutation's own transaction, where a failed insert correctly rolls the
+				// mutation back. This one cannot: the balance movement that satisfied the
+				// condition is ALREADY COMMITTED, and this insert is the alert's only chance.
+				// With a single attempt, a momentary connection reset or a statement error
+				// destroyed the alert outright — the balance had moved, the threshold had been
+				// crossed, and the notification an operator relies on for a low-balance or
+				// overdraft warning simply ceased to exist. PublishEventDurably spends a small
+				// bounded budget on that insert and logs every attempt, so a transient
+				// database fault no longer costs the alert.
 				//
 				// It does not make the capture atomic and does not claim to — the mutation is
 				// durable before the first attempt, so a process that dies in the window still
-				// loses the alert. That residual at-most-once behaviour is the single
-				// documented exception to requirement R-2 and is written down as such in
-				// docs/event-streaming.md, along with the system.error escalation that makes an
-				// exhausted budget visible rather than silent.
+				// loses the alert.
+				//
+				// THIS IS NOT THE ONLY SUCH CASE, and saying it was is a claim this comment
+				// used to make. There are exactly THREE post-commit captures in this
+				// repository, they are at-most-once for the same structural reason, and each
+				// is documented as an exception to requirement R-2 rather than as an instance
+				// of it:
+				//
+				//   1. balance.monitor — this call site. The balance movement that met the
+				//      condition committed under another transaction.
+				//   2. bulk_transaction.<status> — sendBulkTransactionWebhook. A batch
+				//      summary belongs to no single mutation and there is no batch-spanning
+				//      transaction to join.
+				//   3. The status-derived transaction.* events of a COALESCED batch —
+				//      postTransactionActions' fallback. Its writer is called from
+				//      transaction_coalescing.go, which AAP §0.6.2 freezes.
+				//
+				// All three spend the same bounded budget and log every attempt, and
+				// docs/event-streaming.md states the set and what it costs a subscriber —
+				// along with the system.error escalation that makes an exhausted budget
+				// visible rather than silent. Every OTHER event type carries the full
+				// transactional guarantee.
 				//
 				// ctx is passed through rather than detached because the only caller —
 				// runTransactionPostCommitWorkWithHooks in transaction_execution.go — already
@@ -142,6 +205,229 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 	}
 }
 
+// monitorCaptureKey identifies one balance-and-monitor alert.
+//
+// Both halves are needed. One balance can carry several monitors and one monitor names exactly
+// one balance, so keying on either alone would let a second monitor's crossing on the same
+// balance be mistaken for one already captured, and the alert would then be dropped by both
+// routes.
+//
+// Parameters:
+//   - balanceID string: the monitored balance.
+//   - monitorID string: the monitor whose condition was met.
+//
+// Returns:
+//   - string: the set key. The separator is a character neither identifier can contain.
+func monitorCaptureKey(balanceID, monitorID string) string {
+	return balanceID + "|" + monitorID
+}
+
+// balanceMonitorCapture records what the pre-commit monitor evaluation covered.
+//
+// It travels from the atomic writer to the post-commit monitor check and answers two different
+// questions, which is why it is a pair of sets rather than one:
+//
+//   - balances: whose monitors were READ AND EVALUATED before the write. The post-commit check
+//     skips those balances entirely — the same cached list would be read and the same conditions
+//     evaluated against the same values, so a second pass costs a read per balance on the
+//     transaction path and can conclude nothing new.
+//   - alerts: which crossings were CAPTURED, keyed by monitorCaptureKey. Retained separately
+//     because it is what makes the skip auditable rather than implicit, and because a crossing
+//     may be captured for a balance whose sibling in the same write was not evaluated at all.
+//
+// The zero value covers nothing and holds nothing, so a caller that has done no pre-commit
+// evaluation passes it and the post-commit check behaves exactly as it did before this existed.
+type balanceMonitorCapture struct {
+	balances map[string]struct{}
+	alerts   map[string]struct{}
+}
+
+// covers reports whether a balance's monitors were already read and evaluated with the mutation.
+//
+// Parameters:
+//   - balanceID string: the balance the post-commit check is about to examine.
+//
+// Returns:
+//   - bool: true when the pre-commit pass owned this balance.
+func (c balanceMonitorCapture) covers(balanceID string) bool {
+	if len(c.balances) == 0 {
+		return false
+	}
+
+	_, ok := c.balances[balanceID]
+
+	return ok
+}
+
+// holds reports whether one crossing is already durable.
+//
+// It is the finer-grained companion to covers, used for the balance that WAS evaluated but whose
+// monitor set the post-commit check re-read anyway — a path that exists only when a caller
+// supplies alerts without the balance, and one that must not publish a crossing twice.
+//
+// Parameters:
+//   - balanceID string: the monitored balance.
+//   - monitorID string: the monitor whose condition was met.
+//
+// Returns:
+//   - bool: true when this crossing was committed inside the mutation.
+func (c balanceMonitorCapture) holds(balanceID, monitorID string) bool {
+	if len(c.alerts) == 0 {
+		return false
+	}
+
+	_, ok := c.alerts[monitorCaptureKey(balanceID, monitorID)]
+
+	return ok
+}
+
+// prepareBalanceMonitorEvents evaluates the monitors of balances a mutation has just changed and
+// returns the balance.monitor rows to enrol in that mutation's own transaction. R-2.
+//
+// # The failure it removes
+//
+// A monitor crossing used to be captured only AFTER the balance movement had committed, from a
+// goroutine started by the post-commit hook. The window between the two is small and it is
+// real: a process killed inside it leaves a balance that has crossed its threshold and NO event
+// anywhere — no row, no retry, no trace that an alert was owed. A bounded retry around the
+// standalone insert made the common transient fault survivable but could not close that window,
+// because by the time it runs there is no transaction left to enrol in.
+//
+// This closes it for the path that owns the transaction. The monitors are read and their
+// conditions evaluated against the SAME in-memory balances the writer is about to persist — the
+// values are identical, because the writer is what turns those objects into rows — and the
+// resulting outbox rows travel into the write. The alert and the movement then commit, or roll
+// back, together.
+//
+// # What is deliberately NOT changed
+//
+// Monitor CONDITION EVALUATION is frozen domain logic (AAP §0.6.2) and is untouched:
+// CheckCondition is called with the same argument, through the same cached read, and only
+// crossings it reports are captured. No balance arithmetic, ordering or persistence semantic is
+// altered — this function reads and marshals, and performs no write of its own.
+//
+// # Error policy, split by what the failure means
+//
+//   - A MONITOR READ that fails is reported and stepped past, and the affected balance is left
+//     out of the capture so the OTHER route still evaluates it durably — the writer's monitor
+//     handoff when publishing is configured, the post-commit hook when it is not. The
+//     alternative would make every ledger movement depend on the monitor cache and the
+//     monitors table being readable, which is a far worse trade than a late alert.
+//   - A PAYLOAD that will not serialise is returned as an error, which fails the write. That is a
+//     producer defect rather than a transient condition, and it is the same answer the
+//     transaction event gives: a mutation whose event cannot be captured must not commit.
+//
+// # This is one of TWO mechanisms, and they compose
+//
+// The writer also records a durable monitor HANDOFF inside the same transaction, which
+// BalanceMonitorHandoffProcessor drains — see database.recordBalanceMonitorHandoffs. That is
+// what covers the paths this function is not wired into (the coalesced batch, whose argument
+// list AAP §0.6.2 freezes) and the balances whose monitors could not be read here. The writer
+// suppresses the handoff for exactly the balances this pass covered, so a crossing is captured
+// once: by this function when it can, by the handoff otherwise. Publishing from both would
+// deliver every alert twice under two different event ids, which nothing downstream could
+// collapse.
+//
+// Parameters:
+//   - ctx context.Context: the context for the reads; no write happens here.
+//   - balances []*model.Balance: the balances the mutation has updated, as they will be
+//     persisted. Nil entries are skipped.
+//
+// Returns:
+//   - []*model.EventOutbox: the rows to hand to the atomic writer, nil when nothing fired or
+//     when event publishing is not configured.
+//   - balanceMonitorCapture: what this pass covered, for the post-commit hook to skip.
+//   - error: only a payload that cannot be serialised.
+func (l *Blnk) prepareBalanceMonitorEvents(
+	ctx context.Context,
+	balances []*model.Balance,
+) ([]*model.EventOutbox, balanceMonitorCapture, error) {
+	ctx, span := balanceTracer.Start(ctx, "PrepareBalanceMonitorEvents")
+	defer span.End()
+
+	var (
+		rows    []*model.EventOutbox
+		capture balanceMonitorCapture
+	)
+
+	if l == nil || l.datasource == nil {
+		return nil, capture, nil
+	}
+
+	// NO CACHE IS NOT A REASON TO SKIP THIS. The guard here used to include l.cache == nil,
+	// which made in-transaction monitor capture conditional on an infrastructure detail: an
+	// instance built without a cache silently fell back to post-commit capture and reopened
+	// the loss window this path exists to close, with nothing in the logs to say so. The
+	// monitor read below tolerates a nil cache on both its read and its write-back, so the
+	// only thing a missing cache costs is the cache.
+
+	for _, balance := range balances {
+		if balance == nil {
+			continue
+		}
+
+		monitors, err := l.getBalanceMonitorsCached(ctx, balance.BalanceID)
+		if err != nil {
+			// Reported and stepped past, never returned: see the error policy above. The
+			// post-commit hook evaluates this balance because it never enters the capture.
+			span.RecordError(err)
+			logrus.WithError(err).WithField("balance", balance.BalanceID).Warn(
+				"balance monitors could not be read before the write, so any crossing they " +
+					"describe is captured after the commit instead of with it",
+			)
+
+			continue
+		}
+
+		if capture.balances == nil {
+			capture.balances = make(map[string]struct{}, len(balances))
+		}
+		capture.balances[balance.BalanceID] = struct{}{}
+
+		for _, monitor := range monitors {
+			if !monitor.CheckCondition(balance) {
+				continue
+			}
+
+			// The SAME event string and the SAME payload object the fallback publishes, so the
+			// stored bytes are identical whichever route captures the crossing — which is what
+			// keeps the dual-delivery guarantee true for this producer as well. The ledger is
+			// supplied from the monitored balance because model.BalanceMonitor carries none and
+			// requirement R-6 partitions by ledger.
+			row, prepareErr := l.PrepareEventOutbox(ctx, NewWebhook{
+				Event:   "balance.monitor",
+				Payload: monitor,
+			}, WithEventLedgerID(balance.LedgerID))
+			if prepareErr != nil {
+				span.RecordError(prepareErr)
+
+				return nil, balanceMonitorCapture{}, prepareErr
+			}
+
+			// Nil is the unconfigured case: no brokers, so no event pipeline and no row to
+			// capture. The balance still counts as evaluated, because a deployment with no
+			// event pipeline has nothing for the post-commit route to capture either.
+			if row == nil {
+				continue
+			}
+
+			if capture.alerts == nil {
+				capture.alerts = make(map[string]struct{}, len(monitors))
+			}
+
+			rows = append(rows, row)
+			capture.alerts[monitorCaptureKey(balance.BalanceID, monitor.MonitorID)] = struct{}{}
+		}
+	}
+
+	span.SetAttributes(
+		attribute.Int("balance.monitors_evaluated_for", len(capture.balances)),
+		attribute.Int("balance.monitor_events_captured", len(rows)),
+	)
+
+	return rows, capture, nil
+}
+
 // getBalanceMonitorsCached retrieves balance monitors with caching.
 // It first checks the cache for monitors, and if not found, fetches from the database
 // and caches the result with a 5-minute TTL.
@@ -157,12 +443,18 @@ func (l *Blnk) getBalanceMonitorsCached(ctx context.Context, balanceID string) (
 	cacheKey := "monitors:" + balanceID
 
 	var monitors []model.BalanceMonitor
-	err := l.cache.Get(ctx, cacheKey, &monitors)
-	if err == nil && monitors != nil {
-		return monitors, nil
+
+	// GUARDED ON BOTH SIDES, because this function is reachable on an instance built without
+	// a cache — production always has one, tests construct Blnk directly, and the monitor
+	// capture path must behave the same either way. cache.Cache is an interface, so a nil
+	// field is a nil interface and calling through it panics rather than returning an error.
+	if l.cache != nil {
+		if err := l.cache.Get(ctx, cacheKey, &monitors); err == nil && monitors != nil {
+			return monitors, nil
+		}
 	}
 
-	monitors, err = l.datasource.GetBalanceMonitors(balanceID)
+	monitors, err := l.datasource.GetBalanceMonitors(balanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +463,11 @@ func (l *Blnk) getBalanceMonitorsCached(ctx context.Context, balanceID string) (
 		monitors = []model.BalanceMonitor{}
 	}
 
-	_ = l.cache.Set(ctx, cacheKey, monitors, 5*time.Minute)
+	// The write-back, guarded for the same reason as the read above.
+	if l.cache != nil {
+		_ = l.cache.Set(ctx, cacheKey, monitors, 5*time.Minute)
+	}
+
 	return monitors, nil
 }
 

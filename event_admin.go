@@ -23,6 +23,7 @@ import (
 	"crypto/sha512"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -30,8 +31,10 @@ import (
 
 	"github.com/segmentio/kafka-go"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/blnkfinance/blnk/config"
+	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/internal/metrics"
 	"github.com/blnkfinance/blnk/model"
 )
@@ -336,12 +339,16 @@ type KafkaAdmin interface {
 	// ConsumerLag measures how far a consumer group trails the end of the log.
 	ConsumerLag(ctx context.Context, req ConsumerLagRequest) (ConsumerLagReport, error)
 
-	// TopicEndOffsets reads the broker-side offsets the zero-loss reconciliation
-	// compares outbox counts against.
-	TopicEndOffsets(ctx context.Context, topics ...string) (TopicOffsetReport, error)
+	// TopicEndOffsets measures the per-partition offset windows the zero-loss
+	// reconciliation classifies each outbox row's stored coordinate against.
+	TopicEndOffsets(ctx context.Context, since time.Time, topics ...string) (TopicOffsetReport, error)
 
 	// Close releases the client's pooled connections.
 	Close() error
+	// CompensateProvisioning undoes the half-completed provisioning a deferred result reported,
+	// revoking the credential and removing the bindings the failed attempt attempted. It is the
+	// obligation that comes with asking for DeferCompensation.
+	CompensateProvisioning(ctx context.Context, result SubscriberProvisioningResult) error
 }
 
 // KafkaAdminClient is the kafka-go-backed implementation of KafkaAdmin.
@@ -416,6 +423,22 @@ type KafkaAdminClient struct {
 	// defaultOffsetSnapshotTTL; a negative value disables caching entirely, which is
 	// what a test asserting on raw round trips wants.
 	offsetSnapshotTTL time.Duration
+
+	// reservedPrincipals are the SASL identities this deployment uses for its OWN Kafka
+	// access — the administrative principal and the producer principal — recorded here so a
+	// subscriber provisioning can refuse to overwrite one.
+	//
+	// SEC-05: provisioning performs a SCRAM UPSERT. Writing a credential for a principal that
+	// is really Blnk's own would REPLACE that credential with a freshly generated password and
+	// return it in the response body, handing an API caller either Write on every Blnk-owned
+	// topic or the ability to mint credentials and grant ACLs. Configuration validation refuses
+	// such a deployment at start-up, and this field is what lets the write path refuse it again
+	// at the moment of the upsert — the two together, because configuration can be reloaded and
+	// an admin client can be constructed from a configuration this process never validated.
+	//
+	// Empty when no SASL is configured, which is a broker requiring no authentication and so
+	// has no privileged identity to protect.
+	reservedPrincipals []string
 
 	// now is the clock, injectable so cache expiry is testable without sleeping. Nil
 	// means time.Now.
@@ -556,6 +579,8 @@ func NewKafkaAdmin(cnf *config.Configuration) (*KafkaAdminClient, error) {
 		partitions:           resolveTopicPartitions(cnf.Kafka.MinPartitions),
 		replicationFactor:    cnf.Kafka.ReplicationFactor,
 		allowPartitionGrowth: cnf.Kafka.AllowPartitionGrowth,
+		// SEC-05: the identities a subscriber credential must never be minted for.
+		reservedPrincipals: reservedKafkaPrincipals(cnf.Kafka),
 	}
 
 	if admin.replicationFactor < 1 {
@@ -1011,7 +1036,11 @@ type topicCreationOutcome struct {
 //     non-empty topic needs growing, ErrReplicationFactorInadequate when an existing topic
 //     is under-replicated, or a wrapped broker error. The two geometry errors are joined
 //     when both apply, and the report is fully populated alongside them.
-func (a *KafkaAdminClient) EnsureTopics(ctx context.Context) (TopicAssuranceReport, error) {
+func (a *KafkaAdminClient) EnsureTopics(ctx context.Context) (_ TopicAssuranceReport, err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "ensure_topics")
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
 	report := TopicAssuranceReport{CompletedAt: time.Now().UTC()}
 	if err := a.ready(ctx); err != nil {
 		return report, err
@@ -1031,7 +1060,17 @@ func (a *KafkaAdminClient) EnsureTopics(ctx context.Context) (TopicAssuranceRepo
 	// The inventory comes from event_topics.go, never from literals here, so this
 	// operation and scripts/kafka-provision.sh provision exactly the same topics
 	// under whatever KAFKA_TOPIC_PREFIX is configured.
-	desired := AllTopicsWithDeadLetters()
+	//
+	// EVERY OWNED PREFIX, not only the configured one. Outbox rows record their destination
+	// at insert time, so a deployment that renamed its namespace still holds committed rows
+	// naming the previous generation's topics — and each prefix an operator declares in
+	// KAFKA_HISTORICAL_TOPIC_PREFIXES is a namespace the publisher will still write to.
+	// Assuring only the live generation would leave those topics unprotected against having
+	// been deleted, or absent entirely on a broker restored from elsewhere, and every publish
+	// of the rows that name them would then either fail or silently auto-create a topic with
+	// one partition and the wrong replication factor. Declaring a prefix and assuring it are
+	// two halves of one decision.
+	desired := AllOwnedTopicsAcrossPrefixes()
 
 	partitionsBefore, err := a.partitionCounts(ctx, desired)
 	if err != nil {
@@ -1972,6 +2011,22 @@ type SubscriberProvisioningRequest struct {
 	// Host restricts the binding to one client host. Empty selects ACLHostAny, which is
 	// the right default for subscribers on networks Blnk does not control.
 	Host string
+
+	// DeferCompensation asks provisioning to REPORT a needed compensation instead of
+	// performing it. PERF-P09.
+	//
+	// The compensation is two administrative round trips on their own ten-second budget, and
+	// they run on the failure path — which is reached, most often, because a five-second
+	// provisioning budget has just expired. Performing them inline therefore adds their whole
+	// duration to a response that has already run out of time, and requirement R-7's ceiling
+	// is on the response.
+	//
+	// So a caller that can finish the work elsewhere sets this, and provisioning returns
+	// CompensationOwed with the bindings to undo. The caller must then call
+	// CompensateProvisioning — the credential HAS been written, and leaving it is the one
+	// state AUTH-01 forbids. It defaults to false so every caller that does not opt in keeps
+	// the inline, fully-compensated behaviour, which is what a CLI and a test want.
+	DeferCompensation bool
 }
 
 // NewSubscriberProvisioningRequest maps a registry row and a freshly generated password
@@ -1989,10 +2044,17 @@ type SubscriberProvisioningRequest struct {
 // would widen the topic grant to every topic sharing that prefix while appearing to
 // narrow it.
 //
-// Nor is the omission papered over by silence. A row recording a key prefix is refused a
-// credential by EventSubscriberService.IssueSubscriberCredential before this request is
-// ever built, so nothing reaches here carrying an authorization this function cannot
-// honour. That is what makes "not mapped" a fail-closed decision rather than a caveat.
+// Nor is the omission papered over by silence. A row recording a key prefix is provisioned
+// normally — the two ACL dimensions above are its whole broker-side boundary — and the
+// prefix itself is DELIVERED to the subscriber by the credential endpoint, inside the same
+// object that states partition_key_prefix_enforced is false. So the scope is honoured where
+// it can be, by the consumer, and this function's silence about it is accurate rather than
+// concealing: nothing here claims a binding that does not exist.
+//
+// Issuance used to REFUSE such a row outright, which is why this comment once said nothing
+// could reach here carrying a key scope. Refusing implemented no part of the access model's
+// third scope; it withheld the credential instead. See the access-model note on
+// model.EventSubscriber.
 //
 // Parameters:
 //   - subscriber *model.EventSubscriber: the registry row. A nil row yields a request
@@ -2060,10 +2122,38 @@ type SubscriberProvisioningResult struct {
 	// ForeignACLBindings is how many bindings on this principal Blnk does not provision and
 	// deliberately did not touch — a hand-made grant, a DENY, a Write.
 	//
-	// Non-zero means somebody is granting this principal access the registry does not
-	// describe. Reconciliation names each one in a warning rather than deleting it, because
-	// ACL deletion has no undo and an operator's deliberate binding is not Blnk's to remove.
+	// Reconciliation names each one rather than deleting it, because ACL deletion has no undo
+	// and an operator's deliberate binding is not Blnk's to remove. Non-zero is therefore
+	// informational on its own: see ForeignACLBindingsGranting for the count that decides
+	// whether a credential may be issued at all.
 	ForeignACLBindings int
+
+	// CompensationOwed reports that provisioning failed after the credential was written and
+	// that the caller asked for the compensation to be DEFERRED, so it has not run. PERF-P09.
+	//
+	// True obliges the caller to call CompensateProvisioning with this result: a credential
+	// exists at the broker with no authorization boundary, which is the one state AUTH-01
+	// forbids leaving behind. It is never true unless the request set DeferCompensation, and
+	// it is mutually exclusive with Compensated — the compensation has either run here or been
+	// handed back, never both.
+	CompensationOwed bool
+
+	// OwedBindings are the bindings the failed provisioning attempted, so a deferred
+	// compensation deletes exactly those rather than everything the principal holds.
+	//
+	// Populated only alongside CompensationOwed. It carries no secret: an ACL entry names a
+	// principal, a resource and an operation.
+	OwedBindings []kafka.ACLEntry
+
+	// ForeignACLBindingsGranting is how many of those foreign bindings GRANT access rather
+	// than restricting it.
+	//
+	// It is ALWAYS zero on a successful return, because provisioning now refuses to issue a
+	// credential to a principal whose effective permissions exceed its recorded authorization
+	// — the same fail-closed shape as AuthorizerActive, and the same reason. It is retained as
+	// a field rather than dropped so the property is assertable from the result, and so the
+	// refusal path can report how many bindings caused it.
+	ForeignACLBindingsGranting int
 
 	// CredentialReplaced is true when the principal already held a SCRAM credential and
 	// this call replaced it. Re-issuing is a supported operation, not an error, and this
@@ -2135,10 +2225,17 @@ type SubscriberProvisioningResult struct {
 // # SEC-02: enforcement is verified BEFORE the credential is written, and failure is fatal
 //
 // In KRaft mode a broker enforces ACLs only when it is started with
-// authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer.
-// WITHOUT IT, CreateACLs SUCCEEDS AND THE BINDINGS ARE NEVER APPLIED: every request from
-// every principal is allowed, the bindings are visible in kafka-acls output, and an isolation
-// test would pass while proving nothing at all.
+// authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer. WITHOUT IT
+// THERE IS NO BOUNDARY AT ALL: with no authorizer configured, every request from every
+// principal is permitted, so a credential minted against such a broker reads every topic
+// Blnk owns — and an isolation test run against it would pass while proving nothing.
+//
+// Such a broker also refuses the ACL administrative APIs themselves: Create, Delete and
+// Describe all answer SECURITY_DISABLED, because there is no authorizer to answer them. That
+// is what makes the state DETECTABLE rather than merely dangerous, and it is what the probe
+// below reads — but it also means provisioning cannot succeed even partially: the bindings
+// this method would create are refused outright, so proceeding would leave a working
+// credential with no bindings and unrestricted access.
 //
 // The probe used to run AFTER the credential was written and was warning-only, so on such a
 // broker this method minted a working credential, returned it, and reported success. The
@@ -2181,7 +2278,12 @@ type SubscriberProvisioningResult struct {
 func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 	ctx context.Context,
 	req SubscriberProvisioningRequest,
-) (SubscriberProvisioningResult, error) {
+) (_ SubscriberProvisioningResult, err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "provision_subscriber_principal",
+		hashedSubscriberSpanAttribute(req.SubscriberID))
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
 	result := SubscriberProvisioningResult{
 		SubscriberID: strings.TrimSpace(req.SubscriberID),
 		Mechanism:    SubscriberSASLMechanism,
@@ -2205,6 +2307,17 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 	result.Topics = topics
 	result.ConsumerGroupPrefix = groupPrefix
 
+	// SEC-05: BEFORE the authorizer probe and before any write, because a collision here means
+	// the SCRAM upsert below would rotate one of this deployment's OWN credentials and return
+	// it in the response. Configuration validation already refuses such a deployment at
+	// start-up; this is the second gate, because configuration can be reloaded and an admin
+	// client can be constructed from a configuration this process never validated. It costs one
+	// slice comparison and it is the difference between an authorized API call minting a
+	// subscriber credential and an authorized API call minting a Kafka superuser one.
+	if err := a.requirePrincipalNotReserved(principal); err != nil {
+		return result, err
+	}
+
 	// SEC-02: BEFORE anything is written. A credential minted against a broker that does not
 	// enforce ACLs — or one whose enforcement cannot be confirmed — has no boundary, so this
 	// is a precondition rather than a diagnostic.
@@ -2223,8 +2336,8 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 		return result, err
 	default:
 		logrus.WithFields(logrus.Fields{
-			"principal": sanitizeLogValue(principal, maxLoggedFilterLength),
-			"error":     sanitizeLogValue(err.Error(), maxLoggedErrorLength),
+			"principal_hash": subscriberLogLabel(principal),
+			"error_class":    kafkaErrorClassField("provision_subscriber_principal", err),
 		}).Debug(
 			"kafka admin: could not determine whether the principal already holds a credential; provisioning anyway",
 		)
@@ -2260,6 +2373,18 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 		// that itself failed leaves CredentialWritten true and Compensated false, which is
 		// the state the broker is actually left in and the only signal that tells the caller
 		// a live principal needs manual revocation.
+		//
+		// DEFERRED when the caller asked for it: the two round trips are handed back instead of
+		// being added to a response whose budget has usually already expired. CredentialWritten
+		// stays TRUE, because it is true — the credential exists and nothing has revoked it yet —
+		// and the caller is obliged to run the compensation.
+		if req.DeferCompensation {
+			result.CompensationOwed = true
+			result.OwedBindings = bindings
+
+			return result, err
+		}
+
 		if cleanupErr := a.compensateFailedProvisioning(ctx, principal, bindings); cleanupErr == nil {
 			result.CredentialWritten = false
 			result.Compensated = true
@@ -2270,12 +2395,16 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 
 	result.ACLBindings = len(bindings)
 	result.ACLBindingsRemoved = reconciliation.Removed
-	result.ForeignACLBindings = len(reconciliation.Foreign)
+	// Deny bindings only. A foreign ALLOW made reconcileSubscriberACLs return an error above,
+	// so a successful provisioning is by construction one with no widening binding on the
+	// principal — which is what makes the issuance response's enforced-access declaration true
+	// rather than aspirational.
+	result.ForeignACLBindings = len(reconciliation.Foreign())
 
 	if len(topics) == 0 {
 		logrus.WithFields(logrus.Fields{
-			"principal":  sanitizeLogValue(principal, maxLoggedFilterLength),
-			"subscriber": sanitizeLogValue(result.SubscriberID, maxLoggedFilterLength),
+			"principal_hash":     subscriberLogLabel(principal),
+			"subscriber_id_hash": subscriberLogLabel(result.SubscriberID),
 		}).Warn(
 			"kafka admin: principal provisioned with no authorised topics, so it can read nothing. This is the " +
 				"fail-closed default of a newly registered subscriber; grant topics on the subscriber before " +
@@ -2285,8 +2414,8 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 
 	if groupPrefix == "" {
 		logrus.WithFields(logrus.Fields{
-			"principal":  sanitizeLogValue(principal, maxLoggedFilterLength),
-			"subscriber": sanitizeLogValue(result.SubscriberID, maxLoggedFilterLength),
+			"principal_hash":     subscriberLogLabel(principal),
+			"subscriber_id_hash": subscriberLogLabel(result.SubscriberID),
 		}).Warn(
 			"kafka admin: principal provisioned without a consumer group grant, so it cannot join a consumer " +
 				"group; set the subscriber's consumer group before issuing credentials",
@@ -2296,17 +2425,18 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 	result.ProvisionedAt = time.Now().UTC()
 
 	logrus.WithFields(logrus.Fields{
-		"subscriber":            sanitizeLogValue(result.SubscriberID, maxLoggedFilterLength),
-		"principal":             sanitizeLogValue(principal, maxLoggedFilterLength),
-		"mechanism":             SubscriberSASLMechanism,
-		"iterations":            iterations,
-		"topics":                len(topics),
-		"consumer_group_prefix": sanitizeLogValue(groupPrefix, maxLoggedFilterLength),
-		"acl_bindings":          result.ACLBindings,
-		"acl_bindings_removed":  result.ACLBindingsRemoved,
-		"foreign_acl_bindings":  result.ForeignACLBindings,
-		"credential_replaced":   result.CredentialReplaced,
-		"authorizer_active":     result.AuthorizerActive,
+		"subscriber_id_hash":   subscriberLogLabel(result.SubscriberID),
+		"principal_hash":       subscriberLogLabel(principal),
+		"mechanism":            SubscriberSASLMechanism,
+		"iterations":           iterations,
+		"topics":               len(topics),
+		"consumer_group_hash":  consumerGroupLogLabel(groupPrefix),
+		"acl_bindings":         result.ACLBindings,
+		"acl_bindings_removed": result.ACLBindingsRemoved,
+		"foreign_acl_bindings": result.ForeignACLBindings,
+		"foreign_acl_granting": result.ForeignACLBindingsGranting,
+		"credential_replaced":  result.CredentialReplaced,
+		"authorizer_active":    result.AuthorizerActive,
 	}).Info("kafka admin: subscriber principal provisioned")
 
 	return result, nil
@@ -2407,9 +2537,11 @@ func (r SubscriberProvisioningRequest) validate() error {
 //     such entry turns a per-topic grant into a cluster-wide one.
 //   - FOREIGN topics, because a grant over a topic Blnk does not own is a grant into
 //     somebody else's data on a broker Blnk shares.
-//   - DEAD-LETTER and INTERNAL topics, because the DLTs carry failed events with Blnk's own
-//     failure metadata and the system category carries Blnk's internal
-//     diagnostics and uncatalogued payloads. None of those has a subscriber audience.
+//   - DEAD-LETTER topics, because every DLT carries other subscribers' failed events
+//     together with Blnk's own failure metadata, so it has no subscriber audience. This is
+//     the only owned-name class excluded: all four categories are grantable, and the
+//     exclusion is structural rather than listed, since SubscriberGrantableTopics composes
+//     only "<prefix>.<category>" names and a ".dlt" name can never be one.
 //
 // IsSubscriberGrantableTopic is the single test for all three, so the API layer, this path
 // and the provisioning script cannot disagree about what is grantable.
@@ -2420,9 +2552,9 @@ func (r SubscriberProvisioningRequest) validateTopics() error {
 	for _, topic := range normalizeTopicList(r.Topics) {
 		if !IsSubscriberGrantableTopic(topic) {
 			return fmt.Errorf(
-				"kafka admin: refusing to grant topic %q; only Blnk-owned subscriber-facing category "+
-					"topics may be granted (%s). Dead-letter and internal topics carry Blnk's own "+
-					"failure and diagnostic data and have no subscriber audience",
+				"kafka admin: refusing to grant topic %q; only Blnk-owned category topics may be "+
+					"granted (%s). Dead-letter topics carry other subscribers' failed events together "+
+					"with Blnk's failure metadata and have no subscriber audience",
 				topic, strings.Join(SubscriberGrantableTopics(), ", "),
 			)
 		}
@@ -2872,6 +3004,14 @@ func (a *KafkaAdminClient) createACLBindings(ctx context.Context, principal stri
 //
 // The asymmetry is deliberate and is the safe direction: Blnk removes only what it would
 // itself have created, and names anything else so an operator can decide.
+//
+// Leaving a foreign binding in place is NOT the same as accepting it, though, and the two were
+// conflated. Reconciliation reports the binding and moves on; PROVISIONING then refuses to issue
+// a credential while any foreign binding GRANTS access, because the boundary a credential is
+// issued against is the one the broker will actually enforce — the union of Blnk's converged
+// grant and everything else on the principal. A foreign DENY is exempt, since it can only
+// tighten that union. See foreignACLBindingGrantsAccess and the refusal in
+// ProvisionSubscriberPrincipal.
 // ---------------------------------------------------------------------------------------
 
 // SubscriberACLReconciliation reports what one reconciliation of a principal's bindings did.
@@ -2896,10 +3036,52 @@ type SubscriberACLReconciliation struct {
 	// Removed is how many surplus Blnk-shaped bindings were deleted.
 	Removed int
 
-	// Foreign describes every binding on this principal that Blnk does not own and did not
-	// touch, one entry per binding, in the broker's own vocabulary. Empty in the ordinary
-	// case; non-empty means somebody granted this principal access by hand.
-	Foreign []string
+	// ForeignAllow describes every binding on this principal that Blnk does not own and that
+	// WIDENS its access — an ALLOW of a shape Blnk never provisions, or a binding whose
+	// permission type the broker did not state definitively.
+	//
+	// A NON-EMPTY ForeignAllow MEANS THE EFFECTIVE GRANT IS BROADER THAN THE REGISTRY
+	// RECORDS, and by an amount Blnk cannot describe. That is why it is separated from
+	// ForeignDeny rather than counted alongside it: the two are opposite facts. A widening
+	// binding invalidates every isolation statement Blnk would otherwise make about the
+	// principal, so an operation that would hand out a credential or converge a widening
+	// REFUSES while any are present — see reconcileSubscriberACLs.
+	//
+	// Blnk still does not delete them. ACL deletion has no undo and an operator's deliberate
+	// binding is not Blnk's to remove; refusing names the problem and leaves the decision
+	// where it belongs, which is the same asymmetry the rest of this surface follows.
+	ForeignAllow []string
+
+	// ForeignDeny describes every foreign binding that can only NARROW the principal's
+	// access: an explicit DENY.
+	//
+	// These are reported and retained and are never fatal. A DENY subtracts from what the
+	// ALLOW bindings grant, so its presence means the subscriber can read less than its grant
+	// describes — which cannot be an isolation failure, and which an operator may well have
+	// added on purpose. Refusing on one would block credential issuance for a principal that
+	// is more restricted than Blnk requires.
+	ForeignDeny []string
+}
+
+// Foreign returns every foreign binding, widening ones first.
+//
+// It exists for logging and counting, where the distinction does not matter and a single list
+// reads better. Anything that ACTS on the difference must read ForeignAllow directly:
+// collapsing the two is exactly the conflation that let a widening binding be reported with
+// the same weight as a harmless DENY and then survive issuance.
+//
+// Returns:
+//   - []string: a fresh slice; nil when there are none.
+func (r SubscriberACLReconciliation) Foreign() []string {
+	if len(r.ForeignAllow) == 0 && len(r.ForeignDeny) == 0 {
+		return nil
+	}
+
+	foreign := make([]string, 0, len(r.ForeignAllow)+len(r.ForeignDeny))
+	foreign = append(foreign, r.ForeignAllow...)
+	foreign = append(foreign, r.ForeignDeny...)
+
+	return foreign
 }
 
 // describeSubscriberACLs reads every ACL binding the broker currently holds for a principal.
@@ -3010,6 +3192,193 @@ func blnkManagedACLBinding(binding kafka.ACLEntry) bool {
 	}
 }
 
+// foreignACLBindingWidens reports whether a foreign binding can GRANT access, as opposed to
+// only taking it away.
+//
+// It is called only on bindings blnkManagedACLBinding has already rejected, so every input is
+// a binding Blnk does not own. The question here is the different and security-critical one:
+// does it make the principal's effective grant broader than the registry records?
+//
+// # Only an unambiguous DENY is treated as harmless
+//
+// Kafka's permission type has four values, and the two that are neither Allow nor Deny —
+// Unknown and Any — are treated as WIDENING. That is deliberate and it is the fail-closed
+// reading: a binding whose permission the broker did not state definitively cannot be shown to
+// narrow anything, and "I could not tell" must never be recorded as "it is safe". Any is
+// additionally a FILTER value rather than a binding value, so seeing it on a described binding
+// means the client or broker returned something this code does not understand, which is exactly
+// when guessing is worst.
+//
+// Parameters:
+//   - binding kafka.ACLEntry: a foreign binding.
+//
+// Returns:
+//   - bool: false only for an explicit Deny; true for everything else.
+func foreignACLBindingWidens(binding kafka.ACLEntry) bool {
+	return binding.PermissionType != kafka.ACLPermissionTypeDeny
+}
+
+// reservedKafkaPrincipals returns the SASL usernames this deployment uses for its own Kafka
+// access, trimmed and deduplicated, with blanks dropped.
+//
+// It is the administrative principal and the producer principal — the two identities a
+// subscriber credential must never be minted for. Both are read even when only one is
+// configured, because "not configured" and "configured to the same thing" are different
+// situations and only the first is safe to ignore.
+//
+// Parameters:
+//   - kafka config.KafkaConfig: the loaded Kafka configuration.
+//
+// Returns:
+//   - []string: the reserved usernames; nil when no SASL identity is configured.
+func reservedKafkaPrincipals(kafkaConfig config.KafkaConfig) []string {
+	candidates := []string{
+		strings.TrimSpace(kafkaConfig.SASLAdminUser),
+		strings.TrimSpace(kafkaConfig.SASLUser),
+	}
+
+	var reserved []string
+	for _, candidate := range candidates {
+		if candidate == "" || slices.Contains(reserved, candidate) {
+			continue
+		}
+
+		reserved = append(reserved, candidate)
+	}
+
+	return reserved
+}
+
+// ErrSubscriberPrincipalReserved is returned when a subscriber's DERIVED principal collides
+// with one of this deployment's own Kafka identities.
+//
+// # The escalation this closes
+//
+// Provisioning performs a SCRAM UPSERT: an existing credential for the principal is REPLACED
+// with a freshly generated password, which the issuance response then returns. So a subscriber
+// whose derived principal happens to equal the administrative or producer username does not get
+// a new identity — it gets THAT identity's credential rotated and handed to the caller, along
+// with either Write on every Blnk-owned topic or the ability to mint credentials and grant ACLs.
+//
+// Configuration validation refuses such a deployment at start-up. This is the second gate, and
+// it exists because the first one is not sufficient on its own: configuration can be reloaded,
+// and an admin client can be built from a configuration this process never validated. The check
+// is cheap, it runs immediately before the write it protects, and a collision here is a
+// deployment fault rather than a caller fault — so it is stated plainly rather than as a
+// validation message aimed at whoever made the request.
+var ErrSubscriberPrincipalReserved = errors.New(
+	"kafka admin: the subscriber's derived principal is one of this deployment's own Kafka " +
+		"identities, so provisioning it would rotate and return that credential; KAFKA_SASL_USER " +
+		"and KAFKA_SASL_ADMIN_USER must not sit inside the reserved 'blnk-sub-' namespace",
+)
+
+// requirePrincipalNotReserved refuses a principal that is one of the deployment's own.
+//
+// Comparison is exact and case-sensitive on the trimmed value, because Kafka principals are
+// case-sensitive: "blnk-sub-x" and "BLNK-SUB-X" are two different identities at the broker, so
+// folding case here would refuse a provisioning that is in fact safe.
+//
+// Parameters:
+//   - principal string: the DERIVED subscriber principal, never a caller-supplied one.
+//
+// Returns:
+//   - error: an error wrapping ErrSubscriberPrincipalReserved on a collision, else nil.
+func (a *KafkaAdminClient) requirePrincipalNotReserved(principal string) error {
+	principal = strings.TrimSpace(principal)
+	if principal == "" || !slices.Contains(a.reservedPrincipals, principal) {
+		return nil
+	}
+
+	logrus.WithField("principal_hash", subscriberLogLabel(principal)).Error(
+		"kafka admin: refusing to provision a subscriber credential for a principal that is this " +
+			"deployment's own Kafka identity; the SCRAM write would rotate that credential and the " +
+			"response would return it. Move KAFKA_SASL_USER and KAFKA_SASL_ADMIN_USER outside the " +
+			"reserved 'blnk-sub-' namespace",
+	)
+
+	return fmt.Errorf("%w (principal %q)",
+		ErrSubscriberPrincipalReserved,
+		sanitizeLogValue(principal, maxLoggedFilterLength),
+	)
+}
+
+// ErrSubscriberForeignACLGrant is returned when a subscriber principal carries an ALLOW ACL
+// binding Blnk did not provision.
+//
+// # Why this is fatal rather than a warning
+//
+// The whole isolation guarantee is "the principal may Read and Describe exactly these topics,
+// and join exactly this consumer-group namespace". A foreign ALLOW binding is, by definition,
+// access outside that set — and Blnk cannot say how much, because the binding may name any
+// resource, pattern, host and operation the broker supports.
+//
+// It used to be detected, logged at warning level, and then provisioning continued: a
+// credential was minted, the password was returned, and the response declared an enforced
+// access boundary that the broker was not in fact enforcing. Nothing in the response said
+// otherwise, and the only trace was one log line in the stream of a SUCCESSFUL request.
+//
+// Now the operation refuses. Nothing is deleted — ACL deletion has no undo and an operator's
+// deliberate binding is not Blnk's to remove — so the remedy is operational and the message
+// says so, and the caller's compensation revokes any credential that was already written.
+var ErrSubscriberForeignACLGrant = errors.New(
+	"kafka admin: this subscriber principal carries ALLOW ACL bindings Blnk did not provision, " +
+		"so its effective access is broader than the subscriber registry records and cannot be " +
+		"stated; remove the foreign bindings with kafka-acls, or move them to a principal outside " +
+		"the reserved subscriber namespace, and retry",
+)
+
+// refuseForeignACLGrant builds the fail-closed error for a principal carrying foreign ALLOW
+// bindings.
+//
+// The bindings are NAMED in the error, already sanitized and bounded by the caller, because the
+// remedy is to remove them by hand and an operator who cannot see which ones they are has to go
+// and describe the ACLs again. The principal is named for the same reason.
+//
+// It wraps ErrSubscriberForeignACLGrant so a caller can classify it with errors.Is without
+// matching on the message.
+//
+// Parameters:
+//   - principal string: the bare SASL username.
+//   - widening []string: the rendered foreign ALLOW bindings.
+//
+// Returns:
+//   - error: an error wrapping ErrSubscriberForeignACLGrant.
+func refuseForeignACLGrant(principal string, widening []string) error {
+	return fmt.Errorf("%w (principal %q, %d binding(s): %s)",
+		ErrSubscriberForeignACLGrant,
+		sanitizeLogValue(principal, maxLoggedFilterLength),
+		len(widening),
+		strings.Join(widening, "; "),
+	)
+}
+
+// classifyForeignACLBinding records one foreign binding on the report, in the list its
+// permission type puts it in.
+//
+// It is the single place a foreign binding is rendered, so every reader — the warning, the
+// refusal error and any test — sees identical text for identical bindings. The resource name and
+// the host are sanitized and length-bounded because both are operator-supplied strings that end
+// up in a log line and in an error body, where an unbounded value with newlines in it can forge
+// log structure.
+//
+// Parameters:
+//   - report *SubscriberACLReconciliation: the report being assembled. Must not be nil.
+//   - binding kafka.ACLEntry: a binding blnkManagedACLBinding has already rejected.
+func classifyForeignACLBinding(report *SubscriberACLReconciliation, binding kafka.ACLEntry) {
+	rendered := fmt.Sprintf("%s %s on %s %q (%s, host %s)",
+		binding.PermissionType, binding.Operation, binding.ResourceType,
+		sanitizeLogValue(binding.ResourceName, maxLoggedFilterLength),
+		binding.ResourcePatternType, sanitizeLogValue(binding.Host, maxLoggedFilterLength))
+
+	if foreignACLBindingWidens(binding) {
+		report.ForeignAllow = append(report.ForeignAllow, rendered)
+
+		return
+	}
+
+	report.ForeignDeny = append(report.ForeignDeny, rendered)
+}
+
 // aclBindingKey renders a binding as the tuple that identifies it, so two bindings can be
 // compared as set members.
 //
@@ -3077,10 +3446,7 @@ func (a *KafkaAdminClient) reconcileSubscriberACLs(
 
 	for _, binding := range observed {
 		if !blnkManagedACLBinding(binding) {
-			report.Foreign = append(report.Foreign, fmt.Sprintf("%s %s on %s %q (%s, host %s)",
-				binding.PermissionType, binding.Operation, binding.ResourceType,
-				sanitizeLogValue(binding.ResourceName, maxLoggedFilterLength),
-				binding.ResourcePatternType, sanitizeLogValue(binding.Host, maxLoggedFilterLength)))
+			classifyForeignACLBinding(&report, binding)
 
 			continue
 		}
@@ -3095,15 +3461,37 @@ func (a *KafkaAdminClient) reconcileSubscriberACLs(
 		}
 	}
 
-	if len(report.Foreign) > 0 {
+	if len(report.ForeignDeny) > 0 {
 		logrus.WithFields(logrus.Fields{
-			"principal": sanitizeLogValue(report.Principal, maxLoggedFilterLength),
-			"bindings":  report.Foreign,
+			"principal_hash": subscriberLogLabel(report.Principal),
+			"bindings":       report.Foreign,
 		}).Warn(
-			"kafka admin: this principal carries ACL bindings Blnk does not provision and will not " +
-				"remove; they grant access the subscriber registry does not describe, so review them " +
-				"by hand",
+			"kafka admin: this principal carries DENY ACL bindings Blnk does not provision and will " +
+				"not remove; they only narrow what the grant allows, so provisioning continues — but " +
+				"the subscriber may read less than its authorised topics suggest",
 		)
+	}
+
+	// AUTH-03: REFUSED HERE, before anything is deleted or created, so a principal whose
+	// effective grant Blnk cannot state is left exactly as it was found.
+	//
+	// A foreign ALLOW binding is access outside the boundary the registry describes, by an
+	// amount Blnk cannot bound. It used to be logged and then ignored: the reconciliation
+	// reported success, the caller minted the credential, and the issuance response declared
+	// an enforced boundary the broker was not enforcing. Refusing before the mutations means
+	// the broker state is unchanged, and the caller's own compensation revokes the credential
+	// it had already written — so no password can be returned under an unknown grant.
+	if len(report.ForeignAllow) > 0 {
+		logrus.WithFields(logrus.Fields{
+			"principal_hash": subscriberLogLabel(report.Principal),
+			"bindings":       report.ForeignAllow,
+		}).Error(
+			"kafka admin: this principal carries ALLOW ACL bindings Blnk did not provision, so its " +
+				"effective access is broader than the subscriber registry records; refusing to " +
+				"reconcile or issue credentials until they are removed by hand",
+		)
+
+		return report, refuseForeignACLGrant(report.Principal, report.ForeignAllow)
 	}
 
 	if len(surplus) > 0 {
@@ -3135,12 +3523,13 @@ func (a *KafkaAdminClient) reconcileSubscriberACLs(
 	}
 
 	logrus.WithFields(logrus.Fields{
-		"principal": sanitizeLogValue(report.Principal, maxLoggedFilterLength),
-		"desired":   report.Desired,
-		"managed":   report.Managed,
-		"created":   report.Created,
-		"removed":   report.Removed,
-		"foreign":   len(report.Foreign),
+		"principal_hash": subscriberLogLabel(report.Principal),
+		"desired":        report.Desired,
+		"managed":        report.Managed,
+		"created":        report.Created,
+		"removed":        report.Removed,
+		// Deny only: a widening binding cannot reach this line, because it returned above.
+		"foreign_deny": len(report.ForeignDeny),
 	}).Info("kafka admin: subscriber ACL bindings reconciled")
 
 	return report, nil
@@ -3177,7 +3566,11 @@ func (a *KafkaAdminClient) reconcileSubscriberACLs(
 func (a *KafkaAdminClient) PruneSubscriberAccess(
 	ctx context.Context,
 	subscriber *model.EventSubscriber,
-) (SubscriberACLReconciliation, error) {
+) (_ SubscriberACLReconciliation, err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "prune_subscriber_access", subscriberSpanAttribute(subscriber))
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
 	desired, principal, err := subscriberDesiredBindings(subscriber)
 	if err != nil {
 		return SubscriberACLReconciliation{}, err
@@ -3198,6 +3591,15 @@ func (a *KafkaAdminClient) PruneSubscriberAccess(
 	surplus := make([]kafka.ACLEntry, 0, len(observed))
 	for _, binding := range observed {
 		if !blnkManagedACLBinding(binding) {
+			// CLASSIFIED AND REPORTED, NEVER REFUSED. This is the one operation on this
+			// surface that must not fail closed on a foreign ALLOW binding, and the reason is
+			// the direction it moves in: pruning only ever REMOVES access, so refusing it
+			// would leave the subscriber with MORE access than the operator asked for —
+			// precisely the outcome the refusal exists to prevent. The widening binding is
+			// surfaced on the report so the caller and the log say so, and the next operation
+			// that would hand out a credential or converge a widening is the one that refuses.
+			classifyForeignACLBinding(&report, binding)
+
 			continue
 		}
 
@@ -3206,6 +3608,17 @@ func (a *KafkaAdminClient) PruneSubscriberAccess(
 		if _, keep := wanted[aclBindingKey(binding)]; !keep {
 			surplus = append(surplus, binding)
 		}
+	}
+
+	if len(report.ForeignAllow) > 0 {
+		logrus.WithFields(logrus.Fields{
+			"principal_hash": subscriberLogLabel(principal),
+			"bindings":       report.ForeignAllow,
+		}).Error(
+			"kafka admin: this principal carries ALLOW ACL bindings Blnk did not provision, so " +
+				"narrowing its authorization does NOT narrow its effective access; the obsolete " +
+				"Blnk-owned bindings were still removed, but the foreign grants must be removed by hand",
+		)
 	}
 
 	if len(surplus) == 0 {
@@ -3222,9 +3635,9 @@ func (a *KafkaAdminClient) PruneSubscriberAccess(
 	report.Removed = len(surplus)
 
 	logrus.WithFields(logrus.Fields{
-		"principal": sanitizeLogValue(principal, maxLoggedFilterLength),
-		"removed":   report.Removed,
-		"desired":   report.Desired,
+		"principal_hash": subscriberLogLabel(principal),
+		"removed":        report.Removed,
+		"desired":        report.Desired,
 	}).Info("kafka admin: obsolete subscriber ACL bindings removed")
 
 	return report, nil
@@ -3247,7 +3660,11 @@ func (a *KafkaAdminClient) PruneSubscriberAccess(
 func (a *KafkaAdminClient) GrantSubscriberAccess(
 	ctx context.Context,
 	subscriber *model.EventSubscriber,
-) (SubscriberACLReconciliation, error) {
+) (_ SubscriberACLReconciliation, err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "grant_subscriber_access", subscriberSpanAttribute(subscriber))
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
 	desired, principal, err := subscriberDesiredBindings(subscriber)
 	if err != nil {
 		return SubscriberACLReconciliation{}, err
@@ -3258,7 +3675,7 @@ func (a *KafkaAdminClient) GrantSubscriberAccess(
 	if len(desired) == 0 {
 		// Nothing to grant. Reported rather than silently skipped, because "authorised for
 		// nothing" is a real state and an operator reading the log should see it stated.
-		logrus.WithField("principal", sanitizeLogValue(principal, maxLoggedFilterLength)).Info(
+		logrus.WithField("principal_hash", subscriberLogLabel(principal)).Info(
 			"kafka admin: the subscriber's recorded authorization grants nothing, so no ACL binding " +
 				"was created",
 		)
@@ -3276,7 +3693,42 @@ func (a *KafkaAdminClient) GrantSubscriberAccess(
 		present[aclBindingKey(binding)] = struct{}{}
 		if blnkManagedACLBinding(binding) {
 			report.Managed++
+
+			continue
 		}
+
+		classifyForeignACLBinding(&report, binding)
+	}
+
+	// AUTH-03: a WIDENING refuses, for the same reason issuance does. Converging a wider grant
+	// on a principal whose effective access Blnk cannot state would report the registry and the
+	// broker as agreeing when they demonstrably do not. Refusing leaves the subscriber with the
+	// access it already had — less than the row now records, which is the documented safe
+	// direction this whole three-step surface is built around, and which the caller reports as
+	// retryable.
+	//
+	// Pruning is deliberately exempt: see PruneSubscriberAccess.
+	if len(report.ForeignAllow) > 0 {
+		logrus.WithFields(logrus.Fields{
+			"principal_hash": subscriberLogLabel(principal),
+			"bindings":       report.ForeignAllow,
+		}).Error(
+			"kafka admin: this principal carries ALLOW ACL bindings Blnk did not provision, so its " +
+				"effective access is broader than the subscriber registry records; refusing to grant " +
+				"further access until they are removed by hand",
+		)
+
+		return report, refuseForeignACLGrant(principal, report.ForeignAllow)
+	}
+
+	if len(report.ForeignDeny) > 0 {
+		logrus.WithFields(logrus.Fields{
+			"principal_hash": subscriberLogLabel(principal),
+			"bindings":       report.ForeignDeny,
+		}).Warn(
+			"kafka admin: this principal carries DENY ACL bindings Blnk does not provision; they only " +
+				"narrow the grant, so the requested bindings were still created",
+		)
 	}
 
 	missing := make([]kafka.ACLEntry, 0, len(desired))
@@ -3299,9 +3751,9 @@ func (a *KafkaAdminClient) GrantSubscriberAccess(
 	report.Created = len(missing)
 
 	logrus.WithFields(logrus.Fields{
-		"principal": sanitizeLogValue(principal, maxLoggedFilterLength),
-		"created":   report.Created,
-		"desired":   report.Desired,
+		"principal_hash": subscriberLogLabel(principal),
+		"created":        report.Created,
+		"desired":        report.Desired,
 	}).Info("kafka admin: subscriber ACL bindings granted")
 
 	return report, nil
@@ -3374,7 +3826,11 @@ func subscriberDesiredBindings(subscriber *model.EventSubscriber) ([]kafka.ACLEn
 //   - bool: true when a SHA-512 credential is present.
 //   - error: ErrKafkaAdminNotConfigured, a validation error for a blank principal, or a
 //     wrapped broker error. An unknown principal is NOT an error; it is false.
-func (a *KafkaAdminClient) SubscriberCredentialExists(ctx context.Context, principal string) (bool, error) {
+func (a *KafkaAdminClient) SubscriberCredentialExists(ctx context.Context, principal string) (_ bool, err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "describe_subscriber_credential")
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
 	if err := a.ready(ctx); err != nil {
 		return false, err
 	}
@@ -3451,7 +3907,11 @@ func (a *KafkaAdminClient) SubscriberCredentialExists(ctx context.Context, princ
 //     security disabled.
 //   - error: ErrKafkaAdminNotConfigured, or a wrapped broker error when the question
 //     could not be answered.
-func (a *KafkaAdminClient) AuthorizerActive(ctx context.Context) (bool, error) {
+func (a *KafkaAdminClient) AuthorizerActive(ctx context.Context) (_ bool, err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "describe_authorizer")
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
 	if err := a.ready(ctx); err != nil {
 		return false, err
 	}
@@ -3490,6 +3950,22 @@ func (a *KafkaAdminClient) AuthorizerActive(ctx context.Context) (bool, error) {
 // no answer — are provably one refusal.
 var ErrAuthorizerNotEnforcing = errors.New(
 	"kafka admin: the broker's ACL enforcement is not confirmed, so no subscriber credential may be issued",
+)
+
+// ErrForeignACLGrantsAccess reports that the principal carries ACL bindings Blnk did not create
+// which grant it access wider than its recorded authorization, so no credential may be issued.
+//
+// It is a sentinel for the same reasons as ErrAuthorizerNotEnforcing: the subscriber service,
+// the API layer and a test all recognise the refusal without matching message text.
+//
+// It is a SIBLING of that error rather than a variation on it, because the two describe the two
+// ways an authorization boundary can be absent. There, the broker would not enforce the
+// bindings; here, the bindings themselves say more than the registry does. Either way the
+// credential would authenticate a principal whose real permissions are not the ones Blnk
+// recorded, which is the state credential issuance exists to prevent.
+var ErrForeignACLGrantsAccess = errors.New(
+	"kafka admin: the principal holds ACL bindings Blnk did not create that grant access beyond its " +
+		"recorded authorization, so no subscriber credential may be issued",
 )
 
 // clock returns the time source, defaulting to time.Now.
@@ -3743,8 +4219,8 @@ func (a *KafkaAdminClient) requireEnforcedAuthorizer(ctx context.Context, princi
 	active, err := a.authorizerActiveCached(ctx)
 	if err != nil {
 		logrus.WithFields(logrus.Fields{
-			"principal": sanitizeLogValue(principal, maxLoggedFilterLength),
-			"error":     sanitizeLogValue(err.Error(), maxLoggedErrorLength),
+			"principal_hash": subscriberLogLabel(principal),
+			"error_class":    kafkaErrorClassField("revoke_subscriber_principal", err),
 		}).Error(
 			"kafka admin: refusing to issue a subscriber credential because the broker's ACL enforcement " +
 				"could not be confirmed. Confirm the broker runs " +
@@ -3761,7 +4237,7 @@ func (a *KafkaAdminClient) requireEnforcedAuthorizer(ctx context.Context, princi
 	}
 
 	if !active {
-		logrus.WithField("principal", principal).Error(
+		logrus.WithField("principal_hash", subscriberLogLabel(principal)).Error(
 			"kafka admin: THE BROKER HAS NO AUTHORIZER CONFIGURED, so no credential was issued. ACL " +
 				"bindings would be accepted and never applied, leaving every principal able to read every " +
 				"topic including other subscribers' topics and the dead-letter topics. Start the broker with " +
@@ -3786,9 +4262,13 @@ func (a *KafkaAdminClient) requireEnforcedAuthorizer(ctx context.Context, princi
 // the caller one budget, not one per call. Ten seconds is enough for two round trips against a
 // broker that is refusing rather than hanging, which is the ordinary shape of the failure being
 // compensated.
+//
+// It is a CEILING AND ONLY A CEILING, applying when no wall clock is in force.
+// kafkaCleanupContext bounds the phase by the caller's SLA whenever there is one, so a
+// compensation inside a five-second credential issuance never spends ten.
 const kafkaCleanupBudget = kafkaAdminRequestTimeout
 
-// kafkaCleanupContext derives the context a compensating operation runs on.
+// kafkaCleanupContext derives the context a compensating broker operation runs on.
 //
 // It carries the caller's VALUES — trace context above all, so the cleanup appears under the
 // span that caused it — and deliberately NOT the caller's cancellation. See
@@ -3796,14 +4276,45 @@ const kafkaCleanupBudget = kafkaAdminRequestTimeout
 // commonest reason provisioning fails is its own deadline expiring, and a cleanup that
 // inherited that deadline could never run on the occasion it exists for.
 //
+// # SLA-01: detached from cancellation, still inside the caller's wall clock
+//
+// Detaching from the cancellation is not licence to detach from the DEADLINE. "Fresh" once meant
+// a brand-new TEN-second budget, and it was the single largest contributor to a five-second
+// credential-issuance contract answering in twenty: an issuance whose broker call failed spent
+// its own budget and then this one on top, with every individual timeout looking correct because
+// they were merely serialised. Requirement R-7 states the ceiling over the RESPONSE, not over
+// each call inside it. Detachment from CANCELLATION is what the cleanup needs; a new wall clock
+// never was.
+//
+// So when the caller is operating under a wall clock — credential issuance is, and it is the only
+// caller that makes a timed promise — this context is bounded by that clock's compensation phase
+// instead. subscriberPhaseContext owns the arithmetic, and two parts of it matter here:
+//
+//   - THE DURABILITY RESERVE is subtracted, so the compensation cannot consume the slice held
+//     back for writing the revocation obligation. A compensation that spent the last of the
+//     budget would leave an exposure whose only record is a log line, which is the exposure the
+//     obligation exists to remove.
+//   - A FLOOR applies, because a zero-length context fails every call instantly: a compensation
+//     reached slightly late would do nothing at all and report that it had tried. The floor is
+//     small enough that it cannot meaningfully extend the response and large enough for one
+//     round trip to a broker that is refusing rather than hanging.
+//
+// A caller with no wall clock keeps the ten-second bound, which is the right size for two round
+// trips against a broker that is refusing rather than hanging.
+//
+// Neither bound makes this path the thing that guarantees cleanup. The service layer persists
+// the revocation obligation BEFORE reaching here and finishes the revocation in the background
+// when the budget is spent — see EventSubscriberService.recordFailure.
+//
 // Parameters:
-//   - ctx context.Context: the caller's context, used for its values.
+//   - ctx context.Context: the caller's context, used for its values and its issuance deadline.
 //
 // Returns:
-//   - context.Context: a fresh context bounded by kafkaCleanupBudget.
+//   - context.Context: a context detached from the caller's cancellation and bounded either by
+//     the caller's wall clock or by kafkaCleanupBudget.
 //   - context.CancelFunc: must be called, conventionally by defer.
 func kafkaCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), kafkaCleanupBudget)
+	return subscriberPhaseContext(ctx, subscriberDurabilityReserve, kafkaCleanupBudget, true)
 }
 
 // compensateFailedProvisioning undoes a half-completed provisioning.
@@ -3837,11 +4348,20 @@ func kafkaCleanupContext(ctx context.Context) (context.Context, context.CancelFu
 // reported anyway, and the credential stayed live at the broker with nothing recording it. The
 // compensation was busiest precisely when it could not work.
 //
-// A fresh context, detached from the caller's cancellation and bounded by its own budget,
-// makes the cleanup possible in exactly that case. It is BOUNDED rather than merely detached
-// for the reason every other detached write in this codebase is: "finish what you owe" must
-// not become "block the request indefinitely on a broker that has gone away". The two round
-// trips share one budget, so a failing broker costs the caller that budget once, not twice.
+// A context detached from the caller's CANCELLATION — but not from its DEADLINE — makes the
+// cleanup possible in exactly that case. It is BOUNDED rather than merely detached for the
+// reason every other detached write in this codebase is: "finish what you owe" must not become
+// "block the request indefinitely on a broker that has gone away". The two round trips share
+// one window, so a failing broker costs the caller that window once, not twice.
+//
+// # AAP-02: the window is the REQUEST'S, not a fresh one
+//
+// Detaching used to mean a full ten seconds of its own here, on top of whatever the forward
+// path had already spent — which is how a five-second endpoint came to answer in twenty. See
+// kafkaCleanupContext: the absolute issuance deadline travels on the context as a value, is
+// re-imposed here, and is rebased so a nested cleanup shares this window instead of opening
+// another. A caller under no issuance deadline — a maintenance sweep, an explicit revocation —
+// still gets the ten-second budget, because there is no endpoint bound to respect.
 //
 // Parameters:
 //   - ctx context.Context: the provisioning context. It is used for its VALUES only — its
@@ -3858,20 +4378,20 @@ func (a *KafkaAdminClient) compensateFailedProvisioning(
 	principal string,
 	bindings []kafka.ACLEntry,
 ) error {
-	logger := logrus.WithField("principal", principal)
+	logger := logrus.WithField("principal_hash", subscriberLogLabel(principal))
 
 	ctx, cancel := kafkaCleanupContext(ctx)
 	defer cancel()
 
 	if err := a.deleteACLBindings(ctx, principal, bindings); err != nil {
-		logger.WithField("error", sanitizeLogValue(err.Error(), maxLoggedErrorLength)).Error(
+		withKafkaError(logger, "compensate_delete_acl_bindings", err).Error(
 			"kafka admin: could not remove the ACL bindings of a failed provisioning; " +
 				"remove them manually with kafka-acls before reissuing",
 		)
 	}
 
 	if err := a.RevokeSubscriberPrincipal(ctx, principal); err != nil {
-		logger.WithField("error", sanitizeLogValue(err.Error(), maxLoggedErrorLength)).Error(
+		withKafkaError(logger, "compensate_revoke_subscriber_principal", err).Error(
 			"kafka admin: A SCRAM CREDENTIAL WAS WRITTEN AND COULD NOT BE REVOKED after provisioning " +
 				"failed. The principal can authenticate and is not recorded in the registry. Delete it " +
 				"manually: kafka-configs --alter --delete-config SCRAM-SHA-512 --entity-type users " +
@@ -3914,7 +4434,11 @@ func (a *KafkaAdminClient) compensateFailedProvisioning(
 //
 // Returns:
 //   - error: ErrKafkaAdminNotConfigured, a validation error, or a wrapped broker error.
-func (a *KafkaAdminClient) RevokeSubscriberPrincipal(ctx context.Context, principal string) error {
+func (a *KafkaAdminClient) RevokeSubscriberPrincipal(ctx context.Context, principal string) (err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "revoke_subscriber_credential")
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
 	if err := a.ready(ctx); err != nil {
 		return err
 	}
@@ -3948,7 +4472,8 @@ func (a *KafkaAdminClient) RevokeSubscriberPrincipal(ctx context.Context, princi
 			SubscriberSASLMechanism, response.Results[i].User, resultErr)
 	}
 
-	logrus.WithField("principal", principal).Info("kafka admin: subscriber SCRAM credential revoked")
+	logrus.WithField("principal_hash", subscriberLogLabel(principal)).
+		Info("kafka admin: subscriber SCRAM credential revoked")
 
 	return nil
 }
@@ -4004,7 +4529,11 @@ func (a *KafkaAdminClient) RevokeSubscriberPrincipal(ctx context.Context, princi
 //
 // Returns:
 //   - error: nil when the broker holds neither the bindings nor the credential.
-func (a *KafkaAdminClient) RevokeSubscriber(ctx context.Context, subscriber *model.EventSubscriber) error {
+func (a *KafkaAdminClient) RevokeSubscriber(ctx context.Context, subscriber *model.EventSubscriber) (err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "revoke_subscriber_access", subscriberSpanAttribute(subscriber))
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
 	if err := a.ready(ctx); err != nil {
 		return err
 	}
@@ -4030,8 +4559,8 @@ func (a *KafkaAdminClient) RevokeSubscriber(ctx context.Context, subscriber *mod
 	case credentialErr != nil:
 		if bindingErr != nil {
 			logrus.WithFields(logrus.Fields{
-				"principal": sanitizeLogValue(principal, maxLoggedFilterLength),
-				"error":     sanitizeLogValue(bindingErr.Error(), maxLoggedErrorLength),
+				"principal_hash": subscriberLogLabel(principal),
+				"error_class":    kafkaErrorClassField("revoke_subscriber_acl_bindings", bindingErr),
 			}).Error(
 				"kafka admin: removing a subscriber's ACL bindings also failed; both need manual attention",
 			)
@@ -4042,8 +4571,8 @@ func (a *KafkaAdminClient) RevokeSubscriber(ctx context.Context, subscriber *mod
 		return bindingErr
 	default:
 		logrus.WithFields(logrus.Fields{
-			"subscriber": strings.TrimSpace(subscriber.SubscriberID),
-			"principal":  principal,
+			"subscriber_id_hash": subscriberLogLabel(subscriber.SubscriberID),
+			"principal_hash":     subscriberLogLabel(principal),
 		}).Info("kafka admin: subscriber access revoked at the broker")
 
 		return nil
@@ -4098,7 +4627,11 @@ func (a *KafkaAdminClient) ReconcileSubscriberACLs(
 	ctx context.Context,
 	subscriber *model.EventSubscriber,
 	revokedTopics []string,
-) error {
+) (err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "reconcile_subscriber_acls", subscriberSpanAttribute(subscriber))
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
 	if err := a.ready(ctx); err != nil {
 		return err
 	}
@@ -4140,9 +4673,9 @@ func (a *KafkaAdminClient) ReconcileSubscriberACLs(
 	bindings := desired.aclEntries()
 	if len(bindings) == 0 {
 		logrus.WithFields(logrus.Fields{
-			"subscriber": strings.TrimSpace(subscriber.SubscriberID),
-			"principal":  principal,
-			"revoked":    len(revokedTopics),
+			"subscriber_id_hash": subscriberLogLabel(subscriber.SubscriberID),
+			"principal_hash":     subscriberLogLabel(principal),
+			"revoked":            len(revokedTopics),
 		}).Info(
 			"kafka admin: subscriber ACL bindings reconciled; the grant is now empty, so the " +
 				"principal can authenticate and read nothing",
@@ -4156,11 +4689,11 @@ func (a *KafkaAdminClient) ReconcileSubscriberACLs(
 	}
 
 	logrus.WithFields(logrus.Fields{
-		"subscriber":  strings.TrimSpace(subscriber.SubscriberID),
-		"principal":   principal,
-		"granted":     len(desired.normalizedTopics()),
-		"revoked":     len(normalizeTopicList(revokedTopics)),
-		"acl_entries": len(bindings),
+		"subscriber_id_hash": subscriberLogLabel(subscriber.SubscriberID),
+		"principal_hash":     subscriberLogLabel(principal),
+		"granted":            len(desired.normalizedTopics()),
+		"revoked":            len(normalizeTopicList(revokedTopics)),
+		"acl_entries":        len(bindings),
 	}).Info("kafka admin: subscriber ACL bindings reconciled with the registry grant")
 
 	return nil
@@ -4223,9 +4756,9 @@ func (a *KafkaAdminClient) deleteACLBindings(
 	}
 
 	logrus.WithFields(logrus.Fields{
-		"principal": principal,
-		"filters":   len(filters),
-		"removed":   removed,
+		"principal_hash": subscriberLogLabel(principal),
+		"filters":        len(filters),
+		"removed":        removed,
 	}).Info("kafka admin: subscriber ACL bindings removed")
 
 	return nil
@@ -4308,8 +4841,8 @@ func (a *KafkaAdminClient) deleteAllPrincipalBindings(ctx context.Context, princ
 	}
 
 	logrus.WithFields(logrus.Fields{
-		"principal": bound,
-		"removed":   removed,
+		"principal_hash": subscriberLogLabel(bound),
+		"removed":        removed,
 	}).Info("kafka admin: every ACL binding for the subscriber principal removed")
 
 	return nil
@@ -4508,7 +5041,11 @@ func (r ConsumerLagReport) LagSamples() []metrics.ConsumerLagSample {
 //   - ConsumerLagReport: per-partition, per-topic and total lag.
 //   - error: ErrKafkaAdminNotConfigured, a validation error for a missing group, or a
 //     wrapped broker error.
-func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagRequest) (ConsumerLagReport, error) {
+func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagRequest) (_ ConsumerLagReport, err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "consumer_lag", hashedSubscriberSpanAttribute(req.SubscriberID))
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
 	report := ConsumerLagReport{
 		SubscriberID: strings.TrimSpace(req.SubscriberID),
 		GroupID:      strings.TrimSpace(req.GroupID),
@@ -4526,8 +5063,8 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 	topics := normalizeTopicList(req.Topics)
 	if len(topics) == 0 {
 		logrus.WithFields(logrus.Fields{
-			"subscriber": sanitizeLogValue(report.SubscriberID, maxLoggedFilterLength),
-			"group":      sanitizeLogValue(report.GroupID, maxLoggedFilterLength),
+			"subscriber_id_hash":  subscriberLogLabel(report.SubscriberID),
+			"consumer_group_hash": consumerGroupLogLabel(report.GroupID),
 		}).Debug("kafka admin: no topics to measure consumer lag for")
 
 		return report, nil
@@ -4548,9 +5085,9 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 
 	if len(report.MissingTopics) > 0 {
 		logrus.WithFields(logrus.Fields{
-			"subscriber": sanitizeLogValue(report.SubscriberID, maxLoggedFilterLength),
-			"group":      sanitizeLogValue(report.GroupID, maxLoggedFilterLength),
-			"topics":     report.MissingTopics,
+			"subscriber_id_hash":  subscriberLogLabel(report.SubscriberID),
+			"consumer_group_hash": consumerGroupLogLabel(report.GroupID),
+			"topics":              report.MissingTopics,
 		}).Warn("kafka admin: consumer lag was requested for topics that do not exist; they contribute no lag")
 	}
 
@@ -4581,11 +5118,14 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 			)
 
 			topicLag.TotalLag += partitionLag.Lag
-			if !partitionLag.Committed {
-				topicLag.PartitionsWithoutCommit++
-			}
+			// UNAVAILABLE FIRST: a partition nobody could read is not a partition without a
+			// commit, and counting it in both would report the same fault twice under two
+			// different diagnoses — one of which ("the group is not consuming this topic")
+			// sends an operator to the consumer rather than to the broker.
 			if partitionLag.Unavailable {
 				topicLag.PartitionsUnavailable++
+			} else if !partitionLag.Committed {
+				topicLag.PartitionsWithoutCommit++
 			}
 			topicLag.Partitions = append(topicLag.Partitions, partitionLag)
 		}
@@ -4600,8 +5140,8 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 		// alert reads does not receive it. See metrics.ConsumerLagUnmeasuredPartitions.
 		if topicLag.PartitionsUnavailable > 0 {
 			logrus.WithFields(logrus.Fields{
-				"subscriber":             sanitizeLogValue(report.SubscriberID, maxLoggedFilterLength),
-				"group":                  sanitizeLogValue(report.GroupID, maxLoggedFilterLength),
+				"subscriber_id_hash":     subscriberLogLabel(report.SubscriberID),
+				"consumer_group_hash":    consumerGroupLogLabel(report.GroupID),
 				"topic":                  topic,
 				"partitions_unavailable": topicLag.PartitionsUnavailable,
 				"partitions":             len(topicLag.Partitions),
@@ -4615,10 +5155,10 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 	}
 
 	logrus.WithFields(logrus.Fields{
-		"subscriber": sanitizeLogValue(report.SubscriberID, maxLoggedFilterLength),
-		"group":      sanitizeLogValue(report.GroupID, maxLoggedFilterLength),
-		"topics":     len(report.Topics),
-		"total_lag":  report.TotalLag,
+		"subscriber_id_hash":  subscriberLogLabel(report.SubscriberID),
+		"consumer_group_hash": consumerGroupLogLabel(report.GroupID),
+		"topics":              len(report.Topics),
+		"total_lag":           report.TotalLag,
 	}).Debug("kafka admin: consumer lag measured")
 
 	return report, nil
@@ -4627,27 +5167,48 @@ func (a *KafkaAdminClient) ConsumerLag(ctx context.Context, req ConsumerLagReque
 // buildPartitionLag assembles one partition's entry from its offset bounds and committed
 // offset.
 //
+// # A partition is unavailable if EITHER side of the subtraction is unreadable
+//
+// Lag is end offset minus a baseline, so it needs both. An unreadable END OFFSET has always
+// marked the partition unavailable; an unreadable COMMITTED OFFSET did not, and that asymmetry
+// was the defect (OBS-21): the missing commit was scored as "never committed", which is a
+// deliberate FULL-LAG policy, so an unmeasurable partition produced the largest possible number
+// instead of no number at all. Both inputs are now treated the same way — no reading, no lag,
+// and the topic is reported as incompletely measured so the degradation alerts.
+//
 // Parameters:
 //   - topic string, partition int: the partition being described.
 //   - bounds partitionOffsetBounds: the zero value is an unavailable partition, which is
 //     what an absent map entry means.
-//   - committedOffset int64: the group's committed offset, or -1 when it has none.
+//   - committed committedOffset: the group's committed-offset reading. Carries -1 for "never
+//     committed" and a separate flag for "the broker would not say".
 //
 // Returns:
-//   - PartitionLag: fully populated, with Lag never negative.
-func buildPartitionLag(topic string, partition int, bounds partitionOffsetBounds, committedOffset int64) PartitionLag {
+//   - PartitionLag: fully populated, with Lag never negative and zero whenever Unavailable.
+func buildPartitionLag(
+	topic string,
+	partition int,
+	bounds partitionOffsetBounds,
+	committed committedOffset,
+) PartitionLag {
+	unavailable := bounds.unavailable || committed.unavailable
+
 	lag := PartitionLag{
 		Topic:           topic,
 		Partition:       partition,
-		CommittedOffset: committedOffset,
-		Committed:       committedOffset >= 0,
-		FirstOffset:     bounds.first,
-		EndOffset:       bounds.end,
-		Unavailable:     bounds.unavailable,
+		CommittedOffset: committed.offset,
+		// An unavailable reading is not evidence of an absent commit: the group may well
+		// have committed here and the broker simply did not say. Reporting Committed false
+		// for it would put the partition in PartitionsWithoutCommit, which is read as "this
+		// consumer is not consuming the topic at all".
+		Committed:   !committed.unavailable && committed.offset >= 0,
+		FirstOffset: bounds.first,
+		EndOffset:   bounds.end,
+		Unavailable: unavailable,
 	}
 
-	if !bounds.unavailable {
-		lag.Lag = lagForPartition(committedOffset, bounds.first, bounds.end)
+	if !unavailable {
+		lag.Lag = lagForPartition(committed.offset, bounds.first, bounds.end)
 	}
 
 	return lag
@@ -4729,26 +5290,32 @@ func offsetBoundsFor(
 	return partitionOffsetBounds{first: -1, end: -1, unavailable: true}
 }
 
-// committedOffsetFor reads one partition's committed offset out of the fetch result.
+// committedOffsetFor reads one partition's committed-offset reading out of the fetch result.
 //
-// A partition the group has never committed on is absent from the map, and this returns
-// the same -1 the broker uses for that case, so the caller has exactly one representation
-// of "no commit" to reason about.
+// An ABSENT entry means the group has never committed on the partition, and it resolves to
+// the same -1 the broker uses for that case, with unavailable false — so the caller has exactly
+// one representation of "no commit" to reason about. An entry that is present and marked
+// unavailable means the broker refused to report it, which is a different fact; see
+// committedOffset.
 //
 // Parameters:
-//   - committed map[string]map[int]int64: the fetch result, possibly nil.
+//   - committed map[string]map[int]committedOffset: the fetch result, possibly nil.
 //   - topic string, partition int: the partition to look up.
 //
 // Returns:
-//   - int64: the committed offset, or -1 when there is none.
-func committedOffsetFor(committed map[string]map[int]int64, topic string, partition int) int64 {
+//   - committedOffset: the reading. The zero-commit default when nothing was recorded.
+func committedOffsetFor(
+	committed map[string]map[int]committedOffset,
+	topic string,
+	partition int,
+) committedOffset {
 	if offsets, exists := committed[topic]; exists {
 		if offset, ok := offsets[partition]; ok {
 			return offset
 		}
 	}
 
-	return -1
+	return committedOffset{offset: -1}
 }
 
 // consumerLagSample renders one topic's measurement as an inventory entry for the
@@ -4880,9 +5447,7 @@ func (a *KafkaAdminClient) offsetBounds(
 					"end_offset": offset.LastOffset,
 				})
 				if offset.Error != nil {
-					entry = entry.WithField(
-						"error", sanitizeLogValue(offset.Error.Error(), maxLoggedErrorLength),
-					)
+					entry = withKafkaError(entry, "read_partition_end_offsets", offset.Error)
 				}
 				entry.Warn(
 					"kafka admin: could not read offsets for this partition; it is excluded from the measurement " +
@@ -4907,8 +5472,10 @@ func (a *KafkaAdminClient) offsetBounds(
 //   - partitions map[string][]int: the partitions to ask about.
 //
 // Returns:
-//   - map[string]map[int]int64: committed offset per topic and partition. A partition
-//     the group has not committed on is absent, or present as the broker's own -1.
+//   - map[string]map[int]committedOffset: the reading per topic and partition. A partition
+//     the group has not committed on is absent, or present as the broker's own -1; a
+//     partition the broker refused to report is present and marked UNAVAILABLE, which is a
+//     different fact and must not be scored as an absent commit.
 //   - error: a wrapped transport or group error. A group that does not exist is NOT an
 //     error — it simply has no commits, which is the state of every subscriber that has
 //     not started consuming yet, and the caller scores it as full lag.
@@ -4916,7 +5483,7 @@ func (a *KafkaAdminClient) committedOffsets(
 	ctx context.Context,
 	group string,
 	partitions map[string][]int,
-) (map[string]map[int]int64, error) {
+) (map[string]map[int]committedOffset, error) {
 	request := &kafka.OffsetFetchRequest{
 		GroupID: group,
 		Topics:  make(map[string][]int, len(partitions)),
@@ -4948,7 +5515,7 @@ func (a *KafkaAdminClient) committedOffsets(
 			// full lag, so a subscriber that never starts consuming shows up as a rising
 			// consumer-lag series and trips the >10000 rule — which is a signal an operator
 			// receives rather than one they would have had to be reading logs to notice.
-			logrus.WithField("group", sanitizeLogValue(group, maxLoggedFilterLength)).Debug(
+			logrus.WithField("consumer_group_hash", consumerGroupLogLabel(group)).Debug(
 				"kafka admin: consumer group does not exist yet, so it has committed nothing; " +
 					"its lag is the whole retained log",
 			)
@@ -4961,23 +5528,48 @@ func (a *KafkaAdminClient) committedOffsets(
 		)
 	}
 
-	committed := make(map[string]map[int]int64, len(response.Topics))
+	committed := make(map[string]map[int]committedOffset, len(response.Topics))
 	for topic, offsets := range response.Topics {
-		perPartition := make(map[int]int64, len(offsets))
+		perPartition := make(map[int]committedOffset, len(offsets))
 
 		for _, offset := range offsets {
 			if offset.Error != nil {
+				// RECORDED AS UNAVAILABLE, not skipped (OBS-21).
+				//
+				// Skipping left the map entry absent, and an absent entry means "the group has
+				// never committed here" — which the lag arithmetic deliberately scores as FULL
+				// LAG FROM THE EARLIEST RETAINED OFFSET. So a partition the broker merely would
+				// not report produced the whole retained log as lag, on a topic that stayed
+				// marked COMPLETE, and that number went to the gauge SubscriberConsumerLagHigh
+				// reads. A leader election on one partition of a healthy, caught-up consumer
+				// could therefore page an operator with a six-figure lag that was never real.
+				//
+				// The two conditions are not the same fact and are no longer collapsed. "No
+				// commit" is knowledge; "the broker refused" is the absence of knowledge, and
+				// the honest handling of the second is to withhold this partition's lag, mark
+				// the topic incompletely measured, and let ConsumerLagMeasurementDegraded carry
+				// it — the rule that exists precisely so an unmeasurable subject alerts instead
+				// of reading as a number.
+				//
+				// WARN rather than Debug for the same reason: this is a degraded measurement an
+				// operator has to know about, not the routine state of an unstarted subscriber.
 				logrus.WithFields(logrus.Fields{
-					"group":     sanitizeLogValue(group, maxLoggedFilterLength),
-					"topic":     topic,
-					"partition": offset.Partition,
-					"error":     sanitizeLogValue(offset.Error.Error(), maxLoggedErrorLength),
-				}).Debug("kafka admin: no committed offset available for this partition; treating it as uncommitted")
+					"consumer_group_hash": consumerGroupLogLabel(group),
+					"topic":               topic,
+					"partition":           offset.Partition,
+					"error_class":         kafkaErrorClassField("fetch_committed_offsets", offset.Error),
+				}).Warn(
+					"kafka admin: the broker could not report this partition's committed offset, so its " +
+						"lag is UNKNOWN and is withheld rather than scored as uncommitted; the topic is " +
+						"reported as incompletely measured",
+				)
+
+				perPartition[offset.Partition] = committedOffset{offset: -1, unavailable: true}
 
 				continue
 			}
 
-			perPartition[offset.Partition] = offset.CommittedOffset
+			perPartition[offset.Partition] = committedOffset{offset: offset.CommittedOffset}
 		}
 
 		committed[topic] = perPartition
@@ -4986,21 +5578,60 @@ func (a *KafkaAdminClient) committedOffsets(
 	return committed, nil
 }
 
+// committedOffset is ONE partition's committed-offset reading, and it exists to keep two
+// facts apart that a bare int64 conflated.
+//
+// A group that has never committed on a partition and a broker that would not report the
+// partition are different states with opposite correct treatments: the first is knowledge and
+// scores as full lag from the earliest retained offset, so an unstarted consumer cannot read as
+// healthy; the second is the ABSENCE of knowledge, and any number derived from it is invented.
+// Representing both as -1 meant the second silently inherited the first's treatment.
+type committedOffset struct {
+	// offset is the group's committed offset, or -1 when it has none. Meaningless when
+	// unavailable is true.
+	offset int64
+
+	// unavailable is true when the broker returned a per-partition error for this
+	// partition. The partition then contributes no lag and makes its topic's measurement
+	// incomplete.
+	unavailable bool
+}
+
 // PartitionOffsetSnapshot is one partition's offset window at a point in time.
 type PartitionOffsetSnapshot struct {
 	// Partition is the partition ID.
 	Partition int
 
-	// FirstOffset is the earliest offset still retained.
+	// FirstOffset is the earliest offset still retained: the INCLUSIVE lower bound of the
+	// window this partition can currently serve.
 	FirstOffset int64
 
-	// EndOffset is the log end offset, which equals the total number of records ever
-	// produced to the partition. It is the figure the zero-loss reconciliation sums.
+	// EndOffset is the log end offset, one past the last record written, which also equals
+	// the total number of records ever produced to the partition.
+	//
+	// It is the EXCLUSIVE upper bound of the readable window, and that is how the
+	// reconciliation uses it: a stored coordinate at or above it cannot be on the log, which
+	// is only possible if the partition was truncated or the topic recreated. The SUM of
+	// these offsets is reported as context and is not the verdict — see
+	// ReconcileAgainstOutbox for why a whole-topic total cannot decide anything on a topic
+	// Blnk may share.
 	EndOffset int64
 
 	// Unavailable is true when the broker could not report this partition, in which case
-	// both offsets are meaningless and the partition contributes nothing to the sums.
+	// both offsets are meaningless: the partition contributes nothing to the sums and is
+	// omitted from PartitionIntervals entirely, so the rows on it are classified as
+	// unmeasured rather than misread as beyond the log end.
 	Unavailable bool
+
+	// WindowStartOffset is the earliest offset whose record was written at or after the
+	// report's WindowStart: the left-hand side of the windowed record count. It is -1 when
+	// the partition holds nothing that recent, and 0 with WindowUnreadable set when the
+	// window could not be resolved for this partition.
+	WindowStartOffset int64
+
+	// WindowUnreadable is true when the window-start offset could not be resolved, so this
+	// partition contributes nothing to the windowed count and the count is incomplete.
+	WindowUnreadable bool
 }
 
 // TopicOffsetSnapshot aggregates one topic's partitions.
@@ -5011,29 +5642,58 @@ type TopicOffsetSnapshot struct {
 	// Partitions carries the per-partition detail, in ascending partition order.
 	Partitions []PartitionOffsetSnapshot
 
-	// EndOffsetSum is the sum of the partitions' end offsets: every record ever
-	// published to this topic, whether or not it is still retained. This is the
-	// reconciliation figure.
+	// EndOffsetSum is the sum of the partitions' end offsets: every record ever published
+	// to this topic BY ANY PRODUCER, whether or not it is still retained.
+	//
+	// It is reported as context and is NOT the reconciliation figure. On a topic Blnk
+	// shares it counts records Blnk never wrote, and it counts every redelivery, replay
+	// and dead-letter copy separately, so it can exceed the number of Blnk events
+	// arbitrarily without meaning anything.
 	EndOffsetSum int64
 
-	// RetainedCount is the sum of end minus first across partitions: the records still
-	// on the log. It is NOT the reconciliation figure — retention deletes records, so
-	// this number legitimately falls below the outbox count — and it is reported so that
-	// a discrepancy caused by retention can be told apart from one caused by loss.
+	// RetainedCount is the sum of end minus first across partitions: the records still on
+	// the log. Like EndOffsetSum it is context rather than proof, and it is reported so
+	// that the share of a topic's traffic the verdict accounts for is readable beside it.
 	RetainedCount int64
 
 	// PartitionsUnavailable counts partitions excluded from the sums.
 	PartitionsUnavailable int
+
+	// WindowRecordCount is how many records this topic accepted inside the report's
+	// window: the sum over partitions of end offset minus window-start offset. It is the
+	// figure the WINDOWED reconciliation compares the outbox against, and it is zero when
+	// the report carries no window.
+	WindowRecordCount int64
+
+	// WindowTruncated is true when retention has removed records that were written inside
+	// the window, so this topic's window count is a LOWER bound. It is detected rather than
+	// assumed: a partition whose window-start offset equals its first retained offset, on a
+	// partition that has already had records deleted, cannot rule out that earlier records
+	// inside the window are gone.
+	WindowTruncated bool
+
+	// WindowPartitionsUnreadable counts partitions whose window-start offset could not be
+	// resolved, so their records are missing from WindowRecordCount.
+	WindowPartitionsUnreadable int
 }
 
 // TopicOffsetReport is the broker-side half of the zero-loss reconciliation.
 //
-// The reconciliation compares the outbox's own row counts against these offsets:
-// dispatched plus dead-lettered rows should equal the summed end offsets of the category
-// topics and their dead-letter siblings. The reconciliation is only valid when
-// PartitionsUnavailable is zero and MissingTopics is empty — otherwise the right-hand
-// side is short through unreadability rather than through loss, which is exactly the
-// mistake this report is shaped to prevent.
+// # What it is for, and what it is not for
+//
+// Its load-bearing content is the PER-PARTITION WINDOWS, reachable through
+// PartitionIntervals(): each outbox row's stored coordinate is checked for membership in the
+// window of its own partition, which is what makes the reconciliation a bounded mapping
+// rather than a comparison of totals.
+//
+// The sums are context. The reconciliation used to be an equality — or a directional
+// inequality — between the summed end offsets and the outbox's row count, and that comparison
+// is unsound however carefully it is read: the two sides share no baseline (outbox pruning
+// shrinks one while the other only climbs), no readability guarantee (retention deletes
+// records the end offset still counts), no topic incarnation (recreating a topic resets it)
+// and no producer (foreign traffic inflates it). MissingTopics and PartitionsUnavailable now
+// mean "no window could be measured here", so the rows on those partitions are reported as
+// unmeasured rather than read as loss.
 type TopicOffsetReport struct {
 	// Topics carries per-topic detail, in the order the request listed them, or the
 	// canonical inventory order when the request named no topics.
@@ -5057,6 +5717,34 @@ type TopicOffsetReport struct {
 
 	// MeasuredAt is when the snapshot was taken.
 	MeasuredAt time.Time
+
+	// WindowStart is the instant the windowed figures below are measured from, and the
+	// zero value means the report carries no window.
+	//
+	// # PERF-P05: why a windowless report cannot support a verdict
+	//
+	// End offsets are cumulative for the life of a topic and survive Kafka retention, while
+	// the outbox's retention sweep deletes terminal rows. Compared over the whole history
+	// the two sides therefore drift apart by exactly however much the outbox has forgotten,
+	// in the direction the check tolerates — so a growing surplus is indistinguishable from
+	// a growing amount of concealed loss. ReconcileAgainstOutbox refuses to call a
+	// windowless comparison conclusive for that reason; the windowless spelling exists for
+	// diagnostics, where the raw end offsets are the point.
+	WindowStart time.Time
+
+	// WindowRecordCount is how many records the broker accepted across every measured topic
+	// inside the window. This is the figure a windowed reconciliation compares against.
+	WindowRecordCount int64
+
+	// WindowTruncated is true when retention has removed records written inside the window
+	// on at least one partition, which makes WindowRecordCount a lower bound and the
+	// verdict inconclusive: a short broker retention against a longer reconciliation window
+	// is exactly the configuration that would otherwise report loss that never happened.
+	WindowTruncated bool
+
+	// WindowPartitionsUnreadable counts partitions whose window-start offset could not be
+	// resolved across all topics.
+	WindowPartitionsUnreadable int
 }
 
 // EndOffsetsByTopic reduces the report to one end-offset sum per topic.
@@ -5097,43 +5785,44 @@ func (r TopicOffsetReport) Lookup(topic string) (TopicOffsetSnapshot, bool) {
 	return TopicOffsetSnapshot{}, false
 }
 
-// TopicEndOffsets reads the broker-side offsets the daily zero-loss reconciliation reads.
+// TopicEndOffsets measures the PER-PARTITION OFFSET WINDOWS the daily zero-loss
+// reconciliation classifies the outbox against.
 //
-// # OBS-01: this is a LOWER BOUND on messages, not a count of events
+// # The windows are the measurement; the sums are context
 //
-// Summed end offsets count RECORDS WRITTEN, and the outbox counts EVENTS. Those are
-// deliberately different numbers, and the reconciliation used to be documented as an
-// equality between them, which cannot hold:
+// Each partition reports a half-open window [FirstOffset, EndOffset): the offsets the broker
+// can currently serve. That window is what makes the reconciliation decidable, because
+// membership of a stored coordinate in it is a fact about ONE record and is unaffected by
+// anything else on the topic.
+//
+// The SUMS this method also returns must not be compared against the outbox's row count. That
+// comparison was the reconciliation once, and it is unsound in four independent ways:
 //
 //   - A REDELIVERY writes a second record for one event. The relay can crash between a
 //     successful publish and the row being marked dispatched, so the redelivery is a designed
-//     behaviour of an at-least-once transport, not a fault.
-//   - A REPLAY writes another record for an event that already has one, on purpose.
-//   - A DEAD-LETTERED event has a record on its `.dlt` topic and its row counted once.
-//   - RETENTION deletes records while their rows remain, so the end offset keeps climbing
-//     while retained records fall.
+//     behaviour of an at-least-once transport, not a fault. A REPLAY writes another on
+//     purpose, and a DEAD-LETTERED event has a record on its `.dlt` sibling.
+//   - FOREIGN TRAFFIC counts. Nothing about an end offset says which producer wrote the
+//     record, so on a topic Blnk shares the sum is inflated by an unknown amount.
+//   - RETENTION deletes records while their rows remain, so the sum asserts a record was
+//     written that no consumer can now read.
+//   - OUTBOX PRUNING removes rows while the sum only climbs, so the gap grows on its own.
 //
-// So messages >= events, always, and an equality check would report loss on a healthy system
-// the first time anything was redelivered — the classic alert that gets muted, taking the
-// real signal with it.
+// A surplus is therefore INDISTINGUISHABLE FROM COMPENSATED LOSS — ten redeliveries and ten
+// lost events produce exactly the totals of a healthy pipeline — which is why the verdict now
+// rests on the per-coordinate mapping and reports the sums only as context.
 //
-// What this number CAN establish is the direction that matters. Every dispatched or
-// dead-lettered row must have produced at least one record, so:
-//
-//	messages <  events   ⇒  LOSS. Rows claim publication that never reached a broker.
-//	messages >= events   ⇒  no loss detectable this way; the excess is the duplicate,
-//	                        replay and dead-letter overhead, and it is expected.
-//
-// Proving the stronger property — that every event_id appears at least once — requires
-// reading the topics and deduplicating on event_id, which needs a consumer. Blnk implements
-// no consumer by design, so that check belongs to the audit procedure in
+// Proving the stronger property — that the bytes at each coordinate are the event its row
+// claims — requires reading the topics and matching on event_id, which needs a consumer. Blnk
+// implements no consumer by design, so that check belongs to the audit procedure in
 // docs/kafka-operations.md rather than to this method, and this method must not be presented
 // as a substitute for it.
 //
 // Called with no topics it measures the whole inventory — every category topic and
 // their dead-letter siblings — which is what the reconciliation wants and what the
 // statistics endpoint reports. Named topics are measured instead, for narrowing an
-// investigation to one category.
+// investigation to one category. Narrowing does not narrow the verdict: rows on the topics
+// left out are classified as unmeasured, so the result is inconclusive rather than partial.
 //
 // Parameters:
 //   - ctx context.Context: honoured before every round trip.
@@ -5141,12 +5830,20 @@ func (r TopicOffsetReport) Lookup(topic string) (TopicOffsetSnapshot, bool) {
 //     entirely empty list selects the full inventory.
 //
 // Returns:
-//   - TopicOffsetReport: per-partition detail and the sums, plus the caveats
-//     (MissingTopics, PartitionsUnavailable) that say whether the reconciliation may be
-//     trusted. Use ReconcileAgainstOutbox to interpret it rather than comparing the sums by
-//     hand.
+//   - TopicOffsetReport: the per-partition windows, the sums, and the caveats
+//     (MissingTopics, PartitionsUnavailable) that say what could not be measured. Pass its
+//     PartitionIntervals() to AuditEventRecordsInIntervals and interpret the pair with
+//     ReconcileAgainstOutbox rather than comparing the sums by hand.
 //   - error: ErrKafkaAdminNotConfigured, or a wrapped broker error.
-func (a *KafkaAdminClient) TopicEndOffsets(ctx context.Context, topics ...string) (TopicOffsetReport, error) {
+func (a *KafkaAdminClient) TopicEndOffsets(
+	ctx context.Context,
+	since time.Time,
+	topics ...string,
+) (_ TopicOffsetReport, err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "topic_end_offsets")
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
 	report := TopicOffsetReport{MeasuredAt: time.Now().UTC()}
 	if err := a.ready(ctx); err != nil {
 		return report, err
@@ -5155,8 +5852,12 @@ func (a *KafkaAdminClient) TopicEndOffsets(ctx context.Context, topics ...string
 	requested := normalizeTopicList(topics)
 	if len(requested) == 0 {
 		// The inventory, from its single source of truth, so the reconciliation covers
-		// exactly the topics the pipeline provisions and publishes to.
-		requested = AllTopicsWithDeadLetters()
+		// exactly the topics the pipeline provisions and publishes to — across every owned
+		// prefix, because the outbox rows this is reconciled against may name a namespace
+		// the deployment has since renamed away from. Omitting a historical topic would
+		// leave its dispatched rows counted with no offsets to match them, which reads as
+		// loss that did not happen.
+		requested = AllOwnedTopicsAcrossPrefixes()
 	}
 
 	partitions, err := a.topicPartitions(ctx, requested)
@@ -5174,6 +5875,26 @@ func (a *KafkaAdminClient) TopicEndOffsets(ctx context.Context, topics ...string
 		return report, err
 	}
 
+	// The window's left-hand side, read only when one was asked for. A failure here does NOT
+	// void the report: the cumulative figures are still valid and are what the diagnostic
+	// reading wants, so the window is simply left unset and ReconcileAgainstOutbox declines to
+	// call the comparison conclusive — which is the honest outcome of a window that could not
+	// be measured.
+	var windowStarts map[string]map[int]int64
+	if !since.IsZero() {
+		report.WindowStart = since.UTC()
+
+		windowStarts, err = a.windowStartOffsets(ctx, partitions, since)
+		if err != nil {
+			kafkaErrorEntry("topic_window_start_offsets", err).Error(
+				"kafka admin: the window-start offsets could not be read, so the reconciliation has no " +
+					"bounded broker-side population and its verdict will be reported inconclusive",
+			)
+
+			report.WindowStart = time.Time{}
+		}
+	}
+
 	report.Topics = make([]TopicOffsetSnapshot, 0, len(partitions))
 	for _, topic := range requested {
 		ids, exists := partitions[topic]
@@ -5186,10 +5907,11 @@ func (a *KafkaAdminClient) TopicEndOffsets(ctx context.Context, topics ...string
 			bound := offsetBoundsFor(bounds, topic, id)
 
 			partitionSnapshot := PartitionOffsetSnapshot{
-				Partition:   id,
-				FirstOffset: bound.first,
-				EndOffset:   bound.end,
-				Unavailable: bound.unavailable,
+				Partition:         id,
+				FirstOffset:       bound.first,
+				EndOffset:         bound.end,
+				WindowStartOffset: -1,
+				Unavailable:       bound.unavailable,
 			}
 
 			if bound.unavailable {
@@ -5197,6 +5919,10 @@ func (a *KafkaAdminClient) TopicEndOffsets(ctx context.Context, topics ...string
 			} else {
 				snapshot.EndOffsetSum += bound.end
 				snapshot.RetainedCount += retainedRecords(bound.first, bound.end)
+
+				if !report.WindowStart.IsZero() {
+					applyWindowToPartition(&partitionSnapshot, &snapshot, windowStarts, topic, id, bound)
+				}
 			}
 
 			snapshot.Partitions = append(snapshot.Partitions, partitionSnapshot)
@@ -5205,6 +5931,9 @@ func (a *KafkaAdminClient) TopicEndOffsets(ctx context.Context, topics ...string
 		report.EndOffsetSum += snapshot.EndOffsetSum
 		report.RetainedCount += snapshot.RetainedCount
 		report.PartitionsUnavailable += snapshot.PartitionsUnavailable
+		report.WindowRecordCount += snapshot.WindowRecordCount
+		report.WindowPartitionsUnreadable += snapshot.WindowPartitionsUnreadable
+		report.WindowTruncated = report.WindowTruncated || snapshot.WindowTruncated
 		report.Topics = append(report.Topics, snapshot)
 	}
 
@@ -5214,6 +5943,9 @@ func (a *KafkaAdminClient) TopicEndOffsets(ctx context.Context, topics ...string
 		"topics":                 len(report.Topics),
 		"end_offset_sum":         report.EndOffsetSum,
 		"retained":               report.RetainedCount,
+		"window_start":           report.WindowStart.Format(time.RFC3339),
+		"window_records":         report.WindowRecordCount,
+		"window_truncated":       report.WindowTruncated,
 		"missing_topics":         len(report.MissingTopics),
 		"partitions_unavailable": report.PartitionsUnavailable,
 	}).Debug("kafka admin: topic end offsets read")
@@ -5251,14 +5983,49 @@ func retainedRecords(firstOffset, endOffset int64) int64 {
 	return endOffset - first
 }
 
+// PartitionIntervals flattens the report into the measured windows the outbox audit is
+// classified against.
+//
+// Only AVAILABLE partitions are returned. An unavailable one is deliberately omitted rather
+// than emitted with zeroed bounds, because a zero-width window would classify every row on
+// that partition as beyond the log end — reporting truncation where the truth is only that
+// the broker did not answer. Omitted partitions surface as unmeasured rows instead, which is
+// what they are, and the report's own PartitionsUnavailable count says how many.
+//
+// Returns:
+//   - []model.PartitionOffsetInterval: one window per measured, available partition, in
+//     report order. Empty when nothing was measured.
+func (r TopicOffsetReport) PartitionIntervals() []model.PartitionOffsetInterval {
+	intervals := make([]model.PartitionOffsetInterval, 0, len(r.Topics))
+	for _, topic := range r.Topics {
+		for _, partition := range topic.Partitions {
+			if partition.Unavailable {
+				continue
+			}
+
+			intervals = append(intervals, model.PartitionOffsetInterval{
+				Topic:       topic.Topic,
+				Partition:   partition.Partition,
+				FirstOffset: partition.FirstOffset,
+				EndOffset:   partition.EndOffset,
+			})
+		}
+	}
+
+	return intervals
+}
+
 // OutboxReconciliation is the verdict of comparing the outbox against the broker.
 //
-// # OBS-01: a verdict, not an equality
+// # A bounded mapping, not an equality
 //
 // It exists because callers were left to compare a record count against an event count
-// themselves, and the only comparison available — equality — is wrong. This type states what
-// the comparison can and cannot establish, so no caller has to re-derive it and none can
-// accidentally report "reconciled" from a number that was never going to match.
+// themselves, and every available comparison of those two totals is wrong. The totals
+// describe different populations — see model.PartitionOffsetInterval for the four ways they
+// diverge — so this type carries the result of placing each row's OWN recorded coordinate
+// inside the measured window of its own partition, plus the bounds of the window that
+// placement covers. No caller has to re-derive the comparison, and none can report
+// "reconciled" from a number that was never going to match.
 type OutboxReconciliation struct {
 	// TerminalEvents is how many outbox rows claim to have been published to the broker.
 	//
@@ -5266,32 +6033,55 @@ type OutboxReconciliation struct {
 	// webhook_pending row IS on its topic and what remains outstanding is the deprecated HTTP
 	// leg — plus every dead-lettered row, whose record is on the dead-letter topic. Each is
 	// counted exactly ONCE, which is the property the unique index on event_id gives.
+	//
+	// It counts rows THE OUTBOX STILL RETAINS. Pruning removes older rows, which is why
+	// OldestTerminalAt is reported beside it: this verdict is a statement about that window
+	// and about nothing earlier.
 	TerminalEvents int64
 
-	// ConfirmedEvents is how many of those rows NAME the record they produced, by carrying the
-	// topic, partition and offset the broker assigned.
+	// CorroboratedEvents is how many of those rows name a record INSIDE the measured
+	// [first, end) window of its partition — a record the broker can serve right now.
 	//
-	// It is the count that makes this reconciliation able to detect loss at all. See
-	// UnconfirmedEvents.
-	ConfirmedEvents int64
+	// It is the only population a green verdict may consist of, and it is strictly stronger
+	// than the "names a coordinate" count it replaced: a coordinate that has aged out or whose
+	// partition was not measured no longer counts as corroboration, because nothing available
+	// today can confirm it.
+	CorroboratedEvents int64
 
-	// UnconfirmedEvents is how many rows claim a publication they cannot name a record for.
+	// UnconfirmedEvents claim a publication without naming any record at all.
 	//
-	// # Why this field, and not just the arithmetic
+	// # Why this is a caveat and not a curiosity
 	//
-	// The comparison below is directional: records are a lower bound on events, so a surplus
-	// is expected. Its weakness — the finding this field closes — is that the surplus is
-	// INDISTINGUISHABLE FROM COMPENSATED LOSS. Ten redeliveries and ten lost events produce
-	// exactly the totals of a healthy pipeline, and a purely arithmetic verdict reads "no
-	// loss" while ten events are missing.
-	//
-	// An unconfirmed row is precisely a claim of publication that nothing corroborates. While
-	// any exist, the verdict is INCONCLUSIVE rather than green: the counting cannot rule out
-	// that they are the losses a surplus is hiding. Zero unconfirmed rows is what makes the
-	// count trustworthy, because then every claim is individually accounted for.
+	// A count-based verdict is directional — records are a lower bound on events, so a surplus
+	// is expected — and its fatal weakness is that THE SURPLUS IS INDISTINGUISHABLE FROM
+	// COMPENSATED LOSS. An unconfirmed row is precisely a claim nothing corroborates, so while
+	// any exist the verdict cannot rule out that they are the losses a surplus is hiding.
 	UnconfirmedEvents int64
 
-	// DuplicatedRecords is how many confirmed rows share a coordinate with another row.
+	// UnmeasuredEvents name a topic or partition the measurement did not cover: a missing
+	// topic, an unavailable partition, or a partition count that has since shrunk. Their
+	// records may well be there; nothing in this measurement says so.
+	UnmeasuredEvents int64
+
+	// AgedOutEvents name an offset BELOW the retained window. The record was written and Kafka
+	// retention has since deleted it.
+	//
+	// This is not loss — the write happened, and the offset proves it — but it is not
+	// corroboration either, and a subscriber that had not consumed the record by then never
+	// will. It is reported separately so that "retention is in play" is a quantified statement
+	// about specific events rather than a blanket caveat derived from topic-wide offsets.
+	AgedOutEvents int64
+
+	// BeyondEndEvents name an offset AT OR ABOVE the log end of their partition.
+	//
+	// On an intact log this is impossible: the broker assigned that offset when it accepted
+	// the write, so the end offset cannot since have fallen below it. It means the partition
+	// was TRUNCATED or the topic DELETED AND RECREATED, and the records those rows name are
+	// gone. This is treated as detected loss rather than as a caveat, because the specific
+	// records Blnk recorded are provably no longer on the log.
+	BeyondEndEvents int64
+
+	// DuplicatedRecords is how many corroborated rows share a coordinate with another row.
 	//
 	// It should be zero always: one record is produced by one acknowledged write of one row,
 	// and the partial unique index on the coordinate forbids two rows naming the same one. A
@@ -5301,10 +6091,56 @@ type OutboxReconciliation struct {
 	// record's corroboration is exactly the double-counting the mapping removes.
 	DuplicatedRecords int64
 
-	// MessagesWritten is how many records the broker has accepted across the measured
-	// topics, from summed end offsets. It counts every redelivery, replay and dead-letter
-	// copy separately.
+	// MessagesWritten is how many records the broker has accepted across the measured topics,
+	// from summed end offsets, and RecordsRetained how many of those it still holds.
+	//
+	// Neither is the basis of the verdict any more, and that is the point of reporting them
+	// separately: MessagesWritten counts every redelivery, every replay, every dead-letter
+	// copy AND every record any other producer ever wrote to a shared topic, so it can be
+	// arbitrarily larger than the number of Blnk events without meaning anything. They are
+	// retained as context an operator reads beside the mapping, never as the proof.
 	MessagesWritten int64
+	RecordsRetained int64
+
+	// BlnkRecordShare is how many of the retained records this reconciliation attributed to
+	// Blnk rows: CorroboratedEvents. Reported as its own field so the response states plainly
+	// how much of a shared topic's traffic the verdict actually accounts for.
+	BlnkRecordShare int64
+
+	// LossDetected is true when specific records this outbox recorded are provably not on the
+	// log: a row naming an offset at or above its partition's end.
+	//
+	// False does NOT mean "proven no loss" — see Conclusive. It means no loss is provable from
+	// the coordinates that were checkable.
+	LossDetected bool
+
+	// Conclusive reports whether the mapping accounted for EVERY retained claim.
+	//
+	// It is true only when every terminal row was placed inside a measured window, no two rows
+	// shared a coordinate, every requested topic existed and every partition reported. A
+	// caller must not report a green reconciliation on an inconclusive result.
+	Conclusive bool
+
+	// Caveats names, in plain words, every reason the result is inconclusive. Empty when
+	// Conclusive is true.
+	Caveats []string
+
+	// CoveredFrom and CoveredTo bound the publication instants of the corroborated
+	// population: the window a green verdict actually speaks about.
+	CoveredFrom time.Time
+	CoveredTo   time.Time
+
+	// OldestTerminalAt is the earliest publication instant among all retained terminal rows.
+	// Anything published before it has been pruned from the outbox and is outside the reach of
+	// any verdict — which is why it is reported rather than left implicit.
+	OldestTerminalAt time.Time
+
+	// MeasuredAt is when the broker side was measured.
+	MeasuredAt time.Time
+
+	// WindowStart is the instant both sides were measured from, zero when the comparison was
+	// whole-history.
+	WindowStart time.Time
 
 	// Overhead is MessagesWritten minus TerminalEvents: the redelivery, replay and
 	// dead-letter copies. Its EXPECTED value is greater than or equal to zero, and a healthy
@@ -5314,122 +6150,199 @@ type OutboxReconciliation struct {
 	// than clamped: clamping would erase the only signal this reconciliation carries.
 	Overhead int64
 
-	// LossDetected is true when the broker holds FEWER records than the outbox has terminal
-	// rows. That is unambiguous: rows claim a publication that no record corresponds to.
-	//
-	// False does NOT mean "proven no loss" — see Conclusive. It means no loss is detectable
-	// by counting.
-	LossDetected bool
-
-	// Conclusive reports whether the count could be trusted at all.
-	//
-	// It is false when a measured topic was missing, when any partition's offsets were
-	// unavailable, or when retention has deleted records — in each case the record count is
-	// not a complete picture of what was written, so neither a shortfall nor a surplus proves
-	// anything. A caller must not report a green reconciliation on an inconclusive result.
-	Conclusive bool
-
-	// Caveats names, in plain words, every reason the result is inconclusive. Empty when
-	// Conclusive is true.
-	Caveats []string
-
-	// MeasuredAt is when the broker side was measured.
-	MeasuredAt time.Time
+	// Windowed reports whether both sides were bounded to a common window. Only a windowed
+	// comparison can be conclusive — see the caveat ReconcileAgainstOutbox adds when it is
+	// not — so this is the field to read before believing MessagesWritten or Overhead.
+	Windowed bool
 }
 
 // Summary renders the verdict as one sentence for a log line or a runbook.
 //
+// The green branch is deliberately the most heavily qualified of the three. It is the sentence
+// an operator will paste into a compliance record, so it states the two independent grounds it
+// rests on — the matched all-time baseline and the per-record verification — rather than
+// asserting an unqualified "no loss", which the arithmetic alone was never able to support.
+//
 // Returns:
-//   - string: the verdict, always naming both numbers so the sentence is checkable.
+//   - string: the verdict, always naming the numbers it rests on so the sentence is
+//     checkable against the fields.
 func (r OutboxReconciliation) Summary() string {
 	switch {
+	case r.BeyondEndEvents > 0:
+		// Stated ahead of the arithmetic because it is stronger evidence: an offset past the
+		// end of a log cannot be explained by any amount of surplus.
+		return fmt.Sprintf(
+			"LOSS DETECTED: %d row(s) name a broker record at or beyond the end of the partition "+
+				"they claim, so those records do not exist. That is only possible if the partition was "+
+				"truncated or the topic was deleted and recreated beneath the ledger, or the events "+
+				"were lost after being marked published",
+			r.BeyondEndEvents,
+		)
 	case r.LossDetected:
 		return fmt.Sprintf(
-			"LOSS DETECTED: %d outbox rows are marked published but the broker holds only %d records "+
-				"across the measured topics (%d missing). Every dispatched or dead-lettered row must have "+
-				"produced at least one record",
-			r.TerminalEvents, r.MessagesWritten, -r.Overhead,
+			"LOSS DETECTED: the broker holds %d record(s) inside the measured window against %d "+
+				"outbox row(s) claiming a publication inside it, a shortfall of %d. Records are a "+
+				"lower bound on events — every redelivery, replay and dead-letter copy adds one — so "+
+				"a shortfall means rows claim a publication that never happened",
+			r.MessagesWritten, r.TerminalEvents, -r.Overhead,
 		)
 	case !r.Conclusive:
 		return fmt.Sprintf(
-			"INCONCLUSIVE: %d outbox rows against %d broker records, but the count cannot be trusted (%s)",
-			r.TerminalEvents, r.MessagesWritten, strings.Join(r.Caveats, "; "),
+			"INCONCLUSIVE: %d of %d outbox rows were matched to a record inside the measured broker "+
+				"windows, and the rest could not be (%s)",
+			r.CorroboratedEvents, r.TerminalEvents, strings.Join(r.Caveats, "; "),
 		)
+	case r.TerminalEvents == 0:
+		return "NO LOSS DETECTED: the outbox holds no rows claiming a publication, so there is " +
+			"nothing to reconcile"
 	default:
+		// The SURPLUS is named, because a green verdict that only said "no loss detected" left an
+		// operator unable to tell a healthy overhead from a shortfall that happened to be hidden
+		// by one: what makes the surplus safe is that every row names the distinct record it
+		// produced, so the extra records belong to redeliveries, replays and dead-letter copies
+		// rather than to events nothing accounts for.
 		return fmt.Sprintf(
-			"NO LOSS DETECTED: %d outbox rows against %d broker records, %d of which are redelivery, "+
-				"replay or dead-letter overhead. Every one of the %d rows names the distinct broker "+
-				"record it produced, so the surplus cannot be masking an equal number of losses",
-			r.TerminalEvents, r.MessagesWritten, r.Overhead, r.ConfirmedEvents,
+			"NO LOSS DETECTED: every one of the %d outbox rows published between %s and %s names the "+
+				"distinct broker record it produced, inside the measured offset window of its own "+
+				"partition, so the %d record(s) of surplus are redelivery, replay and dead-letter "+
+				"copies rather than unaccounted events, and no event this outbox still retains is "+
+				"missing from the broker",
+			r.CorroboratedEvents,
+			r.CoveredFrom.Format(time.RFC3339),
+			r.CoveredTo.Format(time.RFC3339),
+			r.Overhead,
 		)
 	}
 }
 
-// ReconcileAgainstOutbox interprets an offset report against the outbox's own audit.
+// ReconcileAgainstOutbox interprets an offset report against the outbox's interval audit.
 //
-// It is the ONLY sanctioned way to compare the two, and it exists so that the asymmetry is
-// applied in one place: messages are a lower bound on events, never an equality, so the test
-// is a DIRECTIONAL one and the surplus is expected rather than suspicious.
+// It is the ONLY sanctioned way to compare the two, and it exists so that the reasoning lives
+// in one place rather than being re-derived — wrongly — by each caller.
 //
-// # OBS-02: why the audit replaced a bare row count
+// # What replaced the arithmetic, and why it had to be replaced
 //
-// It used to take an int64 — the number of terminal rows — and conclude from arithmetic alone.
-// That conclusion was unsound in one specific and entirely plausible way: THE SURPLUS IS
-// INDISTINGUISHABLE FROM COMPENSATED LOSS. Ten redeliveries and ten lost events produce exactly
-// the totals of a healthy pipeline, so the verdict read "no loss detected" while ten events were
-// genuinely gone, and nothing about the numbers hinted at it.
+// It used to take a row count and conclude from `endOffsetSum - terminalRows >= 0`. That was
+// unsound in four separate ways, each of which is enough on its own to make the verdict
+// meaningless: the two sides had no common baseline (outbox pruning shrinks one while the
+// other only climbs), no common readability guarantee (Kafka retention deletes records the
+// end offset still counts), no common topic incarnation (recreating a topic resets its
+// offsets), and no common producer (foreign traffic on a shared topic inflates the right side
+// by an unknown amount). On top of all that, the surplus it tolerated was indistinguishable
+// from compensated loss: ten redeliveries and ten lost events produce exactly the totals of a
+// healthy pipeline.
 //
-// Taking the audit makes the check a MAPPING as well as a comparison. Every row that claims a
-// publication either names the record it produced or it does not, and while any do not the
-// verdict is inconclusive — because those are exactly the rows a surplus could be hiding. A
-// green verdict now means two things together: the broker holds at least as many records as
-// there are claims, AND every claim names a distinct record of its own.
+// This function now interprets a MAPPING that is bounded per partition. Every retained row
+// that claims a publication has been placed into exactly one bucket by
+// AuditEventRecordsInIntervals, and the verdict is a reading of those buckets:
 //
-// Retention is treated as a caveat rather than folded into the arithmetic. A topic whose
-// records have partly aged out has an end offset that still counts them, so the comparison
-// remains valid in the direction that matters — but a reader must know that retention is in
-// play before concluding anything about what is still consumable.
+//	beyond the log end        ⇒ LOSS. The broker assigned that offset; the log no longer
+//	                            reaches it, so the record is gone (truncation or recreation).
+//	any other uncorroborated  ⇒ INCONCLUSIVE, itemised by reason.
+//	all corroborated, distinct⇒ NO LOSS DETECTED, over the stated publication window.
+//
+// The summed end offsets are still reported, because an operator wants them, but they are no
+// longer the proof. That is deliberate: on a shared topic they cannot be.
 //
 // Parameters:
-//   - report TopicOffsetReport: the broker-side measurement from TopicEndOffsets.
-//   - audit model.EventOutboxAudit: the outbox-side measurement from
-//     AuditTerminalEventRecords. Each event counted once, by virtue of the unique index on
+//   - report TopicOffsetReport: the broker-side measurement from TopicEndOffsets, whose
+//     PartitionIntervals() must be the windows the audit was taken against. Passing an audit
+//     computed from different windows would produce a verdict about nothing.
+//   - audit model.EventRecordIntervalAudit: the outbox-side classification from
+//     AuditEventRecordsInIntervals. Each event counted once, by virtue of the unique index on
 //     event_id.
 //
 // Returns:
 //   - OutboxReconciliation: the verdict, always populated.
 func ReconcileAgainstOutbox(
 	report TopicOffsetReport,
-	audit model.EventOutboxAudit,
+	audit model.EventRecordIntervalAudit,
 ) OutboxReconciliation {
-	duplicated := audit.ConfirmedRows - audit.DistinctRecords
-	if duplicated < 0 {
-		duplicated = 0
+	// THE COMMON POPULATION. When both sides name a window the comparison is drawn INSIDE it,
+	// because the cumulative sum counts a history the outbox no longer holds: a topic that has
+	// accepted a million records over its life and a thousand inside the window must reconcile
+	// against the rows the outbox holds for that window, or every reconciliation reports a
+	// surplus that grows without bound. With no window on either side the cumulative reading is
+	// the only one available, and the caveats say so.
+	windowed := !report.WindowStart.IsZero() && !audit.WindowStart.IsZero()
+
+	writtenRecords := report.EndOffsetSum
+	if windowed {
+		writtenRecords = report.WindowRecordCount
 	}
 
 	verdict := OutboxReconciliation{
-		TerminalEvents:    audit.PublishedRows,
-		ConfirmedEvents:   audit.ConfirmedRows,
-		UnconfirmedEvents: audit.UnconfirmedRows(),
-		DuplicatedRecords: duplicated,
-		MessagesWritten:   report.EndOffsetSum,
-		Overhead:          report.EndOffsetSum - audit.PublishedRows,
-		MeasuredAt:        report.MeasuredAt,
+		TerminalEvents:     audit.PublishedRows,
+		CorroboratedEvents: audit.CorroboratedRows,
+		UnconfirmedEvents:  audit.UnconfirmedRows,
+		UnmeasuredEvents:   audit.UnmeasuredRows,
+		AgedOutEvents:      audit.AgedOutRows,
+		BeyondEndEvents:    audit.BeyondEndRows,
+		DuplicatedRecords:  audit.DuplicatedRecords(),
+		MessagesWritten:    writtenRecords,
+		Windowed:           windowed,
+		Overhead:           writtenRecords - audit.PublishedRows,
+		RecordsRetained:    report.RetainedCount,
+		BlnkRecordShare:    audit.CorroboratedRows,
+		CoveredFrom:        audit.CorroboratedFrom,
+		CoveredTo:          audit.CorroboratedTo,
+		OldestTerminalAt:   audit.OldestTerminalAt,
+		WindowStart:        report.WindowStart,
+		MeasuredAt:         report.MeasuredAt,
 	}
 
-	verdict.LossDetected = verdict.Overhead < 0
+	// TWO INDEPENDENT SIGNALS, and either is enough.
+	//
+	// The first is unambiguous: an offset at or above the log end cannot be explained by
+	// retention, by a redelivery or by another producer — the broker issued it, so the log
+	// reached it once and does not now.
+	//
+	// The second is arithmetic and only available on a windowed comparison: records are a LOWER
+	// BOUND on events, because a redelivery, a replay and a dead-letter copy each append a record
+	// no row claims. So a surplus is normal and a SHORTFALL is not: fewer records inside the
+	// window than rows claiming one inside it means rows claim a publication that never happened.
+	verdict.LossDetected = verdict.BeyondEndEvents > 0 || (windowed && verdict.Overhead < 0)
 
-	caveats := make([]string, 0, 5)
+	caveats := make([]string, 0, 6)
 
-	// THE CAVEAT THIS WHOLE CHANGE EXISTS FOR. A row claiming a publication it cannot name a
-	// record for is not evidence of loss — the record may well be there — but it is precisely
+	if verdict.BeyondEndEvents > 0 {
+		caveats = append(caveats, fmt.Sprintf(
+			"%d row(s) name an offset at or beyond the end of their partition's log, which means the "+
+				"partition was truncated or the topic was deleted and recreated after those records "+
+				"were written",
+			verdict.BeyondEndEvents,
+		))
+	}
+
+	// THE CAVEAT THE COORDINATE MAPPING EXISTS FOR. A row claiming a publication it cannot name
+	// a record for is not evidence of loss — the record may well be there — but it is precisely
 	// what a surplus of redeliveries could be concealing, so no green verdict may be reported
 	// while any remain.
 	if verdict.UnconfirmedEvents > 0 {
 		caveats = append(caveats, fmt.Sprintf(
 			"%d row(s) claim a publication without naming the broker record they produced, so they "+
-				"cannot be matched against the count and a surplus could be masking their loss",
+				"cannot be matched against any measured window",
 			verdict.UnconfirmedEvents,
+		))
+	}
+
+	if verdict.UnmeasuredEvents > 0 {
+		caveats = append(caveats, fmt.Sprintf(
+			"%d row(s) name a topic or partition this measurement did not cover, so their records "+
+				"were neither confirmed nor ruled out",
+			verdict.UnmeasuredEvents,
+		))
+	}
+
+	// Retention is now a statement about SPECIFIC EVENTS rather than a topic-wide subtraction.
+	// The old caveat fired whenever anything at all had aged out of a shared topic — including
+	// records Blnk never wrote — so it was permanently on in any long-lived deployment and told
+	// an operator nothing about their own events.
+	if verdict.AgedOutEvents > 0 {
+		caveats = append(caveats, fmt.Sprintf(
+			"%d row(s) name a record Kafka retention has already deleted, so the write is evidenced "+
+				"by the stored offset but the record can no longer be read",
+			verdict.AgedOutEvents,
 		))
 	}
 
@@ -5446,23 +6359,42 @@ func ReconcileAgainstOutbox(
 
 	if len(report.MissingTopics) > 0 {
 		caveats = append(caveats, fmt.Sprintf(
-			"%d measured topic(s) do not exist on the broker (%s), so their records cannot be counted",
+			"%d measured topic(s) do not exist on the broker (%s), so no window could be measured "+
+				"for them",
 			len(report.MissingTopics), strings.Join(report.MissingTopics, ", "),
 		))
 	}
 
 	if report.PartitionsUnavailable > 0 {
 		caveats = append(caveats, fmt.Sprintf(
-			"%d partition(s) did not report offsets, so their records are missing from the total",
+			"%d partition(s) did not report offsets, so no window could be measured for them",
 			report.PartitionsUnavailable,
 		))
 	}
 
-	if report.RetainedCount < report.EndOffsetSum {
+	// RETENTION IS ONLY A CAVEAT WHEN IT TRUNCATES THE MEASURED WINDOW.
+	//
+	// It used to be one whenever the broker held fewer records than the offsets counted —
+	// which is true of every healthy cluster with any retention policy at all, so the verdict
+	// became permanently inconclusive the first time a segment was deleted and stayed that
+	// way. That is not what retention does to this comparison: end offsets count deleted
+	// records too, so a cumulative reading is unaffected and a WINDOWED reading is affected
+	// only when records written INSIDE the window have been removed. That case is detected
+	// per partition and reported here; anything else is normal operation and is reported as a
+	// note on the report rather than as a reason to distrust the verdict.
+	if report.WindowTruncated {
+		caveats = append(caveats,
+			"retention has removed records that were written inside the measured window, so the "+
+				"broker-side count is a lower bound; shorten the reconciliation window or lengthen the "+
+				"broker's retention so the window fits inside it",
+		)
+	}
+
+	if report.WindowPartitionsUnreadable > 0 {
 		caveats = append(caveats, fmt.Sprintf(
-			"retention has removed %d record(s) that were written, so the broker no longer holds "+
-				"everything the offsets count",
-			report.EndOffsetSum-report.RetainedCount,
+			"%d partition(s) did not report a window-start offset, so the records they accepted inside "+
+				"the window are missing from the total",
+			report.WindowPartitionsUnreadable,
 		))
 	}
 
@@ -5470,4 +6402,1160 @@ func ReconcileAgainstOutbox(
 	verdict.Conclusive = len(caveats) == 0
 
 	return verdict
+}
+
+// ---------------------------------------------------------------------------
+// Event pipeline statistics — the orchestration behind GET /events/stats
+//
+// Everything below assembles ONE answer to "what state is the event pipeline in",
+// from four collaborators: the per-status aggregate and the terminal-record audit
+// from PostgreSQL, the topic end offsets from the broker, and the reconciliation
+// verdict that compares the last two.
+//
+// It lives here, in the root package, and not in the HTTP handler. The handler used
+// to orchestrate it directly — resolve the datasource, read the counts, decide
+// whether the audit was needed, build a Kafka admin client, read the offsets,
+// choose per-failure whether to degrade or refuse, and then reconcile — which put
+// the sequencing rules and the failure policy of a five-step operation inside a
+// function whose job is to translate HTTP. Two costs followed. The sequence was
+// unreachable from anything that is not a Gin request, so the CLI and any test had
+// to restate it; and each degradation decision was expressed as a `c.JSON` early
+// return, so "which failures are tolerable" could only be read by tracing response
+// writes.
+//
+// The handler now performs one call and maps the result onto its DTO.
+// ---------------------------------------------------------------------------
+
+// eventOffsetReadTimeout bounds the broker round trip a statistics read makes.
+//
+// It exists so that an unreachable broker DEGRADES the answer rather than holding the
+// caller open: the outbox counts have already been read from PostgreSQL by the time the
+// broker is dialled, and reporting them without the offsets is a valid, documented answer.
+const eventOffsetReadTimeout = 10 * time.Second
+
+// EventOffsetInclusion is how a statistics read wants the BROKER side treated.
+//
+// The three postures exist because the broker half of the reconciliation is
+// optional in a way the outbox half is not: a deployment with no brokers configured
+// is a legitimate steady state, so an unreadable broker is ordinarily an enrichment
+// that is absent rather than a failure. A caller who specifically asked for that
+// half needs the opposite, and a caller who wants the counts cheaply needs neither.
+type EventOffsetInclusion int
+
+const (
+	// EventOffsetsBestEffort reads the broker when one is configured and omits the
+	// broker-side fields on any failure, logging the reason. It is the zero value and
+	// the posture the daily reconciliation runbook relies on.
+	EventOffsetsBestEffort EventOffsetInclusion = iota
+
+	// EventOffsetsRequired makes a failure to read the broker a typed error, because
+	// the caller asked specifically for the half of the reconciliation that failed.
+	EventOffsetsRequired
+
+	// EventOffsetsSkipped makes no broker round trip at all.
+	EventOffsetsSkipped
+)
+
+// EventOutboxStatistics is the whole state of the event pipeline at one instant: the
+// outbox side always, the broker side and the verdict when they could be measured.
+//
+// # Read the two booleans before reading the fields they govern
+//
+// AuditRead and OffsetsRead exist because "measured and zero" and "not measured"
+// are different answers that the numbers alone cannot distinguish, and confusing
+// them is how a reconciliation reports a clean bill of health it never established.
+// A response that presents an unmeasured broker side as though it were a measured
+// empty one is exactly the failure the zero-loss criterion cannot survive.
+//
+// Reconciliation is nil unless BOTH sides were measured and at least one topic was
+// actually covered. That is a documented absence rather than an error: with nothing
+// measured there is nothing to compare, so no verdict is reported.
+type EventOutboxStatistics struct {
+	// GeneratedAt is when the outbox side was read, in UTC.
+	GeneratedAt time.Time
+
+	// CountsByStatus is the per-status aggregate, keyed by the
+	// model.EventOutboxStatus* values. A status with no rows is ABSENT rather than
+	// present with a zero, because GROUP BY only produces rows that exist — read it
+	// with the two-value form or accept the zero value.
+	CountsByStatus map[string]int64
+
+	// UnreportedStatuses names any status the table holds that model.EventOutboxStatuses
+	// does not know about, sorted.
+	//
+	// The status column deliberately permits values the code has not learned yet so the
+	// state machine can be extended without a migration, which means a new state can
+	// appear in the aggregate before any consumer's shape learns about it. Its rows
+	// would then be missing from every reported total, and a short total is precisely
+	// what a zero-loss reconciliation cannot tolerate. Surfacing the names here is what
+	// lets a caller say so rather than silently under-report.
+	UnreportedStatuses []string
+
+	// WindowStart is the instant the WINDOWED figures are measured from, and Window is its
+	// length. They are reported rather than implied because only one figure here is windowed —
+	// the dispatched count — and a reader who cannot see the interval cannot tell a quiet day
+	// from a short window.
+	WindowStart time.Time
+	Window      time.Duration
+
+	// Audit is the outbox side of the reconciliation, classified against the very
+	// partition windows the broker reported. Meaningful only when AuditRead.
+	Audit model.EventRecordIntervalAudit
+
+	// AuditRead reports whether the audit was actually read. False both when the
+	// posture skipped the broker side entirely and when the audit query failed under a
+	// best-effort posture.
+	AuditRead bool
+
+	// Offsets is the broker-side measurement. Meaningful only when OffsetsRead.
+	Offsets TopicOffsetReport
+
+	// OffsetsRead reports whether the broker was actually read.
+	OffsetsRead bool
+
+	// Reconciliation is the verdict comparing the two sides, or nil when it could not
+	// be produced.
+	Reconciliation *OutboxReconciliation
+}
+
+// eventStatisticsStore is the repository surface the statistics read needs, and
+// deliberately no more of it.
+//
+// Two reads, both of them reads. A statistics call cannot claim, insert or transition
+// anything, and depending on a two-method interface rather than on the whole
+// IDataSource is what states that at the type level instead of in a comment.
+type eventStatisticsStore interface {
+	// CountEventOutboxByStatus returns the per-status aggregate. The instant bounds the
+	// unbounded dispatched population only; every other status is counted in full however
+	// short the window, because a row stuck for days must not vanish from a one-day reading.
+	CountEventOutboxByStatus(ctx context.Context, since time.Time) (map[string]int64, error)
+
+	// AuditEventRecordsInIntervals returns the outbox side of the zero-loss
+	// reconciliation, classified against the readable offset windows the broker
+	// reported. The windows are what make the two sides describe one population, so
+	// the audit is taken AFTER the offsets are measured and against those very
+	// intervals.
+	AuditEventRecordsInIntervals(
+		ctx context.Context,
+		intervals []model.PartitionOffsetInterval,
+	) (model.EventRecordIntervalAudit, error)
+}
+
+// EventOutboxStatistics assembles the statistics for this instance.
+//
+// # The failure policy, in one place
+//
+// The outbox counts are read FIRST and their failure is the only unconditional one:
+// without them there is nothing to report at all. Everything after them is governed
+// by the posture:
+//
+//	EventOffsetsSkipped   returns after the counts. No audit, no broker round trip.
+//	EventOffsetsBestEffort logs and omits on an audit or offset failure. This is what
+//	                      makes a deployment with no brokers answer 200 with the
+//	                      counts, which is a legitimate steady state and not a fault.
+//	EventOffsetsRequired  returns a typed error on either failure, because the caller
+//	                      asked for the half that could not be produced.
+//
+// The audit is read only when the broker side is going to be measured, because its
+// only consumer is the comparison against the offsets.
+//
+// # Why the whole topic inventory is always measured
+//
+// No topic-narrowing parameter is offered, here or at the endpoint. The verdict
+// compares the broker's records against EVERY outbox row that claims a publication,
+// so measuring a subset of the topics would manufacture a shortfall and report loss
+// that has not happened. Restricting the topics is only meaningful alongside a
+// matching restriction on the outbox side, which no repository method offers.
+//
+// Parameters:
+//   - ctx context.Context: cancels the queries and the broker round trip. The broker
+//     read is additionally bounded by its own timeout, so an unreachable broker
+//     degrades the answer rather than holding the caller open.
+//   - inclusion EventOffsetInclusion: how the broker side is to be treated.
+//
+// Returns:
+//   - EventOutboxStatistics: the statistics. Populated whenever err is nil; read
+//     AuditRead and OffsetsRead before the fields they govern.
+//   - error: a typed APIError — ErrInternalServer when the outbox cannot be read, and
+//     ErrKafkaUnavailable when the broker was REQUIRED and could not be read.
+//
+// defaultEventStatisticsWindow is the window a statistics request gets when it names none, and
+// maxEventStatisticsWindow is the longest one accepted.
+//
+// One day, because that is the period the zero-loss reconciliation runbook reconciles over and
+// the period an operator asks "what happened today" about. A week as the ceiling: long enough
+// for an operator investigating something that started last weekend, short enough that the
+// bounded queries stay bounded, and well inside any sensible broker retention — which is what
+// keeps the reconciliation conclusive rather than truncated.
+const (
+	defaultEventStatisticsWindow = 24 * time.Hour
+	maxEventStatisticsWindow     = 7 * 24 * time.Hour
+)
+
+// normalizeEventStatisticsWindow bounds a requested window.
+//
+// A non-positive request becomes the default, which is what a caller that named no window
+// passes, and anything longer than the ceiling is clamped to it. Correcting rather than
+// refusing is deliberate at this layer: the HTTP handler refuses an out-of-range value so the
+// caller sees their mistake, and this is the floor under every other caller — a gauge, a
+// runbook script, a future CLI — so that none of them can ask for an unbounded scan by
+// accident.
+//
+// Parameters:
+//   - window time.Duration: the requested length. Zero means "unspecified".
+//
+// Returns:
+//   - time.Duration: a positive duration no longer than the ceiling.
+func normalizeEventStatisticsWindow(window time.Duration) time.Duration {
+	if window <= 0 {
+		return defaultEventStatisticsWindow
+	}
+
+	if window > maxEventStatisticsWindow {
+		return maxEventStatisticsWindow
+	}
+
+	return window
+}
+
+func (b *Blnk) EventOutboxStatistics(
+	ctx context.Context,
+	inclusion EventOffsetInclusion,
+	window time.Duration,
+) (EventOutboxStatistics, error) {
+	store, err := b.eventStatisticsStore()
+	if err != nil {
+		return EventOutboxStatistics{}, err
+	}
+
+	return eventOutboxStatistics(ctx, store, b.cumulativeEventTopicOffsets, inclusion, window)
+}
+
+// eventOutboxStatistics is the orchestration itself, with its two collaborators passed
+// in.
+//
+// It is separated from the Blnk method for one reason: every branch below is a POLICY
+// decision — which failures degrade the answer and which refuse it — and a policy that
+// can only be exercised through a fully constructed service with a live PostgreSQL and a
+// live broker is a policy whose branches go untested. The seam takes a two-method store
+// and an offset-reader function, so each posture and each failure combination is
+// reachable directly.
+//
+// Parameters:
+//   - ctx context.Context: cancels both reads.
+//   - store eventStatisticsStore: the two repository reads. Must not be nil.
+//   - readOffsets func: the broker-side measurement. A nil function is treated as an
+//     unconfigured broker, which is the same degradation an unreachable one takes.
+//   - inclusion EventOffsetInclusion: how the broker side is to be treated.
+//
+// Returns:
+//   - EventOutboxStatistics: as EventOutboxStatistics.
+//   - error: as EventOutboxStatistics.
+func eventOutboxStatistics(
+	ctx context.Context,
+	store eventStatisticsStore,
+	readOffsets func(context.Context) (TopicOffsetReport, error),
+	inclusion EventOffsetInclusion,
+	window time.Duration,
+) (EventOutboxStatistics, error) {
+	ctx, span := tracer.Start(ctx, "EventOutboxStatistics")
+	defer span.End()
+
+	if store == nil {
+		err := apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"The event outbox is unavailable because the service is not initialised",
+			errEventStatisticsDataSourceMissing,
+		)
+		span.RecordError(err)
+
+		return EventOutboxStatistics{}, err
+	}
+
+	if readOffsets == nil {
+		// An absent reader is the same situation as an unconfigured broker, and reporting
+		// it as that error rather than panicking is what keeps the two postures behaving
+		// identically for a caller that has no broker at all.
+		readOffsets = func(context.Context) (TopicOffsetReport, error) {
+			return TopicOffsetReport{}, ErrKafkaAdminNotConfigured
+		}
+	}
+
+	// ONE WINDOW START, DERIVED ONCE, AND REPORTED. This used to pass the zero instant with a
+	// comment saying it asked for the whole retained history — and the repository normalises a
+	// zero instant to its own default precisely so that a caller which forgot the parameter
+	// cannot scan a table gaining 43.2 million rows a day. So the request did not get the whole
+	// history: it got twenty-four hours of dispatched rows, described to the operator as though
+	// it were everything, with no window on the response to say otherwise.
+	//
+	// What the window does and does not bound is the repository's contract, restated here
+	// because it is what makes a short window safe to ask for: every status EXCEPT dispatched is
+	// counted exactly and in full whatever the window says — those are the populations an
+	// operator acts on, and any of them can legitimately be older than any window — while
+	// dispatched, the only one that grows without bound, is counted from here.
+	windowStart := time.Now().UTC().Add(-normalizeEventStatisticsWindow(window))
+
+	counts, err := store.CountEventOutboxByStatus(ctx, windowStart)
+	if err != nil {
+		span.RecordError(err)
+
+		return EventOutboxStatistics{}, err
+	}
+
+	statistics := EventOutboxStatistics{
+		GeneratedAt:        time.Now().UTC(),
+		CountsByStatus:     counts,
+		UnreportedStatuses: unreportedEventOutboxStatuses(counts),
+		WindowStart:        windowStart,
+		Window:             normalizeEventStatisticsWindow(window),
+	}
+
+	if len(statistics.UnreportedStatuses) > 0 {
+		// Logged HERE as well as returned, because the caller may render it and may
+		// not, and this is a schema-drift warning an operator needs to see either way.
+		logrus.WithField("statuses", strings.Join(statistics.UnreportedStatuses, ", ")).Warn(
+			"the event outbox holds rows in states nothing reports a count for, so the reported " +
+				"per-status counts sum to less than the table's row count; teach the statistics " +
+				"projection the new state before trusting the zero-loss reconciliation",
+		)
+	}
+
+	span.SetAttributes(
+		attribute.Int("event_outbox.statuses_reported", len(counts)),
+		attribute.Int("event_outbox.statuses_unreported", len(statistics.UnreportedStatuses)),
+	)
+
+	if inclusion == EventOffsetsSkipped {
+		return statistics, nil
+	}
+
+	report, err := readOffsets(ctx)
+	if err != nil {
+		if inclusion == EventOffsetsRequired {
+			// DATA-01: the cause is a Kafka client error, which renders with broker
+			// addresses and topology, so it is logged here and a fixed message is
+			// returned in its place.
+			withLoggableCause(nil, err).Error(
+				"the Kafka topic end offsets could not be read for a statistics request that " +
+					"required them",
+			)
+			span.RecordError(err)
+
+			return statistics, apierror.NewAPIError(
+				apierror.ErrKafkaUnavailable,
+				"The Kafka broker could not be read, so the topic end offsets this request required "+
+					"are unavailable; retry once the broker recovers or omit include_offsets to "+
+					"receive the outbox counts alone",
+				errors.New("blnk: reading the event topic end offsets failed"),
+			)
+		}
+
+		withLoggableCause(nil, err).Warn(
+			"the Kafka topic end offsets could not be read, so the statistics report the " +
+				"per-status counts alone; this is the expected result when no brokers are configured",
+		)
+
+		return statistics, nil
+	}
+	statistics.Offsets, statistics.OffsetsRead = report, true
+
+	// The audit is taken against the windows THIS report measured, never against the
+	// whole table: an audit and an offset total that describe different populations
+	// cannot be compared, which is the defect the interval form exists to close.
+	audit, err := store.AuditEventRecordsInIntervals(ctx, report.PartitionIntervals())
+	if err != nil {
+		if inclusion == EventOffsetsRequired {
+			span.RecordError(err)
+
+			return statistics, err
+		}
+
+		withLoggableCause(nil, err).Warn(
+			"the event outbox audit could not be read, so the statistics report the per-status " +
+				"counts and the measured offsets without the zero-loss verdict",
+		)
+
+		return statistics, nil
+	}
+	statistics.Audit, statistics.AuditRead = audit, true
+
+	// With nothing measured there is nothing to compare against, so no verdict is
+	// produced. A verdict computed over zero topics would report a clean bill of health
+	// it never established.
+	if len(report.Topics) > 0 {
+		verdict := ReconcileAgainstOutbox(report, audit)
+		statistics.Reconciliation = &verdict
+
+		span.SetAttributes(
+			attribute.Bool("event_outbox.reconciliation.conclusive", verdict.Conclusive),
+			attribute.Bool("event_outbox.reconciliation.loss_detected", verdict.LossDetected),
+		)
+	}
+
+	return statistics, nil
+}
+
+// errEventStatisticsDataSourceMissing is the cause recorded when statistics are asked
+// for before a datasource exists. It is a start-up or programming fault rather than a
+// caller error, so the cause is kept out of any response body.
+var errEventStatisticsDataSourceMissing = errors.New(
+	"blnk: event statistics require a datasource",
+)
+
+// eventStatisticsStore resolves the repository the statistics read goes through.
+//
+// It is guarded rather than dereferenced because NewBlnk(nil) is a supported
+// construction in this codebase: the caller must receive a typed error it can render
+// rather than a nil-pointer panic from inside a query.
+//
+// Returns:
+//   - eventStatisticsStore: the repository, never nil when err is nil.
+//   - error: a typed internal APIError when no datasource is available.
+func (b *Blnk) eventStatisticsStore() (eventStatisticsStore, error) {
+	unavailable := func() error {
+		return apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"The event outbox is unavailable because the service is not initialised",
+			errEventStatisticsDataSourceMissing,
+		)
+	}
+
+	if b == nil {
+		return nil, unavailable()
+	}
+
+	datasource := b.GetDataSource()
+	if datasource == nil {
+		return nil, unavailable()
+	}
+
+	return datasource, nil
+}
+
+// unreportedEventOutboxStatuses names the statuses present in the aggregate that the
+// state-machine enumeration does not know about, sorted.
+//
+// Driven from model.EventOutboxStatuses, the authoritative list, rather than from a
+// list restated here — a second copy is how a state gets added to one and not the
+// other.
+//
+// Parameters:
+//   - counts map[string]int64: the per-status aggregate. May be nil.
+//
+// Returns:
+//   - []string: the unknown statuses, sorted; nil when every status is known.
+func unreportedEventOutboxStatuses(counts map[string]int64) []string {
+	if len(counts) == 0 {
+		return nil
+	}
+
+	known := model.EventOutboxStatuses()
+
+	var unreported []string
+	for status := range counts {
+		if !slices.Contains(known, status) {
+			unreported = append(unreported, status)
+		}
+	}
+	if len(unreported) == 0 {
+		return nil
+	}
+
+	// Map iteration order is unspecified, so the names are sorted to keep the warning —
+	// and any test asserting on it — deterministic.
+	slices.Sort(unreported)
+
+	return unreported
+}
+
+// cumulativeEventTopicOffsets reads the topic offsets with NO window, which is what the
+// statistics path wants.
+//
+// The bounded comparison this feeds does not come from a window on the broker read: the audit is
+// taken against report.PartitionIntervals(), so each partition's outbox population is bounded by
+// the very interval the offsets measured. Asking for a second, coarser window here would add a
+// caveat and no information — and a window whose left edge the broker could not resolve would
+// make the verdict inconclusive for a reason that has nothing to do with the data.
+//
+// The windowed reading is still available, and is what the reconciliation runbook uses when it
+// wants a broker-side population bounded by wall-clock time rather than by offsets.
+//
+// Parameters:
+//   - ctx context.Context: cancellation is inherited.
+//
+// Returns:
+//   - TopicOffsetReport: the cumulative report.
+//   - error: whatever the windowed read reports.
+func (b *Blnk) cumulativeEventTopicOffsets(ctx context.Context) (TopicOffsetReport, error) {
+	return b.readEventTopicEndOffsets(ctx, time.Time{})
+}
+
+// readEventTopicEndOffsets measures the broker side of the reconciliation.
+//
+// The admin client is built per call and closed before returning. That is the right
+// trade for a rare, operator-triggered read and the wrong one in a loop: it costs one
+// connection and one SASL handshake in exchange for this path owning no client
+// lifecycle. The relay and the metrics collector each hold their own long-lived
+// client.
+//
+// A close failure is logged and never returned, matching how the server does it: the
+// measurement is what the caller asked about, and reporting a connection-teardown
+// problem as a failed read would send an operator looking for a broker fault that
+// does not exist.
+//
+// An unconfigured broker is reported as ErrKafkaAdminNotConfigured WITHOUT building a
+// client, so the reason appears in the caller's log rather than being obscured by an
+// operation that refuses after dialling nothing.
+//
+// Parameters:
+//   - ctx context.Context: cancellation is inherited; the read is additionally bounded
+//     by eventOffsetReadTimeout.
+//   - since time.Time: the left-hand edge of the window the broker-side population is
+//     bounded to. The zero instant asks for the cumulative reading only, which is the
+//     right request for a diagnostic and the wrong one for a verdict — a comparison
+//     against a bounded outbox population needs a bounded broker population too.
+//
+// Returns:
+//   - TopicOffsetReport: the per-topic detail and the sums.
+//   - error: ErrKafkaAdminNotConfigured when no broker is configured, or the broker's
+//     own wrapped error.
+func (b *Blnk) readEventTopicEndOffsets(ctx context.Context, since time.Time) (TopicOffsetReport, error) {
+	if b == nil {
+		return TopicOffsetReport{}, ErrKafkaAdminNotConfigured
+	}
+
+	configuration := b.Config()
+	if configuration == nil || !KafkaBrokersConfigured(configuration.Kafka.Brokers) {
+		return TopicOffsetReport{}, ErrKafkaAdminNotConfigured
+	}
+
+	admin, err := NewKafkaAdmin(configuration)
+	if err != nil {
+		return TopicOffsetReport{}, err
+	}
+	defer func() {
+		if closeErr := admin.Close(); closeErr != nil {
+			withLoggableCause(nil, closeErr).Warn(
+				"closing the Kafka admin client after reading the event topic end offsets failed",
+			)
+		}
+	}()
+
+	measurement, cancel := context.WithTimeout(ctx, eventOffsetReadTimeout)
+	defer cancel()
+
+	// No topic list is passed, so the full inventory is measured — see the note on
+	// EventOutboxStatistics for why narrowing it would invalidate the verdict.
+	return admin.TopicEndOffsets(measurement, since)
+}
+
+// ReconciliationBaseline is everything beyond the two counts that the verdict needs in order
+// to be sound, gathered into one parameter.
+//
+// # Why it is a required parameter rather than an option
+//
+// Both members answer a question the counting cannot: whether the two sides of the comparison
+// cover the same interval, and whether the records the outbox names actually exist. A verdict
+// computed without them is not a weaker verdict, it is an UNSOUND one — it can report a
+// confident "no loss detected" while events are missing. Making it a parameter means a caller
+// has to state what it knows, and a caller that knows nothing gets an inconclusive verdict
+// rather than an optimistic one. That is the whole design: the zero value is the honest
+// "unknown", because model.EventOutboxPurgeTotals.Recorded is false in it and an empty
+// coordinate audit verifies nothing.
+type ReconciliationBaseline struct {
+	// Purges is what retention has deleted from the outbox. Its Recorded field distinguishes
+	// "nothing was purged" from "we cannot tell", and only the former supports a conclusive
+	// verdict.
+	Purges model.EventOutboxPurgeTotals
+
+	// Coordinates is what the outbox claims about the broker, per partition. It is checked
+	// against the report's live per-partition bounds, which is the step that turns the
+	// reconciliation from an inference into a verification.
+	Coordinates model.EventRecordCoordinateAudit
+}
+
+// THE GO-SIDE CLAIM VERIFIER WAS RETIRED HERE, and its work is now done in SQL.
+//
+// It took the offset report and a per-partition coordinate audit and sorted every claimed
+// offset into verified / unverifiable / missing by comparing it against that partition's live
+// low and high water marks. AuditEventRecordsInIntervals now performs the same classification
+// inside the database, over the SAME per-partition windows the offsets were measured in, and
+// returns it as corroborated / aged-out / beyond-end / unmeasured row counts.
+//
+// The SQL form is not merely equivalent, it is stricter in the two ways that matter. It splits
+// "could not be checked" into retention having removed a record the stored offset still
+// evidences (aged out) and the measurement not having covered that topic or partition
+// (unmeasured) — fusing them made every cluster with a retention policy permanently
+// inconclusive. And because the audit and the offsets are drawn over one set of intervals, the
+// two sides of the comparison describe the same population by construction rather than by two
+// callers agreeing to pass matching arguments.
+// TopicCatalogueReport is the answer to "does every topic the relay may need exist right now?"
+//
+// It is deliberately narrower than TopicAssuranceReport. That one is about GEOMETRY — how many
+// partitions, what replication factor, what this run changed — and it is what an operator reads
+// at boot. This one is about EXISTENCE, and it is what the relay's claim gate reads before it
+// leases a single row: a topic that is missing cannot be published to, because auto-creation is
+// disabled, and it cannot be dead-lettered to either.
+type TopicCatalogueReport struct {
+	// Expected is every topic Blnk may write to, across every owned prefix: each category
+	// topic and each dead-letter sibling.
+	Expected []string
+
+	// Missing is the subset of Expected the broker does not have, in Expected's order.
+	Missing []string
+
+	// VerifiedAt is when the broker was read.
+	VerifiedAt time.Time
+}
+
+// Complete reports whether the whole catalogue is present.
+//
+// Returns:
+//   - bool: true when the broker has every expected topic. False for an empty expectation
+//     too, which is not reachable in production — event_topics.go always composes at least
+//     one category per prefix — and must not read as "verified" if it ever became reachable.
+func (r TopicCatalogueReport) Complete() bool {
+	return len(r.Expected) > 0 && len(r.Missing) == 0
+}
+
+// VerifyTopicCatalogue reports which of the topics Blnk may write to are absent from the
+// broker.
+//
+// # Why existence is checked separately from assurance
+//
+// EnsureTopics CREATES; this one only LOOKS. The distinction is what lets the relay's claim
+// gate run on every poll: a metadata read is one round trip and mutates nothing, so it is
+// affordable in a loop, whereas re-running creation continuously would be neither.
+//
+// # Why the dead-letter siblings are part of the answer
+//
+// A missing dead-letter topic is worse than a missing category topic, not better. The category
+// topic's absence fails the publish, which retries; the dead-letter topic's absence fails the
+// PRESERVATION of an event whose retry budget is already spent, and that event has then reached
+// no topic at all. Both are in Expected for that reason, and Complete requires both.
+//
+// # Why every owned prefix is included
+//
+// Rows captured before a KAFKA_TOPIC_PREFIX rename name the previous generation's topics and
+// the relay still publishes them, so those topics are ones it may need. See
+// AllOwnedTopicsAcrossPrefixes.
+//
+// Parameters:
+//   - ctx context.Context: bounds the metadata read.
+//
+// Returns:
+//   - TopicCatalogueReport: populated on success. Expected is always set, even on error, so a
+//     caller can report what it was looking for.
+//   - error: ErrKafkaAdminNotConfigured when no broker is configured, or a wrapped broker
+//     error. A returned error means the catalogue is UNKNOWN rather than incomplete, and a
+//     caller must not treat it as verified.
+func (a *KafkaAdminClient) VerifyTopicCatalogue(ctx context.Context) (TopicCatalogueReport, error) {
+	report := TopicCatalogueReport{
+		Expected:   AllOwnedTopicsAcrossPrefixes(),
+		VerifiedAt: time.Now().UTC(),
+	}
+
+	if err := a.ready(ctx); err != nil {
+		return report, err
+	}
+
+	present, err := a.topicPartitions(ctx, report.Expected)
+	if err != nil {
+		return report, err
+	}
+
+	report.Missing = missingTopics(report.Expected, present)
+	report.VerifiedAt = time.Now().UTC()
+
+	return report, nil
+}
+
+// TopicCatalogueGate answers whether the relay's destination topics exist, caching the answer
+// once they do and rate-limiting how often it asks while they do not.
+//
+// # What it is for
+//
+// Every write the relay makes goes to a Blnk-owned topic, and auto-creation is disabled, so a
+// missing topic fails the publish, burns the row's retry budget one attempt at a time, and then
+// fails the dead-letter write for the same reason — leaving the row failed with no dead-letter
+// topic recorded. A boot against an unprovisioned broker could spend every pending row's budget
+// that way. This gate is what stops the relay claiming a row it cannot deliver.
+//
+// # Why it can repair rather than only report
+//
+// The gate is consulted continuously, which makes it the natural place to CLOSE the gap it
+// finds: when the catalogue is incomplete it runs topic assurance and verifies again. That is
+// the recovery path for a broker that came up after the boot-time assurance had already run and
+// failed. Assurance is only attempted when verification says something is missing, so the
+// steady state is one cheap metadata read — and, after the first success, none at all.
+//
+// # Why success is latched
+//
+// Once the whole catalogue has been seen, it is not re-checked. A topic can be deleted from
+// under a running deployment, but that is an operator action against a live ledger and it
+// surfaces immediately as publish failures and dead letters, which are exactly the signals for
+// it; whereas re-probing for ever would put a metadata read on the relay's path for the entire
+// life of the process to detect something that does not normally happen. The latch is what
+// makes the gate free in the case that matters.
+type TopicCatalogueGate struct {
+	// verify performs one ensure-and-verify pass. It is a field so a test can drive the gate
+	// without a broker; in production newCatalogueVerifier builds it from configuration.
+	verify func(ctx context.Context) (TopicCatalogueReport, error)
+
+	// now is the clock, replaceable in-package, following the relay's own now field.
+	now func() time.Time
+
+	mu       sync.Mutex
+	verified bool
+
+	// nextProbeAt is when the gate will next talk to the broker. Zero means "now".
+	nextProbeAt time.Time
+
+	// probeInterval is the current gap, grown on each failure up to the cap.
+	probeInterval time.Duration
+}
+
+// NewTopicCatalogueGate builds the gate the server role hands to the relay.
+//
+// It performs NO I/O: the admin client is built per probe and closed again, because a probe
+// happens at most every few seconds and holding an authenticated admin session open for the
+// life of the process — for a check that stops running once it succeeds — would keep a SASL
+// connection per broker for nothing.
+//
+// Parameters:
+//   - cfg *config.Configuration: read for the broker list and the topic geometry. A nil
+//     configuration, or one with no brokers, yields a gate that reports the condition and
+//     refuses, which is correct: with no broker there is no catalogue and the relay is not
+//     started in the first place.
+//
+// Returns:
+//   - *TopicCatalogueGate: ready to be passed to WithCatalogueGate.
+func NewTopicCatalogueGate(cfg *config.Configuration) *TopicCatalogueGate {
+	return &TopicCatalogueGate{
+		verify:        newCatalogueVerifier(cfg),
+		now:           time.Now,
+		probeInterval: defaultCatalogueProbeInterval,
+	}
+}
+
+// newCatalogueVerifier returns the ensure-and-verify pass the gate runs.
+//
+// The order is verify-then-ensure-then-verify rather than ensure-then-verify, and that is what
+// makes the gate affordable in a loop: the steady state costs ONE metadata read, and creation
+// is attempted only when that read says something is actually absent.
+func newCatalogueVerifier(cfg *config.Configuration) func(ctx context.Context) (TopicCatalogueReport, error) {
+	return func(ctx context.Context) (TopicCatalogueReport, error) {
+		admin, err := NewKafkaAdmin(cfg)
+		if err != nil {
+			return TopicCatalogueReport{Expected: AllOwnedTopicsAcrossPrefixes()}, err
+		}
+		defer func() {
+			if closeErr := admin.Close(); closeErr != nil {
+				withLoggableCause(nil, closeErr).Warn(
+					"closing the Kafka admin client after a topic-catalogue probe failed",
+				)
+			}
+		}()
+
+		report, err := admin.VerifyTopicCatalogue(ctx)
+		if err != nil || report.Complete() {
+			return report, err
+		}
+
+		// Something is missing, so try to create it. The assurance error is deliberately NOT
+		// returned in place of the verification: what the caller needs to know is whether the
+		// catalogue is complete NOW, and the authority on that is the second verification
+		// below. A failed assurance whose gap another process then filled must still open the
+		// gate.
+		if _, ensureErr := admin.EnsureTopics(ctx); ensureErr != nil {
+			withLoggableCause(logrus.WithField("missing_topics", report.Missing), ensureErr).Warn(
+				"the event topic catalogue is incomplete and assuring it failed; the relay will not " +
+					"claim outbox rows until every destination topic exists, so nothing is published " +
+					"and nothing spends its retry budget on a topic that cannot accept it",
+			)
+		}
+
+		return admin.VerifyTopicCatalogue(ctx)
+	}
+}
+
+// Ready reports whether the relay may claim work.
+//
+// It is safe for concurrent use and cheap once the catalogue has been verified: after the first
+// success it takes a mutex and returns, with no broker contact ever again.
+//
+// All reporting is done HERE rather than by the caller, because the caller is a 1-second poll
+// loop and the gate is what knows whether this call actually probed anything. A refusal is
+// logged once per probe, not once per tick.
+//
+// Parameters:
+//   - ctx context.Context: cancellation is respected; the probe is additionally bounded by
+//     catalogueProbeTimeout.
+//
+// Returns:
+//   - error: nil when every expected topic exists. Otherwise the reason the relay must not
+//     claim — a broker that could not be reached, or the list of topics that are absent.
+func (g *TopicCatalogueGate) Ready(ctx context.Context) error {
+	if g == nil {
+		return nil
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.verified {
+		return nil
+	}
+
+	if g.verify == nil {
+		return errors.New(
+			"the event topic catalogue gate has no verifier, so the relay cannot confirm that its " +
+				"destination topics exist",
+		)
+	}
+
+	now := g.now()
+	if !g.nextProbeAt.IsZero() && now.Before(g.nextProbeAt) {
+		// Inside the backoff window. The condition was already reported by the probe that
+		// opened the window, so this is silent — and it costs nothing, which is what lets the
+		// relay consult the gate on every tick.
+		return errCatalogueNotVerified
+	}
+
+	probe, cancel := context.WithTimeout(ctx, catalogueProbeTimeout)
+	defer cancel()
+
+	report, err := g.verify(probe)
+	if err == nil && report.Complete() {
+		g.verified = true
+		logrus.WithField("topics", len(report.Expected)).Info(
+			"every event topic and dead-letter sibling exists; the event outbox relay may claim rows",
+		)
+
+		return nil
+	}
+
+	g.backOff(now)
+
+	if err != nil {
+		withLoggableCause(logrus.WithFields(logrus.Fields{
+			"next_probe_in": g.probeInterval.String(),
+			"expected":      len(report.Expected),
+		}), err).Warn(
+			"could not verify that the event topic catalogue exists, so the event outbox relay is " +
+				"NOT claiming rows. Nothing is lost — the rows stay pending and no attempt is spent " +
+				"on a destination that may not accept it — but nothing is published either until " +
+				"this succeeds",
+		)
+
+		return err
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"missing_topics": report.Missing,
+		"expected":       len(report.Expected),
+		"next_probe_in":  g.probeInterval.String(),
+	}).Warn(
+		"event topics are missing from the broker, so the event outbox relay is NOT claiming rows. " +
+			"Publishing to a topic that does not exist would fail every attempt and then fail to " +
+			"dead-letter for the same reason, spending each row's retry budget for nothing. Provision " +
+			"the topics — `make kafka_provision`, or let the server's own assurance succeed — and the " +
+			"relay resumes on its own",
+	)
+
+	return fmt.Errorf("%w: %s", errCatalogueIncomplete, strings.Join(report.Missing, ", "))
+}
+
+// Verified reports whether the gate has confirmed the catalogue. It exists for tests and for a
+// caller that wants to log the gate's state without probing.
+//
+// Returns:
+//   - bool: true once a probe has seen the whole catalogue.
+func (g *TopicCatalogueGate) Verified() bool {
+	if g == nil {
+		return false
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return g.verified
+}
+
+// backOff schedules the next probe, doubling the interval up to the cap.
+//
+// Called with the mutex held.
+func (g *TopicCatalogueGate) backOff(now time.Time) {
+	if g.probeInterval <= 0 {
+		g.probeInterval = defaultCatalogueProbeInterval
+	}
+
+	g.nextProbeAt = now.Add(g.probeInterval)
+
+	if next := g.probeInterval * 2; next <= maxCatalogueProbeInterval {
+		g.probeInterval = next
+
+		return
+	}
+
+	g.probeInterval = maxCatalogueProbeInterval
+}
+
+const (
+	// defaultCatalogueProbeInterval is the shortest gap between two broker probes by the
+	// topic-catalogue gate.
+	//
+	// The relay polls every second, and the gate is consulted on every one of those ticks, so
+	// without a floor an unprovisioned broker would be interrogated once per second for as
+	// long as it stayed that way — and the log would carry one refusal per second with it.
+	// Five seconds keeps recovery prompt on a compose stack or a rolling restart while
+	// costing one metadata round trip per five ticks in the worst case, and none at all once
+	// the catalogue is verified.
+	defaultCatalogueProbeInterval = 5 * time.Second
+
+	// maxCatalogueProbeInterval caps the gate's backoff.
+	//
+	// A broker that has been unprovisioned for ten minutes is very unlikely to fix itself in
+	// the next five seconds, so the interval grows; but it is capped, because the whole point
+	// of gating rather than refusing to start is that recovery happens without a human, and
+	// an unbounded backoff would eventually make that indistinguishable from a restart.
+	maxCatalogueProbeInterval = 60 * time.Second
+
+	// catalogueProbeTimeout bounds one probe. A metadata read against a reachable broker is
+	// milliseconds; this is generous enough for a loaded cluster and short enough that a tick
+	// is never held up for long by an unreachable one.
+	catalogueProbeTimeout = 10 * time.Second
+)
+
+var (
+	// errCatalogueNotVerified is the silent refusal returned inside a backoff window. It
+	// carries no detail because the detail was logged by the probe that opened the window.
+	errCatalogueNotVerified = errors.New(
+		"the event topic catalogue has not been verified yet, so the relay is not claiming rows",
+	)
+
+	// errCatalogueIncomplete reports that named topics are absent.
+	errCatalogueIncomplete = errors.New("event topics are missing from the broker")
+)
+
+// CompensateProvisioning undoes the half-completed provisioning a deferred result describes.
+// PERF-P09.
+//
+// It is the other half of SubscriberProvisioningRequest.DeferCompensation: provisioning reports
+// what it left behind, the caller finishes the work somewhere that is not a response path, and
+// this performs exactly the same two round trips the inline compensation would have.
+//
+// # It is a no-op for anything that does not owe a compensation
+//
+// A result whose CompensationOwed is false has either compensated already or never written a
+// credential, and revoking on either would destroy a live credential — a working one, in the
+// re-issue case. So the flag is the gate, not the caller's memory of which branch it took.
+//
+// # Its outcome is the caller's to record
+//
+// Returning nil means the broker was CONFIRMED clean: no principal is left able to authenticate
+// without a boundary. A non-nil error means one is, and compensateFailedProvisioning has already
+// logged it at ERROR with the principal named and the manual remedy spelled out — so a caller
+// that can do nothing useful with the error may drop it, and one that reports state must not.
+//
+// Parameters:
+//   - ctx context.Context: used for its VALUES only; the round trips run on their own bounded
+//     deadline, because a deferred compensation's caller is usually holding an expired one.
+//   - result SubscriberProvisioningResult: the deferred result, read for the principal and the
+//     bindings it attempted.
+//
+// Returns:
+//   - error: nil when nothing was owed or the credential is confirmed revoked; the revocation's
+//     error otherwise.
+func (a *KafkaAdminClient) CompensateProvisioning(
+	ctx context.Context,
+	result SubscriberProvisioningResult,
+) error {
+	if a == nil || !result.CompensationOwed || strings.TrimSpace(result.Principal) == "" {
+		return nil
+	}
+
+	return a.compensateFailedProvisioning(ctx, result.Principal, result.OwedBindings)
+}
+
+// windowStartOffsets resolves, per partition, the earliest offset whose record was written
+// at or after the given instant.
+//
+// # PERF-P05: this is the broker half of the shared reconciliation window
+//
+// The zero-loss check compares outbox rows against broker records, and over the whole
+// history the two cannot be compared at all: end offsets are cumulative for the life of a
+// topic and are unaffected by Kafka retention, while the outbox's retention sweep DELETES
+// terminal rows. So the outbox side shrinks, the broker side never does, and the "surplus"
+// the verdict tolerates grows without bound until it can conceal any amount of loss. Bounding
+// both sides to the same recent window is what makes the comparison mean something again.
+//
+// Kafka answers this natively: a ListOffsets request with a TIMESTAMP returns the first offset
+// whose record timestamp is greater than or equal to it. Differencing that against the end
+// offset gives exactly the number of records the partition accepted inside the window.
+//
+// # Its own round trip, deliberately
+//
+// It does not extend offsetBounds. That method serves the consumer-lag sweep as well, whose
+// results are cached per topic set and read once per subscriber per collection interval;
+// adding a timestamp request there would put a window into a cache keyed without one and would
+// cost every lag sweep a third of a request more for a figure it never reads. One extra round
+// trip on a periodic reconciliation read is the cheaper trade by a wide margin.
+//
+// # The two sentinels a caller must handle
+//
+//   - -1 means the broker has NO record at or after the instant, which is a legitimate and
+//     common reading: every record the partition holds is older than the window. The window
+//     count for that partition is zero.
+//   - An absent entry means the partition could not be read, which is not the same thing and
+//     must not be counted as zero. Callers distinguish the two.
+//
+// Parameters:
+//   - ctx context.Context: cancels the request.
+//   - partitions map[string][]int: the partitions to resolve, from topicPartitions.
+//   - since time.Time: the window start.
+//
+// Returns:
+//   - map[string]map[int]int64: the window-start offset per topic and partition, -1 where the
+//     partition holds nothing that recent, absent where it could not be read.
+//   - error: a wrapped transport error.
+func (a *KafkaAdminClient) windowStartOffsets(
+	ctx context.Context,
+	partitions map[string][]int,
+	since time.Time,
+) (map[string]map[int]int64, error) {
+	request := &kafka.ListOffsetsRequest{
+		Topics:         make(map[string][]kafka.OffsetRequest, len(partitions)),
+		IsolationLevel: kafka.ReadUncommitted,
+	}
+
+	for topic, ids := range partitions {
+		requests := make([]kafka.OffsetRequest, 0, len(ids))
+		for _, id := range ids {
+			requests = append(requests, kafka.TimeOffsetOf(id, since))
+		}
+		request.Topics[topic] = requests
+	}
+
+	response, err := a.client.ListOffsets(ctx, request)
+	if err != nil {
+		return nil, fmt.Errorf("kafka admin: reading window-start offsets: %w", err)
+	}
+
+	starts := make(map[string]map[int]int64, len(response.Topics))
+	for topic, offsets := range response.Topics {
+		perPartition := make(map[int]int64, len(offsets))
+
+		for _, offset := range offsets {
+			if offset.Error != nil {
+				logrus.WithFields(logrus.Fields{
+					"topic":     topic,
+					"partition": offset.Partition,
+					"error":     sanitizeLogValue(offset.Error.Error(), maxLoggedErrorLength),
+				}).Warn(
+					"kafka admin: could not resolve the window-start offset for this partition; it is " +
+						"excluded from the windowed reconciliation rather than counted as empty",
+				)
+
+				continue
+			}
+
+			// A timestamp request's answer arrives in the Offsets map rather than in
+			// FirstOffset or LastOffset, which kafka-go reserves for the two sentinel
+			// timestamps. The map holds one entry per timestamp asked about, and exactly one
+			// was asked about here; the broker's "nothing that recent" answer is the offset
+			// -1, which is carried through unchanged for the caller to interpret.
+			resolved := int64(-1)
+			for candidate := range offset.Offsets {
+				resolved = candidate
+
+				break
+			}
+
+			perPartition[offset.Partition] = resolved
+		}
+
+		starts[topic] = perPartition
+	}
+
+	return starts, nil
+}
+
+// windowStartOffsetFor reads one partition's window-start offset out of the result.
+//
+// AN ABSENT ENTRY IS UNREADABLE, NOT EMPTY — the same distinction offsetBoundsFor exists to
+// preserve, and for the same reason: treating an unreadable partition as zero makes the broker
+// side short and short looks exactly like loss.
+//
+// Parameters:
+//   - starts map[string]map[int]int64: the result of windowStartOffsets, possibly nil.
+//   - topic string, partition int: the partition to look up.
+//
+// Returns:
+//   - int64: the window-start offset, or -1 when the partition holds nothing that recent.
+//   - bool: false when the partition could not be read.
+func windowStartOffsetFor(starts map[string]map[int]int64, topic string, partition int) (int64, bool) {
+	if perPartition, exists := starts[topic]; exists {
+		if offset, ok := perPartition[partition]; ok {
+			return offset, true
+		}
+	}
+
+	return -1, false
+}
+
+// applyWindowToPartition folds one partition's windowed record count into its snapshot and its
+// topic's totals.
+//
+// # The three readings it separates, because collapsing any two of them would lie
+//
+//   - UNREADABLE. The window-start offset could not be resolved. The partition's records are
+//     missing from the count, and the count must say so — treating it as zero would make the
+//     broker side short, and short is what loss looks like.
+//   - NOTHING THAT RECENT. The broker answered -1: every record the partition holds predates
+//     the window. The contribution is a genuine zero.
+//   - TRUNCATED. The window-start offset the broker returned is the partition's FIRST retained
+//     offset, on a partition that has already had records deleted. The earliest record still
+//     present is inside the window, so records that were also inside it may have been removed
+//     by retention and the count is a lower bound. This is the reading that matters when the
+//     broker's retention is shorter than the reconciliation window — the exact configuration
+//     that would otherwise report loss that never happened.
+//
+// Parameters:
+//   - partitionSnapshot *PartitionOffsetSnapshot: filled with the window-start offset.
+//   - snapshot *TopicOffsetSnapshot: accumulates the topic's window figures.
+//   - windowStarts map[string]map[int]int64: the window-start offsets read from the broker.
+//   - topic string, partition int: the partition being folded in.
+//   - bound partitionOffsetBounds: its already-validated first and end offsets.
+func applyWindowToPartition(
+	partitionSnapshot *PartitionOffsetSnapshot,
+	snapshot *TopicOffsetSnapshot,
+	windowStarts map[string]map[int]int64,
+	topic string,
+	partition int,
+	bound partitionOffsetBounds,
+) {
+	start, readable := windowStartOffsetFor(windowStarts, topic, partition)
+	if !readable {
+		partitionSnapshot.WindowUnreadable = true
+		snapshot.WindowPartitionsUnreadable++
+
+		return
+	}
+
+	partitionSnapshot.WindowStartOffset = start
+	if start < 0 {
+		// Every record predates the window: a real zero, not an absence.
+		return
+	}
+
+	if start <= bound.first && bound.first > 0 {
+		// The oldest record the partition still holds is already inside the window, so
+		// retention may have removed earlier records that were inside it too.
+		snapshot.WindowTruncated = true
+	}
+
+	if written := bound.end - start; written > 0 {
+		snapshot.WindowRecordCount += written
+	}
 }

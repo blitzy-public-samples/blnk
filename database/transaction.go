@@ -31,6 +31,128 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// resolveBatchEventOutboxes returns the event rows the batch writer must insert inside its
+// transaction: the caller's rows when it supplied any, otherwise rows derived from the
+// registered transaction event capture.
+//
+// # Why derivation belongs here (requirement R-2)
+//
+// R-2 is that a ledger mutation and the event announcing it commit together. The
+// single-transaction path satisfies it by preparing the row before the write and handing it
+// in. The COALESCED path cannot: it commits many transactions in one database transaction, and
+// the file that assembles that call is frozen by the plan, so the rows can only appear from
+// below. Without this, a coalesced batch committed balance updates and transaction rows while
+// publishing nothing — durable money movement with no event, which is the exact failure R-2
+// names.
+//
+// SUPPLIED ROWS ALWAYS WIN. A caller that prepared its own events is authoritative, and
+// re-deriving over it would replace a row whose payload the caller may have shaped.
+//
+// # Failure is fatal, and that is the point
+//
+// A capture error abandons the whole write. The alternative — commit the mutation and log the
+// capture failure — is the pre-R-2 behaviour: it produces exactly the silent, unrecoverable
+// gap between money moved and event published that this function exists to close. A payload
+// that will not serialise is a producer defect, not a transient condition, so failing the
+// mutation surfaces it immediately instead of losing one event per batch indefinitely.
+//
+// Parameters:
+//   - ctx context.Context: the writer's context, forwarded to the capture for tracing.
+//   - txns []*model.Transaction: the transactions about to be committed.
+//   - balances []*model.Balance: the balance set being updated, used to resolve each
+//     transaction's ledger.
+//   - supplied []*model.EventOutbox: the caller's event rows, usually empty on this path.
+//
+// Returns:
+//   - []*model.EventOutbox: the rows to insert, nil when publishing is not configured.
+//   - error: a cardinality mismatch in the supplied rows, or a capture failure.
+func resolveBatchEventOutboxes(
+	ctx context.Context,
+	txns []*model.Transaction,
+	balances []*model.Balance,
+	supplied []*model.EventOutbox,
+) ([]*model.EventOutbox, error) {
+	rows, err := resolveEventOutboxes(len(txns), supplied)
+	if err != nil || len(rows) > 0 {
+		return rows, err
+	}
+
+	return deriveBatchEventOutboxes(ctx, txns, balances)
+}
+
+// deriveBatchEventOutboxes builds one event row per transaction using the registered capture.
+//
+// # The all-or-nothing rule on nil rows
+//
+// A nil row means event publishing is not configured, which is a PROCESS-WIDE condition: the
+// capture consults one configuration, so either every row is nil or none is. All-nil is
+// therefore the ordinary unconfigured case and returns no rows at all, preserving the
+// no-op-when-unconfigured contract inherited from SendWebhook.
+//
+// A MIXED result cannot happen for that reason and is refused rather than trimmed, because
+// trimming would insert fewer events than transactions and hand the cardinality check a set it
+// would then reject with a misleading message. Refusing here names the real problem.
+//
+// Parameters:
+//   - ctx context.Context: forwarded to the capture.
+//   - txns []*model.Transaction: the transactions about to be committed. Nils are skipped.
+//   - balances []*model.Balance: the balance set, for ledger resolution.
+//
+// Returns:
+//   - []*model.EventOutbox: one row per non-nil transaction, or nil when publishing is off or
+//     no capture is registered.
+//   - error: a capture failure, or a mixed nil/non-nil result.
+func deriveBatchEventOutboxes(
+	ctx context.Context,
+	txns []*model.Transaction,
+	balances []*model.Balance,
+) ([]*model.EventOutbox, error) {
+	capture := registeredTransactionEventCapture()
+	if capture == nil || len(txns) == 0 {
+		return nil, nil
+	}
+
+	ledgers := ledgerIDsByBalanceID(balances)
+
+	rows := make([]*model.EventOutbox, 0, len(txns))
+	captured, skipped := 0, 0
+
+	for _, txn := range txns {
+		if txn == nil {
+			continue
+		}
+
+		row, err := capture(ctx, txn, transactionLedgerIDFromSet(txn, ledgers))
+		if err != nil {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer,
+				"Failed to capture the ledger event for a batched transaction",
+				fmt.Errorf("blnk: capturing the event for transaction %q: %w", txn.TransactionID, err))
+		}
+
+		if row == nil {
+			skipped++
+
+			continue
+		}
+
+		captured++
+		rows = append(rows, row)
+	}
+
+	if captured == 0 {
+		return nil, nil
+	}
+
+	if skipped > 0 {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer,
+			"Failed to capture the ledger event for every batched transaction",
+			fmt.Errorf("blnk: %d of %d batched transactions produced no event row",
+				skipped, captured+skipped))
+	}
+
+	return rows, nil
+}
+
 // resolveEventOutboxes settles which event rows an atomic writer will insert, and
 // enforces the transaction-to-event cardinality.
 //
@@ -43,13 +165,36 @@ import (
 // duplicate publication or a silently dropped event, and neither is recoverable once
 // the mutation has committed.
 //
+// # The cardinality is counted over MUTATION-DESCRIBING rows, not over every row
+//
+// The invariant being protected is "a committed transaction carries exactly one event
+// DESCRIBING IT". Some mutations legitimately commit alongside events that describe
+// something else: a balance movement that crosses a monitor threshold commits its
+// transaction event AND the balance.monitor alerts the movement triggered, in one
+// transaction, because requirement R-2 admits no exception for an alert whose trigger
+// is already durable.
+//
+// Those two classes are already distinguished, once, in model: an event that fires
+// repeatedly for one subject is REPEATABLE (model.EventTypeIsRepeatable — balance.monitor
+// and system.error), and everything else describes a mutation that happens once. Counting
+// only the non-repeatable rows against txnCount therefore makes the check MORE precise
+// rather than looser: two transaction events for one transaction is still refused, a batch
+// of fifty that supplies forty-nine is still refused, and an alert riding along with its
+// trigger is no longer misread as a duplicate publication.
+//
+// Deriving the class from the event type rather than from a flag on the row is deliberate.
+// A flag would be a second statement of the same fact, settable independently, and the two
+// would drift — at which point a genuine duplicate could be waved through by mislabelling
+// it.
+//
 // Parameters:
 //   - txnCount: the number of transactions being committed by this writer.
 //   - supplied: the caller's rows, possibly empty or containing nils.
 //
 // Returns:
 //   - []*model.EventOutbox: the rows to insert, never containing a nil.
-//   - error: a typed bad request when the supplied count does not match txnCount.
+//   - error: a typed bad request when the mutation-describing count does not match
+//     txnCount.
 func resolveEventOutboxes(txnCount int, supplied []*model.EventOutbox) ([]*model.EventOutbox, error) {
 	present := make([]*model.EventOutbox, 0, len(supplied))
 	for _, row := range supplied {
@@ -62,16 +207,26 @@ func resolveEventOutboxes(txnCount int, supplied []*model.EventOutbox) ([]*model
 		return nil, nil
 	}
 
+	// Counted over the rows that DESCRIBE a mutation. A repeatable event —
+	// balance.monitor, system.error — describes a condition rather than the mutation it
+	// travels with, so it rides along without being counted. See the note above.
+	describing := 0
+	for _, row := range present {
+		if !model.EventTypeIsRepeatable(row.EventType) {
+			describing++
+		}
+	}
+
 	// The equality is required only when the writer is actually committing
 	// transactions. A call carrying event rows and NO transactions is the batch-level
 	// case — one event describing a whole operation rather than one event per ledger
 	// mutation — and refusing it here would make that event unrepresentable.
 	//
 	// What the check does catch is the two mismatches that are silent and
-	// unrecoverable once the mutation has committed: more rows than transactions is a
-	// duplicate publication, and fewer is a batch that publishes one event and loses
-	// the rest. Neither is detectable afterwards, because the transaction rows are all
-	// there and the missing events exist nowhere to be counted.
+	// unrecoverable once the mutation has committed: more mutation-describing rows than
+	// transactions is a duplicate publication, and fewer is a batch that publishes one
+	// event and loses the rest. Neither is detectable afterwards, because the
+	// transaction rows are all there and the missing events exist nowhere to be counted.
 	//
 	// NOT caught, and deliberately so: supplying NO events at all. That is the
 	// no-op-when-unconfigured contract this pipeline inherited from SendWebhook —
@@ -79,10 +234,11 @@ func resolveEventOutboxes(txnCount int, supplied []*model.EventOutbox) ([]*model
 	// distinguished here from a producer that forgot to capture. Capture itself is
 	// asserted at the producer call sites, which are the only place that knows an
 	// event was due.
-	if txnCount > 0 && len(present) != txnCount {
+	if txnCount > 0 && describing != txnCount {
 		return nil, apierror.NewAPIError(apierror.ErrBadRequest,
 			"Each committed transaction must carry exactly one event",
-			fmt.Errorf("blnk: %d event rows supplied for %d transactions", len(present), txnCount))
+			fmt.Errorf("blnk: %d mutation-describing event rows supplied for %d transactions (%d rows in total)",
+				describing, txnCount, len(present)))
 	}
 
 	return present, nil
@@ -562,6 +718,23 @@ func (d Datasource) RecordTransactionWithBalancesAndOutbox(ctx context.Context, 
 		))
 	}
 
+	// The balance-monitor handoff, and it goes in HERE for the same reason the event
+	// rows do: the INTENT to judge a balance's monitors belongs in the transaction that
+	// moved the balance, so a committed movement always carries its pending evaluation
+	// and a rolled-back one carries none.
+	//
+	// The event rows are passed in because they answer whether it is needed. A caller
+	// that evaluated a balance's monitors BEFORE the write hands the resulting alerts to
+	// this writer, and those alerts are already inside this transaction — writing a
+	// handoff for that balance as well would have the processor publish the same crossing
+	// a second time under a different event id. See recordBalanceMonitorHandoffs and
+	// balancesAlreadyEvaluatedInTx.
+	if err := recordBalanceMonitorHandoffs(ctx, tx, span,
+		[]*model.Balance{sourceBalance, destinationBalance}, eventRows); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		span.RecordError(err)
 		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit transaction", err)
@@ -630,12 +803,14 @@ func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Cont
 	// writer above — after the lineage outbox, before the commit — so the batch's
 	// events share the fate of the batch's balance updates.
 	//
-	// One event PER TRANSACTION, count-checked whenever the caller supplies any.
-	// The coalescing path can reach this writer with no event rows at all, which is
-	// how coalesced mutations used to commit without events: fifty transactions, one
-	// commit, and nothing published. The cardinality check is what makes "one event
-	// per committed transaction" an enforced invariant instead of a convention.
-	eventRows, err := resolveEventOutboxes(len(txns), eventOutboxes)
+	// One event PER TRANSACTION, count-checked whenever the caller supplies any, and
+	// DERIVED HERE when the caller supplies none. The coalescing path reaches this
+	// writer without event rows — that is how coalesced mutations used to commit
+	// without events: fifty transactions, one commit, and nothing published — and its
+	// argument list cannot be extended, because the file that builds it belongs to the
+	// frozen transaction pipeline. Deriving from the registered capture closes that gap
+	// at the only layer both the transactions and their balances are available in.
+	eventRows, err := resolveBatchEventOutboxes(ctx, txns, balances, eventOutboxes)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -643,6 +818,19 @@ func (d Datasource) RecordTransactionsWithBalanceSetAndOutboxes(ctx context.Cont
 	if err := insertEventOutboxesInTx(ctx, tx, eventRows); err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("failed to insert event outboxes: %w", err)
+	}
+
+	// The balance-monitor handoff for every balance this batch moved that was not already
+	// evaluated with it. THIS is the path the coalescing pipeline reaches, and it is why
+	// the handoff is written by the writer rather than supplied by the caller:
+	// transaction_coalescing.go is frozen by AAP §0.6.2 and cannot be given a new
+	// argument, so a caller-supplied handoff would have covered the single-transaction
+	// path and silently missed every coalesced batch. Deriving it from the balances the
+	// writer is already updating covers both. The coalesced caller supplies no monitor
+	// alerts, so every balance here is handed off.
+	if err := recordBalanceMonitorHandoffs(ctx, tx, span, balances, eventRows); err != nil {
+		span.RecordError(err)
+		return nil, err
 	}
 
 	if err := tx.Commit(); err != nil {

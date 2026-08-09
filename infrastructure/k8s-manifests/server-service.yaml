@@ -10,17 +10,48 @@ metadata:
   name: server
   namespace: blnk
 spec:
-  type: LoadBalancer                # ← expose externally via a GCP LB
+  # ClusterIP, NOT LoadBalancer. THIS IS THE CHANGE THAT REMOVES PUBLIC PLAINTEXT
+  # ACCESS TO THE LEDGER.
+  #
+  # This Service was `type: LoadBalancer` publishing 5001, 80 and 443. Two facts made
+  # that worse than it looks:
+  #
+  #   BLNK TERMINATES NO TLS, so 443 led nowhere. cmd/server.go always calls
+  #   startServer -> plain net/http ListenAndServe on Server.Port; serveTLS, the
+  #   CertMagic path, is unreachable dead code the linter reports as unused. Ports 80
+  #   and 443 targeted container ports nothing binds, so the only working route through
+  #   that load balancer was UNENCRYPTED HTTP ON 5001, straight off the internet.
+  #
+  #   WHAT TRAVELLED OVER IT. Every management call carries the master key in the
+  #   X-Blnk-Key header, and POST /subscribers/{id}/kafka-credentials returns a
+  #   one-time plaintext SCRAM password in its response body — the credential a
+  #   subscriber then uses to read the ledger's event stream. Over cleartext both are
+  #   readable by anything on the path, and the master key grants every permission
+  #   there is.
+  #
+  # EXPOSE THIS THROUGH AN INGRESS OR GATEWAY THAT TERMINATES TLS. Because the
+  # application cannot do it, the proxy in front is the only place it can happen:
+  #
+  #   * HTTPS only, with HTTP redirected rather than served, and HSTS set.
+  #   * TLS 1.2 or above.
+  #   * Then set BLNK_SERVER_TRUSTED_PROXIES (see blnk-config.yaml) to that proxy's
+  #     address range — until you do, Blnk attributes every request to the proxy, so
+  #     the per-client rate limit behaves globally and the access log records the
+  #     proxy rather than the caller.
+  #
+  # No Ingress manifest is committed here on purpose: the class, the certificate
+  # source and the hostname are all deployment-specific, and a committed Ingress would
+  # either be wrong for your cluster or quietly re-expose this in plaintext.
+  #
+  # A NOTE ON MOVING BACK. If a LoadBalancer is genuinely required, terminate TLS ON
+  # it and target 5001 as the backend — do not restore the 80 and 443 entries, which
+  # only ever advertised ports the application does not serve.
+  type: ClusterIP
+  # Named to match the container port, so the target survives a port renumbering.
   ports:
-    - name: "5001"
+    - name: http
       port: 5001
-      targetPort: 5001
-    - name: "80"
-      port: 80
-      targetPort: 80
-    - name: "443"
-      port: 443
-      targetPort: 443
+      targetPort: http
   selector:
     io.kompose.service: server
 status:

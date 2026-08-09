@@ -484,16 +484,16 @@ func outboxEventFixtures() []outboxEventFixture {
 			partitionKey: outboxIdentityID,
 		},
 
-		// The two events that motivate the two extra categories. Neither belongs to the
+		// The two events that motivate the fourth category. Neither belongs to the
 		// transactions, balances or identities topic, and the coverage requirement
-		// forbids dropping them. They get one category EACH rather than sharing one,
-		// because ledger.created must be reachable by a subscriber and system.error must
-		// not be.
+		// forbids dropping them. Both share the one extra category the frozen catalogue
+		// gives them, which is internal — see model.EventCategorySystem for the
+		// reachability consequence that follows for ledger.created.
 		{
 			name:         "ledger.created",
 			eventType:    "ledger.created",
 			payload:      outboxSampleLedger(),
-			topic:        "blnk.ledgers",
+			topic:        "blnk.system",
 			aggregateID:  outboxLedgerID,
 			partitionKey: outboxLedgerID,
 		},
@@ -1484,7 +1484,7 @@ func TestPrepareEventOutbox_EventTypeIsTrimmedWhileThePayloadStaysVerbatim(t *te
 	require.NotNil(t, row)
 
 	assert.Equal(t, "ledger.created", row.EventType, "event_type must be trimmed")
-	assert.Equal(t, "blnk.ledgers", row.Topic, "the trimmed name must be what routing sees")
+	assert.Equal(t, "blnk.system", row.Topic, "the trimmed name must be what routing sees")
 	assert.Equal(t, string(outboxLegacyWebhookBody(t, event)), string(row.Payload),
 		"the payload must remain the legacy body byte for byte, untrimmed")
 	assert.Contains(t, string(row.Payload), `"event":"  ledger.created\t"`,
@@ -2011,9 +2011,9 @@ func TestPrepareEventOutbox_UnkeyableEventGetsTheSentinelPartitionKey(t *testing
 		"aggregate_id inherits the key once every payload-derived candidate is exhausted")
 	assert.Empty(t, row.EventType, "the event type really is empty; nothing was invented")
 	assert.Equal(t, "blnk.system", row.Topic,
-		"an unrecognised event type is routed to the internal system catch-all rather than stranded")
-	assert.False(t, IsSubscriberGrantableTopic(row.Topic),
-		"and that destination must be one no subscriber can be granted, so an unclassifiable event is contained rather than disclosed")
+		"an unrecognised event type is routed to the system catch-all rather than stranded")
+	assert.NotContains(t, []string{"blnk.transactions", "blnk.balances", "blnk.identities"}, row.Topic,
+		"and that destination must not be a domain topic: an unclassifiable event must not appear in a stream a subscriber filters on and reasons about")
 	assert.Equal(t, `{"event":"","data":null}`, string(row.Payload),
 		"the payload is still the two-key envelope, faithfully describing an empty event")
 }
@@ -2559,7 +2559,7 @@ func TestPublishEvent_UsesTheStandaloneInsertWithoutATransaction(t *testing.T) {
 	standalone := datasource.standalone()
 	require.Len(t, standalone, 1, "exactly one standalone insert must have been issued")
 	assert.Equal(t, "ledger.created", standalone[0].EventType)
-	assert.Equal(t, "blnk.ledgers", standalone[0].Topic)
+	assert.Equal(t, "blnk.system", standalone[0].Topic)
 	assert.Equal(t, outboxLedgerID, standalone[0].PartitionKey)
 	assert.Equal(t, outboxLedgerID, standalone[0].LedgerID,
 		"a balance payload DOES carry a ledger, so the ledger column is populated as well as the key")
@@ -2778,6 +2778,13 @@ func TestPublishEvent_IssuesTheOutboxInsertWithThePayloadBytes(t *testing.T) {
 			sqlmock.AnyArg(), // occurred_at: the domain instant, stamped at construction
 			model.EventOutboxStatusPending,
 			defaultEventMaxAttempts,
+			// The two TRACE-CONTEXT columns, bound as SQL NULL because this capture runs on a
+			// background context with no active span. That is the common production shape — a CLI
+			// mutation, a worker-initiated rejection, observability disabled — and binding nil
+			// rather than '' is what keeps "no trace was recorded" a single spelling that the
+			// columns' CHECK constraints and any query filtering on them both agree about.
+			nil,
+			nil,
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(4242)))
 
@@ -2823,7 +2830,12 @@ func TestPublishEventInTx_IssuesTheInsertInsideTheCallersTransaction(t *testing.
 			sqlmock.AnyArg(),
 			"transaction.queued",
 			outboxTransactionID,
-			outboxSourceBalanceID, // partition_key: the source balance, matching the queue's own sharding
+			// partition_key: the source balance. This test supplies NO ledger, so the row
+			// carries the payload-derived fallback; every production transaction capture
+			// supplies the ledger and is keyed on that instead. The identifier is the same
+			// one the transaction queue shards on, which is the same SIDE of the transfer
+			// and not the same partition — the two hash different values.
+			outboxSourceBalanceID,
 			// ledger_id: SQL NULL. model.Transaction HAS NO LEDGER FIELD, so there is no
 			// ledger to record — and binding the source balance id here, as the single
 			// combined column used to, put a balance id in a column called ledger_id where
@@ -2838,6 +2850,13 @@ func TestPublishEventInTx_IssuesTheInsertInsideTheCallersTransaction(t *testing.
 			sqlmock.AnyArg(), // occurred_at: the domain instant, stamped at construction
 			model.EventOutboxStatusPending,
 			defaultEventMaxAttempts,
+			// The two TRACE-CONTEXT columns, bound as SQL NULL because this capture runs on a
+			// background context with no active span. That is the common production shape — a CLI
+			// mutation, a worker-initiated rejection, observability disabled — and binding nil
+			// rather than '' is what keeps "no trace was recorded" a single spelling that the
+			// columns' CHECK constraints and any query filtering on them both agree about.
+			nil,
+			nil,
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(99)))
 	controller.ExpectCommit()
@@ -3398,13 +3417,19 @@ func TestPublishToTopic_RefusesAnOversizedEnvelopeAsPermanent(t *testing.T) {
 
 	assert.ErrorIs(t, err, ErrEventMessageTooLarge,
 		"the refusal must be recognisable without matching message text")
-	assert.Equal(t, model.PublishStatusFailed, result.Status,
-		"a PERMANENT failure reports failed and not retrying: reporting it as retrying would make "+
-			"a message that can never fit indistinguishable from a busy broker, in both the logs "+
-			"and the attempts counter. It reports failed and not dead_lettered either — nothing "+
-			"has been written to a `.dlt` sibling at this point, and for an oversized event the "+
-			"strictly larger dead-letter copy may never be writable at all, so claiming it here "+
-			"would count a preservation that never happened")
+	assert.Equal(t, model.PublishStatusRetrying, result.Status,
+		"the per-attempt outcome vocabulary is the three values requirement R-3 names, so a failed "+
+			"attempt reports retrying whatever its classification. It must NOT report dead_lettered "+
+			"— nothing has been written to a `.dlt` sibling at this point, and for an oversized "+
+			"event the strictly larger dead-letter copy may never be writable at all, so claiming "+
+			"it here would count a preservation that never happened. The PERMANENT distinction is "+
+			"carried on the result's classification fields and is asserted immediately below")
+	assert.True(t, result.Classified,
+		"and the publisher must record that it REACHED a verdict, because that marker is what "+
+			"lets PermanentFailure end this event's life early while an unclassified failure from "+
+			"some other implementation still gets its retry budget")
+	assert.False(t, result.Transient,
+		"the verdict itself: a message that can never fit is not a transient condition")
 	assert.False(t, result.Retryable,
 		"and nothing further will be tried for it, whatever budget the row states")
 	assert.True(t, result.PermanentFailure(),
@@ -3682,7 +3707,8 @@ func TestWithEventLedgerID_SuppliesWhatThePayloadCannotYield(t *testing.T) {
 		assert.Empty(t, row.LedgerID,
 			"a transaction payload carries no ledger, and a fabricated one is worse than none")
 		assert.Equal(t, outboxSourceBalanceID, row.PartitionKey,
-			"the fallback key is the source balance, matching what the transaction queue already shards on")
+			"the fallback key is the source balance — the same identifier the transaction queue "+
+				"shards on, though not the same partition, since the two hash different values")
 	})
 
 	t.Run("with it the ledger is recorded and becomes the key", func(t *testing.T) {
@@ -3907,15 +3933,30 @@ func TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter(t *te
 	datasource.On("RecordTransactionWithBalancesAndOutbox",
 		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(transaction, nil)
+	// The persistence path now resolves each balance's monitors BEFORE the write, so that a
+	// threshold alert commits in the same transaction as the movement that crossed it. No
+	// monitor is configured here, so no alert row is produced and this test still asserts
+	// exactly one event row — see
+	// TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMovement for the
+	// case where one is.
+	datasource.On("GetBalanceMonitors", mock.Anything).Return([]model.BalanceMonitor{}, nil)
 
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
 
-	persisted, eventCaptured, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
+	persisted, eventCaptured, capturedMonitors, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
 		transaction:        transaction,
 		sourceBalance:      sourceBalance,
 		destinationBalance: destinationBalance,
 	})
 	require.NoError(t, err)
+	assert.True(t, capturedMonitors.covers(sourceBalance.BalanceID),
+		"both balances were EVALUATED before the write, so the post-commit check must skip them: "+
+			"it would re-read the same monitor list and re-evaluate the same conditions against the "+
+			"same values, and conclude nothing new at the cost of a read per balance")
+	assert.True(t, capturedMonitors.covers(destinationBalance.BalanceID))
+	assert.False(t, capturedMonitors.holds(sourceBalance.BalanceID, "mon_absent"),
+		"no monitor was configured, so no CROSSING was captured — covered and captured are "+
+			"different facts and this test is the one that keeps them apart")
 	require.NotNil(t, persisted.transaction)
 	assert.True(t, eventCaptured,
 		"the writer committed the event, so the post-commit hook must be told not to capture it "+
@@ -3928,6 +3969,211 @@ func TestPersistSingleTransactionExecutionWork_HandsTheEventRowToTheWriter(t *te
 			"loses exactly as many events as capturing after the commit did")
 	assert.Equal(t, "transaction.applied", captured[0].EventType)
 	assert.Equal(t, sourceBalance.LedgerID, captured[0].LedgerID)
+
+	datasource.AssertExpectations(t)
+}
+
+// TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMovement is the R-2 test
+// for balance.monitor, and it closes finding F-03's critical case.
+//
+// # The loss window this proves is gone
+//
+// A monitor alert used to be captured AFTER the movement that triggered it had committed: the
+// post-commit hook re-read the balance's monitors, re-evaluated each condition, and inserted a
+// row. The mutation was durable and the alert was not, so a process that died in between left a
+// balance past its threshold with an alert that existed nowhere — and no retry budget can close
+// that window, because the first attempt happens after the commit. The alert row now travels in
+// the same transaction as the balance updates and the transaction row.
+//
+// # What is asserted, and why each part matters
+//
+//   - The alert row REACHES THE WRITER, alongside the transaction event. Preparing it and
+//     dropping it would lose exactly as many alerts as post-commit capture did.
+//   - It is keyed on the LEDGER, not on the monitored balance. model.BalanceMonitor carries no
+//     ledger, so without the explicit option the row would key on the balance and store NULL —
+//     requirement R-6 partitions by ledger id.
+//   - The transaction event is still present and still exactly one. The cardinality invariant
+//     that refuses two mutation-describing rows for one transaction must not have been widened
+//     into one that refuses nothing.
+//   - The covered monitor is REPORTED BACK, because that set is the only thing stopping the
+//     post-commit path from publishing the same alert a second time. A balance.monitor id is a
+//     fresh UUID by design, so no subscriber-side idempotency could collapse a duplicate pair.
+func TestPersistSingleTransactionExecutionWork_CommitsMonitorAlertsWithTheMovement(t *testing.T) {
+	transaction := &model.Transaction{
+		TransactionID: "txn_f03a1c77",
+		Source:        "bln_source_f03a",
+		Destination:   "bln_dest_f03a",
+		PreciseAmount: big.NewInt(5000),
+		Precision:     100,
+		Currency:      "USD",
+		Status:        StatusApplied,
+		CreatedAt:     time.Now().UTC(),
+	}
+	// The balances carry the values the writer is about to persist, which is the state
+	// model.UpdateBalances has already produced by the time persistence is reached. The
+	// condition below is evaluated against exactly these values.
+	sourceBalance := &model.Balance{
+		BalanceID: transaction.Source,
+		LedgerID:  "ldg_f03a1c77",
+		Currency:  "USD",
+		Balance:   big.NewInt(-9000),
+	}
+	destinationBalance := &model.Balance{
+		BalanceID: transaction.Destination,
+		LedgerID:  "ldg_f03a1c77",
+		Currency:  "USD",
+		Balance:   big.NewInt(9000),
+	}
+
+	// One monitor, on the SOURCE balance only, whose condition the post-movement value meets.
+	// Scoping it to one balance is deliberate: it proves the captured set names the monitor that
+	// actually fired rather than every monitor the transaction touched.
+	firing := model.BalanceMonitor{
+		MonitorID: "mon_f03a1c77",
+		BalanceID: sourceBalance.BalanceID,
+		Condition: model.AlertCondition{
+			Field:        "balance",
+			Operator:     "<",
+			PreciseValue: big.NewInt(-5000),
+		},
+	}
+	require.True(t, firing.CheckCondition(sourceBalance),
+		"the fixture must actually satisfy its condition, or this test would pass by capturing nothing")
+
+	datasource := new(mocks.MockDataSource)
+	datasource.On("GetBalanceMonitors", sourceBalance.BalanceID).
+		Return([]model.BalanceMonitor{firing}, nil)
+	datasource.On("GetBalanceMonitors", destinationBalance.BalanceID).
+		Return([]model.BalanceMonitor{}, nil)
+	datasource.On("RecordTransactionWithBalancesAndOutbox",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(transaction, nil)
+
+	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
+
+	_, eventCaptured, capturedMonitors, err := blnk.persistSingleTransactionExecutionWork(
+		context.Background(), queuedBatchPostCommitWork{
+			transaction:        transaction,
+			sourceBalance:      sourceBalance,
+			destinationBalance: destinationBalance,
+		})
+	require.NoError(t, err)
+	assert.True(t, eventCaptured)
+
+	captured := datasource.CapturedEventOutboxes()
+	require.Len(t, captured, 2,
+		"the writer must receive BOTH the transaction event and the alert the movement triggered; "+
+			"one row means the alert is back outside the transaction and the loss window is back with it")
+
+	byType := make(map[string]*model.EventOutbox, len(captured))
+	for _, row := range captured {
+		byType[row.EventType] = row
+	}
+
+	transactionEvent, ok := byType["transaction.applied"]
+	require.True(t, ok, "the transaction's own event must still be captured; rows: %v", byType)
+	assert.Equal(t, sourceBalance.LedgerID, transactionEvent.LedgerID)
+
+	alert, ok := byType[model.EventTypeBalanceMonitor]
+	require.True(t, ok, "the balance.monitor alert must be in the same write; rows: %v", byType)
+	assert.Equal(t, sourceBalance.LedgerID, alert.LedgerID,
+		"the alert must be keyed on the LEDGER: model.BalanceMonitor carries no ledger, so without "+
+			"the explicit option this column is NULL and R-6's per-ledger ordering is lost")
+	assert.Contains(t, string(alert.Payload), firing.MonitorID,
+		"the payload must be the monitor object the legacy transport received, unchanged")
+
+	assert.True(t, capturedMonitors.holds(sourceBalance.BalanceID, firing.MonitorID),
+		"exactly the crossing that fired must be reported back, so the post-commit path skips it "+
+			"and publishes nothing twice. A balance.monitor id is a fresh UUID by design, so no "+
+			"subscriber-side idempotency on event_id could collapse a duplicate pair")
+	assert.False(t, capturedMonitors.holds(destinationBalance.BalanceID, firing.MonitorID),
+		"and the crossing is keyed on BOTH halves: one balance can carry several monitors and one "+
+			"monitor names one balance, so a balance-only key would let a sibling's crossing be "+
+			"mistaken for this one and dropped by both routes")
+	assert.True(t, capturedMonitors.covers(destinationBalance.BalanceID),
+		"the destination's monitors were read and evaluated too — it simply had none that fired, "+
+			"which is a skip rather than a capture")
+
+	datasource.AssertExpectations(t)
+}
+
+// TestPersistSingleTransactionExecutionWork_FallsBackWhenMonitorsCannotBeReadRatherThanRefusing
+// is the other half of F-03: the failure direction.
+//
+// # Why the movement still commits
+//
+// A monitor lookup that fails must NOT refuse the transaction, and the reason is a scope boundary
+// rather than a preference. This change substitutes a transport; it may not turn an outage of the
+// monitor store into an outage of the ledger. Refusing here would mean a transaction that Blnk
+// has always applied is now rejected because a table used only for threshold alerting could not
+// be read — money movement failing for a notification's sake.
+//
+// # What must therefore be true instead, and it is the whole assertion
+//
+// The failure must not be laundered into "covered". The balance whose monitors could not be read
+// is deliberately LEFT OUT of the capture, so the post-commit check evaluates it exactly as it
+// did before any of this existed: the pre-existing behaviour, with its pre-existing and
+// documented loss window, and not a silently skipped alert. A capture that claimed the balance
+// while having evaluated nothing would be strictly worse than no capture at all — it would
+// suppress the fallback as well.
+//
+// The sibling balance, whose read succeeded, IS covered. Degradation is per balance rather than
+// per transaction, so one unreadable monitor set does not send a whole write back to the
+// post-commit route.
+func TestPersistSingleTransactionExecutionWork_FallsBackWhenMonitorsCannotBeReadRatherThanRefusing(t *testing.T) {
+	transaction := &model.Transaction{
+		TransactionID: "txn_f03b2d88",
+		Source:        "bln_source_f03b",
+		Destination:   "bln_dest_f03b",
+		PreciseAmount: big.NewInt(1500),
+		Precision:     100,
+		Currency:      "USD",
+		Status:        StatusApplied,
+		CreatedAt:     time.Now().UTC(),
+	}
+	sourceBalance := &model.Balance{BalanceID: transaction.Source, LedgerID: "ldg_f03b2d88", Currency: "USD", Balance: big.NewInt(-100)}
+	destinationBalance := &model.Balance{BalanceID: transaction.Destination, LedgerID: "ldg_f03b2d88", Currency: "USD", Balance: big.NewInt(100)}
+
+	monitorErr := errors.New("monitor lookup unavailable")
+
+	datasource := new(mocks.MockDataSource)
+	datasource.On("GetBalanceMonitors", sourceBalance.BalanceID).
+		Return([]model.BalanceMonitor(nil), monitorErr)
+	datasource.On("GetBalanceMonitors", destinationBalance.BalanceID).
+		Return([]model.BalanceMonitor{}, nil)
+	datasource.On("RecordTransactionWithBalancesAndOutbox",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(transaction, nil)
+
+	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
+
+	_, eventCaptured, capturedMonitors, err := blnk.persistSingleTransactionExecutionWork(
+		context.Background(), queuedBatchPostCommitWork{
+			transaction:        transaction,
+			sourceBalance:      sourceBalance,
+			destinationBalance: destinationBalance,
+		})
+
+	require.NoError(t, err,
+		"a movement whose monitors cannot be read must still commit: this change substitutes a "+
+			"transport and may not turn a monitor-store outage into a ledger outage")
+	assert.True(t, eventCaptured,
+		"the transaction's own event was captured with the write, which the monitor read has no "+
+			"bearing on")
+
+	assert.False(t, capturedMonitors.covers(sourceBalance.BalanceID),
+		"THE BALANCE WHOSE MONITORS COULD NOT BE READ MUST NOT BE CLAIMED AS COVERED. Claiming it "+
+			"would suppress the post-commit evaluation as well, so a crossing would be examined by "+
+			"neither route — strictly worse than the loss window this path exists to narrow")
+	assert.True(t, capturedMonitors.covers(destinationBalance.BalanceID),
+		"and degradation is per balance, not per transaction: the sibling whose read succeeded is "+
+			"still covered, so one unreadable monitor set does not send the whole write back")
+
+	captured := datasource.CapturedEventOutboxes()
+	require.Len(t, captured, 1,
+		"exactly the transaction event, and no alert: no monitor was evaluated for the source, so "+
+			"no crossing could be captured for it")
+	assert.Equal(t, "transaction.applied", captured[0].EventType)
 
 	datasource.AssertExpectations(t)
 }
@@ -3967,7 +4213,7 @@ func TestPersistSingleTransactionExecutionWork_RefusesToCommitAnUncapturableEven
 	datasource := new(mocks.MockDataSource)
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), datasource)
 
-	_, eventCaptured, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
+	_, eventCaptured, capturedMonitors, err := blnk.persistSingleTransactionExecutionWork(context.Background(), queuedBatchPostCommitWork{
 		transaction:        transaction,
 		sourceBalance:      sourceBalance,
 		destinationBalance: destinationBalance,
@@ -3977,6 +4223,9 @@ func TestPersistSingleTransactionExecutionWork_RefusesToCommitAnUncapturableEven
 		"a transaction whose event could not be prepared must be refused, not committed with the "+
 			"event silently dropped")
 	assert.False(t, eventCaptured, "nothing was written, so nothing was captured")
+	assert.Empty(t, capturedMonitors,
+		"and no monitor alert was captured either: the transaction event is prepared first, so the "+
+			"refusal happens before any monitor is even resolved")
 	assert.Empty(t, datasource.CapturedEventOutboxes(),
 		"the atomic writer must not have been reached")
 
@@ -3992,6 +4241,13 @@ func TestPersistSingleTransactionExecutionWork_RefusesToCommitAnUncapturableEven
 // publish error as the asynq task's error — so a failed notification re-ran a rejection that
 // had already happened. Committing the event with the rejection removes the failure mode
 // rather than handling it.
+//
+// AND IT PINS THE ORDERING DOMAIN. The rejection event must be keyed on the LEDGER, like every
+// other event in the same transaction's lifecycle. It used to key on the source balance, because
+// this call site has no balances loaded and simply did not look one up — and a call site choosing
+// a different ordering domain from its siblings is an ordering defect rather than a graceful
+// fallback: one transaction's queueing would land on its ledger's partition and its rejection on
+// its source balance's, so a subscriber could observe the rejection first.
 func TestRejectTransaction_CommitsTheRejectionEventWithTheRejection(t *testing.T) {
 	transaction := &model.Transaction{
 		TransactionID: "txn_2e8b3f70",
@@ -4003,8 +4259,17 @@ func TestRejectTransaction_CommitsTheRejectionEventWithTheRejection(t *testing.T
 		CreatedAt:     time.Now().UTC(),
 	}
 
+	const rejectionLedgerID = "ldg_reject_2e8b"
+
 	datasource := new(mocks.MockDataSource)
 	datasource.On("RecordTransaction", mock.Anything, mock.Anything).Return(transaction, nil)
+	// The one lookup the ledger resolution makes. It is the SOURCE balance, matching
+	// transactionLedgerID in transaction_execution.go so the two producers of one transaction's
+	// events cannot disagree about which balance names the ledger.
+	datasource.On("GetBalanceByIDLite", transaction.Source).Return(&model.Balance{
+		BalanceID: transaction.Source,
+		LedgerID:  rejectionLedgerID,
+	}, nil)
 
 	// A real Blnk rather than the bare struct newOutboxBlnk builds: RejectTransaction runs the
 	// post-commit actions, which index through the queue, so the instance needs a queue and a
@@ -4034,9 +4299,72 @@ func TestRejectTransaction_CommitsTheRejectionEventWithTheRejection(t *testing.T
 		"the event name must come from getEventFromStatus rather than a literal, so it cannot "+
 			"drift from the status-to-event table")
 	assert.Equal(t, transaction.TransactionID, captured[0].AggregateID)
+	assert.Equal(t, rejectionLedgerID, captured[0].PartitionKey,
+		"the rejection event must be keyed on the LEDGER, resolved from the source balance, so it "+
+			"shares a partition with the rest of this transaction's lifecycle events. Keying on the "+
+			"source balance instead — which is what this call site did before it looked the ledger "+
+			"up — puts one transaction's events on two partitions, and Kafka orders only within one")
+	assert.Equal(t, rejectionLedgerID, captured[0].LedgerID,
+		"and the ledger column must record it too, so the event is groupable by ledger by the daily "+
+			"reconciliation and by any consumer")
+
+	datasource.AssertExpectations(t)
+}
+
+// TestRejectTransaction_StillRejectsWhenTheLedgerCannotBeResolved is the other half of the
+// ledger resolution, and the more important half.
+//
+// The lookup runs on the path that records a REJECTION, and a transaction naming a balance that
+// does not exist is one of the ordinary reasons a transaction is rejected in the first place — so
+// the lookup failing is a routine consequence of the very condition being recorded. It must
+// therefore be BEST EFFORT in the strongest sense: the rejection is still persisted, its event is
+// still captured, and the key falls back to the documented payload-derived chain. A rejection that
+// went unrecorded because a balance lookup failed would be strictly worse than a rejection event
+// on a less useful partition.
+func TestRejectTransaction_StillRejectsWhenTheLedgerCannotBeResolved(t *testing.T) {
+	transaction := &model.Transaction{
+		TransactionID: "txn_no_ledger_5a1c",
+		Source:        "bln_missing_source",
+		Destination:   "bln_missing_destination",
+		PreciseAmount: big.NewInt(500),
+		Currency:      "USD",
+		Status:        StatusQueued,
+		CreatedAt:     time.Now().UTC(),
+	}
+
+	datasource := new(mocks.MockDataSource)
+	datasource.On("RecordTransaction", mock.Anything, mock.Anything).Return(transaction, nil)
+	// BOTH balances are unresolvable, which is what forces the fallback: the resolution tries the
+	// source and then the destination, so failing only the source would still find a ledger.
+	datasource.On("GetBalanceByIDLite", transaction.Source).
+		Return((*model.Balance)(nil), errors.New("event outbox test: no such balance"))
+	datasource.On("GetBalanceByIDLite", transaction.Destination).
+		Return((*model.Balance)(nil), errors.New("event outbox test: no such balance"))
+
+	redisServer := miniredis.RunT(t)
+	cnf := outboxPublishingConfiguration()
+	cnf.Kafka.InsecureLocalDev = true
+	cnf.Redis = config.RedisConfig{Dns: redisServer.Addr()}
+	cnf.Queue = config.QueueConfig{WebhookQueue: "webhook_queue", IndexQueue: "index_queue", NumberOfQueues: 1}
+	outboxStoreConfiguration(t, cnf)
+
+	blnk, err := NewBlnk(datasource)
+	require.NoError(t, err)
+
+	rejected, err := blnk.RejectTransaction(context.Background(), transaction, "no such balance")
+	require.NoError(t, err,
+		"a balance lookup that fails must NEVER be the reason a rejection goes unrecorded")
+	require.NotNil(t, rejected)
+	assert.Equal(t, StatusRejected, rejected.Status)
+
+	captured := datasource.CapturedEventOutboxes()
+	require.Len(t, captured, 1, "the rejection event is still captured with the rejection")
 	assert.Equal(t, transaction.Source, captured[0].PartitionKey,
-		"no balance is loaded for a rejection, so the key falls back to the source balance — the "+
-			"same value the transaction queue already shards on — rather than inventing a ledger id")
+		"and the key falls back to the documented payload-derived chain — the source balance — "+
+			"rather than being empty, which would let Kafka scatter the event round-robin")
+	assert.Empty(t, captured[0].LedgerID,
+		"the ledger column stays NULL rather than carrying a fabricated value: no ledger was "+
+			"resolved, and inventing one would corrupt every consumer grouping by ledger")
 
 	datasource.AssertExpectations(t)
 }

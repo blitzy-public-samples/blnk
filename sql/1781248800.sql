@@ -17,22 +17,31 @@
 -- The event outbox: the durable hand-off between a ledger mutation and the
 -- Kafka event announcing it.
 --
--- A row is inserted INSIDE THE SAME DATABASE TRANSACTION as the mutation that
--- produced it, immediately before the commit. The mutation and its event
--- therefore commit or roll back together and can never disagree: there is no
--- window in which a balance moved but the event was lost, and none in which an
--- event describes work that was rolled back. A separate relay polls this table,
--- publishes claimed rows to Kafka, and marks them dispatched.
+-- For almost every event, a row is inserted INSIDE THE SAME DATABASE TRANSACTION
+-- as the mutation that produced it, immediately before the commit. The mutation
+-- and its event therefore commit or roll back together and can never disagree:
+-- there is no window in which a balance moved but the event was lost, and none in
+-- which an event describes work that was rolled back. A separate relay polls this
+-- table, publishes claimed rows to Kafka, and marks them dispatched.
 --
--- What that buys is exactly-once ON THE WRITE SIDE ONLY, and the distinction
--- matters enough to state here rather than leave to documentation. Each event is
--- recorded exactly once — that is what the unique index on event_id enforces —
--- but Kafka delivery downstream remains AT-LEAST-ONCE. A relay that crashes
--- between an acknowledged publish and marking the row dispatched will reclaim
--- the row once its lease expires and publish it again. Suppressing that
--- duplicate is a subscriber obligation, keyed on event_id. Nothing in this table
--- promises end-to-end exactly-once delivery, and it should not be read as if it
--- did.
+-- THREE EVENT CLASSES ARE CAPTURED AFTER THEIR MUTATION COMMITS, and this table
+-- cannot tell you which rows those were, so it is stated here: balance.monitor,
+-- bulk_transaction.<status>, and the transaction.* events of a COALESCED write.
+-- Each has a structural reason — no transaction remains open to enrol them in —
+-- and each is retried on a transient failure, but a process death between the
+-- commit and the insert loses the event and NO ROW IS EVER WRITTEN for it. Those
+-- three are at-most-once on the write side. docs/event-streaming.md publishes the
+-- set and PublishEventDurably enumerates it in code.
+--
+-- What that buys for every other event is exactly-once ON THE WRITE SIDE ONLY,
+-- and the distinction matters enough to state here rather than leave to
+-- documentation. Each such event is recorded exactly once — that is what the
+-- unique index on event_id enforces — but Kafka delivery downstream remains
+-- AT-LEAST-ONCE for all of them. A relay that crashes between an acknowledged
+-- publish and marking the row dispatched will reclaim the row once its lease
+-- expires and publish it again. Suppressing that duplicate is a subscriber
+-- obligation, keyed on event_id. Nothing in this table promises end-to-end
+-- exactly-once delivery, and it should not be read as if it did.
 --
 -- This is a SECOND, INDEPENDENT outbox alongside blnk.lineage_outbox, not a
 -- replacement for it and never merged with it: separate tables, separate relays,
@@ -100,25 +109,41 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- state. The construction path guarantees a value through a documented
     -- fallback chain ending in a sentinel.
     --
-    -- THIS IS NOT THE LEDGER ID, and the two used to be one column. That column
-    -- was called ledger_id and held, depending on the event, a ledger ID, a source
-    -- or destination balance ID, an identity ID, a monitor ID, a batch ID or the
-    -- event type — so the name was wrong for most of its values, and any
-    -- subscriber-facing claim that a key prefix identifies a ledger was unfounded.
-    -- Splitting them means each column means one thing.
+    -- IN PRACTICE THIS HOLDS THE LEDGER ID for every ledger-scoped event, because
+    -- the capture path lets the producer state the ledger and every ledger-scoped
+    -- producer does: transaction, balance, balance-monitor and ledger events all
+    -- store a ledger ID here and in ledger_id, and the two agree. Only an event
+    -- with no ledger at all falls through to something else — an identity ID for
+    -- identity.created, a batch ID for bulk_transaction.<status>, the event type
+    -- for system.error, and a source/destination/transaction ID for a rejected
+    -- transaction whose balances were never loaded.
+    --
+    -- IT IS STILL NOT DEFINED AS THE LEDGER ID, which is why it remains its own
+    -- column. The two used to be one: it was called ledger_id and held, depending
+    -- on the event, a ledger ID, a source or destination balance ID, an identity
+    -- ID, a monitor ID, a batch ID or the event type — so the name was wrong for
+    -- several of its values. Splitting them means each column means one thing:
+    -- this one is "where does this message go" and is never NULL; ledger_id is
+    -- "which ledger is this about" and is NULL when the answer is none.
     partition_key       TEXT                      NOT NULL,
 
     -- The AUTHORITATIVE ledger this event belongs to, or NULL when the event
     -- genuinely has no ledger. It takes no part in partitioning or in ordering.
     --
-    -- Populated only from a payload that actually carries a ledger identifier: a
-    -- ledger, or a balance, which belongs to exactly one ledger. NULL for
-    -- transactions (model.Transaction has no ledger field — a transaction's ledger
-    -- association is indirect, through the balances it moves value between, and
-    -- resolving it would cost a database read on the capture path), for balance
-    -- monitors and identities (neither carries a ledger field), for bulk
-    -- transaction batches (a runtime grouping, not a ledger object) and for
-    -- system.error (no aggregate of any kind).
+    -- Populated either from a payload that carries a ledger identifier — a ledger,
+    -- or a balance, which belongs to exactly one ledger — or from a ledger the
+    -- PRODUCER states explicitly at capture time. The second route is what
+    -- populates it for transactions and balance monitors, whose payload records
+    -- carry no ledger field of their own: transaction execution reads it from the
+    -- loaded source balance (falling back to the destination), and the monitor
+    -- check reads it from the balance whose update satisfied the condition.
+    --
+    -- NULL for identities (an identity is not scoped to a ledger), for bulk
+    -- transaction batches (a runtime grouping spanning whatever ledgers its
+    -- members touched, not a ledger object), for system.error (no aggregate of any
+    -- kind), and for a REJECTED transaction — which usually never loaded its
+    -- balances, that often being why it was rejected, so no ledger is known and
+    -- inventing one would be worse than recording none.
     --
     -- NULLABLE, deliberately, and this is the point of the split: NULL states
     -- "this event has no ledger" as a fact. The previous NOT NULL column with ''

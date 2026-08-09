@@ -17,16 +17,22 @@ limitations under the License.
 package blnk
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"text/template"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -595,6 +601,10 @@ type collectorFakeOutbox struct {
 	counts map[string]int64
 	err    error
 	calls  int
+
+	// windows records the `since` instant of every call, so a test can assert the collector
+	// bounds the count it asks for (PERF-P04).
+	windows []time.Time
 }
 
 func newCollectorFakeOutbox() *collectorFakeOutbox {
@@ -605,11 +615,20 @@ func newCollectorFakeOutbox() *collectorFakeOutbox {
 // with no rows is ABSENT from the map rather than present with a zero. That is what makes
 // the collector's two-value reads mandatory, so a fake that returned zeros would let a
 // buggy single-value read pass.
-func (o *collectorFakeOutbox) CountEventOutboxByStatus(_ context.Context) (map[string]int64, error) {
+//
+// The window is RECORDED rather than applied (PERF-P04). It bounds only the dispatched count,
+// which this collector never reads, and recording it is what lets a test assert that the
+// collector asks for a bounded count at all rather than the whole-history one it replaced.
+func (o *collectorFakeOutbox) CountEventOutboxByStatus(
+	_ context.Context,
+	since time.Time,
+) (map[string]int64, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
 	o.calls++
+	o.windows = append(o.windows, since)
+
 	if o.err != nil {
 		return nil, o.err
 	}
@@ -640,8 +659,25 @@ func (o *collectorFakeOutbox) callCount() int {
 	return o.calls
 }
 
+// snapshotWindows returns the `since` instant of every recorded call.
+func (o *collectorFakeOutbox) snapshotWindows() []time.Time {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	out := make([]time.Time, len(o.windows))
+	copy(out, o.windows)
+
+	return out
+}
+
 // collectorFakeRegistry pages a fixed subscriber list.
 type collectorFakeRegistry struct {
+	// residue, residueCall and residueErr drive the subscriber access-residue read: the
+	// orphaned credentials and refused revocations nothing else measures.
+	residue     model.SubscriberAccessResidue
+	residueCall int
+	residueErr  error
+
 	mu sync.Mutex
 
 	rows  []model.EventSubscriber
@@ -656,13 +692,37 @@ type collectorFakeRegistry struct {
 	revocations    model.SubscriberRevocationBacklog
 	revocationErr  error
 	revocationCall int
+
+	// settlement is the broker-side settlement backlog the aggregate read returns, and
+	// settlementErr makes that read fail. Separate from the revocation pair for the same reason
+	// that pair is separate from rows and err: it is a third independent read, and a test must
+	// be able to fail one without disturbing the others.
+	settlement     model.SubscriberSettlementBacklog
+	settlementErr  error
+	settlementCall int
+
+	// total, totalErr and totalCall drive the registry SIZE read (SEC-10), which is the
+	// denominator the unmeasured count is judged against.
+	//
+	// total is a POINTER so "not stated" is distinguishable from "zero": a nil total means
+	// the fake reports len(rows), which keeps every pre-existing case describing a
+	// consistent registry, while a stated total is how the budget cases express a registry
+	// larger than one sweep can reach.
+	total     *int64
+	totalErr  error
+	totalCall int
 }
 
 // collectorPage is one recorded enumeration request, so the paging and the budget can be
 // asserted on the requests themselves rather than inferred from the results.
+//
+// The position is a CURSOR rather than an offset (PERF-P08/PERF-P22): a nil cursor is the start
+// of a pass, and a non-nil one names the row the previous tick stopped at. Recording the cursor
+// is what makes rotating coverage assertable — an offset-based recorder could not distinguish
+// "resumed where it stopped" from "restarted from the top", which is the defect being fixed.
 type collectorPage struct {
 	limit  int
-	offset int
+	cursor *model.SubscriberCursor
 }
 
 // CountSubscriberRevocationsPending returns the seeded backlog and counts its calls, so a test
@@ -683,29 +743,76 @@ func (r *collectorFakeRegistry) CountSubscriberRevocationsPending(
 	return r.revocations, nil
 }
 
-func (r *collectorFakeRegistry) ListEventSubscribers(
+// CountSubscriberSettlementObligations returns the seeded backlog and counts its calls, so a
+// test can assert the collector reads it ONCE per tick — an aggregate consulted per subscriber
+// would defeat the reason it is an aggregate.
+func (r *collectorFakeRegistry) CountSubscriberSettlementObligations(
 	_ context.Context,
-	limit, offset int,
-) ([]model.EventSubscriber, error) {
+) (model.SubscriberSettlementBacklog, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.pages = append(r.pages, collectorPage{limit: limit, offset: offset})
+	r.settlementCall++
+
+	if r.settlementErr != nil {
+		return model.SubscriberSettlementBacklog{}, r.settlementErr
+	}
+
+	return r.settlement, nil
+}
+
+func (r *collectorFakeRegistry) ListEventSubscribers(
+	_ context.Context,
+	query model.SubscriberPageQuery,
+) (model.SubscriberPage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.pages = append(r.pages, collectorPage{limit: query.Limit, cursor: query.Cursor})
 
 	if r.err != nil {
-		return nil, r.err
-	}
-	if offset >= len(r.rows) {
-		return nil, nil
+		return model.SubscriberPage{}, r.err
 	}
 
-	end := offset + limit
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 1
+	}
+
+	start := 0
+	if query.Cursor != nil {
+		// A cursor naming a row that is no longer here leaves start at len(rows), which is
+		// what a keyset read does when the row it resumed from was deleted and everything
+		// after it went with it: an empty page, and therefore a completed pass.
+		start = len(r.rows)
+		for i := range r.rows {
+			if r.rows[i].CreatedAt.Equal(query.Cursor.CreatedAt) && r.rows[i].ID == query.Cursor.ID {
+				start = i + 1
+
+				break
+			}
+		}
+	}
+
+	if start >= len(r.rows) {
+		return model.SubscriberPage{}, nil
+	}
+
+	end := start + limit
 	if end > len(r.rows) {
 		end = len(r.rows)
 	}
 
-	page := make([]model.EventSubscriber, end-offset)
-	copy(page, r.rows[offset:end])
+	page := model.SubscriberPage{
+		Subscribers: make([]model.EventSubscriber, end-start),
+		HasMore:     end < len(r.rows),
+	}
+	copy(page.Subscribers, r.rows[start:end])
+
+	if page.HasMore {
+		last := page.Subscribers[len(page.Subscribers)-1]
+		page.NextCursor = &model.SubscriberCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
 
 	return page, nil
 }
@@ -724,6 +831,10 @@ func (r *collectorFakeRegistry) snapshotPages() []collectorPage {
 // report the collector then projects through the REAL ConsumerLagReport.LagSamples — so the
 // label resolution and the withholding rule under test are the production ones.
 type collectorFakeAdmin struct {
+	// missingTopics names the authorised topics the broker does not hold, so a test can
+	// drive the incomplete-measurement path without a broker.
+	missingTopics map[string]bool
+
 	mu sync.Mutex
 
 	configured bool
@@ -736,6 +847,15 @@ type collectorFakeAdmin struct {
 
 	err      error
 	requests []ConsumerLagRequest
+
+	// beforeMeasure runs at the START of each ConsumerLag call, OUTSIDE the fake's own mutex,
+	// so a test can observe how many measurements are in flight at once. It has to be outside
+	// the mutex or every call would serialise on it and a concurrent sweep would be
+	// indistinguishable from a sequential one — the fake's own lock would be doing the
+	// serialising the test is trying to measure.
+	//
+	// Read under the mutex and invoked after releasing it, so installing it is race-free.
+	beforeMeasure func()
 }
 
 func newCollectorFakeAdmin() *collectorFakeAdmin {
@@ -743,6 +863,7 @@ func newCollectorFakeAdmin() *collectorFakeAdmin {
 		configured:         true,
 		lagByTopic:         map[string]int64{},
 		unavailableByTopic: map[string]int{},
+		missingTopics:      map[string]bool{},
 	}
 }
 
@@ -758,6 +879,14 @@ func (a *collectorFakeAdmin) ConsumerLag(
 	req ConsumerLagRequest,
 ) (ConsumerLagReport, error) {
 	a.mu.Lock()
+	before := a.beforeMeasure
+	a.mu.Unlock()
+
+	if before != nil {
+		before()
+	}
+
+	a.mu.Lock()
 	a.requests = append(a.requests, req)
 	err := a.err
 	lags := make(map[string]int64, len(a.lagByTopic))
@@ -767,6 +896,10 @@ func (a *collectorFakeAdmin) ConsumerLag(
 	unavailable := make(map[string]int, len(a.unavailableByTopic))
 	for topic, count := range a.unavailableByTopic {
 		unavailable[topic] = count
+	}
+	missing := make(map[string]bool, len(a.missingTopics))
+	for topic, absent := range a.missingTopics {
+		missing[topic] = absent
 	}
 	a.mu.Unlock()
 
@@ -780,6 +913,17 @@ func (a *collectorFakeAdmin) ConsumerLag(
 		MeasuredAt:   time.Now().UTC(),
 	}
 	for _, topic := range req.Topics {
+		// A TOPIC THE BROKER DOES NOT HOLD PRODUCES NO TopicLag, which is the production shape:
+		// it is named in MissingTopics and contributes no sample at all, so the subscriber ends
+		// the tick with a series for its other topics and silence for this one. Reporting it
+		// with a zero lag would be the silence dressed as health — the exact reading the
+		// topic-missing accounting exists to break.
+		if missing[topic] {
+			report.MissingTopics = append(report.MissingTopics, topic)
+
+			continue
+		}
+
 		lag := lags[topic]
 		report.Topics = append(report.Topics, TopicLag{
 			Topic:                 topic,
@@ -804,6 +948,15 @@ func (a *collectorFakeAdmin) snapshotRequests() []ConsumerLagRequest {
 	copy(out, a.requests)
 
 	return out
+}
+
+// reset clears the recorded requests, so a multi-tick test can attribute measurements to the
+// tick that made them rather than to the whole run.
+func (a *collectorFakeAdmin) reset() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.requests = nil
 }
 
 // collectorFakeAgeRefresher stands in for the dead-letter service's age refresh.
@@ -878,12 +1031,13 @@ func (g *collectorRecordedInt64Gauge) snapshot() []collectorGaugeRecord {
 
 // values returns the recorded values in order, for a gauge with no attributes.
 //
-// This recorder now serves ONLY the outbox-backlog gauge, which is the last synchronous
-// Int64Gauge in the event pipeline and is deliberately unattributed — one process has one
-// backlog, so a label would add cardinality without adding information. A companion that
-// indexed records by label tuple existed for the consumer-lag gauge and was removed with it:
-// the lag gauges are asynchronous now, so their telemetry is read from the published inventory
-// (see captureLagInventory) rather than intercepted as writes.
+// This recorder serves the three synchronous, unattributed Int64Gauges of the event pipeline:
+// the outbox backlog, and SEC-10's coverage pair. All three are deliberately label-free — one
+// process has one backlog, and the subscribers the coverage pair counts are precisely the ones
+// the collector did not reach, so it does not know their identifiers to attribute them by. A
+// companion that indexed records by label tuple existed for the consumer-lag gauge and was
+// removed with it: the lag gauges are asynchronous now, so their telemetry is read from the
+// published inventory (see captureLagInventory) rather than intercepted as writes.
 func (g *collectorRecordedInt64Gauge) values() []int64 {
 	out := []int64{}
 	for _, record := range g.snapshot() {
@@ -891,6 +1045,58 @@ func (g *collectorRecordedInt64Gauge) values() []int64 {
 	}
 
 	return out
+}
+
+// collectorUnmeasuredReasons is how many reason labels one coverage tick publishes.
+//
+// It matches the closed reason set in internal/metrics — budget, unprovisioned,
+// measure_failed, registry_failed and topic_missing — and every tick writes all five,
+// including the zeros. A test that assumed one write per tick would read the first reason's
+// value as the whole shortfall.
+const collectorUnmeasuredReasons = 5
+
+// perTickTotals folds an ATTRIBUTED gauge's writes back into one number per tick.
+//
+// The unmeasured gauge is exported attributed BY REASON — the reason decides the remediation,
+// and only 'budget' is answered by configuration — so one tick writes one record per reason
+// rather than a single number. Summing the reasons away recovers the aggregate the coverage
+// alert is stated over, which is exactly what the metrics reference tells an operator to do:
+// sum without(reason)(blnk_kafka_subscribers_unmeasured).
+//
+// The tick boundary is the reason COUNT rather than a marker, because every tick publishes
+// every reason including its zeros — that completeness is itself an assertion here, since a
+// reason written only when non-zero cannot distinguish a healthy tick from a stopped
+// collector.
+//
+// Parameters:
+//   - t *testing.T: fails when the writes do not divide evenly into whole ticks, which means a
+//     reason was skipped and the aggregate below would silently misattribute one tick's total
+//     to another.
+//   - reasons int: how many reason labels one tick writes.
+//
+// Returns:
+//   - []int64: one total per tick, in order.
+func (g *collectorRecordedInt64Gauge) perTickTotals(t *testing.T, reasons int) []int64 {
+	t.Helper()
+
+	records := g.snapshot()
+	require.Zerof(t, len(records)%reasons,
+		"every tick must publish all %d reasons, zeros included, so a healthy tick is "+
+			"distinguishable from a collector that has stopped; got %d writes",
+		reasons, len(records))
+
+	totals := []int64{}
+	for start := 0; start < len(records); start += reasons {
+		var total int64
+		for _, record := range records[start : start+reasons] {
+			require.Containsf(t, record.attributes, "reason",
+				"every unmeasured write must carry its reason; %v does not", record.attributes)
+			total += record.value
+		}
+		totals = append(totals, total)
+	}
+
+	return totals
 }
 
 // captureBacklogGauge swaps the shared backlog gauge for a recorder.
@@ -903,6 +1109,44 @@ func captureBacklogGauge(t *testing.T) *collectorRecordedInt64Gauge {
 	metrics.OutboxPendingBacklog = recorder
 
 	return recorder
+}
+
+// coverageGauges holds the recorders standing in for SEC-10's two coverage gauges.
+//
+// They are returned as a PAIR because neither is interpretable alone: a shortfall of three is a
+// rounding error against a registry of three thousand and almost total blindness against a
+// registry of five, so every assertion below reads both.
+type coverageGauges struct {
+	unmeasured *collectorRecordedInt64Gauge
+	registered *collectorRecordedInt64Gauge
+}
+
+// captureCoverageGauges swaps the two subscriber-coverage gauges for recorders.
+//
+// Intercepting the WRITES rather than reading an exported value is what makes "published on
+// every tick, zero included" assertable: a zero written each tick and a gauge never written at
+// all are indistinguishable in exported state, and the difference between them is the entire
+// point of the instrument — an alert cannot tell a healthy system from a stopped collector
+// unless the healthy system keeps saying so.
+func captureCoverageGauges(t *testing.T) coverageGauges {
+	t.Helper()
+
+	gauges := coverageGauges{
+		unmeasured: &collectorRecordedInt64Gauge{},
+		registered: &collectorRecordedInt64Gauge{},
+	}
+
+	originalUnmeasured := metrics.SubscribersUnmeasured
+	originalRegistered := metrics.SubscribersRegistered
+	t.Cleanup(func() {
+		metrics.SubscribersUnmeasured = originalUnmeasured
+		metrics.SubscribersRegistered = originalRegistered
+	})
+
+	metrics.SubscribersUnmeasured = gauges.unmeasured
+	metrics.SubscribersRegistered = gauges.registered
+
+	return gauges
 }
 
 // lagInventoryView is the exported consumer-lag telemetry, keyed by series.
@@ -981,10 +1225,19 @@ func captureLagInventory(t *testing.T) func() lagInventoryView {
 	}
 }
 
+// collectorSubscriberSeq numbers fixture rows so each one gets a DISTINCT keyset position.
+//
+// Positions descend as rows are created, so the order a test writes its fixtures in is the
+// order the registry returns them in — newest first — and a cursor can name exactly one row.
+// Two rows sharing a position would make the resume point ambiguous and the rotation
+// unassertable.
+var collectorSubscriberSeq atomic.Int64
+
 // collectorSubscriber returns a registry row with canonical identifiers and the given
 // topics.
 func collectorSubscriber(topics ...string) model.EventSubscriber {
 	subscriberID := model.GenerateSubscriberID()
+	seq := collectorSubscriberSeq.Add(1)
 
 	// The principal and the group are DERIVED from the subscriber id, because that is what
 	// the registry stores: the schema's principal_derived and group_derived CHECK
@@ -1000,13 +1253,19 @@ func collectorSubscriber(topics ...string) model.EventSubscriber {
 	}
 
 	return model.EventSubscriber{
+		ID:               math.MaxInt32 - seq,
 		SubscriberID:     subscriberID,
 		Name:             "collector fixture",
 		KafkaPrincipal:   principal,
 		ConsumerGroupID:  group,
 		AuthorizedTopics: topics,
+		CreatedAt:        collectorFixtureEpoch.Add(-time.Duration(seq) * time.Second),
 	}
 }
+
+// collectorFixtureEpoch is the instant fixture creation times descend from. Fixed rather than
+// time.Now() so a keyset position is reproducible across a test run.
+var collectorFixtureEpoch = time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
 
 // lagSeriesKey renders the label tuple a lag series is actually published under.
 //
@@ -1174,13 +1433,29 @@ func TestEventMetricsCollector_EnumeratesTheRegistryAndMeasuresEverySubscriber(t
 	assert.Equal(t, 3, report.LagSeriesPublished, "one series per subscriber-topic pair")
 	assert.False(t, report.BudgetReached)
 
+	// The requests are matched BY GROUP rather than by position. A page is measured
+	// concurrently (PERF-P22), so which broker call is issued first is decided by goroutine
+	// scheduling and is not a contract — what IS a contract is that each row is measured with
+	// the group and the topics recorded on that same row. Asserting arrival order instead would
+	// be a test of the runtime's scheduler that happened to fail whenever it reordered.
 	requests := admin.snapshotRequests()
-	require.Len(t, requests, 2)
-	assert.Equal(t, first.ConsumerGroupID, requests[0].GroupID,
+	require.Len(t, requests, 2, "one measurement per registered subscriber, no more and no fewer")
+
+	byGroup := make(map[string]ConsumerLagRequest, len(requests))
+	for _, request := range requests {
+		byGroup[request.GroupID] = request
+	}
+
+	firstRequest, measuredFirst := byGroup[first.ConsumerGroupID]
+	require.True(t, measuredFirst,
 		"the group measured must be the one recorded on the same registry row")
-	assert.Equal(t, first.AuthorizedTopics, requests[0].Topics,
+	assert.Equal(t, first.AuthorizedTopics, firstRequest.Topics,
 		"a subscriber's own authorised topics are the ones measured, not every topic Blnk owns")
-	assert.Equal(t, second.ConsumerGroupID, requests[1].GroupID)
+
+	secondRequest, measuredSecond := byGroup[second.ConsumerGroupID]
+	require.True(t, measuredSecond, "every registered subscriber must be reached")
+	assert.Equal(t, second.AuthorizedTopics, secondRequest.Topics,
+		"the second row's topics must come from the second row, not be blended with the first")
 
 	published := inventory()
 	assert.Len(t, published.series, 3, "the exported inventory is exactly this tick's measured set")
@@ -1466,6 +1741,343 @@ func TestEventMetricsCollector_BoundsTheWorkOneTickCanDo(t *testing.T) {
 	})
 }
 
+// TestEventMetricsCollector_RotatesUntilEverySubscriberIsMeasured is the PERF-P22 guard, and
+// it is the property the previous collector did not have at all.
+//
+// The lag sweep is BUDGETED, so a registry larger than one budget cannot be measured in a
+// single tick. The old sweep read from OFFSET ZERO every tick, so it measured the same newest
+// slice for ever: past the budget, a subscriber's lag was never measured even once, and the
+// alert that exists to catch a consumer falling behind could not fire for it. Nothing failed
+// and nothing was logged, because from the collector's point of view it had done its work.
+//
+// The sweep now resumes from a keyset cursor, so successive ticks cover successive slices and
+// the pass completes over several ticks. Three things are asserted, and all three are needed:
+// that the second tick asks the repository to RESUME rather than restart, that every subscriber
+// is measured within one pass, and that the readings of the subscribers a tick did not reach
+// stay EXPORTED — because a series that appeared and vanished in turn would read as a consumer
+// connecting and disconnecting, which is worse than the gap it replaced.
+func TestEventMetricsCollector_RotatesUntilEverySubscriberIsMeasured(t *testing.T) {
+	const (
+		registrySize = 7
+		budget       = 3
+	)
+
+	rows := make([]model.EventSubscriber, 0, registrySize)
+	for range registrySize {
+		rows = append(rows, collectorSubscriber("blnk.transactions"))
+	}
+
+	registry := &collectorFakeRegistry{rows: rows}
+	admin := newCollectorFakeAdmin()
+	admin.lagByTopic["blnk.transactions"] = 41
+
+	inventory := captureLagInventory(t)
+	collector := NewEventMetricsCollector(
+		newCollectorFakeOutbox(), registry, nil, admin,
+	).WithSubscriberBudget(budget)
+
+	measured := map[string]int{}
+	passStarts := make([]time.Time, 0, 3)
+
+	for tick := 1; tick <= 3; tick++ {
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err, "tick %d", tick)
+
+		passStarts = append(passStarts, report.LagPassStartedAt)
+
+		for _, request := range admin.snapshotRequests() {
+			measured[request.SubscriberID]++
+		}
+		admin.reset()
+
+		switch tick {
+		case 1, 2:
+			assert.Equal(t, budget, report.SubscribersMeasured, "tick %d measures a budget's worth", tick)
+			assert.True(t, report.BudgetReached, "tick %d stops at the budget", tick)
+			assert.False(t, report.LagPassComplete, "tick %d has not reached the end of the registry", tick)
+		case 3:
+			assert.Equal(t, registrySize-2*budget, report.SubscribersMeasured,
+				"the last tick of a pass measures the remainder")
+			assert.True(t, report.LagPassComplete, "and reports that the pass is now complete")
+		}
+	}
+
+	assert.Len(t, measured, registrySize,
+		"EVERY subscriber must be measured within one pass; the sweep this replaced measured the "+
+			"newest %d for ever and never reached the rest at all", budget)
+	for id, times := range measured {
+		assert.Equal(t, 1, times, "subscriber %s must be measured exactly once per pass", id)
+	}
+
+	// Every reading is still exported at the end of the pass, including the ones taken two
+	// ticks ago. That is the retained-reading union, and without it a rotating sweep would
+	// export each slice in turn and retire the rest.
+	final := inventory()
+	assert.Len(t, final.series, registrySize,
+		"the exported inventory is the whole registry, not the slice the last tick happened to reach")
+	for _, row := range rows {
+		assert.Equal(t, int64(41), final.lag[lagSeriesKey(row, "blnk.transactions")],
+			"subscriber %s must still be exported from the tick that measured it", row.SubscriberID)
+	}
+
+	// The pass clock is the same instant for every tick of one pass and is restarted once the
+	// pass completes, which is what makes "how long since every subscriber was last measured"
+	// answerable from the report.
+	assert.False(t, passStarts[0].IsZero(), "a pass must record when it began")
+	assert.Equal(t, passStarts[0], passStarts[1], "the pass clock spans the ticks of one pass")
+	assert.Equal(t, passStarts[0], passStarts[2])
+
+	t.Run("the next tick begins a fresh pass from the newest subscriber", func(t *testing.T) {
+		registry.mu.Lock()
+		registry.pages = nil
+		registry.mu.Unlock()
+
+		fourth, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		pages := registry.snapshotPages()
+		require.NotEmpty(t, pages)
+		assert.Nil(t, pages[0].cursor,
+			"a completed pass rewinds the cursor, so the next pass starts at the newest subscriber; "+
+				"leaving it set would strand it past the end of a shrinking registry")
+		assert.NotEqual(t, passStarts[0], fourth.LagPassStartedAt,
+			"and restarts the pass clock")
+	})
+
+	t.Run("a completed pass retires what it never saw, without waiting for the TTL", func(t *testing.T) {
+		// The TTL is the fallback, not the mechanism. A single tick cannot tell a deleted
+		// subscriber from one it has not reached; a COMPLETED pass can, because it visited the
+		// whole registry — so a retained series it never measured is retired at once. Waiting
+		// out the TTL there would keep alerting on a subscriber nobody can fix.
+		small := &collectorFakeRegistry{rows: []model.EventSubscriber{rows[0], rows[1]}}
+		smallInventory := captureLagInventory(t)
+		smallCollector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), small, nil, admin,
+		).WithSubscriberBudget(1)
+
+		// Two ticks to complete one pass over two rows.
+		for range 2 {
+			_, err := smallCollector.Collect(context.Background())
+			require.NoError(t, err)
+		}
+		require.Len(t, smallInventory().series, 2)
+
+		small.mu.Lock()
+		small.rows = []model.EventSubscriber{rows[0]}
+		small.mu.Unlock()
+
+		// One tick now covers the whole registry, so the pass completes immediately.
+		completed, err := smallCollector.Collect(context.Background())
+		require.NoError(t, err)
+		require.True(t, completed.LagPassComplete)
+
+		assert.Equal(t, 1, completed.LagSeriesCleared,
+			"the pass covered everything and never saw the deleted subscriber, so its series is gone now")
+		assert.False(t, smallInventory().has(lagSeriesKey(rows[1], "blnk.transactions")))
+		assert.Len(t, smallInventory().series, 1)
+	})
+}
+
+// TestEventMetricsCollector_PublishesCoverageAlongsideTheLagItMeasured is the remaining half of
+// PERF-P22: the rotation is only trustworthy if an operator can see whether it is keeping up.
+//
+// # Why coverage cannot be inferred from the lag gauge
+//
+// A subscriber the rotation has not returned to within the reading TTL stops being exported,
+// and an ABSENT series breaches no threshold — so the >10000 rule reports nothing wrong for
+// exactly the subscribers it can no longer see. Rotation fixed the original defect, in which
+// the oldest subscribers were never measured; without a coverage signal it would leave a
+// quieter form of the same thing, measured too rarely to alert on. These two numbers are what
+// make that distinguishable, and the pass age is the one to alert on because its maximum over a
+// window is the rotation latency to compare against the TTL.
+func TestEventMetricsCollector_PublishesCoverageAlongsideTheLagItMeasured(t *testing.T) {
+	const (
+		registrySize = 5
+		budget       = 2
+	)
+
+	rows := make([]model.EventSubscriber, 0, registrySize)
+	for range registrySize {
+		rows = append(rows, collectorSubscriber("blnk.transactions", "blnk.balances"))
+	}
+
+	registry := &collectorFakeRegistry{rows: rows}
+	admin := newCollectorFakeAdmin()
+	admin.lagByTopic["blnk.transactions"] = 5
+	admin.lagByTopic["blnk.balances"] = 5
+
+	collector := NewEventMetricsCollector(
+		newCollectorFakeOutbox(), registry, nil, admin,
+	).WithSubscriberBudget(budget)
+
+	t.Run("an outstanding pass reports an age that accumulates across its ticks", func(t *testing.T) {
+		// Two in-progress ticks, and the assertion is that the age GROWS between them rather
+		// than merely being non-negative. Growth is the property with content: the age is
+		// measured from the instant the pass began, which is fixed for the whole rotation, so a
+		// value that did not accumulate would mean the clock was being restarted every tick —
+		// and then max_over_time could never reach the rotation latency it is supposed to
+		// report, so a rotation slower than the reading TTL would look instantaneous.
+		first, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+		require.False(t, first.LagPassComplete, "a budget of 2 over 5 rows cannot complete in one tick")
+
+		second, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+		require.False(t, second.LagPassComplete, "nor in two")
+
+		assert.Positive(t, first.LagPassAgeSeconds,
+			"an outstanding rotation must report its age, which is what is compared against the "+
+				"reading TTL to decide whether every subscriber's lag can still alert")
+		assert.Greater(t, second.LagPassAgeSeconds, first.LagPassAgeSeconds,
+			"the age must accumulate over the ticks of one pass, because the pass clock is what "+
+				"it is measured from")
+	})
+
+	t.Run("a completed pass takes the age back to zero", func(t *testing.T) {
+		// The third tick finishes the pass. Zero is published rather than the age the pass
+		// reached, because the quantity is "how long has the CURRENT rotation been outstanding"
+		// and a finished rotation has nothing outstanding — which is also what makes
+		// max_over_time over the gauge equal to the rotation latency.
+		last, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		require.True(t, last.LagPassComplete, "three ticks of 2 must cover 5 rows")
+		assert.Zero(t, last.LagPassAgeSeconds,
+			"a completed pass has no outstanding rotation, so its age is zero")
+	})
+
+	t.Run("covered subscribers counts subscribers, not series", func(t *testing.T) {
+		// Each fixture row is authorised on TWO topics and therefore contributes two series.
+		// Counting series would report five subscribers as ten, and the comparison an operator
+		// actually makes — exported coverage against registry size — would be meaningless.
+		assert.Equal(t, registrySize, collector.coveredSubscriberCount(),
+			"the whole registry is covered after a completed pass, counted once per subscriber")
+	})
+
+	t.Run("losing the broker reports zero coverage rather than the last good value", func(t *testing.T) {
+		// The empty reading is the informative one. Leaving the previous count standing would
+		// report a healthy rotation for a deployment that can no longer measure anything at
+		// all, which is the moment the signal matters most.
+		admin.mu.Lock()
+		admin.configured = false
+		admin.mu.Unlock()
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Zero(t, report.LagSeriesPublished, "no broker means nothing is measurable")
+		assert.Zero(t, collector.coveredSubscriberCount(),
+			"coverage must fall to zero with the inventory it describes")
+	})
+}
+
+// TestEventMetricsCollector_MeasuresAPageWithBoundedConcurrency is the throughput half of
+// PERF-P22.
+//
+// # Why concurrency is part of the coverage fix
+//
+// Each measurement is a broker round trip, so a sequential sweep costs the budget multiplied by
+// the round-trip time — and that product, not the budget, is what limits how much of the
+// registry one tick can cover on a remote or loaded broker. A rotation that cannot get round
+// the registry inside the reading TTL leaves subscribers exported-then-expired, which is the
+// defect in another form.
+//
+// # Why it must stay bounded
+//
+// The broker may already be the thing failing. One goroutine per row would open a connection
+// per subscriber at precisely that moment, so the sweep would become the cause of the outage it
+// is measuring. The assertion below is therefore two-sided: measurements must overlap, and the
+// overlap must never exceed the fixed bound.
+func TestEventMetricsCollector_MeasuresAPageWithBoundedConcurrency(t *testing.T) {
+	const registrySize = 24
+
+	rows := make([]model.EventSubscriber, 0, registrySize)
+	for range registrySize {
+		rows = append(rows, collectorSubscriber("blnk.transactions"))
+	}
+
+	var (
+		mu       sync.Mutex
+		inFlight int
+		peak     int
+	)
+
+	admin := newCollectorFakeAdmin()
+	admin.lagByTopic["blnk.transactions"] = 1
+
+	// gate holds each measurement open until enough have arrived to prove they overlap, so the
+	// test does not depend on any of them being slow.
+	admin.beforeMeasure = func() {
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+
+		// Long enough for the semaphore to be saturated by its peers, short enough that a
+		// serialised implementation still finishes the test quickly.
+		time.Sleep(5 * time.Millisecond)
+
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+	}
+
+	collector := NewEventMetricsCollector(
+		newCollectorFakeOutbox(),
+		&collectorFakeRegistry{rows: rows},
+		nil, admin,
+	)
+
+	report, err := collector.Collect(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, registrySize, report.SubscribersMeasured,
+		"every row must still be measured; concurrency changes the timing, not the coverage")
+
+	mu.Lock()
+	observedPeak := peak
+	mu.Unlock()
+
+	assert.Greater(t, observedPeak, 1,
+		"measurements must overlap; a sequential sweep is what makes the rotation too slow to "+
+			"cover the registry inside the reading TTL")
+	assert.LessOrEqual(t, observedPeak, lagMeasurementConcurrency,
+		"the fan-out must never exceed the bound: an unbounded sweep would open a connection per "+
+			"subscriber against a broker that may already be failing")
+}
+
+// TestEventMetricsCollector_BoundsTheBacklogCountItAsksFor is the PERF-P04 guard on the
+// collector's side of the fix.
+//
+// The backlog gauge is the sum of pending and processing, and both are counted exactly and in
+// full however short the window — a row pending for three days must still appear in the very
+// gauge that exists to show it. What the window bounds is the DISPATCHED count, which this
+// collector never reads and which is the one population that grows without bound. So the
+// collector must ask for a bounded count, and the assertion is on what it asked for.
+func TestEventMetricsCollector_BoundsTheBacklogCountItAsksFor(t *testing.T) {
+	outbox := newCollectorFakeOutbox().
+		set(model.EventOutboxStatusPending, 9).
+		set(model.EventOutboxStatusProcessing, 4)
+
+	before := time.Now().UTC()
+	collector := NewEventMetricsCollector(outbox, nil, nil, nil)
+
+	report, err := collector.Collect(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int64(13), report.PendingBacklog,
+		"the backlog is pending plus processing, both counted in full")
+
+	windows := outbox.snapshotWindows()
+	require.Len(t, windows, 1, "one tick asks once")
+	assert.False(t, windows[0].IsZero(),
+		"the collector must NAME a window: a zero instant would take the repository's default, and "+
+			"relying on a default is how the whole-history scan survived")
+	assert.WithinDuration(t, before.Add(-outboxBacklogCountWindow), windows[0], time.Minute,
+		"and it must be the documented backlog window")
+	assert.True(t, windows[0].Before(time.Now().UTC()))
+}
+
 // TestEventMetricsCollector_LifecycleMatchesTheHouseProcessor pins the lifecycle against the
 // precedent every other background loop in this repository follows.
 //
@@ -1682,6 +2294,125 @@ func TestPrometheusRuleFiles_AreMountedWhereTheGlobResolves(t *testing.T) {
 			assert.NotEmpty(t, ruleFiles, "the mounted directory must actually contain a rule file")
 		})
 	}
+
+	// KUBERNETES HAS NO DIRECTORY TO MOUNT, which is why it needs its own assertion.
+	//
+	// Compose bind-mounts ./alerts wholesale, so a rule file added there is picked up with no
+	// further edit. A ConfigMap cannot do that: each rule file is a separate data KEY and each
+	// key needs its own subPath volumeMount projecting it into the glob's directory. So every
+	// key added is a second edit that can be forgotten — and forgetting it is SILENT. The
+	// ConfigMap applies, the pod starts, /api/v1/rules is simply short by one file, and the
+	// rules in it report no error because they were never loaded.
+	//
+	// PERF-P24 added exactly such a key: blnk-infra-alerts.yml, separate from the mirrored
+	// blnk-kafka-alerts.yml because it reads kubelet metrics that have no Compose equivalent.
+	// This subtest is what makes the pair of edits inseparable.
+	t.Run("kubernetes projects every rule-file key into the glob directory", func(t *testing.T) {
+		configMap := readYAMLFile(t, filepath.Join(root, "infrastructure", "k8s-manifests",
+			"prometheus-configmap.yaml"))
+
+		data, ok := configMap["data"].(map[string]interface{})
+		require.True(t, ok, "the ConfigMap must carry a data section")
+
+		// Every key that is a rule file: a *.yml key other than the scrape configuration.
+		ruleKeys := map[string]struct{}{}
+		for key := range data {
+			if key == "prometheus.yml" {
+				continue
+			}
+			if strings.HasSuffix(key, ".yml") || strings.HasSuffix(key, ".yaml") {
+				ruleKeys[key] = struct{}{}
+			}
+		}
+		require.NotEmpty(t, ruleKeys, "the ConfigMap must carry at least one rule-file key")
+
+		deployment := readYAMLGeneric(t, filepath.Join(root, "infrastructure", "k8s-manifests",
+			"prometheus-deployment.yaml"))
+
+		mounts := prometheusRuleMounts(t, deployment)
+
+		for key := range ruleKeys {
+			mountPath, projected := mounts[key]
+			require.True(t, projected,
+				"ConfigMap key %q is a rule file but prometheus-deployment.yaml projects no "+
+					"subPath mount for it, so Prometheus never loads it — and an unloaded rule "+
+					"file raises no error, it is simply absent from /api/v1/rules", key)
+
+			for dir := range requiredDirs {
+				assert.Equal(t, path.Join(dir, key), mountPath,
+					"key %q must be projected into %s, which is where the rule_files glob "+
+						"resolves; anywhere else and it is mounted but never scanned", key, dir)
+			}
+		}
+	})
+}
+
+// readYAMLGeneric parses a YAML file the same way readYAMLFile does, and exists so a caller
+// that needs to walk a deeply nested manifest is not obliged to re-read the file itself.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - path string: the file to read.
+//
+// Returns:
+//   - map[string]interface{}: the parsed document.
+func readYAMLGeneric(t *testing.T, path string) map[string]interface{} {
+	t.Helper()
+
+	return readYAMLFile(t, path)
+}
+
+// prometheusRuleMounts returns the Prometheus container's subPath volume mounts, indexed by
+// subPath, so a caller can ask "is this ConfigMap key projected, and where".
+//
+// Only subPath mounts are collected, deliberately: the scrape configuration and each rule file
+// are projected individually from one ConfigMap volume, and a mount with no subPath would
+// project the WHOLE ConfigMap over the directory — replacing prometheus.yml's own mount point.
+// A mount without a subPath is therefore not an alternative way to satisfy the contract, so it
+// is not counted as one.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - deployment map[string]interface{}: the parsed prometheus Deployment.
+//
+// Returns:
+//   - map[string]string: subPath to mountPath.
+func prometheusRuleMounts(t *testing.T, deployment map[string]interface{}) map[string]string {
+	t.Helper()
+
+	spec, ok := deployment["spec"].(map[string]interface{})
+	require.True(t, ok, "the Deployment must carry a spec")
+
+	template, ok := spec["template"].(map[string]interface{})
+	require.True(t, ok, "the Deployment must carry a pod template")
+
+	podSpec, ok := template["spec"].(map[string]interface{})
+	require.True(t, ok, "the pod template must carry a spec")
+
+	containers, ok := podSpec["containers"].([]interface{})
+	require.True(t, ok, "the pod must declare containers")
+	require.NotEmpty(t, containers)
+
+	container, ok := containers[0].(map[string]interface{})
+	require.True(t, ok)
+
+	mounts, ok := container["volumeMounts"].([]interface{})
+	require.True(t, ok, "the prometheus container must mount its configuration")
+
+	projected := map[string]string{}
+	for _, entry := range mounts {
+		mount, isMap := entry.(map[string]interface{})
+		require.True(t, isMap)
+
+		subPath, hasSubPath := mount["subPath"].(string)
+		mountPath, hasMountPath := mount["mountPath"].(string)
+		if !hasSubPath || !hasMountPath {
+			continue
+		}
+		projected[subPath] = mountPath
+	}
+
+	return projected
 }
 
 // TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot is the automated guard
@@ -1725,8 +2456,11 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 
 			expected := readYAMLFile(t, pair.rootPath)
 
-			// SCRAPE AUTHENTICATION IS THE ONE SANCTIONED DIVERGENCE, and it is stripped
-			// from both sides before the documents are compared.
+			// TWO SANCTIONED DIVERGENCES, both stripped from both sides before the
+			// documents are compared and both then asserted POSITIVELY on the Kubernetes
+			// side, so normalising them away removes nothing from this test's reach.
+			//
+			// SCRAPE AUTHENTICATION.
 			//
 			// Kubernetes always has a metrics bearer token, so its copy authenticates
 			// unconditionally with credentials_file. The root copy cannot: Prometheus
@@ -1736,12 +2470,25 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 			// to false locally. The block is therefore present-but-commented at the root and
 			// live in the ConfigMap, deliberately.
 			//
-			// Everything else — the scrape targets, the intervals and rule_files — must
-			// still match exactly, which is what this test exists for, so only this one key
-			// is normalised away and the Kubernetes side's authentication is then asserted
-			// positively below.
+			// TARGET DISCOVERY (PERF-P19). The Kubernetes copy discovers pods through the
+			// API server; the root copy names static targets. This is two right answers for
+			// two topologies rather than a drift. server-hpa.yaml and worker-hpa.yaml scale
+			// each role between 2 and 10 replicas, and a Service target load-balances — so a
+			// static `server:5001` reaches ONE arbitrary pod per scrape, collapsing ten
+			// per-process counters into one series that appears to reset and leaving nine
+			// replicas' backlogs and failures with no series to breach a threshold. Compose
+			// runs one container per service and has no API to discover from, so static
+			// targets are correct there and pod discovery is not expressible.
+			//
+			// This assertion USED to compare the targets exactly, and it was right to while
+			// both sides were static. Pinning them together now would pin the defect.
+			//
+			// Everything else — the job names, the intervals, rule_files and the whole rule
+			// file — must still match exactly, which is what this test exists for.
 			stripScrapeAuthorization(expected)
 			stripScrapeAuthorization(embedded)
+			stripScrapeDiscovery(expected)
+			stripScrapeDiscovery(embedded)
 
 			assert.Equal(t, expected, embedded,
 				"the ConfigMap's %s has diverged from the repository-root copy. Update BOTH: "+
@@ -1750,6 +2497,8 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 
 			if pair.key == "prometheus.yml" {
 				assertKubernetesScrapesAuthenticate(t, embeddedText)
+				assertKubernetesScrapesDiscoverPods(t, embeddedText)
+				assertRootScrapesStaticTargets(t, pair.rootPath)
 			}
 		})
 	}
@@ -1784,6 +2533,19 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 			"blnk.outbox.pending",
 			"blnk.subscribers.revocation_pending",
 			"blnk.subscribers.oldest_revocation_age_seconds",
+			"blnk.subscribers.settlement_outstanding",
+			"blnk.subscribers.oldest_settlement_age_seconds",
+			"blnk.subscribers.obligations_settled.total",
+			// The unsettled-state markers and the collector's own health, all of which
+			// alerts here evaluate. Enumerated rather than pattern-matched, because the
+			// whole point is that a rule naming a series nothing publishes evaluates
+			// nothing and can never fire — which is indistinguishable from health.
+			"blnk.subscribers.oldest_credential_orphan_age_seconds",
+			"blnk.subscribers.oldest_revocation_failure_age_seconds",
+			"blnk.kafka.consumer_lag.pass_age_seconds",
+			"blnk.kafka.consumer_lag_inventory_complete",
+			"blnk.event_metrics.last_collection_age_seconds",
+			"blnk.event_metrics.last_success_age_seconds",
 		} {
 			exported[strings.ReplaceAll(instrument, ".", "_")] = struct{}{}
 		}
@@ -1817,17 +2579,46 @@ func TestPrometheusConfigParity_KeepsTheKubernetesCopyInStepWithTheRoot(t *testi
 				found++
 			}
 		}
-		// FOUR, and two of them are counted here precisely because their absence is invisible.
+		// FIVE, and three of them are counted here precisely because their absence is invisible.
 		//
 		// The MEASUREMENT-HEALTH rule: without it, an incompletely measured topic publishes no
 		// lag — correctly, since a partial sum is a lower bound — and nothing at all would then
 		// alert on the subscriber, which reads exactly like a healthy one.
 		//
+		// The COVERAGE rule (SEC-10): a subscriber past the measurement budget has no lag
+		// series whatsoever, so the lag threshold cannot fire for it however far behind it
+		// falls. Same indistinguishable-from-healthy failure, a different cause and a
+		// different fix, which is why it is a separate rule and not a widened expression.
+		//
 		// The REVOCATION rule: a subscriber deleted from the registry whose broker-side SCRAM
 		// credential and ACLs were not removed still authenticates and still reads. Nothing in
 		// the API surface shows it, so the outstanding revocation is only ever visible as this
 		// gauge and this alert.
-		assert.Equal(t, 4, found, "every event-streaming alert must be present")
+		//
+		// The COVERAGE rule (PERF-P22): lag is measured for a rotating slice of the registry,
+		// so a rotation slower than the reading retention lets a subscriber's series EXPIRE —
+		// and an absent series breaches no threshold, which means the lag rule reports nothing
+		// wrong for exactly the subscribers it can no longer see. The lag signal cannot report
+		// that about itself; only this rule can.
+		// THIRTEEN, and the count is asserted rather than a minimum, because a rule silently
+		// dropped from this file is the same failure as one that never loaded: whatever it
+		// watched stops being watched, and nothing anywhere reports that. The catalogue is
+		// listed here in evaluation order so a reader can see what is covered:
+		//
+		//   1. DeadLetterMessageStuck            — events stranded in a dead-letter inventory
+		//   2. SubscriberConsumerLagHigh          — a consumer falling behind
+		//   3. SubscriberRevocationOutstanding    — a credential still owed a revocation
+		//   4. SubscriberCredentialOrphaned       — a credential the registry does not record
+		//   5. SubscriberRevocationRefused        — a revocation the broker refused
+		//   6. ConsumerLagMeasurementDegraded     — a topic measured only in part
+		//   7. SubscriberLagCoverageStale         — a rotation slower than its reading TTL
+		//   8. SubscriberLagCoverageIncomplete    — a subscriber with no lag series at all
+		//   9. SubscriberSettlementNotProgressing — obligations outstanding, none settling
+		//  10. SubscriberSettlementOutstanding    — one obligation outstanding too long
+		//  11. EventMetricsCollectionStale        — the collector has stopped ticking
+		//  12. EventMetricsCollectionFailing      — it ticks and achieves nothing
+		//  13. EventMetricsCollectionAbsent       — there is no collector at all
+		assert.Equal(t, 13, found, "every event-streaming alert must be present")
 	})
 }
 
@@ -1989,6 +2780,157 @@ func stripScrapeAuthorization(document map[string]interface{}) {
 	}
 }
 
+// stripScrapeDiscovery removes the target-discovery mechanism from every scrape job.
+//
+// The second sanctioned divergence (PERF-P19): the Kubernetes copy uses pod discovery and
+// relabelling, the root copy names static targets, and neither is expressible in the other's
+// topology. Both are asserted positively — assertKubernetesScrapesDiscoverPods and
+// assertRootScrapesStaticTargets — so nothing is merely excused here.
+//
+// Parameters:
+//   - document map[string]interface{}: a parsed prometheus configuration, mutated in place.
+func stripScrapeDiscovery(document map[string]interface{}) {
+	jobs, ok := document["scrape_configs"].([]interface{})
+	if !ok {
+		return
+	}
+
+	for _, entry := range jobs {
+		job, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		delete(job, "static_configs")
+		delete(job, "kubernetes_sd_configs")
+		delete(job, "relabel_configs")
+	}
+}
+
+// assertKubernetesScrapesDiscoverPods pins what the stripped comparison can no longer see on
+// the Kubernetes side: every job discovers individual pods, filters to its own workload, pins
+// the metrics port and labels each target with its pod name.
+//
+// Each of those four is load-bearing and each fails quietly if dropped. Without discovery the
+// job scrapes one replica in ten through the Service and its per-process counters appear to
+// reset. Without the keep filter it scrapes every pod in the namespace and buries the two that
+// matter among permanently down targets. Without the address rewrite it scrapes every declared
+// containerPort, so the server's 80 and 443 answer with something that is not metrics. Without
+// the instance relabel every replica shares one series and they overwrite each other, which is
+// the original defect with discovery bolted on.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - embeddedText string: the ConfigMap's prometheus.yml value.
+func assertKubernetesScrapesDiscoverPods(t *testing.T, embeddedText string) {
+	t.Helper()
+
+	var document map[string]interface{}
+	require.NoError(t, yaml.Unmarshal([]byte(embeddedText), &document))
+
+	jobs, ok := document["scrape_configs"].([]interface{})
+	require.True(t, ok, "the embedded configuration must declare scrape jobs")
+	require.NotEmpty(t, jobs)
+
+	for _, entry := range jobs {
+		job, ok := entry.(map[string]interface{})
+		require.True(t, ok)
+
+		name, _ := job["job_name"].(string)
+
+		assert.NotContains(t, job, "static_configs",
+			"job %q must not name a static Service target: the Service load-balances, so each "+
+				"scrape reaches one replica of up to ten and its counters appear to reset", name)
+
+		discovery, ok := job["kubernetes_sd_configs"].([]interface{})
+		require.True(t, ok, "job %q must discover its targets from the Kubernetes API", name)
+		require.NotEmpty(t, discovery, "job %q must declare at least one discovery config", name)
+
+		first, ok := discovery[0].(map[string]interface{})
+		require.True(t, ok)
+		assert.Equal(t, "pod", first["role"],
+			"job %q must use role: pod — endpoints discovery drops a NotReady replica at exactly "+
+				"the moment its metrics matter", name)
+
+		// Namespaced discovery is what allows the namespace-scoped Role in
+		// prometheus-rbac.yaml. Widening it without widening that Role brings back a
+		// discovery that finds nothing and reports no error.
+		namespaces, ok := first["namespaces"].(map[string]interface{})
+		require.True(t, ok, "job %q must restrict discovery to a namespace", name)
+		assert.Equal(t, []interface{}{"blnk"}, namespaces["names"],
+			"job %q must discover only in the blnk namespace, which is what a Role rather than "+
+				"a ClusterRole can grant", name)
+
+		relabels, ok := job["relabel_configs"].([]interface{})
+		require.True(t, ok, "job %q must relabel its discovered targets", name)
+
+		var keeps, addresses, instances int
+		for _, rule := range relabels {
+			relabel, ok := rule.(map[string]interface{})
+			require.True(t, ok)
+
+			if relabel["action"] == "keep" {
+				keeps++
+			}
+			switch relabel["target_label"] {
+			case "__address__":
+				addresses++
+			case "instance":
+				instances++
+			}
+		}
+
+		assert.Equal(t, 1, keeps,
+			"job %q must keep exactly its own workload's pods", name)
+		assert.Equal(t, 1, addresses,
+			"job %q must pin the metrics port; pod discovery otherwise yields one target per "+
+				"declared containerPort", name)
+		assert.Equal(t, 1, instances,
+			"job %q must label each target with its pod name, or every replica shares one "+
+				"series and they overwrite each other", name)
+	}
+}
+
+// assertRootScrapesStaticTargets pins the other half of the divergence, so the normalisation
+// cannot quietly excuse a root copy that has lost its targets altogether.
+//
+// The Compose stack runs one container per service and has no Kubernetes API, so static
+// targets are the correct answer there — but "correct" has to mean present. A root file whose
+// scrape jobs named nothing would pass a stripped comparison and collect nothing.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - rootPath string: path to the repository-root prometheus.yml.
+func assertRootScrapesStaticTargets(t *testing.T, rootPath string) {
+	t.Helper()
+
+	document := readYAMLFile(t, rootPath)
+
+	jobs, ok := document["scrape_configs"].([]interface{})
+	require.True(t, ok, "%s must declare scrape jobs", rootPath)
+	require.NotEmpty(t, jobs)
+
+	for _, entry := range jobs {
+		job, ok := entry.(map[string]interface{})
+		require.True(t, ok)
+
+		name, _ := job["job_name"].(string)
+
+		assert.NotContains(t, job, "kubernetes_sd_configs",
+			"job %q must not use Kubernetes discovery at the root: the Compose stack has no "+
+				"API server to discover from, and Prometheus would fail every discovery cycle", name)
+
+		statics, ok := job["static_configs"].([]interface{})
+		require.True(t, ok, "job %q must name its target statically", name)
+		require.NotEmpty(t, statics, "job %q must name at least one target", name)
+
+		first, ok := statics[0].(map[string]interface{})
+		require.True(t, ok)
+		targets, ok := first["targets"].([]interface{})
+		require.True(t, ok, "job %q must carry a targets list", name)
+		assert.NotEmpty(t, targets, "job %q must name at least one address", name)
+	}
+}
+
 // assertKubernetesScrapesAuthenticate pins the property the stripped comparison can no
 // longer see: the Kubernetes copy authenticates every scrape, by file and never inline.
 //
@@ -2031,21 +2973,53 @@ func assertKubernetesScrapesAuthenticate(t *testing.T, embeddedText string) {
 	}
 }
 
-// readYAMLFile parses a YAML file into a generic map.
+// readYAMLFile parses a YAML file and returns its FIRST document as a generic map.
 //
 // Generic rather than typed on purpose: what is being compared is the DOCUMENT, and a typed
 // struct would silently drop every field it did not declare — which is exactly how a parity
 // check comes to pass while the two copies differ in a field nobody thought to model.
+//
+// MULTI-DOCUMENT files are read rather than refused, because a Kubernetes manifest that ships
+// an object with its companion policy — a StatefulSet with the PodDisruptionBudget that keeps
+// its quorum, say — is one deployable unit and belongs in one file. Every document is decoded
+// so a break anywhere in the file still fails here, and the first is returned because it is
+// the object the file is named for. Callers wanting a later document address it by kind.
 func readYAMLFile(t *testing.T, path string) map[string]interface{} {
+	t.Helper()
+
+	documents := readYAMLDocuments(t, path)
+	require.NotEmpty(t, documents, "%s must contain at least one YAML document", path)
+
+	return documents[0]
+}
+
+// readYAMLDocuments parses every document in a YAML file, in order.
+//
+// Returns:
+//   - []map[string]interface{}: one entry per non-empty document.
+func readYAMLDocuments(t *testing.T, path string) []map[string]interface{} {
 	t.Helper()
 
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err, "%s must be readable", path)
 
-	var parsed map[string]interface{}
-	require.NoError(t, yaml.Unmarshal(contents, &parsed), "%s must be valid YAML", path)
+	decoder := yaml.NewDecoder(bytes.NewReader(contents))
 
-	return parsed
+	var documents []map[string]interface{}
+	for {
+		var parsed map[string]interface{}
+		decodeErr := decoder.Decode(&parsed)
+		if errors.Is(decodeErr, io.EOF) {
+			break
+		}
+		require.NoError(t, decodeErr, "%s must be valid YAML", path)
+
+		if len(parsed) > 0 {
+			documents = append(documents, parsed)
+		}
+	}
+
+	return documents
 }
 
 // collectorRecordedFloat64Gauge records Float64Gauge measurements, so the revocation-age gauge
@@ -2233,4 +3207,1083 @@ func TestSubscriberRevocationBacklog_OldestAgeIsNeverNegativeOrEpochal(t *testin
 		Pending:         1,
 		OldestPendingAt: now.Add(-45 * time.Minute),
 	}.OldestAge(now))
+}
+
+// captureSettlementGauges swaps all four settlement gauges for recorders.
+//
+// All four, together, because they are published as one reading. A fix that recorded only the
+// total would leave the alert — which reads the AGE — as un-fireable as it was before, and one
+// that recorded only the age would leave an operator unable to tell WHICH kind of divergence is
+// accumulating, which is the thing that decides what they do about it.
+func captureSettlementGauges(t *testing.T) (
+	outstanding, grant, credential *collectorRecordedInt64Gauge,
+	age *collectorRecordedFloat64Gauge,
+) {
+	t.Helper()
+
+	outstanding = &collectorRecordedInt64Gauge{}
+	grant = &collectorRecordedInt64Gauge{}
+	credential = &collectorRecordedInt64Gauge{}
+	age = &collectorRecordedFloat64Gauge{}
+
+	originalOutstanding := metrics.SubscriberSettlementOutstanding
+	originalGrant := metrics.SubscriberGrantReconcilePending
+	originalCredential := metrics.SubscriberCredentialCleanupPending
+	originalAge := metrics.OldestSubscriberSettlementAgeSeconds
+	t.Cleanup(func() {
+		metrics.SubscriberSettlementOutstanding = originalOutstanding
+		metrics.SubscriberGrantReconcilePending = originalGrant
+		metrics.SubscriberCredentialCleanupPending = originalCredential
+		metrics.OldestSubscriberSettlementAgeSeconds = originalAge
+	})
+
+	metrics.SubscriberSettlementOutstanding = outstanding
+	metrics.SubscriberGrantReconcilePending = grant
+	metrics.SubscriberCredentialCleanupPending = credential
+	metrics.OldestSubscriberSettlementAgeSeconds = age
+
+	return outstanding, grant, credential, age
+}
+
+// TestEventMetricsCollector_PublishesTheSettlementBacklog is what makes the durable settlement
+// obligations observable.
+//
+// A subscriber's state lives in two systems that cannot be written atomically, so a request that
+// fails part-way leaves them disagreeing. Those disagreements are now recorded on the row rather
+// than only in a log line — but a row nobody reads is not an alert. This is the reading that turns
+// the backlog into a monitored quantity, and it comes from the ROW rather than from the code that
+// raises the obligation, because only a reading from the row survives a restart.
+func TestEventMetricsCollector_PublishesTheSettlementBacklog(t *testing.T) {
+	t.Run("an outstanding backlog is published split by kind, with its age", func(t *testing.T) {
+		outstanding, grant, credential, age := captureSettlementGauges(t)
+
+		registry := &collectorFakeRegistry{}
+		registry.settlement = model.SubscriberSettlementBacklog{
+			Outstanding:              3,
+			GrantReconcilePending:    2,
+			CredentialCleanupPending: 2,
+			OldestPendingAt:          time.Now().UTC().Add(-90 * time.Minute),
+		}
+
+		report, err := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, nil).
+			Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Equal(t, []int64{3}, outstanding.values(),
+			"the total is the figure to graph, and it is an OR rather than a sum because one "+
+				"subscriber can owe both obligations — which is why 2 and 2 give 3 here")
+		assert.Equal(t, []int64{2}, grant.values())
+		assert.Equal(t, []int64{2}, credential.values(),
+			"the split is what changes what an operator DOES: a rising credential-cleanup count is "+
+				"a security matter, a rising grant count is an availability one")
+
+		require.Len(t, age.values(), 1, "the AGE is the alertable quantity")
+		assert.InDelta(t, (90 * time.Minute).Seconds(), age.values()[0], 5,
+			"in SECONDS, matching the instrument's declared unit and the alert's threshold")
+
+		assert.Equal(t, int64(3), report.SettlementBacklog.Outstanding)
+		assert.InDelta(t, (90 * time.Minute).Seconds(), report.OldestSettlementAge.Seconds(), 5)
+		assert.Equal(t, 1, registry.settlementCall,
+			"one aggregate read per tick: consulting it per subscriber would defeat the reason it "+
+				"is an aggregate")
+	})
+
+	t.Run("a settled backlog publishes an explicit zero", func(t *testing.T) {
+		outstanding, grant, credential, age := captureSettlementGauges(t)
+
+		registry := &collectorFakeRegistry{}
+		registry.settlement = model.SubscriberSettlementBacklog{}
+
+		_, err := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, nil).
+			Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Equal(t, []int64{0}, outstanding.values(),
+			"zero must be published explicitly, so 'nothing owed' is distinguishable from 'the "+
+				"collector stopped'")
+		assert.Equal(t, []int64{0}, grant.values())
+		assert.Equal(t, []int64{0}, credential.values())
+		assert.Equal(t, []float64{0}, age.values(),
+			"and the age must be zero rather than the age of the epoch, which would exceed every "+
+				"threshold for ever")
+	})
+
+	t.Run("a failed read publishes nothing and is reported", func(t *testing.T) {
+		outstanding, grant, credential, age := captureSettlementGauges(t)
+
+		registry := &collectorFakeRegistry{}
+		registry.settlementErr = errors.New("dial tcp: connection refused")
+
+		_, err := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, nil).
+			Collect(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "counting outstanding subscriber settlement obligations")
+
+		assert.Empty(t, outstanding.values(),
+			"a zero on a failed read would assert that everything is settled on the strength of a "+
+				"reading that does not exist")
+		assert.Empty(t, grant.values())
+		assert.Empty(t, credential.values())
+		assert.Empty(t, age.values())
+	})
+
+	t.Run("it is measured with no broker configured", func(t *testing.T) {
+		// Obligations are raised BY broker failures, and the commonest of those is the broker
+		// being unreachable — so declining to measure the backlog without a broker would hide it
+		// exactly when it is growing fastest.
+		outstanding, _, _, age := captureSettlementGauges(t)
+
+		registry := &collectorFakeRegistry{}
+		registry.settlement = model.SubscriberSettlementBacklog{
+			Outstanding:           1,
+			GrantReconcilePending: 1,
+			OldestPendingAt:       time.Now().UTC().Add(-2 * time.Minute),
+		}
+
+		_, err := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, nil).
+			Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Equal(t, []int64{1}, outstanding.values())
+		require.Len(t, age.values(), 1)
+		assert.Positive(t, age.values()[0])
+	})
+
+	t.Run("a collector with no registry publishes nothing rather than a zero", func(t *testing.T) {
+		outstanding, grant, credential, age := captureSettlementGauges(t)
+
+		_, err := NewEventMetricsCollector(newCollectorFakeOutbox(), nil, nil, nil).
+			Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Empty(t, outstanding.values(),
+			"there is nothing to read, so a zero would be an invention")
+		assert.Empty(t, grant.values())
+		assert.Empty(t, credential.values())
+		assert.Empty(t, age.values())
+	})
+}
+
+// CountSubscriberAccessResidue returns the seeded residue and counts its calls, so a test can
+// assert the collector reads it ONCE per tick.
+func (r *collectorFakeRegistry) CountSubscriberAccessResidue(
+	_ context.Context,
+) (model.SubscriberAccessResidue, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.residueCall++
+
+	if r.residueErr != nil {
+		return model.SubscriberAccessResidue{}, r.residueErr
+	}
+
+	return r.residue, nil
+}
+
+// TestEventMetricsCollector_RotatesTheSweepSoNoSubscriberIsPermanentlyUnmeasured is the direct
+// guard on OBS-22.
+//
+// # The failure it rules out
+//
+// The sweep used to start at offset 0 on every tick, over a registry the repository orders
+// NEWEST FIRST. With more subscribers than the budget allows, that measured the same newest N
+// for ever: every older subscriber was permanently unmeasured, and because the lag inventory is
+// whole-set their series were not stale but ABSENT — so no alert could reference them, no
+// dashboard showed a gap attributable to them, and the only trace was one warning line per
+// tick. A registry that grew past the budget silently stopped monitoring its oldest tenants.
+//
+// # What must be true instead
+//
+// Successive ticks must cover the whole registry. The assertion is over the SET of subscribers
+// measured across three ticks of a five-row budget against a twelve-row registry: every row
+// must have been measured at least once, which is impossible for a sweep that restarts.
+func TestEventMetricsCollector_RotatesTheSweepSoNoSubscriberIsPermanentlyUnmeasured(t *testing.T) {
+	rows := make([]model.EventSubscriber, 0, 12)
+	for i := 0; i < 12; i++ {
+		rows = append(rows, collectorSubscriber("blnk.transactions"))
+	}
+
+	registry := &collectorFakeRegistry{rows: rows}
+	admin := newCollectorFakeAdmin()
+	collector := NewEventMetricsCollector(
+		newCollectorFakeOutbox(), registry, nil, admin,
+	).WithSubscriberBudget(5)
+
+	// 12 rows against a 5-row budget: 5, then 5, then the REMAINING 2. The last tick of a pass
+	// measures the remainder rather than wrapping round to fill its budget, which is why the
+	// per-tick expectation is stated as a schedule rather than as a constant — a tick that
+	// always measured exactly the budget would have to re-measure rows it had just done, paying
+	// for readings nothing needs.
+	perTick := []int{5, 5, 2}
+
+	measured := map[string]int{}
+	for tick, want := range perTick {
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+		require.Equalf(t, want, report.SubscribersMeasured,
+			"tick %d must measure %d: a tick spends its whole budget unless it reaches the end of "+
+				"the registry, and then it measures what is left and the pass completes",
+			tick+1, want)
+
+		for _, sample := range metrics.ConsumerLagInventory() {
+			measured[sample.Subscriber]++
+		}
+	}
+
+	// 12 rows, 5 + 5 + 2 examinations: every row is reached exactly once and the pass closes. A
+	// restarting sweep would have measured 5 distinct rows and no more, whatever the number of
+	// ticks — that is the defect this asserts is gone.
+	assert.Len(t, measured, 12,
+		"three ticks of a five-row budget must cover a twelve-row registry: a sweep that restarted "+
+			"at the newest row would have covered five, for ever")
+}
+
+// TestEventMetricsCollector_ReportsWhetherTheSweepCoveredTheWholeRegistry pins the coverage
+// signal, which is the only thing that makes a permanently unmeasured subscriber alertable.
+//
+// The lag inventory is whole-set, so an unmeasured subscriber has NO SERIES. Absence is honest
+// and it is also unalertable: nothing can write a rule about the labels of a series that does
+// not exist. Completeness is therefore published as its own fact, with the shortfall beside it
+// broken down by reason.
+func TestEventMetricsCollector_ReportsWhetherTheSweepCoveredTheWholeRegistry(t *testing.T) {
+	t.Run("a sweep that reaches the end of the registry is complete", func(t *testing.T) {
+		rows := []model.EventSubscriber{
+			collectorSubscriber("blnk.transactions"),
+			collectorSubscriber("blnk.balances"),
+		}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), &collectorFakeRegistry{rows: rows}, nil, newCollectorFakeAdmin(),
+		).WithSubscriberBudget(10)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.True(t, report.SweepComplete, "every registered subscriber was measured")
+		assert.Equal(t, 2, report.RegistrySize)
+		assert.False(t, report.BudgetReached)
+	})
+
+	t.Run("a sweep stopped by the budget is incomplete", func(t *testing.T) {
+		rows := make([]model.EventSubscriber, 0, 6)
+		for i := 0; i < 6; i++ {
+			rows = append(rows, collectorSubscriber("blnk.transactions"))
+		}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), &collectorFakeRegistry{rows: rows}, nil, newCollectorFakeAdmin(),
+		).WithSubscriberBudget(2)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.False(t, report.SweepComplete,
+			"four registered subscribers have no lag series this tick, and that must be published "+
+				"rather than left as an absence nothing can alert on")
+		assert.True(t, report.BudgetReached)
+	})
+
+	t.Run("a sweep whose registry enumeration failed never claims completeness", func(t *testing.T) {
+		registry := &collectorFakeRegistry{
+			rows: []model.EventSubscriber{collectorSubscriber("blnk.transactions")},
+			err:  errors.New("collector test: registry unavailable"),
+		}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), registry, nil, newCollectorFakeAdmin(),
+		)
+
+		report, err := collector.Collect(context.Background())
+		require.Error(t, err, "the listing failure must be reported")
+
+		assert.True(t, report.ListingFailed)
+		assert.False(t, report.SweepComplete,
+			"the number of rows never reached is UNKNOWN, and claiming completeness on an unknown is "+
+				"exactly the failure this signal exists to prevent")
+	})
+
+	t.Run("a sweep whose measurement failed is incomplete even though the row was examined", func(t *testing.T) {
+		admin := newCollectorFakeAdmin()
+		admin.err = errors.New("collector test: broker refused the measurement")
+
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(),
+			&collectorFakeRegistry{rows: []model.EventSubscriber{collectorSubscriber("blnk.transactions")}},
+			nil, admin,
+		)
+
+		report, err := collector.Collect(context.Background())
+		require.Error(t, err)
+
+		assert.Equal(t, 1, report.SubscribersFailed,
+			"a refused measurement is a broker fault and is counted apart from an unprovisioned row, "+
+				"which is a registry fault and needs a different action")
+		assert.Zero(t, report.SubscribersSkipped)
+		assert.False(t, report.SweepComplete,
+			"the row was examined and still has no series, so the inventory is incomplete")
+	})
+
+	// The quietest gap in the whole inventory, and the one that motivated a reason of its own.
+	//
+	// A topic that does not exist at the broker yields no partitions, so it produces no lag
+	// sample AND no unreadable partition. The measurement succeeds, the subscriber is counted as
+	// measured, its other topics report real numbers — and the absent topic is represented by
+	// nothing whatsoever. Neither SubscriberConsumerLagHigh nor ConsumerLagMeasurementDegraded
+	// has anything to fire on, so a subscriber authorised on a topic nobody ever provisioned is
+	// indistinguishable from one that is fully up to date.
+	t.Run("a measured subscriber whose authorised topic does not exist is incomplete", func(t *testing.T) {
+		admin := newCollectorFakeAdmin()
+		admin.lagByTopic["blnk.transactions"] = 42
+		admin.missingTopics["blnk.balances"] = true
+
+		row := collectorSubscriber("blnk.transactions", "blnk.balances")
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(),
+			&collectorFakeRegistry{rows: []model.EventSubscriber{row}},
+			nil, admin,
+		)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err,
+			"a missing topic is not a failed collection: the broker answered and the other topic "+
+				"measured normally, so nothing here should surface as a collection error")
+
+		assert.Equal(t, 1, report.SubscribersMeasured,
+			"the measurement SUCCEEDED, which is exactly why this needs its own count")
+		assert.Zero(t, report.SubscribersFailed,
+			"a missing topic is a provisioning or registry fault, not a broker refusal, and "+
+				"conflating them would send an operator to check broker health")
+		assert.Equal(t, 1, report.SubscribersTopicMissing)
+		assert.False(t, report.SweepComplete,
+			"one of the subscriber's authorised topics has no lag series, so the inventory is not "+
+				"complete however healthy the topics that did measure look")
+		assert.Equal(t, 1, report.LagSeriesPublished,
+			"only the topic that exists yields a series; the missing one contributes none, which is "+
+				"the silence this count exists to break")
+	})
+}
+
+// TestEventMetricsCollector_BoundsEveryDependencyCall is the guard on OBS-17.
+//
+// A collection used to run on the process context, so a dependency that accepted a connection
+// and never answered blocked the loop indefinitely. The stall itself is not the damage: every
+// gauge holds its last value, so the whole event pipeline goes on being SCRAPED AS CURRENT while
+// nothing is being measured, and no value in any of those gauges could reveal it.
+//
+// The fake below never returns until its context is done, so the only thing that can end this
+// test is the deadline the collector imposes. A collector without one would hang here — which is
+// exactly the production failure, reproduced.
+func TestEventMetricsCollector_BoundsEveryDependencyCall(t *testing.T) {
+	outbox := &collectorBlockingOutbox{}
+	collector := NewEventMetricsCollector(outbox, nil, nil, nil).
+		WithTickBudget(500 * time.Millisecond).
+		WithCallBudget(100 * time.Millisecond)
+
+	started := time.Now()
+	report, err := collector.Collect(context.Background())
+	elapsed := time.Since(started)
+
+	require.Error(t, err, "an abandoned collection must be reported as a failure, not as a zero reading")
+	assert.NotEmpty(t, report.Failures)
+	assert.Less(t, elapsed, 2*time.Second,
+		"the collection must be abandoned on its own deadline; without one a hung dependency freezes "+
+			"the refresh of every gauge while they all keep being scraped as current")
+	assert.True(t, outbox.sawDeadline(),
+		"the deadline must be imposed on the DEPENDENCY CALL, so the call itself unblocks rather "+
+			"than the collector merely giving up on a goroutine that never returns")
+}
+
+// collectorBlockingOutbox blocks until its context is done, then reports whether that context
+// carried a deadline.
+//
+// It models the dependency failure a timeout cannot be tested without: a connection that is
+// accepted and never answered. A fake that returned an error instead would exercise the error
+// path and prove nothing about the bound.
+type collectorBlockingOutbox struct {
+	mu       sync.Mutex
+	deadline bool
+}
+
+func (o *collectorBlockingOutbox) CountEventOutboxByStatus(ctx context.Context, _ time.Time) (map[string]int64, error) {
+	_, hasDeadline := ctx.Deadline()
+
+	o.mu.Lock()
+	o.deadline = hasDeadline
+	o.mu.Unlock()
+
+	<-ctx.Done()
+
+	return nil, ctx.Err()
+}
+
+func (o *collectorBlockingOutbox) sawDeadline() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return o.deadline
+}
+
+// TestCollectionHealthAlerts_CoverEveryWayTheInventoryCanGoUnmeasured is the guard on the
+// measurability half of this file's alerting.
+//
+// # Why these rules need a test at all
+//
+// The condition rules fire on numbers. These fire on the ABSENCE of numbers, and an alert that is
+// supposed to catch a missing signal is uniquely easy to get wrong in a way nothing notices: it
+// evaluates cleanly, promtool validates it, the dashboards look fine, and the only symptom is
+// that it never fires — which is indistinguishable from the healthy case it was written to
+// exclude. Three specific mistakes are excluded here.
+//
+// AN UNSCOPED absent(). The collector is server-only, so the gauge is legitimately missing from
+// every blnk-worker target. An unscoped absent() would fire permanently on a correct deployment,
+// be silenced within a day, and take the one rule that distinguishes "no problems" from "no
+// collector" with it. The job selector is asserted verbatim.
+//
+// A REMEDIATION THAT HAS FALLEN BEHIND THE REASON VOCABULARY. SubscriberLagCoverageIncomplete
+// branches on blnk_kafka_subscribers_unmeasured's reason attribute and gives each value its own
+// action. A reason added to the Go vocabulary and not to the text leaves an operator mid-incident
+// holding a value the runbook does not explain, so every member of the real vocabulary is
+// required to appear.
+//
+// A DWELL SHORT ENOUGH TO BE NOISE. Coverage is legitimately incomplete on individual ticks
+// whenever the registry is larger than one sweep's budget, because the sweep rotates. A short
+// dwell would make this the noisiest rule in the file on exactly the large deployments that need
+// it most.
+//
+// Asserted against the KUBERNETES copy, for the reason the parity test exists: each file looks
+// correct alone, and the deployment reading the un-updated one is the one that pages nobody.
+func TestCollectionHealthAlerts_CoverEveryWayTheInventoryCanGoUnmeasured(t *testing.T) {
+	data := prometheusConfigMapData(t)
+
+	embeddedText, ok := data["blnk-kafka-alerts.yml"].(string)
+	require.True(t, ok, "the ConfigMap must carry the alert rules")
+
+	var rules map[string]interface{}
+	require.NoError(t, yaml.Unmarshal([]byte(embeddedText), &rules))
+
+	t.Run("the coverage rule names every unmeasured reason and its own action", func(t *testing.T) {
+		description := alertAnnotation(t, rules, "SubscriberLagCoverageIncomplete", "description")
+
+		for _, reason := range metrics.SubscriberUnmeasuredReasons() {
+			assert.Contains(t, description, reason,
+				"reason %q is published by the collector but not explained by the remediation, so an "+
+					"operator reading this page would find a value in the metric that the runbook "+
+					"does not account for", reason)
+		}
+
+		// The metric itself has to be named, or the reason breakdown the branches refer to is
+		// unreachable from the notification.
+		assert.Contains(t, description, "blnk_kafka_subscribers_unmeasured",
+			"the remediation branches on a reason attribute, so it must say which series carries it")
+
+		// The budget branch is the only one whose action is a configuration change, and the
+		// variable name is the actionable part.
+		assert.Contains(t, description, "EVENT_METRICS_SUBSCRIBER_BUDGET",
+			"the budget reason is resolved by raising the budget, so the variable must be named")
+	})
+
+	t.Run("the absence rule is scoped to the one role that runs a collector", func(t *testing.T) {
+		expression := alertExpression(t, rules, "EventMetricsCollectionAbsent")
+
+		assert.Contains(t, expression, `job="blnk-server"`,
+			"the collector is server-only, so an unscoped absent() fires for ever on every worker "+
+				"target and the rule that distinguishes 'no problems' from 'no collector' gets silenced")
+		assert.Contains(t, expression, "absent(",
+			"this is the one condition in the file that IS absence, and it must be stated rather "+
+				"than inferred from a missing condition series")
+	})
+
+	t.Run("the two collection-health rules ask different questions", func(t *testing.T) {
+		// A collector whose database is refusing connections ticks perfectly on schedule: the
+		// collection age stays near zero throughout and only the success age rises. Pointing both
+		// rules at the same gauge would report a healthy monitoring pipeline while every gauge it
+		// could not compute went stale, which is the exact failure the pair exists to separate.
+		stale := alertExpression(t, rules, "EventMetricsCollectionStale")
+		failing := alertExpression(t, rules, "EventMetricsCollectionFailing")
+
+		assert.Contains(t, stale, "blnk_event_metrics_last_collection_age_seconds",
+			"'is the loop running' is answered by the collection age")
+		assert.Contains(t, failing, "blnk_event_metrics_last_success_age_seconds",
+			"'is the loop achieving anything' is answered by the success age, and only by it")
+		assert.NotEqual(t, stale, failing,
+			"two rules over one gauge would leave a ticking-but-failing collector undetected")
+	})
+
+	t.Run("the coverage rule dwells long enough to survive a rotating sweep", func(t *testing.T) {
+		// Rotation means a registry larger than the per-tick budget legitimately reports
+		// incomplete coverage on most ticks. Anything under half an hour turns that into a
+		// standing page on precisely the deployments the rule matters for.
+		assert.Equal(t, "30m", alertField(t, rules, "SubscriberLagCoverageIncomplete", "for"),
+			"a short dwell fires permanently on any registry the budget cannot cover in one tick")
+	})
+}
+
+// alertExpression returns the expr of one named alert from a parsed rules document.
+//
+// Separate from alertAnnotation because the expression is not an annotation, and because a rule
+// whose expression this cannot find must fail loudly rather than be asserted against "".
+//
+// Returns:
+//   - string: the alert's PromQL expression.
+func alertExpression(t *testing.T, rules map[string]interface{}, alert string) string {
+	t.Helper()
+
+	return alertField(t, rules, alert, "expr")
+}
+
+// alertField returns one top-level string field of one named alert.
+//
+// Returns:
+//   - string: the field's value. The test fails when the alert or the field is absent, so a
+//     renamed alert cannot make an assertion pass vacuously.
+func alertField(t *testing.T, rules map[string]interface{}, alert, field string) string {
+	t.Helper()
+
+	groups, ok := rules["groups"].([]interface{})
+	require.True(t, ok, "the rules document must carry groups")
+
+	for _, group := range groups {
+		entries, ok := group.(map[string]interface{})
+		require.True(t, ok)
+
+		ruleList, ok := entries["rules"].([]interface{})
+		require.True(t, ok)
+
+		for _, rule := range ruleList {
+			declared, ok := rule.(map[string]interface{})
+			require.True(t, ok)
+
+			if declared["alert"] != alert {
+				continue
+			}
+
+			value, ok := declared[field].(string)
+			require.True(t, ok, "alert %s must carry a string %s", alert, field)
+
+			return value
+		}
+	}
+
+	t.Fatalf("no alert named %s is declared", alert)
+
+	return ""
+}
+
+// TestRunbookURLs_ResolveToTheRulesOwnProcedure covers F13.
+//
+// # What a bare repository path costs
+//
+// Every runbook_url was `docs/kafka-operations.md`: no scheme, no host, no fragment. An
+// Alertmanager notification renders that verbatim into a chat message, an email or a paging
+// vendor's payload, where a repository-relative path resolves to NOTHING — and even followed by
+// hand it landed at the top of a 1,200-line document rather than at the procedure for the rule
+// that fired. All eight rules pointed at the same place, so the link carried no information
+// about the alert at all.
+//
+// Three properties are asserted, and each covers a different way the link can be useless:
+//
+//   - RESOLVABLE. An absolute https URL, so a notification's reader can open it.
+//   - RULE-SPECIFIC. A fragment naming the rule, so it lands on that rule's own section.
+//   - ANCHORED IN REALITY. The fragment must correspond to a heading that actually exists in
+//     the document, which is the assertion that keeps the link working as the runbook is
+//     edited. A dangling fragment silently degrades to "the top of the document", which is
+//     exactly the state this finding was about.
+//
+// Both copies are checked, for the reason the parity test exists: each file reads correctly
+// alone, and the deployment holding the un-updated one is the one whose responders get nothing.
+func TestRunbookURLs_ResolveToTheRulesOwnProcedure(t *testing.T) {
+	root := moduleRootDir(t)
+	headings := runbookHeadingAnchors(t, filepath.Join(root, "docs", "kafka-operations.md"))
+
+	rootRules := readYAMLFile(t, filepath.Join(root, "alerts", "blnk-kafka-alerts.yml"))
+
+	embeddedText, ok := prometheusConfigMapData(t)["blnk-kafka-alerts.yml"].(string)
+	require.True(t, ok, "the ConfigMap must carry the alert rules")
+
+	var embeddedRules map[string]interface{}
+	require.NoError(t, yaml.Unmarshal([]byte(embeddedText), &embeddedRules))
+
+	copies := map[string]map[string]interface{}{
+		"alerts/blnk-kafka-alerts.yml":                           rootRules,
+		"infrastructure/k8s-manifests/prometheus-configmap.yaml": embeddedRules,
+	}
+
+	for name, rules := range copies {
+		t.Run(name, func(t *testing.T) {
+			alerts := alertNames(t, rules)
+			require.NotEmpty(t, alerts)
+
+			for _, alert := range alerts {
+				raw := alertAnnotation(t, rules, alert, "runbook_url")
+
+				// The DEFAULT rendering: no runbook_base_url external label configured, which
+				// is what an out-of-the-box deployment has.
+				rendered := renderPrometheusAnnotation(t, raw, nil)
+
+				assert.True(t, strings.HasPrefix(rendered, "https://"),
+					"%s: runbook_url must render to an absolute URL a notification can open, got %q",
+					alert, rendered)
+
+				fragment := strings.ToLower(alert)
+				assert.True(t, strings.HasSuffix(rendered, "#"+fragment),
+					"%s: runbook_url must end in its own fragment #%s so the link lands on that "+
+						"rule's procedure rather than at the top of the document, got %q",
+					alert, fragment, rendered)
+
+				assert.Contains(t, headings, fragment,
+					"%s: the fragment #%s corresponds to no heading in docs/kafka-operations.md, so "+
+						"the link degrades to the top of the document — which is the state this "+
+						"finding was about", alert, fragment)
+
+				// The OVERRIDE rendering: a deployment that publishes its own runbook copy.
+				overridden := renderPrometheusAnnotation(t, raw, map[string]string{
+					"runbook_base_url": "https://runbooks.example/blnk",
+				})
+				assert.Equal(t, "https://runbooks.example/blnk#"+fragment, overridden,
+					"%s: a deployment that sets the runbook_base_url external label must get its "+
+						"own documentation base, with the rule fragment preserved", alert)
+			}
+		})
+	}
+}
+
+// renderPrometheusAnnotation expands an annotation the way Prometheus does.
+//
+// Prometheus prepends a PRELUDE declaring $labels, $externalLabels, $externalURL and $value and
+// then executes the annotation as a text/template. That prelude is emulated rather than the
+// variables being string-substituted, because substitution would also rewrite an occurrence
+// inside a quoted string and would not report an undefined variable — and an undefined variable
+// is a real failure mode here: Prometheus logs it and DROPS the annotation, so the alert fires
+// with no runbook link and nothing says why.
+//
+// Parameters:
+//   - t *testing.T: the test; a template error is a hard failure.
+//   - raw string: the annotation as written in the rule file.
+//   - external map[string]string: the external labels. Nil means none configured.
+//
+// Returns:
+//   - string: the expanded annotation.
+func renderPrometheusAnnotation(t *testing.T, raw string, external map[string]string) string {
+	t.Helper()
+
+	if external == nil {
+		external = map[string]string{}
+	}
+
+	const prelude = `{{$labels := .Labels}}{{$externalLabels := .ExternalLabels}}` +
+		`{{$externalURL := .ExternalURL}}{{$value := .Value}}`
+
+	parsed, err := template.New("annotation").Parse(prelude + raw)
+	require.NoError(t, err, "the annotation must be a template Prometheus can parse: %q", raw)
+
+	var built strings.Builder
+	require.NoError(t, parsed.Execute(&built, struct {
+		Labels         map[string]string
+		ExternalLabels map[string]string
+		ExternalURL    string
+		Value          float64
+	}{
+		Labels:         map[string]string{},
+		ExternalLabels: external,
+		ExternalURL:    "http://prometheus:9090",
+	}), "the annotation must execute with the variables Prometheus binds: %q", raw)
+
+	return built.String()
+}
+
+// runbookHeadingAnchors returns the GitHub-style anchor of every heading in a markdown file.
+//
+// The derivation mirrors GitHub's: lowercase, drop everything that is not alphanumeric, space,
+// hyphen or underscore, then replace spaces with hyphens. It is approximate for exotic headings
+// and exact for the plain ones the alert fragments target, which is what this is used for.
+//
+// Parameters:
+//   - t *testing.T: the test; an unreadable document is a hard failure.
+//   - path string: the markdown file.
+//
+// Returns:
+//   - map[string]bool: the anchors present.
+func runbookHeadingAnchors(t *testing.T, path string) map[string]bool {
+	t.Helper()
+
+	body, err := os.ReadFile(path)
+	require.NoError(t, err, "%s must be readable to verify the alert fragments resolve", path)
+
+	heading := regexp.MustCompile(`^#{2,4}\s+(.+?)\s*$`)
+	strip := regexp.MustCompile(`[^a-z0-9 \-_]`)
+
+	anchors := make(map[string]bool)
+	for _, line := range strings.Split(string(body), "\n") {
+		match := heading.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+
+		anchor := strings.ReplaceAll(
+			strings.TrimSpace(strip.ReplaceAllString(strings.ToLower(match[1]), "")), " ", "-",
+		)
+		anchors[anchor] = true
+	}
+
+	return anchors
+}
+
+// alertNames returns every alert name declared in a parsed rules document, in file order.
+//
+// Derived from the file rather than hard-coded so a rule added later is covered automatically —
+// which matters for the runbook-link assertions: a new rule with a bare path would otherwise
+// slip in beside eight correct ones.
+//
+// Returns:
+//   - []string: the alert names.
+func alertNames(t *testing.T, rules map[string]interface{}) []string {
+	t.Helper()
+
+	groups, ok := rules["groups"].([]interface{})
+	require.True(t, ok, "the rules document must carry groups")
+
+	var names []string
+	for _, group := range groups {
+		entries, ok := group.(map[string]interface{})
+		require.True(t, ok)
+
+		ruleList, ok := entries["rules"].([]interface{})
+		require.True(t, ok)
+
+		for _, rule := range ruleList {
+			declared, ok := rule.(map[string]interface{})
+			require.True(t, ok)
+
+			name, ok := declared["alert"].(string)
+			require.True(t, ok, "every rule must declare an alert name")
+			names = append(names, name)
+		}
+	}
+
+	return names
+}
+
+// CountEventSubscribers reports the registry size and counts its calls, so a test can assert the
+// collector reads it ONCE per tick — the aggregate exists so that sizing the registry does not
+// cost more as it grows, and a per-subscriber read would defeat that.
+//
+// Defaults to len(rows) so every pre-existing case describes a consistent registry without
+// restating its size; total overrides it for the budget cases, where the point is that the sweep
+// cannot see the whole registry.
+func (r *collectorFakeRegistry) CountEventSubscribers(_ context.Context) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.totalCall++
+
+	if r.totalErr != nil {
+		return 0, r.totalErr
+	}
+
+	if r.total != nil {
+		return *r.total, nil
+	}
+
+	return int64(len(r.rows)), nil
+}
+
+// TestEventMetricsCollector_PublishesHowMuchOfTheLagSignalIsMissing is SEC-10.
+//
+// # The failure being closed
+//
+// The budget above stops the enumeration, and that was reported as a BOOLEAN in the report and
+// a WARN in the log. Neither is actionable. A subscriber the sweep did not reach has no
+// blnk_kafka_consumer_lag series at all — not a stale one, not a zero one, none — so
+// SubscriberConsumerLagHigh has nothing to evaluate and the subscriber can fall arbitrarily far
+// behind while every dashboard and every alert reads clean. An operator watching those
+// dashboards sees health. The only trace was a log line nobody reads at the moment it begins
+// to matter, and the boolean could not distinguish one unmeasured subscriber from a thousand.
+//
+// So the shortfall is published as a metric, with the registry size beside it, and
+// ConsumerLagCoverageIncomplete fires on any non-zero value.
+//
+// # Why each arm is asserted separately
+//
+// The shortfall is derived from rows actually EXAMINED rather than from the budget flag, which
+// makes it cover four distinct situations with one number. Each is a different bug if it
+// reports zero, and only the first is the one the finding named:
+//
+//   - the budget stopped the sweep;
+//   - the sweep broke early on a repository error;
+//   - no broker is configured, so nothing was measurable at all;
+//   - no registry is wired, so there is nothing to be unmeasured.
+func TestEventMetricsCollector_PublishesHowMuchOfTheLagSignalIsMissing(t *testing.T) {
+	t.Run("the budget's shortfall is published as a number, not a boolean", func(t *testing.T) {
+		gauges := captureCoverageGauges(t)
+
+		// A registry of 900 served through pages the sweep will stop paging, so the
+		// unmeasured population is one the fixtures never have to enumerate. This is the
+		// production shape: the rows past the budget are never read.
+		rows := make([]model.EventSubscriber, 0, 30)
+		for i := 0; i < 30; i++ {
+			rows = append(rows, collectorSubscriber("blnk.transactions"))
+		}
+		total := int64(900)
+
+		registry := &collectorFakeRegistry{rows: rows, total: &total}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), registry, nil, newCollectorFakeAdmin(),
+		).WithSubscriberBudget(10)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		require.True(t, report.BudgetReached, "the fixture must actually reach the budget")
+		assert.Equal(t, int64(900), report.SubscribersRegistered)
+		assert.Equal(t, int64(890), report.SubscribersUnmeasured,
+			"890 subscribers have no lag series: 900 registered less the 10 the budget allowed")
+
+		assert.Equal(t, []int64{890}, gauges.unmeasured.perTickTotals(t, collectorUnmeasuredReasons),
+			"the shortfall must reach the gauge ConsumerLagCoverageIncomplete evaluates")
+		assert.Equal(t, []int64{900}, gauges.registered.values(),
+			"the registry size must accompany it, or 890 cannot be read as a proportion")
+
+		// The LOG still carries it too, with the variable an operator has to change. The
+		// metric replaces the log as the ALERTING channel, not as the diagnostic one.
+		assert.Contains(t, report.LogFields(), "subscribers_unmeasured")
+		assert.Contains(t, report.LogFields(), "subscribers_registered")
+	})
+
+	t.Run("complete coverage publishes an explicit zero on every tick", func(t *testing.T) {
+		// The zero is the measurement that says the signal is complete, and it has to be
+		// written every tick: a gauge only written when something is wrong cannot
+		// distinguish a healthy system from a collector that has stopped.
+		gauges := captureCoverageGauges(t)
+
+		registry := &collectorFakeRegistry{rows: []model.EventSubscriber{
+			collectorSubscriber("blnk.transactions"),
+			collectorSubscriber("blnk.balances"),
+		}}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), registry, nil, newCollectorFakeAdmin(),
+		).WithSubscriberBudget(50)
+
+		for tick := 0; tick < 3; tick++ {
+			report, err := collector.Collect(context.Background())
+			require.NoError(t, err)
+
+			assert.False(t, report.BudgetReached)
+			assert.Zero(t, report.SubscribersUnmeasured)
+			assert.Equal(t, int64(2), report.SubscribersRegistered)
+		}
+
+		assert.Equal(t, []int64{0, 0, 0}, gauges.unmeasured.perTickTotals(t, collectorUnmeasuredReasons),
+			"zero is published on every tick, not omitted when healthy")
+		assert.Equal(t, []int64{2, 2, 2}, gauges.registered.values())
+	})
+
+	t.Run("with no broker every registered subscriber is unmeasured", func(t *testing.T) {
+		// Reporting zero here would be the same false reassurance in a different disguise:
+		// a deployment that has lost its broker has lost its lag signal completely, and
+		// that is precisely the condition worth surfacing.
+		gauges := captureCoverageGauges(t)
+
+		total := int64(4)
+		registry := &collectorFakeRegistry{
+			rows:  []model.EventSubscriber{collectorSubscriber("blnk.transactions")},
+			total: &total,
+		}
+		admin := newCollectorFakeAdmin()
+		admin.configured = false
+
+		collector := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, admin)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Equal(t, int64(4), report.SubscribersRegistered)
+		assert.Equal(t, int64(4), report.SubscribersUnmeasured,
+			"no broker means no offsets to difference, so every registered subscriber is unmeasured")
+		assert.Equal(t, []int64{4}, gauges.unmeasured.perTickTotals(t, collectorUnmeasuredReasons))
+		assert.Equal(t, []int64{4}, gauges.registered.values())
+
+		assert.Empty(t, registry.snapshotPages(),
+			"the registry must not be paged when nothing can be measured; the count answers it")
+	})
+
+	t.Run("with no registry the pair is an honest zero rather than an absence", func(t *testing.T) {
+		gauges := captureCoverageGauges(t)
+
+		collector := NewEventMetricsCollector(newCollectorFakeOutbox(), nil, nil, newCollectorFakeAdmin())
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Zero(t, report.SubscribersRegistered)
+		assert.Zero(t, report.SubscribersUnmeasured)
+		assert.Equal(t, []int64{0}, gauges.unmeasured.perTickTotals(t, collectorUnmeasuredReasons),
+			"nothing is registered, so nothing is unmeasured — and saying so is not the same as saying nothing")
+		assert.Equal(t, []int64{0}, gauges.registered.values())
+	})
+
+	t.Run("a sweep that broke early reports the rows it never reached", func(t *testing.T) {
+		// The listing failure and the budget are DIFFERENT CAUSES with the SAME
+		// consequence, which is why the number is derived from rows examined rather than
+		// from the budget flag. BudgetReached distinguishes the causes; the shortfall
+		// states the fact either way.
+		gauges := captureCoverageGauges(t)
+
+		total := int64(12)
+		registry := &collectorFakeRegistry{err: errors.New("relation does not exist"), total: &total}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), registry, nil, newCollectorFakeAdmin(),
+		).WithSubscriberBudget(50)
+
+		report, err := collector.Collect(context.Background())
+		require.Error(t, err, "a listing failure is still reported as a failure")
+
+		assert.False(t, report.BudgetReached, "the budget was not the cause here")
+		assert.Equal(t, int64(12), report.SubscribersRegistered)
+		assert.Equal(t, int64(12), report.SubscribersUnmeasured,
+			"the sweep examined nothing, so every registered subscriber is unmeasured")
+		assert.Equal(t, []int64{12}, gauges.unmeasured.perTickTotals(t, collectorUnmeasuredReasons),
+			"a failed enumeration must publish its coverage gap, not skip publishing")
+	})
+
+	t.Run("a failure to size the registry is recorded and stepped past", func(t *testing.T) {
+		// The count is an observation ABOUT an observation. Refusing to measure lag
+		// because the registry could not be sized would convert a reporting gap into a
+		// total one, so the sweep proceeds and the failure is reported.
+		gauges := captureCoverageGauges(t)
+
+		registry := &collectorFakeRegistry{
+			rows:     []model.EventSubscriber{collectorSubscriber("blnk.transactions")},
+			totalErr: errors.New("statement timeout"),
+		}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), registry, nil, newCollectorFakeAdmin(),
+		).WithSubscriberBudget(50)
+
+		report, err := collector.Collect(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "counting event subscribers",
+			"the failure must name the read that failed, since the remediation differs from a listing failure")
+
+		assert.Equal(t, 1, report.SubscribersMeasured,
+			"lag is still measured for the subscribers the sweep could reach")
+		assert.Zero(t, report.SubscribersRegistered, "an unknown registry size is not invented")
+		assert.Equal(t, []int64{0}, gauges.unmeasured.perTickTotals(t, collectorUnmeasuredReasons),
+			"with no size to compare against, no shortfall can be claimed")
+	})
+
+	t.Run("a registry that grew mid-sweep never reports a negative shortfall", func(t *testing.T) {
+		// The count and the sweep are separate reads, so the registry can shrink between
+		// them — or the sweep can examine rows a stale count did not include. A negative
+		// shortfall would render as an enormous unsigned value on a gauge and page
+		// somebody at the least useful moment.
+		gauges := captureCoverageGauges(t)
+
+		rows := make([]model.EventSubscriber, 0, 6)
+		for i := 0; i < 6; i++ {
+			rows = append(rows, collectorSubscriber("blnk.transactions"))
+		}
+		stale := int64(2)
+
+		registry := &collectorFakeRegistry{rows: rows, total: &stale}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), registry, nil, newCollectorFakeAdmin(),
+		).WithSubscriberBudget(50)
+
+		report, err := collector.Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Equal(t, 6, report.SubscribersMeasured)
+		assert.Zero(t, report.SubscribersUnmeasured, "floored at zero, never negative")
+		assert.Equal(t, []int64{0}, gauges.unmeasured.perTickTotals(t, collectorUnmeasuredReasons))
+	})
+
+	t.Run("the registry is sized once per tick, not once per subscriber", func(t *testing.T) {
+		// The reason it is an aggregate: observing how big the registry is must not cost
+		// more as it grows. A per-subscriber read would defeat that and would make the
+		// coverage measurement itself the thing that overruns the interval.
+		rows := make([]model.EventSubscriber, 0, 8)
+		for i := 0; i < 8; i++ {
+			rows = append(rows, collectorSubscriber("blnk.transactions"))
+		}
+
+		registry := &collectorFakeRegistry{rows: rows}
+		collector := NewEventMetricsCollector(
+			newCollectorFakeOutbox(), registry, nil, newCollectorFakeAdmin(),
+		).WithSubscriberBudget(50)
+
+		for tick := 0; tick < 2; tick++ {
+			_, err := collector.Collect(context.Background())
+			require.NoError(t, err)
+		}
+
+		registry.mu.Lock()
+		calls := registry.totalCall
+		registry.mu.Unlock()
+
+		assert.Equal(t, 2, calls, "exactly one count per tick, whatever the registry holds")
+	})
+}
+
+// TestRelayDefaults_AgreeWithTheCollector pins two constants that must hold the same value and
+// cannot be one constant.
+//
+// config.defaultRelay.SubscriberMetricsBudget is what an unset RELAY_SUBSCRIBER_METRICS_BUDGET
+// resolves to; blnk.DefaultSubscriberMetricsBudget is what the collector falls back to when it
+// is constructed without a budget. They are separate declarations because package config cannot
+// import the root package — the root package imports config — so nothing but a test can keep
+// them equal.
+//
+// Their divergence would be silent and would matter in one direction specifically. If the
+// config default were the larger, an operator reading .env.example or the ConfigMap would
+// believe a coverage figure the collector never applied; if the collector's were the larger, a
+// deployment would measure fewer subscribers than its documented budget. Either way the
+// documented number and the enforced number differ, on the one control whose whole purpose is
+// to make monitoring coverage explicit.
+func TestRelayDefaults_AgreeWithTheCollector(t *testing.T) {
+	// config.ConfigStore is process-global and MockConfig writes it, so it is snapshotted
+	// and restored: a leaked configuration would make every later test in this package read
+	// this one's.
+	previous := config.ConfigStore.Load()
+	t.Cleanup(func() {
+		if previous != nil {
+			config.ConfigStore.Store(previous)
+
+			return
+		}
+		config.ConfigStore.Store(&config.Configuration{})
+	})
+
+	// The two DSNs are the only required fields; everything else is defaulted, which is what
+	// makes this fixture a reading of the DEFAULTS rather than of anything stated here.
+	configured := &config.Configuration{
+		DataSource: config.DataSourceConfig{Dns: "mock-dns"},
+		Redis:      config.RedisConfig{Dns: "localhost:6379"},
+	}
+	config.MockConfig(configured)
+
+	// MockConfig returns without storing when validation fails, and it defaults IN PLACE, so
+	// a zero budget here would mean the defaults never ran and the comparison below would be
+	// vacuous rather than failing.
+	require.NotZero(t, configured.Relay.SubscriberMetricsBudget,
+		"the configuration defaults must have been applied for this comparison to mean anything")
+
+	require.Equal(t, DefaultSubscriberMetricsBudget, configured.Relay.SubscriberMetricsBudget,
+		"config's relay default and the collector's fallback must be the same number: they are two "+
+			"declarations of one budget, and only this test keeps them equal")
+	assert.Equal(t, 200, DefaultSubscriberMetricsBudget,
+		"200 is the documented default in .env.example, blnk-config.yaml, docs/metrics.md and the "+
+			"ConsumerLagCoverageIncomplete remediation; changing it means changing all of them")
+
+	t.Run("the configured value is what the collector is wired with", func(t *testing.T) {
+		// cmd/server.go passes cfg.Relay.SubscriberMetricsBudget into WithSubscriberBudget.
+		// Before SEC-10 nothing called that configurator at all, so every deployment ran on
+		// the built-in 200 with no way to raise it short of a code change — which is why
+		// this asserts the plumbing and not only the constants.
+		collector := NewEventMetricsCollector(nil, nil, nil, nil).
+			WithSubscriberBudget(configured.Relay.SubscriberMetricsBudget)
+
+		assert.Equal(t, 200, collector.subscriberBudget)
+
+		raised := NewEventMetricsCollector(nil, nil, nil, nil).WithSubscriberBudget(5000)
+		assert.Equal(t, 5000, raised.subscriberBudget,
+			"a raised budget must reach the collector, or the variable is decorative")
+	})
 }

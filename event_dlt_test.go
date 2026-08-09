@@ -178,8 +178,8 @@ var dltCategoryRoutes = []dltCategoryRoute{
 	},
 	{
 		eventType:       "ledger.created",
-		originalTopic:   "blnk.ledgers",
-		deadLetterTopic: "blnk.ledgers.dlt",
+		originalTopic:   "blnk.system",
+		deadLetterTopic: "blnk.system.dlt",
 	},
 	{
 		eventType:       "system.error",
@@ -195,15 +195,12 @@ var dltAllDeadLetterTopics = []string{
 	"blnk.transactions.dlt",
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
-	// The grantable ledgers category's sibling. A dead-letter topic is never grantable, so
-	// this one is as operator-facing as any other; what its category being grantable changes
-	// is only which events can land here.
-	"blnk.ledgers.dlt",
-	// The internal system category's sibling. That category also holds events whose type
-	// the catalogue does not recognise, and those are exactly the events most likely to
-	// fail to publish, so its dead-letter topic must be covered by the age gauge like
-	// any other — a stalled entry there being invisible would hide the failure of an
-	// event that was already a routing defect.
+	// The system category's sibling. That category holds ledger.created, system.error and
+	// every event whose type the catalogue does not recognise, and those last are exactly
+	// the events most likely to fail to publish, so its dead-letter topic must be covered
+	// by the age gauge like any other — a stalled entry there being invisible would hide
+	// the failure of an event that was already a routing defect. A dead-letter topic is
+	// never grantable, whatever its category is.
 	"blnk.system.dlt",
 }
 
@@ -231,10 +228,13 @@ type dltMarkRecord struct {
 }
 
 // dltPageRequest is one recorded ListDeadLetteredEvents call.
-type dltPageRequest struct {
-	limit  int
-	offset int
-}
+//
+// It is the repository's own narrowing contract rather than a limit/offset pair of this
+// file's own invention, because that is now the WHOLE of what the service asks the
+// repository for. Recording anything narrower would make the test unable to see the
+// defect it exists to prevent: a filter that the service accepts and then fails to pass
+// down would be invisible if only the page were captured.
+type dltPageRequest = model.DeadLetterQuery
 
 // dltFakeStore is an in-memory eventDeadLetterStore.
 //
@@ -247,6 +247,13 @@ type dltPageRequest struct {
 //   - ListDeadLetteredEvents pages an inventory held in the repository's own order —
 //     newest occurrence first — so offset arithmetic is exercised the way production
 //     exercises it, including the oldest-end walk the age gauge performs.
+//   - ListDeadLetteredEventsFiltered and CountDeadLetteredEvents apply the filter
+//     PREDICATES THEMSELVES, mirroring deadLetterFilterClause: exact comparison, a status
+//     filter replacing the two-state default, limit and offset counting MATCHES rather
+//     than rows, and both narrowing off the same inventory so the listing and the count
+//     cannot silently describe different sets. Modelling the predicates here rather than
+//     in the service is the point — it is what makes a service that filtered in Go fail
+//     these tests.
 //   - MarkEventDispatched MUTATES the row to dispatched and DROPS IT from the inventory,
 //     which is what the real query does implicitly by filtering on the two terminal
 //     failure states. That is what makes "a replayed event is no longer listed" and "a
@@ -266,20 +273,55 @@ type dltFakeStore struct {
 	counts map[string]int64
 
 	// Injectable failures, each covering one documented error path.
+	//
+	// listErr covers BOTH listing entry points, because both are the same statement to a
+	// caller: a repository that cannot page the inventory cannot page a filtered slice of
+	// it either, and a fake that failed only one would let a propagation test pass while
+	// the path the API actually uses swallowed the error.
 	getErr              error
 	listErr             error
 	countErr            error
+	countDeadLetterErr  error
 	markDeadLetteredErr error
 	markDispatchedErr   error
 	claimReplayErr      error
 	releaseReplayErr    error
 
 	// Recorded calls.
-	deadLettered  []dltMarkRecord
-	dispatched    []dltDispatchRecord
-	listCalls     []dltPageRequest
-	getCalls      []string
-	countCalls    int
+	deadLettered []dltMarkRecord
+	dispatched   []dltDispatchRecord
+	listCalls    []dltPageRequest
+	getCalls     []string
+	countCalls   int
+
+	// countDeadLetterCalls records the narrowing every CountDeadLetteredEvents call was
+	// given, so a test can assert the total was counted over the SAME predicate as the
+	// page rather than over the whole table.
+	countDeadLetterCalls []dltPageRequest
+
+	// inventoryQueries and countQueries record the query every SQL-narrowed inventory read
+	// and count was given, so a test can prove the predicate reached the repository rather
+	// than being applied above it.
+	inventoryQueries []model.DeadLetterQuery
+
+	// inventoryPages records the KEYSET request each inventory read was made with, so a test can
+	// assert the limit the repository was asked for and the cursor it was handed — neither of
+	// which survives the narrowing recorded above.
+	inventoryPages []model.DeadLetterInventoryQuery
+	countQueries   []model.DeadLetterQuery
+
+	// ageCalls counts the grouped age reads and ageErr drives their failure, so the gauge's
+	// degraded path is reachable and the aggregate is provably read once per refresh rather
+	// than once per topic.
+	ageCalls int
+	ageErr   error
+
+	// resolveCalls records every MarkEventDeadLetterResolved call and resolveErr drives its
+	// failure, so a service that resolved without recording — or that reported success on a
+	// write the repository refused — is visible here.
+	resolveCalls []dltResolveRecord
+	resolveErr   error
+
 	replayClaims  []string
 	replayRelease []dltReleaseRecord
 
@@ -302,6 +344,18 @@ type dltDispatchRecord struct {
 	// record is the broker coordinate of the REPLAY write, so a replayed row names the new
 	// record rather than the dead-letter one it was read from.
 	record model.BrokerRecord
+}
+
+// dltResolveRecord is one MarkEventDeadLetterResolved call: the operator decision that
+// makes a dead-lettered row eligible for retention.
+//
+// The instant is recorded because the service supplies it rather than the repository
+// generating one, which is what lets a test assert that the value reported to the caller
+// is the value stored.
+type dltResolveRecord struct {
+	eventID string
+	note    string
+	at      time.Time
 }
 
 // dltReleaseRecord is one ReleaseEventReplay call: the rollback that keeps a failed
@@ -335,7 +389,7 @@ func (s *dltFakeStore) withRow(row model.EventOutbox) *dltFakeStore {
 	stored := row
 	s.rows[row.EventID] = &stored
 
-	// BOTH failure states join the inventory, matching ListDeadLetteredEvents, which covers
+	// BOTH failure states join the inventory, matching ListDeadLetterInventory, which covers
 	// dead_lettered and failed. failed especially: a failed row whose dlt_topic is still NULL
 	// is the "dead-letter write is owed" state, so while it sits there its event exists in no
 	// topic at all, which makes it the one an operator most needs to see.
@@ -382,38 +436,113 @@ func (s *dltFakeStore) GetEventByID(_ context.Context, eventID string) (*model.E
 	return &copied, nil
 }
 
-// ListDeadLetteredEvents pages the inventory, newest first.
-func (s *dltFakeStore) ListDeadLetteredEvents(_ context.Context, limit, offset int) ([]model.EventOutbox, error) {
+// ListDeadLetteredEvents applies the query's narrowing and then pages what matches,
+// newest first.
+//
+// The FILTERING HAPPENS HERE, in the fake repository, because that is where it happens in
+// production: the predicates are rendered into the SQL WHERE clause. It used to happen in
+// the service, above this boundary, and a fake that still filtered above would let a
+// service which silently dropped a filter pass.
+//
+// The consequence for the page arithmetic is the one that matters: limit and offset are
+// applied to the MATCHING rows, so a filtered page is a page of the filtered set rather
+// than a filtered page of the unfiltered one.
+func (s *dltFakeStore) ListDeadLetteredEvents(_ context.Context, query model.DeadLetterQuery) ([]model.EventOutbox, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.listCalls = append(s.listCalls, dltPageRequest{limit: limit, offset: offset})
+	s.listCalls = append(s.listCalls, query)
 
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
 
-	if offset >= len(s.inventory) {
+	matching := s.matchingLocked(query)
+
+	limit := query.Limit
+	if limit <= 0 {
+		limit = defaultDeadLetterListLimit
+	}
+	offset := query.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	if offset >= len(matching) {
 		// The repository returns a nil slice for a page past the end. Reproducing that
 		// exactly is what lets the nil-to-empty normalisation be asserted.
 		return nil, nil
 	}
 
 	end := offset + limit
-	if end > len(s.inventory) {
-		end = len(s.inventory)
+	if end > len(matching) {
+		end = len(matching)
 	}
 
 	page := make([]model.EventOutbox, 0, end-offset)
-	for _, eventID := range s.inventory[offset:end] {
-		page = append(page, *s.rows[eventID])
-	}
+	page = append(page, matching[offset:end]...)
 
 	return page, nil
 }
 
+// CountDeadLetteredEvents counts what the SAME narrowing matches, ignoring the page.
+//
+// It is deliberately driven from matchingLocked, the same predicate the listing uses, so
+// this fake cannot exhibit the very defect the production count exists to rule out — a
+// total describing a different set than the page it accompanies.
+func (s *dltFakeStore) CountDeadLetteredEvents(_ context.Context, query model.DeadLetterQuery) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.countDeadLetterCalls = append(s.countDeadLetterCalls, query)
+
+	if s.countDeadLetterErr != nil {
+		return 0, s.countDeadLetterErr
+	}
+
+	return int64(len(s.matchingLocked(query))), nil
+}
+
+// matchingLocked returns the inventory rows the query's predicates admit, in repository
+// order. The caller must hold the mutex.
+//
+// Comparison is exact and case-sensitive throughout, and the topic predicate is applied to
+// the row's ORIGINAL topic column, both matching the SQL. The occurrence window is
+// inclusive at both ends, so a window whose bounds are equal selects the events at exactly
+// that instant.
+func (s *dltFakeStore) matchingLocked(query model.DeadLetterQuery) []model.EventOutbox {
+	eventType := strings.TrimSpace(query.EventType)
+	topic := strings.TrimSpace(query.Topic)
+	status := strings.TrimSpace(query.Status)
+
+	matching := make([]model.EventOutbox, 0, len(s.inventory))
+	for _, eventID := range s.inventory {
+		row := *s.rows[eventID]
+
+		if eventType != "" && row.EventType != eventType {
+			continue
+		}
+		if topic != "" && row.Topic != topic {
+			continue
+		}
+		if status != "" && row.Status != status {
+			continue
+		}
+		if !query.OccurredFrom.IsZero() && row.OccurredAt.Before(query.OccurredFrom) {
+			continue
+		}
+		if !query.OccurredTo.IsZero() && row.OccurredAt.After(query.OccurredTo) {
+			continue
+		}
+
+		matching = append(matching, row)
+	}
+
+	return matching
+}
+
 // CountEventOutboxByStatus returns a copy of the status counts.
-func (s *dltFakeStore) CountEventOutboxByStatus(_ context.Context) (map[string]int64, error) {
+func (s *dltFakeStore) CountEventOutboxByStatus(_ context.Context, _ time.Time) (map[string]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -690,6 +819,28 @@ func (s *dltFakeStore) snapshotDispatchedIDs() []int64 {
 	return ids
 }
 
+// dltFilterMatches was a free-function matcher for a dead-letter narrowing. It is RETIRED,
+// and with it goes a claim of SQL fidelity it no longer had.
+//
+// deadLetterFilterClause applies three things this did not: it TRIMS the status, event-type and
+// topic predicates; it constrains the population to status IN (dead_lettered, failed) when no
+// status is named, rather than admitting every status; and it renders the resolved_at tri-state.
+// Two matchers on this store carry those properties and are both reachable — matchingLocked for
+// the full-row listing and its count, and dltInventoryMatches for the narrow inventory
+// projection, which is the one that models the resolution predicates. A third matcher agreeing
+// with neither is worse than none: it lets a test assert over a set the statement would not
+// return.
+//
+// snapshotDeadLetterCounts returns the narrowing every CountDeadLetteredEvents call was
+// given, oldest first, so a test can assert the total was counted over the SAME predicate
+// the page was drawn with.
+func (s *dltFakeStore) snapshotDeadLetterCounts() []dltPageRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]dltPageRequest(nil), s.countDeadLetterCalls...)
+}
+
 // snapshotPages returns a copy of the recorded listing requests.
 func (s *dltFakeStore) snapshotPages() []dltPageRequest {
 	s.mu.Lock()
@@ -699,6 +850,17 @@ func (s *dltFakeStore) snapshotPages() []dltPageRequest {
 	copy(pages, s.listCalls)
 
 	return pages
+}
+
+// snapshotCountQueries returns a copy of the narrowings the count was asked for.
+func (s *dltFakeStore) snapshotCountQueries() []dltPageRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	queries := make([]dltPageRequest, len(s.countDeadLetterCalls))
+	copy(queries, s.countDeadLetterCalls)
+
+	return queries
 }
 
 // dltContainsString reports whether values contains target.
@@ -1290,9 +1452,9 @@ func dltAssertCodeAndStatus(t *testing.T, err error, code apierror.ErrorCode, st
 
 // dltEventIDs returns the event ids of a listing page, which is what makes an ordering or
 // paging assertion readable.
-func dltEventIDs(entries []model.EventOutbox) []string {
-	ids := make([]string, 0, len(entries))
-	for _, entry := range entries {
+func dltEventIDs(page model.DeadLetterInventoryPage) []string {
+	ids := make([]string, 0, len(page.Entries))
+	for _, entry := range page.Entries {
 		ids = append(ids, entry.EventID)
 	}
 
@@ -1510,6 +1672,11 @@ func TestDeadLetterRouting_LeavesADeadLetteredRowOutsideTheRelayClaimSet(t *test
 //
 // The same check covers the claim methods: a surface that could claim a row could take part
 // in the relay's job, and dead-lettering is emphatically not that.
+//
+// The seam is asserted as a CLOSED SET rather than as a list of forbidden names, so every
+// addition to it has to be justified here in writing. That is deliberate: the value of the
+// assertion is the argument each entry has to survive, not the count — so the count in the
+// comment below is a consequence of the arguments, never a target to be edited to match.
 func TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow(t *testing.T) {
 	seam := reflect.TypeOf((*eventDeadLetterStore)(nil)).Elem()
 
@@ -1518,20 +1685,56 @@ func TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow(t *testing.T) {
 		declared = append(declared, seam.Method(i).Name)
 	}
 
-	// Seven methods now, and the two additions are the replay CLAIM and its rollback.
-	// They are not "claim methods" in the relay's sense — neither can take a pending row
-	// or take part in publishing new events. ClaimEventForReplay moves a row that is
-	// ALREADY dead-lettered into replaying, which is what makes a replay atomic instead
-	// of a read followed by a check that two concurrent requests could both pass.
+	// TWELVE METHODS NOW, and the argument for each is below. Nine of them mutate nothing
+	// and four of those nine cannot even name a claimable row; the three that do write are
+	// each conditional on a claim token this surface was handed rather than one it took.
+	//
+	// Two are the replay CLAIM and its rollback, which are not "claim methods" in the
+	// relay's sense — neither can take a pending row or take part in publishing new
+	// events. ClaimEventForReplay moves a row that is ALREADY dead-lettered into
+	// replaying, which is what makes a replay atomic instead of a read followed by a check
+	// that two concurrent requests could both pass.
+	//
+	// CountDeadLetteredEvents is a READ counted over the same predicate as the listing. It
+	// is what makes an exact total available for a filtered page; it cannot mutate a row or
+	// reach a claimable one.
+	//
+	// ListDeadLetterInventory is the NARROW TRIAGE PROJECTION the operator listing reads,
+	// paged by keyset. It earns its place by being the cheap read: it returns each entry's
+	// coordinate and the SIZE of its payload instead of the payload, so an inventory of
+	// large events costs a page of metadata, and the cursor keeps that cost flat at any
+	// depth. The full-row listing beside it stays because the age accounting and the replay
+	// path need the stored bytes. Neither can mutate a row.
+	//
+	// CountDeadLetterInventory is the count driven from the INVENTORY predicate, the twin of
+	// CountDeadLetteredEvents at the repository layer: one finding — a filtered listing that
+	// could not be given a total — was answered twice, once over each of the two listing
+	// predicates, and both answers are exercised by the repository's own tests. The service
+	// reads CountDeadLetteredEvents. Keeping the twin on the seam costs nothing a reviewer
+	// should worry about: it is a COUNT(*), so it cannot mutate a row, cannot claim one, and
+	// cannot spend an attempt. What it must never become is a second, drifting definition of
+	// "the inventory" — which is why both counts are required to share their listing's
+	// predicate rather than to re-state it.
+	//
+	// OldestDeadLetterAgeByTopic is the grouped aggregate the age gauge is computed from
+	// (PERF-P07). It replaced a bounded backwards walk over the whole inventory, which read
+	// thousands of rows per refresh to report one instant per topic and understated the age
+	// outright once the inventory outgrew its budget. It is a GROUP BY that returns one row
+	// per dead-letter topic; it reads no payload and writes nothing.
 	assert.ElementsMatch(t, []string{
 		"GetEventByID",
 		"ListDeadLetteredEvents",
+		"ListDeadLetterInventory",
+		"CountDeadLetteredEvents",
+		"CountDeadLetterInventory",
 		"CountEventOutboxByStatus",
 		"MarkEventDeadLettered",
+		"MarkEventDeadLetterResolved",
 		"MarkEventDispatched",
 		"ClaimEventForReplay",
 		"ReleaseEventReplay",
-	}, declared, "the dead-letter store seam must expose exactly these seven methods")
+		"OldestDeadLetterAgeByTopic",
+	}, declared, "the dead-letter store seam must expose exactly these twelve methods")
 
 	assert.NotContains(t, declared, "ClaimPendingEventOutbox",
 		"the dead-letter surface must not be able to claim a PENDING row: that is the relay's job, and a surface that could do it could take part in publishing new events")
@@ -2560,6 +2763,54 @@ func TestReplayDeadLetteredEvent_LabelsTheAttemptPastTheExhaustedBudget(t *testi
 		"the label must be past the budget so it cannot collide with a real attempt")
 }
 
+// TestReplayDeadLetteredEvent_IsNotCountedAsAFirstTimeDelivery is the other half of PERF-P21.
+//
+// The per-event delivery counter, blnk.events.dispatched.total, is incremented at the durable
+// dispatched transition — and a successful replay takes that same transition. It must
+// nevertheless NOT be counted, because this event has already been accounted for as
+// dead-lettered and a counter never decrements. Counting it here would put one event in both
+// terminal counters, so their sum would exceed the population; the dead-letter rate derived from
+// them would then FALL as an operator worked through the inventory, reporting the pipeline as
+// healthier the more triage was being done.
+//
+// The replay is not invisible: it is recorded on the per-attempt instruments under the fixed
+// `replay` attempt label, which is where re-delivery belongs, and that is asserted alongside so
+// the absence above cannot be satisfied by a replay that records nothing at all.
+//
+// The structural half matters as much as the behavioural one. This absence is not observable
+// from a passing replay — a stray increment added on any other branch of this file would be
+// invisible to a test that only drove the happy path — so the file is also asserted to make no
+// reference to the instrument by any spelling.
+func TestReplayDeadLetteredEvent_IsNotCountedAsAFirstTimeDelivery(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	dispatched := captureDispatchedCounter(t)
+	attempts := dltCapturePublishAttempts(t)
+
+	fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
+
+	_, err := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
+	require.NoError(t, err)
+
+	require.Len(t, fixture.store.snapshotDispatched(), 1,
+		"the premise: a successful replay does take the durable dispatched transition")
+
+	assert.Empty(t, dispatched.snapshot(),
+		"and it must still not count as a delivered event: this one is already counted as "+
+			"dead-lettered, so counting it again would make the two terminal counters overlap and "+
+			"the dead-letter rate fall as the inventory was worked through")
+
+	assert.NotEmpty(t, attempts.snapshot(),
+		"the replay must be visible SOMEWHERE, or the absence above is satisfied by a replay "+
+			"that records nothing; the per-attempt instruments are where re-delivery belongs")
+
+	source := parseRepositoryGoFile(t, "event_dlt.go")
+	assert.Zero(t, identifierUses(source, "EventsDispatchedTotal"),
+		"no code path in this file may increment the per-event delivery count: the relay's "+
+			"durable transition is its only owner, and a second writer here would count one "+
+			"event twice")
+}
+
 // ---------------------------------------------------------------------------
 // State transitions and repeat replay
 // ---------------------------------------------------------------------------
@@ -2603,9 +2854,11 @@ func TestReplayDeadLetteredEvent_MovesTheRowToDispatchedAndClearsTheInventory(t 
 
 	after, err := fixture.service.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{})
 	require.NoError(t, err)
-	assert.Empty(t, after,
+	assert.Empty(t, after.Entries,
 		"a replayed event must no longer be listed as dead-lettered")
-	assert.NotNil(t, after, "an empty inventory must still marshal as [] rather than null")
+	assert.NotNil(t, after.Entries, "an empty inventory must still marshal as [] rather than null")
+	assert.False(t, after.HasMore)
+	assert.Nil(t, after.NextCursor)
 }
 
 // TestReplayDeadLetteredEvent_RefusesASecondReplay pins the repeat-replay decision.
@@ -3124,8 +3377,11 @@ func TestDeadLetterMetrics_RecordsEveryDeadLetterWriteWithItsPurposeAndDuration(
 			"a dead-letter write that failed is still a write this process attempted, and it is the one an "+
 				"operator most needs to see: unrecorded, a broker refusing every dead-letter message is "+
 				"indistinguishable from an empty dead-letter path")
-		assert.Equal(t, string(model.PublishStatusFailed), records[0].attributes[publishAttrOutcome],
-			"the outcome must say the write did not land")
+		assert.Equal(t, string(model.PublishStatusRetrying), records[0].attributes[publishAttrOutcome],
+			"a dead-letter write that did not land is recorded as retrying, which is literally what "+
+				"happens next: the row is left non-terminal, stays in the dead-letter inventory, and "+
+				"recoverUnpreservedDeadLetters re-claims it once its lease expires. dead_lettered is "+
+				"reserved for a write a broker acknowledged")
 
 		observations := failedDuration.snapshot()
 		require.Len(t, observations, 1, "a timing-out write is exactly when latency data matters")
@@ -3149,7 +3405,9 @@ func TestDeadLetterMetrics_RecordsEveryDeadLetterWriteWithItsPurposeAndDuration(
 		require.Len(t, records, 1,
 			"from the event's point of view this is the same event as a refused write: its dead-letter "+
 				"message did not land")
-		assert.Equal(t, string(model.PublishStatusFailed), records[0].attributes[publishAttrOutcome])
+		assert.Equal(t, string(model.PublishStatusRetrying), records[0].attributes[publishAttrOutcome],
+			"and it must not be dead_lettered: nothing was written, so counting it would report a "+
+				"preservation that did not happen")
 	})
 }
 
@@ -3185,9 +3443,12 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 
 	assert.Equal(t, int64(3), report.Outstanding,
 		"both terminal failure states count as outstanding")
-	assert.Equal(t, 3, report.Scanned)
-	assert.False(t, report.Truncated)
 	assert.Equal(t, dltFixedNow, report.GeneratedAt)
+	assert.Equal(t, 1, store.snapshotAgeCalls(),
+		"PERF-P07: the whole gauge is ONE grouped aggregate; a per-topic or per-page query would "+
+			"reintroduce the cost the count-then-deep-offset walk had")
+	assert.Empty(t, store.snapshotPages(),
+		"and it must read no PAGE of the inventory at all: the age is a MIN, not a scan for a minimum")
 
 	assert.Equal(t, 45*time.Minute, report.OldestByTopic["blnk.transactions.dlt"],
 		"the OLDEST entry's age must be reported, not the most recent one's")
@@ -3195,7 +3456,6 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	assert.Equal(t, 20*time.Minute, report.OldestByTopic["blnk.balances.dlt"],
 		"a failed row must be attributed to the dead-letter topic it is bound for")
 	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.identities.dlt"])
-	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.ledgers.dlt"])
 	assert.Equal(t, time.Duration(0), report.OldestByTopic["blnk.system.dlt"])
 	assert.Equal(t, 45*time.Minute, report.OldestAge(),
 		"OldestAge is the single number the 15-minute alert is expressed against")
@@ -3207,24 +3467,42 @@ func TestDeadLetterAgeGauge_ReportsTheOldestOutstandingEntry(t *testing.T) {
 	assert.InDelta(t, (45 * time.Minute).Seconds(), values["blnk.transactions.dlt"], 0.0001)
 	assert.InDelta(t, (20 * time.Minute).Seconds(), values["blnk.balances.dlt"], 0.0001)
 	assert.InDelta(t, 0.0, values["blnk.identities.dlt"], 0.0001)
-	assert.InDelta(t, 0.0, values["blnk.ledgers.dlt"], 0.0001)
 	assert.InDelta(t, 0.0, values["blnk.system.dlt"], 0.0001)
 	assert.Greater(t, values["blnk.transactions.dlt"], 900.0,
 		"45 minutes must exceed the 900-second alert threshold, which is what makes the rule fire")
 
-	t.Run("a truncated scan still reads from the oldest end", func(t *testing.T) {
-		// A forward walk would examine the NEWEST rows and, on truncation, report an age drawn
-		// from exactly the wrong end of the inventory.
-		bounded := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{}).WithScanLimit(1)
-		bounded.now = func() time.Time { return dltFixedNow }
+	t.Run("the age is exact however large the inventory is", func(t *testing.T) {
+		// WHAT THIS REPLACED (PERF-P07). The gauge used to walk rows under a 5,000-row bound,
+		// so past that bound it reported a LOWER BOUND on the age and set a Truncated flag. An
+		// alert cannot fire on a lower bound: the true age crossing fifteen minutes is exactly
+		// the case where the reported one might not.
+		//
+		// A grouped MIN has no such bound, so the assertion is now the stronger one — the age
+		// of the oldest entry is reported exactly, and the cost of saying so does not grow with
+		// the inventory, because the aggregate is answered from an index rather than from rows.
+		crowded := newDltFakeStore()
+		for i := range 10_000 {
+			// Every bulk row is YOUNGER than the 45-minute fixture, so the expected answer
+			// stays the one the outer test named and the assertion is about the inventory's
+			// SIZE rather than about which row happens to be oldest.
+			crowded = crowded.withRow(dltAgedRow(t,
+				fmt.Sprintf("evt_age_bulk_%05d", i), "transaction.applied", "blnk.transactions",
+				model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt",
+				time.Duration((i%2000)+1)*time.Second))
+		}
+		crowded = crowded.withRow(oldest)
 
-		truncated, truncErr := bounded.RefreshDeadLetterAgeGauge(context.Background())
-		require.NoError(t, truncErr)
+		crowdedService := dltNewService(crowded, &dltFakePublisher{}, &dltFakeTransport{})
 
-		assert.True(t, truncated.Truncated, "the scan bound must be reported, never silently applied")
-		assert.Equal(t, 1, truncated.Scanned)
-		assert.Equal(t, 45*time.Minute, truncated.OldestAge(),
-			"a bounded scan must still find the oldest entry")
+		crowdedReport, crowdedErr := crowdedService.RefreshDeadLetterAgeGauge(context.Background())
+		require.NoError(t, crowdedErr)
+
+		assert.Equal(t, 45*time.Minute, crowdedReport.OldestAge(),
+			"the oldest entry must be found whatever the inventory's size, with no lower-bound caveat")
+		assert.Equal(t, int64(10_001), crowdedReport.Outstanding,
+			"and the count is the aggregate's own, not a tally of rows somebody walked")
+		assert.Equal(t, 1, crowded.snapshotAgeCalls(), "still one query")
+		assert.Empty(t, crowded.snapshotPages(), "and still no page of rows")
 	})
 
 	t.Run("a future-dated row cannot lower the maximum", func(t *testing.T) {
@@ -3260,7 +3538,7 @@ func TestDeadLetterAgeGauge_FallsBackToZeroWhenTheInventoryDrains(t *testing.T) 
 	require.NoError(t, err)
 
 	assert.Zero(t, report.Outstanding)
-	assert.Zero(t, report.Scanned, "an empty inventory must not be walked at all")
+	assert.Empty(t, store.snapshotPages(), "an empty inventory must not be walked at all")
 	assert.Equal(t, time.Duration(0), report.OldestAge())
 
 	values := gauge.byTopic()
@@ -3547,26 +3825,33 @@ func TestListDeadLetterEvents_ReadsTheOutboxTableAndNeverAKafkaTopic(t *testing.
 	publisher := &dltFakePublisher{}
 	service := dltNewService(store, publisher, transport)
 
-	entries, err := service.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{})
+	page, err := service.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{})
 	require.NoError(t, err, "listing must work with no broker reachable at all")
 
-	require.Len(t, entries, 1)
-	assert.Equal(t, entry.EventID, entries[0].EventID)
-	assert.Equal(t, "blnk.transactions.dlt", entries[0].DLTTopic,
+	require.Len(t, page.Entries, 1)
+	assert.Equal(t, entry.EventID, page.Entries[0].EventID)
+	assert.Equal(t, "blnk.transactions.dlt", page.Entries[0].DLTTopic,
 		"the dead-letter topic comes from the ROW, which is why no consumer is needed")
-	assert.NotEmpty(t, entries[0].FailureMetadata,
+	assert.NotEmpty(t, page.Entries[0].FailureMetadata,
 		"the failure record comes from the row as well")
+	assert.Equal(t, len(entry.Payload), page.Entries[0].PayloadBytes,
+		"the projection must report the body's SIZE; PERF-P06 removed the body itself from the "+
+			"listing, so this is the only thing a triage view can say about it")
+	assert.False(t, page.HasMore, "a single-entry inventory has no further page")
+	assert.Nil(t, page.NextCursor, "and therefore no cursor")
 
 	assert.Empty(t, transport.snapshotRequested(),
 		"no writer may be resolved to serve a listing")
 	assert.Empty(t, publisher.snapshotRequests(),
 		"no publish may be issued to serve a listing")
-	assert.Equal(t, []dltPageRequest{{limit: defaultDeadLetterListLimit, offset: 0}}, store.snapshotPages(),
+	assert.Equal(t,
+		[]model.DeadLetterInventoryQuery{{Limit: defaultDeadLetterListLimit}},
+		store.snapshotInventoryPages(),
 		"an unfiltered page must be one repository query, passed straight through")
 
 	// The stored failure record decodes through the one shared decoder, which is how the API
 	// projection reads it.
-	metadata, decodeErr := DecodeFailureMetadata(entries[0].FailureMetadata)
+	metadata, decodeErr := DecodeFailureMetadata(page.Entries[0].FailureMetadata)
 	require.NoError(t, decodeErr)
 	require.NotNil(t, metadata)
 	assert.Equal(t, "blnk.transactions", metadata.OriginalTopic)
@@ -3614,49 +3899,57 @@ func TestListDeadLetterEvents_CoversBothTerminalFailureStates(t *testing.T) {
 
 // TestListDeadLetterEvents_PagesWithTheDocumentedBounds pins the page arithmetic.
 //
-// A caller asking for a page that is too large, or an offset below zero, has made a recoverable
-// mistake, and degrading to a sane page is more useful than an error. The ceiling matters
-// operationally: without it a triage endpoint becomes a full-table scan.
+// A caller asking for a page that is too large has made a recoverable mistake, and degrading to
+// a sane page is more useful than an error. The ceiling matters operationally: without it a
+// triage endpoint becomes a full-table scan.
+//
+// The cursor is passed through VERBATIM rather than normalised (PERF-P08). It names a position
+// and there is nothing to clamp; the offset it replaced was clamped at zero and unbounded above,
+// which bounded nothing that mattered.
 func TestListDeadLetterEvents_PagesWithTheDocumentedBounds(t *testing.T) {
 	dltPinTopicPrefix(t)
 
 	store := newDltFakeStore()
 	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
 
+	resume := &model.DeadLetterCursor{OccurredAt: time.Now().UTC().Add(-time.Hour), ID: 4242}
+
 	cases := []struct {
-		name     string
-		given    DeadLetterListOptions
-		expected dltPageRequest
+		name          string
+		given         DeadLetterListOptions
+		expectedLimit int
+		expectedCurs  *model.DeadLetterCursor
 	}{
 		{
-			name:     "the zero value asks for the default page",
-			given:    DeadLetterListOptions{},
-			expected: dltPageRequest{limit: defaultDeadLetterListLimit, offset: 0},
+			name:          "the zero value asks for the default page",
+			given:         DeadLetterListOptions{},
+			expectedLimit: defaultDeadLetterListLimit,
 		},
 		{
-			name:     "a non-positive limit falls back to the default",
-			given:    DeadLetterListOptions{Limit: 0},
-			expected: dltPageRequest{limit: defaultDeadLetterListLimit, offset: 0},
+			name:          "a non-positive limit falls back to the default",
+			given:         DeadLetterListOptions{Limit: 0},
+			expectedLimit: defaultDeadLetterListLimit,
 		},
 		{
-			name:     "a negative limit falls back to the default",
-			given:    DeadLetterListOptions{Limit: -25},
-			expected: dltPageRequest{limit: defaultDeadLetterListLimit, offset: 0},
+			name:          "a negative limit falls back to the default",
+			given:         DeadLetterListOptions{Limit: -25},
+			expectedLimit: defaultDeadLetterListLimit,
 		},
 		{
-			name:     "an oversized limit is clamped to the ceiling",
-			given:    DeadLetterListOptions{Limit: maxDeadLetterListLimit + 5000},
-			expected: dltPageRequest{limit: maxDeadLetterListLimit, offset: 0},
+			name:          "an oversized limit is clamped to the ceiling",
+			given:         DeadLetterListOptions{Limit: maxDeadLetterListLimit + 5000},
+			expectedLimit: maxDeadLetterListLimit,
 		},
 		{
-			name:     "a negative offset is clamped to zero",
-			given:    DeadLetterListOptions{Limit: 10, Offset: -3},
-			expected: dltPageRequest{limit: 10, offset: 0},
+			name:          "an explicit limit is passed through unchanged",
+			given:         DeadLetterListOptions{Limit: 25},
+			expectedLimit: 25,
 		},
 		{
-			name:     "an explicit page is passed through unchanged",
-			given:    DeadLetterListOptions{Limit: 25, Offset: 75},
-			expected: dltPageRequest{limit: 25, offset: 75},
+			name:          "a cursor is passed through verbatim",
+			given:         DeadLetterListOptions{Limit: 25, Cursor: resume},
+			expectedLimit: 25,
+			expectedCurs:  resume,
 		},
 	}
 
@@ -3665,9 +3958,12 @@ func TestListDeadLetterEvents_PagesWithTheDocumentedBounds(t *testing.T) {
 			_, err := service.ListDeadLetterEvents(context.Background(), testCase.given)
 			require.NoError(t, err)
 
-			pages := store.snapshotPages()
+			pages := store.snapshotInventoryPages()
 			require.Len(t, pages, index+1)
-			assert.Equal(t, testCase.expected, pages[index])
+			assert.Equal(t, testCase.expectedLimit, pages[index].Limit)
+			assert.Equal(t, testCase.expectedCurs, pages[index].Cursor,
+				"a cursor names a position and there is nothing to clamp, so it must reach the "+
+					"repository exactly as the caller gave it")
 		})
 	}
 
@@ -3681,9 +3977,11 @@ func TestListDeadLetterEvents_PagesWithTheDocumentedBounds(t *testing.T) {
 // what makes "show me the transaction events that are stuck" expressible without the caller
 // having to know the suffix convention.
 //
-// Paging over a FILTERED set skips matches rather than rows, so a filtered page behaves like a
-// page of the filtered set rather than a filtered page of the unfiltered set — the latter would
-// return short, unstable pages as the filter's hit rate varied.
+// Paging over a FILTERED set resumes from the last MATCH rather than from a row position, so a
+// filtered page behaves like a page of the filtered set rather than a filtered page of the
+// unfiltered set — the latter would return short, unstable pages as the filter's hit rate varied.
+// PERF-P06 moved the filters into the SQL statement, so this is now the statement's WHERE clause
+// being exercised through the fake rather than an application-side match loop.
 func TestListDeadLetterEvents_AppliesTheExposedFilters(t *testing.T) {
 	dltPinTopicPrefix(t)
 
@@ -3702,10 +4000,10 @@ func TestListDeadLetterEvents_AppliesTheExposedFilters(t *testing.T) {
 	list := func(t *testing.T, opts DeadLetterListOptions) []string {
 		t.Helper()
 
-		entries, err := service.ListDeadLetterEvents(context.Background(), opts)
+		page, err := service.ListDeadLetterEvents(context.Background(), opts)
 		require.NoError(t, err)
 
-		return dltEventIDs(entries)
+		return dltEventIDs(page)
 	}
 
 	t.Run("by event type", func(t *testing.T) {
@@ -3751,24 +4049,714 @@ func TestListDeadLetterEvents_AppliesTheExposedFilters(t *testing.T) {
 			"producers emit fixed literals, so case folding would differ from the unfiltered path")
 	})
 
-	t.Run("a filtered page skips MATCHES, not rows", func(t *testing.T) {
-		assert.Equal(t,
-			[]string{appliedAgain.EventID},
-			list(t, DeadLetterListOptions{EventType: "transaction.applied", Offset: 1}),
-			"offset must count matching entries, or a filtered page would be short and unstable")
-		assert.Equal(t,
-			[]string{applied.EventID},
-			list(t, DeadLetterListOptions{EventType: "transaction.applied", Limit: 1}))
+	t.Run("a filtered page resumes from the last MATCH, not from a row position", func(t *testing.T) {
+		first, err := service.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{
+			EventType: "transaction.applied",
+			Limit:     1,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{applied.EventID}, dltEventIDs(first))
+		require.True(t, first.HasMore,
+			"two rows match the filter, so a page of one must advertise more")
+		require.NotNil(t, first.NextCursor,
+			"and must hand back the position of the last MATCH it returned")
+
+		second, err := service.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{
+			EventType: "transaction.applied",
+			Limit:     1,
+			Cursor:    first.NextCursor,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{appliedAgain.EventID}, dltEventIDs(second),
+			"resuming from a match must continue the FILTERED sequence, never re-walk the "+
+				"unfiltered one")
+		assert.False(t, second.HasMore, "the filtered set is exhausted")
+		assert.Nil(t, second.NextCursor)
 	})
 
 	t.Run("a filter matching nothing returns an empty page, not nil", func(t *testing.T) {
-		entries, err := service.ListDeadLetterEvents(
+		page, err := service.ListDeadLetterEvents(
 			context.Background(), DeadLetterListOptions{EventType: "identity.created"},
 		)
 		require.NoError(t, err)
-		assert.Empty(t, entries)
-		assert.NotNil(t, entries, "an empty result must marshal as [] rather than null")
+		assert.Empty(t, page.Entries)
+		assert.NotNil(t, page.Entries, "an empty result must marshal as [] rather than null")
+		assert.False(t, page.HasMore)
+		assert.Nil(t, page.NextCursor)
 	})
+
+	t.Run("every filter reaches the repository rather than being applied above it", func(t *testing.T) {
+		// The defect this closes: the service used to filter IN MEMORY by paging the
+		// inventory up to a fixed scan ceiling, so a page that hit the ceiling was returned
+		// looking exactly like a complete one and an exact total was impossible. Both were
+		// properties of WHERE the filtering happened, which is why the assertion is about
+		// what the repository was asked for and not only about what came back.
+		resume := &model.DeadLetterCursor{OccurredAt: time.Now().UTC().Add(-time.Hour), ID: 512}
+		narrowing := DeadLetterListOptions{
+			EventType: "transaction.applied",
+			Topic:     "blnk.transactions",
+			Status:    model.EventOutboxStatusDeadLettered,
+			Limit:     25,
+			Cursor:    resume,
+		}
+
+		fresh := newDltFakeStore()
+		freshService := dltNewService(fresh, &dltFakePublisher{}, &dltFakeTransport{})
+
+		_, err := freshService.ListDeadLetterEvents(context.Background(), narrowing)
+		require.NoError(t, err)
+
+		require.Equal(t, []model.DeadLetterInventoryQuery{{
+			EventType: "transaction.applied",
+			Topic:     "blnk.transactions",
+			Status:    model.EventOutboxStatusDeadLettered,
+			Limit:     25,
+			Cursor:    resume,
+		}}, fresh.snapshotInventoryPages(),
+			"a filtered page must be ONE repository query carrying the whole narrowing")
+	})
+}
+
+// TestListDeadLetterEvents_AppliesTheOccurrenceWindow covers the filter an operator reaches
+// for during an incident.
+//
+// "What is stuck from the twenty minutes the broker was down" is the question actually
+// asked, and before this filter existed the only way to answer it was to page the whole
+// inventory and read timestamps by eye — the endpoint refused the parameter outright. The
+// window bounds occurred_at, the instant the ledger mutation happened, which is what
+// correlates against an incident timeline and is also the column the inventory is ordered by.
+//
+// Both ends are inclusive, so a window stated from an incident's first to last second
+// contains the events at both edges. A REVERSED window is refused rather than returning an
+// empty page, for the same reason an unrecognised status is: an empty page reads to an
+// operator as "nothing is stuck".
+func TestListDeadLetterEvents_AppliesTheOccurrenceWindow(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	// dltAgedRow's age argument is measured back from the fixed clock, so a larger age is
+	// an OLDER occurrence. Recorded here as the instants themselves so the window bounds
+	// below read as bounds rather than as arithmetic.
+	newest := dltAgedRow(t, "evt_window_newest", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute)
+	middle := dltAgedRow(t, "evt_window_middle", "transaction.void", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 10*time.Minute)
+	oldest := dltAgedRow(t, "evt_window_oldest", "balance.created", "blnk.balances",
+		model.EventOutboxStatusFailed, "", 30*time.Minute)
+
+	service := dltNewService(
+		newDltFakeStore().withRow(newest).withRow(middle).withRow(oldest),
+		&dltFakePublisher{}, &dltFakeTransport{},
+	)
+
+	list := func(t *testing.T, opts DeadLetterListOptions) []string {
+		t.Helper()
+
+		entries, err := service.ListDeadLetterEvents(context.Background(), opts)
+		require.NoError(t, err)
+
+		return dltEventIDs(entries)
+	}
+
+	t.Run("a two-sided window selects the middle slice", func(t *testing.T) {
+		assert.Equal(t,
+			[]string{newest.EventID, middle.EventID},
+			list(t, DeadLetterListOptions{
+				OccurredFrom: middle.OccurredAt,
+				OccurredTo:   newest.OccurredAt,
+			}))
+	})
+
+	t.Run("both bounds are inclusive", func(t *testing.T) {
+		assert.Equal(t,
+			[]string{middle.EventID},
+			list(t, DeadLetterListOptions{
+				OccurredFrom: middle.OccurredAt,
+				OccurredTo:   middle.OccurredAt,
+			}),
+			"an equal-bound window must select the events at exactly that instant, or a caller "+
+				"correlating against a precise timestamp gets nothing")
+	})
+
+	t.Run("a one-sided window leaves the other end unbounded", func(t *testing.T) {
+		assert.Equal(t,
+			[]string{newest.EventID, middle.EventID},
+			list(t, DeadLetterListOptions{OccurredFrom: middle.OccurredAt}))
+		assert.Equal(t,
+			[]string{middle.EventID, oldest.EventID},
+			list(t, DeadLetterListOptions{OccurredTo: middle.OccurredAt}))
+	})
+
+	t.Run("the window combines with the other filters", func(t *testing.T) {
+		assert.Equal(t,
+			[]string{middle.EventID},
+			list(t, DeadLetterListOptions{
+				Topic:        "blnk.transactions",
+				OccurredFrom: oldest.OccurredAt,
+				OccurredTo:   middle.OccurredAt,
+			}))
+	})
+
+	t.Run("a reversed window is a validation error, not an empty page", func(t *testing.T) {
+		store := newDltFakeStore()
+		strict := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+		_, err := strict.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{
+			OccurredFrom: newest.OccurredAt,
+			OccurredTo:   oldest.OccurredAt,
+		})
+		dltAssertCodeAndStatus(t, err, apierror.ErrGenValidation, http.StatusBadRequest)
+		assert.Contains(t, err.Error(), "occurred_from",
+			"the refusal must name the parameters the caller sent, so the fix is one edit rather "+
+				"than a hunt through the runbook")
+		assert.Contains(t, err.Error(), "occurred_to")
+
+		assert.Empty(t, store.snapshotInventoryPages(),
+			"an unsatisfiable window must not reach the repository")
+
+		_, countErr := strict.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{
+			OccurredFrom: newest.OccurredAt,
+			OccurredTo:   oldest.OccurredAt,
+		})
+		dltAssertCodeAndStatus(t, countErr, apierror.ErrGenValidation, http.StatusBadRequest)
+		assert.Empty(t, store.snapshotCountQueries(),
+			"the count must refuse the same window the listing refuses")
+	})
+}
+
+// TestCountDeadLetterEvents_CountsTheSameNarrowingAsThePage is what makes an exact total
+// available for a filtered page at all.
+//
+// The total used to come from a whole-table per-status aggregate that knew nothing about the
+// event-type or topic filter, so the endpoint refused include_count for those filters
+// outright. A total computed over a different predicate than the page is worse than no
+// total: a client pages until it has seen total_count rows and either loops forever or stops
+// early, and nothing in either response says which happened.
+//
+// The page is deliberately ignored, because the total is a property of the filter and not of
+// the window into it. Honouring Limit would make total_count never exceed the page size,
+// which is exactly the number a caller asks for it in order not to have to guess.
+func TestCountDeadLetterEvents_CountsTheSameNarrowingAsThePage(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	applied := dltAgedRow(t, "evt_count_applied", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute)
+	void := dltAgedRow(t, "evt_count_void", "transaction.void", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 2*time.Minute)
+	appliedAgain := dltAgedRow(t, "evt_count_applied_again", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusFailed, "", 3*time.Minute)
+	balance := dltAgedRow(t, "evt_count_balance", "balance.created", "blnk.balances",
+		model.EventOutboxStatusDeadLettered, "blnk.balances.dlt", 4*time.Minute)
+
+	store := newDltFakeStore().withRow(applied).withRow(void).withRow(appliedAgain).withRow(balance)
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	for _, tc := range []struct {
+		name  string
+		given DeadLetterListOptions
+		want  int64
+	}{
+		{"unfiltered counts the whole inventory", DeadLetterListOptions{}, 4},
+		{"by event type", DeadLetterListOptions{EventType: "transaction.applied"}, 2},
+		{"by topic", DeadLetterListOptions{Topic: "blnk.transactions"}, 3},
+		{"by status", DeadLetterListOptions{Status: model.EventOutboxStatusFailed}, 1},
+		{
+			"filters combine",
+			DeadLetterListOptions{
+				EventType: "transaction.applied",
+				Status:    model.EventOutboxStatusDeadLettered,
+			},
+			1,
+		},
+		{"a narrowing that matches nothing counts zero", DeadLetterListOptions{EventType: "identity.created"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			total, err := service.CountDeadLetterEvents(context.Background(), tc.given)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, total)
+		})
+	}
+
+	t.Run("the count is over the same predicate the page was drawn with", func(t *testing.T) {
+		narrowing := DeadLetterListOptions{EventType: "transaction.applied", Limit: 1}
+
+		page, err := service.ListDeadLetterEvents(context.Background(), narrowing)
+		require.NoError(t, err)
+		require.Len(t, page.Entries, 1, "the page is deliberately smaller than the match set")
+
+		total, err := service.CountDeadLetterEvents(context.Background(), narrowing)
+		require.NoError(t, err)
+		assert.Equal(t, int64(2), total,
+			"the total must describe the FILTERED set and not the page, or a paging client cannot "+
+				"know when to stop")
+
+		queries := store.snapshotCountQueries()
+		require.NotEmpty(t, queries)
+		last := queries[len(queries)-1]
+		assert.Equal(t, "transaction.applied", last.EventType,
+			"the count must carry the page's own narrowing")
+	})
+
+	t.Run("an unusable status filter is refused before the repository is reached", func(t *testing.T) {
+		fresh := newDltFakeStore()
+		strict := dltNewService(fresh, &dltFakePublisher{}, &dltFakeTransport{})
+
+		_, err := strict.CountDeadLetterEvents(
+			context.Background(), DeadLetterListOptions{Status: model.EventOutboxStatusDispatched},
+		)
+		dltAssertCodeAndStatus(t, err, apierror.ErrGenValidation, http.StatusBadRequest)
+		assert.Empty(t, fresh.snapshotCountQueries())
+	})
+
+	t.Run("the repository's own failure is propagated unchanged", func(t *testing.T) {
+		failing := newDltFakeStore()
+		failing.countDeadLetterErr = apierror.NewAPIError(
+			apierror.ErrInternalServer, "Failed to count dead-lettered events", errors.New("dial tcp: refused"),
+		)
+		failingService := dltNewService(failing, &dltFakePublisher{}, &dltFakeTransport{})
+
+		_, err := failingService.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
+		dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
+	})
+
+	t.Run("a service with no datasource reports it rather than panicking", func(t *testing.T) {
+		_, err := NewEventDeadLetterService(nil, nil).
+			CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
+		dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
+	})
+}
+
+// ---------------------------------------------------------------------------------------
+// SEC-09 — the filtered inventory is complete, and its total says so
+// ---------------------------------------------------------------------------------------
+
+// TestListDeadLetterEvents_PushesEveryPredicateToTheRepository is the SEC-09 guard at the
+// service layer.
+//
+// # The defect
+//
+// The service used to serve a filtered page by WALKING the repository's unfiltered pages and
+// applying the predicates in Go, abandoning the walk after five thousand rows and logging a
+// warning. The page it returned was then indistinguishable from a complete one, and the only
+// record that the scan had given up was a log line the operator was not reading. During a loss
+// investigation "nothing more is stuck" is the most dangerous wrong answer this endpoint gives.
+//
+// # What is asserted, and why it is the repository CALL rather than the result
+//
+// A result-only assertion would pass against the old walk too: with a small fixture the walk
+// never reached its bound and returned the right rows. What distinguishes the two designs is
+// WHAT THE SERVICE ASKS THE DATABASE FOR — one filtered query, or many unfiltered ones. So the
+// recorded calls are the assertion.
+func TestListDeadLetterEvents_PushesEveryPredicateToTheRepository(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	applied := dltAgedRow(t, "evt_push_applied", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute)
+	balance := dltAgedRow(t, "evt_push_balance", "balance.monitor", "blnk.balances",
+		model.EventOutboxStatusDeadLettered, "blnk.balances.dlt", 2*time.Minute)
+
+	store := newDltFakeStore().withRow(applied).withRow(balance)
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	_, err := service.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{
+		EventType: "transaction.applied",
+		Topic:     "blnk.transactions",
+		Status:    model.EventOutboxStatusDeadLettered,
+		Limit:     10,
+		Offset:    3,
+	})
+	require.NoError(t, err)
+
+	// THE INVENTORY READ is what the listing issues: a narrow, keyset-paged projection that
+	// never reads a payload (PERF-P06). It is recorded twice — once as the narrowing and once
+	// as the page — because the two are asserted separately below.
+	require.Len(t, store.inventoryQueries, 1,
+		"ONE query, filtered. A walk would issue a page request per lap, and it is the number "+
+			"of requests — not the rows they returned — that tells the two designs apart")
+	assert.Empty(t, store.listCalls,
+		"the listing must not read whole rows: the projection answers it, and reading bodies to "+
+			"build a listing of kilobytes was the finding")
+
+	assert.Equal(t, model.DeadLetterInventoryFilter{
+		EventType: "transaction.applied",
+		Topic:     "blnk.transactions",
+		Status:    model.EventOutboxStatusDeadLettered,
+		Limit:     10,
+	}, store.inventoryQueries[0],
+		"every predicate must reach the repository, and none may be invented")
+
+	require.Len(t, store.inventoryPages, 1)
+	assert.Equal(t, 10, store.inventoryPages[0].Limit,
+		"the page BOUND goes to SQL, so the LIMIT applies to matching rows rather than to a "+
+			"page that was filtered afterwards")
+}
+
+// TestListDeadLetterEvents_NoLongerTruncatesALargeFilteredInventory is the regression test for
+// the five-thousand-row bound itself.
+//
+// It builds an inventory larger than deadLetterScanMaxRows in which every MATCHING entry sits
+// past the old bound, which is the exact shape that produced a silently empty page: the walk
+// scanned five thousand non-matching rows, gave up, and reported success with nothing in it.
+// The entry now comes back, and the total confirms it — because the database applied the
+// predicate before the page was taken.
+func TestListDeadLetterEvents_NoLongerTruncatesALargeFilteredInventory(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	store := newDltFakeStore()
+
+	// Newest first, matching repository order, so the needle is genuinely at the far end of
+	// the inventory — past where the old walk stopped looking.
+	for i := 0; i < deadLetterScanMaxRows+10; i++ {
+		filler := dltAgedRow(t, fmt.Sprintf("evt_filler_%05d", i), "transaction.applied",
+			"blnk.transactions", model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt",
+			time.Duration(i)*time.Second)
+		store.withRow(filler)
+	}
+
+	needle := dltAgedRow(t, "evt_needle", "identity.created", "blnk.identities",
+		model.EventOutboxStatusDeadLettered, "blnk.identities.dlt", 24*time.Hour)
+	store.withRow(needle)
+
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+	opts := DeadLetterListOptions{EventType: "identity.created"}
+
+	entries, err := service.ListDeadLetterEvents(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, []string{needle.EventID}, dltEventIDs(entries),
+		"an entry past the old scan bound must still be found: a filtered page that stopped "+
+			"looking told an operator nothing was stuck when something was")
+
+	total, err := service.CountDeadLetterEvents(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), total,
+		"and the total must agree with the page, which is the completeness check the "+
+			"truncated walk defeated")
+}
+
+// TestCountDeadLetterEvents_IsAboutTheSamePopulationAsThePage pins the other half of SEC-09:
+// a page an operator can check.
+//
+// include_count used to be REFUSED alongside an event_type or topic filter, because no
+// filter-aware count existed at any layer. The refusal was honest and it was also the reason
+// the truncation went unnoticed — with no total, a short page could not be recognised as short.
+func TestCountDeadLetterEvents_IsAboutTheSamePopulationAsThePage(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	applied := dltAgedRow(t, "evt_count_applied", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute)
+	appliedAgain := dltAgedRow(t, "evt_count_applied_2", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusFailed, "", 2*time.Minute)
+	balance := dltAgedRow(t, "evt_count_balance", "balance.monitor", "blnk.balances",
+		model.EventOutboxStatusDeadLettered, "blnk.balances.dlt", 3*time.Minute)
+
+	store := newDltFakeStore().withRow(applied).withRow(appliedAgain).withRow(balance)
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	cases := []struct {
+		name  string
+		opts  DeadLetterListOptions
+		total int64
+	}{
+		{"unfiltered counts the whole inventory", DeadLetterListOptions{}, 3},
+		{"by event type", DeadLetterListOptions{EventType: "transaction.applied"}, 2},
+		{"by topic", DeadLetterListOptions{Topic: "blnk.transactions"}, 2},
+		{"by status", DeadLetterListOptions{Status: model.EventOutboxStatusFailed}, 1},
+		{
+			"filters combine",
+			DeadLetterListOptions{EventType: "transaction.applied", Status: model.EventOutboxStatusDeadLettered},
+			1,
+		},
+		{"a filter matching nothing counts zero", DeadLetterListOptions{EventType: "ledger.created"}, 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			total, err := service.CountDeadLetterEvents(context.Background(), tc.opts)
+			require.NoError(t, err)
+			assert.Equal(t, tc.total, total)
+
+			// The paging fields must not reach the count: a total is a property of the
+			// FILTER, and one that shrank with the page size would be useless for exactly
+			// the comparison it exists to support.
+			paged := tc.opts
+			paged.Limit, paged.Offset = 1, 1
+
+			pagedTotal, err := service.CountDeadLetterEvents(context.Background(), paged)
+			require.NoError(t, err)
+			assert.Equal(t, tc.total, pagedTotal,
+				"the total must not vary with the page it is reported alongside")
+		})
+	}
+
+	t.Run("the count and the page render the same filter", func(t *testing.T) {
+		store.countDeadLetterCalls = nil
+		store.inventoryQueries = nil
+
+		opts := DeadLetterListOptions{EventType: "transaction.applied", Limit: 1}
+
+		_, err := service.ListDeadLetterEvents(context.Background(), opts)
+		require.NoError(t, err)
+		_, err = service.CountDeadLetterEvents(context.Background(), opts)
+		require.NoError(t, err)
+
+		require.Len(t, store.inventoryQueries, 1)
+		require.Len(t, store.countDeadLetterCalls, 1)
+
+		// Compared on the NARROWING alone: the page a listing asks for is legitimately not
+		// the page a count asks for, and it is the predicate that has to be identical.
+		listed, counted := store.inventoryQueries[0], store.countDeadLetterCalls[0]
+		listed.Limit, listed.Offset = 0, 0
+		counted.Limit, counted.Offset = 0, 0
+		assert.Equal(t, listed, counted,
+			"two independently assembled predicates would let a total describe a population "+
+				"the page was not drawn from")
+	})
+
+	t.Run("an unusable status filter is refused rather than counted", func(t *testing.T) {
+		_, err := service.CountDeadLetterEvents(context.Background(),
+			DeadLetterListOptions{Status: model.EventOutboxStatusDispatched})
+		dltAssertCodeAndStatus(t, err, apierror.ErrGenValidation, http.StatusBadRequest)
+	})
+}
+
+// TestListDeadLetterEvents_FiltersByResolutionState covers the filter triage actually starts
+// from once retention is enabled.
+//
+// A resolved entry stays in the inventory until its retention period elapses, so an operator
+// asking "what is still outstanding?" must be able to exclude them — and an operator auditing
+// what was closed must be able to see only those. Absent means BOTH, which is the honest
+// default for an inventory endpoint.
+func TestListDeadLetterEvents_FiltersByResolutionState(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	outstanding := dltAgedRow(t, "evt_res_open", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute)
+	closed := dltAgedRow(t, "evt_res_closed", "transaction.void", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 2*time.Minute)
+	resolvedAt := dltFixedNow.Add(-time.Hour)
+	closed.ResolvedAt = &resolvedAt
+	closed.ResolutionNote = "replayed once the broker came back"
+
+	store := newDltFakeStore().withRow(outstanding).withRow(closed)
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	list := func(t *testing.T, resolution DeadLetterResolutionFilter) []string {
+		t.Helper()
+
+		entries, err := service.ListDeadLetterEvents(context.Background(),
+			DeadLetterListOptions{Resolution: resolution})
+		require.NoError(t, err)
+
+		return dltEventIDs(entries)
+	}
+
+	assert.Equal(t, []string{outstanding.EventID, closed.EventID}, list(t, DeadLetterResolutionAny),
+		"the default must show the whole inventory: narrowing it silently is what makes a page "+
+			"read as \"nothing is stuck\"")
+	assert.Equal(t, []string{outstanding.EventID}, list(t, DeadLetterResolutionUnresolved))
+	assert.Equal(t, []string{closed.EventID}, list(t, DeadLetterResolutionResolved))
+
+	t.Run("an unknown resolution value is refused rather than widened", func(t *testing.T) {
+		// The failure mode this prevents: a value outside the vocabulary rendering to a
+		// filter that narrows nothing, so the caller receives the whole inventory believing
+		// it is a subset.
+		_, err := service.ListDeadLetterEvents(context.Background(),
+			DeadLetterListOptions{Resolution: DeadLetterResolutionFilter(99)})
+		dltAssertCodeAndStatus(t, err, apierror.ErrGenValidation, http.StatusBadRequest)
+	})
+}
+
+// ---------------------------------------------------------------------------------------
+// SEC-08 — an explicit resolution gates retention
+// ---------------------------------------------------------------------------------------
+
+// TestResolveDeadLetterEvent_RecordsTheOperatorDecisionThatGatesRetention is the SEC-08
+// guard at the service layer.
+//
+// # The defect
+//
+// The retention purge deleted dead-lettered rows on an age timer, on the same footing as
+// delivered ones. A delivered row is a receipt; a dead-lettered row is the record of an event
+// NO SUBSCRIBER EVER RECEIVED, together with the failure metadata explaining why and the bytes
+// a replay is driven from. Nothing distinguished "somebody dealt with this" from "nobody ever
+// looked", because nothing recorded the difference — so the purge destroyed the evidence of the
+// oldest failures first, which are the ones most likely to have been forgotten.
+func TestResolveDeadLetterEvent_RecordsTheOperatorDecisionThatGatesRetention(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	row := dltAgedRow(t, "evt_resolve", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Hour)
+
+	store := newDltFakeStore().withRow(row)
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	assert.False(t, row.IsPurgeableByRetention(),
+		"the premise: an unresolved dead-lettered row is not eligible for retention however old")
+
+	resolved, err := service.ResolveDeadLetterEvent(context.Background(), row.EventID,
+		"  replayed after the broker came back  ")
+	require.NoError(t, err)
+
+	require.NotNil(t, resolved.ResolvedAt)
+	assert.Equal(t, "replayed after the broker came back", resolved.ResolutionNote,
+		"the note is trimmed, because trailing whitespace in an audit record is noise")
+	assert.True(t, resolved.IsPurgeableByRetention(),
+		"THE POINT: recording the decision is what makes the row eligible for the purge")
+
+	// The status is deliberately unchanged, and all three consequences matter.
+	assert.Equal(t, model.EventOutboxStatusDeadLettered, resolved.Status,
+		"the status must not change: dead_lettered is what the zero-loss reconciliation counts "+
+			"(the message really is on the .dlt topic), what the published-audit index selects "+
+			"on, and what a replay requires — so a resolution must not cost the event its "+
+			"replayability")
+	assert.Equal(t, row.DLTTopic, resolved.DLTTopic)
+	assert.Equal(t, row.EventRaw, resolved.EventRaw,
+		"and the stored bytes are untouched, so a resolved event still replays byte for byte")
+
+	require.Len(t, store.resolveCalls, 1)
+	assert.Equal(t, row.EventID, store.resolveCalls[0].eventID)
+	assert.False(t, store.resolveCalls[0].at.IsZero(),
+		"the service supplies the instant, so the value reported to the caller is the value stored")
+}
+
+// TestResolveDeadLetterEvent_RefusesWhatCannotBeResolved covers the three refusals, and each
+// one is a different operational answer.
+func TestResolveDeadLetterEvent_RefusesWhatCannotBeResolved(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	t.Run("a blank id is refused before the repository is reached", func(t *testing.T) {
+		store := newDltFakeStore()
+		service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+		_, err := service.ResolveDeadLetterEvent(context.Background(), "   ", "")
+		dltAssertCodeAndStatus(t, err, apierror.ErrGenValidation, http.StatusBadRequest)
+		assert.Empty(t, store.resolveCalls)
+	})
+
+	t.Run("an unknown event is a 404", func(t *testing.T) {
+		service := dltNewService(newDltFakeStore(), &dltFakePublisher{}, &dltFakeTransport{})
+
+		_, err := service.ResolveDeadLetterEvent(context.Background(), "evt_missing", "")
+		dltAssertCodeAndStatus(t, err, apierror.ErrNotFound, http.StatusNotFound)
+	})
+
+	t.Run("a FAILED row cannot be resolved", func(t *testing.T) {
+		// Its <topic>.dlt write is still owed, so the outbox row is the only copy of the
+		// event in existence and "dealt with" cannot be true of it yet. Resolving it would
+		// make the purge eligible to destroy the last copy.
+		stranded := dltAgedRow(t, "evt_stranded_resolve", "transaction.applied", "blnk.transactions",
+			model.EventOutboxStatusFailed, "", time.Hour)
+
+		service := dltNewService(newDltFakeStore().withRow(stranded), &dltFakePublisher{}, &dltFakeTransport{})
+
+		_, err := service.ResolveDeadLetterEvent(context.Background(), stranded.EventID, "")
+		dltAssertCodeAndStatus(t, err, apierror.ErrEventNotDeadLettered, http.StatusConflict)
+		assert.False(t, stranded.IsPurgeableByRetention())
+	})
+
+	t.Run("an already-resolved row answers its OWN code", func(t *testing.T) {
+		// Distinct from ErrEventNotDeadLettered on purpose: resolving is the action an
+		// operator most naturally repeats — two people working one backlog, or a retry of a
+		// request whose response was lost — and a script must be able to treat "already
+		// resolved" as success while treating "cannot be resolved" as a problem.
+		row := dltAgedRow(t, "evt_double_resolve", "transaction.applied", "blnk.transactions",
+			model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Hour)
+
+		service := dltNewService(newDltFakeStore().withRow(row), &dltFakePublisher{}, &dltFakeTransport{})
+
+		_, err := service.ResolveDeadLetterEvent(context.Background(), row.EventID, "first")
+		require.NoError(t, err)
+
+		_, err = service.ResolveDeadLetterEvent(context.Background(), row.EventID, "second")
+		dltAssertCodeAndStatus(t, err, apierror.ErrEventAlreadyResolved, http.StatusConflict)
+		assert.NotEqual(t, apierror.Normalize(apierror.ErrEventNotDeadLettered),
+			apierror.Normalize(apierror.ErrEventAlreadyResolved),
+			"the two conflicts must be different codes, or a script cannot tell them apart")
+	})
+
+	t.Run("an unusable note is refused", func(t *testing.T) {
+		row := dltAgedRow(t, "evt_bad_note", "transaction.applied", "blnk.transactions",
+			model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Hour)
+
+		store := newDltFakeStore().withRow(row)
+		service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+		for name, note := range map[string]string{
+			"too long":          strings.Repeat("x", maxDeadLetterResolutionNoteLength+1),
+			"control character": "replayed\x00",
+			"a newline":         "replayed\nthen checked",
+		} {
+			t.Run(name, func(t *testing.T) {
+				_, err := service.ResolveDeadLetterEvent(context.Background(), row.EventID, note)
+				dltAssertCodeAndStatus(t, err, apierror.ErrGenValidation, http.StatusBadRequest)
+			})
+		}
+
+		assert.Empty(t, store.resolveCalls, "nothing unusable may reach the row")
+
+		// The bound itself is accepted, which is what makes the refusal a bound rather than
+		// an off-by-one.
+		_, err := service.ResolveDeadLetterEvent(context.Background(), row.EventID,
+			strings.Repeat("x", maxDeadLetterResolutionNoteLength))
+		require.NoError(t, err)
+	})
+
+	t.Run("the rune bound is in RUNES, not bytes", func(t *testing.T) {
+		row := dltAgedRow(t, "evt_rune_note", "transaction.applied", "blnk.transactions",
+			model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Hour)
+
+		service := dltNewService(newDltFakeStore().withRow(row), &dltFakePublisher{}, &dltFakeTransport{})
+
+		// Three bytes per rune, so this is well past the bound in bytes and exactly at it in
+		// runes. A byte-counted bound would refuse a legitimate note written in Japanese.
+		note := strings.Repeat("台", maxDeadLetterResolutionNoteLength)
+
+		_, err := service.ResolveDeadLetterEvent(context.Background(), row.EventID, note)
+		require.NoError(t, err)
+	})
+}
+
+// TestRefreshDeadLetterAgeGauge_ExcludesResolvedEntries is what makes a finite retention
+// period safe to configure.
+//
+// Once retention is enabled a resolved row survives until its period elapses. Counting those
+// rows in the gauge would keep the DeadLetterMessageStuck alert reporting on failures somebody
+// has already accounted for, for days after they were handled — and an alert that fires on
+// closed work is an alert that gets muted, which is the same as not having one.
+func TestRefreshDeadLetterAgeGauge_ExcludesResolvedEntries(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	outstanding := dltAgedRow(t, "evt_gauge_open", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 20*time.Minute)
+	closed := dltAgedRow(t, "evt_gauge_closed", "transaction.void", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 40*time.Hour)
+	resolvedAt := dltFixedNow.Add(-time.Hour)
+	closed.ResolvedAt = &resolvedAt
+
+	store := newDltFakeStore().withRow(outstanding).withRow(closed)
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	report, err := service.RefreshDeadLetterAgeGauge(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(1), report.Outstanding,
+		"outstanding is the UNRESOLVED population; counting closed work would keep the alert firing")
+
+	// The 40-hour resolved entry must not set the gauge. If it did, the reported age would be
+	// dominated by history rather than by the work that remains.
+	assert.Less(t, report.OldestByTopic["blnk.transactions.dlt"], time.Hour,
+		"the oldest age must be drawn from the unresolved entry, not from the resolved one")
+	assert.GreaterOrEqual(t, report.OldestByTopic["blnk.transactions.dlt"], 20*time.Minute)
+
+	// ONE GROUPED AGGREGATE, and no walk at all. The population is narrowed in the statement
+	// — resolved_at IS NULL — rather than by paging the inventory and filtering in Go, which is
+	// what makes the age exact at any backlog size instead of a lower bound drawn from a
+	// bounded scan. Asserting the call COUNT is how the two designs are told apart: a walk
+	// would issue a page request per lap.
+	assert.Equal(t, 1, store.ageCalls,
+		"the age gauge must be one grouped aggregate per refresh, not a walk whose cost grows "+
+			"with the backlog it is measuring")
+	assert.Empty(t, store.listCalls,
+		"no row may be fetched to compute an age: the aggregate answers it in the database")
 }
 
 // TestListDeadLetterEvents_ReturnsAnEmptyPageRatherThanNil covers the normalisation on the
@@ -3782,12 +4770,14 @@ func TestListDeadLetterEvents_ReturnsAnEmptyPageRatherThanNil(t *testing.T) {
 
 	service := dltNewService(newDltFakeStore(), &dltFakePublisher{}, &dltFakeTransport{})
 
-	entries, err := service.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{})
+	page, err := service.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{})
 	require.NoError(t, err)
-	assert.NotNil(t, entries, "an empty inventory must still yield a non-nil slice")
-	assert.Empty(t, entries)
+	assert.NotNil(t, page.Entries, "an empty inventory must still yield a non-nil slice")
+	assert.Empty(t, page.Entries)
+	assert.False(t, page.HasMore)
+	assert.Nil(t, page.NextCursor)
 
-	encoded, marshalErr := json.Marshal(entries)
+	encoded, marshalErr := json.Marshal(page.Entries)
 	require.NoError(t, marshalErr)
 	assert.Equal(t, "[]", string(encoded))
 }
@@ -3826,6 +4816,246 @@ func TestListDeadLetterEvents_RejectsAnUnsupportedStatusFilter(t *testing.T) {
 
 		_, err := failingService.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{})
 		dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
+	})
+}
+
+// TestListDeadLetterEvents_DelegatesFilteringToTheRepository asserts the service asks for a
+// FILTERED page rather than filtering a page it was given.
+//
+// This is the shape of the fix, and the shape is what makes the guarantee. Filtering used to
+// happen here: the service asked for unfiltered pages of 500, applied the predicates in Go, and
+// stopped after a fixed row budget. So one filtered request meant many repository requests, and
+// the answer was a prefix of the matches with nothing to say so.
+//
+// Exactly ONE request, carrying the caller's page and the caller's filter, is therefore the
+// assertion. A service that walked again would fail on the count of requests; one that dropped
+// the predicates would fail on the recorded filter.
+func TestListDeadLetterEvents_DelegatesFilteringToTheRepository(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	store := newDltFakeStore()
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	_, err := service.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{
+		Limit:     25,
+		Offset:    50,
+		EventType: "  transaction.applied  ",
+		Topic:     "blnk.transactions",
+		Status:    model.EventOutboxStatusDeadLettered,
+	})
+	require.NoError(t, err)
+
+	pages := store.snapshotInventoryPages()
+	require.Len(t, pages, 1,
+		"one filtered request must be one repository query; several means the predicates are being applied above the database")
+	assert.Equal(t, 25, pages[0].Limit, "the caller's page size must reach the repository")
+	assert.Equal(t, "transaction.applied", pages[0].EventType,
+		"the trimmed event-type narrowing must reach the repository rather than being applied above it")
+	assert.Equal(t, "blnk.transactions", pages[0].Topic,
+		"the trimmed topic narrowing must reach the repository rather than being applied above it")
+	assert.Equal(t, model.EventOutboxStatusDeadLettered, pages[0].Status,
+		"the status narrowing must reach the repository rather than being applied above it")
+}
+
+// TestListDeadLetterEvents_ReturnsMatchesTheFormerScanBudgetWouldHaveHidden is the regression
+// test for the silent truncation.
+//
+// The inventory here is deliberately LARGER than deadLetterScanMaxRows and every match sits
+// past that bound. Under the walk this returned an empty page with a 200 — an operator asking
+// "what identity events are stuck" was told "none" while three were — and no field in the
+// response distinguished that from an exhausted scan. WithScanLimit is set to something small
+// as well, to state that the gauge's bound is not the listing's bound: the listing has none.
+func TestListDeadLetterEvents_ReturnsMatchesTheFormerScanBudgetWouldHaveHidden(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	store := newDltFakeStore()
+
+	// Bulk filler built directly rather than through dltAgedRow: these rows are only ever
+	// counted past, never inspected, and stamping a canonical envelope on each of 5,200
+	// fixtures would cost seconds for nothing.
+	for i := 0; i < deadLetterScanMaxRows+200; i++ {
+		store.withRow(model.EventOutbox{
+			ID:        int64(1_000_000 + i),
+			EventID:   fmt.Sprintf("evt_filler_%05d", i),
+			EventType: "transaction.applied",
+			Topic:     "blnk.transactions",
+			Status:    model.EventOutboxStatusDeadLettered,
+			DLTTopic:  "blnk.transactions.dlt",
+		})
+	}
+
+	// The matches, appended LAST, so they are the deepest rows in the inventory.
+	buried := make([]string, 0, 3)
+	for i := 0; i < 3; i++ {
+		eventID := fmt.Sprintf("evt_buried_%d", i)
+		store.withRow(model.EventOutbox{
+			ID:        int64(2_000_000 + i),
+			EventID:   eventID,
+			EventType: "identity.created",
+			Topic:     "blnk.identities",
+			Status:    model.EventOutboxStatusDeadLettered,
+			DLTTopic:  "blnk.identities.dlt",
+		})
+		buried = append(buried, eventID)
+	}
+
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{}).WithScanLimit(10)
+
+	entries, err := service.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{
+		EventType: "identity.created",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, buried, dltEventIDs(entries),
+		"a match deeper in the inventory than any scan budget must still be listed: answering 200 with an empty page tells an operator nothing is stuck when something is")
+
+	total, countErr := service.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{
+		EventType: "identity.created",
+	})
+	require.NoError(t, countErr)
+	assert.Equal(t, int64(len(buried)), total,
+		"the total must be of the filtered set, not of the table and not of the page")
+
+	assert.Len(t, store.snapshotInventoryPages(), 1, "the listing must not page the inventory at all")
+}
+
+// TestCountDeadLetterEvents_CountsTheFilteredSet is the total a paginated triage list is
+// reported beside.
+//
+// The API used to REFUSE include_count whenever an event-type or topic filter was set, because
+// the only count available was a per-status aggregate over the whole table — a number that
+// described a different set from the page beside it. An operator narrowing the inventory
+// therefore lost the one figure that says how much work is in front of them.
+//
+// Every case below asserts the count against the same options a listing would be issued with,
+// which is the property that makes the pair usable together.
+func TestCountDeadLetterEvents_CountsTheFilteredSet(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	applied := dltAgedRow(t, "evt_count_applied", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute)
+	void := dltAgedRow(t, "evt_count_void", "transaction.void", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 2*time.Minute)
+	appliedFailed := dltAgedRow(t, "evt_count_applied_failed", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusFailed, "", 3*time.Minute)
+	balance := dltAgedRow(t, "evt_count_balance", "balance.monitor", "blnk.balances",
+		model.EventOutboxStatusDeadLettered, "blnk.balances.dlt", 4*time.Minute)
+
+	store := newDltFakeStore().withRow(applied).withRow(void).withRow(appliedFailed).withRow(balance)
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	cases := []struct {
+		name  string
+		opts  DeadLetterListOptions
+		total int64
+	}{
+		{"unfiltered counts both terminal states", DeadLetterListOptions{}, 4},
+		{"by event type", DeadLetterListOptions{EventType: "transaction.applied"}, 2},
+		{"by topic", DeadLetterListOptions{Topic: "blnk.transactions"}, 3},
+		{"by status", DeadLetterListOptions{Status: model.EventOutboxStatusFailed}, 1},
+		{
+			"filters combine",
+			DeadLetterListOptions{
+				EventType: "transaction.applied",
+				Status:    model.EventOutboxStatusDeadLettered,
+			},
+			1,
+		},
+		{"a filter matching nothing counts zero", DeadLetterListOptions{EventType: "ledger.created"}, 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			total, err := service.CountDeadLetterEvents(context.Background(), tc.opts)
+			require.NoError(t, err)
+			assert.Equal(t, tc.total, total)
+
+			// The count and the page must describe the same set. Asserting the listing's
+			// length against the total for a page large enough to hold every match is what
+			// makes that agreement observable rather than assumed.
+			page, listErr := service.ListDeadLetterEvents(context.Background(), tc.opts)
+			require.NoError(t, listErr)
+			assert.Len(t, page.Entries, int(tc.total),
+				"a total that disagrees with the page it accompanies makes a paging client stop early or loop forever")
+		})
+	}
+
+	t.Run("the page is ignored, because a count is of the set", func(t *testing.T) {
+		total, err := service.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{
+			Limit: 1, Offset: 3,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, int64(4), total)
+	})
+
+	t.Run("the narrowing reaches the repository", func(t *testing.T) {
+		counting := newDltFakeStore()
+		countingService := dltNewService(counting, &dltFakePublisher{}, &dltFakeTransport{})
+
+		_, err := countingService.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{
+			EventType: " transaction.applied ",
+			Topic:     " blnk.transactions ",
+			Status:    model.EventOutboxStatusDeadLettered,
+		})
+		require.NoError(t, err)
+
+		counted := counting.snapshotDeadLetterCounts()
+		require.Len(t, counted, 1,
+			"one count request must be one repository query")
+		assert.Equal(t, "transaction.applied", counted[0].EventType)
+		assert.Equal(t, "blnk.transactions", counted[0].Topic)
+		assert.Equal(t, model.EventOutboxStatusDeadLettered, counted[0].Status)
+	})
+}
+
+// TestCountDeadLetterEvents_RefusesAndPropagatesLikeTheListing keeps the two halves of the
+// endpoint answering with one voice.
+//
+// A count that accepted a status the listing rejects would report a total for a set the caller
+// can never page, and a count that swallowed a repository failure would report zero — which
+// reads as "nothing is stuck" and is the single most dangerous wrong answer this surface can
+// give.
+func TestCountDeadLetterEvents_RefusesAndPropagatesLikeTheListing(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	t.Run("an unsupported status filter is refused before the repository is touched", func(t *testing.T) {
+		store := newDltFakeStore()
+		service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+		for _, status := range []string{
+			model.EventOutboxStatusPending,
+			model.EventOutboxStatusProcessing,
+			model.EventOutboxStatusDispatched,
+			"nonsense",
+		} {
+			_, err := service.CountDeadLetterEvents(
+				context.Background(), DeadLetterListOptions{Status: status})
+			dltAssertCodeAndStatus(t, err, apierror.ErrGenValidation, http.StatusBadRequest)
+		}
+
+		assert.Empty(t, store.snapshotDeadLetterCounts(),
+			"a rejected filter must not reach the repository")
+	})
+
+	t.Run("the repository's own failure is propagated, not reported as zero", func(t *testing.T) {
+		failing := newDltFakeStore()
+		failing.countDeadLetterErr = apierror.NewAPIError(
+			apierror.ErrInternalServer, "Failed to count dead-lettered events", errors.New("dial tcp: refused"),
+		)
+		service := dltNewService(failing, &dltFakePublisher{}, &dltFakeTransport{})
+
+		total, err := service.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
+		assert.Zero(t, total)
+		dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
+	})
+
+	t.Run("a service with no datasource refuses rather than answering zero", func(t *testing.T) {
+		_, err := NewEventDeadLetterService(nil, nil).
+			CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
+		dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
+
+		var nilService *EventDeadLetterService
+		_, nilErr := nilService.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
+		dltAssertCodeAndStatus(t, nilErr, apierror.ErrInternalServer, http.StatusInternalServerError)
 	})
 }
 
@@ -4579,4 +5809,670 @@ func TestDeadLetterOutcomeLogFields_RedactTheFinancialKeyAndBoundTheBrokerError(
 	assert.Equal(t, "blnk.transactions", fields["topic"])
 	assert.Equal(t, "blnk.transactions.dlt", fields["dlt_topic"])
 	assert.Equal(t, 5, fields["attempt_count"])
+}
+
+// dltInventoryMatches applies the SAME predicate the repository's SQL applies.
+//
+// It is deliberately an exact mirror rather than a convenient approximation, because the
+// service now delegates ALL narrowing to the database and a fake that filtered more
+// loosely — or that derived a missing topic from the event type, as the deleted Go-side
+// predicate used to — would let the service pass here while the real query returned a
+// different set. Comparisons are exact and case-sensitive on the stored columns, and the
+// topic is the row's stored topic with no derivation: the real column is NOT NULL under
+// CHECK (btrim(topic) <> ”), so a stored row cannot need one.
+func dltInventoryMatches(row model.EventOutbox, query model.DeadLetterQuery) bool {
+	if query.Status != "" && row.Status != query.Status {
+		return false
+	}
+	if query.EventType != "" && row.EventType != query.EventType {
+		return false
+	}
+	if query.Topic != "" && row.Topic != query.Topic {
+		return false
+	}
+
+	// The occurrence window, INCLUSIVE at both ends, exactly as the statement's two nullable
+	// arms are: a caller correlating against a precise instant must get the events at it.
+	if !query.OccurredFrom.IsZero() && row.OccurredAt.Before(query.OccurredFrom) {
+		return false
+	}
+	if !query.OccurredTo.IsZero() && row.OccurredAt.After(query.OccurredTo) {
+		return false
+	}
+
+	// The resolution arms, mirroring the statement's two NULL tests. Modelled here rather than
+	// in the service on purpose: it is what makes a service that narrowed in Go fail.
+	if query.UnresolvedOnly && row.IsResolvedDeadLetter() {
+		return false
+	}
+	if query.ResolvedOnly && !row.IsResolvedDeadLetter() {
+		return false
+	}
+
+	return true
+}
+
+// matchingInventoryLocked returns the inventory rows a query matches, newest first.
+// The caller holds the lock.
+func (s *dltFakeStore) matchingInventoryLocked(query model.DeadLetterQuery) []model.EventOutbox {
+	matches := make([]model.EventOutbox, 0, len(s.inventory))
+	for _, eventID := range s.inventory {
+		row := *s.rows[eventID]
+		if dltInventoryMatches(row, query) {
+			matches = append(matches, row)
+		}
+	}
+
+	return matches
+}
+
+// ListDeadLetterInventory pages the MATCHING rows newest first, applying the filters, the
+// occurrence window and the keyset cursor exactly as the SQL does.
+//
+// The predicates and the cursor are honoured HERE rather than assumed away, because they live in
+// the query rather than in the service: a fake that ignored them would let the service pass its
+// filtering tests while the statement did the filtering, which is precisely the thing under
+// test.
+func (s *dltFakeStore) ListDeadLetterInventory(
+	_ context.Context,
+	query model.DeadLetterInventoryQuery,
+) (model.DeadLetterInventoryPage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Recorded as the narrowing, so an assertion reads the filters the service passed without
+	// having to know which of the two query shapes carried them.
+	filter := model.DeadLetterQuery{
+		EventType:      query.EventType,
+		Topic:          query.Topic,
+		Status:         query.Status,
+		OccurredFrom:   query.OccurredFrom,
+		OccurredTo:     query.OccurredTo,
+		UnresolvedOnly: query.UnresolvedOnly,
+		ResolvedOnly:   query.ResolvedOnly,
+		Limit:          query.Limit,
+	}
+	s.inventoryQueries = append(s.inventoryQueries, filter)
+	s.inventoryPages = append(s.inventoryPages, query)
+
+	if s.listErr != nil {
+		return model.DeadLetterInventoryPage{}, s.listErr
+	}
+
+	limit := query.Limit
+	if limit <= 0 {
+		limit = len(s.inventory)
+	}
+
+	page := model.DeadLetterInventoryPage{Entries: make([]model.DeadLetterInventoryEntry, 0, limit)}
+	passedCursor := query.Cursor == nil
+
+	for _, eventID := range s.inventory {
+		row := s.rows[eventID]
+
+		if !passedCursor {
+			// The inventory is newest first, so the cursor's row and everything before it
+			// belong to the previous page.
+			if row.OccurredAt.Equal(query.Cursor.OccurredAt) && row.ID == query.Cursor.ID {
+				passedCursor = true
+			}
+
+			continue
+		}
+
+		if !dltInventoryMatches(*row, filter) {
+			continue
+		}
+
+		if len(page.Entries) == limit {
+			// The probe row the real query reads to answer "is there more", and the cursor
+			// comes from the last RETURNED entry rather than from this one.
+			page.HasMore = true
+
+			break
+		}
+
+		page.Entries = append(page.Entries, dltInventoryEntryOf(*row))
+	}
+
+	if page.HasMore && len(page.Entries) > 0 {
+		last := page.Entries[len(page.Entries)-1]
+		page.NextCursor = &model.DeadLetterCursor{OccurredAt: last.OccurredAt, ID: last.ID}
+	}
+
+	return page, nil
+}
+
+// CountDeadLetterInventory counts matches, ignoring the page, exactly as the repository's
+// COUNT(*) over the shared predicate does.
+func (s *dltFakeStore) CountDeadLetterInventory(
+	_ context.Context,
+	query model.DeadLetterQuery,
+) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.countQueries = append(s.countQueries, query)
+
+	if s.countErr != nil {
+		return 0, s.countErr
+	}
+
+	return int64(len(s.matchingInventoryLocked(query))), nil
+}
+
+// snapshotInventoryQueries returns the queries the service handed the FILTERED listing.
+//
+// The whole query is captured rather than a page request, because the property under test is
+// that the narrowing REACHED THE DATABASE. A service that accepted a filter and then applied
+// it in Go would issue an unfiltered query here and still return the right rows for a small
+// fixture — passing a test that only checked the returned entries, while behaving exactly as
+// the defect did on a real inventory.
+// snapshotInventoryPages returns a copy of the keyset requests the inventory was read with.
+func (s *dltFakeStore) snapshotInventoryPages() []model.DeadLetterInventoryQuery {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pages := make([]model.DeadLetterInventoryQuery, len(s.inventoryPages))
+	copy(pages, s.inventoryPages)
+
+	return pages
+}
+
+func (s *dltFakeStore) snapshotInventoryQueries() []model.DeadLetterQuery {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	queries := make([]model.DeadLetterQuery, len(s.inventoryQueries))
+	copy(queries, s.inventoryQueries)
+
+	return queries
+}
+
+// TestListDeadLetterEvents_NarrowingIsAppliedInSQLRatherThanAboveIt is the finding itself.
+//
+// # What was wrong
+//
+// A filtered listing used to be served by WALKING the unfiltered inventory in 500-row pages
+// and testing each row in Go, abandoning the walk after 5,000 scanned rows. Two things
+// followed, and neither was visible to the caller:
+//
+//   - A filter whose matches all lay beyond the ceiling returned an ordinary EMPTY page with
+//     a 200. An operator asking "which transaction events are stuck" was told "none" while
+//     transaction events were stuck. The likelihood of that answer rose with the size of the
+//     inventory, which is exactly backwards for a tool reached during an incident.
+//   - Those matches were unreachable by paging at all: no offset could get past the ceiling.
+//
+// # What is asserted here
+//
+// That the SERVICE DOES NOT NARROW. The fixture is small, so a service filtering in Go would
+// return the same rows and pass any test that only inspected the result — which is precisely
+// how the defect survived. So the assertion is on the query handed to the repository: the
+// filters must be in it, and the unfiltered walk must not be used at all.
+func TestListDeadLetterEvents_NarrowingIsAppliedInSQLRatherThanAboveIt(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	stuck := dltAgedRow(t, "evt_sql_txn", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 20*time.Minute)
+	other := dltAgedRow(t, "evt_sql_bal", "balance.created", "blnk.balances",
+		model.EventOutboxStatusFailed, "", 10*time.Minute)
+
+	store := newDltFakeStore().withRow(stuck).withRow(other)
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	entries, err := service.ListDeadLetterEvents(context.Background(), DeadLetterListOptions{
+		EventType: "transaction.applied",
+		Topic:     "blnk.transactions",
+		Status:    model.EventOutboxStatusDeadLettered,
+	})
+	require.NoError(t, err)
+
+	require.Len(t, entries.Entries, 1, "only the matching entry may be returned")
+	assert.Equal(t, "evt_sql_txn", entries.Entries[0].EventID)
+
+	queries := store.snapshotInventoryQueries()
+	require.Len(t, queries, 1, "a filtered page must be ONE query, not a walk of many")
+	assert.Equal(t, "transaction.applied", queries[0].EventType,
+		"the event-type filter must reach SQL; applied above it, matches beyond the old scan "+
+			"ceiling were reported as absent")
+	assert.Equal(t, "blnk.transactions", queries[0].Topic, "the topic filter must reach SQL")
+	assert.Equal(t, model.EventOutboxStatusDeadLettered, queries[0].Status,
+		"the status filter must reach SQL")
+
+	assert.Empty(t, store.snapshotPages(),
+		"the unfiltered paging method must not be used to serve a filtered listing; that method "+
+			"IS the walk the ceiling truncated")
+}
+
+// TestListDeadLetterEvents_OffsetPagesTheMatchesRatherThanTheInventory asserts that a
+// filtered page is a page of the FILTERED set.
+//
+// Skipping rows before filtering would make a page short and unstable as the filter's hit
+// rate varied — a caller stepping offset by its limit would see gaps. The database applies
+// predicate and page together, so offset counts matches; this pins that end to end and, with
+// the deep offset, pins that a match past the front of the inventory is reachable.
+func TestListDeadLetterEvents_OffsetPagesTheMatchesRatherThanTheInventory(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	store := newDltFakeStore()
+	// Interleaved so that no page of the UNFILTERED inventory is a page of the filtered one:
+	// every second row is a non-match.
+	wanted := make([]string, 0, 6)
+	for i := 0; i < 6; i++ {
+		match := dltAgedRow(t, fmt.Sprintf("evt_match_%d", i), "transaction.applied",
+			"blnk.transactions", model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt",
+			time.Duration(60-i)*time.Minute)
+		noise := dltAgedRow(t, fmt.Sprintf("evt_noise_%d", i), "balance.created",
+			"blnk.balances", model.EventOutboxStatusDeadLettered, "blnk.balances.dlt",
+			time.Duration(60-i)*time.Minute)
+		store = store.withRow(match).withRow(noise)
+		wanted = append(wanted, match.EventID)
+	}
+
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+	filter := DeadLetterListOptions{EventType: "transaction.applied", Limit: 2}
+
+	seen := make([]string, 0, len(wanted))
+	for request := 0; request < 3; request++ {
+		page, err := service.ListDeadLetterEvents(context.Background(), filter)
+		require.NoError(t, err)
+		require.Lenf(t, page.Entries, 2,
+			"request %d must return a FULL page of matches; a short page here means rows were "+
+				"skipped before the filter was applied", request)
+
+		for _, entry := range page.Entries {
+			assert.Equal(t, "transaction.applied", entry.EventType)
+			seen = append(seen, entry.EventID)
+		}
+
+		// RESUMED FROM THE LAST MATCH, not from a row position. That is what makes a filtered
+		// walk exact: an offset counts rows the filter rejected, so it skipped matches and
+		// repeated others as soon as the filter removed anything.
+		//
+		// Taken from the last ENTRY rather than from NextCursor, because the final page of an
+		// exactly-divided walk reports no further page and therefore carries no cursor — and the
+		// position past the last match is exactly what the tail assertion below needs.
+		last := page.Entries[len(page.Entries)-1]
+		filter.Cursor = &model.DeadLetterCursor{OccurredAt: last.OccurredAt, ID: last.ID}
+	}
+
+	assert.ElementsMatch(t, wanted, seen,
+		"paging by the limit must visit every match exactly once, with no gap and no repeat")
+
+	// Past the end of the MATCHES, not past the end of the inventory: six non-matching rows
+	// remain, and they must not appear.
+	tail, err := service.ListDeadLetterEvents(context.Background(), filter)
+	require.NoError(t, err)
+	assert.Empty(t, tail.Entries,
+		"a cursor past the last match returns an empty page, never a non-match: six non-matching "+
+			"rows remain in the inventory and the filter belongs to the statement, so none of them "+
+			"can surface")
+}
+
+// TestCountDeadLetterEvents_CountsTheSameSetTheListingReturns is the second half of the fix.
+//
+// include_count used to be REFUSED alongside an event-type or topic filter, because no
+// filter-aware count existed. The listings an operator actually pages through were therefore
+// the ones that could not say how much was left — and the point of narrowing is to work
+// through a specific backlog.
+//
+// The property that makes the total trustworthy is that the count and the listing share ONE
+// predicate. Asserting the number alone would not show that; the query the count issues is
+// compared against the query the listing issues, field for field, so an independent
+// look-alike predicate would fail here.
+func TestCountDeadLetterEvents_CountsTheSameSetTheListingReturns(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	store := newDltFakeStore()
+	for i := 0; i < 7; i++ {
+		store = store.withRow(dltAgedRow(t, fmt.Sprintf("evt_count_txn_%d", i),
+			"transaction.applied", "blnk.transactions",
+			model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt",
+			time.Duration(30-i)*time.Minute))
+	}
+	for i := 0; i < 3; i++ {
+		store = store.withRow(dltAgedRow(t, fmt.Sprintf("evt_count_bal_%d", i),
+			"balance.created", "blnk.balances",
+			model.EventOutboxStatusFailed, "", time.Duration(20-i)*time.Minute))
+	}
+
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	cases := []struct {
+		name     string
+		options  DeadLetterListOptions
+		expected int64
+	}{
+		{"the whole inventory", DeadLetterListOptions{}, 10},
+		{"narrowed by event type", DeadLetterListOptions{EventType: "transaction.applied"}, 7},
+		{"narrowed by topic", DeadLetterListOptions{Topic: "blnk.balances"}, 3},
+		{"narrowed by status", DeadLetterListOptions{Status: model.EventOutboxStatusFailed}, 3},
+		{
+			"narrowed by every filter at once",
+			DeadLetterListOptions{EventType: "balance.created", Topic: "blnk.balances", Status: model.EventOutboxStatusFailed},
+			3,
+		},
+		{
+			"a filter combination nothing matches counts zero rather than failing",
+			DeadLetterListOptions{EventType: "transaction.applied", Topic: "blnk.balances"},
+			0,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			total, err := service.CountDeadLetterEvents(context.Background(), testCase.options)
+			require.NoError(t, err)
+			assert.Equal(t, testCase.expected, total)
+
+			// The page must not influence the total: a caller reading page two of a
+			// backlog still needs its full size.
+			paged := testCase.options
+			paged.Limit = 2
+			paged.Offset = 4
+			pagedTotal, err := service.CountDeadLetterEvents(context.Background(), paged)
+			require.NoError(t, err)
+			assert.Equal(t, testCase.expected, pagedTotal,
+				"LIMIT and OFFSET select which matches to return and have no bearing on how "+
+					"many there are")
+		})
+	}
+
+	// The predicate is shared, not merely similar. Both queries are issued for the same
+	// options and compared on their filter fields.
+	options := DeadLetterListOptions{EventType: "transaction.applied", Topic: "blnk.transactions", Limit: 3}
+	_, err := service.ListDeadLetterEvents(context.Background(), options)
+	require.NoError(t, err)
+	_, err = service.CountDeadLetterEvents(context.Background(), options)
+	require.NoError(t, err)
+
+	listQueries := store.snapshotInventoryQueries()
+	countQueries := store.snapshotCountQueries()
+	require.NotEmpty(t, listQueries)
+	require.NotEmpty(t, countQueries)
+
+	lastList := listQueries[len(listQueries)-1]
+	lastCount := countQueries[len(countQueries)-1]
+	assert.Equal(t, lastList.EventType, lastCount.EventType,
+		"the count must narrow by exactly what the listing narrowed by, or an operator pages "+
+			"through one set while being told the size of another")
+	assert.Equal(t, lastList.Topic, lastCount.Topic)
+	assert.Equal(t, lastList.Status, lastCount.Status)
+}
+
+// TestCountDeadLetterEvents_RefusesTheSameStatusFilterTheListingRefuses keeps the two
+// operations' validation in step.
+//
+// An unrecognised status must be refused rather than allowed to match nothing, because an
+// empty result reads as "nothing is stuck" — the wrong answer to a question that was never
+// understood. The listing already did that; a count that accepted the same value and answered
+// zero would let a caller conclude the backlog was empty by asking the other endpoint.
+func TestCountDeadLetterEvents_RefusesTheSameStatusFilterTheListingRefuses(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	store := newDltFakeStore().withRow(dltAgedRow(t, "evt_status_guard", "transaction.applied",
+		"blnk.transactions", model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute))
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	options := DeadLetterListOptions{Status: "pending"}
+
+	_, listErr := service.ListDeadLetterEvents(context.Background(), options)
+	require.Error(t, listErr, "a non-terminal status is not a dead-letter filter")
+
+	total, countErr := service.CountDeadLetterEvents(context.Background(), options)
+	require.Error(t, countErr,
+		"the count must refuse what the listing refuses; answering zero would report an empty "+
+			"backlog to a caller whose filter was never valid")
+	assert.Zero(t, total)
+
+	assert.Equal(t, apierror.ErrGenValidation, dltAPIError(t, listErr).Code,
+		"the listing's refusal is a validation error")
+	assert.Equal(t, apierror.ErrGenValidation, dltAPIError(t, countErr).Code,
+		"and so is the count's, so a caller sees one contract across both")
+
+	assert.Empty(t, store.snapshotCountQueries(),
+		"a refused filter must never reach the database")
+}
+
+// dltInventoryEntryOf projects a stored row into the NARROW inventory entry the repository
+// returns, dropping the body and carrying only its size — the same projection the SQL performs
+// with octet_length (PERF-P06).
+func dltInventoryEntryOf(row model.EventOutbox) model.DeadLetterInventoryEntry {
+	return model.DeadLetterInventoryEntry{
+		ID:               row.ID,
+		EventID:          row.EventID,
+		EventType:        row.EventType,
+		AggregateID:      row.AggregateID,
+		PartitionKey:     row.PartitionKey,
+		LedgerID:         row.LedgerID,
+		Topic:            row.Topic,
+		SchemaVersion:    row.SchemaVersion,
+		OccurredAt:       row.OccurredAt,
+		Status:           row.Status,
+		Attempts:         row.Attempts,
+		LastError:        row.LastError,
+		FirstAttemptedAt: row.FirstAttemptedAt,
+		LastAttemptedAt:  row.LastAttemptedAt,
+		DLTTopic:         row.DLTTopic,
+		FailureMetadata:  row.FailureMetadata,
+		PayloadBytes:     len(row.Payload),
+	}
+}
+
+// OldestDeadLetterAgeByTopic reports the oldest outstanding entry per dead-letter topic, as
+// the repository's grouped aggregate does (PERF-P07).
+func (s *dltFakeStore) OldestDeadLetterAgeByTopic(
+	_ context.Context,
+	deadLetterSuffix string,
+) ([]model.DeadLetterTopicAge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.ageCalls++
+
+	if s.ageErr != nil {
+		return nil, s.ageErr
+	}
+
+	grouped := make(map[string]model.DeadLetterTopicAge)
+	for _, eventID := range s.inventory {
+		row := s.rows[eventID]
+
+		// RESOLVED ROWS ARE EXCLUDED, mirroring the statement's resolved_at IS NULL. The gauge
+		// reports the work that REMAINS: a forty-hour entry an operator closed yesterday would
+		// otherwise dominate the age and keep DeadLetterMessageStuck firing over history.
+		if row.IsResolvedDeadLetter() {
+			continue
+		}
+
+		topic := row.DLTTopic
+		if topic == "" {
+			topic = row.Topic + deadLetterSuffix
+		}
+
+		aged := row.OccurredAt
+		if row.LastAttemptedAt != nil {
+			aged = *row.LastAttemptedAt
+		}
+
+		entry, seen := grouped[topic]
+		entry.Topic = topic
+		entry.Outstanding++
+		if !seen || aged.Before(entry.Oldest) {
+			entry.Oldest = aged
+		}
+		grouped[topic] = entry
+	}
+
+	ages := make([]model.DeadLetterTopicAge, 0, len(grouped))
+	for _, entry := range grouped {
+		ages = append(ages, entry)
+	}
+
+	return ages, nil
+}
+
+// snapshotAgeCalls returns how many times the grouped age aggregate was read.
+//
+// The COUNT is the assertion, not the result (PERF-P07): the answer looks identical whether it
+// came from one aggregate or from a per-topic query in a loop, and the difference between those
+// two is the finding.
+func (s *dltFakeStore) snapshotAgeCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.ageCalls
+}
+
+// ListDeadLetteredEventsFiltered pages the inventory, newest first, applying the filter
+// the way SQL does: to the WHOLE population before the page is taken.
+//
+// Filtering before paging is what makes the double faithful. The old Go-side walk filtered
+// AFTER paging and skipped Offset matches by hand; if this double did that, a test would
+// pass against an implementation that had pushed a filter into SQL incorrectly.
+func (s *dltFakeStore) ListDeadLetteredEventsFiltered(
+	_ context.Context,
+	filter model.DeadLetterInventoryFilter,
+	limit, offset int,
+) ([]model.EventOutbox, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	recorded := filter
+	recorded.Limit, recorded.Offset = limit, offset
+	s.listCalls = append(s.listCalls, recorded)
+
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+
+	matching := s.matchingLocked(filter)
+
+	if offset >= len(matching) {
+		// The repository returns a nil slice for a page past the end. Reproducing that
+		// exactly is what lets the nil-to-empty normalisation be asserted.
+		return nil, nil
+	}
+
+	end := offset + limit
+	if end > len(matching) {
+		end = len(matching)
+	}
+
+	page := make([]model.EventOutbox, 0, end-offset)
+	page = append(page, matching[offset:end]...)
+
+	return page, nil
+}
+
+// MarkEventDeadLetterResolved records a resolution, reproducing the real conditional
+// write's three outcomes: it succeeds only on an unresolved dead_lettered row, refuses an
+// already-resolved one with its own code, and refuses anything else as not dead-lettered.
+func (s *dltFakeStore) MarkEventDeadLetterResolved(
+	_ context.Context,
+	eventID string,
+	note string,
+	at time.Time,
+) (*model.EventOutbox, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.resolveCalls = append(s.resolveCalls, dltResolveRecord{eventID: eventID, note: note, at: at})
+
+	if s.resolveErr != nil {
+		return nil, s.resolveErr
+	}
+
+	row, ok := s.rows[eventID]
+	if !ok {
+		return nil, apierror.NewAPIError(apierror.ErrNotFound, "Event not found", sql.ErrNoRows)
+	}
+
+	if row.IsResolvedDeadLetter() {
+		return nil, apierror.NewAPIError(
+			apierror.ErrEventAlreadyResolved,
+			"This dead-lettered event has already been resolved", nil,
+		)
+	}
+	if row.Status != model.EventOutboxStatusDeadLettered {
+		return nil, apierror.NewAPIError(
+			apierror.ErrEventNotDeadLettered,
+			"Only a dead-lettered event can be resolved; this event has no dead-letter record", nil,
+		)
+	}
+
+	resolvedAt := at.UTC()
+	row.ResolvedAt = &resolvedAt
+	row.ResolutionNote = note
+
+	copied := *row
+
+	return &copied, nil
+}
+
+// Four occurrence-window tests that arrived with this feature are GONE, and three of them are
+// moot rather than merely duplicated.
+//
+// They were written for a service with TWO read paths — a single LIMIT/OFFSET query for a
+// request the repository could answer exactly, and a bounded in-memory walk for the filters it
+// could not — and they pinned which path a window took, on the reasoning that routing a
+// windowed request through the walk would cap an index-served answer at the scan budget.
+//
+// That reasoning was right and this service acted on it further: there is ONE path now, and
+// every narrowing including the window is applied in SQL (see DeadLetterListOptions.filtered,
+// which survives as observability only). With no walk left there is no routing to assert, and
+// asserting it against the offset-paged reader records pages the listing no longer reads.
+//
+// What they pinned that still matters is kept:
+//
+//   - the bounds reaching the repository, both bounds inclusive, one-sided windows, the window
+//     combining with the other filters, and a reversed window refused BEFORE any read — all in
+//     TestListDeadLetterEvents_AppliesTheOccurrenceWindow above, against the keyset query the
+//     listing actually issues;
+//   - the refusal NAMING the two parameters, which was this feature's own improvement, now
+//     asserted there and stated in the message itself;
+//   - UTC normalisation of a supplied bound, which deadLetterFilterClause performs when it
+//     binds, covered by database.TestCountEventOutboxByStatus_NormalisesTheWindow;
+//   - the age gauge scanning UNWINDOWED, which is a property of a different read and is
+//     retained below in its own test, retargeted onto the inventory query.
+
+// TestDeadLetterAgeGauge_ReadsNoWindowAtAll guards the one read that must never carry a window,
+// and it pins a deliberate ABSENCE.
+//
+// The gauge exists to find the OLDEST outstanding entry, which is the value the 15-minute alert is
+// written against. Any lower bound on that read would cap the age it could ever report, so an
+// entry stuck for a day would be published as younger than the window — the gauge would look
+// healthy at exactly the moment it is supposed to fire.
+//
+// # Why this asserts what is NOT read
+//
+// The property arrived as "the age scan's pages must be unbounded", written for a gauge that
+// walked the inventory. This gauge does not walk it: OldestDeadLetterAgeByTopic is a grouped
+// aggregate that takes no window and no page, so an unwindowed read is guaranteed by the shape of
+// the call rather than by every page of it being checked. The assertion follows the property to
+// where it now lives — one aggregate call, and no listing read that a window could be attached
+// to. A future refactor that answered the gauge by paging the inventory would fail here, which is
+// exactly when the original concern becomes live again.
+func TestDeadLetterAgeGauge_ReadsNoWindowAtAll(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	stuck := dltAgedRow(t, "evt_unwindowed_stuck", "transaction.applied", "blnk.transactions",
+		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 45*time.Minute)
+	store := newDltFakeStore().withRow(stuck)
+	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+	dltCaptureAgeGauge(t)
+
+	report, err := service.RefreshDeadLetterAgeGauge(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Minute, report.OldestAge(),
+		"the full age must be reported: a capped read is how a stuck entry looks fresh")
+
+	assert.Equal(t, 1, store.snapshotAgeCalls(),
+		"the gauge must answer from the grouped aggregate, which takes no window")
+	assert.Empty(t, store.snapshotInventoryPages(),
+		"and it must read no inventory page at all: a paged read is what a window could bound, "+
+			"and a bounded read caps the age the gauge can ever publish")
+	assert.Empty(t, store.snapshotPages(),
+		"nor the offset-paged listing, for the same reason")
 }

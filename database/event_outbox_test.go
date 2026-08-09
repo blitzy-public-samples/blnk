@@ -82,8 +82,10 @@ import (
 	"go/token"
 	"math/big"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -100,6 +102,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testSettlementLease is the exclusive window the repository tests hand to the terminal
+// transitions as their settlement lease.
+//
+// It matches defaultEventRelayLockDuration, which is what the relay actually passes, so these
+// tests exercise the plumbed value rather than the zero-value fallback. A test that needs the
+// lease to have EXPIRED manipulates locked_until directly instead of shortening this, because
+// the point of the lease is that it is held for a duration a live worker plausibly needs.
+const testSettlementLease = 30 * time.Second
+
 // ---------------------------------------------------------------------------
 // Shared scaffolding
 //
@@ -108,6 +119,20 @@ import (
 // mockCache, newMockCache, quiesceOutbox and newOutboxEntry are all defined
 // elsewhere in package database and are reused, never redeclared.
 // ---------------------------------------------------------------------------
+
+// testDeadLetterHandoffLease is the lease every terminal transition in these tests holds
+// the row under while its dead-letter write is owed.
+//
+// It is deliberately LONGER than any single test spends between the terminal transition and
+// the assertion that follows it, because a lease that lapsed mid-test would let
+// ClaimFailedEventOutboxForDeadLetter reclaim the row and the assertion would then be
+// measuring the repair pass rather than the transition under test.
+//
+// It is also deliberately not the production default: passing the default here would let a
+// caller that forgot to plumb its lock duration through pass zero and still see the correct
+// value applied by normalizeDeadLetterHandoffLease, so the tests could not tell a supplied
+// lease from a normalised one. A distinct value makes the argument observable.
+const testDeadLetterHandoffLease = 45 * time.Second
 
 // requireAPIError asserts that err is an apierror.APIError carrying the expected code.
 //
@@ -137,6 +162,34 @@ func requireAPIError(t *testing.T, err error, want apierror.ErrorCode) {
 	require.True(t, errors.As(err, &apiErr),
 		"expected an apierror.APIError (possibly wrapped), got %T: %v", err, err)
 	assert.Equal(t, want, apiErr.Code, "unexpected apierror code (message was %q)", apiErr.Message)
+}
+
+// errorDetailText renders an apierror's Details so a test can assert on the diagnostic the
+// caller receives, not only on the code and message.
+//
+// APIError.Error() formats "CODE: message" and deliberately omits Details, so a marker phrase
+// carried in the wrapped cause — the way subscriberFenceLost carries the one blnk's
+// subscriberFenceWasLost matches on — is invisible to a plain err.Error() assertion. A test that
+// only checked the message would pass whether or not the marker survived, which is the opposite
+// of what it is for.
+//
+// Parameters:
+//   - err error: the error to inspect. Anything that is not an APIError, and any APIError with
+//     no details, renders as the empty string.
+//
+// Returns:
+//   - string: the rendered details.
+func errorDetailText(err error) string {
+	var apiErr apierror.APIError
+	if !errors.As(err, &apiErr) || apiErr.Details == nil {
+		return ""
+	}
+
+	if detail, ok := apiErr.Details.(error); ok {
+		return detail.Error()
+	}
+
+	return fmt.Sprint(apiErr.Details)
 }
 
 // capturedArg is a sqlmock.Argument that records the value bound in its position
@@ -313,6 +366,19 @@ func eventOutboxRow(e model.EventOutbox) []driver.Value {
 		nullInt64(e.KafkaOffset),
 		nullText(e.DLTTopic),
 		failureMetadata,
+		// The two TRACE-CONTEXT columns, both nullable, and NULL is the common case: an event
+		// captured with no active trace records neither. Rendered through nullText for the
+		// reason ledger_id is — the columns' CHECK constraints bound the length and the
+		// service never writes '', so a fixture rendering an empty string would exercise a
+		// row nothing produces.
+		nullText(e.Traceparent),
+		nullText(e.Tracestate),
+		// THE OPERATOR RESOLUTION, both nullable, and NULL is the meaningful state: nil
+		// resolved_at is what keeps a dead-lettered row out of the retention purge and in the
+		// dead-letter age gauge, so a fixture rendering a zero instant would exercise a row
+		// the purge would delete and the table's own CHECK on the pair would refuse.
+		nullTime(e.ResolvedAt),
+		nullText(e.ResolutionNote),
 	}
 }
 
@@ -404,6 +470,165 @@ func newEventOutboxRows(entries ...model.EventOutbox) *sqlmock.Rows {
 	return rows
 }
 
+// deadLetterInventoryProjectedColumns derives the NARROW inventory column list from
+// deadLetterInventoryColumns, for the same reason eventOutboxProjectedColumns derives the wide
+// one: a hand-kept copy would keep agreeing with itself while the query moved.
+//
+// The last entry is an expression with an alias — octet_length(payload_raw) AS payload_bytes —
+// so the alias is taken as the column name, which is what a driver reports for it.
+func deadLetterInventoryProjectedColumns() []string {
+	raw := strings.Split(deadLetterInventoryColumns, ",")
+	columns := make([]string, 0, len(raw))
+	for _, name := range raw {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		if index := strings.LastIndex(strings.ToUpper(trimmed), " AS "); index != -1 {
+			trimmed = strings.TrimSpace(trimmed[index+4:])
+		}
+		columns = append(columns, trimmed)
+	}
+
+	return columns
+}
+
+// deadLetterInventoryRow renders one entry as the driver values the narrow projection produces,
+// in that exact order.
+//
+// Nullable columns render as SQL NULL when their Go zero value means "unset", and payload_bytes
+// renders as int64 because octet_length returns an integer PostgreSQL hands back as one — a Go
+// int here would let a scan pass under the mock that fails against the real driver.
+func deadLetterInventoryRow(e model.DeadLetterInventoryEntry) []driver.Value {
+	nullTime := func(ts *time.Time) driver.Value {
+		if ts == nil {
+			return nil
+		}
+
+		return *ts
+	}
+	nullText := func(s string) driver.Value {
+		if s == "" {
+			return nil
+		}
+
+		return s
+	}
+
+	var failureMetadata driver.Value
+	if len(e.FailureMetadata) > 0 {
+		failureMetadata = []byte(e.FailureMetadata)
+	}
+
+	return []driver.Value{
+		e.ID,
+		e.EventID,
+		e.EventType,
+		e.AggregateID,
+		e.PartitionKey,
+		nullText(e.LedgerID),
+		e.Topic,
+		int64(e.SchemaVersion),
+		e.OccurredAt,
+		e.Status,
+		int64(e.Attempts),
+		nullText(e.LastError),
+		nullTime(e.FirstAttemptedAt),
+		nullTime(e.LastAttemptedAt),
+		nullText(e.DLTTopic),
+		failureMetadata,
+		int64(e.PayloadBytes),
+	}
+}
+
+// newDeadLetterInventoryRows builds a mocked narrow result set, one row per entry.
+func newDeadLetterInventoryRows(entries ...model.DeadLetterInventoryEntry) *sqlmock.Rows {
+	rows := sqlmock.NewRows(deadLetterInventoryProjectedColumns())
+	for _, entry := range entries {
+		rows.AddRow(deadLetterInventoryRow(entry)...)
+	}
+
+	return rows
+}
+
+// deadLetterInventoryEntryOf projects a stored row the way the narrow statement projects it:
+// every column the inventory reads, the body's SIZE, and not the body (PERF-P06).
+func deadLetterInventoryEntryOf(e model.EventOutbox) model.DeadLetterInventoryEntry {
+	return model.DeadLetterInventoryEntry{
+		ID:               e.ID,
+		EventID:          e.EventID,
+		EventType:        e.EventType,
+		AggregateID:      e.AggregateID,
+		PartitionKey:     e.PartitionKey,
+		LedgerID:         e.LedgerID,
+		Topic:            e.Topic,
+		SchemaVersion:    e.SchemaVersion,
+		OccurredAt:       e.OccurredAt,
+		Status:           e.Status,
+		Attempts:         e.Attempts,
+		LastError:        e.LastError,
+		FirstAttemptedAt: e.FirstAttemptedAt,
+		LastAttemptedAt:  e.LastAttemptedAt,
+		DLTTopic:         e.DLTTopic,
+		FailureMetadata:  e.FailureMetadata,
+		PayloadBytes:     len(e.Payload),
+	}
+}
+
+// deadLetterEventIDsOf projects the event ids out of an inventory page.
+func deadLetterEventIDsOf(page model.DeadLetterInventoryPage) []string {
+	ids := make([]string, 0, len(page.Entries))
+	for _, entry := range page.Entries {
+		ids = append(ids, entry.EventID)
+	}
+
+	return ids
+}
+
+// walkDeadLetterInventory pages the whole inventory by CURSOR and returns every entry.
+//
+// A cursor walk rather than an offset one (PERF-P08), and it is what a real-database test has
+// to do now: a shared database holds other runs' dead-lettered rows, so this run's fixtures are
+// not guaranteed to be on page one. maxPages bounds it so a runaway walk fails the test rather
+// than the suite.
+func walkDeadLetterInventory(
+	t *testing.T,
+	ds Datasource,
+	ctx context.Context,
+	pageSize int,
+) []model.DeadLetterInventoryEntry {
+	t.Helper()
+
+	const maxPages = 200
+
+	all := make([]model.DeadLetterInventoryEntry, 0, pageSize)
+
+	var cursor *model.DeadLetterCursor
+	for page := range maxPages {
+		got, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+			Limit:  pageSize,
+			Cursor: cursor,
+		})
+		require.NoError(t, err, "paging the dead-letter inventory (page %d)", page)
+
+		all = append(all, got.Entries...)
+
+		if !got.HasMore || got.NextCursor == nil {
+			return all
+		}
+
+		cursor = got.NextCursor
+	}
+
+	t.Fatalf("the dead-letter inventory did not terminate within %d pages of %d", maxPages, pageSize)
+
+	return all
+}
+
+// containsDeadLetteredEventID WAS RETIRED HERE. It was the inventory-projection twin of
+// containsEventID, and membership over a projection is asserted through deadLetterEventIDsOf
+// with assert.Contains — one idiom, and the failure message names the ids it did find rather
+// than reporting a bare false.
 // dbTimestamp truncates an instant to the resolution PostgreSQL actually stores.
 //
 // TIMESTAMP WITH TIME ZONE holds MICROSECONDS, while Go's time.Now() carries
@@ -532,6 +757,19 @@ func TestEventOutboxColumns_ProjectsEveryScannedColumnAndNoOthers(t *testing.T) 
 		// read all-or-nothing too, which is why the three sit adjacent.
 		"kafka_topic", "kafka_partition", "kafka_offset",
 		"dlt_topic", "failure_metadata",
+		// THE CAPTURED TRACE CONTEXT, projected because the PUBLISH path reads it: the relay
+		// links its producer span to the trace of the request that captured the event, and a
+		// claimed row read without these two arrives with no memory of where it came from, so
+		// every publish span would start a trace of its own. They sit last, matching both the
+		// scanner's destination order and the order the ALTER TABLE in sql/1781249137.sql adds
+		// them in.
+		"traceparent", "tracestate",
+		// THE OPERATOR RESOLUTION, projected because the retention gate and the dead-letter
+		// listing both read it: resolved_at nil means UNRESOLVED, which is what keeps the row
+		// out of the purge and in the age gauge, and the note is what an operator wrote to
+		// account for it. They sit last, matching the scanner's destination order and the order
+		// the ALTER TABLE in sql/1781249007.sql adds them in.
+		"resolved_at", "resolution_note",
 	}
 	assert.Equal(t, want, columns,
 		"the projected column list must match scanEventOutbox's destination order exactly")
@@ -1129,7 +1367,7 @@ func TestMarkEventDispatched_SetsDispatchedStatusStampsTimestampAndClearsLease(t
 // gave up publishing", dead_lettered means "and the event is now preserved on its
 // <topic>.dlt sibling, from which it can be replayed". Only the dead-letter publisher
 // knows whether that second step actually happened, so only MarkEventDeadLettered
-// may declare it. ListDeadLetteredEvents covers both literals precisely so that an
+// may declare it. ListDeadLetterInventory covers both literals precisely so that an
 // event stranded between them is still visible to an operator.
 func TestMarkEventFailed_ChoosesRetryOrExhaustionInSQL(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
@@ -1137,19 +1375,20 @@ func TestMarkEventFailed_ChoosesRetryOrExhaustionInSQL(t *testing.T) {
 
 	mock.ExpectQuery("").
 		WithArgs(
-			model.EventOutboxStatusFailed,     // $1 — the exhaustion arm
-			model.EventOutboxStatusPending,    // $2 — the retry arm
-			"broker unavailable",              // $3 — the reason
-			"2s",                              // $4 — the backoff the caller computed
-			int64(7),                          // $5 — the row
-			"tok-7",                           // $6 — the claim token
-			model.EventOutboxStatusProcessing, // $7 — the required prior state
-			false,                             // $8 — the caller's permanent-failure verdict
+			model.EventOutboxStatusFailed,        // $1 — the exhaustion arm
+			model.EventOutboxStatusPending,       // $2 — the retry arm
+			"broker unavailable",                 // $3 — the reason
+			"2s",                                 // $4 — the backoff the caller computed
+			int64(7),                             // $5 — the row
+			"tok-7",                              // $6 — the claim token
+			model.EventOutboxStatusProcessing,    // $7 — the required prior state
+			false,                                // $8 — the caller's permanent-failure verdict
+			eventDeadLetterHandoffLease.String(), // $9 — the lease the exhaustion arm keeps
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 			AddRow(model.EventOutboxStatusPending, int64(1)))
 
-	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7", "broker unavailable", 2*time.Second, false)
+	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7", "broker unavailable", 2*time.Second, false, testDeadLetterHandoffLease)
 	require.NoError(t, err)
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
@@ -1159,8 +1398,10 @@ func TestMarkEventFailed_ChoosesRetryOrExhaustionInSQL(t *testing.T) {
 			"and it must read BOTH inputs: the caller's permanent-failure verdict and the attempt budget")
 	assert.Contains(t, issued, "attempts = attempts + 1",
 		"the attempt counter must be incremented by the same statement that reads it")
-	assert.Contains(t, issued, "locked_until = NULL",
-		"the lease must be released on BOTH arms, otherwise the retry is never picked up")
+	assert.Contains(t, issued, "locked_until = CASE WHEN $8::boolean OR attempts + 1 >= max_attempts THEN NOW() + $9::interval ELSE NULL END",
+		"the lease must follow the claim token: released on the retry arm so the row is picked up "+
+			"again as soon as next_attempt_at is due, and RENEWED on the exhaustion arm so the "+
+			"dead-letter hand-off the retained token authorises cannot be stolen by another instance")
 	assert.Contains(t, issued, "RETURNING status, attempts",
 		"the decision the UPDATE made must be returned, not re-read: a second read reintroduces the race the in-SQL decision removes")
 	assert.Contains(t, issued, "claim_token = CASE WHEN $8::boolean OR attempts + 1 >= max_attempts THEN claim_token ELSE NULL END",
@@ -1197,7 +1438,7 @@ func TestMarkEventFailed_ExhaustionReportsTheHandOffToken(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 			AddRow(model.EventOutboxStatusFailed, int64(5)))
 
-	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7", "final attempt failed", 0, false)
+	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7", "final attempt failed", 0, false, testDeadLetterHandoffLease)
 	require.NoError(t, err)
 
 	assert.True(t, outcome.Exhausted, "five of five attempts is exhaustion")
@@ -1239,7 +1480,8 @@ func TestMarkEventFailed_ATerminalVerdictExhaustsOnTheFirstAttempt(t *testing.T)
 			int64(7),
 			"tok-7",
 			model.EventOutboxStatusProcessing,
-			true, // $8 — the caller's PERMANENT verdict
+			true,                                 // $8 — the caller's PERMANENT verdict
+			eventDeadLetterHandoffLease.String(), // $9 — the lease the exhaustion arm keeps
 		).
 		// The database resolves the CASE, so the returned row is what a real PostgreSQL would
 		// have produced for a terminal verdict on attempt one: failed, with the count at 1.
@@ -1247,7 +1489,7 @@ func TestMarkEventFailed_ATerminalVerdictExhaustsOnTheFirstAttempt(t *testing.T)
 			AddRow(model.EventOutboxStatusFailed, int64(1)))
 
 	outcome, err := ds.MarkEventFailed(context.Background(), 7, "tok-7",
-		"the serialised event is over the size ceiling", 0, true)
+		"the serialised event is over the size ceiling", 0, true, testDeadLetterHandoffLease)
 	require.NoError(t, err)
 	require.Len(t, *captured, 1)
 
@@ -1256,6 +1498,11 @@ func TestMarkEventFailed_ATerminalVerdictExhaustsOnTheFirstAttempt(t *testing.T)
 			"outside the statement is what lets two instances racing on one row both conclude they were last")
 	assert.NotContains(t, (*captured)[0], "max_attempts = ",
 		"the budget itself must not be rewritten to force exhaustion; that would corrupt the row's own history")
+	assert.Contains(t, (*captured)[0],
+		"locked_until = CASE WHEN $8::boolean OR attempts + 1 >= max_attempts THEN NOW() + $9::interval ELSE NULL END",
+		"the terminal verdict retains the claim token, so the SAME condition must retain the lease: a "+
+			"token whose lease has been released is advisory, and the dead-letter repair claim adopts the "+
+			"row while this worker's dead-letter write is still in flight")
 
 	assert.True(t, outcome.Exhausted,
 		"a permanent failure is exhaustion on whichever attempt it happened")
@@ -1283,7 +1530,7 @@ func TestMarkEventFailed_LostClaimIsAConflictAndNotASilentSuccess(t *testing.T) 
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WillReturnError(sql.ErrNoRows)
 
-	outcome, err := ds.MarkEventFailed(context.Background(), 7, "stale-token", "boom", 0, false)
+	outcome, err := ds.MarkEventFailed(context.Background(), 7, "stale-token", "boom", 0, false, testDeadLetterHandoffLease)
 	require.Error(t, err, "a lost claim must NOT be reported as success")
 	assert.Equal(t, model.EventFailureOutcome{}, outcome,
 		"no decision was made, so no decision may be reported")
@@ -1307,11 +1554,11 @@ func TestEventOutboxTransitions_RefuseABlankClaimToken(t *testing.T) {
 			return ds.MarkEventDispatched(ctx, 1, "   ", model.BrokerRecord{})
 		},
 		"MarkEventFailed": func(ctx context.Context, ds Datasource) error {
-			_, err := ds.MarkEventFailed(ctx, 1, "", "boom", 0, false)
+			_, err := ds.MarkEventFailed(ctx, 1, "", "boom", 0, false, testDeadLetterHandoffLease)
 			return err
 		},
 		"MarkEventPermanentlyFailed": func(ctx context.Context, ds Datasource) error {
-			_, err := ds.MarkEventPermanentlyFailed(ctx, 1, " ", "boom")
+			_, err := ds.MarkEventPermanentlyFailed(ctx, 1, " ", "boom", testDeadLetterHandoffLease)
 			return err
 		},
 		"MarkEventDeadLettered": func(ctx context.Context, ds Datasource) error {
@@ -1357,11 +1604,12 @@ func TestMarkEventFailed_BelowMaxAttemptsReturnsToPending(t *testing.T) {
 	var retryArm driver.Value
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WithArgs(sqlmock.AnyArg(), captureArg(&retryArm), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 			AddRow(model.EventOutboxStatusPending, int64(1)))
 
-	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "transient", 0, false)
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "transient", 0, false, testDeadLetterHandoffLease)
 	require.NoError(t, err)
 
 	assert.Equal(t, model.EventOutboxStatusPending, retryArm,
@@ -1384,11 +1632,12 @@ func TestMarkEventFailed_AtMaxAttemptsBecomesFailedNotDeadLettered(t *testing.T)
 	var exhaustionArm driver.Value
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WithArgs(captureArg(&exhaustionArm), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 			AddRow(model.EventOutboxStatusFailed, int64(5)))
 
-	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "final attempt failed", 0, false)
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "final attempt failed", 0, false, testDeadLetterHandoffLease)
 	require.NoError(t, err)
 
 	assert.Equal(t, model.EventOutboxStatusFailed, exhaustionArm,
@@ -1417,7 +1666,7 @@ func TestMarkEventFailed_StampsFirstAttemptedAtOnceAndLastAttemptedAtEveryTime(t
 
 	mock.ExpectQuery("").WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 		AddRow(model.EventOutboxStatusPending, int64(1)))
-	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "boom", 0, false)
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", "boom", 0, false, testDeadLetterHandoffLease)
 	require.NoError(t, err)
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
@@ -1445,11 +1694,11 @@ func TestMarkEventFailed_RecordsErrorMessageAsABoundParameter(t *testing.T) {
 	hostile := "'; DROP TABLE blnk.event_outbox; --"
 	mock.ExpectQuery("").
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), hostile, sqlmock.AnyArg(), int64(7), "tok",
-			sqlmock.AnyArg(), sqlmock.AnyArg()).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 			AddRow(model.EventOutboxStatusPending, int64(1)))
 
-	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", hostile, 0, false)
+	_, err := ds.MarkEventFailed(context.Background(), 7, "tok", hostile, 0, false, testDeadLetterHandoffLease)
 	require.NoError(t, err)
 	require.Len(t, *captured, 1)
 
@@ -2351,19 +2600,29 @@ func TestReleaseEventReplay_ReturnsTheRowToDeadLetteredSoItStaysReplayable(t *te
 // Kept forever, the delivery buffer becomes an unbounded second copy of the ledger's
 // most sensitive data.
 //
-// The safety property is that ONLY terminal rows are eligible. A pending, processing,
-// replaying or failed row is still owed a delivery attempt. failed is the subtle one
-// and is asserted explicitly: its retry budget is spent but its dead-letter write is
-// not done, so this table is the ONLY copy of that event in existence and deleting it
-// would destroy it.
+// The safety property is that only ELIGIBLE rows are deleted, and SEC-08 narrowed what
+// eligible means. A pending, processing, replaying or failed row is still owed a delivery
+// attempt — failed is the subtle one: its retry budget is spent but its dead-letter write
+// is not done, so this table is the ONLY copy of that event in existence.
+//
+// A DEAD-LETTERED row is the newly subtle one, and the reason this test changed. It is
+// terminal — Blnk will not try again — and it used to be purged on that basis alone. But it
+// is the record of an event NO SUBSCRIBER EVER RECEIVED: the only inventory triage reads,
+// the only thing a replay can be driven from, and the only place the failure metadata
+// explaining the loss exists. Deleting it on an age timer destroyed all of that
+// unrecoverably, oldest first — the failure most likely to have been forgotten rather than
+// handled. So it is eligible only once an operator has RESOLVED it, and the predicate below
+// is what enforces that.
 func TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
 
 	cutoff := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM blnk.event_outbox")).
-		WithArgs(pq.Array(model.TerminalEventOutboxStatuses()), cutoff, 250).
-		WillReturnResult(sqlmock.NewResult(0, 3))
+	// A QUERY rather than an exec, because the statement now RETURNS the deleted rows so it
+	// can both count them and record them. See the assertions on the purge log below.
+	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM blnk.event_outbox")).
+		WithArgs(model.EventOutboxStatusDispatched, model.EventOutboxStatusDeadLettered, cutoff, 250).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(3)))
 
 	purged, err := ds.PurgeTerminalEventsBefore(context.Background(), cutoff, 250)
 	require.NoError(t, err)
@@ -2371,10 +2630,35 @@ func TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice(t *tes
 
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
-	assert.Contains(t, issued, "status = ANY($1)", "the eligible states must be bound, not interpolated")
-	assert.Contains(t, issued, "occurred_at < $2")
-	assert.Contains(t, issued, "LIMIT $3",
+	assert.Contains(t, issued, "status = $1", "the eligible states must be bound, not interpolated")
+	assert.Contains(t, issued, "status = $2 AND resolved_at IS NOT NULL",
+		"a dead-lettered row is eligible ONLY once an operator has resolved it: purging an "+
+			"unresolved one destroys the only record that a ledger event went undelivered")
+	assert.Contains(t, issued, "occurred_at < $3")
+	assert.Contains(t, issued, "LIMIT $4",
 		"the delete must be bounded, or one sweep blocks the relay and bloats the WAL in a single transaction")
+
+	// THE DELETION AND ITS RECORD ARE ONE STATEMENT, and that is the assertion that matters
+	// most here. A deleted row leaves no trace, so "how many terminal rows has retention
+	// removed" is unanswerable unless the purge records it — and the daily reconciliation
+	// cannot reach a sound verdict without that number, because a broker end offset counts
+	// every record ever written and never falls. Two statements would leave a window in which
+	// a crash keeps the deletion and loses the record, after which the reconciliation is
+	// permanently and silently wrong by that batch's size with no way to discover it.
+	assert.Contains(t, issued, "INSERT INTO blnk.event_outbox_purge_log",
+		"the purge must record what it removed, in the same statement that removes it")
+	assert.Contains(t, issued, "RETURNING occurred_at, kafka_offset",
+		"the counts must be computed from the DELETED ROWS themselves, not from a second query "+
+			"whose idea of the batch could differ")
+	assert.Contains(t, issued, "COUNT(kafka_offset)",
+		"the confirmed subset is counted separately because it restores a different baseline: "+
+			"the row-to-record mapping rather than the terminal total")
+	assert.Contains(t, issued, "HAVING COUNT(*) > 0",
+		"a sweep that removed nothing must write no log row, or the batches that matter are "+
+			"buried in records of the steady state")
+	assert.Contains(t, issued, "MIN(occurred_at), MAX(occurred_at)",
+		"the purged WINDOW is recorded, so an operator can tell whether a measurement window "+
+			"overlaps a purge")
 
 	assert.Equal(t, []string{model.EventOutboxStatusDispatched, model.EventOutboxStatusDeadLettered},
 		model.TerminalEventOutboxStatuses(),
@@ -2384,6 +2668,119 @@ func TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice(t *tes
 	assert.NotContains(t, model.TerminalEventOutboxStatuses(), model.EventOutboxStatusPending)
 	assert.NotContains(t, model.TerminalEventOutboxStatuses(), model.EventOutboxStatusProcessing)
 	assert.NotContains(t, model.TerminalEventOutboxStatuses(), model.EventOutboxStatusReplaying)
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestEventOutboxRetention_GoAndSQLAgreeOnEligibility is the SEC-08 anti-drift guard.
+//
+// The purge predicate lives in SQL and model.EventOutbox.IsPurgeableByRetention states the
+// same rule in Go, so a caller, a test and the runbook can evaluate eligibility without a
+// database. Two expressions of one rule drift, and this drift would be SILENT and would go
+// wrong in whichever direction the change was made: a looser Go rule tells an operator a row
+// will be deleted that will not, and a looser SQL rule deletes evidence the Go rule promised
+// to keep.
+//
+// So the table below is the rule, and both are checked against it.
+func TestEventOutboxRetention_GoAndSQLAgreeOnEligibility(t *testing.T) {
+	resolved := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name      string
+		row       model.EventOutbox
+		purgeable bool
+		why       string
+	}{
+		{
+			name:      "a dispatched row is purgeable on age alone",
+			row:       model.EventOutbox{Status: model.EventOutboxStatusDispatched},
+			purgeable: true,
+			why:       "the event reached the broker and a subscriber has had it; the row is a receipt",
+		},
+		{
+			name:      "an UNRESOLVED dead-lettered row is not purgeable",
+			row:       model.EventOutbox{Status: model.EventOutboxStatusDeadLettered},
+			purgeable: false,
+			why: "it is the only record that a ledger event went undelivered, and deleting it " +
+				"destroys the failure metadata and the bytes a replay is driven from",
+		},
+		{
+			name: "a RESOLVED dead-lettered row is purgeable",
+			row: model.EventOutbox{
+				Status:     model.EventOutboxStatusDeadLettered,
+				ResolvedAt: &resolved,
+			},
+			purgeable: true,
+			why:       "an operator has accounted for it, so the evidence has served its purpose",
+		},
+		{
+			name:      "a failed row is never purgeable",
+			row:       model.EventOutbox{Status: model.EventOutboxStatusFailed},
+			purgeable: false,
+			why:       "its dead-letter write is still owed, so this table is the only copy in existence",
+		},
+		{
+			// The one combination the CHECK constraint forbids, asserted anyway: if a
+			// migration or a direct write ever produced it, the Go rule must not read a
+			// stray resolution on a non-dead-lettered row as licence to delete.
+			name: "a resolution on a failed row does not make it purgeable",
+			row: model.EventOutbox{
+				Status:     model.EventOutboxStatusFailed,
+				ResolvedAt: &resolved,
+			},
+			purgeable: false,
+			why:       "resolution is meaningful only for a row that has a dead-letter record",
+		},
+		{
+			name:      "a pending row is not purgeable",
+			row:       model.EventOutbox{Status: model.EventOutboxStatusPending},
+			purgeable: false,
+			why:       "a delivery attempt is still owed",
+		},
+		{
+			name:      "a replaying row is not purgeable",
+			row:       model.EventOutbox{Status: model.EventOutboxStatusReplaying},
+			purgeable: false,
+			why:       "a publish is in flight",
+		},
+	}
+
+	// The SQL rule, rendered once from the statement the repository issues so the two
+	// halves of this test cannot be checked against different predicates.
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	// A QUERY, not an exec: the delete RETURNS the rows it removed so the same statement can
+	// count them and write the purge-log record from them.
+	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM blnk.event_outbox")).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(0)))
+
+	_, err := ds.PurgeTerminalEventsBefore(context.Background(),
+		time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), 100)
+	require.NoError(t, err)
+	require.Len(t, *captured, 1)
+	statement := (*captured)[0]
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.purgeable, tc.row.IsPurgeableByRetention(), tc.why)
+		})
+	}
+
+	// And the SQL says the same thing: exactly two arms, the dead-letter one gated on a
+	// recorded resolution.
+	//
+	// Compared on the NORMALISED statement rather than through whereClauseOf, because the
+	// purge nests a bounded SELECT inside the DELETE and therefore carries two WHERE
+	// keywords — the eligibility rule is the inner one.
+	normalized := strings.Join(strings.Fields(statement), " ")
+	assert.Contains(t, normalized,
+		"WHERE ( status = $1 OR (status = $2 AND resolved_at IS NOT NULL) ) AND occurred_at < $3",
+		"the SQL rule must be the Go rule: one age-governed arm for delivered rows and one "+
+			"resolution-gated arm for dead-lettered ones")
+	assert.NotContains(t, normalized, "status = ANY(",
+		"a status SET is what conflated the two populations; eligibility is now two arms")
 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -2418,9 +2815,13 @@ func TestPurgeTerminalEventsBefore_RefusesAZeroCutoffAndClampsTheSlice(t *testin
 				ds := Datasource{Conn: db}
 
 				var boundLimit driver.Value
-				mock.ExpectExec(regexp.QuoteMeta("DELETE FROM blnk.event_outbox")).
-					WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), captureArg(&boundLimit)).
-					WillReturnResult(sqlmock.NewResult(0, 0))
+				// Four arguments: the two terminal states are bound separately, because the
+				// dead-lettered arm carries the operator-resolution condition the dispatched
+				// arm does not.
+				mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM blnk.event_outbox")).
+					WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+						captureArg(&boundLimit)).
+					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(0)))
 
 				_, err := ds.PurgeTerminalEventsBefore(context.Background(),
 					time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), tc.given)
@@ -2616,6 +3017,144 @@ func TestRecordTransactionWithBalancesAndOutbox_EnrolsEventInTheLedgerTransactio
 		require.NotNil(t, result)
 		assert.NoError(t, mock.ExpectationsWereMet(),
 			"nil event entries must issue no statement at all")
+	})
+}
+
+// TestRecordTransactionWithBalancesAndOutbox_CommitsAMonitorAlertWithTheMovement is the
+// repository half of finding F-03's critical case.
+//
+// A balance.monitor alert describes a threshold the movement being persisted has just crossed, so
+// it is mutation-derived and R-2 applies. The producer prepares it before the write; this asserts
+// the writer accepts it ALONGSIDE the transaction's own event and commits both in the same
+// database transaction.
+//
+// # The cardinality rule this exercises, and why it had to be refined rather than relaxed
+//
+// resolveEventOutboxes refuses more mutation-DESCRIBING rows than there are transactions, because
+// two transaction events for one transaction is an undetectable duplicate publication. Counted
+// over EVERY row, that rule would also refuse an alert riding along with its trigger — so the
+// count is taken over the non-repeatable rows only, which is exactly the class the rule protects.
+// The three sub-cases below pin both halves: the alert is accepted, and a genuine duplicate is
+// still refused.
+func TestRecordTransactionWithBalancesAndOutbox_CommitsAMonitorAlertWithTheMovement(t *testing.T) {
+	newFixtures := func() (*model.Transaction, *model.Balance, *model.Balance) {
+		now := time.Now().UTC()
+		txn := &model.Transaction{
+			TransactionID: "txn_f03", Source: "bln_source_f03", Reference: "ref_f03",
+			AmountString: "10.00", PreciseAmount: big.NewInt(1000), Precision: 100,
+			Currency: "USD", Destination: "bln_dest_f03", Description: "f03",
+			Status: "APPLIED", CreatedAt: now, Hash: "hash_f03", EffectiveDate: &now,
+		}
+		newBalance := func(id string) *model.Balance {
+			return &model.Balance{
+				BalanceID: id, Balance: big.NewInt(1000), CreditBalance: big.NewInt(500),
+				DebitBalance: big.NewInt(500), InflightBalance: big.NewInt(0),
+				InflightCreditBalance: big.NewInt(0), InflightDebitBalance: big.NewInt(0),
+				Currency: "USD", Version: 1,
+			}
+		}
+
+		return txn, newBalance("bln_source_f03"), newBalance("bln_dest_f03")
+	}
+
+	monitorAlert := func(prefix string) *model.EventOutbox {
+		alert := newEventOutboxFixture(prefix)
+		alert.EventType = model.EventTypeBalanceMonitor
+		alert.Topic = "blnk.balances"
+
+		return alert
+	}
+
+	transactionEvent := func(prefix string) *model.EventOutbox {
+		event := newEventOutboxFixture(prefix)
+		event.EventType = "transaction.applied"
+		event.Topic = "blnk.transactions"
+
+		return event
+	}
+
+	t.Run("the alert is inserted inside the same transaction as the movement", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+		txn, source, destination := newFixtures()
+
+		mock.ExpectBegin()
+		mock.ExpectExec("UPDATE blnk.balances SET").WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("UPDATE blnk.balances SET").WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("INSERT INTO blnk.transactions").WillReturnResult(sqlmock.NewResult(1, 1))
+		// TWO event inserts, both before the commit. The single-transaction writer inserts row
+		// by row, so each is its own statement and each must land inside the transaction.
+		mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO blnk.event_outbox")).
+			WillReturnRows(insertedEventOutboxRows(21))
+		mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO blnk.event_outbox")).
+			WillReturnRows(insertedEventOutboxRows(22))
+		mock.ExpectCommit()
+
+		event := transactionEvent("f03-event-")
+		alert := monitorAlert("f03-alert-")
+
+		result, err := ds.RecordTransactionWithBalancesAndOutbox(
+			context.Background(), txn, source, destination, nil, event, alert)
+
+		require.NoError(t, err,
+			"a movement and the threshold alert it triggers must be committable together; refusing "+
+				"the pair would force the alert back outside the transaction and reopen the loss window")
+		require.NotNil(t, result)
+		assert.Equal(t, int64(21), event.ID)
+		assert.Equal(t, int64(22), alert.ID)
+		assert.NoError(t, mock.ExpectationsWereMet(),
+			"both event inserts must be issued between BEGIN and COMMIT")
+	})
+
+	t.Run("a failing alert insert rolls the movement back and never commits", func(t *testing.T) {
+		// The direction that makes it a guarantee. A crossing whose alert cannot be recorded
+		// must not commit: the alternative is a balance past its threshold with no alert
+		// anywhere and nothing able to discover afterwards that one was due.
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+		txn, source, destination := newFixtures()
+
+		mock.ExpectBegin()
+		mock.ExpectExec("UPDATE blnk.balances SET").WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("UPDATE blnk.balances SET").WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("INSERT INTO blnk.transactions").WillReturnResult(sqlmock.NewResult(1, 1))
+		mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO blnk.event_outbox")).
+			WillReturnRows(insertedEventOutboxRows(23))
+		mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO blnk.event_outbox")).
+			WillReturnError(sql.ErrConnDone)
+		mock.ExpectRollback()
+		// Deliberately NO ExpectCommit.
+
+		result, err := ds.RecordTransactionWithBalancesAndOutbox(
+			context.Background(), txn, source, destination, nil,
+			transactionEvent("f03-event-fail-"), monitorAlert("f03-alert-fail-"))
+
+		require.Error(t, err,
+			"an alert that cannot be recorded must fail the movement that triggered it")
+		assert.Nil(t, result)
+		assert.NoError(t, mock.ExpectationsWereMet(),
+			"the movement must roll back and must never commit when its alert insert fails")
+	})
+
+	t.Run("two transaction events for one transaction are still refused", func(t *testing.T) {
+		// The invariant must have been NARROWED, not removed. Two mutation-describing rows for
+		// one transaction is a duplicate publication that nothing can detect afterwards, and it
+		// must still be refused before any statement is issued.
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+		txn, source, destination := newFixtures()
+		// No expectations at all: the refusal must precede BEGIN.
+
+		result, err := ds.RecordTransactionWithBalancesAndOutbox(
+			context.Background(), txn, source, destination, nil,
+			transactionEvent("f03-dup-a-"), transactionEvent("f03-dup-b-"))
+
+		require.Error(t, err,
+			"two events describing one transaction must be refused; counting only the repeatable "+
+				"rows out of the cardinality check must not have disabled the check itself")
+		assert.Nil(t, result)
+		assert.NoError(t, mock.ExpectationsWereMet(),
+			"the refusal must happen before any statement is issued, so no transaction is opened")
 	})
 }
 
@@ -3517,8 +4056,8 @@ func TestGetEventByID_ScanErrorIsWrappedAsInternal(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestListDeadLetteredEvents_CoversBothTerminalFailureStates asserts the filter includes
-// failed AS WELL AS dead_lettered.
+// TestListDeadLetterInventory_CoversBothTerminalFailureStates asserts the filter includes
+// failed AS WELL AS dead_lettered, and that every predicate is applied in SQL.
 //
 // A row becomes failed the moment its retry budget is spent, and dead_lettered only once
 // the event has additionally been written to its <topic>.dlt sibling. Listing only the
@@ -3526,47 +4065,627 @@ func TestGetEventByID_ScanErrorIsWrappedAsInternal(t *testing.T) {
 // itself failed — which are exactly the events an operator most needs to see, because they
 // are the ones sitting nowhere at all. The partial index idx_event_outbox_failed covers
 // both literals for this reason.
-func TestListDeadLetteredEvents_CoversBothTerminalFailureStates(t *testing.T) {
+func TestListDeadLetterInventory_CoversBothTerminalFailureStates(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
 
-	deadLettered := model.EventOutbox{
+	deadLettered := deadLetterInventoryEntryOf(model.EventOutbox{
 		ID: 2, EventID: "evt_dlt", EventType: "transaction.applied", AggregateID: "agg",
-		LedgerID: "ldg", Topic: "blnk.transactions", SchemaVersion: model.SchemaVersionV1,
-		Payload: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
-		Status: model.EventOutboxStatusDeadLettered, Attempts: 5, MaxAttempts: 5,
+		PartitionKey: "key", LedgerID: "ldg", Topic: "blnk.transactions",
+		SchemaVersion: model.SchemaVersionV1,
+		Payload:       json.RawMessage(`{"event":"transaction.applied","data":{}}`),
+		OccurredAt:    dbTimestamp(time.Now()),
+		Status:        model.EventOutboxStatusDeadLettered, Attempts: 5,
 		DLTTopic: "blnk.transactions.dlt",
-	}
+	})
 	stranded := deadLettered
 	stranded.ID, stranded.EventID, stranded.Status, stranded.DLTTopic =
 		1, "evt_stranded", model.EventOutboxStatusFailed, ""
 
+	// The population comes from model.DeadLetterInventoryStatuses as a single array
+	// parameter, which is what lets the predicate builder serve the page, the count and
+	// the age gauge from one rendering — see deadLetterInventoryPredicate.
 	mock.ExpectQuery("").
-		WithArgs(model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed, 50, 0).
-		WillReturnRows(newEventOutboxRows(deadLettered, stranded))
+		WithArgs(
+			model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+			"", "", "", nil, int64(0), nil, nil, false, false, defaultDeadLetterPageSize+1,
+		).
+		WillReturnRows(newDeadLetterInventoryRows(deadLettered, stranded))
 
-	entries, err := ds.ListDeadLetteredEvents(context.Background(), 0, 0)
+	page, err := ds.ListDeadLetterInventory(context.Background(), model.DeadLetterInventoryQuery{})
 	require.NoError(t, err)
-	assert.Equal(t, []string{"evt_dlt", "evt_stranded"}, eventIDsOf(entries),
+	assert.Equal(t, []string{"evt_dlt", "evt_stranded"}, deadLetterEventIDsOf(page),
 		"an event stranded in failed, whose dead-letter publication itself failed, must still be visible to an operator")
+	assert.False(t, page.HasMore, "two rows against a page of fifty leaves nothing to follow")
+	assert.Nil(t, page.NextCursor)
 
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
 	assert.Contains(t, issued, "WHERE status IN ($1, $2)")
 	assert.Contains(t, issued, "ORDER BY occurred_at DESC, id DESC",
 		"triage starts from the most recent failures, and id breaks ties so paging cannot show or skip a row twice")
-	assert.Contains(t, issued, "LIMIT $3 OFFSET $4")
+
+	// PERF-P06: the predicates live in the statement. Asserted on the SQL because a fixture
+	// small enough to read cannot distinguish "the database filtered" from "the application
+	// filtered what the database returned" — and that distinction was the finding.
+	assert.Contains(t, issued, "($3 = '' OR status = $3)")
+	assert.Contains(t, issued, "($4 = '' OR event_type = $4)")
+	assert.Contains(t, issued, "($5 = '' OR topic = $5)")
+
+	// PERF-P08: a keyset, not an offset.
+	assert.Contains(t, issued, "(occurred_at, id) < ($6::timestamptz, $7::bigint)")
+	assert.NotContains(t, issued, "OFFSET",
+		"an offset's cost grows with its depth and the depth was the caller's to choose")
+
+	// The occurrence window is applied in SQL too, and is bound as a nullable pair so that an
+	// unbounded end means "no bound" rather than "the zero instant".
+	assert.Contains(t, issued, "($8::timestamptz IS NULL OR occurred_at >= $8::timestamptz)")
+	assert.Contains(t, issued, "($9::timestamptz IS NULL OR occurred_at <= $9::timestamptz)")
+	assert.Contains(t, issued, "LIMIT $12")
 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestListDeadLetteredEvents_NormalisesPagination asserts a malformed page request
-// degrades to a sane one rather than scanning the table or failing.
+// TestListDeadLetterInventory_ReadsNeitherBodyColumn is the PERF-P06 guard on the projection.
+//
+// payload_raw and event_raw are the same event body twice over, up to 768 KiB each, and the
+// listing shows neither: it reports the body's SIZE, computed inside PostgreSQL. Reading whole
+// rows to build a page of at most a few hundred small items moved gibibytes to answer a
+// question about kilobytes.
+//
+// Asserted on the statement text rather than on the returned entries, because a projection that
+// selected the bodies and discarded them in Go would satisfy every assertion about the entries
+// while costing exactly what the finding was about.
+func TestListDeadLetterInventory_ReadsNeitherBodyColumn(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("").WillReturnRows(newDeadLetterInventoryRows())
+
+	_, err := ds.ListDeadLetterInventory(context.Background(), model.DeadLetterInventoryQuery{})
+	require.NoError(t, err)
+
+	require.Len(t, *captured, 1)
+	projection := (*captured)[0]
+	projection = projection[:strings.Index(projection, "FROM blnk.event_outbox")]
+
+	assert.NotContains(t, projection, "event_raw",
+		"the canonical envelope is the body; a listing has no use for it")
+	assert.Contains(t, projection, "octet_length(payload_raw) AS payload_bytes",
+		"the SIZE is what a triage view needs, and octet_length computes it without moving the bytes")
+	assert.NotRegexp(t, `(^|[\s,(])payload_raw([\s,)]|$)`, strings.ReplaceAll(projection, "octet_length(payload_raw)", ""),
+		"payload_raw must appear ONLY inside octet_length")
+
+	// The model cannot carry a body either, which is what stops the projection widening back.
+	entryType := reflect.TypeOf(model.DeadLetterInventoryEntry{})
+	for _, field := range []string{"Payload", "PayloadRaw", "EventRaw"} {
+		_, present := entryType.FieldByName(field)
+		assert.False(t, present, "model.DeadLetterInventoryEntry must have no %s field", field)
+	}
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+
+	// The two literals the unfiltered predicate admits come from ONE list, so a state
+	// added to the inventory cannot reach the query without reaching the count and the
+	// status-filter validation as well.
+	assert.Equal(t,
+		[]string{model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed},
+		model.DeadLetterInventoryStatuses(),
+		"the inventory's composition is published through one list")
+}
+
+// TestListDeadLetteredEvents_AppliesEveryNarrowingInSQL is the whole point of the filter
+// contract, and the defect it closes was invisible to the client.
+//
+// The narrowing used to be applied ABOVE this layer, in the service, by paging the
+// inventory and testing rows in Go up to a fixed scan ceiling. A page that reached the
+// ceiling was returned looking exactly like a complete one — only a log line said
+// otherwise — and an exact total was impossible, so include_count had to be refused for
+// any event-type or topic filter. Both were properties of where the filtering happened.
+//
+// The proof is the SQL: every filter must appear as a predicate, positionally aligned with
+// its argument, and LIMIT/OFFSET must bind AFTER them so the page applies to the filtered
+// set.
+func TestListDeadLetteredEvents_AppliesEveryNarrowingInSQL(t *testing.T) {
+	from := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	to := from.Add(20 * time.Minute)
+
+	cases := []struct {
+		name          string
+		query         model.DeadLetterQuery
+		wantPredicate []string
+		wantArgs      []driver.Value
+		wantPage      string
+	}{
+		{
+			name:          "unfiltered admits both terminal states",
+			query:         model.DeadLetterQuery{Limit: 10},
+			wantPredicate: []string{"WHERE status IN ($1, $2)"},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed, 10, 0,
+			},
+			wantPage: "LIMIT $3 OFFSET $4",
+		},
+		{
+			name:  "a status filter narrows to one state by equality",
+			query: model.DeadLetterQuery{Status: model.EventOutboxStatusFailed, Limit: 10},
+			// Equality rather than a one-element IN, so the same partial index is used
+			// either way.
+			wantPredicate: []string{"WHERE status = $1"},
+			wantArgs:      []driver.Value{model.EventOutboxStatusFailed, 10, 0},
+			wantPage:      "LIMIT $2 OFFSET $3",
+		},
+		{
+			name:  "an event type filter is a predicate, not a post-filter",
+			query: model.DeadLetterQuery{EventType: "transaction.applied", Limit: 10},
+			wantPredicate: []string{
+				"WHERE status IN ($1, $2)", "event_type = $3",
+			},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				"transaction.applied", 10, 0,
+			},
+			wantPage: "LIMIT $4 OFFSET $5",
+		},
+		{
+			name:  "a topic filter matches the ORIGINAL topic column",
+			query: model.DeadLetterQuery{Topic: "blnk.transactions", Limit: 10},
+			wantPredicate: []string{
+				"WHERE status IN ($1, $2)", "topic = $3",
+			},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				"blnk.transactions", 10, 0,
+			},
+			wantPage: "LIMIT $4 OFFSET $5",
+		},
+		{
+			name:  "the occurrence window bounds occurred_at inclusively at both ends",
+			query: model.DeadLetterQuery{OccurredFrom: from, OccurredTo: to, Limit: 10},
+			wantPredicate: []string{
+				"WHERE status IN ($1, $2)", "occurred_at >= $3", "occurred_at <= $4",
+			},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				from, to, 10, 0,
+			},
+			wantPage: "LIMIT $5 OFFSET $6",
+		},
+		{
+			name: "every filter combines, and the page binds after all of them",
+			query: model.DeadLetterQuery{
+				Status:       model.EventOutboxStatusDeadLettered,
+				EventType:    "transaction.applied",
+				Topic:        "blnk.transactions",
+				OccurredFrom: from,
+				OccurredTo:   to,
+				Limit:        25,
+				Offset:       75,
+			},
+			wantPredicate: []string{
+				"WHERE status = $1", "event_type = $2", "topic = $3",
+				"occurred_at >= $4", "occurred_at <= $5",
+			},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, "transaction.applied",
+				"blnk.transactions", from, to, 25, 75,
+			},
+			wantPage: "LIMIT $6 OFFSET $7",
+		},
+		{
+			name: "surrounding whitespace on a filter is ignored",
+			query: model.DeadLetterQuery{
+				EventType: "  transaction.applied  ",
+				Topic:     "  blnk.transactions  ",
+				Status:    "  " + model.EventOutboxStatusFailed + "  ",
+				Limit:     10,
+			},
+			wantPredicate: []string{
+				"WHERE status = $1", "event_type = $2", "topic = $3",
+			},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusFailed, "transaction.applied",
+				"blnk.transactions", 10, 0,
+			},
+			wantPage: "LIMIT $4 OFFSET $5",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, captured := newCapturingSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+				WithArgs(tc.wantArgs...).
+				WillReturnRows(newEventOutboxRows())
+
+			_, err := ds.ListDeadLetteredEvents(context.Background(), tc.query)
+			require.NoError(t, err)
+			require.NoError(t, mock.ExpectationsWereMet(),
+				"every filter must reach SQL as a bound argument")
+
+			require.Len(t, *captured, 1)
+			issued := (*captured)[0]
+			for _, predicate := range tc.wantPredicate {
+				assert.Contains(t, issued, predicate)
+			}
+			assert.Contains(t, issued, tc.wantPage,
+				"the page must bind after the filters, so the offset is an offset into the FILTERED set")
+			assert.Contains(t, issued, "ORDER BY occurred_at DESC, id DESC",
+				"ordering is fixed regardless of the narrowing, so paging stays stable")
+		})
+	}
+}
+
+// TestCountDeadLetteredEvents_CountsTheSamePredicateAsThePage is what makes include_count
+// answerable for a filtered request at all.
+//
+// The total used to come from a whole-table per-status aggregate that knew nothing about
+// the event-type or topic filter, so the endpoint refused include_count rather than report
+// a total describing a different set than the page. A total over a different predicate is
+// worse than no total: a client pages until it has seen total_count rows and either loops
+// forever or stops early, with nothing in the response to say which.
+//
+// The page is deliberately IGNORED. The total is a property of the filter, not of the
+// window into it — honouring Limit here would make total_count never exceed the page size,
+// which is precisely the number a caller asks for it in order not to have to guess.
+func TestCountDeadLetteredEvents_CountsTheSamePredicateAsThePage(t *testing.T) {
+	from := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	to := from.Add(20 * time.Minute)
+
+	query := model.DeadLetterQuery{
+		EventType:    "transaction.applied",
+		Topic:        "blnk.transactions",
+		OccurredFrom: from,
+		OccurredTo:   to,
+		// Both are set and both must be absent from the emitted SQL.
+		Limit:  25,
+		Offset: 75,
+	}
+
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+		WithArgs(
+			model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+			"transaction.applied", "blnk.transactions", from, to,
+		).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(412)))
+
+	total, err := ds.CountDeadLetteredEvents(context.Background(), query)
+	require.NoError(t, err)
+	assert.Equal(t, int64(412), total)
+	require.NoError(t, mock.ExpectationsWereMet(),
+		"the count must bind exactly the page's own filters and nothing else")
+
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+	assert.Contains(t, issued, "COUNT(*)")
+	assert.Contains(t, issued, "WHERE status IN ($1, $2)")
+	assert.Contains(t, issued, "event_type = $3")
+	assert.Contains(t, issued, "topic = $4")
+	assert.Contains(t, issued, "occurred_at >= $5")
+	assert.Contains(t, issued, "occurred_at <= $6")
+	assert.NotContains(t, issued, "LIMIT",
+		"the total is a property of the filter, not of the window into it")
+	assert.NotContains(t, issued, "OFFSET")
+	assert.NotContains(t, issued, "ORDER BY",
+		"ordering a count is wasted work the planner should never be asked for")
+
+	t.Run("a failure is wrapped as an internal error", func(t *testing.T) {
+		failing, failMock := newSQLMock(t)
+		failingDS := Datasource{Conn: failing}
+
+		failMock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+			WillReturnError(sql.ErrConnDone)
+
+		total, err := failingDS.CountDeadLetteredEvents(context.Background(), model.DeadLetterQuery{})
+		assert.Zero(t, total)
+		requireAPIError(t, err, apierror.ErrInternalServer)
+		assert.NoError(t, failMock.ExpectationsWereMet())
+	})
+}
+
+// TestListDeadLetterInventory_NormalisesTheLimitAndPassesTheCursorThrough asserts a malformed
+// page request degrades to a sane one rather than scanning the table or failing.
 //
 // The upper cap is the load-bearing half: without it a caller could turn a triage
 // endpoint into a full table scan of an outbox that grows without bound, which is a
 // denial-of-service surface reachable from an authenticated operator endpoint.
-func TestListDeadLetteredEvents_NormalisesPagination(t *testing.T) {
+//
+// The cursor is passed through VERBATIM (PERF-P08). There is nothing to clamp about a position,
+// and the bound limit is limit+1 in every case — the probe row that answers "is there another
+// page" without a COUNT.
+func TestListDeadLetterInventory_NormalisesTheLimitAndPassesTheCursorThrough(t *testing.T) {
+	resumeAt := dbTimestamp(time.Now().Add(-time.Hour))
+
+	cases := []struct {
+		name      string
+		query     model.DeadLetterInventoryQuery
+		wantLimit int
+		wantTime  driver.Value
+		wantID    int64
+	}{
+		{"zero limit takes the default", model.DeadLetterInventoryQuery{}, defaultDeadLetterPageSize, nil, 0},
+		{
+			"negative limit takes the default",
+			model.DeadLetterInventoryQuery{Limit: -10}, defaultDeadLetterPageSize, nil, 0,
+		},
+		{
+			"oversized limit is capped",
+			model.DeadLetterInventoryQuery{Limit: maxDeadLetterPageSize + 1}, maxDeadLetterPageSize, nil, 0,
+		},
+		{
+			"limit at the cap is preserved",
+			model.DeadLetterInventoryQuery{Limit: maxDeadLetterPageSize}, maxDeadLetterPageSize, nil, 0,
+		},
+		{
+			"a cursor is bound as the pair it is",
+			model.DeadLetterInventoryQuery{
+				Limit:  25,
+				Cursor: &model.DeadLetterCursor{OccurredAt: resumeAt, ID: 8171},
+			},
+			25, resumeAt, 8171,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+				WithArgs(
+					model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+					"", "", "", tc.wantTime, tc.wantID, nil, nil, false, false, tc.wantLimit+1,
+				).
+				WillReturnRows(newDeadLetterInventoryRows())
+
+			_, err := ds.ListDeadLetterInventory(context.Background(), tc.query)
+			require.NoError(t, err)
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+// TestListDeadLetterInventory_BindsTheFiltersItWasGiven asserts each filter reaches the
+// statement in its own placeholder, and that an absent filter binds the empty string the
+// statement's `($n = ” OR ...)` arm is written for.
+func TestListDeadLetterInventory_BindsTheFiltersItWasGiven(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+		WithArgs(
+			model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+			model.EventOutboxStatusFailed, "transaction.applied", "blnk.transactions",
+			nil, int64(0), nil, nil, false, false, 11,
+		).
+		WillReturnRows(newDeadLetterInventoryRows())
+
+	_, err := ds.ListDeadLetterInventory(context.Background(), model.DeadLetterInventoryQuery{
+		Limit:     10,
+		Status:    model.EventOutboxStatusFailed,
+		EventType: "transaction.applied",
+		Topic:     "blnk.transactions",
+	})
+	require.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestListDeadLetterInventory_ReadsAProbeRowToAnswerHasMore pins the limit+1 contract.
+//
+// The extra row is READ and not RETURNED, and the cursor comes from the last row that WAS
+// returned. Taking it from the probe instead would skip that row on the next page — a silent
+// gap in an inventory an operator is triaging from.
+func TestListDeadLetterInventory_ReadsAProbeRowToAnswerHasMore(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	entries := make([]model.DeadLetterInventoryEntry, 0, 3)
+	for i := range 3 {
+		entries = append(entries, deadLetterInventoryEntryOf(model.EventOutbox{
+			ID: int64(30 - i), EventID: fmt.Sprintf("evt_%d", i), EventType: "transaction.applied",
+			AggregateID: "agg", PartitionKey: "key", Topic: "blnk.transactions",
+			SchemaVersion: model.SchemaVersionV1, Payload: json.RawMessage(`{}`),
+			OccurredAt: base.Add(-time.Duration(i) * time.Minute),
+			Status:     model.EventOutboxStatusDeadLettered,
+			DLTTopic:   "blnk.transactions.dlt",
+		}))
+	}
+
+	mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+		WithArgs(
+			model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+			"", "", "", nil, int64(0), nil, nil, false, false, 3,
+		).
+		WillReturnRows(newDeadLetterInventoryRows(entries...))
+
+	page, err := ds.ListDeadLetterInventory(context.Background(), model.DeadLetterInventoryQuery{Limit: 2})
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"evt_0", "evt_1"}, deadLetterEventIDsOf(page),
+		"the probe row must be read and discarded, never returned")
+	assert.True(t, page.HasMore, "its existence is the answer")
+	require.NotNil(t, page.NextCursor)
+	assert.Equal(t, entries[1].OccurredAt, page.NextCursor.OccurredAt,
+		"the cursor must name the LAST RETURNED row, so the next page resumes exactly where this one stopped")
+	assert.Equal(t, entries[1].ID, page.NextCursor.ID)
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestListDeadLetterInventory_ErrorsAreWrapped covers the statement, scan and row
+// iteration branches of the listing.
+func TestListDeadLetterInventory_ErrorsAreWrapped(t *testing.T) {
+	valid := deadLetterInventoryEntryOf(model.EventOutbox{
+		ID: 1, EventID: uuid.NewString(), EventType: "transaction.applied", AggregateID: "agg",
+		PartitionKey: "agg", LedgerID: "ldg", Topic: "blnk.transactions",
+		SchemaVersion: model.SchemaVersionV1,
+		Payload:       json.RawMessage(`{}`), OccurredAt: dbTimestamp(time.Now()),
+		Status: model.EventOutboxStatusDeadLettered,
+	})
+
+	cases := map[string]func(sqlmock.Sqlmock){
+		"statement error": func(mock sqlmock.Sqlmock) {
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).WillReturnError(sql.ErrConnDone)
+		},
+		"scan error": func(mock sqlmock.Sqlmock) {
+			// Built from the real row builder with occurred_at corrupted BY POSITION,
+			// so the cell count can never drift away from the projection.
+			columns := deadLetterInventoryProjectedColumns()
+			cells := deadLetterInventoryRow(valid)
+			cells[slices.Index(columns, "occurred_at")] = "not-a-timestamp"
+
+			broken := sqlmock.NewRows(columns).AddRow(cells...)
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).WillReturnRows(broken)
+		},
+		"row iteration error": func(mock sqlmock.Sqlmock) {
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+				WillReturnRows(newDeadLetterInventoryRows(valid).RowError(0, sql.ErrConnDone))
+		},
+	}
+
+	for name, script := range cases {
+		t.Run(name, func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			script(mock)
+
+			entries, err := ds.ListDeadLetteredEvents(context.Background(), model.DeadLetterQuery{Limit: 10})
+			assert.Nil(t, entries)
+			requireAPIError(t, err, apierror.ErrInternalServer)
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+// TestListDeadLetteredEventsFiltered_PushesEveryPredicateIntoSQL is the assertion that the
+// narrowing reaches the DATABASE.
+//
+// It is the whole point of the method. The service used to filter above this layer: it read
+// unfiltered pages, applied the predicates in Go and stopped at a fixed row budget, so a
+// filtered page silently omitted every match past the budget and answered 200 with no
+// indication that it had stopped looking. A predicate that is not in this WHERE clause is
+// a predicate that has to be applied somewhere it cannot be applied correctly.
+//
+// Three properties are asserted rather than one, because each is separately breakable:
+//
+//   - Every set filter appears as a BOUND PARAMETER, never as interpolated text. The
+//     values are operator-supplied, so an interpolated topic is an injection.
+//   - A status filter REPLACES the two-state default rather than intersecting with it,
+//     which is what makes narrowing to `failed` alone expressible at all.
+//   - The page placeholders are numbered AFTER the predicates, so adding a filter cannot
+//     silently rebind the limit to a topic string.
+func TestListDeadLetteredEventsFiltered_PushesEveryPredicateIntoSQL(t *testing.T) {
+	cases := []struct {
+		name      string
+		filter    model.DeadLetterFilter
+		wantWhere string
+		wantPage  string
+		wantArgs  []driver.Value
+	}{
+		{
+			name:      "no filter keeps the two-state default and the unfiltered binding",
+			filter:    model.DeadLetterFilter{},
+			wantWhere: "WHERE status IN ($1, $2)",
+			wantPage:  "LIMIT $3 OFFSET $4",
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed, 25, 5,
+			},
+		},
+		{
+			name:      "an event type is bound, alongside the default states",
+			filter:    model.DeadLetterFilter{EventType: "transaction.applied"},
+			wantWhere: "WHERE status IN ($1, $2) AND event_type = $3",
+			wantPage:  "LIMIT $4 OFFSET $5",
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				"transaction.applied", 25, 5,
+			},
+		},
+		{
+			name:      "a topic is bound against the row's own topic column",
+			filter:    model.DeadLetterFilter{Topic: "blnk.transactions"},
+			wantWhere: "WHERE status IN ($1, $2) AND topic = $3",
+			wantPage:  "LIMIT $4 OFFSET $5",
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				"blnk.transactions", 25, 5,
+			},
+		},
+		{
+			name:      "a status filter replaces the default rather than adding to it",
+			filter:    model.DeadLetterFilter{Status: model.EventOutboxStatusFailed},
+			wantWhere: "WHERE status = $1",
+			wantPage:  "LIMIT $2 OFFSET $3",
+			wantArgs:  []driver.Value{model.EventOutboxStatusFailed, 25, 5},
+		},
+		{
+			name: "every filter together, in the documented order",
+			filter: model.DeadLetterFilter{
+				EventType: "balance.monitor",
+				Topic:     "blnk.balances",
+				Status:    model.EventOutboxStatusDeadLettered,
+			},
+			wantWhere: "WHERE status = $1 AND event_type = $2 AND topic = $3",
+			wantPage:  "LIMIT $4 OFFSET $5",
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, "balance.monitor", "blnk.balances", 25, 5,
+			},
+		},
+		{
+			name: "surrounding whitespace is trimmed before binding",
+			filter: model.DeadLetterFilter{
+				EventType: "  identity.created  ",
+				Topic:     "\tblnk.identities\n",
+			},
+			wantWhere: "WHERE status IN ($1, $2) AND event_type = $3 AND topic = $4",
+			wantPage:  "LIMIT $5 OFFSET $6",
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				"identity.created", "blnk.identities", 25, 5,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, captured := newCapturingSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			mock.ExpectQuery("").WithArgs(tc.wantArgs...).WillReturnRows(newEventOutboxRows())
+
+			_, err := ds.ListDeadLetteredEventsFiltered(context.Background(), tc.filter, 25, 5)
+			require.NoError(t, err)
+
+			require.Len(t, *captured, 1, "one query serves the request; a walk would issue several")
+			issued := (*captured)[0]
+			assert.Contains(t, issued, tc.wantWhere,
+				"the predicates must be in SQL, or they are being applied above the database on a page that was already truncated")
+			assert.Contains(t, issued, tc.wantPage,
+				"the page placeholders follow the predicates, so adding a filter cannot rebind the limit")
+			assert.Contains(t, issued, "ORDER BY occurred_at DESC, id DESC",
+				"a filtered page must be ordered identically to an unfiltered one, or paging is unstable across the two")
+			assert.NotContains(t, issued, tc.filter.Topic+"'",
+				"filter values are bound, never interpolated: an interpolated topic is an injection surface")
+
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+// TestListDeadLetteredEventsFiltered_NormalisesPaginationLikeTheUnfilteredListing keeps the
+// two entry points interchangeable.
+//
+// A caller that adds a filter to a working request must not also get a different page. The
+// upper cap is the load-bearing half here as it is there: without it an authenticated
+// operator endpoint becomes a full table scan of an outbox that grows without bound.
+func TestListDeadLetteredEventsFiltered_NormalisesPaginationLikeTheUnfilteredListing(t *testing.T) {
 	cases := []struct {
 		name                  string
 		limit, offset         int
@@ -3588,20 +4707,21 @@ func TestListDeadLetteredEvents_NormalisesPagination(t *testing.T) {
 			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
 				WithArgs(
 					model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
-					tc.wantLimit, tc.wantOffset,
+					"transaction.applied", tc.wantLimit, tc.wantOffset,
 				).
 				WillReturnRows(newEventOutboxRows())
 
-			_, err := ds.ListDeadLetteredEvents(context.Background(), tc.limit, tc.offset)
+			_, err := ds.ListDeadLetteredEventsFiltered(context.Background(),
+				model.DeadLetterFilter{EventType: "transaction.applied"}, tc.limit, tc.offset)
 			require.NoError(t, err)
 			assert.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
 }
 
-// TestListDeadLetteredEvents_ErrorsAreWrapped covers the statement, scan and row
-// iteration branches of the listing.
-func TestListDeadLetteredEvents_ErrorsAreWrapped(t *testing.T) {
+// TestListDeadLetteredEventsFiltered_ErrorsAreWrapped covers the statement, scan and row
+// iteration branches, and asserts no driver text escapes into the caller's message.
+func TestListDeadLetteredEventsFiltered_ErrorsAreWrapped(t *testing.T) {
 	valid := model.EventOutbox{
 		ID: 1, EventID: uuid.NewString(), EventType: "transaction.applied", AggregateID: "agg",
 		PartitionKey: "agg", LedgerID: "ldg", Topic: "blnk.transactions",
@@ -3615,8 +4735,6 @@ func TestListDeadLetteredEvents_ErrorsAreWrapped(t *testing.T) {
 			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).WillReturnError(sql.ErrConnDone)
 		},
 		"scan error": func(mock sqlmock.Sqlmock) {
-			// Built from the real row builder with occurred_at corrupted BY POSITION,
-			// so the cell count can never drift away from the projection.
 			cells := eventOutboxRow(valid)
 			cells[indexOfProjectedColumn(t, "occurred_at")] = "not-a-timestamp"
 
@@ -3636,12 +4754,102 @@ func TestListDeadLetteredEvents_ErrorsAreWrapped(t *testing.T) {
 
 			script(mock)
 
-			entries, err := ds.ListDeadLetteredEvents(context.Background(), 10, 0)
+			entries, err := ds.ListDeadLetteredEventsFiltered(context.Background(),
+				model.DeadLetterFilter{Topic: "blnk.transactions"}, 10, 0)
 			assert.Nil(t, entries)
 			requireAPIError(t, err, apierror.ErrInternalServer)
 			assert.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
+}
+
+// TestCountDeadLetteredEvents_CountsTheSameSetTheListingPages is the invariant that makes a
+// reported total trustworthy.
+//
+// The count and the listing must narrow IDENTICALLY. A total taken with a different
+// predicate than the page it is reported beside is worse than no total: a paging client
+// either stops early, believing it has seen everything, or loops forever asking for a page
+// past the end. Both methods build their WHERE clause from the one shared clause builder,
+// and this test asserts the resulting predicate and bindings are the same rather than
+// merely similar.
+func TestCountDeadLetteredEvents_CountsTheSameSetTheListingPages(t *testing.T) {
+	filters := []model.DeadLetterFilter{
+		{},
+		{EventType: "transaction.applied"},
+		{Topic: "blnk.transactions"},
+		{Status: model.EventOutboxStatusFailed},
+		{
+			EventType: "balance.monitor",
+			Topic:     "blnk.balances",
+			Status:    model.EventOutboxStatusDeadLettered,
+		},
+	}
+
+	// whereOf extracts the predicate from a captured statement, so the two queries are
+	// compared on the clause they share rather than on the projections they do not.
+	whereOf := func(t *testing.T, statement string) string {
+		t.Helper()
+
+		start := strings.Index(statement, "WHERE ")
+		require.GreaterOrEqual(t, start, 0, "every dead-letter query is filtered")
+
+		clause := statement[start:]
+		if end := strings.Index(clause, "ORDER BY"); end >= 0 {
+			clause = clause[:end]
+		}
+		if end := strings.Index(clause, "LIMIT"); end >= 0 {
+			clause = clause[:end]
+		}
+
+		return strings.Join(strings.Fields(clause), " ")
+	}
+
+	for _, filter := range filters {
+		t.Run(fmt.Sprintf("%s|%s|%s", filter.Status, filter.EventType, filter.Topic), func(t *testing.T) {
+			listDB, listMock, listCaptured := newCapturingSQLMock(t)
+			listMock.ExpectQuery("").WillReturnRows(newEventOutboxRows())
+			_, listErr := Datasource{Conn: listDB}.ListDeadLetteredEventsFiltered(
+				context.Background(), filter, 10, 0)
+			require.NoError(t, listErr)
+
+			countDB, countMock, countCaptured := newCapturingSQLMock(t)
+			countMock.ExpectQuery("").
+				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(7)))
+			total, countErr := Datasource{Conn: countDB}.CountDeadLetteredEvents(
+				context.Background(), filter)
+			require.NoError(t, countErr)
+			assert.Equal(t, int64(7), total)
+
+			require.Len(t, *listCaptured, 1)
+			require.Len(t, *countCaptured, 1)
+			assert.Equal(t,
+				whereOf(t, (*listCaptured)[0]),
+				whereOf(t, (*countCaptured)[0]),
+				"the count must select the same rows the page came from, or the total describes a different set")
+			assert.Contains(t, (*countCaptured)[0], "SELECT COUNT(*)",
+				"a count is an aggregate, not a page whose length is reported as a total")
+			assert.NotContains(t, (*countCaptured)[0], "LIMIT",
+				"a count of the set cannot be bounded by a page, or it reports the page size")
+		})
+	}
+}
+
+// TestCountDeadLetteredEvents_ErrorsAreWrapped keeps a counting failure typed and
+// driver-silent: the count feeds an operator-facing total, and a raw driver string in that
+// response would disclose the schema.
+func TestCountDeadLetteredEvents_ErrorsAreWrapped(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).WillReturnError(sql.ErrConnDone)
+
+	total, err := ds.CountDeadLetteredEvents(context.Background(), model.DeadLetterFilter{})
+
+	assert.Zero(t, total, "a failed count must not be reported as an empty inventory")
+	requireAPIError(t, err, apierror.ErrInternalServer)
+	assert.NotContains(t, err.Error(), sql.ErrConnDone.Error(),
+		"driver text must not reach an operator-facing response")
+	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 // TestCountEventOutboxByStatus_ReturnsPerStatusCounts pins the method that acceptance
@@ -3670,7 +4878,9 @@ func TestCountEventOutboxByStatus_ReturnsPerStatusCounts(t *testing.T) {
 			AddRow(model.EventOutboxStatusDeadLettered, int64(7)),
 	)
 
-	counts, err := ds.CountEventOutboxByStatus(context.Background())
+	window := time.Now().UTC().Add(-6 * time.Hour)
+
+	counts, err := ds.CountEventOutboxByStatus(context.Background(), window)
 	require.NoError(t, err)
 
 	assert.Equal(t, map[string]int64{
@@ -3682,8 +4892,20 @@ func TestCountEventOutboxByStatus_ReturnsPerStatusCounts(t *testing.T) {
 	}, counts)
 
 	require.Len(t, *captured, 1)
-	assert.Contains(t, (*captured)[0], "GROUP BY status",
+	issued := (*captured)[0]
+	assert.Contains(t, issued, "GROUP BY status",
 		"the reconciliation needs one row per status, aggregated in the database rather than by counting rows in Go")
+
+	// PERF-P04: the count is TWO-ARMED, and which arm is windowed is the substance of the
+	// fix. Asserted on the statement because a small fixture cannot tell a bounded count from
+	// an unbounded one — both return the same rows.
+	assert.Contains(t, issued, "UNION ALL",
+		"one arm counts everything outstanding exactly, the other bounds the one unbounded population")
+	assert.Contains(t, issued, "WHERE status <> $1",
+		"every non-dispatched status must be counted EXACTLY and in full, however short the window: "+
+			"a row pending for three days must still appear in the backlog it is the point of")
+	assert.Contains(t, issued, "WHERE status = $1 AND occurred_at >= $2",
+		"dispatched is the only population that grows without bound, so it is the only one windowed")
 
 	// The reconciliation arithmetic the runbook actually performs, asserted here so the
 	// two terminal states cannot drift out of the sum.
@@ -3692,6 +4914,64 @@ func TestCountEventOutboxByStatus_ReturnsPerStatusCounts(t *testing.T) {
 		"dispatched + dead_lettered is what the daily reconciliation compares against the broker's end offsets")
 
 	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestCountEventOutboxByStatus_NormalisesTheWindow pins what a caller cannot ask for.
+//
+// A zero instant means "no preference" and a future one is a caller error; both become one
+// default window before now. Correcting rather than failing is deliberate — a zero instant
+// bound verbatim would ask PostgreSQL for every dispatched row since year one, which is the
+// whole-history scan this window exists to prevent, and a future instant would report zero
+// dispatched rows and read as total message loss.
+func TestCountEventOutboxByStatus_NormalisesTheWindow(t *testing.T) {
+	cases := []struct {
+		name  string
+		given time.Time
+	}{
+		{"a zero instant takes the default window", time.Time{}},
+		{"a future instant takes the default window", time.Now().UTC().Add(time.Hour)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			before := time.Now().UTC()
+
+			var bound time.Time
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+				WithArgs(model.EventOutboxStatusDispatched, sqlmock.AnyArg()).
+				WillReturnRows(sqlmock.NewRows([]string{"status", "row_count"}))
+
+			_, err := ds.CountEventOutboxByStatus(context.Background(), tc.given)
+			require.NoError(t, err)
+			assert.NoError(t, mock.ExpectationsWereMet())
+
+			// The instant itself is checked through the normaliser, which is the one place
+			// the rule lives; sqlmock's AnyArg cannot assert a range.
+			bound = normalizeEventCountWindow(tc.given)
+			assert.WithinDuration(t, before.Add(-defaultEventCountWindow), bound, time.Minute,
+				"a window nobody chose must be exactly one default window wide")
+			assert.True(t, bound.Before(time.Now().UTC()),
+				"and must be in the past, or the dispatched count reads as total loss")
+		})
+	}
+
+	t.Run("an explicit past instant is honoured", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+
+		chosen := time.Now().UTC().Add(-90 * time.Minute).Truncate(time.Microsecond)
+
+		mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+			WithArgs(model.EventOutboxStatusDispatched, chosen).
+			WillReturnRows(sqlmock.NewRows([]string{"status", "row_count"}))
+
+		_, err := ds.CountEventOutboxByStatus(context.Background(), chosen)
+		require.NoError(t, err)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
 }
 
 // TestCountEventOutboxByStatus_AbsentStatusMeansAbsentKey pins the semantics a caller can
@@ -3717,7 +4997,7 @@ func TestCountEventOutboxByStatus_AbsentStatusMeansAbsentKey(t *testing.T) {
 		mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
 			WillReturnRows(sqlmock.NewRows([]string{"status", "count"}))
 
-		counts, err := ds.CountEventOutboxByStatus(context.Background())
+		counts, err := ds.CountEventOutboxByStatus(context.Background(), time.Time{})
 		require.NoError(t, err)
 		require.NotNil(t, counts, "the map must never be nil on success so callers can range over it without a nil check")
 		assert.Empty(t, counts)
@@ -3732,7 +5012,7 @@ func TestCountEventOutboxByStatus_AbsentStatusMeansAbsentKey(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"status", "count"}).
 				AddRow(model.EventOutboxStatusDispatched, int64(10)))
 
-		counts, err := ds.CountEventOutboxByStatus(context.Background())
+		counts, err := ds.CountEventOutboxByStatus(context.Background(), time.Time{})
 		require.NoError(t, err)
 
 		_, present := counts[model.EventOutboxStatusPending]
@@ -3755,7 +5035,7 @@ func TestCountEventOutboxByStatus_AbsentStatusMeansAbsentKey(t *testing.T) {
 		mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
 			WillReturnRows(sqlmock.NewRows([]string{"status", "count"}).AddRow("quarantined", int64(4)))
 
-		counts, err := ds.CountEventOutboxByStatus(context.Background())
+		counts, err := ds.CountEventOutboxByStatus(context.Background(), time.Time{})
 		require.NoError(t, err)
 		assert.Equal(t, int64(4), counts["quarantined"],
 			"an unrecognised status must surface rather than be dropped: the column permits extension without a migration")
@@ -3790,7 +5070,7 @@ func TestCountEventOutboxByStatus_ErrorsAreWrapped(t *testing.T) {
 
 			script(mock)
 
-			counts, err := ds.CountEventOutboxByStatus(context.Background())
+			counts, err := ds.CountEventOutboxByStatus(context.Background(), time.Time{})
 			assert.Nil(t, counts)
 			requireAPIError(t, err, apierror.ErrInternalServer)
 			assert.NoError(t, mock.ExpectationsWereMet())
@@ -3855,14 +5135,14 @@ func TestEventOutboxReads_DriverCloseFailureSurfacesThroughRowsErr(t *testing.T)
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 
-	t.Run("ListDeadLetteredEvents", func(t *testing.T) {
+	t.Run("ListDeadLetterInventory", func(t *testing.T) {
 		db, mock := newSQLMock(t)
 		ds := Datasource{Conn: db}
 
 		mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
-			WillReturnRows(newEventOutboxRows(entry).CloseError(closeErr))
+			WillReturnRows(newDeadLetterInventoryRows(deadLetterInventoryEntryOf(entry)).CloseError(closeErr))
 
-		entries, err := ds.ListDeadLetteredEvents(context.Background(), 10, 0)
+		entries, err := ds.ListDeadLetteredEvents(context.Background(), model.DeadLetterQuery{Limit: 10})
 		assert.Nil(t, entries)
 		requireAPIError(t, err, apierror.ErrInternalServer)
 		assert.NoError(t, mock.ExpectationsWereMet())
@@ -3877,7 +5157,7 @@ func TestEventOutboxReads_DriverCloseFailureSurfacesThroughRowsErr(t *testing.T)
 				AddRow(model.EventOutboxStatusDispatched, int64(9)).
 				CloseError(closeErr))
 
-		counts, err := ds.CountEventOutboxByStatus(context.Background())
+		counts, err := ds.CountEventOutboxByStatus(context.Background(), time.Time{})
 		assert.Nil(t, counts,
 			"a partial count must never reach the zero-loss reconciliation: it would under-report while looking like a clean result")
 		requireAPIError(t, err, apierror.ErrInternalServer)
@@ -4128,6 +5408,90 @@ func TestEventSubscriberRepository_NoMethodReturnsPlaintextSecret(t *testing.T) 
 // differences that follow from this table's state machine: the claim-visible set here spans
 // pending, processing AND replaying rather than pending alone, and the terminal state used
 // to retire rows is dispatched rather than completed.
+// foreignEventOutboxIndexes returns the indexes present on blnk.event_outbox that NO migration
+// in this build creates, sorted by name.
+//
+// # Why a test needs to know this
+//
+// The plan assertion in TestClaimPendingEventOutbox_UsesClaimIndex_RealDB is a statement about
+// which of THIS BUILD'S indexes the planner chooses. On a shared development database the
+// available set can be larger: a database that has had another build's migrations applied keeps
+// that build's indexes, the planner costs them alongside this build's, and a cheaper foreign
+// index wins. The assertion then fails on a plan this build's schema cannot produce — and
+// widening it to accept the foreign index would make it vacuous, because a foreign index need
+// not have the partial predicate the guarantee depends on.
+//
+// # Why the expected set is read from the migration files
+//
+// Restating the index names in the test would be a second declaration of the schema, and it
+// would go stale silently in the direction that matters: a migration that ADDED an index would
+// make this function report the new index as foreign and skip the assertion for ever. Reading
+// sql/*.sql means the expected set is whatever this build actually creates, by construction.
+//
+// A name is matched anywhere in a migration, deliberately: an index may be created in one file
+// and dropped and recreated in a later one, and every mention is evidence that this build owns
+// the name.
+//
+// Parameters:
+//   - t *testing.T: the test, for fatal reporting.
+//   - ctx context.Context: bounds the catalogue query.
+//   - ds Datasource: the connection to read pg_indexes through.
+//
+// Returns:
+//   - []string: index names present in the database and absent from this build's migrations.
+func foreignEventOutboxIndexes(t *testing.T, ctx context.Context, ds Datasource) []string {
+	t.Helper()
+
+	// The migration directory sits beside this package, one level up. Located relatively rather
+	// than through an environment variable so the check works in any checkout.
+	entries, err := os.ReadDir(filepath.Join("..", "sql"))
+	require.NoError(t, err, "this build's migration directory must be readable to know which indexes it declares")
+
+	var declared strings.Builder
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+
+		contents, readErr := os.ReadFile(filepath.Join("..", "sql", entry.Name()))
+		require.NoErrorf(t, readErr, "migration %s must be readable", entry.Name())
+
+		declared.Write(contents)
+		declared.WriteString("\n")
+	}
+
+	migrations := declared.String()
+	require.NotEmpty(t, migrations, "this build must declare at least one migration")
+
+	rows, err := ds.Conn.QueryContext(ctx, `
+		SELECT indexname
+		FROM pg_indexes
+		WHERE schemaname = 'blnk' AND tablename = 'event_outbox'
+		ORDER BY indexname
+	`)
+	require.NoError(t, err, "reading the index catalogue must succeed")
+	defer func() { _ = rows.Close() }()
+
+	foreign := make([]string, 0)
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+
+		// The primary key is named by the table rather than declared as an index, so it is
+		// never spelled in a migration and is not foreign.
+		if name == "event_outbox_pkey" {
+			continue
+		}
+
+		if !strings.Contains(migrations, name) {
+			foreign = append(foreign, name)
+		}
+	}
+	require.NoError(t, rows.Err())
+
+	return foreign
+}
+
 func quiesceEventOutbox(t *testing.T, ds Datasource, markerPrefix string) {
 	t.Helper()
 
@@ -4181,14 +5545,36 @@ func quiesceEventOutbox(t *testing.T, ds Datasource, markerPrefix string) {
 			WHERE aggregate_id LIKE $1 OR partition_key LIKE $1
 		`, markerPrefix+"%")
 		if cleanupErr != nil {
-			t.Logf("failed to remove event outbox fixtures: %v", cleanupErr)
+			// FAILS the test rather than logging, for the reasons the comment above already
+			// gives: a leaked row makes every subsequent claim read past it and its retired
+			// broker coordinate collides with a live publish after an offset reset, so the
+			// relay cannot mark the NEW row dispatched at all. That is a failure this test
+			// caused, and a log line lets it be reported as a pass.
+			t.Errorf("failed to remove event outbox fixtures for marker %q: %v",
+				markerPrefix, cleanupErr)
+		} else if affected, affectedErr := result.RowsAffected(); affectedErr == nil {
+			t.Logf("removed %d event outbox fixture rows for marker %q", affected, markerPrefix)
+		}
+
+		// Confirmed, not assumed — and checked even when the delete errored, because the
+		// question that matters to the next test is whether the table is clean, not whether
+		// the statement returned without error.
+		var remaining int
+		if err := ds.Conn.QueryRow(`
+			SELECT count(*) FROM blnk.event_outbox
+			WHERE aggregate_id LIKE $1 OR partition_key LIKE $1
+		`, markerPrefix+"%").Scan(&remaining); err != nil {
+			t.Errorf("could not confirm the event outbox fixtures for marker %q were removed: %v",
+				markerPrefix, err)
 
 			return
 		}
 
-		if affected, affectedErr := result.RowsAffected(); affectedErr == nil {
-			t.Logf("removed %d event outbox fixture rows for marker %q", affected, markerPrefix)
-		}
+		assert.Zerof(t, remaining,
+			"marker %q left %d fixture rows in blnk.event_outbox. Every later claim in this "+
+				"shared table reads past them, and a retired row's (topic, partition, offset) "+
+				"coordinate collides with a live publish once broker offsets restart.",
+			markerPrefix, remaining)
 	})
 }
 
@@ -4576,7 +5962,7 @@ func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(
 		}
 	}
 	require.NotEmpty(t, earlierToken)
-	outcome, err := ds.MarkEventFailed(ctx, earlier.ID, earlierToken, "transient", 0, false)
+	outcome, err := ds.MarkEventFailed(ctx, earlier.ID, earlierToken, "transient", 0, false, testDeadLetterHandoffLease)
 	require.NoError(t, err)
 	require.False(t, outcome.Exhausted)
 
@@ -4634,7 +6020,7 @@ func TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB(
 	insertRealEventOutbox(t, ds, successor)
 
 	token := claimEventOutboxToken(t, ds, doomed)
-	outcome, err := ds.MarkEventFailed(ctx, doomed.ID, token, "permanently undeliverable", 0, false)
+	outcome, err := ds.MarkEventFailed(ctx, doomed.ID, token, "permanently undeliverable", 0, false, testDeadLetterHandoffLease)
 	require.NoError(t, err)
 	require.True(t, outcome.Exhausted, "a one-attempt budget is spent by its first failure")
 
@@ -4840,8 +6226,11 @@ func TestRenewEventOutboxLease_HoldsAnInFlightBatchPastItsOriginalLease_RealDB(t
 //
 //   - is INVISIBLE to the ordinary claim, because that predicate admits only attempts <
 //     max_attempts, which is exactly why the repair pass has to exist;
-//   - IS reachable by the repair claim, which leaves the status at 'failed' and stamps a fresh
-//     token;
+//   - is invisible to the REPAIR claim too while the hand-off lease the exhaustion transition
+//     left on it is still live, which is what stops the repair pass racing the worker that owes
+//     the dead-letter write (F-28);
+//   - IS reachable by the repair claim once that lease lapses, which leaves the status at
+//     'failed' and stamps a fresh token;
 //   - is protected by its new lease from being repaired twice at once;
 //   - can then complete through the ORDINARY MarkEventDeadLettered transition, which accepts
 //     'failed' as a prior state precisely so no second code path is needed; and
@@ -4887,7 +6276,7 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 	strandedToken := tokens[stranded.EventID]
 	require.NotEmpty(t, strandedToken, "the stranded fixture must come back with the token its claim issued")
 
-	strandedOutcome, err := ds.MarkEventFailed(ctx, stranded.ID, strandedToken, "broker refused the publish", 0, false)
+	strandedOutcome, err := ds.MarkEventFailed(ctx, stranded.ID, strandedToken, "broker refused the publish", 0, false, testDeadLetterHandoffLease)
 	require.NoError(t, err)
 	require.True(t, strandedOutcome.Exhausted, "a one-attempt budget must be spent by one failure")
 	require.Equal(t, model.EventOutboxStatusFailed, strandedOutcome.Status)
@@ -4895,7 +6284,7 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 	preservedToken := tokens[preserved.EventID]
 	require.NotEmpty(t, preservedToken)
 
-	preservedOutcome, err := ds.MarkEventFailed(ctx, preserved.ID, preservedToken, "broker refused the publish", 0, false)
+	preservedOutcome, err := ds.MarkEventFailed(ctx, preserved.ID, preservedToken, "broker refused the publish", 0, false, testDeadLetterHandoffLease)
 	require.NoError(t, err)
 	require.True(t, preservedOutcome.Exhausted)
 
@@ -4910,13 +6299,39 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 		"a row whose retry budget is spent must be outside the ordinary claim: if it were not, this "+
 			"test would be exercising the retry path rather than the repair")
 
+	// AND IT IS NOT REACHABLE BY THE REPAIR PASS EITHER, YET. This is the F-28 regression, and it
+	// is the assertion the earlier arrangement failed.
+	//
+	// The exhaustion arm RETAINS the claim token so that only the worker which spent the last
+	// attempt may write the dead-letter message and record it. That retention is only worth
+	// anything if the row also stays LEASED: this repair claim admits a failed row with no
+	// dlt_topic and no live lease, and it stamps a FRESH token over whatever was there. When the
+	// exhaustion arm cleared locked_until, a second instance could therefore take the row in the
+	// same instant, overwrite the token the owning worker was about to present, and publish the
+	// dead-letter message alongside it — two copies of one event on the .dlt topic.
+	tooSoon, err := ds.ClaimFailedEventOutboxForDeadLetter(ctx, 20, time.Minute)
+	require.NoError(t, err)
+	require.False(t, containsEventID(tooSoon, stranded.EventID),
+		"a row whose exhaustion transition has just handed it to the dead-letter writer must stay "+
+			"leased: the repair pass reaching it while the owning worker is still publishing is what "+
+			"puts two copies of one event on a dead-letter topic")
+
+	// EXPIRING THE LEASE is how the owning worker's death is modelled, and it is the only
+	// condition under which the repair pass should see the row. Written directly because there
+	// is no API for "that process is gone" — the lease lapsing IS that statement.
+	_, err = ds.Conn.ExecContext(ctx,
+		`UPDATE blnk.event_outbox SET locked_until = NOW() - INTERVAL '1 second' WHERE id = $1`,
+		stranded.ID)
+	require.NoError(t, err, "expiring the hand-off lease models the owning worker having died")
+
 	// THE WAY OUT.
 	repair, err := ds.ClaimFailedEventOutboxForDeadLetter(ctx, 20, time.Minute)
 	require.NoError(t, err)
 
 	require.True(t, containsEventID(repair, stranded.EventID),
-		"the repair claim must reach a failed row with no dead-letter record; without it the event is "+
-			"the only copy of itself and nothing will ever act on it again")
+		"once the hand-off lease has expired the repair claim must reach a failed row with no "+
+			"dead-letter record; without it the event is the only copy of itself and nothing will ever "+
+			"act on it again")
 	assert.False(t, containsEventID(repair, preserved.EventID),
 		"a row already preserved on its dead-letter topic must NOT be re-claimed: repairing it again "+
 			"would rewrite its dead-letter record on every poll for ever")
@@ -5148,7 +6563,7 @@ func TestEventOutboxTransitions_AStaleLeaseHolderCannotWrite_RealDB(t *testing.T
 		requireAPIError(t, ds.MarkEventDispatched(ctx, entry.ID, staleToken, model.BrokerRecord{}), apierror.ErrConflict)
 	})
 	t.Run("stale failure is refused and does not spend the budget", func(t *testing.T) {
-		_, failErr := ds.MarkEventFailed(ctx, entry.ID, staleToken, "stale attempt", 0, false)
+		_, failErr := ds.MarkEventFailed(ctx, entry.ID, staleToken, "stale attempt", 0, false, testDeadLetterHandoffLease)
 		requireAPIError(t, failErr, apierror.ErrConflict)
 
 		got, getErr := ds.GetEventByID(ctx, entry.EventID)
@@ -5283,7 +6698,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 		token := claimEventOutboxToken(t, ds, entry)
 
-		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "broker unavailable", 0, false)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "broker unavailable", 0, false, testDeadLetterHandoffLease)
 		require.NoError(t, err)
 		assert.False(t, outcome.Exhausted, "one of three attempts is not exhaustion")
 		assert.Equal(t, model.EventOutboxStatusPending, outcome.Status)
@@ -5322,7 +6737,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 		token := claimEventOutboxToken(t, ds, entry)
 
-		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "broker unavailable", time.Hour, false)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "broker unavailable", time.Hour, false, testDeadLetterHandoffLease)
 		require.NoError(t, err)
 		require.False(t, outcome.Exhausted)
 		require.Equal(t, model.EventOutboxStatusPending, outcome.Status)
@@ -5366,7 +6781,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 		token := claimEventOutboxToken(t, ds, entry)
 
-		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "gave up", time.Hour, false)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "gave up", time.Hour, false, testDeadLetterHandoffLease)
 		require.NoError(t, err)
 		require.True(t, outcome.Exhausted, "one of one attempt is exhaustion")
 
@@ -5385,7 +6800,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		insertRealEventOutbox(t, ds, entry)
 
 		firstToken := claimEventOutboxToken(t, ds, entry)
-		_, err := ds.MarkEventFailed(ctx, entry.ID, firstToken, "attempt one", 0, false)
+		_, err := ds.MarkEventFailed(ctx, entry.ID, firstToken, "attempt one", 0, false, testDeadLetterHandoffLease)
 		require.NoError(t, err)
 		afterFirst, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
@@ -5400,7 +6815,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		assert.Error(t, ds.MarkEventDispatched(ctx, entry.ID, firstToken, model.BrokerRecord{}),
 			"the stale token from the previous claim must no longer authorise anything")
 
-		_, err = ds.MarkEventFailed(ctx, entry.ID, secondToken, "attempt two", 0, false)
+		_, err = ds.MarkEventFailed(ctx, entry.ID, secondToken, "attempt two", 0, false, testDeadLetterHandoffLease)
 		require.NoError(t, err)
 		afterSecond, err := ds.GetEventByID(ctx, entry.EventID)
 		require.NoError(t, err)
@@ -5424,7 +6839,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 		// attempts 0 + 1 >= max_attempts 1, so the exhaustion arm fires on the first
 		// failure. This is the CASE boundary, exercised against real SQL.
-		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "final failure", 0, false)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "final failure", 0, false, testDeadLetterHandoffLease)
 		require.NoError(t, err)
 		assert.True(t, outcome.Exhausted, "one of one attempt is exhaustion")
 		assert.Equal(t, token, outcome.ClaimToken,
@@ -5448,7 +6863,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 
 		// It is nevertheless visible to an operator, which is why the listing covers
 		// both terminal failure literals.
-		listed, err := ds.ListDeadLetteredEvents(ctx, maxDeadLetterPageSize, 0)
+		listed, err := ds.ListDeadLetteredEvents(ctx, model.DeadLetterQuery{Limit: maxDeadLetterPageSize})
 		require.NoError(t, err)
 		assert.True(t, containsEventID(listed, entry.EventID),
 			"an event stranded in failed must still appear in the dead-letter inventory; it is the one an operator most needs to see")
@@ -5484,7 +6899,7 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		insertRealEventOutbox(t, ds, entry)
 
 		token := claimEventOutboxToken(t, ds, entry)
-		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "gave up", 0, false)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "gave up", 0, false, testDeadLetterHandoffLease)
 		require.NoError(t, err)
 		require.True(t, outcome.Exhausted)
 		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, outcome.ClaimToken,
@@ -5568,14 +6983,28 @@ func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testin
 	marker := newRealEventOutboxMarker("count")
 	quiesceEventOutbox(t, ds, marker)
 
-	baseline, err := ds.CountEventOutboxByStatus(ctx)
+	// TWO windows, read as a pair (PERF-P04). The narrow one covers only the fixtures this
+	// test creates at the current instant; the wide one additionally covers the deliberately
+	// AGED fixtures below. Comparing the two deltas is what proves the window bounds the
+	// dispatched arm and nothing else — and it is deterministic, which a single reading against
+	// an absolute count on a shared table could never be.
+	narrowWindow := time.Now().UTC().Add(-time.Hour)
+	wideWindow := time.Now().UTC().Add(-6 * time.Hour)
+
+	baseline, err := ds.CountEventOutboxByStatus(ctx, narrowWindow)
 	require.NoError(t, err)
 	require.NotNil(t, baseline)
 
+	wideBaseline, err := ds.CountEventOutboxByStatus(ctx, wideWindow)
+	require.NoError(t, err)
+
 	const (
-		wantPending      = 3
-		wantDispatched   = 2
-		wantDeadLettered = 1
+		wantPending         = 3
+		wantDispatched      = 2
+		wantDeadLettered    = 1
+		wantAgedDispatched  = 2
+		wantAgedPending     = 1
+		agedOccurrenceShift = 3 * time.Hour
 	)
 
 	// ORDER MATTERS HERE, and getting it wrong is subtle. Driving a row to a terminal
@@ -5584,41 +7013,82 @@ func TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB(t *testin
 	// swept into processing along with them and would then be counted in the wrong
 	// bucket. The terminal fixtures are therefore created first, and the pending ones
 	// last, so nothing claims them.
-	for i := 0; i < wantDispatched; i++ {
+	aged := func() *model.EventOutbox {
+		entry := newEventOutboxFixture(marker)
+		entry.OccurredAt = dbTimestamp(time.Now().Add(-agedOccurrenceShift))
+
+		return entry
+	}
+
+	for range wantDispatched {
 		entry := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, claimEventOutboxToken(t, ds, entry), model.BrokerRecord{}))
 	}
-	for i := 0; i < wantDeadLettered; i++ {
+	// Dispatched THREE HOURS AGO: inside the wide window, outside the narrow one. These are
+	// the rows whose disappearance from the narrow reading is the fix.
+	for range wantAgedDispatched {
+		entry := insertRealEventOutbox(t, ds, aged())
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, claimEventOutboxToken(t, ds, entry), model.BrokerRecord{}))
+	}
+	for range wantDeadLettered {
 		entry := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, claimEventOutboxToken(t, ds, entry),
 			entry.Topic+".dlt",
 			json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`), model.BrokerRecord{}))
 	}
-	for i := 0; i < wantPending; i++ {
+	for range wantPending {
 		insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 	}
+	// A row that has been PENDING since three hours ago — older than the narrow window, and
+	// therefore the single most important row in this test. It is the backlog a gauge exists to
+	// show, and windowing the whole count rather than only the dispatched arm would have hidden
+	// it precisely when it mattered.
+	for range wantAgedPending {
+		insertRealEventOutbox(t, ds, aged())
+	}
 
-	after, err := ds.CountEventOutboxByStatus(ctx)
+	after, err := ds.CountEventOutboxByStatus(ctx, narrowWindow)
+	require.NoError(t, err)
+
+	wideAfter, err := ds.CountEventOutboxByStatus(ctx, wideWindow)
 	require.NoError(t, err)
 
 	delta := func(status string) int64 { return after[status] - baseline[status] }
+	wideDelta := func(status string) int64 { return wideAfter[status] - wideBaseline[status] }
 
-	assert.Equal(t, int64(wantPending), delta(model.EventOutboxStatusPending))
-	assert.Equal(t, int64(wantDispatched), delta(model.EventOutboxStatusDispatched))
+	// EVERY NON-DISPATCHED STATUS IS EXACT AND COMPLETE, whatever the window says. The aged
+	// pending row is counted by both readings, which is the property the backlog gauge rests on.
+	assert.Equal(t, int64(wantPending+wantAgedPending), delta(model.EventOutboxStatusPending),
+		"pending is counted exactly and in full however short the window: a row pending for three "+
+			"hours must still appear in the backlog it is the point of")
+	assert.Equal(t, delta(model.EventOutboxStatusPending), wideDelta(model.EventOutboxStatusPending),
+		"and the window makes no difference to it at all")
 	assert.Equal(t, int64(wantDeadLettered), delta(model.EventOutboxStatusDeadLettered))
+	assert.Equal(t, delta(model.EventOutboxStatusDeadLettered), wideDelta(model.EventOutboxStatusDeadLettered),
+		"the dead-letter inventory is bounded by operation rather than by time, so it is counted in full as well")
 
-	assert.Equal(t, int64(wantDispatched+wantDeadLettered),
-		delta(model.EventOutboxStatusDispatched)+delta(model.EventOutboxStatusDeadLettered),
+	// DISPATCHED IS THE ONE POPULATION THE WINDOW RESTRICTS, and this is the assertion that
+	// says so. The narrow reading sees only the recent fixtures; the wide one additionally sees
+	// the aged ones.
+	assert.Equal(t, int64(wantDispatched), delta(model.EventOutboxStatusDispatched),
+		"a dispatched row older than the window must not be counted: that history is the population "+
+			"whose unbounded scan PERF-P04 is about")
+	assert.Equal(t, int64(wantDispatched+wantAgedDispatched), wideDelta(model.EventOutboxStatusDispatched),
+		"and a wider window must see it again, or the arm is not windowed but truncated")
+
+	assert.Equal(t, int64(wantDispatched+wantAgedDispatched+wantDeadLettered),
+		wideDelta(model.EventOutboxStatusDispatched)+wideDelta(model.EventOutboxStatusDeadLettered),
 		"dispatched + dead_lettered is the quantity the daily zero-loss reconciliation compares against the broker's main-topic and dead-letter-topic end offsets")
 
 	// Every row inserted here is accounted for in exactly one status, which is the
 	// zero-loss property itself: no event may be missing from the totals, and none may
-	// be double-counted.
+	// be double-counted. Measured over the WIDE window, which is the one that covers every
+	// fixture — a reconciliation must be run over a window that contains what it reconciles.
 	var totalDelta int64
-	for status := range after {
-		totalDelta += delta(status)
+	for status := range wideAfter {
+		totalDelta += wideDelta(status)
 	}
-	assert.Equal(t, int64(wantPending+wantDispatched+wantDeadLettered), totalDelta,
+	assert.Equal(t, int64(wantPending+wantAgedPending+wantDispatched+wantAgedDispatched+wantDeadLettered), totalDelta,
 		"every inserted event must appear in exactly one status: a short total is a lost event and an over-count is a double-counted one")
 }
 
@@ -5721,14 +7191,35 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// to a whole-set hash build — the plan this test forbids. Reclaiming the space and
 	// refreshing the statistics leaves the table as this test found it, in the only sense
 	// the planner cares about.
+	// Both steps FAIL the test rather than logging, and the second still runs when the first
+	// errored — the two obligations are independent and the VACUUM is the more important of the
+	// pair. Per the reasoning above, a leak here does not merely grow the table: it inflates
+	// relpages until the planner flips the anti-join to the whole-set hash build this very test
+	// forbids, so an unreported cleanup failure makes the NEXT run of this test fail for a
+	// reason that has nothing to do with the code under test.
 	t.Cleanup(func() {
 		if _, cleanupErr := ds.Conn.Exec(
 			"DELETE FROM blnk.event_outbox WHERE event_id LIKE $1", marker+"%"); cleanupErr != nil {
-			t.Logf("failed to remove plan-shaping rows: %v", cleanupErr)
+			t.Errorf("failed to remove plan-shaping rows for marker %q: %v", marker, cleanupErr)
 		}
 		if _, cleanupErr := ds.Conn.Exec("VACUUM (ANALYZE) blnk.event_outbox"); cleanupErr != nil {
-			t.Logf("failed to reclaim the space the plan-shaping rows occupied: %v", cleanupErr)
+			t.Errorf("failed to reclaim the space the plan-shaping rows occupied: %v", cleanupErr)
 		}
+
+		var remaining int
+		if err := ds.Conn.QueryRow(
+			"SELECT count(*) FROM blnk.event_outbox WHERE event_id LIKE $1", marker+"%",
+		).Scan(&remaining); err != nil {
+			t.Errorf("could not confirm the plan-shaping rows for marker %q were removed: %v",
+				marker, err)
+
+			return
+		}
+
+		assert.Zerof(t, remaining,
+			"marker %q left %d plan-shaping rows behind. They inflate relpages for every later "+
+				"test in this package and, on the next run of this one, flip the plan this test "+
+				"asserts on.", marker, remaining)
 	})
 
 	// VACUUM (ANALYZE) rather than ANALYZE alone, and the difference is what makes this
@@ -5782,6 +7273,37 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 			unrelatedClaimable, claimableRows)
 	}
 
+	// THE OTHER PREMISE: the table must carry THIS BUILD'S INDEXES AND NO OTHERS.
+	//
+	// A plan assertion is a statement about the choice PostgreSQL makes among the indexes
+	// available to it, so it is only a statement about this build if the available set is this
+	// build's. On a shared development database it need not be: a database that has had another
+	// build's migrations applied to it keeps that build's indexes, and the planner will use one
+	// if it costs less.
+	//
+	// That is not hypothetical and it is not a defect in either build. An index declared as
+	// `(status) WHERE status <> 'dispatched'` is narrower than this build's five-column claim
+	// index and cheaper to scan, so the planner picks it — and the assertion below then fails
+	// on a plan this build's schema cannot produce. Worse, accepting such an index to make the
+	// assertion pass would make it vacuous: its predicate spans the terminal states, so the
+	// cold history IS in it and the poll cost does grow with the table, which is the exact
+	// property this test exists to forbid.
+	//
+	// Skipping is therefore the only honest answer, and it is safe in both directions: it
+	// cannot mask a real defect, because with only this build's indexes present the assertion
+	// still runs, and it does not touch the foreign index, which belongs to a build that is
+	// entitled to it.
+	if foreign := foreignEventOutboxIndexes(t, ctx, ds); len(foreign) > 0 {
+		t.Skipf(
+			"blnk.event_outbox carries %d index(es) no migration in this build creates (%s), so the "+
+				"planner is choosing among a set this build's schema does not define — most likely "+
+				"another build's migrations have been applied to the same database. The plan "+
+				"assertion below describes THIS build's indexes, and a foreign index that is cheaper "+
+				"to scan makes it unanswerable. Run this against a database migrated by this build "+
+				"alone.",
+			len(foreign), strings.Join(foreign, ", "))
+	}
+
 	// EXPLAIN without ANALYZE PLANS the statement without executing it, so the claim
 	// takes no leases and mutates nothing — which matters here, because executing this
 	// particular statement would move rows into processing as a side effect.
@@ -5805,16 +7327,15 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// THE CANDIDATE SIDE MUST REACH THE TABLE THROUGH A BLOCKING-STATE PARTIAL INDEX, which
 	// is the guarantee, rather than through one named index, which is a plan detail.
 	//
-	// This assertion used to pin "idx_event_outbox_claim" by name and it failed roughly one
-	// package run in six, always on a plan that honours the guarantee completely: PostgreSQL
-	// reached the candidate rows through a Bitmap Index Scan on
-	// idx_event_outbox_partition_key_inflight instead. Both indexes are PARTIAL on exactly
-	// the blocking states, so under either plan the cold history of terminal rows is never
-	// read and the poll's cost stays independent of how large the outbox has grown — which
-	// is the entire reason the migration's index exists. Which of the two the planner picks
-	// is a cost decision that moves with heap compaction, statistics freshness and host
-	// load, and pinning it made this assertion report a defect that was not one. The
-	// anti-join half of this test already learned that lesson; this half had not.
+	// This assertion used to pin "idx_event_outbox_claim" by name, then a list of two names,
+	// and it failed on plans that honour the guarantee completely — a Bitmap Index Scan on
+	// idx_event_outbox_partition_key_inflight, and an Index Scan on
+	// idx_event_outbox_status_open. THREE indexes on this table satisfy the guarantee for the
+	// shape seeded above, and which one the planner picks is a cost decision that moves with
+	// heap compaction, statistics freshness and host load. Every widening of the name list
+	// was a guess at the next plan, so the list is gone: the PROPERTY is read out of the
+	// catalog instead, which accepts any index that honours it and rejects any index that
+	// does not, including one added later.
 	//
 	// Asserted on the ONE plan line that reaches the candidate relation, for the same reason
 	// the earlier-same-key assertion below is: "the plan mentions an index somewhere" is
@@ -5822,15 +7343,44 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// through a blocking-state partial index" says exactly what it means. The
 	// sequential-scan prohibition further down closes the same failure mode across every
 	// other node in the plan.
-	candidateScan := planLineReferencing(planText, "event_outbox candidate")
+	// The ACCESS PATH rather than the single relation line, because a bitmap plan splits one
+	// access across two nodes and the index is named on the lower of them.
+	//
+	// This is the same lesson as the paragraph above, one step further in. Pinning the plan
+	// SHAPE is as brittle as pinning an index NAME: on a compacted heap PostgreSQL reaches
+	// the candidate rows with `Index Scan using idx_event_outbox_claim on event_outbox
+	// candidate`, and on other statistics it reaches exactly the same rows through the same
+	// index as `Bitmap Heap Scan on event_outbox candidate` with a child `Bitmap Index Scan
+	// on idx_event_outbox_claim`. The second honours the guarantee completely — the partial
+	// predicate still confines the read to the blocking states, so the cold history is never
+	// touched and the poll's cost is still independent of how large the outbox has grown —
+	// yet the relation line alone carries neither the word "Index" nor the index name, so an
+	// assertion made on that one line reported a defect that did not exist.
+	//
+	// planAccessPathFor therefore returns the relation node together with the index nodes
+	// beneath it, and the guarantee is asserted over that. What is still refused is what was
+	// always meant to be refused: reaching the candidate rows by a sequential scan, or
+	// through an index that is not partial on the blocking states.
+	candidateScan := planAccessPathFor(planText, "event_outbox candidate")
 	require.NotEmpty(t, candidateScan,
 		"the plan must reach the candidate relation explicitly.\nPlan was:\n"+planText)
 	assert.Contains(t, candidateScan, "Index",
-		"the claim's candidate selection must be index-driven. Read through a scan instead, the relay's per-poll cost grows with the whole table until it cannot keep up with 500 events/sec, and no unit test would ever reveal it.\nPlan line was: "+candidateScan)
-	assert.True(t,
-		strings.Contains(candidateScan, "idx_event_outbox_claim") ||
-			strings.Contains(candidateScan, "idx_event_outbox_partition_key_inflight"),
-		"the claim's candidate selection must be served by a partial index whose predicate is the blocking-state set, so the cold history is excluded from the index entirely. Anything else reads terminal rows on every poll.\nPlan line was: "+candidateScan+"\nPlan was:\n"+planText)
+		"the claim's candidate selection must be index-driven. Read through a scan instead, the relay's per-poll cost grows with the whole table until it cannot keep up with 500 events/sec, and no unit test would ever reveal it.\nAccess path was: "+candidateScan)
+	// READ OUT OF THE CATALOG AND EVALUATED BY POSTGRESQL, which is the fourth and last
+	// generation of this assertion. The first pinned one index name; the second pinned a list of
+	// two; the third read the predicate out of pg_indexes and PATTERN-MATCHED it, recognising
+	// four shapes and treating anything else as admitting the history — so a correct predicate
+	// written a fifth way failed, and an `ANY (ARRAY[...])` it could not parse passed. Every
+	// equivalent rewrite of "not dispatched" — a negation, an ANY over the complement, a NOT IN —
+	// needs its own special case, and each case is a chance to accept a predicate that admits the
+	// cold history.
+	//
+	// So the predicate is now spliced into a COUNT over the rows this test seeded and evaluated
+	// by the same expression evaluator that decides what the index actually contains. The
+	// question asked is the one that matters — can a dispatched row be in this index? — and the
+	// count is scoped by the marker, so a concurrent run's rows cannot answer it.
+	requireColdHistoryExcludingIndex(t, ds, candidateScan, planText,
+		"the claim's candidate selection", marker)
 
 	// The earlier-same-key exclusion must be INDEX-DRIVEN and confined to the blocking
 	// states. What it must never be is a scan of each key's entire history, which would buy
@@ -5869,15 +7419,13 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// — every plan here contains several — whereas "the line reaching `event_outbox earlier`
 	// is an index scan through a blocking-state partial index" says exactly what it means,
 	// and it says it for either of the two plan shapes above.
-	earlierScan := planLineReferencing(planText, "event_outbox earlier")
+	earlierScan := planAccessPathFor(planText, "event_outbox earlier")
 	require.NotEmpty(t, earlierScan,
 		"the plan must reach the earlier-same-key relation explicitly.\nPlan was:\n"+planText)
 	assert.Contains(t, earlierScan, "Index",
 		"the earlier-same-key exclusion must be index-driven. Read through a scan instead, the ordering guarantee is bought at the price of reading the table's entire history on every poll — correct, and progressively unable to keep up.\nPlan line was: "+earlierScan)
-	assert.True(t,
-		strings.Contains(earlierScan, "idx_event_outbox_partition_key_inflight") ||
-			strings.Contains(earlierScan, "idx_event_outbox_claim"),
-		"the earlier-same-key exclusion must be served by a partial index whose predicate is the blocking-state set — either idx_event_outbox_partition_key_inflight probed per candidate, or idx_event_outbox_claim scanned once to build an anti join — so the cold history is excluded entirely. Anything else scans each key's history on every poll.\nPlan line was: "+earlierScan)
+	requireColdHistoryExcludingIndex(t, ds, earlierScan, planText,
+		"the earlier-same-key exclusion", marker)
 
 	assert.NotContains(t, planText, "Seq Scan on event_outbox",
 		"the claim must not sequentially scan blnk.event_outbox.\nPlan was:\n"+planText)
@@ -5890,29 +7438,217 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// that sort's input to the claimable working set rather than to the whole table.
 }
 
-// planLineReferencing returns the first line of an EXPLAIN plan that mentions needle,
-// trimmed of the tree drawing and indentation.
+// assertScanExcludesDispatchedHistory WAS RETIRED HERE, in favour of
+// requireColdHistoryExcludingIndex, which asks PostgreSQL the same question instead of
+// pattern-matching the answer.
 //
-// It exists so a plan assertion can be made about ONE relation rather than about the whole
-// plan text. Asserting "the plan contains an index scan somewhere" is nearly vacuous — every
-// plan here contains several — whereas asserting that the line reaching
-// `event_outbox earlier` is an index scan says exactly what it means.
+// It read the predicate out of pg_indexes — which was the right move, and the reason it replaced
+// a list of index names — and then decided whether that predicate admitted the dispatched state
+// with a four-arm switch over its TEXT. Two failure modes followed from that, and both are the
+// wrong direction: `admitsDispatched` started true and only the four recognised shapes cleared
+// it, so a correct predicate written a fifth way was reported as a defect; and the
+// `status = ANY (ARRAY[...])` arm left it true whenever the list could not be cut out of the
+// string, which is a pass turned into a failure by a rendering change.
+//
+// Splicing the predicate into a COUNT over the seeded rows needs none of those cases and cannot
+// be defeated by a rewrite, because the evaluator that answers it is the one that decides what
+// the index contains.
+// indexNameFromPlanLine extracts the index name from an EXPLAIN scan line.
+//
+// Both spellings the planner emits are handled — "Index Scan using <name> on <rel>" and
+// "Bitmap Index Scan on <name>" — because which one appears is another cost decision, and a
+// helper that understood only one would reintroduce the flakiness this replaces.
 //
 // Parameters:
-//   - planText string: the EXPLAIN output, newline separated.
-//   - needle string: the relation alias to find.
+//   - planLine string: one EXPLAIN line.
 //
 // Returns:
-//   - string: the matching line with surrounding whitespace removed, or "" when none
-//     matches.
-func planLineReferencing(planText, needle string) string {
-	for _, line := range strings.Split(planText, "\n") {
-		if strings.Contains(line, needle) {
-			return strings.TrimSpace(line)
-		}
+//   - string: the index name, or "" when the line reads no index.
+func indexNameFromPlanLine(planLine string) string {
+	if _, after, found := strings.Cut(planLine, "using "); found {
+		name, _, _ := strings.Cut(after, " ")
+
+		return strings.TrimSpace(name)
+	}
+
+	if _, after, found := strings.Cut(planLine, "Bitmap Index Scan on "); found {
+		name, _, _ := strings.Cut(after, " ")
+
+		return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(name), "\n"))
 	}
 
 	return ""
+}
+
+// planAccessPathFor returns the node of an EXPLAIN plan that mentions needle, together with the
+// index nodes beneath it, trimmed of the tree drawing and indentation.
+//
+// It replaced planLineReferencing, which returned the matched LINE alone:
+//
+//	Bitmap Heap Scan on event_outbox candidate
+//	  ->  Bitmap Index Scan on idx_event_outbox_claim
+//
+// Both read exactly the same rows through exactly the same index. The second names the index
+// on the CHILD node, so an assertion made on the line mentioning the relation sees neither the
+// word "Index" nor the index name and fails a plan that honours the guarantee completely.
+// That is a plan-shape assertion masquerading as a guarantee assertion, and it is the same
+// mistake as pinning one index by name.
+//
+// Returning the access path keeps the guarantee assertable — the caller can still require that
+// the read is index-driven, and through a blocking-state partial index — while accepting
+// either shape. It does not weaken the sequential-scan prohibition: a `Seq Scan` node has no
+// index child, so its access path carries no index name and no "Index", and the whole-plan
+// `Seq Scan on event_outbox` assertion is unaffected either way.
+//
+// # How the children are found
+//
+// EXPLAIN indents each child deeper than its parent, so the descendants of the matched node
+// are the following lines whose indentation is strictly greater, up to the first line that is
+// not. Only the index-naming ones are collected; the Recheck Cond and Filter lines belong to
+// the same node and are already carried by it.
+//
+// Parameters:
+//   - planText string: the whole EXPLAIN output.
+//   - needle string: the relation reference identifying the node.
+//
+// Returns:
+//   - string: the matching node, plus its index children, each trimmed and joined by " | ".
+//     Empty when no line mentions needle.
+func planAccessPathFor(planText, needle string) string {
+	lines := strings.Split(planText, "\n")
+
+	for i, line := range lines {
+		if !strings.Contains(line, needle) {
+			continue
+		}
+
+		depth := planNodeIndent(line)
+		path := []string{strings.TrimSpace(line)}
+
+		for _, child := range lines[i+1:] {
+			if strings.TrimSpace(child) == "" {
+				continue
+			}
+			if planNodeIndent(child) <= depth {
+				break
+			}
+			if strings.Contains(child, "Index Scan") || strings.Contains(child, "Index Only Scan") {
+				path = append(path, strings.TrimSpace(child))
+			}
+		}
+
+		return strings.Join(path, " | ")
+	}
+
+	return ""
+}
+
+// planNodeIndent is the indentation depth of one EXPLAIN line, which is what expresses the
+// parent-child structure of the plan tree in text form.
+//
+// The "->  " arrow is counted as part of the indentation rather than as content, because a
+// child node's arrow sits where its parent's content begins: without folding it in, a direct
+// child would measure the same depth as its parent and the descendant walk would stop
+// immediately.
+//
+// Parameters:
+//   - line string: one raw line of EXPLAIN output.
+//
+// Returns:
+//   - int: the number of leading characters before the node's own text.
+func planNodeIndent(line string) int {
+	indent := 0
+	for indent < len(line) && line[indent] == ' ' {
+		indent++
+	}
+
+	if strings.HasPrefix(line[indent:], "->") {
+		indent += len("->")
+		for indent < len(line) && line[indent] == ' ' {
+			indent++
+		}
+	}
+
+	return indent
+}
+
+// TestPlanAccessPathFor_CarriesTheIndexNodesBeneathTheRelation covers the parser directly,
+// because the assertion that depends on it lives in a _RealDB test that skips when the shared
+// outbox is too busy for a plan to be meaningful — and because the shape it exists to handle
+// is chosen by the planner, so a run may not produce one at all.
+//
+// The bitmap case is the one that was failing in the field: the index is named on the child,
+// so the guarantee is only assertable if the child comes back with the parent.
+func TestPlanAccessPathFor_CarriesTheIndexNodesBeneathTheRelation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		plan          string
+		wantContains  []string
+		wantOmits     []string
+		wantEmptyPath bool
+	}{
+		{
+			name: "a plain index scan names the index on the relation line",
+			plan: "Sort  (cost=1..2 rows=7 width=541)\n" +
+				"  ->  Index Scan using idx_event_outbox_claim on event_outbox candidate  (cost=0.28..8.30 rows=7 width=28)\n" +
+				"        Index Cond: (status = ANY ('{pending,processing}'::text[]))\n",
+			wantContains: []string{"Index Scan using idx_event_outbox_claim", "event_outbox candidate"},
+		},
+		{
+			name: "a bitmap plan carries the child index node up to the relation",
+			plan: "Nested Loop Anti Join  (cost=41.26..176.47 rows=7 width=28)\n" +
+				"  ->  Bitmap Heap Scan on event_outbox candidate  (cost=41.00..119.60 rows=7 width=51)\n" +
+				"        Recheck Cond: (status = ANY ('{pending,processing}'::text[]))\n" +
+				"        Filter: (attempts < max_attempts)\n" +
+				"        ->  Bitmap Index Scan on idx_event_outbox_claim  (cost=0.00..41.00 rows=20 width=0)\n" +
+				"              Index Cond: (status = ANY ('{pending,processing}'::text[]))\n" +
+				"  ->  Index Scan using idx_event_outbox_partition_key_inflight on event_outbox earlier\n",
+			wantContains: []string{
+				"Bitmap Heap Scan on event_outbox candidate",
+				"Bitmap Index Scan on idx_event_outbox_claim",
+			},
+			// The SIBLING node's index must not be absorbed: it is a different access path,
+			// and folding it in would let one relation's index satisfy another's assertion.
+			wantOmits: []string{"idx_event_outbox_partition_key_inflight"},
+		},
+		{
+			name: "a sequential scan yields no index, so the guarantee still fails on it",
+			plan: "Limit  (cost=0..1 rows=7 width=28)\n" +
+				"  ->  Seq Scan on event_outbox candidate  (cost=0.00..900.00 rows=7 width=51)\n" +
+				"        Filter: (status = ANY ('{pending,processing}'::text[]))\n",
+			wantContains: []string{"Seq Scan on event_outbox candidate"},
+			wantOmits:    []string{"Index"},
+		},
+		{
+			name:          "a relation the plan never reaches yields nothing",
+			plan:          "Seq Scan on lineage_outbox  (cost=0.00..1.00 rows=1 width=1)\n",
+			wantEmptyPath: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := planAccessPathFor(test.plan, "event_outbox candidate")
+
+			if test.wantEmptyPath {
+				assert.Empty(t, path)
+
+				return
+			}
+
+			require.NotEmpty(t, path)
+			for _, want := range test.wantContains {
+				assert.Contains(t, path, want)
+			}
+			for _, omit := range test.wantOmits {
+				assert.NotContains(t, path, omit)
+			}
+		})
+	}
 }
 
 // TestPlanIndexesUsed_NamesEveryIndexAnExplainPlanReads covers the plan parser directly.
@@ -6031,12 +7767,16 @@ func planIndexesUsed(planText string) []string {
 	return indexes
 }
 
-// eventOutboxClaimQueries are the four statements that lease rows, named so the
+// eventOutboxClaimQueries are the three statements that lease rows, named so the
 // invariant below covers all of them rather than whichever one a reader remembers.
+//
+// Q-03: a fourth entry, "owed dead-letter claim", was removed with the orphan query it
+// named. Recovering a row whose dead-letter write is still owed has exactly ONE claim —
+// claimFailedEventOutboxForDeadLetterQuery, which the relay drives every tick — and the
+// orphan was a divergent second predicate for the same job that nothing called.
 var eventOutboxClaimQueries = map[string]string{
 	"pending claim":            claimPendingEventOutboxQuery,
 	"failed dead-letter claim": claimFailedEventOutboxForDeadLetterQuery,
-	"owed dead-letter claim":   claimEventsOwedDeadLetterQuery,
 	"webhook delivery claim":   claimPendingWebhookDeliveriesQuery,
 }
 
@@ -6141,14 +7881,20 @@ func TestClaimPendingEventOutbox_ClaimsInBatchesBoundedByBatchSize_RealDB(t *tes
 		"repeated bounded claims must drain the backlog in occurrence order; ordering has to hold ACROSS batches, not only within one")
 }
 
-// TestListDeadLetteredEvents_PagesNewestFirst_RealDB asserts the ordering and paging the
+// TestListDeadLetterInventory_PagesNewestFirst_RealDB asserts the ordering and paging the
 // dead-letter API relies on, against real SQL.
 //
 // Triage starts from the most recent failures, so the listing is newest-first. The paging
 // assertion matters just as much as the ordering: with a non-deterministic tie-break a
 // row can appear on two pages or on none, and an operator working through a dead-letter
 // backlog would silently skip events.
-func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
+//
+// PERF-P08: the walk is by CURSOR. That is not merely a translation of the old offset walk —
+// it is a stronger assertion, because a keyset page is stable under concurrent inserts and an
+// offset page is not. A shared database with sibling runs inserting rows is exactly the
+// condition under which the offset walk would have repeated and skipped rows, and this test
+// would have been the one flaking.
+func TestListDeadLetterInventory_PagesNewestFirst_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 	marker := newRealEventOutboxMarker("dlt")
@@ -6157,7 +7903,7 @@ func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
 	const total = 5
 	base := dbTimestamp(time.Now().Add(-time.Hour))
 	oldestFirst := make([]string, 0, total)
-	for i := 0; i < total; i++ {
+	for i := range total {
 		entry := newEventOutboxFixture(marker)
 		entry.OccurredAt = base.Add(time.Duration(i) * time.Second)
 		insertRealEventOutbox(t, ds, entry)
@@ -6174,6 +7920,158 @@ func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
 		newestFirst = append(newestFirst, oldestFirst[i])
 	}
 
+	mineFrom := func(entries []model.DeadLetterInventoryEntry) []string {
+		mine := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			if entry.AggregateID == marker+"agg" {
+				mine = append(mine, entry.EventID)
+			}
+		}
+
+		return mine
+	}
+
+	// THE WHOLE INVENTORY, PAGED BY CURSOR, not one large page. A single page cannot be relied
+	// on to hold this run's fixtures: the database is shared, other runs leave dead-lettered rows
+	// behind, and the listing is newest-first — so once the table holds more than one page of
+	// them these fixtures are not on page one and the ordering assertion below compares against
+	// somebody else's rows. Walking to the end is bounded and fails on non-termination, which is
+	// the only reading that cannot pass or fail on who else is running.
+	all := model.DeadLetterInventoryPage{
+		Entries: walkDeadLetterInventory(t, ds, ctx, maxDeadLetterPageSize),
+	}
+	assert.Equal(t, newestFirst, mineFrom(all.Entries),
+		"the dead-letter inventory must be ordered newest occurrence first, because triage starts from the most recent failures")
+
+	// The narrow projection reaches the real driver intact: the size is reported and the body
+	// is not read (PERF-P06). Asserted against PostgreSQL because octet_length on a BYTEA
+	// column is the thing a mock cannot prove.
+	require.NotEmpty(t, all.Entries)
+	for _, entry := range all.Entries {
+		if entry.AggregateID != marker+"agg" {
+			continue
+		}
+		assert.Positive(t, entry.PayloadBytes,
+			"octet_length must report the stored body's size; a zero would mean the projection read nothing")
+	}
+
+	// Walk the fixtures a SMALL page at a time and assert every one appears exactly once across
+	// the pages. Two per page against five fixtures forces several cursor hand-offs, which is
+	// where a non-deterministic tie-break shows up; the same helper walks it, so the termination
+	// bound is the same one the whole-inventory read above relies on.
+	seen := map[string]int{}
+	for _, eventID := range mineFrom(walkDeadLetterInventory(t, ds, ctx, 2)) {
+		seen[eventID]++
+	}
+	for _, eventID := range oldestFirst {
+		assert.Equal(t, 1, seen[eventID],
+			"event %s appeared %d times across the pages; a non-deterministic tie-break makes an operator skip or repeat events", eventID, seen[eventID])
+	}
+
+	// The cursor is STABLE across a concurrent insert, which is what the offset it replaced
+	// could not be. A row inserted between two pages shifted every later offset by one, so an
+	// offset-paged operator silently skipped a row for every row that arrived while they read.
+	first, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{Limit: 2})
+	require.NoError(t, err)
+	require.True(t, first.HasMore, "five fixtures against a page of two must leave more")
+	require.NotNil(t, first.NextCursor)
+
+	intruder := newEventOutboxFixture(marker)
+	intruder.OccurredAt = dbTimestamp(time.Now())
+	insertRealEventOutbox(t, ds, intruder)
+	require.NoError(t, ds.MarkEventDeadLettered(ctx, intruder.ID, claimEventOutboxToken(t, ds, intruder),
+		intruder.Topic+".dlt",
+		json.RawMessage(`{"original_topic":"`+intruder.Topic+`","attempt_count":5}`), model.BrokerRecord{}))
+
+	second, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+		Limit:  2,
+		Cursor: first.NextCursor,
+	})
+	require.NoError(t, err)
+
+	firstIDs := mineFrom(first.Entries)
+	secondIDs := mineFrom(second.Entries)
+	for _, eventID := range secondIDs {
+		assert.NotContains(t, firstIDs, eventID,
+			"a row inserted between two pages must not push a row onto both of them")
+	}
+	assert.NotContains(t, secondIDs, intruder.EventID,
+		"a row NEWER than the cursor belongs to a page already served, so a keyset walk must not show it again")
+}
+
+// TestDeadLetterInventoryNarrowing_FiltersAndCountsInSQL_RealDB proves the filter contract
+// against real PostgreSQL, which is the only place it can be proved.
+//
+// # What was wrong, and why a mock could not have caught it
+//
+// The narrowing used to be applied ABOVE the repository: the service paged the inventory and
+// tested each row in Go, up to a fixed 5,000-row scan ceiling. Two consequences followed, and
+// a client could detect neither.
+//
+//   - A page that hit the ceiling was returned looking exactly like a complete one. Only a
+//     log line said otherwise. On an inventory larger than the ceiling — which is precisely
+//     the incident an operator is triaging — a filter would report a subset of the matches as
+//     though it were all of them.
+//   - An exact total was impossible. The only count available was a whole-table per-status
+//     aggregate that knew nothing about the event-type or topic filter, so the endpoint had
+//     to REFUSE include_count for those filters rather than return a total describing a
+//     different set than the page.
+//
+// This test therefore asserts three things that only real SQL can establish: that each
+// predicate actually selects, that the offset is an offset into the FILTERED set, and that
+// the count and the page agree — including agreeing when they are both wrong to agree, which
+// is why the count is compared against the length of an unpaged listing rather than against a
+// number written here by hand.
+//
+// The occurrence window is exercised with bounds INSIDE the fixture spread, so a window that
+// silently degraded to no window would return more rows and fail.
+func TestDeadLetterInventoryNarrowing_FiltersAndCountsInSQL_RealDB(t *testing.T) {
+	ds := openLockedEventOutboxDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("dltfilter")
+	quiesceEventOutbox(t, ds, marker)
+
+	// One instant per fixture, an hour back so nothing collides with a concurrently
+	// running tier, and spread a minute apart so a window can select a middle slice.
+	base := dbTimestamp(time.Now().Add(-time.Hour))
+
+	// seed inserts a fixture and drives it to the requested terminal failure state through
+	// the production transitions, so the rows under test are rows production could produce.
+	seed := func(t *testing.T, eventType, topic string, occurredAt time.Time, deadLetter bool) *model.EventOutbox {
+		t.Helper()
+
+		entry := newEventOutboxFixture(marker)
+		entry.EventType = eventType
+		entry.Topic = topic
+		entry.OccurredAt = occurredAt
+		insertRealEventOutbox(t, ds, entry)
+
+		token := claimEventOutboxToken(t, ds, entry)
+
+		// The exhaustion arm: spend the whole budget in one transition so the row lands in
+		// failed without this test restating the retry loop.
+		_, err := ds.MarkEventFailed(ctx, entry.ID, token, "seeded for the filter test", 0, true, testDeadLetterHandoffLease)
+		require.NoError(t, err)
+
+		if deadLetter {
+			require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt",
+				json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`),
+				model.BrokerRecord{}))
+		}
+
+		return entry
+	}
+
+	appliedOldest := seed(t, "transaction.applied", "blnk.transactions", base, true)
+	voidMiddle := seed(t, "transaction.void", "blnk.transactions", base.Add(time.Minute), true)
+	appliedNewer := seed(t, "transaction.applied", "blnk.transactions", base.Add(2*time.Minute), false)
+	balanceNewest := seed(t, "balance.created", "blnk.balances", base.Add(3*time.Minute), true)
+
+	// Every assertion below is scoped to THIS run's rows: the table is shared with other
+	// tiers and other clones, so an absolute count would be a flake rather than an
+	// assertion. The narrowing is combined with the run's own ledger id, which
+	// newEventOutboxFixture carries — but ledger_id is not a filter, so the projection is
+	// done here and the count is compared against the projected listing.
 	mineFrom := func(entries []model.EventOutbox) []string {
 		mine := make([]string, 0, len(entries))
 		for _, entry := range entries {
@@ -6181,29 +8079,158 @@ func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
 				mine = append(mine, entry.EventID)
 			}
 		}
+
 		return mine
 	}
 
-	// A single page large enough to hold every fixture: assert the ordering.
-	all, err := ds.ListDeadLetteredEvents(ctx, maxDeadLetterPageSize, 0)
-	require.NoError(t, err)
-	assert.Equal(t, newestFirst, mineFrom(all),
-		"the dead-letter inventory must be ordered newest occurrence first, because triage starts from the most recent failures")
+	listMine := func(t *testing.T, query model.DeadLetterQuery) []string {
+		t.Helper()
 
-	// Walk the fixtures a page at a time and assert every one appears exactly once
-	// across the pages.
-	seen := map[string]int{}
-	for offset := 0; offset < len(all); offset += 2 {
-		page, pageErr := ds.ListDeadLetteredEvents(ctx, 2, offset)
-		require.NoError(t, pageErr)
-		for _, eventID := range mineFrom(page) {
-			seen[eventID]++
+		query.Limit = maxDeadLetterPageSize
+		entries, err := ds.ListDeadLetteredEvents(ctx, query)
+		require.NoError(t, err)
+
+		return mineFrom(entries)
+	}
+
+	cases := []struct {
+		name  string
+		query model.DeadLetterQuery
+		want  []string
+	}{
+		{
+			name:  "unfiltered lists both terminal states, newest occurrence first",
+			query: model.DeadLetterQuery{},
+			want: []string{
+				balanceNewest.EventID, appliedNewer.EventID,
+				voidMiddle.EventID, appliedOldest.EventID,
+			},
+		},
+		{
+			name:  "an event type filter selects in SQL",
+			query: model.DeadLetterQuery{EventType: "transaction.applied"},
+			want:  []string{appliedNewer.EventID, appliedOldest.EventID},
+		},
+		{
+			name:  "a topic filter matches the original topic column",
+			query: model.DeadLetterQuery{Topic: "blnk.transactions"},
+			want:  []string{appliedNewer.EventID, voidMiddle.EventID, appliedOldest.EventID},
+		},
+		{
+			name:  "a status filter narrows to one terminal state",
+			query: model.DeadLetterQuery{Status: model.EventOutboxStatusFailed},
+			want:  []string{appliedNewer.EventID},
+		},
+		{
+			name:  "a dead_lettered filter excludes the row whose dead-letter write is still owed",
+			query: model.DeadLetterQuery{Status: model.EventOutboxStatusDeadLettered},
+			want:  []string{balanceNewest.EventID, voidMiddle.EventID, appliedOldest.EventID},
+		},
+		{
+			name: "an occurrence window selects a middle slice, inclusively at both ends",
+			query: model.DeadLetterQuery{
+				OccurredFrom: base.Add(time.Minute),
+				OccurredTo:   base.Add(2 * time.Minute),
+			},
+			want: []string{appliedNewer.EventID, voidMiddle.EventID},
+		},
+		{
+			name:  "a one-sided window leaves the other end unbounded",
+			query: model.DeadLetterQuery{OccurredFrom: base.Add(2 * time.Minute)},
+			want:  []string{balanceNewest.EventID, appliedNewer.EventID},
+		},
+		{
+			name: "an equal-bound window selects exactly that instant",
+			query: model.DeadLetterQuery{
+				OccurredFrom: base.Add(time.Minute),
+				OccurredTo:   base.Add(time.Minute),
+			},
+			want: []string{voidMiddle.EventID},
+		},
+		{
+			name: "filters combine",
+			query: model.DeadLetterQuery{
+				EventType:    "transaction.applied",
+				Topic:        "blnk.transactions",
+				Status:       model.EventOutboxStatusDeadLettered,
+				OccurredFrom: base,
+				OccurredTo:   base.Add(2 * time.Minute),
+			},
+			want: []string{appliedOldest.EventID},
+		},
+		{
+			name:  "a filter matching nothing returns no rows rather than everything",
+			query: model.DeadLetterQuery{EventType: "identity.created"},
+			want:  []string{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, listMine(t, tc.query))
+		})
+	}
+
+	t.Run("the offset is an offset into the FILTERED set", func(t *testing.T) {
+		// Two of this run's four rows carry this event type. Skipping one must leave the
+		// OLDER of those two, not whichever row happened to be second in the unfiltered
+		// inventory — which is the difference between a page of the filtered set and a
+		// filtered page of the unfiltered one.
+		entries, err := ds.ListDeadLetteredEvents(ctx, model.DeadLetterQuery{
+			EventType: "transaction.applied",
+			Limit:     maxDeadLetterPageSize,
+			Offset:    1,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{appliedOldest.EventID}, mineFrom(entries))
+
+		first, err := ds.ListDeadLetteredEvents(ctx, model.DeadLetterQuery{
+			EventType: "transaction.applied",
+			Limit:     1,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{appliedNewer.EventID}, mineFrom(first),
+			"the first filtered page must be the newest match")
+	})
+
+	t.Run("the count describes the same set as the page", func(t *testing.T) {
+		// Scoped to this run by narrowing on a topic no other tier in this file seeds
+		// alongside this marker, then reconciled against the listing rather than against a
+		// hand-written number: the assertion that matters is that the two AGREE, and a
+		// literal would only prove that one of them matches a guess.
+		for _, query := range []model.DeadLetterQuery{
+			{EventType: "transaction.applied", Topic: "blnk.transactions"},
+			{Topic: "blnk.balances", Status: model.EventOutboxStatusDeadLettered},
+			{OccurredFrom: base, OccurredTo: base.Add(3 * time.Minute)},
+		} {
+			listed := listMine(t, query)
+
+			total, err := ds.CountDeadLetteredEvents(ctx, query)
+			require.NoError(t, err)
+
+			// The table is shared, so the count covers rows this run did not seed. The
+			// invariant that holds regardless is that the total is never SHORT of what the
+			// same predicate listed — a count over a narrower predicate than the page is
+			// the exact defect this method exists to rule out.
+			assert.GreaterOrEqual(t, total, int64(len(listed)),
+				"the total must never be short of the page the same predicate returned")
 		}
-	}
-	for _, eventID := range oldestFirst {
-		assert.Equal(t, 1, seen[eventID],
-			"event %s appeared %d times across the pages; a non-deterministic tie-break makes an operator skip or repeat events", eventID, seen[eventID])
-	}
+	})
+
+	t.Run("the count ignores the page", func(t *testing.T) {
+		query := model.DeadLetterQuery{Topic: "blnk.transactions"}
+
+		unpaged, err := ds.CountDeadLetteredEvents(ctx, query)
+		require.NoError(t, err)
+
+		query.Limit, query.Offset = 1, 2
+		paged, err := ds.CountDeadLetteredEvents(ctx, query)
+		require.NoError(t, err)
+
+		assert.Equal(t, unpaged, paged,
+			"the total is a property of the filter, not of the window into it; honouring the page "+
+				"would make total_count never exceed the page size")
+	})
 }
 
 // ===========================================================================
@@ -6331,16 +8358,16 @@ func TestRequireSubscriberFields_DerivesTheIdentityAndRefusesASuppliedOne(t *tes
 func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.T) {
 	assert.NoError(t, requireGrantableTopics(nil),
 		"an empty grant is the fail-closed default of a fresh registration")
-	assert.NoError(t, requireGrantableTopics(model.SubscriberGrantableTopics(expectedEventTopicPrefix())),
+	assert.NoError(t, requireGrantableTopics(model.SubscriberGrantableTopics(configuredEventTopicPrefix())),
 		"the composed grantable list must itself be accepted, or two layers disagree")
 
 	refused := map[string]string{
-		"the any-resource wildcard": "*",
-		"a wildcarded category":     "blnk.*",
-		"a foreign topic":           "attacker.transactions",
-		"a dead-letter topic":       "blnk.transactions.dlt",
-		"the system category":       "blnk.system",
-		"the system dead-letter":    "blnk.system.dlt",
+		"the any-resource wildcard":              "*",
+		"a wildcarded category":                  "blnk.*",
+		"a foreign topic":                        "attacker.transactions",
+		"a dead-letter topic":                    "blnk.transactions.dlt",
+		"the system dead-letter":                 "blnk.system.dlt",
+		"a category this contract does not have": "blnk.ledgers",
 	}
 	for name, topic := range refused {
 		t.Run("refuses "+name, func(t *testing.T) {
@@ -6348,27 +8375,24 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 		})
 	}
 
-	// THE SYSTEM CATEGORY IS REFUSED, and it is in the table above rather than here for a
-	// reason worth stating, because the opposite reading is tempting: `blnk.system` carries
-	// `ledger.created` and `system.error`, two of the thirteen event types the legacy webhook
-	// transport delivered, so refusing a grant on it does leave a migrating subscriber with no
-	// authorized path to either.
+	// THE SYSTEM CATEGORY IS ACCEPTED, and it is worth saying so here because the opposite
+	// reading is tempting. `blnk.system` carries `ledger.created` and `system.error`, two of
+	// the thirteen event types the legacy webhook transport delivered, so refusing a grant on
+	// it would leave a migrating subscriber with no authorized path to either — coverage on
+	// the publishing side and a regression on the consuming side.
 	//
-	// That cost is accepted, because the migration changes the AUDIENCE and not only the
-	// transport. The webhook transport had exactly one recipient — the single URL in
-	// notification.webhook.url, an endpoint the operator owns — while Kafka has one principal
-	// per subscriber. `system.error`'s payload is the FROZEN legacy body, so it still carries
-	// the error text as it renders: a PostgreSQL error names schema, table, column and
-	// routine, a broker error names internal addresses. Granting that to third-party
-	// principals to preserve "everything reaches everyone" would WIDEN the disclosure the
-	// webhook made, not preserve it — and the body cannot be narrowed without breaking the
-	// payload-preservation guarantee the whole migration rests on.
-	//
-	// Coverage is unaffected: both event types are captured in the outbox, published to the
-	// topic, counted by the metrics and replayable from the dead-letter inventory. What an
-	// internal category withholds is an ACL, not the event — and a broker administrator can
-	// still grant one out of band, which Blnk's own provisioning deliberately will not do.
-	// See model.EventCategorySystem, which is the single source of this decision.
+	// What a grant of it discloses is real: `system.error`'s payload is the FROZEN legacy
+	// body, so it still carries the error text as it renders — a PostgreSQL error names
+	// schema, table, column and routine; a broker error names internal addresses. That body
+	// cannot be narrowed without breaking the payload-preservation guarantee the whole
+	// migration rests on. So the containment is an AUDIENCE decision recorded per subscriber
+	// in authorized_topics, exactly the decision an operator already made when they pointed
+	// one webhook URL at the same text — not a decision this layer makes for them. This layer
+	// enforces only that a stored topic is one that MAY be granted.
+	t.Run("accepts the system category", func(t *testing.T) {
+		assert.NoError(t, requireGrantableTopics([]string{"blnk.system"}),
+			"blnk.system carries ledger.created and system.error, so a subscriber must be able to hold it")
+	})
 
 	t.Run("refuses an offending topic in any position", func(t *testing.T) {
 		requireAPIError(t,
@@ -6381,7 +8405,7 @@ func TestRequireGrantableTopics_RefusesEverythingOutsideTheAllowlist(t *testing.
 		// than assumed: drift between layers means a topic one refuses and another
 		// grants.
 		prefixes := grantableTopicPrefixes()
-		composed := model.SubscriberGrantableTopics(expectedEventTopicPrefix())
+		composed := model.SubscriberGrantableTopics(configuredEventTopicPrefix())
 
 		assert.Len(t, prefixes, len(composed))
 		for _, topic := range composed {
@@ -6505,7 +8529,61 @@ func TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace(t *testing.T) {
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		require.NoError(t, source.RecordSubscriberCredentialIfUnchanged(
-			context.Background(), "acme_prod", &previous, reference, time.Now()))
+			context.Background(), "acme_prod", &previous, reference, time.Now(), "claim-token"))
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("carries the provisioning claim as well as the reference", func(t *testing.T) {
+		// The reference CAS alone cannot detect a caller whose lease expired: while the
+		// rightful new owner is still provisioning it has recorded nothing, so the stored
+		// reference is STILL the one this caller observed. Its write would land and the
+		// winner would then be refused — the fence inverted.
+		db, mock, captured := newCapturingSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("UPDATE blnk.event_subscribers").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		require.NoError(t, source.RecordSubscriberCredentialIfUnchanged(
+			context.Background(), "acme_prod", &previous, reference, time.Now(), "claim-token"))
+		require.NoError(t, mock.ExpectationsWereMet())
+		require.Len(t, *captured, 1)
+
+		statement := (*captured)[0]
+		assert.Contains(t, statement, "provisioning_token = $6",
+			"the claim must be a predicate of the write, not merely an argument")
+		assert.Contains(t, statement, "credential_reference = $5",
+			"and the reference CAS must survive alongside it")
+	})
+
+	t.Run("refuses a write that presents no claim", func(t *testing.T) {
+		// Defaulting to unfenced would restore the exact behaviour the predicate removes,
+		// so a blank token is refused in memory before any statement runs.
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		requireAPIError(t, source.RecordSubscriberCredentialIfUnchanged(
+			context.Background(), "acme_prod", &previous, reference, time.Now(), "  "),
+			apierror.ErrInvalidInput)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("reports a lost claim as a conflict naming the claim, not the reference", func(t *testing.T) {
+		// The two conflicts have different remedies — retry under a fresh claim versus
+		// re-read and issue again — so they must not collapse into one message.
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("UPDATE blnk.event_subscribers").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
+			WillReturnRows(sqlmock.NewRows([]string{"holds_claim", "revocation_pending"}).
+				AddRow(false, false))
+
+		err := source.RecordSubscriberCredentialIfUnchanged(
+			context.Background(), "acme_prod", &previous, reference, time.Now(), "stale-token")
+		requireAPIError(t, err, apierror.ErrConflict)
+		assert.Contains(t, err.Error(), "no longer held by this caller")
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 
@@ -6520,7 +8598,7 @@ func TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace(t *testing.T) {
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
 		require.NoError(t, source.RecordSubscriberCredentialIfUnchanged(
-			context.Background(), "acme_prod", nil, reference, time.Now()))
+			context.Background(), "acme_prod", nil, reference, time.Now(), "claim-token"))
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 
@@ -6531,24 +8609,75 @@ func TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace(t *testing.T) {
 		// No row matched...
 		mock.ExpectExec("UPDATE blnk.event_subscribers").
 			WillReturnResult(sqlmock.NewResult(0, 0))
-		// ...and the subscriber does exist, so this is a race and not a 404.
-		mock.ExpectQuery("SELECT").WillReturnRows(newEventSubscriberRows(t, map[string]driver.Value{
-			"id":                   int64(1),
-			"subscriber_id":        "acme_prod",
-			"name":                 "Acme",
-			"kafka_principal":      "blnk-sub-acme_prod",
-			"consumer_group_id":    "blnk-sub-acme_prod.default",
-			"authorized_topics":    pq.Array([]string{"blnk.transactions"}),
-			"credential_reference": previous,
-			"credential_issued_at": time.Now(),
-			"created_at":           time.Now(),
-			"updated_at":           time.Now(),
-		}))
+		// ...and the row exists under THIS caller's claim with no revocation pending, so the
+		// only remaining explanation is that the reference moved: a race, not a 404 and not a
+		// lost fence.
+		//
+		// ONE follow-up query, not two. describeFencedWriteMiss reads both facts in a single
+		// round trip — whether the claim is still this caller's and whether a revocation is
+		// pending — and a second expectation stacked below this one was an earlier
+		// generation's (exists, held) shape that nothing consumes. sqlmock does not object to
+		// an unconsumed expectation until ExpectationsWereMet, so the subtest reached the right
+		// verdict and then failed on the leftover.
+		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
+			WillReturnRows(sqlmock.NewRows([]string{"holds_claim", "revocation_pending"}).
+				AddRow(true, false))
 
 		err := source.RecordSubscriberCredentialIfUnchanged(
-			context.Background(), "acme_prod", &previous, reference, time.Now())
+			context.Background(), "acme_prod", &previous, reference, time.Now(), "claim-token")
 		requireAPIError(t, err, apierror.ErrConflict)
+		assert.NotContains(t, err.Error(), "provisioning claim",
+			"a superseded credential is NOT a lost fence, and the two demand opposite responses: "+
+				"the loser of a credential race abandons its issuance, while a caller that lost the "+
+				"claim must compensate for the credential it already wrote at the broker")
 		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("distinguishes a LOST FENCE from a superseded credential", func(t *testing.T) {
+		// AUTH-01 + the fence: both predicates can fail, and the caller's remedy differs.
+		// A superseded credential means this issuance simply lost a race. A lost claim
+		// means another operation may be running right now and cannot know about the
+		// credential this one already wrote at the broker, so this one MUST compensate.
+		// Reporting them with the same error would silently skip that compensation.
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("UPDATE blnk.event_subscribers").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		// The row is there but the claim is not this caller's any more, which is the ONE query
+		// describeFencedWriteMiss issues and the two booleans it selects.
+		//
+		// A bare ExpectQuery("SELECT") returning a full subscriber row sat here first, from a
+		// generation that re-read the row to diagnose the miss. Being bare, it matched the
+		// describe query — which also starts with SELECT — and handed fifteen columns to a
+		// two-column Scan, so the diagnosis failed at the driver and a deliberate CONFLICT
+		// surfaced as INTERNAL_SERVER_ERROR: the exact conflation this subtest exists to rule out.
+		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
+			WillReturnRows(sqlmock.NewRows([]string{"holds_claim", "revocation_pending"}).
+				AddRow(false, false))
+
+		err := source.RecordSubscriberCredentialIfUnchanged(
+			context.Background(), "acme_prod", &previous, reference, time.Now(), "stale-token")
+		requireAPIError(t, err, apierror.ErrConflict)
+		assert.Contains(t, err.Error()+errorDetailText(err), "the provisioning claim was no longer held",
+			"the marker phrase is what blnk.subscriberFenceWasLost matches on, so the service can "+
+				"route this to compensation rather than treating it as an ordinary conflict")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("refuses a blank claim token before any statement", func(t *testing.T) {
+		// A blank token would either turn the ownership condition into a comparison
+		// against the empty string, which matches nothing and presents as a spurious
+		// conflict, or — if the condition were ever dropped — match every row. Refusing
+		// it here makes "this write happened under a live claim" a property of the
+		// statement rather than of the caller's discipline.
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		err := source.RecordSubscriberCredentialIfUnchanged(
+			context.Background(), "acme_prod", &previous, reference, time.Now(), "   ")
+		requireAPIError(t, err, apierror.ErrInvalidInput)
+		assert.NoError(t, mock.ExpectationsWereMet(), "nothing may reach the database")
 	})
 
 	t.Run("reports not-found rather than a conflict for a missing subscriber", func(t *testing.T) {
@@ -6559,10 +8688,10 @@ func TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace(t *testing.T) {
 
 		mock.ExpectExec("UPDATE blnk.event_subscribers").
 			WillReturnResult(sqlmock.NewResult(0, 0))
-		mock.ExpectQuery("SELECT").WillReturnError(sql.ErrNoRows)
+		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").WillReturnError(sql.ErrNoRows)
 
 		err := source.RecordSubscriberCredentialIfUnchanged(
-			context.Background(), "acme_prod", &previous, reference, time.Now())
+			context.Background(), "acme_prod", &previous, reference, time.Now(), "claim-token")
 		requireAPIError(t, err, apierror.ErrSubscriberNotFound)
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
@@ -6572,7 +8701,7 @@ func TestRecordSubscriberCredentialIfUnchanged_DetectsALostRace(t *testing.T) {
 		source := Datasource{Conn: db}
 
 		err := source.RecordSubscriberCredentialIfUnchanged(
-			context.Background(), "acme_prod", nil, "S3cret-Password", time.Now())
+			context.Background(), "acme_prod", nil, "S3cret-Password", time.Now(), "claim-token")
 		requireAPIError(t, err, apierror.ErrInvalidInput)
 		assert.NotContains(t, err.Error(), "S3cret")
 		assert.NoError(t, mock.ExpectationsWereMet())
@@ -6593,22 +8722,101 @@ func TestClearSubscriberCredential_NullsBothHalvesTogether(t *testing.T) {
 		mock.ExpectExec("credential_reference = NULL").
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
-		require.NoError(t, source.ClearSubscriberCredential(context.Background(), "acme_prod"))
+		require.NoError(t, source.ClearSubscriberCredential(
+			context.Background(), "acme_prod", "claim-token"))
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 
-	t.Run("reports not-found for a missing subscriber", func(t *testing.T) {
-		// Succeeding silently would let a caller believe it cleaned up a row that
-		// does not exist.
+	t.Run("clears only under the caller's provisioning claim", func(t *testing.T) {
+		// Clearing runs at the END of a fenced operation, after broker work whose duration a
+		// third party decides. Under an expired lease an unconditional clear would blank the
+		// record a NEWER issuance had just written, leaving the registry reporting "not yet
+		// provisioned" for a subscriber holding a working credential — the one direction this
+		// write must never move in, because it UNDER-reports access.
+		db, mock, captured := newCapturingSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("UPDATE blnk.event_subscribers").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		require.NoError(t, source.ClearSubscriberCredential(
+			context.Background(), "acme_prod", "claim-token"))
+		require.NoError(t, mock.ExpectationsWereMet())
+		require.Len(t, *captured, 1)
+
+		assert.Contains(t, (*captured)[0], "provisioning_token = $3")
+	})
+
+	t.Run("refuses a clear that presents no claim", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		requireAPIError(t,
+			source.ClearSubscriberCredential(context.Background(), "acme_prod", "  "),
+			apierror.ErrInvalidInput)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("a row that vanished is a LOST FENCE, not a not-found", func(t *testing.T) {
+		// The write is fence-protected, so "no row matched" no longer means "there is no
+		// such subscriber". A row that disappeared under a caller holding a claim means
+		// something else removed it concurrently — and that caller has just revoked a
+		// credential at the broker. Reporting not-found would read as "nothing to clean
+		// up" and suppress the compensation, which is the dangerous direction.
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
 		mock.ExpectExec("UPDATE blnk.event_subscribers").
 			WillReturnResult(sqlmock.NewResult(0, 0))
+		// describeFencedWriteMiss reads (holds_claim, revocation_pending) in ONE query. The
+		// two-column (exists, held) shape that stood here is an earlier generation's, and with a
+		// false in the first column it decoded as "the claim is not yours" rather than as the row
+		// having vanished — the same verdict by luck, from the wrong reading.
+		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
+			WillReturnRows(sqlmock.NewRows([]string{"holds_claim", "revocation_pending"}).
+				AddRow(false, false))
+
+		err := source.ClearSubscriberCredential(context.Background(), "acme_prod", "claim-token")
+		requireAPIError(t, err, apierror.ErrConflict)
+		assert.Contains(t, err.Error()+errorDetailText(err), "the provisioning claim was no longer held")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("a lapsed claim is refused rather than blanking somebody else's record", func(t *testing.T) {
+		// The clear follows a broker-side revocation, which is several round trips. If the
+		// lease lapsed in the meantime and a concurrent issuance recorded a NEW reference,
+		// blanking it would leave the registry reporting no credential while a working one
+		// existed — the exact under-reporting the ownership condition exists to prevent.
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("provisioning_token").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
+			WillReturnRows(sqlmock.NewRows([]string{"holds_claim", "revocation_pending"}).
+				AddRow(false, false))
 
 		requireAPIError(t,
-			source.ClearSubscriberCredential(context.Background(), "acme_prod"),
-			apierror.ErrSubscriberNotFound)
+			source.ClearSubscriberCredential(context.Background(), "acme_prod", "stale-token"),
+			apierror.ErrConflict)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("reports a lost claim as a conflict, never as not-found", func(t *testing.T) {
+		// The remedies are opposite: a 404 says re-register, a 409 says the operation was
+		// overtaken and its write was correctly discarded.
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectExec("UPDATE blnk.event_subscribers").
+			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
+			WillReturnRows(sqlmock.NewRows([]string{"holds_claim", "revocation_pending"}).
+				AddRow(false, false))
+
+		err := source.ClearSubscriberCredential(context.Background(), "acme_prod", "stale-token")
+		requireAPIError(t, err, apierror.ErrConflict)
+		assert.Contains(t, err.Error(), "no longer held by this caller")
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 
@@ -6619,8 +8827,18 @@ func TestClearSubscriberCredential_NullsBothHalvesTogether(t *testing.T) {
 		// ErrBadRequest is the code the shared required-field guard uses; both it and
 		// ErrInvalidInput are 400, and this asserts the one this path actually takes.
 		requireAPIError(t,
-			source.ClearSubscriberCredential(context.Background(), "  "),
+			source.ClearSubscriberCredential(context.Background(), "  ", "claim-token"),
 			apierror.ErrBadRequest)
+	})
+
+	t.Run("requires a claim token", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		requireAPIError(t,
+			source.ClearSubscriberCredential(context.Background(), "acme_prod", ""),
+			apierror.ErrInvalidInput)
+		assert.NoError(t, mock.ExpectationsWereMet(), "nothing may reach the database")
 	})
 }
 
@@ -6686,7 +8904,7 @@ func TestTakeEventSubscriber_ReturnsTheRowItDeleted(t *testing.T) {
 				"updated_at":        time.Now(),
 			}))
 
-		deleted, err := source.TakeEventSubscriber(context.Background(), "acme_prod")
+		deleted, err := source.TakeEventSubscriber(context.Background(), "acme_prod", "claim-token")
 		require.NoError(t, err)
 		require.NotNil(t, deleted)
 
@@ -6705,10 +8923,69 @@ func TestTakeEventSubscriber_ReturnsTheRowItDeleted(t *testing.T) {
 		source := Datasource{Conn: db}
 
 		mock.ExpectQuery("DELETE FROM blnk.event_subscribers").WillReturnError(sql.ErrNoRows)
+		// The row genuinely is not there, so this is a not-found rather than a lost fence — and
+		// "not there" is expressed as the describe query returning NO ROWS, which is the only
+		// reading that yields subscriberFenceMissRowGone. The earlier (exists=false, held=false)
+		// shape returned a row saying the claim was not the caller's, which is a LOST FENCE and
+		// resolved to the 409 this subtest exists to distinguish from a 404.
+		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
+			WillReturnError(sql.ErrNoRows)
 
-		deleted, err := source.TakeEventSubscriber(context.Background(), "acme_prod")
+		deleted, err := source.TakeEventSubscriber(context.Background(), "acme_prod", "claim-token")
 		assert.Nil(t, deleted)
 		requireAPIError(t, err, apierror.ErrSubscriberNotFound)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("deletes only under the caller's provisioning claim", func(t *testing.T) {
+		// This is the LAST write of a deregistration and runs after a broker round trip. An
+		// unconditional delete under an expired lease would remove a row another operation is
+		// working on — most damagingly an issuance, which would leave a live broker principal
+		// with no registry row naming it.
+		db, mock, captured := newCapturingSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectQuery("DELETE FROM blnk.event_subscribers").WillReturnRows(
+			newEventSubscriberRows(t, map[string]driver.Value{
+				"id":                int64(7),
+				"subscriber_id":     "acme_prod",
+				"name":              "Acme",
+				"kafka_principal":   "blnk-sub-acme_prod",
+				"consumer_group_id": "blnk-sub-acme_prod.default",
+				"authorized_topics": pq.Array([]string{"blnk.transactions"}),
+				"created_at":        time.Now(),
+				"updated_at":        time.Now(),
+			}))
+
+		_, err := source.TakeEventSubscriber(context.Background(), "acme_prod", "claim-token")
+		require.NoError(t, err)
+		require.NoError(t, mock.ExpectationsWereMet())
+		require.Len(t, *captured, 1)
+
+		assert.Contains(t, (*captured)[0], "provisioning_token = $2")
+	})
+
+	t.Run("reports a lost claim as a conflict, never as not-found", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectQuery("DELETE FROM blnk.event_subscribers").WillReturnError(sql.ErrNoRows)
+		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
+			WillReturnRows(sqlmock.NewRows([]string{"holds_claim", "revocation_pending"}).
+				AddRow(false, true))
+
+		_, err := source.TakeEventSubscriber(context.Background(), "acme_prod", "stale-token")
+		requireAPIError(t, err, apierror.ErrConflict)
+		assert.Contains(t, err.Error(), "no longer held by this caller")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("refuses a delete that presents no claim", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		_, err := source.TakeEventSubscriber(context.Background(), "acme_prod", "  ")
+		requireAPIError(t, err, apierror.ErrInvalidInput)
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 
@@ -6721,7 +8998,7 @@ func TestTakeEventSubscriber_ReturnsTheRowItDeleted(t *testing.T) {
 			Schema: "blnk", Table: "event_subscribers", File: "namespace.c", Routine: "RangeVarGetRelid",
 		})
 
-		_, err := source.TakeEventSubscriber(context.Background(), "acme_prod")
+		_, err := source.TakeEventSubscriber(context.Background(), "acme_prod", "claim-token")
 		requireAPIError(t, err, apierror.ErrInternalServer)
 		assertNoDatabaseDetailLeak(t, err)
 		assert.NoError(t, mock.ExpectationsWereMet())
@@ -6792,13 +9069,13 @@ func TestSubscriberRepository_DoesNotLeakDriverDetail(t *testing.T) {
 
 	operations := map[string]func(Datasource) error{
 		"UpdateEventSubscriber": func(source Datasource) error {
-			return source.UpdateEventSubscriber(context.Background(), canonicalSubscriber(t))
+			return source.UpdateEventSubscriber(context.Background(), canonicalSubscriber(t), "claim-token")
 		},
 		"DeleteEventSubscriber": func(source Datasource) error {
 			return source.DeleteEventSubscriber(context.Background(), "acme_prod")
 		},
 		"ClearSubscriberCredential": func(source Datasource) error {
-			return source.ClearSubscriberCredential(context.Background(), "acme_prod")
+			return source.ClearSubscriberCredential(context.Background(), "acme_prod", "claim-token")
 		},
 		"MarkSubscriberMigrated": func(source Datasource) error {
 			return source.MarkSubscriberMigrated(context.Background(), "acme_prod", time.Now())
@@ -7000,62 +9277,190 @@ func TestMarkEventWebhookPending_CoalescesTheCoordinate(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestAuditTerminalEventRecords_CountsClaimsAndTheirCorroboration pins the audit query.
+// TestAuditEventRecordsInIntervals_ClassifiesAgainstTheMeasuredWindows pins the audit query,
+// which IS the finding's resolution.
 //
-// The three counts and the predicate ARE the finding's resolution, so each is asserted against
-// the SQL rather than only against a result:
+// Every element asserted here is load-bearing:
 //
-//   - COUNT(kafka_offset) is what separates a claim that names a record from one that does not.
-//     SQL COUNT of an expression ignores NULLs, which is why the confirmed count needs no CASE.
-//   - COUNT(DISTINCT (…)) is the schema-integrity check: two rows naming one record would make
-//     it lower than the confirmed count, which the partial unique index should make impossible.
+//   - The windows arrive as four PARALLEL ARRAYS zipped by unnest, so one statement serves any
+//     number of partitions. Interpolating them would be an injection surface on values that
+//     ultimately come from a broker response.
+//   - The join is a LEFT JOIN. An inner join would silently DROP every row whose partition was
+//     not measured, inflating the corroborated fraction — the exact failure the classification
+//     exists to prevent.
+//   - The five CASE arms are the classification, and their ORDER matters: the coordinate-less
+//     test comes first because a NULL offset would compare false against every bound, and the
+//     beyond-end test comes before the aged-out one so a truncated partition is never reported
+//     as retention.
 //   - The predicate must include webhook_pending rows through kafka_dispatched_at. Restricting
-//     it to the terminal statuses would leave their records unaccounted for on the broker side
+//     it to the terminal statuses would leave their records unaccounted for on the outbox side
 //     and loosen the reconciliation during exactly the dual-delivery window it matters most in.
-func TestAuditTerminalEventRecords_CountsClaimsAndTheirCorroboration(t *testing.T) {
+func TestAuditEventRecordsInIntervals_ClassifiesAgainstTheMeasuredWindows(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
 
-	mock.ExpectQuery("").
-		WithArgs(model.EventOutboxStatusDeadLettered).
-		WillReturnRows(sqlmock.NewRows([]string{"published_rows", "confirmed_rows", "distinct_records"}).
-			AddRow(int64(1_000), int64(990), int64(990)))
+	oldest := time.Now().UTC().Add(-48 * time.Hour)
+	from := oldest.Add(time.Hour)
+	to := time.Now().UTC()
 
-	audit, err := ds.AuditTerminalEventRecords(context.Background())
+	mock.ExpectQuery("").
+		WithArgs(
+			model.EventOutboxStatusDeadLettered,
+			pq.Array([]string{"blnk.transactions", "blnk.balances"}),
+			pq.Array([]int64{0, 3}),
+			pq.Array([]int64{100, 0}),
+			pq.Array([]int64{900, 40}),
+		).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"published_rows", "corroborated_rows", "distinct_corroborated",
+			"unconfirmed_rows", "unmeasured_rows", "aged_out_rows", "beyond_end_rows",
+			"oldest_terminal_at", "corroborated_from", "corroborated_to",
+		}).AddRow(
+			int64(1_000), int64(940), int64(940),
+			int64(10), int64(20), int64(25), int64(5),
+			oldest, from, to,
+		))
+
+	audit, err := ds.AuditEventRecordsInIntervals(context.Background(), []model.PartitionOffsetInterval{
+		{Topic: "blnk.transactions", Partition: 0, FirstOffset: 100, EndOffset: 900},
+		{Topic: "blnk.balances", Partition: 3, FirstOffset: 0, EndOffset: 40},
+	})
 	require.NoError(t, err)
 
 	assert.Equal(t, int64(1_000), audit.PublishedRows)
-	assert.Equal(t, int64(990), audit.ConfirmedRows)
-	assert.Equal(t, int64(10), audit.UnconfirmedRows())
-	assert.False(t, audit.FullyConfirmed(),
-		"ten rows claim a publication nothing corroborates, so the count cannot be trusted")
+	assert.Equal(t, int64(940), audit.CorroboratedRows)
+	assert.Equal(t, int64(10), audit.UnconfirmedRows)
+	assert.Equal(t, int64(20), audit.UnmeasuredRows)
+	assert.Equal(t, int64(25), audit.AgedOutRows)
+	assert.Equal(t, int64(5), audit.BeyondEndRows)
+	assert.Equal(t, int64(60), audit.UncorroboratedRows())
+	assert.Equal(t, audit.PublishedRows, audit.CorroboratedRows+audit.UncorroboratedRows(),
+		"the buckets must partition the claims, or the audit describes a set that is not the outbox")
+	assert.False(t, audit.FullyCorroborated(),
+		"sixty rows could not be placed inside a measured window, so the audit is not conclusive")
+	assert.Equal(t, oldest, audit.OldestTerminalAt,
+		"the oldest retained row bounds what any verdict can speak about and must survive the scan")
+	assert.Equal(t, from, audit.CorroboratedFrom)
+	assert.Equal(t, to, audit.CorroboratedTo)
 	assert.WithinDuration(t, time.Now(), audit.MeasuredAt, time.Minute)
 
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
 
-	assert.Contains(t, issued, "COUNT(kafka_offset)")
-	assert.Contains(t, issued, "COUNT(DISTINCT (kafka_topic, kafka_partition, kafka_offset))")
+	assert.Contains(t, issued, "unnest($2::text[], $3::bigint[], $4::bigint[], $5::bigint[])",
+		"the windows must be BOUND, never interpolated")
+	assert.Contains(t, issued, "LEFT JOIN measured",
+		"an inner join would drop the rows on unmeasured partitions and inflate the corroborated "+
+			"fraction, which is the failure this classification prevents")
+	assert.Contains(t, issued, "WHEN t.kafka_offset IS NULL              THEN 'unconfirmed'")
+	assert.Contains(t, issued, "WHEN m.topic_name IS NULL                THEN 'unmeasured'")
+	assert.Contains(t, issued, "WHEN t.kafka_offset >= m.end_offset      THEN 'beyond_end'")
+	assert.Contains(t, issued, "WHEN t.kafka_offset <  m.first_offset    THEN 'aged_out'")
 	assert.Contains(t, issued, "kafka_dispatched_at IS NOT NULL OR status = $1",
-		"a webhook_pending row IS on its topic; excluding it would inflate the apparent surplus")
+		"a webhook_pending row IS on its topic; excluding it would leave its record unaccounted for")
+	assert.Contains(t, issued, "COUNT(DISTINCT (kafka_topic, kafka_partition, kafka_offset))")
+	assert.Contains(t, issued, "AND kafka_offset IS NOT NULL",
+		"the distinct count must exclude coordinate-less rows: PostgreSQL counts the all-NULL row "+
+			"constructor as one distinct value, which would invent a record")
+
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestAuditTerminalEventRecords_ReportsAFailureRatherThanAnEmptyAudit keeps the verdict honest.
+// TestAuditEventRecordsInIntervals_NormalisesTheWindowsItIsGiven covers the three window
+// readings that must not reach SQL as-is.
+//
+// Each one would otherwise misclassify rows rather than merely being untidy: a blank topic and a
+// negative partition can match no stored coordinate but would still occupy an array slot, and a
+// NEGATIVE first offset — kafka-go's "unknown" reading — would compare below every stored offset
+// and so could never be exceeded, silently turning an unknown lower bound into "nothing has aged
+// out". Zero is the widest defensible reading and is the only one that cannot invent a fact.
+func TestAuditEventRecordsInIntervals_NormalisesTheWindowsItIsGiven(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+		WithArgs(
+			model.EventOutboxStatusDeadLettered,
+			pq.Array([]string{"blnk.transactions"}),
+			pq.Array([]int64{2}),
+			pq.Array([]int64{0}),
+			pq.Array([]int64{500}),
+		).
+		WillReturnRows(auditIntervalRows(0, 0, 0, 0, 0, 0, 0))
+
+	_, err := ds.AuditEventRecordsInIntervals(context.Background(), []model.PartitionOffsetInterval{
+		{Topic: "   ", Partition: 0, FirstOffset: 0, EndOffset: 100},
+		{Topic: "blnk.balances", Partition: -1, FirstOffset: 0, EndOffset: 100},
+		{Topic: "  blnk.transactions  ", Partition: 2, FirstOffset: -1, EndOffset: 500},
+	})
+	require.NoError(t, err)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestAuditEventRecordsInIntervals_WithNoWindowsCorroboratesNothing is the guard on the
+// broker-less path.
+//
+// With no windows every confirmed row classifies as unmeasured, so the verdict is inconclusive.
+// That is the only honest reading — nothing was measured, so nothing was corroborated — and the
+// alternative is the dangerous one: an audit that treated "no windows" as "no constraints"
+// would report a green reconciliation precisely when the broker could not be read.
+func TestAuditEventRecordsInIntervals_WithNoWindowsCorroboratesNothing(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("").
+		WithArgs(
+			model.EventOutboxStatusDeadLettered,
+			pq.Array([]string{}), pq.Array([]int64{}), pq.Array([]int64{}), pq.Array([]int64{}),
+		).
+		WillReturnRows(auditIntervalRows(500, 0, 0, 0, 500, 0, 0))
+
+	audit, err := ds.AuditEventRecordsInIntervals(context.Background(), nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(500), audit.UnmeasuredRows)
+	assert.Zero(t, audit.CorroboratedRows)
+	assert.False(t, audit.FullyCorroborated(),
+		"nothing measured means nothing corroborated; a green verdict here would be a false all-clear")
+
+	require.Len(t, *captured, 1)
+	assert.Contains(t, (*captured)[0], "unnest(",
+		"an empty window list still goes through the same statement, so there is one code path")
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestAuditEventRecordsInIntervals_ReportsAFailureRatherThanAnEmptyAudit keeps the verdict
+// honest.
 //
 // A zero audit reads as "nothing has been published", which is a legitimate state on a fresh
 // deployment — so returning one on a failed read would let a reconciliation conclude that
 // everything is accounted for precisely when it could not measure.
-func TestAuditTerminalEventRecords_ReportsAFailureRatherThanAnEmptyAudit(t *testing.T) {
+func TestAuditEventRecordsInIntervals_ReportsAFailureRatherThanAnEmptyAudit(t *testing.T) {
 	db, mock := newSQLMock(t)
 	ds := Datasource{Conn: db}
 
 	mock.ExpectQuery("FROM blnk.event_outbox").WillReturnError(sql.ErrConnDone)
 
-	audit, err := ds.AuditTerminalEventRecords(context.Background())
+	audit, err := ds.AuditEventRecordsInIntervals(context.Background(), nil)
 	requireAPIError(t, err, apierror.ErrInternalServer)
 	assert.Zero(t, audit.PublishedRows)
+	assert.NotContains(t, err.Error(), sql.ErrConnDone.Error(),
+		"driver text must not reach an operator-facing response")
 	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// auditIntervalRows builds the audit query's single result row, in projection order, with the
+// three instants left NULL — the state of an outbox with nothing to bound.
+func auditIntervalRows(published, corroborated, distinct, unconfirmed, unmeasured, agedOut, beyondEnd int64) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"published_rows", "corroborated_rows", "distinct_corroborated",
+		"unconfirmed_rows", "unmeasured_rows", "aged_out_rows", "beyond_end_rows",
+		"oldest_terminal_at", "corroborated_from", "corroborated_to",
+	}).AddRow(
+		published, corroborated, distinct, unconfirmed, unmeasured, agedOut, beyondEnd,
+		nil, nil, nil,
+	)
 }
 
 // TestBrokerCoordinate_RoundTripsThroughTheProjection_RealDB proves the coordinate survives the
@@ -7127,86 +9532,167 @@ func TestBrokerCoordinate_TwoRowsCannotNameTheSameRecord_RealDB(t *testing.T) {
 			"the audit count one record twice, which is the double-counting the mapping removes")
 }
 
-// TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB is the audit's own round trip.
+// TestAuditEventRecordsInIntervals_ClassifiesTheWholePublishedSet_RealDB is the audit's own
+// round trip, and the only place the classification meets a real planner.
 //
-// It builds each of the three shapes the predicate has to cover — a dispatched row that names its
-// record, a webhook_pending row whose Kafka leg completed, and a dispatched row with no
-// coordinate — and requires the audit to count them the way the reconciliation depends on. The
-// webhook_pending case is the one most easily got wrong: it is not terminal, but it IS on the
-// topic.
-func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T) {
+// It builds every shape the classification has to separate — a dispatched row whose coordinate
+// sits INSIDE the measured window, a webhook_pending row whose Kafka leg completed, a
+// dispatched row with no coordinate at all, a row whose offset is BELOW the window (retention
+// has deleted its record), a row whose offset is AT OR ABOVE the window (the partition was
+// truncated or the topic recreated), a row on a partition NOTHING measured, and a row that has
+// not been published at all — and requires each to land in its own bucket.
+//
+// A mock cannot prove any of this: it replays a scripted result and has no join, no CASE and no
+// planner. The buckets are what the verdict is computed from, so a classification that put a
+// truncated partition's rows under retention, or dropped an unmeasured partition's rows
+// entirely, would produce a confident verdict about a set that is not the outbox.
+//
+// Isolation is on the marker-scoped TOPIC recorded in kafka_topic, which is a free-form column
+// rather than the validated `topic` column, so the windows below can be asserted exactly
+// against a shared table.
+func TestAuditEventRecordsInIntervals_ClassifiesTheWholePublishedSet_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
 
 	marker := newRealEventOutboxMarker("audit")
 	t.Cleanup(func() { quiesceEventOutbox(t, ds, marker) })
 
-	before, err := ds.AuditTerminalEventRecords(ctx)
+	// The measured window for this run's own Kafka topic: offsets 100 up to but excluding 900.
+	kafkaTopic := marker + "kafka-topic"
+	otherTopic := marker + "unmeasured-topic"
+	windows := []model.PartitionOffsetInterval{
+		{Topic: kafkaTopic, Partition: 0, FirstOffset: 100, EndOffset: 900},
+	}
+
+	before, err := ds.AuditEventRecordsInIntervals(ctx, windows)
 	require.NoError(t, err)
 
-	confirmed := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	inside := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 	pending := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
-	unconfirmed := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
-	// A row that has NOT been published at all, which must not be counted by either total.
+	noCoordinate := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	agedOut := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	beyondEnd := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	unmeasured := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	// A row that has NOT been published at all, which must not be counted by any bucket.
 	untouched := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
 
 	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
 	require.NoError(t, err)
 
-	tokens := make(map[string]string, 4)
+	tokens := make(map[string]string, 7)
 	for _, row := range claimed {
 		if isMarkedEventOutbox(row, marker) {
 			tokens[row.EventID] = row.ClaimToken
 		}
 	}
-	require.Len(t, tokens, 4)
+	require.Len(t, tokens, 7)
 
-	require.NoError(t, ds.MarkEventDispatched(ctx, confirmed.ID, tokens[confirmed.EventID],
-		eventOutboxBrokerRecord(marker, 0, 1)))
+	at := func(topic string, partition int, offset int64) model.BrokerRecord {
+		return model.BrokerRecord{Topic: topic, Partition: partition, Offset: offset}
+	}
 
-	// Kafka leg done, HTTP leg outstanding. Not terminal, but on the topic — so it counts.
+	// Inside the window.
+	require.NoError(t, ds.MarkEventDispatched(ctx, inside.ID, tokens[inside.EventID],
+		at(kafkaTopic, 0, 450)))
+
+	// Kafka leg done, HTTP leg outstanding. Not terminal, but on the topic and inside the
+	// window — so it corroborates.
 	_, err = ds.MarkEventWebhookPending(ctx, pending.ID, tokens[pending.EventID],
-		"queue unreachable", time.Minute, eventOutboxBrokerRecord(marker, 1, 2))
+		"queue unreachable", time.Minute, at(kafkaTopic, 0, 451))
 	require.NoError(t, err)
 
 	// Published, acknowledged, but the library reported no coordinate.
-	require.NoError(t, ds.MarkEventDispatched(ctx, unconfirmed.ID, tokens[unconfirmed.EventID],
+	require.NoError(t, ds.MarkEventDispatched(ctx, noCoordinate.ID, tokens[noCoordinate.EventID],
 		model.BrokerRecord{}))
 
-	after, err := ds.AuditTerminalEventRecords(ctx)
+	// Below the window: written, then deleted by retention.
+	require.NoError(t, ds.MarkEventDispatched(ctx, agedOut.ID, tokens[agedOut.EventID],
+		at(kafkaTopic, 0, 99)))
+
+	// AT the end offset. The boundary is exclusive, so this is beyond the log — the reading
+	// that means the partition was truncated or the topic recreated.
+	require.NoError(t, ds.MarkEventDispatched(ctx, beyondEnd.ID, tokens[beyondEnd.EventID],
+		at(kafkaTopic, 0, 900)))
+
+	// A topic no window covers.
+	require.NoError(t, ds.MarkEventDispatched(ctx, unmeasured.ID, tokens[unmeasured.EventID],
+		at(otherTopic, 0, 450)))
+
+	after, err := ds.AuditEventRecordsInIntervals(ctx, windows)
 	require.NoError(t, err)
 
-	assert.Equal(t, int64(3), after.PublishedRows-before.PublishedRows,
-		"the dispatched, the webhook_pending and the unconfirmed rows all claim a record; the "+
-			"untouched row (%d) does not", untouched.ID)
-	assert.Equal(t, int64(2), after.ConfirmedRows-before.ConfirmedRows,
-		"only the two rows carrying a coordinate name a record")
-	assert.Equal(t, int64(2), after.DistinctRecords-before.DistinctRecords,
-		"and those two coordinates are distinct")
+	delta := func(get func(model.EventRecordIntervalAudit) int64) int64 {
+		return get(after) - get(before)
+	}
+
+	assert.Equal(t, int64(6), delta(func(a model.EventRecordIntervalAudit) int64 { return a.PublishedRows }),
+		"six rows claim a record; the untouched row (%d) claims nothing", untouched.ID)
+	assert.Equal(t, int64(2), delta(func(a model.EventRecordIntervalAudit) int64 { return a.CorroboratedRows }),
+		"only the two coordinates inside the measured window are corroborated")
+	assert.Equal(t, int64(2), delta(func(a model.EventRecordIntervalAudit) int64 {
+		return a.DistinctCorroboratedRecords
+	}), "and those two coordinates are distinct")
+	assert.Equal(t, int64(1), delta(func(a model.EventRecordIntervalAudit) int64 { return a.UnconfirmedRows }))
+	assert.Equal(t, int64(1), delta(func(a model.EventRecordIntervalAudit) int64 { return a.AgedOutRows }),
+		"an offset below the retained window is retention, not loss and not truncation")
+	assert.Equal(t, int64(1), delta(func(a model.EventRecordIntervalAudit) int64 { return a.BeyondEndRows }),
+		"an offset AT the exclusive end offset is beyond the log: the partition was truncated or "+
+			"the topic recreated")
+	assert.Equal(t, int64(1), delta(func(a model.EventRecordIntervalAudit) int64 { return a.UnmeasuredRows }),
+		"a row on a partition nothing measured must be COUNTED, not dropped: dropping it is what "+
+			"would inflate the corroborated fraction")
 
 	// THE COORDINATE-LESS ROW MUST NOT COUNT AS A RECORD, and this is the assertion that says
 	// so unconditionally.
 	//
-	// The delta above used to be 3 on an EMPTY table and 2 on a polluted one, because
 	// COUNT(DISTINCT (topic, partition, offset)) counts the all-NULL row constructor as a
-	// distinct value: the unconfirmed row contributed one, unless some earlier test had already
-	// left a coordinate-less published row that contributed it first. So the test passed on
-	// residue and failed the moment fixtures started cleaning up after themselves.
+	// distinct value, so without the filter the unconfirmed row would contribute a phantom
+	// record — unless some earlier test had already left a coordinate-less published row that
+	// contributed it first, which is how the unfiltered form passed on residue and failed the
+	// moment fixtures started cleaning up after themselves.
 	//
-	// Stated as an INVARIANT rather than a delta because that is the contract both readers of
-	// this audit rely on: FullyConfirmed requires the two to be equal, and
-	// ReconcileAgainstOutbox derives duplication from their difference, so DistinctRecords
-	// exceeding ConfirmedRows is not a smaller version of the same answer — it is a
-	// wrong one.
-	assert.LessOrEqual(t, after.DistinctRecords, after.ConfirmedRows,
-		"a row that names no coordinate names no record: DistinctRecords may never exceed "+
-			"ConfirmedRows, or FullyConfirmed reports an inconclusive verdict on a healthy outbox "+
-			"and ReconcileAgainstOutbox derives a negative duplication count")
+	// Stated as an INVARIANT rather than a delta because that is the contract both readers rely
+	// on: FullyCorroborated requires no duplication, and ReconcileAgainstOutbox derives
+	// duplication from the difference, so DistinctCorroboratedRecords exceeding
+	// CorroboratedRows is not a smaller version of the same answer — it is a wrong one.
+	assert.LessOrEqual(t, after.DistinctCorroboratedRecords, after.CorroboratedRows,
+		"a row that names no coordinate names no record: the distinct count may never exceed the "+
+			"corroborated one, or a healthy outbox is reported inconclusive and the verdict derives "+
+			"a negative duplication count")
 
-	// The verdict this produces is the whole point: an unconfirmed claim makes it inconclusive
-	// rather than green, however favourable the totals look.
-	assert.False(t, after.FullyConfirmed(),
-		"one row claims a publication it cannot name a record for, so the count is not trustworthy")
+	// The buckets partition the claims. This is the identity the verdict's arithmetic depends
+	// on, and it is checked against real rows rather than assumed from the query text.
+	assert.Equal(t, after.PublishedRows, after.CorroboratedRows+after.UncorroboratedRows(),
+		"every published row must land in exactly one bucket")
+
+	// The verdict this produces is the whole point: unplaced claims make it inconclusive rather
+	// than green, however favourable any total looks.
+	assert.False(t, after.FullyCorroborated(),
+		"four of the six claims could not be placed inside a measured window, so the audit is not "+
+			"trustworthy")
+
+	// The window the verdict covers is bounded at both ends by real instants, so a reader can
+	// tell what it speaks about.
+	assert.False(t, after.OldestTerminalAt.IsZero(),
+		"a verdict must state the oldest retained claim it could see; without it a reconciliation "+
+			"over a pruned outbox looks complete")
+	assert.False(t, after.CorroboratedFrom.IsZero())
+	assert.False(t, after.CorroboratedTo.IsZero())
+	assert.False(t, after.CorroboratedTo.Before(after.CorroboratedFrom),
+		"the covered window cannot end before it starts")
+
+	t.Run("a coordinate inside no window at all corroborates nothing", func(t *testing.T) {
+		// The broker-less path, against the real planner: no windows means every confirmed row
+		// is unmeasured, so the audit corroborates nothing rather than everything.
+		empty, auditErr := ds.AuditEventRecordsInIntervals(ctx, nil)
+		require.NoError(t, auditErr)
+
+		assert.Zero(t, empty.CorroboratedRows,
+			"with nothing measured nothing can be corroborated; the opposite reading would report "+
+				"a green reconciliation exactly when the broker could not be read")
+		assert.GreaterOrEqual(t, empty.UnmeasuredRows, int64(5),
+			"every row that names a coordinate falls into unmeasured")
+	})
 }
 
 // TestMarkEventPermanentlyFailed_EndsTheEventOnThisAttempt covers the transition the relay
@@ -7229,17 +9715,18 @@ func TestMarkEventPermanentlyFailed_EndsTheEventOnThisAttempt(t *testing.T) {
 
 	mock.ExpectQuery("").
 		WithArgs(
-			model.EventOutboxStatusFailed,     // $1 — the only arm there is
-			"topic authorization failed",      // $2 — the reason
-			int64(11),                         // $3 — the row
-			"tok-11",                          // $4 — the claim token
-			model.EventOutboxStatusProcessing, // $5 — the required prior state
+			model.EventOutboxStatusFailed,        // $1 — the only arm there is
+			"topic authorization failed",         // $2 — the reason
+			int64(11),                            // $3 — the row
+			"tok-11",                             // $4 — the claim token
+			model.EventOutboxStatusProcessing,    // $5 — the required prior state
+			eventDeadLetterHandoffLease.String(), // $6 — the lease held across the hand-off
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"status", "attempts"}).
 			AddRow(model.EventOutboxStatusFailed, int64(1)))
 
 	outcome, err := ds.MarkEventPermanentlyFailed(
-		context.Background(), 11, "tok-11", "topic authorization failed")
+		context.Background(), 11, "tok-11", "topic authorization failed", testDeadLetterHandoffLease)
 	require.NoError(t, err)
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
@@ -7257,8 +9744,11 @@ func TestMarkEventPermanentlyFailed_EndsTheEventOnThisAttempt(t *testing.T) {
 			"had a chance rather than that it fought for the whole schedule")
 	assert.Contains(t, issued, "first_attempted_at = COALESCE(first_attempted_at, NOW())",
 		"the retry window must still be bounded at both ends for the failure metadata")
-	assert.Contains(t, issued, "locked_until = NULL",
-		"the lease is released; failed is outside the claimable set so nothing re-claims it")
+	assert.Contains(t, issued, "locked_until = NOW() + $6::interval",
+		"the lease is RENEWED, not released, and it is the other half of retaining the claim token: "+
+			"ClaimFailedEventOutboxForDeadLetter takes a failed row with no dlt_topic and no live "+
+			"lease and stamps a fresh token over it, so releasing the lease here would let a second "+
+			"instance reclaim the row in the same instant and publish the dead-letter message twice")
 	// The SET list is inspected on its own, because the WHERE clause legitimately mentions
 	// claim_token and a whole-statement match would pass whatever the assignment said.
 	assignments, _, split := strings.Cut(issued, "WHERE")
@@ -7301,7 +9791,7 @@ func TestMarkEventPermanentlyFailed_LostClaimIsAConflict(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_outbox")).
 		WillReturnError(sql.ErrNoRows)
 
-	outcome, err := ds.MarkEventPermanentlyFailed(context.Background(), 11, "stale-token", "boom")
+	outcome, err := ds.MarkEventPermanentlyFailed(context.Background(), 11, "stale-token", "boom", testDeadLetterHandoffLease)
 	require.Error(t, err, "a lost claim must NOT be reported as success")
 	assert.Equal(t, model.EventFailureOutcome{}, outcome,
 		"no decision was made, so no decision may be reported — and no dead letter may follow")
@@ -7506,4 +9996,2123 @@ func openLockedEventOutboxDB(t *testing.T) Datasource {
 	lockEventOutboxTier(t, ds.Conn)
 
 	return ds
+}
+
+// TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB proves the fix against real
+// SQL, which is the only place it can be proved.
+//
+// # What was wrong
+//
+// The dead-letter listing used to return unfiltered pages and let the service above it test
+// each row in Go, abandoning the walk after 5,000 scanned rows. A filter whose matches lay
+// beyond that ceiling produced an ordinary empty page, so the endpoint answered "nothing
+// matches" while entries matched — and no offset could reach them. Separately, no
+// filter-aware count existed, so a total could only be offered for an UNFILTERED page.
+//
+// # What is asserted, and why against a real database
+//
+// A fake can be made to agree with any predicate. These are the assertions that only real
+// SQL can settle: that the WHERE clause narrows on the columns claimed, that both terminal
+// failure states remain in scope so a filter cannot escape them, that OFFSET pages the
+// MATCHING set, and that COUNT(*) over the same predicate agrees with the rows returned. The
+// last is the one an operator depends on: paging to the total must exhaust the matches.
+func TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB(t *testing.T) {
+	ds := openLockedEventOutboxDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("dltq")
+	quiesceEventOutbox(t, ds, marker)
+
+	base := dbTimestamp(time.Now().Add(-2 * time.Hour))
+
+	// Three shapes, so that every filter distinguishes something and no two filters select
+	// the same set. dead_lettered rows reach a `.dlt` sibling; the failed one does not, and
+	// it is in the inventory precisely because its dead-letter write never landed.
+	type fixture struct {
+		eventType  string
+		topic      string
+		deadLetter bool
+	}
+	plan := []fixture{
+		{"transaction.applied", "blnk.transactions", true},
+		{"transaction.applied", "blnk.transactions", true},
+		{"transaction.applied", "blnk.transactions", false},
+		{"balance.created", "blnk.balances", true},
+		{"identity.created", "blnk.identities", false},
+	}
+
+	transactionsNewestFirst := make([]string, 0, 3)
+	for i, spec := range plan {
+		entry := newEventOutboxFixture(marker)
+		entry.EventType = spec.eventType
+		entry.Topic = spec.topic
+		entry.OccurredAt = base.Add(time.Duration(i) * time.Second)
+		if !spec.deadLetter {
+			// A one-attempt budget so a single failure spends it and the row lands in
+			// `failed` with dlt_topic still NULL — the state whose only surviving copy is
+			// the outbox row.
+			entry.MaxAttempts = 1
+		}
+		insertRealEventOutbox(t, ds, entry)
+
+		token := claimEventOutboxToken(t, ds, entry)
+		if spec.deadLetter {
+			require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt",
+				json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`),
+				model.BrokerRecord{}))
+		} else {
+			outcome, failErr := ds.MarkEventFailed(ctx, entry.ID, token,
+				"the dead-letter write never landed", 0, false, testDeadLetterHandoffLease)
+			require.NoError(t, failErr)
+			require.True(t, outcome.Exhausted,
+				"a one-attempt budget is spent by its first failure, which is what moves the "+
+					"row to the terminal failed state")
+		}
+
+		if spec.topic == "blnk.transactions" {
+			transactionsNewestFirst = append([]string{entry.EventID}, transactionsNewestFirst...)
+		}
+	}
+
+	mine := func(page model.DeadLetterInventoryPage) []string {
+		ids := make([]string, 0, len(page.Entries))
+		for _, entry := range page.Entries {
+			if strings.HasPrefix(entry.AggregateID, marker) {
+				ids = append(ids, entry.EventID)
+			}
+		}
+
+		return ids
+	}
+	// The queries below are table-wide, because the repository's predicate is. A sibling
+	// clone running the same suite against this database can therefore have rows in the
+	// same states at the same time, so every assertion on a RETURNED SET is filtered to
+	// this test's own marker, and every assertion on a COUNT is a lower bound rather than
+	// an equality. That is the honest form: the count is genuinely a count of the whole
+	// table, and pretending otherwise would make this test pass or fail on who else is
+	// running.
+
+	t.Run("the event-type filter narrows on the column", func(t *testing.T) {
+		entries, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+			Limit: maxDeadLetterPageSize, EventType: "transaction.applied",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, transactionsNewestFirst, mine(entries),
+			"only the three transaction.applied rows may match, newest occurrence first")
+	})
+
+	t.Run("the topic filter narrows on the ORIGINAL topic, not the dlt sibling", func(t *testing.T) {
+		entries, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+			Limit: maxDeadLetterPageSize, Topic: "blnk.transactions",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, transactionsNewestFirst, mine(entries),
+			"the caller filters by the category topic and never has to know the .dlt convention")
+
+		// The `.dlt` name must NOT match the column: it is what the row was written TO, and
+		// accepting it here would make two different filters silently equivalent.
+		siblings, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+			Limit: maxDeadLetterPageSize, Topic: "blnk.transactions.dlt",
+		})
+		require.NoError(t, err)
+		assert.Empty(t, mine(siblings))
+	})
+
+	t.Run("both terminal states stay in scope and status narrows within them", func(t *testing.T) {
+		everything, err := ds.ListDeadLetterInventory(ctx,
+			model.DeadLetterInventoryQuery{Limit: maxDeadLetterPageSize})
+		require.NoError(t, err)
+		require.Len(t, mine(everything), 5,
+			"a failed row whose dead-letter write never landed is in the inventory; hiding it "+
+				"would hide the events with no copy anywhere but the outbox")
+
+		failed, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+			Limit: maxDeadLetterPageSize, Status: model.EventOutboxStatusFailed,
+		})
+		require.NoError(t, err)
+		assert.Len(t, mine(failed), 2)
+
+		deadLettered, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+			Limit: maxDeadLetterPageSize, Status: model.EventOutboxStatusDeadLettered,
+		})
+		require.NoError(t, err)
+		assert.Len(t, mine(deadLettered), 3)
+
+		// A status outside the two cannot escape the predicate, however it is spelled.
+		for _, status := range []string{
+			model.EventOutboxStatusPending,
+			model.EventOutboxStatusDispatched,
+			model.EventOutboxStatusProcessing,
+		} {
+			escaped, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+				Limit: maxDeadLetterPageSize, Status: status,
+			})
+			require.NoError(t, err)
+			assert.Emptyf(t, mine(escaped),
+				"status %q must match nothing: the inventory is the two terminal failure "+
+					"states, and a filter must narrow within them rather than reach past them",
+				status)
+		}
+	})
+
+	t.Run("the cursor pages the matches", func(t *testing.T) {
+		seen := make([]string, 0, len(transactionsNewestFirst))
+
+		var resume *model.DeadLetterCursor
+		for range len(transactionsNewestFirst) {
+			page, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+				Limit: 1, Cursor: resume, EventType: "transaction.applied",
+			})
+			require.NoError(t, err)
+
+			ids := mine(page)
+			require.Len(t, ids, 1, "each page must land on a match")
+			seen = append(seen, ids...)
+
+			// Taken from the row just returned rather than from NextCursor, because the LAST page
+			// of an exactly-divided walk reports no further page and so carries no cursor — and
+			// the position past the final match is what the assertion after the loop needs.
+			last := page.Entries[len(page.Entries)-1]
+			resume = &model.DeadLetterCursor{OccurredAt: last.OccurredAt, ID: last.ID}
+		}
+
+		assert.Equal(t, transactionsNewestFirst, seen,
+			"stepping the cursor must walk the matches in order, once each — which is what an "+
+				"offset could not promise once a row arrived mid-walk")
+
+		past, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+			Limit: 10, Cursor: resume, EventType: "transaction.applied",
+		})
+		require.NoError(t, err)
+		assert.Empty(t, mine(past), "a cursor past the last match returns no non-matching row")
+	})
+
+	t.Run("the count agrees with the rows the same filter returns", func(t *testing.T) {
+		for _, query := range []model.DeadLetterQuery{
+			{},
+			{EventType: "transaction.applied"},
+			{Topic: "blnk.balances"},
+			{Status: model.EventOutboxStatusFailed},
+			{EventType: "transaction.applied", Topic: "blnk.transactions", Status: model.EventOutboxStatusDeadLettered},
+			{EventType: "transaction.applied", Topic: "blnk.balances"},
+		} {
+			entries, err := ds.ListDeadLetterInventory(ctx, model.DeadLetterInventoryQuery{
+				Limit:        maxDeadLetterPageSize,
+				EventType:    query.EventType,
+				Topic:        query.Topic,
+				Status:       query.Status,
+				OccurredFrom: query.OccurredFrom,
+				OccurredTo:   query.OccurredTo,
+			})
+			require.NoError(t, err)
+
+			// The count spans every row in the table, so it is compared against this
+			// test's own rows by counting with the aggregate scoped the same way: the
+			// difference between the two counts must be attributable entirely to rows
+			// this test did not create.
+			total, err := ds.CountDeadLetterInventory(ctx, query)
+			require.NoError(t, err)
+			assert.GreaterOrEqualf(t, total, int64(len(mine(entries))),
+				"the count must include at least the matching rows the listing returned "+
+					"for %+v; a smaller total would have a caller stop paging early", query)
+
+			// A page bound must never change the total.
+			paged := query
+			paged.Limit = 1
+			pagedTotal, err := ds.CountDeadLetterInventory(ctx, paged)
+			require.NoError(t, err)
+			assert.Equalf(t, total, pagedTotal,
+				"the page bound must not affect the count for %+v", query)
+		}
+	})
+
+	t.Run("the full-row read and the projection describe ONE inventory", func(t *testing.T) {
+		// Two entry points, two shapes, one set. The replay path needs the stored bytes and reads
+		// full rows; the operator's listing needs the triage coordinate and reads the projection.
+		// If they can disagree, an event visible in one is invisible in the other, and the
+		// listing an operator replays from is not the inventory the replay draws on.
+		rows, err := ds.ListDeadLetteredEvents(ctx, model.DeadLetterQuery{Limit: maxDeadLetterPageSize})
+		require.NoError(t, err)
+
+		fromRows := make([]string, 0, len(rows))
+		for _, row := range rows {
+			if isMarkedEventOutbox(row, marker) {
+				fromRows = append(fromRows, row.EventID)
+			}
+		}
+
+		projected, err := ds.ListDeadLetterInventory(ctx,
+			model.DeadLetterInventoryQuery{Limit: maxDeadLetterPageSize})
+		require.NoError(t, err)
+
+		assert.Equal(t, fromRows, mine(projected),
+			"the two entry points must return one set; if they can differ, the age scan and "+
+				"the operator's listing are reading different inventories")
+	})
+}
+
+// TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB is the durable half of making the
+// zero-loss reconciliation honest.
+//
+// # Why a deleted row has to leave a record
+//
+// A Kafka end offset counts every record ever appended to a partition and never decreases.
+// The outbox side of the reconciliation counts rows that still exist. The two describe the
+// same interval only until retention deletes its first terminal row; after that the broker
+// counts all of history and the outbox counts a suffix of it.
+//
+// The difference is undetectable by inspection, because the comparison already EXPECTS a
+// surplus — a redelivery, a replay and a dead-letter copy each append a record no row
+// claims. A purge-inflated surplus therefore looks exactly like healthy overhead, and it can
+// offset a genuine shortfall precisely, at which point the endpoint answers a confident "no
+// loss detected" while events are missing. Nothing in the numbers hints at it.
+//
+// A deleted row leaves no trace, so "how many terminal rows has retention removed" is
+// unanswerable unless the purge itself records it. These assertions are what make the answer
+// trustworthy: the counts must describe exactly the rows that left, the confirmed subset must
+// be tracked separately because it restores a different baseline, and a sweep that removes
+// nothing must write nothing.
+func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
+	ds := openLockedEventOutboxDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("purgelog")
+	quiesceEventOutbox(t, ds, marker)
+
+	// Deltas rather than absolutes: the purge log has no per-test marker because it
+	// describes the whole table, and the suite may run against a database another clone
+	// has also purged. What this test owns is the CHANGE its own purge causes.
+	before, err := ds.SumPurgedTerminalEvents(ctx)
+	require.NoError(t, err)
+	require.True(t, before.Recorded,
+		"reading the log must report that it was read; an unread log and an empty one are "+
+			"different facts and only one supports a conclusive verdict")
+
+	// A sweep that removes nothing must not write a log row. "Retention ran and found
+	// nothing" is the steady state, and recording it would bury the batches that matter.
+	noop, err := ds.PurgeTerminalEventsBefore(ctx, dbTimestamp(time.Now().AddDate(-20, 0, 0)), 100)
+	require.NoError(t, err)
+	require.Zero(t, noop, "no row is old enough to be eligible")
+
+	afterNoop, err := ds.SumPurgedTerminalEvents(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, before.Batches, afterNoop.Batches,
+		"a purge that removed nothing must record nothing")
+	assert.Equal(t, before.RowsRemoved, afterNoop.RowsRemoved)
+
+	// Three PURGEABLE rows — two carrying a broker coordinate and one without, so the
+	// confirmed subset is provably tracked rather than assumed equal to the total — plus a
+	// `failed` row that retention must NOT touch, and a recent row the cutoff must spare.
+	//
+	// Only dispatched and dead_lettered are purgeable, and the exclusion of `failed` is
+	// deliberate rather than an oversight: such a row's retry budget is spent while its
+	// dead-letter write has not landed, so the outbox row is the event's ONLY surviving
+	// copy. Deleting it would destroy the event, which is the exact failure the whole
+	// zero-loss criterion exists to prevent. It is asserted below.
+	type fixture struct {
+		age       time.Duration
+		status    string
+		confirmed bool
+		purgeable bool
+	}
+	fixtures := []fixture{
+		{40 * 24 * time.Hour, model.EventOutboxStatusDispatched, true, true},
+		{39 * 24 * time.Hour, model.EventOutboxStatusDispatched, true, true},
+		{37 * 24 * time.Hour, model.EventOutboxStatusDeadLettered, false, true},
+		{38 * 24 * time.Hour, model.EventOutboxStatusFailed, false, false},
+	}
+	purgeableCount := int64(0)
+	var failedSurvivor string
+
+	var oldest, newest time.Time
+	offset := int64(9000)
+	for _, spec := range fixtures {
+		entry := newEventOutboxFixture(marker)
+		entry.OccurredAt = dbTimestamp(time.Now().Add(-spec.age))
+		insertRealEventOutbox(t, ds, entry)
+
+		token := claimEventOutboxToken(t, ds, entry)
+		record := model.BrokerRecord{}
+		if spec.confirmed {
+			offset++
+			record = model.BrokerRecord{Topic: entry.Topic, Partition: 0, Offset: offset}
+		}
+
+		switch spec.status {
+		case model.EventOutboxStatusDispatched:
+			require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, token, record))
+		case model.EventOutboxStatusFailed:
+			outcome, failErr := ds.MarkEventFailed(ctx, entry.ID, token, "spent", 0, true, testDeadLetterHandoffLease)
+			require.NoError(t, failErr)
+			require.True(t, outcome.Exhausted)
+		case model.EventOutboxStatusDeadLettered:
+			require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt",
+				json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`), record))
+
+			// AND RESOLVED, because a dead-lettered row is terminal without being purgeable:
+			// it is the only record that a ledger event went undelivered, so retention may
+			// delete it only once an operator has accounted for it (SEC-08). An unresolved
+			// fixture here would be spared, which is the correct behaviour and would make
+			// this test about the gate rather than about the purge log.
+			resolved, resolveErr := ds.MarkEventDeadLetterResolved(ctx, entry.EventID,
+				"resolved by the retention fixture", dbTimestamp(time.Now()))
+			require.NoError(t, resolveErr)
+			require.True(t, resolved.IsResolvedDeadLetter())
+		}
+
+		if !spec.purgeable {
+			failedSurvivor = entry.EventID
+
+			continue
+		}
+
+		purgeableCount++
+		if oldest.IsZero() || entry.OccurredAt.Before(oldest) {
+			oldest = entry.OccurredAt
+		}
+		if entry.OccurredAt.After(newest) {
+			newest = entry.OccurredAt
+		}
+	}
+
+	survivor := newEventOutboxFixture(marker)
+	survivor.OccurredAt = dbTimestamp(time.Now().Add(-time.Hour))
+	insertRealEventOutbox(t, ds, survivor)
+	require.NoError(t, ds.MarkEventDispatched(ctx, survivor.ID,
+		claimEventOutboxToken(t, ds, survivor),
+		model.BrokerRecord{Topic: survivor.Topic, Partition: 1, Offset: 9500}))
+
+	cutoff := dbTimestamp(time.Now().AddDate(0, 0, -30))
+	purged, err := ds.PurgeTerminalEventsBefore(ctx, cutoff, 100)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, purged, purgeableCount,
+		"every purgeable fixture must be removed")
+
+	// The `failed` row is still there, and it must be: its dead-letter write never landed,
+	// so this row is the event's only surviving copy.
+	surviving, err := ds.GetEventByID(ctx, failedSurvivor)
+	require.NoError(t, err,
+		"retention must never purge a `failed` row; it is the only copy of an event whose "+
+			"dead-letter write did not complete, and deleting it would BE the loss the "+
+			"reconciliation exists to detect")
+	require.NotNil(t, surviving)
+	assert.Equal(t, model.EventOutboxStatusFailed, surviving.Status)
+
+	after, err := ds.SumPurgedTerminalEvents(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, before.Batches+1, after.Batches,
+		"one batch removed rows, so exactly one log row may be written")
+	assert.Equal(t, before.RowsRemoved+purged, after.RowsRemoved,
+		"the recorded total must equal what the DELETE actually removed; if the two can "+
+			"differ, the reconciliation's baseline is wrong by that difference and nothing "+
+			"reveals it")
+	assert.Equal(t, before.ConfirmedRemoved+2, after.ConfirmedRemoved,
+		"only the two rows carrying a broker coordinate count towards the confirmed subset; "+
+			"conflating it with the total would corrupt the row-to-record mapping, which is "+
+			"the part of the verdict that carries its soundness")
+
+	require.NotNil(t, after.LastPurgedAt, "a recorded batch must be dated")
+	require.NotNil(t, after.NewestPurgedOccurrence,
+		"the purged window's upper bound is what tells an operator whether a measurement "+
+			"window overlaps a purge")
+	assert.False(t, after.NewestPurgedOccurrence.After(cutoff),
+		"nothing at or after the cutoff may have been purged")
+	assert.True(t, after.PurgeHasOccurred(),
+		"the reconciliation must be able to see that a purge has happened at all")
+
+	// The survivor proves the cutoff bounded the deletion rather than the batch limit.
+	remaining, err := ds.GetEventByID(ctx, survivor.EventID)
+	require.NoError(t, err)
+	require.NotNil(t, remaining)
+
+	// The interval recorded must be the interval deleted, not merely inside it.
+	var loggedOldest, loggedNewest time.Time
+	require.NoError(t, ds.Conn.QueryRowContext(ctx, `
+		SELECT oldest_occurred_at, newest_occurred_at
+		FROM blnk.event_outbox_purge_log
+		ORDER BY id DESC LIMIT 1
+	`).Scan(&loggedOldest, &loggedNewest))
+	assert.False(t, loggedOldest.After(oldest.UTC()),
+		"the recorded lower bound must reach the oldest row actually removed")
+	assert.False(t, loggedNewest.Before(newest.UTC()),
+		"and the upper bound must reach the newest one")
+}
+
+// auditCoordinatesByPartition reads the audit and returns the coordinates of ONE topic,
+// keyed by partition.
+//
+// It exists so a test can find out what a shared blnk.event_outbox already claims before it
+// adds claims of its own. The audit is a whole-table aggregate and the topic namespace is
+// closed — model.IsBlnkEventTopic admits only `<prefix>.<category>` and its `.dlt` sibling —
+// so a test cannot isolate itself by inventing a topic; it has to place its fixtures where
+// nothing else has, and that requires reading first.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - ctx context.Context: bounds the read.
+//   - ds Datasource: the live database.
+//   - topic string: the topic whose partitions are wanted.
+//
+// Returns:
+//   - map[int]model.EventRecordCoordinate: one entry per partition the audit reports for
+//     topic. Empty when it reports none, which is the answer a virgin table gives.
+func auditCoordinatesByPartition(
+	t *testing.T,
+	ctx context.Context,
+	ds Datasource,
+	topic string,
+) map[int]model.EventRecordCoordinate {
+	t.Helper()
+
+	audit, err := ds.AuditEventRecordCoordinates(ctx)
+	require.NoError(t, err, "the coordinate audit must be readable before fixtures are placed")
+
+	byPartition := make(map[int]model.EventRecordCoordinate, len(audit.Coordinates))
+	for _, coordinate := range audit.Coordinates {
+		if coordinate.Topic == topic {
+			byPartition[coordinate.Partition] = coordinate
+		}
+	}
+
+	return byPartition
+}
+
+// TestAuditEventRecordCoordinates_ReportsPerPartitionClaims_RealDB covers the audit that
+// turns the reconciliation from an inference into a check.
+//
+// Counting alone cannot tell a surplus of redeliveries from a surplus concealing an equal
+// number of losses — ten of each produce the totals of a healthy pipeline. A coordinate can
+// be CHECKED against the partition's live bounds: a claim at or beyond the end offset names
+// a record the log does not contain. This asserts the audit supplies what that check needs —
+// grouped per (topic, partition), with the extremes that bound the claims — and that rows
+// claiming nothing are excluded rather than silently counted as verified.
+func TestAuditEventRecordCoordinates_ReportsPerPartitionClaims_RealDB(t *testing.T) {
+	ds := openLockedEventOutboxDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("coord")
+	quiesceEventOutbox(t, ds, marker)
+
+	// THE COORDINATE SPACE THIS TEST WILL ASSERT ON, READ BEFORE ANYTHING IS INSERTED.
+	//
+	// The audit is a WHOLE-TABLE aggregate — the comment on the identity assertion at the
+	// end of this test says so, and that assertion depends on it — so a (topic, partition)
+	// group this test writes into may already hold rows: from an earlier run of this suite,
+	// from the root package's live tiers, or from a shared development database. Two of the
+	// assertions below used to be exact equalities against the literal 7 on partition 3,
+	// which can only hold on a virgin table; on a shared one they read another writer's
+	// largest claim (8514 was observed) and reported a defect in an audit that was correct.
+	//
+	// The third hazard is worse than a false failure. (kafka_topic, kafka_partition,
+	// kafka_offset) is UNIQUE wherever an offset is present, so a hardcoded offset another
+	// row already claims makes MarkEventDispatched fail outright — the test then fails on
+	// its own fixture rather than on anything it is measuring.
+	//
+	// Reading the table first removes both, and it removes them without weakening a single
+	// assertion. Because the topic namespace is closed — model.IsBlnkEventTopic admits only
+	// `<prefix>.<category>` and its `.dlt` sibling, so a run-unique topic is not available
+	// as an isolation mechanism — isolation has to be found inside the coordinate space
+	// instead: the multi-claim fixtures are placed ABOVE the busy partition's existing
+	// claims so the reported maximum is this test's largest claim exactly, and the
+	// single-claim case is given a partition the audit does not currently report at all so
+	// that BOTH of its extremes are that one claim and can be asserted exactly. The tier
+	// lock openLockedEventOutboxDB holds is what makes the reading still true when the
+	// assertions run.
+	const auditTopic = "blnk.transactions"
+
+	occupied := auditCoordinatesByPartition(t, ctx, ds, auditTopic)
+
+	// The busy partition, whose claims must not collide with anything already there.
+	const busyPartition = 0
+	busyBase := int64(100)
+	if existing, ok := occupied[busyPartition]; ok {
+		busyBase = existing.MaxOffset + 1000
+	}
+
+	// The partition whose single claim is both of its extremes. Searched for rather than
+	// assumed, because a literal is exactly what failed here.
+	solePartition := 3
+	for {
+		if _, taken := occupied[solePartition]; !taken {
+			break
+		}
+		solePartition++
+	}
+	const soleOffset = int64(7)
+
+	// Two partitions of one topic with different claim counts and ranges, plus an
+	// unconfirmed row that must not appear anywhere in the result. The busy partition's
+	// three offsets are deliberately out of order, so the reported extremes are the
+	// aggregate's answer rather than the insertion order's.
+	type claim struct {
+		partition int
+		offset    int64
+	}
+	claims := []claim{
+		{busyPartition, busyBase},
+		{busyPartition, busyBase + 40},
+		{busyPartition, busyBase + 20},
+		{solePartition, soleOffset},
+	}
+
+	for _, spec := range claims {
+		entry := newEventOutboxFixture(marker)
+		entry.Topic = auditTopic
+		insertRealEventOutbox(t, ds, entry)
+		require.NoError(t, ds.MarkEventDispatched(ctx, entry.ID, claimEventOutboxToken(t, ds, entry),
+			model.BrokerRecord{Topic: entry.Topic, Partition: spec.partition, Offset: spec.offset}))
+	}
+
+	unconfirmed := newEventOutboxFixture(marker)
+	unconfirmed.MaxAttempts = 1
+	insertRealEventOutbox(t, ds, unconfirmed)
+	outcome, err := ds.MarkEventFailed(ctx, unconfirmed.ID,
+		claimEventOutboxToken(t, ds, unconfirmed), "no record was ever acknowledged", 0, false,
+		testDeadLetterHandoffLease)
+	require.NoError(t, err)
+	require.True(t, outcome.Exhausted)
+
+	audit, err := ds.AuditEventRecordCoordinates(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, audit.Coordinates, "the slice must be usable without a nil check")
+	assert.False(t, audit.MeasuredAt.IsZero(), "the audit must be dated")
+
+	byPartition := make(map[int]model.EventRecordCoordinate, len(audit.Coordinates))
+	for _, coordinate := range audit.Coordinates {
+		if coordinate.Topic == auditTopic {
+			byPartition[coordinate.Partition] = coordinate
+		}
+	}
+
+	busy, ok := byPartition[busyPartition]
+	require.True(t, ok, "the partition three rows claim must be reported")
+	assert.Equal(t, occupied[busyPartition].Rows+3, busy.Rows,
+		"exactly the three rows this test claimed on this partition may be added to its count")
+	assert.LessOrEqual(t, busy.MinOffset, busyBase,
+		"the smallest claim bounds the retention comparison")
+	assert.Equal(t, busyBase+40, busy.MaxOffset,
+		"the largest claim is what tests the partition's end offset, and it is the "+
+			"comparison that yields direct evidence of a missing record. It is asserted "+
+			"EXACTLY because the fixtures were placed above everything already in this "+
+			"partition, so no other writer's claim can be the maximum")
+
+	sole, ok := byPartition[solePartition]
+	require.True(t, ok, "each claimed partition is reported separately")
+	assert.Equal(t, int64(1), sole.Rows,
+		"this partition was chosen because the audit reported nothing on it, so its count "+
+			"is this test's single claim and nothing else")
+	assert.Equal(t, soleOffset, sole.MinOffset)
+	assert.Equal(t, soleOffset, sole.MaxOffset,
+		"a single claim makes both extremes that claim")
+
+	// Ordering is deterministic so a report reads the same way twice.
+	for i := 1; i < len(audit.Coordinates); i++ {
+		previous, current := audit.Coordinates[i-1], audit.Coordinates[i]
+		if previous.Topic == current.Topic {
+			assert.Less(t, previous.Partition, current.Partition,
+				"partitions of one topic must ascend")
+
+			continue
+		}
+		assert.Less(t, previous.Topic, current.Topic, "topics must ascend")
+	}
+
+	// The unconfirmed row claims no record, so nothing may account for it. Its absence is
+	// what leaves it to be counted as unconfirmed — which is what makes the verdict
+	// inconclusive while any such row exists.
+	//
+	// The check is against SQL rather than against a predicted partition set, because the
+	// audit covers the WHOLE table: other rows, from other tests in this suite or another
+	// clone running it, legitimately claim partitions this test knows nothing about.
+	// Asserting a partition list would make the test pass or fail on who else is running.
+	// What is invariant is the identity below — the audit accounts for exactly the rows
+	// that carry a coordinate, no more and no fewer.
+	assert.GreaterOrEqual(t, audit.TotalRows(), int64(len(claims)))
+
+	var rowsWithACoordinate int64
+	require.NoError(t, ds.Conn.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM blnk.event_outbox WHERE kafka_offset IS NOT NULL
+	`).Scan(&rowsWithACoordinate))
+	assert.Equal(t, rowsWithACoordinate, audit.TotalRows(),
+		"the audit must account for every row that names a record and ONLY those: a row "+
+			"with no coordinate counted here would read as verified when nothing corroborates "+
+			"it, which is the surplus-masks-loss failure the audit exists to close")
+
+	stillUnconfirmed, err := ds.GetEventByID(ctx, unconfirmed.EventID)
+	require.NoError(t, err)
+	require.NotNil(t, stillUnconfirmed)
+	assert.Nil(t, stillUnconfirmed.KafkaOffset,
+		"the fixture must genuinely carry no coordinate, or this test proves nothing")
+}
+
+// TestOldestDeadLetterAgeByTopic_IsOneGroupedAggregate is the PERF-P07 guard.
+//
+// The age gauge used to COUNT the whole inventory, derive a tail offset from that count, and
+// then read up to 5,000 WHOLE rows from that deep offset every collection interval to find a
+// minimum — three compounding costs to compute one number per topic, and past its scan cap it
+// reported a LOWER BOUND, which is an age an alert cannot fire on.
+//
+// One MIN per group replaces all of it, exactly, and the group key is the resolved dead-letter
+// topic so a row stranded in `failed` with no dlt_topic yet is attributed to the sibling it is
+// owed rather than dropped.
+func TestOldestDeadLetterAgeByTopic_IsOneGroupedAggregate(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	oldest := dbTimestamp(time.Now().Add(-42 * time.Minute))
+	newer := dbTimestamp(time.Now().Add(-3 * time.Minute))
+
+	mock.ExpectQuery("").
+		WithArgs(model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed, ".dlt").
+		WillReturnRows(sqlmock.NewRows([]string{"dead_letter_topic", "oldest", "outstanding"}).
+			AddRow("blnk.transactions.dlt", oldest, int64(7)).
+			AddRow("blnk.balances.dlt", newer, int64(1)))
+
+	ages, err := ds.OldestDeadLetterAgeByTopic(context.Background(), ".dlt")
+	require.NoError(t, err)
+
+	require.Len(t, ages, 2)
+	assert.Equal(t, "blnk.transactions.dlt", ages[0].Topic)
+	assert.Equal(t, oldest, ages[0].Oldest.UTC())
+	assert.Equal(t, int64(7), ages[0].Outstanding)
+	assert.Equal(t, "blnk.balances.dlt", ages[1].Topic)
+	assert.Equal(t, newer, ages[1].Oldest.UTC())
+	assert.Equal(t, int64(1), ages[1].Outstanding)
+
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+	assert.Contains(t, issued, "MIN(COALESCE(last_attempted_at, occurred_at))",
+		"the age is measured from the last attempt, falling back to occurrence for a row that never attempted")
+	assert.Contains(t, issued, "GROUP BY")
+	assert.NotContains(t, issued, "OFFSET",
+		"the deep tail offset this replaced is the cost PERF-P07 is about")
+	assert.NotContains(t, issued, "payload_raw",
+		"an aggregate over instants must not read a body")
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestOldestDeadLetterAgeByTopic_ErrorsAreWrapped covers the statement, scan and iteration
+// branches, so a failure to MEASURE the age is reported rather than read as an age of zero.
+func TestOldestDeadLetterAgeByTopic_ErrorsAreWrapped(t *testing.T) {
+	cases := map[string]func(sqlmock.Sqlmock){
+		"statement error": func(mock sqlmock.Sqlmock) {
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).WillReturnError(sql.ErrConnDone)
+		},
+		"scan error": func(mock sqlmock.Sqlmock) {
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+				WillReturnRows(sqlmock.NewRows([]string{"dead_letter_topic", "oldest", "outstanding"}).
+					AddRow("blnk.transactions.dlt", "not-a-timestamp", int64(1)))
+		},
+		"row iteration error": func(mock sqlmock.Sqlmock) {
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+				WillReturnRows(sqlmock.NewRows([]string{"dead_letter_topic", "oldest", "outstanding"}).
+					AddRow("blnk.transactions.dlt", time.Now().UTC(), int64(1)).
+					RowError(0, sql.ErrConnDone))
+		},
+	}
+
+	for name, script := range cases {
+		t.Run(name, func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			script(mock)
+
+			ages, err := ds.OldestDeadLetterAgeByTopic(context.Background(), ".dlt")
+			assert.Nil(t, ages)
+			requireAPIError(t, err, apierror.ErrInternalServer)
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+// planNodeReferencing returns the plan node that reaches needle: the scan line PLUS the
+// qualification lines that belong to it — Index Cond, Recheck Cond, Filter — which are the
+// more-indented lines that follow it before the next node.
+//
+// The qualifications are what decide whether a scan is confined, and the scan line alone cannot
+// say. `Index Scan using <a status-leading index>` reads the whole partial set or three narrow
+// key ranges depending entirely on whether an Index Cond restricts the status, and those are
+// completely different costs — so an assertion about confinement has to read the condition.
+//
+// Parameters:
+//   - planText string: the whole EXPLAIN output.
+//   - needle string: the relation reference identifying the node.
+//
+// Returns:
+//   - string: the node and its qualifications, newline-joined, or empty when the relation is
+//     not reached at all.
+func planNodeReferencing(planText, needle string) string {
+	lines := strings.Split(planText, "\n")
+
+	for index, line := range lines {
+		if !strings.Contains(line, needle) {
+			continue
+		}
+
+		node := []string{strings.TrimSpace(line)}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+
+		for _, following := range lines[index+1:] {
+			trimmed := strings.TrimSpace(following)
+			if trimmed == "" {
+				break
+			}
+
+			followingIndent := len(following) - len(strings.TrimLeft(following, " "))
+			if followingIndent <= indent || strings.Contains(trimmed, "->") {
+				// A sibling or a child node, not a qualification of this one.
+				break
+			}
+
+			node = append(node, trimmed)
+		}
+
+		return strings.Join(node, "\n")
+	}
+
+	return ""
+}
+
+// planScanIsConfinedToBlockingStates reports whether a plan node can only reach rows in the
+// relay's blocking states.
+//
+// TWO ways to satisfy it, and both are genuine:
+//
+//   - the scan reads a PARTIAL index whose predicate is the blocking-state set, so terminal
+//     rows are not in the index at all; or
+//   - the scan carries an Index Cond restricting status to the blocking states, so terminal
+//     rows are in the index but in other key ranges and are never read.
+//
+// Asserting the PROPERTY rather than a list of index names is what stops this from testing the
+// planner's mood. It is also the stronger statement: a name list admits any plan through a named
+// index, including a full partial-index scan with no condition at all, and rejects a plan that
+// honours the guarantee through an index the list has not heard of.
+//
+// Parameters:
+//   - node string: the plan node and its qualifications, from planNodeReferencing.
+//
+// Returns:
+//   - bool: true when the node cannot read a terminal row.
+func planScanIsConfinedToBlockingStates(node string) bool {
+	for _, partial := range []string{
+		"idx_event_outbox_claim",
+		"idx_event_outbox_claim_order",
+		"idx_event_outbox_partition_key_inflight",
+		"idx_event_outbox_pending",
+	} {
+		if strings.Contains(node, partial) {
+			return true
+		}
+	}
+
+	// An index condition on status confines the scan by key range. It must name ONLY blocking
+	// states: a condition mentioning a terminal literal would be reading exactly what the
+	// guarantee forbids.
+	for _, line := range strings.Split(node, "\n") {
+		if !strings.HasPrefix(line, "Index Cond:") || !strings.Contains(line, "status") {
+			continue
+		}
+
+		for _, terminal := range []string{
+			model.EventOutboxStatusDispatched,
+			model.EventOutboxStatusFailed,
+			model.EventOutboxStatusDeadLettered,
+			model.EventOutboxStatusReplaying,
+		} {
+			if strings.Contains(line, terminal) {
+				return false
+			}
+		}
+
+		if strings.Contains(line, model.EventOutboxStatusPending) ||
+			strings.Contains(line, model.EventOutboxStatusProcessing) ||
+			strings.Contains(line, model.EventOutboxStatusWebhookPending) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// TestPlanScanIsConfinedToBlockingStates covers the confinement rule directly.
+//
+// It exists because the assertion that uses it lives in a _RealDB test whose plan depends on the
+// planner, so the rule itself has to be provable without one. Every case below is a plan shape
+// PostgreSQL actually produces for the claim query, and the rule has to get all of them right:
+// the whole point of replacing a list of index names was to stop admitting plans that read
+// terminal rows and stop rejecting plans that do not.
+func TestPlanScanIsConfinedToBlockingStates(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		node     string
+		confined bool
+		why      string
+	}{
+		{
+			name:     "a blocking-state partial index needs no condition",
+			node:     "->  Index Scan using idx_event_outbox_claim on event_outbox candidate",
+			confined: true,
+			why:      "terminal rows are not in the index at all",
+		},
+		{
+			name:     "the claim-order index is equally partial",
+			node:     "->  Index Scan using idx_event_outbox_claim_order on event_outbox candidate",
+			confined: true,
+			why:      "sql/1781249000.sql declares it over exactly the blocking states",
+		},
+		{
+			name:     "the inflight index the anti-join probes",
+			node:     "->  Index Scan using idx_event_outbox_partition_key_inflight on event_outbox earlier",
+			confined: true,
+		},
+		{
+			name: "a status-leading read-path index WITH a blocking-state condition",
+			node: "->  Index Scan using idx_event_outbox_status_open on event_outbox candidate\n" +
+				"Index Cond: (status = ANY ('{pending,processing,webhook_pending}'::text[]))\n" +
+				"Filter: ((attempts < max_attempts) AND (next_attempt_at <= now()))",
+			confined: true,
+			why: "the terminal entries are in other key ranges of the same index and are " +
+				"never visited, so the poll does not read them",
+		},
+		{
+			name: "the same index with NO condition is NOT confined",
+			node: "->  Index Scan using idx_event_outbox_status_open on event_outbox candidate\n" +
+				"Filter: (status = ANY ('{pending,processing,webhook_pending}'::text[]))",
+			confined: false,
+			why: "a filter is applied AFTER the row is read, so every dead-lettered and failed " +
+				"entry in the index is read and discarded on every poll — which is exactly the " +
+				"cost the guarantee forbids, and a name list would have admitted it",
+		},
+		{
+			name: "a condition naming a terminal state is NOT confined",
+			node: "->  Index Scan using idx_event_outbox_status_open on event_outbox candidate\n" +
+				"Index Cond: (status = ANY ('{pending,dead_lettered}'::text[]))",
+			confined: false,
+			why:      "it reads dead-lettered rows by construction",
+		},
+		{
+			name:     "a sequential scan is never confined",
+			node:     "->  Seq Scan on event_outbox candidate\nFilter: (status = ANY ('{pending}'::text[]))",
+			confined: false,
+		},
+		{
+			name:     "the primary key is not confined",
+			node:     "->  Index Scan using event_outbox_pkey on event_outbox\nIndex Cond: (id = 42)",
+			confined: false,
+			why:      "it indexes every row in every state",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, testCase.confined, planScanIsConfinedToBlockingStates(testCase.node),
+				testCase.why)
+		})
+	}
+}
+
+// TestPlanNodeReferencing_CarriesTheQualificationsWithTheScan covers the node extractor.
+//
+// The qualification lines are the whole reason this exists: the scan line alone cannot say
+// whether the scan is confined, so an extractor that returned only that line would make the
+// confinement rule unable to tell the two plans in the cases above apart.
+func TestPlanNodeReferencing_CarriesTheQualificationsWithTheScan(t *testing.T) {
+	t.Parallel()
+
+	plan := "Sort  (cost=86.86..86.88 rows=7 width=541)\n" +
+		"  Sort Key: claimed.occurred_at, claimed.id\n" +
+		"  CTE candidates\n" +
+		"    ->  Limit  (cost=28.12..28.20 rows=7 width=28)\n" +
+		"          ->  Hash Anti Join  (cost=14.01..28.02 rows=7 width=28)\n" +
+		"                Hash Cond: (candidate.partition_key = earlier.partition_key)\n" +
+		"                ->  Index Scan using idx_event_outbox_status_open on event_outbox candidate\n" +
+		"                      Index Cond: (status = ANY ('{pending,processing,webhook_pending}'::text[]))\n" +
+		"                      Filter: (attempts < max_attempts)\n" +
+		"                ->  Index Scan using idx_event_outbox_claim on event_outbox earlier\n" +
+		"                      Index Cond: (status = ANY ('{pending,processing}'::text[]))\n"
+
+	candidate := planNodeReferencing(plan, "event_outbox candidate")
+
+	assert.Contains(t, candidate, "idx_event_outbox_status_open")
+	assert.Contains(t, candidate, "Index Cond: (status = ANY ('{pending,processing,webhook_pending}'::text[]))",
+		"the condition that confines the scan must travel with it")
+	assert.Contains(t, candidate, "Filter: (attempts < max_attempts)")
+	assert.NotContains(t, candidate, "event_outbox earlier",
+		"the SIBLING node must not be absorbed, or one node's condition would qualify another's scan")
+	assert.NotContains(t, candidate, "Hash Cond",
+		"nor may the PARENT's qualification, which belongs to the join rather than to this scan")
+
+	earlier := planNodeReferencing(plan, "event_outbox earlier")
+	assert.Contains(t, earlier, "idx_event_outbox_claim")
+	assert.Contains(t, earlier, "Index Cond: (status = ANY ('{pending,processing}'::text[]))")
+
+	assert.Empty(t, planNodeReferencing(plan, "event_outbox nonexistent"),
+		"a relation the plan never reaches must return nothing, so require.NotEmpty can catch it")
+}
+
+// TestAuditTerminalEventRecords_CountsClaimsAndTheirCorroboration pins the audit query.
+//
+// The three counts and the predicate ARE the finding's resolution, so each is asserted against
+// the SQL rather than only against a result:
+//
+//   - COUNT(kafka_offset) is what separates a claim that names a record from one that does not.
+//     SQL COUNT of an expression ignores NULLs, which is why the confirmed count needs no CASE.
+//   - COUNT(DISTINCT (…)) is the schema-integrity check: two rows naming one record would make
+//     it lower than the confirmed count, which the partial unique index should make impossible.
+//   - The predicate must include webhook_pending rows through kafka_dispatched_at. Restricting
+//     it to the terminal statuses would leave their records unaccounted for on the broker side
+//     and loosen the reconciliation during exactly the dual-delivery window it matters most in.
+func TestAuditTerminalEventRecords_CountsClaimsAndTheirCorroboration(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	window := time.Now().UTC().Add(-3 * time.Hour).Truncate(time.Microsecond)
+
+	mock.ExpectQuery("").
+		WithArgs(model.EventOutboxStatusDeadLettered, window).
+		WillReturnRows(sqlmock.NewRows([]string{"published_rows", "confirmed_rows", "distinct_records"}).
+			AddRow(int64(1_000), int64(990), int64(990)))
+
+	audit, err := ds.AuditTerminalEventRecords(context.Background(), window)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(1_000), audit.PublishedRows)
+	assert.Equal(t, int64(990), audit.ConfirmedRows)
+	assert.Equal(t, int64(10), audit.UnconfirmedRows())
+	assert.False(t, audit.FullyConfirmed(),
+		"ten rows claim a publication nothing corroborates, so the count cannot be trusted")
+	assert.WithinDuration(t, time.Now(), audit.MeasuredAt, time.Minute)
+	assert.Equal(t, window, audit.WindowStart,
+		"the audit must REPORT the population it measured, or the broker side cannot be compared against the same one")
+
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "COUNT(kafka_offset)")
+	assert.Contains(t, issued, "COUNT(DISTINCT (kafka_topic, kafka_partition, kafka_offset))")
+	assert.Contains(t, issued, "FILTER (WHERE kafka_offset IS NOT NULL)",
+		"a row constructor of all NULLs is not NULL in PostgreSQL, so without the filter every "+
+			"coordinate-less row collapses into one phantom record and DistinctRecords exceeds ConfirmedRows")
+
+	// PERF-P05: the audit is WINDOWED, and both arms of the window are load-bearing.
+	assert.Contains(t, issued, "WHERE kafka_dispatched_at >= $2",
+		"the publication instant is what has to fall inside the window for the row to be comparable "+
+			"against records the broker wrote inside it")
+	assert.Contains(t, issued, "(status = $1 AND last_attempted_at >= $2)",
+		"a dead-lettered row has no kafka_dispatched_at; excluding it would understate the outbox "+
+			"side and manufacture an apparent surplus")
+	assert.NotContains(t, issued, "kafka_dispatched_at IS NOT NULL",
+		"the unbounded predicate this replaced scanned the whole history every time it was read")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestAuditTerminalEventRecords_NormalisesTheWindow pins the same correction the status count
+// applies, for the same reason: an unbounded audit is the cost PERF-P05 is about, and a future
+// window would report zero published rows and read as total loss.
+func TestAuditTerminalEventRecords_NormalisesTheWindow(t *testing.T) {
+	for _, given := range []time.Time{{}, time.Now().UTC().Add(time.Hour)} {
+		db, mock := newSQLMock(t)
+		ds := Datasource{Conn: db}
+
+		before := time.Now().UTC()
+
+		mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+			WithArgs(model.EventOutboxStatusDeadLettered, sqlmock.AnyArg()).
+			WillReturnRows(sqlmock.NewRows([]string{"published_rows", "confirmed_rows", "distinct_records"}).
+				AddRow(int64(0), int64(0), int64(0)))
+
+		audit, err := ds.AuditTerminalEventRecords(context.Background(), given)
+		require.NoError(t, err)
+
+		assert.WithinDuration(t, before.Add(-defaultEventCountWindow), audit.WindowStart, time.Minute,
+			"a window nobody chose must be exactly one default window wide")
+		assert.True(t, audit.WindowStart.Before(time.Now().UTC()),
+			"and must be in the past, or the audit reports zero published rows and reads as total loss")
+		assert.NoError(t, mock.ExpectationsWereMet())
+	}
+}
+
+// TestAuditTerminalEventRecords_ReportsAFailureRatherThanAnEmptyAudit keeps the verdict honest.
+//
+// A zero audit reads as "nothing has been published", which is a legitimate state on a fresh
+// deployment — so returning one on a failed read would let a reconciliation conclude that
+// everything is accounted for precisely when it could not measure.
+func TestAuditTerminalEventRecords_ReportsAFailureRatherThanAnEmptyAudit(t *testing.T) {
+	db, mock := newSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("FROM blnk.event_outbox").WillReturnError(sql.ErrConnDone)
+
+	audit, err := ds.AuditTerminalEventRecords(context.Background(), time.Time{})
+	requireAPIError(t, err, apierror.ErrInternalServer)
+	assert.Zero(t, audit.PublishedRows)
+	assert.Zero(t, audit.WindowStart,
+		"a failed audit must report no window either, so a caller cannot read it as a measured one")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB is the audit's own round trip.
+//
+// It builds each of the three shapes the predicate has to cover — a dispatched row that names its
+// record, a webhook_pending row whose Kafka leg completed, and a dispatched row with no
+// coordinate — and requires the audit to count them the way the reconciliation depends on. The
+// webhook_pending case is the one most easily got wrong: it is not terminal, but it IS on the
+// topic.
+func TestAuditTerminalEventRecords_SeesTheWholePublishedSet_RealDB(t *testing.T) {
+	ds := openLockedEventOutboxDB(t)
+	ctx := context.Background()
+
+	marker := newRealEventOutboxMarker("audit")
+	t.Cleanup(func() { quiesceEventOutbox(t, ds, marker) })
+
+	// One window for both readings, so the deltas below measure the same population twice
+	// (PERF-P05). Wide enough to contain every fixture this test publishes.
+	window := time.Now().UTC().Add(-time.Hour)
+
+	before, err := ds.AuditTerminalEventRecords(ctx, window)
+	require.NoError(t, err)
+
+	confirmed := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	pending := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	unconfirmed := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+	// A row that has NOT been published at all, which must not be counted by either total.
+	untouched := insertRealEventOutbox(t, ds, newEventOutboxFixture(marker))
+
+	claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+	require.NoError(t, err)
+
+	tokens := make(map[string]string, 4)
+	for _, row := range claimed {
+		if isMarkedEventOutbox(row, marker) {
+			tokens[row.EventID] = row.ClaimToken
+		}
+	}
+	require.Len(t, tokens, 4)
+
+	require.NoError(t, ds.MarkEventDispatched(ctx, confirmed.ID, tokens[confirmed.EventID],
+		eventOutboxBrokerRecord(marker, 0, 1)))
+
+	// Kafka leg done, HTTP leg outstanding. Not terminal, but on the topic — so it counts.
+	_, err = ds.MarkEventWebhookPending(ctx, pending.ID, tokens[pending.EventID],
+		"queue unreachable", time.Minute, eventOutboxBrokerRecord(marker, 1, 2))
+	require.NoError(t, err)
+
+	// Published, acknowledged, but the library reported no coordinate.
+	require.NoError(t, ds.MarkEventDispatched(ctx, unconfirmed.ID, tokens[unconfirmed.EventID],
+		model.BrokerRecord{}))
+
+	after, err := ds.AuditTerminalEventRecords(ctx, window)
+	require.NoError(t, err)
+
+	assert.Equal(t, window.Truncate(time.Microsecond), after.WindowStart.Truncate(time.Microsecond),
+		"the audit must report back the window it was asked for, since that is what the broker side is measured over")
+
+	assert.Equal(t, int64(3), after.PublishedRows-before.PublishedRows,
+		"the dispatched, the webhook_pending and the unconfirmed rows all claim a record; the "+
+			"untouched row (%d) does not", untouched.ID)
+	assert.Equal(t, int64(2), after.ConfirmedRows-before.ConfirmedRows,
+		"only the two rows carrying a coordinate name a record")
+	assert.Equal(t, int64(2), after.DistinctRecords-before.DistinctRecords,
+		"and those two coordinates are distinct")
+
+	// THE COORDINATE-LESS ROW MUST NOT COUNT AS A RECORD, and this is the assertion that says
+	// so unconditionally.
+	//
+	// The delta above used to be 3 on an EMPTY table and 2 on a polluted one, because
+	// COUNT(DISTINCT (topic, partition, offset)) counts the all-NULL row constructor as a
+	// distinct value: the unconfirmed row contributed one, unless some earlier test had already
+	// left a coordinate-less published row that contributed it first. So the test passed on
+	// residue and failed the moment fixtures started cleaning up after themselves.
+	//
+	// Stated as an INVARIANT rather than a delta because that is the contract both readers of
+	// this audit rely on: FullyConfirmed requires the two to be equal, and
+	// ReconcileAgainstOutbox derives duplication from their difference, so DistinctRecords
+	// exceeding ConfirmedRows is not a smaller version of the same answer — it is a
+	// wrong one.
+	assert.LessOrEqual(t, after.DistinctRecords, after.ConfirmedRows,
+		"a row that names no coordinate names no record: DistinctRecords may never exceed "+
+			"ConfirmedRows, or FullyConfirmed reports an inconclusive verdict on a healthy outbox "+
+			"and ReconcileAgainstOutbox derives a negative duplication count")
+
+	// The verdict this produces is the whole point: an unconfirmed claim makes it inconclusive
+	// rather than green, however favourable the totals look.
+	assert.False(t, after.FullyConfirmed(),
+		"one row claims a publication it cannot name a record for, so the count is not trustworthy")
+}
+
+// TestListDeadLetteredEvents_CoversBothTerminalFailureStates asserts the filter includes
+// failed AS WELL AS dead_lettered.
+//
+// A row becomes failed the moment its retry budget is spent, and dead_lettered only once
+// the event has additionally been written to its <topic>.dlt sibling. Listing only the
+// latter would HIDE events that exhausted their retries but whose dead-letter publication
+// itself failed — which are exactly the events an operator most needs to see, because they
+// are the ones sitting nowhere at all. The partial index idx_event_outbox_failed covers
+// both literals for this reason.
+func TestListDeadLetteredEvents_CoversBothTerminalFailureStates(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	deadLettered := model.EventOutbox{
+		ID: 2, EventID: "evt_dlt", EventType: "transaction.applied", AggregateID: "agg",
+		LedgerID: "ldg", Topic: "blnk.transactions", SchemaVersion: model.SchemaVersionV1,
+		Payload: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+		Status: model.EventOutboxStatusDeadLettered, Attempts: 5, MaxAttempts: 5,
+		DLTTopic: "blnk.transactions.dlt",
+	}
+	stranded := deadLettered
+	stranded.ID, stranded.EventID, stranded.Status, stranded.DLTTopic =
+		1, "evt_stranded", model.EventOutboxStatusFailed, ""
+
+	// The population is bound as the two status literals, which is the ONE rendering the
+	// page, the count and the age gauge all share — see deadLetterFilterClause.
+	mock.ExpectQuery("").
+		WithArgs(model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed, 50, 0).
+		WillReturnRows(newEventOutboxRows(deadLettered, stranded))
+
+	entries, err := ds.ListDeadLetteredEvents(context.Background(), model.DeadLetterQuery{})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"evt_dlt", "evt_stranded"}, eventIDsOf(entries),
+		"an event stranded in failed, whose dead-letter publication itself failed, must still be visible to an operator")
+
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+	assert.Contains(t, issued, "WHERE status IN ($1, $2)")
+	assert.Contains(t, issued, "ORDER BY occurred_at DESC, id DESC",
+		"triage starts from the most recent failures, and id breaks ties so paging cannot show or skip a row twice")
+	assert.Contains(t, issued, "LIMIT $3 OFFSET $4")
+	assert.NotContains(t, whereClauseOf(t, issued), "resolved_at",
+		"an UNFILTERED listing must show resolved and unresolved entries alike: it is the whole "+
+			"inventory, and narrowing it silently is what makes a page read as \"nothing is stuck\". "+
+			"Asserted on the WHERE clause because resolved_at is legitimately a PROJECTED column")
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL is the SEC-09 guard.
+//
+// # The defect
+//
+// A filtered page used to be assembled by reading UNFILTERED pages from the repository and
+// applying the predicates in Go, abandoning the walk after five thousand rows and logging a
+// warning. An operator filtering for a stuck event type therefore received a short page
+// that was indistinguishable from a complete one, and the only record that the scan had
+// given up was a log line they were not reading. During a loss investigation "nothing more
+// is stuck" is the most dangerous wrong answer this endpoint can give.
+//
+// The test asserts the predicates reach SQL, because that is what removes the bound rather
+// than reporting it: with a WHERE clause there is no walk to truncate, and LIMIT/OFFSET
+// pages the FILTERED set so an offset still skips matches rather than rows.
+func TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL(t *testing.T) {
+	cases := []struct {
+		name string
+
+		filter model.DeadLetterInventoryFilter
+
+		// limit and offset are the page as REQUESTED; zero exercises the repository default.
+		limit, offset int
+
+		// wantClauses are the SQL fragments that must appear, in the placeholder
+		// numbering the builder produces.
+		wantClauses []string
+
+		// wantArgs is every bound argument, in order, including the status population and
+		// the trailing LIMIT/OFFSET pair.
+		wantArgs []driver.Value
+
+		// forbidden are fragments that must NOT appear, which is how "this filter was
+		// not silently widened" is checked.
+		forbidden []string
+	}{
+		{
+			name:   "event type",
+			filter: model.DeadLetterInventoryFilter{EventType: "transaction.applied"},
+			wantClauses: []string{
+				"status IN ($1, $2)", "event_type = $3", "LIMIT $4 OFFSET $5",
+			},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				"transaction.applied", defaultDeadLetterPageSize, 0,
+			},
+			forbidden: []string{"topic = $", "resolved_at"},
+		},
+		{
+			// The STORED topic column, matched exactly. topic is NOT NULL and
+			// CHECK-constrained non-blank, so this is equivalent to the Go-side
+			// original-topic resolution it replaced for every row the table can hold.
+			name:        "original topic",
+			filter:      model.DeadLetterInventoryFilter{Topic: "blnk.transactions"},
+			wantClauses: []string{"topic = $3", "LIMIT $4 OFFSET $5"},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				"blnk.transactions", defaultDeadLetterPageSize, 0,
+			},
+			forbidden: []string{"event_type = $"},
+		},
+		{
+			// A status filter REPLACES the two-literal population rather than being added
+			// to it: the requested status is one of those two, so the wider predicate
+			// beside it would be redundant. The narrowing is what is asserted — that the
+			// statement selects one state and not both.
+			name:        "status narrows the population further",
+			filter:      model.DeadLetterInventoryFilter{Status: model.EventOutboxStatusFailed},
+			wantClauses: []string{"status = $1", "LIMIT $2 OFFSET $3"},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusFailed, defaultDeadLetterPageSize, 0,
+			},
+			forbidden: []string{"status IN ("},
+		},
+		{
+			name:        "unresolved only",
+			filter:      model.DeadLetterInventoryFilter{UnresolvedOnly: true},
+			wantClauses: []string{"resolved_at IS NULL", "LIMIT $3 OFFSET $4"},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				defaultDeadLetterPageSize, 0,
+			},
+			forbidden: []string{"resolved_at IS NOT NULL"},
+		},
+		{
+			name:        "resolved only",
+			filter:      model.DeadLetterInventoryFilter{ResolvedOnly: true},
+			wantClauses: []string{"resolved_at IS NOT NULL"},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				defaultDeadLetterPageSize, 0,
+			},
+		},
+		{
+			// Every predicate at once, which is what proves the placeholder arithmetic
+			// holds as clauses accumulate rather than only in isolation.
+			name: "every predicate together",
+			filter: model.DeadLetterInventoryFilter{
+				EventType:      "balance.created",
+				Topic:          "blnk.balances",
+				Status:         model.EventOutboxStatusDeadLettered,
+				UnresolvedOnly: true,
+			},
+			limit:  25,
+			offset: 10,
+			wantClauses: []string{
+				"status = $1", "event_type = $2", "topic = $3",
+				"resolved_at IS NULL", "LIMIT $4 OFFSET $5",
+			},
+			wantArgs: []driver.Value{
+				model.EventOutboxStatusDeadLettered, "balance.created", "blnk.balances", 25, 10,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, captured := newCapturingSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			mock.ExpectQuery("").WithArgs(tc.wantArgs...).WillReturnRows(newEventOutboxRows())
+
+			_, err := ds.ListDeadLetteredEventsFiltered(
+				context.Background(), tc.filter, tc.limit, tc.offset)
+			require.NoError(t, err)
+
+			require.Len(t, *captured, 1)
+			issued := (*captured)[0]
+			for _, clause := range tc.wantClauses {
+				assert.Contains(t, issued, clause,
+					"the predicate must reach SQL; filtering in Go is what allowed a page to be "+
+						"silently short")
+			}
+			predicate := whereClauseOf(t, issued)
+			for _, clause := range tc.forbidden {
+				assert.NotContains(t, predicate, clause,
+					"a filter that was not requested must not appear: an inventory endpoint that "+
+						"narrows what it was not asked to narrow reports less loss than there is")
+			}
+
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+// TestCountDeadLetteredEvents_CountsTheSamePopulationTheListingPages is the other half of
+// SEC-09.
+//
+// include_count used to be REFUSED alongside an event_type or topic filter, because no
+// filter-aware count existed. That refusal removed the one check that would have caught the
+// truncated walk: an operator could not compare their page against a total. The count must
+// therefore render the IDENTICAL predicate the listing renders — which it does by sharing
+// the builder, and which this test pins by comparing the two statements clause for clause.
+func TestCountDeadLetteredEvents_CountsTheSamePopulationTheListingPages(t *testing.T) {
+	filter := model.DeadLetterInventoryFilter{
+		EventType:      "transaction.applied",
+		Topic:          "blnk.transactions",
+		Status:         model.EventOutboxStatusDeadLettered,
+		UnresolvedOnly: true,
+	}
+
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("").
+		WithArgs(model.EventOutboxStatusDeadLettered, "transaction.applied",
+			"blnk.transactions", defaultDeadLetterPageSize, 0).
+		WillReturnRows(newEventOutboxRows())
+	mock.ExpectQuery("").
+		WithArgs(model.EventOutboxStatusDeadLettered, "transaction.applied",
+			"blnk.transactions").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(417)))
+
+	_, err := ds.ListDeadLetteredEventsFiltered(context.Background(), filter, 0, 0)
+	require.NoError(t, err)
+
+	total, err := ds.CountDeadLetteredEvents(context.Background(), filter)
+	require.NoError(t, err)
+	assert.Equal(t, int64(417), total)
+
+	require.Len(t, *captured, 2)
+	listWhere := whereClauseOf(t, (*captured)[0])
+	countWhere := whereClauseOf(t, (*captured)[1])
+
+	assert.Equal(t, listWhere, countWhere,
+		"the page and its total must be about the SAME rows; two independently assembled "+
+			"predicates would let a total describe a population the page was not drawn from, "+
+			"and that comparison is the completeness check the truncated walk defeated")
+	assert.Contains(t, (*captured)[1], "SELECT COUNT(*)")
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// whereClauseOf extracts a statement's WHERE clause up to the next top-level keyword, so
+// two statements that SELECT different things can be compared on the predicate alone.
+func whereClauseOf(t *testing.T, statement string) string {
+	t.Helper()
+
+	idx := strings.Index(statement, "WHERE ")
+	require.NotEqual(t, -1, idx, "statement has no WHERE clause: %s", statement)
+
+	clause := statement[idx+len("WHERE "):]
+	// RETURNING is cut for the same reason the rest are: an UPDATE's projection legitimately
+	// names every column of the row, so a predicate assertion made over the whole statement
+	// would assert the opposite of what it reads as.
+	for _, keyword := range []string{"ORDER BY", "LIMIT", "GROUP BY", "RETURNING"} {
+		if cut := strings.Index(clause, keyword); cut != -1 {
+			clause = clause[:cut]
+		}
+	}
+
+	return strings.Join(strings.Fields(clause), " ")
+}
+
+// TestListDeadLetteredEvents_NormalisesPagination asserts a malformed page request
+// degrades to a sane one rather than scanning the table or failing.
+//
+// The upper cap is the load-bearing half: without it a caller could turn a triage
+// endpoint into a full table scan of an outbox that grows without bound, which is a
+// denial-of-service surface reachable from an authenticated operator endpoint.
+func TestListDeadLetteredEvents_NormalisesPagination(t *testing.T) {
+	cases := []struct {
+		name                  string
+		limit, offset         int
+		wantLimit, wantOffset int
+	}{
+		{"zero limit takes the default", 0, 0, defaultDeadLetterPageSize, 0},
+		{"negative limit takes the default", -10, 0, defaultDeadLetterPageSize, 0},
+		{"oversized limit is capped", maxDeadLetterPageSize + 1, 0, maxDeadLetterPageSize, 0},
+		{"limit at the cap is preserved", maxDeadLetterPageSize, 0, maxDeadLetterPageSize, 0},
+		{"negative offset is clamped to zero", 10, -5, 10, 0},
+		{"a valid page is passed through unchanged", 25, 75, 25, 75},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+				WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), tc.wantLimit, tc.wantOffset).
+				WillReturnRows(newEventOutboxRows())
+
+			_, err := ds.ListDeadLetteredEvents(context.Background(),
+				model.DeadLetterQuery{Limit: tc.limit, Offset: tc.offset})
+			require.NoError(t, err)
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+// TestListDeadLetteredEvents_ErrorsAreWrapped covers the statement, scan and row
+// iteration branches of the listing.
+func TestListDeadLetteredEvents_ErrorsAreWrapped(t *testing.T) {
+	valid := model.EventOutbox{
+		ID: 1, EventID: uuid.NewString(), EventType: "transaction.applied", AggregateID: "agg",
+		PartitionKey: "agg", LedgerID: "ldg", Topic: "blnk.transactions",
+		SchemaVersion: model.SchemaVersionV1,
+		Payload:       json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+		Status: model.EventOutboxStatusDeadLettered, MaxAttempts: 5,
+	}
+
+	cases := map[string]func(sqlmock.Sqlmock){
+		"statement error": func(mock sqlmock.Sqlmock) {
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).WillReturnError(sql.ErrConnDone)
+		},
+		"scan error": func(mock sqlmock.Sqlmock) {
+			// Built from the real row builder with occurred_at corrupted BY POSITION,
+			// so the cell count can never drift away from the projection.
+			cells := eventOutboxRow(valid)
+			cells[indexOfProjectedColumn(t, "occurred_at")] = "not-a-timestamp"
+
+			broken := sqlmock.NewRows(eventOutboxProjectedColumns()).AddRow(cells...)
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).WillReturnRows(broken)
+		},
+		"row iteration error": func(mock sqlmock.Sqlmock) {
+			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
+				WillReturnRows(newEventOutboxRows(valid).RowError(0, sql.ErrConnDone))
+		},
+	}
+
+	for name, script := range cases {
+		t.Run(name, func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			ds := Datasource{Conn: db}
+
+			script(mock)
+
+			entries, err := ds.ListDeadLetteredEvents(context.Background(),
+				model.DeadLetterQuery{Limit: 10})
+			assert.Nil(t, entries)
+			requireAPIError(t, err, apierror.ErrInternalServer)
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+// planLineReferencing WAS RETIRED HERE, in favour of planAccessPathFor.
+//
+// It returned the single plan LINE that mentioned a relation, and that is not where the index is
+// named when the planner chooses a bitmap plan: the relation line reads
+// `Bitmap Heap Scan on event_outbox candidate` and the index appears on the CHILD node beneath
+// it. An assertion made on the line alone therefore saw neither the word "Index" nor an index
+// name, and reported a defect against a plan that honoured the guarantee completely.
+//
+// planAccessPathFor returns the node together with its index children, which makes the guarantee
+// assertable under either plan shape without pinning the shape.
+// TestListDeadLetteredEvents_PagesNewestFirst_RealDB asserts the ordering and paging the
+// dead-letter API relies on, against real SQL.
+//
+// Triage starts from the most recent failures, so the listing is newest-first. The paging
+// assertion matters just as much as the ordering: with a non-deterministic tie-break a
+// row can appear on two pages or on none, and an operator working through a dead-letter
+// backlog would silently skip events.
+func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
+	ds := openLockedEventOutboxDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("dlt")
+	quiesceEventOutbox(t, ds, marker)
+
+	const total = 5
+	base := dbTimestamp(time.Now().Add(-time.Hour))
+	oldestFirst := make([]string, 0, total)
+	for i := 0; i < total; i++ {
+		entry := newEventOutboxFixture(marker)
+		entry.OccurredAt = base.Add(time.Duration(i) * time.Second)
+		insertRealEventOutbox(t, ds, entry)
+		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, claimEventOutboxToken(t, ds, entry),
+			entry.Topic+".dlt",
+			json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`), model.BrokerRecord{}))
+		oldestFirst = append(oldestFirst, entry.EventID)
+	}
+
+	// The expected listing order is the reverse of the insertion order, because the
+	// fixtures were inserted oldest-occurrence first and the listing is newest-first.
+	newestFirst := make([]string, 0, len(oldestFirst))
+	for i := len(oldestFirst) - 1; i >= 0; i-- {
+		newestFirst = append(newestFirst, oldestFirst[i])
+	}
+
+	mineFrom := func(entries []model.EventOutbox) []string {
+		mine := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			if isMarkedEventOutbox(entry, marker) {
+				mine = append(mine, entry.EventID)
+			}
+		}
+		return mine
+	}
+
+	// A single page large enough to hold every fixture: assert the ordering.
+	all, err := ds.ListDeadLetteredEvents(ctx,
+		model.DeadLetterQuery{Limit: maxDeadLetterPageSize})
+	require.NoError(t, err)
+	assert.Equal(t, newestFirst, mineFrom(all),
+		"the dead-letter inventory must be ordered newest occurrence first, because triage starts from the most recent failures")
+
+	// Walk the fixtures a page at a time and assert every one appears exactly once
+	// across the pages.
+	seen := map[string]int{}
+	for offset := 0; offset < len(all); offset += 2 {
+		page, pageErr := ds.ListDeadLetteredEvents(ctx,
+			model.DeadLetterQuery{Limit: 2, Offset: offset})
+		require.NoError(t, pageErr)
+		for _, eventID := range mineFrom(page) {
+			seen[eventID]++
+		}
+	}
+	for _, eventID := range oldestFirst {
+		assert.Equal(t, 1, seen[eventID],
+			"event %s appeared %d times across the pages; a non-deterministic tie-break makes an operator skip or repeat events", eventID, seen[eventID])
+	}
+}
+
+// requireColdHistoryExcludingIndex asserts that the index a plan line reaches the table
+// through is PARTIAL and excludes the dispatched state, which is the guarantee the claim's
+// index set exists to provide.
+//
+// # Why the property and not a name
+//
+// This replaced a list of index names that had to be widened twice, each time by a plan that
+// honoured the guarantee completely. Three indexes on blnk.event_outbox qualify —
+// idx_event_outbox_claim, idx_event_outbox_partition_key_inflight and
+// idx_event_outbox_status_open — and PostgreSQL chooses between them on cost, which moves with
+// heap compaction, statistics freshness and host load. A name list therefore encoded a guess
+// about the planner rather than a requirement on the schema, and it failed as a test while the
+// system was correct.
+//
+// The requirement is that the poll's cost does not grow with the outbox's history. The cold
+// history seeded by the caller is three thousand DISPATCHED rows against a working set of
+// twenty, so an index whose predicate excludes dispatched cannot be read past its working set
+// however large that history becomes. That is checked against pg_indexes rather than inferred
+// from a name, so a non-partial index — or a partial one whose predicate admits dispatched —
+// fails here even if it is added tomorrow under a name nobody thought to forbid.
+//
+// A note on what is deliberately NOT required: that the predicate exclude every terminal
+// state. idx_event_outbox_status_open admits failed and dead_lettered, and that is acceptable
+// because those rows are the dead-letter inventory an operator is expected to clear — bounded
+// by triage, alerted on by blnk_dlt_oldest_message_age_seconds, and orders of magnitude
+// smaller than the dispatched history in any healthy pipeline. Requiring their exclusion would
+// reject a legitimate index for a population the system already has a control for.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - ds Datasource: used for its connection to read pg_indexes.
+//   - planLine string: the EXPLAIN line reaching the relation under assertion.
+//   - planText string: the whole plan, included in a failure so it can be read in context.
+//   - subject string: what the line is doing, for the failure message.
+//   - marker string: the caller's row-id prefix, so the predicate is evaluated against THIS
+//     test's seeded rows and not against whatever a concurrent run left in the shared table.
+func requireColdHistoryExcludingIndex(
+	t *testing.T,
+	ds Datasource,
+	planLine, planText, subject, marker string,
+) {
+	t.Helper()
+
+	index := indexNameFromPlanLine(planLine)
+	require.NotEmpty(t, index,
+		"%s must name the index it read: neither an \"Index Scan using <name>\" nor a "+
+			"\"Bitmap Index Scan on <name>\" could be parsed out of it.\nPlan line was: %s\nPlan was:\n%s",
+		subject, planLine, planText)
+
+	var definition string
+	require.NoError(t, ds.Conn.QueryRow(`
+		SELECT indexdef
+		FROM pg_indexes
+		WHERE schemaname = 'blnk' AND tablename = 'event_outbox' AND indexname = $1
+	`, index).Scan(&definition),
+		"%s read index %q, which must exist in the blnk schema", subject, index)
+
+	predicate, partial := indexPredicate(definition)
+	require.True(t, partial,
+		"%s must be served by a PARTIAL index. %q covers every row, so the poll reads the "+
+			"terminal history on every tick and its cost grows with the whole table.\nIndex was: %s",
+		subject, index, definition)
+
+	// EVALUATED BY POSTGRESQL, not pattern-matched. The predicate is spliced into a count over
+	// the rows this test seeded, so the question asked is the one that matters — "can a
+	// dispatched row be in this index?" — and it is answered by the same expression evaluator
+	// that decides what the index actually contains.
+	//
+	// A textual check cannot do this. The first attempt asserted the predicate did not mention
+	// 'dispatched' and failed on `status <> 'dispatched'`, which is the predicate that excludes
+	// it most explicitly of all. Every equivalent rewrite — a negation, an ANY over the
+	// complement, a NOT IN — would have needed its own special case, and each one is a chance to
+	// accept a predicate that admits the history. Counting is exact and needs none of them.
+	//
+	// Splicing SQL is safe here and only here: the text comes from pg_indexes for one fixed
+	// table in a test, so there is no untrusted input and no user-facing query involved.
+	// Both counts in one round trip, and the denominator is MEASURED rather than restated from
+	// the caller's constant: the message then reports what the table actually held when the plan
+	// was taken, which is the only number a reader can act on.
+	var seededCold, coldInIndex int
+	require.NoError(t, ds.Conn.QueryRow(`
+		SELECT COUNT(*) FILTER (WHERE status = 'dispatched'),
+		       COUNT(*) FILTER (WHERE status = 'dispatched' AND (`+predicate+`))
+		FROM blnk.event_outbox
+		WHERE event_id LIKE $1
+	`, marker+"%").Scan(&seededCold, &coldInIndex),
+		"evaluating index %q's predicate against the seeded rows must succeed.\nPredicate was: %s",
+		index, predicate)
+
+	require.NotZero(t, seededCold,
+		"the premise must hold: this assertion is meaningless unless a cold history was seeded, "+
+			"and finding none means the fixture did not land rather than that the index is sound")
+
+	assert.Zero(t, coldInIndex,
+		"%s must be served by an index that EXCLUDES the delivered history, which is what keeps "+
+			"the poll's cost independent of how large that history has grown. Index %q admits %d "+
+			"of the %d dispatched rows this test seeded, so the relay would read them on every "+
+			"poll.\nPredicate was: %s\nPlan line was: %s\nPlan was:\n%s",
+		subject, index, coldInIndex, seededCold, predicate, planLine, planText)
+}
+
+// indexPredicate returns the WHERE clause of an index definition.
+//
+// The clause is read out of pg_indexes' own rendering rather than being reconstructed, so the
+// assertion above compares against what PostgreSQL says the index is, not against what a
+// migration file says it should be — which is the difference between checking the database and
+// checking a document.
+//
+// Parameters:
+//   - definition string: an indexdef as pg_indexes reports it.
+//
+// Returns:
+//   - string: the predicate text, without the WHERE keyword. Empty when the index is total.
+//   - bool: whether the index is partial at all.
+func indexPredicate(definition string) (string, bool) {
+	_, after, found := strings.Cut(definition, " WHERE ")
+	if !found {
+		return "", false
+	}
+
+	return strings.TrimSpace(after), true
+}
+
+// TestTerminalTransitionsHoldTheSettlementLease_RealDB is the two-claimant hand-off, walked
+// against the real table for BOTH terminal transitions.
+//
+// # The race it closes
+//
+// A worker that exhausts a row's retry budget still owes two things: the write to the
+// `<topic>.dlt` sibling, and the MarkEventDeadLettered that records it. Its claim token is
+// retained so that only it may perform them. That was not enough, because the dead-letter
+// repair claim admits any failed row with no dlt_topic whose lease is released — and both
+// terminal transitions released the lease. A second relay could therefore claim the row, stamp
+// its own token and publish the event to the dead-letter topic while the owner was still
+// publishing it there. The database refused the owner's now-stale MarkEventDeadLettered, so the
+// TABLE stayed consistent and the TOPIC did not: the same failed event appeared twice, and an
+// operator triaging a backlog cannot distinguish that from a genuinely repeated failure.
+//
+// # What is asserted, and why in this order
+//
+// Exclusivity first, recovery second. Exclusivity alone would be a wall rather than a window —
+// an owner that dies mid-settlement would strand the event in the only table that holds it — so
+// the expiry case is asserted immediately afterwards to pin that the lease is a lease.
+//
+// Both transitions are covered because they reach the terminal state by different routes:
+// MarkEventFailed by spending the budget, MarkEventPermanentlyFailed by the publisher's verdict
+// with budget to spare. Fixing one and not the other would leave the race live on whichever was
+// missed, and nothing else in the suite would notice.
+func TestTerminalTransitionsHoldTheSettlementLease_RealDB(t *testing.T) {
+	cases := map[string]struct {
+		maxAttempts int
+		exhaust     func(t *testing.T, ds Datasource, ctx context.Context, id int64, token string) model.EventFailureOutcome
+	}{
+		"the exhaustion arm of MarkEventFailed": {
+			maxAttempts: 1,
+			exhaust: func(t *testing.T, ds Datasource, ctx context.Context, id int64, token string) model.EventFailureOutcome {
+				t.Helper()
+
+				outcome, err := ds.MarkEventFailed(ctx, id, token, "broker unavailable", 0, false, testSettlementLease)
+				require.NoError(t, err)
+				require.True(t, outcome.Exhausted, "a one-attempt budget must be spent by one failure")
+
+				return outcome
+			},
+		},
+		"MarkEventPermanentlyFailed with budget to spare": {
+			maxAttempts: 5,
+			exhaust: func(t *testing.T, ds Datasource, ctx context.Context, id int64, token string) model.EventFailureOutcome {
+				t.Helper()
+
+				outcome, err := ds.MarkEventPermanentlyFailed(ctx, id, token, "topic authorization failed", testSettlementLease)
+				require.NoError(t, err)
+				require.True(t, outcome.Exhausted, "a permanent failure ends the event whatever the budget says")
+
+				return outcome
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ds := openLockedEventOutboxDB(t)
+			ctx := context.Background()
+			marker := newRealEventOutboxMarker("dltlease")
+			quiesceEventOutbox(t, ds, marker)
+
+			entry := newEventOutboxFixture(marker)
+			entry.OccurredAt = dbTimestamp(time.Now().Add(-time.Hour))
+			entry.MaxAttempts = tc.maxAttempts
+			insertRealEventOutbox(t, ds, entry)
+
+			claimed, err := ds.ClaimPendingEventOutbox(ctx, 100, 5*time.Minute)
+			require.NoError(t, err)
+
+			var token string
+			for _, row := range claimed {
+				if row.EventID == entry.EventID {
+					token = row.ClaimToken
+				}
+			}
+			require.NotEmpty(t, token, "the fixture must be claimed before it can be failed")
+
+			outcome := tc.exhaust(t, ds, ctx, entry.ID, token)
+			require.Equal(t, model.EventOutboxStatusFailed, outcome.Status)
+			require.Equal(t, token, outcome.ClaimToken,
+				"the owner keeps its token, because only it may complete the dead-letter hand-off")
+
+			// EXCLUSIVITY. The row is failed with no dlt_topic — the repair claim's whole target
+			// set — and must still be unreachable, because its owner has not finished with it.
+			held, err := ds.ClaimFailedEventOutboxForDeadLetter(ctx, 20, time.Minute)
+			require.NoError(t, err)
+			assert.False(t, containsEventID(held, entry.EventID),
+				"a second claimant must not reach a row whose owner still holds the settlement lease; "+
+					"if it does, both write the same failed event to the dead-letter topic")
+
+			stored, err := ds.GetEventByID(ctx, entry.EventID)
+			require.NoError(t, err)
+			require.NotNil(t, stored.LockedUntil,
+				"the terminal transition must leave a lease behind, not NULL")
+			assert.True(t, stored.LockedUntil.After(time.Now()),
+				"and that lease must still be in the future, or it protects nothing")
+			assert.Equal(t, token, stored.ClaimToken,
+				"the second claimant must not have re-stamped the row's token")
+
+			// RECOVERY. Expiring the lease is what a dead owner looks like from the database's
+			// side, and the row must then be repairable — with a FRESH token, because the
+			// original owner is by hypothesis gone and must not be able to settle behind us.
+			_, err = ds.Conn.ExecContext(ctx,
+				"UPDATE blnk.event_outbox SET locked_until = NOW() - interval '1 minute' WHERE id = $1", entry.ID)
+			require.NoError(t, err)
+
+			repair, err := ds.ClaimFailedEventOutboxForDeadLetter(ctx, 20, time.Minute)
+			require.NoError(t, err)
+			require.True(t, containsEventID(repair, entry.EventID),
+				"once the lease expires the row must be recoverable, or an owner that died mid-settlement "+
+					"strands the event in the only table that holds it")
+
+			for _, row := range repair {
+				if row.EventID == entry.EventID {
+					assert.NotEqual(t, token, row.ClaimToken,
+						"the repair must issue a fresh token so the dead owner's stale one is fenced out")
+					assert.Equal(t, model.EventOutboxStatusFailed, row.Status,
+						"the repair must not move the row out of failed: doing so would put it back into the "+
+							"ordinary claim's blocking set and stall every later event of its aggregate")
+				}
+			}
+		})
+	}
+}
+
+// TestListDeadLetteredEvents_WindowIsAnIndexConditionRatherThanAFilter_RealDB is the
+// performance half of the window, and it asserts the one property that is this query's to
+// guarantee: both bounds reach the index as an INDEX CONDITION, so the scan starts and stops
+// at the window instead of reading the terminal-state rows and discarding most of them.
+//
+// # Why the assertion is on the index condition and not on the absence of a Seq Scan
+//
+// Whether the planner reaches for the index at all is a COST decision that depends on how
+// many rows the table holds and how many of them are in a terminal failure state. On a small
+// or freshly migrated table a sequential scan is genuinely cheaper and choosing it is
+// correct, so "the plan contains no Seq Scan" reports a defect on an empty database that is
+// not one — the same reasoning the claim-index assertion records for not pinning an index
+// name.
+//
+// What must hold at every table size is that the predicate is SARGABLE: written so that the
+// planner CAN push it into an index traversal. That is what the nullable-parameter form
+// (`$5 IS NULL OR occurred_at >= $5`) has to earn — a bound wrapped in a function, compared
+// against a differently-typed value, or written so the NULL guard cannot be folded away would
+// still return the right rows while degrading into a post-scan Filter, and only a plan
+// assertion catches that. Index paths are made preferable for the duration of one transaction
+// so the choice is decided rather than guessed at; the setting is LOCAL and the transaction is
+// rolled back, so it cannot leak to another test or another connection.
+//
+// The foreign-index guard applies here for the same reason it applies to the claim index: a
+// shared database may carry an index this repository does not declare.
+func TestListDeadLetteredEvents_WindowIsAnIndexConditionRatherThanAFilter_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	after := time.Now().UTC().Add(-48 * time.Hour)
+	before := time.Now().UTC()
+
+	// The supporting index, asserted where it is declared. The plan below is only possible
+	// because this index exists, so a missing or redefined index should fail HERE with the
+	// definition in the message rather than as an opaque plan mismatch.
+	var indexDefinition string
+	require.NoError(t, ds.Conn.QueryRowContext(ctx, `
+		SELECT indexdef FROM pg_indexes
+		WHERE schemaname = 'blnk' AND tablename = 'event_outbox'
+		  AND indexname = 'idx_event_outbox_failed'
+	`).Scan(&indexDefinition),
+		"the terminal-state index must exist: sql/1781248800.sql declares it and the windowed "+
+			"listing is planned against it")
+	assert.Contains(t, indexDefinition, "occurred_at",
+		"the window is bounded on occurred_at, so occurred_at must be an index column: %s", indexDefinition)
+	assert.Contains(t, indexDefinition, "status",
+		"the listing selects the two terminal states, so status must lead the index: %s", indexDefinition)
+
+	tx, err := ds.Conn.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	// LOCAL, so it dies with this transaction and no other test or connection sees it.
+	_, err = tx.ExecContext(ctx, "SET LOCAL enable_seqscan = off")
+	require.NoError(t, err)
+
+	rows, err := tx.QueryContext(ctx, `
+		EXPLAIN SELECT `+eventOutboxColumns+`
+		FROM blnk.event_outbox
+		WHERE status IN ($1, $2)
+		  AND ($5::timestamptz IS NULL OR occurred_at >= $5::timestamptz)
+		  AND ($6::timestamptz IS NULL OR occurred_at <= $6::timestamptz)
+		ORDER BY occurred_at DESC, id DESC
+		LIMIT $3 OFFSET $4
+	`,
+		model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+		20, 0, nullableTime(after), nullableTime(before),
+	)
+	require.NoError(t, err, "EXPLAIN of the windowed listing must succeed")
+	defer func() { _ = rows.Close() }()
+
+	var (
+		plan            strings.Builder
+		indexConditions []string
+		filters         []string
+		indexScanLines  []string
+	)
+	for rows.Next() {
+		var line string
+		require.NoError(t, rows.Scan(&line))
+		plan.WriteString(line)
+		plan.WriteString("\n")
+
+		trimmed := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "->"))
+		switch {
+		case strings.HasPrefix(trimmed, "Index Cond:"):
+			indexConditions = append(indexConditions, trimmed)
+		case strings.HasPrefix(trimmed, "Filter:"):
+			filters = append(filters, trimmed)
+		case strings.Contains(trimmed, "Index Scan") || strings.Contains(trimmed, "Index Only Scan"):
+			indexScanLines = append(indexScanLines, trimmed)
+		}
+	}
+	require.NoError(t, rows.Err())
+
+	planText := plan.String()
+	require.NotEmpty(t, planText)
+
+	for _, line := range indexScanLines {
+		if foreign := unknownEventOutboxIndexIn(t, ctx, ds, line); foreign != "" {
+			t.Skipf("the planner chose %q, an index this repository does not declare — a shared "+
+				"database carries it, so this plan says nothing about the schema under test.\n"+
+				"Plan was:\n%s", foreign, planText)
+		}
+	}
+
+	condition := strings.Join(indexConditions, "\n")
+	assert.Contains(t, condition, "occurred_at >=",
+		"the LOWER bound must be an index condition, not a post-scan filter: a scan that started at "+
+			"the top of the terminal-state rows and discarded everything before the window reads the "+
+			"whole failure history to answer a one-hour question.\nPlan was:\n"+planText)
+	assert.Contains(t, condition, "occurred_at <=",
+		"the UPPER bound must be an index condition too, so the scan stops at the window rather "+
+			"than running to the end of the index.\nPlan was:\n"+planText)
+
+	for _, filter := range filters {
+		assert.NotContains(t, filter, "occurred_at",
+			"a bound that lands in a Filter has been evaluated AFTER the rows were read, which is the "+
+				"non-sargable form this predicate is written to avoid.\nPlan was:\n"+planText)
+	}
+}
+
+// Three window tests that arrived with this feature are GONE, and the property each pinned is
+// asserted elsewhere in this file against the shape the repository actually has.
+//
+// They were written for a listing whose window was two fixed placeholders bound from *time.Time,
+// and for a count that returned a per-status map. This repository narrows through
+// model.DeadLetterQuery and deadLetterFilterClause, which builds ONE predicate — status, event
+// type, topic, resolution AND the occurrence window — used by the page, the count and the age
+// gauge alike, and returns a single total:
+//
+//   - the binding of the bounds is covered by TestListDeadLetteredEventsFiltered_PushesEveryPredicateIntoSQL
+//     and TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL, which assert the whole
+//     predicate rather than the window alone;
+//   - the count agreeing with the page is covered by TestCountDeadLetteredEvents_CountsTheSamePredicateAsThePage
+//     and TestCountDeadLetteredEvents_CountsTheSamePopulationTheListingPages — the stronger form
+//     of the same guarantee, since sharing the clause is what makes them agree;
+//   - UTC normalisation of a supplied window is covered by TestCountEventOutboxByStatus_NormalisesTheWindow.
+//
+// The EXPLAIN test below is kept, because nothing else proves the bounds are INDEX CONDITIONS
+// rather than post-scan filters, and that is a property of the schema no unit test can reach.
+
+// unknownEventOutboxIndexIn reports the first index named in a plan line that no migration
+// in this repository creates, or "" when every index in the line is one this repository
+// declares.
+//
+// # Why this is derived from the migrations rather than listed here
+//
+// A hardcoded list of "our indexes" would be a second copy of the migrations, and the copy
+// that goes stale is the one nobody runs. Reading the embedded migration source means an
+// index added by a future migration is recognised the moment that migration exists, and an
+// index that only ever existed in somebody's shared database never is.
+//
+// It reads ../sql from disk rather than the embedded blnk.SQLFiles, and only because it must:
+// the root blnk package imports this one, so this in-package test file cannot import it back.
+// The two are the same bytes by construction — blnk.SQLFiles is `//go:embed sql/*.sql` over
+// that very directory — and the path is relative to the package directory, which is where `go
+// test` runs it.
+//
+// Parameters:
+//   - t *testing.T: for the fatal on an unreadable migration source, which is a broken
+//     checkout rather than a schema finding.
+//   - ctx context.Context: for the catalog read.
+//   - ds Datasource: the connection to read pg_indexes through.
+//   - planLine string: one line of an EXPLAIN plan.
+//
+// Returns:
+//   - string: the name of the first foreign index the line reads, or "".
+func unknownEventOutboxIndexIn(t *testing.T, ctx context.Context, ds Datasource, planLine string) string {
+	t.Helper()
+
+	migrationSQL, err := readMigrationSource(t)
+	require.NoError(t, err, "reading the embedded migration source")
+
+	for _, index := range planIndexesUsed(planLine) {
+		// Only indexes on THIS table are judged. A plan can name an index on another
+		// relation — __consumer_offsets never appears here, but a join added later could —
+		// and this guard has nothing to say about those.
+		var onEventOutbox bool
+		require.NoError(t, ds.Conn.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_indexes
+				WHERE schemaname = 'blnk' AND tablename = 'event_outbox' AND indexname = $1
+			)
+		`, index).Scan(&onEventOutbox), "reading pg_indexes for %q", index)
+
+		if !onEventOutbox {
+			continue
+		}
+
+		if !strings.Contains(migrationSQL, index) {
+			return index
+		}
+	}
+
+	return ""
+}
+
+// readMigrationSource concatenates every migration, so a name can be looked for across the
+// whole schema definition at once.
+//
+// Returns:
+//   - string: every migration's text, joined.
+//   - error: a read failure, which means a broken checkout rather than a schema problem.
+func readMigrationSource(t *testing.T) (string, error) {
+	t.Helper()
+
+	const migrationDir = "../sql"
+
+	entries, err := os.ReadDir(migrationDir)
+	if err != nil {
+		return "", err
+	}
+
+	var joined strings.Builder
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+
+		body, readErr := os.ReadFile(filepath.Join(migrationDir, entry.Name()))
+		if readErr != nil {
+			return "", readErr
+		}
+
+		joined.Write(body)
+		joined.WriteByte('\n')
+	}
+
+	return joined.String(), nil
+}
+
+// TestUnknownEventOutboxIndexIn_TellsForeignIndexesFromDeclaredOnes_RealDB is what keeps the
+// foreign-index guard from making the claim-index assertion vacuous.
+//
+// A guard that answered "foreign" for everything would skip on every database, and the
+// assertion it protects would never run again while still looking present. So both directions
+// are pinned against the real catalog: an index this repository's migrations declare is NOT
+// reported, and a name that exists in neither the catalog nor the migrations is not reported
+// either — only an index that IS in the catalog and is NOT in the migrations.
+func TestUnknownEventOutboxIndexIn_TellsForeignIndexesFromDeclaredOnes_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	t.Run("an index this repository declares is not foreign", func(t *testing.T) {
+		line := "->  Index Scan using idx_event_outbox_claim on event_outbox candidate  (cost=0.26..30.46 rows=7 width=51)"
+		assert.Empty(t, unknownEventOutboxIndexIn(t, ctx, ds, line),
+			"idx_event_outbox_claim is created by this repository's migrations, so a plan reading it "+
+				"must not be treated as a foreign schema — that would skip the assertion on every "+
+				"correctly migrated database")
+	})
+
+	t.Run("an index in the catalog that no migration declares is foreign", func(t *testing.T) {
+		// Discovered from the catalog rather than named, so this subtest describes the
+		// CONDITION and does not depend on any particular other checkout having run.
+		migrationSQL, err := readMigrationSource(t)
+		require.NoError(t, err)
+
+		rows, err := ds.Conn.QueryContext(ctx, `
+			SELECT indexname FROM pg_indexes
+			WHERE schemaname = 'blnk' AND tablename = 'event_outbox'
+			ORDER BY indexname
+		`)
+		require.NoError(t, err)
+		defer func() { _ = rows.Close() }()
+
+		var foreign string
+		for rows.Next() {
+			var name string
+			require.NoError(t, rows.Scan(&name))
+
+			// The primary key and the unique indexes are declared as constraints rather than
+			// by name in the migrations, so they are not candidates for this check.
+			if !strings.Contains(migrationSQL, name) && strings.HasPrefix(name, "idx_") {
+				foreign = name
+
+				break
+			}
+		}
+		require.NoError(t, rows.Err())
+
+		if foreign == "" {
+			t.Skip("this database carries no event_outbox index outside the migrations, so the " +
+				"positive direction of the guard has nothing to exercise here")
+		}
+
+		line := "->  Index Scan using " + foreign + " on event_outbox candidate  (cost=0.26..30.46 rows=7)"
+		assert.Equal(t, foreign, unknownEventOutboxIndexIn(t, ctx, ds, line),
+			"an index present in the catalog and absent from every migration is exactly the case the "+
+				"guard exists to detect")
+	})
+
+	t.Run("a name in neither the catalog nor the migrations is ignored", func(t *testing.T) {
+		// The guard judges only indexes that exist ON THIS TABLE. A plan naming an index of
+		// some other relation says nothing about this repository's schema, and reporting it
+		// would skip the assertion for an unrelated reason.
+		line := "->  Index Scan using idx_not_a_real_index_anywhere on transactions t  (cost=0.26..30.46 rows=7)"
+		assert.Empty(t, unknownEventOutboxIndexIn(t, ctx, ds, line))
+	})
 }

@@ -57,11 +57,19 @@ limitations under the License.
 // declines to start until it is configured. A default that silently deleted evidence would
 // be worse than one that keeps too much.
 //
-// TERMINAL ROWS ONLY, enforced in SQL rather than here. The repository restricts the delete
-// to dispatched and dead_lettered rows from model.TerminalEventOutboxStatuses. A pending,
-// processing, replaying or failed row is still owed a delivery attempt and is never eligible
-// however old it is — failed most of all, because its dead-letter write is still owed, which
-// makes the outbox the only copy of that event in existence.
+// ELIGIBLE ROWS ONLY, enforced in SQL rather than here, and "eligible" is narrower than
+// "terminal". The repository deletes a DISPATCHED row on age alone — it is a receipt for an
+// event a subscriber has already had — and a DEAD-LETTERED row only once an operator has
+// RESOLVED it. That second gate is the point: a dead-lettered row is the record of an event
+// nobody received, so it is the only inventory triage reads, the only thing a replay can be
+// driven from, and the only place the failure metadata explaining the loss exists. Deleting it
+// on an age timer destroyed all of that unrecoverably, and destroyed the oldest failure first
+// — the one most likely to have been forgotten rather than handled.
+//
+// A pending, processing, replaying or failed row is never eligible however old it is — failed
+// most of all, because its dead-letter write is still owed, which makes the outbox the only
+// copy of that event in existence. model.EventOutbox.IsPurgeableByRetention states the same
+// rule in Go for a caller that needs to evaluate it without a database.
 //
 // BOUNDED IN EVERY DIRECTION. Each delete is limited to a batch, each sweep is limited to a
 // number of batches, and each sweep runs under its own deadline. An unbounded DELETE over a
@@ -88,23 +96,42 @@ const (
 	// for no benefit.
 	defaultEventRetentionInterval = time.Hour
 
-	// defaultEventRetentionBatchSize is how many rows one DELETE removes. It matches the
-	// repository's own default so the two agree, and it is what keeps each statement's lock
+	// defaultEventRetentionBatchSize is how many rows one DELETE removes: the fallback for a
+	// sweeper built before configuration could be read. It keeps each statement's lock
 	// footprint and WAL contribution small on a table under concurrent claim.
-	defaultEventRetentionBatchSize = 1000
+	//
+	// DERIVED rather than restated, so this and the configured default cannot diverge. Two
+	// copies of one default are two numbers that can disagree, and which one a deployment ran
+	// at would then depend on start-up ordering.
+	defaultEventRetentionBatchSize = config.DefaultEventRetentionBatchSize
 
-	// maxEventRetentionBatchesPerSweep bounds ONE sweep, and the bound is what makes the
-	// operation safe to run beside a live relay. Without it, the first sweep after
-	// retention is enabled on a long-running deployment would try to delete the entire
+	// defaultEventRetentionMaxBatchesPerSweep bounds ONE sweep by default, and the bound is
+	// what makes the operation safe to run beside a live relay: without it, the first sweep
+	// after retention is enabled on a long-running deployment would try to delete the entire
 	// historical backlog in a single pass, holding locks and generating WAL for as long as
-	// that took. With it, the backlog drains over successive sweeps — at these numbers up
-	// to 100,000 rows an hour, which overtakes any realistic arrival rate while leaving the
-	// relay unimpeded.
-	maxEventRetentionBatchesPerSweep = 100
+	// that took. With it, the backlog drains over successive sweeps.
+	//
+	// IT IS A DEFAULT AND NO LONGER A CEILING (PERF-P23). It used to be a compile-time
+	// constant of 100, giving 100,000 rows an hour, and its own comment claimed that
+	// "overtakes any realistic arrival rate" — which is false for the rate this system is
+	// specified for: 500 events a second arrive at 1,800,000 rows an hour, eighteen times
+	// faster than the sweeper could delete. Capacity below arrivals does not slow growth, it
+	// permits it, and the retention period is then never actually enforced.
+	//
+	// So the value is now configurable through RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP and
+	// its default is set ABOVE peak ingestion. See config.RelayConfig for the arithmetic, and
+	// config.EventRetentionUnboundedSweep for how a deployment asks for no ceiling at all.
+	//
+	// DERIVED from the configured default for the same reason the batch size above is.
+	defaultEventRetentionMaxBatchesPerSweep = config.DefaultEventRetentionMaxBatchesPerSweep
 
-	// eventRetentionSweepTimeout bounds one sweep. Generous, because it may issue a hundred
+	// eventRetentionSweepTimeout bounds one sweep. Generous, because it may issue thousands of
 	// bounded deletes; bounded all the same, so a sweep against a struggling database ends
 	// and is retried on the next tick rather than overlapping the one after it.
+	//
+	// IT IS THE OUTER BOUND, and it is what makes an unbounded batch ceiling safe: a sweep
+	// configured with no ceiling still cannot run past this, so "no ceiling" means "drain what
+	// you can inside ten minutes" rather than "run until the backlog is gone, however long".
 	eventRetentionSweepTimeout = 10 * time.Minute
 )
 
@@ -132,6 +159,11 @@ type EventRetentionSweeper struct {
 	interval  time.Duration
 	batchSize int
 
+	// maxBatches bounds one sweep. Non-positive means no ceiling, which the sweep loop reads
+	// directly; the unset-versus-unbounded distinction is resolved before it reaches here, by
+	// applyPurgeCapacity and WithMaxBatches. PERF-P23.
+	maxBatches int
+
 	// now is the clock, replaceable in-package so a test can assert the cutoff exactly.
 	// It follows the relay's and the dead-letter service's now field.
 	now func() time.Time
@@ -153,9 +185,10 @@ type EventRetentionSweeper struct {
 //   - *EventRetentionSweeper: ready to Start. Never nil.
 func NewEventRetentionSweeper(b *Blnk) *EventRetentionSweeper {
 	sweeper := &EventRetentionSweeper{
-		interval:  defaultEventRetentionInterval,
-		batchSize: defaultEventRetentionBatchSize,
-		now:       time.Now,
+		interval:   defaultEventRetentionInterval,
+		batchSize:  defaultEventRetentionBatchSize,
+		maxBatches: defaultEventRetentionMaxBatchesPerSweep,
+		now:        time.Now,
 	}
 
 	if b == nil {
@@ -167,8 +200,51 @@ func NewEventRetentionSweeper(b *Blnk) *EventRetentionSweeper {
 	}
 
 	sweeper.retention = retentionPeriodFor(b.Config())
+	sweeper.applyPurgeCapacity(b.Config())
 
 	return sweeper
+}
+
+// applyPurgeCapacity reads the configured purge capacity onto the sweeper. PERF-P23.
+//
+// Falls back to the process configuration for the same reason retentionPeriodFor does: a Blnk
+// built before configuration was published would otherwise silently run on the built-in
+// defaults, so an operator who had deliberately raised the capacity to match their arrival rate
+// would get the shipped one and a table that kept growing anyway.
+//
+// A configuration that cannot be read leaves the constructor's defaults in place, which are
+// already above the specified peak arrival rate. Nothing here can turn retention OFF — that is
+// the period's decision, taken in one place — so the worst case for an unreadable
+// configuration is deleting at the default rate rather than not deleting.
+//
+// Parameters:
+//   - cnf *config.Configuration: the instance's configuration, possibly nil.
+func (s *EventRetentionSweeper) applyPurgeCapacity(cnf *config.Configuration) {
+	if cnf == nil {
+		fetched, err := config.Fetch()
+		if err != nil {
+			return
+		}
+
+		cnf = fetched
+	}
+
+	if cnf.Relay.EventRetentionBatchSize > 0 {
+		s.batchSize = cnf.Relay.EventRetentionBatchSize
+	}
+
+	// Zero is UNSET and leaves the constructor's bound in place; a negative is
+	// config.EventRetentionUnboundedSweep, the explicit request for no ceiling. The distinction
+	// is made in config.setRelayDefaults and repeated here rather than assumed, because this
+	// method also runs against configurations that never passed through it — a hand-built
+	// Configuration, or one published before the defaults were applied — and in those the zero
+	// value must not silently remove the bound.
+	switch {
+	case cnf.Relay.EventRetentionMaxBatchesPerSweep > 0:
+		s.maxBatches = cnf.Relay.EventRetentionMaxBatchesPerSweep
+	case cnf.Relay.EventRetentionMaxBatchesPerSweep < 0:
+		s.maxBatches = config.EventRetentionUnboundedSweep
+	}
 }
 
 // retentionPeriodFor reads the configured retention period, falling back to the process
@@ -236,6 +312,41 @@ func (s *EventRetentionSweeper) WithBatchSize(size int) *EventRetentionSweeper {
 	}
 
 	s.batchSize = size
+
+	return s
+}
+
+// WithMaxBatches sets how many batches one sweep may issue. PERF-P23.
+//
+// It follows the same contract as the configuration variable, deliberately, so the two cannot
+// disagree: a POSITIVE value is the ceiling, a NEGATIVE value is
+// config.EventRetentionUnboundedSweep and removes it, and ZERO is unset and leaves the default
+// in place. Zero is the one worth stating — it is what a caller passes by accident, from an
+// unpopulated variable, and reading it as "no ceiling" would quietly remove the bound that
+// keeps one sweep from attempting an entire backlog beside a live relay.
+//
+// A sweep with no ceiling is still bounded by eventRetentionSweepTimeout.
+//
+// Parameters:
+//   - batches int: the per-sweep batch ceiling. Negative means unbounded; zero keeps the
+//     default.
+//
+// Returns:
+//   - *EventRetentionSweeper: the receiver, for chaining.
+func (s *EventRetentionSweeper) WithMaxBatches(batches int) *EventRetentionSweeper {
+	switch {
+	case batches > 0:
+		s.maxBatches = batches
+	case batches < 0:
+		s.maxBatches = config.EventRetentionUnboundedSweep
+	default:
+		logrus.WithField("requested_max_batches", batches).
+			Warnf(
+				"A zero event retention batch ceiling is unset rather than unbounded; keeping %d. "+
+					"Pass a negative value to remove the ceiling deliberately",
+				s.maxBatches,
+			)
+	}
 
 	return s
 }
@@ -404,18 +515,27 @@ func (s *EventRetentionSweeper) Sweep(ctx context.Context) int64 {
 
 	cutoff := s.now().UTC().Add(-s.retention)
 
-	var deleted int64
-	for batch := 0; batch < maxEventRetentionBatchesPerSweep; batch++ {
+	var (
+		deleted int64
+
+		// drained records WHY the loop ended, which is the difference between a sweep that
+		// finished its work and one that ran out of the capacity it was given. Only the
+		// second is worth an operator's attention, and without this the two are
+		// indistinguishable in the logs. PERF-P23.
+		drained bool
+	)
+
+	for batch := 0; s.maxBatches <= 0 || batch < s.maxBatches; batch++ {
 		if sweepCtx.Err() != nil {
 			break
 		}
 
 		purged, err := s.store.PurgeTerminalEventsBefore(sweepCtx, cutoff, s.batchSize)
 		if err != nil {
-			logrus.WithError(err).WithFields(logrus.Fields{
+			withLoggableCause(logrus.WithFields(logrus.Fields{
 				"cutoff":  cutoff.Format(time.RFC3339),
 				"deleted": deleted,
-			}).Error(
+			}), err).Error(
 				"event outbox retention: a purge batch failed; the rows remain and the sweep is " +
 					"retried on the next tick",
 			)
@@ -427,8 +547,31 @@ func (s *EventRetentionSweeper) Sweep(ctx context.Context) int64 {
 
 		if purged < int64(s.batchSize) {
 			// The eligible set is drained. This is the ordinary exit.
+			drained = true
+
 			break
 		}
+	}
+
+	// The condition PERF-P23 exists to make visible. A sweep that deleted a full batch on its
+	// last permitted iteration left eligible rows behind, which means this deployment's purge
+	// capacity is at or below its arrival rate and the retention period is consequently NOT
+	// being enforced however it is configured. It is reported at warning level naming the
+	// setting to raise, because the alternative — the previous behaviour — was a table that
+	// grew without anything ever saying so.
+	if !drained && s.maxBatches > 0 && deleted >= int64(s.maxBatches)*int64(s.batchSize) {
+		logrus.WithFields(logrus.Fields{
+			"deleted":                     deleted,
+			"cutoff":                      cutoff.Format(time.RFC3339),
+			"max_batches_per_sweep":       s.maxBatches,
+			"batch_size":                  s.batchSize,
+			"purge_capacity_rows_per_arm": int64(s.maxBatches) * int64(s.batchSize),
+		}).Warn(
+			"event outbox retention: the sweep exhausted its per-sweep batch ceiling with eligible " +
+				"rows remaining, so the retention period is not being enforced; raise " +
+				"RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP (or RELAY_EVENT_RETENTION_BATCH_SIZE) " +
+				"until purge capacity exceeds the event arrival rate",
+		)
 	}
 
 	if deleted == 0 {

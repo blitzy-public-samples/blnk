@@ -160,76 +160,147 @@ func TestEventOutbox_BrokerRecordRequiresAllThreeColumns(t *testing.T) {
 	assert.Equal(t, "blnk.identities/0@0", coordinate.String())
 }
 
-func TestEventOutboxAudit_UnconfirmedRowsIsTheShortfallAndNeverNegative(t *testing.T) {
-	// The ordinary shortfall. Also kills the arithmetic mutant that turns the
-	// subtraction into an addition: 13 rather than 7 fails here.
-	assert.Equal(t, int64(7),
-		EventOutboxAudit{PublishedRows: 10, ConfirmedRows: 3}.UnconfirmedRows(),
-		"seven rows claim a publication they cannot name a record for")
+func TestPartitionOffsetInterval_ContainsIsHalfOpen(t *testing.T) {
+	window := PartitionOffsetInterval{
+		Topic: "blnk.transactions", Partition: 2, FirstOffset: 100, EndOffset: 200,
+	}
 
-	// Fully confirmed: nothing outstanding.
-	assert.Equal(t, int64(0),
-		EventOutboxAudit{PublishedRows: 10, ConfirmedRows: 10}.UnconfirmedRows(),
-		"a fully confirmed audit has no unconfirmed rows")
+	// The two boundaries are the whole contract, and they are asymmetric because
+	// Kafka's are: FirstOffset is the earliest RETAINED record, EndOffset is one past
+	// the last WRITTEN one.
+	assert.True(t, window.Contains(100), "the first retained offset is inside the window")
+	assert.True(t, window.Contains(199), "the last written offset is inside the window")
+	assert.False(t, window.Contains(200),
+		"the end offset is one PAST the last record, so a coordinate there cannot be on the log")
+	assert.False(t, window.Contains(99),
+		"an offset below the first retained one has been deleted by retention")
 
-	// MORE confirmed than published cannot happen against an intact schema, and
-	// the function clamps rather than returning a negative — a negative would
-	// propagate into the reconciliation verdict as a surplus and describe
-	// duplication that did not occur.
-	assert.Equal(t, int64(0),
-		EventOutboxAudit{PublishedRows: 3, ConfirmedRows: 10}.UnconfirmedRows(),
-		"the shortfall is clamped at zero rather than going negative")
+	// An offset far beyond the end is the truncation/recreation signal, and it must
+	// read as outside rather than being clamped into the window.
+	assert.False(t, window.Contains(1_000_000),
+		"an offset far beyond the log end must read as outside: it is how a recreated topic is detected")
 
-	// The empty audit, which is what a quiet outbox looks like.
-	assert.Equal(t, int64(0), EventOutboxAudit{}.UnconfirmedRows(),
-		"an audit of nothing has no shortfall")
-
-	// A single unconfirmed row is the smallest finding the audit can make, and it
-	// must be visible: the whole point of the split is that one uncorroborated
-	// claim is no longer hidden by a surplus elsewhere.
-	assert.Equal(t, int64(1),
-		EventOutboxAudit{PublishedRows: 1, ConfirmedRows: 0}.UnconfirmedRows(),
-		"one unconfirmed row is reported as one, not rounded away")
+	// An empty window admits nothing. This kills the mutant that turns the
+	// less-than into a less-than-or-equal, which would corroborate a row against a
+	// partition holding no records at all.
+	empty := PartitionOffsetInterval{Topic: "blnk.balances", FirstOffset: 42, EndOffset: 42}
+	assert.False(t, empty.Contains(42), "a zero-width window contains nothing")
+	assert.False(t, empty.Contains(41))
 }
 
-func TestEventOutboxAudit_FullyConfirmedNeedsBothNoShortfallAndDistinctRecords(t *testing.T) {
-	// The conclusive case: every claim named, and every name distinct.
+func TestPartitionOffsetInterval_RecordsIsTheWidthAndNeverNegative(t *testing.T) {
+	assert.Equal(t, int64(100),
+		PartitionOffsetInterval{FirstOffset: 100, EndOffset: 200}.Records())
+
+	// A partition that has never been written to.
+	assert.Equal(t, int64(0), PartitionOffsetInterval{}.Records(),
+		"an untouched partition holds no records")
+
+	// A partition every record of which has aged out: first equals end, at a
+	// non-zero offset. Zero is the correct reading, and it is a legitimate one
+	// rather than a fault.
+	assert.Equal(t, int64(0),
+		PartitionOffsetInterval{FirstOffset: 9_000, EndOffset: 9_000}.Records(),
+		"a fully aged-out partition holds no records, and that is not an error")
+
+	// An inverted reading cannot happen from a coherent broker response, and the
+	// width clamps rather than going negative: a negative would propagate into a
+	// reported record count and describe a log that holds less than nothing.
+	assert.Equal(t, int64(0),
+		PartitionOffsetInterval{FirstOffset: 500, EndOffset: 100}.Records(),
+		"an inverted window is reported as empty rather than as a negative width")
+}
+
+func TestEventRecordIntervalAudit_UncorroboratedRowsSumsEveryReasonAndNothingElse(t *testing.T) {
+	// Each bucket contributes, and the four are added rather than any one of them
+	// standing in for the rest. This kills the mutants that drop a term: a fix that
+	// counted only unconfirmed rows would call a topic recreation conclusive.
+	audit := EventRecordIntervalAudit{
+		PublishedRows:    10,
+		CorroboratedRows: 4,
+		UnconfirmedRows:  1,
+		UnmeasuredRows:   2,
+		AgedOutRows:      2,
+		BeyondEndRows:    1,
+	}
+	assert.Equal(t, int64(6), audit.UncorroboratedRows(),
+		"every reason a claim could not be placed counts against the verdict, not just the first")
+
+	// The identity the whole classification rests on: the buckets partition the
+	// claims, so corroborated plus uncorroborated is exactly what was published.
+	assert.Equal(t, audit.PublishedRows, audit.CorroboratedRows+audit.UncorroboratedRows(),
+		"every published row lands in exactly one bucket, or the verdict is describing a different set")
+
+	// Each bucket alone is enough to make a claim uncorroborated.
+	for name, single := range map[string]EventRecordIntervalAudit{
+		"unconfirmed": {PublishedRows: 1, UnconfirmedRows: 1},
+		"unmeasured":  {PublishedRows: 1, UnmeasuredRows: 1},
+		"aged out":    {PublishedRows: 1, AgedOutRows: 1},
+		"beyond end":  {PublishedRows: 1, BeyondEndRows: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, int64(1), single.UncorroboratedRows(),
+				"one unplaceable claim is reported as one, not rounded away")
+			assert.False(t, single.FullyCorroborated())
+		})
+	}
+
+	// A quiet outbox.
+	assert.Equal(t, int64(0), EventRecordIntervalAudit{}.UncorroboratedRows(),
+		"an audit of nothing has nothing outstanding")
+}
+
+func TestEventRecordIntervalAudit_DuplicatedRecordsIsTheShortfallAndNeverNegative(t *testing.T) {
+	// Two rows corroborated by one record. Only possible with the partial unique
+	// index on the coordinate absent, which is why it is reported rather than
+	// absorbed.
+	assert.Equal(t, int64(1),
+		EventRecordIntervalAudit{CorroboratedRows: 10, DistinctCorroboratedRecords: 9}.DuplicatedRecords(),
+		"one record corroborating two rows is double counting and must be visible")
+
+	assert.Equal(t, int64(0),
+		EventRecordIntervalAudit{CorroboratedRows: 10, DistinctCorroboratedRecords: 10}.DuplicatedRecords())
+
+	// MORE distinct records than corroborated rows is an impossible reading. It is
+	// not hypothetical: the repository counts distinct coordinates with
+	// COUNT(DISTINCT (topic, partition, offset)) and PostgreSQL counts the all-NULL
+	// row constructor as one distinct value, so an unfiltered query let a
+	// coordinate-less row contribute a phantom record. The query filters them out;
+	// this clamp keeps a negative from propagating into the verdict as duplication
+	// that did not occur if it ever stops.
+	assert.Equal(t, int64(0),
+		EventRecordIntervalAudit{CorroboratedRows: 9, DistinctCorroboratedRecords: 10}.DuplicatedRecords(),
+		"an impossible reading is clamped rather than reported as negative duplication")
+}
+
+func TestEventRecordIntervalAudit_FullyCorroboratedNeedsEveryClaimPlacedAndDistinct(t *testing.T) {
+	// The conclusive case: every claim placed inside a measured window, every
+	// coordinate distinct.
 	assert.True(t,
-		EventOutboxAudit{PublishedRows: 10, ConfirmedRows: 10, DistinctRecords: 10}.FullyConfirmed(),
-		"ten rows naming ten distinct records is a conclusive audit")
+		EventRecordIntervalAudit{
+			PublishedRows: 10, CorroboratedRows: 10, DistinctCorroboratedRecords: 10,
+		}.FullyCorroborated(),
+		"ten rows naming ten distinct records inside the measured windows is conclusive")
 
-	// A shortfall alone must defeat it, even though the distinct count agrees
-	// with the confirmed count. This kills the mutant that turns the && into an
-	// ||, which would call an audit with three uncorroborated claims conclusive.
+	// An unplaced claim defeats it even though the distinct count agrees with the
+	// corroborated count. This kills the mutant that turns the && into an ||.
 	assert.False(t,
-		EventOutboxAudit{PublishedRows: 10, ConfirmedRows: 7, DistinctRecords: 7}.FullyConfirmed(),
-		"three rows claiming a publication they cannot name defeats the verdict on their own")
+		EventRecordIntervalAudit{
+			PublishedRows: 10, CorroboratedRows: 7, DistinctCorroboratedRecords: 7, AgedOutRows: 3,
+		}.FullyCorroborated(),
+		"three records deleted by retention cannot be corroborated, so the audit is not conclusive")
 
-	// Two rows sharing a coordinate must defeat it too, for the same reason in
-	// the other direction: the partial unique index makes that impossible, so
-	// seeing it means the index is gone and the audit must not assume otherwise.
+	// A shared coordinate defeats it in the other direction.
 	assert.False(t,
-		EventOutboxAudit{PublishedRows: 10, ConfirmedRows: 10, DistinctRecords: 9}.FullyConfirmed(),
+		EventRecordIntervalAudit{
+			PublishedRows: 10, CorroboratedRows: 10, DistinctCorroboratedRecords: 9,
+		}.FullyCorroborated(),
 		"two rows naming one record defeats the verdict — the unique index that forbids it "+
 			"is evidently absent")
-
-	// DistinctRecords must never EXCEED ConfirmedRows, and the audit refuses to
-	// call such a reading conclusive.
-	//
-	// This is not hypothetical. The repository query counted distinct coordinates
-	// with COUNT(DISTINCT (topic, partition, offset)), and PostgreSQL counts the
-	// all-NULL row constructor as one distinct value — so a single published row
-	// with no coordinate contributed a phantom record and pushed this count above
-	// the confirmed one. The query now filters those rows out; this assertion is
-	// what keeps a healthy outbox from being reported inconclusive if it ever
-	// stops doing so.
-	assert.False(t,
-		EventOutboxAudit{PublishedRows: 10, ConfirmedRows: 10, DistinctRecords: 11}.FullyConfirmed(),
-		"more distinct records than confirmed rows is an impossible reading, not a conclusive one")
 
 	// An empty audit is trivially conclusive: nothing claims a publication, so
 	// nothing is unaccounted for. Asserting it pins the vacuous case rather than
 	// leaving it to be discovered by a caller.
-	assert.True(t, EventOutboxAudit{}.FullyConfirmed(),
+	assert.True(t, EventRecordIntervalAudit{}.FullyCorroborated(),
 		"an audit of nothing is conclusive about nothing")
 }

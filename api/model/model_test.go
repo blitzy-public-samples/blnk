@@ -615,7 +615,7 @@ func TestToBalanceMonitor(t *testing.T) {
 	assert.Equal(t, createMonitor.Condition.Precision, monitor.Condition.Precision)
 }
 
-// TestValidateCreateSubscriber_BoundsTheTopicGrant checks the request-body
+// TestCreateSubscriberValidate_BoundsTheTopicGrant checks the request-body
 // validation for POST /subscribers.
 //
 // Both directions are asserted. The refusals are the resource bound and the
@@ -623,7 +623,14 @@ func TestToBalanceMonitor(t *testing.T) {
 // legitimate requests — a subscriber registered with no grant at all is the
 // registry's normal fail-closed state, and a sixteen-topic grant is exactly what a
 // topic-prefix migration needs.
-func TestValidateCreateSubscriber_BoundsTheTopicGrant(t *testing.T) {
+//
+// It drives Validate(prefix), which is now the SINGLE validation entry point. There
+// used to be a second, exported, prefix-independent validator that no handler called
+// and that re-checked a subset of these rules under a hard-coded prefix; two
+// functions checking overlapping rules with one of them dead is how the
+// authoritative one ends up the weaker. Its prefix-independent rules are now applied
+// by Validate itself, so this test exercises the code a request actually takes.
+func TestCreateSubscriberValidate_BoundsTheTopicGrant(t *testing.T) {
 	oversized := make([]string, model.MaxSubscriberTopics+1)
 	for i := range oversized {
 		oversized[i] = "blnk.transactions"
@@ -718,7 +725,7 @@ func TestValidateCreateSubscriber_BoundsTheTopicGrant(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			body := tt.body
-			err := body.ValidateCreateSubscriber()
+			err := body.Validate(model.DefaultEventTopicPrefix)
 			if tt.wantErr {
 				assert.Error(t, err, tt.reason)
 				return
@@ -728,7 +735,7 @@ func TestValidateCreateSubscriber_BoundsTheTopicGrant(t *testing.T) {
 	}
 }
 
-// TestValidateUpdateSubscriber_ValidatesTheGrantOnlyWhenPresent pins the
+// TestUpdateSubscriberValidate_ValidatesTheGrantOnlyWhenPresent pins the
 // omitted-versus-empty distinction the update shape exists for.
 //
 // nil means the caller is not touching the authorised set, so an update to an
@@ -736,7 +743,7 @@ func TestValidateCreateSubscriber_BoundsTheTopicGrant(t *testing.T) {
 // deliberate revocation of every grant and must be accepted. A present non-empty
 // grant replaces the whole set and so is validated exactly as strictly as on create —
 // otherwise the update path would be the way around the create path's bounds.
-func TestValidateUpdateSubscriber_ValidatesTheGrantOnlyWhenPresent(t *testing.T) {
+func TestUpdateSubscriberValidate_ValidatesTheGrantOnlyWhenPresent(t *testing.T) {
 	name := "renamed"
 	oversized := make([]string, model.MaxSubscriberTopics+1)
 	for i := range oversized {
@@ -745,25 +752,25 @@ func TestValidateUpdateSubscriber_ValidatesTheGrantOnlyWhenPresent(t *testing.T)
 
 	t.Run("an omitted grant is not validated", func(t *testing.T) {
 		body := UpdateSubscriber{Name: &name}
-		assert.NoError(t, body.ValidateUpdateSubscriber(),
+		assert.NoError(t, body.Validate(model.DefaultEventTopicPrefix),
 			"an update that does not mention the grant must not be rejected because of it")
 	})
 
 	t.Run("a present empty grant revokes everything and is valid", func(t *testing.T) {
 		body := UpdateSubscriber{AuthorizedTopics: []string{}}
-		assert.NoError(t, body.ValidateUpdateSubscriber(),
+		assert.NoError(t, body.Validate(model.DefaultEventTopicPrefix),
 			"revoking every topic is a legitimate operation and must remain expressible")
 	})
 
 	t.Run("a present grant is bounded exactly as on create", func(t *testing.T) {
 		body := UpdateSubscriber{AuthorizedTopics: oversized}
-		assert.Error(t, body.ValidateUpdateSubscriber(),
+		assert.Error(t, body.Validate(model.DefaultEventTopicPrefix),
 			"an update replaces the whole grant, so a bound enforced only on create is no bound at all")
 	})
 
 	t.Run("a present grant is narrowed to the owned taxonomy", func(t *testing.T) {
 		body := UpdateSubscriber{AuthorizedTopics: []string{"someone-else.orders"}}
-		assert.Error(t, body.ValidateUpdateSubscriber())
+		assert.Error(t, body.Validate(model.DefaultEventTopicPrefix))
 	})
 }
 
@@ -771,7 +778,7 @@ func TestValidateUpdateSubscriber_ValidatesTheGrantOnlyWhenPresent(t *testing.T)
 // by the BINDER, before any handler code runs.
 //
 // This is a different guarantee from the Validate methods above and is why both
-// exist. A handler that forgets to call ValidateCreateSubscriber still cannot accept
+// exist. A handler that forgets to call Validate still cannot accept
 // an unbounded topic array, because gin applies these tags while decoding the body —
 // so the dimensions that bound allocation hold regardless of handler code. The
 // assertion goes through gin's own validator, which is the exact code path a bind

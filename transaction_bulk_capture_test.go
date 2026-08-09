@@ -75,7 +75,8 @@ func newBulkCaptureDatasource() *bulkCaptureDatasource {
 	return &bulkCaptureDatasource{MockDataSource: new(mocks.MockDataSource)}
 }
 
-// InsertEventOutbox records the standalone insert the bulk producer performs.
+// InsertEventOutbox records the standalone insert, which the bulk producer now reaches only
+// on its FALLBACK path — when the batch has no coordinator record.
 func (s *bulkCaptureDatasource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox) error {
 	s.guard.Lock()
 	defer s.guard.Unlock()
@@ -84,6 +85,31 @@ func (s *bulkCaptureDatasource) InsertEventOutbox(ctx context.Context, e *model.
 	s.rows = append(s.rows, e)
 
 	return nil
+}
+
+// FinalizeBulkTransactionBatchWithEvent records the ATOMIC write the bulk producer now
+// performs: the coordinator's terminal transition and the outcome event in one transaction.
+//
+// It is overridden rather than stubbed through testify because these tests assert on the
+// CONTEXT the write is issued with, and a mock expectation records arguments without giving a
+// convenient place to keep the context alongside the row. Recording both here is what lets the
+// trace-correlation and cancellation-detachment assertions read the pair together.
+//
+// The boolean reports that this call performed the transition, which is the answer a healthy
+// first attempt gets.
+func (s *bulkCaptureDatasource) FinalizeBulkTransactionBatchWithEvent(
+	ctx context.Context,
+	_ string,
+	_ *model.BulkTransactionBatch,
+	event *model.EventOutbox,
+) (bool, error) {
+	s.guard.Lock()
+	defer s.guard.Unlock()
+
+	s.contexts = append(s.contexts, ctx)
+	s.rows = append(s.rows, event)
+
+	return true, nil
 }
 
 // captured returns the single recorded insert, failing the test unless there was exactly one.

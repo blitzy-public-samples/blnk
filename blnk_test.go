@@ -39,21 +39,27 @@ package blnk
 //     belongs in the outbox, and with no broker it belongs on the legacy queue, because no
 //     relay would ever drain a row written by a deployment that has no Kafka.
 //
-// Nothing here performs network I/O. Redis is miniredis, no datasource is contacted, and the
-// only broker addresses used are RFC 5737 documentation addresses that are never dialled.
+// Nothing here performs network I/O. Redis is miniredis, no datasource is contacted, and every
+// broker address used is wiringBlackholeBroker — RFC 1918 private space, routed nowhere in a
+// default environment and never dialled. See that constant for why it is private space rather
+// than an RFC 5737 documentation address.
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/hibiken/asynq"
+	"github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -63,10 +69,16 @@ import (
 	"github.com/blnkfinance/blnk/model"
 )
 
-// wiringBlackholeBroker is an RFC 5737 TEST-NET-2 documentation address. It is reserved for
-// documentation and is not routable, so if any code path under test ever did dial a broker
-// the failure would be an unambiguous timeout rather than a connection to something real.
-const wiringBlackholeBroker = "198.51.100.1:9092"
+// wiringBlackholeBroker is an RFC 1918 private address that is routed nowhere in a default
+// environment, so if any code path under test ever did dial a broker the failure would be an
+// unambiguous timeout rather than a connection to something real.
+//
+// It was 198.51.100.1, an RFC 5737 TEST-NET-2 address. That is a PUBLIC address, and
+// acknowledged plaintext no longer reaches a broker outside Blnk's own network:
+// KAFKA_INSECURE_LOCAL_DEV claims the broker is local, and requireLocalBrokersForPlaintext
+// now verifies the claim instead of merely warning about it. Private space keeps the
+// unroutability this constant exists for while satisfying that check.
+const wiringBlackholeBroker = "10.255.255.1:9092"
 
 // wiringConstructionBudget bounds how long NewBlnk may take.
 //
@@ -624,6 +636,58 @@ func TestBlnkClose_ReleasesTheEventPublisherAndStaysNilSafe(t *testing.T) {
 		assert.NoError(t, instance.Close(),
 			"the no-op releases nothing because it acquired nothing")
 	})
+
+	t.Run("the release is announced, and a failed release is announced differently", func(t *testing.T) {
+		// PERF-P17 was that NOTHING invoked this method: every shutdown left the publisher's
+		// writer goroutines and broker connections to the process's death. Now that the server
+		// and worker commands do invoke it, an operator has to be able to CONFIRM that from the
+		// log — the absence of the step is not observable from outside the process, and neither
+		// is its presence unless it says so.
+		t.Run("success", func(t *testing.T) {
+			hook := logtest.NewGlobal()
+			defer hook.Reset()
+
+			require.NoError(t, (&Blnk{events: NewNoopEventPublisher()}).Close())
+
+			var announced bool
+			for _, entry := range hook.AllEntries() {
+				if entry.Level == logrus.InfoLevel &&
+					strings.Contains(entry.Message, "service resources released") {
+					announced = true
+
+					break
+				}
+			}
+			assert.True(t, announced,
+				"a clean release must be announced, or the shutdown sequence has a silent step and "+
+					"nobody can tell whether it ran")
+		})
+
+		t.Run("failure", func(t *testing.T) {
+			// A WARNING, not an error: the process is exiting regardless and the kernel closes
+			// the sockets, so this reports what did not close cleanly rather than work anyone
+			// can still act on. Logging it at error would page for a condition with no remedy.
+			hook := logtest.NewGlobal()
+			defer hook.Reset()
+
+			publisher := &wiringRecordingPublisher{
+				NoopEventPublisher: NewNoopEventPublisher(),
+				err:                errors.New("wiring test: the writer refused to close"),
+			}
+			require.Error(t, (&Blnk{events: publisher}).Close())
+
+			var warned bool
+			for _, entry := range hook.AllEntries() {
+				if entry.Level == logrus.WarnLevel &&
+					strings.Contains(entry.Message, "releasing service resources reported errors") {
+					warned = true
+
+					break
+				}
+			}
+			assert.True(t, warned, "a failed release must be reported, at warning rather than error")
+		})
+	})
 }
 
 // TestInitializeEventPublisher_NeverReturnsANilPublisher pins the field invariant the
@@ -643,11 +707,104 @@ func TestInitializeEventPublisher_NeverReturnsANilPublisher(t *testing.T) {
 		{name: "an empty broker list", cnf: &config.Configuration{Kafka: config.KafkaConfig{Brokers: []string{}}}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			publisher, err := initializeEventPublisher(testCase.cnf)
+			publisher, err := initializeEventPublisher(testCase.cnf, ProcessRoleServer)
 			require.NoError(t, err, fmt.Sprintf("%s must not fail construction", testCase.name))
 			require.NotNil(t, publisher)
 			assert.True(t, IsNoopEventPublisher(publisher))
 		})
+	}
+}
+
+// TestInitializeEventPublisher_OnlyThePublishingRoleBuildsAProducer pins the least-privilege
+// boundary between the process roles.
+//
+// It is the assertion that stops the worker holding write authority over every ledger topic.
+// The configuration below IS fully publishable — brokers, an insecure-local-dev
+// acknowledgement, everything a producer needs — so the ONLY thing that can make the result a
+// no-op is the role. A regression that dropped the role check would build a real producer here
+// and fail, which is the point: the check is invisible in behaviour otherwise, because a
+// producer nothing calls looks exactly like no producer at all until the credential leaks.
+func TestInitializeEventPublisher_OnlyThePublishingRoleBuildsAProducer(t *testing.T) {
+	// THE SHARED BLACKHOLE CONSTANT, not a literal. This fixture held 198.51.100.1 — a PUBLIC
+	// documentation address — and it has to be private space now, for the reason the constant's
+	// own comment gives: KAFKA_INSECURE_LOCAL_DEV asserts the broker is local, and
+	// requireLocalBrokersForPlaintext verifies the assertion instead of merely warning about it,
+	// so an acknowledged-plaintext configuration pointing at a public address is one the
+	// transport must REFUSE. A refusal here would fail this test for a reason that has nothing
+	// to do with the role boundary it exists to pin.
+	publishable := &config.Configuration{
+		Kafka: config.KafkaConfig{
+			Brokers:          []string{wiringBlackholeBroker},
+			TopicPrefix:      "blnk",
+			InsecureLocalDev: true,
+		},
+	}
+
+	t.Run("the server role builds a real producer", func(t *testing.T) {
+		publisher, err := initializeEventPublisher(publishable, ProcessRoleServer)
+		require.NoError(t, err)
+		require.NotNil(t, publisher)
+		assert.False(t, IsNoopEventPublisher(publisher),
+			"the server hosts the relay, so it is the one role that must be able to publish")
+
+		if closer, ok := publisher.(io.Closer); ok {
+			assert.NoError(t, closer.Close())
+		}
+	})
+
+	// Both non-publishing roles, against the SAME publishable configuration, so the assertion
+	// is about the role and nothing else.
+	for _, role := range []ProcessRole{ProcessRoleWorker, ProcessRoleTool} {
+		t.Run(string(role)+" gets the no-op even with a publishable configuration", func(t *testing.T) {
+			publisher, err := initializeEventPublisher(publishable, role)
+			require.NoError(t, err)
+			require.NotNil(t, publisher)
+			assert.True(t, IsNoopEventPublisher(publisher),
+				"role %q publishes nothing, so it must hold no writer and no producer credential", role)
+		})
+	}
+
+	// The role check must precede the configuration read, or a non-publishing role would still
+	// fail to start on a credential it would never present. Plaintext without the
+	// local-development acknowledgement is the cheapest configuration NewEventPublisher
+	// refuses outright.
+	t.Run("a non-publishing role is unaffected by a producer misconfiguration", func(t *testing.T) {
+		refused := &config.Configuration{
+			Kafka: config.KafkaConfig{
+				Brokers:     []string{wiringBlackholeBroker},
+				TopicPrefix: "blnk",
+			},
+		}
+
+		_, serverErr := initializeEventPublisher(refused, ProcessRoleServer)
+		require.Error(t, serverErr,
+			"the precondition for this test: the server role must refuse this configuration")
+
+		publisher, err := initializeEventPublisher(refused, ProcessRoleWorker)
+		require.NoError(t, err,
+			"the worker never presents this credential, so refusing to start on it would be a "+
+				"broker outage taking down a role that does not use the broker")
+		assert.True(t, IsNoopEventPublisher(publisher))
+	})
+}
+
+// TestProcessRole_PublishesEventsIsAnAllowlist pins the direction the role test fails in.
+//
+// Only the server publishes. A role added later without a decision recorded in
+// PublishesEvents must come out non-publishing, because the alternative failure — a new role
+// silently acquiring write authority over every ledger topic — is the one that cannot be
+// noticed by watching the system behave.
+func TestProcessRole_PublishesEventsIsAnAllowlist(t *testing.T) {
+	assert.True(t, ProcessRoleServer.PublishesEvents(),
+		"the server hosts the relay and is the only producer of Kafka messages")
+	assert.False(t, ProcessRoleWorker.PublishesEvents(),
+		"the worker captures events into the outbox and publishes none")
+	assert.False(t, ProcessRoleTool.PublishesEvents(),
+		"migrate and verify-chain publish nothing")
+
+	for _, unknown := range []ProcessRole{"", "relay", "SERVER", "server ", "future-role"} {
+		assert.Falsef(t, unknown.PublishesEvents(),
+			"role %q is not on the allowlist, so it must not be treated as a publisher", unknown)
 	}
 }
 

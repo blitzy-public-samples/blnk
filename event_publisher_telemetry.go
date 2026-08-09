@@ -17,17 +17,21 @@ limitations under the License.
 package blnk
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/blnkfinance/blnk/model"
 	"github.com/sirupsen/logrus"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/apierror"
+	"github.com/blnkfinance/blnk/internal/logsafe"
 )
 
 // This file holds the publisher's TELEMETRY VOCABULARY and its PROCESS-WIDE LIFECYCLE — the
@@ -67,7 +71,11 @@ const (
 // identifier keeps. Sixteen hex characters is 64 bits: ample to distinguish the ledgers a
 // single operator is looking at without being reversible, and the full digest would only
 // make the line longer.
-const logIdentifierHashLength = 16
+//
+// An alias of the canonical value rather than a second declaration: package api hashes
+// identifiers for its request log too, and two lengths would make the same subject
+// correlate under two different digests.
+const logIdentifierHashLength = logsafe.IdentifierHashLength
 
 // maxLazyTopicWriters bounds how many writers may be cached for topics that were not part
 // of the publisher's constructed inventory.
@@ -78,17 +86,20 @@ const logIdentifierHashLength = 16
 // arriving for the previous name — and one further change on top of it, without a restart.
 //
 // The number is a literal because a const cannot call a function, which makes it exactly the
-// kind of value that goes stale when a category is added or removed. It HAS gone stale once:
-// it read 16 — two four-category generations — while the catalogue carried five categories,
-// and nothing failed at build or run time. TestMaxLazyTopicWriters_IsTwoPrefixGenerations ties
-// it back to the inventory so the arithmetic is checked rather than trusted, which is what
-// turned that silent staleness into a failing test.
+// kind of value that goes stale when a category is added or removed. It HAS gone stale in both
+// directions: it read 16 while the catalogue briefly carried five categories, and it read 20
+// after the catalogue was returned to its frozen four. Nothing failed at build or run time
+// either time. TestMaxLazyTopicWriters_IsTwoPrefixGenerations ties it back to the inventory so
+// the arithmetic is checked rather than trusted, which is what turns that silent staleness into
+// a failing test.
+//
+// Four categories → 8 writers per generation → 16 for two.
 //
 // Past the bound the oldest lazily-created writer is retired. Retirement is an eviction and
 // never a refusal: a retired topic published to again simply gets a new writer, so bounding
 // this cache costs at most one reconnection for a topic that has not been used recently, and
 // prevents a pool of connections that only ever grows.
-const maxLazyTopicWriters = 20
+const maxLazyTopicWriters = 16
 
 // PublishPurpose distinguishes the three reasons a message is written, so that one event's
 // telemetry cannot be confused with another's.
@@ -97,13 +108,17 @@ const maxLazyTopicWriters = 20
 // indistinguishable in the metrics, with two concrete consequences:
 //
 //   - The dead-letter RATE divides dead-lettered events by the TOTAL TERMINAL OUTCOMES —
-//     dead-lettered plus published — so both counters have to count the same population,
+//     dead-lettered plus DISPATCHED — so both counters have to count the same population,
 //     each event once. An operator replaying fifty dead-lettered events would otherwise add
-//     fifty to the published side of that sum and make the rate depend on how much triage
-//     happened that day. (The denominator is the sum rather than the published count alone
+//     fifty to the delivered side of that sum and make the rate depend on how much triage
+//     happened that day. (The denominator is the sum rather than the dispatched count alone
 //     because the two counters are DISJOINT: dividing by successes would report
 //     dead-letters as a fraction of successes, which overstates the rate and diverges
-//     without bound as failures rise. See metrics.EventsPublishedTotal.)
+//     without bound as failures rise. The delivered side is metrics.EventsDispatchedTotal
+//     and NOT metrics.EventsPublishedTotal, which counts acknowledged writes rather than
+//     events and therefore includes redeliveries — see PERF-P21. Purpose still governs the
+//     write counter for the same reason it governs everything else here: a replay is not
+//     original throughput.)
 //   - The latency TARGET is stated for first-attempt original publishes. A replay is attempt
 //     N+1 of an event that already failed five times, and a dead-letter write is not part of
 //     any retry sequence at all; giving either of them a numeric attempt label would extend
@@ -115,7 +130,10 @@ const (
 	// PublishPurposeOriginal is a first delivery of an event to its category topic. An
 	// UNSTATED purpose — the empty string a zero-valued PublishRequest carries — resolves
 	// to it, which is the only thing the mandated envelope-only Publish method can mean.
-	// Only this purpose increments the published-events counter.
+	// It is the only purpose the relay publishes under, and therefore the only one that
+	// can reach the published-events counter — which the RELAY increments, after the
+	// transition that makes the delivery durable, rather than the publisher on the
+	// broker's acknowledgement.
 	//
 	// It is spelled out rather than being the empty string because it is a LABEL VALUE and
 	// a log field: "original" is greppable and self-describing on a dashboard, whereas an
@@ -125,11 +143,14 @@ const (
 	// PublishPurposeReplay is an operator-triggered re-publication of a dead-lettered event
 	// to its original topic. It is recorded under a fixed attempt label and never counted as
 	// a newly published event: the event is being delivered again, not for the first time.
+	// It IS counted on the broker-acknowledgement counter, under this purpose — that counter
+	// measures traffic the broker accepted, and a replay is real traffic.
 	PublishPurposeReplay PublishPurpose = "replay"
 
 	// PublishPurposeDeadLetter is a write to a `<topic>.dlt` sibling. It is recorded under
 	// its own fixed attempt label, and its terminal accounting is the dead-lettered counter
-	// rather than the published counter.
+	// rather than the published counter. Like a replay, it is counted on the
+	// broker-acknowledgement counter under this purpose.
 	PublishPurposeDeadLetter PublishPurpose = "dead_letter"
 )
 
@@ -269,16 +290,200 @@ func attemptLabel(purpose PublishPurpose, attempt int) string {
 // Parameters:
 //   - value string: the identifier. May be empty.
 //
+// The implementation lives in internal/logsafe so that package api hashes identifiers by
+// exactly the same rule; this remains the name package blnk calls.
+//
 // Returns:
 //   - string: a short hex token, or "" for an empty input.
 func hashLogIdentifier(value string) string {
-	if value == "" {
-		return ""
+	return model.HashIdentifier(value)
+}
+
+// HashLogIdentifier is the exported form of hashLogIdentifier, so that every layer produces
+// the SAME token for the same identifier.
+//
+// It exists because the pseudonym has to be a PIVOT rather than a per-package convention. An
+// operator reads subscriber_id_hash in a log line or on a metric series and needs to resolve
+// it to a subscriber; the API layer therefore has to publish the same token on the subscriber
+// resource, and the API layer is a different package. A second implementation there — even a
+// correct one — would be a second thing to keep in step, and the failure mode of drift is
+// silent: two tokens for one subscriber, and a pivot that returns nothing.
+//
+// The rule is deliberately simple enough to reproduce outside Go, which is the other half of
+// making the pseudonym usable: SHA-256 of the exact identifier bytes, hex-encoded, truncated
+// to the first 16 characters. docs/kafka-operations.md publishes the shell equivalent so an
+// operator can hash a candidate identifier without this binary.
+//
+// Parameters:
+//   - value string: the identifier. May be empty.
+//
+// Returns:
+//   - string: a short hex token, or "" for an empty input.
+func HashLogIdentifier(value string) string {
+	return hashLogIdentifier(value)
+}
+
+// The bounded classes a Kafka failure is reported as in a LOG LINE.
+//
+// Separate from the adminSpanError* vocabulary in event_tracing.go, and deliberately so: that
+// set describes an administrative operation, while a log line is also emitted for a produce, a
+// metadata read and an offset read, and it has to distinguish the two conditions that are
+// nobody's fault — no broker configured, and a caller that gave up — from the ones that are.
+//
+// Every member is a fixed literal and the set is closed, which is what makes the value safe as
+// a log field. A kafka-go error is not: it renders with broker hostnames, listener addresses,
+// the topic and partition it was acting on and, for a credential operation, the principal.
+const (
+	kafkaErrorClassNone          = "none"
+	kafkaErrorClassNotConfigured = "not_configured"
+	kafkaErrorClassCancelled     = "context_cancelled"
+	kafkaErrorClassDeadline      = "context_deadline_exceeded"
+	kafkaErrorClassPublisher     = "publisher_state"
+	kafkaErrorClassTopicRefused  = "topic_not_owned"
+	kafkaErrorClassMessageTooBig = "message_too_large"
+	kafkaErrorClassAuthorizer    = "authorizer_not_enforcing"
+	kafkaErrorClassGeometry      = "topic_geometry_refused"
+	kafkaErrorClassBroker        = "broker_error"
+)
+
+// KafkaErrorClass maps a Kafka failure to one of the bounded classes above.
+//
+// The two context conditions are tested FIRST because they are reachable through every other
+// condition: a produce that was cancelled mid-flight surfaces as a wrapped context error on
+// one path and as a broker write error on another, and reporting one operator-visible event
+// under two classes depending on where it landed makes the series useless for alerting.
+//
+// not_configured is separated from every failure class because IT IS NOT A FAILURE. A
+// deployment with no brokers is a supported steady state — the publisher degrades to the no-op
+// and the ledger serves traffic exactly as before — so a caller that receives it must be able
+// to decide not to warn. See GetEventOutboxStats, which is the endpoint that was warning on
+// every request in precisely that configuration.
+//
+// Parameters:
+//   - cause error: the Kafka failure. May be nil.
+//
+// Returns:
+//   - string: one of the kafkaErrorClass* constants. Never empty.
+func KafkaErrorClass(cause error) string {
+	switch {
+	case cause == nil:
+		return kafkaErrorClassNone
+	case errors.Is(cause, context.Canceled):
+		return kafkaErrorClassCancelled
+	case errors.Is(cause, context.DeadlineExceeded):
+		return kafkaErrorClassDeadline
+	case errors.Is(cause, ErrKafkaAdminNotConfigured):
+		return kafkaErrorClassNotConfigured
+	case errors.Is(cause, ErrEventPublisherClosed), errors.Is(cause, ErrKafkaProducerCredentialsRequired):
+		return kafkaErrorClassPublisher
+	case errors.Is(cause, ErrTopicNotOwned):
+		return kafkaErrorClassTopicRefused
+	case errors.Is(cause, ErrEventMessageTooLarge):
+		return kafkaErrorClassMessageTooBig
+	case errors.Is(cause, ErrAuthorizerNotEnforcing):
+		return kafkaErrorClassAuthorizer
+	case errors.Is(cause, ErrPartitionGrowthRefused), errors.Is(cause, ErrReplicationFactorInadequate):
+		return kafkaErrorClassGeometry
+	default:
+		return kafkaErrorClassBroker
+	}
+}
+
+// LogKafkaDiagnostic sends a Kafka client's own error text to the trace-level diagnostic sink.
+//
+// It is the counterpart of the database package's logDatabaseDiagnostic and exists for the same
+// reason: the raw text is genuinely useful when a broker is misbehaving, and it names brokers,
+// listeners, topics and principals, so it must not be in the log by default. TRACE is the sink
+// because DEBUG is already this pipeline's routine per-event volume — see the LogLevel field in
+// config — so an operator who raises the level to debug to follow a delivery must not thereby
+// start shipping cluster topology.
+//
+// The level is checked before the error is formatted rather than left to logrus, because
+// WithError formats eagerly and this is on failure paths that a broker outage makes hot.
+//
+// Parameters:
+//   - operation string: a FIXED literal naming what was attempted, for correlation with the
+//     bounded line that precedes it.
+//   - cause error: the raw failure. A nil cause is a no-op.
+func LogKafkaDiagnostic(operation string, cause error) {
+	if cause == nil || !logrus.IsLevelEnabled(logrus.TraceLevel) {
+		return
 	}
 
-	sum := sha256.Sum256([]byte(value))
+	// THE RAW CAUSE IS ATTACHED VERBATIM HERE, and only here. This sink exists precisely so
+	// the driver's or client's own text is reachable when an operator asks for it explicitly,
+	// which is why it is gated on the trace level and why it does NOT go through the
+	// redacting helper every other site uses — redacting the one place the full text is
+	// supposed to be available would leave it available nowhere.
+	logrus.WithField("operation", operation).WithField(logrus.ErrorKey, cause).Trace(
+		"kafka diagnostic: the client's own error text, which may name brokers, listeners, " +
+			"topics and principals and is therefore emitted at trace only",
+	)
+}
 
-	return hex.EncodeToString(sum[:])[:logIdentifierHashLength]
+// withKafkaError attaches the BOUNDED CLASS of a Kafka failure to a log entry and routes the
+// raw cause to the trace-level diagnostic sink.
+//
+// It exists so a call site can be converted by wrapping one expression rather than by
+// restructuring the statement, which is what keeps twenty conversions reviewable. The
+// diagnostic is emitted here rather than left to each caller for the same reason: a caller that
+// forgets it loses the raw text entirely, and the failure is silent.
+//
+// # THE ONE EXCEPTION, AND WHY IT IS NOT THIS
+//
+// PublishResult.LogFields keeps a rendered "error" field, and deliberately: AAP requirement R-4
+// mandates that "the attempt count and error reason must be logged on every attempt, not only
+// on final failure", and §0.1.3 names the field list — attempt, max attempts, error, event ID,
+// topic. That is an explicit AAP requirement, so it outranks the general rule this helper
+// enforces; the value is length-bounded by sanitizeLogValue instead. The same applies to the
+// error reason stored in failure_metadata and last_error, which R-5 requires as DATA rather
+// than as a log field. Every OTHER Kafka failure in this package goes through here.
+//
+// Parameters:
+//   - entry *logrus.Entry: the entry to extend. Must not be nil.
+//   - operation string: a FIXED literal naming what was attempted.
+//   - cause error: the failure. A nil cause still yields the "none" class, so a shared line
+//     keeps a stable field set.
+//
+// Returns:
+//   - *logrus.Entry: the entry carrying error_class, ready for a level call.
+func withKafkaError(entry *logrus.Entry, operation string, cause error) *logrus.Entry {
+	LogKafkaDiagnostic(operation, cause)
+
+	return entry.WithField("error_class", KafkaErrorClass(cause))
+}
+
+// kafkaErrorClassField is withKafkaError for a site that builds a logrus.Fields map rather than
+// chaining onto an entry.
+//
+// It routes the raw cause to the trace-level sink and returns the class, so converting a field
+// is a value substitution inside the map literal and the statement around it is untouched.
+//
+// Parameters:
+//   - operation string: a FIXED literal naming what was attempted.
+//   - cause error: the failure. May be nil.
+//
+// Returns:
+//   - string: a bounded class, suitable as an "error_class" field value.
+func kafkaErrorClassField(operation string, cause error) string {
+	LogKafkaDiagnostic(operation, cause)
+
+	return KafkaErrorClass(cause)
+}
+
+// kafkaErrorEntry starts a log entry carrying only the bounded class of a Kafka failure.
+//
+// The convenience form of withKafkaError, for a site that previously read
+// logrus.WithField("error", ...) and has no other fields to carry.
+//
+// Parameters:
+//   - operation string: a FIXED literal naming what was attempted.
+//   - cause error: the failure. May be nil.
+//
+// Returns:
+//   - *logrus.Entry: ready for a level call.
+func kafkaErrorEntry(operation string, cause error) *logrus.Entry {
+	return withKafkaError(logrus.NewEntry(logrus.StandardLogger()), operation, cause)
 }
 
 // publisherAuthMode names the authentication the publisher will use, without disclosing
@@ -459,7 +664,7 @@ func SharedEventPublisher() (TopicEventPublisher, error) {
 		superseded := sharedEventPublisher.publisher
 		sharedEventPublisher.publisher = nil
 		if closeErr := superseded.Close(); closeErr != nil {
-			logrus.WithError(closeErr).Warn(
+			withLoggableCause(nil, closeErr).Warn(
 				"failed to close the superseded shared event publisher after a configuration change",
 			)
 		}
@@ -509,7 +714,7 @@ func SetSharedEventPublisher(publisher TopicEventPublisher) {
 	if sharedEventPublisher.selfBuilt && sharedEventPublisher.publisher != nil {
 		displaced := sharedEventPublisher.publisher
 		if closeErr := displaced.Close(); closeErr != nil {
-			logrus.WithError(closeErr).Warn(
+			withLoggableCause(nil, closeErr).Warn(
 				"failed to close the self-built shared event publisher as it was displaced",
 			)
 		}

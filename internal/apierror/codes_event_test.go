@@ -45,6 +45,10 @@ var eventStreamingCodeCases = []struct {
 	{ErrEventNotFound, http.StatusNotFound, "EVENT_NOT_FOUND"},
 	{ErrEventNotDeadLettered, http.StatusConflict, "EVENT_NOT_DEAD_LETTERED"},
 	{ErrEventReplayFailed, http.StatusInternalServerError, "EVENT_REPLAY_FAILED"},
+	// 409 and not 404: the row exists and the caller's request is well formed — the resolution
+	// it asks for has already been recorded, so repeating it would overwrite one operator's note
+	// with another's. The remedy is to read the existing resolution, not to retry.
+	{ErrEventAlreadyResolved, http.StatusConflict, "EVENT_ALREADY_RESOLVED"},
 	// The identifier says Kafka but the string carries the EVENT_ family prefix, and
 	// that asymmetry is deliberate. So is the 503: an unreachable broker is a
 	// retryable upstream condition, not a defect here, so it must not resolve to 500.
@@ -54,11 +58,25 @@ var eventStreamingCodeCases = []struct {
 	// A dependency of issuance being unconfigured is not a malformed request, so 503
 	// and never 400: only an operator can supply the externally advertised list.
 	{ErrSubscriberBrokersNotConfigured, http.StatusServiceUnavailable, "SUBSCRIBER_BROKERS_NOT_CONFIGURED"},
-	// The three STATE refusals. All 409, because the request is well formed and it is
+	// The two STATE refusals. Both 409, because the request is well formed and it is
 	// the registry row that has to change before the identical request can succeed.
-	{ErrSubscriberIsolationUnenforceable, http.StatusConflict, "SUBSCRIBER_ISOLATION_UNENFORCEABLE"},
+	//
+	// SUBSCRIBER_ISOLATION_UNENFORCEABLE was a third, and it is deliberately GONE rather
+	// than retained unused: it named the refusal to issue a credential to a subscriber
+	// recording a partition-key prefix, which is no longer refused — the prefix is a
+	// consumer-side filtering contract, disclosed with the credential instead of standing in
+	// the way of it. A code nothing can return documents a refusal that does not happen.
 	{ErrSubscriberDeprovisioning, http.StatusConflict, "SUBSCRIBER_DEPROVISIONING"},
 	{ErrSubscriberGrantEmpty, http.StatusConflict, "SUBSCRIBER_GRANT_EMPTY"},
+	// A fourth state refusal, and the one whose state lives at the BROKER rather than in the
+	// registry row. 409 for the same reason and never the 503 of the *_FAILED codes: the
+	// broker answered, so there is no upstream condition for a retry to outlast.
+	{ErrSubscriberAccessExceedsAuthorization, http.StatusConflict, "SUBSCRIBER_ACCESS_EXCEEDS_AUTHORIZATION"},
+	// 403, and the only one here that is about the CHANNEL rather than about state: the request
+	// is well formed and the caller is authorised, and the server is refusing to put a one-time
+	// secret on a transport it cannot establish as confidential. A retry over the same transport
+	// cannot succeed, which is why it is not a 503.
+	{ErrSubscriberInsecureTransport, http.StatusForbidden, "SUBSCRIBER_INSECURE_TRANSPORT"},
 	// 504, not 503 and emphatically not the 500 a missing entry would produce: the
 	// dependency answered too slowly, or the caller went away.
 	{ErrSubscriberProvisioningTimeout, http.StatusGatewayTimeout, "SUBSCRIBER_PROVISIONING_TIMEOUT"},
@@ -75,9 +93,21 @@ func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 	// catalog is what the guard exists to prevent: a code that arrives with neither a
 	// status entry nor a row here would then satisfy a self-referential comparison and
 	// resolve to the unknown-code 500 in production. Adding a code is a deliberate edit
-	// of this number.
-	if len(eventStreamingCodeCases) != 12 {
-		t.Fatalf("eventStreamingCodeCases has %d rows, want 12 (one per new code in codes.go)", len(eventStreamingCodeCases))
+	// of this number — as is REMOVING one, and the arithmetic that produced 14 is worth
+	// recording because every step of it was a separate edit:
+	//
+	//   12 — the original event-streaming family.
+	//   −11 — SUBSCRIBER_ISOLATION_UNENFORCEABLE retired, because the refusal it named was
+	//        replaced by issuing the credential and delivering the key scope to the consumer.
+	//   +14 — EVENT_ALREADY_RESOLVED, SUBSCRIBER_INSECURE_TRANSPORT and
+	//        SUBSCRIBER_ACCESS_EXCEEDS_AUTHORIZATION added.
+	//
+	// The number was left at 11 while the rows were added, which is how the guard came to fail
+	// for the right reason — the inventory no longer matched codes.go — and it caught a genuine
+	// omission underneath: SUBSCRIBER_ACCESS_EXCEEDS_AUTHORIZATION had no statusByCode entry at
+	// all, so a deliberate 409 was resolving to 500.
+	if len(eventStreamingCodeCases) != 14 {
+		t.Fatalf("eventStreamingCodeCases has %d rows, want 14 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
 	}
 	for _, tt := range eventStreamingCodeCases {
 		t.Run(string(tt.code), func(t *testing.T) {

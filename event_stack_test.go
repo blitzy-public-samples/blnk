@@ -37,9 +37,12 @@ package blnk
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -337,13 +340,68 @@ func TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation(t *test
 			continue
 		}
 
-		// Advice printed to the operator: a quoted fragment inside a message argument, not a
-		// command. These interpolate nothing at runtime.
-		assert.Truef(t, strings.HasPrefix(trimmed, `"`),
+		// THE VERSION PROBE, and it is the one function allowed to receive the variable.
+		//
+		// resolve_compose_cl must know which Compose it is about to use, because the compose files
+		// need depends_on.required and that field arrived in 2.20.0 — a host below it cannot parse
+		// them at all. compose_version_of runs `<invocation> version --short`, which reads no
+		// compose file, interpolates no service and consults no KAFKA_BROKERS, so it is outside
+		// the precedence problem this guard exists for rather than an exception to it.
+		//
+		// Named explicitly rather than allowing "any function call", so a helper added later that
+		// runs a REAL compose command on the side still fails here.
+		if strings.Contains(trimmed, `compose_version_of "${COMPOSE_CL}"`) {
+			continue
+		}
+
+		// Everything that survives to here must be a READ of the variable's value rather than an
+		// execution of it: printed advice, a message argument, a comparison. What fails is
+		// COMMAND POSITION — the only place an invocation can skip the pin.
+		//
+		// Tested by position rather than by "the line starts with a quote", which was the earlier
+		// rule and was wrong in both directions: it rejected a printf whose message merely names
+		// the variable, and it accepted a continuation line that began with a quote and went on to
+		// execute one.
+		commandPositions := []string{
+			`${COMPOSE_CL} `,
+			`${COMPOSE_CL}"`,
+			`${COMPOSE_CL}` + "\n",
+		}
+		executed := false
+		for _, opener := range []string{"", "$(", "`", "| ", "|| ", "&& ", "; ", "then ", "do ", "! "} {
+			for _, position := range commandPositions {
+				if strings.HasPrefix(trimmed, opener+position) {
+					executed = true
+				}
+			}
+			if strings.Contains(trimmed, opener+`${COMPOSE_CL} `) && opener != "" {
+				executed = true
+			}
+		}
+
+		assert.Falsef(t, executed,
 			"stack.sh line %q invokes compose directly. Every invocation must go through the "+
 				"compose() helper, or it receives whichever KAFKA_BROKERS survived sourcing .env "+
 				"instead of the effective one", trimmed)
 	}
+
+	// THE VERSION FLOOR ITSELF, asserted here because the resolver is the only thing that enforces
+	// it and a silent removal would reintroduce F-33: a Compose v1 host that fails on
+	// depends_on.required rather than on a version check, with an error naming a field.
+	assert.Contains(t, stack, `COMPOSE_MINIMUM_VERSION="2.20.0"`,
+		"the resolver must state the version floor the compose files require, because "+
+			"depends_on.required arrived in Compose 2.20.0 and an older release cannot parse them")
+	assert.NotContains(t, stack, `command -v docker-compose`,
+		"the standalone docker-compose script is Compose v1, below the floor, and must not be "+
+			"probed for: falling back to it replaces a clear version refusal with a parse error")
+	assert.NotContains(t, stack, `COMPOSE_CL="docker-compose"`,
+		"nothing may resolve to Compose v1")
+
+	// ONE resolver, not two. Both copies were identical, so the later silently shadowed the
+	// former and a fix applied to the first would have had no effect at all.
+	assert.Equal(t, 1, strings.Count(stack, "\nresolve_compose_cl() {"),
+		"resolve_compose_cl must be defined exactly once; a duplicate definition shadows the "+
+			"first and makes an edit to it a no-op")
 
 	// The two-variable capture that makes the precedence reproducible must survive: "unset" and
 	// "set to empty" are different answers, and compose treats an explicitly empty shell value as
@@ -589,6 +647,59 @@ func TestStackScript_GeneratesBothKafkaPrincipals(t *testing.T) {
 	assert.Contains(t, script, "kafka_producer_principal",
 		"and the producer principal must be named once, so the identity stack.sh writes and the "+
 			"identity kafka-provision.sh mints are the same")
+}
+
+// TestStackScript_DefinesEachFunctionExactlyOnce is Q-02.
+//
+// # What was wrong
+//
+// resolve_compose_cl was defined TWICE, sixty-five lines apart, together with a duplicated
+// section banner and a duplicated block of documentation. The two bodies were byte-identical,
+// so nothing misbehaved — which is exactly what makes it worth a guard. In a shell script the
+// LAST definition silently replaces the earlier one, so the copy a reader finds first, edits,
+// and satisfies themselves about is not necessarily the copy that runs. The next divergent
+// edit to the wrong copy would change nothing at all and would be indistinguishable from a
+// change that did not work, on the function that decides whether the whole stack can talk to
+// Docker.
+//
+// # Why the assertion is over EVERY function rather than that one
+//
+// The defect is a property of the file — 1,500 lines of shell with no compiler, where a
+// redefinition is not an error and not a warning — so pinning the single function that
+// happened to be duplicated would leave the next one unguarded. Counting every definition
+// costs nothing and states the invariant that actually matters: one name, one body.
+func TestStackScript_DefinesEachFunctionExactlyOnce(t *testing.T) {
+	script := readRepoFile(t, "stack.sh")
+
+	// Top-level POSIX definitions only: `name() {` at column zero. A nested or indented
+	// helper is out of scope here, and this file has none.
+	definition := regexp.MustCompile(`(?m)^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{`)
+
+	counts := map[string]int{}
+	for _, match := range definition.FindAllStringSubmatch(script, -1) {
+		counts[match[1]]++
+	}
+
+	require.NotEmpty(t, counts, "the definition pattern must actually match this script")
+
+	for name, count := range counts {
+		assert.Equalf(t, 1, count,
+			"stack.sh defines %s() %d times. A shell script silently keeps the LAST definition, so "+
+				"the copy a reader edits may not be the copy that runs — and identical copies make "+
+				"the next divergent edit invisible rather than wrong. Keep one definition.",
+			name, count)
+	}
+
+	// The function the finding named, asserted by name as well as by count, so the regression
+	// this test exists for is legible without decoding the loop above.
+	assert.Equal(t, 1, counts["resolve_compose_cl"],
+		"resolve_compose_cl must be defined exactly once")
+
+	// The duplicated banner went with it. Two identically titled sections is how the second
+	// copy escaped review in the first place: each section read correctly on its own.
+	assert.Equal(t, 1, strings.Count(script, "# The Compose command line\n"),
+		"the duplicated section banner must be gone too; two identically titled sections is what "+
+			"made the duplicate body look like the only body")
 }
 
 // ---------------------------------------------------------------------------
@@ -856,4 +967,389 @@ func TestCompose_PassesTheProducerIdentityToProvisioning(t *testing.T) {
 					"and worker read, so one .env configures both sides", file, variable)
 		}
 	}
+}
+
+// TestLogLevel_IsProjectedByEveryRuntimeSurfaceThatAdvertisesIt closes the gap between an
+// instruction and the deployments it is given to.
+//
+// The event pipeline's per-event diagnostics are emitted at DEBUG on purpose — the
+// successful-publish lines in the relay and the publisher, the metrics collector's per-tick
+// summary, and the notice that a consumer-lag series has been retired — because at the 500
+// events per second this pipeline targets, a line per published event saying "it worked" is
+// volume rather than observability. .env.example therefore tells an operator to raise the
+// level to investigate event delivery, and docs/metrics.md repeats it.
+//
+// That instruction is only true where the variable actually reaches the process. It reached a
+// binary started by hand and NOTHING ELSE: no compose service forwarded it and no Deployment
+// projected it, so an operator following the documentation on the two deployments Blnk ships
+// changed the level and saw no additional line, with nothing to explain why. The failure is
+// silent in both directions — the pipeline looks quiet and the setting looks ineffective.
+//
+// Every surface is asserted here rather than one per file so the four projections cannot drift
+// apart: a key added to the compose files and forgotten in the manifests leaves the same gap
+// on the deployment that is hardest to debug.
+func TestLogLevel_IsProjectedByEveryRuntimeSurfaceThatAdvertisesIt(t *testing.T) {
+	const variable = "BLNK_LOG_LEVEL"
+
+	// The template advertises it. This is the claim the projections below have to honour, so
+	// it is asserted rather than assumed: were the key ever removed from the template, the
+	// rest of this test would be enforcing a contract nobody had published.
+	assert.Containsf(t, readRepoFile(t, ".env.example"), variable+"=",
+		".env.example must declare %s: it is where the instruction to raise the level for an "+
+			"event-delivery investigation is published", variable)
+
+	t.Run("both compose services forward it", func(t *testing.T) {
+		for _, file := range composeProjections {
+			for _, service := range composeApplicationServices {
+				environment, ok := composeService(t, file, service)["environment"].(map[string]interface{})
+				require.Truef(t, ok, "%s: the %q service must declare an environment map", file, service)
+
+				value, present := environment[variable]
+				require.Truef(t, present,
+					"%s: the %q service must forward %s, or raising the level has no effect on the "+
+						"compose stack — which is the deployment an operator is most likely to be "+
+						"debugging", file, service, variable)
+
+				// Compose's PASS-THROUGH form: a key with no value copies the variable when it
+				// is set and leaves it ENTIRELY ABSENT when it is not. `${NAME:-}` would set an
+				// empty string instead, which is the shape that silently defeats the
+				// BLNK_-prefixed alias block this key belongs to.
+				assert.Emptyf(t, toStringValue(value),
+					"%s: %s must use compose's pass-through form — the key with nothing after the "+
+						"colon — so an unset variable is absent from the container rather than "+
+						"present and empty.\n  got: %q", file, variable, toStringValue(value))
+			}
+		}
+	})
+
+	t.Run("the ConfigMap declares it and both Deployments project it", func(t *testing.T) {
+		root := moduleRootDir(t)
+
+		configMap := readYAMLFile(t, filepath.Join(root, "infrastructure", "k8s-manifests", "blnk-config.yaml"))
+		data, ok := configMap["data"].(map[string]interface{})
+		require.True(t, ok, "blnk-config.yaml must declare a data map")
+
+		declared, present := data[variable]
+		require.Truef(t, present,
+			"blnk-config.yaml must declare %s, or the Deployments below have no key to reference "+
+				"and every pod fails to start", variable)
+		assert.Emptyf(t, toStringValue(declared),
+			"%s must ship EMPTY, which means info: debug is verbose in proportion to throughput and "+
+				"is a diagnostic setting for the duration of an investigation, not a deployment "+
+				"default", variable)
+
+		for _, manifest := range []string{"server-deployment.yaml", "worker-deployment.yaml"} {
+			deployment := readYAMLFile(t, filepath.Join(root, "infrastructure", "k8s-manifests", manifest))
+
+			reference := deploymentEnvConfigMapKey(t, deployment, manifest, variable)
+			assert.Equalf(t, "blnk-config", reference["name"],
+				"%s: %s must come from the blnk-config ConfigMap", manifest, variable)
+			assert.Equalf(t, variable, reference["key"],
+				"%s: %s must reference the key of the same name, or the value an operator edits is "+
+					"not the value the pod reads", manifest, variable)
+		}
+	})
+}
+
+// deploymentEnvConfigMapKey returns one Deployment env entry's configMapKeyRef.
+//
+// It walks the parsed manifest rather than grepping because the property is structural: the
+// entry has to be a valueFrom.configMapKeyRef, and a `value:` carrying a literal — which a
+// grep for the name would accept — would hard-code the level into the manifest and take a
+// rollout to change either way.
+//
+// Parameters:
+//   - t *testing.T: for the fatal on a manifest that does not have the expected shape.
+//   - deployment map[string]interface{}: the parsed Deployment.
+//   - manifest string: the file name, for messages.
+//   - variable string: the environment variable to find.
+//
+// Returns:
+//   - map[string]interface{}: the configMapKeyRef of that entry.
+func deploymentEnvConfigMapKey(
+	t *testing.T,
+	deployment map[string]interface{},
+	manifest, variable string,
+) map[string]interface{} {
+	t.Helper()
+
+	spec, ok := deployment["spec"].(map[string]interface{})
+	require.Truef(t, ok, "%s must declare a spec", manifest)
+	template, ok := spec["template"].(map[string]interface{})
+	require.Truef(t, ok, "%s must declare a pod template", manifest)
+	podSpec, ok := template["spec"].(map[string]interface{})
+	require.Truef(t, ok, "%s must declare a pod spec", manifest)
+	containers, ok := podSpec["containers"].([]interface{})
+	require.Truef(t, ok && len(containers) > 0, "%s must declare at least one container", manifest)
+	container, ok := containers[0].(map[string]interface{})
+	require.Truef(t, ok, "%s: the first container must be a mapping", manifest)
+	environment, ok := container["env"].([]interface{})
+	require.Truef(t, ok, "%s: the container must declare an env list", manifest)
+
+	for _, raw := range environment {
+		entry, isMap := raw.(map[string]interface{})
+		if !isMap || toStringValue(entry["name"]) != variable {
+			continue
+		}
+
+		valueFrom, hasValueFrom := entry["valueFrom"].(map[string]interface{})
+		require.Truef(t, hasValueFrom,
+			"%s: %s must be projected from the ConfigMap, not written as a literal value",
+			manifest, variable)
+
+		reference, hasReference := valueFrom["configMapKeyRef"].(map[string]interface{})
+		require.Truef(t, hasReference,
+			"%s: %s must use a configMapKeyRef", manifest, variable)
+
+		return reference
+	}
+
+	t.Fatalf("%s: the container env list does not project %s", manifest, variable)
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// The production broker workload
+//
+// Both assertions below cover failures that a `kubectl apply` reports as SUCCESS. The
+// manifest is accepted, the objects are created, and what goes wrong goes wrong minutes
+// later inside a container or not at all until a Kafka upgrade — so neither is catchable by
+// review of a diff or by any dry run, and each is asserted here instead.
+// ---------------------------------------------------------------------------
+
+// kafkaStatefulSet returns the parsed broker StatefulSet.
+func kafkaStatefulSet(t *testing.T) map[string]interface{} {
+	t.Helper()
+
+	return readYAMLFile(t, filepath.Join(
+		moduleRootDir(t), "infrastructure", "k8s-manifests", "kafka-statefulset.yaml",
+	))
+}
+
+// kafkaBootstrapScript returns the text of the init container's shell body.
+func kafkaBootstrapScript(t *testing.T) string {
+	t.Helper()
+
+	spec, ok := kafkaStatefulSet(t)["spec"].(map[string]interface{})
+	require.True(t, ok, "kafka-statefulset.yaml must declare a spec")
+	template, ok := spec["template"].(map[string]interface{})
+	require.True(t, ok, "kafka-statefulset.yaml must declare a pod template")
+	podSpec, ok := template["spec"].(map[string]interface{})
+	require.True(t, ok, "kafka-statefulset.yaml must declare a pod spec")
+	initContainers, ok := podSpec["initContainers"].([]interface{})
+	require.Truef(t, ok && len(initContainers) > 0,
+		"kafka-statefulset.yaml must declare the bootstrap init container: in KRaft a SCRAM "+
+			"credential has to be seeded while the metadata log is created, so the broker cannot "+
+			"authenticate anyone without it")
+
+	container, ok := initContainers[0].(map[string]interface{})
+	require.True(t, ok, "the first init container must be a mapping")
+	command, ok := container["command"].([]interface{})
+	require.Truef(t, ok && len(command) > 0, "the init container must declare a command")
+
+	return toStringValue(command[len(command)-1])
+}
+
+// assertValidKafkaClusterID holds a value to what a Kafka cluster ID actually is.
+//
+// It is the base64url encoding of a 16-byte UUID: exactly 22 characters from
+// [A-Za-z0-9_-], which is what `kafka-storage random-uuid` emits and what Uuid.fromString
+// accepts — it rejects anything longer than 22 outright. Kafka's two reserved IDs are
+// excluded as well, because a cluster claiming the zero UUID or the metadata topic ID is
+// not a cluster anyone should be running.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - source string: where the value came from, for the message.
+//   - id string: the value to judge.
+func assertValidKafkaClusterID(t *testing.T, source, id string) {
+	t.Helper()
+
+	assert.Lenf(t, id, 22,
+		"%s: a Kafka cluster ID is EXACTLY 22 characters — the base64url encoding of a 16-byte "+
+			"UUID. Kafka's Uuid.fromString rejects anything longer, and apache/kafka 3.9's format "+
+			"tool does NOT check: it writes whatever string it is given into meta.properties and "+
+			"the broker starts on it, so a wrong value works until something parses it as a UUID "+
+			"and by then the volume is formatted with it. Generate one with "+
+			"'kafka-storage.sh random-uuid'.\n  got: %q (%d characters)", source, id, len(id))
+
+	decoded, err := base64.RawURLEncoding.DecodeString(id)
+	require.NoErrorf(t, err,
+		"%s: a cluster ID must decode as unpadded base64url; %q does not", source, id)
+	assert.Lenf(t, decoded, 16,
+		"%s: a cluster ID must decode to 16 bytes, the width of a UUID; %q decodes to %d",
+		source, id, len(decoded))
+
+	for _, reserved := range []string{"AAAAAAAAAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAAAAAAAQ"} {
+		assert.NotEqualf(t, reserved, id,
+			"%s: %q is one of Kafka's reserved UUIDs and cannot name a cluster", source, id)
+	}
+}
+
+// TestKafkaStatefulSet_ComesUpInParallelBecauseOrderedReadyDeadlocksAQuorum covers a
+// permanent cold-start deadlock that reports itself as a slow broker.
+//
+// Three combined broker+controller replicas are all KRaft voters, so committing metadata
+// needs 2 of 3. Readiness is an authenticated, authorized `kafka-topics --list`, which
+// cannot answer until the quorum has elected a leader. OrderedReady creates pod N+1 only
+// once pod N is Ready. So kafka-0 waits for a quorum that needs kafka-1, and Kubernetes will
+// not create kafka-1 until kafka-0 is Ready.
+//
+// Nothing breaks the cycle on its own: a failing readiness probe does not restart a pod, the
+// startup probe is a TCP check that passes regardless, and no timeout applies. The set sits
+// at 1/3 for ever.
+//
+// The policy is asserted together with the two facts that make it necessary, so the
+// assertion cannot outlive its reason: were the set ever reduced to a single replica, or its
+// readiness reduced to something that does not need the quorum, this test says so instead of
+// enforcing a policy nobody can explain.
+func TestKafkaStatefulSet_ComesUpInParallelBecauseOrderedReadyDeadlocksAQuorum(t *testing.T) {
+	spec, ok := kafkaStatefulSet(t)["spec"].(map[string]interface{})
+	require.True(t, ok, "kafka-statefulset.yaml must declare a spec")
+
+	replicas, isNumber := spec["replicas"].(int)
+	require.Truef(t, isNumber, "the broker StatefulSet must declare a replica count")
+	require.GreaterOrEqualf(t, replicas, 3, "the KRaft quorum needs three voters to tolerate one loss")
+
+	assert.Equalf(t, "Parallel", toStringValue(spec["podManagementPolicy"]),
+		"with %d voting replicas and a quorum-dependent readiness probe, OrderedReady deadlocks "+
+			"the cold start permanently: pod 0 cannot become Ready without a majority, and no "+
+			"second pod is created until it is. podManagementPolicy governs creation and scaling "+
+			"only — rolling updates stay ordered through updateStrategy — so Parallel costs "+
+			"nothing on an upgrade", replicas)
+
+	// The voter list is static configuration and must name every replica, or the majority the
+	// policy above is chosen for cannot be reached however the pods are created.
+	script := kafkaBootstrapScript(t)
+	for ordinal := 0; ordinal < replicas; ordinal++ {
+		assert.Containsf(t, script, fmt.Sprintf("%d@kafka-%d.kafka-headless.", ordinal, ordinal),
+			"the KRaft voter list must name kafka-%d: it cannot be discovered, and it must be "+
+				"identical on every broker", ordinal)
+	}
+
+	// And readiness must still be the authenticated check the policy is reasoned about. A TCP
+	// probe here would remove the deadlock and make the assertion above unexplainable.
+	template, ok := spec["template"].(map[string]interface{})
+	require.True(t, ok)
+	podSpec, ok := template["spec"].(map[string]interface{})
+	require.True(t, ok)
+	containers, ok := podSpec["containers"].([]interface{})
+	require.True(t, ok && len(containers) > 0)
+	broker, ok := containers[0].(map[string]interface{})
+	require.True(t, ok)
+	probe, ok := broker["readinessProbe"].(map[string]interface{})
+	require.True(t, ok, "the broker must declare a readiness probe")
+	exec, ok := probe["exec"].(map[string]interface{})
+	require.Truef(t, ok,
+		"readiness must be an EXEC probe: a broker that has bound its port but cannot "+
+			"authenticate anyone is not ready, and a TCP check would call it ready and let the "+
+			"relay publish into a cluster that rejects every connection")
+	probeCommand, ok := exec["command"].([]interface{})
+	require.True(t, ok && len(probeCommand) > 0)
+	assert.Containsf(t, toStringValue(probeCommand[len(probeCommand)-1]), "--command-config",
+		"the readiness check must authenticate, which is what makes it depend on the quorum")
+}
+
+// TestKafkaStatefulSet_RefusesToFormatWithoutAValidClusterID covers the one step in this
+// deployment that cannot be corrected afterwards.
+//
+// The cluster ID is written into meta.properties, and a broker refuses a log whose ID
+// disagrees with its configuration — so a wrong value is fixed by destroying the volume. The
+// manifest once carried a 26-character fallback, which is not a cluster ID at all: it
+// exceeds the 22 characters Uuid.fromString accepts and decodes to 19 bytes rather than 16.
+// apache/kafka 3.9 formatted with it anyway and the broker started, which is what made the
+// value dangerous rather than harmless — it would have survived until something parsed it as
+// a UUID, with every volume already carrying it.
+//
+// So: no fallback in the format command, the shape enforced before the format runs, and any
+// value actually configured — in the ConfigMap or in the compose files — held to the same
+// shape here.
+func TestKafkaStatefulSet_RefusesToFormatWithoutAValidClusterID(t *testing.T) {
+	script := kafkaBootstrapScript(t)
+
+	t.Run("the format command has no fallback", func(t *testing.T) {
+		assert.Containsf(t, script, `--cluster-id "${KAFKA_CLUSTER_ID}"`,
+			"the ID must be taken from the ConfigMap alone")
+
+		// No DEFAULTING expansion anywhere in the script. `${KAFKA_CLUSTER_ID:-}` with an
+		// empty default is fine and is what the emptiness check below uses — under `set -u`
+		// it is how an unset variable is tested without aborting. `${KAFKA_CLUSTER_ID:-X}`
+		// for any non-empty X is the defect: it formats the volume with an ID nobody chose,
+		// and every deployment that left it unset would share that ID, which defeats the one
+		// check Kafka does make — a broker refusing to join a cluster whose ID is not its own.
+		const expansion = "${KAFKA_CLUSTER_ID:-"
+		for offset := 0; ; {
+			index := strings.Index(script[offset:], expansion)
+			if index < 0 {
+				break
+			}
+
+			at := offset + index + len(expansion)
+			require.Lessf(t, at, len(script), "truncated expansion of KAFKA_CLUSTER_ID")
+			assert.Equalf(t, byte('}'), script[at],
+				"a NON-EMPTY shell default for the cluster ID formats the volume with an ID "+
+					"nobody chose: %q", script[at-len(expansion):min(at+24, len(script))])
+
+			offset = at
+		}
+	})
+
+	t.Run("the shape is enforced before the format", func(t *testing.T) {
+		formatAt := strings.Index(script, "kafka-storage.sh format")
+		require.Positive(t, formatAt, "the init container must format the storage")
+
+		preamble := script[:formatAt]
+		assert.Containsf(t, preamble, `if [ -z "${KAFKA_CLUSTER_ID:-}" ]; then`,
+			"an empty ID must be refused BEFORE the format, which is the last moment it is "+
+				"still recoverable")
+		assert.Containsf(t, preamble, `*[!A-Za-z0-9_-]*`,
+			"the base64url alphabet must be enforced before the format")
+		assert.Containsf(t, preamble, `[ "${#KAFKA_CLUSTER_ID}" -ne 22 ]`,
+			"the 22-character width must be enforced before the format: it is the difference "+
+				"between a UUID and a string that merely looks like one")
+		assert.Containsf(t, preamble, "random-uuid",
+			"every refusal must name the command that produces a valid value, or it is not "+
+				"actionable at three in the morning")
+	})
+
+	t.Run("the ConfigMap declares the key and ships no value", func(t *testing.T) {
+		configMap := readYAMLFile(t, filepath.Join(
+			moduleRootDir(t), "infrastructure", "k8s-manifests", "blnk-config.yaml",
+		))
+		data, ok := configMap["data"].(map[string]interface{})
+		require.True(t, ok, "blnk-config.yaml must declare a data map")
+
+		value, present := data["KAFKA_CLUSTER_ID"]
+		require.Truef(t, present,
+			"blnk-config.yaml must DECLARE KAFKA_CLUSTER_ID even though it ships empty: the key "+
+				"is where an operator learns the value is required, how to generate one, and that "+
+				"it can never be changed after the first format")
+
+		configured := toStringValue(value)
+		if configured == "" {
+			return
+		}
+
+		// A value committed here reaches production, so it is held to the real shape rather
+		// than trusted to have come from the right command.
+		assertValidKafkaClusterID(t, "blnk-config.yaml KAFKA_CLUSTER_ID", configured)
+	})
+
+	t.Run("the compose default is a valid cluster ID", func(t *testing.T) {
+		// The local stack DOES default it, because a developer's broker is disposable and
+		// re-created constantly. That default is still a real cluster ID.
+		for _, file := range composeProjections {
+			marker := "${KAFKA_CLUSTER_ID:-"
+			text := readRepoFile(t, file)
+			index := strings.Index(text, marker)
+			require.Positivef(t, index, "%s must interpolate KAFKA_CLUSTER_ID for the broker", file)
+
+			remainder := text[index+len(marker):]
+			closing := strings.Index(remainder, "}")
+			require.Positive(t, closing, "%s: malformed interpolation of KAFKA_CLUSTER_ID", file)
+
+			assertValidKafkaClusterID(t, file+" KAFKA_CLUSTER_ID default", remainder[:closing])
+		}
+	})
 }

@@ -142,7 +142,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"slices"
 	"strconv"
@@ -512,7 +511,10 @@ func eventIsolationRequireTopics(
 ) {
 	t.Helper()
 
-	report, err := admin.TopicEndOffsets(ctx, topics...)
+	// A zero instant asks for end offsets only: this probe cares whether the topics EXIST,
+	// not how much of their content is recent, and asking for a window would add a
+	// ListOffsets round trip whose answer nothing here reads (PERF-P05).
+	report, err := admin.TopicEndOffsets(ctx, time.Time{}, topics...)
 	if err != nil {
 		t.Skipf(
 			"the Kafka topics this test needs could not be read (%v); run scripts/kafka-provision.sh "+
@@ -563,6 +565,25 @@ type eventIsolationStore struct {
 	// model.EventSubscriber — that struct is serialised into API responses, and a live
 	// claim token in a response body would be an internal lock handed to a caller.
 	fences map[string]eventIsolationFence
+
+	// obligations mirrors the five settlement columns, and is a separate map for the same
+	// reason fences is: they are operational bookkeeping the repository deliberately does not
+	// project into model.EventSubscriber, because that struct is serialised into API responses.
+	obligations map[string]eventIsolationObligation
+}
+
+// eventIsolationObligation is one subscriber's outstanding broker-side settlement work.
+type eventIsolationObligation struct {
+	grantPendingAt      time.Time
+	credentialCleanupAt time.Time
+	attempts            int
+	lastError           string
+	lastAttemptAt       time.Time
+}
+
+// outstanding reports whether anything is owed.
+func (o eventIsolationObligation) outstanding() bool {
+	return !o.grantPendingAt.IsZero() || !o.credentialCleanupAt.IsZero()
 }
 
 // eventIsolationFence is one live provisioning claim: the token it is held under and the
@@ -575,8 +596,9 @@ type eventIsolationFence struct {
 // eventIsolationNewStore builds an empty registry.
 func eventIsolationNewStore() *eventIsolationStore {
 	return &eventIsolationStore{
-		rows:   make(map[string]model.EventSubscriber),
-		fences: make(map[string]eventIsolationFence),
+		rows:        make(map[string]model.EventSubscriber),
+		fences:      make(map[string]eventIsolationFence),
+		obligations: make(map[string]eventIsolationObligation),
 	}
 }
 
@@ -589,11 +611,13 @@ func eventIsolationSubscriberNotFound(subscriberID string) error {
 	)
 }
 
-// clone returns a defensive copy of a row.
+// seedLegacyKeyScope WAS RETIRED HERE. It wrote a partition_key_prefix straight onto a stored row,
+// bypassing validation, so a test could model a subscriber that already carried a key scope.
 //
-// The registry hands out pointers, and a caller that mutated the slice inside one would be
-// editing the store through the back door. Copying the slice header's contents as well as
-// the struct is what makes the store behave like a database rather than like a shared map.
+// That was only necessary while recording a key scope was REFUSED: with no way to ask for one, a
+// row holding one could only be manufactured. Registration now issues the scope and discloses that
+// the broker does not enforce it, so a test that needs a key-scoped subscriber registers one — and
+// a fixture built the way production builds it is worth more than one built behind its back.
 func (s *eventIsolationStore) clone(row model.EventSubscriber) *model.EventSubscriber {
 	copied := row
 	copied.AuthorizedTopics = append([]string(nil), row.AuthorizedTopics...)
@@ -652,12 +676,21 @@ func (s *eventIsolationStore) GetEventSubscriberByID(
 	return s.clone(row), nil
 }
 
+// CountEventSubscribers counts the seeded rows. Nothing in this file reads it — the isolation
+// assertions address subscribers by key — but the store must satisfy the whole seam.
+func (s *eventIsolationStore) CountEventSubscribers(_ context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return int64(len(s.rows)), nil
+}
+
 // ListEventSubscribers pages the registry. Ordering is unspecified here because nothing in
 // this file depends on it; the isolation assertions address subscribers by key.
 func (s *eventIsolationStore) ListEventSubscribers(
 	_ context.Context,
-	limit, offset int,
-) ([]model.EventSubscriber, error) {
+	query model.SubscriberPageQuery,
+) (model.SubscriberPage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -666,22 +699,27 @@ func (s *eventIsolationStore) ListEventSubscribers(
 		rows = append(rows, *s.clone(row))
 	}
 
-	if offset >= len(rows) {
-		return nil, nil
+	page := model.SubscriberPage{Subscribers: rows}
+	if query.Limit > 0 && query.Limit < len(rows) {
+		page.Subscribers = rows[:query.Limit]
+		page.HasMore = true
 	}
 
-	rows = rows[offset:]
-	if limit > 0 && limit < len(rows) {
-		rows = rows[:limit]
-	}
-
-	return rows, nil
+	return page, nil
 }
 
-// UpdateEventSubscriber replaces the mutable columns of an existing row.
+// UpdateEventSubscriber replaces the mutable columns of an existing row, under the caller's
+// provisioning claim and only while the row is not tombstoned for deregistration.
+//
+// Both predicates are reproduced rather than simplified. They are what stop a caller whose
+// lease expired from overwriting the authorization a new owner reconciled with the broker, and
+// what stop an update from WIDENING the topic set of a subscriber whose revocation is already in
+// flight — and a fake that omitted them would let a test asserting either property pass against
+// a store that does not enforce it.
 func (s *eventIsolationStore) UpdateEventSubscriber(
 	_ context.Context,
 	subscriber *model.EventSubscriber,
+	fenceToken string,
 ) error {
 	if subscriber == nil {
 		return apierror.NewAPIError(
@@ -694,10 +732,11 @@ func (s *eventIsolationStore) UpdateEventSubscriber(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	existing, ok := s.rows[strings.TrimSpace(subscriber.SubscriberID)]
-	if !ok {
-		return eventIsolationSubscriberNotFound(subscriber.SubscriberID)
+	if err := s.fencedWriteGuardLocked(subscriber.SubscriberID, fenceToken, true); err != nil {
+		return err
 	}
+
+	existing := s.rows[strings.TrimSpace(subscriber.SubscriberID)]
 
 	row := *subscriber
 	row.AuthorizedTopics = append([]string(nil), subscriber.AuthorizedTopics...)
@@ -714,17 +753,20 @@ func (s *eventIsolationStore) UpdateEventSubscriber(
 func (s *eventIsolationStore) TakeEventSubscriber(
 	_ context.Context,
 	subscriberID string,
+	fenceToken string,
 ) (*model.EventSubscriber, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := strings.TrimSpace(subscriberID)
-	row, ok := s.rows[key]
-	if !ok {
-		return nil, eventIsolationSubscriberNotFound(subscriberID)
+	if err := s.fencedWriteGuardLocked(subscriberID, fenceToken, false); err != nil {
+		return nil, err
 	}
 
+	key := strings.TrimSpace(subscriberID)
+	row := s.rows[key]
+
 	delete(s.rows, key)
+	delete(s.fences, key)
 
 	return s.clone(row), nil
 }
@@ -743,6 +785,7 @@ func (s *eventIsolationStore) RecordSubscriberCredentialIfUnchanged(
 	expected *string,
 	credentialReference string,
 	issuedAt time.Time,
+	fenceToken string,
 ) error {
 	if err := model.ValidateCredentialReference(credentialReference); err != nil {
 		return apierror.NewAPIError(
@@ -755,11 +798,12 @@ func (s *eventIsolationStore) RecordSubscriberCredentialIfUnchanged(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := strings.TrimSpace(subscriberID)
-	row, ok := s.rows[key]
-	if !ok {
-		return eventIsolationSubscriberNotFound(subscriberID)
+	if err := s.fencedWriteGuardLocked(subscriberID, fenceToken, false); err != nil {
+		return err
 	}
+
+	key := strings.TrimSpace(subscriberID)
+	row := s.rows[key]
 
 	if !eventIsolationReferencesMatch(row.CredentialReference, expected) {
 		return apierror.NewAPIError(
@@ -782,8 +826,232 @@ func (s *eventIsolationStore) RecordSubscriberCredentialIfUnchanged(
 	return nil
 }
 
-// ClearSubscriberCredential returns a row to the "registered, not yet provisioned" state.
-func (s *eventIsolationStore) ClearSubscriberCredential(_ context.Context, subscriberID string) error {
+// ClearSubscriberCredential returns a row to the "registered, not yet provisioned" state,
+// under the caller's provisioning claim so a stale owner cannot blank a newer issuance's record.
+func (s *eventIsolationStore) ClearSubscriberCredential(
+	_ context.Context,
+	subscriberID, fenceToken string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.fencedWriteGuardLocked(subscriberID, fenceToken, false); err != nil {
+		return err
+	}
+
+	key := strings.TrimSpace(subscriberID)
+	row := s.rows[key]
+
+	row.CredentialReference = nil
+	row.CredentialIssuedAt = nil
+	row.UpdatedAt = time.Now().UTC()
+	s.rows[key] = row
+
+	// One statement, one fact: the row's credential columns and the cleanup marker both describe
+	// whether Blnk records a credential it has not settled.
+	s.dischargeCredentialCleanupLocked(key)
+
+	return nil
+}
+
+// dischargeCredentialCleanupLocked clears the cleanup marker, resetting the counters only when
+// nothing else remains owed. Callers must hold the mutex.
+func (s *eventIsolationStore) dischargeCredentialCleanupLocked(key string) {
+	obligation, ok := s.obligations[key]
+	if !ok {
+		return
+	}
+
+	obligation.credentialCleanupAt = time.Time{}
+
+	if obligation.grantPendingAt.IsZero() {
+		obligation.attempts = 0
+		obligation.lastError = ""
+	}
+
+	s.obligations[key] = obligation
+}
+
+// RecordSubscriberGrantReconcilePending marks a pending broker-side grant reconciliation,
+// keeping the first instant.
+func (s *eventIsolationStore) RecordSubscriberGrantReconcilePending(
+	_ context.Context,
+	subscriberID string,
+	pendingAt time.Time,
+	fenceToken string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.fencedWriteGuardLocked(subscriberID, fenceToken, false); err != nil {
+		return err
+	}
+
+	key := strings.TrimSpace(subscriberID)
+	obligation := s.obligations[key]
+
+	if obligation.grantPendingAt.IsZero() {
+		if pendingAt.IsZero() {
+			pendingAt = time.Now()
+		}
+
+		obligation.grantPendingAt = pendingAt.UTC()
+	}
+
+	s.obligations[key] = obligation
+
+	return nil
+}
+
+// ClearSubscriberGrantReconcilePending discharges the grant-reconciliation marker.
+func (s *eventIsolationStore) ClearSubscriberGrantReconcilePending(
+	_ context.Context,
+	subscriberID, fenceToken string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.fencedWriteGuardLocked(subscriberID, fenceToken, false); err != nil {
+		return err
+	}
+
+	key := strings.TrimSpace(subscriberID)
+	obligation := s.obligations[key]
+	obligation.grantPendingAt = time.Time{}
+
+	if obligation.credentialCleanupAt.IsZero() {
+		obligation.attempts = 0
+		obligation.lastError = ""
+	}
+
+	s.obligations[key] = obligation
+
+	return nil
+}
+
+// RecordSubscriberCredentialCleanupPending marks a pending credential cleanup, keeping the first
+// instant.
+func (s *eventIsolationStore) RecordSubscriberCredentialCleanupPending(
+	_ context.Context,
+	subscriberID string,
+	pendingAt time.Time,
+	fenceToken string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.fencedWriteGuardLocked(subscriberID, fenceToken, false); err != nil {
+		return err
+	}
+
+	key := strings.TrimSpace(subscriberID)
+	obligation := s.obligations[key]
+
+	if obligation.credentialCleanupAt.IsZero() {
+		if pendingAt.IsZero() {
+			pendingAt = time.Now()
+		}
+
+		obligation.credentialCleanupAt = pendingAt.UTC()
+	}
+
+	s.obligations[key] = obligation
+
+	return nil
+}
+
+// GetSubscriberSettlementObligation reads what one subscriber owes.
+func (s *eventIsolationStore) GetSubscriberSettlementObligation(
+	_ context.Context,
+	subscriberID string,
+) (model.SubscriberSettlementObligation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := strings.TrimSpace(subscriberID)
+	if _, ok := s.rows[key]; !ok {
+		return model.SubscriberSettlementObligation{}, eventIsolationSubscriberNotFound(subscriberID)
+	}
+
+	obligation := s.obligations[key]
+
+	return model.SubscriberSettlementObligation{
+		SubscriberID:             key,
+		GrantReconcilePending:    !obligation.grantPendingAt.IsZero(),
+		CredentialCleanupPending: !obligation.credentialCleanupAt.IsZero(),
+		Attempts:                 obligation.attempts,
+		LastError:                obligation.lastError,
+	}, nil
+}
+
+// ListSubscriberSettlementObligations returns the outstanding obligations, oldest attempt first.
+func (s *eventIsolationStore) ListSubscriberSettlementObligations(
+	_ context.Context,
+	limit int,
+	notBefore time.Time,
+) ([]model.SubscriberSettlementObligation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if limit <= 0 {
+		limit = 50
+	}
+
+	obligations := make([]model.SubscriberSettlementObligation, 0, len(s.obligations))
+
+	for key, obligation := range s.obligations {
+		if !obligation.outstanding() || len(obligations) >= limit {
+			continue
+		}
+
+		if !notBefore.IsZero() && !obligation.lastAttemptAt.IsZero() &&
+			!obligation.lastAttemptAt.Before(notBefore) {
+			continue
+		}
+
+		obligations = append(obligations, model.SubscriberSettlementObligation{
+			SubscriberID:             key,
+			GrantReconcilePending:    !obligation.grantPendingAt.IsZero(),
+			CredentialCleanupPending: !obligation.credentialCleanupAt.IsZero(),
+			Attempts:                 obligation.attempts,
+			LastError:                obligation.lastError,
+		})
+	}
+
+	return obligations, nil
+}
+
+// MarkSubscriberSettlementAttempt records a settlement attempt without discharging anything.
+func (s *eventIsolationStore) MarkSubscriberSettlementAttempt(
+	_ context.Context,
+	subscriberID string,
+	attemptedAt time.Time,
+	failure string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := strings.TrimSpace(subscriberID)
+	obligation := s.obligations[key]
+
+	if attemptedAt.IsZero() {
+		attemptedAt = time.Now()
+	}
+
+	obligation.attempts++
+	obligation.lastAttemptAt = attemptedAt.UTC()
+	obligation.lastError = failure
+	s.obligations[key] = obligation
+
+	return nil
+}
+
+// MarkSubscriberMigrated stamps the instant a subscriber completed its move to Kafka.
+// RecordSubscriberWebhookURL writes the URL and clears migrated_at, as the repository does.
+func (s *eventIsolationStore) RecordSubscriberWebhookURL(
+	_ context.Context,
+	subscriberID, webhookURL string,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -793,15 +1061,36 @@ func (s *eventIsolationStore) ClearSubscriberCredential(_ context.Context, subsc
 		return eventIsolationSubscriberNotFound(subscriberID)
 	}
 
-	row.CredentialReference = nil
-	row.CredentialIssuedAt = nil
+	recorded := webhookURL
+	row.WebhookURL = &recorded
+	row.MigratedAt = nil
 	row.UpdatedAt = time.Now().UTC()
 	s.rows[key] = row
 
 	return nil
 }
 
-// MarkSubscriberMigrated stamps the instant a subscriber completed its move to Kafka.
+// ClearSubscriberWebhookURL forgets the URL and leaves migrated_at alone.
+func (s *eventIsolationStore) ClearSubscriberWebhookURL(
+	_ context.Context,
+	subscriberID string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := strings.TrimSpace(subscriberID)
+	row, ok := s.rows[key]
+	if !ok {
+		return eventIsolationSubscriberNotFound(subscriberID)
+	}
+
+	row.WebhookURL = nil
+	row.UpdatedAt = time.Now().UTC()
+	s.rows[key] = row
+
+	return nil
+}
+
 func (s *eventIsolationStore) MarkSubscriberMigrated(
 	_ context.Context,
 	subscriberID string,
@@ -822,6 +1111,31 @@ func (s *eventIsolationStore) MarkSubscriberMigrated(
 	s.rows[key] = row
 
 	return nil
+}
+
+// CompleteSubscriberWebhookMigration forgets the legacy endpoint AND stamps the migration
+// instant together, which is the atomicity the cutover endpoint depends on.
+func (s *eventIsolationStore) CompleteSubscriberWebhookMigration(
+	_ context.Context,
+	subscriberID string,
+	migratedAt time.Time,
+) (*model.EventSubscriber, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := strings.TrimSpace(subscriberID)
+	row, ok := s.rows[key]
+	if !ok {
+		return nil, eventIsolationSubscriberNotFound(subscriberID)
+	}
+
+	stamped := migratedAt
+	row.WebhookURL = nil
+	row.MigratedAt = &stamped
+	row.UpdatedAt = time.Now().UTC()
+	s.rows[key] = row
+
+	return s.clone(row), nil
 }
 
 // PurgeMigratedSubscriberWebhookURLs erases the legacy URL of every subscriber that
@@ -859,23 +1173,28 @@ func (s *eventIsolationStore) PurgeMigratedSubscriberWebhookURLs(
 //   - _ context.Context: unused; the store is local.
 //   - subscriberID string: the business key.
 //   - pendingAt time.Time: the instant to record on the FIRST marking.
+//   - fenceToken string: the provisioning claim the caller holds.
 //
 // Returns:
 //   - *model.EventSubscriber: the marked row, carrying the principal and topics to revoke.
-//   - error: ErrSubscriberNotFound when absent.
+//   - error: ErrSubscriberNotFound when absent, ErrConflict when the claim is not the caller's.
 func (s *eventIsolationStore) MarkSubscriberRevocationPending(
 	_ context.Context,
 	subscriberID string,
 	pendingAt time.Time,
+	fenceToken string,
 ) (*model.EventSubscriber, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := strings.TrimSpace(subscriberID)
-	row, ok := s.rows[key]
-	if !ok {
-		return nil, eventIsolationSubscriberNotFound(subscriberID)
+	// requireActive is FALSE: re-marking an already-tombstoned row is a deregistration retry,
+	// and finishing one is the whole reason the tombstone survives a failed revocation.
+	if err := s.fencedWriteGuardLocked(subscriberID, fenceToken, false); err != nil {
+		return nil, err
 	}
+
+	key := strings.TrimSpace(subscriberID)
+	row := s.rows[key]
 
 	if row.RevocationPendingAt == nil {
 		stamped := pendingAt
@@ -943,21 +1262,6 @@ func (s *eventIsolationStore) ClaimSubscriberForProvisioning(
 	return token, nil
 }
 
-// ReleaseSubscriberProvisioningFence clears a claim, if the caller still holds it.
-//
-// Conditional on the token for the reason every transition in this schema is: a caller whose
-// lease expired no longer owns the claim, and clearing one somebody else has taken would let a
-// third operation start alongside it. A mismatch is REPORTED rather than swallowed, because
-// the service logs that outcome and a lost fence is worth knowing about.
-//
-// Parameters:
-//   - _ context.Context: unused; the store is local.
-//   - subscriberID string: the business key.
-//   - token string: the token the claim was taken under.
-//
-// Returns:
-//   - error: ErrInvalidInput for a missing token, ErrConflict when the claim is no longer the
-//     caller's.
 func (s *eventIsolationStore) ReleaseSubscriberProvisioningFence(
 	_ context.Context,
 	subscriberID string,
@@ -974,18 +1278,114 @@ func (s *eventIsolationStore) ReleaseSubscriberProvisioningFence(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// THE SHARED PREDICATE, which is token AND LEASE. Each of these three sites tested the token
+	// alone, so an EXPIRED claim was accepted as held — and the production statements carry
+	// `provisioning_until > NOW()` in the write itself, so the fake was modelling a permission the
+	// database does not grant.
 	key := strings.TrimSpace(subscriberID)
-
-	held, ok := s.fences[key]
-	if !ok || held.token != strings.TrimSpace(token) {
-		return apierror.NewAPIError(
-			apierror.ErrConflict,
-			"The provisioning claim is no longer held by this caller",
-			fmt.Errorf("event isolation store: subscriber %q is not fenced under the supplied token", subscriberID),
-		)
+	if err := s.requireFenceLocked(subscriberID, token, "releasing the provisioning claim"); err != nil {
+		return err
 	}
 
 	delete(s.fences, key)
+
+	return nil
+}
+
+// RenewSubscriberProvisioningFence extends a claim the caller still holds.
+//
+// It is CONDITIONAL and it does NOT re-claim, exactly as the repository's is. A caller whose
+// lease was taken over must learn it no longer owns the subscriber rather than be handed it
+// back, because the new owner is mid-flight against the broker.
+//
+// Parameters:
+//   - _ context.Context: unused; the store is local.
+//   - subscriberID string: the business key.
+//   - token string: the token the claim was taken under.
+//   - lease time.Duration: how much longer the claim is held FROM NOW.
+//
+// Returns:
+//   - error: ErrInvalidInput for a missing token, ErrSubscriberNotFound when absent,
+//     ErrConflict when the claim is no longer the caller's.
+func (s *eventIsolationStore) RenewSubscriberProvisioningFence(
+	_ context.Context,
+	subscriberID string,
+	token string,
+	lease time.Duration,
+) error {
+	if strings.TrimSpace(token) == "" {
+		return apierror.NewAPIError(
+			apierror.ErrInvalidInput,
+			"A provisioning claim token is required to renew the fence",
+			errors.New("event isolation store: no claim token was supplied"),
+		)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := strings.TrimSpace(subscriberID)
+	if _, ok := s.rows[key]; !ok {
+		return eventIsolationSubscriberNotFound(subscriberID)
+	}
+
+	if err := s.requireFenceLocked(subscriberID, token, "renewing the provisioning claim"); err != nil {
+		return err
+	}
+
+	held := s.fences[key]
+
+	if lease <= 0 {
+		lease = SubscriberProvisioningFenceLease
+	}
+
+	held.until = time.Now().UTC().Add(lease)
+	s.fences[key] = held
+
+	return nil
+}
+
+// fencedWriteGuardLocked reproduces the WHERE clause every fenced write carries.
+//
+// s.mu must already be held.
+//
+// Parameters:
+//   - subscriberID string: the business key.
+//   - token string: the claim the caller presented.
+//   - requireActive bool: true for a write that must refuse a tombstoned row.
+//
+// Returns:
+//   - error: nil when the write may proceed.
+func (s *eventIsolationStore) fencedWriteGuardLocked(
+	subscriberID, token string,
+	requireActive bool,
+) error {
+	if strings.TrimSpace(token) == "" {
+		return apierror.NewAPIError(
+			apierror.ErrInvalidInput,
+			"A provisioning claim token is required to modify this subscriber",
+			errors.New("event isolation store: a fenced write was attempted with no claim token"),
+		)
+	}
+
+	key := strings.TrimSpace(subscriberID)
+
+	row, ok := s.rows[key]
+	if !ok {
+		return eventIsolationSubscriberNotFound(subscriberID)
+	}
+
+	if err := s.requireFenceLocked(subscriberID, token, "applying a fenced write"); err != nil {
+		return err
+	}
+
+	if requireActive && row.RevocationPendingAt != nil {
+		return apierror.NewAPIError(
+			apierror.ErrConflict,
+			"This subscriber is being deregistered, so its access model can no longer be changed",
+			fmt.Errorf("event isolation store: subscriber %q carries a revocation tombstone", subscriberID),
+		)
+	}
 
 	return nil
 }
@@ -1020,7 +1420,7 @@ type eventIsolationFixture struct {
 	service *EventSubscriberService
 	store   *eventIsolationStore
 
-	// grantable is the subscriber-facing category topics, in the order EventTopics
+	// grantable is every category topic, in the order EventTopics
 	// composes them. The fixture asserts there are at least two so that one can be
 	// granted and another deliberately withheld.
 	grantable []string
@@ -1256,10 +1656,13 @@ func eventIsolationAwaitAuthenticable(
 
 			return probeErr
 		})
-		if !errors.Is(err, kafka.SASLAuthenticationFailed) {
+		if !eventIsolationIsCredentialPropagating(err) {
 			// Any other outcome, error or not, means authentication is settled: the broker
 			// either accepted the credential or refused the request for a reason that has
-			// nothing to do with it.
+			// nothing to do with it. The decision is named rather than inlined because it is
+			// the ONE error code propagation explains, and reading it as "is this still
+			// propagating?" is what keeps a future reader from widening it to every SASL
+			// failure — which would turn a genuinely unusable credential into a timeout.
 			return
 		}
 
@@ -1426,12 +1829,23 @@ func eventIsolationTeardown(
 	// end state rather than a problem.
 	if _, err := fixture.service.DeregisterSubscriber(ctx, subscriber.SubscriberID); err != nil &&
 		!isSubscriberNotFoundError(err) {
-		t.Logf("teardown: deregistering subscriber %q: %v", subscriber.SubscriberID, err)
+		// The FIRST attempt failing is logged rather than failed, because there is a second
+		// one and a principal removed by the fallback has not leaked.
+		t.Logf("teardown: deregistering subscriber %q failed, falling back to a direct broker "+
+			"revocation (not yet a leak): %v", subscriber.SubscriberID, err)
 
 		// Fall back to a direct broker revocation. The registry row is local and
 		// disposable; the broker credential is not, so it gets a second attempt.
 		if revokeErr := fixture.admin.RevokeSubscriber(ctx, subscriber); revokeErr != nil {
-			t.Logf("teardown: revoking principal %q at the broker: %v",
+			// BOTH attempts failed, so a SCRAM credential and its ACLs are left on a broker
+			// every other test in this package shares, with no registry row recording them.
+			// That is a leak this test caused, and it must not be able to report success:
+			// the next isolation run asserts that a principal outside its grant cannot read,
+			// and an abandoned principal with live ACLs is exactly what makes that assertion
+			// pass or fail for the wrong reason.
+			t.Errorf("teardown: LEAKED the Kafka principal %q — both DeregisterSubscriber and "+
+				"the direct RevokeSubscriber fallback failed, so a credential and its ACLs "+
+				"remain on the shared broker with no registry row recording them: %v",
 				subscriber.KafkaPrincipal, revokeErr)
 		}
 	}
@@ -1452,7 +1866,13 @@ func eventIsolationTeardown(
 	// still reported, just one settle window later.
 	exists, err := eventIsolationAwaitCredentialRevoked(ctx, fixture, subscriber.KafkaPrincipal)
 	if err != nil {
-		t.Logf("teardown: confirming principal %q was revoked: %v", subscriber.KafkaPrincipal, err)
+		// Being UNABLE TO VERIFY is not the same as being clean, and it must not be reported as
+		// clean. If the credential list cannot be read, this run cannot say whether it left a
+		// principal on the shared broker — and "we could not tell" is the state in which a leak
+		// silently survives into the next run's isolation assertions.
+		t.Errorf("teardown: could not confirm principal %q was revoked, so this run cannot "+
+			"establish that it left no credential on the shared broker: %v",
+			subscriber.KafkaPrincipal, err)
 
 		return
 	}
@@ -1527,7 +1947,10 @@ func eventIsolationDeleteSubscriberGroups(
 
 	namespace, err := SubscriberConsumerGroupNamespace(subscriber.SubscriberID)
 	if err != nil {
-		t.Logf("teardown: deriving the consumer group namespace of %q: %v", subscriber.SubscriberID, err)
+		// Without the namespace no group can be found, so this run cannot clean up at all and
+		// cannot tell whether it left anything behind. That is a failure, not a note.
+		t.Errorf("teardown: could not derive the consumer group namespace of %q, so this run's "+
+			"consumer groups cannot be found or removed: %v", subscriber.SubscriberID, err)
 
 		return
 	}
@@ -1536,7 +1959,8 @@ func eventIsolationDeleteSubscriberGroups(
 
 	groups, err := eventIsolationGroupsUnder(ctx, client, namespace)
 	if err != nil {
-		t.Logf("teardown: listing the consumer groups under %q: %v", namespace, err)
+		t.Errorf("teardown: could not list the consumer groups under %q, so this run cannot "+
+			"establish that it left none behind: %v", namespace, err)
 
 		return
 	}
@@ -1545,19 +1969,21 @@ func eventIsolationDeleteSubscriberGroups(
 		return
 	}
 
+	// The request failing does NOT skip the confirmation below. The two are separate
+	// obligations: whether the delete succeeded, and whether the groups are gone. A broker that
+	// refused the request but had already removed the groups is clean, and a request that
+	// returned without error but left one is not.
 	response, err := client.DeleteGroups(ctx, &kafka.DeleteGroupsRequest{
 		Addr:     client.Addr,
 		GroupIDs: groups,
 	})
 	if err != nil {
-		t.Logf("teardown: deleting the consumer groups under %q: %v", namespace, err)
-
-		return
-	}
-
-	for group, groupErr := range response.Errors {
-		if groupErr != nil {
-			t.Logf("teardown: deleting consumer group %q: %v", group, groupErr)
+		t.Errorf("teardown: deleting the consumer groups under %q failed: %v", namespace, err)
+	} else {
+		for group, groupErr := range response.Errors {
+			if groupErr != nil {
+				t.Errorf("teardown: deleting consumer group %q failed: %v", group, groupErr)
+			}
 		}
 	}
 
@@ -1566,7 +1992,8 @@ func eventIsolationDeleteSubscriberGroups(
 	// tolerate for a principal.
 	remaining, err := eventIsolationGroupsUnder(ctx, client, namespace)
 	if err != nil {
-		t.Logf("teardown: confirming the consumer groups under %q were deleted: %v", namespace, err)
+		t.Errorf("teardown: could not confirm the consumer groups under %q were deleted, so a "+
+			"leak here would go unreported: %v", namespace, err)
 
 		return
 	}
@@ -2555,8 +2982,10 @@ func TestEventIsolation_CredentialIssuanceReturnsTheSecretOnceWithinTheBudget(t 
 		// resolve for a subscriber; Kafka makes it worse, because a broker answers each client
 		// with the advertised address of the listener the connection arrived on, so even a
 		// reachable internal bootstrap hands back internal names for the partition leaders.
-		// subscriberFacingBrokers therefore reports the external list and REFUSES issuance when
-		// it is unset, rather than falling back — see ErrSubscriberBrokersNotConfigured.
+		// subscriberFacingBrokers therefore reports the external list whenever one is
+		// configured, and falls back to the internal list with a warning when it is not — the
+		// fallback keeps the endpoint usable on the eight required variables alone, and the
+		// warning is what tells an operator with external subscribers to set the override.
 		//
 		// This assertion named fixture.env.kafka.Brokers, so it only held while the two lists
 		// happened to be equal, and it failed the moment they were configured differently — the
@@ -2732,191 +3161,188 @@ func TestEventIsolation_RevokedCredentialCanNoLongerReachTheBroker(t *testing.T)
 	})
 }
 
-// TestEventIsolation_ASubscriberRecordingAKeyPrefixIsRefusedACredential is SEC-05 against a
-// REAL broker, and it is the finding's resolution stated as a property of the running system.
+// TestEventIsolation_ASubscriberRecordingAKeyPrefixIsProvisionedAndDisclosed states the key-scope
+// access model as a property of the RUNNING SYSTEM: the prefix is a consumer-side filtering
+// contract, the broker-enforced boundary is unchanged by it, and neither the credential nor the
+// row is withheld because of it.
 //
-// # The defect, and why the fix is a refusal
+// # What this replaced, and why
 //
-// partition_key_prefix was recorded on the subscriber and described as part of its
-// authorization, and it constrained NOTHING. Kafka's authorizer has no message-key dimension:
-// its finest topic-level grant is Read on a whole topic. So a credential issued for a
-// subscriber carrying a key prefix could read EVERY record on EVERY authorised topic, and the
-// registry described a boundary narrower than the one that existed.
+// This test used to assert the opposite: that a subscriber recording a partition_key_prefix was
+// REFUSED a credential, that no credential existed at the broker, and that recording a prefix on
+// a provisioned subscriber was refused too. The concern behind it was real — Kafka's authorizer
+// has no message-key dimension, so a registry row carrying a prefix must never be readable as
+// "the broker confines this subscriber to those keys" — and the remedy was the wrong one.
 //
-// The review's guidance was to "redesign the access model, then test that records outside the
-// authorized key prefix are unreachable". There is no grant that makes them unreachable —
-// per-tenant topics are excluded by the AAP — so the only fail-closed redesign is that such a
-// subscriber is UNPROVISIONABLE, and this test asserts the consequence that actually matters:
-// NO CREDENTIAL EXISTS AT THE BROKER for it. A principal with no credential cannot reach
-// anything, inside its key prefix or outside it, which is strictly stronger than any ACL could
-// have been.
+// A subscriber that is refused a credential CONSUMES NOTHING. That is not a narrower boundary,
+// it is the absence of one, and it left the credential endpoint unable to do the thing it exists
+// for while the access model defines a subscriber's boundary as its topics, its consumer group
+// AND its partition-key prefix. So the refusal is gone — from issuance, from update and from the
+// schema, in sql/1781248930.sql — and what replaces it is disclosure: the credential carries the
+// prefix together with the statement that its enforcement is consumer-side.
 //
-// It runs against the real broker rather than a double because "no credential was written" is a
-// claim about the broker's metadata log, and the double could only report what it was told.
-func TestEventIsolation_ASubscriberRecordingAKeyPrefixIsRefusedACredential(t *testing.T) {
+// # What is asserted here, and why the broker is required for it
+//
+// Two claims, and only a real authorizer can settle either:
+//
+//  1. The prefix grants and withholds NOTHING at the broker. The principal reads its granted
+//     topic in full — every partition, whatever the keys on it — which is what makes
+//     "consumer_side" an honest label rather than a hedge.
+//  2. Acceptance criterion V-5 still holds for this principal. A key-scoped subscriber is refused
+//     every topic, dead-letter topic, listing and consumer group outside its grant exactly as a
+//     subscriber with no prefix is, because the two broker-enforced dimensions are untouched by
+//     any of this. This is the assertion that would break if a future change tried to "honour"
+//     the prefix by binding a PREFIXED topic pattern, which would widen the grant to every topic
+//     sharing that prefix while appearing to narrow it.
+func TestEventIsolation_ASubscriberRecordingAKeyPrefixIsProvisionedAndDisclosed(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
-	granted, _ := eventIsolationGrantSplit(fixture)
-	subscriberID := eventIsolationSubscriberID("keyscope")
-
+	granted, withheld := eventIsolationGrantSplit(fixture)
 	keyPrefix := "ldg_" + uuid.NewString()
-	subscriber, err := fixture.service.RegisterSubscriber(ctx, SubscriberRegistration{
-		SubscriberID:       subscriberID,
-		Name:               "event isolation probe (key scope)",
-		AuthorizedTopics:   []string{granted},
-		PartitionKeyPrefix: &keyPrefix,
-	})
-	require.NoError(t, err,
-		"recording a key prefix must be ACCEPTED at registration; it is issuance that refuses it, "+
-			"so the row can be inspected and corrected")
-	require.NotNil(t, subscriber)
-	t.Cleanup(func() { eventIsolationTeardown(t, fixture, subscriber) })
 
-	require.True(t, subscriber.KeyScopeUnenforceable(),
+	// Provisioned through the SHARED helper, with the key prefix supplied. That the helper's
+	// require.NoError on issuance now passes is itself the headline result: the same call
+	// against the previous behaviour failed there.
+	principal := eventIsolationProvision(t, ctx, fixture, "keyscope", []string{granted}, keyPrefix)
+
+	require.True(t, principal.subscriber.DeclaresKeyScope(),
 		"the fixture must actually be in the state under test")
+	require.Equal(t, model.KeyScopeEnforcementConsumerSide,
+		principal.subscriber.KeyScopeEnforcement(),
+		"and the row must report where that scope is enforced")
 
-	credential, err := fixture.service.IssueSubscriberCredential(ctx, subscriberID)
-	require.Error(t, err,
-		"a subscriber whose recorded authorization Kafka cannot enforce must be refused a "+
-			"credential; issuing one would grant every record on %q while the registry claimed a "+
-			"narrower scope", granted)
+	// EMPIRICAL enforcement, before anything is concluded from a refusal below.
+	eventIsolationRequireEnforcement(t, ctx, principal, withheld[0])
 
-	var apiErr apierror.APIError
-	require.ErrorAs(t, err, &apiErr)
-	// The DEDICATED code, not the generic conflict. Both resolve to 409, which is the right
-	// status — the request is well formed and it is the recorded STATE that refuses it, so the
-	// remedy is "fix the resource, then repeat this request unchanged" — but a caller
-	// automating onboarding has to tell this refusal apart from every other conflict the
-	// registry can raise in order to act on it, and only a distinct code lets it.
-	assert.Equal(t, apierror.ErrSubscriberIsolationUnenforceable, apiErr.Code,
-		"the request is well formed; it is the recorded state that refuses it, and clearing the "+
-			"prefix is the fix")
-	assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
-		"and it must still be a 409, or the remedy above stops being what the status advertises")
+	t.Run("the credential exists and discloses its key scope", func(t *testing.T) {
+		assert.NotEmpty(t, principal.credential.Password(),
+			"a secret must have been minted; the refusal this replaced generated none")
+		assert.Equal(t, keyPrefix, principal.credential.PartitionKeyPrefix,
+			"the subscriber must RECEIVE the scope it is expected to apply, in the same response as "+
+				"the credential it qualifies")
+		assert.Equal(t, model.KeyScopeEnforcementConsumerSide,
+			principal.credential.KeyScopeEnforcement,
+			"and it must be told WHERE that scope is enforced, or the prefix reads as a broker boundary")
 
-	assert.Empty(t, credential.Password(),
-		"no secret may be generated for an authorization that cannot be enforced")
-
-	t.Run("the broker holds no credential for the principal", func(t *testing.T) {
-		// THE ASSERTION THAT MATTERS. Whatever the registry says, the operative question is
-		// whether this principal can authenticate at all — and it must not be able to.
-		exists, existsErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
+		exists, existsErr := fixture.admin.SubscriberCredentialExists(ctx, principal.subscriber.KafkaPrincipal)
 		require.NoError(t, existsErr, "describing the SCRAM credential of %q",
-			subscriber.KafkaPrincipal)
-		assert.False(t, exists,
-			"principal %q HOLDS A LIVE CREDENTIAL after a refused issuance: it can read every "+
-				"record on every authorised topic, which is precisely the access the registry's key "+
-				"prefix appeared to exclude", subscriber.KafkaPrincipal)
-	})
+			principal.subscriber.KafkaPrincipal)
+		assert.True(t, exists,
+			"principal %q holds no credential at the broker, so it can consume nothing at all",
+			principal.subscriber.KafkaPrincipal)
 
-	t.Run("the registry records no credential either", func(t *testing.T) {
-		stored, readErr := fixture.service.GetSubscriber(ctx, subscriberID)
+		stored, readErr := fixture.service.GetSubscriber(ctx, principal.subscriber.SubscriberID)
 		require.NoError(t, readErr)
-		assert.Nil(t, stored.CredentialReference)
-		assert.Nil(t, stored.CredentialIssuedAt)
+		require.NotNil(t, stored.CredentialReference, "the issuance must be recorded")
+		require.NotNil(t, stored.PartitionKeyPrefix,
+			"and the recorded scope survives issuance rather than being cleared to permit it")
+		assert.Equal(t, keyPrefix, *stored.PartitionKeyPrefix)
 	})
 
-	// provisioned is the credential the recovery subtest below mints. The subtest that follows
-	// it needs a subscriber that HOLDS one, so the two run in order and share it rather than
-	// provisioning a second principal for the same row — which Kafka could not hold anyway,
-	// since it keeps one credential per principal.
-	var provisioned SubscriberCredential
-
-	t.Run("clearing the key prefix restores provisionability", func(t *testing.T) {
-		// The refusal has to be RECOVERABLE, or the design is a trap rather than a
-		// fail-closed default. Clearing the prefix is the caller accepting that access is
-		// granted per topic.
-		cleared := ""
-		updated, updateErr := fixture.service.UpdateSubscriber(ctx, subscriberID, SubscriberUpdate{
-			PartitionKeyPrefix: &cleared,
-		})
-		require.NoError(t, updateErr)
-		require.Nil(t, updated.PartitionKeyPrefix)
-
-		issued, issueErr := fixture.service.IssueSubscriberCredential(ctx, subscriberID)
-		require.NoError(t, issueErr,
-			"once the unenforceable constraint is gone the subscriber must be provisionable")
-		require.NotEmpty(t, issued.Password())
-		provisioned = issued
-
-		// And the credential it now holds really works, on the topic it was granted — so the
-		// recovery path is proven end to end rather than only at the registry.
-		client := eventIsolationClient(t, fixture.env, issued)
-		outcome, disclosed := eventIsolationListOffsets(ctx, client, granted)
+	t.Run("the key scope withholds nothing at the broker", func(t *testing.T) {
+		// THE HONEST HALF. The credential reads the granted topic in FULL: both offset ends
+		// of the partition it probes are disclosed, and the broker never consults a key.
+		// This is what consumer-side enforcement means, and it is asserted rather than
+		// documented because a subscriber that assumed otherwise would build a tenancy
+		// boundary on it.
+		outcome, disclosed := eventIsolationListOffsets(ctx, principal.client, granted)
 		eventIsolationAssertAllowed(t,
-			fmt.Sprintf("reading the granted topic %q after clearing the key prefix", granted),
+			fmt.Sprintf("reading the granted topic %q as a key-scoped principal", granted),
 			outcome.any())
-		assert.NotEmpty(t, disclosed)
+		assert.NotEmpty(t, disclosed,
+			"a key-scoped credential must read its granted topic exactly as an unscoped one does; "+
+				"the prefix is not an ACL and nothing at the broker evaluates it")
 	})
 
-	// THE REVERSE ORDER, which is where SEC-05 was walked around.
-	//
-	// Everything above guards "record a prefix, then ask for a credential". This guards
-	// "hold a credential, then record a prefix" — one ordinary update, which used to be
-	// accepted silently, with no warning and no revocation. The state it produced is the exact
-	// state the refusal exists to prevent, and it was demonstrated against a real broker: a live
-	// credential read eight records from its granted topic, six of them outside the prefix its
-	// own row advertised, two keyed for unrelated tenants. Nothing failed, so nobody could
-	// discover it from the outside; only the registry lied.
-	//
-	// It runs against the real broker for the same reason the refusal above does. The assertion
-	// that matters is not that an error came back — it is that the boundary did not move: the
-	// same principal, the same bindings, the same access as a moment earlier, and a row that
-	// still describes them truthfully.
-	t.Run("recording a key prefix on a provisioned subscriber is refused too", func(t *testing.T) {
-		require.NotEmpty(t, provisioned.Password(),
-			"this subtest needs the credential the previous one issued")
+	t.Run("V-5 still holds: everything outside the grant is refused", func(t *testing.T) {
+		// The two BROKER-enforced dimensions are untouched by the key scope, and this is the
+		// assertion that says so. It would fail if the prefix were ever mapped onto a
+		// prefixed TOPIC binding in an attempt to honour it.
+		for _, topic := range withheld {
+			outcome, disclosed := eventIsolationListOffsets(ctx, principal.client, topic)
+			eventIsolationAssertReadDenied(t, topic, outcome)
+			assert.Empty(t, disclosed,
+				"the broker disclosed partition offsets for %q, which is outside the grant", topic)
 
-		before, beforeErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
-		require.NoError(t, beforeErr)
-		require.True(t, before, "the premise is a subscriber that already holds a live credential")
+			eventIsolationAssertTopicUndiscoverable(t,
+				fmt.Sprintf("fetching records from topic %q outside a key-scoped subscriber's grant", topic),
+				eventIsolationFetch(ctx, principal.client, topic, 0).any())
+		}
 
+		// Including the dead-letter sibling of the GRANTED topic, which holds the payloads an
+		// operator is still triaging and is never grantable.
+		for _, topic := range append([]string{DLTFor(granted)}, DLTFor(withheld[0])) {
+			require.True(t, IsDeadLetterTopic(topic), "%q is not a dead-letter topic name", topic)
+			require.NotContains(t, principal.credential.AuthorizedTopics, topic,
+				"the credential unexpectedly names a dead-letter topic in its grant")
+
+			outcome, disclosed := eventIsolationListOffsets(ctx, principal.client, topic)
+			eventIsolationAssertReadDenied(t, topic, outcome)
+			assert.Empty(t, disclosed,
+				"the broker disclosed partition offsets for the dead-letter topic %q", topic)
+		}
+
+		visible, err := eventIsolationVisibleTopics(ctx, principal.client)
+		require.NoError(t, err, "listing the topics visible to principal %q",
+			principal.credential.Username)
+		for _, topic := range AllTopicsWithDeadLetters() {
+			if topic == granted {
+				continue
+			}
+
+			assert.NotContains(t, visible, topic,
+				"the topic listing disclosed the Blnk-owned topic %q, which is outside the grant", topic)
+		}
+
+		// And the group dimension, which is a different resource type and therefore a
+		// separate probe.
+		eventIsolationAssertGroupDenied(t,
+			"joining a consumer group outside a key-scoped subscriber's namespace",
+			eventIsolationOffsetFetch(ctx, principal.client, "blnk-isolation-unrelated-group", granted))
+	})
+
+	t.Run("recording a key prefix on a provisioned subscriber is accepted", func(t *testing.T) {
+		// THE REVERSE ORDER, which used to be refused as the second half of the same policy.
+		// An operator who decides on a key scope after the credential exists must be able to
+		// record that decision; refusing left them with nowhere to put it and no route to the
+		// state except revoking a working credential, destroying a secret that cannot be
+		// recovered in response to a request that never mentioned revocation.
+		//
+		// What must NOT change is the boundary, and that is what this asserts against the
+		// broker: same credential, same allowed read, same refusals.
 		latePrefix := "ldg_late_" + uuid.NewString()
-		updated, updateErr := fixture.service.UpdateSubscriber(ctx, subscriberID, SubscriberUpdate{
-			PartitionKeyPrefix: &latePrefix,
-		})
-		require.Error(t, updateErr,
-			"recording a key prefix on a subscriber that holds a credential must be refused: the "+
-				"credential cannot be narrowed to match it, so the row would describe a boundary "+
-				"that does not exist")
-		assert.Nil(t, updated)
+		updated, updateErr := fixture.service.UpdateSubscriber(ctx, principal.subscriber.SubscriberID,
+			SubscriberUpdate{PartitionKeyPrefix: &latePrefix})
+		require.NoError(t, updateErr,
+			"recording a key scope on a provisioned subscriber is a decision an operator is "+
+				"allowed to record")
+		require.NotNil(t, updated.PartitionKeyPrefix)
+		assert.Equal(t, latePrefix, *updated.PartitionKeyPrefix)
 
-		var updateAPIErr apierror.APIError
-		require.ErrorAs(t, updateErr, &updateAPIErr)
-		assert.Equal(t, apierror.ErrSubscriberIsolationUnenforceable, updateAPIErr.Code,
-			"the same typed code the issuance refusal uses: one impossible state, one code, "+
-				"whichever direction a caller approaches it from")
-		assert.Equal(t, http.StatusConflict, apierror.StatusForCode(updateAPIErr.Code))
-
-		stored, readErr := fixture.service.GetSubscriber(ctx, subscriberID)
-		require.NoError(t, readErr)
-		assert.Nil(t, stored.PartitionKeyPrefix,
-			"THE REGISTRY MUST NOT RECORD THE CLAIM. A stored prefix here is the whole defect: it "+
-				"outlives the request, and every operator, migration report and support answer "+
-				"derived from this row would state a tenancy boundary the credential does not have")
-		assert.False(t, stored.KeyScopeUnenforceable())
-		require.NotNil(t, stored.CredentialReference,
-			"and the refusal must not revoke the working credential either — it takes nothing away")
-
-		after, afterErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
+		after, afterErr := fixture.admin.SubscriberCredentialExists(ctx, principal.subscriber.KafkaPrincipal)
 		require.NoError(t, afterErr)
 		assert.True(t, after,
-			"the refused update must leave the broker untouched, credential included")
+			"the update must not revoke the credential the row already holds")
 
-		// And the access itself is unchanged: still allowed on the granted topic, still refused
-		// everywhere else. A refusal that quietly widened or narrowed the boundary would be its
-		// own defect, and only the broker can answer that.
-		client := eventIsolationClient(t, fixture.env, provisioned)
-
-		allowed, disclosed := eventIsolationListOffsets(ctx, client, granted)
+		allowed, disclosed := eventIsolationListOffsets(ctx, principal.client, granted)
 		eventIsolationAssertAllowed(t,
-			fmt.Sprintf("reading the granted topic %q after the refused key-prefix update", granted),
+			fmt.Sprintf("reading the granted topic %q after recording a late key prefix", granted),
 			allowed.any())
 		assert.NotEmpty(t, disclosed,
-			"the credential must still read what it could read before the refused update")
+			"the credential must still read what it could read before the update")
+
+		stillDenied, stillDisclosed := eventIsolationListOffsets(ctx, principal.client, withheld[0])
+		eventIsolationAssertReadDenied(t, withheld[0], stillDenied)
+		assert.Empty(t, stillDisclosed,
+			"and it must still be refused everything outside its grant: recording a key scope "+
+				"moves no ACL in either direction")
 	})
 }
 
+// subscriberIDOf WAS RETIRED HERE. It was a nil-safe accessor for a principal's subscriber id, and
+// the fixture that mints a principal requires both the principal and its subscriber to be non-nil
+// before returning it — so every one of the fifteen sites that reads the field reads it directly,
+// and a nil-tolerant accessor beside them suggested a nil is reachable when it is not.
 // TestEventIsolation_NarrowingASubscribersGrantWithdrawsItAtTheBroker is AUTH-02 against a real
 // broker.
 //
@@ -3057,5 +3483,384 @@ func TestEventIsolation_DeregistrationRevokesBeforeItForgetsThePrincipal(t *test
 			protocol.ErrNoTopic,
 			kafka.UnknownTopicOrPartition,
 		)
+	})
+}
+
+// requireFenceLocked reproduces the repository's ownership predicate for a fenced write.
+//
+// The real writes carry `AND provisioning_token = $n AND provisioning_until > NOW()` inside the
+// statement, so a caller whose lease lapsed is refused rather than racing. A fake that ignored
+// the token would let every fence test pass while the production predicate was absent, which is
+// the one thing these tests exist to rule out.
+//
+// The caller must already hold s.mu.
+//
+// Parameters:
+//   - subscriberID string: the row the write targets.
+//   - token string: the claim token the write carried.
+//   - operation string: named in the lost-fence error, matching the repository's wording.
+//
+// Returns:
+//   - error: ErrInvalidInput for a blank token, the lost-fence conflict when the claim is not
+//     the caller's, nil otherwise.
+func (s *eventIsolationStore) requireFenceLocked(subscriberID, token, operation string) error {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return apierror.NewAPIError(apierror.ErrInvalidInput,
+			"A provisioning claim token is required for this operation", nil)
+	}
+
+	key := strings.TrimSpace(subscriberID)
+
+	held, ok := s.fences[key]
+	if !ok || held.token != trimmed || !held.until.After(time.Now().UTC()) {
+		// THE CLIENT MESSAGE database.fencedWriteMissError produces, with the marker in the
+		// DETAIL because subscriberFenceWasLost matches on it: a fake that reported a generic
+		// conflict would exercise the wrong branch of every compensation path, and one that
+		// reported a message the repository no longer returns would pass here and fail against
+		// the database. The release and renewal statements answer with the same sentence up to
+		// its final clause, so this one string serves all three sites.
+		return apierror.NewAPIError(apierror.ErrConflict,
+			"The subscriber provisioning claim is no longer held by this caller, so the change was not applied",
+			fmt.Errorf("subscriber %q: the provisioning claim was no longer held while %s, so the "+
+				"write was refused", subscriberID, operation))
+	}
+
+	return nil
+}
+
+// MarkSubscriberCredentialOrphaned records a credential the service could neither record nor
+// revoke. UNFENCED, exactly as the repository is: it is reached when the claim may already have
+// lapsed, and conditioning it would lose the marker in the case that produces it.
+func (s *eventIsolationStore) MarkSubscriberCredentialOrphaned(
+	_ context.Context,
+	subscriberID string,
+	orphanedAt time.Time,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := strings.TrimSpace(subscriberID)
+	row, ok := s.rows[key]
+	if !ok {
+		// A row deleted mid-issuance is not an error: the deregistration revoked the principal
+		// on its way out, which is one of the documented causes.
+		return nil
+	}
+
+	if row.CredentialOrphanedAt == nil {
+		stamped := orphanedAt
+		row.CredentialOrphanedAt = &stamped
+	}
+	row.UpdatedAt = time.Now().UTC()
+	s.rows[key] = row
+
+	return nil
+}
+
+// MarkSubscriberRevocationFailed records that the broker REFUSED the most recent revocation.
+// Unfenced for the same reason, and it does not keep the first instant.
+func (s *eventIsolationStore) MarkSubscriberRevocationFailed(
+	_ context.Context,
+	subscriberID string,
+	failedAt time.Time,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := strings.TrimSpace(subscriberID)
+	row, ok := s.rows[key]
+	if !ok {
+		return nil
+	}
+
+	stamped := failedAt
+	row.RevocationFailedAt = &stamped
+	row.UpdatedAt = time.Now().UTC()
+	s.rows[key] = row
+
+	return nil
+}
+
+// eventIsolationIsCredentialPropagating reports whether err is the one failure a credential that
+// has just been written to the metadata log explains on its own.
+//
+// [58] SASL Authentication Failed is that failure and the only one. AlterUserScramCredentials
+// returns when the credential is in the log, and the broker's authenticator loads it a moment
+// later, so a handshake in that gap is refused with 58 by a broker that is working correctly.
+//
+// Nothing else belongs here, and the exclusions are the point rather than an omission:
+//
+//   - A transport error, a dial failure or a timeout says the broker could not be reached. The
+//     fixture already proved it could be reached at setup, so this is an environment fault and
+//     must be reported, not waited out.
+//   - An authorization refusal says the credential authenticated and the request was denied. That
+//     is a settled credential and a different question, and the probe is chosen so it cannot
+//     happen.
+//
+// Widening this set is how a wait stops proving anything: whatever is retried here is, by
+// construction, an outcome the caller will never be told about.
+func eventIsolationIsCredentialPropagating(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return errors.Is(err, kafka.SASLAuthenticationFailed)
+}
+
+// TestEventIsolation_AKeyScopedSubscriberIsRefusedAndUnprovisionable IS GONE, and its
+// absence is the point.
+//
+// It asserted that recording a partition_key_prefix was refused with 409
+// SUBSCRIBER_ISOLATION_UNENFORCEABLE and that such a row could never be provisioned. That
+// refusal implemented no part of AAP R-7's third scope — it withheld the CREDENTIAL
+// instead, so a key-scoped subscriber could not consume at all — and it has been replaced
+// by issuing the scope and DISCLOSING that the broker does not enforce it. The typed code
+// is retired rather than left unraisable.
+//
+// What replaces the coverage: TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndTold
+// (below, if present) and the api/model validation tests for the value itself, plus
+// TestSubscribersAPI_RecordsAndReturnsTheKeyScope in the api package, which asserts the
+// prefix comes back beside partition_key_prefix_enforced=false.
+
+// TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsNotEnforced is C-02
+// against a REAL broker, and it is the finding's resolution stated as a property of the running
+// system.
+//
+// # What used to be asserted here, and why it was wrong
+//
+// This test used to assert a REFUSAL: a subscriber recording a partition key prefix was
+// unprovisionable, and the test proved that no credential existed at the broker for it. The
+// reasoning was that a topic-level credential is wider than a key-scoped row appears to describe,
+// so refusing was the only fail-closed answer.
+//
+// The reasoning skipped a step. A refusal is fail-closed only when a narrower grant exists to
+// insist upon, and none does: Kafka's authorizer names five resource types — Topic, Group,
+// Cluster, TransactionalId and DelegationToken — and not one is a message key, while a topic per
+// key space is excluded outright. So the refusal did not withhold a wider credential pending a
+// narrower one. It withheld the ONLY credential that can exist, permanently, for a state the
+// registry is explicitly designed to hold — turning a mandatory endpoint into a dead end.
+//
+// # What is asserted instead
+//
+// Three things, in this order, and the third is the one that could not be faked:
+//
+//  1. The credential IS issued, DOES authenticate, and carries the recorded prefix, so the
+//     mandatory capability exists for every registry state the schema can hold.
+//  2. The dimensions Kafka DOES enforce still hold exactly as they do for every other
+//     subscriber — the granted topic is readable, every withheld topic is refused, and the group
+//     namespace is reserved. A key-scoped subscriber is not a weaker subscriber.
+//  3. The credential is admitted to the RAW PARTITION STREAM of its granted topic from offset
+//     zero. Its declared prefix is a freshly generated ledger identifier that no record on that
+//     shared topic carries, so an allowed fetch from the beginning is the observable proof that
+//     the broker applied no key narrowing whatever: the principal reads the partition, not a
+//     key-filtered view of it.
+//
+// Point 3 is deliberately an authorization observation rather than a record-level one. Proving it
+// by producing one in-prefix and one out-of-prefix record and reading both back would need Write
+// access to a category topic that sibling test runs share, and this file's discipline is that no
+// probe leaves records behind. The authorization answer is sufficient and stronger than it looks:
+// a broker that filtered by key would have to refuse or truncate the fetch, and it does neither.
+//
+// It runs against the real broker because every one of the three is a claim about what the
+// broker's authorizer does, and a double could only report what it was told.
+func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsNotEnforced(t *testing.T) {
+	fixture, ctx := eventIsolationSetup(t)
+
+	granted, withheld := eventIsolationGrantSplit(fixture)
+	subscriberID := eventIsolationSubscriberID("keyscope")
+
+	// A prefix no record on the shared topic can carry. That is what makes point 3 above
+	// conclusive: if the broker narrowed by key, the subscriber would see nothing at all.
+	keyPrefix := "ldg_" + uuid.NewString()
+	subscriber, err := fixture.service.RegisterSubscriber(ctx, SubscriberRegistration{
+		SubscriberID:       subscriberID,
+		Name:               "event isolation probe (key scope)",
+		AuthorizedTopics:   []string{granted},
+		PartitionKeyPrefix: &keyPrefix,
+	})
+	require.NoError(t, err, "recording a key prefix must be accepted at registration")
+	require.NotNil(t, subscriber)
+	t.Cleanup(func() { eventIsolationTeardown(t, fixture, subscriber) })
+
+	require.True(t, subscriber.RequiresClientSideKeyFiltering(),
+		"the fixture must actually be in the state under test")
+
+	credential, err := fixture.service.IssueSubscriberCredential(ctx, subscriberID)
+	require.NoError(t, err,
+		"A RECORDED KEY PREFIX MUST NOT WITHDRAW THE CREDENTIAL CAPABILITY. Kafka can express no "+
+			"narrower grant, so refusing here does not defer issuance until a safer credential is "+
+			"available — it withholds the only credential that can ever exist for this row")
+	require.NotEmpty(t, credential.Password(), "a real secret is returned, exactly once")
+
+	assert.Equal(t, keyPrefix, credential.PartitionKeyPrefix,
+		"and it travels WITH the credential, so the response can state whose obligation applying "+
+			"it is rather than leaving the holder to assume the broker did it")
+
+	assert.Equal(t, []string{granted}, credential.AuthorizedTopics,
+		"the grant is the narrow grant that was requested; a widened one would make everything "+
+			"below test a different boundary")
+
+	t.Run("the broker really holds the credential", func(t *testing.T) {
+		exists, existsErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
+		require.NoError(t, existsErr, "describing the SCRAM credential of %q",
+			subscriber.KafkaPrincipal)
+		assert.True(t, exists,
+			"principal %q holds NO credential after a successful issuance: the response returned a "+
+				"password its holder cannot authenticate with, which is the dead end this replaced "+
+				"wearing a success status", subscriber.KafkaPrincipal)
+	})
+
+	t.Run("the registry records the credential and keeps the prefix", func(t *testing.T) {
+		stored, readErr := fixture.service.GetSubscriber(ctx, subscriberID)
+		require.NoError(t, readErr)
+		require.NotNil(t, stored.CredentialReference,
+			"a successful issuance records the reference")
+		require.NotNil(t, stored.CredentialIssuedAt)
+		require.NotNil(t, stored.PartitionKeyPrefix,
+			"and it does NOT erase the prefix: the operator's stated intent survives issuance")
+		assert.Equal(t, keyPrefix, *stored.PartitionKeyPrefix)
+		assert.True(t, stored.RequiresClientSideKeyFiltering(),
+			"so every subsequent read of this subscriber declares the client-side obligation")
+	})
+
+	principalClient := eventIsolationClient(t, fixture.env, credential)
+
+	// EMPIRICAL enforcement, before anything is concluded from a refusal below.
+	eventIsolationRequireEnforcement(t, ctx, &eventIsolationPrincipal{
+		credential: credential,
+		client:     principalClient,
+	}, withheld[0])
+
+	t.Run("topic isolation is unaffected by the key scope", func(t *testing.T) {
+		// The dimension Kafka DOES enforce must hold exactly as it does for a subscriber with no
+		// prefix. A key-scoped subscriber that was quietly granted less — or more — would make
+		// the prefix change a boundary it has no business changing.
+		allowed, disclosed := eventIsolationListOffsets(ctx, principalClient, granted)
+		eventIsolationAssertAllowed(t,
+			fmt.Sprintf("reading the granted topic %q as a key-scoped subscriber", granted),
+			allowed.any())
+		assert.NotEmpty(t, disclosed,
+			"the granted topic must be readable: the prefix narrows records, not topics")
+
+		for _, topic := range withheld {
+			outcome, leaked := eventIsolationListOffsets(ctx, principalClient, topic)
+			eventIsolationAssertReadDenied(t, topic, outcome)
+			assert.Empty(t, leaked,
+				"the broker disclosed partition offsets for %q, which is outside the grant", topic)
+		}
+	})
+
+	t.Run("the key boundary is NOT enforced, and that is why the response declares it", func(t *testing.T) {
+		// THE ASSERTION THAT MATTERS, and the reason the response's
+		// client_side_key_filtering_required flag exists rather than a comment.
+		//
+		// keyPrefix is a fresh identifier, so no record on this shared topic carries it. A broker
+		// enforcing the prefix would therefore have to refuse this fetch or return an empty view
+		// of the partition. It does neither: the principal is admitted to the partition from
+		// offset zero, which is every record on it regardless of key.
+		outcome := eventIsolationFetch(ctx, principalClient, granted, 0)
+		eventIsolationAssertAllowed(t,
+			fmt.Sprintf(
+				"fetching %q from offset 0 with a credential whose row declares the unrelated key "+
+					"prefix %q", granted, keyPrefix),
+			outcome.any())
+
+		assert.True(t, outcome.allowed(),
+			"THE PREFIX IS NOT A BOUNDARY. This fetch reads the partition from the beginning while "+
+				"the subscriber's row declares a prefix no record here carries, so the broker "+
+				"plainly applies no key narrowing. Anything that reports this subscriber as "+
+				"confined to its prefix — a response field, a registry projection or a runbook — "+
+				"states a boundary that does not exist, which is exactly why issuance declares the "+
+				"narrowing as the holder's own obligation instead")
+	})
+
+	// THE REVERSE ORDER: hold a credential, then record a prefix.
+	//
+	// This used to be refused, on the reasoning that it produced a row describing a boundary the
+	// credential did not have. But the danger was never in the ROW — it was in a response that
+	// echoed a prefix without saying who enforced it, and that is what changed. The grant itself
+	// is identical either side of this update, because there is no key dimension for it to move.
+	//
+	// So what is asserted is that the update changes the REGISTRY and NOT the boundary: same
+	// principal, same credential, same access a moment later. Only a real broker can answer that
+	// last part.
+	t.Run("recording a key prefix on a provisioned subscriber changes no boundary", func(t *testing.T) {
+		before, beforeErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
+		require.NoError(t, beforeErr)
+		require.True(t, before, "the premise is a subscriber that already holds a live credential")
+
+		latePrefix := "ldg_late_" + uuid.NewString()
+		updated, updateErr := fixture.service.UpdateSubscriber(ctx, subscriberID, SubscriberUpdate{
+			PartitionKeyPrefix: &latePrefix,
+		})
+		require.NoError(t, updateErr,
+			"recording a key prefix on a provisioned subscriber must be accepted: it changes the "+
+				"registry's statement of intent and no broker-side grant, so refusing it protects "+
+				"nothing and blocks an ordinary operator action")
+		require.NotNil(t, updated.PartitionKeyPrefix)
+		assert.Equal(t, latePrefix, *updated.PartitionKeyPrefix)
+
+		stored, readErr := fixture.service.GetSubscriber(ctx, subscriberID)
+		require.NoError(t, readErr)
+		require.NotNil(t, stored.PartitionKeyPrefix,
+			"the registry records what the operator asked for")
+		assert.Equal(t, latePrefix, *stored.PartitionKeyPrefix)
+		require.NotNil(t, stored.CredentialReference,
+			"and the working credential is left alone: there is no wider access to take away")
+
+		after, afterErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
+		require.NoError(t, afterErr)
+		assert.True(t, after,
+			"the update must leave the credential at the broker untouched")
+
+		// And the access itself is unchanged: still allowed on the granted topic, still refused
+		// on the withheld ones. An update that quietly widened or narrowed the boundary on the
+		// strength of a field the broker cannot read would be its own defect.
+		allowed, disclosed := eventIsolationListOffsets(ctx, principalClient, granted)
+		eventIsolationAssertAllowed(t,
+			fmt.Sprintf("reading the granted topic %q after the late key-prefix update", granted),
+			allowed.any())
+		assert.NotEmpty(t, disclosed,
+			"the credential must still read what it could read before the update")
+
+		outcome, leaked := eventIsolationListOffsets(ctx, principalClient, withheld[0])
+		eventIsolationAssertReadDenied(t, withheld[0], outcome)
+		assert.Empty(t, leaked,
+			"and must still be refused %q: recording a prefix widens nothing", withheld[0])
+	})
+
+	t.Run("clearing the key prefix removes the obligation and keeps the credential", func(t *testing.T) {
+		// Clearing is how an operator accepts topic-level scope and stops the registry implying
+		// otherwise. It no longer RESTORES provisionability — issuance never stopped working — so
+		// what it must do is take the declared obligation away without disturbing the credential.
+		cleared := ""
+		updated, updateErr := fixture.service.UpdateSubscriber(ctx, subscriberID, SubscriberUpdate{
+			PartitionKeyPrefix: &cleared,
+		})
+		require.NoError(t, updateErr,
+			"clearing the prefix must never be refused; it is the documented way to make the row "+
+				"describe the access that exists")
+		require.Nil(t, updated.PartitionKeyPrefix,
+			"a present empty string CLEARS the column rather than storing an empty prefix")
+		assert.False(t, updated.RequiresClientSideKeyFiltering())
+		require.NotNil(t, updated.CredentialReference,
+			"and the credential survives the repair")
+
+		reissued, issueErr := fixture.service.IssueSubscriberCredential(ctx, subscriberID)
+		require.NoError(t, issueErr)
+		require.NotEmpty(t, reissued.Password())
+		assert.Empty(t, reissued.PartitionKeyPrefix,
+			"and the reissued credential declares no obligation, because the row records none")
+
+		// The reissued credential works on the topic it was granted, so the whole cycle —
+		// register with a prefix, issue, record another, clear, reissue — is proven end to end
+		// rather than only at the registry.
+		client := eventIsolationClient(t, fixture.env, reissued)
+		outcome, disclosed := eventIsolationListOffsets(ctx, client, granted)
+		eventIsolationAssertAllowed(t,
+			fmt.Sprintf("reading the granted topic %q after clearing the key prefix", granted),
+			outcome.any())
+		assert.NotEmpty(t, disclosed)
 	})
 }

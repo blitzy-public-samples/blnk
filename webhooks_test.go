@@ -434,10 +434,16 @@ func TestProcessWebhookWithReusedClient(t *testing.T) {
 // inside two seconds against an unroutable address.
 const legacyWebhookConstructionBudget = 2 * time.Second
 
-// legacyWebhookBlackholeBroker is TEST-NET-2 (RFC 5737), guaranteed to route nowhere, so a
-// construction that dialled it would stall past legacyWebhookConstructionBudget. Passing the
-// budget with it configured is the evidence of the ABSENCE of a dial.
-const legacyWebhookBlackholeBroker = "198.51.100.1:9092"
+// legacyWebhookBlackholeBroker is an RFC 1918 private address routed nowhere in a default
+// environment, so a construction that dialled it would stall past
+// legacyWebhookConstructionBudget. Passing the budget with it configured is the evidence of
+// the ABSENCE of a dial.
+//
+// Private space rather than the RFC 5737 TEST-NET-2 address this used to be: TEST-NET is
+// PUBLIC, and acknowledged plaintext no longer reaches a broker outside Blnk's own network
+// (requireLocalBrokersForPlaintext now verifies KAFKA_INSECURE_LOCAL_DEV's claim instead of
+// only warning). The unroutability the probe depends on is unchanged.
+const legacyWebhookBlackholeBroker = "10.255.255.1:9092"
 
 // legacyWebhookNeverCalledURL is configured but never contacted: the enqueue paths only check
 // that the URL is non-empty, and no worker runs here. Port 1 is privileged and unbound, so an
@@ -793,6 +799,11 @@ func (s *legacyWebhookRelayStore) MarkEventDispatched(
 // MarkEventFailed records a failed publish attempt and reports that budget remains. Nothing here
 // should reach it, so the recording lets a test assert the ABSENCE of failures rather than infer
 // success from a dispatch.
+//
+// The trailing lease is the dead-letter hand-off window the exhaustion arm holds the row under.
+// It is ignored here because this double never takes that arm — every recorded call is a
+// retryable failure that keeps budget — and a test asserting the absence of failures does not
+// need the lease to prove it.
 func (s *legacyWebhookRelayStore) MarkEventFailed(
 	_ context.Context,
 	_ int64,
@@ -800,6 +811,7 @@ func (s *legacyWebhookRelayStore) MarkEventFailed(
 	errMsg string,
 	_ time.Duration,
 	_ bool,
+	_ time.Duration,
 ) (model.EventFailureOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -822,6 +834,7 @@ func (s *legacyWebhookRelayStore) MarkEventPermanentlyFailed(
 	_ int64,
 	_ string,
 	errMsg string,
+	_ time.Duration,
 ) (model.EventFailureOutcome, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

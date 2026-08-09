@@ -1,0 +1,1109 @@
+/*
+Copyright 2024 Blnk Finance Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// event_producer_atomicity.go is the repository implementation for the two
+// mechanisms that bring the last two event families under requirement R-2:
+// blnk.balance_monitor_handoff and blnk.bulk_transaction_batches.
+//
+// Every other event type is captured inside the database transaction that performs
+// its mutation — see the three atomic writers in transaction.go. Two could not be,
+// and for two different structural reasons:
+//
+//   - balance.monitor fires because a CONDITION was met on a balance a transaction
+//     has ALREADY committed. By the time the alert exists there is no open
+//     transaction to enrol it in.
+//   - bulk_transaction.<status> summarises a batch executed one transaction at a
+//     time, each under its own transaction. There is no batch-spanning transaction
+//     for the summary to join.
+//
+// Neither is solved by retrying the capture, because retrying cannot close a
+// process-crash window. Both are solved by giving the event something durable to be
+// atomic WITH:
+//
+//   - the handoff table records, inside the balance's own transaction, the INTENT to
+//     evaluate that balance's monitors. The evaluation's result and the handoff's
+//     transition to terminal then commit together.
+//   - the batch coordinator records, before any member transaction runs, that a batch
+//     began. Its transition to a terminal outcome and the outcome event then commit
+//     together.
+//
+// In both cases the pattern is the same and is worth naming: a pre-recorded intent
+// plus an atomic completion. What is left over is never a lost event — it is an
+// unfinished intent, which is visible, countable and finishable.
+//
+// The claim query, the apierror wrapping and the status vocabulary are lifted from
+// lineage.go and event_outbox.go rather than reinvented, for the same reason those two
+// agree with each other: a third shape would be a maintenance liability.
+package database
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/blnkfinance/blnk/config"
+	"github.com/blnkfinance/blnk/internal/apierror"
+	"github.com/blnkfinance/blnk/model"
+	"github.com/lib/pq"
+	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// balanceMonitorHandoffColumns is the projection every read of the handoff table
+// uses, declared once so the column order and the Scan order cannot drift apart.
+const balanceMonitorHandoffColumns = `id, handoff_id, balance_id, ledger_id, balance_snapshot, ` +
+	`status, attempts, max_attempts, last_error, events_captured, created_at, processed_at, locked_until`
+
+// insertBalanceMonitorHandoffsInTx records, inside the caller's transaction, the
+// intent to evaluate the monitors of every supplied balance.
+//
+// # This is the atomicity, and it is why the function takes a *sql.Tx
+//
+// The transaction belongs to the atomic writer that is updating these balances. Writing
+// the intent here — after the balance UPDATEs and before the COMMIT — is what makes a
+// committed movement inseparable from its pending evaluation. Move this after the
+// commit and the guarantee is gone while every happy-path test still passes, which is
+// precisely the failure the handoff exists to remove.
+//
+// # A row is written only for a balance that HAS a monitor
+//
+// The insert is one statement whose VALUES list is filtered by an EXISTS against
+// blnk.balance_monitors. That is deliberate and it is what makes this affordable on the
+// money path: the overwhelming majority of balances carry no monitor, and a row per
+// balance per transaction would be pure write amplification — two rows per transaction
+// at the system's throughput target, every one destined to be evaluated to "nothing
+// fired" and deleted. With the guard, a deployment with no monitors configured writes
+// nothing and pays one indexed probe per balance.
+//
+// The guard is sound because a monitor cannot fire retroactively. A monitor registered
+// AFTER a movement was never intended to alert on it, which is exactly the behaviour of
+// the post-commit evaluation this replaces, so deciding at write time changes nothing an
+// operator can observe.
+//
+// idx_balance_monitors_balance_id, added by the same migration as this table, is what
+// keeps the probe an index lookup. blnk.balance_monitors has a foreign key on
+// balance_id but PostgreSQL does not index a foreign-key column automatically, so
+// before that index this probe would have been a sequential scan holding the balance
+// locks for its duration.
+//
+// # Nothing here fails the caller for a reason of its own
+//
+// A nil balance, a balance with a blank id and an empty list are all skipped rather than
+// rejected. The writers call this unconditionally, and a movement must never be refused
+// because an alerting side effect could not be described. A genuine statement error IS
+// returned, because at that point the transaction is aborted anyway and the caller's
+// rollback is the correct outcome.
+//
+// Parameters:
+//   - ctx context.Context: the context for the statement.
+//   - tx *sql.Tx: the caller's open transaction. Required; a nil tx is a programming
+//     error and returns an error rather than silently writing outside the transaction.
+//   - balances []*model.Balance: the balances the transaction is updating, in their
+//     POST-mutation state. Each is snapshotted as written.
+//
+// Returns:
+//   - error: nil when nothing needed writing or the write succeeded; the wrapped
+//     statement error otherwise.
+func insertBalanceMonitorHandoffsInTx(ctx context.Context, tx *sql.Tx, balances []*model.Balance) error {
+	if len(balances) == 0 {
+		return nil
+	}
+
+	if tx == nil {
+		return apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"Failed to record balance monitor handoffs",
+			errors.New("a balance monitor handoff must be written inside the balance's own transaction"),
+		)
+	}
+
+	handoffs, err := model.PrepareBalanceMonitorHandoffs(balances)
+	if err != nil {
+		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to prepare balance monitor handoffs", err)
+	}
+
+	if len(handoffs) == 0 {
+		return nil
+	}
+
+	var query strings.Builder
+	query.WriteString(`
+		INSERT INTO blnk.balance_monitor_handoff
+		(handoff_id, balance_id, ledger_id, balance_snapshot)
+		SELECT v.handoff_id, v.balance_id, v.ledger_id, v.balance_snapshot
+		FROM (VALUES
+	`)
+
+	args := make([]interface{}, 0, len(handoffs)*4)
+	for index, handoff := range handoffs {
+		if index > 0 {
+			query.WriteString(",")
+		}
+		base := len(args) + 1
+		// The FIRST tuple carries the casts. PostgreSQL infers a VALUES list's column
+		// types from its first row, and a bare placeholder there is untyped, so without
+		// these the planner cannot resolve v.balance_snapshot against a jsonb column.
+		if index == 0 {
+			fmt.Fprintf(&query, "($%d::text, $%d::text, $%d::text, $%d::jsonb)", base, base+1, base+2, base+3)
+		} else {
+			fmt.Fprintf(&query, "($%d, $%d, $%d, $%d)", base, base+1, base+2, base+3)
+		}
+
+		ledgerID := interface{}(nil)
+		if handoff.LedgerID != "" {
+			ledgerID = handoff.LedgerID
+		}
+		args = append(args, handoff.HandoffID, handoff.BalanceID, ledgerID, []byte(handoff.BalanceSnapshot))
+	}
+
+	query.WriteString(`
+		) AS v(handoff_id, balance_id, ledger_id, balance_snapshot)
+		WHERE EXISTS (
+			SELECT 1 FROM blnk.balance_monitors m WHERE m.balance_id = v.balance_id
+		)
+	`)
+
+	if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
+		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to record balance monitor handoffs", err)
+	}
+
+	return nil
+}
+
+// balancesAlreadyEvaluatedInTx reports which balances the CALLER has already evaluated
+// the monitors of, read from the event rows this same transaction is inserting.
+//
+// # The duplicate this exists to prevent
+//
+// Two mechanisms in this repository bring `balance.monitor` under requirement R-2, and
+// they were built independently:
+//
+//   - the CALLER-SIDE pass — blnk.prepareBalanceMonitorEvents — reads a moved balance's
+//     monitors before the write and hands the resulting `balance.monitor` rows to the
+//     writer, so the alert is inserted in the very transaction that moved the balance.
+//     It runs on the single-transaction path only.
+//   - the WRITER-SIDE handoff — recordBalanceMonitorHandoffs below — records the INTENT
+//     to evaluate, which BalanceMonitorHandoffProcessor later drains, evaluating the
+//     conditions and committing the alerts with the handoff's completion. It runs on
+//     every atomic writer, including the coalescing path the plan freezes.
+//
+// Both are correct in isolation. Run together on one balance they publish the SAME
+// crossing twice, under two different event ids — and a `balance.monitor` id is a fresh
+// UUID by design, precisely so a monitor that fires repeatedly is not collapsed into one
+// event, so no subscriber-side idempotency could ever collapse the pair. The duplicate
+// would be indistinguishable from two genuine crossings.
+//
+// # Why the two compose rather than one replacing the other
+//
+// The caller-side pass gives the alert itself — not merely the intent — the mutation's
+// transaction, which is what requirement R-2 asks for literally, and it delivers with no
+// added latency. The writer-side handoff reaches paths the caller cannot: the coalesced
+// batch, whose argument list is frozen, and any balance whose monitors could not be read
+// before the write. Keeping both, with the handoff suppressed exactly where the caller
+// already evaluated, is strictly better than either alone: every path is covered, nothing
+// is published twice, and the hot path keeps the stronger guarantee.
+//
+// # Reading the coverage from the rows rather than from a new parameter
+//
+// The balance is taken from the event's own payload, which carries the marshaled
+// BalanceMonitor and therefore its balance_id. AggregateID is the MONITOR id for this
+// event type (see blnk.eventAggregateID) and so cannot answer the question. Threading a
+// coverage set down as a new writer argument would change three exported repository
+// signatures, IDataSource and every mock of it, to communicate something the rows the
+// writer is already inserting state exactly.
+//
+// A payload that will not parse yields no coverage, which is the safe direction: the
+// handoff is written, the processor evaluates, and the worst case is the duplicate this
+// function exists to avoid rather than an alert nobody evaluates. It cannot happen in
+// practice — the row was produced by marshalling a BalanceMonitor — and a bookkeeping
+// read must not be the thing that refuses a money write.
+//
+// Parameters:
+//   - rows []*model.EventOutbox: the event rows this transaction is inserting. Nil
+//     entries and every event type other than balance.monitor are ignored.
+//
+// Returns:
+//   - map[string]struct{}: the balances whose monitors the caller evaluated. Nil when
+//     none did, so the caller can test it with a plain length check.
+func balancesAlreadyEvaluatedInTx(rows []*model.EventOutbox) map[string]struct{} {
+	var evaluated map[string]struct{}
+
+	for _, row := range rows {
+		if row == nil || row.EventType != model.EventTypeBalanceMonitor {
+			continue
+		}
+
+		// The legacy two-key envelope: {"event": "balance.monitor", "data": {…}}. Only
+		// the balance id is read, so the rest of the monitor is left untouched — this
+		// must not become a second definition of the payload's shape.
+		var envelope struct {
+			Data struct {
+				BalanceID string `json:"balance_id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(row.Payload, &envelope); err != nil {
+			continue
+		}
+
+		balanceID := strings.TrimSpace(envelope.Data.BalanceID)
+		if balanceID == "" {
+			continue
+		}
+
+		if evaluated == nil {
+			evaluated = make(map[string]struct{}, len(rows))
+		}
+		evaluated[balanceID] = struct{}{}
+	}
+
+	return evaluated
+}
+
+// balancesAwaitingMonitorEvaluation is the balance set the handoff is written for: the
+// ones the caller did not already evaluate.
+//
+// # Coverage is per BALANCE, and that is exactly right
+//
+// The caller-side pass evaluates ALL of a balance's monitors in one read. So a balance
+// that produced even one alert had every one of its monitors judged, and the ones that
+// did not fire need no second look — a later movement will bring its own handoff. A
+// balance that produced NO alert is left in the set: it either has no monitors, in which
+// case the insert's own EXISTS clause skips it, or its monitor read failed before the
+// write, which is the case the handoff is the durable answer to.
+//
+// Parameters:
+//   - balances []*model.Balance: the balances this transaction is updating.
+//   - evaluated map[string]struct{}: the coverage from balancesAlreadyEvaluatedInTx.
+//
+// Returns:
+//   - []*model.Balance: the balances still needing evaluation. The input slice is
+//     returned unchanged when nothing was covered, which is the common case.
+func balancesAwaitingMonitorEvaluation(balances []*model.Balance, evaluated map[string]struct{}) []*model.Balance {
+	if len(evaluated) == 0 {
+		return balances
+	}
+
+	awaiting := make([]*model.Balance, 0, len(balances))
+	for _, balance := range balances {
+		if balance == nil {
+			continue
+		}
+		if _, covered := evaluated[balance.BalanceID]; covered {
+			continue
+		}
+		awaiting = append(awaiting, balance)
+	}
+
+	return awaiting
+}
+
+// recordBalanceMonitorHandoffs is the gate the atomic writers call.
+//
+// It answers two questions — does this deployment capture events at all, and did the
+// caller already evaluate these monitors inside this very transaction — and writes the
+// handoffs only for what is left. The first gate is not an optimisation; it is what keeps
+// two deployment shapes correct at once:
+//
+//   - With Kafka configured, the handoff is written and the handoff processor owns the
+//     evaluation. The post-commit evaluation stands down, so the alert is captured
+//     exactly once, transactionally.
+//   - With no Kafka configured there is no relay and no handoff processor, so a handoff
+//     row would be an intent nothing can ever drain — the alert would simply never be
+//     evaluated. The gate writes nothing, and the post-commit path publishes down the
+//     legacy transport exactly as it did before this feature existed (AAP §0.5.4).
+//
+// The predicate is config.Configuration.EventPublishingConfigured, deliberately shared
+// with the root package's eventPublishingConfigured so the writer and the post-commit
+// path cannot reach opposite conclusions and leave a movement evaluated by neither.
+//
+// The SECOND gate is what keeps the two R-2 mechanisms from publishing one crossing
+// twice — see balancesAlreadyEvaluatedInTx for why both exist and how they compose.
+//
+// A configuration read failure is NOT fatal to the ledger write. It is logged by
+// config.Fetch's own path and treated here as "not configured", which is the safe
+// direction: the post-commit path still evaluates, so the alert is delayed at worst,
+// never lost, and a money movement is never refused because a configuration lookup
+// failed.
+//
+// Parameters:
+//   - ctx context.Context: the context for the statement.
+//   - tx *sql.Tx: the writer's open transaction.
+//   - span trace.Span: the writer's span, annotated with the handoff count.
+//   - balances []*model.Balance: the balances this transaction is updating.
+//   - capturedEvents []*model.EventOutbox: the event rows this transaction is inserting,
+//     read for the balances whose monitors the caller already evaluated.
+//
+// Returns:
+//   - error: only a genuine statement failure, which correctly rolls the writer back.
+func recordBalanceMonitorHandoffs(ctx context.Context, tx *sql.Tx, span trace.Span, balances []*model.Balance, capturedEvents []*model.EventOutbox) error {
+	cnf, err := config.Fetch()
+	if err != nil || !cnf.EventPublishingConfigured() {
+		return nil
+	}
+
+	evaluated := balancesAlreadyEvaluatedInTx(capturedEvents)
+	awaiting := balancesAwaitingMonitorEvaluation(balances, evaluated)
+	if len(awaiting) == 0 {
+		// Every moved balance was evaluated with the mutation, so there is nothing left to
+		// hand off. Recorded on the span rather than passed silently: "no handoffs" and
+		// "handoffs suppressed because the caller covered every balance" are different
+		// facts, and only one of them means the alerts are already durable.
+		span.AddEvent("Balance monitor handoffs not needed; every balance was evaluated with the mutation", trace.WithAttributes(
+			attribute.Int("balance_monitor_handoff.balances_evaluated_by_caller", len(evaluated)),
+		))
+
+		return nil
+	}
+
+	if err := insertBalanceMonitorHandoffsInTx(ctx, tx, awaiting); err != nil {
+		return err
+	}
+
+	span.AddEvent("Balance monitor handoffs recorded", trace.WithAttributes(
+		attribute.Int("balance_monitor_handoff.balances", len(awaiting)),
+		attribute.Int("balance_monitor_handoff.balances_evaluated_by_caller", len(evaluated)),
+	))
+
+	return nil
+}
+
+// claimPendingBalanceMonitorHandoffQuery is the claim statement, declared at package level
+// so a test can assert on its text. The two properties a test pins here — MATERIALIZED and
+// FOR UPDATE SKIP LOCKED — are both invisible in behaviour until the exact conditions that
+// break them occur, so asserting the shape is what keeps them.
+const claimPendingBalanceMonitorHandoffQuery = `
+		WITH candidates AS MATERIALIZED (
+			SELECT candidate.id FROM blnk.balance_monitor_handoff candidate
+			WHERE candidate.status IN ('pending', 'processing')
+			  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
+			  AND candidate.attempts < candidate.max_attempts
+			ORDER BY candidate.created_at ASC, candidate.id ASC
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		),
+		claimed AS (
+			UPDATE blnk.balance_monitor_handoff
+			SET status = $1, locked_until = NOW() + $2::interval, attempts = attempts + 1
+			WHERE id IN (SELECT id FROM candidates)
+			RETURNING ` + balanceMonitorHandoffColumns + `
+		)
+		SELECT * FROM claimed ORDER BY created_at ASC, id ASC
+	`
+
+// ClaimPendingBalanceMonitorHandoffs claims a batch of handoffs for evaluation.
+//
+// It is the event outbox claim query with this table's columns: a MATERIALIZED CTE
+// selects a bounded, creation-ordered, FOR UPDATE SKIP LOCKED set of ids, a second CTE
+// UPDATEs exactly those ids, and the outer SELECT re-sorts the returned rows because
+// UPDATE ... RETURNING does not preserve the inner ORDER BY. SKIP LOCKED is what lets
+// several processors run without blocking each other, and the re-sort is what keeps a
+// batch FIFO.
+//
+// # The candidate selection MUST stay a MATERIALIZED CTE
+//
+// The obvious spelling — `UPDATE … WHERE id IN (SELECT … LIMIT $3 FOR UPDATE SKIP
+// LOCKED)`, which is what ClaimPendingOutboxEntries in database/lineage.go still uses —
+// does NOT reliably honour the limit here, and the difference is this statement's
+// `attempts = attempts + 1`. The subquery filters on `attempts < max_attempts`, so the
+// UPDATE writes a column its own semi-join subplan reads; the planner is then free to
+// re-evaluate that subplan, and each evaluation applies the LIMIT afresh. Measured against
+// PostgreSQL 16 with three claimable rows and a batch size of two, the inline form claimed
+// all THREE, while the lineage query — which does not touch `attempts` — claimed two from
+// the identical table.
+//
+// It is worse than a wrong number, because it is PLAN-DEPENDENT: it appears on a small
+// table and hides on a large one, so it survives a full test suite and surfaces on an empty
+// deployment. Over-claiming leases rows the processor will not reach in this pass, and every
+// one of them sits unevaluated until its lease expires — the exact delay to a monitor alert
+// that the handoff exists to prevent.
+//
+// A MATERIALIZED CTE is evaluated exactly once by definition, which makes the limit a fact
+// about the statement rather than about the plan the planner happened to choose.
+//
+// A claim is a LEASE, not a lock: it sets status to processing and locked_until to
+// now plus the lease, so a processor that dies mid-evaluation has its rows re-claimed
+// once the lease expires. That is the at-least-once half of the guarantee. The
+// exactly-once half is not enforced here — it is enforced by the DERIVED event ids the
+// evaluation produces, which make a re-evaluation of the same handoff insert the same
+// rows and collide with the unique index rather than duplicate the alert.
+//
+// Parameters:
+//   - ctx context.Context: the context for the query.
+//   - batchSize int: the maximum number of handoffs to claim.
+//   - lockDuration time.Duration: how long the claim is held.
+//
+// Returns:
+//   - []model.BalanceMonitorHandoff: the claimed handoffs, oldest first.
+//   - error: the wrapped query error.
+func (d Datasource) ClaimPendingBalanceMonitorHandoffs(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.BalanceMonitorHandoff, error) {
+	rows, err := d.Conn.QueryContext(ctx, claimPendingBalanceMonitorHandoffQuery,
+		model.OutboxStatusProcessing, lockDuration.String(), batchSize)
+	if err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to claim pending balance monitor handoffs", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	handoffs := make([]model.BalanceMonitorHandoff, 0, batchSize)
+	for rows.Next() {
+		handoff, scanErr := scanBalanceMonitorHandoff(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		handoffs = append(handoffs, *handoff)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read claimed balance monitor handoffs", err)
+	}
+
+	return handoffs, nil
+}
+
+// CompleteBalanceMonitorHandoffWithEvents writes the evaluation's result and the
+// handoff's completion in ONE database transaction.
+//
+// # This single transaction is the whole point of the handoff
+//
+// The alert events and the record that this balance's monitors have been evaluated
+// commit together. There is therefore no state in which the evaluation is marked done
+// and its alerts are missing, and none in which the alerts exist and the handoff is
+// still claimable — the two failure modes that a "publish then mark" sequence permits.
+//
+// A zero-length event list is the COMMON case and is not a no-op: it means the monitors
+// were evaluated and no condition was met, which is a result worth recording. Recording
+// it is what distinguishes "evaluated, nothing fired" from "never evaluated", and those
+// are indistinguishable from the event outbox alone.
+//
+// # Why the UPDATE is not conditioned on the lease
+//
+// A lapsed lease can let two processors evaluate one handoff concurrently. That is
+// tolerated deliberately rather than fenced, because the events they produce carry
+// DERIVED ids — a function of the handoff id and the monitor id — so the second
+// insert collides with the unique index on event_id and the repository reports the
+// existing row as success. The duplicate is absorbed by the schema instead of by a
+// lock, which is both cheaper and more robust: it also absorbs a duplicate produced by
+// a retry, a replay or a restart, none of which a lease would catch.
+//
+// Parameters:
+//   - ctx context.Context: the context for the transaction.
+//   - handoffID string: the handoff being completed.
+//   - events []*model.EventOutbox: the balance.monitor rows the evaluation produced,
+//     possibly empty.
+//
+// Returns:
+//   - error: nil on commit; the wrapped failure otherwise, in which case nothing was
+//     written and the handoff remains claimable.
+func (d Datasource) CompleteBalanceMonitorHandoffWithEvents(ctx context.Context, handoffID string, events []*model.EventOutbox) error {
+	ctx, span := otel.Tracer("database.balance_monitor_handoff").Start(ctx, "CompleteBalanceMonitorHandoffWithEvents")
+	defer span.End()
+
+	trimmed := strings.TrimSpace(handoffID)
+	if trimmed == "" {
+		return apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"Failed to complete the balance monitor handoff",
+			errors.New("a handoff id is required"),
+		)
+	}
+
+	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
+	if err != nil {
+		span.RecordError(err)
+		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// ALREADY-STORED ALERTS ARE FILTERED OUT BEFORE THE INSERT, and this is what makes a
+	// repeated evaluation succeed rather than abort.
+	//
+	// PostgreSQL marks a transaction ABORTED after any error, so a unique violation here could
+	// not be caught and recovered from inside this transaction — the way the standalone insert
+	// recovers from it. The duplicate therefore has to be removed BEFORE the statement runs.
+	fresh, err := filterAlreadyStoredMonitorAlerts(ctx, tx, events)
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
+
+	if err := insertEventOutboxesInTx(ctx, tx, fresh); err != nil {
+		span.RecordError(err)
+		return err
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE blnk.balance_monitor_handoff
+		SET status = $1,
+		    processed_at = NOW(),
+		    locked_until = NULL,
+		    last_error = NULL,
+		    events_captured = $2
+		WHERE handoff_id = $3
+		  AND status <> $1
+	`, model.OutboxStatusCompleted, len(events), trimmed)
+	if err != nil {
+		span.RecordError(err)
+		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to complete the balance monitor handoff", err)
+	}
+
+	// A row count of zero means the handoff was ALREADY completed, by a concurrent
+	// evaluation whose lease overlapped this one. That is not an error: the events this
+	// transaction inserted carry the same derived ids as the ones already stored, so the
+	// insert above resolved to the existing rows and committing changes nothing. The
+	// commit still runs, because rolling back here would leave the caller believing the
+	// evaluation failed and schedule a third attempt at work that is finished.
+	affected, err := result.RowsAffected()
+	if err == nil && affected == 0 {
+		span.AddEvent("Balance monitor handoff was already completed", trace.WithAttributes(
+			attribute.String("handoff.id", trimmed),
+		))
+	}
+
+	if err := tx.Commit(); err != nil {
+		span.RecordError(err)
+		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit the balance monitor handoff", err)
+	}
+
+	span.SetAttributes(
+		attribute.String("handoff.id", trimmed),
+		attribute.Int("handoff.events_captured", len(events)),
+	)
+
+	return nil
+}
+
+// filterAlreadyStoredMonitorAlerts drops the alerts that are already durable.
+//
+// # Why this is needed at all
+//
+// A handoff can legitimately be evaluated twice — a lapsed claim lease, a retry after a failed
+// commit, a restart — and both evaluations derive the SAME event ids, because the identity is
+// the pair (handoff, monitor). That collision is the mechanism working: it is what stops the
+// alert being delivered twice. But inside a transaction a unique violation ABORTS everything,
+// so the duplicate cannot be recognised after the fact the way the standalone insert
+// recognises it. It has to be removed first.
+//
+// # Why existence is compared on the TYPE AND AGGREGATE and not on the bytes
+//
+// The standalone path discriminates a benign duplicate from a genuine id reuse by comparing
+// event_raw byte for byte. That test is unavailable here: event_raw carries occurred_at, which
+// is minted when the row is prepared, so a re-evaluation of one handoff produces the same id
+// with different bytes and a byte comparison would call it a collision.
+//
+// event_type and aggregate_id ARE stable across re-evaluations, and they are enough to keep a
+// real collision loud: a stored row under this id describing a different event type or a
+// different aggregate is NOT this alert, so it is left in the list, the insert conflicts, and
+// the completion fails visibly instead of discarding an event.
+//
+// # The residual race, and why it converges
+//
+// Two processors can pass this filter simultaneously and then collide on the insert. The loser's
+// transaction aborts, its handoff returns to pending, and the retry's filter finds the row and
+// excludes it. No alert is lost and none is duplicated; one evaluation is simply repeated.
+//
+// Parameters:
+//   - ctx context.Context: the context for the query.
+//   - tx *sql.Tx: the completion's transaction, so the read shares its snapshot.
+//   - events []*model.EventOutbox: the alerts the evaluation produced.
+//
+// Returns:
+//   - []*model.EventOutbox: the alerts not yet stored, in input order.
+//   - error: the wrapped query error.
+func filterAlreadyStoredMonitorAlerts(ctx context.Context, tx *sql.Tx, events []*model.EventOutbox) ([]*model.EventOutbox, error) {
+	if len(events) == 0 {
+		return events, nil
+	}
+
+	ids := make([]string, 0, len(events))
+	for _, event := range events {
+		if event != nil {
+			ids = append(ids, event.EventID)
+		}
+	}
+
+	if len(ids) == 0 {
+		return events, nil
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT event_id, event_type, aggregate_id
+		FROM blnk.event_outbox
+		WHERE event_id = ANY($1)
+	`, pq.Array(ids))
+	if err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to check for already-stored alerts", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	type storedAlert struct {
+		eventType   string
+		aggregateID string
+	}
+	stored := make(map[string]storedAlert, len(ids))
+	for rows.Next() {
+		var eventID string
+		var alert storedAlert
+		if err := rows.Scan(&eventID, &alert.eventType, &alert.aggregateID); err != nil {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read already-stored alerts", err)
+		}
+		stored[eventID] = alert
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read already-stored alerts", err)
+	}
+
+	if len(stored) == 0 {
+		return events, nil
+	}
+
+	fresh := make([]*model.EventOutbox, 0, len(events))
+	for _, event := range events {
+		if event == nil {
+			continue
+		}
+
+		if existing, ok := stored[event.EventID]; ok &&
+			existing.eventType == event.EventType && existing.aggregateID == event.AggregateID {
+			logrus.WithFields(logrus.Fields{
+				"event_id":   event.EventID,
+				"event_type": event.EventType,
+			}).Info(
+				"the balance monitor alert is already durable, so this evaluation is a repeat; " +
+					"the handoff is completed without recording a second copy",
+			)
+
+			continue
+		}
+
+		fresh = append(fresh, event)
+	}
+
+	return fresh, nil
+}
+
+// MarkBalanceMonitorHandoffFailed records an evaluation failure against a handoff.
+//
+// The row returns to pending while attempts remain, so the next poll re-claims it, and
+// is marked failed once the budget is spent. That mirrors how both existing outboxes
+// treat a failed unit of work, and it means an exhausted handoff stays in the table as
+// the record of an evaluation that never happened rather than disappearing.
+//
+// The claim already incremented attempts, so this does not increment it again —
+// counting a failure twice would halve the effective budget.
+//
+// # Why permanent is a parameter rather than a guess
+//
+// Some failures cannot be retried into success. A snapshot that does not decode will not
+// decode on the sixth attempt either: the bytes are fixed, and re-reading them costs five
+// more claims, five more log lines and five more poll intervals to reach the conclusion
+// the first attempt already had. The evaluator knows which kind of failure it hit and this
+// layer does not, so it says. A retryable failure passes false and keeps the budget.
+//
+// Parameters:
+//   - ctx context.Context: the context for the statement.
+//   - handoffID string: the handoff that failed.
+//   - reason string: the failure detail, stored verbatim in last_error.
+//   - permanent bool: true when no further attempt can succeed, which fails the row
+//     immediately instead of spending the remaining budget on a known-lost cause.
+//
+// Returns:
+//   - error: the wrapped statement error.
+func (d Datasource) MarkBalanceMonitorHandoffFailed(ctx context.Context, handoffID, reason string, permanent bool) error {
+	trimmed := strings.TrimSpace(handoffID)
+	if trimmed == "" {
+		return apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"Failed to record the balance monitor handoff failure",
+			errors.New("a handoff id is required"),
+		)
+	}
+
+	_, err := d.Conn.ExecContext(ctx, `
+		UPDATE blnk.balance_monitor_handoff
+		SET status = CASE WHEN $6 OR attempts >= max_attempts THEN $1 ELSE $2 END,
+		    processed_at = CASE WHEN $6 OR attempts >= max_attempts THEN NOW() ELSE NULL END,
+		    locked_until = NULL,
+		    last_error = $3
+		WHERE handoff_id = $4
+		  AND status <> $5
+	`, model.OutboxStatusFailed, model.OutboxStatusPending, reason, trimmed, model.OutboxStatusCompleted, permanent)
+	if err != nil {
+		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to record the balance monitor handoff failure", err)
+	}
+
+	return nil
+}
+
+// CountBalanceMonitorHandoffByStatus returns the number of handoffs in each status.
+//
+// It answers the operational question the event outbox cannot: whether a balance
+// movement's monitors were evaluated at all. A non-zero failed count means alerts were
+// never judged, which is a materially different fact from an alert that was judged and
+// did not fire.
+//
+// Parameters:
+//   - ctx context.Context: the context for the query.
+//
+// Returns:
+//   - map[string]int64: status to count, containing only the statuses present.
+//   - error: the wrapped query error.
+func (d Datasource) CountBalanceMonitorHandoffByStatus(ctx context.Context) (map[string]int64, error) {
+	rows, err := d.Conn.QueryContext(ctx, `
+		SELECT status, COUNT(*) FROM blnk.balance_monitor_handoff GROUP BY status
+	`)
+	if err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to count balance monitor handoffs", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	counts := make(map[string]int64, 4)
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read balance monitor handoff counts", err)
+		}
+		counts[status] = count
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read balance monitor handoff counts", err)
+	}
+
+	return counts, nil
+}
+
+// scanBalanceMonitorHandoff reads one row of balanceMonitorHandoffColumns.
+//
+// The nullable columns are read through sql.Null* and flattened, so the caller never
+// has to distinguish "SQL NULL" from "zero" for a field where the two mean the same
+// thing.
+//
+// Parameters:
+//   - rows *sql.Rows: positioned on a row.
+//
+// Returns:
+//   - *model.BalanceMonitorHandoff: the decoded row.
+//   - error: the wrapped scan error.
+func scanBalanceMonitorHandoff(rows *sql.Rows) (*model.BalanceMonitorHandoff, error) {
+	handoff := &model.BalanceMonitorHandoff{}
+	var ledgerID, lastError sql.NullString
+	var snapshot []byte
+	var processedAt, lockedUntil sql.NullTime
+
+	if err := rows.Scan(
+		&handoff.ID,
+		&handoff.HandoffID,
+		&handoff.BalanceID,
+		&ledgerID,
+		&snapshot,
+		&handoff.Status,
+		&handoff.Attempts,
+		&handoff.MaxAttempts,
+		&lastError,
+		&handoff.EventsCaptured,
+		&handoff.CreatedAt,
+		&processedAt,
+		&lockedUntil,
+	); err != nil {
+		return nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read a balance monitor handoff", err)
+	}
+
+	handoff.LedgerID = ledgerID.String
+	handoff.LastError = lastError.String
+	handoff.BalanceSnapshot = append([]byte(nil), snapshot...)
+	if processedAt.Valid {
+		at := processedAt.Time
+		handoff.ProcessedAt = &at
+	}
+	if lockedUntil.Valid {
+		at := lockedUntil.Time
+		handoff.LockedUntil = &at
+	}
+
+	return handoff, nil
+}
+
+// InsertBulkTransactionBatch records that a bulk batch has begun.
+//
+// It is written BEFORE any member transaction runs, and that ordering is the point: the
+// batch is durable and enumerable from the moment it starts, so a process that dies
+// half way through leaves a row saying "this batch began and never reported an outcome"
+// rather than leaving nothing at all.
+//
+// The insert is idempotent on the primary key. A batch id is minted fresh per request,
+// so a conflict means the same batch is being started twice — a retry of the enclosing
+// request — and the correct answer is to accept the existing row rather than to fail a
+// batch because its coordinator was already recorded.
+//
+// Parameters:
+//   - ctx context.Context: the context for the statement.
+//   - batch *model.BulkTransactionBatch: the coordinator row. Status is forced to
+//     processing and finalized_at left NULL, because a batch cannot be inserted
+//     already-finished.
+//
+// Returns:
+//   - error: the wrapped statement error.
+func (d Datasource) InsertBulkTransactionBatch(ctx context.Context, batch *model.BulkTransactionBatch) error {
+	if batch == nil || strings.TrimSpace(batch.BatchID) == "" {
+		return apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"Failed to record the bulk transaction batch",
+			errors.New("a batch id is required"),
+		)
+	}
+
+	_, err := d.Conn.ExecContext(ctx, `
+		INSERT INTO blnk.bulk_transaction_batches
+		(batch_id, status, transaction_count, atomic, inflight)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (batch_id) DO NOTHING
+	`,
+		strings.TrimSpace(batch.BatchID),
+		model.BulkBatchStatusProcessing,
+		batch.TransactionCount,
+		batch.Atomic,
+		batch.Inflight,
+	)
+	if err != nil {
+		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to record the bulk transaction batch", err)
+	}
+
+	return nil
+}
+
+// FinalizeBulkTransactionBatchWithEvent moves a batch to its terminal outcome AND
+// inserts the outcome event, in ONE database transaction.
+//
+// # The guarantee, stated as the two states it makes unreachable
+//
+//   - a terminal coordinator row whose outcome event was never written, and
+//   - an outcome event describing a batch the coordinator still calls in-progress.
+//
+// Both are reachable when the outcome and the event are written separately, and the
+// first is exactly what used to happen: the outcome was computed, the event insert
+// failed, and the summary was gone with only a log line to show for it.
+//
+// # Why the UPDATE is guarded on the row being non-terminal
+//
+// The guard is what makes the whole finalise idempotent, and idempotence is required
+// because this is retried. A first attempt whose COMMIT succeeded but whose
+// acknowledgement was lost must not be followed by a second, differently-identified
+// event for one batch outcome. On the retry the guard matches nothing, this function
+// reports the already-recorded outcome, and the caller stops.
+//
+// An already-terminal row is therefore reported as SUCCESS rather than as a conflict —
+// but only when it agrees. A row already terminal with a DIFFERENT status is a genuine
+// conflict: something else declared a different outcome for this batch, and silently
+// discarding either answer would be worse than reporting it.
+//
+// Parameters:
+//   - ctx context.Context: the context for the transaction.
+//   - batchID string: the batch being finalised.
+//   - outcome *model.BulkTransactionBatch: the terminal status, error message and
+//     transaction count to record.
+//   - event *model.EventOutbox: the prepared outcome event. Required — a finalise with
+//     no event would defeat the atomicity this function exists for.
+//
+// Returns:
+//   - bool: true when this call performed the transition, false when it found the
+//     batch already finalised with the same outcome.
+//   - error: the wrapped failure, including the conflicting-outcome case.
+func (d Datasource) FinalizeBulkTransactionBatchWithEvent(
+	ctx context.Context,
+	batchID string,
+	outcome *model.BulkTransactionBatch,
+	event *model.EventOutbox,
+) (bool, error) {
+	ctx, span := otel.Tracer("database.bulk_transaction_batches").Start(ctx, "FinalizeBulkTransactionBatchWithEvent")
+	defer span.End()
+
+	trimmed := strings.TrimSpace(batchID)
+	if trimmed == "" || outcome == nil || event == nil {
+		return false, apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"Failed to finalize the bulk transaction batch",
+			errors.New("a batch id, an outcome and a prepared outcome event are all required"),
+		)
+	}
+
+	if !model.IsTerminalBulkBatchStatus(outcome.Status) {
+		return false, apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"Failed to finalize the bulk transaction batch",
+			fmt.Errorf("%q is not a terminal batch outcome", outcome.Status),
+		)
+	}
+
+	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
+	if err != nil {
+		span.RecordError(err)
+		return false, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to begin transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	errorMessage := interface{}(nil)
+	if strings.TrimSpace(outcome.ErrorMessage) != "" {
+		errorMessage = outcome.ErrorMessage
+	}
+
+	var finalizedStatus string
+	err = tx.QueryRowContext(ctx, `
+		UPDATE blnk.bulk_transaction_batches
+		SET status = $1,
+		    transaction_count = $2,
+		    error_message = $3,
+		    event_id = $4,
+		    finalized_at = NOW()
+		WHERE batch_id = $5
+		  AND status = $6
+		RETURNING status
+	`,
+		outcome.Status,
+		outcome.TransactionCount,
+		errorMessage,
+		event.EventID,
+		trimmed,
+		model.BulkBatchStatusProcessing,
+	).Scan(&finalizedStatus)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		// Either the batch is already terminal, or it was never recorded. Both answers
+		// come from one read so the two cannot be confused, and neither is decided by a
+		// second round trip that could observe a different instant.
+		return false, d.resolveUnfinalizableBulkBatch(ctx, tx, trimmed, outcome.Status)
+	}
+	if err != nil {
+		span.RecordError(err)
+		return false, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to finalize the bulk transaction batch", err)
+	}
+
+	if err := insertEventOutboxesInTx(ctx, tx, []*model.EventOutbox{event}); err != nil {
+		span.RecordError(err)
+		return false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		span.RecordError(err)
+		return false, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to commit the bulk transaction batch outcome", err)
+	}
+
+	span.SetAttributes(
+		attribute.String("batch.id", trimmed),
+		attribute.String("batch.status", finalizedStatus),
+		attribute.String("event.id", event.EventID),
+	)
+
+	return true, nil
+}
+
+// resolveUnfinalizableBulkBatch explains a finalise that matched no row.
+//
+// It runs inside the caller's still-open transaction so the row it reads is the row the
+// UPDATE failed to match, rather than whatever a later connection would see.
+//
+// Three answers are possible and they are genuinely different:
+//
+//   - no row at all: the coordinator was never recorded. That is a programming error in
+//     the caller, not a race, and it is reported as one.
+//   - a terminal row with the SAME outcome: the finalise already happened. Reported as
+//     success so a retry after a lost acknowledgement stops instead of recording a
+//     second event for one outcome.
+//   - a terminal row with a DIFFERENT outcome: two answers exist for one batch. Neither
+//     is discarded silently.
+//
+// Parameters:
+//   - ctx context.Context: the context for the query.
+//   - tx *sql.Tx: the caller's open transaction.
+//   - batchID string: the trimmed batch id.
+//   - attempted string: the outcome the caller was trying to record.
+//
+// Returns:
+//   - error: nil when the batch is already finalised with the same outcome.
+func (d Datasource) resolveUnfinalizableBulkBatch(ctx context.Context, tx *sql.Tx, batchID, attempted string) error {
+	var stored string
+	err := tx.QueryRowContext(ctx, `
+		SELECT status FROM blnk.bulk_transaction_batches WHERE batch_id = $1
+	`, batchID).Scan(&stored)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return apierror.NewAPIError(
+			apierror.ErrNotFound,
+			"The bulk transaction batch was not recorded before its outcome",
+			fmt.Errorf("no coordinator row exists for batch %q", batchID),
+		)
+	case err != nil:
+		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read the bulk transaction batch", err)
+	case stored == attempted:
+		return nil
+	default:
+		return apierror.NewAPIError(
+			apierror.ErrConflict,
+			"The bulk transaction batch already reported a different outcome",
+			fmt.Errorf("batch %q is recorded as %q and cannot be finalized as %q", batchID, stored, attempted),
+		)
+	}
+}
+
+// CountUnfinalizedBulkTransactionBatches counts batches that began and never reported
+// an outcome, and returns the oldest one's start time.
+//
+// This is the one window the coordinator cannot close: a process that dies before the
+// finalising transaction leaves its batch here. Counting it is what makes that residue
+// a visible operational fact instead of an absence nobody can query — and the age is
+// what distinguishes a batch still legitimately running from one that was abandoned,
+// since a large batch may take minutes by design.
+//
+// Parameters:
+//   - ctx context.Context: the context for the query.
+//   - olderThan time.Duration: ignore batches younger than this, so batches still in
+//     flight are not reported as stuck. Zero counts every non-terminal batch.
+//
+// Returns:
+//   - int64: how many batches are outstanding beyond the grace period.
+//   - *time.Time: when the oldest of them began, nil when there are none.
+//   - error: the wrapped query error.
+func (d Datasource) CountUnfinalizedBulkTransactionBatches(ctx context.Context, olderThan time.Duration) (int64, *time.Time, error) {
+	if olderThan < 0 {
+		olderThan = 0
+	}
+
+	var count int64
+	var oldest sql.NullTime
+	err := d.Conn.QueryRowContext(ctx, `
+		SELECT COUNT(*), MIN(created_at)
+		FROM blnk.bulk_transaction_batches
+		WHERE status = $1
+		  AND created_at < NOW() - $2::interval
+	`, model.BulkBatchStatusProcessing, olderThan.String()).Scan(&count, &oldest)
+	if err != nil {
+		return 0, nil, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to count unfinalized bulk transaction batches", err)
+	}
+
+	if !oldest.Valid {
+		return count, nil, nil
+	}
+
+	at := oldest.Time
+
+	return count, &at, nil
+}

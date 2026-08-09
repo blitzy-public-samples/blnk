@@ -144,7 +144,6 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
-		"blnk.ledgers",
 		"blnk.system",
 		"blnk.transactions.dlt",
 		"blnk.balances.dlt",
@@ -169,7 +168,8 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 		// somebody created under our prefix is still not a topic we own, and treating it as ours
 		// would let a stray name reach a writer and a dead-letter composition.
 		"blnk.unknown":            "the namespace is right but there is no such category",
-		"blnk.quarantine":         "the catalogue is five categories; quarantine is not one of them, and admitting a name Blnk does not create would let the ACL pruner treat another team's bindings as its own to delete",
+		"blnk.ledgers":            "a well-formed name inside the namespace whose category does not exist: the catalogue is four categories and ledger.created routes to blnk.system, so a ledgers topic is a name this deployment does not create",
+		"blnk.quarantine":         "the catalogue is four categories; quarantine is not one of them, and admitting a name Blnk does not create would let the ACL pruner treat another team's bindings as its own to delete",
 		"blnk.transaction":        "the singular is not the category name",
 		"blnk.orders":             "a category this deployment does not have",
 		"blnk.transactions.other": "a deeper name is not a category topic",
@@ -188,24 +188,25 @@ func TestIsBlnkEventTopic_AdmitsTheNamespaceAndNothingAdjacentToIt(t *testing.T)
 		"an empty prefix must not admit a foreign name")
 }
 
-// TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic is the allowlist's
-// contract from both directions: exactly what it admits, and everything of Blnk's that it does
-// not.
+// TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryDeadLetterTopic is the
+// allowlist's contract from both directions: exactly what it admits, and everything of Blnk's
+// that it does not.
 //
-// The set is the three TENANT categories the requirement names PLUS blnk.ledgers. That fourth
-// entry is the point of the list: ledger.created is delivered to every subscriber by the legacy
-// transport today, so a Kafka catalogue in which no subscriber credential can reach it would be
-// a consuming-side regression, and it used to be exactly that — the event shared the internal
-// system category and was therefore published and unreachable at the same time.
+// The set is the four category topics of the agreed contract — the three the requirement names
+// plus blnk.system, which carries ledger.created and system.error. Both of those were delivered
+// by the legacy transport, so a Kafka catalogue in which no subscriber credential can reach them
+// would be a consuming-side regression.
 //
-// blnk.system is excluded even though it carries system.error — one of the thirteen event types
-// the legacy transport delivered — and that exclusion is deliberate rather than an oversight, for
-// the two reasons set out on TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory:
-// the legacy audience for system.error was the operator's single configured URL rather than
-// subscribers, and this category is the catalogue's catch-all, so making it grantable would give
-// an unmapped event type an audience that never asked for it. With ledger.created moved out, that
-// exclusion costs a subscriber nothing it previously received.
-func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t *testing.T) {
+// What the list excludes is every DEAD-LETTER sibling. A `<topic>.dlt` record carries Blnk's
+// failure metadata — broker error text, attempt windows, internal topic names — and is triaged
+// through the master-key-gated dead-letter API, not consumed by the subscriber whose event
+// failed. A subscriber that wants its own dead-lettering builds its own topic under its own
+// namespace, which is what the published `<topic>.dlt` convention exists to keep clear of.
+//
+// Grantable is not the same as granted: this list is what MAY be granted, and any given
+// subscriber holds only the subset recorded on it. Whether blnk.system is in that subset is an
+// operator decision, because a grant of it discloses system.error's verbatim body.
+func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryDeadLetterTopic(t *testing.T) {
 	const prefix = "blnk"
 
 	grantable := SubscriberGrantableTopics(prefix)
@@ -214,11 +215,11 @@ func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t
 		"blnk.transactions",
 		"blnk.balances",
 		"blnk.identities",
-		"blnk.ledgers",
+		"blnk.system",
 	}, grantable,
-		"a subscriber may be granted exactly the four tenant-facing category topics; every "+
+		"a subscriber may be granted exactly the four category topics of the agreed contract; every "+
 			"over-grant finding in this area reduces to this one enumerated boundary, and every "+
-			"under-grant finding reduces to blnk.ledgers being absent from it")
+			"under-grant finding reduces to blnk.system being absent from it")
 
 	for _, topic := range grantable {
 		assert.Truef(t, IsSubscriberGrantableTopicName(topic, prefix),
@@ -226,13 +227,12 @@ func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t
 	}
 
 	ungrantable := map[string]string{
-		"blnk.system":             "the catalogue's catch-all, and system.error's frozen payload carries raw error text describing the deployment",
-		"blnk.quarantine":         "not a catalogued category at all; the five-category inventory is closed, so it can be neither owned nor granted",
+		"blnk.ledgers":            "ledger events live in the system category, so a ledgers topic is a name this deployment neither creates nor grants",
+		"blnk.quarantine":         "not a catalogued category at all; the four-category inventory is closed, so it can be neither owned nor granted",
 		"blnk.transactions.dlt":   "a dead-letter topic is Blnk's own; a subscriber builds its own <topic>.dlt",
 		"blnk.balances.dlt":       "the same, for every category",
 		"blnk.identities.dlt":     "the same",
-		"blnk.ledgers.dlt":        "the same, and a grantable category's dead-letter sibling is no more grantable than an internal one's",
-		"blnk.system.dlt":         "the same",
+		"blnk.system.dlt":         "the same, and a grantable category's dead-letter sibling is no more grantable than any other",
 		"blnk.quarantine.dlt":     "and neither is its dead-letter form",
 		"*":                       "Kafka reads \"*\" as every resource, turning a per-topic grant cluster-wide",
 		"":                        "an empty name grants nothing and must not be admitted as a member",
@@ -254,9 +254,10 @@ func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t
 		assert.Truef(t, IsBlnkEventTopic(topic, prefix), "%q must be inside the owned namespace", topic)
 	}
 
-	assert.Less(t, len(grantable), len(AllEventCategories()),
-		"the grantable list must be a strict subset of the categories; equal length means an internal "+
-			"category became grantable")
+	assert.Len(t, grantable, len(AllEventCategories()),
+		"every category topic is grantable, so the list must hold exactly one entry per category; "+
+			"fewer means a category is published and unreachable, more means a name that is not a "+
+			"category topic reached the allowlist")
 
 	// An empty prefix composes against the default rather than producing bare category names.
 	for _, topic := range SubscriberGrantableTopics("") {
@@ -341,33 +342,37 @@ func TestEventSubscriberPredicates_ReadTheRowRatherThanAssuming(t *testing.T) {
 
 		// Every one of these is consulted on a row that may not have been found, so a nil
 		// receiver must be a definite "no" rather than a panic in a ledger process.
-		assert.False(t, absent.DeclaresUnenforceableIsolation())
+		assert.False(t, absent.RequiresClientSideKeyFiltering())
 		assert.False(t, absent.IsProvisioned())
 		assert.False(t, absent.IsMigrated())
 	})
 
-	t.Run("DeclaresUnenforceableIsolation is C-08's refusal", func(t *testing.T) {
-		// The predicate decides whether a credential may be minted at all, so its edges are the
-		// difference between refusing a boundary Kafka cannot apply and handing one out.
+	t.Run("RequiresClientSideKeyFiltering states which boundary the subscriber owns", func(t *testing.T) {
+		// The predicate decides what the credential CONTRACT says, not whether a credential may
+		// be minted: Kafka has no key-level ACL resource, so a recorded prefix is a narrowing the
+		// subscriber applies itself and the response has to say so. Its edges are therefore the
+		// difference between telling a subscriber it must filter and letting it believe the broker
+		// already did.
 		none := &EventSubscriber{}
-		assert.False(t, none.DeclaresUnenforceableIsolation(),
-			"no recorded prefix is nothing to be unable to enforce")
+		assert.False(t, none.RequiresClientSideKeyFiltering(),
+			"no recorded prefix leaves nothing for the subscriber to filter")
 
 		blank := ""
-		assert.False(t, (&EventSubscriber{PartitionKeyPrefix: &blank}).DeclaresUnenforceableIsolation(),
+		assert.False(t, (&EventSubscriber{PartitionKeyPrefix: &blank}).RequiresClientSideKeyFiltering(),
 			"an empty recorded prefix declares no boundary")
 
 		whitespace := "   \t "
-		assert.False(t, (&EventSubscriber{PartitionKeyPrefix: &whitespace}).DeclaresUnenforceableIsolation(),
-			"whitespace declares no boundary either; treating it as one would refuse issuance over nothing")
+		assert.False(t, (&EventSubscriber{PartitionKeyPrefix: &whitespace}).RequiresClientSideKeyFiltering(),
+			"whitespace declares no boundary either; treating it as one would announce an obligation "+
+				"over nothing")
 
 		declared := "ldg_customer-"
-		assert.True(t, (&EventSubscriber{PartitionKeyPrefix: &declared}).DeclaresUnenforceableIsolation(),
+		assert.True(t, (&EventSubscriber{PartitionKeyPrefix: &declared}).RequiresClientSideKeyFiltering(),
 			"a real recorded prefix IS a declared record-level boundary, and no Kafka ACL admits some "+
-				"records of a partition and refuses others by key")
+				"records of a partition and refuses others by key, so the subscriber must apply it")
 
 		padded := "  ldg_customer-  "
-		assert.True(t, (&EventSubscriber{PartitionKeyPrefix: &padded}).DeclaresUnenforceableIsolation(),
+		assert.True(t, (&EventSubscriber{PartitionKeyPrefix: &padded}).RequiresClientSideKeyFiltering(),
 			"a padded prefix still declares one; trimming to nothing is the only way it does not")
 	})
 
@@ -599,5 +604,81 @@ func TestIsCanonicalUUID_AcceptsOnlyTheCanonicalForm(t *testing.T) {
 	}
 	for value, because := range refused {
 		assert.Falsef(t, IsCanonicalUUID(value), "%s (%q) is not the canonical form", because, value)
+	}
+}
+
+// TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic is the allowlist's
+// contract from both directions: exactly what it admits, and everything of Blnk's that it does
+// not.
+//
+// The set is exactly the three TENANT categories the requirement names. The topic catalogue has a
+// fourth category, blnk.system, and it is deliberately NOT in this list.
+//
+// blnk.system is excluded even though it carries system.error and ledger.created — two of the
+// thirteen event types the legacy transport delivered — and that exclusion is deliberate rather
+// than an oversight, for the two reasons set out on
+// TestSubscriberGrantableEventCategories_ExcludesEveryInternalCategory: system.error's frozen
+// payload carries raw error text describing the deployment, and this category is the catalogue's
+// catch-all, so making it grantable would give an unmapped event type an audience that never
+// asked for it. The cost — ledger.created has no subscriber route — is recorded on
+// EventCategorySystem and in docs/webhook-to-kafka-migration.md rather than resolved by inventing
+// a fifth category the frozen topic contract does not have.
+func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t *testing.T) {
+	const prefix = "blnk"
+
+	grantable := SubscriberGrantableTopics(prefix)
+
+	require.ElementsMatch(t, []string{
+		"blnk.transactions",
+		"blnk.balances",
+		"blnk.identities",
+		"blnk.system",
+	}, grantable,
+		"a subscriber may be granted exactly the FOUR category topics of the closed catalogue, "+
+			"blnk.system included: under the frozen four-category contract it carries ledger.created "+
+			"as well as system.error, so withholding the name would make ordinary ledger data "+
+			"unreachable to every subscriber. What granting it discloses is documented, and the "+
+			"decision stays per subscriber through authorized_topics")
+
+	for _, topic := range grantable {
+		assert.Truef(t, IsSubscriberGrantableTopicName(topic, prefix),
+			"%q is in the grantable list but the membership test rejects it", topic)
+	}
+
+	ungrantable := map[string]string{
+		"blnk.quarantine":         "not a catalogued category at all; the four-category inventory is closed, so it can be neither owned nor granted",
+		"blnk.transactions.dlt":   "a dead-letter topic is Blnk's own; a subscriber builds its own <topic>.dlt",
+		"blnk.balances.dlt":       "the same, for every category",
+		"blnk.identities.dlt":     "the same",
+		"blnk.system.dlt":         "the same",
+		"blnk.quarantine.dlt":     "and neither is its dead-letter form",
+		"*":                       "Kafka reads \"*\" as every resource, turning a per-topic grant cluster-wide",
+		"":                        "an empty name grants nothing and must not be admitted as a member",
+		"blnk.transactions ":      "an untrimmed name is a different topic to Kafka",
+		" blnk.transactions":      "and so is this one",
+		"other.transactions":      "a foreign namespace",
+		"blnk":                    "the namespace itself is not a topic",
+		"blnk.transactions.other": "a deeper name inside the namespace is still not a category topic",
+	}
+	for topic, because := range ungrantable {
+		assert.Falsef(t, IsSubscriberGrantableTopicName(topic, prefix),
+			"%q must NOT be grantable: %s", topic, because)
+	}
+
+	// The grantable set is a strict subset of the namespace: everything in it is Blnk's, and not
+	// everything of Blnk's is in it. Both halves are asserted so a future widening cannot pass
+	// unnoticed.
+	for _, topic := range grantable {
+		assert.Truef(t, IsBlnkEventTopic(topic, prefix), "%q must be inside the owned namespace", topic)
+	}
+
+	assert.Len(t, grantable, len(AllEventCategories()),
+		"the grantable list is the catalogue, name for name: a category events are routed to but no "+
+			"subscriber may be granted is a topic nothing can consume")
+
+	// An empty prefix composes against the default rather than producing bare category names.
+	for _, topic := range SubscriberGrantableTopics("") {
+		assert.True(t, strings.HasPrefix(topic, DefaultEventTopicPrefix+"."),
+			"an empty prefix must compose against the default namespace, got %q", topic)
 	}
 }

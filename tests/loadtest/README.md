@@ -99,6 +99,57 @@ That makes the queue benchmark watch both:
 - `new:transaction_*`
 - `hot_*`
 
+## The event-streaming acceptance run
+
+`tests/loadtest/events.js` is a different kind of scenario from the four above. It does not
+compare queue topologies; it decides whether the Kafka event pipeline meets three stated
+acceptance criteria, and it prints a verdict for each:
+
+| Verdict metric | Criterion |
+|----------------|-----------|
+| `event_publish_events_per_second` | V-1 — 500 events/sec sustained |
+| `event_publish_p99_seconds` | V-1 — p99 capture-to-dispatch latency under 2s, first attempts only |
+| `event_publish_dead_letter_ratio` | V-3 — under 0.1% of events dead-lettered |
+| `event_publish_verdicts_available` | the three above were actually measured |
+
+Run it with:
+
+```bash
+set -a; . ./.env; set +a          # the master key and the metrics bearer token
+bash tests/loadtest/run_case.sh events
+```
+
+Two files are written: `summary-events.json` and `run-events.ndjson`. No queue benchmark runs
+and no Redis DSN is needed — the event pipeline's backlog is `blnk_outbox_pending`, which the
+scenario reads from `/metrics` itself.
+
+**The load shape defaults to the criterion's own figures — 500/s for 30 minutes — and the
+runner does not substitute the transaction cases' defaults for them.** Pass `RATE` or
+`DURATION` explicitly for a shorter smoke run, and the run announces that you did:
+
+```bash
+RATE=50 DURATION=2m bash tests/loadtest/run_case.sh events
+```
+
+A smoke run's verdicts are real for the load it offered, which is not the load the criteria are
+stated over. Only a default run certifies V-1 and V-3.
+
+### Reading the verdict honestly
+
+Two things about the output are worth knowing before relying on it.
+
+`event_publish_verdicts_available` is the row to check FIRST. A run against a stack whose
+observability was off reports three zeroes, two of which satisfy their `<` thresholds — so this
+flag is what stops a stack that measured nothing from reporting a clean sweep. It goes to 0, and
+the summary names the reason, when either metrics scrape failed, the window was not positive, no
+terminal events were seen, or **the first-attempt latency histogram had no observations**.
+
+The p99 verdict is computed from `blnk_events_capture_to_dispatch_duration_seconds` and from
+nothing else. `blnk_events_publish_duration_seconds` is reported beside it, and their difference
+is reported as the queue wait, but neither is a threshold and neither can satisfy V-1: publish
+duration's clock starts at the relay's claim, so it omits the queue wait and reports its
+smallest figures for exactly the backlog the criterion exists to catch.
+
 ## Manual run flow
 
 If you want to run the tools manually instead of using `run_case.sh`, use two terminals.

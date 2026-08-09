@@ -103,10 +103,27 @@ func (l *Blnk) postIdentityActions(ctx context.Context, identity *model.Identity
 // is a separate, deliberate change to the contract rather than a side effect of moving
 // transports.
 //
-// An identity has NO ledger — it is not a ledger-scoped entity — so no WithEventLedgerID is
-// supplied and ledger_id is stored as SQL NULL. The partition key falls back to the identity
-// id through the documented chain in PrepareEventOutbox, which gives one identity's events a
-// stable partition and therefore a total order among themselves.
+// AN IDENTITY HAS NO LEDGER, so requirement R-6's ledger partitioning has nothing to apply
+// here, and this is one of the two catalogue entries where that is a property of the DATA MODEL
+// rather than of this call site not bothering.
+//
+// model.Identity declares no ledger field and no balance reference: an identity is a party, and
+// the same party may hold balances in many ledgers or none. There is therefore no authoritative
+// ledger to thread — not one that is expensive to obtain, one that does not exist — and
+// inventing one by, say, picking the first balance that happens to reference the identity would
+// fabricate an ordering domain that changes as balances are added.
+//
+// So no WithEventLedgerID is supplied, ledger_id is stored as SQL NULL, and the partition key
+// resolves to the IDENTITY ID through PrepareEventOutbox's documented chain. That is the correct
+// answer rather than a degraded one: the identity is the aggregate these events describe, so
+// keying on it gives one identity's events a single partition and therefore a total order among
+// themselves — which is exactly the guarantee a consumer of identity events needs. The
+// partition-key table in docs/event-streaming.md states this, and event_ordering_integration_test.go
+// asserts it, so the choice is documented and pinned rather than incidental.
+//
+// A NULL ledger_id is likewise correct and not a gap: the column records the ledger the mutation
+// belonged to, and this mutation belonged to none. Storing a fabricated value would corrupt the
+// daily reconciliation and any consumer grouping by ledger.
 //
 // The `identity.created` event is captured atomically with the identity row: the capture
 // handed to the datasource is invoked with the finalised identity and its row is inserted

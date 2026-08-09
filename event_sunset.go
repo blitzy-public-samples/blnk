@@ -52,14 +52,20 @@ import (
 //
 // # The window has TWO ends, and dual delivery is gated on both
 //
-// The sunset is one end of a window whose other end is
-// WEBHOOK_DEPRECATION_START_DATE, and requirement R-12 is about the SPAN between
-// them: Kafka publishing and legacy HTTP delivery run concurrently for EXACTLY 30
-// days. A predicate that consulted the sunset alone could not express that span, and
-// the start date existed in configuration while no decision read it — so a
-// deployment whose relay began publishing weeks before its declared start ran dual
-// delivery for weeks longer than 30 days, and the configured start said otherwise
-// with nothing reconciling the two.
+// The sunset is one end of a window whose other end is DERIVED from it — exactly
+// WebhookDualDeliveryWindowDays earlier — and requirement R-12 is about the SPAN
+// between them: Kafka publishing and legacy HTTP delivery run concurrently for
+// EXACTLY 30 days. A predicate that consulted the sunset alone could not express
+// that span, so a deployment whose relay began publishing weeks before the window
+// opened would run dual delivery for weeks longer than 30 days.
+//
+// THERE IS ONE CONFIGURABLE END, and it is WEBHOOK_DEPRECATION_SUNSET_DATE.
+// Requirement R-10 freezes the deployment contract at eight variables, of which
+// exactly one describes this window, so the opening instant carries no environment
+// variable of its own and no message in this file may tell an operator to set one:
+// the only actionable remedy for a window in the wrong place is to correct the
+// SUNSET date. See config.WebhookDeprecationStartDate, which is a derived, read-only
+// field.
 //
 // WebhookDualDeliveryActive is therefore the authoritative predicate for the LEGACY
 // LEG, and it consults both ends: the window is the half-open interval
@@ -231,8 +237,9 @@ func webhookSunsetInstant(cnf *config.Configuration) (time.Time, webhookSunsetRe
 				"webhook_deprecation_sunset_date is NOT SET while Kafka brokers are configured. " +
 					"The dual-delivery window has no end, so the sunset is being treated as ALREADY " +
 					"PASSED: legacy HTTP webhook delivery stops and the deprecated webhook " +
-					"management routes answer 410 Gone. Set WEBHOOK_DEPRECATION_SUNSET_DATE, or " +
-					"WEBHOOK_DEPRECATION_START_DATE and let the 30-day window derive it",
+					"management routes answer 410 Gone. Set WEBHOOK_DEPRECATION_SUNSET_DATE to an " +
+					"RFC3339 instant 30 days after this deployment begins publishing; the window's " +
+					"opening instant is derived from it and has no variable of its own",
 			)
 		}
 
@@ -242,10 +249,10 @@ func webhookSunsetInstant(cnf *config.Configuration) (time.Time, webhookSunsetRe
 	parsed, err := time.Parse(webhookSunsetLayout, raw)
 	if err != nil {
 		if sunsetParseWarnings.shouldWarn(raw) {
-			entry := logrus.WithError(err).WithFields(logrus.Fields{
-				"value":    raw,
+			entry := withLoggableCause(logrus.WithFields(logrus.Fields{
+				"value":    sanitizeLogValue(raw, maxLoggedFilterLength),
 				"expected": webhookSunsetLayout,
-			})
+			}), err)
 			if publishing {
 				entry.Error(
 					"webhook_deprecation_sunset_date is not a valid RFC3339 instant while Kafka " +
@@ -288,7 +295,7 @@ func webhookSunsetInstant(cnf *config.Configuration) (time.Time, webhookSunsetRe
 func resolveWebhookSunset() (time.Time, webhookSunsetResolution) {
 	cnf, err := fetchConfiguration()
 	if err != nil {
-		logrus.WithError(err).Debug(
+		withLoggableCause(nil, err).Debug(
 			"configuration is not loaded; treating the webhook sunset as not yet passed",
 		)
 
@@ -409,6 +416,68 @@ func webhookSunsetPassedFor(
 	}
 }
 
+// WebhookSunsetSnapshot is the sunset as ONE request saw it: the instant to describe
+// and the verdict to act on, resolved together.
+//
+// # Why the two must come from one resolution
+//
+// The HTTP guard needs both — a Sunset header advertising the date, and a verdict
+// deciding whether to answer 410 — and it used to obtain them from two independent
+// calls, WebhookSunsetDate followed by WebhookSunsetPassed. Each re-reads the live
+// configuration store, whose contents are replaced wholesale on reload, so a reload
+// landing between them produced a single response advertising date A while deciding
+// under date B. A client reading the header would be told it had until A when the
+// refusal it just received was taken under B, and nothing in the response would
+// disclose the disagreement.
+//
+// The mismatch is small and the window for it is narrow, which is precisely why it
+// must be closed structurally rather than watched for: it cannot be reproduced on
+// demand and would never be observed in testing.
+//
+// The fields are read-only once returned. There is no method that recomputes anything.
+type WebhookSunsetSnapshot struct {
+	// Date is the resolved sunset instant in UTC. Meaningful only when DateConfigured
+	// is true; otherwise it is the zero time and must not be rendered.
+	Date time.Time
+
+	// DateConfigured reports whether there is an instant to DESCRIBE. It does not
+	// answer whether the sunset has passed — a deployment publishing to Kafka with an
+	// unusable window has no instant to advertise and yet IS past the sunset, because
+	// that state fails closed. Take the verdict from Passed and nothing else.
+	DateConfigured bool
+
+	// Passed is the verdict, evaluated against the instant the caller supplied and
+	// against the same resolution Date came from.
+	Passed bool
+}
+
+// WebhookSunsetSnapshotAt resolves the sunset ONCE and answers every question about it.
+//
+// It reads the configuration store a single time, so the date it reports and the
+// verdict it returns cannot describe different configurations. Callers that need both
+// — the 410 guard being the one that does — must use this rather than pairing
+// WebhookSunsetDate with WebhookSunsetPassed.
+//
+// The comparison is still webhookSunsetPassedFor's, so this adds no second reading of
+// the boundary: it is the same predicate the relay's dual-delivery branch reaches, and
+// the same fail-closed treatment of an unusable window.
+//
+// Parameters:
+//   - now time.Time: the instant to evaluate the sunset against, injected for the same
+//     reason WebhookSunsetPassed takes it — so tests pin the boundary exactly.
+//
+// Returns:
+//   - WebhookSunsetSnapshot: the date, whether it is renderable, and the verdict.
+func WebhookSunsetSnapshotAt(now time.Time) WebhookSunsetSnapshot {
+	sunset, resolution := resolveWebhookSunset()
+
+	return WebhookSunsetSnapshot{
+		Date:           sunset,
+		DateConfigured: resolution == sunsetResolved,
+		Passed:         webhookSunsetPassedFor(sunset, resolution, now),
+	}
+}
+
 // WebhookSunsetPassedNow reports whether the webhook sunset has passed as of the
 // current wall clock.
 //
@@ -520,11 +589,11 @@ func webhookWindowStart(cnf *config.Configuration, sunset time.Time) time.Time {
 	parsed, err := time.Parse(webhookSunsetLayout, raw)
 	if err != nil {
 		if startParseWarnings.shouldWarn(raw) {
-			logrus.WithError(err).WithFields(logrus.Fields{
-				"value":         raw,
+			withLoggableCause(logrus.WithFields(logrus.Fields{
+				"value":         sanitizeLogValue(raw, maxLoggedFilterLength),
 				"expected":      webhookSunsetLayout,
 				"derived_start": derived.Format(webhookSunsetLayout),
-			}).Warn(
+			}), err).Warn(
 				"webhook_deprecation_start_date is not a valid RFC3339 instant and is being " +
 					"ignored; the window start is derived from the sunset instead. Correct the value",
 			)
@@ -559,8 +628,18 @@ func WebhookDualDeliveryWindowState(now time.Time) WebhookWindowState {
 		return WebhookWindowUnavailable
 	}
 
+	// The CLOSED end is decided by webhookSunsetPassedFor, not by a comparison written
+	// here. This used to test `!now.Before(sunset)` inline, which was a second place in
+	// the codebase comparing an instant to the sunset — correct today, and free to drift
+	// from the predicate the 410 guard uses the moment either boundary rule changed. The
+	// pair that would then disagree is exactly the one this file exists to keep in
+	// step: "the legacy leg has stopped" and "the webhook routes answer 410".
+	//
+	// The resolution is already known to be sunsetResolved, so this reaches that
+	// function's resolved arm and nothing else; the fail-closed arm is unreachable from
+	// here and is handled above as WebhookWindowUnavailable.
 	instant := now.UTC()
-	if !instant.Before(sunset) {
+	if webhookSunsetPassedFor(sunset, resolution, instant) {
 		return WebhookWindowClosed
 	}
 
@@ -676,11 +755,16 @@ func WebhookWindowObstacle(state WebhookWindowState) error {
 //
 // # Why this lives here rather than at the call site
 //
-// The message names WEBHOOK_DEPRECATION_START_DATE and quotes both ends of the window, and
+// The message quotes both ends of the window and names the one variable that moves them, and
 // this file is the single owner of the window — including the vocabulary for explaining it.
 // A relay that composed this message itself would be a second place that knew what the
-// configured dates are called, and the invariant test that keeps every raw read in one file
+// configured date is called, and the invariant test that keeps every raw read in one file
 // would rightly reject it.
+//
+// The remedy it names is WEBHOOK_DEPRECATION_SUNSET_DATE, and only that. The opening instant
+// is derived from the sunset and has no environment variable, so naming one would send an
+// operator to set a key that does not exist — the message would look actionable and change
+// nothing.
 //
 // # Why the state is a parameter
 //
@@ -693,7 +777,7 @@ func WebhookWindowObstacle(state WebhookWindowState) error {
 //
 // Returns:
 //   - error: non-nil only for WebhookWindowPending. The message names both ends of the
-//     window, the variable to correct, and the two acceptable ways forward.
+//     window, the one variable that moves them, and the two acceptable ways forward.
 func WebhookWindowPendingObstacle(state WebhookWindowState) error {
 	if state != WebhookWindowPending {
 		return nil
@@ -705,17 +789,20 @@ func WebhookWindowPendingObstacle(state WebhookWindowState) error {
 		// resolved. Reported without dates rather than not reported at all.
 		return errors.New(
 			"the dual-delivery window has not opened yet, so publishing to Kafka now would " +
-				"deliver no legacy webhooks: correct WEBHOOK_DEPRECATION_START_DATE",
+				"deliver no legacy webhooks: correct WEBHOOK_DEPRECATION_SUNSET_DATE",
 		)
 	}
 
 	return fmt.Errorf(
 		"the dual-delivery window opens at %s and has not opened yet, so publishing to Kafka now "+
 			"would enqueue no legacy webhooks and would run the two transports concurrently for "+
-			"longer than the %d days ending %s. Correct WEBHOOK_DEPRECATION_START_DATE to when "+
-			"this deployment actually begins publishing, or do not publish until then",
+			"longer than the %d days ending %s. Move the window by setting "+
+			"WEBHOOK_DEPRECATION_SUNSET_DATE to %d days after this deployment actually begins "+
+			"publishing — the opening instant is derived from it and has no variable of its own — "+
+			"or do not publish until then",
 		start.Format(webhookSunsetLayout),
 		config.WebhookDualDeliveryWindowDays,
 		sunset.Format(webhookSunsetLayout),
+		config.WebhookDualDeliveryWindowDays,
 	)
 }

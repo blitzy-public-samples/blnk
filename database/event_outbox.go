@@ -87,23 +87,25 @@ package database
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/apierror"
+	"github.com/blnkfinance/blnk/internal/logsafe"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -121,6 +123,35 @@ const (
 	// outbox relays already use is safer than honouring an obviously wrong
 	// argument.
 	defaultEventClaimLease = 30 * time.Second
+
+	// eventDeadLetterHandoffLease is the lease a terminal transition LEAVES ON THE ROW so
+	// that the dead-letter write it owes is exclusively its own.
+	//
+	// # The race it closes
+	//
+	// MarkEventFailed's exhaustion arm and MarkEventPermanentlyFailed both retain the claim
+	// token, precisely so that only the worker that spent the last attempt may perform the
+	// dead-letter write and the MarkEventDeadLettered that records it. Both used to clear
+	// locked_until at the same time, and clearing it handed the row straight back:
+	// ClaimFailedEventOutboxForDeadLetter selects a failed row with dlt_topic IS NULL and an
+	// ABSENT OR EXPIRED lease, and stamps a FRESH token over whatever was there. So a second
+	// relay instance could reclaim the row in the same instant, overwrite the token the first
+	// worker was about to present, and publish to the dead-letter topic concurrently with it —
+	// two copies of one event on the dead-letter topic, and the first worker's transition then
+	// failing with a lost claim it never actually lost. Retaining the token without retaining
+	// the lease made the token's exclusivity decorative.
+	//
+	// Holding a lease across the hand-off is what makes the retained token mean something: the
+	// repair path cannot see the row until the lease lapses, by which time the owning worker
+	// has either recorded the dead-letter write — MarkEventDeadLettered clears both the lease
+	// and the token — or died, which is exactly when the repair path SHOULD take it.
+	//
+	// It equals defaultEventClaimLease deliberately. The hand-off is one broker write plus one
+	// UPDATE, the same shape of work an ordinary claim covers, and a longer lease would only
+	// delay repair after a crash while a shorter one would reintroduce the race under load.
+	// It is a separate constant rather than a reuse because the two answer different questions
+	// and a future change to one must not silently move the other.
+	eventDeadLetterHandoffLease = 30 * time.Second
 
 	// Page-size bounds for the dead-letter listing. The default keeps an
 	// unqualified request cheap; the maximum stops a caller turning a triage
@@ -155,10 +186,15 @@ const (
 // legacy webhook leg and a dead-letter replay all serialise. Projecting the JSONB
 // column would silently substitute normalised bytes for the producer's own and break
 // acceptance criteria V-8 and V-9 without any read failing.
+// traceparent and tracestate are projected because the PUBLISH path reads them: the relay
+// links its producer span to the trace that captured the event, and without them in the
+// projection a claimed row arrives with no memory of where it came from and every publish
+// span starts a trace of its own.
 const eventOutboxColumns = `id, event_id, event_type, aggregate_id, partition_key, ledger_id, topic, schema_version, ` +
 	`payload_raw, event_raw, occurred_at, status, attempts, max_attempts, next_attempt_at, last_error, first_attempted_at, ` +
 	`last_attempted_at, dispatched_at, locked_until, claim_token, webhook_dispatched, kafka_dispatched_at, ` +
-	`webhook_attempts, kafka_topic, kafka_partition, kafka_offset, dlt_topic, failure_metadata`
+	`webhook_attempts, kafka_topic, kafka_partition, kafka_offset, dlt_topic, failure_metadata, traceparent, tracestate, ` +
+	`resolved_at, resolution_note`
 
 // eventOutboxScanner is the minimum surface scanEventOutbox needs, satisfied by
 // both *sql.Row and *sql.Rows. Sharing one scanner between the single-row and
@@ -182,10 +218,13 @@ type eventOutboxScanner interface {
 func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 	var e model.EventOutbox
 	var ledgerID, lastError, claimToken, dltTopic, kafkaTopic sql.NullString
+	var traceparent, tracestate sql.NullString
 	var firstAttemptedAt, lastAttemptedAt, dispatchedAt, lockedUntil, kafkaDispatchedAt sql.NullTime
 	var kafkaPartition sql.NullInt32
 	var kafkaOffset sql.NullInt64
 	var failureMetadata []byte
+	var resolvedAt sql.NullTime
+	var resolutionNote sql.NullString
 
 	if err := s.Scan(
 		&e.ID,
@@ -220,9 +259,26 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 		&kafkaOffset,
 		&dltTopic,
 		&failureMetadata,
+		// The trace context of the request that captured this event. NULL for every event
+		// captured without an active trace, which is a legitimate and common state — see
+		// model.EventOutbox.Traceparent.
+		&traceparent,
+		&tracestate,
+		// The operator resolution. resolved_at NIL MEANS UNRESOLVED, which is the state that
+		// keeps the row out of the retention purge and in the dead-letter age gauge, so it is
+		// read as a nullable time rather than collapsed to a zero instant.
+		&resolvedAt,
+		&resolutionNote,
 	); err != nil {
 		return model.EventOutbox{}, err
 	}
+
+	if resolvedAt.Valid {
+		instant := resolvedAt.Time
+		e.ResolvedAt = &instant
+	}
+
+	e.ResolutionNote = resolutionNote.String
 
 	// ledger_id is NULLABLE and NULL means "this event has no ledger" as a
 	// positive fact — see the column comment in the migration. It collapses to the
@@ -235,6 +291,11 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 	// the value every conditional transition must present to be allowed to write.
 	e.ClaimToken = claimToken.String
 	e.DLTTopic = dltTopic.String
+	// Collapsed to the empty string for the same reason ledger_id is: the model fields are
+	// plain strings tagged omitempty, so "no trace was recorded" has one spelling on the Go
+	// side and no reader has to branch on a pointer to ask the question.
+	e.Traceparent = traceparent.String
+	e.Tracestate = tracestate.String
 	if len(failureMetadata) > 0 {
 		e.FailureMetadata = failureMetadata
 	}
@@ -291,20 +352,25 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 // containment and extraction queries, payload_raw for every byte-level guarantee.
 // Populating one without the other is not an option — a reader takes the body from
 // payload_raw, so a missing payload_raw is a missing event body.
+// traceparent and tracestate are inserted so the trace that captured an event survives to
+// the publish. They are bound as SQL NULL when absent rather than as empty strings, on the
+// same reasoning as ledger_id: the column is nullable so that "there was no trace" is a
+// statable fact, and two spellings of one meaning is how a query filtering on one silently
+// misses rows.
 const eventOutboxInsertColumns = `event_id, event_type, aggregate_id, partition_key, ledger_id, topic, ` +
-	`schema_version, payload, payload_raw, event_raw, occurred_at, status, max_attempts`
+	`schema_version, payload, payload_raw, event_raw, occurred_at, status, max_attempts, traceparent, tracestate`
 
 const eventOutboxInsertQuery = `
 		INSERT INTO blnk.event_outbox
 		(` + eventOutboxInsertColumns + `)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		RETURNING id
 	`
 
 // eventOutboxInsertValueCount is the number of bound values per inserted row. It
 // keeps the batch insert's placeholder arithmetic tied to the column list above
 // rather than to a literal that a later column addition would leave stale.
-const eventOutboxInsertValueCount = 13
+const eventOutboxInsertValueCount = 15
 
 // maxEventOutboxInsertRows bounds how many rows one multi-row INSERT may carry,
 // and it is a hard requirement rather than tuning.
@@ -388,7 +454,7 @@ func validateEventOutboxEntry(e *model.EventOutbox) error {
 	if strings.TrimSpace(e.PartitionKey) == "" {
 		return apierror.NewAPIError(apierror.ErrBadRequest, "Event outbox entry requires a partition key", nil)
 	}
-	if !model.IsBlnkEventTopic(e.Topic, expectedEventTopicPrefix()) {
+	if !model.IsBlnkEventTopicUnderAnyPrefix(e.Topic, expectedEventTopicPrefixes()) {
 		return apierror.NewAPIError(apierror.ErrBadRequest,
 			"Event outbox entry requires a Blnk-owned topic", nil)
 	}
@@ -434,13 +500,26 @@ func validateEventOutboxEntry(e *model.EventOutbox) error {
 	return nil
 }
 
-// expectedEventTopicPrefix resolves the topic namespace this deployment owns, for the
+// expectedEventTopicPrefixes resolves every topic namespace this deployment owns, for the
 // topic-membership check above.
 //
-// It reads KAFKA_TOPIC_PREFIX and falls back to model.DefaultEventTopicPrefix when
-// configuration is unset, blank or not loaded — which mirrors the root package's
-// TopicPrefix exactly, so the name a row is validated against is the name that row's
-// topic was composed from.
+// It reads KAFKA_TOPIC_PREFIX followed by KAFKA_HISTORICAL_TOPIC_PREFIXES, and falls back
+// to model.DefaultEventTopicPrefix when configuration is unset, blank or not loaded — which
+// mirrors the root package's OwnedTopicPrefixes exactly, so the names a row is validated
+// against are the names that row's topic could have been composed from.
+//
+// # Why the historical prefixes belong here too
+//
+// The two ownership checks — this one at insert and the publisher's at writer
+// resolution — must share ONE definition of an owned destination, or a row can be accepted
+// by the layer that stores it and refused by the layer that publishes it, which is a
+// permanently undeliverable committed event. Since the publisher now admits every declared
+// prefix so that rows captured before a rename can still drain, this admits them too.
+//
+// The widening reaches nothing a producer can steer. A new row's topic is composed by
+// TopicForEvent from the CONFIGURED prefix alone, so a historical name cannot arrive on an
+// insert in the first place; what the shared definition buys is that the two layers cannot
+// disagree, not extra reach for a caller.
 //
 // THE FALLBACK IS THE STRICT ANSWER, not a permissive one. Defaulting to "blnk" means a
 // deployment that renamed its namespace but has not loaded configuration has its inserts
@@ -450,19 +529,38 @@ func validateEventOutboxEntry(e *model.EventOutbox) error {
 // The value is re-read per call rather than cached, because the configuration store is
 // an atomic value that is re-published whenever configuration is reloaded; a cached
 // prefix would keep validating against configuration that no longer exists. The cost is
-// one atomic load and a trim of a short string, and nothing pays it on a hot loop —
+// one atomic load and a trim of a few short strings, and nothing pays it on a hot loop —
 // validation runs once per inserted row.
-func expectedEventTopicPrefix() string {
+//
+// Returns:
+//   - []string: one or more distinct, non-blank prefixes, the configured one first.
+func expectedEventTopicPrefixes() []string {
 	cnf, err := config.Fetch()
 	if err != nil || cnf == nil {
-		return model.DefaultEventTopicPrefix
+		return []string{model.DefaultEventTopicPrefix}
 	}
 
-	if prefix := strings.TrimSpace(cnf.Kafka.TopicPrefix); prefix != "" {
-		return prefix
+	prefixes := cnf.Kafka.OwnedTopicPrefixes()
+	if len(prefixes) == 0 {
+		return []string{model.DefaultEventTopicPrefix}
 	}
 
-	return model.DefaultEventTopicPrefix
+	return prefixes
+}
+
+// configuredEventTopicPrefix resolves the CURRENT topic namespace only — KAFKA_TOPIC_PREFIX,
+// falling back to model.DefaultEventTopicPrefix.
+//
+// It is deliberately narrower than expectedEventTopicPrefixes and is for the questions where
+// only the live generation is a valid answer: which topics a SUBSCRIBER may be granted, and
+// which topics are provisioned into. A historical namespace is something to drain, so
+// granting a subscriber Read on it, or continuing to create topics there, would be exactly
+// the wrong direction — it keeps a generation alive that the allowlist exists to retire.
+//
+// Returns:
+//   - string: a non-empty prefix.
+func configuredEventTopicPrefix() string {
+	return expectedEventTopicPrefixes()[0]
 }
 
 // prepareEventOutboxEntry normalises then validates one entry, in that order, and
@@ -504,6 +602,19 @@ func normalizeEventOutboxEntry(e *model.EventOutbox) error {
 		e.SchemaVersion = model.SchemaVersionV1
 	}
 	e.Status = model.EventOutboxStatusPending
+
+	// THE TRACE CONTEXT IS SANITISED, NEVER VALIDATED INTO A REJECTION.
+	//
+	// Both values originate in a caller-supplied HTTP header, and both columns carry a length
+	// CHECK. If an oversized header reached the statement, PostgreSQL would raise a constraint
+	// violation INSIDE THE CALLER'S LEDGER TRANSACTION and roll the money movement back — so a
+	// request header would be able to fail a transfer. Dropping the unusable value here means
+	// the worst a bad header can cost is one missing trace link, and it makes the database
+	// constraints a backstop that cannot fire rather than a live failure mode.
+	//
+	// SanitizeTraceContext owns the rules, including that a tracestate cannot outlive the
+	// traceparent it describes.
+	e.Traceparent, e.Tracestate = model.SanitizeTraceContext(e.Traceparent, e.Tracestate)
 
 	// THE CANONICAL ENVELOPE IS DERIVED HERE WHEN A CALLER LEFT IT EMPTY, which is what
 	// makes "every row carries the value the broker was given" an invariant rather than a
@@ -574,16 +685,33 @@ func eventOutboxInsertArgs(e *model.EventOutbox) []interface{} {
 		e.OccurredAt,
 		model.EventOutboxStatusPending,
 		e.MaxAttempts,
+		// SQL NULL rather than '' when there was no trace, so the CHECK constraints on the
+		// two columns never see an empty string and a query asking "which events carry a
+		// trace" has one answer to test for. normalizeEventOutboxEntry has already dropped
+		// anything unusable, so what reaches here is either a legal value or nothing.
+		nullableTraceValue(e.Traceparent),
+		nullableTraceValue(e.Tracestate),
 	}
 }
 
-// eventIdentifierHashLength is how many hex characters of a digest a log line carries.
+// nullableTraceValue binds a trace-context value, or SQL NULL when it is absent.
 //
-// Sixteen is 64 bits, which is far more than enough to keep two distinct identifiers apart
-// in one deployment's logs while being short enough to read and to grep. It matches the
-// producer-side hashLogIdentifier in the root package, so the same identifier produces the
-// same token on both sides and the two lines can be joined.
-const eventIdentifierHashLength = 16
+// Its own function rather than two inline conditionals because the two columns need identical
+// treatment and an asymmetry between them would be invisible: a tracestate stored as ” beside
+// a NULL traceparent reads as "vendor state for no trace", which is not a state that exists.
+//
+// Parameters:
+//   - value string: the trimmed trace value, or empty when there is none.
+//
+// Returns:
+//   - interface{}: the value, or nil so the driver binds SQL NULL.
+func nullableTraceValue(value string) interface{} {
+	if trimmed := strings.TrimSpace(value); trimmed != "" {
+		return trimmed
+	}
+
+	return nil
+}
 
 // hashedEventIdentifier turns a financial identifier into a stable, non-reversible token
 // for a log field.
@@ -593,19 +721,23 @@ const eventIdentifierHashLength = 16
 // empty string rather than the digest of the empty string, so "no aggregate" and "some
 // aggregate" stay distinguishable.
 //
+// # It DELEGATES rather than reimplements, and that is the point
+//
+// This token is published in three places by three packages: on metrics and logs by the root
+// package, on this package's own log lines, and as subscriber_id_hash on the subscriber
+// resource by api/model. model.HashIdentifier is the single rule all three call, so one
+// identifier produces one token everywhere and an operator can pivot between them. A local
+// digest here — even a correct one — would be a second thing to keep in step, and drift would
+// be silent: two tokens for one subject and a pivot that resolves nothing.
+//
 // Parameters:
 //   - value string: the identifier. May be empty.
 //
 // Returns:
-//   - string: a short hex token, or "" for an empty input.
+//   - string: a short hex token of model.LogIdentifierHashLength characters, or "" for an
+//     empty input.
 func hashedEventIdentifier(value string) string {
-	if value == "" {
-		return ""
-	}
-
-	sum := sha256.Sum256([]byte(value))
-
-	return hex.EncodeToString(sum[:])[:eventIdentifierHashLength]
+	return model.HashIdentifier(value)
 }
 
 // wrapEventOutboxInsertError turns a driver failure into the typed error the rest
@@ -785,19 +917,21 @@ func captureEntityEvent[T any](ctx context.Context, d Datasource, tx *sql.Tx, en
 // Retrying does, however, remove the FAR MORE LIKELY failure inside that window — a
 // momentary connection reset, a brief pool exhaustion, a statement error — and the
 // producers whose mutation is already committed therefore call this through a bounded
-// retry rather than once: PublishEventDurably in event_outbox.go for balance.monitor,
-// and sendBulkTransactionWebhook for the bulk outcome. Both re-send the SAME prepared
-// row, which is why the retry cannot duplicate the event: an identical stored row is
-// adopted as success below (see resolveDuplicateEventOutboxInsert) instead of being
-// inserted a second time under a second id. The residual at-most-once behaviour that
-// remains after the budget is spent is documented as the single explicit exception to
-// requirement R-2 in docs/event-streaming.md.
+// retry rather than once: PublishEventDurably in event_outbox.go for balance.monitor
+// and for a coalesced batch's transaction.* events, and sendBulkTransactionWebhook for
+// the bulk outcome. All of them re-send the SAME prepared row, which is why the retry
+// cannot duplicate the event: an identical stored row is adopted as success below (see
+// resolveDuplicateEventOutboxInsert) instead of being inserted a second time under a
+// second id. The residual at-most-once behaviour that remains after the budget is spent
+// is documented as one of the THREE explicit exceptions to requirement R-2 in
+// docs/event-streaming.md, enumerated on PublishEventDurably.
 //
 // It is used by the producers that have NO SINGLE MUTATION to be atomic with:
-// balance monitor alerts, bulk transaction batch progress, system.error, and the
-// coalesced transaction batch whose writer is called from a file this change may not
-// edit. For those, there is no transaction to enrol the event in, so this path is the
-// correct one rather than a compromise.
+// balance monitor alerts, bulk transaction batch progress, the coalesced transaction
+// batch whose writer is called from a file this change may not edit, and system.error —
+// which is the one of the four that describes no mutation at all. For those, there is no
+// transaction to enrol the event in, so this path is the correct one rather than a
+// compromise.
 //
 // The three ordinary creation events NO LONGER COME HERE. Ledger, identity and balance
 // creation each insert their event inside the transaction that inserts the entity —
@@ -830,7 +964,7 @@ func (d Datasource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox)
 			return nil
 		}
 
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		// Loud by design. This is the non-atomic path, so a failure here means the
 		// domain mutation that produced this event is already committed and the event
 		// is gone. Returning the error alone would make that invisible at any call
@@ -851,7 +985,10 @@ func (d Datasource) InsertEventOutbox(ctx context.Context, e *model.EventOutbox)
 			"topic":             e.Topic,
 			"aggregate_id_hash": hashedEventIdentifier(e.AggregateID),
 			"atomic":            false,
-		}).WithError(err).Error("event lost: non-atomic outbox insert failed after its mutation was committed")
+			"error_class":       databaseErrorClass(err),
+			"sqlstate":          postgresSQLState(err),
+		}).Error("event lost: non-atomic outbox insert failed after its mutation was committed")
+		logDatabaseDiagnostic("insert_event_outbox_non_atomic", err)
 
 		return wrapEventOutboxInsertError(err)
 	}
@@ -1305,7 +1442,7 @@ func (d Datasource) ClaimPendingEventOutbox(ctx context.Context, batchSize int, 
 
 	if batchSize <= 0 {
 		err := apierror.NewAPIError(apierror.ErrBadRequest, "Event outbox claim batch size must be greater than zero", nil)
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, err
 	}
 
@@ -1326,7 +1463,7 @@ func (d Datasource) ClaimPendingEventOutbox(ctx context.Context, batchSize int, 
 	rows, err := d.Conn.QueryContext(ctx, claimPendingEventOutboxQuery,
 		model.EventOutboxStatusProcessing, lockDuration.String(), claimToken, batchSize)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to claim pending event outbox entries", "claim_pending_event_outbox", err)
 	}
 	defer func() {
@@ -1342,14 +1479,14 @@ func (d Datasource) ClaimPendingEventOutbox(ctx context.Context, batchSize int, 
 	for rows.Next() {
 		entry, scanErr := scanEventOutbox(rows)
 		if scanErr != nil {
-			span.RecordError(scanErr)
+			failDatabaseSpan(span, scanErr)
 			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event outbox entry", "claim_pending_event_outbox", scanErr)
 		}
 		entries = append(entries, entry)
 	}
 
 	if err = rows.Err(); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event outbox entries", "claim_pending_event_outbox", err)
 	}
 
@@ -1401,7 +1538,7 @@ func (d Datasource) ClaimPendingEventOutbox(ctx context.Context, batchSize int, 
 // ordinary claim: several relay instances must be able to repair disjoint subsets.
 // The candidate selection is a MATERIALIZED CTE for the reason given at length on
 // claimPendingEventOutboxQuery: inside an IN subquery the LIMIT can be re-executed per
-// outer row and the batch bound becomes advisory. All four claims in this file share
+// outer row and the batch bound becomes advisory. All three claims in this file share
 // the shape, so all four take the same precaution — fixing one and leaving the others
 // would mean the bound holds for the ordinary claim and not for the repair paths, which
 // are the ones that run when the system is already unhealthy.
@@ -1459,7 +1596,7 @@ func (d Datasource) ClaimFailedEventOutboxForDeadLetter(
 	if batchSize <= 0 {
 		err := apierror.NewAPIError(apierror.ErrBadRequest,
 			"Event outbox dead-letter recovery batch size must be greater than zero", nil)
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return nil, err
 	}
@@ -1481,7 +1618,7 @@ func (d Datasource) ClaimFailedEventOutboxForDeadLetter(
 	rows, err := d.Conn.QueryContext(ctx, claimFailedEventOutboxForDeadLetterQuery,
 		lockDuration.String(), claimToken, batchSize)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return nil, loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to claim event outbox entries awaiting dead-letter preservation",
@@ -1497,7 +1634,7 @@ func (d Datasource) ClaimFailedEventOutboxForDeadLetter(
 	for rows.Next() {
 		entry, scanErr := scanEventOutbox(rows)
 		if scanErr != nil {
-			span.RecordError(scanErr)
+			failDatabaseSpan(span, scanErr)
 
 			return nil, loggedDatabaseError(apierror.ErrInternalServer,
 				"Failed to scan an event outbox entry awaiting dead-letter preservation",
@@ -1507,7 +1644,7 @@ func (d Datasource) ClaimFailedEventOutboxForDeadLetter(
 	}
 
 	if err = rows.Err(); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return nil, loggedDatabaseError(apierror.ErrInternalServer,
 			"Error iterating over event outbox entries awaiting dead-letter preservation",
@@ -1567,6 +1704,50 @@ func requireEventOutboxClaimToken(claimToken, transition string) error {
 	return nil
 }
 
+// normalizeDeadLetterHandoffLease resolves the lease a terminal transition holds the row
+// under while its dead-letter write is owed.
+//
+// A NON-POSITIVE LEASE MUST NOT BE HONOURED, and the reason is the same one the claim
+// paths already normalise for: `NOW() + '0s'::interval` is an instant that has already
+// passed by the time the next poll runs, so the row satisfies
+// claimFailedEventOutboxForDeadLetter's `locked_until < NOW()` immediately and is
+// re-claimed with a fresh token while the first worker's dead-letter write is still in
+// flight. That is the exact race the retained lease exists to prevent, reintroduced by a
+// zero-valued argument — which is what a caller that forgot to plumb its lock duration
+// through would pass.
+//
+// Falling back to defaultEventClaimLease matches what every claim in this file does with
+// a non-positive lockDuration, so the two halves of the ownership window are governed by
+// one value rather than by whichever caller happened to supply something.
+//
+// The fallback is LOGGED rather than silent: a relay that reaches this has a
+// configuration or wiring defect, and it will otherwise behave correctly enough that
+// nobody looks.
+//
+// Parameters:
+//   - lease time.Duration: the caller's requested lease.
+//   - transition string: the transition name, for the diagnostic.
+//
+// Returns:
+//   - time.Duration: lease when positive, otherwise defaultEventClaimLease.
+func normalizeDeadLetterHandoffLease(lease time.Duration, transition string) time.Duration {
+	if lease > 0 {
+		return lease
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"transition":      transition,
+		"requested_lease": lease.String(),
+		"applied_lease":   defaultEventClaimLease.String(),
+	}).Warn(
+		"Non-positive dead-letter hand-off lease; falling back to the default. A lease that has " +
+			"already expired lets the dead-letter repair pass reclaim the row while this worker's " +
+			"dead-letter write is still in flight, which is how one event reaches a .dlt topic twice",
+	)
+
+	return defaultEventClaimLease
+}
+
 // eventOutboxClaimLost is the typed error every conditional transition returns when
 // its UPDATE matched no row, and it is a DELIBERATE behaviour change from the
 // previous warn-and-continue treatment.
@@ -1616,10 +1797,13 @@ func requireEventOutboxRowAffected(result sql.Result, id int64, transition strin
 
 	affected, err := result.RowsAffected()
 	if err != nil {
-		logrus.WithError(err).WithFields(logrus.Fields{
+		logrus.WithFields(logrus.Fields{
 			"event_outbox_id": id,
 			"transition":      transition,
+			"error_class":     databaseErrorClass(err),
+			"sqlstate":        postgresSQLState(err),
 		}).Debug("Could not determine rows affected for event outbox transition")
+		logDatabaseDiagnostic("require_event_outbox_row_affected", err)
 		return nil
 	}
 	if affected == 0 {
@@ -1683,7 +1867,7 @@ func (d Datasource) RenewEventOutboxLease(ctx context.Context, claimToken string
 	defer span.End()
 
 	if err := requireEventOutboxClaimToken(claimToken, "renew_lease"); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return 0, err
 	}
 
@@ -1704,7 +1888,7 @@ func (d Datasource) RenewEventOutboxLease(ctx context.Context, claimToken string
 		WHERE claim_token = $2 AND status = $3
 	`, lease.String(), claimToken, model.EventOutboxStatusProcessing)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return 0, loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to renew the event outbox lease", "renew_event_outbox_lease", err)
 	}
@@ -1714,8 +1898,12 @@ func (d Datasource) RenewEventOutboxLease(ctx context.Context, claimToken string
 		// The driver could not report a count. The renewal itself succeeded, so this is
 		// reported as zero rather than as a failure: the caller uses the count only to
 		// decide whether to keep renewing, and one uncounted round is harmless.
-		logrus.WithError(err).WithField("claim_token", claimToken).
-			Debug("Could not determine how many event outbox leases were renewed")
+		logrus.WithFields(logrus.Fields{
+			"claim_token": claimToken,
+			"error_class": databaseErrorClass(err),
+			"sqlstate":    postgresSQLState(err),
+		}).Debug("Could not determine how many event outbox leases were renewed")
+		logDatabaseDiagnostic("renew_event_outbox_lease", err)
 
 		return 0, nil
 	}
@@ -1777,7 +1965,7 @@ func (d Datasource) MarkEventDispatched(
 	)
 
 	if err := requireEventOutboxClaimToken(claimToken, model.EventOutboxStatusDispatched); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return err
 	}
 
@@ -1798,146 +1986,36 @@ func (d Datasource) MarkEventDispatched(
 		model.EventOutboxStatusProcessing, model.EventOutboxStatusReplaying,
 		recordTopic, recordPartition, recordOffset)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark event outbox entry as dispatched", "mark_event_dispatched", err)
 	}
 
 	if affectedErr := requireEventOutboxRowAffected(result, id, model.EventOutboxStatusDispatched); affectedErr != nil {
-		span.RecordError(affectedErr)
+		failDatabaseSpan(span, affectedErr)
 		return affectedErr
 	}
 	return nil
 }
 
-// MarkEventFailed records a failed publish attempt and its reason, decides in the
-// same statement whether the entry is retried or has spent its budget, and reports
-// that decision back to the caller.
+// defaultEventSettlementLease WAS RETIRED HERE. normalizeDeadLetterHandoffLease falls back to
+// defaultEventClaimLease instead, at the same thirty seconds.
 //
-// The status is chosen in SQL rather than in Go: if the increment exhausts
-// max_attempts the row becomes failed, otherwise it returns to pending for another
-// attempt. Deciding it inside the UPDATE keeps the read and the write atomic, so
-// two relay instances racing on one row cannot both conclude they were the last
-// attempt. In a SET list every right-hand reference to attempts reads the OLD value,
-// so both arms of the CASE agree on the same arithmetic.
-//
-// # THE CALLER'S VERDICT IS THE OTHER HALF OF THAT DECISION
-//
-// terminal is the publisher's own answer to "can another attempt succeed?", and it
-// short-circuits the arithmetic: a terminal failure exhausts the row on whichever
-// attempt it happened, budget remaining or not.
-//
-// Without it the durable state contradicted what the publisher had already reported
-// and metered. The publisher classifies a failure as transient or permanent and
-// reports PublishStatusDeadLettered for a permanent one — an oversized envelope,
-// bytes that are not valid JSON, a destination outside the topic namespace Blnk owns
-// — because no retry can change the answer. That verdict was then thrown away here,
-// and the row returned to pending to spend its whole schedule rediscovering it. The
-// consequences were all in the same direction: 31 seconds of backoff before the event
-// reached the dead-letter topic where an operator could see it, four extra attempts of
-// relay throughput spent on a message that can never be published, and a permanently
-// stuck event reported as a busy one in the status counter for the whole interval.
-//
-// The decision still happens in SQL, and it must: the parameter is one input to the
-// CASE rather than a Go-side branch, so two instances racing on one row still cannot
-// both conclude they were the last attempt.
-//
-// The arithmetic arm is NOT removed. A transient failure is still bounded by
-// max_attempts, which is what stops an unreachable broker keeping a row claimable for
-// ever, and terminal only ever brings that boundary forward.
-//
-// # Why it returns an outcome instead of just an error
-//
-// The caller has to know which arm was taken, because only the exhaustion arm hands
-// off to the dead-letter path. Deriving that in Go from a re-read of the row would
-// reintroduce exactly the race the in-SQL decision exists to remove: between the
-// UPDATE and the re-read, another instance could have moved the row again. The
-// outcome carries the resulting status, the new attempt count, whether the budget is
-// spent, and the token to use for the hand-off.
-//
-// # What happens to the claim, and why the two arms differ
-//
-// On the RETRY arm the lease and the token are both released, which is what lets the
-// row be re-claimed — by this instance or another — on a later poll.
-//
-// On the EXHAUSTION arm the token is RETAINED. The row is now failed and owes one
-// more step: the dead-letter write, followed by MarkEventDeadLettered. Retaining the
-// token means only the worker that spent the last attempt can perform that step, so
-// two instances cannot both dead-letter the same event and put two copies on the
-// dead-letter topic. The lease is released either way, which is harmless here
-// because failed is outside the claimable set.
-//
-// The exhaustion arm sets failed and NOT dead_lettered, following the state
-// machine model.EventOutbox documents: failed means "we gave up publishing", and
-// dead_lettered means "and the event is now preserved on its `<topic>.dlt`
-// sibling, from which it can be replayed". Only the dead-letter publisher knows
-// whether that second step actually happened, so only it may declare it — see
-// MarkEventDeadLettered. ListDeadLetteredEvents covers both literals, so an event
-// stuck between the two states is still visible to an operator rather than
-// invisible until its dead-letter write succeeds.
-//
-// first_attempted_at is stamped through COALESCE so it survives as the first
-// attempt even on the retry path, and last_attempted_at moves with every attempt.
-// Both are stamped here as well as on the claim, because the dead-letter failure
-// metadata needs the retry window bounded either way.
-//
-// # retryAfter is what makes the backoff real
-//
-// The row's next due instant becomes NOW() + retryAfter on the retry arm, and the
-// claim predicate is next_attempt_at <= NOW(). That is the whole reason this
-// parameter exists. Before it, the lease was simply released and the row was
-// claimable again on the very next poll: the relay either retried immediately —
-// hammering a broker that was already failing — or slept in process, which blocks
-// the batch and, at the configured schedule (1s + 2s + 4s + 8s + 16s = 31s),
-// outlives the 30-second lease so a second instance reclaims the row mid-sleep and
-// publishes it twice. Persisting the decision removes both options, for every
-// instance at once.
-//
-// THE SCHEDULE ITSELF IS THE CALLER'S. RELAY_RETRY_BASE_BACKOFF_MS, the doubling and
-// the RELAY_RETRY_MAX_BACKOFF_MS cap are configuration, and computing them in SQL
-// here would freeze them into a migration and put them out of reach of the
-// configuration meant to govern them. This method records only the instant the
-// caller decided on. A negative retryAfter is treated as zero — due immediately —
-// because a caller that computed a negative delay meant "no delay", and reaching
-// into the past would be indistinguishable from it while looking deliberate.
-//
-// THE EXHAUSTION ARM LEAVES next_attempt_at ALONE, and the CASE expression that does
-// so is the point rather than a flourish.
-//
-// A row whose budget is spent is not waiting for a retry, and nothing reads a due
-// instant on it. The ordinary claim requires attempts < max_attempts, so it can never
-// reach an exhausted row; and the dead-letter repair claim
-// (claimFailedEventOutboxForDeadLetter) selects on status, dlt_topic and the LEASE
-// only — it is throttled by frequency, not by a due instant. Writing a future instant
-// there would therefore be read by exactly one audience, an operator triaging a
-// dead-letter backlog, and it would tell them a retry was still coming when the budget
-// that would have paid for it is gone. Leaving the value as the last retry set it keeps
-// the row's own history readable instead.
-//
-// Parameters:
-//   - ctx context.Context: cancels the update.
-//   - id int64: the row's surrogate key.
-//   - claimToken string: the token the claim issued; the update is refused without it.
-//   - errMsg string: the failure reason, stored in last_error.
-//   - retryAfter time.Duration: how long the row must wait before its next publish
-//     attempt. Applied on the retry arm only. Non-positive means due immediately.
-//   - terminal bool: the caller's verdict that no further attempt can succeed. True
-//     exhausts the row on this attempt whatever the budget says; false leaves the
-//     decision to the attempt arithmetic.
-//
-// Returns:
-//   - model.EventFailureOutcome: the resulting status, the new attempt count, whether
-//     the budget is spent, whether the caller declared the failure permanent, and the
-//     token for the dead-letter hand-off.
-//   - error: the typed claim-lost error when no row matched, or a wrapped driver error.
+// Two constants for one window is how the two halves of an ownership window come to be governed
+// by different numbers. The lease a terminal transition holds a row under while its dead-letter
+// write is owed has to be the same kind of window the CLAIM took — that is the whole reason a
+// non-positive argument is corrected rather than honoured — so it falls back to the claim's own
+// default and there is one value to change.
 func (d Datasource) MarkEventFailed(
 	ctx context.Context,
 	id int64,
 	claimToken, errMsg string,
 	retryAfter time.Duration,
 	terminal bool,
+	deadLetterLease time.Duration,
 ) (model.EventFailureOutcome, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkEventFailed")
 	defer span.End()
+	deadLetterLease = normalizeDeadLetterHandoffLease(deadLetterLease, "mark_event_failed")
 	if retryAfter < 0 {
 		retryAfter = 0
 	}
@@ -1945,17 +2023,23 @@ func (d Datasource) MarkEventFailed(
 		attribute.Int64("event_outbox.id", id),
 		attribute.String("event_outbox.retry_after", retryAfter.String()),
 		attribute.Bool("event_outbox.terminal", terminal),
+		attribute.String("event_outbox.dead_letter_lease", deadLetterLease.String()),
 	)
 
 	if err := requireEventOutboxClaimToken(claimToken, model.EventOutboxStatusFailed); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return model.EventFailureOutcome{}, err
 	}
 
 	// $8 is the caller's terminal verdict, ORed into every arm of the decision so the
-	// status, the due instant and the retained token all agree about which arm was taken.
-	// Repeating the condition rather than computing it once is what keeps the whole
-	// decision inside the single statement.
+	// status, the due instant, the retained token AND the retained lease all agree about
+	// which arm was taken. Repeating the condition rather than computing it once is what
+	// keeps the whole decision inside the single statement.
+	//
+	// locked_until follows the token: the exhausted arm keeps a lease for the dead-letter
+	// hand-off it still owes (see eventDeadLetterHandoffLease), and the retrying arm clears
+	// it, because a row going back to pending must become claimable as soon as
+	// next_attempt_at is due and is protected by that instant instead.
 	var outcome model.EventFailureOutcome
 	err := d.Conn.QueryRowContext(ctx, `
 		UPDATE blnk.event_outbox
@@ -1964,23 +2048,24 @@ func (d Datasource) MarkEventFailed(
 			last_error = $3,
 			first_attempted_at = COALESCE(first_attempted_at, NOW()),
 			last_attempted_at = NOW(),
-			locked_until = NULL,
+			locked_until = CASE WHEN $8::boolean OR attempts + 1 >= max_attempts THEN NOW() + $9::interval ELSE NULL END,
 			next_attempt_at = CASE WHEN $8::boolean OR attempts + 1 >= max_attempts THEN next_attempt_at ELSE NOW() + $4::interval END,
 			claim_token = CASE WHEN $8::boolean OR attempts + 1 >= max_attempts THEN claim_token ELSE NULL END
 		WHERE id = $5 AND claim_token = $6 AND status = $7
 		RETURNING status, attempts
 	`, model.EventOutboxStatusFailed, model.EventOutboxStatusPending, errMsg, retryAfter.String(), id, claimToken,
-		model.EventOutboxStatusProcessing, terminal).Scan(&outcome.Status, &outcome.Attempts)
+		model.EventOutboxStatusProcessing, terminal,
+		eventDeadLetterHandoffLease.String()).Scan(&outcome.Status, &outcome.Attempts)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// No row matched, so the claim was lost or the row is no longer
 			// processing. RETURNING makes this reachable as ErrNoRows rather than as
 			// a zero affected count.
 			lost := eventOutboxClaimLost(id, model.EventOutboxStatusFailed)
-			span.RecordError(lost)
+			failDatabaseSpan(span, lost)
 			return model.EventFailureOutcome{}, lost
 		}
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return model.EventFailureOutcome{}, loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark event outbox entry as failed", "mark_event_failed", err)
 	}
 
@@ -2040,35 +2125,65 @@ func (d Datasource) MarkEventFailed(
 // and safe: ClaimPendingEventOutbox filters on status IN ('pending','processing',
 // 'webhook_pending'), so an unspent budget cannot make a failed row claimable again, while
 // ClaimFailedEventOutboxForDeadLetter selects on status, dlt_topic IS NULL and the lease
-// alone — so the dead-letter repair path still reaches it if the write below it fails.
+// alone — so the dead-letter repair path still reaches it once the hand-off lease this
+// transition leaves behind has lapsed, which is the only point at which the owning worker
+// can no longer be performing the write itself.
 //
-// The CLAIM TOKEN IS RETAINED, exactly as MarkEventFailed's exhaustion arm retains it and
-// for exactly the same reason: the dead-letter write and the MarkEventDeadLettered that
-// records it are still owed, and only the worker that took this decision may perform them.
-// That is what stops two workers putting two copies of one event on a dead-letter topic.
+// The CLAIM TOKEN AND THE LEASE ARE BOTH RETAINED, exactly as MarkEventFailed's exhaustion
+// arm retains them and for exactly the same reason: the dead-letter write and the
+// MarkEventDeadLettered that records it are still owed, and only the worker that took this
+// decision may perform them. That is what stops two workers putting two copies of one event
+// on a dead-letter topic.
 //
-// The LEASE is released, which is harmless because failed is outside the claimable set,
-// and next_attempt_at is left as the last retry set it — there is no next attempt to
-// describe, and writing a future instant would tell an operator a retry was still coming.
+// The lease used to be RELEASED here — locked_until = NULL — on the reasoning that a failed
+// row is outside the claimable set. It is not:
+// claimFailedEventOutboxForDeadLetter selects on `status = 'failed' AND dlt_topic IS NULL AND
+// (locked_until IS NULL OR locked_until < NOW())`, so releasing the lease made the row
+// claimable on the very next poll, with a FRESH token, while this worker's dead-letter write
+// was still in flight. Retaining the token without retaining the lease is not exclusive
+// ownership; it is a token whose exclusivity another claim can overwrite. See
+// MarkEventFailed for the full account.
+//
+// The LEASE IS RENEWED rather than released, and the two go together. Releasing it made the
+// retained token decorative: ClaimFailedEventOutboxForDeadLetter admits a failed row with
+// dlt_topic IS NULL and no live lease, and it stamps a FRESH token, so a second instance
+// could reclaim the row in the same instant and publish the dead-letter message alongside the
+// owning worker. Holding eventDeadLetterHandoffLease keeps the repair path out until the
+// hand-off has either been recorded — MarkEventDeadLettered clears the lease and the token —
+// or the holder can no longer be holding it.
+//
+// next_attempt_at is left as the last retry set it — there is no next attempt to describe,
+// and writing a future instant would tell an operator a retry was still coming.
 //
 // Parameters:
 //   - ctx context.Context: cancels the update.
 //   - id int64: the row's surrogate key.
 //   - claimToken string: the token the claim issued; the update is refused without it.
 //   - errMsg string: the failure reason, stored in last_error.
+//   - deadLetterLease time.Duration: how long this worker holds the row for the
+//     dead-letter hand-off. Non-positive is normalised to defaultEventClaimLease.
 //
 // Returns:
 //   - model.EventFailureOutcome: Status failed, the new attempt count, Exhausted true —
 //     because no further attempt will be made whatever the count says — and the token for
 //     the dead-letter hand-off.
 //   - error: the typed claim-lost error when no row matched, or a wrapped driver error.
-func (d Datasource) MarkEventPermanentlyFailed(ctx context.Context, id int64, claimToken, errMsg string) (model.EventFailureOutcome, error) {
+func (d Datasource) MarkEventPermanentlyFailed(
+	ctx context.Context,
+	id int64,
+	claimToken, errMsg string,
+	deadLetterLease time.Duration,
+) (model.EventFailureOutcome, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkEventPermanentlyFailed")
 	defer span.End()
-	span.SetAttributes(attribute.Int64("event_outbox.id", id))
+	deadLetterLease = normalizeDeadLetterHandoffLease(deadLetterLease, "mark_event_permanently_failed")
+	span.SetAttributes(
+		attribute.Int64("event_outbox.id", id),
+		attribute.String("event_outbox.dead_letter_lease", deadLetterLease.String()),
+	)
 
 	if err := requireEventOutboxClaimToken(claimToken, model.EventOutboxStatusFailed); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return model.EventFailureOutcome{}, err
 	}
 
@@ -2080,20 +2195,21 @@ func (d Datasource) MarkEventPermanentlyFailed(ctx context.Context, id int64, cl
 			last_error = $2,
 			first_attempted_at = COALESCE(first_attempted_at, NOW()),
 			last_attempted_at = NOW(),
-			locked_until = NULL
+			locked_until = NOW() + $6::interval
 		WHERE id = $3 AND claim_token = $4 AND status = $5
 		RETURNING status, attempts
 	`, model.EventOutboxStatusFailed, errMsg, id, claimToken,
-		model.EventOutboxStatusProcessing).Scan(&outcome.Status, &outcome.Attempts)
+		model.EventOutboxStatusProcessing,
+		eventDeadLetterHandoffLease.String()).Scan(&outcome.Status, &outcome.Attempts)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// The claim was lost, or the row is no longer processing. Reachable as
 			// ErrNoRows rather than as a zero affected count because of RETURNING.
 			lost := eventOutboxClaimLost(id, model.EventOutboxStatusFailed)
-			span.RecordError(lost)
+			failDatabaseSpan(span, lost)
 			return model.EventFailureOutcome{}, lost
 		}
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return model.EventFailureOutcome{}, loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to mark event outbox entry as permanently failed", "mark_event_permanently_failed", err)
 	}
@@ -2110,147 +2226,6 @@ func (d Datasource) MarkEventPermanentlyFailed(ctx context.Context, id int64, cl
 		attribute.Bool("event_outbox.exhausted", outcome.Exhausted),
 	)
 	return outcome, nil
-}
-
-// claimEventsOwedDeadLetterQuery claims rows whose retry budget is spent and whose
-// dead-letter write has NOT been recorded, taking a lease and stamping a fresh claim
-// token WITHOUT changing their status.
-//
-// It is a package-level constant so tests can assert that FOR UPDATE SKIP LOCKED, the
-// occurred_at ordering, the untouched status and the dlt_topic IS NULL restriction are
-// all still present.
-//
-// # The set, and why it must be reachable at all
-//
-// MarkEventFailed's exhaustion arm records 'failed' and RETAINS the claim token so the
-// worker that spent the last attempt is the only one permitted to write the event to its
-// `<topic>.dlt` sibling. When that write — or the MarkEventDeadLettered that records it —
-// fails, the row is left failed with no dlt_topic, and at that point it was reachable by
-// nothing at all: the main claim excludes it twice over (wrong status, no budget) and
-// ClaimEventForReplay accepts only dead_lettered. This table is the ONLY copy of that
-// event — the retention purge deliberately refuses to delete a failed row for exactly this
-// reason — so an operator's only recourse was a hand-written UPDATE.
-//
-// 'processing' is included alongside 'failed' because a relay can die between this claim
-// and the dead-letter record; such a row is recovered by the same predicate once its lease
-// expires. dlt_topic IS NULL is what makes the set SELF-CLEARING: recording the
-// dead-letter takes the row out of it permanently.
-//
-// # Why the status is deliberately NOT changed
-//
-// Moving the row to 'processing' would put it back into the main claim's blocking set, so
-// a row whose dead-letter topic was unreachable would stall every later event of its
-// aggregate for as long as the outage lasted. Leaving it failed keeps the trade the main
-// claim's anti-join documents: an event that can never reach the main topic must not hold
-// its key back. MarkEventDeadLettered accepts 'failed' as a prior state precisely so this
-// works.
-//
-// # next_attempt_at is the retry pacing
-//
-// MarkEventFailed's exhaustion arm schedules it exactly as its retry arm does, so a
-// dead-letter topic that is unreachable is retried on the same bounded backoff the publish
-// attempts used rather than once per poll interval per stranded row.
-// MATERIALIZED for the reason given on claimPendingEventOutboxQuery.
-const claimEventsOwedDeadLetterQuery = `
-		WITH candidates AS MATERIALIZED (
-			SELECT candidate.id FROM blnk.event_outbox candidate
-			WHERE candidate.status IN ('failed', 'processing')
-			  AND candidate.dlt_topic IS NULL
-			  AND candidate.attempts >= candidate.max_attempts
-			  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
-			  AND candidate.next_attempt_at <= NOW()
-			ORDER BY candidate.next_attempt_at ASC, candidate.occurred_at ASC, candidate.id ASC
-			LIMIT $3
-			FOR UPDATE SKIP LOCKED
-		),
-		claimed AS (
-			UPDATE blnk.event_outbox
-			SET locked_until = NOW() + $1::interval,
-				claim_token = $2,
-				last_attempted_at = NOW()
-			WHERE id IN (SELECT id FROM candidates)
-			RETURNING ` + eventOutboxColumns + `
-		)
-		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
-	`
-
-// ClaimEventsOwedDeadLetter claims events whose retry budget is spent and whose
-// dead-letter write is still owed, so the hand-off can be retried instead of the event
-// being stranded in the only table that holds it.
-//
-// In a healthy system this returns nothing: the hand-off happens in the same batch as the
-// attempt that exhausted the budget. It matters when the dead-letter topic is unreachable,
-// when the broker rejects the write, or when the relay dies between the write and the
-// record — and in every one of those cases the alternative is an event that exists nowhere
-// else and can be neither published, replayed nor purged.
-//
-// The returned rows carry a FRESH claim token, which is what authorises
-// MarkEventDeadLettered, and their attempt count still shows the budget spent, which is
-// how a caller knows to retry the hand-off rather than the publish.
-//
-// Parameters:
-//   - ctx context.Context: cancels the claim.
-//   - batchSize int: how many rows to claim. Non-positive is rejected, because a zero LIMIT
-//     claims nothing and returns no error, which is indistinguishable from "nothing is owed".
-//   - lockDuration time.Duration: the lease. Non-positive is normalised to
-//     defaultEventClaimLease, since an expired-on-arrival lease lets two relays write the
-//     same event to the dead-letter topic.
-//
-// Returns:
-//   - []model.EventOutbox: the claimed rows, oldest occurrence first.
-//   - error: a validation error for a non-positive batch, or a wrapped driver error.
-func (d Datasource) ClaimEventsOwedDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
-	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClaimEventsOwedDeadLetter")
-	defer span.End()
-
-	if batchSize <= 0 {
-		err := apierror.NewAPIError(apierror.ErrBadRequest, "Dead-letter hand-off claim batch size must be greater than zero", nil)
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if lockDuration <= 0 {
-		logrus.WithField("requested_lock_duration", lockDuration.String()).
-			Warnf("Non-positive dead-letter hand-off lock duration; falling back to %s", defaultEventClaimLease)
-		lockDuration = defaultEventClaimLease
-	}
-
-	claimToken := uuid.NewString()
-
-	span.SetAttributes(
-		attribute.Int("event_outbox.batch_size", batchSize),
-		attribute.String("event_outbox.lock_duration", lockDuration.String()),
-	)
-
-	rows, err := d.Conn.QueryContext(ctx, claimEventsOwedDeadLetterQuery,
-		lockDuration.String(), claimToken, batchSize)
-	if err != nil {
-		span.RecordError(err)
-		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to claim events owed a dead-letter write", "claim_events_owed_dead_letter", err)
-	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			logrus.Errorf("Error closing rows: %v", closeErr)
-		}
-	}()
-
-	var entries []model.EventOutbox
-	for rows.Next() {
-		entry, scanErr := scanEventOutbox(rows)
-		if scanErr != nil {
-			span.RecordError(scanErr)
-			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event outbox entry", "claim_events_owed_dead_letter", scanErr)
-		}
-		entries = append(entries, entry)
-	}
-
-	if err = rows.Err(); err != nil {
-		span.RecordError(err)
-		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event outbox entries", "claim_events_owed_dead_letter", err)
-	}
-
-	span.SetAttributes(attribute.Int("event_outbox.claimed_count", len(entries)))
-	return entries, nil
 }
 
 // MarkEventDeadLettered records that an entry has been written to its dead-letter
@@ -2303,7 +2278,7 @@ func (d Datasource) MarkEventDeadLettered(
 	)
 
 	if err := requireEventOutboxClaimToken(claimToken, model.EventOutboxStatusDeadLettered); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return err
 	}
 
@@ -2334,12 +2309,12 @@ func (d Datasource) MarkEventDeadLettered(
 		model.EventOutboxStatusFailed, model.EventOutboxStatusProcessing,
 		recordTopic, recordPartition, recordOffset)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark event outbox entry as dead-lettered", "mark_event_dead_lettered", err)
 	}
 
 	if affectedErr := requireEventOutboxRowAffected(result, id, model.EventOutboxStatusDeadLettered); affectedErr != nil {
-		span.RecordError(affectedErr)
+		failDatabaseSpan(span, affectedErr)
 		return affectedErr
 	}
 	return nil
@@ -2419,7 +2394,7 @@ func (d Datasource) ClaimEventForReplay(ctx context.Context, eventID string, loc
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, d.describeUnclaimableReplay(ctx, eventID)
 		}
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to claim event for replay", "claim_event_for_replay", err)
 	}
 
@@ -2462,7 +2437,7 @@ func (d Datasource) ReleaseEventReplay(ctx context.Context, id int64, claimToken
 	span.SetAttributes(attribute.Int64("event_outbox.id", id))
 
 	if err := requireEventOutboxClaimToken(claimToken, model.EventOutboxStatusReplaying); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return err
 	}
 
@@ -2475,12 +2450,12 @@ func (d Datasource) ReleaseEventReplay(ctx context.Context, id int64, claimToken
 		WHERE id = $3 AND claim_token = $4 AND status = $5
 	`, model.EventOutboxStatusDeadLettered, replayErr, id, claimToken, model.EventOutboxStatusReplaying)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to release event replay claim", "release_event_replay", err)
 	}
 
 	if affectedErr := requireEventOutboxRowAffected(result, id, model.EventOutboxStatusReplaying); affectedErr != nil {
-		span.RecordError(affectedErr)
+		failDatabaseSpan(span, affectedErr)
 		return affectedErr
 	}
 	return nil
@@ -2630,7 +2605,7 @@ func (d Datasource) ClaimPendingWebhookDeliveries(ctx context.Context, batchSize
 
 	if batchSize <= 0 {
 		err := apierror.NewAPIError(apierror.ErrBadRequest, "Webhook delivery claim batch size must be greater than zero", nil)
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, err
 	}
 
@@ -2650,7 +2625,7 @@ func (d Datasource) ClaimPendingWebhookDeliveries(ctx context.Context, batchSize
 	rows, err := d.Conn.QueryContext(ctx, claimPendingWebhookDeliveriesQuery,
 		lockDuration.String(), claimToken, batchSize)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to claim pending webhook deliveries", "claim_pending_webhook_deliveries", err)
 	}
 	defer func() {
@@ -2663,14 +2638,14 @@ func (d Datasource) ClaimPendingWebhookDeliveries(ctx context.Context, batchSize
 	for rows.Next() {
 		entry, scanErr := scanEventOutbox(rows)
 		if scanErr != nil {
-			span.RecordError(scanErr)
+			failDatabaseSpan(span, scanErr)
 			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event outbox entry", "claim_pending_webhook_deliveries", scanErr)
 		}
 		entries = append(entries, entry)
 	}
 
 	if err = rows.Err(); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event outbox entries", "claim_pending_webhook_deliveries", err)
 	}
 
@@ -2704,7 +2679,7 @@ func (d Datasource) MarkWebhookDispatched(ctx context.Context, id int64, claimTo
 	span.SetAttributes(attribute.Int64("event_outbox.id", id))
 
 	if err := requireEventOutboxClaimToken(claimToken, "webhook_dispatched"); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return err
 	}
 
@@ -2714,12 +2689,12 @@ func (d Datasource) MarkWebhookDispatched(ctx context.Context, id int64, claimTo
 		WHERE id = $1 AND claim_token = $2
 	`, id, claimToken)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark webhook dispatched for event outbox entry", "mark_webhook_dispatched", err)
 	}
 
 	if affectedErr := requireEventOutboxRowAffected(result, id, "webhook_dispatched"); affectedErr != nil {
-		span.RecordError(affectedErr)
+		failDatabaseSpan(span, affectedErr)
 		return affectedErr
 	}
 	return nil
@@ -2813,7 +2788,7 @@ func (d Datasource) MarkEventWebhookPending(
 	)
 
 	if err := requireEventOutboxClaimToken(claimToken, model.EventOutboxStatusWebhookPending); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return model.EventWebhookOutcome{}, err
 	}
 
@@ -2863,12 +2838,12 @@ func (d Datasource) MarkEventWebhookPending(
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			lost := eventOutboxClaimLost(id, model.EventOutboxStatusWebhookPending)
-			span.RecordError(lost)
+			failDatabaseSpan(span, lost)
 
 			return model.EventWebhookOutcome{}, lost
 		}
 
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return model.EventWebhookOutcome{}, loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to record the pending legacy webhook leg for event outbox entry", "mark_event_webhook_pending", err)
@@ -2965,7 +2940,7 @@ func (d Datasource) MarkEventLegacyWebhookAttempted(
 	)
 
 	if err := requireEventOutboxClaimToken(claimToken, "legacy_webhook_attempt"); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return model.EventWebhookOutcome{}, err
 	}
@@ -2993,12 +2968,12 @@ func (d Datasource) MarkEventLegacyWebhookAttempted(
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			lost := eventOutboxClaimLost(id, "legacy_webhook_attempt")
-			span.RecordError(lost)
+			failDatabaseSpan(span, lost)
 
 			return model.EventWebhookOutcome{}, lost
 		}
 
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return model.EventWebhookOutcome{}, loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to record the legacy webhook attempt for event outbox entry",
@@ -3061,7 +3036,7 @@ func (d Datasource) PurgeTerminalEventsBefore(ctx context.Context, cutoff time.T
 		// than an intention, and silently doing nothing would hide a broken
 		// retention job that looks like it is running.
 		err := apierror.NewAPIError(apierror.ErrBadRequest, "Event outbox retention cutoff is required", nil)
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return 0, err
 	}
 	if limit <= 0 {
@@ -3079,7 +3054,7 @@ func (d Datasource) PurgeTerminalEventsBefore(ctx context.Context, cutoff time.T
 	// This is the one IN-subquery LIMIT in this file that is NOT wrapped in a
 	// MATERIALIZED CTE, and the omission is deliberate rather than an oversight.
 	//
-	// The hazard the four claims guard against — documented at length on
+	// The hazard the three claims guard against — documented at length on
 	// claimPendingEventOutboxQuery — is that the planner may re-execute the subquery
 	// once per outer row, and that each execution then returns a DIFFERENT row because
 	// FOR UPDATE SKIP LOCKED has already taken the previous one. What makes the bound
@@ -3090,30 +3065,258 @@ func (d Datasource) PurgeTerminalEventsBefore(ctx context.Context, cutoff time.T
 	// it returns the same rows and the LIMIT holds however many times it is evaluated.
 	// Add FOR UPDATE or FOR UPDATE SKIP LOCKED to this statement and that stops being
 	// true, at which point it needs the CTE too.
-	result, err := d.Conn.ExecContext(ctx, `
-		DELETE FROM blnk.event_outbox
-		WHERE id IN (
-			SELECT id FROM blnk.event_outbox
-			WHERE status = ANY($1) AND occurred_at < $2
-			ORDER BY occurred_at ASC
-			LIMIT $3
+	// The delete RETURNS what it removed, and the same statement records it.
+	//
+	// # Why the deletion and its record are one statement
+	//
+	// The reconciliation cannot reach a sound verdict without knowing how many terminal
+	// rows retention has removed — a broker end offset counts every record ever written
+	// and never falls, so once rows are gone the outbox side counts a suffix of history
+	// while the broker side counts all of it, and the resulting surplus can offset a
+	// genuine shortfall exactly. See the migration that creates the purge log.
+	//
+	// That makes the record part of the deletion rather than bookkeeping about it. Two
+	// statements — delete, then insert — would leave a window in which a crash loses the
+	// record while keeping the deletion, and the reconciliation would then be
+	// PERMANENTLY and SILENTLY wrong by however many rows that batch removed, with no way
+	// to discover it. One statement makes the two atomic without a transaction: the
+	// deleted rows are captured in a CTE and the log row is written from the same CTE, so
+	// either both happen or neither does.
+	//
+	// The aggregate is computed over the deleted rows themselves, so the counts describe
+	// exactly what left the table rather than a second query's idea of it. A batch that
+	// removes nothing writes no log row — HAVING COUNT(*) > 0 — because "retention ran and
+	// found nothing" is the steady state and recording it would bury the batches that
+	// matter in noise.
+	// THE TWO TERMINAL STATES ARE BOUND SEPARATELY, not as one array, because they are not
+	// eligible on the same terms (SEC-08). A dispatched row is a receipt for an event a
+	// subscriber has already had, so age alone governs it. A DEAD-LETTERED row is the record
+	// of an event nobody received — the only inventory triage reads, the only thing a replay
+	// can be driven from, and the only place the failure metadata explaining the loss exists —
+	// so it is eligible only once an operator has RESOLVED it. Deleting an unresolved one on
+	// an age timer destroyed all of that unrecoverably, oldest first: the failures most likely
+	// to have been forgotten rather than handled.
+	//
+	// model.EventOutbox.IsPurgeableByRetention states the same rule in Go, and
+	// TestEventOutboxRetention_GoAndSQLAgreeOnEligibility pins the two together.
+	row := d.Conn.QueryRowContext(ctx, `
+		WITH removed AS (
+			DELETE FROM blnk.event_outbox
+			WHERE id IN (
+				SELECT id FROM blnk.event_outbox
+				WHERE (
+				        status = $1
+				        OR (status = $2 AND resolved_at IS NOT NULL)
+				      )
+				  AND occurred_at < $3
+				ORDER BY occurred_at ASC
+				LIMIT $4
+			)
+			RETURNING occurred_at, kafka_offset
+		), logged AS (
+			INSERT INTO blnk.event_outbox_purge_log
+				(cutoff, rows_removed, confirmed_removed, oldest_occurred_at, newest_occurred_at)
+			SELECT $3, COUNT(*), COUNT(kafka_offset), MIN(occurred_at), MAX(occurred_at)
+			FROM removed
+			HAVING COUNT(*) > 0
+			RETURNING rows_removed
 		)
-	`, pq.Array(model.TerminalEventOutboxStatuses()), cutoff, limit)
-	if err != nil {
-		span.RecordError(err)
-		return 0, loggedDatabaseError(apierror.ErrInternalServer, "Failed to purge terminal event outbox entries", "purge_terminal_events_before", err)
-	}
+		SELECT COUNT(*) FROM removed
+	`, model.EventOutboxStatusDispatched, model.EventOutboxStatusDeadLettered, cutoff, limit)
 
-	purged, err := result.RowsAffected()
-	if err != nil {
-		// The delete succeeded; only the count is unavailable. Reporting zero would
-		// stop a caller's sweep loop early, so the failure is surfaced instead.
-		span.RecordError(err)
-		return 0, loggedDatabaseError(apierror.ErrInternalServer, "Failed to count purged event outbox entries", "purge_terminal_events_before", err)
+	var purged int64
+	if err := row.Scan(&purged); err != nil {
+		failDatabaseSpan(span, err)
+		return 0, loggedDatabaseError(apierror.ErrInternalServer, "Failed to purge terminal event outbox entries", "purge_terminal_events_before", err)
 	}
 
 	span.SetAttributes(attribute.Int64("event_outbox.purged_count", purged))
 	return purged, nil
+}
+
+// SumPurgedTerminalEvents reports what retention has removed from blnk.event_outbox over
+// the table's whole life.
+//
+// # Why the reconciliation cannot do without it
+//
+// A broker's end offset counts every record ever appended and never decreases. The outbox
+// side of the reconciliation counts rows that still exist. Those two quantities describe
+// the same interval only until retention deletes its first terminal row; after that the
+// broker counts all of history and the outbox counts a suffix of it, and the difference is
+// indistinguishable from the expected surplus of redeliveries, replays and dead-letter
+// copies. Since the comparison is directional — a shortfall proves loss, a surplus is
+// expected — an inflated surplus can offset a real shortfall exactly and the verdict reads
+// a confident "no loss detected" while events are missing.
+//
+// Adding these totals back restores a MATCHED baseline: current terminal rows plus purged
+// terminal rows is an all-time count, which is what an all-time offset sum can be compared
+// against. Where the totals are unavailable the verdict must be inconclusive rather than
+// optimistic, because "no purge has happened" and "we cannot tell whether one has" are
+// different statements and only one of them supports a green verdict.
+//
+// Parameters:
+//   - ctx context.Context: cancels the aggregate.
+//
+// Returns:
+//   - model.EventOutboxPurgeTotals: the totals. An empty log yields zeroes with
+//     Recorded true, which is a real answer — retention has removed nothing — and is
+//     distinct from being unable to read the log at all.
+//   - error: the repository's typed error.
+func (d Datasource) SumPurgedTerminalEvents(ctx context.Context) (model.EventOutboxPurgeTotals, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "SumPurgedTerminalEvents")
+	defer span.End()
+
+	totals := model.EventOutboxPurgeTotals{Recorded: true}
+
+	var lastPurgedAt sql.NullTime
+	var newestPurgedOccurrence sql.NullTime
+
+	err := d.Conn.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(rows_removed), 0)      AS rows_removed,
+			COALESCE(SUM(confirmed_removed), 0) AS confirmed_removed,
+			COUNT(*)                            AS batches,
+			MAX(purged_at)                      AS last_purged_at,
+			MAX(newest_occurred_at)             AS newest_purged_occurrence
+		FROM blnk.event_outbox_purge_log
+	`).Scan(
+		&totals.RowsRemoved,
+		&totals.ConfirmedRemoved,
+		&totals.Batches,
+		&lastPurgedAt,
+		&newestPurgedOccurrence,
+	)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return model.EventOutboxPurgeTotals{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to total the event outbox purge log", "sum_purged_terminal_events", err)
+	}
+
+	if lastPurgedAt.Valid {
+		instant := lastPurgedAt.Time.UTC()
+		totals.LastPurgedAt = &instant
+	}
+	if newestPurgedOccurrence.Valid {
+		instant := newestPurgedOccurrence.Time.UTC()
+		totals.NewestPurgedOccurrence = &instant
+	}
+
+	span.SetAttributes(
+		attribute.Int64("event_outbox.purged_rows_total", totals.RowsRemoved),
+		attribute.Int64("event_outbox.purged_confirmed_total", totals.ConfirmedRemoved),
+		attribute.Int64("event_outbox.purge_batches", totals.Batches),
+	)
+
+	return totals, nil
+}
+
+// AuditEventRecordCoordinates reports, per (topic, partition), how many terminal rows claim
+// a broker record there and what the extreme claimed offsets are.
+//
+// # Why this exists alongside the counting audit
+//
+// AuditTerminalEventRecords answers "how many rows claim a publication, and how many of
+// those name a record". It cannot answer whether the records they name EXIST, and that gap
+// is what makes a purely arithmetic verdict unsound: the surplus of records over rows is
+// expected — a redelivery, a replay and a dead-letter copy each append a record no row
+// claims — so a surplus concealing an equal number of losses looks exactly like a healthy
+// pipeline.
+//
+// A coordinate can be checked rather than inferred. Compared against the live per-partition
+// bounds the broker reports, the claims divide into three cases, and only the first is
+// benign:
+//
+//   - within [first, end)     — the record exists and the claim is verified.
+//   - at or beyond end        — the row claims a record the log does not contain. That is
+//     direct evidence of loss or of a topic having been recreated
+//     beneath the ledger, not an inference from totals.
+//   - below first             — the record has aged out under retention, so the claim can
+//     no longer be verified either way and the verdict must say so.
+//
+// # Why extremes rather than every offset
+//
+// One row per partition, whatever the volume. The two comparisons that decide the cases
+// above are against the extremes — the largest claim tests the end bound and the smallest
+// tests the retention bound — so returning the whole set of offsets would multiply the
+// result by the size of the table to answer the same question. An aggregate over an index
+// scan stays affordable on a daily reconciliation of a table with tens of millions of rows;
+// streaming every coordinate would not.
+//
+// Rows with no coordinate are excluded by the NOT NULL predicate. They are not overlooked:
+// they are precisely the unconfirmed rows AuditTerminalEventRecords counts, and that count
+// already forces an inconclusive verdict while any exist.
+//
+// Parameters:
+//   - ctx context.Context: cancels the aggregate.
+//
+// Returns:
+//   - model.EventRecordCoordinateAudit: one entry per claimed partition, ordered by topic
+//     then partition. Coordinates is non-nil and empty when nothing is confirmed.
+//   - error: the repository's typed error.
+func (d Datasource) AuditEventRecordCoordinates(ctx context.Context) (model.EventRecordCoordinateAudit, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "AuditEventRecordCoordinates")
+	defer span.End()
+
+	audit := model.EventRecordCoordinateAudit{
+		Coordinates: []model.EventRecordCoordinate{},
+		MeasuredAt:  time.Now().UTC(),
+	}
+
+	rows, err := d.Conn.QueryContext(ctx, `
+		SELECT kafka_topic, kafka_partition, COUNT(*), MIN(kafka_offset), MAX(kafka_offset)
+		FROM blnk.event_outbox
+		WHERE kafka_offset IS NOT NULL
+		  AND kafka_topic IS NOT NULL
+		  AND kafka_partition IS NOT NULL
+		GROUP BY kafka_topic, kafka_partition
+		ORDER BY kafka_topic ASC, kafka_partition ASC
+	`)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return model.EventRecordCoordinateAudit{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to audit the broker coordinates of published event outbox entries",
+			"audit_event_record_coordinates", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logrus.Errorf("Error closing rows: %v", closeErr)
+		}
+	}()
+
+	for rows.Next() {
+		var coordinate model.EventRecordCoordinate
+		if scanErr := rows.Scan(
+			&coordinate.Topic,
+			&coordinate.Partition,
+			&coordinate.Rows,
+			&coordinate.MinOffset,
+			&coordinate.MaxOffset,
+		); scanErr != nil {
+			failDatabaseSpan(span, scanErr)
+
+			return model.EventRecordCoordinateAudit{}, loggedDatabaseError(apierror.ErrInternalServer,
+				"Failed to scan an event outbox broker coordinate",
+				"audit_event_record_coordinates", scanErr)
+		}
+		audit.Coordinates = append(audit.Coordinates, coordinate)
+	}
+
+	if err = rows.Err(); err != nil {
+		failDatabaseSpan(span, err)
+
+		return model.EventRecordCoordinateAudit{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Error iterating over event outbox broker coordinates",
+			"audit_event_record_coordinates", err)
+	}
+
+	span.SetAttributes(
+		attribute.Int("event_outbox.claimed_partitions", len(audit.Coordinates)),
+		attribute.Int64("event_outbox.claimed_rows", audit.TotalRows()),
+	)
+
+	return audit, nil
 }
 
 // GetEventByID retrieves an entry by its business event_id UUID.
@@ -3147,7 +3350,7 @@ func (d Datasource) GetEventByID(ctx context.Context, eventID string) (*model.Ev
 			// is an ordinary outcome of a caller-supplied id, not a fault.
 			return nil, loggedDatabaseError(apierror.ErrNotFound, "Event not found", "get_event_by_id", err)
 		}
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to retrieve event outbox entry", "get_event_by_id", err)
 	}
 
@@ -3155,23 +3358,291 @@ func (d Datasource) GetEventByID(ctx context.Context, eventID string) (*model.Ev
 	return &entry, nil
 }
 
-// ListDeadLetteredEvents pages the dead-letter inventory behind the dead-letter
-// API.
+// deadLetterSpanAttributes WAS RETIRED HERE. Each dead-letter query now sets its own span
+// attributes at the point it knows them, which is where the filtered/unfiltered fact is decided;
+// a shared renderer had to be handed a query type, and there are two.
+// ListDeadLetteredEvents pages the dead-letter inventory, applying EVERY narrowing the
+// query expresses IN SQL.
 //
-// Both terminal failure states are included. A row becomes failed the moment its
-// retry budget is spent and dead_lettered only once the event has additionally been
-// written to its `<topic>.dlt` sibling; listing only the latter would hide events
-// that exhausted their retries but whose dead-letter publication itself failed —
-// exactly the events an operator most needs to see. The partial index on
-// (status, occurred_at) covers both literals for this reason.
+// It is the single entry point every caller uses — the operator listing, the dead-letter age
+// scan and the recovery audit — and it delegates to ListDeadLetterInventory so a filtered page
+// and an unfiltered one cannot be drawn from different statements. The zero-valued query is
+// the whole inventory at the repository's default page size.
 //
-// Ordering is by occurred_at descending, newest first, because triage starts from
-// the most recent failures; id descending breaks ties so paging cannot show or skip
-// a row twice when several share an instant. limit is defaulted and capped, and a
-// negative offset is clamped to zero, so a malformed page request degrades to a
-// sane one instead of scanning the table or failing.
-func (d Datasource) ListDeadLetteredEvents(ctx context.Context, limit, offset int) ([]model.EventOutbox, error) {
-	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ListDeadLetteredEvents")
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - query model.DeadLetterQuery: the narrowing and the page. The zero value is valid.
+//
+// Returns:
+//   - []model.EventOutbox: the matching page, newest occurrence first. Empty, not an error,
+//     when nothing matches.
+//   - error: the repository's typed error.
+func (d Datasource) ListDeadLetteredEvents(
+	ctx context.Context,
+	query model.DeadLetterQuery,
+) ([]model.EventOutbox, error) {
+	return d.ListDeadLetteredEventsFiltered(ctx, query, query.Limit, query.Offset)
+}
+
+// ListDeadLetterInventory returns one page of the dead-letter inventory an operator triages
+// from, narrowed and paged entirely in SQL.
+//
+// Both terminal failure states are included by default. A row becomes failed the moment its
+// retry budget is spent and dead_lettered only once the event has additionally reached its
+// `<topic>.dlt` sibling, so listing only the latter would hide the events whose dead-letter
+// write itself failed — the ones most in need of attention. Only a dead_lettered row can be
+// replayed; a failed one has no dead-letter message to replay from.
+//
+// Ordering is by occurred_at descending, newest first, because triage starts from the most
+// recent failures; id descending breaks ties so paging can neither show nor skip a row twice
+// when several share an instant.
+//
+// # What it does NOT read
+//
+// The event's body. See deadLetterInventoryColumns: the projection reports the body's size
+// and never its bytes, so the cost of a page is set by the number of items in it rather than
+// by how large the events happened to be.
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - query model.DeadLetterInventoryQuery: the page and its narrowing. The zero value is
+//     valid and returns the newest default-sized page of everything.
+//
+// Returns:
+//   - model.DeadLetterInventoryPage: the entries, plus the cursor for the next page when one
+//     exists. Entries is never nil on success.
+//   - error: a logged internal error.
+func (d Datasource) ListDeadLetterInventory(
+	ctx context.Context,
+	query model.DeadLetterInventoryQuery,
+) (model.DeadLetterInventoryPage, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ListDeadLetterInventory")
+	defer span.End()
+
+	limit := query.Limit
+	if limit <= 0 {
+		limit = defaultDeadLetterPageSize
+	}
+	if limit > maxDeadLetterPageSize {
+		limit = maxDeadLetterPageSize
+	}
+
+	// The cursor's two halves are bound as a nullable pair, because a nil cursor and a
+	// cursor at the zero instant must be the same request — "start at the newest entry" —
+	// and binding a zero timestamp would instead exclude everything older than year one,
+	// which is every row.
+	var cursorInstant interface{}
+	var cursorID int64
+	if query.Cursor != nil {
+		cursorInstant = query.Cursor.OccurredAt.UTC()
+		cursorID = query.Cursor.ID
+	}
+
+	span.SetAttributes(
+		attribute.Int("event_outbox.limit", limit),
+		attribute.String("event_outbox.status_filter", query.Status),
+		attribute.Bool("event_outbox.cursor_present", query.Cursor != nil),
+		attribute.Bool("event_outbox.unresolved_only", query.UnresolvedOnly),
+		attribute.Bool("event_outbox.resolved_only", query.ResolvedOnly),
+	)
+
+	// limit+1: the extra row is read to establish that another page exists and is then
+	// discarded, which answers "is there more" without a COUNT over the inventory.
+	// The window's two ends are bound the same nullable way as the cursor, and for the same
+	// reason: a zero instant means "unbounded", not "year one", and binding it literally would
+	// exclude every row at one end and none at the other.
+	var occurredFrom, occurredTo interface{}
+	if !query.OccurredFrom.IsZero() {
+		occurredFrom = query.OccurredFrom.UTC()
+	}
+
+	if !query.OccurredTo.IsZero() {
+		occurredTo = query.OccurredTo.UTC()
+	}
+
+	rows, err := d.Conn.QueryContext(ctx, listDeadLetterInventoryQuery,
+		model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+		query.Status, query.EventType, query.Topic,
+		cursorInstant, cursorID, occurredFrom, occurredTo,
+		query.UnresolvedOnly, query.ResolvedOnly, limit+1)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return model.DeadLetterInventoryPage{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to list the dead-letter inventory", "list_dead_letter_inventory", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logrus.Errorf("Error closing rows: %v", closeErr)
+		}
+	}()
+
+	page := model.DeadLetterInventoryPage{
+		Entries: make([]model.DeadLetterInventoryEntry, 0, limit),
+	}
+
+	for rows.Next() {
+		entry, scanErr := scanDeadLetterInventoryEntry(rows)
+		if scanErr != nil {
+			failDatabaseSpan(span, scanErr)
+
+			return model.DeadLetterInventoryPage{}, loggedDatabaseError(apierror.ErrInternalServer,
+				"Failed to scan a dead-letter inventory entry", "list_dead_letter_inventory", scanErr)
+		}
+
+		if len(page.Entries) == limit {
+			// The probe row. Its existence is the answer, and the cursor is taken from the
+			// LAST RETURNED entry rather than from this one, so the next page resumes
+			// exactly where this one stopped.
+			page.HasMore = true
+
+			break
+		}
+
+		page.Entries = append(page.Entries, entry)
+	}
+
+	if err = rows.Err(); err != nil {
+		failDatabaseSpan(span, err)
+
+		return model.DeadLetterInventoryPage{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Error iterating over the dead-letter inventory", "list_dead_letter_inventory", err)
+	}
+
+	if page.HasMore && len(page.Entries) > 0 {
+		last := page.Entries[len(page.Entries)-1]
+		page.NextCursor = &model.DeadLetterCursor{OccurredAt: last.OccurredAt, ID: last.ID}
+	}
+
+	span.SetAttributes(
+		attribute.Int("event_outbox.dead_lettered_count", len(page.Entries)),
+		attribute.Bool("event_outbox.has_more", page.HasMore),
+	)
+
+	return page, nil
+}
+
+// deadLetterFilterClause renders a dead-letter filter as a SQL predicate and its arguments.
+//
+// # Why the clause is built rather than written out
+//
+// The three filters are independently optional, so eight combinations of predicate exist. A
+// query per combination would be eight strings to keep in step with one another; a single
+// string with `($n = ” OR column = $n)` per filter would defeat the partial index on
+// (status, occurred_at) for the unfiltered case, because the planner cannot prove the OR away.
+// Building only the predicates the caller actually set keeps the common case identical to the
+// query that existed before filtering was pushed down.
+//
+// EVERY VALUE IS A BOUND PARAMETER. Nothing from the caller is interpolated into the SQL text,
+// so an event type or topic containing a quote is a value that matches nothing rather than a
+// fragment of the statement — the property that makes an operator-facing filter safe to expose.
+//
+// The status filter REPLACES the two-state default rather than adding to it. Both terminal
+// states are listed when no status is named, because a row becomes `failed` when its retry
+// budget is spent and `dead_lettered` only once the dead-letter publication also succeeded, and
+// an operator triaging stuck events needs both.
+//
+// Parameters:
+//   - filter model.DeadLetterFilter: the requested narrowing. The zero value selects the whole
+//     inventory.
+//   - next int: the 1-based index of the first placeholder to allocate, so the caller can
+//     append LIMIT/OFFSET parameters after the predicate's own.
+//
+// Returns:
+//   - string: the WHERE clause body, never empty — it always at least bounds the status set.
+//   - []interface{}: the arguments, in placeholder order.
+//   - int: the next unused placeholder index.
+func deadLetterFilterClause(filter model.DeadLetterFilter, next int) (string, []interface{}, int) {
+	clauses := make([]string, 0, 3)
+	args := make([]interface{}, 0, 4)
+
+	if status := strings.TrimSpace(filter.Status); status != "" {
+		clauses = append(clauses, fmt.Sprintf("status = $%d", next))
+		args = append(args, status)
+		next++
+	} else {
+		clauses = append(clauses, fmt.Sprintf("status IN ($%d, $%d)", next, next+1))
+		args = append(args,
+			model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed)
+		next += 2
+	}
+
+	if eventType := strings.TrimSpace(filter.EventType); eventType != "" {
+		clauses = append(clauses, fmt.Sprintf("event_type = $%d", next))
+		args = append(args, eventType)
+		next++
+	}
+
+	if topic := strings.TrimSpace(filter.Topic); topic != "" {
+		clauses = append(clauses, fmt.Sprintf("topic = $%d", next))
+		args = append(args, topic)
+		next++
+	}
+
+	// THE OCCURRENCE WINDOW, bound inclusively at both ends and omitted when either end is
+	// zero: zero means "unbounded", not "year one", and binding it literally would exclude
+	// every row at one end and none at the other. occurred_at is the right column for a triage
+	// window rather than the row's creation or last-attempt instant — it is when the ledger
+	// mutation happened, which is what an operator correlating a backlog against an incident
+	// timeline holds, and it is the column the listing is ordered by, so the window and the
+	// paging agree about what "newest first" selects.
+	if !filter.OccurredFrom.IsZero() {
+		clauses = append(clauses, fmt.Sprintf("occurred_at >= $%d", next))
+		args = append(args, filter.OccurredFrom.UTC())
+		next++
+	}
+
+	if !filter.OccurredTo.IsZero() {
+		clauses = append(clauses, fmt.Sprintf("occurred_at <= $%d", next))
+		args = append(args, filter.OccurredTo.UTC())
+		next++
+	}
+
+	// RESOLUTION takes no placeholder, which is why it is rendered last: a NULL test is not a
+	// value comparison, so it cannot be parameterised and it cannot disturb the numbering the
+	// clauses above established. Only one of the two can hold — the service's tri-state makes
+	// the contradiction unrepresentable — but both are written independently so a caller
+	// constructing the filter directly gets an empty result rather than a widened one.
+	if filter.UnresolvedOnly {
+		clauses = append(clauses, "resolved_at IS NULL")
+	}
+
+	if filter.ResolvedOnly {
+		clauses = append(clauses, "resolved_at IS NOT NULL")
+	}
+
+	return strings.Join(clauses, " AND "), args, next
+}
+
+// ListDeadLetteredEventsFiltered pages the dead-letter inventory with the caller's filters
+// applied IN SQL.
+//
+// It is the listing the dead-letter API serves. The page it returns is exactly the requested
+// slice of the MATCHING set — not a filtered slice of an unfiltered page, and not a truncated
+// prefix of the matches — so a client paging a filtered inventory receives every match and can
+// tell the end of the result from an exhausted scan budget, because there is no scan budget.
+//
+// Ordering and bounds are identical to ListDeadLetteredEvents: occurred_at descending with id
+// descending to break ties, a defaulted and capped limit, and a negative offset clamped to
+// zero. Identical ordering is what makes paging stable across the two entry points, and the
+// tie-break is what stops a row being shown twice or skipped when several share an instant.
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - filter model.DeadLetterFilter: the narrowing. The zero value lists the whole inventory,
+//     which makes this a superset of ListDeadLetteredEvents rather than a variant of it.
+//   - limit int: page size. Non-positive selects the default; oversized is capped.
+//   - offset int: how many matching rows to skip. Negative is clamped to zero.
+//
+// Returns:
+//   - []model.EventOutbox: the matching page, nil when nothing matches.
+//   - error: a logged internal error carrying no driver detail.
+func (d Datasource) ListDeadLetteredEventsFiltered(
+	ctx context.Context,
+	filter model.DeadLetterFilter,
+	limit, offset int,
+) ([]model.EventOutbox, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ListDeadLetteredEventsFiltered")
 	defer span.End()
 
 	if limit <= 0 {
@@ -3183,21 +3654,27 @@ func (d Datasource) ListDeadLetteredEvents(ctx context.Context, limit, offset in
 	if offset < 0 {
 		offset = 0
 	}
+
+	predicate, args, next := deadLetterFilterClause(filter, 1)
+	args = append(args, limit, offset)
+
 	span.SetAttributes(
 		attribute.Int("event_outbox.limit", limit),
 		attribute.Int("event_outbox.offset", offset),
+		attribute.Bool("event_outbox.filtered", filter.Narrows()),
 	)
 
 	rows, err := d.Conn.QueryContext(ctx, `
 		SELECT `+eventOutboxColumns+`
 		FROM blnk.event_outbox
-		WHERE status IN ($1, $2)
+		WHERE `+predicate+`
 		ORDER BY occurred_at DESC, id DESC
-		LIMIT $3 OFFSET $4
-	`, model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed, limit, offset)
+		LIMIT $`+strconv.Itoa(next)+` OFFSET $`+strconv.Itoa(next+1), args...)
 	if err != nil {
-		span.RecordError(err)
-		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to list dead-lettered events", "list_dead_lettered_events", err)
+		failDatabaseSpan(span, err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to list dead-lettered events", "list_dead_lettered_events_filtered", err)
 	}
 	defer func() {
 		if closeErr := rows.Close(); closeErr != nil {
@@ -3209,23 +3686,73 @@ func (d Datasource) ListDeadLetteredEvents(ctx context.Context, limit, offset in
 	for rows.Next() {
 		entry, scanErr := scanEventOutbox(rows)
 		if scanErr != nil {
-			span.RecordError(scanErr)
-			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan dead-lettered event", "list_dead_lettered_events", scanErr)
+			failDatabaseSpan(span, scanErr)
+
+			return nil, loggedDatabaseError(apierror.ErrInternalServer,
+				"Failed to scan dead-lettered event", "list_dead_lettered_events_filtered", scanErr)
 		}
 		entries = append(entries, entry)
 	}
 
 	if err = rows.Err(); err != nil {
-		span.RecordError(err)
-		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over dead-lettered events", "list_dead_lettered_events", err)
+		failDatabaseSpan(span, err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Error iterating over dead-lettered events", "list_dead_lettered_events_filtered", err)
 	}
 
 	span.SetAttributes(attribute.Int("event_outbox.dead_lettered_count", len(entries)))
+
 	return entries, nil
 }
 
-// CountEventOutboxByStatus returns a status-keyed count of every row in
-// blnk.event_outbox.
+// CountDeadLetteredEvents counts the dead-letter inventory THE SAME FILTER selects.
+//
+// It is the other half of a usable paginated triage list. Without it a filtered page could
+// report no total at all — the API refused `include_count` alongside a filter for exactly that
+// reason — and a client had no way to know how many matches it was paging through, or whether
+// the short page it just received was the end of the result or the end of a scan budget.
+//
+// The predicate is built by the SAME function the listing uses, which is what guarantees the
+// count describes the set the pages are drawn from. Two hand-written predicates would drift,
+// and a total that disagrees with the pages is worse than no total.
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - filter model.DeadLetterFilter: the narrowing. The zero value counts the whole inventory.
+//
+// Returns:
+//   - int64: how many rows match. Zero is a legitimate answer and not an error.
+//   - error: a logged internal error carrying no driver detail.
+func (d Datasource) CountDeadLetteredEvents(
+	ctx context.Context,
+	filter model.DeadLetterFilter,
+) (int64, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CountDeadLetteredEvents")
+	defer span.End()
+
+	predicate, args, _ := deadLetterFilterClause(filter, 1)
+
+	var total int64
+	if err := d.Conn.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM blnk.event_outbox
+		WHERE `+predicate, args...).Scan(&total); err != nil {
+		failDatabaseSpan(span, err)
+
+		return 0, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to count dead-lettered events", "count_dead_lettered_events", err)
+	}
+
+	span.SetAttributes(
+		attribute.Int64("event_outbox.dead_lettered_total", total),
+		attribute.Bool("event_outbox.filtered", filter.Narrows()),
+	)
+
+	return total, nil
+}
+
+// CountEventOutboxByStatus returns a status-keyed count of blnk.event_outbox rows.
 //
 // IT IS NOT UNUSED — do not delete it. A grep for callers inside this package
 // alone finds none, which is exactly the trap this comment exists to prevent. It
@@ -3234,6 +3761,17 @@ func (d Datasource) ListDeadLetteredEvents(ctx context.Context, limit, offset in
 // dead-letter-topic end offsets reported by the broker. Three things consume it —
 // the event statistics endpoint, the reconciliation runbook in the Kafka operations
 // documentation, and the pending-backlog gauge exported to the metrics pipeline.
+//
+// # What "since" bounds, and what it deliberately does not
+//
+// Every status EXCEPT dispatched is counted exactly and in full, whatever the window says:
+// those are the populations an operator acts on and any of them can legitimately be older
+// than any window. `dispatched` — the only population that grows without bound — is counted
+// from since onwards. See countEventOutboxByStatusQuery for why the split is drawn there.
+//
+// A caller that wants the reading to be cheap therefore asks for a short window and gets a
+// complete answer about everything outstanding; the figure that becomes approximate is the
+// one that was already historical.
 //
 // A status with no rows is ABSENT from the returned map rather than present with a
 // zero, because GROUP BY only produces rows that exist. Callers must therefore read
@@ -3245,17 +3783,28 @@ func (d Datasource) ListDeadLetteredEvents(ctx context.Context, limit, offset in
 //
 // The map is never nil on success: an empty table yields an empty map, so a caller
 // can range over the result without a nil check.
-func (d Datasource) CountEventOutboxByStatus(ctx context.Context) (map[string]int64, error) {
+//
+// Parameters:
+//   - ctx context.Context: cancels the aggregate.
+//   - since time.Time: the earliest occurrence instant a dispatched row must have to be
+//     counted. A zero or future instant is normalised to defaultEventCountWindow before
+//     now, so a caller cannot accidentally ask for a whole-history scan or for a window
+//     that excludes everything.
+//
+// Returns:
+//   - map[string]int64: counts by status, never nil on success.
+//   - error: a logged internal error.
+func (d Datasource) CountEventOutboxByStatus(ctx context.Context, since time.Time) (map[string]int64, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CountEventOutboxByStatus")
 	defer span.End()
 
-	rows, err := d.Conn.QueryContext(ctx, `
-		SELECT status, COUNT(*)
-		FROM blnk.event_outbox
-		GROUP BY status
-	`)
+	since = normalizeEventCountWindow(since)
+	span.SetAttributes(attribute.String("event_outbox.window_start", since.Format(time.RFC3339)))
+
+	rows, err := d.Conn.QueryContext(ctx, countEventOutboxByStatusQuery,
+		model.EventOutboxStatusDispatched, since)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to count event outbox entries by status", "count_event_outbox_by_status", err)
 	}
 	defer func() {
@@ -3269,14 +3818,14 @@ func (d Datasource) CountEventOutboxByStatus(ctx context.Context) (map[string]in
 		var status string
 		var count int64
 		if scanErr := rows.Scan(&status, &count); scanErr != nil {
-			span.RecordError(scanErr)
+			failDatabaseSpan(span, scanErr)
 			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event outbox status count", "count_event_outbox_by_status", scanErr)
 		}
 		counts[status] = count
 	}
 
 	if err = rows.Err(); err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event outbox status counts", "count_event_outbox_by_status", err)
 	}
 
@@ -3284,6 +3833,905 @@ func (d Datasource) CountEventOutboxByStatus(ctx context.Context) (map[string]in
 	return counts, nil
 }
 
+// AuditEventRecordsInIntervals classifies every row that claims a Kafka record against the
+// MEASURED offset windows of the partitions those records live in.
+//
+// # Why counting could never prove zero loss, and why an interval can
+//
+// The reconciliation used to compare the outbox's currently-retained rows against the
+// broker's cumulative end offsets. Those two numbers describe different populations, and no
+// amount of care in the arithmetic fixes that:
+//
+//   - Records are a LOWER BOUND on events — a redelivery, a replay or a dead-letter copy
+//     writes its own record — so the comparison is directional and a surplus is expected.
+//     The surplus is then INDISTINGUISHABLE FROM COMPENSATED LOSS: ten lost events plus ten
+//     redeliveries produce exactly the totals of a healthy pipeline.
+//   - Outbox retention prunes rows, so the left side shrinks over time while the right side
+//     only climbs, and the gap that hides loss grows on its own.
+//   - Kafka retention deletes records the end offset still counts, so "the sum says it was
+//     written" is not "a consumer could still read it".
+//   - Recreating a topic resets its offsets, so the right side collapses to a number smaller
+//     than the left and a healthy system reports catastrophic loss.
+//   - Foreign or pre-existing traffic on a shared topic inflates the right side by an unknown
+//     amount, masking loss by exactly that much.
+//
+// This query answers a different, answerable question, once per row: IS THE RECORD THIS ROW
+// NAMED INSIDE THE WINDOW ITS PARTITION CAN CURRENTLY SERVE. Nothing else on the topic
+// affects that answer, so foreign traffic is simply not attributed to Blnk, and every reason
+// a row cannot be corroborated is reported as its own count instead of vanishing into a
+// total.
+//
+// # The classification, and why every bucket is separate
+//
+// Each row lands in exactly one bucket and the buckets sum to PublishedRows:
+//
+//   - corroborated — offset inside [first_offset, end_offset) of a measured partition. The
+//     only bucket a green verdict may contain.
+//   - unconfirmed — no coordinate at all. COUNT of a NULL-able expression ignores NULLs, and
+//     the all-or-nothing check constraint means a non-NULL offset implies a complete
+//     coordinate, so testing the offset alone is sufficient.
+//   - unmeasured — names a topic or partition absent from the measurement: a missing topic, an
+//     unavailable partition, or a partition count that has since shrunk. The LEFT JOIN is what
+//     detects it; an inner join would have silently dropped these rows and inflated the
+//     corroborated fraction, which is the failure this classification exists to prevent.
+//   - aged_out — offset BELOW first_offset. Written, then deleted by Kafka retention. Not
+//     loss, but not corroborable either.
+//   - beyond_end — offset AT OR ABOVE end_offset. Impossible on an intact log, because the
+//     broker assigned that offset when it accepted the write; it means the partition was
+//     truncated or the topic recreated. This is the topic-incarnation signal.
+//
+// DistinctCorroboratedRecords is counted over the corroborated rows only and is FILTERED to
+// rows naming a coordinate. The filter is required rather than defensive: COUNT(DISTINCT expr)
+// ignores a NULL expr, but a ROW CONSTRUCTOR whose every field is NULL is not itself NULL in
+// PostgreSQL, so without it every coordinate-less row would collapse into one phantom extra
+// "record" and the documented equality with CorroboratedRows would be false on a healthy
+// outbox.
+//
+// # The window the verdict covers is reported, not assumed
+//
+// OldestTerminalAt is the earliest publication instant among all terminal rows still retained,
+// and CorroboratedFrom/CorroboratedTo bound the corroborated population. They exist because
+// the outbox is pruned: a verdict is a statement about the rows that still exist, and one
+// presented without that bound is how an aggressively pruned outbox produced a
+// reconciliation that looked complete. COALESCE to occurred_at covers a dead-lettered row,
+// which has no kafka_dispatched_at because its record went to the dead-letter topic.
+//
+// # Why the webhook_pending row is included
+//
+// It HAS been published to Kafka; what is outstanding is the deprecated HTTP leg. Its record
+// is on the topic, so excluding it would leave a real record unaccounted for on the outbox
+// side during exactly the dual-delivery window when the reconciliation matters most.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - intervals []model.PartitionOffsetInterval: the measured windows, from
+//     TopicOffsetReport.PartitionIntervals(). An EMPTY list is valid and classifies every
+//     confirmed row as unmeasured, which is the correct reading of "the broker told us
+//     nothing" and is what stops a broker-less run reporting a green verdict.
+//
+// Returns:
+//   - model.EventRecordIntervalAudit: the classification and the instants it covers.
+//   - error: a logged internal error carrying no driver detail.
+func (d Datasource) AuditEventRecordsInIntervals(
+	ctx context.Context,
+	intervals []model.PartitionOffsetInterval,
+) (model.EventRecordIntervalAudit, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "AuditEventRecordsInIntervals")
+	defer span.End()
+
+	audit := model.EventRecordIntervalAudit{MeasuredAt: time.Now().UTC()}
+
+	// The windows are passed as four parallel arrays and zipped by unnest, so one statement
+	// serves any number of partitions with a fixed parameter count. Built with make rather
+	// than left nil, because lib/pq renders a nil slice as SQL NULL and unnest(NULL) yields
+	// no rows at all — which would classify correctly by accident here, but would break the
+	// moment the join was used in the other direction.
+	topics := make([]string, 0, len(intervals))
+	partitions := make([]int64, 0, len(intervals))
+	firstOffsets := make([]int64, 0, len(intervals))
+	endOffsets := make([]int64, 0, len(intervals))
+	for _, interval := range intervals {
+		topic := strings.TrimSpace(interval.Topic)
+		if topic == "" || interval.Partition < 0 {
+			// A window with no topic or a negative partition cannot match any stored
+			// coordinate, and passing it would only make the arrays longer. Dropping it here
+			// keeps "unmeasured" meaning what it says.
+			continue
+		}
+
+		first := interval.FirstOffset
+		if first < 0 {
+			// A broker that could not report the earliest retained offset is reported as
+			// zero rather than as a negative sentinel, which is the widest window the
+			// measurement supports and therefore the reading that cannot manufacture an
+			// aged-out row that is not one.
+			first = 0
+		}
+
+		topics = append(topics, topic)
+		partitions = append(partitions, int64(interval.Partition))
+		firstOffsets = append(firstOffsets, first)
+		endOffsets = append(endOffsets, interval.EndOffset)
+	}
+
+	span.SetAttributes(attribute.Int("event_outbox.measured_partitions", len(topics)))
+
+	var oldestTerminalAt, corroboratedFrom, corroboratedTo sql.NullTime
+
+	err := d.Conn.QueryRowContext(ctx, `
+		WITH measured AS (
+			SELECT *
+			FROM unnest($2::text[], $3::bigint[], $4::bigint[], $5::bigint[])
+				AS m(topic_name, partition_id, first_offset, end_offset)
+		),
+		terminal AS (
+			SELECT
+				kafka_topic,
+				kafka_partition,
+				kafka_offset,
+				COALESCE(kafka_dispatched_at, occurred_at) AS published_at
+			FROM blnk.event_outbox
+			WHERE kafka_dispatched_at IS NOT NULL OR status = $1
+		),
+		classified AS (
+			SELECT
+				t.kafka_topic,
+				t.kafka_partition,
+				t.kafka_offset,
+				t.published_at,
+				CASE
+					WHEN t.kafka_offset IS NULL              THEN 'unconfirmed'
+					WHEN m.topic_name IS NULL                THEN 'unmeasured'
+					WHEN t.kafka_offset >= m.end_offset      THEN 'beyond_end'
+					WHEN t.kafka_offset <  m.first_offset    THEN 'aged_out'
+					ELSE 'corroborated'
+				END AS classification
+			FROM terminal t
+			LEFT JOIN measured m
+				ON m.topic_name = t.kafka_topic
+				AND m.partition_id = t.kafka_partition
+		)
+		SELECT
+			COUNT(*)                                                       AS published_rows,
+			COUNT(*) FILTER (WHERE classification = 'corroborated')        AS corroborated_rows,
+			COUNT(DISTINCT (kafka_topic, kafka_partition, kafka_offset))
+				FILTER (WHERE classification = 'corroborated'
+					AND kafka_offset IS NOT NULL)                          AS distinct_corroborated,
+			COUNT(*) FILTER (WHERE classification = 'unconfirmed')         AS unconfirmed_rows,
+			COUNT(*) FILTER (WHERE classification = 'unmeasured')          AS unmeasured_rows,
+			COUNT(*) FILTER (WHERE classification = 'aged_out')            AS aged_out_rows,
+			COUNT(*) FILTER (WHERE classification = 'beyond_end')          AS beyond_end_rows,
+			MIN(published_at)                                              AS oldest_terminal_at,
+			MIN(published_at) FILTER (WHERE classification = 'corroborated') AS corroborated_from,
+			MAX(published_at) FILTER (WHERE classification = 'corroborated') AS corroborated_to
+		FROM classified
+	`,
+		model.EventOutboxStatusDeadLettered,
+		pq.Array(topics), pq.Array(partitions), pq.Array(firstOffsets), pq.Array(endOffsets),
+	).Scan(
+		&audit.PublishedRows,
+		&audit.CorroboratedRows,
+		&audit.DistinctCorroboratedRecords,
+		&audit.UnconfirmedRows,
+		&audit.UnmeasuredRows,
+		&audit.AgedOutRows,
+		&audit.BeyondEndRows,
+		&oldestTerminalAt,
+		&corroboratedFrom,
+		&corroboratedTo,
+	)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return model.EventRecordIntervalAudit{}, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to audit the broker records of published event outbox entries",
+			"audit_event_records_in_intervals", err)
+	}
+
+	if oldestTerminalAt.Valid {
+		audit.OldestTerminalAt = oldestTerminalAt.Time.UTC()
+	}
+	if corroboratedFrom.Valid {
+		audit.CorroboratedFrom = corroboratedFrom.Time.UTC()
+	}
+	if corroboratedTo.Valid {
+		audit.CorroboratedTo = corroboratedTo.Time.UTC()
+	}
+
+	span.SetAttributes(
+		attribute.Int64("event_outbox.published_rows", audit.PublishedRows),
+		attribute.Int64("event_outbox.corroborated_rows", audit.CorroboratedRows),
+		attribute.Int64("event_outbox.uncorroborated_rows", audit.UncorroboratedRows()),
+		attribute.Int64("event_outbox.beyond_end_rows", audit.BeyondEndRows),
+	)
+
+	return audit, nil
+}
+
+// ListUndrainedEventTopics groups every row that still owes a publish by the destination
+// topic recorded on it. See database.eventOutboxRepository for what the audit is for and why
+// "undrained" is the two sets it is rather than simply the non-terminal statuses.
+//
+// # Why it groups rather than filtering in SQL
+//
+// The question this answers — "does any stored destination lie outside the namespaces we
+// own?" — needs the OWNED PREFIX LIST to answer, and that list lives in configuration read by
+// the root package. Encoding a namespace predicate in this statement would put topic-naming
+// policy in the persistence layer, where the doc comment on model.IsBlnkEventTopic explains it
+// does not belong. Returning the grouped inventory instead lets the caller apply whichever
+// ownership test it is holding, and keeps this query a plain aggregate.
+//
+// The result is bounded by the number of distinct topics in the table, so it is returned
+// whole. A topic recorded with a blank value cannot exist — the insert validation refuses
+// it — but the aggregate would still group one, so the row is skipped rather than reported
+// under an empty name that no ownership test can classify.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//
+// Returns:
+//   - []model.EventTopicBacklog: one entry per distinct destination topic that still owes
+//     work, ordered by the oldest outstanding occurrence first, so the most overdue
+//     generation is read first. Empty when the outbox owes nothing.
+//   - error: a logged internal error.
+func (d Datasource) ListUndrainedEventTopics(ctx context.Context) ([]model.EventTopicBacklog, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ListUndrainedEventTopics")
+	defer span.End()
+
+	// The status sets are spelled from the model's own literals through parameters, so a
+	// status renamed there cannot leave this statement silently matching nothing.
+	//
+	// The undelivered set is stated as "not one of the two that owe no publish" rather than
+	// as a list of the four that do: a status ADDED to the state machine then joins the
+	// undrained set by default, which is the safe direction for an audit whose whole purpose
+	// is to notice rows nothing is draining. Getting that wrong the other way would report a
+	// stranded generation as drained.
+	rows, err := d.Conn.QueryContext(ctx, `
+		SELECT
+			topic,
+			COUNT(*) FILTER (WHERE status NOT IN ($1, $2))          AS undelivered_rows,
+			COUNT(*) FILTER (WHERE status = $2)                     AS replayable_rows,
+			MIN(occurred_at)                                        AS oldest_occurred_at
+		FROM blnk.event_outbox
+		WHERE status NOT IN ($1, $3)
+		GROUP BY topic
+		ORDER BY oldest_occurred_at ASC, topic ASC
+	`, model.EventOutboxStatusDispatched, model.EventOutboxStatusDeadLettered,
+		model.EventOutboxStatusWebhookPending)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to list the undrained destination topics of the event outbox",
+			"list_undrained_event_topics", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logrus.Errorf("Error closing rows: %v", closeErr)
+		}
+	}()
+
+	backlogs := make([]model.EventTopicBacklog, 0, len(model.AllEventCategories())*2)
+	for rows.Next() {
+		var (
+			backlog model.EventTopicBacklog
+			oldest  sql.NullTime
+		)
+		if err := rows.Scan(
+			&backlog.Topic, &backlog.UndeliveredRows, &backlog.ReplayableRows, &oldest,
+		); err != nil {
+			failDatabaseSpan(span, err)
+
+			return nil, loggedDatabaseError(apierror.ErrInternalServer,
+				"Failed to read an undrained destination topic of the event outbox",
+				"list_undrained_event_topics", err)
+		}
+		if strings.TrimSpace(backlog.Topic) == "" {
+			continue
+		}
+		if oldest.Valid {
+			backlog.OldestOccurredAt = oldest.Time.UTC()
+		}
+
+		backlogs = append(backlogs, backlog)
+	}
+	if err := rows.Err(); err != nil {
+		failDatabaseSpan(span, err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to iterate the undrained destination topics of the event outbox",
+			"list_undrained_event_topics", err)
+	}
+
+	span.SetAttributes(attribute.Int("event_outbox.undrained_topics", len(backlogs)))
+
+	return backlogs, nil
+}
+
+// ---------------------------------------------------------------------------------------
+// DATA-01: driver errors must not become API response bodies
+//
+// apierror.APIError carries its cause in an interface{} Details field that is serialised into
+// the response. lib/pq's *pq.Error is a STRUCT WITH EXPORTED FIELDS — Severity, Code, Message,
+// Detail, Hint, Schema, Table, Column, Constraint, File, Line, Routine — so passing one as
+// Details published the schema name, the table, the column, the violated constraint and even
+// the PostgreSQL source file and function that raised it, to whoever called the endpoint. That
+// is a map of the database handed out one failed request at a time.
+//
+// Both event repositories therefore route every driver-origin failure through the helpers
+// below: the full error is LOGGED, with its SQLSTATE, and the API error carries a code and a
+// message and NO details at all. Details is `omitempty`, so it simply does not appear.
+//
+// Nothing is lost by that. The operator gets more than before — a structured log line naming
+// the operation and the SQLSTATE class — while the caller gets what a caller can act on, which
+// is the typed code. The two audiences were previously served by one field, and it was the
+// wrong field for one of them.
+// ---------------------------------------------------------------------------------------
+
+// postgresSQLState extracts the five-character SQLSTATE from a driver error.
+//
+// It is a bounded, non-revealing value — a standardised error class such as "23505", not a
+// message — which makes it safe to put in a log field and useful for grouping failures. It
+// returns "unknown" for anything that is not a *pq.Error, including a wrapped one, so a log
+// line always has the field.
+//
+// Parameters:
+//   - err error: the error to inspect. May be nil or wrapped.
+//
+// Returns:
+//   - string: the SQLSTATE, or "unknown".
+func postgresSQLState(err error) string {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return string(pqErr.Code)
+	}
+
+	return "unknown"
+}
+
+// ---------------------------------------------------------------------------------------
+// DATA-02: the driver's own words must not reach the standard log or a span either
+//
+// DATA-01 above stopped the driver error being SERIALISED INTO THE RESPONSE. It left the
+// error in the two other places it does not belong, and both of them leave the process:
+//
+//   - attaching the cause to a log entry directly rendered the full text into an "error"
+//     field. A *pq.Error
+//     renders as its Message, and PostgreSQL's messages name the SCHEMA, the TABLE, the
+//     COLUMN and the violated CONSTRAINT; a plumbing failure names the HOST AND PORT it
+//     could not reach. Logs are shipped to an aggregator and indexed, so that is a map of
+//     the database and its topology accumulating in a searchable store.
+//   - failDatabaseSpan(span, cause) writes the same text as an exception.message attribute on a
+//     span. Traces go to a shared backend that is routinely readable by more people than
+//     the database is, and an exception event is retained for the whole trace's lifetime.
+//
+// Both are replaced by a BOUNDED CLASS plus the SQLSTATE. The class vocabulary below is
+// closed and every member is a fixed literal, so the pair (error_class, sqlstate) groups
+// failures for alerting exactly as the raw text did — better, in fact, since two failures
+// of one kind no longer differ by an interpolated identifier.
+//
+// The raw cause is not discarded. It goes to logDatabaseDiagnostic, which emits at TRACE
+// and nowhere else. That level is the separately controlled sink: DEBUG is already the
+// event pipeline's routine per-event volume (see config.Configuration.LogLevel), so an
+// operator raising the level to debug for a delivery investigation must NOT thereby start
+// shipping schema and topology detail. Choosing the level below the one already in
+// ordinary use is what makes the sink a deliberate act rather than a side effect.
+// ---------------------------------------------------------------------------------------
+
+// The bounded classes a database failure is reported as. Every value is a fixed literal and
+// the set is closed, which is what makes them safe as a log field and as a span status.
+//
+// The SQLSTATE-derived members use the two-character CLASS rather than the five-character
+// code, because the class is what decides where an operator looks: 08 is the network or the
+// pool, 23 is the data, 40 is contention that a retry resolves, 42 is the schema or the
+// grant — a genuine deployment fault — and 53/57 are the server refusing service. The exact
+// five characters travel beside the class in the sqlstate field, so nothing is lost by
+// classifying coarsely here.
+const (
+	databaseErrorClassUnknown       = "unknown"
+	databaseErrorClassNoRows        = "no_rows"
+	databaseErrorClassCancelled     = "context_cancelled"
+	databaseErrorClassDeadline      = "context_deadline_exceeded"
+	databaseErrorClassConnection    = "connection"
+	databaseErrorClassData          = "data_exception"
+	databaseErrorClassIntegrity     = "integrity_constraint"
+	databaseErrorClassContention    = "serialization_or_deadlock"
+	databaseErrorClassSchemaOrGrant = "syntax_or_access_rule"
+	databaseErrorClassResources     = "insufficient_resources"
+	databaseErrorClassIntervention  = "operator_intervention"
+	databaseErrorClassServer        = "internal_server_error"
+	databaseErrorClassDriver        = "driver"
+	databaseErrorClassApplication   = "application"
+)
+
+// databaseErrorClass maps a failure to one of the bounded classes above.
+//
+// The Go-level conditions are tested FIRST and in this order deliberately. A cancelled or
+// expired context surfaces from lib/pq as a driver error on some paths and as a context
+// error on others, and reporting the same operator-visible event under two different
+// classes depending on where the cancellation landed would make the series useless for
+// alerting. sql.ErrNoRows precedes them because it is not a fault at all on the paths that
+// use RETURNING to detect a lost claim.
+//
+// An apierror.APIError is classified by its CODE and never by its message. That is not
+// timidity about Blnk's own prose: several of these values carry a Details error that
+// interpolates a subscriber or event identifier, so the message is caller data, while the
+// code vocabulary is closed and is already the value clients switch on.
+//
+// Parameters:
+//   - err error: the failure to classify. May be nil or wrapped.
+//
+// Returns:
+//   - string: one of the databaseErrorClass* constants, or "api:<CODE>" for a typed
+//     application error. Never empty, so a log field is always present.
+func databaseErrorClass(err error) string {
+	var apiErr apierror.APIError
+
+	switch {
+	case err == nil:
+		return databaseErrorClassUnknown
+	case errors.Is(err, sql.ErrNoRows):
+		return databaseErrorClassNoRows
+	case errors.Is(err, context.Canceled):
+		return databaseErrorClassCancelled
+	case errors.Is(err, context.DeadlineExceeded):
+		return databaseErrorClassDeadline
+	case errors.As(err, &apiErr):
+		return "api:" + string(apiErr.Code)
+	}
+
+	state := postgresSQLState(err)
+	if len(state) < 2 {
+		return databaseErrorClassDriver
+	}
+
+	switch state[:2] {
+	case "08":
+		return databaseErrorClassConnection
+	case "22":
+		return databaseErrorClassData
+	case "23":
+		return databaseErrorClassIntegrity
+	case "40":
+		return databaseErrorClassContention
+	case "42":
+		return databaseErrorClassSchemaOrGrant
+	case "53":
+		return databaseErrorClassResources
+	case "57":
+		return databaseErrorClassIntervention
+	case "XX":
+		return databaseErrorClassServer
+	default:
+		return databaseErrorClassDriver
+	}
+}
+
+// ErrorClass is the exported form of databaseErrorClass, for a caller OUTSIDE this package that
+// has to log a failure this package returned.
+//
+// The API layer is the caller that needs it. A handler receives an error from a repository
+// method and cannot assume anything about its text: IDataSource is an interface, so the value
+// may be the bounded apierror.APIError loggedDatabaseError returns, a driver error from a
+// different implementation, or a mock's own error. Classifying it here rather than rendering it
+// there means one vocabulary covers every implementation, and a handler cannot accidentally be
+// the place a driver error escapes.
+//
+// Parameters:
+//   - err error: the failure to classify. May be nil or wrapped.
+//
+// Returns:
+//   - string: a bounded class. Never empty.
+func ErrorClass(err error) string {
+	return databaseErrorClass(err)
+}
+
+// SQLState is the exported form of postgresSQLState, so a caller outside this package can carry
+// the standardised five-character error class beside the bounded class from ErrorClass.
+//
+// Parameters:
+//   - err error: the failure to inspect. May be nil or wrapped.
+//
+// Returns:
+//   - string: the SQLSTATE, or "unknown".
+func SQLState(err error) string {
+	return postgresSQLState(err)
+}
+
+// LogDiagnostic is the exported form of logDatabaseDiagnostic, so a caller outside this package
+// routes a raw cause to the same trace-level sink rather than to its own log line.
+//
+// Parameters:
+//   - operation string: a fixed literal naming what was attempted.
+//   - cause error: the raw failure. A nil cause is a no-op.
+func LogDiagnostic(operation string, cause error) {
+	logDatabaseDiagnostic(operation, cause)
+}
+
+// logDatabaseDiagnostic sends the raw cause to the trace-level diagnostic sink.
+//
+// This is the ONE place in either event repository that renders a driver error's own text,
+// and it is reachable only when the standard logger is at TRACE. The level check is
+// explicit rather than left to logrus's own filtering because logrus.WithError formats the
+// error eagerly: without the guard the cause would be rendered into a field on every
+// failure and then thrown away, which is both wasted work at 500 events a second and a
+// value sitting in a hook's reach.
+//
+// Parameters:
+//   - operation string: what was being attempted, for correlation with the bounded line.
+//   - cause error: the raw failure. A nil cause is a no-op.
+func logDatabaseDiagnostic(operation string, cause error) {
+	if cause == nil || !logrus.IsLevelEnabled(logrus.TraceLevel) {
+		return
+	}
+
+	// THE RAW CAUSE IS ATTACHED VERBATIM HERE, and only here. This sink exists precisely so
+	// the driver's or client's own text is reachable when an operator asks for it explicitly,
+	// which is why it is gated on the trace level and why it does NOT go through the
+	// redacting helper every other site uses — redacting the one place the full text is
+	// supposed to be available would leave it available nowhere.
+	logrus.WithField("operation", operation).WithField(logrus.ErrorKey, cause).Trace(
+		"database diagnostic: the driver's own error text, which may name schema objects, " +
+			"constraints and broker or host addresses and is therefore emitted at trace only",
+	)
+}
+
+// failDatabaseSpan marks a span failed with a bounded class instead of recording the raw error.
+//
+// span.RecordError is deliberately not used, for the reason DATA-02 documents: it writes the
+// error's own text as an exception.message attribute, and both the driver's text and an
+// apierror's interpolated details leave the deployment on a span.
+//
+// The SQLSTATE is set as an attribute rather than folded into the status description so that
+// a trace backend can facet on it. A nil error is a no-op, so a caller may route both
+// outcomes through one call.
+//
+// Parameters:
+//   - span trace.Span: the span to mark. A nil or non-recording span is tolerated.
+//   - cause error: the failure. May be nil.
+func failDatabaseSpan(span trace.Span, cause error) {
+	if span == nil || cause == nil {
+		return
+	}
+
+	class := databaseErrorClass(cause)
+	span.SetAttributes(
+		attribute.String("db.error_class", class),
+		attribute.String("db.sqlstate", postgresSQLState(cause)),
+	)
+	span.SetStatus(codes.Error, class)
+}
+
+// loggedDatabaseError logs a driver-origin failure as a bounded class and returns a typed API
+// error that carries NO details.
+//
+// It is the only way an event repository should report a database failure to a caller. The
+// alternative — passing the driver error as details — is the DATA-01 disclosure, and it is
+// easy to reintroduce because it reads like helpfulness.
+//
+// The error is constructed directly rather than through apierror.NewAPIError so that the
+// logging here, which carries the operation, the class and the SQLSTATE, is the only log line
+// for the failure rather than a second one alongside a details-only entry.
+//
+// Parameters:
+//   - code apierror.ErrorCode: the typed code the caller receives. Normalised.
+//   - message string: the caller-facing message. Must not interpolate the cause.
+//   - operation string: what was being attempted, for the log field. A fixed literal.
+//   - cause error: the driver error. Classified, never rendered; the text itself goes only to
+//     the trace-level diagnostic sink.
+//
+// Returns:
+//   - error: an apierror.APIError value, so errors.As continues to work at every call site.
+func loggedDatabaseError(code apierror.ErrorCode, message, operation string, cause error) error {
+	logrus.WithFields(logrus.Fields{
+		"operation":   operation,
+		"error_class": databaseErrorClass(cause),
+		"sqlstate":    postgresSQLState(cause),
+		"code":        string(code),
+	}).Error(message)
+	logDatabaseDiagnostic(operation, cause)
+
+	// The code is carried through UNNORMALIZED, exactly as apierror.NewAPIError does.
+	// Normalizing here would quietly rewrite INTERNAL_SERVER_ERROR to GEN_INTERNAL on
+	// every repository error, changing the code clients receive — a wire-contract change
+	// smuggled in by a logging helper. Whether the legacy codes should be normalized is a
+	// real question, and it belongs to the API layer that owns the mapping, not to this.
+	return apierror.APIError{Code: code, Message: message}
+}
+
+// claimEventsOwedDeadLetterQuery claims rows whose retry budget is spent and whose
+// dead-letter write has NOT been recorded, taking a lease and stamping a fresh claim
+// token WITHOUT changing their status.
+//
+// It is a package-level constant so tests can assert that FOR UPDATE SKIP LOCKED, the
+// occurred_at ordering, the untouched status and the dlt_topic IS NULL restriction are
+// all still present.
+//
+// # The set, and why it must be reachable at all
+//
+// MarkEventFailed's exhaustion arm records 'failed' and RETAINS the claim token so the
+// worker that spent the last attempt is the only one permitted to write the event to its
+// `<topic>.dlt` sibling. When that write — or the MarkEventDeadLettered that records it —
+// fails, the row is left failed with no dlt_topic, and at that point it was reachable by
+// nothing at all: the main claim excludes it twice over (wrong status, no budget) and
+// ClaimEventForReplay accepts only dead_lettered. This table is the ONLY copy of that
+// event — the retention purge deliberately refuses to delete a failed row for exactly this
+// reason — so an operator's only recourse was a hand-written UPDATE.
+//
+// 'processing' is included alongside 'failed' because a relay can die between this claim
+// and the dead-letter record; such a row is recovered by the same predicate once its lease
+// expires. dlt_topic IS NULL is what makes the set SELF-CLEARING: recording the
+// dead-letter takes the row out of it permanently.
+//
+// # Why the status is deliberately NOT changed
+//
+// Moving the row to 'processing' would put it back into the main claim's blocking set, so
+// a row whose dead-letter topic was unreachable would stall every later event of its
+// aggregate for as long as the outage lasted. Leaving it failed keeps the trade the main
+// claim's anti-join documents: an event that can never reach the main topic must not hold
+// its key back. MarkEventDeadLettered accepts 'failed' as a prior state precisely so this
+// works.
+//
+// # next_attempt_at is the retry pacing
+//
+// MarkEventFailed's exhaustion arm schedules it exactly as its retry arm does, so a
+// dead-letter topic that is unreachable is retried on the same bounded backoff the publish
+// attempts used rather than once per poll interval per stranded row.
+// MATERIALIZED for the reason given on claimPendingEventOutboxQuery.
+const claimEventsOwedDeadLetterQuery = `
+		WITH candidates AS MATERIALIZED (
+			SELECT candidate.id FROM blnk.event_outbox candidate
+			WHERE candidate.status IN ('failed', 'processing')
+			  AND candidate.dlt_topic IS NULL
+			  AND candidate.attempts >= candidate.max_attempts
+			  AND (candidate.locked_until IS NULL OR candidate.locked_until < NOW())
+			  AND candidate.next_attempt_at <= NOW()
+			ORDER BY candidate.next_attempt_at ASC, candidate.occurred_at ASC, candidate.id ASC
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		),
+		claimed AS (
+			UPDATE blnk.event_outbox
+			SET locked_until = NOW() + $1::interval,
+				claim_token = $2,
+				last_attempted_at = NOW()
+			WHERE id IN (SELECT id FROM candidates)
+			RETURNING ` + eventOutboxColumns + `
+		)
+		SELECT * FROM claimed ORDER BY occurred_at ASC, id ASC
+	`
+
+// ClaimEventsOwedDeadLetter claims events whose retry budget is spent and whose
+// dead-letter write is still owed, so the hand-off can be retried instead of the event
+// being stranded in the only table that holds it.
+//
+// In a healthy system this returns nothing: the hand-off happens in the same batch as the
+// attempt that exhausted the budget. It matters when the dead-letter topic is unreachable,
+// when the broker rejects the write, or when the relay dies between the write and the
+// record — and in every one of those cases the alternative is an event that exists nowhere
+// else and can be neither published, replayed nor purged.
+//
+// The returned rows carry a FRESH claim token, which is what authorises
+// MarkEventDeadLettered, and their attempt count still shows the budget spent, which is
+// how a caller knows to retry the hand-off rather than the publish.
+//
+// Parameters:
+//   - ctx context.Context: cancels the claim.
+//   - batchSize int: how many rows to claim. Non-positive is rejected, because a zero LIMIT
+//     claims nothing and returns no error, which is indistinguishable from "nothing is owed".
+//   - lockDuration time.Duration: the lease. Non-positive is normalised to
+//     defaultEventClaimLease, since an expired-on-arrival lease lets two relays write the
+//     same event to the dead-letter topic.
+//
+// Returns:
+//   - []model.EventOutbox: the claimed rows, oldest occurrence first.
+//   - error: a validation error for a non-positive batch, or a wrapped driver error.
+func (d Datasource) ClaimEventsOwedDeadLetter(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ClaimEventsOwedDeadLetter")
+	defer span.End()
+
+	if batchSize <= 0 {
+		err := apierror.NewAPIError(apierror.ErrBadRequest, "Dead-letter hand-off claim batch size must be greater than zero", nil)
+		failDatabaseSpan(span, err)
+		return nil, err
+	}
+
+	if lockDuration <= 0 {
+		logrus.WithField("requested_lock_duration", lockDuration.String()).
+			Warnf("Non-positive dead-letter hand-off lock duration; falling back to %s", defaultEventClaimLease)
+		lockDuration = defaultEventClaimLease
+	}
+
+	claimToken := uuid.NewString()
+
+	span.SetAttributes(
+		attribute.Int("event_outbox.batch_size", batchSize),
+		attribute.String("event_outbox.lock_duration", lockDuration.String()),
+	)
+
+	rows, err := d.Conn.QueryContext(ctx, claimEventsOwedDeadLetterQuery,
+		lockDuration.String(), claimToken, batchSize)
+	if err != nil {
+		failDatabaseSpan(span, err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to claim events owed a dead-letter write", "claim_events_owed_dead_letter", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logrus.Errorf("Error closing rows: %v", closeErr)
+		}
+	}()
+
+	var entries []model.EventOutbox
+	for rows.Next() {
+		entry, scanErr := scanEventOutbox(rows)
+		if scanErr != nil {
+			failDatabaseSpan(span, scanErr)
+			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event outbox entry", "claim_events_owed_dead_letter", scanErr)
+		}
+		entries = append(entries, entry)
+	}
+
+	if err = rows.Err(); err != nil {
+		failDatabaseSpan(span, err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event outbox entries", "claim_events_owed_dead_letter", err)
+	}
+
+	span.SetAttributes(attribute.Int("event_outbox.claimed_count", len(entries)))
+	return entries, nil
+}
+
+// deadLetterInventoryPredicate builds the WHERE clause shared by the dead-letter listing
+// and its count, and appends the values it binds.
+//
+// # One builder, because two would be a defect waiting to happen
+//
+// The listing and the count MUST select exactly the same set. If they can disagree, an
+// operator pages through entries while the total tells them a different number exists,
+// and neither figure can be trusted — the sort of discrepancy that is discovered during
+// an incident, at the worst possible moment. Deriving both clauses from one function makes
+// disagreement unrepresentable rather than merely unlikely: a filter added here is added
+// to both queries at once, and a filter cannot be added to one alone.
+//
+// Both terminal failure states are always included. A row becomes failed the moment its
+// retry budget is spent, and dead_lettered only once the event has additionally reached
+// its `<topic>.dlt` sibling, so restricting to the latter would hide the events whose
+// dead-letter write itself failed — the ones with no copy anywhere but the outbox row, and
+// therefore the ones most in need of attention. The status filter narrows WITHIN those two
+// rather than escaping them, so no filter value can reach a pending or dispatched row.
+//
+// Every value is bound. The only string formatting is placeholder NUMBERING, derived from
+// the length of the argument slice, so a filter's value can never become part of the
+// statement text.
+//
+// Parameters:
+//   - query model.DeadLetterQuery: the requested narrowing. Blank filters are skipped, so
+//     the zero value yields the unfiltered inventory.
+//   - args []interface{}: the argument slice to append to, normally empty.
+//
+// Returns:
+//   - string: the WHERE clause, including the leading "WHERE".
+//   - []interface{}: args with the bound filter values appended, in placeholder order.
+func deadLetterInventoryPredicate(
+	query model.DeadLetterQuery,
+	args []interface{},
+) (string, []interface{}) {
+	var clause strings.Builder
+
+	args = append(args, model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed)
+	clause.WriteString(fmt.Sprintf("WHERE status IN ($%d, $%d)", len(args)-1, len(args)))
+
+	if query.Status != "" {
+		args = append(args, query.Status)
+		clause.WriteString(fmt.Sprintf(" AND status = $%d", len(args)))
+	}
+	if query.EventType != "" {
+		args = append(args, query.EventType)
+		clause.WriteString(fmt.Sprintf(" AND event_type = $%d", len(args)))
+	}
+	if query.Topic != "" {
+		// The ORIGINAL category topic, compared against the stored column. That
+		// comparison is exact rather than a best effort: topic is NOT NULL and carries
+		// CHECK (btrim(topic) <> ''), so no stored row can hold a blank the service
+		// would have to substitute an event-type derivation for.
+		args = append(args, query.Topic)
+		clause.WriteString(fmt.Sprintf(" AND topic = $%d", len(args)))
+	}
+
+	// THE SAME OCCURRENCE WINDOW THE LISTING APPLIES. A count drawn from a narrowing the page
+	// was not is worse than no count at all: a paging client comparing the two would never
+	// terminate, so the window is applied here or in neither place.
+	if !query.OccurredFrom.IsZero() {
+		args = append(args, query.OccurredFrom.UTC())
+		clause.WriteString(fmt.Sprintf(" AND occurred_at >= $%d", len(args)))
+	}
+
+	if !query.OccurredTo.IsZero() {
+		args = append(args, query.OccurredTo.UTC())
+		clause.WriteString(fmt.Sprintf(" AND occurred_at <= $%d", len(args)))
+	}
+
+	// THE SAME RESOLUTION NARROWING THE LISTING APPLIES, for the same reason the window is
+	// applied here: a count drawn from a narrowing the page was not is worse than no count at
+	// all.
+	if query.UnresolvedOnly {
+		clause.WriteString(" AND resolved_at IS NULL")
+	}
+
+	if query.ResolvedOnly {
+		clause.WriteString(" AND resolved_at IS NOT NULL")
+	}
+
+	return clause.String(), args
+}
+
+// normalizeDeadLetterPage WAS RETIRED HERE. Both dead-letter listings clamp their own limit
+// against defaultDeadLetterPageSize and maxDeadLetterPageSize inline, and the inventory listing
+// pages by CURSOR rather than by offset — so there is no offset left for a shared normaliser to
+// correct, and a helper that still normalised one would imply otherwise.
+// CountDeadLetterInventory counts the entries a listing query matches, ignoring its page.
+//
+// # Why a filter-aware count had to exist
+//
+// The total accompanying a page used to come from the per-status aggregate, which can only
+// answer for a status: with an event-type or topic filter set there was no way to count the
+// matching set, so the endpoint REFUSED to provide a total for exactly the narrowed
+// listings an operator pages through. That is the wrong trade in a triage tool — the whole
+// reason to narrow is to work through a specific backlog, and working through it without
+// knowing its size means never knowing whether you are near the end.
+//
+// It shares deadLetterInventoryPredicate with the listing, so the count is a count OF THE
+// LISTING rather than an independent query that resembles it. The page is deliberately not
+// applied: LIMIT and OFFSET select which matches to return and have no bearing on how many
+// there are.
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - query model.DeadLetterQuery: the narrowing. Limit and Offset are ignored.
+//
+// Returns:
+//   - int64: how many entries match. Zero is a valid, successful answer.
+//   - error: the repository's typed error.
+func (d Datasource) CountDeadLetterInventory(
+	ctx context.Context,
+	query model.DeadLetterQuery,
+) (int64, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CountDeadLetterInventory")
+	defer span.End()
+
+	span.SetAttributes(attribute.Bool("event_outbox.filtered", query.HasFilters()))
+
+	where, args := deadLetterInventoryPredicate(query, make([]interface{}, 0, 5))
+
+	var total int64
+	err := d.Conn.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM blnk.event_outbox
+		`+where, args...).Scan(&total)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return 0, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to count the dead-letter inventory", "count_dead_letter_inventory", err)
+	}
+
+	span.SetAttributes(attribute.Int64("event_outbox.dead_letter_total", total))
+
+	return total, nil
+}
+
+// expectedEventTopicPrefix (singular) WAS RETIRED HERE. It resolved the one namespace this
+// deployment owns, and the question it answered has since split in two:
+//
+//   - expectedEventTopicPrefixes returns EVERY namespace this deployment owns, including the
+//     historical ones a renamed prefix leaves behind, and validateEventOutboxEntry admits a
+//     stored topic under any of them. A stored row written before the rename must still be
+//     publishable, or renaming the prefix strands the outbox.
+//   - configuredEventTopicPrefix returns only the CURRENT one, for the questions where a
+//     historical namespace is the wrong answer: which topics a subscriber may be granted, and
+//     which topics are provisioned into. A historical namespace is something to drain.
+//
+// Keeping the singular form beside them left a third answer to the same question, and it was the
+// one that could not tell those two cases apart.
 // AuditTerminalEventRecords reports how many rows claim a Kafka record and how many of those
 // name the record they produced.
 //
@@ -3330,11 +4778,14 @@ func (d Datasource) CountEventOutboxByStatus(ctx context.Context) (map[string]in
 // Returns:
 //   - model.EventOutboxAudit: the counts and the instant they were read.
 //   - error: a logged internal error.
-func (d Datasource) AuditTerminalEventRecords(ctx context.Context) (model.EventOutboxAudit, error) {
+func (d Datasource) AuditTerminalEventRecords(ctx context.Context, since time.Time) (model.EventOutboxAudit, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "AuditTerminalEventRecords")
 	defer span.End()
 
-	audit := model.EventOutboxAudit{MeasuredAt: time.Now().UTC()}
+	since = normalizeEventCountWindow(since)
+	span.SetAttributes(attribute.String("event_outbox.window_start", since.Format(time.RFC3339)))
+
+	audit := model.EventOutboxAudit{MeasuredAt: time.Now().UTC(), WindowStart: since}
 
 	// THE FILTER ON THE DISTINCT COUNT IS REQUIRED, not defensive.
 	//
@@ -3351,19 +4802,12 @@ func (d Datasource) AuditTerminalEventRecords(ctx context.Context) (model.EventO
 	// difference and had to clamp a negative it should never have been able to see. The
 	// documented contract — DistinctRecords equals ConfirmedRows unless two rows name the same
 	// record — is only true with the filter in place.
-	err := d.Conn.QueryRowContext(ctx, `
-		SELECT
-			COUNT(*)            AS published_rows,
-			COUNT(kafka_offset) AS confirmed_rows,
-			COUNT(DISTINCT (kafka_topic, kafka_partition, kafka_offset))
-				FILTER (WHERE kafka_offset IS NOT NULL) AS distinct_records
-		FROM blnk.event_outbox
-		WHERE kafka_dispatched_at IS NOT NULL OR status = $1
-	`, model.EventOutboxStatusDeadLettered).Scan(
+	err := d.Conn.QueryRowContext(ctx, auditTerminalEventRecordsQuery,
+		model.EventOutboxStatusDeadLettered, since).Scan(
 		&audit.PublishedRows, &audit.ConfirmedRows, &audit.DistinctRecords,
 	)
 	if err != nil {
-		span.RecordError(err)
+		failDatabaseSpan(span, err)
 
 		return model.EventOutboxAudit{}, loggedDatabaseError(apierror.ErrInternalServer,
 			"Failed to audit the broker records of published event outbox entries",
@@ -3379,77 +4823,616 @@ func (d Datasource) AuditTerminalEventRecords(ctx context.Context) (model.EventO
 	return audit, nil
 }
 
-// ---------------------------------------------------------------------------------------
-// DATA-01: driver errors must not become API response bodies
+// eventIdentifierHashLength WAS RETIRED HERE, in favour of model.LogIdentifierHashLength.
 //
-// apierror.APIError carries its cause in an interface{} Details field that is serialised into
-// the response. lib/pq's *pq.Error is a STRUCT WITH EXPORTED FIELDS — Severity, Code, Message,
-// Detail, Hint, Schema, Table, Column, Constraint, File, Line, Routine — so passing one as
-// Details published the schema name, the table, the column, the violated constraint and even
-// the PostgreSQL source file and function that raised it, to whoever called the endpoint. That
-// is a map of the database handed out one failed request at a time.
+// The hashing moved into the model package precisely so that every layer that puts a derived
+// identifier in a log line produces the SAME token for the same input — the repository, the
+// service and the API all hash tenant-derived identifiers before logging them, and two copies of
+// the length would let one layer emit sixteen characters and another twelve for one subscriber,
+// which makes the two log lines impossible to correlate and defeats the reason for hashing.
+// scanDeadLetterInventoryEntry decodes one narrow inventory row.
 //
-// Both event repositories therefore route every driver-origin failure through the helpers
-// below: the full error is LOGGED, with its SQLSTATE, and the API error carries a code and a
-// message and NO details at all. Details is `omitempty`, so it simply does not appear.
-//
-// Nothing is lost by that. The operator gets more than before — a structured log line naming
-// the operation and the SQLSTATE class — while the caller gets what a caller can act on, which
-// is the typed code. The two audiences were previously served by one field, and it was the
-// wrong field for one of them.
-// ---------------------------------------------------------------------------------------
-
-// postgresSQLState extracts the five-character SQLSTATE from a driver error.
-//
-// It is a bounded, non-revealing value — a standardised error class such as "23505", not a
-// message — which makes it safe to put in a log field and useful for grouping failures. It
-// returns "unknown" for anything that is not a *pq.Error, including a wrapped one, so a log
-// line always has the field.
+// It is separate from scanEventOutbox because the projections differ and sharing one scanner
+// between them would mean either reading columns the listing does not select or silently
+// leaving fields zero — the second of which is how a listing starts reporting "this event had
+// no partition key" for every row.
 //
 // Parameters:
-//   - err error: the error to inspect. May be nil or wrapped.
+//   - s eventOutboxScanner: *sql.Rows or *sql.Row.
 //
 // Returns:
-//   - string: the SQLSTATE, or "unknown".
-func postgresSQLState(err error) string {
-	var pqErr *pq.Error
-	if errors.As(err, &pqErr) {
-		return string(pqErr.Code)
+//   - model.DeadLetterInventoryEntry: the decoded entry.
+//   - error: the driver's scan error, unwrapped, so the caller can classify it.
+func scanDeadLetterInventoryEntry(s eventOutboxScanner) (model.DeadLetterInventoryEntry, error) {
+	var entry model.DeadLetterInventoryEntry
+	var ledgerID, lastError, dltTopic sql.NullString
+	var firstAttemptedAt, lastAttemptedAt sql.NullTime
+	var failureMetadata []byte
+	var payloadBytes sql.NullInt64
+
+	if err := s.Scan(
+		&entry.ID,
+		&entry.EventID,
+		&entry.EventType,
+		&entry.AggregateID,
+		&entry.PartitionKey,
+		&ledgerID,
+		&entry.Topic,
+		&entry.SchemaVersion,
+		&entry.OccurredAt,
+		&entry.Status,
+		&entry.Attempts,
+		&lastError,
+		&firstAttemptedAt,
+		&lastAttemptedAt,
+		&dltTopic,
+		&failureMetadata,
+		&payloadBytes,
+	); err != nil {
+		return model.DeadLetterInventoryEntry{}, err
 	}
 
-	return "unknown"
+	entry.LedgerID = ledgerID.String
+	entry.LastError = lastError.String
+	entry.DLTTopic = dltTopic.String
+	entry.PayloadBytes = int(payloadBytes.Int64)
+
+	if firstAttemptedAt.Valid {
+		instant := firstAttemptedAt.Time
+		entry.FirstAttemptedAt = &instant
+	}
+	if lastAttemptedAt.Valid {
+		instant := lastAttemptedAt.Time
+		entry.LastAttemptedAt = &instant
+	}
+
+	// Assigned only when present, so SQL NULL stays a nil RawMessage rather than becoming
+	// the four bytes "null" — which a reader would then decode into a zero-valued record and
+	// report as metadata that was captured and happened to be empty.
+	if len(failureMetadata) > 0 {
+		entry.FailureMetadata = append(json.RawMessage(nil), failureMetadata...)
+	}
+
+	return entry, nil
 }
 
-// loggedDatabaseError logs a driver-origin failure in full and returns a typed API error that
-// carries NO details.
+// oldestDeadLetterAgeByTopicQuery reports the oldest outstanding entry per dead-letter topic
+// as ONE grouped aggregate.
 //
-// It is the only way an event repository should report a database failure to a caller. The
-// alternative — passing the driver error as details — is the DATA-01 disclosure, and it is
-// easy to reintroduce because it reads like helpfulness.
+// # PERF-P07: what this replaced
 //
-// The error is constructed directly rather than through apierror.NewAPIError so that the
-// logging here, which carries the operation and the SQLSTATE, is the only log line for the
-// failure rather than a second one alongside a details-only entry.
+// The age gauge used to COUNT the whole inventory, compute a tail offset from that count, and
+// then read up to 5,000 WHOLE rows — bodies included — from that deep offset, every
+// collection interval, to find a minimum. Three compounding costs to compute one number per
+// topic, and it was not even exact: past its scan cap it reported a lower bound and warned,
+// and an alert on a lower bound cannot fire when the true age crosses the threshold and the
+// bound does not.
+//
+// This reads the partial index that already covers the two terminal failure states, groups by
+// the dead-letter topic and takes MIN of the age instant. No row is fetched, the answer is
+// exact, and the cost is set by the number of topics rather than by the size of the backlog —
+// which is what matters, because the backlog is largest exactly when the gauge matters most.
+//
+// # The age instant, and why it is a COALESCE
+//
+// A dead_lettered row's age runs from when it reached its `<topic>.dlt` sibling, which is the
+// hand-off instant recorded as last_attempted_at. A row still AWAITING its dead-letter write
+// has no such instant and its age must run from something — otherwise the rows most in need
+// of attention would report no age at all — so it falls back to when the event occurred.
+//
+// The topic is likewise a COALESCE: a row that has been preserved names its dlt_topic, and a
+// row that has not is grouped under the `.dlt` sibling of the topic it was headed for, so
+// both appear on the series an operator alerts on rather than one of them silently missing.
+const oldestDeadLetterAgeByTopicQuery = `
+		SELECT
+			COALESCE(NULLIF(dlt_topic, ''), topic || $3) AS age_topic,
+			MIN(COALESCE(last_attempted_at, occurred_at)) AS oldest,
+			COUNT(*)                                     AS outstanding
+		FROM blnk.event_outbox
+		WHERE status IN ($1, $2)
+		  AND resolved_at IS NULL
+		GROUP BY age_topic
+	`
+
+// OldestDeadLetterAgeByTopic reports, per dead-letter topic, the age instant of the oldest
+// entry still outstanding and how many are outstanding there.
+//
+// It is what the dead-letter age gauge and the 15-minute alert are computed from, so it is
+// EXACT: no scan cap, no lower bound, no truncation warning to interpret.
 //
 // Parameters:
-//   - code apierror.ErrorCode: the typed code the caller receives. Normalised.
-//   - message string: the caller-facing message. Must not interpolate the cause.
-//   - operation string: what was being attempted, for the log field. A fixed literal.
-//   - cause error: the driver error. Logged in full; never returned.
+//   - ctx context.Context: cancels the aggregate.
+//   - deadLetterSuffix string: the `.dlt` suffix used to name the sibling topic of a row whose
+//     dead-letter write has not happened yet. Passed in rather than written here so the topic
+//     naming rules live in exactly one place.
 //
 // Returns:
-//   - error: an apierror.APIError value, so errors.As continues to work at every call site.
-func loggedDatabaseError(code apierror.ErrorCode, message, operation string, cause error) error {
-	logrus.WithError(cause).WithFields(logrus.Fields{
-		"operation": operation,
-		"sqlstate":  postgresSQLState(cause),
-		"code":      string(code),
-	}).Error(message)
+//   - []model.DeadLetterTopicAge: one entry per topic holding something, empty when nothing is
+//     outstanding — which is the healthy state and must be reported as a reading rather than
+//     as an absence.
+//   - error: a logged internal error.
+func (d Datasource) OldestDeadLetterAgeByTopic(
+	ctx context.Context,
+	deadLetterSuffix string,
+) ([]model.DeadLetterTopicAge, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "OldestDeadLetterAgeByTopic")
+	defer span.End()
 
-	// The code is carried through UNNORMALIZED, exactly as apierror.NewAPIError does.
-	// Normalizing here would quietly rewrite INTERNAL_SERVER_ERROR to GEN_INTERNAL on
-	// every repository error, changing the code clients receive — a wire-contract change
-	// smuggled in by a logging helper. Whether the legacy codes should be normalized is a
-	// real question, and it belongs to the API layer that owns the mapping, not to this.
-	return apierror.APIError{Code: code, Message: message}
+	rows, err := d.Conn.QueryContext(ctx, oldestDeadLetterAgeByTopicQuery,
+		model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed, deadLetterSuffix)
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to read the oldest dead-letter age per topic", "oldest_dead_letter_age_by_topic", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logrus.Errorf("Error closing rows: %v", closeErr)
+		}
+	}()
+
+	ages := make([]model.DeadLetterTopicAge, 0, len(model.AllEventCategories()))
+	for rows.Next() {
+		var age model.DeadLetterTopicAge
+		var oldest sql.NullTime
+
+		if scanErr := rows.Scan(&age.Topic, &oldest, &age.Outstanding); scanErr != nil {
+			failDatabaseSpan(span, scanErr)
+
+			return nil, loggedDatabaseError(apierror.ErrInternalServer,
+				"Failed to scan a dead-letter age row", "oldest_dead_letter_age_by_topic", scanErr)
+		}
+
+		// MIN over a group that exists cannot be NULL here, because the COALESCE in the
+		// query falls back to a NOT NULL column. Scanned through a nullable time all the
+		// same, so a future column change cannot turn a reading into a scan error.
+		if oldest.Valid {
+			age.Oldest = oldest.Time.UTC()
+		}
+
+		ages = append(ages, age)
+	}
+
+	if err = rows.Err(); err != nil {
+		failDatabaseSpan(span, err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Error iterating over dead-letter age rows", "oldest_dead_letter_age_by_topic", err)
+	}
+
+	span.SetAttributes(attribute.Int("event_outbox.dead_letter_topics", len(ages)))
+
+	return ages, nil
+}
+
+// countEventOutboxByStatusQuery counts every row that is NOT terminally delivered
+// exactly, and the terminally delivered rows only inside the caller's window.
+//
+// It is a package-level constant so a test can assert the two-armed shape, which is the
+// whole substance of the fix and is invisible from the method's behaviour on a small table.
+//
+// # PERF-P04: why the count is split rather than simply bounded
+//
+// It used to be one `GROUP BY status` over the whole table. At 500 events per second the
+// table grows by 43.2 million rows a day, so that aggregate is a sequential scan whose cost
+// rises for ever — and it sat behind an operator endpoint and a metrics collector that ran
+// it every fifteen seconds.
+//
+// Windowing the WHOLE count would have been cheap and wrong. The counts that matter
+// operationally are of rows that have NOT finished — the pending backlog, the rows in
+// flight, the dead-letter inventory — and any of those can be older than any window you
+// would pick. Under-reporting them is worse than an expensive query: a pending row stuck
+// for three days would vanish from a 24-hour reading of the backlog, and the gauge that
+// exists to show exactly that would report zero.
+//
+// So the split follows the cost, not the calendar. Every non-dispatched status is counted
+// exactly and completely, because that population is BOUNDED BY OPERATION — it is the
+// working set plus the dead-letter inventory, which acceptance criterion V-3 holds below
+// 0.1% of throughput — and a partial index on `status <> 'dispatched'` makes it an
+// index-only scan of just those rows. Only `dispatched`, the one unbounded population, is
+// restricted to the window, read through a partial index on its occurred_at.
+//
+// The result is a reading that hides nothing an operator acts on and stops growing with a
+// history nobody is asking about.
+const countEventOutboxByStatusQuery = `
+		SELECT status, COUNT(*) AS row_count
+		FROM blnk.event_outbox
+		WHERE status <> $1
+		GROUP BY status
+		UNION ALL
+		SELECT status, COUNT(*) AS row_count
+		FROM blnk.event_outbox
+		WHERE status = $1 AND occurred_at >= $2
+		GROUP BY status
+	`
+
+// defaultEventCountWindow is the window applied when a caller asks for none.
+//
+// One day, because that is the period the zero-loss reconciliation runbook reconciles over
+// and the period an operator asks "what happened today" about. It is a FALLBACK and not a
+// policy: every production caller passes its own window, and this exists so that a caller
+// which forgot to gets a bounded reading rather than a whole-table scan.
+const defaultEventCountWindow = 24 * time.Hour
+
+// normalizeEventCountWindow turns a caller's window start into a usable one.
+//
+// Two inputs are corrected rather than honoured, because both would defeat the bound this
+// parameter exists to impose:
+//
+//   - THE ZERO INSTANT would select the whole history — the very scan PERF-P04 removed —
+//     and it is what a caller that simply forgot the parameter passes.
+//   - A FUTURE INSTANT would select nothing, reporting an empty outbox on a busy one, which
+//     is worse than expensive: it reads as a healthy system.
+//
+// Both become defaultEventCountWindow before now. Correcting rather than failing is
+// deliberate: these readings feed a gauge and an operator endpoint, and refusing to answer
+// would take away the observability at the moment somebody is looking for it.
+//
+// Parameters:
+//   - since time.Time: the requested window start.
+//
+// Returns:
+//   - time.Time: a UTC instant in the past, never zero.
+func normalizeEventCountWindow(since time.Time) time.Time {
+	now := time.Now().UTC()
+	if since.IsZero() || since.After(now) {
+		return now.Add(-defaultEventCountWindow)
+	}
+
+	return since.UTC()
+}
+
+// auditTerminalEventRecordsQuery counts the rows inside the window that claim a broker
+// record, and how many of them name it.
+//
+// A package-level constant so a test can assert the windowed predicate and the FILTER, both
+// of which are load-bearing and neither of which is observable from the returned numbers on
+// a small table.
+//
+// # PERF-P05: the two arms of the window predicate
+//
+// A row's publication instant is kafka_dispatched_at, which is stamped when the broker
+// acknowledges the main-topic write — that is the instant the record it claims was written,
+// so it is the instant that has to fall inside the window for the row to be comparable
+// against records the broker wrote inside it. It is covered by
+// idx_event_outbox_published_audit, which INCLUDEs the whole coordinate, so this arm is an
+// index-only range scan.
+//
+// A DEAD-LETTERED row is the second arm because it has no kafka_dispatched_at: its record is
+// on the `<topic>.dlt` sibling and was written by the hand-off, whose instant the row
+// records as last_attempted_at. Excluding those rows would understate the outbox side and
+// manufacture an apparent surplus; using their occurrence instant instead would misplace
+// them in time by however long their retries ran.
+const auditTerminalEventRecordsQuery = `
+		SELECT
+			COUNT(*)            AS published_rows,
+			COUNT(kafka_offset) AS confirmed_rows,
+			COUNT(DISTINCT (kafka_topic, kafka_partition, kafka_offset))
+				FILTER (WHERE kafka_offset IS NOT NULL) AS distinct_records
+		FROM blnk.event_outbox
+		WHERE kafka_dispatched_at >= $2
+		   OR (status = $1 AND last_attempted_at >= $2)
+	`
+
+// listDeadLetterInventoryQuery pages the dead-letter inventory with every predicate applied
+// in SQL and the page bounded by a KEYSET rather than an offset.
+//
+// A package-level constant so a test can assert the keyset predicate, the SQL-side filters
+// and the ordering, none of which is observable from the rows a small fixture returns.
+//
+// # PERF-P08: the keyset, and what it replaced
+//
+// `ORDER BY occurred_at DESC, id DESC OFFSET $n` makes a page's cost proportional to its
+// DEPTH: PostgreSQL reads and discards every row before the offset. The depth was supplied
+// by the caller and bounded by nothing, so one request could walk an arbitrary prefix of a
+// table growing by 43.2 million rows a day. The keyset predicate below — strictly older than
+// the cursor's instant, or the same instant with a lower id — is a range scan from the index
+// entry the cursor names, so EVERY page costs the same as the first.
+//
+// It is also correct under concurrent writes, which the offset never was: rows inserted while
+// a caller pages shift every later offset, so an offset-paged client silently repeats and
+// skips rows. A cursor names a POSITION, and positions do not move.
+//
+// # The filters
+//
+// event_type and topic compare exactly; status narrows to one of the two terminal failure
+// states, and its absence admits BOTH — a row that spent its retries but whose dead-letter
+// write also failed is the one an operator most needs to see, and listing only dead_lettered
+// would hide precisely those. Each predicate is written as `($n = ” OR column = $n)` so one
+// statement serves every combination: a second, filter-aware statement would be a second
+// thing to keep correct, and the planner discards the constant-false half of an unused arm.
+//
+// LIMIT is bound as limit+1 by the caller, which is how "is there another page" is answered
+// without a count: the extra row is read, not returned, and its presence is the answer.
+// deadLetterInventoryColumns is the NARROW projection the dead-letter inventory reads.
+//
+// # PERF-P06: what is missing from it, and why that is the whole point
+//
+// Neither payload_raw nor event_raw appears here. Both are the event's body — up to 768 KiB
+// each, and the same bytes twice over — and the listing shows neither: it reports the body's
+// SIZE, which octet_length computes inside PostgreSQL so the bytes never cross the wire at
+// all. Reading whole rows to build a listing of at most a few hundred small items moved
+// gibibytes to answer a question about kilobytes, and a filtered request moved that much
+// again for every page it walked looking for matches.
+//
+// octet_length is measured on payload_raw, the BYTEA column, and not on the JSONB one: the
+// JSONB column holds PostgreSQL's normalised re-rendering of the producer's bytes, so its
+// length is a different number from the one that was published.
+//
+// failure_metadata stays, because it is five fields and the API projection fills gaps in the
+// row's own columns from it. last_error stays because the projection CLASSIFIES it; nothing
+// publishes it verbatim.
+const deadLetterInventoryColumns = `id, event_id, event_type, aggregate_id, partition_key, ledger_id, topic, ` +
+	`schema_version, occurred_at, status, attempts, last_error, first_attempted_at, last_attempted_at, ` +
+	`dlt_topic, failure_metadata, octet_length(payload_raw) AS payload_bytes`
+
+const listDeadLetterInventoryQuery = `
+		SELECT ` + deadLetterInventoryColumns + `
+		FROM blnk.event_outbox
+		WHERE status IN ($1, $2)
+		  AND ($3 = '' OR status = $3)
+		  AND ($4 = '' OR event_type = $4)
+		  AND ($5 = '' OR topic = $5)
+		  AND ($6::timestamptz IS NULL OR (occurred_at, id) < ($6::timestamptz, $7::bigint))
+		  AND ($8::timestamptz IS NULL OR occurred_at >= $8::timestamptz)
+		  AND ($9::timestamptz IS NULL OR occurred_at <= $9::timestamptz)
+		  AND (NOT $10::boolean OR resolved_at IS NULL)
+		  AND (NOT $11::boolean OR resolved_at IS NOT NULL)
+		ORDER BY occurred_at DESC, id DESC
+		LIMIT $12
+	`
+
+// MarkEventDeadLetterResolved records that an operator has accounted for a
+// dead-lettered event, which is what makes the row eligible for retention.
+//
+// # SEC-08: this transition is the whole retention gate
+//
+// Without it the purge selected on status alone and deleted dead-lettered rows on an
+// age timer — destroying, unrecoverably, the only record that a ledger event went
+// undelivered together with the failure metadata explaining why. Resolution is an
+// operator DECISION about a row already in its final delivery state, so it is recorded
+// as its own fact rather than as a new status: the dead_lettered literal is what the
+// zero-loss reconciliation counts, what the published-audit index selects on, and what
+// a replay requires, and none of those may change because someone closed a ticket.
+//
+// # It is a conditional write, and the condition is the contract
+//
+// The UPDATE requires status = dead_lettered AND resolved_at IS NULL, so:
+//
+//   - a row that never reached its `<topic>.dlt` sibling (failed, dlt_topic NULL) is
+//     REFUSED. Its dead-letter write is still owed and the outbox row is the only copy
+//     of the event in existence, so "dealt with" cannot be true of it yet.
+//   - a row already resolved is REFUSED rather than silently re-stamped, because the
+//     recorded instant and note are an audit trail and the second caller's account of
+//     why would overwrite the first's.
+//   - a row mid-replay is refused for the duration of the replay, which is correct:
+//     the outcome of that publish is not yet known.
+//
+// The distinction between the three refusals is returned as a typed code so a script
+// can tell "already done" from "not eligible" without parsing prose.
+//
+// Parameters:
+//   - ctx context.Context: cancels the write.
+//   - eventID string: the business event_id UUID, as the route carries it.
+//   - note string: the operator's account of why no further action is owed. Optional;
+//     stored only when non-empty, and bounded by the service before it arrives here.
+//   - at time.Time: the resolution instant. Required, and supplied by the caller so a
+//     test can pin it and so the value matches what the response reports.
+//
+// Returns:
+//   - *model.EventOutbox: the row as it now stands, so a caller can report the
+//     resolution it recorded rather than the one it asked for.
+//   - error: ErrNotFound when no such event; ErrEventAlreadyResolved when it is already
+//     resolved; ErrEventNotDeadLettered when it has no dead-letter record to resolve; a
+//     typed internal error otherwise.
+func (d Datasource) MarkEventDeadLetterResolved(
+	ctx context.Context,
+	eventID string,
+	note string,
+	at time.Time,
+) (*model.EventOutbox, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkEventDeadLetterResolved")
+	defer span.End()
+	span.SetAttributes(attribute.String("event_outbox.event_id", eventID))
+
+	if at.IsZero() {
+		err := apierror.NewAPIError(apierror.ErrBadRequest, "A dead-letter resolution instant is required", nil)
+		failDatabaseSpan(span, err)
+		return nil, err
+	}
+
+	// A blank note is stored as NULL rather than as an empty string, so
+	// event_outbox_resolution_pair_chk reads the pair the way the column comments
+	// describe and a projection can use omitempty without ambiguity.
+	var storedNote interface{}
+	if trimmed := strings.TrimSpace(note); trimmed != "" {
+		storedNote = trimmed
+	}
+
+	row := d.Conn.QueryRowContext(ctx, `
+		UPDATE blnk.event_outbox
+		SET resolved_at = $2,
+		    resolution_note = $3
+		WHERE event_id = $1
+		  AND status = $4
+		  AND resolved_at IS NULL
+		RETURNING `+eventOutboxColumns, eventID, at.UTC(), storedNote, model.EventOutboxStatusDeadLettered)
+
+	entry, err := scanEventOutbox(row)
+	if err == nil {
+		span.SetAttributes(attribute.Bool("event_outbox.resolved", true))
+		return &entry, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		failDatabaseSpan(span, err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to resolve dead-lettered event", "mark_event_dead_letter_resolved", err)
+	}
+
+	// The conditional write matched nothing, and WHICH condition failed is what the
+	// caller has to be told. One read answers it, and reading after the attempt rather
+	// than before it is deliberate: a check-then-write would report a state the write
+	// then contradicted.
+	current, readErr := d.GetEventByID(ctx, eventID)
+	if readErr != nil {
+		// Includes the not-found case, already typed by GetEventByID.
+		return nil, readErr
+	}
+
+	if current.IsResolvedDeadLetter() {
+		return nil, apierror.NewAPIError(
+			apierror.ErrEventAlreadyResolved,
+			"This dead-lettered event has already been resolved",
+			fmt.Errorf("blnk: event %s was resolved at %s", eventID, current.ResolvedAt.UTC().Format(time.RFC3339)),
+		)
+	}
+
+	return nil, apierror.NewAPIError(
+		apierror.ErrEventNotDeadLettered,
+		"Only a dead-lettered event can be resolved; this event has no dead-letter record",
+		fmt.Errorf("blnk: event %s is %s, not %s", eventID, current.Status, model.EventOutboxStatusDeadLettered),
+	)
+}
+
+// withLoggableCause attaches a driver or dependency error to a log entry in the two renderings
+// an operator needs, and it is the ONLY way the event repositories should put an error into a
+// line.
+//
+// The "cause" field is redacted — network topology and secret values removed, control
+// characters stripped, length bounded — and is what a deployment writes at info, warn and
+// error. The "cause_verbatim" field carries the unredacted text and is attached ONLY when the
+// standard logger is at debug, which is the restricted sink.
+//
+// It is the counterpart of the identically named helpers in package blnk and package api, and
+// all three delegate to internal/logsafe, so one failure travelling up through the repository,
+// the service and the handler is redacted and bounded identically at every layer. Using
+// logrus.WithError instead is the defect this replaces: a pq error routinely renders with the
+// host it dialled, and a wrapped configuration error can quote the DSN outright.
+//
+// Parameters:
+//   - entry *logrus.Entry: the entry to extend. A nil entry is treated as a fresh one.
+//   - err error: the error to attach. A nil error leaves the entry untouched.
+//
+// Returns:
+//   - *logrus.Entry: the entry with the cause fields attached.
+func withLoggableCause(entry *logrus.Entry, err error) *logrus.Entry {
+	if entry == nil {
+		entry = logrus.NewEntry(logrus.StandardLogger())
+	}
+
+	if err == nil {
+		return entry
+	}
+
+	entry = entry.WithField("cause", logsafe.Cause(err))
+
+	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+		entry = entry.WithField("cause_verbatim", logsafe.CauseVerbatim(err))
+	}
+
+	return entry
+}
+
+// ListDeadLetteredEvents pages the dead-letter inventory behind the dead-letter
+// API.
+//
+// Both terminal failure states are included. A row becomes failed the moment its
+// retry budget is spent and dead_lettered only once the event has additionally been
+// written to its `<topic>.dlt` sibling; listing only the latter would hide events
+// that exhausted their retries but whose dead-letter publication itself failed —
+// exactly the events an operator most needs to see. The partial index on
+// (status, occurred_at) covers both literals for this reason.
+//
+// Ordering is by occurred_at descending, newest first, because triage starts from
+// the most recent failures; id descending breaks ties so paging cannot show or skip
+// a row twice when several share an instant. limit is defaulted and capped, and a
+// negative offset is clamped to zero, so a malformed page request degrades to a
+// sane one instead of scanning the table or failing.
+// ExistingEventIDs returns the subset of the supplied event ids that already have a row.
+//
+// # What it is for
+//
+// The post-commit path uses it to decide whether an event is still owed. The batch writer
+// captures a coalesced batch's events inside the mutation, and the frozen file that calls the
+// writer and then the post-commit work cannot pass that fact along, so the post-commit path
+// asks the table instead of guessing from which branch ran.
+//
+// # Read as a hint, never as permission to drop an event
+//
+// A row's PRESENCE is authoritative — the unique index on event_id means a row exists only
+// because a capture committed it. Its ABSENCE is authoritative too at the moment of the query.
+// What the caller must not do is treat an ERROR as presence: this returns the error and the
+// caller then re-captures, where the unique index refuses the duplicate. Failing that way round
+// costs a rejected insert; failing the other way loses the event.
+//
+// Status is deliberately not filtered. A row that has already been dispatched, failed or
+// dead-lettered is still a row that exists, so re-capturing it would either be refused by the
+// index or resurrect an event the relay has finished with.
+//
+// Parameters:
+//   - ctx context.Context: request context.
+//   - eventIDs []string: the ids to test. Empty or all-blank returns an empty map with no query.
+//
+// Returns:
+//   - map[string]struct{}: the ids that exist. Never nil on success.
+//   - error: a typed internal error when the query or scan fails.
+func (d Datasource) ExistingEventIDs(ctx context.Context, eventIDs []string) (map[string]struct{}, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ExistingEventIDs")
+	defer span.End()
+
+	wanted := make([]string, 0, len(eventIDs))
+	for _, id := range eventIDs {
+		if strings.TrimSpace(id) != "" {
+			wanted = append(wanted, id)
+		}
+	}
+
+	present := make(map[string]struct{}, len(wanted))
+	if len(wanted) == 0 {
+		return present, nil
+	}
+
+	span.SetAttributes(attribute.Int("event_outbox.requested", len(wanted)))
+
+	// pq.Array keeps this ONE statement with ONE parameter however many ids arrive, so a
+	// hundred-transaction batch neither builds a hundred placeholders nor issues a hundred
+	// queries. The unique index on event_id serves the lookup.
+	rows, err := d.Conn.QueryContext(ctx, `
+		SELECT event_id
+		FROM blnk.event_outbox
+		WHERE event_id = ANY($1)
+	`, pq.Array(wanted))
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to look up existing event outbox entries", "existing_event_ids", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logrus.Errorf("Error closing rows: %v", closeErr)
+		}
+	}()
+
+	for rows.Next() {
+		var eventID string
+		if err := rows.Scan(&eventID); err != nil {
+			failDatabaseSpan(span, err)
+
+			return nil, loggedDatabaseError(apierror.ErrInternalServer,
+				"Failed to scan an existing event outbox entry", "existing_event_ids", err)
+		}
+		present[eventID] = struct{}{}
+	}
+
+	if err := rows.Err(); err != nil {
+		failDatabaseSpan(span, err)
+
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to read existing event outbox entries", "existing_event_ids", err)
+	}
+
+	span.SetAttributes(attribute.Int("event_outbox.present", len(present)))
+
+	return present, nil
 }

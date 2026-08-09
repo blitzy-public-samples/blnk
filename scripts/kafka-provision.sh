@@ -20,10 +20,12 @@
 #
 # TWO PRINCIPALS, NEITHER OF THEM THE ADMINISTRATOR
 #
-# The producer is what the server and worker publish as, and it is the load-bearing one:
+# The producer is what the SERVER publishes as - the outbox relay and the dead-letter writer
+# are the only producers in Blnk and both run in the server role, so the worker presents no
+# broker credential at all. It is the load-bearing principal:
 # config.KafkaConfig REFUSES to publish as the administrative principal, so with an
 # administrative pair configured and no producer pair Blnk's event publisher fails to
-# construct and neither process starts. The administrator is a cluster superuser - it creates
+# construct and the server does not start. The administrator is a cluster superuser - it creates
 # topics, mints SCRAM credentials and rewrites ACLs - so publishing as it would make a leaked
 # producer credential a compromise of the cluster's authorization state rather than the
 # ability to publish events.
@@ -31,8 +33,10 @@
 # The producer's grant is Write and Describe on the Blnk-owned topics and nothing else: no
 # Read, no consumer group, no cluster operation. The subscriber's is the mirror image - Read
 # and Describe on the topics it may consume, and Read on its own consumer-group namespace -
-# and it is granted only the topics model.SubscriberGrantableTopics allows, which excludes the
-# internal category and every dead-letter sibling.
+# and it is granted only the topics model.SubscriberGrantableTopics allows, which excludes
+# every dead-letter sibling. The sample principal's default grant is narrower still: the three
+# domain category topics, without the system topic a real subscriber may be granted
+# deliberately.
 #
 # NO CREDENTIAL IS EVER PRINTED. A generated password is written to a mode-0600 file the
 # operator nominates through KAFKA_PRODUCER_SECRET_FILE or
@@ -52,28 +56,31 @@
 #     <prefix>.transactions        <prefix>.transactions.dlt
 #     <prefix>.balances            <prefix>.balances.dlt
 #     <prefix>.identities          <prefix>.identities.dlt
-#     <prefix>.ledgers             <prefix>.ledgers.dlt
 #     <prefix>.system              <prefix>.system.dlt
 #
 # Only the CATEGORY names are written down below; each dead-letter name is derived by
 # appending ".dlt", exactly as event_topics.go's DLTFor does. Deriving rather than listing
 # is what structurally prevents the two halves of the catalogue drifting apart.
 #
-# There are two categories more than the three named in the requirement because two real
-# event types - ledger.created and system.error - belong to none of transactions, balances
-# or identities, while the requirement also demands that every event formerly delivered by
-# webhook be published AND that subscribers can consume what they used to receive. Those
-# are two different questions and one extra topic could not answer both: ledger.created is
-# ordinary ledger data that every webhook subscriber receives today, so it needs a
-# GRANTABLE home, while system.error carries Blnk's own error text and must stay
-# ungrantable. Hence <prefix>.ledgers for the first and <prefix>.system for the second,
-# both following the identical naming convention, so no event type is silently dropped and
-# none is published to a topic no subscriber may be granted. <prefix>.system doubles as the
-# catch-all for an event type the catalogue does not recognise. Do not "correct" this to
-# six or eight topics: model.EventCategory routes events into exactly these five and
-# event_topics.go composes exactly these ten names from them. A name this script does not
-# create is a name the relay cannot publish to, and a name it creates that the code never
-# writes to is dead weight in every environment.
+# There is ONE category more than the three named in the requirement because two real event
+# types - ledger.created and system.error - belong to none of transactions, balances or
+# identities, while the requirement also demands that every event formerly delivered by
+# webhook be published. Both go to <prefix>.system, which follows the identical naming
+# convention and doubles as the catch-all for an event type the catalogue does not
+# recognise, so no event type is silently dropped.
+#
+# <prefix>.system is INTERNAL: it is created but never granted. That means ledger.created is
+# published and not consumable by a subscriber credential, which is a real limitation of the
+# frozen four-category catalogue and is documented as one in docs/event-streaming.md. A fifth
+# <prefix>.ledgers topic was implemented to close it and then removed: the catalogue is a
+# published contract, so an extra topic obliges every subscriber wanting universal coverage
+# to hold a grant it was never told about, and widening a frozen contract belongs to a
+# revision of the agreed plan rather than to this script.
+#
+# Do not "correct" this to six or ten topics: model.EventCategory routes events into exactly
+# these four and event_topics.go composes exactly these eight names from them. A name this
+# script does not create is a name the relay cannot publish to, and a name it creates that
+# the code never writes to is dead weight in every environment.
 #
 # ORDERING: BOOTSTRAP, THEN BROKER, THEN THIS
 #
@@ -355,6 +362,31 @@ KAFKA_MIN_PARTITIONS="${KAFKA_MIN_PARTITIONS:-6}"
 # event_admin.go's partitionGrowthDecision, which apply the identical rule at runtime; the two
 # must agree, or provisioning and start-up would disagree about the same topic.
 KAFKA_ALLOW_PARTITION_GROWTH="${KAFKA_ALLOW_PARTITION_GROWTH:-}"
+
+# Consent to proceed when the broker CANNOT SAY whether a principal already holds a
+# SCRAM-SHA-512 credential.
+#
+# Unset, an indeterminate probe leaves THAT PRINCIPAL alone — no credential is written, the
+# disposition records "indeterminate" rather than "skipped" so the summary can say why, and the
+# principal's ACLs are still asserted because those are idempotent. That is the safe direction
+# and it is not theoretical: the preservation decision is the only thing standing between a
+# routine re-run and a silent password replacement, and "cannot tell" used to be recorded as
+# "absent", which sent control into the generate-and-upsert arm. A live credential was then
+# overwritten with a freshly generated one, under no rotation flag, and every consumer
+# authenticating with the old password failed at once — while this script reported a successful
+# provisioning run.
+#
+# The run itself CONTINUES. Refusing to guess and aborting are different reactions and only the
+# first is required: aborting would also discard the idempotent ACL repair an operator re-running
+# this came for, and would turn a broker that is briefly unauthorised to describe user configs
+# into a compose bring-up that cannot start at all, because kafka-init is a one-shot the
+# application services wait on.
+#
+# Set, an indeterminate probe is treated as ABSENT, restoring that behaviour deliberately for
+# the one deployment where it is correct: a broker that does not permit describe on user
+# entities, where the probe can never succeed and the alternative is a principal that can never
+# be provisioned. The log says plainly what may be overwritten.
+KAFKA_ALLOW_SCRAM_PROBE_FAILURE="${KAFKA_ALLOW_SCRAM_PROBE_FAILURE:-}"
 
 # Replication factor, configuration-driven with a LOCAL default of 1. Deliberately not 3,
 # and deliberately not hard-coded either way.
@@ -668,6 +700,11 @@ readonly KAFKA_PROVISION_INTERFACE=(
     # Dropping it fails safe rather than open, which is precisely why its absence went
     # unnoticed.
     KAFKA_ALLOW_PARTITION_GROWTH
+    # Consent to proceed on an indeterminate credential probe, and it crosses the boundary for
+    # exactly the reason above: the describe permission that makes the probe fail belongs to
+    # the broker and the client configuration, not to the invocation context, so a host-side
+    # run and a delegated run must reach the same verdict from one .env.
+    KAFKA_ALLOW_SCRAM_PROBE_FAILURE
     KAFKA_SECURITY_PROTOCOL
     KAFKA_SCRAM_ITERATIONS
     KAFKA_SASL_ADMIN_USER
@@ -675,9 +712,10 @@ readonly KAFKA_PROVISION_INTERFACE=(
     KAFKA_SASL_USER
     KAFKA_SASL_SECRET
     # A path, and one an invoker's filesystem may not share. Forwarded anyway, deliberately:
-    # write_secret_file then fails naming that exact directory, which tells the operator to
-    # mount it, whereas dropping the variable fails with the generic "no delivery channel is
-    # configured" and sends them looking for the wrong thing.
+    # stage_generated_secret then fails naming that exact directory, which tells the operator
+    # to mount it, whereas dropping the variable fails with the generic "no delivery channel
+    # is configured" and sends them looking for the wrong thing. That failure also happens
+    # BEFORE the broker is altered, so a mis-mounted path costs a re-run and nothing else.
     KAFKA_SASL_SECRET_FILE
     KAFKA_PRODUCER_USER
     KAFKA_PRODUCER_SECRET
@@ -731,6 +769,20 @@ readonly KAFKA_PROVISION_RETIRED_VARIABLES=(
 # scripts/kafka-bootstrap.sh seeds the administrative principal with the same mechanism, so
 # the broker needs exactly one enabled.
 readonly SCRAM_MECHANISM="SCRAM-SHA-512"
+
+# The three answers a credential probe can give, as EXIT CODES rather than as words on stdout.
+#
+# The distinction between the second and the third is the whole point: "the broker says this
+# principal has no SHA-512 credential" licenses minting one, and "the broker did not answer"
+# licenses nothing at all. Collapsing them into a single non-zero return is what allowed a
+# transient describe failure to be read as absence and a live secret to be replaced.
+#
+# They are exit codes because the probe is used as a CONDITION, and a previous version that
+# printed its answer to stdout returned 0 unconditionally — so every caller read "exists"
+# whatever the broker said, and the word appeared in the operator's console mid-sentence.
+readonly SCRAM_PROBE_EXISTS=0
+readonly SCRAM_PROBE_ABSENT=1
+readonly SCRAM_PROBE_UNKNOWN=2
 readonly MIN_SCRAM_ITERATIONS=4096
 
 # The required partition floor, quoted in diagnostics so the message explains the rule
@@ -812,39 +864,33 @@ readonly REQUIRED_AUTHORIZER="org.apache.kafka.metadata.authorizer.StandardAutho
 # it fixes the order of event_topics.go's AllTopics, AllDeadLetterTopics and
 # AllTopicsWithDeadLetters, which provisioning is compared against.
 #
-# 'ledgers' carries ledger.created - ordinary ledger data, a name and an id and a creation
-# instant, exactly the shape of identity.created - so it is grantable and appears in both
-# lists below. It is a category of its own rather than a member of 'system' precisely
-# because it must be grantable and system must not be.
+# FOUR CATEGORIES AND EIGHT TOPICS is the frozen catalogue. A fifth 'ledgers' category was
+# added here and then reverted: ledger.created belongs to none of the three named categories,
+# so it shares the one extra category with system.error, and separating them to keep it
+# grantable is a contract change decided by whoever owns the catalogue rather than by a
+# provisioning script. model.EventCategorySystem records the consequence.
 #
 # 'system' is INTERNAL and is provisioned anyway, which is not a contradiction. No
 # subscriber may be granted it - it is excluded from SubscriberGrantableEventCategories -
-# but Blnk publishes system.error to it, and it is also where an event type the mapping
-# table does not recognise is routed, precisely so the "every event is published, with zero
-# exceptions" guarantee survives a producer that forgot to extend the table. A topic that
+# but Blnk publishes system.error AND ledger.created to it, and it is also where an event
+# type the mapping table does not recognise is routed, precisely so the "every event is
+# published, with zero exceptions" guarantee survives a producer that forgot to extend the
+# table. A topic that
 # does not exist cannot receive one: against a broker with auto.create.topics.enable=false
 # the publish fails, the row retries until its budget is spent, and the dead-letter write
 # then fails too because <prefix>.system.dlt is missing as well - so the very events the
 # internal category exists to keep durable are the ones that get stranded.
 # It is asserted against model.AllEventCategories by TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns.
-readonly EVENT_CATEGORIES=(transactions balances identities ledgers system)
+readonly EVENT_CATEGORIES=(transactions balances identities system)
 
-# The categories NO subscriber may be granted, and the reason this list exists separately
-# from the one above.
+# There is NO list of ungrantable categories here, and the absence is deliberate.
 #
-# It is internalEventCategories in model/event.go, and the two must agree because they are
-# the same rule enforced in two places: Go refuses a subscriber DTO or an ACL request naming
-# an internal topic, and this script must refuse the same names or the sample principal ends
-# up holding a grant the API would have rejected. 'system' carries system.error and every
-# event type the mapping table does not recognise - Blnk's own operational traffic and its
-# safety net - so a subscriber able to read it would receive events no subscriber ever asked
-# for, including the internal errors of a ledger it has nothing to do with. It is the ONLY
-# internal category: ledger.created lives in 'ledgers', which IS grantable, because a
-# subscriber that received it over the legacy webhook must be able to keep receiving it.
-#
-# Asserted against model.SubscriberGrantableEventCategories by
-# TestKafkaProvisionScript_GrantsOnlyTheCategoriesTheCodeAllows.
-readonly INTERNAL_EVENT_CATEGORIES=(system)
+# One stood in this position, mirroring an internalEventCategories set in model/event.go, and
+# both are gone. Withholding 'system' would have withheld ledger.created with it, because the
+# four-category catalogue seats that event on the same topic - so a subscriber migrating off the
+# webhook transport would silently stop receiving an event that transport delivers today. The
+# concern the list was reaching for is answered per subscriber, in authorized_topics, and what a
+# grant of the system category discloses is documented at model.EventCategorySystem.
 
 # The categories a SUBSCRIBER may be granted, in that same canonical order: this is
 # model.SubscriberGrantableEventCategories written in shell, and
@@ -859,28 +905,41 @@ readonly INTERNAL_EVENT_CATEGORIES=(system)
 # subscriber-isolation acceptance criterion is proved by showing a principal CANNOT read outside
 # its grant, and a principal granted every category has no outside.
 #
-# What is excluded, and why each exclusion is a security boundary rather than a preference:
+# What a grant of each category carries, so the per-subscriber decision is made with the facts:
 #
 #   system   carries system.error, whose payload is the FROZEN legacy body, so it carries
-#            Blnk's own error text verbatim — a driver message naming schema, table and
-#            column, a broker error naming internal addresses. The legacy transport delivered
-#            it to ONE globally configured URL, the operator's own endpoint; a shared topic
-#            granted to N subscribers would hand each of them every other one's failures. It
-#            is also the catalogue's CATCH-ALL, where an event type no mapping recognises is
-#            routed, and an uncatalogued event has by definition no established audience.
-#            Read under the master key instead. ledger.created is NOT excluded and is not
-#            here: it is ordinary ledger data and lives in the grantable 'ledgers' category
-#            precisely so that excluding 'system' costs a subscriber nothing it used to get.
+#            Blnk's own error text verbatim - a driver message naming schema, table and
+#            column, a broker error naming internal addresses. It is also the catalogue's
+#            CATCH-ALL, where an event type no mapping recognises is routed. It carries
+#            ledger.created too, which is why the category is grantable at all: withholding it
+#            would make that event unreachable. Grant it to the subscribers that need ledger
+#            events and to no others.
 #   *.dlt    holds events that already failed, together with failure metadata naming broker
 #            addresses and internal error reasons. Granting one would hand a subscriber every
 #            OTHER subscriber's failed events. Read through GET /events/dead-letter under the
 #            master key. The dead-letter names are excluded by not being category names at
 #            all, so no entry here can ever produce one.
 #
+# ALL FOUR CATEGORIES ARE GRANTABLE, including 'system', and that is a deliberate decision
+# rather than an oversight. Under the frozen four-category catalogue blnk.system carries
+# ledger.created as well as system.error, so withholding the category would make ledger.created
+# unreachable to every subscriber — a regression against the transport being replaced, which
+# delivered ledger.created and system.error alike to the single configured webhook URL.
+#
+# What granting it discloses is documented in docs/event-streaming.md, and the decision stays
+# PER SUBSCRIBER: authorized_topics is an explicit list, so an operator grants the system topic
+# to the subscribers that should have it and not to the others. This list is the set of names
+# that MAY appear there, not a set every subscriber receives. The sample principal below takes
+# the whole list because a local consumer has nobody to be isolated from — a real deployment
+# narrows it.
+#
 # Kept as a separate list rather than derived by filtering EVENT_CATEGORIES because the
-# distinction is a POLICY, not a naming rule — model/event.go states it as a policy too, in the
-# explicit internalEventCategories map.
-readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(transactions balances identities ledgers)
+# distinction is a POLICY, not a naming rule, and because provisioning every category while
+# granting a subset must remain expressible: conflating the two is how a topic that events are
+# routed to goes uncreated. model.SubscriberGrantableEventCategories states the same policy on
+# the Go side, and TestKafkaProvisionScript_GrantsOnlyTheCategoriesTheCodeAllows asserts the two
+# agree name for name and in the same order.
+readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(transactions balances identities system)
 
 # The suffix that forms a dead-letter sibling. This is the published <topic>.dlt naming
 # convention and it must equal event_topics.go's DeadLetterTopicSuffix. Blnk owns the .dlt
@@ -956,10 +1015,13 @@ GENERATED_SECRET_FILES=()
 # credential itself is never printed (Q4-20).
 SUBSCRIBER_SECRET_ARTIFACT=""
 CATEGORY_TOPICS=()
-# The topics a subscriber MAY be granted: the category topics minus the internal ones, and
-# never a dead-letter sibling. It is the shell's copy of model.SubscriberGrantableTopics and
-# it is the allowlist both the default grant and any override are checked against.
+# The topics a subscriber MAY be granted: every category topic, and never a dead-letter
+# sibling. It is the shell's copy of model.SubscriberGrantableTopics and it is the allowlist
+# any override is checked against.
 GRANTABLE_TOPICS=()
+# What the sample principal is granted when no override is supplied: a least-privilege subset
+# of the allowlist. See SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES.
+SAMPLE_DEFAULT_TOPICS=()
 DEAD_LETTER_TOPICS=()
 ALL_TOPICS=()
 SUMMARY_TOPICS=()
@@ -977,6 +1039,14 @@ PRODUCER_PROVISIONED="no"
 PRODUCER_SECRET_DISPOSITION=""
 # generate_password's return channel. A variable rather than stdout so that no line of this
 # script writes a credential to output - see generate_password for why that matters.
+# The path stage_generated_secret staged a credential at, for commit_staged_secret to
+# consume. A GLOBAL rather than a printed value, and that is load-bearing rather than
+# stylistic: a printed path has to be read with "$(...)", which runs the function in a
+# SUBSHELL, and a subshell cannot append to GENERATED_SECRET_FILES in the parent. The
+# staged file would then never be registered for cleanup, so an abort between staging and
+# the commit would leave a credential on disk - the exact guarantee staging is supposed to
+# provide. generate_password returns GENERATED_PASSWORD the same way, for the same reason.
+STAGED_SECRET_PATH=""
 GENERATED_PASSWORD=""
 CONTAINER_RUNTIME=()
 CONTAINER_STDIN_FLAG=()
@@ -998,18 +1068,24 @@ ADMIN_SASL_MODE=""
 # report a durability that was never confirmed.
 SUMMARY_REPLICATION=()
 
-# What happened to the sample subscriber's password: "generated", "supplied", "rotated" or
-# "preserved". Drives the closing summary and where a generated value is delivered.
+# What happened to each principal's password. SIX values, and the summary has a case for
+# every one of them:
+#
+#   supplied      - the operator gave an explicit value, so no probe was needed
+#   rotated       - a replacement was generated because a rotation was requested
+#   generated     - none existed, so one was generated and delivered to its file
+#   preserved     - one already exists and was deliberately left alone
+#   indeterminate - the credential's state could NOT be established, so nothing was written
+#   skipped       - none exists and there is nowhere to deliver a generated one
+#
+# "indeterminate" is distinct from "skipped" on purpose. Both leave the credential untouched,
+# but they need different remedies and reporting them alike sends an operator looking in the
+# wrong place: skipped means "configure a destination", indeterminate means "the probe itself
+# failed — fix broker reachability or the admin principal's authorisation".
+#
+# Read by the closing summary and by the once-only credential print, which exists for the
+# producer too: a generated password nobody can read is a credential nobody can put into .env.
 SUBSCRIBER_SECRET_DISPOSITION=""
-PRODUCER_SECRET_DISPOSITION=""
-
-# The same four dispositions for the producer principal's password, read by the closing
-# summary and by the once-only credential print.
-PRODUCER_SECRET_DISPOSITION=""
-
-# The same, for the producer principal's password. Read by the closing summary and by the
-# once-only credential print, which exists for the producer too: a generated password nobody
-# can read is a credential nobody can put into .env.
 PRODUCER_SECRET_DISPOSITION=""
 
 # The resolved producer principal, and what happened to it: "yes" when provisioned,
@@ -1568,66 +1644,37 @@ resolve_topics() {
             "Blnk's configuration load applies the identical ceiling."
     fi
 
+    # ONE pass per list, and each list composed from the same prefix in the same call, so no
+    # two of them can be a different rendering of the same names. There were briefly four
+    # successive rebuilds of GRANTABLE_TOPICS here, each overwriting the last: harmless only
+    # because they agreed, and exactly the shape in which a divergence hides.
     CATEGORY_TOPICS=()
     DEAD_LETTER_TOPICS=()
-    GRANTABLE_TOPICS=()
     for category in "${EVENT_CATEGORIES[@]}"; do
         topic="${prefix}.${category}"
         CATEGORY_TOPICS+=("$topic")
         DEAD_LETTER_TOPICS+=("${topic}${DEAD_LETTER_SUFFIX}")
-        # Every category is PROVISIONED; only the non-internal ones are GRANTABLE. Building
-        # both lists in one pass over the same canonical order is what keeps them from
-        # drifting: a category added above appears in the catalogue and in the allowlist
-        # together unless it is named internal, which is the only way to leave it out.
-        if ! is_internal_category "$category"; then
-            GRANTABLE_TOPICS+=("$topic")
-        fi
-    done
-
-    # The subscriber-facing allowlist, composed from the same prefix so that the two lists
-    # cannot disagree about a name. This is the exact analogue of
-    # event_topics.go's SubscriberGrantableTopics, which adds the configured prefix to
-    # model.SubscriberGrantableTopics for the same reason.
-    GRANTABLE_TOPICS=()
-    for category in "${SUBSCRIBER_GRANTABLE_CATEGORIES[@]}"; do
-        GRANTABLE_TOPICS+=("${prefix}.${category}")
-    done
-
-    # The grantable slice is derived from its own category list rather than filtered out of
-    # CATEGORY_TOPICS, so an internal category cannot reach a subscriber grant by being
-    # forgotten in a filter. It mirrors event_topics.go's SubscriberGrantableTopics().
-    GRANTABLE_TOPICS=()
-    for category in "${SUBSCRIBER_GRANTABLE_CATEGORIES[@]}"; do
-        GRANTABLE_TOPICS+=("${prefix}.${category}")
     done
 
     ALL_TOPICS=("${CATEGORY_TOPICS[@]}" "${DEAD_LETTER_TOPICS[@]}")
 
-    # Composed from the same prefix in the same pass, so the grantable names cannot be a
-    # different rendering of the same list. This is model.SubscriberGrantableTopics(prefix).
+    # The subscriber-facing allowlist, composed from SUBSCRIBER_GRANTABLE_CATEGORIES and the
+    # same prefix, so the two lists cannot disagree about a name. It is derived from its own
+    # category list rather than filtered out of CATEGORY_TOPICS, so a category that must not
+    # be granted cannot reach a subscriber grant by being forgotten in a filter. This is the
+    # exact analogue of event_topics.go's SubscriberGrantableTopics, which adds the configured
+    # prefix to model.SubscriberGrantableTopics for the same reason.
     GRANTABLE_TOPICS=()
     for category in "${SUBSCRIBER_GRANTABLE_CATEGORIES[@]}"; do
         GRANTABLE_TOPICS+=("${prefix}.${category}")
     done
-}
 
-# Report whether a bare category token is Blnk-internal.
-#
-# The shell counterpart of model.IsInternalEventCategory, and a function rather than an
-# inline comparison so that adding a second internal category is one edit to
-# INTERNAL_EVENT_CATEGORIES rather than a hunt through the file.
-#
-# Returns 0 when the category is internal, 1 otherwise.
-is_internal_category() {
-    local candidate="$1" internal
-
-    for internal in "${INTERNAL_EVENT_CATEGORIES[@]}"; do
-        if [[ "$candidate" == "$internal" ]]; then
-            return 0
-        fi
+    # What the SAMPLE principal is granted by default: a subset of the allowlist, for the
+    # reasons on SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES.
+    SAMPLE_DEFAULT_TOPICS=()
+    for category in "${SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES[@]}"; do
+        SAMPLE_DEFAULT_TOPICS+=("${prefix}.${category}")
     done
-
-    return 1
 }
 
 # Report whether a fully-qualified topic name is one a subscriber may be granted.
@@ -1652,35 +1699,33 @@ is_grantable_topic() {
 
 # The topics the sample subscriber is authorised to read.
 #
-# THE DEFAULT IS THE GRANTABLE CATEGORY TOPICS, AND ONLY THOSE. Two exclusions, each for its
-# own reason:
+# THE DEFAULT IS THE THREE DOMAIN CATEGORY TOPICS, which is a strict subset of what the API
+# would allow. Two things are excluded, each for its own reason:
 #
-#   1. NO INTERNAL CATEGORY. The default used to be every category topic, which handed
-#      the sample principal Read on <prefix>.system - the topic carrying system.error and
-#      every unrecognised event type. Go refuses that grant outright
-#      (model.SubscriberGrantableTopics excludes it, and both the subscriber DTO validation
-#      and the Kafka ACL request check against that list), so the script was minting a grant
-#      the API would have rejected: the same subscriber provisioned through
-#      POST /subscribers/{id}/kafka-credentials could not have obtained it.
-#   2. NO DEAD-LETTER SIBLING. A subscriber consumes events; a dead-letter topic holds events
-#      Blnk failed to publish and is operator-facing, triaged and replayed through the
-#      internal events API. Excluding them is also what gives the subscriber-isolation
-#      criterion something to prove - the isolation test asserts an authorization failure on
-#      a topic, on a dead-letter topic and on a list operation outside the grant, and a
-#      principal that could read the DLTs would make that assertion vacuous.
+#   1. THE SYSTEM TOPIC, which a real subscriber CAN be granted and a sample principal is not.
+#      It carries system.error, whose frozen payload includes Blnk's error text verbatim, so
+#      granting it is a deliberate decision about one subscriber's entitlement - and a
+#      provisioning script has made no such decision. Excluding it also gives the
+#      subscriber-isolation criterion something to prove: a principal granted every category
+#      has no outside, so the isolation assertion would be vacuous. Name it explicitly in
+#      KAFKA_SAMPLE_SUBSCRIBER_TOPICS to grant it, which is also how a subscriber that needs
+#      ledger.created is set up.
+#   2. NO DEAD-LETTER SIBLING, and this one is not a policy but a rule the API enforces too. A
+#      subscriber consumes events; a dead-letter topic holds events Blnk failed to publish and
+#      is operator-facing, triaged and replayed through the internal events API. A principal
+#      that could read the DLTs would make the isolation assertion vacuous from the other side.
 #
-# KAFKA_SAMPLE_SUBSCRIBER_TOPICS narrows the default, for a subscriber that legitimately
-# needs a smaller slice. It CANNOT widen it: every entry is checked against the same
-# allowlist, because an override that could name any topic would defeat the narrowing above
-# entirely - the internal category would be one comma-separated string away from being
-# granted, and a topic outside this stack's prefix could be granted to a principal this
-# stack minted.
+# KAFKA_SAMPLE_SUBSCRIBER_TOPICS overrides the default, and it may name any topic on the
+# allowlist - including the system topic - but nothing outside it: a dead-letter sibling, a
+# category that does not exist, or a topic outside this stack's prefix is refused, because an
+# override that could name any topic could grant a principal this stack minted something the
+# API would have rejected.
 resolve_subscriber_topics() {
     local entry
 
     SUBSCRIBER_TOPICS=()
     if [[ -z "$(trim "$KAFKA_SAMPLE_SUBSCRIBER_TOPICS")" ]]; then
-        SUBSCRIBER_TOPICS=("${GRANTABLE_TOPICS[@]}")
+        SUBSCRIBER_TOPICS=("${SAMPLE_DEFAULT_TOPICS[@]}")
         return 0
     fi
 
@@ -1691,14 +1736,14 @@ resolve_subscriber_topics() {
                 "  $(join_commas "${GRANTABLE_TOPICS[@]}")" \
                 "This is the same allowlist model.SubscriberGrantableTopics enforces, so a" \
                 "grant refused here is one POST /subscribers/{id}/kafka-credentials would" \
-                "also refuse. Two names are commonly attempted and both are excluded on" \
-                "purpose:" \
-                "  - the internal category '$(join_commas "${INTERNAL_EVENT_CATEGORIES[@]}")', which carries Blnk's own" \
-                "    operational events and every unrecognised event type;" \
+                "also refuse. Two kinds of name are commonly attempted and both are excluded" \
+                "on purpose:" \
                 "  - any '${DEAD_LETTER_SUFFIX}' sibling, which is operator-facing and is triaged and" \
-                "    replayed through the internal events API rather than consumed." \
+                "    replayed through the internal events API rather than consumed;" \
+                "  - any name that is not one of the four category topics above, including a" \
+                "    category this deployment does not have." \
                 "Fix: list a subset of the grantable topics above, or unset the variable to" \
-                "grant all of them."
+                "take the sample default: $(join_commas "${SAMPLE_DEFAULT_TOPICS[@]}")."
         fi
         SUBSCRIBER_TOPICS+=("$entry")
     done < <(split_list "$KAFKA_SAMPLE_SUBSCRIBER_TOPICS" ",")
@@ -1706,8 +1751,8 @@ resolve_subscriber_topics() {
     if ((${#SUBSCRIBER_TOPICS[@]} == 0)); then
         die "KAFKA_SAMPLE_SUBSCRIBER_TOPICS is set but contains no usable topic name." \
             "Value: '${KAFKA_SAMPLE_SUBSCRIBER_TOPICS}'" \
-            "Fix: give a comma-separated list of grantable topic names, or unset it to grant" \
-            "all of them: $(join_commas "${GRANTABLE_TOPICS[@]}")."
+            "Fix: give a comma-separated list of grantable topic names, or unset it to take" \
+            "the sample default: $(join_commas "${SAMPLE_DEFAULT_TOPICS[@]}")."
     fi
 
     for entry in "${SUBSCRIBER_TOPICS[@]}"; do
@@ -1716,12 +1761,12 @@ resolve_subscriber_topics() {
         fi
 
         die "KAFKA_SAMPLE_SUBSCRIBER_TOPICS names '${entry}', which is not a grantable topic." \
-            "Only Blnk-owned subscriber-facing category topics may be granted, and the" \
-            "comparison is exact - a wildcard, a dead-letter topic, an internal topic or a" \
-            "differently-cased or whitespace-padded name is refused here for the same reason" \
-            "event_topics.go's IsSubscriberGrantableTopic refuses it." \
+            "Only Blnk-owned category topics may be granted, and the comparison is exact - a" \
+            "wildcard, a dead-letter topic, a broker-internal topic or a differently-cased or" \
+            "whitespace-padded name is refused here for the same reason event_topics.go's" \
+            "IsSubscriberGrantableTopic refuses it." \
             "Grantable (${#GRANTABLE_TOPICS[@]}): $(join_commas "${GRANTABLE_TOPICS[@]}")" \
-            "Refused because it is internal or a dead-letter sibling, if it looked familiar:" \
+            "Refused because it is a dead-letter sibling, if it looked familiar:" \
             "$(join_commas "${DEAD_LETTER_TOPICS[@]}")"
     done
 }
@@ -1754,12 +1799,12 @@ require_valid_producer() {
 
     if [[ -z "$PRODUCER_USER" ]]; then
         die "neither KAFKA_SASL_USER nor KAFKA_PRODUCER_USER names a producer principal." \
-            "This is the principal the server and worker publish events as, and it has to be" \
-            "created before they can. Blnk will not let a publisher authenticate as" \
+            "This is the principal the server publishes events as, and it has to be" \
+            "created before it can. Blnk will not let a publisher authenticate as" \
             "KAFKA_SASL_ADMIN_USER instead - config.ProducerSASL refuses, and the publisher" \
             "fails to build with a named error - so an empty producer principal on a stack" \
             "that has administrative credentials means events are never published at all." \
-            "Fix: set KAFKA_SASL_USER to the principal the server and worker will present," \
+            "Fix: set KAFKA_SASL_USER to the principal the server will present," \
             "or leave both unset to accept the shipped default of blnk-producer, or set" \
             "KAFKA_SKIP_PRODUCER=1 if the cluster's owner manages this principal." \
             "Nothing has been provisioned."
@@ -3075,7 +3120,7 @@ ensure_topics() {
 # ---------------------------------------------------------------------------------------
 # Step two: the steady-state producer principal
 #
-# The identity the server and worker publish ledger events as. Without it the publisher
+# The identity the server publishes ledger events as. Without it the publisher
 # authenticates as the cluster administrator, which is the excess privilege described at
 # KAFKA_SASL_USER near the top of this script.
 #
@@ -3142,17 +3187,47 @@ generate_password() {
     GENERATED_PASSWORD="$password"
 }
 
+# stage_secret_atomically is RETIRED. Its properties live in the stage/commit PAIR below.
+#
+# SEC-15 was answered twice. This was the single-shot form — stage beside the destination, write,
+# rename, all in one call — and stage_generated_secret + commit_staged_secret is the two-phase
+# form, which stages BEFORE the broker is altered and commits only once the broker has accepted
+# the credential. The two-phase form is the one every call site uses, and it is strictly the
+# better shape: the single-shot form publishes a secret file for a credential that may still fail
+# to be created, leaving an operator holding a password the broker never accepted.
+#
+# Every property this function carried is kept, and each is stated where it now lives:
+#
+#   * REFUSE A SYMLINK AT THE DESTINATION (CWE-59), before anything is created — moved verbatim
+#     into stage_generated_secret. `>"$destination"` and `chmod 600 "$destination"` both resolve a
+#     link, so a link pre-placed in a shared bind mount received the credential and the 0600
+#     landed on the LINK TARGET rather than on the path this script chose. A dangling link is the
+#     worse case: it is a request to create a file wherever it points.
+#   * CREATE EXCLUSIVELY, BESIDE THE DESTINATION — stage_generated_secret, under `umask 077` and
+#     `set -o noclobber`. Beside it rather than in TMPDIR, because rename(2) is atomic only within
+#     one filesystem and TMPDIR is a different one in every container this runs in.
+#   * ESTABLISH THE MODE BEFORE ANY BYTE OF THE CREDENTIAL EXISTS, and pass the value by
+#     redirection so it reaches no log and no process-table entry — stage_generated_secret.
+#   * RENAME OVER THE DESTINATION (CWE-367) — commit_staged_secret. rename(2) replaces the path in
+#     one step and does not write through a symlink at it, so a concurrent reader sees either the
+#     whole previous credential or the whole new one, never nothing and never half.
+#   * CLEAN UP ON EVERY FAILURE — the EXIT trap, which the staged path is registered with BEFORE
+#     it is written. That covers a signal part-way through, which an explicit `rm -f` per failure
+#     arm does not. The single exception is a commit that fails AFTER the broker accepted the
+#     credential: there the staged file holds the only copy of a live password, so it is taken
+#     back off the trap's list deliberately and the operator is told where it is.
 # Write a generated credential to a permissioned file, and report only the PATH.
 #
 # This is the "deliberately permissioned mechanism" that replaced printing to stdout. Three
-# properties make it one rather than a rename of the same disclosure:
+# properties make it one rather than a rename of the same disclosure, and the pair below
+# delivers all three between them:
 #
-#   1. THE MODE IS SET BEFORE THE CONTENT EXISTS. "umask 077" is applied in a subshell around
-#      the creating redirection, so the file is never briefly group- or world-readable; a
-#      chmod after the write leaves a window in which it is. The chmod afterwards is belt and
-#      braces for a pre-existing file whose mode this run did not choose.
-#   2. NOTHING IS APPENDED. The file is truncated, so a rotation replaces the credential
-#      rather than leaving both readable and leaving the reader to guess which is live.
+#   1. THE MODE IS SET BEFORE THE CONTENT EXISTS, on a file created with O_EXCL, so there is
+#      neither an instant in which the credential sits at a wider mode nor a symlink through
+#      which the mode could apply to some other file.
+#   2. NOTHING IS APPENDED, AND NOTHING IS HALF-WRITTEN. The destination is replaced by an
+#      atomic rename, so a rotation is one visible transition from the whole old value to the
+#      whole new one rather than a window of empty or partial content.
 #   3. THE VALUE NEVER REACHES A LOG. Only the path is reported, and the write goes through a
 #      redirection rather than a command argument, so the credential appears in no process
 #      table entry either.
@@ -3162,10 +3237,73 @@ generate_password() {
 #   $2 credential  : the value to write.
 #   $3 label       : what the credential is for, used in diagnostics only.
 #
-# Dies when the destination cannot be written, because a generated credential that was not
+# Either half dies when it cannot do its part, because a generated credential that was not
 # delivered anywhere is a principal nobody can authenticate as.
-deliver_generated_secret() {
-    local destination="$1" credential="$2" label="$3" directory=""
+#
+# ---------------------------------------------------------------------------
+#
+# Delivering a generated credential is TWO steps, and they sit either side of the broker
+# mutation. stage_generated_secret runs BEFORE it; commit_staged_secret runs after it
+# succeeds. Nothing calls them in one breath, and that separation is the whole point.
+#
+# # Why staging has to precede the broker call
+#
+# A single "alter the broker, then write the file" function has an unrecoverable failure
+# mode: the credential is live at the broker and the only copy of the password is gone.
+# Nothing can retrieve it afterwards, because SCRAM stores a salted verifier and not the
+# password, so the broker cannot be asked what it now accepts. The subscriber is locked
+# out, and the fix is another rotation - which is exactly the operation an operator was
+# trying to avoid performing blind. Every reason a write fails is knowable in advance: a
+# missing directory, a read-only mount, a wrong owner inside a container, no space. So
+# they are established first, on a real file with real permissions, and the broker is
+# only touched once delivery is known to work.
+#
+# # Why a staged file rather than writing the destination directly
+#
+# Writing the destination in place has a second, quieter defect. '>' TRUNCATES an
+# existing file and KEEPS ITS MODE - umask applies only to files being created - so a
+# destination that already existed at 0644 receives the password and stays world-readable
+# for the window before any chmod lands. A staged path is created fresh with noclobber,
+# so it cannot be a pre-existing file with a mode somebody else chose, and 0600 is
+# established BEFORE a single byte of credential is written to it.
+#
+# The staged file is registered with GENERATED_SECRET_FILES before it is written, so
+# every abort path - a die anywhere below, Ctrl-C, SIGTERM - removes it through the EXIT
+# trap. There is no cleanup to remember at the call sites and none to forget.
+#
+# Parameters:
+#   $1 destination - the final path the operator nominated.
+#   $2 credential  - the generated password.
+#   $3 label       - what the credential is for, used in messages.
+#
+# Sets STAGED_SECRET_PATH to the staged path, for commit_staged_secret to consume. It does
+# NOT print it: see that variable's declaration for why a printed value would break cleanup.
+stage_generated_secret() {
+    local destination="$1" credential="$2" label="$3"
+    local directory="" staged="" previous_umask=""
+
+    # The directory check is stated as its own diagnostic rather than being left to the
+    # creation failure below, because this is the case an operator actually hits: the
+    # *_SECRET_FILE variable named a path whose parent is not mounted, and the fix is about the
+    # mount rather than about the write.
+    # REFUSED FIRST, BEFORE A TEMPORARY FILE EXISTS, so a refusal leaves nothing behind. -L is
+    # true for a symlink whether or not its target exists, which is what makes it the right test:
+    # a DANGLING link is the more dangerous of the two, because it is a request to create a file
+    # wherever it points. The commit below is a rename and would not write THROUGH a link, but a
+    # link at this path is either an operator indirection this would silently destroy or someone
+    # else's doing in a shared bind mount — and delivering a password into a directory somebody
+    # else is manipulating is precisely what must not happen. Refusing says so instead of
+    # guessing which it was.
+    if [[ -L "$destination" ]]; then
+        die "refusing to deliver the generated ${label} credential: '${destination}' is a symbolic link." \
+            "A credential is never written through a link. In a shared directory a link at this" \
+            "path is either an indirection this would destroy or someone else's doing, and" \
+            "neither is safe to write a password into." \
+            "Fix: remove the link and let this script create the file, or point the" \
+            "*_SECRET_FILE variable at a real path." \
+            "THE BROKER HAS NOT BEEN TOUCHED: staging runs before the credential is created, so" \
+            "nothing needs undoing and re-running after fixing the path is safe."
+    fi
 
     directory="$(dirname -- "$destination")"
     if [[ ! -d "$directory" ]]; then
@@ -3173,24 +3311,118 @@ deliver_generated_secret() {
             "Destination requested: ${destination}" \
             "Fix: mount a writable directory at that path, point the *_SECRET_FILE variable" \
             "somewhere that exists, or supply the credential explicitly instead of having one" \
-            "generated."
+            "generated." \
+            "THE BROKER HAS NOT BEEN TOUCHED: no credential was created, so nothing needs" \
+            "undoing and re-running after fixing the path is safe."
     fi
 
-    if ! (
-        umask 077
-        printf '%s\n' "$credential" >"$destination"
-    ); then
-        die "cannot deliver the generated ${label} credential: writing '${destination}' failed." \
-            "Fix: make the directory writable by the user this script runs as, choose another" \
-            "path, or supply the credential explicitly."
+    # Beside the destination, never in TMPDIR. A rename is atomic only within one
+    # filesystem, and TMPDIR is routinely a different one - under compose it is very often
+    # a tmpfs. Staging elsewhere would turn the commit into a copy, which reintroduces
+    # precisely the partially-written, wrongly-moded destination that staging exists to
+    # prevent.
+    staged="${destination}.blnk-staged.$$"
+
+    previous_umask="$(umask)"
+    umask 077
+
+    # noclobber, so a path that already exists is an error rather than something to
+    # truncate. That is what guarantees the mode below is one this function established.
+    if ! (set -o noclobber && : >"$staged") 2>/dev/null; then
+        umask "$previous_umask"
+        die "cannot deliver the generated ${label} credential: '${staged}' could not be created." \
+            "Fix: check that '${directory}' is writable by the user this script runs as." \
+            "Inside a container that usually means the mount is read-only or owned by" \
+            "another user. If a file of that name is left over from an interrupted run," \
+            "remove it." \
+            "THE BROKER HAS NOT BEEN TOUCHED: no credential was created."
     fi
 
-    chmod 600 "$destination" 2>/dev/null || true
+    umask "$previous_umask"
+
+    # Registered before anything is written to it, so an abort between here and the commit
+    # cannot leave a credential behind on disk.
+    GENERATED_SECRET_FILES+=("$staged")
+
+    # Belt and braces over the umask, and FATAL rather than ignored. A credential must not
+    # be written to a file whose permissions could not be established - that was the
+    # original defect, where the chmod was 'chmod 600 ... || true' and a failure to secure
+    # the file simply proceeded to fill it with a password.
+    if ! chmod 600 "$staged" 2>/dev/null; then
+        die "cannot deliver the generated ${label} credential: the mode of '${staged}' could not be set to 0600." \
+            "Refusing to write a credential to a file whose permissions are unknown." \
+            "THE BROKER HAS NOT BEEN TOUCHED: no credential was created."
+    fi
+
+    if ! printf '%s\n' "$credential" >"$staged" 2>/dev/null; then
+        die "cannot deliver the generated ${label} credential: writing '${staged}' failed." \
+            "Fix: check the free space and the permissions on '${directory}'." \
+            "THE BROKER HAS NOT BEEN TOUCHED: no credential was created."
+    fi
+
+    STAGED_SECRET_PATH="$staged"
+}
+
+# retain_secret_file takes a path back off the EXIT trap's removal list.
+#
+# It exists for exactly one situation, and it is a situation where the trap's usual
+# instinct is wrong. The trap deletes scratch credential files because leaving a password
+# on disk is a disclosure. But if a credential is already LIVE at the broker and the
+# staged file holds the only copy of its password, deleting that file does not prevent a
+# disclosure - it destroys the sole means of using an account that now exists, and SCRAM
+# stores a salted verifier rather than the password, so nothing can recover it afterwards.
+# Between "a 0600 file the operator has just been told about" and "an unusable live
+# credential", the file is plainly the lesser harm.
+#
+# Parameters:
+#   $1 - the path to stop tracking.
+retain_secret_file() {
+    local keep="$1" remaining=() file=""
+
+    for file in ${GENERATED_SECRET_FILES[@]+"${GENERATED_SECRET_FILES[@]}"}; do
+        if [[ "$file" != "$keep" ]]; then
+            remaining+=("$file")
+        fi
+    done
+
+    GENERATED_SECRET_FILES=(${remaining[@]+"${remaining[@]}"})
+}
+
+# commit_staged_secret moves a staged credential into place once the broker has accepted
+# it.
+#
+# The rename is what makes the destination's contents and its mode change together. A
+# reader either sees the previous credential or the new one, never a half-written file,
+# and never the new password inside a file still carrying an old wide mode: rename
+# replaces the destination inode outright, so the 0600 established during staging is the
+# mode the destination ends up with, whatever it was before.
+#
+# Parameters:
+#   $1 staged      - the path returned by stage_generated_secret.
+#   $2 destination - the final path.
+#   $3 label       - what the credential is for, used in messages.
+commit_staged_secret() {
+    local staged="$1" destination="$2" label="$3"
+
+    if ! mv -f -- "$staged" "$destination" 2>/dev/null; then
+        # Take it off the trap's list FIRST. Otherwise the die below exits, the trap runs,
+        # and the one copy of a live credential's password is removed by the very cleanup
+        # meant to protect it - making the message that follows a lie.
+        retain_secret_file "$staged"
+
+        die "the ${label} credential was created at the broker but could not be moved into place." \
+            "Staged file: ${staged}" \
+            "Destination: ${destination}" \
+            "THE CREDENTIAL IS LIVE AT THE BROKER. The password is in the staged file above," \
+            "at mode 0600 - move it into place yourself, and delete it once you have. The" \
+            "staged file is NOT removed on this path precisely because it holds the only copy;" \
+            "a SCRAM verifier cannot be read back, so losing it means rotating again."
+    fi
 
     log "wrote the generated ${label} credential to a mode-0600 file" \
         "path: ${destination}" \
         "The value is NOT printed here and is not in this run's output: read it from that" \
-        "file. It is truncated and rewritten on a rotation, never appended to."
+        "file. It is replaced wholesale on a rotation, never appended to."
 }
 
 # Deliver a generated credential to the file an operator named, and nowhere else.
@@ -3214,47 +3446,6 @@ deliver_generated_secret() {
 #   $1 - path to write. Its parent directory must already exist and be writable.
 #   $2 - a short label naming what the credential is for, used only in messages.
 #   $3 - the credential. Never logged.
-write_secret_file() {
-    local path="$1" label="$2" secret="$3"
-    local directory previous_umask
-
-    directory="$(dirname -- "$path")"
-    if [[ ! -d "$directory" ]]; then
-        die "cannot deliver the generated ${label} password: the directory '${directory}' does not exist." \
-            "The path came from the secret-file variable for ${label}." \
-            "Fix: create the directory first, or point the variable at one that exists. Under" \
-            "compose, the directory has to be a writable mount - a read-only one, or a path" \
-            "that exists only inside the container, cannot deliver anything to you." \
-            "The credential has NOT been written to the broker."
-    fi
-
-    previous_umask="$(umask)"
-    umask 077
-
-    if ! : >"$path" 2>/dev/null; then
-        umask "$previous_umask"
-        die "cannot deliver the generated ${label} password: '${path}' could not be created." \
-            "Fix: check that '${directory}' is writable by this process. Inside a container" \
-            "that usually means the mount is read-only or owned by another user." \
-            "The credential has NOT been written to the broker."
-    fi
-
-    umask "$previous_umask"
-
-    # Belt and braces on top of the umask, for a path that already existed with a wider mode.
-    # Still before the write, for the reason given above.
-    if ! chmod 600 "$path" 2>/dev/null; then
-        die "cannot deliver the generated ${label} password: the mode of '${path}' could not be set to 0600." \
-            "Refusing to write a credential to a file whose permissions are unknown." \
-            "The credential has NOT been written to the broker."
-    fi
-
-    if ! printf '%s\n' "$secret" >"$path" 2>/dev/null; then
-        die "cannot deliver the generated ${label} password: writing to '${path}' failed." \
-            "Fix: check the free space and the permissions on '${directory}'." \
-            "The credential has NOT been written to the broker."
-    fi
-}
 
 # Report whether a principal already holds a SCRAM-SHA-512 credential.
 #
@@ -3272,15 +3463,17 @@ write_secret_file() {
 # that can authenticate here - Blnk standardises on SHA-512 and the broker needs exactly
 # that one enabled.
 #
-# The describe is guarded and its output discarded on failure. A failure means "cannot tell",
-# and the caller must then treat the credential as absent and provision one: refusing to
-# provision because a probe failed would leave the principal permanently unusable on a
-# broker whose describe is not permitted, whereas provisioning is at worst the previous
-# behaviour.
+# The describe is guarded, and A FAILURE IS ITS OWN ANSWER. "Cannot tell" is returned as
+# SCRAM_PROBE_UNKNOWN and is NOT folded into "absent", because the two license different
+# actions: absence licenses minting a credential, and silence licenses nothing.
 #
-# It is named for the mechanism rather than for a role because BOTH principals this script
-# mints - the sample subscriber and the producer - preserve an existing credential through
-# it.
+# That fold was a real defect with a concrete cost. A transient describe failure - a broker
+# mid-restart, a momentary timeout, a client configuration briefly missing its administrative
+# credentials - was recorded as absence, so the disposition chain skipped its `preserved` arm
+# and fell into generate-and-upsert. The broker then replaced a WORKING credential with a newly
+# generated password, under no rotation flag, and every consumer and every publishing process
+# authenticating with the old one began failing immediately - while this script printed a
+# successful provisioning run. The operator had asked only for topics to be assured.
 #
 # IT IS A PREDICATE, AND IT HAS TO BE ONE, because both call sites use it as the condition
 # of an `elif`. It printed its answer to STDOUT as "exists" / "absent" / "unknown" and
@@ -3298,8 +3491,57 @@ write_secret_file() {
 # global it leaked this probe's exit status into every later caller of it.
 #
 # Returns 0 when the credential exists, 1 when it does not or cannot be determined.
-scram_credential_exists() {
+scram_credential_is_present() {
+    local user="$1"
+
+    # `|| true` IS LOAD-BEARING, not defensive noise. The probe reports absent and unknown as
+    # non-zero exit codes, and this script runs under `set -e`: a bare call would take the
+    # whole run down on the single most ordinary outcome there is — a fresh broker with no
+    # credential yet — before this predicate could answer anything.
+    scram_credential_state "$user" || true
+
+    [[ "$SCRAM_CREDENTIAL_STATE" == "present" ]]
+}
+
+# SCRAM_CREDENTIAL_STATE is scram_credential_state's answer: present, absent or unknown.
+#
+# It is a global rather than stdout because the probe writes the broker's own diagnostic to
+# stderr, and mixing a machine-readable verdict into a stream a human also reads is how the
+# verdict ends up being parsed out of a log line.
+SCRAM_CREDENTIAL_STATE="unknown"
+
+# scram_credential_state answers whether a principal holds a ${SCRAM_MECHANISM} credential
+# with THREE outcomes rather than two: present, absent, or unknown.
+#
+# # Why the third state has to exist
+#
+# The probe is a "kafka-configs --describe" against the broker, and that call can fail for
+# reasons that say NOTHING about the credential: the broker is unreachable, the admin
+# principal is not authorised to describe user configs, the CLI is missing, a TLS handshake
+# fails. A two-valued probe has to fold every one of those onto a boolean, and the previous
+# implementation folded them onto ABSENT.
+#
+# Absent is not the safe direction here, and calling it safe was the defect. Downstream, the
+# "credential is absent" branch is what GENERATES a new password and upserts it whenever a
+# secret-file destination is configured. So an unreachable broker or an unauthorised admin
+# silently ROTATED a working producer or subscriber credential — no KAFKA_ROTATE_* asked for
+# it, every consumer already holding the old password stopped authenticating, and the run
+# reported success. The failure is invisible precisely because the upsert succeeds: the
+# broker accepts the new credential and nothing anywhere compares it with the old one.
+#
+# So an indeterminate probe now says so, and every caller must decide what to do about it
+# rather than being handed a wrong fact. The one thing no caller may do is write a
+# credential: see require_determinate_credential_state.
+#
+# Arguments:
+#   $1 - the principal to probe.
+#
+# Sets:
+#   SCRAM_CREDENTIAL_STATE - present | absent | unknown.
+scram_credential_state() {
     local user="$1" output status
+
+    SCRAM_CREDENTIAL_STATE="unknown"
 
     # stderr is folded into the capture rather than discarded, so a probe that failed for an
     # administrative reason can be reported to the operator in the broker's own words, with
@@ -3309,27 +3551,125 @@ scram_credential_exists() {
     if ((status != 0)); then
         printf '%s\n' "$output" | redact >&2
         warn "could not determine whether '${user}' already holds a ${SCRAM_MECHANISM} credential" \
-            "The broker's own answer is above, with credential-bearing lines removed. This run" \
-            "treats the credential as ABSENT, which is the safe direction: it provisions one if" \
-            "it has a password to use and skips the principal if it does not, rather than" \
-            "reporting a credential it never saw."
+            "The broker's own answer is above, with credential-bearing lines removed." \
+            "This run treats the state as UNKNOWN and will NOT write a credential for this" \
+            "principal, because the alternative — assuming absence — generates a new password" \
+            "and upserts it, which silently rotates a working credential and breaks every" \
+            "consumer already using the current one." \
+            "Fix the probe (broker reachability, admin authorisation) and re-run, or set the" \
+            "principal's password explicitly, which needs no probe."
 
-        return 1
+        # THE GLOBAL AND THE EXIT CODE ARE SET TOGETHER, ON EVERY PATH, BY THIS FUNCTION ALONE.
+        # Two channels for one fact is only safe while one function writes both of them in the
+        # same breath: a caller then cannot read a verdict this probe did not reach. The global
+        # is what the predicate and the write-gate read, because it survives the `||` a
+        # non-zero return has to be invoked through; the code is what lets a caller distinguish
+        # the three answers without touching a global at all.
+        SCRAM_CREDENTIAL_STATE="unknown"
+
+        return "$SCRAM_PROBE_UNKNOWN"
     fi
 
     # Matching on the MECHANISM rather than on the presence of any output is what keeps a
     # principal holding only a SHA-256 credential from being mistaken for one that can
     # authenticate here: Blnk standardises on SHA-512 and the broker needs exactly that one.
     if [[ "$output" == *"${SCRAM_MECHANISM}"* ]]; then
+        SCRAM_CREDENTIAL_STATE="present"
+
+        return "$SCRAM_PROBE_EXISTS"
+    fi
+
+    SCRAM_CREDENTIAL_STATE="absent"
+
+    return "$SCRAM_PROBE_ABSENT"
+}
+
+# require_determinate_credential_state reports whether a credential WRITE may proceed for a
+# principal whose probe has just run.
+#
+# It exists so the rule "never write a credential on an indeterminate probe" is stated once
+# rather than repeated at each call site, where one omission reinstates the silent rotation
+# this whole tri-state exists to prevent.
+#
+# # Why this REFUSES the principal rather than aborting the run
+#
+# Refusing to guess and aborting are not the same thing, and only the first is required. The
+# finding is that a credential must not be written on an answer the broker never gave; leaving
+# the principal untouched satisfies that completely. Aborting additionally throws away the
+# idempotent ACL assertion that follows — which is precisely the repair an operator re-running
+# this script during an incident came for — and, in the compose stack, turns a broker that is
+# briefly unauthorised to describe user configs into a bring-up that cannot start at all,
+# because kafka-init is a one-shot the application services wait on.
+#
+# So the principal is skipped, the disposition records WHY it was skipped, and the run's
+# summary says plainly that the password is unchanged and not because it was preserved. That
+# distinction is the whole reporting contract: "skipped" tells an operator to configure a
+# destination, "indeterminate" tells them to fix the probe.
+#
+# KAFKA_ALLOW_SCRAM_PROBE_FAILURE is the one documented escape hatch, for a broker that can
+# NEVER answer a describe on user entities and where the alternative is a principal that can
+# never be provisioned. Set, an unknown state is treated as absent — deliberately accepting
+# that a live credential may be replaced — and the log says so in those words.
+#
+# Arguments:
+#   $1 - the principal, for the diagnostic.
+#
+# Returns:
+#   0 when SCRAM_CREDENTIAL_STATE is present or absent, or when the operator has consented in
+#   advance; 1 when it is unknown and they have not.
+require_determinate_credential_state() {
+    local user="$1"
+
+    if [[ "$SCRAM_CREDENTIAL_STATE" != "unknown" ]]; then
         return 0
     fi
+
+    if is_truthy "$KAFKA_ALLOW_SCRAM_PROBE_FAILURE"; then
+        warn "proceeding on an UNKNOWN credential state for '${user}' because KAFKA_ALLOW_SCRAM_PROBE_FAILURE is set" \
+            "This run will treat the credential as ABSENT and may therefore REPLACE one that" \
+            "already exists. Every consumer or publishing process holding the current password" \
+            "will stop authenticating, and nothing here can tell you whether that happened." \
+            "Unset the variable to have this principal skipped instead."
+
+        return 0
+    fi
+
+    warn "not writing a credential for '${user}': its current state is unknown" \
+        "REFUSING TO GUESS. A generated password would be upserted over whatever the broker" \
+        "already holds, rotating a credential nobody asked to rotate. The principal is left" \
+        "exactly as it is, and its ACLs are still asserted below because those are idempotent" \
+        "and cannot invalidate an existing credential." \
+        "Fix, whichever applies:" \
+        "  - the usual cause is a broker that is not ready or not reachable yet. Re-run." \
+        "  - if the administrative principal lacks DescribeConfigs on user entities, grant it," \
+        "    or point KAFKA_SASL_ADMIN_USER/KAFKA_SASL_ADMIN_SECRET at one that has it." \
+        "  - to write the credential you already intend to write, set the password explicitly;" \
+        "    an explicit value needs no probe and is applied idempotently." \
+        "  - if this broker can NEVER answer a describe on users, set" \
+        "    KAFKA_ALLOW_SCRAM_PROBE_FAILURE=1 to accept the risk deliberately."
 
     return 1
 }
 
+# scram_credential_exists is RETIRED, and deliberately not replaced.
+#
+# It was the yes/no wrapper the disposition chains used before the state was a tri-state, and
+# it existed in two mutually exclusive forms: one built on a `scram_credential_probe` helper
+# that no longer exists, and one that read scram_credential_state's exit code and ABORTED the
+# run on the third answer. Neither was reachable — both chains call scram_credential_is_present
+# and then require_determinate_credential_state — and the first would have failed with
+# "command not found" the moment anything did call it.
+#
+# The two properties they carried are kept, at the places that own them: refusing to write a
+# credential on an answer the broker never gave is require_determinate_credential_state, and
+# the deliberate escape hatch for a broker that can never answer is the
+# KAFKA_ALLOW_SCRAM_PROBE_FAILURE branch inside it. What is NOT kept is the abort, because the
+# run has idempotent ACL work left to do that an operator re-running this script came for.
+
+
 # Report whether the broker knows this principal at all.
 #
-# A DELIBERATELY WEAKER QUESTION than scram_credential_exists, and the difference is the
+# A DELIBERATELY WEAKER QUESTION than scram_credential_state, and the difference is the
 # point. That one asks "can this principal authenticate the way Blnk needs?"; this one asks
 # "does the broker hold any configuration for this name?" - a SHA-256-only credential, a
 # quota, or a SHA-512 credential. Both matter, in different places: the credential probe
@@ -3522,7 +3862,7 @@ ensure_sample_subscriber() {
         password="$GENERATED_PASSWORD"
         generated="yes"
         SUBSCRIBER_SECRET_DISPOSITION="rotated"
-    elif scram_credential_exists "$user"; then
+    elif scram_credential_is_present "$user"; then
         SUBSCRIBER_SECRET_DISPOSITION="preserved"
         log "keeping the existing SCRAM credential for '${user}'" \
             "It already holds a ${SCRAM_MECHANISM} credential, so this run does not touch" \
@@ -3532,6 +3872,13 @@ ensure_sample_subscriber() {
             "To replace the password deliberately, set" \
             "KAFKA_ROTATE_SAMPLE_SUBSCRIBER_SECRET=1, or set" \
             "KAFKA_SAMPLE_SUBSCRIBER_SECRET to a value of your own."
+    elif ! require_determinate_credential_state "$user"; then
+        # THE PROBE WAS INDETERMINATE, so nothing is written. Generating here — which is what
+        # the next arm does — would upsert a new password over whatever the broker already
+        # holds and rotate a credential nobody asked to rotate. The disposition records the
+        # reason rather than reporting a generation that did not happen.
+        SUBSCRIBER_SECRET_DISPOSITION="indeterminate"
+        SUBSCRIBER_PROVISIONED="skipped"
     elif [[ -n "$(trim "$KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE")" ]]; then
         generate_password
         password="$GENERATED_PASSWORD"
@@ -3588,6 +3935,25 @@ ensure_sample_subscriber() {
     # the topics had been assured, so the run looked like a broker problem rather than a script
     # one. The producer leg has had this guard all along; this is the same guard, and the
     # asymmetry was the defect.
+    # AN INDETERMINATE PROBE MUST ALSO RETURN BEFORE THE UPSERT, and for a sharper reason than
+    # "preserved" does. The branch that set it leaves $password EMPTY, so falling through
+    # composes an empty SCRAM value — but worse, if a password HAD been generated the upsert
+    # would rotate a credential whose existence was never established. Either way the write is
+    # wrong, and only a return prevents it.
+    #
+    # This is the second half of finding F-11's fix: setting the disposition is not enough on
+    # its own, because the upsert below is reached by fall-through rather than by an explicit
+    # decision. The ACLs are still asserted, because they are idempotent and carry no secret,
+    # and repairing a drifted binding is exactly what an operator re-running this wants even
+    # when the credential cannot be inspected.
+    if [[ "$SUBSCRIBER_SECRET_DISPOSITION" == "indeterminate" ]]; then
+        if principal_is_known "$user"; then
+            grant_subscriber_acls "$user" "$group_prefix"
+        fi
+
+        return 0
+    fi
+
     if [[ "$SUBSCRIBER_SECRET_DISPOSITION" == "preserved" ]]; then
         grant_subscriber_acls "$user" "$group_prefix"
         SUBSCRIBER_PROVISIONED="yes"
@@ -3619,6 +3985,23 @@ ensure_sample_subscriber() {
     # part of it and Kafka answers "Invalid credential property". Verified against
     # apache/kafka 3.9: the bracketed form is rejected, the bare form creates a credential
     # that then authenticates.
+
+    # DELIVERY IS PROVED BEFORE THE BROKER IS TOUCHED (F-04).
+    #
+    # A generated password has exactly one copy, and it is in this shell. If the broker
+    # accepted the credential and the file could not then be written, the account would be
+    # live with an unrecoverable password: SCRAM keeps a salted verifier, so the broker
+    # cannot be asked what it now accepts, and the subscriber is locked out until somebody
+    # rotates blind. Staging first turns every one of those failures - absent directory,
+    # read-only mount, wrong owner, no space, unsettable mode - into a clean abort that
+    # leaves the broker exactly as it was and is safe to re-run.
+    local staged_secret=""
+    if [[ "$generated" == "yes" ]]; then
+        stage_generated_secret \
+            "$(trim "$KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE")" "$password" "sample subscriber"
+        staged_secret="$STAGED_SECRET_PATH"
+    fi
+
     local scram_file output
     scram_file="$(new_secret_file scram)"
     if ! printf '%s\n' \
@@ -3666,8 +4049,11 @@ ensure_sample_subscriber() {
     # log. The file keeps the credential readable to the operator without making it readable
     # to everything that reads logs.
     if [[ "$generated" == "yes" ]]; then
-        deliver_generated_secret \
-            "$(trim "$KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE")" "$password" "sample subscriber"
+        # The broker has accepted it, so the staged file becomes the destination in one
+        # atomic rename. The mode travels with the rename, which is what leaves the
+        # destination at 0600 even if it previously existed with a wider one.
+        commit_staged_secret \
+            "$staged_secret" "$(trim "$KAFKA_SAMPLE_SUBSCRIBER_SECRET_FILE")" "sample subscriber"
 
         log "provisioned the sample subscriber credential" \
             "user     : ${user}" \
@@ -3784,7 +4170,7 @@ ensure_producer_principal() {
         password="$GENERATED_PASSWORD"
         generated="yes"
         PRODUCER_SECRET_DISPOSITION="rotated"
-    elif scram_credential_exists "$user"; then
+    elif scram_credential_is_present "$user"; then
         PRODUCER_SECRET_DISPOSITION="preserved"
         log "keeping the existing SCRAM credential for '${user}'" \
             "It already holds a ${SCRAM_MECHANISM} credential, so this run does not touch it:" \
@@ -3792,6 +4178,12 @@ ensure_producer_principal() {
             "The grant below is still asserted, because ACL addition is idempotent." \
             "To replace the password deliberately, set KAFKA_PRODUCER_SECRET, or set" \
             "KAFKA_ROTATE_PRODUCER_SECRET=1 with KAFKA_PRODUCER_SECRET_FILE configured."
+    elif ! require_determinate_credential_state "$user"; then
+        # As for the sample subscriber, and the consequence here is larger: rotating this
+        # credential stops the running server and worker from authenticating, so an
+        # indeterminate probe must never reach the generation arm below.
+        PRODUCER_SECRET_DISPOSITION="indeterminate"
+        PRODUCER_PROVISIONED="skipped"
     elif [[ -n "$(trim "$KAFKA_PRODUCER_SECRET_FILE")" ]]; then
         # Named for the same reason as the rotation arm above.
         generate_password "producer" "KAFKA_PRODUCER_SECRET" "KAFKA_SKIP_PRODUCER"
@@ -3818,6 +4210,25 @@ ensure_producer_principal() {
             "  - set KAFKA_PRODUCER_SECRET yourself, and the same value in KAFKA_SASL_SECRET;" \
             "  - set KAFKA_PRODUCER_SECRET_FILE to a path on a writable mount and a password" \
             "    is generated into it with mode 0600."
+
+        return 0
+    fi
+
+    # AN INDETERMINATE PROBE MUST ALSO RETURN BEFORE THE UPSERT, and for a sharper reason than
+    # "preserved" does. The branch that set it leaves $password EMPTY, so falling through
+    # composes an empty SCRAM value — but worse, if a password HAD been generated the upsert
+    # would rotate a credential whose existence was never established. Either way the write is
+    # wrong, and only a return prevents it.
+    #
+    # This is the second half of finding F-11's fix: setting the disposition is not enough on
+    # its own, because the upsert below is reached by fall-through rather than by an explicit
+    # decision. The ACLs are still asserted, because they are idempotent and carry no secret,
+    # and repairing a drifted binding is exactly what an operator re-running this wants even
+    # when the credential cannot be inspected.
+    if [[ "$PRODUCER_SECRET_DISPOSITION" == "indeterminate" ]]; then
+        if principal_is_known "$user"; then
+            grant_producer_acls "$user"
+        fi
 
         return 0
     fi
@@ -3850,6 +4261,23 @@ ensure_producer_principal() {
     # No square brackets, for the reason recorded at the subscriber's upsert: in a properties
     # file everything after the first '=' is the value, so brackets become part of the password
     # and Kafka answers "Invalid credential property".
+    # DELIVERY IS PROVED BEFORE THE BROKER IS TOUCHED (F-04).
+    #
+    # A generated password has exactly one copy, and it is in this shell. If the broker
+    # accepted the credential and the file could not then be written, the account would be
+    # live with an unrecoverable password: SCRAM keeps a salted verifier, so the broker
+    # cannot be asked what it now accepts, and the server and worker - which authenticate as
+    # this very principal - would refuse to construct their publisher and fail to start.
+    # Staging first turns every one of those failures - absent directory,
+    # read-only mount, wrong owner, no space, unsettable mode - into a clean abort that
+    # leaves the broker exactly as it was and is safe to re-run.
+    local staged_secret=""
+    if [[ "$generated" == "yes" ]]; then
+        stage_generated_secret \
+            "$(trim "$KAFKA_PRODUCER_SECRET_FILE")" "$password" "producer"
+        staged_secret="$STAGED_SECRET_PATH"
+    fi
+
     local scram_file output
     scram_file="$(new_secret_file scram)"
     if ! printf '%s\n' \
@@ -3885,8 +4313,10 @@ ensure_producer_principal() {
     PRODUCER_PROVISIONED="yes"
 
     if [[ "$generated" == "yes" ]]; then
-        deliver_generated_secret \
-            "$(trim "$KAFKA_PRODUCER_SECRET_FILE")" "$password" "producer"
+        # The broker has accepted it, so the staged file becomes the destination in one
+        # atomic rename, carrying its 0600 mode with it.
+        commit_staged_secret \
+            "$staged_secret" "$(trim "$KAFKA_PRODUCER_SECRET_FILE")" "producer"
 
         log "provisioned the producer credential" \
             "user     : ${user}" \
@@ -4044,7 +4474,7 @@ grant_subscriber_acls() {
 # written to a file is a credential the publisher DOES NOT YET HAVE, and saying so is the
 # difference between a summary that reports success and one that reports what is true.
 print_producer_summary() {
-    printf '%s\n' "Event producer (the identity the server and worker publish as):"
+    printf '%s\n' "Event producer (the identity the server publishes as):"
 
     case "$PRODUCER_PROVISIONED" in
         yes)
@@ -4071,6 +4501,14 @@ print_producer_summary() {
                 supplied)
                     printf '%s\n' "  password             the KAFKA_SASL_SECRET you supplied, which is what the"
                     printf '%s\n' "                       server and worker already read"
+                    ;;
+                indeterminate)
+                    printf '%s\n' "  password             UNCHANGED, and not because it was preserved: this run could"
+                    printf '%s\n' "                       not determine whether a credential exists, so it wrote none."
+                    printf '%s\n' "                       Writing one anyway would have rotated a live credential and"
+                    printf '%s\n' "                       stopped the server and worker authenticating."
+                    printf '%s\n' "                       Fix broker reachability or the admin principal's authorisation"
+                    printf '%s\n' "                       to describe user configs, then re-run"
                     ;;
             esac
             ;;
@@ -4121,7 +4559,7 @@ print_summary() {
 
     case "$PRODUCER_PROVISIONED" in
         yes)
-            printf '%s\n' "Steady-state producer (what the server and worker publish as):"
+            printf '%s\n' "Steady-state producer (what the server publishes as):"
             printf '%s\n' "  principal            ${ACL_PRINCIPAL_PREFIX}${PRODUCER_USER}"
             printf '%s\n' "  writable topics      every topic listed above, including the .dlt siblings"
             printf '%s\n' "  granted operations   Write, Describe"
@@ -4142,6 +4580,14 @@ print_summary() {
                     ;;
                 supplied)
                     printf '%s\n' "  password             the KAFKA_PRODUCER_SECRET you supplied"
+                    ;;
+                indeterminate)
+                    printf '%s\n' "  password             UNCHANGED, and not because it was preserved: this run could"
+                    printf '%s\n' "                       not determine whether a credential exists, so it wrote none."
+                    printf '%s\n' "                       Writing one anyway would have rotated a live credential and"
+                    printf '%s\n' "                       stopped the server and worker authenticating."
+                    printf '%s\n' "                       Fix broker reachability or the admin principal's authorisation"
+                    printf '%s\n' "                       to describe user configs, then re-run"
                     ;;
             esac
             printf '%s\n' "  REQUIRED BY BLNK     set KAFKA_SASL_USER and KAFKA_SASL_SECRET to this"
@@ -4191,6 +4637,13 @@ print_summary() {
                 supplied)
                     printf '%s\n' "  password             the KAFKA_SAMPLE_SUBSCRIBER_SECRET you supplied"
                     ;;
+                indeterminate)
+                    printf '%s\n' "  password             UNCHANGED, and not because it was preserved: this run could"
+                    printf '%s\n' "                       not determine whether a credential exists, so it wrote none"
+                    printf '%s\n' "                       rather than risk rotating one a consumer is using."
+                    printf '%s\n' "                       Fix broker reachability or the admin principal's authorisation"
+                    printf '%s\n' "                       to describe user configs, then re-run"
+                    ;;
             esac
             ;;
         skipped)
@@ -4212,7 +4665,7 @@ print_summary() {
 
     case "$PRODUCER_PROVISIONED" in
         yes)
-            printf '%s\n' "Producer principal (what the server and worker publish as):"
+            printf '%s\n' "Producer principal (what the server publishes as):"
             printf '%s\n' "  principal            ${ACL_PRINCIPAL_PREFIX}${PRODUCER_USER}"
             printf '%s\n' "  writable topics      $(join_commas "${ALL_TOPICS[@]}")"
             printf '%s\n' "  granted operations   Write, Describe on those topics"

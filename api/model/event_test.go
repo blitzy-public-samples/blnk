@@ -65,10 +65,11 @@ func derivedReference(t *testing.T) string {
 // the resource name "*" as matching every resource, so a single such entry converts
 // a per-topic grant into a cluster-wide one.
 //
-// The three TENANT category topics are accepted. What is refused is every DEAD-LETTER
-// name — those carry failure metadata and other subscribers' failed events, and are read
-// under the master key instead — and blnk.system, for the reason set out at the system
-// subtest below.
+// All FOUR category topics are accepted, blnk.system included, for the reason set out
+// at the system subtest below. What is refused is every DEAD-LETTER name — those carry
+// failure metadata and other subscribers' failed events, and are read under the master
+// key instead — along with foreign names, wildcards, and names whose category does not
+// exist in the closed four-category catalogue.
 func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *testing.T) {
 	grantable := model.SubscriberGrantableTopics(testTopicPrefix)
 	require.NotEmpty(t, grantable, "there must be at least one grantable topic to test against")
@@ -93,6 +94,7 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 		"a topic under another prefix":  "acme.transactions",
 		"an untrimmed grantable name":   " blnk.transactions ",
 		"an uppercased category":        "blnk.TRANSACTIONS",
+		"a retired category name":       "blnk.ledgers",
 	}
 	for name, topic := range refused {
 		t.Run("refuses "+name, func(t *testing.T) {
@@ -103,62 +105,74 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 		})
 	}
 
-	// THE SYSTEM CATEGORY IS REFUSED, and the argument against refusing it deserves stating
-	// because it is a reasonable one: blnk.system carries system.error, one of the thirteen
-	// event types the legacy HTTP transport delivered, so a subscriber granted nothing here has
-	// no authorized path to it.
+	// THE SYSTEM CATEGORY IS GRANTABLE, and it is the one member of the set that has to
+	// argue for itself, because blnk.system carries system.error, whose payload is the
+	// frozen legacy body and therefore carries raw error text verbatim.
 	//
-	// It is refused anyway, because THE LEGACY TRANSPORT'S AUDIENCE WAS NOT SUBSCRIBERS. There
-	// was one globally configured webhook URL — the operator's own endpoint — so "the legacy
-	// transport delivered it" says only that the OPERATOR received it. Granting blnk.system to
-	// a credential is a different act entirely: system.error's payload is the frozen legacy
-	// body, which carries the raw error text verbatim, and that text describes the inside of
-	// the deployment — a PostgreSQL error names schema, table, column and routine; a broker
-	// error names internal addresses. On a topic shared by every subscriber, each one would
-	// receive every other one's failures, in a category no per-tenant boundary applies to.
+	// It is grantable because that is EXACT PARITY with the transport being replaced.
+	// internal/notification.NotifyError already delivers system.error, with that same
+	// verbatim error text, to the single configured webhook URL — so an event carrying
+	// deployment detail to a subscriber-supplied endpoint is what Blnk does today, not
+	// something this change introduces. Refusing the category would have made the Kafka
+	// pipeline deliver strictly LESS than the webhook it replaces, which R-1 forbids: the
+	// requirement is 100% of the event types SendWebhook routes, and an event published to
+	// a topic no credential may name is not delivered to anybody.
 	//
-	// R-1 is a PUBLISHING requirement and it is met in full: all thirteen event types are
-	// published, and blnk.system is read under the master key like the dead-letter topics.
-	// The refusal now costs a subscriber NOTHING it used to receive, which is what makes it a
-	// clean boundary rather than a trade: ledger.created used to be the casualty of sharing a
-	// category with operator diagnostics, and it no longer shares one — it has its own
-	// grantable blnk.ledgers, asserted in the exact-set case below.
-	t.Run("refuses the system category", func(t *testing.T) {
-		err := validateGrantableTopics([]string{"blnk.system"}, testTopicPrefix)
-		require.Error(t, err,
-			"blnk.system is internal: its system.error payload carries raw error text describing "+
-				"the deployment, and one shared topic would hand every subscriber every other "+
-				"subscriber's failures")
-		assert.Contains(t, err.Error(), "not grantable")
+	// THE COST IS REAL AND IS RECORDED RATHER THAN GLOSSED. Because ledger.created shares
+	// blnk.system under the frozen four-category catalogue, a subscriber that wants ledger
+	// events is granted a topic that also carries system.error. That is a decision to take per
+	// subscriber, which is why the grant lives in authorized_topics and this allowlist only
+	// says what MAY be named. A fifth grantable `ledgers` category was implemented to separate
+	// them and removed: the catalogue is enumerated
+	// identically by the provisioning script, both Compose files, the Kubernetes manifests and
+	// every subscriber's topic list, so it is four everywhere or it is a deliberate contract
+	// change made in all of them at once. docs/event-streaming.md states the consequence for
+	// subscribers plainly.
+	t.Run("accepts the system category", func(t *testing.T) {
+		assert.NoError(t, validateGrantableTopics([]string{"blnk.system"}, testTopicPrefix),
+			"blnk.system must be grantable, or ledger.created — which routes to it under the "+
+				"four-category catalogue — is published to a topic no credential may name, and "+
+				"the Kafka pipeline delivers strictly less than the webhook it replaces")
 	})
 
-	t.Run("the grantable set is exactly the four tenant categories", func(t *testing.T) {
+	t.Run("the grantable set is exactly the four category topics", func(t *testing.T) {
 		// Stated as an EXACT set rather than as a series of accept/refuse cases, because
 		// every over-grant finding in this area reduces to the same question — which topics
 		// may a credential ever name — and a boundary is only checkable if it is enumerated
-		// in one place. A new category that is grantable by default would fail here, which is
-		// the point, and so would a tenant-facing category quietly dropped from the set: the
-		// UNDER-grant direction is what left ledger.created unreachable by every credential
-		// Blnk can issue, so it is asserted here with the same weight as the over-grant one.
+		// in one place. A FIFTH category appearing here would fail, which is the point, and so
+		// would a category quietly dropped from the set.
 		assert.ElementsMatch(t,
-			[]string{"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.ledgers"},
+			[]string{"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system"},
 			model.SubscriberGrantableTopics(testTopicPrefix),
-			"only tenant-facing categories are grantable; system and every dead-letter topic "+
-				"are read under the master key")
+			"all four category topics are grantable and no dead-letter topic is; which of them a "+
+				"PARTICULAR subscriber holds is decided per subscriber by authorized_topics, not "+
+				"by this allowlist")
 	})
 
-	t.Run("accepts the ledgers category", func(t *testing.T) {
-		// The positive counterpart of "refuses the system category", and the one that would
-		// have caught the arrangement this replaced. ledger.created is delivered to every
-		// subscriber by the legacy webhook today, so a credential must be able to name its
-		// topic; when it shared the internal category, this request was refused and the event
-		// was published to a topic nothing could read.
-		require.NoError(t, validateGrantableTopics([]string{"blnk.ledgers"}, testTopicPrefix),
-			"blnk.ledgers carries ledger.created — ordinary ledger data, the same shape as "+
-				"identity.created — so a subscriber must be able to be granted it")
+	t.Run("refuses every dead-letter sibling, grantable category or not", func(t *testing.T) {
+		// A `<topic>.dlt` holds Blnk's failure metadata alongside the full payload of every
+		// event that failed, for every subscriber, so it is operator-facing whatever the
+		// category it belongs to. Asserting it for a TENANT category as well as the internal
+		// one is what stops "the category is grantable" being read as "so is its sibling".
+		for _, topic := range []string{
+			"blnk.transactions.dlt",
+			"blnk.balances.dlt",
+			"blnk.identities.dlt",
+			"blnk.system.dlt",
+		} {
+			assert.Errorf(t, validateGrantableTopics([]string{topic}, testTopicPrefix),
+				"%q is a dead-letter topic and must never be grantable", topic)
+		}
+	})
 
-		assert.Error(t, validateGrantableTopics([]string{"blnk.ledgers.dlt"}, testTopicPrefix),
-			"its dead-letter sibling stays operator-facing, exactly like every other category's")
+	t.Run("refuses a category this contract does not have", func(t *testing.T) {
+		// The plausible mistake: ledger events are real and are published, but they are
+		// published to blnk.system, so blnk.ledgers is a name nothing creates and nobody may
+		// be granted.
+		err := validateGrantableTopics([]string{"blnk.ledgers"}, testTopicPrefix)
+		require.Error(t, err,
+			"ledger events live in the system category, so a ledgers topic is not grantable")
+		assert.Contains(t, err.Error(), "not grantable")
 	})
 
 	t.Run("refuses an offending topic anywhere in the list", func(t *testing.T) {
@@ -196,28 +210,183 @@ func TestValidateGrantableTopics_AcceptsOnlySubscriberFacingCategoryTopics(t *te
 // SEC-01 / SEC-03 — the recorded key-scoped authorization
 // ---------------------------------------------------------------------------
 
-// TestValidateSubscriberKeyScope_RefusesUnstorableValues covers the recorded key scope.
+// TestSubscriberRequests_AdjudicateTheKeyScopeShape pins where the key-scope SHAPE rules live.
 //
-// The value grants nothing at the broker — Kafka's authorizer has no message-key
-// dimension, so recording one makes the subscriber UNPROVISIONABLE and issuance
-// refuses it. These rules are therefore about the string being storable and
-// displayable, not about isolation: it is echoed into API responses, log lines and
-// trace attributes, and a newline in it forges a second log entry.
-func TestValidateSubscriberKeyScope_RefusesUnstorableValues(t *testing.T) {
-	assert.NoError(t, validateSubscriberKeyScope(""),
-		"recording no key scope is the only state a credential can be issued in")
-	assert.NoError(t, validateSubscriberKeyScope("ldg_9f1c8a72"),
-		"a storable value is accepted here; issuance is what refuses it")
+// This test is the inverse of the one it replaces, and the reversal is the whole point. The
+// earlier version asserted that the DTO must PASS EVERY VALUE THROUGH — newlines, surrounding
+// whitespace, half a kilobyte of it — because the service was going to refuse any non-blank
+// prefix outright with a typed 409, and answering the same state with two different codes is
+// worse for a client than answering it with one.
+//
+// The service no longer refuses it. A partition-key prefix is a CONSUMER-SIDE FILTERING
+// CONTRACT, disclosed with the credential rather than standing in the way of it, and
+// SUBSCRIBER_ISOLATION_UNENFORCEABLE is gone rather than retained unused. That removes the
+// argument for passing the value through and replaces it with the opposite one: the prefix is
+// persisted on the registry row, echoed in the credential response, and written into the log
+// fields of every issuance, revocation and provisioning failure. This validator is now the only
+// thing between a caller and a control character or an unbounded value in all three.
+//
+// So the shape rules are back, and they are asserted on BOTH paths. What must still hold is the
+// part that never depended on the refusal: a BLANK prefix is always fine, on create and as the
+// documented way to clear a legacy row on update.
+func TestSubscriberRequests_AdjudicateTheKeyScopeShape(t *testing.T) {
+	t.Run("a well-formed prefix is accepted on both paths", func(t *testing.T) {
+		create := validCreateSubscriber()
+		create.PartitionKeyPrefix = "ldg_9f1c8a72"
+		assert.NoError(t, create.Validate(testTopicPrefix))
 
-	assert.Error(t, validateSubscriberKeyScope("ldg_9f1c\n8a72"), "a newline forges a log entry")
-	assert.Error(t, validateSubscriberKeyScope("ldg\r8a72"), "a carriage return overwrites a line")
-	assert.Error(t, validateSubscriberKeyScope("ldg\x008a72"), "a NUL truncates C-side consumers")
-	assert.Error(t, validateSubscriberKeyScope("ldg\x7f"), "DEL is a control character too")
-	assert.Error(t, validateSubscriberKeyScope(" ldg_9f1c "),
-		"surrounding whitespace makes a prefix comparison match nothing, invisibly")
-	assert.Error(t, validateSubscriberKeyScope(strings.Repeat("k", maxSubscriberKeyScopeLen+1)))
-	assert.NoError(t, validateSubscriberKeyScope(strings.Repeat("k", maxSubscriberKeyScopeLen)),
+		supplied := "ldg_9f1c8a72"
+		assert.NoError(t, UpdateSubscriber{PartitionKeyPrefix: &supplied}.Validate(testTopicPrefix))
+	})
+
+	for name, prefix := range map[string]string{
+		"a prefix with a newline":  "ldg_9f1c\n8a72",
+		"a prefix with whitespace": " ldg_9f1c ",
+		"an over-long prefix":      strings.Repeat("k", 500),
+	} {
+		t.Run(name, func(t *testing.T) {
+			create := validCreateSubscriber()
+			create.PartitionKeyPrefix = prefix
+			assert.Error(t, create.Validate(testTopicPrefix),
+				"the value is persisted, echoed in the credential response and logged, and "+
+					"nothing downstream refuses it any more")
+
+			supplied := prefix
+			assert.Error(t, UpdateSubscriber{PartitionKeyPrefix: &supplied}.Validate(testTopicPrefix),
+				"and the same on update: a rule applied only on creation has an edit-shaped hole")
+		})
+	}
+
+	t.Run("an omitted prefix is still fine", func(t *testing.T) {
+		create := validCreateSubscriber()
+		create.PartitionKeyPrefix = ""
+		assert.NoError(t, create.Validate(testTopicPrefix))
+
+		cleared := ""
+		assert.NoError(t, UpdateSubscriber{PartitionKeyPrefix: &cleared}.Validate(testTopicPrefix),
+			"clearing remains the documented remedy for a legacy row that carries one")
+	})
+}
+
+// TestResolveDeadLetterEventRequest_BoundsTheOperatorNote covers the body of
+// POST /events/dead-letter/:event_id/resolve.
+//
+// The note is STORED and then projected back out by the inventory listing, so it is bounded
+// for the two reasons every operator-supplied label in this pipeline is: an unbounded note
+// becomes an unbounded field in every response, and a control character corrupts the log line
+// and the dashboard cell it lands in. It is OPTIONAL because a required free-text field does
+// not produce explanations — it produces "x" and "done", which look like records without being
+// any.
+func TestResolveDeadLetterEventRequest_BoundsTheOperatorNote(t *testing.T) {
+	t.Run("an absent note is valid", func(t *testing.T) {
+		assert.NoError(t, ResolveDeadLetterEventRequest{}.Validate())
+		assert.NoError(t, ResolveDeadLetterEventRequest{Note: "   "}.Validate(),
+			"whitespace only is the same as absent, not a refusal")
+	})
+
+	t.Run("an ordinary explanation is accepted", func(t *testing.T) {
+		assert.NoError(t, ResolveDeadLetterEventRequest{
+			Note: "replayed after the broker came back; ticket 4182",
+		}.Validate())
+	})
+
+	t.Run("the bound is enforced and the bound itself is accepted", func(t *testing.T) {
+		assert.NoError(t, ResolveDeadLetterEventRequest{
+			Note: strings.Repeat("x", maxDeadLetterResolutionNoteLen),
+		}.Validate())
+
+		err := ResolveDeadLetterEventRequest{
+			Note: strings.Repeat("x", maxDeadLetterResolutionNoteLen+1),
+		}.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "at most")
+	})
+
+	t.Run("the bound is in RUNES, not bytes", func(t *testing.T) {
+		// Three bytes per rune. A byte-counted bound would refuse a legitimate note written
+		// in Japanese while accepting a longer one written in ASCII, which is a bound on the
+		// operator's language rather than on the field.
+		assert.NoError(t, ResolveDeadLetterEventRequest{
+			Note: strings.Repeat("台", maxDeadLetterResolutionNoteLen),
+		}.Validate())
+
+		require.Error(t, ResolveDeadLetterEventRequest{
+			Note: strings.Repeat("台", maxDeadLetterResolutionNoteLen+1),
+		}.Validate())
+	})
+
+	t.Run("control characters are refused, newlines included", func(t *testing.T) {
+		for name, note := range map[string]string{
+			"a NUL":             "replayed\x00",
+			"a newline":         "replayed\nthen verified",
+			"a carriage return": "replayed\rthen verified",
+			"a tab":             "replayed\tthen verified",
+			"a DEL":             "replayed\x7f",
+		} {
+			t.Run(name, func(t *testing.T) {
+				err := ResolveDeadLetterEventRequest{Note: note}.Validate()
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "control characters")
+			})
+		}
+	})
+
+	t.Run("the binder bound and the validator bound are both present", func(t *testing.T) {
+		// The binder counts BYTES and stops a multi-megabyte body being decoded at all; the
+		// validator counts RUNES and is what the column and the response field are sized for.
+		// Both are needed, and the stricter applies.
+		field, ok := reflect.TypeOf(ResolveDeadLetterEventRequest{}).FieldByName("Note")
+		require.True(t, ok)
+		assert.Equal(t, "omitempty,max=4096", field.Tag.Get("binding"),
+			"the byte bound is the outer guard: without it an arbitrarily large body is decoded "+
+				"before any validation runs")
+
+		assert.Equal(t, 1024, maxDeadLetterResolutionNoteLen,
+			"blnk.maxDeadLetterResolutionNoteLength is 1024; they are separate constants because "+
+				"this package cannot import the root package, so nothing but this assertion keeps "+
+				"them equal — and a DTO that accepted more than the service stores would refuse the "+
+				"request one layer later with a different message")
+	})
+}
+
+// TestValidateSubscriberName_RefusesUnstorableLabels covers the human label. CWE-20.
+//
+// The label was previously required and trimmed and nothing more, which bounds nothing: the
+// column is TEXT, which has no length limit in PostgreSQL, and NOT NULL does not stop a
+// megabyte of text or a value carrying newlines and terminal escapes. It is not inert either —
+// it is echoed in the subscriber list and the credential response and written into
+// operator-facing log lines — so these rules are about the string being storable and
+// displayable.
+func TestValidateSubscriberName_RefusesUnstorableLabels(t *testing.T) {
+	assert.NoError(t, validateSubscriberName("ledger-ops", true),
+		"an ordinary label must be accepted")
+	assert.NoError(t, validateSubscriberName("  ledger-ops  ", true),
+		"surrounding whitespace is trimmed rather than refused: unlike a key prefix, a label is "+
+			"not compared against anything, so the difference is cosmetic")
+
+	assert.Error(t, validateSubscriberName("", true), "a blank label defeats the reason the field exists")
+	assert.Error(t, validateSubscriberName("   ", true), "a label of spaces is a blank label")
+
+	assert.Error(t, validateSubscriberName("ledger\nops", true), "a newline forges a second log entry")
+	assert.Error(t, validateSubscriberName("ledger\rops", true), "a carriage return overwrites a line")
+	assert.Error(t, validateSubscriberName("ledger\x00ops", true), "a NUL truncates C-side consumers")
+	assert.Error(t, validateSubscriberName("ledger\x1b[31mops", true), "an escape sequence rewrites a terminal")
+	assert.Error(t, validateSubscriberName("ledger\x7fops", true), "DEL is a control character too")
+
+	assert.Error(t, validateSubscriberName(strings.Repeat("n", maxSubscriberNameLen+1), true),
+		"an unbounded label must be refused")
+	assert.NoError(t, validateSubscriberName(strings.Repeat("n", maxSubscriberNameLen), true),
 		"the bound itself must be accepted, or the limit is off by one")
+
+	// THE BOUND IS IN RUNES, NOT BYTES. Counting bytes would give a label written in a
+	// non-Latin script roughly a third of the allowance the same label gets in English, which
+	// is a bound on the alphabet rather than on the value.
+	assert.NoError(t, validateSubscriberName(strings.Repeat("台", maxSubscriberNameLen), true),
+		"a label at the bound in runes must be accepted however many bytes it occupies")
+	assert.Error(t, validateSubscriberName(strings.Repeat("台", maxSubscriberNameLen+1), true))
+
+	assert.NoError(t, validateSubscriberName("réconciliation d'équipe 🇫🇷", true),
+		"the alphabet is deliberately unrestricted: a name is a human label")
 }
 
 // ---------------------------------------------------------------------------
@@ -370,13 +539,19 @@ func TestCreateSubscriber_IgnoresACallerSuppliedPrincipal(t *testing.T) {
 		"a supplied group must have no influence whatsoever")
 }
 
-// TestCreateSubscriber_Validate covers what remains caller-supplied.
-func TestCreateSubscriber_Validate(t *testing.T) {
-	valid := CreateSubscriber{
+// validCreateSubscriber returns a registration request that passes validation, so a test can
+// change exactly the one field it is about.
+func validCreateSubscriber() CreateSubscriber {
+	return CreateSubscriber{
 		SubscriberID:     "acme_prod",
 		Name:             "Acme production",
 		AuthorizedTopics: []string{"blnk.transactions"},
 	}
+}
+
+// TestCreateSubscriber_Validate covers what remains caller-supplied.
+func TestCreateSubscriber_Validate(t *testing.T) {
+	valid := validCreateSubscriber()
 	assert.NoError(t, valid.Validate(testTopicPrefix))
 
 	t.Run("an omitted subscriber ID is accepted for generation", func(t *testing.T) {
@@ -422,10 +597,35 @@ func TestCreateSubscriber_Validate(t *testing.T) {
 		assert.Error(t, request.Validate(testTopicPrefix))
 	})
 
-	t.Run("refuses an internal webhook URL", func(t *testing.T) {
-		request := valid
-		request.WebhookURL = "https://169.254.169.254/latest/meta-data/"
-		assert.Error(t, request.Validate(testTopicPrefix))
+	t.Run("refuses a missing name", func(t *testing.T) {
+		// Enforced by Validate rather than by a binding:"required" tag, so an omitted
+		// name and a whitespace-only one answer the same code — GEN_VALIDATION_ERROR —
+		// instead of the binder's GEN_MALFORMED_REQUEST for one and this for the other.
+		for name, value := range map[string]string{"omitted": "", "whitespace": "  \t "} {
+			t.Run(name, func(t *testing.T) {
+				request := valid
+				request.Name = value
+				assert.Error(t, request.Validate(testTopicPrefix),
+					"name is the one field no service can invent, and it is NOT NULL in the table")
+			})
+		}
+	})
+
+	t.Run("carries no webhook_url field at all", func(t *testing.T) {
+		// C-01. The four deprecated webhook-subscription routes are fronted by the
+		// sunset guard and answer 410 Gone after the retirement instant; THIS route is
+		// not deprecated and not guarded. A webhook_url accepted here would therefore
+		// let a caller keep writing legacy webhook state after the surface that owns it
+		// had been retired, which is the same as not retiring it.
+		//
+		// Asserted against the JSON shape rather than the Go struct, because the shape
+		// is what a client sees: an unknown key is simply ignored by encoding/json, so
+		// a caller sending one is not refused — it has no effect, which is the point.
+		body, err := json.Marshal(valid)
+		require.NoError(t, err)
+		assert.NotContains(t, string(body), "webhook_url",
+			"the general registration route must neither accept nor echo legacy webhook state; "+
+				"POST /subscribers/:id/webhook-subscription is the guarded write path")
 	})
 
 	t.Run("Derived refuses a non-canonical identifier", func(t *testing.T) {
@@ -461,14 +661,31 @@ func TestUpdateSubscriber_Validate(t *testing.T) {
 		assert.NoError(t, UpdateSubscriber{PartitionKeyPrefix: &cleared}.Validate(testTopicPrefix))
 	})
 
-	t.Run("a present URL is checked at the same standard as create", func(t *testing.T) {
-		// A policy applied only on creation is a policy with an edit-shaped hole.
-		internal := "https://10.0.0.7/blnk"
-		assert.Error(t, UpdateSubscriber{WebhookURL: &internal}.Validate(testTopicPrefix))
+	// A rule applied only on creation is a rule with an edit-shaped hole, which is the same
+	// reason the URL is re-checked below. A rename is the ordinary way a hostile label would
+	// arrive: creation is often scripted from a template, editing is done by hand.
+	t.Run("a present name is checked at the same standard as create", func(t *testing.T) {
+		hostile := "ledger\nops"
+		assert.Error(t, UpdateSubscriber{Name: &hostile}.Validate(testTopicPrefix))
 
-		cleared := ""
-		assert.NoError(t, UpdateSubscriber{WebhookURL: &cleared}.Validate(testTopicPrefix))
+		oversized := strings.Repeat("n", maxSubscriberNameLen+1)
+		assert.Error(t, UpdateSubscriber{Name: &oversized}.Validate(testTopicPrefix))
+
+		blank := "   "
+		assert.Error(t, UpdateSubscriber{Name: &blank}.Validate(testTopicPrefix),
+			"a present blank name is an attempt to erase the label, not an omission — the pointer "+
+				"is what distinguishes the two, and omitting the field is how you leave it alone")
+
+		valid := "ledger-ops"
+		assert.NoError(t, UpdateSubscriber{Name: &valid}.Validate(testTopicPrefix))
 	})
+
+	// The legacy webhook URL is NOT a field on this request any more: the subscriber
+	// registry no longer carries a per-subscriber destination, so there is nothing here for
+	// an edit to reach. The "a policy applied only on creation is a policy with an
+	// edit-shaped hole" assertion it used to make is made instead against the deprecated
+	// webhook-subscription requests, which are the only shapes that still take a URL — see
+	// TestWebhookSubscriptionRequests_ValidateTheirURL below.
 }
 
 // TestWebhookSubscriptionRequests_ValidateTheirURL covers the one route whose entire
@@ -559,12 +776,31 @@ func TestNewSubscriberResponse_ProjectsTheNullableColumns(t *testing.T) {
 		MigratedAt:         &migrated,
 	})
 	assert.Equal(t, prefix, full.PartitionKeyPrefix)
-	assert.Equal(t, webhook, full.WebhookURL)
 	require.NotNil(t, full.MigratedAt)
+
+	// C-01: the recorded legacy URL is NOT projected, even though the row carries one.
+	// It is readable through GET /subscribers/:id/webhook-subscription alone, which the
+	// sunset guard fronts — so it stops being disclosed at the retirement instant.
+	// Echoing it here as well would keep it readable through an unguarded route after
+	// that, and the two reads would then disagree about whether the legacy surface still
+	// exists.
+	//
+	// Asserted on the marshalled body rather than a struct field, because a field that
+	// no longer exists cannot be asserted absent in Go, and the body is what a client
+	// reads.
+	fullBody, err := json.Marshal(full)
+	require.NoError(t, err)
+	assert.NotContains(t, string(fullBody), "webhook_url",
+		"the general subscriber projection must not disclose the legacy endpoint")
+	assert.NotContains(t, string(fullBody), webhook)
+
+	// migrated_at IS projected, and deliberately. It is migration progress about this
+	// deployment rather than legacy webhook state — no endpoint, no third-party data —
+	// and a progress report needs it before and after the sunset alike.
+	assert.Contains(t, string(fullBody), "migrated_at")
 
 	bare := NewSubscriberResponse(model.EventSubscriber{SubscriberID: "acme_prod"})
 	assert.Empty(t, bare.PartitionKeyPrefix)
-	assert.Empty(t, bare.WebhookURL)
 	assert.Nil(t, bare.MigratedAt)
 	assert.Nil(t, bare.CredentialIssuedAt, "nil is the reliable no-credential test")
 
@@ -578,6 +814,41 @@ func TestNewSubscriberResponse_ProjectsTheNullableColumns(t *testing.T) {
 // ---------------------------------------------------------------------------
 // DATA-01 — the dead-letter projection is an inventory, not a dump
 // ---------------------------------------------------------------------------
+
+// deadLetteredEntry is the NARROW inventory entry the repository returns for the stored row
+// below, projected exactly as the listing statement projects it (PERF-P06): every column the
+// response needs, the body's SIZE, and not the body.
+//
+// The two fixtures are kept separate deliberately. deadLetteredRow describes what is STORED,
+// including the payload whose content DATA-01 is about; this one describes what the repository
+// is willing to READ. Deriving one from the other is what makes the removal assertions
+// meaningful — a fixture that simply never mentioned the payload would assert absence rather
+// than removal, and would keep passing if the projection widened again.
+func deadLetteredEntry(t *testing.T) model.DeadLetterInventoryEntry {
+	t.Helper()
+
+	row := deadLetteredRow(t)
+
+	return model.DeadLetterInventoryEntry{
+		ID:               row.ID,
+		EventID:          row.EventID,
+		EventType:        row.EventType,
+		AggregateID:      row.AggregateID,
+		PartitionKey:     row.PartitionKey,
+		LedgerID:         row.LedgerID,
+		Topic:            row.Topic,
+		SchemaVersion:    row.SchemaVersion,
+		OccurredAt:       row.OccurredAt,
+		Status:           row.Status,
+		Attempts:         row.Attempts,
+		LastError:        row.LastError,
+		FirstAttemptedAt: row.FirstAttemptedAt,
+		LastAttemptedAt:  row.LastAttemptedAt,
+		DLTTopic:         row.DLTTopic,
+		FailureMetadata:  row.FailureMetadata,
+		PayloadBytes:     len(row.Payload),
+	}
+}
 
 // deadLetteredRow is a stored row whose every sensitive field is populated, so the
 // projection assertions are testing removal rather than absence.
@@ -630,8 +901,7 @@ func deadLetteredRow(t *testing.T) model.EventOutbox {
 // would have returned all of it, for a triage task that needs none of it — replay
 // re-publishes the stored bytes server-side, so the operator never supplies them.
 func TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText(t *testing.T) {
-	row := deadLetteredRow(t)
-	item := NewDeadLetterEvent(row)
+	item := NewDeadLetterEvent(deadLetteredEntry(t))
 
 	body, err := json.Marshal(item)
 	require.NoError(t, err)
@@ -644,7 +914,15 @@ func TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText(t *testing.T) {
 			"the projection must not carry payload content (%q leaked)", sensitive)
 	}
 
-	for _, internal := range []string{"10.0.0.4", "10.0.0.7", "9092", "broken pipe", "write tcp"} {
+	// The BROKER ADDRESS AS AN ADDRESS, not the bare port digits. "9092" on its own is four
+	// digits, and the rendered body carries RFC3339 timestamps with nanosecond precision — so
+	// a substring test for it fails whenever a nanosecond fraction happens to contain that
+	// sequence, which is roughly one run in a few hundred and has nothing to do with the
+	// property under test. Asserting the host:port form keeps the guard exact: a leaked broker
+	// endpoint always appears with its host, because that is how the failure text names it.
+	for _, internal := range []string{
+		"10.0.0.4", "10.0.0.7", ":9092", "broken pipe", "write tcp",
+	} {
 		assert.NotContains(t, rendered, internal,
 			"the projection must not describe the deployment (%q leaked)", internal)
 	}
@@ -665,12 +943,30 @@ func TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText(t *testing.T) {
 		_, present := reflect.TypeOf(DeadLetterEvent{}).FieldByName(field)
 		assert.False(t, present, "DeadLetterEvent must have no %s field", field)
 	}
+
+	// The guarantee moved one layer DOWN as well (PERF-P06). The projection this response is
+	// built from carries the body's size and not the body, so the bytes are never read out of
+	// the database at all — the response could not carry them even if it wanted to. Asserted
+	// structurally, because a widened projection is how a payload would find its way back
+	// into a listing, and it would do so without any change to DeadLetterEvent.
+	entryType := reflect.TypeOf(model.DeadLetterInventoryEntry{})
+	for _, field := range []string{"Payload", "PayloadRaw", "EventRaw"} {
+		_, present := entryType.FieldByName(field)
+		assert.False(t, present,
+			"model.DeadLetterInventoryEntry must have no %s field: the listing statement must not "+
+				"read a body it has no use for", field)
+	}
+
+	sizeField, hasSize := entryType.FieldByName("PayloadBytes")
+	require.True(t, hasSize, "the projection must still report the body's SIZE")
+	assert.Equal(t, reflect.Int, sizeField.Type.Kind(),
+		"the size is a count, which is what octet_length returns")
 }
 
 // TestNewDeadLetterEvent_KeepsWhatTriageActuallyNeeds is the other half: minimizing
 // must not leave the endpoint useless.
 func TestNewDeadLetterEvent_KeepsWhatTriageActuallyNeeds(t *testing.T) {
-	row := deadLetteredRow(t)
+	row := deadLetteredEntry(t)
 	item := NewDeadLetterEvent(row)
 
 	assert.Equal(t, row.EventID, item.EventID, "the replay handle must survive")
@@ -693,7 +989,7 @@ func TestNewDeadLetterEvent_KeepsWhatTriageActuallyNeeds(t *testing.T) {
 	assert.Equal(t, row.SchemaVersion, item.SchemaVersion)
 	assert.Equal(t, row.OccurredAt, item.OccurredAt)
 
-	assert.Equal(t, len(row.Payload), item.PayloadBytes,
+	assert.Equal(t, row.PayloadBytes, item.PayloadBytes,
 		"the size is what confirms or refutes a message_too_large classification")
 	assert.Positive(t, item.PayloadBytes)
 
@@ -707,7 +1003,7 @@ func TestNewDeadLetterEvent_KeepsWhatTriageActuallyNeeds(t *testing.T) {
 // own columns are unset — the two are written by different steps of one failure, so a
 // row can legitimately carry one and not the other.
 func TestNewDeadLetterEvent_FillsAttemptGapsFromTheFailureMetadata(t *testing.T) {
-	row := deadLetteredRow(t)
+	row := deadLetteredEntry(t)
 	row.FirstAttemptedAt = nil
 	row.LastAttemptedAt = nil
 	row.Attempts = 0
@@ -730,7 +1026,7 @@ func TestNewDeadLetterEvent_FillsAttemptGapsFromTheFailureMetadata(t *testing.T)
 // TestNewDeadLetterEvent_HandlesAnUnparseableMetadataBlob proves the projection does
 // not fail on Blnk's own bookkeeping being malformed.
 func TestNewDeadLetterEvent_HandlesAnUnparseableMetadataBlob(t *testing.T) {
-	row := deadLetteredRow(t)
+	row := deadLetteredEntry(t)
 	row.FailureMetadata = json.RawMessage(`{not json`)
 
 	item := NewDeadLetterEvent(row)
@@ -743,12 +1039,12 @@ func TestNewDeadLetterEvent_HandlesAnUnparseableMetadataBlob(t *testing.T) {
 // TestNewDeadLetterEvent_OnANeverFailedRowReportsNoReason covers a pending row read
 // through the same projection: no failure means no reason, not "unclassified".
 func TestNewDeadLetterEvent_OnANeverFailedRowReportsNoReason(t *testing.T) {
-	item := NewDeadLetterEvent(model.EventOutbox{
-		EventID:   "0f6e2c8a-1b4d-4e9f-8a7c-2d5b6e3f1a9c",
-		EventType: "transaction.applied",
-		Topic:     "blnk.transactions",
-		Status:    "pending",
-		Payload:   json.RawMessage(`{"event":"transaction.applied","data":{}}`),
+	item := NewDeadLetterEvent(model.DeadLetterInventoryEntry{
+		EventID:      "0f6e2c8a-1b4d-4e9f-8a7c-2d5b6e3f1a9c",
+		EventType:    "transaction.applied",
+		Topic:        "blnk.transactions",
+		Status:       "pending",
+		PayloadBytes: len(`{"event":"transaction.applied","data":{}}`),
 	})
 
 	assert.Empty(t, item.FailureReason)
@@ -831,5 +1127,124 @@ func TestClassifyFailureReason_DistinguishesTheActionableCases(t *testing.T) {
 		// the actionable half: it will not clear on its own.
 		assert.Equal(t, FailureReasonAuthorizationDenied,
 			classifyFailureReason("broker unavailable: authorization failed for principal"))
+	})
+}
+
+// TestNewSubscriberResponse_StatesWhatTheNextCallWillDo covers the two predictions the
+// subscriber projection makes about calls the client has not made yet.
+//
+// Both exist because the state they describe was previously reported accurately field by field
+// while the CONSEQUENCE — the only part anybody acts on — was in a Go doc comment.
+//
+//   - CREDENTIAL ISSUANCE BLOCKED. A row whose next credential call will be refused says so on
+//     the row rather than at the call. Two states block it — a deregistration whose broker-side
+//     revocation is still owed, and an empty topic grant — and both are properties of the ROW, so
+//     both are knowable the moment it is read. A RECORDED partition key prefix is deliberately
+//     NOT one of them: that refusal once existed, it implemented no part of the key scope, and it
+//     was replaced by issuing the credential and STATING which dimensions the broker enforces.
+//     The assertions below pin that down, because a prediction of a refusal that no longer
+//     happens would be worse than no prediction at all.
+//   - REVOCATION PENDING. docs/metrics.md answers the critical revocation alert with "find the
+//     affected subscribers with GET /subscribers", and the response reported none of it — so the
+//     documented answer to "which subscribers owe a revocation?" was a psql session.
+//
+// Both are asserted present-and-false on an ordinary row too. A client that had to infer either
+// from a MISSING field would infer it wrong, which is why neither carries omitempty.
+func TestNewSubscriberResponse_StatesWhatTheNextCallWillDo(t *testing.T) {
+	base := func() model.EventSubscriber {
+		return model.EventSubscriber{
+			SubscriberID:     "sub_projection",
+			Name:             "Projection",
+			KafkaPrincipal:   "blnk-sub-sub_projection",
+			ConsumerGroupID:  "blnk-sub-sub_projection.default",
+			AuthorizedTopics: []string{"blnk.transactions"},
+		}
+	}
+
+	t.Run("an ordinary row reports both as settled", func(t *testing.T) {
+		response := NewSubscriberResponse(base())
+
+		assert.False(t, response.CredentialIssuanceBlocked,
+			"a row with no key scope is provisionable, and says so rather than staying silent")
+		assert.Empty(t, response.CredentialIssuanceBlockedReason,
+			"the reason is present only when there is one, so it cannot be read as a warning")
+		assert.False(t, response.RevocationPending)
+		assert.Empty(t, response.RevocationPendingReason)
+		assert.Nil(t, response.RevocationPendingAt)
+	})
+
+	// The key-scoped row is the case that changed. It is asserted here, in the test that
+	// covers the predictions, precisely because the prediction it USED to carry was the
+	// refusal: a reader of this file has to be able to see that the absence of a block on a
+	// key-scoped row is intended and not an omission.
+	t.Run("a recorded key scope is provisionable and the scope is declared, not refused", func(t *testing.T) {
+		row := base()
+		prefix := "ldg_acme"
+		row.PartitionKeyPrefix = &prefix
+
+		response := NewSubscriberResponse(row)
+
+		require.False(t, response.CredentialIssuanceBlocked,
+			"a recorded partition key prefix no longer withholds the credential: the refusal "+
+				"implemented no part of the key scope, it withdrew a mandatory capability, and it "+
+				"was replaced by issuing the credential and declaring what the broker enforces")
+		assert.Empty(t, response.CredentialIssuanceBlockedReason,
+			"and no remedy is offered, because there is nothing to remedy")
+		assert.Equal(t, prefix, response.PartitionKeyPrefix,
+			"the recorded value is still reported: it is the narrowing the subscriber has to apply")
+		assert.False(t, response.EnforcedAccess.PartitionKeyPrefixEnforced,
+			"the enforcement declaration must keep saying the prefix is not a broker scope — that "+
+				"statement is what replaced the refusal, so it carries the whole warning now")
+		assert.True(t, response.EnforcedAccess.ClientSideKeyFilteringRequired,
+			"AND it must say whose job the narrowing is, in machine-readable form, because a "+
+				"consumer that reads only 'not enforced' learns that its scope is wider than "+
+				"recorded without learning that it is the one that has to close the gap")
+		assert.Equal(t, prefix, response.EnforcedAccess.PartitionKeyPrefix,
+			"restated inside the object that says the broker does not enforce it, which is the "+
+				"only place a reader cannot mistake it for a boundary")
+	})
+
+	t.Run("an empty topic grant predicts the refusal and names the remedy", func(t *testing.T) {
+		row := base()
+		row.AuthorizedTopics = nil
+
+		response := NewSubscriberResponse(row)
+
+		require.True(t, response.CredentialIssuanceBlocked,
+			"a credential authorised for nothing is a live SCRAM principal with no purpose, so "+
+				"issuance refuses it and the row has to say so before the call is made")
+		assert.Contains(t, response.CredentialIssuanceBlockedReason, "authorized_topics",
+			"the reason must name the field to set")
+	})
+
+	t.Run("a deregistration in flight predicts the refusal", func(t *testing.T) {
+		row := base()
+		pendingAt := time.Date(2026, 5, 1, 14, 2, 0, 0, time.UTC)
+		row.RevocationPendingAt = &pendingAt
+
+		response := NewSubscriberResponse(row)
+
+		require.True(t, response.CredentialIssuanceBlocked,
+			"issuing here would re-arm a principal whose revocation is already owed, which is a "+
+				"safety property rather than a convenience")
+		assert.Contains(t, response.CredentialIssuanceBlockedReason, "deregister",
+			"and the reason must name the state to complete or abandon")
+	})
+
+	t.Run("a tombstoned row reports the outstanding revocation and when it began", func(t *testing.T) {
+		row := base()
+		pendingAt := time.Date(2026, 5, 1, 14, 2, 0, 0, time.UTC)
+		row.RevocationPendingAt = &pendingAt
+
+		response := NewSubscriberResponse(row)
+
+		require.True(t, response.RevocationPending)
+		require.NotNil(t, response.RevocationPendingAt,
+			"the instant is what turns 'a cleanup is outstanding' into the age the alert is stated "+
+				"over")
+		assert.Equal(t, pendingAt, response.RevocationPendingAt.UTC())
+		assert.Contains(t, response.RevocationPendingReason, "revocation",
+			"and the reason must name the outstanding broker-side revocation, which is the only "+
+				"thing a tombstone means now that a confirmed revocation clears it")
 	})
 }

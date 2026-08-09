@@ -1115,7 +1115,8 @@ func (b *Blnk) EnqueueLegacyWebhookDelivery(eventID string, body []byte) error {
 			return nil
 		}
 
-		logrus.WithError(err).WithField("event_id", eventID).Error("could not enqueue legacy webhook delivery")
+		withLoggableCause(logrus.WithField("event_id", eventID), err).
+			Error("could not enqueue legacy webhook delivery")
 
 		return err
 	}

@@ -501,7 +501,7 @@ func runWorkers(ctx context.Context, b *blnkInstance, conf *config.Configuration
 	}
 	if shutdown != nil {
 		defer func() {
-			tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			tctx, cancel := context.WithTimeout(context.Background(), telemetryFlushTimeout)
 			defer cancel()
 			if err := shutdown(tctx); err != nil {
 				logrus.Errorf("Error during shutdown: %v", err)
@@ -556,6 +556,19 @@ func runWorkers(ctx context.Context, b *blnkInstance, conf *config.Configuration
 		hotSrv.Shutdown()
 	}
 	srv.Shutdown()
+
+	// Close the service container (PERF-P17), and only now that every worker server has
+	// stopped. This role is a PRODUCER — handleTransactionRejection publishes
+	// transaction.rejected through the same publisher — so closing it while a handler could
+	// still be running would fail that publish rather than tidy up after it. The asynq
+	// Shutdown calls above are synchronous and wait for in-flight tasks, which is what makes
+	// this line safe here and unsafe anywhere above it.
+	if err := b.blnk.Close(); err != nil {
+		logrus.WithError(err).Error(
+			"closing the service container reported an error; some of the publisher or the asynq " +
+				"client may not have shut down cleanly",
+		)
+	}
 
 	logrus.Info("Shutdown complete.")
 	return nil
@@ -620,10 +633,16 @@ func startMonitoringServer(conf *config.Configuration) *http.Server {
 	}
 
 	monitoringAddr := fmt.Sprintf(":%s", conf.Queue.MonitoringPort)
-	srv := &http.Server{
+
+	// Bounded with exactly the same limits as the API listener (PERF-P25), through the shared
+	// helper rather than a second opinion written out here. This listener is the one more
+	// likely to be forgotten and the less likely to be behind an ingress that would bound it
+	// anyway — it exists to serve the asynqmon dashboard and /metrics to an operator or a
+	// scraper, so it is reached directly.
+	srv := hardenHTTPServer(&http.Server{
 		Addr:    monitoringAddr,
 		Handler: monitoringMux,
-	}
+	})
 
 	go func() {
 		logrus.Infof("Worker monitoring server listening on %s (health: /health, dashboard: /monitoring)", monitoringAddr)

@@ -25,10 +25,24 @@ spec:
         io.kompose.service: jaeger
     spec:
       containers:
-        - env:
-            - name: COLLECTOR_OTLP_ENABLED
-              value: "true"
-          image: jaegertracing/all-in-one:latest
+        # PINNED BY VERSION AND DIGEST, AND ON THE v2 IMAGE, NOT v1.
+        #
+        #   "latest" resolved to jaegertracing/all-in-one:1.76.0, and that image prints
+        #   its own end-of-life notice on startup: Jaeger v1 reached end-of-life on
+        #   31 December 2025 and receives no further bug fixes or security patches.
+        #   Pinning the v1 digest would have frozen a knowingly unpatched image, so the
+        #   pin moves to the supported line.
+        #
+        #   jaegertracing/jaeger is the v2 all-in-one and needs no configuration file for
+        #   this use: OTLP ingest on 4317/gRPC and 4318/HTTP and the UI on 16686 are on by
+        #   default. COLLECTOR_OTLP_ENABLED is therefore GONE rather than renamed — it was
+        #   a v1-only switch that v2 ignores, and leaving it would read as load-bearing
+        #   configuration while doing nothing. The container ports and the livenessProbe
+        #   below are unchanged and were verified against the v2 image.
+        #
+        #   Re-pin the tag and the digest together; a tag can be repushed over a
+        #   different image, a digest cannot.
+        - image: jaegertracing/jaeger:2.20.0@sha256:4a130978c31a30d9baadd9fd902eeb779ed7bf2efd53e8b17bd79069e689da1b
           livenessProbe:
             exec:
               command:

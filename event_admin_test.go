@@ -24,6 +24,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -42,6 +43,7 @@ import (
 
 	apimodel "github.com/blnkfinance/blnk/api/model"
 	"github.com/blnkfinance/blnk/config"
+	"github.com/blnkfinance/blnk/internal/apierror"
 	"github.com/blnkfinance/blnk/internal/metrics"
 	"github.com/blnkfinance/blnk/model"
 )
@@ -76,20 +78,17 @@ import (
 // in the canonical order provisioning uses.
 //
 // blnk.system carries ledger.created and system.error and is also where an event type the
-// catalogue does not recognise is routed. It is INTERNAL — no subscriber can be granted it
-// — but Blnk itself writes to it, so it must be provisioned with the same geometry as every
-// other topic. A system topic that does not exist would strand both Blnk's own records and
-// exactly the events that already indicate a routing defect.
+// catalogue does not recognise is routed, so it must be provisioned with the same geometry as
+// every other topic. A system topic that does not exist would strand both Blnk's own records
+// and exactly the events that already indicate a routing defect.
 var expectedEventTopics = []string{
 	"blnk.transactions",
 	"blnk.balances",
 	"blnk.identities",
-	"blnk.ledgers",
 	"blnk.system",
 	"blnk.transactions.dlt",
 	"blnk.balances.dlt",
 	"blnk.identities.dlt",
-	"blnk.ledgers.dlt",
 	"blnk.system.dlt",
 }
 
@@ -118,6 +117,21 @@ type fakeAdminClient struct {
 	end   map[string]map[int]int64
 	// committed is the consumer group's committed offsets per topic and partition.
 	committed map[string]map[int]int64
+
+	// windowStart is the offset a TIMESTAMP request resolves to, per partition.
+	//
+	// A timestamp request is a DIFFERENT question from FirstOffsetOf or LastOffsetOf and
+	// kafka-go answers it in a different field — the Offsets map rather than FirstOffset or
+	// LastOffset — so it is modelled separately here (PERF-P05). A partition with no entry
+	// resolves to -1, which is the broker's "nothing that recent". A partition listed in
+	// windowStartOmitted is answered with NO entry at all, which is what an unreadable
+	// partition looks like and must stay distinguishable from an empty one.
+	windowStart        map[string]map[int]int64
+	windowStartOmitted map[string]map[int]bool
+
+	// timeOffsetRequests counts the timestamp requests, so a test can assert that a window is
+	// read in its OWN round trip and only when one was asked for.
+	timeOffsetRequests int
 	// scram maps a principal to the SCRAM mechanisms it holds credentials for.
 	scram map[string][]kafka.ScramMechanism
 	// bindings is the broker's ACL store: CreateACLs adds to it, DeleteACLs removes the
@@ -190,6 +204,8 @@ func newFakeAdminClient() *fakeAdminClient {
 		metadataTopicErrors: map[string]error{},
 		offsetErrors:        map[string]map[int]error{},
 		committedErrors:     map[string]map[int]error{},
+		windowStart:         map[string]map[int]int64{},
+		windowStartOmitted:  map[string]map[int]bool{},
 	}
 }
 
@@ -236,6 +252,39 @@ func (f *fakeAdminClient) withOffsets(topic string, partition int, first, end in
 	f.end[topic][partition] = end
 
 	return f
+}
+
+// withWindowStart sets the offset a TIMESTAMP request resolves to for one partition: the first
+// record written at or after the reconciliation window's start.
+func (f *fakeAdminClient) withWindowStart(topic string, partition int, offset int64) *fakeAdminClient {
+	if f.windowStart[topic] == nil {
+		f.windowStart[topic] = map[int]int64{}
+	}
+	f.windowStart[topic][partition] = offset
+
+	return f
+}
+
+// withUnreadableWindow makes one partition answer a timestamp request with NO offset at all.
+//
+// That is what an unreadable partition looks like, and it must stay distinguishable from a
+// partition holding nothing that recent: reading the first as the second makes the broker-side
+// count short, and short is indistinguishable from loss.
+func (f *fakeAdminClient) withUnreadableWindow(topic string, partition int) *fakeAdminClient {
+	if f.windowStartOmitted[topic] == nil {
+		f.windowStartOmitted[topic] = map[int]bool{}
+	}
+	f.windowStartOmitted[topic][partition] = true
+
+	return f
+}
+
+// snapshotTimeOffsetRequests returns how many timestamp requests were issued.
+func (f *fakeAdminClient) snapshotTimeOffsetRequests() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.timeOffsetRequests
 }
 
 // withCommitted sets one partition's committed offset for the consumer group.
@@ -789,6 +838,46 @@ func (f *fakeAdminClient) ListOffsets(
 				FirstOffset: -1,
 				LastOffset:  -1,
 			}
+
+			// A TIMESTAMP request, which is neither of the two sentinels. kafka-go answers it
+			// in the Offsets map, and the fake must do the same or the production code would be
+			// reading a field the real client never fills.
+			if request.Timestamp != int64(kafka.FirstOffset) && request.Timestamp != int64(kafka.LastOffset) {
+				f.timeOffsetRequests++
+
+				if injected, ok := f.offsetErrors[topic][request.Partition]; ok {
+					offsets.Error = injected
+					response.Topics[topic] = append(response.Topics[topic], offsets)
+
+					continue
+				}
+
+				if f.windowStartOmitted[topic][request.Partition] {
+					// UNREADABLE: the partition is left out of the response altogether, which
+					// is what the real client produces for a partition the broker did not
+					// answer for. It must stay distinguishable from "nothing that recent",
+					// which is an EMPTY Offsets map — reading the first as the second makes
+					// the broker side short, and short is indistinguishable from loss.
+					continue
+				}
+
+				offsets.Offsets = map[int64]time.Time{}
+				if start, ok := f.windowStart[topic][request.Partition]; ok && start >= 0 {
+					// A resolved answer arrives in the Offsets map, keyed by the offset.
+					offsets.Offsets[start] = time.Unix(0, request.Timestamp*int64(time.Millisecond))
+				} else {
+					// NOTHING THAT RECENT. The broker answers offset -1 with timestamp -1, and
+					// -1 is kafka-go's LastOffset sentinel, so the real client routes it to
+					// LastOffset and leaves the Offsets map EMPTY. Modelled exactly, because
+					// the production reader derives its -1 from the map being empty.
+					offsets.LastOffset = -1
+				}
+
+				response.Topics[topic] = append(response.Topics[topic], offsets)
+
+				continue
+			}
+
 			if injected, ok := f.offsetErrors[topic][request.Partition]; ok {
 				offsets.Error = injected
 			} else {
@@ -934,52 +1023,39 @@ func TestEventTopicInventory_MatchesTheSingleSourceOfTruth(t *testing.T) {
 		"the inventory this file asserts against must be exactly the inventory event_topics.go composes, "+
 			"so the test and the implementation share one source of truth")
 
-	const categoryCount = 5
+	const categoryCount = 4
 
 	require.Len(t, expectedEventTopics, categoryCount*2,
-		"five category topics and one dead-letter sibling each")
+		"four category topics and one dead-letter sibling each")
 	assert.Equal(t, expectedEventTopics[:categoryCount], AllTopics(),
-		"the first five entries are the category topics, in canonical provisioning order")
+		"the first four entries are the category topics, in canonical provisioning order")
 	assert.Equal(t, expectedEventTopics[categoryCount:], AllDeadLetterTopics(),
-		"the last five entries are their dead-letter siblings, in the same order")
+		"the last four entries are their dead-letter siblings, in the same order")
 
 	categories := EventCategories()
 	require.Len(t, categories, categoryCount,
-		"four categories are what give every emitted event type a home — including the internal system category an unrecognised type routes to; a fifth would need a topic here and a change to the published topic contract")
+		"four categories are what give every emitted event type a home — including the system category an unrecognised type routes to; a fifth would need a topic here and a change to the published topic contract")
 
-	// The internal category must be PROVISIONED BUT NOT GRANTABLE. Both halves matter, and
-	// they pull in opposite directions, which is why both are asserted.
+	// EVERY CATEGORY TOPIC IS PROVISIONED AND GRANTABLE, and NO dead-letter sibling is.
 	//
-	// Provisioned, because Blnk writes to it: ledger.created and system.error route there,
-	// and so does any event type the catalogue does not recognise. A topic nobody created is
-	// a topic the relay cannot publish to, so the events would strand in the outbox.
+	// Provisioned, because Blnk writes to all of them. A topic nobody created is a topic the
+	// relay cannot publish to, so its events would strand in the outbox.
 	//
-	// Not grantable, because its contents are not subscriber data: system.error's payload is
-	// the frozen legacy body and still carries the error text as it renders, and an
-	// uncatalogued event could be any domain payload at all. Withholding the ACL is what
-	// contains both without changing a published payload contract.
-	for _, category := range []string{model.EventCategorySystem} {
+	// Grantable, because each carries event types the legacy webhook transport delivers today —
+	// the system topic included, which is why ledger.created keeps an authorized route after
+	// the sunset. Which of them a PARTICULAR subscriber holds is decided per subscriber by its
+	// authorized_topics, not here.
+	//
+	// Never the dead-letter siblings: they carry failure metadata and every subscriber's failed
+	// events, and are read under the master key through GET /events/dead-letter.
+	for _, category := range categories {
 		topic := TopicForCategory(category)
 		assert.Contains(t, expectedEventTopics, topic,
 			"category topic %q must be provisioned: Blnk publishes to it", topic)
-		assert.False(t, IsSubscriberGrantableTopic(topic),
-			"category topic %q is internal and must not be grantable: its payloads are Blnk's own error detail and any event type the catalogue does not recognise", topic)
+		assert.True(t, IsSubscriberGrantableTopic(topic),
+			"category topic %q must be grantable, or an event type the legacy transport delivers has no authorized Kafka route", topic)
 		assert.False(t, IsSubscriberGrantableTopic(DLTFor(topic)),
 			"dead-letter topic %q must never be grantable: it carries failure metadata and every subscriber's failed events", DLTFor(topic))
-	}
-
-	// And every OTHER category must be grantable, or a subscriber migrating off webhooks has
-	// no authorized path to the events it used to receive.
-	for _, category := range EventCategories() {
-		if model.IsInternalEventCategory(category) {
-			continue
-		}
-
-		topic := TopicForCategory(category)
-		assert.True(t, IsSubscriberGrantableTopic(topic),
-			"category topic %q carries subscriber-facing ledger data and must be grantable", topic)
-		assert.False(t, IsSubscriberGrantableTopic(DLTFor(topic)),
-			"but its dead-letter sibling %q must not be", DLTFor(topic))
 	}
 
 	for index, category := range categories {
@@ -1796,8 +1872,8 @@ func TestProvisionSubscriberPrincipal_NeverGrantsWriteOrAWildcardPattern(t *test
 
 	subscriber := testSubscriber()
 	// The widest LEGITIMATE grant, which is the grantable allowlist rather than the whole
-	// inventory: the dead-letter and internal topics are no longer grantable at all, so asking
-	// for them is refused before any binding is built (see
+	// inventory: all four category topics are grantable and no dead-letter topic is, so asking
+	// for a DLT is refused before any binding is built (see
 	// TestProvisionSubscriberPrincipal_RefusesATopicOutsideTheGrantableAllowlist).
 	subscriber.AuthorizedTopics = SubscriberGrantableTopics()
 
@@ -2355,18 +2431,21 @@ func TestProvisionSubscriberPrincipal_RefusesAConsumerGroupOutsideTheSubscribers
 // The list becomes the resource name of a LITERAL binding, so whatever is in it is what the
 // credential can read. Three classes must be impossible: the wildcard, because "*" matches
 // every resource; a foreign topic, because that is somebody else's data on a shared broker;
-// and the dead-letter and internal topics, which carry Blnk's own failure metadata and
-// diagnostics and have no subscriber audience.
+// and every dead-letter topic, which carries Blnk's failure metadata and every other
+// subscriber's failed events and has no subscriber audience.
 func TestProvisionSubscriberPrincipal_RefusesATopicOutsideTheGrantableAllowlist(t *testing.T) {
 	cases := map[string]string{
 		"the wildcard":            "*",
 		"a foreign topic":         "attacker.transactions",
 		"a dead-letter topic":     "blnk.transactions.dlt",
-		"the system topic":        "blnk.system",
 		"the system dead-letter":  "blnk.system.dlt",
+		"a retired category name": "blnk.ledgers",
 		"an internal Kafka topic": "__consumer_offsets",
 		"a prefix fragment":       "blnk.",
 		"the prefix alone":        "blnk",
+		// Ledger events are published, but to blnk.system, so a ledgers topic is a name
+		// nothing creates and nobody may be granted.
+		"a category this contract does not have": "blnk.ledgers",
 	}
 
 	for name, topic := range cases {
@@ -3015,6 +3094,73 @@ func TestConsumerLag_ExcludesAnUnreadablePartitionRatherThanScoringItZero(t *tes
 	assert.Zero(t, report.Topics[0].Partitions[1].Lag)
 }
 
+// TestConsumerLag_WithholdsLagForAPartitionWhoseCommittedOffsetTheBrokerRefused is the
+// END-TO-END guard on OBS-21, driven through the real ConsumerLag path with a broker that
+// answers ListOffsets for every partition and refuses OffsetFetch for one of them.
+//
+// # The failure this rules out
+//
+// A per-partition error in the OffsetFetch response used to be skipped, which left the entry
+// absent, which the lookup reported as -1, which the arithmetic treats as "the group has never
+// committed" — a deliberate FULL-LAG policy. So refusing to report one partition of a
+// caught-up consumer produced the entire retained log as that partition's lag, on a topic that
+// stayed marked COMPLETE, and that number went to the gauge SubscriberConsumerLagHigh fires on.
+// The alert an operator received would name a six-figure backlog that did not exist, while
+// ConsumerLagMeasurementDegraded — the rule that exists to cover an unmeasurable subject — said
+// nothing, because nothing had reported a degradation.
+//
+// The fake has been able to inject this since it was written; no test had ever asked it to,
+// which is precisely how the defect survived every other lag assertion in this file.
+func TestConsumerLag_WithholdsLagForAPartitionWhoseCommittedOffsetTheBrokerRefused(t *testing.T) {
+	fake := newFakeAdminClient()
+	// Both partitions are readable on the END-OFFSET side, with a large retained log so a
+	// full-lag misscoring would be unmistakable.
+	fake.withOffsets("blnk.transactions", 0, 1000, 900000).withCommitted("blnk.transactions", 0, 899990)
+	fake.withOffsets("blnk.transactions", 1, 1000, 900000).withCommitted("blnk.transactions", 1, 899995)
+	// ...and the broker refuses the committed offset for exactly one of them.
+	fake.committedErrors["blnk.transactions"] = map[int]error{1: kafka.NotCoordinatorForGroup}
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	report, err := admin.ConsumerLag(context.Background(), ConsumerLagRequest{
+		SubscriberID: "sub_11111111-1111-1111-1111-111111111111",
+		GroupID:      "sub_11111111-1111-1111-1111-111111111111-group",
+		Topics:       []string{"blnk.transactions"},
+	})
+	require.NoError(t, err, "one refused partition must not void the whole measurement")
+
+	require.Len(t, report.Topics, 1)
+	topicLag := report.Topics[0]
+
+	assert.Equal(t, int64(10), report.TotalLag,
+		"only the partition whose committed offset was actually read may contribute: the total is a "+
+			"LOWER BOUND, not the 899,000 a full-lag misscoring would have invented")
+	assert.Equal(t, 1, topicLag.PartitionsUnavailable,
+		"the refused partition must raise the degraded-measurement count, which is the signal "+
+			"ConsumerLagMeasurementDegraded fires on")
+	assert.Zero(t, topicLag.PartitionsWithoutCommit,
+		"and it must not ALSO be diagnosed as a partition the group never committed on — that reading "+
+			"sends an operator to the consumer instead of to the broker")
+
+	require.Len(t, topicLag.Partitions, 2)
+	assert.False(t, topicLag.Partitions[0].Unavailable)
+	assert.Equal(t, int64(10), topicLag.Partitions[0].Lag)
+	assert.True(t, topicLag.Partitions[1].Unavailable,
+		"an unreadable committed offset makes the partition unmeasurable, exactly as an unreadable "+
+			"end offset does")
+	assert.Zero(t, topicLag.Partitions[1].Lag)
+	assert.False(t, topicLag.Partitions[1].Committed,
+		"nothing was read, so no commit may be claimed either way")
+
+	// The consequence that matters operationally: the partial total is WITHHELD from the gauge
+	// the threshold rule reads, and the unmeasured-partition count is published in its place.
+	samples := report.LagSamples()
+	require.Len(t, samples, 1)
+	assert.False(t, samples[0].LagComplete,
+		"a topic measured from a partial set of committed offsets must be marked incomplete")
+	assert.Equal(t, 1, samples[0].UnmeasuredPartitions)
+}
+
 // TestConsumerLag_ReportsRequestedTopicsThatDoNotExist stops a mistyped or unprovisioned
 // topic from reading as permanently healthy.
 func TestConsumerLag_ReportsRequestedTopicsThatDoNotExist(t *testing.T) {
@@ -3255,7 +3401,7 @@ func TestTopicEndOffsets_DefaultsToTheWholeInventory(t *testing.T) {
 
 	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
 
-	report, err := admin.TopicEndOffsets(context.Background())
+	report, err := admin.TopicEndOffsets(context.Background(), time.Time{})
 	require.NoError(t, err)
 
 	fake.mu.Lock()
@@ -3302,7 +3448,7 @@ func TestTopicEndOffsets_SumsEndOffsetsAndSeparatesRetention(t *testing.T) {
 
 	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
 
-	report, err := admin.TopicEndOffsets(context.Background(), "blnk.transactions", "blnk.transactions.dlt")
+	report, err := admin.TopicEndOffsets(context.Background(), time.Time{}, "blnk.transactions", "blnk.transactions.dlt")
 	require.NoError(t, err)
 
 	assert.Equal(t, int64(203), report.EndOffsetSum, "every record ever published across both topics")
@@ -3334,7 +3480,7 @@ func TestTopicEndOffsets_FlagsWhatWouldInvalidateTheReconciliation(t *testing.T)
 
 	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
 
-	report, err := admin.TopicEndOffsets(context.Background(), "blnk.transactions", "blnk.absent")
+	report, err := admin.TopicEndOffsets(context.Background(), time.Time{}, "blnk.transactions", "blnk.absent")
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"blnk.absent"}, report.MissingTopics)
@@ -3345,6 +3491,169 @@ func TestTopicEndOffsets_FlagsWhatWouldInvalidateTheReconciliation(t *testing.T)
 	require.True(t, found)
 	require.Len(t, snapshot.Partitions, 2)
 	assert.True(t, snapshot.Partitions[1].Unavailable)
+}
+
+// TestTopicEndOffsets_ReadsAWindowOnlyWhenOneIsAskedFor is the PERF-P05 guard on the broker
+// side of the reconciliation.
+//
+// The comparison needs both sides counted over the SAME population. Cumulative end offsets are
+// not one: they count records retention has already deleted, while the outbox forgets, so the
+// tolerated surplus grows by however much the outbox has forgotten until it can conceal any
+// amount of loss. A window-start offset per partition is what bounds the broker side, and it is
+// a timestamp lookup — a different question from the two sentinel offsets, answered in a
+// different field.
+//
+// It is read in its OWN round trip and only when a window was asked for, because the cached
+// bounds the lag sweep shares must not be invalidated or enlarged by a reconciliation that runs
+// once a day.
+func TestTopicEndOffsets_ReadsAWindowOnlyWhenOneIsAskedFor(t *testing.T) {
+	since := time.Now().UTC().Add(-2 * time.Hour)
+
+	t.Run("no window asked for reads no window", func(t *testing.T) {
+		fake := newFakeAdminClient()
+		fake.withOffsets("blnk.transactions", 0, 0, 100)
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		report, err := admin.TopicEndOffsets(context.Background(), time.Time{}, "blnk.transactions")
+		require.NoError(t, err)
+
+		assert.True(t, report.WindowStart.IsZero(),
+			"a caller that named no window must get none, so the verdict is reported diagnostic-only")
+		assert.Zero(t, report.WindowRecordCount)
+		assert.Zero(t, fake.snapshotTimeOffsetRequests(),
+			"and no timestamp lookup may be issued: it would cost a round trip whose answer nobody reads")
+	})
+
+	t.Run("a window counts the records written inside it", func(t *testing.T) {
+		fake := newFakeAdminClient()
+		// Partition 0: 100 records, the window starting at offset 90 — ten inside.
+		fake.withOffsets("blnk.transactions", 0, 0, 100).withWindowStart("blnk.transactions", 0, 90)
+		// Partition 1: 50 records, the window starting at offset 45 — five inside.
+		fake.withOffsets("blnk.transactions", 1, 0, 50).withWindowStart("blnk.transactions", 1, 45)
+
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		report, err := admin.TopicEndOffsets(context.Background(), since, "blnk.transactions")
+		require.NoError(t, err)
+
+		assert.Equal(t, since, report.WindowStart)
+		assert.Equal(t, int64(15), report.WindowRecordCount,
+			"the windowed figure is what the reconciliation compares against, and it is a fraction "+
+				"of the 150 cumulative records")
+		assert.Equal(t, int64(150), report.EndOffsetSum,
+			"the cumulative sum is still reported, because the diagnostic reading and the per-topic "+
+				"projection both use it")
+		assert.False(t, report.WindowTruncated)
+		assert.Zero(t, report.WindowPartitionsUnreadable)
+
+		snapshot, found := report.Lookup("blnk.transactions")
+		require.True(t, found)
+		assert.Equal(t, int64(90), snapshot.Partitions[0].WindowStartOffset)
+		assert.Equal(t, int64(45), snapshot.Partitions[1].WindowStartOffset)
+
+		// TWO round trips, not one enlarged one: the window is asked about separately so the
+		// bounds request the lag sweep caches stays exactly what it was.
+		assert.Equal(t, 2, fake.callCount("ListOffsets"),
+			"the window is its own request, so the cached bounds the lag sweep shares are untouched")
+		assert.Equal(t, 2, fake.snapshotTimeOffsetRequests(), "one timestamp lookup per partition")
+	})
+
+	t.Run("a partition holding nothing that recent contributes a real zero", func(t *testing.T) {
+		fake := newFakeAdminClient()
+		fake.withOffsets("blnk.transactions", 0, 0, 100).withWindowStart("blnk.transactions", 0, -1)
+
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		report, err := admin.TopicEndOffsets(context.Background(), since, "blnk.transactions")
+		require.NoError(t, err)
+
+		assert.Zero(t, report.WindowRecordCount,
+			"every record predates the window, which is a genuine zero and not a failure to read")
+		assert.Zero(t, report.WindowPartitionsUnreadable)
+		assert.False(t, report.WindowTruncated)
+		assert.False(t, report.WindowStart.IsZero(), "the window itself was still measured")
+	})
+
+	t.Run("an unreadable window start is reported, never counted as zero", func(t *testing.T) {
+		// THE DISTINCTION THIS EXISTS FOR. "Nothing that recent" and "could not be read" both
+		// contribute no records, and treating the second as the first makes the broker side
+		// short — which is indistinguishable from message loss, and is reported as loss.
+		fake := newFakeAdminClient()
+		fake.withOffsets("blnk.transactions", 0, 0, 100).withWindowStart("blnk.transactions", 0, 90)
+		fake.withOffsets("blnk.transactions", 1, 0, 100).withUnreadableWindow("blnk.transactions", 1)
+
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		report, err := admin.TopicEndOffsets(context.Background(), since, "blnk.transactions")
+		require.NoError(t, err)
+
+		assert.Equal(t, 1, report.WindowPartitionsUnreadable,
+			"the partition that could not be read must be COUNTED as unreadable")
+		assert.Equal(t, int64(10), report.WindowRecordCount,
+			"and must contribute nothing, so the shortfall it causes is explained rather than silent")
+
+		snapshot, found := report.Lookup("blnk.transactions")
+		require.True(t, found)
+		assert.True(t, snapshot.Partitions[1].WindowUnreadable)
+		assert.Equal(t, int64(-1), snapshot.Partitions[1].WindowStartOffset)
+
+		// The verdict must decline to conclude, which is the whole purpose of counting it.
+		verdict := ReconcileAgainstOutbox(report, model.EventRecordIntervalAudit{
+			PublishedRows: 10, CorroboratedRows: 10, DistinctCorroboratedRecords: 10, WindowStart: since,
+		})
+		assert.False(t, verdict.Conclusive)
+		assert.Contains(t, strings.Join(verdict.Caveats, " "), "window-start offset")
+	})
+
+	t.Run("retention inside the window is detected and reported", func(t *testing.T) {
+		// The window resolves to an offset at or below the oldest record the partition still
+		// holds, which means records written INSIDE the window have been deleted. That is the
+		// only case in which retention invalidates a windowed comparison, and it is the case
+		// the old unconditional retention caveat could not distinguish from healthy operation.
+		fake := newFakeAdminClient()
+		fake.withOffsets("blnk.transactions", 0, 60, 100).withWindowStart("blnk.transactions", 0, 60)
+
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		report, err := admin.TopicEndOffsets(context.Background(), since, "blnk.transactions")
+		require.NoError(t, err)
+
+		assert.True(t, report.WindowTruncated,
+			"the oldest retained record is already inside the window, so earlier ones inside it are gone")
+		assert.Equal(t, int64(40), report.WindowRecordCount,
+			"what remains is still counted, so the figure is a lower bound rather than nothing")
+
+		verdict := ReconcileAgainstOutbox(report, model.EventRecordIntervalAudit{
+			PublishedRows: 40, CorroboratedRows: 40, DistinctCorroboratedRecords: 40, WindowStart: since,
+		})
+		assert.False(t, verdict.Conclusive)
+		assert.Contains(t, strings.Join(verdict.Caveats, " "), "inside the measured window")
+	})
+
+	t.Run("no partition answering leaves the cumulative report usable", func(t *testing.T) {
+		// A window that could not be read anywhere must not void the whole measurement: the
+		// cumulative figures are still true and are what the diagnostic reading wants. The
+		// verdict then declines to be conclusive, which is the honest outcome of a window
+		// nobody could measure.
+		fake := newFakeAdminClient()
+		fake.withOffsets("blnk.transactions", 0, 0, 100).withUnreadableWindow("blnk.transactions", 0)
+		fake.withOffsets("blnk.transactions", 1, 0, 50).withUnreadableWindow("blnk.transactions", 1)
+
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		report, err := admin.TopicEndOffsets(context.Background(), since, "blnk.transactions")
+		require.NoError(t, err, "a window that could not be read is not a failure of the measurement")
+
+		assert.Equal(t, int64(150), report.EndOffsetSum, "the cumulative figures survive")
+		assert.Equal(t, 2, report.WindowPartitionsUnreadable)
+		assert.Zero(t, report.WindowRecordCount)
+
+		verdict := ReconcileAgainstOutbox(report, model.EventRecordIntervalAudit{
+			PublishedRows: 150, CorroboratedRows: 150, DistinctCorroboratedRecords: 150, WindowStart: since,
+		})
+		assert.False(t, verdict.Conclusive,
+			"a windowed comparison whose window nothing answered for cannot be concluded from")
+	})
 }
 
 // TestRetainedRecords_NeverGoesNegative covers the retention arithmetic in isolation.
@@ -3403,15 +3712,143 @@ func TestOffsetBoundsFor_TreatsAnAbsentReadingAsUnavailable(t *testing.T) {
 }
 
 // TestCommittedOffsetFor_ReportsTheBrokersOwnSentinel keeps one representation of "no
-// commit" in play.
+// commit" in play, and keeps it DISTINCT from "the broker would not say".
+//
+// The two used to share the -1 sentinel, which is how an unreadable partition inherited the
+// full-lag treatment that belongs only to a group that has genuinely never committed. Both are
+// asserted here so the distinction cannot be collapsed again by a lookup that returns a bare
+// integer.
 func TestCommittedOffsetFor_ReportsTheBrokersOwnSentinel(t *testing.T) {
-	committed := map[string]map[int]int64{"blnk.transactions": {0: 42}}
+	committed := map[string]map[int]committedOffset{
+		"blnk.transactions": {
+			0: {offset: 42},
+			2: {offset: -1, unavailable: true},
+		},
+	}
 
-	assert.Equal(t, int64(42), committedOffsetFor(committed, "blnk.transactions", 0))
-	assert.Equal(t, int64(-1), committedOffsetFor(committed, "blnk.transactions", 1),
+	present := committedOffsetFor(committed, "blnk.transactions", 0)
+	assert.Equal(t, int64(42), present.offset)
+	assert.False(t, present.unavailable, "a reported commit is available")
+
+	uncommitted := committedOffsetFor(committed, "blnk.transactions", 1)
+	assert.Equal(t, int64(-1), uncommitted.offset,
 		"an uncommitted partition must read as the broker's own -1")
-	assert.Equal(t, int64(-1), committedOffsetFor(committed, "blnk.balances", 0))
-	assert.Equal(t, int64(-1), committedOffsetFor(nil, "blnk.transactions", 0))
+	assert.False(t, uncommitted.unavailable,
+		"an absent entry is KNOWLEDGE — the group has not committed — and must not be reported as "+
+			"unmeasurable, or an unstarted consumer would stop scoring as full lag")
+
+	unreadable := committedOffsetFor(committed, "blnk.transactions", 2)
+	assert.True(t, unreadable.unavailable,
+		"a partition the broker refused to report is the ABSENCE of knowledge and must be marked as such")
+
+	assert.Equal(t, int64(-1), committedOffsetFor(committed, "blnk.balances", 0).offset)
+	assert.False(t, committedOffsetFor(committed, "blnk.balances", 0).unavailable)
+	assert.Equal(t, int64(-1), committedOffsetFor(nil, "blnk.transactions", 0).offset)
+	assert.False(t, committedOffsetFor(nil, "blnk.transactions", 0).unavailable)
+}
+
+// TestBuildPartitionLag_WithholdsLagWhenTheCommittedOffsetIsUnreadable is the direct guard on
+// OBS-21, and it is the assertion the previous shape could not have satisfied.
+//
+// # What went wrong
+//
+// A per-partition error in the OffsetFetch response was skipped, so the partition's entry was
+// absent, so committedOffsetFor returned -1, so the lag arithmetic applied its FULL-LAG policy:
+// baseline = earliest retained offset, lag = every record still on the log. The partition stayed
+// marked available, the topic stayed marked complete, and that fabricated number went to
+// blnk_kafka_consumer_lag — the series SubscriberConsumerLagHigh fires on. A leader election on
+// one partition of a healthy, caught-up consumer could page an operator with a six-figure lag
+// that never existed, and ConsumerLagMeasurementDegraded — the rule whose whole purpose is to
+// cover an unmeasurable subject — stayed silent because nothing had reported a degradation.
+//
+// # What must be true instead
+//
+// No reading, no lag. The partition is unavailable, it contributes zero to the total, and it is
+// NOT counted as a partition without a commit, because "the group has not committed" is a claim
+// this measurement is in no position to make.
+func TestBuildPartitionLag_WithholdsLagWhenTheCommittedOffsetIsUnreadable(t *testing.T) {
+	bounds := partitionOffsetBounds{first: 1000, end: 900000}
+
+	t.Run("an unreadable committed offset withholds the lag", func(t *testing.T) {
+		lag := buildPartitionLag("blnk.transactions", 3, bounds,
+			committedOffset{offset: -1, unavailable: true})
+
+		assert.True(t, lag.Unavailable,
+			"an unreadable committed offset makes the partition unmeasurable, exactly as an "+
+				"unreadable end offset does")
+		assert.Zero(t, lag.Lag,
+			"the full-lag policy belongs to a group that has genuinely never committed; applying it "+
+				"here invents the largest number the partition could possibly carry")
+		assert.False(t, lag.Committed,
+			"nothing was read, so no commit may be claimed either way")
+	})
+
+	t.Run("a genuinely uncommitted partition still scores full lag", func(t *testing.T) {
+		lag := buildPartitionLag("blnk.transactions", 3, bounds, committedOffset{offset: -1})
+
+		assert.False(t, lag.Unavailable, "this partition WAS measured; the group simply has no commit")
+		assert.Equal(t, int64(899000), lag.Lag,
+			"full lag from the earliest RETAINED offset, which is what stops an unstarted consumer "+
+				"from reading as perfectly healthy")
+		assert.False(t, lag.Committed)
+	})
+
+	t.Run("a committed partition is unaffected", func(t *testing.T) {
+		lag := buildPartitionLag("blnk.transactions", 3, bounds, committedOffset{offset: 899500})
+
+		assert.False(t, lag.Unavailable)
+		assert.True(t, lag.Committed)
+		assert.Equal(t, int64(500), lag.Lag)
+	})
+
+	t.Run("an unreadable end offset still withholds the lag", func(t *testing.T) {
+		lag := buildPartitionLag("blnk.transactions", 3,
+			partitionOffsetBounds{first: -1, end: -1, unavailable: true},
+			committedOffset{offset: 42})
+
+		assert.True(t, lag.Unavailable, "the pre-existing half of the rule must not regress")
+		assert.Zero(t, lag.Lag)
+	})
+}
+
+// TestTopicLag_CountsAnUnreadableCommittedOffsetAsUnavailableRatherThanUncommitted asserts the
+// aggregate consequences of the fix: the topic's measurement is INCOMPLETE, so LagSamples
+// withholds the lag from the alerting gauge and publishes the unmeasured-partition count
+// instead, and the partition is not double-diagnosed as a missing commit.
+func TestTopicLag_CountsAnUnreadableCommittedOffsetAsUnavailableRatherThanUncommitted(t *testing.T) {
+	bounds := partitionOffsetBounds{first: 0, end: 10}
+
+	topicLag := TopicLag{Topic: "blnk.transactions"}
+	for _, reading := range []committedOffset{
+		{offset: 8},                     // measured, 2 behind
+		{offset: -1, unavailable: true}, // the broker refused
+	} {
+		partitionLag := buildPartitionLag(topicLag.Topic, len(topicLag.Partitions), bounds, reading)
+		topicLag.TotalLag += partitionLag.Lag
+		if partitionLag.Unavailable {
+			topicLag.PartitionsUnavailable++
+		} else if !partitionLag.Committed {
+			topicLag.PartitionsWithoutCommit++
+		}
+		topicLag.Partitions = append(topicLag.Partitions, partitionLag)
+	}
+
+	assert.Equal(t, int64(2), topicLag.TotalLag,
+		"only the partition that was actually measured contributes, so the total is a LOWER BOUND "+
+			"rather than a fabricated maximum")
+	assert.Equal(t, 1, topicLag.PartitionsUnavailable,
+		"the unreadable partition must raise the degraded-measurement count, which is what makes "+
+			"ConsumerLagMeasurementDegraded fire")
+	assert.Zero(t, topicLag.PartitionsWithoutCommit,
+		"and it must NOT also be diagnosed as a partition the group never committed on, which "+
+			"would send an operator to the consumer instead of to the broker")
+
+	sample := consumerLagSample("sub_1", "sub_1-group", topicLag)
+	assert.False(t, sample.LagComplete,
+		"an incompletely measured topic must be marked incomplete so its partial lag is withheld "+
+			"from the gauge the threshold rule reads")
+	assert.Equal(t, 1, sample.UnmeasuredPartitions,
+		"and the count of what could not be read must be published in its place")
 }
 
 // TestNewKafkaAdmin_EmptyBrokersYieldsAnUnconfiguredClientThatFailsFast is the graceful
@@ -3454,7 +3891,7 @@ func TestNewKafkaAdmin_EmptyBrokersYieldsAnUnconfiguredClientThatFailsFast(t *te
 			_, err = admin.ConsumerLag(ctx, ConsumerLagRequest{GroupID: "g", Topics: []string{"t"}})
 			assert.ErrorIs(t, err, ErrKafkaAdminNotConfigured)
 
-			_, err = admin.TopicEndOffsets(ctx)
+			_, err = admin.TopicEndOffsets(ctx, time.Time{})
 			assert.ErrorIs(t, err, ErrKafkaAdminNotConfigured)
 		})
 	}
@@ -3629,7 +4066,7 @@ func TestKafkaAdminClient_EveryOperationHonoursACancelledContext(t *testing.T) {
 			return err
 		},
 		"TopicEndOffsets": func(ctx context.Context, admin *KafkaAdminClient) error {
-			_, err := admin.TopicEndOffsets(ctx)
+			_, err := admin.TopicEndOffsets(ctx, time.Time{})
 
 			return err
 		},
@@ -3742,8 +4179,8 @@ func TestNormalizeTopicList_DropsBlanksAndDuplicatesInOrder(t *testing.T) {
 func TestMissingTopics_NamesTheAbsentOnesInRequestedOrder(t *testing.T) {
 	present := map[string][]int{"blnk.transactions": {0}, "blnk.balances": {0}}
 
-	assert.Equal(t, []string{"blnk.identities", "blnk.ledgers", "blnk.system"},
-		missingTopics([]string{"blnk.transactions", "blnk.identities", "blnk.balances", "blnk.ledgers", "blnk.system"}, present))
+	assert.Equal(t, []string{"blnk.identities", "blnk.system"},
+		missingTopics([]string{"blnk.transactions", "blnk.identities", "blnk.balances", "blnk.system"}, present))
 	assert.Nil(t, missingTopics([]string{"blnk.transactions"}, present))
 	assert.Equal(t, []string{"blnk.transactions"}, missingTopics([]string{"blnk.transactions"}, nil))
 }
@@ -4663,104 +5100,343 @@ func TestReconcileSubscriberACLs_RefusesWithoutASubscriber(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Zero-loss reconciliation — OBS-01
+// Zero-loss reconciliation — bounded per-partition coordinate mapping (V-2)
 // ---------------------------------------------------------------------------------------
 
-// fullyConfirmedAudit builds an outbox-side audit in which every published row names a
-// distinct broker record.
+// fullyCorroboratedAudit builds an outbox-side audit in which every published row names a
+// distinct broker record INSIDE a measured window.
 //
-// It is the precondition for a CONCLUSIVE verdict (OBS-02), so the lower-bound cases below use
-// it in order to keep testing the direction of the comparison rather than accidentally testing
-// the unconfirmed-row caveat.
-func fullyConfirmedAudit(publishedRows int64) model.EventOutboxAudit {
-	return model.EventOutboxAudit{
-		PublishedRows:   publishedRows,
-		ConfirmedRows:   publishedRows,
-		DistinctRecords: publishedRows,
-		MeasuredAt:      time.Now().UTC(),
+// It is the precondition for a CONCLUSIVE verdict, so the cases below use it in order to keep
+// testing one property at a time rather than accidentally testing the uncorroborated-row
+// caveats.
+func fullyCorroboratedAudit(publishedRows int64) model.EventRecordIntervalAudit {
+	now := time.Now().UTC()
+
+	return model.EventRecordIntervalAudit{
+		PublishedRows:               publishedRows,
+		CorroboratedRows:            publishedRows,
+		DistinctCorroboratedRecords: publishedRows,
+		OldestTerminalAt:            now.Add(-time.Hour),
+		CorroboratedFrom:            now.Add(-time.Hour),
+		CorroboratedTo:              now,
+		MeasuredAt:                  now,
 	}
 }
 
-// TestReconcileAgainstOutbox_TreatsMessagesAsALowerBoundOnEvents is the OBS-01 guard.
+// measuredReport builds a broker-side report with one topic and one measured partition,
+// so a test can state a window rather than a total.
 //
-// Summed end offsets count RECORDS and the outbox counts EVENTS, and the reconciliation used to
-// be documented as an equality between them. It cannot hold: a redelivery after a crash writes
-// a second record for one event, a replay writes another on purpose, and a dead-lettered event
-// has a record on its `.dlt` topic. So messages >= events always, and an equality check reports
-// loss on a healthy system the first time anything is redelivered — the alert that gets muted,
-// taking the real signal with it.
-func TestReconcileAgainstOutbox_TreatsMessagesAsALowerBoundOnEvents(t *testing.T) {
-	t.Run("a surplus is expected, not loss", func(t *testing.T) {
-		report := TopicOffsetReport{EndOffsetSum: 1_100, RetainedCount: 1_100, MeasuredAt: time.Now().UTC()}
+// The partition detail is not decoration. Since the reconciliation verifies each claimed
+// coordinate against the live bounds of the partition it names, a report carrying only a summed
+// end offset supports no verification at all — and a verdict with nothing verified is back to
+// the arithmetic in which a surplus and a compensated loss are indistinguishable. So every case
+// states a real interval, which is what a real broker read produces. A non-zero first offset is
+// an aged-out window rather than an empty one, and that distinction is the whole point of
+// passing the bound rather than a count.
+func measuredReport(topic string, partition int, first, end int64) TopicOffsetReport {
+	return TopicOffsetReport{
+		Topics: []TopicOffsetSnapshot{{
+			Topic: topic,
+			Partitions: []PartitionOffsetSnapshot{{
+				Partition: partition, FirstOffset: first, EndOffset: end,
+			}},
+			EndOffsetSum:  end,
+			RetainedCount: end - first,
+		}},
+		EndOffsetSum:  end,
+		RetainedCount: end - first,
+		MeasuredAt:    time.Now().UTC(),
+	}
+}
 
-		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
-		assert.False(t, verdict.LossDetected,
-			"100 more records than events is redelivery and replay overhead, which is normal")
-		assert.True(t, verdict.Conclusive)
-		assert.Equal(t, int64(100), verdict.Overhead)
+// TestTopicOffsetReport_PartitionIntervalsAreTheWindowsTheAuditIsTakenAgainst pins the
+// projection the whole bounded reconciliation depends on.
+//
+// The audit classifies each row's stored coordinate against these windows, so what this
+// method emits IS the scope of the verdict. Two properties matter and both are breakable:
+// every available partition must appear with its own bounds, and an UNAVAILABLE one must not
+// appear at all — emitting it with zeroed bounds would make every row on that partition look
+// like it named an offset beyond the log end, reporting a topic recreation where the truth is
+// only that the broker did not answer.
+func TestTopicOffsetReport_PartitionIntervalsAreTheWindowsTheAuditIsTakenAgainst(t *testing.T) {
+	report := TopicOffsetReport{
+		Topics: []TopicOffsetSnapshot{
+			{
+				Topic: "blnk.transactions",
+				Partitions: []PartitionOffsetSnapshot{
+					{Partition: 0, FirstOffset: 0, EndOffset: 500},
+					{Partition: 1, FirstOffset: 120, EndOffset: 640},
+					{Partition: 2, Unavailable: true},
+				},
+			},
+			{
+				Topic: "blnk.balances",
+				Partitions: []PartitionOffsetSnapshot{
+					{Partition: 0, FirstOffset: 9_000, EndOffset: 9_000},
+				},
+			},
+		},
+		MeasuredAt: time.Now().UTC(),
+	}
+
+	intervals := report.PartitionIntervals()
+
+	assert.Equal(t, []model.PartitionOffsetInterval{
+		{Topic: "blnk.transactions", Partition: 0, FirstOffset: 0, EndOffset: 500},
+		{Topic: "blnk.transactions", Partition: 1, FirstOffset: 120, EndOffset: 640},
+		{Topic: "blnk.balances", Partition: 0, FirstOffset: 9_000, EndOffset: 9_000},
+	}, intervals,
+		"each available partition contributes its OWN window; a per-topic total could not "+
+			"place a coordinate at all")
+
+	for _, interval := range intervals {
+		assert.NotEqual(t, 2, interval.Partition,
+			"a partition the broker could not report must be ABSENT rather than emitted with "+
+				"zeroed bounds, which would misread every row on it as beyond the log end")
+	}
+
+	t.Run("a fully aged-out partition is still a measured window", func(t *testing.T) {
+		// first == end is a real reading: a partition every record of which has been deleted
+		// by retention. It must be reported, because a row naming an offset below it is
+		// aged out — a fact — while omitting the window would report the same row as
+		// unmeasured, which is a different and weaker statement.
+		require.Len(t, intervals, 3)
+		assert.Zero(t, intervals[2].Records())
+	})
+
+	t.Run("nothing measured yields no windows", func(t *testing.T) {
+		assert.Empty(t, TopicOffsetReport{}.PartitionIntervals())
+	})
+}
+
+// TestReconcileAgainstOutbox_DoesNotRestTheVerdictOnWholeTopicTotals is the guard on the
+// finding this reconciliation was rebuilt for.
+//
+// # The defect
+//
+// The verdict used to be `endOffsetSum - terminalRows >= 0`. Summed end offsets count RECORDS
+// on the whole topic — every redelivery, every replay, every dead-letter copy, and every
+// record any OTHER producer ever wrote to a shared topic — while the outbox counts the EVENTS
+// it currently retains. The two share no baseline, no readability guarantee, no topic
+// incarnation and no producer, so the subtraction was not a weak signal, it was a comparison
+// of unrelated quantities that reported itself as conclusive.
+//
+// # The property
+//
+// The totals no longer decide anything. A topic carrying a million foreign records reconciles
+// exactly as a quiet one does, and a topic whose totals look perfect is INCONCLUSIVE the
+// moment a single row cannot be placed in a measured window.
+func TestReconcileAgainstOutbox_DoesNotRestTheVerdictOnWholeTopicTotals(t *testing.T) {
+	t.Run("a vast surplus of foreign traffic changes nothing", func(t *testing.T) {
+		// A shared topic holding a million records, 1,000 of which are Blnk's. Under the old
+		// arithmetic the "overhead" was 999,000 and read as health; it is now simply context.
+		report := measuredReport("blnk.transactions", 0, 0, 1_000_000)
+
+		verdict := ReconcileAgainstOutbox(report, fullyCorroboratedAudit(1_000))
+
+		assert.True(t, verdict.Conclusive,
+			"every claim was placed in a measured window, which is what the verdict rests on")
+		assert.False(t, verdict.LossDetected)
+		assert.Equal(t, int64(1_000_000), verdict.MessagesWritten,
+			"the total is still reported, as context")
+		assert.Equal(t, int64(1_000), verdict.BlnkRecordShare,
+			"the response must state how much of a shared topic's traffic the verdict accounts for")
 		assert.Contains(t, verdict.Summary(), "NO LOSS DETECTED")
-		assert.Contains(t, verdict.Summary(), "names the distinct broker record it produced",
-			"a green verdict must state WHY the surplus cannot be masking loss, not merely that "+
-				"none was detected")
+		assert.Contains(t, verdict.Summary(), "inside the measured offset window",
+			"a green verdict must say what it checked, not merely that nothing was detected")
 	})
 
-	t.Run("a shortfall is loss", func(t *testing.T) {
-		report := TopicOffsetReport{EndOffsetSum: 990, RetainedCount: 990, MeasuredAt: time.Now().UTC()}
+	t.Run("fewer records than rows is no longer a verdict on its own", func(t *testing.T) {
+		// The old check called this loss. It is not: on a topic Blnk shares, or one whose
+		// records have partly aged out, the total says nothing about whether THIS outbox's
+		// records are present. What decides it is whether each row's coordinate is inside a
+		// window — and here every one is.
+		report := measuredReport("blnk.transactions", 0, 0, 900)
 
-		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
-		assert.True(t, verdict.LossDetected,
-			"fewer records than rows means rows claim a publication that never happened")
-		assert.Equal(t, int64(-10), verdict.Overhead,
-			"the shortfall must stay signed; clamping it would erase the only signal here")
-		assert.Contains(t, verdict.Summary(), "LOSS DETECTED")
+		verdict := ReconcileAgainstOutbox(report, fullyCorroboratedAudit(1_000))
+
+		assert.False(t, verdict.LossDetected,
+			"a shortfall in whole-topic totals is not evidence about this outbox's own records")
+		assert.True(t, verdict.Conclusive)
 	})
 
-	t.Run("exact equality is not loss", func(t *testing.T) {
-		report := TopicOffsetReport{EndOffsetSum: 1_000, RetainedCount: 1_000, MeasuredAt: time.Now().UTC()}
+	t.Run("an empty outbox is conclusive rather than suspicious", func(t *testing.T) {
+		// A fresh deployment has published nothing, and a reconciliation that reported that
+		// as a problem would fire on every new install.
+		verdict := ReconcileAgainstOutbox(
+			measuredReport("blnk.transactions", 0, 0, 0),
+			model.EventRecordIntervalAudit{},
+		)
 
-		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
-		assert.False(t, verdict.LossDetected, "the boundary is inclusive: equal is not short")
-		assert.Zero(t, verdict.Overhead)
+		assert.True(t, verdict.Conclusive)
+		assert.False(t, verdict.LossDetected)
+		assert.Zero(t, verdict.CorroboratedEvents)
+		assert.Contains(t, verdict.Summary(), "nothing to reconcile",
+			"the vacuous case must read as vacuous rather than borrowing the green sentence's "+
+				"claim about a window it does not have")
 	})
+}
+
+// TestReconcileAgainstOutbox_TreatsAnOffsetBeyondTheLogEndAsLoss is the topic-recreation and
+// truncation guard.
+//
+// It is the ONE unambiguous signal in the whole reconciliation. The broker assigned that
+// offset when it accepted the write, so the log reached it once; if the end offset is now at
+// or below it, the log has been truncated or the topic deleted and recreated, and the records
+// those rows name are gone. Nothing else — retention, redelivery, foreign traffic — can
+// produce that reading, which is why it sets LossDetected rather than merely a caveat.
+func TestReconcileAgainstOutbox_TreatsAnOffsetBeyondTheLogEndAsLoss(t *testing.T) {
+	report := measuredReport("blnk.transactions", 0, 0, 40)
+	audit := model.EventRecordIntervalAudit{
+		PublishedRows:               1_000,
+		CorroboratedRows:            960,
+		DistinctCorroboratedRecords: 960,
+		BeyondEndRows:               40,
+		CorroboratedFrom:            time.Now().UTC().Add(-time.Hour),
+		CorroboratedTo:              time.Now().UTC(),
+	}
+
+	verdict := ReconcileAgainstOutbox(report, audit)
+
+	assert.True(t, verdict.LossDetected,
+		"40 rows name records the log can no longer reach; those records are gone")
+	assert.False(t, verdict.Conclusive)
+	assert.Equal(t, int64(40), verdict.BeyondEndEvents)
+	assert.Contains(t, verdict.Summary(), "LOSS DETECTED")
+	assert.Contains(t, strings.Join(verdict.Caveats, " "), "truncated or the topic was deleted",
+		"the caveat must name the cause, because the remedy for a recreated topic is nothing "+
+			"like the remedy for a slow relay")
+	assert.Contains(t, verdict.Summary(), "truncated",
+		"loss takes precedence in the summary, and it must say which kind of loss")
 }
 
 // TestReconcileAgainstOutbox_RefusesToConcludeFromAnIncompleteMeasurement covers the caveats,
-// which are what stop a green verdict being reported from a number that was never complete.
+// which are what stop a green verdict being reported from a measurement that never covered
+// everything.
 func TestReconcileAgainstOutbox_RefusesToConcludeFromAnIncompleteMeasurement(t *testing.T) {
-	cases := map[string]TopicOffsetReport{
+	corroborated := fullyCorroboratedAudit(1_000)
+
+	cases := map[string]struct {
+		report TopicOffsetReport
+		audit  model.EventRecordIntervalAudit
+		expect string
+	}{
 		"a missing topic": {
-			EndOffsetSum: 1_000, RetainedCount: 1_000,
-			MissingTopics: []string{"blnk.identities"},
+			report: TopicOffsetReport{
+				Topics:        measuredReport("blnk.transactions", 0, 0, 1_000).Topics,
+				EndOffsetSum:  1_000,
+				RetainedCount: 1_000,
+				MissingTopics: []string{"blnk.identities"},
+				MeasuredAt:    time.Now().UTC(),
+			},
+			audit:  corroborated,
+			expect: "do not exist on the broker",
 		},
 		"an unavailable partition": {
-			EndOffsetSum: 1_000, RetainedCount: 1_000,
-			PartitionsUnavailable: 2,
+			report: TopicOffsetReport{
+				Topics:                measuredReport("blnk.transactions", 0, 0, 1_000).Topics,
+				EndOffsetSum:          1_000,
+				RetainedCount:         1_000,
+				PartitionsUnavailable: 2,
+				MeasuredAt:            time.Now().UTC(),
+			},
+			audit:  corroborated,
+			expect: "did not report offsets",
 		},
-		"retention has deleted records": {
-			EndOffsetSum: 1_000, RetainedCount: 400,
+		"rows on a partition nothing measured": {
+			report: measuredReport("blnk.transactions", 0, 0, 1_000),
+			audit: model.EventRecordIntervalAudit{
+				PublishedRows:               1_000,
+				CorroboratedRows:            940,
+				DistinctCorroboratedRecords: 940,
+				UnmeasuredRows:              60,
+			},
+			expect: "did not cover",
+		},
+		"records retention has already deleted": {
+			report: measuredReport("blnk.transactions", 0, 400, 1_000),
+			audit: model.EventRecordIntervalAudit{
+				PublishedRows:               1_000,
+				CorroboratedRows:            600,
+				DistinctCorroboratedRecords: 600,
+				AgedOutRows:                 400,
+			},
+			expect: "retention has already deleted",
 		},
 	}
 
-	for name, report := range cases {
+	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
-			verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
-			assert.False(t, verdict.Conclusive, "%s makes the count incomplete", name)
+			verdict := ReconcileAgainstOutbox(testCase.report, testCase.audit)
+
+			assert.False(t, verdict.Conclusive, "%s leaves claims unaccounted for", name)
 			require.NotEmpty(t, verdict.Caveats, "the reason must be stated, not just flagged")
+			assert.Contains(t, strings.Join(verdict.Caveats, " "), testCase.expect,
+				"each reason needs its OWN wording, or an operator cannot tell a retention "+
+					"problem from an unreachable broker")
 			assert.Contains(t, verdict.Summary(), "INCONCLUSIVE")
+			assert.False(t, verdict.LossDetected,
+				"an incomplete measurement is not evidence of loss; only an offset beyond the "+
+					"log end is")
 		})
 	}
 
-	t.Run("loss is still reported on an inconclusive measurement", func(t *testing.T) {
-		// A shortfall is unambiguous even when the count is incomplete: an incomplete count
-		// can only ever be LOWER than the truth, so it cannot manufacture a shortfall.
-		verdict := ReconcileAgainstOutbox(TopicOffsetReport{
-			EndOffsetSum: 900, RetainedCount: 900, PartitionsUnavailable: 1,
-		}, fullyConfirmedAudit(1_000))
+	t.Run("aged-out rows are counted as events, not as a topic-wide subtraction", func(t *testing.T) {
+		// The caveat this replaces fired whenever ANY record had aged out of a shared topic,
+		// including records Blnk never wrote, so it was permanently on in any long-lived
+		// deployment and told an operator nothing about their own events. Retention on the
+		// topic with none of Blnk's own records affected must now be conclusive.
+		report := measuredReport("blnk.transactions", 0, 900_000, 1_000_000)
 
-		assert.True(t, verdict.LossDetected)
-		assert.False(t, verdict.Conclusive)
-		assert.Contains(t, verdict.Summary(), "LOSS DETECTED",
-			"loss takes precedence over inconclusiveness in the summary")
+		verdict := ReconcileAgainstOutbox(report, fullyCorroboratedAudit(1_000))
+
+		assert.True(t, verdict.Conclusive,
+			"retention that deleted no record THIS OUTBOX named cannot make its verdict inconclusive")
+		assert.Zero(t, verdict.AgedOutEvents)
+		assert.Equal(t, int64(100_000), verdict.RecordsRetained,
+			"the retained total is still reported as context")
+	})
+
+	t.Run("healthy retention outside the window is NOT a caveat", func(t *testing.T) {
+		// THE REGRESSION THIS PINS (PERF-P05). RetainedCount below EndOffsetSum is what every
+		// cluster with a retention policy looks like: end offsets count deleted records, so a
+		// windowed reading is unaffected unless records written INSIDE the window were removed.
+		// Treating the general case as a caveat made the verdict permanently inconclusive from
+		// the first segment deletion onwards, which is an alert nobody can ever clear.
+		report := windowedOffsetReport(1_000)
+		report.RetainedCount = 12
+
+		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
+
+		assert.True(t, verdict.Conclusive,
+			"retention that removed records from OUTSIDE the measured window changes nothing about "+
+				"a comparison drawn inside it")
+		assert.Empty(t, verdict.Caveats)
+		assert.Contains(t, verdict.Summary(), "NO LOSS DETECTED")
+	})
+
+	t.Run("a windowed comparison counts the records written inside the window", func(t *testing.T) {
+		// The figure the verdict reads is WindowRecordCount and not the cumulative sum, which
+		// is the whole substance of measuring a common population: a topic that has accepted a
+		// million records over its life and 1,010 inside the window reconciles against the
+		// 1,000 rows the outbox holds for that window, not against the million.
+		report := TopicOffsetReport{
+			EndOffsetSum:      1_000_000,
+			RetainedCount:     1_000_000,
+			WindowRecordCount: 1_010,
+			WindowStart:       reconciliationWindowStart(),
+			MeasuredAt:        time.Now().UTC(),
+		}
+
+		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
+
+		assert.Equal(t, int64(1_010), verdict.MessagesWritten,
+			"the cumulative sum counts a history the outbox no longer holds, and comparing against "+
+				"it manufactures a surplus that grows without bound")
+		assert.Equal(t, int64(10), verdict.Overhead)
+		assert.True(t, verdict.Conclusive)
+		assert.Equal(t, reconciliationWindowStart(), verdict.WindowStart,
+			"the verdict must REPORT the window it was drawn over")
 	})
 }
 
@@ -5318,64 +5994,45 @@ func TestReconcileSubscriberACLs_ConvergesToNothingWhenTheGrantIsCleared(t *test
 	assert.Equal(t, kafka.ResourceTypeGroup, held[0].ResourceType)
 }
 
-// TestReconcileSubscriberACLs_LeavesEveryBindingBlnkDoesNotOwn is the safety half of AUTH-02.
+// deniedTopicBinding builds a foreign DENY binding on a topic: a shape Blnk never provisions
+// and which can only NARROW what the grant allows.
+func deniedTopicBinding(principal, topic string) kafka.ACLEntry {
+	return kafka.ACLEntry{
+		ResourceType:        kafka.ResourceTypeTopic,
+		ResourceName:        topic,
+		ResourcePatternType: kafka.PatternTypeLiteral,
+		Principal:           principal,
+		Host:                "*",
+		Operation:           kafka.ACLOperationTypeRead,
+		PermissionType:      kafka.ACLPermissionTypeDeny,
+	}
+}
+
+// TestReconcileSubscriberACLs_LeavesForeignDenyBindingsAloneAndCarriesOn is the safety half of
+// AUTH-02, for the bindings that are safe to leave.
 //
 // ACL deletion has no undo, and a reconciliation wide enough to tidy an operator's deliberate
 // work is wide enough to delete something load-bearing that nobody remembers creating. So the
-// ownership test is an ALLOWLIST of the two shapes Blnk provisions, and everything else on the
-// principal is reported and left exactly where it is.
-func TestReconcileSubscriberACLs_LeavesEveryBindingBlnkDoesNotOwn(t *testing.T) {
+// ownership test is an ALLOWLIST of the two shapes Blnk provisions, and a foreign binding is
+// never deleted.
+//
+// A DENY is additionally safe to CARRY ON PAST. It subtracts from what the ALLOW bindings
+// grant, so its presence means the subscriber can read LESS than its authorization describes —
+// which cannot be an isolation failure, and which an operator may well have added on purpose.
+// Refusing on one would block credential issuance for a principal that is more restricted than
+// Blnk requires.
+func TestReconcileSubscriberACLs_LeavesForeignDenyBindingsAloneAndCarriesOn(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 
 	principal := testSubscriberPrincipal(t)
 
-	foreign := []kafka.ACLEntry{
-		{
-			// A DENY. Removing it would WIDEN access, which is the worst possible direction.
-			ResourceType:        kafka.ResourceTypeTopic,
-			ResourceName:        "blnk.transactions",
-			ResourcePatternType: kafka.PatternTypeLiteral,
-			Principal:           principal,
-			Host:                "*",
-			Operation:           kafka.ACLOperationTypeRead,
-			PermissionType:      kafka.ACLPermissionTypeDeny,
-		},
-		{
-			// A Write an operator granted deliberately. Blnk never grants Write, so it cannot
-			// have created this and must not assume it may remove it.
-			ResourceType:        kafka.ResourceTypeTopic,
-			ResourceName:        "blnk.transactions",
-			ResourcePatternType: kafka.PatternTypeLiteral,
-			Principal:           principal,
-			Host:                "*",
-			Operation:           kafka.ACLOperationTypeWrite,
-			PermissionType:      kafka.ACLPermissionTypeAllow,
-		},
-		{
-			// A PREFIXED topic pattern. Blnk grants topics literally, so this is somebody
-			// else's broader grant.
-			ResourceType:        kafka.ResourceTypeTopic,
-			ResourceName:        "blnk.",
-			ResourcePatternType: kafka.PatternTypePrefixed,
-			Principal:           principal,
-			Host:                "*",
-			Operation:           kafka.ACLOperationTypeRead,
-			PermissionType:      kafka.ACLPermissionTypeAllow,
-		},
-		{
-			// A cluster resource. Outside the two resource types Blnk provisions entirely.
-			ResourceType:        kafka.ResourceTypeCluster,
-			ResourceName:        "kafka-cluster",
-			ResourcePatternType: kafka.PatternTypeLiteral,
-			Principal:           principal,
-			Host:                "*",
-			Operation:           kafka.ACLOperationTypeDescribe,
-			PermissionType:      kafka.ACLPermissionTypeAllow,
-		},
+	denies := []kafka.ACLEntry{
+		deniedTopicBinding(principal, "blnk.transactions"),
+		deniedTopicBinding(principal, "blnk.balances"),
 	}
 
 	fake := newFakeAdminClient()
-	for _, binding := range foreign {
+	for _, binding := range denies {
 		fake.withBinding(binding)
 	}
 
@@ -5390,20 +6047,402 @@ func TestReconcileSubscriberACLs_LeavesEveryBindingBlnkDoesNotOwn(t *testing.T) 
 		context.Background(),
 		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
 	)
-	require.NoError(t, err)
+	require.NoError(t, err, "a DENY narrows access and must not block issuance")
 
 	assert.Equal(t, 1, report.ACLBindingsRemoved,
 		"exactly the one stale Blnk-shaped binding may be removed")
-	assert.Equal(t, len(foreign), report.ForeignACLBindings,
+	assert.Equal(t, len(denies), report.ForeignACLBindings,
 		"every binding outside Blnk's ownership must be REPORTED so an operator can decide")
+	assert.Zero(t, report.ForeignACLBindingsGranting,
+		"a DENY SUBTRACTS from what the ALLOW bindings grant, so none of these grants access — "+
+			"which is exactly why the reconciliation may carry on past them")
+
+	// THE ISSUANCE SUCCEEDED, so the credential is at the broker and nothing was compensated.
+	//
+	// These four assertions used to read the other way — credential gone, compensation
+	// confirmed, no SCRAM at the broker, "after the refusal" — which is the tail of
+	// TestProvisionSubscriberPrincipal_RefusesAForeignAllowBinding below, spliced onto a test
+	// whose own require.NoError three lines up says a DENY must NOT block issuance. The two
+	// cannot both hold: a refusal that returns no error is not a refusal, and this test's whole
+	// point is that a more-restricted principal still gets its credential.
+	assert.True(t, report.CredentialWritten,
+		"a DENY narrows access, so the credential is written exactly as it would be without one")
+	assert.False(t, report.Compensated,
+		"nothing was undone, because nothing was refused")
+	assert.NotEmpty(t, fake.scram,
+		"the SCRAM credential must be at the broker: that is what issuance produced")
 
 	held := aclKeys(fake.heldBindings())
-	for _, binding := range foreign {
+	for _, binding := range denies {
 		assert.Contains(t, held, fakeACLKey(binding),
-			"a binding Blnk does not provision must survive reconciliation untouched")
+			"a binding Blnk does not provision must survive untouched, refusal or not")
 	}
 	assert.NotContains(t, held, fakeACLKey(stale),
 		"the stale Blnk-shaped binding must be gone")
+}
+
+// TestProvisionSubscriberPrincipal_RefusesAForeignAllowBinding is AUTH-03, and it is a
+// data-disclosure guard rather than a tidiness one.
+//
+// # What was wrong
+//
+// A foreign ALLOW binding was DETECTED, logged at warning level, and then provisioning carried
+// on: the credential was minted, the password was returned, and the issuance response declared
+// an enforced access boundary the broker was not enforcing. The subscriber held whatever the
+// foreign binding granted — a wildcard topic pattern, a cluster Describe, another tenant's
+// topic — and nothing an integrator could read said so. The only trace was one log line in the
+// stream of a SUCCESSFUL request.
+//
+// # What must hold now
+//
+// Every one of these four properties is part of the fix, and each is asserted:
+//
+//  1. The call REFUSES, with an error classifiable as ErrSubscriberForeignACLGrant.
+//  2. NOTHING is deleted and nothing is created. The refusal happens before the mutations, so
+//     the broker is left exactly as it was found — including the stale Blnk-shaped binding,
+//     which is a deliberate trade: converging half a grant on a principal whose effective
+//     access cannot be stated is worse than converging none of it.
+//  3. The SCRAM credential written moments earlier is COMPENSATED — revoked — so no usable
+//     credential survives the refusal.
+//  4. The password does not appear in the error.
+//
+// The four foreign shapes are each independently sufficient, so each is exercised on its own:
+// a table would let one passing shape mask a failing one.
+func TestProvisionSubscriberPrincipal_RefusesAForeignAllowBinding(t *testing.T) {
+	principal := func(t *testing.T) string {
+		t.Helper()
+
+		return testSubscriberPrincipal(t)
+	}
+
+	cases := map[string]func(t *testing.T) kafka.ACLEntry{
+		"a Write an operator granted deliberately": func(t *testing.T) kafka.ACLEntry {
+			// Blnk never grants Write, so it cannot have created this — and it lets the
+			// subscriber PUBLISH onto a ledger topic, which is the most serious of the four.
+			return kafka.ACLEntry{
+				ResourceType:        kafka.ResourceTypeTopic,
+				ResourceName:        "blnk.transactions",
+				ResourcePatternType: kafka.PatternTypeLiteral,
+				Principal:           principal(t),
+				Host:                "*",
+				Operation:           kafka.ACLOperationTypeWrite,
+				PermissionType:      kafka.ACLPermissionTypeAllow,
+			}
+		},
+		"a PREFIXED topic pattern": func(t *testing.T) kafka.ACLEntry {
+			// Blnk grants topics literally. A prefix of "blnk." grants EVERY Blnk topic,
+			// including every other subscriber's and every dead-letter topic.
+			return kafka.ACLEntry{
+				ResourceType:        kafka.ResourceTypeTopic,
+				ResourceName:        "blnk.",
+				ResourcePatternType: kafka.PatternTypePrefixed,
+				Principal:           principal(t),
+				Host:                "*",
+				Operation:           kafka.ACLOperationTypeRead,
+				PermissionType:      kafka.ACLPermissionTypeAllow,
+			}
+		},
+		"a cluster resource": func(t *testing.T) kafka.ACLEntry {
+			// Outside the two resource types Blnk provisions entirely, and cluster Describe
+			// lets a subscriber enumerate every topic in the cluster.
+			return kafka.ACLEntry{
+				ResourceType:        kafka.ResourceTypeCluster,
+				ResourceName:        "kafka-cluster",
+				ResourcePatternType: kafka.PatternTypeLiteral,
+				Principal:           principal(t),
+				Host:                "*",
+				Operation:           kafka.ACLOperationTypeDescribe,
+				PermissionType:      kafka.ACLPermissionTypeAllow,
+			}
+		},
+		"a binding whose permission type is not stated": func(t *testing.T) kafka.ACLEntry {
+			// FAIL CLOSED on the unknown. A binding the broker did not describe definitively
+			// cannot be shown to narrow anything, and "I could not tell" must never be
+			// recorded as "it is safe".
+			return kafka.ACLEntry{
+				ResourceType:        kafka.ResourceTypeTopic,
+				ResourceName:        "blnk.balances",
+				ResourcePatternType: kafka.PatternTypeLiteral,
+				Principal:           principal(t),
+				Host:                "*",
+				Operation:           kafka.ACLOperationTypeRead,
+				PermissionType:      kafka.ACLPermissionTypeUnknown,
+			}
+		},
+	}
+
+	for name, build := range cases {
+		t.Run(name, func(t *testing.T) {
+			storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+			foreign := build(t)
+
+			fake := newFakeAdminClient().withBinding(foreign)
+
+			// A stale Blnk-shaped binding, so the test can prove reconciliation performed NO
+			// mutation rather than merely that it had nothing to do.
+			stale := topicBinding(t, "blnk.identities", kafka.ACLOperationTypeRead)
+			fake.withBinding(stale)
+
+			admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+			subscriber := testSubscriber()
+
+			result, err := admin.ProvisionSubscriberPrincipal(
+				context.Background(),
+				NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+			)
+
+			require.Error(t, err, "a widening binding must refuse, not warn")
+			assert.ErrorIs(t, err, ErrSubscriberForeignACLGrant,
+				"the refusal must be classifiable, so the caller can report the operational remedy")
+			assert.NotContains(t, err.Error(), sentinelPassword,
+				"no error may carry the generated password")
+
+			held := aclKeys(fake.heldBindings())
+			assert.Contains(t, held, fakeACLKey(foreign),
+				"the foreign binding is the operator's, and ACL deletion has no undo")
+			assert.Contains(t, held, fakeACLKey(stale),
+				"the refusal must precede every mutation, so even a stale Blnk binding survives")
+
+			assert.Zero(t, result.ACLBindingsRemoved)
+			assert.Zero(t, result.ACLBindings,
+				"no binding count may be reported for a provisioning that refused")
+
+			// AUTH-01: the credential was written before the ACL step, so the refusal must
+			// leave no usable credential behind.
+			assert.True(t, result.Compensated,
+				"the SCRAM credential written before the refusal must be revoked")
+			assert.False(t, result.CredentialWritten,
+				"a confirmed revocation must clear CredentialWritten, so no caller believes a "+
+					"credential survives")
+		})
+	}
+}
+
+// TestGrantSubscriberAccess_RefusesAForeignAllowBindingButPruneDoesNot pins the ONE asymmetry
+// in the fail-closed rule, which is the difference between a widening and a narrowing.
+//
+// Both operations run on a principal whose effective access Blnk cannot state. They must answer
+// differently, and the direction of travel is why:
+//
+//   - GRANTING is a widening. Converging it would report the registry and the broker as
+//     agreeing when they demonstrably do not, so it refuses — leaving the subscriber with the
+//     access it already had, which is LESS than the row records and is the safe direction this
+//     whole three-step surface is built around.
+//   - PRUNING only ever REMOVES access. Refusing it would leave the subscriber with MORE access
+//     than the operator just asked for, which is precisely the outcome the refusal exists to
+//     prevent. So it proceeds, removes the obsolete Blnk-owned bindings, and reports the
+//     foreign one.
+func TestGrantSubscriberAccess_RefusesAForeignAllowBindingButPruneDoesNot(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	principal := testSubscriberPrincipal(t)
+
+	widening := kafka.ACLEntry{
+		ResourceType:        kafka.ResourceTypeTopic,
+		ResourceName:        "blnk.",
+		ResourcePatternType: kafka.PatternTypePrefixed,
+		Principal:           principal,
+		Host:                "*",
+		Operation:           kafka.ACLOperationTypeRead,
+		PermissionType:      kafka.ACLPermissionTypeAllow,
+	}
+
+	t.Run("granting refuses", func(t *testing.T) {
+		fake := newFakeAdminClient().withBinding(widening)
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		report, err := admin.GrantSubscriberAccess(context.Background(), testSubscriber())
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrSubscriberForeignACLGrant)
+		assert.Zero(t, report.Created, "nothing may be granted on top of an unknown grant")
+		assert.Len(t, report.ForeignAllow, 1)
+		assert.Empty(t, report.ForeignDeny)
+	})
+
+	t.Run("pruning proceeds and reports", func(t *testing.T) {
+		fake := newFakeAdminClient().withBinding(widening)
+
+		// A Blnk-shaped binding for a topic the subscriber is no longer authorised for: the
+		// obsolete grant the prune exists to remove.
+		stale := topicBinding(t, "blnk.identities", kafka.ACLOperationTypeRead)
+		fake.withBinding(stale)
+
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		report, err := admin.PruneSubscriberAccess(context.Background(), testSubscriber())
+
+		require.NoError(t, err,
+			"refusing a narrowing would leave MORE access than the operator asked for")
+		assert.Equal(t, 1, report.Removed, "the obsolete Blnk-owned binding must still go")
+		assert.Len(t, report.ForeignAllow, 1,
+			"the widening binding must be reported, so the caller and the log say the narrowing "+
+				"did not narrow the effective access")
+
+		held := aclKeys(fake.heldBindings())
+		assert.Contains(t, held, fakeACLKey(widening))
+		assert.NotContains(t, held, fakeACLKey(stale))
+	})
+}
+
+// TestForeignACLBindingWidens_TreatsOnlyAnExplicitDenyAsHarmless pins the classifier the whole
+// refusal turns on.
+//
+// Kafka's permission type has four values and only ONE of them provably takes access away. The
+// other three are treated as widening, which is the fail-closed reading: Unknown and Any are
+// values a described binding should never carry, so seeing one means the client or broker
+// returned something this code does not understand — exactly when guessing is worst.
+func TestForeignACLBindingWidens_TreatsOnlyAnExplicitDenyAsHarmless(t *testing.T) {
+	for name, tc := range map[string]struct {
+		permission kafka.ACLPermissionType
+		widens     bool
+	}{
+		"allow widens":   {kafka.ACLPermissionTypeAllow, true},
+		"deny narrows":   {kafka.ACLPermissionTypeDeny, false},
+		"unknown widens": {kafka.ACLPermissionTypeUnknown, true},
+		"any widens":     {kafka.ACLPermissionTypeAny, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.widens, foreignACLBindingWidens(kafka.ACLEntry{
+				ResourceType:   kafka.ResourceTypeTopic,
+				PermissionType: tc.permission,
+			}))
+		})
+	}
+
+	t.Run("the two lists are reported separately and combine in order", func(t *testing.T) {
+		report := SubscriberACLReconciliation{
+			ForeignAllow: []string{"allow-1", "allow-2"},
+			ForeignDeny:  []string{"deny-1"},
+		}
+
+		assert.Equal(t, []string{"allow-1", "allow-2", "deny-1"}, report.Foreign(),
+			"the combined view is for logging and counting, widening first")
+		assert.Nil(t, SubscriberACLReconciliation{}.Foreign(),
+			"no foreign bindings must yield nil rather than an empty slice a caller has to check")
+	})
+}
+
+// TestProvisionSubscriberPrincipal_RefusesToOverwriteAReservedPrincipal is SEC-05, and it is a
+// privilege-escalation guard.
+//
+// Provisioning performs a SCRAM UPSERT: an existing credential for the principal is REPLACED
+// with a freshly generated password, which the issuance response then returns. So a subscriber
+// whose derived principal equals the administrative or producer username does not get a new
+// identity — it gets THAT identity's credential rotated and handed to the caller, along with
+// either Write on every Blnk-owned topic or the ability to mint credentials and grant ACLs.
+//
+// Configuration validation refuses such a deployment at start-up. This is the second gate, and
+// it is not redundant: configuration can be reloaded, and an admin client can be constructed
+// from a configuration this process never validated. It must refuse BEFORE the upsert, so the
+// assertion is that no SCRAM write happened at all.
+func TestProvisionSubscriberPrincipal_RefusesToOverwriteAReservedPrincipal(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	subscriber := testSubscriber()
+
+	// The BARE SASL username, not the "User:" ACL principal string that
+	// testSubscriberPrincipal renders. reservedPrincipals holds the usernames read out of
+	// KAFKA_SASL_USER and KAFKA_SASL_ADMIN_USER, and the derived value the SCRAM upsert would
+	// write is the bare one — comparing the two forms is exactly the mistake that would make
+	// this guard never fire.
+	principal, err := model.CanonicalKafkaPrincipal(testSubscriberID)
+	require.NoError(t, err)
+
+	for name, reserved := range map[string][]string{
+		"the administrative principal": {principal, "blnk-producer"},
+		"the producer principal":       {"blnk-admin", principal},
+		"both":                         {principal, principal},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := newFakeAdminClient()
+			admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+			admin.reservedPrincipals = reserved
+
+			result, err := admin.ProvisionSubscriberPrincipal(
+				context.Background(),
+				NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+			)
+
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrSubscriberPrincipalReserved)
+			assert.NotContains(t, err.Error(), sentinelPassword)
+
+			assert.False(t, result.CredentialWritten,
+				"the refusal must precede the SCRAM upsert")
+			assert.Zero(t, fake.callCount("AlterUserScramCredentials"),
+				"no credential write may be attempted for a reserved principal")
+			assert.Zero(t, fake.callCount("CreateACLs"))
+			assert.False(t, result.AuthorizerActive,
+				"the refusal must precede even the authorizer probe, so it costs no round trip")
+		})
+	}
+
+	t.Run("an unrelated reserved principal does not block provisioning", func(t *testing.T) {
+		fake := newFakeAdminClient()
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+		admin.reservedPrincipals = []string{"blnk-admin", "blnk-producer"}
+
+		_, err := admin.ProvisionSubscriberPrincipal(
+			context.Background(),
+			NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+		)
+		require.NoError(t, err)
+	})
+
+	t.Run("comparison is case sensitive, because Kafka principals are", func(t *testing.T) {
+		fake := newFakeAdminClient()
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+		admin.reservedPrincipals = []string{strings.ToUpper(principal)}
+
+		_, err := admin.ProvisionSubscriberPrincipal(
+			context.Background(),
+			NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+		)
+		require.NoError(t, err,
+			"folding case would refuse a provisioning that is in fact safe, and tell the operator "+
+				"something untrue about why")
+	})
+}
+
+// TestReservedKafkaPrincipals_ReadsBothIdentitiesAndDeduplicates pins what the admin client
+// carries into the check above.
+func TestReservedKafkaPrincipals_ReadsBothIdentitiesAndDeduplicates(t *testing.T) {
+	for name, tc := range map[string]struct {
+		admin, producer string
+		want            []string
+	}{
+		"both configured and distinct": {"blnk-admin", "blnk-producer", []string{"blnk-admin", "blnk-producer"}},
+		"only the administrative one":  {"blnk-admin", "", []string{"blnk-admin"}},
+		"only the producer":            {"", "blnk-producer", []string{"blnk-producer"}},
+		"neither":                      {"", "", nil},
+		"whitespace is trimmed":        {"  blnk-admin  ", "", []string{"blnk-admin"}},
+		// Deduplicated so the list reads cleanly. The COLLISION itself is refused at
+		// configuration load, not here — this function only reports the identities.
+		"the same identity twice": {"blnk-admin", "blnk-admin", []string{"blnk-admin"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, reservedKafkaPrincipals(config.KafkaConfig{
+				SASLAdminUser: tc.admin,
+				SASLUser:      tc.producer,
+			}))
+		})
+	}
+}
+
+// TestReservedSubscriberPrincipalNamespace_IsPinnedAcrossPackages is the only thing keeping two
+// copies of one constant from drifting.
+//
+// The config package cannot import model — model already depends on config, and the import
+// would close the cycle — so the reserved namespace is restated in config and asserted equal
+// here. A drift would be silent and would disable the start-up check for exactly the namespace
+// it is meant to protect.
+func TestReservedSubscriberPrincipalNamespace_IsPinnedAcrossPackages(t *testing.T) {
+	assert.Equal(t, model.SubscriberPrincipalNamespace, config.ReservedSubscriberPrincipalNamespace,
+		"config restates the reserved namespace because it cannot import model; the two must be equal")
+	assert.Equal(t, "blnk-sub-", model.SubscriberPrincipalNamespace,
+		"the namespace is a published contract: changing it orphans every principal already minted")
 }
 
 // TestBlnkManagedACLBinding_IsAnAllowlistOfExactlyTwoShapes pins the ownership test itself.
@@ -5723,8 +6762,8 @@ func TestPruneSubscriberAccess_RefusesARowItCannotDeriveABoundaryFrom(t *testing
 		"nothing may be deleted on the strength of a boundary that could not be derived")
 }
 
-// TestReconcileAgainstOutbox_RefusesAGreenVerdictWhileAnyRowCannotNameItsRecord is the OBS-02
-// guard, and it is the whole of the finding's resolution.
+// TestReconcileAgainstOutbox_RefusesAGreenVerdictWhileAnyRowCannotNameItsRecord is the
+// masking guard, and it is the heart of the finding's resolution.
 //
 // # The defect
 //
@@ -5737,10 +6776,11 @@ func TestPruneSubscriberAccess_RefusesARowItCannotDeriveABoundaryFrom(t *testing
 //
 // # The fix, stated as a property
 //
-// Each row now names the record it produced, so the check is a mapping rather than a
-// subtraction: while ANY row claims a publication it cannot name a record for, the verdict is
-// inconclusive — because those rows are exactly what a surplus could be hiding. This test drives
-// the masking scenario directly and requires the verdict to refuse it.
+// Each row names the record it produced and that coordinate is checked against the measured
+// window of its own partition, so the check is a bounded mapping rather than a subtraction:
+// while ANY row cannot be placed, the verdict is inconclusive — because those rows are exactly
+// what a surplus could be hiding. This test drives the masking scenario directly and requires
+// the verdict to refuse it.
 func TestReconcileAgainstOutbox_RefusesAGreenVerdictWhileAnyRowCannotNameItsRecord(t *testing.T) {
 	t.Run("the masking scenario is no longer reported as no loss", func(t *testing.T) {
 		// 1,000 rows claim a publication. The broker holds 1,000 records. Under the old
@@ -5750,38 +6790,57 @@ func TestReconcileAgainstOutbox_RefusesAGreenVerdictWhileAnyRowCannotNameItsReco
 		// nothing corroborates — and the ten records that make the totals balance could just
 		// as easily be redeliveries of events that WERE published. The counting cannot tell,
 		// so it must not pretend to.
-		report := TopicOffsetReport{EndOffsetSum: 1_000, RetainedCount: 1_000, MeasuredAt: time.Now().UTC()}
-		audit := model.EventOutboxAudit{
-			PublishedRows:   1_000,
-			ConfirmedRows:   990,
-			DistinctRecords: 990,
+		report := measuredReport("blnk.transactions", 0, 0, 1_000)
+		audit := model.EventRecordIntervalAudit{
+			PublishedRows:               1_000,
+			CorroboratedRows:            990,
+			DistinctCorroboratedRecords: 990,
+			UnconfirmedRows:             10,
 		}
 
 		verdict := ReconcileAgainstOutbox(report, audit)
 
 		assert.False(t, verdict.LossDetected,
-			"there is no shortfall, so no loss is DETECTED — the point is that none can be ruled out")
+			"no record is provably gone, so no loss is DETECTED — the point is that none can be "+
+				"ruled out either")
 		assert.False(t, verdict.Conclusive,
 			"A GREEN VERDICT HERE IS THE DEFECT: ten rows claim a publication nothing corroborates, "+
 				"and the ten surplus records could be redeliveries rather than those ten events")
 		assert.Equal(t, int64(10), verdict.UnconfirmedEvents)
 		require.NotEmpty(t, verdict.Caveats)
 		assert.Contains(t, verdict.Summary(), "INCONCLUSIVE")
-		assert.Contains(t, verdict.Summary(), "without naming the broker record",
+		assert.Contains(t, strings.Join(verdict.Caveats, " "), "without naming the broker record",
 			"the caveat must say what is wrong, so an operator knows what to fix")
 	})
 
-	t.Run("a fully confirmed outbox is conclusive", func(t *testing.T) {
-		// The same totals, with every claim accounted for. Now the surplus provably IS
-		// overhead, because each of the 1,000 claims names a distinct record of its own.
-		report := TopicOffsetReport{EndOffsetSum: 1_000, RetainedCount: 1_000, MeasuredAt: time.Now().UTC()}
+	t.Run("a fully corroborated outbox is conclusive", func(t *testing.T) {
+		// The same totals, with every claim placed inside a measured window. Now the surplus
+		// provably IS overhead, because each of the 1,000 claims names a distinct record of
+		// its own inside the window its partition can serve.
+		report := measuredReport("blnk.transactions", 0, 0, 1_000)
 
-		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
+		verdict := ReconcileAgainstOutbox(report, fullyCorroboratedAudit(1_000))
 
 		assert.True(t, verdict.Conclusive)
 		assert.Zero(t, verdict.UnconfirmedEvents)
-		assert.Equal(t, int64(1_000), verdict.ConfirmedEvents)
+		assert.Equal(t, int64(1_000), verdict.CorroboratedEvents)
 		assert.Contains(t, verdict.Summary(), "NO LOSS DETECTED")
+	})
+
+	t.Run("the covered window is reported, so a green verdict states its own scope", func(t *testing.T) {
+		// A verdict without its window is how a reconciliation over an aggressively pruned
+		// outbox came to look complete: the rows it could not see had been deleted, so it
+		// reported success over whatever was left without saying so.
+		audit := fullyCorroboratedAudit(1_000)
+
+		verdict := ReconcileAgainstOutbox(measuredReport("blnk.transactions", 0, 0, 1_000), audit)
+
+		assert.Equal(t, audit.CorroboratedFrom, verdict.CoveredFrom)
+		assert.Equal(t, audit.CorroboratedTo, verdict.CoveredTo)
+		assert.Equal(t, audit.OldestTerminalAt, verdict.OldestTerminalAt,
+			"the oldest retained row bounds what ANY verdict can speak about, so it travels with it")
+		assert.Contains(t, verdict.Summary(), audit.CorroboratedFrom.Format(time.RFC3339),
+			"the sentence an operator quotes must name the window it covers")
 	})
 
 	t.Run("two rows naming one record is reported as a schema fault", func(t *testing.T) {
@@ -5790,11 +6849,11 @@ func TestReconcileAgainstOutbox_RefusesAGreenVerdictWhileAnyRowCannotNameItsReco
 		// that index exists. It is checked rather than assumed because two rows sharing one
 		// record's corroboration is the same double-counting the mapping removes, and an
 		// absent index would reintroduce it silently.
-		report := TopicOffsetReport{EndOffsetSum: 1_000, RetainedCount: 1_000, MeasuredAt: time.Now().UTC()}
-		audit := model.EventOutboxAudit{
-			PublishedRows:   1_000,
-			ConfirmedRows:   1_000,
-			DistinctRecords: 995,
+		report := measuredReport("blnk.transactions", 0, 0, 1_000)
+		audit := model.EventRecordIntervalAudit{
+			PublishedRows:               1_000,
+			CorroboratedRows:            1_000,
+			DistinctCorroboratedRecords: 995,
 		}
 
 		verdict := ReconcileAgainstOutbox(report, audit)
@@ -5806,60 +6865,99 @@ func TestReconcileAgainstOutbox_RefusesAGreenVerdictWhileAnyRowCannotNameItsReco
 	})
 
 	t.Run("loss still takes precedence over inconclusiveness", func(t *testing.T) {
-		// A shortfall is unambiguous whatever else is wrong: an incomplete or partly
-		// unconfirmed measurement can only ever UNDERSTATE the claims, so it cannot
-		// manufacture a shortfall.
-		report := TopicOffsetReport{EndOffsetSum: 900, RetainedCount: 900, MeasuredAt: time.Now().UTC()}
-		audit := model.EventOutboxAudit{PublishedRows: 1_000, ConfirmedRows: 500, DistinctRecords: 500}
+		// A record beyond the log end is unambiguous whatever else is wrong, so it must win
+		// the summary: an operator reading "INCONCLUSIVE" would go looking for a measurement
+		// problem instead of a recreated topic.
+		report := measuredReport("blnk.transactions", 0, 0, 900)
+		audit := model.EventRecordIntervalAudit{
+			PublishedRows:               1_000,
+			CorroboratedRows:            500,
+			DistinctCorroboratedRecords: 500,
+			UnconfirmedRows:             400,
+			BeyondEndRows:               100,
+		}
 
 		verdict := ReconcileAgainstOutbox(report, audit)
 
 		assert.True(t, verdict.LossDetected)
 		assert.False(t, verdict.Conclusive)
 		assert.Contains(t, verdict.Summary(), "LOSS DETECTED")
+		assert.Len(t, verdict.Caveats, 2,
+			"both reasons must be listed even though only one sets the verdict")
 	})
 
-	t.Run("an empty outbox is conclusive rather than suspicious", func(t *testing.T) {
-		// A fresh deployment has published nothing, and a reconciliation that reported that as
-		// a problem would fire on every new install.
-		verdict := ReconcileAgainstOutbox(
-			TopicOffsetReport{MeasuredAt: time.Now().UTC()},
-			model.EventOutboxAudit{},
-		)
+	t.Run("every reason is carried on its own field", func(t *testing.T) {
+		// Collapsing any two of these into one number would destroy the distinction an
+		// operator acts on: retention is routine, an unmeasured partition is a broker
+		// problem, an unconfirmed row is a relay problem, and a beyond-end offset is a
+		// recreated topic.
+		audit := model.EventRecordIntervalAudit{
+			PublishedRows:               100,
+			CorroboratedRows:            60,
+			DistinctCorroboratedRecords: 60,
+			UnconfirmedRows:             10,
+			UnmeasuredRows:              12,
+			AgedOutRows:                 15,
+			BeyondEndRows:               3,
+		}
 
-		assert.True(t, verdict.Conclusive)
-		assert.False(t, verdict.LossDetected)
-		assert.Zero(t, verdict.UnconfirmedEvents)
+		verdict := ReconcileAgainstOutbox(measuredReport("blnk.transactions", 0, 0, 100), audit)
+
+		assert.Equal(t, int64(10), verdict.UnconfirmedEvents)
+		assert.Equal(t, int64(12), verdict.UnmeasuredEvents)
+		assert.Equal(t, int64(15), verdict.AgedOutEvents)
+		assert.Equal(t, int64(3), verdict.BeyondEndEvents)
+		assert.Equal(t, int64(60), verdict.CorroboratedEvents)
+		assert.Equal(t, verdict.TerminalEvents,
+			verdict.CorroboratedEvents+verdict.UnconfirmedEvents+verdict.UnmeasuredEvents+
+				verdict.AgedOutEvents+verdict.BeyondEndEvents,
+			"the buckets must partition the claims, or the verdict is describing a set that is "+
+				"not the outbox")
+		assert.Len(t, verdict.Caveats, 4, "one caveat per reason, each in its own words")
 	})
 }
 
-// TestEventOutboxAudit_DerivesItsOwnConclusions pins the two derived answers, because both are
-// read as guards and an off-by-one in either would change a verdict.
-func TestEventOutboxAudit_DerivesItsOwnConclusions(t *testing.T) {
-	t.Run("unconfirmed rows never go negative", func(t *testing.T) {
-		// ConfirmedRows can only exceed PublishedRows if the two counts were read from
-		// different queries, but a negative "unconfirmed" would be reported as a caveat and
-		// send an operator looking for rows that do not exist.
-		audit := model.EventOutboxAudit{PublishedRows: 10, ConfirmedRows: 12, DistinctRecords: 12}
-		assert.Zero(t, audit.UnconfirmedRows())
+// TestEventRecordIntervalAudit_DerivesItsOwnConclusions pins the two derived answers, because
+// both are read as guards and an off-by-one in either would change a verdict.
+func TestEventRecordIntervalAudit_DerivesItsOwnConclusions(t *testing.T) {
+	t.Run("uncorroborated rows sum every reason", func(t *testing.T) {
+		audit := model.EventRecordIntervalAudit{
+			PublishedRows:    10,
+			CorroboratedRows: 4,
+			UnconfirmedRows:  1,
+			UnmeasuredRows:   2,
+			AgedOutRows:      2,
+			BeyondEndRows:    1,
+		}
+		assert.Equal(t, int64(6), audit.UncorroboratedRows())
 	})
 
-	t.Run("fully confirmed requires both properties", func(t *testing.T) {
-		assert.True(t, model.EventOutboxAudit{
-			PublishedRows: 5, ConfirmedRows: 5, DistinctRecords: 5,
-		}.FullyConfirmed())
-
-		assert.False(t, model.EventOutboxAudit{
-			PublishedRows: 5, ConfirmedRows: 4, DistinctRecords: 4,
-		}.FullyConfirmed(), "an unconfirmed row is enough to disqualify it")
-
-		assert.False(t, model.EventOutboxAudit{
-			PublishedRows: 5, ConfirmedRows: 5, DistinctRecords: 4,
-		}.FullyConfirmed(), "so is a shared coordinate")
+	t.Run("duplicated records never go negative", func(t *testing.T) {
+		// DistinctCorroboratedRecords can only exceed CorroboratedRows if the counts were read
+		// from different queries, and a negative "duplicated" would be reported as a caveat
+		// describing duplication that did not occur.
+		audit := model.EventRecordIntervalAudit{
+			CorroboratedRows: 10, DistinctCorroboratedRecords: 12,
+		}
+		assert.Zero(t, audit.DuplicatedRecords())
 	})
 
-	t.Run("nothing published is fully confirmed", func(t *testing.T) {
-		assert.True(t, model.EventOutboxAudit{}.FullyConfirmed())
+	t.Run("fully corroborated requires both properties", func(t *testing.T) {
+		assert.True(t, model.EventRecordIntervalAudit{
+			PublishedRows: 5, CorroboratedRows: 5, DistinctCorroboratedRecords: 5,
+		}.FullyCorroborated())
+
+		assert.False(t, model.EventRecordIntervalAudit{
+			PublishedRows: 5, CorroboratedRows: 4, DistinctCorroboratedRecords: 4, UnconfirmedRows: 1,
+		}.FullyCorroborated(), "an unplaced claim is enough to disqualify it")
+
+		assert.False(t, model.EventRecordIntervalAudit{
+			PublishedRows: 5, CorroboratedRows: 5, DistinctCorroboratedRecords: 4,
+		}.FullyCorroborated(), "so is a shared coordinate")
+	})
+
+	t.Run("nothing published is fully corroborated", func(t *testing.T) {
+		assert.True(t, model.EventRecordIntervalAudit{}.FullyCorroborated())
 	})
 }
 
@@ -6247,4 +7345,745 @@ func exportedLags(series []exportedLagSeries) []int64 {
 	}
 
 	return lags
+}
+
+// ---------------------------------------------------------------------------
+// Event pipeline statistics — the orchestration behind GET /events/stats
+// ---------------------------------------------------------------------------
+
+// statsFakeStore is an in-memory eventStatisticsStore.
+//
+// It records the calls as well as answering them, because half of what the
+// orchestration decides is WHETHER a read happens at all: the audit is only wanted
+// when the broker side is going to be measured, and a skipped posture must make no
+// broker round trip. Neither of those is observable from the returned value.
+type statsFakeStore struct {
+	counts map[string]int64
+	audit  model.EventRecordIntervalAudit
+
+	countErr error
+	auditErr error
+
+	countCalls int
+	auditCalls int
+}
+
+func (s *statsFakeStore) CountEventOutboxByStatus(context.Context, time.Time) (map[string]int64, error) {
+	s.countCalls++
+	if s.countErr != nil {
+		return nil, s.countErr
+	}
+
+	return s.counts, nil
+}
+
+func (s *statsFakeStore) AuditEventRecordsInIntervals(
+	context.Context,
+	[]model.PartitionOffsetInterval,
+) (model.EventRecordIntervalAudit, error) {
+	s.auditCalls++
+	if s.auditErr != nil {
+		return model.EventRecordIntervalAudit{}, s.auditErr
+	}
+
+	return s.audit, nil
+}
+
+// statsOffsetReader builds an offset reader that records how often it was called.
+func statsOffsetReader(report TopicOffsetReport, err error, calls *int) func(context.Context) (TopicOffsetReport, error) {
+	return func(context.Context) (TopicOffsetReport, error) {
+		*calls++
+
+		return report, err
+	}
+}
+
+// statsMeasuredReport is a broker measurement covering one topic, which is the minimum
+// that makes a verdict producible.
+func statsMeasuredReport() TopicOffsetReport {
+	return TopicOffsetReport{
+		Topics: []TopicOffsetSnapshot{{
+			Topic:         "blnk.transactions",
+			EndOffsetSum:  12,
+			RetainedCount: 12,
+		}},
+		EndOffsetSum:  12,
+		RetainedCount: 12,
+		MeasuredAt:    time.Now().UTC(),
+	}
+}
+
+// TestEventOutboxStatistics_ReadsTheOutboxFirstAndTheBrokerAsAnEnrichment pins the
+// sequencing the whole read depends on.
+//
+// The counts come from PostgreSQL and their failure is the only unconditional one:
+// without them there is nothing to report. Everything after them is an enrichment,
+// which is what allows a deployment with NO BROKERS — a legitimate steady state, not a
+// fault — to answer with the counts alone.
+//
+// The audit is read only when the broker side is going to be measured, because its
+// only consumer is the comparison against the offsets. That is asserted by call count
+// rather than by return value, since a wasted query is invisible in the result.
+func TestEventOutboxStatistics_ReadsTheOutboxFirstAndTheBrokerAsAnEnrichment(t *testing.T) {
+	t.Run("a skipped posture reads neither the audit nor the broker", func(t *testing.T) {
+		store := &statsFakeStore{counts: map[string]int64{
+			model.EventOutboxStatusPending:      3,
+			model.EventOutboxStatusDispatched:   9,
+			model.EventOutboxStatusDeadLettered: 1,
+		}}
+		offsetCalls := 0
+
+		statistics, err := eventOutboxStatistics(context.Background(), store,
+			statsOffsetReader(statsMeasuredReport(), nil, &offsetCalls), EventOffsetsSkipped, 0)
+		require.NoError(t, err)
+
+		assert.Equal(t, 1, store.countCalls)
+		assert.Zero(t, store.auditCalls,
+			"the audit's only consumer is the comparison against the offsets, so a skipped posture must not pay for it")
+		assert.Zero(t, offsetCalls, "a skipped posture must make no broker round trip at all")
+
+		assert.False(t, statistics.AuditRead)
+		assert.False(t, statistics.OffsetsRead)
+		assert.Nil(t, statistics.Reconciliation)
+		assert.Equal(t, int64(3), statistics.CountsByStatus[model.EventOutboxStatusPending])
+		assert.False(t, statistics.GeneratedAt.IsZero(), "the outbox side is always stamped")
+	})
+
+	t.Run("a best-effort posture degrades when the broker cannot be read", func(t *testing.T) {
+		store := &statsFakeStore{counts: map[string]int64{model.EventOutboxStatusDispatched: 4}}
+		offsetCalls := 0
+
+		statistics, err := eventOutboxStatistics(context.Background(), store,
+			statsOffsetReader(TopicOffsetReport{}, ErrKafkaAdminNotConfigured, &offsetCalls),
+			EventOffsetsBestEffort, 0)
+		require.NoError(t, err,
+			"no broker is a legitimate steady state, so it must not turn a statistics read into a failure")
+
+		assert.Equal(t, 1, offsetCalls)
+		assert.False(t, statistics.OffsetsRead,
+			"an unmeasured broker side must be reported as unmeasured, not as a measured zero")
+		assert.Nil(t, statistics.Reconciliation,
+			"there is nothing to compare against, so no verdict may be reported")
+
+		// AND THE AUDIT IS UNREAD TOO, which is a consequence of a later fix rather than of this
+		// one. The audit is taken against the partition INTERVALS the offset report measured —
+		// AuditEventRecordsInIntervals — because an audit over the whole table and an offset
+		// total describe different populations and cannot be compared, which is the defect the
+		// interval form closes. With no report there are no intervals, so there is nothing to
+		// audit and reporting it as read would assert a measurement nobody took.
+		assert.False(t, statistics.AuditRead,
+			"the audit is scoped to the intervals the offset report measured, so an unread broker "+
+				"leaves nothing to audit")
+		assert.Zero(t, store.auditCalls,
+			"and it must not be attempted over a population the offsets cannot bound")
+	})
+
+	t.Run("a required posture refuses when the broker cannot be read", func(t *testing.T) {
+		store := &statsFakeStore{counts: map[string]int64{model.EventOutboxStatusDispatched: 4}}
+		offsetCalls := 0
+
+		_, err := eventOutboxStatistics(context.Background(), store,
+			statsOffsetReader(TopicOffsetReport{}, errors.New("dial tcp 10.0.0.4:9092: connect: refused"), &offsetCalls),
+			EventOffsetsRequired, 0)
+
+		dltAssertCodeAndStatus(t, err, apierror.ErrKafkaUnavailable, http.StatusServiceUnavailable)
+
+		// DATA-01: the broker's own words name addresses and topology, so they must stay
+		// in the log rather than travel in the error a handler renders.
+		assert.NotContains(t, err.Error(), "10.0.0.4",
+			"a Kafka client error must not carry broker addresses into the response")
+	})
+
+	t.Run("a required posture refuses when the audit cannot be read", func(t *testing.T) {
+		store := &statsFakeStore{
+			counts:   map[string]int64{model.EventOutboxStatusDispatched: 4},
+			auditErr: apierror.NewAPIError(apierror.ErrInternalServer, "audit failed", errors.New("boom")),
+		}
+		offsetCalls := 0
+
+		_, err := eventOutboxStatistics(context.Background(), store,
+			statsOffsetReader(statsMeasuredReport(), nil, &offsetCalls), EventOffsetsRequired, 0)
+
+		dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
+
+		// THE BROKER IS READ FIRST, and that is the interval form's doing rather than an
+		// oversight. The audit is scoped to the partition intervals the offset report measured,
+		// so the report has to exist before the audit can be asked for anything comparable. What
+		// the posture decides is whether a failed audit is FATAL — and it is, here, because a
+		// required verdict with no outbox side would be a clean bill of health nobody
+		// established.
+		assert.Equal(t, 1, offsetCalls,
+			"the audit is bounded by the intervals the offsets measured, so the broker read "+
+				"necessarily precedes it")
+	})
+
+	t.Run("a failure to read the counts is unconditional", func(t *testing.T) {
+		for _, inclusion := range []EventOffsetInclusion{
+			EventOffsetsBestEffort, EventOffsetsRequired, EventOffsetsSkipped,
+		} {
+			store := &statsFakeStore{countErr: apierror.NewAPIError(
+				apierror.ErrInternalServer, "Failed to count", errors.New("dial tcp: refused"),
+			)}
+			offsetCalls := 0
+
+			_, err := eventOutboxStatistics(context.Background(), store,
+				statsOffsetReader(statsMeasuredReport(), nil, &offsetCalls), inclusion, 0)
+
+			dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
+			assert.Zero(t, store.auditCalls)
+			assert.Zero(t, offsetCalls)
+		}
+	})
+
+	t.Run("a nil store is reported rather than dereferenced", func(t *testing.T) {
+		_, err := eventOutboxStatistics(context.Background(), nil, nil, EventOffsetsBestEffort, 0)
+		dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
+	})
+
+	t.Run("a nil offset reader degrades exactly like an unconfigured broker", func(t *testing.T) {
+		store := &statsFakeStore{counts: map[string]int64{model.EventOutboxStatusDispatched: 1}}
+
+		statistics, err := eventOutboxStatistics(
+			context.Background(), store, nil, EventOffsetsBestEffort, 0,
+		)
+		require.NoError(t, err)
+		assert.False(t, statistics.OffsetsRead)
+	})
+}
+
+// TestEventOutboxStatistics_ProducesAVerdictOnlyWhenBothSidesWereMeasured is the
+// honesty requirement the zero-loss criterion rests on.
+//
+// A verdict computed over zero topics would report a clean bill of health it never
+// established. "Measured and zero" and "not measured" are different answers, and the
+// numbers alone cannot distinguish them — which is why the two booleans exist and why
+// the verdict is absent rather than green when nothing was covered.
+func TestEventOutboxStatistics_ProducesAVerdictOnlyWhenBothSidesWereMeasured(t *testing.T) {
+	audit := model.EventRecordIntervalAudit{
+		PublishedRows:               10,
+		CorroboratedRows:            10,
+		DistinctCorroboratedRecords: 10,
+	}
+
+	t.Run("both sides measured yields the verdict", func(t *testing.T) {
+		store := &statsFakeStore{
+			counts: map[string]int64{model.EventOutboxStatusDispatched: 10},
+			audit:  audit,
+		}
+		offsetCalls := 0
+
+		statistics, err := eventOutboxStatistics(context.Background(), store,
+			statsOffsetReader(statsMeasuredReport(), nil, &offsetCalls), EventOffsetsBestEffort, 0)
+		require.NoError(t, err)
+
+		assert.True(t, statistics.AuditRead)
+		assert.True(t, statistics.OffsetsRead)
+		require.NotNil(t, statistics.Reconciliation)
+
+		// Delegated to ReconcileAgainstOutbox rather than recomputed, so the comparison
+		// stays directional: records are a lower bound on events, and only a shortfall is
+		// evidence of loss.
+		assert.Equal(t, ReconcileAgainstOutbox(statistics.Offsets, audit), *statistics.Reconciliation)
+		assert.False(t, statistics.Reconciliation.LossDetected)
+	})
+
+	t.Run("a measurement covering no topics yields no verdict", func(t *testing.T) {
+		store := &statsFakeStore{
+			counts: map[string]int64{model.EventOutboxStatusDispatched: 10},
+			audit:  audit,
+		}
+		offsetCalls := 0
+
+		statistics, err := eventOutboxStatistics(context.Background(), store,
+			statsOffsetReader(TopicOffsetReport{MeasuredAt: time.Now().UTC()}, nil, &offsetCalls),
+			EventOffsetsRequired, 0)
+		require.NoError(t, err)
+
+		assert.True(t, statistics.OffsetsRead, "the read itself succeeded")
+		assert.Nil(t, statistics.Reconciliation,
+			"with no topics covered there is nothing to compare, so a verdict would assert something it never established")
+	})
+}
+
+// TestEventOutboxStatistics_NamesAStatusNothingReportsACountFor closes the gap that
+// makes a short total indistinguishable from a lost event.
+//
+// The status column deliberately permits values the code has not learned yet, so the
+// state machine can be extended without a migration. A new state therefore appears in
+// the aggregate before any consumer's shape learns about it, and its rows are then
+// missing from every reported total — which is exactly what a zero-loss reconciliation
+// cannot tolerate. Naming it is the cheapest thing that makes the gap visible.
+func TestEventOutboxStatistics_NamesAStatusNothingReportsACountFor(t *testing.T) {
+	store := &statsFakeStore{counts: map[string]int64{
+		model.EventOutboxStatusDispatched: 4,
+		"quarantined":                     2,
+		"archived":                        1,
+	}}
+
+	statistics, err := eventOutboxStatistics(
+		context.Background(), store, nil, EventOffsetsSkipped, 0,
+	)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"archived", "quarantined"}, statistics.UnreportedStatuses,
+		"unknown statuses must be named, and sorted so the warning and any assertion on it are deterministic")
+
+	t.Run("every known status is reported as known", func(t *testing.T) {
+		counts := make(map[string]int64, len(model.EventOutboxStatuses()))
+		for _, status := range model.EventOutboxStatuses() {
+			counts[status] = 1
+		}
+
+		statistics, err := eventOutboxStatistics(
+			context.Background(), &statsFakeStore{counts: counts}, nil, EventOffsetsSkipped, 0,
+		)
+		require.NoError(t, err)
+		assert.Empty(t, statistics.UnreportedStatuses,
+			"the whole state machine must be recognised, or the enumeration and the table have drifted")
+	})
+
+	t.Run("an empty table names nothing", func(t *testing.T) {
+		statistics, err := eventOutboxStatistics(
+			context.Background(), &statsFakeStore{counts: map[string]int64{}}, nil, EventOffsetsSkipped, 0,
+		)
+		require.NoError(t, err)
+		assert.Empty(t, statistics.UnreportedStatuses)
+	})
+}
+
+// measuredOffsetReport built a two-partition report from a single record total. It is RETIRED:
+// measuredReport above states a partition's bounds directly, so it expresses this shape and the
+// aged-out one this could not — its FirstOffset was fixed at zero. The reason the partition
+// detail had to be there in the first place is recorded on measuredReport, where it now applies
+// to sixteen callers instead of none.
+
+// TestReconcileSubscriberACLs_LeavesEveryBindingBlnkDoesNotOwn is the safety half of AUTH-02.
+//
+// ACL deletion has no undo, and a reconciliation wide enough to tidy an operator's deliberate
+// work is wide enough to delete something load-bearing that nobody remembers creating. So the
+// ownership test is an ALLOWLIST of the two shapes Blnk provisions, and everything else on the
+// principal is reported and left exactly where it is.
+//
+// # Why every fixture here is a DENY
+//
+// It used to mix DENY with three ALLOW shapes — a deliberate Write, a prefixed topic pattern and
+// a cluster Describe — and require NO error. AUTH-03 withdrew that: a foreign ALLOW makes the
+// principal's effective access broader than the registry records, so provisioning now REFUSES
+// rather than issuing a credential whose stated boundary the broker is not enforcing, and
+// TestProvisionSubscriberPrincipal_RefusesAForeignAllowBinding exercises all four of those shapes
+// on their own. Keeping them here asserted the opposite answer for the same input.
+//
+// What this test still proves, and what its sibling does not, is that ownership is decided by
+// SHAPE across every dimension: resource type, pattern type and operation. Every fixture is a
+// DENY so that none of them can trip AUTH-03 — a DENY only ever subtracts from what the ALLOW
+// bindings grant, so it cannot widen effective access and reconciliation carries on past it.
+func TestReconcileSubscriberACLs_LeavesEveryBindingBlnkDoesNotOwn(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	principal := testSubscriberPrincipal(t)
+
+	foreign := []kafka.ACLEntry{
+		{
+			// A DENY on a topic Blnk DOES grant literally. Removing it would WIDEN access,
+			// which is the worst possible direction.
+			ResourceType:        kafka.ResourceTypeTopic,
+			ResourceName:        "blnk.transactions",
+			ResourcePatternType: kafka.PatternTypeLiteral,
+			Principal:           principal,
+			Host:                "*",
+			Operation:           kafka.ACLOperationTypeRead,
+			PermissionType:      kafka.ACLPermissionTypeDeny,
+		},
+		{
+			// A DENY on an operation Blnk never grants at all. Blnk provisions Read and
+			// Describe, so a Write binding cannot be its work whichever way it points.
+			ResourceType:        kafka.ResourceTypeTopic,
+			ResourceName:        "blnk.transactions",
+			ResourcePatternType: kafka.PatternTypeLiteral,
+			Principal:           principal,
+			Host:                "*",
+			Operation:           kafka.ACLOperationTypeWrite,
+			PermissionType:      kafka.ACLPermissionTypeDeny,
+		},
+		{
+			// A PREFIXED pattern. Blnk grants topics literally, so a prefixed binding is
+			// somebody else's regardless of which way it points.
+			ResourceType:        kafka.ResourceTypeTopic,
+			ResourceName:        "blnk.",
+			ResourcePatternType: kafka.PatternTypePrefixed,
+			Principal:           principal,
+			Host:                "*",
+			Operation:           kafka.ACLOperationTypeRead,
+			PermissionType:      kafka.ACLPermissionTypeDeny,
+		},
+		{
+			// A cluster resource. Outside the two resource types Blnk provisions entirely.
+			ResourceType:        kafka.ResourceTypeCluster,
+			ResourceName:        "kafka-cluster",
+			ResourcePatternType: kafka.PatternTypeLiteral,
+			Principal:           principal,
+			Host:                "*",
+			Operation:           kafka.ACLOperationTypeDescribe,
+			PermissionType:      kafka.ACLPermissionTypeDeny,
+		},
+	}
+
+	fake := newFakeAdminClient()
+	for _, binding := range foreign {
+		fake.withBinding(binding)
+	}
+
+	// And one genuinely stale Blnk-shaped binding, so the test proves reconciliation still
+	// does its job rather than passing by doing nothing at all.
+	stale := topicBinding(t, "blnk.identities", kafka.ACLOperationTypeRead)
+	fake.withBinding(stale)
+
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	report, err := admin.ProvisionSubscriberPrincipal(
+		context.Background(),
+		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
+	)
+	require.NoError(t, err,
+		"none of these bindings grants access, so none of them can make the effective access "+
+			"broader than the registry records and issuance must proceed")
+
+	assert.Equal(t, 1, report.ACLBindingsRemoved,
+		"exactly the one stale Blnk-shaped binding may be removed")
+	assert.Equal(t, len(foreign), report.ForeignACLBindings,
+		"every binding outside Blnk's ownership must be REPORTED so an operator can decide")
+	assert.Zero(t, report.ForeignACLBindingsGranting,
+		"and none of them grants, which is what makes carrying on past them safe")
+
+	held := aclKeys(fake.heldBindings())
+	for _, binding := range foreign {
+		assert.Contains(t, held, fakeACLKey(binding),
+			"a binding Blnk does not provision must survive reconciliation untouched")
+	}
+	assert.NotContains(t, held, fakeACLKey(stale),
+		"the stale Blnk-shaped binding must be gone")
+}
+
+// catalogueGateStub drives TopicCatalogueGate without a broker.
+type catalogueGateStub struct {
+	mu      sync.Mutex
+	calls   int
+	reports []TopicCatalogueReport
+	errs    []error
+}
+
+func (s *catalogueGateStub) verify(context.Context) (TopicCatalogueReport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	index := s.calls
+	s.calls++
+
+	// The last entry repeats, so a test states the interesting prefix of the sequence and the
+	// steady state that follows it.
+	if index >= len(s.reports) {
+		index = len(s.reports) - 1
+	}
+
+	var err error
+	if index < len(s.errs) {
+		err = s.errs[index]
+	}
+
+	return s.reports[index], err
+}
+
+func (s *catalogueGateStub) probeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.calls
+}
+
+// completeCatalogue is a report saying every expected topic exists.
+func completeCatalogue() TopicCatalogueReport {
+	return TopicCatalogueReport{Expected: AllOwnedTopicsAcrossPrefixes(), VerifiedAt: relayFixedNow}
+}
+
+// incompleteCatalogue is a report saying one dead-letter topic is absent — the case that is
+// worst in practice, because it fails the PRESERVATION of an event whose budget is spent.
+func incompleteCatalogue() TopicCatalogueReport {
+	return TopicCatalogueReport{
+		Expected:   AllOwnedTopicsAcrossPrefixes(),
+		Missing:    []string{DLTFor(TopicForCategory(model.EventCategoryTransactions))},
+		VerifiedAt: relayFixedNow,
+	}
+}
+
+// TestTopicCatalogueGate_OpensOnceAndOnlyOnAVerifiedCatalogue is the gate's contract.
+//
+// # What the gate is for
+//
+// Every write the relay makes goes to a Blnk-owned topic and auto-creation is disabled, so a
+// missing topic fails the publish, spends the row's retry budget one attempt at a time, and
+// then fails the dead-letter write for the same reason — leaving the row failed with no
+// dead-letter topic recorded. A boot against an unprovisioned broker could do that to every
+// pending row. The gate is what stops the relay claiming a row it cannot deliver.
+//
+// # Why "opens once" matters as much as "opens only when verified"
+//
+// The gate is consulted on every poll — once a second at the defaults. If it probed the broker
+// each time, the fix for one failure mode would be a permanent metadata read on the relay's
+// path, plus a log line per second for as long as a broker stayed unprovisioned. Latching
+// success and backing off failure is what makes it affordable enough to be consulted at all.
+func TestTopicCatalogueGate_OpensOnceAndOnlyOnAVerifiedCatalogue(t *testing.T) {
+	t.Run("a verified catalogue opens the gate and is never re-probed", func(t *testing.T) {
+		stub := &catalogueGateStub{reports: []TopicCatalogueReport{completeCatalogue()}}
+		gate := &TopicCatalogueGate{
+			verify:        stub.verify,
+			now:           func() time.Time { return relayFixedNow },
+			probeInterval: defaultCatalogueProbeInterval,
+		}
+
+		require.NoError(t, gate.Ready(context.Background()))
+		assert.True(t, gate.Verified())
+
+		for i := 0; i < 25; i++ {
+			require.NoError(t, gate.Ready(context.Background()))
+		}
+		assert.Equal(t, 1, stub.probeCount(),
+			"success must LATCH: the relay consults the gate every poll, so re-probing would put a "+
+				"broker round trip on that path for the life of the process")
+	})
+
+	t.Run("missing topics keep the gate shut and name them", func(t *testing.T) {
+		stub := &catalogueGateStub{reports: []TopicCatalogueReport{incompleteCatalogue()}}
+		gate := &TopicCatalogueGate{
+			verify:        stub.verify,
+			now:           func() time.Time { return relayFixedNow },
+			probeInterval: defaultCatalogueProbeInterval,
+		}
+
+		err := gate.Ready(context.Background())
+		require.Error(t, err, "an incomplete catalogue must refuse: publishing to a topic that does "+
+			"not exist spends the row's retry budget and then cannot dead-letter either")
+		assert.ErrorIs(t, err, errCatalogueIncomplete)
+		assert.Contains(t, err.Error(), DLTFor(TopicForCategory(model.EventCategoryTransactions)),
+			"the refusal must name the absent topic, or an operator has nothing to act on")
+		assert.False(t, gate.Verified())
+	})
+
+	t.Run("a broker that cannot be reached refuses without claiming to be verified", func(t *testing.T) {
+		unreachable := errors.New("dial tcp 10.0.0.1:9092: i/o timeout")
+		stub := &catalogueGateStub{
+			reports: []TopicCatalogueReport{{Expected: AllOwnedTopicsAcrossPrefixes()}},
+			errs:    []error{unreachable},
+		}
+		gate := &TopicCatalogueGate{
+			verify:        stub.verify,
+			now:           func() time.Time { return relayFixedNow },
+			probeInterval: defaultCatalogueProbeInterval,
+		}
+
+		err := gate.Ready(context.Background())
+		require.Error(t, err)
+		assert.ErrorIs(t, err, unreachable,
+			"an UNKNOWN catalogue must not be treated as an incomplete one or as a verified one: "+
+				"the relay's decision is the same, but the reason an operator is given is not")
+		assert.False(t, gate.Verified())
+	})
+
+	t.Run("probes are rate-limited between attempts and back off", func(t *testing.T) {
+		stub := &catalogueGateStub{reports: []TopicCatalogueReport{incompleteCatalogue()}}
+		now := relayFixedNow
+		gate := &TopicCatalogueGate{
+			verify:        stub.verify,
+			now:           func() time.Time { return now },
+			probeInterval: defaultCatalogueProbeInterval,
+		}
+
+		require.Error(t, gate.Ready(context.Background()))
+		require.Equal(t, 1, stub.probeCount())
+
+		// Every tick inside the window is answered from the gate's own state, with no broker
+		// contact and no second log line.
+		for i := 0; i < 10; i++ {
+			err := gate.Ready(context.Background())
+			require.ErrorIs(t, err, errCatalogueNotVerified,
+				"inside the backoff window the refusal is silent and free")
+		}
+		assert.Equal(t, 1, stub.probeCount(), "the window must suppress the probe, not just the log")
+
+		// Past the window it probes again, and the window has doubled.
+		now = now.Add(defaultCatalogueProbeInterval)
+		require.Error(t, gate.Ready(context.Background()))
+		assert.Equal(t, 2, stub.probeCount())
+		assert.Equal(t, defaultCatalogueProbeInterval*4, gate.probeInterval,
+			"the interval doubles on each failed probe so a long outage is not interrogated once a "+
+				"second, and it is read AFTER the second failure has grown it twice")
+	})
+
+	t.Run("the backoff is capped so recovery never needs a restart", func(t *testing.T) {
+		stub := &catalogueGateStub{reports: []TopicCatalogueReport{incompleteCatalogue()}}
+		now := relayFixedNow
+		gate := &TopicCatalogueGate{
+			verify:        stub.verify,
+			now:           func() time.Time { return now },
+			probeInterval: defaultCatalogueProbeInterval,
+		}
+
+		for i := 0; i < 20; i++ {
+			require.Error(t, gate.Ready(context.Background()))
+			now = now.Add(maxCatalogueProbeInterval)
+		}
+
+		assert.Equal(t, maxCatalogueProbeInterval, gate.probeInterval,
+			"an unbounded backoff would eventually make automatic recovery indistinguishable from "+
+				"a restart, which is the very thing gating instead of refusing to start avoids")
+	})
+
+	t.Run("a broker that comes good later opens the gate without a restart", func(t *testing.T) {
+		stub := &catalogueGateStub{reports: []TopicCatalogueReport{
+			incompleteCatalogue(),
+			completeCatalogue(),
+		}}
+		now := relayFixedNow
+		gate := &TopicCatalogueGate{
+			verify:        stub.verify,
+			now:           func() time.Time { return now },
+			probeInterval: defaultCatalogueProbeInterval,
+		}
+
+		require.Error(t, gate.Ready(context.Background()))
+
+		now = now.Add(defaultCatalogueProbeInterval)
+		require.NoError(t, gate.Ready(context.Background()),
+			"this is the whole reason the relay starts rather than refusing: provisioning the topics "+
+				"must be enough, with no human restarting anything")
+		assert.True(t, gate.Verified())
+	})
+
+	t.Run("a nil gate and a verifierless gate are both handled", func(t *testing.T) {
+		var absent *TopicCatalogueGate
+		assert.NoError(t, absent.Ready(context.Background()),
+			"a nil gate is ungated, which is the pre-existing behaviour every test relies on")
+		assert.False(t, absent.Verified())
+
+		empty := &TopicCatalogueGate{now: func() time.Time { return relayFixedNow }}
+		assert.Error(t, empty.Ready(context.Background()),
+			"a gate that cannot verify anything must refuse rather than open by default")
+	})
+}
+
+// fullyConfirmedAudit builds an outbox-side audit in which every published row names a
+// distinct broker record.
+//
+// It is the precondition for a CONCLUSIVE verdict (OBS-02), so the lower-bound cases below use
+// it in order to keep testing the direction of the comparison rather than accidentally testing
+// the unconfirmed-row caveat.
+func fullyConfirmedAudit(publishedRows int64) model.EventRecordIntervalAudit {
+	return model.EventRecordIntervalAudit{
+		PublishedRows:               publishedRows,
+		CorroboratedRows:            publishedRows,
+		DistinctCorroboratedRecords: publishedRows,
+		MeasuredAt:                  time.Now().UTC(),
+		WindowStart:                 reconciliationWindowStart(),
+	}
+}
+
+// reconciliationWindowStart is the instant both sides of a reconciliation are measured from.
+//
+// A CONCLUSIVE verdict now requires the two sides to name the same window (PERF-P05), so a
+// fixture that set one on neither would be testing the not-windowed caveat rather than the
+// direction of the comparison. Fixed rather than time.Now() so both sides agree exactly, which
+// is the property the verdict checks.
+func reconciliationWindowStart() time.Time {
+	return time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+}
+
+// windowedOffsetReport builds a broker-side report measured over the shared window, in which
+// `records` were written inside it.
+//
+// EndOffsetSum and WindowRecordCount are set to the same figure because these fixtures describe
+// a topic whose whole content falls inside the window; RetainedCount matches so nothing looks
+// truncated. The verdict reads WindowRecordCount when both sides are windowed, so that is the
+// figure that decides the comparison.
+func windowedOffsetReport(records int64) TopicOffsetReport {
+	return TopicOffsetReport{
+		EndOffsetSum:      records,
+		RetainedCount:     records,
+		WindowRecordCount: records,
+		WindowStart:       reconciliationWindowStart(),
+		MeasuredAt:        time.Now().UTC(),
+	}
+}
+
+// TestReconcileAgainstOutbox_TreatsMessagesAsALowerBoundOnEvents is the OBS-01 guard.
+//
+// Summed end offsets count RECORDS and the outbox counts EVENTS, and the reconciliation used to
+// be documented as an equality between them. It cannot hold: a redelivery after a crash writes
+// a second record for one event, a replay writes another on purpose, and a dead-lettered event
+// has a record on its `.dlt` topic. So messages >= events always, and an equality check reports
+// loss on a healthy system the first time anything is redelivered — the alert that gets muted,
+// taking the real signal with it.
+func TestReconcileAgainstOutbox_TreatsMessagesAsALowerBoundOnEvents(t *testing.T) {
+	t.Run("a surplus is expected, not loss", func(t *testing.T) {
+		report := windowedOffsetReport(1_100)
+
+		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
+		assert.False(t, verdict.LossDetected,
+			"100 more records than events is redelivery and replay overhead, which is normal")
+		assert.True(t, verdict.Conclusive)
+		assert.True(t, verdict.Windowed,
+			"both sides named the same window, which is what makes the comparison a comparison")
+		assert.Equal(t, int64(100), verdict.Overhead)
+		assert.Contains(t, verdict.Summary(), "NO LOSS DETECTED")
+		assert.Contains(t, verdict.Summary(), "names the distinct broker record it produced",
+			"a green verdict must state WHY the surplus cannot be masking loss, not merely that "+
+				"none was detected")
+	})
+
+	t.Run("a shortfall is loss", func(t *testing.T) {
+		report := windowedOffsetReport(990)
+
+		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
+		assert.True(t, verdict.LossDetected,
+			"fewer records than rows means rows claim a publication that never happened")
+		assert.Equal(t, int64(-10), verdict.Overhead,
+			"the shortfall must stay signed; clamping it would erase the only signal here")
+		assert.Contains(t, verdict.Summary(), "LOSS DETECTED")
+	})
+
+	t.Run("exact equality is not loss", func(t *testing.T) {
+		report := windowedOffsetReport(1_000)
+
+		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
+		assert.False(t, verdict.LossDetected, "the boundary is inclusive: equal is not short")
+		assert.Zero(t, verdict.Overhead)
+	})
+}
+
+// TestEventOutboxAudit_DerivesItsOwnConclusions pins the two derived answers, because both are
+// read as guards and an off-by-one in either would change a verdict.
+func TestEventOutboxAudit_DerivesItsOwnConclusions(t *testing.T) {
+	t.Run("unconfirmed rows never go negative", func(t *testing.T) {
+		// ConfirmedRows can only exceed PublishedRows if the two counts were read from
+		// different queries, but a negative "unconfirmed" would be reported as a caveat and
+		// send an operator looking for rows that do not exist.
+		audit := model.EventOutboxAudit{PublishedRows: 10, ConfirmedRows: 12, DistinctRecords: 12}
+		assert.Zero(t, audit.UnconfirmedRows())
+	})
+
+	t.Run("fully confirmed requires both properties", func(t *testing.T) {
+		assert.True(t, model.EventOutboxAudit{
+			PublishedRows: 5, ConfirmedRows: 5, DistinctRecords: 5,
+		}.FullyConfirmed())
+
+		assert.False(t, model.EventOutboxAudit{
+			PublishedRows: 5, ConfirmedRows: 4, DistinctRecords: 4,
+		}.FullyConfirmed(), "an unconfirmed row is enough to disqualify it")
+
+		assert.False(t, model.EventOutboxAudit{
+			PublishedRows: 5, ConfirmedRows: 5, DistinctRecords: 4,
+		}.FullyConfirmed(), "so is a shared coordinate")
+	})
+
+	t.Run("nothing published is fully confirmed", func(t *testing.T) {
+		assert.True(t, model.EventOutboxAudit{}.FullyConfirmed())
+	})
 }
