@@ -48,35 +48,26 @@ type Api struct {
 func (a Api) Router() *gin.Engine {
 	router := a.router
 
-	// THE WEBHOOK RETIREMENT GUARD, FIRST — before authentication and before any route is
-	// matched, which are the only two positions from which "410 on every request" can be true.
+	// THE WEBHOOK RETIREMENT GUARD IS NOT INSTALLED HERE, and that is a correction rather than
+	// an omission.
 	//
-	// It was attached per route, to the four deprecated methods that had handlers. Gin matches
-	// method AND path to decide which handlers run, so a PATCH, an OPTIONS or a HEAD to the same
-	// path matched nothing and was answered by the ROUTER with 404 or 405 — "no such thing", or
-	// "wrong verb, try another", about a surface that has been retired. Requirement
-	// R-12 says the webhook REST API answers 410 Gone on every request, and four methods is not
-	// every request. Gin runs the global chain for unmatched requests too, so a global guard
-	// that matches the path itself is what reaches the methods nobody registered.
+	// It used to be, with router.Use, immediately before Authenticate. Both of those positions
+	// are necessary — before authentication, so a caller is not told 401 or 403 about a surface
+	// that is never coming back and left fixing credentials for it; and before route matching,
+	// so a PATCH, OPTIONS or HEAD that matches no registered handler is answered 410 rather than
+	// the router's own 404 or 405, since requirement R-12 says every request and four methods is
+	// not every request.
 	//
-	// Before Authenticate for the same reason: with authentication first, an unauthenticated
-	// request to a retired route is told 401 and a wrongly-scoped one is told 403, so a caller
-	// keeps fixing credentials for a route that is never coming back. Nothing is disclosed by
-	// answering honestly — the path is published in the migration guide and the body is a fixed
-	// sentence — and the guard reads no subscriber state at all.
+	// Neither is sufficient. Every router.Use in this method runs AFTER every one in NewAPI, and
+	// NewAPI installs RequestSizeLimit and RateLimitMiddleware — both of which ABORT. So a
+	// throttled or oversized request to a retired route was answered 429 or 413 and never reached
+	// this guard at all. It is therefore installed in NewAPI, ahead of every aborting middleware;
+	// see the comment there. Installing it in both places would only run its path test twice per
+	// request.
 	//
-	// It matches ONE exact three-segment shape AND the method, so everything else in this file
-	// is untouched: /hooks (a different, supported feature) and the rest of /subscribers (the
-	// registry and the credential endpoint, which ARE the migration path) all answer exactly as
-	// before.
-	//
-	// WebhookSunsetPreAuthGuard, NOT WebhookSunsetGuard. The distinction is the path match, and
-	// getting it wrong is not a subtlety: WebhookSunsetGuard is the per-route barrier and tests
-	// no path at all, because gin already decided the path by the time a per-route handler runs.
-	// Installed here with router.Use it would have answered 410 to EVERY request in the API once
-	// the instant passed — every transaction, every balance, every /hooks callout — which is the
-	// opposite of a retirement scoped to one surface.
-	router.Use(middleware.WebhookSunsetPreAuthGuard())
+	// The per-route WebhookSunsetGuard below is unaffected and still attached to the four
+	// registered verbs: two independent barriers for a behaviour whose failure mode is "the
+	// routes quietly keep working" is deliberate.
 
 	// Apply auth middleware to all routes
 	router.Use(a.auth.Authenticate())
@@ -184,12 +175,25 @@ func (a Api) Router() *gin.Engine {
 	// purpose: no route parameter is registered directly there, so the
 	// dead-letter and stats subtrees can never be shadowed.
 	router.GET("/events/dead-letter", a.ListDeadLetterEvents)
+	// REPLAY IS THE WHOLE OF THE DEAD-LETTER WORKFLOW, and there is deliberately no
+	// second write beside it.
+	//
+	// A `resolve` route was registered here and has been removed. It recorded an
+	// operator's decision that a dead-lettered event needed no further action, so that
+	// retention could delete the row — and it made the surface fourteen routes where
+	// the agreed plan approves thirteen. Worse, the two writes could not compose: a
+	// resolved row could not then be replayed, because marking the successful
+	// re-publish `dispatched` violated the state constraint that kept a resolution
+	// confined to the dead-lettered states, and the refusal released the row as
+	// replayable again — so a broker-acknowledged replay reported failure and invited a
+	// duplicate publish.
+	//
+	// Retention is now modelled through this route alone: a dead-lettered row is
+	// retained indefinitely, keeps feeding the dead-letter age gauge and keeps the
+	// DeadLetterMessageStuck alert firing until a replay the broker acknowledges turns
+	// it into a dispatched receipt — which is the only state the retention sweep may
+	// delete by age.
 	router.POST("/events/dead-letter/:event_id/replay", a.ReplayDeadLetterEvent)
-	// Resolving is what makes a dead-lettered row eligible for retention, and it
-	// is a sibling of replay rather than a consequence of it: the legitimate
-	// resolutions include replaying, decommissioning the subscriber and accepting
-	// the loss, and only an operator can say which happened.
-	router.POST("/events/dead-letter/:event_id/resolve", a.ResolveDeadLetterEvent)
 	router.GET("/events/stats", a.GetEventOutboxStats)
 
 	// Subscriber routes: the registry of Kafka principals and their credentials.
@@ -290,10 +294,41 @@ func NewAPI(b *blnk.Blnk) *Api {
 
 	r.Use(logrusAccessLogger())
 	r.Use(logrusRecovery())
+
+	// MOVED AHEAD OF THE ABORTING MIDDLEWARE BELOW, and the move is the point.
+	//
+	// SecurityHeaders only SETS response headers; it never aborts. Running it before the two
+	// middlewares that do means every refusal this chain produces carries them — the retirement's
+	// 410, a 413 for an oversized body, a 429 for a throttled caller — where previously the first
+	// two of those were written by middleware that ran before it and went out bare.
+	r.Use(middleware.SecurityHeaders())
+
+	// THE RETIRED-PATH BARRIER, AND IT MUST PRECEDE EVERY MIDDLEWARE THAT CAN ABORT.
+	//
+	// This used to be installed in Router(), which runs its router.Use calls AFTER every one in
+	// this function. RequestSizeLimit and RateLimitMiddleware both abort, so a request to a
+	// retired webhook-subscription route was answered 413 or 429 — never reaching either sunset
+	// guard. A throttled caller was told to slow down and retry a surface that is gone, and would
+	// have retried it forever. Requirement R-12 says the webhook REST API answers 410 Gone on
+	// EVERY request, and "every request except the throttled ones" does not satisfy it.
+	//
+	// Its blast radius is unchanged by the move. WebhookSunsetPreAuthGuard tests the request
+	// against one exact three-segment path shape and the four retired methods before it does
+	// anything else, so /hooks, the live subscriber registry, the credential endpoint and every
+	// ledger and transaction route pass through it untouched — exactly as they did when it sat in
+	// Router(). It is installed HERE ONLY; Router() no longer installs it, because two
+	// registrations would run the same path test twice per request for no benefit.
+	//
+	// It sits before otelgin, which costs the 410 its server span. That is deliberate and it is
+	// the cheaper side of the trade: putting otelgin first would mean moving RateLimitMiddleware
+	// behind it too, and every throttled request under a flood would then open a span — turning
+	// an attack into trace volume. The retirement stays observable through the access log line
+	// logrusAccessLogger has already opened above.
+	r.Use(middleware.WebhookSunsetPreAuthGuard())
+
 	r.Use(middleware.RequestSizeLimit(conf.Server.MaxRequestBodySizeMB * 1024 * 1024))
 	auth := middleware.NewAuthMiddleware(b)
 	r.Use(middleware.RateLimitMiddleware(conf))
-	r.Use(middleware.SecurityHeaders())
 	// The server span every request trace is rooted in, and the point from which the trace
 	// reaches the event pipeline: handlers pass c.Request.Context() into the service layer, the
 	// event capture writes the active trace context onto the outbox row, and the relay's publish

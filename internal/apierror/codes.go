@@ -137,15 +137,15 @@ const (
 	// by the other *_FAILED codes because an unreachable broker is a retryable
 	// upstream condition, not a defect in this service — do not "correct" it.
 	//
-	// ErrEventAlreadyResolved is its own code rather than a generic conflict for one
-	// operational reason: resolving a dead-lettered event is the action an operator
-	// most naturally repeats — two people triaging the same backlog, or one retrying
-	// a request whose response was lost — and a script has to be able to treat "it
-	// was already resolved" as success while treating "it cannot be resolved" as a
-	// problem. A shared 409 makes those indistinguishable without parsing prose.
+	// EVENT_ALREADY_RESOLVED WAS RETIRED FROM THIS FAMILY. It answered a second write on
+	// the dead-letter surface — an operator recording that a dead-lettered event needed no
+	// further action — and both the write and its route are gone: they took the management
+	// surface past the approved route count, and a resolved row's broker-acknowledged replay
+	// could not then be recorded. Retention now spares every dead-lettered row and a replay
+	// is what makes one a purgeable receipt, so there is no second write and no code for its
+	// conflict. Do not reintroduce the value without reintroducing that whole design.
 	ErrEventNotFound        ErrorCode = "EVENT_NOT_FOUND"
 	ErrEventNotDeadLettered ErrorCode = "EVENT_NOT_DEAD_LETTERED"
-	ErrEventAlreadyResolved ErrorCode = "EVENT_ALREADY_RESOLVED"
 	ErrEventReplayFailed    ErrorCode = "EVENT_REPLAY_FAILED"
 	ErrKafkaUnavailable     ErrorCode = "EVENT_KAFKA_UNAVAILABLE"
 
@@ -370,7 +370,6 @@ var statusByCode = map[ErrorCode]int{
 	// upstream condition); every other *_FAILED code in this map is 500.
 	ErrEventNotFound:        http.StatusNotFound,
 	ErrEventNotDeadLettered: http.StatusConflict,
-	ErrEventAlreadyResolved: http.StatusConflict,
 	ErrEventReplayFailed:    http.StatusInternalServerError,
 	ErrKafkaUnavailable:     http.StatusServiceUnavailable,
 

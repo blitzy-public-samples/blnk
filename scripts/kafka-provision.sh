@@ -69,9 +69,14 @@
 # convention and doubles as the catch-all for an event type the catalogue does not
 # recognise, so no event type is silently dropped.
 #
-# <prefix>.system is INTERNAL: it is created but never granted. That means ledger.created is
-# published and not consumable by a subscriber credential, which is a real limitation of the
-# frozen four-category catalogue and is documented as one in docs/event-streaming.md. A fifth
+# <prefix>.system is GRANTABLE BUT NOT IN THE SAMPLE DEFAULT, and the distinction is the one
+# SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES exists to express. It is on the allowlist —
+# model.SubscriberGrantableEventCategories includes it and KAFKA_SAMPLE_SUBSCRIBER_TOPICS may
+# name it — so ledger.created IS consumable by a subscriber whose grant asks for it. It is
+# withheld from the sample principal by default because the same topic carries system.error,
+# whose payload is an internal error message. This comment previously said the topic was
+# created and never granted, which contradicted both the allowlist below and the Go policy it
+# mirrors. A fifth
 # <prefix>.ledgers topic was implemented to close it and then removed: the catalogue is a
 # published contract, so an extra topic obliges every subscriber wanting universal coverage
 # to hold a grant it was never told about, and widening a frozen contract belongs to a
@@ -940,6 +945,26 @@ readonly EVENT_CATEGORIES=(transactions balances identities system)
 # the Go side, and TestKafkaProvisionScript_GrantsOnlyTheCategoriesTheCodeAllows asserts the two
 # agree name for name and in the same order.
 readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(transactions balances identities system)
+
+# What the SAMPLE principal is granted when KAFKA_SAMPLE_SUBSCRIBER_TOPICS is unset.
+#
+# IT WAS REFERENCED AND NEVER DEFINED. Two loops expanded it to build the sample's default
+# topic list, and under `set -u` bash expands an undefined ARRAY to nothing rather than
+# failing, so the list came out EMPTY and the empty case is not the one that is validated:
+# resolve_subscriber_topics only refuses an empty result on the OVERRIDE path. The script
+# therefore reported a provisioned sample subscriber that could read nothing, and the first
+# symptom was a demo consumer receiving no records with every ACL apparently in place.
+#
+# IT IS A STRICT SUBSET OF SUBSCRIBER_GRANTABLE_CATEGORIES, and the two are separate for the
+# reason stated above: what a subscriber MAY be granted is a policy, what the sample IS
+# granted is a least-privilege default. `system` is grantable — model.EventCategorySystem is
+# in SubscriberGrantableEventCategories, and an operator may name the system topic through
+# KAFKA_SAMPLE_SUBSCRIBER_TOPICS — but it is deliberately not in the default: it carries
+# system.error, whose payload is an internal error message, and a sample credential handed
+# out for a walkthrough should not read operational failures by default.
+#
+# Ordered as a subset of the allowlist so the two lists read against each other.
+readonly SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES=(transactions balances identities)
 
 # The suffix that forms a dead-letter sibling. This is the published <topic>.dlt naming
 # convention and it must equal event_topics.go's DeadLetterTopicSuffix. Blnk owns the .dlt
@@ -4467,66 +4492,31 @@ grant_subscriber_acls() {
 # event_topics.go's AllTopicsWithDeadLetters when a subscriber reports seeing no events.
 # ---------------------------------------------------------------------------------------
 
-# The producer principal's section of the closing summary.
+# print_producer_summary WAS RETIRED FROM HERE, and removed rather than wired in.
 #
-# Its own function rather than inline, because print_summary is already long and because the
-# producer's disposition has one case the subscriber's does not: a generated password that was
-# written to a file is a credential the publisher DOES NOT YET HAVE, and saying so is the
-# difference between a summary that reports success and one that reports what is true.
-print_producer_summary() {
-    printf '%s\n' "Event producer (the identity the server publishes as):"
-
-    case "$PRODUCER_PROVISIONED" in
-        yes)
-            printf '%s\n' "  principal            ${ACL_PRINCIPAL_PREFIX}${PRODUCER_USER}"
-            printf '%s\n' "  writable topics      all ${#ALL_TOPICS[@]} Blnk-owned topics, category and dead-letter alike"
-            printf '%s\n' "  granted operations   Write, Describe on those topics"
-            printf '%s\n' "  NOT granted          Read anywhere, no consumer group, no cluster authority"
-            case "$PRODUCER_SECRET_DISPOSITION" in
-                preserved)
-                    printf '%s\n' "  password             unchanged - the existing credential was kept, so the"
-                    printf '%s\n' "                       running server and worker keep publishing"
-                    printf '%s\n' "                       (KAFKA_ROTATE_PRODUCER_SECRET=1 to replace it)"
-                    ;;
-                rotated)
-                    printf '%s\n' "  password             ROTATED - written to ${PRODUCER_SECRET_LOCATION} (mode 0600)."
-                    printf '%s\n' "                       COPY IT INTO KAFKA_SASL_SECRET AND RESTART the server and"
-                    printf '%s\n' "                       worker; until then they cannot authenticate as this principal"
-                    ;;
-                generated)
-                    printf '%s\n' "  password             generated - written to ${PRODUCER_SECRET_LOCATION} (mode 0600)"
-                    printf '%s\n' "                       and printed nowhere. COPY IT INTO KAFKA_SASL_SECRET, or the"
-                    printf '%s\n' "                       publisher falls back to the administrative principal"
-                    ;;
-                supplied)
-                    printf '%s\n' "  password             the KAFKA_SASL_SECRET you supplied, which is what the"
-                    printf '%s\n' "                       server and worker already read"
-                    ;;
-                indeterminate)
-                    printf '%s\n' "  password             UNCHANGED, and not because it was preserved: this run could"
-                    printf '%s\n' "                       not determine whether a credential exists, so it wrote none."
-                    printf '%s\n' "                       Writing one anyway would have rotated a live credential and"
-                    printf '%s\n' "                       stopped the server and worker authenticating."
-                    printf '%s\n' "                       Fix broker reachability or the admin principal's authorisation"
-                    printf '%s\n' "                       to describe user configs, then re-run"
-                    ;;
-            esac
-            ;;
-        skipped)
-            printf '%s\n' "  skipped - KAFKA_SKIP_PRODUCER is set. Whatever KAFKA_SASL_USER and"
-            printf '%s\n' "  KAFKA_SASL_SECRET the publisher is configured with must already exist on this"
-            printf '%s\n' "  broker with Write and Describe on the topics above; if they are empty it will"
-            printf '%s\n' "  authenticate as the administrator and warn about the excess privilege."
-            ;;
-        *)
-            printf '%s\n' "  not provisioned"
-            ;;
-    esac
-    printf '%s\n' ""
-}
+# It was a third rendering of the producer's summary section, never called by anything. Its own
+# comment said it was extracted from print_summary "because print_summary is already long" — but
+# the extraction was never finished: the inline block it was copied from is still there, still
+# live, and still covers all five PRODUCER_SECRET_DISPOSITION cases.
+#
+# WIRING IT IN WOULD HAVE BROKEN THE SCRIPT. It referenced ${PRODUCER_SECRET_LOCATION}, which is
+# assigned nowhere. Unlike an undefined ARRAY, an undefined SCALAR under `set -u` is fatal, so the
+# rotated and generated paths — the two that matter most, because they are the runs where the
+# operator must copy a new secret — would have aborted the summary after provisioning had already
+# succeeded. It also told the reader that a supplied password was "the KAFKA_SASL_SECRET you
+# supplied", conflating this script's own input (KAFKA_PRODUCER_SECRET) with the variable the
+# application reads.
+#
+# So the live inline block in print_summary is the only producer rendering, and it is the correct
+# one. Note for a maintainer: print_summary still prints a SECOND, less complete producer section
+# further down, covering only the rotated and supplied dispositions. That duplication is
+# cosmetic — neither block is wrong — and is left alone here because no finding covers it.
 
 print_summary() {
     local index
+    # For the sample-subscriber branch: the allowlist entries this run did not grant.
+    local grantable_topic granted_topic granted
+    local withheld_topics=()
 
     printf '%s\n' ""
     ok "Kafka is provisioned for Blnk event streaming"
@@ -4614,13 +4604,36 @@ print_summary() {
 
     case "$SUBSCRIBER_PROVISIONED" in
         yes)
+            for grantable_topic in "${GRANTABLE_TOPICS[@]}"; do
+                granted=no
+                for granted_topic in "${SUBSCRIBER_TOPICS[@]}"; do
+                    if [[ "$grantable_topic" == "$granted_topic" ]]; then
+                        granted=yes
+                        break
+                    fi
+                done
+                if [[ "$granted" == "no" ]]; then
+                    withheld_topics+=("$grantable_topic")
+                fi
+            done
+
             printf '%s\n' "Sample subscriber:"
             printf '%s\n' "  principal            ${ACL_PRINCIPAL_PREFIX}${SUBSCRIBER_USER}"
             printf '%s\n' "  consumer group       ${SUBSCRIBER_GROUP_PREFIX}* (prefixed)"
             printf '%s\n' "  readable topics      $(join_commas "${SUBSCRIBER_TOPICS[@]}")"
             printf '%s\n' "  granted operations   Read, Describe on those topics; Read on that group namespace"
-            printf '%s\n' "  NOT granted          Write anywhere; no .dlt topic and no <prefix>.system -"
-            printf '%s\n' "                       those are Blnk's own internals"
+            printf '%s\n' "  NOT granted          Write anywhere, and no .dlt topic - those are Blnk's"
+            printf '%s\n' "                       own internals, triaged through the events API"
+            # WITHHELD IS COMPUTED, not written out. The summary used to assert that
+            # <prefix>.system is never granted, which contradicted the allowlist and the Go
+            # policy both. Deriving it from the two arrays means this line describes the grant
+            # that was actually made, and keeps describing it if the default set changes.
+            if ((${#withheld_topics[@]} > 0)); then
+                printf '%s\n' "  grantable, withheld  $(join_commas "${withheld_topics[@]}")"
+                printf '%s\n' "                       on the allowlist but not in the sample default -"
+                printf '%s\n' "                       the system topic carries system.error. Name it in"
+                printf '%s\n' "                       KAFKA_SAMPLE_SUBSCRIBER_TOPICS to include it"
+            fi
             case "$SUBSCRIBER_SECRET_DISPOSITION" in
                 preserved)
                     printf '%s\n' "  password             unchanged - the existing credential was kept"

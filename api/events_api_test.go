@@ -907,6 +907,56 @@ func TestEventsAPI_StatsRejectsAnUnknownQueryParameter(t *testing.T) {
 		"a parameter this endpoint does not honour must be refused. body: %s", w.Body.String())
 }
 
+// TestEventsAPI_StatsRefusesAWindowItCannotReport is the MD-2 guard.
+//
+// The response reports the interval it measured as `window_seconds`, an integer. A sub-second or
+// fractional window was accepted, honoured at full precision against the database and then
+// reported truncated: `?window=1500ms` measured 1.5 seconds and answered `window_seconds: 1`, and
+// `?window=500ms` answered 0 — which reads as "no window" and is the one value that means the
+// opposite of what happened.
+//
+// An operator comparing a count against the window they asked for would be comparing it against a
+// different one, with nothing in the response revealing the difference. Refusing costs one
+// corrected request; truncating costs the arithmetic that follows it.
+func TestEventsAPI_StatsRefusesAWindowItCannotReport(t *testing.T) {
+	router := eventsRouter(t, true)
+
+	t.Run("a fractional window is refused rather than truncated", func(t *testing.T) {
+		for _, window := range []string{"1500ms", "500ms", "90s500ms", "1us", "2m30s100ms"} {
+			t.Run(window, func(t *testing.T) {
+				w := eventsRouterRequest(t, router, http.MethodGet,
+					"/events/stats?window="+window, "")
+
+				require.Equal(t, http.StatusBadRequest, w.Code,
+					"a window that cannot be reported in whole seconds must be refused. body: %s",
+					w.Body.String())
+				assertErrorCode(t, w, http.StatusBadRequest, apierror.ErrGenValidation)
+
+				// The refusal has to say WHAT is wrong and what is acceptable, or the operator's
+				// next attempt is another guess.
+				body := w.Body.String()
+				assert.Contains(t, body, "whole number of seconds")
+				assert.Contains(t, body, eventQueryParamWindow)
+			})
+		}
+	})
+
+	t.Run("a whole-second window is honoured", func(t *testing.T) {
+		// 1.5h is 5400 seconds exactly, so a fractional UNIT is not the test: what matters is
+		// whether the duration lands on a whole second.
+		for _, window := range []string{"1s", "90s", "15m", "36h", "2m30s", "1.5h"} {
+			t.Run(window, func(t *testing.T) {
+				w := eventsRouterRequest(t, router, http.MethodGet,
+					"/events/stats?window="+window, "")
+
+				assert.Equal(t, http.StatusOK, w.Code,
+					"%s is a whole number of seconds and must be accepted. body: %s",
+					window, w.Body.String())
+			})
+		}
+	})
+}
+
 // TestEventsAPI_UnsupportedMethodsDoNotReachTheHandlers is the routing assertion.
 //
 // The three routes are registered for one verb each. A different verb must not fall through
@@ -1067,10 +1117,13 @@ func eventsQueryContext(t *testing.T, rawQuery string) (*gin.Context, *httptest.
 //     SQL index conditions by deadLetterFilterClause. TestGetDeadLetterEvents_AcceptsTheWindow
 //     and its malformed-bound sibling above exercise every accepted and refused form over HTTP,
 //     which is where an operator meets it.
-//   - The total comes from the dead-letter SERVICE, which shares its predicate with the listing,
-//     so paging to the total exhausts the matches. That is why there is no countable-page
-//     predicate to test: include_count is accepted alongside EVERY filter, and the restriction
-//     those tests pinned was the limitation this tree removed.
+//   - The total comes from the dead-letter SERVICE, through a paired read that draws it and the
+//     page from ONE database snapshot, so the total describes the very population the page is a
+//     slice of. That is why there is no countable-page predicate to test: include_count is
+//     accepted alongside EVERY filter, and the restriction those tests pinned was the limitation
+//     this tree removed. What the total does NOT promise is that paging to it exhausts the
+//     matches — the inventory is live across a paging session — and DeadLetterPageResponse.
+//     TotalCount states that scope rather than leaving a client to assume the stronger one.
 //   - deadLetterInventoryTotal therefore has no per-status map to assert arguments against. Its
 //     contract — the total describes THIS page's set — is asserted through the endpoint.
 //
@@ -1092,11 +1145,18 @@ func TestDeadLetterQueryParameters_AcceptTheOccurrenceWindow(t *testing.T) {
 		"the parameter name is published to operators and to the triage runbook")
 	assert.Equal(t, "occurred_to", eventQueryParamOccurredTo)
 
+	// RETARGETED ONTO rejectUnsupportedQueryParameters, WHICH IS THE FUNCTION THE ROUTER REACHES.
+	//
+	// These two subtests used to call rejectUnsupportedEventQueryParameters — a byte-for-byte
+	// second copy of that guard which nothing on the request path ever invoked. So the coverage
+	// for "an unknown query parameter is refused" was attached to the copy that never ran, and the
+	// guard actually protecting GET /events/dead-letter had none. The duplicate has been deleted;
+	// these now exercise the live one, which is the same assertion against the code that runs.
 	t.Run("a windowed request is not refused as unsupported", func(t *testing.T) {
 		c, recorder := eventsQueryContext(t,
 			"occurred_from=2026-08-01T00:00:00Z&occurred_to=2026-08-02T00:00:00Z")
 
-		assert.True(t, rejectUnsupportedEventQueryParameters(c, deadLetterQueryParameters))
+		assert.True(t, rejectUnsupportedQueryParameters(c, deadLetterQueryParameters))
 		assert.Equal(t, http.StatusOK, recorder.Code, "no refusal may be written")
 		assert.Empty(t, recorder.Body.String())
 	})
@@ -1104,7 +1164,7 @@ func TestDeadLetterQueryParameters_AcceptTheOccurrenceWindow(t *testing.T) {
 	t.Run("an unknown parameter is still refused, and the window is offered back", func(t *testing.T) {
 		c, recorder := eventsQueryContext(t, "occurred_at=2026-08-01T00:00:00Z")
 
-		assert.False(t, rejectUnsupportedEventQueryParameters(c, deadLetterQueryParameters))
+		assert.False(t, rejectUnsupportedQueryParameters(c, deadLetterQueryParameters))
 		assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenValidation)
 		assert.Contains(t, recorder.Body.String(), "occurred_from",
 			"the refusal must name the parameters the endpoint does accept, or a near miss is a dead end")
@@ -1141,6 +1201,77 @@ func TestDeadLetterQueryParameters_AreDocumentedInTheTriageRunbook(t *testing.T)
 		assert.NotContains(t, runbook, staleClaim,
 			"the runbook must not deny a filter the endpoint accepts")
 	}
+}
+
+// TestDeadLetterListing_RunbookCommandsConsumeTheEnvelope binds the response SHAPE to the
+// commands an operator copies out of the runbook.
+//
+// The handler has always answered with a page envelope, and every runbook command parsed the body
+// as a bare array. `jq '.[]'` over an object does not fail loudly with the value an operator
+// wants; on this object it emits the four field VALUES, so a replay loop reading `.[].event_id`
+// produced nothing at all and a triage listing printed field values with no ids — during an
+// incident, from a command the documentation told them to run.
+//
+// The shape is the envelope, because cursor paging has to return the cursor somewhere (PERF-P08).
+// So the commands are what changed, and this test is what keeps them changed: it asserts that no
+// command in the dead-letter runbook reads the listing as an array.
+func TestDeadLetterListing_RunbookCommandsConsumeTheEnvelope(t *testing.T) {
+	runbook := eventsReadRepositoryFile(t, "docs", "kafka-operations.md")
+
+	// The three jq forms that read a bare array. Each is the exact text that appeared in a
+	// dead-letter command, so a reintroduction is caught rather than merely discouraged.
+	for _, bareArray := range []string{
+		`jq '.[] | {event_id`,
+		`jq -r '.[].event_id'`,
+		`jq 'group_by(.failure_reason)`,
+	} {
+		assert.NotContainsf(t, runbook, bareArray,
+			"a dead-letter command must read .data[]; %q parses the envelope as an array and "+
+				"silently yields the wrong thing", bareArray)
+	}
+
+	// And the envelope has to be STATED, not merely used, because an operator writing their own
+	// script reads the prose rather than reverse-engineering the examples.
+	for _, required := range []string{
+		"`{data, next_cursor, has_more, total_count?}` envelope",
+		"read `.data[]`",
+		`jq -r '.data[].event_id'`,
+	} {
+		assert.Containsf(t, runbook, required,
+			"the runbook must publish the envelope contract: %q is missing", required)
+	}
+
+	// The empty answer, in the form it is actually returned. "200 and []" described a body the
+	// endpoint does not produce, and a script branching on it would treat every empty inventory
+	// as a shape mismatch.
+	assert.Contains(t, runbook, "`200` with `\"data\": []`",
+		"an empty inventory is an empty data array inside the envelope, never a bare []")
+}
+
+// TestDeadLetterPageResponse_IsTheOnlyShapeTheListingReturns pins the envelope at the type level.
+//
+// The doc comments on both the handler and the DTO used to say the body was a bare array unless a
+// total was asked for — a shape the code has not produced since paging moved to a cursor. A
+// client written from that description reads `.[]` and gets nothing usable.
+func TestDeadLetterPageResponse_IsTheOnlyShapeTheListingReturns(t *testing.T) {
+	response := DeadLetterPageResponse{Data: []model.DeadLetterEvent{}}
+
+	body, err := json.Marshal(response)
+	require.NoError(t, err)
+
+	// data is present and is [] rather than null even with no entries, which is what lets a
+	// script range over it unconditionally.
+	assert.JSONEq(t, `{"data":[],"has_more":false}`, string(body),
+		"the envelope is the shape with or without a total; total_count is added, not substituted")
+
+	withTotal := response
+	total := int64(0)
+	withTotal.TotalCount = &total
+
+	body, err = json.Marshal(withTotal)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"data":[],"has_more":false,"total_count":0}`, string(body),
+		"a measured zero must render, which is why the field is a pointer")
 }
 
 // eventsReadRepositoryFile returns the text of a repository file, so a published contract can be

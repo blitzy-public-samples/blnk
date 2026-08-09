@@ -1702,12 +1702,20 @@ func groupEventRowsByPartitionKey(rows []model.EventOutbox) [][]model.EventOutbo
 	indexByKey := make(map[string]int, len(rows))
 
 	for _, row := range rows {
+		// GROUPED BY THE KEY THE PUBLISH ACTUALLY USES, not by the stored column.
+		//
+		// The two differ on a row whose partition key was derived before its ledger was known,
+		// and the publisher prefers the ledger (requirement R-6). Grouping on the column there
+		// would put two rows destined for ONE Kafka partition into two groups and publish them
+		// concurrently — losing the ordering this function exists to preserve, on exactly the
+		// rows where the discrepancy lives. See model.EffectivePartitionKey.
+		//
 		// A blank key would collapse every unkeyed row into one group and serialise them.
 		// It cannot occur on a persisted row — the capture path guarantees a value through
 		// a documented fallback chain — so the row id is used to keep such a row in a group
 		// of its own rather than inventing a shared bucket for a case that means the data
 		// is already wrong.
-		key := row.PartitionKey
+		key := row.EffectiveKey()
 		if key == "" {
 			key = fmt.Sprintf("id:%d", row.ID)
 		}

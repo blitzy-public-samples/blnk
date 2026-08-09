@@ -203,15 +203,12 @@ func TestDeadLetterEvent_WireContract(t *testing.T) {
 		{name: "FirstAttemptedAt", jsonKey: "first_attempted_at", omitEmpty: true},
 		{name: "LastAttemptedAt", jsonKey: "last_attempted_at", omitEmpty: true},
 		{name: "PayloadBytes", jsonKey: "payload_bytes"},
-		// The RETENTION GATE. Both are optional and their ABSENCE is the load-bearing
-		// state: no resolved_at means the failure is still outstanding, which is what keeps
-		// the row out of the retention purge and inside the dead-letter age gauge. They are
-		// on the wire because they change what the reader should do about the entry —
-		// without them an operator paging the inventory once retention is enabled cannot
-		// tell the failures still needing attention from the ones already closed, which is
-		// the distinction triage is entirely about.
-		{name: "ResolvedAt", jsonKey: "resolved_at", omitEmpty: true},
-		{name: "ResolutionNote", jsonKey: "resolution_note", omitEmpty: true},
+		// AND NOTHING ELSE. resolved_at and resolution_note were declared here and have been
+		// withdrawn with the endpoint that wrote them: an operator's resolution used to exempt
+		// an entry from the retention purge and from the dead-letter age gauge, and it left the
+		// row in a state from which a broker-acknowledged replay could not be recorded. Every
+		// entry in this inventory is now outstanding by construction — a replay is what takes
+		// one out of it — so there is nothing for the pair to distinguish.
 	})
 
 	t.Run("a bare entry omits every optional key and keeps the mandatory ones", func(t *testing.T) {
@@ -230,7 +227,7 @@ func TestDeadLetterEvent_WireContract(t *testing.T) {
 				"topic", "status", "attempts", "payload_bytes",
 			},
 			keys,
-			"the nine non-optional keys must always be present, and the eight optional ones absent "+
+			"the nine non-optional keys must always be present, and the six optional ones absent "+
 				"rather than null, so a client never has to distinguish null from missing")
 	})
 
@@ -1132,6 +1129,32 @@ func TestKafkaCredentialsResponse_WireContract(t *testing.T) {
 		{name: "Password", jsonKey: "password"},
 		{name: "Mechanism", jsonKey: "mechanism"},
 		{name: "IssuedAt", jsonKey: "issued_at"},
+		// The two the service established and the response used to drop. Neither is omitempty:
+		// an empty fingerprint and a false Replaced are both meaningful readings, and omitting
+		// them would make "not replaced" indistinguishable from "the field is not returned".
+		{name: "CredentialFingerprint", jsonKey: "credential_fingerprint"},
+		{name: "Replaced", jsonKey: "replaced"},
+	})
+
+	t.Run("the fingerprint and the replacement flag reach the caller", func(t *testing.T) {
+		// The password is returned once and nothing persists it, so the FINGERPRINT is the only
+		// handle a client has on an issuance afterwards — and it is the same value a subscriber
+		// read reports, which is what makes the two comparable. REPLACED is the destructive-action
+		// confirmation: Kafka stores one credential per principal, so true means a live consumer's
+		// password has just stopped working.
+		decoded := marshalToKeys(t, apimodel.KafkaCredentialsResponse{
+			CredentialFingerprint: "9f1c8a72",
+			Replaced:              true,
+		})
+
+		assert.Equal(t, `"9f1c8a72"`, string(decoded["credential_fingerprint"]))
+		assert.Equal(t, "true", string(decoded["replaced"]))
+
+		// AND BOTH ARE PRESENT IN THEIR ZERO FORM, which is the property omitempty would break.
+		zero := marshalToKeys(t, apimodel.KafkaCredentialsResponse{})
+		assert.Contains(t, zero, "replaced",
+			"a first issuance must say so rather than omitting the field")
+		assert.Equal(t, "false", string(zero["replaced"]))
 	})
 
 	t.Run("everything a subscriber needs to start consuming is present at once", func(t *testing.T) {
@@ -1465,6 +1488,37 @@ func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *
 				"claims isolation that does not")
 
 		assert.Equal(t, topics, enforced.Topics, "the topic set must be reported exactly")
+	})
+
+	// M-1: the negative claim used to be INFERABLE ONLY. A client had to notice that
+	// "partition_key" was absent from enforced_by, and an absence is not a contract — a
+	// dimension missing from a list reads identically to one the server forgot and to one a
+	// newer version added. Stating it makes those readings distinguishable.
+	t.Run("the dimension that is NOT enforced is named as well", func(t *testing.T) {
+		assert.Equal(t, []string{apimodel.EnforcementDimensionPartitionKey}, enforced.NotEnforcedBy,
+			"the message-key dimension the API accepts and the broker cannot evaluate must be "+
+				"stated positively, not left to be deduced from its absence")
+
+		// Populated for EVERY subscriber, because it describes what the BROKER can evaluate and
+		// not what this row configured. A field that appeared only for a subscriber carrying a
+		// prefix would let a reader conclude the dimension is enforced for everyone else.
+		unscoped := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "")
+		assert.Equal(t, []string{apimodel.EnforcementDimensionPartitionKey}, unscoped.NotEnforcedBy,
+			"a subscriber with no prefix recorded must still be told the broker has no key "+
+				"dimension, or its absence here reads as enforcement")
+
+		// The two lists together enumerate every dimension this API names, and they are
+		// disjoint. A dimension moving from one to the other is then a visible contract change
+		// rather than a silent one, which is the whole reason the negative list exists.
+		for _, dimension := range enforced.NotEnforcedBy {
+			assert.NotContains(t, enforced.EnforcedBy, dimension,
+				"a dimension cannot be both enforced and not enforced")
+		}
+
+		// Never omitempty, for the same reason exclusive_grant_verified is not: a missing key
+		// would be indistinguishable from "there is no unenforced dimension".
+		assert.Contains(t, marshalToKeys(t, enforced), "not_enforced_by",
+			"an absent key would read as a boundary with no gaps in it")
 	})
 
 	t.Run("the consumer group namespace is derived, not restated", func(t *testing.T) {

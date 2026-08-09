@@ -2952,6 +2952,15 @@ func (a *KafkaAdminClient) createACLBindings(ctx context.Context, principal stri
 		return nil
 	}
 
+	// AUTH-04: the LAST gate, and the only unbypassable one. Three call sites reach this
+	// function — provisioning's reconciliation, PruneSubscriberAccess/GrantSubscriberAccess, and
+	// ReconcileSubscriberACLs — and a guard placed at any one of them leaves the other two open.
+	// Placing it here means every ACL Blnk creates, on every path present or future, has had its
+	// shape checked against the two shapes a subscriber grant is made of.
+	if err := validateDesiredACLBindings(principal, bindings); err != nil {
+		return err
+	}
+
 	response, err := a.client.CreateACLs(ctx, &kafka.CreateACLsRequest{ACLs: bindings})
 	if err != nil {
 		return fmt.Errorf("kafka admin: binding %d ACL(s) for principal %q: %w", len(bindings), principal, err)
@@ -3392,6 +3401,91 @@ func aclBindingKey(binding kafka.ACLEntry) string {
 		binding.Principal, binding.Host, binding.Operation, binding.PermissionType)
 }
 
+// ErrSubscriberBindingShapeUnsupported is returned when a binding Blnk is about to CREATE is
+// not one of the two shapes it owns.
+//
+// It exists because an ACL mistake is silent. The broker accepts any well-formed binding, so a
+// widened one produces no error, no log and no failing request — the only symptom is a
+// subscriber that can read somebody else's ledger, discovered by whoever notices first.
+var ErrSubscriberBindingShapeUnsupported = errors.New(
+	"kafka admin: refusing to create an ACL binding outside the two shapes a subscriber grant is " +
+		"made of (Read/Describe Allow on a LITERAL topic name, Read Allow on a PREFIXED consumer " +
+		"group namespace)",
+)
+
+// validateDesiredACLBindings asserts that every binding about to be WRITTEN is one Blnk owns.
+//
+// # Why the desired set is checked and not only the observed one
+//
+// blnkManagedACLBinding is the ownership allowlist, and reconciliation already applies it to
+// what the broker REPORTS. That catches a widened binding one reconcile too late: the binding
+// is created, it is live, and the next reconcile classifies it as a foreign ALLOW and refuses —
+// so the failure mode of a widening bug was "grant the access, then jam the subscriber's
+// provisioning permanently". Applying the same allowlist to the desired set inverts that: the
+// widened binding is never written, and the operation fails before it touches the broker.
+//
+// Three properties are checked, and each corresponds to a way a subscriber grant could become
+// broader than the registry records:
+//
+//   - THE SHAPE, via blnkManagedACLBinding. A PREFIXED topic pattern instead of a LITERAL one
+//     is the dangerous edit — it silently converts "Read blnk.transactions" into "Read every
+//     topic whose name starts with blnk.transactions", DLTs included — and a Cluster resource
+//     or a Write/Alter operation would be worse still. This is also what forbids a Deny, which
+//     Blnk never provisions.
+//   - THE PRINCIPAL, which must be the one identity this reconciliation is for. A binding
+//     carrying a different principal would grant one subscriber's topics to another's
+//     credential, and reconciliation would never remove it because it describes by principal.
+//   - THE RESOURCE NAME, which must be non-empty, whitespace-free at its edges, and not the
+//     wildcard. Kafka reads the resource name "*" as matching EVERY resource, so a LITERAL
+//     binding on "*" passes the shape check and is a cluster-wide grant; the registry's topic
+//     allowlist refuses a wildcard at admission, and this is the same refusal at the last
+//     moment before it would be written.
+//
+// It is deliberately NOT a check that the names equal the registry's topic list. That comparison
+// belongs to admission, where the list is known, and repeating it here would need the row
+// threaded through a function whose whole job is to be a pure guard on a slice of bindings.
+//
+// Parameters:
+//   - principal string: the bound principal, already prefixed as Kafka states it.
+//   - desired []kafka.ACLEntry: the bindings aclEntries produced. Empty is valid and means
+//     "authorised for nothing", which is a legitimate instruction.
+//
+// Returns:
+//   - error: nil when every binding is owned; otherwise an error wrapping
+//     ErrSubscriberBindingShapeUnsupported and naming the offending binding.
+func validateDesiredACLBindings(principal string, desired []kafka.ACLEntry) error {
+	expected := kafkaPrincipalPrefix + strings.TrimSpace(principal)
+
+	for _, binding := range desired {
+		rendered := fmt.Sprintf("%s %s on %s %q (%s)",
+			binding.PermissionType, binding.Operation, binding.ResourceType,
+			sanitizeLogValue(binding.ResourceName, maxLoggedFilterLength),
+			binding.ResourcePatternType)
+
+		if !blnkManagedACLBinding(binding) {
+			return fmt.Errorf("%w: %s", ErrSubscriberBindingShapeUnsupported, rendered)
+		}
+
+		if binding.Principal != expected {
+			return fmt.Errorf(
+				"%w: %s names principal %q, but this reconciliation is for %q",
+				ErrSubscriberBindingShapeUnsupported, rendered,
+				sanitizeLogValue(binding.Principal, maxLoggedFilterLength),
+				sanitizeLogValue(expected, maxLoggedFilterLength))
+		}
+
+		name := binding.ResourceName
+		if name == "" || name != strings.TrimSpace(name) || name == ACLHostAny {
+			return fmt.Errorf(
+				"%w: %s names a resource that is blank, padded, or the wildcard %q, which Kafka "+
+					"reads as matching every resource",
+				ErrSubscriberBindingShapeUnsupported, rendered, ACLHostAny)
+		}
+	}
+
+	return nil
+}
+
 // reconcileSubscriberACLs makes the broker's Blnk-owned bindings for a principal EXACTLY the
 // desired set.
 //
@@ -3429,6 +3523,20 @@ func (a *KafkaAdminClient) reconcileSubscriberACLs(
 	report := SubscriberACLReconciliation{
 		Principal: strings.TrimSpace(principal),
 		Desired:   len(desired),
+	}
+
+	// AUTH-04: checked BEFORE the describe, so a widened desired set costs no round trip and
+	// leaves the broker untouched.
+	//
+	// It is NOT the authoritative gate — createACLBindings is, because it is the one function
+	// that writes and every path reaches it. This one is here for a different reason: this
+	// function DELETES surplus bindings before it creates the desired ones, so without an early
+	// refusal a widened set would first strip the subscriber's live bindings and only then fail.
+	// The end state would be safe — narrower than recorded, which is the direction every partial
+	// failure here must fall — but the subscriber would lose working access to a request that was
+	// never going to be applied.
+	if err := validateDesiredACLBindings(report.Principal, desired); err != nil {
+		return report, err
 	}
 
 	observed, err := a.describeSubscriberACLs(ctx, principal)
@@ -6195,6 +6303,28 @@ func (r OutboxReconciliation) Summary() string {
 	case r.TerminalEvents == 0:
 		return "NO LOSS DETECTED: the outbox holds no rows claiming a publication, so there is " +
 			"nothing to reconcile"
+	case !r.Windowed:
+		// THE SAME GREEN VERDICT, WITHOUT CALLING A CUMULATIVE TOTAL A SURPLUS.
+		//
+		// The conclusion is unchanged and rests on the same evidence: every row names the distinct
+		// record it produced, verified against its partition's live bounds. What differs is the
+		// record TOTAL. With no common window the broker figure counts every record the topics have
+		// ever accepted — a history the outbox no longer holds — so the difference between it and
+		// the row count grows for the life of the topic and is not a surplus over anything. The
+		// green sentence used to report it as one, which invited an operator to read a number in
+		// the millions as unaccounted copies.
+		return fmt.Sprintf(
+			"NO LOSS DETECTED: every one of the %d outbox rows published between %s and %s names the "+
+				"distinct broker record it produced, inside the measured offset window of its own "+
+				"partition, so no event this outbox still retains is missing from the broker. The "+
+				"broker's %d record(s) are a CUMULATIVE total for the topics rather than a count "+
+				"inside a shared window, so the difference against the row count is not a surplus "+
+				"and no shortfall can be computed from it",
+			r.CorroboratedEvents,
+			r.CoveredFrom.Format(time.RFC3339),
+			r.CoveredTo.Format(time.RFC3339),
+			r.MessagesWritten,
+		)
 	default:
 		// The SURPLUS is named, because a green verdict that only said "no loss detected" left an
 		// operator unable to tell a healthy overhead from a shortfall that happened to be hidden
@@ -6303,7 +6433,30 @@ func ReconcileAgainstOutbox(
 	// window than rows claiming one inside it means rows claim a publication that never happened.
 	verdict.LossDetected = verdict.BeyondEndEvents > 0 || (windowed && verdict.Overhead < 0)
 
-	caveats := make([]string, 0, 6)
+	caveats := make([]string, 0, 7)
+
+	// AN UNWINDOWED COMPARISON IS NOT A CAVEAT, and the reason is worth stating because the
+	// opposite is the intuitive answer.
+	//
+	// A broker end offset counts every record a partition has ever accepted and never falls,
+	// while the outbox side is a population retention deletes from and a request may bound. With
+	// no window on both sides those two TOTALS describe different intervals, and the shortfall
+	// arithmetic over them is meaningless — which is why LossDetected only consults Overhead when
+	// windowed.
+	//
+	// But the totals are not what this verdict rests on. It rests on the per-row COORDINATE
+	// MAPPING: every row claiming a publication either names a record verified against the live
+	// bounds of the partition it names, or it is counted into UnconfirmedEvents, UnmeasuredEvents,
+	// AgedOutEvents or BeyondEndEvents — each of which raises its own caveat below. So a fully
+	// mapped population is accounted for event by event, with no window needed, and a population
+	// that is not fully mapped is already inconclusive for a reason that names itself.
+	//
+	// Adding a blanket caveat here would therefore not catch a false green — there is none to
+	// catch — and it WOULD destroy a deliberate property: retention on a topic Blnk shares with
+	// another producer is permanently in the past, so an always-on caveat would report every such
+	// deployment as inconclusive for ever, which is the noise this verdict was rewritten to
+	// remove. What the unwindowed case does need is for the SURPLUS not to be described as a
+	// windowed surplus, and Summary does that from the Windowed flag.
 
 	if verdict.BeyondEndEvents > 0 {
 		caveats = append(caveats, fmt.Sprintf(
@@ -6516,6 +6669,15 @@ type EventOutboxStatistics struct {
 	// Reconciliation is the verdict comparing the two sides, or nil when it could not
 	// be produced.
 	Reconciliation *OutboxReconciliation
+
+	// ProducerAtomicity is the outstanding half of the two pre-recorded intents, or nil
+	// when neither census could be read.
+	//
+	// Nil is "not measured" and a zero-valued struct is "measured, nothing outstanding".
+	// Reporting the second as the first — or the first as zeros — is the one confusion a
+	// zero-loss check cannot survive, which is why this is a pointer rather than a value with
+	// a companion flag: there is nothing to read if it is nil.
+	ProducerAtomicity *ProducerAtomicityCensus
 }
 
 // eventStatisticsStore is the repository surface the statistics read needs, and
@@ -6539,7 +6701,73 @@ type eventStatisticsStore interface {
 		ctx context.Context,
 		intervals []model.PartitionOffsetInterval,
 	) (model.EventRecordIntervalAudit, error)
+
+	// CountBalanceMonitorHandoffByStatus and CountUnfinalizedBulkTransactionBatches are the
+	// two PRE-RECORDED INTENT censuses, and they answer the one question the per-status
+	// counts above cannot.
+	//
+	// Two event families are not captured inside the transaction that produces them, because
+	// neither event exists at that point: a monitor alert does not exist until the balance is
+	// committed, and a bulk batch's summary belongs to no single member transaction. Each
+	// therefore has an INTENT written atomically instead — a balance-monitor handoff, and a
+	// batch coordinator row — from which the event is captured later, also atomically. An
+	// outstanding intent is an event that is OWED and that no outbox row exists for yet, so a
+	// reconciliation reading only the outbox would find it consistent while alerts and batch
+	// summaries were still pending.
+	//
+	// They are on this seam rather than left to a separate endpoint because they are part of
+	// the same answer, and the statistics response declares a field for them.
+	CountBalanceMonitorHandoffByStatus(ctx context.Context) (map[string]int64, error)
+	CountUnfinalizedBulkTransactionBatches(
+		ctx context.Context,
+		olderThan time.Duration,
+	) (int64, *time.Time, error)
 }
+
+// ProducerAtomicityCensus is how much of the two pre-recorded intents is outstanding.
+//
+// It travels with the outbox counts rather than beside them because it answers the same
+// question — whether every event that should exist does — and a reader who saw only the
+// per-status counts would read a clean outbox as a clean pipeline while alerts and batch
+// summaries were still owed.
+//
+// The zero value is a MEANINGFUL reading: nothing outstanding. That is why the statistics
+// carry it as a pointer and leave it nil when a census could not be read, rather than
+// reporting zeros for "we could not tell" — the one misreading a zero-loss check cannot
+// afford.
+type ProducerAtomicityCensus struct {
+	// MonitorHandoffPending, MonitorHandoffProcessing, MonitorHandoffCompleted and
+	// MonitorHandoffFailed are the handoff relay's four states, read straight from the
+	// aggregate. A status with no rows is absent from that aggregate and reads as zero here,
+	// which is the correct reading of "none in that state".
+	//
+	// FAILED IS THE NUMBER TO ACT ON: each one is a balance movement whose monitor conditions
+	// were never judged, so any alert it should have produced does not exist and never will
+	// without intervention.
+	MonitorHandoffPending    int64
+	MonitorHandoffProcessing int64
+	MonitorHandoffCompleted  int64
+	MonitorHandoffFailed     int64
+
+	// UnfinalizedBatches counts asynchronous bulk batches that began and never reported an
+	// outcome, past the grace period so batches still legitimately running are excluded, and
+	// OldestUnfinalizedBatchAt is when the oldest of them began — nil when there are none.
+	// The age is what separates a large batch still running from one that was abandoned, so
+	// the count alone is not actionable and the pair is.
+	UnfinalizedBatches       int64
+	OldestUnfinalizedBatchAt *time.Time
+}
+
+// unfinalizedBulkBatchGrace is how long a bulk batch may run before an unfinalized
+// coordinator row counts as outstanding.
+//
+// A batch legitimately takes time — it is asynchronous precisely because it may hold
+// thousands of member transactions — so counting one the moment it starts would report the
+// steady state as a residue and make the figure useless. Fifteen minutes is comfortably
+// beyond any batch this ledger processes and well inside the fifteen-minute dead-letter
+// alerting window an operator is already watching, so a genuinely abandoned batch surfaces on
+// the same timescale as every other event-pipeline residue.
+const unfinalizedBulkBatchGrace = 15 * time.Minute
 
 // EventOutboxStatistics assembles the statistics for this instance.
 //
@@ -6628,7 +6856,7 @@ func (b *Blnk) EventOutboxStatistics(
 		return EventOutboxStatistics{}, err
 	}
 
-	return eventOutboxStatistics(ctx, store, b.cumulativeEventTopicOffsets, inclusion, window)
+	return eventOutboxStatistics(ctx, store, b.readEventTopicEndOffsets, inclusion, window)
 }
 
 // eventOutboxStatistics is the orchestration itself, with its two collaborators passed
@@ -6644,7 +6872,8 @@ func (b *Blnk) EventOutboxStatistics(
 // Parameters:
 //   - ctx context.Context: cancels both reads.
 //   - store eventStatisticsStore: the two repository reads. Must not be nil.
-//   - readOffsets func: the broker-side measurement. A nil function is treated as an
+//   - readOffsets func: the broker-side measurement, taking the WINDOW START the outbox side
+//     was counted from so both sides describe one interval. A nil function is treated as an
 //     unconfigured broker, which is the same degradation an unreachable one takes.
 //   - inclusion EventOffsetInclusion: how the broker side is to be treated.
 //
@@ -6654,7 +6883,7 @@ func (b *Blnk) EventOutboxStatistics(
 func eventOutboxStatistics(
 	ctx context.Context,
 	store eventStatisticsStore,
-	readOffsets func(context.Context) (TopicOffsetReport, error),
+	readOffsets func(context.Context, time.Time) (TopicOffsetReport, error),
 	inclusion EventOffsetInclusion,
 	window time.Duration,
 ) (EventOutboxStatistics, error) {
@@ -6676,7 +6905,7 @@ func eventOutboxStatistics(
 		// An absent reader is the same situation as an unconfigured broker, and reporting
 		// it as that error rather than panicking is what keeps the two postures behaving
 		// identically for a caller that has no broker at all.
-		readOffsets = func(context.Context) (TopicOffsetReport, error) {
+		readOffsets = func(context.Context, time.Time) (TopicOffsetReport, error) {
 			return TopicOffsetReport{}, ErrKafkaAdminNotConfigured
 		}
 	}
@@ -6708,6 +6937,11 @@ func eventOutboxStatistics(
 		UnreportedStatuses: unreportedEventOutboxStatuses(counts),
 		WindowStart:        windowStart,
 		Window:             normalizeEventStatisticsWindow(window),
+		// THE OWED EVENTS, read from PostgreSQL alongside the counts and never from the
+		// broker, so the figure is present in every posture — including the one that skips
+		// Kafka entirely and the one where the broker is unreachable, which is exactly when an
+		// operator is asking what is outstanding.
+		ProducerAtomicity: producerAtomicityCensus(ctx, store),
 	}
 
 	if len(statistics.UnreportedStatuses) > 0 {
@@ -6729,7 +6963,14 @@ func eventOutboxStatistics(
 		return statistics, nil
 	}
 
-	report, err := readOffsets(ctx)
+	// MEASURED FROM THE SAME INSTANT THE OUTBOX SIDE WAS COUNTED FROM (V-2). The broker read
+	// used to be cumulative: every record the topics had ever accepted, compared against an
+	// outbox population bounded by a window. Two populations, one verdict — and the verdict
+	// could still report itself CONCLUSIVE, because the arithmetic that would have caught the
+	// mismatch (a shortfall of records against rows) is only available when both sides name a
+	// window, and with the broker side unbounded it was silently switched off. Passing the
+	// window start here is what makes the comparison a comparison.
+	report, err := readOffsets(ctx, windowStart)
 	if err != nil {
 		if inclusion == EventOffsetsRequired {
 			// DATA-01: the cause is a Kafka client error, which renders with broker
@@ -6793,6 +7034,84 @@ func eventOutboxStatistics(
 	}
 
 	return statistics, nil
+}
+
+// producerAtomicityCensus reads the two pre-recorded intent censuses, and answers nil rather
+// than zeros when either read fails.
+//
+// # Why a failure omits the whole object
+//
+// The two censuses answer one question — how many events are OWED and not yet captured — and a
+// partial answer to it is worse than none: a caller cannot tell "no monitor alerts are
+// outstanding" from "the handoff table could not be read", and a zero-loss reconciliation that
+// mistakes the second for the first reports a clean bill of health it never established. So a
+// failure on either read yields nil, which the response renders as an ABSENT key rather than as
+// zeros, and the cause is logged where an operator will see it.
+//
+// It is DEGRADING and not refusing, deliberately. The per-status counts and the broker
+// comparison are the reconciliation's main line; a census read that fails must not deny an
+// operator the rest of the statistics during the incident that broke it.
+//
+// Parameters:
+//   - ctx context.Context: cancels both reads.
+//   - store eventStatisticsStore: the repository surface. Must not be nil.
+//
+// Returns:
+//   - *ProducerAtomicityCensus: the two censuses, or nil when either could not be read.
+func producerAtomicityCensus(
+	ctx context.Context,
+	store eventStatisticsStore,
+) *ProducerAtomicityCensus {
+	handoffs, err := store.CountBalanceMonitorHandoffByStatus(ctx)
+	if err != nil {
+		withLoggableCause(nil, err).Warn(
+			"the balance-monitor handoff census could not be read, so the statistics omit the " +
+				"producer-atomicity figures rather than reporting zeros for them; an outstanding " +
+				"handoff is a balance movement whose monitor conditions have not been judged, and " +
+				"reporting zero would say the opposite",
+		)
+
+		return nil
+	}
+
+	batches, oldest, err := store.CountUnfinalizedBulkTransactionBatches(ctx, unfinalizedBulkBatchGrace)
+	if err != nil {
+		withLoggableCause(nil, err).Warn(
+			"the unfinalized bulk-batch census could not be read, so the statistics omit the " +
+				"producer-atomicity figures rather than reporting a partial answer",
+		)
+
+		return nil
+	}
+
+	// The four handoff states use the shared outbox status vocabulary rather than one of their
+	// own — see model.BalanceMonitorHandoff.Status — so they are read through the same
+	// constants the outbox counts are. A status with no rows is absent from the aggregate and
+	// indexes to zero, which is the correct reading of "none in that state".
+	census := &ProducerAtomicityCensus{
+		MonitorHandoffPending:    handoffs[model.OutboxStatusPending],
+		MonitorHandoffProcessing: handoffs[model.OutboxStatusProcessing],
+		MonitorHandoffCompleted:  handoffs[model.OutboxStatusCompleted],
+		MonitorHandoffFailed:     handoffs[model.OutboxStatusFailed],
+		UnfinalizedBatches:       batches,
+		OldestUnfinalizedBatchAt: oldest,
+	}
+
+	// LOGGED ONLY WHEN SOMETHING IS OWED, and at warn, because these two numbers are the ones
+	// nothing else in the response can reveal: an unjudged monitor movement and an abandoned
+	// batch are both events that will never exist without intervention.
+	if census.MonitorHandoffFailed > 0 || census.UnfinalizedBatches > 0 {
+		logrus.WithFields(logrus.Fields{
+			"monitor_handoff_failed": census.MonitorHandoffFailed,
+			"unfinalized_batches":    census.UnfinalizedBatches,
+		}).Warn(
+			"the event pipeline owes events that no outbox row represents: a failed monitor " +
+				"handoff is a balance movement whose conditions were never judged, and an " +
+				"unfinalized bulk batch never reported its outcome",
+		)
+	}
+
+	return census
 }
 
 // errEventStatisticsDataSourceMissing is the cause recorded when statistics are asked
@@ -6866,28 +7185,6 @@ func unreportedEventOutboxStatuses(counts map[string]int64) []string {
 	slices.Sort(unreported)
 
 	return unreported
-}
-
-// cumulativeEventTopicOffsets reads the topic offsets with NO window, which is what the
-// statistics path wants.
-//
-// The bounded comparison this feeds does not come from a window on the broker read: the audit is
-// taken against report.PartitionIntervals(), so each partition's outbox population is bounded by
-// the very interval the offsets measured. Asking for a second, coarser window here would add a
-// caveat and no information — and a window whose left edge the broker could not resolve would
-// make the verdict inconclusive for a reason that has nothing to do with the data.
-//
-// The windowed reading is still available, and is what the reconciliation runbook uses when it
-// wants a broker-side population bounded by wall-clock time rather than by offsets.
-//
-// Parameters:
-//   - ctx context.Context: cancellation is inherited.
-//
-// Returns:
-//   - TopicOffsetReport: the cumulative report.
-//   - error: whatever the windowed read reports.
-func (b *Blnk) cumulativeEventTopicOffsets(ctx context.Context) (TopicOffsetReport, error) {
-	return b.readEventTopicEndOffsets(ctx, time.Time{})
 }
 
 // readEventTopicEndOffsets measures the broker side of the reconciliation.

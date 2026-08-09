@@ -18,7 +18,10 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -27,8 +30,10 @@ import (
 	"github.com/blnkfinance/blnk"
 	"github.com/blnkfinance/blnk/api/model"
 	"github.com/blnkfinance/blnk/internal/apierror"
+	"github.com/blnkfinance/blnk/internal/logsafe"
 	coremodel "github.com/blnkfinance/blnk/model"
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/sirupsen/logrus"
 )
 
@@ -841,12 +846,15 @@ func (a *Api) subscriberTopicPrefix() string {
 // # Responses
 //
 //	201 the registered subscriber, carrying no credential material
-//	400 GEN_MALFORMED_REQUEST for an unbindable body — malformed JSON, or a field
-//	    of the wrong JSON type. A body that PARSES is never refused here, so a
-//	    missing field is a validation error rather than a transport one
-//	400 GEN_VALIDATION_ERROR for a body the DTO refuses — a missing or blank name,
-//	    a non-canonical identifier, a topic outside the deployment's grantable set,
-//	    an unusable key scope or an unacceptable legacy URL
+//	400 GEN_MALFORMED_REQUEST for an unbindable body — malformed JSON, a field of
+//	    the wrong JSON type, an absent body, more than one JSON value, or a binding
+//	    tag the body violates
+//	400 GEN_VALIDATION_ERROR for a field this shape does not declare, and for a body
+//	    the DTO refuses — a missing or blank name, a non-canonical identifier, a topic
+//	    outside the deployment's grantable set, an unusable key scope or an
+//	    unacceptable legacy URL. An UNKNOWN FIELD is refused rather than dropped: a
+//	    misspelled authorized_topics would otherwise register a subscriber authorised
+//	    for nothing, with a 201 saying it worked. See bindStrictManagementJSON
 //	403 AUTH_MASTER_KEY_REQUIRED for a non-master caller
 //	409 GEN_CONFLICT when the identifier or the derived principal is already taken
 func (a *Api) CreateSubscriber(c *gin.Context) {
@@ -855,9 +863,7 @@ func (a *Api) CreateSubscriber(c *gin.Context) {
 	}
 
 	var req model.CreateSubscriber
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondCode(c, apierror.ErrGenMalformedRequest, err.Error(), nil)
-
+	if !bindStrictManagementJSON(c, &req) {
 		return
 	}
 
@@ -900,6 +906,24 @@ func (a *Api) CreateSubscriber(c *gin.Context) {
 // ListSubscribers serves GET /subscribers: the paged registry an operator answers
 // "who is this principal?" and "who has not migrated yet?" from.
 //
+// # ONE RESPONSE SHAPE, FOR ALL THREE READINGS
+//
+// This route has three readings — the ordinary keyset page, the `subscriber_id_hash` resolution
+// and the `revocation_pending=true` scan — and every one of them answers with the
+// SubscriberPageResponse envelope: `{data, next_cursor, has_more, total_count?}`. A client reads
+// `.data[]` whichever it asked for.
+//
+// Two of them used to answer with a bare JSON array. That is a breaking difference rather than a
+// cosmetic one: a client written against the page reading fails on the resolver with a type error
+// rather than a message, and the two bare-array readings are precisely the ones an operator
+// reaches from a runbook DURING AN INCIDENT, where a deserialisation failure is the most expensive
+// thing that can happen.
+//
+// The two non-paging readings return COMPLETE results — the resolver at most one row, the scan the
+// whole registry — so they report `has_more: false`, emit no cursor, and always carry
+// `total_count`, which for a complete result is simply its length. They also REFUSE `limit` and
+// `cursor` rather than ignoring them: see refuseSubscriberPagingOptions.
+//
 // # Paging, ordering and counting
 //
 // limit follows this package's uniform convention: absent, non-positive or oversized values
@@ -914,15 +938,18 @@ func (a *Api) CreateSubscriber(c *gin.Context) {
 // id, which is what makes the cursor stable; sort_by and sort_order are accepted for client
 // compatibility and do not change it.
 //
-// include_count is HONOURED, and it changes the response shape to the envelope
-// every other counted listing in this API answers in: {"data": [...],
-// "total_count": N}. Without it the body is a bare array, which is what an existing
-// client already reads.
+// include_count is HONOURED, and it ADDS total_count to the response rather than changing
+// its shape: the body is the {data, next_cursor, has_more} envelope either way, because
+// cursor paging has to return the cursor somewhere. A client reads `.data[]`
+// unconditionally. This comment used to say that the body was a bare array without
+// include_count, which described a response the code has not produced since paging moved
+// off the offset.
 //
-// It used to be refused, because no layer could count the registry. The repository
-// now does, with a query rather than the length of the page — reporting a page
-// length as a total would be a falsehood a paging client loops on forever. The
-// listing narrows by nothing, so the count and the page describe the same set.
+// The total used to be refused outright, because no layer could count the registry. The
+// repository now does, with a query rather than the length of the page — reporting a page
+// length as a total would be a falsehood a paging client loops on forever — and it is read
+// from the SAME snapshot as the page, so the two describe one registry rather than merely
+// sharing a (nonexistent) filter.
 //
 // The value is parsed strictly: "1", "t", "true", "TRUE", "True" and their false
 // counterparts are accepted, an absent or empty parameter means false, and anything
@@ -933,15 +960,15 @@ func (a *Api) CreateSubscriber(c *gin.Context) {
 // a caller asked for and did not get hands them a result that answers a different
 // question with nothing to say so.
 //
-// An empty registry is 200 and `[]` — never 404 and never `null`, so a
-// migration-progress script can range over the result unconditionally. Every entry
+// An empty registry is 200 with `"data": []` — never 404, and `data` is never `null`, so a
+// migration-progress script can range over `.data[]` unconditionally. Every entry
 // is projected by model.NewSubscriberResponse, so none carries a credential
 // reference, only its fingerprint.
 //
 // # Responses
 //
-//	200 a JSON array of subscribers, possibly empty; or {"data":[...],
-//	    "total_count":N} when include_count is true
+//	200 {"data":[...], "next_cursor":"...", "has_more":bool}, plus "total_count":N
+//	    when include_count is true. data may be empty; it is never null.
 //	400 GEN_VALIDATION_ERROR for a non-integer page parameter, an unparseable
 //	    include_count, or an unsupported query parameter
 //	403 AUTH_MASTER_KEY_REQUIRED for a non-master caller
@@ -975,6 +1002,10 @@ func (a *Api) ListSubscribers(c *gin.Context) {
 	// It short-circuits the page readers below deliberately: a limit and a cursor describe a walk
 	// through the registry, and a resolution is not a walk the caller is performing.
 	if pseudonym, resolving := subscriberPseudonymFromQuery(c); resolving {
+		if !refuseSubscriberPagingOptions(c, subscriberQueryParamPseudonym) {
+			return
+		}
+
 		a.resolveSubscriberPseudonym(c, pseudonym)
 
 		return
@@ -986,6 +1017,10 @@ func (a *Api) ListSubscribers(c *gin.Context) {
 	// export a tenant identifier into every notification — so without this the alert names a
 	// count and nothing an operator can act on.
 	if pending, present := subscriberRevocationFilterFromQuery(c); present && pending {
+		if !refuseSubscriberPagingOptions(c, subscriberQueryParamRevocationPending) {
+			return
+		}
+
 		a.listSubscribersAwaitingRevocation(c)
 
 		return
@@ -1009,10 +1044,28 @@ func (a *Api) ListSubscribers(c *gin.Context) {
 		return
 	}
 
-	page, err := a.blnk.ListEventSubscribers(c.Request.Context(), coremodel.SubscriberPageQuery{
-		Limit:  limit,
-		Cursor: cursor,
-	})
+	// ONE READ WHEN A TOTAL WAS ASKED FOR, TWO OTHERWISE.
+	//
+	// The page and the total used to be two independent calls, and the response asserted that
+	// they described "the same set by construction" — which identical predicates cannot make
+	// true across two snapshots. A subscriber registered or deregistered between them is counted
+	// by one read and absent from the other. The combined read draws both from one read-only
+	// REPEATABLE READ snapshot; a caller that did not ask for a total still takes the cheaper
+	// single-statement path, because there is then no second answer to be coherent with.
+	pageQuery := coremodel.SubscriberPageQuery{Limit: limit, Cursor: cursor}
+
+	var (
+		page  coremodel.SubscriberPage
+		total int64
+		err   error
+	)
+
+	if includeCount {
+		page, total, err = a.blnk.ListAndCountEventSubscribers(c.Request.Context(), pageQuery)
+	} else {
+		page, err = a.blnk.ListEventSubscribers(c.Request.Context(), pageQuery)
+	}
+
 	if err != nil {
 		respondSubscriberRegistryError(c, err)
 
@@ -1035,17 +1088,11 @@ func (a *Api) ListSubscribers(c *gin.Context) {
 	}
 
 	if includeCount {
-		// An AGGREGATE over the registry rather than the length of this page. A paging client
-		// that reads the page length as the total stops after one full page, or compares a
-		// number against itself for ever; and the listing narrows by nothing, so this count and
-		// that page describe the same set by construction.
-		total, countErr := a.blnk.CountEventSubscribers(c.Request.Context())
-		if countErr != nil {
-			respondSubscriberRegistryError(c, countErr)
-
-			return
-		}
-
+		// An AGGREGATE over the registry rather than the length of this page: a paging client that
+		// reads the page length as the total stops after one full page, or compares a number
+		// against itself for ever. It was read in the same snapshot as the page above, so the two
+		// describe one registry — see SubscriberPageResponse.TotalCount for what that does and
+		// does not promise.
 		response.TotalCount = &total
 	}
 
@@ -1072,6 +1119,15 @@ type SubscriberPageResponse struct {
 	// TotalCount is how many subscribers the registry holds, present only when the caller
 	// asked for it with include_count. A pointer so that "not requested" and "zero" are
 	// distinguishable rather than both rendering as 0.
+	//
+	// It is read from the SAME snapshot as data, so the total and THIS page describe one
+	// registry. That pairing used to be asserted rather than delivered — the two were separate
+	// reads on separate connections, and a registration between them left the total describing a
+	// set the page was not a slice of.
+	//
+	// It is not a promise about a paging SESSION: paging is many requests over a live registry, so
+	// a later page may hold subscribers this total did not count. Read it as "the registry size,
+	// as at this page".
 	TotalCount *int64 `json:"total_count,omitempty"`
 }
 
@@ -1133,7 +1189,10 @@ func (a *Api) GetSubscriber(c *gin.Context) {
 //
 //	200 the subscriber as it now stands
 //	400 GEN_MALFORMED_REQUEST for an unbindable body
-//	400 GEN_VALIDATION_ERROR for a body the DTO refuses
+//	400 GEN_VALIDATION_ERROR for a field this shape does not declare, or for a body
+//	    the DTO refuses. An unknown field is refused rather than dropped: a body whose
+//	    fields were all misspelled decodes to an empty update, which is a legitimate
+//	    instruction, so the response was 200 with the row unchanged
 //	403 AUTH_MASTER_KEY_REQUIRED for a non-master caller
 //	404 SUBSCRIBER_NOT_FOUND when no such subscriber exists
 //	409 GEN_CONFLICT when a concurrent issuance holds the provisioning fence
@@ -1150,9 +1209,7 @@ func (a *Api) UpdateSubscriber(c *gin.Context) {
 	}
 
 	var req model.UpdateSubscriber
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondCode(c, apierror.ErrGenMalformedRequest, err.Error(), nil)
-
+	if !bindStrictManagementJSON(c, &req) {
 		return
 	}
 
@@ -1397,11 +1454,21 @@ func (a *Api) IssueKafkaCredentials(c *gin.Context) {
 		// waiting for it — see issueWithinBudget for why waiting is not an option and
 		// why abandoning is safe.
 		logrus.WithFields(logrus.Fields{
-			// Safe to log verbatim: subscriberIDFromRoute has already refused anything
-			// model.CanonicalizeSubscriberIdentifier would not accept, so the value holds
-			// no whitespace, no control characters and no log-injection payload.
-			"subscriber": subscriberID,
-			"budget":     blnk.SubscriberCredentialIssuanceBudget.String(),
+			// HASHED, LIKE EVERY OTHER SUBSCRIBER IDENTIFIER IN A LOG LINE. The value is safe in
+			// the injection sense — subscriberIDFromRoute has already refused anything
+			// model.CanonicalizeSubscriberIdentifier would not accept, so it holds no whitespace
+			// and no control characters — but that was never the reason the rest of this codebase
+			// hashes it. A subscriber id is a TENANT-CHOSEN name that reaches logs, alert
+			// annotations and incident tickets, so every other layer emits the keyed digest under
+			// a _hash key and this one line emitted the name itself: enough to make the pseudonyms
+			// everywhere else resolvable by anyone reading the same stream, and it was the field
+			// that failed most visibly, on a timeout an operator goes looking for.
+			//
+			// logsafe.Identifier is the shared rule, so the token printed here is the same token
+			// the service layer, the repository and the consumer-lag sweep print for this
+			// subscriber — which is what makes the lines correlatable at all.
+			"subscriber_id_hash": logsafe.Identifier(subscriberID),
+			"budget":             blnk.SubscriberCredentialIssuanceBudget.String(),
 		}).Warn(
 			"subscribers api: credential issuance exceeded the issuance budget and the request was " +
 				"answered without waiting for it. The abandoned attempt observes the same expired " +
@@ -1452,6 +1519,16 @@ func (a *Api) IssueKafkaCredentials(c *gin.Context) {
 		Password:  credential.Password(),
 		Mechanism: credential.Mechanism,
 		IssuedAt:  credential.IssuedAt,
+		// THE TWO FIELDS THE SERVICE ESTABLISHED AND THE RESPONSE USED TO DROP.
+		//
+		// The fingerprint is the only handle a client has on an issuance afterwards, since the
+		// password is returned once and nothing persists it — it is the same value a subscriber
+		// read reports, so the two become comparable. Replaced is the destructive-action
+		// confirmation: Kafka stores one credential per principal, so a true here means a live
+		// consumer's password has just stopped working, and that is not something to learn from a
+		// support ticket.
+		CredentialFingerprint: credential.Fingerprint,
+		Replaced:              credential.Replaced,
 	})
 }
 
@@ -1533,8 +1610,8 @@ func (a *Api) IssueKafkaCredentials(c *gin.Context) {
 //	    the subscriber is counted as awaiting migration again
 //	400 GEN_MALFORMED_REQUEST for an unbindable body or a missing webhook_url
 //	400 GEN_MISSING_PARAMETER for a blank identifier
-//	400 GEN_VALIDATION_ERROR for a non-canonical identifier, or for a URL the
-//	    destination policy refuses
+//	400 GEN_VALIDATION_ERROR for a field this shape does not declare, for a
+//	    non-canonical identifier, or for a URL the destination policy refuses
 //	403 AUTH_MASTER_KEY_REQUIRED for a non-master caller
 //	404 SUBSCRIBER_NOT_FOUND when no such subscriber exists
 //	410 GEN_GONE once the webhook retirement instant has passed, written by the
@@ -1564,9 +1641,7 @@ func (a *Api) RegisterWebhookSubscription(c *gin.Context) {
 	}
 
 	var req model.CreateWebhookSubscription
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondCode(c, apierror.ErrGenMalformedRequest, err.Error(), nil)
-
+	if !bindStrictManagementJSON(c, &req) {
 		return
 	}
 
@@ -1673,8 +1748,8 @@ func (a *Api) GetWebhookSubscription(c *gin.Context) {
 //	    same statement, so the subscriber is counted as awaiting migration again
 //	400 GEN_MALFORMED_REQUEST for an unbindable body or a missing webhook_url
 //	400 GEN_MISSING_PARAMETER for a blank identifier
-//	400 GEN_VALIDATION_ERROR for a non-canonical identifier, or for a URL the
-//	    destination policy refuses
+//	400 GEN_VALIDATION_ERROR for a field this shape does not declare, for a
+//	    non-canonical identifier, or for a URL the destination policy refuses
 //	403 AUTH_MASTER_KEY_REQUIRED for a non-master caller
 //	404 SUBSCRIBER_NOT_FOUND when no such subscriber exists
 //	410 GEN_GONE once the webhook retirement instant has passed, written by the
@@ -1703,9 +1778,7 @@ func (a *Api) UpdateWebhookSubscription(c *gin.Context) {
 	}
 
 	var req model.UpdateWebhookSubscription
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondCode(c, apierror.ErrGenMalformedRequest, err.Error(), nil)
-
+	if !bindStrictManagementJSON(c, &req) {
 		return
 	}
 
@@ -1878,7 +1951,10 @@ func (a *Api) resolveSubscriberPseudonym(c *gin.Context, pseudonym string) {
 
 		var typed apierror.APIError
 		if errors.As(err, &typed) && typed.Code == apierror.ErrSubscriberNotFound {
-			c.JSON(http.StatusOK, []model.SubscriberResponse{})
+			// AN EMPTY PAGE, IN THE SAME ENVELOPE, and a searched-to-the-end total of zero. This
+			// used to be a bare `[]`, which made "no such subscriber" a differently SHAPED answer
+			// from every other reading of this route.
+			c.JSON(http.StatusOK, completeSubscriberPage(nil))
 
 			return
 		}
@@ -1888,7 +1964,221 @@ func (a *Api) resolveSubscriberPseudonym(c *gin.Context, pseudonym string) {
 		return
 	}
 
-	c.JSON(http.StatusOK, []model.SubscriberResponse{model.NewSubscriberResponse(*subscriber)})
+	c.JSON(http.StatusOK, completeSubscriberPage(
+		[]model.SubscriberResponse{model.NewSubscriberResponse(*subscriber)},
+	))
+}
+
+// bindStrictManagementJSON decodes a management request body, REFUSING any field the shape does
+// not declare, and then runs the binding tags exactly as gin would.
+//
+// # What silently ignoring an unknown field costs on this surface
+//
+// gin's ShouldBindJSON discards unknown keys. encoding/json's default behaviour is the same, so a
+// misspelling was accepted and dropped, and the consequence differs per route in a way that makes
+// each one worse than a plain no-op:
+//
+//   - POST /subscribers with "authorised_topics" (the British spelling, or any typo) registered a
+//     subscriber authorised for NOTHING. The field is optional at the binder, so the request
+//     succeeded with 201 and the operator held a subscriber that can obtain a credential and read
+//     no topic — a failure they discover from the consumer, not from the API.
+//   - PUT /subscribers/{id} with every field misspelled decoded to a wholly empty update, which is
+//     a legitimate instruction meaning "rewrite the row with its own values". So the response was
+//     200 with the unchanged row, and a caller comparing the response against what they sent had
+//     no way to tell an ignored field from a value the server chose to keep.
+//   - The webhook-subscription bodies carry one field each, so a misspelling there is refused by
+//     binding:"required" — but only by accident of the shape having nothing else in it.
+//
+// A rejected filter and a rejected body field are the same class of problem, and this API already
+// refuses an unknown QUERY parameter for exactly this reason (see rejectUnsupportedQueryParameters).
+// The body was the remaining half.
+//
+// # Why not gin's global toggle
+//
+// gin.EnableJsonDecoderDisallowUnknownFields() is process-wide and would change every endpoint in
+// this API, including the many no finding covers. The same reasoning keeps ParseQueryOptions
+// untouched. So the strictness is applied per handler, on the four management bodies.
+//
+// # Why the binding tags still run
+//
+// Decoding through encoding/json directly bypasses gin's validator, and these shapes depend on it:
+// binding:"required" on the webhook URL, and "max=16,dive,max=249" on the topic list, which is what
+// keeps a caller from submitting a thousand topic names or one longer than Kafka accepts. So the
+// validator is invoked explicitly afterwards through the same binding.Validator gin itself uses —
+// one decode, and the identical rules.
+//
+// # The two error codes, and why an unknown field is not "malformed"
+//
+// A body carrying an unknown field PARSES; nothing about the transport is wrong. It is a caller
+// naming something this endpoint cannot honour, which is a validation failure and is the code an
+// unknown query parameter already answers with. GEN_MALFORMED_REQUEST stays for what it always
+// meant: JSON that does not parse, or a field of the wrong JSON type.
+//
+// Parameters:
+//   - c *gin.Context: the request. On refusal the response is already written when this returns.
+//   - target any: a pointer to the request DTO.
+//
+// Returns:
+//   - bool: false when the refusal has been written.
+func bindStrictManagementJSON(c *gin.Context, target any) bool {
+	if c.Request == nil || c.Request.Body == nil {
+		respondCode(c, apierror.ErrGenMalformedRequest, "A JSON request body is required", nil)
+
+		return false
+	}
+
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(target); err != nil {
+		// encoding/json reports an unknown field as `json: unknown field "x"` and offers no typed
+		// error for it, so the prefix is the only handle. It is a stable, documented message; a
+		// change to it would fail the test that pins this refusal rather than passing silently.
+		if field, unknown := unknownJSONField(err); unknown {
+			respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(
+				"%q is not a field this endpoint accepts; a field named but not honoured would "+
+					"leave the request half-applied with nothing in the response to say so",
+				field,
+			), nil)
+
+			return false
+		}
+
+		if errors.Is(err, io.EOF) {
+			respondCode(c, apierror.ErrGenMalformedRequest, "A JSON request body is required", nil)
+
+			return false
+		}
+
+		respondCode(c, apierror.ErrGenMalformedRequest, err.Error(), nil)
+
+		return false
+	}
+
+	// A SECOND JSON VALUE after the first is refused rather than ignored, for the same reason an
+	// unknown field is: `{"name":"a"}{"name":"b"}` is a caller sending two instructions and
+	// receiving the first, with the response describing neither ambiguity.
+	if decoder.More() {
+		respondCode(c, apierror.ErrGenMalformedRequest,
+			"The request body must contain exactly one JSON object", nil)
+
+		return false
+	}
+
+	// THE BINDING TAGS, run through gin's own validator so decoding directly does not quietly
+	// drop them. binding.Validator is the same instance ShouldBindJSON would have used.
+	if err := binding.Validator.ValidateStruct(target); err != nil {
+		respondCode(c, apierror.ErrGenMalformedRequest, err.Error(), nil)
+
+		return false
+	}
+
+	return true
+}
+
+// unknownJSONField extracts the field name from encoding/json's unknown-field error.
+//
+// Parameters:
+//   - err error: the decode error.
+//
+// Returns:
+//   - string: the offending field name, unquoted.
+//   - bool: true when err is an unknown-field error.
+func unknownJSONField(err error) (string, bool) {
+	const prefix = "json: unknown field "
+
+	message := err.Error()
+	if !strings.HasPrefix(message, prefix) {
+		return "", false
+	}
+
+	return strings.Trim(strings.TrimPrefix(message, prefix), `"`), true
+}
+
+// refuseSubscriberPagingOptions refuses a paging option a non-paging reading of GET /subscribers
+// cannot honour.
+//
+// # Why refusing beats ignoring, and beats honouring
+//
+// The pseudonym resolution and the awaiting-revocation scan are not walks. The resolver returns
+// at most one row; the scan deliberately covers the WHOLE registry, because a partial list of
+// live unaccounted-for credentials reads exactly like a complete one and acting on it would leave
+// the rest authenticating while the incident looked closed — which is why the service refuses
+// rather than truncating when the registry exceeds its bound.
+//
+// So `?revocation_pending=true&limit=10` asks for something that does not exist. It was silently
+// ignored: the caller received every matching row, believing they had asked for ten, with nothing
+// in the response saying which they got. On this endpoint that is the dangerous direction — an
+// operator who thinks they are holding a bounded page of a longer list stops looking. Honouring
+// it is worse still, since a truncated scan is the exact failure mode the service refuses.
+//
+// `include_count` is deliberately NOT refused here: both readings are complete, so their length
+// IS the total, and completeSubscriberPage reports it unconditionally. Asking for a total that is
+// already there is not a contradiction.
+//
+// Parameters:
+//   - c *gin.Context: the request. On refusal the response is already written when this returns.
+//   - reading string: the parameter that selected this reading, named in the refusal so the
+//     operator can see which two of their parameters disagree.
+//
+// Returns:
+//   - bool: false when the refusal has been written.
+func refuseSubscriberPagingOptions(c *gin.Context, reading string) bool {
+	for _, parameter := range []string{
+		subscriberQueryParamLimit, subscriberQueryParamCursor,
+	} {
+		if _, present := c.GetQuery(parameter); !present {
+			continue
+		}
+
+		respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(
+			"%q cannot be combined with %q: that reading returns a COMPLETE result rather than a "+
+				"page, so there is nothing to bound or to resume from. Remove %q, or omit %q to "+
+				"page the registry",
+			parameter, reading, parameter, reading,
+		), nil)
+
+		return false
+	}
+
+	return true
+}
+
+// completeSubscriberPage wraps a COMPLETE result — one this route did not page — in the same
+// envelope every other reading of GET /subscribers answers in.
+//
+// # Why the shape is not allowed to vary by branch
+//
+// This route has three readings: the ordinary keyset page, the pseudonym resolution and the
+// awaiting-revocation scan. Two of them used to answer with a bare JSON array while the third
+// answered with `{data, next_cursor, has_more, total_count?}`. A client written against one
+// reading breaks on another with a type error rather than a message, and the two bare-array
+// readings are the ones an operator reaches DURING AN INCIDENT, from a runbook, when a
+// deserialisation failure is the most expensive thing that can happen.
+//
+// # Why has_more is false and total_count is always present here
+//
+// Neither of these readings is a page. The resolver returns at most one row and the revocation
+// scan covers the WHOLE registry, so there is nothing to resume from — has_more is false and no
+// cursor is emitted, which is exactly what a paging client needs to see to stop after one
+// request. And because the result is complete, its length IS the total: reporting it is honest
+// here in a way it would not be for a page, and it saves the caller inferring a total from a
+// response shape that elsewhere means something else.
+//
+// Parameters:
+//   - items []model.SubscriberResponse: the complete result. Nil is rendered as [].
+//
+// Returns:
+//   - SubscriberPageResponse: the envelope, with total_count set to len(items).
+func completeSubscriberPage(items []model.SubscriberResponse) SubscriberPageResponse {
+	if items == nil {
+		// [] rather than null, so a script can range over .data[] unconditionally.
+		items = []model.SubscriberResponse{}
+	}
+
+	total := int64(len(items))
+
+	return SubscriberPageResponse{Data: items, HasMore: false, TotalCount: &total}
 }
 
 // subscriberRevocationFilterFromQuery reads the revocation_pending filter.
@@ -1955,7 +2245,13 @@ func (a *Api) listSubscribersAwaitingRevocation(c *gin.Context) {
 		items = append(items, model.NewSubscriberResponse(subscriber))
 	}
 
-	c.JSON(http.StatusOK, items)
+	// THE SAME ENVELOPE as every other reading of this route. It used to be a bare array, so the
+	// first step of the outstanding-revocation runbook returned a differently shaped body from the
+	// ordinary listing — during an incident, from a command an operator copies.
+	//
+	// The scan covers the WHOLE registry rather than a page, so the total is exact and there is
+	// nothing to resume from. See completeSubscriberPage.
+	c.JSON(http.StatusOK, completeSubscriberPage(items))
 }
 
 // Query-parameter names and refusal messages for the operator lookups that page the

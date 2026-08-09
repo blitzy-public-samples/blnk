@@ -709,7 +709,8 @@ Your subscriber record may carry a `partition_key_prefix`, and your credential r
 ```json
 "partition_key_prefix": "ldg_9f1c8a72",
 "partition_key_prefix_enforced": false,
-"partition_key_prefix_enforced_by": "consumer_side"
+"partition_key_prefix_enforced_by": "consumer_side",
+"not_enforced_by": ["partition_key"]
 ```
 
 **Read those two fields before you design around the prefix.** Kafka's authorizer has no message-key dimension: an ACL grants `Read` on a *topic*, so your credential reads **every** record on every topic it is granted, whatever the keys are. The prefix is the scope you are expected to apply *in your consumer*, against the message key — `key.startsWith(prefix)`, a byte-exact prefix test on an opaque identifier, with no case folding and no trimming. Records outside it will be delivered to you; discarding them is your side of the contract.
@@ -717,6 +718,8 @@ Your subscriber record may carry a `partition_key_prefix`, and your credential r
 If you need records outside your scope to be *unreachable* rather than filtered, that is a topic-grant question, not a key question — ask your operator to narrow `authorized_topics` or to publish your domain to a topic of its own. Both are real ACLs.
 
 `partition_key_prefix_enforced_by` is `none` when no prefix is recorded, which means the topic and consumer-group grants are your whole boundary and there is nothing for you to filter. The field is always present, so you can branch on it without first testing whether the prefix is empty.
+
+`not_enforced_by` says the same thing as a list, and it is the one to assert on if you want a test that fails when the contract changes: it carries `partition_key` for every subscriber, and together with `enforced_by` it enumerates every dimension this API names. Compare it against a fixed expectation rather than checking that `partition_key` is absent from `enforced_by` — an absence proves nothing, because a dimension the server never mentions reads identically to one it forgot.
 
 ## Observability
 

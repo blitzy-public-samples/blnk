@@ -1071,15 +1071,6 @@ func (m *MockDataSource) GetEventByID(ctx context.Context, eventID string) (*mod
 	return args.Get(0).(*model.EventOutbox), args.Error(1)
 }
 
-func (m *MockDataSource) MarkEventDeadLetterResolved(ctx context.Context, eventID string, note string, at time.Time) (*model.EventOutbox, error) {
-	args := m.Called(ctx, eventID, note, at)
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
-	}
-
-	return args.Get(0).(*model.EventOutbox), args.Error(1)
-}
-
 func (m *MockDataSource) CountDeadLetteredEvents(ctx context.Context, query model.DeadLetterQuery) (int64, error) {
 	args := m.Called(ctx, query)
 	return args.Get(0).(int64), args.Error(1)
@@ -1107,6 +1098,14 @@ func (m *MockDataSource) ListDeadLetterInventory(ctx context.Context, query mode
 		return model.DeadLetterInventoryPage{}, args.Error(1)
 	}
 	return args.Get(0).(model.DeadLetterInventoryPage), args.Error(1)
+}
+
+func (m *MockDataSource) ListAndCountDeadLetterInventory(ctx context.Context, query model.DeadLetterInventoryQuery) (model.DeadLetterInventoryPage, int64, error) {
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return model.DeadLetterInventoryPage{}, 0, args.Error(2)
+	}
+	return args.Get(0).(model.DeadLetterInventoryPage), args.Get(1).(int64), args.Error(2)
 }
 
 func (m *MockDataSource) OldestDeadLetterAgeByTopic(ctx context.Context, topicPrefix string) ([]model.DeadLetterTopicAge, error) {
@@ -1201,14 +1200,25 @@ func (m *MockDataSource) ListEventSubscribers(ctx context.Context, query model.S
 	return args.Get(0).(model.SubscriberPage), args.Error(1)
 }
 
+func (m *MockDataSource) ListAndCountEventSubscribers(ctx context.Context, query model.SubscriberPageQuery) (model.SubscriberPage, int64, error) {
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return model.SubscriberPage{}, 0, args.Error(2)
+	}
+	return args.Get(0).(model.SubscriberPage), args.Get(1).(int64), args.Error(2)
+}
+
 func (m *MockDataSource) CountEventSubscribers(ctx context.Context) (int64, error) {
 	args := m.Called(ctx)
 	return args.Get(0).(int64), args.Error(1)
 }
 
-func (m *MockDataSource) UpdateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber, fenceToken string) error {
+func (m *MockDataSource) UpdateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber, fenceToken string) (*model.EventSubscriber, error) {
 	args := m.Called(ctx, subscriber, fenceToken)
-	return args.Error(0)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.EventSubscriber), args.Error(1)
 }
 
 func (m *MockDataSource) DeleteEventSubscriber(ctx context.Context, subscriberID string) error {

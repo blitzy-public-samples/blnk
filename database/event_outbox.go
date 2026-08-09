@@ -193,8 +193,7 @@ const (
 const eventOutboxColumns = `id, event_id, event_type, aggregate_id, partition_key, ledger_id, topic, schema_version, ` +
 	`payload_raw, event_raw, occurred_at, status, attempts, max_attempts, next_attempt_at, last_error, first_attempted_at, ` +
 	`last_attempted_at, dispatched_at, locked_until, claim_token, webhook_dispatched, kafka_dispatched_at, ` +
-	`webhook_attempts, kafka_topic, kafka_partition, kafka_offset, dlt_topic, failure_metadata, traceparent, tracestate, ` +
-	`resolved_at, resolution_note`
+	`webhook_attempts, kafka_topic, kafka_partition, kafka_offset, dlt_topic, failure_metadata, traceparent, tracestate`
 
 // eventOutboxScanner is the minimum surface scanEventOutbox needs, satisfied by
 // both *sql.Row and *sql.Rows. Sharing one scanner between the single-row and
@@ -223,8 +222,6 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 	var kafkaPartition sql.NullInt32
 	var kafkaOffset sql.NullInt64
 	var failureMetadata []byte
-	var resolvedAt sql.NullTime
-	var resolutionNote sql.NullString
 
 	if err := s.Scan(
 		&e.ID,
@@ -264,21 +261,9 @@ func scanEventOutbox(s eventOutboxScanner) (model.EventOutbox, error) {
 		// model.EventOutbox.Traceparent.
 		&traceparent,
 		&tracestate,
-		// The operator resolution. resolved_at NIL MEANS UNRESOLVED, which is the state that
-		// keeps the row out of the retention purge and in the dead-letter age gauge, so it is
-		// read as a nullable time rather than collapsed to a zero instant.
-		&resolvedAt,
-		&resolutionNote,
 	); err != nil {
 		return model.EventOutbox{}, err
 	}
-
-	if resolvedAt.Valid {
-		instant := resolvedAt.Time
-		e.ResolvedAt = &instant
-	}
-
-	e.ResolutionNote = resolutionNote.String
 
 	// ledger_id is NULLABLE and NULL means "this event has no ledger" as a
 	// positive fact — see the column comment in the migration. It collapses to the
@@ -808,6 +793,19 @@ func (d Datasource) InsertEventOutboxInTx(ctx context.Context, tx *sql.Tx, e *mo
 // whether an event was being captured alongside it.
 type sqlExecer interface {
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
+// sqlQueryer is the minimum surface a READ needs, satisfied by both *sql.DB and *sql.Tx.
+//
+// It is the read-side counterpart of sqlExecer and exists for the same reason: a page and the
+// total that accompanies it have to be answerable from ONE SNAPSHOT, which means running the
+// two statements inside a transaction, while the same two reads must remain available
+// standalone. Parameterising the statement by its connection is what keeps a single copy of
+// each — the alternative is a second copy of the cursor predicate that only the paired read
+// uses, and a divergence there is invisible until a total disagrees with the page it describes.
+type sqlQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 }
 
 // EventPreparer builds the outbox row for an entity that has JUST BEEN INSERTED, and is
@@ -3088,14 +3086,18 @@ func (d Datasource) PurgeTerminalEventsBefore(ctx context.Context, cutoff time.T
 	// removes nothing writes no log row — HAVING COUNT(*) > 0 — because "retention ran and
 	// found nothing" is the steady state and recording it would bury the batches that
 	// matter in noise.
-	// THE TWO TERMINAL STATES ARE BOUND SEPARATELY, not as one array, because they are not
-	// eligible on the same terms (SEC-08). A dispatched row is a receipt for an event a
-	// subscriber has already had, so age alone governs it. A DEAD-LETTERED row is the record
-	// of an event nobody received — the only inventory triage reads, the only thing a replay
-	// can be driven from, and the only place the failure metadata explaining the loss exists —
-	// so it is eligible only once an operator has RESOLVED it. Deleting an unresolved one on
-	// an age timer destroyed all of that unrecoverably, oldest first: the failures most likely
-	// to have been forgotten rather than handled.
+	// ONE TERMINAL STATE IS ELIGIBLE, AND ONLY ONE (SEC-08). A dispatched row is a receipt for
+	// an event a subscriber has already had, so age alone governs it. A DEAD-LETTERED row is
+	// the record of an event NOBODY RECEIVED — the only inventory triage reads, the only thing
+	// a replay can be driven from, and the only place the failure metadata explaining the loss
+	// exists — so age must never remove it. Deleting one on an age timer destroyed all of that
+	// unrecoverably, oldest first: the failures most likely to have been forgotten rather than
+	// handled.
+	//
+	// A dead-lettered row leaves the inventory by being REPLAYED, not by being annotated: a
+	// re-publish the broker acknowledges makes the row dispatched, and a receipt is what this
+	// sweep may then remove. That is the whole retention model, and it needs no second column
+	// and no second endpoint to express.
 	//
 	// model.EventOutbox.IsPurgeableByRetention states the same rule in Go, and
 	// TestEventOutboxRetention_GoAndSQLAgreeOnEligibility pins the two together.
@@ -3104,25 +3106,22 @@ func (d Datasource) PurgeTerminalEventsBefore(ctx context.Context, cutoff time.T
 			DELETE FROM blnk.event_outbox
 			WHERE id IN (
 				SELECT id FROM blnk.event_outbox
-				WHERE (
-				        status = $1
-				        OR (status = $2 AND resolved_at IS NOT NULL)
-				      )
-				  AND occurred_at < $3
+				WHERE status = $1
+				  AND occurred_at < $2
 				ORDER BY occurred_at ASC
-				LIMIT $4
+				LIMIT $3
 			)
 			RETURNING occurred_at, kafka_offset
 		), logged AS (
 			INSERT INTO blnk.event_outbox_purge_log
 				(cutoff, rows_removed, confirmed_removed, oldest_occurred_at, newest_occurred_at)
-			SELECT $3, COUNT(*), COUNT(kafka_offset), MIN(occurred_at), MAX(occurred_at)
+			SELECT $2, COUNT(*), COUNT(kafka_offset), MIN(occurred_at), MAX(occurred_at)
 			FROM removed
 			HAVING COUNT(*) > 0
 			RETURNING rows_removed
 		)
 		SELECT COUNT(*) FROM removed
-	`, model.EventOutboxStatusDispatched, model.EventOutboxStatusDeadLettered, cutoff, limit)
+	`, model.EventOutboxStatusDispatched, cutoff, limit)
 
 	var purged int64
 	if err := row.Scan(&purged); err != nil {
@@ -3419,6 +3418,32 @@ func (d Datasource) ListDeadLetterInventory(
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ListDeadLetterInventory")
 	defer span.End()
 
+	return listDeadLetterInventory(ctx, d.Conn, span, query)
+}
+
+// listDeadLetterInventory is the page read, parameterised by the connection it runs on.
+//
+// It exists so that the standalone read and the SNAPSHOT-CONSISTENT read that pairs the page
+// with its total run the identical statement over the identical bindings. Duplicating the
+// statement for the two paths is how the cursor predicate, the probe row and the ordering drift
+// apart, and that drift would show up as a page that differed depending on whether a total had
+// been asked for.
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - conn sqlQueryer: *sql.DB for a standalone read, *sql.Tx for the paired read.
+//   - span trace.Span: the caller's span, annotated here.
+//   - query model.DeadLetterInventoryQuery: the narrowing and the page.
+//
+// Returns:
+//   - model.DeadLetterInventoryPage: as ListDeadLetterInventory.
+//   - error: as ListDeadLetterInventory.
+func listDeadLetterInventory(
+	ctx context.Context,
+	conn sqlQueryer,
+	span trace.Span,
+	query model.DeadLetterInventoryQuery,
+) (model.DeadLetterInventoryPage, error) {
 	limit := query.Limit
 	if limit <= 0 {
 		limit = defaultDeadLetterPageSize
@@ -3442,8 +3467,6 @@ func (d Datasource) ListDeadLetterInventory(
 		attribute.Int("event_outbox.limit", limit),
 		attribute.String("event_outbox.status_filter", query.Status),
 		attribute.Bool("event_outbox.cursor_present", query.Cursor != nil),
-		attribute.Bool("event_outbox.unresolved_only", query.UnresolvedOnly),
-		attribute.Bool("event_outbox.resolved_only", query.ResolvedOnly),
 	)
 
 	// limit+1: the extra row is read to establish that another page exists and is then
@@ -3460,11 +3483,10 @@ func (d Datasource) ListDeadLetterInventory(
 		occurredTo = query.OccurredTo.UTC()
 	}
 
-	rows, err := d.Conn.QueryContext(ctx, listDeadLetterInventoryQuery,
+	rows, err := conn.QueryContext(ctx, listDeadLetterInventoryQuery,
 		model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
 		query.Status, query.EventType, query.Topic,
-		cursorInstant, cursorID, occurredFrom, occurredTo,
-		query.UnresolvedOnly, query.ResolvedOnly, limit+1)
+		cursorInstant, cursorID, occurredFrom, occurredTo, limit+1)
 	if err != nil {
 		failDatabaseSpan(span, err)
 
@@ -3596,19 +3618,6 @@ func deadLetterFilterClause(filter model.DeadLetterFilter, next int) (string, []
 		clauses = append(clauses, fmt.Sprintf("occurred_at <= $%d", next))
 		args = append(args, filter.OccurredTo.UTC())
 		next++
-	}
-
-	// RESOLUTION takes no placeholder, which is why it is rendered last: a NULL test is not a
-	// value comparison, so it cannot be parameterised and it cannot disturb the numbering the
-	// clauses above established. Only one of the two can hold — the service's tri-state makes
-	// the contradiction unrepresentable — but both are written independently so a caller
-	// constructing the filter directly gets an empty result rather than a widened one.
-	if filter.UnresolvedOnly {
-		clauses = append(clauses, "resolved_at IS NULL")
-	}
-
-	if filter.ResolvedOnly {
-		clauses = append(clauses, "resolved_at IS NOT NULL")
 	}
 
 	return strings.Join(clauses, " AND "), args, next
@@ -4650,17 +4659,6 @@ func deadLetterInventoryPredicate(
 		clause.WriteString(fmt.Sprintf(" AND occurred_at <= $%d", len(args)))
 	}
 
-	// THE SAME RESOLUTION NARROWING THE LISTING APPLIES, for the same reason the window is
-	// applied here: a count drawn from a narrowing the page was not is worse than no count at
-	// all.
-	if query.UnresolvedOnly {
-		clause.WriteString(" AND resolved_at IS NULL")
-	}
-
-	if query.ResolvedOnly {
-		clause.WriteString(" AND resolved_at IS NOT NULL")
-	}
-
 	return clause.String(), args
 }
 
@@ -4698,12 +4696,34 @@ func (d Datasource) CountDeadLetterInventory(
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CountDeadLetterInventory")
 	defer span.End()
 
+	return countDeadLetterInventory(ctx, d.Conn, span, query)
+}
+
+// countDeadLetterInventory is the count, parameterised by the connection it runs on, for the
+// same reason listDeadLetterInventory is: the paired read must count with the predicate the
+// page was drawn with, not with one that resembles it.
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - conn sqlQueryer: *sql.DB for a standalone count, *sql.Tx for the paired read.
+//   - span trace.Span: the caller's span, annotated here.
+//   - query model.DeadLetterQuery: the narrowing. Limit and Offset are ignored.
+//
+// Returns:
+//   - int64: as CountDeadLetterInventory.
+//   - error: as CountDeadLetterInventory.
+func countDeadLetterInventory(
+	ctx context.Context,
+	conn sqlQueryer,
+	span trace.Span,
+	query model.DeadLetterQuery,
+) (int64, error) {
 	span.SetAttributes(attribute.Bool("event_outbox.filtered", query.HasFilters()))
 
 	where, args := deadLetterInventoryPredicate(query, make([]interface{}, 0, 5))
 
 	var total int64
-	err := d.Conn.QueryRowContext(ctx, `
+	err := conn.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM blnk.event_outbox
 		`+where, args...).Scan(&total)
@@ -4717,6 +4737,88 @@ func (d Datasource) CountDeadLetterInventory(
 	span.SetAttributes(attribute.Int64("event_outbox.dead_letter_total", total))
 
 	return total, nil
+}
+
+// ListAndCountDeadLetterInventory returns one page of the inventory AND how many entries the
+// same narrowing matches, both read from a single snapshot.
+//
+// # Why one snapshot rather than two reads
+//
+// The page and the total used to be two independent statements on two connections, and the
+// response then asserted a relationship between them that nothing established: an entry
+// dead-lettered between the two reads is counted by one and absent from the other, so the total
+// describes a set the page is not a slice of. On a triage endpoint that reads as a different
+// amount of stuck work than there is — the operator sees 41 entries and a total of 40, or pages
+// to the total and finds the backlog is not empty.
+//
+// REPEATABLE READ is what fixes it. In PostgreSQL that isolation level takes one snapshot at the
+// first statement and every later statement in the transaction sees exactly that snapshot, so
+// the count is a count of the very population the page was drawn from. The transaction is
+// declared READ ONLY as well, which lets PostgreSQL skip the bookkeeping a writable snapshot
+// needs and — more importantly here — makes it impossible for this path to write.
+//
+// # What is still NOT guaranteed, and why the response says so
+//
+// One snapshot makes the total and THIS page agree. It cannot make "paging to the total
+// exhausts the matches" true, because paging spans many requests over a live inventory: the
+// relay dead-letters entries and a replay removes them while a client pages. The total is
+// therefore exact as at this page, not a promise about the session, and the DTO documents it
+// that way rather than claiming an exactness no read can deliver.
+//
+// Parameters:
+//   - ctx context.Context: cancels the transaction.
+//   - query model.DeadLetterInventoryQuery: the narrowing and the page. The count applies the
+//     same narrowing and ignores the page.
+//
+// Returns:
+//   - model.DeadLetterInventoryPage: the page, as ListDeadLetterInventory.
+//   - int64: how many entries the narrowing matches in the same snapshot.
+//   - error: the repository's typed error. A failure to open or read the snapshot is reported
+//     rather than silently degraded to two reads, because a caller that asked for a coherent
+//     pair must not be handed an incoherent one that looks the same.
+func (d Datasource) ListAndCountDeadLetterInventory(
+	ctx context.Context,
+	query model.DeadLetterInventoryQuery,
+) (model.DeadLetterInventoryPage, int64, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ListAndCountDeadLetterInventory")
+	defer span.End()
+
+	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return model.DeadLetterInventoryPage{}, 0, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to read the dead-letter inventory", "list_and_count_dead_letter_inventory", err)
+	}
+
+	// ROLLED BACK UNCONDITIONALLY, never committed. Nothing was written, so there is nothing to
+	// commit, and a rollback releases the snapshot on every path including the error ones. The
+	// result is already in hand by then, so a rollback failure is logged rather than returned:
+	// discarding a correct answer over a condition the caller cannot act on would be the worse
+	// outcome.
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			withLoggableCause(nil, rollbackErr).Error(
+				"failed to roll back the dead-letter inventory snapshot")
+		}
+	}()
+
+	page, err := listDeadLetterInventory(ctx, tx, span, query)
+	if err != nil {
+		return model.DeadLetterInventoryPage{}, 0, err
+	}
+
+	// The page's own narrowing, with the cursor and the limit dropped: which matches to return is
+	// not a question about how many there are.
+	total, err := countDeadLetterInventory(ctx, tx, span, query.FilterQuery())
+	if err != nil {
+		return model.DeadLetterInventoryPage{}, 0, err
+	}
+
+	return page, total, nil
 }
 
 // expectedEventTopicPrefix (singular) WAS RETIRED HERE. It resolved the one namespace this
@@ -4913,6 +5015,11 @@ func scanDeadLetterInventoryEntry(s eventOutboxScanner) (model.DeadLetterInvento
 // exact, and the cost is set by the number of topics rather than by the size of the backlog —
 // which is what matters, because the backlog is largest exactly when the gauge matters most.
 //
+// EVERY OUTSTANDING ENTRY COUNTS, with no exemption. A dead-lettered row leaves this aggregate
+// by being REPLAYED — a re-publish the broker acknowledges makes it dispatched, and dispatched
+// is not one of the two states counted here. Nothing else takes a row out, which is what keeps
+// the DeadLetterMessageStuck alert firing until the event has actually reached a subscriber.
+//
 // # The age instant, and why it is a COALESCE
 //
 // A dead_lettered row's age runs from when it reached its `<topic>.dlt` sibling, which is the
@@ -4930,7 +5037,6 @@ const oldestDeadLetterAgeByTopicQuery = `
 			COUNT(*)                                     AS outstanding
 		FROM blnk.event_outbox
 		WHERE status IN ($1, $2)
-		  AND resolved_at IS NULL
 		GROUP BY age_topic
 	`
 
@@ -5177,122 +5283,9 @@ const listDeadLetterInventoryQuery = `
 		  AND ($6::timestamptz IS NULL OR (occurred_at, id) < ($6::timestamptz, $7::bigint))
 		  AND ($8::timestamptz IS NULL OR occurred_at >= $8::timestamptz)
 		  AND ($9::timestamptz IS NULL OR occurred_at <= $9::timestamptz)
-		  AND (NOT $10::boolean OR resolved_at IS NULL)
-		  AND (NOT $11::boolean OR resolved_at IS NOT NULL)
 		ORDER BY occurred_at DESC, id DESC
-		LIMIT $12
+		LIMIT $10
 	`
-
-// MarkEventDeadLetterResolved records that an operator has accounted for a
-// dead-lettered event, which is what makes the row eligible for retention.
-//
-// # SEC-08: this transition is the whole retention gate
-//
-// Without it the purge selected on status alone and deleted dead-lettered rows on an
-// age timer — destroying, unrecoverably, the only record that a ledger event went
-// undelivered together with the failure metadata explaining why. Resolution is an
-// operator DECISION about a row already in its final delivery state, so it is recorded
-// as its own fact rather than as a new status: the dead_lettered literal is what the
-// zero-loss reconciliation counts, what the published-audit index selects on, and what
-// a replay requires, and none of those may change because someone closed a ticket.
-//
-// # It is a conditional write, and the condition is the contract
-//
-// The UPDATE requires status = dead_lettered AND resolved_at IS NULL, so:
-//
-//   - a row that never reached its `<topic>.dlt` sibling (failed, dlt_topic NULL) is
-//     REFUSED. Its dead-letter write is still owed and the outbox row is the only copy
-//     of the event in existence, so "dealt with" cannot be true of it yet.
-//   - a row already resolved is REFUSED rather than silently re-stamped, because the
-//     recorded instant and note are an audit trail and the second caller's account of
-//     why would overwrite the first's.
-//   - a row mid-replay is refused for the duration of the replay, which is correct:
-//     the outcome of that publish is not yet known.
-//
-// The distinction between the three refusals is returned as a typed code so a script
-// can tell "already done" from "not eligible" without parsing prose.
-//
-// Parameters:
-//   - ctx context.Context: cancels the write.
-//   - eventID string: the business event_id UUID, as the route carries it.
-//   - note string: the operator's account of why no further action is owed. Optional;
-//     stored only when non-empty, and bounded by the service before it arrives here.
-//   - at time.Time: the resolution instant. Required, and supplied by the caller so a
-//     test can pin it and so the value matches what the response reports.
-//
-// Returns:
-//   - *model.EventOutbox: the row as it now stands, so a caller can report the
-//     resolution it recorded rather than the one it asked for.
-//   - error: ErrNotFound when no such event; ErrEventAlreadyResolved when it is already
-//     resolved; ErrEventNotDeadLettered when it has no dead-letter record to resolve; a
-//     typed internal error otherwise.
-func (d Datasource) MarkEventDeadLetterResolved(
-	ctx context.Context,
-	eventID string,
-	note string,
-	at time.Time,
-) (*model.EventOutbox, error) {
-	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkEventDeadLetterResolved")
-	defer span.End()
-	span.SetAttributes(attribute.String("event_outbox.event_id", eventID))
-
-	if at.IsZero() {
-		err := apierror.NewAPIError(apierror.ErrBadRequest, "A dead-letter resolution instant is required", nil)
-		failDatabaseSpan(span, err)
-		return nil, err
-	}
-
-	// A blank note is stored as NULL rather than as an empty string, so
-	// event_outbox_resolution_pair_chk reads the pair the way the column comments
-	// describe and a projection can use omitempty without ambiguity.
-	var storedNote interface{}
-	if trimmed := strings.TrimSpace(note); trimmed != "" {
-		storedNote = trimmed
-	}
-
-	row := d.Conn.QueryRowContext(ctx, `
-		UPDATE blnk.event_outbox
-		SET resolved_at = $2,
-		    resolution_note = $3
-		WHERE event_id = $1
-		  AND status = $4
-		  AND resolved_at IS NULL
-		RETURNING `+eventOutboxColumns, eventID, at.UTC(), storedNote, model.EventOutboxStatusDeadLettered)
-
-	entry, err := scanEventOutbox(row)
-	if err == nil {
-		span.SetAttributes(attribute.Bool("event_outbox.resolved", true))
-		return &entry, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		failDatabaseSpan(span, err)
-		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to resolve dead-lettered event", "mark_event_dead_letter_resolved", err)
-	}
-
-	// The conditional write matched nothing, and WHICH condition failed is what the
-	// caller has to be told. One read answers it, and reading after the attempt rather
-	// than before it is deliberate: a check-then-write would report a state the write
-	// then contradicted.
-	current, readErr := d.GetEventByID(ctx, eventID)
-	if readErr != nil {
-		// Includes the not-found case, already typed by GetEventByID.
-		return nil, readErr
-	}
-
-	if current.IsResolvedDeadLetter() {
-		return nil, apierror.NewAPIError(
-			apierror.ErrEventAlreadyResolved,
-			"This dead-lettered event has already been resolved",
-			fmt.Errorf("blnk: event %s was resolved at %s", eventID, current.ResolvedAt.UTC().Format(time.RFC3339)),
-		)
-	}
-
-	return nil, apierror.NewAPIError(
-		apierror.ErrEventNotDeadLettered,
-		"Only a dead-lettered event can be resolved; this event has no dead-letter record",
-		fmt.Errorf("blnk: event %s is %s, not %s", eventID, current.Status, model.EventOutboxStatusDeadLettered),
-	)
-}
 
 // withLoggableCause attaches a driver or dependency error to a log entry in the two renderings
 // an operator needs, and it is the ONLY way the event repositories should put an error into a

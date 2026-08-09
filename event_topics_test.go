@@ -1961,19 +1961,65 @@ func TestKafkaProvisionScript_ProvisionsEveryCategoryTheCodeOwns(t *testing.T) {
 	})
 
 	t.Run("the script's grantable set matches the code's", func(t *testing.T) {
-		// The script grants its sample principal a DEFAULT topic list, and a second, hand-kept
-		// copy of the allowlist is a second thing to forget. This is what keeps that list equal
-		// to the one the API and the ACL provisioner use, in the same canonical order.
+		// THE ALLOWLIST, which is a POLICY: which categories a subscriber may ever be granted. A
+		// second, hand-kept copy of it is a second thing to forget, so this holds it equal to the
+		// one the API and the ACL provisioner enforce, in the same canonical order.
 		declaration := regexp.MustCompile(`(?m)^readonly SUBSCRIBER_GRANTABLE_CATEGORIES=\(([^)]*)\)`)
 		match := declaration.FindSubmatch(script)
 		require.NotNil(t, match,
-			"the script must declare `readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(...)`, because its "+
-				"sample-subscriber grant is derived from it")
+			"the script must declare `readonly SUBSCRIBER_GRANTABLE_CATEGORIES=(...)`, because the "+
+				"topics it will accept for its sample principal are derived from it")
 
 		assert.Equal(t, model.SubscriberGrantableEventCategories(), strings.Fields(string(match[1])),
-			"the sample principal's default grant must be exactly the categories a real subscriber "+
+			"the categories the script will grant must be exactly the categories a real subscriber "+
 				"may be granted, in the same order: a category grantable in one and not the other means "+
 				"the script mints a grant the API would refuse, or refuses one the API would allow")
+	})
+
+	// MD-6. The sample principal's DEFAULT grant is a different question from the allowlist, and
+	// conflating the two is what this subtest exists to prevent.
+	//
+	// The array it reads was REFERENCED AND NEVER DEFINED. Two loops in the script expanded it to
+	// compose the sample's default topics, and bash expands an undefined array to nothing even
+	// under `set -u`, so the list came out EMPTY — and the empty case is not the one the script
+	// validates, because resolve_subscriber_topics only refuses an empty result on the override
+	// path. Provisioning reported a sample subscriber that had been granted nothing, and the first
+	// symptom was a demo consumer receiving no records with every ACL apparently in place.
+	t.Run("the sample principal's default grant is defined and is a subset of the allowlist", func(t *testing.T) {
+		declaration := regexp.MustCompile(`(?m)^readonly SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES=\(([^)]*)\)`)
+		match := declaration.FindSubmatch(script)
+		require.NotNil(t, match,
+			"the script must DECLARE `readonly SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES=(...)`. It is "+
+				"expanded to build the sample's default topic list, and an undefined array expands to "+
+				"nothing rather than failing, so an absent declaration provisions a principal "+
+				"authorised for no topic at all and reports success")
+
+		sampleDefault := strings.Fields(string(match[1]))
+		require.NotEmpty(t, sampleDefault,
+			"an empty default grant is the exact outcome the missing declaration produced, so an "+
+				"empty declaration is no better than none")
+
+		// A SUBSET, not a copy. Every default must be grantable — the script checks its overrides
+		// against the allowlist and would otherwise refuse its own default — while the allowlist
+		// may legitimately be wider, because what a subscriber MAY hold and what a sample IS given
+		// are different decisions.
+		grantable := model.SubscriberGrantableEventCategories()
+		for _, category := range sampleDefault {
+			assert.Contains(t, grantable, category,
+				"the sample default grants %q, which is not on the allowlist: the script would refuse "+
+					"this exact list if an operator supplied it through KAFKA_SAMPLE_SUBSCRIBER_TOPICS",
+				category)
+		}
+
+		// LEAST PRIVILEGE, asserted as itself. The system category carries system.error, whose
+		// payload is an internal error message, so a credential handed out for a walkthrough must
+		// not read it by default. It stays grantable on request, which the subtest above covers.
+		assert.NotContains(t, sampleDefault, model.EventCategorySystem,
+			"the sample default must not include the system category: it carries system.error, and "+
+				"the point of a separate default is that it is narrower than the policy")
+		assert.Less(t, len(sampleDefault), len(grantable),
+			"the default must be strictly narrower than the allowlist, or the two lists are one list "+
+				"under two names and the distinction they exist to draw is gone")
 	})
 
 	t.Run("the dead-letter suffix agrees too", func(t *testing.T) {

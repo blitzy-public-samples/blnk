@@ -1128,13 +1128,19 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 			// request would change the stored bytes of every event and break both byte-equality
 			// guarantees — and reaches subscribers as Kafka record headers instead.
 			"traceparent", "tracestate",
-			// OPERATOR RESOLUTION — the seventh group, and the only one written by a human
-			// rather than by the pipeline. A dead-lettered row is terminal without being
-			// purgeable: the event reached no subscriber, so the row is the only record that
-			// it went undelivered, and deleting it on an age timer destroys that evidence.
-			// resolved_at is what makes such a row eligible for retention at all, and the
-			// note is the operator's account of why no further action is owed.
-			"resolved_at", "resolution_note",
+			// AN OPERATOR-RESOLUTION GROUP WAS RETIRED FROM HERE. resolved_at and
+			// resolution_note recorded a human's decision that a dead-lettered entry needed no
+			// further action, which then made the row purgeable by age — and the two could not
+			// compose with a replay in either order. Resolve first and a broker-acknowledged
+			// replay could not be recorded, because moving the row to dispatched violated the
+			// constraint confining a resolution to the dead-lettered states; replay first and
+			// the resolution was refused outright, because it required the state the replay had
+			// just left.
+			//
+			// What replaced it needs no columns. The retention purge deletes dispatched rows
+			// only, so a dead-lettered row is never removed by age however old it is and the
+			// evidence of an undelivered event cannot be destroyed on a timer; a replay the
+			// broker acknowledges is what makes the row a receipt and hands it to retention.
 		}
 
 		assert.Equal(t, expected, jsonTagNames(t, typ),
@@ -1277,12 +1283,8 @@ func TestEventOutbox_ColumnContract(t *testing.T) {
 			// and was empty, which is not a state that exists, and a reader would try to
 			// resolve it.
 			"traceparent": true, "tracestate": true,
-			// Both resolution fields are omitted while absent, and the absence of resolved_at
-			// is the load-bearing state: NIL MEANS UNRESOLVED, which is what excludes the row
-			// from the retention purge and keeps it feeding the dead-letter age gauge.
-			// Rendering "resolved_at": "0001-01-01T00:00:00Z" would assert a resolution at the
-			// year one, which is the one reading a retention sweep must never act on.
-			"resolved_at": true, "resolution_note": true,
+			// resolved_at and resolution_note are ABSENT rather than expected-omitempty, because
+			// the columns are gone. See the retirement note on the tag set above.
 		}
 		require.Len(t, omitempty, typ.NumField(), "every field must have a documented omitempty expectation")
 

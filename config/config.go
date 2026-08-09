@@ -854,11 +854,12 @@ type RelayConfig struct {
 	//
 	// A DEAD-LETTERED row is the opposite — the record of an event NO SUBSCRIBER EVER
 	// RECEIVED, together with the failure metadata explaining why and the bytes a replay is
-	// driven from. It is NOT deleted by this period. It becomes eligible only once an
-	// operator has explicitly resolved it through POST /events/dead-letter/:id/resolve, and
-	// then this period applies from its occurrence. An unresolved failure therefore stays,
-	// however old, and keeps the DeadLetterMessageStuck alert firing until somebody
-	// accounts for it.
+	// driven from. It is NEVER deleted by this period, however old it is, and it keeps the
+	// DeadLetterMessageStuck alert firing until the event actually reaches a subscriber. The
+	// workflow that ends its life is REPLAY, through
+	// POST /events/dead-letter/:event_id/replay: a re-publish the broker acknowledges makes
+	// the row dispatched, and this period then applies to it as it does to any other
+	// receipt.
 	//
 	// Every other state is still owed a delivery attempt and is never deleted however old
 	// it is; a failed row in particular is excluded because its dead-letter write is still

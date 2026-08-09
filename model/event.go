@@ -42,6 +42,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -778,42 +779,6 @@ type EventOutbox struct {
 	// a table that takes one row per ledger mutation.
 	Traceparent string `json:"traceparent,omitempty"`
 	Tracestate  string `json:"tracestate,omitempty"`
-
-	// ResolvedAt is when an operator recorded that this dead-lettered event has
-	// been dealt with, and it is the ONE thing that makes the row eligible for
-	// retention.
-	//
-	// Nil means UNRESOLVED: the event reached no subscriber and nobody has
-	// accounted for it. Such a row is the only record that a ledger event went
-	// undelivered — the only inventory triage reads, the only thing a replay can
-	// be driven from, and the only place the failure metadata explaining the loss
-	// exists. So it is excluded from the retention purge however old it is, and it
-	// keeps feeding the dead-letter age gauge until someone resolves it.
-	//
-	// A pointer rather than a zero time because "not resolved" and "resolved at
-	// the year 1" must not render or compare alike; see IsResolvedDeadLetter.
-	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
-
-	// ResolutionNote is the operator's own account of why no further action is
-	// owed — the part no timestamp can carry, and the difference between an audit
-	// trail and a boolean. Empty when none was given. Bounded and sanitised
-	// before storage, because it is operator-supplied free text that the listing
-	// projects back out.
-	ResolutionNote string `json:"resolution_note,omitempty"`
-}
-
-// IsResolvedDeadLetter reports whether an operator has accounted for this
-// dead-lettered event.
-//
-// It is the Go side of the retention gate and is deliberately a method on the row
-// rather than a free function over a status string: resolution is a property of the
-// ROW, not of its status, which is exactly the distinction the status-only purge
-// predicate used to miss.
-//
-// Returns:
-//   - bool: true when a resolution instant is recorded.
-func (e EventOutbox) IsResolvedDeadLetter() bool {
-	return e.ResolvedAt != nil && !e.ResolvedAt.IsZero()
 }
 
 // IsPurgeableByRetention reports whether the retention sweep is permitted to delete
@@ -828,24 +793,23 @@ func (e EventOutbox) IsResolvedDeadLetter() bool {
 // two together, because a divergence here would be silent and would either delete
 // evidence or stop deleting anything.
 //
-// The rule, in words: a DISPATCHED row is a receipt for an event a subscriber has
-// already had, so age alone governs it. A DEAD-LETTERED row is the record of an event
-// nobody received, so it is eligible only once an operator has resolved it. Every other
-// state is still owed a delivery attempt — failed most of all, because its `<topic>.dlt`
-// write has not landed and the outbox row is therefore the only copy of the event in
-// existence.
+// The rule, in words: ONLY A DISPATCHED ROW MAY BE DELETED BY AGE. It is a receipt for an
+// event a subscriber has already had, so nothing is lost by removing it once it is old
+// enough. Every other state is still owed something, and two of them are owed it until an
+// operator acts:
+//
+//   - A DEAD-LETTERED row is the record of an event NO SUBSCRIBER EVER RECEIVED, together
+//     with the failure metadata explaining why and the bytes a replay is driven from. It is
+//     NEVER eligible, however old it is. The workflow that ends its life is REPLAY: a
+//     re-publish the broker acknowledges makes the row dispatched, and a receipt is what age
+//     may then remove.
+//   - A FAILED row is worse still: its `<topic>.dlt` write has not landed, so the outbox row
+//     is the only copy of the event in existence.
 //
 // Returns:
 //   - bool: true when the row may be deleted by age.
 func (e EventOutbox) IsPurgeableByRetention() bool {
-	switch e.Status {
-	case EventOutboxStatusDispatched:
-		return true
-	case EventOutboxStatusDeadLettered:
-		return e.IsResolvedDeadLetter()
-	default:
-		return false
-	}
+	return e.Status == EventOutboxStatusDispatched
 }
 
 // DeadLetterInventoryFilter narrows the dead-letter inventory IN SQL.
@@ -1369,6 +1333,188 @@ func (a EventRecordIntervalAudit) FullyCorroborated() bool {
 // its depth, and a grouped age reading that never reads a row at all.
 // ---------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------
+// The legacy webhook URL policy — ONE definition, for every layer that records the column
+// ---------------------------------------------------------------------------------------
+
+// ValidateWebhookURL judges a legacy webhook URL against the single policy every layer that
+// writes blnk.event_subscribers.webhook_url must apply.
+//
+// # Why it lives here
+//
+// The policy existed in TWO independent implementations — one in the repository, one in the
+// request DTO — each with its own destination classifier and its own wording. One column, two
+// rules, and the drift between them was not hypothetical: a service, CLI or migration caller
+// reaching the repository directly was judged by a different standard from an HTTP caller, and a
+// reason phrase differed between them for the same rejected host, so the same mistake read as two
+// different problems depending on which door it came through.
+//
+// This file is deliberately dependency-free, and both callers already import it, so the policy can
+// live in exactly one place without an import cycle. Each caller keeps its OWN error type — the
+// repository answers with a typed apierror, the DTO with a plain validation error — because the
+// two surfaces answer to different contracts; what they must not each own is the rule.
+//
+// # What the policy is
+//
+// An https URL, with a host, that is not visibly internal, carrying no surrounding whitespace.
+// Each clause earns its place:
+//
+//   - HTTPS ONLY, because the payload is a ledger, identity or balance event and pushing it in
+//     cleartext is a disclosure whatever the destination.
+//   - NO SURROUNDING WHITESPACE, refused rather than trimmed, because the column is stored
+//     VERBATIM: trimming for validation and storing the original would persist a destination that
+//     never passed the check. It also keeps the repository and the DTO honest about one value.
+//   - NOT AN INTERNAL DESTINATION, because a webhook URL is third-party input that Blnk itself
+//     dials, which makes it a server-side request forgery vector straight at the cloud metadata
+//     endpoint and at every service that trusts the network rather than the caller.
+//
+// An empty or all-whitespace value is ACCEPTABLE and means "clear the record": the column is
+// nullable precisely so "no endpoint" and "this endpoint" stay distinguishable, and every caller
+// maps nil/empty/value the same three ways.
+//
+// Parameters:
+//   - raw string: the URL exactly as it will be stored. Not trimmed by this function.
+//
+// Returns:
+//   - message string: a short caller-facing statement of what is wrong, echoing no caller input.
+//     Empty when the URL is acceptable.
+//   - reason string: why, for the log or the error cause. It may name the offending HOST, which is
+//     the caller's own value and the one thing they need to see; it never echoes the whole URL or a
+//     parser's rendering of it.
+func ValidateWebhookURL(raw string) (message, reason string) {
+	if strings.TrimSpace(raw) == "" {
+		return "", ""
+	}
+
+	if raw != strings.TrimSpace(raw) {
+		return "The webhook URL must not have surrounding whitespace",
+			"a URL differing from another only by whitespace is a copy-paste artefact, and this " +
+				"column is stored verbatim, so trimming it would persist a destination the caller " +
+				"did not supply"
+	}
+
+	// THE PARSER'S ERROR IS NOT RETURNED. url.Parse quotes the input back, and the input is a
+	// third party's endpoint that has no business in Blnk's error responses or logs.
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "The webhook URL is not a valid URL", "the value could not be parsed as a URL"
+	}
+
+	if parsed.Scheme != "https" {
+		return "The webhook URL must use https",
+			fmt.Sprintf(
+				"scheme %q is not permitted; ledger and identity payloads must not be pushed in cleartext",
+				parsed.Scheme,
+			)
+	}
+
+	host := parsed.Hostname()
+	if host == "" {
+		return "The webhook URL must name a host", "the URL carries no host"
+	}
+
+	if internal := InternalWebhookDestinationReason(host); internal != "" {
+		return "The webhook URL must not address an internal destination",
+			fmt.Sprintf("host %q is refused: %s", host, internal)
+	}
+
+	return "", ""
+}
+
+// InternalWebhookDestinationReason reports why a host is an internal destination, or "" when it is
+// not visibly internal.
+//
+// It returns a REASON rather than a boolean so a caller can say which rule was hit. "Not allowed"
+// sends an operator looking for a policy document; "the range the cloud metadata service lives on"
+// tells them what they just pointed Blnk at.
+//
+// Literal addresses are classified through net.IP and never as text, so every spelling is covered —
+// IPv4, IPv6, and the IPv4-mapped IPv6 form "::ffff:127.0.0.1" that a denylist of strings always
+// misses. A name with no dot is refused because it can only resolve through a search domain or a
+// hosts entry, both of which are inside the deployment.
+//
+// Parameters:
+//   - host string: the hostname or literal address from the URL, without a port.
+//
+// Returns:
+//   - string: a short reason, or "" when the host is acceptable.
+func InternalWebhookDestinationReason(host string) string {
+	if address := net.ParseIP(host); address != nil {
+		switch {
+		case address.IsLoopback():
+			return "it is a loopback address, which would make Blnk call itself"
+		case address.IsLinkLocalUnicast(), address.IsLinkLocalMulticast():
+			return "it is a link-local address, the range the cloud metadata service lives on"
+		case address.IsPrivate():
+			return "it is a private address, which reaches services that trust the network rather than the caller"
+		case address.IsUnspecified():
+			return "it is the unspecified address"
+		case address.IsInterfaceLocalMulticast(), address.IsMulticast():
+			return "it is a multicast address"
+		default:
+			return ""
+		}
+	}
+
+	lowered := strings.ToLower(host)
+	switch {
+	case lowered == "localhost", strings.HasSuffix(lowered, ".localhost"):
+		return "it resolves to loopback"
+	// .local is mDNS and .internal is the conventional private zone — metadata.google.internal is
+	// one of the two best-known metadata endpoints.
+	case strings.HasSuffix(lowered, ".local"), strings.HasSuffix(lowered, ".internal"):
+		return "it is an internal-only name"
+	case !strings.Contains(lowered, "."):
+		return "it is unqualified, so it can only resolve inside this deployment"
+	default:
+		return ""
+	}
+}
+
+// EffectivePartitionKey resolves the Kafka message key a row is ACTUALLY published under.
+//
+// # Why this is not simply the partition_key column
+//
+// Requirement R-6 partitions by ledger ID, so the publish path keys on the ledger when the row
+// carries one and falls back to the stored partition key when it does not. partition_key is
+// therefore the key for a ledger-less event — an identity, a bulk batch, a system error — and the
+// SECOND choice for everything else.
+//
+// The two values agree on almost every row, because PrepareEventOutbox derives the partition key
+// from the ledger when a ledger is known. They diverge on exactly the rows where the answer
+// matters: one written before the ledger was threaded through, or one whose partition key was
+// derived from the payload before the ledger was resolved. Reading the column alone reports the
+// key those events were NOT routed by, and an operator answering "why are these two events out of
+// order" from it reaches the wrong conclusion with nothing to indicate that they might have.
+//
+// It lives here, on the model, so that the publish path and every projection that REPORTS the key
+// resolve it through one rule. Two copies of a fallback chain is how a response starts describing
+// a routing decision the publisher did not make.
+//
+// Parameters:
+//   - ledgerID string: the row's authoritative ledger, empty for a ledger-less event.
+//   - partitionKey string: the row's stored partition key.
+//
+// Returns:
+//   - string: the key the message is published under. Empty only when both inputs are blank,
+//     which is an event belonging to no aggregate at all.
+func EffectivePartitionKey(ledgerID, partitionKey string) string {
+	if trimmed := strings.TrimSpace(ledgerID); trimmed != "" {
+		return trimmed
+	}
+
+	return strings.TrimSpace(partitionKey)
+}
+
+// EffectiveKey is the Kafka message key this row is published under. See
+// EffectivePartitionKey for why it is not simply the stored column.
+//
+// Returns:
+//   - string: the ledger id when the row has one, otherwise the stored partition key.
+func (e EventOutbox) EffectiveKey() string {
+	return EffectivePartitionKey(e.LedgerID, e.PartitionKey)
+}
+
 // DeadLetterInventoryEntry is one row of the dead-letter inventory, projected to exactly
 // what a triage listing shows.
 //
@@ -1435,6 +1581,20 @@ type DeadLetterInventoryEntry struct {
 	// PayloadBytes is the size of the stored body in bytes, measured in SQL so the bytes
 	// themselves never leave the database.
 	PayloadBytes int
+}
+
+// EffectiveKey is the Kafka message key this entry was published under, resolved through the
+// same rule the publish path uses. See EffectivePartitionKey.
+//
+// It is what an ordering question has to be answered from. The stored partition_key alone is the
+// SECOND choice on any row carrying a ledger, so a listing reporting it can name a key the event
+// was not routed by — on precisely the rows where the two disagree, which are the rows an
+// operator is investigating.
+//
+// Returns:
+//   - string: the ledger id when the entry has one, otherwise the stored partition key.
+func (e DeadLetterInventoryEntry) EffectiveKey() string {
+	return EffectivePartitionKey(e.LedgerID, e.PartitionKey)
 }
 
 // DeadLetterCursor is a position in the dead-letter inventory, expressed as the ordering
@@ -1549,16 +1709,6 @@ type DeadLetterInventoryQuery struct {
 	// failed is the one an operator most needs to see.
 	Status string
 
-	// UnresolvedOnly and ResolvedOnly narrow by whether an operator has accounted for the
-	// entry, with the same meaning and the same field names as DeadLetterQuery carries —
-	// the listing and the count must apply ONE narrowing or a paging client comparing a page
-	// against a total would never terminate.
-	//
-	// Both false returns resolved and unresolved alike, which is the honest default for an
-	// inventory endpoint: it shows everything the table holds.
-	UnresolvedOnly bool
-	ResolvedOnly   bool
-
 	// Cursor resumes a previous page. Nil starts at the newest entry.
 	Cursor *DeadLetterCursor
 	// OccurredFrom and OccurredTo bound the event's OCCURRENCE instant inclusively, and either
@@ -1570,6 +1720,30 @@ type DeadLetterInventoryQuery struct {
 	// the window and the cursor agree about what "newest first" selects.
 	OccurredFrom time.Time
 	OccurredTo   time.Time
+}
+
+// FilterQuery is this page's narrowing with the PAGE dropped: the same event type, topic,
+// status and occurrence window, without the cursor or the limit.
+//
+// It exists so that a count accompanying a page is derived FROM the page's own query rather
+// than assembled beside it. Two structures built independently from one request is how a filter
+// gets applied to the page and not to its total, and a total describing a wider set than the
+// page is not a harmless discrepancy on a triage endpoint — a paging client comparing the two
+// never terminates, and an operator reads a backlog that is the wrong size.
+//
+// The page bounds are dropped rather than carried because which matches to return has no
+// bearing on how many there are.
+//
+// Returns:
+//   - DeadLetterQuery: the same narrowing, page-unbounded.
+func (q DeadLetterInventoryQuery) FilterQuery() DeadLetterQuery {
+	return DeadLetterQuery{
+		EventType:    q.EventType,
+		Topic:        q.Topic,
+		Status:       q.Status,
+		OccurredFrom: q.OccurredFrom,
+		OccurredTo:   q.OccurredTo,
+	}
 }
 
 // DeadLetterInventoryPage is one page of the inventory, plus what a caller needs to ask for
@@ -2491,26 +2665,6 @@ type DeadLetterQuery struct {
 	// contain would match nothing, and an empty page reads as "nothing is stuck".
 	Status string
 
-	// UnresolvedOnly restricts the result to rows no operator has accounted for.
-	//
-	// It is the narrowing triage actually starts from: once retention is enabled, resolved
-	// rows accumulate in the inventory until their period elapses, and an operator asking
-	// "what is still outstanding?" must not have to read past them. The dead-letter age
-	// gauge reads the same subset, so the number an operator sees and the number
-	// DeadLetterMessageStuck fires on are drawn from one predicate.
-	//
-	// A `failed` row can never be resolved — its dead-letter write is still owed — so this
-	// narrows the dead_lettered population only.
-	UnresolvedOnly bool
-
-	// ResolvedOnly restricts the result to rows an operator HAS accounted for, which is how
-	// the backlog awaiting retention is inspected.
-	//
-	// Setting both this and UnresolvedOnly asks for rows that cannot exist; see
-	// Contradictory, which names that rather than letting SQL return an empty page an
-	// operator would read as "nothing is stuck".
-	ResolvedOnly bool
-
 	// OccurredFrom and OccurredTo bound the event's OCCURRENCE instant, inclusively,
 	// and either may be zero to leave that end unbounded.
 	//
@@ -2546,9 +2700,7 @@ func (q DeadLetterQuery) Filtered() bool {
 		strings.TrimSpace(q.Topic) != "" ||
 		strings.TrimSpace(q.Status) != "" ||
 		!q.OccurredFrom.IsZero() ||
-		!q.OccurredTo.IsZero() ||
-		q.UnresolvedOnly ||
-		q.ResolvedOnly
+		!q.OccurredTo.IsZero()
 }
 
 // IsEmpty reports whether the query narrows nothing, so a caller can tell a page of
@@ -2561,18 +2713,6 @@ func (q DeadLetterQuery) Filtered() bool {
 //   - bool: true for the zero value.
 func (q DeadLetterQuery) IsEmpty() bool {
 	return !q.Filtered()
-}
-
-// Contradictory reports whether the query asks for rows that cannot exist.
-//
-// Only one combination can: resolved and unresolved at once. It is worth naming rather than
-// letting SQL return zero rows, because an empty page in this endpoint reads as "nothing is
-// stuck" and that is the answer least safe to give by accident.
-//
-// Returns:
-//   - bool: true when the narrowing is self-contradictory.
-func (q DeadLetterQuery) Contradictory() bool {
-	return q.UnresolvedOnly && q.ResolvedOnly
 }
 
 // EventOutboxStatuses returns EVERY state in the outbox state machine, in
@@ -3826,6 +3966,28 @@ type EventSubscriber struct {
 	// issuance refuses a row marked pending revocation.
 	CredentialOrphanedAt *time.Time `json:"credential_orphaned_at,omitempty"`
 
+	// --- Settlement obligations the background pass owes ---
+
+	// GrantReconcilePendingAt and CredentialCleanupPendingAt are the two settlement markers,
+	// stamped when a broker-side step could not be completed and cleared only once it has been.
+	//
+	// They were already columns, already written by the settlement paths and already counted by
+	// the residue aggregate — but they were NOT on this struct, and so were invisible to every
+	// predicate a lifecycle path consults. A row whose ACL grant was never created, or whose
+	// credential Blnk intended to destroy and could not, therefore read as an ordinary row to
+	// the guard that decides whether broker work can be confirmed.
+	//
+	// GrantReconcilePendingAt means the recorded authorization is WIDER than the broker's, so a
+	// grant this row describes may not exist. CredentialCleanupPendingAt means a SCRAM credential
+	// may exist that Blnk intended to destroy, or the recorded reference names one that no longer
+	// works — which is the direction that matters, because a credential nothing accounts for
+	// still authenticates.
+	//
+	// Both keep their FIRST instant on repeated stamping, because the age of the obligation is
+	// what an operator alerts on rather than the age of the latest attempt.
+	GrantReconcilePendingAt    *time.Time `json:"grant_reconcile_pending_at,omitempty"`
+	CredentialCleanupPendingAt *time.Time `json:"credential_cleanup_pending_at,omitempty"`
+
 	// --- Row bookkeeping ---
 
 	CreatedAt time.Time `json:"created_at"`
@@ -3870,7 +4032,7 @@ func (s *EventSubscriber) HasTopicAccess(topic string) bool {
 //
 // # Why it trims
 //
-// The presence predicates — RequiresClientSideKeyFiltering and KeyScopeUnenforceable —
+// The presence predicates — RequiresClientSideKeyFiltering and DeclaresKeyScope —
 // trim before deciding whether a scope is recorded at all, and this accessor did not.
 // The two therefore disagreed about exactly one value: a whitespace-only prefix, which
 // the predicates read as "no scope" while HasKeyAccess and EffectiveKeyScope read as a
@@ -3886,34 +4048,6 @@ func (s *EventSubscriber) RequestedKeyScope() string {
 	}
 
 	return strings.TrimSpace(*s.PartitionKeyPrefix)
-}
-
-// RequiresKeyScopeEnforcement reports whether this subscriber asked for a boundary
-// narrower than a whole topic, and therefore whether anything remains to be enforced
-// after the broker has checked the topic and group ACLs.
-//
-// True means the recorded boundary CANNOT BE EXPRESSED AS A KAFKA ACL, so whatever
-// narrowing it describes has to happen above the broker.
-//
-// IT DOES NOT GATE A REFUSAL, and an earlier revision of this comment said it did.
-// Issuance used to fail closed on this predicate, which withdrew the mandatory
-// credential capability from every subscriber that recorded a prefix; that refusal is
-// gone. What the boundary produces now is a declaration on the credential response —
-// see RequiresClientSideKeyFiltering, which is the predicate the response is built
-// from, and api/model.SubscriberEnforcedAccess, which carries it.
-//
-// The two predicates say the same thing about every persistable row and differ only
-// on a whitespace-only prefix, which normalizeSubscriberKeyScope refuses to store.
-// This one reads the scope verbatim through RequestedKeyScope, so it is the
-// conservative reading and is what a component reasoning about ENFORCEABILITY should
-// consult; RequiresClientSideKeyFiltering trims, so it is what a WIRE RESPONSE should
-// be built from. TestEventSubscriber_RequiresClientSideKeyFilteringTreatsABlankPrefixAsAbsent
-// records the asymmetry as unreachable defence-in-depth rather than intent.
-//
-// It differs from DeclaresKeyScope only in reading the flattened accessor, and it keeps
-// its own name because it is the question a caller deciding what to DISCLOSE asks.
-func (s *EventSubscriber) RequiresKeyScopeEnforcement() bool {
-	return s.RequestedKeyScope() != ""
 }
 
 // HasKeyAccess reports whether this subscriber is entitled to a record carrying the
@@ -4059,6 +4193,96 @@ func (s *EventSubscriber) IsProvisioned() bool {
 	return s != nil && s.CredentialReference != nil && *s.CredentialReference != ""
 }
 
+// MayHaveBrokerCredential reports whether a means of authenticating as this row's principal
+// MIGHT exist at a broker.
+//
+// # Why the question is "might" and not "does"
+//
+// This is the guard that decides whether an operation which cannot reach a broker is allowed to
+// proceed as though there were nothing at a broker to act on. The only safe answer to that
+// question is drawn from the row's own evidence, and the evidence is one-sided: Blnk can be
+// certain a credential was written, but it can never be certain one was not, because the failure
+// modes that lose the record are exactly the ones that leave the credential behind.
+//
+// So this predicate is the UNION of every state that can coexist with a live credential, and it
+// is deliberately conservative. A false positive costs a retryable refusal; a false negative
+// costs a live SASL credential with live ACL bindings, left at a broker with nothing anywhere
+// naming the principal it belongs to and no row to retry from.
+//
+// # The three states, and why each one has to be here
+//
+//   - A CREDENTIAL REFERENCE: a credential was written for this principal and has not been
+//     confirmed removed. This is the certain case and was the only one IsProvisioned tested.
+//   - AN ORPHAN MARKER: an issuance wrote the credential at the broker and then could neither
+//     record nor revoke it, so the reference is NIL while a means of authenticating exists. This
+//     is the state the reference test gets exactly backwards — the absence of the record IS the
+//     evidence — and it is how a deletion once removed the only row naming a live principal.
+//   - A CLEANUP OBLIGATION: a credential Blnk intended to destroy may still exist, or the
+//     recorded reference names one that no longer works. Either way the broker's state is
+//     unconfirmed, and the direction of the doubt is that something authenticates.
+//
+// # The two markers deliberately NOT included, and why each exclusion is safe
+//
+// GrantReconcilePendingAt means the recorded authorization is WIDER than the broker's — a grant
+// that may not exist. That is the safe direction: no authentication follows from a missing ACL
+// binding, and blocking a deletion on it would strand rows whose only defect is that they promise
+// less access than they were given.
+//
+// RevocationPendingAt is NOT credential evidence, and including it would be actively harmful.
+// It is a tombstone stamped by deregistration BEFORE the broker is touched, so a deregistration
+// consults this predicate on a row it has just marked — and a predicate that answered true for
+// its own tombstone would make deregistration impossible in a deployment that never configured
+// Kafka, which is a supported steady state. It also adds nothing: a tombstoned row that ever held
+// a credential still carries its reference, because the reference is cleared only after a
+// confirmed revocation. Grants and widenings for a tombstoned row are refused separately, by the
+// active-subscriber guard, which is where that concern belongs.
+//
+// # A nil receiver answers false
+//
+// Matching IsProvisioned and IsRevocationPending, for the reason all three share: the
+// repository's not-found representation is a nil pointer, and a guard that panics where it is
+// supposed to refuse is worse than no guard at all. A subscriber that does not exist has no
+// credential.
+//
+// Returns:
+//   - bool: true when any of the three states above holds.
+func (s *EventSubscriber) MayHaveBrokerCredential() bool {
+	if s == nil {
+		return false
+	}
+
+	return s.IsProvisioned() ||
+		s.CredentialOrphanedAt != nil ||
+		s.CredentialCleanupPendingAt != nil
+}
+
+// BrokerCredentialEvidence names WHY MayHaveBrokerCredential answered true, for the log line and
+// the error detail that accompany a refusal.
+//
+// A refusal that says only "this subscriber may hold a credential" leaves an operator to work out
+// which of four states they are looking at, and the remedies differ: an orphan is settled by
+// RE-ISSUING, a tombstone by retrying the DEREGISTRATION, a cleanup obligation by letting the
+// settlement pass run or forcing a revocation. Naming the state is what makes the refusal
+// actionable rather than merely correct.
+//
+// Returns:
+//   - string: a short phrase naming the strongest evidence, or "" when there is none. The order
+//     is by certainty: a recorded reference is a fact, the markers are possibilities.
+func (s *EventSubscriber) BrokerCredentialEvidence() string {
+	switch {
+	case s == nil:
+		return ""
+	case s.IsProvisioned():
+		return "the registry records an issued credential for this principal"
+	case s.CredentialOrphanedAt != nil:
+		return "an issuance left a credential at the broker that Blnk could neither record nor revoke"
+	case s.CredentialCleanupPendingAt != nil:
+		return "a credential this row intended to destroy has not been confirmed destroyed"
+	default:
+		return ""
+	}
+}
+
 // IsMigrated reports whether the subscriber has completed its move from legacy
 // HTTP webhook delivery to Kafka consumption. A nil MigratedAt means not yet
 // migrated, which is what dual-window migration-progress reporting counts.
@@ -4086,14 +4310,17 @@ func (s *EventSubscriber) IsRevocationPending() bool {
 // RequiresClientSideKeyFiltering reports whether the subscriber records a partition key prefix
 // whose narrowing the SUBSCRIBER has to apply itself, because the broker will not.
 //
-// # It states a fact, and it used to state a verdict
+// # It states a fact, and it must not be read as a verdict
 //
-// This predicate was called KeyScopeUnenforceable and credential issuance FAILED CLOSED on it:
-// a subscriber recording a prefix could never obtain a credential, permanently, and the
-// mandatory credential endpoint answered 409 for it forever. The intent was honesty — a
-// topic-level credential is wider than a key-scoped row appears to describe — but the effect was
-// to withdraw a required capability, and it withdrew it for a state the registry is explicitly
-// designed to hold.
+// The name says what the SUBSCRIBER must do, not what Blnk refuses to do, and the distinction is
+// the whole reason it is worded this way. An earlier predicate over this same column was named
+// for unenforceability, and credential issuance failed closed on it: a subscriber recording a
+// prefix could never obtain a credential, permanently, and the mandatory credential endpoint
+// answered 409 for it forever. The intent was honesty — a topic-level credential is wider than a
+// key-scoped row appears to describe — but the effect was to withdraw a required capability, and
+// it withdrew it for a state the registry is explicitly designed to hold. That predicate has been
+// removed rather than merely re-documented, so no future caller can reach for a name that
+// implies a refusal this package no longer performs.
 //
 // Kafka's authorizer has FIVE resource types — Topic, Group, Cluster, TransactionalId and
 // DelegationToken — and none of them is a message key. There is no binding, pattern type or
@@ -5497,20 +5724,6 @@ func (s *EventSubscriber) DeclaresUnenforceableIsolation() bool {
 	return s != nil && s.PartitionKeyPrefix != nil && strings.TrimSpace(*s.PartitionKeyPrefix) != ""
 }
 
-// KeyScopeUnenforceable reports whether the subscriber records a key-scoped
-// authorization constraint that Kafka cannot enforce.
-//
-// It is the predicate credential issuance fails closed on. A non-empty prefix means
-// the recorded authorization is narrower than any credential Blnk can mint, so the
-// honest answer is to refuse rather than to issue whole-topic access under a row
-// that says otherwise. The empty string is treated as absent for the same reason the
-// column is nullable: "a constraint on the empty prefix" is not an intent anybody
-// has, and reading it as one would refuse a subscriber that asked for nothing.
-// A nil receiver answers false, for the reason given on IsRevocationPending.
-func (s *EventSubscriber) KeyScopeUnenforceable() bool {
-	return s != nil && s.PartitionKeyPrefix != nil && strings.TrimSpace(*s.PartitionKeyPrefix) != ""
-}
-
 // DeclaresKeyScope reports whether this subscriber records a partition-key scope.
 //
 // # What the property is, and where it is checked
@@ -5582,12 +5795,13 @@ const (
 
 // KeyScopeEnforcement reports where this subscriber's key scope is enforced.
 //
-// This is the accessor that replaced the refusal predicate KeyScopeUnenforceable. The
-// difference is not cosmetic: the old name asserted that a recorded prefix could not be
-// honoured, and three separate barriers — issuance, update and a CHECK constraint — read
-// it as licence to deny the subscriber a credential entirely. Reporting the enforcement
-// POINT instead lets the credential be issued with the boundary the broker really keeps,
-// while every surface that shows the prefix shows this value beside it.
+// This is the accessor that replaced a boolean predicate named for unenforceability, which
+// has since been deleted outright. The difference is not cosmetic: the old name asserted
+// that a recorded prefix could not be honoured, and three separate barriers — issuance,
+// update and a CHECK constraint — read it as licence to deny the subscriber a credential
+// entirely. Reporting the enforcement POINT instead lets the credential be issued with the
+// boundary the broker really keeps, while every surface that shows the prefix shows this
+// value beside it.
 //
 // A nil receiver answers KeyScopeEnforcementNone, because a subscriber that does not
 // exist has recorded nothing — and because this is read on rows loaded from a repository

@@ -685,6 +685,23 @@ func (s *eventIsolationStore) CountEventSubscribers(_ context.Context) (int64, e
 	return int64(len(s.rows)), nil
 }
 
+// ListAndCountEventSubscribers answers the page and the total from one observation of the
+// fake's state, under a single lock acquisition, matching the repository's single snapshot.
+func (s *eventIsolationStore) ListAndCountEventSubscribers(
+	ctx context.Context,
+	query model.SubscriberPageQuery,
+) (model.SubscriberPage, int64, error) {
+	page, err := s.ListEventSubscribers(ctx, query)
+	if err != nil {
+		return model.SubscriberPage{}, 0, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return page, int64(len(s.rows)), nil
+}
+
 // ListEventSubscribers pages the registry. Ordering is unspecified here because nothing in
 // this file depends on it; the isolation assertions address subscribers by key.
 func (s *eventIsolationStore) ListEventSubscribers(
@@ -720,9 +737,9 @@ func (s *eventIsolationStore) UpdateEventSubscriber(
 	_ context.Context,
 	subscriber *model.EventSubscriber,
 	fenceToken string,
-) error {
+) (*model.EventSubscriber, error) {
 	if subscriber == nil {
-		return apierror.NewAPIError(
+		return nil, apierror.NewAPIError(
 			apierror.ErrGenValidation,
 			"A subscriber is required",
 			errors.New("event isolation store: subscriber is nil"),
@@ -733,7 +750,7 @@ func (s *eventIsolationStore) UpdateEventSubscriber(
 	defer s.mu.Unlock()
 
 	if err := s.fencedWriteGuardLocked(subscriber.SubscriberID, fenceToken, true); err != nil {
-		return err
+		return nil, err
 	}
 
 	existing := s.rows[strings.TrimSpace(subscriber.SubscriberID)]
@@ -745,7 +762,11 @@ func (s *eventIsolationStore) UpdateEventSubscriber(
 	row.UpdatedAt = time.Now().UTC()
 	s.rows[row.SubscriberID] = row
 
-	return nil
+	// The STORED row, matching RETURNING: the caller must never answer with the copy it handed in,
+	// because that copy carries the updated_at it read before this write.
+	stored := row
+
+	return &stored, nil
 }
 
 // TakeEventSubscriber removes a subscriber and returns the row it removed, so the caller

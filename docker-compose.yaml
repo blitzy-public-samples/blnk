@@ -1128,7 +1128,7 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
       # The rule directory prometheus.yml's rule_files glob resolves against. Without
-      # this mount the stanza matches nothing and ALL EIGHT alert rules are inert, with no
+      # this mount the stanza matches nothing and ALL 13 alert rules are inert, with no
       # startup error to notice, so the mount and the glob have to be kept in step.
       # Mounted as a directory so a rule file added later needs no edit here.
       - ./alerts:/etc/prometheus/alerts:ro

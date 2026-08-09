@@ -1468,9 +1468,10 @@ func startEventRetention(ctx context.Context, instance *blnk.Blnk) func() {
 	if obstacle := sweeper.StartupObstacle(); obstacle != nil {
 		if errors.Is(obstacle, blnk.ErrEventRetentionDisabled) {
 			logrus.Info(
-				"event outbox retention is disabled; delivered and dead-lettered event rows are kept " +
-					"indefinitely. Set RELAY_EVENT_RETENTION_DAYS to a positive number of days to have " +
-					"them deleted after that period",
+				"event outbox retention is disabled; delivered event rows are kept indefinitely. Set " +
+					"RELAY_EVENT_RETENTION_DAYS to a positive number of days to have them deleted after " +
+					"that period. Dead-lettered rows are never deleted by age whatever this is set to: " +
+					"a replay the broker acknowledges is what turns one into a deletable receipt",
 			)
 
 			return func() {}
@@ -1478,7 +1479,7 @@ func startEventRetention(ctx context.Context, instance *blnk.Blnk) func() {
 
 		withLoggableCause(nil, obstacle).Warn(
 			"event outbox retention is configured but the sweeper could not start, so nothing will " +
-				"delete delivered or dead-lettered event rows",
+				"delete delivered event rows",
 		)
 
 		return func() {}

@@ -446,6 +446,18 @@ type WebhookSunsetSnapshot struct {
 	// that state fails closed. Take the verdict from Passed and nothing else.
 	DateConfigured bool
 
+	// WindowStart is the instant the dual-delivery window OPENED, in UTC, derived from
+	// the same configuration read Date came from. Meaningful only when DateConfigured is
+	// true; otherwise it is the zero time and must not be rendered.
+	//
+	// It is here because the HTTP guards render RFC 9745's Deprecation header from it and
+	// used to obtain it from a SECOND call to WebhookDeprecationWindow. That call performs
+	// its own resolution — and internally its own second configuration read — so a reload
+	// landing in between produced a Deprecation header describing one window's opening
+	// beside a Sunset header describing another window's close. RFC 9745 §4 requires the
+	// two to be ordered, and two independently-resolved values cannot be shown to be.
+	WindowStart time.Time
+
 	// Passed is the verdict, evaluated against the instant the caller supplied and
 	// against the same resolution Date came from.
 	Passed bool
@@ -469,13 +481,61 @@ type WebhookSunsetSnapshot struct {
 // Returns:
 //   - WebhookSunsetSnapshot: the date, whether it is renderable, and the verdict.
 func WebhookSunsetSnapshotAt(now time.Time) WebhookSunsetSnapshot {
-	sunset, resolution := resolveWebhookSunset()
+	start, sunset, resolution := resolveWebhookWindow()
 
 	return WebhookSunsetSnapshot{
 		Date:           sunset,
 		DateConfigured: resolution == sunsetResolved,
+		WindowStart:    start,
 		Passed:         webhookSunsetPassedFor(sunset, resolution, now),
 	}
+}
+
+// resolveWebhookWindow resolves BOTH ends of the retirement window and the resolution that
+// produced them from ONE read of the configuration store.
+//
+// # Why one read rather than two convenient ones
+//
+// config.ConfigStore is an atomic.Value whose contents are replaced WHOLESALE on reload, so
+// every independent read is a chance to observe a different generation. Composing the window
+// out of two reads therefore produced a window whose two ends could come from different
+// configurations — and the composition was doing exactly that twice over: resolveWebhookSunset
+// reads the store to parse the sunset, and the caller then read it again to derive the start.
+//
+// The consequence was not theoretical. The two ends are rendered into the Sunset and Deprecation
+// headers of one response, and RFC 9745 §4 requires the deprecation instant to precede the
+// sunset instant. Two ends drawn from different generations can violate that ordering, and the
+// response would carry the violation with nothing to disclose it. The window for the race is
+// narrow, which is why it is closed structurally: it cannot be reproduced on demand and would
+// never be caught by watching for it.
+//
+// Reading once also makes the start and the sunset consistent by construction rather than by
+// convention — webhookWindowStart derives the start FROM the sunset, so handing it a sunset that
+// came from a different configuration than its own cnf argument is precisely the mismatch.
+//
+// Returns:
+//   - time.Time: the window's opening instant in UTC, or the zero time when the sunset did not
+//     resolve.
+//   - time.Time: the sunset instant as webhookSunsetInstant reported it, which callers needing a
+//     verdict must pass to webhookSunsetPassedFor together with the resolution. It is NOT zeroed
+//     on an unresolved reading, because the fail-closed verdict depends on the pair.
+//   - webhookSunsetResolution: which of the situations applies.
+func resolveWebhookWindow() (time.Time, time.Time, webhookSunsetResolution) {
+	cnf, err := fetchConfiguration()
+	if err != nil {
+		withLoggableCause(nil, err).Debug(
+			"configuration is not loaded; treating the webhook sunset as not yet passed",
+		)
+
+		return time.Time{}, time.Time{}, sunsetAbsentNoTransport
+	}
+
+	sunset, resolution := webhookSunsetInstant(cnf)
+	if resolution != sunsetResolved {
+		return time.Time{}, sunset, resolution
+	}
+
+	return webhookWindowStart(cnf, sunset), sunset, resolution
 }
 
 // WebhookSunsetPassedNow reports whether the webhook sunset has passed as of the
@@ -692,17 +752,15 @@ func WebhookDualDeliveryActive(now time.Time) bool {
 //   - bool: true only when a sunset is configured and parses, in which case both
 //     instants are meaningful. When false, both are zero and must not be rendered.
 func WebhookDeprecationWindow() (time.Time, time.Time, bool) {
-	sunset, resolution := resolveWebhookSunset()
+	// Delegated so that "the window" has ONE resolution in this package. This used to read the
+	// configuration store twice — once through resolveWebhookSunset and once for the start — and
+	// could therefore return a start and a sunset drawn from different generations.
+	start, sunset, resolution := resolveWebhookWindow()
 	if resolution != sunsetResolved {
 		return time.Time{}, time.Time{}, false
 	}
 
-	cnf, err := fetchConfiguration()
-	if err != nil {
-		cnf = nil
-	}
-
-	return webhookWindowStart(cnf, sunset), sunset, true
+	return start, sunset, true
 }
 
 // WebhookWindowObstacle describes why a process that publishes to Kafka must not start on

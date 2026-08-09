@@ -26,7 +26,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/segmentio/kafka-go"
 	"github.com/sirupsen/logrus"
@@ -145,14 +144,6 @@ const (
 	// declared a lower bound for is a sound trade; a page that under-reports its
 	// contents silently is not.
 	deadLetterScanMaxRows = 5000
-
-	// maxDeadLetterResolutionNoteLength bounds an operator's resolution note, in runes.
-	//
-	// 1,024 is room for a sentence of explanation and a ticket reference — which is what
-	// the note is for — without turning a triage record into a document store. It is
-	// bounded at all because the value is stored and then projected back out by the
-	// listing, so an unbounded note becomes an unbounded field in every response.
-	maxDeadLetterResolutionNoteLength = 1024
 )
 
 // replayAttemptOffset is added to an exhausted row's attempt count to label the
@@ -594,20 +585,6 @@ type DeadLetterListOptions struct {
 	// page reads to an operator as "nothing is stuck".
 	OccurredFrom time.Time
 	OccurredTo   time.Time
-
-	// Resolution narrows by whether an operator has accounted for the entry.
-	//
-	// It is the filter triage actually starts from: once retention is enabled, resolved
-	// rows accumulate in the inventory until their period elapses, and an operator asking
-	// "what is still outstanding?" must not have to read past them. The dead-letter age
-	// gauge reads the same subset, so the number an operator sees and the number the
-	// DeadLetterMessageStuck alert fires on are drawn from one predicate.
-	//
-	// A TRI-STATE rather than a *bool because it is read from a query string and rendered
-	// into a SQL predicate, and both of those want a named vocabulary — and because it
-	// makes "resolved and unresolved at once" unrepresentable rather than merely refused.
-	// The zero value returns both, which is the honest default for an inventory endpoint.
-	Resolution DeadLetterResolutionFilter
 }
 
 // filtered reports whether any narrowing was requested.
@@ -651,30 +628,26 @@ func (o DeadLetterListOptions) filtered() bool {
 //   - model.DeadLetterInventoryQuery: the repository-facing keyset query.
 func (o DeadLetterListOptions) inventoryQuery() model.DeadLetterInventoryQuery {
 	return model.DeadLetterInventoryQuery{
-		Limit:          o.Limit,
-		EventType:      o.EventType,
-		Topic:          o.Topic,
-		Status:         o.Status,
-		Cursor:         o.Cursor,
-		OccurredFrom:   o.OccurredFrom,
-		OccurredTo:     o.OccurredTo,
-		UnresolvedOnly: o.Resolution == DeadLetterResolutionUnresolved,
-		ResolvedOnly:   o.Resolution == DeadLetterResolutionResolved,
+		Limit:        o.Limit,
+		EventType:    o.EventType,
+		Topic:        o.Topic,
+		Status:       o.Status,
+		Cursor:       o.Cursor,
+		OccurredFrom: o.OccurredFrom,
+		OccurredTo:   o.OccurredTo,
 	}
 }
 
 // - model.DeadLetterQuery: the same narrowing and page, in repository terms.
 func (o DeadLetterListOptions) deadLetterQuery() model.DeadLetterQuery {
 	return model.DeadLetterQuery{
-		EventType:      o.EventType,
-		Topic:          o.Topic,
-		Status:         o.Status,
-		OccurredFrom:   o.OccurredFrom,
-		OccurredTo:     o.OccurredTo,
-		UnresolvedOnly: o.Resolution == DeadLetterResolutionUnresolved,
-		ResolvedOnly:   o.Resolution == DeadLetterResolutionResolved,
-		Limit:          o.Limit,
-		Offset:         o.Offset,
+		EventType:    o.EventType,
+		Topic:        o.Topic,
+		Status:       o.Status,
+		OccurredFrom: o.OccurredFrom,
+		OccurredTo:   o.OccurredTo,
+		Limit:        o.Limit,
+		Offset:       o.Offset,
 	}
 }
 
@@ -787,22 +760,27 @@ type eventDeadLetterStore interface {
 	//
 	// It is the repository-layer twin of CountDeadLetteredEvents above: one finding — a
 	// filtered listing that could not be given a total — was answered over each of the two
-	// listing predicates, and both answers are exercised by the repository's own tests. The
-	// service reads CountDeadLetteredEvents, whose narrowing the listing's call recorder
-	// observes; this one is retained so the inventory projection keeps a count built from
-	// its OWN predicate rather than from one that merely resembles it.
+	// listing predicates, and both answers are exercised by the repository's own tests. It is
+	// what a count asked for on its OWN, without a page, is served from.
 	CountDeadLetterInventory(ctx context.Context, query model.DeadLetterQuery) (int64, error)
+
+	// ListAndCountDeadLetterInventory answers the page and its total from ONE SNAPSHOT, and is
+	// what a listing that asked for a total reads.
+	//
+	// Sharing a predicate was never sufficient on its own. Two statements on two connections
+	// observe two populations, so an entry dead-lettered between them is counted by one and
+	// absent from the other and the total then describes a set the page is not a slice of —
+	// which on a triage endpoint reads as a different amount of stuck work than there is. The
+	// count's narrowing is DERIVED from the page's here rather than assembled beside it, so the
+	// two cannot describe different filters either.
+	ListAndCountDeadLetterInventory(
+		ctx context.Context,
+		query model.DeadLetterInventoryQuery,
+	) (model.DeadLetterInventoryPage, int64, error)
 
 	// CountEventOutboxByStatus returns a status-keyed count of every row, which is how
 	// the age scan sizes its window without a bespoke query.
 	CountEventOutboxByStatus(ctx context.Context, since time.Time) (map[string]int64, error)
-
-	// MarkEventDeadLetterResolved records that an operator has accounted for a
-	// dead-lettered event. It is the ONLY thing that makes such a row eligible for the
-	// retention purge, and it is conditional on the dead_lettered state and an unset
-	// resolution so a row still owing its `<topic>.dlt` write cannot be marked handled
-	// and an existing resolution cannot be overwritten.
-	MarkEventDeadLetterResolved(ctx context.Context, eventID string, note string, at time.Time) (*model.EventOutbox, error)
 
 	// MarkEventDeadLettered records the dead-letter topic and metadata and moves the row
 	// to its dead-lettered terminal state, CONDITIONAL on the caller still holding the
@@ -1815,6 +1793,82 @@ func (s *EventDeadLetterService) ListDeadLetterEvents(
 	)
 
 	return page, nil
+}
+
+// ListAndCountDeadLetterEvents returns one page of the inventory together with how many entries
+// the same narrowing matches, both drawn from ONE DATABASE SNAPSHOT.
+//
+// # Why this exists beside the two single-purpose reads
+//
+// A caller asking for a page and a total used to make two calls, and the response then asserted
+// a relationship between the two answers that nothing established: an entry dead-lettered
+// between them is counted by one read and absent from the other. A total that describes a set
+// the page is not a slice of is not a rounding error on this endpoint — an operator triaging a
+// backlog reads it as how much work is stuck, and a paging client comparing the page against the
+// total does not terminate.
+//
+// The two single-purpose reads remain, because a caller that wants only a page or only a total
+// should not pay for a transaction. This is the path for the caller that wants both and needs
+// them to agree.
+//
+// What it does NOT promise is that paging to the total exhausts the matches: paging spans many
+// requests over a live inventory that the relay adds to and a replay removes from. The total is
+// exact as at this page.
+//
+// Parameters:
+//   - ctx context.Context: cancels the read.
+//   - opts DeadLetterListOptions: the page and its narrowing. The count applies the same
+//     narrowing and ignores the page.
+//
+// Returns:
+//   - model.DeadLetterInventoryPage: the page, as ListDeadLetterEvents.
+//   - int64: how many entries the narrowing matches in the same snapshot.
+//   - error: a validation error for an unusable status filter or a reversed occurrence window,
+//     or the repository's own typed error.
+func (s *EventDeadLetterService) ListAndCountDeadLetterEvents(
+	ctx context.Context,
+	opts DeadLetterListOptions,
+) (model.DeadLetterInventoryPage, int64, error) {
+	ctx, span := tracer.Start(ctx, "ListAndCountDeadLetterEvents")
+	defer span.End()
+
+	if s == nil || s.store == nil {
+		return model.DeadLetterInventoryPage{}, 0, apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"Listing dead-lettered events requires a datasource",
+			errors.New("blnk: the dead-letter service has no datasource"),
+		)
+	}
+
+	normalized, err := normalizeDeadLetterListOptions(opts)
+	if err != nil {
+		span.RecordError(err)
+
+		return model.DeadLetterInventoryPage{}, 0, err
+	}
+
+	span.SetAttributes(deadLetterListSpanAttributes(normalized)...)
+
+	page, total, err := s.store.ListAndCountDeadLetterInventory(ctx, normalized.inventoryQuery())
+	if err != nil {
+		span.RecordError(err)
+
+		return model.DeadLetterInventoryPage{}, 0, err
+	}
+
+	// Defensive, exactly as in ListDeadLetterEvents: a handler marshals this directly and [] is
+	// the right empty JSON, not null.
+	if page.Entries == nil {
+		page.Entries = []model.DeadLetterInventoryEntry{}
+	}
+
+	span.SetAttributes(
+		attribute.Int("dead_letter.returned", len(page.Entries)),
+		attribute.Bool("dead_letter.has_more", page.HasMore),
+		attribute.Int64("dead_letter.total", total),
+	)
+
+	return page, total, nil
 }
 
 // CountDeadLetterEvents reports how many inventory entries the SAME narrowing matches,
@@ -3019,21 +3073,6 @@ func normalizeDeadLetterListOptions(opts DeadLetterListOptions) (DeadLetterListO
 		)
 	}
 
-	// A resolution value OUTSIDE the vocabulary is refused rather than rendered. The failure
-	// mode it prevents: an unrecognised value falling through to "narrow nothing", so the
-	// caller receives the whole inventory believing it is a subset — and an inventory endpoint
-	// answering with more than was asked for reads as less loss than there is, in the one
-	// direction that matters.
-	switch opts.Resolution {
-	case DeadLetterResolutionAny, DeadLetterResolutionUnresolved, DeadLetterResolutionResolved:
-	default:
-		return opts, apierror.NewAPIError(
-			apierror.ErrGenValidation,
-			"A dead-letter resolution filter must be unset, \"resolved\" or \"unresolved\"",
-			fmt.Errorf("blnk: unsupported dead-letter resolution filter %d", opts.Resolution),
-		)
-	}
-
 	if !opts.OccurredFrom.IsZero() && !opts.OccurredTo.IsZero() && opts.OccurredFrom.After(opts.OccurredTo) {
 		return opts, apierror.NewAPIError(
 			apierror.ErrGenValidation,
@@ -3213,8 +3252,33 @@ func (b *Blnk) ListDeadLetterEvents(
 	return b.EventDeadLetters().ListDeadLetterEvents(ctx, opts)
 }
 
+// ListAndCountDeadLetterEvents pages the inventory and counts it from one snapshot. It is the
+// read behind GET /events/dead-letter?include_count=true.
+//
+// The page and the total used to be two calls, and an entry dead-lettered between them made the
+// total describe a set the page was not a slice of. Both are read inside one read-only
+// REPEATABLE READ transaction here, so they describe one population.
+//
+// No publisher is resolved: both reads are of the outbox table, so this works with the broker
+// down.
+//
+// Parameters:
+//   - ctx context.Context: cancels the read.
+//   - opts DeadLetterListOptions: the page and its narrowing.
+//
+// Returns:
+//   - model.DeadLetterInventoryPage: the page.
+//   - int64: the total the same narrowing matches, as at that page.
+//   - error: as EventDeadLetterService.ListAndCountDeadLetterEvents.
+func (b *Blnk) ListAndCountDeadLetterEvents(
+	ctx context.Context,
+	opts DeadLetterListOptions,
+) (model.DeadLetterInventoryPage, int64, error) {
+	return b.EventDeadLetters().ListAndCountDeadLetterEvents(ctx, opts)
+}
+
 // CountDeadLetterEvents counts the inventory a listing with the same options pages through.
-// It is the total behind GET /events/dead-letter?include_count=true.
+// It is the total behind a standalone count.
 //
 // It narrows through the SAME options type the listing takes, so a total is always of the
 // set the page came from. The alternative the API used to be limited to — a per-status
@@ -3331,211 +3395,3 @@ func (s *EventDeadLetterService) countFailedAwaitingDeadLetter(
 // however short the window is. It is stated explicitly rather than left to the repository's
 // fallback so the call site says what it is asking for.
 const deadLetterCountWindow = 24 * time.Hour
-
-// DeadLetterResolutionFilter selects by resolution state.
-//
-// A tri-state rather than a *bool because it is read from a query string and rendered
-// into a SQL predicate, and both of those want a named vocabulary: "any", "unresolved"
-// and "resolved" say what they mean at every layer, where a nil pointer requires the
-// reader to know which way round the absence goes.
-type DeadLetterResolutionFilter int
-
-const (
-	// DeadLetterResolutionAny returns resolved and unresolved entries alike. The zero
-	// value, so the unfiltered listing shows the whole inventory.
-	DeadLetterResolutionAny DeadLetterResolutionFilter = iota
-
-	// DeadLetterResolutionUnresolved returns only entries no operator has accounted
-	// for: the work still outstanding, and what the age gauge is computed from.
-	DeadLetterResolutionUnresolved
-
-	// DeadLetterResolutionResolved returns only entries an operator HAS accounted for,
-	// which is how the backlog awaiting retention is inspected.
-	DeadLetterResolutionResolved
-)
-
-// ResolveDeadLetterEvent records that an operator has accounted for a dead-lettered
-// event, which is the ONLY thing that makes the row eligible for retention.
-//
-// # SEC-08: why resolving is a distinct action rather than an implied one
-//
-// The retention purge used to select on status alone and delete dead-lettered rows on an
-// age timer. That destroyed the only record that a ledger event went undelivered, along
-// with the failure metadata explaining it and the row a replay is driven from — and it
-// destroyed the OLDEST such record first, which is the one most likely to have been
-// forgotten rather than handled. Nothing distinguished "someone dealt with this" from
-// "nobody ever looked", because nothing recorded the difference.
-//
-// This does. Until it is called the row stays, keeps feeding the dead-letter age gauge
-// and keeps the DeadLetterMessageStuck alert firing — which is the correct pressure, and
-// is what makes the retention period safe to set to a finite number of days.
-//
-// # What it deliberately does NOT do
-//
-// It does not replay, and a resolution is not a claim that the event was delivered. The
-// legitimate resolutions include "replayed successfully", "the subscriber was
-// decommissioned", "superseded by a later event" and "accepted as lost, ticket 4182" —
-// only the operator can tell which, which is why the note exists and why nothing here
-// infers it.
-//
-// It does not change the status either, so the event remains counted by the zero-loss
-// reconciliation (its message really is on the `.dlt` topic) and remains REPLAYABLE. A
-// resolution recorded in error costs nothing but a retention window; a resolution that
-// blocked a later replay could cost the event.
-//
-// Parameters:
-//   - ctx context.Context: cancels the write.
-//   - eventID string: the business event_id UUID from the route.
-//   - note string: the operator's account of why no further action is owed. Optional,
-//     trimmed, and bounded at maxDeadLetterResolutionNoteLength runes.
-//
-// Returns:
-//   - model.EventOutbox: the row as it now stands, carrying the resolution actually
-//     recorded rather than the one requested.
-//   - error: a validation error for a blank id or an unusable note; ErrEventNotFound
-//     (404); ErrEventAlreadyResolved (409); ErrEventNotDeadLettered (409) when the row
-//     has no dead-letter record to resolve; the repository's typed error otherwise.
-func (s *EventDeadLetterService) ResolveDeadLetterEvent(
-	ctx context.Context,
-	eventID string,
-	note string,
-) (model.EventOutbox, error) {
-	ctx, span := tracer.Start(ctx, "ResolveDeadLetterEvent")
-	defer span.End()
-
-	if s == nil || s.store == nil {
-		return model.EventOutbox{}, apierror.NewAPIError(
-			apierror.ErrInternalServer,
-			"Resolving a dead-lettered event requires a datasource",
-			errors.New("blnk: the dead-letter service has no datasource"),
-		)
-	}
-
-	eventID = strings.TrimSpace(eventID)
-	if eventID == "" {
-		return model.EventOutbox{}, apierror.NewAPIError(
-			apierror.ErrGenValidation,
-			"An event id is required to resolve a dead-lettered event",
-			errors.New("blnk: dead-letter resolution called with a blank event id"),
-		)
-	}
-
-	note, err := normalizeDeadLetterResolutionNote(note)
-	if err != nil {
-		span.RecordError(err)
-
-		return model.EventOutbox{}, err
-	}
-
-	span.SetAttributes(
-		attribute.String("dead_letter.event_id", hashLogIdentifier(eventID)),
-		attribute.Bool("dead_letter.note_supplied", note != ""),
-	)
-
-	resolved, err := s.store.MarkEventDeadLetterResolved(ctx, eventID, note, time.Now().UTC())
-	if err != nil {
-		span.RecordError(err)
-
-		return model.EventOutbox{}, err
-	}
-	if resolved == nil {
-		// Defensive: the repository returns a row or an error, never both nil. A nil
-		// here would otherwise reach the projection as a dereference.
-		return model.EventOutbox{}, apierror.NewAPIError(
-			apierror.ErrInternalServer,
-			"The dead-letter resolution reported neither a row nor an error",
-			errors.New("blnk: MarkEventDeadLetterResolved returned (nil, nil)"),
-		)
-	}
-
-	logrus.WithFields(logrus.Fields{
-		"event_id":      hashLogIdentifier(resolved.EventID),
-		"event_type":    boundedEventTypeLabel(resolved.EventType),
-		"dlt_topic":     boundedTopicLabel(resolved.DLTTopic),
-		"note_supplied": note != "",
-	}).Info(
-		"a dead-lettered event was resolved by an operator; the row is now eligible for " +
-			"retention and no longer counts towards the dead-letter age gauge",
-	)
-
-	span.SetAttributes(attribute.Bool("dead_letter.resolved", true))
-
-	return *resolved, nil
-}
-
-// normalizeDeadLetterResolutionNote trims and bounds the operator's note.
-//
-// The note is free text that is STORED and then PROJECTED back out by the listing, so it
-// is bounded for the same two reasons every operator-supplied label in this pipeline is:
-// an unbounded column becomes an unbounded field in every response, and a control
-// character corrupts the log line and the dashboard cell it lands in. The alphabet is
-// otherwise unrestricted — it is prose, in whatever language the operator writes.
-//
-// Parameters:
-//   - note string: the note as supplied. Empty is valid and means none.
-//
-// Returns:
-//   - string: the trimmed note, or empty.
-//   - error: a typed validation error when too long or containing control characters.
-func normalizeDeadLetterResolutionNote(note string) (string, error) {
-	trimmed := strings.TrimSpace(note)
-	if trimmed == "" {
-		return "", nil
-	}
-
-	if count := utf8.RuneCountInString(trimmed); count > maxDeadLetterResolutionNoteLength {
-		return "", apierror.NewAPIError(
-			apierror.ErrGenValidation,
-			fmt.Sprintf(
-				"A dead-letter resolution note must be at most %d characters",
-				maxDeadLetterResolutionNoteLength,
-			),
-			fmt.Errorf(
-				"blnk: dead-letter resolution note is %d characters, above the %d permitted",
-				count, maxDeadLetterResolutionNoteLength,
-			),
-		)
-	}
-
-	for _, character := range trimmed {
-		// Newlines included: the note is rendered in a single JSON field and echoed in
-		// one log line, and a note carrying line breaks splits both.
-		if character < 0x20 || character == 0x7f {
-			return "", apierror.NewAPIError(
-				apierror.ErrGenValidation,
-				"A dead-letter resolution note must not contain control characters",
-				errors.New(
-					"blnk: the dead-letter resolution note contains a control character, which "+
-						"corrupts every log line and dashboard cell it appears in",
-				),
-			)
-		}
-	}
-
-	return trimmed, nil
-}
-
-// ResolveDeadLetterEvent records that an operator has accounted for a dead-lettered event.
-// It is the write behind POST /events/dead-letter/:event_id/resolve, and it is what makes
-// the row eligible for the retention purge.
-//
-// No publisher is resolved: resolving touches the outbox row and nothing else. That is
-// deliberate rather than incidental — resolving is not a delivery, and an endpoint that
-// needed a broker to record an operator's decision would be unavailable in exactly the
-// incident that produced the backlog.
-//
-// Parameters:
-//   - ctx context.Context: cancels the write.
-//   - eventID string: the event's UUID.
-//   - note string: the operator's account of why no further action is owed. Optional.
-//
-// Returns:
-//   - model.EventOutbox: the row as it now stands.
-//   - error: as EventDeadLetterService.ResolveDeadLetterEvent.
-func (b *Blnk) ResolveDeadLetterEvent(
-	ctx context.Context,
-	eventID string,
-	note string,
-) (model.EventOutbox, error) {
-	return b.EventDeadLetters().ResolveDeadLetterEvent(ctx, eventID, note)
-}

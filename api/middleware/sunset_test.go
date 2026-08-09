@@ -438,6 +438,15 @@ func TestWebhookSunsetGuard_UnconfiguredRetirementKeepsAnswering(t *testing.T) {
 // a registered verb. The behavioural matrix above proves what the guard does; this proves where
 // api.Router puts it, which is what decides whether the guard is ever consulted.
 //
+// # It also pins the barrier's position relative to the middleware that can end a request
+//
+// Being installed globally and before authentication is not enough. The chain is assembled by TWO
+// functions — NewAPI, then Router on the engine NewAPI returned — so every Use in Router runs
+// after every Use in NewAPI. The barrier lived in Router while RateLimitMiddleware lived in
+// NewAPI, which meant a throttled request to a retired route was answered 429 and never reached
+// either guard. That position is invisible from any response that is not itself throttled, so it
+// is asserted here against the source.
+//
 // # Two layers, and which one may be global
 //
 // There are two guards and they are not interchangeable. WebhookSunsetPreAuthGuard matches the
@@ -474,12 +483,48 @@ func TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication(t *test
 	// not merely its presence.
 	type installation struct {
 		callee string
-		at     token.Pos
+		// enclosing is the function the installation sits in. It matters because the chain is
+		// assembled by TWO functions — NewAPI first, then Router on the engine NewAPI returned —
+		// so a file position only orders two installations that share a function. Across
+		// functions, "which function" IS the order.
+		enclosing string
+		at        token.Pos
+	}
+
+	// The function enclosing a position, resolved by containment rather than by name matching, so
+	// a helper added between the two does not silently make every installation "unknown".
+	enclosingFunc := func(pos token.Pos) string {
+		for _, declaration := range parsed.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+
+			if pos >= function.Body.Pos() && pos <= function.Body.End() {
+				return function.Name.Name
+			}
+		}
+
+		return ""
 	}
 
 	var preAuthInstallations []installation
 	var routeAttachments []installation
 	var authInstallations []installation
+	// The middlewares that can END a request before a later one is reached. The barrier must
+	// precede every one of them, or the refusal THEY issue becomes the answer a retired route
+	// gives. They end a request by different means, and both count:
+	//
+	//   - RateLimitMiddleware aborts outright with 429. This is the one M-5 was raised about.
+	//   - RequestSizeLimit does not abort; it swaps the body for a MaxBytesReader, so the 413
+	//     arrives later when something reads it. Ordering the barrier ahead of it is not strictly
+	//     required today for that reason, and it is asserted anyway: the guard reads no body, so
+	//     nothing is lost, and if this middleware is ever changed to refuse up front the barrier
+	//     is already in front of it.
+	abortingInstallations := map[string]*installation{
+		"middleware.RequestSizeLimit":    nil,
+		"middleware.RateLimitMiddleware": nil,
+	}
 
 	ast.Inspect(parsed, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
@@ -488,16 +533,29 @@ func TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication(t *test
 		}
 
 		for _, argument := range call.Args {
-			switch render(argument) {
+			rendered := render(argument)
+
+			// The aborting middlewares are constructed WITH ARGUMENTS, so their rendered form
+			// carries the argument text and cannot be matched exactly. The callee prefix is the
+			// stable part.
+			for name := range abortingInstallations {
+				if strings.HasPrefix(rendered, name+"(") {
+					abortingInstallations[name] = &installation{
+						callee: render(call.Fun), enclosing: enclosingFunc(call.Pos()), at: call.Pos(),
+					}
+				}
+			}
+
+			switch rendered {
 			case "middleware.WebhookSunsetPreAuthGuard()":
 				preAuthInstallations = append(preAuthInstallations,
-					installation{callee: render(call.Fun), at: call.Pos()})
+					installation{callee: render(call.Fun), enclosing: enclosingFunc(call.Pos()), at: call.Pos()})
 			case "middleware.WebhookSunsetGuard()":
 				routeAttachments = append(routeAttachments,
-					installation{callee: render(call.Fun), at: call.Pos()})
+					installation{callee: render(call.Fun), enclosing: enclosingFunc(call.Pos()), at: call.Pos()})
 			case "a.auth.Authenticate()":
 				authInstallations = append(authInstallations,
-					installation{callee: render(call.Fun), at: call.Pos()})
+					installation{callee: render(call.Fun), enclosing: enclosingFunc(call.Pos()), at: call.Pos()})
 			}
 		}
 
@@ -509,14 +567,48 @@ func TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication(t *test
 			"which requests never reach a route at all. Found: %v", preAuthInstallations)
 	require.Len(t, authInstallations, 1, "the authenticator must still be installed exactly once")
 
-	assert.Equal(t, "router.Use", preAuthInstallations[0].callee,
-		"the pre-auth guard must be installed GLOBALLY, with router.Use. Attached to a route "+
-			"instead it cannot answer for a method nobody registered, and those were exactly the "+
-			"methods answering 404 and 405 about a retired surface. Attached to a "+
+	assert.True(t, strings.HasSuffix(preAuthInstallations[0].callee, ".Use"),
+		"the pre-auth guard must be installed GLOBALLY, with Use on the engine. Attached to a "+
+			"route instead it cannot answer for a method nobody registered, and those were exactly "+
+			"the methods answering 404 and 405 about a retired surface. Attached to a "+
 			"/subscribers group it would retire the registry and the credential endpoint, which "+
-			"are the migration path away from the retired surface")
+			"are the migration path away from the retired surface. Got %q",
+		preAuthInstallations[0].callee)
 
-	assert.Less(t, preAuthInstallations[0].at, authInstallations[0].at,
+	// M-5: THE BARRIER MUST PRECEDE EVERY MIDDLEWARE THAT CAN ABORT, and it is installed in
+	// NewAPI precisely so that it does.
+	//
+	// It used to be installed in Router. Every Use in Router runs AFTER every Use in NewAPI, and
+	// NewAPI installs RequestSizeLimit and RateLimitMiddleware — both of which abort — so a
+	// throttled or oversized request to a retired route was answered 429 or 413 and never reached
+	// either sunset guard. A caller told to slow down and retry would retry a surface that is
+	// gone, forever. R-12 says every request answers 410, and "every request except the throttled
+	// ones" is not that.
+	require.Equal(t, "NewAPI", preAuthInstallations[0].enclosing,
+		"the barrier must be installed in NewAPI, which is the only function that runs before the "+
+			"aborting middleware it has to precede. Got %q", preAuthInstallations[0].enclosing)
+
+	for name, aborting := range abortingInstallations {
+		require.NotNil(t, aborting, "%s is expected in the chain; if it moved, this test must "+
+			"be told where, because the barrier's position is defined relative to it", name)
+		require.Equal(t, "NewAPI", aborting.enclosing,
+			"%s is expected in NewAPI alongside the barrier, so their file positions order them. "+
+				"Got %q", name, aborting.enclosing)
+
+		assert.Less(t, preAuthInstallations[0].at, aborting.at,
+			"the retirement barrier must be installed BEFORE %s. Installed after it, a request to "+
+				"a retired route is answered by %s instead of 410 — which is what happened when the "+
+				"barrier lived in Router", name, name)
+	}
+
+	// BEFORE AUTHENTICATION, still. Across functions the enclosing function IS the order: NewAPI
+	// builds the engine and returns it, Router then installs the authenticator on that same
+	// engine, so anything NewAPI installed necessarily runs first. Comparing file positions here
+	// would assert the wrong thing — Router is declared above NewAPI in this file.
+	require.Equal(t, "Router", authInstallations[0].enclosing,
+		"the authenticator is expected in Router; if it moves into NewAPI this test must compare "+
+			"positions instead of functions. Got %q", authInstallations[0].enclosing)
+	assert.NotEqual(t, authInstallations[0].enclosing, preAuthInstallations[0].enclosing,
 		"the pre-auth guard must be installed BEFORE the authenticator. After it, an "+
 			"unauthenticated request to a retired route is answered 401 and a wrongly-scoped one "+
 			"403 - neither is 410, and a caller told 401 will go on fixing credentials for a route "+
@@ -539,6 +631,9 @@ func TestAPIRouter_InstallsTheSunsetGuardGloballyAndBeforeAuthentication(t *test
 		"the per-route guard belongs on exactly the four retired verbs. Found: %v", routeAttachments)
 
 	for _, attachment := range routeAttachments {
+		assert.Equal(t, "Router", attachment.enclosing,
+			"the per-route attachments belong with the route registrations in Router: got %q",
+			attachment.enclosing)
 		assert.NotEqual(t, "router.Use", attachment.callee,
 			"WebhookSunsetGuard runs only after a route has matched, so installing it with router.Use "+
 				"leaves the retirement unable to answer an unregistered verb or an unauthenticated "+
@@ -785,6 +880,102 @@ func TestWebhookSunset_PreAuthGuardMatchesExactlyTheDeprecatedRoutes(t *testing.
 		t.Run(testCase.name, func(t *testing.T) {
 			assert.False(t, IsDeprecatedWebhookSubscriptionRequest(testCase.fullPath, testCase.method),
 				"the retirement must not reach %q", testCase.fullPath)
+		})
+	}
+}
+
+// TestSunsetGuards_EachResolveTheWindowExactlyOnce is the guard-level half of M-4.
+//
+// # Why this is asserted against the source
+//
+// The property is "one resolution per request", and a response cannot show how many times the
+// configuration store was read to produce it. Both guards answered correctly under every existing
+// test in this package while each made TWO resolutions:
+//
+//   - WebhookSunsetPreAuthGuard called WebhookDeprecationWindow for its headers and then
+//     WebhookSunsetPassed(time.Now()) for its verdict.
+//   - WebhookSunsetGuard took a snapshot for its verdict but still called
+//     WebhookDeprecationWindow for the Deprecation header and for the decision of whether to
+//     render headers at all.
+//
+// Each of those calls re-reads a store whose contents are replaced wholesale on reload, so a
+// reload landing between them produced a response advertising one window while refusing under
+// another — and, because the window's two ends are two independently configured fields, a
+// Deprecation instant that can fall AFTER the Sunset instant beside it, which RFC 9745 §4 forbids.
+// The race is narrow, cannot be reproduced on demand, and would never be caught by watching for
+// it, which is exactly why the structural property is pinned instead.
+//
+// The two forbidden helpers are not deprecated in general — WebhookDeprecationWindow is the right
+// call for a startup log line, which resolves once and is not composing a response. They are
+// forbidden HERE, where something else has already been resolved in the same request.
+func TestSunsetGuards_EachResolveTheWindowExactlyOnce(t *testing.T) {
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, "sunset.go", nil, parser.SkipObjectResolution)
+	require.NoError(t, err, "parsing api/middleware/sunset.go")
+
+	render := func(node ast.Node) string {
+		var out strings.Builder
+		require.NoError(t, printer.Fprint(&out, fileSet, node))
+
+		return out.String()
+	}
+
+	// Every call into the root package made from inside one function body, by callee name.
+	callsInto := func(function *ast.FuncDecl) map[string]int {
+		found := map[string]int{}
+		ast.Inspect(function, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			if callee := render(call.Fun); strings.HasPrefix(callee, "blnk.") {
+				found[callee]++
+			}
+
+			return true
+		})
+
+		return found
+	}
+
+	guards := map[string]*ast.FuncDecl{}
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body == nil {
+			continue
+		}
+
+		if function.Name.Name == "WebhookSunsetGuard" || function.Name.Name == "WebhookSunsetPreAuthGuard" {
+			guards[function.Name.Name] = function
+		}
+	}
+
+	require.Len(t, guards, 2, "both guards must exist in this file; found %v", guards)
+
+	for name, guard := range guards {
+		t.Run(name, func(t *testing.T) {
+			calls := callsInto(guard)
+
+			assert.Equal(t, 1, calls["blnk.WebhookSunsetSnapshotAt"],
+				"%s must take EXACTLY ONE snapshot: it is the only value that carries the headers, "+
+					"the render decision and the verdict from a single configuration read. Calls "+
+					"observed: %v", name, calls)
+
+			// The two helpers that each perform their OWN resolution. Reaching for either from
+			// inside a guard reintroduces the split, and it reads as harmless at the call site.
+			for _, forbidden := range []string{
+				"blnk.WebhookDeprecationWindow",
+				"blnk.WebhookSunsetPassed",
+				"blnk.WebhookSunsetPassedNow",
+				"blnk.WebhookSunsetDate",
+			} {
+				assert.Zero(t, calls[forbidden],
+					"%s must not call %s: it resolves the window again, so the value it returns can "+
+						"come from a different configuration generation than the snapshot already "+
+						"taken. Everything this guard needs is on the snapshot — Date, WindowStart, "+
+						"DateConfigured and Passed", name, forbidden)
+			}
 		})
 	}
 }

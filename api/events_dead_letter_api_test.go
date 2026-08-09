@@ -92,10 +92,13 @@ func deadLetterTestRouter(t *testing.T, isMaster bool) *gin.Engine {
 //
 // # Why the route table needs a test of its own
 //
-// A handler with no route is unreachable, compiles cleanly and fails no other test. The
-// resolve endpoint is new, and it is the endpoint the whole retention gate depends on: without
-// it a dead-lettered row can never become eligible for the purge, so an operator's only
-// options would be to keep every failure forever or to disable retention entirely.
+// A handler with no route is unreachable, compiles cleanly and fails no other test — and the
+// converse matters just as much here: an EXTRA route is a management surface nobody approved.
+// The three routes below are the whole of this file's API. A fourth, POST
+// /events/dead-letter/:event_id/resolve, was registered and has been removed: it took the
+// management surface to fourteen routes where thirteen are approved, and it could not compose
+// with replay, because a resolved row whose re-publish the broker acknowledged could not then
+// be marked dispatched. Retention is modelled through replay alone.
 //
 // # Why the assertion is on the CODE and not the status
 //
@@ -114,18 +117,23 @@ func TestDeadLetterRoutes_AreRegisteredAndMasterKeyGated(t *testing.T) {
 	for _, route := range []string{
 		"GET /events/dead-letter",
 		"POST /events/dead-letter/:event_id/replay",
-		"POST /events/dead-letter/:event_id/resolve",
 		"GET /events/stats",
 	} {
 		assert.True(t, routes[route], "%s must be registered; an unrouted handler is unreachable "+
 			"and breaks no test", route)
 	}
 
+	// AND NOTHING ELSE UNDER /events. The retired resolve route must stay retired: it is
+	// unapproved surface, and its write could leave a dead-lettered row in a state from which a
+	// broker-acknowledged replay could not be recorded.
+	assert.False(t, routes["POST /events/dead-letter/:event_id/resolve"],
+		"the resolve route is retired; retention is modelled through replay, which turns a "+
+			"dead-lettered row into a dispatched receipt")
+
 	t.Run("a non-master caller is refused with the master-key code", func(t *testing.T) {
 		cases := []struct{ method, path string }{
 			{http.MethodGet, "/events/dead-letter"},
 			{http.MethodPost, "/events/dead-letter/evt_1/replay"},
-			{http.MethodPost, "/events/dead-letter/evt_1/resolve"},
 			{http.MethodGet, "/events/stats"},
 		}
 
@@ -146,105 +154,94 @@ func TestDeadLetterRoutes_AreRegisteredAndMasterKeyGated(t *testing.T) {
 	})
 }
 
-// TestListDeadLetterEvents_AcceptsTheResolvedFilterAndRefusesAnUnusableOne covers the query
-// vocabulary the SEC-09 fix added.
+// TestListDeadLetterEvents_RefusesAnUnknownQueryParameter covers the closed query vocabulary.
 //
-// The `resolved` filter is REFUSED rather than coerced when unrecognised, and that is the
-// substantive property. Go's strconv.ParseBool and gin's own boolean readers both turn an
-// unparseable value into false — and false here means "unresolved only", so `?resolved=maybe`
-// would hand back the outstanding subset while the caller believed they had asked for
-// something else. On an inventory endpoint a filter that quietly means something other than
-// what was asked is worth an error: a short page reads as "nothing is stuck".
-func TestListDeadLetterEvents_AcceptsTheResolvedFilterAndRefusesAnUnusableOne(t *testing.T) {
+// The endpoint refuses parameters it cannot honour rather than ignoring them, because a
+// silently ignored filter returns MORE rows than the caller asked for while looking like it
+// worked, and on an inventory endpoint a page that is wider than requested reads as less loss
+// than there is.
+//
+// `resolved` is one of the names now refused. It selected the resolved or unresolved subset of
+// the inventory, and both the filter and the resolution it narrowed on are gone: retention
+// spares every dead-lettered row, and a replay the broker acknowledges is what takes one out of
+// the inventory.
+func TestListDeadLetterEvents_RefusesAnUnknownQueryParameter(t *testing.T) {
 	router := deadLetterTestRouter(t, true)
 
-	t.Run("an unusable value is refused with a validation error", func(t *testing.T) {
-		for _, value := range []string{"maybe", "2", "unresolved", "TRUE!", "null"} {
-			t.Run(value, func(t *testing.T) {
-				recorder := httptest.NewRecorder()
-				request := httptest.NewRequest(http.MethodGet,
-					"/events/dead-letter?resolved="+value, nil)
-				router.ServeHTTP(recorder, request)
+	for _, name := range []string{"resolvd", "resolved", "unresolved_only"} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/events/dead-letter?"+name+"=true", nil)
+			router.ServeHTTP(recorder, request)
 
-				require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-				assert.Equal(t, string(apierror.ErrGenValidation),
-					deadLetterErrorCode(t, recorder.Body.Bytes()))
-				assert.Contains(t, recorder.Body.String(), "resolved",
-					"the message must name the parameter, or an operator cannot tell which of "+
-						"several filters was rejected")
-			})
-		}
-	})
-
-	t.Run("an unknown parameter is still refused", func(t *testing.T) {
-		// The endpoint refuses parameters it cannot honour rather than ignoring them,
-		// because a silently ignored filter returns MORE rows than the caller asked for
-		// while looking like it worked. `resolved` is now in the accepted set, so this also
-		// proves the addition did not turn the check off.
-		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodGet, "/events/dead-letter?resolvd=true", nil)
-		router.ServeHTTP(recorder, request)
-
-		require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-		assert.Equal(t, string(apierror.ErrGenValidation), deadLetterErrorCode(t, recorder.Body.Bytes()))
-		assert.Contains(t, recorder.Body.String(), "resolved",
-			"the refusal lists the accepted parameters, and `resolved` must now be among them")
-	})
+			require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+			assert.Equal(t, string(apierror.ErrGenValidation),
+				deadLetterErrorCode(t, recorder.Body.Bytes()))
+			assert.Contains(t, recorder.Body.String(), name,
+				"the refusal must name the parameter it could not honour, or an operator cannot "+
+					"tell which of several filters was rejected")
+		})
+	}
 }
 
-// TestResolveDeadLetterEvent_RefusesAnUnusableBodyAtTheBoundary covers the request body.
+// TestListDeadLetterEvents_RefusesTwoTopicFiltersThatDisagree closes the last silently
+// discarded filter on this endpoint.
 //
-// The body is OPTIONAL — resolving without an explanation is a legitimate action and requiring
-// a document would make the simple case a ceremony — but a MALFORMED body is refused rather
-// than discarded. Silently dropping a note the operator wrote would lose the audit trail they
-// were trying to leave, which is the one thing the note exists for.
-func TestResolveDeadLetterEvent_RefusesAnUnusableBodyAtTheBoundary(t *testing.T) {
+// Both spellings of the topic filter are accepted because both are natural: an operator
+// reading the inventory sees dlt_topic on every item, while one asking "which transaction
+// events are stuck" thinks in category topics. They resolve to one predicate, so naming the
+// same topic in both is one instruction written twice and is honoured.
+//
+// Naming two DIFFERENT topics is not. It used to be resolved by preferring `topic` and
+// dropping `dlt_topic` without a word, which returned a page describing a question the caller
+// did not ask — and on an inventory endpoint a page drawn from the wrong topic reads as a
+// different amount of loss than there is.
+func TestListDeadLetterEvents_RefusesTwoTopicFiltersThatDisagree(t *testing.T) {
 	router := deadLetterTestRouter(t, true)
 
-	t.Run("malformed JSON is refused", func(t *testing.T) {
+	t.Run("two spellings naming different topics are refused", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodPost, "/events/dead-letter/evt_1/resolve",
-			strings.NewReader("{not json"))
-		request.Header.Set("Content-Type", "application/json")
+		request := httptest.NewRequest(http.MethodGet,
+			"/events/dead-letter?topic=blnk.transactions&dlt_topic=blnk.balances.dlt", nil)
 		router.ServeHTTP(recorder, request)
 
 		require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-		assert.Equal(t, string(apierror.ErrGenValidation), deadLetterErrorCode(t, recorder.Body.Bytes()))
+		assert.Equal(t, string(apierror.ErrGenValidation),
+			deadLetterErrorCode(t, recorder.Body.Bytes()))
+
+		// BOTH VALUES HAVE TO APPEAR. A refusal that says only "conflicting filters" leaves the
+		// operator to guess which pair of a five-parameter query it meant.
+		body := recorder.Body.String()
+		assert.Contains(t, body, "blnk.transactions")
+		assert.Contains(t, body, "blnk.balances")
 	})
 
-	t.Run("an unusable note is refused before the repository is reached", func(t *testing.T) {
-		// A control character in the note. Refused at the DTO, which is why this is
-		// observable without a datasource — and refusing it here rather than at the service
-		// means the caller learns the real bound rather than having the note truncated at
-		// storage.
-		body, err := json.Marshal(map[string]string{"note": "replayed\x00"})
-		require.NoError(t, err)
-
+	t.Run("the same topic in both spellings is one instruction, not a conflict", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodPost, "/events/dead-letter/evt_1/resolve",
-			strings.NewReader(string(body)))
-		request.Header.Set("Content-Type", "application/json")
+		request := httptest.NewRequest(http.MethodGet,
+			"/events/dead-letter?topic=blnk.transactions&dlt_topic=blnk.transactions.dlt", nil)
 		router.ServeHTTP(recorder, request)
 
-		require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-		assert.Equal(t, string(apierror.ErrGenValidation), deadLetterErrorCode(t, recorder.Body.Bytes()))
-		assert.Contains(t, recorder.Body.String(), "control characters")
+		// The service is unreachable in this harness, so the assertion is that the request got
+		// PAST validation rather than that it succeeded: any code other than 400 proves the
+		// pair was accepted.
+		assert.NotEqual(t, http.StatusBadRequest, recorder.Code,
+			"the two spellings resolve to the same topic, so this is not a contradiction: %s",
+			recorder.Body.String())
 	})
 
-	t.Run("an oversized note is refused by the binder before it is decoded", func(t *testing.T) {
-		// The byte bound is the OUTER guard: without it an arbitrarily large body would be
-		// decoded in full before any validation ran.
-		body, err := json.Marshal(map[string]string{"note": strings.Repeat("x", 8192)})
-		require.NoError(t, err)
+	t.Run("either spelling alone is honoured", func(t *testing.T) {
+		for _, query := range []string{
+			"topic=blnk.transactions",
+			"dlt_topic=blnk.transactions.dlt",
+		} {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/events/dead-letter?"+query, nil)
+			router.ServeHTTP(recorder, request)
 
-		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodPost, "/events/dead-letter/evt_1/resolve",
-			strings.NewReader(string(body)))
-		request.Header.Set("Content-Type", "application/json")
-		router.ServeHTTP(recorder, request)
-
-		require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-		assert.Equal(t, string(apierror.ErrGenValidation), deadLetterErrorCode(t, recorder.Body.Bytes()))
+			assert.NotEqual(t, http.StatusBadRequest, recorder.Code,
+				"%s is a supported filter: %s", query, recorder.Body.String())
+		}
 	})
 }
 

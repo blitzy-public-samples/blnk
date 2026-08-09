@@ -19,8 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
 	"strings"
 	"time"
 	"unicode"
@@ -123,9 +121,13 @@ import (
 // in full, and the operations runbook reads them there, through the database,
 // where the audience is a database operator rather than an HTTP response.
 //
-// This type is deliberately not wrapped in a list envelope. The handler
-// returns []DeadLetterEvent directly, or nests it in api.FilterResponse when
-// the caller asks for a total count.
+// EVERY listing response wraps these in api.DeadLetterPageResponse — `{data,
+// next_cursor, has_more, total_count?}` — and a client reads `.data[]`, never the
+// body as an array. That is not optional or count-dependent: cursor paging replaced
+// offset paging (PERF-P08), and the cursor has to be returned somewhere, so there is
+// no shape in which the body is a bare array. This comment used to say the handler
+// returned the slice directly and nested it only when a total was asked for, which
+// described a response the code has not produced since.
 type DeadLetterEvent struct {
 	// EventID is the UUID that uniquely identifies the event. It is the value
 	// callers pass to the replay endpoint, and it doubles as the subscriber
@@ -143,13 +145,18 @@ type DeadLetterEvent struct {
 
 	// LedgerID is the ledger the event belongs to, when it belongs to one.
 	//
-	// It is NOT the Kafka message key, and this field's documentation used to say
-	// that it was. The distinction matters to anyone triaging an ordering
-	// question: the key is PartitionKey below, which is derived from the ledger
-	// when there is one and falls back to the aggregate when there is not, so on
-	// a ledger-less event the key is present while this field is empty. Reading
-	// this as the key would produce the wrong answer for exactly the events whose
-	// routing is least obvious.
+	// PartitionKey below — not this field — is the message key, and this field's
+	// documentation used to claim otherwise. The two coincide when a ledger is
+	// present, because requirement R-6 partitions by ledger ID and the publish
+	// path prefers it; they do not coincide on a LEDGER-LESS event, where the key
+	// is present and this field is empty. An identity, a bulk batch and a system
+	// error are all in that case, so reading this field as the key gives the wrong
+	// answer for exactly the events whose routing is least obvious.
+	//
+	// It is retained beside PartitionKey rather than folded into it because the two
+	// together are what make the routing decision legible: a non-empty ledger_id
+	// means the key IS the ledger, and an empty one means the key came from the
+	// row's stored partition key.
 	//
 	// Optional because not every event category carries a ledger, so it is
 	// omitted rather than reported as an empty string.
@@ -158,11 +165,18 @@ type DeadLetterEvent struct {
 	// PartitionKey is the Kafka message key this event was published under, and
 	// therefore what pinned it to its partition.
 	//
-	// It is the stored key from the outbox row, not a value recomputed here, so
-	// it is the key the event was ACTUALLY written with rather than the key it
-	// would be written with today — the two differ for a row committed before a
-	// keying change, and only the stored one explains the partition the event is
-	// really in.
+	// It is the EFFECTIVE key, resolved from the row exactly as the publish path resolves
+	// it — the ledger id when the event has one, and the stored partition_key column
+	// otherwise — because requirement R-6 partitions by ledger ID. It is not a key
+	// recomputed from the payload or from today's rules: both inputs come from the stored
+	// row, so this is the key the event was ACTUALLY written with rather than the key it
+	// would be written with today.
+	//
+	// Reporting the stored column alone was wrong for the rows where it matters. The column
+	// is the publisher's SECOND choice whenever a ledger is present, so on a row whose
+	// partition key was derived before the ledger was known the two differ — and that row
+	// is precisely the one an operator is investigating. ledger_id is on this response too,
+	// so the stored column remains derivable: an event with a ledger_id was keyed on it.
 	//
 	// This is the field to reason about ordering with. Per-aggregate ordering is
 	// a property of the key: every event sharing a key lands in one partition and
@@ -232,33 +246,6 @@ type DeadLetterEvent struct {
 	// needs from the payload for triage — a message_too_large classification is
 	// confirmed or refuted by this number alone — without the body itself.
 	PayloadBytes int `json:"payload_bytes"`
-
-	// ResolvedAt is when an operator recorded that this dead-lettered event has
-	// been dealt with, and it is the field that says whether the entry is still
-	// WORK or already HISTORY.
-	//
-	// It is on the wire because it changes what the reader should do about the
-	// entry, and because it is the one thing that makes the row eligible for
-	// retention: an unresolved entry is never deleted however old it is, and it
-	// keeps the dead-letter age gauge — and the DeadLetterMessageStuck alert —
-	// counting. Without this field an operator paging the inventory after
-	// retention is enabled could not tell the outstanding failures from the ones
-	// already closed, which is the distinction triage is entirely about.
-	//
-	// Nil, and so omitted, while the entry is unresolved.
-	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
-
-	// ResolutionNote is the operator's own account of why no further action is
-	// owed — "replayed after the broker came back", "the subscriber was
-	// decommissioned", "accepted as lost, ticket 4182".
-	//
-	// It is projected back out because a resolution without its reason is only
-	// marginally better than no resolution: the next operator has to be able to
-	// tell a handled failure from a dismissed one. It is bounded and refused
-	// control characters before storage, so it is safe to render.
-	//
-	// Empty, and so omitted, when the resolution carried no note.
-	ResolutionNote string `json:"resolution_note,omitempty"`
 }
 
 // The failure-reason vocabulary. Every value an operator can see is one of these, and
@@ -379,13 +366,21 @@ func NewDeadLetterEvent(row model.DeadLetterInventoryEntry) DeadLetterEvent {
 		EventType:   row.EventType,
 		AggregateID: row.AggregateID,
 		LedgerID:    row.LedgerID,
-		// The STORED key, never a recomputed one — see the field's own documentation. It
-		// is what pinned the event to its partition, so it is the only field on this
-		// response an ordering question can be answered from, and it was declared and
-		// documented here while never being assigned: every dead-letter projection
-		// omitted it (the tag is omitempty), so the answer read as "this event had no
-		// key" rather than as a gap.
-		PartitionKey:     row.PartitionKey,
+		// THE EFFECTIVE KEY — what the publish path actually keyed on, resolved through the
+		// model's own rule rather than read straight off the stored column.
+		//
+		// The column alone is the SECOND choice for any row carrying a ledger, because
+		// requirement R-6 partitions by ledger ID and the publisher prefers it. The two agree on
+		// almost every row and diverge on exactly the ones an operator is investigating: a row
+		// written before the ledger was threaded through, or one whose partition key was derived
+		// from the payload first. Reporting the column there would name the key the event was NOT
+		// routed by, and both fields are on this response so the stored value stays derivable
+		// from ledger_id.
+		//
+		// It was also, before that, declared and documented while never being assigned: every
+		// dead-letter projection omitted it (the tag is omitempty), so the answer read as "this
+		// event had no key" rather than as a gap.
+		PartitionKey:     row.EffectiveKey(),
 		OccurredAt:       row.OccurredAt,
 		SchemaVersion:    row.SchemaVersion,
 		Topic:            row.Topic,
@@ -1176,6 +1171,20 @@ func (c CreateSubscriber) Derived() (principal, consumerGroup string, err error)
 //
 // Returns:
 //   - error: describing the first violation, nil when the request is usable.
+// ValidateCreateSubscriber and ValidateUpdateSubscriber WERE RETIRED from this file.
+//
+// They were the "prefix-independent half" of the two Validate methods below, and their stated
+// reason for existing was a caller that has no configuration snapshot — a binder hook, a CLI, a
+// table-driven test. No such caller was ever written: every handler calls Validate(topicPrefix),
+// and no test called them either.
+//
+// They are removed rather than left for a future caller because they were STRICTLY WEAKER in a
+// way that would not announce itself. Both applied the grantable allowlist under
+// DefaultEventTopicPrefix instead of the deployment's own prefix, so on any deployment with a
+// custom KAFKA_TOPIC_PREFIX they would have accepted a grant naming topics that do not exist
+// here and refused the ones that do. A future caller reaching for the shorter name would have
+// got that silently. Validate is the only correct entry point, so it is the only one offered.
+
 func (c CreateSubscriber) Validate(topicPrefix string) error {
 	// The prefix-independent rules run FIRST and are shared with nothing else, which is
 	// what makes this the single validation entry point. They were once a second exported
@@ -1622,89 +1631,25 @@ const maxSubscriberNameLen = MaxSubscriberNameLength
 // Returns:
 //   - error: describing the violation without echoing more of the URL than the host.
 func validateLegacyWebhookURL(rawURL string) error {
-	if rawURL == "" {
+	// THE ONE POLICY, in model.ValidateWebhookURL. This function used to carry its own copy of the
+	// https, host, whitespace and internal-destination rules, including its own destination
+	// classifier, beside a second copy in the repository — one column, two rules, with the same
+	// rejected host producing two different reason phrases depending on which door the request came
+	// through. What stays here is the ERROR SHAPE: a DTO validation error rather than a typed
+	// apierror, and prefixed with the field name because that is what a caller of this endpoint
+	// needs in order to know which body key to correct.
+	//
+	// An empty value passes, meaning "no endpoint recorded", which is what the nullable column is
+	// for.
+	message, reason := model.ValidateWebhookURL(rawURL)
+	if message == "" {
 		return nil
 	}
 
-	if rawURL != strings.TrimSpace(rawURL) {
-		return fmt.Errorf("webhook_url must not have surrounding whitespace")
-	}
-
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		// The parse error is not echoed: it quotes the input, and the input is a
-		// third party's endpoint that has no business in Blnk's error responses.
-		return fmt.Errorf("webhook_url is not a valid URL")
-	}
-
-	if parsed.Scheme != "https" {
-		return fmt.Errorf("webhook_url must use https, got scheme %q", parsed.Scheme)
-	}
-
-	host := parsed.Hostname()
-	if host == "" {
-		return fmt.Errorf("webhook_url must include a host")
-	}
-
-	if reason := internalWebhookDestinationReason(host); reason != "" {
-		return fmt.Errorf("webhook_url host %q is not an allowed destination: %s", host, reason)
-	}
-
-	return nil
-}
-
-// internalWebhookDestinationReason reports why a host is an internal destination, or ""
-// when it is not.
-//
-// It returns a REASON rather than a boolean so the caller can say which rule was hit.
-// "not allowed" sends an operator looking for a policy document; "the cloud instance
-// metadata endpoint" tells them what they just tried to point Blnk at.
-//
-// Parameters:
-//   - host string: the hostname or IP literal from the URL, without a port.
-//
-// Returns:
-//   - string: the reason, or "" when the host is acceptable.
-func internalWebhookDestinationReason(host string) string {
-	lowered := strings.ToLower(host)
-
-	// IP literals are decided on the parsed address, never on the text. net.ParseIP
-	// resolves the IPv4-mapped IPv6 forms too, so "::ffff:127.0.0.1" is recognised as
-	// loopback rather than passing as an unfamiliar-looking string.
-	if address := net.ParseIP(host); address != nil {
-		switch {
-		case address.IsLoopback():
-			return "it is a loopback address"
-		case address.IsLinkLocalUnicast(), address.IsLinkLocalMulticast():
-			return "it is a link-local address, which reaches the cloud instance metadata endpoint"
-		case address.IsPrivate():
-			return "it is a private address inside Blnk's own network"
-		case address.IsUnspecified():
-			return "it is the unspecified address"
-		case address.IsMulticast():
-			return "it is a multicast address"
-		}
-
-		return ""
-	}
-
-	if lowered == "localhost" || strings.HasSuffix(lowered, ".localhost") {
-		return "it resolves to loopback"
-	}
-
-	// .local is mDNS and .internal is the conventional private zone — and the name
-	// metadata.google.internal is one of the two best-known metadata endpoints.
-	if strings.HasSuffix(lowered, ".local") || strings.HasSuffix(lowered, ".internal") {
-		return "it is an internal-only hostname"
-	}
-
-	// An unqualified single-label name can only resolve through a local search domain,
-	// which is by definition inside the network Blnk runs in.
-	if !strings.Contains(lowered, ".") {
-		return "it is an unqualified hostname that can only resolve inside Blnk's own network"
-	}
-
-	return ""
+	// The MESSAGE and the REASON together, because the reason names the offending host or scheme —
+	// the caller's own value, and the one thing that tells them what to change. Neither echoes the
+	// whole URL or the parser's rendering of it.
+	return fmt.Errorf("webhook_url: %s (%s)", strings.ToLower(message[:1])+message[1:], reason)
 }
 
 // SubscriberResponse is the read shape for GET /subscribers,
@@ -2000,6 +1945,24 @@ type SubscriberEnforcedAccess struct {
 	// partition_key_prefix is absent by construction, not by omission.
 	EnforcedBy []string `json:"enforced_by"`
 
+	// NotEnforcedBy names every access-shaped dimension the API accepts and the broker does NOT
+	// evaluate, and it is exhaustive in the same way EnforcedBy is.
+	//
+	// It exists because the negative claim was previously only INFERABLE. A client had to notice
+	// that "partition_key" was absent from EnforcedBy, and an absence proves nothing about a
+	// contract — a dimension missing from a list reads identically to a dimension the server
+	// forgot, or to one a newer version added. Stating it makes the two readings distinguishable
+	// and gives a client something to assert on: EnforcedBy and NotEnforcedBy together enumerate
+	// every dimension this API names, so a dimension moving from one list to the other is a
+	// visible change rather than a silent one.
+	//
+	// It is populated unconditionally — with or without a prefix recorded — because it describes
+	// the BROKER's capabilities, not this subscriber's configuration. Kafka's authorizer has no
+	// message-key resource type whether or not anybody asked it to use one, and a field that
+	// appeared only for subscribers carrying a prefix would let a reader conclude the dimension
+	// is enforced for everyone else.
+	NotEnforcedBy []string `json:"not_enforced_by"`
+
 	// Topics is the exact set of topics the principal may Read and Describe. Anything
 	// outside it is refused at the broker, not filtered by the client.
 	Topics []string `json:"topics"`
@@ -2088,8 +2051,9 @@ type SubscriberEnforcedAccess struct {
 // EnforcementDimensionPartitionKey names the access-shaped dimension Kafka does NOT evaluate.
 //
 // It is a constant rather than a literal for the same reason the enforced dimensions are: the
-// value appears in a response body, so it is part of the API contract and a reworded literal
-// would silently change what a client is matching on.
+// value appears in a response body — it is the sole member of SubscriberEnforcedAccess.NotEnforcedBy
+// — so it is part of the API contract, and a reworded literal would silently change what a client
+// is matching on.
 const EnforcementDimensionPartitionKey = "partition_key"
 
 // SubscriberKeyScopeGuidance is the remedy every subscriber and credential response carries.
@@ -2166,6 +2130,11 @@ func NewSubscriberEnforcedAccess(
 		EnforcedBy: []string{
 			EnforcementDimensionTopic,
 			EnforcementDimensionConsumerGroup,
+		},
+		// The counterpart list, stated for every subscriber rather than only for one carrying a
+		// prefix: it describes what the BROKER cannot evaluate, which does not vary by row.
+		NotEnforcedBy: []string{
+			EnforcementDimensionPartitionKey,
 		},
 		Topics: topics,
 		// Never set true anywhere. Kafka has no message-key authorization dimension, so a
@@ -2493,6 +2462,37 @@ type KafkaCredentialsResponse struct {
 	// IssuedAt is the instant the credential was minted, matching the
 	// credential_issued_at recorded on the subscriber.
 	IssuedAt time.Time `json:"issued_at"`
+
+	// CredentialFingerprint is the short, non-sensitive digest fragment of the stored
+	// credential reference — the SAME value GET /subscribers reports for this row once the
+	// issuance is recorded.
+	//
+	// It is what makes an issuance identifiable after the fact. The password is returned
+	// exactly once and nothing persists it, so without this field a client holding a
+	// credential had no way to ask "is the credential I am using the one the registry
+	// records?": it could read credential_fingerprint from a subscriber read and have
+	// nothing to compare it against. The service computed it on every issuance and the
+	// response dropped it.
+	//
+	// It is not a secret and cannot be authenticated with, and the reference cannot be
+	// recovered from it — which is why it is safe to return beside the password and safe to
+	// log, unlike either of them.
+	CredentialFingerprint string `json:"credential_fingerprint"`
+
+	// Replaced reports that this principal ALREADY held a SCRAM credential and this issuance
+	// replaced it.
+	//
+	// Kafka stores one credential per principal, so a re-issue is destructive by
+	// construction: the moment this returns true, any consumer still authenticating with the
+	// previous password has stopped working. That is a fact the caller needs at the moment of
+	// issuance — it is the difference between "provision a new subscriber" and "you have just
+	// cut off a live consumer" — and the service established it from the broker's own
+	// describe while the response said nothing.
+	//
+	// It is also the honest form of the orphan remedy: re-issuing is what settles a
+	// credential Blnk could not account for, precisely because it replaces it, and this field
+	// is the confirmation that the replacement happened.
+	Replaced bool `json:"replaced"`
 }
 
 // CreateWebhookSubscription is the request body for
@@ -2635,141 +2635,3 @@ type WebhookSubscriptionResponse struct {
 	// as awaiting migration.
 	MigratedAt *time.Time `json:"migrated_at,omitempty"`
 }
-
-// ValidateCreateSubscriber validates a POST /subscribers body without a configured topic
-// prefix in hand.
-//
-// It is the prefix-independent half of Validate, and it exists so that the request body can
-// be rejected at the DTO layer — where a malformed body is cheapest to refuse — by a caller
-// that has no configuration snapshot: a binder hook, a table-driven contract test, a CLI.
-// Validate remains the authoritative check because only it can compare a grant against the
-// deployment's own topic namespace.
-//
-// Name is required for the reason the registry exists: it is the label an operator recognises
-// a principal by months later, it is NOT NULL in blnk.event_subscribers, and it is the one
-// field no service can invent a meaningful value for.
-//
-// The grant is checked in two ways. model.ValidateSubscriberTopics applies the resource
-// bounds — cardinality, blank elements, length, the Kafka character set and duplicates — and
-// the grantable allowlist is applied under model.DefaultEventTopicPrefix, which is the
-// STRICTEST available answer when the configured prefix is unknown: a deployment that renamed
-// its prefix is validated again, against its real prefix, by Validate.
-//
-// Returns:
-//   - error: nil when the body is acceptable, otherwise an error naming the broken rule.
-func (c CreateSubscriber) ValidateCreateSubscriber() error {
-	if strings.TrimSpace(c.Name) == "" {
-		return fmt.Errorf("name is required")
-	}
-
-	if err := model.ValidateSubscriberTopics(c.AuthorizedTopics); err != nil {
-		return err
-	}
-
-	return validateGrantableTopics(c.AuthorizedTopics, model.DefaultEventTopicPrefix)
-}
-
-// ValidateUpdateSubscriber validates a PUT /subscribers/:subscriber_id body without a
-// configured topic prefix in hand.
-//
-// No field is required: an update carries the mutable subset a caller chose to change, and
-// every field is a pointer or a nilable slice precisely so that "omitted" stays
-// distinguishable from "set to empty".
-//
-// The grant is validated only when PRESENT. nil means the caller is not touching the
-// authorised set, so validating it would reject an update to an unrelated field on a
-// subscriber whose stored grant predates a rule — while a present empty array is a
-// deliberate revocation of every topic and must continue to be accepted. When a grant IS
-// present it replaces the whole set, so it is validated exactly as strictly as on create; an
-// update path that checked less would be the way around the create path's bounds.
-//
-// Returns:
-//   - error: nil when the body is acceptable, otherwise an error naming the broken rule.
-func (u UpdateSubscriber) ValidateUpdateSubscriber() error {
-	if u.AuthorizedTopics == nil {
-		return nil
-	}
-
-	if err := model.ValidateSubscriberTopics(u.AuthorizedTopics); err != nil {
-		return err
-	}
-
-	return validateGrantableTopics(u.AuthorizedTopics, model.DefaultEventTopicPrefix)
-}
-
-// ResolveDeadLetterEventRequest is the optional body of
-// POST /events/dead-letter/:event_id/resolve.
-//
-// # Why the whole body is optional and the note is not required
-//
-// Resolving without an explanation is a legitimate action — a small deployment
-// clearing a single known failure should not have to compose a JSON document — so
-// the endpoint accepts an empty request. The note is offered rather than demanded
-// because a REQUIRED free-text field does not produce explanations; it produces
-// "x" and "done", which are worse than nothing because they look like records.
-//
-// It is bounded and refused control characters at the service layer, for the two
-// reasons every operator-supplied label in this pipeline is: the value is stored
-// and then projected back out by the inventory listing, so an unbounded note
-// becomes an unbounded field in every response, and a control character corrupts
-// the log line and the dashboard cell it lands in.
-type ResolveDeadLetterEventRequest struct {
-	// Note is the operator's account of why the dead-lettered event needs no
-	// further action: "replayed after the broker came back", "the subscriber was
-	// decommissioned", "accepted as lost, ticket 4182".
-	//
-	// The binder's max is in BYTES while the service's bound is in RUNES, and the
-	// stricter of the two applies — see Validate. Both exist because the binder
-	// bound is what stops a multi-megabyte body being decoded at all, and the rune
-	// bound is what the column and the response field are actually sized for.
-	Note string `json:"note,omitempty" binding:"omitempty,max=4096"`
-}
-
-// Validate bounds the note before the service is reached.
-//
-// It is a second check on top of the binding tag, and deliberately so: the tag
-// counts bytes, this counts runes, and a note of Japanese or emoji text is well
-// within 4,096 bytes while being far past the 1,024 characters the column and the
-// listing field are sized for. Refusing here means the caller learns the real
-// bound rather than having their note silently truncated at storage.
-//
-// Returns:
-//   - error: a plain error naming the bound, which the handler renders as
-//     GEN_VALIDATION_ERROR exactly as it does for every other Validate in this
-//     package, or nil.
-func (r ResolveDeadLetterEventRequest) Validate() error {
-	trimmed := strings.TrimSpace(r.Note)
-	if trimmed == "" {
-		return nil
-	}
-
-	if count := utf8.RuneCountInString(trimmed); count > maxDeadLetterResolutionNoteLen {
-		return fmt.Errorf(
-			"note must be at most %d characters, and this one is %d",
-			maxDeadLetterResolutionNoteLen, count,
-		)
-	}
-
-	for _, character := range trimmed {
-		// Newlines included. The note is rendered in one JSON field and echoed in one
-		// log line, and a note carrying line breaks splits both.
-		if character < 0x20 || character == 0x7f {
-			return fmt.Errorf(
-				"note must not contain control characters, which corrupt every log line and " +
-					"dashboard cell they appear in",
-			)
-		}
-	}
-
-	return nil
-}
-
-// maxDeadLetterResolutionNoteLen bounds the resolution note, in runes.
-//
-// It must agree with blnk.maxDeadLetterResolutionNoteLength, which is the bound the
-// service enforces and the column is sized for. The two are separate constants
-// because this package cannot import the root package without a cycle, and
-// TestResolveDeadLetterEventRequest_AgreesWithTheServiceBound is what keeps them
-// equal — a DTO that accepted more than the service stores would refuse the request
-// one layer later with a different message.
-const maxDeadLetterResolutionNoteLen = 1024

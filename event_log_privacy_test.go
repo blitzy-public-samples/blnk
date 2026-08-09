@@ -553,6 +553,23 @@ func newPagingSubscriberStore(t *testing.T, size int) *pagingSubscriberStore {
 }
 
 // ListEventSubscribers returns one page, honouring limit and offset.
+// ListAndCountEventSubscribers pages exactly as ListEventSubscribers does and reports the
+// registry size, so the paging double satisfies the whole seam.
+//
+// It overrides the embedded implementation because that one pages an unordered map, and this
+// double exists precisely to give the walk a stable order.
+func (s *pagingSubscriberStore) ListAndCountEventSubscribers(
+	ctx context.Context,
+	query model.SubscriberPageQuery,
+) (model.SubscriberPage, int64, error) {
+	page, err := s.ListEventSubscribers(ctx, query)
+	if err != nil {
+		return model.SubscriberPage{}, 0, err
+	}
+
+	return page, int64(len(s.ordered)), nil
+}
+
 func (s *pagingSubscriberStore) ListEventSubscribers(
 	_ context.Context,
 	query model.SubscriberPageQuery,

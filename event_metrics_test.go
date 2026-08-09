@@ -4287,3 +4287,178 @@ func TestRelayDefaults_AgreeWithTheCollector(t *testing.T) {
 			"a raised budget must reach the collector, or the variable is decorative")
 	})
 }
+
+// TestKafkaAlertInventory_IsStatedOnceAndAgreesEverywhere is the MI-8 guard.
+//
+// # The drift it closes
+//
+// alerts/blnk-kafka-alerts.yml defines the rules. Six other files DESCRIBE that set — a count in
+// .env.example, a name list in .env.example, a count in each compose file, a count in the worker
+// Deployment, and a "go straight to your alert" index in the operations runbook — and every one of
+// them was hand-maintained. They had drifted to describing EIGHT rules against a file defining
+// thirteen, and the runbook index listed seven of them, one under a name no rule has
+// (`ConsumerLagCoverageIncomplete` for `SubscriberLagCoverageIncomplete`), so an operator arriving
+// from that notification followed a dead anchor.
+//
+// The failure mode is specific and bad: an operator who confirms "/rules lists all eight" against
+// a Prometheus that loaded thirteen concludes the configuration is correct, and an operator paged
+// by one of the six undocumented rules has no response procedure to read. Both are worse than no
+// inventory at all, because both look like a system that has been checked.
+//
+// # Why a test rather than a careful edit
+//
+// The counts were correct when written. Nothing made them wrong except a rule being added, which
+// is the routine change this repository should make easy — so the reconciliation has to be
+// enforced rather than performed once. Every assertion below derives its expectation from the
+// alerts file, so adding a rule fails here with the list of places to update, rather than silently
+// invalidating six documents.
+func TestKafkaAlertInventory_IsStatedOnceAndAgreesEverywhere(t *testing.T) {
+	root := moduleRootDir(t)
+
+	raw, err := os.ReadFile(filepath.Join(root, "alerts", "blnk-kafka-alerts.yml"))
+	require.NoError(t, err, "the alerts file is the authority every other file describes")
+
+	var parsed struct {
+		Groups []struct {
+			Name  string `yaml:"name"`
+			Rules []struct {
+				Alert string `yaml:"alert"`
+			} `yaml:"rules"`
+		} `yaml:"groups"`
+	}
+	require.NoError(t, yaml.Unmarshal(raw, &parsed), "parsing the alerts file")
+
+	var rules []string
+	for _, group := range parsed.Groups {
+		for _, rule := range group.Rules {
+			if rule.Alert != "" {
+				rules = append(rules, rule.Alert)
+			}
+		}
+	}
+	require.NotEmpty(t, rules, "an empty rule set would make every assertion below vacuous")
+
+	count := strconv.Itoa(len(rules))
+
+	readFile := func(elem ...string) string {
+		contents, err := os.ReadFile(filepath.Join(append([]string{root}, elem...)...))
+		require.NoError(t, err, "reading %v", elem)
+
+		return string(contents)
+	}
+
+	t.Run("the runbook indexes every rule, and only real rules", func(t *testing.T) {
+		runbook := readFile("docs", "kafka-operations.md")
+
+		for _, rule := range rules {
+			// The row an operator arriving from a notification reads.
+			assert.Contains(t, runbook, "| `"+rule+"` |",
+				"docs/kafka-operations.md must carry an index row for %q; a rule whose notification "+
+					"leads to no row leaves the responder with no procedure", rule)
+
+			// And the section that row links to. A row pointing at a missing anchor is a dead end
+			// that renders as a working link.
+			assert.Contains(t, runbook, "### "+rule+"\n",
+				"docs/kafka-operations.md must carry a `### %s` response section, which is what the "+
+					"index row anchors to", rule)
+		}
+
+		// THE REVERSE DIRECTION, which is how the mis-named entry survived: the index named
+		// ConsumerLagCoverageIncomplete, no rule did, and nothing compared the two.
+		//
+		// Scoped to the ALERT INDEX TABLE rather than to every table in the document. The runbook
+		// has other tables whose first column is a backticked identifier — error codes, response
+		// fields — and matching those would fail this test for names that are correctly not alerts.
+		// The table is delimited by its own header and ends at the first blank line.
+		indexStart := strings.Index(runbook, "| Alert | Response section |")
+		require.GreaterOrEqual(t, indexStart, 0,
+			"the alert index table must exist; it is the entry point every notification links into")
+		indexTable := runbook[indexStart:]
+		if end := strings.Index(indexTable, "\n\n"); end >= 0 {
+			indexTable = indexTable[:end]
+		}
+
+		indexed := regexp.MustCompile(`(?m)^\| \x60([A-Za-z]+)\x60 \|`).
+			FindAllStringSubmatch(indexTable, -1)
+		require.Len(t, indexed, len(rules),
+			"the alert index must have exactly one row per rule: %d rules, %d rows",
+			len(rules), len(indexed))
+
+		for _, row := range indexed {
+			assert.Contains(t, rules, row[1],
+				"docs/kafka-operations.md indexes %q, which is not a rule in alerts/blnk-kafka-alerts.yml. "+
+					"Either the rule was renamed and the index was not, or the index invented a name — "+
+					"and an operator following it reaches an anchor for an alert that cannot fire",
+				row[1])
+		}
+	})
+
+	t.Run("the environment template states the count and every name", func(t *testing.T) {
+		// This file tells an operator what to CONFIRM at /rules after enabling metrics
+		// authentication, so a wrong count here is a verification step that passes on a broken
+		// deployment and fails on a correct one.
+		env := readFile(".env.example")
+
+		assert.Contains(t, env, count+" rules in alerts/blnk-kafka-alerts.yml",
+			".env.example must state the real rule count (%s)", count)
+		assert.Contains(t, env, count+" rules in the blnk-kafka-alerts group",
+			".env.example's confirmation checklist must state the real rule count (%s)", count)
+
+		for _, rule := range rules {
+			assert.Contains(t, env, rule,
+				".env.example lists the rules to confirm at /rules, so it must name %q; an operator "+
+					"checking a partial list against a complete /rules page cannot tell a missing rule "+
+					"from an extra one", rule)
+		}
+	})
+
+	t.Run("every series an alert reads is documented in the metrics reference", func(t *testing.T) {
+		// THE OTHER HALF OF MI-8: names, not counts.
+		//
+		// Four instruments driving two rules — SubscriberCredentialOrphaned and
+		// SubscriberRevocationRefused — were absent from docs/metrics.md entirely. That is the
+		// worst place for a gap, because the reference is what an operator reads to decide whether
+		// a series exists at all: a rule evaluating an absent series never fires and reports
+		// nothing, so "no alert" and "nothing wrong" are indistinguishable.
+		//
+		// The scope is deliberately "series an ALERT reads" rather than every instrument declared
+		// in internal/metrics. An instrument nobody alerts on is a diagnostic whose documentation
+		// is a judgement call; one a rule depends on is part of the alerting contract. It also
+		// keeps this assertion inside this feature's scope: the blnk.chain.* instruments belong to
+		// hash chaining, which no rule here reads.
+		reference := readFile("docs", "metrics.md")
+
+		// Prometheus renders an OpenTelemetry instrument's dots as underscores, so the alert
+		// expressions and the reference both use the underscored form.
+		series := regexp.MustCompile(`blnk_[a-z0-9_]+`).FindAllString(string(raw), -1)
+		require.NotEmpty(t, series, "the alert expressions must read some blnk_ series")
+
+		seen := map[string]bool{}
+		for _, name := range series {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+
+			assert.Contains(t, reference, name,
+				"alerts/blnk-kafka-alerts.yml reads %q, so docs/metrics.md must document it. An "+
+					"operator cannot tell a rule that is quiet because nothing is wrong from one that "+
+					"is quiet because its series was never recorded", name)
+		}
+	})
+
+	t.Run("every deployment surface states the same count", func(t *testing.T) {
+		// Three files explain what an unmounted rule file or a disarmed metrics registry costs, and
+		// each quantifies it. They are read by whoever is deciding whether to skip that step.
+		for _, target := range [][]string{
+			{"docker-compose.yaml"},
+			{"docker-compose.dev.yaml"},
+			{"infrastructure", "k8s-manifests", "worker-deployment.yaml"},
+		} {
+			t.Run(filepath.Join(target...), func(t *testing.T) {
+				assert.Contains(t, readFile(target...), count,
+					"this file quantifies the alert rules that go inert, so it must state %s", count)
+			})
+		}
+	})
+}

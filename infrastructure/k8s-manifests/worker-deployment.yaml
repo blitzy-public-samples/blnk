@@ -42,9 +42,9 @@ spec:
       labels:
         io.kompose.service: worker
     spec:
-      # This pod never calls the Kubernetes API — it talks to Postgres, Redis,
-      # Kafka
-      # and TypeSense — and it is the role that processes untrusted transaction
+      # This pod never calls the Kubernetes API — it talks to Postgres, Redis and
+      # TypeSense, and NOT to Kafka: it holds no broker credential and opens no
+      # broker connection — and it is the role that processes untrusted transaction
       # payloads off a queue, so a mounted namespace-scoped token is exactly the
       # credential not to leave lying in it.
       automountServiceAccountToken: false
@@ -52,9 +52,10 @@ spec:
       # as
       # root. Nothing needs it: the only port bound is 5004, above the
       # privileged
-      # range, and the binary is world-executable. fsGroup matches the uid so
-      # the
-      # projected kafka-tls CA is group-readable rather than root-only.
+      # range, and the binary is world-executable. fsGroup matches the uid for the
+      # same reason it does on the server, and is kept identical between the two
+      # roles so a future projection here does not need it rediscovered — this role
+      # currently projects no Secret whose mode depends on it.
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -295,29 +296,37 @@ spec:
             # still be
             # delivering webhooks while the other has retired them.
             #
-            # All eight have safe defaults, so the configuration this role does
-            # read
-            # is unchanged by their absence.
+            # Every one of them has a safe default, so the configuration this role
+            # does read is unchanged by their absence.
             - name: KAFKA_TOPIC_PREFIX
               valueFrom:
                 configMapKeyRef:
                   name: blnk-config
                   key: KAFKA_TOPIC_PREFIX
-            - name: KAFKA_SASL_USER
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: KAFKA_SASL_USER
-            - name: KAFKA_TLS_ENABLED
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: KAFKA_TLS_ENABLED
-            - name: KAFKA_TLS_CA_FILE
-              valueFrom:
-                configMapKeyRef:
-                  name: blnk-config
-                  key: KAFKA_TLS_CA_FILE
+            # KAFKA_SASL_USER, KAFKA_TLS_ENABLED AND KAFKA_TLS_CA_FILE ARE
+            # DELIBERATELY ABSENT, alongside the producer secret and the kafka-tls
+            # projection that used to accompany them.
+            #
+            # THIS ROLE BUILDS NO PRODUCER. blnk.ProcessRole.PublishesEvents is an
+            # allowlist naming only the server, and initializeEventPublisher returns
+            # the no-op for every other role WITHOUT reading the broker list, the
+            # SASL pair or the TLS material. So this pod held a working write
+            # credential for every Blnk-owned topic and a certificate authority for a
+            # handshake it never performs — standing authority to forge ledger events,
+            # exercised never, and carried by anything that compromised the pod.
+            #
+            # EVENT CAPTURE IS UNAFFECTED, which is the reason this is safe to remove
+            # rather than a capability being withdrawn. transaction.rejected reaches
+            # the outbox from THIS role through RejectTransaction's post-transaction
+            # actions, and capture is gated on KAFKA_BROKERS through
+            # eventPublishingConfigured — never on a credential. The row is written to
+            # Postgres inside the ledger transaction, and the relay in the server role
+            # is what publishes it.
+            #
+            # KAFKA_TOPIC_PREFIX above IS still needed, and the distinction matters:
+            # the outbox row records the topic its event is destined for, so this role
+            # must resolve the same names the relay will publish to. Naming a topic is
+            # not authority over it.
             - name: KAFKA_MIN_PARTITIONS
               valueFrom:
                 configMapKeyRef:
@@ -437,48 +446,12 @@ spec:
                 secretKeyRef:
                   name: blnk-datasource
                   key: dsn
-            # The PRODUCER password. A credential, so it comes from a Secret
-            # rather
-            # than from the ConfigMap, and it is the only Kafka credential this
-            # role
-            # needs: publishing requires Write and Describe on the Blnk-owned
-            # topics
-            # and nothing more.
-            #
-            # THE OPERATOR PROVISIONS THIS SECRET OUT OF BAND. The reference
-            # below expects a Secret named kafka-credentials — resolved in this
-            # pod's own namespace, blnk — carrying the key producer-secret,
-            # whose value is the SCRAM password of the principal named by
-            # KAFKA_SASL_USER above. It must be a DIFFERENT value from that
-            # Secret's admin-secret key: config.ProducerSASL declines to let a
-            # publisher authenticate as the administrator, so reusing one
-            # password is a configuration Blnk refuses to start with rather than
-            # merely a weak one.
-            #
-            # NO SECRET MANIFEST IS COMMITTED TO THIS FOLDER, deliberately — a
-            # committed Secret is a credential in version control, and
-            # blnk-config.yaml states the same rule. kafka-statefulset.yaml's
-            # header lists both Secrets this deployment needs, every key in
-            # each, and the kubectl commands that create them.
-            - name: KAFKA_SASL_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: kafka-credentials
-                  key: producer-secret
-                  # optional so a deployment that has not adopted Kafka still
-                  # starts. A required reference would hold every pod in
-                  # CreateContainerConfigError until the Secret existed, which
-                  # is
-                  # both wrong for the shipped state — KAFKA_BROKERS is empty,
-                  # so
-                  # there is nothing to authenticate to — and a worse failure
-                  # than the alternative: unset, config/config.go names the
-                  # missing variable in the boot log and the construction path
-                  # refuses to dial anything half-authenticated.
-                  optional: true
-            # THREE KAFKA VARIABLES ARE DELIBERATELY ABSENT FROM THIS ROLE and
-            # none of them may be added: KAFKA_SASL_ADMIN_USER,
-            # KAFKA_SASL_ADMIN_SECRET and KAFKA_ALLOW_ADMIN_PRODUCER.
+            # NO KAFKA CREDENTIAL OF ANY KIND IS DELIVERED TO THIS ROLE, and none may
+            # be added: not KAFKA_SASL_ADMIN_USER, KAFKA_SASL_ADMIN_SECRET or
+            # KAFKA_ALLOW_ADMIN_PRODUCER, and — since this pod builds no producer
+            # either — not KAFKA_SASL_USER or KAFKA_SASL_SECRET.
+            # server-deployment.yaml projects all of them, so the difference between
+            # the two Deployments is a decision rather than drift.
             # server-deployment.yaml projects all three, so the difference
             # between the two Deployments is a decision rather than drift. It is
             # recorded on this side too, because a manifest is read one workload
@@ -505,18 +478,17 @@ spec:
             # ConfigMap key in for the server, every pod of this Deployment
             # would fail to start.
             #
-            # KAFKA_ALLOW_ADMIN_PRODUCER is inert here for the same reason. It
-            # only chooses BETWEEN credentials, and ProducerSASL reports
-            # adminOnly only when an administrative pair is configured; with
-            # neither half present this pod publishes as the producer principal
-            # above, or without SASL when that pair is empty too.
+            # KAFKA_ALLOW_ADMIN_PRODUCER is inert here for the same reason, and now
+            # doubly so. It only chooses BETWEEN credentials, and this role holds
+            # none: it builds no producer at all, so there is no authentication
+            # decision for it to influence.
             # OBSERVABILITY. This is what makes /metrics EXIST on this pod: the
             # route is
             # registered only when the OpenTelemetry SDK was set up, and the SDK
             # is set up
             # only when this is true. False means no /metrics route at all,
             # every scrape
-            # 404s, and the eight rules in alerts/blnk-kafka-alerts.yml can
+            # 404s, and the 13 rules in alerts/blnk-kafka-alerts.yml can
             # never fire
             # because their series are never recorded. See blnk-config.yaml.
             - name: BLNK_ENABLE_OBSERVABILITY
@@ -716,7 +688,7 @@ spec:
               cpu: '2'
               memory: 768Mi
           volumeMounts:
-            # NO kafka-tls PROJECTION, and that is the difference from
+            # NO kafka-tls PROJECTION AND NO KAFKA CREDENTIAL, which is the difference from
             # server-deployment.yaml, which mounts ca.crt at the path its
             # KAFKA_TLS_CA_FILE names.
             #
@@ -733,28 +705,6 @@ spec:
               subPath: blnk.json
             - name: blnk-state
               mountPath: /var/lib/blnk
-            # The certificate authority Blnk verifies the brokers against, at
-            # the
-            # path KAFKA_TLS_CA_FILE names.
-            #
-            # ONLY ca.crt is projected, not the whole Secret. kafka-tls also
-            # holds the brokers' keystore and its passwords, and this container
-            # needs neither: a client verifying a server needs the CA, not the
-            # server's private key. Mounting the whole Secret would put a broker
-            # private key in a process that has no use for it — a blast-radius
-            # increase for nothing, since ca.crt is public material and the
-            # keystore is not.
-            #
-            # optional: true so a deployment that has not adopted Kafka still
-            # starts.
-            # With KAFKA_BROKERS empty there is no broker to verify, and a
-            # required
-            # Secret would hold every pod in ContainerCreating waiting for
-            # material
-            # nothing reads.
-            - name: kafka-tls
-              mountPath: /etc/kafka/tls
-              readOnly: true
       restartPolicy: Always
       # SIZED AGAINST THIS ROLE'S OWN SHUTDOWN BUDGET (PERF-P20/P11), which is
       # much longer than the server's because asynq's Shutdown WAITS FOR
@@ -779,11 +729,3 @@ spec:
         # true.
         - name: blnk-state
           emptyDir: {}
-        - name: kafka-tls
-          secret:
-            secretName: kafka-tls
-            optional: true
-            items:
-              - key: ca.crt
-                path: ca.crt
-            defaultMode: 0444

@@ -117,11 +117,6 @@ const (
 	eventQueryParamDLTTopic  = "dlt_topic"
 	eventQueryParamStatus    = "status"
 
-	// eventQueryParamResolved narrows the inventory by whether an operator has accounted
-	// for the entry. Absent means BOTH, which is the honest default for an inventory
-	// listing; "true"/"1"/"yes" and "false"/"0"/"no" select the two subsets, and anything
-	// else is refused rather than silently widened.
-	eventQueryParamResolved       = "resolved"
 	eventQueryParamOccurredFrom   = "occurred_from"
 	eventQueryParamOccurredTo     = "occurred_to"
 	eventQueryParamIncludeCount   = "include_count"
@@ -174,7 +169,6 @@ var deadLetterQueryParameters = []string{
 	eventQueryParamStatus,
 	eventQueryParamOccurredFrom,
 	eventQueryParamOccurredTo,
-	eventQueryParamResolved,
 	eventQueryParamIncludeCount,
 	eventQueryParamSortBy,
 	eventQueryParamSortOrder,
@@ -388,12 +382,16 @@ func includeCountFromQuery(c *gin.Context) (bool, bool) {
 //
 // # Responses
 //
-// 200 with a JSON array of dead-letter items, or with the {data, total_count}
-// envelope when include_count=true. total_count is available for EVERY narrowing,
-// including event_type and topic: it is counted from the same predicate as the page,
-// so the two cannot describe different sets. An empty inventory is 200 and `[]` —
-// never 404 and never `null`: "no events are stuck" is a successful answer, and a
-// reconciliation script must be able to range over the result unconditionally.
+// 200 with the DeadLetterPageResponse envelope — `{data, next_cursor, has_more,
+// total_count?}` — ALWAYS, whether or not a total was asked for. A client reads
+// `.data[]`; the body is never a bare array, because cursor paging has to return the
+// cursor somewhere. total_count is present only with include_count=true, is available
+// for EVERY narrowing including event_type and topic, and is read from the same
+// snapshot as the page, so the two cannot describe different sets.
+//
+// An empty inventory is 200 with `"data": []` — never 404, and `data` is never `null`:
+// "no events are stuck" is a successful answer, and a reconciliation script must be
+// able to range over `.data[]` unconditionally.
 // 403 GEN_* / AUTH_MASTER_KEY_REQUIRED for a non-master caller, 400
 // GEN_VALIDATION_ERROR for an unusable parameter, 500 GEN_INTERNAL for a
 // repository failure.
@@ -427,7 +425,29 @@ func (a *Api) ListDeadLetterEvents(c *gin.Context) {
 		return
 	}
 
-	page, err := a.blnk.ListDeadLetterEvents(c.Request.Context(), options)
+	// ONE READ WHEN A TOTAL WAS ASKED FOR, TWO OTHERWISE.
+	//
+	// The page and the total used to be two independent calls, and the response then asserted a
+	// relationship between them that nothing established: an entry dead-lettered between the two
+	// reads is counted by one and absent from the other, so the total described a set the page
+	// was not a slice of. On a triage endpoint that reads as a different amount of stuck work
+	// than there is, and a client comparing the page against the total does not terminate.
+	//
+	// The combined read draws both from one read-only REPEATABLE READ snapshot. A caller that did
+	// not ask for a total still takes the cheaper single-statement path, because there is then no
+	// second answer to be coherent with.
+	var (
+		page  coremodel.DeadLetterInventoryPage
+		total int64
+		err   error
+	)
+
+	if includeCount {
+		page, total, err = a.blnk.ListAndCountDeadLetterEvents(c.Request.Context(), options)
+	} else {
+		page, err = a.blnk.ListDeadLetterEvents(c.Request.Context(), options)
+	}
+
 	if err != nil {
 		// The service returns a typed APIError for an unusable status filter and
 		// for a missing datasource, so respondError resolves the code from the
@@ -457,22 +477,15 @@ func (a *Api) ListDeadLetterEvents(c *gin.Context) {
 	}
 
 	if includeCount {
-		// Counted from the SAME narrowing the page was drawn with, which is what makes the total
-		// available for every filter rather than only for an unfiltered or status-only request.
-		// It was previously derived from a whole-table per-status aggregate that knew nothing
-		// about event_type, topic or the occurrence window, so those filters had to refuse
-		// include_count outright — the count and the page would otherwise have described
-		// different sets, and a paging client comparing them would loop forever.
-		// Paging to this total therefore exhausts the matches, which is the property a client
-		// depends on: two queries that merely looked alike could disagree, and an operator would
-		// discover the disagreement mid-incident.
-		total, countErr := a.blnk.CountDeadLetterEvents(c.Request.Context(), options)
-		if countErr != nil {
-			respondError(c, countErr, withDefault(apierror.ErrGenInternal))
-
-			return
-		}
-
+		// Counted from the SAME narrowing the page was drawn with and in the SAME snapshot, so
+		// the total is a total of this very page's population. The narrowing matters because a
+		// total was once derived from a whole-table per-status aggregate that knew nothing about
+		// event_type, topic or the occurrence window; the snapshot matters because two reads
+		// sharing a predicate still observe two populations.
+		//
+		// What it is not is a promise about the paging SESSION. Paging spans many requests over a
+		// live inventory that the relay adds to and a replay removes from, so a later page can
+		// reveal entries this total did not count. See DeadLetterPageResponse.TotalCount.
 		response.TotalCount = &total
 	}
 
@@ -487,11 +500,13 @@ func (a *Api) ListDeadLetterEvents(c *gin.Context) {
 // something was written while the caller was paging.
 //
 // total_count is present only when include_count was asked for, and it is then counted from the
-// SAME narrowing the page was drawn with. It was once refused for every filter but status,
-// because the total came from a whole-table per-status aggregate that knew nothing about
-// event_type, topic or the occurrence window; the count and the page would have described
-// different sets, and a paging client comparing them loops for ever. It is counted, never
-// estimated, for the same reason.
+// SAME narrowing the page was drawn with, in the SAME database snapshot. It was once refused for
+// every filter but status, because the total came from a whole-table per-status aggregate that
+// knew nothing about event_type, topic or the occurrence window. It is counted, never estimated.
+//
+// What total_count is exact ABOUT is stated on the field, because the honest scope of the number
+// is narrower than "the size of the backlog" and an operator acting on it during an incident
+// needs to know which.
 type DeadLetterPageResponse struct {
 	// Data is the page, newest occurrence first. Never null.
 	Data []model.DeadLetterEvent `json:"data"`
@@ -504,8 +519,24 @@ type DeadLetterPageResponse struct {
 	// without inspecting the token.
 	HasMore bool `json:"has_more"`
 
-	// TotalCount is the size of the inventory the page was drawn from, when one could be
-	// produced exactly.
+	// TotalCount is how many entries the request's narrowing matched, present only when
+	// include_count was asked for.
+	//
+	// # What it is exact about
+	//
+	// It is counted — never estimated — with the page's own filters, and it is read from the SAME
+	// snapshot as data, so the total and THIS page describe one population. That pairing is the
+	// property this field is for, and it used to be absent: the two were separate reads on
+	// separate connections, and an entry dead-lettered between them was counted by one and
+	// missing from the other.
+	//
+	// # What it is NOT
+	//
+	// It is not a promise about a paging SESSION. The inventory is live — the relay dead-letters
+	// entries into it and a replay takes them out — and paging is many requests, so a later page
+	// may hold entries this total did not count, and entries counted here may be gone by the time
+	// they would have been paged to. Treat it as "how much matched, as at this page", which is
+	// what a triage decision needs, rather than as a fixed size to page towards.
 	TotalCount *int64 `json:"total_count,omitempty"`
 }
 
@@ -545,7 +576,7 @@ func deadLetterListOptionsFromQuery(c *gin.Context) (blnk.DeadLetterListOptions,
 		return blnk.DeadLetterListOptions{}, false
 	}
 
-	resolution, ok := deadLetterResolutionFilterFromQuery(c)
+	topic, ok := deadLetterTopicFilterFromQuery(c)
 	if !ok {
 		return blnk.DeadLetterListOptions{}, false
 	}
@@ -554,11 +585,10 @@ func deadLetterListOptionsFromQuery(c *gin.Context) (blnk.DeadLetterListOptions,
 		Limit:        limit,
 		Cursor:       cursor,
 		EventType:    strings.TrimSpace(c.Query(eventQueryParamEventType)),
-		Topic:        deadLetterTopicFilterFromQuery(c),
+		Topic:        topic,
 		Status:       strings.TrimSpace(c.Query(eventQueryParamStatus)),
 		OccurredFrom: occurredFrom,
 		OccurredTo:   occurredTo,
-		Resolution:   resolution,
 	}, true
 }
 
@@ -691,23 +721,48 @@ func deadLetterCursorFromQuery(c *gin.Context) (*coremodel.DeadLetterCursor, boo
 // inventory sees dlt_topic on every item and will filter by it; an operator
 // asking "which transaction events are stuck" thinks in category topics. The
 // ".dlt" suffix is therefore trimmed using the package's own exported constant —
-// never a literal — so the two spellings resolve to one filter. topic wins when
-// both are present, because it is the value the service compares against
-// unmodified.
+// never a literal — so the two spellings resolve to one filter.
+//
+// # Two spellings that DISAGREE are refused
+//
+// Supplying both used to be resolved by preferring `topic` and discarding
+// `dlt_topic` silently. That is the one behaviour worth an error here: the caller
+// named two different narrowings and received a page drawn from one of them, so
+// the answer describes a question they did not ask and nothing in it says so — and
+// on this endpoint a page narrower or wider than requested reads as a different
+// amount of loss. Supplying both with the SAME resolved topic is accepted, because
+// `?topic=blnk.transactions&dlt_topic=blnk.transactions.dlt` is one instruction
+// written twice rather than a contradiction.
 //
 // Parameters:
-//   - c *gin.Context: the request.
+//   - c *gin.Context: the request. On refusal the response is already written when
+//     this returns.
 //
 // Returns:
 //   - string: the original category topic to filter on, or "" for no narrowing.
-func deadLetterTopicFilterFromQuery(c *gin.Context) string {
-	if topic := strings.TrimSpace(c.Query(eventQueryParamTopic)); topic != "" {
-		return strings.TrimSuffix(topic, blnk.DeadLetterTopicSuffix)
+//   - bool: false when the refusal has been written.
+func deadLetterTopicFilterFromQuery(c *gin.Context) (string, bool) {
+	topic := strings.TrimSuffix(
+		strings.TrimSpace(c.Query(eventQueryParamTopic)), blnk.DeadLetterTopicSuffix)
+	deadLetterTopic := strings.TrimSuffix(
+		strings.TrimSpace(c.Query(eventQueryParamDLTTopic)), blnk.DeadLetterTopicSuffix)
+
+	if topic != "" && deadLetterTopic != "" && topic != deadLetterTopic {
+		respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(
+			"%q and %q name different topics (%q and %q); supply one of them, or the same topic "+
+				"in both spellings",
+			eventQueryParamTopic, eventQueryParamDLTTopic,
+			topic, deadLetterTopic+blnk.DeadLetterTopicSuffix,
+		), nil)
+
+		return "", false
 	}
 
-	deadLetterTopic := strings.TrimSpace(c.Query(eventQueryParamDLTTopic))
+	if topic != "" {
+		return topic, true
+	}
 
-	return strings.TrimSuffix(deadLetterTopic, blnk.DeadLetterTopicSuffix)
+	return deadLetterTopic, true
 }
 
 // ReplayDeadLetterEvent serves POST /events/dead-letter/:event_id/replay: it
@@ -801,99 +856,6 @@ func (a *Api) ReplayDeadLetterEvent(c *gin.Context) {
 		Status:     string(outcome.Status),
 		ReplayedAt: outcome.ReplayedAt,
 	})
-}
-
-// ResolveDeadLetterEvent serves POST /events/dead-letter/:event_id/resolve: it
-// records that an operator has accounted for a dead-lettered event.
-//
-// # What it is for, and why the endpoint has to exist
-//
-// The retention purge used to delete dead-lettered rows on an age timer, on the
-// same footing as delivered ones. A delivered row is a receipt; a dead-lettered
-// row is the record of an event NO SUBSCRIBER EVER RECEIVED, together with the
-// failure metadata explaining why and the bytes a replay is driven from. Deleting
-// it destroyed all of that unrecoverably — and destroyed the OLDEST such record
-// first, which is the one most likely to have been forgotten rather than handled.
-//
-// Nothing distinguished "somebody dealt with this" from "nobody ever looked",
-// because nothing recorded the difference. This endpoint is where the difference
-// gets recorded, and it is what makes a finite retention period safe to set: an
-// unresolved entry is never purged however old it is, and it keeps the
-// DeadLetterMessageStuck alert firing until someone accounts for it.
-//
-// # What resolving does NOT mean
-//
-// It is not a replay and not a claim that the event was delivered. The legitimate
-// resolutions include "replayed after the broker came back", "the subscriber was
-// decommissioned", "superseded by a later event" and "accepted as lost, ticket
-// 4182" — only the operator knows which, which is what the optional note is for.
-//
-// The entry stays `dead_lettered` and therefore stays REPLAYABLE, and it stays
-// counted by the daily zero-loss reconciliation, because its message really is on
-// the `.dlt` topic. A resolution recorded in error costs a retention window; a
-// resolution that blocked a later replay could cost the event.
-//
-// # Responses
-//
-// 200 with the resolved entry, projected by the same model.NewDeadLetterEvent the
-// listing uses — so the caller sees the resolution exactly as the inventory will
-// report it. 403 AUTH_MASTER_KEY_REQUIRED for a non-master caller. 400
-// GEN_MISSING_PARAMETER with no id, GEN_VALIDATION_ERROR for an unusable note. 404
-// EVENT_NOT_FOUND. 409 EVENT_ALREADY_RESOLVED when it is already resolved —
-// distinct from EVENT_NOT_DEAD_LETTERED so a script can treat "already done" as
-// success — and 409 EVENT_NOT_DEAD_LETTERED when the entry has no dead-letter
-// record to resolve, which is the state of a row whose `<topic>.dlt` write is
-// still owed.
-//
-// Parameters:
-//   - c *gin.Context: the request and response.
-func (a *Api) ResolveDeadLetterEvent(c *gin.Context) {
-	if !ensureEventManagementAuthorized(c) {
-		return
-	}
-
-	eventID, passed := c.Params.Get("event_id")
-	if !passed || strings.TrimSpace(eventID) == "" {
-		respondCode(c, apierror.ErrGenMissingParameter,
-			"event_id is required. pass it in the route /events/dead-letter/:event_id/resolve", nil)
-
-		return
-	}
-
-	// The body is OPTIONAL: resolving without an explanation is a legitimate, if
-	// less useful, action, and requiring a body would make the simple case a
-	// two-field ceremony. An absent body is an empty request rather than a refusal;
-	// a MALFORMED body is still refused, because silently discarding a note the
-	// operator wrote would lose the audit trail they were trying to leave.
-	var request model.ResolveDeadLetterEventRequest
-	if c.Request.Body != nil && c.Request.ContentLength != 0 {
-		if err := c.ShouldBindJSON(&request); err != nil {
-			respondCode(c, apierror.ErrGenValidation, "Invalid request payload", err)
-
-			return
-		}
-	}
-
-	if err := request.Validate(); err != nil {
-		respondCode(c, apierror.ErrGenValidation, err.Error(), nil)
-
-		return
-	}
-
-	resolved, err := a.blnk.ResolveDeadLetterEvent(c.Request.Context(), eventID, request.Note)
-	if err != nil {
-		respondError(c, err,
-			withDefault(apierror.ErrGenInternal),
-			withUpgrade(apierror.ErrGenNotFound, apierror.ErrEventNotFound),
-			withUpgrade(apierror.ErrGenConflict, apierror.ErrEventNotDeadLettered),
-		)
-
-		return
-	}
-
-	// Projected through the same listing shape the paged inventory uses, so the event a
-	// resolve returns and the event the listing shows are the same body.
-	c.JSON(http.StatusOK, model.NewDeadLetterEvent(resolved.InventoryEntry()))
 }
 
 // GetEventOutboxStats serves GET /events/stats: the outbox side of the daily
@@ -1067,6 +1029,22 @@ func eventStatsWindowFromQuery(c *gin.Context) (time.Duration, bool) {
 		return 0, false
 	}
 
+	// A WHOLE NUMBER OF SECONDS, refused rather than truncated. The response reports the
+	// interval it measured as `window_seconds`, an integer, so `?window=1500ms` was accepted,
+	// measured as 1.5 seconds and REPORTED as 1 — an operator comparing a figure against the
+	// window they asked for would be comparing it against a different one, with nothing in the
+	// response to reveal the difference. Refusing costs them one corrected request; rounding
+	// costs them the arithmetic that follows.
+	if window%time.Second != 0 {
+		respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(
+			"%q must be a whole number of seconds, such as %q or %q; this endpoint reports the "+
+				"interval it measured in seconds and cannot describe %s without losing precision",
+			eventQueryParamWindow, "15m", "36h", window,
+		), nil)
+
+		return 0, false
+	}
+
 	return window, true
 }
 
@@ -1121,6 +1099,22 @@ func eventOutboxStatsResponseFrom(statistics blnk.EventOutboxStatistics) model.E
 		windowStart := statistics.WindowStart
 		response.WindowStart = &windowStart
 		response.WindowSeconds = int64(statistics.Window.Seconds())
+	}
+
+	// THE OWED EVENTS. Present whenever both censuses were read — including a zero-valued
+	// reading, which means nothing is outstanding and is the reassuring answer an operator is
+	// looking for — and ABSENT when either read failed, because zeros for "we could not tell"
+	// is the one misreading a zero-loss check cannot afford. The service already makes that
+	// distinction by returning nil; this projection must not flatten it.
+	if census := statistics.ProducerAtomicity; census != nil {
+		response.ProducerAtomicity = &model.ProducerAtomicityStats{
+			MonitorHandoffPending:    census.MonitorHandoffPending,
+			MonitorHandoffProcessing: census.MonitorHandoffProcessing,
+			MonitorHandoffCompleted:  census.MonitorHandoffCompleted,
+			MonitorHandoffFailed:     census.MonitorHandoffFailed,
+			UnfinalizedBatches:       census.UnfinalizedBatches,
+			OldestUnfinalizedBatchAt: census.OldestUnfinalizedBatchAt,
+		}
 	}
 
 	if !statistics.OffsetsRead {
@@ -1197,55 +1191,18 @@ func eventOutboxStatsResponseFrom(statistics blnk.EventOutboxStatistics) model.E
 	return response
 }
 
-// rejectUnsupportedEventQueryParameters refuses a request that carries a query
-// parameter the endpoint cannot honour.
+// rejectUnsupportedEventQueryParameters and quotedEventQueryParameters WERE RETIRED HERE.
 //
-// An unhonourable filter is an ERROR rather than an omission because these are
-// triage endpoints: silently ignoring a narrowing answers a different question
-// from the one asked, and the caller cannot tell. An operator who filtered by an
-// occurrence window and received the whole inventory would read stale entries as
-// current. The accepted set is therefore closed, and it is this endpoint's set
-// rather than the filter package's — an occurrence-window filter exists at no
-// layer, so it is refused here instead of being simulated after the service has
-// already paged.
-func rejectUnsupportedEventQueryParameters(c *gin.Context, supported []string) bool {
-	if c.Request == nil || c.Request.URL == nil {
-		return true
-	}
-
-	var unsupported []string
-	for name := range c.Request.URL.Query() {
-		if !slices.Contains(supported, name) {
-			unsupported = append(unsupported, name)
-		}
-	}
-
-	if len(unsupported) == 0 {
-		return true
-	}
-
-	// Map iteration order is unspecified, so the names are sorted to keep the
-	// message — and any test asserting on it — deterministic.
-	slices.Sort(unsupported)
-
-	respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(
-		"unsupported query parameter(s) %s; this endpoint accepts only %s",
-		strings.Join(quotedEventQueryParameters(unsupported), ", "),
-		strings.Join(quotedEventQueryParameters(supported), ", "),
-	), nil)
-
-	return false
-}
-
-// quotedEventQueryParameters renders parameter names for an error message.
-func quotedEventQueryParameters(names []string) []string {
-	quoted := make([]string, 0, len(names))
-	for _, name := range names {
-		quoted = append(quoted, fmt.Sprintf("%q", name))
-	}
-
-	return quoted
-}
+// They were a byte-for-byte SECOND COPY of rejectUnsupportedQueryParameters and
+// quotedQueryParameters above — same body, same message, same sorted-names rationale — and
+// nothing on the request path ever called them. Only two tests did, which is the part that
+// mattered: the coverage for "an unknown query parameter is refused" was attached to the copy
+// that never ran, so the guard actually protecting GET /events/dead-letter had none. Those
+// tests now exercise the live function.
+//
+// A second implementation of a refusal is worse than no second implementation. Tightening one
+// leaves the other permissive, and a reader cannot tell from either which one the router
+// reaches.
 
 // deadLetterInventoryTotal WAS RETIRED HERE. It had become a one-line pass-through to
 // EventDeadLetterService.CountDeadLetterEvents, and the listing handler calls that directly.
@@ -1256,43 +1213,3 @@ func quotedEventQueryParameters(names []string) []string {
 // include_count was REFUSED for exactly the narrowed listings an operator pages through. The
 // service's count shares its predicate with the listing, so the total now describes the page's
 // own result set for every filter, and the argument for that lives at the call site.
-// deadLetterResolutionFilterFromQuery reads the `resolved` filter.
-//
-// # Why it is refused rather than coerced
-//
-// gin's own boolean readers and Go's strconv.ParseBool would both turn an
-// unrecognised value into false, and false HERE means "unresolved only" — so
-// `?resolved=maybe` would silently hand back the outstanding subset while the
-// caller believed they had asked for something else. On an inventory endpoint a
-// filter that quietly means something other than what was asked is the failure
-// mode worth spending an error on: a short page reads as "nothing is stuck".
-//
-// Absent means BOTH, which is the honest default for an inventory: it shows
-// everything the table holds and lets the caller narrow deliberately.
-//
-// Parameters:
-//   - c *gin.Context: the request. On refusal the response is already written when
-//     this returns.
-//
-// Returns:
-//   - blnk.DeadLetterResolutionFilter: the requested subset.
-//   - bool: false when the refusal has been written.
-func deadLetterResolutionFilterFromQuery(c *gin.Context) (blnk.DeadLetterResolutionFilter, bool) {
-	raw := strings.TrimSpace(c.Query(eventQueryParamResolved))
-	switch strings.ToLower(raw) {
-	case "":
-		return blnk.DeadLetterResolutionAny, true
-	case "true", "1", "yes":
-		return blnk.DeadLetterResolutionResolved, true
-	case "false", "0", "no":
-		return blnk.DeadLetterResolutionUnresolved, true
-	default:
-		respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(
-			"Invalid %s value; use \"true\" for entries an operator has resolved, \"false\" for "+
-				"those still outstanding, or omit it for both",
-			eventQueryParamResolved,
-		), nil)
-
-		return blnk.DeadLetterResolutionAny, false
-	}
-}

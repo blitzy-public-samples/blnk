@@ -4,17 +4,23 @@ This is the operator's runbook for Blnk's Kafka event pipeline: how to provision
 
 ## How to Use This Document
 
-Every rule in `alerts/blnk-kafka-alerts.yml` names this file as its `runbook_url`. If you arrived from a notification, go straight to your alert:
+Every rule in `alerts/blnk-kafka-alerts.yml` names this file as its `runbook_url`, and **all 13 of them are listed below** — the table is the complete set, not a selection. `TestKafkaAlertInventory_IsStatedOnceAndAgreesEverywhere` fails if a rule is added without a row here. If you arrived from a notification, go straight to your alert:
 
 | Alert | Response section |
 |-------|-----------------|
 | `DeadLetterMessageStuck` | [DeadLetterMessageStuck](#deadlettermessagestuck) |
 | `SubscriberConsumerLagHigh` | [SubscriberConsumerLagHigh](#subscriberconsumerlaghigh) |
 | `SubscriberRevocationOutstanding` | [SubscriberRevocationOutstanding](#subscriberrevocationoutstanding) |
-| `SubscriberSettlementOutstanding` | [SubscriberSettlementOutstanding](#subscribersettlementoutstanding) |
-| `SubscriberSettlementNotProgressing` | [SubscriberSettlementNotProgressing](#subscribersettlementnotprogressing) |
+| `SubscriberCredentialOrphaned` | [SubscriberCredentialOrphaned](#subscribercredentialorphaned) |
+| `SubscriberRevocationRefused` | [SubscriberRevocationRefused](#subscriberrevocationrefused) |
 | `ConsumerLagMeasurementDegraded` | [ConsumerLagMeasurementDegraded](#consumerlagmeasurementdegraded) |
-| `ConsumerLagCoverageIncomplete` | [ConsumerLagCoverageIncomplete](#consumerlagcoverageincomplete) |
+| `SubscriberLagCoverageStale` | [SubscriberLagCoverageStale](#subscriberlagcoveragestale) |
+| `SubscriberLagCoverageIncomplete` | [SubscriberLagCoverageIncomplete](#subscriberlagcoverageincomplete) |
+| `SubscriberSettlementNotProgressing` | [SubscriberSettlementNotProgressing](#subscribersettlementnotprogressing) |
+| `SubscriberSettlementOutstanding` | [SubscriberSettlementOutstanding](#subscribersettlementoutstanding) |
+| `EventMetricsCollectionStale` | [EventMetricsCollectionStale](#eventmetricscollectionstale) |
+| `EventMetricsCollectionFailing` | [EventMetricsCollectionFailing](#eventmetricscollectionfailing) |
+| `EventMetricsCollectionAbsent` | [EventMetricsCollectionAbsent](#eventmetricscollectionabsent) |
 
 If you arrived for routine work, the four procedures are [Provisioning](#provisioning), [The ACL Model](#the-acl-model), [Dead-Letter Triage and Replay](#dead-letter-triage-and-replay) and [The Daily Outbox-versus-Offset Reconciliation](#the-daily-outbox-versus-offset-reconciliation).
 
@@ -501,6 +507,7 @@ Credential issuance says so rather than guessing. The response carries the recor
 ```json
 "enforced_access": {
   "enforced_by": ["topic", "consumer_group"],
+  "not_enforced_by": ["partition_key"],
   "topics": ["blnk.transactions"],
   "consumer_group_namespace": "blnk-sub-sub_9f8d3c214b7a5e6f.",
   "partition_key_prefix_enforced": false,
@@ -509,7 +516,7 @@ Credential issuance says so rather than guessing. The response carries the recor
 }
 ```
 
-`partition_key_prefix_enforced` is **always** `false` and `partition_key_prefix_enforced_by` is `consumer_side` whenever a prefix is recorded, `none` when one is not. Issuance also logs a WARNING naming the prefix, the enforcement point and the topics the credential really covers, so the moment a key-scoped principal comes into existence is visible in the operator log.
+`enforced_by` and `not_enforced_by` together enumerate every dimension this API names, and they are disjoint — so the message-key dimension is stated as unenforced rather than left to be deduced from its absence, and a dimension moving between the two lists is a visible contract change. `not_enforced_by` carries `partition_key` for **every** subscriber, with or without a prefix recorded, because it describes what the broker can evaluate and not what the row configured. `partition_key_prefix_enforced` is **always** `false` and `partition_key_prefix_enforced_by` is `consumer_side` whenever a prefix is recorded, `none` when one is not. Issuance also logs a WARNING naming the prefix, the enforcement point and the topics the credential really covers, so the moment a key-scoped principal comes into existence is visible in the operator log.
 
 Recording a prefix in the other order — onto a subscriber that **already** holds a credential — logs its own WARNING, carrying the same fields plus `credential_issued_at`. Both orders are disclosed because only one of them is reported by anything else: a prefix binds no ACL, so it produces no grant churn for the update's own log line to mention, and without this warning a live principal would quietly come to sit under a row describing something narrower than it is. The issuance instant is there to tell a row you have just provisioned apart from one whose principal has been reading whole topics for months.
 
@@ -517,11 +524,10 @@ Recording a prefix in the other order — onto a subscriber that **already** hol
 
 > **This used to be a refusal, and it was wrong.** `POST /subscribers/:subscriber_id/kafka-credentials` answered `409 SUBSCRIBER_ISOLATION_UNENFORCEABLE` for any row recording a prefix, recording one on a provisioned subscriber was refused too, and a `CHECK` constraint made the combination unrepresentable. The concern was legitimate — a registry row must not be readable as a boundary the broker keeps — but a subscriber that is refused a credential consumes **nothing**, which is the absence of a boundary rather than a narrower one. The refusals are gone, the constraint is dropped by `sql/1781248930.sql`, and the error code no longer exists. If your database predates that migration, a `PATCH` recording a prefix on a provisioned subscriber returns `500` naming the migration to apply.
 >
-> One caveat if you were running the refusal: `sql/1781248920.sql` **cleared** `partition_key_prefix` on every row that held it beside a credential, and those values were not retained anywhere. Re-record them with `PATCH /subscribers/{id}`.
+> One caveat if you were running the refusal: `sql/1781248920.sql` **cleared** `partition_key_prefix` on every row that held it beside a credential, and those values were not retained anywhere. Re-record them with `PUT /subscribers/{id}` — the registry has no `PATCH` route, and an unregistered verb is answered by the router rather than the handler.
 
-Note also that the prefix is **recorded rather than derived** — unlike the principal and the group. It could not be derived: a Kafka message key on Blnk's topics is the ledger the event belongs to wherever one exists, and otherwise the aggregate the event describes (see [event-streaming.md](event-streaming.md#the-key-is-the-ledger-id-wherever-a-ledger-exists)), so a prefix computed from the subscriber's own identifier would match no record ever produced and a subscriber filtering on it would silently discard its entire stream.
 
-`partition_key_prefix` and `partition_key_prefix_enforced` live in the same object deliberately: the scope cannot be read without the statement that the broker does not keep it. **The subscriber's consumer must discard records whose key does not carry the prefix**, because nothing upstream of the consumer discards them. When no prefix is recorded the field reads `all-keys` and `partition_key_prefix_enforced` is `true`, because the topic grant is then the whole boundary.
+`partition_key_prefix` and `partition_key_prefix_enforced` live in the same object deliberately: the scope cannot be read without the statement that the broker does not keep it. **The subscriber's consumer must discard records whose key does not carry the prefix**, because nothing upstream of the consumer discards them. When no prefix is recorded, `partition_key_prefix` is **omitted** from the body and `partition_key_prefix_enforced_by` reads `none`: the topic grant is then the whole boundary and there is nothing for a consumer to filter. `partition_key_prefix_enforced` stays `false` in that case too — it is never `true`, because the broker has no message-key dimension to enforce with whether or not a prefix was asked for, and a `true` there would be the one wrong answer that is a disclosure bug. There is no `all-keys` sentinel on the wire either: this field is what a consumer compares record keys against, so any stand-in for "no restriction" would be a filter matching nothing, and a client applying it would silently discard its entire stream.
 
 This is the same posture the event contract takes for duplicate suppression: delivery is at-least-once, so `event_id` idempotency is a documented subscriber obligation rather than a broker guarantee. A key scope is that pattern applied to authorization.
 
@@ -530,6 +536,8 @@ This is the same posture the event contract takes for duplicate suppression: del
 > **Changed behaviour.** Issuance used to **refuse** any row carrying a prefix with `409 SUBSCRIBER_ISOLATION_UNENFORCEABLE`, and the schema forbade the prefix alongside a credential. Both are gone: the refusal implemented no part of the third scope, it withheld the credential instead, so a key-scoped subscriber could not consume at all. `sql/1781249138.sql` drops `event_subscribers_key_scope_chk`, and the error code is retired rather than left unraisable. Recording a prefix on an already-provisioned subscriber is now accepted and **takes effect on the next issuance** — re-issue to hand the consumer its new boundary; the credential already in the field still carries the old one.
 
 Note also that the prefix is **recorded rather than derived** — unlike the principal and the group. It could not be derived: a Kafka message key on Blnk's topics is the outbox row's stored partition key, which is the **ledger id** wherever the event's subject belongs to a ledger (see [event-streaming.md](event-streaming.md#the-key-is-the-ledger-id-wherever-a-ledger-exists)), and a prefix computed from the subscriber's own identifier bears no relation to any ledger id — so a subscriber filtering on it would silently discard its entire stream. A prefix is therefore only meaningful when the operator sets it from the ledger identifiers that subscriber is entitled to.
+
+> This paragraph appeared twice, once here and once earlier in the section, with the two copies giving slightly different accounts of the same fact. The earlier copy has been removed.
 ### Issuing credentials
 
 The response body contains a secret that exists nowhere else, so write it to a private file and never to a terminal. `--output` keeps it off stdout; `umask 077` keeps the file private from the moment it is created.
@@ -818,14 +826,13 @@ Paged and filtered:
 | `limit` | Page size. Default `20`, maximum `100`; an out-of-range value resets to `20`, a non-numeric one is refused. |
 | `offset` | Page offset. A negative value becomes `0`. Prefer `cursor` for anything deeper than a page or two: an offset's cost grows with its depth. |
 | `cursor` | Keyset cursor naming the `(occurred_at, id)` coordinate of the last entry on the previous page. It is the stable way to page: a row cannot be shown twice or skipped when new failures arrive between requests. |
-| `resolved` | `true` for entries an operator has resolved, `false` for those still outstanding, omitted for both. Anything else is refused rather than coerced. |
 | `event_type` | Exact match on the event name, e.g. `transaction.applied`. |
 | `topic` | Exact match on the **original category** topic, e.g. `blnk.transactions`. |
 | `dlt_topic` | The same filter expressed as the `.dlt` sibling, e.g. `blnk.transactions.dlt`. |
 | `status` | `failed` or `dead_lettered`. Anything else is refused. |
 | `occurred_from` | RFC3339 instant. **Inclusive** lower bound on `occurred_at`. |
 | `occurred_to` | RFC3339 instant. **Inclusive** upper bound on `occurred_at`. |
-| `include_count` | Adds a `{data, total_count}` envelope. Supported alongside **every** filter in this table: the total is counted through the same predicate the page is selected by, so paging to `total_count` exhausts the matches. |
+| `include_count` | Adds `total_count` to the envelope, which is present either way. Supported alongside **every** filter in this table: the total is counted through the same predicate the page is selected by, **in the same database snapshot**, so the total and the page you are holding describe one population. It is not a fixed size to page towards — the inventory is live. |
 | `sort_by` | Accepted and **inert**, for compatibility with a generic list-endpoint client. |
 | `sort_order` | Accepted and **inert**, for the same reason. |
 
@@ -840,7 +847,7 @@ Two values are refused rather than guessed at, and both refusals matter during a
 - A bound that is **not RFC3339** — a bare date such as `2026-08-01`, or a Unix epoch — is `400 GEN_VALIDATION_ERROR`. Guessing a time zone for a date is how a window ends up a day out, and a day is the difference between "this failed during the incident" and "this failed before it".
 - An **inverted** window, `occurred_from` later than `occurred_to`, is `400 GEN_VALIDATION_ERROR`. It matches nothing, and answering it with an empty page would read as "nothing failed then" — the wrong answer to a question that was typed backwards.
 
-The window is applied in **SQL**, served by the `(status, occurred_at)` index, and not by the in-memory filter walk that `event_type` and `topic` use. That is what makes "what failed last Tuesday" answerable at all: the walk is bounded by a scan limit and the inventory is newest-first, so an older window would exhaust that budget before reaching the rows it asked for. It also narrows the pages the walk reads, so a window combined with `event_type` spends its whole budget inside the window.
+The window is applied in **SQL**, served by the `(status, occurred_at)` index — as `event_type`, `topic` and `status` now are. That is what makes "what failed last Tuesday" answerable at all. The filters were once applied by an in-memory walk bounded by a scan limit, over a newest-first inventory, so an older window exhausted that budget before reaching the rows it asked for and returned an empty page with nothing to say the budget had run out. There is no walk and no budget left to reach.
 
 ```bash
 # Everything that failed inside one incident window.
@@ -850,17 +857,17 @@ curl -sS "$BLNK_API/events/dead-letter?occurred_from=2026-08-01T13:00:00Z&occurr
 
 An offset is honoured, so `2026-08-01T14:00:00+01:00` and `2026-08-01T13:00:00Z` select the same instant.
 
-An empty inventory is `200` and `[]` — never `404` and never `null`. "No events are stuck" is a successful answer, and a script must be able to range over the result unconditionally.
+**This listing always answers with the `{data, next_cursor, has_more, total_count?}` envelope**, so read `.data[]` and never the body as an array. That holds whether or not you asked for a total: cursor paging has to return the cursor somewhere, so there is no shape in which the body is a bare list. Page by handing `next_cursor` back as `?cursor=`, and stop when it is absent — not when a page comes back empty.
+
+An empty inventory is `200` with `"data": []` — never `404`, and `data` is never `null`. "No events are stuck" is a successful answer, and a script must be able to range over `.data[]` unconditionally.
 
 **Always page with `include_count=true` when you are investigating a loss.** The total is what tells a short page apart from a complete one, and this is not a theoretical concern: the filtered listing used to be assembled in memory and abandoned after five thousand scanned rows, so a filter whose matches lay past that point returned an empty page with nothing in the response saying so. It is applied in SQL now and there is no bound left to reach — but the total is still the check that would catch a future regression, and it costs one query.
-
-`resolved` is refused rather than coerced when it is not one of `true`/`1`/`yes`/`false`/`0`/`no`. That is deliberate: the usual boolean readers turn an unparseable value into `false`, and `false` here means *unresolved only* — so `?resolved=maybe` would quietly hand back a subset while you believed you had asked for something else.
 
 Narrow to one topic's replayable backlog:
 
 ```bash
 curl -sS "$BLNK_API/events/dead-letter?topic=blnk.transactions&status=dead_lettered&limit=100" \
-  --config "$BLNK_CURL_CONFIG" | jq '.[] | {event_id, event_type, status, attempts, failure_reason, last_attempted_at}'
+  --config "$BLNK_CURL_CONFIG" | jq '.data[] | {event_id, event_type, status, attempts, failure_reason, last_attempted_at}'
 ```
 
 Each item carries `event_id`, `event_type`, `aggregate_id`, `ledger_id`, `partition_key`, `occurred_at`, `schema_version`, `topic`, `dlt_topic`, `status`, `attempts`, `failure_reason`, `first_attempted_at`, `last_attempted_at` and `payload_bytes`. **The payload itself is never returned** — the projection is the single place the stored payload, the raw driver error text and the internal failure struct are dropped, so an operator triaging a backlog does not receive a copy of every event body.
@@ -980,7 +987,7 @@ A useful shortcut when the classification is what you are triaging on: the listi
 ```bash
 curl -sS "$BLNK_API/events/dead-letter?limit=100" \
   --config "$BLNK_CURL_CONFIG" \
-  | jq 'group_by(.failure_reason) | map({failure_reason: .[0].failure_reason, count: length})'
+  | jq '.data | group_by(.failure_reason) | map({failure_reason: .[0].failure_reason, count: length})'
 ```
 
 ### Step 4 — Replay
@@ -1022,7 +1029,7 @@ Replaying a backlog is a loop over the listing. Keep it deliberate — one topic
 ```bash
 curl -sS "$BLNK_API/events/dead-letter?topic=blnk.transactions&status=dead_lettered&limit=100" \
   --config "$BLNK_CURL_CONFIG" \
-| jq -r '.[].event_id' \
+| jq -r '.data[].event_id' \
 | while read -r id; do
     curl -sS -X POST "$BLNK_API/events/dead-letter/$id/replay" \
       --config "$BLNK_CURL_CONFIG" | jq -c '{event_id, topic, status}'
@@ -1045,61 +1052,23 @@ curl -sS "$BLNK_API/events/dead-letter?topic=blnk.transactions&status=dead_lette
   your handler is order-sensitive rather than idempotent, check `occurred_at` against the state you
   already hold before applying, and ignore an event older than what you have.
 
-### Step 5 — Resolve, and why you cannot skip it
+### Step 5 — There is no resolve step
 
-Replaying moves the event. **Resolving records that you dealt with it**, and it is the only thing that ever makes a dead-lettered row eligible for deletion.
+**A replay the broker acknowledges is the whole of the workflow.** There is no second call to record that you dealt with an entry, and the absence is deliberate.
 
-```bash
-curl -sS -X POST \
-  "$BLNK_API/events/dead-letter/9f8d3c21-4b7a-5e6f-8a12-0c4d5e6f7a8b/resolve" \
-  --config "$BLNK_CURL_CONFIG" \
-  -H "Content-Type: application/json" \
-  -d '{"note": "replayed after the broker came back; ticket 4182"}' | jq .
-```
+A `POST /events/dead-letter/{event_id}/resolve` route existed and has been withdrawn. It recorded an operator's decision that an entry needed no further action, which then made the row eligible for the retention purge — and it could not compose with a replay in either order. Resolve first and the replay's success became unrecordable: marking the row `dispatched` violated the constraint that confined a resolution to the dead-lettered states, so the API answered `EVENT_REPLAY_FAILED` for a publish the broker had *accepted* and released the row as replayable again, inviting a duplicate on the topic. Replay first and the resolution was refused outright, because it required the `dead_lettered` state the replay had just left.
 
-The response is the inventory entry, exactly as the listing will now report it, with `resolved_at` and `resolution_note` populated.
+What follows from the withdrawal, in the terms of the two things it used to control:
 
-**Resolving is not a claim that the event was delivered.** All of these are legitimate resolutions, and only you can tell which happened:
+- **The retention purge** now deletes `dispatched` rows only. A dead-lettered row is never removed by age, however old it is, so nothing can destroy the evidence of a loss. It becomes deletable by being *replayed*: the acknowledged re-publish makes it `dispatched`, and `RELAY_EVENT_RETENTION_DAYS` then applies to it as it does to every other receipt.
+- **The dead-letter age gauge** counts every outstanding entry, with no exemption. `blnk_dlt_oldest_message_age_seconds` and `DeadLetterMessageStuck` therefore stay up until the event has actually reached a subscriber, which is stronger pressure than a note could be — an entry cannot be signed off without being delivered.
 
-| What you did | A useful note |
+That leaves the two cases a resolution used to cover, and both have an honest answer:
+
+| Situation | What to do |
 |---|---|
-| Replayed it successfully | `replayed after the broker came back; ticket 4182` |
-| The subscriber no longer exists | `subscriber sub_9f8d… decommissioned 2026-04; no audience for this event` |
-| A later event supersedes it | `superseded by transaction.void on the same aggregate` |
-| Accepted the loss | `accepted as lost — payload exceeded the broker maximum and cannot publish; ticket 4310` |
-
-The note is optional and bounded at 1,024 characters, with control characters refused. It is worth writing: the next operator has to be able to tell a *handled* failure from a *dismissed* one, and a resolution without a reason barely distinguishes them.
-
-**What resolving does and does not change:**
-
-- The status stays `dead_lettered`, so the event is **still replayable** and still counted by the daily zero-loss reconciliation — its message really is on the `.dlt` topic. A resolution recorded in error costs you a retention window; one that blocked a later replay could cost you the event.
-- It leaves the **dead-letter age gauge**, so `blnk_dlt_oldest_message_age_seconds` and the `DeadLetterMessageStuck` alert stop counting it. That is the mechanism by which the alert reflects outstanding work rather than history.
-- It becomes eligible for the retention purge, subject to `RELAY_EVENT_RETENTION_DAYS` — see [Retention: the two lifecycles](#retention-the-two-lifecycles).
-
-| Status | `error_detail.code` | Meaning |
-|--------|--------------------|---------|
-| `200` | — | Recorded. |
-| `400` | `GEN_MISSING_PARAMETER` | No event id in the route. |
-| `400` | `GEN_VALIDATION_ERROR` | The note is too long or carries control characters. |
-| `403` | `AUTH_MASTER_KEY_REQUIRED` | Use the master key. |
-| `404` | `EVENT_NOT_FOUND` | No event with that id. |
-| `409` | `EVENT_ALREADY_RESOLVED` | Already resolved. **A script may treat this as success** — that is why it is its own code rather than a shared conflict. |
-| `409` | `EVENT_NOT_DEAD_LETTERED` | The row is `failed`: its `<topic>.dlt` write is still owed, so the outbox row is the only copy of the event in existence and it cannot be "dealt with" yet. Get the dead-letter write to land first. |
-
-To see what is still outstanding rather than the whole history:
-
-```bash
-curl -sS "$BLNK_API/events/dead-letter?resolved=false&include_count=true&limit=100" \
-  --config "$BLNK_CURL_CONFIG" | jq '{outstanding: .total_count}'
-```
-
-And to audit what was closed, with the reasons:
-
-```bash
-curl -sS "$BLNK_API/events/dead-letter?resolved=true&limit=100" \
-  --config "$BLNK_CURL_CONFIG" \
-| jq -r '.[] | [.event_id, .resolved_at, .resolution_note] | @tsv'
-```
+| Replayed successfully | Nothing further. The row is `dispatched`, it has left the inventory and the gauge, and retention will remove it. |
+| The subscriber is gone, a later event supersedes it, or the loss is accepted | The entry stays. Record the decision where decisions belong — the incident ticket — and, when the event genuinely must leave the inventory, replay it: the topic is Blnk's own, a subscriber deduplicates on `event_id`, and a decommissioned subscriber has no consumer to receive it. Deleting the row by hand in the database is the other option and it destroys the only record that the event went undelivered, so take it only with the same deliberation as any other manual write to a ledger-adjacent table. |
 
 ### Step 6 — Verify
 
@@ -1110,7 +1079,7 @@ Three checks, in increasing strength.
 #    appear in the inventory.
 curl -sS "$BLNK_API/events/dead-letter?status=dead_lettered&limit=100" \
   --config "$BLNK_CURL_CONFIG" \
-| jq -r '.[].event_id' | grep -c '9f8d3c21-4b7a-5e6f-8a12-0c4d5e6f7a8b' || echo "cleared"
+| jq -r '.data[].event_id' | grep -c '9f8d3c21-4b7a-5e6f-8a12-0c4d5e6f7a8b' || echo "cleared"
 
 # 2. The counts moved: dead_lettered down, dispatched up.
 curl -sS "$BLNK_API/events/stats" --config "$BLNK_CURL_CONFIG" \
@@ -1139,22 +1108,19 @@ The sweep runs hourly in the server role, deletes in bounded batches so it never
 | Row state | Deleted by age? | Why |
 |---|---|---|
 | `dispatched` | **Yes** | A receipt. The event reached the broker and a subscriber has had it; after the period the row says nothing anyone needs. |
-| `dead_lettered`, resolved | **Yes**, from its occurrence | An operator accounted for it, so the evidence has served its purpose. |
-| `dead_lettered`, unresolved | **No, however old** | It is the only record that a ledger event went undelivered, the only thing a replay can be driven from, and the only place the failure metadata lives. |
+| `dead_lettered` | **Never, however old** | It is the only record that a ledger event went undelivered, the only thing a replay can be driven from, and the only place the failure metadata lives. Replaying it makes it `dispatched`, and *then* the period applies. |
 | `failed` | **Never** | Its `<topic>.dlt` write is still owed, so this table is the only copy of the event in existence. |
 | `pending`, `processing`, `webhook_pending`, `replaying` | **Never** | A delivery attempt is still owed. |
 
-That third row is what makes a finite period safe to configure. **The purge cannot destroy the evidence of a loss nobody has looked at** — it can only remove what somebody signed off. The pressure to sign off is the `DeadLetterMessageStuck` alert, which keeps firing until you do.
+That second row is what makes a finite period safe to configure. **The purge cannot destroy the evidence of a loss** — it can only remove events that reached the broker. The pressure to work through the backlog is the `DeadLetterMessageStuck` alert, which keeps firing until each entry has actually been delivered.
 
-The practical consequence for an operator: **an unresolved backlog grows without bound and the purge will not help you.** If `blnk_dlt_oldest_message_age_seconds` is high and the inventory is large, the answer is to work through it with Steps 1–5 above, not to shorten the retention period — shortening it changes nothing for those rows.
+The practical consequence for an operator: **a dead-letter backlog grows without bound and the purge will not help you.** If `blnk_dlt_oldest_message_age_seconds` is high and the inventory is large, the answer is to work through it with Steps 1–4 above, not to shorten the retention period — shortening it changes nothing for those rows.
 
-To see how much of the inventory is waiting on you versus waiting on retention:
+To size the backlog that is waiting on you:
 
 ```bash
-curl -sS "$BLNK_API/events/dead-letter?resolved=false&include_count=true&limit=1" \
+curl -sS "$BLNK_API/events/dead-letter?include_count=true&limit=1" \
   --config "$BLNK_CURL_CONFIG" | jq '{outstanding: .total_count}'
-curl -sS "$BLNK_API/events/dead-letter?resolved=true&include_count=true&limit=1" \
-  --config "$BLNK_CURL_CONFIG" | jq '{awaiting_retention: .total_count}'
 ```
 
 ## The Daily Outbox-versus-Offset Reconciliation
@@ -1512,7 +1478,7 @@ severity: critical
 
 **900 seconds is the 15-minute threshold**, written as a literal so it is greppable. The dwell is deliberately `0m` rather than omitted: the threshold already carries the whole 15 minutes, and a `for` here would double-count it.
 
-The gauge is an **age, not a count** — a single entry this old is enough to fire — and it is the age of the *oldest unresolved* entry per dead-letter topic, so one comparison covers the whole inventory. Its inventory is every outbox row in the `failed` **or** `dead_lettered` state, reported under the `.dlt` topic it was destined for, so an event whose dead-letter write itself failed is included.
+The gauge is an **age, not a count** — a single entry this old is enough to fire — and it is the age of the *oldest outstanding* entry per dead-letter topic, so one comparison covers the whole inventory. Its inventory is every outbox row in the `failed` **or** `dead_lettered` state, reported under the `.dlt` topic it was destined for, so an event whose dead-letter write itself failed is included. There is no exemption: an entry leaves this gauge by being **replayed**, which makes it `dispatched`, and by nothing else.
 
 1. **Identify the topic** from the alert's `topic` label. It is a `.dlt` name; the original category topic is that name with `.dlt` removed, and it is where a replay goes.
 2. **Read the status first, because remediation depends on it.**
@@ -1525,9 +1491,8 @@ The gauge is an **age, not a count** — a single entry this old is enough to fi
 3. **List the entries** for that topic — [Step 1](#step-1--list-the-dead-lettered-events).
 4. **Read the failure metadata** and bound the failure window — [Step 2](#step-2--read-the-failure-metadata).
 5. **Fix the underlying cause** — [Step 3](#step-3--decide). Replaying before the cause is fixed re-dead-letters the event and buys nothing.
-6. **Replay** — [Step 4](#step-4--replay).
-7. **Resolve** — [Step 5](#step-5--resolve-and-why-you-cannot-skip-it). This is the step that clears the alert, and it is easy to stop before it: replaying moves the event, resolving records that you dealt with it. An entry you replayed but did not resolve **keeps this alert firing**, because the gauge counts unresolved entries and the replay did not change that. It is also the step that makes the row eligible for retention, so skipping it keeps the payload — and its personal data — indefinitely.
-8. **Confirm the gauge returns toward zero.** The collector re-reads it from authoritative state on every tick and records an **explicit zero** when a topic's inventory is empty; **that zero is the reading that clears the alert.** A gauge still above the threshold after a successful replay means unresolved entries remain — either rows still in `failed`, or rows you replayed without resolving.
+6. **Replay** — [Step 4](#step-4--replay). This is the step that clears the alert, and it is the only one that can: the replay is what takes the entry out of the gauge's inventory, and it does so by making the row `dispatched`. There is no follow-up call — see [Step 5](#step-5--there-is-no-resolve-step).
+7. **Confirm the gauge returns toward zero.** The collector re-reads it from authoritative state on every tick and records an **explicit zero** when a topic's inventory is empty; **that zero is the reading that clears the alert.** A gauge still above the threshold after a successful replay means entries remain — either rows still in `failed`, whose dead-letter write has yet to land, or `dead_lettered` rows you have not replayed.
 
 ### SubscriberConsumerLagHigh
 
@@ -1546,10 +1511,10 @@ A warning rather than a page: the events are durably in Kafka and a consumer cat
    ```bash
    curl -sS "$BLNK_API/subscribers?subscriber_id_hash=$TOKEN" \
      --config "$BLNK_CURL_CONFIG" \
-     | jq -r '.[] | "\(.subscriber_id)\t\(.kafka_principal)\t\(.consumer_group_id)"'
+     | jq -r '.data[] | "\(.subscriber_id)\t\(.kafka_principal)\t\(.consumer_group_id)"'
    ```
 
-   A one-element array resolved it. `[]` with **200** means the registry was searched to its end and holds no such subscriber. **500** `GEN_INTERNAL` means the registry exceeds the resolver's bound of 100 pages × 100 rows, so the answer is **unknown rather than negative** — query the table directly in that case:
+   `GET /subscribers` answers with the `{data, next_cursor, has_more, total_count}` envelope for **every** reading, including this one, so read `.data[]`. A one-element `data` resolved it; an empty `data` with **200** means the registry was searched to its end and holds no such subscriber. `total_count` is exact here because the resolution is complete rather than paged, and `limit` and `cursor` are **refused** on this reading — there is no page to bound. **500** `GEN_INTERNAL` means the registry exceeds the resolver's bound of 100 pages × 100 rows, so the answer is **unknown rather than negative** — query the table directly in that case:
 
    ```bash
    $BLNK_PSQL -c "
@@ -1595,7 +1560,7 @@ It fires on the **age**, not the count, and the age is measured from when the ob
    ```bash
    curl -sS "$BLNK_API/subscribers?revocation_pending=true" \
      --config "$BLNK_CURL_CONFIG" \
-     | jq -r '.[] | "\(.revocation_pending_at)\t\(.subscriber_id)\t\(.kafka_principal)"'
+     | jq -r '.data[] | "\(.revocation_pending_at)\t\(.subscriber_id)\t\(.kafka_principal)"'
    ```
 
    The scan covers the **whole** registry rather than the page you asked for, and returns the rows **oldest obligation first** — the same order the alert fires on, so the longest exposure is at the top. Each row carries `revocation_pending_at` (how long) and `kafka_principal` (what has to be revoked).
@@ -1981,9 +1946,9 @@ docker compose --profile monitoring up -d prometheus
 
 ## Relay Operations
 
-**The event relay runs in the server process role**, started immediately after the fund-lineage outbox processor it is modelled on — this repository's established home for an outbox relay, which also avoids standing up a fourth asynq server for one poll loop. There is no separate relay binary and no relay subcommand: `blnk start` *is* how the relay is run. `make run_relay` is an alias for the server role, provided so that "where does the relay run" is answerable without reading `cmd/server.go`, and so the relay can be run in isolation for a load test or while watching a backlog drain. It loads `.env` the way `make kafka_provision` does — the file supplies defaults, the caller's environment wins — and reports the broker list it resolved from `KAFKA_BROKERS`, the `BLNK_KAFKA_BROKERS` alias, or `blnk.json`. Finding none is a warning rather than a refusal: `config.Fetch` is the authority, and the target will not reject a deployment the typed loader would have accepted. The warning is still worth reading, because the failure it points at is silent.
+**The event relay runs in the server process role**, started immediately after the fund-lineage outbox processor it is modelled on — this repository's established home for an outbox relay, which also avoids standing up a fourth asynq server for one poll loop. There is no separate relay binary and no relay subcommand: `blnk start` *is* how the relay is run. `make run_relay` is an alias for the server role, provided so that "where does the relay run" is answerable without reading `cmd/server.go`, and so the relay can be run in isolation for a load test or while watching a backlog drain. It loads `.env` the way `make kafka_provision` does — the file supplies defaults, the caller's environment wins — and reports the broker list it resolved from `KAFKA_BROKERS`, the `BLNK_KAFKA_BROKERS` alias, or `blnk.json`. **Finding none is a refusal: the target prints the four places a broker list can be set and exits non-zero without starting anything.** It fails fast deliberately, because the alternative failure is silent — a server that comes up healthy, serves the API, captures events into `blnk.event_outbox` and publishes none of them. That is the one outcome worth a hard stop, and it is a stop only in this target: `blnk start` itself treats an empty broker list as the legitimate no-Kafka steady state described under [Running Without Kafka](#running-without-kafka), so nothing here narrows what the typed loader accepts. `config.Fetch` remains the authority on whether a *configured* value is valid.
 
-**`make run_relay` reads `.env`, so the ordinary workflow needs nothing exported.** `./stack.sh --init` writes `KAFKA_BROKERS` and the producer pair into a mode-0600 `.env`, and the target sources that file — then replays the caller's own environment on top, so **anything you pass on the command line wins** and `.env` supplies only what you did not:
+**`make run_relay` reads `.env`, so the ordinary workflow needs nothing exported.** `./stack.sh --init` writes `KAFKA_BROKERS` and the producer pair into a mode-0600 `.env`, and the target sources that file — then replays the caller's own environment on top, so **anything you pass on the command line wins** and `.env` supplies only what you did not. Reading the file is what makes the refusal above honest: those assignments are not exported into your shell, so a target that consulted only the environment would refuse the operator who had just followed its own setup instruction.
 
 ```bash
 make run_relay                              # broker list from .env
@@ -1999,13 +1964,6 @@ set -a; . ./.env; set +a
 ```
 
 Skip that and the server comes up looking entirely healthy while publishing nothing, because the relay start is conditional on brokers being configured.
-
-`make run_relay` **reads `.env`** — the same way `make kafka_provision` does, and with the same precedence: the caller's exported environment wins, `.env` supplies the rest. That is what makes the refusal above honest. `./stack.sh --init` writes the broker list and the producer pair into a mode-0600 `.env`, and those assignments are not exported into your shell, so a target that consulted only the environment refused the operator who had just followed its own instruction. To point one run somewhere else, name it on the command line:
-
-```bash
-make run_relay                                   # brokers and credentials from .env
-KAFKA_BROKERS=localhost:9092 make run_relay      # this run only; .env supplies the rest
-```
 
 **The start is conditional on brokers being configured.** With an empty broker list the relay logs one info line and starts nothing — see [Running Without Kafka](#running-without-kafka).
 
@@ -2240,7 +2198,7 @@ recoverable from anywhere.
 | The publisher refuses to build; the server will not start | Brokers and an administrative pair are configured but no producer pair is | Set `KAFKA_SASL_USER` and `KAFKA_SASL_SECRET`. Publishing as the administrator would make a leaked producer credential a compromise of the cluster's whole authorization state. `KAFKA_ALLOW_ADMIN_PRODUCER=true` is a documented, warned-about escape hatch for a deployment mid-upgrade, not a fix. |
 | Both Kafka clients refuse to connect, naming TLS | `KAFKA_TLS_ENABLED` is off and `KAFKA_INSECURE_LOCAL_DEV` is not set | Configure the `KAFKA_TLS_*` block. Only set `KAFKA_INSECURE_LOCAL_DEV` for the local single-broker stack; it is warned about on every configuration load. |
 | A subscriber sees records outside its `partition_key_prefix` | Working as designed: the prefix is enforced **consumer-side** and no ACL evaluates a message key | Filter on the key in the consumer, or — if the records must be unreachable rather than filtered — narrow `authorized_topics`, which is a real ACL. See [the partition-key prefix](#the-partition-key-prefix-is-a-consumer-side-filtering-contract). |
-| `PATCH /subscribers/{id}` with a `partition_key_prefix` answers `500` naming a constraint | The database still carries `event_subscribers_key_scope_chk` | Apply the pending migrations; `sql/1781248930.sql` drops it. See [the partition-key prefix](#the-partition-key-prefix-is-a-consumer-side-filtering-contract). |
+| `PUT /subscribers/{id}` with a `partition_key_prefix` answers `500` naming a constraint | The database still carries `event_subscribers_key_scope_chk` | Apply the pending migrations; `sql/1781248930.sql` drops it. See [the partition-key prefix](#the-partition-key-prefix-is-a-consumer-side-filtering-contract). |
 | Replay answers `409 EVENT_NOT_DEAD_LETTERED` | The row is `failed` (its dead-letter write is still owed), already replayed, or another replay holds it | Restore broker reachability so the dead-letter write completes, then replay. See [the two states](#the-two-states-and-why-only-one-is-replayable). |
 | A subscriber cannot join its consumer group | The group is outside its `blnk-sub-<subscriber_id>.` namespace, or the binding was written without the trailing delimiter | Use a leaf inside the namespace — `blnk-sub-<id>.default` is the issued default. Check the binding is `PREFIXED` on the dot-terminated namespace. |
 | The alerts never fire, and nothing looks wrong | The rules are not loaded, or the scrape is refused | Check `http://localhost:9090/rules` — not `/targets` — and the bearer-token note in [Is the alert armed at all?](#is-the-alert-armed-at-all). |

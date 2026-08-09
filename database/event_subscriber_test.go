@@ -463,11 +463,22 @@ func TestUpdateEventSubscriber_IsFencedAndRefusesATombstonedRow(t *testing.T) {
 		db, mock, captured := newCapturingSQLMock(t)
 		source := Datasource{Conn: db}
 
-		mock.ExpectExec("UPDATE blnk.event_subscribers").
-			WillReturnResult(sqlmock.NewResult(0, 1))
+		stored := time.Now().UTC()
+		mock.ExpectQuery("UPDATE blnk.event_subscribers").WillReturnRows(
+			newEventSubscriberRows(t, map[string]driver.Value{
+				"id":                int64(4),
+				"subscriber_id":     "acme_prod",
+				"name":              "Acme",
+				"kafka_principal":   "blnk-sub-acme_prod",
+				"consumer_group_id": "blnk-sub-acme_prod.default",
+				"authorized_topics": pq.Array([]string{"blnk.transactions"}),
+				"created_at":        stored.Add(-time.Hour),
+				"updated_at":        stored,
+			}))
 
-		require.NoError(t, source.UpdateEventSubscriber(
-			context.Background(), canonicalSubscriber(t), "claim-token"))
+		updated, err := source.UpdateEventSubscriber(
+			context.Background(), canonicalSubscriber(t), "claim-token")
+		require.NoError(t, err)
 		require.NoError(t, mock.ExpectationsWereMet())
 		require.Len(t, *captured, 1)
 
@@ -476,6 +487,17 @@ func TestUpdateEventSubscriber_IsFencedAndRefusesATombstonedRow(t *testing.T) {
 			"a caller whose lease expired must not be able to write")
 		assert.Contains(t, statement, "revocation_pending_at IS NULL",
 			"an authorization change must not be accepted on a row being deregistered")
+
+		// RETURNING, so the caller answers with the row as STORED. An ExecContext left the
+		// service returning the row it had assembled, carrying the updated_at it read BEFORE
+		// the write — an instant strictly older than the stored one, which a client using it
+		// to detect concurrent modification compares against its own write and reads as
+		// unchanged.
+		assert.Contains(t, statement, "RETURNING",
+			"the write must return the row it wrote, or the response describes a pre-write state")
+		require.NotNil(t, updated)
+		assert.WithinDuration(t, stored, updated.UpdatedAt, 0,
+			"the returned updated_at must be the stored one")
 	})
 
 	t.Run("refuses a write that presents no claim", func(t *testing.T) {
@@ -484,9 +506,9 @@ func TestUpdateEventSubscriber_IsFencedAndRefusesATombstonedRow(t *testing.T) {
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
-		requireAPIError(t, source.UpdateEventSubscriber(
-			context.Background(), canonicalSubscriber(t), "   "),
-			apierror.ErrInvalidInput)
+		_, err := source.UpdateEventSubscriber(
+			context.Background(), canonicalSubscriber(t), "   ")
+		requireAPIError(t, err, apierror.ErrInvalidInput)
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 
@@ -494,12 +516,13 @@ func TestUpdateEventSubscriber_IsFencedAndRefusesATombstonedRow(t *testing.T) {
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
-		mock.ExpectExec("UPDATE blnk.event_subscribers").
-			WillReturnResult(sqlmock.NewResult(0, 0))
+		// NO ROWS is what a failed predicate looks like now that the statement RETURNS the row:
+		// the same condition the affected-row count used to report, reached through the scan.
+		mock.ExpectQuery("UPDATE blnk.event_subscribers").WillReturnError(sql.ErrNoRows)
 		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
 			WillReturnRows(fenceMissRows(false, false))
 
-		err := source.UpdateEventSubscriber(
+		_, err := source.UpdateEventSubscriber(
 			context.Background(), canonicalSubscriber(t), "stale-token")
 		requireAPIError(t, err, apierror.ErrConflict)
 		assert.Contains(t, err.Error(), "no longer held by this caller")
@@ -512,12 +535,11 @@ func TestUpdateEventSubscriber_IsFencedAndRefusesATombstonedRow(t *testing.T) {
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
-		mock.ExpectExec("UPDATE blnk.event_subscribers").
-			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery("UPDATE blnk.event_subscribers").WillReturnError(sql.ErrNoRows)
 		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
 			WillReturnRows(fenceMissRows(true, true))
 
-		err := source.UpdateEventSubscriber(
+		_, err := source.UpdateEventSubscriber(
 			context.Background(), canonicalSubscriber(t), "claim-token")
 		requireAPIError(t, err, apierror.ErrConflict)
 		assert.Contains(t, err.Error(), "being deregistered")
@@ -530,14 +552,13 @@ func TestUpdateEventSubscriber_IsFencedAndRefusesATombstonedRow(t *testing.T) {
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
-		mock.ExpectExec("UPDATE blnk.event_subscribers").
-			WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectQuery("UPDATE blnk.event_subscribers").WillReturnError(sql.ErrNoRows)
 		mock.ExpectQuery("provisioning_token IS NOT DISTINCT FROM").
 			WillReturnError(sql.ErrNoRows)
 
-		requireAPIError(t, source.UpdateEventSubscriber(
-			context.Background(), canonicalSubscriber(t), "claim-token"),
-			apierror.ErrSubscriberNotFound)
+		_, err := source.UpdateEventSubscriber(
+			context.Background(), canonicalSubscriber(t), "claim-token")
+		requireAPIError(t, err, apierror.ErrSubscriberNotFound)
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 }
@@ -774,9 +795,21 @@ func TestCompleteSubscriberWebhookMigration_MovesBothColumnsInOneStatement(t *te
 
 		statement := (*captured)[0]
 		assert.Contains(t, statement, "webhook_url = NULL")
-		assert.Contains(t, statement, "migrated_at = $1")
 		assert.Contains(t, statement, "RETURNING",
 			"the row is returned so a caller can confirm both facts without re-reading")
+
+		// COALESCE, AND NOT A BARE ASSIGNMENT. This statement is idempotent by design — the
+		// endpoint can legitimately be called again on a row already migrated, and webhook_url is
+		// already NULL by then so nothing else distinguishes the repeat — but an unconditional
+		// `migrated_at = $1` rewrote the instant on every call. The column records WHEN a
+		// subscriber left HTTP delivery, which is what migration-progress reporting reads and what
+		// an operator uses to judge whether the sunset window has been served, so a repeat made a
+		// long-migrated subscriber look like it moved today.
+		assert.Contains(t, statement, "migrated_at = COALESCE(migrated_at, $1)",
+			"the FIRST transition must be preserved: a repeated call must not move the migration "+
+				"instant forward")
+		assert.NotContains(t, statement, "migrated_at = $1,",
+			"a bare assignment is the defect: it overwrites the first transition on every repeat")
 	})
 
 	t.Run("carries no fence and no tombstone predicate, deliberately", func(t *testing.T) {

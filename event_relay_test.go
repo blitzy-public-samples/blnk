@@ -2760,6 +2760,56 @@ func TestGroupEventRowsByPartitionKey_KeepsClaimOrderAndSeparatesKeys(t *testing
 		"groups are ordered by first appearance, keeping the batch's FIFO shape")
 }
 
+// TestGroupEventRowsByPartitionKey_GroupsByTheKeyThePublishUses closes the gap between the
+// grouping and the routing.
+//
+// The grouping exists to serialise the rows destined for ONE Kafka partition, and a partition is
+// selected by the key the publish sends — which is the ledger when the row carries one
+// (requirement R-6) and the stored partition_key otherwise. Grouping on the stored column alone
+// therefore splits two rows headed for the same partition into two groups and publishes them
+// concurrently, losing the ordering guarantee on precisely the rows where the two values disagree:
+// a row written before the ledger was threaded through, or one whose key was derived from the
+// payload first.
+//
+// Concurrency makes the resulting misordering non-deterministic, so it would surface as an
+// intermittent ordering complaint with nothing in the data to explain it.
+func TestGroupEventRowsByPartitionKey_GroupsByTheKeyThePublishUses(t *testing.T) {
+	// Two rows on ONE ledger whose stored keys differ — the divergent case. Under the old
+	// grouping these were two groups; they are one partition.
+	first := relayRow(21, "d-1", "transaction.applied", "bln_legacy_one", relayFixedNow)
+	first.LedgerID = "ldg_shared"
+	second := relayRow(22, "d-2", "transaction.applied", "bln_legacy_two", relayFixedNow.Add(time.Second))
+	second.LedgerID = "ldg_shared"
+
+	// A third row on a DIFFERENT ledger, so the test proves the grouping still separates
+	// genuinely independent aggregates rather than collapsing everything into one group.
+	other := relayRow(23, "e-1", "transaction.applied", "bln_legacy_one", relayFixedNow.Add(2*time.Second))
+	other.LedgerID = "ldg_other"
+
+	require.NotEqual(t, first.PartitionKey, second.PartitionKey,
+		"the fixture's whole point is that the stored keys differ")
+	require.Equal(t, first.EffectiveKey(), second.EffectiveKey(),
+		"...while the key the publish uses is the same")
+
+	groups := groupEventRowsByPartitionKey([]model.EventOutbox{first, second, other})
+
+	require.Len(t, groups, 2, "one group per PUBLISHED key, not per stored column")
+	assert.Equal(t, []string{"d-1", "d-2"}, relayGroupEventIDs(groups[0]),
+		"two rows headed for one partition must be published by one goroutine, in claim order")
+	assert.Equal(t, []string{"e-1"}, relayGroupEventIDs(groups[1]),
+		"a different ledger is a different partition and may proceed concurrently")
+
+	// AND THE STORED COLUMN ALONE WOULD SPLIT THEM. Asserted explicitly so the test states the
+	// defect it guards rather than only the fixed behaviour.
+	byStoredColumn := map[string]int{}
+	for _, row := range []model.EventOutbox{first, second, other} {
+		byStoredColumn[row.PartitionKey]++
+	}
+	assert.Len(t, byStoredColumn, 2,
+		"the stored keys form a different partitioning of these rows, which is what made the old "+
+			"grouping wrong rather than merely redundant")
+}
+
 // TestGroupEventRowsByPartitionKey_KeepsUnkeyedRowsApart asserts a blank key does not collapse
 // unrelated rows into one serialised group. A persisted row always has a key, so this covers
 // the case where the data is already wrong.

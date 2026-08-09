@@ -57,19 +57,20 @@ limitations under the License.
 // declines to start until it is configured. A default that silently deleted evidence would
 // be worse than one that keeps too much.
 //
-// ELIGIBLE ROWS ONLY, enforced in SQL rather than here, and "eligible" is narrower than
-// "terminal". The repository deletes a DISPATCHED row on age alone — it is a receipt for an
-// event a subscriber has already had — and a DEAD-LETTERED row only once an operator has
-// RESOLVED it. That second gate is the point: a dead-lettered row is the record of an event
-// nobody received, so it is the only inventory triage reads, the only thing a replay can be
-// driven from, and the only place the failure metadata explaining the loss exists. Deleting it
-// on an age timer destroyed all of that unrecoverably, and destroyed the oldest failure first
-// — the one most likely to have been forgotten rather than handled.
+// ONE ELIGIBLE STATE, enforced in SQL rather than here, and it is narrower than "terminal".
+// The repository deletes a DISPATCHED row on age alone — it is a receipt for an event a
+// subscriber has already had. A DEAD-LETTERED row is NEVER deleted, however old it is: it is
+// the record of an event nobody received, so it is the only inventory triage reads, the only
+// thing a replay can be driven from, and the only place the failure metadata explaining the
+// loss exists. Deleting it on an age timer destroyed all of that unrecoverably, and destroyed
+// the oldest failure first — the one most likely to have been forgotten rather than handled.
+// Such a row leaves the inventory by being REPLAYED: a re-publish the broker acknowledges
+// makes it dispatched, and this sweep then treats it as the receipt it has become.
 //
-// A pending, processing, replaying or failed row is never eligible however old it is — failed
-// most of all, because its dead-letter write is still owed, which makes the outbox the only
-// copy of that event in existence. model.EventOutbox.IsPurgeableByRetention states the same
-// rule in Go for a caller that needs to evaluate it without a database.
+// A pending, processing, replaying or failed row is never eligible either — failed most of
+// all, because its dead-letter write is still owed, which makes the outbox the only copy of
+// that event in existence. model.EventOutbox.IsPurgeableByRetention states the same rule in Go
+// for a caller that needs to evaluate it without a database.
 //
 // BOUNDED IN EVERY DIRECTION. Each delete is limited to a batch, each sweep is limited to a
 // number of batches, and each sweep runs under its own deadline. An unbounded DELETE over a
@@ -147,7 +148,7 @@ type eventRetentionStore interface {
 	PurgeTerminalEventsBefore(ctx context.Context, cutoff time.Time, limit int) (int64, error)
 }
 
-// EventRetentionSweeper periodically deletes delivered and dead-lettered event rows older
+// EventRetentionSweeper periodically deletes DELIVERED event rows older
 // than the configured retention period.
 type EventRetentionSweeper struct {
 	store eventRetentionStore
@@ -614,7 +615,7 @@ var (
 	// operator's decision, not a default.
 	ErrEventRetentionDisabled = errors.New(
 		"blnk: event outbox retention is disabled; set RELAY_EVENT_RETENTION_DAYS to a positive " +
-			"number of days to have delivered and dead-lettered events deleted after that period",
+			"number of days to have delivered events deleted after that period",
 	)
 
 	errEventRetentionSweeperNil = errors.New("blnk: the event retention sweeper is nil")

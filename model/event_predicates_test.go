@@ -682,3 +682,138 @@ func TestSubscriberGrantableTopics_IsTheAllowlistAndExcludesEveryInternalTopic(t
 			"an empty prefix must compose against the default namespace, got %q", topic)
 	}
 }
+
+// TestValidateWebhookURL_IsTheSinglePolicyEveryLayerApplies pins the policy that used to exist
+// twice.
+//
+// The https, host, whitespace and internal-destination rules were implemented independently in the
+// repository and in the request DTO, each with its own destination classifier and its own wording.
+// One column, two rules: a service, CLI or migration caller reaching the repository directly was
+// judged by a different standard from an HTTP caller, and the same rejected host produced two
+// different reason phrases depending on which door the request arrived through.
+//
+// This test is where the rule now lives, so both callers inherit it and neither can drift.
+func TestValidateWebhookURL_IsTheSinglePolicyEveryLayerApplies(t *testing.T) {
+	t.Run("an absent endpoint is acceptable and means clear the record", func(t *testing.T) {
+		// The column is nullable precisely so "no endpoint" and "this endpoint" stay
+		// distinguishable, and every caller maps nil/empty/value the same three ways.
+		for _, raw := range []string{"", "   ", "\t\n"} {
+			message, reason := ValidateWebhookURL(raw)
+			assert.Emptyf(t, message, "%q means clear the record, not a policy violation", raw)
+			assert.Empty(t, reason)
+		}
+	})
+
+	t.Run("an https URL to an external host is accepted", func(t *testing.T) {
+		for _, raw := range []string{
+			"https://hooks.example.com/blnk",
+			"https://hooks.example.com:8443/blnk?v=1",
+			"https://sub.domain.example.co.uk/path/to/hook",
+		} {
+			message, _ := ValidateWebhookURL(raw)
+			assert.Emptyf(t, message, "%q is a legitimate destination", raw)
+		}
+	})
+
+	t.Run("surrounding whitespace is refused, never trimmed", func(t *testing.T) {
+		// The column is stored VERBATIM, so trimming for validation and storing the original
+		// would persist a destination that never passed the check.
+		for _, raw := range []string{
+			" https://hooks.example.com/blnk",
+			"https://hooks.example.com/blnk ",
+			"\thttps://hooks.example.com/blnk\n",
+		} {
+			message, reason := ValidateWebhookURL(raw)
+			require.NotEmptyf(t, message, "%q must be refused rather than trimmed", raw)
+			assert.Contains(t, message, "whitespace")
+			assert.Contains(t, reason, "stored verbatim",
+				"the reason must say WHY trimming is not an option")
+		}
+	})
+
+	t.Run("cleartext is refused whatever the destination", func(t *testing.T) {
+		for _, raw := range []string{
+			"http://hooks.example.com/blnk",
+			"ftp://hooks.example.com/",
+			"file:///etc/passwd",
+			"gopher://hooks.example.com/",
+		} {
+			message, reason := ValidateWebhookURL(raw)
+			require.NotEmptyf(t, message, "%q must be refused", raw)
+			assert.Contains(t, message, "https", "the refusal must name the requirement")
+			assert.Contains(t, reason, "cleartext")
+		}
+	})
+
+	t.Run("every spelling of an internal destination is refused", func(t *testing.T) {
+		// A webhook URL is third-party input that Blnk itself dials, which makes it a
+		// server-side request forgery vector straight at the cloud metadata endpoint and at every
+		// service that trusts the network rather than the caller.
+		internal := map[string]string{
+			"loopback literal":          "https://127.0.0.1/blnk",
+			"loopback by name":          "https://localhost/blnk",
+			"loopback subdomain":        "https://api.localhost/blnk",
+			"IPv6 loopback":             "https://[::1]/blnk",
+			"IPv4-mapped IPv6 loopback": "https://[::ffff:127.0.0.1]/blnk",
+			"cloud metadata endpoint":   "https://169.254.169.254/latest/meta-data/",
+			"private 10/8":              "https://10.0.0.7:9092/blnk",
+			"private 172.16/12":         "https://172.16.4.9/blnk",
+			"private 192.168/16":        "https://192.168.1.1/blnk",
+			"unspecified address":       "https://0.0.0.0/blnk",
+			"multicast":                 "https://239.1.2.3/blnk",
+			"mDNS hostname":             "https://broker.local/blnk",
+			"internal zone hostname":    "https://metadata.google.internal/blnk",
+			"unqualified hostname":      "https://postgres/blnk",
+		}
+
+		for name, raw := range internal {
+			t.Run(name, func(t *testing.T) {
+				message, reason := ValidateWebhookURL(raw)
+				require.NotEmptyf(t, message, "%q must be refused", raw)
+				assert.Contains(t, message, "internal destination")
+
+				// The REASON names the host and says which rule was hit. "Not allowed" sends an
+				// operator looking for a policy document; naming the range tells them what they
+				// just pointed Blnk at.
+				assert.NotEmpty(t, reason)
+				assert.Contains(t, reason, "refused")
+			})
+		}
+	})
+
+	t.Run("a URL with no host is refused", func(t *testing.T) {
+		message, _ := ValidateWebhookURL("https:///blnk")
+		require.NotEmpty(t, message)
+		assert.Contains(t, message, "host")
+	})
+
+	t.Run("neither the message nor the reason echoes the whole URL", func(t *testing.T) {
+		// The URL is a third party's endpoint, and its path and query can carry a token. The HOST
+		// is named deliberately — it is the one thing the caller needs to see — but nothing else.
+		const secret = "s3cr3t-token-in-the-path"
+
+		message, reason := ValidateWebhookURL("https://127.0.0.1/blnk/" + secret + "?key=" + secret)
+		require.NotEmpty(t, message)
+
+		assert.NotContains(t, message, secret)
+		assert.NotContains(t, reason, secret)
+		assert.Contains(t, reason, "127.0.0.1", "the host is what a caller has to act on")
+	})
+
+	t.Run("an unparseable URL does not echo the parser's rendering of it", func(t *testing.T) {
+		// url.Parse quotes the input back, and the input has no business in Blnk's error
+		// responses or logs.
+		message, reason := ValidateWebhookURL("https://exa mple.com/\x7f")
+		require.NotEmpty(t, message)
+		assert.NotContains(t, reason, "exa mple")
+	})
+
+	t.Run("an external host is not classified as internal", func(t *testing.T) {
+		for _, host := range []string{
+			"hooks.example.com", "8.8.8.8", "203.0.113.10", "[2001:db8::1]",
+		} {
+			assert.Emptyf(t, InternalWebhookDestinationReason(strings.Trim(host, "[]")),
+				"%s is a public destination", host)
+		}
+	})
+}

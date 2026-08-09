@@ -268,87 +268,6 @@ func TestSubscriberRequests_AdjudicateTheKeyScopeShape(t *testing.T) {
 	})
 }
 
-// TestResolveDeadLetterEventRequest_BoundsTheOperatorNote covers the body of
-// POST /events/dead-letter/:event_id/resolve.
-//
-// The note is STORED and then projected back out by the inventory listing, so it is bounded
-// for the two reasons every operator-supplied label in this pipeline is: an unbounded note
-// becomes an unbounded field in every response, and a control character corrupts the log line
-// and the dashboard cell it lands in. It is OPTIONAL because a required free-text field does
-// not produce explanations — it produces "x" and "done", which look like records without being
-// any.
-func TestResolveDeadLetterEventRequest_BoundsTheOperatorNote(t *testing.T) {
-	t.Run("an absent note is valid", func(t *testing.T) {
-		assert.NoError(t, ResolveDeadLetterEventRequest{}.Validate())
-		assert.NoError(t, ResolveDeadLetterEventRequest{Note: "   "}.Validate(),
-			"whitespace only is the same as absent, not a refusal")
-	})
-
-	t.Run("an ordinary explanation is accepted", func(t *testing.T) {
-		assert.NoError(t, ResolveDeadLetterEventRequest{
-			Note: "replayed after the broker came back; ticket 4182",
-		}.Validate())
-	})
-
-	t.Run("the bound is enforced and the bound itself is accepted", func(t *testing.T) {
-		assert.NoError(t, ResolveDeadLetterEventRequest{
-			Note: strings.Repeat("x", maxDeadLetterResolutionNoteLen),
-		}.Validate())
-
-		err := ResolveDeadLetterEventRequest{
-			Note: strings.Repeat("x", maxDeadLetterResolutionNoteLen+1),
-		}.Validate()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "at most")
-	})
-
-	t.Run("the bound is in RUNES, not bytes", func(t *testing.T) {
-		// Three bytes per rune. A byte-counted bound would refuse a legitimate note written
-		// in Japanese while accepting a longer one written in ASCII, which is a bound on the
-		// operator's language rather than on the field.
-		assert.NoError(t, ResolveDeadLetterEventRequest{
-			Note: strings.Repeat("台", maxDeadLetterResolutionNoteLen),
-		}.Validate())
-
-		require.Error(t, ResolveDeadLetterEventRequest{
-			Note: strings.Repeat("台", maxDeadLetterResolutionNoteLen+1),
-		}.Validate())
-	})
-
-	t.Run("control characters are refused, newlines included", func(t *testing.T) {
-		for name, note := range map[string]string{
-			"a NUL":             "replayed\x00",
-			"a newline":         "replayed\nthen verified",
-			"a carriage return": "replayed\rthen verified",
-			"a tab":             "replayed\tthen verified",
-			"a DEL":             "replayed\x7f",
-		} {
-			t.Run(name, func(t *testing.T) {
-				err := ResolveDeadLetterEventRequest{Note: note}.Validate()
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), "control characters")
-			})
-		}
-	})
-
-	t.Run("the binder bound and the validator bound are both present", func(t *testing.T) {
-		// The binder counts BYTES and stops a multi-megabyte body being decoded at all; the
-		// validator counts RUNES and is what the column and the response field are sized for.
-		// Both are needed, and the stricter applies.
-		field, ok := reflect.TypeOf(ResolveDeadLetterEventRequest{}).FieldByName("Note")
-		require.True(t, ok)
-		assert.Equal(t, "omitempty,max=4096", field.Tag.Get("binding"),
-			"the byte bound is the outer guard: without it an arbitrarily large body is decoded "+
-				"before any validation runs")
-
-		assert.Equal(t, 1024, maxDeadLetterResolutionNoteLen,
-			"blnk.maxDeadLetterResolutionNoteLength is 1024; they are separate constants because "+
-				"this package cannot import the root package, so nothing but this assertion keeps "+
-				"them equal — and a DTO that accepted more than the service stores would refuse the "+
-				"request one layer later with a different message")
-	})
-}
-
 // TestValidateSubscriberName_RefusesUnstorableLabels covers the human label. CWE-20.
 //
 // The label was previously required and trimmed and nothing more, which bounds nothing: the
@@ -445,7 +364,15 @@ func TestValidateLegacyWebhookURL_EnforcesTheDestinationPolicy(t *testing.T) {
 		t.Run("refuses "+name, func(t *testing.T) {
 			err := validateLegacyWebhookURL(raw)
 			require.Error(t, err, "%s must be refused", raw)
-			assert.Contains(t, err.Error(), "not an allowed destination")
+
+			// The wording is the SHARED policy's, because the policy is now defined once in
+			// model.ValidateWebhookURL rather than copied here and in the repository. Asserting on
+			// the shared phrase is what makes the two doors — an HTTP caller and a service, CLI or
+			// migration caller reaching the repository directly — provably answer the same way for
+			// the same host.
+			assert.Contains(t, err.Error(), "internal destination")
+			assert.Contains(t, err.Error(), "webhook_url",
+				"a DTO validation error must name the body key the caller has to correct")
 		})
 	}
 
@@ -901,7 +828,8 @@ func deadLetteredRow(t *testing.T) model.EventOutbox {
 // would have returned all of it, for a triage task that needs none of it — replay
 // re-publishes the stored bytes server-side, so the operator never supplies them.
 func TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText(t *testing.T) {
-	item := NewDeadLetterEvent(deadLetteredEntry(t))
+	row := deadLetteredEntry(t)
+	item := NewDeadLetterEvent(row)
 
 	body, err := json.Marshal(item)
 	require.NoError(t, err)
@@ -935,9 +863,16 @@ func TestNewDeadLetterEvent_CarriesNoPayloadAndNoRawFailureText(t *testing.T) {
 	// keeps-what-triage-needs one: it is an identifier of the same class as aggregate_id
 	// and ledger_id, which are already carried, and asserting it here records that its
 	// inclusion was weighed against DATA-01 rather than overlooked.
-	assert.Contains(t, rendered, `"partition_key":"bln_legacy_key_51d0"`,
-		"the stored partition key must reach the response: it is an identifier of the same class "+
+	//
+	// The value is the EFFECTIVE key — the ledger, on this fixture — because that is the key the
+	// publish path resolved and therefore the partition the message is in. The stored column is
+	// not rendered anywhere, which is deliberate: it is the publisher's second choice and reporting
+	// it would answer an ordering question with the wrong key.
+	assert.Contains(t, rendered, `"partition_key":"`+row.EffectiveKey()+`"`,
+		"the effective partition key must reach the response: it is an identifier of the same class "+
 			"as aggregate_id, and without it no ordering question can be answered from this API")
+	assert.NotContains(t, rendered, "bln_legacy_key_51d0",
+		"the superseded stored key must not be rendered: it names a partition this event is not in")
 
 	for _, field := range []string{"Payload", "LastError", "FailureMetadata"} {
 		_, present := reflect.TypeOf(DeadLetterEvent{}).FieldByName(field)
@@ -973,15 +908,28 @@ func TestNewDeadLetterEvent_KeepsWhatTriageActuallyNeeds(t *testing.T) {
 	assert.Equal(t, row.EventType, item.EventType)
 	assert.Equal(t, row.AggregateID, item.AggregateID)
 	assert.Equal(t, row.LedgerID, item.LedgerID)
-	// THE STORED KEY, and the assertion that would have caught it being unassigned. It is
-	// the only field on this response an ordering question can be answered from — every
-	// event sharing a key is in one partition and therefore consumed in publish order — and
-	// because the tag is omitempty, leaving it unset did not render an empty field: it
-	// rendered no field, so the answer read as "this event had no key" rather than as a gap.
-	assert.Equal(t, row.PartitionKey, item.PartitionKey,
-		"the projection must carry the STORED partition key, which is what pinned the event to its partition")
+	// THE EFFECTIVE KEY, which on this fixture is NOT the stored column.
+	//
+	// The fixture is deliberately the divergent case: it carries a ledger AND a partition key
+	// left over from an earlier keying rule, and the publish path prefers the ledger because
+	// requirement R-6 partitions by ledger ID. So the message went to the ledger's partition, and
+	// a response reporting `bln_legacy_key_51d0` would name the key the event was NOT routed by —
+	// on exactly the row an operator is investigating, and with nothing to indicate the answer
+	// might be wrong. It is the only field here an ordering question can be answered from, so
+	// naming the wrong key is worse than naming none.
+	//
+	// This assertion also still covers the field being unassigned, which is how it started: the
+	// tag is omitempty, so leaving it unset rendered no field at all and the answer read as "this
+	// event had no key" rather than as a gap.
+	require.NotEqual(t, row.LedgerID, row.PartitionKey,
+		"the fixture must keep the two values different, or this assertion proves nothing")
+	assert.Equal(t, row.EffectiveKey(), item.PartitionKey,
+		"the projection must report the key the publish path resolved, not the stored column")
+	assert.Equal(t, row.LedgerID, item.PartitionKey,
+		"and on a row carrying a ledger that key IS the ledger")
 	assert.NotEqual(t, row.AggregateID, item.PartitionKey,
-		"and it must be the stored key rather than the aggregate id: they differ for a row committed before a keying change")
+		"never the aggregate id: that is the last rung of the chain, reached only when a row has "+
+			"neither a ledger nor a stored key")
 	assert.Equal(t, row.Topic, item.Topic, "replay targets this topic")
 	assert.Equal(t, row.DLTTopic, item.DLTTopic)
 	assert.Equal(t, row.Status, item.Status)
@@ -997,6 +945,76 @@ func TestNewDeadLetterEvent_KeepsWhatTriageActuallyNeeds(t *testing.T) {
 	require.NotNil(t, item.LastAttemptedAt)
 	assert.Equal(t, FailureReasonBrokerUnavailable, item.FailureReason,
 		"a broken pipe is a broker problem, and saying so is the point of classifying")
+}
+
+// TestNewDeadLetterEvent_ReportsTheKeyThePublisherActuallyUsed is the whole of MD-8 in one
+// place: the reported key and the routed key must be one value resolved by one rule.
+//
+// The response used to read the stored partition_key column. The publish path prefers the
+// LEDGER — requirement R-6 partitions by ledger ID — so on any row where the two disagree the
+// API named a partition the event was not in. Nothing in the response said which value it was,
+// so an operator investigating "why are these two events out of order" got a confident wrong
+// answer from the only field that can answer the question.
+//
+// The three cases below are the fallback chain's three rungs, asserted through the DTO rather
+// than through the model, because it is the DTO that a subscriber and an operator read.
+func TestNewDeadLetterEvent_ReportsTheKeyThePublisherActuallyUsed(t *testing.T) {
+	base := deadLetteredEntry(t)
+
+	t.Run("a ledger-scoped row reports its ledger, not the stored column", func(t *testing.T) {
+		require.NotEmpty(t, base.LedgerID)
+		require.NotEqual(t, base.LedgerID, base.PartitionKey)
+
+		item := NewDeadLetterEvent(base)
+
+		assert.Equal(t, base.LedgerID, item.PartitionKey)
+		assert.Equal(t, base.LedgerID, item.LedgerID,
+			"both fields are on the response, so the reader can see WHY the key is what it is")
+	})
+
+	t.Run("a ledger-less row reports the stored column", func(t *testing.T) {
+		// The events with no ledger — identities, bulk batches, system errors, rejected
+		// transactions — are keyed on the stored column, and it is their real key.
+		row := base
+		row.LedgerID = ""
+
+		item := NewDeadLetterEvent(row)
+
+		assert.Equal(t, base.PartitionKey, item.PartitionKey,
+			"the stored key is the actual key when there is no ledger to prefer")
+		assert.Empty(t, item.LedgerID, "and an absent ledger is omitted rather than blanked")
+	})
+
+	t.Run("whitespace in the ledger reads as absence", func(t *testing.T) {
+		// A key made of spaces would be a partition of its own, silently splitting an
+		// aggregate's events across two partitions.
+		row := base
+		row.LedgerID = "   "
+
+		item := NewDeadLetterEvent(row)
+
+		assert.Equal(t, base.PartitionKey, item.PartitionKey)
+	})
+
+	t.Run("the DTO and the model resolve one key", func(t *testing.T) {
+		// The assertion that keeps them one rule rather than two implementations that agree
+		// today. If the projection ever recomputes the key itself, this fails.
+		for name, row := range map[string]model.DeadLetterInventoryEntry{
+			"ledger present": base,
+			"ledger absent":  func() model.DeadLetterInventoryEntry { r := base; r.LedgerID = ""; return r }(),
+			"neither": func() model.DeadLetterInventoryEntry {
+				r := base
+				r.LedgerID = ""
+				r.PartitionKey = ""
+
+				return r
+			}(),
+		} {
+			t.Run(name, func(t *testing.T) {
+				assert.Equal(t, row.EffectiveKey(), NewDeadLetterEvent(row).PartitionKey)
+			})
+		}
+	})
 }
 
 // TestNewDeadLetterEvent_FillsAttemptGapsFromTheFailureMetadata covers a row whose

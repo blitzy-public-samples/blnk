@@ -290,7 +290,7 @@ Two limits are worth stating outright, because the narrower one is the natural a
 - The credential grants **Read and Describe on your authorised topics** and **Read on your consumer-group namespace**, and nothing further. No dead-letter topic is ever granted to a subscriber, so no `<topic>.dlt` appears in `authorized_topics`.
 - **`ledger.created` needs an explicit grant, and it is the one event you can lose at the cutover by not asking for it.** The topic catalogue has four categories, and `ledger.created` shares `blnk.system` with `system.error` — whose payload is a frozen legacy body carrying verbatim internal error text. `blnk.system` is grantable, precisely so this event stays reachable, but it is not granted by default. So a webhook subscriber that consumes `ledger.created` today must have `blnk.system` in its `authorized_topics` **before** the sunset. Raise it with your operator: the grant also delivers `system.error` and any event type Blnk has not yet catalogued, so if you do not consume ledger creations, reading them from the REST API remains the narrower answer.
 - **Within an authorised topic the BROKER applies no further restriction.** Kafka authorises at topic and consumer-group granularity and has no message-key dimension, so per-key filtering cannot be enforced by the broker and is not claimed anywhere. `enforced_access.partition_key_prefix_enforced` is always `false`, and it is reported explicitly rather than left to be inferred.
-- **`enforced_access.partition_key_scope` is yours to apply.** If the subscriber records a `partition_key_prefix`, this field carries it and **your consumer must discard records whose key does not start with it** — nothing upstream of you discards them. Blnk keys every event by ledger id, so the prefix is a ledger boundary. When no prefix is recorded the field reads `all-keys` and `partition_key_prefix_enforced` is `true`, because the topic grant is then the whole boundary. This is the same kind of obligation as `event_id` idempotency: stated in the response rather than promised by the broker. See [kafka-operations.md](kafka-operations.md#the-partition-key-prefix-is-delivered-to-the-consumer-not-bound-at-the-broker).
+- **`enforced_access.partition_key_prefix` is yours to apply.** If the subscriber records a `partition_key_prefix`, this field carries it and **your consumer must discard records whose key does not start with it** — nothing upstream of you discards them. Blnk keys every event by ledger id, so the prefix is a ledger boundary. When no prefix is recorded the field is **omitted** and `partition_key_prefix_enforced_by` reads `none`, because the topic grant is then the whole boundary and there is nothing to filter; `partition_key_prefix_enforced` stays `false` either way, since it describes the broker rather than the row. `enforced_access.not_enforced_by` states the same limitation as a list you can assert on, carrying `partition_key` for every subscriber. This is the same kind of obligation as `event_id` idempotency: stated in the response rather than promised by the broker. See [kafka-operations.md](kafka-operations.md#the-partition-key-prefix-is-delivered-to-the-consumer-not-bound-at-the-broker).
 - **To narrow what the BROKER enforces, narrow the topic grant** — that is the dimension the broker can actually check.
 
 > **This is an unmet requirement, not a design decision.** The specification asks for ACLs scoped to
@@ -409,8 +409,8 @@ codebase changed itself. **Automatic** entries happen at the instant, by configu
 | Removed | When | Detail |
 |---|---|---|
 | Webhook subscription registration | **Automatic** | The deprecated `/subscribers/{subscriber_id}/webhook-subscription` routes answer `410 Gone` |
-| Recording a legacy URL | **Automatic** | Create and update on the generic `/subscribers` routes refuse a new `webhook_url` with `GEN_GONE`; clearing one remains allowed |
-| Reporting a legacy URL | **Automatic** | Subscriber reads stop projecting `webhook_url`, on both the single-subscriber and list responses |
+| Recording a legacy URL | **Automatic** | `POST` and `PUT /subscribers/{subscriber_id}/webhook-subscription` are the only write paths for it, and both answer `410 Gone`. Clearing one is `DELETE` on the same route, so it stops at the instant too |
+| Reporting a legacy URL | **Automatic** | `GET /subscribers/{subscriber_id}/webhook-subscription` is the only read path, and it answers `410 Gone` |
 | HTTP delivery | **Automatic** | No delivery is enqueued or attempted; a delivery still owed when the instant passes is dropped rather than left pending |
 | `webhooks.go` and its functions | **Manual** | `processHTTP`, `SendWebhook` and `ProcessWebhook` are deleted in a later release. The source carries an explicit operator checklist for it; the date does not do it |
 | The delivery handler registration | **Manual** | The `WebhookQueue → ProcessWebhook` mapping is unregistered in that same release — **the mapping only**, never the queue, see [What Never Existed](#what-never-existed) |
@@ -418,8 +418,23 @@ codebase changed itself. **Automatic** entries happen at the instant, by configu
 
 **Subscribers must migrate to consuming Kafka directly. There is no compatibility shim, and none is
 planned.** No proxy re-emits Kafka events as HTTP pushes, and after the sunset no route accepts a new
-webhook URL — the deprecated routes answer `410`, and the generic subscriber routes refuse the field
-with `GEN_GONE` while still allowing an existing value to be cleared.
+webhook URL: the four deprecated routes answer `410 GEN_GONE`, and they are the only routes that ever
+accepted or reported one.
+
+**The generic `/subscribers` routes have no `webhook_url` field at all**, and that is what makes the
+sunset enforceable rather than advisory. `CreateSubscriber` and `UpdateSubscriber` deliberately do
+not declare it, so legacy webhook state can only be written through the guarded routes — a caller
+cannot reach for the unguarded registry route and keep writing it after the guarded ones have begun
+answering `410`. Sending `webhook_url` to `POST` or `PUT /subscribers` is refused as a field the
+shape does not declare, with `400 GEN_VALIDATION_ERROR` naming it, and that is true **before and
+after** the instant alike: it is not a sunset behaviour and it is not `GEN_GONE`. Register the
+subscriber on `/subscribers`, then record its URL on
+`/subscribers/{subscriber_id}/webhook-subscription`.
+
+`SubscriberResponse` likewise never projects `webhook_url`, at any time — the recorded URL is read
+only through the guarded `GET`, so the two reads cannot disagree about whether the legacy surface
+still exists. `migrated_at` does stay on the subscriber body, before and after the sunset, because it
+is migration *progress* rather than legacy webhook state and discloses no endpoint.
 
 ### The `410 Gone` is a typed error code, not a bare status
 

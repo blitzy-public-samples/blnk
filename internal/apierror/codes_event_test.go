@@ -45,10 +45,6 @@ var eventStreamingCodeCases = []struct {
 	{ErrEventNotFound, http.StatusNotFound, "EVENT_NOT_FOUND"},
 	{ErrEventNotDeadLettered, http.StatusConflict, "EVENT_NOT_DEAD_LETTERED"},
 	{ErrEventReplayFailed, http.StatusInternalServerError, "EVENT_REPLAY_FAILED"},
-	// 409 and not 404: the row exists and the caller's request is well formed — the resolution
-	// it asks for has already been recorded, so repeating it would overwrite one operator's note
-	// with another's. The remedy is to read the existing resolution, not to retry.
-	{ErrEventAlreadyResolved, http.StatusConflict, "EVENT_ALREADY_RESOLVED"},
 	// The identifier says Kafka but the string carries the EVENT_ family prefix, and
 	// that asymmetry is deliberate. So is the 503: an unreachable broker is a
 	// retryable upstream condition, not a defect here, so it must not resolve to 500.
@@ -93,21 +89,23 @@ func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 	// catalog is what the guard exists to prevent: a code that arrives with neither a
 	// status entry nor a row here would then satisfy a self-referential comparison and
 	// resolve to the unknown-code 500 in production. Adding a code is a deliberate edit
-	// of this number — as is REMOVING one, and the arithmetic that produced 14 is worth
+	// of this number — as is REMOVING one, and the arithmetic that produced 13 is worth
 	// recording because every step of it was a separate edit:
 	//
 	//   12 — the original event-streaming family.
-	//   −11 — SUBSCRIBER_ISOLATION_UNENFORCEABLE retired, because the refusal it named was
+	//   −1 — SUBSCRIBER_ISOLATION_UNENFORCEABLE retired, because the refusal it named was
 	//        replaced by issuing the credential and delivering the key scope to the consumer.
-	//   +14 — EVENT_ALREADY_RESOLVED, SUBSCRIBER_INSECURE_TRANSPORT and
+	//   +3 — EVENT_ALREADY_RESOLVED, SUBSCRIBER_INSECURE_TRANSPORT and
 	//        SUBSCRIBER_ACCESS_EXCEEDS_AUTHORIZATION added.
+	//   −1 — EVENT_ALREADY_RESOLVED retired again with the dead-letter resolve endpoint. That
+	//        endpoint's write could leave a row from which a broker-acknowledged replay could
+	//        not be recorded, and retention needs no second write to be safe: a dead-lettered
+	//        row is never purged by age, and a replay is what turns one into a receipt.
 	//
-	// The number was left at 11 while the rows were added, which is how the guard came to fail
-	// for the right reason — the inventory no longer matched codes.go — and it caught a genuine
-	// omission underneath: SUBSCRIBER_ACCESS_EXCEEDS_AUTHORIZATION had no statusByCode entry at
-	// all, so a deliberate 409 was resolving to 500.
-	if len(eventStreamingCodeCases) != 14 {
-		t.Fatalf("eventStreamingCodeCases has %d rows, want 14 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
+	// One of those edits caught a genuine omission underneath: SUBSCRIBER_ACCESS_EXCEEDS_
+	// AUTHORIZATION had no statusByCode entry at all, so a deliberate 409 was resolving to 500.
+	if len(eventStreamingCodeCases) != 13 {
+		t.Fatalf("eventStreamingCodeCases has %d rows, want 13 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
 	}
 	for _, tt := range eventStreamingCodeCases {
 		t.Run(string(tt.code), func(t *testing.T) {

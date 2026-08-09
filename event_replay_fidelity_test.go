@@ -764,6 +764,23 @@ func (s *replayFidelityStore) CountDeadLetterInventory(
 	return int64(len(s.deadLetterInventoryLocked(query))), nil
 }
 
+// ListAndCountDeadLetterInventory answers the page and the total from one observation of the
+// double's state, under a single lock acquisition, matching the repository's single snapshot.
+func (s *replayFidelityStore) ListAndCountDeadLetterInventory(
+	ctx context.Context,
+	query model.DeadLetterInventoryQuery,
+) (model.DeadLetterInventoryPage, int64, error) {
+	page, err := s.ListDeadLetterInventory(ctx, query)
+	if err != nil {
+		return model.DeadLetterInventoryPage{}, 0, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return page, int64(len(s.deadLetterInventoryLocked(query.FilterQuery()))), nil
+}
+
 // The map-shaped CountDeadLetteredEvents this double also carried is GONE.
 //
 // It answered "how many rows per terminal status inside this occurrence window" from a
@@ -2299,39 +2316,4 @@ func (s *replayFidelityStore) ListDeadLetteredEventsFiltered(
 	}
 
 	return inventory, nil
-}
-
-// MarkEventDeadLetterResolved records an operator resolution on a dead-lettered row.
-//
-// Replay fidelity is what this file is about, and a resolution deliberately does NOT
-// affect it: the row keeps its status and its stored bytes, so a resolved event is still
-// replayable and still replays byte for byte. This method exists so that property is
-// reachable from here rather than only asserted in prose.
-func (s *replayFidelityStore) MarkEventDeadLetterResolved(
-	_ context.Context,
-	eventID string,
-	note string,
-	at time.Time,
-) (*model.EventOutbox, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	row := s.rows[eventID]
-	if row == nil {
-		return nil, apierror.NewAPIError(apierror.ErrNotFound, "Event not found", errors.New("no rows in result set"))
-	}
-	if row.IsResolvedDeadLetter() {
-		return nil, apierror.NewAPIError(apierror.ErrEventAlreadyResolved, "Already resolved", nil)
-	}
-	if row.Status != model.EventOutboxStatusDeadLettered {
-		return nil, apierror.NewAPIError(apierror.ErrEventNotDeadLettered, "Not dead-lettered", nil)
-	}
-
-	resolvedAt := at.UTC()
-	row.ResolvedAt = &resolvedAt
-	row.ResolutionNote = note
-
-	found := *row
-
-	return &found, nil
 }

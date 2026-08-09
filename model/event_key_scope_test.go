@@ -65,30 +65,6 @@ func TestEventSubscriber_RequestedKeyScopeFlattensTheNullableColumn(t *testing.T
 		"a recorded scope is returned exactly as recorded")
 }
 
-func TestEventSubscriber_RequiresKeyScopeEnforcementIsTrueOnlyForANarrowerBoundary(t *testing.T) {
-	// No scope: a whole-topic entitlement, which a Kafka ACL expresses exactly, so
-	// nothing has to be enforced above the broker.
-	assert.False(t, (&EventSubscriber{}).RequiresKeyScopeEnforcement(),
-		"a subscriber entitled to whole topics needs no enforcement Kafka cannot provide")
-
-	// A scope: narrower than any ACL can express, so this must be true and the
-	// credential contract must say the subscriber owns that narrowing. Killing the
-	// mutant that flips the comparison matters more here than anywhere else in the
-	// file — inverted, it would tell every whole-topic subscriber it must filter
-	// records the broker already confined, and tell every key-scoped one the broker
-	// confined records it did not, which is the exact opposite of the real boundary.
-	assert.True(t,
-		(&EventSubscriber{PartitionKeyPrefix: stringPtr("ldg_9f2c")}).DeclaresKeyScope(),
-		"a recorded key prefix is narrower than a topic ACL and must be reported as a declared "+
-			"scope, because the consumer is what applies it")
-
-	// Nil receiver: no declaration. Answerable rather than fatal, via RequestedKeyScope's
-	// own nil guard.
-	var absent *EventSubscriber
-	assert.False(t, absent.DeclaresKeyScope(),
-		"a subscriber that does not exist declares no boundary")
-}
-
 func TestEventSubscriber_HasKeyAccessIsAByteExactPrefixTest(t *testing.T) {
 	// With NO scope recorded every key is in bounds, including the empty key. This
 	// is the branch that makes an unprovisioned prefix and an explicit whole-topic
@@ -194,7 +170,7 @@ func TestEventSubscriber_IsRevocationPendingTestsOnlyThePresenceOfTheTimestamp(t
 }
 
 // TestEventSubscriber_KeyScopeEnforcementNamesWhereTheScopeIsKept pins the accessor that
-// replaced KeyScopeUnenforceable.
+// replaced a boolean predicate named for unenforceability, now deleted.
 //
 // The old predicate answered this same boolean under a name asserting a policy, and three
 // barriers read it as licence to deny the subscriber a credential outright. Reporting the
@@ -218,8 +194,8 @@ func TestEventSubscriber_KeyScopeEnforcementNamesWhereTheScopeIsKept(t *testing.
 	// disclose a filtering contract no caller asked for — and, under the behaviour this
 	// replaced, refuse a credential over whitespace.
 	//
-	// Note that RequestedKeyScope returns such a value verbatim, so this accessor and
-	// RequiresKeyScopeEnforcement would disagree about a whitespace-only prefix. That row
+	// Note that RequestedKeyScope returns such a value verbatim, so this accessor and a
+	// predicate reading the scope untrimmed would disagree about a whitespace-only prefix. That row
 	// cannot be persisted: normalizeSubscriberKeyScope collapses a blank prefix to nil and
 	// REFUSES any value with surrounding whitespace, so the disagreement is unreachable
 	// defence-in-depth rather than a contract. It is recorded here so a reader does not
@@ -239,6 +215,15 @@ func TestEventSubscriber_KeyScopeEnforcementNamesWhereTheScopeIsKept(t *testing.
 		"a subscriber that does not exist records no client-side filtering obligation")
 }
 
+// TestEventSubscriber_DeclaresKeyScopeIsTrueOnlyForANarrowerBoundary is the surviving guard on
+// the registry's own presence question.
+//
+// A near-identical test over RequiresKeyScopeEnforcement stood beside it. That predicate was a
+// FOURTH spelling of this one question, and its name claimed something remained to be ENFORCED
+// after the topic and group ACLs had been checked. Nothing enforces it — Kafka has no message-key
+// resource type, so the narrowing is the consumer's own filter — so the name has been deleted
+// along with the unenforceability spelling, and its coverage collapses into this test rather than
+// being duplicated under a second name.
 func TestEventSubscriber_DeclaresKeyScopeIsTrueOnlyForANarrowerBoundary(t *testing.T) {
 	// No scope: a whole-topic entitlement, which a Kafka ACL expresses exactly, so nothing
 	// is left for the consumer to apply.

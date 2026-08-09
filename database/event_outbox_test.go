@@ -373,12 +373,6 @@ func eventOutboxRow(e model.EventOutbox) []driver.Value {
 		// row nothing produces.
 		nullText(e.Traceparent),
 		nullText(e.Tracestate),
-		// THE OPERATOR RESOLUTION, both nullable, and NULL is the meaningful state: nil
-		// resolved_at is what keeps a dead-lettered row out of the retention purge and in the
-		// dead-letter age gauge, so a fixture rendering a zero instant would exercise a row
-		// the purge would delete and the table's own CHECK on the pair would refuse.
-		nullTime(e.ResolvedAt),
-		nullText(e.ResolutionNote),
 	}
 }
 
@@ -764,12 +758,6 @@ func TestEventOutboxColumns_ProjectsEveryScannedColumnAndNoOthers(t *testing.T) 
 		// scanner's destination order and the order the ALTER TABLE in sql/1781249137.sql adds
 		// them in.
 		"traceparent", "tracestate",
-		// THE OPERATOR RESOLUTION, projected because the retention gate and the dead-letter
-		// listing both read it: resolved_at nil means UNRESOLVED, which is what keeps the row
-		// out of the purge and in the age gauge, and the note is what an operator wrote to
-		// account for it. They sit last, matching the scanner's destination order and the order
-		// the ALTER TABLE in sql/1781249007.sql adds them in.
-		"resolved_at", "resolution_note",
 	}
 	assert.Equal(t, want, columns,
 		"the projected column list must match scanEventOutbox's destination order exactly")
@@ -2601,9 +2589,9 @@ func TestReleaseEventReplay_ReturnsTheRowToDeadLetteredSoItStaysReplayable(t *te
 // most sensitive data.
 //
 // The safety property is that only ELIGIBLE rows are deleted, and SEC-08 narrowed what
-// eligible means. A pending, processing, replaying or failed row is still owed a delivery
-// attempt — failed is the subtle one: its retry budget is spent but its dead-letter write
-// is not done, so this table is the ONLY copy of that event in existence.
+// eligible means to ONE state. A pending, processing, replaying or failed row is still owed a
+// delivery attempt — failed is the subtle one: its retry budget is spent but its dead-letter
+// write is not done, so this table is the ONLY copy of that event in existence.
 //
 // A DEAD-LETTERED row is the newly subtle one, and the reason this test changed. It is
 // terminal — Blnk will not try again — and it used to be purged on that basis alone. But it
@@ -2611,8 +2599,8 @@ func TestReleaseEventReplay_ReturnsTheRowToDeadLetteredSoItStaysReplayable(t *te
 // the only thing a replay can be driven from, and the only place the failure metadata
 // explaining the loss exists. Deleting it on an age timer destroyed all of that
 // unrecoverably, oldest first — the failure most likely to have been forgotten rather than
-// handled. So it is eligible only once an operator has RESOLVED it, and the predicate below
-// is what enforces that.
+// handled. So it is NEVER eligible: a dead-lettered row leaves the inventory by being
+// REPLAYED, which makes it dispatched, and the predicate below is what enforces that.
 func TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice(t *testing.T) {
 	db, mock, captured := newCapturingSQLMock(t)
 	ds := Datasource{Conn: db}
@@ -2621,7 +2609,7 @@ func TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice(t *tes
 	// A QUERY rather than an exec, because the statement now RETURNS the deleted rows so it
 	// can both count them and record them. See the assertions on the purge log below.
 	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM blnk.event_outbox")).
-		WithArgs(model.EventOutboxStatusDispatched, model.EventOutboxStatusDeadLettered, cutoff, 250).
+		WithArgs(model.EventOutboxStatusDispatched, cutoff, 250).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(3)))
 
 	purged, err := ds.PurgeTerminalEventsBefore(context.Background(), cutoff, 250)
@@ -2630,12 +2618,12 @@ func TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice(t *tes
 
 	require.Len(t, *captured, 1)
 	issued := (*captured)[0]
-	assert.Contains(t, issued, "status = $1", "the eligible states must be bound, not interpolated")
-	assert.Contains(t, issued, "status = $2 AND resolved_at IS NOT NULL",
-		"a dead-lettered row is eligible ONLY once an operator has resolved it: purging an "+
-			"unresolved one destroys the only record that a ledger event went undelivered")
-	assert.Contains(t, issued, "occurred_at < $3")
-	assert.Contains(t, issued, "LIMIT $4",
+	assert.Contains(t, issued, "status = $1", "the eligible state must be bound, not interpolated")
+	assert.NotContains(t, issued, model.EventOutboxStatusDeadLettered,
+		"a dead-lettered row must never be reachable by this delete: purging one destroys the "+
+			"only record that a ledger event went undelivered")
+	assert.Contains(t, issued, "occurred_at < $2")
+	assert.Contains(t, issued, "LIMIT $3",
 		"the delete must be bounded, or one sweep blocks the relay and bloats the WAL in a single transaction")
 
 	// THE DELETION AND ITS RECORD ARE ONE STATEMENT, and that is the assertion that matters
@@ -2683,8 +2671,6 @@ func TestPurgeTerminalEventsBefore_DeletesOnlyTerminalRowsInABoundedSlice(t *tes
 //
 // So the table below is the rule, and both are checked against it.
 func TestEventOutboxRetention_GoAndSQLAgreeOnEligibility(t *testing.T) {
-	resolved := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
-
 	cases := []struct {
 		name      string
 		row       model.EventOutbox
@@ -2698,38 +2684,18 @@ func TestEventOutboxRetention_GoAndSQLAgreeOnEligibility(t *testing.T) {
 			why:       "the event reached the broker and a subscriber has had it; the row is a receipt",
 		},
 		{
-			name:      "an UNRESOLVED dead-lettered row is not purgeable",
+			name:      "a dead-lettered row is never purgeable",
 			row:       model.EventOutbox{Status: model.EventOutboxStatusDeadLettered},
 			purgeable: false,
 			why: "it is the only record that a ledger event went undelivered, and deleting it " +
-				"destroys the failure metadata and the bytes a replay is driven from",
-		},
-		{
-			name: "a RESOLVED dead-lettered row is purgeable",
-			row: model.EventOutbox{
-				Status:     model.EventOutboxStatusDeadLettered,
-				ResolvedAt: &resolved,
-			},
-			purgeable: true,
-			why:       "an operator has accounted for it, so the evidence has served its purpose",
+				"destroys the failure metadata and the bytes a replay is driven from. It leaves " +
+				"the inventory by being replayed, which makes it dispatched",
 		},
 		{
 			name:      "a failed row is never purgeable",
 			row:       model.EventOutbox{Status: model.EventOutboxStatusFailed},
 			purgeable: false,
 			why:       "its dead-letter write is still owed, so this table is the only copy in existence",
-		},
-		{
-			// The one combination the CHECK constraint forbids, asserted anyway: if a
-			// migration or a direct write ever produced it, the Go rule must not read a
-			// stray resolution on a non-dead-lettered row as licence to delete.
-			name: "a resolution on a failed row does not make it purgeable",
-			row: model.EventOutbox{
-				Status:     model.EventOutboxStatusFailed,
-				ResolvedAt: &resolved,
-			},
-			purgeable: false,
-			why:       "resolution is meaningful only for a row that has a dead-letter record",
 		},
 		{
 			name:      "a pending row is not purgeable",
@@ -2753,7 +2719,7 @@ func TestEventOutboxRetention_GoAndSQLAgreeOnEligibility(t *testing.T) {
 	// A QUERY, not an exec: the delete RETURNS the rows it removed so the same statement can
 	// count them and write the purge-log record from them.
 	mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM blnk.event_outbox")).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(0)))
 
 	_, err := ds.PurgeTerminalEventsBefore(context.Background(),
@@ -2768,19 +2734,20 @@ func TestEventOutboxRetention_GoAndSQLAgreeOnEligibility(t *testing.T) {
 		})
 	}
 
-	// And the SQL says the same thing: exactly two arms, the dead-letter one gated on a
-	// recorded resolution.
+	// And the SQL says the same thing: ONE arm, naming the one state a receipt is in.
 	//
 	// Compared on the NORMALISED statement rather than through whereClauseOf, because the
 	// purge nests a bounded SELECT inside the DELETE and therefore carries two WHERE
 	// keywords — the eligibility rule is the inner one.
 	normalized := strings.Join(strings.Fields(statement), " ")
 	assert.Contains(t, normalized,
-		"WHERE ( status = $1 OR (status = $2 AND resolved_at IS NOT NULL) ) AND occurred_at < $3",
-		"the SQL rule must be the Go rule: one age-governed arm for delivered rows and one "+
-			"resolution-gated arm for dead-lettered ones")
+		"WHERE status = $1 AND occurred_at < $2",
+		"the SQL rule must be the Go rule: one age-governed arm, and it admits dispatched rows only")
 	assert.NotContains(t, normalized, "status = ANY(",
-		"a status SET is what conflated the two populations; eligibility is now two arms")
+		"a status SET is what conflated the two populations; eligibility is one state")
+	assert.NotContains(t, normalized, "resolved_at",
+		"the resolution column is gone: it created a state a broker-acknowledged replay could "+
+			"not commit from, and retention needs no second column to be safe")
 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -2815,12 +2782,9 @@ func TestPurgeTerminalEventsBefore_RefusesAZeroCutoffAndClampsTheSlice(t *testin
 				ds := Datasource{Conn: db}
 
 				var boundLimit driver.Value
-				// Four arguments: the two terminal states are bound separately, because the
-				// dead-lettered arm carries the operator-resolution condition the dispatched
-				// arm does not.
+				// Three arguments: the one eligible state, the cutoff and the bound.
 				mock.ExpectQuery(regexp.QuoteMeta("DELETE FROM blnk.event_outbox")).
-					WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-						captureArg(&boundLimit)).
+					WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), captureArg(&boundLimit)).
 					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(0)))
 
 				_, err := ds.PurgeTerminalEventsBefore(context.Background(),
@@ -4088,7 +4052,7 @@ func TestListDeadLetterInventory_CoversBothTerminalFailureStates(t *testing.T) {
 	mock.ExpectQuery("").
 		WithArgs(
 			model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
-			"", "", "", nil, int64(0), nil, nil, false, false, defaultDeadLetterPageSize+1,
+			"", "", "", nil, int64(0), nil, nil, defaultDeadLetterPageSize+1,
 		).
 		WillReturnRows(newDeadLetterInventoryRows(deadLettered, stranded))
 
@@ -4121,7 +4085,10 @@ func TestListDeadLetterInventory_CoversBothTerminalFailureStates(t *testing.T) {
 	// unbounded end means "no bound" rather than "the zero instant".
 	assert.Contains(t, issued, "($8::timestamptz IS NULL OR occurred_at >= $8::timestamptz)")
 	assert.Contains(t, issued, "($9::timestamptz IS NULL OR occurred_at <= $9::timestamptz)")
-	assert.Contains(t, issued, "LIMIT $12")
+	assert.Contains(t, issued, "LIMIT $10")
+	assert.NotContains(t, issued, "resolved_at",
+		"the resolution narrowing is gone with the endpoint that wrote it: every entry in this "+
+			"inventory is outstanding, and a replay is what takes one out")
 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -4439,7 +4406,7 @@ func TestListDeadLetterInventory_NormalisesTheLimitAndPassesTheCursorThrough(t *
 			mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
 				WithArgs(
 					model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
-					"", "", "", tc.wantTime, tc.wantID, nil, nil, false, false, tc.wantLimit+1,
+					"", "", "", tc.wantTime, tc.wantID, nil, nil, tc.wantLimit+1,
 				).
 				WillReturnRows(newDeadLetterInventoryRows())
 
@@ -4461,7 +4428,7 @@ func TestListDeadLetterInventory_BindsTheFiltersItWasGiven(t *testing.T) {
 		WithArgs(
 			model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
 			model.EventOutboxStatusFailed, "transaction.applied", "blnk.transactions",
-			nil, int64(0), nil, nil, false, false, 11,
+			nil, int64(0), nil, nil, 11,
 		).
 		WillReturnRows(newDeadLetterInventoryRows())
 
@@ -4500,7 +4467,7 @@ func TestListDeadLetterInventory_ReadsAProbeRowToAnswerHasMore(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("FROM blnk.event_outbox")).
 		WithArgs(
 			model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
-			"", "", "", nil, int64(0), nil, nil, false, false, 3,
+			"", "", "", nil, int64(0), nil, nil, 3,
 		).
 		WillReturnRows(newDeadLetterInventoryRows(entries...))
 
@@ -9069,7 +9036,10 @@ func TestSubscriberRepository_DoesNotLeakDriverDetail(t *testing.T) {
 
 	operations := map[string]func(Datasource) error{
 		"UpdateEventSubscriber": func(source Datasource) error {
-			return source.UpdateEventSubscriber(context.Background(), canonicalSubscriber(t), "claim-token")
+			_, err := source.UpdateEventSubscriber(
+				context.Background(), canonicalSubscriber(t), "claim-token")
+
+			return err
 		},
 		"DeleteEventSubscriber": func(source Datasource) error {
 			return source.DeleteEventSubscriber(context.Background(), "acme_prod")
@@ -10250,6 +10220,121 @@ func TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB(t *testing.T)
 	})
 }
 
+// TestListAndCountDeadLetterInventory_DrawsBothAnswersFromOneSnapshot_RealDB is the property a
+// shared predicate could never deliver on its own.
+//
+// The page and its total were two statements on two connections. Both applied the same filters,
+// and the response said so — but an entry dead-lettered between the two reads is counted by one
+// and absent from the other, so the total described a set the page was not a slice of. On a
+// triage endpoint that reads as a different amount of stuck work than there is, and a client
+// comparing the page against the total does not terminate.
+//
+// The test writes a row BETWEEN the two reads of the pair. It can do that because a REPEATABLE
+// READ snapshot is taken at the transaction's first statement, and the insert here happens on a
+// second connection after that statement has run: under two independent reads the second one
+// sees the new row, and under one snapshot neither does. That distinction is the whole test.
+func TestListAndCountDeadLetterInventory_DrawsBothAnswersFromOneSnapshot_RealDB(t *testing.T) {
+	ds := openLockedEventOutboxDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("dltsnap")
+	quiesceEventOutbox(t, ds, marker)
+
+	base := dbTimestamp(time.Now().Add(-3 * time.Hour))
+
+	// A narrowing no other clone of this suite can land in, so the count below is an EQUALITY
+	// rather than a lower bound: the event type is unique to this test.
+	eventType := "transaction.applied." + marker
+
+	deadLetter := func(offset time.Duration) string {
+		entry := newEventOutboxFixture(marker)
+		entry.EventType = eventType
+		entry.Topic = "blnk.transactions"
+		entry.OccurredAt = base.Add(offset)
+		insertRealEventOutbox(t, ds, entry)
+
+		token := claimEventOutboxToken(t, ds, entry)
+		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt",
+			json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`),
+			model.BrokerRecord{}))
+
+		return entry.EventID
+	}
+
+	for i := range 3 {
+		deadLetter(time.Duration(i) * time.Second)
+	}
+
+	query := model.DeadLetterInventoryQuery{Limit: 2, EventType: eventType}
+
+	t.Run("the pair agrees with itself", func(t *testing.T) {
+		page, total, err := ds.ListAndCountDeadLetterInventory(ctx, query)
+		require.NoError(t, err)
+
+		require.Len(t, page.Entries, 2, "the page bound must still be honoured inside the snapshot")
+		assert.True(t, page.HasMore,
+			"the probe row is read inside the snapshot too, so has_more still answers correctly")
+		assert.Equal(t, int64(3), total,
+			"the total counts the narrowing and ignores the page")
+
+		// Newest first, exactly as the standalone listing orders: the snapshot must not have
+		// changed which rows a page selects or in what order.
+		standalone, err := ds.ListDeadLetterInventory(ctx, query)
+		require.NoError(t, err)
+		require.Len(t, standalone.Entries, 2)
+
+		for i := range page.Entries {
+			assert.Equal(t, standalone.Entries[i].EventID, page.Entries[i].EventID,
+				"the paired read must run the same statement as the standalone one")
+		}
+	})
+
+	t.Run("a row written mid-read is in neither answer", func(t *testing.T) {
+		// The insert runs after the transaction's FIRST statement, from this test's own
+		// connection. Under two independent reads the count would see four and the page three;
+		// under one snapshot both see three.
+		before, beforeTotal, err := ds.ListAndCountDeadLetterInventory(ctx,
+			model.DeadLetterInventoryQuery{Limit: maxDeadLetterPageSize, EventType: eventType})
+		require.NoError(t, err)
+		require.Equal(t, int64(3), beforeTotal)
+		require.Len(t, before.Entries, 3)
+
+		deadLetter(4 * time.Second)
+
+		after, afterTotal, err := ds.ListAndCountDeadLetterInventory(ctx,
+			model.DeadLetterInventoryQuery{Limit: maxDeadLetterPageSize, EventType: eventType})
+		require.NoError(t, err)
+
+		// A LATER snapshot sees the new row — the transaction is per call, not per test, so the
+		// pair is coherent without being frozen in time.
+		assert.Equal(t, int64(4), afterTotal)
+		assert.Len(t, after.Entries, 4)
+
+		// AND THE PAIR STILL AGREES. This is the assertion that fails on two independent reads:
+		// the page length and the total must describe one population at every observation.
+		assert.Equal(t, int64(len(after.Entries)), afterTotal,
+			"a full page and its total must agree; when they are two snapshots they can differ by "+
+				"whatever the relay dead-lettered in between")
+	})
+
+	t.Run("a snapshot read writes nothing", func(t *testing.T) {
+		// READ ONLY is declared on the transaction, so this path cannot mutate a row even by
+		// accident. Asserted through the observable consequence: the rows' terminal state and
+		// attempt budget are untouched by having been listed.
+		statuses, err := ds.CountEventOutboxByStatus(ctx, time.Time{})
+		require.NoError(t, err)
+
+		_, _, err = ds.ListAndCountDeadLetterInventory(ctx,
+			model.DeadLetterInventoryQuery{Limit: maxDeadLetterPageSize, EventType: eventType})
+		require.NoError(t, err)
+
+		after, err := ds.CountEventOutboxByStatus(ctx, time.Time{})
+		require.NoError(t, err)
+		assert.Equal(t, statuses[model.EventOutboxStatusDeadLettered],
+			after[model.EventOutboxStatusDeadLettered],
+			"listing the inventory must not move a row between states")
+	})
+}
+
 // TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB is the durable half of making the
 // zero-loss reconciliation honest.
 //
@@ -10316,11 +10401,11 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 	fixtures := []fixture{
 		{40 * 24 * time.Hour, model.EventOutboxStatusDispatched, true, true},
 		{39 * 24 * time.Hour, model.EventOutboxStatusDispatched, true, true},
-		{37 * 24 * time.Hour, model.EventOutboxStatusDeadLettered, false, true},
+		{37 * 24 * time.Hour, model.EventOutboxStatusDeadLettered, false, false},
 		{38 * 24 * time.Hour, model.EventOutboxStatusFailed, false, false},
 	}
 	purgeableCount := int64(0)
-	var failedSurvivor string
+	survivors := make(map[string]string, 2)
 
 	var oldest, newest time.Time
 	offset := int64(9000)
@@ -10344,22 +10429,16 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 			require.NoError(t, failErr)
 			require.True(t, outcome.Exhausted)
 		case model.EventOutboxStatusDeadLettered:
+			// DEAD-LETTERED AND THEREFORE SPARED, however old it is (SEC-08). It is the only
+			// record that a ledger event went undelivered, so age must never remove it: it
+			// leaves the inventory by being REPLAYED, which makes it dispatched, and only then
+			// is it a receipt this sweep may delete.
 			require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, token, entry.Topic+".dlt",
 				json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":5}`), record))
-
-			// AND RESOLVED, because a dead-lettered row is terminal without being purgeable:
-			// it is the only record that a ledger event went undelivered, so retention may
-			// delete it only once an operator has accounted for it (SEC-08). An unresolved
-			// fixture here would be spared, which is the correct behaviour and would make
-			// this test about the gate rather than about the purge log.
-			resolved, resolveErr := ds.MarkEventDeadLetterResolved(ctx, entry.EventID,
-				"resolved by the retention fixture", dbTimestamp(time.Now()))
-			require.NoError(t, resolveErr)
-			require.True(t, resolved.IsResolvedDeadLetter())
 		}
 
 		if !spec.purgeable {
-			failedSurvivor = entry.EventID
+			survivors[spec.status] = entry.EventID
 
 			continue
 		}
@@ -10388,13 +10467,24 @@ func TestPurgeTerminalEventsBefore_RecordsWhatItRemoved_RealDB(t *testing.T) {
 
 	// The `failed` row is still there, and it must be: its dead-letter write never landed,
 	// so this row is the event's only surviving copy.
-	surviving, err := ds.GetEventByID(ctx, failedSurvivor)
+	surviving, err := ds.GetEventByID(ctx, survivors[model.EventOutboxStatusFailed])
 	require.NoError(t, err,
 		"retention must never purge a `failed` row; it is the only copy of an event whose "+
 			"dead-letter write did not complete, and deleting it would BE the loss the "+
 			"reconciliation exists to detect")
 	require.NotNil(t, surviving)
 	assert.Equal(t, model.EventOutboxStatusFailed, surviving.Status)
+
+	// And so is the dead-lettered one, at 37 days against a 30-day cutoff. This is the
+	// assertion that fails if eligibility is ever widened back to the terminal SET: the row
+	// carries the failure metadata an operator triages from and the bytes a replay is driven
+	// from, and no timer may take them.
+	spared, err := ds.GetEventByID(ctx, survivors[model.EventOutboxStatusDeadLettered])
+	require.NoError(t, err,
+		"retention must never purge a dead-lettered row; it is the only record that a ledger "+
+			"event went undelivered")
+	require.NotNil(t, spared)
+	assert.Equal(t, model.EventOutboxStatusDeadLettered, spared.Status)
 
 	after, err := ds.SumPurgedTerminalEvents(ctx)
 	require.NoError(t, err)
@@ -11185,10 +11275,9 @@ func TestListDeadLetteredEvents_CoversBothTerminalFailureStates(t *testing.T) {
 	assert.Contains(t, issued, "ORDER BY occurred_at DESC, id DESC",
 		"triage starts from the most recent failures, and id breaks ties so paging cannot show or skip a row twice")
 	assert.Contains(t, issued, "LIMIT $3 OFFSET $4")
-	assert.NotContains(t, whereClauseOf(t, issued), "resolved_at",
-		"an UNFILTERED listing must show resolved and unresolved entries alike: it is the whole "+
-			"inventory, and narrowing it silently is what makes a page read as \"nothing is stuck\". "+
-			"Asserted on the WHERE clause because resolved_at is legitimately a PROJECTED column")
+	assert.NotContains(t, issued, "resolved_at",
+		"the resolution column is gone from the schema: retention now spares every dead-lettered "+
+			"row and a replay is what makes one purgeable, so no listing may narrow on it")
 
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
@@ -11267,43 +11356,42 @@ func TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL(t *testing.T)
 			forbidden: []string{"status IN ("},
 		},
 		{
-			name:        "unresolved only",
-			filter:      model.DeadLetterInventoryFilter{UnresolvedOnly: true},
-			wantClauses: []string{"resolved_at IS NULL", "LIMIT $3 OFFSET $4"},
+			// THE OCCURRENCE WINDOW, both ends bound inclusively, which is the narrowing an
+			// operator correlating a backlog against an incident timeline actually uses.
+			name: "occurrence window",
+			filter: model.DeadLetterInventoryFilter{
+				OccurredFrom: time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
+				OccurredTo:   time.Date(2024, 6, 2, 0, 0, 0, 0, time.UTC),
+			},
+			wantClauses: []string{
+				"occurred_at >= $3", "occurred_at <= $4", "LIMIT $5 OFFSET $6",
+			},
 			wantArgs: []driver.Value{
 				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
+				time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
+				time.Date(2024, 6, 2, 0, 0, 0, 0, time.UTC),
 				defaultDeadLetterPageSize, 0,
 			},
-			forbidden: []string{"resolved_at IS NOT NULL"},
-		},
-		{
-			name:        "resolved only",
-			filter:      model.DeadLetterInventoryFilter{ResolvedOnly: true},
-			wantClauses: []string{"resolved_at IS NOT NULL"},
-			wantArgs: []driver.Value{
-				model.EventOutboxStatusDeadLettered, model.EventOutboxStatusFailed,
-				defaultDeadLetterPageSize, 0,
-			},
+			forbidden: []string{"event_type = $", "resolved_at"},
 		},
 		{
 			// Every predicate at once, which is what proves the placeholder arithmetic
 			// holds as clauses accumulate rather than only in isolation.
 			name: "every predicate together",
 			filter: model.DeadLetterInventoryFilter{
-				EventType:      "balance.created",
-				Topic:          "blnk.balances",
-				Status:         model.EventOutboxStatusDeadLettered,
-				UnresolvedOnly: true,
+				EventType: "balance.created",
+				Topic:     "blnk.balances",
+				Status:    model.EventOutboxStatusDeadLettered,
 			},
 			limit:  25,
 			offset: 10,
 			wantClauses: []string{
-				"status = $1", "event_type = $2", "topic = $3",
-				"resolved_at IS NULL", "LIMIT $4 OFFSET $5",
+				"status = $1", "event_type = $2", "topic = $3", "LIMIT $4 OFFSET $5",
 			},
 			wantArgs: []driver.Value{
 				model.EventOutboxStatusDeadLettered, "balance.created", "blnk.balances", 25, 10,
 			},
+			forbidden: []string{"resolved_at"},
 		},
 	}
 
@@ -11347,10 +11435,9 @@ func TestListDeadLetteredEventsFiltered_AppliesEveryPredicateInSQL(t *testing.T)
 // the builder, and which this test pins by comparing the two statements clause for clause.
 func TestCountDeadLetteredEvents_CountsTheSamePopulationTheListingPages(t *testing.T) {
 	filter := model.DeadLetterInventoryFilter{
-		EventType:      "transaction.applied",
-		Topic:          "blnk.transactions",
-		Status:         model.EventOutboxStatusDeadLettered,
-		UnresolvedOnly: true,
+		EventType: "transaction.applied",
+		Topic:     "blnk.transactions",
+		Status:    model.EventOutboxStatusDeadLettered,
 	}
 
 	db, mock, captured := newCapturingSQLMock(t)

@@ -91,8 +91,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -112,9 +110,18 @@ import (
 // once so the single-row and listing paths cannot drift apart in either
 // projection or scan order — a drift that would not fail to compile and would
 // instead surface as silently transposed fields.
+// THE SETTLEMENT MARKERS ARE PART OF THE ROW, and they were not.
+//
+// grant_reconcile_pending_at and credential_cleanup_pending_at were written by the settlement
+// paths and counted by the residue aggregate, but they were absent from this projection — so
+// every lifecycle guard that read a row and asked whether broker work could be confirmed saw an
+// ordinary subscriber where the row itself recorded an unsettled broker obligation. A credential
+// Blnk intended to destroy and could not is the direction that matters, because it still
+// authenticates.
 const eventSubscriberColumns = `id, subscriber_id, name, kafka_principal, consumer_group_id, authorized_topics, ` +
 	`partition_key_prefix, credential_reference, credential_issued_at, webhook_url, migrated_at, ` +
-	`revocation_pending_at, revocation_failed_at, credential_orphaned_at, created_at, updated_at`
+	`revocation_pending_at, revocation_failed_at, credential_orphaned_at, ` +
+	`grant_reconcile_pending_at, credential_cleanup_pending_at, created_at, updated_at`
 
 // Page-size bounds for the registry listing. The default keeps an unqualified
 // request cheap; the maximum stops a caller turning a management endpoint into a
@@ -211,6 +218,7 @@ func scanEventSubscriber(s eventSubscriberScanner) (model.EventSubscriber, error
 	var partitionKeyPrefix, credentialReference, webhookURL sql.NullString
 	var credentialIssuedAt, migratedAt, revocationPendingAt sql.NullTime
 	var revocationFailedAt, credentialOrphanedAt sql.NullTime
+	var grantReconcilePendingAt, credentialCleanupPendingAt sql.NullTime
 
 	if err := s.Scan(
 		&sub.ID,
@@ -227,6 +235,8 @@ func scanEventSubscriber(s eventSubscriberScanner) (model.EventSubscriber, error
 		&revocationPendingAt,
 		&revocationFailedAt,
 		&credentialOrphanedAt,
+		&grantReconcilePendingAt,
+		&credentialCleanupPendingAt,
 		&sub.CreatedAt,
 		&sub.UpdatedAt,
 	); err != nil {
@@ -272,6 +282,14 @@ func scanEventSubscriber(s eventSubscriberScanner) (model.EventSubscriber, error
 	if revocationPendingAt.Valid {
 		pending := revocationPendingAt.Time
 		sub.RevocationPendingAt = &pending
+	}
+	if grantReconcilePendingAt.Valid {
+		pending := grantReconcilePendingAt.Time
+		sub.GrantReconcilePendingAt = &pending
+	}
+	if credentialCleanupPendingAt.Valid {
+		pending := credentialCleanupPendingAt.Time
+		sub.CredentialCleanupPendingAt = &pending
 	}
 
 	return sub, nil
@@ -563,105 +581,26 @@ func requireGrantableTopics(topics []string) error {
 // Returns:
 //   - error: a typed invalid-input error naming the rule broken, or nil.
 func requireSafeWebhookURL(webhookURL *string) error {
-	if webhookURL == nil || strings.TrimSpace(*webhookURL) == "" {
+	if webhookURL == nil {
 		return nil
 	}
 
-	raw := *webhookURL
-
-	// SURROUNDING WHITESPACE IS REFUSED, not trimmed, and this rule belongs here rather than
-	// only in the request DTO.
+	// THE ONE POLICY, in model.ValidateWebhookURL. This function used to carry its own copy —
+	// including its own destination classifier — beside a second copy in the request DTO, so one
+	// column had two rules: a service, CLI or migration caller reaching this repository directly
+	// was judged by a different standard from an HTTP caller, and the same rejected host produced
+	// two different reason phrases. What stays here is the ERROR TYPE, because this layer answers
+	// with a typed apierror while the DTO answers with a plain validation error.
 	//
-	// The write paths store this column VERBATIM, so trimming for validation and then storing
-	// the original meant a value could pass a check the stored bytes did not satisfy: " https://
-	// hooks.example.com/blnk " was validated as the trimmed URL and persisted with the spaces,
-	// where it is a different URL to every reader and to whatever eventually sends to it. The
-	// API DTO already refuses it, so trimming here also made a service, CLI or migration caller
-	// subject to a laxer policy than an HTTP caller — one column, two rules.
-	//
-	// An all-whitespace value is NOT refused: the guard above treats it as "clear the record",
-	// which is the same three-way nil/empty/value mapping the service layer applies, and the
-	// nullable column exists to keep those distinguishable.
-	if raw != strings.TrimSpace(raw) {
-		return apierror.NewAPIError(apierror.ErrInvalidInput,
-			"The webhook URL must not have surrounding whitespace",
-			errors.New(
-				"a URL differing from another only by whitespace is a copy-paste artefact, and this "+
-					"column is stored verbatim, so trimming it would persist a destination the caller "+
-					"did not supply",
-			))
+	// An empty or all-whitespace value passes: it means "clear the record", which is the same
+	// three-way nil/empty/value mapping the service layer applies and the reason the column is
+	// nullable.
+	message, reason := model.ValidateWebhookURL(*webhookURL)
+	if message == "" {
+		return nil
 	}
 
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		return apierror.NewAPIError(apierror.ErrInvalidInput,
-			"The webhook URL is not a valid URL", err)
-	}
-
-	if parsed.Scheme != "https" {
-		return apierror.NewAPIError(apierror.ErrInvalidInput,
-			"The webhook URL must use https",
-			fmt.Errorf("scheme %q is not permitted; ledger and identity payloads must not be pushed in cleartext",
-				parsed.Scheme))
-	}
-
-	host := parsed.Hostname()
-	if host == "" {
-		return apierror.NewAPIError(apierror.ErrInvalidInput,
-			"The webhook URL must name a host", nil)
-	}
-
-	if reason := internalDestinationReason(host); reason != "" {
-		return apierror.NewAPIError(apierror.ErrInvalidInput,
-			"The webhook URL must not address an internal destination",
-			fmt.Errorf("host %q is refused: %s", host, reason))
-	}
-
-	return nil
-}
-
-// internalDestinationReason reports why a host is an internal destination, or "" when it is
-// not visibly internal.
-//
-// Literal addresses are classified with net.IP so every form of them is covered — IPv4, IPv6,
-// and IPv4-mapped IPv6, which is the spelling a denylist of strings always misses. A name
-// without a dot is refused because it can only resolve through a search domain or a hosts
-// entry, both of which are inside the deployment.
-//
-// Parameters:
-//   - host string: the hostname or literal address from the URL.
-//
-// Returns:
-//   - string: a short reason, or "" when the host is acceptable.
-func internalDestinationReason(host string) string {
-	if address := net.ParseIP(host); address != nil {
-		switch {
-		case address.IsLoopback():
-			return "it is a loopback address, which would make Blnk call itself"
-		case address.IsLinkLocalUnicast(), address.IsLinkLocalMulticast():
-			return "it is a link-local address, the range the cloud metadata service lives on"
-		case address.IsPrivate():
-			return "it is a private address, which reaches services that trust the network rather than the caller"
-		case address.IsUnspecified():
-			return "it is the unspecified address"
-		case address.IsInterfaceLocalMulticast(), address.IsMulticast():
-			return "it is a multicast address"
-		default:
-			return ""
-		}
-	}
-
-	lowered := strings.ToLower(host)
-	switch {
-	case lowered == "localhost", strings.HasSuffix(lowered, ".localhost"):
-		return "it resolves to loopback"
-	case strings.HasSuffix(lowered, ".local"), strings.HasSuffix(lowered, ".internal"):
-		return "it is an internal-only name"
-	case !strings.Contains(lowered, "."):
-		return "it is unqualified, so it can only resolve inside this deployment"
-	default:
-		return ""
-	}
+	return apierror.NewAPIError(apierror.ErrInvalidInput, message, errors.New(reason))
 }
 
 // classifySubscriberWriteError turns a driver error from an insert or update into
@@ -1160,6 +1099,28 @@ func (d Datasource) ListEventSubscribers(
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ListEventSubscribers")
 	defer span.End()
 
+	return listEventSubscribers(ctx, d.Conn, span, query)
+}
+
+// listEventSubscribers is the page read, parameterised by the connection it runs on, so that the
+// standalone read and the snapshot-consistent read that pairs the page with its total run the
+// identical statement over identical bindings. See ListAndCountEventSubscribers.
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - conn subscriberQueryer: *sql.DB for a standalone read, *sql.Tx for the paired read.
+//   - span trace.Span: the caller's span, annotated here.
+//   - query model.SubscriberPageQuery: the page.
+//
+// Returns:
+//   - model.SubscriberPage: as ListEventSubscribers.
+//   - error: as ListEventSubscribers.
+func listEventSubscribers(
+	ctx context.Context,
+	conn subscriberQueryer,
+	span trace.Span,
+	query model.SubscriberPageQuery,
+) (model.SubscriberPage, error) {
 	limit := query.Limit
 	if limit <= 0 {
 		limit = defaultSubscriberPageSize
@@ -1182,7 +1143,7 @@ func (d Datasource) ListEventSubscribers(
 
 	// limit+1: the extra row establishes that another page exists and is discarded, which
 	// answers "is there more" without counting the registry.
-	rows, err := d.Conn.QueryContext(ctx, listEventSubscribersQuery, cursorInstant, cursorID, limit+1)
+	rows, err := conn.QueryContext(ctx, listEventSubscribersQuery, cursorInstant, cursorID, limit+1)
 	if err != nil {
 		failDatabaseSpan(span, err)
 		return model.SubscriberPage{}, loggedDatabaseError(apierror.ErrInternalServer, "Failed to list event subscribers", "list_event_subscribers", err)
@@ -1263,8 +1224,27 @@ func (d Datasource) CountEventSubscribers(ctx context.Context) (int64, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CountEventSubscribers")
 	defer span.End()
 
+	return countEventSubscribers(ctx, d.Conn, span)
+}
+
+// countEventSubscribers is the count, parameterised by the connection it runs on, for the same
+// reason listEventSubscribers is. See ListAndCountEventSubscribers.
+//
+// Parameters:
+//   - ctx context.Context: cancels the query.
+//   - conn subscriberQueryer: *sql.DB for a standalone count, *sql.Tx for the paired read.
+//   - span trace.Span: the caller's span, annotated here.
+//
+// Returns:
+//   - int64: as CountEventSubscribers.
+//   - error: as CountEventSubscribers.
+func countEventSubscribers(
+	ctx context.Context,
+	conn subscriberQueryer,
+	span trace.Span,
+) (int64, error) {
 	var total int64
-	if err := d.Conn.QueryRowContext(ctx, `
+	if err := conn.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM blnk.event_subscribers
 	`).Scan(&total); err != nil {
@@ -1279,6 +1259,92 @@ func (d Datasource) CountEventSubscribers(ctx context.Context) (int64, error) {
 
 	span.SetAttributes(attribute.Int64("subscriber.total", total))
 	return total, nil
+}
+
+// subscriberQueryer is the minimum read surface these two statements need, satisfied by both
+// *sql.DB and *sql.Tx.
+//
+// It is the registry's counterpart of the outbox's sqlQueryer and exists for the identical
+// reason: the page and its total have to be answerable from ONE SNAPSHOT, which means running
+// both inside a transaction, while both reads must remain available standalone. Parameterising
+// each statement by its connection keeps exactly one copy of the keyset predicate.
+type subscriberQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
+// ListAndCountEventSubscribers returns one page of the registry AND how many rows it holds, both
+// read from a single snapshot.
+//
+// # Why one snapshot rather than two reads
+//
+// The page and the total used to be two independent statements on two connections. A subscriber
+// registered or deregistered between them is counted by one and absent from the other, so the
+// total describes a registry the page is not a slice of — and the response asserted that they
+// described "the same set by construction", which two snapshots cannot make true however
+// identical their predicates are.
+//
+// REPEATABLE READ is what fixes it: PostgreSQL takes one snapshot at the first statement and
+// every later statement in the transaction sees exactly that snapshot. READ ONLY is declared as
+// well, which makes it impossible for this path to write.
+//
+// # What is still NOT guaranteed
+//
+// One snapshot makes the total and THIS page agree. It cannot make "paging to the total
+// exhausts the registry" true, because paging spans many requests over a live registry. The
+// total is exact as at this page, and SubscriberPageResponse documents it that way.
+//
+// Parameters:
+//   - ctx context.Context: cancels the transaction.
+//   - query model.SubscriberPageQuery: the page. The count is of the whole registry, which the
+//     listing narrows by nothing — if a filter is ever added to the listing it must be added to
+//     the count in the same change.
+//
+// Returns:
+//   - model.SubscriberPage: the page, as ListEventSubscribers.
+//   - int64: how many subscribers exist in the same snapshot.
+//   - error: the repository's typed error. A failure to open or read the snapshot is reported
+//     rather than degraded to two reads, because a caller that asked for a coherent pair must
+//     not be handed an incoherent one that looks identical.
+func (d Datasource) ListAndCountEventSubscribers(
+	ctx context.Context,
+	query model.SubscriberPageQuery,
+) (model.SubscriberPage, int64, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "ListAndCountEventSubscribers")
+	defer span.End()
+
+	tx, err := d.Conn.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		failDatabaseSpan(span, err)
+
+		return model.SubscriberPage{}, 0, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to list event subscribers", "list_and_count_event_subscribers", err)
+	}
+
+	// Rolled back unconditionally, never committed: nothing was written, and a rollback releases
+	// the snapshot on every path. The result is already in hand, so a rollback failure is logged
+	// rather than returned.
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			withLoggableCause(nil, rollbackErr).Error(
+				"failed to roll back the subscriber registry snapshot")
+		}
+	}()
+
+	page, err := listEventSubscribers(ctx, tx, span, query)
+	if err != nil {
+		return model.SubscriberPage{}, 0, err
+	}
+
+	total, err := countEventSubscribers(ctx, tx, span)
+	if err != nil {
+		return model.SubscriberPage{}, 0, err
+	}
+
+	return page, total, nil
 }
 
 // UpdateEventSubscriber updates a subscriber's access model and its legacy webhook
@@ -1322,7 +1388,27 @@ func (d Datasource) CountEventSubscribers(ctx context.Context) (int64, error) {
 //   - subscriber *model.EventSubscriber: the row as it should be written.
 //   - fenceToken string: the provisioning claim the caller holds. Required.
 //
+// # IT RETURNS THE ROW IT WROTE
+//
+// The statement used to be an ExecContext, and the service then returned the in-memory row it had
+// assembled — carrying the updated_at it had READ before the write. So a PUT answered with an
+// instant strictly older than the one now stored, and a client using updated_at to detect
+// concurrent modification would compare its own write against a value that predates it and
+// conclude nothing had changed. The row's other columns had the same exposure: any value the
+// statement did not write (a database default, a trigger) was reported as whatever the caller
+// happened to send.
+//
+// RETURNING the full projection removes the class of problem rather than the one field. The
+// response is now the row as PostgreSQL holds it after the write, which is the only description of
+// it that cannot be stale.
+//
+// Parameters:
+//   - ctx context.Context: cancels the statement.
+//   - subscriber *model.EventSubscriber: the row as it should be written.
+//   - fenceToken string: the provisioning claim the caller holds. Required.
+//
 // Returns:
+//   - *model.EventSubscriber: the row as stored after the write, never nil when err is nil.
 //   - error: a typed conflict when the claim is lost or the row is tombstoned, a typed
 //     not-found when the row is gone, a typed conflict for a principal collision, or a logged
 //     internal error.
@@ -1330,22 +1416,22 @@ func (d Datasource) UpdateEventSubscriber(
 	ctx context.Context,
 	subscriber *model.EventSubscriber,
 	fenceToken string,
-) error {
+) (*model.EventSubscriber, error) {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "UpdateEventSubscriber")
 	defer span.End()
 
 	if err := requireSubscriberFields(subscriber); err != nil {
 		failDatabaseSpan(span, err)
-		return err
+		return nil, err
 	}
 
 	if err := requireFenceToken(fenceToken); err != nil {
 		failDatabaseSpan(span, err)
-		return err
+		return nil, err
 	}
 	span.SetAttributes(attribute.String("subscriber.id", subscriber.SubscriberID))
 
-	result, err := d.Conn.ExecContext(ctx, `
+	row := d.Conn.QueryRowContext(ctx, `
 		UPDATE blnk.event_subscribers
 		SET name = $1,
 			kafka_principal = $2,
@@ -1357,7 +1443,7 @@ func (d Datasource) UpdateEventSubscriber(
 		WHERE subscriber_id = $8
 		  AND provisioning_token = $9
 		  AND revocation_pending_at IS NULL
-	`,
+		RETURNING `+eventSubscriberColumns,
 		subscriber.Name,
 		subscriber.KafkaPrincipal,
 		subscriber.ConsumerGroupID,
@@ -1368,36 +1454,36 @@ func (d Datasource) UpdateEventSubscriber(
 		subscriber.SubscriberID,
 		strings.TrimSpace(fenceToken),
 	)
+
+	updated, err := scanEventSubscriber(row)
 	if err != nil {
 		failDatabaseSpan(span, err)
+
+		// NO ROWS IS THE FENCED-WRITE MISS, and it is the same condition the affected-row count
+		// used to report. Either predicate failed — the claim expired, or the row was tombstoned —
+		// or the row is gone, and those call for opposite responses, so the classifier decides
+		// rather than this statement reporting a flat not-found.
+		if errors.Is(err, sql.ErrNoRows) {
+			miss := d.classifyFencedWriteMiss(ctx, subscriber.SubscriberID, fenceToken,
+				"Failed to update event subscriber")
+			failDatabaseSpan(span, miss)
+
+			return nil, miss
+		}
+
 		// Reachable through the principal index: moving a principal onto one another
 		// subscriber already holds is a conflict, not a server fault.
-		return classifySubscriberWriteError(err, "Failed to update event subscriber")
-	}
-
-	affected, err := result.RowsAffected()
-	if err != nil {
-		failDatabaseSpan(span, err)
-
-		return loggedDatabaseError(apierror.ErrInternalServer,
-			"Failed to update event subscriber", "update_event_subscriber", err)
-	}
-
-	if affected == 0 {
-		miss := d.classifyFencedWriteMiss(ctx, subscriber.SubscriberID, fenceToken,
-			"Failed to update event subscriber")
-		failDatabaseSpan(span, miss)
-
-		return miss
+		return nil, classifySubscriberWriteError(err, "Failed to update event subscriber")
 	}
 
 	span.AddEvent("Event subscriber updated", trace.WithAttributes(
-		attribute.String("subscriber.id", subscriber.SubscriberID),
-		attribute.String("subscriber.principal", subscriber.KafkaPrincipal),
-		attribute.String("subscriber.consumer_group", subscriber.ConsumerGroupID),
-		attribute.Int("subscriber.authorized_topic_count", len(subscriber.AuthorizedTopics)),
+		attribute.String("subscriber.id", updated.SubscriberID),
+		attribute.String("subscriber.principal", updated.KafkaPrincipal),
+		attribute.String("subscriber.consumer_group", updated.ConsumerGroupID),
+		attribute.Int("subscriber.authorized_topic_count", len(updated.AuthorizedTopics)),
 	))
-	return nil
+
+	return &updated, nil
 }
 
 // DeleteEventSubscriber removes a subscriber from the registry.
@@ -1841,10 +1927,20 @@ func (d Datasource) CompleteSubscriberWebhookMigration(
 	}
 	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
 
+	// COALESCE, so the FIRST transition is the one that is kept.
+	//
+	// This statement is idempotent by design — it is how a subscriber's dual-run artefact is
+	// removed, and DELETE /subscribers/{id}/webhook-subscription can legitimately be called again
+	// on a row already migrated — but an unconditional assignment made each repeat rewrite
+	// migrated_at to the current instant. The column is the record of WHEN a subscriber left HTTP
+	// delivery: it is what migration-progress reporting reads and what an operator uses to decide
+	// whether the sunset window has been served, so a second call quietly moved the migration
+	// forward in time and made a long-migrated subscriber look like it moved today. webhook_url is
+	// already NULL by then, so nothing else in the row distinguishes the repeat.
 	row := d.Conn.QueryRowContext(ctx, `
 		UPDATE blnk.event_subscribers
 		SET webhook_url = NULL,
-			migrated_at = $1,
+			migrated_at = COALESCE(migrated_at, $1),
 			updated_at = $2
 		WHERE subscriber_id = $3
 		RETURNING `+eventSubscriberColumns,

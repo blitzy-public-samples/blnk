@@ -1106,3 +1106,126 @@ func TestHooksRoutes_SurviveTheWebhookSunset(t *testing.T) {
 		})
 	}
 }
+
+// setupThrottledSunsetRouter builds the same router setupSunsetRouter does, but with a rate limit
+// small enough that the SECOND request from one client is refused.
+//
+// The tiny limit is the whole apparatus. The production defaults are 2000 rps with a burst of
+// 4000, so exhausting them would take four thousand requests and would prove the same thing far
+// more slowly.
+//
+// Parameters:
+//   - t *testing.T: the test, for require.
+//   - sunsetDate string: the RFC3339 retirement instant.
+//
+// Returns:
+//   - *gin.Engine: the assembled router, whose limiter admits one request per client.
+func setupThrottledSunsetRouter(t *testing.T, sunsetDate string) *gin.Engine {
+	t.Helper()
+
+	rps := 1.0
+	burst := 1
+
+	config.MockConfig(&config.Configuration{
+		Queue: config.QueueConfig{
+			TransactionQueue: "transaction_queue_test_sunset_throttled",
+			NumberOfQueues:   1,
+		},
+		Redis:      config.RedisConfig{Dns: "localhost:6379"},
+		DataSource: config.DataSourceConfig{Dns: "postgres://postgres:@localhost:5432/blnk?sslmode=disable"},
+		Server: config.ServerConfig{
+			Secure:    false,
+			SecretKey: sunsetTestSecretKey,
+		},
+		RateLimit:                    config.RateLimitConfig{RequestsPerSecond: &rps, Burst: &burst},
+		WebhookDeprecationSunsetDate: sunsetDate,
+	})
+
+	cnf, err := config.Fetch()
+	require.NoError(t, err, "fetching the mocked configuration")
+	require.NotNil(t, cnf.RateLimit.RequestsPerSecond,
+		"the rate limit did not reach the configuration store, so nothing below would be throttled")
+	require.Equal(t, sunsetDate, cnf.WebhookDeprecationSunsetDate,
+		"the retirement instant did not reach the configuration store")
+
+	db, err := database.NewDataSource(cnf)
+	require.NoError(t, err, "creating the datasource")
+
+	instance, err := blnk.NewBlnk(db)
+	require.NoError(t, err, "creating the Blnk instance")
+
+	api := NewAPI(instance)
+	require.NotNil(t, api, "NewAPI returned nil, which means configuration fetch failed")
+
+	return api.Router()
+}
+
+// TestWebhookSunset_IsNotPreemptedByRateLimiting is the M-5 guard, asserted through a response
+// rather than through the source.
+//
+// # The defect
+//
+// The retirement barrier was installed in api.Router, and every router.Use there runs AFTER every
+// r.Use in NewAPI — where RateLimitMiddleware is installed. So a throttled request to a retired
+// webhook-subscription route was answered 429 by the limiter and never reached either sunset
+// guard. The caller was told to slow down and try again, about a surface that is gone, and would
+// have retried it indefinitely. Requirement R-12 says the webhook REST API answers 410 Gone on
+// every request; "every request except the throttled ones" does not satisfy it.
+//
+// # Why the limiter is exhausted rather than mocked
+//
+// The bug is one of ORDER, and order is a property of the assembled chain. A test that installed
+// its own middleware would assemble a different chain and could pass while the real one stayed
+// broken, which is precisely what every existing test in this file did — they authenticate, use a
+// registered verb, and send one request each, so none of them is ever throttled.
+func TestWebhookSunset_IsNotPreemptedByRateLimiting(t *testing.T) {
+	router := setupThrottledSunsetRouter(t, pastSunset())
+
+	// FIRST, prove the limiter is actually armed: a live route must start refusing. Without this
+	// the test below would pass on a router that throttles nothing, which is the failure mode a
+	// too-generous limit would produce and the reason the limit is asserted rather than assumed.
+	var throttled bool
+	for range 8 {
+		rec := doSunsetRequest(t, router, http.MethodGet, "/ledgers", true)
+		if rec.Code == http.StatusTooManyRequests {
+			throttled = true
+
+			break
+		}
+	}
+	require.True(t, throttled,
+		"the rate limiter never refused a live route, so nothing below would have been preempted "+
+			"and this test would prove nothing")
+
+	// NOW the retired path, with the limiter already exhausted for this client. Every one of these
+	// would have been 429 before the barrier moved.
+	for _, method := range []string{
+		http.MethodPost, http.MethodGet, http.MethodPut, http.MethodDelete,
+		// The unregistered verbs too: they reach no route, so they are answered by the chain gin
+		// rebuilds for unmatched requests — which contains the limiter as well.
+		http.MethodPatch, http.MethodHead, http.MethodOptions,
+	} {
+		t.Run(method, func(t *testing.T) {
+			rec := doSunsetRequest(t, router, method, retiredWebhookPath, true)
+
+			require.Equal(t, http.StatusGone, rec.Code,
+				"a throttled request to a retired route must still be told the route is GONE, not "+
+					"that it should retry. Got %d: %s", rec.Code, rec.Body.String())
+
+			// HEAD carries no body by definition, so the code assertion applies to the others.
+			if method != http.MethodHead {
+				assert.Equal(t, string(apierror.ErrGenGone), errorCodeOf(t, rec.Body.Bytes()),
+					"the refusal must carry GEN_GONE, so a client can tell a retirement from a "+
+						"throttle without parsing prose")
+			}
+		})
+	}
+
+	// AND THE NEIGHBOURS ARE STILL THROTTLED. Moving the barrier ahead of the limiter must not
+	// have moved the limiter, and a barrier that somehow admitted everything would pass every
+	// assertion above while disabling rate limiting for the whole API.
+	rec := doSunsetRequest(t, router, http.MethodGet, "/ledgers", true)
+	assert.Equal(t, http.StatusTooManyRequests, rec.Code,
+		"a live route must still be throttled; the barrier is scoped to the retired surface and "+
+			"must not have displaced the limiter for anything else. Got %d", rec.Code)
+}

@@ -582,6 +582,18 @@ type eventOutbox interface {
 	// page, so a total and the page it accompanies are driven from one predicate.
 	CountDeadLetterInventory(ctx context.Context, query model.DeadLetterQuery) (int64, error)
 
+	// ListAndCountDeadLetterInventory answers both of the above from ONE SNAPSHOT, and is what
+	// a listing that asked for a total goes through.
+	//
+	// One predicate was never enough on its own: two statements on two connections see two
+	// populations, so an entry dead-lettered between them is counted by one read and absent
+	// from the other, and the total then describes a set the page is not a slice of. On a
+	// triage endpoint that reads as a different amount of stuck work than there is.
+	ListAndCountDeadLetterInventory(
+		ctx context.Context,
+		query model.DeadLetterInventoryQuery,
+	) (model.DeadLetterInventoryPage, int64, error)
+
 	// ListDeadLetteredEvents pages the inventory as FULL rows, newest occurrence first, with
 	// every narrowing applied in SQL. It is what the dead-letter service and the replay path
 	// read; ListDeadLetterInventory is the narrow projection the operator listing pages.
@@ -590,15 +602,6 @@ type eventOutbox interface {
 	// CountDeadLetteredEvents counts what the SAME narrowing the listing used matches,
 	// ignoring the page, so the total and the page describe one set.
 	CountDeadLetteredEvents(ctx context.Context, query model.DeadLetterQuery) (int64, error)
-
-	// MarkEventDeadLetterResolved records an operator's account that a dead-lettered
-	// event needs no further action, which is the ONLY thing that makes such a row
-	// eligible for the retention purge.
-	//
-	// It is a conditional write requiring the dead_lettered state and an unset
-	// resolution, so a row whose `<topic>.dlt` write is still owed is refused and an
-	// already-resolved row is refused rather than re-stamped over its audit trail.
-	MarkEventDeadLetterResolved(ctx context.Context, eventID string, note string, at time.Time) (*model.EventOutbox, error)
 
 	// CountEventSubscribers counts the whole registry, which is what the listing's
 	// include_count option answers with.
@@ -851,6 +854,15 @@ type eventSubscriber interface {
 	// while never reaching the rest of the registry, so older subscribers had no lag
 	// series at all and the lag alert could not fire for them.
 	ListEventSubscribers(ctx context.Context, query model.SubscriberPageQuery) (model.SubscriberPage, error)
+
+	// ListAndCountEventSubscribers pages the registry and counts it from ONE SNAPSHOT, and is
+	// what a listing that asked for a total goes through. Two reads on two connections see two
+	// registries, so a subscriber registered between them makes the total describe a set the
+	// page is not a slice of.
+	ListAndCountEventSubscribers(
+		ctx context.Context,
+		query model.SubscriberPageQuery,
+	) (model.SubscriberPage, int64, error)
 	DeleteEventSubscriber(ctx context.Context, subscriberID string) error // Removes a subscriber from the registry
 
 	// UpdateEventSubscriber replaces a subscriber's mutable columns — its access
@@ -868,7 +880,16 @@ type eventSubscriber interface {
 	// A miss is reported as a CONFLICT naming which condition failed, never as a
 	// not-found: "your claim expired" and "this subscriber does not exist" call for
 	// opposite responses.
-	UpdateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber, fenceToken string) error
+	//
+	// It RETURNS the row as stored after the write. An ExecContext left the caller to answer with
+	// the row it had assembled, carrying the updated_at it read BEFORE the write — so a PUT
+	// reported an instant older than the one stored, and a client using it to detect concurrent
+	// modification compared its own write against a value that predates it.
+	UpdateEventSubscriber(
+		ctx context.Context,
+		subscriber *model.EventSubscriber,
+		fenceToken string,
+	) (*model.EventSubscriber, error)
 
 	// TakeEventSubscriber removes a subscriber and RETURNS the row it removed,
 	// so the caller holds the principal and authorised topics that broker-side

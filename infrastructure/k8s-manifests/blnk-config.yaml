@@ -370,12 +370,13 @@ data:
   #   * DISPATCHED rows are receipts — the event reached the broker and a
   #     subscriber has had it — so age alone governs them.
   #   * DEAD-LETTERED rows are the record of an event NO SUBSCRIBER RECEIVED, and
-  #     this period does NOT delete them on its own. They become eligible only
-  #     once an operator resolves one through
-  #     POST /events/dead-letter/{event_id}/resolve. An unresolved failure stays
-  #     however old it is, and keeps the DeadLetterMessageStuck alert firing until
-  #     somebody accounts for it. That gate is what makes a finite value here safe:
-  #     the purge can never destroy the evidence of a loss nobody has looked at.
+  #     this period NEVER deletes them, however old they are. Such a row keeps the
+  #     DeadLetterMessageStuck alert firing until the event actually reaches a
+  #     subscriber, and it leaves the inventory by being REPLAYED through
+  #     POST /events/dead-letter/{event_id}/replay — a re-publish the broker
+  #     acknowledges makes the row dispatched, and this period then applies to it
+  #     as a receipt. That is what makes a finite value here safe: the purge can
+  #     never destroy the evidence of a loss nobody has dealt with.
   #   * pending, processing, replaying and failed rows are never purged at all. A
   #     failed row still owes its <topic>.dlt write, so this table is the only copy
   #     of that event in existence.
@@ -517,6 +518,63 @@ data:
   # because falling back silently would leave the forgeable behaviour in place
   # while this file said otherwise.
   BLNK_SERVER_TRUSTED_PROXIES: ""
+
+  # Whether X-Forwarded-Proto may be BELIEVED, which is what decides whether the
+  # credential-issuance endpoint will answer at all behind an ingress.
+  #
+  # THE WORKLOADS DO NOT START WITHOUT THIS KEY. server-deployment.yaml reads it
+  # through a NON-OPTIONAL configMapKeyRef, so an absent key is a
+  # CreateContainerConfigError and the pod never runs. It was referenced there and
+  # never defined here, which is why it is stated explicitly now rather than left
+  # to the application default.
+  #
+  # WHY IT SHIPS FALSE. POST /subscribers/{id}/kafka-credentials returns a one-time
+  # SASL password, and that response is the only chance to disclose it to anything
+  # watching the wire. When Blnk terminates TLS itself it can see the channel is
+  # confidential. When TLS terminates in FRONT of it — the normal Kubernetes shape,
+  # where the hop from ingress to pod is plaintext — it cannot, and
+  # X-Forwarded-Proto is a header any client can set. This flag is the deployment
+  # stating, once and explicitly, that the header is now under a proxy's control.
+  #
+  # False is therefore deny-by-default: credential issuance refuses with
+  # SUBSCRIBER_INSECURE_TRANSPORT rather than putting a password on a channel
+  # nobody has established as confidential. A loopback caller is still served,
+  # because those bytes never leave the host. Shipping "true" would have been the
+  # convenient default and the wrong one — it re-enables exactly that disclosure,
+  # silently, for every deployment that has no such proxy.
+  #
+  # SET IT TO "true" ONLY WHEN ALL THREE HOLD:
+  #   1. An ingress, load balancer or mesh sidecar terminates TLS in front of the
+  #      server.
+  #   2. That proxy SETS X-Forwarded-Proto rather than passing a client value
+  #      through — it must overwrite, not append.
+  #   3. Nothing can reach the pod's port bypassing that proxy. A NetworkPolicy
+  #      admitting only the ingress namespace is how this is normally enforced.
+  #
+  # Nothing else in Blnk's behaviour depends on it.
+  BLNK_SERVER_TRUST_FORWARDED_PROTO: "false"
+
+  # Whether the in-process metrics registry and the /metrics route exist.
+  #
+  # THE WORKLOADS DO NOT START WITHOUT THIS KEY either. worker-deployment.yaml
+  # reads it through a non-optional configMapKeyRef and it was never defined here.
+  #
+  # It ships "true", matching the default both compose files use, because the cost
+  # of each wrong answer is not symmetric. False means there is NO /metrics route:
+  # every scrape 404s and the rules in alerts/blnk-kafka-alerts.yml can never fire,
+  # because the series they read are never recorded — so a deployment believes it
+  # has dead-letter and consumer-lag alerting and has none. The cost of true when
+  # nobody scrapes is one in-process registry.
+  #
+  # Set it to "false" to opt out. Read it with BLNK_METRICS_BEARER_TOKEN, which
+  # both deployments take from a Secret: with this true and that token unset,
+  # /metrics answers UNAUTHENTICATED.
+  #
+  # It is projected onto BOTH roles. prometheus.yml scrapes the server on 5001 and
+  # the worker on 5004, and the two record different series — the server hosts the
+  # relay, so the outbox, publish and dead-letter instruments are its — so arming
+  # only one role leaves half the alert rules permanently silent.
+  BLNK_ENABLE_OBSERVABILITY: "true"
 
   # The PER-CLIENT request rate limit, and both halves are stated because the
   # middleware disables the limiter entirely when either is missing — so setting

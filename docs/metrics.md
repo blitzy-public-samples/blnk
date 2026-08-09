@@ -180,8 +180,16 @@ failed permanently, it did not run out of tries.
 | `blnk_events_purged_total` | Counter | — | Terminal event rows deleted by the retention sweep. Read it **against eligibility**, not on its own: a flat counter most often means nothing is older than the retention cutoff yet, and only otherwise means the sweep is disabled or stuck. The sweep deletes in batches, so a step-shaped increase is its normal signature rather than evidence of a misconfigured cutoff. |
 | `blnk_subscribers_revocation_pending` | Gauge | — | Subscribers whose broker-side credential revocation is still owed. Normally zero. |
 | `blnk_subscribers_oldest_revocation_age_seconds` | Gauge | — | How long the oldest outstanding revocation has been owed. Zero when nothing is owed. |
+| `blnk_kafka_consumer_lag_pass_age_seconds` | Gauge | — | How long the consumer-lag rotation took to get back round the whole subscriber registry. This is the series `SubscriberLagCoverageStale` reads. It matters because a reading EXPIRES after ten minutes: a subscriber the rotation does not return to inside that retention has its `blnk_kafka_consumer_lag` series stop being exported, and an absent series breaches no threshold — so `SubscriberConsumerLagHigh` goes quiet for exactly the subscribers it can no longer see. |
+| `blnk_kafka_consumer_lag_covered_subscribers` | Gauge | — | How many subscribers currently have an exported lag reading. Read it against `blnk_subscribers_registered` to see what proportion of the registry the rotation is actually covering; the remedy for a shortfall is a larger `EVENT_METRICS_SUBSCRIBER_BUDGET` or a shorter collection interval. |
 | `blnk_subscribers_lag_unmeasured` | Gauge | — | Registered subscribers the last collection did not measure lag for **at all**. Non-zero means those subscribers have NO `blnk_kafka_consumer_lag` series, so `SubscriberConsumerLagHigh` cannot fire for them however far behind they fall. Normally zero. See the note below — this is not the same condition as `blnk_kafka_consumer_lag_unmeasured_partitions`. |
 | `blnk_subscribers_registered` | Gauge | — | Subscribers the registry holds. Published so the row above reads as a proportion, and so the measurement budget's headroom is visible before it is exhausted rather than only after. |
+| `blnk_subscribers_settlement_outstanding` | Gauge | — | Subscribers with a broker obligation — a revocation, a grant reconciliation or a credential cleanup — still to be settled. Read with `blnk_subscribers_obligations_settled_total`: `SubscriberSettlementNotProgressing` fires on outstanding work with a flat settlement rate, which is the signature of a stalled settler rather than a busy one. |
+| `blnk_subscribers_oldest_settlement_age_seconds` | Gauge | — | How long the oldest unsettled obligation has stood. This is the series `SubscriberSettlementOutstanding` reads. Zero when nothing is outstanding. |
+| `blnk_subscribers_revocation_failures` | Gauge | — | Subscribers whose last revocation attempt was REFUSED by the broker, as opposed to merely still owed. The distinction is the remedy: a pending revocation needs time, a refused one needs an operator, because it will not clear by retrying. Normally zero. |
+| `blnk_subscribers_oldest_revocation_failure_age_seconds` | Gauge | — | How long the oldest refused revocation has stood. This is the series `SubscriberRevocationRefused` reads, so a deployment without it has that rule evaluating an absent series and never firing. Zero when nothing is refused. |
+| `blnk_subscribers_credential_orphans` | Gauge | — | Subscribers carrying a credential Blnk could NOT persist a reference for or could not revoke — a principal that may authenticate at the broker while the registry cannot name its credential. Normally zero, and a non-zero value is unaccounted broker access rather than a lagging counter. |
+| `blnk_subscribers_oldest_credential_orphan_age_seconds` | Gauge | — | How long the oldest orphaned credential has been outstanding. This is the series `SubscriberCredentialOrphaned` reads. Zero when there are none. |
 
 **Why `blnk_events_published_total` is counted at the row transition and not at the broker
 acknowledgement.** Delivery is at-least-once by construction: the relay publishes, then marks the
@@ -413,16 +421,22 @@ page the caller happens to ask for:
 ```bash
 curl -sS "$BLNK_API/subscribers?subscriber_id_hash=$TOKEN" \
   --config "$BLNK_CURL_CONFIG" \
-  | jq -r '.[] | "\(.subscriber_id)\t\(.kafka_principal)\t\(.consumer_group_id)"'
+  | jq -r '.data[] | "\(.subscriber_id)\t\(.kafka_principal)\t\(.consumer_group_id)"'
 ```
 
 Three answers, and they mean different things:
 
+Every reading of `GET /subscribers` answers with the `{data, next_cursor, has_more, total_count}`
+envelope, this one included, so read `.data[]` rather than the body as an array.
+
 | Response | Meaning |
 | --- | --- |
-| A one-element array | Resolved. |
-| `[]` with **200** | The registry was searched to its end and holds no subscriber with that token. |
+| A one-element `data` | Resolved. |
+| An empty `data` with **200** | The registry was searched to its end and holds no subscriber with that token. |
 | **500** `GEN_INTERNAL` | The registry is larger than the resolver's bound (100 pages of 100 rows), so the answer is **unknown, not negative**. Query `blnk.event_subscribers` directly. |
+
+`limit` and `cursor` are **refused** on this reading with `400 GEN_VALIDATION_ERROR`: a resolution
+returns at most one row, so there is no page to bound or to resume from.
 
 Do **not** resolve a token by fetching one page and hashing the rows locally. That was the
 documented procedure before the filter existed and it is wrong in a way that produces no error:

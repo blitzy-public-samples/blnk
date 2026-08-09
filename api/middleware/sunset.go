@@ -34,8 +34,9 @@ import (
 // answering — and they read ONE resolved retirement window, owned by the root package's
 // event_sunset.go. They ask different questions of it because they sit at different
 // boundaries: the relay asks WebhookDualDeliveryActive, true only inside
-// [start, sunset), while this guard asks WebhookSunsetPassed, which turns on the sunset
-// instant alone. Delivery has two ends to respect; a 410 has one.
+// [start, sunset), while this guard reads the Passed verdict of one
+// WebhookSunsetSnapshotAt, which turns on the sunset instant alone. Delivery has two ends
+// to respect; a 410 has one.
 //
 // Neither compares a date itself, and that is what makes them unable to disagree. A
 // duplicated comparison could leave the service accepting webhook management calls
@@ -195,7 +196,8 @@ func requestAddressesRetiredWebhookSurface(c *gin.Context) bool {
 // remains the retirement's local, visible statement at each route registration and would still
 // refuse if this middleware were ever removed from the chain. Two independent barriers for a
 // behaviour whose failure mode is "the routes quietly keep working" is deliberate, and they
-// cannot disagree: both ask blnk.WebhookSunsetPassed, the single decision point.
+// cannot disagree: both take one blnk.WebhookSunsetSnapshotAt, the single decision point, and
+// render their headers and their verdict from that one value.
 //
 // Returns:
 //   - gin.HandlerFunc: global middleware that aborts with apierror.ErrGenGone for the four
@@ -212,17 +214,26 @@ func WebhookSunsetPreAuthGuard() gin.HandlerFunc {
 			return
 		}
 
-		if deprecated, sunset, configured := blnk.WebhookDeprecationWindow(); configured {
-			// Both headers are rendered from ONE resolution of the window, so the pair
-			// cannot describe windows that disagree and the ordering RFC 9745 §4 requires
-			// holds by construction — exactly as the per-route guard behind this one does
-			// it, because a caller must not be told two different things about the same
-			// retirement depending on which guard answered.
-			c.Header(webhookSunsetHeader, sunset.UTC().Format(http.TimeFormat))
-			c.Header(webhookDeprecationHeader, formatDeprecationDate(deprecated))
+		// ONE SNAPSHOT, and the clock is read into it, so the two headers and the verdict
+		// below all rest on the same resolution of the same configuration generation.
+		//
+		// This used to be TWO independent resolutions — WebhookDeprecationWindow for the
+		// headers, then WebhookSunsetPassed(time.Now()) for the verdict — each re-reading a
+		// store whose contents are replaced wholesale on reload. A reload landing between them
+		// produced a response advertising one window while refusing under another, and the
+		// per-route guard behind this one had the same split. A caller must not be told two
+		// different things about one retirement depending on which guard answered, and now it
+		// cannot be: both guards read this single value.
+		snapshot := blnk.WebhookSunsetSnapshotAt(time.Now())
+
+		if snapshot.DateConfigured {
+			// Both headers come from the SAME snapshot, so the pair cannot describe windows
+			// that disagree and the ordering RFC 9745 §4 requires holds by construction.
+			c.Header(webhookSunsetHeader, snapshot.Date.UTC().Format(http.TimeFormat))
+			c.Header(webhookDeprecationHeader, formatDeprecationDate(snapshot.WindowStart))
 		}
 
-		if blnk.WebhookSunsetPassed(time.Now()) {
+		if snapshot.Passed {
 			abortWithCode(c, apierror.ErrGenGone, webhookSunsetGoneMessage)
 
 			return
@@ -455,10 +466,15 @@ func isDeprecatedWebhookSubscriptionPath(path string) bool {
 //     construction time would answer the question as it stood when the router was
 //     assembled rather than when the request arrived. WebhookSunsetGuard therefore does
 //     nothing but return the closure; every branch is inside it.
-//   - ONE SNAPSHOT SERVES BOTH the header and the verdict. This used to pair
-//     WebhookSunsetDate with WebhookSunsetPassed, and each of those re-reads the live
-//     store — so a reload landing between them produced one response advertising date A
-//     while refusing under date B. A client reading the header was told it had until A
+//   - ONE SNAPSHOT SERVES BOTH HEADERS AND THE VERDICT, and the "is there a window to
+//     render" test with them. This used to pair WebhookSunsetDate with
+//     WebhookSunsetPassed; taking a snapshot fixed the verdict but the Deprecation header
+//     and the render/skip decision were still drawn from a second call to
+//     WebhookDeprecationWindow — which performed its own two reads of the store. Each read
+//     of a store whose contents are replaced wholesale is a chance to observe a different
+//     generation, so a reload landing between them produced one response advertising date A
+//     while refusing under date B, or a Deprecation instant from one window beside a Sunset
+//     instant from another — which can violate the ordering RFC 9745 §4 requires. A client reading the header was told it had until A
 //     by the very response that had already applied B, with nothing in the body to
 //     disclose it. The window for that is narrow, which is exactly why it is closed
 //     structurally: it cannot be reproduced on demand and would never be caught by
@@ -518,25 +534,27 @@ func WebhookSunsetGuard() gin.HandlerFunc {
 
 		// Advertise the retirement date whenever there is one to advertise: before the
 		// verdict, and regardless of it, so a client still inside the window is warned
-		// by the very responses it is succeeding with. WebhookDeprecationWindow reports
-		// both ends of the SAME resolution the predicate uses, so the headers cannot
-		// describe a different moment from the one the refusal rests on. Its third
-		// result answers only "is there a window to render", never "has the instant
-		// passed" — that question belongs to the predicate alone, and nothing here
-		// branches on it.
-		if deprecated, _, configured := blnk.WebhookDeprecationWindow(); configured {
+		// by the very responses it is succeeding with.
+		//
+		// EVERY VALUE HERE COMES FROM THE SNAPSHOT ABOVE — the "is there a window to
+		// render" test included. This branch used to call WebhookDeprecationWindow, which
+		// is a SECOND resolution of the store: the sunset stamp was taken from the snapshot
+		// but the window's opening instant and the render/skip decision were taken from that
+		// second call, so a reload landing between them could pair one generation's opening
+		// instant with another generation's close, or emit headers for a window the verdict
+		// was not taken under. DateConfigured answers only "is there a window to render",
+		// never "has the instant passed" — that question belongs to Passed alone, and
+		// nothing here branches on it.
+		if snapshot.DateConfigured {
 			// The layout hard-codes GMT, so the value has to be rendered from UTC for
-			// the zone it claims to be true. Taken from the SNAPSHOT rather than from the
-			// window's second result, because the snapshot is the resolution the verdict
-			// below rests on: reading the date from a second call would let the header
-			// describe a different moment from the refusal beside it.
+			// the zone it claims to be true.
 			stamp := snapshot.Date.UTC().Format(http.TimeFormat)
 			c.Header(webhookSunsetHeader, stamp)
 			// The window's opening instant, in the sf-date form RFC 9745 requires. It
 			// comes from the SAME resolution as the sunset above, so the two headers
 			// cannot describe windows that disagree, and the ordering RFC 9745 §4
 			// requires holds by construction.
-			c.Header(webhookDeprecationHeader, formatDeprecationDate(deprecated))
+			c.Header(webhookDeprecationHeader, formatDeprecationDate(snapshot.WindowStart))
 		}
 
 		if snapshot.Passed {

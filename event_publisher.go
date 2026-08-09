@@ -2873,7 +2873,12 @@ func PublishRequestFromOutbox(row model.EventOutbox, attempt int) PublishRequest
 		Raw:   row.EventRaw,
 		Topic: row.Topic,
 		// LEDGER FIRST — requirement R-6 partitions by ledger ID. See the fallback chain above.
-		Key:     firstNonBlank(row.LedgerID, row.PartitionKey),
+		//
+		// Resolved through model.EffectivePartitionKey rather than inline, because the API
+		// REPORTS this key on the dead-letter listing and an operator answers ordering questions
+		// from what it says. Two copies of the fallback chain is how the reported key and the
+		// routed key start disagreeing on exactly the rows where they matter.
+		Key:     row.EffectiveKey(),
 		Attempt: attempt,
 		// THE CAPTURED TRACE, carried from the row so the publish span links to the request
 		// that produced the event. This conversion is used by the relay, the dead-letter write

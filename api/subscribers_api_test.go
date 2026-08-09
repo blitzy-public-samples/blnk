@@ -449,6 +449,281 @@ func TestListSubscribers_HonoursIncludeCountWithTheEstablishedEnvelope(t *testin
 	})
 }
 
+// TestManagementBodies_RefuseAFieldTheShapeDoesNotDeclare is the M-9 guard.
+//
+// gin's ShouldBindJSON discards unknown keys, so a misspelling was accepted and dropped. The
+// consequence differs per route, and on two of them it is worse than a no-op:
+//
+//   - POST /subscribers with "authorised_topics" — the British spelling, or any typo — registered a
+//     subscriber authorised for NOTHING and answered 201. The operator holds a subscriber that can
+//     obtain a credential and read no topic, and learns it from the consumer rather than the API.
+//   - PUT /subscribers/{id} with every field misspelled decoded to a wholly EMPTY update, which is
+//     a legitimate instruction meaning "rewrite the row with its own values" — so the answer was
+//     200 with the unchanged row, and a caller diffing the response against what they sent could
+//     not tell an ignored field from a value the server kept.
+//
+// A rejected filter and a rejected body field are the same class of problem, and this API already
+// refuses an unknown QUERY parameter. The body was the remaining half.
+func TestManagementBodies_RefuseAFieldTheShapeDoesNotDeclare(t *testing.T) {
+	router := subscribersRouter(t, true)
+
+	cases := map[string]struct {
+		method string
+		path   string
+		body   string
+		field  string
+	}{
+		"registration with a misspelled grant": {
+			method: http.MethodPost,
+			path:   "/subscribers",
+			body:   `{"name":"Acme","authorised_topics":["blnk.transactions"]}`,
+			field:  "authorised_topics",
+		},
+		"registration with an invented field": {
+			method: http.MethodPost,
+			path:   "/subscribers",
+			body:   `{"name":"Acme","webhook_url":"https://hooks.example.com/blnk"}`,
+			field:  "webhook_url",
+		},
+		"update with a misspelled grant": {
+			method: http.MethodPut,
+			path:   "/subscribers/" + uniqueSubscriberID(),
+			body:   `{"authorised_topics":["blnk.transactions"]}`,
+			field:  "authorised_topics",
+		},
+		"update with a misspelled key scope": {
+			method: http.MethodPut,
+			path:   "/subscribers/" + uniqueSubscriberID(),
+			body:   `{"partition_key":"ldg_1"}`,
+			field:  "partition_key",
+		},
+		"webhook registration with an invented field": {
+			method: http.MethodPost,
+			path:   "/subscribers/" + uniqueSubscriberID() + "/webhook-subscription",
+			body:   `{"webhook_url":"https://hooks.example.com/blnk","headers":{"X":"y"}}`,
+			field:  "headers",
+		},
+		"webhook update with an invented field": {
+			method: http.MethodPut,
+			path:   "/subscribers/" + uniqueSubscriberID() + "/webhook-subscription",
+			body:   `{"webhook_url":"https://hooks.example.com/blnk","secret":"s"}`,
+			field:  "secret",
+		},
+	}
+
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			recorder := subscriberRequest(t, router, testCase.method, testCase.path, testCase.body)
+
+			require.Equal(t, http.StatusBadRequest, recorder.Code,
+				"a field this endpoint cannot honour must be refused, not dropped; body: %s",
+				recorder.Body.String())
+
+			// GEN_VALIDATION_ERROR, not GEN_MALFORMED_REQUEST: the body PARSES, and nothing about
+			// the transport is wrong. It is the same code an unknown query parameter answers with.
+			assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenValidation)
+
+			assert.Contains(t, recorder.Body.String(), testCase.field,
+				"the refusal must NAME the field, or a caller with six keys cannot tell which one "+
+					"was rejected")
+		})
+	}
+}
+
+// TestManagementBodies_StillAcceptWhatTheyDeclare is the other half of M-9: strictness must not
+// have narrowed the accepted vocabulary.
+//
+// A guard that refused a legitimate body would be a worse regression than the gap it closes, and
+// the binding tags have to keep running — decoding through encoding/json directly bypasses gin's
+// validator, and these shapes depend on it for binding:"required" and for the topic-list bounds.
+func TestManagementBodies_StillAcceptWhatTheyDeclare(t *testing.T) {
+	router := subscribersRouter(t, true)
+
+	t.Run("every declared field is accepted", func(t *testing.T) {
+		subscriberID := uniqueSubscriberID()
+		body := fmt.Sprintf(
+			`{"subscriber_id":%q,"name":"Acme","authorized_topics":["blnk.transactions"],`+
+				`"partition_key_prefix":"ldg_1"}`, subscriberID)
+
+		recorder := subscriberRequest(t, router, http.MethodPost, "/subscribers", body)
+		require.Equal(t, http.StatusCreated, recorder.Code,
+			"a body naming only declared fields must be accepted; body: %s", recorder.Body.String())
+
+		t.Cleanup(func() { deleteSubscriber(t, router, subscriberID) })
+	})
+
+	t.Run("a required field is still enforced by its binding tag", func(t *testing.T) {
+		// The validator is invoked explicitly after the strict decode, so binding:"required"
+		// still refuses. Losing it would have made the webhook routes accept an empty body.
+		recorder := subscriberRequest(t, router, http.MethodPost,
+			"/subscribers/"+uniqueSubscriberID()+"/webhook-subscription", `{}`)
+
+		require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+		assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenMalformedRequest)
+	})
+
+	t.Run("a topic list beyond the binding bound is still refused", func(t *testing.T) {
+		// binding:"max=16,dive,max=249" is what stops a caller submitting a thousand topic names
+		// or one longer than Kafka accepts, and it only runs because the validator is invoked
+		// explicitly.
+		topics := make([]string, 0, 17)
+		for i := range 17 {
+			topics = append(topics, fmt.Sprintf("blnk.t%d", i))
+		}
+		encoded, err := json.Marshal(topics)
+		require.NoError(t, err)
+
+		recorder := subscriberRequest(t, router, http.MethodPost, "/subscribers",
+			`{"name":"Acme","authorized_topics":`+string(encoded)+`}`)
+
+		require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+		assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenMalformedRequest)
+	})
+
+	t.Run("malformed JSON is still a transport problem, not a validation one", func(t *testing.T) {
+		for name, body := range map[string]string{
+			"unparseable": `{"name":`,
+			"wrong type":  `{"name":123}`,
+			"absent body": ``,
+			"two values":  `{"name":"a"}{"name":"b"}`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				recorder := subscriberRequest(t, router, http.MethodPost, "/subscribers", body)
+
+				require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+				assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenMalformedRequest)
+			})
+		}
+	})
+}
+
+// TestListSubscribers_AnswersOneShapeForEveryReading is the M-7 guard.
+//
+// GET /subscribers has three readings — the ordinary keyset page, the `subscriber_id_hash`
+// resolution and the `revocation_pending=true` scan — and two of them used to answer with a bare
+// JSON array while the third answered with the page envelope. That is a breaking difference, not a
+// cosmetic one: a client written against the page reading fails on the resolver with a type error
+// rather than a message.
+//
+// And it fails where it costs most. The two bare-array readings are the ones an operator reaches
+// from a runbook DURING AN INCIDENT — the first step of the outstanding-revocation procedure, and
+// the resolution of a pseudonym off a consumer-lag alert — so the shape that broke was the one
+// exercised while something was already wrong.
+//
+// Each reading is asserted to decode into the SAME envelope struct, which is the property a client
+// depends on and the one a bare array cannot satisfy.
+func TestListSubscribers_AnswersOneShapeForEveryReading(t *testing.T) {
+	type envelope struct {
+		Data       []json.RawMessage `json:"data"`
+		NextCursor string            `json:"next_cursor"`
+		HasMore    bool              `json:"has_more"`
+		TotalCount *int64            `json:"total_count"`
+	}
+
+	decode := func(t *testing.T, target string) envelope {
+		t.Helper()
+
+		recorder := subscribersRequest(t, http.MethodGet, target)
+		require.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+
+		// THE ASSERTION THAT A BARE ARRAY CANNOT PASS. Unmarshalling `[...]` into a struct is a
+		// type error, which is exactly the failure a client written against one reading hit on
+		// another.
+		var body envelope
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body),
+			"every reading must decode into the page envelope; body: %s", recorder.Body.String())
+		require.NotNil(t, body.Data,
+			"data must be [] rather than null or absent, so a script can range over it "+
+				"unconditionally")
+
+		return body
+	}
+
+	t.Run("the ordinary page", func(t *testing.T) {
+		decode(t, "/subscribers?limit=1")
+	})
+
+	t.Run("the pseudonym resolution of an unknown token", func(t *testing.T) {
+		// A token no subscriber can hash to. An empty result is a SUCCESSFUL answer here — the
+		// registry was searched to its end — so it must be an empty data array, not a 404 and not
+		// a bare [].
+		body := decode(t, "/subscribers?subscriber_id_hash="+strings.Repeat("f", 16))
+
+		assert.Empty(t, body.Data)
+		assert.False(t, body.HasMore, "a resolution is not a walk, so there is nothing to resume")
+		assert.Empty(t, body.NextCursor)
+		require.NotNil(t, body.TotalCount,
+			"the resolution is COMPLETE, so its length is the exact total and reporting it is honest")
+		assert.Zero(t, *body.TotalCount)
+	})
+
+	t.Run("the awaiting-revocation scan", func(t *testing.T) {
+		body := decode(t, "/subscribers?revocation_pending=true")
+
+		assert.False(t, body.HasMore,
+			"the scan covers the WHOLE registry, so a caller must not be invited to page it")
+		assert.Empty(t, body.NextCursor)
+		require.NotNil(t, body.TotalCount)
+		assert.EqualValues(t, len(body.Data), *body.TotalCount,
+			"a complete result's total is its length; anything else would misdescribe it")
+	})
+
+	t.Run("revocation_pending=false is the ordinary page", func(t *testing.T) {
+		// Carried rather than refused so a client building the query from a boolean variable does
+		// not have to special-case one of its values — and it must therefore behave exactly as the
+		// parameter's absence does.
+		body := decode(t, "/subscribers?revocation_pending=false&limit=1")
+		assert.Nil(t, body.TotalCount, "nobody asked for a total on the ordinary page")
+	})
+}
+
+// TestListSubscribers_RefusesPagingOptionsOnACompleteReading is the other half of M-7.
+//
+// The pseudonym resolution and the revocation scan are not walks: the resolver returns at most one
+// row, and the scan deliberately covers the WHOLE registry because a partial list of live
+// unaccounted-for credentials reads exactly like a complete one — acting on it would leave the rest
+// authenticating while the incident looked closed, which is why the service refuses rather than
+// truncating when the registry exceeds its bound.
+//
+// So `?revocation_pending=true&limit=10` asks for something that does not exist. It was silently
+// ignored, and the caller received every matching row believing they had asked for ten. On this
+// endpoint that is the dangerous direction: an operator who thinks they hold a bounded page of a
+// longer list stops looking.
+func TestListSubscribers_RefusesPagingOptionsOnACompleteReading(t *testing.T) {
+	readings := map[string]string{
+		"the pseudonym resolution": "subscriber_id_hash=" + strings.Repeat("a", 16),
+		"the revocation scan":      "revocation_pending=true",
+	}
+
+	for readingName, reading := range readings {
+		for _, option := range []string{"limit=10", "cursor=abc"} {
+			t.Run(readingName+" refuses "+option, func(t *testing.T) {
+				recorder := subscribersRequest(t, http.MethodGet,
+					"/subscribers?"+reading+"&"+option)
+
+				require.Equal(t, http.StatusBadRequest, recorder.Code,
+					"a paging option this reading cannot honour must be refused rather than "+
+						"ignored; body: %s", recorder.Body.String())
+
+				// The refusal must name BOTH parameters, or the operator is left guessing which
+				// two of their query values disagree.
+				body := recorder.Body.String()
+				assert.Contains(t, body, strings.SplitN(option, "=", 2)[0])
+				assert.Contains(t, body, strings.SplitN(reading, "=", 2)[0])
+			})
+		}
+
+		t.Run(readingName+" still accepts include_count", func(t *testing.T) {
+			// Both readings are complete, so their length IS the total and it is reported
+			// unconditionally. Asking for a total that is already there is not a contradiction.
+			recorder := subscribersRequest(t, http.MethodGet,
+				"/subscribers?"+reading+"&include_count=true")
+
+			assert.Equal(t, http.StatusOK, recorder.Code, "body: %s", recorder.Body.String())
+		})
+	}
+}
+
 // TestListSubscribers_ParsesIncludeCountStrictly is the other half of C-13.
 //
 // ParseQueryOptions reads include_count as `value == "true"`, so "TRUE", "True" and

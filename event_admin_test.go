@@ -7361,20 +7361,55 @@ type statsFakeStore struct {
 	counts map[string]int64
 	audit  model.EventRecordIntervalAudit
 
-	countErr error
-	auditErr error
+	handoff   map[string]int64
+	batches   int64
+	batchesAt *time.Time
 
-	countCalls int
-	auditCalls int
+	countErr   error
+	auditErr   error
+	handoffErr error
+	batchesErr error
+
+	countCalls     int
+	auditCalls     int
+	countedSince   time.Time
+	censusAttempts int
 }
 
-func (s *statsFakeStore) CountEventOutboxByStatus(context.Context, time.Time) (map[string]int64, error) {
+func (s *statsFakeStore) CountEventOutboxByStatus(
+	_ context.Context,
+	since time.Time,
+) (map[string]int64, error) {
 	s.countCalls++
+	s.countedSince = since
+
 	if s.countErr != nil {
 		return nil, s.countErr
 	}
 
 	return s.counts, nil
+}
+
+func (s *statsFakeStore) CountBalanceMonitorHandoffByStatus(
+	context.Context,
+) (map[string]int64, error) {
+	s.censusAttempts++
+	if s.handoffErr != nil {
+		return nil, s.handoffErr
+	}
+
+	return s.handoff, nil
+}
+
+func (s *statsFakeStore) CountUnfinalizedBulkTransactionBatches(
+	context.Context,
+	time.Duration,
+) (int64, *time.Time, error) {
+	if s.batchesErr != nil {
+		return 0, nil, s.batchesErr
+	}
+
+	return s.batches, s.batchesAt, nil
 }
 
 func (s *statsFakeStore) AuditEventRecordsInIntervals(
@@ -7390,11 +7425,31 @@ func (s *statsFakeStore) AuditEventRecordsInIntervals(
 }
 
 // statsOffsetReader builds an offset reader that records how often it was called.
-func statsOffsetReader(report TopicOffsetReport, err error, calls *int) func(context.Context) (TopicOffsetReport, error) {
-	return func(context.Context) (TopicOffsetReport, error) {
+//
+// It records the WINDOW it was asked for as well, because that argument is what makes the
+// broker side and the outbox side describe one population: a cumulative broker reading
+// compared against a windowed outbox count is a shortfall manufactured by the question.
+func statsOffsetReader(
+	report TopicOffsetReport,
+	err error,
+	calls *int,
+) func(context.Context, time.Time) (TopicOffsetReport, error) {
+	return func(_ context.Context, _ time.Time) (TopicOffsetReport, error) {
 		*calls++
 
 		return report, err
+	}
+}
+
+// statsWindowRecordingOffsetReader is statsOffsetReader with the window captured.
+func statsWindowRecordingOffsetReader(
+	report TopicOffsetReport,
+	since *time.Time,
+) func(context.Context, time.Time) (TopicOffsetReport, error) {
+	return func(_ context.Context, windowStart time.Time) (TopicOffsetReport, error) {
+		*since = windowStart
+
+		return report, nil
 	}
 }
 
@@ -7602,6 +7657,159 @@ func TestEventOutboxStatistics_ProducesAVerdictOnlyWhenBothSidesWereMeasured(t *
 		assert.True(t, statistics.OffsetsRead, "the read itself succeeded")
 		assert.Nil(t, statistics.Reconciliation,
 			"with no topics covered there is nothing to compare, so a verdict would assert something it never established")
+	})
+}
+
+// TestEventOutboxStatistics_ComparesOneCommonPopulation is the V-2 requirement that the
+// two sides of the zero-loss check describe the same interval.
+//
+// The outbox side has always been windowed — it must be, since dispatched rows accumulate
+// without bound — while the broker side was read cumulatively: every record the topics had
+// ever accepted. Comparing those two produces a surplus that grows for the life of the
+// topic, and worse, it switches OFF the only arithmetic that can detect loss, because a
+// shortfall of records against rows is only meaningful when both counts cover one interval.
+// The reading could still call itself conclusive.
+//
+// Both halves are asserted here: that the same instant reaches the broker reader, and that a
+// reading which nonetheless comes back unwindowed refuses to conclude.
+func TestEventOutboxStatistics_ComparesOneCommonPopulation(t *testing.T) {
+	t.Run("the broker is measured from the instant the outbox was counted from", func(t *testing.T) {
+		store := &statsFakeStore{counts: map[string]int64{model.EventOutboxStatusDispatched: 3}}
+
+		var offsetWindow time.Time
+
+		report := statsMeasuredReport()
+
+		statistics, err := eventOutboxStatistics(
+			context.Background(), store,
+			statsWindowRecordingOffsetReader(report, &offsetWindow),
+			EventOffsetsBestEffort, 6*time.Hour,
+		)
+		require.NoError(t, err)
+
+		require.False(t, offsetWindow.IsZero(),
+			"the broker read must be bounded; a zero instant is the cumulative reading V-2 cannot use")
+		assert.Equal(t, statistics.WindowStart, offsetWindow,
+			"one window start, derived once, reaching both sides — otherwise the verdict compares "+
+				"two populations")
+		assert.Equal(t, store.countedSince, offsetWindow,
+			"the outbox count and the broker read must name the same instant")
+		assert.Equal(t, 6*time.Hour, statistics.Window,
+			"the honoured window is reported so a reader can see what the figures cover")
+	})
+
+	t.Run("an unwindowed reading never calls a cumulative total a surplus", func(t *testing.T) {
+		// A broker report carrying no window start is the cumulative reading: every record the
+		// topics have ever accepted. The verdict is still produced, and it can still be green —
+		// what establishes it is the per-row coordinate mapping, not the totals — but the DIFFERENCE
+		// between the cumulative total and the row count is not a surplus over anything, and the
+		// green sentence used to report it as one. On a long-lived topic that put a number in the
+		// millions in front of an operator as though it were unaccounted copies.
+		cumulative := statsMeasuredReport()
+		cumulative.WindowStart = time.Time{}
+
+		store := &statsFakeStore{
+			counts: map[string]int64{model.EventOutboxStatusDispatched: 10},
+			audit: model.EventRecordIntervalAudit{
+				PublishedRows:               10,
+				CorroboratedRows:            10,
+				DistinctCorroboratedRecords: 10,
+			},
+		}
+		offsetCalls := 0
+
+		statistics, err := eventOutboxStatistics(context.Background(), store,
+			statsOffsetReader(cumulative, nil, &offsetCalls), EventOffsetsBestEffort, 0)
+		require.NoError(t, err)
+		require.NotNil(t, statistics.Reconciliation)
+
+		assert.False(t, statistics.Reconciliation.Windowed,
+			"the flag is what a reader branches on, so it must report the truth about the reading")
+
+		summary := statistics.Reconciliation.Summary()
+		assert.Contains(t, summary, "CUMULATIVE",
+			"the reading's scope must be stated in the sentence an operator reads")
+		assert.NotContains(t, summary, "surplus are redelivery",
+			"the windowed green sentence's surplus claim must not be used for a cumulative total")
+
+		// AND THE SHORTFALL ARITHMETIC STAYS OFF. It is the signal that rows claim a publication
+		// that never happened, and over two different intervals it produces nothing but noise.
+		assert.False(t, statistics.Reconciliation.LossDetected)
+	})
+}
+
+// TestEventOutboxStatistics_ReportsTheEventsThatAreOwed covers the two censuses that no
+// per-status count can reveal.
+//
+// A monitor alert does not exist until the balance is committed, and a bulk batch's summary
+// belongs to no single member transaction, so neither is captured inside the transaction
+// that produces it. Each has an intent written atomically instead. An outstanding intent is
+// an event that is OWED with no outbox row for it yet — so a reconciliation reading only the
+// outbox reports a clean pipeline while alerts and batch summaries are still pending.
+//
+// The distinction that matters is between MEASURED-AND-ZERO and NOT-MEASURED. Reporting
+// zeros for a census that could not be read is the one misreading a zero-loss check cannot
+// afford, which is why the field is a pointer and why it is nil rather than zero on failure.
+func TestEventOutboxStatistics_ReportsTheEventsThatAreOwed(t *testing.T) {
+	oldest := time.Now().UTC().Add(-2 * time.Hour)
+
+	t.Run("the census travels with the counts", func(t *testing.T) {
+		store := &statsFakeStore{
+			counts: map[string]int64{model.EventOutboxStatusDispatched: 1},
+			handoff: map[string]int64{
+				model.OutboxStatusPending: 2,
+				model.OutboxStatusFailed:  1,
+			},
+			batches:   3,
+			batchesAt: &oldest,
+		}
+
+		statistics, err := eventOutboxStatistics(
+			context.Background(), store, nil, EventOffsetsSkipped, 0,
+		)
+		require.NoError(t, err)
+		require.NotNil(t, statistics.ProducerAtomicity,
+			"the field is declared on the response, so leaving it unset promises a figure and "+
+				"delivers nothing")
+
+		assert.Equal(t, int64(2), statistics.ProducerAtomicity.MonitorHandoffPending)
+		assert.Equal(t, int64(1), statistics.ProducerAtomicity.MonitorHandoffFailed)
+		assert.Zero(t, statistics.ProducerAtomicity.MonitorHandoffProcessing,
+			"a state with no rows is absent from the aggregate and reads as zero, which is correct")
+		assert.Equal(t, int64(3), statistics.ProducerAtomicity.UnfinalizedBatches)
+		require.NotNil(t, statistics.ProducerAtomicity.OldestUnfinalizedBatchAt)
+		assert.WithinDuration(t, oldest, *statistics.ProducerAtomicity.OldestUnfinalizedBatchAt, 0)
+
+		// READ IN EVERY POSTURE, including the one that never touches Kafka. Both censuses
+		// come from PostgreSQL, and a skipped or unreachable broker is exactly when an
+		// operator is asking what is outstanding.
+		assert.Equal(t, 1, store.censusAttempts)
+	})
+
+	t.Run("a census that cannot be read is absent rather than zero", func(t *testing.T) {
+		for name, store := range map[string]*statsFakeStore{
+			"the handoff census fails": {
+				counts:     map[string]int64{model.EventOutboxStatusDispatched: 1},
+				handoffErr: errors.New("dial tcp 10.0.0.7:5432: connect: refused"),
+			},
+			"the batch census fails": {
+				counts:     map[string]int64{model.EventOutboxStatusDispatched: 1},
+				batchesErr: errors.New("statement timeout"),
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				statistics, err := eventOutboxStatistics(
+					context.Background(), store, nil, EventOffsetsSkipped, 0,
+				)
+
+				// THE COUNTS STILL ANSWER. The census is an enrichment: losing it must not
+				// take the whole reading down, or a slow query on one table hides every figure.
+				require.NoError(t, err)
+				assert.NotEmpty(t, statistics.CountsByStatus)
+				assert.Nil(t, statistics.ProducerAtomicity,
+					"zeros would say nothing is owed, which is the opposite of what is known")
+			})
+		}
 	})
 }
 
@@ -8086,4 +8294,176 @@ func TestEventOutboxAudit_DerivesItsOwnConclusions(t *testing.T) {
 	t.Run("nothing published is fully confirmed", func(t *testing.T) {
 		assert.True(t, model.EventOutboxAudit{}.FullyConfirmed())
 	})
+}
+
+// TestValidateDesiredACLBindings_RefusesEveryShapeThatWidensAGrant is the M-1 guard on the
+// bindings Blnk is about to CREATE, as opposed to the ones it reads back.
+//
+// blnkManagedACLBinding is the ownership allowlist, and reconciliation already applied it to what
+// the broker REPORTS. That caught a widened binding one reconcile too late: the binding was
+// written, it was live, and only the NEXT reconcile classified it as a foreign ALLOW and refused —
+// so the failure mode of a widening bug was "grant the access, then jam this subscriber's
+// provisioning permanently". Checking the desired set inverts that. An ACL mistake has no runtime
+// symptom on the Blnk side, so a guard that runs before the write is the only one that prevents
+// rather than reports.
+func TestValidateDesiredACLBindings_RefusesEveryShapeThatWidensAGrant(t *testing.T) {
+	const principal = "blnk-sub-acme"
+
+	owned := func(mutate func(*kafka.ACLEntry)) kafka.ACLEntry {
+		entry := kafka.ACLEntry{
+			ResourceType:        kafka.ResourceTypeTopic,
+			ResourceName:        "blnk.transactions",
+			ResourcePatternType: kafka.PatternTypeLiteral,
+			Principal:           kafkaPrincipalPrefix + principal,
+			Host:                ACLHostAny,
+			Operation:           kafka.ACLOperationTypeRead,
+			PermissionType:      kafka.ACLPermissionTypeAllow,
+		}
+		if mutate != nil {
+			mutate(&entry)
+		}
+
+		return entry
+	}
+
+	t.Run("the two owned shapes are accepted", func(t *testing.T) {
+		group := owned(func(e *kafka.ACLEntry) {
+			e.ResourceType = kafka.ResourceTypeGroup
+			e.ResourceName = "blnk-sub-acme."
+			e.ResourcePatternType = kafka.PatternTypePrefixed
+		})
+		describe := owned(func(e *kafka.ACLEntry) { e.Operation = kafka.ACLOperationTypeDescribe })
+
+		require.NoError(t, validateDesiredACLBindings(principal,
+			[]kafka.ACLEntry{owned(nil), describe, group}),
+			"the guard must accept exactly what aclEntries produces, or it blocks provisioning")
+	})
+
+	t.Run("an empty desired set is a legitimate instruction", func(t *testing.T) {
+		// "Authorised for nothing" is the fail-closed default of a fresh registration, and
+		// reconciling to it is how a cleared topic list reaches the broker. Refusing it here
+		// would make a narrowing to empty impossible to apply.
+		require.NoError(t, validateDesiredACLBindings(principal, nil))
+	})
+
+	for name, binding := range map[string]kafka.ACLEntry{
+		// THE dangerous edit. A PREFIXED topic pattern converts "Read blnk.transactions" into
+		// "Read every topic whose name starts with blnk.transactions" — which includes
+		// blnk.transactions.dlt, every failed event on the cluster.
+		"a prefixed topic pattern": owned(func(e *kafka.ACLEntry) {
+			e.ResourcePatternType = kafka.PatternTypePrefixed
+		}),
+		// Kafka reads the resource name "*" as matching EVERY resource, so this passes a naive
+		// shape check and is a cluster-wide grant.
+		"the wildcard as a topic name": owned(func(e *kafka.ACLEntry) { e.ResourceName = "*" }),
+		"a blank topic name":           owned(func(e *kafka.ACLEntry) { e.ResourceName = "" }),
+		// Untrimmed names are refused rather than trimmed: Kafka would treat the padded form as
+		// a different topic from the one that reads correctly here.
+		"a padded topic name": owned(func(e *kafka.ACLEntry) { e.ResourceName = " blnk.transactions" }),
+		// Blnk grants Read and Describe and nothing else. Write on a ledger topic would let a
+		// subscriber forge events.
+		"a write operation": owned(func(e *kafka.ACLEntry) { e.Operation = kafka.ACLOperationTypeWrite }),
+		"a cluster resource": owned(func(e *kafka.ACLEntry) {
+			e.ResourceType = kafka.ResourceTypeCluster
+		}),
+		// A literal group pattern reserves one group id instead of the namespace, so the
+		// subscriber cannot join any other group of its own — and a prefixed TOPIC is the
+		// mirror-image mistake.
+		"a literal group pattern": owned(func(e *kafka.ACLEntry) {
+			e.ResourceType = kafka.ResourceTypeGroup
+			e.ResourceName = "blnk-sub-acme."
+			e.ResourcePatternType = kafka.PatternTypeLiteral
+		}),
+		// Blnk never provisions a Deny, so one appearing in a desired set means the set was
+		// assembled by something other than aclEntries.
+		"a deny binding": owned(func(e *kafka.ACLEntry) {
+			e.PermissionType = kafka.ACLPermissionTypeDeny
+		}),
+		// A binding carrying another identity would grant this subscriber's topics to a
+		// different credential, and reconciliation would never remove it: it describes by
+		// principal.
+		"another principal": owned(func(e *kafka.ACLEntry) {
+			e.Principal = kafkaPrincipalPrefix + "blnk-sub-other"
+		}),
+		"an unprefixed principal": owned(func(e *kafka.ACLEntry) { e.Principal = principal }),
+	} {
+		t.Run("refuses "+name, func(t *testing.T) {
+			err := validateDesiredACLBindings(principal, []kafka.ACLEntry{binding})
+
+			require.Error(t, err, "this binding widens or misdirects the grant and must not be written")
+			assert.ErrorIs(t, err, ErrSubscriberBindingShapeUnsupported,
+				"the refusal must be classifiable, so a caller can tell it from a broker failure")
+		})
+	}
+
+	t.Run("a widened binding among valid ones is still caught", func(t *testing.T) {
+		// The guard must scan the whole set. Stopping at the first owned binding is the bug that
+		// would let a widened entry ride along behind a correct one.
+		err := validateDesiredACLBindings(principal, []kafka.ACLEntry{
+			owned(nil),
+			owned(func(e *kafka.ACLEntry) { e.ResourcePatternType = kafka.PatternTypePrefixed }),
+		})
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrSubscriberBindingShapeUnsupported)
+	})
+
+	t.Run("what aclEntries actually produces passes the guard", func(t *testing.T) {
+		// The guard and the builder must agree, and they are separate code. If they ever
+		// disagree, every provisioning fails closed — safe, but a total outage — so this pins
+		// the agreement rather than trusting it.
+		row := model.EventSubscriber{
+			SubscriberID:     "sub_" + strings.Repeat("a", 20),
+			AuthorizedTopics: []string{"blnk.transactions", "blnk.balances"},
+			ConsumerGroupID:  "grp",
+		}
+		request := NewSubscriberProvisioningRequest(&row, sentinelPassword)
+
+		require.NoError(t, validateDesiredACLBindings(request.boundPrincipal(), request.aclEntries()),
+			"aclEntries is the only producer of desired bindings, so its output must satisfy the "+
+				"guard every write path runs it through")
+	})
+}
+
+// TestCreateACLBindings_IsTheUnbypassableGate proves the shape guard sits on the ONE function that
+// writes, rather than on a caller.
+//
+// This test exists because the guard was first installed in reconcileSubscriberACLs, and that was
+// wrong in a way only a caller census reveals: THREE functions create bindings — provisioning's
+// reconciliation, GrantSubscriberAccess/PruneSubscriberAccess, and the exported
+// ReconcileSubscriberACLs that applies an edited topic list. A guard on one of them leaves the
+// other two open, and the one it left open was the grant-edit path, which is the path an operator
+// uses most. So the assertion here is not "a widened binding is refused" — the unit test above
+// covers that — it is "the refusal happens without the broker being called at all", which is only
+// true if the check precedes the CreateACLs round trip inside the writer itself.
+func TestCreateACLBindings_IsTheUnbypassableGate(t *testing.T) {
+	const principal = "blnk-sub-acme"
+
+	widened := kafka.ACLEntry{
+		ResourceType: kafka.ResourceTypeTopic,
+		ResourceName: "blnk.transactions",
+		// The dangerous shape: PREFIXED widens this to every topic starting with the name,
+		// blnk.transactions.dlt included.
+		ResourcePatternType: kafka.PatternTypePrefixed,
+		Principal:           kafkaPrincipalPrefix + principal,
+		Host:                ACLHostAny,
+		Operation:           kafka.ACLOperationTypeRead,
+		PermissionType:      kafka.ACLPermissionTypeAllow,
+	}
+
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, 6, 1)
+
+	err := admin.createACLBindings(context.Background(), principal, []kafka.ACLEntry{widened})
+
+	require.Error(t, err, "the writer itself must refuse a binding outside the two owned shapes")
+	assert.ErrorIs(t, err, ErrSubscriberBindingShapeUnsupported)
+
+	// THE POINT OF THIS TEST. An ACL mistake has no runtime symptom, so a guard that refuses
+	// after the write has already landed prevents nothing.
+	assert.Empty(t, fake.createACLsRequests,
+		"the broker must not have been asked to create anything; a guard that runs after "+
+			"CreateACLs would leave the widened binding live and merely report it")
+	assert.Empty(t, fake.bindings,
+		"no binding may exist in the broker's store after a refused create")
 }

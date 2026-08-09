@@ -558,15 +558,31 @@ func runWorkers(ctx context.Context, b *blnkInstance, conf *config.Configuration
 	srv.Shutdown()
 
 	// Close the service container (PERF-P17), and only now that every worker server has
-	// stopped. This role is a PRODUCER — handleTransactionRejection publishes
-	// transaction.rejected through the same publisher — so closing it while a handler could
-	// still be running would fail that publish rather than tidy up after it. The asynq
-	// Shutdown calls above are synchronous and wait for in-flight tasks, which is what makes
-	// this line safe here and unsafe anywhere above it.
+	// stopped.
+	//
+	// THIS ROLE IS NOT A PRODUCER, and an earlier version of this comment said it was — that
+	// handleTransactionRejection published transaction.rejected through the container's
+	// publisher. Neither half is true. That function's own comment records why it no longer
+	// publishes anything (the duplicate capture conflicted on the derived event id), and
+	// blnk.ProcessRole.PublishesEvents names only the server, so initializeEventPublisher
+	// hands this role the no-op — there is no writer here to fail a publish.
+	//
+	// The ordering is still load-bearing, for the resources Close DOES release: the asynq
+	// client, the Kafka admin client, and the drain of scheduled background cleanups. A task
+	// handler still running holds the asynq client to enqueue follow-on work, so closing it
+	// first would fail live work rather than tidy up after it. The asynq Shutdown calls above
+	// are synchronous and wait for in-flight tasks, which is what makes this line safe here
+	// and unsafe anywhere above it.
+	//
+	// Event CAPTURE is unaffected either way: a captured event is a row committed to Postgres
+	// inside the ledger transaction, so it is durable before this point is reached and is
+	// published later by the relay in the server role.
 	if err := b.blnk.Close(); err != nil {
 		logrus.WithError(err).Error(
-			"closing the service container reported an error; some of the publisher or the asynq " +
-				"client may not have shut down cleanly",
+			"closing the service container reported an error; the asynq client or a scheduled " +
+				"cleanup may not have shut down cleanly. This role holds no event publisher, so a " +
+				"captured event is unaffected: it is already committed to blnk.event_outbox and is " +
+				"published by the relay in the server role",
 		)
 	}
 

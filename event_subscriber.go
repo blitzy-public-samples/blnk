@@ -328,6 +328,15 @@ type eventSubscriberStore interface {
 	// ListEventSubscribers pages the registry newest first.
 	ListEventSubscribers(ctx context.Context, query model.SubscriberPageQuery) (model.SubscriberPage, error)
 
+	// ListAndCountEventSubscribers pages the registry and counts it from ONE SNAPSHOT, and is
+	// what a listing that asked for a total reads. Two reads on two connections observe two
+	// registries, so a subscriber registered between them makes the total describe a set the
+	// page is not a slice of.
+	ListAndCountEventSubscribers(
+		ctx context.Context,
+		query model.SubscriberPageQuery,
+	) (model.SubscriberPage, int64, error)
+
 	// CountEventSubscribers counts the whole registry, which is what the listing's
 	// include_count option answers with. It is a separate query rather than the length of
 	// a page, because a page length is not a total.
@@ -336,7 +345,14 @@ type eventSubscriberStore interface {
 	// UpdateEventSubscriber replaces the mutable columns of an existing row, under the
 	// caller's provisioning claim and only while the row is not tombstoned for
 	// deregistration. A miss on either is a conflict naming which condition failed.
-	UpdateEventSubscriber(ctx context.Context, subscriber *model.EventSubscriber, fenceToken string) error
+	//
+	// It returns the row as STORED after the write, so a caller never answers with the
+	// pre-update updated_at it read on the way in.
+	UpdateEventSubscriber(
+		ctx context.Context,
+		subscriber *model.EventSubscriber,
+		fenceToken string,
+	) (*model.EventSubscriber, error)
 
 	// TakeEventSubscriber removes a subscriber and RETURNS the row it removed, so the
 	// caller still holds the principal and topics that broker-side revocation needs. It is
@@ -2466,6 +2482,40 @@ func (s *EventSubscriberService) ListSubscribers(
 	return store.ListEventSubscribers(ctx, query)
 }
 
+// ListAndCountSubscribers pages the registry and counts it from ONE DATABASE SNAPSHOT.
+//
+// It exists because "the listing narrows by nothing, so this count and that page describe the
+// same set by construction" was not true across two reads: a subscriber registered or
+// deregistered between them is counted by one and absent from the other, however identical the
+// two predicates are. Both statements run inside one read-only REPEATABLE READ transaction here,
+// which is what makes the pair coherent.
+//
+// The two single-purpose reads remain for callers that want only one of the two answers. This is
+// the path for the caller that wants both and needs them to agree.
+//
+// It does NOT promise that paging to the total exhausts the registry — paging spans many
+// requests over a live registry. The total is exact as at this page.
+//
+// Parameters:
+//   - ctx context.Context: cancels the read.
+//   - query model.SubscriberPageQuery: the page.
+//
+// Returns:
+//   - model.SubscriberPage: the page, as ListSubscribers.
+//   - int64: the registry size in the same snapshot.
+//   - error: ErrEventKafkaUnavailable when no registry is configured, or the repository's error.
+func (s *EventSubscriberService) ListAndCountSubscribers(
+	ctx context.Context,
+	query model.SubscriberPageQuery,
+) (model.SubscriberPage, int64, error) {
+	store, err := s.requireStore()
+	if err != nil {
+		return model.SubscriberPage{}, 0, err
+	}
+
+	return store.ListAndCountEventSubscribers(ctx, query)
+}
+
 // CountSubscribers reports how many subscribers the registry holds.
 //
 // It exists so GET /subscribers can honour include_count, which used to be refused outright
@@ -2696,6 +2746,25 @@ func (s *EventSubscriberService) UpdateSubscriber(
 	// three fields a binding is actually derived from.
 	reconcileBroker := authorizationNeedsReconciliation(storedAuthorization, subscriber, changes)
 
+	// REFUSED: WIDENING THE BOUNDARY OF A PRINCIPAL WHOSE CREDENTIAL IS UNACCOUNTED FOR.
+	//
+	// An orphaned row names a principal for which a SCRAM credential exists at the broker that
+	// Blnk could neither record nor revoke — so a means of authenticating as it is outstanding and
+	// unknown. A cleanup obligation is the same doubt from the other direction. Creating NEW ACL
+	// bindings for such a principal hands that outstanding credential access it did not have,
+	// which is the one direction that cannot be undone by discovering the mistake later.
+	//
+	// NARROWING STAYS ALLOWED, and that distinction is the whole of this guard. Removing a
+	// binding reduces the exposure, which is exactly what an operator responding to an orphan
+	// wants to be able to do; refusing every edit would leave the row frozen at its widest.
+	// Re-issuance also stays available and is the documented remedy: Kafka stores one credential
+	// per principal, so a new issuance REPLACES the orphan by construction and settles the state.
+	if reconcileBroker {
+		if err := refuseWideningUnaccountedAccess(subscriber, storedAuthorization); err != nil {
+			return nil, err
+		}
+	}
+
 	pruned, granted := 0, 0
 
 	if reconcileBroker {
@@ -2758,7 +2827,12 @@ func (s *EventSubscriberService) UpdateSubscriber(
 	// lost or the row was tombstoned while the prune above was in flight, and the conflict that
 	// reports it is the whole point: the prune has already narrowed the broker, so continuing
 	// to STEP 3 with a stale view would re-grant an authorization somebody else has replaced.
-	if err := store.UpdateEventSubscriber(ctx, subscriber, fence.token); err != nil {
+	// THE ROW AS STORED, not the one assembled above. The write stamps updated_at, so the
+	// assembled value carries the instant this call READ — strictly older than the one now stored —
+	// and answering with it gives a client using updated_at to detect concurrent modification a
+	// value that predates its own write.
+	persisted, err := store.UpdateEventSubscriber(ctx, subscriber, fence.token)
+	if err != nil {
 		// A LOST CLAIM IS NOT AN ORDINARY CONFLICT WHEN THE PRUNE ALREADY LANDED. The broker
 		// now grants less than the registry records, and that residue has to be described
 		// rather than merely returned as a 409 — see abandonUpdateAfterLostFence for why it is
@@ -2769,6 +2843,11 @@ func (s *EventSubscriberService) UpdateSubscriber(
 
 		return nil, err
 	}
+
+	// From here the stored row IS the subscriber: the grant step below derives its bindings from
+	// it, so using the assembled copy would risk granting against a value the database did not
+	// accept.
+	subscriber = persisted
 
 	if reconcileBroker {
 		// STEP 3 — GRANT. Whatever the new authorization adds reaches the broker only now that
@@ -3210,30 +3289,47 @@ func warnOnKeyScopeRecordedAfterIssuance(
 //
 // # What decides instead
 //
-// The ROW'S OWN EVIDENCE. credential_reference is non-nil exactly when a SCRAM credential was
-// written for this principal at a broker and has not been confirmed removed, and it is the join
-// key between this row and the broker's own authorization state. With none, nothing can
-// authenticate as the principal any binding names, so the bindings are inert and proceeding is
-// honest — which is what keeps the registry usable without Kafka at all.
+// The ROW'S OWN EVIDENCE, read through model.EventSubscriber.MayHaveBrokerCredential — which is
+// the union of every state that can coexist with a live credential, not just a recorded reference.
+//
+// This guard used to test IsProvisioned, i.e. credential_reference alone, and that test is
+// exactly backwards for the worst of the four states. An ORPHANED credential is one an issuance
+// wrote at the broker and could then neither record nor revoke: the reference is NIL precisely
+// BECAUSE the recording failed, so the absence of the record is the evidence rather than its
+// refutation. IsProvisioned answered false for such a row, the caller concluded there was nothing
+// at a broker to act on, and deregistration deleted the only row naming a principal that can
+// still authenticate — with no row left to retry from, which is the unrecoverable outcome this
+// whole guard exists to prevent. A row carrying an unsettled cleanup obligation, or a
+// deregistration tombstone, fell through the same hole.
+//
+// The predicate is conservative on purpose: a false positive costs a retryable refusal that a
+// configured broker resolves, while a false negative costs live broker access nothing accounts
+// for. See MayHaveBrokerCredential for why grant_reconcile_pending_at is deliberately excluded.
 //
 // Parameters:
-//   - subscriber *model.EventSubscriber: the row as the registry holds it. Nil is not provisioned.
+//   - subscriber *model.EventSubscriber: the row as the registry holds it. Nil may hold nothing.
 //   - action string: what could not be confirmed, for the log line and the detail.
 //
 // Returns:
-//   - error: a retryable ErrKafkaUnavailable when the row holds a credential, otherwise nil.
+//   - error: a retryable ErrKafkaUnavailable when the row may hold broker access, otherwise nil.
 func refuseUnconfirmableBrokerWork(subscriber *model.EventSubscriber, action string) error {
-	if subscriber == nil || !subscriber.IsProvisioned() {
+	if !subscriber.MayHaveBrokerCredential() {
 		return nil
 	}
+
+	// WHICH of the four states, because the remedies differ: an orphan is settled by re-issuing, a
+	// tombstone by retrying the deregistration, a cleanup obligation by letting settlement run.
+	// A refusal that named none of them left an operator to work that out from the columns.
+	evidence := subscriber.BrokerCredentialEvidence()
 
 	logrus.WithFields(logrus.Fields{
 		"subscriber_id_hash": subscriberLogLabel(subscriber.SubscriberID),
 		"principal_hash":     subscriberLogLabel(subscriber.KafkaPrincipal),
 		"action":             action,
+		"evidence":           evidence,
 	}).Error(
-		"event subscriber: this subscriber holds a live Kafka credential but no broker is " +
-			"configured, so " + action + " CANNOT be confirmed and the registry was left " +
+		"event subscriber: this subscriber may hold live Kafka access (" + evidence + ") but no " +
+			"broker is configured, so " + action + " CANNOT be confirmed and the registry was left " +
 			"describing the access the broker still allows. Configure the broker and retry",
 	)
 
@@ -3244,7 +3340,8 @@ func refuseUnconfirmableBrokerWork(subscriber *model.EventSubscriber, action str
 		// Retryable: nothing was written, and the request succeeds unchanged once a broker is
 		// reachable. The row is the record that makes the retry findable.
 		NewSubscriberErrorDetail(
-			"Changing a provisioned subscriber's broker-side access requires a reachable broker",
+			"Changing the broker-side access of a subscriber that may hold a credential requires "+
+				"a reachable broker: "+evidence,
 			subscriber.SubscriberID, true,
 		),
 	)
@@ -3597,9 +3694,15 @@ func (s *EventSubscriberService) DeregisterSubscriber(
 			return pending, err
 		}
 
-		// No credential was ever written for this principal, so any ACL binding naming it is
-		// inert and the row can be removed directly. This is what keeps the registry usable
-		// without Kafka.
+		// REACHING HERE MEANS THE ROW CARRIES NO CREDENTIAL EVIDENCE AT ALL: no reference, no
+		// orphan marker and no unsettled cleanup obligation. Nothing can authenticate as the
+		// principal, so any ACL binding naming it is inert and the row can be removed directly.
+		// This is what keeps the registry usable without Kafka.
+		//
+		// The row's own revocation tombstone does not count against it, and deliberately so —
+		// this path stamped that tombstone itself two steps ago, so a guard that read it as
+		// evidence would make deregistration impossible in a deployment that never configured
+		// Kafka. See model.EventSubscriber.MayHaveBrokerCredential.
 		removed, takeErr := store.TakeEventSubscriber(ctx, subscriberID, fence.token)
 		if takeErr != nil {
 			return pending, takeErr
@@ -5241,9 +5344,9 @@ func (s *EventSubscriberService) RevokeSubscriberCredential(ctx context.Context,
 		}
 	}
 
-	// With no broker AND no credential there is nothing to revoke, so the registry record is
-	// simply cleared. A deployment that has never configured Kafka can still tidy a row that
-	// predates that decision.
+	// With no broker AND no credential evidence — no reference, no orphan marker, no unsettled
+	// cleanup obligation — there is nothing to revoke, so the registry record is simply cleared. A
+	// deployment that has never configured Kafka can still tidy a row that predates that decision.
 	if admin.IsConfigured() {
 		// The claim is confirmed on the way in and the phase is bounded, for the same reason
 		// deregistration's is: revocation is several administrative round trips and this method
@@ -5727,8 +5830,22 @@ func (b *Blnk) ListEventSubscribers(
 	return service.ListSubscribers(ctx, query)
 }
 
-// CountEventSubscribers counts the registry. It is the read behind include_count on
-// GET /subscribers.
+// ListAndCountEventSubscribers pages the registry and counts it from one snapshot. It is the
+// read behind GET /subscribers?include_count=true.
+//
+// The page and the total used to be two calls, and a registration between them made the total
+// describe a set the page was not a slice of.
+func (b *Blnk) ListAndCountEventSubscribers(
+	ctx context.Context,
+	query model.SubscriberPageQuery,
+) (model.SubscriberPage, int64, error) {
+	service := b.EventSubscribers()
+	defer closeEventSubscriberService(service)
+
+	return service.ListAndCountSubscribers(ctx, query)
+}
+
+// CountEventSubscribers counts the registry. It is the read behind a standalone count.
 func (b *Blnk) CountEventSubscribers(ctx context.Context) (int64, error) {
 	service := b.EventSubscribers()
 	defer closeEventSubscriberService(service)
@@ -6337,6 +6454,106 @@ func newSubscriberAuthorization(subscriber *model.EventSubscriber) subscriberAut
 		consumerGroup: strings.TrimSpace(subscriber.ConsumerGroupID),
 		topics:        topics,
 	}
+}
+
+// widens reports whether this snapshot implies any broker-side binding the prior one did not.
+//
+// It is asymmetric on purpose. Removing a topic, or leaving the set alone, cannot give a principal
+// access it lacked; ADDING one can, and so can moving the principal or the consumer group, because
+// each of those is a new binding on a name that had none.
+//
+// Parameters:
+//   - prior subscriberAuthorization: the authorization as the registry held it.
+//
+// Returns:
+//   - bool: true when this snapshot names a binding prior did not.
+func (a subscriberAuthorization) widens(prior subscriberAuthorization) bool {
+	if a.principal != prior.principal || a.consumerGroup != prior.consumerGroup {
+		// A different principal or group is a binding on a name that carried none, whatever the
+		// topic list does.
+		return true
+	}
+
+	held := make(map[string]struct{}, len(prior.topics))
+	for _, topic := range prior.topics {
+		held[topic] = struct{}{}
+	}
+
+	for _, topic := range a.topics {
+		if _, ok := held[topic]; !ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+// refuseWideningUnaccountedAccess blocks a widening whose principal may hold a credential Blnk
+// cannot account for.
+//
+// # What it prevents
+//
+// An orphaned row names a principal for which a SCRAM credential exists at the broker that Blnk
+// could neither record nor revoke, so a means of authenticating as it is outstanding and its
+// password is not known here. A cleanup obligation is the same doubt reached from the other side.
+// Creating new ACL bindings for such a principal grants that outstanding credential access it did
+// not previously have — and unlike a recorded credential, there is no reference to revoke, so the
+// grant cannot be walked back by revoking the thing that uses it.
+//
+// # What it deliberately allows
+//
+// NARROWING, and re-issuance. Removing bindings reduces the exposure, which is what an operator
+// responding to an orphan needs; freezing the row at its widest would make the guard worse than
+// the gap. Re-issuance is the documented settlement — Kafka stores one credential per principal,
+// so a new issuance replaces the orphan by construction — and it does not go through this path.
+//
+// Parameters:
+//   - subscriber *model.EventSubscriber: the row with the requested changes already applied.
+//   - prior subscriberAuthorization: the authorization as the registry held it before them.
+//
+// Returns:
+//   - error: ErrConflict when the change widens the boundary of an unaccounted-for principal,
+//     otherwise nil.
+func refuseWideningUnaccountedAccess(
+	subscriber *model.EventSubscriber,
+	prior subscriberAuthorization,
+) error {
+	// A RECORDED credential is not the concern: its reference is the join key that makes a
+	// revocation possible, so a widening remains reversible. The unaccounted states are the ones
+	// with no reference to revoke.
+	if subscriber == nil || subscriber.IsProvisioned() {
+		return nil
+	}
+
+	if subscriber.CredentialOrphanedAt == nil && subscriber.CredentialCleanupPendingAt == nil {
+		return nil
+	}
+
+	if !newSubscriberAuthorization(subscriber).widens(prior) {
+		return nil
+	}
+
+	evidence := subscriber.BrokerCredentialEvidence()
+
+	logrus.WithFields(logrus.Fields{
+		"subscriber_id_hash": subscriberLogLabel(subscriber.SubscriberID),
+		"principal_hash":     subscriberLogLabel(subscriber.KafkaPrincipal),
+		"evidence":           evidence,
+	}).Error(
+		"event subscriber: refusing to widen the Kafka authorization of a principal whose " +
+			"credential is unaccounted for (" + evidence + "); the new bindings would grant that " +
+			"outstanding credential access it does not have, and there is no recorded reference to " +
+			"revoke it by. Re-issue the credential to settle the state, or narrow the grant",
+	)
+
+	return apierror.NewAPIError(
+		apierror.ErrConflict,
+		"This subscriber's Kafka credential is unaccounted for, so its authorization cannot be "+
+			"widened; re-issue its credentials to settle the state first, or narrow the grant",
+		// NOT retryable: the same request will be refused until the state is settled, and the
+		// settlement is a different call.
+		NewSubscriberErrorDetail(evidence, subscriber.SubscriberID, false),
+	)
 }
 
 // equals reports whether two snapshots imply the same broker-side bindings.

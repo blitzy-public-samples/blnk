@@ -465,6 +465,43 @@ func (s *subscriberTestStore) ListEventSubscribers(
 	return page, nil
 }
 
+// ListAndCountEventSubscribers answers the page and the total from ONE observation of the
+// fake's state, which is what the repository's read-only REPEATABLE READ transaction gives the
+// real store.
+//
+// One lock acquisition covers both answers. Calling the two single-purpose methods in turn would
+// release the mutex between them and reproduce the very two-snapshot defect this method closes,
+// so a test asserting coherence would pass against a store that does not hold the property.
+//
+// The call is recorded under its own name so a test can assert that a listing which asked for a
+// total made ONE call rather than two.
+func (s *subscriberTestStore) ListAndCountEventSubscribers(
+	ctx context.Context,
+	query model.SubscriberPageQuery,
+) (model.SubscriberPage, int64, error) {
+	if err := s.record("ListAndCountEventSubscribers", ctx); err != nil {
+		return model.SubscriberPage{}, 0, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows := make([]model.EventSubscriber, 0, len(s.rows))
+	for _, row := range s.rows {
+		rows = append(rows, row)
+	}
+
+	total := int64(len(rows))
+
+	page := model.SubscriberPage{Subscribers: rows}
+	if query.Limit > 0 && query.Limit < len(rows) {
+		page.Subscribers = rows[:query.Limit]
+		page.HasMore = true
+	}
+
+	return page, total, nil
+}
+
 // CountEventSubscribers counts every seeded row. It counts the SAME set
 // ListEventSubscribers pages, which is the property the listing's include_count depends on.
 func (s *subscriberTestStore) CountEventSubscribers(ctx context.Context) (int64, error) {
@@ -482,9 +519,9 @@ func (s *subscriberTestStore) UpdateEventSubscriber(
 	ctx context.Context,
 	subscriber *model.EventSubscriber,
 	fenceToken string,
-) error {
+) (*model.EventSubscriber, error) {
 	if err := s.record("UpdateEventSubscriber", ctx); err != nil {
-		return err
+		return nil, err
 	}
 
 	s.mu.Lock()
@@ -494,14 +531,19 @@ func (s *subscriberTestStore) UpdateEventSubscriber(
 	// revocation tombstone. A fake that skipped the last two would let the fenced-write tests
 	// pass against a store that does not enforce what production enforces.
 	if err := s.fencedWriteGuardLocked(subscriber.SubscriberID, fenceToken, true); err != nil {
-		return err
+		return nil, err
 	}
 
 	stored := *subscriber
+	// STAMPED HERE, exactly as the statement's `updated_at = $7` does — and returned, because the
+	// caller must answer with the stored instant rather than the one it read on the way in. A fake
+	// that returned the caller's own copy would let the staleness defect pass unnoticed.
 	stored.UpdatedAt = time.Now().UTC()
 	s.rows[stored.SubscriberID] = stored
 
-	return nil
+	returned := stored
+
+	return &returned, nil
 }
 
 func (s *subscriberTestStore) TakeEventSubscriber(
@@ -757,9 +799,14 @@ func (s *subscriberTestStore) CompleteSubscriberWebhookMigration(
 	// No fence check and no tombstone check, matching the repository: neither column has a
 	// broker counterpart, and the erasure of third-party data does not wait on another
 	// operation's state.
-	stamped := migratedAt
 	row.WebhookURL = nil
-	row.MigratedAt = &stamped
+	// COALESCE, mirroring the statement: the FIRST transition is kept, so a repeat call cannot
+	// move a long-migrated subscriber's migration instant forward to today. A fake that
+	// overwrote it would let the defect pass here while the repository's own test caught it.
+	if row.MigratedAt == nil {
+		stamped := migratedAt
+		row.MigratedAt = &stamped
+	}
 	row.UpdatedAt = time.Now().UTC()
 	s.rows[key] = row
 
@@ -5535,11 +5582,12 @@ func TestDeclaresKeyScope_ReadsWhitespaceAsAbsent(t *testing.T) {
 
 	t.Run("a nil subscriber answers rather than panicking", func(t *testing.T) {
 		// Nil is the repository's not-found, so every predicate that reads a row can hold one.
-		// All three spellings are exercised because all three are called on rows a repository
+		// BOTH surviving spellings are exercised because both are called on rows a repository
 		// read produced, and one of them tolerating nil while another panics is exactly the kind
-		// of disagreement having three names for one question invites.
+		// of disagreement having several names for one question invites. There were four such
+		// names; the two whose names asserted a policy this package no longer performs —
+		// unenforceability and required enforcement — have been deleted rather than re-documented.
 		var subscriber *model.EventSubscriber
-		assert.False(t, subscriber.KeyScopeUnenforceable())
 		assert.False(t, subscriber.RequiresClientSideKeyFiltering())
 		assert.False(t, subscriber.DeclaresKeyScope())
 
@@ -7321,6 +7369,239 @@ func TestSubscriberLifecycle_FailsClosedWhenAProvisionedRowCannotHaveItsRevocati
 	}
 }
 
+// subscriberOrphanedRow is a row whose credential is UNACCOUNTED FOR: no reference, but an orphan
+// marker.
+//
+// It is the state the reference-only guard read exactly backwards. An issuance wrote the SCRAM
+// credential at the broker and then could neither record it nor revoke it, so credential_reference
+// is nil PRECISELY BECAUSE the recording failed — the absence of the record is the evidence that a
+// credential exists, not its refutation.
+func subscriberOrphanedRow(t *testing.T) model.EventSubscriber {
+	t.Helper()
+
+	row := subscriberFixtureRow(t)
+	orphaned := time.Now().UTC().Add(-30 * time.Minute)
+	row.CredentialOrphanedAt = &orphaned
+
+	require.Nil(t, row.CredentialReference,
+		"the fixture's whole point is a live credential with NO reference recorded")
+
+	return row
+}
+
+// subscriberCleanupPendingRow is a row carrying an unsettled credential-cleanup obligation: a
+// credential Blnk intended to destroy that has not been confirmed destroyed.
+func subscriberCleanupPendingRow(t *testing.T) model.EventSubscriber {
+	t.Helper()
+
+	row := subscriberFixtureRow(t)
+	pending := time.Now().UTC().Add(-20 * time.Minute)
+	row.CredentialCleanupPendingAt = &pending
+
+	return row
+}
+
+// TestSubscriberLifecycle_FailsClosedForACredentialWithNoRecordedReference is the C-2 guard, and
+// it is the case the AUTH-02 test above could not catch.
+//
+// # Why a reference-only test was backwards
+//
+// The guard asked IsProvisioned, which reads credential_reference. Two states can coexist with a
+// LIVE broker credential and carry no reference at all:
+//
+//   - ORPHANED. Provisioning writes the SCRAM credential BEFORE the ACL bindings, because a
+//     binding for a principal that does not exist is inert while a credential with no bindings
+//     still authenticates. When recording that issuance fails, the compensation is to revoke —
+//     and when the revocation ALSO fails, a means of authenticating exists for a principal the
+//     registry records no issuance for. credential_reference is nil because the write failed.
+//   - CLEANUP PENDING. A credential Blnk intended to destroy has not been confirmed destroyed.
+//
+// For both, the old guard answered "not provisioned", the caller concluded there was nothing at a
+// broker to act on, and deregistration DELETED the only row naming the principal. There was then
+// nothing anywhere to retry from — the unrecoverable outcome the guard exists to prevent, reached
+// through the guard itself.
+func TestSubscriberLifecycle_FailsClosedForACredentialWithNoRecordedReference(t *testing.T) {
+	fixtures := map[string]func(*testing.T) model.EventSubscriber{
+		"an orphaned credential":          subscriberOrphanedRow,
+		"an unsettled cleanup obligation": subscriberCleanupPendingRow,
+	}
+
+	for fixtureName, fixture := range fixtures {
+		t.Run(fixtureName, func(t *testing.T) {
+			seed := fixture(t)
+
+			t.Run("deregistration must not delete the only row naming the principal", func(t *testing.T) {
+				run := newSubscriberLifecycle(t).seeded(seed)
+				run.admin.configured = false
+
+				_, err := run.service.DeregisterSubscriber(context.Background(), subscriberFixtureID)
+
+				require.Error(t, err,
+					"with no broker to revoke against, deleting the row makes the outstanding "+
+						"credential unfindable rather than merely unrevoked")
+				requireAPIErrorCode(t, err, apierror.ErrKafkaUnavailable)
+
+				row, present := run.store.row(subscriberFixtureID)
+				require.True(t, present, "the row must survive: it is the only thing naming the principal")
+				assert.NotEmpty(t, row.KafkaPrincipal,
+					"and it must still name the principal a retry has to revoke")
+				assert.Empty(t, run.admin.revocations(),
+					"nothing was revoked, which is exactly why nothing may be forgotten")
+			})
+
+			t.Run("narrowing must not report a boundary the broker does not hold", func(t *testing.T) {
+				run := newSubscriberLifecycle(t).seeded(seed)
+				run.admin.configured = false
+
+				_, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
+					SubscriberUpdate{AuthorizedTopics: []string{"blnk.transactions"}})
+
+				require.Error(t, err)
+				requireAPIErrorCode(t, err, apierror.ErrKafkaUnavailable)
+
+				row, present := run.store.row(subscriberFixtureID)
+				require.True(t, present)
+				assert.ElementsMatch(t, []string{"blnk.transactions", "blnk.balances"}, row.AuthorizedTopics,
+					"the registry must still record the access the broker still grants")
+			})
+
+			t.Run("revocation must not erase evidence it could not act on", func(t *testing.T) {
+				run := newSubscriberLifecycle(t).seeded(seed)
+				run.admin.configured = false
+
+				err := run.service.RevokeSubscriberCredential(context.Background(), subscriberFixtureID)
+
+				require.Error(t, err)
+				requireAPIErrorCode(t, err, apierror.ErrKafkaUnavailable)
+			})
+		})
+	}
+}
+
+// TestUpdateSubscriber_RefusesToWidenAnUnaccountedForPrincipal is the second half of C-2, and it
+// applies WITH a broker configured.
+//
+// Creating new ACL bindings for a principal whose credential Blnk cannot account for hands that
+// outstanding credential access it did not previously have. Unlike a recorded credential there is
+// no reference to revoke, so the grant cannot be walked back by revoking the thing that uses it.
+//
+// NARROWING must stay allowed, and that is asserted here too: refusing every edit would freeze the
+// row at its widest, which is worse than the gap. Re-issuance remains the documented settlement.
+func TestUpdateSubscriber_RefusesToWidenAnUnaccountedForPrincipal(t *testing.T) {
+	t.Run("widening an orphaned row is refused", func(t *testing.T) {
+		run := newSubscriberLifecycle(t).seeded(subscriberOrphanedRow(t))
+
+		_, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
+			SubscriberUpdate{AuthorizedTopics: []string{
+				"blnk.transactions", "blnk.balances", "blnk.identities",
+			}})
+
+		require.Error(t, err, "the new binding would grant the outstanding credential a topic it "+
+			"could not read before")
+		requireAPIErrorCode(t, err, apierror.ErrConflict)
+
+		row, present := run.store.row(subscriberFixtureID)
+		require.True(t, present)
+		assert.ElementsMatch(t, []string{"blnk.transactions", "blnk.balances"}, row.AuthorizedTopics,
+			"and the widening must not have been persisted either")
+
+		pruned, granted := run.admin.reconciliation()
+		assert.Empty(t, granted,
+			"the refusal must land BEFORE the broker is touched: a binding created and then "+
+				"reported as an error is the exposure itself")
+		assert.Empty(t, pruned,
+			"and before the prune too, so the row is left exactly as it was found")
+	})
+
+	t.Run("narrowing an orphaned row is allowed", func(t *testing.T) {
+		run := newSubscriberLifecycle(t).seeded(subscriberOrphanedRow(t))
+
+		updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
+			SubscriberUpdate{AuthorizedTopics: []string{"blnk.transactions"}})
+
+		require.NoError(t, err,
+			"removing a binding reduces the exposure, which is what an operator responding to an "+
+				"orphan needs to be able to do")
+		assert.ElementsMatch(t, []string{"blnk.transactions"}, updated.AuthorizedTopics)
+	})
+
+	t.Run("a row with a RECORDED credential may still be widened", func(t *testing.T) {
+		// The reference is the join key that makes a revocation possible, so a widening here
+		// stays reversible. Freezing provisioned rows would break ordinary operation.
+		run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
+
+		updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
+			SubscriberUpdate{AuthorizedTopics: []string{
+				"blnk.transactions", "blnk.balances", "blnk.identities",
+			}})
+
+		require.NoError(t, err)
+		assert.Len(t, updated.AuthorizedTopics, 3)
+	})
+
+	t.Run("an edit that moves no binding is allowed on an orphaned row", func(t *testing.T) {
+		// Renaming is not a grant. Coupling deprecated bookkeeping to a credential's settlement
+		// state would make an orphan unmanageable for reasons the data does not justify.
+		run := newSubscriberLifecycle(t).seeded(subscriberOrphanedRow(t))
+
+		name := "renamed while orphaned"
+		updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
+			SubscriberUpdate{Name: &name})
+
+		require.NoError(t, err)
+		assert.Equal(t, name, updated.Name)
+	})
+}
+
+// TestMayHaveBrokerCredential_IsTheUnionOfEveryUnconfirmedState pins the predicate itself, which
+// is what every lifecycle guard now consults.
+func TestMayHaveBrokerCredential_IsTheUnionOfEveryUnconfirmedState(t *testing.T) {
+	stamp := time.Now().UTC()
+
+	t.Run("the three states that may coexist with a live credential", func(t *testing.T) {
+		reference := "ref"
+
+		for name, row := range map[string]*model.EventSubscriber{
+			"a recorded reference": {CredentialReference: &reference},
+			"an orphan marker":     {CredentialOrphanedAt: &stamp},
+			"a cleanup obligation": {CredentialCleanupPendingAt: &stamp},
+		} {
+			t.Run(name, func(t *testing.T) {
+				assert.True(t, row.MayHaveBrokerCredential())
+				assert.NotEmpty(t, row.BrokerCredentialEvidence(),
+					"a refusal has to name which state it is, because the remedies differ")
+			})
+		}
+	})
+
+	t.Run("the two markers that are not credential evidence", func(t *testing.T) {
+		// A revocation tombstone is stamped by deregistration BEFORE the broker is touched, so a
+		// predicate that read it would refuse deregistration its own tombstone — making the
+		// operation impossible in a deployment that never configured Kafka. A grant-reconcile
+		// marker means the recorded authorization is WIDER than the broker's, which is the safe
+		// direction: no authentication follows from a missing ACL binding.
+		for name, row := range map[string]*model.EventSubscriber{
+			"a revocation tombstone":   {RevocationPendingAt: &stamp},
+			"a grant-reconcile marker": {GrantReconcilePendingAt: &stamp},
+		} {
+			t.Run(name, func(t *testing.T) {
+				assert.False(t, row.MayHaveBrokerCredential())
+			})
+		}
+	})
+
+	t.Run("a nil receiver answers false rather than panicking", func(t *testing.T) {
+		var row *model.EventSubscriber
+
+		assert.False(t, row.MayHaveBrokerCredential())
+		assert.Empty(t, row.BrokerCredentialEvidence())
+	})
+
+	t.Run("a clean row holds nothing", func(t *testing.T) {
+		assert.False(t, (&model.EventSubscriber{}).MayHaveBrokerCredential())
+	})
+}
+
 // TestDeregisterSubscriber_ClearsTheTombstoneOnceTheBrokerIsConfirmedClean is the F14 guard: the
 // revocation tombstone must mark ONE obligation, not two.
 //
@@ -7422,8 +7703,8 @@ func TestRegisterSubscriber_TreatsOnlyAnAbsentIdentifierAsAbsent(t *testing.T) {
 }
 
 // RETIRED: TestIssueSubscriberCredential_RefusesASubscriberWhoseKeyScopeKafkaCannotEnforce,
-// TestUpdateSubscriber_RefusesAKeyScopeOnASubscriberThatHoldsACredential and
-// TestKeyScopeUnenforceable_ReadsWhitespaceAsAbsent stood here.
+// TestUpdateSubscriber_RefusesAKeyScopeOnASubscriberThatHoldsACredential and a test over the
+// deleted unenforceability predicate stood here.
 //
 // All three asserted the SEC-05 refusal: a subscriber recording a partition key prefix was
 // unprovisionable, and recording a prefix on a subscriber holding a credential was refused. The

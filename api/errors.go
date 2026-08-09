@@ -18,6 +18,7 @@ package api
 import (
 	"database/sql"
 	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/blnkfinance/blnk"
@@ -25,6 +26,7 @@ import (
 	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/internal/apierror"
 	redlock "github.com/blnkfinance/blnk/internal/lock"
+	"github.com/blnkfinance/blnk/internal/logsafe"
 	"github.com/blnkfinance/blnk/internal/tokenization"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
@@ -130,16 +132,72 @@ func respondError(c *gin.Context, err error, opts ...respondOpt) {
 
 	if o.defaultCode != "" {
 		msg := err.Error()
-		if o.fallbackMessage != "" {
+
+		switch {
+		case o.fallbackMessage != "":
+			// The caller chose the client-facing wording, so it is used verbatim.
 			msg = o.fallbackMessage
-			logrus.WithError(err).Error("API error masked by fallback message")
+			logrus.WithField("cause", logsafe.Cause(err)).Error("API error masked by fallback message")
+
+		case serverFacingStatus(o.defaultCode, o):
+			// MI-3: A 5xx DEFAULT MUST NOT ECHO err.Error().
+			//
+			// Reaching here means classification found nothing: no typed APIError, no known
+			// sentinel, no recognised message pattern. So this message was not written for a
+			// client by anyone — it is whatever a repository, driver or broker produced, and on
+			// this path those are exactly the errors that carry a DSN, a host:port, SQL text or a
+			// filesystem path. `pq: connection refused on 10.0.0.5` reached callers of every
+			// endpoint using withDefault(GEN_INTERNAL), ErrEventReplayFailed,
+			// ErrReconStartFailed or ErrSubscriberProvisioningFailed with no fallback message.
+			//
+			// THE FINAL FALLBACK BELOW ALREADY DID THIS. The two paths differ only in whether a
+			// caller named a default code, which is a choice about the CODE, never a decision to
+			// disclose internals — so the same sanitized text applies to both.
+			//
+			// The test is on the STATUS rather than on a list of codes: a 4xx default is a
+			// caller-actionable refusal whose message is the useful part of the response, and
+			// keeping those verbatim is why this is not a blanket sanitize. A code added later
+			// gets the right treatment from its own status entry, with nothing here to update.
+			msg = sanitizedInternalMessage
+			logrus.WithFields(logrus.Fields{
+				"code":  string(o.defaultCode),
+				"cause": logsafe.Cause(err),
+			}).Error(
+				"unclassified error behind a server-fault default code; the response carries " +
+					"sanitized text and the cause is recorded here",
+			)
 		}
+
 		writeError(c, o.defaultCode, msg, nil, o)
 		return
 	}
 
-	logrus.WithError(err).Error("unclassified error in API response")
+	logrus.WithField("cause", logsafe.Cause(err)).Error("unclassified error in API response")
 	writeError(c, apierror.ErrGenInternal, sanitizedInternalMessage, nil, o)
+}
+
+// serverFacingStatus reports whether the response this code produces will be a server-fault
+// status, and therefore whether an unclassified error message must be withheld from the client.
+//
+// IT RESOLVES THE CODE THE SAME WAY writeError DOES — Normalize, then any registered upgrade —
+// because the status that matters is the one actually sent. Testing the raw code would give the
+// wrong answer for any caller combining withDefault with withUpgrade: the upgraded code decides
+// the status, so the un-upgraded code could read 4xx while a 5xx went out carrying the driver's
+// text.
+//
+// Parameters:
+//   - code apierror.ErrorCode: the default code respondError is about to write.
+//   - o *respondOptions: the resolved options, consulted for its upgrade table.
+//
+// Returns:
+//   - bool: true when the effective status is 500 or above.
+func serverFacingStatus(code apierror.ErrorCode, o *respondOptions) bool {
+	effective := apierror.Normalize(code)
+	if to, ok := o.upgrades[effective]; ok {
+		effective = to
+	}
+
+	return apierror.StatusForCode(effective) >= http.StatusInternalServerError
 }
 
 func writeError(c *gin.Context, code apierror.ErrorCode, message string, details interface{}, o *respondOptions) {

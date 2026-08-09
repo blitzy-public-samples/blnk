@@ -728,6 +728,23 @@ spec:
                   # missing variable in the boot log and the construction path
                   # refuses to dial anything half-authenticated.
                   optional: true
+            # WHETHER THIS ROLE HAS A /metrics ROUTE AT ALL, and the token below
+            # is worthless without it.
+            #
+            # The worker set this and the server did not, while
+            # prometheus-configmap.yaml scrapes BOTH — job blnk-server on 5001 and
+            # job blnk-worker on 5004 — so every server scrape returned 404 while the
+            # monitoring stack reported itself healthy. The two roles record
+            # DIFFERENT series: the server hosts the event relay, so the outbox,
+            # publish-attempt, dead-letter-age and consumer-lag instruments are its,
+            # and those are precisely the series the rules in
+            # alerts/blnk-kafka-alerts.yml read. Arming only the worker left most of
+            # that alerting permanently silent with nothing reporting a problem.
+            - name: BLNK_ENABLE_OBSERVABILITY
+              valueFrom:
+                configMapKeyRef:
+                  name: blnk-config
+                  key: BLNK_ENABLE_OBSERVABILITY
             # /metrics IS BEARER-AUTHENTICATED, AND BOTH SIDES NEED THE SAME
             # TOKEN.
             #

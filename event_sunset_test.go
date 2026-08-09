@@ -1175,3 +1175,129 @@ func TestWebhookWindowState_StringNamesEveryState(t *testing.T) {
 	assert.Equal(t, "unknown", WebhookWindowState(99).String(),
 		"an unforeseen value must render legibly rather than as a bare integer")
 }
+
+// TestWebhookSunsetSnapshotAt_ComposesTheWindowFromOneConfigurationRead is the M-4 guard, and it
+// is deterministic rather than a race probe.
+//
+// # What could go wrong, stated precisely
+//
+// The window has two ends and they come from two INDEPENDENT configuration fields:
+// WebhookDeprecationSunsetDate, and WebhookDeprecationStartDate which overrides the derived start
+// when it is set. config.ConfigStore is an atomic.Value whose contents are replaced WHOLESALE on
+// reload, so composing the window out of two reads lets each end come from a different generation.
+//
+// That is not a cosmetic inconsistency. RFC 9745 §4 requires the Deprecation instant to precede
+// the Sunset instant, and both are rendered into the headers of ONE response by the HTTP guards.
+// A start taken from a generation whose dates are later than the sunset's generation produces a
+// response whose Deprecation header is AFTER its Sunset header — a protocol violation the response
+// carries with nothing to disclose it.
+//
+// # How the test forces the condition instead of waiting for it
+//
+// fetchConfiguration is replaced with a function that returns a DIFFERENT generation on every
+// call. Any implementation that reads twice therefore composes the window from two generations
+// every time, with no timing involved: the second read cannot help but return the later dates. An
+// implementation that reads once cannot see the second generation at all.
+//
+// The two generations are chosen so the failure is unmissable — generation two's START is a decade
+// AFTER generation one's SUNSET — so a two-read composition yields start > sunset rather than
+// merely a different-but-plausible pair.
+func TestWebhookSunsetSnapshotAt_ComposesTheWindowFromOneConfigurationRead(t *testing.T) {
+	restoreFetchConfiguration(t)
+	sunsetParseWarnings.reset()
+	startParseWarnings.reset()
+
+	const (
+		firstSunset  = "2030-01-01T00:00:00Z"
+		firstStart   = "2029-12-02T00:00:00Z"
+		secondSunset = "2040-01-01T00:00:00Z"
+		secondStart  = "2039-12-02T00:00:00Z"
+	)
+
+	var reads int
+	fetchConfiguration = func() (*config.Configuration, error) {
+		reads++
+
+		// EVERY call after the first returns the later generation. A reload is being simulated as
+		// having landed between any two reads, whichever two they are.
+		if reads > 1 {
+			return &config.Configuration{
+				WebhookDeprecationSunsetDate: secondSunset,
+				WebhookDeprecationStartDate:  secondStart,
+			}, nil
+		}
+
+		return &config.Configuration{
+			WebhookDeprecationSunsetDate: firstSunset,
+			WebhookDeprecationStartDate:  firstStart,
+		}, nil
+	}
+
+	snapshot := WebhookSunsetSnapshotAt(mustParseSunset(t, "2029-12-15T00:00:00Z"))
+
+	assert.Equal(t, 1, reads,
+		"the snapshot must read the configuration store EXACTLY ONCE. Every additional read is a "+
+			"chance to observe a different generation, and the two ends of the window are two "+
+			"independently configured fields, so two reads can compose a window that never existed")
+
+	// BOTH ENDS FROM THE FIRST GENERATION. This is the assertion that fails on a two-read
+	// composition, and it fails loudly: the start would be 2039 while the sunset stayed 2030.
+	assert.Equal(t, mustParseSunset(t, firstSunset), snapshot.Date,
+		"the sunset must come from the generation that was read")
+	assert.Equal(t, mustParseSunset(t, firstStart), snapshot.WindowStart,
+		"the window start must come from the SAME generation as the sunset, not from whatever the "+
+			"store held by the time a second read happened")
+
+	// THE PROPERTY THE HEADERS DEPEND ON, asserted as itself rather than left implied by the two
+	// equalities above. RFC 9745 §4 requires this ordering of the pair the guards render.
+	assert.True(t, snapshot.WindowStart.Before(snapshot.Date),
+		"the window must open before it closes: RFC 9745 §4 requires the Deprecation instant to "+
+			"precede the Sunset instant, and the guards render both from this one snapshot")
+
+	assert.True(t, snapshot.DateConfigured, "the first generation configures a renderable instant")
+	assert.False(t, snapshot.Passed, "the probe instant is inside the first generation's window")
+}
+
+// TestWebhookDeprecationWindow_AgreesWithTheSnapshot pins the two public readings of one window to
+// each other.
+//
+// They are separate entry points — the guards take a snapshot, while startup logging and the
+// relay's refusal message take the window — and they used to resolve independently, so they could
+// describe different windows to an operator reading a log line and a client reading a header. They
+// now share one resolver, and this is what holds them to it.
+func TestWebhookDeprecationWindow_AgreesWithTheSnapshot(t *testing.T) {
+	restoreFetchConfiguration(t)
+	sunsetParseWarnings.reset()
+	startParseWarnings.reset()
+
+	t.Run("a configured window is reported identically by both", func(t *testing.T) {
+		storeSunsetDate(t, "2030-06-01T00:00:00Z")
+
+		start, sunset, configured := WebhookDeprecationWindow()
+		require.True(t, configured)
+
+		snapshot := WebhookSunsetSnapshotAt(time.Now())
+		assert.Equal(t, sunset, snapshot.Date,
+			"the sunset an operator is shown must be the sunset a client is refused under")
+		assert.Equal(t, start, snapshot.WindowStart,
+			"and the window start likewise, or the Deprecation header and the startup log describe "+
+				"different migrations")
+		assert.True(t, snapshot.DateConfigured,
+			"both readings must agree there IS a window, since the guards use DateConfigured to "+
+				"decide whether to render the headers at all")
+	})
+
+	t.Run("an unconfigured window is reported as absent by both", func(t *testing.T) {
+		// The graceful-degradation steady state of a deployment with no Kafka. Neither reading may
+		// invent a date, because rendering one would announce a retirement nobody configured.
+		storeSunsetDate(t, "")
+
+		_, _, configured := WebhookDeprecationWindow()
+		assert.False(t, configured)
+
+		snapshot := WebhookSunsetSnapshotAt(time.Now())
+		assert.False(t, snapshot.DateConfigured)
+		assert.True(t, snapshot.WindowStart.IsZero(),
+			"an unresolved window has no start to render, and a zero value is what the guards test")
+	})
+}
