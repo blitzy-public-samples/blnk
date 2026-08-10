@@ -5203,14 +5203,23 @@ function buildProvenance(metrics) {
         value: gaugeValue(metrics, M_EVENTS_PER_SEC),
         target: TARGET_EVENTS_PER_SEC,
         comparison: ">=",
+        // SERIES_PUBLISHED, because that is the counter the value beside it was differenced
+        // from: M_EVENTS_PER_SEC is publishedEvents / LOAD_SECONDS and is recorded only when
+        // the PUBLISHED series resolved. It used to report the DISPATCHED series here, which
+        // names a counter no part of this figure reads and contradicted the equivalent_promql
+        // in this very block — the one defect a provenance field exists to make impossible,
+        // and in the flattering direction too, since dispatched trails published by the
+        // population still owed a legacy webhook. The dispatched counter's own resolution is
+        // still auditable, on the event_publish_dispatched_series_code gauge and the
+        // dispatched_delta row under raw_inputs.
         series:
           resolvedSeriesName(
-            SERIES_DISPATCHED,
-            gaugeValue(metrics, M_DISPATCHED_SERIES_CODE),
-          ) || SERIES_DISPATCHED[0],
+            SERIES_PUBLISHED,
+            gaugeValue(metrics, M_PUBLISHED_SERIES_CODE),
+          ) || SERIES_PUBLISHED[0],
         series_resolution: describeCode(
           SERIES_CODE_LABELS,
-          gaugeValue(metrics, M_DISPATCHED_SERIES_CODE),
+          gaugeValue(metrics, M_PUBLISHED_SERIES_CODE),
         ),
         method:
           "the counter's delta over the measured window, summed over every topic and event_type label, divided by the LOAD INTERVAL rather than by the window. The window is necessarily longer than the load — it opens at the baseline scrape after provisioning and closes after the tail drain — so dividing by it would charge the load for seconds during which none was offered, and would do so in the failing direction",
