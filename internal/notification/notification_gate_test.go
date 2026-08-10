@@ -490,9 +490,12 @@ func TestNotifyError_KafkaConfiguredWithNoSenderRegistered_DoesNotPanic(t *testi
 // password, and system.error is published to a replicated, retained topic — but substituting
 // one payload for another under the same event name is a BREAKING CHANGE to a published
 // contract, delivered as a side effect of a transport migration. It is addressed instead by
-// two things that cost no contract anything: system.error routes to the internal blnk.system
-// category, which model.SubscriberGrantableTopics excludes so that no subscriber can be
-// granted it, and the bounded classification is logged rather than published.
+// two things that cost no contract anything: system.error routes to blnk.system, the NARROWEST
+// category in the catalogue — model.SubscriberGrantableTopics does include it, so a grant is
+// possible, but it is chosen per subscriber and the documented rule is to grant it only to a
+// subscriber that needs ledger.created — and the bounded classification is logged rather than
+// published. The audience for this body is therefore the operator plus whoever was deliberately
+// granted that topic, which is what model.EventCategorySystem states a grant discloses.
 //
 // The LENGTH ASSERTION is the point of this test: a third key is a change to a published
 // contract, and it should fail here rather than reach a subscriber. The three keys the

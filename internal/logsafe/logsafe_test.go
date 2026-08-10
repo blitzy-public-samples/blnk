@@ -402,3 +402,233 @@ func TestRedactedValue_SanitizesAndBoundsLikeValue(t *testing.T) {
 	assert.Empty(t, RedactedValue("dial tcp 10.0.0.4:9092", 0),
 		"and a non-positive cap yields nothing at all, exactly as Value does")
 }
+
+// TestCause_RedactsASecretInEverySpellingOfItsKey is the guard on the defect that whole-key
+// matching cannot avoid: the same secret is spelled "password" in a Postgres DSN,
+// "sasl.password" in a Kafka property, "ssl.keystore.password" in a client config and
+// "KAFKA_SASL_ADMIN_SECRET" in this service's own environment, and every one of those
+// reached a log line intact while only the bare words were enumerated.
+//
+// Each case here is a spelling this deployment can actually produce, and each asserts BOTH
+// halves of the contract: the value is gone, and the key that names which setting failed is
+// still there, because "the DSN was rejected" without the field name is not a diagnosis.
+func TestCause_RedactsASecretInEverySpellingOfItsKey(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		err    error
+		secret string
+		keptAs string
+	}{
+		{
+			name:   "a Kafka dotted property",
+			err:    errors.New("sasl.password=hunter2 was rejected by the broker"),
+			secret: "hunter2",
+			keptAs: "sasl.password=",
+		},
+		{
+			name:   "a Kafka dotted principal",
+			err:    errors.New("sasl.username=blnk-producer is unknown"),
+			secret: "blnk-producer",
+			keptAs: "sasl.username=",
+		},
+		{
+			name:   "a nested keystore property",
+			err:    errors.New("ssl.keystore.password=changeit did not open the keystore"),
+			secret: "changeit",
+			keptAs: "ssl.keystore.password=",
+		},
+		{
+			name:   "this service's own admin credential variable",
+			err:    errors.New("KAFKA_SASL_ADMIN_SECRET=hunter2 is malformed"),
+			secret: "hunter2",
+			keptAs: "KAFKA_SASL_ADMIN_SECRET=",
+		},
+		{
+			name:   "an underscored spelling no enumeration held",
+			err:    errors.New("sasl_secret=hunter2 was rejected"),
+			secret: "hunter2",
+			keptAs: "sasl_secret=",
+		},
+		{
+			name:   "a hyphenated header spelling",
+			err:    errors.New("proxy-authorization=Bearer-abc123 was refused"),
+			secret: "abc123",
+			keptAs: "proxy-authorization=",
+		},
+		{
+			name:   "a bearer token variable",
+			err:    errors.New("BLNK_METRICS_BEARER_TOKEN=abc123 did not match"),
+			secret: "abc123",
+			keptAs: "BLNK_METRICS_BEARER_TOKEN=",
+		},
+		{
+			name:   "a credential word that was never enumerated at all",
+			err:    errors.New("credentials=abc123 were refused"),
+			secret: "abc123",
+			keptAs: "credentials=",
+		},
+		{
+			name:   "a key qualified by a service rather than by a routing word",
+			err:    errors.New("BLNK_TYPESENSE_KEY=abc123 was rejected"),
+			secret: "abc123",
+			keptAs: "BLNK_TYPESENSE_KEY=",
+		},
+		{
+			name:   "a JAAS fragment that arrives as one token",
+			err:    errors.New(`sasl.jaas.config=PlainLoginModule/required/password="s3cr3t" is invalid`),
+			secret: "s3cr3t",
+			keptAs: "sasl.jaas.config=",
+		},
+		{
+			name:   "an address under a prefixed key, which carries no port for shape to catch",
+			err:    errors.New("KAFKA_BROKERS=broker.internal is unreachable"),
+			secret: "broker.internal",
+			keptAs: "KAFKA_BROKERS=",
+		},
+		{
+			name:   "an address under a nested key",
+			err:    errors.New("kafka.bootstrap.servers=broker.internal is down"),
+			secret: "broker.internal",
+			keptAs: "kafka.bootstrap.servers=",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := Cause(tt.err)
+
+			assert.NotContains(t, got, tt.secret,
+				"the value must not survive in any spelling of its key: %s", got)
+			assert.Contains(t, got, tt.keptAs+Placeholder,
+				"the key must survive so the line still names which setting failed: %s", got)
+		})
+	}
+}
+
+// TestCause_KeepsTheAssignmentsThePipelineLogsOnPurpose is the other side of the rule above,
+// and the reason the segment sets are not simply widened until nothing gets through.
+//
+// Every case here is a value this codebase logs deliberately. "partition_key" in particular
+// is what the relay's ordering diagnosis is written in: redacting it would leave an operator
+// investigating an out-of-order delivery unable to see which key was affected. A test that
+// only proved secrets vanish would be satisfied by a rule that redacts everything.
+func TestCause_KeepsTheAssignmentsThePipelineLogsOnPurpose(t *testing.T) {
+	t.Parallel()
+
+	kept := []string{
+		"partition_key=ldg_0192",
+		"partition_keys=2",
+		"event_key=evt_a1b2",
+		"idempotency-key=evt_a1b2",
+		"sort_key=occurred_at",
+		"aggregate_key=ldg_0192",
+		"user_agent=blnk/1.0",
+		"pass_rate=0.99",
+		"sasl.mechanism=SCRAM-SHA-512",
+		"KAFKA_TOPIC_PREFIX=blnk",
+		"RELAY_MAX_RETRY_ATTEMPTS=5",
+		"attempts=5",
+		"sslmode=disable",
+	}
+
+	for _, assignment := range kept {
+		t.Run(assignment, func(t *testing.T) {
+			t.Parallel()
+
+			got := Cause(errors.New(assignment + " was not accepted"))
+
+			assert.Contains(t, got, assignment,
+				"a diagnostic assignment must survive: %s", got)
+			assert.NotContains(t, got, Placeholder,
+				"and nothing in it may be redacted: %s", got)
+		})
+	}
+}
+
+// TestKeyNamesRedactableValue_HoldsForEverySpellingOfEveryWordItKnows derives its inputs from
+// the word sets themselves rather than restating them, so a word added later is covered in all
+// four spellings the moment it is added, and the three matching layers each stay load-bearing.
+//
+// This is what makes the rule a rule instead of a list. The defect it replaces was not a
+// missing entry; it was that every entry had to be written in advance in the exact spelling it
+// would arrive in.
+func TestKeyNamesRedactableValue_HoldsForEverySpellingOfEveryWordItKnows(t *testing.T) {
+	t.Parallel()
+
+	segmentWords := make([]string, 0, len(secretKeySegments)+len(endpointKeySegments))
+	for word := range secretKeySegments {
+		segmentWords = append(segmentWords, word)
+	}
+
+	for word := range endpointKeySegments {
+		segmentWords = append(segmentWords, word)
+	}
+
+	require.NotEmpty(t, segmentWords, "the sets must not be empty, or this test proves nothing")
+
+	t.Run("every segment word is caught wherever it sits and however it is separated", func(t *testing.T) {
+		t.Parallel()
+
+		for _, word := range segmentWords {
+			for _, spelling := range []string{
+				word,
+				"kafka." + word,
+				"KAFKA_" + strings.ToUpper(word),
+				"kafka-" + word,
+				"ssl." + word + ".override",
+			} {
+				assert.True(t, keyNamesRedactableValue(strings.ToLower(spelling)),
+					"%q must be recognised through the word %q", spelling, word)
+			}
+		}
+	})
+
+	t.Run("every enumerated whole key is caught in each separator spelling", func(t *testing.T) {
+		t.Parallel()
+
+		for _, set := range []map[string]struct{}{sensitiveKeys, endpointKeys} {
+			for key := range set {
+				for _, separator := range []string{"_", ".", "-"} {
+					spelling := strings.ReplaceAll(key, "_", separator)
+					spelling = strings.ReplaceAll(spelling, ".", separator)
+
+					assert.True(t, keyNamesRedactableValue(spelling),
+						"%q must reach the entry %q whichever separator it is written with",
+						spelling, key)
+				}
+			}
+		}
+	})
+
+	t.Run("a routing key survives and an unqualified one does not", func(t *testing.T) {
+		t.Parallel()
+
+		for qualifier := range routingKeyQualifiers {
+			assert.False(t, keyNamesRedactableValue(qualifier+"_key"),
+				"%s_key names a routing value and must survive", qualifier)
+			assert.False(t, keyNamesRedactableValue(qualifier+"_keys"),
+				"%s_keys names routing values and must survive", qualifier)
+		}
+
+		for _, credential := range []string{"key", "keys", "api_key", "signing.key", "typesense_key"} {
+			assert.True(t, keyNamesRedactableValue(credential),
+				"%q is not qualified by a routing word, so it takes the safe reading", credential)
+		}
+	})
+
+	t.Run("a key naming neither a secret nor an address is left alone", func(t *testing.T) {
+		t.Parallel()
+
+		for _, ordinary := range []string{
+			"sslmode", "attempts", "topic", "event_type", "schema_version",
+			"sasl.mechanism", "log.retention.hours", "user_agent", "pass_rate",
+		} {
+			assert.False(t, keyNamesRedactableValue(ordinary),
+				"%q names a diagnostic value and must not be redacted", ordinary)
+		}
+	})
+}

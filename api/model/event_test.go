@@ -1209,17 +1209,19 @@ func TestNewSubscriberResponse_StatesWhatTheNextCallWillDo(t *testing.T) {
 		assert.Empty(t, response.CredentialIssuanceBlockedReason,
 			"and no remedy is offered, because there is nothing to remedy")
 		assert.Equal(t, prefix, response.PartitionKeyPrefix,
-			"the recorded value is still reported: it is the narrowing the subscriber has to apply")
-		assert.False(t, response.EnforcedAccess.PartitionKeyPrefixEnforced,
-			"the enforcement declaration must keep saying the prefix is not a broker scope — that "+
-				"statement is what replaced the refusal, so it carries the whole warning now")
-		assert.True(t, response.EnforcedAccess.ClientSideKeyFilteringRequired,
-			"AND it must say whose job the narrowing is, in machine-readable form, because a "+
-				"consumer that reads only 'not enforced' learns that its scope is wider than "+
-				"recorded without learning that it is the one that has to close the gap")
+			"the recorded value is still reported: it is the narrowing Blnk's gateway applies")
+		assert.True(t, response.EnforcedAccess.PartitionKeyPrefixEnforced,
+			"and the enforcement declaration says it is ENFORCED, which is what replaced both the "+
+				"refusal and the consumer-side disclosure that followed it")
+		assert.True(t, response.EnforcedAccess.GatewayDeliveryRequired,
+			"AND it must say where the records come from, in machine-readable form: a key-scoped "+
+				"subscriber holds no topic Read, so a client that tried to fetch from the broker "+
+				"would simply be refused")
+		assert.False(t, response.EnforcedAccess.BrokerRecordAccess,
+			"which is the same fact stated as the grant it rests on")
 		assert.Equal(t, prefix, response.EnforcedAccess.PartitionKeyPrefix,
-			"restated inside the object that says the broker does not enforce it, which is the "+
-				"only place a reader cannot mistake it for a boundary")
+			"restated inside the object that names the component enforcing it, which is the only "+
+				"place a reader cannot mistake who keeps it")
 	})
 
 	t.Run("an empty topic grant predicts the refusal and names the remedy", func(t *testing.T) {

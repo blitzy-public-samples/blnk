@@ -239,13 +239,13 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 			name:      "ledger created",
 			eventType: "ledger.created",
 			want:      EventCategorySystem,
-			reason:    "ledger.created belongs to none of the three named categories, and the agreed topic contract is FOUR categories, so it routes to blnk.system - which is internal, meaning the event is captured, published and replayable but not consumable by a subscriber credential. A fifth grantable 'ledgers' category was implemented to close that gap and removed again: the catalogue is a published contract and widening it obliges every subscriber to hold a grant it was never told about",
+			reason:    "ledger.created belongs to none of the three named categories, and the agreed topic contract is FOUR categories, so it routes to blnk.system. That category IS grantable - see SubscriberGrantableEventCategories - because withholding it would withhold ledger.created, which the legacy webhook transport delivers today, from every subscriber. What it is not is granted by default: it is chosen per subscriber, and the documented rule is to grant it only to one that needs ledger.created, because the same topic carries system.error's verbatim body. A fifth grantable 'ledgers' category was implemented to separate them and removed again: the catalogue is a published contract and widening it obliges every subscriber to hold a grant it was never told about",
 		},
 		{
 			name:      "system error",
 			eventType: "system.error",
 			want:      EventCategorySystem,
-			reason:    "system.error carries Blnk's internal diagnostic detail, so it routes to the internal system category and is covered without being offered to subscribers",
+			reason:    "system.error carries Blnk's internal diagnostic detail, so it routes to the system category, which is the narrowest in the catalogue rather than an unreachable one: a grant is possible and is a deliberate per-subscriber decision made against what EventCategorySystem documents it discloses",
 		},
 	}
 
@@ -264,41 +264,13 @@ func TestEventCategory_ResolvesEveryEmittedEventString(t *testing.T) {
 	assert.Len(t, tests, 15, "the table must cover all thirteen emitted event types, with the runtime-composed bulk name exercised by three suffixes")
 }
 
-// TestEventCategory_UnknownEventFallsBackToTheSystemCategory pins the catch-all arm,
-// and pins WHERE it points.
-//
-// Two properties are asserted:
-//
-//  1. Coverage. An event type nobody mapped must still resolve to a real category, so
-//     a producer added later that forgets to extend the table gets its events
-//     published and observable rather than rejected or dropped. The row is already
-//     committed by the time routing happens, so rejecting would strand a durable
-//     event.
-//  2. A named destination. The fallback must land on the system category specifically,
-//     not on a domain topic whose subscribers filter it expecting ledger data, and not
-//     on an invented fifth topic the agreed inventory does not contain.
-//
-// The internal-category assertion is the point of the test, and it is what a separate
-// "quarantine" category would have been an alternative way of achieving. The topic
-// contract fixes the catalogue at four categories instead, so containment rests
-// entirely on the system category staying internal; an edit that made it grantable
-// would restore the disclosure, and a coverage-only assertion would not notice.
-func TestEventCategory_UnknownEventFallsBackToTheInternalSystemCategory(t *testing.T) {
-	assert.Equal(t, EventCategorySystem, EventCategory("totally.unknown.event"),
-		"an unrecognised event type must fall back to the system category — dropping it or returning an empty token would breach the zero-exceptions coverage guarantee for event types added later")
-
-	assert.Equal(t, EventCategorySystem, EventCategory(""),
-		"the empty event type must also resolve to a real category: the resolver is total, so no input can ever produce an empty category token that would then compose a malformed topic name")
-
-	assert.False(t, IsCataloguedEventType("totally.unknown.event"),
-		"an unrecognised event type must be reported as uncatalogued, which is what makes the fallback observable rather than silent")
-	assert.False(t, IsCataloguedEventType(""),
-		"a blank event type is uncatalogued too")
-	assert.True(t, IsCataloguedEventType("transaction.applied"),
-		"a named member of the catalogue must be reported as catalogued")
-	assert.True(t, IsCataloguedEventType("bulk_transaction.applied"),
-		"a runtime-composed bulk transaction name must be reported as catalogued, because it is matched by prefix rather than enumerated")
-}
+// The catch-all arm's own test is not here. It used to be, in a duplicate whose prose
+// described blnk.system as internal and ungrantable — a property the code does not have and
+// that TestSubscriberGrantableEventCategories_IsEveryCategoryInTheCatalogue asserts the
+// opposite of, in this same file. The surviving
+// TestEventCategory_UnknownEventFallsBackToTheSystemCategory below states the contract
+// correctly and asserts a superset: the same two fallback answers plus IsCataloguedEventType,
+// which is what makes a routing omission observable rather than silent.
 
 // TestSubscriberGrantableEventCategories_CoversEveryCategory pins the allowlist the
 // subscriber authorization path and the ACL provisioning both consult.

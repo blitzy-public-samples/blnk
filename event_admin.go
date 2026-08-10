@@ -23,6 +23,7 @@ import (
 	"crypto/sha512"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"sort"
 	"strings"
@@ -279,6 +280,17 @@ type kafkaAdminAPI interface {
 	Metadata(ctx context.Context, req *kafka.MetadataRequest) (*kafka.MetadataResponse, error)
 	OffsetFetch(ctx context.Context, req *kafka.OffsetFetchRequest) (*kafka.OffsetFetchResponse, error)
 	ListOffsets(ctx context.Context, req *kafka.ListOffsetsRequest) (*kafka.ListOffsetsResponse, error)
+
+	// Fetch reads records from one partition. It is the only READ of message payloads in
+	// this seam, and it exists for the subscriber stream gateway: a key-scoped subscriber
+	// holds Describe and no Read at the broker, so Blnk reads on its behalf and returns
+	// only the records its partition-key prefix admits.
+	//
+	// It is deliberately on this seam and NOT on KafkaAdmin. KafkaAdmin is what the
+	// subscriber service depends on and what a dozen test doubles implement; widening it
+	// would make every one of them implement a record read they have no use for. The
+	// gateway takes its own one-method seam instead.
+	Fetch(ctx context.Context, req *kafka.FetchRequest) (*kafka.FetchResponse, error)
 }
 
 // Compile-time proof that the seam is a faithful subset of the real client. If a
@@ -2012,6 +2024,28 @@ type SubscriberProvisioningRequest struct {
 	// the right default for subscribers on networks Blnk does not control.
 	Host string
 
+	// KeyScoped says that the registry row this request was built from declares a
+	// partition-key prefix, and therefore that RECORD-LEVEL READ MUST BE WITHHELD.
+	//
+	// It is a bool rather than the prefix itself, and that is deliberate: the prefix's
+	// VALUE has no representation at the broker — Kafka's authorizer has no message-key
+	// dimension — while its PRESENCE decides the shape of the grant. Carrying the value
+	// here would invite somebody to look for a binding to put it in, and the only bindings
+	// that could hold it are wrong: a PREFIXED topic pattern would widen the grant to every
+	// topic sharing the prefix while appearing to narrow it.
+	//
+	// True produces topic Describe and consumer-group Read and NO topic Read, so every
+	// fetch such a principal attempts is refused by the broker with any client from any
+	// host. Its records are delivered by the subscriber stream gateway, which applies the
+	// prefix before a record leaves the process. False produces the ordinary grant, in
+	// which the topic list IS the boundary and the broker keeps all of it.
+	//
+	// It is set by NewSubscriberProvisioningRequest from the row, never by a caller
+	// choosing a boundary: a request that could ask for record access on a key-scoped
+	// subscriber would be a way to defeat the enforcement point through an ordinary
+	// authorized call.
+	KeyScoped bool
+
 	// DeferCompensation asks provisioning to REPORT a needed compensation instead of
 	// performing it. PERF-P09.
 	//
@@ -2027,6 +2061,34 @@ type SubscriberProvisioningRequest struct {
 	// state AUTH-01 forbids. It defaults to false so every caller that does not opt in keeps
 	// the inline, fully-compensated behaviour, which is what a CLI and a test want.
 	DeferCompensation bool
+
+	// DeclaredKeyScope carries the partition key prefix the REGISTRY ROW records, for the sole
+	// purpose of CHECKING KeyScoped against the row it claims to come from. It is never turned
+	// into a binding, because there is no binding to turn it into.
+	//
+	// # Why an unenforceable value is carried at all
+	//
+	// This layer is the last thing between a request and a live SCRAM credential with Read on
+	// real ledger topics, and Kafka's authorizer has no message-key dimension: a row recording a
+	// key prefix describes a boundary no ACL can express. What closes that gap is the NARROWING —
+	// KeyScoped withholds record-level Read, so the credential can fetch nothing and the stream
+	// gateway delivers the subscriber's records with the prefix applied before they leave the
+	// process.
+	//
+	// The narrowing is therefore the only thing that makes such a request safe, and this field is
+	// what makes its ABSENCE detectable here. NewSubscriberProvisioningRequest sets both from the
+	// same row, so the pair is consistent by construction; a request that names a scope while
+	// asking for the ordinary unnarrowed grant did not come from that constructor, and it is
+	// exactly the shape that would defeat the enforcement point through an ordinary authorized
+	// call. validate refuses it — which matters because this layer is exported and reachable from
+	// any caller: a CLI, a repair script, a future endpoint.
+	//
+	// It is deliberately NOT mapped onto a prefixed TOPIC pattern, which is the mistake it exists
+	// to prevent: a prefixed topic binding would WIDEN the grant to every topic sharing that
+	// string while appearing to narrow it.
+	//
+	// Empty is the ordinary case and provisioning proceeds. See validate.
+	DeclaredKeyScope string
 }
 
 // NewSubscriberProvisioningRequest maps a registry row and a freshly generated password
@@ -2037,24 +2099,25 @@ type SubscriberProvisioningRequest struct {
 // authorised topics — must all come from the same row, and a caller assembling the
 // request by hand could quietly pair one subscriber's principal with another's topics.
 //
-// PartitionKeyPrefix is deliberately NOT mapped, and cannot be: Kafka's authorizer has
-// no message-key dimension. There is no ACL that restricts a consumer to a slice of a
-// topic by key. Pretending to enforce it here — by, say, binding a prefixed TOPIC
-// pattern instead of a literal one — would be strictly worse than not enforcing it: it
-// would widen the topic grant to every topic sharing that prefix while appearing to
-// narrow it.
+// PartitionKeyPrefix's VALUE is deliberately not mapped, and cannot be: Kafka's authorizer
+// has no message-key dimension, so there is no ACL that restricts a consumer to a slice of
+// a topic by key. Pretending to enforce it here — by, say, binding a prefixed TOPIC pattern
+// instead of a literal one — would be strictly worse than not enforcing it: it would widen
+// the topic grant to every topic sharing that prefix while appearing to narrow it.
 //
-// Nor is the omission papered over by silence. A row recording a key prefix is provisioned
-// normally — the two ACL dimensions above are its whole broker-side boundary — and the
-// prefix itself is DELIVERED to the subscriber by the credential endpoint, inside the same
-// object that states partition_key_prefix_enforced is false. So the scope is honoured where
-// it can be, by the consumer, and this function's silence about it is accurate rather than
-// concealing: nothing here claims a binding that does not exist.
+// Its PRESENCE, however, is mapped, onto KeyScoped, and that is what makes the boundary
+// real. A row declaring a key scope is provisioned WITHOUT topic Read: it keeps Describe and
+// its consumer-group namespace, and the broker refuses every record fetch it attempts. The
+// records it is entitled to are delivered by the subscriber stream gateway, which applies
+// model.EventSubscriber.HasKeyAccess to each record's key before returning it.
 //
-// Issuance used to REFUSE such a row outright, which is why this comment once said nothing
-// could reach here carrying a key scope. Refusing implemented no part of the access model's
-// third scope; it withheld the credential instead. See the access-model note on
-// model.EventSubscriber.
+// The two readings this replaced were both wrong, in opposite directions. Issuance once
+// REFUSED any row carrying a prefix, which withheld the only credential that can exist for a
+// state the registry is designed to hold. Then it granted whole-topic Read and DISCLOSED that
+// the prefix was the consumer's to apply — accurate as a statement and absent as a boundary,
+// since a client that ignores the obligation reads every other ledger's records on the shared
+// category topic. Withholding record-level Read withholds exactly the access the prefix was
+// meant to deny, and nothing else. See the access-model note on model.EventSubscriber.
 //
 // Parameters:
 //   - subscriber *model.EventSubscriber: the registry row. A nil row yields a request
@@ -2076,6 +2139,13 @@ func NewSubscriberProvisioningRequest(subscriber *model.EventSubscriber, passwor
 		Password:            NewSubscriberSecret(password),
 		ConsumerGroupPrefix: subscriber.ConsumerGroupID,
 		Topics:              subscriber.AuthorizedTopics,
+		// Read from the SAME row as the topics, so a grant can never be built with one
+		// subscriber's topic list and another's enforcement decision.
+		KeyScoped: subscriber.RequiresGatewayDelivery(),
+		// The prefix itself travels beside the flag it decided, for no purpose other than
+		// letting validate confirm the two agree. Every binding is derived from KeyScoped;
+		// nothing reads this value to grant anything.
+		DeclaredKeyScope: subscriber.RequestedKeyScope(),
 	}
 }
 
@@ -2169,6 +2239,37 @@ type SubscriberProvisioningResult struct {
 	// property is assertable from the result, and so a caller logging the result records the
 	// fact rather than the assumption.
 	AuthorizerActive bool
+
+	// TopicRecordAccessGranted reports whether the bindings written include Read on the
+	// subscriber's topics — that is, whether this principal may fetch records DIRECTLY from
+	// the broker.
+	//
+	// False for a key-scoped subscriber, always, and that is the isolation boundary rather
+	// than a detail: such a principal is granted Describe and its consumer-group namespace
+	// and nothing else, so the broker refuses every fetch it attempts. Its records are
+	// delivered by the subscriber stream gateway.
+	//
+	// It is reported rather than inferred so a caller's log line and the credential response
+	// state what was actually written, and so a test can assert the grant shape from the
+	// result instead of re-deriving it.
+	TopicRecordAccessGranted bool
+
+	// KeyScopeBoundaryVerified reports that a key-scoped subscriber's partition-key boundary
+	// was CONFIRMED to be enforceable before this result was returned.
+	//
+	// It is true only when all three hold: the broker confirmed it enforces ACLs, the
+	// bindings reconciled for this principal contain no topic Read, and reconciliation found
+	// no foreign ALLOW binding widening the principal beyond them. Together those mean the
+	// only path a record can take to this subscriber is the gateway that applies its prefix.
+	//
+	// Provisioning REFUSES rather than returning false for a key-scoped subscriber — see
+	// ErrSubscriberKeyScopeUnenforced — so on a successful return this is true whenever the
+	// request was key-scoped. It is retained as a field so the property is assertable from
+	// the result, exactly as AuthorizerActive is, and so the refusal path can report it.
+	//
+	// It is false for a subscriber with NO key scope, because there is no key boundary to
+	// verify: the topic grant is the whole boundary and the broker keeps it.
+	KeyScopeBoundaryVerified bool
 
 	// CredentialWritten reports whether a SCRAM credential is believed to exist at the
 	// broker when this result was returned.
@@ -2363,6 +2464,16 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 	bindings := req.aclEntries()
 
 	reconciliation, err := a.reconcileSubscriberACLs(ctx, principal, bindings)
+
+	// SEC-06: a key-scoped subscriber's boundary is VERIFIED before a password can be
+	// returned, and the verdict is assigned to the SAME err the reconciliation reports through
+	// — so a refusal here takes the AUTH-01 compensation path below and the credential that
+	// was just written is revoked. Verifying after the response would be verifying nothing:
+	// the secret would already be in the caller's hands.
+	if err == nil {
+		err = verifyKeyScopeBoundary(req, bindings, reconciliation, result.AuthorizerActive)
+	}
+
 	if err != nil {
 		// AUTH-01: the credential exists and its boundary does not. That combination is the
 		// one state provisioning must never leave behind, because the principal can
@@ -2395,6 +2506,12 @@ func (a *KafkaAdminClient) ProvisionSubscriberPrincipal(
 
 	result.ACLBindings = len(bindings)
 	result.ACLBindingsRemoved = reconciliation.Removed
+	// Read back off the bindings that were actually reconciled, not off the request, so the
+	// result describes the grant the broker now holds.
+	result.TopicRecordAccessGranted = bindingsGrantTopicRead(bindings)
+	// True only for a key-scoped request, and by this line the verification above has already
+	// passed — provisioning refuses rather than reaching here unverified.
+	result.KeyScopeBoundaryVerified = req.KeyScoped
 	// Deny bindings only. A foreign ALLOW made reconcileSubscriberACLs return an error above,
 	// so a successful provisioning is by construction one with no widening binding on the
 	// principal — which is what makes the issuance response's enforced-access declaration true
@@ -2522,7 +2639,64 @@ func (r SubscriberProvisioningRequest) validate() error {
 		return err
 	}
 
+	if err := r.validateKeyScope(); err != nil {
+		return err
+	}
+
 	return validateSCRAMPassword(r.Password.reveal())
+}
+
+// validateKeyScope refuses a request that declares a key scope it does not narrow the grant for.
+//
+// # What is actually dangerous here
+//
+// Kafka's authorizer evaluates resources and has no message-key dimension, so no ACL can express
+// a partition-key prefix. A credential minted with the ORDINARY grant for a row that records one
+// therefore reads EVERY record on every granted topic — other ledgers' and other subscribers'
+// included — while the row it came from says the subscriber may see only the records whose key
+// carries one prefix. Disclosing the prefix to the holder does not close that gap either: a
+// client-side filter is a convention, and the party asked to honour it is the one holding the
+// credential.
+//
+// What closes it is KeyScoped: record-level Read is withheld, every fetch such a principal
+// attempts is refused by the broker from any client on any host, and the subscriber's records are
+// delivered by the stream gateway with the prefix applied first. So the request that must be
+// refused is not the key-scoped one — it is the one that names a scope while asking for the
+// unnarrowed grant.
+//
+// # Why the check is here as well as in the service
+//
+// NewSubscriberProvisioningRequest sets both fields from one row, so it cannot produce that pair.
+// This function is exported, though, and reachable from any caller — a CLI, a repair script, a
+// future endpoint — and a request assembled by hand is precisely how the enforcement point would
+// be defeated through an ordinary authorized call. The service layer's own guard,
+// requireProvisionableKeyScope, refuses a scope that NOTHING enforces before a secret exists;
+// this one refuses a scope this request would not enforce, at the boundary that talks to the
+// broker.
+//
+// # What it does not do
+//
+// It does not attempt to enforce the prefix, and it must not: the only binding shaped anything
+// like a key scope is a PREFIXED topic pattern, which matches topic NAMES and would widen the
+// grant to every topic sharing the string while appearing to narrow it.
+//
+// Returns:
+//   - error: a refusal naming the prefix and the missing narrowing, otherwise nil.
+func (r SubscriberProvisioningRequest) validateKeyScope() error {
+	scope := strings.TrimSpace(r.DeclaredKeyScope)
+	if scope == "" || r.KeyScoped {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"kafka admin: refusing to provision subscriber %q, whose registry row records the partition "+
+			"key prefix %q while this request asks for the ordinary grant; Kafka's authorizer has no "+
+			"message-key dimension, so the credential would hold Read on every record of every "+
+			"authorised topic and the registry would describe a narrower boundary than exists. Build "+
+			"the request with NewSubscriberProvisioningRequest, which withholds record-level Read for "+
+			"a key-scoped row, or clear the prefix to accept whole-topic access",
+		strings.TrimSpace(r.SubscriberID), scope,
+	)
 }
 
 // validateTopics refuses any topic outside the subscriber-grantable allowlist.
@@ -2710,12 +2884,40 @@ func (r SubscriberProvisioningRequest) normalizedTopics() []string {
 //	Topic  <each authorised topic>  LITERAL   Describe  Allow  — see its partitions
 //	Group  <consumer group prefix>  PREFIXED  Read      Allow  — join and commit
 //
-// Kafka's own implication rules make Read imply Describe on the same resource, so the
-// topic Describe binding is technically redundant, and the group Read binding already
-// implies the group Describe that FindCoordinator and OffsetFetch require. Describe is
-// nonetheless requested explicitly on topics so that the grant is auditable from the
-// binding list alone, without the reader having to know the implication table. The
-// redundancy is deliberate and costs one binding per topic.
+// Kafka's own implication rules make Read imply Describe on the same resource, so for a
+// subscriber that HAS topic Read the Describe binding is technically redundant, and the group
+// Read binding already implies the group Describe that FindCoordinator and OffsetFetch
+// require. Describe is nonetheless requested explicitly on topics so that the grant is
+// auditable from the binding list alone, without the reader having to know the implication
+// table. The redundancy is deliberate and costs one binding per topic — and for a key-scoped
+// subscriber it is not redundant at all, because Describe is then the ONLY topic operation
+// granted.
+//
+// # KEY-SCOPED SUBSCRIBERS ARE GRANTED NO TOPIC READ, and that is the isolation boundary
+//
+// When the request is KeyScoped the Read binding is omitted from every topic. The row asks
+// for a narrower boundary than a whole topic — records whose key carries a given prefix — and
+// Kafka's authorizer cannot express it, so granting Read anyway would grant the whole topic
+// while the registry, the response and the runbook all described something smaller. That is
+// what this omission ends: such a principal can list its topics and their offsets, can join
+// its own consumer group, and CANNOT FETCH A SINGLE RECORD, with any client, from any host.
+//
+// Its records are delivered by the subscriber stream gateway, which reads the shared topic
+// with Blnk's own identity and applies the recorded prefix before returning anything. The
+// grant here and that filter are the two halves of one boundary: withholding Read is what
+// makes the gateway the only path, and the gateway is what stops the withholding from being a
+// dead end.
+//
+// The group binding is retained for such a subscriber even though it cannot consume from the
+// broker, and deliberately: the namespace is RESERVED by that binding, so no other principal
+// can take it, and clearing the row's key scope later restores direct consumption without
+// having to re-reserve anything.
+//
+// THOSE TWO DIMENSIONS ARE THE WHOLE BOUNDARY, and that is why a request carrying a
+// declared key scope never reaches this function: validate refuses it. A topic granted
+// LITERAL Read is readable IN FULL, whatever key each record carries, so there is no
+// binding here that could confine a subscriber to one ledger's records — and the boundary
+// this list describes must be the same width as the registry row it came from.
 //
 // Returns:
 //   - []kafka.ACLEntry: the bindings, in a deterministic order — all bindings for the
@@ -2727,13 +2929,20 @@ func (r SubscriberProvisioningRequest) aclEntries() []kafka.ACLEntry {
 	topics := r.normalizedTopics()
 	groupPrefix := r.consumerGroupPrefix()
 
-	entries := make([]kafka.ACLEntry, 0, len(topics)*2+1)
-
-	for _, topic := range topics {
-		for _, operation := range []kafka.ACLOperationType{
+	// The topic operations this grant is made of. Describe is always present; Read is present
+	// only when the boundary the row describes is one the broker can keep in full.
+	topicOperations := []kafka.ACLOperationType{kafka.ACLOperationTypeDescribe}
+	if !r.KeyScoped {
+		topicOperations = []kafka.ACLOperationType{
 			kafka.ACLOperationTypeRead,
 			kafka.ACLOperationTypeDescribe,
-		} {
+		}
+	}
+
+	entries := make([]kafka.ACLEntry, 0, len(topics)*len(topicOperations)+1)
+
+	for _, topic := range topics {
+		for _, operation := range topicOperations {
 			entries = append(entries, kafka.ACLEntry{
 				ResourceType:        kafka.ResourceTypeTopic,
 				ResourceName:        topic,
@@ -4075,6 +4284,141 @@ var ErrForeignACLGrantsAccess = errors.New(
 	"kafka admin: the principal holds ACL bindings Blnk did not create that grant access beyond its " +
 		"recorded authorization, so no subscriber credential may be issued",
 )
+
+// ErrSubscriberKeyScopeUnenforced reports that a subscriber recording a partition-key prefix
+// could not be provisioned with a boundary that actually keeps it, so no credential may be
+// issued.
+//
+// It is the third member of the family above, and it describes the third way an authorization
+// boundary can be absent. With ErrAuthorizerNotEnforcing the broker would not enforce the
+// bindings at all; with ErrForeignACLGrantsAccess the bindings themselves say more than the
+// registry does; here the bindings Blnk itself was about to write would have granted
+// record-level Read to a principal whose row asks for less than a whole topic.
+//
+// That combination is exactly the disclosure this release closes: whole-topic Read handed to a
+// key-scoped subscriber lets it consume every other ledger's records on the shared category
+// topic, whatever the response says about the prefix. A key-scoped subscriber is therefore
+// granted Describe and its consumer-group namespace and no topic Read, and its records are
+// delivered by the subscriber stream gateway, which applies the prefix before returning
+// anything. If for any reason that shape cannot be established — the grant still carries Read,
+// or the broker's enforcement is unconfirmed — issuance FAILS rather than returning a password
+// whose isolation nobody verified.
+//
+// It is a sentinel for the same reasons its siblings are: the subscriber service, the API layer
+// and a test all recognise the refusal without matching message text.
+var ErrSubscriberKeyScopeUnenforced = errors.New(
+	"kafka admin: a subscriber recording a partition-key prefix must be granted no record-level " +
+		"Read, so that Blnk's subscriber stream gateway is the only path its records can take; the " +
+		"boundary could not be established, so no subscriber credential may be issued",
+)
+
+// bindingsGrantTopicRead reports whether a desired binding set includes Read on a TOPIC.
+//
+// It answers the one question that decides whether a principal can fetch records at all, and it
+// is written over the bindings rather than over the request so that the answer describes what
+// was, or is about to be, written at the broker. Deriving it from the request instead would make
+// this a restatement of KeyScoped, and a restatement cannot catch the case it exists for: a
+// binding set that does not match the decision the request asked for.
+//
+// Only ALLOW is considered. A DENY on a topic Read is a narrowing Blnk never provisions — and if
+// an operator has added one, it takes access away rather than granting it, so it must not be
+// read here as evidence of a grant.
+//
+// Parameters:
+//   - bindings []kafka.ACLEntry: the desired set. Empty answers false, which is correct: a
+//     principal granted nothing can read nothing.
+//
+// Returns:
+//   - bool: true when any ALLOW Read on a Topic resource is present.
+func bindingsGrantTopicRead(bindings []kafka.ACLEntry) bool {
+	for _, binding := range bindings {
+		if binding.ResourceType == kafka.ResourceTypeTopic &&
+			binding.Operation == kafka.ACLOperationTypeRead &&
+			binding.PermissionType == kafka.ACLPermissionTypeAllow {
+			return true
+		}
+	}
+
+	return false
+}
+
+// verifyKeyScopeBoundary is SEC-06: the check that a key-scoped subscriber's partition-key
+// boundary is real before its credential can be returned.
+//
+// # Why a check at all, when aclEntries already omits the Read binding
+//
+// Because the omission is one line in a function several callers away from the response that
+// promises the boundary, and the cost of that line regressing is silent: the credential would be
+// issued, the response would declare the prefix enforced at the gateway, and the principal would
+// hold whole-topic Read the whole time. This is the assertion that turns "the code that builds
+// the grant is correct" into "the grant that was written is correct", made at the moment the
+// password becomes returnable and against the bindings that were actually reconciled.
+//
+// # The three facts it requires, and why each is necessary
+//
+//   - THE BINDINGS CARRY NO TOPIC READ. Without this the broker admits the principal to the
+//     whole shared topic and the gateway is one path among two.
+//   - ACL ENFORCEMENT IS CONFIRMED. A broker with no authorizer permits every request from
+//     every principal, so a grant that omits Read grants nothing less than one that includes
+//     it. requireEnforcedAuthorizer has already refused such a broker before anything was
+//     written; this re-reads the fact off the result so the verification stands on its own.
+//   - NO FOREIGN ALLOW BINDING. reconcileSubscriberACLs refuses those outright, so this is
+//     belt-and-braces — but a hand-made ALLOW Read on the topic would restore exactly the
+//     access being withheld, and a check that ignored it would verify the wrong set.
+//
+// A request with NO key scope is verified vacuously: there is no key boundary to keep, the topic
+// grant is the whole boundary, and the broker enforces all of it.
+//
+// Parameters:
+//   - req SubscriberProvisioningRequest: the request, read for KeyScoped only.
+//   - bindings []kafka.ACLEntry: the desired bindings that were reconciled.
+//   - reconciliation SubscriberACLReconciliation: what reconciliation observed at the broker.
+//   - authorizerActive bool: whether the broker confirmed it enforces ACLs.
+//
+// Returns:
+//   - error: nil when the boundary holds; otherwise an error wrapping
+//     ErrSubscriberKeyScopeUnenforced naming which of the three facts failed.
+func verifyKeyScopeBoundary(
+	req SubscriberProvisioningRequest,
+	bindings []kafka.ACLEntry,
+	reconciliation SubscriberACLReconciliation,
+	authorizerActive bool,
+) error {
+	if !req.KeyScoped {
+		return nil
+	}
+
+	if bindingsGrantTopicRead(bindings) {
+		return fmt.Errorf(
+			"%w: the grant reconciled for principal %q includes Read on a topic, so the broker "+
+				"would admit it to every record on that shared topic regardless of the recorded "+
+				"partition-key prefix",
+			ErrSubscriberKeyScopeUnenforced,
+			sanitizeLogValue(reconciliation.Principal, maxLoggedFilterLength),
+		)
+	}
+
+	if !authorizerActive {
+		return fmt.Errorf(
+			"%w: the broker's ACL enforcement is not confirmed for principal %q, so withholding "+
+				"Read withholds nothing",
+			ErrSubscriberKeyScopeUnenforced,
+			sanitizeLogValue(reconciliation.Principal, maxLoggedFilterLength),
+		)
+	}
+
+	if len(reconciliation.ForeignAllow) > 0 {
+		return fmt.Errorf(
+			"%w: principal %q carries %d ALLOW ACL binding(s) Blnk did not provision, which may "+
+				"restore the record access this boundary withholds",
+			ErrSubscriberKeyScopeUnenforced,
+			sanitizeLogValue(reconciliation.Principal, maxLoggedFilterLength),
+			len(reconciliation.ForeignAllow),
+		)
+	}
+
+	return nil
+}
 
 // clock returns the time source, defaulting to time.Now.
 //
@@ -6586,28 +6930,67 @@ func ReconcileAgainstOutbox(
 // broker is dialled, and reporting them without the offsets is a valid, documented answer.
 const eventOffsetReadTimeout = 10 * time.Second
 
-// EventOffsetInclusion is how a statistics read wants the BROKER side treated.
+// EventOffsetInclusion is how a statistics read wants the BROKER side treated — and, because
+// the two are one decision, whether the DISPATCHED HISTORY is counted at all.
 //
 // The three postures exist because the broker half of the reconciliation is
 // optional in a way the outbox half is not: a deployment with no brokers configured
 // is a legitimate steady state, so an unreadable broker is ordinarily an enrichment
 // that is absent rather than a failure. A caller who specifically asked for that
 // half needs the opposite, and a caller who wants the counts cheaply needs neither.
+//
+// # PERF-M05/M02: why ONE posture governs both halves, and why Skipped is the zero value
+//
+// The dispatched count and the broker offsets are wanted by exactly the same caller and by no
+// other: the only reason to know how many rows were dispatched in an interval is to compare it
+// against what the broker recorded over that interval. Every other caller — the drain poll in
+// the load harness, a health check, an operator asking what is outstanding — wants the
+// unresolved inventory and nothing else.
+//
+// So the posture selects the whole reading rather than half of it. Skipped counts the
+// unresolved inventory alone, which is bounded by operation and index-only; the other two
+// additionally count the dispatched history, which at 500 events per second is 43.2 million
+// index entries for a day. A separate `include_history` flag was the obvious alternative and
+// was rejected: two flags that are always set together are two flags that can disagree, and
+// the disagreement that matters here is the cheap-looking call that quietly does the expensive
+// half.
+//
+// Skipped is the ZERO VALUE, so a Go caller that constructs the type without thinking and an
+// HTTP caller that omits `include_offsets` get the same cheap reading. The previous zero value
+// was best-effort, which meant the default was a broker round trip plus a history-sized count
+// — paid, in the load harness, on every quiescence poll of the drain loop.
 type EventOffsetInclusion int
 
 const (
-	// EventOffsetsBestEffort reads the broker when one is configured and omits the
-	// broker-side fields on any failure, logging the reason. It is the zero value and
-	// the posture the daily reconciliation runbook relies on.
-	EventOffsetsBestEffort EventOffsetInclusion = iota
+	// EventOffsetsSkipped makes no broker round trip at all and counts no dispatched
+	// history: the answer is the exact unresolved inventory. It is the ZERO VALUE and the
+	// posture every routine caller wants.
+	EventOffsetsSkipped EventOffsetInclusion = iota
 
-	// EventOffsetsRequired makes a failure to read the broker a typed error, because
-	// the caller asked specifically for the half of the reconciliation that failed.
+	// EventOffsetsBestEffort counts the dispatched history, reads the broker when one is
+	// configured, and omits the broker-side fields on any failure, logging the reason. It is
+	// the posture the daily reconciliation runbook relies on, and it must be asked for.
+	EventOffsetsBestEffort
+
+	// EventOffsetsRequired is EventOffsetsBestEffort except that a failure to read the
+	// broker becomes a typed error, because the caller asked specifically for the half of
+	// the reconciliation that failed.
 	EventOffsetsRequired
-
-	// EventOffsetsSkipped makes no broker round trip at all.
-	EventOffsetsSkipped
 )
+
+// countsDispatchedHistory reports whether this posture counts the unbounded dispatched
+// population as well as the unresolved inventory.
+//
+// It is a method rather than an inline comparison at the two places that need it so that the
+// coupling stated on EventOffsetInclusion — that the dispatched count and the broker read are
+// one decision — is enforced in one place. Two inline comparisons is how the response comes to
+// claim a history figure that the query never produced.
+//
+// Returns:
+//   - bool: true for every posture that measures the broker side.
+func (i EventOffsetInclusion) countsDispatchedHistory() bool {
+	return i != EventOffsetsSkipped
+}
 
 // EventOutboxStatistics is the whole state of the event pipeline at one instant: the
 // outbox side always, the broker side and the verdict when they could be measured.
@@ -6651,6 +7034,16 @@ type EventOutboxStatistics struct {
 	WindowStart time.Time
 	Window      time.Duration
 
+	// DispatchedHistoryCounted reports whether the dispatched population was counted at all.
+	//
+	// It is a companion flag for the same reason AuditRead and OffsetsRead are: an absent
+	// `dispatched` key means "no rows in the window" and "never counted" indistinguishably,
+	// because GROUP BY produces only rows that exist — and a reconciliation that reads the
+	// second as the first concludes that nothing was published. False whenever the posture
+	// skipped the broker side, which is the cheap reading every routine caller takes
+	// (PERF-M05).
+	DispatchedHistoryCounted bool
+
 	// Audit is the outbox side of the reconciliation, classified against the very
 	// partition windows the broker reported. Meaningful only when AuditRead.
 	Audit model.EventRecordIntervalAudit
@@ -6687,9 +7080,18 @@ type EventOutboxStatistics struct {
 // anything, and depending on a two-method interface rather than on the whole
 // IDataSource is what states that at the type level instead of in a comment.
 type eventStatisticsStore interface {
-	// CountEventOutboxByStatus returns the per-status aggregate. The instant bounds the
-	// unbounded dispatched population only; every other status is counted in full however
-	// short the window, because a row stuck for days must not vanish from a one-day reading.
+	// CountUnresolvedEventOutbox returns the per-status aggregate for every NON-DISPATCHED
+	// status, exact and unwindowed. It is what a EventOffsetsSkipped read answers with, and
+	// it is the whole reading whenever the broker side is not being measured (PERF-M05):
+	// its cost is set by how much work is outstanding rather than by how much history the
+	// table holds.
+	CountUnresolvedEventOutbox(ctx context.Context) (map[string]int64, error)
+
+	// CountEventOutboxByStatus returns the same aggregate PLUS the dispatched history. The
+	// instant bounds the unbounded dispatched population only; every other status is counted
+	// in full however short the window, because a row stuck for days must not vanish from a
+	// one-day reading. It is read only when the broker side is being measured, because the
+	// dispatched figure exists to be compared against the broker's records.
 	CountEventOutboxByStatus(ctx context.Context, since time.Time) (map[string]int64, error)
 
 	// AuditEventRecordsInIntervals returns the outbox side of the zero-loss
@@ -6811,13 +7213,31 @@ const unfinalizedBulkBatchGrace = 15 * time.Minute
 // maxEventStatisticsWindow is the longest one accepted.
 //
 // One day, because that is the period the zero-loss reconciliation runbook reconciles over and
-// the period an operator asks "what happened today" about. A week as the ceiling: long enough
-// for an operator investigating something that started last weekend, short enough that the
-// bounded queries stay bounded, and well inside any sensible broker retention — which is what
-// keeps the reconciliation conclusive rather than truncated.
+// the period an operator asks "what happened today" about.
+//
+// # PERF-M05: the ceiling is the default, so the window may only be NARROWED
+//
+// It used to be a week, on the reasoning that a week is "long enough for an operator
+// investigating something that started last weekend, short enough that the bounded queries stay
+// bounded". The second half of that does not hold at the target rate. The window bounds exactly
+// one figure — the exact COUNT of the dispatched population — and at 500 events per second a day
+// of it is 43.2 million index entries while a week is 302.4 million. A count of 302 million
+// entries is not servable inside any sane request timeout, so permitting it did not buy the
+// operator a wider retrospective: it bought them a timeout, and the database the scan anyway.
+//
+// And a wider window bought very little even when it completed. Everything an operator acts on —
+// the pending backlog, the rows in flight, the dead-letter inventory, the two repair legs — is
+// counted exactly and for ALL TIME regardless of the window, and the zero-loss audit is bounded
+// by outbox retention rather than by this parameter. The only figure that grew with the window
+// was a historical one.
+//
+// So the ceiling is the daily reconciliation period, and the parameter's remaining job is to
+// NARROW it: `?window=15m` for a twenty-minute incident is the case it exists for, and that case
+// is unaffected. A retrospective longer than a day is served by the dead-letter inventory and
+// the audit, both of which are retention-bounded and neither of which reads this window.
 const (
 	defaultEventStatisticsWindow = 24 * time.Hour
-	maxEventStatisticsWindow     = 7 * 24 * time.Hour
+	maxEventStatisticsWindow     = defaultEventStatisticsWindow
 )
 
 // normalizeEventStatisticsWindow bounds a requested window.
@@ -6924,7 +7344,14 @@ func eventOutboxStatistics(
 	// dispatched, the only one that grows without bound, is counted from here.
 	windowStart := time.Now().UTC().Add(-normalizeEventStatisticsWindow(window))
 
-	counts, err := store.CountEventOutboxByStatus(ctx, windowStart)
+	// WHICH AGGREGATE, decided by the posture and by nothing else (PERF-M05). Skipped takes the
+	// unresolved inventory alone — exact, unwindowed, bounded by outstanding work — and the two
+	// broker-reading postures additionally count the dispatched history, because that figure
+	// exists only to be compared against what the broker recorded. See EventOffsetInclusion for
+	// why this is one decision rather than two flags.
+	countsHistory := inclusion.countsDispatchedHistory()
+
+	counts, err := readEventStatusCounts(ctx, store, windowStart, countsHistory)
 	if err != nil {
 		span.RecordError(err)
 
@@ -6932,11 +7359,12 @@ func eventOutboxStatistics(
 	}
 
 	statistics := EventOutboxStatistics{
-		GeneratedAt:        time.Now().UTC(),
-		CountsByStatus:     counts,
-		UnreportedStatuses: unreportedEventOutboxStatuses(counts),
-		WindowStart:        windowStart,
-		Window:             normalizeEventStatisticsWindow(window),
+		GeneratedAt:              time.Now().UTC(),
+		CountsByStatus:           counts,
+		UnreportedStatuses:       unreportedEventOutboxStatuses(counts),
+		WindowStart:              windowStart,
+		Window:                   normalizeEventStatisticsWindow(window),
+		DispatchedHistoryCounted: countsHistory,
 		// THE OWED EVENTS, read from PostgreSQL alongside the counts and never from the
 		// broker, so the figure is present in every posture — including the one that skips
 		// Kafka entirely and the one where the broker is unreachable, which is exactly when an
@@ -6957,9 +7385,10 @@ func eventOutboxStatistics(
 	span.SetAttributes(
 		attribute.Int("event_outbox.statuses_reported", len(counts)),
 		attribute.Int("event_outbox.statuses_unreported", len(statistics.UnreportedStatuses)),
+		attribute.Bool("event_outbox.dispatched_history_counted", countsHistory),
 	)
 
-	if inclusion == EventOffsetsSkipped {
+	if !countsHistory {
 		return statistics, nil
 	}
 
@@ -7034,6 +7463,37 @@ func eventOutboxStatistics(
 	}
 
 	return statistics, nil
+}
+
+// readEventStatusCounts reads whichever per-status aggregate the posture calls for.
+//
+// It exists so that the CHOICE is one expression in one place. The two aggregates return the
+// same shape and differ only in what they cost and what they cover, which is exactly the
+// situation in which a second call site drifts onto the expensive one — and the drift is
+// invisible in review, because both lines read as "count the outbox by status".
+//
+// Parameters:
+//   - ctx context.Context: cancels the aggregate.
+//   - store eventStatisticsStore: the repository seam. Must not be nil.
+//   - windowStart time.Time: the instant the dispatched arm counts from. Ignored when the
+//     dispatched arm is not being run.
+//   - includeHistory bool: true to count the unbounded dispatched population as well.
+//
+// Returns:
+//   - map[string]int64: counts by status. The `dispatched` key is present only when
+//     includeHistory and the window actually holds dispatched rows.
+//   - error: the repository's own typed error, unwrapped.
+func readEventStatusCounts(
+	ctx context.Context,
+	store eventStatisticsStore,
+	windowStart time.Time,
+	includeHistory bool,
+) (map[string]int64, error) {
+	if includeHistory {
+		return store.CountEventOutboxByStatus(ctx, windowStart)
+	}
+
+	return store.CountUnresolvedEventOutbox(ctx)
 }
 
 // producerAtomicityCensus reads the two pre-recorded intent censuses, and answers nil rather
@@ -7854,5 +8314,326 @@ func applyWindowToPartition(
 
 	if written := bound.end - start; written > 0 {
 		snapshot.WindowRecordCount += written
+	}
+}
+
+// ---------------------------------------------------------------------------------------
+// The record read — the one place Blnk reads message payloads back out of Kafka
+//
+// # Why an administrative client reads records at all
+//
+// A key-scoped subscriber is provisioned with Describe and NO Read on its topics, so the
+// broker refuses its every fetch. That refusal IS the isolation boundary — Kafka's
+// authorizer has no message-key dimension, so a grant narrow enough to express the
+// subscriber's prefix does not exist — and it leaves Blnk owing such a subscriber a way to
+// consume. The subscriber stream gateway is that way: it reads with Blnk's own credential
+// and returns only the records the subscriber's prefix admits.
+//
+// The read therefore lives here, beside the ACL grants it is the counterpart to, rather
+// than in a second Kafka client with its own transport and its own SASL handshake.
+// ---------------------------------------------------------------------------------------
+
+// TopicRecordFetch is one bounded read of one partition.
+//
+// Every bound is explicit and required. An unbounded read of a shared category topic is a
+// request whose cost is decided by however many records happen to be on the partition, which
+// is not a property any caller of this can know, so the type has no "read everything" shape
+// to reach for.
+type TopicRecordFetch struct {
+	// Topic is the fully-qualified topic to read. The gateway has already established that
+	// the requesting subscriber is authorised for it; this type performs no authorization.
+	Topic string
+
+	// Partition is the partition to read. Partitions are addressed one at a time because a
+	// subscriber's cursor is per partition — a page spanning partitions could not report a
+	// single resumable next offset.
+	Partition int
+
+	// Offset is where to start. Values at or above zero are absolute; the two Kafka
+	// sentinels are honoured, so kafka.FirstOffset reads from the earliest retained record
+	// and kafka.LastOffset from the end of the log.
+	Offset int64
+
+	// MaxRecords bounds how many records are returned. It is applied AFTER the broker
+	// answers, because Kafka bounds a fetch by bytes rather than by count.
+	MaxRecords int
+
+	// MaxBytes bounds the response the broker is asked to build. It is the bound that
+	// actually protects this process's memory, since a single oversized record can exceed
+	// any record count.
+	MaxBytes int64
+
+	// MaxWait is how long the broker may hold the request waiting for MinBytes to
+	// accumulate. It is what makes an empty partition answer promptly rather than at the
+	// broker's default.
+	MaxWait time.Duration
+}
+
+// FetchedRecord is one record as it came off the partition.
+//
+// Key and Value are COPIES of the bytes the reader produced, not views onto it. The reader
+// and its underlying connection buffer are released before this returns, so a view would
+// alias memory the client is free to reuse.
+type FetchedRecord struct {
+	// Offset is the record's position in the partition, which is what makes a page
+	// resumable.
+	Offset int64
+
+	// Key is the message key, verbatim. For Blnk's own events it is the partition key —
+	// the ledger id for a ledger-scoped event — which is exactly what a subscriber's
+	// partition-key prefix is matched against.
+	Key []byte
+
+	// Value is the message body, verbatim: the marshalled LedgerEvent envelope.
+	Value []byte
+
+	// Time is the record's timestamp as the broker reports it.
+	Time time.Time
+}
+
+// TopicRecordBatch is what one bounded read produced.
+type TopicRecordBatch struct {
+	// Topic and Partition echo what was read, so a batch is self-describing.
+	Topic     string
+	Partition int
+
+	// Records are in offset order, at most MaxRecords of them.
+	Records []FetchedRecord
+
+	// HighWatermark is the offset the next record produced will occupy, so a caller can
+	// tell "caught up" from "more to read" without a second round trip.
+	HighWatermark int64
+
+	// LogStartOffset is the earliest offset still retained, which is what tells a caller
+	// its cursor has fallen off the back of the log rather than merely being behind.
+	LogStartOffset int64
+
+	// Truncated reports that MaxRecords cut the batch short, so a caller knows more
+	// records are immediately available at NextOffset rather than inferring it from a full
+	// page.
+	Truncated bool
+}
+
+// NextOffset is the offset a caller should resume from.
+//
+// It is derived from what was SCANNED rather than from what a caller chose to keep, which is
+// the property the gateway depends on: a page in which every record was withheld by a key
+// scope still advances, so a subscriber cannot be stalled forever by records it is not
+// entitled to.
+//
+// Returns:
+//   - int64: one past the last record read; the requested offset when nothing was read and
+//     the request named an absolute one; the high watermark when nothing was read and the
+//     request named a sentinel.
+func (b TopicRecordBatch) NextOffset(requested int64) int64 {
+	if len(b.Records) > 0 {
+		return b.Records[len(b.Records)-1].Offset + 1
+	}
+
+	if requested >= 0 {
+		return requested
+	}
+
+	return b.HighWatermark
+}
+
+// FetchTopicRecords reads a bounded page of records from one partition.
+//
+// # What it does not do
+//
+// It does not authorise. The credential it reads with is Blnk's own and is wide enough to
+// read every category topic, so a caller that skipped the subscriber's topic and key checks
+// would be handed records the subscriber is not entitled to. Authorization belongs to the
+// gateway, which is the only caller.
+//
+// # Why the reader is drained and closed here
+//
+// kafka-go returns records through a RecordReader backed by the connection's read buffer.
+// Holding one past this call would hold that buffer, and reading a Bytes value after the
+// reader advances is undefined — so every key and value is copied out eagerly and the reader
+// is closed before returning, error or not.
+//
+// Parameters:
+//   - ctx context.Context: bounds the read. A cancelled or expired context is reported
+//     before the broker is touched.
+//   - req TopicRecordFetch: the topic, partition, offset and bounds to read within.
+//
+// Returns:
+//   - TopicRecordBatch: the records read and the partition's watermarks.
+//   - error: ErrKafkaAdminNotConfigured when no broker is configured, the broker's own
+//     error when it refused the read, or a wrapped transport failure.
+func (a *KafkaAdminClient) FetchTopicRecords(
+	ctx context.Context,
+	req TopicRecordFetch,
+) (_ TopicRecordBatch, err error) {
+	ctx, span := startKafkaAdminSpan(ctx, "fetch_topic_records")
+	defer span.End()
+	defer func() { failKafkaAdminSpan(span, err) }()
+
+	batch := TopicRecordBatch{Topic: req.Topic, Partition: req.Partition}
+	if err := a.ready(ctx); err != nil {
+		return batch, err
+	}
+
+	topic := strings.TrimSpace(req.Topic)
+	if topic == "" {
+		return batch, errors.New("kafka admin: a record read names no topic")
+	}
+
+	if req.MaxRecords <= 0 || req.MaxBytes <= 0 || req.MaxWait <= 0 {
+		return batch, fmt.Errorf(
+			"kafka admin: a record read of %q partition %d must be bounded: "+
+				"max_records=%d max_bytes=%d max_wait=%s",
+			topic, req.Partition, req.MaxRecords, req.MaxBytes, req.MaxWait,
+		)
+	}
+
+	response, err := a.client.Fetch(ctx, &kafka.FetchRequest{
+		Topic:     topic,
+		Partition: req.Partition,
+		Offset:    req.Offset,
+		// ONE BYTE, so the broker answers as soon as anything is available and MaxWait is a
+		// ceiling rather than a floor. A larger MinBytes would make a quiet partition hold
+		// the subscriber's request open for the full wait for no reason.
+		MinBytes: 1,
+		MaxBytes: req.MaxBytes,
+		MaxWait:  req.MaxWait,
+		// READ_COMMITTED. Blnk's producer is not transactional, so every record it writes is
+		// committed and the two isolation levels agree for its own topics — but a topic is a
+		// shared namespace and this is a subscriber-facing read, so the stricter level is the
+		// correct default: it can never disclose an aborted record, and it costs nothing here.
+		IsolationLevel: kafka.ReadCommitted,
+	})
+	if err != nil {
+		return batch, fmt.Errorf("kafka admin: fetching %q partition %d: %w", topic, req.Partition, err)
+	}
+
+	if response == nil {
+		return batch, fmt.Errorf(
+			"kafka admin: fetching %q partition %d returned no response and no error",
+			topic, req.Partition,
+		)
+	}
+
+	batch.HighWatermark = response.HighWatermark
+	batch.LogStartOffset = response.LogStartOffset
+
+	// THE READER IS RELEASED WHATEVER HAPPENS, including on the broker-error path below,
+	// because a refused fetch still returns a reader on some client versions.
+	defer closeRecordReader(response.Records)
+
+	// The broker's own verdict arrives INSIDE the response — this is where
+	// TOPIC_AUTHORIZATION_FAILED appears — so it is returned as an error rather than read
+	// past. A caller that ignored it would report an empty page for a refused read, which
+	// reads as "caught up".
+	if response.Error != nil {
+		return batch, fmt.Errorf(
+			"kafka admin: the broker refused a read of %q partition %d: %w",
+			topic, req.Partition, response.Error,
+		)
+	}
+
+	records, truncated, err := readFetchedRecords(response.Records, req.MaxRecords)
+	if err != nil {
+		return batch, fmt.Errorf("kafka admin: reading %q partition %d: %w", topic, req.Partition, err)
+	}
+
+	batch.Records = records
+	batch.Truncated = truncated
+
+	return batch, nil
+}
+
+// readFetchedRecords drains at most limit records out of a reader, copying every key and
+// value.
+//
+// io.EOF is the reader's normal end and is not an error. Anything else is: a partial read
+// would otherwise be indistinguishable from the end of the partition, and a caller would
+// advance its cursor past records it never saw.
+//
+// Parameters:
+//   - reader kafka.RecordReader: the reader the response carried. A nil reader yields no
+//     records, which is what an empty partition produces.
+//   - limit int: the maximum number of records to read.
+//
+// Returns:
+//   - []FetchedRecord: the records read, in the order the reader produced them.
+//   - bool: true when the limit stopped the read with records still available.
+//   - error: a read failure that is not the reader's end.
+func readFetchedRecords(reader kafka.RecordReader, limit int) ([]FetchedRecord, bool, error) {
+	if reader == nil {
+		return nil, false, nil
+	}
+
+	records := make([]FetchedRecord, 0, limit)
+	for {
+		record, err := reader.ReadRecord()
+		if errors.Is(err, io.EOF) {
+			return records, false, nil
+		}
+		if err != nil {
+			return records, false, err
+		}
+		if record == nil {
+			return records, false, nil
+		}
+
+		if len(records) == limit {
+			// THE LIMIT, reported rather than silently applied. There is at least one more
+			// record on the partition at NextOffset, and a caller told otherwise would wait
+			// for a poll interval it does not need to wait for.
+			return records, true, nil
+		}
+
+		key, err := readRecordBytes(record.Key)
+		if err != nil {
+			return records, false, fmt.Errorf("reading the key of offset %d: %w", record.Offset, err)
+		}
+
+		value, err := readRecordBytes(record.Value)
+		if err != nil {
+			return records, false, fmt.Errorf("reading the value of offset %d: %w", record.Offset, err)
+		}
+
+		records = append(records, FetchedRecord{
+			Offset: record.Offset,
+			Key:    key,
+			Value:  value,
+			Time:   record.Time,
+		})
+	}
+}
+
+// readRecordBytes materialises one kafka.Bytes value, tolerating a nil.
+//
+// A nil key is ordinary — Blnk always sets one, but a shared topic may carry records from
+// elsewhere — and it is NOT the same as an empty key for a key-scoped subscriber: an empty
+// key carries no prefix, so such a record is withheld rather than delivered. Returning nil
+// bytes rather than an error is what lets that decision be made by the authorization rule
+// instead of failing the whole page.
+func readRecordBytes(value kafka.Bytes) ([]byte, error) {
+	if value == nil {
+		return nil, nil
+	}
+
+	return kafka.ReadAll(value)
+}
+
+// closeRecordReader releases a reader that holds a connection buffer.
+//
+// Closability is discovered rather than assumed: kafka-go's readers implement io.Closer, but
+// the empty reader a refused fetch returns does not have to, and the interface the response
+// declares does not include Close.
+func closeRecordReader(reader kafka.RecordReader) {
+	closer, ok := reader.(io.Closer)
+	if !ok || closer == nil {
+		return
+	}
+
+	if err := closer.Close(); err != nil {
+		kafkaErrorEntry("fetch_record_reader_close", err).Debug(
+			"kafka admin: a record reader did not close cleanly, so its connection buffer is " +
+				"returned to the pool by the transport instead",
+		)
 	}
 }

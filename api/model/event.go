@@ -548,8 +548,34 @@ type EventOutboxStatsResponse struct {
 	// reach it.
 	WebhookPending int64 `json:"webhook_pending"`
 
-	// Dispatched counts rows the broker has acknowledged. Terminal.
-	Dispatched int64 `json:"dispatched"`
+	// Dispatched counts rows the broker has acknowledged, inside the reported window.
+	// Terminal.
+	//
+	// It is a POINTER with omitempty because it is the one count here that is not always
+	// taken (PERF-M05). Dispatched is the only unbounded population in the outbox — 43.2
+	// million rows a day at the target rate — so counting it exactly is a deliberate
+	// operation rather than a routine one, and it is performed only for a request that asked
+	// for the broker side with `include_offsets=true`. Every other count above is exact and
+	// complete for all time on every request.
+	//
+	// Emitting a zero would be the one misreading a zero-loss check cannot survive: "nothing
+	// was dispatched today" and "the dispatched population was not counted" are opposite
+	// findings, and a reconciliation that read the second as the first would report total
+	// loss on a perfectly healthy pipeline. The key is therefore ABSENT rather than zero when
+	// the count was not taken, and DispatchedHistoryCounted below says so explicitly.
+	Dispatched *int64 `json:"dispatched,omitempty"`
+
+	// DispatchedHistoryCounted reports whether the dispatched count above was taken.
+	//
+	// It is emitted ALWAYS, including when false, and it is the companion flag that makes
+	// the omission above readable rather than merely safe: a client that finds no
+	// `dispatched` key can distinguish "not counted" from a serialisation it does not
+	// understand, and a client written before this field existed sees the key it expects
+	// only when the figure behind it is real.
+	//
+	// It is false whenever `include_offsets` was absent or false, which is the cheap reading
+	// every routine caller should take, and true whenever it was true.
+	DispatchedHistoryCounted bool `json:"dispatched_history_counted"`
 
 	// Failed counts rows whose retry budget is spent but which have not yet
 	// been written to a dead-letter topic.
@@ -1885,11 +1911,16 @@ type SubscriberResponse struct {
 	RevocationPendingReason string `json:"revocation_pending_reason,omitempty"`
 }
 
-// Enforcement dimensions reported by SubscriberEnforcedAccess.EnforcedBy. They name what
-// Kafka's authorizer actually evaluates on every request a subscriber makes.
+// Enforcement dimensions reported by SubscriberEnforcedAccess.EnforcedBy. They name the
+// dimensions Blnk enforces on every request a subscriber makes — two of them at the broker's
+// own authorizer, and one at Blnk's subscriber stream gateway.
 const (
 	// EnforcementDimensionTopic is Read and Describe bound to an EXACT topic name, so a
 	// topic absent from the grant is refused at the broker.
+	//
+	// For a KEY-SCOPED subscriber the same dimension is bound to Describe only: record access
+	// is withheld from the broker entirely so that the gateway is the only path records can
+	// take. The dimension is enforced either way, which is why it is listed either way.
 	EnforcementDimensionTopic = "topic"
 
 	// EnforcementDimensionConsumerGroup is Read bound to the subscriber's consumer-group
@@ -1898,80 +1929,85 @@ const (
 	EnforcementDimensionConsumerGroup = "consumer_group"
 )
 
-// SubscriberEnforcedAccess declares, inside the response body, which parts of a subscriber's
-// recorded access model the broker actually enforces.
+// SubscriberEnforcedAccess declares, inside the response body, WHERE each part of a
+// subscriber's recorded access model is enforced.
 //
 // # Why the API states this rather than leaving it to documentation
 //
 // A subscriber's record carries three access-shaped values: authorized_topics, a consumer
-// group, and partition_key_prefix. Two of them are ACL bindings. The third is not, and cannot
-// be: Kafka's authorizer has no message-key dimension, so there is no ACL that confines a
-// consumer to a slice of a topic by key. A subscriber granted a topic reads EVERY record on
-// that topic whatever its key prefix says.
+// group, and partition_key_prefix. Two of them are ACL bindings the broker evaluates. The
+// third cannot be: Kafka's authorizer has no message-key dimension, so no ACL confines a
+// consumer to a slice of a topic by key.
 //
 // An integrator reading a response that lists all three together has no way to tell which is
-// which, and the plausible wrong conclusion is the dangerous one: that two subscribers sharing
-// a topic with different key prefixes cannot see each other's events. They can. Building a
-// tenancy boundary on that belief would expose every tenant's ledger events to every other
-// tenant on the same topic.
+// which, and for a long time the plausible wrong conclusion was also the true one in the worst
+// sense: two subscribers sharing a topic with different key prefixes really COULD see each
+// other's events, because the platform granted both whole-topic Read and asked them to filter.
+// This object exists so nobody has to guess, and — since the correction described below — so
+// that the answer it gives is an enforced boundary rather than a request for cooperation.
 //
-// So the enforced dimensions are enumerated positively, in the body, and the one question whose
-// wrong answer is a disclosure bug is answered outright by PartitionKeyPrefixEnforced. A client
-// deciding whether key filtering is a security control reads a false, or scans EnforcedBy and
-// finds no key dimension among the values declared above. Either way the answer is in the
-// response rather than in prose nobody reads, and it cannot drift from the implementation.
+// # What changed, and why the previous shape was not acceptable
 //
-// # This field IS where the truth is stated, and that is the design
+// This struct used to report partition_key_prefix_enforced = false and
+// client_side_key_filtering_required = true: an accurate description of a boundary that did not
+// exist. A security review of the running system named the consequence plainly — whole-topic
+// credentials expose records belonging to other ledgers and other subscribers, and disclosure
+// plus client cooperation is not an authorization boundary. A subscriber that ignored the
+// obligation, or simply used a different consumer, read everything on the shared category topic
+// and nothing in the platform could tell.
 //
-// A prefix is accepted, recorded and returned, so something has to say who keeps the boundary —
-// and it has to be machine-readable, in the same object, because prose nobody reads is not a
-// disclosure control. This field is that statement. It is never true: Kafka's authorizer has no
-// message-key resource type, so a true here could only ever be a false claim, and the
-// constructors below hard-code the false rather than accepting it as a parameter precisely so no
-// caller can forge one.
+// So the boundary moved rather than the wording. A subscriber that records a partition-key
+// prefix is now provisioned WITHOUT Read on any topic: the broker refuses every record fetch it
+// attempts, with any client, from any host. Its records are delivered by Blnk's subscriber
+// stream gateway, which authenticates the credential Blnk issued for it and applies the
+// recorded prefix to every record's key before returning it. partition_key is therefore an
+// ENFORCED dimension, partition_key_prefix_enforced_by names the component that enforces it,
+// and NotEnforcedBy is empty.
 //
-// The alternative was refusing the prefix outright, which earlier builds did. That implemented no
-// part of the scope — it withheld the credential instead — and it left this field as a disclaimer
-// about data the API would no longer accept. Delivering the boundary beside the statement of who
-// enforces it is strictly more useful and no less honest.
+// # This is not per-tenant topics
 //
-// This is not per-tenant topics. Blnk deliberately does not create a topic per subscriber;
-// isolation is delivered by the exact topic grant plus the reserved consumer-group namespace,
-// which is what these two dimensions describe. The consequence is worth stating plainly to
-// whoever is designing on top of it: A SUBSCRIBER THAT MUST NOT SEE ANOTHER'S RECORDS MUST NOT
-// SHARE A TOPIC WITH IT.
+// Blnk deliberately does not create a topic per subscriber. Isolation is delivered by the exact
+// topic grant, the reserved consumer-group namespace, and — for a key-scoped subscriber — the
+// gateway's per-record key check. The consequence worth stating to whoever designs on top of
+// it: A SUBSCRIBER THAT MUST NOT SEE ANOTHER'S RECORDS MUST EITHER NOT SHARE A TOPIC WITH IT,
+// OR CARRY A PARTITION-KEY PREFIX AND CONSUME THROUGH THE GATEWAY.
 //
 // # The remedy travels with the limitation
 //
-// Stating what is not enforced is only half of what a reader needs; the other half is what to do
-// instead, and Guidance carries it in the same object. That pairing is deliberate. A security
-// review of the running system found that the negative facts here were complete and correct while
-// the remedy for them existed only outside the response — in the operations runbook, in a WARNING
-// in Blnk's own log, and in a Go constant nothing referenced — so an integrator reading a
-// requirement that promised key-prefix scoping and an integrator reading this body could reach
-// opposite conclusions about where the isolation boundary sits, and neither response said how to
-// close the gap. It says so now.
+// Guidance carries, in the same object, what a reader has to DO with all of this — which
+// endpoint to consume from, and what a subscriber without a prefix is and is not confined by.
+// That pairing was added when the remedy for the old client-side obligation existed only
+// outside the response, in a runbook and a log line, so an integrator reading a requirement
+// that promised key-prefix scoping and an integrator reading this body could reach opposite
+// conclusions. It says so in-band now, and what it says is a routing instruction rather than a
+// disclaimer.
 type SubscriberEnforcedAccess struct {
-	// EnforcedBy names every dimension the broker evaluates, and is exhaustive.
-	// partition_key_prefix is absent by construction, not by omission.
+	// EnforcedBy names every dimension Blnk enforces for this subscriber, and is exhaustive.
+	//
+	// topic and consumer_group are always present and are kept by the BROKER's authorizer.
+	// partition_key is present exactly when a prefix is recorded, and is kept by Blnk's
+	// subscriber stream gateway — see PartitionKeyPrefixEnforcedBy, which names the component
+	// rather than leaving a reader to assume the broker does everything in this list.
+	//
+	// It gained the third value with the isolation correction. Before it, partition_key was
+	// absent from this list "by construction, not by omission", and that was honest about the
+	// broker and wrong about the platform: nothing enforced the prefix at all. It is listed now
+	// because a component does.
 	EnforcedBy []string `json:"enforced_by"`
 
-	// NotEnforcedBy names every access-shaped dimension the API accepts and the broker does NOT
-	// evaluate, and it is exhaustive in the same way EnforcedBy is.
+	// NotEnforcedBy names every access-shaped dimension this API accepts and NOTHING enforces.
 	//
-	// It exists because the negative claim was previously only INFERABLE. A client had to notice
-	// that "partition_key" was absent from EnforcedBy, and an absence proves nothing about a
-	// contract — a dimension missing from a list reads identically to a dimension the server
-	// forgot, or to one a newer version added. Stating it makes the two readings distinguishable
-	// and gives a client something to assert on: EnforcedBy and NotEnforcedBy together enumerate
-	// every dimension this API names, so a dimension moving from one list to the other is a
-	// visible change rather than a silent one.
+	// IT IS ALWAYS EMPTY, and that is the invariant this release establishes rather than an
+	// oversight: a response can no longer say that a boundary an operator recorded is kept by
+	// nobody. The field is retained — rather than deleted — for two reasons. A client that
+	// branched on it keeps working, seeing an empty list where it used to see partition_key.
+	// And it remains the place a future unenforced dimension would have to appear, so adding
+	// one is a visible change in the contract instead of a silent absence from EnforcedBy.
 	//
-	// It is populated unconditionally — with or without a prefix recorded — because it describes
-	// the BROKER's capabilities, not this subscriber's configuration. Kafka's authorizer has no
-	// message-key resource type whether or not anybody asked it to use one, and a field that
-	// appeared only for subscribers carrying a prefix would let a reader conclude the dimension
-	// is enforced for everyone else.
+	// Together the two lists still enumerate every dimension this API names, so a dimension
+	// moving between them is observable. The pair is what makes the negative claim assertable
+	// at all: an absence from EnforcedBy proves nothing, because a dimension the server forgot
+	// and a dimension a newer version added read identically.
 	NotEnforcedBy []string `json:"not_enforced_by"`
 
 	// Topics is the exact set of topics the principal may Read and Describe. Anything
@@ -1983,51 +2019,71 @@ type SubscriberEnforcedAccess struct {
 	// subscriber's consumer group is not derivable, which registration prevents.
 	ConsumerGroupNamespace string `json:"consumer_group_namespace,omitempty"`
 
-	// PartitionKeyPrefixEnforced is always false and is stated rather than implied. It is
-	// the one question whose wrong answer is a data-disclosure bug, so the response answers
-	// it outright instead of leaving it to be inferred from EnforcedBy.
+	// PartitionKeyPrefixEnforced answers the one question whose wrong answer is a
+	// data-disclosure bug, outright rather than by inference from EnforcedBy.
 	//
-	// It is false whenever a prefix is recorded, and — read together with
-	// ClientSideKeyFilteringRequired below — it tells the consumer that IT is the component
-	// applying the narrowing. With no prefix recorded there is nothing to narrow and the topic
-	// grant is the whole boundary, which the broker does enforce.
+	// TRUE exactly when a prefix is recorded, because a prefix that is recorded IS enforced:
+	// the subscriber's credential is granted no record-level Read at the broker, and Blnk's
+	// stream gateway applies the prefix to every record's key before returning it. Read it
+	// together with PartitionKeyPrefixEnforcedBy, which names the component doing so, and with
+	// BrokerRecordAccess, which says why direct consumption is refused.
+	//
+	// It was hard-coded FALSE until the isolation correction, on the reasoning that Kafka's
+	// authorizer has no message-key resource type — which is still true, and was never the
+	// whole question. A false here described a boundary nobody kept while the row, the runbook
+	// and the requirement all described one that was kept, and the gap was a real exposure
+	// rather than a documentation defect. With no prefix recorded there is nothing to narrow,
+	// the topic grant is the whole boundary, and this is false.
 	PartitionKeyPrefixEnforced bool `json:"partition_key_prefix_enforced"`
 
 	// PartitionKeyPrefix echoes the routing hint recorded on the subscriber, or is empty when
 	// none is recorded.
 	//
 	// It is stated HERE, beside PartitionKeyPrefixEnforced and inside the same object, and that
-	// adjacency is the whole point: the value and the fact that the broker ignores it cannot be
-	// read apart. The subscriber body reports the prefix at the top level too, where a reader
-	// could take it for an access boundary; in here it is unmistakable.
+	// adjacency is the whole point: the value and the component that keeps it cannot be read
+	// apart. The subscriber body reports the prefix at the top level too, where a reader could
+	// take it for something the broker checks; in here it is unmistakable.
 	PartitionKeyPrefix string `json:"partition_key_prefix,omitempty"`
 
-	// ClientSideKeyFilteringRequired is TRUE exactly when a prefix is recorded, and it is the
-	// actionable instruction the rest of this object only implies.
+	// GatewayDeliveryRequired is TRUE exactly when a prefix is recorded, and it is the
+	// actionable instruction the rest of this object only implies: CONSUME THROUGH BLNK'S
+	// SUBSCRIBER STREAM GATEWAY, not directly from the broker.
 	//
-	// A consumer granted a topic reads EVERY record on that topic whatever its key. So a
-	// subscriber that recorded a prefix and expects to see only its own records must discard the
-	// rest itself, in its own consumer, and nothing at the broker will do it for them. Stating
-	// that as a boolean rather than leaving it to be deduced from "prefix present AND not
-	// enforced" is what makes it impossible to miss — and it is the field a client should branch
-	// on when deciding whether to install a key filter.
+	// It replaced client_side_key_filtering_required, and the replacement is the correction
+	// rather than a rename. That field told a subscriber to discard the records it was not
+	// entitled to, in its own consumer, having just been granted Read on the whole shared
+	// topic — so the boundary depended on the cooperation of the party it constrained. This
+	// field tells a subscriber where its records come from, and the reason it must go there is
+	// that the broker will refuse it: no topic Read binding exists for a key-scoped principal.
 	//
-	// Issuance used to REFUSE for such a subscriber, permanently, rather than say this. That
-	// withdrew a required capability for a state the registry is designed to hold; declaring the
-	// obligation is the honest form of the same concern.
-	ClientSideKeyFilteringRequired bool `json:"client_side_key_filtering_required"`
+	// A client should branch on THIS when choosing a transport. A subscriber for which it is
+	// false consumes from the broker with its SASL credential exactly as before.
+	GatewayDeliveryRequired bool `json:"gateway_delivery_required"`
 
-	// PartitionKeyPrefixEnforcedBy names WHERE the key scope is enforced, and it is the same
-	// fact the two booleans above state, said as a place rather than as a pair of yes/no
-	// answers: "consumer_side" when a prefix is recorded, "none" when none is.
+	// BrokerRecordAccess reports whether this subscriber's credential may fetch records
+	// DIRECTLY from the broker. It is the exact complement of GatewayDeliveryRequired.
+	//
+	// It is stated separately because it is the fact that explains the other: a key-scoped
+	// subscriber is not being ASKED to use the gateway as a courtesy, it is granted Describe on
+	// its topics and Read on its consumer-group namespace and no topic Read at all, so every
+	// fetch it attempts at the broker is refused by the authorizer. An integrator debugging a
+	// TOPIC_AUTHORIZATION_FAILED on a granted topic reads this field and knows immediately that
+	// the refusal is the design.
+	BrokerRecordAccess bool `json:"broker_record_access"`
+
+	// PartitionKeyPrefixEnforcedBy names WHICH COMPONENT enforces the key scope, and it is the
+	// same fact the booleans above state, said as a place rather than as yes/no answers:
+	// "blnk_stream_gateway" when a prefix is recorded, "none" when none is.
 	//
 	// It is carried IN ADDITION to the booleans rather than instead of them because the two
-	// readings serve different callers. A client deciding whether to install a key filter wants
-	// the boolean it can branch on; a client or operator asking what the boundary IS wants the
-	// place, and "enforced: false" answers that question with a denial rather than an answer —
-	// which is how a field that could only ever be false came to be read as "unenforceable,
-	// therefore refuse to issue". All three are derived from ONE value here, so they cannot
-	// disagree.
+	// readings serve different callers. A client choosing a transport wants the boolean it can
+	// branch on; a client or operator asking what the boundary IS wants to know who keeps it,
+	// and "enforced: false" answers that question with a denial rather than an answer — which
+	// is how a field that could only ever be false came once to be read as "unenforceable,
+	// therefore refuse to issue" and once as "disclose it and move on". Its value was
+	// "consumer_side" until the isolation correction; it names a Blnk component now, because a
+	// Blnk component performs the check. All of these are derived from ONE value here, so they
+	// cannot disagree.
 	PartitionKeyPrefixEnforcedBy model.KeyScopeEnforcementStatus `json:"partition_key_prefix_enforced_by"`
 
 	// ExclusiveGrantVerified reports that Blnk READ the principal's complete ACL grant at the
@@ -2058,94 +2114,105 @@ type SubscriberEnforcedAccess struct {
 	// the same unverified claim in a different response. Only credential issuance verifies.
 	ExclusiveGrantVerified bool `json:"exclusive_grant_verified"`
 
-	// Guidance is the REMEDY, carried in the same object as the limitation it answers, and it
+	// Guidance is the REMEDY, carried in the same object as the boundary it describes, and it
 	// is always SubscriberKeyScopeGuidance.
 	//
-	// # Why a negative fact was not enough on its own
+	// # Why a fact was not enough on its own
 	//
-	// Every other field here answers "what is enforced?". Between them they establish that
-	// the message key is not a boundary — but a reader who has just learned that the narrowing
-	// they were counting on does not exist still has to work out what to do instead, and until
-	// this field existed the API did not say. The answer lived in prose (the operations
-	// runbook), in a WARNING in Blnk's own log, and in a Go constant that no response
-	// referenced. None of those is reachable by the integrator reading this body.
+	// Every other field here answers "what is enforced, and by what?". Between them they
+	// establish where the boundary sits — but a reader who has just learned that the broker
+	// does not evaluate message keys still has to work out what to DO, and until this field
+	// existed the API did not say. The answer lived in prose (the operations runbook), in a
+	// line in Blnk's own log, and in a Go constant that no response referenced. None of those
+	// is reachable by the integrator reading this body.
 	//
 	// That gap had a concrete cost, and it is the one the security review named: a partition
-	// key prefix looks like an access boundary in a requirement or a design note, and reads as
-	// one in every field of a subscriber row EXCEPT the ones here. Someone reading the
-	// specification and someone reading this response could reach opposite conclusions about
-	// where the isolation boundary sits. Stating the remedy in-band collapses that: the same
-	// bytes that say the key is not enforced also say what to narrow instead.
+	// key prefix looks like an access boundary in a requirement or a design note, and until the
+	// isolation correction it was not one anywhere in the system. Stating the remedy in-band
+	// collapses the ambiguity — the same bytes that say who enforces the key scope also say
+	// which endpoint delivers the records it applies to.
 	//
 	// # It is prose, and it must not be branched on
 	//
 	// This is guidance for a human reading a response or a support ticket, and its wording may
-	// be reworded. Branch on ClientSideKeyFilteringRequired, or assert on the EnforcedBy and
-	// NotEnforcedBy pair — those are the machine-readable contract. A client matching on this
-	// string is matching on documentation.
+	// be reworded. Branch on GatewayDeliveryRequired or BrokerRecordAccess, or assert on the
+	// EnforcedBy and NotEnforcedBy pair — those are the machine-readable contract. A client
+	// matching on this string is matching on documentation.
 	//
 	// # It is present unconditionally
 	//
 	// No omitempty, and it is populated whether or not a prefix is recorded, for the same
-	// reason NotEnforcedBy is: it describes what the BROKER can evaluate, which does not vary
-	// by row. A remedy that appeared only on key-scoped subscribers would let a reader of any
-	// other subscriber conclude that the key dimension is enforced for them.
+	// reason NotEnforcedBy is: it describes what the BROKER can evaluate and where Blnk puts
+	// the boundary it cannot, neither of which varies by row. A remedy that appeared only on
+	// key-scoped subscribers would leave a reader of any other subscriber guessing.
 	Guidance string `json:"guidance"`
 }
 
-// EnforcementDimensionPartitionKey names the access-shaped dimension Kafka does NOT evaluate.
+// EnforcementDimensionPartitionKey names the access-shaped dimension the BROKER does not
+// evaluate and BLNK does: a subscriber's partition-key prefix, enforced at the subscriber
+// stream gateway.
 //
 // It is a constant rather than a literal for the same reason the enforced dimensions are: the
-// value appears in a response body — it is the sole member of SubscriberEnforcedAccess.NotEnforcedBy
-// — so it is part of the API contract, and a reworded literal would silently change what a client
-// is matching on.
+// value appears in a response body — it joins SubscriberEnforcedAccess.EnforcedBy whenever a
+// prefix is recorded — so it is part of the API contract, and a reworded literal would silently
+// change what a client is matching on.
+//
+// It was the sole member of NotEnforcedBy before the isolation correction, which is the one
+// change worth noting about it: the name did not move, the list it appears in did.
 const EnforcementDimensionPartitionKey = "partition_key"
 
-// SubscriberKeyScopeGuidance is the remedy every subscriber and credential response carries, in
-// SubscriberEnforcedAccess.Guidance.
+// SubscriberKeyScopeGuidance is the routing instruction every subscriber and credential
+// response carries, in SubscriberEnforcedAccess.Guidance.
 //
-// One sentence, stated once, so the registry view and the credential view cannot give different
-// advice about the same limitation.
+// Stated once, so the registry view and the credential view cannot give different advice about
+// the same boundary.
 //
 // It is a constant rather than a literal at the assignment for the same reason the dimension
 // names are: it reaches a response body, so it is part of what a client sees, and one copy is
-// what keeps the two views from drifting apart. It was declared here and referenced NOWHERE for
-// a period, which meant the doc comment above described a response field that did not exist —
-// the remedy was in the runbook and in Blnk's own log, and absent from the one place an
-// integrator was certain to look. NewSubscriberEnforcedAccess now assigns it, so the sentence
-// above is a statement about the wire and not an intention.
+// what keeps the two views from drifting apart.
+//
+// Its TEXT is the isolation correction stated to an integrator. It used to say that a
+// partition-key prefix "is never enforced" and that the remedy was to narrow authorized_topics
+// or isolate at the deployment boundary — accurate advice about a platform that granted
+// whole-topic Read and asked the consumer to filter. A key-scoped subscriber is now granted no
+// record-level Read at all and consumes through Blnk's stream gateway, which applies the prefix
+// before returning a record, so what an integrator needs from this sentence is where to read
+// from rather than what to give up on.
 const SubscriberKeyScopeGuidance = "Kafka authorises whole topics and consumer groups and has " +
-	"no message-key dimension, so a partition-key prefix is never enforced: a granted topic is " +
-	"readable in full, including records written for other ledgers and other subscribers. To " +
-	"confine a subscriber, narrow its authorized_topics, which the broker does enforce, or " +
-	"isolate the data at the deployment boundary."
+	"no message-key dimension, so Blnk enforces a subscriber's partition-key prefix itself: a " +
+	"subscriber that records one is granted Describe but NOT Read on its topics, so the broker " +
+	"refuses every direct fetch, and its records are delivered by GET /subscribers/{id}/events, " +
+	"which returns only the records whose key carries the prefix. A subscriber with no prefix " +
+	"consumes directly from the broker and is confined by its authorized_topics alone, which " +
+	"means a granted topic is readable in full — including records written for other ledgers " +
+	"and other subscribers on that topic."
 
 // keyScopeEnforcementFor renders a recorded prefix as the enforcement point it implies.
 //
-// One derivation, read by every constructor in this file, so the boolean pair and the place
-// name can never describe different states of the same subscriber.
+// One derivation, read by every constructor in this file, so the booleans and the place name can
+// never describe different states of the same subscriber.
 //
 // Parameters:
 //   - partitionKeyPrefix string: the recorded prefix, already trimmed.
 //
 // Returns:
-//   - model.KeyScopeEnforcementStatus: ConsumerSide when a prefix is recorded, otherwise None.
+//   - model.KeyScopeEnforcementStatus: Gateway when a prefix is recorded, otherwise None.
 func keyScopeEnforcementFor(partitionKeyPrefix string) model.KeyScopeEnforcementStatus {
 	if strings.TrimSpace(partitionKeyPrefix) == "" {
 		return model.KeyScopeEnforcementNone
 	}
 
-	return model.KeyScopeEnforcementConsumerSide
+	return model.KeyScopeEnforcementGateway
 }
 
 // NewSubscriberEnforcedAccess builds the enforced-access declaration for a subscriber.
 //
 // It is the single place the declaration is assembled, so no handler can publish a response
-// that claims key filtering is enforced, and the enforced dimension list cannot diverge between
-// the subscriber view and the credential view. The consumer-group namespace is DERIVED here
-// through the same model helper the ACL binding itself is built from, rather than accepted as a
-// parameter, so the value reported can never describe a namespace different from the one the
-// broker actually reserved.
+// that describes the boundary differently, and the enforced dimension list cannot diverge
+// between the subscriber view and the credential view. The consumer-group namespace is DERIVED
+// here through the same model helper the ACL binding itself is built from, rather than accepted
+// as a parameter, so the value reported can never describe a namespace different from the one
+// the broker actually reserved.
 //
 // A subscriber id that does not canonicalize yields an empty namespace rather than an error:
 // this is a response projection, and registration already refuses such an id, so the only way
@@ -2154,72 +2221,119 @@ func keyScopeEnforcementFor(partitionKeyPrefix string) model.KeyScopeEnforcement
 // to inspect precisely because it is malformed.
 //
 // THE KEY SCOPE IS DECLARED HERE TOO, and pairing it with its enforcement point is the whole
-// reason this constructor takes it. A prefix reported on its own reads as a limit on the
-// credential; reported beside "enforced_by: consumer_side" it reads as the filtering contract
-// it is. Neither field is settable without the other, because this is the only place either is
-// assigned.
+// reason this constructor takes it. A prefix reported on its own reads as a limit somebody keeps
+// without saying who; reported beside "enforced_by: blnk_stream_gateway" and
+// "broker_record_access: false" it reads as the boundary it is. None of those fields is settable
+// without the others, because this is the only place any of them is assigned.
 //
-// THE REMEDY IS ATTACHED HERE, unconditionally, from SubscriberKeyScopeGuidance. Being assembled
-// in the one place is what makes it reachable from every response that carries a boundary — the
-// registry views and the credential view alike — without a handler having to remember it, and it
-// is why the guidance cannot say one thing on a subscriber read and another at issuance.
+// EVERY DERIVED FIELD COMES FROM ONE FACT: whether the trimmed prefix is empty. The enforced and
+// not-enforced dimension lists, the enforcement point, the two booleans and the guidance are all
+// computed from it here, so a response cannot report a prefix that nothing enforces, or claim
+// gateway delivery for a subscriber that has direct broker access, or list partition_key in both
+// dimension lists at once.
+//
+// THE GUIDANCE IS ATTACHED HERE, unconditionally, from SubscriberKeyScopeGuidance. Being
+// assembled in the one place is what makes it reachable from every response that carries a
+// boundary — the registry views and the credential view alike — without a handler having to
+// remember it, and it is why the guidance cannot say one thing on a subscriber read and another
+// at issuance.
 //
 // Parameters:
 //   - subscriberID string: the business key the principal and group are derived from.
 //   - topics []string: the subscriber's exact topic grant. A nil slice becomes [] so the body
 //     never carries null for a set an operator has to read.
-//   - partitionKeyPrefix string: the key boundary the consumer must apply, trimmed and echoed
+//   - partitionKeyPrefix string: the key boundary Blnk's gateway applies, trimmed and echoed
 //     VERBATIM. Empty stays empty and is the "no restriction" case; it is deliberately NOT
-//     replaced by model.SubscriberKeyScopeAllKeys, because this field is what a consumer
-//     filters on and a sentinel here would have it discard every record whose key does not
-//     begin with the sentinel. The English form of "no restriction" belongs to
-//     model.SubscriberCredential.KeyScope, which returns the scope and who enforces it as a
-//     pair and cannot be read as a filter.
+//     replaced by model.SubscriberKeyScopeAllKeys, because this field is the prefix records are
+//     matched against and a sentinel here would describe a filter that matches nothing. The
+//     English form of "no restriction" belongs to model.SubscriberCredential.KeyScope, which
+//     returns the scope and who enforces it as a pair and cannot be read as a filter.
 //
 // Returns:
-//   - SubscriberEnforcedAccess: the declaration, with PartitionKeyPrefixEnforced false, the
-//     enforcement point reported as consumer_side or none, and Guidance carrying
-//     SubscriberKeyScopeGuidance.
+//   - SubscriberEnforcedAccess: the declaration. With a prefix recorded: partition_key joins
+//     EnforcedBy, PartitionKeyPrefixEnforced and GatewayDeliveryRequired are true,
+//     BrokerRecordAccess is false and the enforcement point is blnk_stream_gateway. Without one:
+//     two enforced dimensions, both key booleans false, BrokerRecordAccess true and the
+//     enforcement point none. NotEnforcedBy is empty either way.
 func NewSubscriberEnforcedAccess(
 	subscriberID string,
 	topics []string,
 	partitionKeyPrefix string,
 ) SubscriberEnforcedAccess {
+	return NewSubscriberEnforcedAccessUnder(
+		subscriberID, topics, partitionKeyPrefix, keyScopeEnforcementFor(partitionKeyPrefix),
+	)
+}
+
+// NewSubscriberEnforcedAccessUnder builds the declaration for a KNOWN enforcement point.
+//
+// It exists because the enforcement point is a property of the DEPLOYMENT and not of the
+// registry row. A row records a prefix; whether anything evaluates that prefix depends on
+// whether an enforcing gateway is declared, which only a caller holding the configuration
+// knows. Credential issuance holds it — it read the same value to decide whether to mint at
+// all — so it passes the answer in rather than letting this file guess.
+//
+// NewSubscriberEnforcedAccess above is the registry-read form and derives the point from the
+// prefix alone, which yields consumer_side for a key-scoped row. That is the correct answer for
+// a read: it describes a row whose credential has been WITHHELD, because issuance refuses a
+// recorded prefix that nothing enforces.
+//
+// The two booleans are DERIVED FROM the enforcement point rather than passed alongside it, so
+// no caller can produce an object that says "enforced at the gateway" and "the client must
+// filter" at the same time.
+//
+// Parameters:
+//   - subscriberID string: used to derive the consumer-group namespace.
+//   - topics []string: the exact topics the principal may Read and Describe.
+//   - partitionKeyPrefix string: the recorded prefix, trimmed here.
+//   - enforcement model.KeyScopeEnforcementStatus: where the scope is enforced. Only
+//     broker_gateway makes PartitionKeyPrefixEnforced true.
+//
+// Returns:
+//   - SubscriberEnforcedAccess: the declaration, internally consistent by construction.
+func NewSubscriberEnforcedAccessUnder(
+	subscriberID string,
+	topics []string,
+	partitionKeyPrefix string,
+	enforcement model.KeyScopeEnforcementStatus,
+) SubscriberEnforcedAccess {
 	partitionKeyPrefix = strings.TrimSpace(partitionKeyPrefix)
+
+	// THE ONE FACT every field below is derived from. Trimmed, because a whitespace-only column
+	// is not a scope — and because model.EventSubscriber's own predicates trim, so a row that
+	// reached here with one must not be reported as narrowed when nothing narrows it.
+	keyScoped := partitionKeyPrefix != ""
 
 	enforced := SubscriberEnforcedAccess{
 		EnforcedBy: []string{
 			EnforcementDimensionTopic,
 			EnforcementDimensionConsumerGroup,
 		},
-		// The counterpart list, stated for every subscriber rather than only for one carrying a
-		// prefix: it describes what the BROKER cannot evaluate, which does not vary by row.
-		NotEnforcedBy: []string{
-			EnforcementDimensionPartitionKey,
-		},
-		Topics: topics,
-		// Never set true anywhere. Kafka has no message-key authorization dimension, so a
-		// true here could only ever be a false claim.
-		PartitionKeyPrefixEnforced: false,
+		// EMPTY, ALWAYS, and it is an explicitly allocated empty slice rather than nil so the
+		// body carries [] instead of null: "nothing is unenforced" is a claim the response
+		// makes, and null would read as "not stated". See the field's own documentation for why
+		// it is retained now that it can never be populated.
+		NotEnforcedBy: []string{},
+		Topics:        topics,
+		// TRUE when a prefix is recorded, because a recorded prefix IS enforced — at the
+		// gateway named below, which applies it to every record's key before returning one.
+		PartitionKeyPrefixEnforced: keyScoped,
 		// THE RECORDED VALUE, trimmed, and empty when there is none. A sentinel was tried here
-		// and removed: this string is what a consumer compares record keys against, so any
-		// stand-in for "no restriction" is a filter that matches nothing, and a client applying
-		// it would silently discard its entire stream. The flag below is what states whether
-		// there is anything to apply at all.
+		// and removed: this string is the prefix record keys are matched against, so any
+		// stand-in for "no restriction" describes a filter that matches nothing.
 		PartitionKeyPrefix: partitionKeyPrefix,
-		// Derived from the prefix rather than passed in, so the flag and the value it describes
-		// cannot disagree — a true beside an empty prefix, or a recorded prefix with no
-		// instruction attached, would each be worse than either alone.
-		ClientSideKeyFilteringRequired: partitionKeyPrefix != "",
+		// The transport instruction. True and BrokerRecordAccess are complements by
+		// construction, so a client cannot be told both to use the gateway and that it may
+		// fetch directly.
+		GatewayDeliveryRequired: keyScoped,
+		BrokerRecordAccess:      !keyScoped,
 		// The place-shaped form of the same derivation, so a caller reading the enforcement
-		// point and a caller reading the flag are told the same thing.
+		// point and a caller reading the booleans are told the same thing.
 		PartitionKeyPrefixEnforcedBy: keyScopeEnforcementFor(partitionKeyPrefix),
-		// THE REMEDY, in the same object as the limitation, and the same sentence for every
-		// caller of this constructor. Assigned unconditionally: it describes what Kafka's
-		// authorizer can evaluate, which is not a property of this row, so a subscriber with no
-		// prefix recorded is told the same thing as one that has a prefix. Every field above
-		// says what is NOT kept at the broker; this one says what to do about it, which is the
-		// half a reader of the specification could previously only find outside the response.
+		// THE ROUTING INSTRUCTION, in the same object as the boundary, and the same sentence for
+		// every caller of this constructor. Assigned unconditionally: it describes what Kafka's
+		// authorizer can evaluate and where Blnk puts the boundary it cannot, neither of which
+		// is a property of this row.
 		Guidance: SubscriberKeyScopeGuidance,
 		// FALSE by default, and the default is the honest answer for every caller of this
 		// constructor except issuance. This builds the REQUESTED boundary from a registry row,
@@ -2227,6 +2341,13 @@ func NewSubscriberEnforcedAccess(
 		// actually grants. Only NewVerifiedSubscriberEnforcedAccess sets it, and only because
 		// issuance really did read the grant and refuse a broader one.
 		ExclusiveGrantVerified: false,
+	}
+
+	// partition_key joins the ENFORCED list — rather than the not-enforced one it used to be the
+	// sole member of — exactly when there is a prefix to enforce. Appended here rather than
+	// listed above so the two lists are visibly derived from one condition.
+	if keyScoped {
+		enforced.EnforcedBy = append(enforced.EnforcedBy, EnforcementDimensionPartitionKey)
 	}
 
 	if namespace, err := model.CanonicalConsumerGroupNamespace(subscriberID); err == nil {
@@ -2264,7 +2385,34 @@ func NewVerifiedSubscriberEnforcedAccess(
 	topics []string,
 	partitionKeyPrefix string,
 ) SubscriberEnforcedAccess {
-	enforced := NewSubscriberEnforcedAccess(subscriberID, topics, partitionKeyPrefix)
+	return NewVerifiedSubscriberEnforcedAccessUnder(
+		subscriberID, topics, partitionKeyPrefix, keyScopeEnforcementFor(partitionKeyPrefix),
+	)
+}
+
+// NewVerifiedSubscriberEnforcedAccessUnder is the issuance form: a verified grant AND a known
+// enforcement point.
+//
+// Issuance is the only caller. It read the broker's complete ACL grant for this principal and
+// refused a broader one, and it read the deployment's key-scope enforcement mode to decide
+// whether to mint at all — so it is the one caller able to answer both questions truthfully in
+// one object.
+//
+// Parameters:
+//   - subscriberID string: used to derive the consumer-group namespace.
+//   - topics []string: the exact topics the principal may Read and Describe.
+//   - partitionKeyPrefix string: the recorded prefix.
+//   - enforcement model.KeyScopeEnforcementStatus: where the scope is enforced.
+//
+// Returns:
+//   - SubscriberEnforcedAccess: with ExclusiveGrantVerified set.
+func NewVerifiedSubscriberEnforcedAccessUnder(
+	subscriberID string,
+	topics []string,
+	partitionKeyPrefix string,
+	enforcement model.KeyScopeEnforcementStatus,
+) SubscriberEnforcedAccess {
+	enforced := NewSubscriberEnforcedAccessUnder(subscriberID, topics, partitionKeyPrefix, enforcement)
 	enforced.ExclusiveGrantVerified = true
 
 	return enforced
@@ -2489,8 +2637,12 @@ type KafkaCredentialsResponse struct {
 	// — and they do not resolve outside the deployment; a broker also answers
 	// each client with the advertised address of the listener it arrived on, so
 	// an external subscriber must be given an externally advertised address.
-	// Issuance is refused with 503 when none is configured, so a successful
-	// response never carries an endpoint the subscriber cannot dial.
+	//
+	// KAFKA_SUBSCRIBER_BROKERS is an OPTIONAL OVERRIDE, not a requirement. When it is
+	// unset, issuance FALLS BACK to KAFKA_BROKERS and warns that it is handing out an
+	// internal address — so a successful response is not by itself proof that this
+	// endpoint is routable from the subscriber's network. Issuance is refused with
+	// 503 SUBSCRIBER_BROKERS_NOT_CONFIGURED only when NEITHER list is configured.
 	Brokers []string `json:"brokers"`
 
 	// BrokerEndpoint is a convenience rendering of the same subscriber-facing
@@ -2702,4 +2854,115 @@ type WebhookSubscriptionResponse struct {
 	// consumption. Nil, and so omitted, means the subscriber is still counted
 	// as awaiting migration.
 	MigratedAt *time.Time `json:"migrated_at,omitempty"`
+}
+
+// ---------------------------------------------------------------------------------------
+// The subscriber event stream — GET /subscribers/{subscriber_id}/events
+// ---------------------------------------------------------------------------------------
+
+// SubscriberEventStreamRecord is one event a subscriber is entitled to.
+//
+// # Why the value is raw JSON and not a decoded envelope
+//
+// It is the marshalled LedgerEvent exactly as it sits on the topic, byte for byte. A
+// subscriber reading through this endpoint and a subscriber consuming the topic directly
+// therefore parse identical bytes, which is the property that makes the two paths
+// interchangeable — and it is what keeps the schema contract in one place, on the topic,
+// rather than in a second re-marshalled shape this layer would own.
+type SubscriberEventStreamRecord struct {
+	// Offset is the record's position in its partition. It is what a caller resumes from,
+	// and it is per partition, so a client merging partitions must track one per partition.
+	Offset int64 `json:"offset"`
+
+	// Partition is where the record came from, so a record stays self-describing once
+	// several partitions' pages have been merged.
+	Partition int `json:"partition"`
+
+	// Key is the message key: the partition key the event was published under, which for a
+	// ledger-scoped event is the ledger id.
+	//
+	// It is returned deliberately rather than withheld as an implementation detail. It is
+	// the value the subscriber's own partition-key prefix was matched against, so returning
+	// it is what lets a subscriber VERIFY the boundary it was promised instead of taking
+	// this endpoint's word for it.
+	Key string `json:"key"`
+
+	// Timestamp is the record's broker timestamp, which is when Kafka accepted it — not
+	// when the event occurred. The event's own occurred_at travels inside the envelope.
+	Timestamp time.Time `json:"timestamp"`
+
+	// Event is the LedgerEvent envelope verbatim.
+	Event json.RawMessage `json:"event"`
+}
+
+// SubscriberEventStreamResponse is one page of a subscriber's own event stream.
+//
+// # What this endpoint is, and why it exists at all
+//
+// It is the ENFORCEMENT POINT for a subscriber's partition-key prefix. Kafka's authorizer has
+// no message-key dimension, so a subscriber whose access is confined to a key prefix cannot be
+// given a broker grant that expresses it. Blnk therefore grants such a subscriber Describe and
+// NO Read — the broker refuses its every fetch — and serves its records here instead, applying
+// the prefix to each record before any of them leaves the process.
+//
+// A subscriber with NO prefix recorded does not need this endpoint: it holds topic Read and
+// consumes from the broker directly. It may still use it, and gets the same bytes.
+//
+// # What it is not
+//
+// It is not a consumer group. Nothing is committed, no offset is remembered and no rebalancing
+// happens: the cursor is the caller's, sent as `offset` and returned as `next_offset`. That is
+// what keeps the endpoint stateless and any replica able to serve it — and it is why building
+// subscriber-side consumer error handling remains explicitly out of scope.
+type SubscriberEventStreamResponse struct {
+	// SubscriberID, Topic and Partition echo what was read.
+	SubscriberID string `json:"subscriber_id"`
+	Topic        string `json:"topic"`
+	Partition    int    `json:"partition"`
+
+	// Records are the records this subscriber is entitled to, in offset order. Never null:
+	// an empty page is `[]`, because a caught-up subscriber is an ordinary state and every
+	// client would otherwise have to special-case it.
+	Records []SubscriberEventStreamRecord `json:"records"`
+
+	// NextOffset is where to resume, and it advances past WITHHELD records as well as
+	// delivered ones.
+	//
+	// That is the field's whole subtlety and it is deliberate: a key-scoped subscriber whose
+	// entitled records sit behind a thousand belonging to other ledgers would never reach
+	// them if the cursor only moved for records it received. So a page can legitimately
+	// return zero records and still advance — which is why a client must resume from THIS
+	// value and not from the last record's offset.
+	NextOffset int64 `json:"next_offset"`
+
+	// HighWatermark is the offset the next record produced will occupy, so a client can
+	// compute its own lag as high_watermark - next_offset without a second endpoint.
+	HighWatermark int64 `json:"high_watermark"`
+
+	// LogStartOffset is the earliest offset still retained on the partition. A cursor below
+	// it has fallen off the back of the log — records were deleted by retention before this
+	// subscriber read them — which is a different condition from being behind and needs a
+	// different response.
+	LogStartOffset int64 `json:"log_start_offset"`
+
+	// RecordsScanned is how many records were read before filtering, and RecordsWithheld
+	// how many of those the key scope excluded.
+	//
+	// Both are reported because together they make the boundary legible: a page with no
+	// records and a non-zero withheld count is a working filter rather than a broken feed,
+	// and a client that could not tell those apart would report an incident for correct
+	// behaviour. They are counts only — nothing about a withheld record is disclosed.
+	RecordsScanned  int `json:"records_scanned"`
+	RecordsWithheld int `json:"records_withheld"`
+
+	// Truncated reports that the page size cut this read short, so more records are
+	// immediately available at next_offset and a client need not wait a poll interval.
+	Truncated bool `json:"truncated"`
+
+	// KeyScope is the partition-key prefix that was applied, omitted when the subscriber
+	// records none. KeyScopeEnforced states that it WAS applied, and is present on every
+	// response — including false — so a client can branch on it without first testing
+	// whether the scope string is empty.
+	KeyScope         string `json:"key_scope,omitempty"`
+	KeyScopeEnforced bool   `json:"key_scope_enforced"`
 }

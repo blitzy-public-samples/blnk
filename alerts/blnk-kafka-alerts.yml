@@ -76,8 +76,39 @@
 # section rather than to the top of the runbook saves the same reader a scroll
 # through a thousand-line document while they are being paged.
 #
-# A fork serving its own documentation should rewrite the base of these thirteen URLs;
-# the anchors are the alert names, lowercased, so they follow the rule names.
+# THE DEFAULT BASE TRACKS A BRANCH, NOT A RELEASE, and that is worth knowing before you
+# rely on it. It resolves against .../blob/main/docs/kafka-operations.md, so the page an
+# on-call engineer opens is the runbook at HEAD — which can describe a procedure the
+# DEPLOYED release does not have, either a step that does not exist yet or one that was
+# withdrawn. It is the right default because it is always reachable and needs no
+# per-deployment configuration; it is the wrong thing to page against once a deployment is
+# pinned to a release.
+#
+# PIN IT WITH THE runbook_base_url EXTERNAL LABEL. That is the supported per-deployment
+# override and it needs no edit to these thirteen rules: set it in prometheus.yml, or in the
+# prometheus-config ConfigMap on Kubernetes, to a release-tagged or internally published
+# copy — for example .../blob/v0.9.0/docs/kafka-operations.md, or
+# https://runbooks.internal.example/blnk/kafka. Each rule then renders
+# "<that base>#<alert name lowercased>" and nothing else about the rule changes.
+#
+# A fork serving its own documentation sets the same label rather than rewriting these
+# thirteen URLs; the anchors are the alert names, lowercased, so they follow the rule names.
+
+# `check rules` PROVES THESE PARSE; alerts/tests/blnk-kafka-alerts_test.yml
+# proves one of them fires. The two are independent, and the difference cost a
+# real rule: SubscriberSettlementNotProgressing was valid PromQL that could
+# never fire on a settlement pass which had never settled anything, because
+# its right-hand counter has no series until it does. Run both when changing a
+# rule:
+#
+#     promtool check rules alerts/blnk-kafka-alerts.yml
+#     cd alerts/tests && promtool test rules blnk-kafka-alerts_test.yml
+#
+# The test file is in a SUBDIRECTORY because prometheus.yml loads rules with
+# the glob /etc/prometheus/alerts/*.yml, which would match it — and a promtool
+# test file is not a rule file, so Prometheus would refuse the entire
+# configuration and load none of these thirteen rules. The glob does not
+# recurse.
 
 groups:
   # One group: every rule covers the same domain and shares one cadence, and a
@@ -384,8 +415,27 @@ groups:
         # ago is expected to be outstanding — and a zero settlement rate alone is
         # the healthy steady state, because most deployments never fail a subscriber
         # operation at all.
+        #
+        # WRITTEN WITH `unless` RATHER THAN `and ... == 0`, AND THAT IS THE
+        # WHOLE RULE. The settled counter has NO SERIES until the pass
+        # discharges its first obligation — OpenTelemetry exports the attribute
+        # sets that have been written, not every instrument declared — so `and
+        # rate(...) == 0` matched against an empty vector and produced an empty
+        # result. The rule could therefore never fire on the one deployment that
+        # needs it: a pass that has never settled anything, which is exactly
+        # what "not progressing" means. `unless` inverts the failure: the left
+        # side survives when the right has nothing to match, so a real backlog
+        # alerts before the counter's first sample.
+        #
+        # The vector matching is unchanged. `unless` is a set operator like
+        # `and` and matches on the full label set, so instance and job still
+        # pair the backlog with its own process's settle rate, and because
+        # `unless` returns the LEFT side, $value and $labels in the annotation
+        # below mean what they meant before. Suppression is now expressed as "a
+        # positive settle rate exists" instead of "the rate equals zero", which
+        # is the same condition whenever the series exists at all.
         expr: blnk_subscribers_settlement_outstanding > 0
-          and rate(blnk_subscribers_obligations_settled_total[30m]) == 0
+          unless rate(blnk_subscribers_obligations_settled_total[30m]) > 0
         # Ten consecutive evaluations at the interval above. Long enough that a pass
         # legitimately paced off — a remedy retried after the retry interval against
         # a broker that is still failing — does not trip it, and short enough to be

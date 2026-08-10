@@ -408,9 +408,16 @@ spec:
             # server
             # audits the outbox at start-up and names any namespace it should
             # have
-            # been told about. worker-deployment.yaml does not project it: that
-            # role
-            # publishes nothing, so it resolves no writer.
+            # been told about.
+            #
+            # worker-deployment.yaml does not project it, and the reason is narrower
+            # than "that role publishes nothing". Capture DOES consult the owned-prefix
+            # set — database/event_outbox.go validates a row's destination topic against
+            # it at insert. But a NEW row's topic is composed by TopicForEvent from the
+            # CONFIGURED prefix alone, so a historical name cannot arrive on an insert
+            # and the historical list can never decide whether one is accepted. Only the
+            # publisher, the dead-letter write and replay read STORED topics, and all
+            # three run in this role.
             - name: KAFKA_HISTORICAL_TOPIC_PREFIXES
               valueFrom:
                 configMapKeyRef:

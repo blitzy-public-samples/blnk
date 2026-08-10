@@ -621,17 +621,43 @@ type eventOutbox interface {
 	// happened yet, so those rows appear on the same series rather than silently missing.
 	OldestDeadLetterAgeByTopic(ctx context.Context, deadLetterSuffix string) ([]model.DeadLetterTopicAge, error)
 
+	// CountUnresolvedEventOutbox returns a status-keyed count of every row that has NOT
+	// reached its terminal dispatched state, and reads no dispatched row at all.
+	//
+	// IT IS THE READING EVERY ROUTINE CALLER WANTS (PERF-M05). The pending-backlog and
+	// repair-backlog gauges, recomputed every fifteen seconds, and the dead-letter
+	// service's awaiting-preservation count read only non-dispatched statuses — yet all of
+	// them used to go through CountEventOutboxByStatus and so paid for an exact count of a
+	// day of dispatched history, 43.2 million index entries at the target rate, on every
+	// call. This is that query's first arm alone.
+	//
+	// There is NO WINDOW, deliberately: a window could only hide rows this reading exists
+	// to surface. A pending row stuck for three days must appear in the backlog, and a
+	// `failed` row that has owed its dead-letter write since last week must appear in the
+	// repair backlog. Every count is exact and complete for all time, and the population is
+	// bounded by OPERATION rather than by history — acceptance criterion V-3 holds it below
+	// 0.1% of throughput — so the cost tracks how much work is outstanding.
+	//
+	// The map is keyed by the model.EventOutboxStatus* values, and a status with no rows is
+	// absent rather than present with a zero.
+	CountUnresolvedEventOutbox(ctx context.Context) (map[string]int64, error)
+
 	// CountEventOutboxByStatus returns a status-keyed count of every row in
-	// blnk.event_outbox.
+	// blnk.event_outbox, INCLUDING the dispatched history inside the window.
 	//
 	// IT IS NOT UNUSED — do not delete it. It exists for one named purpose: the
 	// daily zero-loss reconciliation, which passes when the dispatched plus
 	// dead-lettered counts equal the sum of the main-topic and dead-letter-topic
-	// end offsets reported by the broker. Three things consume it: the event
-	// statistics endpoint, the reconciliation runbook in the Kafka operations
-	// documentation, and the pending-backlog gauge exported to the metrics
-	// pipeline. A grep for callers inside this package alone will find none,
-	// which is exactly the trap this comment exists to prevent.
+	// end offsets reported by the broker. Two things consume it: the event statistics
+	// endpoint when a caller asked for the broker side, and the reconciliation runbook in
+	// the Kafka operations documentation that drives that endpoint. A grep for callers
+	// inside this package alone will find none, which is exactly the trap this comment
+	// exists to prevent.
+	//
+	// IT IS THE ON-DEMAND READING, and CountUnresolvedEventOutbox above is the routine one.
+	// The dispatched arm is an exact count over the one population here that grows without
+	// bound: a day is 43.2 million index entries and a week is 302.4 million, affordable
+	// once for a deliberate reconciliation and ruinous on a timer (PERF-M05).
 	//
 	// The map is keyed by the model.EventOutboxStatus* values, and a status with
 	// no rows is absent from the map rather than present with a zero — callers

@@ -118,7 +118,7 @@
 # run's console output. Rotation is now an explicit request:
 # KAFKA_ROTATE_SAMPLE_SUBSCRIBER_SECRET=1 or KAFKA_ROTATE_PRODUCER_SECRET=1, each needing a
 # destination file, or supply the secret directly. For the producer the stakes are higher than
-# a broken local consumer: rotating it out from under a running server and worker stops them
+# a broken local consumer: rotating it out from under a running server stops it
 # authenticating, which is why a rotation with nowhere to deliver the new value refuses
 # outright rather than proceeding.
 #
@@ -251,8 +251,10 @@
 #                                                               publishes as; Write and
 #                                                               Describe on every owned
 #                                                               topic, nothing else
-#   KAFKA_PRODUCER_SECRET                 (unset)               generated on FIRST run only,
-#                                                               then printed exactly once
+#   KAFKA_PRODUCER_SECRET                 (unset)               generated into the 0600 file
+#                                                               named by *_SECRET_FILE and
+#                                                               never printed; no file and
+#                                                               no secret skips the principal
 #   KAFKA_ROTATE_PRODUCER_SECRET          (unset)               truthy replaces an existing
 #                                                               password
 #   KAFKA_SKIP_PRODUCER                   (unset)               truthy skips the producer's
@@ -483,7 +485,7 @@ KAFKA_CLI_KILL_GRACE_SECONDS="${KAFKA_CLI_KILL_GRACE_SECONDS:-5}"
 
 # THE STEADY-STATE PRODUCER PRINCIPAL, and why it has to exist at all.
 #
-# The event publisher inside the server and worker processes authenticates as
+# The event publisher inside the SERVER process authenticates as
 # KAFKA_SASL_USER / KAFKA_SASL_SECRET. Leaving that pair unset makes it fall back to the
 # ADMINISTRATIVE principal, which is a super.user on this broker: it can create and delete
 # topics, mint and revoke SCRAM credentials for every subscriber, and rewrite every ACL. The
@@ -508,7 +510,7 @@ KAFKA_CLI_KILL_GRACE_SECONDS="${KAFKA_CLI_KILL_GRACE_SECONDS:-5}"
 # DEFAULTED TO EMPTY, not to blnk-producer, because empty here means "not stated" and the
 # fallback belongs in one place. require_valid_producer resolves the producer identity as
 # KAFKA_SASL_USER, then KAFKA_PRODUCER_USER, then the default - which is EXACTLY the precedence
-# the compose files apply when they hand the same pair to the server and worker
+# the compose files apply when they hand the same pair to the server
 # (KAFKA_SASL_USER: ${KAFKA_SASL_USER:-${KAFKA_PRODUCER_USER:-}}). The two cannot diverge, which
 # is the whole point: the principal this script MINTS has to be the principal the relay
 # PRESENTS, and a separate default here is how those two quietly become different names.
@@ -1066,9 +1068,33 @@ SUMMARY_GROWTH_REFUSED=()
 #
 # The vocabulary is event_admin.go's, deliberately - created / grown / unchanged - so the
 # shell provisioner and the Go assurance path can be read against each other.
+#
+# EVERY TOPIC LANDS IN EXACTLY ONE OF THESE FOUR, and each count is the length of its own array
+# rather than a subtraction. The counts used to be three arrays and an arithmetic remainder, which
+# could go NEGATIVE: created and grown were appended independently, so a topic this run created and
+# then grew was counted in both and subtracted twice.
+#
+# SUMMARY_RACED is the class that was missing. Provisioning is deliberately concurrent-safe - the
+# compose one-shot and a manual `make kafka_provision` can run together - so "another provisioner
+# did it" is an ordinary outcome, and so is "the broker could not be asked". Neither is a creation,
+# a growth or a no-change, and reporting either as one of those makes the summary say something
+# this run does not know. An operator reading `created: 8` treats it as a rebuilt catalogue with
+# restarted offsets; that reading has to be earned.
 SUMMARY_CREATED=()
 SUMMARY_GROWN=()
+SUMMARY_UNCHANGED=()
+SUMMARY_RACED=()
 SUMMARY_PARTITIONS=()
+# The inputs to reconcile_principal_acls, rebuilt by each caller immediately before it runs.
+#
+# ACL_DESIRED holds the canonical descriptors the configuration asks for; ACL_OWNED_SHAPES
+# holds the (resource type, pattern type, operation) triples this script provisions for that
+# principal, which is what lets a stale grant of ours be told apart from somebody else's
+# binding. Globals rather than parameters because bash cannot pass an array by value, and this
+# script already passes its lists this way - SUBSCRIBER_TOPICS and ALL_TOPICS are read the
+# same way by the functions that grant on them.
+ACL_DESIRED=()
+ACL_OWNED_SHAPES=()
 SUBSCRIBER_TOPICS=()
 SUBSCRIBER_USER=""
 SUBSCRIBER_GROUP_PREFIX=""
@@ -1956,7 +1982,7 @@ require_valid_subscriber() {
     # trailing '.' a required part of a value no shipped surface carried: .env.example, both
     # compose files' kafka-init fallbacks, this script's own usage output and its comment
     # table all named the bare principal. Every default local bring-up therefore died here,
-    # kafka-init restarted on a loop, and because server and worker gate on that service
+    # kafka-init restarted on a loop, and because the server gates on that service
     # completing, the whole stack stayed at "created" with zero topics on a healthy broker
     # (auto-creation is off, so the relay would have had nothing to publish to either). The
     # remedy the message offered - "unset the variable" - could not work: Compose re-injected
@@ -2922,6 +2948,55 @@ topic_geometry() {
     printf '%s %s' "$partitions" "${replication:-0}"
 }
 
+# Report whether a topic exists, distinguishing "absent" from "could not tell".
+#
+# # Why this is not topic_geometry
+#
+# topic_geometry answers empty for BOTH an absent topic and one whose --describe momentarily
+# returns nothing, and the create/grow/unchanged summary was derived from that answer. So a topic
+# that existed but was unreadable for a few hundred milliseconds — a broker mid-election, a
+# metadata refresh, a Describe the admin principal is not granted — was reported as CREATED BY
+# THIS RUN. That is the one thing the summary exists to be trusted about: "created: 8" on a
+# deployment that has been publishing for weeks is read as "the catalogue was lost and rebuilt,
+# and every offset with it", which is an incident. Inferring it from an ambiguous silence made the
+# line unusable as the audit trail the daily outbox-versus-offset reconciliation depends on.
+#
+# --list is used rather than --describe because it answers the question being asked. A topic that
+# appears in the list exists, whatever its geometry, and the list either succeeds or fails as a
+# whole — so a failure is reportable as a failure instead of looking like an empty catalogue.
+# The retry is the same three-attempts-a-second pattern require_topic_geometry uses, for the same
+# reason: a metadata refresh is not an answer.
+#
+# Arguments:
+#   $1 - the topic name.
+# Outputs:
+#   "yes", "no", or "unknown" on stdout. "unknown" means the broker could not be asked, and every
+#   caller must treat it as such rather than as either of the other two.
+topic_presence() {
+    local topic="$1" attempt output status
+
+    for attempt in 1 2 3; do
+        status=0
+        output="$(kafka_topics --list 2>/dev/null)" || status=$?
+
+        if ((status == 0)); then
+            if printf '%s\n' "$output" | grep -Fxq -- "$topic"; then
+                printf '%s' "yes"
+            else
+                printf '%s' "no"
+            fi
+
+            return 0
+        fi
+
+        if ((attempt < 3)); then
+            sleep 1 || true
+        fi
+    done
+
+    printf '%s' "unknown"
+}
+
 # Read a topic's geometry, retrying briefly, and fail if it cannot be read at all.
 #
 # An unreadable geometry used to be accepted: the topic was recorded as "unknown" and the
@@ -2965,11 +3040,45 @@ require_topic_geometry() {
 # Records the OBSERVED partition count and replication factor in SUMMARY_PARTITIONS and
 # SUMMARY_REPLICATION so that the closing summary reports what is actually on the broker
 # rather than what was requested.
+#
+# CLASSIFIES THE TOPIC INTO EXACTLY ONE OF created / grown / unchanged, in the local variable
+# "state", and appends to SUMMARY_CREATED or SUMMARY_GROWN once, at the very end, only after
+# the transition has been CONFIRMED against the broker. Three properties follow from that, and
+# each of them was previously violated:
+#
+#   1. The two buckets are MUTUALLY EXCLUSIVE. They used to be independent appends, so a topic
+#      that appeared during the run and was then grown landed in both - and the summary's
+#      "unchanged" line, computed as total minus created minus grown, printed a NEGATIVE
+#      number. When they collide, created wins: "it was not there and now it is" is the fact
+#      that matters, and it is reported alone rather than alongside a growth of the topic that
+#      same run had just brought into existence.
+#   2. Growth is counted only when THIS RUN's alter succeeded. The append used to happen
+#      BEFORE the alter was issued, so a run whose alter lost a race to a peer provisioner -
+#      the compose one-shot against a manual "make kafka_provision" - reported a growth it did
+#      not perform, and so did a run whose alter failed outright before the re-read decided
+#      whether that mattered.
+#   3. Creation is counted only when the topic was CONFIRMED ABSENT beforehand. See
+#      topic_presence: an unreadable probe is "unknown" and is counted as nothing, because a
+#      created count is this script's loudest signal and must never be manufactured by a
+#      transient metadata read.
+#
+# event_admin.go's EnsureTopics reports the same three words from the same kind of evidence,
+# probing partition counts into partitionsBefore ahead of its create pass, and the two outputs
+# are meant to be readable against each other.
 ensure_topic() {
     local topic="$1" target="$2"
     local output geometry current replication existed_before
+    # Evidence collected as this function proceeds, and read ONCE at the tail to choose exactly
+    # one outcome. Nothing is appended to a summary array before the evidence for it exists.
+    local grew_confirmed="no" grown_elsewhere="no" growth_incomplete="no"
+    # Declared here rather than inside the under-target branch, because the classification at
+    # the tail reads it on every path and `set -u` makes an unset name fatal.
+    local grow_permitted="yes" record_state=""
 
-    # PROBED BEFORE THE CREATE, so this run can say what it actually DID.
+    # PROBED BEFORE THE CREATE, so this run can say what it actually DID. --if-not-exists makes
+    # creation idempotent by making it indistinguishable - an existing topic and a freshly
+    # created one both leave exit 0 - so without this probe the equal-partition arm below would
+    # report every topic as "already correct", including one it had created seconds earlier.
     #
     # --if-not-exists makes creation idempotent by making it indistinguishable: an existing
     # topic and a freshly created one both leave exit 0 and both fall into the same
@@ -2979,21 +3088,17 @@ ensure_topic() {
     # nothing had changed, and the run could not be used as evidence for the outbox-versus-
     # offset reconciliation in docs/kafka-operations.md.
     #
-    # An empty answer means the topic is absent. It can also mean the geometry is momentarily
-    # unreadable, and that ambiguity is safe HERE and only here: the value is used for wording
-    # alone, never for a decision, and require_topic_geometry below refuses the run outright if
-    # the geometry cannot be read after the create. So the worst case is one line that says
-    # "created" about a topic that already existed - while the geometry it then reports is the
-    # broker's own, verified either way. The reverse mistake, silence about a real creation, is
-    # the one that costs an operator the audit trail.
+    # THE PROBE IS topic_presence, WHICH HAS THREE ANSWERS. It used to be `topic_geometry`,
+    # which answers empty for an absent topic AND for one whose geometry is momentarily
+    # unreadable, so an existing topic the broker could not describe for a moment was reported
+    # as created by this run. "created" is the strongest claim this summary makes - it says the
+    # catalogue was rebuilt and its offsets restarted - and it must not rest on an ambiguous
+    # silence. An "unknown" answer is now carried through to its own outcome at the tail rather
+    # than being resolved by guessing.
     #
     # event_admin.go's EnsureTopics resolves this the same way, probing partition counts into
     # partitionsBefore ahead of its create pass and reporting created/grown/unchanged from it.
-    if [[ -z "$(topic_geometry "$topic")" ]]; then
-        existed_before="no"
-    else
-        existed_before="yes"
-    fi
+    existed_before="$(topic_presence "$topic")"
 
     # --if-not-exists is Kafka's own creation idempotency: an existing topic is a no-op with
     # exit 0, whatever its partition count, so the reconciliation below is reached either way.
@@ -3028,7 +3133,6 @@ ensure_topic() {
         #
         # Reported and skipped rather than fatal: an under-partitioned topic is a throughput
         # limit, not an outage, and failing a bring-up over one would be the worse outcome.
-        local record_state grow_permitted="yes"
         record_state="$(topic_record_state "$topic")"
 
         if [[ "$record_state" != "empty" ]] && ! is_truthy "$KAFKA_ALLOW_PARTITION_GROWTH"; then
@@ -3059,7 +3163,9 @@ ensure_topic() {
         # and the summary entry at the tail of this function must still run, so a topic left
         # under-partitioned is still verified and still reported with its real geometry.
         if [[ "$grow_permitted" == "no" ]]; then
-            SUMMARY_GROWTH_REFUSED+=("$topic")
+            # Classified at the tail with every other disposition, so nothing is appended to a
+            # summary array from two places.
+            :
         elif [[ "$record_state" != "empty" ]]; then
             warn "growing '${topic}' from ${current} to ${target} partitions even though it is not" \
                 "known to be empty, because KAFKA_ALLOW_PARTITION_GROWTH is set." \
@@ -3069,7 +3175,11 @@ ensure_topic() {
         fi
 
         if [[ "$grow_permitted" == "yes" ]]; then
-            SUMMARY_GROWN+=("$topic")
+            # NOT RECORDED AS GROWN HERE. The summary used to append the topic at this point,
+            # before the alter had been attempted, so it stayed counted as grown by this run even
+            # when the alter FAILED and the re-read showed that another provisioner had grown it -
+            # the race the block below exists to tolerate. What follows sets the evidence flags
+            # instead, and the tail of this function turns them into exactly one outcome.
             log "growing '${topic}' from ${current} to ${target} partitions"
             if ! output="$(kafka_topics --alter --topic "$topic" --partitions "$target" 2>&1)"; then
                 # Re-read before deciding this is a failure. Two provisioners racing each other -
@@ -3080,6 +3190,7 @@ ensure_topic() {
                 current="${geometry%% *}"
                 replication="${geometry##* }"
                 if ((10#$current >= 10#$target)); then
+                    grown_elsewhere="yes"
                     log "'${topic}' already has ${current} partitions; another provisioner grew it"
                 else
                     printf '%s\n' "$output" | redact >&2
@@ -3094,18 +3205,39 @@ ensure_topic() {
                 fi
             else
                 # Re-read rather than assuming the target was reached, so the summary reports
-                # what the broker has and not what was asked for.
+                # what the broker has and not what was asked for. The re-read is also what
+                # CONFIRMS the growth: an alter that exits 0 is the broker accepting a request,
+                # and this line is the broker agreeing it took effect.
                 geometry="$(require_topic_geometry "$topic")"
                 current="${geometry%% *}"
                 replication="${geometry##* }"
+                if ((10#$current >= 10#$target)); then
+                    grew_confirmed="yes"
+                else
+                    # Accepted and yet not there. Neither "grown" nor "unchanged" is true of this
+                    # topic, so it is neither: it is reported as indeterminate and the geometry
+                    # table below still shows the count the broker actually has.
+                    growth_incomplete="yes"
+                    warn "'${topic}' still reports ${current} partitions after an alter to" \
+                        "${target} was accepted, so this run cannot claim to have grown it." \
+                        "The geometry below is the broker's own. Re-run this script to converge;" \
+                        "it is idempotent, and a partition count only ever increases."
+                fi
             fi
         fi
     elif ((10#$current == 10#$target)); then
-        if [[ "$existed_before" == "no" ]]; then
-            log "created '${topic}' with ${current} partitions"
-        else
-            log "'${topic}' exists with ${current} partitions, already correct"
-        fi
+        case "$existed_before" in
+            no)
+                log "created '${topic}' with ${current} partitions"
+                ;;
+            yes)
+                log "'${topic}' exists with ${current} partitions, already correct"
+                ;;
+            *)
+                log "'${topic}' has ${current} partitions, already correct; whether it existed" \
+                    "before this run could not be determined, so it is reported as unchanged"
+                ;;
+        esac
     else
         # More partitions than configured. Left alone, reported, and NOT an error - matching
         # event_admin.go, which counts this as a refused shrink rather than a failure.
@@ -3125,8 +3257,53 @@ ensure_topic() {
 
     require_topic_replication "$topic" "$replication"
 
-    if [[ "$existed_before" == "no" ]]; then
-        SUMMARY_CREATED+=("$topic")
+    # ONE OUTCOME PER TOPIC, FROM THE EVIDENCE GATHERED ABOVE.
+    #
+    # The four classes are mutually exclusive and every topic lands in exactly one, which is what
+    # makes the counts add up to the catalogue size. They previously did not: "created" and
+    # "grown" were appended independently, so a topic that this run created AND then grew was
+    # counted twice and the unchanged figure - computed by SUBTRACTING both from the total - came
+    # out negative. Nothing here subtracts; each count is the length of its own array.
+    #
+    #   created            absent before this run, and present after it. The strongest claim,
+    #                      because it says the catalogue was rebuilt and its offsets restarted
+    #                      from zero.
+    #   grown              present before, below the target, and THIS RUN's own alter was
+    #                      confirmed to have taken effect. An alter another provisioner won
+    #                      leaves the catalogue in the same state and is NOT this: the summary
+    #                      is what an operator reads to learn what this invocation did, and a
+    #                      run that claims an alter it did not issue makes the audit trail
+    #                      unusable for the one question it answers. Such a topic is `raced`,
+    #                      which names the uncertainty instead of resolving it, and the
+    #                      per-topic line above says "another provisioner grew it".
+    #   under-partitioned  below the target and deliberately left there: it holds records, or
+    #                      could not be proven empty, and growth was not consented to. ITS OWN
+    #                      class, not a kind of `unchanged` - "unchanged" says the catalogue
+    #                      needed nothing, this says it needs a decision, and folded together
+    #                      they print "created=0 grown=0 unchanged=8" for a catalogue stuck at 3
+    #                      partitions against a configured 6.
+    #   raced              the truth is not this run's to report: the pre-state could not be
+    #                      read, an accepted alter has not converged, or this run created the
+    #                      topic and then found it with fewer partitions than it asked for,
+    #                      which can only mean another provisioner created it first. Named
+    #                      rather than folded into one of the others, because a summary that
+    #                      guesses is worse than one that abstains.
+    #   unchanged          present before, at or above the target, with a geometry this run did
+    #                      not change.
+    if [[ "$existed_before" == "unknown" || "$growth_incomplete" == "yes" || "$grown_elsewhere" == "yes" ]]; then
+        SUMMARY_RACED+=("$topic")
+    elif [[ "$existed_before" == "no" ]]; then
+        if [[ "$grew_confirmed" == "yes" ]]; then
+            SUMMARY_RACED+=("$topic")
+        else
+            SUMMARY_CREATED+=("$topic")
+        fi
+    elif [[ "$grew_confirmed" == "yes" ]]; then
+        SUMMARY_GROWN+=("$topic")
+    elif [[ "$grow_permitted" == "no" ]]; then
+        SUMMARY_GROWTH_REFUSED+=("$topic")
+    else
+        SUMMARY_UNCHANGED+=("$topic")
     fi
 
     SUMMARY_TOPICS+=("$topic")
@@ -3186,6 +3363,9 @@ ensure_topics() {
     SUMMARY_REPLICATION=()
     SUMMARY_CREATED=()
     SUMMARY_GROWN=()
+    SUMMARY_UNCHANGED=()
+    SUMMARY_RACED=()
+    SUMMARY_GROWTH_REFUSED=()
     for topic in "${ALL_TOPICS[@]}"; do
         ensure_topic "$topic" "$TARGET_PARTITIONS"
     done
@@ -3193,11 +3373,36 @@ ensure_topics() {
     # Counts, not just a total, so the line records what this run CHANGED. "created=0 grown=0
     # unchanged=8" is a catalogue that was already right; "created=8" on a deployment that has
     # been publishing for weeks says the catalogue was lost and rebuilt, and every offset with
-    # it. The same three words in the same order as event_admin.go's assurance log.
+    # it. The same words in the same order as event_admin.go's assurance log.
+    #
+    # EVERY COUNT IS AN ARRAY LENGTH. The unchanged figure used to be the total minus the other
+    # two, which made it a function of their correctness rather than an observation, and let it
+    # print a negative number when a topic was counted in both. Each topic is now classified once
+    # in ensure_topic, so the four lengths sum to the catalogue size by construction.
+    #
+    # The raced line is printed only when it is non-empty, because an empty class every run is a
+    # line that stops being read - and this one has to be noticed on the run where it appears.
+    local raced_line="" refused_line=""
+    if ((${#SUMMARY_RACED[@]} > 0)); then
+        raced_line="raced     : ${#SUMMARY_RACED[@]} (${SUMMARY_RACED[*]}) - another provisioner acted, or the broker could not be asked; re-run to confirm"
+    fi
+
+    # The deliberate refusals, which the array beside SUMMARY_TOPICS was declared to report and
+    # nothing ever printed. A topic left under-partitioned because it holds records is a standing
+    # throughput limit that only a warning mid-run mentioned, and a warning several screens above
+    # a success line is one nobody acts on. It is its OWN disposition rather than a kind of
+    # `unchanged`, so this line and the count agree with each other and with the four figures
+    # above summing to the catalogue.
+    if ((${#SUMMARY_GROWTH_REFUSED[@]} > 0)); then
+        refused_line="under-partitioned : ${#SUMMARY_GROWTH_REFUSED[@]} (${SUMMARY_GROWTH_REFUSED[*]}) - holding records, or not provably empty, and growth was not consented to; see the warnings above"
+    fi
+
     ok "all ${#SUMMARY_TOPICS[@]} topics are present with a verified geometry" \
         "created   : ${#SUMMARY_CREATED[@]}${SUMMARY_CREATED[*]:+ (${SUMMARY_CREATED[*]})}" \
         "grown     : ${#SUMMARY_GROWN[@]}${SUMMARY_GROWN[*]:+ (${SUMMARY_GROWN[*]})}" \
-        "unchanged : $((${#SUMMARY_TOPICS[@]} - ${#SUMMARY_CREATED[@]} - ${#SUMMARY_GROWN[@]}))"
+        "unchanged : ${#SUMMARY_UNCHANGED[@]}" \
+        ${raced_line:+"$raced_line"} \
+        ${refused_line:+"$refused_line"}
 }
 
 # ---------------------------------------------------------------------------------------
@@ -3564,7 +3769,7 @@ commit_staged_secret() {
 # word itself was emitted into the operator's console mid-sentence. The consequences differed
 # by caller and both were bad: the producer branch took its `preserved` short-circuit and the
 # run reported SUCCESS with no credential on the broker at all - a green bring-up followed by
-# a SASL failure the server and worker could not explain - while the subscriber branch fell
+# a SASL failure the server could not explain - while the subscriber branch fell
 # through to the credential upsert with an EMPTY password, which the broker refuses, failing
 # a run that had nothing wrong with it. It also made two of the subscriber branches
 # unreachable, so the documented one-time secret-file delivery never happened on a first run.
@@ -3783,6 +3988,441 @@ principal_is_known() {
     return 1
 }
 
+# ---------------------------------------------------------------------------------------
+# ACL reconciliation
+#
+# WHY RECONCILIATION AND NOT JUST "--add"
+#
+# Every ACL grant in this script used to be a bare "kafka-acls --add", which is idempotent
+# and was described as needing no existence check. Idempotent is not the same as
+# CONVERGENT: --add can only ever widen. So this script could grow a grant and never narrow
+# one, and narrowing is the direction that matters for an authorization control.
+#
+# Three ordinary operations narrowed a grant and were then silently ignored:
+#
+#   1. Removing a category from KAFKA_SAMPLE_SUBSCRIBER_TOPICS. The re-run added the smaller
+#      set, every previous topic's Read and Describe binding stayed, and the summary printed
+#      the SMALL list while the broker still served the large one.
+#   2. Changing KAFKA_TOPIC_PREFIX. Both principals kept full grants on the whole previous
+#      namespace, which is a live grant on topics the deployment no longer considers its own.
+#   3. Renaming the sample subscriber or its consumer group. The old prefixed GROUP binding
+#      survived, leaving a reserved namespace nothing owns.
+#
+# Each of those is a configuration change an operator would reasonably expect to take
+# effect, and in each case the effective grant stayed broader than the configuration - with
+# a run that reported success. That is the same defect class as a stale credential, and it
+# is fixed the same way: converge to the desired set rather than append to whatever is
+# there.
+#
+# THE ORDER IS DELETE-THEN-CREATE
+#
+# Deliberately, and it is the safe order. Every partial failure must leave a principal with
+# FEWER rights than the configuration describes, never more. Deleting first satisfies that:
+# a reconciliation that dies between the two steps has removed access it was about to
+# re-grant, which the next run restores. Creating first and then failing to delete leaves
+# live access nothing describes. event_admin.go's reconcileSubscriberACLs orders its two
+# round trips the same way and for the same reason, and this script is the local-stack
+# counterpart of that function - the two must not disagree about what a principal's grant is.
+#
+# WHAT COUNTS AS "OURS" TO REMOVE
+#
+# Only bindings whose SHAPE this script provisions, where a shape is the triple
+# (resource type, pattern type, operation) - Read and Describe on a LITERAL topic and Read
+# on a PREFIXED group for a subscriber; Write and Describe on a LITERAL topic for the
+# producer. Those are the dimensions this script owns, and a binding of an owned shape whose
+# resource is not in the desired set is surplus and is removed.
+#
+# Everything else on the principal is FOREIGN and is never removed by this script, because
+# this script did not create it and cannot know what it is for. Foreign bindings are instead
+# classified the way blnkManagedACLBinding and foreignACLBindingWidens classify them:
+#
+#   - An explicit DENY is reported and left alone. It can only narrow the effective grant,
+#     so it is safe to keep - and removing it would WIDEN access, which no reconciliation
+#     here may do as a side effect.
+#   - Anything that can GRANT - an ALLOW of an unowned shape, or a permission type the
+#     broker did not state as Allow or Deny - is FATAL. The effective grant is then broader
+#     than the configuration by an amount this script cannot bound, so it refuses rather
+#     than reporting a grant it cannot state. Fail closed, exactly as issuance does.
+#
+# THE THREE PROHIBITIONS STILL HOLD, and reconciliation does not relax them: no wildcard
+# topic pattern, no Write for a subscriber, and no log line that can interpolate the
+# administrative password. What it adds is a fourth: no grant survives a configuration that
+# no longer asks for it.
+# ---------------------------------------------------------------------------------------
+
+# The canonical descriptor of one ACL binding, as a single "|"-delimited field list.
+#
+# Written once, here, so the desired set and the observed set are built by the same code and
+# can be compared by string equality. A mismatch in field order or letter case between the
+# two constructions would read as "every binding is surplus, and every desired binding is
+# missing" - a reconciliation that deletes a correct grant and immediately re-creates it,
+# which is both alarming in the log and a real, if brief, loss of access.
+#
+# Parameters:
+#   $1 resource type  - TOPIC or GROUP, upper case, as the broker reports it.
+#   $2 resource name  - the topic name or the group prefix, verbatim.
+#   $3 pattern type   - LITERAL or PREFIXED, upper case.
+#   $4 operation      - READ, DESCRIBE or WRITE, upper case.
+#   $5 host           - the ACL host, normally "*".
+acl_descriptor() {
+    printf '%s|%s|%s|%s|%s' "$1" "$2" "$3" "$4" "$5"
+}
+
+# The shape of a binding: what it is, without which resource it names.
+#
+# This is the predicate for ownership. Two bindings of the same shape are provisioned by the
+# same code path here, so a binding of an owned shape on an unexpected resource is a stale
+# grant of ours rather than somebody else's binding.
+acl_shape() {
+    local descriptor="$1"
+    local type name pattern operation
+
+    IFS='|' read -r type name pattern operation _ <<<"$descriptor"
+
+    printf '%s|%s|%s' "$type" "$pattern" "$operation"
+}
+
+# Read every ACL binding the broker currently holds for one principal.
+#
+# Prints one canonical descriptor per line with the permission type appended as a sixth
+# field, sorted, deduplicated:
+#
+#     TOPIC|blnk.transactions|LITERAL|READ|*|ALLOW
+#
+# The parse is anchored on the two line shapes "kafka-acls --list" emits and ignores
+# everything else, which is what makes it safe to merge the CLI's own stderr into the input:
+# a JVM warning matches neither shape. Resource names in Kafka cannot contain a comma, so the
+# comma-delimited field extraction is exact rather than heuristic.
+#
+# A FAILED READ IS FATAL. It has to be: reconciliation removes bindings, and an empty answer
+# that actually means "could not tell" would be read as "this principal has nothing", which
+# converges to the desired set by creating everything and removing nothing. That is the
+# harmless direction, but the same empty answer with a SMALLER desired set would report a
+# successful narrowing that never happened - the exact defect this function exists to fix.
+describe_principal_acls() {
+    local principal="$1" output status
+
+    output="$(kafka_acls --list --principal "$principal" 2>&1)" && status=0 || status=$?
+
+    if ((status != 0)); then
+        printf '%s\n' "$output" | redact >&2
+        die "could not read the ACL bindings currently held by ${principal}." \
+            "The broker's own output is above. This is fatal rather than treated as 'no" \
+            "bindings' because the next step REMOVES the bindings this run does not want, and" \
+            "an unreadable answer would let it report a narrowing it had not performed." \
+            "The two usual causes:" \
+            "  1. $(admin_identity_label) lacks Describe authority on the cluster - add the" \
+            "     principal to the broker's super.users;" \
+            "  2. no authorizer is configured, so the broker has no ACL store to read." \
+            "     KRaft needs ${REQUIRED_AUTHORIZER}."
+    fi
+
+    printf '%s\n' "$output" | awk '
+        /^Current ACLs for resource/ {
+            rt = ""; rn = ""; pt = ""
+            if (match($0, /resourceType=[A-Z_]+/))   rt = substr($0, RSTART + 13, RLENGTH - 13)
+            if (match($0, /name=[^,]+/))             rn = substr($0, RSTART + 5,  RLENGTH - 5)
+            if (match($0, /patternType=[A-Z_]+/))    pt = substr($0, RSTART + 12, RLENGTH - 12)
+            next
+        }
+        /\(principal=/ {
+            if (rt == "") next
+            op = ""; pm = ""; hs = ""
+            if (match($0, /operation=[A-Z_]+/))      op = substr($0, RSTART + 10, RLENGTH - 10)
+            if (match($0, /permissionType=[A-Z_]+/)) pm = substr($0, RSTART + 15, RLENGTH - 15)
+            if (match($0, /host=[^,]+/))             hs = substr($0, RSTART + 5,  RLENGTH - 5)
+            if (op == "" || pm == "") next
+            print rt "|" rn "|" pt "|" op "|" hs "|" pm
+        }
+    ' | LC_ALL=C sort -u
+}
+
+# Add or remove exactly one binding, named field by field.
+#
+# One binding per call rather than a batch. It is more round trips, and it buys the thing that
+# matters when a reconciliation goes wrong: the failure message names the single binding that
+# could not be written, instead of a batch whose partial application has to be inferred.
+#
+# Parameters:
+#   $1 action     - "--add" or "--remove".
+#   $2 principal  - the full "User:<name>" form.
+#   $3 descriptor - a canonical descriptor from acl_descriptor.
+#
+# Returns 0 on success. On failure it prints the broker's redacted output to stderr and
+# returns non-zero; the caller decides whether that is fatal.
+apply_acl_binding() {
+    local action="$1" principal="$2" descriptor="$3"
+    local type name pattern operation host output resource_flag=()
+
+    IFS='|' read -r type name pattern operation host <<<"$descriptor"
+
+    case "$type" in
+        TOPIC) resource_flag=(--topic "$name") ;;
+        GROUP) resource_flag=(--group "$name") ;;
+        *)
+            # Unreachable through either caller: the desired sets are built from TOPIC and
+            # GROUP shapes only, and a foreign shape is refused before anything is applied.
+            # Guarded anyway, because the alternative to a named refusal here is a
+            # kafka-acls invocation with no resource flag, which Kafka would apply to
+            # something other than what was asked for.
+            die "internal: cannot ${action#--} an ACL binding on resource type '${type}'." \
+                "This script provisions TOPIC and GROUP bindings only."
+            ;;
+    esac
+
+    # --force suppresses the interactive confirmation --remove would otherwise prompt for.
+    # Without it a removal run under the compose one-shot reads EOF from /dev/null and
+    # abandons the removal, which would leave the stale binding in place while the run
+    # reported success.
+    if ! output="$(kafka_acls "$action" --force \
+        --allow-principal "$principal" \
+        --allow-host "$host" \
+        --operation "$operation" \
+        "${resource_flag[@]}" \
+        --resource-pattern-type "$pattern" 2>&1)"; then
+        printf '%s\n' "$output" | redact >&2
+
+        return 1
+    fi
+
+    return 0
+}
+
+# Make the broker's owned bindings for one principal EXACTLY the desired set.
+#
+# Reads two global arrays, which is this script's established way of passing a list into a
+# function:
+#
+#   ACL_DESIRED        canonical descriptors the configuration asks for.
+#   ACL_OWNED_SHAPES   shapes this script provisions for this principal, so a binding of an
+#                      owned shape on an undesired resource is recognised as stale.
+#
+# Verifies the end state by re-reading it, rather than trusting that a successful --add and a
+# successful --remove leave the broker where they were asked to. A grant is the thing this
+# script exists to establish; "the commands returned zero" is not the same claim as "the
+# broker now holds exactly this".
+#
+# Parameters:
+#   $1 principal - the full "User:<name>" form.
+#   $2 label     - what to call this principal in the output, e.g. "subscriber".
+reconcile_principal_acls() {
+    local principal="$1" label="$2"
+    local observed=() surplus=() missing=() foreign_allow=() foreign_deny=()
+    local line descriptor shape wanted found permission
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        observed+=("$line")
+    done < <(describe_principal_acls "$principal")
+
+    # Classify what is there. Every observed binding lands in exactly one of four buckets, so
+    # nothing is silently unaccounted for.
+    for line in "${observed[@]}"; do
+        permission="${line##*|}"
+        descriptor="${line%|*}"
+        shape="$(acl_shape "$descriptor")"
+
+        if [[ "$permission" != "ALLOW" ]]; then
+            if [[ "$permission" == "DENY" ]]; then
+                foreign_deny+=("${descriptor} (${permission})")
+            else
+                # Neither ALLOW nor DENY: UNKNOWN, or the ANY filter value leaking into a
+                # described binding. Counted as widening, because a permission the broker did
+                # not state definitively cannot be shown to narrow anything, and "I could not
+                # tell" must never be recorded as "it is safe".
+                foreign_allow+=("${descriptor} (${permission})")
+            fi
+
+            continue
+        fi
+
+        found=no
+        for wanted in "${ACL_OWNED_SHAPES[@]}"; do
+            if [[ "$shape" == "$wanted" ]]; then
+                found=yes
+                break
+            fi
+        done
+
+        if [[ "$found" == "no" ]]; then
+            foreign_allow+=("$descriptor")
+
+            continue
+        fi
+
+        found=no
+        for wanted in "${ACL_DESIRED[@]}"; do
+            if [[ "$descriptor" == "$wanted" ]]; then
+                found=yes
+                break
+            fi
+        done
+
+        if [[ "$found" == "no" ]]; then
+            surplus+=("$descriptor")
+        fi
+    done
+
+    if ((${#foreign_deny[@]} > 0)); then
+        warn "${principal} carries DENY ACL bindings this script does not provision, and they" \
+            "are being LEFT IN PLACE: $(join_commas "${foreign_deny[@]}")." \
+            "A deny can only narrow what the grant allows, so removing one would widen access" \
+            "as a side effect of provisioning - which this script will not do." \
+            "The ${label} may therefore be able to do LESS than the grant below suggests."
+    fi
+
+    # REFUSED BEFORE ANYTHING IS WRITTEN, so a principal whose effective grant this script
+    # cannot state is left exactly as it was found. Matching reconcileSubscriberACLs, which
+    # refuses issuance on the same condition rather than minting a credential under a boundary
+    # the broker is not enforcing.
+    if ((${#foreign_allow[@]} > 0)); then
+        die "${principal} carries ACL bindings this script did not provision and that GRANT" \
+            "access: $(join_commas "${foreign_allow[@]}")." \
+            "Its effective grant is therefore broader than this configuration describes, by an" \
+            "amount this script cannot bound - so nothing has been added or removed and the" \
+            "broker is exactly as it was found." \
+            "Blnk's own credential issuance refuses on the same condition, so a subscriber in" \
+            "this state cannot be provisioned through the API either." \
+            "Fix: remove the bindings above by hand with 'kafka-acls --remove', then re-run." \
+            "If one of them is deliberate, it belongs on a principal this script does not" \
+            "manage - this one is reconciled to the configuration on every run."
+    fi
+
+    for descriptor in "${ACL_DESIRED[@]}"; do
+        found=no
+        for line in "${observed[@]}"; do
+            if [[ "${line%|*}" == "$descriptor" && "${line##*|}" == "ALLOW" ]]; then
+                found=yes
+                break
+            fi
+        done
+
+        if [[ "$found" == "no" ]]; then
+            missing+=("$descriptor")
+        fi
+    done
+
+    # DELETE FIRST. See the section header: every partial failure must leave the principal
+    # narrower than the configuration, never broader.
+    for descriptor in "${surplus[@]}"; do
+        log "revoking a grant the configuration no longer asks for" \
+            "principal: ${principal}" \
+            "binding  : ${descriptor}"
+
+        if ! apply_acl_binding --remove "$principal" "$descriptor"; then
+            die "could not revoke the obsolete ACL binding '${descriptor}' from ${principal}." \
+                "The broker's own output is above. The binding is still in place, so the" \
+                "${label}'s effective grant remains broader than this configuration describes." \
+                "The two usual causes:" \
+                "  1. $(admin_identity_label) lacks Alter authority on the cluster - add the" \
+                "     principal to the broker's super.users;" \
+                "  2. no authorizer is configured, so the broker has no ACL store to write to." \
+                "     KRaft needs ${REQUIRED_AUTHORIZER}."
+        fi
+    done
+
+    for descriptor in "${missing[@]}"; do
+        if ! apply_acl_binding --add "$principal" "$descriptor"; then
+            die "could not grant the ACL binding '${descriptor}' to ${principal}." \
+                "The broker's own output is above. The two usual causes:" \
+                "  1. $(admin_identity_label) lacks Alter authority on the cluster - add the" \
+                "     principal to the broker's super.users;" \
+                "  2. no authorizer is configured, so the broker has nowhere to store an ACL." \
+                "     KRaft needs ${REQUIRED_AUTHORIZER}; without it ACLs are meaningless and" \
+                "     isolation cannot be enforced at all."
+        fi
+    done
+
+    # VERIFIED, not assumed. Re-read and compare both directions, so the run's success claim is
+    # a statement about the broker rather than about the exit statuses of the commands above.
+    #
+    # RETRIED, because an ACL write is committed to the metadata log before the CLI returns but
+    # a subsequent read can be served by a broker whose authorizer cache has not caught up.
+    # Three attempts a second apart distinguish "still propagating" from "did not happen", the
+    # same way require_topic_geometry distinguishes them for a freshly created topic.
+    #
+    # THE TWO OUTCOMES ARE NOT SYMMETRIC, and they are handled differently on purpose:
+    #
+    #   - A surplus binding STILL PRESENT after a successful remove means the principal's grant
+    #     is still broader than the configuration. That is the direction this whole function
+    #     exists to prevent, and it is FATAL: a run must not report a narrowing it cannot see.
+    #   - A desired binding STILL MISSING after a successful add means the grant is NARROWER
+    #     than intended. That fails safely and announces itself the moment the client connects,
+    #     so it is reported loudly and does not abort a run that may have other work to finish -
+    #     aborting would leave a half-provisioned deployment over the less dangerous of the two
+    #     divergences.
+    if ((${#surplus[@]} > 0 || ${#missing[@]} > 0)); then
+        local attempt remaining=() still_present=() still_missing=()
+
+        for attempt in 1 2 3; do
+            remaining=()
+            still_present=()
+            still_missing=()
+
+            while IFS= read -r line; do
+                [[ -n "$line" ]] || continue
+                remaining+=("$line")
+            done < <(describe_principal_acls "$principal")
+
+            for descriptor in "${surplus[@]}"; do
+                for line in "${remaining[@]}"; do
+                    if [[ "${line%|*}" == "$descriptor" ]]; then
+                        still_present+=("$descriptor")
+                        break
+                    fi
+                done
+            done
+
+            for descriptor in "${ACL_DESIRED[@]}"; do
+                found=no
+                for line in "${remaining[@]}"; do
+                    if [[ "${line%|*}" == "$descriptor" && "${line##*|}" == "ALLOW" ]]; then
+                        found=yes
+                        break
+                    fi
+                done
+                if [[ "$found" == "no" ]]; then
+                    still_missing+=("$descriptor")
+                fi
+            done
+
+            if ((${#still_present[@]} == 0 && ${#still_missing[@]} == 0)); then
+                break
+            fi
+
+            if ((attempt < 3)); then
+                sleep 1 || true
+            fi
+        done
+
+        if ((${#still_present[@]} > 0)); then
+            die "the broker still holds ACL bindings this run revoked from ${principal}:" \
+                "$(join_commas "${still_present[@]}")." \
+                "Every remove reported success, so the grant is still broader than this" \
+                "configuration describes and the run must not report otherwise - most often" \
+                "because another provisioner is writing the same principal's ACLs concurrently." \
+                "Re-run this script; it converges, so a second run either succeeds or fails the" \
+                "same way with the same list."
+        fi
+
+        if ((${#still_missing[@]} > 0)); then
+            warn "${principal} is missing ACL bindings this run granted it:" \
+                "$(join_commas "${still_missing[@]}")." \
+                "Every add reported success, so either the broker's authorizer cache has not" \
+                "caught up after three attempts, or the grant did not take." \
+                "This fails SAFE - the principal can do less than intended, not more - and it" \
+                "will surface as an authorization failure the moment a client connects." \
+                "Re-run this script to converge; it is idempotent."
+        fi
+    fi
+
+    ok "reconciled the ${label} grant for ${principal}" \
+        "desired : ${#ACL_DESIRED[@]} binding(s)" \
+        "granted : ${#missing[@]} added" \
+        "revoked : ${#surplus[@]} removed (grants the configuration no longer asks for)" \
+        "left    : ${#foreign_deny[@]} foreign deny binding(s) untouched"
+}
+
 # Grant the producer exactly Write and Describe, on every topic Blnk publishes to.
 #
 # WHY DESCRIBE AS WELL AS WRITE. A Kafka producer fetches topic metadata before it can choose
@@ -3800,43 +4440,44 @@ principal_is_known() {
 # cmd/server.go; Read on anything, because a producer consumes nothing; and any group grant,
 # because a producer joins no consumer group. Each omission is what keeps a leaked producer
 # credential to the smallest possible blast radius - it can write events, and nothing else.
+#
+# RECONCILED, NOT APPENDED. The grant converges on ALL_TOPICS rather than being added to it,
+# which is what makes a KAFKA_TOPIC_PREFIX change take effect: without it the producer kept
+# full Write and Describe on the whole previous namespace indefinitely. See the ACL
+# reconciliation header above.
 grant_producer_acls() {
     local user="$1"
     local principal="${ACL_PRINCIPAL_PREFIX}${user}"
-    local topic output
+    local topic
 
-    log "granting ACLs to ${principal}" \
+    log "reconciling ACLs for ${principal}" \
         "topics : $(join_commas "${ALL_TOPICS[@]}")" \
         "grants : Write, Describe (no Read, no group, no cluster authority)" \
         "host   : ${ACL_HOST_ANY}"
 
-    # Literal patterns, one binding per topic, rather than one prefixed pattern on the topic
-    # prefix. A prefixed grant on "blnk" would also cover any future topic whose name begins
-    # that way, including ones this feature does not own, so the narrower form is used even
-    # though it costs one binding per topic instead of one in total. kafka-acls --add is
-    # idempotent, so re-runs need no existence check.
+    # Literal patterns, one binding per topic and operation, rather than one prefixed pattern
+    # on the topic prefix. A prefixed grant on "blnk" would also cover any future topic whose
+    # name begins that way, including ones this feature does not own, so the narrower form is
+    # used even though it costs one binding per topic instead of one in total.
+    ACL_DESIRED=()
+    ACL_OWNED_SHAPES=(
+        "TOPIC|LITERAL|WRITE"
+        "TOPIC|LITERAL|DESCRIBE"
+    )
+
     for topic in "${ALL_TOPICS[@]}"; do
-        if ! output="$(kafka_acls --add \
-            --allow-principal "$principal" \
-            --allow-host "$ACL_HOST_ANY" \
-            --operation Write \
-            --operation Describe \
-            --topic "$topic" \
-            --resource-pattern-type literal 2>&1)"; then
-            printf '%s\n' "$output" | redact >&2
-            die "could not grant Write and Describe on topic '${topic}' to ${principal}." \
-                "The broker's own output is above. The two usual causes:" \
-                "  1. $(admin_identity_label) lacks Alter authority on the cluster - add" \
-                "     the principal to the broker's super.users;" \
-                "  2. no authorizer is configured, so the broker has nowhere to store an ACL." \
-                "     KRaft needs ${REQUIRED_AUTHORIZER}." \
-                "Without this binding the relay authenticates and then fails every publish," \
-                "which surfaces as events accumulating in blnk.event_outbox with a" \
-                "TOPIC_AUTHORIZATION_FAILED last_error."
-        fi
+        ACL_DESIRED+=(
+            "$(acl_descriptor TOPIC "$topic" LITERAL WRITE "$ACL_HOST_ANY")"
+            "$(acl_descriptor TOPIC "$topic" LITERAL DESCRIBE "$ACL_HOST_ANY")"
+        )
     done
 
-    ok "granted Write and Describe on ${#ALL_TOPICS[@]} topics to ${principal}"
+    # Every failure path inside the reconciler is fatal and names the binding it could not
+    # write. The one worth spelling out for this principal: without a Write binding the relay
+    # authenticates and then fails every publish, which surfaces as events accumulating in
+    # blnk.event_outbox with a TOPIC_AUTHORIZATION_FAILED last_error rather than as anything
+    # that looks like a permissions problem.
+    reconcile_principal_acls "$principal" "producer"
 }
 
 # Refuse a rotation that has nowhere to deliver the new password.
@@ -3852,7 +4493,7 @@ grant_producer_acls() {
 # nobody asked for. A rotation is different: the operator asked for a new credential in so
 # many words. Quietly doing nothing would leave them believing the old password had been
 # replaced — and for the PRODUCER it is worse still, because a rotation that half-succeeded
-# would leave the running server and worker presenting a password nobody holds.
+# would leave the running server presenting a password nobody holds.
 #
 # The generated value cannot simply be printed instead. This script runs as the compose
 # kafka-init service, whose stdout is a container log that retains the credential for the
@@ -4204,7 +4845,7 @@ ensure_sample_subscriber() {
 # Create or update the producer's SCRAM credential, then grant its Write and Describe bindings.
 #
 # The credential discipline is the sample subscriber's, for the same reason: a routine
-# bring-up must not invalidate the credential a running server and worker are authenticating
+# bring-up must not invalidate the credential a running server is authenticating
 # with. An existing SCRAM-SHA-512 credential is preserved unless a value is supplied or a
 # rotation is explicitly requested, and a generated value is delivered to a mode-0600 file
 # rather than printed.
@@ -4219,7 +4860,7 @@ ensure_producer_principal() {
             "KAFKA_SKIP_PRODUCER is set. The topics above were still assured." \
             "This is the right setting for a broker whose principals are managed elsewhere." \
             "Remember that Blnk REFUSES TO PUBLISH as the administrative principal: the" \
-            "server and worker still need KAFKA_SASL_USER and KAFKA_SASL_SECRET naming a" \
+            "server still needs KAFKA_SASL_USER and KAFKA_SASL_SECRET naming a" \
             "principal with Write and Describe on the topics above."
         PRODUCER_PROVISIONED="skipped"
 
@@ -4257,13 +4898,13 @@ ensure_producer_principal() {
         PRODUCER_SECRET_DISPOSITION="preserved"
         log "keeping the existing SCRAM credential for '${user}'" \
             "It already holds a ${SCRAM_MECHANISM} credential, so this run does not touch it:" \
-            "replacing it would stop the running server and worker from authenticating." \
+            "replacing it would stop the running server from authenticating." \
             "The grant below is still asserted, because ACL addition is idempotent." \
             "To replace the password deliberately, set KAFKA_PRODUCER_SECRET, or set" \
             "KAFKA_ROTATE_PRODUCER_SECRET=1 with KAFKA_PRODUCER_SECRET_FILE configured."
     elif ! require_determinate_credential_state "$user"; then
         # As for the sample subscriber, and the consequence here is larger: rotating this
-        # credential stops the running server and worker from authenticating, so an
+        # credential stops the running server from authenticating, so an
         # indeterminate probe must never reach the generation arm below.
         PRODUCER_SECRET_DISPOSITION="indeterminate"
         PRODUCER_PROVISIONED="skipped"
@@ -4277,7 +4918,7 @@ ensure_producer_principal() {
         # SKIPPED rather than failed, matching the sample subscriber: the topics are what the
         # relay needs, and failing here would mean a bring-up with no .env could not start the
         # broker at all. The message is emphatic because the consequence is not cosmetic - the
-        # server and worker will refuse to construct their publisher without this pair.
+        # server will refuse to construct its publisher without this pair.
         PRODUCER_SECRET_DISPOSITION="skipped"
         PRODUCER_PROVISIONED="skipped"
         log "skipping the steady-state producer principal: no password to give it" \
@@ -4286,7 +4927,7 @@ ensure_producer_principal() {
             "credential indefinitely." \
             "THIS MATTERS MORE THAN THE SAMPLE SUBSCRIBER: with an administrative pair" \
             "configured and no producer pair, Blnk's event publisher REFUSES TO CONSTRUCT and" \
-            "the server and worker do not start. Blnk will not publish as the administrator." \
+            "the server does not start. Blnk will not publish as the administrator." \
             "To create it, any one of:" \
             "  - run 'stack.sh --init', which generates KAFKA_PRODUCER_SECRET and the matching" \
             "    KAFKA_SASL_USER and KAFKA_SASL_SECRET into a mode-0600 .env;" \
@@ -4338,7 +4979,7 @@ ensure_producer_principal() {
     # justified it as "the CLI offers no alternative", and the subscriber leg forty lines above
     # disproves that in the same file: --add-config-file is available and is described there as
     # a complete remedy rather than a mitigation. Leaving the STEADY-STATE PRODUCER - the
-    # long-lived identity the server and worker authenticate as - on the weaker of two paths
+    # long-lived identity the server authenticates as - on the weaker of two paths
     # this file already implements was indefensible.
     #
     # No square brackets, for the reason recorded at the subscriber's upsert: in a properties
@@ -4349,8 +4990,8 @@ ensure_producer_principal() {
     # A generated password has exactly one copy, and it is in this shell. If the broker
     # accepted the credential and the file could not then be written, the account would be
     # live with an unrecoverable password: SCRAM keeps a salted verifier, so the broker
-    # cannot be asked what it now accepts, and the server and worker - which authenticate as
-    # this very principal - would refuse to construct their publisher and fail to start.
+    # cannot be asked what it now accepts, and the server - which authenticates as
+    # this very principal - would refuse to construct its publisher and fail to start.
     # Staging first turns every one of those failures - absent directory,
     # read-only mount, wrong owner, no space, unsettable mode - into a clean abort that
     # leaves the broker exactly as it was and is safe to re-run.
@@ -4405,8 +5046,8 @@ ensure_producer_principal() {
             "user     : ${user}" \
             "mechanism: ${SCRAM_MECHANISM} (${KAFKA_SCRAM_ITERATIONS} iterations)" \
             "Put this user and the password from that file into KAFKA_SASL_USER and" \
-            "KAFKA_SASL_SECRET for the server and worker, or they will refuse to construct" \
-            "their event publisher rather than publish as the administrator."
+            "KAFKA_SASL_SECRET for the server, or it will refuse to construct" \
+            "its event publisher rather than publish as the administrator."
     else
         log "used the KAFKA_PRODUCER_SECRET you supplied; it is not echoed"
     fi
@@ -4432,10 +5073,10 @@ ensure_producer_principal() {
 # enumerating groups, so a subscriber can run as many consumer groups as it likes under its
 # own prefix and none of them needs a new ACL - while it still cannot join anybody else's.
 #
-# THREE PROHIBITIONS, HELD BY HAND
+# FOUR PROHIBITIONS, HELD BY HAND
 #
-# event_admin_test.go asserts all three for the Go path. There is no equivalent automated
-# test for a shell script, which is exactly why they are written down here:
+# event_admin_test.go asserts the equivalents for the Go path. There is no equivalent
+# automated test for a shell script, which is exactly why they are written down here:
 #
 #   1. NEVER a wildcard topic pattern. No --topic '*', no wildcard resource-pattern type.
 #      Every topic is named explicitly with a literal pattern. A wildcard grant is
@@ -4444,57 +5085,46 @@ ensure_producer_principal() {
 #      produce to a category topic could forge ledger events.
 #   3. NEVER surface the administrative password. It exists only inside the 0600
 #      client-properties file, and no log line in this script can interpolate it.
+#   4. NEVER leave a grant the configuration no longer asks for. The three bindings above are
+#      the WHOLE grant, not a minimum: reconcile_principal_acls removes any owned binding
+#      outside them, because an --add-only provisioner can widen a grant and can never narrow
+#      one. See the ACL reconciliation header further up.
 # ---------------------------------------------------------------------------------------
 
 grant_subscriber_acls() {
     local user="$1" group_prefix="$2"
     local principal="${ACL_PRINCIPAL_PREFIX}${user}"
-    local topic output
+    local topic
 
-    log "granting ACLs to ${principal}" \
+    log "reconciling ACLs for ${principal}" \
         "topics : $(join_commas "${SUBSCRIBER_TOPICS[@]}")" \
         "group  : ${group_prefix} (prefixed)" \
         "host   : ${ACL_HOST_ANY}"
 
-    # kafka-acls --add is idempotent: re-adding an existing binding succeeds as a no-op, so
-    # re-runs need no existence check.
+    # THE GRANT AS A SET, so removing a category from KAFKA_SAMPLE_SUBSCRIBER_TOPICS or
+    # renaming the principal's consumer group actually narrows what the broker serves. Adding
+    # the smaller set and leaving the previous bindings in place - which is all --add can do -
+    # left the summary printing the small list while the broker still served the large one.
+    ACL_DESIRED=()
+    ACL_OWNED_SHAPES=(
+        "TOPIC|LITERAL|READ"
+        "TOPIC|LITERAL|DESCRIBE"
+        "GROUP|PREFIXED|READ"
+    )
+
     for topic in "${SUBSCRIBER_TOPICS[@]}"; do
-        if ! output="$(kafka_acls --add \
-            --allow-principal "$principal" \
-            --allow-host "$ACL_HOST_ANY" \
-            --operation Read \
-            --operation Describe \
-            --topic "$topic" \
-            --resource-pattern-type literal 2>&1)"; then
-            printf '%s\n' "$output" | redact >&2
-            die "could not grant Read and Describe on topic '${topic}' to ${principal}." \
-                "The broker's own output is above. The two usual causes:" \
-                "  1. $(admin_identity_label) lacks Alter authority on the cluster - add" \
-                "     the principal to the broker's super.users;" \
-                "  2. no authorizer is configured, so the broker has nowhere to store an ACL." \
-                "     KRaft needs ${REQUIRED_AUTHORIZER}; without it ACLs are meaningless and" \
-                "     subscriber isolation cannot be enforced at all."
-        fi
+        ACL_DESIRED+=(
+            "$(acl_descriptor TOPIC "$topic" LITERAL READ "$ACL_HOST_ANY")"
+            "$(acl_descriptor TOPIC "$topic" LITERAL DESCRIBE "$ACL_HOST_ANY")"
+        )
     done
 
-    if ! output="$(kafka_acls --add \
-        --allow-principal "$principal" \
-        --allow-host "$ACL_HOST_ANY" \
-        --operation Read \
-        --group "$group_prefix" \
-        --resource-pattern-type prefixed 2>&1)"; then
-        printf '%s\n' "$output" | redact >&2
-        die "could not grant Read on consumer groups prefixed '${group_prefix}' to ${principal}." \
-            "The broker's own output is above. Without this binding the principal can" \
-            "authenticate and describe its topics but cannot join a consumer group or commit" \
-            "an offset, which looks like a consumer that starts and then does nothing." \
-            "Fix: the same two causes as the topic grants above - give" \
-            "$(admin_identity_label) Alter authority on the cluster by adding the principal" \
-            "to the broker's super.users, and make sure KRaft has ${REQUIRED_AUTHORIZER}" \
-            "configured so the broker has somewhere to store an ACL at all."
-    fi
+    # Without this binding the principal can authenticate and describe its topics but cannot
+    # join a consumer group or commit an offset, which looks like a consumer that starts and
+    # then does nothing.
+    ACL_DESIRED+=("$(acl_descriptor GROUP "$group_prefix" PREFIXED READ "$ACL_HOST_ANY")")
 
-    ok "granted Read and Describe on ${#SUBSCRIBER_TOPICS[@]} topics, and Read on the '${group_prefix}' group namespace"
+    reconcile_principal_acls "$principal" "subscriber"
 }
 
 # ---------------------------------------------------------------------------------------
@@ -4605,17 +5235,41 @@ print_summary() {
     done
     printf '%s\n' ""
 
+    # A REFUSED GROWTH IS NAMED HERE TOO, and not only in the disposition line above it.
+    #
+    # The table shows each topic's real partition count, so the information is technically
+    # present - but reading it requires the operator to compare eight numbers against
+    # KAFKA_MIN_PARTITIONS by eye, and the run exited zero, which is the signal most people
+    # act on. A topic left under-partitioned is a throughput ceiling on the ledger's event
+    # stream that nothing else will ever report: no alert fires, no consumer errors, and the
+    # next run refuses it again just as quietly. The closing summary is where an operator
+    # looks once, so it says so once, with the remedy attached.
+    if ((${#SUMMARY_GROWTH_REFUSED[@]} > 0)); then
+        printf '%s\n' "Left under-partitioned (fewer than the configured ${TARGET_PARTITIONS} partitions):"
+        for index in "${!SUMMARY_GROWTH_REFUSED[@]}"; do
+            printf '  %s\n' "${SUMMARY_GROWTH_REFUSED[index]}"
+        done
+        printf '%s\n' "  Each holds records, or could not be proven empty, so growing it was refused:"
+        printf '%s\n' "  raising a partition count re-maps existing keys, and the key here is the ledger"
+        printf '%s\n' "  id that carries the per-aggregate ordering guarantee."
+        printf '%s\n' "  To grow anyway: KAFKA_ALLOW_PARTITION_GROWTH=true, accepting that ordering does"
+        printf '%s\n' "  not hold for keys already in flight. To keep the current count deliberately,"
+        printf '%s\n' "  set KAFKA_MIN_PARTITIONS to it so configuration and reality agree."
+        printf '%s\n' ""
+    fi
+
     case "$PRODUCER_PROVISIONED" in
         yes)
             printf '%s\n' "Steady-state producer (what the server publishes as):"
             printf '%s\n' "  principal            ${ACL_PRINCIPAL_PREFIX}${PRODUCER_USER}"
             printf '%s\n' "  writable topics      every topic listed above, including the .dlt siblings"
             printf '%s\n' "  granted operations   Write, Describe"
-            printf '%s\n' "  NOT granted          Read anywhere, no consumer group, no cluster operation"
+            printf '%s\n' "  NOT granted          Create, Alter, Read anywhere, no consumer group, no"
+            printf '%s\n' "                       cluster operation"
             case "$PRODUCER_SECRET_DISPOSITION" in
                 preserved)
                     printf '%s\n' "  password             unchanged - the existing credential was kept, so a"
-                    printf '%s\n' "                       running server and worker keep authenticating"
+                    printf '%s\n' "                       running server keeps authenticating"
                     ;;
                 rotated)
                     printf '%s\n' "  password             ROTATED into the file named above. Update"
@@ -4633,7 +5287,7 @@ print_summary() {
                     printf '%s\n' "  password             UNCHANGED, and not because it was preserved: this run could"
                     printf '%s\n' "                       not determine whether a credential exists, so it wrote none."
                     printf '%s\n' "                       Writing one anyway would have rotated a live credential and"
-                    printf '%s\n' "                       stopped the server and worker authenticating."
+                    printf '%s\n' "                       stopped the server authenticating."
                     printf '%s\n' "                       Fix broker reachability or the admin principal's authorisation"
                     printf '%s\n' "                       to describe user configs, then re-run"
                     ;;
@@ -4645,7 +5299,7 @@ print_summary() {
         skipped)
             printf '%s\n' "Steady-state producer:"
             if is_truthy "$KAFKA_SKIP_PRODUCER"; then
-                printf '%s\n' "  skipped - KAFKA_SKIP_PRODUCER is set. The server and worker still need"
+                printf '%s\n' "  skipped - KAFKA_SKIP_PRODUCER is set. The server still needs"
                 printf '%s\n' "  KAFKA_SASL_USER and KAFKA_SASL_SECRET naming a principal with Write and"
                 printf '%s\n' "  Describe on the topics above"
             else
@@ -4656,7 +5310,10 @@ print_summary() {
             ;;
         *)
             printf '%s\n' "Steady-state producer:"
-            printf '%s\n' "  not provisioned"
+            printf '%s\n' "  NOT provisioned. Blnk REFUSES to publish as the administrator, so a server"
+            printf '%s\n' "  configured with an administrative pair and no producer pair will not start."
+            printf '%s\n' "  Run './stack.sh --init', or set KAFKA_PRODUCER_SECRET, so that publishing"
+            printf '%s\n' "  does not carry authority to create topics, mint credentials and rewrite ACLs"
             ;;
     esac
 
@@ -4743,8 +5400,9 @@ print_summary() {
             printf '%s\n' "  NOT granted          Create, Alter, Read, any consumer group, any cluster operation"
             case "$PRODUCER_SECRET_DISPOSITION" in
                 rotated)
-                    printf '%s\n' "  password             ROTATED - shown above, once. Put it in .env as"
-                    printf '%s\n' "                       KAFKA_SASL_SECRET and restart the server and worker"
+                    printf '%s\n' "  password             ROTATED into the mode-0600 file named above, and"
+                    printf '%s\n' "                       never printed. Put it in .env as KAFKA_SASL_SECRET"
+                    printf '%s\n' "                       and restart the server"
                     ;;
                 supplied)
                     printf '%s\n' "  password             the KAFKA_SASL_SECRET you supplied"

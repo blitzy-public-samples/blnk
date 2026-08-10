@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -337,6 +338,21 @@ type replayFidelityStore struct {
 	// issuedClaimToken is the token ClaimEventForReplay hands out. Fixed rather than
 	// generated so the assertion above can compare against a known value.
 	issuedClaimToken string
+
+	// releaseContexts records what each rollback saw of its context, so the detachment the
+	// service performs is asserted rather than assumed. See ReleaseEventReplay.
+	releaseContexts []replayFidelityContextObservation
+}
+
+// replayFidelityContextObservation is what one call saw of the context it was handed.
+type replayFidelityContextObservation struct {
+	// err is ctx.Err() on entry. Nil is the requirement on a release path whose caller has
+	// already been cancelled, because that is what detachment means.
+	err error
+	// hasDeadline and deadline record the bound, so a detached context that can never expire
+	// is distinguishable from a detached context that is bounded.
+	hasDeadline bool
+	deadline    time.Time
 }
 
 // recordClaimToken notes the token one transition presented. The caller holds the lock.
@@ -398,11 +414,29 @@ func (s *replayFidelityStore) ClaimEventForReplay(
 }
 
 // ReleaseEventReplay is the rollback that keeps a failed replay replayable.
-func (s *replayFidelityStore) ReleaseEventReplay(_ context.Context, id int64, claimToken, replayErr string) error {
+//
+// It OBSERVES the context for the same reason dltFakeStore.ReleaseEventReplay does: the service
+// runs this on a context detached from the caller's cancellation and bounded by its own timeout,
+// and a fake that ignored the context could not distinguish that from running it on the caller's
+// context — where the rollback fails for exactly the reason the replay did. So it refuses a dead
+// context, as the database would, and records what it observed.
+func (s *replayFidelityStore) ReleaseEventReplay(ctx context.Context, id int64, claimToken, replayErr string) error {
+	deadline, hasDeadline := ctx.Deadline()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.releaseContexts = append(s.releaseContexts, replayFidelityContextObservation{
+		err:         ctx.Err(),
+		hasDeadline: hasDeadline,
+		deadline:    deadline,
+	})
+
 	s.recordClaimToken("release", claimToken)
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	row := s.byID(id)
 	if row == nil {
@@ -501,17 +535,6 @@ func (s *replayFidelityStore) GetEventByID(_ context.Context, eventID string) (*
 	return &found, nil
 }
 
-// inventoryLocked was a second narrowing on this same store. It is RETIRED in favour of
-// matchingLocked below, which every listing and count on this double already calls.
-//
-// The two took THE SAME PARAMETER: model.DeadLetterFilter is a type alias for
-// model.DeadLetterQuery (model/event.go), so this was not a narrower or a wider shape, it was
-// another name for one. matchingLocked is also the faithful one of the pair. It trims the three
-// string predicates and it constrains the population to the two terminal failure states when no
-// status is named — both of which deadLetterFilterClause does in SQL, and neither of which this
-// one and its dltFilterMatches matcher did. The claim in the comment it carried, that a
-// zero-valued filter selects the terminal states, was true of matchingLocked and not of itself.
-//
 // ListDeadLetterInventory pages the same matching rows as the NARROW projection the operator
 // listing reads, keyed by cursor. The replay path itself reads full rows through
 // ListDeadLetteredEvents above — this exists so the store satisfies the whole seam, and so a
@@ -621,13 +644,54 @@ func (s *replayFidelityStore) CountDeadLetteredEvents(
 	return int64(len(s.matchingLocked(query))), nil
 }
 
+// replayFidelityIsTerminalFailure reports whether a row is in the dead-letter inventory's
+// population: the two states from which an event has stopped making progress on its own.
+//
+// # Why this is ONE function rather than a repeated pair of comparisons
+//
+// It is the population deadLetterFilterClause selects in SQL when no status is named, and this
+// store answers four separate questions over it — the full-row listing, its count, the narrow
+// projection and the age aggregate. Written out at each of those, the predicate was four copies
+// of one fact, and the failure mode of four copies is not that one is wrong today: it is that a
+// status added to the state machine tomorrow reaches three of them. A double that admitted a row
+// the statement excludes lets a test pass over a set the database would never return.
+//
+// `failed` is in the population deliberately, and it is the entry an operator most needs: its
+// retry budget is spent while its dead-letter write has NOT landed, so the outbox row is the
+// event's only surviving copy.
+func replayFidelityIsTerminalFailure(row *model.EventOutbox) bool {
+	if row == nil {
+		return false
+	}
+
+	return row.Status == model.EventOutboxStatusDeadLettered ||
+		row.Status == model.EventOutboxStatusFailed
+}
+
 // matchingLocked returns the inventory rows the query admits, newest first. The caller
 // must hold the mutex.
 //
 // Reverse insertion order approximates the repository's "occurred_at DESC, id DESC": every
 // fixture row shares one occurrence instant, so id descending is the operative clause, and
 // rows are inserted in ascending id order.
+//
+// # It is the ONLY narrowing on this store, and that is the point
+//
+// Two others existed beside it and both are gone. One took model.DeadLetterFilter, which is a
+// type ALIAS for model.DeadLetterQuery (model/event.go) — so it was not a narrower or a wider
+// shape, it was a second name for the same one — and it neither trimmed its predicates nor
+// constrained the population to the terminal states when no status was named, both of which
+// deadLetterFilterClause does in SQL. Its own comment claimed the second property; only this
+// function had it. The other was a byte-for-byte re-derivation with the clauses in a different
+// order.
+//
+// A double with several matchers is worse than a loose one: whichever a test happens to reach
+// decides what it asserts over, and the answer stops being a statement about the statement.
 func (s *replayFidelityStore) matchingLocked(query model.DeadLetterQuery) []model.EventOutbox {
+	// TRIMMED, because deadLetterFilterClause trims. A predicate carrying whitespace narrows to
+	// nothing in SQL and would narrow to nothing here too if this compared raw, so trimming is
+	// what keeps the double and the statement agreeing on a padded filter rather than merely on
+	// a clean one.
 	eventType := strings.TrimSpace(query.EventType)
 	topic := strings.TrimSpace(query.Topic)
 	status := strings.TrimSpace(query.Status)
@@ -635,11 +699,7 @@ func (s *replayFidelityStore) matchingLocked(query model.DeadLetterQuery) []mode
 	var inventory []model.EventOutbox
 	for i := len(s.order) - 1; i >= 0; i-- {
 		row := s.rows[s.order[i]]
-		if row == nil {
-			continue
-		}
-		if row.Status != model.EventOutboxStatusDeadLettered &&
-			row.Status != model.EventOutboxStatusFailed {
+		if !replayFidelityIsTerminalFailure(row) {
 			continue
 		}
 		if eventType != "" && row.EventType != eventType {
@@ -663,50 +723,6 @@ func (s *replayFidelityStore) matchingLocked(query model.DeadLetterQuery) []mode
 	return inventory
 }
 
-// deadLetterInventoryLocked builds the terminal-failure inventory a query matches, newest
-// first. The caller holds the lock.
-//
-// The predicate mirrors the repository's SQL exactly — case-sensitive equality on the
-// stored columns, with no derivation of a missing topic — because the service now delegates
-// all narrowing to the database, and a looser fake would let it pass here while the real
-// query returned a different set.
-func (s *replayFidelityStore) deadLetterInventoryLocked(
-	query model.DeadLetterQuery,
-) []model.EventOutbox {
-	var inventory []model.EventOutbox
-	// Reverse insertion order approximates the repository's "occurred_at DESC, id DESC",
-	// as above.
-	for i := len(s.order) - 1; i >= 0; i-- {
-		row := s.rows[s.order[i]]
-		if row == nil {
-			continue
-		}
-		if row.Status != model.EventOutboxStatusDeadLettered &&
-			row.Status != model.EventOutboxStatusFailed {
-			continue
-		}
-		if query.Status != "" && row.Status != query.Status {
-			continue
-		}
-		if query.EventType != "" && row.EventType != query.EventType {
-			continue
-		}
-		if query.Topic != "" && row.Topic != query.Topic {
-			continue
-		}
-		if !query.OccurredFrom.IsZero() && row.OccurredAt.Before(query.OccurredFrom) {
-			continue
-		}
-		if !query.OccurredTo.IsZero() && row.OccurredAt.After(query.OccurredTo) {
-			continue
-		}
-
-		inventory = append(inventory, *row)
-	}
-
-	return inventory
-}
-
 // OldestDeadLetterAgeByTopic groups the inventory by dead-letter topic, as the repository's
 // aggregate does (PERF-P07).
 func (s *replayFidelityStore) OldestDeadLetterAgeByTopic(
@@ -718,11 +734,7 @@ func (s *replayFidelityStore) OldestDeadLetterAgeByTopic(
 
 	grouped := make(map[string]model.DeadLetterTopicAge)
 	for _, row := range s.rows {
-		if row == nil {
-			continue
-		}
-		if row.Status != model.EventOutboxStatusDeadLettered &&
-			row.Status != model.EventOutboxStatusFailed {
+		if !replayFidelityIsTerminalFailure(row) {
 			continue
 		}
 
@@ -761,7 +773,7 @@ func (s *replayFidelityStore) CountDeadLetterInventory(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return int64(len(s.deadLetterInventoryLocked(query))), nil
+	return int64(len(s.matchingLocked(query))), nil
 }
 
 // ListAndCountDeadLetterInventory answers the page and the total from one observation of the
@@ -778,7 +790,7 @@ func (s *replayFidelityStore) ListAndCountDeadLetterInventory(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return page, int64(len(s.deadLetterInventoryLocked(query.FilterQuery()))), nil
+	return page, int64(len(s.matchingLocked(query.FilterQuery()))), nil
 }
 
 // The map-shaped CountDeadLetteredEvents this double also carried is GONE.
@@ -790,9 +802,35 @@ func (s *replayFidelityStore) ListAndCountDeadLetterInventory(
 // name for one capability and the package stopped compiling. The DeadLetterQuery form
 // above is the one the interface declares and the one every caller uses.
 
-// CountEventOutboxByStatus returns a status-keyed count of every row. A status with no
-// rows is absent from the map, matching the repository's GROUP BY semantics.
-func (s *replayFidelityStore) CountEventOutboxByStatus(_ context.Context, _ time.Time) (map[string]int64, error) {
+// CountUnresolvedEventOutbox returns a status-keyed count of every NON-DISPATCHED row. A status
+// with no rows is absent from the map, matching the repository's GROUP BY semantics.
+//
+// It takes no window and it OMITS the dispatched key, matching the aggregate the dead-letter
+// seam now declares (PERF-M05). The omission is modelled rather than glossed over because a fake
+// that reported dispatched counts from an aggregate whose SQL has no dispatched arm would let a
+// caller read a figure production never produces.
+func (s *replayFidelityStore) CountUnresolvedEventOutbox(_ context.Context) (map[string]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	counts := make(map[string]int64)
+	for _, row := range s.rows {
+		if row.Status == model.EventOutboxStatusDispatched {
+			continue
+		}
+		counts[row.Status]++
+	}
+
+	return counts, nil
+}
+
+// countRowsByStatus counts the stored rows by status, dispatched INCLUDED.
+//
+// It is test-only inspection of the fake's own state rather than a production seam, which is
+// exactly what a test asserting "the replayed row reached its terminal dispatched state" needs:
+// the production aggregate deliberately cannot answer that question any more, because counting
+// the dispatched population is the expensive on-demand reading (PERF-M05).
+func (s *replayFidelityStore) countRowsByStatus() map[string]int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -801,7 +839,7 @@ func (s *replayFidelityStore) CountEventOutboxByStatus(_ context.Context, _ time
 		counts[row.Status]++
 	}
 
-	return counts, nil
+	return counts
 }
 
 // MarkEventDeadLettered applies the dead-letter transition.
@@ -914,6 +952,11 @@ type replayFidelityPublisher struct {
 	// closed records that Close was called, so a test can assert lifecycle without
 	// reaching into the service.
 	closed bool
+
+	// onPublish runs before the attempt is recorded, for a test that needs the world to change
+	// at the one instant the row is claimed and the replay is not yet over. Cancelling the
+	// caller's context from here is the only way to reach the rollback with a dead caller.
+	onPublish func()
 }
 
 // newReplayFidelityPublisher returns a publisher that accepts every write.
@@ -999,6 +1042,16 @@ func (p *replayFidelityPublisher) PublishToTopic(
 		}
 
 		return result, result.Err
+	}
+
+	p.mu.Lock()
+	hook := p.onPublish
+	p.mu.Unlock()
+
+	// Outside the lock: the hook exists to disturb the world mid-replay, and one that touched
+	// this publisher would deadlock against it.
+	if hook != nil {
+		hook()
 	}
 
 	p.mu.Lock()
@@ -1966,10 +2019,19 @@ func TestReplayFidelity_ReplayedRowLeavesTheDeadLetterInventory(t *testing.T) {
 	}
 	assert.Empty(t, inventory.Entries, "the only entry in this store has been replayed")
 
-	counts, err := harness.store.CountEventOutboxByStatus(ctx, time.Time{})
-	require.NoError(t, err)
+	// Read from the fake's own rows rather than through the production aggregate: counting the
+	// dispatched population is the deliberate on-demand reading now, and the aggregate the
+	// dead-letter seam offers has no dispatched arm at all (PERF-M05).
+	counts := harness.store.countRowsByStatus()
 	assert.Equal(t, int64(1), counts[model.EventOutboxStatusDispatched])
 	assert.Zero(t, counts[model.EventOutboxStatusDeadLettered])
+
+	// And the same fact through the seam the service actually uses: a replayed event has left
+	// the unresolved inventory entirely, so that aggregate reports nothing at all.
+	unresolved, err := harness.store.CountUnresolvedEventOutbox(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, unresolved,
+		"a replayed event is terminal, so nothing remains for the unresolved aggregate to count")
 }
 
 // TestReplayFidelity_RepeatReplayIsRejectedRatherThanDuplicating asserts that replaying
@@ -2251,6 +2313,96 @@ func TestReplayFidelity_RowFromTheRealProducerPathReplaysFaithfully(t *testing.T
 		"the producer's payload bytes must arrive exactly as they were marshaled")
 }
 
+// TestReplayFidelity_AFailedReplayStaysReplayableEvenWhenTheCallerIsGone is the fidelity
+// criterion's dependency on the rollback, stated as a property of THIS file's contract.
+//
+// # Why replay fidelity depends on it
+//
+// Everything else here asserts that a replayed event reproduces the original bytes. That
+// guarantee is only worth anything while the event is still replayable, and a failed replay is
+// the point at which it can stop being: a claimed row sits in `replaying`, which is outside the
+// relay's claimable set AND outside the dead-letter inventory, so a row left there is an event
+// nothing will ever offer to a subscriber again. Byte fidelity over an event that cannot be
+// replayed is a guarantee about nothing.
+//
+// The rollback that prevents it runs on a context DETACHED from the caller's, and this test is
+// what establishes that. The caller is cancelled from inside the publish — the instant the row is
+// claimed and the replay is not yet over — so a rollback that inherited the cancellation could
+// not run at all. The store refuses a dead context exactly as the database would, so inheritance
+// shows up as a missing release rather than as a silent pass.
+func TestReplayFidelity_AFailedReplayStaysReplayableEvenWhenTheCallerIsGone(t *testing.T) {
+	harness := newReplayFidelityHarness(t)
+	fixture := replayFidelityFixtures()[0]
+
+	row := fixture.row(t, 1)
+	harness.store.put(row)
+
+	exhausted, lastErr := harness.exhaustRetryBudget(t, row)
+	harness.store.put(exhausted)
+
+	preserved, err := harness.service.DeadLetter(context.Background(), exhausted, lastErr)
+	require.NoError(t, err, "the event must reach its dead-letter topic before it can be replayed")
+	require.Equal(t, fixture.deadLetterTopic, preserved.DeadLetterTopic)
+
+	harness.clock.Set(replayFidelityReplayAt)
+
+	// The broker still refuses, so the replay fails — and the caller disappears while it is in
+	// flight, which is how a replay fails in practice.
+	harness.publisher.failWith(errReplayFidelityBroker)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	harness.publisher.onPublish = cancel
+
+	_, replayErr := harness.service.ReplayDeadLetteredEvent(ctx, exhausted.EventID)
+	require.Error(t, replayErr, "a replay against a refusing broker must report a failure")
+	require.Error(t, ctx.Err(), "the caller must be gone before the rollback runs")
+
+	observations := harness.store.observedReleaseContexts()
+	require.Lenf(t, observations, 1,
+		"the claim MUST be released even though the caller is gone. Zero releases means the "+
+			"rollback inherited the caller's cancellation and died with it, stranding the event in "+
+			"`replaying` where neither the relay nor the dead-letter inventory can see it — and no "+
+			"amount of byte fidelity helps an event nothing will replay")
+	assert.NoErrorf(t, observations[0].err,
+		"the rollback must run on a context detached from the caller's cancellation; it saw %v",
+		observations[0].err)
+	assert.True(t, observations[0].hasDeadline,
+		"and it must still be bounded, so a database that has gone away cannot hold it open")
+
+	stored, ok := harness.store.snapshot(exhausted.EventID)
+	require.True(t, ok)
+	require.Equal(t, model.EventOutboxStatusDeadLettered, stored.Status,
+		"the row must be back in the dead-lettered state, which is the only state a replay can be "+
+			"claimed from")
+	assert.Equal(t, fixture.deadLetterTopic, stored.DLTTopic,
+		"the dead-letter topic must be retained: the replay reads its destination out of the "+
+			"stored metadata, so losing it would cost the event its replay target")
+	require.NotNil(t, stored.FailureMetadata,
+		"and the failure metadata must be retained, for the same reason")
+
+	// AND THE FIDELITY GUARANTEE STILL HOLDS ON THE NEXT ATTEMPT. This is the assertion that
+	// makes the rollback part of THIS file's contract rather than a neighbouring concern: the
+	// bytes a successful replay produces after a cancelled one must be the original bytes.
+	harness.publisher.onPublish = nil
+	harness.publisher.succeed()
+
+	replay, retryErr := harness.service.ReplayDeadLetteredEvent(context.Background(), exhausted.EventID)
+	require.NoError(t, retryErr, "a released row must be replayable by the next request")
+	assert.Equal(t, fixture.topic, replay.Topic,
+		"and it must go back to its ORIGINAL topic, recovered from the retained metadata")
+
+	attempts := harness.publisher.captures()
+	require.GreaterOrEqual(t, len(attempts), replayFidelityMaxAttempts+2,
+		"the budget's attempts, the cancelled replay and the successful one")
+
+	original := attempts[0].value
+	replayed := attempts[len(attempts)-1].value
+	assert.Equal(t, string(original), string(replayed),
+		"the replay after a cancelled one must still be byte-identical to the original: a rollback "+
+			"that rewrote or re-marshalled anything on its way through would show up here")
+}
+
 // replayFidelityDataMember extracts the "data" member of a webhook body as RAW BYTES.
 func replayFidelityDataMember(t *testing.T, body string) json.RawMessage {
 	t.Helper()
@@ -2289,11 +2441,6 @@ func TestReplayFidelity_LeaksNoConfigurationBetweenTests(t *testing.T) {
 		"no test may leave its own topic prefix in the process-global configuration store")
 }
 
-// replayFidelityClock was this file's settable clock. It is RETIRED: movableTestClock above
-// is the same type under the name the capability earned once a second suite needed it, and
-// its doc comment carries the race-safety argument this one had lost. The harness field is a
-// *movableTestClock, so this was the copy nothing installed.
-//
 // ListDeadLetteredEventsFiltered pages the two terminal failure states, newest first,
 // applying the filter to the whole population BEFORE the page is taken — which is what
 // SQL does, and therefore the only faithful order for a double to apply it in.
@@ -2316,4 +2463,12 @@ func (s *replayFidelityStore) ListDeadLetteredEventsFiltered(
 	}
 
 	return inventory, nil
+}
+
+// observedReleaseContexts returns what each rollback saw of its context.
+func (s *replayFidelityStore) observedReleaseContexts() []replayFidelityContextObservation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.releaseContexts)
 }

@@ -124,6 +124,12 @@ const (
 	eventQueryParamWindow         = "window"
 	eventQueryParamSortBy         = "sort_by"
 	eventQueryParamSortOrder      = "sort_order"
+
+	// eventOffsetsBestEffortValue is the third value include_offsets accepts, alongside
+	// "true" and "false". It names the posture that used to be reachable only by omitting
+	// the parameter, and it is declared here so the reader and the refusal message cannot
+	// disagree about how it is spelled (PERF-M02).
+	eventOffsetsBestEffortValue = "best_effort"
 )
 
 // Window bounds for GET /events/stats.
@@ -139,16 +145,30 @@ const (
 // A window fixes both. The dispatched count and the audit are bounded by it, the broker side
 // is measured over the SAME interval, and every other status is still counted exactly and in
 // full — so nothing an operator acts on is hidden by choosing a short window.
+//
+// # PERF-M05: and why the ceiling equals the default, so the window may only be NARROWED
+//
+// The ceiling was a week. The window bounds exactly one figure — the exact COUNT of the
+// dispatched population — and at 500 events per second a day of that is 43.2 million index
+// entries while a week is 302.4 million. A count over 302 million entries is not servable inside
+// any request timeout, so permitting it handed an authenticated caller a scan the database pays
+// for and the caller never receives. Everything an operator acts on is counted for ALL TIME
+// regardless of the window, and the zero-loss audit is bounded by retention rather than by this
+// parameter, so a wider window bought a historical figure and nothing else.
+//
+// The parameter's remaining job is to narrow: `?window=15m` for a twenty-minute incident is the
+// case it exists for and is unaffected.
 const (
 	// eventStatsDefaultWindow is the window applied when a request names none. One day,
 	// matching the daily zero-loss reconciliation the runbook describes.
 	eventStatsDefaultWindow = 24 * time.Hour
 
-	// eventStatsMaxWindow is the longest window accepted. A week: long enough for an
-	// operator investigating something that started last weekend, short enough that the
-	// bounded queries stay bounded — and well inside any sensible broker retention, which is
-	// what keeps the reconciliation conclusive rather than truncated.
-	eventStatsMaxWindow = 7 * 24 * time.Hour
+	// eventStatsMaxWindow is the longest window accepted, and it is the default: a request
+	// may ask for less than the daily reconciliation period but never for more. It must stay
+	// equal to blnk.maxEventStatisticsWindow, which is the service layer's own floor under
+	// every non-HTTP caller — a ceiling here that exceeded the service's would be silently
+	// clamped, which is the one behaviour this endpoint refuses rather than performs.
+	eventStatsMaxWindow = eventStatsDefaultWindow
 )
 
 // deadLetterQueryParameters is every query parameter GET /events/dead-letter
@@ -895,13 +915,25 @@ func (a *Api) ReplayDeadLetterEvent(c *gin.Context) {
 // with 200, offsets_complete is false and the offset keys are OMITTED rather than
 // emitted as nulls a reconciliation script would have to special-case.
 //
-// include_offsets selects between the three postures:
+// include_offsets selects between the three postures — and, because the two are one decision,
+// whether the DISPATCHED HISTORY is counted at all (PERF-M05/M02):
 //
-//	absent   best effort. The broker is read when one is configured, and a
-//	         failure is logged and omitted. This is what the runbook uses.
-//	true     required. A failure answers 503 EVENT_KAFKA_UNAVAILABLE, because the
-//	         caller asked for the half of the reconciliation that is missing.
-//	false    skipped. No broker round trip is made at all.
+//	absent       skipped. No broker round trip, and the counts cover the exact UNRESOLVED
+//	             inventory only. This is the cheap default every routine caller should take.
+//	false        skipped, said explicitly. Identical to absent.
+//	best_effort  the dispatched history is counted over the window and the broker is read
+//	             when one is configured; a failure is logged, the broker-side keys are
+//	             omitted, and the answer is still 200. This is what a broker-less
+//	             deployment wants, and what the daily check uses when a 503 is unhelpful.
+//	true         required. As best_effort, except that a failure to read the broker answers
+//	             503 EVENT_KAFKA_UNAVAILABLE, because the caller asked for the half of the
+//	             reconciliation that is missing. This is what the reconciliation runbook uses.
+//
+// The dispatched figure and the broker offsets are wanted by one caller and no other: the only
+// reason to know how many rows were dispatched in an interval is to compare it against what the
+// broker recorded over that interval. `dispatched_history_counted` on the response says which
+// reading was taken, because an absent `dispatched` key means "none in the window" and "never
+// counted" indistinguishably.
 //
 // # The offsets are read for the WHOLE inventory, deliberately
 //
@@ -970,6 +1002,33 @@ func (a *Api) GetEventOutboxStats(c *gin.Context) {
 // a reason the caller cannot see, and they would read a missing verdict as an
 // unreachable broker.
 //
+// # PERF-M02: an ABSENT parameter now SKIPS the broker side, and counts no history
+//
+// Absent used to mean best-effort, which made the DEFAULT reading a broker round trip plus an
+// exact count of a day of dispatched history — 43.2 million index entries at the target rate.
+// The callers that omit the parameter are precisely the ones that want neither: the load
+// harness's drain loop polled this endpoint on that default every second while waiting for the
+// outbox to quiesce, so the measurement perturbed the system it was measuring, and any health
+// check or dashboard doing the same paid the same price for fields it discarded.
+//
+// The expensive, optional, failure-prone enrichment is now opt-in, and blnk.EventOffsetsSkipped
+// is the zero value of the posture type so the HTTP default and the Go default cannot document
+// different behaviour.
+//
+// # best_effort is spelled out because it is no longer the default
+//
+// The posture itself did not change and neither did `true`: it still means REQUIRED, so a
+// reconciliation that cannot read the broker receives a 503 rather than a quietly halved
+// answer. What changed is that best-effort — read the broker when one is configured, degrade to
+// the counts when it cannot be read, never fail — used to be reachable only by omitting the
+// parameter, and omitting it now means skipped. It therefore has a name.
+//
+// That name matters for one caller in particular: an operator who wants the dispatched history
+// on a deployment with no brokers at all. Skipped does not count history, `true` would answer
+// 503, and `best_effort` is exactly right — it counts the history, attempts the broker, and
+// returns 200 with the counts when there is no broker to read. That is also the posture every
+// broker-less deployment ran in permanently before this parameter had to be named.
+//
 // Parameters:
 //   - c *gin.Context: the request. On refusal the response is already written
 //     when this returns.
@@ -981,19 +1040,19 @@ func (a *Api) GetEventOutboxStats(c *gin.Context) {
 //   - bool: false when the refusal has been written.
 func eventOffsetInclusionFromQuery(c *gin.Context) (blnk.EventOffsetInclusion, bool) {
 	switch strings.ToLower(strings.TrimSpace(c.Query(eventQueryParamIncludeOffsets))) {
-	case "":
-		return blnk.EventOffsetsBestEffort, true
+	case "", "false":
+		return blnk.EventOffsetsSkipped, true
 	case "true":
 		return blnk.EventOffsetsRequired, true
-	case "false":
-		return blnk.EventOffsetsSkipped, true
+	case eventOffsetsBestEffortValue, "best-effort":
+		return blnk.EventOffsetsBestEffort, true
 	default:
 		respondCode(c, apierror.ErrGenValidation, fmt.Sprintf(
-			"%s must be %q or %q when it is supplied",
-			eventQueryParamIncludeOffsets, "true", "false",
+			"%s must be %q, %q or %q when it is supplied",
+			eventQueryParamIncludeOffsets, "true", "false", eventOffsetsBestEffortValue,
 		), nil)
 
-		return blnk.EventOffsetsBestEffort, false
+		return blnk.EventOffsetsSkipped, false
 	}
 }
 
@@ -1095,11 +1154,23 @@ func eventOutboxStatsResponseFrom(statistics blnk.EventOutboxStatistics) model.E
 		Pending:        counts[coremodel.EventOutboxStatusPending],
 		Processing:     counts[coremodel.EventOutboxStatusProcessing],
 		WebhookPending: counts[coremodel.EventOutboxStatusWebhookPending],
-		Dispatched:     counts[coremodel.EventOutboxStatusDispatched],
 		Failed:         counts[coremodel.EventOutboxStatusFailed],
 		DeadLettered:   counts[coremodel.EventOutboxStatusDeadLettered],
 		Replaying:      counts[coremodel.EventOutboxStatusReplaying],
 		GeneratedAt:    statistics.GeneratedAt,
+
+		DispatchedHistoryCounted: statistics.DispatchedHistoryCounted,
+	}
+
+	// THE DISPATCHED COUNT, emitted only when it was actually taken (PERF-M05). Every other
+	// count above is exact and complete on every request; this one is a count of the single
+	// unbounded population and is taken only for a request that asked for the broker side.
+	// Indexing the map would yield zero for both "none dispatched in the window" and "never
+	// counted", and a reconciliation reading the second as the first concludes that nothing was
+	// published at all — so the key is omitted instead, and the flag above says which it is.
+	if statistics.DispatchedHistoryCounted {
+		dispatched := counts[coremodel.EventOutboxStatusDispatched]
+		response.Dispatched = &dispatched
 	}
 
 	// THE INTERVAL THE WINDOWED FIGURES COVER, reported so the numbers are self-describing. The

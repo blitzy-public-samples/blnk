@@ -342,37 +342,43 @@ func TestEventSubscriberPredicates_ReadTheRowRatherThanAssuming(t *testing.T) {
 
 		// Every one of these is consulted on a row that may not have been found, so a nil
 		// receiver must be a definite "no" rather than a panic in a ledger process.
-		assert.False(t, absent.RequiresClientSideKeyFiltering())
+		assert.False(t, absent.RequiresGatewayDelivery())
 		assert.False(t, absent.IsProvisioned())
 		assert.False(t, absent.IsMigrated())
 	})
 
-	t.Run("RequiresClientSideKeyFiltering states which boundary the subscriber owns", func(t *testing.T) {
-		// The predicate decides what the credential CONTRACT says, not whether a credential may
-		// be minted: Kafka has no key-level ACL resource, so a recorded prefix is a narrowing the
-		// subscriber applies itself and the response has to say so. Its edges are therefore the
-		// difference between telling a subscriber it must filter and letting it believe the broker
-		// already did.
+	t.Run("RequiresGatewayDelivery states which path this subscriber's records take", func(t *testing.T) {
+		// The predicate decides the SHAPE OF THE GRANT and what the credential contract says, not
+		// whether a credential may be minted. Kafka has no key-level ACL resource, so a recorded
+		// prefix is a boundary Blnk keeps itself: such a subscriber is provisioned without topic
+		// Read and its records are delivered, key-filtered, by the stream gateway. Its edges are
+		// therefore the difference between withholding record access from a subscriber that asked
+		// for a narrowing and granting a whole shared topic to one that did.
 		none := &EventSubscriber{}
-		assert.False(t, none.RequiresClientSideKeyFiltering(),
-			"no recorded prefix leaves nothing for the subscriber to filter")
+		assert.False(t, none.RequiresGatewayDelivery(),
+			"no recorded prefix means the topic grant is the boundary, so the broker delivers")
+		assert.True(t, none.GrantsBrokerRecordAccess(),
+			"and record access is granted, which is the complement this pair must never contradict")
 
 		blank := ""
-		assert.False(t, (&EventSubscriber{PartitionKeyPrefix: &blank}).RequiresClientSideKeyFiltering(),
+		assert.False(t, (&EventSubscriber{PartitionKeyPrefix: &blank}).RequiresGatewayDelivery(),
 			"an empty recorded prefix declares no boundary")
 
 		whitespace := "   \t "
-		assert.False(t, (&EventSubscriber{PartitionKeyPrefix: &whitespace}).RequiresClientSideKeyFiltering(),
+		assert.False(t, (&EventSubscriber{PartitionKeyPrefix: &whitespace}).RequiresGatewayDelivery(),
 			"whitespace declares no boundary either; treating it as one would announce an obligation "+
 				"over nothing")
 
 		declared := "ldg_customer-"
-		assert.True(t, (&EventSubscriber{PartitionKeyPrefix: &declared}).RequiresClientSideKeyFiltering(),
-			"a real recorded prefix IS a declared record-level boundary, and no Kafka ACL admits some "+
-				"records of a partition and refuses others by key, so the subscriber must apply it")
+		scoped := &EventSubscriber{PartitionKeyPrefix: &declared}
+		assert.True(t, scoped.RequiresGatewayDelivery(),
+			"a real recorded prefix IS a record-level boundary, and no Kafka ACL admits some records "+
+				"of a partition and refuses others by key, so Blnk applies it at the gateway")
+		assert.False(t, scoped.GrantsBrokerRecordAccess(),
+			"which is only a boundary because direct record access is withheld from such a row")
 
 		padded := "  ldg_customer-  "
-		assert.True(t, (&EventSubscriber{PartitionKeyPrefix: &padded}).RequiresClientSideKeyFiltering(),
+		assert.True(t, (&EventSubscriber{PartitionKeyPrefix: &padded}).RequiresGatewayDelivery(),
 			"a padded prefix still declares one; trimming to nothing is the only way it does not")
 	})
 

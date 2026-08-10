@@ -141,7 +141,7 @@ spec:
               subPath: prometheus.yml
             # Projects the ConfigMap's blnk-kafka-alerts.yml key into the
             # directory the rule_files glob scans, /etc/prometheus/alerts/*.yml,
-            # which is what actually loads all four Kafka alerts. A second
+            # which is what actually loads all 13 Kafka alerts. A second
             # subPath mount on the SAME volume keeps the scrape-config mount
             # above untouched. subPath must equal the ConfigMap data key and
             # mountPath must fall inside that glob: a mismatch loads no rules
@@ -163,7 +163,7 @@ spec:
             # The metrics bearer token both scrape jobs authenticate with.
             # Without it Prometheus scrapes an endpoint that answers every
             # unauthenticated request with an error, so no series is collected
-            # and none of the four Kafka alerts can ever fire — a failure that looks
+            # and none of the 13 Kafka alerts can ever fire — a failure that looks
             # exactly like health, because an absent alert and a healthy system
             # are indistinguishable.
             #

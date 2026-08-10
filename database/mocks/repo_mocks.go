@@ -1121,6 +1121,17 @@ func (m *MockDataSource) CountDeadLetterInventory(ctx context.Context, query mod
 	return args.Get(0).(int64), args.Error(1)
 }
 
+// CountUnresolvedEventOutbox is the LIGHTWEIGHT status aggregate: every non-dispatched status,
+// exact and unwindowed. It takes no window argument, which is the point of it (PERF-M05) — a
+// test that expects a window here is expecting the on-demand history reading below instead.
+func (m *MockDataSource) CountUnresolvedEventOutbox(ctx context.Context) (map[string]int64, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(map[string]int64), args.Error(1)
+}
+
 func (m *MockDataSource) CountEventOutboxByStatus(ctx context.Context, since time.Time) (map[string]int64, error) {
 	args := m.Called(ctx, since)
 	if args.Get(0) == nil {

@@ -197,9 +197,36 @@ const (
 	// that is failing to claim.
 	orderingRelayLockDuration = 30 * time.Second
 
-	// relayContentionLease is the lease the two-relay contention test runs on, and it is
-	// deliberately absurd.
+	// relayContentionLease is the lease the two-relay contention test parks its earlier row
+	// under, and it is deliberately absurd.
 	//
+	// THIRTY MINUTES, against a test that finishes in seconds. The lease is not modelling a
+	// realistic relay; it is removing an alternative explanation. The blocked row must stay
+	// blocked because an EARLIER ROW FOR ITS PARTITION KEY HAS NOT SETTLED, and a row whose
+	// lease expired mid-observation would become claimable for a completely different reason —
+	// the reclaim path — producing a green run that proves nothing, or a red one that indicts
+	// the ordering guard for the reclaim's behaviour. Absurd is what makes expiry impossible
+	// rather than merely unlikely.
+	//
+	// It is deliberately NOT the relays' own lock duration: those stay on the pinned production
+	// lease so that leasedElsewhere can still tell this test's leases from a foreign process's,
+	// which is the diagnosis requireAllDispatched depends on.
+	relayContentionLease = 30 * time.Minute
+
+	// relayContentionObservation is how long the blocked row is watched while both relays poll.
+	//
+	// Long enough to cover many poll intervals — at the 40ms interval above, dozens of claims
+	// per relay — because the property is "never claimed", and a window shorter than one poll
+	// would assert only that nothing had happened yet. Short enough that the test stays a test:
+	// the guard is enforced by a single SQL predicate, so a violation is immediate rather than
+	// gradual, and waiting longer buys no additional confidence.
+	relayContentionObservation = 2 * time.Second
+
+	// relayContentionPollInterval is how often the blocked row's state is re-read during that
+	// window. Frequent enough that a TRANSIENT claim — one relay taking the row and another
+	// path putting it back — is caught rather than missed between two sparse reads.
+	relayContentionPollInterval = 25 * time.Millisecond
+
 	// orderingDispatchTimeout bounds the wait for every published row to reach its
 	// dispatched terminal state.
 	//
@@ -263,6 +290,32 @@ const (
 	// clear of the delivery subtest's aggregate numbering, so a row is attributable to one
 	// subtest at a glance.
 	orderingClaimAggregateBase = 90
+
+	// The divergent-key test's own dimensions (PERF-C02).
+	//
+	// orderingDivergentRows is how many events of ONE ledger it seeds. Six is enough that a
+	// reordering shows up as a permutation rather than as a coin flip, and small enough that
+	// two relays polling every 40ms drain it in well under a second.
+	orderingDivergentRows = 6
+
+	// orderingDivergentAggregateBase keeps this test's synthetic transaction identifiers clear
+	// of both the delivery subtest's numbering and orderingClaimAggregateBase, so a row is
+	// still attributable to one test at a glance.
+	orderingDivergentAggregateBase = 70
+
+	// orderingDivergentRelayCount is how many relay instances run against the seeded rows at
+	// once. TWO is the whole point: the defect this test exists for is invisible to one relay,
+	// because a single process groups its claimed batch by the effective key before publishing
+	// and so serialises the rows itself. Only separate processes claiming concurrently can
+	// publish two rows of one Kafka partition at the same time.
+	orderingDivergentRelayCount = 2
+
+	// orderingDivergentProbeLease is the lease the claim-level probe takes.
+	//
+	// Deliberately short: the probe claims to observe WHAT the claim admits, then leaves the
+	// rows for the relays. A production-length lease would make the test wait 30 seconds for
+	// the probe's own rows to become claimable again.
+	orderingDivergentProbeLease = 300 * time.Millisecond
 
 	// orderingLedgerMintAttempts bounds the search for a ledger id set that spans more than
 	// one partition. One attempt fails with probability 6 * (1/6)^12 — about three in a
@@ -1798,6 +1851,270 @@ func TestEventOrdering_EventsSharingAnAggregateAreConsumedInPublishOrder(t *test
 	})
 }
 
+// relayContentionParkEarlierRow puts a row into the state a relay that claimed it and then
+// stalled leaves behind: processing, leased far into the future, and never dispatched.
+//
+// # Why this is written with SQL rather than through ClaimPendingEventOutbox
+//
+// A real claim would be more faithful if it could be aimed, and it cannot. The claim is FIFO
+// over the WHOLE table and the outbox is shared — with sibling workspaces, with a running
+// server, with this run's own earlier tests — so a batch-of-one claim returns whatever row is
+// oldest, which is very often not this test's. Looping until the wanted row appears would drag
+// every other pending row through a lease as a side effect, and the state that arrives is
+// identical either way. The subject under test is the CLAIM'S per-partition-key guard, not the
+// route by which a predecessor came to be in flight.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - f *orderingFixture: the fixture, for its connection pool.
+//   - eventID string: the row to park.
+//
+// Returns:
+//   - string: the claim token written, so the release can prove it is undoing its own work.
+func relayContentionParkEarlierRow(t *testing.T, f *orderingFixture, eventID string) string {
+	t.Helper()
+
+	token := "relay-contention-" + f.runID
+
+	result, err := f.pool.ExecContext(context.Background(), `
+		UPDATE blnk.event_outbox
+		SET status = 'processing',
+			locked_until = NOW() + $2::interval,
+			claim_token = $3,
+			first_attempted_at = COALESCE(first_attempted_at, NOW()),
+			last_attempted_at = NOW()
+		WHERE event_id = $1
+	`, eventID, relayContentionLease.String(), token)
+	require.NoError(t, err, "parking the earlier row of the contended aggregate failed")
+
+	affected, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected,
+		"exactly the earlier row must be parked; parking none makes the observation below "+
+			"vacuous and parking more would block aggregates this test does not own")
+
+	row, err := f.ds.GetEventByID(context.Background(), eventID)
+	require.NoError(t, err, "re-reading the parked row failed")
+	require.Equal(t, model.EventOutboxStatusProcessing, row.Status,
+		"the premise is a predecessor IN FLIGHT; without it the later row is legitimately "+
+			"claimable and nothing below means anything")
+	require.NotNil(t, row.LockedUntil)
+	require.Truef(t, row.LockedUntil.After(time.Now().Add(relayContentionObservation)),
+		"the parked lease must outlast the observation window, or the row becomes claimable "+
+			"through expiry rather than staying blocked by the ordering guard. lease until %s",
+		row.LockedUntil)
+
+	return token
+}
+
+// relayContentionReleaseEarlierRow returns the parked row to pending so the relays can publish
+// it normally, undoing exactly what relayContentionParkEarlierRow did.
+//
+// The token is presented in the predicate rather than only the event id: a release that matched
+// on the id alone would also undo a claim a REAL relay had taken in the meantime, and this
+// function's whole premise is that no relay could.
+func relayContentionReleaseEarlierRow(t *testing.T, f *orderingFixture, eventID, token string) {
+	t.Helper()
+
+	result, err := f.pool.ExecContext(context.Background(), `
+		UPDATE blnk.event_outbox
+		SET status = 'pending',
+			locked_until = NULL,
+			claim_token = NULL,
+			attempts = 0,
+			next_attempt_at = NOW()
+		WHERE event_id = $1 AND claim_token = $2
+	`, eventID, token)
+	require.NoError(t, err, "releasing the parked row failed")
+
+	affected, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected,
+		"the parked row must still carry this test's own claim token: if it does not, something "+
+			"else took the row while it was leased half an hour into the future, and the "+
+			"observation above was measuring that instead of the ordering guard")
+}
+
+// relayContentionStartRelay starts one relay processor on the production lease and registers its
+// shutdown.
+//
+// Returns:
+//   - *EventRelayProcessor: the started processor.
+func relayContentionStartRelay(t *testing.T, f *orderingFixture, ctx context.Context, label string) *EventRelayProcessor {
+	t.Helper()
+
+	relay := NewEventRelayProcessor(f.blnk).
+		WithPollInterval(orderingRelayPollInterval).
+		WithBatchSize(orderingRelayBatchSize).
+		WithLockDuration(orderingRelayLockDuration)
+
+	relayCtx, cancelRelay := context.WithCancel(ctx)
+	t.Cleanup(func() {
+		relay.Stop()
+		cancelRelay()
+	})
+
+	relay.Start(relayCtx)
+	require.Truef(t, relay.IsRunning(),
+		"relay %s refused to start; startupObstacle logs which precondition was missing", label)
+
+	return relay
+}
+
+// TestEventOrdering_TwoRelaysContendingForOneAggregateCannotOvertakeEachOther is the
+// DISTRIBUTED half of acceptance criterion V-6.
+//
+// # What the single-relay test could not establish
+//
+// TestEventOrdering_EventsSharingAnAggregateAreConsumedInPublishOrder proves two things about
+// one process: that a batch is published in occurrence order, and that the message key routes an
+// aggregate to one partition. Both are properties of a single relay draining a backlog, and
+// neither says anything about the deployment that actually runs — two or more server replicas,
+// each with its own relay, polling the same outbox table. In that deployment the ordering
+// guarantee cannot come from anything inside one process, because no process can see what
+// another has claimed. It comes from ONE SQL PREDICATE: a row is a claim candidate only while no
+// earlier row for its partition key is still pending or processing.
+//
+// Delete that predicate and the single-relay test still passes in full — one relay claiming a
+// batch still publishes it in order — while the deployment silently loses per-aggregate ordering
+// the moment a second replica exists. That is the gap this test closes, and it is why the
+// arrangement is two relays rather than a larger backlog.
+//
+// # The arrangement
+//
+// One aggregate, so both events share one partition key and the guard is the only thing that can
+// order them. Two events. The earlier is parked IN FLIGHT under an absurd lease, which is what a
+// relay that claimed a row and then stalled — GC pause, slow broker, lost pod — leaves behind.
+// Two relays then poll the table for two seconds.
+//
+//   - THE LATER ROW MUST NOT MOVE. Not claimed, not leased, not published. A relay that took it
+//     would publish the aggregate's second event before its first, and no consumer could recover
+//     the order afterwards because the records would be in the partition the wrong way round.
+//   - THEN THE PREDECESSOR SETTLES, and the same two relays must publish both, in order, with
+//     the earlier record at the lower offset.
+//
+// The second half is also the first half's non-vacuity proof, and that is why they are one test
+// rather than two. "Nothing was published for two seconds" is exactly what a pair of relays that
+// never started, or that could not reach the broker, would also produce; the only way to know the
+// silence meant refusal is to remove the reason for it and watch the same relays deliver.
+func TestEventOrdering_TwoRelaysContendingForOneAggregateCannotOvertakeEachOther(t *testing.T) {
+	fixture := newOrderingFixture(t)
+	ctx := context.Background()
+
+	// ONE aggregate, minted directly rather than through mintLedgers: that helper requires the
+	// ids it draws to span more than one partition, which is exactly right for the delivery test
+	// and unsatisfiable for a single key. Contention on ONE partition key is the whole subject
+	// here, so a second ledger would add only a stream that is trivially independent.
+	ledgerID := model.GenerateUUIDWithSuffix("ldg")
+	ledgers := []string{ledgerID}
+	contendedPartition := fixture.expectedPartitionFor(ledgerID)
+	require.Containsf(t, fixture.partitions, contendedPartition,
+		"the contended ledger must hash to a partition the topic actually has; %s resolved to %d "+
+			"against %v", ledgerID, contendedPartition, fixture.partitions)
+	t.Logf("contended aggregate: ledger %s on %s/%d", ledgerID, fixture.topic, contendedPartition)
+
+	// Recorded before anything is captured, so the fetch below reads this run alone.
+	startOffsets := fixture.endOffsets(t)
+
+	eventIDs := fixture.publishRun(ctx, t, ledgers, []orderingSlot{
+		{aggregate: 0, sequence: 0},
+		{aggregate: 0, sequence: 1},
+	})
+	require.Len(t, eventIDs, 2, "the contended aggregate must have exactly a predecessor and a successor")
+
+	earlier, later := eventIDs[0], eventIDs[1]
+	require.NotEqual(t, earlier, later, "the two events must be distinct rows")
+
+	token := relayContentionParkEarlierRow(t, fixture, earlier)
+
+	first := relayContentionStartRelay(t, fixture, ctx, "A")
+	second := relayContentionStartRelay(t, fixture, ctx, "B")
+
+	t.Run("the successor is neither claimed nor published while its predecessor is in flight", func(t *testing.T) {
+		deadline := time.Now().Add(relayContentionObservation)
+		observations := 0
+
+		for time.Now().Before(deadline) {
+			row, err := fixture.ds.GetEventByID(ctx, later)
+			require.NoError(t, err, "reading the blocked row failed")
+			observations++
+
+			require.Equalf(t, model.EventOutboxStatusPending, row.Status,
+				"THE SUCCESSOR WAS CLAIMED while its predecessor was still in flight, so its "+
+					"record can reach the partition first and the aggregate's order is lost "+
+					"irrecoverably. A row is a claim candidate only while no earlier row for its "+
+					"partition key is pending or processing — see claimPendingEventOutboxQuery. "+
+					"row: status=%s attempts=%d token=%q", row.Status, row.Attempts, row.ClaimToken)
+			require.Emptyf(t, row.ClaimToken,
+				"a claim token on the blocked row means some relay leased it: %q", row.ClaimToken)
+			require.Nilf(t, row.LockedUntil,
+				"a lease on the blocked row means some relay claimed it: %v", row.LockedUntil)
+			require.Zero(t, row.Attempts,
+				"an attempt against the blocked row means a relay tried to publish it")
+
+			time.Sleep(relayContentionPollInterval)
+		}
+
+		require.Greaterf(t, observations, 1,
+			"the blocked row was read %d time(s): the observation window must span several poll "+
+				"intervals or it asserts only that nothing had happened yet", observations)
+
+		// AND NOTHING REACHED THE BROKER. The row state is the mechanism; this is the
+		// consequence, and it is asserted separately because a relay that published without
+		// recording the dispatch would satisfy the assertions above and still have broken the
+		// order on the topic.
+		records, _ := fixture.fetchPartition(t, contendedPartition, startOffsets[contendedPartition])
+		require.Emptyf(t, records,
+			"%d record(s) of this run reached %s/%d while the aggregate's earlier event was "+
+				"still in flight. Whichever relay wrote them overtook its predecessor.",
+			len(records), fixture.topic, contendedPartition)
+
+		require.True(t, first.IsRunning(), "relay A must still be running, or the silence above is its absence")
+		require.True(t, second.IsRunning(), "relay B must still be running, or the silence above is its absence")
+	})
+
+	t.Run("once the predecessor settles both are published in order", func(t *testing.T) {
+		relayContentionReleaseEarlierRow(t, fixture, earlier, token)
+
+		// The SAME two relays, still running, now do the work. That is what makes the silence
+		// above a refusal rather than an absence.
+		fixture.requireAllDispatched(ctx, t, eventIDs)
+
+		observed, _ := fixture.consumeRun(t, startOffsets, len(eventIDs))
+		require.Len(t, observed, 2)
+
+		first.Stop()
+		second.Stop()
+		assert.False(t, first.IsRunning(), "IsRunning must report false once Stop has returned")
+		assert.False(t, second.IsRunning(), "IsRunning must report false once Stop has returned")
+
+		bySequence := make(map[int]orderingObservation, len(observed))
+		for _, observation := range observed {
+			require.Equal(t, ledgerID, observation.key,
+				"every record of the contended aggregate must be keyed by its ledger")
+			bySequence[observation.payload.Data.MetaData.Sequence] = observation
+		}
+		require.Len(t, bySequence, 2, "both sequences must be present exactly once")
+
+		predecessor, successor := bySequence[0], bySequence[1]
+
+		assert.Equal(t, predecessor.partition, successor.partition,
+			"one partition key must resolve to one partition, or ordering is not even definable")
+		assert.Equal(t, contendedPartition, predecessor.partition,
+			"and it must be the partition the stable hash of the ledger resolves to, or the key "+
+				"reaching the broker is not the key this test parked and released")
+		assert.Lessf(t, predecessor.offset, successor.offset,
+			"THE PREDECESSOR MUST OCCUPY THE LOWER OFFSET. Two relays published these records and "+
+				"the partition is the only record of their order, so a successor at a lower offset "+
+				"is a reordering no consumer can undo. sequence 0 at %s/%d offset %d, sequence 1 at "+
+				"%s/%d offset %d",
+			fixture.topic, predecessor.partition, predecessor.offset,
+			fixture.topic, successor.partition, successor.offset)
+
+		orderingRequireRelayGoroutineGone(t)
+	})
+}
+
 // TestEventOrdering_ProductionCaptureKeysTransactionEventsByLedgerID is the proof that
 // requirement R-6's partitioning dimension is supplied by PRODUCTION CODE and not by a test.
 //
@@ -1816,6 +2133,26 @@ func TestEventOrdering_EventsSharingAnAggregateAreConsumedInPublishOrder(t *test
 // is a marshal and no I/O, which is what lets this run everywhere rather than only where the
 // integration fixture is reachable.
 func TestEventOrdering_ProductionCaptureKeysTransactionEventsByLedgerID(t *testing.T) {
+	// RESTORED WHEN THIS TEST ENDS. config.ConfigStore is a process-global atomic.Value, so the
+	// broker list, topic prefix and sunset date installed below outlive this function and are
+	// read by every later test in the package that calls config.Fetch — including the ones that
+	// assert the UNCONFIGURED posture, which would then fail inside a test that never mentions
+	// Kafka. Restoring is the established idiom here; see storeLegacyWebhookConfiguration in
+	// webhooks_test.go and the outbox fixture's own store helper.
+	previousConfiguration := config.ConfigStore.Load()
+	t.Cleanup(func() {
+		if previousConfiguration != nil {
+			config.ConfigStore.Store(previousConfiguration)
+
+			return
+		}
+
+		// Nothing was installed before this test, so the store is returned to a configuration
+		// that carries nothing rather than left holding this one. An empty value cannot be
+		// written back into an atomic.Value, which is why this stores a zero Configuration.
+		config.ConfigStore.Store(&config.Configuration{})
+	})
+
 	// Kafka brokers make event capture configured, and the deprecation window has to be
 	// stated alongside them: the loader refuses brokers without one, so MockConfig would
 	// silently store nothing and the assertions below would fail for a configuration
@@ -2551,4 +2888,371 @@ func TestEventOrdering_OperationsGuideAgreesWithThePublishedKeyContract(t *testi
 	assert.Contains(t, text, "event-streaming.md#the-key-is-the-ledger-id-wherever-a-ledger-exists",
 		"the runbook must link to the corrected section, so the two documents cannot describe "+
 			"the key differently")
+}
+
+// TestEventOrdering_DivergentStoredKeysStaySerialisedAcrossRelayReplicas is the proof for
+// PERF-C02: that the value the DATABASE serialises dispatch on is the value KAFKA partitions
+// on, on the rows where the schema lets the two disagree.
+//
+// # The condition this test creates, and why it is a real one
+//
+// A row carries two key columns. ledger_id is the authoritative ledger; partition_key is "where
+// does this message go" and is NOT NULL. The publish path resolves the message key as
+// model.EffectivePartitionKey — the ledger where a row has one, the stored partition key where
+// it does not — because requirement R-6 partitions by ledger id.
+//
+// On a row captured today the two AGREE, because PrepareEventOutbox derives the partition key
+// from the ledger whenever a ledger is known. The schema permits them to DIVERGE, and two
+// populations actually do: a row written before the ledger was threaded through its call site,
+// whose partition_key holds a source balance while ledger_id holds the ledger; and a row whose
+// partition_key was derived from the payload before the ledger was resolved. This test seeds
+// exactly that: one ledger, and stored partition keys that differ per row.
+//
+// # Why the delivery subtest above cannot see the defect
+//
+// Two independent mechanisms serialise same-key rows, and they fail differently:
+//
+//   - groupEventRowsByPartitionKey groups a CLAIMED BATCH by the effective key and publishes
+//     each group with one goroutine. That holds WITHIN one process whatever the SQL does, so a
+//     single relay publishes these rows in order even with a claim that admits all of them.
+//   - The claim's earlier-same-key exclusion is what holds ACROSS processes. It is the only
+//     mechanism that does.
+//
+// So a claim serialising on the wrong key reorders nothing until a second replica exists — which
+// is why this test runs two relays, and why the existing single-relay subtest passed throughout
+// the period the defect was live.
+//
+// # What is asserted
+//
+// The claim-level probe is the deterministic detector: with the rows seeded, ONE claim wide
+// enough for all of them must hand back at most one, because at most one row per effective key
+// may be in flight. Against the superseded predicate it handed back every row, since their
+// stored keys all differ.
+//
+// The delivery assertion is the consequence: two relays, run concurrently over the same rows,
+// must produce messages that all land on the ledger's ONE partition at strictly increasing
+// offsets in occurrence order. That is acceptance criterion V-6 under the condition R-6's
+// keying creates.
+func TestEventOrdering_DivergentStoredKeysStaySerialisedAcrossRelayReplicas(t *testing.T) {
+	fixture := newOrderingFixture(t)
+	ctx := context.Background()
+
+	// ONE ledger, so every row hashes to one partition and any reordering is observable as a
+	// permutation of one sequence rather than being spread across independent partitions.
+	ledgerID := model.GenerateUUIDWithSuffix("ldg")
+	expectedPartition := fixture.expectedPartitionFor(ledgerID)
+
+	startOffsets := fixture.endOffsets(t)
+
+	rows, eventIDs := fixture.seedDivergentKeyRows(ctx, t, ledgerID)
+
+	t.Run("one claim admits at most one row of the ledger", func(t *testing.T) {
+		orderingAssertClaimSerialisesDivergentKeys(ctx, t, fixture, ledgerID, eventIDs)
+	})
+
+	t.Run("two concurrent relays publish them in occurrence order", func(t *testing.T) {
+		orderingAssertConcurrentRelaysPreserveOrder(
+			ctx, t, fixture, ledgerID, expectedPartition, rows, eventIDs, startOffsets)
+	})
+}
+
+// seedDivergentKeyRows captures orderingDivergentRows events for ONE ledger and stores them with
+// DIFFERENT partition keys, which is the condition PERF-C02 is about.
+//
+// The rows are produced by the production capture path — PrepareEventOutbox with
+// WithEventLedgerID — so everything about them except the one column under test is what
+// production writes. Only partition_key is then overwritten, and only to a value production
+// itself used to write there: the transaction's source balance id.
+//
+// They are BACKDATED, for the same reason the claim-order subtest backdates its rows: candidates
+// are claimed oldest first, so backdating puts this test's rows at the head of the claimable set
+// on a table that may hold unrelated pending work.
+//
+// Parameters:
+//   - ctx context.Context: the context for the inserts.
+//   - t *testing.T: the test.
+//   - ledgerID string: the one ledger every seeded row belongs to.
+//
+// Returns:
+//   - []*model.EventOutbox: the seeded rows, in occurrence order.
+//   - []string: their event ids, in the same order.
+func (f *orderingFixture) seedDivergentKeyRows(
+	ctx context.Context,
+	t *testing.T,
+	ledgerID string,
+) ([]*model.EventOutbox, []string) {
+	t.Helper()
+
+	eventName := orderingEventName()
+	base := time.Now().UTC().AddDate(0, 0, -orderingClaimBackdateDays).Truncate(time.Second)
+
+	rows := make([]*model.EventOutbox, 0, orderingDivergentRows)
+	eventIDs := make([]string, 0, orderingDivergentRows)
+
+	for sequence := 1; sequence <= orderingDivergentRows; sequence++ {
+		transaction := orderingTransaction(f.runID, ledgerID, orderingDivergentAggregateBase, sequence)
+
+		row, err := f.blnk.PrepareEventOutbox(ctx, NewWebhook{
+			Event:   eventName,
+			Payload: transaction,
+		}, WithEventLedgerID(ledgerID))
+		require.NoError(t, err, "preparing the outbox row for sequence %d failed", sequence)
+		require.NotNil(t, row,
+			"PrepareEventOutbox returned no row, which means event publishing is not configured")
+
+		require.Equal(t, ledgerID, row.LedgerID,
+			"the capture path must record the supplied ledger, or this test is not seeding the "+
+				"condition it claims to")
+		require.Equal(t, ledgerID, row.PartitionKey,
+			"the capture path must key by the ledger today; this test overwrites that below to "+
+				"recreate the divergence the schema still permits, and a capture path that had "+
+				"stopped agreeing would make the overwrite meaningless")
+
+		// THE DIVERGENCE, and the only field this test changes. A per-row balance id is exactly
+		// what the payload-derived key used to be, so the stored keys differ from each other and
+		// from the ledger while ledger_id — and therefore the Kafka message key — stays the same
+		// for every row.
+		row.PartitionKey = fmt.Sprintf("bln_%s_d%03d_source", f.runID, sequence)
+		row.OccurredAt = base.Add(time.Duration(sequence) * time.Second)
+
+		require.NotEqual(t, row.PartitionKey, row.EffectiveKey(),
+			"the seeded row must publish under a key different from its stored one, or the "+
+				"divergence this test exists for is not present")
+		require.Equal(t, ledgerID, row.EffectiveKey(),
+			"every seeded row must publish under the one ledger, or they do not share a Kafka "+
+				"partition and nothing about ordering follows")
+
+		require.NoError(t, f.ds.InsertEventOutbox(ctx, row),
+			"inserting the divergent-key row for sequence %d failed", sequence)
+
+		rows = append(rows, row)
+		eventIDs = append(eventIDs, row.EventID)
+	}
+
+	t.Logf("seeded %d rows for ledger %s with %d distinct stored partition keys",
+		len(rows), ledgerID, len(rows))
+
+	return rows, eventIDs
+}
+
+// orderingAssertClaimSerialisesDivergentKeys is the deterministic detector for PERF-C02.
+//
+// One claim, wide enough to take every seeded row, must hand back AT MOST ONE of them: the
+// claim admits a candidate only when no earlier row sharing its EFFECTIVE key is still pending
+// or processing, and all of these rows share one. A claim serialising on the stored column
+// returns all six, because all six stored keys differ.
+//
+// It asserts "at most one" rather than "exactly one" because the row it would return may
+// legitimately be held by something else on a shared database — the delivery subtests in this
+// package run real relays against the same table. Zero is therefore not a failure; two is,
+// under every circumstance, because no concurrent claimer can cause a claim to return two rows
+// of one key.
+//
+// The lease it takes is short and the rows are left pending, because the delivery assertion
+// that follows needs them.
+//
+// Parameters:
+//   - ctx context.Context: the context for the claim.
+//   - t *testing.T: the subtest.
+//   - f *orderingFixture: the live fixture.
+//   - ledgerID string: the ledger every seeded row belongs to, for the failure message.
+//   - eventIDs []string: the seeded event ids.
+func orderingAssertClaimSerialisesDivergentKeys(
+	ctx context.Context,
+	t *testing.T,
+	f *orderingFixture,
+	ledgerID string,
+	eventIDs []string,
+) {
+	t.Helper()
+
+	seeded := make(map[string]struct{}, len(eventIDs))
+	for _, eventID := range eventIDs {
+		seeded[eventID] = struct{}{}
+	}
+
+	batch, err := f.ds.ClaimPendingEventOutbox(ctx, len(eventIDs)*2, orderingDivergentProbeLease)
+	require.NoError(t, err, "the probe claim failed")
+
+	mine := make([]string, 0, len(eventIDs))
+	keys := make([]string, 0, len(eventIDs))
+	for _, row := range batch {
+		if _, ok := seeded[row.EventID]; !ok {
+			continue
+		}
+
+		mine = append(mine, row.EventID)
+		keys = append(keys, fmt.Sprintf("%s(stored %s)", row.EffectiveKey(), row.PartitionKey))
+	}
+
+	require.LessOrEqual(t, len(mine), 1,
+		"one claim returned %d rows of ledger %s at once: %v.\n"+
+			"Every one of these rows publishes under the ledger as its Kafka message key, so they "+
+			"share ONE partition — and the claim must therefore admit at most one of them at a "+
+			"time, across every relay instance. Returning several means the earlier-same-key "+
+			"exclusion is comparing a different key from the one the publisher uses: the rows' "+
+			"STORED partition keys all differ (%v) while their EFFECTIVE keys are all %s. Two "+
+			"relay replicas can then hold two rows of one partition and append them in either "+
+			"order.",
+		len(mine), ledgerID, mine, keys, ledgerID)
+
+	// Released rather than left leased, so the relays that follow do not wait out the probe's
+	// lease. Any row it did claim is returned to the claimable set with its retry budget
+	// untouched — the claim spends no attempt.
+	f.releaseProbeLease(ctx, t, mine)
+
+	t.Logf("the probe claim admitted %d of %d seeded rows, which is the serialisation the "+
+		"ordering guarantee rests on", len(mine), len(eventIDs))
+}
+
+// releaseProbeLease returns rows the probe claim leased to the claimable set immediately.
+//
+// It clears status, the lease and the claim token in one statement rather than through the
+// repository, because no production caller needs to un-claim a row and adding the operation to
+// the interface to serve a test would put an unused transition in production code. The lease
+// would expire on its own in orderingDivergentProbeLease; releasing it explicitly is what keeps
+// the assertion that follows independent of that timing.
+//
+// Parameters:
+//   - ctx context.Context: the context for the update.
+//   - t *testing.T: the subtest.
+//   - eventIDs []string: the rows the probe claimed. Empty is a no-op.
+func (f *orderingFixture) releaseProbeLease(ctx context.Context, t *testing.T, eventIDs []string) {
+	t.Helper()
+
+	if len(eventIDs) == 0 {
+		return
+	}
+
+	for _, eventID := range eventIDs {
+		if _, err := f.pool.ExecContext(ctx,
+			`UPDATE blnk.event_outbox
+			    SET status = 'pending', locked_until = NULL, claim_token = NULL
+			  WHERE event_id = $1 AND status = 'processing'`,
+			eventID,
+		); err != nil {
+			// Reported rather than fatal: the lease expires on its own, so the run can still
+			// complete — it just waits.
+			t.Logf("could not release the probe lease on %s (%v); the relays will wait for it to expire",
+				eventID, err)
+		}
+	}
+}
+
+// orderingAssertConcurrentRelaysPreserveOrder runs orderingDivergentRelayCount relays over the
+// seeded rows at once and asserts the topic received them in occurrence order.
+//
+// Two relays over one *Blnk is what two replicas look like FROM THE DATABASE: two independent
+// claim loops, each taking its own lease and its own claim token, with nothing but the claim's
+// predicate keeping them from holding two rows of one Kafka partition simultaneously. They share
+// the process's Kafka writers, exactly as two pods share nothing — which is immaterial here,
+// because the writers are safe for concurrent use and the ordering question is decided before a
+// write is issued.
+//
+// Parameters:
+//   - ctx context.Context: the parent context.
+//   - t *testing.T: the subtest.
+//   - f *orderingFixture: the live fixture.
+//   - ledgerID string: the ledger every seeded row belongs to.
+//   - expectedPartition int: the partition the stable hash resolves that ledger to.
+//   - rows []*model.EventOutbox: the seeded rows, in occurrence order.
+//   - eventIDs []string: their event ids, in the same order.
+//   - startOffsets map[int]int64: the topic's end offsets before anything was published.
+func orderingAssertConcurrentRelaysPreserveOrder(
+	ctx context.Context,
+	t *testing.T,
+	f *orderingFixture,
+	ledgerID string,
+	expectedPartition int,
+	rows []*model.EventOutbox,
+	eventIDs []string,
+	startOffsets map[int]int64,
+) {
+	t.Helper()
+
+	relays := make([]*EventRelayProcessor, 0, orderingDivergentRelayCount)
+	relayCtx, cancelRelays := context.WithCancel(ctx)
+
+	t.Cleanup(func() {
+		for _, relay := range relays {
+			relay.Stop()
+		}
+		cancelRelays()
+	})
+
+	for instance := 0; instance < orderingDivergentRelayCount; instance++ {
+		relay := NewEventRelayProcessor(f.blnk).
+			WithPollInterval(orderingRelayPollInterval).
+			WithBatchSize(orderingRelayBatchSize).
+			WithLockDuration(orderingRelayLockDuration)
+
+		relay.Start(relayCtx)
+		require.Truef(t, relay.IsRunning(),
+			"relay instance %d refused to start; startupObstacle logs which precondition was missing",
+			instance)
+
+		relays = append(relays, relay)
+	}
+
+	f.requireAllDispatched(ctx, t, eventIDs)
+	observed, _ := f.consumeRun(t, startOffsets, len(eventIDs))
+
+	for _, relay := range relays {
+		relay.Stop()
+		assert.False(t, relay.IsRunning(), "IsRunning must report false once Stop has returned")
+	}
+	orderingRequireRelayGoroutineGone(t)
+
+	// Only this test's own events. The topic is shared with every other run against this
+	// broker, and consumeRun reads whatever arrived after the start offsets.
+	sequenceByEventID := make(map[string]int, len(rows))
+	for index, row := range rows {
+		sequenceByEventID[row.EventID] = index + 1
+	}
+
+	sequences := make([]int, 0, len(rows))
+	offsets := make([]int64, 0, len(rows))
+
+	for _, observation := range observed {
+		sequence, mine := sequenceByEventID[observation.envelope.EventID]
+		if !mine {
+			continue
+		}
+
+		assert.Equal(t, ledgerID, observation.key,
+			"event %s was keyed with %q instead of its ledger id: the stored partition key must "+
+				"never reach the wire as the message key on a row that carries a ledger",
+			observation.envelope.EventID, observation.key)
+		require.Equal(t, expectedPartition, observation.partition,
+			"event %s landed on partition %d instead of %d, so these rows did not share a "+
+				"partition and no ordering conclusion follows",
+			observation.envelope.EventID, observation.partition, expectedPartition)
+
+		sequences = append(sequences, sequence)
+		offsets = append(offsets, observation.offset)
+	}
+
+	require.Len(t, sequences, len(rows),
+		"expected all %d seeded events on %s/%d, observed %d",
+		len(rows), f.topic, expectedPartition, len(sequences))
+
+	expectedSequence := make([]int, 0, len(rows))
+	for sequence := 1; sequence <= len(rows); sequence++ {
+		expectedSequence = append(expectedSequence, sequence)
+	}
+
+	// THE CRITERION. consumeRun reads each partition forward from the start offset, so the
+	// order of `sequences` is the order the partition holds — the order a subscriber sees.
+	assert.Equal(t, expectedSequence, sequences,
+		"ledger %s was appended to partition %d out of occurrence order: got %v at offsets %v.\n"+
+			"Every one of these rows carries a DIFFERENT stored partition key and the SAME ledger, "+
+			"so they are the rows on which the claim's key and the publisher's key must agree. Out "+
+			"of order here means two relay instances held two rows of one partition at once.",
+		ledgerID, expectedPartition, sequences, offsets)
+	assert.IsIncreasing(t, offsets,
+		"ledger %s must occupy strictly increasing offsets within partition %d",
+		ledgerID, expectedPartition)
+
+	t.Logf("%d relays drained %d divergent-key rows of ledger %s to partition %d at offsets %d..%d, in occurrence order",
+		orderingDivergentRelayCount, len(rows), ledgerID, expectedPartition, offsets[0], offsets[len(offsets)-1])
 }

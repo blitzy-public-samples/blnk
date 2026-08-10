@@ -602,32 +602,32 @@ type collectorFakeOutbox struct {
 	err    error
 	calls  int
 
-	// windows records the `since` instant of every call, so a test can assert the collector
-	// bounds the count it asks for (PERF-P04).
-	windows []time.Time
+	// unwindowedCalls counts calls to the UNWINDOWED aggregate, which is the only one the
+	// seam offers now (PERF-M05). It used to record the `since` instant of every call so a
+	// test could assert the collector bounded the count it asked for; the collector no longer
+	// names a window at all, because the aggregate it reads has none to name.
+	unwindowedCalls int
 }
 
 func newCollectorFakeOutbox() *collectorFakeOutbox {
 	return &collectorFakeOutbox{counts: map[string]int64{}}
 }
 
-// CountEventOutboxByStatus reproduces the repository's GROUP BY semantics exactly: a status
+// CountUnresolvedEventOutbox reproduces the repository's GROUP BY semantics exactly: a status
 // with no rows is ABSENT from the map rather than present with a zero. That is what makes
 // the collector's two-value reads mandatory, so a fake that returned zeros would let a
 // buggy single-value read pass.
 //
-// The window is RECORDED rather than applied (PERF-P04). It bounds only the dispatched count,
-// which this collector never reads, and recording it is what lets a test assert that the
-// collector asks for a bounded count at all rather than the whole-history one it replaced.
-func (o *collectorFakeOutbox) CountEventOutboxByStatus(
-	_ context.Context,
-	since time.Time,
-) (map[string]int64, error) {
+// It reproduces the UNRESOLVED aggregate, which takes no window (PERF-M05). Every count the
+// collector reads is of a non-dispatched status, so a fake honouring a window would model a
+// bound the real query does not have — and the dispatched history the previous windowed
+// aggregate also counted, at 43.2 million index entries a day, was read by nobody.
+func (o *collectorFakeOutbox) CountUnresolvedEventOutbox(_ context.Context) (map[string]int64, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
 	o.calls++
-	o.windows = append(o.windows, since)
+	o.unwindowedCalls++
 
 	if o.err != nil {
 		return nil, o.err
@@ -659,15 +659,16 @@ func (o *collectorFakeOutbox) callCount() int {
 	return o.calls
 }
 
-// snapshotWindows returns the `since` instant of every recorded call.
-func (o *collectorFakeOutbox) snapshotWindows() []time.Time {
+// unwindowedCallCount returns how many times the UNWINDOWED aggregate was asked for.
+//
+// It is the assertion surface PERF-M05 needs: the property under test is no longer "the
+// collector named a bounded window" but "the collector reached for the aggregate that has no
+// history arm in it", and the count is what proves the call landed there.
+func (o *collectorFakeOutbox) unwindowedCallCount() int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	out := make([]time.Time, len(o.windows))
-	copy(out, o.windows)
-
-	return out
+	return o.unwindowedCalls
 }
 
 // collectorFakeRegistry pages a fixed subscriber list.
@@ -1008,7 +1009,9 @@ func (g *collectorRecordedInt64Gauge) Record(_ context.Context, value int64, opt
 
 	attributes := map[string]string{}
 	for _, keyValue := range recorded.ToSlice() {
-		attributes[string(keyValue.Key)] = keyValue.Value.Emit()
+		// Value.String rather than the deprecated Value.Emit; the two agree exactly for the
+		// string, int64 and bool attributes these instruments record.
+		attributes[string(keyValue.Key)] = keyValue.Value.String()
 	}
 
 	g.mu.Lock()
@@ -1147,6 +1150,23 @@ func captureCoverageGauges(t *testing.T) coverageGauges {
 	metrics.SubscribersRegistered = gauges.registered
 
 	return gauges
+}
+
+// captureMeasurementBudgetGauge swaps the exported sweep budget for a recorder.
+//
+// Separate from captureCoverageGauges rather than folded into it, because the two answer
+// different questions and the existing cases assert on the pair above by position. This one is
+// the other operand of the headroom subtraction, and the reason it is exported at all: the
+// documented query used to name the DEFAULT as a literal.
+func captureMeasurementBudgetGauge(t *testing.T) *collectorRecordedInt64Gauge {
+	t.Helper()
+
+	recorder := &collectorRecordedInt64Gauge{}
+	original := metrics.SubscriberMeasurementBudget
+	t.Cleanup(func() { metrics.SubscriberMeasurementBudget = original })
+	metrics.SubscriberMeasurementBudget = recorder
+
+	return recorder
 }
 
 // lagInventoryView is the exported consumer-lag telemetry, keyed by series.
@@ -1335,7 +1355,7 @@ func TestEventMetricsCollector_PublishesTheBacklogIncludingZero(t *testing.T) {
 
 		_, failErr := NewEventMetricsCollector(failing, nil, nil, nil).Collect(context.Background())
 		require.Error(t, failErr)
-		assert.Contains(t, failErr.Error(), "counting the event outbox by status")
+		assert.Contains(t, failErr.Error(), "counting the unresolved event outbox")
 		assert.Empty(t, failingGauge.values(),
 			"a failed count must publish nothing rather than a fabricated zero")
 	})
@@ -2047,20 +2067,29 @@ func TestEventMetricsCollector_MeasuresAPageWithBoundedConcurrency(t *testing.T)
 			"subscriber against a broker that may already be failing")
 }
 
-// TestEventMetricsCollector_BoundsTheBacklogCountItAsksFor is the PERF-P04 guard on the
-// collector's side of the fix.
+// TestEventMetricsCollector_ReadsTheUnresolvedAggregateAndNoHistory is the PERF-M05 guard on
+// the collector's side of the fix, and it replaces the PERF-P04 guard that preceded it.
 //
-// The backlog gauge is the sum of pending and processing, and both are counted exactly and in
-// full however short the window — a row pending for three days must still appear in the very
-// gauge that exists to show it. What the window bounds is the DISPATCHED count, which this
-// collector never reads and which is the one population that grows without bound. So the
-// collector must ask for a bounded count, and the assertion is on what it asked for.
-func TestEventMetricsCollector_BoundsTheBacklogCountItAsksFor(t *testing.T) {
+// The earlier guard asserted the collector NAMED A WINDOW, on the reasoning that a zero instant
+// would take the repository's default and relying on a default is how a whole-history scan
+// survives. That reasoning was sound and the conclusion was too weak: the collector was naming a
+// twenty-four-hour window on an aggregate whose second arm counted dispatched history exactly,
+// so every fifteen-second tick counted 43.2 million index entries at the target rate to produce
+// a figure it then discarded. Bounded is not cheap.
+//
+// The property is now the stronger one: the collector must reach for the aggregate that HAS no
+// history arm. Every figure it publishes — the pending backlog and the two repair backlogs — is
+// of a non-dispatched status, all of which that aggregate counts exactly and for all time, so a
+// row pending for three days still appears in the very gauge that exists to show it. Compile-time
+// enforcement comes from the seam declaring only the unwindowed method; this asserts the call
+// actually lands there on a collection, and that ONE tick asks ONCE.
+func TestEventMetricsCollector_ReadsTheUnresolvedAggregateAndNoHistory(t *testing.T) {
 	outbox := newCollectorFakeOutbox().
 		set(model.EventOutboxStatusPending, 9).
-		set(model.EventOutboxStatusProcessing, 4)
+		set(model.EventOutboxStatusProcessing, 4).
+		set(model.EventOutboxStatusFailed, 7).
+		set(model.EventOutboxStatusWebhookPending, 3)
 
-	before := time.Now().UTC()
 	collector := NewEventMetricsCollector(outbox, nil, nil, nil)
 
 	report, err := collector.Collect(context.Background())
@@ -2068,14 +2097,19 @@ func TestEventMetricsCollector_BoundsTheBacklogCountItAsksFor(t *testing.T) {
 	assert.Equal(t, int64(13), report.PendingBacklog,
 		"the backlog is pending plus processing, both counted in full")
 
-	windows := outbox.snapshotWindows()
-	require.Len(t, windows, 1, "one tick asks once")
-	assert.False(t, windows[0].IsZero(),
-		"the collector must NAME a window: a zero instant would take the repository's default, and "+
-			"relying on a default is how the whole-history scan survived")
-	assert.WithinDuration(t, before.Add(-outboxBacklogCountWindow), windows[0], time.Minute,
-		"and it must be the documented backlog window")
-	assert.True(t, windows[0].Before(time.Now().UTC()))
+	// The two repair backlogs come out of the SAME aggregate, which is why removing the
+	// history arm costs the collector no query and no coverage (PERF-M06).
+	assert.Equal(t, int64(7), report.DeadLetterRepairBacklog,
+		"the dead-letter repair backlog is the `failed` count, from this same reading")
+	assert.Equal(t, int64(3), report.LegacyWebhookRepairBacklog,
+		"the legacy-webhook repair backlog is the `webhook_pending` count, from this same reading")
+
+	assert.Equal(t, 1, outbox.unwindowedCallCount(),
+		"one tick must ask the unresolved aggregate exactly once: a second call would double the "+
+			"cost of the cheapest reading the pipeline has, and zero calls would mean the gauges "+
+			"were published from something other than the outbox")
+	assert.Equal(t, 1, outbox.callCount(),
+		"and it must be the only outbox read a collection makes")
 }
 
 // TestEventMetricsCollector_LifecycleMatchesTheHouseProcessor pins the lifecycle against the
@@ -2294,6 +2328,38 @@ func TestPrometheusRuleFiles_AreMountedWhereTheGlobResolves(t *testing.T) {
 			assert.NotEmpty(t, ruleFiles, "the mounted directory must actually contain a rule file")
 		})
 	}
+
+	t.Run("everything the glob matches is a rule file", func(t *testing.T) {
+		// THE COST OF A CONVENIENT GLOB. Picking up rule files added to ./alerts without a
+		// further edit here also means picking up ANY .yml added there — and a file that is
+		// not a rule file does not degrade gracefully. Prometheus validates every matched
+		// file at configuration load, so one that fails validation is refused as part of the
+		// whole configuration: the process does not start, and all thirteen rules go with it.
+		//
+		// The realistic way that happens is a promtool UNIT-TEST file, whose top-level keys
+		// are `rule_files`, `evaluation_interval` and `tests` — none of which exists in a
+		// rule file. This repository has exactly such a file, kept in ./alerts/tests, which
+		// the glob does not reach because it does not recurse.
+		matched, err := filepath.Glob(filepath.Join(root, "alerts", "*.yml"))
+		require.NoError(t, err)
+
+		for _, file := range matched {
+			parsed := readYAMLFile(t, file)
+
+			assert.Containsf(t, parsed, "groups",
+				"%s is matched by the rule_files glob, so it must be a rule file — a file with a "+
+					"top-level key other than `groups` is refused at configuration load and takes "+
+					"every rule with it. Unit-test files belong in alerts/tests, which the "+
+					"non-recursive glob does not reach", filepath.Base(file))
+
+			for _, key := range []string{"tests", "rule_files", "evaluation_interval"} {
+				assert.NotContainsf(t, parsed, key,
+					"%s carries the promtool unit-test key %q and is matched by the rule_files "+
+						"glob; Prometheus would refuse the configuration and load no rules at all. "+
+						"Move it to alerts/tests", filepath.Base(file), key)
+			}
+		}
+	})
 
 	// KUBERNETES HAS NO DIRECTORY TO MOUNT, which is why it needs its own assertion.
 	//
@@ -3239,6 +3305,67 @@ func (g *collectorRecordedFloat64Gauge) values() []float64 {
 	return append([]float64(nil), g.records...)
 }
 
+// collectorRecordedInt64Counter captures Int64Counter increments with their attributes.
+//
+// The ATTRIBUTES are the point rather than the total. EventMetricsCollectionFailuresTotal exists to
+// say which dependency failed while the two age gauges say only that something did, so a recorder
+// that summed the increments would assert the very thing the counter is not for — and would have
+// passed just as happily while two of its documented values were emitted by nothing at all.
+type collectorRecordedInt64Counter struct {
+	embedded.Int64Counter
+
+	mu      sync.Mutex
+	records []collectorGaugeRecord
+}
+
+var _ otelmetric.Int64Counter = (*collectorRecordedInt64Counter)(nil)
+
+func (c *collectorRecordedInt64Counter) Add(_ context.Context, value int64, options ...otelmetric.AddOption) {
+	recorded := otelmetric.NewAddConfig(options).Attributes()
+
+	attributes := map[string]string{}
+	for _, keyValue := range recorded.ToSlice() {
+		// String rather than the deprecated Emit. Every attribute this fake ever receives is an
+		// attribute.String, and for the STRING kind both return the raw value unchanged, so the
+		// swap is behaviour-preserving here — it exists because the OpenTelemetry bump that
+		// carried the baggage-parsing fix also deprecated Emit, and a deprecation warning in a
+		// touched file is a NEW lint finding on a repository whose gate reports only new ones.
+		attributes[string(keyValue.Key)] = keyValue.Value.String()
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.records = append(c.records, collectorGaugeRecord{value: value, attributes: attributes})
+}
+
+func (c *collectorRecordedInt64Counter) Enabled(context.Context) bool { return true }
+
+// collections returns the `collection` attribute of every increment, in order.
+func (c *collectorRecordedInt64Counter) collections() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	out := []string{}
+	for _, record := range c.records {
+		out = append(out, record.attributes["collection"])
+	}
+
+	return out
+}
+
+// captureCollectionFailures swaps the collection-failure counter for a recorder.
+func captureCollectionFailures(t *testing.T) *collectorRecordedInt64Counter {
+	t.Helper()
+
+	recorder := &collectorRecordedInt64Counter{}
+	original := metrics.EventMetricsCollectionFailuresTotal
+	t.Cleanup(func() { metrics.EventMetricsCollectionFailuresTotal = original })
+	metrics.EventMetricsCollectionFailuresTotal = recorder
+
+	return recorder
+}
+
 // captureRevocationGauges swaps both outstanding-revocation gauges for recorders.
 //
 // Both, together, because they are published as a pair and a fix that recorded only the count
@@ -3792,7 +3919,7 @@ type collectorBlockingOutbox struct {
 	deadline bool
 }
 
-func (o *collectorBlockingOutbox) CountEventOutboxByStatus(ctx context.Context, _ time.Time) (map[string]int64, error) {
+func (o *collectorBlockingOutbox) CountUnresolvedEventOutbox(ctx context.Context) (map[string]int64, error) {
 	_, hasDeadline := ctx.Deadline()
 
 	o.mu.Lock()
@@ -4649,6 +4776,288 @@ func TestKafkaAlertInventory_IsStatedOnceAndAgreesEverywhere(t *testing.T) {
 				assert.Contains(t, readFile(target...), count,
 					"this file quantifies the alert rules that go inert, so it must state %s", count)
 			})
+		}
+	})
+}
+
+// TestMeasurementBudget_IsExportedSoHeadroomIsPortable closes the last hardcoded constant in the
+// documented queries.
+//
+// # What was wrong
+//
+// Coverage headroom is budget minus registry size, and it is the figure to watch because it goes
+// negative BEFORE any subscriber goes unmeasured. The registry size was exported and the budget was
+// not, so the documented query had to name the default as a literal:
+//
+//	200 - blnk_subscribers_registered
+//
+// The budget is configurable through two accepted environment names, so that query is wrong on
+// every deployment that raised it — and wrong in the direction that hurts: a deployment running
+// 1000 is shown as out of headroom eight hundred subscribers early, and the operator most likely to
+// have raised it is exactly the one the false reading misleads. A dashboard cannot recover a value
+// that was never exported.
+//
+// # What is asserted
+//
+// The gauge carries the figure the sweep ACTUALLY stops at, not the configured value re-read from
+// somewhere else, so the exported number cannot disagree with the behaviour. And it is written on
+// every tick, like the registry size beside it, so a reconfiguration is visible and a stopped
+// collector is not mistaken for a small registry. The documented query is pinned too: exporting the
+// series is only half a fix if the reference still tells an operator to subtract from 200.
+func TestMeasurementBudget_IsExportedSoHeadroomIsPortable(t *testing.T) {
+	t.Run("the configured budget is published on every tick", func(t *testing.T) {
+		budget := captureMeasurementBudgetGauge(t)
+		gauges := captureCoverageGauges(t)
+
+		registry := &collectorFakeRegistry{}
+		collector := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, nil).
+			WithSubscriberBudget(1000)
+
+		for range 2 {
+			_, err := collector.Collect(context.Background())
+			require.NoError(t, err)
+		}
+
+		assert.Equal(t, []int64{1000, 1000}, budget.values(),
+			"the RAISED budget must be exported, once per tick. A literal in the query instead of "+
+				"this series is what showed a deployment running 1000 as exhausted at 200")
+		require.Len(t, gauges.registered.values(), 2,
+			"the denominator is published on the same ticks, or headroom is a subtraction over two "+
+				"different moments")
+	})
+
+	t.Run("the default is published when nothing overrode it", func(t *testing.T) {
+		budget := captureMeasurementBudgetGauge(t)
+		captureCoverageGauges(t)
+
+		_, err := NewEventMetricsCollector(newCollectorFakeOutbox(), &collectorFakeRegistry{}, nil, nil).
+			Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Equal(t, []int64{int64(DefaultSubscriberMetricsBudget)}, budget.values(),
+			"an unconfigured collector runs on the default and must say so; publishing a zero would "+
+				"report every deployment as permanently out of budget while its sweeps completed")
+	})
+
+	t.Run("the documented headroom query subtracts two series", func(t *testing.T) {
+		// The QUERIES, with the comment lines around them removed. The prose deliberately names
+		// the retired `200 - …` form to explain why it was retired, and an assertion over the raw
+		// section would report that explanation as the defect — the same reason the events.js
+		// contract tests strip comments before asserting an absence.
+		reference := readRepoFile(t, filepath.Join("docs", "metrics.md"))
+		section := reference[strings.Index(reference, "## Example Prometheus Queries"):]
+
+		queries := []string{}
+		for _, line := range strings.Split(section, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "```") {
+				continue
+			}
+			queries = append(queries, trimmed)
+		}
+		joined := strings.Join(queries, "\n")
+		require.NotEmpty(t, joined, "the examples section must contain queries")
+
+		assert.Contains(t, joined,
+			"blnk_subscribers_measurement_budget - blnk_subscribers_registered",
+			"docs/metrics.md must document headroom as a difference of the two exported series")
+
+		for _, query := range queries {
+			assert.NotContainsf(t, query, "200 - blnk_subscribers_registered",
+				"a documented query must not hardcode the default budget: it is configurable, and "+
+					"a literal reports false exhaustion on every deployment that raised it — %s",
+				query)
+		}
+	})
+}
+
+// TestCollectionFailures_AreAttributedForEveryCollection is the behavioural half of the
+// `collection` vocabulary contract.
+//
+// # What was wrong
+//
+// The settlement and access-residue collectors appended their failure to the report and returned,
+// without counting it. Both publish NOTHING on a failed read — deliberately, because a zero would
+// assert that nothing is owed on the strength of a reading that does not exist — so every gauge
+// they own simply keeps its previous value. A dashboard therefore showed a flat, healthy-looking
+// backlog, and the only trace of the failure was one field on a struct the caller logs.
+//
+// For access residue that is the most expensive possible place to be silent: its figures are
+// unaccounted BROKER ACCESS, so "the query has been failing since the last four zeroes" rendered
+// identically to "no credential is unaccounted for".
+//
+// # Why the attribute is asserted and not the count
+//
+// EventMetricsCollectionFailing already says that something is failing. This counter's whole
+// purpose is to say WHICH, so a test that asserted only "one increment happened" would pass on a
+// collector that attributed a settlement failure to the outbox backlog. The successful-tick case is
+// asserted for the same reason: a counter that increments on success is a false alarm, and a false
+// alarm on this series sends an operator to a healthy dependency.
+func TestCollectionFailures_AreAttributedForEveryCollection(t *testing.T) {
+	t.Run("a failed settlement read is counted under subscriber_settlement", func(t *testing.T) {
+		failures := captureCollectionFailures(t)
+		captureSettlementGauges(t)
+
+		registry := &collectorFakeRegistry{settlementErr: errors.New("obligations query refused")}
+
+		report, err := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, nil).
+			Collect(context.Background())
+		require.Error(t, err,
+			"a tick with a failed collection reports it: Collect joins report.Failures into its "+
+				"error so a caller cannot act on a partial reading as though it were complete")
+		require.NotEmpty(t, report.Failures,
+			"and the report carries it too — a caller holding it should not have to scrape metrics "+
+				"to learn what its own call observed")
+
+		assert.Contains(t, failures.collections(), collectionSettlement,
+			"a settlement read that failed must be counted under %q. The collector publishes no "+
+				"gauge on failure, so without this the backlog looks flat rather than unmeasured",
+			collectionSettlement)
+	})
+
+	t.Run("a failed access-residue read is counted under subscriber_access_residue", func(t *testing.T) {
+		failures := captureCollectionFailures(t)
+		captureSettlementGauges(t)
+
+		registry := &collectorFakeRegistry{residueErr: errors.New("residue query refused")}
+
+		report, err := NewEventMetricsCollector(newCollectorFakeOutbox(), registry, nil, nil).
+			Collect(context.Background())
+		require.Error(t, err)
+		require.NotEmpty(t, report.Failures)
+		assert.False(t, report.ResidueMeasured,
+			"the report's own flag must say the residue was not measured, which is what makes the "+
+				"four zeroes it did not publish unambiguous")
+
+		assert.Contains(t, failures.collections(), collectionAccessResidue,
+			"a failed residue read must be counted under %q: the figures it withholds are "+
+				"unaccounted broker access, so an unmeasured reading must not render as a clean one",
+			collectionAccessResidue)
+	})
+
+	t.Run("a tick with nothing wrong counts nothing", func(t *testing.T) {
+		failures := captureCollectionFailures(t)
+		captureSettlementGauges(t)
+
+		_, err := NewEventMetricsCollector(newCollectorFakeOutbox(), &collectorFakeRegistry{}, nil, nil).
+			Collect(context.Background())
+		require.NoError(t, err)
+
+		assert.Empty(t, failures.collections(),
+			"a healthy tick must leave this counter alone; an increment on success is a page for a "+
+				"dependency that is working")
+	})
+}
+
+// TestCollectionFailureVocabulary_IsEmittedAndDocumented reconciles the `collection` attribute's
+// closed set with the code that emits it and the reference that publishes it.
+//
+// # The drift it closes
+//
+// docs/metrics.md named six values. Two of them — `subscriber_settlement` and
+// `subscriber_access_residue` — were never emitted by anything, because both collectors appended
+// their failure to the report and returned WITHOUT calling recordCollectionFailure. The value that
+// was emitted and undocumented, `subscriber_listing`, was missing from the list. So the counter
+// documented two dependencies it could not attribute and hid one it could.
+//
+// That is worse than an incomplete list. The counter's stated purpose is to answer WHICH dependency
+// is failing while `EventMetricsCollectionFailing` says only that something is — and an operator
+// who queries `{collection="subscriber_settlement"}`, gets an empty result and concludes settlement
+// is healthy has been misled by the reference into reading absence as health. The settlement and
+// access-residue collectors are exactly where that reading is most expensive: both publish nothing
+// on failure, so every gauge they own keeps its last value, and unaccounted broker access looks
+// like no unaccounted broker access.
+//
+// # Why it is driven from the constants
+//
+// The list was correct for the collectors that existed when it was written. Nothing invalidated it
+// except a collector being added, which is the routine change this file should make safe — so the
+// expectation is derived from the const block rather than restated here, and adding a value fails
+// this test with the document to update rather than silently widening the domain.
+func TestCollectionFailureVocabulary_IsEmittedAndDocumented(t *testing.T) {
+	root := moduleRootDir(t)
+
+	source, err := os.ReadFile(filepath.Join(root, "event_metrics.go"))
+	require.NoError(t, err, "the collector is the authority on what it emits")
+
+	// The closed set, read out of the declaration rather than listed, so the two directions
+	// below compare the code against itself and against the document.
+	declared := regexp.MustCompile(`(?m)^\t(collection[A-Za-z]+)\s+= "([a-z_]+)"$`).
+		FindAllStringSubmatch(string(source), -1)
+	require.NotEmpty(t, declared,
+		"event_metrics.go must declare the collection vocabulary as a const block of fixed "+
+			"literals; an empty match would make every assertion below vacuous")
+
+	// The constants themselves, so a renamed literal fails here rather than drifting.
+	values := map[string]string{}
+	for _, entry := range declared {
+		values[entry[1]] = entry[2]
+	}
+	require.Equal(t, map[string]string{
+		"collectionOutboxBacklog":     collectionOutboxBacklog,
+		"collectionDeadLetterAge":     collectionDeadLetterAge,
+		"collectionRevocations":       collectionRevocations,
+		"collectionSubscriberLag":     collectionSubscriberLag,
+		"collectionSubscriberListing": collectionSubscriberListing,
+		"collectionSettlement":        collectionSettlement,
+		"collectionAccessResidue":     collectionAccessResidue,
+	}, values,
+		"the parsed const block must be the vocabulary this test names; a value added to the block "+
+			"has to be emitted and documented, and one removed has to leave the reference")
+
+	t.Run("every declared value is actually emitted", func(t *testing.T) {
+		// The half that the documentation could not catch. A constant nothing passes to the
+		// recorder is a series that never exists, and an empty query result reads as health.
+		for name, value := range values {
+			assert.Containsf(t, string(source), "recordCollectionFailure(ctx, "+name+")",
+				"event_metrics.go declares %s = %q but never records it. A documented attribute "+
+					"value no code emits makes an absent series indistinguishable from a healthy "+
+					"one, which is the reading the counter exists to prevent", name, value)
+		}
+	})
+
+	t.Run("the reference publishes exactly those values", func(t *testing.T) {
+		reference, err := os.ReadFile(filepath.Join(root, "docs", "metrics.md"))
+		require.NoError(t, err, "the metrics reference is what an operator reads")
+
+		row := ""
+		for _, line := range strings.Split(string(reference), "\n") {
+			if strings.HasPrefix(line, "| `blnk_event_metrics_collection_failures_total` |") {
+				require.Emptyf(t, row,
+					"docs/metrics.md must describe blnk_event_metrics_collection_failures_total "+
+						"exactly once, or two rows can disagree")
+				row = line
+			}
+		}
+		require.NotEmptyf(t, row,
+			"docs/metrics.md must carry a row for blnk_event_metrics_collection_failures_total")
+
+		for name, value := range values {
+			assert.Containsf(t, row, "`"+value+"`",
+				"docs/metrics.md must publish %q (%s) as a value of the `collection` attribute; a "+
+					"dependency the counter can attribute but the reference does not name is one "+
+					"nobody queries", value, name)
+		}
+
+		// THE REVERSE DIRECTION, which is how the two never-emitted values survived: the row
+		// named them, no constant did, and nothing compared the two. Every backticked snake_case
+		// token in the row that is neither a series name nor the attribute's own name has to be a
+		// value of the vocabulary.
+		emitted := map[string]bool{}
+		for _, value := range values {
+			emitted[value] = true
+		}
+
+		for _, token := range regexp.MustCompile("\x60([a-z][a-z0-9_]*)\x60").
+			FindAllStringSubmatch(row, -1) {
+			if strings.HasPrefix(token[1], "blnk_") || token[1] == "collection" {
+				continue
+			}
+
+			assert.Truef(t, emitted[token[1]],
+				"docs/metrics.md names %q as a `collection` value, and no constant in "+
+					"event_metrics.go emits it. An operator querying it gets an empty result and "+
+					"reads it as the dependency being healthy", token[1])
 		}
 	})
 }

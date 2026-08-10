@@ -45,10 +45,22 @@ var eventStreamingCodeCases = []struct {
 	{ErrEventNotFound, http.StatusNotFound, "EVENT_NOT_FOUND"},
 	{ErrEventNotDeadLettered, http.StatusConflict, "EVENT_NOT_DEAD_LETTERED"},
 	{ErrEventReplayFailed, http.StatusInternalServerError, "EVENT_REPLAY_FAILED"},
+	// The second code in this family deliberately mapped to 500, and the ONE reason it is
+	// inventoried here despite sharing the unknown-code default: an unkeyable event is a
+	// producer defect inside this service rather than anything a caller did, so 500 is the
+	// judgement and not the absence of one. TestStatusForCode_EventCodesAreMappedNotDefaulted
+	// is what tells the two apart, because it does a two-value lookup instead of comparing
+	// StatusForCode against 500.
+	{ErrEventKeyUnresolvable, http.StatusInternalServerError, "EVENT_KEY_UNRESOLVABLE"},
 	// The identifier says Kafka but the string carries the EVENT_ family prefix, and
 	// that asymmetry is deliberate. So is the 503: an unreachable broker is a
 	// retryable upstream condition, not a defect here, so it must not resolve to 500.
 	{ErrKafkaUnavailable, http.StatusServiceUnavailable, "EVENT_KAFKA_UNAVAILABLE"},
+	// TAXONOMY-01. 504, and neither of its neighbours: a replay abandoned by a cancelled
+	// caller or a spent deadline is not the broker being unavailable (503, which would
+	// send an operator to a healthy Kafka) and not a defect in this service (500). The
+	// event stays dead-lettered, so the request is safe to repeat.
+	{ErrEventReplayTimeout, http.StatusGatewayTimeout, "EVENT_REPLAY_TIMEOUT"},
 	{ErrSubscriberNotFound, http.StatusNotFound, "SUBSCRIBER_NOT_FOUND"},
 	{ErrSubscriberProvisioningFailed, http.StatusServiceUnavailable, "SUBSCRIBER_PROVISIONING_FAILED"},
 	// A dependency of issuance being unconfigured is not a malformed request, so 503
@@ -57,11 +69,15 @@ var eventStreamingCodeCases = []struct {
 	// The two STATE refusals. Both 409, because the request is well formed and it is
 	// the registry row that has to change before the identical request can succeed.
 	//
-	// SUBSCRIBER_ISOLATION_UNENFORCEABLE was a third, and it is deliberately GONE rather
-	// than retained unused: it named the refusal to issue a credential to a subscriber
-	// recording a partition-key prefix, which is no longer refused — the prefix is a
-	// consumer-side filtering contract, disclosed with the credential instead of standing in
-	// the way of it. A code nothing can return documents a refusal that does not happen.
+	// SUBSCRIBER_ISOLATION_UNENFORCEABLE is a third, and its meaning NARROWED rather than
+	// disappeared. It once named a blanket refusal to issue any credential to a subscriber
+	// recording a partition-key prefix; such a subscriber is no longer refused outright —
+	// it is granted Describe without Read and its records are delivered key-filtered by the
+	// subscriber stream gateway. What the code names now is the fail-closed floor beneath
+	// that: a declared isolation that cannot be established at all. It is inventoried here
+	// because it is still declared in codes.go, and a code present without a statusByCode
+	// row resolves to the unknown-code 500 — which is exactly what this table forbids.
+	{ErrSubscriberIsolationUnenforceable, http.StatusConflict, "SUBSCRIBER_ISOLATION_UNENFORCEABLE"},
 	{ErrSubscriberDeprovisioning, http.StatusConflict, "SUBSCRIBER_DEPROVISIONING"},
 	{ErrSubscriberGrantEmpty, http.StatusConflict, "SUBSCRIBER_GRANT_EMPTY"},
 	// A fourth state refusal, and the one whose state lives at the BROKER rather than in the
@@ -76,6 +92,18 @@ var eventStreamingCodeCases = []struct {
 	// 504, not 503 and emphatically not the 500 a missing entry would produce: the
 	// dependency answered too slowly, or the caller went away.
 	{ErrSubscriberProvisioningTimeout, http.StatusGatewayTimeout, "SUBSCRIBER_PROVISIONING_TIMEOUT"},
+	// SEC-KEY-01. The two DATA-PLANE codes, and the only ones in this family a subscriber
+	// rather than an operator can provoke: the subscriber stream gateway is authenticated by
+	// the subscriber's own SASL credential, so it answers the same two questions the broker
+	// would have answered had the subscriber held record access — who are you, and may you
+	// read this topic.
+	//
+	// 401 and 403 respectively, and keeping them apart is the point. A rejected secret is
+	// recoverable by presenting the right one or re-issuing; a topic outside the grant is not
+	// recoverable by any credential, and answering it with 401 would send a client into a
+	// re-authentication loop against a boundary only an operator can move.
+	{ErrSubscriberCredentialInvalid, http.StatusUnauthorized, "SUBSCRIBER_CREDENTIAL_INVALID"},
+	{ErrSubscriberTopicNotGranted, http.StatusForbidden, "SUBSCRIBER_TOPIC_NOT_GRANTED"},
 }
 
 // TestStatusForCode_EventStreamingCodes states the mapping positively;
@@ -89,23 +117,34 @@ func TestStatusForCode_EventStreamingCodes(t *testing.T) {
 	// catalog is what the guard exists to prevent: a code that arrives with neither a
 	// status entry nor a row here would then satisfy a self-referential comparison and
 	// resolve to the unknown-code 500 in production. Adding a code is a deliberate edit
-	// of this number — as is REMOVING one, and the arithmetic that produced 13 is worth
+	// of this number — as is REMOVING one, and the arithmetic that produced 18 is worth
 	// recording because every step of it was a separate edit:
 	//
-	//   12 — the original event-streaming family.
-	//   −1 — SUBSCRIBER_ISOLATION_UNENFORCEABLE retired, because the refusal it named was
-	//        replaced by issuing the credential and delivering the key scope to the consumer.
+	//   12 — the original event-streaming family, SUBSCRIBER_ISOLATION_UNENFORCEABLE included.
 	//   +3 — EVENT_ALREADY_RESOLVED, SUBSCRIBER_INSECURE_TRANSPORT and
 	//        SUBSCRIBER_ACCESS_EXCEEDS_AUTHORIZATION added.
 	//   −1 — EVENT_ALREADY_RESOLVED retired again with the dead-letter resolve endpoint. That
 	//        endpoint's write could leave a row from which a broker-acknowledged replay could
 	//        not be recorded, and retention needs no second write to be safe: a dead-lettered
 	//        row is never purged by age, and a replay is what turns one into a receipt.
+	//   +1 — EVENT_REPLAY_TIMEOUT added, because a replay abandoned by a cancelled caller or a
+	//        spent deadline was resolving to EVENT_KAFKA_UNAVAILABLE and telling an operator to
+	//        wait for a broker that had never stopped answering.
+	//   +2 — SUBSCRIBER_CREDENTIAL_INVALID and SUBSCRIBER_TOPIC_NOT_GRANTED added with the
+	//        subscriber stream gateway, which is the component that enforces a key-scoped
+	//        subscriber's partition-key prefix. They are the first codes in this family a
+	//        subscriber can provoke, so they are the first that carry a 401 and a 403.
+	//
+	//   +1 — EVENT_KEY_UNRESOLVABLE added with the producer-side capture guard: an event that
+	//        can be assigned no Kafka message key cannot preserve per-aggregate ordering, so it
+	//        is refused at capture rather than published unordered.
+	//
+	//   = 18.
 	//
 	// One of those edits caught a genuine omission underneath: SUBSCRIBER_ACCESS_EXCEEDS_
 	// AUTHORIZATION had no statusByCode entry at all, so a deliberate 409 was resolving to 500.
-	if len(eventStreamingCodeCases) != 13 {
-		t.Fatalf("eventStreamingCodeCases has %d rows, want 13 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
+	if len(eventStreamingCodeCases) != 18 {
+		t.Fatalf("eventStreamingCodeCases has %d rows, want 18 (one per event-streaming code in codes.go)", len(eventStreamingCodeCases))
 	}
 	for _, tt := range eventStreamingCodeCases {
 		t.Run(string(tt.code), func(t *testing.T) {

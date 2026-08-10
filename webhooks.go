@@ -91,67 +91,10 @@ import (
 //
 // Retiring this file is a separate, later step with a strict order of operations,
 // spelled out in the SUNSET block at the foot of this file. Read it before deleting
-// anything: two symbols here must outlive the file, and one shared asynq queue must
-// survive it untouched.
-
-// NewWebhook is the webhook notification envelope, and it is a FROZEN CONTRACT.
-// It includes an event type and associated payload data.
-//
-// Marshaled, it is the exact HTTP body Blnk has always POSTed to a subscriber: a
-// two-key object, {"event": <string>, "data": <object>}. That same marshaled object
-// is now carried verbatim — both keys, unaltered — as the payload of the Kafka
-// LedgerEvent envelope, which is what lets an existing subscriber's body parser keep
-// working when only the transport has changed.
-//
-// Consequently the field names, the field types and above all the JSON tags must not
-// change. Renaming a tag, dropping the outer envelope in favour of the inner data
-// object, or adding a field would silently break byte-equivalence between the two
-// transports and, with it, every subscriber parser written against the HTTP era.
-// The struct outlives this file: at sunset it moves, unmodified, to event_outbox.go.
-type NewWebhook struct {
-	Event   string      `json:"event"` // The event type that triggered the webhook.
-	Payload interface{} `json:"data"`  // The data associated with the event.
-}
-
-// getEventFromStatus maps a transaction status to a corresponding event string.
-//
-// This function is the transaction event-string vocabulary. Seven of the thirteen
-// event names Blnk emits originate here, and they are the names that route a Kafka
-// message to a topic just as they used to name a webhook.
-//
-// THE TABLE ITSELF NOW LIVES IN model.EventTypeForTransactionStatus, and this is a
-// one-line delegation to it. The table had to move because the repository layer
-// derives event rows inside the atomic writers and needs the same mapping, and
-// `model` cannot import the root package — so leaving the table here would have meant
-// two tables, in two packages, mapping one status to an event name. Two tables that
-// agree today is precisely what drift looks like before it happens: one status
-// resolving to two different event names depending on which layer was looking would
-// split one aggregate's events across two topics with nothing failing to say so.
-//
-// The behaviour is unchanged, including the case-insensitive comparison. Only the
-// location of the table changed, which is also the sunset relocation the AAP requires:
-// when webhooks.go is deleted this function goes with it, and the vocabulary it used
-// to own is already somewhere that survives.
-//
-// DELIBERATELY PRESERVED DEFECT — do not "fix" this in passing. StatusCommit
-// ("COMMIT", declared in transaction_inflight.go) has no case in the table, so it
-// falls through to transaction.unknown. That is pre-existing behaviour, not a
-// regression introduced by the Kafka work, and it is kept exactly as-is on purpose:
-// the dual-delivery comparison asserts that the Kafka message and the legacy webhook
-// carry identical bytes for the same event, and adding a transaction.commit case
-// would change one side of that comparison and fail it for a reason that has nothing
-// to do with the transport. The behaviour is documented in docs/event-streaming.md so
-// it can be corrected later as a deliberate, separately reviewed change — with the
-// subscriber-facing event-name change that implies.
-//
-// Parameters:
-// - status string: The status of the transaction.
-//
-// Returns:
-// - string: The corresponding event string for the transaction status.
-func getEventFromStatus(status string) string {
-	return model.EventTypeForTransactionStatus(status)
-}
+// anything. Its first step is already done — the two symbols that had to outlive this
+// file, NewWebhook and getEventFromStatus, now live in event_outbox.go and
+// event_topics.go — so what remains is a deletion plus the one prohibition that matters:
+// the shared asynq queue must survive it untouched.
 
 // legacyWebhookPrivateDestinationWarning makes the operator's private-destination
 // assertion appear in the log exactly once per process.
@@ -1289,26 +1232,33 @@ func (b *Blnk) ProcessWebhook(ctx context.Context, task *asynq.Task) error {
 // transport to compare against, and the 410 Gone behaviour is a runtime decision made
 // by that predicate, not a consequence of deleting source.
 //
-// STEP 1 — RELOCATE FIRST, DELETE SECOND. Two symbols in this file must outlive it,
-// because they are not implementation, they are contract:
+// STEP 1 — RELOCATE FIRST, DELETE SECOND. ALREADY DONE. Two symbols that used to be
+// declared here are not implementation, they are contract, and they have been moved out
+// of this file ahead of its deletion:
 //
-//   - NewWebhook moves to event_outbox.go. Its marshaled form IS the payload carried
-//     inside every LedgerEvent, so it survives the transport that named it.
-//   - getEventFromStatus moves to event_topics.go. It IS the transaction event-string
-//     vocabulary that decides which topic a transaction event is published to.
+//   - NewWebhook now lives in event_outbox.go. Its marshaled form IS the payload carried
+//     inside every LedgerEvent, so it survives the transport that named it. Twelve
+//     surviving non-test files depend on it.
+//   - getEventFromStatus now lives in event_topics.go, beside the topic resolution it
+//     feeds. It IS the transaction event-string vocabulary that decides which topic a
+//     transaction event is published to. Three surviving non-test files call it.
 //
-// Every root .go file is package blnk, so both are file moves inside a single package:
-// no import changes anywhere, no call site edited, and transaction_execution.go's use
-// of getEventFromStatus keeps compiling untouched. Move them, confirm the build, and
-// only then continue. Deleting this file first would break the payload contract and
-// the event vocabulary at once.
+// Both were file moves inside package blnk: no import changed, no call site was edited,
+// and every caller kept compiling untouched. Doing it early rather than as the first act
+// of the deletion release is deliberate — it means whoever performs that release does not
+// have to rescue two symbols from a 1,300-line file under time pressure, and STEP 2 is now
+// a pure deletion. NOTHING ELSE in this file outlives it; verify that with a build after
+// STEP 2 rather than by reading, and if a symbol declared here turns out to be needed,
+// move it out FIRST and update this list.
 //
 // STEP 2 — DELETE. Remove processHTTP, processHTTPRaw, SendWebhook,
 // EnqueueLegacyWebhookDelivery, legacyWebhookTaskID, LegacyWebhookRetention and
-// ProcessWebhook, then this file, then webhooks_test.go and webhooks_process_test.go.
-// Those two test files cover the HTTP transport specifically and have no subject once it
-// is gone; the payload and vocabulary behaviours they also touch are by then covered
-// where those symbols now live.
+// ProcessWebhook, then this file, then webhooks_test.go, webhooks_process_test.go,
+// webhooks_destination_test.go and webhooks_logging_test.go. Those four test files cover
+// the HTTP transport specifically and have no subject once it is gone; the payload and
+// vocabulary behaviours they also touch are covered where those two symbols now live.
+// event_dual_delivery_test.go goes with STEP 5, because its subject is the dual-delivery
+// branch rather than this file.
 //
 // Delete the relay's call to EnqueueLegacyWebhookDelivery in the same change, or the
 // build breaks at that call site. That is deliberate: the dual-delivery branch and this

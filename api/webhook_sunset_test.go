@@ -29,6 +29,7 @@ import (
 	"github.com/blnkfinance/blnk/database"
 	"github.com/blnkfinance/blnk/database/mocks"
 	"github.com/blnkfinance/blnk/internal/apierror"
+	"github.com/blnkfinance/blnk/internal/hooks"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -669,9 +670,11 @@ func assertNotRetired(
 ) {
 	t.Helper()
 
+	// Sanitised because one of the routes this walks is the credential issuance route: a
+	// diagnostic that rendered a successful response from it would carry a SASL password.
 	assert.NotEqual(t, http.StatusGone, recorder.Code,
-		"%s %s was retired by the webhook sunset: %s. body: %s",
-		method, path, why, recorder.Body.String())
+		"%s %s was retired by the webhook sunset: %s. %s",
+		method, path, why, safeResponseBody(recorder))
 	assert.NotEqual(t, apierror.ErrGenGone, sunsetErrorCode(t, recorder),
 		"%s %s carries the retirement code: %s", method, path, why)
 }
@@ -1030,46 +1033,219 @@ func TestWebhookSunset_RoutesAnswerNormallyBeforeSunsetDate(t *testing.T) {
 	})
 }
 
+// sunsetHookLifecycle is one observed run of the whole /hooks lifecycle: the status every step
+// answered, the identifier the registry minted, and the hook the registry read back.
+type sunsetHookLifecycle struct {
+	// statuses are the HTTP statuses of the steps, in the order sunsetDriveHookLifecycle
+	// performs them, keyed by step name so a mismatch names the step rather than an index.
+	statuses map[string]int
+	// hookID is the identifier the registry assigned to the created hook.
+	hookID string
+	// readBack is the hook as the registry returned it from GET /hooks/{id}.
+	readBack hooks.Hook
+	// listedIDs are the identifiers GET /hooks reported.
+	listedIDs []string
+	// headers records, per step, whether the response advertised a retirement.
+	advertised map[string]string
+}
+
+// sunsetDriveHookLifecycle registers a hook, reads it, lists it, updates it, deletes it, and
+// reads it again — through the router given, recording what happened at every step.
+//
+// It performs the SAME sequence whatever router it is handed, which is what makes two runs
+// comparable. The hook's name carries the label so two runs against one Redis cannot be confused
+// for each other, and the fixture is a VALID one: an invalid body would answer 400 on both
+// routers and the comparison would hold while proving nothing about the surface working.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - router *gin.Engine: the router to drive.
+//   - label string: distinguishes this run's hook from the other run's.
+//
+// Returns:
+//   - sunsetHookLifecycle: everything observed, for comparison and for direct assertion.
+func sunsetDriveHookLifecycle(t *testing.T, router *gin.Engine, label string) sunsetHookLifecycle {
+	t.Helper()
+
+	observed := sunsetHookLifecycle{
+		statuses:   map[string]int{},
+		advertised: map[string]string{},
+	}
+
+	record := func(step string, recorder *httptest.ResponseRecorder) *httptest.ResponseRecorder {
+		observed.statuses[step] = recorder.Code
+		observed.advertised[step] = recorder.Header().Get("Sunset") +
+			recorder.Header().Get("Deprecation")
+
+		return recorder
+	}
+
+	fixture := hooks.Hook{
+		Name:    "sunset lifecycle probe " + label,
+		URL:     "https://hooks.example.com/blnk-" + label,
+		Type:    hooks.PreTransaction,
+		Active:  true,
+		Timeout: 30,
+	}
+	payload, err := json.Marshal(fixture)
+	require.NoError(t, err, "marshalling the hook fixture")
+
+	created := record("register",
+		sunsetRequest(t, router, http.MethodPost, "/hooks", string(payload)))
+	if created.Code != http.StatusCreated {
+		// Returned early rather than dereferenced: the caller asserts on the status, and
+		// decoding a failure body as a hook would report a JSON error in place of the status
+		// mismatch that is the real finding.
+		return observed
+	}
+
+	var registered hooks.Hook
+	require.NoError(t, json.Unmarshal(created.Body.Bytes(), &registered),
+		"a 201 must carry the registered hook: %s", created.Body.String())
+	require.NotEmpty(t, registered.ID,
+		"the registry must assign an identifier, or nothing that follows can address the hook")
+	observed.hookID = registered.ID
+
+	read := record("read",
+		sunsetRequest(t, router, http.MethodGet, "/hooks/"+registered.ID, ""))
+	if read.Code == http.StatusOK {
+		require.NoError(t, json.Unmarshal(read.Body.Bytes(), &observed.readBack),
+			"a 200 must carry the hook: %s", read.Body.String())
+	}
+
+	// TWO LISTINGS, and the distinction is the manager's rather than this test's: hooks are
+	// indexed in Redis under a per-TYPE set, so an unfiltered request addresses the set for the
+	// empty type and legitimately reports nothing. Both are driven — the unfiltered one for its
+	// status, the typed one because it is the only one that can show the hook is really indexed.
+	record("list", sunsetRequest(t, router, http.MethodGet, "/hooks", ""))
+
+	typed := record("list by type", sunsetRequest(t, router,
+		http.MethodGet, "/hooks?type="+string(hooks.PreTransaction), ""))
+	if typed.Code == http.StatusOK {
+		var all []hooks.Hook
+		require.NoError(t, json.Unmarshal(typed.Body.Bytes(), &all),
+			"a 200 must carry the hook list: %s", typed.Body.String())
+		for _, one := range all {
+			observed.listedIDs = append(observed.listedIDs, one.ID)
+		}
+	}
+
+	renamed := registered
+	renamed.Name = "sunset lifecycle probe " + label + " (renamed)"
+	updatePayload, err := json.Marshal(renamed)
+	require.NoError(t, err)
+
+	record("update", sunsetRequest(t, router,
+		http.MethodPut, "/hooks/"+registered.ID, string(updatePayload)))
+
+	record("delete", sunsetRequest(t, router,
+		http.MethodDelete, "/hooks/"+registered.ID, ""))
+
+	record("read after delete",
+		sunsetRequest(t, router, http.MethodGet, "/hooks/"+registered.ID, ""))
+
+	return observed
+}
+
+// sunsetHookLifecycleExpectations is the status every step must answer on a WORKING /hooks
+// surface, stated independently of what either router happens to return.
+//
+// Comparing the two runs to each other is necessary and not sufficient: two routers that both
+// answered 404, or both 500, would agree perfectly. So the expected statuses are written out, and
+// the comparison then adds that the retirement changed nothing.
+var sunsetHookLifecycleExpectations = map[string]int{
+	"register":          http.StatusCreated,
+	"read":              http.StatusOK,
+	"list":              http.StatusOK,
+	"list by type":      http.StatusOK,
+	"update":            http.StatusOK,
+	"delete":            http.StatusOK,
+	"read after delete": http.StatusNotFound,
+}
+
 // TestWebhookSunset_HooksRoutesUnaffectedAfterSunset guards the most expensive mistake
 // available in this package.
 //
-// /hooks is NOT the webhook subscription API. api/hooks.go and internal/hooks implement
-// the PRE_TRANSACTION and POST_TRANSACTION request-time callouts — synchronous
-// interception whose RESPONSES influence transaction processing — which is a different,
-// fully supported feature that merely shares a word and an asynq queue with the transport
-// being retired. Attaching the retirement with router.Use, or to a /subscribers group, or
-// matching "hook" anywhere in a path, would take it down alongside the transport, and it
-// would look like a correct retirement while doing it.
+// /hooks is NOT the webhook subscription API. api/hooks.go and internal/hooks implement the
+// PRE_TRANSACTION and POST_TRANSACTION request-time callouts — synchronous interception whose
+// RESPONSES influence transaction processing — which is a different, fully supported feature that
+// merely shares a word and an asynq queue with the transport being retired. Attaching the
+// retirement with router.Use, or to a /subscribers group, or matching "hook" anywhere in a path,
+// would take it down alongside the transport, and it would look like a correct retirement while
+// doing it.
 //
-// Every registered /hooks route is exercised, at a retirement instant that has passed, so
-// any leak shows up here.
+// # Why "not 410" was not enough, and what replaced it
+//
+// This test used to assert only that each /hooks route did not answer 410 and carried no
+// retirement code. Every OTHER way of breaking the surface passed it: a route that regressed to
+// 404 because its registration moved, a 500 from a guard that consumed the body, a handler
+// unreachable because a middleware aborted early — none of them is a 410, and the feature would
+// be dead while the test stayed green. It also asserted nothing about the hooks themselves, so a
+// surface that answered 200 to everything and stored nothing was indistinguishable from a working
+// one.
+//
+// So the whole LIFECYCLE is driven — register, read, list, update, delete, read again — twice: on
+// a router whose retirement instant is in the future, and on one whose instant has passed. Three
+// properties are then required, and each excludes a different failure:
+//
+//  1. THE EXPECTED STATUSES, written out in sunsetHookLifecycleExpectations. Two broken routers
+//     agree with each other perfectly, so agreement alone proves nothing.
+//  2. IDENTICAL ANSWERS EITHER SIDE OF THE INSTANT. This is the retirement-specific property: the
+//     passed instant must change nothing, step for step.
+//  3. OBSERVABLE REGISTRY STATE after the instant has passed. The hook read back is the hook that
+//     was registered, the listing contains it, and it is gone after the delete — so a surface
+//     answering 200 without storing anything fails here.
+//
+// The runs use distinct hook names so that sharing one registry cannot make one run's state look
+// like the other's.
 func TestWebhookSunset_HooksRoutesUnaffectedAfterSunset(t *testing.T) {
-	router := setupSunsetRouter(t, sunsetPassedInstant, withSunsetMasterKeyPrincipal())
+	inWindow := sunsetDriveHookLifecycle(t,
+		setupSunsetRouter(t, sunsetFutureInstant, withSunsetMasterKeyPrincipal()),
+		"in-window")
 
-	// The five routes registered in api/api.go, in registration order.
-	for _, target := range []struct {
-		method string
-		path   string
-		body   string
-	}{
-		{http.MethodPost, "/hooks", `{"name":"sunset probe"}`},
-		{http.MethodPut, "/hooks/hook_sunset_probe", `{"name":"sunset probe"}`},
-		{http.MethodGet, "/hooks/hook_sunset_probe", ""},
-		{http.MethodGet, "/hooks", ""},
-		{http.MethodDelete, "/hooks/hook_sunset_probe", ""},
-	} {
-		t.Run(target.method+" "+target.path, func(t *testing.T) {
-			recorder := sunsetRequest(t, router, target.method, target.path, target.body)
+	retired := sunsetDriveHookLifecycle(t,
+		setupSunsetRouter(t, sunsetPassedInstant, withSunsetMasterKeyPrincipal()),
+		"retired")
 
-			assertNotRetired(t, recorder, target.method, target.path,
-				"/hooks is the PRE_TRANSACTION and POST_TRANSACTION callout feature, which "+
-					"is fully supported and must never be reached by the webhook retirement")
-			assert.Empty(t, recorder.Header().Get("Sunset"),
-				"an unguarded route must not advertise a retirement it is not subject to")
-			assert.Empty(t, recorder.Header().Get("Deprecation"),
-				"nor a deprecation it is not subject to")
-		})
+	for step, want := range sunsetHookLifecycleExpectations {
+		assert.Equalf(t, want, retired.statuses[step],
+			"AFTER THE RETIREMENT INSTANT, %q on /hooks answered %d instead of %d. /hooks is the "+
+				"PRE_TRANSACTION and POST_TRANSACTION callout feature, which is fully supported and "+
+				"must be untouched by the webhook transport's retirement — and a regression to any "+
+				"status, not only to 410, takes it down",
+			step, retired.statuses[step], want)
+
+		assert.Equalf(t, inWindow.statuses[step], retired.statuses[step],
+			"the retirement instant changed the answer to %q from %d to %d; an identical request "+
+				"either side of the instant must produce an identical status",
+			step, inWindow.statuses[step], retired.statuses[step])
+
+		assert.Emptyf(t, retired.advertised[step],
+			"%q advertised a Sunset or Deprecation it is not subject to: %q",
+			step, retired.advertised[step])
+		assert.Emptyf(t, inWindow.advertised[step],
+			"%q advertised a retirement inside the window too: %q",
+			step, inWindow.advertised[step])
 	}
+
+	// OBSERVABLE STATE, on the RETIRED router: the surface did the work rather than merely
+	// answering.
+	require.NotEmpty(t, retired.hookID,
+		"the retired router's registry must have minted an identifier")
+	assert.Equal(t, retired.hookID, retired.readBack.ID,
+		"the hook read back must be the hook that was registered")
+	assert.Equal(t, "sunset lifecycle probe retired", retired.readBack.Name,
+		"and it must carry the values it was registered with, or the surface answered 200 without "+
+			"storing anything")
+	assert.Equal(t, hooks.PreTransaction, retired.readBack.Type,
+		"including the hook TYPE, which is what decides whether it runs before or after a "+
+			"transaction")
+	assert.Contains(t, retired.listedIDs, retired.hookID,
+		"the typed listing must report the hook the registry holds, or the surface answered 201 "+
+			"without indexing anything")
+	assert.NotEqual(t, inWindow.hookID, retired.hookID,
+		"the two runs must be distinct registrations, or one run's observable state could be "+
+			"mistaken for the other's")
 }
 
 // TestWebhookSunset_RetiresNothingBeyondTheRetiredSurface is the blast-radius assertion for

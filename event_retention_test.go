@@ -299,6 +299,23 @@ func TestEventRetentionSweeper_PurgeCapacityIsConfigurableAndExceedsPeakArrivals
 		assert.Greater(t, capacityPerSweep*sweepsPerHour, peakRowsPerHour,
 			"purge capacity must EXCEED peak arrivals; at or below it the retention period is "+
 				"not enforced however it is configured, which is the defect PERF-P23 records")
+
+		// AND BY A MARGIN THAT CAN RECOVER, not merely by a margin (PERF-C03).
+		//
+		// Exceeding peak is necessary and was not sufficient. The default first cleared it by
+		// 11% — 2,000,000 an hour against 1,800,000 — and a sweeper that cannot catch up needs
+		// recovery capacity rather than break-even: one sweep cut short by its ten-minute
+		// timeout leaves a deficit that 11% works off over ten hours, and the deficit is rows
+		// the retention period says should already be gone.
+		//
+		// 2x is the floor asserted here because it recovers a wholly missed sweep inside one
+		// hour, which is the failure this margin exists for. It costs nothing in steady state:
+		// a sweep stops when it runs out of ELIGIBLE rows, so at peak it deletes 1,800,000 and
+		// stops whatever the ceiling is.
+		assert.GreaterOrEqual(t, capacityPerSweep*sweepsPerHour, 2*peakRowsPerHour,
+			"purge capacity must clear peak arrivals at least TWICE OVER, or a single missed "+
+				"sweep cannot be recovered inside an hour; got %d rows/hour against %d arriving",
+			capacityPerSweep*sweepsPerHour, peakRowsPerHour)
 	})
 
 	t.Run("the sweeper's fallbacks are the configured defaults, not copies of them", func(t *testing.T) {

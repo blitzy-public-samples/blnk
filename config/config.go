@@ -260,6 +260,10 @@ var (
 		EventRetentionBatchSize:          DefaultEventRetentionBatchSize,
 		EventRetentionMaxBatchesPerSweep: DefaultEventRetentionMaxBatchesPerSweep,
 
+		RepairBatchSize:         DefaultRelayRepairBatchSize,
+		RepairMaxBatchesPerTick: DefaultRelayRepairMaxBatchesPerTick,
+		RepairConcurrency:       DefaultRelayRepairConcurrency,
+
 		// Deliberately the same number as defaultKafka.MetricsSubscriberBudget, and kept in
 		// step with blnk.DefaultSubscriberMetricsBudget, which is the value the collector
 		// falls back to when it cannot read a configuration at all. These are two published
@@ -286,7 +290,45 @@ const (
 
 	// DefaultEventRetentionMaxBatchesPerSweep is how many such statements one sweep issues by
 	// default. It is the throughput factor, and it is the safer of the two to raise.
-	DefaultEventRetentionMaxBatchesPerSweep = 2000
+	//
+	// PERF-C03: 4000, raised from 2000. Two thousand batches of a thousand rows is 2,000,000
+	// an hour against an arrival rate of 1,800,000 at the validated 500 events a second —
+	// 1.11x, and 11% is not headroom on a mechanism that CANNOT CATCH UP once it falls
+	// behind. One sweep cut short by the ten-minute timeout leaves a deficit that takes ten
+	// hours of steady state to work off, and the deficit is rows the retention period says
+	// should already be gone. 4000 gives 2.2x, which recovers a missed sweep inside one hour.
+	//
+	// It costs nothing in steady state, which is what makes the larger number the right
+	// default rather than merely a safer one: the ceiling bounds what ONE sweep may attempt,
+	// and a sweep stops as soon as it runs out of ELIGIBLE rows. At 500 events a second it
+	// still deletes 1,800,000 and stops. The ceiling is reached only while catching up, which
+	// is exactly when the capacity is wanted, and such a sweep is bounded by the ten-minute
+	// timeout regardless.
+	DefaultEventRetentionMaxBatchesPerSweep = 4000
+)
+
+// The shipped REPAIR capacity (PERF-M06), EXPORTED for the same reason the retention capacity
+// above is: the relay needs these numbers as its fallback for a configuration it cannot read,
+// and two copies of a default are two numbers that can disagree about what a deployment ran at.
+//
+// 25 x 100 = 2,500 rows a tick, written 8 at a time. See RelayConfig's repair block for the
+// arithmetic and for why the previous fixed 20 rows a tick could not clear an outage's backlog.
+const (
+	// DefaultRelayRepairBatchSize is how many rows one repair claim takes by default. It
+	// matches the publish claim's batch size, because a repair row's cost is one Kafka write —
+	// the same unit of work the publish batch is sized around.
+	DefaultRelayRepairBatchSize = 100
+
+	// DefaultRelayRepairMaxBatchesPerTick is how many repair claims one tick chains by default.
+	// Half the publish loop's 50, so a repair backlog drains fast without the publish loop
+	// waiting a whole tick behind it.
+	DefaultRelayRepairMaxBatchesPerTick = 25
+
+	// DefaultRelayRepairConcurrency is how many message-key groups of a repair batch are
+	// written at once by default. The same 8 the publish loop uses, for the same reason: one
+	// goroutine at a realistic 10ms acknowledgement sustains about 100 writes a second, which
+	// is an order of magnitude under what a recovery needs.
+	DefaultRelayRepairConcurrency = 8
 )
 
 // MaxRelayRetryAttempts is the CEILING on RELAY_MAX_RETRY_ATTEMPTS, not merely its
@@ -669,6 +711,32 @@ type KafkaConfig struct {
 	// issuance say so while the endpoint keeps working. See SubscriberFacingBrokers.
 	SubscriberBrokers []string `json:"subscriber_brokers" envconfig:"KAFKA_SUBSCRIBER_BROKERS"`
 
+	// KeyScopeEnforcement names WHERE a subscriber's partition_key_prefix is enforced, and
+	// it exists so that Blnk can never issue a credential whose declared key scope nothing
+	// evaluates.
+	//
+	// Kafka's authorizer has no record-key dimension — see KeyScopeEnforcementBrokerGateway
+	// — so on the shipped default of "none" a granted topic is readable in full and a
+	// prefix is a hint the consumer applies to itself. Issuance therefore REFUSES a
+	// subscriber that records a prefix while this is "none": handing out a principal whose
+	// response says the prefix is not enforced still hands out a principal that can read
+	// every other ledger's records on that topic, and a field in a JSON body is not a
+	// control. An operator that wants key-scoped subscribers deploys an enforcing gateway
+	// and declares it here.
+	//
+	// Valid values are "none" and "broker_gateway". Anything else is normalised to "none" by
+	// setKafkaDefaults, with a warning naming the value, because failing closed is the only
+	// safe reading of a misspelled enforcement mode.
+	KeyScopeEnforcement string `json:"key_scope_enforcement" envconfig:"KAFKA_KEY_SCOPE_ENFORCEMENT"`
+
+	// KeyScopeGatewayBrokers is the bootstrap list a key-scoped subscriber is told to dial,
+	// and it must be the ENFORCING component rather than the brokers.
+	//
+	// Required whenever KeyScopeEnforcement is "broker_gateway", and refused when it equals
+	// Brokers: a gateway list pointing at the brokers means nothing evaluates record keys,
+	// which is the state the declaration would be lying about. See KeyScopeGateway.
+	KeyScopeGatewayBrokers []string `json:"key_scope_gateway_brokers" envconfig:"KAFKA_KEY_SCOPE_GATEWAY_BROKERS"`
+
 	// SUPPLEMENTARY (least privilege). SASLUser and SASLSecret are the STEADY-STATE
 	// PRODUCER principal: the identity
 	// the event publisher in the server and worker processes authenticates as. It
@@ -834,9 +902,11 @@ type RelayConfig struct {
 	RetryBaseBackoffMS int `json:"retry_base_backoff_ms" envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
 	RetryMaxBackoffMS  int `json:"retry_max_backoff_ms"  envconfig:"RELAY_RETRY_MAX_BACKOFF_MS"`
 
-	// EventRetentionDays is how long a DELIVERED or DEAD-LETTERED event row is kept
-	// before it is deleted, and it is a data-protection control rather than a storage
-	// tuning knob.
+	// EventRetentionDays is how long a DISPATCHED event row is kept before it is deleted,
+	// and it is a data-protection control rather than a storage tuning knob.
+	//
+	// Exactly one status is age-eligible: dispatched. No other row is ever deleted by this
+	// period, however old it is — see TWO POPULATIONS, TWO LIFECYCLES below.
 	//
 	// WHAT THE OUTBOX HOLDS IS SENSITIVE. Each row's payload is the webhook body
 	// verbatim: a transaction event carries amounts and balance identifiers, and an
@@ -904,6 +974,21 @@ type RelayConfig struct {
 	// configurable so an operator whose ingestion is higher still can raise it, and one who
 	// would rather protect a small database can lower it.
 	//
+	// ABOVE, not merely at: the default is now 4,000,000 rows an hour, 2.2x arrival, because
+	// the 2,000,000 it was set to first is 1.11x and a sweeper that cannot catch up needs
+	// recovery capacity rather than a break-even margin (PERF-C03). See
+	// DefaultEventRetentionMaxBatchesPerSweep for why raising it is free in steady state.
+	//
+	// # This setting cannot be read without the storage arithmetic beside it
+	//
+	// Capacity decides whether the retention PERIOD is enforced. The period then decides how
+	// much storage the table occupies, and that is measured rather than estimated: 2,372 bytes
+	// per row including all seventeen indexes, of which roughly 88% is the event body held
+	// three times over, giving 95.4 GiB a day at 500 events a second. The full derivation is
+	// at the payload columns in sql/1781248800.sql, and the pg-data volume in the reference
+	// manifests is sized from it. A period configured without that arithmetic is how a shipped
+	// 90 days came to sit against a 10Gi volume, 858x apart.
+	//
 	// # Zero means UNSET, and unbounded has its own value
 	//
 	// An unset int field is indistinguishable from a deliberate zero, so the two readings of
@@ -949,6 +1034,66 @@ type RelayConfig struct {
 	// a larger budget closes — and the collection is comfortably inside its interval; that
 	// gauge and blnk.subscribers.registered together say whether there is headroom.
 	SubscriberMetricsBudget int `json:"subscriber_metrics_budget" envconfig:"RELAY_SUBSCRIBER_METRICS_BUDGET"`
+
+	// REPAIR CAPACITY (PERF-M06): how fast the relay clears the two REPAIR backlogs, which
+	// is a different question from how fast it publishes new events.
+	//
+	// # The two backlogs, and why they need their own capacity
+	//
+	// Two populations are outside the publish claim's reach by design and are reached by their
+	// own passes each tick:
+	//
+	//   * rows whose retry budget is spent and whose `<topic>.dlt` write still failed — each
+	//     is the ONLY copy of an event that reached no topic at all; and
+	//   * rows whose Kafka leg finished and whose legacy webhook enqueue never succeeded,
+	//     which is the dual-delivery promise for the migration window.
+	//
+	// Both sets are empty in normal operation, which is precisely why their capacity was easy
+	// to under-size: an idle pass costs one indexed query and any batch size looks adequate.
+	// They fill during an OUTAGE, all at once. A 15-minute broker outage at the 500 events per
+	// second acceptance rate produces about 450,000 rows, and the previous fixed 20 rows per
+	// tick — one pass, sequential, un-chained — drains that at 20 rows a second: roughly
+	// SIX AND A QUARTER HOURS on one replica, with the dead-letter age alert firing throughout.
+	//
+	// # The arithmetic these three multiply into
+	//
+	//	rows per tick   = RepairMaxBatchesPerTick x RepairBatchSize
+	//	drain rate      = rows per tick / poll interval, capped by broker acknowledgement time
+	//	                  divided by RepairConcurrency
+	//
+	// At the shipped 25 x 100 with 8-way concurrency and a realistic 10ms acknowledgement, one
+	// tick's 2,500 rows take about three seconds of wall time, so the drain rate is on the
+	// order of 800 rows a second and the 450,000-row backlog above clears in about ten minutes
+	// rather than in a working day. The bound still exists — it is what stops one tick
+	// attempting an entire historical backlog and holding leases it cannot finish inside — and
+	// blnk.events.repair.saturated reports when it is the binding constraint, which is the
+	// signal to raise these numbers rather than to guess at them.
+	//
+	// EACH CHAINED BATCH TAKES ITS OWN CLAIM AND ITS OWN LEASE, so chaining does not widen the
+	// window in which a row is held: a batch that finishes leaves its rows terminal and the
+	// next batch claims fresh rows under a new token. That is what makes chaining safe here
+	// where a single enormous batch would not be.
+	//
+	// RepairBatchSize is how many rows ONE repair claim takes. It is the lease-footprint
+	// factor: every row in a batch needs its own Kafka write, and the whole batch must finish
+	// inside the lease.
+	RepairBatchSize int `json:"repair_batch_size" envconfig:"RELAY_REPAIR_BATCH_SIZE"`
+
+	// RepairMaxBatchesPerTick is how many repair claims ONE tick chains before returning to
+	// the publish loop. It is the throughput factor and the safer of the three to raise.
+	//
+	// It is bounded rather than unbounded so that a large repair backlog cannot starve the
+	// publish loop: new events keep flowing while the backlog drains, which matters because
+	// the backlog exists precisely when the pipeline is recovering.
+	RepairMaxBatchesPerTick int `json:"repair_max_batches_per_tick" envconfig:"RELAY_REPAIR_MAX_BATCHES_PER_TICK"`
+
+	// RepairConcurrency is how many message-key groups of one repair batch are written at
+	// once, mirroring the publish loop's own concurrency.
+	//
+	// ORDERING IS NOT AT RISK. The rows are grouped by the same effective key the publisher
+	// hashes and each group is written sequentially by one goroutine, exactly as the publish
+	// loop does — so two rows that must stay ordered are never written concurrently.
+	RepairConcurrency int `json:"repair_concurrency" envconfig:"RELAY_REPAIR_CONCURRENCY"`
 }
 
 // eventStreamingEnvOverride is how the CONVENTIONAL BLNK_-prefixed names for the
@@ -1019,11 +1164,28 @@ type eventStreamingEnvOverride struct {
 	// the comma splitting, so the prefixed alias splits exactly as the bare name does
 	// instead of through a second, hand-written parse.
 	KafkaSubscriberBrokers *[]string `envconfig:"KAFKA_SUBSCRIBER_BROKERS"`
-	KafkaTopicPrefix       *string   `envconfig:"KAFKA_TOPIC_PREFIX"`
-	KafkaSASLAdminUser     *string   `envconfig:"KAFKA_SASL_ADMIN_USER"`
-	KafkaSASLAdminSecret   *string   `envconfig:"KAFKA_SASL_ADMIN_SECRET"`
-	KafkaMinPartitions     *int      `envconfig:"KAFKA_MIN_PARTITIONS"`
-	KafkaReplicationFactor *int      `envconfig:"KAFKA_REPLICATION_FACTOR"`
+	// KafkaHistoricalTopicPrefixes is here for the same reason, and its absence was a real
+	// defect rather than an omission of convenience. Both compose files forward
+	// BLNK_KAFKA_HISTORICAL_TOPIC_PREFIXES and .env.example documents that either form
+	// resolves, but with no field here the only names that reached the configuration were the
+	// bare KAFKA_HISTORICAL_TOPIC_PREFIXES and the alias envconfig DERIVES for a nested field,
+	// BLNK_KAFKA_KAFKA_HISTORICAL_TOPIC_PREFIXES. So the documented and forwarded name was
+	// silently ignored, and the symptom is the worst kind this variable has: every event
+	// captured under a previous KAFKA_TOPIC_PREFIX is refused at writer resolution after the
+	// next restart, having been configured to be publishable.
+	KafkaHistoricalTopicPrefixes *[]string `envconfig:"KAFKA_HISTORICAL_TOPIC_PREFIXES"`
+	// KafkaKeyScopeGatewayBrokers is a list for the same mechanical reason, and it is resolved
+	// here rather than in applyPrefixedEnvAliases so that the mode and the gateway list cannot
+	// be resolved by different mechanisms — a deployment that set the mode through one name
+	// and the list through the other would declare an enforcement point with no addresses,
+	// which KeyScopeGateway reads as "not declared" and refuses issuance on.
+	KafkaKeyScopeGatewayBrokers *[]string `envconfig:"KAFKA_KEY_SCOPE_GATEWAY_BROKERS"`
+	KafkaKeyScopeEnforcement    *string   `envconfig:"KAFKA_KEY_SCOPE_ENFORCEMENT"`
+	KafkaTopicPrefix            *string   `envconfig:"KAFKA_TOPIC_PREFIX"`
+	KafkaSASLAdminUser          *string   `envconfig:"KAFKA_SASL_ADMIN_USER"`
+	KafkaSASLAdminSecret        *string   `envconfig:"KAFKA_SASL_ADMIN_SECRET"`
+	KafkaMinPartitions          *int      `envconfig:"KAFKA_MIN_PARTITIONS"`
+	KafkaReplicationFactor      *int      `envconfig:"KAFKA_REPLICATION_FACTOR"`
 
 	RelayMaxRetryAttempts                 *int `envconfig:"RELAY_MAX_RETRY_ATTEMPTS"`
 	RelayRetryBaseBackoffMS               *int `envconfig:"RELAY_RETRY_BASE_BACKOFF_MS"`
@@ -1032,6 +1194,9 @@ type eventStreamingEnvOverride struct {
 	RelayEventRetentionDays               *int `envconfig:"RELAY_EVENT_RETENTION_DAYS"`
 	RelayEventRetentionBatchSize          *int `envconfig:"RELAY_EVENT_RETENTION_BATCH_SIZE"`
 	RelayEventRetentionMaxBatchesPerSweep *int `envconfig:"RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP"`
+	RelayRepairBatchSize                  *int `envconfig:"RELAY_REPAIR_BATCH_SIZE"`
+	RelayRepairMaxBatchesPerTick          *int `envconfig:"RELAY_REPAIR_MAX_BATCHES_PER_TICK"`
+	RelayRepairConcurrency                *int `envconfig:"RELAY_REPAIR_CONCURRENCY"`
 }
 
 // applyEventStreamingEnvOverride resolves the Kafka and relay environment variables
@@ -1069,6 +1234,15 @@ func applyEventStreamingEnvOverride(cnf *Configuration) error {
 	if override.KafkaSubscriberBrokers != nil {
 		cnf.Kafka.SubscriberBrokers = *override.KafkaSubscriberBrokers
 	}
+	if override.KafkaHistoricalTopicPrefixes != nil {
+		cnf.Kafka.HistoricalTopicPrefixes = *override.KafkaHistoricalTopicPrefixes
+	}
+	if override.KafkaKeyScopeGatewayBrokers != nil {
+		cnf.Kafka.KeyScopeGatewayBrokers = *override.KafkaKeyScopeGatewayBrokers
+	}
+	if override.KafkaKeyScopeEnforcement != nil {
+		cnf.Kafka.KeyScopeEnforcement = *override.KafkaKeyScopeEnforcement
+	}
 	if override.KafkaTopicPrefix != nil {
 		cnf.Kafka.TopicPrefix = *override.KafkaTopicPrefix
 	}
@@ -1105,6 +1279,15 @@ func applyEventStreamingEnvOverride(cnf *Configuration) error {
 	}
 	if override.RelayEventRetentionMaxBatchesPerSweep != nil {
 		cnf.Relay.EventRetentionMaxBatchesPerSweep = *override.RelayEventRetentionMaxBatchesPerSweep
+	}
+	if override.RelayRepairBatchSize != nil {
+		cnf.Relay.RepairBatchSize = *override.RelayRepairBatchSize
+	}
+	if override.RelayRepairMaxBatchesPerTick != nil {
+		cnf.Relay.RepairMaxBatchesPerTick = *override.RelayRepairMaxBatchesPerTick
+	}
+	if override.RelayRepairConcurrency != nil {
+		cnf.Relay.RepairConcurrency = *override.RelayRepairConcurrency
 	}
 
 	return nil
@@ -1942,41 +2125,21 @@ func (cnf *Configuration) validateKafkaSASLCredentials() error {
 // bad value must degrade event delivery rather than prevent the server from
 // starting. It runs after setDefaultValues, so it inspects effective values with
 // defaults already applied.
+//
+// IT NO LONGER REPORTS NEGATIVES OR AN OVER-CEILING BUDGET. setRelayDefaults has already
+// replaced each of those with the value that will actually be used, and named it, so a
+// second report here could only describe a state that no longer exists — which is what it
+// used to do: it warned that "retries will not be delayed" about a negative backoff whose
+// consumers then substituted a positive delay of their own, and it clamped an over-ceiling
+// budget setRelayDefaults had already clamped, producing two warnings for one value. What is
+// left is the one inconsistency normalisation cannot resolve, because both values are
+// individually valid.
 func (cnf *Configuration) validateRelayRetryWindow() {
-	if cnf.Relay.MaxRetryAttempts < 1 {
-		logrus.WithField("max_retry_attempts", cnf.Relay.MaxRetryAttempts).Warn(
-			"relay max_retry_attempts is below 1; events will not be retried before being dead-lettered",
-		)
-	}
-
-	// CLAMPED rather than merely warned about. The attempt number is a metric attribute on a
-	// histogram, so a configured budget above the ceiling widens that attribute's domain by
-	// one value per attempt — see MaxRelayRetryAttempts. Reducing it here is what keeps the
-	// domain closed at its declared eight values.
-	if cnf.Relay.MaxRetryAttempts > MaxRelayRetryAttempts {
-		logrus.WithFields(logrus.Fields{
-			"max_retry_attempts": cnf.Relay.MaxRetryAttempts,
-			"ceiling":            MaxRelayRetryAttempts,
-		}).Warn(
-			"relay max_retry_attempts exceeds the supported ceiling and has been reduced to it; " +
-				"the attempt number is a bounded metric attribute and cannot be extended by configuration",
-		)
-
-		cnf.Relay.MaxRetryAttempts = MaxRelayRetryAttempts
-	}
-
-	if cnf.Relay.RetryBaseBackoffMS < 0 {
-		logrus.WithField("retry_base_backoff_ms", cnf.Relay.RetryBaseBackoffMS).Warn(
-			"relay retry_base_backoff_ms is negative; retries will not be delayed",
-		)
-	}
-
-	if cnf.Relay.RetryMaxBackoffMS < 0 {
-		logrus.WithField("retry_max_backoff_ms", cnf.Relay.RetryMaxBackoffMS).Warn(
-			"relay retry_max_backoff_ms is negative; the backoff cap will not delay retries",
-		)
-	}
-
+	// An INVERTED window: a base delay above the cap. Both values are legitimate on their
+	// own, so neither can be corrected without discarding something the operator asked for.
+	// The relay applies the cap last, so every retry waits the capped maximum — the slower
+	// schedule, bounded as configured. Reported because the shape of the schedule is not what
+	// the two numbers read as.
 	if cnf.Relay.RetryBaseBackoffMS > cnf.Relay.RetryMaxBackoffMS {
 		logrus.WithFields(logrus.Fields{
 			"retry_base_backoff_ms": cnf.Relay.RetryBaseBackoffMS,
@@ -2356,6 +2519,52 @@ func (cnf *Configuration) setKafkaDefaults() {
 	// a non-empty slice carrying nothing usable — read as "not configured" rather than as a
 	// list of blank endpoints.
 	cnf.Kafka.SubscriberBrokers = normalizeBrokers(cnf.Kafka.SubscriberBrokers)
+
+	// THE ENFORCEMENT MODE FAILS CLOSED, and normalising it here rather than at each reader
+	// is what makes that single-valued. An unrecognised value — a typo, a mode borrowed from
+	// another product, a value a future release adds and this build does not understand — is
+	// forced to "none", because the only safe reading of "I do not know what enforcement this
+	// names" is "nothing is enforcing". Silence would let a misspelled mode read as
+	// enforcement by whichever reader happened to compare case-sensitively.
+	cnf.Kafka.KeyScopeEnforcement = strings.ToLower(strings.TrimSpace(cnf.Kafka.KeyScopeEnforcement))
+	switch cnf.Kafka.KeyScopeEnforcement {
+	case "":
+		cnf.Kafka.KeyScopeEnforcement = KeyScopeEnforcementNone
+	case KeyScopeEnforcementNone, KeyScopeEnforcementBrokerGateway:
+	default:
+		logrus.WithFields(logrus.Fields{
+			"configured": cnf.Kafka.KeyScopeEnforcement,
+			"applied":    KeyScopeEnforcementNone,
+			"variable":   "KAFKA_KEY_SCOPE_ENFORCEMENT",
+			"supported":  []string{KeyScopeEnforcementNone, KeyScopeEnforcementBrokerGateway},
+		}).Warn(
+			"KAFKA_KEY_SCOPE_ENFORCEMENT names no supported enforcement mode and has been reset " +
+				"to none, so credential issuance will refuse every subscriber that records a " +
+				"partition_key_prefix; an unrecognised mode must not read as enforcement",
+		)
+
+		cnf.Kafka.KeyScopeEnforcement = KeyScopeEnforcementNone
+	}
+	cnf.Kafka.KeyScopeGatewayBrokers = normalizeBrokers(cnf.Kafka.KeyScopeGatewayBrokers)
+
+	// DECLARED-BUT-UNUSABLE IS ANNOUNCED, because it is the one combination that looks
+	// configured and enforces nothing. KeyScopeGateway already refuses it, so issuance
+	// behaves correctly either way; without this line the operator's only clue would be a
+	// 409 on a request they believe they configured for.
+	if cnf.Kafka.KeyScopeEnforcement == KeyScopeEnforcementBrokerGateway {
+		if _, active := cnf.Kafka.KeyScopeGateway(); !active {
+			logrus.WithFields(logrus.Fields{
+				"gateway_broker_count": len(cnf.Kafka.KeyScopeGatewayBrokers),
+				"variable":             "KAFKA_KEY_SCOPE_GATEWAY_BROKERS",
+			}).Warn(
+				"KAFKA_KEY_SCOPE_ENFORCEMENT is broker_gateway but no distinct gateway bootstrap " +
+					"list is configured, so key-scope enforcement is NOT active and issuance will " +
+					"refuse every subscriber that records a partition_key_prefix; set " +
+					"KAFKA_KEY_SCOPE_GATEWAY_BROKERS to the enforcing endpoint, which must differ " +
+					"from KAFKA_BROKERS",
+			)
+		}
+	}
 
 	// Credentials are trimmed here rather than in trimWhitespace because a stray
 	// newline from an environment file turns a correct SASL username into one the
@@ -2849,46 +3058,43 @@ func (k KafkaConfig) OwnedTopicPrefixes() []string {
 // It exists so that the single question "what do I tell this subscriber to connect to?" has
 // one answer in one place.
 //
-// # KAFKA_BROKERS is the fallback, and the fallback is REQUIRED rather than optional
+// # KAFKA_SUBSCRIBER_BROKERS IS MANDATORY FOR ISSUANCE, and there is no fallback
 //
-// SubscriberBrokers used to be a hard prerequisite: absent it, issuance refused with 503 so
-// that a subscriber could never be handed an address it cannot resolve. That made a NINTH
-// variable mandatory for the credential endpoint, and requirement R-10 fixes the mandatory
-// configuration surface at eight. A deployment satisfying the whole documented contract could
-// therefore run the relay, publish every event, and still receive 503 from every issuance
-// request — a required endpoint made unusable by a setting the contract never mentions.
+// An earlier revision fell back to KAFKA_BROKERS with a warning, on the argument that
+// requirement R-10 fixes the mandatory configuration surface at eight variables and a ninth
+// should not be able to make a documented endpoint unusable. That argument weighed the wrong
+// cost. KAFKA_BROKERS is what BLNK dials, and inside a deployment it is an internal address —
+// "kafka:9092" on a compose network, a ClusterIP or headless Service in Kubernetes — which
+// does not resolve for a subscriber outside it. Kafka compounds it rather than tolerating it:
+// a broker answers every client with the ADVERTISED address of the listener the connection
+// arrived on, so even an externally reachable bootstrap address hands back internal ones for
+// the partition leaders.
 //
-// So the resolution order is: the advertised list when one is configured, the internal list
-// otherwise, and "nothing configured" only when Kafka itself is unconfigured. The advertised
-// list keeps its whole reason for existing — inside a deployment "kafka:9092" or a ClusterIP
-// Service name does not resolve for an outside subscriber, and a broker answers every client
-// with the ADVERTISED address of the listener the connection arrived on — but that reason is
-// now carried by the second return value and by the warning the caller logs, rather than by
-// refusing to answer at all. An operator whose subscribers run outside the deployment sees the
-// warning at start-up and at every issuance; one whose subscribers run inside it needs no
-// extra variable to make a documented endpoint work.
+// A warning is not a control. The failure it warns about arrives days later as a connection
+// timeout at the subscriber, holding a secret that is shown exactly once and cannot be
+// recovered — so diagnosing it means reissuing the credential, which invalidates the one the
+// subscriber is holding. Refusing at issuance costs an operator one variable, once, with the
+// name in the error message; falling back costs a subscriber an unusable credential and a
+// forced rotation to find out why.
+//
+// R-10's eight variables are the surface that must exist for PUBLISHING. This one gates a
+// single endpoint, and the endpoint's whole output is an address a third party will dial:
+// there is no correct value for Blnk to infer, because only an operator knows what its
+// externally advertised listener is. So issuance answers the documented typed 503 when it is
+// unset, start-up warns that it will, and nothing internal is ever substituted.
 //
 // The returned slice is a COPY. The configuration is shared through an atomic.Value and read
 // concurrently, so handing out the backing array would let a caller that appends to its
 // result mutate what every later reader sees.
 //
 // Returns:
-//   - brokers []string: a copy of the list to report, nil only when neither
-//     KAFKA_SUBSCRIBER_BROKERS nor KAFKA_BROKERS is configured.
-//   - advertised bool: true when the list came from KAFKA_SUBSCRIBER_BROKERS. False with a
-//     non-empty list means the internal bootstrap list is being reported, which callers must
-//     warn about — it is correct only when subscribers run inside the deployment.
+//   - brokers []string: a copy of KAFKA_SUBSCRIBER_BROKERS, nil when it is unset.
+//   - advertised bool: true exactly when a non-empty list was configured. It is retained as a
+//     second return value rather than folded into the nil check so that callers written
+//     against the old fallback contract cannot silently reinterpret an empty list as a
+//     usable one.
 func (k KafkaConfig) SubscriberFacingBrokers() (brokers []string, advertised bool) {
-	if normalized := normalizeBrokers(k.SubscriberBrokers); len(normalized) > 0 {
-		brokers = make([]string, len(normalized))
-		copy(brokers, normalized)
-
-		return brokers, true
-	}
-
-	// THE REQUIRED FALLBACK. Empty here means no Kafka at all, which the caller answers with
-	// the same "Kafka is not configured" refusal every other Kafka-dependent operation gives.
-	normalized := normalizeBrokers(k.Brokers)
+	normalized := normalizeBrokers(k.SubscriberBrokers)
 	if len(normalized) == 0 {
 		return nil, false
 	}
@@ -2896,7 +3102,83 @@ func (k KafkaConfig) SubscriberFacingBrokers() (brokers []string, advertised boo
 	brokers = make([]string, len(normalized))
 	copy(brokers, normalized)
 
-	return brokers, false
+	return brokers, true
+}
+
+// KeyScopeEnforcementNone is the shipped default: no component evaluates record keys, so a
+// subscriber's partition_key_prefix is a routing hint it must filter on itself.
+const KeyScopeEnforcementNone = "none"
+
+// KeyScopeEnforcementBrokerGateway declares that subscriber connections are terminated by a
+// gateway that authorises record keys against each principal's granted prefix.
+//
+// Blnk does not ship that gateway, and the reason is a property of Kafka rather than a gap
+// here: the authorizer interface authorises OPERATIONS ON RESOURCES — topics, groups, the
+// cluster, transactional ids — and a record key is not a resource. No ACL can express "read
+// only records whose key starts with X", so no arrangement of ACLs can enforce a key scope on
+// a shared topic. Enforcing one requires a component that reads the records, which is a
+// custom authorizer plugin or a protocol-aware proxy in front of the brokers.
+//
+// This value is how an operator who has deployed such a component tells Blnk about it. Setting
+// it changes two things and nothing else: issuance stops refusing key-scoped subscribers, and
+// the credential response reports the gateway's own bootstrap list and declares the key scope
+// ENFORCED at the gateway. Setting it without a gateway in front of the brokers is a false
+// declaration, which is why KeyScopeGateway refuses a gateway list that is empty or identical
+// to the broker list.
+const KeyScopeEnforcementBrokerGateway = "broker_gateway"
+
+// KeyScopeGateway resolves the key-scope enforcement point for subscriber credentials.
+//
+// It is the single decision behind two behaviours that must never disagree: whether issuance
+// may mint a credential for a subscriber carrying a partition_key_prefix, and what that
+// credential's response declares about where the prefix is enforced. Two separate reads would
+// permit a credential that declares enforcement it was not issued under.
+//
+// # Why an identical list is refused rather than accepted
+//
+// A gateway list equal to KAFKA_BROKERS means subscribers were pointed straight at the
+// brokers, where nothing evaluates keys. Accepting it would produce the exact failure this
+// whole mechanism exists to prevent — a credential declaring enforced key isolation while the
+// broker serves every record on the topic — so a configuration that cannot be enforcing is
+// treated as not enforcing, and never becomes the endpoint a credential names. Issuance itself
+// still proceeds: the in-binary subscriber stream gateway is the enforcement point in that
+// deployment, and it is reached over Blnk's own API rather than at a bootstrap address.
+//
+// Returns:
+//   - brokers []string: a copy of the gateway bootstrap list, nil unless enforcement is
+//     active. Never the broker list.
+//   - active bool: true only when the mode is broker_gateway AND the gateway list is
+//     non-empty AND it differs from the internal broker list.
+func (k KafkaConfig) KeyScopeGateway() (brokers []string, active bool) {
+	if !strings.EqualFold(strings.TrimSpace(k.KeyScopeEnforcement), KeyScopeEnforcementBrokerGateway) {
+		return nil, false
+	}
+
+	gateway := normalizeBrokers(k.KeyScopeGatewayBrokers)
+	if len(gateway) == 0 {
+		return nil, false
+	}
+
+	internal := normalizeBrokers(k.Brokers)
+	if len(gateway) == len(internal) {
+		identical := true
+		for index := range gateway {
+			if gateway[index] != internal[index] {
+				identical = false
+
+				break
+			}
+		}
+
+		if identical {
+			return nil, false
+		}
+	}
+
+	brokers = make([]string, len(gateway))
+	copy(brokers, gateway)
+
+	return brokers, true
 }
 
 // ValidateSASLAdminCredentials reports a half-configured administrative credential.
@@ -3026,12 +3308,49 @@ func normalizeBrokers(brokers []string) []string {
 // keeps "no retries before dead-lettering" a visible choice rather than one this function
 // silently overrides.
 func (cnf *Configuration) setRelayDefaults() {
+	// THE THREE RETRY VALUES ARE NORMALISED HERE, AND ONLY HERE.
+	//
+	// Zero means "not set" and is filled in silently: requirement R-4 fixes the correct
+	// answer, so a deployment that never mentioned the setting needs no warning about it. A
+	// NEGATIVE is different — it is a value an operator typed, it cannot be honoured, and it
+	// used to be LEFT IN PLACE. Two things followed from that, and both are why normalising
+	// here rather than downstream is the fix:
+	//
+	//   - THE WARNING DESCRIBED THE OPPOSITE OF WHAT HAPPENED. validateRelayRetryWindow said a
+	//     negative base backoff meant "retries will not be delayed" and a negative budget meant
+	//     "events will not be retried before being dead-lettered". Neither was true: every
+	//     consumer substituted a positive value of its own, so the retries WERE delayed and the
+	//     events WERE retried, on a schedule no log line named. An operator reading that
+	//     warning would go looking for a delivery failure that was not occurring.
+	//   - THE CONFIGURATION KEPT A VALUE NOTHING HONOURED. The substitutions live in
+	//     event_relay.go's newRelayRetryPolicy and event_outbox.go's eventMaxAttempts, so
+	//     cnf.Relay still read -1 while the relay ran on 1s/30s/5. Anything that reports
+	//     configuration rather than re-deriving it — a log field, a support answer, a future
+	//     statistics endpoint — reported the value that was not in effect.
+	//
+	// Normalising at the single point where the configuration is settled makes every reader
+	// agree, and each warning names the value, its variable and the value actually applied, so
+	// the log states the outcome instead of predicting one. The downstream fallbacks stay as a
+	// second line of defence for a RelayConfig built directly, which is how the test suite
+	// constructs one.
 	switch {
+	case cnf.Relay.MaxRetryAttempts < 0:
+		logrus.WithFields(logrus.Fields{
+			"configured": cnf.Relay.MaxRetryAttempts,
+			"applied":    defaultRelay.MaxRetryAttempts,
+			"variable":   "RELAY_MAX_RETRY_ATTEMPTS",
+		}).Warn(
+			"relay max_retry_attempts is negative, which cannot be a retry budget; the default " +
+				"is being applied instead, so events are retried the documented number of times " +
+				"before being dead-lettered",
+		)
+		cnf.Relay.MaxRetryAttempts = defaultRelay.MaxRetryAttempts
 	case cnf.Relay.MaxRetryAttempts == 0:
 		cnf.Relay.MaxRetryAttempts = defaultRelay.MaxRetryAttempts
 	case cnf.Relay.MaxRetryAttempts > MaxRelayRetryAttempts:
 		logrus.WithFields(logrus.Fields{
 			"configured": cnf.Relay.MaxRetryAttempts,
+			"applied":    MaxRelayRetryAttempts,
 			"maximum":    MaxRelayRetryAttempts,
 			"variable":   "RELAY_MAX_RETRY_ATTEMPTS",
 		}).Warn(
@@ -3041,10 +3360,34 @@ func (cnf *Configuration) setRelayDefaults() {
 		cnf.Relay.MaxRetryAttempts = MaxRelayRetryAttempts
 	}
 
-	if cnf.Relay.RetryBaseBackoffMS == 0 {
+	switch {
+	case cnf.Relay.RetryBaseBackoffMS < 0:
+		logrus.WithFields(logrus.Fields{
+			"configured": cnf.Relay.RetryBaseBackoffMS,
+			"applied":    defaultRelay.RetryBaseBackoffMS,
+			"variable":   "RELAY_RETRY_BASE_BACKOFF_MS",
+		}).Warn(
+			"relay retry_base_backoff_ms is negative, which cannot be a delay; the default is " +
+				"being applied instead, so a retry storm cannot spend the whole retry budget " +
+				"inside one poll interval",
+		)
+		cnf.Relay.RetryBaseBackoffMS = defaultRelay.RetryBaseBackoffMS
+	case cnf.Relay.RetryBaseBackoffMS == 0:
 		cnf.Relay.RetryBaseBackoffMS = defaultRelay.RetryBaseBackoffMS
 	}
-	if cnf.Relay.RetryMaxBackoffMS == 0 {
+
+	switch {
+	case cnf.Relay.RetryMaxBackoffMS < 0:
+		logrus.WithFields(logrus.Fields{
+			"configured": cnf.Relay.RetryMaxBackoffMS,
+			"applied":    defaultRelay.RetryMaxBackoffMS,
+			"variable":   "RELAY_RETRY_MAX_BACKOFF_MS",
+		}).Warn(
+			"relay retry_max_backoff_ms is negative, which cannot be a delay cap; the default is " +
+				"being applied instead",
+		)
+		cnf.Relay.RetryMaxBackoffMS = defaultRelay.RetryMaxBackoffMS
+	case cnf.Relay.RetryMaxBackoffMS == 0:
 		cnf.Relay.RetryMaxBackoffMS = defaultRelay.RetryMaxBackoffMS
 	}
 
@@ -3068,6 +3411,37 @@ func (cnf *Configuration) setRelayDefaults() {
 				"future and delete every delivered event; retention is being disabled instead",
 		)
 		cnf.Relay.EventRetentionDays = 0
+	}
+
+	// REPAIR CAPACITY (PERF-M06). All three are filled in when unset and normalised when
+	// nonsensical, because every one of them has a correct answer this code can supply and
+	// none of them means "off" at zero:
+	//
+	//   * a repair batch size of zero claims nothing, so the two repair passes would run every
+	//     tick and never repair anything — a silently disabled recovery path rather than a
+	//     disabled feature, and the rows it abandons are the only copies of events that
+	//     reached no topic at all;
+	//   * a per-tick bound of zero chains no batches, which is the same silence; and
+	//   * a concurrency of zero would make the bounded semaphore unacquirable.
+	//
+	// A NEGATIVE value is normalised to the default rather than honoured, for all three. There
+	// is no meaningful reading of a negative batch, bound or width — unlike the retention
+	// sweep, where a negative per-sweep bound is the documented way to ask for no ceiling —
+	// and the repair passes deliberately have no unbounded mode: their bound is what keeps a
+	// recovery from starving the publish loop it shares a tick with.
+	//
+	// Switching repair off is not offered, and that is deliberate. A deployment that stopped
+	// repairing would silently keep events that reached no topic, and there is no operational
+	// reason to want that; a deployment that wants repair to cost almost nothing sets a small
+	// batch, which still makes progress.
+	if cnf.Relay.RepairBatchSize <= 0 {
+		cnf.Relay.RepairBatchSize = defaultRelay.RepairBatchSize
+	}
+	if cnf.Relay.RepairMaxBatchesPerTick <= 0 {
+		cnf.Relay.RepairMaxBatchesPerTick = defaultRelay.RepairMaxBatchesPerTick
+	}
+	if cnf.Relay.RepairConcurrency <= 0 {
+		cnf.Relay.RepairConcurrency = defaultRelay.RepairConcurrency
 	}
 
 	// PURGE CAPACITY (PERF-P23). Unlike the retention PERIOD above, these two DO have a

@@ -174,25 +174,37 @@ func TestEventSubscriber_IsRevocationPendingTestsOnlyThePresenceOfTheTimestamp(t
 //
 // The old predicate answered this same boolean under a name asserting a policy, and three
 // barriers read it as licence to deny the subscriber a credential outright. Reporting the
-// enforcement POINT is what let the credential be issued with the boundary the broker really
-// keeps while every surface showing the prefix shows this value beside it.
+// enforcement POINT is what let the credential be issued while every surface showing the prefix
+// shows the component that keeps it beside the value.
+//
+// Its VALUE changed with the isolation correction, and the change is the point of this test: it
+// used to answer "consumer_side", meaning the platform granted whole-topic Read and asked the
+// subscriber to discard what it was not entitled to. It answers "blnk_stream_gateway" now, because
+// a key-scoped subscriber is granted no topic Read at all and its records are filtered by Blnk
+// before delivery. A regression to the old value would be a regression to the old exposure.
 func TestEventSubscriber_KeyScopeEnforcementNamesWhereTheScopeIsKept(t *testing.T) {
-	// A real prefix: recorded, and enforced by the CONSUMER because Kafka has no
-	// message-key dimension to enforce it with.
+	// A real prefix: recorded, and enforced by BLNK'S STREAM GATEWAY, because Kafka has no
+	// message-key dimension to enforce it with and the subscriber therefore holds no topic Read.
 	scoped := &EventSubscriber{PartitionKeyPrefix: stringPtr("ldg_9f2c")}
 	assert.True(t, scoped.DeclaresKeyScope(), "a recorded prefix is a recorded scope")
-	assert.Equal(t, KeyScopeEnforcementConsumerSide, scoped.KeyScopeEnforcement(),
-		"the broker grants whole topics, so the scope is the subscriber's own filter")
+	assert.Equal(t, KeyScopeEnforcementGateway, scoped.KeyScopeEnforcement(),
+		"the broker cannot evaluate a message key, so Blnk keeps this boundary itself rather than "+
+			"granting the whole topic and asking the consumer to filter")
+	assert.False(t, scoped.GrantsBrokerRecordAccess(),
+		"which is only true because record access is withheld: a key-scoped subscriber that also "+
+			"held topic Read would have the gateway as one path among two")
 
 	// No column at all: the topic and group ACLs are the entire boundary.
 	assert.False(t, (&EventSubscriber{}).DeclaresKeyScope(), "an unset prefix records no scope")
 	assert.Equal(t, KeyScopeEnforcementNone, (&EventSubscriber{}).KeyScopeEnforcement(),
-		"with no scope recorded there is nothing left for a consumer to filter")
+		"with no scope recorded the topic grant is the whole boundary and the broker keeps it")
+	assert.True(t, (&EventSubscriber{}).GrantsBrokerRecordAccess(),
+		"so such a subscriber consumes directly, exactly as the access model describes")
 
 	// A BLANK prefix is absent, not a constraint on the empty string. Without the
-	// TrimSpace this reports consumer-side enforcement of nothing, which would have Blnk
-	// disclose a filtering contract no caller asked for — and, under the behaviour this
-	// replaced, refuse a credential over whitespace.
+	// TrimSpace this reports gateway enforcement of nothing — which would withhold record access
+	// from a subscriber that asked for no narrowing, breaking its direct consumption over
+	// whitespace.
 	//
 	// Note that RequestedKeyScope returns such a value verbatim, so this accessor and a
 	// predicate reading the scope untrimmed would disagree about a whitespace-only prefix. That row
@@ -211,8 +223,11 @@ func TestEventSubscriber_KeyScopeEnforcementNamesWhereTheScopeIsKept(t *testing.
 
 	// Nil receiver answers the absent case, for the same reason IsRevocationPending does.
 	var absent *EventSubscriber
-	assert.False(t, absent.RequiresClientSideKeyFiltering(),
-		"a subscriber that does not exist records no client-side filtering obligation")
+	assert.False(t, absent.RequiresGatewayDelivery(),
+		"a subscriber that does not exist records no key scope, so nothing routes it to the gateway")
+	assert.True(t, absent.GrantsBrokerRecordAccess(),
+		"and the complement answers too rather than panicking; nothing is granted on the strength "+
+			"of it, because provisioning derives bindings from a row it has loaded")
 }
 
 // TestEventSubscriber_DeclaresKeyScopeIsTrueOnlyForANarrowerBoundary is the surviving guard on

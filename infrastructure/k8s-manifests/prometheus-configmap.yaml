@@ -45,7 +45,7 @@ data:
     # answers everything else with an apierror, and when secure is true with no
     # metrics_bearer_token configured it refuses every request outright. So an
     # unauthenticated scrape against a production deployment collects nothing,
-    # every series the rules match on is absent, and all four alerts sit
+    # every series the rules match on is absent, and all 13 Kafka alerts sit
     # permanently in a state where they cannot fire. That failure is SILENT in
     # the worst way: Prometheus reports the target as down, the rules report no
     # error, and the absence of an alert is indistinguishable from health.
@@ -206,13 +206,24 @@ data:
         rules:
           # THE BROKER'S DISK, which the retention policy in
           # kafka-statefulset.yaml bounds but cannot guarantee.
-          # log.retention.bytes is 2 GiB per partition against 60 partitions
-          # per broker on a 200Gi volume — 120 GiB, 60% — so the steady state
+          # log.retention.bytes is 2 GiB per partition against 48 partitions
+          # per broker on a 160Gi volume — 96 GiB, 60% — so the steady state
           # has ample headroom. What this rule catches is every way the
           # arithmetic stops holding: a topic added without recomputing the
           # per-partition budget, partitions grown past KAFKA_MIN_PARTITIONS,
           # a per-topic retention override, or a consumer-group offset topic
           # behaving unexpectedly.
+          #
+          # DOC-m02: this said "60 partitions per broker on a 200Gi volume —
+          # 120 GiB", and all three numbers were wrong. The catalogue is four
+          # categories plus their four .dlt siblings, so 8 topics x 6 = 48
+          # partitions, and the volumeClaimTemplate is 160Gi. A monitoring
+          # narrative describing a different cluster from the one it watches is
+          # how an operator reading this rule concludes the THRESHOLD is wrong
+          # rather than that the disk is filling.
+          # TestManifests_KafkaVolumeHoldsTheTopicGeometryItIsSizedFor derives
+          # these numbers from model.AllEventCategories() and the manifests and
+          # asserts this prose states them, so the two cannot drift apart again.
           #
           # WHY IT MATTERS MORE THAN A USUAL DISK ALERT: a Kafka broker that
           # fills its log directory does not shed old data to continue. It
@@ -567,8 +578,29 @@ data:
             # ago is expected to be outstanding — and a zero settlement rate alone is
             # the healthy steady state, because most deployments never fail a subscriber
             # operation at all.
+            #
+            # WRITTEN WITH `unless` RATHER THAN `and ... == 0`, AND THAT IS THE
+            # WHOLE RULE. The settled counter has NO SERIES until the pass
+            # discharges its first obligation — OpenTelemetry exports the
+            # attribute sets that have been written, not every instrument
+            # declared — so `and rate(...) == 0` matched against an empty vector
+            # and produced an empty result. The rule could therefore never fire
+            # on the one deployment that needs it: a pass that has never settled
+            # anything, which is exactly what "not progressing" means. `unless`
+            # inverts the failure: the left side survives when the right has
+            # nothing to match, so a real backlog alerts before the counter's
+            # first sample.
+            #
+            # The vector matching is unchanged. `unless` is a set operator like
+            # `and` and matches on the full label set, so instance and job still
+            # pair the backlog with its own process's settle rate, and because
+            # `unless` returns the LEFT side, $value and $labels in the
+            # annotation below mean what they meant before. Suppression is now
+            # expressed as "a positive settle rate exists" instead of "the rate
+            # equals zero", which is the same condition whenever the series
+            # exists at all.
             expr: blnk_subscribers_settlement_outstanding > 0
-              and rate(blnk_subscribers_obligations_settled_total[30m]) == 0
+              unless rate(blnk_subscribers_obligations_settled_total[30m]) > 0
             # Ten consecutive evaluations at the interval above. Long enough that a pass
             # legitimately paced off — a remedy retried after the retry interval against
             # a broker that is still failing — does not trip it, and short enough to be

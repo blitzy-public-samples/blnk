@@ -276,27 +276,26 @@ func (l *Blnk) sendBulkTransactionWebhook(ctx context.Context, batchID, status, 
 			return err
 		}
 
-		// The coordinator row is absent, so the atomic finalise is unavailable for this
-		// batch. That happens when the row could not be written at batch start — a
-		// database fault at exactly that moment — and it is reported at ERROR because the
-		// batch has silently lost its atomicity guarantee and an operator should know
-		// which batch it was. The outcome is still captured below, with the pre-coordinator
-		// behaviour, because a weaker capture is strictly better than none.
+		// Capture became unconfigured between the guard above and the finalise, so there is
+		// no event row for a transaction to carry. A MISSING COORDINATOR ROW NO LONGER
+		// REACHES HERE: the repository adopts such a batch and writes its terminal row inside
+		// the transaction that inserts the event, so the outcome and its event still commit
+		// together. See errBulkBatchNotCoordinated.
 		logrus.WithError(err).WithFields(logrus.Fields{
 			"batch_id": batchID,
 			"status":   status,
-		}).Error(
-			"the bulk transaction batch has no coordinator record, so its outcome event " +
-				"cannot be captured atomically; falling back to a standalone capture, which " +
-				"can still be lost if the process dies before it completes",
+		}).Warn(
+			"bulk transaction outcome capture is unavailable, so this batch's outcome goes " +
+				"down the legacy transport instead of the event outbox",
 		)
 	}
 
-	// THE FALLBACK AND LEGACY PATH. Reached when coordination is unavailable — either no
-	// Kafka broker is configured, in which case this routes to the legacy webhook transport
-	// exactly as it did before the event pipeline existed, or the coordinator row is
-	// missing. The durable variant is used because the batch outcome is already durable and
-	// this insert is its only chance, so a transient database fault must not destroy it.
+	// THE LEGACY PATH. Reached only when event capture is unconfigured — no Kafka broker —
+	// in which case this routes to the legacy webhook transport exactly as it did before the
+	// event pipeline existed. There is no outbox row on this path for anything to be atomic
+	// with, and no relay to drain one. The durable variant is used because the batch outcome
+	// is already durable and this attempt is its only chance, so a transient fault must not
+	// destroy it.
 	return l.PublishEventDurably(publishCtx, event)
 }
 
@@ -321,14 +320,30 @@ func (l *Blnk) bulkBatchCoordinationEnabled() bool {
 	return l.eventConfiguration().EventPublishingConfigured()
 }
 
-// errBulkBatchNotCoordinated marks a batch that has no coordinator record.
+// errBulkBatchNotCoordinated marks a batch whose outcome cannot be captured atomically.
 //
 // It is a distinct sentinel rather than a bare not-found error because the caller must
 // treat it differently from every other failure: every other failure means the outcome was
 // not captured and must be reported, while this one means the ATOMIC capture is unavailable
-// and the weaker one should be attempted. Conflating them would either lose the outcome or
-// fall back on failures where falling back is wrong.
-var errBulkBatchNotCoordinated = errors.New("the bulk transaction batch has no coordinator record")
+// and the legacy transport should carry the outcome instead. Conflating them would either
+// lose the outcome or fall back on failures where falling back is wrong.
+//
+// # It no longer means "the coordinator row is missing"
+//
+// A missing coordinator row used to produce this sentinel, and the outcome was then captured
+// by a single insert standing outside any transaction — which is what made
+// bulk_transaction.<status> at-most-once for the life of a deployment whose start-of-batch
+// write had failed once. The repository now ADOPTS such a batch instead: it writes the
+// terminal coordinator row inside the very transaction that inserts the outcome event, so
+// the outcome record and its event commit together (see
+// Datasource.adoptOrExplainUnfinalizableBulkBatch). Requirement R-2 is satisfied for this
+// producer unconditionally.
+//
+// What remains is ONE case, and it is not a database failure at all: event capture is not
+// configured, so PrepareEventOutbox yields no row and there is no event for a transaction to
+// carry. The outcome then goes down the legacy transport exactly as it did before the event
+// pipeline existed.
+var errBulkBatchNotCoordinated = errors.New("bulk transaction outcome capture is unavailable")
 
 // finalizeBulkBatchOutcome records the batch outcome and its event in ONE transaction,
 // retrying a transient failure with the SAME prepared event.
@@ -346,8 +361,10 @@ var errBulkBatchNotCoordinated = errors.New("the bulk transaction batch has no c
 // # The three ways this returns
 //
 //   - nil: the outcome and its event are durable, either written here or already written.
-//   - errBulkBatchNotCoordinated: no coordinator row exists, so the caller should fall
-//     back to the standalone capture.
+//     "Written here" includes the case where the coordinator row was missing and the
+//     repository adopted the batch, writing that row terminal in the same transaction.
+//   - errBulkBatchNotCoordinated: event capture is not configured, so there is no event row
+//     to be atomic with and the caller routes the outcome down the legacy transport.
 //   - anything else: the outcome is NOT captured, and the caller reports it.
 //
 // A CONFLICT IS NOT RETRIED. It means either the unique index refused the event id — a
@@ -411,7 +428,22 @@ func (l *Blnk) finalizeBulkBatchOutcome(
 			return nil
 		}
 
+		// A NOT-FOUND FROM THE FINALISE IS NO LONGER EXPECTED. The repository adopts a batch
+		// whose coordinator row is missing rather than reporting it absent, so this arm can
+		// only be reached by a future repository answer nobody has written yet. It is kept as
+		// the defensive route to the legacy transport — a captured outcome by the weaker route
+		// beats none — and it is reported at ERROR rather than silently, because reaching it
+		// means the atomicity this producer is documented to have was not obtained.
 		if isNotFoundError(lastErr) {
+			logrus.WithError(lastErr).WithFields(logrus.Fields{
+				"batch_id": batchID,
+				"status":   status,
+			}).Error(
+				"the bulk transaction outcome could not be recorded atomically because the " +
+					"repository reported the batch absent, which adoption is supposed to make " +
+					"impossible; falling back to the legacy transport for this outcome",
+			)
+
 			return fmt.Errorf("%w: %s", errBulkBatchNotCoordinated, lastErr.Error())
 		}
 
@@ -484,9 +516,13 @@ func (l *Blnk) finalizeBulkBatchOutcome(
 // is no outbox row to claim, nothing to dead-letter and nothing to replay, so unless it is
 // raised the only trace is a log line nobody is alerted on. Routing it through NotifyError
 // emits a system.error event, which is the same escalation a lost balance.monitor alert takes
-// — so both of the post-commit producers described at PostCommitEventCaptureContract are
-// observable through one signal, instead of one of them depending on whether its caller
-// happened to inspect a returned error. One caller discarded this function's error outright.
+// — so every producer whose capture can fail outright is observable through one signal,
+// instead of depending on whether its caller happened to inspect a returned error. One caller
+// discarded this function's error outright.
+//
+// This is now reached only when the finalising TRANSACTION itself cannot commit after every
+// attempt, or when the caller's context is cancelled mid-retry. It is no longer reached
+// because a coordinator row was missing: that case is adopted rather than refused.
 //
 // ONE HELPER FOR ALL THREE UNRECOVERABLE EXITS, because all three lose the same thing. A
 // reused event id, a retry abandoned by a cancelled caller, and a fully spent budget differ in
@@ -551,9 +587,10 @@ func (l *Blnk) recordBulkBatchStart(ctx context.Context, batchID string, req *mo
 			"batch_id":          batchID,
 			"transaction_count": len(req.Transactions),
 		}).Error(
-			"the bulk transaction batch coordinator record could not be written, so this batch's " +
-				"outcome event cannot be captured atomically with its outcome; the batch proceeds " +
-				"and its outcome will be captured on the weaker standalone path",
+			"the bulk transaction batch coordinator record could not be written, so this batch is " +
+				"not enumerable while it runs and will not appear among unfinalized batches; its " +
+				"outcome event is still captured atomically, because the finalise adopts a batch " +
+				"whose start was never recorded and writes the terminal row with the event",
 		)
 	}
 }
@@ -653,9 +690,11 @@ func (l *Blnk) CreateBulkTransactions(ctx context.Context, req *model.BulkTransa
 		// A FAILURE HERE DOES NOT REFUSE THE BATCH. The insert hits the same database the
 		// member transactions are about to use, so a fault here means the batch is going to
 		// fail anyway on its own terms, and refusing it for a bookkeeping write would turn a
-		// recoverable database blip into a rejected ledger request. It is logged at ERROR and
-		// the finalise falls back to the standalone capture, which is the pre-coordinator
-		// behaviour.
+		// recoverable database blip into a rejected ledger request. It is logged at ERROR
+		// because the batch is then invisible to the unfinalized-batch count while it runs —
+		// but its outcome event stays ATOMIC regardless: the finalise ADOPTS a batch whose
+		// start was never recorded, writing the terminal coordinator row inside the same
+		// transaction as the event. What the failure costs is enumerability, not atomicity.
 		l.recordBulkBatchStart(ctx, batchID, req)
 
 		// processBulkTransactions mutates each transaction (status, metadata,

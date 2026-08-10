@@ -1052,6 +1052,10 @@ It sets up the API routes, traces, and TypeSense client before launching the ser
 // Returns:
 //   - *cobra.Command: the `start` command.
 func serverCommands(b *blnkInstance) *cobra.Command {
+	// Bound to --require-kafka below and read by RunE. Declared here rather than in a package
+	// variable so a second `start` command built for a test carries its own flag state.
+	var requireKafka bool
+
 	// Define the `start` command for starting the server
 	cmd := &cobra.Command{
 		Use:   "start",
@@ -1081,11 +1085,119 @@ func serverCommands(b *blnkInstance) *cobra.Command {
 				context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer stopSignals()
 
+			// The Kafka requirement is checked BEFORE the listener binds and before any
+			// background processor starts, so a deployment that asked for the relay and would
+			// not have got one fails fast instead of serving.
+			if requireKafka {
+				if err := requireKafkaBrokersConfigured(); err != nil {
+					return err
+				}
+			}
+
 			return runServer(ctx, b)
 		},
 	}
 
+	// --require-kafka EXISTS SO THAT THE DECISION IS MADE BY THE CODE THAT KNOWS.
+	//
+	// startEventRelay is conditional on brokers being configured: with an empty list it logs one
+	// info line and starts nothing, so the server comes up entirely healthy while every captured
+	// event stays pending in blnk.event_outbox. Nothing is wrong with that as a steady state —
+	// it is the documented pre-migration mode — but a deployment that MEANT to run the relay has
+	// no way to say so, and the failure is silence.
+	//
+	// The alternative that was tried was a shell guard in the makefile which resolved the broker
+	// list itself, and it could not agree with the loader — three ways, each of which made the
+	// target ANNOUNCE a relay that would not start:
+	//
+	//   It took the FIRST NON-EMPTY of KAFKA_BROKERS, BLNK_KAFKA_KAFKA_BROKERS and
+	//   BLNK_KAFKA_BROKERS, in that order. The loader's precedence is the reverse at the top:
+	//   BLNK_KAFKA_BROKERS wins, then KAFKA_BROKERS, then the derived key, then the file. So
+	//   `BLNK_KAFKA_BROKERS= KAFKA_BROKERS=host:9092 make run_relay` was announced as configured
+	//   from the bare name while the loader resolved NO brokers — the empty higher-precedence
+	//   name being exactly how an operator turns Kafka off for one run.
+	//
+	//   It tested the config file with `grep '"brokers"'`, which reads `"brokers": []` as
+	//   configured.
+	//
+	//   And nothing in a first-non-empty scan can express that an explicitly EMPTY value at a
+	//   higher-precedence name CLEARS a list a lower one supplied, because that is a property of
+	//   the overlay rather than of any single source.
+	//
+	// A flag on the binary has none of those problems, because it asks the question after the
+	// same load, of the same struct, with the same predicate the relay's own gate uses. There is
+	// one resolution and one definition of "configured", so the guard cannot drift from the
+	// behaviour it guards.
+	cmd.Flags().BoolVar(&requireKafka, "require-kafka", false,
+		"refuse to start unless this deployment's own configuration resolves to at least one "+
+			"Kafka broker, so a server that would silently run without the event relay fails "+
+			"to start instead")
+
 	return cmd
+}
+
+// requireKafkaBrokersConfigured refuses to start the server role when the effective configuration
+// resolves to no Kafka broker.
+//
+// # It reads the same resolution the relay does
+//
+// config.Fetch returns the configuration the whole process shares — blnk.json decoded, then the
+// environment overlaid by envconfig, then defaults applied — and blnk.KafkaBrokersConfigured is
+// the same predicate startEventRelay gates on. Nothing here re-implements or re-validates: a
+// malformed topic prefix or a half-configured SASL principal is refused by config's own
+// validation during the load that has already happened by the time this runs, and this function
+// answers exactly one question that validation deliberately does not, because the answer is
+// legitimately "none" in a deployment that has not migrated.
+//
+// # What the message has to say, and why
+//
+// The operator who sees this has already asked for the relay, so the useful information is where a
+// broker list can come from and which spelling wins. The order below is config's documented
+// precedence — see eventStreamingEnvOverride — and it was confirmed by loading this package under
+// each combination rather than read off the comment:
+//
+//	BLNK_KAFKA_BROKERS        wins over everything; it is the conventional prefixed name and is
+//	                          applied as an overlay after the rest of the environment
+//	KAFKA_BROKERS             the R-10 deployment contract name
+//	BLNK_KAFKA_KAFKA_BROKERS  the key envconfig derives from the nested struct, still honoured
+//	kafka.brokers in the configuration file, used when no environment name is set
+//
+// And the fact that is easiest to get wrong: a name that is SET AND EMPTY is not absent. An empty
+// value at a higher-precedence name CLEARS what a lower one supplied — that is how an operator
+// turns Kafka off for a single run — which is why `KAFKA_BROKERS= blnk start --require-kafka` is
+// refused here rather than falling back to the configuration file.
+//
+// Returns:
+//   - error: nil when at least one usable broker address is configured; otherwise a refusal
+//     naming the sources, so Cobra reports it and the process exits non-zero.
+func requireKafkaBrokersConfigured() error {
+	cfg, err := config.Fetch()
+	if err != nil {
+		return fmt.Errorf("--require-kafka: the configuration could not be read: %w", err)
+	}
+
+	if cfg != nil && blnk.KafkaBrokersConfigured(cfg.Kafka.Brokers) {
+		return nil
+	}
+
+	return errors.New(
+		"--require-kafka was given, but this deployment's configuration resolves to no Kafka " +
+			"broker. The event outbox relay would not start and every captured event would stay " +
+			"pending in blnk.event_outbox while the server looked healthy. Set brokers in one of " +
+			"these, highest precedence first:\n" +
+			"  BLNK_KAFKA_BROKERS        the conventional prefixed name; wins over every other " +
+			"source\n" +
+			"  KAFKA_BROKERS             the deployment contract name\n" +
+			"  BLNK_KAFKA_KAFKA_BROKERS  the key envconfig derives for this field\n" +
+			"  \"kafka\": { \"brokers\": [\"host:9092\"] } in the configuration file, used when " +
+			"no environment name is set\n" +
+			"A name that is set and EMPTY is not absent: it clears what a lower-precedence source " +
+			"supplied, which is how Kafka is turned off for one run. So " +
+			"`KAFKA_BROKERS= blnk start --require-kafka` means no brokers for this run and is " +
+			"refused here rather than falling back to the configuration file. Start without " +
+			"--require-kafka to run the documented pre-migration mode, in which ledger events are " +
+			"delivered over the legacy webhook transport",
+	)
 }
 
 // runServer starts the API listener and every background processor the server role owns, blocks

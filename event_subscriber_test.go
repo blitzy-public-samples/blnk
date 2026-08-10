@@ -1652,6 +1652,45 @@ func subscriberLifecycleConfiguration(t *testing.T) *config.Configuration {
 	return cnf
 }
 
+// subscriberLifecycleKeyScopeGatewayBrokers is the ENFORCING endpoint a key-scoped subscriber is
+// told to dial.
+//
+// Deliberately different from both the internal broker list and the advertised subscriber list,
+// so an assertion that the gateway was reported cannot pass by accident on either.
+var subscriberLifecycleKeyScopeGatewayBrokers = []string{"keyscope-gateway.example.com:9095"}
+
+// enforceKeyScopeGateway republishes the lifecycle configuration with key-scope enforcement
+// ACTIVE, and returns the gateway list it declared.
+//
+// What declaring it CHANGES is the endpoint a key-scoped credential names, and only that. The
+// in-binary subscriber stream gateway enforces the prefix in every build — see
+// streamGatewayEnforcesKeyScope — so issuance does not depend on this call; a test that omits it
+// still gets a credential, and gets the SUBSCRIBER-FACING broker list rather than this gateway.
+// A test asserting that the enforcing endpoint is what a key-scoped credential reports therefore
+// has to declare one here, and a test asserting the ordinary deployment's endpoint must not call
+// this at all.
+//
+// Parameters:
+//   - t *testing.T: for the helper marker and the configuration restore.
+//
+// Returns:
+//   - []string: the declared gateway bootstrap list, which is what issuance must report.
+func enforceKeyScopeGateway(t *testing.T) []string {
+	t.Helper()
+
+	outboxStoreConfiguration(t, &config.Configuration{
+		Kafka: config.KafkaConfig{
+			Brokers:                []string{"broker-1:9092", "broker-2:9092"},
+			SubscriberBrokers:      append([]string(nil), subscriberLifecycleSubscriberBrokers...),
+			TopicPrefix:            "blnk",
+			KeyScopeEnforcement:    config.KeyScopeEnforcementBrokerGateway,
+			KeyScopeGatewayBrokers: append([]string(nil), subscriberLifecycleKeyScopeGatewayBrokers...),
+		},
+	})
+
+	return append([]string(nil), subscriberLifecycleKeyScopeGatewayBrokers...)
+}
+
 func newSubscriberLifecycle(t *testing.T) *subscriberLifecycle {
 	t.Helper()
 
@@ -2095,39 +2134,10 @@ func TestIssueSubscriberCredential_ReportsTheSubscriberFacingBrokers(t *testing.
 			"resolve for it, and publishing them discloses internal topology")
 }
 
-// TestIssueSubscriberCredential_FallsBackToTheConfiguredBrokerList is the R-10 half.
-//
-// KAFKA_SUBSCRIBER_BROKERS used to be a prerequisite, and issuance answered 503 without it.
-// That made a ninth variable mandatory for an endpoint the configuration contract describes
-// with eight: a deployment configured exactly as documented could publish every event and
-// still be refused every credential. So the internal list is now the REQUIRED FALLBACK — the
-// endpoint works — and the fact that it was used is warned about instead, because reporting an
-// internal address is right for an in-cluster subscriber and wrong for an external one, and
-// only an operator knows which.
-func TestIssueSubscriberCredential_FallsBackToTheConfiguredBrokerList(t *testing.T) {
-	run := newSubscriberLifecycle(t)
-
-	// Republished WITHOUT the subscriber-facing list, and with Kafka still configured: this is
-	// a deployment that publishes events perfectly well and has simply never been told what to
-	// tell a subscriber.
-	outboxStoreConfiguration(t, &config.Configuration{
-		Kafka: config.KafkaConfig{
-			Brokers:     []string{"broker-1:9092"},
-			TopicPrefix: "blnk",
-		},
-	})
-
-	credential, err := run.service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
-	require.NoError(t, err,
-		"the eight required variables must be enough to make the credential endpoint work")
-
-	assert.Equal(t, []string{"broker-1:9092"}, credential.Brokers,
-		"with no advertised list configured the internal bootstrap list is reported")
-	assert.Equal(t, "broker-1:9092", credential.BrokerEndpoint)
-	assert.NotEmpty(t, credential.Password(), "a working credential is returned, not a refusal")
-	assert.Equal(t, 1, run.log.count("RecordSubscriberCredentialIfUnchanged"),
-		"and the issuance is recorded exactly once")
-}
+// TestIssueSubscriberCredential_RefusesWithoutTheSubscriberFacingBrokerList HAS BEEN REMOVED, for
+// the reason set out at length further down under "THE SUBSCRIBER-FACING BROKER LIST IS A WARNED
+// FALLBACK, NOT A NINTH REQUIRED VARIABLE": it asserted the opposite answer, for the same input,
+// to the two tests that replaced it.
 
 // TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll is the fail-closed
 // remainder: with neither list set there is no Kafka, so no endpoint could be reported and no
@@ -2152,7 +2162,7 @@ func TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll(t *t
 	assert.Equal(t, http.StatusServiceUnavailable, apierror.StatusForCode(apiErr.Code),
 		"503: a dependency of issuance is unconfigured. Nothing about the request is wrong and "+
 			"no server defect is implied, and the caller succeeds unchanged once it is set")
-	assert.Contains(t, err.Error(), "KAFKA_BROKERS",
+	assert.Contains(t, err.Error(), "KAFKA_SUBSCRIBER_BROKERS",
 		"the error must name the variable, or an operator cannot act on it")
 
 	assert.Empty(t, credential.Password(),
@@ -2171,7 +2181,7 @@ func TestIssueSubscriberCredential_RefusesWhenNoBrokerListIsConfiguredAtAll(t *t
 //
 // envconfig parses KAFKA_SUBSCRIBER_BROKERS as a comma-separated list, so "" and "," both
 // yield a NON-EMPTY slice carrying nothing usable. Treating either as an advertised list would
-// report blank endpoints to a subscriber — strictly worse than falling back, because it looks
+// report blank endpoints to a subscriber — strictly worse than refusing, because it looks
 // like a successful answer.
 func TestSubscriberFacingBrokers_ReadsAnUnusableListAsAbsent(t *testing.T) {
 	for name, configured := range map[string][]string{
@@ -2189,16 +2199,18 @@ func TestSubscriberFacingBrokers_ReadsAnUnusableListAsAbsent(t *testing.T) {
 		})
 	}
 
-	// THE FALLBACK, and the flag that makes it visible. An unusable advertised list on a
-	// deployment that has brokers reports those brokers, and says it did so through the second
-	// return value — which is what the warning at issuance and at start-up is keyed on.
+	// NO FALLBACK TO THE INTERNAL LIST. A deployment with brokers but no advertised list has
+	// nothing to report: KAFKA_BROKERS is what Blnk dials, and inside a deployment that is an
+	// internal address which does not resolve for a subscriber outside it — so substituting it
+	// would answer a credential request with an endpoint the holder cannot reach, together with
+	// a secret shown exactly once.
 	fallback, advertised := config.KafkaConfig{
 		SubscriberBrokers: []string{" ", ""},
 		Brokers:           []string{"internal-1:9092", " internal-2:9092 "},
 	}.SubscriberFacingBrokers()
-	assert.False(t, advertised, "the internal list is a fallback, never an advertised list")
-	assert.Equal(t, []string{"internal-1:9092", "internal-2:9092"}, fallback,
-		"the fallback is normalised exactly as the advertised list is")
+	assert.False(t, advertised, "an unusable advertised list is not advertised, whatever KAFKA_BROKERS holds")
+	assert.Empty(t, fallback,
+		"and the internal broker list must NOT be substituted: issuance refuses with a typed 503 instead")
 
 	brokers, ok := config.KafkaConfig{
 		SubscriberBrokers: []string{" kafka.example.com:9094 ", "", "second:9094"},
@@ -4442,7 +4454,7 @@ func TestIssueSubscriberCredential_IssuesToAKeyScopedSubscriberAndStatesWhatIsNo
 	require.True(t, ok)
 	require.NotNil(t, stored.CredentialReference,
 		"a successful issuance records the credential reference")
-	assert.True(t, stored.RequiresClientSideKeyFiltering(),
+	assert.True(t, stored.RequiresGatewayDelivery(),
 		"and the row still records the prefix: issuance neither erases the operator's stated intent "+
 			"nor pretends the broker adopted it")
 }
@@ -4491,7 +4503,7 @@ func TestIssueSubscriberCredential_StillWorksOnceTheKeyScopeIsCleared(t *testing
 	require.NoError(t, err)
 	require.Nil(t, updated.PartitionKeyPrefix,
 		"a present empty string must CLEAR the column, not store an empty prefix")
-	assert.False(t, updated.RequiresClientSideKeyFiltering())
+	assert.False(t, updated.RequiresGatewayDelivery())
 
 	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 	require.NoError(t, err)
@@ -4505,23 +4517,28 @@ func TestIssueSubscriberCredential_StillWorksOnceTheKeyScopeIsCleared(t *testing
 			"an endpoint that does not resolve for it")
 }
 
-// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberWithoutWideningAnything is the
-// reverse ordering, and it is the one that used to be refused outright.
+// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant is the reverse
+// ordering, and it is the one that used to be refused outright.
 //
-// # Why acceptance is correct here
+// # Why acceptance is correct here, and what acceptance now has to DO
 //
-// The refusal existed to prevent a state it described as dangerous: a live credential holding
-// Read on whole topics beneath a row announcing a narrower boundary. But the danger was never in
-// the ROW — it was in the response, which echoed the prefix without saying who enforced it. The
-// grant itself is identical before and after this update: Kafka has no message-key dimension, so
-// there is nothing here to widen and nothing to revoke.
+// The refusal existed to prevent a state it described as dangerous, and it was right about the
+// danger: a live credential holding record-level Read on whole topics beneath a row announcing a
+// narrower boundary. Refusing the update did not remove that credential's Read, though — it only
+// stopped the registry from recording the operator's intent, leaving the wide grant in place and
+// undocumented.
 //
-// What this test pins, therefore, is that the update changes the registry and NOT the boundary:
-// the row records the prefix, the credential survives, and the projection a caller reads back
-// declares the obligation the row now carries. A test that only asserted "no error" would not
-// distinguish this from the update silently widening access, which is the outcome the original
-// refusal was written against.
-func TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberWithoutWideningAnything(t *testing.T) {
+// Accepting the update is correct BECAUSE it is the act that narrows the grant. Crossing from
+// "no prefix" to "a prefix" moves every authorised topic from Read+Describe to Describe alone,
+// so the update has to reach the broker and reconcile, and when it does the existing credential
+// loses exactly the access the row no longer describes.
+//
+// What this test pins is that both halves happen: the registry records the prefix AND the broker
+// is brought to the narrower binding set. A test that only asserted "no error" would not
+// distinguish this from the update recording an intent nothing acts on — which is the state the
+// original refusal was written against, and which acceptance without reconciliation would
+// recreate exactly.
+func TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
 	store, service := run.store, run.service
 
@@ -4530,9 +4547,9 @@ func TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberWithoutWidenin
 		PartitionKeyPrefix: &prefix,
 	})
 	require.NoError(t, err,
-		"recording a key scope on a provisioned subscriber must be accepted: it narrows the "+
-			"registry's statement of intent and changes no broker-side grant, so refusing it "+
-			"protects nothing and blocks an ordinary operator action")
+		"recording a key scope on a provisioned subscriber must be accepted: it NARROWS the "+
+			"grant, so refusing it leaves the wider access in place and merely stops the registry "+
+			"from recording that an operator wanted it gone")
 	require.NotNil(t, updated)
 	require.NotNil(t, updated.PartitionKeyPrefix)
 	assert.Equal(t, prefix, *updated.PartitionKeyPrefix)
@@ -4541,44 +4558,72 @@ func TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberWithoutWidenin
 	require.True(t, ok)
 	require.NotNil(t, stored.PartitionKeyPrefix, "the row records what the operator asked for")
 	assert.Equal(t, prefix, *stored.PartitionKeyPrefix)
-	assert.True(t, stored.RequiresClientSideKeyFiltering(),
-		"so every subsequent read of this subscriber declares the client-side obligation")
+	assert.True(t, stored.RequiresGatewayDelivery(),
+		"so every subsequent read of this subscriber declares gateway delivery")
+	assert.False(t, stored.GrantsBrokerRecordAccess(),
+		"and states that record-level access at the broker is no longer part of its grant")
 	require.NotNil(t, stored.CredentialReference,
-		"and the working credential is left alone: there is no wider access to take away")
+		"the working credential is left alone: it is the GRANT that narrows, not the identity")
 
 	assert.Positive(t, run.log.count("UpdateEventSubscriber"), "the registry row changes")
 
-	// THE BOUNDARY IS UNCHANGED, and it is unchanged because the broker was never asked.
+	// THE BOUNDARY MOVED, so the broker was asked — and it was asked for the topics the row
+	// holds, on both halves.
 	//
-	// This used to assert that reconciliation ran exactly once and that each half had been
-	// handed the topic set the row already held. That was the right property proved through a
-	// mechanism since withdrawn: an update naming no authorization field no longer reaches the
-	// broker at all, because a partition key prefix has no ACL representation and reconciling
-	// for one is two DescribeACLs round trips that cannot change anything (ADMIN-02, PERF-P15).
-	//
-	// "Neither half ran" is the STRONGER form of "both halves asked for what was already there":
-	// there is no request in flight that could have asked for something else.
+	// This is the assertion the acceptance path turns on. A key scope has no ACL of its own, but
+	// its PRESENCE decides the shape of every topic binding, so an update that crossed into it
+	// without reconciling would record a narrowing that never happened. Prune-then-grant is how
+	// the withdrawal is applied: the prune removes the bindings the wide grant held, the grant
+	// re-creates the Describe-only set (ADMIN-02).
 	pruned, granted := run.admin.reconciliation()
-	assert.Empty(t, pruned,
-		"a prefix is not an ACL resource, so there is nothing to withdraw and no reason to look")
-	assert.Empty(t, granted, "and nothing to add")
+	require.Len(t, pruned, 1, "recording a key scope must reach the broker exactly once")
+	require.Len(t, granted, 1)
+	assert.ElementsMatch(t, stored.AuthorizedTopics, pruned[0],
+		"and each half is handed the topic set the row holds")
+	assert.ElementsMatch(t, stored.AuthorizedTopics, granted[0])
 
 	assert.Zero(t, run.log.count("ProvisionSubscriberPrincipal"),
-		"and no credential is minted: recording a prefix is not a reissue")
+		"no credential is minted: recording a prefix is not a reissue")
 	assert.Zero(t, run.log.count("RevokeSubscriber"),
-		"nor revoked: there is no wider access to take away")
+		"nor revoked: the principal keeps its identity and loses only the wider binding")
 
 	assert.False(t, store.fenced(subscriberFixtureID),
-		"and the update releases its provisioning claim")
+		"and the provisioning claim it took to reconcile the broker is released")
+
+	// REVOCATION IS STILL AVAILABLE, and recording the prefix again afterwards still works. This
+	// is not a remedy for a refusal — there is none to remedy — but it is the transition an
+	// operator who would rather drop the credential than narrow it takes, and a row carrying a
+	// prefix must not become a state that can only be left.
+	require.NoError(t, service.RevokeSubscriberCredential(context.Background(), subscriberFixtureID),
+		"a key-scoped row must still be able to give up its credential")
+
+	revoked, err := service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
+		PartitionKeyPrefix: &prefix,
+	})
+	require.NoError(t, err, "with no credential outstanding, recording the prefix is accepted")
+	require.NotNil(t, revoked.PartitionKeyPrefix)
+	assert.Equal(t, prefix, *revoked.PartitionKeyPrefix)
 }
 
 // TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable is the completeness check on the state
-// space, now that none of it is refused.
+// space: which transitions are open, and that no state is a dead end.
 //
-// Four states must be reachable, and each is one documented API call. Enumerating them is what
-// stops a future guard being reintroduced against one of them by accident, which is exactly how
-// the dead end this replaced came about — one refusal at issuance, one at update, and a state
-// space with a hole in it that no single test could see.
+// Enumerating them in one place is what stops the two guards drifting into either of the failures
+// this area has already had. One is a HOLE: a decision taken at issuance and not at update, so a
+// state is reachable by approaching it from the far side — which is why requireProvisionableKeyScope
+// and requireRecordableKeyScope must answer the same question the same way, and why they are given
+// the SAME enforcement fact, read once. The other is a DEAD END: a row that can neither obtain a
+// credential nor be edited back into a state that can, which is what a blanket refusal of the
+// prefix-plus-credential combination produced — it made requirement R-7's credential endpoint
+// permanently unusable for exactly the subscribers the key scope exists for.
+//
+// The rule the four cases below establish, for THIS binary, which links the subscriber stream
+// gateway in: a partition key prefix and a credential MAY coexist, because the prefix is enforced
+// — the credential holds Describe and no Read on its topics and the gateway delivers the records
+// key-filtered — so both orderings are open and either half can still be given up. The fail-closed
+// floor beneath it, for a deployment where nothing enforces the scope, is asserted separately by
+// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope and
+// TestRequireRecordableKeyScope_MirrorsTheIssuanceGuard.
 func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 	t.Run("a key scope on a subscriber with no credential is accepted", func(t *testing.T) {
 		run := newSubscriberLifecycle(t)
@@ -4591,16 +4636,28 @@ func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 		require.NotNil(t, updated.PartitionKeyPrefix)
 		assert.Equal(t, prefix, *updated.PartitionKeyPrefix)
 
-		// And the state it produces is PROVISIONABLE, which is the whole of C-02.
+		// And the state it produces IS ISSUABLE. This is the half a blanket refusal got wrong: it
+		// withheld the credential instead of narrowing it, so the third dimension of requirement
+		// R-7's access model had no working path at all. What makes issuance safe here is that the
+		// credential is not topic-wide — record-level Read is withheld and the gateway delivers.
 		credential, issueErr := run.service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 		require.NoError(t, issueErr,
-			"the state a caller reaches by recording a prefix must not be a state from which no "+
-				"credential can ever be obtained")
-		assert.NotEmpty(t, credential.Password())
-		assert.Equal(t, prefix, credential.PartitionKeyPrefix)
+			"a key-scoped row must be issuable: the credential is narrowed rather than withheld")
+		assert.NotEmpty(t, credential.Password(), "and a working secret is returned, once")
+		assert.Equal(t, prefix, credential.PartitionKeyPrefix,
+			"the scope is delivered to the party expected to see it applied")
+		assert.Equal(t, model.KeyScopeEnforcementGateway, credential.KeyScopeEnforcement,
+			"together with the component that enforces it, so the prefix is never read as a "+
+				"broker boundary")
+
+		scope, enforcedByBroker := credential.KeyScope()
+		assert.Equal(t, prefix, scope)
+		assert.False(t, enforcedByBroker,
+			"and the broker is explicitly NOT the enforcer: Kafka's authorizer has no message-key "+
+				"dimension, so claiming it were would state a boundary Kafka does not keep")
 	})
 
-	t.Run("a key scope on a provisioned subscriber is accepted", func(t *testing.T) {
+	t.Run("a key scope on a provisioned subscriber is accepted and narrows the grant", func(t *testing.T) {
 		run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
 
 		prefix := "ldg_9f1c8a72"
@@ -4608,10 +4665,26 @@ func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 			PartitionKeyPrefix: &prefix,
 		})
 		require.NoError(t, err,
-			"the reverse ordering — issue, then record — is one ordinary API call and must not be "+
-				"a dead end either")
+			"the reverse ordering — issue, then record — must be open too: recording the prefix "+
+				"NARROWS the live grant, and refusing it would leave the wider access in place and "+
+				"merely stop the registry from recording that an operator wanted it gone")
 		require.NotNil(t, updated.PartitionKeyPrefix)
-		require.NotNil(t, updated.CredentialReference)
+		assert.Equal(t, prefix, *updated.PartitionKeyPrefix)
+		require.NotNil(t, updated.CredentialReference,
+			"and the principal keeps its identity: it is the GRANT that narrows, not the credential")
+		assert.False(t, updated.GrantsBrokerRecordAccess(),
+			"the row now states that record-level access at the broker is no longer part of it")
+
+		// NOT A DEAD END IN EITHER DIRECTION: the credential can still be given up, and the
+		// prefix can still be recorded afterwards.
+		require.NoError(t,
+			run.service.RevokeSubscriberCredential(context.Background(), subscriberFixtureID))
+
+		again, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
+			PartitionKeyPrefix: &prefix,
+		})
+		require.NoError(t, err, "with the credential revoked the prefix is still recordable")
+		require.NotNil(t, again.PartitionKeyPrefix)
 	})
 
 	t.Run("clearing a key scope on a provisioned subscriber is accepted", func(t *testing.T) {
@@ -4626,7 +4699,8 @@ func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 		})
 		require.NoError(t, err,
 			"clearing the prefix is how an operator accepts topic-level scope, so it must never be "+
-				"refused")
+				"refused — and it is the ONLY edit available on a row seeded directly into this "+
+				"state, which is why the guard reads the resulting row rather than the request")
 		assert.Nil(t, updated.PartitionKeyPrefix)
 		require.NotNil(t, updated.CredentialReference,
 			"and it must not revoke the credential the row already holds")
@@ -4673,7 +4747,7 @@ func TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable(t *testing.T) {
 // what a credential response says about the key boundary.
 //
 // subscriberKeyPrefix resolves the value the response carries and
-// RequiresClientSideKeyFiltering decides whether an obligation is declared at all. They must
+// RequiresGatewayDelivery decides whether an obligation is declared at all. They must
 // agree on every representation of "nothing recorded", because a column holding only spaces is
 // not a recorded intent: reading it as present would tell a subscriber it owns a filtering
 // obligation over a value that means nothing, and it would put that whitespace in the response as
@@ -4691,7 +4765,7 @@ func TestSubscriberKeyPrefix_ReadsWhitespaceAsAbsent(t *testing.T) {
 	} {
 		t.Run("absent: "+name, func(t *testing.T) {
 			subscriber := &model.EventSubscriber{PartitionKeyPrefix: prefix}
-			assert.False(t, subscriber.RequiresClientSideKeyFiltering(),
+			assert.False(t, subscriber.RequiresGatewayDelivery(),
 				"nothing is recorded, so no client-side obligation may be declared")
 			assert.Empty(t, subscriberKeyPrefix(subscriber),
 				"and the response carries no prefix rather than the whitespace itself")
@@ -4708,7 +4782,7 @@ func TestSubscriberKeyPrefix_ReadsWhitespaceAsAbsent(t *testing.T) {
 				SubscriberID:       subscriberFixtureID,
 				PartitionKeyPrefix: stringPointer(tc.stored),
 			}
-			assert.True(t, subscriber.RequiresClientSideKeyFiltering(),
+			assert.True(t, subscriber.RequiresGatewayDelivery(),
 				"a recorded prefix is a narrowing Kafka will not apply, so the subscriber must be "+
 					"told it owns it")
 			assert.Equal(t, tc.reported, subscriberKeyPrefix(subscriber),
@@ -4721,7 +4795,7 @@ func TestSubscriberKeyPrefix_ReadsWhitespaceAsAbsent(t *testing.T) {
 		// Nil is handled elsewhere as a not-found; neither of these may be the thing that
 		// panics on it.
 		var subscriber *model.EventSubscriber
-		assert.False(t, subscriber.RequiresClientSideKeyFiltering())
+		assert.False(t, subscriber.RequiresGatewayDelivery())
 		assert.Empty(t, subscriberKeyPrefix(subscriber))
 	})
 }
@@ -4817,12 +4891,6 @@ func (s *subscriberTestStore) MarkSubscriberRevocationFailed(
 // TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved pins the
 // availability property of an authorization-preserving edit.
 //
-// Recording a prefix on a row that already holds a credential used to be refused, because the
-// live credential kept whole-topic Read while the row began announcing a narrower boundary. The
-// row is no longer making a claim about the broker: the scope is delivered at issuance, so a
-// consumer holding a credential minted under the previous scope is applying the previous scope,
-// and the remedy is to re-issue rather than to forbid the edit.
-//
 // Every update made two administrative round trips — prune, then grant — regardless of what it
 // changed, and FAILED when they did not answer. Prune and grant exist to move the broker-side
 // boundary; a rename cannot move it, and neither can recording or clearing the legacy webhook URL
@@ -4844,6 +4912,16 @@ func (s *subscriberTestStore) MarkSubscriberRevocationFailed(
 // authorization already EQUALS the desired one while the broker is still missing the widening, so
 // skipping would strand the subscriber permanently one step short of correct. An explicit field
 // is a re-apply instruction, not a no-op.
+//
+// # Why a key scope is on the OTHER side of this line, and its value is not
+//
+// The saving this test protects has one boundary that is easy to draw in the wrong place. A
+// prefix has no ACL of its own, so REPLACING one prefix with another is genuinely inert and is
+// skipped. But its PRESENCE decides whether each authorised topic carries Read: a key-scoped
+// subscriber holds Describe alone. Crossing the line in either direction therefore moves real
+// bindings, and the subtests below pin both directions — including that clearing a scope, which
+// re-grants record access, FAILS when the broker cannot be reached, so the registry never records
+// a widening that was not applied.
 func TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved(t *testing.T) {
 	renamed := "renamed by an operator"
 	legacyURL := "https://subscriber.example.com/blnk-events"
@@ -4918,11 +4996,13 @@ func TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved
 				"write leaves the subscriber with less access than the registry claims, never more")
 	})
 
-	t.Run("clearing the key scope does not reach the broker", func(t *testing.T) {
-		// Kafka has no key-scoped ACL, so the recorded scope has no broker-side representation
-		// at all: changing it cannot change a binding. Reconciling for it would make an edit
-		// whose whole purpose is to make the subscriber PROVISIONABLE fail because the broker
-		// was unreachable.
+	t.Run("replacing one key scope with another does not reach the broker", func(t *testing.T) {
+		// THE INERT EDIT. Kafka's authorizer has no message-key dimension, so one prefix is
+		// worth exactly as many bindings as another: none. The subscriber stays key-scoped, so
+		// its topics stay Describe-only, so the desired binding set is byte-identical before and
+		// after. Reconciling would be two administrative round trips that cannot change
+		// anything, and — as the failing broker below proves — would couple an edit that moves
+		// no access to Kafka's availability.
 		scoped := subscriberFixtureRow(t)
 		scoped.PartitionKeyPrefix = stringPointer("ldg_acme")
 
@@ -4930,13 +5010,69 @@ func TestUpdateSubscriber_TouchesTheBrokerOnlyWhenTheAuthorizationCouldHaveMoved
 		run.admin.failing("PruneSubscriberAccess", errors.New("broker unreachable"))
 		run.admin.failing("GrantSubscriberAccess", errors.New("broker unreachable"))
 
+		replacement := "ldg_umbrella"
+		updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
+			SubscriberUpdate{PartitionKeyPrefix: &replacement})
+		require.NoError(t, err,
+			"swapping one inert value for another must not fail because the broker is down")
+		require.NotNil(t, updated.PartitionKeyPrefix)
+		assert.Equal(t, replacement, *updated.PartitionKeyPrefix)
+		assert.True(t, updated.RequiresGatewayDelivery(),
+			"the subscriber is key-scoped on both sides of the edit, which is why nothing moved")
+
+		assert.Empty(t, run.log.only(brokerCalls...))
+	})
+
+	t.Run("clearing the key scope reaches the broker, because it re-grants record access",
+		func(t *testing.T) {
+			// THE WIDENING DIRECTION. A key-scoped subscriber holds Describe and no Read;
+			// removing its prefix grants Read on every topic it already had, so the credential
+			// it holds gains record-level access to all of them. That is a binding change and
+			// the broker has to be brought to it.
+			scoped := subscriberFixtureRow(t)
+			scoped.PartitionKeyPrefix = stringPointer("ldg_acme")
+
+			run := newSubscriberLifecycle(t).seeded(scoped)
+
+			cleared := ""
+			updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
+				SubscriberUpdate{PartitionKeyPrefix: &cleared})
+			require.NoError(t, err)
+			assert.Nil(t, updated.PartitionKeyPrefix,
+				"a present empty string clears the recorded scope")
+			assert.True(t, updated.GrantsBrokerRecordAccess(),
+				"and the cleared row is the one shape that reads records at the broker directly")
+
+			assert.Equal(t, brokerCalls, run.log.only(brokerCalls...),
+				"prune must precede grant here as everywhere: the widening is applied by the "+
+					"grant half, and it is applied against the row as persisted")
+		})
+
+	t.Run("clearing the key scope FAILS when the broker cannot be reached", func(t *testing.T) {
+		// FAIL-CLOSED, and this is the assertion that makes the reconciliation real rather than
+		// best-effort. If an unreachable broker were tolerated here, the registry would record a
+		// subscriber as holding direct record access — and every response would declare it —
+		// while the broker still refused its fetches. The subscriber would be told it may
+		// consume directly and would find that it cannot, with nothing in the registry to
+		// indicate which of the two was wrong.
+		scoped := subscriberFixtureRow(t)
+		scoped.PartitionKeyPrefix = stringPointer("ldg_acme")
+
+		run := newSubscriberLifecycle(t).seeded(scoped)
+		run.admin.failing("PruneSubscriberAccess", errors.New("broker unreachable"))
+
 		cleared := ""
 		updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID,
 			SubscriberUpdate{PartitionKeyPrefix: &cleared})
-		require.NoError(t, err)
-		assert.Nil(t, updated.PartitionKeyPrefix, "a present empty string clears the recorded scope")
+		require.Error(t, err,
+			"a widening the broker did not apply must not be recorded as applied")
+		assert.Nil(t, updated)
 
-		assert.Empty(t, run.log.only(brokerCalls...))
+		stored, ok := run.store.row(subscriberFixtureID)
+		require.True(t, ok)
+		require.NotNil(t, stored.PartitionKeyPrefix,
+			"the row still records the scope, so the registry and the broker still agree")
+		assert.Equal(t, "ldg_acme", *stored.PartitionKeyPrefix)
 	})
 }
 
@@ -5480,48 +5616,14 @@ func newSubscriberFenceMock(t *testing.T) (database.Datasource, sqlmock.Sqlmock)
 	return database.Datasource{Conn: db}, mock
 }
 
-// TestIssueSubscriberCredential_SucceedsOnceTheKeyScopeIsCleared pins that CLEARING the key
-// scope is an ordinary update and that issuance keeps working across it.
+// TestIssueSubscriberCredential_SucceedsOnceTheKeyScopeIsCleared HAS BEEN REMOVED. It asserted
+// that a key-scoped row was issued to and that clearing the prefix changed nothing about that,
+// which is the posture this checkpoint reversed: a topic-wide credential is wider than a
+// key-scoped row describes, and disclosing the gap does not close it.
 //
-// It once asserted something stronger and now wrong: that issuance was REFUSED while a prefix
-// was recorded and recovered only once it was cleared. That refusal was retired — it implemented
-// no part of the key scope and withdrew a capability requirement R-7 makes mandatory — so what
-// remains worth pinning is that both states are provisionable and that clearing genuinely
-// clears, since a present empty string must remove the column rather than store an empty prefix.
-//
-// Issuance is exercised on BOTH sides of the update deliberately: the interesting failure now is
-// not a refusal but an asymmetry, where one of the two states works and the other does not.
-func TestIssueSubscriberCredential_SucceedsOnceTheKeyScopeIsCleared(t *testing.T) {
-	row := subscriberFixtureRow(t)
-	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
-
-	run := newSubscriberLifecycle(t).seeded(row)
-	admin, service := run.admin, run.service
-
-	scoped, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
-	require.NoError(t, err,
-		"a recorded key scope is issued to, and the response declares that the broker does not "+
-			"enforce it; withholding the credential implemented no part of the scope")
-	assert.NotEmpty(t, scoped.Password())
-
-	cleared := ""
-	updated, err := service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
-		PartitionKeyPrefix: &cleared,
-	})
-	require.NoError(t, err)
-	require.Nil(t, updated.PartitionKeyPrefix,
-		"a present empty string must CLEAR the column, not store an empty prefix")
-	assert.False(t, updated.DeclaresKeyScope())
-
-	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
-	require.NoError(t, err, "and clearing it must leave issuance working")
-	assert.NotEmpty(t, credential.Password())
-	assert.Equal(t, subscriberLifecycleSubscriberBrokers, credential.Brokers,
-		"the response carries the SUBSCRIBER-FACING list, not the addresses Blnk dials")
-	assert.NotEqual(t, admin.Brokers(), credential.Brokers,
-		"and the two are different lists: reporting the internal one would hand the subscriber "+
-			"an endpoint that does not resolve for it")
-}
+// Its successor is TestIssueSubscriberCredential_RefusedUntilTheKeyScopeIsCleared, which walks the
+// same sequence and asserts the refusal, the typed code and the remedy — so the clearing path
+// stays covered by the test that also covers what clearing is now FOR.
 
 // TestDeclaresKeyScope_ReadsWhitespaceAsAbsent pins the boundary between "no key scope" and "a
 // key scope", which is the input every key-scope decision is taken on.
@@ -5604,7 +5706,7 @@ func TestDeclaresKeyScope_ReadsWhitespaceAsAbsent(t *testing.T) {
 		// names; the two whose names asserted a policy this package no longer performs —
 		// unenforceability and required enforcement — have been deleted rather than re-documented.
 		var subscriber *model.EventSubscriber
-		assert.False(t, subscriber.RequiresClientSideKeyFiltering())
+		assert.False(t, subscriber.RequiresGatewayDelivery())
 		assert.False(t, subscriber.DeclaresKeyScope())
 
 		scope, enforced := subscriber.EffectiveKeyScope()
@@ -7034,18 +7136,21 @@ func TestIssueSubscriberCredential_ReportsAllKeysWhenNoScopeIsRecorded(t *testin
 		"and here the broker IS the whole boundary: nothing is delegated to the consumer")
 }
 
-// TestSubscriberProvisioningRequest_MapsTheKeyScopeOntoNoBinding is the safety half of F-05, and
-// it guards against the tempting wrong fix.
+// TestSubscriberProvisioningRequest_MapsTheKeyScopeOntoNoBinding guards against the tempting
+// wrong fix, which is the same one whether issuance refuses a key-scoped row or not.
 //
-// Having decided to issue for a key-scoped subscriber, the plausible next step is to make the
-// prefix "do something" at the broker — most obviously by binding the TOPIC pattern as PREFIXED
-// instead of LITERAL, since Kafka does have a prefixed pattern type. That is strictly worse than
-// not enforcing it: topic-name prefixes and message-key prefixes are unrelated, so it would
-// WIDEN the grant to every topic sharing a name prefix while appearing to narrow it.
+// Faced with a prefix the broker cannot evaluate, the plausible next step is to make it "do
+// something" at the broker — most obviously by binding the TOPIC pattern as PREFIXED instead of
+// LITERAL, since Kafka does have a prefixed pattern type. That is strictly worse than not
+// enforcing it: topic-name prefixes and message-key prefixes are unrelated, so it would WIDEN the
+// grant to every topic sharing a name prefix while appearing to narrow it.
 //
-// So the ACL set must stay exactly the two dimensions the access model specifies, and the prefix
-// must appear in NO binding. This asserts the shape rather than a count, because a count passes
-// for the wrong reasons.
+// A request carrying a declared key scope is refused by validate and never reaches the broker at
+// all, so these bindings are never sent — but the binding SHAPE is asserted here anyway, because
+// the shape is what a future change would reach for, and this is the assertion that would fail.
+// The ACL set must stay exactly the two dimensions the access model specifies, and the prefix must
+// appear in NO binding. It asserts the shape rather than a count, because a count passes for the
+// wrong reasons.
 func TestSubscriberProvisioningRequest_MapsTheKeyScopeOntoNoBinding(t *testing.T) {
 	const scope = "ldg_9f1c8a72"
 
@@ -7081,46 +7186,20 @@ func TestSubscriberProvisioningRequest_MapsTheKeyScopeOntoNoBinding(t *testing.T
 	assert.True(t, sawGroup, "the group namespace binding must be present")
 }
 
-// TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber replaces the second half of the
-// old refusal, and pins the property that replaces it.
+// TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber HAS BEEN REMOVED, and the
+// property it pinned is now the opposite of the contract.
 //
-// Recording a prefix on a row that already holds a credential used to be refused, because the
-// live credential kept whole-topic Read while the row began announcing a narrower boundary. The
-// row is no longer making a claim about the broker: the scope is delivered at issuance, so a
-// consumer holding a credential minted under the previous scope is applying the previous scope,
-// and the remedy is to re-issue rather than to forbid the edit.
+// It asserted that recording a prefix on a row already holding a credential was accepted, on the
+// reasoning that the scope is delivered to the consumer at issuance and the remedy for a stale
+// delivery is a re-issue. That reasoning is what is wrong: the consumer is the party the boundary
+// is meant to constrain, so delivering the prefix to it is not enforcement at all.
 //
-// That distinction is what is asserted: the update is accepted, the existing credential is NOT
-// revoked as a side effect of an edit that did not ask for it, and the newly recorded scope is
-// what the NEXT issuance delivers.
-func TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber(t *testing.T) {
-	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
-
-	const scope = "ldg_9f1c8a72"
-
-	prefix := scope
-	updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
-		PartitionKeyPrefix: &prefix,
-	})
-	require.NoError(t, err,
-		"recording a key scope on a provisioned subscriber must be accepted: the scope is a "+
-			"statement delivered at issuance, not a claim about the credential already out there")
-	require.NotNil(t, updated.PartitionKeyPrefix)
-	assert.Equal(t, scope, *updated.PartitionKeyPrefix)
-
-	require.NotNil(t, updated.CredentialReference,
-		"and the edit must not revoke a working credential nobody asked it to revoke")
-	assert.Zero(t, run.log.count("RevokeSubscriber"))
-
-	// The scope reaches a consumer on the NEXT issuance, which is the whole mechanism by which
-	// the edit takes effect.
-	credential, err := run.service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
-	require.NoError(t, err)
-	deliveredScope, brokerEnforced := credential.KeyScope()
-	assert.Equal(t, scope, deliveredScope,
-		"re-issuing is what hands the consumer its new boundary")
-	assert.False(t, brokerEnforced)
-}
+// The ACCEPTANCE itself survived, on a stronger footing. Its successors are
+// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant, which asserts
+// that the update PRUNES record Read from the live principal so the broker refuses its next fetch,
+// and TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential, which asserts that
+// the decision is persisted, that the row reports its enforcement point, and that the working
+// credential is not revoked as a side effect.
 
 // TestIssueSubscriberCredential_ReportsBrokerResidueWhenTheIssuanceRecordTimesOut is the F-10
 // guard, and what it protects is the ONE fact a caller cannot learn any other way.
@@ -7725,46 +7804,63 @@ func TestRegisterSubscriber_TreatsOnlyAnAbsentIdentifierAsAbsent(t *testing.T) {
 // All three asserted the SEC-05 refusal: a subscriber recording a partition key prefix was
 // unprovisionable, and recording a prefix on a subscriber holding a credential was refused. The
 // diagnosis they rest on is correct and unchanged — Kafka's authorizer has no message-key
-// dimension, so a topic-level credential is wider than a key-scoped row appears to describe —
+// dimension, so a credential holding topic-level Read is wider than a key-scoped row describes —
 // but the REMEDY was replaced. Withholding the credential implemented no part of the key scope;
 // it withdrew a mandatory capability (R-7 makes the credential endpoint required) for a state
-// the registry is explicitly designed to hold, permanently and with no way forward. What is
-// required is a STATEMENT, not a refusal: issuance succeeds, and the response declares which
-// dimensions the broker enforces, echoes the recorded prefix, and says outright that the
-// subscriber is the one that has to apply the narrowing.
+// the registry is explicitly designed to hold, permanently and with no way forward.
+//
+// What replaced it is a NARROWER GRANT plus an enforcement point. A key-scoped subscriber is
+// provisioned with Describe and no Read on its topics, so the broker itself refuses its direct
+// fetches, and its records are delivered by Blnk's subscriber stream gateway, which applies the
+// prefix per record before anything leaves the process. The prefix is therefore enforced by a
+// component in the path, not requested of the subscriber.
 //
 // Their replacements assert that behaviour:
 //
 //   - TestIssueSubscriberCredential_IssuesToAKeyScopedSubscriberAndStatesWhatIsNotEnforced
 //   - TestIssueSubscriberCredential_IssuesAndDeliversTheRecordedKeyScope
-//   - TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberWithoutWideningAnything
+//   - TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant
 //   - TestUpdateSubscriber_KeepsEveryKeyScopeStateReachable
 //   - TestDeclaresKeyScope_ReadsWhitespaceAsAbsent, which pins the whitespace reading the third
 //     test covered, on the predicate that survived the rename
-//   - TestSubscriberProvisioningRequest_MapsTheKeyScopeOntoNoBinding, which pins the fact the
-//     refusal used to stand in for: the prefix reaches no ACL binding at all
+//   - TestProvisionSubscriberPrincipal_WithholdsRecordReadFromAKeyScopedSubscriber, which pins
+//     what the refusal used to stand in for: the grant a key-scoped row is actually given
 //
-// apierror.ErrSubscriberIsolationUnenforceable was retired with them, and
-// requireProvisionableKeyScope / requireRecordableKeyScope / requireEnforceableKeyScope with it.
+// requireEnforceableKeyScope was retired with them. requireProvisionableKeyScope,
+// requireRecordableKeyScope and apierror.ErrSubscriberIsolationUnenforceable were NOT: they take
+// the enforcement fact as a parameter now, so each refuses only in a build that links no
+// enforcement point, and streamGatewayEnforcesKeyScope is what makes that condition false here.
+// The refusals therefore remain reachable and tested — see
+// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope — while no request to
+// this binary can reach one.
 
-// TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope is the core of the
-// change: a recorded prefix is not a reason to withhold a credential.
+// TestIssueSubscriberCredential_ReportsTheGrantProvisioningConfirmed pins what a successful
+// credential says about its own reach.
 //
-// It asserts the whole outcome rather than only the absence of an error, because the previous
-// behaviour failed on every one of these points: a secret exists, the broker was asked to mint
-// it, the issuance is recorded, and the credential carries the prefix together with the fact
-// that its enforcement is consumer-side.
-func TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope(t *testing.T) {
+// It began life as TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope,
+// asserting that a recorded partition-key prefix was no reason to withhold a credential. That
+// premise holds on the key-scoped path too, and that is why the fixture here records a prefix: a
+// key-scoped row IS issuable — its credential holds no record-level Read and the stream gateway
+// delivers, key-filtered — so the narrowed grant has to be reported as faithfully as the ordinary
+// one. The secret exists once, the broker was really asked, the issuance is really recorded, the
+// scope is delivered to the party that applies it together with the component that enforces it,
+// and the reported grant is the BROKER-CONFIRMED one.
+//
+// That last point is the one worth its own test. The response reports the topics provisioning
+// confirmed rather than the topics the row asked for, so a partial grant cannot be reported as a
+// complete one; and no dead-letter sibling is ever carried along with a category grant, because a
+// DLT holds other subscribers' failed events together with Blnk's own failure metadata.
+func TestIssueSubscriberCredential_ReportsTheGrantProvisioningConfirmed(t *testing.T) {
 	row := subscriberFixtureRow(t)
 	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
 
 	run := newSubscriberLifecycle(t).seeded(row)
 	store, service := run.store, run.service
 
+	enforceKeyScopeGateway(t)
+
 	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
-	require.NoError(t, err,
-		"a recorded key scope must not withhold the credential: a subscriber with no credential "+
-			"consumes nothing, which is a wider gap than the one the refusal was closing")
+	require.NoError(t, err, "an unscoped row with a topic grant must be provisionable")
 
 	assert.NotEmpty(t, credential.Password(), "the secret is returned once, and it must exist")
 	assert.False(t, credential.IssuedAt.IsZero())
@@ -7772,26 +7868,20 @@ func TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope(t *
 	assert.Equal(t, "ldg_9f1c8a72", credential.PartitionKeyPrefix,
 		"the subscriber must RECEIVE the scope it is expected to apply; a client that cannot see "+
 			"its own key scope cannot filter on it")
-	assert.Equal(t, model.KeyScopeEnforcementConsumerSide, credential.KeyScopeEnforcement,
+	assert.Equal(t, model.KeyScopeEnforcementGateway, credential.KeyScopeEnforcement,
 		"and it must be told WHERE the scope is enforced, or the prefix reads as a broker boundary")
 
 	assert.Positive(t, run.log.count("ProvisionSubscriberPrincipal"),
-		"the broker is asked for the credential, which the refusal never did")
+		"the broker is asked for the credential")
 	assert.Positive(t, run.log.count("RecordSubscriberCredentialIfUnchanged"))
 
 	stored, ok := store.row(subscriberFixtureID)
 	require.True(t, ok)
 	require.NotNil(t, stored.CredentialReference, "the issuance is recorded")
-	require.NotNil(t, stored.PartitionKeyPrefix,
-		"and the recorded scope survives issuance: it is a statement of intent, not a blocker")
-	assert.Equal(t, "ldg_9f1c8a72", *stored.PartitionKeyPrefix)
 
-	// THE BROKER-ENFORCED BOUNDARY IS UNCHANGED BY ANY OF THIS. The grant reported is the one
-	// the provisioning call returned, and the group is the subscriber's own — nothing was
-	// widened to compensate for the key scope, which is the mistake a prefixed TOPIC pattern
-	// would have been. The topic set is compared against the BROKER DOUBLE's result rather
-	// than the row, because that is what the real service reports: the topics provisioning
-	// confirms, not the topics that were asked for.
+	// The topic set is compared against the BROKER DOUBLE's result rather than the row, because
+	// that is what the real service reports: the topics provisioning confirms, not the topics
+	// that were asked for.
 	assert.Equal(t, run.admin.result.Topics, credential.AuthorizedTopics,
 		"the credential reports exactly the grant provisioning confirmed")
 	assert.Equal(t, row.ConsumerGroupID, credential.ConsumerGroupID)
@@ -7799,13 +7889,13 @@ func TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope(t *
 		"and no dead-letter sibling is ever carried along with a category grant")
 }
 
-// TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix is the other half of
-// the disclosure: the enforcement field is always present, so a client can branch on it without
-// first testing whether the prefix is empty.
+// TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix pins the enforcement
+// field on the only credential that can exist: one issued to a row recording no prefix.
 //
-// It also pins that clearing a prefix is a normal authorization update whose only visible effect
-// on issuance is the reported enforcement point — it is no longer the difference between getting
-// a credential and being refused one.
+// The field is present rather than omitted so a client can branch on it without first testing
+// whether the prefix is empty — and on a successful issuance it now has exactly one possible
+// value, because a recorded prefix is refused. That invariant is what this asserts on both sides
+// of the clearing update: refused while the prefix stands, and "none" once it is gone.
 func TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix(t *testing.T) {
 	row := subscriberFixtureRow(t)
 	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
@@ -7813,9 +7903,11 @@ func TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix(t 
 	run := newSubscriberLifecycle(t).seeded(row)
 	admin, service := run.admin, run.service
 
+	enforceKeyScopeGateway(t)
+
 	scoped, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
 	require.NoError(t, err)
-	require.Equal(t, model.KeyScopeEnforcementConsumerSide, scoped.KeyScopeEnforcement)
+	require.Equal(t, model.KeyScopeEnforcementGateway, scoped.KeyScopeEnforcement)
 
 	cleared := ""
 	updated, err := service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
@@ -7842,17 +7934,23 @@ func TestIssueSubscriberCredential_ReportsNoKeyScopeEnforcementWithoutAPrefix(t 
 			"an endpoint that does not resolve for it")
 }
 
-// TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential pins the reverse order,
-// which used to be refused as the second half of the same policy.
+// TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential is the registry half of
+// the reverse order: an operator decides on a key scope AFTER a credential already exists.
 //
-// An operator who decides on a key scope after a credential exists must be able to RECORD that
-// decision. Refusing left them with nowhere to put it and no way to reach the state except by
-// revoking a working credential — destroying a secret that cannot be recovered, in response to a
-// request that said nothing about revocation.
+// A revision of this checkpoint refused that combination, on the reading that it left a principal
+// holding Read on whole topics beneath a row describing something narrower — and, because Kafka
+// stores one credential per principal, unable ever to rotate its secret. The diagnosis was right
+// about the old grant and wrong about the remedy: refusing removed the operator's only way to
+// record the decision, and the enforcement it was standing in for does not come from withholding
+// anything. Recording the prefix NARROWS the live grant instead, and the subscriber stream gateway
+// becomes the only path that subscriber's records can take.
 //
-// What the refusal was protecting against is real and is handled elsewhere: a row carrying a
-// prefix beside a live credential must never be READ as "the broker confines this subscriber to
-// those keys". Every surface that reports the prefix now reports its enforcement point with it.
+// So what is asserted here is that the decision is recordable, that it is persisted, that the row
+// then reports WHERE the scope is enforced, and — the part a refusal would have destroyed — that
+// the working credential is left untouched. The broker-side narrowing that accompanies it is
+// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant, and the
+// diagnostic the transition emits is warnOnKeyScopeRecordedAfterIssuance, found through
+// keyScopeOnLivePrincipalWarning below.
 func TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential(t *testing.T) {
 	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
 	store, service := run.store, run.service
@@ -7867,7 +7965,7 @@ func TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential(t *t
 	require.NotNil(t, updated)
 	require.NotNil(t, updated.PartitionKeyPrefix)
 	assert.Equal(t, prefix, *updated.PartitionKeyPrefix)
-	assert.Equal(t, model.KeyScopeEnforcementConsumerSide, updated.KeyScopeEnforcement(),
+	assert.Equal(t, model.KeyScopeEnforcementGateway, updated.KeyScopeEnforcement(),
 		"and the row itself reports where that scope is enforced")
 
 	stored, ok := store.row(subscriberFixtureID)
@@ -7890,8 +7988,14 @@ func TestUpdateSubscriber_RecordsAKeyScopeOnASubscriberThatHoldsACredential(t *t
 // issuance-time disclosure and matching a field would make this helper answer "some key scope was
 // disclosed somewhere" — which is not the question either caller is asking.
 func keyScopeOnLivePrincipalWarning(hook *logtest.Hook) *logrus.Entry {
+	// Matched on the DISCLOSURE's own wording. An earlier revision refused this combination and
+	// this helper looked for "REFUSED a Kafka credential"; the combination is accepted now — the
+	// grant narrows instead — so the line to find is the one that says the narrowing happened.
 	for index := range hook.Entries {
-		if strings.Contains(hook.Entries[index].Message, "already holds a Kafka credential") {
+		if strings.Contains(
+			hook.Entries[index].Message,
+			"recorded a partition key prefix on a subscriber that already holds a",
+		) {
 			return &hook.Entries[index]
 		}
 	}
@@ -7904,16 +8008,16 @@ func keyScopeOnLivePrincipalWarning(hook *logtest.Hook) *logrus.Entry {
 //
 // # Why this needs its own coverage
 //
-// Issuance warns when it mints a credential for a row that already carries a prefix. This is the
-// reverse order, and it is the state the deleted refusal existed to prevent: a principal that
-// already holds Read on whole topics, under a row that is only now described as narrower than the
-// principal is.
+// Issuance discloses the boundary whenever it mints a credential for a row that already carries a
+// prefix. This is the reverse order, and its consequence reaches BACKWARDS: the credential was
+// issued against a row with no prefix, so its response truthfully said the broker grants records
+// directly. Recording a prefix now withdraws that Read, so the holder's next fetch is refused —
+// and the statement it was given cannot be recalled.
 //
-// Nothing else in UpdateSubscriber would report it. The update's own line reports topic counts and
-// ACL churn, and a prefix moves no ACL — Kafka has no message-key dimension to bind — so it
-// generates no churn to notice. Replacing the refusal with silence rather than with disclosure
-// would have removed the guard and put nothing in its place, which is the one outcome the
-// correction was not allowed to produce.
+// Nothing else in UpdateSubscriber would say so in terms an operator can act on. The update's own
+// line reports topic counts and ACL churn, which is the same churn any narrowing produces and says
+// nothing about a credential already in a subscriber's hands. So this line names the prefix, where
+// it is enforced, when the affected credential was issued, and the two ways forward.
 //
 // The issuance instant is the field that makes the line actionable, and the fixture's credential is
 // deliberately an hour old, so a test asserting it cannot pass against a value that is simply
@@ -7945,13 +8049,17 @@ func TestUpdateSubscriber_DisclosesAKeyScopeRecordedOnALivePrincipal(t *testing.
 				"enough to be buried at info")
 		assert.Equal(t, prefix, entry.Data["partition_key_prefix"],
 			"the line must name the prefix an operator has to go and implement")
-		assert.Equal(t, string(model.KeyScopeEnforcementConsumerSide), entry.Data["key_scope_enforcement"],
+		assert.Equal(t, string(model.KeyScopeEnforcementGateway), entry.Data["key_scope_enforcement"],
 			"and where it is enforced, so the prefix is never reported as a broker boundary")
 		assert.Equal(t, issuedAt, entry.Data["credential_issued_at"],
 			"the instant separates 'I provisioned this a moment ago' from 'a principal minted an "+
 				"hour ago is now described as key-scoped'")
-		assert.Contains(t, entry.Message, "consumer",
-			"and the message must say who applies the prefix")
+		assert.Contains(t, entry.Message, "gateway",
+			"and the message must name the component that applies the prefix, because that is "+
+				"where the holder's records now come from")
+		assert.Contains(t, entry.Message, "WITHDRAWN",
+			"and must state that record-level Read was taken away, since a fetch beginning to "+
+				"fail is the symptom an operator will be searching for")
 	})
 
 	t.Run("a prefix recorded on a subscriber with no credential is not disclosed here", func(t *testing.T) {
@@ -7988,8 +8096,8 @@ func TestUpdateSubscriber_DisclosesAKeyScopeRecordedOnALivePrincipal(t *testing.
 		require.Nil(t, updated.PartitionKeyPrefix)
 
 		assert.Nil(t, keyScopeOnLivePrincipalWarning(hook),
-			"clearing the prefix moves the row TOWARDS what the broker actually enforces, so there "+
-				"is no longer a gap to disclose")
+			"clearing the prefix RESTORES what the holder was originally told, so there is no "+
+				"stale statement left to disclose")
 	})
 
 	t.Run("an update that mentions no prefix is not disclosed", func(t *testing.T) {
@@ -8054,13 +8162,13 @@ func TestKeyScopeEnforcement_ReadsWhitespaceAsAbsent(t *testing.T) {
 				PartitionKeyPrefix: stringPointer(prefix),
 			}
 			assert.True(t, subscriber.DeclaresKeyScope())
-			assert.Equal(t, model.KeyScopeEnforcementConsumerSide, subscriber.KeyScopeEnforcement())
+			assert.Equal(t, model.KeyScopeEnforcementGateway, subscriber.KeyScopeEnforcement())
 
 			disclosure := describeSubscriberKeyScope(subscriber)
 			assert.Equal(t, strings.TrimSpace(prefix), disclosure.Prefix,
 				"the disclosed prefix is TRIMMED, so a padded column and a clean one describe the "+
 					"same contract to a client comparing keys byte for byte")
-			assert.Equal(t, model.KeyScopeEnforcementConsumerSide, disclosure.Enforcement)
+			assert.Equal(t, model.KeyScopeEnforcementGateway, disclosure.Enforcement)
 		})
 	}
 
@@ -8075,4 +8183,363 @@ func TestKeyScopeEnforcement_ReadsWhitespaceAsAbsent(t *testing.T) {
 		assert.Empty(t, disclosure.Prefix)
 		assert.Equal(t, model.KeyScopeEnforcementNone, disclosure.Enforcement)
 	})
+}
+
+// TestIssueSubscriberCredential_SucceedsOnceTheKeyScopeIsCleared pins that CLEARING the key
+// scope is an ordinary update and that issuance keeps working across it.
+//
+// It once asserted something stronger and now wrong: that issuance was REFUSED while a prefix
+// was recorded and recovered only once it was cleared. That refusal was retired — it implemented
+// no part of the key scope and withdrew a capability requirement R-7 makes mandatory — so what
+// remains worth pinning is that both states are provisionable and that clearing genuinely
+// clears, since a present empty string must remove the column rather than store an empty prefix.
+//
+// Issuance is exercised on BOTH sides of the update deliberately: the interesting failure now is
+// not a refusal but an asymmetry, where one of the two states works and the other does not.
+func TestIssueSubscriberCredential_SucceedsOnceTheKeyScopeIsCleared(t *testing.T) {
+	row := subscriberFixtureRow(t)
+	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
+
+	run := newSubscriberLifecycle(t).seeded(row)
+	admin, service := run.admin, run.service
+
+	scoped, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	require.NoError(t, err,
+		"a recorded key scope is issued to, and the response declares that the broker does not "+
+			"enforce it; withholding the credential implemented no part of the scope")
+	assert.NotEmpty(t, scoped.Password())
+
+	cleared := ""
+	updated, err := service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
+		PartitionKeyPrefix: &cleared,
+	})
+	require.NoError(t, err)
+	require.Nil(t, updated.PartitionKeyPrefix,
+		"a present empty string must CLEAR the column, not store an empty prefix")
+	assert.False(t, updated.DeclaresKeyScope())
+
+	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	require.NoError(t, err, "and clearing it must leave issuance working")
+	assert.NotEmpty(t, credential.Password())
+	assert.Equal(t, subscriberLifecycleSubscriberBrokers, credential.Brokers,
+		"the response carries the SUBSCRIBER-FACING list, not the addresses Blnk dials")
+	assert.NotEqual(t, admin.Brokers(), credential.Brokers,
+		"and the two are different lists: reporting the internal one would hand the subscriber "+
+			"an endpoint that does not resolve for it")
+}
+
+// TestIssueSubscriberCredential_StillNamesAnEndpointForAKeyScopedSubscriberWithoutAGateway is the
+// ordinary deployment: a key scope enforced by the in-binary stream gateway, with no EXTERNAL
+// gateway declared.
+//
+// # The substitution this guards, and why it needs its own test
+//
+// Where an external enforcing endpoint is declared, a key-scoped credential must name IT rather
+// than the brokers: that subscriber's connection is terminated by the gateway, and reporting a
+// bootstrap address would hand out a credential declaring gateway-enforced isolation together
+// with an endpoint that bypasses the gateway. TestIssueSubscriberCredential_ReportsTheGrant
+// ProvisioningConfirmed covers that case, and it declares a gateway to reach it.
+//
+// The substitution must not key on WHETHER the scope is enforced, because the answer to that is
+// always yes — streamGatewayEnforcesKeyScope — while the gateway ADDRESS is populated only by an
+// external declaration. Keying on the fact replaces the broker list with an empty one in every
+// ordinary deployment, and the subscriber is handed a credential naming nowhere to connect: a 200
+// whose failure surfaces as an unexplained connection error in somebody else's logs. Nothing else
+// in the suite would notice, because every other key-scoped issuance test declares a gateway
+// first and therefore takes the substituted path.
+//
+// The in-binary gateway needs no substitution: it is not a bootstrap endpoint but a route on
+// Blnk's own API. The broker list stays truthful for this subscriber precisely because its grant
+// is narrowed — Describe and no topic Read — so those addresses admit it to describe its topics
+// and refuse its every fetch, which is the boundary the response also declares.
+func TestIssueSubscriberCredential_StillNamesAnEndpointForAKeyScopedSubscriberWithoutAGateway(
+	t *testing.T,
+) {
+	row := subscriberFixtureRow(t)
+	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
+
+	// DELIBERATELY NOT enforceKeyScopeGateway: this is the deployment in which the only
+	// enforcement point is the one linked into the binary.
+	run := newSubscriberLifecycle(t).seeded(row)
+	admin, service := run.admin, run.service
+
+	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	require.NoError(t, err,
+		"a key-scoped row is issuable without an external gateway: the stream gateway in this "+
+			"binary is the enforcement point")
+
+	require.NotEmpty(t, credential.Brokers,
+		"AND THE CREDENTIAL MUST NAME SOMEWHERE TO CONNECT. An empty list here is the defect this "+
+			"test exists for: the subscriber cannot dial it, and it reads as an outage rather than "+
+			"as a misconfiguration")
+	assert.Equal(t, subscriberLifecycleSubscriberBrokers, credential.Brokers,
+		"and the endpoint is the subscriber-facing broker list, because no external gateway was "+
+			"declared to replace it")
+	assert.Equal(t, strings.Join(subscriberLifecycleSubscriberBrokers, ","), credential.BrokerEndpoint,
+		"the joined form travels in the same response and must agree with the list")
+	assert.NotEqual(t, admin.Brokers(), credential.Brokers,
+		"never the addresses Blnk dials, which do not resolve outside the deployment")
+	assert.NotEqual(t, subscriberLifecycleKeyScopeGatewayBrokers, credential.Brokers,
+		"and never a gateway this deployment never declared")
+
+	assert.Equal(t, model.KeyScopeEnforcementGateway, credential.KeyScopeEnforcement,
+		"the scope IS enforced — by the stream gateway on Blnk's own API — so the credential says "+
+			"so even though the endpoint it names is a broker list")
+	assert.Equal(t, "ldg_9f1c8a72", credential.PartitionKeyPrefix,
+		"and the subscriber is told the prefix its records are filtered by")
+}
+
+// TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber replaces the second half of the
+// old refusal, and pins the property that replaces it.
+//
+// Recording a prefix on a row that already holds a credential used to be refused, because the
+// live credential kept whole-topic Read while the row began announcing a narrower boundary. The
+// row is no longer making a claim about the broker: the scope is delivered at issuance, so a
+// consumer holding a credential minted under the previous scope is applying the previous scope,
+// and the remedy is to re-issue rather than to forbid the edit.
+//
+// That distinction is what is asserted: the update is accepted, the existing credential is NOT
+// revoked as a side effect of an edit that did not ask for it, and the newly recorded scope is
+// what the NEXT issuance delivers.
+func TestUpdateSubscriber_AcceptsAKeyScopeOnAProvisionedSubscriber(t *testing.T) {
+	run := newSubscriberLifecycle(t).seeded(subscriberProvisionedRow(t))
+
+	const scope = "ldg_9f1c8a72"
+
+	prefix := scope
+	updated, err := run.service.UpdateSubscriber(context.Background(), subscriberFixtureID, SubscriberUpdate{
+		PartitionKeyPrefix: &prefix,
+	})
+	require.NoError(t, err,
+		"recording a key scope on a provisioned subscriber must be accepted: the scope is a "+
+			"statement delivered at issuance, not a claim about the credential already out there")
+	require.NotNil(t, updated.PartitionKeyPrefix)
+	assert.Equal(t, scope, *updated.PartitionKeyPrefix)
+
+	require.NotNil(t, updated.CredentialReference,
+		"and the edit must not revoke a working credential nobody asked it to revoke")
+	assert.Zero(t, run.log.count("RevokeSubscriber"))
+
+	// The scope reaches a consumer on the NEXT issuance, which is the whole mechanism by which
+	// the edit takes effect.
+	credential, err := run.service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	require.NoError(t, err)
+	deliveredScope, brokerEnforced := credential.KeyScope()
+	assert.Equal(t, scope, deliveredScope,
+		"re-issuing is what hands the consumer its new boundary")
+	assert.False(t, brokerEnforced)
+}
+
+// TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope is the core of the
+// change: a recorded prefix is not a reason to withhold a credential.
+//
+// It asserts the whole outcome rather than only the absence of an error, because the previous
+// behaviour failed on every one of these points: a secret exists, the broker was asked to mint
+// it, the issuance is recorded, and the credential carries the prefix together with the fact
+// that its enforcement is consumer-side.
+func TestIssueSubscriberCredential_ProvisionsASubscriberThatRecordsAKeyScope(t *testing.T) {
+	row := subscriberFixtureRow(t)
+	row.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
+
+	run := newSubscriberLifecycle(t).seeded(row)
+	store, service := run.store, run.service
+
+	credential, err := service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	require.NoError(t, err,
+		"a recorded key scope must not withhold the credential: a subscriber with no credential "+
+			"consumes nothing, which is a wider gap than the one the refusal was closing")
+
+	assert.NotEmpty(t, credential.Password(), "the secret is returned once, and it must exist")
+	assert.False(t, credential.IssuedAt.IsZero())
+
+	assert.Equal(t, "ldg_9f1c8a72", credential.PartitionKeyPrefix,
+		"the subscriber must RECEIVE the scope it is expected to apply; a client that cannot see "+
+			"its own key scope cannot filter on it")
+	assert.Equal(t, model.KeyScopeEnforcementGateway, credential.KeyScopeEnforcement,
+		"and it must be told WHERE the scope is enforced, or the prefix reads as a broker boundary")
+
+	assert.Positive(t, run.log.count("ProvisionSubscriberPrincipal"),
+		"the broker is asked for the credential, which the refusal never did")
+	assert.Positive(t, run.log.count("RecordSubscriberCredentialIfUnchanged"))
+
+	stored, ok := store.row(subscriberFixtureID)
+	require.True(t, ok)
+	require.NotNil(t, stored.CredentialReference, "the issuance is recorded")
+	require.NotNil(t, stored.PartitionKeyPrefix,
+		"and the recorded scope survives issuance: it is a statement of intent, not a blocker")
+	assert.Equal(t, "ldg_9f1c8a72", *stored.PartitionKeyPrefix)
+
+	// THE BROKER-ENFORCED BOUNDARY IS UNCHANGED BY ANY OF THIS. The grant reported is the one
+	// the provisioning call returned, and the group is the subscriber's own — nothing was
+	// widened to compensate for the key scope, which is the mistake a prefixed TOPIC pattern
+	// would have been. The topic set is compared against the BROKER DOUBLE's result rather
+	// than the row, because that is what the real service reports: the topics provisioning
+	// confirms, not the topics that were asked for.
+	assert.Equal(t, run.admin.result.Topics, credential.AuthorizedTopics,
+		"the credential reports exactly the grant provisioning confirmed")
+	assert.Equal(t, row.ConsumerGroupID, credential.ConsumerGroupID)
+	assert.NotContains(t, credential.AuthorizedTopics, DLTFor(row.AuthorizedTopics[0]),
+		"and no dead-letter sibling is ever carried along with a category grant")
+}
+
+// TestIssueSubscriberCredential_FallsBackToTheConfiguredBrokerList is the R-10 half.
+//
+// KAFKA_SUBSCRIBER_BROKERS used to be a prerequisite, and issuance answered 503 without it.
+// That made a ninth variable mandatory for an endpoint the configuration contract describes
+// with eight: a deployment configured exactly as documented could publish every event and
+// still be refused every credential. So the internal list is now the REQUIRED FALLBACK — the
+// endpoint works — and the fact that it was used is warned about instead, because reporting an
+// internal address is right for an in-cluster subscriber and wrong for an external one, and
+// only an operator knows which.
+func TestIssueSubscriberCredential_FallsBackToTheConfiguredBrokerList(t *testing.T) {
+	run := newSubscriberLifecycle(t)
+
+	// Republished WITHOUT the subscriber-facing list, and with Kafka still configured: this is
+	// a deployment that publishes events perfectly well and has simply never been told what to
+	// tell a subscriber.
+	outboxStoreConfiguration(t, &config.Configuration{
+		Kafka: config.KafkaConfig{
+			Brokers:     []string{"broker-1:9092"},
+			TopicPrefix: "blnk",
+		},
+	})
+
+	hook := logtest.NewGlobal()
+
+	credential, err := run.service.IssueSubscriberCredential(context.Background(), subscriberFixtureID)
+	require.NoError(t, err,
+		"the eight required variables must be enough to make the credential endpoint work")
+
+	assert.Equal(t, []string{"broker-1:9092"}, credential.Brokers,
+		"with no advertised list configured the internal bootstrap list is reported")
+	assert.Equal(t, "broker-1:9092", credential.BrokerEndpoint)
+	assert.NotEmpty(t, credential.Password(), "a working credential is returned, not a refusal")
+	assert.Equal(t, 1, run.log.count("RecordSubscriberCredentialIfUnchanged"),
+		"and the issuance is recorded exactly once")
+
+	// AND THE SUBSTITUTION IS NOT SILENT, which is the whole reason a fallback is acceptable
+	// where a silent one would not be. The secret is shown exactly once, so a subscriber handed
+	// an address it cannot reach discovers that as a connection timeout days later, nowhere near
+	// the request that produced it; this line is what lets an operator connect the two without
+	// reissuing — which would invalidate the credential the subscriber is holding.
+	warned := false
+	for _, entry := range hook.AllEntries() {
+		if entry.Level == logrus.WarnLevel &&
+			strings.Contains(entry.Message, "KAFKA_SUBSCRIBER_BROKERS") {
+			warned = true
+		}
+	}
+	assert.True(t, warned,
+		"the fallback must WARN and name KAFKA_SUBSCRIBER_BROKERS: reporting the addresses Blnk "+
+			"dials is correct only for a subscriber inside this deployment, and an unreported "+
+			"substitution reaches the holder as an unexplained connection timeout")
+
+	// The internal addresses are still never presented as an advertised list: the response
+	// reports them because they are all there is, and the log says so.
+	assert.NotContains(t, credential.Brokers, "",
+		"no blank entry may reach the reported list; a subscriber would try to dial it")
+}
+
+// TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope is the guard on the
+// fail-closed floor beneath the subscriber stream gateway.
+//
+// # Why the floor still exists once the gateway does
+//
+// A row recording a partition_key_prefix describes a boundary Kafka's authorizer has no dimension
+// for. In THIS binary that boundary is real — aclEntries withholds topic Read from a key-scoped
+// principal, verifyKeyScopeBoundary proves the withholding before the password becomes
+// returnable, and the stream gateway filters every record by key — so issuance proceeds and
+// streamGatewayEnforcesKeyScope records why.
+//
+// Strip the enforcement point and the ONLY credential this service could mint reads every record
+// on every authorised topic, other ledgers' and other subscribers' included. Disclosing that in
+// the response was tried and is not a boundary: the party asked to apply the filter is the party
+// holding the credential. So the guard refuses, and the refusal has to be actionable — a caller
+// must be able to tell it from an outage and know what to change.
+//
+// The guard therefore takes the enforcement fact as a PARAMETER rather than reading the constant,
+// which is what keeps this refusal reachable and asserted rather than dead by construction.
+func TestRequireProvisionableKeyScope_RefusesOnlyWhereNothingEnforcesTheScope(t *testing.T) {
+	scoped := subscriberFixtureRow(t)
+	scoped.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
+
+	unscoped := subscriberFixtureRow(t)
+	unscoped.PartitionKeyPrefix = nil
+
+	t.Run("refused where nothing enforces it", func(t *testing.T) {
+		err := requireProvisionableKeyScope(&scoped, false)
+		require.Error(t, err,
+			"a recorded key prefix describes a boundary Kafka cannot keep, so without an "+
+				"enforcement point the only credential available is wider than the row says")
+
+		var apiErr apierror.APIError
+		require.ErrorAs(t, err, &apiErr)
+		assert.Equal(t, apierror.ErrSubscriberIsolationUnenforceable, apiErr.Code,
+			"the TYPED code, not a generic conflict: this refusal has a remedy CONFLICT cannot express")
+		assert.Equal(t, http.StatusConflict, apierror.StatusForCode(apiErr.Code),
+			"409, and never the 500 an unmapped code would resolve to: the request carries no body, "+
+				"nothing is unavailable and no retry helps — the row's state has to change")
+		assert.Contains(t, err.Error(), "Clear the partition key prefix",
+			"the refusal must name the remedy, or the endpoint is a dead end")
+		assert.Contains(t, err.Error(), "narrow the subscriber's authorized topics",
+			"and the enforceable alternative, which is what an operator wanting isolation needs")
+	})
+
+	t.Run("permitted where the stream gateway enforces it", func(t *testing.T) {
+		require.True(t, streamGatewayEnforcesKeyScope,
+			"this binary links the enforcement point in; the premise of the assertion below")
+		assert.NoError(t, requireProvisionableKeyScope(&scoped, streamGatewayEnforcesKeyScope),
+			"a key-scoped row must be provisionable where its scope is actually enforced — "+
+				"withholding the credential entirely is an absent boundary, not a narrower one")
+	})
+
+	t.Run("never engaged for a row that records no scope", func(t *testing.T) {
+		assert.NoError(t, requireProvisionableKeyScope(&unscoped, false),
+			"with no prefix recorded the topic grant IS the whole boundary and the broker keeps "+
+				"all of it, so there is nothing for this guard to refuse")
+		assert.NoError(t, requireProvisionableKeyScope(nil, false),
+			"and a nil row is not a refusal: the caller's own not-found handling owns that")
+	})
+}
+
+// TestRequireRecordableKeyScope_MirrorsTheIssuanceGuard pins the other half.
+//
+// Guarding only issuance would let "issue, then record" walk around the refusal: a subscriber
+// registered with no prefix is issued a whole-topic credential, and a later update records a
+// prefix onto the live principal. Where nothing enforces the scope that leaves exactly the state
+// the issuance guard exists to prevent, reached in two steps instead of one — so the same typed
+// code answers both orderings, and a client handling it from one endpoint needs no second case.
+//
+// Where the scope IS enforced the update is ACCEPTED and narrows the grant, which is asserted by
+// TestUpdateSubscriber_RecordsAKeyScopeOnAProvisionedSubscriberAndNarrowsTheGrant. Clearing a
+// prefix is never refused on either path, because it is the remedy the refusal names.
+func TestRequireRecordableKeyScope_MirrorsTheIssuanceGuard(t *testing.T) {
+	provisioned := subscriberFixtureRow(t)
+	provisioned.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
+	provisioned.CredentialReference = stringPointer("cref_live")
+
+	err := requireRecordableKeyScope(&provisioned, false)
+	require.Error(t, err, "recording a scope onto a live principal must be refused where nothing "+
+		"enforces it, or the issuance guard is decorative")
+
+	var apiErr apierror.APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, apierror.ErrSubscriberIsolationUnenforceable, apiErr.Code,
+		"one state, one code: the same refusal the credential endpoint answers with")
+
+	assert.NoError(t, requireRecordableKeyScope(&provisioned, streamGatewayEnforcesKeyScope),
+		"and under enforcement the update passes through: it NARROWS the grant rather than "+
+			"describing a boundary nobody keeps")
+
+	unprovisioned := subscriberFixtureRow(t)
+	unprovisioned.PartitionKeyPrefix = stringPointer("ldg_9f1c8a72")
+	unprovisioned.CredentialReference = nil
+	assert.NoError(t, requireRecordableKeyScope(&unprovisioned, false),
+		"a prefix on a row holding no credential is a legitimate statement of intent and always has been")
+
+	cleared := subscriberFixtureRow(t)
+	cleared.PartitionKeyPrefix = nil
+	cleared.CredentialReference = stringPointer("cref_live")
+	assert.NoError(t, requireRecordableKeyScope(&cleared, false),
+		"clearing a prefix must never be refused: it is the remedy the refusal itself names")
 }

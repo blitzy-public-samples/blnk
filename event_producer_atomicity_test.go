@@ -20,8 +20,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math/big"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1195,7 +1199,9 @@ func TestCheckBalanceMonitors_PublishesNothingWhenNoConditionIsMet(t *testing.T)
 
 	instance.checkBalanceMonitors(context.Background(), monitoredBalance(), balanceMonitorCapture{})
 
-	assert.Never(t, func() bool { return len(outboxPendingLegacyTasks(t, redisAddress)) > 0 },
+	// countPendingLegacyTasks rather than the T-taking reader: this condition runs on
+	// testify's goroutine, which may outlive the test.
+	assert.Never(t, func() bool { return countPendingLegacyTasks(redisAddress) > 0 },
 		waitForPostActions, pollPostActions,
 		"a condition that was not met must publish nothing at all")
 }
@@ -1439,12 +1445,18 @@ func requireLegacyDelivery(t *testing.T, redisAddress string, event NewWebhook) 
 	t.Helper()
 
 	require.Eventually(t, func() bool {
-		return len(outboxPendingLegacyTasks(t, redisAddress)) == 1
+		return countPendingLegacyTasks(redisAddress) == 1
 	}, waitForPostActions, pollPostActions,
 		"a webhook-only deployment must still receive %s; before the fallback was restored it "+
 			"was delivered by NEITHER transport", event.Event)
 
-	tasks := outboxPendingLegacyTasks(t, redisAddress)
+	// READ ONCE THE WINDOW HAS CLOSED, and through the error-returning reader rather than the
+	// counter: the assertions below are about the task's CONTENT, so a read failure has to be a
+	// test failure rather than a zero that reads as "no task".
+	tasks, listErr := pendingLegacyTasks(redisAddress)
+	require.NoError(t, listErr, "listing the pending legacy webhook tasks")
+	require.Len(t, tasks, 1, "exactly one legacy task must be pending for %s", event.Event)
+
 	assert.Equal(t, outboxLegacyQueueName, tasks[0].Queue,
 		"the task must land on the configured webhook queue, whose mux holds the handler")
 	assert.Equal(t, string(outboxLegacyWebhookBody(t, event)), string(tasks[0].Payload),
@@ -2073,3 +2085,102 @@ func (c *escalationCapture) await(t *testing.T) escalatedSystemError {
 // TestCheckBalanceMonitors_DeliversOverTheLegacyTransportWithoutKafka for the delivery,
 // TestCheckBalanceMonitors_SkipsAnAlertAlreadyCommittedWithItsMovement for the per-monitor skip,
 // and TestCheckBalanceMonitors_EscalatesALostAlert for the loss.
+
+// TestPolledConditions_CannotFailTheTestFromTestifysGoroutine is the guard on a defect class
+// that cost this package a whole run and blamed a test that had passed.
+//
+// # What went wrong
+//
+// assert.Never and require.Eventually evaluate their condition REPEATEDLY and on a goroutine of
+// testify's own, and they stop waiting for it once the window closes. A straggler evaluation can
+// therefore still be running after the test function has returned and after t.Cleanup has torn
+// down the miniredis server it reads. If that condition can fail the test — because it calls
+// require or assert, directly or through a helper that takes *testing.T — the report arrives
+// after completion, and Go's testing package turns it into "panic: Fail in goroutine after
+// <test> has completed", which fails the ENTIRE PACKAGE and names the wrong test. Under -race the
+// wider scheduling window made it the usual outcome rather than a rare one.
+//
+// # What this asserts
+//
+// No polled condition in this package's tests may touch the test at all: its job is to answer
+// true or false. A read that cannot be performed is "not yet satisfied" — which is the correct
+// answer for Never, and for Eventually leaves the loud failure to the timeout, on the test
+// goroutine where it is legal. Helpers for the two forms sit beside each other in
+// event_outbox_test.go: outboxPendingLegacyTasks for the test goroutine, countPendingLegacyTasks
+// for a condition.
+//
+// The WithT variants are exempt: they are handed an *assert.CollectT precisely so that a
+// condition CAN assert, and testify owns the reporting.
+func TestPolledConditions_CannotFailTheTestFromTestifysGoroutine(t *testing.T) {
+	t.Parallel()
+
+	sources, err := filepath.Glob("*_test.go")
+	require.NoError(t, err, "listing this package's test files")
+	require.NotEmpty(t, sources, "no test sources found, so this scan would prove nothing")
+
+	polled := map[string]struct{}{"Never": {}, "Eventually": {}}
+	scanned := 0
+
+	for _, source := range sources {
+		fileSet := token.NewFileSet()
+
+		parsed, parseErr := parser.ParseFile(fileSet, source, nil, parser.SkipObjectResolution)
+		require.NoErrorf(t, parseErr, "parsing %s", source)
+
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+
+			selector, isSelector := call.Fun.(*ast.SelectorExpr)
+			if !isSelector {
+				return true
+			}
+
+			pkg, isIdent := selector.X.(*ast.Ident)
+			if !isIdent || (pkg.Name != "assert" && pkg.Name != "require") {
+				return true
+			}
+
+			if _, isPolled := polled[selector.Sel.Name]; !isPolled {
+				return true
+			}
+
+			for _, argument := range call.Args {
+				literal, isLiteral := argument.(*ast.FuncLit)
+				if !isLiteral {
+					continue
+				}
+
+				scanned++
+
+				ast.Inspect(literal.Body, func(inner ast.Node) bool {
+					ident, isIdent := inner.(*ast.Ident)
+					if !isIdent || ident.Name != "t" {
+						return true
+					}
+
+					position := fileSet.Position(ident.Pos())
+					t.Errorf(
+						"%s:%d: a polled %s.%s condition uses the test (t). testify evaluates it on "+
+							"its own goroutine and stops waiting for it, so a straggler reports after "+
+							"the test has completed and Go panics with \"Fail in goroutine after … has "+
+							"completed\", failing the whole package and naming the wrong test. Return "+
+							"true or false instead, folding an unreadable dependency into \"not yet "+
+							"satisfied\" — see countPendingLegacyTasks",
+						position.Filename, position.Line, pkg.Name, selector.Sel.Name,
+					)
+
+					return false
+				})
+			}
+
+			return true
+		})
+	}
+
+	require.NotZero(t, scanned,
+		"no polled condition was found to inspect; the package uses assert.Never and "+
+			"require.Eventually, so finding none means this scan is broken rather than clean")
+}

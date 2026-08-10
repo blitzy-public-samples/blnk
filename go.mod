@@ -48,17 +48,41 @@ require (
 	github.com/typesense/typesense-go v1.1.0
 	github.com/wacul/ptr v1.0.0
 	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.60.0
-	go.opentelemetry.io/otel v1.43.0
-	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0
-	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.43.0
-	go.opentelemetry.io/otel/exporters/prometheus v0.64.0
-	go.opentelemetry.io/otel/exporters/stdout/stdoutlog v0.17.0
-	go.opentelemetry.io/otel/log v0.17.0
-	go.opentelemetry.io/otel/metric v1.43.0
-	go.opentelemetry.io/otel/sdk v1.43.0
-	go.opentelemetry.io/otel/sdk/log v0.17.0
-	go.opentelemetry.io/otel/sdk/metric v1.43.0
-	go.opentelemetry.io/otel/trace v1.43.0
+	// The OpenTelemetry Go modules are a SECURITY FLOOR at v1.44.0 (and the paired
+	// v0.65.0 / v0.18.0 releases of the exporter and log modules), not a preference.
+	//
+	// v1.43.0 and earlier are affected by the baggage-parsing denial-of-service
+	// advisory in go.opentelemetry.io/otel/baggage, and that code is REACHABLE ON
+	// EVERY REQUEST here rather than latent: internal/traces/otel.go installs a
+	// composite propagator that includes baggage propagation, and the otelgin
+	// middleware in api/api.go extracts it from inbound headers. An attacker-supplied
+	// `baggage` header is therefore parsed before any handler runs. v1.44.0 is the
+	// first release the advisory records as patched.
+	//
+	// Keep the whole family on one release line. The three module groups version
+	// independently — stable at v1.x, exporters and the log signal at v0.x — so the
+	// mapping is: otel/metric/trace/sdk/sdk-metric and the OTLP exporters at v1.44.0,
+	// exporters/prometheus at v0.65.0, log/sdk-log/stdoutlog at v0.18.0. Mixing lines
+	// compiles and then fails at run time on an interface the SDK and API disagree
+	// about.
+	//
+	// otelgin is deliberately NOT moved in step. It is a contrib module on its own
+	// v0.x line, it contains no baggage parser, and minimal version selection already
+	// resolves go.opentelemetry.io/otel to the v1.44.0 required above, so the patched
+	// parser is what the binary links. The contrib release paired with v1.44.0
+	// (v0.69.0) additionally requires a newer gin, and upgrading the HTTP framework
+	// inside a security patch is a blast radius this change has no reason to take on.
+	go.opentelemetry.io/otel v1.44.0
+	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.44.0
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.44.0
+	go.opentelemetry.io/otel/exporters/prometheus v0.65.0
+	go.opentelemetry.io/otel/exporters/stdout/stdoutlog v0.18.0
+	go.opentelemetry.io/otel/log v0.18.0
+	go.opentelemetry.io/otel/metric v1.44.0
+	go.opentelemetry.io/otel/sdk v1.44.0
+	go.opentelemetry.io/otel/sdk/log v0.18.0
+	go.opentelemetry.io/otel/sdk/metric v1.44.0
+	go.opentelemetry.io/otel/trace v1.44.0
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sync v0.20.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -89,7 +113,7 @@ require (
 	github.com/go-sql-driver/mysql v1.9.1 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/gorilla/mux v1.8.0 // indirect
-	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
+	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
@@ -109,7 +133,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
-	github.com/prometheus/procfs v0.19.2 // indirect
+	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/sony/gobreaker v0.5.0 // indirect
 	github.com/spf13/cast v1.7.0 // indirect
@@ -126,12 +150,12 @@ require (
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
-	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.43.0 // indirect
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.44.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
-	go.yaml.in/yaml/v2 v2.4.3 // indirect
+	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	golang.org/x/arch v0.14.0 // indirect
 	golang.org/x/mod v0.35.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
@@ -139,8 +163,8 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.8.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
-	google.golang.org/grpc v1.80.0 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
+	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )

@@ -1842,9 +1842,29 @@ func (d Datasource) ClearSubscriberWebhookURL(ctx context.Context, subscriberID 
 // CREATES one. The purge is what cleans up the ones that predate or bypass it.
 //
 // Returns ErrGenConflict when the row still holds a URL and ErrSubscriberNotFound when
-// there is no such subscriber. Both arrive as zero rows affected, so they are told
-// apart by re-reading the row rather than guessed at — reporting "not found" for a
-// subscriber that plainly exists would send an operator looking for the wrong problem.
+// there is no such subscriber. Reporting "not found" for a subscriber that plainly
+// exists would send an operator looking for the wrong problem, so the two are told
+// apart — and, per RACE-01 below, they are told apart from the SAME snapshot that
+// refused the write rather than by a second look at the row.
+//
+// # RACE-01: one statement decides the outcome AND names it
+//
+// The write and the explanation used to be two statements. The UPDATE narrowed on
+// `webhook_url IS NULL`, and when it affected no row a separate, unlocked `SELECT 1`
+// decided whether that meant "the row exists and held a URL" (conflict) or "there is no
+// such row" (not found). Between the two, another session could delete the subscriber,
+// re-create it, or clear its URL — so the answer described a state that was never the
+// one the write was refused against. Nothing was corrupted by that, but the typed code
+// and the remedy in the message could both be wrong, and a wrong remedy on a migration
+// step is an operator editing the wrong row.
+//
+// The statement below is therefore ONE round trip whose first CTE locks the candidate
+// row with FOR UPDATE, whose second CTE performs the conditional stamp against that
+// locked row, and whose final SELECT reports both facts — whether the row was stampable
+// and whether it was stamped — from the same snapshot. Zero rows returned means the
+// subscriber does not exist, which is now a fact about the locked read rather than a
+// guess made afterwards; a concurrent session that wants to change the row waits for
+// this transaction instead of racing it.
 func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID string, migratedAt time.Time) error {
 	ctx, span := otel.Tracer("transaction.database").Start(ctx, "MarkSubscriberMigrated")
 	defer span.End()
@@ -1861,26 +1881,62 @@ func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID str
 	}
 	span.SetAttributes(attribute.String("subscriber.id", subscriberID))
 
-	result, err := d.Conn.ExecContext(ctx, `
-		UPDATE blnk.event_subscribers
-		SET migrated_at = $1,
-			updated_at = $2
-		WHERE subscriber_id = $3
-		  AND webhook_url IS NULL
-	`, migratedAt, time.Now(), subscriberID)
-	if err != nil {
+	// One row is returned when the subscriber exists, and none when it does not — which is
+	// what makes "not found" a fact about the locked read rather than a second guess. The
+	// single column reports whether the conditional stamp inside the same statement landed.
+	var stamped bool
+
+	err := d.Conn.QueryRowContext(ctx, `
+		WITH target AS (
+			SELECT subscriber_id,
+			       (webhook_url IS NULL) AS stampable
+			FROM blnk.event_subscribers
+			WHERE subscriber_id = $3
+			FOR UPDATE
+		),
+		stamped AS (
+			UPDATE blnk.event_subscribers AS s
+			SET migrated_at = $1,
+				updated_at = $2
+			FROM target AS t
+			WHERE s.subscriber_id = t.subscriber_id
+			  AND t.stampable
+			RETURNING s.subscriber_id
+		)
+		SELECT EXISTS (SELECT 1 FROM stamped) AS stamped
+		FROM target AS t
+	`, migratedAt, time.Now(), subscriberID).Scan(&stamped)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// The locked read matched nothing, so there is no subscriber to stamp. This is the
+		// answer the separate existence probe used to guess at.
+		refusal := apierror.NewAPIError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, nil)
+		failDatabaseSpan(span, refusal)
+
+		return refusal
+
+	case err != nil:
 		failDatabaseSpan(span, err)
+
 		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark subscriber migrated", "mark_subscriber_migrated", err)
 	}
 
-	affected, err := result.RowsAffected()
-	if err != nil {
-		failDatabaseSpan(span, err)
-		return loggedDatabaseError(apierror.ErrInternalServer, "Failed to mark subscriber migrated", "mark_subscriber_migrated", err)
-	}
-
-	if affected == 0 {
-		refusal := d.explainRefusedMigrationStamp(ctx, subscriberID)
+	if !stamped {
+		// The row exists and the predicate declined it, which — subscriber_id being the only
+		// other term — means webhook_url was non-NULL on the row this statement locked.
+		refusal := apierror.NewAPIError(
+			apierror.ErrGenConflict,
+			"This subscriber still has a legacy webhook URL recorded, so it cannot be marked "+
+				"migrated on its own. Complete the migration instead, which forgets the URL and "+
+				"records the instant together.",
+			errors.New(
+				"database: migrated_at was not stamped because webhook_url is still set; a row "+
+					"holding both asserts that the subscriber has and has not stopped receiving "+
+					"legacy pushes. Use CompleteSubscriberWebhookMigration, which moves both "+
+					"columns in one statement",
+			),
+		)
 		failDatabaseSpan(span, refusal)
 
 		return refusal
@@ -1893,61 +1949,23 @@ func (d Datasource) MarkSubscriberMigrated(ctx context.Context, subscriberID str
 	return nil
 }
 
-// explainRefusedMigrationStamp tells the two reasons MarkSubscriberMigrated updated no
-// row apart, by re-reading the row the statement declined to touch.
+// explainRefusedMigrationStamp HAS BEEN REMOVED, and its absence is RACE-01.
 //
-// A subscriber that exists is a subscriber whose webhook_url was non-NULL when the
-// statement ran, because subscriber_id is the only other term in the predicate. That is
-// the conflict, and it is reported as one. No row at all is a plain not-found.
+// It existed because MarkSubscriberMigrated's conditional UPDATE could not say WHY it had
+// affected no row: both "no such subscriber" and "the row still holds a webhook_url" arrive
+// as zero rows affected, so a second, unlocked `SELECT 1` was issued to tell them apart.
 //
-// A URL cleared concurrently between the two statements also lands here and is reported
-// as the conflict, which is the correct answer for the attempt that was refused: the
-// state it was refused against was real, and the caller's remedy — repeat the
-// request — succeeds on the next try.
+// That second read was a different snapshot from the one the write was refused against. A
+// concurrent delete, a delete-and-recreate, or a URL cleared in between all produced an
+// answer describing a state the refused write had never seen — a webhook conflict reported
+// for a subscriber that no longer existed, or a not-found for one that plainly did. No state
+// was corrupted, but the typed code and the operator remedy in the message could both be
+// wrong, and on a migration step a wrong remedy is an operator editing the wrong row.
 //
-// The read failing is reported as an internal error rather than being collapsed into
-// either answer, because "we could not tell you why" is a different fact from either
-// reason and only one of the three is the caller's to fix.
-//
-// It probes EXISTENCE rather than re-reading webhook_url, because the answer does not
-// depend on the column's value now. subscriber_id is the only other term in the refused
-// predicate, so a row that exists is a row the URL predicate declined — and if the URL
-// was cleared in between, the refusal still describes the attempt that was actually
-// made, whose remedy is to repeat it.
-func (d Datasource) explainRefusedMigrationStamp(ctx context.Context, subscriberID string) error {
-	var exists int
-
-	err := d.Conn.QueryRowContext(ctx, `
-		SELECT 1
-		FROM blnk.event_subscribers
-		WHERE subscriber_id = $1
-	`, subscriberID).Scan(&exists)
-
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return apierror.NewAPIError(apierror.ErrSubscriberNotFound, subscriberNotFoundMessage, nil)
-	case err != nil:
-		return loggedDatabaseError(
-			apierror.ErrInternalServer,
-			"Failed to mark subscriber migrated",
-			"explain_refused_migration_stamp",
-			err,
-		)
-	default:
-		return apierror.NewAPIError(
-			apierror.ErrGenConflict,
-			"This subscriber still has a legacy webhook URL recorded, so it cannot be marked "+
-				"migrated on its own. Complete the migration instead, which forgets the URL and "+
-				"records the instant together.",
-			errors.New(
-				"database: migrated_at was not stamped because webhook_url is still set; a row "+
-					"holding both asserts that the subscriber has and has not stopped receiving "+
-					"legacy pushes. Use CompleteSubscriberWebhookMigration, which moves both "+
-					"columns in one statement",
-			),
-		)
-	}
-}
+// The classification now comes from the SAME statement that performs the write: a FOR UPDATE
+// CTE locks the candidate row, a data-modifying CTE stamps it if the predicate allows, and
+// the statement's own result reports whether it landed. Zero rows returned is the not-found,
+// observed under the lock. There is nothing left for a follow-up read to explain.
 
 // CompleteSubscriberWebhookMigration forgets a subscriber's legacy endpoint and records that it
 // has finished moving to Kafka — in ONE statement.

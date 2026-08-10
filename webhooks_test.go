@@ -34,7 +34,6 @@ import (
 	"github.com/blnkfinance/blnk/model"
 	"github.com/hibiken/asynq"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,26 +46,18 @@ import (
 //     claimed blnk.event_outbox row. That change of caller is asserted by driving the
 //     relay's processBatch directly against substituted store and Kafka seams.
 //
-//  2. PUBLISHER CONSTRUCTION WITH NO KAFKA. Every test constructs NewBlnk(nil) with a nil
-//     datasource and no Kafka configuration, so what is proven is construction: an
-//     unconfigured broker list selects the no-op publisher, returns a nil error, dials
-//     nothing and blocks on nothing, and the legacy enqueue keeps working when called
-//     directly. A failure or a hang here means initializeEventPublisher in blnk.go is
-//     wrong, not that an assertion needs relaxing.
+//  2. PUBLISHER CONSTRUCTION, both with and without Kafka. The construction tests pass a nil
+//     datasource to NewBlnk, so what they prove is construction and nothing about delivery:
+//     an unconfigured or blank broker list selects the no-op publisher, returns a nil error,
+//     dials nothing and blocks on nothing; a CONFIGURED broker list does not select the no-op,
+//     and in both cases the pooled HTTP client, its timeouts and the legacy enqueue are
+//     unchanged. A failure or a hang here means initializeEventPublisher in blnk.go is wrong,
+//     not that an assertion needs relaxing.
 //
 // Scope deliberately held elsewhere: payload equivalence between the two transports is
 // event_dual_delivery_test.go's subject (acceptance criterion V-8), the sunset date
-// arithmetic is event_sunset_test.go's, and no Kafka client is imported here.
-
-// MockConfigFetcher is a mock for the config fetching
-type MockConfigFetcher struct {
-	mock.Mock
-}
-
-func (m *MockConfigFetcher) Fetch() (*config.Configuration, error) {
-	args := m.Called()
-	return args.Get(0).(*config.Configuration), args.Error(1)
-}
+// arithmetic is event_sunset_test.go's, and no Kafka CLIENT is imported here — the
+// configured-broker case names a black-holed address precisely so that nothing dials.
 
 func TestSendWebhook(t *testing.T) {
 	mr := miniredis.RunT(t)
@@ -579,11 +570,12 @@ func newBlnkWithinLegacyWebhookBudget(t *testing.T) (*Blnk, error) {
 // reaches neither a resolver nor a socket, while the legacy HTTP client is left intact. It says
 // nothing about whether an event reaches a subscriber — no relay and no worker run here.
 //
-// The four legacy tests above all construct NewBlnk(nil) with no Kafka configuration, so they
-// depend silently on that behaviour; were construction to fail or dial, they would break for a
-// reason unrelated to webhooks and the fix would be in initializeEventPublisher (blnk.go). The
-// cases are therefore named after the tests whose input they reproduce; blnk_test.go states the
-// same property generally over its own fixtures.
+// The legacy tests above run with no Kafka configuration, and the ones that build a service
+// container do it through NewBlnk(nil), so they depend silently on this behaviour; were
+// construction to fail or dial, they would break for a reason unrelated to webhooks and the fix
+// would be in initializeEventPublisher (blnk.go). The cases below are therefore named after the
+// tests whose CONFIGURATION they reproduce rather than after the call they make; blnk_test.go
+// states the same property generally over its own fixtures.
 //
 // The blank-broker case matters: treated as an address rather than as absence, "   " would
 // produce a Kafka publisher that can never connect while nothing in the configuration looked

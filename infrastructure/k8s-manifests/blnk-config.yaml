@@ -132,15 +132,25 @@ data:
   # Set this to the address of whatever exposes the broker's external listener —
   # a LoadBalancer, NodePort or Ingress — which is knowledge only an operator has.
   #
-  # IT IS AN OPTIONAL OVERRIDE. Empty makes issuance report KAFKA_BROKERS and log
-  # that it did, at start-up and on every issuance, because the eight variables the
-  # configuration contract requires must be enough to run every documented endpoint
-  # and this is not one of them. A cluster whose subscribers run inside it needs
-  # nothing here; one whose subscribers are outside must set it, or those
-  # subscribers receive an address that does not resolve for them.
+  # IT IS REQUIRED FOR CREDENTIAL ISSUANCE. Empty makes
+  # POST /subscribers/{id}/kafka-credentials answer 503 SUBSCRIBER_BROKERS_NOT_CONFIGURED
+  # naming this key, and no credential is created. There is NO fallback to
+  # KAFKA_BROKERS.
+  #
+  # A fallback existed, with a warning on every issuance, and the warning was not a
+  # control: it landed in Blnk's log while the consequence landed on the subscriber.
+  # An internal Service name reported to an outside subscriber surfaces as an
+  # unexplained connection timeout in THEIR logs days later, and because the SASL
+  # secret is shown exactly once, diagnosing it costs a reissue. Refusing is the
+  # cheaper failure: immediate, it names the key to set, and it discloses no
+  # internal address.
+  #
+  # Every other endpoint runs without this. A cluster whose subscribers really do
+  # run inside it sets this to the same value as KAFKA_BROKERS, which makes that
+  # claim explicit in one line rather than implicit in a fallback.
   #
   # Empty ships here because KAFKA_BROKERS above is empty: with no broker there is
-  # no issuance at all.
+  # no issuance to refuse.
   KAFKA_SUBSCRIBER_BROKERS: ""
 
   # The prefix every topic name derives from: the category topics
@@ -337,7 +347,12 @@ data:
   # blnk_kafka_subscribers_unmeasured{reason="budget"} beside the registry size as
   # blnk_subscribers_registered, and SubscriberLagCoverageIncomplete fires on any
   # non-zero shortfall — so the gap is visible rather than silent, but visible is
-  # not measured. Read the reason label before acting: the gauge's other four
+  # not measured. WHATEVER IS SET HERE IS EXPORTED as
+  # blnk_subscribers_measurement_budget, so headroom is that gauge minus
+  # blnk_subscribers_registered and goes negative BEFORE the shortfall shows; a
+  # dashboard must subtract the two series rather than hardcoding this number,
+  # which would read a raised budget as exhausted far too early.
+  # Read the reason label before acting: the gauge's other four
   # values (unprovisioned, measure_failed, registry_failed, topic_missing) are
   # gaps this number cannot close.
   #
@@ -354,23 +369,68 @@ data:
 
   # How many days an outbox row is kept before the purge removes it.
   #
-  # 90 DAYS IS SHIPPED, not 0, and the change matters. What this table holds is
-  # sensitive: each row's payload is the webhook body verbatim, so a transaction
-  # event carries amounts and balance identifiers and an identity event carries
-  # names, email addresses, phone numbers, postal addresses and dates of birth.
-  # Retention disabled by default turned the delivery buffer into an unbounded
-  # second copy of the ledger's most sensitive data, with none of the access
-  # controls the primary tables have around it, growing for the life of the
+  # A FINITE VALUE IS SHIPPED, not 0, and the change matters. What this table
+  # holds is sensitive: each row's payload is the webhook body verbatim, so a
+  # transaction event carries amounts and balance identifiers and an identity
+  # event carries names, email addresses, phone numbers, postal addresses and
+  # dates of birth. Retention disabled by default turned the delivery buffer into
+  # an unbounded second copy of the ledger's most sensitive data, with none of the
+  # access controls the primary tables have around it, growing for the life of the
   # deployment. A finite default with a documented reason to change it is the
   # safer shipping position; "0" still disables the purge entirely for a
   # deployment under a legal hold that requires it.
   #
-  # REVIEW THIS AGAINST YOUR OWN RETENTION POLICY before going to production.
-  # 90 days comfortably covers the daily zero-loss reconciliation window (the
-  # procedure in docs/kafka-operations.md compares these rows against Kafka
-  # offsets) while not keeping personal data indefinitely. A jurisdiction, an
-  # audit programme or a legal hold may require longer; a stricter data-retention
-  # obligation may require shorter.
+  # ===================================================================
+  # PERF-C03: WHY 3 AND NOT 90, AND HOW TO CHANGE IT SAFELY
+  #
+  # This shipped 90. Ninety days was chosen against data-protection reasoning
+  # alone, with no storage arithmetic behind it and no reference to the two other
+  # settings it is coupled to, and it was wrong on BOTH counts:
+  #
+  #   * STORAGE. sql/1781248800.sql now carries the measured cost of a row:
+  #     2,372 bytes including all seventeen indexes, of which roughly 88% is the
+  #     event body held three times over. At the 500-events-per-second throughput
+  #     acceptance criterion V-1 validates, that is 95.4 GiB a day, so 90 days is
+  #     a steady state of 8.4 TiB before bloat headroom — against a pg-data volume
+  #     that shipped at 10Gi. The two numbers were set roughly 858x apart. That is
+  #     not "keeps more history": the outbox shares its volume with the LEDGER, so
+  #     it is ledger unavailability with a retention period as the cause.
+  #
+  #   * THE BROKER COUPLING. kafka-statefulset.yaml states, at its own
+  #     log.retention.hours, that broker retention must stay LONGER than this
+  #     value — the daily outbox-versus-offset reconciliation can only compare a
+  #     window both sides still hold, and outbox rows outliving their records
+  #     leaves rows with nothing to reconcile against. The broker ships 168 hours,
+  #     which is 7 days. Ninety days violated that outright, and the sibling
+  #     comment's claim that "nothing is currently in tension" was stale the
+  #     moment a non-zero value was shipped here.
+  #
+  # THREE DAYS is the value all four constraints agree on:
+  #
+  #   1. It is at least the reconciliation window. GET /events/stats measures over
+  #      24 hours and cannot be asked for more, so anything the endpoint can look
+  #      back over is retained.
+  #   2. It carries two days of margin on that, so a reconciliation that is run
+  #      late, skipped, or spans a Friday-to-Monday gap still has both sides.
+  #   3. It is well inside the broker's 7 days, so the coupling holds with room to
+  #      raise this before the broker has to move too.
+  #   4. It is 429 GiB of steady state at the validated rate (3 x 95.4 GiB x 1.5
+  #      bloat headroom), which the pg-data volume is now sized for.
+  #
+  # RAISING IT REQUIRES TWO OTHER CHANGES IN THE SAME COMMIT: the pg-data
+  # volumeClaimTemplate in postgres-statefulset.yaml, by 143 GiB per extra day at
+  # 500 events/second, and — above 7 days — log.retention.hours in
+  # kafka-statefulset.yaml. Lowering it requires neither.
+  #
+  # RUNNING WELL BELOW 500 EVENTS/SECOND? The demand scales linearly. Recompute
+  # with `GiB/day = rate x 86400 x 2372 / 1024^3` and size the volume from your
+  # own figure rather than inheriting one derived from the validated peak.
+  #
+  # REVIEW THIS AGAINST YOUR OWN RETENTION POLICY before going to production. A
+  # jurisdiction, an audit programme or a legal hold may require longer — in which
+  # case raise the volume with it; a stricter data-retention obligation may
+  # require shorter, which costs nothing.
+  # ===================================================================
   #
   # TWO POPULATIONS, TWO LIFECYCLES:
   #
@@ -387,7 +447,7 @@ data:
   #   * pending, processing, replaying and failed rows are never purged at all. A
   #     failed row still owes its <topic>.dlt write, so this table is the only copy
   #     of that event in existence.
-  RELAY_EVENT_RETENTION_DAYS: "90"
+  RELAY_EVENT_RETENTION_DAYS: "3"
 
   # PURGE CAPACITY: how fast the retention period above is ENFORCED, which is a
   # separate question from how long the period is. The two multiply, and the
@@ -395,13 +455,26 @@ data:
   #
   #     rows deleted per hour = MAX_BATCHES_PER_SWEEP x BATCH_SIZE
   #
-  # These values give 2,000,000 rows an hour. Compare that against this
+  # These values give 4,000,000 rows an hour. Compare that against this
   # deployment's event arrival rate before changing either. Capacity BELOW the
   # arrival rate does not slow the table's growth, it permits it: the sweeper
   # never catches up, the oldest eligible rows are never reached, and the
   # retention period above is not enforced however short it is set. At the
   # throughput this system is validated against — 500 events a second — rows
-  # arrive at 1,800,000 an hour, so the defaults clear peak with room to spare.
+  # arrive at 1,800,000 an hour.
+  #
+  # PERF-C03: MAX_BATCHES_PER_SWEEP was 2000, giving 2,000,000 an hour. That is
+  # 1.11x the arrival rate, and 11% headroom is not headroom on a mechanism that
+  # cannot catch up once it falls behind: one sweep cut short by the ten-minute
+  # timeout leaves a deficit that takes ten hours of steady state to work off, and
+  # the deficit is measured in rows that the retention period says should already
+  # be gone. 4000 gives 2.2x, which recovers a missed sweep inside one hour.
+  #
+  # It costs nothing in steady state. The ceiling bounds what ONE sweep may
+  # attempt; a sweep stops as soon as it runs out of ELIGIBLE rows, so at 500
+  # events a second it still deletes 1,800,000 and stops. The ceiling is only
+  # reached while catching up, which is exactly when the extra capacity is wanted,
+  # and a sweep that reaches it is bounded by the ten-minute timeout regardless.
   #
   # BATCH_SIZE is the lock-footprint factor: each DELETE takes row locks and
   # writes WAL for what it removes, on a table the relay is claiming from
@@ -419,7 +492,7 @@ data:
   # whenever retention is enabled, and a sweep that exhausts its ceiling with
   # rows still eligible logs a warning naming both variables.
   RELAY_EVENT_RETENTION_BATCH_SIZE: "1000"
-  RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP: "2000"
+  RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP: "4000"
 
   # The RFC3339 instant at which the legacy HTTP webhook transport is retired.
   # Until then Kafka publishing and webhook delivery run from the same outbox
@@ -473,13 +546,14 @@ data:
   # A cluster ID is the base64url encoding of a 16-byte UUID: exactly 22 characters
   # from [A-Za-z0-9_-]. Generate one and put it here:
   #
-  #   docker run --rm apache/kafka:3.9.2 /opt/kafka/bin/kafka-storage.sh random-uuid
+  #   docker run --rm apache/kafka:4.3.1 /opt/kafka/bin/kafka-storage.sh random-uuid
   #   kubectl -n blnk patch configmap blnk-config --type merge \
   #     -p '{"data":{"KAFKA_CLUSTER_ID":"<the 22-character value>"}}'
   #
   # The init container validates the length and the alphabet BEFORE formatting,
   # which is the only point at which a wrong value is still recoverable. Note that
-  # apache/kafka 3.9's format tool itself does not check either: it writes whatever
+  # apache/kafka's format tool itself does not check either, on 3.9, 4.0 or 4.3: it
+  # writes whatever
   # string it is given and the broker starts on it, so a value that is not a real
   # UUID works until something parses it as one — and by then the volume carries it.
   KAFKA_CLUSTER_ID: ""

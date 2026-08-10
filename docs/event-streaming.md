@@ -1,6 +1,6 @@
 # Blnk Event Streaming Reference
 
-Blnk publishes every ledger mutation to Kafka as a `LedgerEvent`. This document is the subscriber-facing contract: the topics you consume, the JSON envelope you receive, the guarantees Blnk makes, the obligations it leaves to you, and the topic names Blnk reserves for itself. It replaces the legacy HTTP webhook push, which is retired at the end of the migration window.
+Blnk publishes every event that was formerly routed through the legacy webhook sender to Kafka as a `LedgerEvent` — all thirteen catalogue entries, with no exceptions. That is a wider set than "every ledger mutation": most entries do describe a mutation, but `balance.monitor` reports a threshold being crossed and `system.error` reports that something failed, and neither is a mutation of the ledger. What every entry has in common is the transport it used to take. This document is the subscriber-facing contract: the topics you consume, the JSON envelope you receive, the guarantees Blnk makes, the obligations it leaves to you, and the topic names Blnk reserves for itself. It replaces the legacy HTTP webhook push, which is retired at the end of the migration window.
 
 The legacy HTTP webhook transport runs alongside Kafka for a fixed 30-day window and is then
 retired. The window and the retirement are both governed by one setting,
@@ -12,7 +12,8 @@ delivered and Kafka is the only transport.
 **What the sunset instant does, and what it does not do.** Passing the date is a *runtime* change
 only. Delivery stops, and the deprecated webhook-subscription routes begin answering `410 Gone`.
 It does **not** remove any code: the legacy sender, its asynq handler and its configuration block
-are all still present and are deleted in a later, manual release. Two consequences follow, and
+are all still present and are deleted in a later, manual release, whose first step — relocating the
+two payload-contract symbols out of `webhooks.go` — is already done. Two consequences follow, and
 both matter operationally:
 
 - The change is reversible by configuration. Moving the date back into the future restores dual
@@ -22,21 +23,34 @@ both matter operationally:
 
 ## Prerequisites
 
-- A Kafka cluster reachable from the Blnk server and worker roles, on a release that is both
-  **capable** and **patched**. Those are two different floors and both apply:
+- A Kafka cluster reachable from the Blnk **server** role, on a release that is both **capable** and
+  **patched**. The server is the only process that dials Kafka: it hosts the outbox relay, which is
+  the sole publisher, and it builds the administrative client that provisions subscribers and reads
+  offsets. The **worker** role needs no broker access at all — it captures events as rows in
+  `blnk.event_outbox` inside the ledger's own transaction and resolves to the no-op publisher — so a
+  deployment gives it no Kafka credential and nothing about it waits on the broker. (The local
+  Compose stack's `kafka-init` one-shot dials the broker too, to provision the catalogue.) Two
+  version floors apply to whichever release you run:
   - **Feature floor — 3.5.** `kafka-storage format --add-scram` arrived in Kafka 3.5, and SASL/SCRAM
     in KRaft mode cannot be bootstrapped without it. Nothing below 3.5 can run this pipeline.
-  - **Supported floor — 3.9.2 on the 3.x line.** 3.5 being capable does not make it safe: the
-    releases between 3.5 and 3.9.1 carry published Apache Kafka security advisories. Run an
-    advisory-fixed release — 3.9.2 or later on 3.x, which is what this repository pins for its
-    own broker (`apache/kafka:3.9.2` in the Compose stack and in the Kubernetes StatefulSet) — or
-    a correspondingly patched 4.x release. Treat 3.5 as the oldest release the *feature* exists
-    in, never as a version to deploy.
+  - **Security floor — the highest advisory floor, currently 4.2.0.** 3.5 being capable does not
+    make it safe: four advisories bear on this image, three with ranges firm enough to pin
+    against, and the highest of those floors is 4.2.0. Run an advisory-fixed release. This
+    repository pins `apache/kafka:4.3.1` **by immutable digest** for its own broker, the same
+    digest in the Compose stack and in the Kubernetes StatefulSet, so local development and
+    production run identical bytes. `.env.example` carries the per-advisory table at
+    `KAFKA_IMAGE`, and `docs/kafka-operations.md` carries the three checks to re-run before
+    moving off the pin. Treat 3.5 as the oldest release the *feature* exists in, never as a
+    version to deploy.
 - `KAFKA_BROKERS` configured on Blnk. **With no brokers configured Blnk publishes nothing to
   Kafka** — the event relay does not start, and a deployment that still has `BLNK_WEBHOOK_URL`
-  (`notification.webhook.url`) set keeps receiving the legacy HTTP webhook instead. That is a
-  supported steady state, not an error, and it is what lets a deployment migrate on its own
-  schedule. See [Running without Kafka is supported](#running-without-kafka-is-supported).
+  (`notification.webhook.url`) set keeps receiving the legacy HTTP webhook instead, **provided the
+  configured sunset has not passed**. That combination is a supported steady state, not an error,
+  and it is what lets a deployment migrate on its own schedule. An empty broker list *together
+  with* a sunset instant that has already passed is the one configuration that delivers nothing at
+  all, because the sunset retires the legacy leg without checking that a replacement exists. See
+  [Running without Kafka is supported](#running-without-kafka-is-supported), which sets both cases
+  out side by side.
 - Credentials issued for your subscriber. Each subscriber is a Kafka principal whose ACLs are
   scoped to its authorised topics and its consumer-group namespace — see
   [Getting Access](#getting-access).
@@ -54,7 +68,7 @@ Events are grouped into four **category topics**, each with a **dead-letter sibl
 
 All four categories are grantable. There is no internal-only topic in this inventory, so what a
 given subscriber can read is decided entirely by the grant it was issued rather than by any
-category being withheld from everyone. Read [what granting `blnk.system` discloses](#what-granting-blnksystem-discloses)
+category being withheld from everyone. Read [what granting `blnk.system` discloses](#why-four-categories-and-what-blnksystem-costs-you)
 before granting it.
 
 ### The topic prefix
@@ -203,7 +217,7 @@ Thirteen catalogue entries, and this is the complete set. Twelve are fixed names
 | `balance.created` | `blnk.balances` | A balance is created. |
 | `balance.monitor` | `blnk.balances` | A balance monitor's condition is met. Fires on every occurrence, so the same monitor produces many of these. |
 | `identity.created` | `blnk.identities` | An identity is created. |
-| `ledger.created` | `blnk.system` | A ledger is created. Ask your operator for `blnk.system` in your `authorized_topics` — it is granted deliberately rather than by default, because it shares the category with `system.error`. See [what granting `blnk.system` discloses](#what-granting-blnksystem-discloses). |
+| `ledger.created` | `blnk.system` | A ledger is created. Ask your operator for `blnk.system` in your `authorized_topics` — it is granted deliberately rather than by default, because it shares the category with `system.error`. See [what granting `blnk.system` discloses](#why-four-categories-and-what-blnksystem-costs-you). |
 | `system.error` | `blnk.system` | Blnk raises an internal error notification. Grantable on the same terms, and the reason the grant is a deliberate one: this body carries Blnk's own error text verbatim. |
 
 The seven `transaction.*` names are derived from the transaction's status by a single mapping, which is why a transaction's whole lifecycle appears under this one prefix.
@@ -347,10 +361,12 @@ Three event types are captured by a write that stands alone, for one shared reas
 
 The set is declared in the code, once, as `PostCommitEventCaptureContract`, and this section is asserted against it. Anything not listed here — every per-transaction status event, including those of a **coalesced** batch, and every `ledger.created`, `balance.created` and `identity.created` — is captured inside its mutation's transaction and carries guarantee 1 in full.
 
+Two of the three reach their standalone write only through the narrow window named in the table below, so on a healthy deployment with a broker configured they behave like every other event; `system.error` is standalone always, and for a different reason. Read the "Where the standalone write is reached" column before you build a reconciliation path: the window, not the event type, is what decides whether you need one.
+
 | Event type | Where the standalone write is reached | What is lost if it fails |
 |-----------|--------------------------------------|--------------------------|
-| `balance.monitor` | Only on a deployment with **no Kafka broker**. With a broker configured, the alert is captured inside the balance's own transaction — either evaluated before the write and committed with it, or from a durable handoff row committed with it and evaluated by the handoff processor, which writes the alerts and the handoff's completion in one transaction. | The threshold notification. The balance movement stands. |
-| `bulk_transaction.<status>` | Only when the batch **coordinator row is absent**. Normally the summary is inserted in the same transaction as the coordinator's terminal transition, so the outcome and its event commit together. | The batch *summary* only. Every member transaction's own event is atomic with that member's mutation. |
+| `balance.monitor` | On a deployment with **no Kafka broker**, and when the **pre-write evaluation could not read the monitors** for the balance being moved. With a broker configured and the monitors readable, the alert is captured inside the balance's own transaction — either evaluated before the write and committed with it, or from a durable handoff row committed with it and evaluated by the handoff processor, which writes the alerts and the handoff's completion in one transaction. | The threshold notification. The balance movement stands. |
+| `bulk_transaction.<status>` | Only when the **finalising transaction cannot commit** after its retry budget. The summary is otherwise inserted in the same transaction as the coordinator's terminal transition — including for a batch whose start was never recorded, which is *adopted* into that transaction rather than captured outside one — so the outcome and its event commit together. | The batch *summary* only. Every member transaction's own event is atomic with that member's mutation, and the batch is left non-terminal so `GET /events/stats` and the unfinalized-batch count still show it. |
 | `system.error` | Always. It describes no mutation — it reports that something failed — so there has never been a transaction it could have joined. | The error notification. Nothing about the ledger. |
 
 Two of the three spend a **bounded retry budget** on that standalone insert — `balance.monitor` and `bulk_transaction.<status>`, the two that describe ledger state — while `system.error` makes a single attempt. That asymmetry is deliberate: retrying is worth a database round trip when the event carries information about ledger state you might otherwise have to reconcile, and `system.error` carries none.
@@ -374,7 +390,7 @@ Do not infer a batch outcome from the absence of a summary, and do not treat a m
 
 Every message carries a **partition key**, and it is always set. The key is hashed by a stable balancer to select a partition, so all messages sharing a key land on one partition, and Kafka preserves order within a partition.
 
-**Blnk partitions by **ledger id**.** That is the one dimension the ordering guarantee is built on: every event that belongs to a ledger is keyed on that ledger, so a ledger's events are pinned to a single partition and arrive in the order the mutations happened. The events that belong to no ledger reach a documented fallback chain instead: `identity.created`, because an identity is not ledger-scoped; `bulk_transaction.*`, because a batch is a runtime grouping that can span ledgers; and `system.error`, because it describes no ledger object at all. `transaction.rejected` is keyed on its ledger like every other transaction event — the ledger is resolved from the balance the transaction names — and reaches the fallback only when that balance cannot be read, which is itself one of the ordinary reasons a transaction is rejected.
+Blnk partitions by **ledger id**. That is the one dimension the ordering guarantee is built on: every event that belongs to a ledger is keyed on that ledger, so a ledger's events are pinned to a single partition and arrive in the order the mutations happened. The events that belong to no ledger reach a documented fallback chain instead: `identity.created`, because an identity is not ledger-scoped; `bulk_transaction.*`, because a batch is a runtime grouping that can span ledgers; and `system.error`, because it describes no ledger object at all. `transaction.rejected` is keyed on its ledger like every other transaction event — the ledger is resolved from the balance the transaction names — and reaches the fallback only when that balance cannot be read, which is itself one of the ordinary reasons a transaction is rejected.
 
 **Ordering is guaranteed per partition key. It is not guaranteed across a topic.** Two events with different keys carry no ordering relationship at all, even on the same topic and even if one was committed to the ledger before the other. Design your consumer around that: order within a key is something you can rely on, order between keys is something you must not.
 
@@ -413,10 +429,33 @@ Why those three carry no ledger:
 - **`system.error` has no aggregate at all.** Keying on the event type puts the whole error stream on
   one partition and therefore in total order, which is what an error stream wants.
 
-If a payload somehow yields none of the above, the key falls back to `aggregate_id`, then to the
-event type, then to a fixed sentinel. The chain exists so that a key is always present and always
-deterministic — an absent key would let Kafka scatter the message round-robin and destroy ordering
-with nothing in the data to show it.
+#### The dimension is declared, and a departure from it is reported
+
+Each event type declares which of those three dimensions its key is *supposed* to come from —
+`ledger`, `aggregate` or `event_type` — and the capture path compares the dimension it actually
+achieved against that declaration. The table above is that declaration: every `transaction.*`,
+`balance.*` and `ledger.created` is ledger-dimensioned, `identity.created` and
+`bulk_transaction.<status>` are aggregate-dimensioned, and `system.error` is type-dimensioned.
+
+This matters because a key taken from a balance and a key taken from a ledger look identical in
+the row. Without the declaration, an event that *should* have been keyed on its ledger and was
+not is indistinguishable from one that was — so per-ledger ordering could quietly stop applying
+to a whole event type with nothing to show it. When the achieved dimension is weaker than the
+declared one, Blnk logs a warning naming the event type and both dimensions, and records them on
+the capture span as `event.key_dimension.declared` and `event.key_dimension.achieved`.
+
+**One shape reaches that warning in normal operation:** a `transaction.rejected` event for a
+transaction persisted with no balances. No balance moved, so no ledger exists to key it on, and
+the key falls to the source balance — which is also what Blnk's own transaction queue shards on,
+so the event stays ordered against that balance's other events. Its `ledger_id` is `null`, because
+a fabricated ledger id is worse for everything that reads it than an absent one.
+
+An event that can produce **no key at all** is refused rather than published: `PrepareEventOutbox`
+returns `EVENT_KEY_UNRESOLVABLE` and the producer sees the failure. Only an event with no type and
+a payload naming nothing can reach that, which is a defect in Blnk rather than a state your data
+can put it in. An earlier revision admitted such events under a fixed `blnk.unkeyed` sentinel key;
+that traded a visible refusal for an invisible one, because the event was published and ordered
+against nothing.
 
 **What keying on the ledger costs, and it is worth knowing.** Every event of one ledger lands on
 **one partition**, so a deployment whose volume is concentrated in a single ledger reads that topic
@@ -435,15 +474,17 @@ transaction share a partition and can never be observed out of order.
 
 Blnk uses the Murmur2 balancer, which reproduces the Java client's default partitioner exactly. A message Blnk produces for a given key therefore lands on the partition a Java or librdkafka producer would have chosen for the same key. That matters if you reason about partition assignment from the key, or if anything other than Blnk ever writes to these topics.
 
-A message with no key would be spread across partitions rather than pinned to one, which is also the Java behaviour — but in practice the fallback chain above means Blnk never publishes an unkeyed event.
+A message with no key would be spread across partitions rather than pinned to one, which is also the Java behaviour — but Blnk never publishes an unkeyed event: an event that can be assigned no key is refused at capture, as described above.
 
 ### Ordering also depends on the relay
 
 Keying is necessary but not sufficient. Blnk's relay claims outbox rows in **occurrence order** and publishes them in that order, so the sequence reaching a partition is the sequence in which the mutations happened. Ordering is therefore a property of the key *and* the claim, not the key alone.
 
-The claim additionally returns **at most one row per partition key**, across all concurrent relay
-instances rather than merely within one. Two events sharing a key can therefore never be in flight
-simultaneously, which is what makes ordering hold when the relay is scaled out. One consequence is
+The claim additionally returns **at most one row per message key**, across all concurrent relay
+instances rather than merely within one — and it resolves that key exactly as the publisher does,
+ledger first, so the value the database serialises on is the value Kafka partitions on. Two events
+sharing a key can therefore never be in flight simultaneously, which is what makes ordering hold
+when the relay is scaled out. One consequence is
 worth planning for: while an event is still being retried, later events sharing its partition key
 wait behind it even when they belong to another category. That is a deliberate
 correctness-over-throughput trade, and it is bounded by the retry budget.
@@ -710,35 +751,85 @@ This is the one property of the access model that surprises people, so it is sta
 
 The topic grant is therefore not merely *a* boundary, it is **the** boundary. If two parties must not see each other's events, they must not be granted the same topic — and because the four category topics are fixed, that means separating them at the deployment boundary rather than at the grant. There is no third option, and no field on a subscriber changes this.
 
-### Your `partition_key_prefix` is yours to enforce — this is a contract, not a hint
+### Your `partition_key_prefix` is enforced by Blnk, and it decides how you consume
 
-Your subscriber record may carry a `partition_key_prefix`, and it is the field most likely to be mistaken for an access boundary. It is not one. Your credential response reports it inside `enforced_access` beside the five fields that say so:
+Your subscriber record may carry a `partition_key_prefix`. It is a real boundary — and because Kafka cannot express it, **Blnk enforces it, and enforcing it changes where your records come from.** Read this section before you write a consumer, because it determines which of two transports you use.
+
+Kafka's authorizer has no message-key dimension: an ACL grants `Read` on a *topic*, never on a slice of one. So a credential holding topic `Read` reads every record on that topic whatever the keys are. Rather than hand you such a credential and ask you to discard what is not yours, Blnk **withholds record-level `Read`** from a key-scoped subscriber and serves your records itself, filtered.
+
+Your credential response states which of the two shapes you have:
 
 ```json
 "partition_key_prefix": "ldg_9f1c8a72",
-"partition_key_prefix_enforced": false,
-"partition_key_prefix_enforced_by": "consumer_side",
-"client_side_key_filtering_required": true,
-"not_enforced_by": ["partition_key"],
-"guidance": "Kafka authorises whole topics and consumer groups and has no message-key dimension, so a partition-key prefix is never enforced: a granted topic is readable in full, including records written for other ledgers and other subscribers. To confine a subscriber, narrow its authorized_topics, which the broker does enforce, or isolate the data at the deployment boundary."
+"partition_key_prefix_enforced": true,
+"partition_key_prefix_enforced_by": "blnk_stream_gateway",
+"gateway_delivery_required": true,
+"broker_record_access": false,
+"enforced_by": ["topic", "consumer_group", "partition_key"],
+"not_enforced_by": [],
+"guidance": "Kafka authorises whole topics and consumer groups and has no message-key dimension, so Blnk enforces a subscriber's partition-key prefix itself: a subscriber that records one is granted Describe but NOT Read on its topics, so the broker refuses every direct fetch, and its records are delivered by GET /subscribers/{id}/events, which returns only the records whose key carries the prefix. A subscriber with no prefix consumes directly from the broker and is confined by its authorized_topics alone, which means a granted topic is readable in full — including records written for other ledgers and other subscribers on that topic."
 ```
 
-**Read them before you design around the prefix.** Kafka's authorizer has no message-key dimension: an ACL grants `Read` on a *topic*, so your credential reads **every** record on every topic it is granted, whatever the keys are.
+**`gateway_delivery_required` is the field to branch on.** It is `true` exactly when a prefix is recorded, and it is the one field whose wrong answer is a broken integration:
 
-**`client_side_key_filtering_required` is your obligation, in the same sense that `event_id` deduplication is.** It is `true` exactly when a prefix is recorded, and when it is true the narrowing is applied **in your consumer and nowhere else**. Blnk does not filter for you. It cannot: nothing between the topic and your consumer inspects a key on your behalf, and no ACL exists that would.
+| `gateway_delivery_required` | Your grant | How you consume |
+|-----------------------------|-----------|-----------------|
+| `false` | `Read` and `Describe` on each authorised topic | An ordinary Kafka consumer, directly from the broker. Your `authorized_topics` are your whole boundary — see the section above. |
+| `true` | `Describe` only; **no `Read`** | `GET /subscribers/{id}/events`. A direct fetch is refused by the broker with `TOPIC_AUTHORIZATION_FAILED`. |
 
-Your side of the contract, then, is two lines of consumer code and one piece of discipline:
+`broker_record_access` is its exact complement and says *why* a direct fetch fails: no `Read` binding exists for your principal. Both are always present, so you can branch without first testing whether the prefix string is empty.
 
-- **Filter on the key.** `key.startsWith(prefix)` — a byte-exact prefix test on an opaque identifier, with no case folding, no trimming and no Unicode normalisation. Records outside your prefix **will** be delivered to you; discarding them is yours to do.
-- **Do not treat the prefix as a security control.** Your process is *able* to read out-of-prefix records, so anything that reads the stream — a debug log of raw records, a dead-letter of your own, a metric labelled by key, an operator with your credential — can see them too. Handle the whole topic as data you are trusted with, because that is what you have been granted.
+#### Reading your stream through the gateway
 
-If you need records outside your scope to be *unreachable* rather than filtered, that is a topic-grant question, not a key question — ask your operator to narrow `authorized_topics`, or to isolate your domain at the deployment boundary. Those are the two enforceable answers, and `guidance` in every response names them so the remedy travels with the limitation rather than living only here.
+```
+GET /subscribers/{subscriber_id}/events?topic=blnk.transactions&partition=0&offset=0&limit=100
+X-Blnk-Subscriber-Secret: <the password your credential response returned>
+```
 
-`partition_key_prefix_enforced_by` is `none` when no prefix is recorded, which means the topic and consumer-group grants are your whole boundary and there is nothing for you to filter. The field is always present, so you can branch on it without first testing whether the prefix is empty.
+The secret is the SASL password you were issued, in a **header** — never a query parameter, which would put a live credential in access logs and browser history. Send it over TLS: Blnk refuses this endpoint over a channel the deployment has not established as confidential, and unlike issuance the request carries your credential on *every poll*.
 
-`not_enforced_by` says the same thing as a list, and it is the one to assert on if you want a test that fails when the contract changes: it carries `partition_key` for every subscriber, and together with `enforced_by` it enumerates every dimension this API names. Compare it against a fixed expectation rather than checking that `partition_key` is absent from `enforced_by` — an absence proves nothing, because a dimension the server never mentions reads identically to one it forgot.
+The response is a page plus your cursor:
 
-`guidance` is prose for a human reading a response or a support ticket, and its wording may change. Branch on `client_side_key_filtering_required`, or assert on the `enforced_by` / `not_enforced_by` pair; those are the machine-readable contract.
+```json
+{
+  "subscriber_id": "acme-prod",
+  "topic": "blnk.transactions",
+  "partition": 0,
+  "records": [
+    {"offset": 41, "partition": 0, "key": "ldg_9f1c8a72", "timestamp": "2026-03-01T12:00:00Z", "event": { }}
+  ],
+  "next_offset": 44,
+  "high_watermark": 99,
+  "log_start_offset": 7,
+  "records_scanned": 3,
+  "records_withheld": 2,
+  "truncated": false,
+  "key_scope": "ldg_9f1c8a72",
+  "key_scope_enforced": true
+}
+```
+
+Four properties of it matter for a correct consumer.
+
+- **`event` is the envelope byte for byte**, exactly as it sits on the topic. Nothing is re-encoded, so a record read here and the same record read directly from Kafka parse identically — including large integers a JSON round trip would corrupt.
+- **Resume from `next_offset`, never from the last record's offset.** `next_offset` advances past records that were **withheld** as well as delivered ones. A page can legitimately return zero records and still advance, which is what stops your entitled records being unreachable behind a run of records belonging to other ledgers.
+- **`records_withheld` is your evidence the filter ran.** An empty page with a non-zero withheld count is a working boundary, not a broken feed. Do not treat it as an error.
+- **`truncated` means more is available at `next_offset` now**, so poll again immediately instead of waiting out your interval.
+
+One cursor per **partition**: offsets are per partition, so a consumer reading a multi-partition topic tracks one `next_offset` for each. `high_watermark - next_offset` is your lag, with no second endpoint to call. Bounds are `limit` (default 100, maximum 500) and `max_wait_ms` (default 1000, maximum 10000); an out-of-range value is clamped and the response reports what was actually read, while a non-numeric one is refused — a substituted cursor would silently skip or re-read events.
+
+The endpoint is **not** a consumer group. Nothing is committed and no rebalancing happens: the cursor is yours to keep, which is also why `event_id` deduplication remains your obligation exactly as it is on the direct path.
+
+#### What the boundary does and does not cover
+
+- **It is enforced, not requested.** The filter runs inside Blnk, before any record leaves the process, and it is the same rule the registry recorded: a byte-exact prefix test on the key, with no case folding, trimming or Unicode normalisation. Using a different client does not change it, because the broker will not serve you records at all.
+- **It is a filter on `Read`, not on `Describe`.** You keep `Describe` on your topics, so an ordinary Kafka client can still read partition counts and offsets — which is what you need to measure lag.
+- **It does not narrow the topic dimension.** The gateway enforces your `authorized_topics` too (a topic outside them is `403 SUBSCRIBER_TOPIC_NOT_GRANTED`), but within a granted topic the prefix is the only additional narrowing. If you need a *different* set of topics, that is a grant change.
+- **Clearing your prefix widens you.** An operator who removes it re-grants topic `Read`, and you go back to consuming directly — and to reading the whole topic. `PUT /subscribers/{id}` is where that happens, and your next credential response will say so.
+
+`not_enforced_by` is now **empty for every subscriber**, and it stays in the body deliberately: it is where a future dimension the broker cannot evaluate would appear, and an absent key would read as "not stated" rather than as "nothing is unenforced". `enforced_by` carries `partition_key` exactly when a prefix is recorded — assert on the pair if you want a test that fails when the contract changes.
+
+`guidance` is prose for a human reading a response or a support ticket, and its wording may change. Branch on `gateway_delivery_required`, or assert on the `enforced_by` / `not_enforced_by` pair; those are the machine-readable contract.
 
 ## Observability
 
@@ -779,10 +870,12 @@ A practical checklist. The reasoning behind each item is in the sections above.
   `.dlt` topic, is refused with an authorisation error. A topic you *are* granted, you read whole:
   it carries every ledger's events and every other subscriber's, because there are no per-tenant
   topics.
-- **Key filtering (required when `client_side_key_filtering_required` is `true`).** Discard records
-  whose key does not begin with your `partition_key_prefix`, with a byte-exact `startsWith`. The
-  broker performs no key check — this is your obligation, in the same sense that deduplicating on
-  `event_id` is.
+- **Transport depends on `gateway_delivery_required`.** When it is `false`, consume from the broker
+  as above. When it is `true` your principal holds `Describe` and **no** `Read`, so a direct fetch is
+  refused with `TOPIC_AUTHORIZATION_FAILED`: read `GET /subscribers/{id}/events` instead, presenting
+  your SASL password in `X-Blnk-Subscriber-Secret` over TLS, and resume from `next_offset` rather
+  than from the last record's offset. Blnk applies your `partition_key_prefix` per record; you do not
+  filter, and cannot be relied upon to.
 - **Offsets.** Commit offsets after your handler has recorded the `event_id`, so a redelivery after
   a crash is suppressed by your idempotency store rather than reprocessed.
 - **Message size.** Blnk refuses to publish an event larger than 768 KiB, so a consumer's

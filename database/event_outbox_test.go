@@ -570,6 +570,10 @@ func deadLetterInventoryEntryOf(e model.EventOutbox) model.DeadLetterInventoryEn
 }
 
 // deadLetterEventIDsOf projects the event ids out of an inventory page.
+//
+// Membership over a projection is asserted through this helper and assert.Contains rather than
+// through a bespoke containsDeadLetteredEventID predicate: one idiom, and a failure names the
+// ids that WERE found instead of reporting a bare false.
 func deadLetterEventIDsOf(page model.DeadLetterInventoryPage) []string {
 	ids := make([]string, 0, len(page.Entries))
 	for _, entry := range page.Entries {
@@ -619,10 +623,6 @@ func walkDeadLetterInventory(
 	return all
 }
 
-// containsDeadLetteredEventID WAS RETIRED HERE. It was the inventory-projection twin of
-// containsEventID, and membership over a projection is asserted through deadLetterEventIDsOf
-// with assert.Contains — one idiom, and the failure message names the ids it did find rather
-// than reporting a bare false.
 // dbTimestamp truncates an instant to the resolution PostgreSQL actually stores.
 //
 // TIMESTAMP WITH TIME ZONE holds MICROSECONDS, while Go's time.Now() carries
@@ -656,13 +656,22 @@ func newEventOutboxFixture(markerPrefix string) *model.EventOutbox {
 		EventID:     uuid.NewString(),
 		EventType:   "transaction.applied",
 		AggregateID: markerPrefix + "agg",
-		// UNIQUE PER FIXTURE, deliberately. At most one row per partition key is
-		// claimable at any instant — that is what preserves per-aggregate ordering —
-		// so fixtures sharing a key would drain one at a time and every test that
-		// claims a batch would see a single row. Tests that are ABOUT same-key
-		// behaviour set this explicitly; every other test wants independent rows.
+		// UNIQUE PER FIXTURE, deliberately, AND IN BOTH COLUMNS. At most one row per
+		// EFFECTIVE key is claimable at any instant — that is what preserves
+		// per-aggregate ordering — so fixtures sharing a key would drain one at a time
+		// and every test that claims a batch would see a single row.
+		//
+		// The effective key is the LEDGER wherever a row has one and the partition key
+		// only where it does not (model.EffectivePartitionKey, rendered as SQL by
+		// eventOutboxEffectiveKeySQL). So a unique partition_key over a SHARED ledger —
+		// which is what this fixture used to build — produces rows that are independent
+		// on paper and one aggregate in fact. Every real-database test that claims a
+		// batch of them then saw exactly one row.
+		//
+		// Tests that are ABOUT same-key behaviour call shareEventOutboxKey, which sets
+		// both columns; every other test wants independent rows and gets them here.
 		PartitionKey:  markerPrefix + "key-" + uuid.NewString(),
-		LedgerID:      markerPrefix + "ldg",
+		LedgerID:      markerPrefix + "ldg-" + uuid.NewString(),
 		Topic:         "blnk.transactions",
 		SchemaVersion: model.SchemaVersionV1,
 		Payload: json.RawMessage(
@@ -670,6 +679,27 @@ func newEventOutboxFixture(markerPrefix string) *model.EventOutbox {
 		OccurredAt:  dbTimestamp(time.Now()),
 		MaxAttempts: defaultEventMaxAttempts,
 	}
+}
+
+// shareEventOutboxKey makes a fixture publish under a given Kafka message key, which means
+// setting BOTH key columns.
+//
+// A test asserting same-key behaviour is asserting something about the key the PUBLISHER uses,
+// and that key is the EFFECTIVE one: the ledger wherever the row has one, the stored partition
+// key only where it does not. Setting partition_key alone therefore does not make two rows share
+// a key at all — their distinct ledgers still separate them — and the assertion would be made
+// about a condition the fixtures never created. Setting the ledger alone would work today and
+// would stop working the moment a fixture stopped carrying one.
+//
+// Both, so the fixture states the intent unambiguously and holds under either resolution.
+//
+// Parameters:
+//   - entry *model.EventOutbox: the fixture to re-key.
+//   - key string: the key both columns take. Non-blank, because partition_key has a not-blank
+//     CHECK and a blank ledger falls through rather than grouping.
+func shareEventOutboxKey(entry *model.EventOutbox, key string) {
+	entry.PartitionKey = key
+	entry.LedgerID = key
 }
 
 // insertedEventOutboxRows is the single-row insert's RETURNING id result.
@@ -830,14 +860,23 @@ func TestClaimPendingEventOutbox_QueryContainsSkipLockedAndOccurredAtOrdering(t 
 
 	// THE ORD-01 PREDICATE. FOR UPDATE SKIP LOCKED stops two relays claiming the same
 	// row; it does NOT stop one relay skipping an earlier locked row and claiming a
-	// LATER row of the same partition key. Kafka preserves append order rather than
+	// LATER row of the same message key. Kafka preserves append order rather than
 	// occurred_at, so that reordering reaches subscribers with nothing anywhere to show
 	// it. The NOT EXISTS clause is what makes at most one row per key claimable, and it
 	// is asserted here because it is invisible in behaviour until two relays run.
 	assert.Contains(t, issued, "NOT EXISTS",
-		"the claim must exclude a row whose partition key already has an earlier row in flight; SKIP LOCKED alone permits same-key reordering")
-	assert.Contains(t, issued, "earlier.partition_key = candidate.partition_key",
-		"the exclusion must be scoped BY PARTITION KEY; scoping it wider would serialise unrelated aggregates and destroy throughput")
+		"the claim must exclude a row whose message key already has an earlier row in flight; SKIP LOCKED alone permits same-key reordering")
+
+	// SCOPED BY THE EFFECTIVE KEY, which is the key the publisher hashes — the ledger
+	// wherever a row has one, the stored partition key only where it does not. Scoping it
+	// wider would serialise unrelated aggregates and destroy throughput; scoping it to the
+	// partition_key COLUMN was the previous shape and was NARROWER than the Kafka
+	// partition, which is worse than either (PERF-C02): two same-ledger rows with divergent
+	// stored keys went unserialised while both hashed to one partition.
+	assert.Contains(t, issued, eventOutboxEffectiveKeySQL("earlier")+" = "+eventOutboxEffectiveKeySQL("candidate"),
+		"the exclusion must compare the EFFECTIVE key on both sides, so the value the database serialises on is the value Kafka partitions on")
+	assert.NotContains(t, issued, "earlier.partition_key = candidate.partition_key",
+		"the superseded column comparison must not return")
 	assert.Contains(t, issued, "(earlier.occurred_at, earlier.id) < (candidate.occurred_at, candidate.id)",
 		"the exclusion must compare occurrence THEN id, matching the claim ordering exactly, or two rows sharing an instant could both be claimed")
 	assert.Contains(t, issued, "earlier.status IN ('pending', 'processing')",
@@ -4883,6 +4922,131 @@ func TestCountEventOutboxByStatus_ReturnsPerStatusCounts(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
+// TestCountUnresolvedEventOutbox_CountsTheInventoryAndNoHistory is the PERF-M05 guard on the
+// repository side.
+//
+// # What the two-armed count cost the callers that only ever read one arm
+//
+// Two callers run this aggregate on a timer: the metrics collector recomputes the backlog and
+// repair gauges every fifteen seconds, and the dead-letter service counts the rows awaiting a
+// dead-letter write. Both read ONLY non-dispatched statuses, and both said so in a comment while
+// calling the two-armed query with a twenty-four-hour window — so every call additionally
+// performed an exact COUNT of a day of dispatched rows, 43.2 million index entries at the target
+// rate, and discarded the answer. Fifteen seconds apart, that is a scan that never stops.
+//
+// # The assertions are on the STATEMENT, and they have to be
+//
+// A fixture holding five rows cannot tell a one-armed query from a two-armed one: both return the
+// same rows. The substance of the fix is the ABSENCE of the second arm and of the window, which is
+// visible only in the SQL — and it is exactly what a well-meaning future edit would undo by
+// "reusing" the fuller query with a wide window.
+//
+// The predicate must also be spelled `status <> $1`, character for character as the other query's
+// first arm spells it, so both resolve to the same partial index. A paraphrase — an IN list of the
+// known non-dispatched statuses — would read identically, plan as a sequential scan, and silently
+// stop counting any status added to the state machine later, which the column deliberately allows.
+func TestCountUnresolvedEventOutbox_CountsTheInventoryAndNoHistory(t *testing.T) {
+	db, mock, captured := newCapturingSQLMock(t)
+	ds := Datasource{Conn: db}
+
+	mock.ExpectQuery("").WillReturnRows(
+		sqlmock.NewRows([]string{"status", "count"}).
+			AddRow(model.EventOutboxStatusPending, int64(3)).
+			AddRow(model.EventOutboxStatusProcessing, int64(1)).
+			AddRow(model.EventOutboxStatusWebhookPending, int64(5)).
+			AddRow(model.EventOutboxStatusFailed, int64(2)).
+			AddRow(model.EventOutboxStatusDeadLettered, int64(7)),
+	)
+
+	counts, err := ds.CountUnresolvedEventOutbox(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]int64{
+		model.EventOutboxStatusPending:        3,
+		model.EventOutboxStatusProcessing:     1,
+		model.EventOutboxStatusWebhookPending: 5,
+		model.EventOutboxStatusFailed:         2,
+		model.EventOutboxStatusDeadLettered:   7,
+	}, counts)
+
+	// The four figures the routine callers actually publish, all of them from this ONE reading:
+	// the backlog gauge is pending plus processing, and the two repair backlogs are `failed`
+	// and `webhook_pending` (PERF-M06).
+	assert.Equal(t, int64(4), counts[model.EventOutboxStatusPending]+
+		counts[model.EventOutboxStatusProcessing],
+		"the backlog gauge comes out of this reading")
+	assert.Equal(t, int64(2), counts[model.EventOutboxStatusFailed],
+		"and so does the dead-letter repair backlog")
+	assert.Equal(t, int64(5), counts[model.EventOutboxStatusWebhookPending],
+		"and the legacy-webhook repair backlog")
+
+	require.Len(t, *captured, 1)
+	issued := (*captured)[0]
+
+	assert.Contains(t, issued, "GROUP BY status",
+		"one row per status, aggregated in the database rather than by counting rows in Go")
+	assert.Contains(t, issued, "WHERE status <> $1",
+		"the predicate must be spelled exactly as the two-armed query's first arm spells it, so "+
+			"both resolve to the same partial index; a paraphrased IN list would plan as a "+
+			"sequential scan and would stop counting any status added to the state machine later")
+
+	assert.NotContains(t, issued, "UNION ALL",
+		"THE SECOND ARM MUST BE ABSENT. This is the whole substance of PERF-M05: a routine caller "+
+			"must not pay for an exact count of the one unbounded population — 43.2 million index "+
+			"entries a day at the target rate — to read a backlog it computes from four other "+
+			"statuses")
+	assert.NotContains(t, issued, "occurred_at",
+		"and there must be no window at all: a window could only HIDE rows this reading exists to "+
+			"surface, and a row pending for three days must still appear in the backlog")
+	assert.NotContains(t, issued, "$2",
+		"one parameter, the dispatched status to exclude, and nothing else")
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestCountUnresolvedEventOutbox_ErrorsAreWrapped covers the statement, scan and row-iteration
+// failures on the lightweight aggregate.
+//
+// It shares its scan loop with CountEventOutboxByStatus, and the shared loop is what makes these
+// cases worth stating twice: the one property both must have is that a mid-iteration failure is
+// REPORTED rather than yielding the partially-drained map, because a zero-loss reconciliation
+// compared against a short total reports loss that has not happened.
+func TestCountUnresolvedEventOutbox_ErrorsAreWrapped(t *testing.T) {
+	for name, arrange := range map[string]func(sqlmock.Sqlmock){
+		"the statement fails": func(mock sqlmock.Sqlmock) {
+			mock.ExpectQuery("").WillReturnError(errors.New("pq: permission denied"))
+		},
+		"a row cannot be scanned": func(mock sqlmock.Sqlmock) {
+			mock.ExpectQuery("").WillReturnRows(
+				sqlmock.NewRows([]string{"status", "count"}).
+					AddRow(model.EventOutboxStatusPending, "not-a-number"),
+			)
+		},
+		"iteration fails partway": func(mock sqlmock.Sqlmock) {
+			mock.ExpectQuery("").WillReturnRows(
+				sqlmock.NewRows([]string{"status", "count"}).
+					AddRow(model.EventOutboxStatusPending, int64(3)).
+					RowError(0, errors.New("connection reset by peer")),
+			)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			db, mock, _ := newCapturingSQLMock(t)
+			ds := Datasource{Conn: db}
+			arrange(mock)
+
+			counts, err := ds.CountUnresolvedEventOutbox(context.Background())
+
+			require.Error(t, err)
+			assert.Nil(t, counts,
+				"a failed reading must return NO map: a partially-drained one would be read as a "+
+					"complete census and would understate every backlog it feeds")
+			requireAPIError(t, err, apierror.ErrInternalServer)
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
 // TestCountEventOutboxByStatus_NormalisesTheWindow pins what a caller cannot ask for.
 //
 // A zero instant means "no preference" and a future one is a caller error; both become one
@@ -5363,7 +5527,8 @@ func TestEventSubscriberRepository_NoMethodReturnsPlaintextSecret(t *testing.T) 
 //     cannot ignore.
 //   - THE CLAIM READS MORE THAN THE LEASE. It orders the whole claimable set by occurred_at
 //     and takes the first batch, and it excludes a row when an EARLIER row shares its
-//     partition key and is still pending or processing. A foreign row that survives parking
+//     EFFECTIVE key — its ledger where it has one, its stored partition key where it does
+//     not — and is still pending or processing. A foreign row that survives parking
 //     can therefore starve a fixture out of the batch or block its key, and both read as a
 //     product defect in the claim rather than as pollution in the table.
 //
@@ -5811,8 +5976,7 @@ func TestClaimPendingEventOutbox_FifoByOccurredAt_RealDB(t *testing.T) {
 	for _, f := range inserted {
 		entry := newEventOutboxFixture(marker)
 		entry.AggregateID = marker + "shared-aggregate"
-		entry.PartitionKey = marker + sharedKey
-		entry.LedgerID = marker + "shared-ledger"
+		shareEventOutboxKey(entry, marker+sharedKey)
 		entry.OccurredAt = f.occurredAt
 		insertRealEventOutbox(t, ds, entry)
 		byLabel[f.label] = entry.EventID
@@ -5890,12 +6054,12 @@ func TestClaimPendingEventOutbox_OnlyOneRowPerPartitionKeyIsEverInFlight_RealDB(
 	sharedKey := marker + "one-key"
 
 	earlier := newEventOutboxFixture(marker)
-	earlier.PartitionKey = sharedKey
+	shareEventOutboxKey(earlier, sharedKey)
 	earlier.OccurredAt = base
 	insertRealEventOutbox(t, ds, earlier)
 
 	later := newEventOutboxFixture(marker)
-	later.PartitionKey = sharedKey
+	shareEventOutboxKey(later, sharedKey)
 	later.OccurredAt = base.Add(time.Minute)
 	insertRealEventOutbox(t, ds, later)
 
@@ -5976,13 +6140,13 @@ func TestClaimPendingEventOutbox_AnExhaustedRowDoesNotStallItsKeyForever_RealDB(
 	sharedKey := marker + "stall-key"
 
 	doomed := newEventOutboxFixture(marker)
-	doomed.PartitionKey = sharedKey
+	shareEventOutboxKey(doomed, sharedKey)
 	doomed.OccurredAt = base
 	doomed.MaxAttempts = 1
 	insertRealEventOutbox(t, ds, doomed)
 
 	successor := newEventOutboxFixture(marker)
-	successor.PartitionKey = sharedKey
+	shareEventOutboxKey(successor, sharedKey)
 	successor.OccurredAt = base.Add(time.Minute)
 	insertRealEventOutbox(t, ds, successor)
 
@@ -6030,12 +6194,12 @@ func TestMarkEventWebhookPending_LeavesTheRowClaimableWithoutBlockingItsKey_Real
 	sharedKey := marker + "webhook-pending-key"
 
 	published := newEventOutboxFixture(marker)
-	published.PartitionKey = sharedKey
+	shareEventOutboxKey(published, sharedKey)
 	published.OccurredAt = base
 	insertRealEventOutbox(t, ds, published)
 
 	successor := newEventOutboxFixture(marker)
-	successor.PartitionKey = sharedKey
+	shareEventOutboxKey(successor, sharedKey)
 	successor.OccurredAt = base.Add(time.Minute)
 	insertRealEventOutbox(t, ds, successor)
 
@@ -6351,19 +6515,33 @@ func TestClaimFailedEventOutboxForDeadLetter_RecoversAnUnpreservedRowNothingElse
 		"once preserved, the row must leave the repair backlog for good")
 }
 
-// TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB is the FOR UPDATE SKIP
-// LOCKED proof, and sqlmock cannot give it: a mock has no locking semantics at all.
+// TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB proves that concurrent relay
+// instances never publish the same event twice, and sqlmock cannot give it: a mock has no
+// locking semantics at all.
 //
 // Two properties are asserted, and both are needed:
 //
-//   - DISJOINTNESS. No row may appear in two workers' batches. Without SKIP LOCKED — or
-//     with the row lock dropped entirely — two relay instances can claim the same row and
-//     publish the same event twice.
+//   - DISJOINTNESS. No row may appear in two workers' batches. Without the row lock entirely,
+//     two relay instances can claim the same row and publish the same event twice.
 //   - NO STARVATION. Every fixture must be claimed exactly once across the workers, so
-//     the whole backlog is drained. A claim that avoided duplicates by making workers
-//     block on each other would satisfy disjointness while destroying the throughput the
-//     500-events-per-second target depends on, and asserting the full set was claimed is
-//     what rules that out.
+//     the whole backlog is drained.
+//
+// # What this test does NOT prove, and why a second one exists
+//
+// It does not prove SKIP LOCKED, and it is important not to read it as though it did. The
+// claim is a SINGLE autocommit statement, so the row locks it takes are released the instant
+// it returns. Two concurrent claimers with SKIP LOCKED removed would therefore BLOCK on each
+// other for microseconds, unblock when the other statement committed, re-evaluate the row
+// under READ COMMITTED, find it is no longer pending, and move on — arriving at exactly the
+// disjoint, fully-drained outcome asserted below. Both assertions here survive deleting SKIP
+// LOCKED from the query.
+//
+// That matters because SKIP LOCKED is doing real work: at 500 events per second across
+// several relay instances, a claimer that queues behind another's lock instead of skipping it
+// serialises the whole pipeline. Proving it needs a lock that OUTLIVES the claim statement,
+// which no self-contained concurrent claim can produce.
+// TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB holds exactly such
+// a lock and is where that property is established.
 func TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB(t *testing.T) {
 	ds := openLockedEventOutboxDB(t)
 	ctx := context.Background()
@@ -6423,6 +6601,137 @@ func TestClaimPendingEventOutbox_ConcurrentClaimsAreDisjoint_RealDB(t *testing.T
 	// unclaimed.
 	assert.Len(t, claimCounts, total,
 		"every fixture must be claimed exactly once across the workers; a short count means workers blocked on each other rather than skipping locked rows")
+}
+
+// TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB is the SKIP LOCKED
+// proof, and it is the only test in this file that can be one.
+//
+// # Why the concurrent-claim test is not enough
+//
+// The neighbouring disjointness test lines four claimers up against twenty rows and asserts
+// that no row is claimed twice and none is left behind. Both hold with SKIP LOCKED deleted.
+// The claim is one autocommit statement, so its row locks live only for the duration of that
+// statement: a claimer without SKIP LOCKED waits microseconds for the other statement to
+// commit, re-evaluates the row it was waiting on, finds it is `processing` now, and skips it
+// anyway. The outcome is identical and the property is untested.
+//
+// # What this test does instead
+//
+// It holds a row lock that the claim CANNOT outlast. A second connection opens an explicit
+// transaction, takes `SELECT ... FOR UPDATE` on the FIFO-earliest claimable row, and keeps it
+// open across the claim. Two behaviours then diverge completely:
+//
+//   - WITH SKIP LOCKED the locked row is passed over, the next candidate is locked instead,
+//     and the claim returns promptly with a different row.
+//   - WITHOUT IT the claim blocks on the lock for as long as the holder keeps it — here, until
+//     the context deadline expires and the claim fails outright.
+//
+// So the assertion is not a statistical one about contention. It is: the claim answered, it
+// answered with the OTHER row, it answered quickly, and the lock was still held when it did.
+//
+// # And the row is skipped, not excluded
+//
+// A claim that simply refused to consider the locked row would satisfy all of that while
+// stranding it for ever, so the lock is released and the parked row is required to become
+// claimable again. That is what makes "skipped" mean deferred rather than dropped — and it is
+// the difference between SKIP LOCKED and a bug that silently drains part of the backlog.
+func TestClaimPendingEventOutbox_SkipsALockedRowRatherThanBlockingOnIt_RealDB(t *testing.T) {
+	ds := openLockedEventOutboxDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("skiplock")
+	quiesceEventOutbox(t, ds, marker)
+
+	// Two rows with DIFFERENT partition keys, which newEventOutboxFixture gives by default and
+	// which is load-bearing here: at most one row per partition key is claimable at a time, so
+	// two rows sharing a key would leave the second unclaimable for a reason that has nothing to
+	// do with locking and the test would pass without proving anything.
+	base := dbTimestamp(time.Now().Add(-time.Hour))
+
+	parked := newEventOutboxFixture(marker)
+	parked.OccurredAt = base
+	insertRealEventOutbox(t, ds, parked)
+
+	successor := newEventOutboxFixture(marker)
+	successor.OccurredAt = base.Add(time.Second)
+	insertRealEventOutbox(t, ds, successor)
+
+	// The FIFO-earliest row is the one locked, deliberately. It is the row the claim's ORDER BY
+	// reaches FIRST, so a claimer that blocks blocks immediately and a claimer that skips has to
+	// carry on to a later candidate — the arrangement in which the two behaviours are furthest
+	// apart. Locking a later row would let a blocking claimer succeed on the first candidate and
+	// prove nothing.
+	holder, err := ds.Conn.BeginTx(ctx, nil)
+	require.NoError(t, err, "opening the transaction that holds the row lock")
+
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		if rollbackErr := holder.Rollback(); rollbackErr != nil &&
+			!errors.Is(rollbackErr, sql.ErrTxDone) {
+			logrus.WithError(rollbackErr).Warn("rolling back the SKIP LOCKED holder transaction")
+		}
+	}
+	// Registered before the lock is taken, so a failure anywhere below cannot leave a row locked
+	// for the rest of the package's run.
+	t.Cleanup(release)
+
+	var lockedID int64
+	require.NoError(t,
+		holder.QueryRowContext(ctx,
+			`SELECT id FROM blnk.event_outbox WHERE id = $1 FOR UPDATE`, parked.ID).Scan(&lockedID),
+		"the holder transaction must take the row lock")
+	require.Equal(t, parked.ID, lockedID)
+
+	// A DEADLINE IS THE INSTRUMENT. Without SKIP LOCKED the claim waits on the lock above, which
+	// is never released inside this window, so the deadline is what converts an indefinite block
+	// into a reportable failure instead of a hung test.
+	claimCtx, cancelClaim := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelClaim()
+
+	started := time.Now()
+	claimed, claimErr := ds.ClaimPendingEventOutbox(claimCtx, 1, testSettlementLease)
+	elapsed := time.Since(started)
+
+	require.NoErrorf(t, claimErr,
+		"the claim must ANSWER while another transaction holds a row lock on the earliest "+
+			"candidate. It did not, and after %s the context deadline expired — which is what "+
+			"happens when FOR UPDATE SKIP LOCKED loses its SKIP LOCKED: the claimer queues behind "+
+			"the lock instead of moving to the next candidate, and at 500 events per second "+
+			"across several relay instances that serialises the entire pipeline", elapsed)
+
+	require.Len(t, claimed, 1, "one row was asked for and one claimable row was unlocked")
+	assert.Equalf(t, successor.EventID, claimed[0].EventID,
+		"the claim must return the SUCCESSOR, not the locked row. Returning the locked row would "+
+			"mean the row lock is not being taken at all, and two relay instances would publish "+
+			"the same event")
+	assert.Equal(t, model.EventOutboxStatusProcessing, claimed[0].Status)
+
+	assert.Lessf(t, elapsed, 2*time.Second,
+		"the claim must skip PROMPTLY rather than wait. %s is long enough to be a block that "+
+			"happened to be released rather than a row that was passed over", elapsed)
+
+	// THE LOCK WAS STILL HELD WHEN THE CLAIM ANSWERED. Without this the test would also pass
+	// against a claimer that blocked and was unblocked by the holder ending early — the exact
+	// scenario the elapsed-time bound only makes unlikely.
+	var stillLocked int64
+	require.NoError(t,
+		holder.QueryRowContext(ctx, `SELECT $1::bigint`, parked.ID).Scan(&stillLocked),
+		"the holder transaction must still be open, or the claim may simply have waited it out")
+	require.Equal(t, parked.ID, stillLocked)
+
+	// SKIPPED MEANS DEFERRED, NOT DROPPED. Release the lock and the parked row must re-enter the
+	// claimable set; a claim that had excluded it rather than skipped it would strand the oldest
+	// event in the backlog for ever while reporting a healthy drain.
+	release()
+
+	reclaimed, err := ds.ClaimPendingEventOutbox(ctx, 5, testSettlementLease)
+	require.NoError(t, err)
+	assert.Truef(t, containsEventID(reclaimed, parked.EventID),
+		"once the lock is released the passed-over row must be claimable again. SKIP LOCKED defers "+
+			"a row; it does not remove it from the backlog.\nclaimed: %v", eventIDsOf(reclaimed))
 }
 
 // TestClaimPendingEventOutbox_ReclaimsAfterLockExpiry_RealDB is the crash-recovery
@@ -6878,8 +7187,16 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		assert.Equal(t, model.EventOutboxStatusReplaying, claimed.Status)
 		require.NotEmpty(t, claimed.ClaimToken, "the replay claim must issue a token")
 
-		// THE POINT OF THE CLAIM: a second concurrent replay request finds nothing to
-		// claim, so it cannot publish a duplicate.
+		// THE STATE GUARD: a row already replaying is not claimable, so a second request
+		// arriving after the first has landed finds nothing to claim and cannot publish a
+		// duplicate.
+		//
+		// This is a SERIAL call and it proves a serial property. It says nothing about two
+		// requests that arrive together — both could read `dead_lettered` and both transition if
+		// the claim were a read followed by a write instead of one conditional UPDATE, and this
+		// assertion would hold throughout. That race is proved in
+		// TestClaimEventForReplay_ExactlyOneOfTwoSimultaneousClaimsWins_RealDB, which is where
+		// the word "concurrent" belongs.
 		_, err = ds.ClaimEventForReplay(ctx, entry.EventID, time.Minute)
 		requireAPIError(t, err, apierror.ErrConflict)
 
@@ -6931,6 +7248,152 @@ func TestEventOutboxTransitions_DriveTheStateMachine_RealDB(t *testing.T) {
 		assert.Error(t, ds.MarkWebhookDispatched(ctx, entry.ID, "someone-elses-token"),
 			"a worker that does not hold the claim must not be able to record a webhook it never sent")
 	})
+}
+
+// TestClaimEventForReplay_ExactlyOneOfTwoSimultaneousClaimsWins_RealDB is the replay claim's
+// concurrency property, and it is the only test that establishes it.
+//
+// # What the serial assertion could not reach
+//
+// The replay lifecycle test calls the claim twice in sequence and asserts the second one
+// conflicts. That is a real property — a row already replaying is not claimable — but it is a
+// property about a row whose transition has ALREADY LANDED, and it holds under an
+// implementation with no atomicity whatsoever. A claim written as "read the row, check its
+// status in Go, then write" would pass it every time while allowing two simultaneous requests
+// to both read `dead_lettered`, both decide they may proceed, and both transition. Two replay
+// requests for one stuck event is not a hypothetical: it is a double-click on a triage console,
+// or two operators working the same dead-letter backlog, and the consequence is the same event
+// published twice onto its original topic.
+//
+// # The arrangement
+//
+// Two goroutines are lined up on a barrier and released together, both claiming the SAME
+// dead-lettered row. Exactly one must succeed with a token and exactly one must be told the row
+// is not available — and the row itself must end up `replaying` under the winner's token, so
+// that "one winner" is a fact about the database and not merely about the two return values.
+//
+// It runs several rounds on fresh rows. One round is logically sufficient — the claim is a
+// single conditional UPDATE, so PostgreSQL's row lock decides it — but a single round can be
+// won by the goroutines simply not overlapping, and rounds are what make the overlap real
+// rather than assumed.
+func TestClaimEventForReplay_ExactlyOneOfTwoSimultaneousClaimsWins_RealDB(t *testing.T) {
+	ds := openLockedEventOutboxDB(t)
+	ctx := context.Background()
+	marker := newRealEventOutboxMarker("replayrace")
+	quiesceEventOutbox(t, ds, marker)
+
+	// A lease long enough that the expired-replay arm of the claim cannot open: a claim also
+	// succeeds on a `replaying` row whose lease has run out, and a short lease here would let
+	// the loser win legitimately for a reason that has nothing to do with the race.
+	const replayLease = time.Minute
+	const rounds = 8
+
+	// deadLetter drives one fresh fixture all the way to dead_lettered, which is the only state
+	// a replay may be claimed from.
+	deadLetter := func() *model.EventOutbox {
+		entry := newEventOutboxFixture(marker)
+		entry.MaxAttempts = 1
+		insertRealEventOutbox(t, ds, entry)
+
+		token := claimEventOutboxToken(t, ds, entry)
+		outcome, err := ds.MarkEventFailed(ctx, entry.ID, token, "gave up", 0, false,
+			testDeadLetterHandoffLease)
+		require.NoError(t, err)
+		require.True(t, outcome.Exhausted)
+		require.NoError(t, ds.MarkEventDeadLettered(ctx, entry.ID, outcome.ClaimToken,
+			entry.Topic+".dlt",
+			json.RawMessage(`{"original_topic":"`+entry.Topic+`","attempt_count":1}`),
+			model.BrokerRecord{}))
+
+		return entry
+	}
+
+	for round := range rounds {
+		entry := deadLetter()
+
+		type attempt struct {
+			row *model.EventOutbox
+			err error
+		}
+		attempts := make([]attempt, 2)
+
+		// A CLOSED CHANNEL rather than a WaitGroup for the release, so both goroutines are
+		// unblocked by one operation instead of being woken in sequence. `ready` proves each
+		// goroutine reached the barrier before it is opened, which is what makes the overlap a
+		// fact rather than a hope.
+		release := make(chan struct{})
+		ready := make(chan struct{}, len(attempts))
+
+		var finished sync.WaitGroup
+		for i := range attempts {
+			finished.Add(1)
+			go func(i int) {
+				defer finished.Done()
+
+				ready <- struct{}{}
+				<-release
+
+				attempts[i].row, attempts[i].err = ds.ClaimEventForReplay(ctx, entry.EventID, replayLease)
+			}(i)
+		}
+
+		for range attempts {
+			<-ready
+		}
+		close(release)
+		finished.Wait()
+
+		winners := make([]*model.EventOutbox, 0, len(attempts))
+		var conflicts int
+		for i, result := range attempts {
+			if result.err == nil {
+				require.NotNilf(t, result.row, "attempt %d returned neither a row nor an error", i)
+				winners = append(winners, result.row)
+
+				continue
+			}
+
+			requireAPIError(t, result.err, apierror.ErrConflict)
+			conflicts++
+			assert.Nilf(t, result.row,
+				"attempt %d reported a conflict and must return no row with it: a caller that "+
+					"reads the row anyway would publish the event the winner is publishing", i)
+		}
+
+		require.Lenf(t, winners, 1,
+			"round %d: EXACTLY ONE of two simultaneous replay claims may succeed; %d did. Two "+
+				"winners means the claim is a read followed by a write rather than one conditional "+
+				"UPDATE, and the same dead-lettered event is republished twice onto its original "+
+				"topic", round, len(winners))
+		require.Equalf(t, 1, conflicts,
+			"round %d: the loser must be told the row is unavailable rather than receiving a "+
+				"database error it cannot interpret", round)
+
+		winner := winners[0]
+		require.NotEmpty(t, winner.ClaimToken, "the winning claim must issue a token")
+		assert.Equal(t, model.EventOutboxStatusReplaying, winner.Status)
+
+		// THE DATABASE IS THE ARBITER. Two return values agreeing is not the property; the row
+		// holding exactly one claim is.
+		stored, err := ds.GetEventByID(ctx, entry.EventID)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equalf(t, model.EventOutboxStatusReplaying, stored.Status,
+			"round %d: the row must be replaying once a claim has been granted", round)
+		assert.Equalf(t, winner.ClaimToken, stored.ClaimToken,
+			"round %d: the stored token must be the WINNER's. A loser that overwrote it would fence "+
+				"the winner out of its own replay, and the event would be left stuck in replaying "+
+				"with nobody able to finish or release it", round)
+
+		// AND THE LOSER CANNOT ACT. Its own release must be refused, or a caller that treated
+		// the conflict as recoverable could roll back a replay that is under way.
+		require.Error(t, ds.ReleaseEventReplay(ctx, entry.ID, uuid.NewString(), "loser interference"),
+			"a token the row does not hold must not be able to release the replay")
+
+		// Leave the row terminal so it cannot interact with a later round's claim assertions.
+		require.NoError(t,
+			ds.ReleaseEventReplay(ctx, winner.ID, winner.ClaimToken, "round complete"))
+	}
 }
 
 // TestCountEventOutboxByStatus_ReconcilesAgainstInsertedRows_RealDB is acceptance
@@ -7296,7 +7759,7 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	//
 	// This assertion used to pin "idx_event_outbox_claim" by name, then a list of two names,
 	// and it failed on plans that honour the guarantee completely — a Bitmap Index Scan on
-	// idx_event_outbox_partition_key_inflight, and an Index Scan on
+	// idx_event_outbox_effective_key_inflight, and an Index Scan on
 	// idx_event_outbox_status_open. THREE indexes on this table satisfy the guarantee for the
 	// shape seeded above, and which one the planner picks is a cost decision that moves with
 	// heap compaction, statistics freshness and host load. Every widening of the name list
@@ -7357,7 +7820,7 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// That property is asserted rather than the name of one specific index, because
 	// PostgreSQL has TWO correct ways to satisfy it and picks between them on cost:
 	//
-	//   - a NESTED LOOP anti-join that probes idx_event_outbox_partition_key_inflight once
+	//   - a NESTED LOOP anti-join that probes idx_event_outbox_effective_key_inflight once
 	//     per candidate row, which wins when there are many candidates; and
 	//   - a HASH anti-join whose build side is read from idx_event_outbox_claim in ONE index
 	//     scan, which wins when the claimable working set is small — the steady state the
@@ -7405,21 +7868,6 @@ func TestClaimPendingEventOutbox_UsesClaimIndex_RealDB(t *testing.T) {
 	// that sort's input to the claimable working set rather than to the whole table.
 }
 
-// assertScanExcludesDispatchedHistory WAS RETIRED HERE, in favour of
-// requireColdHistoryExcludingIndex, which asks PostgreSQL the same question instead of
-// pattern-matching the answer.
-//
-// It read the predicate out of pg_indexes — which was the right move, and the reason it replaced
-// a list of index names — and then decided whether that predicate admitted the dispatched state
-// with a four-arm switch over its TEXT. Two failure modes followed from that, and both are the
-// wrong direction: `admitsDispatched` started true and only the four recognised shapes cleared
-// it, so a correct predicate written a fifth way was reported as a defect; and the
-// `status = ANY (ARRAY[...])` arm left it true whenever the list could not be cut out of the
-// string, which is a pass turned into a failure by a rendering change.
-//
-// Splicing the predicate into a COUNT over the seeded rows needs none of those cases and cannot
-// be defeated by a rewrite, because the evaluator that answers it is the one that decides what
-// the index contains.
 // indexNameFromPlanLine extracts the index name from an EXPLAIN scan line.
 //
 // Both spellings the planner emits are handled — "Index Scan using <name> on <rel>" and
@@ -7465,7 +7913,9 @@ func indexNameFromPlanLine(planLine string) string {
 // the read is index-driven, and through a blocking-state partial index — while accepting
 // either shape. It does not weaken the sequential-scan prohibition: a `Seq Scan` node has no
 // index child, so its access path carries no index name and no "Index", and the whole-plan
-// `Seq Scan on event_outbox` assertion is unaffected either way.
+// `Seq Scan on event_outbox` assertion is unaffected either way. This is why there is no
+// helper returning the single plan LINE that mentions a relation: on a bitmap plan that line is
+// `Bitmap Heap Scan on event_outbox candidate` and the index is nowhere in it.
 //
 // # How the children are found
 //
@@ -7571,14 +8021,14 @@ func TestPlanAccessPathFor_CarriesTheIndexNodesBeneathTheRelation(t *testing.T) 
 				"        Filter: (attempts < max_attempts)\n" +
 				"        ->  Bitmap Index Scan on idx_event_outbox_claim  (cost=0.00..41.00 rows=20 width=0)\n" +
 				"              Index Cond: (status = ANY ('{pending,processing}'::text[]))\n" +
-				"  ->  Index Scan using idx_event_outbox_partition_key_inflight on event_outbox earlier\n",
+				"  ->  Index Scan using idx_event_outbox_effective_key_inflight on event_outbox earlier\n",
 			wantContains: []string{
 				"Bitmap Heap Scan on event_outbox candidate",
 				"Bitmap Index Scan on idx_event_outbox_claim",
 			},
 			// The SIBLING node's index must not be absorbed: it is a different access path,
 			// and folding it in would let one relation's index satisfy another's assertion.
-			wantOmits: []string{"idx_event_outbox_partition_key_inflight"},
+			wantOmits: []string{"idx_event_outbox_effective_key_inflight"},
 		},
 		{
 			name: "a sequential scan yields no index, so the guarantee still fails on it",
@@ -7636,8 +8086,8 @@ func TestPlanIndexesUsed_NamesEveryIndexAnExplainPlanReads(t *testing.T) {
 		{
 			name: "bitmap index scan names the index after on",
 			plan: "Bitmap Heap Scan on event_outbox candidate\n" +
-				"  ->  Bitmap Index Scan on idx_event_outbox_partition_key_inflight  (cost=0.00..40.24 rows=20 width=0)\n",
-			want: []string{"idx_event_outbox_partition_key_inflight"},
+				"  ->  Bitmap Index Scan on idx_event_outbox_effective_key_inflight  (cost=0.00..40.24 rows=20 width=0)\n",
+			want: []string{"idx_event_outbox_effective_key_inflight"},
 		},
 		{
 			name: "index scan names the index after using and stops before on",
@@ -7648,9 +8098,9 @@ func TestPlanIndexesUsed_NamesEveryIndexAnExplainPlanReads(t *testing.T) {
 			name: "every index in a multi node plan is reported in plan order",
 			plan: "Sort  (cost=204.17..204.19 rows=6 width=458)\n" +
 				"  ->  Bitmap Index Scan on idx_event_outbox_claim\n" +
-				"  ->  Index Scan using idx_event_outbox_partition_key_inflight on event_outbox earlier\n" +
+				"  ->  Index Scan using idx_event_outbox_effective_key_inflight on event_outbox earlier\n" +
 				"  ->  Index Scan using event_outbox_pkey on event_outbox\n",
-			want: []string{"idx_event_outbox_claim", "idx_event_outbox_partition_key_inflight", "event_outbox_pkey"},
+			want: []string{"idx_event_outbox_claim", "idx_event_outbox_effective_key_inflight", "event_outbox_pkey"},
 		},
 		{
 			name: "index only scan and backward scan are recognised",
@@ -10220,6 +10670,290 @@ func TestListDeadLetterInventory_FiltersPagesAndCountsInSQL_RealDB(t *testing.T)
 	})
 }
 
+// ---------------------------------------------------------------------------
+// The driver seam
+//
+// Two properties of the paired read cannot be observed from outside the call: that a write
+// committed BETWEEN its two statements is invisible to the second one, and that the
+// transaction it opens is the isolation level and access mode it documents. Both live below
+// database/sql, so the test reaches them by wrapping the driver rather than by inference.
+//
+// This is a test-only seam and it exists for exactly one test. It intercepts nothing and
+// changes nothing by default: every method delegates, and the hook fires only for a
+// statement the test named and only while the test has armed it.
+// ---------------------------------------------------------------------------
+
+// snapshotProbe is the recording and injection point a probed connection reports to.
+//
+// It is safe for concurrent use because database/sql may drive several connections from one
+// *sql.DB, and the recording must not itself be the thing that makes a test flaky.
+type snapshotProbe struct {
+	mu sync.Mutex
+	// seen is every statement text the probe observed, in order, so a hook that stopped
+	// matching can say what it saw instead of merely reporting zero firings.
+	seen []string
+	// options is every driver.TxOptions BeginTx was called with, which is how the isolation
+	// level and the read-only flag are asserted as REQUESTED rather than as inferred.
+	options []driver.TxOptions
+	// hook runs immediately before a matching statement is sent to the server.
+	hook func()
+	// matches decides which statement the hook precedes.
+	matches func(string) bool
+	// fired counts hook invocations, so the injection can be proved to have happened.
+	fired int
+}
+
+// newSnapshotProbe returns an unarmed probe. It records, and does nothing else, until a hook
+// is installed.
+func newSnapshotProbe() *snapshotProbe {
+	return &snapshotProbe{seen: make([]string, 0, 8), options: make([]driver.TxOptions, 0, 2)}
+}
+
+// beforeCountOn arms the probe to run hook immediately before the dead-letter COUNT statement.
+//
+// The predicate is deliberately narrow — the count is the only statement in this repository
+// that counts blnk.event_outbox rows — and deliberately structural rather than an exact
+// string, so that a whitespace change in the query does not silently disarm the probe. A
+// change that removes the statement entirely disarms it loudly instead, because firings() then
+// returns zero and the test requires one.
+func (probe *snapshotProbe) beforeCountOn(hook func()) {
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+
+	probe.hook = hook
+	probe.matches = func(statement string) bool {
+		return strings.Contains(statement, "COUNT(*)") &&
+			strings.Contains(statement, "blnk.event_outbox")
+	}
+}
+
+// observe records a statement and, when it is the one the hook precedes, runs the hook.
+//
+// The hook runs with the probe's lock RELEASED. It commits on another connection and would
+// otherwise be holding a lock that connection's own bookkeeping may need, and a test that
+// deadlocks in its instrumentation is worse than one that does not exist.
+func (probe *snapshotProbe) observe(statement string) {
+	probe.mu.Lock()
+	probe.seen = append(probe.seen, statement)
+	hook := probe.hook
+	matched := probe.matches != nil && probe.matches(statement)
+	if matched {
+		probe.fired++
+	}
+	probe.mu.Unlock()
+
+	if matched && hook != nil {
+		hook()
+	}
+}
+
+// observeTransaction records what BeginTx was asked for.
+func (probe *snapshotProbe) observeTransaction(options driver.TxOptions) {
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+
+	probe.options = append(probe.options, options)
+}
+
+// firings reports how many times the hook ran.
+func (probe *snapshotProbe) firings() int {
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+
+	return probe.fired
+}
+
+// statements returns a copy of every statement text observed.
+func (probe *snapshotProbe) statements() []string {
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+
+	return slices.Clone(probe.seen)
+}
+
+// transactions returns a copy of every transaction option set observed.
+func (probe *snapshotProbe) transactions() []driver.TxOptions {
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+
+	return slices.Clone(probe.options)
+}
+
+// probedConnector hands out connections that report to a probe.
+//
+// A connector rather than a registered driver name, so the probe is reached through the value
+// the test owns instead of through a package-level registry: two tests can hold two probes at
+// once and neither can observe the other's statements.
+type probedConnector struct {
+	base  driver.Connector
+	probe *snapshotProbe
+}
+
+// Connect opens one connection and wraps it.
+func (connector probedConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	inner, err := connector.base.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &probedConn{inner: inner, probe: connector.probe}, nil
+}
+
+// Driver returns the underlying driver, unwrapped: nothing consults it but database/sql's own
+// bookkeeping, which has no interest in the probe.
+func (connector probedConnector) Driver() driver.Driver { return connector.base.Driver() }
+
+// probedConn delegates every operation to a real lib/pq connection, reporting the statement
+// texts and transaction options to the probe on the way through.
+//
+// Every optional interface lib/pq implements is implemented here too. That completeness is
+// load-bearing rather than tidy: a missing QueryerContext sends database/sql down the
+// prepare-then-execute path, where the statement text is seen at a different moment, and a
+// missing ConnBeginTx would make BeginTx fall back to a plain BEGIN and silently discard the
+// isolation level this test exists to assert.
+type probedConn struct {
+	inner driver.Conn
+	probe *snapshotProbe
+}
+
+// Prepare satisfies driver.Conn. Present because the interface requires it; database/sql
+// prefers PrepareContext.
+func (conn *probedConn) Prepare(query string) (driver.Stmt, error) {
+	conn.probe.observe(query)
+
+	return conn.inner.Prepare(query)
+}
+
+// PrepareContext records the statement and delegates.
+func (conn *probedConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	conn.probe.observe(query)
+
+	preparer, ok := conn.inner.(driver.ConnPrepareContext)
+	if !ok {
+		return conn.inner.Prepare(query)
+	}
+
+	return preparer.PrepareContext(ctx, query)
+}
+
+// Close releases the underlying connection.
+func (conn *probedConn) Close() error { return conn.inner.Close() }
+
+// Begin satisfies driver.Conn.
+func (conn *probedConn) Begin() (driver.Tx, error) { //nolint:staticcheck // required by driver.Conn
+	return conn.inner.Begin() //nolint:staticcheck // delegating the deprecated method
+}
+
+// BeginTx records the requested isolation level and access mode, then delegates.
+func (conn *probedConn) BeginTx(ctx context.Context, options driver.TxOptions) (driver.Tx, error) {
+	conn.probe.observeTransaction(options)
+
+	beginner, ok := conn.inner.(driver.ConnBeginTx)
+	if !ok {
+		return conn.inner.Begin() //nolint:staticcheck // the pre-1.8 fallback
+	}
+
+	return beginner.BeginTx(ctx, options)
+}
+
+// QueryContext is where the injection happens: the probe sees the statement, runs its hook if
+// this is the one it was armed for, and only then is the query sent.
+func (conn *probedConn) QueryContext(
+	ctx context.Context,
+	query string,
+	args []driver.NamedValue,
+) (driver.Rows, error) {
+	queryer, ok := conn.inner.(driver.QueryerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+
+	conn.probe.observe(query)
+
+	return queryer.QueryContext(ctx, query, args)
+}
+
+// ExecContext records and delegates.
+func (conn *probedConn) ExecContext(
+	ctx context.Context,
+	query string,
+	args []driver.NamedValue,
+) (driver.Result, error) {
+	execer, ok := conn.inner.(driver.ExecerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+
+	conn.probe.observe(query)
+
+	return execer.ExecContext(ctx, query, args)
+}
+
+// Ping delegates so database/sql's health checks keep working.
+func (conn *probedConn) Ping(ctx context.Context) error {
+	pinger, ok := conn.inner.(driver.Pinger)
+	if !ok {
+		return nil
+	}
+
+	return pinger.Ping(ctx)
+}
+
+// ResetSession delegates so pooled connections are recycled as lib/pq expects.
+func (conn *probedConn) ResetSession(ctx context.Context) error {
+	resetter, ok := conn.inner.(driver.SessionResetter)
+	if !ok {
+		return nil
+	}
+
+	return resetter.ResetSession(ctx)
+}
+
+// IsValid delegates the pool's validity check.
+func (conn *probedConn) IsValid() bool {
+	validator, ok := conn.inner.(driver.Validator)
+	if !ok {
+		return true
+	}
+
+	return validator.IsValid()
+}
+
+// openProbedEventOutboxDB returns a Datasource whose statements pass through a probe.
+//
+// It opens its OWN pool rather than wrapping the shared one, because the injection has to
+// commit on a connection that is not the one holding the snapshot. The caller keeps using the
+// locked datasource for fixtures and cleanup; only the call under observation goes through
+// this one.
+//
+// Parameters:
+//   - t *testing.T: owns the pool's lifetime.
+//   - probe *snapshotProbe: the recorder and injection point.
+//
+// Returns:
+//   - Datasource: a datasource over the same database, observed.
+func openProbedEventOutboxDB(t *testing.T, probe *snapshotProbe) Datasource {
+	t.Helper()
+
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = defaultRealTestDSN
+	}
+
+	base, err := pq.NewConnector(dsn)
+	require.NoError(t, err, "building a lib/pq connector for the probed pool")
+
+	db := sql.OpenDB(probedConnector{base: base, probe: probe})
+	require.NoError(t, db.Ping(), "the probed pool must reach the same database")
+	t.Cleanup(func() {
+		if closeErr := db.Close(); closeErr != nil {
+			logrus.WithError(closeErr).Warn("closing the probed event outbox pool")
+		}
+	})
+
+	return Datasource{Conn: db}
+}
+
 // TestListAndCountDeadLetterInventory_DrawsBothAnswersFromOneSnapshot_RealDB is the property a
 // shared predicate could never deliver on its own.
 //
@@ -10288,32 +11022,93 @@ func TestListAndCountDeadLetterInventory_DrawsBothAnswersFromOneSnapshot_RealDB(
 		}
 	})
 
-	t.Run("a row written mid-read is in neither answer", func(t *testing.T) {
-		// The insert runs after the transaction's FIRST statement, from this test's own
-		// connection. Under two independent reads the count would see four and the page three;
-		// under one snapshot both see three.
-		before, beforeTotal, err := ds.ListAndCountDeadLetterInventory(ctx,
+	t.Run("a row committed BETWEEN the page and the count is in neither answer", func(t *testing.T) {
+		// THIS IS THE ONLY ARRANGEMENT THAT DISCRIMINATES, and the reason is worth stating
+		// plainly because the obvious arrangement does not.
+		//
+		// Writing a row between two COMPLETE invocations proves nothing. Two autocommit reads
+		// per invocation would pass it just as readily: each pair runs its page and its count
+		// microseconds apart with nothing writing in between, so the two answers agree by
+		// coincidence of timing and the assertion never fires. The property under test is not
+		// "the pair agrees when nothing changes" — it is "the pair agrees WHEN SOMETHING DOES",
+		// and the only place something can change is INSIDE one invocation, after its first
+		// statement and before its second.
+		//
+		// So the write is injected at the driver seam. The probe fires immediately before the
+		// count statement leaves for the server, commits a fourth matching row on a SEPARATE
+		// connection, and returns. In PostgreSQL a REPEATABLE READ snapshot is taken by the
+		// transaction's FIRST statement — BEGIN ISOLATION LEVEL ... acquires none — so the page
+		// has already fixed the snapshot and the count must still see three. Under two
+		// independent reads the count sees four and the pair contradicts itself by exactly the
+		// row the relay dead-lettered in between, which is the production symptom: a triage
+		// endpoint that reports 41 entries and a total of 40.
+		probe := newSnapshotProbe()
+		probed := openProbedEventOutboxDB(t, probe)
+
+		var injected string
+		probe.beforeCountOn(func() {
+			injected = deadLetter(4 * time.Second)
+		})
+
+		page, total, err := probed.ListAndCountDeadLetterInventory(ctx,
 			model.DeadLetterInventoryQuery{Limit: maxDeadLetterPageSize, EventType: eventType})
 		require.NoError(t, err)
-		require.Equal(t, int64(3), beforeTotal)
-		require.Len(t, before.Entries, 3)
 
-		deadLetter(4 * time.Second)
+		// NON-VACUITY FIRST. Everything below is a claim about a write that landed between two
+		// statements, and it is worthless if the write did not land there. The probe reports
+		// how many times it fired, and the row is separately proved to exist.
+		require.Equalf(t, 1, probe.firings(),
+			"the probe must have fired exactly once, immediately before the count statement. "+
+				"Zero firings means the count no longer matches the statement this probe "+
+				"recognises and the whole subtest is vacuous; more than one means the pair is "+
+				"issuing several counts.\nstatements seen:\n  %s",
+			strings.Join(probe.statements(), "\n  "))
+		require.NotEmpty(t, injected, "the injected row must have been created")
 
-		after, afterTotal, err := ds.ListAndCountDeadLetterInventory(ctx,
+		// THE ASSERTION. Three, from the snapshot the page took, not the four now committed.
+		assert.Equalf(t, int64(3), total,
+			"the count must be answered from the snapshot the PAGE took. A fourth matching row "+
+				"was committed on another connection between the two statements, so a count of 4 "+
+				"means the two answers came from two snapshots and the total describes a set the "+
+				"page is not a slice of")
+		assert.Len(t, page.Entries, 3,
+			"the page is the earlier half of the same snapshot and cannot see the row either")
+		assert.Equalf(t, int64(len(page.Entries)), total,
+			"a full page and its total must agree even when the inventory changed underneath "+
+				"them; that agreement is the entire contract of the paired read")
+		assert.False(t, page.HasMore,
+			"has_more is read inside the same snapshot, so the probe row must not make the page "+
+				"claim a successor that the total does not count")
+
+		for _, entry := range page.Entries {
+			assert.NotEqualf(t, injected, entry.EventID,
+				"the row committed after the snapshot was taken must not appear in the page")
+		}
+
+		// THE ISOLATION IS ASSERTED AT THE SEAM, not inferred from the outcome. A pair that
+		// happened to agree for some other reason — one statement doing both jobs, a cached
+		// count — would satisfy the assertions above while the documented mechanism was gone.
+		// The driver records what BeginTx was actually asked for.
+		options := probe.transactions()
+		require.Lenf(t, options, 1,
+			"the paired read must open EXACTLY ONE transaction; %d means the page and the count "+
+				"are not sharing one", len(options))
+		assert.Equalf(t, driver.IsolationLevel(sql.LevelRepeatableRead), options[0].Isolation,
+			"the snapshot must be REPEATABLE READ. READ COMMITTED takes a fresh snapshot per "+
+				"statement, so the count would see the injected row even inside one transaction")
+		assert.Truef(t, options[0].ReadOnly,
+			"the transaction must be declared READ ONLY: it exists to read, and the declaration "+
+				"is what makes it impossible for this path to write")
+
+		// AND THE SNAPSHOT IS PER CALL, NOT PER PROCESS. A later read must see the fourth row,
+		// or "coherent" would have been achieved by never observing anything new again.
+		later, laterTotal, err := ds.ListAndCountDeadLetterInventory(ctx,
 			model.DeadLetterInventoryQuery{Limit: maxDeadLetterPageSize, EventType: eventType})
 		require.NoError(t, err)
-
-		// A LATER snapshot sees the new row — the transaction is per call, not per test, so the
-		// pair is coherent without being frozen in time.
-		assert.Equal(t, int64(4), afterTotal)
-		assert.Len(t, after.Entries, 4)
-
-		// AND THE PAIR STILL AGREES. This is the assertion that fails on two independent reads:
-		// the page length and the total must describe one population at every observation.
-		assert.Equal(t, int64(len(after.Entries)), afterTotal,
-			"a full page and its total must agree; when they are two snapshots they can differ by "+
-				"whatever the relay dead-lettered in between")
+		assert.Equal(t, int64(4), laterTotal,
+			"a subsequent call takes a NEW snapshot; the pair is coherent without being frozen")
+		assert.Len(t, later.Entries, 4)
+		assert.Equal(t, int64(len(later.Entries)), laterTotal)
 	})
 
 	t.Run("a snapshot read writes nothing", func(t *testing.T) {
@@ -10887,7 +11682,7 @@ func planScanIsConfinedToBlockingStates(node string) bool {
 	for _, partial := range []string{
 		"idx_event_outbox_claim",
 		"idx_event_outbox_claim_order",
-		"idx_event_outbox_partition_key_inflight",
+		"idx_event_outbox_effective_key_inflight",
 		"idx_event_outbox_pending",
 	} {
 		if strings.Contains(node, partial) {
@@ -10954,7 +11749,7 @@ func TestPlanScanIsConfinedToBlockingStates(t *testing.T) {
 		},
 		{
 			name:     "the inflight index the anti-join probes",
-			node:     "->  Index Scan using idx_event_outbox_partition_key_inflight on event_outbox earlier",
+			node:     "->  Index Scan using idx_event_outbox_effective_key_inflight on event_outbox earlier",
 			confined: true,
 		},
 		{
@@ -11576,16 +12371,6 @@ func TestListDeadLetteredEvents_ErrorsAreWrapped(t *testing.T) {
 	}
 }
 
-// planLineReferencing WAS RETIRED HERE, in favour of planAccessPathFor.
-//
-// It returned the single plan LINE that mentioned a relation, and that is not where the index is
-// named when the planner chooses a bitmap plan: the relation line reads
-// `Bitmap Heap Scan on event_outbox candidate` and the index appears on the CHILD node beneath
-// it. An assertion made on the line alone therefore saw neither the word "Index" nor an index
-// name, and reported a defect against a plan that honoured the guarantee completely.
-//
-// planAccessPathFor returns the node together with its index children, which makes the guarantee
-// assertable under either plan shape without pinning the shape.
 // TestListDeadLetteredEvents_PagesNewestFirst_RealDB asserts the ordering and paging the
 // dead-letter API relies on, against real SQL.
 //
@@ -11661,7 +12446,7 @@ func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
 //
 // This replaced a list of index names that had to be widened twice, each time by a plan that
 // honoured the guarantee completely. Three indexes on blnk.event_outbox qualify —
-// idx_event_outbox_claim, idx_event_outbox_partition_key_inflight and
+// idx_event_outbox_claim, idx_event_outbox_effective_key_inflight and
 // idx_event_outbox_status_open — and PostgreSQL chooses between them on cost, which moves with
 // heap compaction, statistics freshness and host load. A name list therefore encoded a guess
 // about the planner rather than a requirement on the schema, and it failed as a test while the
@@ -11680,6 +12465,18 @@ func TestListDeadLetteredEvents_PagesNewestFirst_RealDB(t *testing.T) {
 // by triage, alerted on by blnk_dlt_oldest_message_age_seconds, and orders of magnitude
 // smaller than the dispatched history in any healthy pipeline. Requiring their exclusion would
 // reject a legitimate index for a population the system already has a control for.
+//
+// # Why the predicate is EVALUATED rather than parsed
+//
+// A predecessor read the same predicate out of pg_indexes — which was the right move, and the
+// reason it replaced the name list — and then decided whether it admitted the dispatched state
+// with a four-arm switch over its TEXT. Both of that switch's failure modes pointed the wrong
+// way: its verdict started at "admits dispatched" and only the four recognised spellings
+// cleared it, so a correct predicate written a fifth way was reported as a defect; and its
+// `status = ANY (ARRAY[...])` arm left the verdict standing whenever the list could not be cut
+// out of the string, turning a rendering change into a failure. Splicing the predicate into a
+// COUNT over the seeded rows needs none of those cases and cannot be defeated by a rewrite,
+// because the evaluator that answers the question is the one that decides what the index holds.
 //
 // Parameters:
 //   - t *testing.T: the test.
@@ -12156,38 +12953,48 @@ func TestUnknownEventOutboxIndexIn_TellsForeignIndexesFromDeclaredOnes_RealDB(t 
 	})
 
 	t.Run("an index in the catalog that no migration declares is foreign", func(t *testing.T) {
-		// Discovered from the catalog rather than named, so this subtest describes the
-		// CONDITION and does not depend on any particular other checkout having run.
+		// THE FOREIGN INDEX IS CREATED HERE RATHER THAN LOOKED FOR.
+		//
+		// This subtest used to scan pg_indexes for an index no migration declares and SKIP when
+		// it found none — which is the state of every correctly migrated database, including
+		// every CI database. So the positive direction of the guard, the direction that decides
+		// whether a plan assertion is skipped or trusted, ran only on a developer's machine that
+		// happened to have another checkout's migrations applied to it. It was reported as a
+		// pass everywhere else, and a skip is not a pass.
+		//
+		// Creating the condition makes the assertion unconditional. The index is dropped in
+		// cleanup on every path, and its name is deliberately unmistakable so a leaked one is
+		// identifiable rather than mysterious: nothing in sql/ declares it, and the guard it
+		// feeds treats exactly that as foreign.
+		//
+		// It is safe on a shared database for as long as it exists, which is the duration of
+		// this subtest: it is an ordinary btree on one column, it changes no plan this suite
+		// asserts on — `TestClaimPendingEventOutbox_UsesClaimIndex_RealDB` reads the same
+		// catalog and would skip while it existed, and the two never overlap because subtests
+		// here do not run in parallel — and DROP INDEX IF EXISTS in cleanup is idempotent.
+		const foreign = "idx_event_outbox_foreign_index_probe"
+
+		_, err := ds.Conn.ExecContext(ctx,
+			`CREATE INDEX IF NOT EXISTS `+foreign+` ON blnk.event_outbox (schema_version)`)
+		require.NoError(t, err,
+			"the probe index must be creatable: without it this subtest can only skip, and the "+
+				"positive direction of the guard is what decides whether a plan assertion is "+
+				"trusted")
+		t.Cleanup(func() {
+			_, dropErr := ds.Conn.ExecContext(ctx, `DROP INDEX IF EXISTS blnk.`+foreign)
+			assert.NoError(t, dropErr,
+				"the probe index must be dropped: left behind, it makes the claim-index plan "+
+					"assertion skip on this database for every later run")
+		})
+
+		// THE PREMISE, asserted rather than assumed: the name must genuinely be absent from every
+		// migration, or the guard would be right to ignore it and this subtest would be testing
+		// nothing.
 		migrationSQL, err := readMigrationSource(t)
 		require.NoError(t, err)
-
-		rows, err := ds.Conn.QueryContext(ctx, `
-			SELECT indexname FROM pg_indexes
-			WHERE schemaname = 'blnk' AND tablename = 'event_outbox'
-			ORDER BY indexname
-		`)
-		require.NoError(t, err)
-		defer func() { _ = rows.Close() }()
-
-		var foreign string
-		for rows.Next() {
-			var name string
-			require.NoError(t, rows.Scan(&name))
-
-			// The primary key and the unique indexes are declared as constraints rather than
-			// by name in the migrations, so they are not candidates for this check.
-			if !strings.Contains(migrationSQL, name) && strings.HasPrefix(name, "idx_") {
-				foreign = name
-
-				break
-			}
-		}
-		require.NoError(t, rows.Err())
-
-		if foreign == "" {
-			t.Skip("this database carries no event_outbox index outside the migrations, so the " +
-				"positive direction of the guard has nothing to exercise here")
-		}
+		require.NotContains(t, migrationSQL, foreign,
+			"the probe index name must appear in no migration; if a migration ever declares it, "+
+				"this subtest is exercising the negative direction under a positive name")
 
 		line := "->  Index Scan using " + foreign + " on event_outbox candidate  (cost=0.26..30.46 rows=7)"
 		assert.Equal(t, foreign, unknownEventOutboxIndexIn(t, ctx, ds, line),
@@ -12202,4 +13009,119 @@ func TestUnknownEventOutboxIndexIn_TellsForeignIndexesFromDeclaredOnes_RealDB(t 
 		line := "->  Index Scan using idx_not_a_real_index_anywhere on transactions t  (cost=0.26..30.46 rows=7)"
 		assert.Empty(t, unknownEventOutboxIndexIn(t, ctx, ds, line))
 	})
+}
+
+// TestClaimPendingEventOutbox_SerialisesOnTheEffectiveKey is the structural half of PERF-C02:
+// that the claim's earlier-same-key exclusion compares the key the PUBLISHER uses and not the
+// stored column.
+//
+// # Why the column was the wrong key
+//
+// The Kafka message key is model.EffectivePartitionKey — the row's ledger where it has one, its
+// stored partition_key where it does not — because requirement R-6 partitions by ledger id. The
+// exclusion is the statement "at most one row per Kafka partition key is in flight", and written
+// against partition_key it was a statement about a different value. The two disagree on exactly
+// the rows the schema permits: a row written before the ledger reached its call site, or one
+// whose partition key was derived from the payload before the ledger was resolved. Two such rows
+// of ONE ledger have different stored keys, so the exclusion did not hold them apart — while the
+// publisher hashed both to one partition, letting two relay replicas append them in either order.
+//
+// This asserts over the query text, which needs no database and cannot be satisfied by a fake:
+// the guarantee is a property of the SQL. The behavioural proof, with two relays and a real
+// broker, is TestEventOrdering_DivergentStoredKeysStaySerialisedAcrossRelayReplicas.
+func TestClaimPendingEventOutbox_SerialisesOnTheEffectiveKey(t *testing.T) {
+	t.Parallel()
+
+	// BOTH sides, because an exclusion comparing the effective key on one side and the column on
+	// the other is worse than either: it would match almost nothing and exclude almost nothing.
+	assert.Contains(t, claimPendingEventOutboxQuery, eventOutboxEffectiveKeySQL("earlier")+" = "+eventOutboxEffectiveKeySQL("candidate"),
+		"the claim must exclude a candidate when an earlier row shares its EFFECTIVE key, with the "+
+			"same expression on both sides")
+
+	assert.NotContains(t, claimPendingEventOutboxQuery, "earlier.partition_key = candidate.partition_key",
+		"the superseded column comparison must not return: it leaves same-ledger rows with "+
+			"divergent stored keys unserialised while Kafka places them on one partition")
+
+	// The expression itself, spelled out here so a change to it has to be made in two places
+	// with this test's reasoning in front of the author.
+	assert.Equal(t,
+		"COALESCE(NULLIF(btrim(earlier.ledger_id), ''), btrim(earlier.partition_key))",
+		eventOutboxEffectiveKeySQL("earlier"),
+		"the SQL rendering must be model.EffectivePartitionKey term for term: ledger first, "+
+			"trimmed, with a blank ledger falling through to the partition key")
+
+	// And the ordering columns the exclusion's tuple comparison reads, which is what makes
+	// "earlier" mean earlier by OCCURRENCE rather than by insertion.
+	assert.Contains(t, claimPendingEventOutboxQuery,
+		"(earlier.occurred_at, earlier.id) < (candidate.occurred_at, candidate.id)",
+		"the exclusion must compare occurrence order, with the surrogate key breaking ties")
+}
+
+// TestClaimPendingEventOutbox_EffectiveKeyIndexMatchesTheQuery_RealDB closes the gap between a
+// correct predicate and a usable one.
+//
+// A partial expression index is usable ONLY when the query spells its expression identically.
+// A difference does not produce a wrong answer, which is what makes it dangerous: the claim
+// still serialises correctly and simply stops being index-backed, so every poll degrades into a
+// sequential scan of a table that grows by 43.2 million rows a day at the acceptance rate. That
+// is the same outage by a slower route, and nothing in a functional test would notice.
+//
+// So the index's definition is read out of pg_indexes and the query's own expression is required
+// to appear in it. Reading the catalogue rather than the migration text is deliberate: it is the
+// applied schema that decides whether the planner has an index, and a migration that was written
+// but never applied is exactly the state this would otherwise miss.
+func TestClaimPendingEventOutbox_EffectiveKeyIndexMatchesTheQuery_RealDB(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	var definition string
+	err := ds.Conn.QueryRowContext(ctx, `
+		SELECT indexdef
+		FROM pg_indexes
+		WHERE schemaname = 'blnk'
+		  AND tablename = 'event_outbox'
+		  AND indexname = 'idx_event_outbox_effective_key_inflight'
+	`).Scan(&definition)
+	require.NoError(t, err,
+		"idx_event_outbox_effective_key_inflight must exist: it is what keeps the claim's "+
+			"earlier-same-key exclusion an index probe rather than a scan of the key's whole "+
+			"history. Apply sql/1781252000.sql.")
+
+	// pg_indexes renders the expression with the columns UNQUALIFIED, because an index belongs to
+	// one relation. The query's expression is qualified by an alias, so the comparison is made
+	// against the unqualified rendering of the same rule.
+	unqualified := strings.ReplaceAll(eventOutboxEffectiveKeySQL(""), ".", "")
+	unqualified = strings.ReplaceAll(unqualified, "''", "''::text")
+
+	assert.Contains(t, definition, unqualified,
+		"the index expression and the claim's expression must be identical, or the planner cannot "+
+			"use the index for the exclusion.\nindex: %s\nquery expression: %s",
+		definition, eventOutboxEffectiveKeySQL("candidate"))
+
+	// The partial predicate is the BLOCKING set, and it is narrower than the claimable set on
+	// purpose: an exhausted, dead-lettered or webhook-owing row must not hold its key for ever.
+	assert.Contains(t, definition, "'pending'",
+		"the index must be partial on the blocking states")
+	assert.Contains(t, definition, "'processing'",
+		"the index must be partial on the blocking states")
+	assert.NotContains(t, definition, "webhook_pending",
+		"webhook_pending is CLAIMABLE but not BLOCKING: its position in the Kafka partition is "+
+			"already fixed, so blocking its key would let a failing legacy enqueue stall Kafka "+
+			"delivery for the whole aggregate")
+	assert.NotContains(t, definition, "dead_lettered",
+		"a dead-lettered row must not block its key for ever")
+
+	// And the superseded index is gone, so the hottest table in this schema is not maintaining a
+	// second key nothing probes.
+	var lingering int
+	require.NoError(t, ds.Conn.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM pg_indexes
+		WHERE schemaname = 'blnk'
+		  AND tablename = 'event_outbox'
+		  AND indexname = 'idx_event_outbox_partition_key_inflight'
+	`).Scan(&lingering))
+	assert.Zero(t, lingering,
+		"the superseded column index must be dropped: no statement probes it any more, so it is "+
+			"pure write amplification on every insert and every status transition")
 }

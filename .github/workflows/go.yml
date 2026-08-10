@@ -21,8 +21,18 @@ jobs:
         with:
           go-version: 1.25.12
 
-      - name: Tidy
-        run: go mod tidy
+      # A CHECK, NOT A REPAIR. `go mod tidy` on its own MUTATES the manifests and then the job
+      # builds and tests the repaired tree, so a pull request that added an import without
+      # updating go.mod, or that left a stale requirement behind, was silently fixed in CI and
+      # merged with manifests that do not describe it. `git diff --exit-code` turns the repair
+      # into the failure it should always have been: the committed manifests must already be
+      # tidy. Reproducibility depends on it — the module graph a release builds from is the one
+      # in the repository, not the one CI computed.
+      - name: Verify the dependency manifests are already tidy
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
       - name: Build
         run: go build ./cmd/*.go
@@ -76,8 +86,18 @@ jobs:
         with:
           go-version: 1.25.12
 
-      - name: Tidy
-        run: go mod tidy
+      # A CHECK, NOT A REPAIR. `go mod tidy` on its own MUTATES the manifests and then the job
+      # builds and tests the repaired tree, so a pull request that added an import without
+      # updating go.mod, or that left a stale requirement behind, was silently fixed in CI and
+      # merged with manifests that do not describe it. `git diff --exit-code` turns the repair
+      # into the failure it should always have been: the committed manifests must already be
+      # tidy. Reproducibility depends on it — the module graph a release builds from is the one
+      # in the repository, not the one CI computed.
+      - name: Verify the dependency manifests are already tidy
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
       - name: Migrate Database
         run: go run ./cmd migrate up
@@ -139,8 +159,18 @@ jobs:
         with:
           go-version: 1.25.12
 
-      - name: Tidy
-        run: go mod tidy
+      # A CHECK, NOT A REPAIR. `go mod tidy` on its own MUTATES the manifests and then the job
+      # builds and tests the repaired tree, so a pull request that added an import without
+      # updating go.mod, or that left a stale requirement behind, was silently fixed in CI and
+      # merged with manifests that do not describe it. `git diff --exit-code` turns the repair
+      # into the failure it should always have been: the committed manifests must already be
+      # tidy. Reproducibility depends on it — the module graph a release builds from is the one
+      # in the repository, not the one CI computed.
+      - name: Verify the dependency manifests are already tidy
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
       - name: Migrate Database
         run: go run ./cmd migrate up
@@ -228,8 +258,29 @@ jobs:
       # here is truthful; the isolation suite FAILS rather than skips if the broker turns out
       # not to enforce, so a false attestation could not make this job pass.
       KAFKA_DENY_BY_DEFAULT_ATTESTED: "true"
+      # THE SUBSCRIBER-FACING BROKER LIST, AND IT IS NOT OPTIONAL.
+      #
+      # Credential issuance names the addresses a SUBSCRIBER will connect to, which in a real
+      # deployment is the broker's external listener rather than the internal bootstrap list the
+      # relay uses. Issuance therefore refuses when this is unset rather than defaulting to
+      # KAFKA_BROKERS, so that a deployment cannot hand out its internal addresses by omission —
+      # and the isolation fixture refuses to paper over that refusal, so every
+      # TestEventIsolation_ test SKIPS without it.
+      #
+      # It was missing here, which made this job unable to pass on a clean run: nine isolation
+      # tests skipped and the fail-on-skip gate below then failed the job. The one job whose
+      # purpose is to prove the security criteria could not go green while doing so.
+      #
+      # Same value as KAFKA_BROKERS in this job only because the compose broker publishes its
+      # external listener onto the runner's localhost; they are separate settings and stay
+      # separately spelled.
+      KAFKA_SUBSCRIBER_BROKERS: localhost:9092
       BLNK_DATA_SOURCE_DNS: postgres://postgres@localhost:5432/blnk?sslmode=disable
       BLNK_REDIS_DNS: localhost:6379
+      # TypeSense is not part of this job's services, and it does not need to be: none of the
+      # selected suites indexes anything. It is set because ./api and ./database construct a
+      # service container during setup and an unset value makes that construction noisy.
+      BLNK_TYPESENSE_DNS: http://localhost:8108
 
     steps:
       - uses: actions/checkout@v4
@@ -284,21 +335,92 @@ jobs:
           fi
           echo "kafka-init completed successfully"
 
-      - name: Tidy
-        run: go mod tidy
+      - name: Verify the dependency manifests are already tidy
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
       - name: Migrate Database
         run: go run ./cmd migrate up
 
+      # THE SELECTION IS DECLARED ONCE, HERE, AND CHECKED BEFORE IT IS USED.
+      #
+      # The previous selector named six families against three packages and matched tests in
+      # ONE of them: `TestEventIsolation_|TestEventRecovery_|TestEventOrdering_|
+      # TestDeadLetterRouting_|TestDualDelivery_|TestEventReplay` selected 56 tests in the root
+      # package, ZERO in ./database, ZERO in ./api, and `TestEventReplay` matched nothing
+      # anywhere — the replay suite is named TestReplayFidelity_. So the repository-layer claims
+      # (the FIFO claim, SKIP LOCKED, the lease and the snapshot reads, all in ./database and all
+      # suffixed _RealDB) and the whole HTTP surface (./api) were never run against the broker or
+      # the migrated database, while the job's own summary announced that every selected test had
+      # run. A selector that matches nothing skips nothing, so the fail-on-skip gate reported
+      # success over the absence.
+      #
+      # Each entry is `<package> <regexp>`. The inventory step below runs `go test -list` for
+      # every one and FAILS when any matches zero tests, which is what stops a renamed family
+      # from silently leaving the acceptance set again.
+      - name: Declare the required acceptance families
+        run: |
+          set -euo pipefail
+          cat > kafka-families.txt <<'FAMILIES'
+          . ^TestEventIsolation_
+          . ^TestEventRecovery_
+          . ^TestEventOrdering_
+          . ^TestDeadLetterRouting_
+          . ^TestDualDelivery_
+          . ^TestReplayFidelity_
+          . ^TestZeroLoss_
+          ./database _RealDB$
+          ./api ^TestEventsAPI_
+          ./api ^TestSubscribersAPI_
+          ./api ^TestWebhookSunset_
+          FAMILIES
+          cat kafka-families.txt
+
+      # THE PRECONDITION. A selector is a claim about what will run, and it is the one claim in
+      # this job that nothing else can check: a suite that does not exist cannot skip, cannot
+      # fail, and cannot appear in any summary.
+      - name: Require every declared family to match at least one test
+        run: |
+          set -euo pipefail
+          missing=0
+          while read -r package pattern; do
+            [ -n "${package}" ] || continue
+            matched="$(go test -list "${pattern}" "${package}" | grep -c '^Test' || true)"
+            printf '%-12s %-28s %s test(s)\n' "${package}" "${pattern}" "${matched}"
+            if [ "${matched}" -eq 0 ]; then
+              echo "::error::the acceptance family ${pattern} matches NO test in ${package}"
+              missing=$((missing + 1))
+            fi
+          done < kafka-families.txt
+          if [ "${missing}" -ne 0 ]; then
+            echo ""
+            echo "${missing} declared acceptance famil(ies) matched nothing, so this job would"
+            echo "report success over suites that never ran. Either the family was renamed — in"
+            echo "which case update kafka-families.txt above — or the suite was deleted, in which"
+            echo "case the acceptance criterion it proved no longer has coverage."
+            exit 1
+          fi
+
       # -json so the skip check below has machine-readable output, and tee so a human reading
       # the log still sees the run. -p 1 because these suites share one broker and one outbox.
+      #
+      # The per-package invocation is deliberate: the patterns are package-specific — ./database's
+      # live suites are identified by a _RealDB suffix rather than a prefix — and one combined
+      # `-run` alternation applied to all three packages is exactly how the previous selector
+      # came to match nothing in two of them without anybody noticing.
       - name: Kafka acceptance suites
         run: |
           set -euo pipefail
-          go test -json -count=1 -p 1 \
-            -run 'TestEventIsolation_|TestEventRecovery_|TestEventOrdering_|TestDeadLetterRouting_|TestDualDelivery_|TestEventReplay' \
-            . ./database ./api 2>&1 | tee kafka-tests.json | \
-            jq -r 'select(.Action == "output") | .Output' | sed -e 's/[[:space:]]*$//'
+          : > kafka-tests.json
+          while read -r package pattern; do
+            [ -n "${package}" ] || continue
+            echo "==> ${package} ${pattern}"
+            go test -json -count=1 -p 1 -run "${pattern}" "${package}" 2>&1 | \
+              tee -a kafka-tests.json | \
+              jq -r 'select(.Action == "output") | .Output' | sed -e 's/[[:space:]]*$//'
+          done < kafka-families.txt
 
       # THE CHECK THIS JOB EXISTS FOR.
       #

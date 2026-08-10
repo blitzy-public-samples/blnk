@@ -112,12 +112,22 @@
 #   # interpolate into the SCRAM argument, the properties file and the JAAS login it
 #   # writes. This recipe is the one scripts/kafka-bootstrap.sh recommends, and it
 #   # satisfies all three checks by construction.
+#   # `head -c 32` IS LOAD-BEARING, AND SO IS `tr -dc`. Between them they produce
+#   # exactly 32 bytes from the safe alphabet AND NO TRAILING NEWLINE, which is what
+#   # the init container requires. `--from-file` reads a file's bytes verbatim: it does
+#   # not trim, so a newline in the file is a newline in the secret and a newline in the
+#   # environment variable the broker reads.
+#   #
+#   # A previous version of this block ended with `openssl rand -base64 24 > admin-secret`
+#   # instead, and because it came SECOND it overwrote the files the correct line had just
+#   # written. That form emits 32 base64 characters PLUS a newline, so the secret arrived
+#   # 33 characters long with whitespace in it, RULE 2 below rejected it as containing a
+#   # character outside the safe alphabet, and the init container exited 1 before the
+#   # metadata log was formatted. Verified in a container: the filtered form is accepted
+#   # at length 32; `openssl rand -base64 24 > file` is rejected at length 33.
 #   openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32 > admin-secret
 #   openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32 > producer-secret
 #
-#   umask 077
-#   openssl rand -base64 24 > admin-secret
-#   openssl rand -base64 24 > producer-secret
 #   kubectl -n blnk create secret generic kafka-credentials \
 #     --from-file=admin-secret=./admin-secret \
 #     --from-file=producer-secret=./producer-secret
@@ -468,10 +478,17 @@ spec:
 
               # RULE 2 — PASSWORD ALPHABET. The same interpolation hazard, for the
               # same three destinations. base64 output is deliberately admitted
-              # (A-Za-z0-9+/=) EXCEPT for '=' — so the header below instructs
-              # `openssl rand -base64 48 | tr -d '=+/'` rather than raw base64, and
-              # this check is what makes an operator who skipped that step fail here
-              # instead of seeding a truncated password.
+              # (A-Za-z0-9+/=) EXCEPT for '=' — so the header above instructs
+              # `openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32` rather than
+              # raw base64, and this check is what makes an operator who skipped that
+              # step fail here instead of seeding a truncated password.
+              #
+              # NOTE THAT WHITESPACE IS OUTSIDE THE SET, WHICH INCLUDES A NEWLINE. That
+              # is not incidental: `kubectl create secret --from-file` copies a file's
+              # bytes verbatim, so any recipe that redirects a command's output into a
+              # file without trimming ships the trailing newline as part of the
+              # credential and fails HERE. Every recipe quoted in this file therefore
+              # ends in `head -c <n>`, which emits an exact byte count and no newline.
               case "${KAFKA_SASL_ADMIN_SECRET}" in
                 *[!A-Za-z0-9._~+/-]* )
                   echo "kafka-bootstrap: the kafka-credentials admin-secret contains a character" >&2
@@ -481,7 +498,7 @@ spec:
                   echo "kafka-bootstrap: whitespace would truncate or re-point the credential" >&2
                   echo "kafka-bootstrap: rather than be rejected by the broker." >&2
                   echo "kafka-bootstrap: Generate one with:" >&2
-                  echo "kafka-bootstrap:   openssl rand -base64 48 | tr -d '=+/' | cut -c1-48" >&2
+                  echo "kafka-bootstrap:   openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32" >&2
                   exit 1
                   ;;
               esac
@@ -513,7 +530,7 @@ spec:
                 echo "kafka-bootstrap: ${SECRET_DISTINCT} distinct characters; at least 16 are required." >&2
                 echo "kafka-bootstrap: A long run of a few characters passes a length check and" >&2
                 echo "kafka-bootstrap: no attacker. Generate one with:" >&2
-                echo "kafka-bootstrap:   openssl rand -base64 48 | tr -d '=+/' | cut -c1-48" >&2
+                echo "kafka-bootstrap:   openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32" >&2
                 exit 1
               fi
               unset SECRET_LENGTH SECRET_DISTINCT
@@ -655,29 +672,54 @@ spec:
               # cluster.
               #
               # THE ARITHMETIC, because these numbers are derived rather
-              # than chosen:
+              # than chosen. THE TOPIC CATALOGUE IS model.AllEventCategories,
+              # which is four categories and not five:
               #
-              #   5 topics + 5 .dlt siblings = 10 topics
-              #   x KAFKA_MIN_PARTITIONS (6)  = 60 partitions
-              #   RF 3 over 3 brokers         => EVERY broker holds all 60
+              #   4 categories (transactions, balances, identities, system)
+              #     + their 4 .dlt siblings   = 8 topics
+              #   x KAFKA_MIN_PARTITIONS (6)  = 48 partitions
+              #   RF 3 over 3 brokers         => EVERY broker holds all 48
+              #
+              # DOC-m02: this block said "5 topics + 5 .dlt = 10 topics" and
+              # therefore 60 partitions, and it sized them against "200Gi".
+              # All three were wrong. A <prefix>.ledgers topic WAS implemented
+              # and then removed — ledger.created is published to
+              # <prefix>.system, as scripts/kafka-provision.sh records — and
+              # the volumeClaimTemplate at the foot of this file is 160Gi, not
+              # 200Gi. The template's own comment carried the correct
+              # derivation the whole time, so the two halves of one decision
+              # disagreed about both the numerator and the denominator.
               #
               # log.retention.bytes is PER PARTITION, which is the subtlety that
               # makes an eyeballed value wrong by two orders of magnitude. The
-              # volumeClaimTemplate below is 200Gi; targeting 60% of it for log
+              # volumeClaimTemplate below is 160Gi; targeting 60% of it for log
               # data leaves headroom for segment rolls, index files and the
               # cushion a broker needs to compact and delete rather than wedge:
               #
-              #   0.60 x 200 GiB / 60 partitions = 2 GiB per partition
-              #   worst case on disk: 60 x 2 GiB = 120 GiB, 60% of the volume
+              #   0.60 x 160 GiB / 48 partitions = 2 GiB per partition
+              #   worst case on disk: 48 x 2 GiB = 96 GiB, 60% of the volume
+              #
+              # The VALUE below is unchanged by this correction and was always
+              # right: 2 GiB per partition satisfies both the stale reading
+              # (0.60 x 200 / 60) and the true one (0.60 x 160 / 48). Only the
+              # derivation was wrong, which is precisely why it survived — an
+              # incorrect justification for a correct number is invisible until
+              # somebody scales one of the inputs using it.
               #
               # SCALING ANY OF THOSE INPUTS CHANGES THIS VALUE. More topics,
               # more partitions, more brokers than the replication factor, or
               # a differently sized volume all move it, and the direction that
               # hurts is a larger denominator with the same per-partition
-              # budget. Recompute rather than assume.
+              # budget. Recompute rather than assume. Adding one category topic
+              # adds six partitions on every broker, which is 12 GiB more log
+              # data against a budget with 64 GiB of headroom in it.
               #
-              # For scale: at a typical 2 KiB event, 500 events/second is
-              # about 3.4 GiB an hour per broker, so 120 GiB is roughly 35
+              # For scale, using the MEASURED envelope rather than a round
+              # number: a transaction event's event_raw is 963 bytes (see the
+              # capacity block in sql/1781248800.sql), so with the record key
+              # and Kafka's own per-record overhead a record is about 1 KiB. At
+              # 500 events/second that is roughly 1.7 GiB an hour per broker —
+              # every broker receives all of it at RF 3 — so 96 GiB is about 56
               # hours of sustained peak. At the 768 KiB ceiling
               # model.MaxEventMessageBytes allows it is minutes — which is the
               # point. NO plausible volume survives sustained worst-case
@@ -695,9 +737,20 @@ spec:
               # and it can only do that over a window both sides still hold —
               # so purging outbox rows before the records expire keeps the two
               # ageing together, while the reverse leaves rows with no records
-              # to reconcile against. Retention ships disabled (0 days), so
-              # nothing is currently in tension; raising it above 7 days
-              # requires raising this in the same change.
+              # to reconcile against.
+              #
+              # PERF-C03: this comment used to add "retention ships disabled
+              # (0 days), so nothing is currently in tension", and that had
+              # stopped being true — blnk-config.yaml shipped 90 days, which
+              # is nearly thirteen times this bound, so the coupling stated
+              # here was violated by the manifest it points at. Retention now
+              # ships at 3 days, so the margin is four days.
+              #
+              # 168 hours is 7 days, so RAISING RELAY_EVENT_RETENTION_DAYS
+              # ABOVE 7 REQUIRES RAISING THIS IN THE SAME CHANGE — and raising
+              # it at all requires resizing the pg-data volume in
+              # postgres-statefulset.yaml, which is sized from the outbox's
+              # measured per-row cost at that exact number of days.
               log.retention.hours=168
               # SEGMENT SIZE IS WHAT MAKES RETENTION ACTUALLY DELETE. Kafka
               # deletes whole CLOSED segments and never the active one, so the
@@ -757,7 +810,8 @@ spec:
               # IDEMPOTENCY IS --ignore-formatted, not a guard around it. On an
               # already-formatted volume the CLI prints "All of the log
               # directories are already formatted" and EXITS 0 — verified against
-              # apache/kafka 3.9.2 — so a restarted pod re-runs this and
+              # apache/kafka 4.3.1, the pinned release below — so a restarted pod
+              # re-runs this and
               # continues, rather than crash-looping the way a bare `format`
               # would. The credential is already in that log, so there is nothing
               # to re-seed.
@@ -835,9 +889,10 @@ spec:
               #
               # BE PRECISE ABOUT WHAT IT COST, because the failure is latent rather
               # than immediate and that is what let it survive. `kafka-storage format`
-              # on 3.9 and on 4.0 stores --cluster-id VERBATIM in meta.properties and
-              # does not parse it, so the format succeeds and a broker started against
-              # it comes up — verified against apache/kafka 3.9.2 and 4.0.0. The value
+              # on 3.9, on 4.0 and on 4.3 stores --cluster-id VERBATIM in
+              # meta.properties and does not parse it, so the format succeeds and a
+              # broker started against it comes up — verified against apache/kafka
+              # 3.9.2, 4.0.0 and 4.3.1, the pinned release. The value
               # is nonetheless permanently wrong: it is written into the metadata log
               # as the cluster's identity, every tool and client that turns a cluster
               # id back into a Uuid rejects it, and correcting it later means
@@ -1023,11 +1078,15 @@ spec:
                   name: blnk-config
                   key: KAFKA_CLUSTER_ID
                   optional: true
-          # The same tag the broker container runs, and it must stay that way:
-          # this container formats the log the next one reads, and a format
-          # written at one metadata.version and opened by a different release is
-          # how a broker refuses its own storage.
-          image: apache/kafka:3.9.2
+          # The same PINNED DIGEST the broker container runs, and it must stay
+          # that way: this container formats the log the next one reads, and a
+          # format written at one metadata.version and opened by a different
+          # release is how a broker refuses its own storage. Pinning both to one
+          # digest rather than one tag is what makes that failure unreachable by
+          # editing — a tag can come to mean different bytes in the two
+          # containers without the file changing. See the broker's image below
+          # for why the digest carries the guarantee and the tag does not.
+          image: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
           name: kafka-bootstrap
           # This container writes in exactly three places, and all three are volumes:
           # the log directory it formats, the generated configuration, and the CLI's
@@ -1035,9 +1094,10 @@ spec:
           # read-only — which also means the argument file carrying the SCRAM password
           # cannot be written anywhere except the memory-backed config volume.
           #
-          # Verified against apache/kafka:3.9.2: `kafka-storage.sh format --add-scram`
-          # completes as uid 1000 with the root filesystem read-only and these three
-          # paths mounted, writing meta.properties and failing to write anywhere else.
+          # Verified against apache/kafka:4.3.1, the pinned release below:
+          # `kafka-storage.sh format --add-scram` completes as uid 1000 with the root
+          # filesystem read-only and these three paths mounted, writing
+          # meta.properties and failing to write anywhere else.
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -1138,16 +1198,63 @@ spec:
             # below.
             - name: KAFKA_HEAP_OPTS
               value: '-Xmx1G -Xms1G'
-          # The same floor the compose stack pins, for the same two reasons:
-          # "kafka-storage format --add-scram" arrived in Kafka 3.5, and 3.9.2 is
-          # the lowest release free of CVE-2026-33558, whose DEBUG-level
-          # NetworkClient logging makes SASL credentials, SCRAM salts and salted
-          # passwords recoverable from a log file. See .env.example for the full
-          # per-advisory floor table, including why no 4.x tag at or below 4.3.0
-          # is clean. `latest` is not an option here even though two neighbours in
-          # this folder use it: the --add-scram floor is a hard constraint, so the
-          # tag has to be readable in the manifest.
-          image: apache/kafka:3.9.2
+          # PINNED BY DIGEST, and the digest rather than the tag is the part
+          # that carries the guarantee. A tag is a MUTABLE pointer: the same
+          # `apache/kafka:4.3.1` can be repushed, so two clusters applying this
+          # identical file weeks apart can run different bytes and neither
+          # `kubectl diff` nor a git diff would show anything. A digest is
+          # content-addressed, so it cannot. The tag is kept alongside it purely
+          # so a reader sees which release this is without resolving the hash;
+          # when both are present the runtime resolves the DIGEST and treats the
+          # tag as commentary. `latest` is not an option here even though two
+          # neighbours in this folder use it.
+          #
+          # TWO INDEPENDENT FLOORS DECIDE THIS RELEASE, and both are hard.
+          #
+          # FUNCTIONAL: "kafka-storage format --add-scram" arrived in Kafka 3.5.
+          # The bootstrap init container above cannot work without it, because in
+          # KRaft mode a SCRAM credential has to exist IN THE METADATA LOG before
+          # any broker will authenticate — there is no running broker to create
+          # the first credential against.
+          #
+          # SECURITY: the floors below. Three have ranges firm enough to pin
+          # against, and the highest of them is 4.2.0:
+          #
+          #   CVE-2026-33558  <=3.9.1, 4.0.0            fixed 3.9.2, 4.0.1
+          #   CVE-2026-35554  <=3.9.1, <=4.0.1, <=4.1.1  fixed 3.9.2, 4.0.2,
+          #                                                    4.1.2, 4.2.0
+          #   CVE-2026-33557  4.1.0-4.1.1               fixed 4.1.2, 4.2.0
+          #
+          # 33558 is the one that reaches THIS deployment hardest: DEBUG-level
+          # NetworkClient logging renders AlterUserScramCredentialsRequest
+          # verbatim, putting SASL credentials, SCRAM salts and salted passwords
+          # into a log file — and subscriber provisioning calls precisely that
+          # API. 35554 is a Java-producer buffer-pool race that misroutes records
+          # to the wrong topic silently; Blnk publishes through
+          # segmentio/kafka-go, so it reaches only the bundled CLI tools, but
+          # silent cross-topic delivery would defeat the ACL isolation this
+          # broker enforces, so it is treated as a floor rather than as
+          # not-applicable. 33557 needs sasl.enabled.mechanisms=OAUTHBEARER,
+          # which this broker does not enable.
+          #
+          # A FOURTH, CVE-2026-41115, is deliberately listed WITHOUT a range:
+          # improper authorization in CONSUMER_GROUP_DESCRIBE's validation of
+          # DESCRIBE on the GROUP resource. No range is asserted here because
+          # none was verified, and a floor table with an invented row is worse
+          # than one with an honest gap. It is named because it bears directly on
+          # this cluster: per-subscriber GROUP ACLs are the isolation mechanism
+          # (see event_admin.go and the V-5 isolation test), so consult
+          # https://kafka.apache.org/cve-list before moving to any release below
+          # this one. .env.example carries this same table for the Compose stack.
+          #
+          # MOVING OFF THIS PIN RE-RUNS THREE CHECKS. None is exercised by
+          # swapping the image and watching the pod become ready, and all three
+          # are load-bearing here: --add-scram must still accept a credential at
+          # format time, the broker must still authenticate SCRAM-SHA-512 on the
+          # SASL listener, and StandardAuthorizer must still ENFORCE ACLs rather
+          # than merely accept them. docs/kafka-operations.md carries the
+          # procedure and what each check proves.
+          image: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
           # LIVENESS is deliberately WEAKER than readiness, and the asymmetry is
           # the point. A liveness probe that authenticated would restart every
           # broker in the cluster the moment a credential was rotated wrongly —
@@ -1219,10 +1326,12 @@ spec:
           # memory-backed config emptyDir and the log volume — is explicit, so a
           # read-only root removes the write surface without removing the workload.
           #
-          # Verified against apache/kafka:3.9.2 under exactly this posture: the broker
-          # runs as uid 1000 with the root filesystem read-only, applies the heap below,
-          # answers an admin request, logs no permission error, and writes its log4j
-          # output into the mounted volume.
+          # Verified against apache/kafka:4.3.1, the pinned release below, under
+          # exactly this posture: the broker runs as uid 1000 with the root filesystem
+          # read-only, applies the heap below, answers a SCRAM-authenticated admin
+          # request, creates a 6-partition topic, logs no permission error, brings
+          # StandardAuthorizer up, and writes its log4j output into the mounted
+          # volume.
           securityContext:
             allowPrivilegeEscalation: false
             privileged: false
@@ -1388,8 +1497,13 @@ spec:
             # hours of a typical 2 KiB event at 500/second.
             #
             # Change this number and log.retention.bytes together, or the volume
-            # decides when the broker stops. Adding a category topic adds six
-            # partitions, which is 12 GiB more log data per broker.
+            # decides when the broker stops. Adding one entry to
+            # model.AllEventCategories adds TWO topics — the category and its
+            # .dlt sibling — which is twelve partitions and 24 GiB more log data
+            # per broker. TestKafkaStatefulSet_StorageCoversThePerBrokerRetentionFloor
+            # recomputes this floor from the category list, KAFKA_MIN_PARTITIONS,
+            # KAFKA_REPLICATION_FACTOR, `replicas` and log.retention.bytes on
+            # every run, so that drift fails a test instead of a broker.
             storage: 160Gi
 ---
 # THE QUORUM BUDGET (F-22).

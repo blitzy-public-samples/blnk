@@ -17,8 +17,22 @@ PROJECT=blnk
 printProject:
 	echo ${PROJECT}
 
+# DOWNLOAD AND VERIFY, NEVER `go get ./...`.
+#
+# `go get ./...` RESOLVES and can WRITE go.mod and go.sum: it upgrades a requirement to a newer
+# version that satisfies the same import, adds anything missing and rewrites the manifests as a
+# side effect of what was supposed to be a fetch. So the first thing a new contributor ran, on a
+# repository whose whole dependency contract is `go.mod` plus `go.sum`, was the one command able
+# to change it — and a bumped version arriving in an unrelated pull request is indistinguishable
+# from a deliberate upgrade.
+#
+# `go mod download` fetches exactly what the manifests pin and writes neither. `go mod verify`
+# then checks every module in the cache against its recorded go.sum hash, which is the supply
+# chain check the download alone does not perform. Upgrading a dependency is a deliberate
+# `go get <module>@<version>` followed by `go mod tidy`, reviewed as its own change.
 init:
-	go get ./...
+	go mod download
+	go mod verify
 
 generate:
 	go generate ./...
@@ -176,8 +190,28 @@ mutate_events: mutation_gate
 mutate_all: SCOPES=${MUTATION_FAST_SCOPES} ${MUTATION_EVENT_SCOPES}
 mutate_all: mutation_gate
 
+# THE MUTATION TOOL IS PINNED TO AN EXACT VERSION, and the pin is a supply-chain control
+# rather than a reproducibility nicety.
+#
+# `@latest` resolves at install time, so whatever the upstream module publishes next runs
+# HERE — on a developer's machine and in CI — with the module cache's own privileges and no
+# review in between. It also makes two runs of the same commit score differently the moment
+# upstream changes a mutator or a default, so a gate that failed cannot be reproduced and a
+# gate that passed cannot be trusted.
+#
+# v0.6.0 is the current release of github.com/go-gremlins/gremlins and is the version the
+# thresholds below were measured against. Moving it is a deliberate change: bump this
+# constant, re-measure the efficacy figures documented above MUTATION_THRESHOLD, and update
+# them in the same commit — a mutator added upstream changes the denominator, so an unchanged
+# threshold against a new version is a different gate wearing the same number.
+#
+# The checksum is not restated here because the module proxy already supplies one: go install
+# verifies the module against GOSUMDB (sum.golang.org) for a version not present in go.sum,
+# so a tampered artifact for this exact version fails the install rather than running.
+GREMLINS_VERSION=v0.6.0
+
 mutation_gate:
-	@command -v gremlins >/dev/null 2>&1 || go install github.com/go-gremlins/gremlins/cmd/gremlins@latest
+	@command -v gremlins >/dev/null 2>&1 || go install github.com/go-gremlins/gremlins/cmd/gremlins@${GREMLINS_VERSION}
 	@set -e; \
 	if [ -z "${SCOPES}" ]; then \
 		echo "mutation_gate is not a target to invoke directly: it scores whatever SCOPES names,"; \
@@ -280,48 +314,46 @@ run_workers:
 # is the name the operations runbook documents. It answers "where does the relay run" without
 # reading cmd/server.go. Both spellings print what is actually starting.
 #
-# # Why the guard exists, and what it does NOT claim
+# # Why the guard exists, and why the APPLICATION makes the decision
 #
 # startEventRelay is CONDITIONAL ON BROKERS BEING CONFIGURED: with an empty broker list it logs
 # a single info line and starts nothing, so the server comes up looking entirely healthy while
 # every captured event stays pending in blnk.event_outbox. That silence is the only failure this
 # guard is here to convert into a refusal.
 #
-# It deliberately does NOT re-validate the configuration. The application owns that, and owns it
-# in more depth than a shell test can: config.validateKafkaTopicPrefix refuses a prefix that
-# cannot compose a legal topic name, config.validateKafkaSASLCredentials refuses a
-# half-configured administrative principal, and blnk.KafkaBrokersConfigured normalises the list
-# before judging it — all of them on the same load `./${PROJECT} start` performs seconds later.
-# A guard that duplicated any of that would drift from it, and a guard that pronounced a value
-# "valid" that the application then rejected would be worse than no guard at all.
+# THE REFUSAL IS `--require-kafka`, A FLAG ON THE BINARY, AND NOT A SHELL TEST. This recipe used
+# to resolve the broker list itself, and a shell reimplementation of that resolution cannot agree
+# with the loader — it did not, in three separate ways, each of which made this target ANNOUNCE a
+# relay the application would then decline to start:
 #
-# # Why FOUR sources are consulted, not one
+#   it took the FIRST NON-EMPTY of KAFKA_BROKERS, BLNK_KAFKA_KAFKA_BROKERS and BLNK_KAFKA_BROKERS
+#   in that order, while the loader's precedence is BLNK_KAFKA_BROKERS first, then KAFKA_BROKERS,
+#   then the derived key, then the file — so `BLNK_KAFKA_BROKERS= KAFKA_BROKERS=host:9092 make
+#   run_relay` was announced as configured from the bare name while the application resolved NO
+#   brokers, an explicitly empty higher-precedence name being exactly how Kafka is turned off for
+#   one run;
 #
-# The check used to read $${KAFKA_BROKERS} alone and refuse when it was empty, which refused
-# correctly-configured deployments — a false negative that blocks the operator it was written to
-# help. The application accepts brokers from four places, and this now looks at all of them:
+#   it tested the config file with `grep '"brokers"'`, which reads `"brokers": []` as configured;
 #
-#   KAFKA_BROKERS              the R-10 contract name; envconfig's alternate key
-#   BLNK_KAFKA_KAFKA_BROKERS   the key envconfig actually derives, since Kafka is a prefix segment
-#   BLNK_KAFKA_BROKERS         the house-convention alias applyPrefixedEnvAliases overlays, which
-#                              WINS over the bare name when both are set
-#   kafka.brokers in ${CONFIG_FILE}  the config file, which envconfig then overlays
+#   and no first-non-empty scan can express that an empty value at a higher-precedence name CLEARS
+#   what a lower one supplied, because that is a property of the overlay and not of any one source.
 #
-# The config file is tested only for the PRESENCE of a brokers key, with grep rather than a JSON
-# parser, and that asymmetry is deliberate: the result is used solely to STAND DOWN, never to
-# assert that brokers are configured. Read that way a crude match is safe, because a false
-# positive costs one info line from the application and a false negative would resurrect exactly
-# the bug being fixed. Requiring jq for a decision this coarse would add a dependency to a
-# target that needs none.
+# `./${PROJECT} start --require-kafka` asks the question after the same load, of the same struct,
+# with the same predicate the relay's own gate uses — blnk.KafkaBrokersConfigured on
+# cfg.Kafka.Brokers — and names every source in its refusal. One resolution, one definition of
+# "configured", nothing here to drift from it. The application also owns the DEEPER validation it
+# always owned: config.validateKafkaTopicPrefix refuses a prefix that cannot compose a legal topic
+# name and config.validateKafkaSASLCredentials refuses a half-configured administrative principal.
 #
 # # WHY .env IS SOURCED, AND WHY IT IS THE FIFTH SOURCE RATHER THAN THE FIRST
 #
-# The four sources above are read from the PROCESS ENVIRONMENT, and `./stack.sh --init` writes
-# KAFKA_BROKERS and the producer pair into a mode-0600 .env — a file, whose assignments are not
-# exported into anyone's shell. So a target that consulted only the environment refused the
+# The application reads its configuration from the PROCESS ENVIRONMENT, and `./stack.sh --init`
+# writes KAFKA_BROKERS and the producer pair into a mode-0600 .env — a file, whose assignments are
+# not exported into anyone's shell. So a target that passed on only the environment refused the
 # operator who had just run the setup instruction this recipe's own error message recommends,
 # and pointed them at the very file it declined to read. That was the defect, and it was worse
-# than a plain refusal because the remedy printed was already satisfied.
+# than a plain refusal because the remedy printed was already satisfied. Sourcing .env is
+# therefore make's ONE job here: assembling the environment the application then resolves from.
 #
 # So .env is sourced here exactly as `kafka_provision` sources it, and the ordering is the same
 # one Compose applies to --env-file: .env SUPPLIES DEFAULTS, THE CALLER'S ENVIRONMENT WINS.
@@ -348,49 +380,62 @@ run_workers:
 # so signals and the exit status reach the server directly.
 CONFIG_FILE?=blnk.json
 
+# Answers "does ${CONFIG_FILE} declare at least one USABLE Kafka broker?" through an exit
+# status: 0 yes, non-zero no.
+#
+# WHY THIS IS NOT `grep -q '"brokers"'`
+#
+# That test passed on an EMPTY array. `"kafka": { "brokers": [] }` contains the string
+# `"brokers"`, so the target reported the file as a configured source and started the server —
+# which then resolved no writer, ran no relay, and left every captured event sitting in
+# blnk.event_outbox at status pending while the API looked completely healthy. That is the exact
+# failure the broker check exists to prevent, so the check has to read the ARRAY rather than the
+# key. `"brokers": [""]` and `"brokers": ["  "]` fail for the same reason: a blank string is not
+# an address kafka-go can dial.
+#
+# A VARIABLE RATHER THAN A SUB-MAKE, and that is not a style preference. The first version of
+# this fix put the parse in its own target and had run_server_relay invoke it with $(MAKE) —
+# which broke `make -n`. GNU make EXECUTES any recipe line containing $(MAKE) even under -n, so
+# that the sub-make can print its own commands; run_server_relay's recipe is a single
+# backslash-continued line, so the whole thing ran, reached `exec ./blnk start`, and a DRY RUN
+# started a server. That is worse than a cosmetic bug here: a live server hosts the event relay,
+# which claims blnk.event_outbox rows, and the setup notes require the server to be DOWN while
+# the event and outbox suites run. Expanding a variable keeps -n a dry run.
+#
+# python3 first, jq second, and the fallback is the `||` rather than a `command -v` dance: an
+# absent python3 exits 127, which is a failure, which falls through to jq exactly as an
+# unparseable file does. If NEITHER is installed both fail and the answer is "not declared" —
+# the fail-closed direction, because guessing "yes" is what produced the silent failure above,
+# and KAFKA_BROKERS in the environment takes precedence over this file anyway.
+BROKER_ARRAY_DECLARED = python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); k=d.get("kafka") or {}; b=k.get("brokers") or []; sys.exit(0 if isinstance(b,list) and [x for x in b if isinstance(x,str) and x.strip()] else 1)' "$(CONFIG_FILE)" 2>/dev/null || jq -e '(.kafka.brokers // []) | map(select(type == "string" and (. | gsub("^\\s+|\\s+$$"; "")) != "")) | length > 0' "$(CONFIG_FILE)" >/dev/null 2>&1
+
+# The same question as a target, so it can be exercised directly and by the contract test.
+# Not intended for day-to-day use.
+_brokers_declared_in_file:
+	@${BROKER_ARRAY_DECLARED}
+
 run_server_relay:
 	@caller_environment="$$(export -p)"; \
-	caller_brokers=""; \
-	for candidate in "$${KAFKA_BROKERS}" "$${BLNK_KAFKA_KAFKA_BROKERS}" "$${BLNK_KAFKA_BROKERS}"; do \
-		if [ -n "$$candidate" ]; then caller_brokers="$$candidate"; break; fi; \
-	done; \
+	prefixed_set="$${BLNK_KAFKA_BROKERS+set}"; \
+	bare_set="$${KAFKA_BROKERS+set}"; \
+	derived_set="$${BLNK_KAFKA_KAFKA_BROKERS+set}"; \
+	caller_decided="$$prefixed_set$$bare_set$$derived_set"; \
 	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
 	eval "$$caller_environment"; \
-	brokers=""; \
-	for candidate in "$${KAFKA_BROKERS}" "$${BLNK_KAFKA_KAFKA_BROKERS}" "$${BLNK_KAFKA_BROKERS}"; do \
-		if [ -n "$$candidate" ]; then brokers="$$candidate"; break; fi; \
-	done; \
-	if [ -n "$$caller_brokers" ]; then \
-		source_name="the environment"; \
-	else \
-		source_name=".env"; \
+	if [ -n "$$caller_decided" ]; then \
+		if [ -z "$$prefixed_set" ]; then unset BLNK_KAFKA_BROKERS; fi; \
+		if [ -z "$$bare_set" ]; then unset KAFKA_BROKERS; fi; \
+		if [ -z "$$derived_set" ]; then unset BLNK_KAFKA_KAFKA_BROKERS; fi; \
 	fi; \
-	if [ -z "$$brokers" ] && [ -f "${CONFIG_FILE}" ] && grep -q '"brokers"' "${CONFIG_FILE}"; then \
-		brokers="(declared in ${CONFIG_FILE})"; \
-		source_name="${CONFIG_FILE}"; \
-	fi; \
-	if [ -z "$$brokers" ]; then \
-		echo "No Kafka brokers are configured in any source this deployment reads, so the event"; \
-		echo "outbox relay would not start and every captured event would stay pending in"; \
-		echo "blnk.event_outbox — with the server otherwise looking healthy. Set brokers in one of:"; \
-		echo "  KAFKA_BROKERS             (the deployment contract name)"; \
-		echo "  BLNK_KAFKA_KAFKA_BROKERS  (envconfig's derived key)"; \
-		echo "  BLNK_KAFKA_BROKERS        (the BLNK_-prefixed alias, which wins over the bare name)"; \
-		echo "  \"kafka\": { \"brokers\": [...] } in ${CONFIG_FILE}"; \
-		echo "  any of those three names in a .env file in this directory, which this target"; \
-		echo "  sources — './stack.sh --init' writes them there, at mode 0600, along with the"; \
-		echo "  KAFKA_SASL_USER/KAFKA_SASL_SECRET producer pair the publisher authenticates with."; \
-		echo "A value passed on the command line WINS over .env, including an empty one:"; \
-		echo "'KAFKA_BROKERS= make run_relay' means no brokers for this run and is refused here"; \
-		echo "rather than falling back to the file."; \
-		exit 1; \
-	fi; \
-	echo "Starting the SERVER role from $$source_name: HTTP API, lineage outbox processor,"; \
-	echo "event metrics collector and the event outbox relay. This is not the relay alone —"; \
-	echo "the API will be listening and the other background workers will be running."; \
-	echo "The application validates the Kafka configuration itself and will refuse to start"; \
-	echo "if it is malformed."; \
-	exec ./${PROJECT} start
+	echo "Starting the SERVER role: HTTP API, lineage outbox processor, event metrics collector"; \
+	echo "and the event outbox relay. This is not the relay alone — the API will be listening"; \
+	echo "and the other background workers will be running."; \
+	echo "--require-kafka is passed, so the APPLICATION resolves its own Kafka configuration and"; \
+	echo "refuses to start when that resolution yields no broker — the same resolution and the"; \
+	echo "same predicate the relay's own gate uses. Its refusal names every source it read."; \
+	echo "'KAFKA_BROKERS= make run_relay' therefore means no brokers for this run and is refused,"; \
+	echo "because a name that is set and empty clears a list ${CONFIG_FILE} supplied."; \
+	exec ./${PROJECT} start --config "${CONFIG_FILE}" --require-kafka
 
 # The AAP-named alias. Identical behaviour, including the announcement above, so neither
 # spelling can leave an operator believing a bare relay is what came up.
@@ -419,7 +464,8 @@ build_test_run:
 #
 # EIGHT owned topics, from FOUR categories. The fourth exists because two real event types —
 # ledger.created and system.error — belong to none of the three the requirement names, while the
-# coverage rule admits no exceptions; blnk.system takes both and is created but never granted.
+# coverage rule admits no exceptions; blnk.system takes both, and it is grantable like every
+# other category — it is only withheld from the SAMPLE subscriber's default grant.
 # There is deliberately no fifth blnk.ledgers category: one was implemented and reverted, and
 # model/event.go's catalogue is frozen at four.
 #
@@ -446,9 +492,10 @@ build_test_run:
 #
 # There is no fifth blnk.ledgers category. One was implemented, on the reasoning that
 # ledger.created is ordinary ledger data a webhook subscriber receives today and therefore needs
-# a GRANTABLE home; it was reverted because the catalogue is frozen at four, and blnk.system is
-# never granted. A subscriber that needs ledger.created is served by the migration path rather
-# than by a topic of its own.
+# a GRANTABLE home; it was reverted because the catalogue is frozen at four and blnk.system is
+# itself grantable. A subscriber that needs ledger.created is authorized for blnk.system rather
+# than given a topic of its own — which is why withholding that name would have made ordinary
+# ledger data unreachable to every subscriber.
 #
 # REPLICATION FACTOR IS 1 LOCALLY AND 3 IN PRODUCTION, which is the whole reason it is a
 # variable. A single-broker KRaft cluster cannot satisfy 3 — topic creation fails outright — so
@@ -533,6 +580,31 @@ build_test_run:
 # prints every variable it reads, which is how stack.sh builds its passthrough list. A list
 # copied into this recipe would be a second copy to keep in step, and a name missing from it
 # would fail silently and plausibly.
+# Refuses a `kubectl apply` that would deploy an unresolved or mutable image, BEFORE the
+# apply rather than at pull time. Kubernetes does not validate image references at
+# admission, so `blnk:REPLACE_WITH_PINNED_DIGEST` is admitted, scheduled, and only fails
+# when the kubelet pulls — by which point the Deployment is partially rolled out.
+#
+#   make k8s_preflight                     check the committed tree (EXPECTED to fail:
+#                                          the placeholder is intentional in git)
+#   make k8s_preflight DIR=./rendered      check a tree you have already rendered
+#   make k8s_render BLNK_IMAGE=repo@sha256:...   render to ./rendered, then check it
+#
+# Neither target contacts a cluster or reads a kubeconfig, so both are safe in CI.
+k8s_preflight:
+	./scripts/k8s-preflight.sh $${DIR}
+
+# Renders the manifests with the application image resolved, into a directory you then
+# apply. A COPY rather than an in-place edit on purpose: an in-place substitution would
+# leave a digest in the working tree that must never be committed.
+k8s_render:
+	@test -n "$${BLNK_IMAGE}" || { \
+		echo "BLNK_IMAGE is required and must be digest-pinned, e.g."; \
+		echo "  make k8s_render BLNK_IMAGE=ghcr.io/you/blnk@sha256:<64 hex>"; \
+		exit 1; \
+	}
+	./scripts/k8s-preflight.sh --render $${RENDER_DIR:-./rendered}
+
 kafka_provision:
 	@caller_environment="$$(export -p)"; \
 	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \

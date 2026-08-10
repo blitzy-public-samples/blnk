@@ -989,9 +989,26 @@ func (d Datasource) FinalizeBulkTransactionBatchWithEvent(
 		// Either the batch is already terminal, or it was never recorded. Both answers
 		// come from one read so the two cannot be confused, and neither is decided by a
 		// second round trip that could observe a different instant.
-		return false, d.resolveUnfinalizableBulkBatch(ctx, tx, trimmed, outcome.Status)
-	}
-	if err != nil {
+		//
+		// A MISSING ROW IS ADOPTED RATHER THAN REFUSED, and that is what removes the last
+		// standalone capture from a producer that has state to be atomic with. It used to
+		// be reported as ErrNotFound, the caller fell back to a single-shot insert outside
+		// any transaction, and the batch summary was then at-most-once for the whole life
+		// of a deployment whose coordinator write had failed once at batch start. Writing
+		// the coordinator row here, in its terminal state, inside THIS transaction gives
+		// the event a mutation to commit with after all: the outcome record and its event
+		// are inserted together or not at all.
+		//
+		// AN ADOPTION FALLS THROUGH to the event insert and the commit below rather than
+		// returning: the whole point is that both rows share one commit, so returning here
+		// would leave the adopted row inside a transaction the deferred rollback discards.
+		adopted, resolveErr := d.adoptOrExplainUnfinalizableBulkBatch(ctx, tx, trimmed, outcome, event)
+		if resolveErr != nil || !adopted {
+			return false, resolveErr
+		}
+
+		finalizedStatus = outcome.Status
+	} else if err != nil {
 		span.RecordError(err)
 		return false, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to finalize the bulk transaction batch", err)
 	}
@@ -1015,30 +1032,61 @@ func (d Datasource) FinalizeBulkTransactionBatchWithEvent(
 	return true, nil
 }
 
-// resolveUnfinalizableBulkBatch explains a finalise that matched no row.
+// adoptOrExplainUnfinalizableBulkBatch resolves a finalise that matched no row, either by
+// adopting the batch or by explaining why it cannot be finalised.
 //
 // It runs inside the caller's still-open transaction so the row it reads is the row the
-// UPDATE failed to match, rather than whatever a later connection would see.
+// UPDATE failed to match, rather than whatever a later connection would see — and, in the
+// adoption case, so the row it writes commits with the event the caller is inserting.
 //
 // Three answers are possible and they are genuinely different:
 //
-//   - no row at all: the coordinator was never recorded. That is a programming error in
-//     the caller, not a race, and it is reported as one.
+//   - no row at all: the coordinator write at batch start did not happen. The batch is
+//     ADOPTED — its coordinator row is inserted here, already terminal, and the caller's
+//     event insert and commit then proceed exactly as they would have. This is the case
+//     that used to be reported as ErrNotFound and to send the caller down a standalone,
+//     at-most-once capture; requirement R-2 asks for the event to share a transaction with
+//     the state it describes, and this is the transaction that records that state.
 //   - a terminal row with the SAME outcome: the finalise already happened. Reported as
 //     success so a retry after a lost acknowledgement stops instead of recording a
 //     second event for one outcome.
 //   - a terminal row with a DIFFERENT outcome: two answers exist for one batch. Neither
 //     is discarded silently.
 //
+// A non-terminal row cannot reach here: the guarded UPDATE would have matched it.
+//
+// # Why adoption is safe rather than a way to invent history
+//
+// The row it writes is not a guess. Every column comes from the outcome the caller
+// computed from the batch it just ran — the same values the start-of-batch row would have
+// carried, plus the terminal status the batch actually reached — so the adopted row is
+// indistinguishable from one written at batch start and finalised normally, except that
+// its start timestamp is the adoption instant. It is written with ON CONFLICT DO NOTHING
+// and its effect re-checked, so a concurrent finaliser that inserted first is detected
+// rather than overwritten, and the conflicting-outcome answer above is what that
+// concurrent case gets.
+//
 // Parameters:
-//   - ctx context.Context: the context for the query.
-//   - tx *sql.Tx: the caller's open transaction.
+//   - ctx context.Context: the context for the statements.
+//   - tx *sql.Tx: the caller's open transaction. Both the read and any adoption insert
+//     run inside it.
 //   - batchID string: the trimmed batch id.
-//   - attempted string: the outcome the caller was trying to record.
+//   - outcome *model.BulkTransactionBatch: the terminal outcome the caller is recording.
+//   - event *model.EventOutbox: the prepared outcome event, whose id the adopted row
+//     records so the outcome and its event stay joinable.
 //
 // Returns:
-//   - error: nil when the batch is already finalised with the same outcome.
-func (d Datasource) resolveUnfinalizableBulkBatch(ctx context.Context, tx *sql.Tx, batchID, attempted string) error {
+//   - bool: true when this call recorded the outcome — including by adoption — and false
+//     when it found the batch already finalised with the same outcome. The caller commits
+//     in both cases, so an adoption is reported as work performed.
+//   - error: nil when the outcome is recorded or already present with the same value.
+func (d Datasource) adoptOrExplainUnfinalizableBulkBatch(
+	ctx context.Context,
+	tx *sql.Tx,
+	batchID string,
+	outcome *model.BulkTransactionBatch,
+	event *model.EventOutbox,
+) (bool, error) {
 	var stored string
 	err := tx.QueryRowContext(ctx, `
 		SELECT status FROM blnk.bulk_transaction_batches WHERE batch_id = $1
@@ -1046,22 +1094,126 @@ func (d Datasource) resolveUnfinalizableBulkBatch(ctx context.Context, tx *sql.T
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return apierror.NewAPIError(
-			apierror.ErrNotFound,
-			"The bulk transaction batch was not recorded before its outcome",
-			fmt.Errorf("no coordinator row exists for batch %q", batchID),
-		)
+		return d.adoptBulkTransactionBatch(ctx, tx, batchID, outcome, event)
 	case err != nil:
-		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read the bulk transaction batch", err)
-	case stored == attempted:
-		return nil
+		return false, apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read the bulk transaction batch", err)
+	case stored == outcome.Status:
+		return false, nil
 	default:
-		return apierror.NewAPIError(
+		return false, apierror.NewAPIError(
 			apierror.ErrConflict,
 			"The bulk transaction batch already reported a different outcome",
-			fmt.Errorf("batch %q is recorded as %q and cannot be finalized as %q", batchID, stored, attempted),
+			fmt.Errorf("batch %q is recorded as %q and cannot be finalized as %q", batchID, stored, outcome.Status),
 		)
 	}
+}
+
+// adoptBulkTransactionBatch inserts an already-terminal coordinator row for a batch whose
+// start was never recorded.
+//
+// Called only from adoptOrExplainUnfinalizableBulkBatch, and only when the read inside the
+// caller's transaction found no row at all. See that function for why the values are the
+// caller's computed outcome rather than a reconstruction.
+//
+// ON CONFLICT DO NOTHING, with the effect re-checked, because two finalisers can race for
+// one batch: whichever loses must not overwrite the winner's outcome, and must be told
+// whether the stored answer agrees with its own.
+//
+// Parameters:
+//   - ctx context.Context: the context for the statements.
+//   - tx *sql.Tx: the caller's open transaction.
+//   - batchID string: the trimmed batch id.
+//   - outcome *model.BulkTransactionBatch: the terminal outcome being adopted.
+//   - event *model.EventOutbox: the prepared outcome event, recorded on the row.
+//
+// Returns:
+//   - bool: true when the adoption inserted the row.
+//   - error: the wrapped statement error, or a conflict when a concurrent finaliser
+//     inserted a different outcome first.
+func (d Datasource) adoptBulkTransactionBatch(
+	ctx context.Context,
+	tx *sql.Tx,
+	batchID string,
+	outcome *model.BulkTransactionBatch,
+	event *model.EventOutbox,
+) (bool, error) {
+	errorMessage := interface{}(nil)
+	if strings.TrimSpace(outcome.ErrorMessage) != "" {
+		errorMessage = outcome.ErrorMessage
+	}
+
+	var adoptedStatus string
+	err := tx.QueryRowContext(ctx, `
+		INSERT INTO blnk.bulk_transaction_batches
+		(batch_id, status, transaction_count, atomic, inflight, error_message, event_id, finalized_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+		ON CONFLICT (batch_id) DO NOTHING
+		RETURNING status
+	`,
+		batchID,
+		outcome.Status,
+		outcome.TransactionCount,
+		outcome.Atomic,
+		outcome.Inflight,
+		errorMessage,
+		event.EventID,
+	).Scan(&adoptedStatus)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		// A concurrent finaliser inserted first. Its outcome decides, and the caller is
+		// told whether that outcome is the one it was recording.
+		return false, d.reconcileAdoptedBulkBatch(ctx, tx, batchID, outcome.Status)
+	}
+	if err != nil {
+		return false, apierror.NewAPIError(
+			apierror.ErrInternalServer,
+			"Failed to record the bulk transaction batch outcome",
+			fmt.Errorf("adopting the unrecorded batch %q: %w", batchID, err),
+		)
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"batch_id": batchID,
+		"status":   adoptedStatus,
+		"event_id": event.EventID,
+	}).Warn(
+		"the bulk transaction batch had no coordinator record, so its terminal row is being written " +
+			"in the same transaction as its outcome event; the summary stays atomic with the outcome, " +
+			"but the batch was not enumerable while it ran — investigate why the start-of-batch write failed",
+	)
+
+	return true, nil
+}
+
+// reconcileAdoptedBulkBatch reports whether the row a concurrent finaliser inserted agrees
+// with the outcome this caller was adopting.
+//
+// Parameters:
+//   - ctx context.Context: the context for the query.
+//   - tx *sql.Tx: the caller's open transaction.
+//   - batchID string: the trimmed batch id.
+//   - attempted string: the outcome this caller was recording.
+//
+// Returns:
+//   - error: nil when the stored outcome matches, a conflict when it does not, and the
+//     wrapped read error when the row cannot be read at all.
+func (d Datasource) reconcileAdoptedBulkBatch(ctx context.Context, tx *sql.Tx, batchID, attempted string) error {
+	var stored string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT status FROM blnk.bulk_transaction_batches WHERE batch_id = $1
+	`, batchID).Scan(&stored); err != nil {
+		return apierror.NewAPIError(apierror.ErrInternalServer, "Failed to read the bulk transaction batch", err)
+	}
+
+	if stored == attempted {
+		return nil
+	}
+
+	return apierror.NewAPIError(
+		apierror.ErrConflict,
+		"The bulk transaction batch already reported a different outcome",
+		fmt.Errorf("batch %q is recorded as %q and cannot be finalized as %q", batchID, stored, attempted),
+	)
 }
 
 // CountUnfinalizedBulkTransactionBatches counts batches that began and never reported

@@ -175,7 +175,9 @@ declare KAFKA_BROKERS_FROM_SHELL="${KAFKA_BROKERS-}"
 help() {
     printf "\n \
     Usage:${BLU} %s ${GRN}parameters${NC}\n \
-    ${GRN}--pull, -p${NC}\t\t Pull the repo from registry\n \
+    ${GRN}--pull, -p${NC}\t\t Pull this stack's images from the registry. Set\n \
+    \t\t\t STACK_PRUNE_IMAGES=1 to ALSO prune every unused image on the\n \
+    \t\t\t host older than 72h first — host-global, not just this project\n \
     ${GRN}--up,-u${NC}\t\t Provision Kafka, then spin the stack up\n \
     ${GRN}--build,-b${NC}\t\t Provision Kafka, then build and spin the stack up\n \
     ${GRN}--down,-d${NC}\t\t Shut down, keeping every data volume\n \
@@ -263,16 +265,138 @@ showenv() {
 # Each outcome is reported by KEY NAME and never by value, so that the operator can see which
 # keys were filled without the credential reaching a terminal, a scrollback buffer or - when
 # this runs in CI - a build log.
+#
+# write_env_substitution performs the edit. It exists as a separate function because the
+# mechanism matters as much as the result, and the mechanism is the fix for two defects.
+#
+# THE VALUE NEVER REACHES ARGV. This used to be `sed -i "s|{KEY}|${value}|g"`, which places the
+# credential in sed's command line - and on Linux /proc/<pid>/cmdline is mode 444, readable by
+# every account on the host, while /proc/<pid>/environ is mode 400, readable only by the owner.
+# So the old form published the PostgreSQL password and the Kafka superuser password to any
+# local user who ran `ps` or read /proc during the fraction of a second sed lived, and it did so
+# in the same function whose comment promises that values are "never" printed. The value now
+# crosses into awk through the ENVIRONMENT, which is the private one of those two channels.
+#
+# THE REPLACEMENT IS LITERAL. A value reaching a sed replacement is not literal text: "&" means
+# "the whole match" and "\1" a backreference, so a generated secret containing either produced a
+# .env holding something other than the secret, and the service then failed to authenticate with
+# a credential that had been silently altered. awk's index()/substr() splice below has no
+# metacharacters at all.
+#
+# IT DOES NOT DEPEND ON GNU sed. `sed -i` with no suffix argument is a GNU extension; BSD and
+# macOS sed read the next argument as the backup suffix, so on those platforms the old form
+# consumed "${env}" as a suffix and edited nothing, or errored. awk plus an explicit rename is
+# POSIX and behaves the same everywhere.
+#
+# $1 mode  - "placeholder" to replace every {KEY} occurrence, "blank" to fill a valueless KEY= line
+# $2 key   - the environment key name
+# $3 value - the value to write; never printed, never passed as an argument
+# require_env_key_name refuses anything that is not a usable environment key name.
+#
+# Called from set_env_value BEFORE it chooses a branch, and again from write_env_substitution,
+# because the two are reachable independently and the check has to hold for both. The append
+# branch is why this is factored out at all: it writes "KEY=value" straight onto the end of
+# ${env} without rewriting the file, so a check living only in write_env_substitution left it
+# unguarded - a malformed key was appended and reported as a success, and a key containing a
+# newline would have injected whole lines of its own into a file full of credentials.
+#
+# The permitted set is [A-Za-z0-9_], which is what a shell, docker compose and envconfig can all
+# read back. Everything else is refused by name rather than sanitised, because silently altering
+# the key an operator asked for produces a .env that does not say what they think it says.
+require_env_key_name() {
+    case "${1}" in
+        "" | *[!A-Za-z0-9_]* )
+            printf '%b\n' " ${RED}Refusing to edit ${env}${NC}: '${1}' is not a valid environment key name."
+            printf '%b\n' " Keys may contain only letters, digits and underscores."
+            return 1
+            ;;
+    esac
+}
+
+write_env_substitution() {
+    local mode="${1}" key="${2}" value="${3}" tmp=""
+
+    require_env_key_name "${key}" || return 1
+
+    # The temporary file is created BESIDE ${env} and under umask 077.
+    #
+    # Beside it, because the rename at the end is only atomic within one filesystem - a reader
+    # of ${env} sees either the old content or the new, never a partial write.
+    #
+    # Under umask 077, because the temporary file holds the same secrets as the file it will
+    # become. Creating it under the ambient umask would leave the credentials world-readable in
+    # the temporary copy even though the final file is 600.
+    tmp="$( umask 077; mktemp "${env}.XXXXXX" )" || {
+        printf '%b\n' " ${RED}Could not create a temporary file beside ${env}${NC}; nothing was written."
+        return 1
+    }
+
+    if ! SEV_MODE="${mode}" SEV_KEY="${key}" SEV_VALUE="${value}" awk '
+        BEGIN {
+            mode  = ENVIRON["SEV_MODE"]
+            key   = ENVIRON["SEV_KEY"]
+            value = ENVIRON["SEV_VALUE"]
+            ph    = "{" key "}"
+            phlen = length(ph)
+            klen  = length(key)
+        }
+        mode == "placeholder" {
+            # A literal global replace, built by splicing rather than by substitution, so no
+            # character in the value carries a meaning.
+            out = ""
+            line = $0
+            while ((at = index(line, ph)) > 0) {
+                out  = out substr(line, 1, at - 1) value
+                line = substr(line, at + phlen)
+            }
+            print out line
+            next
+        }
+        mode == "blank" {
+            # Compared by position rather than by regex for the same reason.
+            if (substr($0, 1, klen + 1) == key "=") {
+                rest = substr($0, klen + 2)
+                if (rest ~ /^[ \t]*$/) {
+                    print key "=" value
+                    next
+                }
+            }
+            print
+            next
+        }
+        { print }
+    ' "${env}" >"${tmp}"
+    then
+        rm -f "${tmp}"
+        printf '%b\n' " ${RED}Failed to rewrite ${env}${NC}; it is unchanged."
+        return 1
+    fi
+
+    # Asserted rather than assumed: mktemp under umask 077 should already be 600, but this file
+    # is about to BECOME ${env}, and its mode is the mode ${env} will have.
+    chmod 600 "${tmp}" 2>/dev/null || true
+
+    if ! mv -f "${tmp}" "${env}"
+    then
+        rm -f "${tmp}"
+        printf '%b\n' " ${RED}Could not replace ${env}${NC}; it is unchanged."
+        return 1
+    fi
+}
+
 set_env_value() {
     local key="${1}" value="${2}"
 
+    # CHECKED BEFORE THE BRANCH IS CHOSEN, so the append arm below is covered too.
+    require_env_key_name "${key}" || return 1
+
     if grep -qF "{${key}}" "${env}"
     then
-        sed -i "s|{${key}}|${value}|g" "${env}"
+        write_env_substitution "placeholder" "${key}" "${value}" || return 1
         printf '%b\n' " ${GRN}${key}${NC} generated into ${env}."
     elif grep -qE "^${key}=[[:space:]]*$" "${env}"
     then
-        sed -i "s|^${key}=[[:space:]]*$|${key}=${value}|" "${env}"
+        write_env_substitution "blank" "${key}" "${value}" || return 1
         printf '%b\n' " ${GRN}${key}${NC} generated into ${env}."
     elif grep -qE "^${key}=" "${env}"
     then
@@ -324,45 +448,19 @@ generate_kafka_secret() {
     exit 1
 }
 
-# Refuse to leave ${env} readable by anyone but its owner.
+# NOTE ON A CONTROL THAT USED TO LIVE HERE.
 #
-# It holds every secret --init generates - the Postgres password, and the Kafka administrative
-# password whose principal sits in the broker's super.users. Enforced rather than merely set,
-# because the file may predate this check: a stack initialised by an earlier version of --init
-# has a world-readable .env today, and saying nothing would leave it that way for ever.
+# A second, weaker copy of the permission check stood at this point: require_private_env_file.
+# It was DEAD CODE - defined, never called - and it duplicated enforce_env_permissions above,
+# which does the same job better and is called from initialize_env, the Kafka credential
+# backfill and --init. Two competing implementations of one security control is worse than one,
+# because a reader cannot tell which is authoritative and a fix applied to the wrong copy looks
+# applied while changing nothing.
 #
-# Repaired rather than refused. The remedy is one chmod, the operator would only run it
-# themselves, and failing the command over something this script can fix would be pedantry -
-# but it is ANNOUNCED, because a permission that was wrong once may be wrong again through
-# whatever set it.
-require_private_env_file() {
-    local mode=""
+# It is deleted rather than wired up, and its one genuine advantage was carried across first:
+# it tried BSD's `stat -f '%Lp'` as well as GNU's `stat -c '%a'`, so enforce_env_permissions now
+# tries both. Nothing was lost with it.
 
-    if [ ! -e "${env}" ]
-    then
-        return 0
-    fi
-
-    # stat's spelling differs between GNU and BSD; both are tried and an unknown one is
-    # skipped rather than guessed at, since a wrong format string would report a mode that is
-    # not the file's.
-    mode="$(stat -c '%a' "${env}" 2>/dev/null || stat -f '%Lp' "${env}" 2>/dev/null || true)"
-    if [ -z "${mode}" ]
-    then
-        return 0
-    fi
-
-    case "${mode}" in
-        600|400 )
-            return 0
-            ;;
-    esac
-
-    printf '%b\n' " ${YEL}${env}${NC} was mode ${RED}${mode}${NC}, which lets other accounts on this host read every" \
-        " secret in it - including ${BLU}KAFKA_SASL_ADMIN_SECRET${NC}, whose principal is in the broker's" \
-        " super.users. Tightening it to ${GRN}600${NC}."
-    chmod 600 "${env}" || printf '%b\n' " ${RED}Could not change the mode of ${env}. Fix it by hand: chmod 600 ${env}${NC}"
-}
 
 # Reports any {PLACEHOLDER} that survived into ${env}. A surviving one IS a literal password:
 # nothing downstream replaces it, so the service it belongs to authenticates with the brace
@@ -400,7 +498,13 @@ enforce_env_permissions() {
         return 0
     fi
 
-    mode="$(stat -c '%a' "${env}" 2>/dev/null || true)"
+    # stat's spelling differs between GNU and BSD, and BOTH are tried. GNU coreutils uses
+    # -c '%a'; BSD and macOS use -f '%Lp'. Only the GNU form used to be attempted, so on macOS
+    # every invocation fell into the unverifiable branch below and re-chmod'd a file that was
+    # already correct, announcing a permission change that had not happened. An unknown third
+    # spelling is still left empty and handled as unverifiable, because a wrong format string
+    # would report a mode that is not the file's.
+    mode="$(stat -c '%a' "${env}" 2>/dev/null || stat -f '%Lp' "${env}" 2>/dev/null || true)"
 
     # A mode this script cannot read is a mode it cannot verify, so it is tightened anyway:
     # an unverifiable permission must not be treated as an acceptable one.
@@ -551,8 +655,10 @@ ensure_env_secrets() {
         generated="${generated} KAFKA_SASL_SECRET"
     fi
 
-    # Re-asserted after writing: set_env_value edits in place with sed -i, and a future
-    # rewrite-and-rename would not necessarily carry the mode across.
+    # Re-asserted after writing: set_env_value replaces ${env} by writing a temporary file and
+    # renaming it over the original, so the mode ${env} ends up with is the temporary file's.
+    # write_env_substitution creates that file under umask 077 and chmods it 600 before the
+    # rename, but this is the check that makes the guarantee rather than trusting it.
     enforce_env_permissions
 
     if [ -n "${generated}" ]
@@ -923,15 +1029,6 @@ provision_kafka() {
         return 1
     fi
 
-    local assignments=() name
-    for name in "${kafka_provision_passthrough[@]}"
-    do
-        if [ -n "${!name+declared}" ]
-        then
-            assignments+=("${name}=${!name}")
-        fi
-    done
-
     # THE PRODUCER PAIR IS NOT REWRITTEN HERE, and it used to be: two assignments mapped
     # KAFKA_SASL_* onto KAFKA_PRODUCER_* unconditionally, AFTER the allowlist, so they won.
     # ${example} documents setting only the KAFKA_PRODUCER_* pair as the normal compose route,
@@ -941,15 +1038,40 @@ provision_kafka() {
     # applies the same KAFKA_SASL_* first, KAFKA_PRODUCER_* second precedence the compose
     # services and config.KafkaConfig apply, so all three agree by construction.
     #
-    # "env" rather than exporting, so nothing here leaks a credential into this shell's
-    # environment for every later command in the bring-up to inherit. The two computed values
-    # come last so they win over any ${env} entry of the same name that reached the list: the
-    # broker list is the EFFECTIVE one, which honours a shell-level override, and the service is
-    # the one the caller asked about.
-    env "${assignments[@]}" \
-        KAFKA_BROKERS="${brokers}" \
-        KAFKA_COMPOSE_SERVICE="${service}" \
-        "${kafka_provision_script}"
+    # A SUBSHELL WITH export, NOT `env KEY=value`.
+    #
+    # The goal has not changed: nothing here may leak a credential into this shell's environment
+    # for every later command in the bring-up to inherit. A subshell achieves that as completely
+    # as `env` did - the exports die with the subshell - while fixing what `env` got wrong.
+    #
+    # What it got wrong is that `env KAFKA_SASL_ADMIN_SECRET=... script` places the broker
+    # superuser's password in env's ARGV, and /proc/<pid>/cmdline is mode 444 on Linux: readable
+    # by every account on the host for as long as provisioning runs, which is seconds, not
+    # microseconds. The `export` builtin is executed by this shell itself, so there is no new
+    # command line for anyone to read; the values reach the script through its environment,
+    # /proc/<pid>/environ, which is mode 400 and readable only by its owner.
+    #
+    # The two computed values are exported last so they win over any ${env} entry of the same
+    # name that reached the passthrough list: the broker list is the EFFECTIVE one, which honours
+    # a shell-level override, and the service is the one the caller asked about.
+    #
+    # `exec` replaces the subshell rather than forking under it, so the exit status is the
+    # script's own and there is one fewer process holding the credentials.
+    (
+        local name
+        for name in "${kafka_provision_passthrough[@]}"
+        do
+            if [ -n "${!name+declared}" ]
+            then
+                export "${name}=${!name}"
+            fi
+        done
+
+        export KAFKA_BROKERS="${brokers}"
+        export KAFKA_COMPOSE_SERVICE="${service}"
+
+        exec "${kafka_provision_script}"
+    )
 }
 
 # Confirms that events have somewhere to go: a broker that authenticates and a catalogue that
@@ -1482,7 +1604,27 @@ main() {
 
     case "${1}" in
         --pull | -p )
-            docker image prune -a --force --filter "until=72h"
+            # NO HOST-GLOBAL PRUNE BY DEFAULT (SEC-8). This arm used to begin with
+            #     docker image prune -a --force --filter "until=72h"
+            # which deletes EVERY unused image on the Docker host older than 72 hours — not
+            # this project's images, every image reachable by this daemon, including those
+            # belonging to other projects, other checkouts of this repository and anything
+            # else sharing the host or a CI runner. help() documented this arm only as "Pull
+            # the repo from registry", so an operator asking to pull got an unannounced
+            # reclaim of the whole image cache, with no confirmation and no way to opt out;
+            # on a shared or CI host what it reclaimed was somebody else's build cache, and
+            # the cost reappeared as an unexplained cold rebuild somewhere unrelated.
+            #
+            # Reclaiming is still available, but it must be asked for by name and it says
+            # what it is about to do first.
+            if [[ "${STACK_PRUNE_IMAGES:-}" == "1" || "${STACK_PRUNE_IMAGES:-}" == "true" ]]; then
+                printf '%b\n' " ${YEL}STACK_PRUNE_IMAGES is set: pruning ALL unused Docker images older than 72h${NC}" \
+                    " This is ${RED}HOST-GLOBAL${NC} and is not limited to this project. Images belonging to" \
+                    " other projects, other checkouts and other users of this Docker daemon will be" \
+                    " deleted if nothing currently references them." \
+                    " Unset STACK_PRUNE_IMAGES to pull without reclaiming."
+                docker image prune -a --force --filter "until=72h"
+            fi
             # The start-up profile set, not the teardown one: pull what this stack would run.
             # Pulling the broker image for a stack that never starts it would cost several
             # hundred megabytes for nothing.
@@ -1532,10 +1674,11 @@ main() {
                 # That ordering is the point: a create-then-chmod leaves a window, however
                 # brief, in which the file exists with the permissive mode and the secrets are
                 # already being written into it. The surrounding umask is set as well, because
-                # the later `sed -i` writes a TEMPORARY FILE in the same directory and takes
-                # its mode from the umask, not from the file it is replacing - so without it
-                # the secrets would appear world-readable in that temporary copy even though
-                # the final file was private.
+                # every later edit writes a TEMPORARY FILE in the same directory and takes its
+                # mode from the umask, not from the file it is replacing - so without it the
+                # secrets would appear world-readable in that temporary copy even though the
+                # final file was private. write_env_substitution sets umask 077 itself for the
+                # same reason; this is the belt to that braces.
                 printf "Creating file: ${YEL}%s${NC} with secrets... Check it before you spin up the stack.\n" "${env}"
 
                 # THE MODE IS SET BEFORE THE FIRST SECRET EXISTS, and that ordering is the
@@ -1569,8 +1712,13 @@ main() {
                     exit 1
                 fi
 
+                # ROUTED THROUGH set_env_value LIKE EVERY OTHER SECRET, and it used not to be:
+                # this line was a bare `sed -i "s|{POSTGRES_PASSWORD}|$POSTGRES_PASSWORD|g"`,
+                # which put the database password into sed's world-readable argv and depended on
+                # GNU sed's in-place extension. One writer for every credential means one place
+                # where that is fixed, and it already is - see write_env_substitution.
                 POSTGRES_PASSWORD=$(openssl rand -base64 15)
-                sed -i "s|{POSTGRES_PASSWORD}|$POSTGRES_PASSWORD|g" ${env}
+                set_env_value "POSTGRES_PASSWORD" "$POSTGRES_PASSWORD" >/dev/null
                 # The Kafka administrative principal and its password, generated the same way
                 # and for the same reason: one credential per stack, created locally, written
                 # only into ${env} - which is git-ignored - and never into this file.

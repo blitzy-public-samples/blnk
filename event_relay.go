@@ -109,10 +109,11 @@ const (
 	// with headroom, which is the usage kafka-go documents — one writer, many callers.
 	//
 	// ORDERING IS NOT AT RISK. Kafka orders within a PARTITION, the partition is chosen by
-	// the message key, and the key is the row's stored partition key; two events that must
-	// stay ordered therefore share a key, and this file never publishes two rows with the
-	// same key at the same time. See groupEventRowsByPartitionKey for the two independent
-	// reasons that holds.
+	// the message key, and the key is the row's EFFECTIVE key — its ledger where it has one,
+	// its stored partition key where it does not (model.EffectivePartitionKey); two events
+	// that must stay ordered therefore share a key, and this file never publishes two rows
+	// with the same key at the same time. See groupEventRowsByPartitionKey for the two
+	// independent reasons that holds.
 	defaultEventRelayConcurrency = 8
 
 	// maxEventRelayBatchesPerTick bounds how many batches one tick chains, so a large
@@ -159,15 +160,26 @@ const (
 	// times a second for no benefit.
 	eventRelayMinLeaseRenewalInterval = 250 * time.Millisecond
 
-	// defaultEventRelayDeadLetterRecoveryBatch bounds how many unpreserved dead letters one
-	// tick tries to repair.
+	// The REPAIR fallbacks (PERF-M06), reached only by a relay built without a readable
+	// configuration. config.DefaultRelayRepair* are the shipped values and the single source
+	// of the numbers; these mirror them so a relay that cannot read a configuration still
+	// recovers at a usable rate rather than at a token one.
 	//
-	// Deliberately far smaller than the publish batch. This is a REPAIR path over a set
-	// that is empty in normal operation, and every row in it needs a Kafka write of its
-	// own; a large batch would turn a broker outage into a long, pointless burst of writes
-	// on every tick. Twenty is enough to clear a realistic backlog within a few polls
-	// while costing one indexed query per tick when there is nothing to do.
-	defaultEventRelayDeadLetterRecoveryBatch = 20
+	// # What replaced the fixed 20 rows a tick, and why it had to
+	//
+	// Both repair passes used to claim 20 rows, once per tick, sequentially, un-chained — and
+	// the number looked adequate because these sets are EMPTY in normal operation, so an idle
+	// pass costs one indexed query whatever the batch size is. They fill during an outage, all
+	// at once: 15 minutes at the 500 events per second acceptance rate produces about 450,000
+	// rows, and 20 rows a second drains that in roughly SIX AND A QUARTER HOURS on one replica
+	// with the dead-letter age alert firing throughout.
+	//
+	// The three knobs multiply into a drain rate — see config.RelayConfig's repair block for
+	// the arithmetic — and each chained batch takes its OWN claim and its own lease, so
+	// chaining does not widen the window in which any row is held.
+	defaultEventRelayRepairBatchSize      = config.DefaultRelayRepairBatchSize
+	defaultEventRelayRepairBatchesPerTick = config.DefaultRelayRepairMaxBatchesPerTick
+	defaultEventRelayRepairConcurrency    = config.DefaultRelayRepairConcurrency
 
 	// eventRelayBookkeepingTimeout bounds the bookkeeping transitions the relay performs
 	// on a DETACHED context. See detachedBookkeepingContext for why they are detached at
@@ -301,8 +313,9 @@ func (p relayRetryPolicy) backoffFor(attempt int) time.Duration {
 // whether it got there; the relay hands off instead. See eventRelayDeadLetterer.
 type eventRelayStore interface {
 	// ClaimPendingEventOutbox claims a batch, oldest occurrence first, taking a lease and
-	// stamping every row with a claim token. It returns at most one row per partition key
-	// across all concurrent relay instances, which is half of the ordering guarantee.
+	// stamping every row with a claim token. It returns at most one row per EFFECTIVE key —
+	// the same key the publisher hashes — across all concurrent relay instances, which is
+	// half of the ordering guarantee.
 	ClaimPendingEventOutbox(ctx context.Context, batchSize int, lockDuration time.Duration) ([]model.EventOutbox, error)
 
 	// MarkEventDispatched moves a claimed row to its success terminal state. It is
@@ -429,6 +442,15 @@ type EventRelayProcessor struct {
 	// defaultEventRelayConcurrency.
 	concurrency int
 
+	// The REPAIR capacity (PERF-M06), resolved from configuration at construction and
+	// overridable through WithRepairCapacity. It governs the two passes that clear work the
+	// publish claim cannot reach — outstanding dead-letter writes and outstanding legacy
+	// webhook enqueues — and it is separate from the publish batch because the two fill under
+	// different conditions: the publish backlog grows with ingress, these grow with an outage.
+	repairBatchSize      int
+	repairBatchesPerTick int
+	repairConcurrency    int
+
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
 	running bool
@@ -525,6 +547,10 @@ func NewEventRelayProcessor(blnk *Blnk) *EventRelayProcessor {
 		stopCh:       make(chan struct{}),
 		now:          time.Now,
 
+		repairBatchSize:      defaultEventRelayRepairBatchSize,
+		repairBatchesPerTick: defaultEventRelayRepairBatchesPerTick,
+		repairConcurrency:    defaultEventRelayRepairConcurrency,
+
 		dualDeliveryActive: WebhookDualDeliveryActive,
 		windowState:        WebhookDualDeliveryWindowState,
 	}
@@ -539,6 +565,7 @@ func NewEventRelayProcessor(blnk *Blnk) *EventRelayProcessor {
 	}
 
 	processor.retry = newRelayRetryPolicy(blnk.Config().Relay)
+	processor.applyRepairCapacity(blnk.Config().Relay)
 	processor.legacy = blnk
 
 	if blnk.datasource != nil {
@@ -684,6 +711,75 @@ func (p *EventRelayProcessor) WithConcurrency(workers int) *EventRelayProcessor 
 	}
 
 	p.concurrency = workers
+
+	return p
+}
+
+// applyRepairCapacity resolves the two repair passes' capacity from configuration.
+//
+// It normalises rather than trusts, and it does so for the same reason config.setRelayDefaults
+// does: a relay is constructible from a configuration this process did not load — a test's
+// MockConfig, a value assembled in code — so a zero or negative here would silently disable the
+// only path that ever revisits an event which reached no topic at all. Each non-positive value
+// falls back to the shipped default, which is the behaviour every other capacity field in this
+// file already has.
+//
+// Parameters:
+//   - relay config.RelayConfig: the resolved relay configuration.
+func (p *EventRelayProcessor) applyRepairCapacity(relay config.RelayConfig) {
+	if relay.RepairBatchSize > 0 {
+		p.repairBatchSize = relay.RepairBatchSize
+	}
+	if relay.RepairMaxBatchesPerTick > 0 {
+		p.repairBatchesPerTick = relay.RepairMaxBatchesPerTick
+	}
+	if relay.RepairConcurrency > 0 {
+		p.repairConcurrency = relay.RepairConcurrency
+	}
+}
+
+// WithRepairCapacity sets how fast the two repair passes clear their backlogs. Call it before
+// Start.
+//
+// ONE configurator for the three numbers rather than three, because they are one decision:
+// batch size times batches per tick is the rows a tick may repair, and the concurrency is what
+// decides how long those rows take. Setting one without the others is how a capacity change
+// comes to have no effect — raising the batch alone leaves the per-tick bound binding, and
+// raising both without the width leaves every row waiting on the previous acknowledgement.
+//
+// A non-positive value LEAVES THAT FIELD ALONE with a warning, rather than being applied. Zero
+// rows a tick is a silently disabled recovery path, and the rows it would abandon are the only
+// copies of events that reached no topic at all; zero concurrency would wait for a semaphore
+// permit that never exists.
+//
+// Parameters:
+//   - batchSize int: rows one repair claim takes.
+//   - batchesPerTick int: how many such claims one tick chains.
+//   - concurrency int: how many message-key groups of a batch are written at once.
+//
+// Returns:
+//   - *EventRelayProcessor: the receiver, for chaining.
+func (p *EventRelayProcessor) WithRepairCapacity(batchSize, batchesPerTick, concurrency int) *EventRelayProcessor {
+	for name, value := range map[string]int{
+		"repair_batch_size":       batchSize,
+		"repair_batches_per_tick": batchesPerTick,
+		"repair_concurrency":      concurrency,
+	} {
+		if value <= 0 {
+			logrus.WithFields(logrus.Fields{"setting": name, "requested": value}).
+				Warn("event relay: ignoring a non-positive repair capacity value; keeping the configured value")
+		}
+	}
+
+	if batchSize > 0 {
+		p.repairBatchSize = batchSize
+	}
+	if batchesPerTick > 0 {
+		p.repairBatchesPerTick = batchesPerTick
+	}
+	if concurrency > 0 {
+		p.repairConcurrency = concurrency
+	}
 
 	return p
 }
@@ -953,18 +1049,23 @@ func (p *EventRelayProcessor) processTick(ctx context.Context) {
 		}
 	}
 
-	// The REPAIR pass first, and deliberately so. It queries a set that is empty in normal
-	// operation, so it costs one indexed query; and when the set is NOT empty those rows are
-	// the only copies of events that reached no topic at all, which makes them the most
-	// urgent work in the tick rather than the least. Putting it after the publish loop would
+	// The REPAIR passes first, and deliberately so. Each queries a set that is empty in normal
+	// operation, so an idle pass costs one indexed query; and when a set is NOT empty those rows
+	// are the only copies of events that reached no topic at all, which makes them the most
+	// urgent work in the tick rather than the least. Putting them after the publish loop would
 	// also mean a sustained backlog — fifty chained batches — starved the repair entirely.
-	p.recoverUnpreservedDeadLetters(ctx)
+	//
+	// CHAINED, exactly as the publish loop below is (PERF-M06). One batch per tick was a drain
+	// rate of batchSize per poll interval however fast the broker was, which could not clear
+	// what an outage produces; see the repair constants for the arithmetic. The bound is what
+	// keeps a recovery from starving the publish loop it shares this tick with.
+	p.repairChained(ctx, repairLegDeadLetter, p.recoverUnpreservedDeadLetters)
 
 	// The LEGACY leg's own repair pass, for the same reasons and with the same shape. Its
 	// candidate set is likewise empty in normal operation and index-backed, and when it is not
 	// empty those rows are webhooks promised for the migration window that no other statement
 	// will ever pick up. SUNSET: deleted with the dual-delivery branch.
-	p.recoverOwedLegacyWebhooks(ctx)
+	p.repairChained(ctx, repairLegLegacyWebhook, p.recoverOwedLegacyWebhooks)
 
 	for chained := 0; chained < maxEventRelayBatchesPerTick; chained++ {
 		if !p.shouldClaimAnotherBatch(ctx) {
@@ -978,6 +1079,228 @@ func (p *EventRelayProcessor) processTick(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// The two repair legs, named so the metrics attribute and the log field cannot disagree about
+// which backlog a reading describes.
+//
+// SUNSET: repairLegLegacyWebhook goes with the dual-delivery branch.
+const (
+	repairLegDeadLetter    = "dead_letter"
+	repairLegLegacyWebhook = "legacy_webhook"
+)
+
+// repairChained runs one repair pass repeatedly until it drains, up to the per-tick bound, and
+// publishes what the pass achieved (PERF-M06).
+//
+// # Why chaining, and why it is bounded
+//
+// A repair pass claims at most repairBatchSize rows. Run once per tick, the drain rate is that
+// batch per poll interval — 20 rows a second under the previous fixed batch — which cannot clear
+// what an outage produces: 15 minutes at 500 events a second is about 450,000 rows, roughly six
+// and a quarter hours at that rate, with the dead-letter age alert firing throughout.
+//
+// The bound remains because the alternative is worse in the opposite direction. An unbounded loop
+// would let one tick attempt an entire historical backlog, holding the publish loop — which this
+// tick also owes — behind it for as long as that took. Bounded chaining drains fast AND keeps new
+// events flowing, which matters because a repair backlog exists precisely while the pipeline is
+// recovering.
+//
+// A SHORT BATCH ENDS THE CHAIN, which is the same drained-set signal processTick uses for the
+// publish loop: a pass that repaired fewer rows than it could claim has nothing left to claim.
+//
+// # What it publishes
+//
+// blnk.events.repair.saturated is the reading that could not be derived from the backlog and the
+// drain rate: both fall while a recovery is merely slow, so only "the budget was spent and work
+// remained" distinguishes "recovering as configured" from "configured too slowly to recover".
+//
+// Parameters:
+//   - ctx context.Context: cancelling it ends the chain; rows already claimed keep their lease.
+//   - leg string: repairLegDeadLetter or repairLegLegacyWebhook, for the metric attribute.
+//   - pass func(context.Context) int: one bounded pass, returning how many rows it repaired.
+func (p *EventRelayProcessor) repairChained(ctx context.Context, leg string, pass func(context.Context) int) {
+	budget := p.repairBatchesPerTick
+	if budget < 1 {
+		budget = 1
+	}
+
+	batches := 0
+	repaired := 0
+	saturated := false
+
+	for chained := 0; chained < budget; chained++ {
+		// The same non-blocking check the publish loop makes before every batch: claiming new
+		// work while stopping would only lease rows and leave them.
+		if !p.shouldClaimAnotherBatch(ctx) {
+			break
+		}
+
+		done := pass(ctx)
+		batches++
+		repaired += done
+
+		if done < p.repairBatchSize {
+			// Drained, or every row of the batch failed — either way there is nothing this tick
+			// can usefully chain onto. A pass that failed every row has already logged per row.
+			break
+		}
+
+		// A full batch on the LAST permitted iteration means the budget, not the backlog, ended
+		// the chain.
+		if chained == budget-1 {
+			saturated = true
+		}
+	}
+
+	p.recordRepairOutcome(ctx, leg, repaired, batches, saturated)
+}
+
+// recordRepairOutcome publishes what one tick's chained repair achieved for one leg.
+//
+// Recorded on EVERY tick including the idle ones, and the zeros are the point: a saturation gauge
+// left at 1 after the backlog cleared would keep an operator looking at a capacity problem that
+// no longer exists, and a drain rate is only readable if the counter is known not to have stopped
+// being incremented for want of a call.
+//
+// The BACKLOG gauge is deliberately not published here. It is a count of rows the relay has not
+// claimed, which this function cannot know without a query the event-metrics collector already
+// makes for blnk.outbox.pending — so the collector publishes it from the per-status counts it
+// already holds, and this publishes only what the pass itself observed.
+//
+// Parameters:
+//   - ctx context.Context: the tick context, used only as the metric recording context.
+//   - leg string: which repair leg this describes.
+//   - repaired int: rows that reached their destination this tick.
+//   - batches int: how many chained passes ran.
+//   - saturated bool: whether the per-tick budget ended the chain with a full batch.
+func (p *EventRelayProcessor) recordRepairOutcome(ctx context.Context, leg string, repaired, batches int, saturated bool) {
+	attributes := otelmetric.WithAttributes(attribute.String("leg", leg))
+
+	if metrics.EventRepairsCompletedTotal != nil && repaired > 0 {
+		metrics.EventRepairsCompletedTotal.Add(ctx, int64(repaired), attributes)
+	}
+
+	if metrics.EventRepairSaturated != nil {
+		saturatedValue := int64(0)
+		if saturated {
+			saturatedValue = 1
+		}
+
+		metrics.EventRepairSaturated.Record(ctx, saturatedValue, attributes)
+	}
+
+	// Logged only when something happened, because this runs every poll interval and an idle
+	// pass has nothing to say. Saturation IS something happening even at zero repaired: it means
+	// the budget was spent on rows that all failed.
+	if repaired == 0 && !saturated {
+		return
+	}
+
+	fields := logrus.Fields{
+		"leg":       leg,
+		"repaired":  repaired,
+		"batches":   batches,
+		"saturated": saturated,
+	}
+
+	if saturated {
+		logrus.WithFields(fields).Warn(
+			"event relay: the repair budget for this leg was spent with work still outstanding; " +
+				"raise RELAY_REPAIR_MAX_BATCHES_PER_TICK or RELAY_REPAIR_BATCH_SIZE if the backlog " +
+				"is not falling fast enough",
+		)
+
+		return
+	}
+
+	logrus.WithFields(fields).Info("event relay: repaired outstanding rows for this leg")
+}
+
+// repairRowsConcurrently writes one claimed repair batch, bounded by repairConcurrency.
+//
+// # Ordering is preserved by construction, not by luck
+//
+// The rows are grouped by the SAME effective key the publisher hashes, through the same
+// groupEventRowsByPartitionKey the publish loop uses, and each group is written sequentially by
+// one goroutine. Two rows that must stay ordered therefore share a group and are never written at
+// the same time — which matters for the legacy leg, whose enqueues carry a subscriber-visible
+// order, and costs nothing for the dead-letter leg.
+//
+// Cancellation is honoured before every group AND between rows within a group, exactly as
+// processBatch does: rows not yet attempted keep their lease and are re-claimed once it expires,
+// which is the same mechanism that recovers a crashed relay.
+//
+// Parameters:
+//   - ctx context.Context: cancelling it stops dispatching further rows.
+//   - rows []model.EventOutbox: the claimed batch.
+//   - repair func(context.Context, model.EventOutbox) bool: one row's repair, returning whether
+//     it reached its destination. It must be safe for concurrent use across groups.
+//
+// Returns:
+//   - int: how many rows were repaired.
+func (p *EventRelayProcessor) repairRowsConcurrently(
+	ctx context.Context,
+	rows []model.EventOutbox,
+	repair func(context.Context, model.EventOutbox) bool,
+) int {
+	width := p.repairConcurrency
+	if width < 1 {
+		width = 1
+	}
+
+	groups := groupEventRowsByPartitionKey(rows)
+	permits := semaphore.NewWeighted(int64(width))
+
+	var (
+		wait     sync.WaitGroup
+		mu       sync.Mutex
+		repaired int
+	)
+
+	for _, group := range groups {
+		if !publishingMayProceed(ctx) {
+			break
+		}
+
+		// Acquired before spawning, so the number of in-flight writes is bounded by the permit
+		// count rather than by the number of groups.
+		if acquireErr := permits.Acquire(ctx, 1); acquireErr != nil {
+			break
+		}
+
+		wait.Add(1)
+
+		go func(group []model.EventOutbox) {
+			defer wait.Done()
+			defer permits.Release(1)
+
+			done := 0
+			for _, row := range group {
+				if !publishingMayProceed(ctx) {
+					break
+				}
+
+				if repair(ctx, row) {
+					done++
+				}
+			}
+
+			if done == 0 {
+				return
+			}
+
+			mu.Lock()
+			repaired += done
+			mu.Unlock()
+		}(group)
+	}
+
+	// Waiting here is what makes Stop's promise true: the tick cannot return, and so p.wg cannot
+	// drain, until the writes in flight have finished.
+	wait.Wait()
+
+	return repaired
 }
 
 // shouldClaimAnotherBatch reports whether the relay may CLAIM MORE WORK.
@@ -1430,9 +1753,7 @@ func (p *EventRelayProcessor) recoverUnpreservedDeadLetters(ctx context.Context)
 		return 0
 	}
 
-	rows, err := p.store.ClaimFailedEventOutboxForDeadLetter(
-		ctx, defaultEventRelayDeadLetterRecoveryBatch, p.lockDuration,
-	)
+	rows, err := p.store.ClaimFailedEventOutboxForDeadLetter(ctx, p.repairBatchSize, p.lockDuration)
 	if err != nil {
 		withLoggableCause(nil, err).Error(
 			"event relay: could not claim events awaiting dead-letter preservation; they stay in the " +
@@ -1450,38 +1771,46 @@ func (p *EventRelayProcessor) recoverUnpreservedDeadLetters(ctx context.Context)
 		"event relay: retrying the dead-letter preservation of events whose earlier write failed",
 	)
 
-	repaired := 0
+	// Written repairConcurrency groups at a time rather than one row after another (PERF-M06).
+	// Every row here needs its own Kafka write, so a sequential loop bounded the whole recovery
+	// at one broker acknowledgement at a time — about 100 rows a second — which is an order of
+	// magnitude under what an outage's backlog needs. Ordering is preserved by grouping on the
+	// same effective key the publisher hashes; see repairRowsConcurrently.
+	return p.repairRowsConcurrently(ctx, rows, p.preserveOneDeadLetter)
+}
 
-	for _, row := range rows {
-		// Checked before each row, not only at the top: a repair burst during a broker
-		// outage is exactly when a shutdown is likely, and the rows not yet attempted keep
-		// their lease and are re-claimed after it expires.
-		if !publishingMayProceed(ctx) {
-			break
-		}
-
-		outcome, dltErr := p.deadLetters.DeadLetter(ctx, row, unpreservedDeadLetterCause(row))
-		if dltErr != nil {
-			withLoggableCause(logrus.WithFields(p.rowFields(row, row.Attempts)), dltErr).Warn(
-				"event relay: retrying the dead-letter preservation of this event failed again; it " +
-					"stays in the dead-letter inventory and is retried once its lease expires",
-			)
-
-			continue
-		}
-
-		repaired++
-
-		logrus.WithFields(p.rowFields(row, row.Attempts)).WithFields(logrus.Fields{
-			"dlt_topic": outcome.DeadLetterTopic,
-			"attempts":  outcome.Metadata.AttemptCount,
-		}).Warn(
-			"event relay: an event whose dead-letter write had failed is now preserved on its " +
-				"dead-letter topic and is replayable",
+// preserveOneDeadLetter retries the `<topic>.dlt` write for one claimed row.
+//
+// Split out of recoverUnpreservedDeadLetters so the row's work is a value the bounded writer can
+// call, and so the two repair legs have the same shape: claim, then write the batch through
+// repairRowsConcurrently.
+//
+// Parameters:
+//   - ctx context.Context: cancels the write.
+//   - row model.EventOutbox: the claimed row, carrying a fresh claim token.
+//
+// Returns:
+//   - bool: true when the event is now preserved on its dead-letter topic and replayable.
+func (p *EventRelayProcessor) preserveOneDeadLetter(ctx context.Context, row model.EventOutbox) bool {
+	outcome, dltErr := p.deadLetters.DeadLetter(ctx, row, unpreservedDeadLetterCause(row))
+	if dltErr != nil {
+		withLoggableCause(logrus.WithFields(p.rowFields(row, row.Attempts)), dltErr).Warn(
+			"event relay: retrying the dead-letter preservation of this event failed again; it " +
+				"stays in the dead-letter inventory and is retried once its lease expires",
 		)
+
+		return false
 	}
 
-	return repaired
+	logrus.WithFields(p.rowFields(row, row.Attempts)).WithFields(logrus.Fields{
+		"dlt_topic": outcome.DeadLetterTopic,
+		"attempts":  outcome.Metadata.AttemptCount,
+	}).Warn(
+		"event relay: an event whose dead-letter write had failed is now preserved on its " +
+			"dead-letter topic and is replayable",
+	)
+
+	return true
 }
 
 // recoverOwedLegacyWebhooks finishes the LEGACY leg of rows whose Kafka leg has finished and
@@ -1537,9 +1866,7 @@ func (p *EventRelayProcessor) recoverOwedLegacyWebhooks(ctx context.Context) int
 		return 0
 	}
 
-	rows, err := p.store.ClaimPendingWebhookDeliveries(
-		ctx, defaultEventRelayDeadLetterRecoveryBatch, p.lockDuration,
-	)
+	rows, err := p.store.ClaimPendingWebhookDeliveries(ctx, p.repairBatchSize, p.lockDuration)
 	if err != nil {
 		withLoggableCause(nil, err).Error(
 			"event relay: could not claim events whose legacy webhook leg is still owed; the legs " +
@@ -1557,22 +1884,13 @@ func (p *EventRelayProcessor) recoverOwedLegacyWebhooks(ctx context.Context) int
 		"event relay: finishing the legacy webhook leg of events whose earlier enqueue failed",
 	)
 
-	delivered := 0
-
-	for _, row := range rows {
-		// Checked before each row rather than only at the top: this pass runs during the
-		// outages that produce its work, which is when a shutdown is most likely. Rows not
-		// yet attempted keep their lease and are re-claimed once it expires.
-		if !publishingMayProceed(ctx) {
-			break
-		}
-
-		if p.recoverOneOwedLegacyWebhook(ctx, row) {
-			delivered++
-		}
-	}
-
-	return delivered
+	// Bounded-concurrent for the same reason the dead-letter leg is (PERF-M06), and grouped on
+	// the effective key so two enqueues of one aggregate keep their order — which matters more
+	// here than on the dead-letter leg, because a subscriber still receiving webhooks sees this
+	// order directly.
+	return p.repairRowsConcurrently(ctx, rows, func(ctx context.Context, row model.EventOutbox) bool {
+		return p.recoverOneOwedLegacyWebhook(ctx, row)
+	})
 }
 
 // recoverOneOwedLegacyWebhook enqueues one outstanding legacy delivery and records the outcome.
@@ -1690,13 +2008,18 @@ func unpreservedDeadLetterCause(row model.EventOutbox) error {
 // same time or out of occurrence order — which holds here for TWO INDEPENDENT REASONS:
 //
 //  1. The claim already guarantees it. ClaimPendingEventOutbox returns at most one row per
-//     partition key, across every concurrent instance, so in practice each group has one row.
+//     EFFECTIVE key, across every concurrent instance, so in practice each group has one row.
+//     Its predicate resolves that key by the SAME rule this function does — eventOutboxEffectiveKeySQL
+//     is model.EffectivePartitionKey in SQL — so the two agree by construction rather than by
+//     coincidence.
 //  2. This function guarantees it locally. Two rows sharing a key would land in the same group
 //     and be published in claim order by one goroutine rather than racing in two.
 //
-// The redundancy is deliberate: relying on the first alone would put the ordering guarantee in
-// a SQL predicate in another package, where a well-intentioned change could break it with
-// nothing in this file to show it.
+// The redundancy is deliberate, and it is what limits the blast radius of a divergence between
+// the two: reason 2 holds WITHIN one process whatever the SQL does, so a claim that serialised
+// on the wrong key could only ever reorder rows across SEPARATE replicas. That is exactly the
+// defect PERF-C02 was — invisible on a single-relay test and real in production — which is why
+// relying on reason 2 alone is not enough either.
 func groupEventRowsByPartitionKey(rows []model.EventOutbox) [][]model.EventOutbox {
 	groups := make([][]model.EventOutbox, 0, len(rows))
 	indexByKey := make(map[string]int, len(rows))
@@ -2477,9 +2800,11 @@ func (p *EventRelayProcessor) deadLetter(
 // Everything between this banner and its closing one exists for the 30-day window in which
 // Kafka publishing and legacy HTTP webhook delivery run side by side from the same outbox
 // row. Retiring it is operator work rather than something the configured date performs: the
-// ordered procedure — what must be relocated before anything is deleted, and which parts of
-// the shared webhook queue must survive because transaction hooks and search indexing use
-// it — is recorded once, in the sunset block at the foot of webhooks.go.
+// ordered procedure — and in particular which parts of the shared webhook queue must survive
+// because transaction hooks and search indexing use it — is recorded once, in the sunset block
+// at the foot of webhooks.go. That procedure's first step, relocating the two payload-contract
+// symbols out of the file being deleted, is already done: NewWebhook now lives in
+// event_outbox.go and getEventFromStatus in event_topics.go.
 //
 // Nothing above this banner is part of it: claiming, publishing, the retry schedule,
 // dead-lettering and replay all outlive the sunset unchanged.

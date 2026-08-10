@@ -686,9 +686,11 @@ type PublishResult struct {
 	// waiting for the next poll tick, the poll interval itself, and the claim query's
 	// latency — the three intervals that dominate a backlog. A relay stalled for a minute
 	// would report a five-millisecond publish, so the figure would look healthiest exactly
-	// when subscribers were furthest behind. Both are recorded: the difference between them
-	// is the queue wait, which is what tells an operator whether a slow end-to-end figure is
-	// the broker or the relay.
+	// when subscribers were furthest behind. Both are recorded: for a SINGLE event the
+	// difference between its two observations is that event's queue wait, which is what tells
+	// an operator whether a slow end-to-end figure is the broker or the relay. Per event only
+	// — subtracting the two p99 FIGURES is not a queue-wait percentile, because quantiles are
+	// not subtractive; docs/metrics.md states that where the two series are catalogued.
 	//
 	// It spans two clocks by necessity — the capturing process stamped occurred_at, this
 	// process reads the acknowledgement — so a NEGATIVE reading is possible under skew and
@@ -1011,11 +1013,28 @@ func IsPermanentPublishError(err error) bool {
 //     same operator situation as no broker being configured: nothing can be published from
 //     this process now, the event stays safe in its outbox row, and the honest answer is
 //     "unavailable, try again" rather than "internal error".
-//  2. A PublishError's OWN classification. Transient was decided at the moment of failure
-//     by classifyTransientPublishError against the broker's real error, so it is the most
-//     informed answer available and it is not second-guessed here.
+//  2. A PublishError's OWN classification, with ONE correction applied to it. A permanent
+//     failure is never an outage, and that direction is taken verbatim. A TRANSIENT failure
+//     is an outage unless its only cause is this process giving up — see TAXONOMY-01 below.
 //  3. The raw error, for a failure that reached the caller unwrapped — a borrowed writer's
-//     WriteMessages error, or a double reporting the broker's own error code.
+//     WriteMessages error, or a double reporting the broker's own error code — classified by
+//     brokerUnavailable.
+//
+// # TAXONOMY-01: a cancelled write is retryable, and it is NOT an outage
+//
+// This function used to return a PublishError's Transient flag unchanged, and to delegate the
+// raw case to the retry classifier. Both readings answered "will another attempt help?" when
+// the question asked is "is the broker the reason?", and for one class of failure those have
+// opposite answers: a write abandoned because the process is shutting down, because the relay
+// lost its outbox lease, or because a request budget expired is worth attempting again and
+// says nothing whatever about Kafka.
+//
+// Reported as an outage it reached the replay endpoint's mapper, which answered
+// EVENT_KAFKA_UNAVAILABLE / 503 with a message naming the broker and advising a retry once it
+// recovers — for a broker that was never unhealthy. So context termination with no network or
+// protocol signature anywhere in its chain is reported false here, and the retry verdict is
+// left exactly as wide as it was: nothing about the relay's budget changes, because
+// classifyTransientPublishError still calls such a failure transient.
 //
 // Anything unrecognised is reported as false. That is the conservative direction: an
 // unknown failure stays visible as a fault in this service rather than being written off
@@ -1038,40 +1057,85 @@ func IsBrokerUnavailableError(err error) bool {
 
 	var publishErr *PublishError
 	if errors.As(err, &publishErr) {
-		return publishErr.Transient
+		// A publisher that called the failure permanent is describing a defect in the event or
+		// in this service, and no reading here overrides that.
+		if !publishErr.Transient {
+			return false
+		}
+
+		// TAXONOMY-01. The publisher's transient verdict is kept for every cause EXCEPT a bare
+		// cancellation or expiry, which is this process's own decision rather than the broker's
+		// condition.
+		return !localContextTermination(publishErr)
 	}
 
 	return brokerUnavailable(err)
 }
 
+// localContextTermination reports that a failure is THIS PROCESS giving up — a cancelled
+// context, a spent deadline, a lost lease, a shutdown — rather than anything observed about the
+// broker.
+//
+// The concrete-signature test comes first and it is what makes the predicate safe. Go's net
+// package maps a dial cancelled or timed out by its context onto errors that satisfy
+// errors.Is(err, context.Canceled) and errors.Is(err, context.DeadlineExceeded), wrapped in a
+// *net.OpError — so a broker that blackholes connections produces a real outage whose chain
+// also looks like cancellation. Asking "does this carry an outage signature?" before "does this
+// look cancelled?" keeps that case an outage; the reverse order would report an unreachable
+// broker as an internal defect.
+//
+// Parameters:
+//   - err error: the failure. A nil is reported false.
+//
+// Returns:
+//   - bool: true only for a context termination with no broker or network signature at all.
+func localContextTermination(err error) bool {
+	if err == nil || brokerOutageSignature(err) {
+		return false
+	}
+
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // brokerUnavailable classifies a RAW publish failure — one that has not been through
 // kafkaPublisher.fail and so carries no verdict of its own.
 //
-// # ONE CLASSIFIER, TWO QUESTIONS (RETRY-01)
+// # TWO QUESTIONS, AND THEY ARE NOT THE SAME QUESTION (TAXONOMY-01)
 //
-// This is now exactly classifyTransientPublishError, and the delegation is the fix rather
-// than a shortcut. The two questions — "will another attempt help?" and "is the broker the
-// reason?" — have one answer for a publish failure, because a broker that cannot accept the
-// write right now is precisely the failure a later attempt succeeds at.
+// "Will another attempt help?" is classifyTransientPublishError. "Is the BROKER the reason?"
+// is this. Every failure this reports is also retryable, so the set here is a SUBSET of the
+// retryable set — but it is a strict subset, and the difference is the whole point of this
+// function existing separately.
 //
-// While they were two functions they DISAGREED, and the disagreement was reachable in
-// ordinary operation: brokerUnavailable recognised *net.DNSError and *net.OpError while the
-// transient classification did not, so a broker whose name stopped resolving — a container
-// or pod replacement, a Service recreation, a resolver restart — produced one failure that
-// was simultaneously reported terminal=true (skipping the whole retry budget and
-// dead-lettering the event on the spot) and failure_class=broker_unavailable on the very
-// next log line. A rolling restart therefore dead-lettered every event in flight instead of
-// self-healing, which breaks requirement R-4's bounded five-attempt budget and blows
-// acceptance criterion V-3's 0.1% dead-letter budget during planned maintenance.
+// This used to delegate wholesale to classifyTransientPublishError, and that made one class of
+// failure lie about its cause. Context termination is retryable — a write abandoned because
+// the process is shutting down, because the relay lost its outbox lease, or because a request
+// budget expired says nothing at all about the event, so another attempt in a live process
+// publishes it — but it is a LOCAL decision, not an outage. Reported as one it reached
+// event_dlt.go's replay mapper, which answered EVENT_KAFKA_UNAVAILABLE / 503 with a message
+// naming the broker as the problem and telling the operator to retry once it recovers. The
+// broker was healthy; the caller had cancelled, or the deadline had passed. An operator
+// reading that went looking at Kafka for a fault that was on this side of the connection.
 //
-// The invariant this delegation makes structural, rather than a property two functions had
-// to be kept in step to preserve: A FAILURE CLASSIFIED broker_unavailable IS NEVER TERMINAL
-// ON AN UNSPENT BUDGET.
+// So the two verdicts are two predicates again, and the DISAGREEMENT the delegation existed
+// to prevent is prevented structurally instead: every signature named below is one
+// classifyTransientPublishError also reports, which is what preserves RETRY-01's invariant —
+// A FAILURE CLASSIFIED broker_unavailable IS NEVER TERMINAL ON AN UNSPENT BUDGET — while
+// letting the retry verdict stay strictly wider than the outage verdict.
 //
-// The set of failures it reports is UNCHANGED. It always contained everything the transient
-// classification recognised plus the three signatures kafka-go does not mark retriable, and
-// those three now live in brokerUnavailableSignature, which the transient classification
-// consults as its last rule. What changed is the retry verdict, which widened to match.
+// # Why the concrete signatures are tested BEFORE context termination
+//
+// The order is load-bearing, not stylistic. net.Dialer.DialContext maps an expired or
+// cancelled dial onto errors that satisfy errors.Is(err, context.DeadlineExceeded) and
+// errors.Is(err, context.Canceled) respectively, wrapped in a *net.OpError. A broker that
+// blackholes SYNs therefore produces a genuine outage whose error chain also matches context
+// termination. Testing the concrete network signature first keeps that case an outage;
+// testing context first would have reported an unreachable broker as an internal defect,
+// which is the same misclassification as the one being fixed, in the opposite direction.
+//
+// A bare context error — one that arrives with no network or protocol signature anywhere in
+// its chain — is the only shape this reports false for, and it is exactly the shape that means
+// "this process gave up", never "the broker is down".
 //
 // Parameters:
 //   - err error: the raw failure. May be nil.
@@ -1079,46 +1143,78 @@ func IsBrokerUnavailableError(err error) bool {
 // Returns:
 //   - bool: true when the failure is the broker being unavailable.
 func brokerUnavailable(err error) bool {
-	return classifyTransientPublishError(err)
+	if err == nil {
+		return false
+	}
+
+	// The per-message slice a failed batch returns. It exposes no Unwrap, so errors.As cannot
+	// see inside it and its elements must be inspected directly — the same reason
+	// classifyTransientPublishError recurses by hand. A batch is an outage when ANY element
+	// is: one message failing on an unavailable partition leader is the broker's condition,
+	// not the batch's.
+	var writeErrors kafka.WriteErrors
+	if errors.As(err, &writeErrors) {
+		for _, writeErr := range writeErrors {
+			if writeErr != nil && brokerUnavailable(writeErr) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	return brokerOutageSignature(err)
 }
 
-// brokerUnavailableSignature recognises the three broker-outage signatures kafka-go's own
-// retriability judgement does not report, so they can be named in ONE place and consulted by
-// both the retry verdict and the broker-unavailability verdict.
+// brokerOutageSignature recognises the failures that are EVIDENCE OF THE BROKER, as opposed to
+// evidence of this process, this event, or this caller's deadline.
 //
-// It exists as a leaf helper rather than as a branch inside either caller because the two
-// used to hold separate copies of this knowledge and drifted apart; a single leaf cannot
-// drift, and it cannot recurse into either caller.
+// It is the leaf brokerUnavailable is written in terms of, and it is deliberately a closed list
+// of concrete signatures rather than a reach for an interface:
 //
-//   - BrokerNotAvailable and ReplicaNotAvailable. kafka-go does NOT list these in
-//     Error.Temporary, yet both are the broker stating plainly that it cannot serve the
-//     partition right now. They are the two codes a caller most expects to see during a
-//     rolling restart, so leaving them out would report the commonest planned outage as an
-//     internal error.
+//   - A KAFKA PROTOCOL ERROR answers from its own code and never falls through. kafka.Error
+//     implements Error, Timeout and Temporary, so it satisfies net.Error — testing the
+//     interface would classify MessageSizeTooLarge, InvalidTopic and RecordListTooLarge, which
+//     are defects in the event, as broker outages. Temporary() is what covers the broker-side
+//     conditions kafka-go already knows are retriable (a leader election, not-enough-replicas,
+//     a request the broker did not acknowledge in time), and the two codes it omits are named
+//     explicitly: BrokerNotAvailable and ReplicaNotAvailable are the broker stating plainly
+//     that it cannot serve the partition, and they are the pair a caller sees most during a
+//     rolling restart.
+//   - RAW CONNECTION FAILURES — refused, reset, a broken pipe, a truncated or closed stream.
+//     These reach the caller unwrapped often enough to be worth naming, and each is the
+//     ordinary signature of a broker that has just gone away.
 //   - *net.OpError and *net.DNSError, which cover a dial, route or resolution failure whose
-//     underlying errno is outside the small set classifyTransientPublishError names — a
-//     resolution failure has no errno at all, which is exactly how it escaped.
+//     underlying cause is outside the errno set above — a resolution failure has no errno at
+//     all, which is exactly how it once escaped classification entirely.
 //
-// The net checks are deliberately made against those CONCRETE types and never against the
-// net.Error interface: kafka.Error implements Error, Timeout and Temporary, so it satisfies
-// net.Error, and an interface test would silently reclassify every Kafka protocol error —
-// including genuine defects such as an invalid topic or an oversized message — as a
-// broker outage. A kafka.Error is answered from its code alone and does not fall through to
-// the net checks, because a protocol code is never a network operation error.
+// Anything else is reported false, which is the conservative direction for this question: an
+// unrecognised failure stays visible as a fault in Blnk rather than being written off as
+// somebody else's outage.
 //
 // Parameters:
-//   - err error: the failure. Never nil in practice; a nil is reported false.
+//   - err error: the failure. A nil is reported false.
 //
 // Returns:
-//   - bool: true when the failure carries one of the three signatures.
-func brokerUnavailableSignature(err error) bool {
+//   - bool: true when the failure carries one of the signatures above.
+func brokerOutageSignature(err error) bool {
 	if err == nil {
 		return false
 	}
 
 	var kafkaErr kafka.Error
 	if errors.As(err, &kafkaErr) {
-		return kafkaErr == kafka.BrokerNotAvailable || kafkaErr == kafka.ReplicaNotAvailable
+		return kafkaErr.Temporary() ||
+			kafkaErr == kafka.BrokerNotAvailable ||
+			kafkaErr == kafka.ReplicaNotAvailable
+	}
+
+	if errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.EOF) {
+		return true
 	}
 
 	var opErr *net.OpError
@@ -2824,20 +2920,27 @@ func (p *kafkaPublisher) Close() error {
 //
 // # Why the key is the ledger, and how the claim still composes with it
 //
-// Requirement R-6 partitions by LEDGER ID, and that is what this function keys on. The reason
-// it composes with the database's ordering work is that the two values AGREE wherever a ledger
-// exists: WithEventLedgerID writes the supplied ledger into ledger_id AND partition_key, and
-// every payload that yields a ledger of its own does the same. So the value
-// ClaimPendingEventOutbox serialises dispatch on — at most ONE row per partition_key in flight,
-// which is the purpose of the NOT EXISTS anti-join in claimPendingEventOutboxQuery and of the
-// idx_event_outbox_partition_key_inflight index behind it — is the same value Kafka partitions
-// on, and the database's ordering guarantee reaches the subscriber intact.
+// Requirement R-6 partitions by LEDGER ID, and that is what this function keys on. It composes
+// with the database's ordering work because the claim serialises on THE SAME rule rather than
+// on a column: ClaimPendingEventOutbox admits at most ONE row per EFFECTIVE key in flight —
+// the purpose of the NOT EXISTS anti-join in claimPendingEventOutboxQuery and of the
+// idx_event_outbox_effective_key_inflight expression index behind it — and both sides of that
+// predicate are rendered from eventOutboxEffectiveKeySQL, which is model.EffectivePartitionKey
+// in SQL. The value the database serialises on is therefore the value Kafka partitions on by
+// construction, and the ordering guarantee reaches the subscriber intact even with several
+// relay replicas running.
 //
-// This is why populating the ledger AT CAPTURE TIME is not optional. Transaction payloads carry
-// no ledger field, so the producer must state it: transaction execution takes it from the
-// source balance it has already loaded, and the ledger and balance hooks hold the entity
-// itself. Without that, ledger_id is NULL, the key falls through to partition_key, and
-// whole-ledger affinity is lost silently — which is exactly the failure model
+// Serialising on the partition_key COLUMN instead was the previous shape and it was unsound
+// (PERF-C02): the two values agree only wherever a ledger reached the row's partition key, so
+// two same-ledger rows with divergent stored keys went unserialised while both hashed to one
+// Kafka partition — two replicas could then append them in either order.
+//
+// Populating the ledger AT CAPTURE TIME is still not optional, for a different reason: it is
+// what gives whole-ledger affinity in the first place. Transaction payloads carry no ledger
+// field, so the producer must state it: transaction execution takes it from the source balance
+// it has already loaded, and the ledger and balance hooks hold the entity itself. Without
+// that, ledger_id is NULL, the key falls back to partition_key, and events of one ledger
+// spread across partitions — which is exactly the failure model
 // model.EventOutbox.PartitionKey's own documentation warns about, in the other direction.
 //
 // Events that genuinely have NO ledger keep their partition-key affinity through the fallback:
@@ -3165,8 +3268,8 @@ func KafkaBrokersConfigured(brokers []string) bool {
 //   - Raw connection failures, which reach the caller unwrapped often enough to be worth
 //     naming: a refused, reset or broken connection is the ordinary signature of a broker
 //     restart.
-//   - brokerUnavailableSignature, the three broker-outage shapes none of the four rules
-//     above recognises: BrokerNotAvailable, ReplicaNotAvailable, and a *net.OpError or
+//   - brokerOutageSignature, the broker-outage shapes none of the four rules above
+//     recognises: BrokerNotAvailable, ReplicaNotAvailable, and a *net.OpError or
 //     *net.DNSError whose cause is outside the small errno set named above.
 //
 // # RETRY-01: why the fifth rule is here and not only in brokerUnavailable
@@ -3180,15 +3283,23 @@ func KafkaBrokersConfigured(brokers []string) bool {
 // failure_class=broker_unavailable. A rolling restart converted every event in flight into a
 // manual replay and a DeadLetterMessageStuck page.
 //
-// So the two verdicts are ONE predicate now: brokerUnavailable delegates here, and the rule
-// they used to disagree about lives in one leaf both consult. The invariant that buys —
-// a failure classified broker_unavailable is never terminal on an unspent budget — is
-// requirement R-4's bounded five-attempt budget doing what it says.
+// The two verdicts share that fifth rule as ONE leaf, which is what keeps them from drifting
+// apart again: every failure brokerUnavailable reports is a failure this function reports, so
+// the invariant a failure classified broker_unavailable is never terminal on an unspent budget
+// holds by construction rather than by two functions being maintained in step.
+//
+// # TAXONOMY-01: the retryable set is WIDER than the outage set, and stays that way
+//
+// The two are not the same question, and this one answers the wider of them. Context expiry
+// above is the case that separates them: a write abandoned by a cancelled context or a spent
+// budget IS worth attempting again, and it is NOT evidence of anything about the broker — so it
+// is transient here and not an outage in brokerUnavailable. Collapsing the two verdicts into
+// this function is what once let a shutdown be reported to an operator as a broker failure.
 //
 // Anything unrecognised is still reported as permanent. That is the conservative direction
 // for an unknown failure, because an unbounded retry of something that can never succeed is
 // worse than a dead-letter entry an operator can see and replay — and it is why this widening
-// names three concrete signatures rather than reaching for the net.Error interface, which
+// names concrete signatures rather than reaching for the net.Error interface, which
 // kafka.Error also satisfies.
 //
 // Parameters:
@@ -3234,7 +3345,7 @@ func classifyTransientPublishError(err error) bool {
 		return true
 	}
 
-	return brokerUnavailableSignature(err)
+	return brokerOutageSignature(err)
 }
 
 // recordPublishAttempt records the two per-attempt instruments.

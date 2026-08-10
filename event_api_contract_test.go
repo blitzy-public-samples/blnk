@@ -358,12 +358,27 @@ func TestReplayEventResponse_WireContract(t *testing.T) {
 
 // TestEventOutboxStatsResponse_WireContract pins GET /events/stats, including the validity
 // caveats without which its numbers cannot be trusted.
+// dispatchedCount is the pointer form the dispatched count now takes on the wire.
+//
+// It is a pointer because dispatched is the ONE status count that is not always measured
+// (PERF-M05): counting the single unbounded population is the deliberate on-demand reading, and
+// emitting a zero for "nobody counted" would tell a reconciliation that nothing was published.
+// A helper rather than a local variable at each site keeps these contract cases reading as the
+// literals they are about.
+func dispatchedCount(v int64) *int64 { return &v }
+
 func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 	assertWireContract(t, apimodel.EventOutboxStatsResponse{}, []fieldContract{
 		{name: "Pending", jsonKey: "pending"},
 		{name: "Processing", jsonKey: "processing"},
 		{name: "WebhookPending", jsonKey: "webhook_pending"},
-		{name: "Dispatched", jsonKey: "dispatched"},
+		// PERF-M05: dispatched is the ONE count that is not always taken, so it is the one
+		// count that omits. It is a count of the single unbounded population — 43.2 million
+		// rows a day at the target rate — and is read only for a request that asked for the
+		// broker side, so an emitted zero would say "nothing was dispatched today" when the
+		// truth is "nobody counted". DispatchedHistoryCounted beside it is always emitted.
+		{name: "Dispatched", jsonKey: "dispatched", omitEmpty: true},
+		{name: "DispatchedHistoryCounted", jsonKey: "dispatched_history_counted"},
 		{name: "Failed", jsonKey: "failed"},
 		{name: "DeadLettered", jsonKey: "dead_lettered"},
 		{name: "Replaying", jsonKey: "replaying"},
@@ -402,6 +417,14 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 		require.NotEmpty(t, statuses, "the model must publish its status vocabulary for this to check anything")
 
 		for _, status := range statuses {
+			// DISPATCHED IS THE ONE EXCEPTION, and it is exercised in its own subtest below
+			// (PERF-M05). Counting it is the deliberate on-demand reading rather than part of
+			// every response, so an emitted zero would carry the one meaning a zero-loss check
+			// cannot survive: "nothing was published" in place of "nobody counted".
+			if status == model.EventOutboxStatusDispatched {
+				continue
+			}
+
 			require.Contains(t, decoded, status,
 				"the reconciliation runbook names every relay state, and a count of zero must read "+
 					"as 'none in that state' rather than as 'no such state'. %q is in the model's "+
@@ -411,14 +434,50 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 		}
 	})
 
+	// The dispatched count's own contract, which is the inverse of every other count's: it is
+	// present exactly when it was measured, and the flag beside it is present always.
+	t.Run("the dispatched count is present only when it was taken, and says which", func(t *testing.T) {
+		unmeasured := marshalToKeys(t, apimodel.EventOutboxStatsResponse{})
+
+		assert.NotContains(t, unmeasured, "dispatched",
+			"an uncounted dispatched population must OMIT the key: emitting 0 would tell a "+
+				"reconciliation that nothing was published, which is the opposite of the truth "+
+				"and is indistinguishable from a genuinely empty window")
+		require.Contains(t, unmeasured, "dispatched_history_counted",
+			"and the flag must be present so the omission is readable rather than merely safe")
+		assert.Equal(t, "false", string(unmeasured["dispatched_history_counted"]))
+
+		counted := int64(0)
+		measuredEmpty := marshalToKeys(t, apimodel.EventOutboxStatsResponse{
+			Dispatched:               &counted,
+			DispatchedHistoryCounted: true,
+		})
+
+		require.Contains(t, measuredEmpty, "dispatched",
+			"a MEASURED zero must be emitted: 'we counted, and the window held none' is a real "+
+				"finding and is exactly what the omission above must not be confused with")
+		assert.Equal(t, "0", string(measuredEmpty["dispatched"]))
+		assert.Equal(t, "true", string(measuredEmpty["dispatched_history_counted"]))
+
+		counted = 40
+		measured := marshalToKeys(t, apimodel.EventOutboxStatsResponse{
+			Dispatched:               &counted,
+			DispatchedHistoryCounted: true,
+		})
+
+		assert.Equal(t, "40", string(measured["dispatched"]))
+		assert.Equal(t, "true", string(measured["dispatched_history_counted"]))
+	})
+
 	// The replaying lease deserves its own subtest because it is the status that was
 	// missing, and because it is the only NON-TERMINAL state a caller can mistake for a
 	// terminal one: a row held by an in-flight replay is neither published nor lost.
 	t.Run("the replaying lease is counted and is not terminal", func(t *testing.T) {
 		decoded := marshalToKeys(t, apimodel.EventOutboxStatsResponse{
-			Dispatched:   40,
-			DeadLettered: 2,
-			Replaying:    3,
+			Dispatched:               dispatchedCount(40),
+			DispatchedHistoryCounted: true,
+			DeadLettered:             2,
+			Replaying:                3,
 			Reconciliation: &apimodel.OutboxReconciliationResult{
 				TerminalEvents: 42,
 			},
@@ -440,7 +499,10 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 	})
 
 	t.Run("a reading with no offsets cannot be mistaken for a valid reconciliation", func(t *testing.T) {
-		decoded := marshalToKeys(t, apimodel.EventOutboxStatsResponse{Dispatched: 12})
+		decoded := marshalToKeys(t, apimodel.EventOutboxStatsResponse{
+			Dispatched:               dispatchedCount(12),
+			DispatchedHistoryCounted: true,
+		})
 
 		assert.NotContains(t, decoded, "topic_end_offsets",
 			"a deployment with no brokers is a legitimate steady state: the key is omitted rather "+
@@ -460,14 +522,15 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 	t.Run("a partial reading reports which part is missing", func(t *testing.T) {
 		measuredAt := time.Date(2026, 3, 3, 4, 5, 6, 0, time.UTC)
 		decoded := marshalToKeys(t, apimodel.EventOutboxStatsResponse{
-			Dispatched:            41,
-			DeadLettered:          1,
-			TopicEndOffsets:       map[string]int64{"blnk.transactions": 40},
-			OffsetsComplete:       false,
-			MissingTopics:         []string{"blnk.identities"},
-			PartitionsUnavailable: 2,
-			OffsetsMeasuredAt:     &measuredAt,
-			GeneratedAt:           measuredAt,
+			Dispatched:               dispatchedCount(41),
+			DispatchedHistoryCounted: true,
+			DeadLettered:             1,
+			TopicEndOffsets:          map[string]int64{"blnk.transactions": 40},
+			OffsetsComplete:          false,
+			MissingTopics:            []string{"blnk.identities"},
+			PartitionsUnavailable:    2,
+			OffsetsMeasuredAt:        &measuredAt,
+			GeneratedAt:              measuredAt,
 		})
 
 		assert.Equal(t, "false", string(decoded["offsets_complete"]))
@@ -497,7 +560,10 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 	// earlier, so a reading that omitted them would report a consistent table while alerts
 	// and batch summaries were still owed.
 	t.Run("outstanding producer intents are reported, and an unread reading is omitted rather than zeroed", func(t *testing.T) {
-		unread := marshalToKeys(t, apimodel.EventOutboxStatsResponse{Dispatched: 7})
+		unread := marshalToKeys(t, apimodel.EventOutboxStatsResponse{
+			Dispatched:               dispatchedCount(7),
+			DispatchedHistoryCounted: true,
+		})
 
 		assert.NotContains(t, unread, "producer_atomicity",
 			"a failed read must omit the object: zero means 'nothing is owed', which is the one "+
@@ -505,7 +571,8 @@ func TestEventOutboxStatsResponse_WireContract(t *testing.T) {
 
 		began := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 		read := marshalToKeys(t, apimodel.EventOutboxStatsResponse{
-			Dispatched: 7,
+			Dispatched:               dispatchedCount(7),
+			DispatchedHistoryCounted: true,
 			ProducerAtomicity: &apimodel.ProducerAtomicityStats{
 				MonitorHandoffPending:    2,
 				MonitorHandoffFailed:     1,
@@ -783,7 +850,10 @@ func TestOutboxReconciliationResult_WireContract(t *testing.T) {
 	t.Run("a stats response with no offsets carries no verdict and no windows", func(t *testing.T) {
 		// With nothing measured on the broker side there is no verdict to report, and
 		// emitting an empty one would read as "reconciled, nothing written".
-		decoded := marshalToKeys(t, apimodel.EventOutboxStatsResponse{Dispatched: 12})
+		decoded := marshalToKeys(t, apimodel.EventOutboxStatsResponse{
+			Dispatched:               dispatchedCount(12),
+			DispatchedHistoryCounted: true,
+		})
 
 		assert.NotContains(t, decoded, "reconciliation",
 			"a deployment with no brokers is a legitimate steady state; an absent verdict is honest "+
@@ -1407,50 +1477,54 @@ func TestScopeResources_CoverTheEventAndSubscriberSurfaces(t *testing.T) {
 	})
 }
 
-// TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces is the API half of
-// the partition-key-prefix hazard.
+// TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforcesIt is the API half
+// of the partition-key-prefix hazard.
 //
 // # The hazard
 //
 // A subscriber's record carries three access-shaped values — authorized_topics, a consumer
 // group, and partition_key_prefix — and only the first two are ACL bindings. Kafka's authorizer
-// has no message-key dimension, so there is no ACL that confines a consumer to a slice of a
-// topic by key: a subscriber granted a topic reads EVERY record on it whatever the prefix says.
-// An integrator who reads all three as one access model draws the plausible and dangerous
-// conclusion that two subscribers sharing a topic with different key prefixes cannot see each
-// other's events, and builds a tenancy boundary on it.
+// has no message-key dimension, so no ACL confines a consumer to a slice of a topic by key.
 //
-// So the response states the enforced dimensions positively, answers the key question outright,
-// AND names where the key scope is enforced instead. These assertions are what stop that
-// statement being quietly weakened later — in either direction: claiming the prefix is a broker
-// boundary, or withholding it altogether, which is what happened while credential issuance
-// refused a subscriber that recorded one.
-func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *testing.T) {
+// The response used to answer that by declaring the key dimension UNENFORCED and asking the
+// subscriber to filter for itself. A security review rejected it: cooperation is not an access
+// boundary, and a subscriber that ignored the request — or used any other Kafka client — read
+// every record on the shared topic, including records written for other ledgers.
+//
+// So the dimension is enforced now, by a component of Blnk's rather than by the broker, and this
+// body is where the response says which component enforces what. That is the property these
+// assertions protect, in both directions: a response must not claim the prefix is a broker
+// boundary, and it must not report it as nobody's boundary either.
+func TestSubscriberEnforcedAccess_StatesEachDimensionAndTheComponentThatEnforcesIt(t *testing.T) {
 	subscriberID := "acme_prod"
 	topics := []string{"blnk.transactions", "blnk.balances"}
 	const keyScope = "ldg_9f1c8a72"
 
 	enforced := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, keyScope)
 
-	t.Run("partition key filtering is declared unenforced, in the body", func(t *testing.T) {
-		assert.False(t, enforced.PartitionKeyPrefixEnforced,
-			"this field may never be true: Kafka has no message-key authorization dimension, so a "+
-				"true here would be a false claim that a subscriber is confined to a slice of a topic")
+	t.Run("partition key filtering is declared ENFORCED, in the body", func(t *testing.T) {
+		assert.True(t, enforced.PartitionKeyPrefixEnforced,
+			"a recorded prefix is kept by Blnk, so this field states it: false here was the "+
+				"declaration that a boundary an operator recorded was nobody's obligation")
 
-		assert.NotContains(t, enforced.EnforcedBy, "partition_key",
-			"the enforced-dimension list is exhaustive, so a partition-key entry would assert an "+
-				"ACL that cannot exist")
-		assert.NotContains(t, enforced.EnforcedBy, "partition_key_prefix")
+		assert.Contains(t, enforced.EnforcedBy, apimodel.EnforcementDimensionPartitionKey,
+			"and the machine-readable list carries the dimension, so a client branching on the "+
+				"list reaches the same conclusion as one reading the boolean")
+
+		// THE BODY, not the documentation. A client cannot branch on a comment.
+		keys := marshalToKeys(t, enforced)
+		require.Contains(t, keys, "partition_key_prefix_enforced")
+		require.Contains(t, keys, "enforced_by")
 	})
 
 	t.Run("the key scope is reported together with where it IS enforced", func(t *testing.T) {
-		// Both fields or neither. The prefix alone reads as a limit on the credential, which is
-		// why it was once withheld from this response entirely — and withholding it left the
-		// subscriber unable to apply the one scope it was expected to keep.
+		// Both fields or neither. The prefix alone reads as a limit the CREDENTIAL carries, which
+		// is what made the previous contract dangerous — the prefix was echoed with nothing in
+		// the body saying that no component applied it.
 		assert.Equal(t, keyScope, enforced.PartitionKeyPrefix,
-			"the recorded scope must reach the client that has to apply it")
-		assert.Equal(t, model.KeyScopeEnforcementConsumerSide, enforced.PartitionKeyPrefixEnforcedBy,
-			"and it must say WHERE, or the prefix is indistinguishable from a broker boundary")
+			"the recorded scope must reach the client whose records it selects")
+		assert.Equal(t, model.KeyScopeEnforcementGateway, enforced.PartitionKeyPrefixEnforcedBy,
+			"and it must say WHERE, or 'enforced' is the unverifiable claim it replaced")
 
 		keys := marshalToKeys(t, enforced)
 		require.Contains(t, keys, "partition_key_prefix_enforced_by",
@@ -1463,6 +1537,8 @@ func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *
 		unscoped := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "")
 		assert.Empty(t, unscoped.PartitionKeyPrefix, "nothing recorded means nothing echoed")
 		assert.Equal(t, model.KeyScopeEnforcementNone, unscoped.PartitionKeyPrefixEnforcedBy)
+		assert.False(t, unscoped.PartitionKeyPrefixEnforced,
+			"and nothing enforced: there is no prefix, which is a third state and not a gap")
 
 		keys := marshalToKeys(t, unscoped)
 		require.Contains(t, keys, "partition_key_prefix_enforced_by")
@@ -1472,53 +1548,69 @@ func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *
 
 	t.Run("a whitespace-only key scope is reported as absent", func(t *testing.T) {
 		// It agrees with model.EventSubscriber.DeclaresKeyScope, which reads whitespace as
-		// absent for the same reason: a scope on nothing is not an intent anybody has.
+		// absent for the same reason: a scope on nothing is not an intent anybody has. It must
+		// not produce an ENFORCED declaration either, or a body would claim a filter that
+		// matches every key is a boundary.
 		blank := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "   \t ")
 		assert.Empty(t, blank.PartitionKeyPrefix)
 		assert.Equal(t, model.KeyScopeEnforcementNone, blank.PartitionKeyPrefixEnforcedBy)
+		assert.False(t, blank.PartitionKeyPrefixEnforced)
+		assert.NotContains(t, blank.EnforcedBy, apimodel.EnforcementDimensionPartitionKey)
 	})
 
-	t.Run("the dimensions that ARE enforced are named", func(t *testing.T) {
+	t.Run("the dimensions that ARE enforced are named, and the list follows the row", func(t *testing.T) {
 		assert.Equal(t, []string{
 			apimodel.EnforcementDimensionTopic,
 			apimodel.EnforcementDimensionConsumerGroup,
+			apimodel.EnforcementDimensionPartitionKey,
 		}, enforced.EnforcedBy,
-			"topic and consumer group are the two the broker evaluates, and the list must be "+
-				"exactly those: a missing one understates the isolation that exists, an extra one "+
-				"claims isolation that does not")
+			"three dimensions for a key-scoped subscriber, and exactly those: a missing one "+
+				"understates the isolation that exists, an extra one claims isolation that does not")
+
+		unscoped := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "")
+		assert.Equal(t, []string{
+			apimodel.EnforcementDimensionTopic,
+			apimodel.EnforcementDimensionConsumerGroup,
+		}, unscoped.EnforcedBy,
+			"and two for a subscriber that recorded no prefix: the key dimension is claimed only "+
+				"where there is a key scope to apply, or the flag teaches a client nothing")
 
 		assert.Equal(t, topics, enforced.Topics, "the topic set must be reported exactly")
 	})
 
-	// M-1: the negative claim used to be INFERABLE ONLY. A client had to notice that
-	// "partition_key" was absent from enforced_by, and an absence is not a contract — a
-	// dimension missing from a list reads identically to one the server forgot and to one a
-	// newer version added. Stating it makes those readings distinguishable.
-	t.Run("the dimension that is NOT enforced is named as well", func(t *testing.T) {
-		assert.Equal(t, []string{apimodel.EnforcementDimensionPartitionKey}, enforced.NotEnforcedBy,
-			"the message-key dimension the API accepts and the broker cannot evaluate must be "+
-				"stated positively, not left to be deduced from its absence")
+	// M-1 kept, inverted. The negative claim used to be the load-bearing statement in this
+	// object: partition_key sat in not_enforced_by, and a client had to read it to learn that
+	// the prefix was its own problem. The boundary is enforced now, so the list is EMPTY — and
+	// the key stays in the body, because an absent key would be indistinguishable from a
+	// response that simply forgot to state it.
+	t.Run("nothing is reported as unenforced, on any path", func(t *testing.T) {
+		assert.Empty(t, enforced.NotEnforcedBy,
+			"a key-scoped subscriber has no unenforced dimension: the prefix is applied by the "+
+				"gateway, which is what replaced asking the subscriber to apply it")
 
-		// Populated for EVERY subscriber, because it describes what the BROKER can evaluate and
-		// not what this row configured. A field that appeared only for a subscriber carrying a
-		// prefix would let a reader conclude the dimension is enforced for everyone else.
 		unscoped := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "")
-		assert.Equal(t, []string{apimodel.EnforcementDimensionPartitionKey}, unscoped.NotEnforcedBy,
-			"a subscriber with no prefix recorded must still be told the broker has no key "+
-				"dimension, or its absence here reads as enforcement")
+		assert.Empty(t, unscoped.NotEnforcedBy,
+			"and neither does a subscriber with no prefix, which has nothing to enforce rather "+
+				"than something enforced by nobody")
 
-		// The two lists together enumerate every dimension this API names, and they are
-		// disjoint. A dimension moving from one to the other is then a visible contract change
-		// rather than a silent one, which is the whole reason the negative list exists.
+		// The two lists remain disjoint, which is what makes a dimension MOVING between them a
+		// visible contract change — the change this very test records having happened once.
 		for _, dimension := range enforced.NotEnforcedBy {
 			assert.NotContains(t, enforced.EnforcedBy, dimension,
 				"a dimension cannot be both enforced and not enforced")
 		}
 
 		// Never omitempty, for the same reason exclusive_grant_verified is not: a missing key
-		// would be indistinguishable from "there is no unenforced dimension".
-		assert.Contains(t, marshalToKeys(t, enforced), "not_enforced_by",
-			"an absent key would read as a boundary with no gaps in it")
+		// would be indistinguishable from "not stated", and [] is a claim.
+		for name, declaration := range map[string]apimodel.SubscriberEnforcedAccess{
+			"key-scoped": enforced,
+			"unscoped":   unscoped,
+		} {
+			keys := marshalToKeys(t, declaration)
+			require.Contains(t, keys, "not_enforced_by", name+" must carry the key")
+			assert.NotNil(t, keys["not_enforced_by"],
+				name+" must carry [] rather than null, so 'nothing is unenforced' is stated")
+		}
 	})
 
 	t.Run("the consumer group namespace is derived, not restated", func(t *testing.T) {
@@ -1582,12 +1674,9 @@ func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *
 	})
 
 	t.Run("every subscriber response carries the declaration", func(t *testing.T) {
-		// A LEGACY ROW, and the projection is built from the model directly for that reason. The
-		// service now REFUSES to record a partition key prefix — 409
-		// SUBSCRIBER_ISOLATION_UNENFORCEABLE at registration and at update — so no subscriber
-		// created through the API carries one. What can still carry one is a row written before
-		// that refusal existed, and this asserts such a row reads honestly rather than that
-		// recording a prefix is a supported operation.
+		// BUILT FROM THE MODEL DIRECTLY, because the declaration has to be right for a row
+		// whatever produced it — one registered with a prefix, one updated into a prefix, and
+		// one written before the enforcement point existed all read through this projection.
 		prefix := "ledger-42"
 		response := apimodel.NewSubscriberResponse(model.EventSubscriber{
 			SubscriberID:       subscriberID,
@@ -1595,17 +1684,19 @@ func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *
 			PartitionKeyPrefix: &prefix,
 		})
 
-		// A row carrying a prefix can now only be a LEGACY row — registration and update
-		// both refuse one — and it is still reported, next to the declaration that it is
-		// unenforced, in the same body. That adjacency is the point: the two cannot be read
-		// apart, so whoever finds such a row also reads what it does not mean.
+		// The prefix and what enforces it travel in ONE body, and that adjacency is the point:
+		// the two cannot be read apart, so whoever finds the prefix also reads where it applies.
 		assert.Equal(t, prefix, response.PartitionKeyPrefix)
-		assert.False(t, response.EnforcedAccess.PartitionKeyPrefixEnforced)
+		assert.True(t, response.EnforcedAccess.PartitionKeyPrefixEnforced)
 		assert.Equal(t, prefix, response.EnforcedAccess.PartitionKeyPrefix,
 			"the declaration echoes the same value the top-level field carries, so a client reading "+
 				"either one reads the same contract")
-		assert.Equal(t, model.KeyScopeEnforcementConsumerSide,
+		assert.Equal(t, model.KeyScopeEnforcementGateway,
 			response.EnforcedAccess.PartitionKeyPrefixEnforcedBy)
+		assert.True(t, response.EnforcedAccess.GatewayDeliveryRequired,
+			"and the registry view gives the same transport instruction the credential view does, "+
+				"so an integrator reading either one wires the same consumer")
+		assert.False(t, response.EnforcedAccess.BrokerRecordAccess)
 
 		keys := marshalToKeys(t, response)
 		require.Contains(t, keys, "enforced_access",
@@ -1619,54 +1710,78 @@ func TestSubscriberEnforcedAccess_StatesTheBoundaryTheBrokerActuallyEnforces(t *
 // # Why this field exists rather than a refusal
 //
 // Credential issuance used to REFUSE any subscriber recording a partition key prefix, with the
-// typed code SUBSCRIBER_ISOLATION_UNENFORCEABLE and a 409, permanently. The intent was to avoid
-// handing over a credential whose real reach exceeded what the row appeared to describe. The
-// effect was to withdraw a mandatory capability for a state the registry is designed to hold: a
-// subscriber registered with a prefix could never obtain credentials at all, from either
-// direction, and a database CHECK constraint made the combination unrepresentable as well.
+// typed code SUBSCRIBER_ISOLATION_UNENFORCEABLE and a 409, permanently. That withdrew a mandatory
+// capability for a state the registry is designed to hold: a subscriber registered with a prefix
+// could never obtain credentials at all, and a database CHECK constraint made the combination
+// unrepresentable as well.
 //
-// Refusing is only fail-closed when a narrower grant exists to insist upon. Kafka's authorizer
-// names five resource types and none is a message key, and a topic per key space is excluded, so
-// there is no narrower credential being withheld — there is no such credential.
+// What replaced it was DISCLOSURE — issue whole-topic Read, echo the prefix, and declare that
+// applying it was the consumer's own obligation. That was accurate prose about an absent boundary.
+// A subscriber that ignored the obligation, or used any other Kafka client, read every record on
+// the shared category topic, including records written for other ledgers and other subscribers,
+// and nothing in the platform could prevent or detect it. A security review named exactly that:
+// disclosure and client cooperation are not an authorization boundary.
 //
-// So the boundary is STATED instead, and this is where. The three fields below are the whole of
-// the guarantee, and the third is the one a client branches on. They are asserted as a group
-// because their VALUE is in their agreement: any one of them alone is either ambiguous or
+// So the boundary is ENFORCED now, and this is where the contract says so. A subscriber recording
+// a prefix is granted Describe but NOT Read on its topics — the broker refuses every direct fetch
+// — and its records are delivered by Blnk's stream gateway, which applies the prefix to each
+// record's key. The fields below are the whole of that statement, and they are asserted as a
+// group because their VALUE is in their agreement: any one of them alone is either ambiguous or
 // ignorable.
 func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testing.T) {
 	subscriberID := "acme_prod"
 	topics := []string{"blnk.transactions"}
 
-	t.Run("a recorded prefix declares a client-side obligation", func(t *testing.T) {
+	t.Run("a recorded prefix declares an enforced boundary and where records come from", func(t *testing.T) {
 		declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "ldg_9f2c")
 
 		assert.Equal(t, "ldg_9f2c", declared.PartitionKeyPrefix,
-			"the prefix is echoed, because a subscriber cannot apply a narrowing it was not told")
-		assert.False(t, declared.PartitionKeyPrefixEnforced,
-			"and it is stated as unenforced in the same object, so the two cannot be read apart")
-		assert.True(t, declared.ClientSideKeyFilteringRequired,
-			"and the branchable field says outright that the narrowing is the holder's own to "+
-				"apply — this is the field whose wrong answer is a disclosure bug, because a client "+
-				"reading false here would consume a shared topic believing the broker filtered it")
+			"the prefix is echoed, because it is the boundary the gateway applies on this "+
+				"subscriber's behalf")
+		assert.True(t, declared.PartitionKeyPrefixEnforced,
+			"and it is stated as ENFORCED in the same object: a recorded prefix is kept by Blnk, "+
+				"which is what replaced granting whole-topic Read and asking the consumer to filter")
+		assert.Equal(t, model.KeyScopeEnforcementGateway, declared.PartitionKeyPrefixEnforcedBy,
+			"and the enforcement point is named, because 'enforced' without a component is the "+
+				"claim that used to be false")
+		assert.True(t, declared.GatewayDeliveryRequired,
+			"the branchable field says where the records come from — this is the field whose wrong "+
+				"answer is a broken integration, because a client reading false here would fetch "+
+				"from a broker that refuses it")
+		assert.False(t, declared.BrokerRecordAccess,
+			"and its complement says WHY the broker refuses: no topic Read binding exists for a "+
+				"key-scoped principal, which is the boundary itself")
+		assert.Contains(t, declared.EnforcedBy, apimodel.EnforcementDimensionPartitionKey,
+			"partition_key is an ENFORCED dimension now, and listing it is the machine-readable "+
+				"form of that change")
+		assert.Empty(t, declared.NotEnforcedBy,
+			"and nothing is left unenforced: a response can no longer say that a boundary an "+
+				"operator recorded is kept by nobody")
 	})
 
-	t.Run("no prefix declares no obligation", func(t *testing.T) {
+	t.Run("no prefix declares no key boundary and direct broker access", func(t *testing.T) {
 		// The mutant this kills is the one that hard-codes true. A flag that is always true
 		// teaches a client nothing and gets ignored, which returns the contract to the state
 		// where the boundary was implied rather than stated.
 		declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, "")
 
 		assert.Empty(t, declared.PartitionKeyPrefix)
-		assert.False(t, declared.ClientSideKeyFilteringRequired,
-			"a whole-topic entitlement leaves nothing for the holder to filter")
+		assert.False(t, declared.GatewayDeliveryRequired,
+			"a whole-topic entitlement is delivered by the broker itself")
+		assert.True(t, declared.BrokerRecordAccess,
+			"and such a subscriber really does hold topic Read")
 		assert.False(t, declared.PartitionKeyPrefixEnforced,
 			"still false rather than absent: there is no prefix, so there is no enforced prefix")
+		assert.NotContains(t, declared.EnforcedBy, apimodel.EnforcementDimensionPartitionKey,
+			"and the dimension is not claimed for a subscriber that recorded none")
+		assert.Empty(t, declared.NotEnforcedBy,
+			"nor is it reported as unenforced: there is nothing to enforce, which is a third state")
 	})
 
-	t.Run("the flag is DERIVED from the prefix, so the two cannot disagree", func(t *testing.T) {
-		// Passing the flag alongside the value would allow a caller to send a prefix with no
-		// instruction attached, or an instruction with no prefix to apply. Either is worse than
-		// neither, so the constructor computes one from the other.
+	t.Run("every flag is DERIVED from the prefix, so they cannot disagree", func(t *testing.T) {
+		// Passing the flags alongside the value would allow a caller to send a prefix with no
+		// enforcement point attached, or gateway delivery with no prefix to filter on. Either is
+		// worse than neither, so the constructor computes all of them from one fact.
 		for name, prefix := range map[string]string{
 			"padded":     "  ldg_9f2c  ",
 			"whitespace": "   ",
@@ -1675,8 +1790,14 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 		} {
 			t.Run(name, func(t *testing.T) {
 				declared := apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, prefix)
-				assert.Equal(t, declared.PartitionKeyPrefix != "", declared.ClientSideKeyFilteringRequired,
-					"the obligation is declared exactly when a prefix survives normalisation")
+				scoped := declared.PartitionKeyPrefix != ""
+
+				assert.Equal(t, scoped, declared.GatewayDeliveryRequired,
+					"gateway delivery is required exactly when a prefix survives normalisation")
+				assert.Equal(t, scoped, declared.PartitionKeyPrefixEnforced,
+					"and the enforcement flag agrees with it")
+				assert.Equal(t, !scoped, declared.BrokerRecordAccess,
+					"and broker record access is its exact complement, never both and never neither")
 				assert.Equal(t, strings.TrimSpace(prefix), declared.PartitionKeyPrefix,
 					"and the echoed prefix is trimmed, because storage padding is not part of the "+
 						"key a subscriber compares against")
@@ -1684,15 +1805,19 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 		}
 	})
 
-	t.Run("both declarations are always present in the body", func(t *testing.T) {
-		// No omitempty on either boolean. An absent client_side_key_filtering_required reads as
-		// "not applicable", and this one has to read as a definite yes or no.
+	t.Run("every declaration is always present in the body", func(t *testing.T) {
+		// No omitempty on any of the booleans. An absent gateway_delivery_required reads as "not
+		// applicable", and it has to read as a definite yes or no.
 		for name, prefix := range map[string]string{"with a prefix": "ldg_9f2c", "without one": ""} {
 			t.Run(name, func(t *testing.T) {
 				keys := marshalToKeys(t, apimodel.NewSubscriberEnforcedAccess(subscriberID, topics, prefix))
-				assert.Contains(t, keys, "client_side_key_filtering_required",
-					"an absent key would be indistinguishable from no obligation")
+				assert.Contains(t, keys, "gateway_delivery_required",
+					"an absent key would be indistinguishable from direct broker consumption")
+				assert.Contains(t, keys, "broker_record_access")
 				assert.Contains(t, keys, "partition_key_prefix_enforced")
+				assert.NotContains(t, keys, "client_side_key_filtering_required",
+					"the retired field must be GONE rather than left reporting a false alongside "+
+						"its replacement, which would read as two contradictory instructions")
 			})
 		}
 	})
@@ -1711,8 +1836,10 @@ func TestSubscriberEnforcedAccess_NamesWhoseObligationTheKeyNarrowingIs(t *testi
 		assert.Equal(t, prefix, response.PartitionKeyPrefix)
 		assert.Equal(t, prefix, response.EnforcedAccess.PartitionKeyPrefix,
 			"the declaration resolves the prefix from the same row the top-level field does")
-		assert.True(t, response.EnforcedAccess.ClientSideKeyFilteringRequired,
+		assert.True(t, response.EnforcedAccess.GatewayDeliveryRequired,
 			"so a reader of the registry is told what a holder of the credential was told")
+		assert.False(t, response.EnforcedAccess.BrokerRecordAccess,
+			"including the fact that this subscriber cannot fetch from the broker at all")
 		assert.False(t, response.EnforcedAccess.ExclusiveGrantVerified,
 			"and still claims no verified exclusivity: reading a row observes no broker grant")
 	})

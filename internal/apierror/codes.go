@@ -149,12 +149,56 @@ const (
 	ErrEventReplayFailed    ErrorCode = "EVENT_REPLAY_FAILED"
 	ErrKafkaUnavailable     ErrorCode = "EVENT_KAFKA_UNAVAILABLE"
 
+	// ErrEventReplayTimeout is a replay that was ABANDONED rather than one that failed:
+	// the caller went away, or the request's deadline expired, before the re-publish
+	// could be acknowledged.
+	//
+	// TAXONOMY-01: it exists because the other two answers are both wrong for that
+	// case, and one of them was being given. A cancelled or expired publish used to
+	// resolve to EVENT_KAFKA_UNAVAILABLE, whose 503 and whose message assert that the
+	// BROKER is unavailable and that the request should be repeated once it recovers —
+	// sending an operator to look at a healthy Kafka for a deadline that expired on this
+	// side of the connection. EVENT_REPLAY_FAILED and its 500 would be the opposite
+	// error: nothing in Blnk is broken either, and the event is intact.
+	//
+	// 504 rather than 503, for the same reason ErrSubscriberProvisioningTimeout is: 503
+	// says a dependency is unreachable or unconfigured, 504 says the work did not
+	// complete inside the time allowed. The event stays dead-lettered, so the request is
+	// safe to repeat.
+	ErrEventReplayTimeout ErrorCode = "EVENT_REPLAY_TIMEOUT"
+	// ErrEventKeyUnresolvable is the refusal to capture an event that can be assigned no
+	// Kafka message key.
+	//
+	// It resolves to 500 rather than 400 because no request body can cause it. The key is
+	// derived from the event name and the payload object a PRODUCER inside this service
+	// passes, and every real producer passes at least a name; reaching this code means an
+	// event with no type and a payload naming nothing reached PrepareEventOutbox, which is
+	// a defect in this service. Requirement R-6 makes the key load-bearing — it selects the
+	// partition and therefore the ordering — so an unkeyable event is refused instead of
+	// being admitted under a sentinel key that orders it against nothing.
+	ErrEventKeyUnresolvable ErrorCode = "EVENT_KEY_UNRESOLVABLE"
+
 	// SUBSCRIBER — Kafka subscriber registry & credentials.
 	// ErrSubscriberProvisioningFailed also resolves to 503 rather than 500 for the
 	// same reason: provisioning depends on the Kafka admin API, so a failure is
 	// retryable by the caller rather than a server defect.
 	ErrSubscriberNotFound           ErrorCode = "SUBSCRIBER_NOT_FOUND"
 	ErrSubscriberProvisioningFailed ErrorCode = "SUBSCRIBER_PROVISIONING_FAILED"
+
+	// ErrSubscriberKeyScopeUnenforced is the refusal to issue a credential to a subscriber
+	// whose recorded partition_key_prefix nothing would enforce.
+	//
+	// 409, alongside the other state refusals, and for their reason: the request is well
+	// formed and it is the deployment's or the row's state that has to change before it can be
+	// honoured — deploy and declare a key-authorising gateway, or clear the prefix and narrow
+	// authorized_topics, which the broker does enforce. It is emphatically not the 503 of
+	// SUBSCRIBER_PROVISIONING_FAILED, which advertises a retryable upstream condition; nothing
+	// here is retryable, and repeating the request unchanged will be refused identically.
+	//
+	// It is a separate code from ErrSubscriberGrantEmpty and ErrSubscriberAccessExceedsAuthorization
+	// because the remedy is somewhere else again: not the grant, not a stray ACL, but whether
+	// any component in the deployment evaluates record keys at all.
+	ErrSubscriberKeyScopeUnenforced ErrorCode = "SUBSCRIBER_KEY_SCOPE_UNENFORCED"
 
 	// ErrSubscriberAccessExceedsAuthorization is the refusal to issue a credential to a
 	// principal the broker would grant MORE access than the registry records.
@@ -223,6 +267,39 @@ const (
 	// request succeeds.
 	ErrSubscriberGrantEmpty ErrorCode = "SUBSCRIBER_GRANT_EMPTY"
 
+	// ErrSubscriberIsolationUnenforceable is the refusal to act on a subscriber whose row
+	// records a partition key prefix, because Kafka cannot enforce one.
+	//
+	// # What the refusal protects
+	//
+	// Kafka's authorizer evaluates resources — topics, groups, the cluster — and has NO
+	// message-key dimension. A principal granted Read on a topic reads every record on it,
+	// whatever key each record carries. So a credential minted for a row that records a key
+	// prefix would grant strictly MORE than the row describes: every ledger's and every other
+	// subscriber's records on the same category topic. Disclosing that in the response was
+	// tried and is not sufficient — a client-side filter is a convention the holder of the
+	// credential can simply ignore, and a convention is not an authorization boundary.
+	//
+	// It is returned from BOTH directions of the same state, so neither ordering reaches it:
+	// issuing a credential for a row that records a prefix, and recording a prefix on a row
+	// that already holds a credential. The second matters as much as the first, because
+	// without it the guard is bypassed by "issue, then record" — and because Kafka stores one
+	// SCRAM credential per principal, a row in that state could never rotate its secret, since
+	// re-issuance is issuance.
+	//
+	// # Why 409, and what the caller does about it
+	//
+	// 409, with the other state refusals in this family: the request is well formed and
+	// nothing about it is malformed or unauthorised — it is the STATE of the registry row that
+	// has to change first. Two remedies exist and the message names both. Clear
+	// partition_key_prefix, which accepts in the open that access is granted per topic; or
+	// narrow authorized_topics, which the broker really does enforce. After either, the
+	// identical request succeeds.
+	//
+	// It is emphatically not SUBSCRIBER_PROVISIONING_FAILED, whose 503 advertises a retryable
+	// upstream condition: nothing here is retryable, and no dependency is unavailable.
+	ErrSubscriberIsolationUnenforceable ErrorCode = "SUBSCRIBER_ISOLATION_UNENFORCEABLE"
+
 	// ErrSubscriberInsecureTransport is the refusal to return a one-time SASL password
 	// over a channel this deployment has not declared confidential.
 	//
@@ -270,6 +347,44 @@ const (
 	// reads matters far less than the typed code its retry logic and this deployment's
 	// logs discriminate on.
 	ErrSubscriberProvisioningTimeout ErrorCode = "SUBSCRIBER_PROVISIONING_TIMEOUT"
+
+	// ErrSubscriberCredentialInvalid is the subscriber stream gateway refusing a caller
+	// whose presented SASL credential does not match the one the registry recorded.
+	//
+	// It is the gateway's AUTHENTICATION failure, and it is deliberately distinct from
+	// every code above, all of which describe a MANAGEMENT call made by an operator
+	// holding Blnk's master key. The gateway is a data-plane endpoint authenticated by
+	// the subscriber's own SASL credential — the same credential the broker would have
+	// checked had the subscriber been granted direct record access — so a mismatch here
+	// is the exact analogue of the broker's SASL rejection, not a Blnk authorization
+	// decision.
+	//
+	// 401 rather than 403, and the difference is which of the two questions failed. 401
+	// says the caller has not established WHO it is, which is recoverable by presenting
+	// the right secret or re-issuing one; 403 (ErrSubscriberTopicNotGranted) says a known
+	// caller asked for something outside its grant, which no credential can fix. Without
+	// this entry the refusal would resolve to the unknown-code 500 default and read as a
+	// defect in this service rather than as a rejected secret.
+	//
+	// The message this code travels with names neither the principal nor the reason the
+	// comparison failed. A gateway that distinguished "no such subscriber" from "wrong
+	// password" would let an unauthenticated caller enumerate the registry.
+	ErrSubscriberCredentialInvalid ErrorCode = "SUBSCRIBER_CREDENTIAL_INVALID"
+
+	// ErrSubscriberTopicNotGranted is the subscriber stream gateway refusing an
+	// AUTHENTICATED subscriber that asked for a topic outside its authorized_topics.
+	//
+	// The gateway holds a broker credential of Blnk's own, wide enough to read every
+	// category topic, so the subscriber's topic grant is not enforced for it by the
+	// broker on this path — the gateway is the component that enforces it, and this is
+	// the code that refusal carries. It is the same boundary
+	// EnforcementDimensionTopic names in a subscriber response, evaluated at the
+	// gateway instead of at the authorizer.
+	//
+	// 403: the caller is known and the request is well formed, and the answer will not
+	// change until an operator widens the grant. Without this entry the refusal would
+	// resolve to the unknown-code 500 default, which a client would retry.
+	ErrSubscriberTopicNotGranted ErrorCode = "SUBSCRIBER_TOPIC_NOT_GRANTED"
 )
 
 // statusByCode is the single source of truth for the default HTTP status of
@@ -372,6 +487,12 @@ var statusByCode = map[ErrorCode]int{
 	ErrEventNotDeadLettered: http.StatusConflict,
 	ErrEventReplayFailed:    http.StatusInternalServerError,
 	ErrKafkaUnavailable:     http.StatusServiceUnavailable,
+	// 504: the replay was abandoned by a cancelled caller or a spent deadline. Neither
+	// the broker (503) nor this service (500) is the culprit, and without this entry the
+	// distinction would resolve to the unknown-code 500 default and read as a defect.
+	ErrEventReplayTimeout: http.StatusGatewayTimeout,
+	// 500: an unkeyable event is a producer defect inside this service, not a caller error.
+	ErrEventKeyUnresolvable: http.StatusInternalServerError,
 
 	// SUBSCRIBER — 503 on provisioning failure is deliberate for the same reason.
 	ErrSubscriberNotFound:           http.StatusNotFound,
@@ -383,6 +504,9 @@ var statusByCode = map[ErrorCode]int{
 	// registry row's state that has to change before it can be honoured.
 	ErrSubscriberDeprovisioning: http.StatusConflict,
 	ErrSubscriberGrantEmpty:     http.StatusConflict,
+	// Also 409: the remedy is a state change — declare an enforcing gateway, or drop the
+	// prefix — and not a retry.
+	ErrSubscriberKeyScopeUnenforced: http.StatusConflict,
 	// Also 409, and NOT the 503 of SUBSCRIBER_PROVISIONING_FAILED: the broker answered and
 	// the boundary it would enforce is wider than the row records, which a retry cannot
 	// change. Without this entry the refusal would resolve to the unknown-code 500 — which is
@@ -390,6 +514,11 @@ var statusByCode = map[ErrorCode]int{
 	// while its row here was absent, so a deliberate 409 judgement reached the caller as a
 	// server defect.
 	ErrSubscriberAccessExceedsAuthorization: http.StatusConflict,
+	// Also 409, and for the same reason: Kafka has no message-key dimension, so the boundary
+	// a credential would carry is wider than a row recording a partition key prefix
+	// describes, and no retry narrows it. The remedy is a change to the row — clear the
+	// prefix, or narrow the authorized topics — after which the identical request succeeds.
+	ErrSubscriberIsolationUnenforceable: http.StatusConflict,
 	// 403: the request is well formed and the caller is authorised; the server is
 	// refusing to put a one-time secret on a channel it cannot establish as
 	// confidential. Without this entry the refusal would resolve to the unknown-code
@@ -399,6 +528,15 @@ var statusByCode = map[ErrorCode]int{
 	// away, and neither is a defect in this service. Without this entry a spent
 	// issuance budget resolves to the unknown-code 500 default.
 	ErrSubscriberProvisioningTimeout: http.StatusGatewayTimeout,
+	// 401: the subscriber stream gateway is a data-plane endpoint authenticated by the
+	// subscriber's OWN SASL credential, so a mismatch is a failure to establish who the
+	// caller is — the analogue of the broker's own SASL rejection. Without this entry a
+	// rejected secret resolves to the unknown-code 500 default and reads as a defect.
+	ErrSubscriberCredentialInvalid: http.StatusUnauthorized,
+	// 403: the caller authenticated and then asked for a topic outside its grant. The
+	// answer cannot change until an operator widens the grant, so it must not be a 401
+	// (which invites presenting another secret) nor a 500 (which invites a retry).
+	ErrSubscriberTopicNotGranted: http.StatusForbidden,
 
 	// Legacy codes — same statuses MapErrorToHTTPStatus implied, with the
 	// BAD_REQUEST omission fixed (it previously fell through to 500).

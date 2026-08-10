@@ -188,6 +188,9 @@ failed permanently, it did not run out of tries.
 | `blnk_dlt_oldest_message_age_seconds` | Gauge | `topic` | Age of the oldest unresolved dead-letter entry, per dead-letter topic, over every outbox row in the `failed` or `dead_lettered` state — which is both terminal routes and, deliberately, the rows whose `.dlt` write has not landed yet — measured from its last publish attempt. Use to alert on a triage backlog nobody is clearing; zero is reported explicitly when a topic's inventory is empty, and zero is the reading that clears the alert. |
 | `blnk_kafka_consumer_lag` | Gauge | `subscriber`, `group`, `topic` | Committed offset behind the log end offset, summed across a topic's partitions and measured in-process. Use to alert on a subscriber falling behind — but read `blnk_kafka_consumer_lag_unmeasured_partitions` beside it, because a topic that was only partly measured is withheld from this series rather than reported at its partial sum. |
 | `blnk_outbox_pending` | Gauge | — | Outbox rows not yet published, counted as **pending plus processing only** — claimed-but-unacknowledged rows are included, so a stalled relay holding every row under a lease cannot read as a drained backlog. It contains **no** terminal rows, so it cannot show retained `dispatched`, `failed` or `dead_lettered` rows accumulating. Use it for one question: is the relay keeping up? A rising figure against a flat publish rate is backlog, not throughput. |
+| `blnk_events_repair_backlog` | Gauge | `leg` | Rows a REPAIR leg still owes — work the ordinary publish claim cannot reach. `leg="dead_letter"` is rows whose retry budget is spent and whose `<topic>.dlt` write also failed, each the only copy of an event that reached no topic at all; `leg="legacy_webhook"` is rows whose Kafka leg finished and whose legacy webhook enqueue never succeeded. **Disjoint from `blnk_outbox_pending`, not a subset of it**: those statuses are `failed` and `webhook_pending`, and that gauge counts only `pending` plus `processing` — so a repair backlog of half a million rows reads as a drained outbox there. Normally zero; it fills during an outage, all at once. |
+| `blnk_events_repair_completed_total` | Counter | `leg` | Rows a repair pass drove to their destination: a dead letter acknowledged on its `<topic>.dlt` sibling, or a legacy webhook enqueued. Incremented per ROW that succeeded, never per claim and never per attempt, so `rate()` over it is the **drain rate** in rows per second. Divide the backlog above by it for time-to-clear. |
+| `blnk_events_repair_saturated` | Gauge | `leg` | 1 when the last tick spent its whole repair budget with a full batch still coming back, 0 when the leg drained. It is the reading the backlog and the drain rate cannot give you: both fall while a recovery is merely slow, so this is what separates "recovering as configured" from "configured too slowly to recover". A sustained 1 is the signal to raise `RELAY_REPAIR_MAX_BATCHES_PER_TICK` or `RELAY_REPAIR_BATCH_SIZE`. |
 | `blnk_events_purged_total` | Counter | — | Terminal event rows deleted by the retention sweep. Read it **against eligibility**, not on its own: a flat counter most often means nothing is older than the retention cutoff yet, and only otherwise means the sweep is disabled or stuck. The sweep deletes in batches, so a step-shaped increase is its normal signature rather than evidence of a misconfigured cutoff. |
 | `blnk_subscribers_revocation_pending` | Gauge | — | Subscribers whose broker-side credential revocation is still owed. Normally zero. |
 | `blnk_subscribers_oldest_revocation_age_seconds` | Gauge | — | How long the oldest outstanding revocation has been owed. Zero when nothing is owed. |
@@ -195,7 +198,8 @@ failed permanently, it did not run out of tries.
 | `blnk_kafka_consumer_lag_covered_subscribers` | Gauge | — | How many subscribers currently have an exported lag reading. Read it against `blnk_subscribers_registered` to see what proportion of the registry the rotation is actually covering; the remedy for a shortfall is a larger `EVENT_METRICS_SUBSCRIBER_BUDGET` or a shorter collection interval. |
 | `blnk_kafka_subscribers_unmeasured` | Gauge | `reason` | Registered subscribers the last collection did not measure lag for **at all**, attributed by why. Non-zero means those subscribers have NO `blnk_kafka_consumer_lag` series, so `SubscriberConsumerLagHigh` cannot fire for them however far behind they fall. Normally zero. The `reason` domain is closed at five values and every one of them is written on every tick, zeros included, so a healthy collection is distinguishable from a stopped one: `budget` (the rotation has not got back to them, which is the only reason a configuration change fixes), `unprovisioned` (the row has no authorised topics, or identifiers the registry did not generate), `measure_failed` (the broker refused the measurement), `registry_failed` (the registry enumeration itself failed) and `topic_missing` (a row authorises a topic that does not exist). Each subscriber is counted under exactly ONE reason, so `sum without(reason)(…)` never exceeds `blnk_subscribers_registered`. Sum the reasons away for the total; read them apart to know what to do. See the note below — this is not the same condition as `blnk_kafka_consumer_lag_unmeasured_partitions`. |
 | `blnk_subscribers_registered` | Gauge | — | Subscribers the registry holds. Published so the row above reads as a proportion, and so the measurement budget's headroom is visible before it is exhausted rather than only after. |
-| `blnk_subscribers_settlement_outstanding` | Gauge | — | Subscribers with a broker obligation — a revocation, a grant reconciliation or a credential cleanup — still to be settled. Read with `blnk_subscribers_obligations_settled_total`: `SubscriberSettlementNotProgressing` fires on outstanding work with a flat settlement rate, which is the signature of a stalled settler rather than a busy one. |
+| `blnk_subscribers_measurement_budget` | Gauge | — | Subscribers **one consumer-lag sweep may measure**, as configured — `EVENT_METRICS_SUBSCRIBER_BUDGET`, alias `RELAY_SUBSCRIBER_METRICS_BUDGET`, default 200. Exported so headroom is a difference of two series: `blnk_subscribers_measurement_budget - blnk_subscribers_registered`, which goes negative before any subscriber goes unmeasured. It is the figure the sweep actually stops at rather than the configured value re-read, so it cannot disagree with the behaviour. Published on every tick, like the row above, so a reconfiguration is visible and a stopped collector is not mistaken for a small registry. |
+| `blnk_subscribers_settlement_outstanding` | Gauge | — | Subscribers with a broker obligation — a revocation, a grant reconciliation or a credential cleanup — still to be settled. Read with `blnk_subscribers_obligations_settled_total`: `SubscriberSettlementNotProgressing` fires on outstanding work whose settlement rate is flat **or absent**, which is the signature of a stalled settler rather than a busy one. |
 | `blnk_subscribers_oldest_settlement_age_seconds` | Gauge | — | How long the oldest unsettled obligation has stood. This is the series `SubscriberSettlementOutstanding` reads. Zero when nothing is outstanding. |
 | `blnk_subscribers_revocation_failures` | Gauge | — | Subscribers whose last revocation attempt was REFUSED by the broker, as opposed to merely still owed. The distinction is the remedy: a pending revocation needs time, a refused one needs an operator, because it will not clear by retrying. Normally zero. |
 | `blnk_subscribers_oldest_revocation_failure_age_seconds` | Gauge | — | How long the oldest refused revocation has stood. This is the series `SubscriberRevocationRefused` reads, so a deployment without it has that rule evaluating an absent series and never firing. Zero when nothing is refused. |
@@ -203,11 +207,13 @@ failed permanently, it did not run out of tries.
 | `blnk_subscribers_oldest_credential_orphan_age_seconds` | Gauge | — | How long the oldest orphaned credential has been outstanding. This is the series `SubscriberCredentialOrphaned` reads. Zero when there are none. |
 | `blnk_subscribers_credential_cleanup_pending` | Gauge | — | Subscribers whose broker-side credential still has to be deleted after deregistration. It is part of `blnk_subscribers_settlement_outstanding`, reported apart because the remedy differs from a grant reconciliation. Normally zero. |
 | `blnk_subscribers_grant_reconcile_pending` | Gauge | — | Subscribers whose broker ACL bindings no longer match their authorised topics and have not been reconciled yet. Also part of `blnk_subscribers_settlement_outstanding`. Normally zero; a persistent value means the settlement pass is not progressing, which is what `SubscriberSettlementNotProgressing` fires on. |
-| `blnk_subscribers_obligations_settled_total` | Counter | — | Broker obligations the settlement pass has discharged. Read as a RATE beside the two gauges above: a non-zero backlog with a zero rate is a stalled pass, and that conjunction is exactly `SubscriberSettlementNotProgressing`'s expression. |
+| `blnk_subscribers_obligations_settled_total` | Counter | — | Broker obligations the settlement pass has discharged. Read as a RATE beside the two gauges above: a non-zero backlog with a zero rate is a stalled pass, and so is a non-zero backlog with **no series here at all** — this family does not exist until the first obligation is settled. `SubscriberSettlementNotProgressing` covers both, which is why it is written as a set difference (`unless rate(…) > 0`) rather than a conjunction with `== 0`; see the settlement notes below. |
 | `blnk_kafka_consumer_lag_inventory_complete` | Gauge | — | 1 when the last sweep measured every registered subscriber and left nothing unmeasured by a failure, 0 otherwise. This is the series `SubscriberLagCoverageIncomplete` reads, so a deployment without it has that rule evaluating an absent series and never firing. Read `blnk_kafka_subscribers_unmeasured` for how much and why. |
 | `blnk_event_metrics_last_collection_age_seconds` | Gauge | — | How long ago the collector last RAN, whether or not it succeeded. This is the series `EventMetricsCollectionStale` reads, and `EventMetricsCollectionAbsent` alerts on its absence scoped to `job="blnk-server"`. Every gauge on this page is refreshed by that collector, so a rising value means every one of them is stale. |
 | `blnk_event_metrics_last_success_age_seconds` | Gauge | — | How long ago the collector last SUCCEEDED. The distinction from the row above is the whole point: a collector still ticking while every collection fails keeps one figure flat and the other rising, and this is the series `EventMetricsCollectionFailing` reads. |
-| `blnk_event_metrics_collection_failures_total` | Counter | `collection` | Failed collections, attributed by which one (`outbox_backlog`, `dead_letter_age`, `subscriber_lag`, `subscriber_revocations`, `subscriber_settlement`, `subscriber_access_residue`). Read it to see WHICH dependency is failing while the two age gauges say that something is. |
+| `blnk_event_metrics_collection_failures_total` | Counter | `collection` | Failed collections, attributed by which one. The `collection` domain is closed at seven values, one per independent collection plus the registry enumeration: `outbox_backlog`, `dead_letter_age`, `subscriber_revocations`, `subscriber_lag`, `subscriber_listing` (the registry enumeration itself, which fails as a whole rather than per subscriber), `subscriber_settlement` and `subscriber_access_residue`. No error text and no identifier ever reaches the attribute, so the series count is a property of the code rather than of whatever failed. Read it to see WHICH dependency is failing while the two age gauges say only that something is. |
+| `blnk_subscriber_stream_records_delivered_total` | Counter | `topic`, `key_scoped` | Records the subscriber stream gateway returned to a subscriber. The gateway is the ENFORCEMENT POINT for a partition-key prefix: a key-scoped subscriber holds Describe and no Read at the broker, so its records reach it only through `GET /subscribers/{id}/events`, filtered per record. Read as a rate to see gateway throughput per topic. |
+| `blnk_subscriber_stream_records_withheld_total` | Counter | `topic`, `key_scoped` | Records the gateway EXCLUDED because the subscriber's partition-key prefix does not admit them. This is the only externally visible evidence that the key boundary is doing anything, because a filtered feed and a quiet topic look identical from the delivered count alone. Read it beside the row above: a sustained delivered rate with a **zero** withheld rate on a shared category topic at `key_scoped="true"` is the signature of a filter that has stopped filtering, and is worth investigating even though nothing has failed. Withheld records are dropped, never redacted or summarised, so this count is all that is retained about them. |
 
 **Why `blnk_events_published_total` is counted at the row transition and not at the broker
 acknowledgement.** Delivery is at-least-once by construction: the relay publishes, then marks the
@@ -424,6 +430,11 @@ are invisible to it and it stays flat while the table grows. Query terminal stat
 compare against the table's size on disk. That growth matters because every retained row holds a
 verbatim copy of its webhook body.
 
+The endpoint takes the `dispatched` count only when asked, because it is an exact `COUNT` over the
+one population that grows without bound: send `GET /events/stats?include_offsets=best_effort`, and
+read `dispatched_history_counted` before reading `dispatched`, since an absent key means "not
+counted" rather than "none". The other statuses need no parameter — they are exact on every reading.
+
 **Subscriber and group labels are pseudonyms, not names.** `blnk_kafka_consumer_lag` carries a
 truncated SHA-256 of the subscriber identifier and of its consumer-group namespace rather than
 the values themselves. A metric label is the most widely copied value in an observability
@@ -476,7 +487,7 @@ printf '%s' "$SUBSCRIBER_ID" | sha256sum | cut -c1-16
 
 Service logs carry the same token in their `subscriber_id_hash` field and consumer-group
 pseudonyms in `consumer_group_hash`, so a log line, a metric series and a registry row all
-pivot on one value. The `topic` label is deliberately **not** hashed: it names one of the five
+pivot on one value. The `topic` label is deliberately **not** hashed: it names one of the four
 fixed, published, Blnk-owned category topics, so it identifies nobody.
 
 **A non-zero `blnk_subscribers_revocation_pending` means a live credential is unaccounted
@@ -495,23 +506,55 @@ hand with `kafka-configs --alter --delete-config SCRAM-SHA-512 --entity-type use
 recorded and is never reset by a later failed attempt, so it reports the age of the exposure
 rather than the age of the last try.
 
-**Finding the affected subscribers: read the table, not the API.** The alert deliberately carries
-no subscriber label — that would export a tenant identifier into every notification — and the
-registry API does **not** project the marker either, so `GET /subscribers` cannot answer this. The
-obligation lives in one database column, `revocation_pending_at`, which names the principal to
-revoke:
+**Finding the affected subscribers: ask the registry API.** The alert deliberately carries no
+subscriber label — that would export a tenant identifier into every notification — so the
+responder's first step is to ask which rows are affected. One master-key-gated request answers it:
 
-```sql
-SELECT subscriber_id, kafka_principal, consumer_group_id, revocation_pending_at,
-       now() - revocation_pending_at AS outstanding_for
-FROM blnk.event_subscribers
-WHERE revocation_pending_at IS NOT NULL
-ORDER BY revocation_pending_at;
+```bash
+curl -sS "$BLNK_API/subscribers?revocation_pending=true" --config "$BLNK_CURL_CONFIG"
 ```
 
-Alternatively, search the service logs for the revocation-failure entry, which carries the
-principal. The full triage and hand-revocation procedure is in
-[kafka-operations.md](kafka-operations.md#subscriberrevocationoutstanding).
+Three properties of that reading matter during an incident:
+
+- **It scans the whole registry, not a page.** `limit` and `cursor` are *refused* rather than
+  ignored, because a truncated list of live unaccounted-for credentials reads exactly like a
+  complete one — a responder acting on it would revoke those, close the incident, and leave the
+  rest authenticating. The total in the envelope is therefore exact.
+- **It is ordered oldest obligation first**, which is the same order the alert fires on, so you
+  work the longest exposure first.
+- **A walk that could not cover the registry is an error, never a shorter list.** It answers `500`
+  with `GEN_INTERNAL` naming the reason, and *that* is when you fall back to the SQL below.
+
+Every subscriber in the response carries the three markers directly — `revocation_pending` and
+`revocation_pending_reason`, plus the instants `revocation_pending_at`, `revocation_failed_at` and
+`credential_orphaned_at`, each present only when it is set. `kafka_principal` and
+`consumer_group_id` are on the same row, so the response names the principal to revoke.
+
+**The two other markers have no filter of their own.** `credential_orphaned_at` is stamped by a
+failed *issuance* and `revocation_failed_at` by a broker that *refused* a revocation, and neither is
+what `revocation_pending=true` selects. Read them from an ordinary `GET /subscribers` page, or query
+them directly — which is also the fallback for the incomplete-walk case above:
+
+```sql
+SELECT subscriber_id, kafka_principal, consumer_group_id,
+       revocation_pending_at, revocation_failed_at, credential_orphaned_at,
+       now() - LEAST(
+         COALESCE(revocation_pending_at,   'infinity'),
+         COALESCE(revocation_failed_at,    'infinity'),
+         COALESCE(credential_orphaned_at,  'infinity')
+       ) AS outstanding_for
+FROM blnk.event_subscribers
+WHERE revocation_pending_at IS NOT NULL
+   OR revocation_failed_at IS NOT NULL
+   OR credential_orphaned_at IS NOT NULL
+ORDER BY outstanding_for DESC;
+```
+
+The service logs carry the same information: the revocation-failure entry names the principal. The
+full triage and hand-revocation procedure is in
+[kafka-operations.md](kafka-operations.md#subscriberrevocationoutstanding), and the `$BLNK_API` and
+`$BLNK_CURL_CONFIG` above are established by
+[Keep credentials out of process arguments](kafka-operations.md#keep-credentials-out-of-process-arguments).
 
 **The settlement gauges describe a registry that has drifted from the broker.** A subscriber's
 state lives in two systems that cannot be written atomically: the registry row in PostgreSQL, and
@@ -538,6 +581,17 @@ backlog looks identical whether the pass is settling nothing or settling exactly
 obligations arrive; a rate over the counter separates those. A zero rate with a non-zero backlog
 is a stuck pass — check that the server role logged `subscriber settlement processor started`,
 which it declines to do when `KAFKA_BROKERS` is empty.
+
+**No rate at all is the same finding, and `SubscriberSettlementNotProgressing` is written to say
+so.** This counter is subject to the absent-family note at the top of this page: it has no series
+until the pass discharges its first obligation, so a deployment whose settler has never worked
+exports nothing here. The rule is therefore `blnk_subscribers_settlement_outstanding > 0 unless
+rate(…) > 0` rather than `… and rate(…) == 0`. `and` against an absent series yields an empty
+result, which left the rule unable to fire on exactly the deployment it exists for; `unless`
+returns the left-hand side when the right has nothing to match, so an outstanding backlog alerts
+before this counter's first sample. Matching is unchanged — `unless` pairs on the full label set,
+so a backlog is still compared with its own process's settle rate — and the alert's `$value` is
+still the backlog, because `unless` returns the left side.
 
 **A non-zero `blnk_kafka_subscribers_unmeasured` means part of the lag signal does not exist.**
 Measuring lag costs two broker round trips per authorised topic and produces a retained series
@@ -600,7 +654,7 @@ deployment running without Kafka rather than a fault.
 | `SubscriberRevocationOutstanding` | `blnk_subscribers_oldest_revocation_age_seconds > 3600` | `0m` | critical |
 | `SubscriberCredentialOrphaned` | `blnk_subscribers_oldest_credential_orphan_age_seconds > 3600` | `0m` | critical |
 | `SubscriberRevocationRefused` | `blnk_subscribers_oldest_revocation_failure_age_seconds > 900` | `0m` | warning |
-| `SubscriberSettlementNotProgressing` | `blnk_subscribers_settlement_outstanding > 0 and rate(blnk_subscribers_obligations_settled_total[30m]) == 0` | `30m` | warning |
+| `SubscriberSettlementNotProgressing` | `blnk_subscribers_settlement_outstanding > 0 unless rate(blnk_subscribers_obligations_settled_total[30m]) > 0` | `30m` | warning |
 | `SubscriberSettlementOutstanding` | `blnk_subscribers_oldest_settlement_age_seconds > 3600` | `0m` | critical |
 | `ConsumerLagMeasurementDegraded` | `blnk_kafka_consumer_lag_unmeasured_partitions > 0` | `5m` | warning |
 | `SubscriberLagCoverageStale` | `max_over_time(blnk_kafka_consumer_lag_pass_age_seconds[30m]) > 600` | `0m` | warning |
@@ -726,7 +780,8 @@ sum by (purpose) (rate(blnk_events_broker_acknowledgements_total[5m]))
 # Publish attempts by outcome: retry pressure, independent of how many events were delivered.
 # A rising retrying share is a broker under strain. There is no `failed` outcome to read the
 # stuck population from — see the note on the closed vocabulary above; read that from
-# blnk_events_dead_lettered_total and GET /events/stats.
+# blnk_events_dead_lettered_total and GET /events/stats (its `failed` and `dead_lettered`
+# counts need no parameter; only `dispatched` is taken on request).
 rate(blnk_events_publish_attempts_total[5m])
 
 # Attempts that gave up: events that will NOT be attempted again. This is the pair that
@@ -821,14 +876,34 @@ blnk_kafka_subscribers_unmeasured > 0
 sum without(reason)(blnk_kafka_subscribers_unmeasured) / clamp_min(blnk_subscribers_registered, 1)
 
 # Measurement-budget headroom. Watch this rather than waiting for the shortfall above: it goes
-# negative BEFORE any subscriber goes unmeasured, and the constant is
-# EVENT_METRICS_SUBSCRIBER_BUDGET (alias RELAY_SUBSCRIBER_METRICS_BUDGET), which has no series
-# of its own.
-200 - blnk_subscribers_registered
+# negative BEFORE any subscriber goes unmeasured. Both operands are series, so the query is true
+# on every deployment — it used to read `200 - blnk_subscribers_registered`, naming the DEFAULT
+# as a literal, which showed a deployment running a budget of 1000 as exhausted eight hundred
+# subscribers early. The budget is set by EVENT_METRICS_SUBSCRIBER_BUDGET (alias
+# RELAY_SUBSCRIBER_METRICS_BUDGET) and exported as the gauge below.
+blnk_subscribers_measurement_budget - blnk_subscribers_registered
 
 # Relay backlog: rows captured but not yet published, counted as pending plus processing. A
 # rising figure against a flat publish rate is a relay that is not keeping up.
 blnk_outbox_pending
+
+# REPAIR backlog and its DRAIN RATE, per leg. These two are read together or neither is
+# actionable: the first is what is owed, the second is how fast it is being paid, and their
+# quotient is the time to clear. Note that blnk_outbox_pending above CANNOT answer this — the
+# rows here are `failed` and `webhook_pending`, which that gauge does not count.
+blnk_events_repair_backlog
+rate(blnk_events_repair_completed_total[5m])
+
+# Seconds to clear the repair backlog at the current drain rate, per leg. A result that climbs
+# means the backlog is growing faster than the repair is clearing it.
+blnk_events_repair_backlog
+  / on(leg) rate(blnk_events_repair_completed_total[5m])
+
+# Repair capacity is the binding constraint, not the broker. This is the condition to alert on
+# when a recovery is taking too long: the per-tick budget ended the chain with work still
+# coming back, so RELAY_REPAIR_MAX_BATCHES_PER_TICK or RELAY_REPAIR_BATCH_SIZE is the remedy
+# rather than more brokers.
+max_over_time(blnk_events_repair_saturated[15m]) == 1
 
 # Retention sweep removal rate. Zero most often means NOTHING IS ELIGIBLE — no terminal row is
 # older than the retention cutoff yet — and only otherwise means the sweep is disabled or stuck.

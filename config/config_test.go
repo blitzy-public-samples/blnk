@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -479,50 +480,161 @@ func TestUploadWhitelistHostsParsing(t *testing.T) {
 // Kafka, relay or webhook-deprecation configuration, in all three forms a reader
 // might reach for.
 //
-// envconfig v1.4.0 derives a field's primary key by accumulating the prefix
-// through every enclosing struct and appending the tag literal, then falls back
-// to the bare tag literal as an alternate key consulted only when the primary is
-// unset. KafkaConfig is nested under Configuration.Kafka, so its primary key is
-// BLNK_KAFKA_<TAG> — BLNK_KAFKA_KAFKA_BROKERS — and its alternate is the bare,
-// deployment-mandated KAFKA_BROKERS.
+// # It is DERIVED, because a hand-written list is what went wrong
 //
-// The intuitive-looking BLNK_KAFKA_BROKERS is neither of those keys, and used to be
-// read by nothing at all — a deployment that set it silently got default behaviour.
-// applyPrefixedEnvAliases now resolves it explicitly, and with HIGHER precedence
-// than the bare name, so all three forms below are live and each is asserted by
-// TestLoadConfigFromFile_KafkaEnvNameForms. Every form is still cleared here,
-// because a value leaking in from the surrounding environment would satisfy a later
-// assertion for the wrong reason.
-var eventStreamingEnvKeys = []string{
-	"KAFKA_BROKERS", "BLNK_KAFKA_KAFKA_BROKERS", "BLNK_KAFKA_BROKERS",
-	"KAFKA_SUBSCRIBER_BROKERS", "BLNK_KAFKA_KAFKA_SUBSCRIBER_BROKERS", "BLNK_KAFKA_SUBSCRIBER_BROKERS",
-	"KAFKA_TOPIC_PREFIX", "BLNK_KAFKA_KAFKA_TOPIC_PREFIX", "BLNK_KAFKA_TOPIC_PREFIX",
-	"KAFKA_SASL_USER", "BLNK_KAFKA_KAFKA_SASL_USER", "BLNK_KAFKA_SASL_USER",
-	"KAFKA_SASL_SECRET", "BLNK_KAFKA_KAFKA_SASL_SECRET", "BLNK_KAFKA_SASL_SECRET",
-	"KAFKA_SASL_ADMIN_USER", "BLNK_KAFKA_KAFKA_SASL_ADMIN_USER", "BLNK_KAFKA_SASL_ADMIN_USER",
-	"KAFKA_SASL_ADMIN_SECRET", "BLNK_KAFKA_KAFKA_SASL_ADMIN_SECRET", "BLNK_KAFKA_SASL_ADMIN_SECRET",
-	"KAFKA_MIN_PARTITIONS", "BLNK_KAFKA_KAFKA_MIN_PARTITIONS", "BLNK_KAFKA_MIN_PARTITIONS",
-	"KAFKA_REPLICATION_FACTOR", "BLNK_KAFKA_KAFKA_REPLICATION_FACTOR", "BLNK_KAFKA_REPLICATION_FACTOR",
-	"EVENT_METRICS_SUBSCRIBER_BUDGET", "BLNK_KAFKA_EVENT_METRICS_SUBSCRIBER_BUDGET", "BLNK_EVENT_METRICS_SUBSCRIBER_BUDGET",
-	"KAFKA_TLS_ENABLED", "BLNK_KAFKA_KAFKA_TLS_ENABLED", "BLNK_KAFKA_TLS_ENABLED",
-	"KAFKA_TLS_CA_FILE", "BLNK_KAFKA_KAFKA_TLS_CA_FILE", "BLNK_KAFKA_TLS_CA_FILE",
-	"KAFKA_TLS_CERT_FILE", "BLNK_KAFKA_KAFKA_TLS_CERT_FILE", "BLNK_KAFKA_TLS_CERT_FILE",
-	"KAFKA_TLS_KEY_FILE", "BLNK_KAFKA_KAFKA_TLS_KEY_FILE", "BLNK_KAFKA_TLS_KEY_FILE",
-	"KAFKA_TLS_SERVER_NAME", "BLNK_KAFKA_KAFKA_TLS_SERVER_NAME", "BLNK_KAFKA_TLS_SERVER_NAME",
-	"KAFKA_TLS_INSECURE_SKIP_VERIFY", "BLNK_KAFKA_KAFKA_TLS_INSECURE_SKIP_VERIFY", "BLNK_KAFKA_TLS_INSECURE_SKIP_VERIFY",
-	"KAFKA_INSECURE_LOCAL_DEV", "BLNK_KAFKA_KAFKA_INSECURE_LOCAL_DEV", "BLNK_KAFKA_INSECURE_LOCAL_DEV",
-	"KAFKA_ALLOW_PARTITION_GROWTH", "BLNK_KAFKA_KAFKA_ALLOW_PARTITION_GROWTH", "BLNK_KAFKA_ALLOW_PARTITION_GROWTH",
-	"KAFKA_ALLOW_ADMIN_PRODUCER", "BLNK_KAFKA_KAFKA_ALLOW_ADMIN_PRODUCER", "BLNK_KAFKA_ALLOW_ADMIN_PRODUCER",
-	"RELAY_MAX_RETRY_ATTEMPTS", "BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS", "BLNK_RELAY_MAX_RETRY_ATTEMPTS",
-	"RELAY_RETRY_BASE_BACKOFF_MS", "BLNK_RELAY_RELAY_RETRY_BASE_BACKOFF_MS", "BLNK_RELAY_RETRY_BASE_BACKOFF_MS",
-	"RELAY_RETRY_MAX_BACKOFF_MS", "BLNK_RELAY_RELAY_RETRY_MAX_BACKOFF_MS", "BLNK_RELAY_RETRY_MAX_BACKOFF_MS",
-	"RELAY_EVENT_RETENTION_DAYS", "BLNK_RELAY_RELAY_EVENT_RETENTION_DAYS", "BLNK_RELAY_EVENT_RETENTION_DAYS",
-	"RELAY_EVENT_RETENTION_BATCH_SIZE", "BLNK_RELAY_RELAY_EVENT_RETENTION_BATCH_SIZE",
-	"BLNK_RELAY_EVENT_RETENTION_BATCH_SIZE",
-	"RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP", "BLNK_RELAY_RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP",
-	"BLNK_RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP",
+// This used to be a literal slice maintained beside the configuration structs, and
+// it fell behind them: KAFKA_HISTORICAL_TOPIC_PREFIXES and
+// RELAY_SUBSCRIBER_METRICS_BUDGET were added to KafkaConfig and RelayConfig and
+// never added here, so an ambient value for either survived clearEventStreamingEnv
+// and could satisfy a default or precedence assertion for the wrong reason. Adding
+// the two missing names would have fixed the symptom and left the mechanism —
+// two lists that must agree, with nothing making them agree — intact. Reflecting
+// over the structs makes them one list.
+//
+// # The three forms, and why each exists
+//
+// envconfig v1.4.0 derives a field's primary key by accumulating the prefix through
+// every enclosing struct and appending the tag literal, then falls back to the bare
+// tag literal as an alternate consulted only when the primary is unset. KafkaConfig
+// is Configuration.Kafka, so its primary key is BLNK_KAFKA_<TAG> and its alternate
+// is the bare, deployment-mandated <TAG> that AAP R-10 names.
+//
+// The intuitive-looking BLNK_<TAG> is neither of those keys and used to be read by
+// nothing at all — a deployment that set BLNK_KAFKA_BROKERS silently got default
+// behaviour. applyPrefixedEnvAliases now resolves it explicitly and with HIGHER
+// precedence than the bare name, so all three forms are live; each is asserted by
+// TestLoadConfigFromFile_KafkaEnvNameForms, and every form has to be cleared here
+// because any one of them leaking in would be read.
+var eventStreamingEnvKeys = deriveEventStreamingEnvKeys()
+
+// eventStreamingEnvExtras are names cleared defensively that no struct tag produces.
+//
+// WebhookDeprecationStartDate carries a json tag and no envconfig tag, so envconfig
+// derives BLNK_WEBHOOKDEPRECATIONSTARTDATE for it and the readable form below is
+// read by nothing today. It is cleared anyway: the field is documented as the other
+// end of the dual-delivery window, and an operator who exports the readable name
+// after it acquires a tag should not be able to change what these tests observe.
+var eventStreamingEnvExtras = []string{
 	"WEBHOOK_DEPRECATION_START_DATE", "BLNK_WEBHOOK_DEPRECATION_START_DATE",
-	"WEBHOOK_DEPRECATION_SUNSET_DATE", "BLNK_WEBHOOK_DEPRECATION_SUNSET_DATE",
+}
+
+// deriveEventStreamingEnvKeys reads the envconfig tags off the configuration structs
+// themselves and expands each into the three forms described above.
+//
+// The subtrees are named rather than discovered because "event streaming" is a
+// judgement about which configuration this file's tests are allowed to disturb, not
+// a property of the type: clearing Configuration.Redis or Configuration.DataSource
+// here would break the tests that legitimately depend on them. Naming two structs
+// and a field is stable in a way that naming twenty-five variables is not — a new
+// field inside either struct is picked up with no edit to this file, which is the
+// failure this replaces.
+func deriveEventStreamingEnvKeys() []string {
+	keys := make([]string, 0, 96)
+	seen := make(map[string]struct{}, 96)
+
+	add := func(forms ...string) {
+		for _, form := range forms {
+			if _, already := seen[form]; already {
+				continue
+			}
+			seen[form] = struct{}{}
+			keys = append(keys, form)
+		}
+	}
+
+	// The prefix envconfig accumulates for each subtree, which is blnkEnvPrefix plus
+	// the upper-cased name of the field on Configuration that holds it.
+	subtrees := []struct {
+		prefix string
+		typ    reflect.Type
+	}{
+		{blnkEnvPrefix + "KAFKA_", reflect.TypeOf(KafkaConfig{})},
+		{blnkEnvPrefix + "KAFKA_", reflect.TypeOf(KafkaTLSConfig{})},
+		{blnkEnvPrefix + "RELAY_", reflect.TypeOf(RelayConfig{})},
+	}
+
+	for _, subtree := range subtrees {
+		for i := 0; i < subtree.typ.NumField(); i++ {
+			tag := subtree.typ.Field(i).Tag.Get("envconfig")
+			if tag == "" {
+				continue
+			}
+			add(tag, subtree.prefix+tag, blnkEnvPrefix+tag)
+		}
+	}
+
+	// Webhook deprecation lives directly on Configuration, so its primary key takes
+	// the bare prefix with no intervening subtree name.
+	configuration := reflect.TypeOf(Configuration{})
+	for i := 0; i < configuration.NumField(); i++ {
+		field := configuration.Field(i)
+		tag := field.Tag.Get("envconfig")
+		if tag == "" || !strings.HasPrefix(tag, "WEBHOOK_DEPRECATION_") {
+			continue
+		}
+		add(tag, blnkEnvPrefix+tag)
+	}
+
+	add(eventStreamingEnvExtras...)
+
+	return keys
+}
+
+// TestEventStreamingEnvKeys_CoverEveryConfiguredVariable pins the derivation above
+// against the variables AAP R-10 mandates by name.
+//
+// The derivation cannot omit a struct field, but it CAN be wrong about the shape of
+// the names it builds — a mistaken subtree prefix would produce a full-looking list
+// of keys that nothing reads, and every test that depends on clearing would go back
+// to passing for the wrong reason with nothing to show for it. Asserting the exact
+// eight names the requirement fixes, in every form, is the independent check: those
+// are stated in the AAP rather than derived from the code, so the two cannot drift
+// together.
+func TestEventStreamingEnvKeys_CoverEveryConfiguredVariable(t *testing.T) {
+	present := make(map[string]struct{}, len(eventStreamingEnvKeys))
+	for _, key := range eventStreamingEnvKeys {
+		present[key] = struct{}{}
+	}
+
+	// The eight names AAP R-10 mandates, plus the two whose absence was the finding.
+	for _, expected := range []string{
+		"KAFKA_BROKERS", "BLNK_KAFKA_KAFKA_BROKERS", "BLNK_KAFKA_BROKERS",
+		"KAFKA_TOPIC_PREFIX", "BLNK_KAFKA_KAFKA_TOPIC_PREFIX", "BLNK_KAFKA_TOPIC_PREFIX",
+		"KAFKA_SASL_ADMIN_USER", "BLNK_KAFKA_KAFKA_SASL_ADMIN_USER", "BLNK_KAFKA_SASL_ADMIN_USER",
+		"KAFKA_SASL_ADMIN_SECRET", "BLNK_KAFKA_KAFKA_SASL_ADMIN_SECRET", "BLNK_KAFKA_SASL_ADMIN_SECRET",
+		"RELAY_MAX_RETRY_ATTEMPTS", "BLNK_RELAY_RELAY_MAX_RETRY_ATTEMPTS", "BLNK_RELAY_MAX_RETRY_ATTEMPTS",
+		"RELAY_RETRY_BASE_BACKOFF_MS", "BLNK_RELAY_RELAY_RETRY_BASE_BACKOFF_MS",
+		"BLNK_RELAY_RETRY_BASE_BACKOFF_MS",
+		"RELAY_RETRY_MAX_BACKOFF_MS", "BLNK_RELAY_RELAY_RETRY_MAX_BACKOFF_MS",
+		"BLNK_RELAY_RETRY_MAX_BACKOFF_MS",
+		"WEBHOOK_DEPRECATION_SUNSET_DATE", "BLNK_WEBHOOK_DEPRECATION_SUNSET_DATE",
+		// The two the hand-written list had fallen behind on.
+		"KAFKA_HISTORICAL_TOPIC_PREFIXES", "BLNK_KAFKA_KAFKA_HISTORICAL_TOPIC_PREFIXES",
+		"BLNK_KAFKA_HISTORICAL_TOPIC_PREFIXES",
+		"RELAY_SUBSCRIBER_METRICS_BUDGET", "BLNK_RELAY_RELAY_SUBSCRIBER_METRICS_BUDGET",
+		"BLNK_RELAY_SUBSCRIBER_METRICS_BUDGET",
+	} {
+		_, ok := present[expected]
+		assert.Truef(t, ok,
+			"%s is not cleared by clearEventStreamingEnv, so an ambient value for it survives "+
+				"into every test in this file that asserts a DEFAULT or a PRECEDENCE. Either the "+
+				"subtree prefixes in deriveEventStreamingEnvKeys are wrong or the field lost its "+
+				"envconfig tag", expected)
+	}
+
+	// Every derived name must be complete in its forms: a bare tag whose prefixed
+	// siblings are missing clears the alternate key and leaves the PRIMARY set, which
+	// is the form envconfig prefers and therefore the one that would win.
+	for _, key := range eventStreamingEnvKeys {
+		if strings.HasPrefix(key, blnkEnvPrefix) {
+			continue
+		}
+
+		_, aliased := present[blnkEnvPrefix+key]
+		assert.Truef(t, aliased,
+			"%s is cleared but %s%s is not, and applyPrefixedEnvAliases gives the prefixed form "+
+				"HIGHER precedence, so the one left behind is the one that wins", key, blnkEnvPrefix, key)
+	}
 }
 
 // clearEventStreamingEnv unsets every key in eventStreamingEnvKeys and restores
@@ -1970,6 +2082,84 @@ func TestLoadConfigFromFile_KafkaEnvNameForms(t *testing.T) {
 			},
 		},
 		{
+			// THE FINDING FOR THE HISTORICAL PREFIX LIST. Both compose files forward
+			// BLNK_KAFKA_HISTORICAL_TOPIC_PREFIXES and .env.example documents that either
+			// form resolves — and no field resolved it, so only the bare name and
+			// envconfig's own BLNK_KAFKA_KAFKA_ artefact worked. The consequence is the
+			// worst this variable has: a deployment that renamed KAFKA_TOPIC_PREFIX and
+			// declared the old namespace through the documented, forwarded name got an
+			// EMPTY historical list, and every event captured under the previous prefix was
+			// refused at writer resolution after the next restart.
+			name:   "the mandated bare KAFKA_HISTORICAL_TOPIC_PREFIXES resolves",
+			envKey: "KAFKA_HISTORICAL_TOPIC_PREFIXES",
+			value:  "legacy,older",
+			assert: func(t *testing.T, loaded *Configuration) {
+				assertBrokerList(t, loaded.Kafka.HistoricalTopicPrefixes, []string{"legacy", "older"})
+			},
+		},
+		{
+			name:   "the prefixed BLNK_KAFKA_KAFKA_HISTORICAL_TOPIC_PREFIXES primary key resolves",
+			envKey: "BLNK_KAFKA_KAFKA_HISTORICAL_TOPIC_PREFIXES",
+			value:  "legacy",
+			assert: func(t *testing.T, loaded *Configuration) {
+				assertBrokerList(t, loaded.Kafka.HistoricalTopicPrefixes, []string{"legacy"})
+			},
+		},
+		{
+			name:   "the ordinary BLNK_KAFKA_HISTORICAL_TOPIC_PREFIXES alias resolves",
+			envKey: "BLNK_KAFKA_HISTORICAL_TOPIC_PREFIXES",
+			value:  "legacy,older",
+			assert: func(t *testing.T, loaded *Configuration) {
+				// Split by the library, so the alias is a genuine equivalent of the bare
+				// name rather than a single-value special case.
+				assertBrokerList(t, loaded.Kafka.HistoricalTopicPrefixes, []string{"legacy", "older"})
+			},
+		},
+		{
+			// The key-scope declaration is an AUTHORIZATION control, so a form that
+			// resolved to nothing would silently leave issuance refusing every key-scoped
+			// subscriber on a deployment that had declared a gateway. Both of its names are
+			// exercised for that reason, and so are both of the gateway list's.
+			name:   "the mandated bare KAFKA_KEY_SCOPE_ENFORCEMENT resolves",
+			envKey: "KAFKA_KEY_SCOPE_ENFORCEMENT",
+			value:  KeyScopeEnforcementBrokerGateway,
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.KeyScopeEnforcement != KeyScopeEnforcementBrokerGateway {
+					t.Errorf("Expected Kafka.KeyScopeEnforcement to be %q, got %q",
+						KeyScopeEnforcementBrokerGateway, loaded.Kafka.KeyScopeEnforcement)
+				}
+			},
+		},
+		{
+			name:   "the ordinary BLNK_KAFKA_KEY_SCOPE_ENFORCEMENT alias resolves",
+			envKey: "BLNK_KAFKA_KEY_SCOPE_ENFORCEMENT",
+			value:  KeyScopeEnforcementBrokerGateway,
+			assert: func(t *testing.T, loaded *Configuration) {
+				if loaded.Kafka.KeyScopeEnforcement != KeyScopeEnforcementBrokerGateway {
+					t.Errorf("Expected Kafka.KeyScopeEnforcement to be %q, got %q",
+						KeyScopeEnforcementBrokerGateway, loaded.Kafka.KeyScopeEnforcement)
+				}
+			},
+		},
+		{
+			name:   "the mandated bare KAFKA_KEY_SCOPE_GATEWAY_BROKERS resolves",
+			envKey: "KAFKA_KEY_SCOPE_GATEWAY_BROKERS",
+			value:  "gateway-1:9095,gateway-2:9095",
+			assert: func(t *testing.T, loaded *Configuration) {
+				assertBrokerList(t, loaded.Kafka.KeyScopeGatewayBrokers,
+					[]string{"gateway-1:9095", "gateway-2:9095"})
+			},
+		},
+		{
+			name:   "the ordinary BLNK_KAFKA_KEY_SCOPE_GATEWAY_BROKERS alias resolves",
+			envKey: "BLNK_KAFKA_KEY_SCOPE_GATEWAY_BROKERS",
+			value:  "gateway-3:9095,gateway-4:9095",
+			assert: func(t *testing.T, loaded *Configuration) {
+				assertBrokerList(t, loaded.Kafka.KeyScopeGatewayBrokers,
+					[]string{"gateway-3:9095", "gateway-4:9095"})
+			},
+		},
+		{
 			name:   "the ordinary BLNK_KAFKA_TOPIC_PREFIX alias resolves",
 			envKey: "BLNK_KAFKA_TOPIC_PREFIX",
 			value:  "acme",
@@ -2911,62 +3101,86 @@ func TestResolveWebhookDeprecationWindow(t *testing.T) {
 	})
 }
 
-// TestValidateAndAddDefaults_RelayWindowWarnings covers the relay retry-window
-// consistency check. Relay tuning is an operational knob: a bad value must degrade
-// event delivery, never stop the server from starting, so every finding is a
-// warning and validateAndAddDefaults still returns nil in every case below.
+// TestValidateAndAddDefaults_RelayWindowWarnings covers what happens to an unusable relay
+// retry window. Relay tuning is an operational knob: a bad value must degrade event delivery,
+// never stop the server from starting, so every finding is a warning and
+// validateAndAddDefaults still returns nil in every case below.
 //
-// The check runs after the defaults are applied, so it inspects effective values.
-// That is why each case supplies non-zero values for the fields it is exercising —
-// a zero would simply be replaced by its default before the check ever saw it.
+// # A negative value is NORMALISED, not merely reported
+//
+// It used to be reported and left in place, and the report was wrong about the outcome: the
+// warning said "retries will not be delayed" while each consumer went on to substitute a
+// value of its own. For RELAY_MAX_RETRY_ATTEMPTS the two consumers substituted DIFFERENT
+// values — the row was stamped with the default of five by eventMaxAttempts while
+// newRelayRetryPolicy allowed the ceiling of eight — so one negative produced two effective
+// budgets and no log line named either. So each case below asserts BOTH halves of the fix:
+// the warning names the variable and the value applied, and the effective value really is
+// that one.
+//
+// The check runs after the defaults are applied, so it inspects effective values. That is why
+// each case supplies non-zero values for the fields it is exercising — a zero means "unset"
+// and is replaced by its default silently, with no warning to assert on.
 func TestValidateAndAddDefaults_RelayWindowWarnings(t *testing.T) {
 	clearEventStreamingEnv(t)
 
 	const (
-		baseAboveCapWarning = "relay retry_base_backoff_ms exceeds retry_max_backoff_ms"
-		negativeBaseWarning = "relay retry_base_backoff_ms is negative"
-		negativeCapWarning  = "relay retry_max_backoff_ms is negative"
-		tooFewAttemptsWarn  = "relay max_retry_attempts is below 1"
+		baseAboveCapWarning  = "relay retry_base_backoff_ms exceeds retry_max_backoff_ms"
+		negativeBaseWarning  = "relay retry_base_backoff_ms is negative"
+		negativeCapWarning   = "relay retry_max_backoff_ms is negative"
+		negativeAttemptsWarn = "relay max_retry_attempts is negative"
 	)
 
 	cases := []struct {
-		name     string
-		relay    RelayConfig
-		want     []string
-		unwanted []string
+		name      string
+		relay     RelayConfig
+		want      []string
+		unwanted  []string
+		effective *RelayConfig
 	}{
 		{
 			name:     "a base backoff above the cap warns",
 			relay:    RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 40000, RetryMaxBackoffMS: 30000},
 			want:     []string{baseAboveCapWarning},
-			unwanted: []string{negativeBaseWarning, negativeCapWarning, tooFewAttemptsWarn},
+			unwanted: []string{negativeBaseWarning, negativeCapWarning, negativeAttemptsWarn},
+			// NEITHER value is corrected: both are individually valid, so the operator's
+			// slower-but-capped schedule is honoured rather than second-guessed.
+			effective: &RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 40000, RetryMaxBackoffMS: 30000},
 		},
 		{
-			name:     "a negative base backoff warns",
-			relay:    RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: -1, RetryMaxBackoffMS: 30000},
-			want:     []string{negativeBaseWarning},
-			unwanted: []string{baseAboveCapWarning, negativeCapWarning, tooFewAttemptsWarn},
+			name:      "a negative base backoff warns and the default is applied",
+			relay:     RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: -1, RetryMaxBackoffMS: 30000},
+			want:      []string{negativeBaseWarning},
+			unwanted:  []string{baseAboveCapWarning, negativeCapWarning, negativeAttemptsWarn},
+			effective: &RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: 30000},
 		},
 		{
-			// A negative cap is below the base as well, so both findings are
-			// expected — the check reports every problem it sees rather than the
-			// first one.
-			name:     "a negative cap warns",
-			relay:    RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: -1},
-			want:     []string{negativeCapWarning, baseAboveCapWarning},
-			unwanted: []string{negativeBaseWarning, tooFewAttemptsWarn},
+			// The inverted-window finding is NOT expected here any more, and its absence is
+			// the point: the cap is normalised to its default of 30000 before the window is
+			// inspected, so the base of 1000 no longer exceeds it. Reporting an inversion
+			// against a value that had already been replaced was a warning about a state
+			// that did not exist.
+			name:      "a negative cap warns and the default is applied",
+			relay:     RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: -1},
+			want:      []string{negativeCapWarning},
+			unwanted:  []string{negativeBaseWarning, negativeAttemptsWarn, baseAboveCapWarning},
+			effective: &RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: 30000},
 		},
 		{
-			name:     "a retry count below one warns",
-			relay:    RelayConfig{MaxRetryAttempts: -1, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: 30000},
-			want:     []string{tooFewAttemptsWarn},
-			unwanted: []string{baseAboveCapWarning, negativeBaseWarning, negativeCapWarning},
+			// THE FINDING. A negative budget now resolves to ONE value, named in the log,
+			// which is what stops eventMaxAttempts and newRelayRetryPolicy disagreeing about
+			// how many attempts an event gets.
+			name:      "a negative retry count warns and the default is applied",
+			relay:     RelayConfig{MaxRetryAttempts: -1, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: 30000},
+			want:      []string{negativeAttemptsWarn},
+			unwanted:  []string{baseAboveCapWarning, negativeBaseWarning, negativeCapWarning},
+			effective: &RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: 30000},
 		},
 		{
-			name:     "the default window warns about nothing",
-			relay:    RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: 30000},
-			want:     nil,
-			unwanted: []string{baseAboveCapWarning, negativeBaseWarning, negativeCapWarning, tooFewAttemptsWarn},
+			name:      "the default window warns about nothing",
+			relay:     RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: 30000},
+			want:      nil,
+			unwanted:  []string{baseAboveCapWarning, negativeBaseWarning, negativeCapWarning, negativeAttemptsWarn},
+			effective: &RelayConfig{MaxRetryAttempts: 5, RetryBaseBackoffMS: 1000, RetryMaxBackoffMS: 30000},
 		},
 	}
 
@@ -2990,6 +3204,24 @@ func TestValidateAndAddDefaults_RelayWindowWarnings(t *testing.T) {
 			for _, warning := range tc.unwanted {
 				if warnedAbout(hook, warning) {
 					t.Errorf("Did not expect a warning containing %q", warning)
+				}
+			}
+
+			// THE OTHER HALF. A warning that names an applied value is only true if that
+			// value is the one every consumer will read, so the effective configuration is
+			// asserted alongside the log line rather than instead of it.
+			if tc.effective != nil {
+				if cnf.Relay.MaxRetryAttempts != tc.effective.MaxRetryAttempts {
+					t.Errorf("Expected an effective max_retry_attempts of %d, got %d",
+						tc.effective.MaxRetryAttempts, cnf.Relay.MaxRetryAttempts)
+				}
+				if cnf.Relay.RetryBaseBackoffMS != tc.effective.RetryBaseBackoffMS {
+					t.Errorf("Expected an effective retry_base_backoff_ms of %d, got %d",
+						tc.effective.RetryBaseBackoffMS, cnf.Relay.RetryBaseBackoffMS)
+				}
+				if cnf.Relay.RetryMaxBackoffMS != tc.effective.RetryMaxBackoffMS {
+					t.Errorf("Expected an effective retry_max_backoff_ms of %d, got %d",
+						tc.effective.RetryMaxBackoffMS, cnf.Relay.RetryMaxBackoffMS)
 				}
 			}
 		})
@@ -4846,6 +5078,130 @@ func TestSetupRateLimiting_DefaultsToAFiniteProductionSafeLimit(t *testing.T) {
 		}
 		if *cnf.RateLimit.Burst != 20 {
 			t.Errorf("Expected the burst to be derived as twice the rate, got %v", *cnf.RateLimit.Burst)
+		}
+	})
+}
+
+// TestRelayConfig_RepairCapacityDefaultsAndResolves pins the capacity the two relay repair
+// passes run at (PERF-M06).
+//
+// # What the numbers are for
+//
+// Two populations of outbox row are outside the publish claim's reach by design: rows whose
+// retry budget is spent and whose `<topic>.dlt` write also failed, and rows whose Kafka leg
+// finished and whose legacy webhook enqueue never succeeded. Both are EMPTY in normal operation
+// and fill during an OUTAGE, all at once — 15 minutes at the 500 events per second acceptance
+// rate is about 450,000 rows — so the capacity that clears them is a recovery-time property
+// rather than a throughput one, and it needs its own settings.
+//
+// # Why each assertion is here
+//
+// A zero or negative in any of the three would silently disable the only path that ever
+// revisits an event which reached no topic at all: no batch claims nothing, no per-tick bound
+// chains nothing, and no concurrency waits on a semaphore permit that never exists. So all
+// three default rather than being honoured, and there is deliberately no "off" value —
+// switching repair off has no legitimate use, unlike the retention sweep, whose PERIOD of zero
+// is the documented way to disable a destructive operation.
+//
+// Both environment name forms are asserted because the deployment contract publishes both: the
+// bare names the requirement mandates, and the repository's own BLNK_ prefix.
+func TestRelayConfig_RepairCapacityDefaultsAndResolves(t *testing.T) {
+	t.Run("unset takes the shipped capacity", func(t *testing.T) {
+		clearEventStreamingEnv(t)
+
+		cnf := eventStreamingBaseConfig()
+		if err := cnf.validateAndAddDefaults(); err != nil {
+			t.Fatalf("Expected no error, got %v", err)
+		}
+
+		if cnf.Relay.RepairBatchSize != DefaultRelayRepairBatchSize {
+			t.Errorf("Expected an unset repair batch size to default to %d, got %d",
+				DefaultRelayRepairBatchSize, cnf.Relay.RepairBatchSize)
+		}
+		if cnf.Relay.RepairMaxBatchesPerTick != DefaultRelayRepairMaxBatchesPerTick {
+			t.Errorf("Expected an unset per-tick bound to default to %d, got %d",
+				DefaultRelayRepairMaxBatchesPerTick, cnf.Relay.RepairMaxBatchesPerTick)
+		}
+		if cnf.Relay.RepairConcurrency != DefaultRelayRepairConcurrency {
+			t.Errorf("Expected an unset repair concurrency to default to %d, got %d",
+				DefaultRelayRepairConcurrency, cnf.Relay.RepairConcurrency)
+		}
+	})
+
+	t.Run("the shipped capacity clears an outage backlog", func(t *testing.T) {
+		// The arithmetic the defaults were chosen from, asserted so a future change to either
+		// number has to face it. 25 x 100 = 2,500 rows a tick; the superseded fixed batch of 20
+		// rows once per tick is what this replaced.
+		perTick := DefaultRelayRepairMaxBatchesPerTick * DefaultRelayRepairBatchSize
+		if perTick < 1000 {
+			t.Errorf(
+				"the shipped repair capacity is %d rows a tick, which cannot clear what an outage "+
+					"produces: 15 minutes at 500 events a second leaves about 450,000 rows, and the "+
+					"superseded 20 rows a tick took roughly six and a quarter hours",
+				perTick)
+		}
+	})
+
+	t.Run("a non-positive value defaults rather than disabling repair", func(t *testing.T) {
+		for name, configured := range map[string]int{"zero": 0, "negative": -4} {
+			t.Run(name, func(t *testing.T) {
+				clearEventStreamingEnv(t)
+
+				cnf := eventStreamingBaseConfig()
+				cnf.Relay.RepairBatchSize = configured
+				cnf.Relay.RepairMaxBatchesPerTick = configured
+				cnf.Relay.RepairConcurrency = configured
+
+				if err := cnf.validateAndAddDefaults(); err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+
+				if cnf.Relay.RepairBatchSize != DefaultRelayRepairBatchSize ||
+					cnf.Relay.RepairMaxBatchesPerTick != DefaultRelayRepairMaxBatchesPerTick ||
+					cnf.Relay.RepairConcurrency != DefaultRelayRepairConcurrency {
+					t.Errorf(
+						"Expected %d to default in all three, got batch=%d per_tick=%d concurrency=%d; "+
+							"a deployment that stopped repairing would silently keep events that "+
+							"reached no topic at all",
+						configured, cnf.Relay.RepairBatchSize,
+						cnf.Relay.RepairMaxBatchesPerTick, cnf.Relay.RepairConcurrency)
+				}
+			})
+		}
+	})
+
+	t.Run("all three resolve from either environment variable form", func(t *testing.T) {
+		for name, prefix := range map[string]string{
+			"the documented bare names":            "",
+			"the repository's prefixed convention": "BLNK_",
+		} {
+			t.Run(name, func(t *testing.T) {
+				clearEventStreamingEnv(t)
+				t.Setenv(prefix+"RELAY_REPAIR_BATCH_SIZE", "40")
+				t.Setenv(prefix+"RELAY_REPAIR_MAX_BATCHES_PER_TICK", "9")
+				t.Setenv(prefix+"RELAY_REPAIR_CONCURRENCY", "3")
+
+				cnf := eventStreamingBaseConfig()
+				if err := applyEventStreamingEnvOverride(&cnf); err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+				if err := cnf.validateAndAddDefaults(); err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+
+				if cnf.Relay.RepairBatchSize != 40 {
+					t.Errorf("Expected %sRELAY_REPAIR_BATCH_SIZE to set 40, got %d",
+						prefix, cnf.Relay.RepairBatchSize)
+				}
+				if cnf.Relay.RepairMaxBatchesPerTick != 9 {
+					t.Errorf("Expected %sRELAY_REPAIR_MAX_BATCHES_PER_TICK to set 9, got %d",
+						prefix, cnf.Relay.RepairMaxBatchesPerTick)
+				}
+				if cnf.Relay.RepairConcurrency != 3 {
+					t.Errorf("Expected %sRELAY_REPAIR_CONCURRENCY to set 3, got %d",
+						prefix, cnf.Relay.RepairConcurrency)
+				}
+			})
 		}
 	})
 }

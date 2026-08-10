@@ -1,0 +1,180 @@
+# Copyright 2024 Blnk Finance Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Unit tests for alerts/blnk-kafka-alerts.yml, run with:
+#
+#   promtool test rules alerts/tests/blnk-kafka-alerts_test.yml
+#
+# WHY THIS FILE EXISTS AT ALL. `promtool check rules` proves a rule file PARSES
+# and
+# that its expressions are valid PromQL. It cannot prove a rule FIRES, and the
+# two
+# are independent: SubscriberSettlementNotProgressing passed `check rules` for
+# its
+# entire life while being unable to fire on the one deployment it exists for.
+# Its
+# expression was
+#
+#   blnk_subscribers_settlement_outstanding > 0
+#     and rate(blnk_subscribers_obligations_settled_total[30m]) == 0
+#
+# and the counter on the right has NO SERIES until the settlement pass
+# discharges
+# its first obligation — OpenTelemetry exports the attribute sets that have been
+# written, not every instrument declared. `and` against an empty vector yields
+# an
+# empty vector, so a growing backlog on a settler that had never settled
+# anything
+# produced no alert and no error. A rule that is silent because nothing is wrong
+# and a rule that is silent because its right-hand series does not exist look
+# identical from outside, which is what made the defect survive review of the
+# expression itself.
+#
+# The first test below is therefore the one that matters: a backlog with NO
+# settlement-counter samples at all. It fails against the `and ... == 0` form
+# and
+# passes against the `unless ... > 0` form, which is the whole content of the
+# fix.
+# The other two cases pin the behaviour that had to be preserved while changing
+# the operator — a flat counter still alerts, and a counter that is moving still
+# suppresses — because an absent-safe rule that alerted through real progress
+# would trade a missed alert for a false one.
+#
+# Alert-rule tests are used rather than promql_expr_test on purpose: they
+# evaluate
+# the rule AS LOADED from the rule file, including its `for` duration, so the
+# assertion is about the deployed rule rather than about an expression restated
+# here. A test that quoted the expression back would pass no matter what the
+# rule
+# said.
+
+# WHY THIS FILE IS IN A SUBDIRECTORY. prometheus.yml loads rules with the glob
+# /etc/prometheus/alerts/*.yml against the bind-mounted ./alerts directory, and
+# a
+# unit-test file is not a rule file: `promtool check rules` rejects it outright
+# ("field tests not found in type rulefmt.RuleGroups"), so Prometheus would
+# refuse
+# the whole configuration and every one of the thirteen rules would fail to
+# load.
+# The glob does not recurse, so ./alerts/tests is inside the same mount and out
+# of
+# its reach. TestPrometheusAlertsDirectory_HoldsOnlyRuleFiles keeps it that way.
+rule_files:
+  - ../blnk-kafka-alerts.yml
+
+# Matches the group's own `interval: 30s`, so `for: 30m` means the same number
+# of
+# consecutive evaluations here as it does in Prometheus.
+evaluation_interval: 30s
+
+tests:
+  # -------------------------------------------------------------------------
+  # 1. THE REGRESSION CASE: a backlog, and no settlement counter at all.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: a backlog alerts before the settled counter's first sample
+    input_series:
+      # Two subscribers owing something, for 45 minutes, on one server. No
+      # blnk_subscribers_obligations_settled_total series is declared at all —
+      # which is exactly the state of a deployment whose settlement pass has
+      # never discharged an obligation, and the state the old expression could
+      # not alert on.
+      - series: 'blnk_subscribers_settlement_outstanding{job="blnk-server",instance="blnk-server:5001"}'
+        values: '2+0x90'
+    alert_rule_test:
+      # Inside `for: 30m`: pending, not yet firing. Asserted so the test cannot
+      # pass by the rule firing instantly, which would defeat the debounce that
+      # keeps a briefly-paced-off settler from paging anyone.
+      - eval_time: 20m
+        alertname: SubscriberSettlementNotProgressing
+        exp_alerts: []
+
+      # Past `for: 30m`: firing, attributed to the instance carrying the
+      # backlog.
+      - eval_time: 31m
+        alertname: SubscriberSettlementNotProgressing
+        exp_alerts:
+          # Anchored so the second firing case below aliases this expectation
+          # instead of restating it: two copies of an annotation could disagree,
+          # and the point of asserting it at all is that one rendering is right.
+          - &settlement_firing
+            exp_labels:
+              severity: warning
+              component: event-streaming
+              job: blnk-server
+              instance: blnk-server:5001
+            exp_annotations:
+              summary: >-
+                Broker-side subscriber reconciliation is outstanding and nothing
+                is settling it
+              description: >-
+                Subscriber obligations have been outstanding on blnk-server:5001
+                for over half an hour with NOTHING discharged in that time,
+                which is the signature of a settlement pass that is not running
+                rather than one that is busy. Check
+                blnk_subscribers_credential_cleanup_pending first — that count
+                is the security-relevant half, a credential that may exist
+                beyond what is recorded — then
+                blnk_subscribers_grant_reconcile_pending, which means enforced
+                access may not match authorized_topics. Common causes: a server
+                role started with no broker configured while subscribers were
+                provisioned against one, a processor that failed its wiring
+                check, or a loop that has died. Not attributed to a subscriber
+                on purpose: a subscriber label would export a tenant identifier
+                into every notification. Find the rows with GET /subscribers.
+              runbook_url: https://github.com/blnkfinance/blnk/blob/main/docs/kafka-operations.md#subscribersettlementnotprogressing
+
+  # -------------------------------------------------------------------------
+  # 2. The counter exists and is flat. This is what the old form covered, and it
+  #    must still hold: changing the operator must not narrow the rule.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: a flat settlement counter still alerts
+    input_series:
+      - series: 'blnk_subscribers_settlement_outstanding{job="blnk-server",instance="blnk-server:5001"}'
+        values: '3+0x90'
+      # Settled once long ago and nothing since: the counter exists, its rate
+      # over
+      # the last half hour is zero.
+      - series: 'blnk_subscribers_obligations_settled_total{job="blnk-server",instance="blnk-server:5001"}'
+        values: '7+0x90'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: SubscriberSettlementNotProgressing
+        exp_alerts:
+          - *settlement_firing
+
+  # -------------------------------------------------------------------------
+  # 3. The pass is working. A backlog that is being discharged is a BUSY
+  # settler,
+  #    not a stalled one, and it must stay quiet — otherwise the absent-safe
+  # form
+  #    would have traded a missed alert for a permanent false one.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: a moving settlement counter suppresses the alert
+    input_series:
+      - series: 'blnk_subscribers_settlement_outstanding{job="blnk-server",instance="blnk-server:5001"}'
+        values: '5+0x90'
+      # One obligation discharged per scrape: a positive rate throughout.
+      - series: 'blnk_subscribers_obligations_settled_total{job="blnk-server",instance="blnk-server:5001"}'
+        values: '0+1x90'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: SubscriberSettlementNotProgressing
+        exp_alerts: []
+
+      - eval_time: 45m
+        alertname: SubscriberSettlementNotProgressing
+        exp_alerts: []

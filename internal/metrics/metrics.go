@@ -247,9 +247,14 @@ var EventPublishAttemptsTotal metric.Int64Counter
 // relay reports the same few milliseconds here as an idle one, so certifying V-1 from this
 // series reports a pass for precisely the backlog the criterion exists to catch.
 //
-// What this instrument answers is the BROKER WRITE IN ISOLATION. Differenced against the
-// end-to-end figure it yields the queue wait, which is how an operator tells a slow broker
-// from a relay backlog:
+// What this instrument answers is the BROKER WRITE IN ISOLATION, and it is a diagnostic-only
+// supporting figure: nothing may be certified from it. Differenced against the end-to-end p99
+// it indicates, to an order of magnitude, whether the time is going into the broker or into
+// the wait to be claimed — but that difference is NOT a queue-wait percentile. Quantiles are
+// not subtractive: the 99th percentile of each interval is ranked over its own population, so
+// their difference is the difference of two p99 figures rather than the p99 of any difference,
+// and it can even come out negative. Anything quoting a queue-wait percentile has to
+// instrument the queue wait directly.
 //
 //	histogram_quantile(0.99, sum by (le) (rate(
 //	  blnk_events_publish_duration_seconds_bucket{attempt="1",outcome="dispatched"}[5m])))
@@ -330,6 +335,37 @@ var EventCaptureToDispatchDuration metric.Float64Histogram
 // dead-letter rate is a fraction of.
 // Attributes: topic, event_type
 var EventsDeadLetteredTotal metric.Int64Counter
+
+// SubscriberStreamRecordsDelivered counts records the subscriber stream gateway returned to a
+// subscriber, and SubscriberStreamRecordsWithheld counts the ones its partition-key prefix
+// excluded.
+//
+// # Why the withheld count is a first-class signal and not a debug log line
+//
+// The gateway IS the enforcement point for a key-scoped subscriber: Kafka's authorizer has no
+// message-key dimension, so such a subscriber is granted Describe and no Read and its records
+// reach it only through this path, filtered per record. That makes "is the filter working?" a
+// question an operator has to be able to answer, and it is unanswerable from the delivered
+// count alone — a feed with a working filter and a feed on a quiet topic look identical.
+//
+// A sustained delivered count with a ZERO withheld count on a shared category topic is
+// therefore the signature worth watching: it is what a filter that has stopped filtering looks
+// like, and it is indistinguishable from healthy operation without this pair.
+//
+// # Why they are counters and why the attributes stop where they do
+//
+// Counters, because they are per-record events and their RATE is the reading; a gauge would
+// lose every value between scrapes. Attributed by topic and by whether the subscriber is
+// key-scoped, and NOT by subscriber id: an id is caller-chosen and unbounded, so one series
+// per subscriber would accumulate for the lifetime of the process. SubscriberConsumerLag
+// carries subscriber identity because a lag figure means nothing without it and it has an
+// explicit cardinality budget; a delivered/withheld rate is answerable per topic.
+//
+// Attributes: topic, key_scoped
+var (
+	SubscriberStreamRecordsDelivered metric.Int64Counter
+	SubscriberStreamRecordsWithheld  metric.Int64Counter
+)
 
 // EVERY GAUGE BELOW is maintained by ONE production caller, the periodic
 // EventMetricsCollector in event_metrics.go, and by nothing else — the dead-letter age, the
@@ -785,15 +821,41 @@ var SubscribersUnmeasured metric.Int64Gauge
 // measured. That count alone cannot be judged: three unmeasured out of five is a different
 // situation from three out of three thousand.
 //
-// This gauge supplies the denominator, and it also makes the measurement budget's HEADROOM
-// visible before it is exhausted rather than only after, since the budget itself has no
-// series of its own.
+// This gauge supplies the denominator, and together with SubscriberMeasurementBudget below it
+// makes the measurement budget's HEADROOM visible before it is exhausted rather than only
+// after.
 //
 // A GAUGE, published on every tick including when nothing is unmeasured, so a stopped
 // collector is distinguishable from a fully measured registry. Attributes: none — the
 // question is how many, not which, and a subscriber label would put unbounded-cardinality
 // tenant identifiers on it.
 var SubscribersRegistered metric.Int64Gauge
+
+// SubscriberMeasurementBudget is how many subscribers one consumer-lag sweep may measure.
+//
+// # Why a configured limit is exported as telemetry
+//
+// The headroom an operator has to watch is budget minus registry size, and it goes negative
+// BEFORE any subscriber goes unmeasured — which is the point of watching it rather than waiting
+// for SubscribersUnmeasured to rise. Without this series that subtraction has no left-hand
+// operand, so the query had to name the DEFAULT as a literal:
+//
+//	200 - blnk_subscribers_registered
+//
+// That is wrong on every deployment that raised the budget, and wrong in the dangerous
+// direction: a deployment running a budget of 1000 reads a literal 200 and sees exhaustion
+// eight hundred subscribers early, so the number it is shown is not the number it configured.
+// A dashboard cannot know a value that was never exported, and the operator most likely to have
+// changed it is exactly the one the false reading misleads.
+//
+// So the CONFIGURED value is published, from the same call as the registry size and on every
+// tick, and the portable query is a difference of two series:
+//
+//	blnk_subscribers_measurement_budget - blnk_subscribers_registered
+//
+// A GAUGE rather than a counter, because it is a level that can be reconfigured, and
+// unattributed for the same reason as the row above: it is one number per process.
+var SubscriberMeasurementBudget metric.Int64Gauge
 
 // The closed vocabulary of SubscribersUnmeasured's "reason" attribute.
 //
@@ -1003,6 +1065,62 @@ func nonNegativeAge(now, at time.Time) float64 {
 // counting only pending rows would report a drained backlog at exactly the moment a stalled
 // relay is holding every claimable row under a lease.
 var OutboxPendingBacklog metric.Int64Gauge
+
+// The three REPAIR instruments (PERF-M06). Together they answer the only two questions worth
+// asking about a recovery in progress: how much is owed, and how fast it is being paid.
+//
+// # What "repair" means here, and why it is not the publish backlog
+//
+// Two populations of outbox row are outside the publish claim's reach by design and are reached
+// by their own passes each relay tick:
+//
+//   - leg="dead_letter" — a row whose retry budget is spent and whose `<topic>.dlt` write
+//     failed. It is the ONLY copy of an event that reached no topic at all.
+//   - leg="legacy_webhook" — a row whose Kafka leg finished and whose legacy webhook enqueue
+//     never succeeded. SUNSET: this leg goes with the dual-delivery branch.
+//
+// Both are empty in normal operation and fill during an OUTAGE, all at once, which is exactly
+// when nothing else in the exposition describes them: blnk.outbox.pending counts pending plus
+// processing and neither of these states is either, so a repair backlog of half a million rows
+// was previously invisible on every dashboard while the dead-letter age alert fired.
+//
+// # How to read them together
+//
+//	blnk_events_repair_backlog{leg="dead_letter"}                   -- rows still owed
+//	rate(blnk_events_repair_completed_total{leg="dead_letter"}[5m])  -- the DRAIN RATE, rows/sec
+//	backlog / drain rate                                            -- seconds to clear
+//
+// A non-zero backlog with a zero drain rate is the condition to act on: the pass is claiming
+// nothing or every write is failing. A non-zero backlog with a healthy drain rate and
+// blnk_events_repair_saturated at 1 is the other one: the per-tick bound is the binding
+// constraint, and RELAY_REPAIR_MAX_BATCHES_PER_TICK or RELAY_REPAIR_BATCH_SIZE is the knob.
+
+// EventRepairBacklog is how many rows each repair leg still owes.
+//
+// Published by the event-metrics collector from the per-status counts it ALREADY reads for
+// blnk.outbox.pending, so it costs no additional query: the dead-letter leg is the `failed`
+// count and the legacy leg is the `webhook_pending` count. Attributed by leg, and recorded
+// including zero — a cleared backlog must publish 0 rather than leave the previous reading
+// standing in the exporter.
+var EventRepairBacklog metric.Int64Gauge
+
+// EventRepairsCompletedTotal counts rows a repair pass actually repaired, attributed by leg.
+//
+// A COUNTER rather than a gauge because the operationally useful figure is its rate, and a rate
+// is what survives the collection interval being changed. Incremented once per row that reached
+// its destination — a dead letter preserved on its `<topic>.dlt` sibling, or a legacy webhook
+// enqueued — never on a claim and never on an attempt, so `rate()` is the drain rate and not
+// the attempt rate.
+var EventRepairsCompletedTotal metric.Int64Counter
+
+// EventRepairSaturated reports whether the per-tick chaining bound stopped a repair pass with
+// work still outstanding: 1 when the last tick used its whole budget, 0 when it drained.
+//
+// It exists because the backlog and the drain rate together cannot distinguish "recovering as
+// fast as configured" from "configured too slowly to recover": both read as a falling backlog.
+// This is the difference, and it is the signal that raising the repair capacity would help.
+// Attributed by leg, and recorded on every tick including the zeros.
+var EventRepairSaturated metric.Int64Gauge
 
 // EventsPurgedTotal counts event outbox rows DELETED by the retention sweep.
 //
@@ -1402,6 +1520,22 @@ func Init() error {
 		return err
 	}
 
+	SubscriberStreamRecordsDelivered, err = meter.Int64Counter("blnk.subscriber_stream.records.delivered",
+		metric.WithDescription("Records the subscriber stream gateway returned to a subscriber, by topic and whether the subscriber is key-scoped"),
+		metric.WithUnit("{record}"),
+	)
+	if err != nil {
+		return err
+	}
+
+	SubscriberStreamRecordsWithheld, err = meter.Int64Counter("blnk.subscriber_stream.records.withheld",
+		metric.WithDescription("Records the subscriber stream gateway excluded because the subscriber's partition-key prefix does not admit them, by topic and whether the subscriber is key-scoped"),
+		metric.WithUnit("{record}"),
+	)
+	if err != nil {
+		return err
+	}
+
 	DLTOldestMessageAgeSeconds, err = meter.Float64Gauge("blnk.dlt.oldest_message_age_seconds",
 		metric.WithDescription("Seconds the oldest unresolved dead-letter entry has been waiting, over rows in the failed or dead_lettered state, measured from the last publish attempt"),
 		metric.WithUnit("s"),
@@ -1483,6 +1617,30 @@ func Init() error {
 		return err
 	}
 
+	EventRepairBacklog, err = meter.Int64Gauge("blnk.events.repair.backlog",
+		metric.WithDescription("Event outbox rows a repair leg still owes, by leg"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return err
+	}
+
+	EventRepairsCompletedTotal, err = meter.Int64Counter("blnk.events.repair.completed.total",
+		metric.WithDescription("Event outbox rows repaired to their destination, by leg"),
+		metric.WithUnit("{event}"),
+	)
+	if err != nil {
+		return err
+	}
+
+	EventRepairSaturated, err = meter.Int64Gauge("blnk.events.repair.saturated",
+		metric.WithDescription("1 when a repair pass spent its whole per-tick budget with work outstanding, by leg"),
+		metric.WithUnit("{state}"),
+	)
+	if err != nil {
+		return err
+	}
+
 	EventsPurgedTotal, err = meter.Int64Counter("blnk.events.purged.total",
 		metric.WithDescription("Terminal event outbox rows deleted by the retention sweep"),
 		metric.WithUnit("{event}"),
@@ -1537,6 +1695,18 @@ func Init() error {
 		metric.WithDescription(
 			"Subscribers the registry holds, so the unmeasured count can be read as a proportion "+
 				"and the measurement budget's headroom is visible before it is exhausted",
+		),
+		metric.WithUnit("{subscriber}"),
+	)
+	if err != nil {
+		return err
+	}
+
+	SubscriberMeasurementBudget, err = meter.Int64Gauge("blnk.subscribers.measurement_budget",
+		metric.WithDescription(
+			"Subscribers one consumer-lag sweep may measure, as configured, so headroom is a "+
+				"difference of two series rather than a literal that is wrong wherever the "+
+				"budget was raised",
 		),
 		metric.WithUnit("{subscriber}"),
 	)

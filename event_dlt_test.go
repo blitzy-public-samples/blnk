@@ -346,6 +346,18 @@ type dltReleaseRecord struct {
 	id         int64
 	claimToken string
 	replayErr  string
+
+	// contextErr is what the context reported at the moment the release was entered. It is
+	// what proves the release did not inherit the caller's cancellation: the service runs it
+	// on context.WithoutCancel, so this must be nil even when the caller's context is dead.
+	contextErr error
+
+	// hasDeadline and deadline record the bound the release was given. Detachment alone is
+	// not enough — a rollback on a context that can never expire would hold a request open
+	// against a database that has gone away — so the service bounds it, and that bound is
+	// asserted here rather than assumed.
+	hasDeadline bool
+	deadline    time.Time
 }
 
 // dltFakeStore must satisfy the seam it stands in for, and must fail the build here if
@@ -493,38 +505,23 @@ func (s *dltFakeStore) CountDeadLetteredEvents(_ context.Context, query model.De
 // inclusive at both ends, so a window whose bounds are equal selects the events at exactly
 // that instant.
 func (s *dltFakeStore) matchingLocked(query model.DeadLetterQuery) []model.EventOutbox {
-	eventType := strings.TrimSpace(query.EventType)
-	topic := strings.TrimSpace(query.Topic)
-	status := strings.TrimSpace(query.Status)
-
 	matching := make([]model.EventOutbox, 0, len(s.inventory))
 	for _, eventID := range s.inventory {
 		row := *s.rows[eventID]
-
-		if eventType != "" && row.EventType != eventType {
-			continue
+		if dltInventoryMatches(row, query) {
+			matching = append(matching, row)
 		}
-		if topic != "" && row.Topic != topic {
-			continue
-		}
-		if status != "" && row.Status != status {
-			continue
-		}
-		if !query.OccurredFrom.IsZero() && row.OccurredAt.Before(query.OccurredFrom) {
-			continue
-		}
-		if !query.OccurredTo.IsZero() && row.OccurredAt.After(query.OccurredTo) {
-			continue
-		}
-
-		matching = append(matching, row)
 	}
 
 	return matching
 }
 
-// CountEventOutboxByStatus returns a copy of the status counts.
-func (s *dltFakeStore) CountEventOutboxByStatus(_ context.Context, _ time.Time) (map[string]int64, error) {
+// CountUnresolvedEventOutbox returns a copy of the status counts.
+//
+// It takes no window, matching the aggregate the dead-letter seam now declares (PERF-M05): the
+// `failed` count this service reads is exact and complete for all time, and the dispatched
+// history the previous windowed aggregate also counted was read by nobody.
+func (s *dltFakeStore) CountUnresolvedEventOutbox(_ context.Context) (map[string]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -699,13 +696,38 @@ func (s *dltFakeStore) ClaimEventForReplay(
 }
 
 // ReleaseEventReplay is the rollback: replaying -> dead_lettered, recording the reason.
-func (s *dltFakeStore) ReleaseEventReplay(_ context.Context, id int64, claimToken, replayErr string) error {
+//
+// # It OBSERVES the context, and that is not incidental
+//
+// The release runs on a context the service DETACHES from the caller's cancellation and bounds
+// with its own timeout, because the commonest way a replay fails is the caller going away —
+// a closed browser tab, a proxy timeout, a deploy taking the process down mid-replay. Run on
+// the caller's context instead, the rollback fails for exactly the reason the replay did, every
+// time, and the row is left in `replaying` holding a token nobody has.
+//
+// A fake that ignored the context could not tell those two implementations apart: both call
+// this method with the same arguments and both record the same release. So this one behaves
+// like the database — it REFUSES a cancelled context — and records the deadline it was given,
+// which is what lets a test assert the detachment rather than trust it.
+func (s *dltFakeStore) ReleaseEventReplay(ctx context.Context, id int64, claimToken, replayErr string) error {
+	deadline, hasDeadline := ctx.Deadline()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.replayRelease = append(s.replayRelease, dltReleaseRecord{
 		id: id, claimToken: claimToken, replayErr: replayErr,
+		contextErr:  ctx.Err(),
+		hasDeadline: hasDeadline,
+		deadline:    deadline,
 	})
+
+	// A REAL DATABASE CALL FAILS ON A DEAD CONTEXT, so this one does too. lib/pq checks the
+	// context before it writes and cancels the statement if it is already done, so a release
+	// handed a cancelled context does not perform the update — it returns the cancellation.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if s.releaseReplayErr != nil {
 		return s.releaseReplayErr
@@ -801,16 +823,6 @@ func (s *dltFakeStore) snapshotDispatchedIDs() []int64 {
 	return ids
 }
 
-// dltFilterMatches was a free-function matcher for a dead-letter narrowing. It is RETIRED,
-// and with it goes a claim of SQL fidelity it no longer had.
-//
-// deadLetterFilterClause applies two things this did not: it TRIMS the status, event-type and
-// topic predicates, and it constrains the population to status IN (dead_lettered, failed) when
-// no status is named rather than admitting every status. Two matchers on this store carry those
-// properties and are both reachable — matchingLocked for the full-row listing and its count, and
-// dltInventoryMatches for the narrow inventory projection. A third matcher agreeing with neither
-// is worse than none: it lets a test assert over a set the statement would not return.
-//
 // snapshotDeadLetterCounts returns the narrowing every CountDeadLetteredEvents call was
 // given, oldest first, so a test can assert the total was counted over the SAME predicate
 // the page was drawn with.
@@ -977,6 +989,12 @@ type dltFakePublisher struct {
 	err error
 	// closes counts Close calls, so publisher ownership can be asserted.
 	closes int
+
+	// onPublish runs before the request is recorded, for a test that needs something to happen
+	// at the one instant the row is claimed and the replay is not yet over. Cancelling the
+	// caller's context from here is the only way to reach the rollback path with a dead caller,
+	// which is the state that path exists for.
+	onPublish func()
 }
 
 var _ TopicEventPublisher = (*dltFakePublisher)(nil)
@@ -991,6 +1009,16 @@ func (p *dltFakePublisher) Publish(ctx context.Context, event model.LedgerEvent)
 
 // PublishToTopic records the request and reports a result shaped like the real one.
 func (p *dltFakePublisher) PublishToTopic(_ context.Context, req PublishRequest) (PublishResult, error) {
+	p.mu.Lock()
+	hook := p.onPublish
+	p.mu.Unlock()
+
+	// Run OUTSIDE the lock: the hook exists to disturb the world mid-replay, and a hook that
+	// needed this publisher would otherwise deadlock against it.
+	if hook != nil {
+		hook()
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1160,10 +1188,14 @@ func (g *dltRecordedFloatGauge) count() int {
 }
 
 // dltAttributeMap flattens recorded attributes to a comparable map.
+//
+// Value.String rather than the deprecated Value.Emit. The two agree exactly for the
+// string, int64 and bool attributes this pipeline records, and String is the accessor
+// the attribute package documents from v1.44.0 onwards.
 func dltAttributeMap(pairs []attribute.KeyValue) map[string]string {
 	attributes := make(map[string]string, len(pairs))
 	for _, pair := range pairs {
-		attributes[string(pair.Key)] = pair.Value.Emit()
+		attributes[string(pair.Key)] = pair.Value.String()
 	}
 
 	return attributes
@@ -1732,7 +1764,11 @@ func TestDeadLetterRouting_NeverSpendsAnotherAttemptOnTheRow(t *testing.T) {
 		"ListAndCountDeadLetterInventory",
 		"CountDeadLetteredEvents",
 		"CountDeadLetterInventory",
-		"CountEventOutboxByStatus",
+		// The UNRESOLVED aggregate, not the windowed one (PERF-M05). This service reads only
+		// the `failed` count, which the unresolved reading gives exactly and for all time,
+		// and the windowed reading additionally counted a day of dispatched history — 43.2
+		// million index entries at the target rate — that nothing here looked at.
+		"CountUnresolvedEventOutbox",
 		"MarkEventDeadLettered",
 		"MarkEventDispatched",
 		"ClaimEventForReplay",
@@ -3578,8 +3614,141 @@ func TestDeadLetterAgeGauge_FallsBackToZeroWhenTheInventoryDrains(t *testing.T) 
 	})
 }
 
+// TestReplayDeadLetteredEvent_TwoSimultaneousReplaysProduceExactlyOnePublish is the STATE-01
+// proof under genuine concurrency.
+//
+// # Why the sequential test below is not this test
+//
+// TestReplayDeadLetteredEvent_ClaimsTheRowSoConcurrentReplaysCannotBothPublish runs its two
+// replays one after the other, and what it establishes is that a row the first replay has
+// ALREADY moved cannot be claimed again. That is a real property and it is not this one. It
+// holds under an implementation with no atomicity at all — read the row, check the status in
+// Go, publish — because by the time the second request runs, the first has finished and the
+// stored status has changed. Two requests that arrive TOGETHER are the case that
+// implementation breaks on: both read `dead_lettered`, both pass the check, and both publish.
+//
+// The duplicate that produces is byte-identical, because a replay republishes the stored
+// bytes, so a subscriber deduplicating on event_id discards one. That is not a defence. It
+// occupies a partition slot, it inflates every offset-based reconciliation, and leaning on
+// consumer behaviour to cover a publishing-side defect is the opposite of a guarantee.
+//
+// # The arrangement
+//
+// Both requests are released from one barrier, and the WINNER IS PARKED inside the publisher —
+// it blocks there, holding the claim, until the loser has been refused. So the loser makes its
+// attempt at the moment the row is `replaying` and the first publish has not completed, which
+// is precisely the window a read-check-publish implementation is wrong in. Exactly one publish
+// must reach the writer, the loser must get a typed conflict, and only the winner may record a
+// terminal state.
+func TestReplayDeadLetteredEvent_TwoSimultaneousReplaysProduceExactlyOnePublish(t *testing.T) {
+	fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
+	fixture.store.nextClaimToken = "the-only-valid-token"
+
+	// parked is closed once the loser has been refused, which is what releases the winner from
+	// the publisher. loserSettled is how the publisher learns that happened.
+	loserSettled := make(chan struct{})
+	// Closed on cleanup as well, so a failure before the loser finishes cannot hang the test in
+	// the publisher for the package's whole timeout.
+	t.Cleanup(func() {
+		select {
+		case <-loserSettled:
+		default:
+			close(loserSettled)
+		}
+	})
+
+	fixture.publisher.onPublish = func() {
+		// The winner arrives here holding the claim. Waiting means the loser's claim attempt is
+		// made while the row is `replaying` and this publish is still outstanding — the exact
+		// interleaving a non-atomic check cannot survive.
+		select {
+		case <-loserSettled:
+		case <-time.After(10 * time.Second):
+			t.Error("the losing replay never settled; the winner waited in the publisher and the " +
+				"claim contest did not resolve")
+		}
+	}
+
+	type attempt struct {
+		result ReplayOutcome
+		err    error
+	}
+	attempts := make([]attempt, 2)
+
+	release := make(chan struct{})
+	ready := make(chan struct{}, len(attempts))
+
+	var finished sync.WaitGroup
+	for i := range attempts {
+		finished.Add(1)
+		go func(i int) {
+			defer finished.Done()
+
+			ready <- struct{}{}
+			<-release
+
+			attempts[i].result, attempts[i].err =
+				fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
+
+			// The FIRST goroutine to return is the loser: the winner is parked in the publisher
+			// until this fires. Closing here rather than after Wait is what makes the park
+			// resolvable at all.
+			select {
+			case <-loserSettled:
+			default:
+				close(loserSettled)
+			}
+		}(i)
+	}
+
+	for range attempts {
+		<-ready
+	}
+	close(release)
+	finished.Wait()
+
+	var winners, conflicts int
+	for i, result := range attempts {
+		if result.err == nil {
+			winners++
+			assert.Truef(t, result.result.Recorded,
+				"attempt %d succeeded and must report the replay as recorded", i)
+
+			continue
+		}
+
+		conflicts++
+		dltAssertCodeAndStatus(t, result.err, apierror.ErrEventNotDeadLettered, http.StatusConflict)
+	}
+
+	require.Equalf(t, 1, winners,
+		"EXACTLY ONE of two simultaneous replays may succeed; %d did. Two winners means the "+
+			"dead-lettered precondition is checked outside the transition, and one stuck event "+
+			"becomes two records on the topic", winners)
+	require.Equal(t, 1, conflicts,
+		"the loser must be refused with a typed conflict rather than a generic failure: an "+
+			"operator retrying a replay needs to know the row was taken, not that something broke")
+
+	assert.Lenf(t, fixture.store.snapshotReplayClaims(), 2,
+		"BOTH requests must have ATTEMPTED the claim. If only one did, the contest never happened "+
+			"and this test proves nothing")
+	assert.Lenf(t, fixture.publisher.snapshotRequests(), 1,
+		"only the request that WON the claim may publish. This is the assertion that fails when "+
+			"the precondition is a separate read: both requests pass the check and both publish")
+
+	dispatched := fixture.store.snapshotDispatched()
+	require.Len(t, dispatched, 1, "only the winning request may record a terminal state")
+	assert.Equal(t, "the-only-valid-token", dispatched[0].claimToken,
+		"the winner must present the token ITS claim issued, or the conditional update is not "+
+			"conditional on anything")
+
+	assert.Empty(t, fixture.store.snapshotReplayReleases(),
+		"a successful replay reaches dispatched; the loser never held a claim, so nothing may be "+
+			"released back to dead_lettered")
+}
+
 // TestReplayDeadLetteredEvent_ClaimsTheRowSoConcurrentReplaysCannotBothPublish is the
-// STATE-01 proof on the replay path.
+// SEQUENTIAL half of the STATE-01 proof on the replay path.
 //
 // # The defect this guards against
 //
@@ -3592,12 +3761,16 @@ func TestDeadLetterAgeGauge_FallsBackToZeroWhenTheInventoryDrains(t *testing.T) 
 // duplicate is real, it occupies a partition slot, and leaning on consumer behaviour to
 // paper over a publishing-side defect is not a guarantee.
 //
-// # What is asserted
+// # What is asserted, and what is NOT
 //
-// The precondition now lives INSIDE the transition. Exactly one of two sequential replays
-// claims the row, so exactly one publishes; the second is refused before reaching the
-// publisher. The claim is asserted to have been attempted twice — proving the second
-// request really did try — while the publisher saw one message.
+// The precondition lives INSIDE the transition, so a row a previous replay has already moved
+// cannot be claimed again: exactly one of two SEQUENTIAL replays claims the row, and the second
+// is refused before reaching the publisher. The claim is asserted to have been attempted twice —
+// proving the second request really did try — while the publisher saw one message.
+//
+// This says nothing about two requests arriving together, which is the harder case and the one
+// a non-atomic check actually fails.
+// TestReplayDeadLetteredEvent_TwoSimultaneousReplaysProduceExactlyOnePublish covers it.
 func TestReplayDeadLetteredEvent_ClaimsTheRowSoConcurrentReplaysCannotBothPublish(t *testing.T) {
 	fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
 	fixture.store.nextClaimToken = "the-only-valid-token"
@@ -3681,6 +3854,131 @@ func TestReplayDeadLetteredEvent_ReleasesTheClaimWhenTheReplayFails(t *testing.T
 		assert.Equal(t, model.EventOutboxStatusDeadLettered,
 			fixture.store.row(t, fixture.row.EventID).Status)
 	})
+}
+
+// TestReplayDeadLetteredEvent_ReleasesTheClaimEvenWhenTheCallerHasAlreadyGoneAway is the
+// property releaseReplayClaim's detached context exists for, and the one the release tests
+// above cannot reach.
+//
+// # Why the other release tests do not establish it
+//
+// TestReplayDeadLetteredEvent_ReleasesTheClaimWhenTheReplayFails proves the release HAPPENS on
+// both failure shapes. It runs on context.Background(), which is never cancelled, so it holds
+// identically whether the release inherits the caller's cancellation or not — and inheritance is
+// exactly the defect. The commonest way a replay fails is the caller going away: an operator
+// closing the tab, a proxy timing the request out, a rolling deploy taking the process down
+// mid-replay. On the caller's context the rollback then fails for precisely the reason the replay
+// did, every single time, and the row is left in `replaying` holding a token nobody has —
+// invisible to the relay's claimable set AND to the dead-letter inventory.
+//
+// # The arrangement
+//
+// The caller's context is cancelled from inside the publisher, which is the one instant at which
+// the row is claimed and the replay is not yet over. Then the publish fails. Everything after
+// that point runs with a dead caller, so a release that inherited the cancellation could not
+// perform its update at all — and the fake store refuses a dead context exactly as lib/pq does,
+// so an inherited cancellation is a failed release rather than a silently passing one.
+//
+// What is required: the release ran, it saw a LIVE context, that context was BOUNDED, the row is
+// dead-lettered again with the reason recorded, and it is replayable.
+func TestReplayDeadLetteredEvent_ReleasesTheClaimEvenWhenTheCallerHasAlreadyGoneAway(t *testing.T) {
+	failures := []struct {
+		name string
+		// arrange programs the failure shape, and returns the substring the recorded reason
+		// must carry.
+		arrange func(fixture *dltReplayFixture) string
+		// publishes is how many publish attempts the shape produces, which distinguishes
+		// "the publish failed" from "the publish succeeded and the bookkeeping failed".
+		publishes int
+	}{
+		{
+			name: "the publish fails after the caller is gone",
+			arrange: func(fixture *dltReplayFixture) string {
+				fixture.publisher.err = errors.New("broker refused the replay")
+
+				return "broker refused the replay"
+			},
+			publishes: 1,
+		},
+		{
+			name: "the bookkeeping fails after the caller is gone",
+			arrange: func(fixture *dltReplayFixture) string {
+				fixture.store.markDispatchedErr = errors.New("connection reset")
+
+				return "connection reset"
+			},
+			publishes: 1,
+		},
+	}
+
+	for _, failure := range failures {
+		t.Run(failure.name, func(t *testing.T) {
+			fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
+			fixture.store.nextClaimToken = "claim-held-by-a-gone-caller"
+			wantReason := failure.arrange(fixture)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			// CANCELLED FROM INSIDE THE PUBLISH: the row is claimed, the replay is under way,
+			// and from here on every context derived from the caller's is dead.
+			fixture.publisher.onPublish = cancel
+
+			_, err := fixture.service.ReplayDeadLetteredEvent(ctx, fixture.row.EventID)
+			require.Error(t, err, "a replay that did not complete must report a failure")
+
+			require.Equal(t, failure.publishes, len(fixture.publisher.snapshotRequests()),
+				"the publish must have been attempted; cancelling before it would test a different path")
+			require.Errorf(t, ctx.Err(),
+				"the caller's context must be dead by the time the rollback runs, or this test is "+
+					"the same as the one that runs on context.Background()")
+
+			releases := fixture.store.snapshotReplayReleases()
+			require.Lenf(t, releases, 1,
+				"the claim MUST be released even though the caller is gone. Zero releases means the "+
+					"rollback ran on the caller's context and died with it, leaving the row in "+
+					"`replaying` with a token nobody holds — outside the relay's claimable set and "+
+					"outside the dead-letter inventory")
+
+			release := releases[0]
+			assert.NoErrorf(t, release.contextErr,
+				"the release must run on a context DETACHED from the caller's cancellation. It saw "+
+					"%v, which is the caller's own cancellation inherited — the failure mode that "+
+					"makes the most likely replay failure the least recoverable", release.contextErr)
+			assert.Truef(t, release.hasDeadline,
+				"the detached context must still be BOUNDED. Detaching without a bound would hold "+
+					"the rollback open indefinitely against a database that has gone away, on work "+
+					"the claim's own lease recovery already covers")
+			if release.hasDeadline {
+				assert.WithinDurationf(t, time.Now().Add(replayReleaseTimeout), release.deadline,
+					2*time.Second,
+					"the bound must be replayReleaseTimeout (%s); a much longer one is an unbounded "+
+						"rollback in disguise", replayReleaseTimeout)
+			}
+
+			assert.Equal(t, fixture.row.ID, release.id)
+			assert.Equal(t, "claim-held-by-a-gone-caller", release.claimToken,
+				"the release must present the token the claim issued, or the conditional update "+
+					"matches nothing")
+			assert.Containsf(t, release.replayErr, wantReason,
+				"the reason must be recorded, so the next operator sees why THIS attempt failed "+
+					"rather than only the original publish failure")
+
+			assert.Equal(t, model.EventOutboxStatusDeadLettered,
+				fixture.store.row(t, fixture.row.EventID).Status,
+				"the row must be dead-lettered again, which is what keeps it replayable and visible")
+
+			// AND IT REALLY IS REPLAYABLE, on a fresh caller. Anything less means the cancellation
+			// cost the event its replayability, which is the outcome the release exists to prevent.
+			fixture.publisher.err = nil
+			fixture.publisher.onPublish = nil
+			fixture.store.markDispatchedErr = nil
+			_, retryErr := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
+			require.NoError(t, retryErr,
+				"a released row must be replayable by the next request; a cancelled caller must not "+
+					"cost the event its replayability")
+		})
+	}
 }
 
 // TestDeadLetterAgeGauge_ReducesToTheMaximumRatherThanTheLastRowSeen closes the one gap the
@@ -4318,39 +4616,59 @@ func TestListAndCountDeadLetterEvents_ReportsAMissingDatasource(t *testing.T) {
 	dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
 }
 
-// TestCountDeadLetterEvents_CountsTheSameNarrowingAsThePage is what makes an exact total
-// available for a filtered page at all.
+// ---------------------------------------------------------------------------------------
+// The dead-letter count, stated ONCE
+// ---------------------------------------------------------------------------------------
+
+// TestCountDeadLetterEvents_CountsTheSameSetThePageIsDrawnFrom is the whole count contract, in
+// one place.
 //
-// The total used to come from a whole-table per-status aggregate that knew nothing about the
-// event-type or topic filter, so the endpoint refused include_count for those filters
-// outright. A total computed over a different predicate than the page is worse than no
-// total: a client pages until it has seen total_count rows and either loops forever or stops
-// early, and nothing in either response says which happened.
+// # Why this suite is one suite
 //
-// The page is deliberately ignored, because the total is a property of the filter and not of
-// the window into it. Honouring Limit would make total_count never exceed the page size,
-// which is exactly the number a caller asks for it in order not to have to guess.
-func TestCountDeadLetterEvents_CountsTheSameNarrowingAsThePage(t *testing.T) {
+// It replaces FOUR test functions that asserted the same contract over four different fixture
+// sets — CountsTheFilteredSet, CountsTheSameNarrowingAsThePage, CountsTheSameSetTheListingReturns
+// and IsAboutTheSamePopulationAsThePage — plus two more that overlapped on the refusals. Between
+// them they ran the same six narrowings four times, re-derived "the page does not affect the
+// total" three times, and asserted the shared-predicate property in three slightly different
+// ways. That is not additional coverage. It is one contract with four owners, and the cost is
+// paid on every change: a seventh narrowing has to be added in four places, and the reader who
+// finds only three of them cannot tell whether the fourth is a deliberate exception.
+//
+// Everything the four asserted is asserted here, and each property exactly once:
+//
+//   - The count answers each filter dimension, their combination, and zero for a narrowing that
+//     matches nothing.
+//   - The count agrees with the page it accompanies when the page can hold every match.
+//   - LIMIT and OFFSET have no bearing on it, because a count is of the SET.
+//   - The narrowing reaches the repository, TRIMMED, as one query per request.
+//   - The count and the listing narrow by the same predicate — compared field by field, with the
+//     page bounds zeroed, because the page a listing asks for is legitimately not the page a
+//     count asks for.
+func TestCountDeadLetterEvents_CountsTheSameSetThePageIsDrawnFrom(t *testing.T) {
 	dltPinTopicPrefix(t)
 
+	// ONE fixture set, chosen so every dimension distinguishes something and no two narrowings
+	// select the same rows: two event types on one topic, a third on another, and both terminal
+	// failure states represented — `failed` included because it is the entry an operator most
+	// needs to see, its retry budget spent while its dead-letter write has not landed.
 	applied := dltAgedRow(t, "evt_count_applied", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute)
 	void := dltAgedRow(t, "evt_count_void", "transaction.void", "blnk.transactions",
 		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 2*time.Minute)
-	appliedAgain := dltAgedRow(t, "evt_count_applied_again", "transaction.applied", "blnk.transactions",
+	appliedFailed := dltAgedRow(t, "evt_count_applied_failed", "transaction.applied", "blnk.transactions",
 		model.EventOutboxStatusFailed, "", 3*time.Minute)
-	balance := dltAgedRow(t, "evt_count_balance", "balance.created", "blnk.balances",
+	balance := dltAgedRow(t, "evt_count_balance", "balance.monitor", "blnk.balances",
 		model.EventOutboxStatusDeadLettered, "blnk.balances.dlt", 4*time.Minute)
 
-	store := newDltFakeStore().withRow(applied).withRow(void).withRow(appliedAgain).withRow(balance)
+	store := newDltFakeStore().withRow(applied).withRow(void).withRow(appliedFailed).withRow(balance)
 	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
 
-	for _, tc := range []struct {
-		name  string
-		given DeadLetterListOptions
-		want  int64
+	narrowings := []struct {
+		name    string
+		options DeadLetterListOptions
+		total   int64
 	}{
-		{"unfiltered counts the whole inventory", DeadLetterListOptions{}, 4},
+		{"unfiltered counts both terminal states", DeadLetterListOptions{}, 4},
 		{"by event type", DeadLetterListOptions{EventType: "transaction.applied"}, 2},
 		{"by topic", DeadLetterListOptions{Topic: "blnk.transactions"}, 3},
 		{"by status", DeadLetterListOptions{Status: model.EventOutboxStatusFailed}, 1},
@@ -4362,61 +4680,162 @@ func TestCountDeadLetterEvents_CountsTheSameNarrowingAsThePage(t *testing.T) {
 			},
 			1,
 		},
-		{"a narrowing that matches nothing counts zero", DeadLetterListOptions{EventType: "identity.created"}, 0},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			total, err := service.CountDeadLetterEvents(context.Background(), tc.given)
+		{
+			"a combination nothing matches counts zero rather than failing",
+			DeadLetterListOptions{EventType: "transaction.applied", Topic: "blnk.balances"},
+			0,
+		},
+		{"an event type outside the inventory counts zero", DeadLetterListOptions{EventType: "ledger.created"}, 0},
+	}
+
+	for _, narrowing := range narrowings {
+		t.Run(narrowing.name, func(t *testing.T) {
+			total, err := service.CountDeadLetterEvents(context.Background(), narrowing.options)
 			require.NoError(t, err)
-			assert.Equal(t, tc.want, total)
+			assert.Equal(t, narrowing.total, total)
+
+			// THE COUNT AND THE PAGE DESCRIBE ONE SET. Asserting the listing's length against
+			// the total, for a page large enough to hold every match, is what makes that
+			// agreement observable rather than assumed: a total that disagrees with the page it
+			// accompanies makes a paging client stop early or loop for ever.
+			page, listErr := service.ListDeadLetterEvents(context.Background(), narrowing.options)
+			require.NoError(t, listErr)
+			assert.Len(t, page.Entries, int(narrowing.total),
+				"the page and its total must describe the same population")
+
+			// AND THE PAGE HAS NO BEARING ON THE TOTAL. A caller reading page two of a backlog
+			// still needs its full size.
+			paged := narrowing.options
+			paged.Limit, paged.Offset = 2, 3
+			pagedTotal, pagedErr := service.CountDeadLetterEvents(context.Background(), paged)
+			require.NoError(t, pagedErr)
+			assert.Equal(t, narrowing.total, pagedTotal,
+				"LIMIT and OFFSET select WHICH matches to return and have no bearing on how many "+
+					"there are")
 		})
 	}
 
-	t.Run("the count is over the same predicate the page was drawn with", func(t *testing.T) {
-		narrowing := DeadLetterListOptions{EventType: "transaction.applied", Limit: 1}
+	t.Run("the narrowing reaches the repository, trimmed, as one query", func(t *testing.T) {
+		counting := newDltFakeStore()
+		countingService := dltNewService(counting, &dltFakePublisher{}, &dltFakeTransport{})
 
-		page, err := service.ListDeadLetterEvents(context.Background(), narrowing)
+		_, err := countingService.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{
+			EventType: " transaction.applied ",
+			Topic:     " blnk.transactions ",
+			Status:    model.EventOutboxStatusDeadLettered,
+		})
+		require.NoError(t, err)
+
+		counted := counting.snapshotDeadLetterCounts()
+		require.Len(t, counted, 1, "one count request must be one repository query")
+		assert.Equal(t, "transaction.applied", counted[0].EventType,
+			"the predicate must arrive trimmed: a padded value narrows to nothing in SQL")
+		assert.Equal(t, "blnk.transactions", counted[0].Topic)
+		assert.Equal(t, model.EventOutboxStatusDeadLettered, counted[0].Status)
+	})
+
+	t.Run("the count and the listing narrow by exactly the same predicate", func(t *testing.T) {
+		fresh := newDltFakeStore().withRow(applied).withRow(void).withRow(appliedFailed)
+		sharing := dltNewService(fresh, &dltFakePublisher{}, &dltFakeTransport{})
+
+		// A page deliberately SMALLER than the match set, so a count that echoed the page rather
+		// than the predicate would answer 1 instead of 2.
+		options := DeadLetterListOptions{
+			EventType: "transaction.applied",
+			Topic:     "blnk.transactions",
+			Limit:     1,
+		}
+
+		page, err := sharing.ListDeadLetterEvents(context.Background(), options)
 		require.NoError(t, err)
 		require.Len(t, page.Entries, 1, "the page is deliberately smaller than the match set")
 
-		total, err := service.CountDeadLetterEvents(context.Background(), narrowing)
+		total, err := sharing.CountDeadLetterEvents(context.Background(), options)
 		require.NoError(t, err)
 		assert.Equal(t, int64(2), total,
 			"the total must describe the FILTERED set and not the page, or a paging client cannot "+
 				"know when to stop")
 
-		queries := store.snapshotCountQueries()
-		require.NotEmpty(t, queries)
-		last := queries[len(queries)-1]
-		assert.Equal(t, "transaction.applied", last.EventType,
-			"the count must carry the page's own narrowing")
+		listQueries := fresh.snapshotInventoryQueries()
+		countQueries := fresh.snapshotDeadLetterCounts()
+		require.Len(t, listQueries, 1)
+		require.Len(t, countQueries, 1)
+
+		// Compared on the NARROWING alone, with the bounds zeroed: the page a listing asks for is
+		// legitimately not the page a count asks for, and it is the predicate that has to be
+		// identical. Two independently assembled predicates would let a total describe a
+		// population the page was not drawn from.
+		listed, counted := listQueries[0], countQueries[0]
+		listed.Limit, listed.Offset = 0, 0
+		counted.Limit, counted.Offset = 0, 0
+		assert.Equal(t, listed, counted,
+			"an operator must not page through one set while being told the size of another")
+	})
+}
+
+// TestCountDeadLetterEvents_RefusesAndPropagatesExactlyAsTheListingDoes is the count's failure
+// contract, also in one place.
+//
+// It replaces the refusal halves of the four consolidated suites plus two dedicated ones. The
+// property being defended throughout is that the count NEVER answers zero for a question it
+// could not answer: zero is a real and reassuring number — "the backlog is empty" — so returning
+// it for a rejected filter, a database outage or an uninitialised service would report a healthy
+// dead-letter inventory in exactly the situations where nobody knows what the inventory holds.
+func TestCountDeadLetterEvents_RefusesAndPropagatesExactlyAsTheListingDoes(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	t.Run("an unsupported status filter is refused before the repository is touched", func(t *testing.T) {
+		store := newDltFakeStore().withRow(dltAgedRow(t, "evt_status_guard", "transaction.applied",
+			"blnk.transactions", model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute))
+		service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
+
+		for _, status := range []string{
+			model.EventOutboxStatusPending,
+			model.EventOutboxStatusProcessing,
+			model.EventOutboxStatusDispatched,
+			"nonsense",
+		} {
+			options := DeadLetterListOptions{Status: status}
+
+			// THE LISTING AND THE COUNT MUST REFUSE THE SAME THING. A count that accepted a
+			// filter the listing rejects would report a number for a set the caller can never
+			// page through.
+			_, listErr := service.ListDeadLetterEvents(context.Background(), options)
+			require.Errorf(t, listErr, "%q is not a terminal failure state and is not a filter", status)
+			assert.Equal(t, apierror.ErrGenValidation, dltAPIError(t, listErr).Code)
+
+			total, countErr := service.CountDeadLetterEvents(context.Background(), options)
+			dltAssertCodeAndStatus(t, countErr, apierror.ErrGenValidation, http.StatusBadRequest)
+			assert.Zerof(t, total, "a refused count must not also report a number")
+		}
+
+		assert.Empty(t, store.snapshotDeadLetterCounts(),
+			"a rejected filter must never reach the database")
+		assert.Empty(t, store.snapshotCountQueries())
 	})
 
-	t.Run("an unusable status filter is refused before the repository is reached", func(t *testing.T) {
-		fresh := newDltFakeStore()
-		strict := dltNewService(fresh, &dltFakePublisher{}, &dltFakeTransport{})
-
-		_, err := strict.CountDeadLetterEvents(
-			context.Background(), DeadLetterListOptions{Status: model.EventOutboxStatusDispatched},
-		)
-		dltAssertCodeAndStatus(t, err, apierror.ErrGenValidation, http.StatusBadRequest)
-		assert.Empty(t, fresh.snapshotCountQueries())
-	})
-
-	t.Run("the repository's own failure is propagated unchanged", func(t *testing.T) {
+	t.Run("the repository's own failure is propagated, not reported as zero", func(t *testing.T) {
 		failing := newDltFakeStore()
 		failing.countDeadLetterErr = apierror.NewAPIError(
-			apierror.ErrInternalServer, "Failed to count dead-lettered events", errors.New("dial tcp: refused"),
+			apierror.ErrInternalServer, "Failed to count dead-lettered events",
+			errors.New("dial tcp: refused"),
 		)
-		failingService := dltNewService(failing, &dltFakePublisher{}, &dltFakeTransport{})
+		service := dltNewService(failing, &dltFakePublisher{}, &dltFakeTransport{})
 
-		_, err := failingService.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
+		total, err := service.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
+		assert.Zero(t, total)
 		dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
 	})
 
-	t.Run("a service with no datasource reports it rather than panicking", func(t *testing.T) {
+	t.Run("a service with no datasource refuses rather than answering zero", func(t *testing.T) {
 		_, err := NewEventDeadLetterService(nil, nil).
 			CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
 		dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
+
+		// And a nil receiver, which is what a caller holding an unconstructed service has.
+		var nilService *EventDeadLetterService
+		_, nilErr := nilService.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
+		dltAssertCodeAndStatus(t, nilErr, apierror.ErrInternalServer, http.StatusInternalServerError)
 	})
 }
 
@@ -4525,92 +4944,6 @@ func TestListDeadLetterEvents_NoLongerTruncatesALargeFilteredInventory(t *testin
 	assert.Equal(t, int64(1), total,
 		"and the total must agree with the page, which is the completeness check the "+
 			"truncated walk defeated")
-}
-
-// TestCountDeadLetterEvents_IsAboutTheSamePopulationAsThePage pins the other half of SEC-09:
-// a page an operator can check.
-//
-// include_count used to be REFUSED alongside an event_type or topic filter, because no
-// filter-aware count existed at any layer. The refusal was honest and it was also the reason
-// the truncation went unnoticed — with no total, a short page could not be recognised as short.
-func TestCountDeadLetterEvents_IsAboutTheSamePopulationAsThePage(t *testing.T) {
-	dltPinTopicPrefix(t)
-
-	applied := dltAgedRow(t, "evt_count_applied", "transaction.applied", "blnk.transactions",
-		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute)
-	appliedAgain := dltAgedRow(t, "evt_count_applied_2", "transaction.applied", "blnk.transactions",
-		model.EventOutboxStatusFailed, "", 2*time.Minute)
-	balance := dltAgedRow(t, "evt_count_balance", "balance.monitor", "blnk.balances",
-		model.EventOutboxStatusDeadLettered, "blnk.balances.dlt", 3*time.Minute)
-
-	store := newDltFakeStore().withRow(applied).withRow(appliedAgain).withRow(balance)
-	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
-
-	cases := []struct {
-		name  string
-		opts  DeadLetterListOptions
-		total int64
-	}{
-		{"unfiltered counts the whole inventory", DeadLetterListOptions{}, 3},
-		{"by event type", DeadLetterListOptions{EventType: "transaction.applied"}, 2},
-		{"by topic", DeadLetterListOptions{Topic: "blnk.transactions"}, 2},
-		{"by status", DeadLetterListOptions{Status: model.EventOutboxStatusFailed}, 1},
-		{
-			"filters combine",
-			DeadLetterListOptions{EventType: "transaction.applied", Status: model.EventOutboxStatusDeadLettered},
-			1,
-		},
-		{"a filter matching nothing counts zero", DeadLetterListOptions{EventType: "ledger.created"}, 0},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			total, err := service.CountDeadLetterEvents(context.Background(), tc.opts)
-			require.NoError(t, err)
-			assert.Equal(t, tc.total, total)
-
-			// The paging fields must not reach the count: a total is a property of the
-			// FILTER, and one that shrank with the page size would be useless for exactly
-			// the comparison it exists to support.
-			paged := tc.opts
-			paged.Limit, paged.Offset = 1, 1
-
-			pagedTotal, err := service.CountDeadLetterEvents(context.Background(), paged)
-			require.NoError(t, err)
-			assert.Equal(t, tc.total, pagedTotal,
-				"the total must not vary with the page it is reported alongside")
-		})
-	}
-
-	t.Run("the count and the page render the same filter", func(t *testing.T) {
-		store.countDeadLetterCalls = nil
-		store.inventoryQueries = nil
-
-		opts := DeadLetterListOptions{EventType: "transaction.applied", Limit: 1}
-
-		_, err := service.ListDeadLetterEvents(context.Background(), opts)
-		require.NoError(t, err)
-		_, err = service.CountDeadLetterEvents(context.Background(), opts)
-		require.NoError(t, err)
-
-		require.Len(t, store.inventoryQueries, 1)
-		require.Len(t, store.countDeadLetterCalls, 1)
-
-		// Compared on the NARROWING alone: the page a listing asks for is legitimately not
-		// the page a count asks for, and it is the predicate that has to be identical.
-		listed, counted := store.inventoryQueries[0], store.countDeadLetterCalls[0]
-		listed.Limit, listed.Offset = 0, 0
-		counted.Limit, counted.Offset = 0, 0
-		assert.Equal(t, listed, counted,
-			"two independently assembled predicates would let a total describe a population "+
-				"the page was not drawn from")
-	})
-
-	t.Run("an unusable status filter is refused rather than counted", func(t *testing.T) {
-		_, err := service.CountDeadLetterEvents(context.Background(),
-			DeadLetterListOptions{Status: model.EventOutboxStatusDispatched})
-		dltAssertCodeAndStatus(t, err, apierror.ErrGenValidation, http.StatusBadRequest)
-	})
 }
 
 // ---------------------------------------------------------------------------------------
@@ -4817,147 +5150,6 @@ func TestListDeadLetterEvents_ReturnsMatchesTheFormerScanBudgetWouldHaveHidden(t
 		"the total must be of the filtered set, not of the table and not of the page")
 
 	assert.Len(t, store.snapshotInventoryPages(), 1, "the listing must not page the inventory at all")
-}
-
-// TestCountDeadLetterEvents_CountsTheFilteredSet is the total a paginated triage list is
-// reported beside.
-//
-// The API used to REFUSE include_count whenever an event-type or topic filter was set, because
-// the only count available was a per-status aggregate over the whole table — a number that
-// described a different set from the page beside it. An operator narrowing the inventory
-// therefore lost the one figure that says how much work is in front of them.
-//
-// Every case below asserts the count against the same options a listing would be issued with,
-// which is the property that makes the pair usable together.
-func TestCountDeadLetterEvents_CountsTheFilteredSet(t *testing.T) {
-	dltPinTopicPrefix(t)
-
-	applied := dltAgedRow(t, "evt_count_applied", "transaction.applied", "blnk.transactions",
-		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute)
-	void := dltAgedRow(t, "evt_count_void", "transaction.void", "blnk.transactions",
-		model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", 2*time.Minute)
-	appliedFailed := dltAgedRow(t, "evt_count_applied_failed", "transaction.applied", "blnk.transactions",
-		model.EventOutboxStatusFailed, "", 3*time.Minute)
-	balance := dltAgedRow(t, "evt_count_balance", "balance.monitor", "blnk.balances",
-		model.EventOutboxStatusDeadLettered, "blnk.balances.dlt", 4*time.Minute)
-
-	store := newDltFakeStore().withRow(applied).withRow(void).withRow(appliedFailed).withRow(balance)
-	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
-
-	cases := []struct {
-		name  string
-		opts  DeadLetterListOptions
-		total int64
-	}{
-		{"unfiltered counts both terminal states", DeadLetterListOptions{}, 4},
-		{"by event type", DeadLetterListOptions{EventType: "transaction.applied"}, 2},
-		{"by topic", DeadLetterListOptions{Topic: "blnk.transactions"}, 3},
-		{"by status", DeadLetterListOptions{Status: model.EventOutboxStatusFailed}, 1},
-		{
-			"filters combine",
-			DeadLetterListOptions{
-				EventType: "transaction.applied",
-				Status:    model.EventOutboxStatusDeadLettered,
-			},
-			1,
-		},
-		{"a filter matching nothing counts zero", DeadLetterListOptions{EventType: "ledger.created"}, 0},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			total, err := service.CountDeadLetterEvents(context.Background(), tc.opts)
-			require.NoError(t, err)
-			assert.Equal(t, tc.total, total)
-
-			// The count and the page must describe the same set. Asserting the listing's
-			// length against the total for a page large enough to hold every match is what
-			// makes that agreement observable rather than assumed.
-			page, listErr := service.ListDeadLetterEvents(context.Background(), tc.opts)
-			require.NoError(t, listErr)
-			assert.Len(t, page.Entries, int(tc.total),
-				"a total that disagrees with the page it accompanies makes a paging client stop early or loop forever")
-		})
-	}
-
-	t.Run("the page is ignored, because a count is of the set", func(t *testing.T) {
-		total, err := service.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{
-			Limit: 1, Offset: 3,
-		})
-		require.NoError(t, err)
-		assert.Equal(t, int64(4), total)
-	})
-
-	t.Run("the narrowing reaches the repository", func(t *testing.T) {
-		counting := newDltFakeStore()
-		countingService := dltNewService(counting, &dltFakePublisher{}, &dltFakeTransport{})
-
-		_, err := countingService.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{
-			EventType: " transaction.applied ",
-			Topic:     " blnk.transactions ",
-			Status:    model.EventOutboxStatusDeadLettered,
-		})
-		require.NoError(t, err)
-
-		counted := counting.snapshotDeadLetterCounts()
-		require.Len(t, counted, 1,
-			"one count request must be one repository query")
-		assert.Equal(t, "transaction.applied", counted[0].EventType)
-		assert.Equal(t, "blnk.transactions", counted[0].Topic)
-		assert.Equal(t, model.EventOutboxStatusDeadLettered, counted[0].Status)
-	})
-}
-
-// TestCountDeadLetterEvents_RefusesAndPropagatesLikeTheListing keeps the two halves of the
-// endpoint answering with one voice.
-//
-// A count that accepted a status the listing rejects would report a total for a set the caller
-// can never page, and a count that swallowed a repository failure would report zero — which
-// reads as "nothing is stuck" and is the single most dangerous wrong answer this surface can
-// give.
-func TestCountDeadLetterEvents_RefusesAndPropagatesLikeTheListing(t *testing.T) {
-	dltPinTopicPrefix(t)
-
-	t.Run("an unsupported status filter is refused before the repository is touched", func(t *testing.T) {
-		store := newDltFakeStore()
-		service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
-
-		for _, status := range []string{
-			model.EventOutboxStatusPending,
-			model.EventOutboxStatusProcessing,
-			model.EventOutboxStatusDispatched,
-			"nonsense",
-		} {
-			_, err := service.CountDeadLetterEvents(
-				context.Background(), DeadLetterListOptions{Status: status})
-			dltAssertCodeAndStatus(t, err, apierror.ErrGenValidation, http.StatusBadRequest)
-		}
-
-		assert.Empty(t, store.snapshotDeadLetterCounts(),
-			"a rejected filter must not reach the repository")
-	})
-
-	t.Run("the repository's own failure is propagated, not reported as zero", func(t *testing.T) {
-		failing := newDltFakeStore()
-		failing.countDeadLetterErr = apierror.NewAPIError(
-			apierror.ErrInternalServer, "Failed to count dead-lettered events", errors.New("dial tcp: refused"),
-		)
-		service := dltNewService(failing, &dltFakePublisher{}, &dltFakeTransport{})
-
-		total, err := service.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
-		assert.Zero(t, total)
-		dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
-	})
-
-	t.Run("a service with no datasource refuses rather than answering zero", func(t *testing.T) {
-		_, err := NewEventDeadLetterService(nil, nil).
-			CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
-		dltAssertCodeAndStatus(t, err, apierror.ErrInternalServer, http.StatusInternalServerError)
-
-		var nilService *EventDeadLetterService
-		_, nilErr := nilService.CountDeadLetterEvents(context.Background(), DeadLetterListOptions{})
-		dltAssertCodeAndStatus(t, nilErr, apierror.ErrInternalServer, http.StatusInternalServerError)
-	})
 }
 
 // ---------------------------------------------------------------------------
@@ -5434,6 +5626,32 @@ func TestReplayFailureOutcome_PairsEveryCodeWithAMessageThatNamesTheRightCulprit
 		"a defect this service owns must not be described as a broker problem")
 	assert.NotEqual(t, unavailableMessage, failedMessage,
 		"the two outcomes must be distinguishable by message as well as by code")
+
+	// TAXONOMY-01: the third arm. An abandoned replay is neither of the two above, and it used
+	// to be reported as the first — a 503 whose message named a healthy broker as the culprit.
+	abandonedCode, abandonedMessage := replayFailureOutcome(
+		fmt.Errorf("waiting for acknowledgement: %w", context.Canceled))
+	assert.Equal(t, apierror.ErrEventReplayTimeout, abandonedCode)
+	assert.Equal(t, http.StatusGatewayTimeout, apierror.StatusForCode(abandonedCode),
+		"the abandonment code must resolve to 504 through an explicit statusByCode entry; without "+
+			"one it silently becomes the unknown-code 500 and reads as a defect in this service")
+	assert.NotContains(t, strings.ToLower(abandonedMessage), "broker is unavailable",
+		"an abandoned replay must not accuse the broker of being unavailable")
+	assert.Contains(t, strings.ToLower(abandonedMessage), "dead-lettered",
+		"the message must say the event is still dead-lettered, which is what makes repeating the "+
+			"request obviously safe")
+	assert.NotEqual(t, unavailableMessage, abandonedMessage)
+	assert.NotEqual(t, failedMessage, abandonedMessage)
+
+	// And the counter-case at the mapper: a dial that timed out is STILL an outage, even though
+	// its error chain matches context expiry.
+	dialTimeoutCode, _ := replayFailureOutcome(&net.OpError{
+		Op: "dial", Net: "tcp",
+		Addr: &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 9092},
+		Err:  os.ErrDeadlineExceeded,
+	})
+	assert.Equal(t, apierror.ErrKafkaUnavailable, dialTimeoutCode,
+		"an unreachable broker must not be reclassified as an abandoned request")
 }
 
 // TestIsBrokerUnavailableError_SeparatesAnOutageFromADefect pins the classifier the mapper
@@ -5449,7 +5667,9 @@ func TestReplayFailureOutcome_PairsEveryCodeWithAMessageThatNamesTheRightCulprit
 //     would break: kafka.Error implements Error, Timeout and Temporary, so it satisfies
 //     net.Error, and classifying by that interface would turn every protocol error into an
 //     outage.
-//   - A PublishError's own verdict wins over any re-derivation, in BOTH directions.
+//   - A PublishError's own verdict wins over any re-derivation, in BOTH directions — except
+//     that a TRANSIENT verdict whose only cause is context termination is not an outage. See
+//     TestIsBrokerUnavailableError_DoesNotBlameTheBrokerForALocalCancellation.
 func TestIsBrokerUnavailableError_SeparatesAnOutageFromADefect(t *testing.T) {
 	unavailable := map[string]error{
 		"no leader available":                      kafka.LeaderNotAvailable,
@@ -5466,8 +5686,6 @@ func TestIsBrokerUnavailableError_SeparatesAnOutageFromADefect(t *testing.T) {
 		"broker name does not resolve":             &net.DNSError{Err: "no such host", IsNotFound: true},
 		"connection reset":                         syscall.ECONNRESET,
 		"broken pipe":                              syscall.EPIPE,
-		"deadline expired":                         context.DeadlineExceeded,
-		"context cancelled":                        context.Canceled,
 		"publisher closed":                         ErrEventPublisherClosed,
 		"publisher closed, wrapped":                fmt.Errorf("writer: %w", ErrEventPublisherClosed),
 		"the publisher said transient":             &PublishError{Transient: true, Err: errors.New("some broker trouble")},
@@ -5501,6 +5719,71 @@ func TestIsBrokerUnavailableError_SeparatesAnOutageFromADefect(t *testing.T) {
 	}
 
 	assert.False(t, IsBrokerUnavailableError(nil), "a nil error is not a failure at all")
+}
+
+// TestIsBrokerUnavailableError_DoesNotBlameTheBrokerForALocalCancellation is TAXONOMY-01, and it
+// is the half of the classification the delegation used to get wrong.
+//
+// # The defect this pins closed
+//
+// brokerUnavailable was `return classifyTransientPublishError(err)`, and that classifier calls
+// context termination RETRYABLE — correctly, because a write abandoned by a shutdown, a lost
+// outbox lease or a spent request budget is worth attempting again. Reading the same verdict as
+// "the broker is the reason" made every such failure an outage: the replay endpoint answered
+// EVENT_KAFKA_UNAVAILABLE with 503 and a message telling the operator to retry once the broker
+// recovered, for a broker that had never stopped answering.
+//
+// # What is asserted, and why both halves are needed
+//
+// Each case must be RETRYABLE and NOT AN OUTAGE at the same time. Asserting only the second half
+// would pass for a fix that had also stopped retrying these failures — which would dead-letter
+// every event a graceful shutdown interrupted, exactly the regression RETRY-01 exists to
+// prevent. The pair states the invariant precisely: the retryable set is strictly wider than the
+// outage set, and context termination is the difference between them.
+//
+// The last case is the one that keeps the fix honest in the other direction. Go's net package
+// maps a dial cancelled or timed out by its context onto errors that satisfy
+// errors.Is(err, context.DeadlineExceeded), wrapped in a *net.OpError — so a broker that
+// blackholes connections produces a genuine outage whose chain also looks like cancellation. It
+// must still be classified as an outage, which is why the concrete signatures are tested first.
+func TestIsBrokerUnavailableError_DoesNotBlameTheBrokerForALocalCancellation(t *testing.T) {
+	local := map[string]error{
+		"the caller cancelled":              context.Canceled,
+		"the deadline expired":              context.DeadlineExceeded,
+		"a cancellation reached us wrapped": fmt.Errorf("waiting for acknowledgement: %w", context.Canceled),
+		"an expiry reached us wrapped":      fmt.Errorf("waiting for acknowledgement: %w", context.DeadlineExceeded),
+		"the publisher classified it transient": &PublishError{
+			Topic:     "blnk.transactions",
+			EventID:   "evt_cancelled",
+			EventType: "transaction.applied",
+			Attempt:   2,
+			Transient: true,
+			Err:       context.Canceled,
+		},
+	}
+
+	for name, err := range local {
+		t.Run(name, func(t *testing.T) {
+			assert.True(t, classifyTransientPublishError(err),
+				"a cancelled or expired write says nothing about the event, so the budget must be "+
+					"kept and another attempt must remain available")
+
+			assert.False(t, IsBrokerUnavailableError(err),
+				"%v is THIS PROCESS giving up, not the broker refusing: reported as an outage it "+
+					"answers 503 and tells an operator to wait for a broker that is healthy", err)
+		})
+	}
+
+	// The counter-case: an unreachable broker whose error chain ALSO matches context expiry,
+	// which is what net.DialContext produces when its deadline fires. It is an outage.
+	dialTimeout := &net.OpError{
+		Op: "dial", Net: "tcp",
+		Addr: &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 9092},
+		Err:  os.ErrDeadlineExceeded,
+	}
+	assert.True(t, IsBrokerUnavailableError(dialTimeout),
+		"a dial that timed out is the broker being unreachable, and it must not be reclassified as "+
+			"a local cancellation just because its chain matches context.DeadlineExceeded")
 }
 
 // TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable covers the publish-failure
@@ -5553,9 +5836,20 @@ func TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable(t *testin
 		"the broker host does not resolve": &net.DNSError{
 			Err: "no such host", Name: "kafka.internal", IsNotFound: true,
 		},
-		"the acknowledgement deadline expired": fmt.Errorf(
-			"waiting for acknowledgement: %w", context.DeadlineExceeded),
-		"the transport is closed": fmt.Errorf("resolving a writer: %w", ErrEventPublisherClosed),
+		// A dial whose own deadline fired. Its chain matches context.DeadlineExceeded as well as
+		// carrying a *net.OpError, and it belongs HERE rather than on the abandonment arm: the
+		// broker did not answer a connection attempt, which is an outage.
+		"the dial timed out": &net.OpError{
+			Op: "dial", Net: "tcp",
+			Addr: &net.TCPAddr{IP: net.ParseIP("10.9.8.7"), Port: 9092},
+			Err:  os.ErrDeadlineExceeded,
+		},
+		// The broker's OWN acknowledgement timeout, which arrives as a protocol code rather than
+		// as a context error. A bare context expiry no longer resolves here — see
+		// TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayAsATimeout — because it means this
+		// process stopped waiting, not that the broker failed to answer.
+		"the broker did not acknowledge in time": kafka.RequestTimedOut,
+		"the transport is closed":                fmt.Errorf("resolving a writer: %w", ErrEventPublisherClosed),
 	}
 
 	for name, cause := range cases {
@@ -5590,6 +5884,60 @@ func TestReplayDeadLetteredEvent_ReportsAnUnavailableBrokerAsRetryable(t *testin
 			assert.Equal(t, model.EventOutboxStatusDeadLettered,
 				fixture.store.row(t, fixture.row.EventID).Status,
 				"the event stays dead-lettered so it can be replayed again once the broker recovers")
+		})
+	}
+}
+
+// TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayAsATimeout is TAXONOMY-01 at the endpoint,
+// and it is the third arm of the split.
+//
+// # What was wrong
+//
+// A replay whose context was cancelled — the caller disconnected, or the request's deadline
+// expired — resolved to EVENT_KAFKA_UNAVAILABLE and 503, with a message stating that the Kafka
+// broker was unavailable and asking the operator to retry once it recovered. The broker was
+// healthy in every one of those cases; the request had been abandoned on this side. An operator
+// following that message goes looking at Kafka, and a client's retry policy is told a dependency
+// is down when nothing is.
+//
+// # What is asserted
+//
+// The code, the 504 it must resolve to through an explicit statusByCode entry, and the message —
+// which must not accuse the broker and must say the event is still dead-lettered, because that is
+// what makes repeating the request obviously safe. The row's terminal state is asserted for the
+// same reason it is on the other two arms: an abandoned replay must leave the event replayable.
+func TestReplayDeadLetteredEvent_ReportsAnAbandonedReplayAsATimeout(t *testing.T) {
+	dltPinTopicPrefix(t)
+
+	cases := map[string]error{
+		"the caller went away":              context.Canceled,
+		"the request deadline expired":      context.DeadlineExceeded,
+		"a cancellation reached us wrapped": fmt.Errorf("waiting for acknowledgement: %w", context.Canceled),
+		"the publisher classified the abandoned attempt transient": &PublishError{
+			Topic:     "blnk.transactions",
+			EventID:   "evt_transaction.applied_replay",
+			EventType: "transaction.applied",
+			Attempt:   6,
+			Transient: true,
+			Err:       context.DeadlineExceeded,
+		},
+	}
+
+	for name, cause := range cases {
+		t.Run(name, func(t *testing.T) {
+			fixture := dltNewReplayFixture(t, "transaction.applied", "blnk.transactions", "")
+			fixture.publisher.err = cause
+
+			outcome, err := fixture.service.ReplayDeadLetteredEvent(context.Background(), fixture.row.EventID)
+			dltAssertCodeAndStatus(t, err, apierror.ErrEventReplayTimeout, http.StatusGatewayTimeout)
+
+			assert.NotContains(t, strings.ToLower(dltAPIError(t, err).Message), "broker is unavailable",
+				"an abandoned request must not report the broker as unavailable")
+
+			assert.False(t, outcome.Recorded)
+			assert.Equal(t, model.EventOutboxStatusDeadLettered,
+				fixture.store.row(t, fixture.row.EventID).Status,
+				"the event stays dead-lettered, so the abandoned replay can simply be repeated")
 		})
 	}
 }
@@ -5712,7 +6060,8 @@ func TestDeadLetterOutcomeLogFields_RedactTheFinancialKeyAndBoundTheBrokerError(
 	assert.Equal(t, 5, fields["attempt_count"])
 }
 
-// dltInventoryMatches applies the SAME predicate the repository's SQL applies.
+// dltInventoryMatches applies the SAME predicate the repository's SQL applies, and it is the
+// ONLY narrowing on this double.
 //
 // It is deliberately an exact mirror rather than a convenient approximation, because the
 // service now delegates ALL narrowing to the database and a fake that filtered more
@@ -5721,14 +6070,31 @@ func TestDeadLetterOutcomeLogFields_RedactTheFinancialKeyAndBoundTheBrokerError(
 // different set. Comparisons are exact and case-sensitive on the stored columns, and the
 // topic is the row's stored topic with no derivation: the real column is NOT NULL under
 // CHECK (btrim(topic) <> ”), so a stored row cannot need one.
+//
+// # Why there is one of these and not three
+//
+// This store answered the same narrowing question from three places: the full-row listing and
+// its count shared one matcher, the narrow projection had a second, and a free function stood
+// beside both agreeing with neither. Three matchers over one predicate is worse than one loose
+// matcher, because whichever a test happens to reach decides what it asserts over, and the
+// answer stops being a statement about the statement at all. The survivor is the one that both
+// TRIMS its predicates and constrains the population, because deadLetterFilterClause does both.
+//
+// The three string predicates are TRIMMED for that reason. A padded filter narrows to nothing in
+// SQL, so a double comparing raw values would agree with the statement on a clean filter and
+// disagree on a padded one.
 func dltInventoryMatches(row model.EventOutbox, query model.DeadLetterQuery) bool {
-	if query.Status != "" && row.Status != query.Status {
+	status := strings.TrimSpace(query.Status)
+	eventType := strings.TrimSpace(query.EventType)
+	topic := strings.TrimSpace(query.Topic)
+
+	if status != "" && row.Status != status {
 		return false
 	}
-	if query.EventType != "" && row.EventType != query.EventType {
+	if eventType != "" && row.EventType != eventType {
 		return false
 	}
-	if query.Topic != "" && row.Topic != query.Topic {
+	if topic != "" && row.Topic != topic {
 		return false
 	}
 
@@ -5742,20 +6108,6 @@ func dltInventoryMatches(row model.EventOutbox, query model.DeadLetterQuery) boo
 	}
 
 	return true
-}
-
-// matchingInventoryLocked returns the inventory rows a query matches, newest first.
-// The caller holds the lock.
-func (s *dltFakeStore) matchingInventoryLocked(query model.DeadLetterQuery) []model.EventOutbox {
-	matches := make([]model.EventOutbox, 0, len(s.inventory))
-	for _, eventID := range s.inventory {
-		row := *s.rows[eventID]
-		if dltInventoryMatches(row, query) {
-			matches = append(matches, row)
-		}
-	}
-
-	return matches
 }
 
 // ListDeadLetterInventory pages the MATCHING rows newest first, applying the filters, the
@@ -5860,7 +6212,7 @@ func (s *dltFakeStore) CountDeadLetterInventory(
 		return 0, s.countErr
 	}
 
-	return int64(len(s.matchingInventoryLocked(query))), nil
+	return int64(len(s.matchingLocked(query))), nil
 }
 
 // ListAndCountDeadLetterInventory answers the page and the total from ONE observation of the
@@ -5896,7 +6248,7 @@ func (s *dltFakeStore) ListAndCountDeadLetterInventory(
 
 	page := s.inventoryPageLocked(query, filter)
 
-	return page, int64(len(s.matchingInventoryLocked(query.FilterQuery()))), nil
+	return page, int64(len(s.matchingLocked(query.FilterQuery()))), nil
 }
 
 // snapshotInventoryQueries returns the queries the service handed the FILTERED listing.
@@ -6061,131 +6413,6 @@ func TestListDeadLetterEvents_OffsetPagesTheMatchesRatherThanTheInventory(t *tes
 		"a cursor past the last match returns an empty page, never a non-match: six non-matching "+
 			"rows remain in the inventory and the filter belongs to the statement, so none of them "+
 			"can surface")
-}
-
-// TestCountDeadLetterEvents_CountsTheSameSetTheListingReturns is the second half of the fix.
-//
-// include_count used to be REFUSED alongside an event-type or topic filter, because no
-// filter-aware count existed. The listings an operator actually pages through were therefore
-// the ones that could not say how much was left — and the point of narrowing is to work
-// through a specific backlog.
-//
-// The property that makes the total trustworthy is that the count and the listing share ONE
-// predicate. Asserting the number alone would not show that; the query the count issues is
-// compared against the query the listing issues, field for field, so an independent
-// look-alike predicate would fail here.
-func TestCountDeadLetterEvents_CountsTheSameSetTheListingReturns(t *testing.T) {
-	dltPinTopicPrefix(t)
-
-	store := newDltFakeStore()
-	for i := 0; i < 7; i++ {
-		store = store.withRow(dltAgedRow(t, fmt.Sprintf("evt_count_txn_%d", i),
-			"transaction.applied", "blnk.transactions",
-			model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt",
-			time.Duration(30-i)*time.Minute))
-	}
-	for i := 0; i < 3; i++ {
-		store = store.withRow(dltAgedRow(t, fmt.Sprintf("evt_count_bal_%d", i),
-			"balance.created", "blnk.balances",
-			model.EventOutboxStatusFailed, "", time.Duration(20-i)*time.Minute))
-	}
-
-	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
-
-	cases := []struct {
-		name     string
-		options  DeadLetterListOptions
-		expected int64
-	}{
-		{"the whole inventory", DeadLetterListOptions{}, 10},
-		{"narrowed by event type", DeadLetterListOptions{EventType: "transaction.applied"}, 7},
-		{"narrowed by topic", DeadLetterListOptions{Topic: "blnk.balances"}, 3},
-		{"narrowed by status", DeadLetterListOptions{Status: model.EventOutboxStatusFailed}, 3},
-		{
-			"narrowed by every filter at once",
-			DeadLetterListOptions{EventType: "balance.created", Topic: "blnk.balances", Status: model.EventOutboxStatusFailed},
-			3,
-		},
-		{
-			"a filter combination nothing matches counts zero rather than failing",
-			DeadLetterListOptions{EventType: "transaction.applied", Topic: "blnk.balances"},
-			0,
-		},
-	}
-
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			total, err := service.CountDeadLetterEvents(context.Background(), testCase.options)
-			require.NoError(t, err)
-			assert.Equal(t, testCase.expected, total)
-
-			// The page must not influence the total: a caller reading page two of a
-			// backlog still needs its full size.
-			paged := testCase.options
-			paged.Limit = 2
-			paged.Offset = 4
-			pagedTotal, err := service.CountDeadLetterEvents(context.Background(), paged)
-			require.NoError(t, err)
-			assert.Equal(t, testCase.expected, pagedTotal,
-				"LIMIT and OFFSET select which matches to return and have no bearing on how "+
-					"many there are")
-		})
-	}
-
-	// The predicate is shared, not merely similar. Both queries are issued for the same
-	// options and compared on their filter fields.
-	options := DeadLetterListOptions{EventType: "transaction.applied", Topic: "blnk.transactions", Limit: 3}
-	_, err := service.ListDeadLetterEvents(context.Background(), options)
-	require.NoError(t, err)
-	_, err = service.CountDeadLetterEvents(context.Background(), options)
-	require.NoError(t, err)
-
-	listQueries := store.snapshotInventoryQueries()
-	countQueries := store.snapshotCountQueries()
-	require.NotEmpty(t, listQueries)
-	require.NotEmpty(t, countQueries)
-
-	lastList := listQueries[len(listQueries)-1]
-	lastCount := countQueries[len(countQueries)-1]
-	assert.Equal(t, lastList.EventType, lastCount.EventType,
-		"the count must narrow by exactly what the listing narrowed by, or an operator pages "+
-			"through one set while being told the size of another")
-	assert.Equal(t, lastList.Topic, lastCount.Topic)
-	assert.Equal(t, lastList.Status, lastCount.Status)
-}
-
-// TestCountDeadLetterEvents_RefusesTheSameStatusFilterTheListingRefuses keeps the two
-// operations' validation in step.
-//
-// An unrecognised status must be refused rather than allowed to match nothing, because an
-// empty result reads as "nothing is stuck" — the wrong answer to a question that was never
-// understood. The listing already did that; a count that accepted the same value and answered
-// zero would let a caller conclude the backlog was empty by asking the other endpoint.
-func TestCountDeadLetterEvents_RefusesTheSameStatusFilterTheListingRefuses(t *testing.T) {
-	dltPinTopicPrefix(t)
-
-	store := newDltFakeStore().withRow(dltAgedRow(t, "evt_status_guard", "transaction.applied",
-		"blnk.transactions", model.EventOutboxStatusDeadLettered, "blnk.transactions.dlt", time.Minute))
-	service := dltNewService(store, &dltFakePublisher{}, &dltFakeTransport{})
-
-	options := DeadLetterListOptions{Status: "pending"}
-
-	_, listErr := service.ListDeadLetterEvents(context.Background(), options)
-	require.Error(t, listErr, "a non-terminal status is not a dead-letter filter")
-
-	total, countErr := service.CountDeadLetterEvents(context.Background(), options)
-	require.Error(t, countErr,
-		"the count must refuse what the listing refuses; answering zero would report an empty "+
-			"backlog to a caller whose filter was never valid")
-	assert.Zero(t, total)
-
-	assert.Equal(t, apierror.ErrGenValidation, dltAPIError(t, listErr).Code,
-		"the listing's refusal is a validation error")
-	assert.Equal(t, apierror.ErrGenValidation, dltAPIError(t, countErr).Code,
-		"and so is the count's, so a caller sees one contract across both")
-
-	assert.Empty(t, store.snapshotCountQueries(),
-		"a refused filter must never reach the database")
 }
 
 // dltInventoryEntryOf projects a stored row into the NARROW inventory entry the repository

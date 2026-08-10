@@ -95,6 +95,34 @@ import (
 //
 // ---------------------------------------------------------------------------
 
+// NewWebhook is the webhook notification envelope, and it is a FROZEN CONTRACT.
+// It includes an event type and associated payload data.
+//
+// IT LIVES HERE, NOT IN webhooks.go, AND THAT IS THE WHOLE POINT. Marshaled, it is the
+// exact HTTP body Blnk has always POSTed to a subscriber: a two-key object,
+// {"event": <string>, "data": <object>}. That same marshaled object is carried verbatim —
+// both keys, unaltered — as the `payload` member of the Kafka LedgerEvent envelope, which
+// is what lets an existing subscriber's body parser keep working when only the transport
+// has changed. So the struct is the PAYLOAD CONTRACT, not part of the HTTP transport, and
+// it has to outlive the file that transport lives in.
+//
+// It was declared in webhooks.go and has been relocated here ahead of that file's
+// deletion, which is STEP 1 of the sunset procedure at the foot of webhooks.go and the
+// order the specification requires: relocate first, delete second. Twelve surviving
+// non-test files depend on this type — blnk.go, ledger.go, identity.go, balance.go,
+// transaction_execution.go, transaction_bulk.go, transaction_rejection.go,
+// event_monitor_handoff.go and this file among them — so removing it with the transport
+// would have taken the payload contract down with the delivery mechanism.
+//
+// Consequently the field names, the field types and above all the JSON tags must not
+// change. Renaming a tag, dropping the outer envelope in favour of the inner data
+// object, or adding a field would silently break byte-equivalence between the two
+// transports and, with it, every subscriber parser written against the HTTP era.
+type NewWebhook struct {
+	Event   string      `json:"event"` // The event type that triggered the webhook.
+	Payload interface{} `json:"data"`  // The data associated with the event.
+}
+
 // defaultEventMaxAttempts is the retry budget stamped on an outbox row when the
 // configured relay attempt limit is unavailable or nonsensical.
 //
@@ -106,21 +134,27 @@ import (
 // defaulted by the database.
 const defaultEventMaxAttempts = 5
 
-// unkeyedEventPartitionKey is the terminal fallback for the Kafka message key.
+// THE UNKEYED SENTINEL IS GONE, and its removal is the point of this note.
 //
-// The key decides the partition, and the partition decides ordering: every event
-// sharing a key is appended to one partition and is therefore consumed in publish
-// order. An EMPTY key is the failure mode this constant exists to prevent — Kafka
-// treats a null/empty key as "any partition", so unkeyed events are scattered
-// round-robin and their relative order is lost silently, with nothing in the data
-// to show that it happened.
+// The key decides the partition, and the partition decides ordering: every event sharing
+// a key is appended to one partition and is therefore consumed in publish order. An EMPTY
+// key is the failure mode — Kafka treats a null/empty key as "any partition", so unkeyed
+// events are scattered round-robin and their relative order is lost silently, with nothing
+// in the data to show that it happened.
 //
-// This value is reached only when an event has no aggregate identifier AND no
-// event type to fall back to, which in practice means a caller passed a
-// zero-valued NewWebhook. Routing those to one fixed key keeps them ordered
-// amongst themselves and keeps them visible, and the distinctive value makes them
-// trivial to spot in the outbox: `WHERE partition_key = 'blnk.unkeyed'`.
-const unkeyedEventPartitionKey = "blnk.unkeyed"
+// A constant named unkeyedEventPartitionKey used to absorb that case: an event with no
+// aggregate AND no event type was given the literal key "blnk.unkeyed" and admitted. That
+// traded a visible refusal for an invisible one. The row was accepted, published, and
+// ordered only against other unkeyable events — a guarantee no subscriber asked for and
+// none could use — and the only way to discover it was to think to run
+// `WHERE partition_key = 'blnk.unkeyed'`.
+//
+// PrepareEventOutbox now REFUSES such an event with ErrEventKeyUnresolvable. Reaching it
+// requires a producer to pass an event with no type and a payload with no identifier of any
+// kind — a zero-valued NewWebhook — which is a producer defect that must fail at the call
+// site rather than become a row. Every real event type has a declared key dimension (see
+// model.KeyDimensionForEventType) and every real payload yields at least the event type,
+// so nothing that this repository emits can reach the refusal.
 
 // postCommitEventPublishSem bounds how many post-commit event captures may be in
 // flight at once, across every transaction and balance in the process.
@@ -508,6 +542,67 @@ func eventAggregateID(payload interface{}) string {
 		// falls back.
 		return ""
 	}
+}
+
+// resolveEventPartitionKey picks the Kafka message key and reports WHICH dimension it came
+// from.
+//
+// The second return value is what makes a departure from requirement R-6 detectable. The
+// three candidates are tried in descending strength and the dimension is named alongside the
+// answer, so PrepareEventOutbox can compare it against the dimension the event type declares
+// (model.KeyDimensionForEventType) instead of accepting whatever the chain produced.
+//
+// Precedence, and why it is this order:
+//
+//  1. derived — the key eventPartitionKey resolved from the payload. That function applies
+//     the R-6 rule itself: a payload that knows its ledger returns the ledger, whatever its
+//     category. So a non-empty answer here is the ledger for every ledger-bearing event and
+//     the event's own aggregate otherwise, which is exactly what the two strong dimensions
+//     mean.
+//  2. aggregate — the aggregate id resolved separately by eventAggregateID, for a payload
+//     shape eventPartitionKey has no arm for but that still names something.
+//  3. eventType — the type itself, which is what gives system.error a single partition and
+//     therefore a total order.
+//
+// The dimension reported for candidates 1 and 2 is ledger when the caller's derived key IS
+// the ledger and aggregate otherwise, which the caller decides by passing the ledger it
+// resolved; this function only distinguishes "from the payload" from "from the type". That
+// split is deliberate: the ledger-versus-aggregate question is answered by eventLedgerID,
+// and duplicating it here would create a second answer able to disagree.
+//
+// Parameters:
+//   - derived string: the key resolved from the payload, or the caller-supplied ledger when
+//     one was given. Empty when the payload yielded nothing.
+//   - aggregateID string: the separately resolved aggregate id. Empty when there is none.
+//   - eventType string: the trimmed event name. Empty only for a zero-valued event.
+//   - ledgerID string: the authoritative ledger, empty when the event has none. Used ONLY to
+//     name the dimension, never as a candidate — a caller-supplied ledger has already been
+//     folded into derived by the caller.
+//
+// Returns:
+//   - string: the chosen key, empty when every candidate is empty.
+//   - model.EventKeyDimension: the dimension the key came from. Meaningless when the key is
+//     empty, and the caller refuses that case.
+func resolveEventPartitionKey(
+	derived, aggregateID, eventType, ledgerID string,
+) (string, model.EventKeyDimension) {
+	if derived != "" {
+		if ledgerID != "" && derived == ledgerID {
+			return derived, model.EventKeyDimensionLedger
+		}
+
+		return derived, model.EventKeyDimensionAggregate
+	}
+
+	if aggregateID != "" {
+		return aggregateID, model.EventKeyDimensionAggregate
+	}
+
+	if eventType != "" {
+		return eventType, model.EventKeyDimensionEventType
+	}
+
+	return "", model.EventKeyDimensionEventType
 }
 
 // eventPartitionKey derives the KAFKA MESSAGE KEY for an event FROM ITS PAYLOAD ALONE.
@@ -1117,27 +1212,72 @@ func (l *Blnk) PrepareEventOutbox(ctx context.Context, event NewWebhook, options
 		partitionKey = supplied
 	}
 
-	// The documented fallback chain, and it applies to the PARTITION KEY ONLY. Its
-	// purpose is a key that is always present and always deterministic: an empty key
-	// would let Kafka scatter the event round-robin and destroy ordering with nothing
-	// in the data to show it.
+	// THE KEY IS RESOLVED AGAINST A DECLARED DIMENSION, not through an untyped chain.
 	//
-	// Falling back to the event type is what gives system.error — which has no
-	// aggregate of any kind — a single partition and therefore a total order, which
-	// is precisely what an error stream wants. The sentinel is reached only when
-	// there is no event type either.
+	// model.KeyDimensionForEventType declares which identifier this event type's key is
+	// SUPPOSED to be — the ledger for everything that describes ledger state, the event's
+	// own aggregate for identities and batches, the event type itself for system.error —
+	// and resolveEventPartitionKey reports which one was actually achieved. The two agree
+	// for every event this repository emits with a populated payload; when they do not,
+	// the miss is logged and recorded on the span rather than absorbed, because a key
+	// taken from a balance instead of a ledger is a departure from requirement R-6 that
+	// used to be indistinguishable from compliance.
+	//
+	// An event that can produce NO key is refused outright. See the note above the
+	// removed unkeyed sentinel for why admitting it was worse than refusing it.
 	//
 	// NOTHING LIKE THIS APPLIES TO ledgerID. A missing ledger stays missing: it is
 	// stored as SQL NULL, because a fabricated ledger id is worse than no ledger id.
+	declared := model.KeyDimensionForEventType(eventType)
+	partitionKey, achieved := resolveEventPartitionKey(partitionKey, aggregateID, eventType, ledgerID)
 	if partitionKey == "" {
-		partitionKey = aggregateID
+		err := fmt.Errorf(
+			"blnk: event %q carries no ledger, no aggregate and no event type, so no Kafka "+
+				"message key can be derived for it", event.Event,
+		)
+
+		withLoggableCause(logrus.WithFields(logrus.Fields{
+			"declared_key_dimension": string(declared),
+		}), err).Error(
+			"event not captured: its Kafka message key is unresolvable, so publishing it would " +
+				"scatter it across partitions and lose its ordering silently",
+		)
+		span.RecordError(err)
+
+		return nil, apierror.NewAPIError(
+			apierror.ErrEventKeyUnresolvable,
+			"The event cannot be assigned a partition key",
+			err,
+		)
 	}
-	if partitionKey == "" {
-		partitionKey = eventType
+
+	span.SetAttributes(
+		attribute.String("event.key_dimension.declared", string(declared)),
+		attribute.String("event.key_dimension.achieved", string(achieved)),
+	)
+
+	if achieved != declared {
+		// REPORTED, NOT REFUSED. The one shape that reaches here in practice is a REJECTED
+		// transaction persisted with no balances: no balance moved, so no ledger exists to
+		// key it on, and refusing the event would destroy the only record that the
+		// transaction was rejected. Keying it on its source balance — which is what the
+		// transaction queue already shards on — keeps it ordered against that balance's
+		// other events, which is the strongest guarantee available for it.
+		//
+		// The line is WARN rather than DEBUG because a ledger-dimensioned event type that
+		// stops resolving its ledger is how per-ledger ordering degrades without any test
+		// failing, and the event type plus both dimensions are what an operator needs to
+		// find the producer.
+		logrus.WithFields(logrus.Fields{
+			"event_type":             eventType,
+			"declared_key_dimension": string(declared),
+			"achieved_key_dimension": string(achieved),
+		}).Warn(
+			"event keyed on a weaker dimension than its type declares: per-ledger ordering " +
+				"is not available for this event, and its ledger column is NULL",
+		)
 	}
-	if partitionKey == "" {
-		partitionKey = unkeyedEventPartitionKey
-	}
+
 	// aggregate_id is NOT NULL in the schema and is what consumers group by, so it
 	// inherits the partition key once every payload-derived candidate is exhausted.
 	if aggregateID == "" {
@@ -1436,13 +1576,15 @@ const PostCommitEventCaptureContract = "balance.monitor, bulk_transaction.<statu
 //     below — is reached only on a deployment with NO Kafka broker, where there is no
 //     handoff processor and the alert goes straight down the legacy webhook transport.
 //   - `bulk_transaction.<status>` is captured by finalizeBulkBatchOutcome, in one
-//     transaction with the batch coordinator's terminal transition. It falls back to this
-//     method when the coordinator row is absent, which is where the retry budget below
-//     still earns its place.
+//     transaction with the batch coordinator's terminal transition — including for a batch
+//     whose start was never recorded, which the repository ADOPTS into that transaction
+//     instead of reporting absent. It falls back to this method for one reason only: event
+//     capture is unconfigured, so there is no row for a transaction to carry.
 //
-// So the residual at-most-once behaviour is now confined to two narrow, named shapes — a
-// broker-less deployment and a batch whose coordinator write failed — rather than being the
-// standing behaviour of two event families. docs/event-streaming.md states which.
+// So the residual at-most-once behaviour is now confined to narrow, named shapes — a
+// broker-less deployment, a pre-write monitor read that failed, and a finalising
+// transaction that could not commit at all — rather than being the standing behaviour of
+// two event families. docs/event-streaming.md states which.
 //
 // # Why the row is prepared once and the INSERT is what retries
 //
@@ -1474,8 +1616,10 @@ const PostCommitEventCaptureContract = "balance.monitor, bulk_transaction.<statu
 //     and that site returns early.
 //  2. `bulk_transaction.<status>` — sendBulkTransactionWebhook in transaction_bulk.go, which
 //     spends the same budget through its own equivalent loop so that it can additionally
-//     carry batch context in its log fields. Reached only when the batch coordinator row is
-//     absent; normally the summary commits with the coordinator's terminal transition.
+//     carry batch context in its log fields. The summary itself is ATOMIC — it commits with
+//     the coordinator's terminal transition, and a batch whose start was never recorded is
+//     ADOPTED into that same transaction rather than captured outside one. What the budget
+//     buys is the finalising transaction's own transient failures.
 //  3. The status-derived `transaction.*` events of a COALESCED batch — postTransactionActions in
 //     transaction_execution.go, through this method. The coalescing writer is driven from
 //     transaction_coalescing.go, which AAP §0.6.2 freezes, so its caller cannot thread event

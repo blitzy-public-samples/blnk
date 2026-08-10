@@ -62,9 +62,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"math/big"
+	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -689,15 +692,27 @@ func newOutboxLegacyBlnk(t *testing.T, cnf *config.Configuration, ds database.ID
 	return &Blnk{config: cnf, datasource: ds, asynqClient: client}
 }
 
-// outboxPendingLegacyTasks returns the tasks waiting on the legacy webhook queue.
+// pendingLegacyTasks reads the legacy webhook queue and is safe to call from any goroutine.
 //
-// A queue asynq has never seen is reported by the inspector as ErrQueueNotFound, and that is
-// the shape "nothing was enqueued" takes rather than an error worth failing on — so it is
-// normalised to an empty result. Every other failure is fatal, because a test that could not
-// read the queue has not observed anything and must not report success.
+// It deliberately takes no *testing.T. The windowed helpers below read the queue in a loop, and
+// a reader closed over the test would both register one cleanup per poll and fail the test from
+// a goroutine the test no longer controls. That is not hypothetical: testify runs an
+// Eventually/Never predicate in its own goroutine and returns as soon as its timer fires, so a
+// final in-flight poll could still be reading while the test's cleanups closed the inspector
+// underneath it, and the test then failed on "redis: client is closed" instead of on the queue
+// contents it was asserting. The inspector here is opened and closed within the call, so no
+// handle outlives the read and no cleanup accumulates.
+//
+// A queue asynq has never seen is reported as ErrQueueNotFound, and that is the shape "nothing
+// was enqueued" takes rather than an error worth failing on, so it is normalised to an empty
+// result. Every other failure is returned rather than swallowed, because a caller that could
+// not read the queue has observed nothing and must not report success.
+//
+// It is for use from the TEST GOROUTINE. Inside an assert.Never or require.Eventually
+// condition, use pendingLegacyTasks instead: see the note there.
 //
 // Parameters:
-//   - t *testing.T: the test, used for the inspector's cleanup and for fatal failures.
+//   - t *testing.T: the test, used for fatal failures.
 //   - redisAddress string: the Redis the tasks were enqueued into.
 //
 // Returns:
@@ -705,16 +720,74 @@ func newOutboxLegacyBlnk(t *testing.T, cnf *config.Configuration, ds database.ID
 func outboxPendingLegacyTasks(t *testing.T, redisAddress string) []*asynq.TaskInfo {
 	t.Helper()
 
-	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: redisAddress})
-	t.Cleanup(func() { _ = inspector.Close() })
-
-	tasks, err := inspector.ListPendingTasks(outboxLegacyQueueName)
-	if errors.Is(err, asynq.ErrQueueNotFound) {
-		return nil
-	}
+	tasks, err := pendingLegacyTasks(redisAddress)
 	require.NoError(t, err, "the legacy webhook queue must be readable for this assertion to mean anything")
 
 	return tasks
+}
+
+// pendingLegacyTasks reads the legacy webhook queue and RETURNS its error, taking no
+// *testing.T at all.
+//
+// # Why the polled callers must use this and not the T-taking form
+//
+// testify evaluates an assert.Never or require.Eventually condition repeatedly and ON ITS OWN
+// GOROUTINE, and it stops WAITING for those goroutines once the window closes — a straggler can
+// still be mid-call after the test function has returned. Two things then go wrong if the
+// condition can fail the test:
+//
+//   - t.Cleanup has already torn the miniredis server down, so the straggler's read fails; and
+//   - reporting that failure from a goroutine after the test completed is not a test failure
+//     but a PANIC ("Fail in goroutine after … has completed") that takes the whole package
+//     down, naming a test that had in fact passed.
+//
+// Under -race the wider scheduling window turned that from rare into routine. Returning the
+// error instead keeps every testify call on the test goroutine, where it is legal, and lets a
+// polled caller treat an unreadable queue as "not yet satisfied" — which is the correct reading
+// for both Never (nothing was observed) and Eventually (keep waiting, then fail loudly on
+// timeout).
+//
+// The inspector is owned and closed per call rather than at test cleanup, so a polling loop
+// neither accumulates connections nor closes one another's. The returned task info is plain
+// data that outlives the connection.
+//
+// Parameters:
+//   - redisAddress string: the Redis the tasks were enqueued into.
+//
+// Returns:
+//   - []*asynq.TaskInfo: the pending tasks, in queue order. Empty when nothing was enqueued.
+//   - error: any failure other than the queue never having existed.
+func pendingLegacyTasks(redisAddress string) ([]*asynq.TaskInfo, error) {
+	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: redisAddress})
+	defer func() { _ = inspector.Close() }()
+
+	tasks, err := inspector.ListPendingTasks(outboxLegacyQueueName)
+	if errors.Is(err, asynq.ErrQueueNotFound) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return tasks, nil
+}
+
+// countPendingLegacyTasks is pendingLegacyTasks for a polled condition: it answers with a
+// count and folds an unreadable queue into -1, which no expected count can equal.
+//
+// Parameters:
+//   - redisAddress string: the Redis the tasks were enqueued into.
+//
+// Returns:
+//   - int: the number of pending tasks, or -1 when the queue could not be read.
+func countPendingLegacyTasks(redisAddress string) int {
+	tasks, err := pendingLegacyTasks(redisAddress)
+	if err != nil {
+		return -1
+	}
+
+	return len(tasks)
 }
 
 // outboxSpyDatasource records which outbox insert was called, with which transaction and
@@ -1197,7 +1270,10 @@ func TestPrepareEventOutbox_SpanWithholdsTheFinancialIdentifiers(t *testing.T) {
 
 		for _, set := range attributeSets {
 			for _, kv := range set {
-				rendered := kv.Value.Emit()
+				// Value.String rather than the deprecated Value.Emit: it renders every
+				// attribute type this span can carry, which is what the leak assertions
+				// below need to inspect.
+				rendered := kv.Value.String()
 				assert.NotContains(t, rendered, ledgerID,
 					"attribute %q exports the ledger id in the clear", kv.Key)
 				assert.NotContains(t, rendered, balanceID,
@@ -1985,37 +2061,179 @@ func TestPrepareEventOutbox_PartitionKeyFallbackChain(t *testing.T) {
 	}
 }
 
-// TestPrepareEventOutbox_UnkeyableEventGetsTheSentinelPartitionKey covers the terminal fallback.
+// TestPrepareEventOutbox_UnkeyableEventIsRefused pins the replacement for the removed
+// "blnk.unkeyed" sentinel.
 //
-// It is reached only by a zero-valued NewWebhook — no aggregate of any kind AND no event
-// type to fall back to. Routing those to one fixed sentinel keeps them ordered amongst
-// themselves rather than scattered, and the distinctive value makes them trivial to find
-// in the table with `WHERE ledger_id = 'blnk.unkeyed'`.
-func TestPrepareEventOutbox_UnkeyableEventGetsTheSentinelPartitionKey(t *testing.T) {
+// An event with no aggregate of any kind AND no event type to fall back to used to be
+// admitted under a fixed sentinel key. That kept it out of the logs and out of every test's
+// way while giving it an ordering guarantee against nothing — the row was published, and the
+// only way to find out was to think to query the sentinel. Requirement R-6 makes the key
+// load-bearing, so the capture is now REFUSED and the producer sees the failure at its call
+// site.
+//
+// Only a zero-valued NewWebhook can reach it: every catalogued event type carries a declared
+// key dimension and every real payload yields at least the type.
+func TestPrepareEventOutbox_UnkeyableEventIsRefused(t *testing.T) {
 	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
 
 	var row *model.EventOutbox
 	var prepareErr error
 	require.NotPanics(t, func() {
 		row, prepareErr = blnk.PrepareEventOutbox(context.Background(), NewWebhook{})
-	})
-	require.NoError(t, prepareErr)
-	require.NotNil(t, row, "even a zero-valued event is captured rather than dropped")
+	}, "the refusal must be an error, not a panic: this runs on the ledger write path")
 
-	assert.Equal(t, unkeyedEventPartitionKey, row.PartitionKey)
-	assert.Equal(t, "blnk.unkeyed", row.PartitionKey,
-		"the sentinel is a literal an operator can search the outbox for")
-	assert.Empty(t, row.LedgerID,
-		"a zero-valued event has NO ledger, and that is stored as NULL rather than as the sentinel: the sentinel is a routing key, never a ledger id")
-	assert.Equal(t, unkeyedEventPartitionKey, row.AggregateID,
-		"aggregate_id inherits the key once every payload-derived candidate is exhausted")
-	assert.Empty(t, row.EventType, "the event type really is empty; nothing was invented")
-	assert.Equal(t, "blnk.system", row.Topic,
-		"an unrecognised event type is routed to the system catch-all rather than stranded")
-	assert.NotContains(t, []string{"blnk.transactions", "blnk.balances", "blnk.identities"}, row.Topic,
-		"and that destination must not be a domain topic: an unclassifiable event must not appear in a stream a subscriber filters on and reasons about")
-	assert.Equal(t, `{"event":"","data":null}`, string(row.Payload),
-		"the payload is still the two-key envelope, faithfully describing an empty event")
+	require.Error(t, prepareErr, "an event with no key must not be captured")
+	assert.Nil(t, row, "no row may be handed back for an event that cannot be published in order")
+
+	var apiErr apierror.APIError
+	require.ErrorAs(t, prepareErr, &apiErr, "the refusal is a typed API error, not a bare error")
+	assert.Equal(t, apierror.ErrEventKeyUnresolvable, apiErr.Code,
+		"the code is what tells a caller this is a key problem rather than a storage failure")
+	assert.Equal(t, http.StatusInternalServerError, apierror.StatusForCode(apiErr.Code),
+		"an unkeyable event is a producer defect in this service, so it is a 500 and not a 400")
+}
+
+// TestPrepareEventOutbox_KeyDimensionIsDeclaredForEveryCataloguedEventType is the R-6
+// declaration contract.
+//
+// model.KeyDimensionForEventType declares what a type's key is SUPPOSED to be, and
+// PrepareEventOutbox compares the dimension it achieved against it. That comparison is only
+// worth anything if every event type this repository emits carries a declaration: an
+// undeclared type falls back to the aggregate dimension, which can never report a miss, so
+// an omission here silently switches the check off for that type.
+func TestPrepareEventOutbox_KeyDimensionIsDeclaredForEveryCataloguedEventType(t *testing.T) {
+	declared := model.EventKeyDimensionsByType()
+
+	for _, eventType := range model.CataloguedEventTypes() {
+		dimension, present := declared[eventType]
+		assert.Truef(t, present,
+			"%q is a catalogued event type, so it must declare a key dimension; without one the "+
+				"R-6 comparison in PrepareEventOutbox cannot fail for it", eventType)
+		assert.NotEmptyf(t, dimension, "%q declares an empty key dimension", eventType)
+	}
+
+	// The bulk family is composed at runtime and is therefore matched by prefix rather than
+	// declared. Its dimension is the batch, which is an aggregate.
+	assert.Equal(t, model.EventKeyDimensionAggregate,
+		model.KeyDimensionForEventType("bulk_transaction.applied"),
+		"a batch is a runtime grouping whose members may span ledgers, so the batch is its own unit")
+
+	// An event type nobody has declared must not report a ledger miss for every occurrence.
+	assert.Equal(t, model.EventKeyDimensionAggregate,
+		model.KeyDimensionForEventType("something.nobody.declared"),
+		"an undeclared type is aggregate-dimensioned so it cannot produce a false R-6 miss")
+}
+
+// TestPrepareEventOutbox_EveryCategoryReachesItsDeclaredKeyDimension walks the whole
+// catalogue and asserts the key each event type actually gets.
+//
+// One case per declared dimension, plus the one real MISS: a rejected transaction carries no
+// balances, so nothing names its ledger and the key falls to the source balance. That miss is
+// reported rather than absorbed, and this test is what pins which shapes are supposed to
+// produce it.
+func TestPrepareEventOutbox_EveryCategoryReachesItsDeclaredKeyDimension(t *testing.T) {
+	blnk := newOutboxBlnk(t, outboxPublishingConfiguration(), nil)
+
+	ledgerID := "ldg_dimension"
+
+	cases := []struct {
+		name        string
+		eventType   string
+		payload     interface{}
+		options     []EventOption
+		wantKey     string
+		wantLedger  string
+		wantDeclare model.EventKeyDimension
+	}{
+		{
+			name:        "a transaction event supplied with its ledger reaches the ledger dimension",
+			eventType:   "transaction.applied",
+			payload:     &model.Transaction{TransactionID: "txn_1", Source: "bal_src", Destination: "bal_dst"},
+			options:     []EventOption{WithEventLedgerID(ledgerID)},
+			wantKey:     ledgerID,
+			wantLedger:  ledgerID,
+			wantDeclare: model.EventKeyDimensionLedger,
+		},
+		{
+			name:        "a balance carries its own ledger, so no option is needed",
+			eventType:   "balance.created",
+			payload:     &model.Balance{BalanceID: "bal_1", LedgerID: ledgerID},
+			wantKey:     ledgerID,
+			wantLedger:  ledgerID,
+			wantDeclare: model.EventKeyDimensionLedger,
+		},
+		{
+			name:        "a monitor alert is keyed on the watched balance's ledger, supplied by the check",
+			eventType:   "balance.monitor",
+			payload:     model.BalanceMonitor{MonitorID: "mon_1", BalanceID: "bal_1"},
+			options:     []EventOption{WithEventLedgerID(ledgerID)},
+			wantKey:     ledgerID,
+			wantLedger:  ledgerID,
+			wantDeclare: model.EventKeyDimensionLedger,
+		},
+		{
+			name:        "a ledger event is about the ledger itself",
+			eventType:   "ledger.created",
+			payload:     &model.Ledger{LedgerID: ledgerID},
+			wantKey:     ledgerID,
+			wantLedger:  ledgerID,
+			wantDeclare: model.EventKeyDimensionLedger,
+		},
+		{
+			name:        "an identity is its own aggregate and has no ledger",
+			eventType:   "identity.created",
+			payload:     &model.Identity{IdentityID: "idt_1"},
+			wantKey:     "idt_1",
+			wantLedger:  "",
+			wantDeclare: model.EventKeyDimensionAggregate,
+		},
+		{
+			name:      "a bulk batch summary is keyed on the batch",
+			eventType: "bulk_transaction.applied",
+			payload: map[string]interface{}{
+				"batch_id": "bulk_1", "status": "applied", "transaction_count": 3,
+			},
+			wantKey:     "bulk_1",
+			wantLedger:  "",
+			wantDeclare: model.EventKeyDimensionAggregate,
+		},
+		{
+			name:        "system.error has no aggregate at all and keys on its type",
+			eventType:   "system.error",
+			payload:     map[string]interface{}{"error": "boom"},
+			wantKey:     "system.error",
+			wantLedger:  "",
+			wantDeclare: model.EventKeyDimensionEventType,
+		},
+		{
+			name:        "THE MISS: a rejected transaction has no balances, so its key falls to the source",
+			eventType:   "transaction.rejected",
+			payload:     &model.Transaction{TransactionID: "txn_2", Source: "bal_src"},
+			wantKey:     "bal_src",
+			wantLedger:  "",
+			wantDeclare: model.EventKeyDimensionLedger,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			row := mustPrepareEventOutbox(t, blnk, NewWebhook{
+				Event:   testCase.eventType,
+				Payload: testCase.payload,
+			}, testCase.options...)
+			require.NotNil(t, row)
+
+			assert.Equal(t, testCase.wantKey, row.PartitionKey, "the Kafka message key")
+			assert.Equal(t, testCase.wantLedger, row.LedgerID,
+				"ledger_id records the AUTHORITATIVE ledger and stays NULL when the event has none; "+
+					"a fabricated ledger is worse than an absent one")
+			assert.Equal(t, testCase.wantDeclare,
+				model.KeyDimensionForEventType(testCase.eventType),
+				"the declared dimension is what the capture compares against")
+			assert.NotEmpty(t, row.PartitionKey, "no event may reach Kafka without a key")
+			assert.NotEmpty(t, row.AggregateID, "aggregate_id is NOT NULL in the schema")
+		})
+	}
 }
 
 // TestPrepareEventOutbox_PartitionKeyIsStableWithinAnAggregate is the ordering guarantee
@@ -4367,4 +4585,77 @@ func TestRejectTransaction_StillRejectsWhenTheLedgerCannotBeResolved(t *testing.
 			"resolved, and inventing one would corrupt every consumer grouping by ledger")
 
 	datasource.AssertExpectations(t)
+}
+
+// TestEventOutboxSource_HoldsTheRelocatedPayloadContract is the mirror of
+// TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary, for the other symbol the
+// sunset had to rescue.
+//
+// # Why a source-level test rather than a behavioural one
+//
+// The behaviour of NewWebhook is covered exhaustively above: every payload assertion in this
+// file marshals it and compares bytes. What no behavioural test can express is WHERE it is
+// declared — and that is the property at risk, because it used to be declared in webhooks.go,
+// the file the sunset deletes. STEP 1 of the procedure at the foot of that file required
+// moving it out FIRST, and it has been moved here.
+//
+// The risk the previous arrangement carried was not subtle: twelve surviving non-test files
+// depend on this type, so deleting webhooks.go with the struct still inside it would have
+// removed the payload contract along with the transport — and the terminal release is by
+// design performed weeks later, by someone reading a checklist rather than this file.
+//
+// # The invariant, asserted in both directions
+//
+//   - It IS declared in event_outbox.go, exactly once. A revert or a bad merge that dropped
+//     the moved declaration would otherwise surface only as a build failure elsewhere.
+//   - It is NOT declared in webhooks.go. A relocation that ADDED without REMOVING is a
+//     duplicate declaration in package blnk and does not compile, so this is the assertion
+//     that fails if someone restores the old declaration.
+//   - The JSON tags are still `event` and `data`. They are the bytes every subscriber parses,
+//     on either transport, and a rename here is a silent break of every parser written
+//     against the HTTP era. Asserting them at the source level catches a rename that a
+//     round-trip test would not, because a round trip through the changed struct agrees with
+//     itself.
+func TestEventOutboxSource_HoldsTheRelocatedPayloadContract(t *testing.T) {
+	path := filepath.Join(moduleRootDir(t), "event_outbox.go")
+	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ParseComments)
+	require.NoError(t, err, "event_outbox.go must be parseable to assert its structure")
+
+	declarations := 0
+	var fields *ast.StructType
+
+	for _, declaration := range parsed.Decls {
+		generic, ok := declaration.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+
+		for _, spec := range generic.Specs {
+			typeSpec, ok := spec.(*ast.TypeSpec)
+			if !ok || typeSpec.Name.Name != "NewWebhook" {
+				continue
+			}
+
+			declarations++
+			if structType, ok := typeSpec.Type.(*ast.StructType); ok {
+				fields = structType
+			}
+		}
+	}
+
+	require.Equal(t, 1, declarations,
+		"NewWebhook must be declared exactly once in event_outbox.go: it was relocated here from webhooks.go ahead of that file's deletion, and its marshaled form IS the payload every LedgerEvent carries")
+	require.NotNil(t, fields, "NewWebhook must still be a struct type")
+
+	assert.NotContains(t, readRepoFile(t, "webhooks.go"), "type NewWebhook struct",
+		"webhooks.go must no longer declare NewWebhook; the relocation is STEP 1 of the sunset procedure and a second declaration in package blnk breaks the build")
+
+	tags := make([]string, 0, len(fields.Fields.List))
+	for _, field := range fields.Fields.List {
+		require.NotNil(t, field.Tag, "every NewWebhook field must carry an explicit JSON tag")
+		tags = append(tags, field.Tag.Value)
+	}
+
+	assert.Equal(t, []string{"`json:\"event\"`", "`json:\"data\"`"}, tags,
+		"the two JSON tags ARE the wire contract, in this order: {\"event\": <string>, \"data\": <object>}. Renaming one, or dropping the outer envelope in favour of the inner data object, breaks byte-equivalence between the two transports and every subscriber parser written against the HTTP era")
 }

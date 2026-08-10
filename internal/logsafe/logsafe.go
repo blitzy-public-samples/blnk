@@ -134,11 +134,92 @@ var endpointKeys = map[string]struct{}{
 // sensitiveKeys are the connection-string and query-parameter keys whose VALUE is a
 // secret. Postgres and Redis errors quote the DSN back, so "password=hunter2" reaches
 // a log line intact unless the value is removed.
+//
+// Matched as a WHOLE key, after separators are normalized. Two of these words earn
+// their place here and are deliberately absent from secretKeySegments, because as a
+// segment they would redact a diagnosis: "pass" would take "pass_rate", and "user"
+// would take "user_agent".
 var sensitiveKeys = map[string]struct{}{
 	"password": {}, "passwd": {}, "pwd": {}, "pass": {},
 	"secret": {}, "token": {}, "apikey": {}, "api_key": {}, "auth": {},
 	"sasl_password": {}, "sasl_username": {}, "user": {}, "username": {},
 }
+
+// secretKeySegments are the words that make a key's value a secret WHEREVER they appear
+// as a whole dot-, underscore- or hyphen-separated segment of it.
+//
+// # Why a segment rule exists at all
+//
+// Whole-key matching cannot keep up with how these keys are actually spelled. The same
+// secret arrives as "password" in a Postgres DSN, "sasl.password" in a Kafka property,
+// "ssl.keystore.password" in a client config, "KAFKA_SASL_ADMIN_SECRET" in this
+// service's own environment, "BLNK_METRICS_BEARER_TOKEN" in its metrics guard, and
+// "proxy-authorization" in an HTTP hop. Every one of those was logged verbatim while
+// this rule matched whole keys only, including spellings that differ from an enumerated
+// entry by nothing but a prefix. Enumerating spellings is a losing race; naming the
+// WORD that carries the meaning is not.
+//
+// # Why these words and not more
+//
+// Each word here is one whose presence in a key means the value is a credential in
+// every spelling this codebase can encounter, so redacting it can never remove a
+// diagnosis. "token" is kept even though "claim_token" ends in it, because a bearer
+// token is a real credential in this repository and a claim token appears in no error
+// or log text at all. "key" is NOT here because it is the one credential word that is
+// also a routing word; it is handled by routingKeyQualifiers instead.
+var secretKeySegments = map[string]struct{}{
+	"password": {}, "passwd": {}, "pwd": {},
+	"secret": {}, "secrets": {}, "token": {}, "apikey": {},
+	"credential": {}, "credentials": {},
+	"auth": {}, "authorization": {}, "jaas": {},
+	"username": {}, "userinfo": {},
+}
+
+// routingKeyQualifiers name the "…_key" keys whose value is a ROUTING value and must
+// survive, which is how "key" can be treated as a credential word without silencing the
+// diagnostics this pipeline logs on purpose.
+//
+// # Why the default is to redact and the exceptions are listed
+//
+// "key" cuts both ways: "BLNK_TYPESENSE_KEY" and "x-api-key" are credentials, while
+// "partition_key" is the routing value the event pipeline logs deliberately and the
+// relay's ordering diagnosis depends on. Neither position in the key distinguishes them
+// — both end in the word — so one of the two has to be the default.
+//
+// It is the credential, because the two mistakes are not equal. Redacting a routing key
+// costs a reader one correlatable value that the event ID beside it already provides;
+// publishing a credential is an information-disclosure defect that outlives the incident
+// that produced it. So an UNRECOGNISED "…_key" is treated as a secret, and the routing
+// meanings are the ones that must be named.
+var routingKeyQualifiers = map[string]struct{}{
+	"partition": {}, "idempotency": {}, "aggregate": {}, "event": {}, "message": {},
+	"sort": {}, "primary": {}, "foreign": {}, "natural": {}, "business": {},
+	"dedup": {}, "cache": {}, "row": {}, "record": {}, "shard": {}, "routing": {},
+}
+
+// endpointKeySegments are the words that make a key's value an address wherever they
+// appear as a whole segment of it, for the same reason secretKeySegments exists: shape
+// alone misses "KAFKA_BROKERS=broker.internal", which carries no port, and whole-key
+// matching misses it too because of the prefix.
+//
+// Over-redaction here is bounded and harmless: a key holding one of these words whose
+// value is a count rather than an address ("servers=3") loses a number that the
+// surrounding message already implies, and that is already this rule's behaviour today
+// for the whole-key spelling.
+var endpointKeySegments = map[string]struct{}{
+	"host": {}, "hostname": {}, "hosts": {},
+	"server": {}, "servers": {},
+	"broker": {}, "brokers": {}, "bootstrap": {},
+	"endpoint": {}, "endpoints": {},
+	"addr": {}, "address": {}, "addresses": {},
+	"peer": {}, "peers": {}, "port": {},
+	"dsn": {}, "url": {}, "uri": {},
+}
+
+// keySeparatorReplacer folds the separators a configuration key is spelled with onto
+// one, so that "sasl.username", "sasl-username" and "sasl_username" are one key rather
+// than three entries.
+var keySeparatorReplacer = strings.NewReplacer(".", "_", "-", "_")
 
 // Value makes an untrusted string safe to log: it strips the characters that let a
 // value forge log structure, and it caps the length.
@@ -409,6 +490,10 @@ func redactURL(core string) (string, bool) {
 // stays legible — "host=[redacted] password=[redacted] sslmode=disable" still tells a
 // reader which settings were present, which is most of what makes a DSN error useful.
 //
+// Only the FIRST "=" is used to split, so a value that itself contains one — a
+// base64 secret ending in padding, a JAAS fragment — is redacted whole rather than
+// partly.
+//
 // Parameters:
 //   - core string: the token with surrounding punctuation removed.
 //
@@ -421,16 +506,92 @@ func redactSensitiveAssignment(core string) (string, bool) {
 		return "", false
 	}
 
-	key := strings.ToLower(strings.Trim(core[:index], "\"'"))
-
-	_, sensitive := sensitiveKeys[key]
-	if !sensitive {
-		if _, endpoint := endpointKeys[key]; !endpoint {
-			return "", false
-		}
+	if !keyNamesRedactableValue(strings.ToLower(strings.Trim(core[:index], "\"'"))) {
+		return "", false
 	}
 
 	return core[:index+1] + Placeholder, true
+}
+
+// keyNamesRedactableValue reports whether a configuration key's value must be replaced,
+// in three layers.
+//
+//  1. The key as written, so an entry may be listed in whatever spelling it is usually
+//     seen in.
+//  2. The key with its separators folded onto "_", so "api-key" reaches the "api_key"
+//     entry and "sasl.username" reaches "sasl_username" without either spelling being
+//     enumerated.
+//  3. Each separated segment of the key against the segment sets, which is what catches
+//     the prefixed and compound spellings — "ssl.keystore.password",
+//     "KAFKA_SASL_ADMIN_SECRET", "kafka.bootstrap.servers" — that no enumeration of
+//     whole keys can anticipate. A segment of "key" is judged by what qualifies it, per
+//     routingKeyQualifiers.
+//
+// The secret and endpoint families are answered together because they produce the
+// identical output: both keep the key and replace the value with Placeholder. Splitting
+// the decision would only invite the two halves to disagree, which is exactly how the
+// dotted Kafka spellings came to be covered for addresses and not for credentials.
+//
+// Parameters:
+//   - key string: the key, already lowercased and stripped of surrounding quotes.
+//
+// Returns:
+//   - bool: whether the value belonging to this key must be replaced.
+func keyNamesRedactableValue(key string) bool {
+	if key == "" {
+		return false
+	}
+
+	if _, ok := sensitiveKeys[key]; ok {
+		return true
+	}
+
+	if _, ok := endpointKeys[key]; ok {
+		return true
+	}
+
+	normalized := key
+	if strings.ContainsAny(key, ".-") {
+		normalized = keySeparatorReplacer.Replace(key)
+
+		if _, ok := sensitiveKeys[normalized]; ok {
+			return true
+		}
+
+		if _, ok := endpointKeys[normalized]; ok {
+			return true
+		}
+	}
+
+	segments := strings.Split(normalized, "_")
+	for position, segment := range segments {
+		if segment == "" {
+			continue
+		}
+
+		if _, ok := secretKeySegments[segment]; ok {
+			return true
+		}
+
+		if _, ok := endpointKeySegments[segment]; ok {
+			return true
+		}
+
+		if segment != "key" && segment != "keys" {
+			continue
+		}
+
+		// A bare "key=" has nothing qualifying it, so it takes the safe reading.
+		if position == 0 {
+			return true
+		}
+
+		if _, routing := routingKeyQualifiers[segments[position-1]]; !routing {
+			return true
+		}
+	}
+
+	return false
 }
 
 // isEndpoint reports whether a token is an address by SHAPE.

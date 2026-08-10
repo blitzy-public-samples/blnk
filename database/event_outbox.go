@@ -1207,12 +1207,63 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 	return nil
 }
 
+// eventOutboxEffectiveKeySQL renders model.EffectivePartitionKey as SQL for one relation
+// alias, and it is the ONLY place that spelling exists in this package.
+//
+// # Why the claim cannot serialise on the partition_key column (PERF-C02)
+//
+// The Kafka message key is NOT the stored column. Requirement R-6 partitions by ledger id,
+// so the publish path keys on ledger_id when the row carries one and falls back to
+// partition_key only when it does not — model.EffectivePartitionKey, applied by
+// model.EventOutbox.EffectiveKey, by the publisher and by the relay's grouping.
+//
+// The claim's earlier-same-key exclusion is the statement "at most one row per KAFKA
+// PARTITION KEY is in flight". Written against partition_key it was a statement about a
+// different key, and the two disagree on exactly the rows the schema permits them to: a row
+// written before the ledger was threaded through its call site, or one whose partition key
+// was derived from the payload before the ledger was resolved. Two such rows sharing a
+// ledger have DIFFERENT stored keys, so the exclusion did not hold them apart — yet they
+// hash to ONE Kafka partition, so two relay replicas could claim them concurrently and
+// append them in either order. Silently: no error, no log line, and per-aggregate ordering
+// gone on precisely the rows an operator would later be investigating.
+//
+// # The expression is exact rather than approximate
+//
+// The expression is
+//
+//	COALESCE(NULLIF(btrim(ledger_id), <empty>), btrim(partition_key))
+//
+// which is Go's "TrimSpace(ledgerID) when non-empty, else TrimSpace(partitionKey)", term for
+// term: btrim is TrimSpace over SQL whitespace, NULLIF against the empty string turns a blank
+// ledger into NULL so COALESCE falls through, and a NULL ledger falls through directly. The
+// literal itself is written in eventOutboxEffectiveKeySQL's body just below, which is the only
+// place it appears. Two CHECK constraints make the
+// result NOT NULL and non-blank on every row — event_outbox_partition_key_not_blank and
+// event_outbox_ledger_id_not_blank_when_present — so the expression can never group rows
+// under NULL, which in an anti-join would silently stop excluding anything.
+//
+// Every function in it is IMMUTABLE, which is what makes the matching expression index in
+// sql/1781252000.sql legal and, more importantly, what makes the planner able to use it: the
+// index and the query must spell the expression identically, and they do because this
+// function is the only spelling either is built from.
+//
+// Parameters:
+//   - alias string: the relation alias the columns are qualified with.
+//
+// Returns:
+//   - string: the SQL expression, parenthesised so it composes into any predicate.
+func eventOutboxEffectiveKeySQL(alias string) string {
+	return `COALESCE(NULLIF(btrim(` + alias + `.ledger_id), ''), btrim(` + alias + `.partition_key))`
+}
+
 // claimPendingEventOutboxQuery claims a batch of publishable rows, takes a lease on
 // them and stamps a fresh claim token, all in one statement. It is a package-level
-// constant rather than a local so its text is reachable from tests, which assert
+// variable rather than a local so its text is reachable from tests, which assert
 // that FOR UPDATE SKIP LOCKED, the occurred_at ordering and the earlier-same-key
 // exclusion are all still present — the three properties a well-meaning refactor is
-// most likely to drop.
+// most likely to drop. A variable and not a constant only because the effective-key
+// expression is composed from eventOutboxEffectiveKeySQL rather than written twice;
+// nothing assigns to it after initialisation.
 //
 // UPDATE ... RETURNING does not preserve the inner ORDER BY, so the claimed rows
 // are re-ordered through a CTE to guarantee FIFO delivery within the batch.
@@ -1237,14 +1288,20 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 // FOR UPDATE SKIP LOCKED makes it impossible for two relay instances to claim the
 // SAME row. It does NOT make it impossible for them to claim two rows of the same
 // aggregate out of order, and that is the failure it hides: relay B skips the
-// earlier row relay A holds and claims a LATER row with the same partition key.
+// earlier row relay A holds and claims a LATER row with the same message key.
 // Kafka preserves APPEND order, not occurred_at, so relay B's message can be
 // appended first and a subscriber then observes transaction.applied before
 // transaction.queued for one transaction. There is no error, no log line and no
 // row state to show it happened — the ordering guarantee that the whole
 // partitioning scheme exists to provide is simply gone.
 //
-// NOT EXISTS closes it by making at most ONE row per partition key claimable at any
+// THE KEY IT SERIALISES ON IS THE EFFECTIVE KEY, not the partition_key column, and
+// the difference is the whole point of the predicate rather than a detail of it. See
+// eventOutboxEffectiveKeySQL: the publish path keys by ledger id where a row has one,
+// so serialising on the stored column left same-ledger rows with divergent stored keys
+// unserialised while Kafka put them on one partition.
+//
+// NOT EXISTS closes it by making at most ONE row per effective key claimable at any
 // instant: a candidate is claimable only when no earlier row sharing its key is
 // still pending or processing. It is race-safe without any additional locking,
 // because the blocking read runs in the same snapshot in which an
@@ -1269,10 +1326,14 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 // aggregate for as long as the dead-letter topic was unreachable, which is precisely
 // the failure this trade exists to avoid.
 //
-// The predicate is index-backed by idx_event_outbox_partition_key_inflight, whose
-// partial WHERE clause is exactly the blocking set. Widening the blocking set here
-// without widening that index turns each candidate check into a scan of the key's
-// entire history.
+// The predicate is index-backed by idx_event_outbox_effective_key_inflight, an
+// EXPRESSION index on the same effective key this predicate compares, whose partial
+// WHERE clause is exactly the blocking set. Widening the blocking set here without
+// widening that index turns each candidate check into a scan of the key's entire
+// history; changing the expression on either side without the other loses the index
+// altogether, because a partial expression index is usable only when the query spells
+// its expression identically — which is why both are built from
+// eventOutboxEffectiveKeySQL.
 //
 // FOR UPDATE SKIP LOCKED is still not optional and must not be replaced by an
 // advisory lock, by NOWAIT, or by a status flag alone: it is what lets several relay
@@ -1343,7 +1404,7 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 // key would instead let a failing LEGACY enqueue stall Kafka delivery for the entire
 // aggregate — the deprecated transport interfering with the new one, which is exactly
 // backwards. idx_event_outbox_claim's partial predicate covers the wider claimable
-// set and idx_event_outbox_partition_key_inflight's covers the narrower blocking one;
+// set and idx_event_outbox_effective_key_inflight's covers the narrower blocking one;
 // they must keep matching these two lists respectively.
 // AS MATERIALIZED IS WHAT MAKES THE LIMIT BINDING. It is not a hint and not an
 // optimisation, and removing it reintroduces a defect that is invisible in a small
@@ -1385,7 +1446,7 @@ func insertEventOutboxChunkInTx(ctx context.Context, tx *sql.Tx, chunk []*model.
 // status list, the ordering and FOR UPDATE SKIP LOCKED are all preserved verbatim, so
 // every partial index this query depends on remains usable and the plan assertions in
 // the tests still hold.
-const claimPendingEventOutboxQuery = `
+var claimPendingEventOutboxQuery = `
 		WITH candidates AS MATERIALIZED (
 			SELECT candidate.id FROM blnk.event_outbox candidate
 			WHERE candidate.status IN ('pending', 'processing', 'webhook_pending')
@@ -1394,7 +1455,7 @@ const claimPendingEventOutboxQuery = `
 			  AND candidate.next_attempt_at <= NOW()
 			  AND NOT EXISTS (
 				SELECT 1 FROM blnk.event_outbox earlier
-				WHERE earlier.partition_key = candidate.partition_key
+				WHERE ` + eventOutboxEffectiveKeySQL("earlier") + ` = ` + eventOutboxEffectiveKeySQL("candidate") + `
 				  AND earlier.status IN ('pending', 'processing')
 				  AND (earlier.occurred_at, earlier.id) < (candidate.occurred_at, candidate.id)
 			  )
@@ -1421,8 +1482,10 @@ const claimPendingEventOutboxQuery = `
 // order they must be published in, and each carries the token in its ClaimToken
 // field — every transition the caller subsequently performs must present it.
 //
-// At most one row per partition key is ever returned across all concurrent relay
-// instances, which is what preserves per-aggregate ordering; see the query comment.
+// At most one row per EFFECTIVE key — the Kafka message key, resolved by
+// eventOutboxEffectiveKeySQL exactly as model.EffectivePartitionKey resolves it in Go — is
+// ever returned across all concurrent relay instances, which is what preserves
+// per-aggregate ordering; see the query comment.
 //
 // A non-positive batchSize is rejected rather than passed through. A zero LIMIT
 // claims nothing and returns no error, which is indistinguishable from an empty
@@ -3761,15 +3824,80 @@ func (d Datasource) CountDeadLetteredEvents(
 	return total, nil
 }
 
-// CountEventOutboxByStatus returns a status-keyed count of blnk.event_outbox rows.
+// CountUnresolvedEventOutbox returns a status-keyed count of every row that has NOT reached
+// its terminal dispatched state, and touches no dispatched row at all.
+//
+// # PERF-M05: this is the reading every ROUTINE caller wants
+//
+// It exists because the two callers that run on a timer — the metrics collector, every
+// fifteen seconds, and the dead-letter service's awaiting-preservation count — read only
+// non-dispatched statuses and each said so in a comment, yet both went through
+// CountEventOutboxByStatus and so paid for an exact COUNT of a day of dispatched history on
+// every single call. At 500 events per second that is 43.2 million index entries counted
+// every fifteen seconds to produce a number nobody read: a permanently-running scan in the
+// steady state, and the largest routine cost in the whole event pipeline.
+//
+// Dropping the second arm is all it takes, because the arm that MATTERS to those callers was
+// never windowed. The population counted here is bounded by OPERATION rather than by history
+// — the pending backlog, the rows in flight, the dead-letter inventory, the two repair legs —
+// which acceptance criterion V-3 holds below 0.1% of throughput, and the partial index on
+// `status <> 'dispatched'` makes it an index-only scan of exactly those rows. Its cost is set
+// by how much work is outstanding, which is the only thing an operational reading should cost.
+//
+// So there is no `since` parameter, deliberately: a window would only be able to HIDE rows
+// this reading exists to surface. A pending row stuck for three days must appear in the
+// backlog gauge, and a `failed` row that has owed its dead-letter write since last week must
+// appear in the repair backlog. Every count here is exact and complete for all time.
+//
+// A status with no rows is ABSENT from the returned map rather than present with a zero,
+// because GROUP BY only produces rows that exist, so callers read it with the two-value form
+// or accept the zero value. The map is never nil on success.
+//
+// Callers needing the dispatched history — the daily zero-loss reconciliation, and nothing
+// else — use CountEventOutboxByStatus instead and pay for it deliberately.
+//
+// Parameters:
+//   - ctx context.Context: cancels the aggregate.
+//
+// Returns:
+//   - map[string]int64: counts by status for every non-dispatched status, never nil on success.
+//   - error: a logged internal error.
+func (d Datasource) CountUnresolvedEventOutbox(ctx context.Context) (map[string]int64, error) {
+	ctx, span := otel.Tracer("transaction.database").Start(ctx, "CountUnresolvedEventOutbox")
+	defer span.End()
+
+	rows, err := d.Conn.QueryContext(ctx, countUnresolvedEventOutboxQuery,
+		model.EventOutboxStatusDispatched)
+	if err != nil {
+		failDatabaseSpan(span, err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Failed to count unresolved event outbox entries by status",
+			"count_unresolved_event_outbox", err)
+	}
+
+	return collectEventOutboxStatusCounts(span, rows, "count_unresolved_event_outbox")
+}
+
+// CountEventOutboxByStatus returns a status-keyed count of blnk.event_outbox rows, INCLUDING
+// the dispatched history inside the caller's window.
 //
 // IT IS NOT UNUSED — do not delete it. A grep for callers inside this package
 // alone finds none, which is exactly the trap this comment exists to prevent. It
 // exists for one named purpose: the daily zero-loss reconciliation, which passes
 // when the dispatched plus dead-lettered counts equal the sum of the main-topic and
-// dead-letter-topic end offsets reported by the broker. Three things consume it —
-// the event statistics endpoint, the reconciliation runbook in the Kafka operations
-// documentation, and the pending-backlog gauge exported to the metrics pipeline.
+// dead-letter-topic end offsets reported by the broker. Two things consume it — the event
+// statistics endpoint when a caller asked for the broker side, and the reconciliation runbook
+// in the Kafka operations documentation that drives that endpoint.
+//
+// # It is the ON-DEMAND reading, and CountUnresolvedEventOutbox is the routine one
+//
+// The dispatched arm is an exact COUNT over the one population in this table that grows
+// without bound: at 500 events per second the outbox gains 43.2 million rows a day, so a
+// day's window counts 43.2 million index entries and a week's counts 302.4 million. That is
+// affordable once for a deliberate reconciliation and unaffordable on a timer, which is why
+// the pending-backlog gauge and the dead-letter service — neither of which reads the
+// dispatched figure — now call CountUnresolvedEventOutbox instead (PERF-M05), and why the
+// statistics endpoint runs this arm only for a caller that asked for the broker side.
 //
 // # What "since" bounds, and what it deliberately does not
 //
@@ -3816,6 +3944,33 @@ func (d Datasource) CountEventOutboxByStatus(ctx context.Context, since time.Tim
 		failDatabaseSpan(span, err)
 		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to count event outbox entries by status", "count_event_outbox_by_status", err)
 	}
+
+	return collectEventOutboxStatusCounts(span, rows, "count_event_outbox_by_status")
+}
+
+// collectEventOutboxStatusCounts drains a `(status, row_count)` result set into a map.
+//
+// Shared by the two status aggregates so that the one thing a reader must be able to trust
+// about both — that a scan or iteration failure is reported rather than silently yielding a
+// SHORT count — is written once. Two copies of this loop is how one of them ends up returning
+// a partially-drained map on a mid-iteration error, and a zero-loss reconciliation compared
+// against a short total reports loss that has not happened.
+//
+// The rows are closed here, so a caller must not defer a close of its own.
+//
+// Parameters:
+//   - span trace.Span: the caller's span, marked failed and annotated with the status count.
+//   - rows *sql.Rows: the open result set. Closed before this returns.
+//   - operation string: the operation label for the logged error.
+//
+// Returns:
+//   - map[string]int64: counts by status, never nil on success and never partial.
+//   - error: a logged internal error.
+func collectEventOutboxStatusCounts(
+	span trace.Span,
+	rows *sql.Rows,
+	operation string,
+) (map[string]int64, error) {
 	defer func() {
 		if closeErr := rows.Close(); closeErr != nil {
 			logrus.Errorf("Error closing rows: %v", closeErr)
@@ -3828,17 +3983,20 @@ func (d Datasource) CountEventOutboxByStatus(ctx context.Context, since time.Tim
 		var count int64
 		if scanErr := rows.Scan(&status, &count); scanErr != nil {
 			failDatabaseSpan(span, scanErr)
-			return nil, loggedDatabaseError(apierror.ErrInternalServer, "Failed to scan event outbox status count", "count_event_outbox_by_status", scanErr)
+			return nil, loggedDatabaseError(apierror.ErrInternalServer,
+				"Failed to scan event outbox status count", operation, scanErr)
 		}
 		counts[status] = count
 	}
 
-	if err = rows.Err(); err != nil {
+	if err := rows.Err(); err != nil {
 		failDatabaseSpan(span, err)
-		return nil, loggedDatabaseError(apierror.ErrInternalServer, "Error iterating over event outbox status counts", "count_event_outbox_by_status", err)
+		return nil, loggedDatabaseError(apierror.ErrInternalServer,
+			"Error iterating over event outbox status counts", operation, err)
 	}
 
 	span.SetAttributes(attribute.Int("event_outbox.status_count", len(counts)))
+
 	return counts, nil
 }
 
@@ -5030,6 +5188,36 @@ func scanDeadLetterInventoryEntry(s eventOutboxScanner) (model.DeadLetterInvento
 // The topic is likewise a COALESCE: a row that has been preserved names its dlt_topic, and a
 // row that has not is grouped under the `.dlt` sibling of the topic it was headed for, so
 // both appear on the series an operator alerts on rather than one of them silently missing.
+//
+// # PERF-M05: what this costs, measured, and why nothing here changed
+//
+// This aggregate's cost is set by the OUTSTANDING FAILURE INVENTORY and never by history: the
+// partial index restricts it to the two terminal failure states, so no dispatched row is
+// touched however much of it has accumulated. Acceptance criterion V-3 holds that inventory
+// below 0.1% of throughput, so in normal operation it reads almost nothing.
+//
+// The cost that WAS compounding it has been removed elsewhere: the metrics collector used to
+// run this and an exact count of a day's dispatched history on the same fifteen-second tick.
+// It now reads CountUnresolvedEventOutbox instead, whose plan is an Index Only Scan of
+// idx_event_outbox_status_open.
+//
+// Two candidate index changes were built and measured against a 1,000,000-row fixture with
+// 100,000 outstanding failure rows — a 10% inventory, an order of magnitude worse than the
+// criterion allows — and BOTH WERE REJECTED. Recorded here so the experiment is not repeated:
+//
+//   - Adding dlt_topic and last_attempted_at to idx_event_outbox_dead_letter_inventory's
+//     INCLUDE list does NOT make this index-only. The planner reaches this index by a BITMAP
+//     scan, and a bitmap scan always visits the heap, so the payload is never consulted. The
+//     wider index measured 1126 pages against 906 and ran slower: 37.9ms against 31.2ms.
+//   - An expression index keyed on the two COALESCEs is 36% smaller (4656 kB against 7280 kB)
+//     and no faster (30.9ms against 31.2ms) — and it cannot REPLACE the inventory index, whose
+//     keyset ordering the dead-letter listing pages by, so it would be a second index adding
+//     write amplification to every dead-letter transition for no measurable read gain.
+//
+// So the shape below is the right one, and a maintained rollup would be machinery to save tens
+// of milliseconds on a fifteen-second timer during an incident. The reading stays exact, which
+// is what the fifteen-minute alert needs: PERF-P07 removed a lower-bound reading precisely
+// because an alert cannot fire on a bound that does not cross the threshold.
 const oldestDeadLetterAgeByTopicQuery = `
 		SELECT
 			COALESCE(NULLIF(dlt_topic, ''), topic || $3) AS age_topic,
@@ -5141,6 +5329,14 @@ func (d Datasource) OldestDeadLetterAgeByTopic(
 //
 // The result is a reading that hides nothing an operator acts on and stops growing with a
 // history nobody is asking about.
+//
+// # PERF-M05: and why even the bounded arm is now ON DEMAND
+//
+// Bounded is not cheap. A day of dispatched history is 43.2 million index entries to count and
+// a week is 302.4 million, which is affordable once for a deliberate reconciliation and
+// ruinous on a fifteen-second timer — and both timer-driven callers read only the FIRST arm.
+// They now use countUnresolvedEventOutboxQuery, which is this query's first arm alone, and the
+// only caller left here is the reconciliation that genuinely needs the dispatched figure.
 const countEventOutboxByStatusQuery = `
 		SELECT status, COUNT(*) AS row_count
 		FROM blnk.event_outbox
@@ -5150,6 +5346,27 @@ const countEventOutboxByStatusQuery = `
 		SELECT status, COUNT(*) AS row_count
 		FROM blnk.event_outbox
 		WHERE status = $1 AND occurred_at >= $2
+		GROUP BY status
+	`
+
+// countUnresolvedEventOutboxQuery is countEventOutboxByStatusQuery's FIRST ARM ALONE: every
+// status except the terminal dispatched one, counted exactly and for all time.
+//
+// It is spelled as its own constant rather than assembled from the query above, for the same
+// reason that one is a constant: a test asserts the shape, and the substance of PERF-M05 is
+// that this statement contains no second arm and no window — which is invisible from the
+// method's behaviour on a small table and is exactly what a well-meaning future edit would
+// undo by "reusing" the fuller query with a wide window.
+//
+// The predicate is identical to the other query's first arm, character for character, so both
+// resolve to the SAME partial index on `status <> 'dispatched'`. A paraphrase — an IN list of
+// the known non-dispatched statuses, say — would read the same and plan as a sequential scan,
+// and would additionally stop counting any status added to the state machine later, which the
+// column deliberately permits.
+const countUnresolvedEventOutboxQuery = `
+		SELECT status, COUNT(*) AS row_count
+		FROM blnk.event_outbox
+		WHERE status <> $1
 		GROUP BY status
 	`
 

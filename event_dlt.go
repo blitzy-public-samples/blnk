@@ -788,9 +788,14 @@ type eventDeadLetterStore interface {
 		query model.DeadLetterInventoryQuery,
 	) (model.DeadLetterInventoryPage, int64, error)
 
-	// CountEventOutboxByStatus returns a status-keyed count of every row, which is how
-	// the age scan sizes its window without a bespoke query.
-	CountEventOutboxByStatus(ctx context.Context, since time.Time) (map[string]int64, error)
+	// CountUnresolvedEventOutbox returns a status-keyed count of every NON-DISPATCHED row,
+	// which is how the age report counts the rows awaiting a dead-letter write without a
+	// bespoke query.
+	//
+	// It takes no window, which is why it is the one on this seam (PERF-M05): the `failed`
+	// count this service reads is exact and complete for all time, and the dispatched
+	// history the previous windowed aggregate also counted was read by nobody.
+	CountUnresolvedEventOutbox(ctx context.Context) (map[string]int64, error)
 
 	// MarkEventDeadLettered records the dead-letter topic and metadata and moves the row
 	// to its dead-lettered terminal state, CONDITIONAL on the caller still holding the
@@ -2273,8 +2278,14 @@ const replayClaimLease = 2 * time.Minute
 // message the replay endpoint must answer with.
 //
 // It is the one place the distinction is drawn, so the code and the message can never
-// disagree about what went wrong. The two arms:
+// disagree about what went wrong. The three arms:
 //
+//   - The replay was ABANDONED — the caller went away, or the request's deadline expired,
+//     with no network or protocol failure anywhere in the error's chain.
+//     ErrEventReplayTimeout, which statusByCode maps to 504. TAXONOMY-01: this arm exists
+//     because such a failure used to take the arm below, so a cancelled request was
+//     answered with a 503 whose message told the operator to wait for a broker that was
+//     never unhealthy. The event stays dead-lettered, so repeating the request is safe.
 //   - The broker is unavailable — unreachable, leaderless, under-replicated, or a
 //     transport that has been closed. ErrKafkaUnavailable, which statusByCode maps to 503.
 //     This is the same code the no-transport branch above returns, and deliberately so:
@@ -2285,11 +2296,18 @@ const replayClaimLease = 2 * time.Minute
 //     service owns — bytes that cannot be published, a destination that cannot be
 //     resolved — where a retry changes nothing.
 //
-// The verdict comes from IsBrokerUnavailableError, which reads the publisher's own
-// per-attempt classification rather than re-deriving one from the error text. Matching on
-// a message here would be the fragile version of this function: broker error strings are
-// not a contract, and a library upgrade that reworded one would silently move every
-// outage back to a 500.
+// The abandonment verdict comes from localContextTermination and the availability verdict
+// from IsBrokerUnavailableError, both of which read concrete error signatures and the
+// publisher's own per-attempt classification rather than re-deriving one from error text.
+// Matching on a message here would be the fragile version of this function: broker error
+// strings are not a contract, and a library upgrade that reworded one would silently move
+// every outage back to a 500.
+//
+// The abandonment arm is tested FIRST, and it is safe to do so because
+// localContextTermination reports false for any failure carrying a broker or network
+// signature — including the dial timeouts and cancelled dials whose error chains also
+// satisfy errors.Is(err, context.DeadlineExceeded). A broker that has genuinely gone away
+// therefore still resolves to the availability arm below.
 //
 // Parameters:
 //   - cause error: the non-nil error PublishToTopic returned.
@@ -2298,6 +2316,12 @@ const replayClaimLease = 2 * time.Minute
 //   - apierror.ErrorCode: the typed code, which has an explicit statusByCode entry.
 //   - string: the message that accompanies it.
 func replayFailureOutcome(cause error) (apierror.ErrorCode, string) {
+	if localContextTermination(cause) {
+		return apierror.ErrEventReplayTimeout,
+			"The replay was abandoned before the broker acknowledged it; the event is still " +
+				"dead-lettered, so the request can be repeated"
+	}
+
 	if IsBrokerUnavailableError(cause) {
 		return apierror.ErrKafkaUnavailable,
 			"The Kafka broker is unavailable, so the event could not be replayed; retry once it recovers"
@@ -2595,7 +2619,7 @@ func (s *EventDeadLetterService) RefreshDeadLetterAgeGauge(ctx context.Context) 
 	// landed is grouped under the sibling topic it is BOUND FOR, and its dlt_topic is still
 	// NULL. Reporting it separately is what keeps a broker refusing dead-letter writes
 	// distinguishable from a busy triage queue.
-	failedAwaiting, err := s.countFailedAwaitingDeadLetter(ctx, now)
+	failedAwaiting, err := s.countFailedAwaitingDeadLetter(ctx)
 	if err != nil {
 		span.RecordError(err)
 
@@ -3400,24 +3424,25 @@ func closeDeadLetterService(service *EventDeadLetterService) {
 //
 // It is the one figure the grouped age aggregate cannot supply, because that aggregate groups
 // preserved and unpreserved rows onto the same topic series — which is correct for an age
-// gauge and wrong for this count. The per-status aggregate answers it exactly and without a
-// scan: `failed` is one of the statuses CountEventOutboxByStatus counts in full whatever
-// window it is given, precisely because a stuck row can be older than any window.
+// gauge and wrong for this count. The unresolved-inventory aggregate answers it exactly and
+// without a scan of history: `failed` is one of the non-dispatched statuses
+// CountUnresolvedEventOutbox counts in full and for all time, precisely because a stuck row
+// can be older than any window somebody might pick.
+//
+// It reads the UNRESOLVED aggregate rather than the fuller one (PERF-M05). It used to pass a
+// twenty-four-hour window to CountEventOutboxByStatus under a comment noting that the window
+// bounded only the dispatched count "which this service never reads" — so each call counted a
+// day of dispatched history, 43.2 million index entries at the target rate, and discarded it.
+// The window argument is gone with the reason for it.
 //
 // Parameters:
 //   - ctx context.Context: cancels the aggregate.
-//   - now time.Time: the instant the (irrelevant, exactness-preserving) window is derived
-//     from. The failed count is complete regardless; the window bounds only the dispatched
-//     count, which this caller ignores.
 //
 // Returns:
 //   - int64: the number of rows awaiting a dead-letter write.
 //   - error: the repository's own typed error.
-func (s *EventDeadLetterService) countFailedAwaitingDeadLetter(
-	ctx context.Context,
-	now time.Time,
-) (int64, error) {
-	counts, err := s.store.CountEventOutboxByStatus(ctx, now.Add(-deadLetterCountWindow))
+func (s *EventDeadLetterService) countFailedAwaitingDeadLetter(ctx context.Context) (int64, error) {
+	counts, err := s.store.CountUnresolvedEventOutbox(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -3428,10 +3453,10 @@ func (s *EventDeadLetterService) countFailedAwaitingDeadLetter(
 	return counts[model.EventOutboxStatusFailed], nil
 }
 
-// deadLetterCountWindow is the window this service passes to the per-status count.
+// deadLetterCountWindow WAS RETIRED HERE (PERF-M05).
 //
-// It bounds ONLY the dispatched count, which this service never reads: every other status —
-// including the `failed` rows awaiting a dead-letter write — is counted exactly and in full
-// however short the window is. It is stated explicitly rather than left to the repository's
-// fallback so the call site says what it is asking for.
-const deadLetterCountWindow = 24 * time.Hour
+// It was the twenty-four-hour window this service passed to the per-status count, stated
+// explicitly "so the call site says what it is asking for" — and what it was asking for turned
+// out to be a day of dispatched history it then ignored. CountUnresolvedEventOutbox takes no
+// window because none of its counts has one: the `failed` rows this service reads are exact and
+// complete for all time, which is the property the count needed and the window never provided.

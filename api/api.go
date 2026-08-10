@@ -204,6 +204,19 @@ func (a Api) Router() *gin.Engine {
 	router.DELETE("/subscribers/:subscriber_id", a.DeleteSubscriber)
 	router.POST("/subscribers/:subscriber_id/kafka-credentials", a.IssueKafkaCredentials)
 
+	// THE DATA-PLANE ROUTE, and the only one under /subscribers that is not an operator
+	// action. It is the enforcement point for a subscriber's partition-key prefix: Kafka's
+	// authorizer has no message-key dimension, so a key-scoped subscriber is granted Describe
+	// and NO Read and the broker refuses its every fetch — this is the path its records take,
+	// filtered per record by the subscriber's own prefix.
+	//
+	// It is registered beside the management routes rather than under a separate prefix so that
+	// api/middleware's pathToResource entry for "subscribers" covers it; a new first path
+	// segment would resolve to no resource and the auth middleware would abort every request to
+	// it, master key included. The handler authenticates the SUBSCRIBER separately, with the
+	// SASL secret it was issued, so reaching this route is not the same as being served by it.
+	router.GET("/subscribers/:subscriber_id/events", a.StreamSubscriberEvents)
+
 	// Deprecated webhook-subscription management routes.
 	//
 	// Retained only for the dual-delivery window. Once

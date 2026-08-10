@@ -254,6 +254,88 @@ CREATE TABLE IF NOT EXISTS blnk.event_outbox (
     -- Reading it by eye: SELECT convert_from(event_raw, 'UTF8').
     event_raw           BYTEA                     NOT NULL,
 
+    -- ===================================================================
+    -- WHAT THE THREE COPIES ABOVE COST, MEASURED (PERF-C03)
+    --
+    -- The three columns above hold the event body three times over, and each of
+    -- the three has a reason stated at it. What none of those reasons could say
+    -- is the price, so the price is stated here — measured rather than
+    -- estimated, because this is the number the retention period and the
+    -- PostgreSQL volume must both be sized from, and an estimate is how those
+    -- two came to be set 858x apart.
+    --
+    -- # The measurement
+    --
+    -- Taken on PostgreSQL 16 against 500,000 rows in a table created with
+    -- `CREATE TABLE ... (LIKE blnk.event_outbox INCLUDING ALL)`, so every column,
+    -- constraint and all seventeen indexes below are included, and shaped like a
+    -- real `transaction.applied` event read out of a running deployment:
+    --
+    --     payload_raw                 741 bytes
+    --     event_raw                   963 bytes
+    --     payload (JSONB)             808 bytes
+    --     ------------------------------------
+    --     whole tuple               1,888 bytes   (no TOAST: under the 2 KiB threshold)
+    --     heap incl. page overhead  2,048 bytes/row
+    --     all seventeen indexes       323 bytes/row
+    --     ====================================
+    --     TOTAL                     2,372 bytes/row
+    --
+    -- The three body columns are 2,512 of the 1,888-byte tuple before
+    -- compression, so roughly 88% of every row IS the triplicated body. That is
+    -- the trade this design makes: a byte-exact payload guarantee, a byte-exact
+    -- replay guarantee and a queryable projection, bought with three copies.
+    --
+    -- # What that means at the validated throughput
+    --
+    -- Acceptance criterion V-1 validates this pipeline at 500 events per second,
+    -- so the arithmetic that matters is:
+    --
+    --     rows/day     = 500 x 86,400            =  43,200,000
+    --     bytes/day    = 43,200,000 x 2,372       = 102.5 GB  =  95.4 GiB/day
+    --     steady state = 95.4 GiB x retention_days x 1.5
+    --
+    -- The 1.5 is bloat and autovacuum headroom, and it is not padding: every row
+    -- is UPDATEd at least twice on its way to a terminal state (claim, then
+    -- dispatch), `status` is indexed so neither update can be HOT, and each one
+    -- therefore leaves a dead tuple and rewrites index entries.
+    --
+    -- WAL is on top of that and is bounded separately by max_wal_size.
+    --
+    -- # The two settings that must be sized from this, and their coupling
+    --
+    --   * RELAY_EVENT_RETENTION_DAYS in infrastructure/k8s-manifests/blnk-config.yaml
+    --     is the multiplier. It is additionally capped by the broker's own
+    --     log.retention.hours in kafka-statefulset.yaml: the daily
+    --     outbox-versus-offset reconciliation can only compare a window BOTH
+    --     sides still hold.
+    --   * the pg-data volumeClaimTemplate in postgres-statefulset.yaml must hold
+    --     the steady state above, plus the ledger's own tables, plus WAL.
+    --
+    -- Neither number is meaningful without the other. A generous retention
+    -- against a small volume does not keep more history — it exhausts the volume
+    -- the LEDGER lives on, which is an availability failure of the whole system
+    -- rather than of this table.
+    --
+    -- # Why this table is not partitioned
+    --
+    -- Range partitioning on occurred_at would turn the purge into a DROP
+    -- PARTITION and would bound vacuum to one partition at a time, which is the
+    -- textbook answer for a table with this write and delete profile. It is
+    -- deliberately NOT done here, for one reason that outweighs the benefit: the
+    -- relay's claim serialises on an anti-join over in-flight rows sharing a
+    -- message key, and the unique index on event_id is what makes capture
+    -- idempotent — and PostgreSQL cannot enforce a unique index across
+    -- partitions unless the partition key is part of it. Adding occurred_at to
+    -- that uniqueness would let the same event_id be captured twice in two
+    -- partitions, which is the one property the outbox exists to provide.
+    --
+    -- Revisit it if the retained window has to grow beyond a few days: the
+    -- alternative is a partitioned ARCHIVE table that terminal rows are moved
+    -- into, where uniqueness is no longer load-bearing because nothing claims
+    -- from it.
+    -- ===================================================================
+
     -- When the domain action happened; RFC3339 on the wire.
     --
     -- THIS, never created_at, is the ordering column throughout this table. The
@@ -715,6 +797,15 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_aggregate
 
 -- The index that makes PER-KEY ORDERING enforceable rather than merely intended,
 -- and the most consequential index in this migration.
+--
+-- SUPERSEDED by idx_event_outbox_effective_key_inflight in sql/1781252000.sql, which
+-- drops this one. Read that migration before this comment: the claim serialises on the
+-- EFFECTIVE key — ledger_id where a row has one, partition_key where it does not, which
+-- is the key the publisher hashes — and keying this index on the column alone left
+-- same-ledger rows with divergent stored keys unserialised while Kafka placed them on one
+-- partition. What follows is preserved because the reasoning about the NOT EXISTS
+-- predicate, the blocking set and the webhook_pending asymmetry is unchanged; only the
+-- key the predicate compares moved.
 --
 -- The claim query used to be FOR UPDATE SKIP LOCKED over a globally ordered
 -- window, which is safe against two relays claiming the SAME row and unsafe

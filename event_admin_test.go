@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -132,6 +133,20 @@ type fakeAdminClient struct {
 	// timeOffsetRequests counts the timestamp requests, so a test can assert that a window is
 	// read in its OWN round trip and only when one was asked for.
 	timeOffsetRequests int
+
+	// records is the fake log: the records Fetch serves, per topic and partition, in offset
+	// order. Each record carries the offset it sits at, so a test can model a compacted or
+	// sparse log without the fake inventing offsets.
+	records map[string]map[int][]kafka.Record
+
+	// fetchErrors is the error Fetch reports INSIDE its response for a topic and partition,
+	// which is where the authorizer's verdict arrives. A test uses it to model
+	// TOPIC_AUTHORIZATION_FAILED without a broker.
+	fetchErrors map[string]map[int]error
+
+	// fetchRequests records what the gateway asked the broker for, so the bounds it applies
+	// are assertable rather than inferred from what came back.
+	fetchRequests []*kafka.FetchRequest
 	// scram maps a principal to the SCRAM mechanisms it holds credentials for.
 	scram map[string][]kafka.ScramMechanism
 	// bindings is the broker's ACL store: CreateACLs adds to it, DeleteACLs removes the
@@ -173,10 +188,26 @@ type fakeAdminClient struct {
 	// scramDeleteError is returned as the per-user result of a credential deletion.
 	scramDeleteError error
 
+	// --- Injected behaviour ---
+
+	// onCall, when set, runs as each call is recorded and BEFORE the call's context is
+	// inspected or any injected failure is returned.
+	//
+	// It exists to disturb the world at a precise point INSIDE a multi-step operation. The
+	// fake is synchronous, so a test cannot otherwise place an event — a caller going away, a
+	// concurrent provisioner — between the credential write and the ACL batch, which is the
+	// only window in which the compensation path can be reached with a dead caller. Cancelling
+	// from here is what makes CLEAN-01 observable rather than assumed.
+	//
+	// IT RUNS WITH THE FAKE'S MUTEX HELD, so it must not call back into the fake. Cancelling a
+	// context, closing a channel, reading a captured local and calling t.Log are all safe;
+	// f.callCount and f.heldBindings would deadlock.
+	onCall func(method string)
+
 	// --- Recordings ---
 
 	calls                    []string
-	deadlines                []bool
+	contexts                 []fakeAdminContextObservation
 	createTopicsRequests     []*kafka.CreateTopicsRequest
 	createPartitionsRequests []*kafka.CreatePartitionsRequest
 	createACLsRequests       []*kafka.CreateACLsRequest
@@ -206,7 +237,49 @@ func newFakeAdminClient() *fakeAdminClient {
 		committedErrors:     map[string]map[int]error{},
 		windowStart:         map[string]map[int]int64{},
 		windowStartOmitted:  map[string]map[int]bool{},
+		records:             map[string]map[int][]kafka.Record{},
+		fetchErrors:         map[string]map[int]error{},
 	}
+}
+
+// withRecords seeds the fake log of one partition, numbering offsets from the given base.
+//
+// The key and value are the two fields the gateway acts on: the key decides whether a
+// key-scoped subscriber is entitled to the record, and the value is what a delivered record
+// carries. kafka.NewBytes is used rather than a raw slice because RecordReader consumers read
+// through the Bytes interface, exactly as the real client's do.
+func (f *fakeAdminClient) withRecords(
+	topic string,
+	partition int,
+	base int64,
+	pairs ...[2]string,
+) *fakeAdminClient {
+	if f.records[topic] == nil {
+		f.records[topic] = map[int][]kafka.Record{}
+	}
+
+	stamp := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	for index, pair := range pairs {
+		f.records[topic][partition] = append(f.records[topic][partition], kafka.Record{
+			Offset: base + int64(index),
+			Time:   stamp.Add(time.Duration(index) * time.Second),
+			Key:    kafka.NewBytes([]byte(pair[0])),
+			Value:  kafka.NewBytes([]byte(pair[1])),
+		})
+	}
+
+	return f
+}
+
+// withFetchError makes Fetch answer one partition with a broker-side error, which is how an
+// authorization refusal reaches a caller.
+func (f *fakeAdminClient) withFetchError(topic string, partition int, err error) *fakeAdminClient {
+	if f.fetchErrors[topic] == nil {
+		f.fetchErrors[topic] = map[int]error{}
+	}
+	f.fetchErrors[topic][partition] = err
+
+	return f
 }
 
 // withTopic adds an existing topic with the given number of partitions, numbered from
@@ -308,13 +381,47 @@ func containsPartition(ids []int, partition int) bool {
 	return false
 }
 
-// record notes a call, whether its context carried a deadline, and returns any injected
-// transport failure for that method.
+// fakeAdminContextObservation is what one call saw of its context.
+//
+// A bare "did it have a deadline" boolean cannot tell a cleanup that ran on a LIVE detached
+// context apart from one that inherited an already-cancelled caller and returned instantly, and
+// that distinction IS the CLEAN-01 guarantee: the compensation exists for the case where the
+// caller's budget has expired, so a compensation that merely inherits the expiry does nothing at
+// all while reporting that it tried. Both the error and the deadline are therefore kept, per
+// call, in call order.
+type fakeAdminContextObservation struct {
+	// method is the admin call this observation belongs to.
+	method string
+	// err is ctx.Err() at the instant the call was made: nil for a live context.
+	err error
+	// hasDeadline and deadline are the bound the call ran under. A detached compensation must
+	// still be BOUNDED, so "no deadline at all" is as much a failure as an expired one.
+	hasDeadline bool
+	deadline    time.Time
+}
+
+// record notes a call, what its context looked like, and returns any injected transport failure
+// for that method.
 func (f *fakeAdminClient) record(method string, ctx context.Context) error {
 	f.calls = append(f.calls, method)
 
-	_, hasDeadline := ctx.Deadline()
-	f.deadlines = append(f.deadlines, hasDeadline)
+	deadline, hasDeadline := ctx.Deadline()
+
+	// The hook runs BEFORE the context is inspected, so an event it triggers — a cancellation
+	// above all — is visible to this very call rather than only to the next one. That ordering
+	// is what lets a test place the caller's departure inside the round trip that fails, which
+	// is the window the compensation path is reached from.
+	if f.onCall != nil {
+		f.onCall(method)
+	}
+
+	contextErr := ctx.Err()
+	f.contexts = append(f.contexts, fakeAdminContextObservation{
+		method:      method,
+		err:         contextErr,
+		hasDeadline: hasDeadline,
+		deadline:    deadline,
+	})
 
 	// A cancelled or expired context is refused, exactly as a real round trip would refuse
 	// it. Without this the fake is BLIND to cancellation, and the guarantees that exist
@@ -322,11 +429,26 @@ func (f *fakeAdminClient) record(method string, ctx context.Context) error {
 	// bookkeeping — cannot be told apart from code that simply passes the caller's context
 	// through. That is the difference between a test that proves the guarantee and one that
 	// would pass either way.
-	if err := ctx.Err(); err != nil {
-		return err
+	if contextErr != nil {
+		return contextErr
 	}
 
 	return f.transportErrors[method]
+}
+
+// observedContextsFor returns, in call order, what every call to one method saw of its context.
+func (f *fakeAdminClient) observedContextsFor(method string) []fakeAdminContextObservation {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	observations := make([]fakeAdminContextObservation, 0, len(f.contexts))
+	for _, observation := range f.contexts {
+		if observation.method == method {
+			observations = append(observations, observation)
+		}
+	}
+
+	return observations
 }
 
 // callCount returns how many times a method was called.
@@ -357,13 +479,13 @@ func (f *fakeAdminClient) everyCallHadADeadline() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	for _, hasDeadline := range f.deadlines {
-		if !hasDeadline {
+	for _, observation := range f.contexts {
+		if !observation.hasDeadline {
 			return false
 		}
 	}
 
-	return len(f.deadlines) > 0
+	return len(f.contexts) > 0
 }
 
 func (f *fakeAdminClient) Metadata(
@@ -932,6 +1054,78 @@ func (f *fakeAdminClient) OffsetFetch(
 	}
 
 	return response, nil
+}
+
+// Fetch serves the seeded log of one partition.
+//
+// It models the three properties the gateway depends on and nothing more: records arrive in
+// offset order from the requested offset, the response reports the partition's watermarks,
+// and a broker-side error arrives in the response rather than as a returned error — which is
+// where an authorization refusal actually appears.
+//
+// kafka.NewRecordReader is the real client's own reader type, so the production code reads
+// through the same interface it reads a live broker through; a slice would let a reader bug
+// pass here and fail against Kafka.
+func (f *fakeAdminClient) Fetch(
+	ctx context.Context,
+	req *kafka.FetchRequest,
+) (*kafka.FetchResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := f.record("Fetch", ctx); err != nil {
+		return nil, err
+	}
+	f.fetchRequests = append(f.fetchRequests, req)
+
+	log := f.records[req.Topic][req.Partition]
+
+	response := &kafka.FetchResponse{
+		Topic:            req.Topic,
+		Partition:        req.Partition,
+		LogStartOffset:   0,
+		HighWatermark:    int64(len(log)),
+		LastStableOffset: int64(len(log)),
+		Records:          kafka.NewRecordReader(),
+	}
+
+	if injected, ok := f.fetchErrors[req.Topic][req.Partition]; ok {
+		response.Error = injected
+
+		return response, nil
+	}
+
+	// FIRST/LAST sentinels resolved the way the broker resolves them, so a caller asking for
+	// the beginning or the end is served rather than silently given nothing.
+	from := req.Offset
+	switch from {
+	case int64(kafka.FirstOffset):
+		from = 0
+	case int64(kafka.LastOffset):
+		from = int64(len(log))
+	}
+
+	served := make([]kafka.Record, 0, len(log))
+	for _, record := range log {
+		if record.Offset < from {
+			continue
+		}
+
+		served = append(served, record)
+	}
+
+	response.Records = kafka.NewRecordReader(served...)
+
+	return response, nil
+}
+
+// fetchBounds returns the requests Fetch received, so a test can assert the bounds the caller
+// applied rather than only the records it kept.
+func (f *fakeAdminClient) fetchBounds() []*kafka.FetchRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]*kafka.FetchRequest(nil), f.fetchRequests...)
 }
 
 // Compile-time proof that the fake is a faithful stand-in for the real client.
@@ -1618,11 +1812,16 @@ const testSubscriberID = "sub_0f6e2c8a"
 // them is accepting a caller's choice of boundary. A fixture that hard-coded "acme-recon"
 // would be asserting a shape the production path no longer permits.
 //
-// PartitionKeyPrefix is set to prove it is carried and NOT enforced: it is an advisory
-// client-side filter hint, and no ACL derives from it.
+// PartitionKeyPrefix is deliberately ABSENT, so this is the ORDINARY subscriber: the topic
+// grant is its whole boundary, the broker keeps all of it, and it holds Read and Describe on
+// each authorised topic. That is the shape most tests in this file are about.
+//
+// It used to carry a prefix, "to prove it is carried and NOT enforced", which was accurate while
+// a key scope changed nothing about the grant. It changes the grant now — a key-scoped
+// subscriber is provisioned with Describe and NO Read so that Blnk's stream gateway is the only
+// path its records can take — so a fixture carrying one would quietly make every binding
+// assertion in this file assert the narrowed shape. testKeyScopedSubscriber is that case, named.
 func testSubscriber() *model.EventSubscriber {
-	prefix := "acme-"
-
 	principal, err := model.CanonicalKafkaPrincipal(testSubscriberID)
 	if err != nil {
 		panic("test fixture: the subscriber identifier must derive a principal: " + err.Error())
@@ -1634,13 +1833,27 @@ func testSubscriber() *model.EventSubscriber {
 	}
 
 	return &model.EventSubscriber{
-		SubscriberID:       testSubscriberID,
-		Name:               "Acme Reconciliation",
-		KafkaPrincipal:     principal,
-		ConsumerGroupID:    group,
-		AuthorizedTopics:   []string{"blnk.transactions", "blnk.balances"},
-		PartitionKeyPrefix: &prefix,
+		SubscriberID:     testSubscriberID,
+		Name:             "Acme Reconciliation",
+		KafkaPrincipal:   principal,
+		ConsumerGroupID:  group,
+		AuthorizedTopics: []string{"blnk.transactions", "blnk.balances"},
 	}
+}
+
+// testKeyScopedSubscriber returns the same row PLUS a recorded partition-key prefix.
+//
+// It is the fixture for the boundary Kafka cannot express: such a subscriber is granted Describe
+// but not Read on its topics, so the broker refuses every record fetch and the records it is
+// entitled to are delivered — key-filtered — by Blnk's subscriber stream gateway. Every test
+// about that shape names this fixture, so no test asserts it by accident.
+func testKeyScopedSubscriber() *model.EventSubscriber {
+	prefix := "acme-"
+
+	subscriber := testSubscriber()
+	subscriber.PartitionKeyPrefix = &prefix
+
+	return subscriber
 }
 
 // testSubscriberPrincipal is the ACL principal string the fixture's bindings carry.
@@ -1857,6 +2070,246 @@ func TestProvisionSubscriberPrincipal_BindsLeastPrivilegeACLs(t *testing.T) {
 
 	assert.Equal(t, expected, entries,
 		"the bindings must be exactly Read and Describe on each literal topic plus Read on the prefixed group")
+}
+
+// TestProvisionSubscriberPrincipal_WithholdsRecordReadFromAKeyScopedSubscriber is SEC-06, and it
+// is the isolation boundary asserted binding by binding.
+//
+// # The exposure this closes
+//
+// A subscriber recording a partition-key prefix used to be provisioned with the ordinary grant:
+// Read and Describe on every authorised topic. The response then echoed the prefix and declared
+// that applying it was the consumer's own obligation. That was accurate prose about a boundary
+// that did not exist — the principal could read every record on a shared category topic,
+// including records written for other ledgers and other subscribers, and a client that ignored
+// the obligation (or simply used another Kafka client) was not misbehaving in any way the
+// platform could detect.
+//
+// # What must be true instead
+//
+// Describe, so the subscriber can still resolve its topics and their offsets. Read on its own
+// consumer-group namespace, so the namespace stays reserved to it. And NO topic Read, so the
+// broker refuses every fetch it attempts — which is what makes Blnk's stream gateway, where the
+// prefix IS applied, the only path its records can take.
+//
+// The equality assertion is deliberate rather than a scan: this grant is smaller than the
+// ordinary one, and a test that only forbade Read could be satisfied by a grant that had lost
+// Describe or the group binding too, leaving a subscriber that can neither consume nor discover
+// anything.
+func TestProvisionSubscriberPrincipal_WithholdsRecordReadFromAKeyScopedSubscriber(t *testing.T) {
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	subscriber := testKeyScopedSubscriber()
+
+	result, err := admin.ProvisionSubscriberPrincipal(
+		context.Background(),
+		NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+	)
+	require.NoError(t, err,
+		"a recorded prefix must not withhold the CREDENTIAL: refusing withheld the only credential "+
+			"such a row can ever have, which is the dead end that preceded the disclosure that "+
+			"preceded this boundary")
+
+	principal := testSubscriberPrincipal(t)
+
+	expected := []kafka.ACLEntry{
+		{
+			ResourceType:        kafka.ResourceTypeTopic,
+			ResourceName:        "blnk.transactions",
+			ResourcePatternType: kafka.PatternTypeLiteral,
+			Principal:           principal,
+			Host:                ACLHostAny,
+			Operation:           kafka.ACLOperationTypeDescribe,
+			PermissionType:      kafka.ACLPermissionTypeAllow,
+		},
+		{
+			ResourceType:        kafka.ResourceTypeTopic,
+			ResourceName:        "blnk.balances",
+			ResourcePatternType: kafka.PatternTypeLiteral,
+			Principal:           principal,
+			Host:                ACLHostAny,
+			Operation:           kafka.ACLOperationTypeDescribe,
+			PermissionType:      kafka.ACLPermissionTypeAllow,
+		},
+		{
+			ResourceType:        kafka.ResourceTypeGroup,
+			ResourceName:        "blnk-sub-" + testSubscriberID + ".",
+			ResourcePatternType: kafka.PatternTypePrefixed,
+			Principal:           principal,
+			Host:                ACLHostAny,
+			Operation:           kafka.ACLOperationTypeRead,
+			PermissionType:      kafka.ACLPermissionTypeAllow,
+		},
+	}
+
+	assert.Equal(t, expected, requestedACLs(fake),
+		"a key-scoped subscriber must be granted Describe on each topic and Read on its group "+
+			"namespace, and NOTHING else: a topic Read here admits it to every record on a shared "+
+			"topic whatever its key")
+
+	assert.False(t, result.TopicRecordAccessGranted,
+		"and the result must SAY so, because the credential response is built from it")
+	assert.True(t, result.KeyScopeBoundaryVerified,
+		"the boundary is verified before the password becomes returnable, not assumed from the "+
+			"code that built the bindings")
+	assert.True(t, result.AuthorizerActive,
+		"withholding Read withholds nothing on a broker that enforces no ACLs, so enforcement is "+
+			"part of the same verification")
+
+	// The ordinary subscriber is unchanged, which is the other half of the property: this is a
+	// narrowing of one case, not of the access model.
+	ordinaryFake := newFakeAdminClient()
+	ordinaryAdmin := newTestKafkaAdmin(ordinaryFake, MinTopicPartitions, 1)
+
+	ordinary, err := ordinaryAdmin.ProvisionSubscriberPrincipal(
+		context.Background(),
+		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
+	)
+	require.NoError(t, err)
+	assert.True(t, ordinary.TopicRecordAccessGranted,
+		"a subscriber with no prefix keeps direct broker consumption: its topic grant IS its "+
+			"boundary and the broker keeps all of it")
+	assert.False(t, ordinary.KeyScopeBoundaryVerified,
+		"and it has no key boundary to verify, which is a different fact from an unverified one")
+}
+
+// TestProvisionSubscriberPrincipal_NarrowsAPreviouslyWideKeyScopedGrant proves the transition an
+// operator actually performs: a subscriber is provisioned, a prefix is recorded, and the grant
+// that already exists at the broker has to LOSE its record access.
+//
+// Creating the narrower binding set without removing the wider one would leave the subscriber
+// exactly as exposed as before while every response reported the boundary as enforced — the
+// worst of the three states, because it is the one that looks fixed.
+func TestProvisionSubscriberPrincipal_NarrowsAPreviouslyWideKeyScopedGrant(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	// First issuance: no prefix recorded, so the ordinary grant is written.
+	_, err := admin.ProvisionSubscriberPrincipal(
+		context.Background(),
+		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
+	)
+	require.NoError(t, err)
+	require.Len(t, fake.heldBindings(), 5, "two topics Read+Describe plus the group binding")
+
+	// A prefix is then recorded, and the credential is reissued.
+	result, err := admin.ProvisionSubscriberPrincipal(
+		context.Background(),
+		NewSubscriberProvisioningRequest(testKeyScopedSubscriber(), sentinelPassword),
+	)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, result.ACLBindingsRemoved,
+		"the two topic Read bindings must be DELETED, not merely left unrequested")
+
+	for _, held := range fake.heldBindings() {
+		if held.ResourceType != kafka.ResourceTypeTopic {
+			continue
+		}
+		assert.NotEqual(t, kafka.ACLOperationTypeRead, held.Operation,
+			"no topic Read may survive on a key-scoped principal; a surviving one is the "+
+				"whole-topic access the prefix is supposed to deny")
+	}
+
+	assert.Len(t, fake.heldBindings(), 3,
+		"the broker must hold exactly Describe on each topic plus the group binding")
+}
+
+// TestVerifyKeyScopeBoundary_RefusesEveryWayTheBoundaryCanBeAbsent pins the verification itself,
+// independently of the provisioning call that runs it.
+//
+// Each case is a distinct way a key-scoped subscriber could end up able to read records it is not
+// entitled to, and all three must refuse — the credential is revoked and no password is returned.
+// The last case is the one that could not be reached through aclEntries: a hand-made ALLOW
+// binding restoring the access Blnk withheld.
+func TestVerifyKeyScopeBoundary_RefusesEveryWayTheBoundaryCanBeAbsent(t *testing.T) {
+	scoped := NewSubscriberProvisioningRequest(testKeyScopedSubscriber(), sentinelPassword)
+	narrow := scoped.aclEntries()
+	reconciliation := SubscriberACLReconciliation{Principal: scoped.Principal}
+
+	require.NoError(t, verifyKeyScopeBoundary(scoped, narrow, reconciliation, true),
+		"the narrowed grant on an enforcing broker with no foreign binding is the boundary")
+
+	t.Run("a topic Read among the bindings", func(t *testing.T) {
+		wide := append([]kafka.ACLEntry(nil), narrow...)
+		wide = append(wide, kafka.ACLEntry{
+			ResourceType:        kafka.ResourceTypeTopic,
+			ResourceName:        "blnk.transactions",
+			ResourcePatternType: kafka.PatternTypeLiteral,
+			Principal:           kafkaPrincipalPrefix + scoped.Principal,
+			Host:                ACLHostAny,
+			Operation:           kafka.ACLOperationTypeRead,
+			PermissionType:      kafka.ACLPermissionTypeAllow,
+		})
+
+		err := verifyKeyScopeBoundary(scoped, wide, reconciliation, true)
+		require.ErrorIs(t, err, ErrSubscriberKeyScopeUnenforced,
+			"a grant carrying Read admits the principal to every record on the topic, so the "+
+				"prefix bounds nothing")
+	})
+
+	t.Run("a broker whose enforcement is unconfirmed", func(t *testing.T) {
+		err := verifyKeyScopeBoundary(scoped, narrow, reconciliation, false)
+		require.ErrorIs(t, err, ErrSubscriberKeyScopeUnenforced,
+			"withholding Read withholds nothing where no authorizer evaluates the bindings")
+	})
+
+	t.Run("a foreign ALLOW binding on the principal", func(t *testing.T) {
+		widened := SubscriberACLReconciliation{
+			Principal:    scoped.Principal,
+			ForeignAllow: []string{"Allow Read on Topic \"blnk.transactions\" (Literal)"},
+		}
+
+		err := verifyKeyScopeBoundary(scoped, narrow, widened, true)
+		require.ErrorIs(t, err, ErrSubscriberKeyScopeUnenforced,
+			"a binding Blnk did not create may restore exactly the access this boundary withholds")
+	})
+
+	t.Run("a subscriber with no key scope is verified vacuously", func(t *testing.T) {
+		ordinary := NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword)
+
+		require.NoError(t, verifyKeyScopeBoundary(ordinary, ordinary.aclEntries(), reconciliation, true),
+			"there is no key boundary to keep, and the topic grant the broker enforces is the "+
+				"whole of what such a subscriber asked for")
+	})
+}
+
+// TestBindingsGrantTopicRead_ReadsTheBindingsRatherThanTheRequest pins the leaf the verification
+// and the result field both rest on.
+//
+// It answers over the bindings on purpose: derived from the request instead, it would be a
+// restatement of KeyScoped and could not catch the case it exists for — a binding set that does
+// not match the decision the request asked for.
+func TestBindingsGrantTopicRead_ReadsTheBindingsRatherThanTheRequest(t *testing.T) {
+	assert.False(t, bindingsGrantTopicRead(nil),
+		"a principal granted nothing can read nothing")
+
+	assert.True(t, bindingsGrantTopicRead(
+		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword).aclEntries()))
+	assert.False(t, bindingsGrantTopicRead(
+		NewSubscriberProvisioningRequest(testKeyScopedSubscriber(), sentinelPassword).aclEntries()))
+
+	// A GROUP Read is not a record grant, and reading it as one would refuse every key-scoped
+	// subscriber — the group binding is retained for them precisely so the namespace stays
+	// reserved.
+	assert.False(t, bindingsGrantTopicRead([]kafka.ACLEntry{{
+		ResourceType:   kafka.ResourceTypeGroup,
+		ResourceName:   "blnk-sub-x.",
+		Operation:      kafka.ACLOperationTypeRead,
+		PermissionType: kafka.ACLPermissionTypeAllow,
+	}}))
+
+	// A DENY takes access away. Counting it as a grant would refuse issuance over a binding that
+	// makes the subscriber narrower, not wider.
+	assert.False(t, bindingsGrantTopicRead([]kafka.ACLEntry{{
+		ResourceType:   kafka.ResourceTypeTopic,
+		ResourceName:   "blnk.transactions",
+		Operation:      kafka.ACLOperationTypeRead,
+		PermissionType: kafka.ACLPermissionTypeDeny,
+	}}))
 }
 
 // TestProvisionSubscriberPrincipal_NeverGrantsWriteOrAWildcardPattern is the negative half
@@ -2182,15 +2635,29 @@ func assertNoPasswordInLogs(t *testing.T, hook *logtest.Hook) {
 			"a log message must never contain the SCRAM password")
 
 		for key, value := range entry.Data {
-			rendered := strings.TrimSpace(strings.Join([]string{key, format(value)}, "="))
+			rendered := strings.TrimSpace(
+				strings.Join([]string{key, renderAdminLogField(value)}, "="),
+			)
 			assert.NotContains(t, rendered, sentinelPassword,
 				"log field %q must never contain the SCRAM password", key)
 		}
 	}
 }
 
-// format renders a structured log field value for substring inspection.
-func format(value interface{}) string {
+// renderAdminLogField renders a structured log field value for substring inspection.
+//
+// # Why the name is qualified
+//
+// It was called `format`, which is one of the most ordinary identifiers a Go file can declare
+// and was declared at package scope in a test binary that compiles EVERY root-package test file
+// together. A second `format` helper written in any other root test file — for a load-test
+// summary, a topic name, a duration — would not merely shadow this one, it would fail to
+// compile the whole binary with a redeclaration error, and the reader of that error would be
+// looking at their own new file rather than at a password-inspection helper eight thousand
+// lines away in another. The name now says which subject it belongs to, which is the convention
+// every other shared helper in this file already follows (`fakeACLKey`, `newTestKafkaAdmin`,
+// `parseEventAdminSource`).
+func renderAdminLogField(value interface{}) string {
 	if err, ok := value.(error); ok {
 		return err.Error()
 	}
@@ -2591,68 +3058,16 @@ func TestProvisionSubscriberPrincipal_RefusesWhenEnforcementCannotBeConfirmed(t 
 	assert.Empty(t, fake.scram)
 }
 
-// TestProvisionSubscriberPrincipal_RevokesTheCredentialWhenBindingFails is the AUTH-01
-// compensation guard.
+// THE AUTH-01 COMPENSATION CONTRACT IS ASSERTED IN ONE PLACE:
+// TestProvisionSubscriberPrincipal_ReportsWhatCompensationActuallyAchieved, further down this
+// file.
 //
-// Provisioning writes the credential first, because a binding for a principal that does not
-// exist is inert while a credential without bindings AUTHENTICATES. So a binding failure used
-// to leave a live, valid credential that had been generated and returned by a call which then
-// reported failure — a secret in a subscriber's hands that no registry row records.
-//
-// The compensation revokes it. Both halves are asserted, because either alone leaves the
-// system in a state somebody has to clean up by hand.
-func TestProvisionSubscriberPrincipal_RevokesTheCredentialWhenBindingFails(t *testing.T) {
-	fake := newFakeAdminClient()
-	fake.aclErrors = []error{errors.New("binding rejected")}
-
-	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
-
-	result, err := admin.ProvisionSubscriberPrincipal(
-		context.Background(),
-		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
-	)
-	require.Error(t, err, "a failed binding must fail the provisioning")
-
-	assert.True(t, result.Compensated, "the caller must be told the broker was left clean")
-	assert.False(t, result.CredentialWritten,
-		"CredentialWritten must describe the state the broker is actually left in, not the step that ran")
-	assert.Empty(t, fake.scram,
-		"the credential written before the binding failed must not survive the failure")
-	assert.NotZero(t, fake.callCount("DeleteACLs"),
-		"the bindings that may have landed must be removed too, since CreateACLs is not atomic")
-}
-
-// TestProvisionSubscriberPrincipal_ReportsWhenCompensationItselfFails covers the state a caller
-// must be able to tell apart from a clean failure: the credential was written, the ACL grant
-// failed, AND revoking the credential failed too.
-//
-// The broker is then holding a principal that can authenticate and that no registry row
-// records. The result must say so — CredentialWritten true, Compensated false — because that is
-// the only signal the caller has, and the subscriber service branches on it to log at ERROR
-// with the principal named rather than as a retryable warning. Reporting "compensated" here
-// would tell an operator the broker was clean while a live credential was unaccounted for.
-func TestProvisionSubscriberPrincipal_ReportsWhenCompensationItselfFails(t *testing.T) {
-	fake := newFakeAdminClient()
-	fake.aclErrors = []error{errors.New("binding rejected")}
-	fake.scramDeleteError = errors.New("revocation rejected")
-
-	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
-
-	result, err := admin.ProvisionSubscriberPrincipal(
-		context.Background(),
-		NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
-	)
-	require.Error(t, err, "a failed binding must still fail the provisioning")
-	assert.Contains(t, err.Error(), "binding rejected",
-		"the ORIGINAL cause must survive; replacing it with the cleanup error would hide what happened")
-
-	assert.True(t, result.CredentialWritten,
-		"the credential could not be revoked, so it still exists and the caller must be told")
-	assert.False(t, result.Compensated,
-		"compensation failed, so the broker was NOT left clean and must not be reported as such")
-	assert.NotEmpty(t, fake.scram,
-		"the fake must still hold the credential, which is what makes this the unclean state")
-}
+// Two tests used to sit here — RevokesTheCredentialWhenBindingFails and
+// ReportsWhenCompensationItselfFails — asserting the same two outcomes that suite's first two
+// cases assert, on the same fixture, with the same injected failures. Three statements of one
+// contract is how the contract comes to be stated three DIFFERENT ways: a case added to one and
+// not the others reads as a deliberate distinction rather than the omission it is. The bound
+// suite carries the caller-cancellation cases too, which is the axis none of the three covered.
 
 // TestProvisionSubscriberPrincipal_WarnsWhenTheGrantIsEmpty covers the fail-closed registry
 // row: a subscriber authorised for nothing.
@@ -2689,14 +3104,19 @@ func TestProvisionSubscriberPrincipal_WarnsWhenTheGrantIsEmpty(t *testing.T) {
 }
 
 // TestNewSubscriberProvisioningRequest_MapsTheRegistryRowAndNotThePartitionKeyPrefix pins
-// the mapping, including the one field that is deliberately NOT mapped.
+// the mapping, including the one field whose VALUE is deliberately not mapped.
 //
-// Kafka's authorizer has no message-key dimension, so the partition-key prefix cannot be
-// enforced by any ACL. Expressing it as a PREFIXED topic pattern — the only binding that
-// looks like it might fit — would WIDEN the topic grant to every topic sharing the prefix
-// while appearing to narrow it, which is strictly worse than not enforcing it at all.
+// Kafka's authorizer has no message-key dimension, so the prefix's value cannot appear in any
+// ACL. Expressing it as a PREFIXED topic pattern — the only binding that looks like it might fit
+// — would WIDEN the topic grant to every topic sharing the prefix while appearing to narrow it,
+// which is strictly worse than not enforcing it at all.
+//
+// Its PRESENCE is mapped, onto KeyScoped, and that is what makes the boundary real: a key-scoped
+// request withholds record-level Read so that Blnk's stream gateway is the only path records can
+// take. Both halves are asserted here, because mapping neither leaves the prefix unenforced and
+// mapping the value would widen the grant.
 func TestNewSubscriberProvisioningRequest_MapsTheRegistryRowAndNotThePartitionKeyPrefix(t *testing.T) {
-	subscriber := testSubscriber()
+	subscriber := testKeyScopedSubscriber()
 
 	request := NewSubscriberProvisioningRequest(subscriber, sentinelPassword)
 
@@ -2704,6 +3124,11 @@ func TestNewSubscriberProvisioningRequest_MapsTheRegistryRowAndNotThePartitionKe
 	assert.Equal(t, subscriber.KafkaPrincipal, request.Principal)
 	assert.Equal(t, subscriber.ConsumerGroupID, request.ConsumerGroupPrefix)
 	assert.Equal(t, subscriber.AuthorizedTopics, request.Topics)
+	assert.True(t, request.KeyScoped,
+		"the PRESENCE of a prefix must reach the request, because it decides whether record-level "+
+			"Read is granted at all")
+	assert.False(t, NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword).KeyScoped,
+		"and a row with no prefix must not be narrowed: its topic grant is its whole boundary")
 	// The plaintext is unreachable from outside the package by design, so the assertion is
 	// on what IS observable: a secret of exactly the expected length is held. Reading the
 	// value back would be the leak the type exists to prevent.
@@ -2719,11 +3144,99 @@ func TestNewSubscriberProvisioningRequest_MapsTheRegistryRowAndNotThePartitionKe
 			"the partition-key prefix must never become a topic resource name")
 		assert.Equal(t, kafka.PatternTypeLiteral, entry.ResourcePatternType,
 			"the partition-key prefix must never be expressed as a prefixed topic pattern")
+		assert.NotEqual(t, kafka.ACLOperationTypeRead, entry.Operation,
+			"and a key-scoped subscriber must hold no topic Read at all: granting it would admit "+
+				"the principal to every record on the shared topic, which is the exposure the "+
+				"gateway exists to close")
 	}
+
+	// AND THE REQUEST IS VALID, precisely BECAUSE of the narrowing above. A declared key scope has
+	// no broker representation, so what makes such a request safe is that it asks for none: no
+	// topic Read is requested, every direct fetch is refused by the broker, and the records are
+	// delivered key-filtered by the stream gateway.
+	require.NoError(t, request.validate(),
+		"a key-scoped request that withholds record-level Read must be provisionable: refusing it "+
+			"withholds the credential instead of narrowing it, and leaves the third dimension of "+
+			"requirement R-7's access model with no working path at all")
+
+	// WHAT IS REFUSED IS THE PAIR THAT CANNOT BE TRUE AT ONCE: a request naming a key scope while
+	// asking for the ordinary, unnarrowed grant. NewSubscriberProvisioningRequest cannot produce
+	// it — it sets both fields from one row — but this type is exported, so a request assembled by
+	// hand is exactly how the enforcement point would be defeated through an ordinary authorized
+	// call. The credential it would mint reads every record on both granted topics beneath a row
+	// saying it may see one ledger's.
+	forged := request
+	forged.KeyScoped = false
+	require.Error(t, forged.validate(),
+		"a request that declares a key scope it does not narrow the grant for must fail "+
+			"validation, or the admin layer mints access wider than the registry row describes")
+	assert.Contains(t, forged.validate().Error(), "no message-key dimension",
+		"the refusal must say why no ACL can express the prefix")
+	assert.Contains(t, forged.validate().Error(), *subscriber.PartitionKeyPrefix,
+		"and must name the prefix, so an operator can see which value it was asked to enforce")
 
 	assert.Equal(t, SubscriberProvisioningRequest{Password: NewSubscriberSecret(sentinelPassword)},
 		NewSubscriberProvisioningRequest(nil, sentinelPassword),
 		"a nil registry row must produce a request that fails validation rather than a panic")
+}
+
+// TestProvisionSubscriberPrincipal_RefusesAKeyScopeItWouldNotNarrow is the admin layer's half of
+// the fail-closed rule, and it asserts the part that matters: NOTHING reaches the broker.
+//
+// A key-scoped row IS provisionable — its bindings are Describe on the topics and Read on the
+// consumer group, with no record-level Read anywhere, and the stream gateway delivers its records
+// key-filtered. What must never be provisioned is a request that names the prefix while asking for
+// the ordinary grant, because the credential it mints reads every record on every granted topic,
+// including other ledgers' and other subscribers', beneath a registry row saying it may see one
+// ledger's.
+//
+// NewSubscriberProvisioningRequest cannot build that pair. This is the barrier on the exported
+// function that any other caller — a CLI, a repair script, a future endpoint — would reach the
+// broker through, and it is where a request assembled by hand arrives.
+func TestProvisionSubscriberPrincipal_RefusesAKeyScopeItWouldNotNarrow(t *testing.T) {
+	fake := newFakeAdminClient()
+	admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+	subscriber := testSubscriber()
+	prefix := "ldg_9f2c"
+	subscriber.PartitionKeyPrefix = &prefix
+
+	forged := NewSubscriberProvisioningRequest(subscriber, sentinelPassword)
+	require.True(t, forged.KeyScoped, "the premise: the constructor narrows a key-scoped row")
+	forged.KeyScoped = false
+
+	result, err := admin.ProvisionSubscriberPrincipal(context.Background(), forged)
+
+	require.Error(t, err, "a key scope the request does not narrow the grant for must be refused")
+	assert.Contains(t, err.Error(), "records the partition key prefix")
+	assert.Contains(t, err.Error(), prefix,
+		"the refusal must name the prefix, so an operator can see which value blocked it")
+
+	assert.False(t, result.CredentialWritten,
+		"no credential may be reported written by a refusal that never reached the broker")
+	assert.False(t, result.CompensationOwed,
+		"and nothing can be owed, because nothing was done")
+	assert.Zero(t, fake.callCount("AlterUserScramCredentials"),
+		"the refusal must happen BEFORE the credential round trip")
+	assert.Zero(t, fake.callCount("CreateACLs"),
+		"and before any binding is created")
+
+	// BOTH REMEDIES THE REFUSAL NAMES MUST WORK, or it is a dead end.
+	//
+	// Building the request through the constructor, which narrows the grant:
+	_, err = admin.ProvisionSubscriberPrincipal(
+		context.Background(), NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+	)
+	require.NoError(t, err,
+		"the same row is provisionable through the constructor, which withholds record-level Read")
+
+	// Or clearing the prefix, which accepts whole-topic access:
+	subscriber.PartitionKeyPrefix = nil
+	_, err = admin.ProvisionSubscriberPrincipal(
+		context.Background(), NewSubscriberProvisioningRequest(subscriber, sentinelPassword),
+	)
+	require.NoError(t, err,
+		"and clearing the prefix makes the identical row provisionable on the ordinary terms")
 }
 
 // TestSubscriberProvisioningRequest_NormalisesItsInputs covers the small normalisations the
@@ -4731,94 +5244,224 @@ func TestEnsureTopics_ReportsEveryGeometryProblemTogether(t *testing.T) {
 	assert.ErrorIs(t, err, ErrPartitionGrowthRefused, "and the partition problem in the same failure")
 }
 
-// TestProvisionSubscriberPrincipal_ReportsWhatCompensationActuallyAchieved is the F-13
-// guard at the CALL SITE, which is where the defect lived.
+// TestProvisionSubscriberPrincipal_ReportsWhatCompensationActuallyAchieved is the F-13 and
+// CLEAN-01 guard at the CALL SITE, which is where the defect lived.
 //
 // Provisioning writes the SCRAM credential first and the ACL bindings second, so a binding
-// failure leaves a credential that AUTHENTICATES with no boundary. Compensation revokes it.
-// The bug was not in the compensation but in what the caller then claimed: it set
-// Compensated = true and CredentialWritten = false unconditionally, whatever the cleanup had
-// managed. A revocation that failed was therefore indistinguishable from one that worked,
-// the result said the broker was clean, and the downstream branch that reports a live orphan
-// could never run.
+// failure leaves a credential that AUTHENTICATES with no boundary. Compensation revokes it. The
+// bug was not in the compensation but in what the caller then claimed: it set Compensated = true
+// and CredentialWritten = false unconditionally, whatever the cleanup had managed. A revocation
+// that failed was therefore indistinguishable from one that worked, the result said the broker
+// was clean, and the downstream branch that reports a live orphan could never run.
 //
-// Both directions are asserted here, because only the pair proves the result is DERIVED from
-// the cleanup rather than asserted alongside it.
+// # Why the caller's cancellation is an axis of the table rather than a case of its own
+//
+// The dominant reason provisioning fails is its own five-second issuance budget expiring, so the
+// compensation is busiest exactly when the caller's context is already dead. That is not a
+// variation on the contract, it is the condition the contract exists for, and it multiplies
+// against every failure shape: a revocation can fail with a live caller or a dead one, and the
+// result must read identically in both. So the failure shape and the caller's fate are two
+// columns of one table, and every case asserts the same invariants.
+//
+// This suite is the ONLY statement of that contract in the file. Two earlier tests asserted the
+// first two cases separately; see the note where they used to sit.
+//
+// # What each case must establish, without exception
+//
+//   - THE PREMISE, unconditionally. The cancelled cases require ctx.Err() to be non-nil after
+//     the call, so a case whose cancellation never landed FAILS rather than passing vacuously.
+//     The previous version of this test cancelled with `defer cancel()` — after provisioning had
+//     returned — and then guarded its only assertion behind `if err != nil && CredentialWritten`,
+//     so it asserted nothing at all on every run.
+//   - THE REPORT MATCHES THE BROKER. Compensated and CredentialWritten are checked against the
+//     fake's own credential store, not merely against each other, so a result that describes a
+//     state the broker is not in cannot pass.
+//   - THE CLEANUP RAN ON A LIVE, BOUNDED CONTEXT. Every compensating call must have seen a
+//     context with no error and a deadline. A cleanup that inherited the caller's cancellation
+//     would be refused by the fake exactly as a broker refuses it, so `Compensated` would be
+//     false — but the context observation says WHY, which is the difference between diagnosing a
+//     detachment regression and diagnosing a broker fault.
 func TestProvisionSubscriberPrincipal_ReportsWhatCompensationActuallyAchieved(t *testing.T) {
 	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
 
-	bindingFailure := errors.New("creating ACL bindings was refused")
+	const (
+		bindingRefused    = "creating ACL bindings was refused"
+		revocationRefused = "deleting the credential was refused"
+		removalRefused    = "removing the ACL bindings was refused"
+	)
 
-	t.Run("a successful compensation reports a clean broker", func(t *testing.T) {
-		fake := newFakeAdminClient()
-		fake.aclErrors = []error{bindingFailure}
-		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+	cases := []struct {
+		name string
+		// cancelCaller cancels the request context from inside the CreateACLs round trip, which
+		// is the instant after the credential exists and before provisioning has finished.
+		cancelCaller bool
+		// scramDeleteError and deleteACLError inject failures into the two compensating calls.
+		scramDeleteError error
+		deleteACLError   error
+		// aclError injects the forward-path failure. The cancelled cases leave it nil, because
+		// the cancellation IS their failure — the round trip is refused for the same reason a
+		// real broker call is refused when the caller has gone away.
+		aclError error
 
-		result, err := admin.ProvisionSubscriberPrincipal(
-			context.Background(),
-			NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
-		)
-		require.Error(t, err, "the binding failure must still be reported to the caller")
+		// wantCompensated and wantCredentialWritten are the two reported flags.
+		wantCompensated       bool
+		wantCredentialWritten bool
+		// wantCause is a substring the returned error must still carry.
+		wantCause string
+	}{
+		{
+			name:            "a live caller whose binding fails leaves a clean broker",
+			aclError:        errors.New(bindingRefused),
+			wantCompensated: true,
+			wantCause:       bindingRefused,
+		},
+		{
+			name:                  "a live caller whose revocation also fails is told about the live orphan",
+			aclError:              errors.New(bindingRefused),
+			scramDeleteError:      errors.New(revocationRefused),
+			wantCredentialWritten: true,
+			wantCause:             bindingRefused,
+		},
+		{
+			name:            "a caller that goes away mid-provisioning still leaves a clean broker",
+			cancelCaller:    true,
+			wantCompensated: true,
+			wantCause:       context.Canceled.Error(),
+		},
+		{
+			name:                  "a caller that goes away and a revocation that fails is the live orphan",
+			cancelCaller:          true,
+			scramDeleteError:      errors.New(revocationRefused),
+			wantCredentialWritten: true,
+			wantCause:             context.Canceled.Error(),
+		},
+		{
+			name: "a caller that goes away and an inert binding left behind is still compensated",
+			// A DeleteACLs failure is logged and NOT returned: bindings for a principal that no
+			// longer exists grant nothing, so they are untidiness rather than access. The
+			// credential revocation is what decides the verdict, and it succeeded.
+			cancelCaller:    true,
+			deleteACLError:  errors.New(removalRefused),
+			wantCompensated: true,
+			wantCause:       context.Canceled.Error(),
+		},
+	}
 
-		assert.True(t, result.Compensated,
-			"the credential was revoked, so the broker is clean")
-		assert.False(t, result.CredentialWritten,
-			"no credential survives, so nothing is unaccounted for")
-		assert.Empty(t, fake.scram,
-			"the fixture must confirm the credential really is gone from the broker")
-	})
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fake := newFakeAdminClient()
+			if testCase.aclError != nil {
+				fake.aclErrors = []error{testCase.aclError}
+			}
+			fake.scramDeleteError = testCase.scramDeleteError
+			if testCase.deleteACLError != nil {
+				fake.deleteACLErrors = []error{testCase.deleteACLError}
+			}
 
-	t.Run("a FAILED compensation reports the live orphan", func(t *testing.T) {
-		// THE CENTRAL ASSERTION. The bindings fail AND the compensating credential
-		// deletion fails, so a principal that can authenticate is left behind with no
-		// registry record. The result must say so.
-		fake := newFakeAdminClient()
-		fake.aclErrors = []error{bindingFailure}
-		fake.scramDeleteError = errors.New("deleting the credential was refused")
-		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-		result, err := admin.ProvisionSubscriberPrincipal(
-			context.Background(),
-			NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword),
-		)
-		require.Error(t, err)
+			if testCase.cancelCaller {
+				// CANCELLED FROM INSIDE THE ROUND TRIP, not before the call. Cancelling up front
+				// fails the `ready` guard before anything is written, so there is no credential
+				// to compensate and the branch under test is never entered — which is why an
+				// up-front cancellation cannot test this at all. CreateACLs is chosen because
+				// the credential exists by then and the provisioning has not returned.
+				fake.onCall = func(method string) {
+					if method == "CreateACLs" {
+						cancel()
+					}
+				}
+			}
 
-		assert.False(t, result.Compensated,
-			"compensation did not succeed, so the broker must NOT be reported clean")
-		assert.True(t, result.CredentialWritten,
-			"a credential is still live at the broker and the caller has to be told, "+
-				"because this is the flag its live-orphan remediation branch reads")
+			admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
 
-		assert.NotEmpty(t, fake.scram,
-			"the fixture must confirm the credential really did survive, or the assertion "+
-				"above would be describing a state that never occurred")
-	})
+			result, err := admin.ProvisionSubscriberPrincipal(ctx,
+				NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword))
 
-	t.Run("the cleanup runs even when the caller's budget has expired", func(t *testing.T) {
-		// The dominant trigger for compensation is the 5-second issuance budget expiring.
-		// Cleanup used to run on that same context, so the revocation began already
-		// cancelled and could not succeed in precisely the case that matters.
-		fake := newFakeAdminClient()
-		fake.aclErrors = []error{bindingFailure}
-		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+			require.Error(t, err, "the provisioning failure must still be reported to the caller")
+			assert.Contains(t, err.Error(), testCase.wantCause,
+				"the ORIGINAL cause must survive; replacing it with a cleanup error would hide "+
+					"what actually happened")
 
-		expired, cancel := context.WithCancel(context.Background())
+			// THE PREMISE, REQUIRED RATHER THAN ASSUMED.
+			if testCase.cancelCaller {
+				require.Error(t, ctx.Err(),
+					"this case is about a caller that has gone away, so its context must be dead "+
+						"by now; if it is live, the cancellation never landed and everything below "+
+						"is asserting the ordinary path under a misleading name")
+			} else {
+				require.NoError(t, ctx.Err(),
+					"this case is about a live caller, so nothing may have cancelled it")
+			}
 
-		// Cancelled AFTER provisioning writes the credential would be ideal, but the fake
-		// is synchronous; cancelling up front is stricter, since it also proves the
-		// detached context is not merely inheriting a still-live deadline.
-		defer cancel()
-
-		result, err := admin.ProvisionSubscriberPrincipal(expired,
-			NewSubscriberProvisioningRequest(testSubscriber(), sentinelPassword))
-
-		// Whatever error surfaces, the invariant is the same: the result never claims a
-		// compensation that did not happen.
-		if err != nil && result.CredentialWritten {
-			assert.False(t, result.Compensated,
+			assert.Equal(t, testCase.wantCompensated, result.Compensated,
+				"Compensated must report what the cleanup ACHIEVED")
+			assert.Equal(t, testCase.wantCredentialWritten, result.CredentialWritten,
+				"CredentialWritten must describe the state the broker is actually left in, not "+
+					"the step that ran")
+			assert.False(t, result.Compensated && result.CredentialWritten,
 				"a live credential and a claimed compensation cannot both be true")
-		}
-	})
+
+			// THE BROKER ITSELF IS THE ARBITER of the two flags above.
+			if testCase.wantCredentialWritten {
+				assert.NotEmpty(t, fake.scram,
+					"the fixture must confirm the credential really did survive, or the flags "+
+						"above are describing a state that never occurred")
+			} else {
+				assert.Empty(t, fake.scram,
+					"the credential written before the failure must not survive it")
+			}
+
+			// BOTH COMPENSATING CALLS WERE MADE, AND EACH ON A LIVE, BOUNDED CONTEXT.
+			//
+			// DeleteACLs is asserted unconditionally because CreateACLs is not atomic across
+			// entries: some may have landed before the error, so the removal is attempted
+			// whatever the forward path managed.
+			assertCompensationRanDetached(t, fake, "DeleteACLs")
+			assertCompensationRanDetached(t, fake, "AlterUserScramCredentials")
+		})
+	}
+}
+
+// assertCompensationRanDetached requires that a compensating call was made and that every one of
+// its round trips ran on a live, bounded context.
+//
+// The credential deletion shares its method name with the credential WRITE, so the write's own
+// observation is skipped by position: the compensation is whatever came after the forward path,
+// and for AlterUserScramCredentials that is every call but the first.
+//
+// Both halves matter and they fail differently. A cleanup with no deadline is a cleanup that can
+// block a request indefinitely on a broker that has gone away, which is why the detached context
+// is bounded rather than merely detached. A cleanup with a cancelled context is the CLEAN-01
+// defect itself: it returns instantly, revokes nothing, and — before the result was derived from
+// the outcome — reported success.
+func assertCompensationRanDetached(t *testing.T, fake *fakeAdminClient, method string) {
+	t.Helper()
+
+	observations := fake.observedContextsFor(method)
+
+	if method == "AlterUserScramCredentials" {
+		require.GreaterOrEqual(t, len(observations), 2,
+			"the credential must have been written and then a revocation attempted; with only "+
+				"one call there was no compensation at all")
+		observations = observations[1:]
+	} else {
+		require.NotEmpty(t, observations,
+			"%s must be attempted during compensation, because CreateACLs is not atomic across "+
+				"entries and some bindings may have landed before the failure", method)
+	}
+
+	for index, observation := range observations {
+		assert.NoErrorf(t, observation.err,
+			"compensating %s call %d ran on a context that was already dead, so it could not "+
+				"have done anything: the cleanup is inheriting the caller's cancellation instead "+
+				"of running on kafkaCleanupContext's detached one", method, index)
+		assert.Truef(t, observation.hasDeadline,
+			"compensating %s call %d ran with no deadline at all; detached from cancellation is "+
+				"not licence to be unbounded, or a refusing broker holds the request open "+
+				"indefinitely", method, index)
+	}
 }
 
 // ---------------------------------------------------------------------------------------
@@ -5103,24 +5746,79 @@ func TestReconcileSubscriberACLs_RefusesWithoutASubscriber(t *testing.T) {
 // Zero-loss reconciliation — bounded per-partition coordinate mapping (V-2)
 // ---------------------------------------------------------------------------------------
 
-// fullyCorroboratedAudit builds an outbox-side audit in which every published row names a
-// distinct broker record INSIDE a measured window.
+// auditBound names how a corroborated audit's population is bounded, and therefore which
+// broker-side report it may legitimately be reconciled against.
 //
-// It is the precondition for a CONCLUSIVE verdict, so the cases below use it in order to keep
-// testing one property at a time rather than accidentally testing the uncorroborated-row
-// caveats.
-func fullyCorroboratedAudit(publishedRows int64) model.EventRecordIntervalAudit {
+// It is a REQUIRED parameter rather than a default because the bound has to match the report:
+// the verdict reads WindowRecordCount when both sides name a window and the retained interval
+// when neither does, so pairing a windowed audit with an unwindowed report — or the reverse —
+// tests the not-windowed caveat instead of whatever the case was written to test, and does so
+// without failing. Naming the bound at the call site is what makes that pairing visible.
+type auditBound int
+
+const (
+	// auditBoundedByRetainedInterval describes an audit bounded by the interval its
+	// corroborated rows actually span, which is what the repository reports when the caller
+	// asked for the whole retained history. It pairs with measuredReport and with any report
+	// that carries partition bounds and no WindowStart.
+	auditBoundedByRetainedInterval auditBound = iota
+
+	// auditBoundedBySharedWindow describes an audit bounded by the window BOTH sides were
+	// measured from, which is the posture the statistics endpoint uses. It pairs with
+	// windowedOffsetReport and with any report carrying reconciliationWindowStart.
+	auditBoundedBySharedWindow
+)
+
+// corroboratedAudit builds an outbox-side audit in which every published row names a distinct
+// broker record.
+//
+// It is the precondition for a CONCLUSIVE verdict, so cases use it in order to test one
+// property at a time rather than accidentally testing the uncorroborated-row caveats: with
+// PublishedRows, CorroboratedRows and DistinctCorroboratedRecords all equal there is no
+// unconfirmed row, no duplicate coordinate and nothing unmeasured for a caveat to fire on.
+//
+// # Why there is one of these and not two
+//
+// There were two — fullyCorroboratedAudit and fullyConfirmedAudit — differing only in the
+// bound, with near-identical doc comments each explaining the same three-equal-counts invariant
+// in its own words. Nothing named the difference, so
+// TestReconcileAgainstOutbox_RefusesToConcludeFromAnIncompleteMeasurement used BOTH inside one
+// function, and a reader had no way to tell whether that was deliberate pairing or a copy/paste
+// that happened to work. The invariant now lives in one place and the difference is a named
+// argument, so a mismatched pairing is visible in the case rather than buried in a helper name.
+//
+// Parameters:
+//   - publishedRows int64: the population size; every row is corroborated.
+//   - bound auditBound: which report shape this audit may be reconciled against.
+//
+// Returns:
+//   - model.EventRecordIntervalAudit: an audit with no caveat-bearing row of any kind.
+func corroboratedAudit(publishedRows int64, bound auditBound) model.EventRecordIntervalAudit {
 	now := time.Now().UTC()
 
-	return model.EventRecordIntervalAudit{
+	audit := model.EventRecordIntervalAudit{
 		PublishedRows:               publishedRows,
 		CorroboratedRows:            publishedRows,
 		DistinctCorroboratedRecords: publishedRows,
-		OldestTerminalAt:            now.Add(-time.Hour),
-		CorroboratedFrom:            now.Add(-time.Hour),
-		CorroboratedTo:              now,
 		MeasuredAt:                  now,
 	}
+
+	switch bound {
+	case auditBoundedByRetainedInterval:
+		// The interval the corroborated rows span. OldestTerminalAt matches its start, because
+		// a terminal row older than anything corroborated is exactly the shape that makes a
+		// verdict inconclusive and no case here is testing that.
+		audit.OldestTerminalAt = now.Add(-time.Hour)
+		audit.CorroboratedFrom = now.Add(-time.Hour)
+		audit.CorroboratedTo = now
+
+	case auditBoundedBySharedWindow:
+		// Fixed rather than time.Now(), so this side and the report name the SAME instant —
+		// which is the property the verdict checks before it agrees to compare window totals.
+		audit.WindowStart = reconciliationWindowStart()
+	}
+
+	return audit
 }
 
 // measuredReport builds a broker-side report with one topic and one measured partition,
@@ -5158,6 +5856,14 @@ func measuredReport(topic string, partition int, first, end int64) TopicOffsetRe
 // appear at all — emitting it with zeroed bounds would make every row on that partition look
 // like it named an offset beyond the log end, reporting a topic recreation where the truth is
 // only that the broker did not answer.
+//
+// The projection is exercised here against stated reports, because every shape a broker can
+// produce — an unavailable partition, an aged-out window, a topic missing altogether — is
+// reachable that way and only some of them are reachable against a live cluster. That the
+// intervals a REAL measurement emits are the intervals a REAL audit is then taken against is
+// proven end to end by TestZeroLoss_TheOutboxCensusAndTheBrokerOffsetsReconcileOverRealRecords
+// and TestZeroLoss_TheStatisticsProjectionIsAssembledFromLivePostgresAndLiveKafka, which drive
+// this method through the production orchestration against a live broker and a live database.
 func TestTopicOffsetReport_PartitionIntervalsAreTheWindowsTheAuditIsTakenAgainst(t *testing.T) {
 	report := TopicOffsetReport{
 		Topics: []TopicOffsetSnapshot{
@@ -5232,7 +5938,7 @@ func TestReconcileAgainstOutbox_DoesNotRestTheVerdictOnWholeTopicTotals(t *testi
 		// arithmetic the "overhead" was 999,000 and read as health; it is now simply context.
 		report := measuredReport("blnk.transactions", 0, 0, 1_000_000)
 
-		verdict := ReconcileAgainstOutbox(report, fullyCorroboratedAudit(1_000))
+		verdict := ReconcileAgainstOutbox(report, corroboratedAudit(1_000, auditBoundedByRetainedInterval))
 
 		assert.True(t, verdict.Conclusive,
 			"every claim was placed in a measured window, which is what the verdict rests on")
@@ -5253,7 +5959,7 @@ func TestReconcileAgainstOutbox_DoesNotRestTheVerdictOnWholeTopicTotals(t *testi
 		// window — and here every one is.
 		report := measuredReport("blnk.transactions", 0, 0, 900)
 
-		verdict := ReconcileAgainstOutbox(report, fullyCorroboratedAudit(1_000))
+		verdict := ReconcileAgainstOutbox(report, corroboratedAudit(1_000, auditBoundedByRetainedInterval))
 
 		assert.False(t, verdict.LossDetected,
 			"a shortfall in whole-topic totals is not evidence about this outbox's own records")
@@ -5314,7 +6020,7 @@ func TestReconcileAgainstOutbox_TreatsAnOffsetBeyondTheLogEndAsLoss(t *testing.T
 // which are what stop a green verdict being reported from a measurement that never covered
 // everything.
 func TestReconcileAgainstOutbox_RefusesToConcludeFromAnIncompleteMeasurement(t *testing.T) {
-	corroborated := fullyCorroboratedAudit(1_000)
+	corroborated := corroboratedAudit(1_000, auditBoundedByRetainedInterval)
 
 	cases := map[string]struct {
 		report TopicOffsetReport
@@ -5388,7 +6094,7 @@ func TestReconcileAgainstOutbox_RefusesToConcludeFromAnIncompleteMeasurement(t *
 		// topic with none of Blnk's own records affected must now be conclusive.
 		report := measuredReport("blnk.transactions", 0, 900_000, 1_000_000)
 
-		verdict := ReconcileAgainstOutbox(report, fullyCorroboratedAudit(1_000))
+		verdict := ReconcileAgainstOutbox(report, corroboratedAudit(1_000, auditBoundedByRetainedInterval))
 
 		assert.True(t, verdict.Conclusive,
 			"retention that deleted no record THIS OUTBOX named cannot make its verdict inconclusive")
@@ -5406,7 +6112,7 @@ func TestReconcileAgainstOutbox_RefusesToConcludeFromAnIncompleteMeasurement(t *
 		report := windowedOffsetReport(1_000)
 		report.RetainedCount = 12
 
-		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
+		verdict := ReconcileAgainstOutbox(report, corroboratedAudit(1_000, auditBoundedBySharedWindow))
 
 		assert.True(t, verdict.Conclusive,
 			"retention that removed records from OUTSIDE the measured window changes nothing about "+
@@ -5428,7 +6134,7 @@ func TestReconcileAgainstOutbox_RefusesToConcludeFromAnIncompleteMeasurement(t *
 			MeasuredAt:        time.Now().UTC(),
 		}
 
-		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
+		verdict := ReconcileAgainstOutbox(report, corroboratedAudit(1_000, auditBoundedBySharedWindow))
 
 		assert.Equal(t, int64(1_010), verdict.MessagesWritten,
 			"the cumulative sum counts a history the outbox no longer holds, and comparing against "+
@@ -5773,6 +6479,300 @@ func TestAuthorizerProbeMemo_IsNotConsultedAfterAFailure(t *testing.T) {
 		"no credential may be written while the boundary is unverified")
 }
 
+// coherentLagShape renders the lag-bearing content of a report, excluding everything that
+// legitimately differs between callers.
+//
+// Identity and MeasuredAt are dropped because two callers asking about the same topics at the
+// same instant SHOULD differ in those. Everything else must be identical, and every input to the
+// arithmetic is included rather than just the total: a caller served a partition list from one
+// view of the cluster and offset bounds from another produces a plausible total from an
+// incoherent snapshot, and only the per-partition detail exposes it.
+//
+// Parameters:
+//   - report ConsumerLagReport: the measurement to project.
+//
+// Returns:
+//   - string: a stable rendering, suitable for equality assertions and readable when one fails.
+func coherentLagShape(report ConsumerLagReport) string {
+	shape := fmt.Sprintf("total=%d missing=%v", report.TotalLag, report.MissingTopics)
+
+	for _, topic := range report.Topics {
+		shape += fmt.Sprintf(" | %s total=%d nocommit=%d unavailable=%d",
+			topic.Topic, topic.TotalLag, topic.PartitionsWithoutCommit, topic.PartitionsUnavailable)
+
+		for _, partition := range topic.Partitions {
+			shape += fmt.Sprintf(" p%d(committed=%d/%t first=%d end=%d lag=%d)",
+				partition.Partition, partition.CommittedOffset, partition.Committed,
+				partition.FirstOffset, partition.EndOffset, partition.Lag)
+		}
+	}
+
+	return shape
+}
+
+// TestKafkaAdminClient_SharedCachesAreSafeAndCoherentUnderConcurrentUse drives the two
+// process-shared caches from many goroutines at once.
+//
+// # Why this test has to exist
+//
+// One KafkaAdminClient is built per process and shared: the credential-issuance endpoint, the
+// metrics sweep and the topic assurance pass all reach the same instance, and the whole point of
+// the caches is that concurrent callers reuse each other's answers. Every guarantee the caches
+// make is therefore a guarantee about CONCURRENT use, and nothing exercised them concurrently.
+// The fake is mutex-guarded specifically so `go test -race` can, and no test asked it to.
+//
+// Three classes of defect are invisible to a serial test and live here:
+//
+//   - A DATA RACE on the memo fields. cacheMu guards them today; a future path that reads
+//     a.authorizerProbe or a.offsetSnapshots without it is a race the race detector reports only
+//     if two goroutines actually touch it at once.
+//   - AN INCOHERENT SNAPSHOT. The partition layout and the end offsets are cached TOGETHER
+//     because a lag computed from two different views of the cluster is a plausible number that
+//     is simply wrong. Under concurrency, a cache that stored the two halves separately — or
+//     published a half-built snapshot — yields exactly that, and only differing per-caller
+//     results reveal it.
+//   - A MEMO THAT DOES NOT MEMOISE. Serial tests prove the second call is served from the memo.
+//     They cannot show that forty concurrent calls do not each make their own round trip, which
+//     is the case the memo exists for: a metrics sweep and an issuance arriving together.
+//
+// # Why the bounds are inequalities
+//
+// authorizerActiveCached and partitionOffsetSnapshot check the cache, miss, and then do the
+// work: two callers arriving in the same instant can both miss and both ask. That is BENIGN —
+// the questions are idempotent and the second answer overwrites the first with the same value —
+// so the contract is not "exactly one round trip" but "at most one per concurrent first-arrival,
+// and never one per call". Asserting exactly one would be asserting single-flight deduplication
+// that the implementation does not claim and does not need. The bounds below are still decisive:
+// with the memo removed, every count becomes the call count, which is far above the worker count.
+//
+// # What is deliberately NOT driven concurrently
+//
+// InvalidateOffsetSnapshot is, because EnsureTopics calls it after creating or growing a topic
+// while a metrics sweep may be in flight — a real interleaving. WithOffsetSnapshotTTL is not: it
+// is a fluent configurator with no production caller at all, applied to a client before it is
+// shared, and its own documentation says the negative value is for tests rather than
+// configuration. Driving it against live readers would report a race on a sequence the type does
+// not support, which would be a finding about the test rather than about the client.
+func TestKafkaAdminClient_SharedCachesAreSafeAndCoherentUnderConcurrentUse(t *testing.T) {
+	storeKafkaTopicPrefix(t, DefaultTopicPrefix)
+
+	const (
+		workers = 8
+		rounds  = 5
+	)
+
+	t.Run("concurrent callers share the memoised answers", func(t *testing.T) {
+		fake := newFakeAdminClient()
+		fake.withOffsets("blnk.transactions", 0, 0, 100).withCommitted("blnk.transactions", 0, 40)
+		fake.withOffsets("blnk.transactions", 1, 10, 70).withCommitted("blnk.transactions", 1, 55)
+
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		// A FROZEN CLOCK, set before any goroutine starts. The TTL must not expire part-way
+		// through, or the round-trip bounds below would depend on how long the storm took.
+		frozen := time.Now()
+		admin.now = func() time.Time { return frozen }
+
+		// Subscribers are derived on THIS goroutine, because derivedSubscriber uses require and
+		// a failed require inside a worker goroutine is undefined behaviour rather than a
+		// failure. Distinct principals per worker keep the provisionings independent: the same
+		// principal provisioned concurrently would report CredentialReplaced for whichever
+		// arrived second, which is a property of the fixture rather than of the cache.
+		subscribers := make([]*model.EventSubscriber, workers)
+		for worker := range subscribers {
+			subscribers[worker] = derivedSubscriber(t,
+				fmt.Sprintf("cache-race-%02d", worker),
+				fmt.Sprintf("Cache Race %02d", worker),
+				[]string{"blnk.transactions"},
+			)
+		}
+
+		start := make(chan struct{})
+		shapes := make([]string, workers*rounds)
+		failures := make([]error, workers*rounds)
+		var group sync.WaitGroup
+
+		for worker := 0; worker < workers; worker++ {
+			group.Add(1)
+
+			go func(worker int) {
+				defer group.Done()
+
+				// ONE BARRIER, closed once, so every worker leaves at the same instant. Signalling
+				// each worker separately would serialise the arrivals and the contention this
+				// test exists to create would never happen.
+				<-start
+
+				for round := 0; round < rounds; round++ {
+					slot := worker*rounds + round
+
+					// The two paths ALTERNATE per round rather than being split across workers,
+					// so provisioning and lag reads interleave on every worker and both caches
+					// are contended for the whole storm rather than in two phases.
+					if round%2 == 0 {
+						_, err := admin.ProvisionSubscriberPrincipal(context.Background(),
+							NewSubscriberProvisioningRequest(subscribers[worker], sentinelPassword))
+						failures[slot] = err
+
+						continue
+					}
+
+					report, err := admin.ConsumerLag(context.Background(), ConsumerLagRequest{
+						SubscriberID: subscribers[worker].SubscriberID,
+						GroupID:      subscribers[worker].ConsumerGroupID,
+						Topics:       []string{"blnk.transactions"},
+					})
+					failures[slot] = err
+					shapes[slot] = coherentLagShape(report)
+				}
+			}(worker)
+		}
+
+		close(start)
+		group.Wait()
+
+		for slot, err := range failures {
+			require.NoErrorf(t, err, "slot %d failed; every call here is against a healthy fake", slot)
+		}
+
+		// EVERY LAG READING IS THE SAME READING. The fake's state never changes, so any
+		// difference is the cache serving one caller a view it did not serve another.
+		expected := "total=75 missing=[] | blnk.transactions total=75 nocommit=0 unavailable=0 " +
+			"p0(committed=40/true first=0 end=100 lag=60) " +
+			"p1(committed=55/true first=10 end=70 lag=15)"
+		measured := 0
+		for slot, shape := range shapes {
+			if shape == "" {
+				continue
+			}
+			measured++
+			assert.Equalf(t, expected, shape,
+				"slot %d was served a different view of the cluster from its peers", slot)
+		}
+		require.Positive(t, measured, "no lag reading was taken, so nothing above was asserted")
+
+		// THE MEMOISATION ITSELF.
+		lagCalls := measured
+		provisionings := workers*rounds - measured
+
+		probes := fake.authorizerProbeCount()
+		assert.LessOrEqual(t, probes, workers,
+			"the authorizer probe may be asked once per concurrent first-arrival at most; more "+
+				"than that means the memo is not being consulted")
+		assert.Lessf(t, probes, provisionings,
+			"%d provisionings made %d probes: the memo must serve the ones that arrived after an "+
+				"answer was cached, or a five-second issuance budget pays for a fixed fact every time",
+			provisionings, probes)
+
+		layoutReads := fake.callCount("Metadata")
+		boundsReads := fake.callCount("ListOffsets")
+		assert.LessOrEqual(t, layoutReads, workers,
+			"the partition layout is a property of the topics; one read per concurrent "+
+				"first-arrival is the ceiling")
+		assert.LessOrEqual(t, boundsReads, workers,
+			"the end offsets are a property of the topics too")
+		assert.Lessf(t, layoutReads, lagCalls,
+			"%d lag reads made %d layout reads; the snapshot must be shared or the metrics sweep "+
+				"is back to 3N round trips", lagCalls, layoutReads)
+		assert.Equal(t, layoutReads, boundsReads,
+			"the layout and the bounds are ONE snapshot, so they are read the same number of "+
+				"times; a divergence means the two halves are being cached separately, which is "+
+				"how a lag comes to be computed from two views of the cluster")
+
+		// The committed offsets are the one question that genuinely differs per group, so they
+		// are NOT cached and must be asked exactly once per lag reading.
+		assert.Equal(t, lagCalls, fake.callCount("OffsetFetch"),
+			"a cached committed offset would report another group's position as this group's")
+	})
+
+	t.Run("an invalidation racing readers never yields an incoherent answer", func(t *testing.T) {
+		// EnsureTopics invalidates after creating or growing a topic, so an invalidation arriving
+		// while a metrics sweep is mid-flight is an ordinary production interleaving rather than a
+		// contrived one. Round-trip counts are deliberately NOT asserted here: an invalidation
+		// forces a re-read by design, so the count is a function of the scheduler. What must hold
+		// regardless is that no caller ever sees a PARTIAL snapshot — a partition present in the
+		// layout but absent from the bounds, or a set of bounds from before an invalidation paired
+		// with a layout from after it.
+		fake := newFakeAdminClient()
+		fake.withOffsets("blnk.transactions", 0, 0, 100).withCommitted("blnk.transactions", 0, 40)
+		fake.withOffsets("blnk.transactions", 1, 10, 70).withCommitted("blnk.transactions", 1, 55)
+
+		admin := newTestKafkaAdmin(fake, MinTopicPartitions, 1)
+
+		start := make(chan struct{})
+		stop := make(chan struct{})
+		shapes := make([]string, workers*rounds)
+		failures := make([]error, workers*rounds)
+
+		var readers, invalidators sync.WaitGroup
+
+		// The invalidator runs for exactly as long as the readers do — stopped only once every
+		// reader has finished — so it is contending for the whole of their lifetime rather than
+		// for a fixed interval that may or may not overlap them.
+		invalidators.Add(1)
+		go func() {
+			defer invalidators.Done()
+
+			<-start
+
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					admin.InvalidateOffsetSnapshot()
+					// Yielded explicitly: an unyielding loop on a busy machine can hold the
+					// processor long enough that the readers make no progress, which would leave
+					// the interleaving this subtest depends on untested.
+					runtime.Gosched()
+				}
+			}
+		}()
+
+		for worker := 0; worker < workers; worker++ {
+			readers.Add(1)
+
+			go func(worker int) {
+				defer readers.Done()
+
+				<-start
+
+				for round := 0; round < rounds; round++ {
+					slot := worker*rounds + round
+
+					report, err := admin.ConsumerLag(context.Background(), ConsumerLagRequest{
+						SubscriberID: fmt.Sprintf("invalidation-%02d", worker),
+						GroupID:      fmt.Sprintf("blnk-sub-invalidation-%02d", worker),
+						Topics:       []string{"blnk.transactions"},
+					})
+					failures[slot] = err
+					shapes[slot] = coherentLagShape(report)
+				}
+			}(worker)
+		}
+
+		close(start)
+		readers.Wait()
+		close(stop)
+		invalidators.Wait()
+
+		expected := "total=75 missing=[] | blnk.transactions total=75 nocommit=0 unavailable=0 " +
+			"p0(committed=40/true first=0 end=100 lag=60) " +
+			"p1(committed=55/true first=10 end=70 lag=15)"
+
+		for slot, err := range failures {
+			require.NoErrorf(t, err, "slot %d failed while a snapshot was being invalidated; an "+
+				"invalidation must cost a round trip, never an error", slot)
+			assert.Equalf(t, expected, shapes[slot],
+				"slot %d was served an incoherent view while the snapshot was being invalidated",
+				slot)
+		}
+
+		assert.Positive(t, fake.callCount("Metadata"),
+			"the readers must actually have reached the broker, or the invalidation raced nothing")
+	})
+}
+
 // TestSubscriberSecret_CannotBeLeakedByAnyRenderingPath is the CWE-532 boundary around the
 // only secret this package handles.
 //
@@ -6059,12 +7059,11 @@ func TestReconcileSubscriberACLs_LeavesForeignDenyBindingsAloneAndCarriesOn(t *t
 
 	// THE ISSUANCE SUCCEEDED, so the credential is at the broker and nothing was compensated.
 	//
-	// These four assertions used to read the other way — credential gone, compensation
-	// confirmed, no SCRAM at the broker, "after the refusal" — which is the tail of
-	// TestProvisionSubscriberPrincipal_RefusesAForeignAllowBinding below, spliced onto a test
-	// whose own require.NoError three lines up says a DENY must NOT block issuance. The two
-	// cannot both hold: a refusal that returns no error is not a refusal, and this test's whole
-	// point is that a more-restricted principal still gets its credential.
+	// This is the half that distinguishes this test from
+	// TestProvisionSubscriberPrincipal_RefusesAForeignAllowBinding below, which asserts the
+	// mirror image on the same fields. The require.NoError three lines up is what forces this
+	// direction: a call that returned no error refused nothing, so there is no failure for a
+	// compensation to undo and the credential must be exactly where a clean issuance leaves it.
 	assert.True(t, report.CredentialWritten,
 		"a DENY narrows access, so the credential is written exactly as it would be without one")
 	assert.False(t, report.Compensated,
@@ -6781,6 +7780,13 @@ func TestPruneSubscriberAccess_RefusesARowItCannotDeriveABoundaryFrom(t *testing
 // while ANY row cannot be placed, the verdict is inconclusive — because those rows are exactly
 // what a surplus could be hiding. This test drives the masking scenario directly and requires
 // the verdict to refuse it.
+//
+// It states the two sides rather than measuring them, which is what lets the masking scenario be
+// constructed exactly — a thousand rows against a thousand records with ten unplaceable — and a
+// live cluster cannot be posed that way. The same refusal over genuinely measured inputs is
+// proven by the second arm of
+// TestZeroLoss_TheStatisticsProjectionIsAssembledFromLivePostgresAndLiveKafka, where a real
+// dispatched row carrying no broker coordinate withdraws a real verdict's confidence.
 func TestReconcileAgainstOutbox_RefusesAGreenVerdictWhileAnyRowCannotNameItsRecord(t *testing.T) {
 	t.Run("the masking scenario is no longer reported as no loss", func(t *testing.T) {
 		// 1,000 rows claim a publication. The broker holds 1,000 records. Under the old
@@ -6819,7 +7825,7 @@ func TestReconcileAgainstOutbox_RefusesAGreenVerdictWhileAnyRowCannotNameItsReco
 		// its own inside the window its partition can serve.
 		report := measuredReport("blnk.transactions", 0, 0, 1_000)
 
-		verdict := ReconcileAgainstOutbox(report, fullyCorroboratedAudit(1_000))
+		verdict := ReconcileAgainstOutbox(report, corroboratedAudit(1_000, auditBoundedByRetainedInterval))
 
 		assert.True(t, verdict.Conclusive)
 		assert.Zero(t, verdict.UnconfirmedEvents)
@@ -6831,7 +7837,7 @@ func TestReconcileAgainstOutbox_RefusesAGreenVerdictWhileAnyRowCannotNameItsReco
 		// A verdict without its window is how a reconciliation over an aggressively pruned
 		// outbox came to look complete: the rows it could not see had been deleted, so it
 		// reported success over whatever was left without saying so.
-		audit := fullyCorroboratedAudit(1_000)
+		audit := corroboratedAudit(1_000, auditBoundedByRetainedInterval)
 
 		verdict := ReconcileAgainstOutbox(measuredReport("blnk.transactions", 0, 0, 1_000), audit)
 
@@ -7374,6 +8380,15 @@ type statsFakeStore struct {
 	auditCalls     int
 	countedSince   time.Time
 	censusAttempts int
+
+	// historyCalls and unresolvedCalls separate the TWO aggregates, which is the substance of
+	// PERF-M05 at this layer: a posture that skips the broker side must take the unresolved
+	// aggregate — exact, unwindowed, bounded by outstanding work — and must never reach the
+	// one whose second arm counts 43.2 million dispatched index entries a day at the target
+	// rate. countCalls stays the total of the two, so every existing assertion on "was the
+	// count read at all" keeps its meaning.
+	historyCalls    int
+	unresolvedCalls int
 }
 
 func (s *statsFakeStore) CountEventOutboxByStatus(
@@ -7381,6 +8396,7 @@ func (s *statsFakeStore) CountEventOutboxByStatus(
 	since time.Time,
 ) (map[string]int64, error) {
 	s.countCalls++
+	s.historyCalls++
 	s.countedSince = since
 
 	if s.countErr != nil {
@@ -7388,6 +8404,31 @@ func (s *statsFakeStore) CountEventOutboxByStatus(
 	}
 
 	return s.counts, nil
+}
+
+// CountUnresolvedEventOutbox answers the lightweight aggregate, and OMITS the dispatched key.
+//
+// The omission is the whole reason this is a separate fake method rather than an alias: the real
+// query has no dispatched arm, so a fake that returned the same map as the history reading would
+// let a projection bug — reporting a dispatched figure that was never counted — pass every test.
+// It also records no `since`, because there is none to record.
+func (s *statsFakeStore) CountUnresolvedEventOutbox(_ context.Context) (map[string]int64, error) {
+	s.countCalls++
+	s.unresolvedCalls++
+
+	if s.countErr != nil {
+		return nil, s.countErr
+	}
+
+	unresolved := make(map[string]int64, len(s.counts))
+	for status, count := range s.counts {
+		if status == model.EventOutboxStatusDispatched {
+			continue
+		}
+		unresolved[status] = count
+	}
+
+	return unresolved, nil
 }
 
 func (s *statsFakeStore) CountBalanceMonitorHandoffByStatus(
@@ -7502,6 +8543,65 @@ func TestEventOutboxStatistics_ReadsTheOutboxFirstAndTheBrokerAsAnEnrichment(t *
 		assert.Nil(t, statistics.Reconciliation)
 		assert.Equal(t, int64(3), statistics.CountsByStatus[model.EventOutboxStatusPending])
 		assert.False(t, statistics.GeneratedAt.IsZero(), "the outbox side is always stamped")
+
+		// AND IT MUST NOT PAY FOR THE HISTORY EITHER (PERF-M05). The unresolved inventory is
+		// bounded by outstanding work and is index-only; the dispatched arm is an exact count
+		// over the one unbounded population — 43.2 million index entries a day at the target
+		// rate — and a posture that reads no broker has nothing to compare it against.
+		assert.Equal(t, 1, store.unresolvedCalls,
+			"a skipped posture must take the UNRESOLVED aggregate")
+		assert.Zero(t, store.historyCalls,
+			"and must never reach the aggregate whose second arm counts dispatched history")
+		assert.False(t, statistics.DispatchedHistoryCounted,
+			"and must say so, because an absent dispatched key otherwise reads as 'none were "+
+				"dispatched' — which is the opposite of the truth and would report total loss")
+		assert.NotContains(t, statistics.CountsByStatus, model.EventOutboxStatusDispatched,
+			"the key must be absent rather than zero, matching the query that produced it")
+	})
+
+	// The inverse, so the coupling is pinned in both directions: the two postures that measure
+	// the broker MUST count the history, because the dispatched figure exists only to be
+	// compared against what the broker recorded (PERF-M05).
+	for name, inclusion := range map[string]EventOffsetInclusion{
+		"a best-effort posture": EventOffsetsBestEffort,
+		"a required posture":    EventOffsetsRequired,
+	} {
+		t.Run(name+" counts the dispatched history", func(t *testing.T) {
+			store := &statsFakeStore{counts: map[string]int64{
+				model.EventOutboxStatusPending:    3,
+				model.EventOutboxStatusDispatched: 9,
+			}}
+			offsetCalls := 0
+
+			statistics, err := eventOutboxStatistics(context.Background(), store,
+				statsOffsetReader(statsMeasuredReport(), nil, &offsetCalls), inclusion, 0)
+			require.NoError(t, err)
+
+			assert.Equal(t, 1, store.historyCalls,
+				"a posture that measures the broker must count the outbox side it is compared against")
+			assert.Zero(t, store.unresolvedCalls,
+				"and must take ONE aggregate rather than both: the history reading already "+
+					"contains every unresolved count")
+			assert.True(t, statistics.DispatchedHistoryCounted)
+			assert.Equal(t, int64(9), statistics.CountsByStatus[model.EventOutboxStatusDispatched])
+			assert.Equal(t, int64(3), statistics.CountsByStatus[model.EventOutboxStatusPending],
+				"and the unresolved counts are still exact and complete in that reading")
+		})
+	}
+
+	// The ZERO VALUE is the cheap posture, which is what keeps the Go default and the HTTP
+	// default from documenting different behaviour (PERF-M02). It used to be best-effort, so a
+	// caller that constructed the type without thinking made a broker round trip and a
+	// history-sized count.
+	t.Run("the zero value of the posture is skipped", func(t *testing.T) {
+		var posture EventOffsetInclusion
+
+		assert.Equal(t, EventOffsetsSkipped, posture,
+			"the cheapest, most failure-free posture must be what a caller gets by saying nothing")
+		assert.False(t, posture.countsDispatchedHistory(),
+			"and it must not count the one unbounded population")
+		assert.True(t, EventOffsetsBestEffort.countsDispatchedHistory())
+		assert.True(t, EventOffsetsRequired.countsDispatchedHistory())
 	})
 
 	t.Run("a best-effort posture degrades when the broker cannot be read", func(t *testing.T) {
@@ -7613,6 +8713,13 @@ func TestEventOutboxStatistics_ReadsTheOutboxFirstAndTheBrokerAsAnEnrichment(t *
 // established. "Measured and zero" and "not measured" are different answers, and the
 // numbers alone cannot distinguish them — which is why the two booleans exist and why
 // the verdict is absent rather than green when nothing was covered.
+//
+// The absence cases are the ones a live stack cannot produce on demand: a broker that answers
+// about no topics, an audit that was never taken, a posture that skipped Kafka entirely. The
+// PRESENCE case — both sides measured, a verdict produced, and its figures drawn from the same
+// rows the census counted — is proven against a live broker and a live database by
+// TestZeroLoss_TheStatisticsProjectionIsAssembledFromLivePostgresAndLiveKafka, which calls this
+// very orchestration with the real repository and the real offset reader.
 func TestEventOutboxStatistics_ProducesAVerdictOnlyWhenBothSidesWereMeasured(t *testing.T) {
 	audit := model.EventRecordIntervalAudit{
 		PublishedRows:               10,
@@ -7787,13 +8894,17 @@ func TestEventOutboxStatistics_ReportsTheEventsThatAreOwed(t *testing.T) {
 	})
 
 	t.Run("a census that cannot be read is absent rather than zero", func(t *testing.T) {
+		// PENDING rather than dispatched, because the posture below is Skipped and a skipped
+		// posture reads the UNRESOLVED aggregate, which has no dispatched arm at all
+		// (PERF-M05). A dispatched-only fixture would come back empty and the "the counts
+		// still answer" assertion below would then be checking the wrong thing.
 		for name, store := range map[string]*statsFakeStore{
 			"the handoff census fails": {
-				counts:     map[string]int64{model.EventOutboxStatusDispatched: 1},
+				counts:     map[string]int64{model.EventOutboxStatusPending: 1},
 				handoffErr: errors.New("dial tcp 10.0.0.7:5432: connect: refused"),
 			},
 			"the batch census fails": {
-				counts:     map[string]int64{model.EventOutboxStatusDispatched: 1},
+				counts:     map[string]int64{model.EventOutboxStatusPending: 1},
 				batchesErr: errors.New("statement timeout"),
 			},
 		} {
@@ -7858,12 +8969,6 @@ func TestEventOutboxStatistics_NamesAStatusNothingReportsACountFor(t *testing.T)
 		assert.Empty(t, statistics.UnreportedStatuses)
 	})
 }
-
-// measuredOffsetReport built a two-partition report from a single record total. It is RETIRED:
-// measuredReport above states a partition's bounds directly, so it expresses this shape and the
-// aged-out one this could not — its FirstOffset was fixed at zero. The reason the partition
-// detail had to be there in the first place is recorded on measuredReport, where it now applies
-// to sixteen callers instead of none.
 
 // TestReconcileSubscriberACLs_LeavesEveryBindingBlnkDoesNotOwn is the safety half of AUTH-02.
 //
@@ -8178,22 +9283,6 @@ func TestTopicCatalogueGate_OpensOnceAndOnlyOnAVerifiedCatalogue(t *testing.T) {
 	})
 }
 
-// fullyConfirmedAudit builds an outbox-side audit in which every published row names a
-// distinct broker record.
-//
-// It is the precondition for a CONCLUSIVE verdict (OBS-02), so the lower-bound cases below use
-// it in order to keep testing the direction of the comparison rather than accidentally testing
-// the unconfirmed-row caveat.
-func fullyConfirmedAudit(publishedRows int64) model.EventRecordIntervalAudit {
-	return model.EventRecordIntervalAudit{
-		PublishedRows:               publishedRows,
-		CorroboratedRows:            publishedRows,
-		DistinctCorroboratedRecords: publishedRows,
-		MeasuredAt:                  time.Now().UTC(),
-		WindowStart:                 reconciliationWindowStart(),
-	}
-}
-
 // reconciliationWindowStart is the instant both sides of a reconciliation are measured from.
 //
 // A CONCLUSIVE verdict now requires the two sides to name the same window (PERF-P05), so a
@@ -8233,7 +9322,7 @@ func TestReconcileAgainstOutbox_TreatsMessagesAsALowerBoundOnEvents(t *testing.T
 	t.Run("a surplus is expected, not loss", func(t *testing.T) {
 		report := windowedOffsetReport(1_100)
 
-		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
+		verdict := ReconcileAgainstOutbox(report, corroboratedAudit(1_000, auditBoundedBySharedWindow))
 		assert.False(t, verdict.LossDetected,
 			"100 more records than events is redelivery and replay overhead, which is normal")
 		assert.True(t, verdict.Conclusive)
@@ -8249,7 +9338,7 @@ func TestReconcileAgainstOutbox_TreatsMessagesAsALowerBoundOnEvents(t *testing.T
 	t.Run("a shortfall is loss", func(t *testing.T) {
 		report := windowedOffsetReport(990)
 
-		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
+		verdict := ReconcileAgainstOutbox(report, corroboratedAudit(1_000, auditBoundedBySharedWindow))
 		assert.True(t, verdict.LossDetected,
 			"fewer records than rows means rows claim a publication that never happened")
 		assert.Equal(t, int64(-10), verdict.Overhead,
@@ -8260,7 +9349,7 @@ func TestReconcileAgainstOutbox_TreatsMessagesAsALowerBoundOnEvents(t *testing.T
 	t.Run("exact equality is not loss", func(t *testing.T) {
 		report := windowedOffsetReport(1_000)
 
-		verdict := ReconcileAgainstOutbox(report, fullyConfirmedAudit(1_000))
+		verdict := ReconcileAgainstOutbox(report, corroboratedAudit(1_000, auditBoundedBySharedWindow))
 		assert.False(t, verdict.LossDetected, "the boundary is inclusive: equal is not short")
 		assert.Zero(t, verdict.Overhead)
 	})

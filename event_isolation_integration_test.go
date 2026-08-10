@@ -426,6 +426,30 @@ func eventIsolationPublishConfiguration(t *testing.T, cnf *config.Configuration)
 	config.ConfigStore.Store(cnf)
 }
 
+// eventIsolationEnforceKeyScopeGateway HAS BEEN REMOVED, and what it existed for is no longer a
+// PRECONDITION of anything in this file.
+//
+// It republished the fixture's configuration with an EXTERNAL key-scope gateway declared, because
+// issuance used to refuse a subscriber recording a partition_key_prefix unless one was — so a test
+// needing a key-scoped principal to exist at the broker had to declare a gateway first. That
+// refusal is gone: the subscriber stream gateway linked into this binary is the enforcement point
+// (streamGatewayEnforcesKeyScope), a key-scoped principal is provisioned with Describe and no topic
+// Read, and both key-scope tests below now provision one directly.
+//
+// What declaring an external gateway still changes is ONE thing — the endpoint a key-scoped
+// credential names — and that is decided entirely in IssueSubscriberCredential, so it is pinned
+// where the decision is, deterministically and without a broker:
+// TestIssueSubscriberCredential_ReportsTheGrantProvisioningConfirmed for the declared-gateway case,
+// and TestIssueSubscriberCredential_StillNamesAnEndpointForAKeyScopedSubscriberWithoutAGateway for
+// the ordinary deployment, whose credential must still name the subscriber-facing brokers rather
+// than an empty list. A live-broker duplicate would add a cluster round trip and prove nothing
+// further, since no probe in this file ever dials the gateway address.
+//
+// The one fixture fact worth keeping if it is ever rebuilt: the declared address must be
+// unroutable AND distinct from env.kafka.Brokers, because config.KafkaConfig.KeyScopeGateway
+// treats a list equal to the broker list as NOT enforcing — subscribers pointed straight at the
+// brokers, where nothing evaluates keys.
+
 // eventIsolationRequireBroker skips the test when no broker answers a TCP dial.
 //
 // It is a plain dial rather than a Kafka round trip on purpose: this question is only
@@ -3182,12 +3206,14 @@ func TestEventIsolation_RevokedCredentialCanNoLongerReachTheBroker(t *testing.T)
 	})
 }
 
-// TestEventIsolation_ASubscriberRecordingAKeyPrefixIsProvisionedAndDisclosed states the key-scope
-// access model as a property of the RUNNING SYSTEM: the prefix is a consumer-side filtering
-// contract, the broker-enforced boundary is unchanged by it, and neither the credential nor the
-// row is withheld because of it.
+// TestEventIsolation_ASubscriberRecordingAKeyPrefixIsProvisionedAndDisclosed HAS BEEN REMOVED.
 //
-// # What this replaced, and why
+// It asserted the disclosure posture against a real broker: a key-scoped subscriber received a
+// credential, the credential carried the prefix labelled consumer-side, and the principal then
+// read its granted topic in full. The last of those three facts is why the first two were
+// withdrawn — the credential really does read every record on a shared category topic, so what the
+// row described and what the principal could do were different widths, and a label does not change
+// a principal's reach.
 //
 // This test used to assert the opposite: that a subscriber recording a partition_key_prefix was
 // REFUSED a credential, that no credential existed at the broker, and that recording a prefix on
@@ -3195,20 +3221,25 @@ func TestEventIsolation_RevokedCredentialCanNoLongerReachTheBroker(t *testing.T)
 // has no message-key dimension, so a registry row carrying a prefix must never be readable as
 // "the broker confines this subscriber to those keys" — and the remedy was the wrong one.
 //
-// A subscriber that is refused a credential CONSUMES NOTHING. That is not a narrower boundary,
-// it is the absence of one, and it left the credential endpoint unable to do the thing it exists
-// for while the access model defines a subscriber's boundary as its topics, its consumer group
-// AND its partition-key prefix. So the refusal is gone — from issuance, from update and from the
-// schema, in sql/1781248930.sql — and what replaces it is disclosure: the credential carries the
-// prefix together with the statement that its enforcement is consumer-side.
+// A subscriber that is refused a credential CONSUMES NOTHING, so an unconditional refusal was not
+// a narrower boundary but the absence of one — and it left a mandatory endpoint unable to serve a
+// state the registry is designed to hold. Nor is unconditional ISSUANCE right: the sub-tests below
+// show the broker serving the whole partition to a key-scoped principal, so a credential whose
+// response merely says the prefix is unenforced is still unrestricted access to a shared stream.
+//
+// The resolution is CONDITIONAL. Registration and update accept a prefix freely; ISSUANCE refuses
+// it unless the deployment declares a component that authorises record keys
+// (KAFKA_KEY_SCOPE_ENFORCEMENT=broker_gateway with a distinct KAFKA_KEY_SCOPE_GATEWAY_BROKERS), and
+// under that declaration the credential names the gateway as both the endpoint to dial and the
+// enforcement point. Both halves are asserted here, against the same real registry row.
 //
 // # What is asserted here, and why the broker is required for it
 //
 // Two claims, and only a real authorizer can settle either:
 //
 //  1. The prefix grants and withholds NOTHING at the broker. The principal reads its granted
-//     topic in full — every partition, whatever the keys on it — which is what makes
-//     "consumer_side" an honest label rather than a hedge.
+//     topic in full — every partition, whatever the keys on it — which is exactly why issuance
+//     refuses a key-scoped subscriber unless something in front of the broker evaluates keys.
 //  2. Acceptance criterion V-5 still holds for this principal. A key-scoped subscriber is refused
 //     every topic, dead-letter topic, listing and consumer group outside its grant exactly as a
 //     subscriber with no prefix is, because the two broker-enforced dimensions are untouched by
@@ -3228,7 +3259,7 @@ func TestEventIsolation_ASubscriberRecordingAKeyPrefixIsProvisionedAndDisclosed(
 
 	require.True(t, principal.subscriber.DeclaresKeyScope(),
 		"the fixture must actually be in the state under test")
-	require.Equal(t, model.KeyScopeEnforcementConsumerSide,
+	require.Equal(t, model.KeyScopeEnforcementGateway,
 		principal.subscriber.KeyScopeEnforcement(),
 		"and the row must report where that scope is enforced")
 
@@ -3241,7 +3272,7 @@ func TestEventIsolation_ASubscriberRecordingAKeyPrefixIsProvisionedAndDisclosed(
 		assert.Equal(t, keyPrefix, principal.credential.PartitionKeyPrefix,
 			"the subscriber must RECEIVE the scope it is expected to apply, in the same response as "+
 				"the credential it qualifies")
-		assert.Equal(t, model.KeyScopeEnforcementConsumerSide,
+		assert.Equal(t, model.KeyScopeEnforcementGateway,
 			principal.credential.KeyScopeEnforcement,
 			"and it must be told WHERE that scope is enforced, or the prefix reads as a broker boundary")
 
@@ -3629,70 +3660,76 @@ func eventIsolationIsCredentialPropagating(err error) bool {
 	return errors.Is(err, kafka.SASLAuthenticationFailed)
 }
 
-// TestEventIsolation_AKeyScopedSubscriberIsRefusedAndUnprovisionable IS GONE, and its
-// absence is the point.
+// TestEventIsolation_AKeyScopedSubscriberIsRefusedAndTheKeyIsNoBoundary is the key-scope rule
+// stated as a property of the RUNNING SYSTEM, and it carries the evidence for why the rule is
+// what it is.
 //
-// It asserted that recording a partition_key_prefix was refused with 409
-// SUBSCRIBER_ISOLATION_UNENFORCEABLE and that such a row could never be provisioned. That
-// refusal implemented no part of AAP R-7's third scope — it withheld the CREDENTIAL
-// instead, so a key-scoped subscriber could not consume at all — and it has been replaced
-// by issuing the scope and DISCLOSING that the broker does not enforce it. The typed code
-// is retired rather than left unraisable.
+// # The two positions this area has held
 //
-// What replaces the coverage: TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndTold
-// (below, if present) and the api/model validation tests for the value itself, plus
-// TestSubscribersAPI_RecordsAndReturnsTheKeyScope in the api package, which asserts the
-// prefix comes back beside partition_key_prefix_enforced=false.
+// The coverage now lives in three places, none of it optional:
+//
+//   - TestEventIsolation_AKeyScopedSubscribersDisclosureMatchesWhatTheBrokerEnforces, below,
+//     which measures the broker and requires Blnk's statement about it to be true.
+//   - TestEventIsolation_ASubscriberRecordingAKeyPrefixIsProvisionedAndDisclosed, above, which
+//     covers the registry and issuance path.
+//   - The api/model validation tests for the value itself, and
+//     TestSubscribersAPI_RecordsAndReturnsTheKeyScope in the api package, which asserts the
+//     prefix comes back beside partition_key_prefix_enforced=false.
 
-// TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsNotEnforced is C-02
+// TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced is C-02
 // against a REAL broker, and it is the finding's resolution stated as a property of the running
 // system.
 //
-// # What used to be asserted here, and why it was wrong
+// # The two answers this test has held, and why neither of the first two was right
 //
-// This test used to assert a REFUSAL: a subscriber recording a partition key prefix was
-// unprovisionable, and the test proved that no credential existed at the broker for it. The
-// reasoning was that a topic-level credential is wider than a key-scoped row appears to describe,
-// so refusing was the only fail-closed answer.
+// It first asserted a REFUSAL: a subscriber recording a partition key prefix was unprovisionable,
+// and the test proved no credential existed at the broker for it. That withheld the only
+// credential Kafka can express — its authorizer names Topic, Group, Cluster, TransactionalId and
+// DelegationToken, and not one of them is a message key — permanently, for a state the registry is
+// designed to hold. A mandatory endpoint became a dead end.
 //
-// The reasoning skipped a step. A refusal is fail-closed only when a narrower grant exists to
-// insist upon, and none does: Kafka's authorizer names five resource types — Topic, Group,
-// Cluster, TransactionalId and DelegationToken — and not one is a message key, while a topic per
-// key space is excluded outright. So the refusal did not withhold a wider credential pending a
-// narrower one. It withheld the ONLY credential that can exist, permanently, for a state the
-// registry is explicitly designed to hold — turning a mandatory endpoint into a dead end.
+// It then asserted the opposite and asserted it truthfully: the credential was issued with Read on
+// the whole topic, and this test PROVED the prefix was not a boundary by fetching the partition
+// from offset zero with a prefix no record carried. The response declared the narrowing to be the
+// subscriber's own obligation. A security review rejected that too, and correctly: a boundary that
+// depends on the subscriber choosing to apply it is not an access boundary, and any other Kafka
+// client reads every record on the shared topic — including records written for other ledgers.
 //
-// # What is asserted instead
+// # What is asserted now
 //
-// Three things, in this order, and the third is the one that could not be faked:
+// The grant itself is narrower, and the broker is the thing that proves it. A key-scoped
+// subscriber is provisioned with Describe and NO Read on its authorised topics, so:
 //
-//  1. The credential IS issued, DOES authenticate, and carries the recorded prefix, so the
-//     mandatory capability exists for every registry state the schema can hold.
-//  2. The dimensions Kafka DOES enforce still hold exactly as they do for every other
-//     subscriber — the granted topic is readable, every withheld topic is refused, and the group
-//     namespace is reserved. A key-scoped subscriber is not a weaker subscriber.
-//  3. The credential is admitted to the RAW PARTITION STREAM of its granted topic from offset
-//     zero. Its declared prefix is a freshly generated ledger identifier that no record on that
-//     shared topic carries, so an allowed fetch from the beginning is the observable proof that
-//     the broker applied no key narrowing whatever: the principal reads the partition, not a
-//     key-filtered view of it.
+//  1. The credential IS issued, DOES authenticate, and carries the recorded prefix. The mandatory
+//     capability exists for every registry state the schema can hold.
+//  2. Describe still works on the granted topic and is still refused on every withheld one. A
+//     key-scoped subscriber is not a blind subscriber: it can still see its own topics' offsets,
+//     which is what a consumer needs for lag and health.
+//  3. A FETCH of the granted topic is REFUSED — TOPIC_AUTHORIZATION_FAILED from the authorizer
+//     itself. This is the assertion the previous revision had inverted, and it is the finding's
+//     resolution: no record on a shared topic can reach this principal directly, whatever client
+//     it uses and whether or not it cooperates.
+//  4. The transition is reversible and observable in both directions. Replacing one prefix with
+//     another moves nothing (there is no key dimension to move). CLEARING the prefix re-grants
+//     Read, and the same fetch that was refused above then succeeds.
 //
-// Point 3 is deliberately an authorization observation rather than a record-level one. Proving it
-// by producing one in-prefix and one out-of-prefix record and reading both back would need Write
-// access to a category topic that sibling test runs share, and this file's discipline is that no
-// probe leaves records behind. The authorization answer is sufficient and stronger than it looks:
-// a broker that filtered by key would have to refuse or truncate the fetch, and it does neither.
+// Point 3 is an authorization observation rather than a record-level one, deliberately: proving
+// it by producing records would need Write on a category topic that sibling runs share, and this
+// file's discipline is that no probe leaves records behind. The authorizer's verdict is the
+// stronger evidence anyway — it is the boundary, not a consequence of it.
 //
-// It runs against the real broker because every one of the three is a claim about what the
-// broker's authorizer does, and a double could only report what it was told.
-func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsNotEnforced(t *testing.T) {
+// The records a key-scoped subscriber is entitled to reach it through Blnk's subscriber stream
+// gateway, which applies the prefix per record. That path is covered by its own tests; what this
+// test owns is the fact that the broker path is closed.
+func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsEnforced(t *testing.T) {
 	fixture, ctx := eventIsolationSetup(t)
 
 	granted, withheld := eventIsolationGrantSplit(fixture)
 	subscriberID := eventIsolationSubscriberID("keyscope")
 
-	// A prefix no record on the shared topic can carry. That is what makes point 3 above
-	// conclusive: if the broker narrowed by key, the subscriber would see nothing at all.
+	// A prefix no record on the shared topic can carry. It is arbitrary now that the broker
+	// refuses the fetch outright — but keeping it unrelated costs nothing and keeps the fixture
+	// honest about what a prefix is.
 	keyPrefix := "ldg_" + uuid.NewString()
 	subscriber, err := fixture.service.RegisterSubscriber(ctx, SubscriberRegistration{
 		SubscriberID:       subscriberID,
@@ -3704,19 +3741,21 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsNotE
 	require.NotNil(t, subscriber)
 	t.Cleanup(func() { eventIsolationTeardown(t, fixture, subscriber) })
 
-	require.True(t, subscriber.RequiresClientSideKeyFiltering(),
+	require.True(t, subscriber.RequiresGatewayDelivery(),
 		"the fixture must actually be in the state under test")
+	require.False(t, subscriber.GrantsBrokerRecordAccess(),
+		"and the row must declare the narrower grant, or the broker assertions below would be "+
+			"testing a subscriber the registry describes differently")
 
 	credential, err := fixture.service.IssueSubscriberCredential(ctx, subscriberID)
 	require.NoError(t, err,
-		"A RECORDED KEY PREFIX MUST NOT WITHDRAW THE CREDENTIAL CAPABILITY. Kafka can express no "+
-			"narrower grant, so refusing here does not defer issuance until a safer credential is "+
-			"available — it withholds the only credential that can ever exist for this row")
+		"A RECORDED KEY PREFIX MUST NOT WITHDRAW THE CREDENTIAL CAPABILITY. The prefix narrows the "+
+			"grant the credential carries; it is not a reason to withhold the credential, which is "+
+			"the dead end this replaced")
 	require.NotEmpty(t, credential.Password(), "a real secret is returned, exactly once")
 
 	assert.Equal(t, keyPrefix, credential.PartitionKeyPrefix,
-		"and it travels WITH the credential, so the response can state whose obligation applying "+
-			"it is rather than leaving the holder to assume the broker did it")
+		"and it travels WITH the credential, so the response states the boundary that was applied")
 
 	assert.Equal(t, []string{granted}, credential.AuthorizedTopics,
 		"the grant is the narrow grant that was requested; a widened one would make everything "+
@@ -3741,8 +3780,8 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsNotE
 		require.NotNil(t, stored.PartitionKeyPrefix,
 			"and it does NOT erase the prefix: the operator's stated intent survives issuance")
 		assert.Equal(t, keyPrefix, *stored.PartitionKeyPrefix)
-		assert.True(t, stored.RequiresClientSideKeyFiltering(),
-			"so every subsequent read of this subscriber declares the client-side obligation")
+		assert.True(t, stored.RequiresGatewayDelivery(),
+			"so every subsequent read of this subscriber declares gateway delivery")
 	})
 
 	principalClient := eventIsolationClient(t, fixture.env, credential)
@@ -3754,15 +3793,17 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsNotE
 	}, withheld[0])
 
 	t.Run("topic isolation is unaffected by the key scope", func(t *testing.T) {
-		// The dimension Kafka DOES enforce must hold exactly as it does for a subscriber with no
-		// prefix. A key-scoped subscriber that was quietly granted less — or more — would make
-		// the prefix change a boundary it has no business changing.
+		// The DESCRIBE dimension must hold exactly as it does for a subscriber with no prefix. A
+		// key-scoped subscriber that lost Describe as well could no longer read its own topics'
+		// offsets, which is what a consumer needs to measure its lag — so withholding it would
+		// narrow more than the prefix asks for.
 		allowed, disclosed := eventIsolationListOffsets(ctx, principalClient, granted)
 		eventIsolationAssertAllowed(t,
-			fmt.Sprintf("reading the granted topic %q as a key-scoped subscriber", granted),
+			fmt.Sprintf("describing the granted topic %q as a key-scoped subscriber", granted),
 			allowed.any())
 		assert.NotEmpty(t, disclosed,
-			"the granted topic must be readable: the prefix narrows records, not topics")
+			"the granted topic must remain describable: the prefix narrows RECORD access, not "+
+				"metadata, and a subscriber that cannot see its own offsets cannot measure lag")
 
 		for _, topic := range withheld {
 			outcome, leaked := eventIsolationListOffsets(ctx, principalClient, topic)
@@ -3772,41 +3813,40 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsNotE
 		}
 	})
 
-	t.Run("the key boundary is NOT enforced, and that is why the response declares it", func(t *testing.T) {
-		// THE ASSERTION THAT MATTERS, and the reason the response's
-		// client_side_key_filtering_required flag exists rather than a comment.
+	t.Run("the key boundary IS enforced: the broker refuses this principal's records", func(t *testing.T) {
+		// THE ASSERTION THAT MATTERS, and the one that was inverted before.
 		//
-		// keyPrefix is a fresh identifier, so no record on this shared topic carries it. A broker
-		// enforcing the prefix would therefore have to refuse this fetch or return an empty view
-		// of the partition. It does neither: the principal is admitted to the partition from
-		// offset zero, which is every record on it regardless of key.
+		// The principal holds Describe on this topic, so metadata resolves and the request reaches
+		// the authorizer's decision on the read itself — which is refused, because a key-scoped
+		// subscriber is granted no Read binding at all. That refusal is the boundary: it does not
+		// depend on which client the subscriber uses, on the prefix it was told, or on it choosing
+		// to filter anything.
 		outcome := eventIsolationFetch(ctx, principalClient, granted, 0)
-		eventIsolationAssertAllowed(t,
-			fmt.Sprintf(
-				"fetching %q from offset 0 with a credential whose row declares the unrelated key "+
-					"prefix %q", granted, keyPrefix),
-			outcome.any())
 
-		assert.True(t, outcome.allowed(),
-			"THE PREFIX IS NOT A BOUNDARY. This fetch reads the partition from the beginning while "+
-				"the subscriber's row declares a prefix no record here carries, so the broker "+
-				"plainly applies no key narrowing. Anything that reports this subscriber as "+
-				"confined to its prefix — a response field, a registry projection or a runbook — "+
-				"states a boundary that does not exist, which is exactly why issuance declares the "+
-				"narrowing as the holder's own obligation instead")
+		eventIsolationAssertAuthorizationError(
+			t,
+			fmt.Sprintf(
+				"fetching records from %q with a KEY-SCOPED credential (declared prefix %q)",
+				granted, keyPrefix),
+			outcome.any(),
+			kafka.TopicAuthorizationFailed,
+		)
+
+		assert.False(t, outcome.allowed(),
+			"A KEY-SCOPED SUBSCRIBER MUST NOT REACH THE RAW PARTITION. An allowed fetch here is the "+
+				"vulnerability this test exists to catch: the principal would be reading every record "+
+				"on a topic it shares with other ledgers and other subscribers, and no response "+
+				"field, projection or runbook could prevent it. Its own records are delivered by the "+
+				"subscriber stream gateway, which applies the prefix per record")
 	})
 
-	// THE REVERSE ORDER: hold a credential, then record a prefix.
+	// REPLACING one prefix with another, which is the edit that moves nothing.
 	//
-	// This used to be refused, on the reasoning that it produced a row describing a boundary the
-	// credential did not have. But the danger was never in the ROW — it was in a response that
-	// echoed a prefix without saying who enforced it, and that is what changed. The grant itself
-	// is identical either side of this update, because there is no key dimension for it to move.
-	//
-	// So what is asserted is that the update changes the REGISTRY and NOT the boundary: same
-	// principal, same credential, same access a moment later. Only a real broker can answer that
-	// last part.
-	t.Run("recording a key prefix on a provisioned subscriber changes no boundary", func(t *testing.T) {
+	// Kafka has no key dimension, so the desired binding set is identical either side of it: the
+	// subscriber is key-scoped before and after, so its topics carry Describe and no Read both
+	// times. The assertion is therefore that the boundary is UNCHANGED — still describable, still
+	// unfetchable, still refused outside the grant, and the credential untouched.
+	t.Run("replacing the key prefix changes no boundary", func(t *testing.T) {
 		before, beforeErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
 		require.NoError(t, beforeErr)
 		require.True(t, before, "the premise is a subscriber that already holds a live credential")
@@ -3816,9 +3856,8 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsNotE
 			PartitionKeyPrefix: &latePrefix,
 		})
 		require.NoError(t, updateErr,
-			"recording a key prefix on a provisioned subscriber must be accepted: it changes the "+
-				"registry's statement of intent and no broker-side grant, so refusing it protects "+
-				"nothing and blocks an ordinary operator action")
+			"swapping one prefix for another must be accepted, and must not depend on the broker: "+
+				"there is no binding for it to move")
 		require.NotNil(t, updated.PartitionKeyPrefix)
 		assert.Equal(t, latePrefix, *updated.PartitionKeyPrefix)
 
@@ -3828,60 +3867,401 @@ func TestEventIsolation_AKeyScopedSubscriberIsProvisionedAndItsKeyBoundaryIsNotE
 			"the registry records what the operator asked for")
 		assert.Equal(t, latePrefix, *stored.PartitionKeyPrefix)
 		require.NotNil(t, stored.CredentialReference,
-			"and the working credential is left alone: there is no wider access to take away")
+			"and the working credential is left alone")
 
 		after, afterErr := fixture.admin.SubscriberCredentialExists(ctx, subscriber.KafkaPrincipal)
 		require.NoError(t, afterErr)
 		assert.True(t, after,
 			"the update must leave the credential at the broker untouched")
 
-		// And the access itself is unchanged: still allowed on the granted topic, still refused
-		// on the withheld ones. An update that quietly widened or narrowed the boundary on the
-		// strength of a field the broker cannot read would be its own defect.
+		// The boundary itself, re-observed. All three answers must be the same as before the edit.
 		allowed, disclosed := eventIsolationListOffsets(ctx, principalClient, granted)
 		eventIsolationAssertAllowed(t,
-			fmt.Sprintf("reading the granted topic %q after the late key-prefix update", granted),
+			fmt.Sprintf("describing the granted topic %q after the prefix replacement", granted),
 			allowed.any())
 		assert.NotEmpty(t, disclosed,
-			"the credential must still read what it could read before the update")
+			"the credential must still describe what it could describe before the update")
+
+		eventIsolationAssertAuthorizationError(
+			t,
+			fmt.Sprintf("fetching %q after the prefix replacement", granted),
+			eventIsolationFetch(ctx, principalClient, granted, 0).any(),
+			kafka.TopicAuthorizationFailed,
+		)
 
 		outcome, leaked := eventIsolationListOffsets(ctx, principalClient, withheld[0])
 		eventIsolationAssertReadDenied(t, withheld[0], outcome)
 		assert.Empty(t, leaked,
-			"and must still be refused %q: recording a prefix widens nothing", withheld[0])
+			"and must still be refused %q: replacing a prefix widens nothing", withheld[0])
 	})
 
-	t.Run("clearing the key prefix removes the obligation and keeps the credential", func(t *testing.T) {
-		// Clearing is how an operator accepts topic-level scope and stops the registry implying
-		// otherwise. It no longer RESTORES provisionability — issuance never stopped working — so
-		// what it must do is take the declared obligation away without disturbing the credential.
+	t.Run("clearing the key prefix re-grants record access at the broker", func(t *testing.T) {
+		// THE WIDENING DIRECTION, and the reason this cycle is worth running end to end: it is the
+		// same claim as point 3 read backwards. If clearing did NOT restore the fetch, the
+		// narrowing would be indistinguishable from a broken grant — a subscriber that could
+		// never read anything would satisfy every refusal above while proving nothing.
 		cleared := ""
 		updated, updateErr := fixture.service.UpdateSubscriber(ctx, subscriberID, SubscriberUpdate{
 			PartitionKeyPrefix: &cleared,
 		})
 		require.NoError(t, updateErr,
-			"clearing the prefix must never be refused; it is the documented way to make the row "+
-				"describe the access that exists")
+			"clearing the prefix must never be refused; it is the documented way to return a "+
+				"subscriber to direct consumption")
 		require.Nil(t, updated.PartitionKeyPrefix,
 			"a present empty string CLEARS the column rather than storing an empty prefix")
-		assert.False(t, updated.RequiresClientSideKeyFiltering())
+		assert.False(t, updated.RequiresGatewayDelivery())
+		assert.True(t, updated.GrantsBrokerRecordAccess())
 		require.NotNil(t, updated.CredentialReference,
-			"and the credential survives the repair")
+			"and the credential survives: it is the GRANT that widens, not the identity")
 
 		reissued, issueErr := fixture.service.IssueSubscriberCredential(ctx, subscriberID)
 		require.NoError(t, issueErr)
 		require.NotEmpty(t, reissued.Password())
 		assert.Empty(t, reissued.PartitionKeyPrefix,
-			"and the reissued credential declares no obligation, because the row records none")
+			"and the reissued credential declares no key scope, because the row records none")
 
-		// The reissued credential works on the topic it was granted, so the whole cycle —
-		// register with a prefix, issue, record another, clear, reissue — is proven end to end
-		// rather than only at the registry.
+		// The whole cycle — register with a prefix, issue, replace it, clear it, reissue — proven
+		// at the broker rather than only in the registry.
 		client := eventIsolationClient(t, fixture.env, reissued)
+
 		outcome, disclosed := eventIsolationListOffsets(ctx, client, granted)
 		eventIsolationAssertAllowed(t,
-			fmt.Sprintf("reading the granted topic %q after clearing the key prefix", granted),
+			fmt.Sprintf("describing the granted topic %q after clearing the key prefix", granted),
 			outcome.any())
 		assert.NotEmpty(t, disclosed)
+
+		eventIsolationAssertAllowed(t,
+			fmt.Sprintf(
+				"FETCHING %q after clearing the key prefix, which is what proves the earlier "+
+					"refusal was the key scope and not a broken grant", granted),
+			eventIsolationFetch(ctx, client, granted, 0).any())
+
+		// And the topic boundary is untouched by the widening: clearing a prefix restores record
+		// access to the topics the subscriber was granted, never to any other.
+		refused, leaked := eventIsolationListOffsets(ctx, client, withheld[0])
+		eventIsolationAssertReadDenied(t, withheld[0], refused)
+		assert.Empty(t, leaked,
+			"clearing a key scope must not reach outside the subscriber's topic grant")
 	})
 }
+
+// TestEventIsolation_TheStreamGatewayDeliversOnlyTheKeyScopedSubscribersRecords is the other
+// half of the key-scope boundary against a REAL broker.
+//
+// # Why both halves need a live broker
+//
+// The test above proves the broker REFUSES a key-scoped principal's fetch, which is what makes
+// the prefix an access boundary rather than a request. That refusal is only defensible if Blnk
+// then delivers the records the subscriber IS entitled to — otherwise the narrowing is a dead
+// end, which is exactly the failure the withheld credential used to be.
+//
+// event_stream_gateway_test.go covers the filtering rule exhaustively with a fake transport. What
+// only a live broker can establish is that the rule is applied to the records Kafka ACTUALLY
+// sends: the reader drains a real RecordReader over a real connection, the keys are real message
+// keys off a partition, and the offsets and watermarks are the broker's.
+//
+// # The three passes, and why the third is the decisive one
+//
+// A fixture-unique key namespace is published first, through BLNK's own administrative
+// principal — not the subscriber's, which holds no Write binding and must not.
+//
+//  1. UNSCOPED: the subscriber records no prefix, so every published record comes back. This is
+//     the control that proves the topic is not simply empty and the credential works.
+//  2. SCOPED TO NOTHING: a prefix no record carries. Every record is withheld, the delivered
+//     page is empty, and the cursor still advances — which is the availability property.
+//  3. SCOPED TO ONE LEDGER: the prefix of half the published records. Exactly those come back.
+//
+// Pass 3 is what makes the pair conclusive. A gateway that refused everything would satisfy
+// pass 2 and fail pass 3, and a gateway that filtered nothing would satisfy pass 1 and fail
+// pass 2 — so only a correct filter satisfies all three.
+func TestEventIsolation_TheStreamGatewayDeliversOnlyTheKeyScopedSubscribersRecords(t *testing.T) {
+	fixture, ctx := eventIsolationSetup(t)
+
+	granted, _ := eventIsolationGrantSplit(fixture)
+	subscriberID := eventIsolationSubscriberID("gateway")
+
+	// TWO LEDGER NAMESPACES, both unique to this run, so the assertions are independent of
+	// whatever else the shared topic carries and of any sibling run publishing concurrently.
+	run := strings.ReplaceAll(uuid.NewString(), "-", "")
+	mine := "ldg_gw_mine_" + run
+	theirs := "ldg_gw_theirs_" + run
+
+	// Published in an interleaved order: a filter that stopped at its first refusal, or checked
+	// only the head of the page, would pass a fixture where the entitled records came first.
+	published := []struct{ key, value string }{
+		{theirs, `{"event_id":"` + run + `-1","aggregate_id":"` + theirs + `"}`},
+		{mine, `{"event_id":"` + run + `-2","aggregate_id":"` + mine + `"}`},
+		{theirs, `{"event_id":"` + run + `-3","aggregate_id":"` + theirs + `"}`},
+		{mine, `{"event_id":"` + run + `-4","aggregate_id":"` + mine + `"}`},
+	}
+
+	partition, startOffset := eventIsolationPublishProbeRecords(t, ctx, fixture, granted, published)
+
+	subscriber, err := fixture.service.RegisterSubscriber(ctx, SubscriberRegistration{
+		SubscriberID:     subscriberID,
+		Name:             "event isolation probe (stream gateway)",
+		AuthorizedTopics: []string{granted},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, subscriber)
+	t.Cleanup(func() { eventIsolationTeardown(t, fixture, subscriber) })
+
+	credential, err := fixture.service.IssueSubscriberCredential(ctx, subscriberID)
+	require.NoError(t, err)
+	require.NotEmpty(t, credential.Password())
+
+	// THE GATEWAY OVER THE SAME REGISTRY AND THE SAME ADMINISTRATIVE CLIENT the process uses.
+	// Constructed directly rather than through Blnk.SubscriberStream because this fixture has no
+	// Blnk instance — the dependencies are identical, and the seam is the point.
+	gateway := NewSubscriberStreamGateway(fixture.store, fixture.admin)
+
+	read := func(t *testing.T) SubscriberStreamPage {
+		t.Helper()
+
+		page, readErr := gateway.ReadEvents(ctx, SubscriberStreamRequest{
+			SubscriberID: subscriberID,
+			Secret:       credential.Password(),
+			Topic:        granted,
+			Partition:    partition,
+			Offset:       startOffset,
+			Limit:        len(published),
+		})
+		require.NoError(t, readErr, "the gateway must serve a subscriber the broker refuses")
+
+		return page
+	}
+
+	t.Run("unscoped: every published record is delivered", func(t *testing.T) {
+		page := read(t)
+
+		require.Len(t, page.Records, len(published),
+			"the control pass: a subscriber with no prefix is entitled to the whole topic, and this "+
+				"is what proves the records are really there and the credential really works")
+		assert.Zero(t, page.RecordsWithheld)
+		assert.False(t, page.KeyScopeEnforced)
+
+		for index, record := range page.Records {
+			assert.Equal(t, published[index].key, record.Key, "record %d: keys in publish order", index)
+			assert.JSONEq(t, published[index].value, string(record.Value),
+				"and the envelope is the bytes that were published, off a real partition")
+		}
+	})
+
+	t.Run("scoped to a prefix nothing carries: everything is withheld and the cursor advances",
+		func(t *testing.T) {
+			unmatched := "ldg_gw_none_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+			_, updateErr := fixture.service.UpdateSubscriber(ctx, subscriberID, SubscriberUpdate{
+				PartitionKeyPrefix: &unmatched,
+			})
+			require.NoError(t, updateErr)
+
+			page := read(t)
+
+			assert.Empty(t, page.Records,
+				"no record on this partition carries the prefix, so the subscriber is entitled to none")
+			assert.Equal(t, len(published), page.RecordsScanned, "all of them were read")
+			assert.Equal(t, len(published), page.RecordsWithheld, "and all of them were withheld")
+			assert.True(t, page.KeyScopeEnforced)
+			assert.Greater(t, page.NextOffset, startOffset,
+				"THE CURSOR MUST STILL ADVANCE. A page of entirely withheld records that left the "+
+					"offset where it was would make every subsequent poll re-read the same records "+
+					"forever — a correct filter that starves the subscriber it protects")
+		})
+
+	t.Run("scoped to one ledger: exactly that ledger's records are delivered", func(t *testing.T) {
+		// THE DECISIVE PASS. Refusing everything satisfies the pass above and fails this one;
+		// filtering nothing satisfies the control and fails the pass above. Only a correct
+		// filter satisfies all three.
+		_, updateErr := fixture.service.UpdateSubscriber(ctx, subscriberID, SubscriberUpdate{
+			PartitionKeyPrefix: &mine,
+		})
+		require.NoError(t, updateErr)
+
+		page := read(t)
+
+		require.Len(t, page.Records, 2, "exactly the two records published under this ledger")
+		assert.Equal(t, 2, page.RecordsWithheld, "and exactly the two published under the other")
+		assert.Equal(t, mine, page.KeyScope)
+
+		for _, record := range page.Records {
+			assert.Equal(t, mine, record.Key,
+				"every delivered key must carry the subscriber's prefix")
+		}
+
+		// AND THE OTHER LEDGER'S RECORDS SURVIVE NOWHERE IN THE PAGE. This is the finding
+		// restated as an assertion: the whole reason the gateway exists is that these bytes must
+		// not reach this subscriber, and a diagnostic field added later in good faith is how
+		// they would.
+		rendered := fmt.Sprintf("%+v", page)
+		assert.NotContains(t, rendered, theirs,
+			"no record outside the subscriber's key scope may appear anywhere in the page")
+	})
+
+	t.Run("and the broker still refuses this principal's own fetch", func(t *testing.T) {
+		// The two halves in one place. The subscriber is key-scoped as of the pass above, so its
+		// grant no longer carries record-level Read — which is what makes the gateway the ONLY
+		// path its records take, rather than a convenience beside an open one.
+		reissued, issueErr := fixture.service.IssueSubscriberCredential(ctx, subscriberID)
+		require.NoError(t, issueErr)
+
+		client := eventIsolationClient(t, fixture.env, reissued)
+
+		allowed, disclosed := eventIsolationListOffsets(ctx, client, granted)
+		eventIsolationAssertAllowed(t,
+			fmt.Sprintf("describing the granted topic %q as a key-scoped subscriber", granted),
+			allowed.any())
+		assert.NotEmpty(t, disclosed, "Describe survives, so a consumer can still measure its lag")
+
+		eventIsolationAssertAuthorizationError(
+			t,
+			fmt.Sprintf("fetching %q directly with the key-scoped credential", granted),
+			eventIsolationFetch(ctx, client, granted, startOffset).any(),
+			kafka.TopicAuthorizationFailed,
+		)
+	})
+}
+
+// eventIsolationPublishProbeRecords writes the probe records this file's gateway test reads
+// back, and returns the partition and offset they start at.
+//
+// # Why publishing is legitimate here when the rest of the file publishes nothing
+//
+// The discipline this file keeps is that no probe leaves records behind AS THE SUBSCRIBER: a
+// subscriber principal holds Read and Describe and no Write, deliberately, so a test that
+// produced through one would be asserting against a grant the production code must never make.
+//
+// These records are published through BLNK's own administrative principal — the same identity
+// that provisions topics and credentials — which is the identity a real deployment publishes
+// with. The records are ordinary events on a shared category topic with the deployment's own
+// retention, and their keys are namespaced to this run so no sibling assertion can see them.
+//
+// The partition is derived from the KEY rather than chosen, using the same hash the publisher
+// uses, so every record lands together and one bounded read sees all of them. Choosing a
+// partition and hoping would make the test flaky in exactly the way partitioned topics are.
+//
+// Parameters:
+//   - t *testing.T: the test, for fatal reporting and cleanup of the writer.
+//   - ctx context.Context: bounds the writes.
+//   - fixture *eventIsolationFixture: for the broker environment.
+//   - topic string: the topic to publish to.
+//   - records []struct{ key, value string }: what to publish, in order.
+//
+// Returns:
+//   - int: the partition every record landed on.
+//   - int64: the offset of the first of them, which is where the gateway read begins.
+func eventIsolationPublishProbeRecords(
+	t *testing.T,
+	ctx context.Context,
+	fixture *eventIsolationFixture,
+	topic string,
+	records []struct{ key, value string },
+) (int, int64) {
+	t.Helper()
+
+	require.NotEmpty(t, records, "the fixture must publish something to read back")
+
+	transport, err := NewKafkaTransport(fixture.env.kafka, KafkaTransportRoleAdmin)
+	require.NoError(t, err, "building the administrative transport for the probe writer")
+
+	// ONE PARTITION FOR EVERY RECORD, and it is FORCED rather than derived.
+	//
+	// The production publisher keys by ledger id and lets a stable hash choose the partition,
+	// which is what delivers per-aggregate ordering — and it is precisely why it cannot be used
+	// here: this fixture's records carry DIFFERENT keys on purpose, so a hash balancer would
+	// scatter them across the topic's partitions and a single bounded read would see one of
+	// them. (That is not hypothetical: it is what the first run of this test did.)
+	//
+	// The partition is still CHOSEN by hashing the first key, so successive runs spread across
+	// the topic rather than piling onto partition zero, and every record is then pinned there.
+	// Co-locating them is sound because the property under test is the KEY filter; partitioning
+	// by key is event_ordering_integration_test.go's subject and is not weakened by a fixture
+	// that deliberately writes elsewhere.
+	partitionIDs := make([]int, fixture.env.kafka.MinPartitions)
+	for index := range partitionIDs {
+		partitionIDs[index] = index
+	}
+	partition := (&kafka.Hash{}).Balance(kafka.Message{Key: []byte(records[0].key)}, partitionIDs...)
+
+	writer := &kafka.Writer{
+		Addr:      kafka.TCP(fixture.env.kafka.Brokers...),
+		Transport: transport,
+		// THE FIXED BALANCER. kafka-go's Writer decides the partition itself and IGNORES
+		// Message.Partition — with no balancer set it round-robins — so pinning the partition is
+		// the balancer's job and not the message's.
+		Balancer: eventIsolationFixedPartition{partition: partition},
+		// RequireAll, so the offsets below are durable before anything reads them. A weaker
+		// acknowledgement would let the read race the write and fail intermittently.
+		RequiredAcks: kafka.RequireAll,
+		BatchTimeout: 10 * time.Millisecond,
+	}
+	t.Cleanup(func() {
+		if closeErr := writer.Close(); closeErr != nil {
+			t.Logf("closing the probe writer: %v", closeErr)
+		}
+		transport.CloseIdleConnections()
+	})
+
+	// THE OFFSET BEFORE THE WRITE, so the read starts exactly at this fixture's own records and
+	// is unaffected by whatever the shared topic already carries or a sibling run adds.
+	before, err := fixture.admin.TopicEndOffsets(ctx, time.Time{}, topic)
+	require.NoError(t, err, "reading the partition's end offset before publishing")
+
+	startOffset := int64(-1)
+	for _, snapshot := range before.Topics {
+		if snapshot.Topic != topic {
+			continue
+		}
+		for _, p := range snapshot.Partitions {
+			if p.Partition == partition {
+				startOffset = p.EndOffset
+			}
+		}
+	}
+	require.GreaterOrEqual(t, startOffset, int64(0),
+		"partition %d of %q reported no end offset, so the probe has no starting point",
+		partition, topic)
+
+	messages := make([]kafka.Message, 0, len(records))
+	for _, record := range records {
+		messages = append(messages, kafka.Message{
+			Topic:     topic,
+			Partition: partition,
+			Key:       []byte(record.key),
+			Value:     []byte(record.value),
+		})
+	}
+
+	writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	require.NoError(t, writer.WriteMessages(writeCtx, messages...),
+		"publishing the probe records as the administrative principal")
+
+	t.Logf("gateway probe: published %d records to %s partition %d from offset %d",
+		len(messages), topic, partition, startOffset)
+
+	return partition, startOffset
+}
+
+// eventIsolationFixedPartition pins every message to one partition.
+//
+// It exists because kafka-go's Writer resolves the partition through its Balancer and ignores
+// Message.Partition entirely: with no balancer set it round-robins, which scattered this file's
+// probe records across six partitions and left a bounded read seeing one of them.
+type eventIsolationFixedPartition struct {
+	partition int
+}
+
+// Balance returns the pinned partition, whatever the message and whatever the partition list.
+//
+// Parameters:
+//   - kafka.Message: ignored; the pin is the whole point.
+//   - ...int: ignored, for the same reason.
+//
+// Returns:
+//   - int: the pinned partition.
+func (b eventIsolationFixedPartition) Balance(_ kafka.Message, _ ...int) int {
+	return b.partition
+}
+
+var _ kafka.Balancer = eventIsolationFixedPartition{}

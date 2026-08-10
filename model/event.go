@@ -36,6 +36,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -371,16 +372,36 @@ func (e LedgerEvent) CanonicalBytes() ([]byte, error) {
 // for those events the write side is EXACTLY-ONCE: the event cannot be lost while
 // its mutation stands, and cannot exist for a mutation that rolled back.
 //
-// A caller with no transaction to share captures standalone through PublishEvent
-// or PublishEventDurably, and for THREE event classes that is at-most-once rather
-// than exactly-once, because their mutation is already committed by the time the
-// row is written: balance.monitor, bulk_transaction.<status>, and the
-// status-derived transaction.* events of a coalesced batch. A bounded retry makes
-// a transient database fault survivable, but a process death in that window loses
-// the event with nothing left to replay. PublishEventDurably enumerates the set
-// and docs/event-streaming.md publishes it, so a subscriber knows which event
-// types carry the weaker guarantee. system.error is standalone too but is not in
-// that set: it describes no mutation, so there is nothing it could be atomic with.
+// EVERY PRODUCER THAT HAS A MUTATION IS TRANSACTIONAL, and that includes the ones
+// a reader might expect to be exceptions. The status-derived transaction.* events of
+// a COALESCED batch are captured by the coalescing writer itself, which derives the
+// rows and inserts them before its own COMMIT (see resolveBatchEventOutboxes in
+// database/transaction.go), so a coalesced batch carries the full guarantee — it is
+// not an exception and must not be described as one. A balance.monitor alert is
+// enrolled either by pre-write evaluation or through a durable handoff row committed
+// with the balance movement. A bulk_transaction.<status> summary is written in the
+// same transaction as the batch's terminal coordinator record, and a batch whose
+// start was never recorded is ADOPTED into that transaction rather than captured
+// outside one.
+//
+// THREE EVENT TYPES STILL CARRY A WEAKER GUARANTEE, each through one narrow named
+// window rather than as standing behaviour, and a subscriber that needs to reconcile
+// should know which:
+//
+//   - balance.monitor — when the pre-write evaluation could not read the monitors,
+//     or on a deployment with no Kafka broker, where no event is captured at all.
+//   - bulk_transaction.<status> — when the finalising transaction cannot commit
+//     after its retry budget. The batch is then left non-terminal and countable, but
+//     no event row exists.
+//   - system.error — always, and for a different reason: it describes no mutation,
+//     so there has never been a transaction it could have joined.
+//
+// A bounded retry makes a transient database fault survivable on those paths, but a
+// process death inside the window loses the event with nothing left to replay.
+// PublishEventDurably enumerates the capture SITES, the constant
+// PostCommitEventCaptureContract declares this event-type set once, and
+// docs/event-streaming.md publishes it. The two enumerations are different sets and
+// PublishEventDurably states both side by side.
 //
 // Kafka delivery downstream is AT-LEAST-ONCE for every event regardless of which
 // path captured it: a relay that crashes between a successfully acknowledged
@@ -3174,21 +3195,18 @@ const (
 	// universal coverage to hold an additional grant, and widening a frozen contract
 	// is a revision of the plan rather than an implementation detail.
 	//
-	// That does leave `ledger.created` unreachable by a subscriber credential, because
-	// this category is internal. That is a real consequence and it is recorded rather
-	// than hidden — in docs/event-streaming.md, where a subscriber reads it. It is an
-	// ACCESS-MODEL decision (does the system category, or some subset of it, become
-	// grantable?) and it is owned by the plan, in one place, instead of being answered
-	// here by minting a topic.
+	// The ACCESS-MODEL question that follows — does the system category become
+	// grantable? — is answered below, and the answer is yes: it is grantable, and
+	// granting it is a deliberate per-subscriber decision. `ledger.created` is therefore
+	// reachable, and what a grant of it also discloses is stated in full further down and
+	// in docs/event-streaming.md, where a subscriber reads it.
 	//
-	// They share ONE category rather than getting one each. A separate grantable
-	// `ledgers` category was tried and removed: it added a fifth category and two more
-	// topics to a public contract the provisioning script, the Kubernetes
-	// configuration, the local stack and the subscriber documentation all enumerate,
-	// and it widened what a subscriber credential can reach beyond the agreed layout.
-	// The reachability argument that motivated it is real and is answered in the
-	// documentation instead — `ledger.created` is captured, published, observable and
-	// replayable; what it does not have is a subscriber ACL.
+	// They share ONE category rather than getting one each. A separate `ledgers` category
+	// was tried and removed: it added a fifth category and two more topics to a public
+	// contract the provisioning script, the Kubernetes configuration, the local stack and
+	// the subscriber documentation all enumerate. The reachability argument that motivated
+	// it is answered by making this category grantable instead, which costs the catalogue
+	// nothing.
 	//
 	// # `ledger.created` lives here, and that is the frozen contract
 	//
@@ -3200,15 +3218,12 @@ const (
 	// script, both compose stacks, the Kubernetes configuration and the operator
 	// documentation all enumerate.
 	//
-	// The consequence is stated plainly rather than left to be discovered: because
-	// this category is internal, `ledger.created` is captured, published, observable
-	// and replayable like every other event, and it is NOT consumable by any
-	// subscriber credential Blnk issues. Making the category grantable to recover that
-	// reachability would hand the same subscribers the verbatim internal error text
-	// `system.error` carries, which cannot be narrowed without breaking the
-	// payload-preservation guarantee. Recovering it therefore requires a decision from
-	// whoever owns the topic catalogue — a fifth grantable category, or a redaction
-	// exception for the system payload — and not a change here.
+	// The consequence is stated plainly rather than left to be discovered: a subscriber
+	// that needs `ledger.created` is granted this category, and the same grant hands it
+	// the verbatim internal error text `system.error` carries, which cannot be narrowed
+	// without breaking the payload-preservation guarantee. That trade is why the grant is
+	// a per-subscriber decision rather than a default, and why what it discloses is
+	// enumerated below rather than left to be inferred.
 	//
 	// # It is GRANTABLE, and granting it is a DELIBERATE operator decision
 	//
@@ -3296,13 +3311,19 @@ func SubscriberGrantableEventCategories() []string {
 // hand it every other subscriber's failed events. The list composes main topics only, so no
 // `.dlt` name can appear on it.
 //
-// So the list is exactly `<prefix>.transactions`, `<prefix>.balances` and
-// `<prefix>.identities`. Two of the thirteen migrated event types — `ledger.created` and
-// `system.error` — consequently have no authorized subscriber path, which is a REAL
-// limitation of the frozen four-category catalogue and is documented as one in
-// docs/event-streaming.md rather than worked around here by minting a fifth topic.
-// Coverage is unaffected: both are captured, published, observable and replayable, and
-// both remain readable operationally under the master key.
+// So the list is exactly the FOUR category topics of the closed catalogue:
+// `<prefix>.transactions`, `<prefix>.balances`, `<prefix>.identities` and
+// `<prefix>.system`. Every category is grantable, and `<prefix>.system` is included
+// deliberately rather than by omission: under the frozen four-category contract it carries
+// `ledger.created` as well as `system.error`, so withholding the name would make ordinary
+// ledger data unreachable to every subscriber. All thirteen migrated event types therefore
+// have an authorized subscriber path.
+//
+// Granting `<prefix>.system` does disclose more than a tenant category does — `system.error`
+// carries raw error text describing the deployment, and this category is the catalogue's
+// catch-all, so an unmapped event type lands here — which is why what it discloses is
+// documented and the decision stays PER SUBSCRIBER through authorized_topics rather than
+// being made once for everyone here.
 //
 // Parameters:
 //   - prefix string: the namespace this deployment owns. Trimmed; a blank prefix falls back
@@ -3429,6 +3450,129 @@ var eventTypeCategories = map[string]string{
 	// `ledgers` category that used to appear here was removed instead.
 	"ledger.created": EventCategorySystem,
 	"system.error":   EventCategorySystem,
+}
+
+// EventKeyDimension names WHICH identifier an event type's Kafka message key is taken
+// from, and it is a DECLARATION rather than a description of whatever the payload
+// happened to yield.
+//
+// Requirement R-6 partitions by ledger id, and a chain of untyped fallbacks made it
+// impossible to tell an event keyed by its ledger — as required — from one keyed by a
+// balance, an identity or a batch because no ledger was available. Both produced a
+// stable key, both looked correct in the row, and only the second is a departure from
+// R-6. Declaring the intended dimension per event type is what makes the departure
+// detectable: PrepareEventOutbox compares the dimension it ACHIEVED against the one
+// declared here and reports a miss instead of absorbing it.
+type EventKeyDimension string
+
+const (
+	// EventKeyDimensionLedger is declared for every event type that describes ledger
+	// state. These are the events R-6 is about: keying them on their ledger is what
+	// places one ledger's whole history on one partition and therefore in order.
+	EventKeyDimensionLedger EventKeyDimension = "ledger"
+
+	// EventKeyDimensionAggregate is declared for event types that genuinely have no
+	// ledger and whose own aggregate is the correct ordering unit. An identity is not
+	// scoped to a ledger in this model and may be referenced by balances in several, so
+	// per-identity ordering is the strongest guarantee that is true; a bulk batch is a
+	// runtime grouping whose members may span ledgers, so the batch is its own unit and
+	// each member still carries its own ledger-keyed transaction event.
+	EventKeyDimensionAggregate EventKeyDimension = "aggregate"
+
+	// EventKeyDimensionEventType is declared for event types with no aggregate of any
+	// kind. Keying on the type gives the stream a single partition and therefore a total
+	// order, which is what an error stream wants.
+	EventKeyDimensionEventType EventKeyDimension = "event_type"
+)
+
+// eventKeyDimensions declares the key dimension of every catalogued event type.
+//
+// It is keyed by EVENT TYPE rather than by category because the system category holds
+// both kinds: ledger.created describes a ledger and must be keyed on it, while
+// system.error describes nothing at all. A per-category table would have to pick one
+// answer for both and would be wrong about one of them.
+//
+// The bulk transaction family is absent for the same reason it is absent from
+// eventTypeCategories — its names are composed at runtime — and KeyDimensionForEventType
+// matches it by prefix.
+var eventKeyDimensions = map[string]EventKeyDimension{
+	"transaction.queued":    EventKeyDimensionLedger,
+	"transaction.applied":   EventKeyDimensionLedger,
+	"transaction.scheduled": EventKeyDimensionLedger,
+	"transaction.inflight":  EventKeyDimensionLedger,
+	"transaction.void":      EventKeyDimensionLedger,
+	"transaction.rejected":  EventKeyDimensionLedger,
+	"transaction.unknown":   EventKeyDimensionLedger,
+	"balance.created":       EventKeyDimensionLedger,
+	"balance.monitor":       EventKeyDimensionLedger,
+	"ledger.created":        EventKeyDimensionLedger,
+	"identity.created":      EventKeyDimensionAggregate,
+	"system.error":          EventKeyDimensionEventType,
+}
+
+// KeyDimensionForEventType returns the declared key dimension of an event type.
+//
+// # Why an unrecognised type is aggregate rather than ledger
+//
+// An event type this repository does not yet know about is routed to the system
+// category by EventCategory, and nothing can be assumed about whether it describes a
+// ledger. Declaring it aggregate-dimensioned says "key it on whatever aggregate it
+// carries", which is achievable for any payload and never reports a false miss —
+// whereas declaring it ledger-dimensioned would report every such event as a departure
+// from R-6 and drown the real ones. Adding a producer therefore means adding a row to
+// this table in the same change, which is what the contract test enforces.
+//
+// Parameters:
+//   - eventType string: the event name, exactly as the producer passes it. Not
+//     normalised: producers pass the catalogued literals.
+//
+// Returns:
+//   - EventKeyDimension: the declared dimension; never empty.
+func KeyDimensionForEventType(eventType string) EventKeyDimension {
+	// Prefix first, so it cannot be shadowed by the exact-match arm below.
+	if strings.HasPrefix(eventType, bulkTransactionEventPrefix) {
+		return EventKeyDimensionAggregate
+	}
+
+	if dimension, declared := eventKeyDimensions[eventType]; declared {
+		return dimension
+	}
+
+	return EventKeyDimensionAggregate
+}
+
+// CataloguedEventTypes returns every event type this repository emits under a fixed name.
+//
+// It is the exact key set of eventTypeCategories, so a producer added to that catalogue
+// appears here with no second list to maintain. The bulk transaction family is deliberately
+// absent for the reason stated on eventTypeCategories: its names are composed at runtime, so
+// no table can enumerate them and both readers match them by prefix.
+//
+// Returns:
+//   - []string: a fresh slice in no guaranteed order; the caller may sort it freely.
+func CataloguedEventTypes() []string {
+	catalogued := make([]string, 0, len(eventTypeCategories))
+	for eventType := range eventTypeCategories {
+		catalogued = append(catalogued, eventType)
+	}
+
+	return catalogued
+}
+
+// EventKeyDimensionsByType returns a copy of the declared key-dimension table.
+//
+// Exported so the contract tests can assert that every catalogued event type carries a
+// declaration, without the table itself becoming writable from outside this package.
+//
+// Returns:
+//   - map[string]EventKeyDimension: a fresh map; the caller may mutate it freely.
+func EventKeyDimensionsByType() map[string]EventKeyDimension {
+	declared := make(map[string]EventKeyDimension, len(eventKeyDimensions))
+	for eventType, dimension := range eventKeyDimensions {
+		declared[eventType] = dimension
+	}
+
+	return declared
 }
 
 // IsCataloguedEventType reports whether an event type is one this repository is known
@@ -3646,6 +3790,60 @@ func DeriveCredentialReference(principal, secret string) (string, error) {
 		hex.EncodeToString(mac.Sum(nil)), nil
 }
 
+// CredentialReferenceMatches reports whether a PRESENTED secret is the one a stored credential
+// reference was derived from.
+//
+// # Why the registry can answer this at all
+//
+// DeriveCredentialReference is a keyed digest — HMAC-SHA256 over the secret, keyed by the
+// principal — so it is deterministic: the same principal and secret always produce the same
+// reference. That is what lets the reference serve as a verifier as well as a correlation
+// value, and it is why nothing here needs the plaintext. The stored column is not reversible and
+// this function does not try to reverse it; it re-derives and compares.
+//
+// # What it is for
+//
+// The subscriber stream gateway — the component that enforces a key-scoped subscriber's
+// partition-key boundary — has to establish that the caller asking for a subscriber's records
+// is the holder of the credential Blnk issued for it. A key-scoped principal is deliberately
+// granted no topic Read at the broker, so the gateway is the only path its records take, and an
+// unauthenticated gateway would be a way around the very boundary it exists to keep.
+//
+// # Constant time, and why the short-circuits are safe
+//
+// The comparison is subtle.ConstantTimeCompare, so a caller cannot learn the reference by
+// timing repeated attempts. The two early returns leak nothing a caller does not already know:
+// an empty argument is the caller's own omission, and a reference that is not well formed is a
+// property of the stored row rather than of the presented secret. A row holding no reference —
+// a subscriber that has never been issued a credential — is refused here rather than at the
+// call site, so no caller can forget the case.
+//
+// Parameters:
+//   - reference string: the value stored in credential_reference. An empty or malformed value
+//     is refused.
+//   - principal string: the subscriber's Kafka principal, which is the HMAC key.
+//   - secret string: the presented password. Never logged by this function, which does not log.
+//
+// Returns:
+//   - bool: true only when re-deriving the reference from principal and secret reproduces the
+//     stored value exactly.
+func CredentialReferenceMatches(reference, principal, secret string) bool {
+	if reference == "" || principal == "" || secret == "" {
+		return false
+	}
+
+	if err := ValidateCredentialReference(reference); err != nil {
+		return false
+	}
+
+	candidate, err := DeriveCredentialReference(principal, secret)
+	if err != nil {
+		return false
+	}
+
+	return subtle.ConstantTimeCompare([]byte(candidate), []byte(reference)) == 1
+}
+
 // ValidateCredentialReference reports whether a value has the exact shape
 // DeriveCredentialReference produces.
 //
@@ -3765,71 +3963,85 @@ func HashIdentifier(value string) string {
 // topics. Isolation is achieved by making each subscriber a distinct Kafka
 // principal and scoping that principal with ACLs.
 //
-// THE BOUNDARY IS EXACTLY THREE SCOPES, and each one names where it is checked:
+// THE BOUNDARY IS EXACTLY THREE SCOPES, and each one names where it is ENFORCED.
+// Which bindings a row implies depends on whether it declares a key scope, because
+// the two cases are enforced in different places:
 //
-//	Topic  <each entry of AuthorizedTopics>  LITERAL   Read + Describe   BROKER
-//	Group  <ConsumerGroupID>                 PREFIXED  Read              BROKER
-//	Key    <PartitionKeyPrefix>              prefix    consume           CONSUMER
+//	NO KEY SCOPE — the topic grant IS the boundary, and the broker keeps all of it:
+//	  Topic  <each entry of AuthorizedTopics>  LITERAL   Read + Describe   BROKER
+//	  Group  <ConsumerGroupID>                 PREFIXED  Read              BROKER
 //
-// KafkaPrincipal, ConsumerGroupID and AuthorizedTopics are the two BROKER-CHECKED
+//	KEY SCOPE RECORDED — record access is withheld at the broker and delivered,
+//	filtered, by Blnk:
+//	  Topic  <each entry of AuthorizedTopics>  LITERAL   Describe only     BROKER
+//	  Group  <ConsumerGroupID>                 PREFIXED  Read              BROKER
+//	  Key    <PartitionKeyPrefix>              prefix    consume           BLNK GATEWAY
+//
+// KafkaPrincipal, ConsumerGroupID and AuthorizedTopics are the BROKER-CHECKED
 // scopes, and a provisioning call translates them into one SCRAM credential plus
 // that set of ACL bindings. KafkaPrincipal is the join key between a registry row
 // and the broker's own authorization state, because every binding names it.
 //
-// # The key scope is a DELIVERED CONTRACT, not a broker binding
+// # The key scope is ENFORCED BY BLNK, because the broker cannot express it
 //
 // Kafka's authorizer has no message-key dimension. Its resource types are Topic,
-// Group, Cluster, TransactionalId, DelegationToken and User — there is no
+// Group, Cluster, TransactionalId and DelegationToken — there is no
 // partition-scoped or key-scoped resource, so no ACL, pattern type or operation
 // can confine a consumer to the records whose key carries a given prefix. That is
 // a property of Kafka rather than of this system, and no amount of care in this
 // package changes it: a principal granted Read on a shared category topic can read
 // every record on it, whatever the key.
 //
-// The two designs that COULD enforce a key boundary at the broker are both closed
-// off deliberately. A resource per authorization domain — a topic per key scope —
-// is ruled out by the access model's own first line: there are no per-tenant
-// topics, because the whole point of the shared category topics is that a new
-// subscriber costs no new topics. An interposed filtering gateway that re-emits
-// already-isolated streams is subscriber-side consumer machinery, which Blnk
-// explicitly does not build. What remains is the one place the key is visible to
-// somebody entitled to act on it: the consumer.
+// One design that WOULD move the boundary into the broker is closed off by the
+// access model's own first line: a resource per authorization domain — a topic per
+// key scope — is ruled out, because the whole point of the shared category topics
+// is that a new subscriber costs no new topics.
 //
-// SO THE PREFIX IS ISSUED, RETURNED AND STATED, rather than refused. It is part of
-// the scope the credential endpoint hands back, alongside the broker endpoint, the
-// topic list and the consumer group, so it reaches the party that can apply it;
-// and it is returned together with an explicit statement of which scopes the
-// broker enforces, so nobody has to infer that the topic grant is whole-topic.
-// EffectiveKeyScope is that statement in code, and HasKeyAccess is the one
-// authoritative predicate the prefix means, so any component that can see a
-// record's key decides with the registry's rule rather than re-deriving it.
+// # So the enforcement point is Blnk, and the grant is narrowed to make it the only path
 //
-// # Why disclosure replaced refusal
+// A subscriber that records a key scope is provisioned WITHOUT Read on any topic. It
+// keeps Describe, so it can still see its topics and their offsets, and it keeps Read
+// on its own consumer-group namespace — but every attempt to fetch a record is refused
+// by the broker's authorizer, with any client, from any host. There is nothing for the
+// subscriber to cooperate with and nothing for it to ignore.
 //
-// Refusing issuance for any row carrying a prefix was the previous behaviour. It
-// kept the registry honest, but it did so by DECLINING the access model rather
-// than implementing it: a subscriber that recorded a key scope got no credential
-// at all, so the scope-by-topics-group-and-key model was unavailable in exactly
-// the case it was written for. Refusal also fixed nothing a reader could see — the
-// row still recorded a prefix, and the only thing that changed was that the
-// subscriber could not consume.
+// Its records are delivered instead by the SUBSCRIBER STREAM GATEWAY: an authenticated
+// Blnk read path that consumes the shared topic with Blnk's own identity, applies
+// HasKeyAccess to each record's key, and returns only the records the row entitles the
+// subscriber to. The caller proves it holds the credential Blnk issued — see
+// CredentialReferenceMatches — so the gateway is not a way around the credential either.
+// HasKeyAccess is the one authoritative predicate the prefix means, and the gateway is
+// its production caller, so the rule the registry recorded is the rule enforced.
 //
-// Calling the field "advisory" in a comment was the earlier framing and was worse
-// than either, because a comment is not what somebody reads when they read a
-// database row. What replaces both is a boundary that says, at the moment a
-// credential is issued and in the response that carries it, exactly which of its
-// three scopes the broker checks and which one the consumer must apply. An
-// operator answering "can this subscriber see that ledger?" reads two enforced
-// scopes and one delivered obligation, and each is labelled.
+// # Why "the consumer applies it" was not good enough
 //
-// This is the same posture the event contract already takes for duplicate
-// suppression: Kafka delivery is at-least-once, so event_id is a documented
-// subscriber obligation rather than a promise the broker keeps. A key scope is
-// that pattern applied to authorization.
+// That was the previous posture, and it is the one this replaced. The prefix was
+// returned to the subscriber beside a declaration that the broker did not enforce it,
+// and the subscriber was asked to filter. Two things were wrong with it. The disclosure
+// was accurate and the isolation was absent: whole-topic Read means every other ledger's
+// transactions, balances and identities are readable by any subscriber granted the same
+// category, and a client that ignores a documented obligation — or simply uses kafka-go
+// directly — is not misbehaving in any way the platform can detect. And it made the
+// registry's own field a false description of the row: an operator reading
+// partition_key_prefix reads a boundary, and until this change there was none.
+//
+// The refusal that preceded THAT was no better: issuance failed closed for any row
+// carrying a prefix, so the registry could hold a state from which the mandatory
+// credential endpoint could never succeed. Withholding the credential withheld the
+// capability; withholding record-level READ withholds only the access the boundary was
+// supposed to deny.
+//
+// # What is still the subscriber's obligation, and what is not
+//
+// Duplicate suppression on event_id remains one: Kafka delivery is at-least-once, and the
+// relay can crash between a successful publish and the row being marked dispatched. Key
+// filtering is NOT one any more. The distinction matters because the first is a delivery
+// property no publisher can remove, while the second was an authorization boundary being
+// delegated to the party it was meant to constrain.
 //
 // Nothing in this package silently widens or narrows the prefix:
-// NewSubscriberProvisioningRequest carries it so the credential contract can
-// report it and deliberately maps it onto NO ACL binding, and HasTopicAccess —
+// NewSubscriberProvisioningRequest carries it so provisioning can withhold record access
+// and the credential contract can report where the scope is kept, and HasTopicAccess —
 // which answers a question about topics — ignores it.
 //
 // # A deregistration in progress is a state of its own
@@ -3861,9 +4073,10 @@ func HashIdentifier(value string) string {
 // a zero value would destroy:
 //
 //   - PartitionKeyPrefix nil means NO key constraint was recorded, as opposed to a
-//     constraint on the empty prefix — which would invert the intent. Non-nil is
-//     returned to the subscriber as the consumer-enforced third scope; see the
-//     access-model note above.
+//     constraint on the empty prefix — which would invert the intent. Non-nil is the
+//     third scope, enforced by the stream gateway, and it also DECIDES THE BROKER
+//     GRANT: a row carrying it is provisioned without topic Read. See the access-model
+//     note above.
 //   - CredentialReference nil is the reliable test for "no credential has ever
 //     been issued", the real "registered, not yet provisioned" state.
 //   - CredentialIssuedAt nil accompanies it; the two are set and overwritten
@@ -4081,7 +4294,7 @@ func (s *EventSubscriber) HasTopicAccess(topic string) bool {
 //
 // # Why it trims
 //
-// The presence predicates — RequiresClientSideKeyFiltering and DeclaresKeyScope —
+// The presence predicates — RequiresGatewayDelivery and DeclaresKeyScope —
 // trim before deciding whether a scope is recorded at all, and this accessor did not.
 // The two therefore disagreed about exactly one value: a whitespace-only prefix, which
 // the predicates read as "no scope" while HasKeyAccess and EffectiveKeyScope read as a
@@ -4115,12 +4328,18 @@ func (s *EventSubscriber) RequestedKeyScope() string {
 // trimming and no normalisation is applied — a caller whose key differs from the
 // recorded scope by whitespace is asking about a different key.
 //
-// IT IS NOT WHAT THE BROKER CHECKS. Kafka's authorizer has no message-key dimension,
-// so this rule is honoured wherever a record's key is visible to something willing to
-// act on it: the subscriber's own consumer, to which the scope is delivered by the
-// credential endpoint, and any Blnk-side path that reads keys — a replay, an
-// administrative export. Keeping the rule here rather than at those call sites is what
-// stops two of them disagreeing about what a recorded prefix means.
+// IT IS NOT WHAT THE BROKER CHECKS, and that is why it has an enforcement point of its
+// own. Kafka's authorizer has no message-key dimension, so a key-scoped subscriber is
+// granted Describe and NO Read on its topics — the broker refuses its every fetch — and
+// its records are served by Blnk's subscriber stream gateway, which calls THIS predicate
+// on every record before returning one. The gateway is the rule's primary caller; a
+// replay or an administrative export that reads keys answers to the same rule.
+//
+// Keeping the rule here rather than at those call sites is what stops two of them
+// disagreeing about what a recorded prefix means — and it is why the previous
+// arrangement, in which the prefix was merely DELIVERED to a subscriber and applied by
+// whatever that subscriber chose to do, was not a boundary at all: cooperation cannot be
+// checked, and a subscriber using any other Kafka client bypassed it entirely.
 func (s *EventSubscriber) HasKeyAccess(key string) bool {
 	// DeclaresKeyScope, not `RequestedKeyScope() != ""`. The two differ on a whitespace-only
 	// column, and here that difference decides whether EVERY record is excluded: no ledger id
@@ -4233,7 +4452,7 @@ func (o SubscriberSettlementObligation) Outstanding() bool {
 // written together; either would do, and testing the reference keeps the
 // "registered, not yet provisioned" state readable at the call site.
 //
-// A NIL RECEIVER answers false, matching RequiresClientSideKeyFiltering. It has to: the repository's not-found
+// A NIL RECEIVER answers false, matching RequiresGatewayDelivery. It has to: the repository's not-found
 // representation for a subscriber is a nil pointer, so every caller that reads a
 // row and then asks a question about it can hold one, and a predicate that
 // panicked there would turn a missing subscriber into a crashed ledger process
@@ -4349,41 +4568,42 @@ func (s *EventSubscriber) IsMigrated() bool {
 // Such a row is not an active subscriber. It exists only so the outstanding
 // revocation stays recoverable, and issuing a credential for it would re-arm a
 // principal that is in the middle of being taken out of service.
-// A nil receiver answers false. Both this predicate and RequiresClientSideKeyFiltering are read
+// A nil receiver answers false. Both this predicate and RequiresGatewayDelivery are read
 // as GUARDS on a row that may not have been found, so they must be answerable on nothing: a
 // guard that panics where it is supposed to refuse is worse than no guard at all.
 func (s *EventSubscriber) IsRevocationPending() bool {
 	return s != nil && s.RevocationPendingAt != nil
 }
 
-// RequiresClientSideKeyFiltering reports whether the subscriber records a partition key prefix
-// whose narrowing the SUBSCRIBER has to apply itself, because the broker will not.
+// RequiresGatewayDelivery reports whether the subscriber records a partition key prefix, and
+// therefore that its records may only be delivered through Blnk's subscriber stream gateway.
 //
-// # It states a fact, and it must not be read as a verdict
+// # It states where records come from, not what the subscriber ought to do
 //
-// The name says what the SUBSCRIBER must do, not what Blnk refuses to do, and the distinction is
-// the whole reason it is worded this way. An earlier predicate over this same column was named
-// for unenforceability, and credential issuance failed closed on it: a subscriber recording a
-// prefix could never obtain a credential, permanently, and the mandatory credential endpoint
-// answered 409 for it forever. The intent was honesty — a topic-level credential is wider than a
-// key-scoped row appears to describe — but the effect was to withdraw a required capability, and
-// it withdrew it for a state the registry is explicitly designed to hold. That predicate has been
-// removed rather than merely re-documented, so no future caller can reach for a name that
-// implies a refusal this package no longer performs.
+// It replaced RequiresClientSideKeyFiltering, and the rename is the correction rather than a
+// tidy-up. That predicate said the narrowing was the SUBSCRIBER's to apply, and every surface
+// repeated it: the credential response carried client_side_key_filtering_required, the runbook
+// explained how to filter, and the principal was handed Read on whole shared category topics so
+// that it could. Client cooperation is not an access boundary. A subscriber that ignored the
+// prefix — or simply used a different consumer — read every other ledger's transactions,
+// balances and identities on those topics, and nothing in the platform prevented it.
 //
 // Kafka's authorizer has FIVE resource types — Topic, Group, Cluster, TransactionalId and
 // DelegationToken — and none of them is a message key. There is no binding, pattern type or
-// operation that confines a consumer to the records whose key carries a given prefix, and the
-// only architecture that would enforce a per-key boundary is a topic per key space, which is
-// ruled out: no per-tenant topics. So a key-enforcing credential is not something Blnk declines
-// to mint; it is not something that exists.
+// operation that confines a consumer to the records whose key carries a given prefix, and a
+// topic per key space is ruled out: no per-tenant topics. That much has not changed. What
+// changed is the conclusion drawn from it.
 //
-// What is therefore required is not a refusal but a STATEMENT. Issuance succeeds, and the
-// response says outright which dimensions the broker enforces, echoes the recorded prefix, and
-// answers the one question whose wrong answer is a data-disclosure bug — see
-// api/model.SubscriberEnforcedAccess. A reader of the registry or the credential response is
-// told that key filtering is the subscriber's own obligation, which is the strongest guarantee
-// available and a far better one than a comment that says the field is advisory.
+// # The boundary is enforced, and this predicate is what selects the path that enforces it
+//
+// A subscriber this reports true for is granted Describe on its authorised topics and Read on
+// its consumer-group namespace, and NO topic Read at all — so the broker refuses every fetch it
+// attempts, whatever client it uses. Its records reach it through the subscriber stream gateway,
+// which authenticates its issued credential and applies HasKeyAccess to every record's key
+// before returning it. The prefix is enforced before delivery, by Blnk, on the shared topics.
+//
+// So this is not a disclosure of a gap. It is the routing fact a client needs — consume through
+// the gateway, not from the broker — and the provisioning fact that makes the boundary real.
 //
 // The empty string is treated as absent for the same reason the column is nullable: "a
 // constraint on the empty prefix" is not an intent anybody has.
@@ -4392,8 +4612,32 @@ func (s *EventSubscriber) IsRevocationPending() bool {
 //
 // Returns:
 //   - bool: true when a non-blank partition key prefix is recorded.
-func (s *EventSubscriber) RequiresClientSideKeyFiltering() bool {
+func (s *EventSubscriber) RequiresGatewayDelivery() bool {
 	return s != nil && s.PartitionKeyPrefix != nil && strings.TrimSpace(*s.PartitionKeyPrefix) != ""
+}
+
+// GrantsBrokerRecordAccess reports whether this subscriber's credential may fetch records
+// DIRECTLY from the broker.
+//
+// It is the exact complement of RequiresGatewayDelivery, and it exists as its own name because
+// the two facts are read by different callers for different purposes: provisioning reads this
+// one to decide whether the ACL grant includes topic Read, and the credential response reads it
+// to tell an integrator where to consume from. Deriving one from the other at each of those
+// call sites is how a grant and the response describing it come to disagree.
+//
+// True is the ordinary case: a subscriber with no key scope is confined by its topic grant
+// alone, the broker enforces that grant completely, and direct consumption is exactly the
+// access model requirement R-7 describes. False means the only boundary the row asks for is one
+// the broker cannot evaluate, so record access is withheld and the stream gateway delivers.
+//
+// A nil receiver answers true, matching RequiresGatewayDelivery's false: neither predicate
+// invents a narrowing for a row that does not exist. Nothing is granted on the strength of it —
+// provisioning derives its bindings from a row it has loaded.
+//
+// Returns:
+//   - bool: true when no key scope is recorded.
+func (s *EventSubscriber) GrantsBrokerRecordAccess() bool {
+	return !s.RequiresGatewayDelivery()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -5744,34 +5988,21 @@ func (a EventOutboxAudit) FullyConfirmed() bool {
 	return a.UnconfirmedRows() == 0 && a.DistinctRecords == a.ConfirmedRows
 }
 
-// DeclaresUnenforceableIsolation reports whether this subscriber's record asks for an
-// access boundary that nothing in the system can enforce.
+// DeclaresUnenforceableIsolation HAS BEEN REMOVED, and the name is the reason it could not
+// stay.
 //
-// # The boundary that does not exist
+// It was the predicate credential issuance failed closed on: a subscriber recording a
+// partition-key prefix could never obtain a credential, because the prefix named a boundary
+// "nothing in the system can enforce". That premise is no longer true. Kafka still has no
+// message-key authorization dimension — it never will — but Blnk now enforces the boundary
+// itself, at the subscriber stream gateway, and withholds record-level Read from a key-scoped
+// principal so the gateway is the only path records can take. DeclaresKeyScope, immediately
+// below, is the surviving presence predicate; RequiresGatewayDelivery is the one that says
+// what follows from it.
 //
-// A non-nil PartitionKeyPrefix says "this subscriber may see only the records whose
-// partition key starts with this". Kafka has no mechanism for that: an ACL names a
-// topic, and a principal granted a topic reads every record on it. So a credential
-// issued to a subscriber that declares a prefix hands out access strictly wider than
-// the record it was issued against describes — and on a shared category topic that
-// wider access is every other subscriber's transactions, balances and identities.
-//
-// The failure mode is not a missing feature, it is a false assurance. An operator reads
-// the registry row, sees the prefix, and concludes the subscriber is confined to its own
-// records. Nothing anywhere contradicts them, because the value is accepted, stored,
-// echoed back and never enforced.
-//
-// So the value is still STORED — it is a real statement of intent, and erasing it would
-// destroy the record of what an operator asked for — and credential issuance REFUSES
-// while it is present. The remedy is explicit rather than silent: clear the prefix to
-// accept topic-level scope, which is the boundary Kafka ACLs can actually hold, or narrow
-// authorized_topics until topic-level scope IS the isolation required.
-//
-// Returns:
-//   - bool: true when a partition-key prefix is recorded.
-func (s *EventSubscriber) DeclaresUnenforceableIsolation() bool {
-	return s != nil && s.PartitionKeyPrefix != nil && strings.TrimSpace(*s.PartitionKeyPrefix) != ""
-}
+// It had no callers when it was removed, which is worse rather than better: it was documented
+// prose asserting that a stored value could not be honoured, sitting one grep away from
+// anybody deciding what to do about a key-scoped subscriber.
 
 // DeclaresKeyScope reports whether this subscriber records a partition-key scope.
 //
@@ -5834,12 +6065,22 @@ const (
 	// boundary and there is nothing left for a consumer to filter.
 	KeyScopeEnforcementNone KeyScopeEnforcementStatus = "none"
 
-	// KeyScopeEnforcementConsumerSide is reported when a key scope IS recorded. The
-	// broker grants Read on whole topics — it has no message-key dimension — so the
-	// scope is honoured by the consumer applying HasKeyAccess to each record's key.
-	// A subscriber that ignores it will see records outside its scope, which is why
-	// this value is disclosed rather than inferred.
-	KeyScopeEnforcementConsumerSide KeyScopeEnforcementStatus = "consumer_side"
+	// KeyScopeEnforcementGateway is reported when a key scope IS recorded: the scope is
+	// enforced by BLNK, at the subscriber stream gateway, which applies HasKeyAccess to
+	// every record's key before the record leaves the process.
+	//
+	// It replaced a value of "consumer_side", and the replacement is the whole of the
+	// isolation correction. Kafka's authorizer has no message-key dimension, so the broker
+	// cannot keep this boundary — but reporting it as the CONSUMER's obligation meant the
+	// platform granted whole-topic Read and asked the subscriber to please discard what it
+	// was not entitled to. Cooperation is not an access boundary: a subscriber that ignored
+	// the prefix, or read the topic with any other client, saw every other ledger's records.
+	//
+	// So a key-scoped subscriber is no longer granted Read on any topic at all. Its
+	// credential authenticates at the gateway, the gateway filters by this scope, and the
+	// broker refuses every direct fetch — which is what makes this value a statement about
+	// where enforcement HAPPENS rather than a request that somebody perform it.
+	KeyScopeEnforcementGateway KeyScopeEnforcementStatus = "blnk_stream_gateway"
 )
 
 // KeyScopeEnforcement reports where this subscriber's key scope is enforced.
@@ -5857,11 +6098,11 @@ const (
 // whose not-found representation is a nil pointer.
 //
 // Returns:
-//   - KeyScopeEnforcementStatus: ConsumerSide when a non-blank prefix is recorded,
-//     otherwise None.
+//   - KeyScopeEnforcementStatus: Gateway when a non-blank prefix is recorded, otherwise
+//     None.
 func (s *EventSubscriber) KeyScopeEnforcement() KeyScopeEnforcementStatus {
 	if s.DeclaresKeyScope() {
-		return KeyScopeEnforcementConsumerSide
+		return KeyScopeEnforcementGateway
 	}
 
 	return KeyScopeEnforcementNone

@@ -64,6 +64,7 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -75,6 +76,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/sasl/scram"
 
 	"github.com/blnkfinance/blnk"
 	"github.com/blnkfinance/blnk/api/model"
@@ -972,7 +976,13 @@ func TestEventsAPI_StatsRefusesAWindowItCannotReport(t *testing.T) {
 	t.Run("a whole-second window is honoured", func(t *testing.T) {
 		// 1.5h is 5400 seconds exactly, so a fractional UNIT is not the test: what matters is
 		// whether the duration lands on a whole second.
-		for _, window := range []string{"1s", "90s", "15m", "36h", "2m30s", "1.5h"} {
+		//
+		// Every case is at or below the daily ceiling, which is now the default (PERF-M05):
+		// the window may only NARROW, because the figure it bounds is an exact count of the
+		// one unbounded population and a week of it is 302.4 million index entries at the
+		// target rate. `36h` was here and has been replaced by `24h` — its whole-second
+		// property is what this subtest is about, and 24h has it too.
+		for _, window := range []string{"1s", "90s", "15m", "24h", "2m30s", "1.5h"} {
 			t.Run(window, func(t *testing.T) {
 				w := eventsRouterRequest(t, router, http.MethodGet,
 					"/events/stats?window="+window, "")
@@ -985,29 +995,126 @@ func TestEventsAPI_StatsRefusesAWindowItCannotReport(t *testing.T) {
 	})
 }
 
+// eventsRouteExists reports whether the router serves pattern under ANY method.
+//
+// It is the premise behind every "this verb is unsupported" assertion: a case aimed at a
+// path the surface does not serve at all would satisfy the refusal and the absence-from-
+// the-table check together, and pass while proving only that the path was misspelled.
+func eventsRouteExists(router *gin.Engine, pattern string) bool {
+	for _, route := range router.Routes() {
+		if route.Path == pattern {
+			return true
+		}
+	}
+
+	return false
+}
+
 // TestEventsAPI_UnsupportedMethodsDoNotReachTheHandlers is the routing assertion.
 //
-// The three routes are registered for one verb each. A different verb must not fall through
-// to a handler for another route — which is what would happen if any of them were registered
-// with router.Any — and must not be answered 200.
+// The three routes are registered for one verb each. A different verb must not fall through to a
+// handler for another route — which is what would happen if any of them were registered with
+// router.Any — and must not be answered 200.
+//
+// # Why "not 200" was not enough, and why the id had to change
+//
+// The replay cases used `evt_probe`, which is not a canonical UUID, so a verb that HAD been
+// wrongly registered would have reached the handler, failed its own identifier validation and
+// answered 400 — not 200, assertion satisfied, defect invisible. The id is now a canonical UUID
+// the handler would accept, so nothing but the router can refuse these requests.
+//
+// The expectation is exact rather than negative, and the two acceptable answers are different
+// facts about the router:
+//
+//   - 405 METHOD NOT ALLOWED means gin matched the PATH and rejected the verb, which is what
+//     HandleMethodNotAllowed produces when it is enabled.
+//   - 404 NOT FOUND means no route matched at all, which is gin's default for an unregistered
+//     method/path pair.
+//
+// Which of the two an engine gives is a property of the engine's configuration and not of this
+// surface, so both are accepted — and anything else, 200 or 400 or 500, is a failure. The route
+// table is then inspected directly, so the absence is asserted structurally as well as
+// observationally, and the datasource is required to have been untouched: a verb that reached a
+// handler and failed later would still have queried.
 func TestEventsAPI_UnsupportedMethodsDoNotReachTheHandlers(t *testing.T) {
+	// A canonical id the replay handler would accept. With a malformed one, a wrongly registered
+	// verb answers 400 from the handler's own validation and this test cannot tell that apart
+	// from the router refusing it.
+	replayableID := uuid.NewString()
+
+	// pattern is the shape gin REGISTERS, which is what router.Routes() reports. It is carried
+	// separately from the path actually requested because the replay route is parameterised: a
+	// concrete "/events/dead-letter/<uuid>/replay" can never equal the registered
+	// "/events/dead-letter/:event_id/replay", so a structural check written against the
+	// request path would hold no matter what the router contained — vacuously, for exactly the
+	// three cases that most need it.
 	for name, target := range map[string]struct {
-		method string
-		path   string
+		method  string
+		path    string
+		pattern string
 	}{
-		"POST to the inventory": {http.MethodPost, "/events/dead-letter"},
-		"DELETE the inventory":  {http.MethodDelete, "/events/dead-letter"},
-		"PUT the statistics":    {http.MethodPut, "/events/stats"},
-		"DELETE the statistics": {http.MethodDelete, "/events/stats"},
-		"GET the replay":        {http.MethodGet, "/events/dead-letter/evt_probe/replay"},
-		"DELETE the replay":     {http.MethodDelete, "/events/dead-letter/evt_probe/replay"},
+		"POST to the inventory": {http.MethodPost, "/events/dead-letter", "/events/dead-letter"},
+		"DELETE the inventory":  {http.MethodDelete, "/events/dead-letter", "/events/dead-letter"},
+		"PUT the statistics":    {http.MethodPut, "/events/stats", "/events/stats"},
+		"DELETE the statistics": {http.MethodDelete, "/events/stats", "/events/stats"},
+		"GET the replay": {
+			http.MethodGet,
+			"/events/dead-letter/" + replayableID + "/replay",
+			"/events/dead-letter/:event_id/replay",
+		},
+		"DELETE the replay": {
+			http.MethodDelete,
+			"/events/dead-letter/" + replayableID + "/replay",
+			"/events/dead-letter/:event_id/replay",
+		},
+		"PUT the replay": {
+			http.MethodPut,
+			"/events/dead-letter/" + replayableID + "/replay",
+			"/events/dead-letter/:event_id/replay",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			w := eventsRouterRequest(t, eventsRouter(t, true), target.method, target.path, "")
+			router, ds := setupEventsRouter(t, nil)
 
-			assert.NotEqual(t, http.StatusOK, w.Code,
-				"%s %s must not be handled; a 200 here means the verb reached a handler that was "+
-					"registered for a different one", target.method, target.path)
+			// THE MASTER KEY IS PRESENTED. This harness runs in secure mode, so an
+			// unauthenticated request is refused with 401 before gin routes it at all — and a
+			// 401 says nothing about whether the verb is registered. Authenticating removes
+			// authentication from the answer, leaving the router as the only thing that can
+			// refuse.
+			w := eventsKeyedRequest(t, router, target.method, target.path, eventsMockMasterKey)
+
+			assert.Containsf(t, []int{http.StatusNotFound, http.StatusMethodNotAllowed}, w.Code,
+				"%s %s answered %d. It is registered for no handler, so the ROUTER must refuse it "+
+					"with 404 or 405; any other status means the verb reached a handler registered "+
+					"for a different one. body: %s",
+				target.method, target.path, w.Code, w.Body.String())
+
+			// STRUCTURAL, not only observational: the pair is absent from the route table.
+			// A gin router can answer 404 for a registered route whose handler is unreachable
+			// for some other reason, and 405 is emitted by a setting rather than by the table,
+			// so the table is inspected directly as well.
+			for _, route := range router.Routes() {
+				if route.Method != target.method || route.Path != target.pattern {
+					continue
+				}
+
+				assert.Failf(t, "an unsupported verb is registered",
+					"%s %s IS REGISTERED, to %s. The event surface registers one verb per route; a "+
+						"second one is either a duplicate registration or a router.Any",
+					target.method, target.pattern, route.Handler)
+			}
+			// The pattern itself must exist under SOME method, or this case is aimed at a path
+			// the surface does not serve at all and would pass for the wrong reason.
+			assert.Truef(t, eventsRouteExists(router, target.pattern),
+				"no route is registered at %s under any method, so this case proves nothing about "+
+					"%s being unsupported — it proves the path is misspelled",
+				target.pattern, target.method)
+
+			// AND NOTHING WAS QUERIED. A verb that reached a handler and then failed its own
+			// validation would answer 4xx while having already read the outbox.
+			assert.Emptyf(t, eventsRepositoryCallsExcludingAuth(ds),
+				"%s %s reached the repository: %v",
+				target.method, target.path, eventsRepositoryCallsExcludingAuth(ds))
 		})
 	}
 }
@@ -1028,9 +1135,14 @@ const eventsResourceMapMasterKey = "resource-map-master-key-for-the-real-router-
 //
 // # What an unmapped prefix does
 //
-// getResourceFromPath returns "" and the middleware aborts with AUTH_UNKNOWN_RESOURCE — for
-// every caller of that route, forever. That is why "events" and "subscribers" had to be added
-// to two files rather than one, and why registering the scope constant alone is not enough.
+// getResourceFromPath returns "" and the middleware aborts with AUTH_UNKNOWN_RESOURCE for
+// every AUTHENTICATED NON-MASTER caller of that route. The master key is NOT among them: it is
+// matched and returned on at api/middleware/auth.go:232-238, before the resource is resolved at
+// all, so it still reaches the handler. That asymmetry is the whole difficulty — the surface
+// looks reachable to the one credential a smoke test is likeliest to use while being unusable by
+// every integration principal, which in a secure deployment is all of them. It is why "events"
+// and "subscribers" had to be added to two files rather than one, and why registering the scope
+// constant alone is not enough.
 //
 // # What this asserts
 //
@@ -1086,7 +1198,7 @@ func TestEventsAPI_PathPrefixesResolveToAuthorizationResources(t *testing.T) {
 
 			require.NotEqual(t, apierror.ErrAuthUnknownResource, body.ErrorDetail.Code,
 				"%s %s RESOLVES TO NO AUTHORIZATION RESOURCE, so the middleware aborts every "+
-					"request to it — master key included. The path prefix is missing from "+
+					"request from every non-master principal. The path prefix is missing from "+
 					"pathToResource in api/middleware/auth.go; adding the scope constant alone is "+
 					"not enough", target.method, target.path)
 
@@ -1363,111 +1475,59 @@ const eventsMockMasterKey = "events-api-mock-datasource-master-key"
 // make a failure harder to read.
 const eventsMockAPIKeySecret = "events-api-non-master-probe-credential"
 
-// eventsBackgroundTouchBuffer and eventsBackgroundTouchTimeout size the barrier below.
+// eventsBackgroundTouchTimeout bounds the wait for the middleware's background last-used update.
 //
-// The buffer only has to absorb the background touches of the requests one router serves,
-// which is a handful, and it is generously oversized so a send can never block. The
-// timeout is a safety valve that is never reached in a correct run: it exists so that a
-// future change which stops the touch from happening fails as a slow test rather than as a
-// hung one.
-const (
-	eventsBackgroundTouchBuffer  = 64
-	eventsBackgroundTouchTimeout = 5 * time.Second
-)
+// It is a safety valve rather than a delay: in a correct run the update lands in microseconds and
+// the wait returns immediately. Reaching the timeout means the middleware stopped performing the
+// update at all, which is a real regression and is reported as a FAILURE rather than stepped over.
+const eventsBackgroundTouchTimeout = 5 * time.Second
 
-// eventsSynchronizedDatasource is the mock datasource with ONE method wrapped, so a
-// request can be joined with the background work the authentication middleware starts for
-// it.
+// eventsBackgroundTouchGrace is how long a REFUSED request is watched for a last-used update it
+// must never make.
 //
-// # The race this removes, and why it is removed HERE
-//
-// api/middleware/auth.go authenticates a non-master credential and then updates the key's
-// last-used timestamp in a fire-and-forget goroutine that reads c.Request.Context() from
-// inside the goroutine. Meanwhile otelgin's middleware restores c.Request in a DEFERRED
-// function, which runs as the handler chain unwinds. The two touch c.Request concurrently,
-// and `go test -race` reports it.
-//
-// That is a property of the production middleware and not of these tests, and this file is
-// not the place it can be corrected — it is a test file, and the authorization middleware
-// is out of its scope. What IS this file's business is not turning a green race build red:
-// a mock-backed request completes in microseconds, so the goroutine is still starting when
-// the chain unwinds and the interleaving becomes reliable rather than rare.
-//
-// So the request is JOINED with its own background work before the chain unwinds. The touch
-// signals this channel after it has run, the barrier middleware below receives that signal
-// after the handler returns and before otelgin's deferred restore, and the resulting
-// happens-before edge orders the goroutine's read ahead of the write. It is a
-// synchronisation edge and not a delay: nothing sleeps, and the ordering is guaranteed
-// rather than made probable.
-//
-// It also makes the mock's own call log safe to read. The recorder is appended to from that
-// same goroutine, so a test that inspected it while the goroutine was live would be racing
-// on testify's internals; joining first means no goroutine is in flight by the time any
-// assertion runs.
-type eventsSynchronizedDatasource struct {
-	*mocks.MockDataSource
+// The admitted path waits for an update that is expected, so its bound can be generous — it is
+// never reached. This bound is paid in full on every correct run, because nothing is expected to
+// arrive, so it is kept short enough to be invisible and long enough to catch a goroutine that a
+// non-blocking check would race past.
+const eventsBackgroundTouchGrace = 200 * time.Millisecond
 
-	// touched receives once per completed background last-used update.
-	touched chan struct{}
-}
-
-// UpdateLastUsed records the call on the embedded mock and then announces that the
-// background goroutine has finished with the request.
+// requireEventsLastUsedTouch joins an authenticated request with the background last-used update
+// the authentication middleware starts for it, and FAILS if that update never happens.
 //
-// The signal is sent AFTER the delegation, which is what makes it mean "the goroutine has
-// read everything it is going to read and its call is recorded" rather than merely "the
-// goroutine started".
+// # Why a join is needed at all
+//
+// The middleware answers the request and updates last_used_at on a goroutine that outlives the
+// response. Two things in a test depend on that goroutine having finished: testify's own call log,
+// which the goroutine appends to and the assertions read; and a strict expectation, which reports
+// an unmet call at the end of the test. Without a join both are decided by whichever goroutine wins,
+// which is the definition of a flaky test.
+//
+// # Why this is not the barrier it replaced
+//
+// A gin middleware used to sit between otelgin and authentication for this purpose, waiting after
+// c.Next() so that the goroutine's read of c.Request was ordered ahead of otelgin's deferred write
+// of it. That was scheduling around a production data race — the middleware read c.Request from
+// inside the goroutine — and its timeout arm PROCEEDED SILENTLY, so the test stayed green whether
+// or not the ordering held. The race is fixed in api/middleware/auth.go, which now captures the
+// context and the key id on the request goroutine before spawning anything, so nothing here has to
+// influence scheduling. What remains is an ordinary wait for asynchronous work, and it is strict.
 //
 // Parameters:
-//   - ctx context.Context: the context the middleware's goroutine captured.
-//   - id string: the API key id being touched.
-//
-// Returns:
-//   - error: whatever the embedded mock was programmed to return.
-func (d *eventsSynchronizedDatasource) UpdateLastUsed(ctx context.Context, id string) error {
-	err := d.MockDataSource.UpdateLastUsed(ctx, id)
+//   - t *testing.T: the test, FAILED when the update does not arrive.
+//   - touched <-chan struct{}: the channel expectEventsAPIKeyLookup returns.
+func requireEventsLastUsedTouch(t *testing.T, touched <-chan struct{}) {
+	t.Helper()
 
-	// Non-blocking: a full buffer would mean far more requests than any test here makes,
-	// and blocking a production goroutine on a test channel is never worth the certainty.
 	select {
-	case d.touched <- struct{}{}:
-	default:
-	}
-
-	return err
-}
-
-// eventsAuthGoroutineBarrier joins each authenticated request with the background work the
-// authentication middleware started for it.
-//
-// It is installed between otelgin and the authentication middleware, so its post-Next code
-// runs after the handler has answered and BEFORE otelgin's deferred restore of c.Request —
-// which is exactly the window the background goroutine's read has to be ordered into.
-//
-// Whether to wait is decided from the context rather than guessed: the middleware sets
-// "apiKey" on precisely the path that spawns the goroutine, and on no other. A master-key
-// request therefore waits for nothing, which is what keeps this from blocking the many
-// tests in this file that authenticate with the master key.
-//
-// Parameters:
-//   - touched <-chan struct{}: the channel the wrapped datasource signals.
-//
-// Returns:
-//   - gin.HandlerFunc: the barrier.
-func eventsAuthGoroutineBarrier(touched <-chan struct{}) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Next()
-
-		// No API-key principal means the master key, an anonymous refusal or a skipped
-		// authentication — none of which starts a goroutine, so there is nothing to join.
-		if _, authenticated := c.Get("apiKey"); !authenticated {
-			return
-		}
-
-		select {
-		case <-touched:
-		case <-time.After(eventsBackgroundTouchTimeout):
-		}
+	case <-touched:
+	case <-time.After(eventsBackgroundTouchTimeout):
+		t.Fatalf(
+			"the authentication middleware did not update the API key's last-used timestamp "+
+				"within %s. It fires that update on a goroutine for every non-master credential it "+
+				"admits, so either the request was not authenticated as expected or the update was "+
+				"removed — and a test that proceeded here would be asserting on a call log another "+
+				"goroutine may still be writing to", eventsBackgroundTouchTimeout,
+		)
 	}
 }
 
@@ -1549,6 +1609,26 @@ func newEventsAPIOverMockDatasource(
 	if mutate != nil {
 		mutate(cfg)
 	}
+
+	// RESTORED WHEN THE TEST ENDS. config.ConfigStore is a process-global atomic.Value, so
+	// everything installed here — the master key, the secure-mode flag, the topic prefix and,
+	// for the replay test, a live broker list — is read by every LATER test in the package that
+	// calls config.Fetch. Without this, a test asserting the unconfigured or insecure posture
+	// fails inside a helper that never mentions Kafka, and the failure names neither this
+	// harness nor the test that ran before it. The same block guards setupSubscribersRouter.
+	previousConfiguration := config.ConfigStore.Load()
+	t.Cleanup(func() {
+		if previousConfiguration != nil {
+			config.ConfigStore.Store(previousConfiguration)
+
+			return
+		}
+
+		// An atomic.Value cannot be emptied, so a process that held nothing before this test is
+		// returned to a configuration that carries nothing rather than left holding this one.
+		config.ConfigStore.Store(&config.Configuration{})
+	})
+
 	config.MockConfig(cfg)
 
 	cnf, err := config.Fetch()
@@ -1557,33 +1637,38 @@ func newEventsAPIOverMockDatasource(
 		"secure mode must survive validateAndAddDefaults, or the authentication middleware "+
 			"returns before it consults the resource map and the authorization tests below "+
 			"pass vacuously")
-	require.Empty(t, cnf.Kafka.Brokers,
-		"this harness must run with NO broker configured: that is the posture the endpoints "+
-			"are required to degrade gracefully in, and it is what makes a replay answer "+
-			"EVENT_KAFKA_UNAVAILABLE deterministically")
+	// THE DEFAULT POSTURE IS NO BROKER, and it is asserted rather than assumed: it is what
+	// makes a replay answer EVENT_KAFKA_UNAVAILABLE deterministically and it is the
+	// graceful-degradation deployment the listing and statistics routes must work in.
+	//
+	// A caller that DELIBERATELY configured brokers through the hook is the one exception —
+	// a successful replay cannot be produced without one — and it gets the stricter check:
+	// config.MockConfig silently leaves the PREVIOUS configuration in the store when it
+	// rejects one, so a test that thought it had a broker would otherwise run against
+	// another test's deployment and fail somewhere unrelated.
+	if len(cfg.Kafka.Brokers) == 0 {
+		require.Empty(t, cnf.Kafka.Brokers,
+			"this harness must run with NO broker configured unless the caller asked for one: "+
+				"that is the posture the endpoints are required to degrade gracefully in")
+	} else {
+		require.Len(t, cnf.Kafka.Brokers, len(cfg.Kafka.Brokers),
+			"config.MockConfig REJECTED the configuration and left the previous one in the "+
+				"store, so this test would run against another test's deployment. Its reason is "+
+				"on the error log just above")
+	}
 
 	ds := new(mocks.MockDataSource)
 
-	// The datasource handed to the service container is the mock with its last-used update
-	// wrapped, so each request can be joined with the background goroutine the
-	// authentication middleware starts for it. See eventsSynchronizedDatasource: this is
-	// what keeps a pre-existing production race in the authorization middleware from being
-	// made reliably observable by a test that answers in microseconds.
-	synchronized := &eventsSynchronizedDatasource{
-		MockDataSource: ds,
-		touched:        make(chan struct{}, eventsBackgroundTouchBuffer),
-	}
-
-	instance, err := blnk.NewBlnk(synchronized)
+	// The mock goes to the service container UNWRAPPED. It used to be wrapped in a decorator
+	// whose only job was to signal a barrier middleware, which existed to schedule around a data
+	// race in the authentication middleware's background goroutine. That race is fixed at its
+	// source, so the harness is an ordinary one again and the join is an ordinary wait — see
+	// requireEventsLastUsedTouch.
+	instance, err := blnk.NewBlnk(ds)
 	require.NoError(t, err, "the service container must build over the mock datasource")
 
 	apiInstance := NewAPI(instance)
 	require.NotNil(t, apiInstance, "NewAPI returned nil, which means the configuration was unusable")
-
-	// Installed BEFORE Router() adds the authentication middleware, so the barrier sits
-	// between otelgin and authentication in the chain — which is the only position from
-	// which it can order the background read ahead of otelgin's deferred write.
-	apiInstance.router.Use(eventsAuthGoroutineBarrier(synchronized.touched))
 
 	return apiInstance, ds
 }
@@ -1626,19 +1711,105 @@ func eventsTestAPIKey(scopes ...string) *coremodel.APIKey {
 // GetAPIKey is the datasource method behind blnk.GetAPIKeyByKey, so that is the
 // expectation name — not the service method's.
 //
-// UpdateLastUsed is expected with .Maybe() because the middleware fires it in a
-// GOROUTINE after the response has been written. A strict expectation would be a
-// race by construction: the request can complete, the recorder can be asserted and
-// the test can finish before that goroutine runs, and an unmet-or-unexpected call
-// would then be reported nondeterministically — which is exactly the flake `-race`
-// makes frequent.
+// UpdateLastUsed is expected STRICTLY — exactly once, on the key that was admitted — because the
+// middleware performs it for every non-master credential it admits, and a `.Maybe()` there hid two
+// different failures: the update being dropped altogether, and the update being made for a
+// different key id.
+//
+// It used to be `.Maybe()` because the update runs on a goroutine that outlives the response, so a
+// strict expectation was reported nondeterministically. The determinism comes from the returned
+// channel instead: the caller waits on it through requireEventsLastUsedTouch before asserting
+// anything, so the call is recorded before the expectation is checked. The signal is sent from
+// testify's own Run hook, which fires AFTER the call has been appended to the mock's log, which is
+// what makes "signalled" mean "recorded".
 //
 // Parameters:
 //   - ds *mocks.MockDataSource: the datasource to program.
 //   - key *coremodel.APIKey: the principal the lookup resolves to.
-func expectEventsAPIKeyLookup(ds *mocks.MockDataSource, key *coremodel.APIKey) {
+//
+// Returns:
+//   - <-chan struct{}: signalled once the background last-used update has been recorded. Buffered,
+//     so the production goroutine never blocks on a test channel even if nobody waits.
+func expectEventsAPIKeyLookup(ds *mocks.MockDataSource, key *coremodel.APIKey) <-chan struct{} {
+	touched := make(chan struct{}, 1)
+
 	ds.On("GetAPIKey", mock.Anything, eventsMockAPIKeySecret).Return(key, nil)
-	ds.On("UpdateLastUsed", mock.Anything, key.APIKeyID).Return(nil).Maybe()
+	ds.On("UpdateLastUsed", mock.Anything, key.APIKeyID).
+		Run(func(mock.Arguments) {
+			select {
+			case touched <- struct{}{}:
+			default:
+			}
+		}).
+		Return(nil).
+		Once()
+
+	return touched
+}
+
+// expectEventsAPIKeyLookupWithoutTouch programs the datasource for a credential the
+// authentication middleware is going to REFUSE.
+//
+// The middleware updates last_used_at only for a credential it ADMITS — the update sits below the
+// permission check — so a request refused on scope must produce no update at all. Expecting one
+// here strictly, as the admitted path does, would deadlock the wait and report an unmet call.
+// The property this programming pins is the opposite one: a refused key must not be recorded as
+// having been used, because last_used_at is read as evidence that a credential is live.
+//
+// UpdateLastUsed is PROGRAMMED but `.Maybe()`. Leaving it unprogrammed would make a regression
+// panic inside the middleware's goroutine and take the whole test binary down with it instead of
+// failing this one test; `.Maybe()` keeps it out of AssertExpectations, and the returned channel is
+// what requireNoEventsLastUsedTouch reads to decide.
+//
+// Parameters:
+//   - ds *mocks.MockDataSource: the datasource to program.
+//   - key *coremodel.APIKey: the principal the lookup resolves to, whose scopes get it refused.
+//
+// Returns:
+//   - <-chan struct{}: signalled if a last-used update happens, which is the failure.
+func expectEventsAPIKeyLookupWithoutTouch(
+	ds *mocks.MockDataSource,
+	key *coremodel.APIKey,
+) <-chan struct{} {
+	touched := make(chan struct{}, 1)
+
+	ds.On("GetAPIKey", mock.Anything, eventsMockAPIKeySecret).Return(key, nil)
+	ds.On("UpdateLastUsed", mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) {
+			select {
+			case touched <- struct{}{}:
+			default:
+			}
+		}).
+		Return(nil).
+		Maybe()
+
+	return touched
+}
+
+// requireNoEventsLastUsedTouch FAILS if the middleware recorded a last-used update for a credential
+// it refused.
+//
+// The wait is a bounded grace period rather than an instant check because the update, if one were
+// ever reintroduced on this path, would run on a goroutine that an instant check could miss. In a
+// correct run nothing arrives and the whole grace period is paid, which is why it is short.
+//
+// Parameters:
+//   - t *testing.T: the test, FAILED when an update arrives.
+//   - touched <-chan struct{}: the channel expectEventsAPIKeyLookupWithoutTouch returns.
+func requireNoEventsLastUsedTouch(t *testing.T, touched <-chan struct{}) {
+	t.Helper()
+
+	select {
+	case <-touched:
+		t.Fatal(
+			"the authentication middleware updated the API key's last-used timestamp for a request " +
+				"it REFUSED on scope. last_used_at is read as evidence that a credential is in use, " +
+				"so a refused attempt must not advance it; the update belongs below the permission " +
+				"check in api/middleware/auth.go, not above it",
+		)
+	case <-time.After(eventsBackgroundTouchGrace):
+	}
 }
 
 // eventsAPIRoute is one registered route on the event management surface, named so a
@@ -1786,9 +1957,11 @@ func eventsRepositoryCallsExcludingAuth(ds *mocks.MockDataSource) []string {
 // # What an unmapped prefix does, and what this asserts instead
 //
 // getResourceFromPath returns "" and the middleware aborts with AUTH_UNKNOWN_RESOURCE
-// for every caller of that route, forever — which is why "events" had to be added to
-// BOTH api/middleware/scope.go and api/middleware/auth.go and why registering the
-// scope constant alone is not enough.
+// for every AUTHENTICATED NON-MASTER caller of that route — not for the master key,
+// which is matched and returned on before the resource is resolved, as described above.
+// That is why "events" had to be added to BOTH api/middleware/scope.go and
+// api/middleware/auth.go, and why registering the scope constant alone is not enough:
+// the omission is invisible to the master key and total for everyone else.
 //
 // The key here is scoped TO these routes, so all three assertions below are available
 // at once and each excludes a different failure:
@@ -1814,15 +1987,19 @@ func TestEventsAPI_AuthorizationResourceIsRegistered(t *testing.T) {
 	for _, route := range eventsAPIRoutes {
 		t.Run(route.name, func(t *testing.T) {
 			router, ds := setupEventsRouter(t, nil)
-			expectEventsAPIKeyLookup(ds, eventsTestAPIKey(route.scope))
+			touched := expectEventsAPIKeyLookup(ds, eventsTestAPIKey(route.scope))
 
 			recorder := eventsKeyedRequest(t, router, route.method, route.path, eventsMockAPIKeySecret)
+
+			// The middleware's background last-used update is joined BEFORE anything reads the
+			// mock's call log below, so no goroutine is in flight while it is being inspected.
+			requireEventsLastUsedTouch(t, touched)
 
 			detail := eventsErrorDetail(t, recorder)
 
 			require.NotEqual(t, apierror.ErrAuthUnknownResource, detail.Code,
 				"%s %s RESOLVES TO NO AUTHORIZATION RESOURCE, so the middleware aborts every "+
-					"request to it — the master key included. The path prefix is missing from "+
+					"request to it from every non-master principal. The path prefix is missing from "+
 					"pathToResource in api/middleware/auth.go; adding the scope constant to "+
 					"api/middleware/scope.go alone is not enough. THIS IS THE ASSERTION THIS "+
 					"TEST EXISTS FOR: it is the only failure mode of the two-file registration "+
@@ -1864,9 +2041,14 @@ func TestEventsAPI_AuthorizationRefusesAnUnrelatedScopeInItsOwnName(t *testing.T
 			// Deliberately unrelated to this surface, and deliberately a real resource:
 			// an unparseable scope would be refused by scope parsing rather than by the
 			// permission check, which is a different code path.
-			expectEventsAPIKeyLookup(ds, eventsTestAPIKey("ledgers:read"))
+			touched := expectEventsAPIKeyLookupWithoutTouch(ds, eventsTestAPIKey("ledgers:read"))
 
 			recorder := eventsKeyedRequest(t, router, route.method, route.path, eventsMockAPIKeySecret)
+
+			// A credential refused on scope must not be recorded as used, and this is where that
+			// is decided. It doubles as the join for the call-log assertions below: after it
+			// returns, nothing the middleware started for this request is still in flight.
+			requireNoEventsLastUsedTouch(t, touched)
 
 			detail := eventsErrorDetail(t, recorder)
 
@@ -2026,7 +2208,7 @@ func eventsReplayableRow(eventID string) *coremodel.EventOutbox {
 // property and not refusing after it.
 func TestListDeadLetterEvents_RefusesANonMasterCallerBeforeAnyRepositoryWork(t *testing.T) {
 	router, ds := setupEventsRouter(t, nil)
-	expectEventsAPIKeyLookup(ds, eventsTestAPIKey("events:read"))
+	touched := expectEventsAPIKeyLookup(ds, eventsTestAPIKey("events:read"))
 
 	// Programmed to succeed, so a leaking gate produces a 200 and this test fails
 	// for the right reason.
@@ -2039,6 +2221,8 @@ func TestListDeadLetterEvents_RefusesANonMasterCallerBeforeAnyRepositoryWork(t *
 
 	recorder := eventsKeyedRequest(t, router,
 		http.MethodGet, "/events/dead-letter", eventsMockAPIKeySecret)
+
+	requireEventsLastUsedTouch(t, touched)
 
 	assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
 	ds.AssertNotCalled(t, "ListDeadLetterInventory", mock.Anything, mock.Anything)
@@ -2060,7 +2244,7 @@ func TestReplayDeadLetterEvent_RefusesANonMasterCallerBeforeAnyRepositoryWork(t 
 	eventID := uuid.NewString()
 
 	router, ds := setupEventsRouter(t, nil)
-	expectEventsAPIKeyLookup(ds, eventsTestAPIKey("events:write"))
+	touched := expectEventsAPIKeyLookup(ds, eventsTestAPIKey("events:write"))
 
 	ds.On("ClaimEventForReplay", mock.Anything, eventID, mock.Anything).
 		Return(eventsReplayableRow(eventID), nil).Maybe()
@@ -2069,6 +2253,8 @@ func TestReplayDeadLetterEvent_RefusesANonMasterCallerBeforeAnyRepositoryWork(t 
 
 	recorder := eventsKeyedRequest(t, router,
 		http.MethodPost, "/events/dead-letter/"+eventID+"/replay", eventsMockAPIKeySecret)
+
+	requireEventsLastUsedTouch(t, touched)
 
 	assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
 	ds.AssertNotCalled(t, "ClaimEventForReplay", mock.Anything, mock.Anything, mock.Anything)
@@ -2086,7 +2272,7 @@ func TestReplayDeadLetterEvent_RefusesANonMasterCallerBeforeAnyRepositoryWork(t 
 // reading, so the gate precedes the counts.
 func TestGetEventOutboxStats_RefusesANonMasterCallerBeforeAnyRepositoryWork(t *testing.T) {
 	router, ds := setupEventsRouter(t, nil)
-	expectEventsAPIKeyLookup(ds, eventsTestAPIKey("events:read"))
+	touched := expectEventsAPIKeyLookup(ds, eventsTestAPIKey("events:read"))
 
 	ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
 		Return(map[string]int64{coremodel.EventOutboxStatusDispatched: 9_999_999}, nil).Maybe()
@@ -2097,6 +2283,8 @@ func TestGetEventOutboxStats_RefusesANonMasterCallerBeforeAnyRepositoryWork(t *t
 
 	recorder := eventsKeyedRequest(t, router,
 		http.MethodGet, "/events/stats", eventsMockAPIKeySecret)
+
+	requireEventsLastUsedTouch(t, touched)
 
 	assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
 	ds.AssertNotCalled(t, "CountEventOutboxByStatus", mock.Anything, mock.Anything)
@@ -3180,6 +3368,237 @@ func TestReplayDeadLetterEvent_RequiresAnEventIDInTheRoute(t *testing.T) {
 	})
 }
 
+// eventsReplayKafkaClient builds an authenticated Kafka client for reading a replayed record
+// back off its topic.
+//
+// The local stack speaks SASL/SCRAM-SHA-512, so an unauthenticated client cannot read anything
+// and a test built on one would report every assertion as a broker problem.
+//
+// THE ADMINISTRATIVE PRINCIPAL IS USED, NOT THE PRODUCER, and the reason is a property worth
+// stating: Blnk's producer principal is granted Write and NOT Read, so it cannot read back what
+// it publishes — least privilege applied to the publisher itself. A read-back verifier therefore
+// needs a different identity, and the administrator is the one this environment already supplies
+// for administrative reads. It is a verification identity belonging to the test, never a
+// production consumer.
+//
+// Parameters:
+//   - t *testing.T: the test, failed when the mechanism cannot be built.
+//   - kafkaConfig config.KafkaConfig: the resolved broker environment.
+//
+// Returns:
+//   - *kafka.Client: a client addressed at the first broker, with its transport closed on cleanup.
+func eventsReplayKafkaClient(t *testing.T, kafkaConfig config.KafkaConfig) *kafka.Client {
+	t.Helper()
+
+	mechanism, err := scram.Mechanism(scram.SHA512,
+		kafkaConfig.SASLAdminUser, kafkaConfig.SASLAdminSecret)
+	require.NoError(t, err,
+		"building the SCRAM-SHA-512 mechanism for the administrative principal")
+
+	transport := &kafka.Transport{SASL: mechanism}
+	if kafkaConfig.TLS.Enabled {
+		transport.TLS = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: kafkaConfig.TLS.ServerName,
+		}
+	}
+	t.Cleanup(transport.CloseIdleConnections)
+
+	return &kafka.Client{
+		Addr:      kafka.TCP(kafkaConfig.Brokers[0]),
+		Timeout:   eventsReplayBrokerTimeout,
+		Transport: transport,
+	}
+}
+
+// eventsReplayBrokerTimeout bounds every broker round trip this test makes. Generous enough for
+// a cold connection and a SASL handshake, short enough that an unreachable broker fails the test
+// rather than hanging it.
+const eventsReplayBrokerTimeout = 15 * time.Second
+
+// TestEventsAPI_ASuccessfulReplayAnswers200AndPutsTheEventBackOnItsTopic is the SUCCESS path of
+// POST /events/dead-letter/:event_id/replay, executed rather than described.
+//
+// # What was untested
+//
+// Every other test of this route asserts a refusal — no broker, not dead-lettered, not found,
+// unauthorised — and the success body was covered only by a test that MARSHALLED
+// model.ReplayEventResponse itself and inspected the JSON. That pins the DTO's tags and can pin
+// nothing about the handler: which outcome fields it copies into which response fields, that it
+// answers 200 rather than 201 or 204, that it reports the ORIGINAL topic rather than the
+// dead-letter topic it was listed from, and that the event id it returns is the one that was
+// replayed. Every one of those is a line of handler code that a self-marshalled DTO never
+// executes. A handler that returned the dlt topic, or an empty event id, or someone else's
+// timestamp would have passed the whole file.
+//
+// # Why it is broker-backed and what that costs
+//
+// A 200 cannot be forged from this package. The handler calls blnk.ReplayDeadLetteredEvent on
+// the concrete service, which resolves the real publisher and refuses with
+// EVENT_KAFKA_UNAVAILABLE when it is the no-op — so a success requires a real publish to a real
+// broker. It therefore SKIPS with a reason when none is configured, exactly as the credential
+// issuance test in the sibling file does, and its name puts it inside the ^TestEventsAPI_ family
+// the Kafka acceptance job runs with a fail-on-skip gate: absent locally, required in CI.
+//
+// The registry stays a MOCK, which is what makes the assertions exact. The claim returns a known
+// dead-lettered row, so the event id, the topic and the payload bytes on the wire are all
+// fixture values the response can be compared against — and the coordinate the broker assigned
+// is captured from the MarkEventDispatched argument, which is the same value the service read
+// out of the publish acknowledgement.
+//
+// # The record is read back at the coordinate the broker named
+//
+// Not scanned for. The acknowledged partition and offset are used to fetch exactly one record,
+// so a value that arrived at a different coordinate, or not at all, fails rather than being
+// missed by a search that gave up. Its key and its bytes are then compared with the stored row:
+// a replay must republish the ORIGINAL bytes, which is the property the byte-fidelity criterion
+// rests on and the reason PublishRequestFromOutbox reads EventRaw instead of re-marshalling.
+func TestEventsAPI_ASuccessfulReplayAnswers200AndPutsTheEventBackOnItsTopic(t *testing.T) {
+	kafkaConfig, reason, configured := subscribersKafkaEnvironment(t)
+	if !configured {
+		t.Skip(reason)
+	}
+
+	eventID := uuid.NewString()
+	row := eventsReplayableRow(eventID)
+
+	apiInstance, datasource := newEventsAPIOverMockDatasource(t, func(cfg *config.Configuration) {
+		cfg.Kafka = kafkaConfig
+		// Brokers without a sunset date are refused by configuration validation, because a
+		// publishing deployment with no usable dual-delivery window is treated as already
+		// retired. A future instant keeps the sunset guard transparent.
+		cfg.WebhookDeprecationSunsetDate = time.Now().Add(20 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	})
+	router := apiInstance.Router()
+
+	// RESOLVED THROUGH PRODUCTION, and only after the configuration is published: TopicForEvent
+	// reads the prefix from the store, and the topic the fixture names must be one Blnk OWNS
+	// under that prefix or the publisher refuses the request for a reason that has nothing to do
+	// with this test. Spelling it out here instead would hard-code a prefix the environment is
+	// free to change.
+	row.Topic = blnk.TopicForEvent(row.EventType)
+	row.DLTTopic = blnk.DLTFor(row.Topic)
+	require.NotEmpty(t, row.Topic, "the fixture's event type must route to a topic")
+
+	datasource.On("ClaimEventForReplay", mock.Anything, eventID, mock.Anything).Return(row, nil)
+
+	// The acknowledged coordinate is CAPTURED rather than matched, because it is what the
+	// broker chose and the test cannot know it in advance. It is also the only place the
+	// service's view of the publish is observable from this package.
+	var acknowledged coremodel.BrokerRecord
+	datasource.On("MarkEventDispatched", mock.Anything, row.ID, row.ClaimToken, mock.Anything).
+		Return(nil).
+		Run(func(args mock.Arguments) {
+			record, isRecord := args.Get(3).(coremodel.BrokerRecord)
+			require.True(t, isRecord, "the dispatch transition must be given a broker record")
+			acknowledged = record
+		})
+	// Not expected to be reached: a successful replay marks the row dispatched and releases
+	// nothing. Programmed so that a release would be RECORDED rather than panicking the mock,
+	// which is what lets the assertion below name it.
+	datasource.On("ReleaseEventReplay", mock.Anything, row.ID, row.ClaimToken, mock.Anything).
+		Return(nil).Maybe()
+
+	before := time.Now().UTC()
+	recorder := eventsKeyedRequest(t, router,
+		http.MethodPost, "/events/dead-letter/"+eventID+"/replay", eventsMockMasterKey)
+	after := time.Now().UTC()
+
+	// 1. THE EXACT STATUS. 200 and nothing else: a replay returns a body, so 204 would be
+	// wrong, and it creates no addressable resource, so 201 would be too.
+	require.Equalf(t, http.StatusOK, recorder.Code,
+		"a successful replay answers 200. body: %s", recorder.Body.String())
+
+	// 2. THE EXACT BODY, decoded into the declared DTO and then read again as raw keys, so a
+	// field renamed in the response but not in the model cannot pass.
+	var response model.ReplayEventResponse
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response),
+		"the success body must decode as the declared response: %s", recorder.Body.String())
+
+	assert.Equal(t, eventID, response.EventID,
+		"THE EVENT ID IS UNCHANGED BY A REPLAY. That is what lets a subscriber deduplicating on "+
+			"event_id absorb the copy, and a handler returning a fresh id would break exactly that")
+	assert.Equal(t, row.Topic, response.Topic,
+		"the ORIGINAL category topic the event went back to, never the dead-letter topic it was "+
+			"listed from")
+	assert.NotContains(t, response.Topic, blnk.DeadLetterTopicSuffix,
+		"a client told to reason about the .dlt topic would consume from the wrong place")
+	assert.Equal(t, string(coremodel.PublishStatusDispatched), response.Status,
+		"the broker acknowledged the record, so the reported status is dispatched rather than "+
+			"retrying or dead-lettered")
+
+	require.False(t, response.ReplayedAt.IsZero(),
+		"the acknowledgement instant must be reported: it is what an operator correlates the "+
+			"replay against")
+	assert.Falsef(t, response.ReplayedAt.Before(before.Add(-time.Second)) ||
+		response.ReplayedAt.After(after.Add(time.Second)),
+		"replayed_at must be the instant of THIS replay, not a stored one: got %s, request ran "+
+			"between %s and %s", response.ReplayedAt, before, after)
+
+	var rawBody map[string]interface{}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &rawBody))
+	assert.Equal(t, eventID, rawBody["event_id"], "the wire key is event_id")
+	assert.Equal(t, row.Topic, rawBody["topic"], "the wire key is topic")
+	assert.NotContains(t, recorder.Body.String(), "failure",
+		"failure metadata has no place on a success")
+
+	// 3. THE BOOKKEEPING RAN, and the coordinate it recorded is a real one.
+	datasource.AssertCalled(t, "MarkEventDispatched",
+		mock.Anything, row.ID, row.ClaimToken, mock.Anything)
+	datasource.AssertNotCalled(t, "ReleaseEventReplay",
+		mock.Anything, row.ID, row.ClaimToken, mock.Anything)
+
+	require.True(t, acknowledged.Confirmed(),
+		"the broker must have acknowledged the record with a coordinate; an unconfirmed record "+
+			"would leave the row claiming a publication it cannot name")
+	require.Equal(t, row.Topic, acknowledged.Topic,
+		"the acknowledged coordinate must name the original topic")
+	require.GreaterOrEqual(t, acknowledged.Offset, int64(0),
+		"a published record occupies a non-negative offset")
+
+	// 4. THE RECORD IS ON THE TOPIC, read at exactly the coordinate the broker named.
+	client := eventsReplayKafkaClient(t, kafkaConfig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), eventsReplayBrokerTimeout)
+	defer cancel()
+
+	fetched, err := client.Fetch(ctx, &kafka.FetchRequest{
+		Topic:     acknowledged.Topic,
+		Partition: acknowledged.Partition,
+		Offset:    acknowledged.Offset,
+		MinBytes:  1,
+		MaxBytes:  1 << 20,
+		MaxWait:   eventsReplayBrokerTimeout / 3,
+	})
+	require.NoError(t, err, "fetching %s/%d at offset %d",
+		acknowledged.Topic, acknowledged.Partition, acknowledged.Offset)
+	require.NoError(t, fetched.Error, "the broker refused the fetch")
+	require.NotNil(t, fetched.Records)
+
+	record, err := fetched.Records.ReadRecord()
+	require.NoErrorf(t, err,
+		"NO RECORD AT %s/%d OFFSET %d. The response reported a successful replay and the "+
+			"bookkeeping recorded that coordinate, so a record has to be there",
+		acknowledged.Topic, acknowledged.Partition, acknowledged.Offset)
+	require.Equal(t, acknowledged.Offset, record.Offset,
+		"the record read must be the one at the acknowledged offset")
+
+	key, err := kafka.ReadAll(record.Key)
+	require.NoError(t, err, "reading the replayed record's key")
+	assert.Equal(t, row.EffectiveKey(), string(key),
+		"the replay must be keyed as the original was, or it lands on a different partition and "+
+			"the aggregate's ordering is broken by the very act of repairing it")
+
+	value, err := kafka.ReadAll(record.Value)
+	require.NoError(t, err, "reading the replayed record's value")
+	assert.Equal(t, string(row.EventRaw), string(value),
+		"A REPLAY REPUBLISHES THE STORED BYTES. Re-marshalling from a struct would produce a "+
+			"value that differs from the original in field order or in a zero value, and the "+
+			"byte-fidelity criterion is what a subscriber's deduplication depends on")
+
+	datasource.AssertExpectations(t)
+}
+
 // TestReplayEventResponse_IsTheShapeASuccessfulReplayReturns pins the success DTO at the
 // type level.
 //
@@ -3245,6 +3664,24 @@ var eventsStatsCounts = map[string]int64{
 	coremodel.EventOutboxStatusFailed:         55,
 	coremodel.EventOutboxStatusDeadLettered:   66,
 	coremodel.EventOutboxStatusReplaying:      77,
+}
+
+// eventsStatsUnresolvedCounts is eventsStatsCounts with the DISPATCHED key removed, which is
+// what the unresolved aggregate actually returns.
+//
+// Modelled rather than glossed over: the real query has no dispatched arm, so a stub that
+// returned the dispatched count anyway would let a projection reporting a figure production never
+// produces pass every test (PERF-M05).
+func eventsStatsUnresolvedCounts() map[string]int64 {
+	unresolved := make(map[string]int64, len(eventsStatsCounts))
+	for status, count := range eventsStatsCounts {
+		if status == coremodel.EventOutboxStatusDispatched {
+			continue
+		}
+		unresolved[status] = count
+	}
+
+	return unresolved
 }
 
 // expectEventsStatsCensus programs the two producer-atomicity reads the statistics take.
@@ -3329,14 +3766,23 @@ func TestGetEventOutboxStats_ReportsThePerStatusCountsTheReconciliationIsBuiltOn
 		coremodel.OutboxStatusFailed:     6,
 	}, 7, &oldestBatch)
 
-	statistics, raw := eventsStatsResponse(t, router, "")
+	// best_effort, because this test is about the DISPATCHED count as well as the others, and
+	// counting the dispatched population is the deliberate reading now (PERF-M05). It is the
+	// posture rather than `true` so that the absent broker degrades to 200 with the counts
+	// instead of the 503 a required posture owes.
+	statistics, raw := eventsStatsResponse(t, router, "include_offsets=best_effort")
 
 	assert.Equal(t, int64(11), statistics.Pending)
 	assert.Equal(t, int64(22), statistics.Processing)
 	assert.Equal(t, int64(33), statistics.WebhookPending,
 		"the legacy leg's outstanding rows are reported separately; folding them into "+
 			"dispatched would hide the dual-delivery backlog")
-	assert.Equal(t, int64(44), statistics.Dispatched)
+	require.NotNil(t, statistics.Dispatched,
+		"a posture that reads the broker side must count the dispatched population, and must "+
+			"emit it rather than omitting the key")
+	assert.Equal(t, int64(44), *statistics.Dispatched)
+	assert.True(t, statistics.DispatchedHistoryCounted,
+		"and must say that it counted it, so an absent key elsewhere is unambiguous")
 	assert.Equal(t, int64(55), statistics.Failed,
 		"failed is the retry budget being spent, and the dead-letter write may still be owed")
 	assert.Equal(t, int64(66), statistics.DeadLettered,
@@ -3399,7 +3845,11 @@ func TestGetEventOutboxStats_MeasuresTheWindowTheCallerAsked(t *testing.T) {
 		"no window takes the daily default the runbook uses": {"", 24 * time.Hour, 86400},
 		"an incident-sized window is honoured":               {"window=15m", 15 * time.Minute, 900},
 		"a whole-second window is honoured":                  {"window=90s", 90 * time.Second, 90},
-		"the weekly ceiling is honoured":                     {"window=168h", 7 * 24 * time.Hour, 604800},
+		// The ceiling IS the default now, so the parameter may only narrow (PERF-M05). A
+		// week's exact dispatched count is 302.4 million index entries at the target rate,
+		// which is not servable inside any request timeout — permitting it bought an operator
+		// a timeout and the database the scan anyway.
+		"the daily ceiling is honoured": {"window=24h", 24 * time.Hour, 86400},
 	} {
 		t.Run(name, func(t *testing.T) {
 			router, ds := setupEventsRouter(t, nil)
@@ -3407,8 +3857,16 @@ func TestGetEventOutboxStats_MeasuresTheWindowTheCallerAsked(t *testing.T) {
 				Return(eventsStatsCounts, nil).Once()
 			expectEventsStatsCensus(ds, map[string]int64{}, 0, nil)
 
+			// best_effort, because the window bounds the DISPATCHED arm and nothing else, so a
+			// posture that does not count the dispatched history has no window to carry
+			// (PERF-M05). tt.query is appended to it so the cases keep naming only the window.
+			query := "include_offsets=best_effort"
+			if tt.query != "" {
+				query += "&" + tt.query
+			}
+
 			before := time.Now().UTC()
-			statistics, _ := eventsStatsResponse(t, router, tt.query)
+			statistics, _ := eventsStatsResponse(t, router, query)
 			after := time.Now().UTC()
 
 			var since []time.Time
@@ -3446,11 +3904,12 @@ func TestGetEventOutboxStats_MeasuresTheWindowTheCallerAsked(t *testing.T) {
 	}
 
 	for name, query := range map[string]string{
-		"a window that is not a duration": "window=lastweek",
-		"a zero window":                   "window=0s",
-		"a negative window":               "window=-1h",
-		"beyond the weekly ceiling":       "window=169h",
-		"a sub-second window":             "window=500ms",
+		"a window that is not a duration":      "window=lastweek",
+		"a zero window":                        "window=0s",
+		"a negative window":                    "window=-1h",
+		"beyond the daily ceiling":             "window=25h",
+		"a week, which used to be the ceiling": "window=168h",
+		"a sub-second window":                  "window=500ms",
 	} {
 		t.Run(name+" is refused before the count", func(t *testing.T) {
 			router, ds := setupEventsRouter(t, nil)
@@ -3476,8 +3935,8 @@ func TestGetEventOutboxStats_MeasuresTheWindowTheCallerAsked(t *testing.T) {
 func TestGetEventOutboxStats_OmitsTheProducerAtomicityCensusRatherThanReportingZeros(t *testing.T) {
 	t.Run("when the handoff census cannot be read", func(t *testing.T) {
 		router, ds := setupEventsRouter(t, nil)
-		ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
-			Return(eventsStatsCounts, nil).Once()
+		ds.On("CountUnresolvedEventOutbox", mock.Anything).
+			Return(eventsStatsUnresolvedCounts(), nil).Once()
 		ds.On("CountBalanceMonitorHandoffByStatus", mock.Anything).
 			Return(nil, errors.New("blnk: the handoff table could not be read")).Once()
 
@@ -3497,8 +3956,8 @@ func TestGetEventOutboxStats_OmitsTheProducerAtomicityCensusRatherThanReportingZ
 
 	t.Run("when the bulk-batch census cannot be read", func(t *testing.T) {
 		router, ds := setupEventsRouter(t, nil)
-		ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
-			Return(eventsStatsCounts, nil).Once()
+		ds.On("CountUnresolvedEventOutbox", mock.Anything).
+			Return(eventsStatsUnresolvedCounts(), nil).Once()
 		ds.On("CountBalanceMonitorHandoffByStatus", mock.Anything).
 			Return(map[string]int64{coremodel.OutboxStatusPending: 2}, nil).Once()
 		ds.On("CountUnfinalizedBulkTransactionBatches", mock.Anything, mock.Anything).
@@ -3527,7 +3986,10 @@ func TestGetEventOutboxStats_AnswersATypedErrorWhenTheOutboxCannotBeRead(t *test
 	driverText := `pq: permission denied for table event_outbox (SQLSTATE 42501) in aclchk.c:2843`
 
 	router, ds := setupEventsRouter(t, nil)
-	ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
+	// The DEFAULT posture's aggregate, because the property is that the endpoint refuses when
+	// the outbox side cannot be read, and the default reading is the one every routine caller
+	// takes (PERF-M05). Its failure is no more tolerable than the history reading's.
+	ds.On("CountUnresolvedEventOutbox", mock.Anything).
 		Return(nil, errors.New(driverText)).Once()
 
 	recorder := eventsKeyedRequest(t, router, http.MethodGet, "/events/stats", eventsMockMasterKey)
@@ -3546,13 +4008,20 @@ func TestGetEventOutboxStats_AnswersATypedErrorWhenTheOutboxCannotBeRead(t *test
 // TestGetEventOutboxStats_HonoursTheThreeOffsetPostures pins include_offsets.
 //
 // The three postures exist because "the broker could not be read" means different things
-// to different callers, and guessing which is wrong in both directions.
+// to different callers, and guessing which is wrong in both directions. The posture
+// additionally decides whether the DISPATCHED HISTORY is counted at all, because that figure
+// and the broker offsets are wanted by one caller and no other (PERF-M05/M02):
 //
-//	absent   best effort. The runbook's daily check uses this: it wants the verdict when
-//	         it can have it and the counts when it cannot.
-//	true     required. The caller asked for the half of the reconciliation that is
-//	         missing, so a failure is a 503 rather than a quietly halved answer.
-//	false    skipped. No broker round trip at all.
+//	absent       skipped. No broker round trip, no dispatched count. The cheap default,
+//	             and what every routine caller — a drain poll, a dashboard — should take.
+//	false        skipped, said explicitly. Identical to absent.
+//	best_effort  the dispatched history is counted and the broker is read when one is
+//	             configured; a failure omits the broker-side keys and still answers 200.
+//	             This is what a broker-less deployment wants and what the daily check uses
+//	             when a 503 would be unhelpful. It used to be reachable only by OMITTING
+//	             the parameter, which is why it now has a name.
+//	true         required. As best_effort, except a failure is a 503 rather than a quietly
+//	             halved answer, because the caller asked for the half that is missing.
 //
 // An unrecognised value is refused rather than read as false: a caller would otherwise
 // receive offsets_complete=false for a reason they cannot see and read a missing verdict as
@@ -3571,41 +4040,83 @@ func TestGetEventOutboxStats_HonoursTheThreeOffsetPostures(t *testing.T) {
 		ds.AssertExpectations(t)
 	})
 
-	t.Run("skipped offsets answer from PostgreSQL alone", func(t *testing.T) {
+	// The two skipped forms are asserted TOGETHER because the whole substance of PERF-M02 is
+	// that they behave identically: the cheap reading must be what a caller gets by saying
+	// nothing, not only what they get by saying "false".
+	for _, query := range []string{"", "include_offsets=false"} {
+		name := "an absent include_offsets"
+		if query != "" {
+			name = "an explicit include_offsets=false"
+		}
+
+		t.Run(name+" answers from PostgreSQL alone and counts no history", func(t *testing.T) {
+			router, ds := setupEventsRouter(t, nil)
+			// THE LIGHTWEIGHT AGGREGATE, and it is the expectation itself that proves it:
+			// CountEventOutboxByStatus is not programmed at all, so a handler that reached
+			// for the history reading would fail on an unexpected call rather than quietly
+			// costing 43.2 million index entries in production.
+			ds.On("CountUnresolvedEventOutbox", mock.Anything).
+				Return(eventsStatsUnresolvedCounts(), nil).Once()
+			expectEventsStatsCensus(ds, map[string]int64{}, 0, nil)
+
+			statistics, raw := eventsStatsResponse(t, router, query)
+
+			assert.Nil(t, statistics.Dispatched,
+				"the dispatched population was not counted, so the key must be ABSENT: a zero "+
+					"would tell a reconciliation that nothing was published")
+			assert.False(t, statistics.DispatchedHistoryCounted,
+				"and the flag must say so, so the omission is readable")
+			assert.NotContains(t, raw, "dispatched")
+
+			assert.Equal(t, int64(11), statistics.Pending,
+				"every unresolved count is still exact and complete: that is the reading this "+
+					"posture takes, not a reduced one")
+			assert.Equal(t, int64(66), statistics.DeadLettered)
+			assert.False(t, statistics.OffsetsComplete)
+			assert.NotContains(t, raw, "topic_end_offsets")
+			ds.AssertExpectations(t)
+		})
+	}
+
+	t.Run("best effort with no broker is a 200 with the counts and the history", func(t *testing.T) {
+		// The posture every broker-less deployment runs in permanently, and the one an
+		// operator uses when they want the dispatched figure without a 503 hanging on a
+		// broker they do not have.
 		router, ds := setupEventsRouter(t, nil)
 		ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
 			Return(eventsStatsCounts, nil).Once()
 		expectEventsStatsCensus(ds, map[string]int64{}, 0, nil)
 
-		statistics, raw := eventsStatsResponse(t, router, "include_offsets=false")
-
-		assert.Equal(t, int64(44), statistics.Dispatched)
-		assert.False(t, statistics.OffsetsComplete)
-		assert.NotContains(t, raw, "topic_end_offsets")
-		ds.AssertExpectations(t)
-	})
-
-	t.Run("best effort with no broker is a 200 with the counts", func(t *testing.T) {
-		// The posture the runbook's daily check runs in, and the posture every
-		// broker-less deployment runs in permanently.
-		router, ds := setupEventsRouter(t, nil)
-		ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
-			Return(eventsStatsCounts, nil).Once()
-		expectEventsStatsCensus(ds, map[string]int64{}, 0, nil)
-
-		statistics, _ := eventsStatsResponse(t, router, "")
+		statistics, _ := eventsStatsResponse(t, router, "include_offsets=best_effort")
 
 		assert.Equal(t, int64(66), statistics.DeadLettered,
 			"an unreachable broker must not cost the operator the outbox counts as well")
+		require.NotNil(t, statistics.Dispatched,
+			"best effort counts the history; only the BROKER half is best effort")
+		assert.Equal(t, int64(44), *statistics.Dispatched)
+		assert.True(t, statistics.DispatchedHistoryCounted)
+		ds.AssertExpectations(t)
+	})
+
+	t.Run("best-effort is accepted with a hyphen as well", func(t *testing.T) {
+		router, ds := setupEventsRouter(t, nil)
+		ds.On("CountEventOutboxByStatus", mock.Anything, mock.Anything).
+			Return(eventsStatsCounts, nil).Once()
+		expectEventsStatsCensus(ds, map[string]int64{}, 0, nil)
+
+		statistics, _ := eventsStatsResponse(t, router, "include_offsets=BEST-EFFORT")
+
+		assert.True(t, statistics.DispatchedHistoryCounted,
+			"the two spellings and the case must not be the difference between two postures")
 		ds.AssertExpectations(t)
 	})
 
 	// The accepted vocabulary here is narrower than include_count's on purpose: this
 	// parameter selects a POSTURE rather than a boolean, and "1" or "t" would have to be
-	// guessed into one of three. So only "true" and "false" are honoured — case and
-	// surrounding whitespace aside — and everything else is refused rather than read as a
-	// posture the caller did not name.
-	for _, value := range []string{"maybe", "1", "0", "yes", "t"} {
+	// guessed into one of three. So only "true", "false" and "best_effort" are honoured —
+	// case, hyphenation and surrounding whitespace aside — and everything else is refused
+	// rather than read as a posture the caller did not name.
+	for _, value := range []string{"maybe", "1", "0", "yes", "t", "best", "besteffort"} {
 		t.Run("include_offsets="+value+" is refused", func(t *testing.T) {
 			router, ds := setupEventsRouter(t, nil)
 

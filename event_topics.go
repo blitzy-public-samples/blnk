@@ -128,11 +128,52 @@ type eventTopicBacklogStore interface {
 //   - Topic creation, ACLs, or any other broker-side effect. This file returns strings.
 //
 // getEventFromStatus, which produces the seven transaction.* names this file routes, is
-// declared in webhooks.go for the whole dual-delivery window and must outlive that file:
-// it is the transaction event-string vocabulary, not part of the HTTP transport. The
-// ordered removal procedure — including where the two surviving symbols go — is recorded
-// once, in the sunset block at the foot of webhooks.go, and is operator work rather than
-// anything the runtime date performs.
+// declared BELOW rather than in webhooks.go. It was moved here ahead of that file's
+// deletion because it is the transaction event-string vocabulary, not part of the HTTP
+// transport, and it has to outlive the transport that once hosted it. The ordered removal
+// procedure for what is left of that file is recorded once, in the sunset block at its
+// foot, and is operator work rather than anything the runtime date performs.
+
+// getEventFromStatus maps a transaction status to a corresponding event string.
+//
+// This function is the transaction event-string vocabulary. Seven of the thirteen event
+// names Blnk emits originate here, and they are the names that route a Kafka message to a
+// topic just as they used to name a webhook — which is why it belongs in this file, beside
+// the topic resolution it feeds, rather than in the HTTP transport that once hosted it.
+//
+// It was declared in webhooks.go and has been relocated here ahead of that file's
+// deletion, which is STEP 1 of the sunset procedure at the foot of webhooks.go. Three
+// surviving non-test files call it — blnk.go, transaction_execution.go and
+// transaction_rejection.go — so deleting it with the transport would have removed the
+// vocabulary that decides which topic a transaction event is published to.
+//
+// THE TABLE ITSELF LIVES IN model.EventTypeForTransactionStatus, and this is a one-line
+// delegation to it. The table had to move there because the repository layer derives event
+// rows inside the atomic writers and needs the same mapping, and `model` cannot import the
+// root package — so leaving the table in the root would have meant two tables, in two
+// packages, mapping one status to an event name. Two tables that agree today is precisely
+// what drift looks like before it happens: one status resolving to two different event
+// names depending on which layer was looking would split one aggregate's events across two
+// topics with nothing failing to say so.
+//
+// DELIBERATELY PRESERVED DEFECT — do not "fix" this in passing. StatusCommit ("COMMIT",
+// declared in transaction_inflight.go) has no case in the table, so it falls through to
+// transaction.unknown. That is pre-existing behaviour, not a regression introduced by the
+// Kafka work, and it is kept exactly as-is on purpose: the dual-delivery comparison
+// asserts that the Kafka message and the legacy webhook carry identical bytes for the same
+// event, and adding a transaction.commit case would change one side of that comparison and
+// fail it for a reason that has nothing to do with the transport. The behaviour is
+// documented in docs/event-streaming.md so it can be corrected later as a deliberate,
+// separately reviewed change — with the subscriber-facing event-name change that implies.
+//
+// Parameters:
+// - status string: The status of the transaction.
+//
+// Returns:
+// - string: The corresponding event string for the transaction status.
+func getEventFromStatus(status string) string {
+	return model.EventTypeForTransactionStatus(status)
+}
 
 // DefaultTopicPrefix is the topic namespace used when KAFKA_TOPIC_PREFIX is not
 // configured. It yields the documented default topic names: blnk.transactions,

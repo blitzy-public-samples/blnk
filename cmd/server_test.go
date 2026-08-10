@@ -804,6 +804,62 @@ func TestServerCommand_StartsSubscriberSettlementBesideTheOtherEventWorkers(t *t
 			"among lines that read as depending on a feature flag")
 }
 
+// TestServerCommand_StartsTheMetricsCollectorOnlyFromTheMaintenancePath is the guard on the
+// single call that stands between thirteen alert rules and no series at all.
+//
+// The event pipeline's three gauges have exactly one production maintainer, the collector in
+// event_metrics.go. A gauge that is never recorded is absent from /metrics entirely, so every
+// rule in alerts/blnk-kafka-alerts.yml — including the two acceptance-criterion alerts,
+// dead-letter age above 900 seconds and consumer lag above 10,000 — would be unable to fire
+// whatever the system was doing, and nothing else in the suite would notice: the collector's
+// own tests would still pass, because they construct it directly.
+//
+// The second half of the contract is WHERE it is started. Two collectors write the same label
+// sets from two processes and each zeroes the other's series as stale, so the start must stay
+// behind the maintenance lease rather than running per replica. That is asserted structurally,
+// by position, because a call added to runServer would read perfectly well in review.
+func TestServerCommand_StartsTheMetricsCollectorOnlyFromTheMaintenancePath(t *testing.T) {
+	source, err := os.ReadFile("server.go")
+	require.NoError(t, err, "reading cmd/server.go")
+
+	body := string(source)
+
+	assert.Equal(t, 1, strings.Count(body, "blnk.NewBlnkEventMetricsCollector("),
+		"the collector must be constructed from exactly one place, so no second site can pair "+
+			"one instance's datasource with another's admin client")
+
+	starter := strings.Index(body, "func startEventMaintenance(")
+	require.Positive(t, starter, "the maintenance starter must exist")
+
+	starts := 0
+
+	for offset := 0; ; {
+		found := strings.Index(body[offset:], "startEventMetricsCollector(ctx, b.blnk, cfg)")
+		if found < 0 {
+			break
+		}
+
+		starts++
+
+		assert.Greater(t, offset+found, starter,
+			"every start must sit inside the maintenance path, not in runServer: a start per "+
+				"replica would have each replica zero the others' gauge series as stale")
+
+		offset += found + 1
+	}
+
+	// TWO, and both are required. One is the lease holder's, and one is the deliberate
+	// degradation when the lease cannot be evaluated at all — which fails towards a duplicated
+	// series an operator can see rather than towards no gauges and no alerts.
+	assert.Equal(t, 2, starts,
+		"the collector is started from the lease holder and from the ungated fallback, and losing "+
+			"either leaves a deployment with unmaintained gauges")
+
+	assert.Equal(t, starts, strings.Count(body, "stopMetrics()"),
+		"every start must be paired with a stop, or a lost lease leaves a collector ticking "+
+			"beside the replica that won it")
+}
+
 // TestStartSubscriberSettlement_WithoutBrokersStartsNothingAndIsStillStoppable covers the
 // Kafka-less steady state.
 //
@@ -1055,4 +1111,130 @@ func (c *countingContainerCloser) Close() error {
 	c.calls++
 
 	return c.err
+}
+
+// TestRequireKafkaBrokersConfigured_RefusesOnlyWhenTheApplicationItselfResolvesNoBroker is the
+// behavioural half of the --require-kafka guard.
+//
+// # Why the guard is a flag on the binary
+//
+// startEventRelay declines to start without brokers and says so once at info, which is correct —
+// a deployment that has not migrated runs exactly that way. The failure it leaves behind is that
+// a deployment which MEANT to run the relay cannot say so: the server serves, looks healthy, and
+// every captured event accumulates in blnk.event_outbox.
+//
+// The makefile used to answer that in shell, resolving the broker list itself, and it could not
+// agree with the loader: it took the first non-empty of KAFKA_BROKERS, BLNK_KAFKA_KAFKA_BROKERS and
+// BLNK_KAFKA_BROKERS in that order, where the loader's precedence puts BLNK_KAFKA_BROKERS first; it
+// read `"brokers": []` in the config file as configured; and a first-non-empty scan cannot express
+// that an explicitly EMPTY higher-precedence name clears what a lower one supplied. Each of those
+// made the target announce a relay the application would then decline to start.
+//
+// This test is what makes the replacement worth having: the predicate under test is the SAME one
+// startEventRelay gates on, read off the SAME configuration store, so the guard and the behaviour
+// it guards cannot disagree by construction.
+//
+// # The cases
+//
+// The broker lists below are the ones blnk.KafkaBrokersConfigured exists to separate. A caller
+// testing len(brokers) > 0 for itself would call {"   "} and {"", " "} configured — envconfig
+// splits KAFKA_BROKERS="," into a slice of blanks — and would then admit a server whose relay
+// could never connect to an address that is not an address.
+func TestRequireKafkaBrokersConfigured_RefusesOnlyWhenTheApplicationItselfResolvesNoBroker(t *testing.T) {
+	for name, tc := range map[string]struct {
+		brokers  []string
+		admitted bool
+	}{
+		"unset":               {brokers: nil, admitted: false},
+		"empty list":          {brokers: []string{}, admitted: false},
+		"one blank entry":     {brokers: []string{"   "}, admitted: false},
+		"comma noise":         {brokers: []string{"", " ", ""}, admitted: false},
+		"one broker":          {brokers: []string{"localhost:9092"}, admitted: true},
+		"several brokers":     {brokers: []string{"a:9092", "b:9092"}, admitted: true},
+		"padded but real":     {brokers: []string{"  localhost:9092  "}, admitted: true},
+		"one real, one blank": {brokers: []string{"", "localhost:9092"}, admitted: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := mockConfig(t)
+			cfg.Kafka.Brokers = tc.brokers
+			config.MockConfig(cfg)
+
+			err := requireKafkaBrokersConfigured()
+
+			if tc.admitted {
+				require.NoError(t, err,
+					"%v is a configured broker list, and refusing it would block a deployment "+
+						"that had done nothing wrong — the false negative this guard replaced",
+					tc.brokers)
+
+				return
+			}
+
+			require.Error(t, err,
+				"%v resolves to no usable broker, so the relay would not start and every captured "+
+					"event would stay pending in blnk.event_outbox while the server looked healthy",
+				tc.brokers)
+
+			// The refusal has to be actionable, and what makes it actionable is naming the
+			// sources AND their precedence. The environment key the field actually resolves from
+			// first is the one an operator is least likely to know.
+			for _, named := range []string{
+				"BLNK_KAFKA_BROKERS",
+				"KAFKA_BROKERS",
+				"BLNK_KAFKA_KAFKA_BROKERS",
+				"set and EMPTY",
+				"--require-kafka",
+			} {
+				assert.Containsf(t, err.Error(), named,
+					"the refusal must mention %q. All three environment names resolve this field "+
+						"and they do not rank equally — see config.eventStreamingEnvOverride — so "+
+						"a message that omits one, or states the order wrongly, sends an operator "+
+						"to a name that will be overridden by one they were not told about",
+					named)
+			}
+
+			// Precedence is part of the message, not a footnote: the prefixed name winning is the
+			// non-obvious half, and it is what makes `BLNK_KAFKA_BROKERS=` a way to turn Kafka off.
+			message := err.Error()
+			assert.Less(t, strings.Index(message, "BLNK_KAFKA_BROKERS"),
+				strings.Index(message, "BLNK_KAFKA_KAFKA_BROKERS"),
+				"the refusal must list the sources in precedence order, highest first")
+		})
+	}
+}
+
+// TestServerCommand_ExposesTheKafkaRequirementAsAFlagRatherThanShellResolution pins the guard's
+// LOCATION as well as its existence.
+//
+// The check must run before the listener binds and before any background processor starts, or a
+// server that is going to be refused has already begun serving and claiming rows. And it must be
+// reachable from the command line, because the makefile target is the caller: with no flag there
+// is nothing for `make run_relay` to delegate to and the shell resolution comes back.
+func TestServerCommand_ExposesTheKafkaRequirementAsAFlagRatherThanShellResolution(t *testing.T) {
+	source, err := os.ReadFile("server.go")
+	require.NoError(t, err, "reading cmd/server.go")
+
+	body := string(source)
+
+	assert.Contains(t, body, `cmd.Flags().BoolVar(&requireKafka, "require-kafka", false,`,
+		"the requirement must be a flag on `start`, so `make run_relay` can delegate to the "+
+			"application's own resolution instead of approximating it in shell")
+
+	guard := strings.Index(body, "if err := requireKafkaBrokersConfigured(); err != nil {")
+	require.Positive(t, guard, "RunE must consult the requirement before running the server")
+
+	run := strings.Index(body, "return runServer(ctx, b)")
+	require.Positive(t, run, "RunE must run the server")
+	assert.Less(t, guard, run,
+		"the requirement must be checked BEFORE runServer: after it, the listener is bound and "+
+			"the background processors have started, so a server about to be refused has already "+
+			"begun serving")
+
+	// One definition of "configured", shared with the relay's own gate.
+	requireIndex := strings.Index(body, "func requireKafkaBrokersConfigured()")
+	require.Positive(t, requireIndex, "the requirement check must exist")
+	assert.Contains(t, body[requireIndex:], "blnk.KafkaBrokersConfigured(cfg.Kafka.Brokers)",
+		"the check must use the same predicate on the same field startEventRelay gates on. A "+
+			"second opinion about what 'configured' means is how a guard comes to admit a server "+
+			"whose relay then declines to start")
 }

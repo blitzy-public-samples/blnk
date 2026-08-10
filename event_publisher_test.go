@@ -1918,7 +1918,9 @@ func (h *publisherRecordedHistogram) snapshot() []publisherMetricRecord {
 func publisherAttributeMap(set attribute.Set) map[string]string {
 	attributes := make(map[string]string, set.Len())
 	for _, keyValue := range set.ToSlice() {
-		attributes[string(keyValue.Key)] = keyValue.Value.Emit()
+		// Value.String rather than the deprecated Value.Emit; the two agree exactly for the
+		// string, int64 and bool attributes the publisher records.
+		attributes[string(keyValue.Key)] = keyValue.Value.String()
 	}
 
 	return attributes
@@ -2019,8 +2021,10 @@ func TestRecordPublishAttempt_RecordsTheEndToEndAgeOfAnAcknowledgedEvent(t *test
 			"here, since only acknowledged publishes are recorded")
 
 	assert.Len(t, captured.duration.snapshot(), 1,
-		"the per-attempt duration is still recorded as well: their difference is the queue wait, "+
-			"which is what distinguishes a slow broker from an under-provisioned relay")
+		"the per-attempt duration is still recorded as well: for THIS event the difference "+
+			"between the two is its own queue wait, which is what distinguishes a slow broker "+
+			"from an under-provisioned relay. Per event only — the same subtraction between two "+
+			"p99 figures is a diagnostic, not a queue-wait percentile")
 }
 
 // TestRecordPublishAttempt_RecordsNoEndToEndAgeForAnUnacknowledgedEvent covers the three cases

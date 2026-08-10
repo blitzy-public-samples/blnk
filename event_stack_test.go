@@ -43,10 +43,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/blnkfinance/blnk/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -413,9 +416,36 @@ func TestStackScript_PinsOneEffectiveBrokerValueOnEveryComposeInvocation(t *test
 		"and the pre-source value must be captured before sourcing .env can replace it")
 
 	// The host fallback pins it too, and did already — it is the precedent this generalises.
-	assert.Contains(t, stack, `KAFKA_BROKERS="${brokers}" \`,
+	//
+	// Asserted on the export rather than on a line continuation. This used to read
+	// `KAFKA_BROKERS="${brokers}" \`, which was the middle of an `env KEY=value ... script`
+	// invocation. That invocation was replaced by a subshell that exports instead, because
+	// `env KEY=value` puts the Kafka superuser password in argv and /proc/<pid>/cmdline is
+	// world-readable. The GUARANTEE this line exists to protect is unchanged — the effective
+	// broker list is still pinned explicitly — so the assertion follows it to its new spelling
+	// rather than being deleted.
+	assert.Contains(t, stack, `export KAFKA_BROKERS="${brokers}"`,
 		"provision_kafka must keep passing the effective list explicitly, so the broker the "+
 			"catalogue is created on is the broker the application publishes to")
+	assert.Contains(t, stack, `export KAFKA_COMPOSE_SERVICE="${service}"`,
+		"and the service the caller asked about must be pinned the same way, after the "+
+			"passthrough loop, so it wins over any .env entry of the same name")
+
+	// AND THE CREDENTIALS MUST NOT GO BACK INTO ARGV.
+	//
+	// provision_kafka forwards KAFKA_SASL_ADMIN_SECRET and KAFKA_PRODUCER_SECRET to the
+	// provisioning script. `env NAME=value cmd` places both in the command line of a real
+	// process, and on Linux /proc/<pid>/cmdline is mode 444 — readable by every account on the
+	// host for as long as provisioning runs. The `export` builtin is executed by the shell
+	// itself, so no command line is created and the values reach the child through its
+	// environment, /proc/<pid>/environ, which is mode 400.
+	assert.NotContains(t, stack, `env "${assignments[@]}"`,
+		"provisioning credentials must not be forwarded as `env NAME=value` arguments: argv is "+
+			"world-readable through /proc, so that publishes the broker superuser password to "+
+			"every local account. Export them in a subshell instead")
+	assert.Contains(t, stack, `export "${name}=${!name}"`,
+		"the passthrough must forward each declared variable with the export builtin, which "+
+			"creates no command line, rather than as an argument to env")
 }
 
 // TestStackScript_LeavesTheNonApplicableCasesUnfailed asserts the gate does not invent work.
@@ -733,28 +763,141 @@ func TestKafkaProvisionScript_MintsALeastPrivilegedProducer(t *testing.T) {
 	grant := script[strings.Index(script, "grant_producer_acls() {"):]
 	grant = grant[:strings.Index(grant, "\n}\n")]
 
-	assert.Contains(t, grant, "--operation Write",
-		"the producer must be granted Write: that is what publishing is")
-	assert.Contains(t, grant, "--operation Describe",
+	// The grant is expressed as a DESIRED SET of canonical descriptors rather than as a
+	// sequence of "kafka-acls --add" invocations, because the script reconciles the principal's
+	// bindings to it instead of only appending to whatever is already there. So the assertions
+	// below read the descriptors, which are where the operations and the pattern type now live.
+	assert.Contains(t, grant, `acl_descriptor TOPIC "$topic" LITERAL WRITE`,
+		"the producer must be granted Write on a LITERAL topic pattern: that is what publishing "+
+			"is, and a wildcard pattern would be indistinguishable from no privilege separation")
+	assert.Contains(t, grant, `acl_descriptor TOPIC "$topic" LITERAL DESCRIBE`,
 		"and Describe, so the writer can see a topic's partitions")
-	assert.Contains(t, grant, "--resource-pattern-type literal",
-		"every topic must be named with a LITERAL pattern; a wildcard grant is indistinguishable "+
-			"from no privilege separation at all")
+
+	// The owned shapes are what the reconciler is allowed to REMOVE, so they bound the damage a
+	// reconciliation can do as tightly as the desired set bounds the grant. Write and Describe
+	// on a literal topic, and nothing else: a producer principal carrying anything further is
+	// refused rather than silently narrowed, because the script did not create it.
+	assert.Contains(t, grant, `ACL_OWNED_SHAPES=(
+        "TOPIC|LITERAL|WRITE"
+        "TOPIC|LITERAL|DESCRIBE"
+    )`,
+		"the shapes the reconciler owns must be exactly the two it grants; a wider ownership "+
+			"claim would let provisioning delete a binding it did not create")
+
+	assert.Contains(t, grant, `reconcile_principal_acls "$principal" "producer"`,
+		"the grant must be RECONCILED, not appended to. kafka-acls --add is idempotent but it "+
+			"only ever widens, so an --add-only producer grant kept full Write on every topic of "+
+			"a previous KAFKA_TOPIC_PREFIX indefinitely")
 
 	for _, forbidden := range []string{
-		"--operation Read",
-		"--operation Create",
-		"--operation Alter",
-		"--operation ClusterAction",
-		"--operation IdempotentWrite",
+		"READ",
+		"CREATE",
+		"ALTER",
+		"CLUSTERACTION",
+		"IDEMPOTENTWRITE",
 		"--group",
 		"--cluster",
+		"GROUP|",
 	} {
 		assert.NotContainsf(t, grant, forbidden,
 			"the producer grant must not include %q. Blnk publishes and does not consume its own "+
 				"topics; topic assurance is the administrative client's work; and the Go client the "+
 				"relay publishes with does not implement the idempotent producer, so no cluster grant "+
 				"is needed either", forbidden)
+	}
+}
+
+// TestKafkaProvisionScript_ReconcilesACLsRatherThanOnlyAddingThem asserts the provisioning
+// script CONVERGES a principal's bindings on the configured set, in both directions.
+//
+// Every grant in the script used to be a bare "kafka-acls --add", justified as idempotent. It is
+// idempotent and it is not convergent: --add can only widen. Three ordinary configuration
+// changes therefore did not take effect, and each left the broker serving MORE than the
+// configuration described while the run reported success and the summary printed the smaller set:
+//
+//   - removing a category from KAFKA_SAMPLE_SUBSCRIBER_TOPICS,
+//   - changing KAFKA_TOPIC_PREFIX, which left both principals fully granted on the whole
+//     previous namespace,
+//   - renaming the sample subscriber or its consumer group, which left a reserved group
+//     namespace nothing owned.
+//
+// The reconciler's shape is asserted here rather than only its existence, because two of its
+// properties are what make it safe to let a provisioning script DELETE an ACL at all.
+func TestKafkaProvisionScript_ReconcilesACLsRatherThanOnlyAddingThem(t *testing.T) {
+	script := readRepoFile(t, filepath.Join("scripts", "kafka-provision.sh"))
+
+	require.Contains(t, script, "reconcile_principal_acls() {",
+		"the script must have a reconciler; an --add-only provisioner cannot narrow a grant")
+
+	reconciler := script[strings.Index(script, "reconcile_principal_acls() {"):]
+	reconciler = reconciler[:strings.Index(reconciler, "\n}\n")]
+
+	// DELETE BEFORE CREATE. Every partial failure must leave the principal narrower than the
+	// configuration, never broader — the same order, for the same reason, as
+	// reconcileSubscriberACLs in event_admin.go.
+	removeAt := strings.Index(reconciler, "apply_acl_binding --remove")
+	addAt := strings.Index(reconciler, "apply_acl_binding --add")
+	require.NotEqual(t, -1, removeAt, "the reconciler must remove surplus bindings")
+	require.NotEqual(t, -1, addAt, "and create missing ones")
+	assert.Less(t, removeAt, addAt,
+		"removal must come BEFORE creation, so a reconciliation that dies between the two has "+
+			"taken access away it was about to re-grant rather than left access nothing describes")
+
+	// FAIL CLOSED ON A FOREIGN GRANT. A binding the script does not own and that can GRANT
+	// makes the effective access broader than the configuration by an amount the script cannot
+	// bound, so it refuses rather than reporting a grant it cannot state.
+	assert.Contains(t, reconciler, "foreign_allow",
+		"a foreign ALLOW binding must be recognised rather than silently tolerated")
+	foreignRefusal := strings.Index(reconciler, "${#foreign_allow[@]} > 0")
+	require.NotEqual(t, -1, foreignRefusal, "and refused")
+	assert.Less(t, foreignRefusal, removeAt,
+		"the refusal must come before anything is written, so a principal whose effective grant "+
+			"cannot be stated is left exactly as it was found")
+
+	// A DENY IS NEVER REMOVED. It can only narrow the effective grant, so deleting one would
+	// WIDEN access as a side effect of provisioning.
+	assert.Contains(t, reconciler, "foreign_deny",
+		"a foreign DENY must be reported and left in place: removing it would widen access")
+
+	// --force, or a removal run non-interactively abandons itself at the confirmation prompt
+	// and the stale binding survives while the run reports success.
+	applier := script[strings.Index(script, "apply_acl_binding() {"):]
+	applier = applier[:strings.Index(applier, "\n}\n")]
+	assert.Contains(t, applier, "--force",
+		"kafka-acls --remove prompts for confirmation; without --force the compose one-shot "+
+			"reads EOF and abandons the removal")
+
+	// VERIFIED, not assumed. The success claim has to be a statement about the broker, and the
+	// two divergences are not symmetric: a revoked binding that is still there means the grant
+	// is still too BROAD and is fatal, while a granted binding that is still missing means it is
+	// too NARROW, which fails safe and announces itself at the client's next connect.
+	assert.Contains(t, reconciler, "still_present",
+		"the end state must be re-read and compared, so 'reconciled' means the broker holds "+
+			"exactly the desired set and not merely that every command exited zero")
+	assert.Contains(t, reconciler, "still_missing",
+		"in both directions")
+
+	fatalOnBroad := strings.Index(reconciler, "${#still_present[@]} > 0")
+	warnOnNarrow := strings.Index(reconciler, "${#still_missing[@]} > 0")
+	require.NotEqual(t, -1, fatalOnBroad, "a surviving revoked binding must be detected")
+	require.NotEqual(t, -1, warnOnNarrow, "and so must a missing granted one")
+	assert.Contains(t, reconciler[fatalOnBroad:warnOnNarrow], "die ",
+		"a grant that is still too broad must be FATAL: the run must not report a narrowing it "+
+			"cannot see")
+	assert.Contains(t, reconciler[warnOnNarrow:], "warn ",
+		"a grant that is still too narrow must be reported rather than fatal; it fails safe, and "+
+			"aborting would leave a half-provisioned deployment over the less dangerous divergence")
+
+	// Both principals must go through it. A reconciled producer beside an --add-only subscriber
+	// is the same defect confined to one identity.
+	for _, function := range []string{"grant_producer_acls", "grant_subscriber_acls"} {
+		body := script[strings.Index(script, function+"() {"):]
+		body = body[:strings.Index(body, "\n}\n")]
+		assert.Containsf(t, body, "reconcile_principal_acls",
+			"%s must reconcile rather than append", function)
+		assert.NotContainsf(t, body, "kafka_acls --add",
+			"%s must not add bindings directly; that is the --add-only path this replaced",
+			function)
 	}
 }
 
@@ -1352,4 +1495,1284 @@ func TestKafkaStatefulSet_RefusesToFormatWithoutAValidClusterID(t *testing.T) {
 			assertValidKafkaClusterID(t, file+" KAFKA_CLUSTER_ID default", remainder[:closing])
 		}
 	})
+}
+
+// measuredEventOutboxRowBytes is the storage cost of one blnk.event_outbox row, MEASURED.
+//
+// 2,372 bytes: heap 2,048 including page overhead, plus 323 across all seventeen indexes, with
+// no TOAST because the tuple is 1,888 bytes and the threshold is 2 KiB. Taken on PostgreSQL 16
+// over 500,000 rows in a table created with `CREATE TABLE ... (LIKE blnk.event_outbox INCLUDING
+// ALL)`, shaped like a real transaction.applied event read out of a running deployment. Roughly
+// 88% of it is the event body, held three times over — the queryable JSONB projection, the
+// byte-exact webhook body and the byte-exact envelope, each with its reason stated at the column
+// in sql/1781248800.sql.
+//
+// It is a CONSTANT here rather than a comment because the assertions below are arithmetic on it,
+// and the whole substance of PERF-C03 is that a retention period and a volume size were chosen
+// without this number between them.
+const measuredEventOutboxRowBytes = 2372
+
+// eventRetentionBloatFactor is the multiplier for dead tuples and autovacuum headroom.
+//
+// Every row is UPDATEd at least twice on its way to a terminal state — claimed, then dispatched —
+// and `status` is indexed, so neither update can be HOT: each leaves a dead tuple and rewrites
+// index entries. 1.5 is a planning allowance, not padding.
+const eventRetentionBloatFactor = 1.5
+
+// validatedEventsPerSecond is the throughput acceptance criterion V-1 states the pipeline is
+// validated at, and therefore the rate every capacity number in the manifests must hold at.
+const validatedEventsPerSecond = 500
+
+// TestManifests_RetentionStorageAndBrokerRetentionAgree is the PERF-C03 guard, and it exists
+// because nothing was checking three numbers that have to be chosen together.
+//
+// # What went wrong, and why no single file was obviously incorrect
+//
+// blnk-config.yaml shipped ninety days of event-outbox retention, reasoned entirely from data
+// protection and perfectly defensible on that basis alone. postgres-statefulset.yaml shipped a
+// 10Gi volume, which is an unremarkable size for a reference manifest. kafka-statefulset.yaml
+// documented, at its own log.retention.hours, that broker retention must stay LONGER than the
+// outbox's — and asserted that nothing was in tension because retention "ships disabled".
+//
+// Every one of those three statements read correctly on its own. Together they were: ninety days
+// at the validated rate is 8.4 TiB against a 10Gi volume, 858x apart and on the volume the
+// LEDGER lives on; and ninety days is nearly thirteen times the broker's seven, so the coupling
+// the third file documented was violated by the first.
+//
+// # Why the assertions are arithmetic rather than fixed numbers
+//
+// Pinning "3" and "600Gi" would fail the moment someone legitimately changed either, and would
+// teach them nothing about what else had to move. These assert the RELATIONSHIPS, so a future
+// change to any one number is accepted exactly when the others were changed with it — and the
+// failure message says which one is short and by how much.
+func TestManifests_RetentionStorageAndBrokerRetentionAgree(t *testing.T) {
+	retentionDays := manifestRetentionDays(t)
+	if retentionDays == 0 {
+		t.Skip("retention is disabled in the manifests, so nothing is coupled to it")
+	}
+	require.Positivef(t, retentionDays,
+		"RELAY_EVENT_RETENTION_DAYS must be zero or positive; a negative period is meaningless")
+
+	t.Run("outbox retention stays inside the broker's own retention", func(t *testing.T) {
+		brokerHours := manifestBrokerRetentionHours(t)
+		require.Positive(t, brokerHours,
+			"kafka-statefulset.yaml must declare log.retention.hours for this coupling to hold")
+
+		assert.LessOrEqualf(t, retentionDays, brokerHours/24,
+			"RELAY_EVENT_RETENTION_DAYS is %d but the broker retains only %d hours (%d days). The "+
+				"daily outbox-versus-offset reconciliation compares outbox rows against broker "+
+				"records and can only do that over a window BOTH sides still hold, so outbox rows "+
+				"outliving their records leaves rows with nothing to reconcile against. Raise "+
+				"log.retention.hours in the same change or lower the retention period",
+			retentionDays, brokerHours, brokerHours/24)
+	})
+
+	t.Run("the PostgreSQL volume holds the outbox that retention implies", func(t *testing.T) {
+		volumeBytes := manifestPostgresVolumeBytes(t)
+		require.Positive(t, volumeBytes,
+			"postgres-statefulset.yaml must declare a pg-data volumeClaimTemplate size")
+
+		perDay := float64(validatedEventsPerSecond) * 86400 * measuredEventOutboxRowBytes
+		steadyState := perDay * float64(retentionDays) * eventRetentionBloatFactor
+
+		assert.Greaterf(t, float64(volumeBytes), steadyState,
+			"the pg-data volume is %.1f GiB but %d days of outbox at the validated %d events/second "+
+				"is %.1f GiB of steady state (%.1f GiB/day x %d days x %.1f bloat headroom, from the "+
+				"measured %d bytes/row). The outbox shares this volume with the LEDGER, so an "+
+				"over-generous retention period does not buy more history — it exhausts the volume "+
+				"the ledger writes to",
+			float64(volumeBytes)/(1<<30), retentionDays, validatedEventsPerSecond,
+			steadyState/(1<<30), perDay/(1<<30), retentionDays, eventRetentionBloatFactor,
+			measuredEventOutboxRowBytes)
+
+		// AND WITH ROOM FOR EVERYTHING ELSE ON IT. The ledger's own tables are never purged, so
+		// their growth is unbounded and no assertion can size them — but a volume that fits the
+		// outbox and nothing else is a volume that fills, so a margin is required rather than
+		// merely advisable. A fifth is the smallest share that is honestly an allowance.
+		assert.Greaterf(t, float64(volumeBytes)*0.8, steadyState,
+			"the outbox's %.1f GiB steady state must leave at least a fifth of the %.1f GiB volume "+
+				"for the ledger's own tables, WAL up to max_wal_size, and the filesystem reserve",
+			steadyState/(1<<30), float64(volumeBytes)/(1<<30))
+	})
+
+	t.Run("purge capacity clears the arrival rate twice over", func(t *testing.T) {
+		data := manifestConfigMapData(t)
+		batchSize := manifestIntSetting(t, data, "RELAY_EVENT_RETENTION_BATCH_SIZE")
+		maxBatches := manifestIntSetting(t, data, "RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP")
+		require.Positive(t, batchSize, "the batch size must be positive for capacity to be finite")
+		require.Positive(t, maxBatches,
+			"the batch ceiling must be positive here; 0 means UNSET and -1 means unbounded, and a "+
+				"manifest that ships a deliberate capacity must state it")
+
+		// The sweep runs hourly, so one sweep's capacity IS the hourly capacity.
+		capacityPerHour := batchSize * maxBatches
+		arrivalsPerHour := validatedEventsPerSecond * 3600
+
+		assert.GreaterOrEqualf(t, capacityPerHour, 2*arrivalsPerHour,
+			"purge capacity is %d rows/hour against %d arriving at the validated %d events/second. "+
+				"Capacity BELOW arrival does not slow the table's growth, it permits it — the "+
+				"sweeper never catches up and the retention period is not enforced however short it "+
+				"is set. And merely exceeding arrival is not enough: a sweeper that cannot catch up "+
+				"needs recovery capacity, because one sweep cut short by the ten-minute timeout "+
+				"leaves a deficit measured in rows the period says should already be gone",
+			capacityPerHour, arrivalsPerHour, validatedEventsPerSecond)
+	})
+}
+
+// TestManifests_KafkaDataClaimsMatchTheStatefulSetTemplate pins the broker's storage claims
+// to the workload that adopts them (AAP-M03).
+//
+// # The failure this catches, and why nothing else catches it
+//
+// kafka-data-persistentvolumeclaim.yaml pre-provisions the three claims the StatefulSet
+// would otherwise create for itself. Adoption is by NAME and nothing else: Kubernetes
+// looks for `<template>-<set>-<ordinal>`, and if it finds a claim there it uses it AS IT
+// FINDS IT. It does not reconcile the claim against the template.
+//
+// That makes every property below a silent-divergence hazard rather than a validation
+// error. A claim requesting less than the template is adopted at the smaller size, and the
+// broker starts, and runs, and fills a disk that the retention arithmetic said had room. A
+// renamed set or template orphans all three: new claims appear under the new names and
+// these sit unbound, which is exactly the idle-volume defect that had this file deleted
+// once already. A missing ordinal after a replica increase leaves one broker provisioned
+// from the template and its siblings from this file, differing in whatever the two
+// disagree on. `kubectl apply` reports success in all four cases.
+//
+// So the assertions DERIVE what they expect from the StatefulSet rather than restating it.
+// Nothing here is a literal that a geometry change would have to remember to update — the
+// count comes from `replicas`, the names from the template name and the set name, the size
+// and access mode from the template itself. Change the workload and this test follows it;
+// change one side only and it fails.
+func TestManifests_KafkaDataClaimsMatchTheStatefulSetTemplate(t *testing.T) {
+	statefulSet := kafkaStatefulSet(t)
+
+	metadata, ok := statefulSet["metadata"].(map[string]interface{})
+	require.True(t, ok, "kafka-statefulset.yaml must declare metadata")
+	setName := toStringValue(metadata["name"])
+	require.NotEmpty(t, setName, "the StatefulSet must be named for its claim names to be derivable")
+
+	spec, ok := statefulSet["spec"].(map[string]interface{})
+	require.True(t, ok, "kafka-statefulset.yaml must declare a spec")
+
+	replicas, ok := spec["replicas"].(int)
+	require.Truef(t, ok, "kafka-statefulset.yaml must declare an integer replica count")
+	require.Positive(t, replicas, "a broker set with no replicas has no storage to claim")
+
+	templates, ok := spec["volumeClaimTemplates"].([]interface{})
+	require.Truef(t, ok && len(templates) == 1,
+		"the broker must declare exactly one volumeClaimTemplate; a second one changes the claim "+
+			"names this test derives and every claim in the PVC manifest would be orphaned")
+
+	template, ok := templates[0].(map[string]interface{})
+	require.True(t, ok, "the volumeClaimTemplate must be a mapping")
+	templateMeta, ok := template["metadata"].(map[string]interface{})
+	require.True(t, ok, "the volumeClaimTemplate must declare metadata")
+	templateName := toStringValue(templateMeta["name"])
+	require.NotEmpty(t, templateName, "the volumeClaimTemplate must be named")
+
+	templateSpec, ok := template["spec"].(map[string]interface{})
+	require.True(t, ok, "the volumeClaimTemplate must declare a spec")
+	templateResources, _ := templateSpec["resources"].(map[string]interface{})
+	templateRequests, _ := templateResources["requests"].(map[string]interface{})
+	templateBytes := parseKubernetesQuantityBytes(t, toStringValue(templateRequests["storage"]))
+
+	templateModes := stringListValue(templateSpec["accessModes"])
+	require.NotEmpty(t, templateModes, "the volumeClaimTemplate must declare an access mode")
+
+	claims := readYAMLDocuments(t, filepath.Join(
+		moduleRootDir(t), "infrastructure", "k8s-manifests", "kafka-data-persistentvolumeclaim.yaml",
+	))
+
+	byName := make(map[string]map[string]interface{}, len(claims))
+	for _, claim := range claims {
+		assert.Equalf(t, "PersistentVolumeClaim", toStringValue(claim["kind"]),
+			"kafka-data-persistentvolumeclaim.yaml must hold only claims")
+
+		claimMeta, isMap := claim["metadata"].(map[string]interface{})
+		require.True(t, isMap, "every claim must declare metadata")
+		byName[toStringValue(claimMeta["name"])] = claim
+	}
+
+	t.Run("one claim per broker, named as the StatefulSet will look for it", func(t *testing.T) {
+		expected := make([]string, 0, replicas)
+		for ordinal := 0; ordinal < replicas; ordinal++ {
+			expected = append(expected, fmt.Sprintf("%s-%s-%d", templateName, setName, ordinal))
+		}
+
+		actual := make([]string, 0, len(byName))
+		for name := range byName {
+			actual = append(actual, name)
+		}
+		sort.Strings(actual)
+		sort.Strings(expected)
+
+		assert.Equalf(t, expected, actual,
+			"the claims in kafka-data-persistentvolumeclaim.yaml must be exactly %v, because that "+
+				"is the <template>-<set>-<ordinal> form the StatefulSet resolves. A claim under any "+
+				"other name is never mounted — it provisions a volume nothing uses, which is the "+
+				"defect that had this manifest deleted rather than fixed. A MISSING ordinal is the "+
+				"mirror image: that broker's claim comes from the template while its siblings come "+
+				"from this file, so the two can differ in size or class with nothing reporting it",
+			expected)
+	})
+
+	t.Run("no bare singleton claim, which cannot serve three brokers", func(t *testing.T) {
+		_, present := byName[templateName]
+		assert.Falsef(t, present,
+			"a claim named exactly %q must NOT exist. It is the shape this file held before it was "+
+				"deleted: one ReadWriteOnce claim is one volume mountable by one node, so three "+
+				"brokers either fail to schedule apart or write concurrently into one KRaft "+
+				"metadata log — and corrupting the metadata log is not an error the broker reports, "+
+				"it is a cluster that will not elect a controller after the next restart",
+			templateName)
+	})
+
+	t.Run("every claim requests what the template requests", func(t *testing.T) {
+		for name, claim := range byName {
+			claimSpec, isMap := claim["spec"].(map[string]interface{})
+			require.Truef(t, isMap, "%s must declare a spec", name)
+
+			resources, _ := claimSpec["resources"].(map[string]interface{})
+			requests, _ := resources["requests"].(map[string]interface{})
+			claimBytes := parseKubernetesQuantityBytes(t, toStringValue(requests["storage"]))
+
+			assert.Equalf(t, templateBytes, claimBytes,
+				"%s requests %d bytes against the volumeClaimTemplate's %d. Kubernetes ADOPTS a "+
+					"pre-existing claim rather than reconciling it, so the smaller number wins "+
+					"silently and the broker runs with less disk than log.retention.bytes was sized "+
+					"against — which surfaces as a broker wedged on a full volume, not as a "+
+					"manifest error",
+				name, claimBytes, templateBytes)
+
+			assert.Equalf(t, templateModes, stringListValue(claimSpec["accessModes"]),
+				"%s declares access modes the template does not. The scheduler places the pod using "+
+					"the CLAIM's modes, so a mismatch here is a pod that cannot be placed where the "+
+					"workload assumed it could", name)
+
+			assert.Equalf(t, toStringValue(templateSpec["storageClassName"]),
+				toStringValue(claimSpec["storageClassName"]),
+				"%s and the volumeClaimTemplate must name the same storage class (both omit it "+
+					"today, taking the cluster default). Naming it on one side only means the "+
+					"adopted volume is backed by storage the workload never asked for — different "+
+					"IOPS, different durability, possibly a class that cannot expand", name)
+
+			claimMeta, _ := claim["metadata"].(map[string]interface{})
+			assert.Equalf(t, "blnk", toStringValue(claimMeta["namespace"]),
+				"%s must live in the blnk namespace alongside the StatefulSet. A claim in another "+
+					"namespace is invisible to the set, so the set creates its own and this one "+
+					"provisions a volume nothing mounts", name)
+		}
+	})
+}
+
+// TestManifests_KafkaVolumeHoldsTheTopicGeometryItIsSizedFor pins the broker volume to the
+// partition count the application actually creates (DOC-m02).
+//
+// # Why the arithmetic is asserted and the prose is asserted with it
+//
+// The volume size, `log.retention.bytes`, the topic count and the partition count are one
+// derivation split across three files: the category list lives in Go, KAFKA_MIN_PARTITIONS
+// in the ConfigMap, and the retention bytes and volume size in the StatefulSet. Nothing
+// links them, so the manifests once documented a cluster of 10 topics and 60 partitions on
+// a 200Gi volume while shipping 8 topics and 48 on 160Gi. The VALUE was right and the
+// justification was wrong, which is the durable kind of wrong: an operator sizing the next
+// change reads the prose, and every number in it was off.
+//
+// The first subtest derives the geometry from the code and asserts the volume holds it. The
+// second asserts the manifests' own prose states the derived numbers — unusual for a test,
+// and correct here, because a stale explanation beside a correct value is precisely the
+// defect and there is no other mechanism that would ever notice it.
+func TestManifests_KafkaVolumeHoldsTheTopicGeometryItIsSizedFor(t *testing.T) {
+	categories := model.AllEventCategories()
+	require.NotEmpty(t, categories, "the event catalogue must resolve at least one category")
+
+	// Each category ships a main topic and a .dlt sibling — EnsureTopics creates both, and
+	// both consume partitions on every broker.
+	topics := 2 * len(categories)
+
+	data := manifestConfigMapData(t)
+	partitionsPerTopic := manifestIntSetting(t, data, "KAFKA_MIN_PARTITIONS")
+	replicationFactor := manifestIntSetting(t, data, "KAFKA_REPLICATION_FACTOR")
+	require.Positive(t, partitionsPerTopic, "KAFKA_MIN_PARTITIONS must be positive")
+	require.Positive(t, replicationFactor, "KAFKA_REPLICATION_FACTOR must be positive")
+
+	statefulSet := kafkaStatefulSet(t)
+	spec, ok := statefulSet["spec"].(map[string]interface{})
+	require.True(t, ok, "kafka-statefulset.yaml must declare a spec")
+	brokers, ok := spec["replicas"].(int)
+	require.Truef(t, ok && brokers > 0, "the broker set must declare a positive replica count")
+
+	require.LessOrEqualf(t, replicationFactor, brokers,
+		"KAFKA_REPLICATION_FACTOR is %d against %d brokers. Topic creation FAILS outright when the "+
+			"factor exceeds the broker count, so the relay comes up against a cluster with no topics",
+		replicationFactor, brokers)
+
+	// Every partition is stored `replicationFactor` times across `brokers` brokers, so each
+	// broker holds this share of the total. With RF == brokers that is every partition.
+	partitionsPerBroker := topics * partitionsPerTopic * replicationFactor / brokers
+
+	retentionBytes := kafkaBrokerRetentionBytes(t)
+	volumeBytes := kafkaDataVolumeBytes(t)
+
+	t.Run("retention across every partition fits the volume with headroom", func(t *testing.T) {
+		logBytes := int64(partitionsPerBroker) * retentionBytes
+
+		assert.Lessf(t, logBytes, volumeBytes,
+			"%d partitions per broker x %d bytes of log.retention.bytes = %d bytes of log data "+
+				"against a %d byte volume. log.retention.bytes is PER PARTITION, which is the "+
+				"subtlety: a broker enforces it partition by partition and never consults the "+
+				"volume, so it fills the disk and wedges rather than trimming further",
+			partitionsPerBroker, retentionBytes, logBytes, volumeBytes)
+
+		// Segments, indexes, the metadata log and in-flight compaction all live on the same
+		// volume, and a broker that reaches 100% does not degrade, it stops.
+		utilisation := float64(logBytes) / float64(volumeBytes)
+		assert.LessOrEqualf(t, utilisation, 0.75,
+			"retained log data would occupy %.0f%% of the broker volume. Beyond about three "+
+				"quarters there is no room for the segment churn, offset indexes and metadata log "+
+				"that share the disk, and a full disk takes the broker down rather than degrading it",
+			utilisation*100)
+		assert.GreaterOrEqualf(t, utilisation, 0.25,
+			"retained log data would occupy only %.0f%% of the broker volume, so most of it is "+
+				"provisioned and paid for and unusable. Either log.retention.bytes is smaller than "+
+				"intended or the volume was sized for a geometry that has since shrunk",
+			utilisation*100)
+	})
+
+	t.Run("the manifests explain the geometry they actually ship", func(t *testing.T) {
+		gibibyte := int64(1) << 30
+		require.Zerof(t, volumeBytes%gibibyte,
+			"this assertion reads the volume size back as whole GiB; %d bytes is not a whole "+
+				"number of them", volumeBytes)
+
+		partitionPhrase := fmt.Sprintf("%d partitions", partitionsPerBroker)
+		volumePhrase := fmt.Sprintf("%dGi", volumeBytes/gibibyte)
+		topicPhrase := fmt.Sprintf("%d topics", topics)
+
+		for _, manifest := range []string{
+			filepath.Join("infrastructure", "k8s-manifests", "kafka-statefulset.yaml"),
+			filepath.Join("infrastructure", "k8s-manifests", "prometheus-configmap.yaml"),
+		} {
+			contents := readRepoFile(t, manifest)
+
+			assert.Containsf(t, contents, partitionPhrase,
+				"%s must state the real per-broker partition count (%s). It once documented 60 "+
+					"against the 48 it shipped, and an operator sizing the next volume from that "+
+					"prose would provision for a cluster that does not exist",
+				manifest, partitionPhrase)
+			assert.Containsf(t, contents, volumePhrase,
+				"%s must state the real volume size (%s); it once said 200Gi against the 160Gi it "+
+					"shipped", manifest, volumePhrase)
+		}
+
+		assert.Containsf(t, readRepoFile(t,
+			filepath.Join("infrastructure", "k8s-manifests", "kafka-statefulset.yaml")),
+			topicPhrase,
+			"kafka-statefulset.yaml must state the real topic count (%s). It is derived from the "+
+				"event categories in model/event.go, so adding a category changes it — and the "+
+				"partition count and the volume with it", topicPhrase)
+	})
+}
+
+// kafkaBrokerRetentionBytes extracts log.retention.bytes from the broker's rendered
+// server.properties in kafka-statefulset.yaml.
+//
+// The setting lives inside a shell heredoc rather than in a structured field, so it is read
+// as text — the same approach manifestBrokerRetentionHours takes for log.retention.hours.
+func kafkaBrokerRetentionBytes(t *testing.T) int64 {
+	t.Helper()
+
+	contents := readRepoFile(t, filepath.Join(
+		"infrastructure", "k8s-manifests", "kafka-statefulset.yaml",
+	))
+
+	matches := regexp.MustCompile(`(?m)^\s*log\.retention\.bytes=(-?\d+)\s*$`).
+		FindStringSubmatch(contents)
+	require.Lenf(t, matches, 2,
+		"kafka-statefulset.yaml must declare log.retention.bytes exactly once in the rendered "+
+			"server.properties; the volume can only be sized against a stated per-partition cap")
+
+	value, err := strconv.ParseInt(matches[1], 10, 64)
+	require.NoError(t, err, "log.retention.bytes must be an integer")
+	require.Positivef(t, value,
+		"log.retention.bytes is %d. Kafka reads -1 as UNLIMITED, which means the broker never "+
+			"trims by size and the volume arithmetic below is vacuous — the disk fills instead",
+		value)
+
+	return value
+}
+
+// kafkaDataVolumeBytes returns the per-broker volume size from the StatefulSet's
+// volumeClaimTemplate.
+func kafkaDataVolumeBytes(t *testing.T) int64 {
+	t.Helper()
+
+	spec, ok := kafkaStatefulSet(t)["spec"].(map[string]interface{})
+	require.True(t, ok, "kafka-statefulset.yaml must declare a spec")
+
+	templates, ok := spec["volumeClaimTemplates"].([]interface{})
+	require.Truef(t, ok && len(templates) > 0,
+		"kafka-statefulset.yaml must declare a volumeClaimTemplate")
+
+	template, ok := templates[0].(map[string]interface{})
+	require.True(t, ok, "the volumeClaimTemplate must be a mapping")
+	templateSpec, _ := template["spec"].(map[string]interface{})
+	resources, _ := templateSpec["resources"].(map[string]interface{})
+	requests, _ := resources["requests"].(map[string]interface{})
+
+	return parseKubernetesQuantityBytes(t, toStringValue(requests["storage"]))
+}
+
+// stringListValue renders a YAML sequence as a string slice, so two sequences can be
+// compared without caring whether the decoder produced strings or interfaces.
+func stringListValue(value interface{}) []string {
+	entries, ok := value.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	rendered := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		rendered = append(rendered, toStringValue(entry))
+	}
+
+	return rendered
+}
+
+// manifestConfigMapData returns the ConfigMap's data map from blnk-config.yaml.
+func manifestConfigMapData(t *testing.T) map[string]interface{} {
+	t.Helper()
+
+	configMap := readYAMLFile(t, filepath.Join(
+		moduleRootDir(t), "infrastructure", "k8s-manifests", "blnk-config.yaml",
+	))
+	data, ok := configMap["data"].(map[string]interface{})
+	require.True(t, ok, "blnk-config.yaml must declare a data map")
+
+	return data
+}
+
+// manifestIntSetting reads one ConfigMap setting as an integer.
+//
+// ConfigMap values are strings by definition, so the quoting is part of the contract: an
+// unquoted number in a ConfigMap is a manifest that will not apply.
+func manifestIntSetting(t *testing.T, data map[string]interface{}, key string) int {
+	t.Helper()
+
+	raw, present := data[key]
+	require.Truef(t, present, "blnk-config.yaml must declare %s", key)
+
+	text := toStringValue(raw)
+	value, err := strconv.Atoi(strings.TrimSpace(text))
+	require.NoErrorf(t, err, "blnk-config.yaml %s must be an integer, got %q", key, text)
+
+	return value
+}
+
+// manifestRetentionDays reads RELAY_EVENT_RETENTION_DAYS from the ConfigMap.
+func manifestRetentionDays(t *testing.T) int {
+	t.Helper()
+
+	return manifestIntSetting(t, manifestConfigMapData(t), "RELAY_EVENT_RETENTION_DAYS")
+}
+
+// manifestBrokerRetentionHours extracts log.retention.hours from the broker's rendered
+// server.properties in kafka-statefulset.yaml.
+//
+// It is read out of the manifest text rather than from a structured field because that is where
+// it lives — the property block is a shell heredoc inside an init container — and reading it
+// from anywhere else would let the two drift.
+func manifestBrokerRetentionHours(t *testing.T) int {
+	t.Helper()
+
+	manifest := readRepoFile(t, filepath.Join("infrastructure", "k8s-manifests", "kafka-statefulset.yaml"))
+
+	matches := regexp.MustCompile(`(?m)^\s*log\.retention\.hours=(\d+)\s*$`).FindStringSubmatch(manifest)
+	require.Lenf(t, matches, 2,
+		"kafka-statefulset.yaml must set log.retention.hours exactly once; the outbox retention "+
+			"period is bounded by it")
+
+	hours, err := strconv.Atoi(matches[1])
+	require.NoError(t, err, "log.retention.hours must be an integer")
+
+	return hours
+}
+
+// manifestPostgresVolumeBytes returns the pg-data volumeClaimTemplate request in bytes.
+func manifestPostgresVolumeBytes(t *testing.T) int64 {
+	t.Helper()
+
+	document := readYAMLFile(t, filepath.Join(
+		moduleRootDir(t), "infrastructure", "k8s-manifests", "postgres-statefulset.yaml",
+	))
+
+	spec, ok := document["spec"].(map[string]interface{})
+	require.True(t, ok, "postgres-statefulset.yaml must declare a spec")
+
+	templates, ok := spec["volumeClaimTemplates"].([]interface{})
+	require.NotEmpty(t, templates, "postgres-statefulset.yaml must declare a volumeClaimTemplate")
+	require.True(t, ok, "volumeClaimTemplates must be a list")
+
+	for _, entry := range templates {
+		template, isMap := entry.(map[string]interface{})
+		if !isMap {
+			continue
+		}
+
+		metadata, _ := template["metadata"].(map[string]interface{})
+		if toStringValue(metadata["name"]) != "pg-data" {
+			continue
+		}
+
+		templateSpec, _ := template["spec"].(map[string]interface{})
+		resources, _ := templateSpec["resources"].(map[string]interface{})
+		requests, _ := resources["requests"].(map[string]interface{})
+
+		return parseKubernetesQuantityBytes(t, toStringValue(requests["storage"]))
+	}
+
+	require.FailNow(t, "postgres-statefulset.yaml must declare a volumeClaimTemplate named pg-data")
+
+	return 0
+}
+
+// parseKubernetesQuantityBytes converts a Kubernetes storage quantity to bytes.
+//
+// Only the binary suffixes are handled, and an unrecognised one FAILS rather than being read as
+// bytes: silently treating "600G" as 600 bytes would make the capacity assertions above pass on a
+// manifest that provisions nothing, which is the opposite of what they are for.
+func parseKubernetesQuantityBytes(t *testing.T, quantity string) int64 {
+	t.Helper()
+
+	trimmed := strings.TrimSpace(quantity)
+	require.NotEmpty(t, trimmed, "a storage request must name a quantity")
+
+	multipliers := []struct {
+		suffix string
+		scale  int64
+	}{
+		{"Ti", 1 << 40},
+		{"Gi", 1 << 30},
+		{"Mi", 1 << 20},
+		{"Ki", 1 << 10},
+	}
+
+	for _, unit := range multipliers {
+		if !strings.HasSuffix(trimmed, unit.suffix) {
+			continue
+		}
+
+		value, err := strconv.ParseInt(strings.TrimSuffix(trimmed, unit.suffix), 10, 64)
+		require.NoErrorf(t, err, "storage quantity %q must be an integer with a binary suffix", quantity)
+
+		return value * unit.scale
+	}
+
+	require.FailNowf(t, "unrecognised storage quantity",
+		"%q must use a binary suffix (Ki, Mi, Gi, Ti); reading it as bytes would let the capacity "+
+			"assertions pass on a volume that provisions nothing", quantity)
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// The relay target delegates broker resolution to the application
+// ---------------------------------------------------------------------------
+
+// makefilePath is the target file operators invoke the server role through.
+const makefilePath = "makefile"
+
+// relayTargetName is the target that starts the role hosting the event outbox relay.
+const relayTargetName = "run_server_relay"
+
+// TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication pins the boundary between what
+// make may decide and what only the application can.
+//
+// # What make legitimately does
+//
+// It sources .env with the caller's environment replayed on top, because `./stack.sh --init`
+// writes KAFKA_BROKERS into a mode-0600 .env whose assignments are exported into nobody's shell —
+// so a target that read only the process environment refused the operator who had just run the
+// setup instruction it recommends. That layering is make's business and stays.
+//
+// # What it must NOT do
+//
+// Decide whether brokers are configured. The recipe used to resolve the list itself, and a shell
+// reimplementation of the loader's resolution cannot agree with it — it did not, in three ways,
+// every one of which made the target ANNOUNCE a relay that would not start:
+//
+//	it took the first non-empty of KAFKA_BROKERS, BLNK_KAFKA_KAFKA_BROKERS and BLNK_KAFKA_BROKERS
+//	in that order, while the loader ranks them the other way at the top — BLNK_KAFKA_BROKERS wins,
+//	then KAFKA_BROKERS, then the derived key, then the file (config.eventStreamingEnvOverride);
+//
+//	it tested the config file with `grep '"brokers"'`, which reads `"brokers": []` as configured;
+//
+//	and no first-non-empty scan can express that an explicitly EMPTY higher-precedence name CLEARS
+//	what a lower one supplied — `BLNK_KAFKA_BROKERS= KAFKA_BROKERS=host:9092` is no brokers to the
+//	application and a configured deployment to the scan.
+//
+// The replacement is `--require-kafka`, which asks the question after the same load, of the same
+// struct, with the same predicate startEventRelay gates on. This test asserts the shell
+// resolution is GONE rather than merely that the flag is present, because a target that did both
+// would still be able to refuse a deployment the application would have admitted.
+func TestMakeRelayTarget_DelegatesBrokerResolutionToTheApplication(t *testing.T) {
+	makefile := readRepoFile(t, makefilePath)
+
+	start := strings.Index(makefile, "\n"+relayTargetName+":\n")
+	require.Positivef(t, start, "%s must define the %s target", makefilePath, relayTargetName)
+
+	// The recipe runs to the first line that is neither blank nor tab-indented — the next target
+	// or the next comment block.
+	recipeLines := make([]string, 0, 32)
+	for _, line := range strings.Split(makefile[start+len(relayTargetName)+2:], "\n") {
+		if line != "" && !strings.HasPrefix(line, "\t") {
+			break
+		}
+
+		recipeLines = append(recipeLines, line)
+	}
+	recipe := strings.Join(recipeLines, "\n")
+	require.NotEmptyf(t, strings.TrimSpace(recipe), "%s: the %s recipe must not be empty",
+		makefilePath, relayTargetName)
+
+	// Comments cannot appear inside a recipe's shell continuation, so nothing is stripped here:
+	// every line asserted about below is executed.
+	assert.Truef(t, strings.Contains(recipe, `exec ./${PROJECT} start --config "${CONFIG_FILE}" --require-kafka`),
+		"%s: the %s recipe must exec the server with --require-kafka, so the APPLICATION decides "+
+			"whether brokers are configured", makefilePath, relayTargetName)
+
+	// THE SHELL RESOLUTION, in every form it took. Each of these RANKS or TESTS the sources —
+	// picks a winner, reads a value, or inspects the config file — and ranking is the application's
+	// job, done after the same load, of the same struct, with the same predicate.
+	//
+	// What is forbidden is deciding, not mentioning. Scoping .env's defaults by SET-NESS (below)
+	// names the aliases without ordering them: it removes contributions the caller did not ask
+	// for and then lets the loader rank whatever is left, so it cannot disagree with the loader
+	// about which one wins — it makes no claim about that at all. Announcing a winner is the form
+	// that can disagree, and the announcement assertion further down is what forbids it.
+	for _, resolution := range []string{
+		`grep -q '"brokers"'`,
+		"caller_brokers",
+		`for candidate in`,
+		"BROKERS_SOURCE",
+		"winning_alias",
+	} {
+		assert.Falsef(t, strings.Contains(recipe, resolution),
+			"%s: the %s recipe must not resolve the broker list itself (found %q). A shell "+
+				"approximation of the loader's precedence cannot agree with it, and the failure "+
+				"mode is announcing a relay that never starts",
+			makefilePath, relayTargetName, resolution)
+	}
+
+	// AND IT MUST NOT NAME A SOURCE IN ITS OUTPUT. This is the assertion that actually closes the
+	// finding: the recipe announced "brokers from KAFKA_BROKERS" while the application resolved
+	// BLNK_KAFKA_BROKERS, so an operator was told about a deployment other than the one that came
+	// up. The application's own refusal names every source it read, which is the only description
+	// that cannot drift from the resolution.
+	for _, line := range strings.Split(recipe, "\n") {
+		if !strings.Contains(line, "echo") {
+			continue
+		}
+
+		for _, alias := range relayAliases {
+			assert.Falsef(t, strings.Contains(line, "("+alias+")"),
+				"%s: the %s recipe announces %s as the source it resolved from. Only the loader "+
+					"knows which alias wins, so an announcement made here can name one the "+
+					"application did not use: %s", makefilePath, relayTargetName, alias,
+				strings.TrimSpace(line))
+		}
+	}
+
+	// THE SET-NESS SCOPING STAYS, because it fixes the defect the layering alone leaves open. With
+	// .env sourced under the caller's environment, an alias present only in .env survives the
+	// replay — so `.env` declaring BLNK_KAFKA_BROKERS outranks a caller who ran
+	// `KAFKA_BROKERS=host:9092 make run_relay`, and a DEFAULT file outvotes an explicit override.
+	// A caller who named any alias therefore suppresses the ones they did not name. Note what this
+	// does NOT do: it never chooses between the caller's own aliases, which is the loader's to
+	// decide and is left entirely to it.
+	for _, scoping := range []string{
+		`prefixed_set="$${BLNK_KAFKA_BROKERS+set}"`,
+		`bare_set="$${KAFKA_BROKERS+set}"`,
+		`derived_set="$${BLNK_KAFKA_KAFKA_BROKERS+set}"`,
+		`if [ -n "$$caller_decided" ]; then`,
+	} {
+		assert.Truef(t, strings.Contains(recipe, scoping),
+			"%s: the %s recipe must scope .env's defaults to the aliases the caller did NOT name "+
+				"(%q missing), or a value parked in .env outvotes an explicit override on the "+
+				"command line", makefilePath, relayTargetName, scoping)
+	}
+
+	// And the .env layering stays, because it is the part make is actually for.
+	for _, layering := range []string{
+		`caller_environment="$$(export -p)"`,
+		`if [ -f .env ]; then set -a; . ./.env; set +a; fi`,
+		`eval "$$caller_environment"`,
+	} {
+		assert.Truef(t, strings.Contains(recipe, layering),
+			"%s: the %s recipe must keep sourcing .env with the caller's environment replayed on "+
+				"top (%q missing): stack.sh --init writes the brokers there, and a set-but-empty "+
+				"value from the caller must survive the replay so the application sees it and "+
+				"refuses", makefilePath, relayTargetName, layering)
+	}
+
+	// The exec must be in the SAME shell as the sourcing. Each LINE of a recipe is its own shell,
+	// so an exec standing on its own would run with make's environment and see none of .env — the
+	// application would then resolve no brokers and refuse a correctly configured deployment,
+	// which is the same silent-failure shape from the other direction.
+	//
+	// A continuation line is also tab-indented, so what distinguishes the two is whether the
+	// PRECEDING line ends in a backslash. That is what is asserted.
+	execAt := strings.Index(recipe, "exec ./${PROJECT}")
+	require.Positivef(t, execAt, "%s: the %s recipe must exec the server", makefilePath, relayTargetName)
+	assert.Truef(t, strings.HasSuffix(recipe[:execAt], "\\\n\t"),
+		"%s: the exec must be a CONTINUATION of the shell that sourced .env — the line before it "+
+			"must end in a backslash. On a line of its own it gets make's environment and sees "+
+			"nothing that was sourced", makefilePath)
+}
+
+// TestStackScript_WritesSecretsIntoEnvWithoutPuttingThemInArgv pins the mechanism by which
+// --init fills .env, because the mechanism was the defect.
+//
+// stack.sh generates and writes three credentials: the PostgreSQL password, the Kafka
+// administrative password whose principal is in the broker's super.users, and the producer
+// password. Each was written with `sed -i "s|{KEY}|${value}|g" .env`, which is wrong in three
+// independent ways, and this test pins the fix for each.
+//
+//  1. SECRECY. `sed` is a real process, and on Linux /proc/<pid>/cmdline is mode 444 — readable
+//     by every account on the host — while /proc/<pid>/environ is mode 400, readable only by the
+//     owner. The old form published all three credentials to any local user who ran `ps` during
+//     the fraction of a second sed lived. It did so inside a function whose own comment promises
+//     that values are reported "by KEY NAME and never by value".
+//
+//  2. CORRECTNESS. A value reaching a sed replacement is not literal: `&` means the whole match
+//     and `\1` a backreference. A generated secret containing either was written altered, and the
+//     service then failed to authenticate with a credential nobody had mistyped.
+//
+//  3. PORTABILITY. `sed -i` with no suffix is a GNU extension. BSD and macOS sed read the next
+//     argument as a backup suffix, so on those platforms the form consumed the filename as a
+//     suffix and edited nothing.
+//
+// The replacement is write_env_substitution: the value crosses into awk through ENVIRON, the
+// substitution is a literal index()/substr() splice, and the file is replaced by an atomic
+// rename of a temporary file created under umask 077.
+func TestStackScript_WritesSecretsIntoEnvWithoutPuttingThemInArgv(t *testing.T) {
+	stack := readRepoFile(t, "stack.sh")
+
+	// NO EXECUTABLE `sed -i` ANYWHERE. Comments explaining the removal are expected and are
+	// excluded by requiring the line not to be a comment, so the prose that documents this fix
+	// does not defeat the assertion that enforces it.
+	for i, line := range strings.Split(stack, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
+			continue
+		}
+		assert.NotContainsf(t, trimmed, "sed -i",
+			"stack.sh:%d: `sed -i` is both a GNU-only in-place form and, when a secret is "+
+				"interpolated into it, a disclosure of that secret through world-readable argv. "+
+				"Use write_env_substitution: %s", i+1, trimmed)
+	}
+
+	require.Contains(t, stack, "write_env_substitution() {",
+		"stack.sh must define write_env_substitution — the argv-free, literal, portable writer "+
+			"that replaced sed -i. Removing sed -i without providing a replacement would mean "+
+			"--init silently writes nothing")
+
+	// THE VALUE CROSSES ON THE ENVIRONMENT, NOT ARGV.
+	assert.Contains(t, stack, `SEV_MODE="${mode}" SEV_KEY="${key}" SEV_VALUE="${value}" awk '`,
+		"write_env_substitution must pass the value to awk through the environment. `awk -v "+
+			"value=...` would put it back in argv, which is the whole defect")
+	assert.NotContains(t, stack, `awk -v value=`,
+		"awk -v places the value in argv, which is mode 444 through /proc")
+
+	// THE SUBSTITUTION IS A LITERAL SPLICE, not a regex substitution, so no character in a
+	// generated secret carries a meaning.
+	assert.Contains(t, stack, "while ((at = index(line, ph)) > 0)",
+		"the placeholder replacement must splice with index()/substr() so that a secret "+
+			"containing & or a backslash is written verbatim")
+	for _, forbidden := range []string{"gsub(", "sub("} {
+		assert.NotContainsf(t, stack, forbidden,
+			"awk's %s treats & in the replacement as the matched text, which silently alters a "+
+				"generated secret", forbidden)
+	}
+
+	// THE REPLACEMENT IS ATOMIC AND PRIVATE.
+	assert.Contains(t, stack, `tmp="$( umask 077; mktemp "${env}.XXXXXX" )"`,
+		"the temporary file must be created beside ${env} so the rename is atomic, and under "+
+			"umask 077 so the secrets are never world-readable in the temporary copy")
+	assert.Contains(t, stack, `mv -f "${tmp}" "${env}"`,
+		"the file must be replaced by a rename, which is atomic: a concurrent reader sees the "+
+			"old content or the new, never a partial write")
+
+	// EVERY SECRET GOES THROUGH THE ONE WRITER. The PostgreSQL password used to bypass
+	// set_env_value with its own bare sed -i, so the fix applied to the shared writer did not
+	// reach it.
+	assert.Contains(t, stack, `set_env_value "POSTGRES_PASSWORD" "$POSTGRES_PASSWORD"`,
+		"the PostgreSQL password must be written through set_env_value like every other "+
+			"credential, so there is one place where the writing mechanism is correct")
+
+	// THE KEY IS VALIDATED BEFORE A BRANCH IS CHOSEN, which is what covers the append arm. A
+	// check living only inside write_env_substitution left `set_env_value` free to append a
+	// malformed key — including one containing a newline, which would inject whole lines into a
+	// file full of credentials — and to report it as a success.
+	require.Contains(t, stack, "require_env_key_name() {",
+		"stack.sh must define a key-name check")
+	setEnvStart := strings.Index(stack, "set_env_value() {")
+	require.Greater(t, setEnvStart, 0, "set_env_value must exist")
+	setEnvEnd := strings.Index(stack[setEnvStart:], "\n}\n")
+	require.Greater(t, setEnvEnd, 0, "set_env_value must be a closed function")
+	setEnv := stack[setEnvStart : setEnvStart+setEnvEnd]
+	keyCheck := strings.Index(setEnv, `require_env_key_name "${key}" || return 1`)
+	firstBranch := strings.Index(setEnv, `if grep -qF "{${key}}"`)
+	require.Greaterf(t, keyCheck, 0,
+		"set_env_value must validate the key name; without it the append branch writes an "+
+			"unvalidated key straight into .env")
+	require.Greater(t, firstBranch, 0, "set_env_value must branch on the placeholder form")
+	assert.Lessf(t, keyCheck, firstBranch,
+		"the key must be validated BEFORE the branch is chosen, so the append arm is covered too")
+}
+
+// TestStackScript_ReadsFileModesPortably pins the loss-free removal of a dead security control.
+//
+// Two implementations of one control stood in this script: enforce_env_permissions, which is
+// called from three places, and require_private_env_file, which was defined and never called.
+// Two competing copies is worse than one, because a reader cannot tell which is authoritative and
+// a fix applied to the wrong copy looks applied while changing nothing.
+//
+// The dead one was deleted — but it had one genuine advantage over the live one: it tried BSD's
+// `stat -f '%Lp'` as well as GNU's `stat -c '%a'`. Without that, enforce_env_permissions could
+// not read a mode on macOS, fell into its unverifiable branch on every call, and re-chmod'd a
+// file that was already correct while announcing a permission change that had not happened.
+// So the advantage was carried across first. This test pins both halves: the duplicate is gone,
+// and what made it worth keeping is not.
+func TestStackScript_ReadsFileModesPortably(t *testing.T) {
+	stack := readRepoFile(t, "stack.sh")
+
+	assert.NotContains(t, stack, "require_private_env_file() {",
+		"require_private_env_file was dead code duplicating enforce_env_permissions and must "+
+			"stay deleted; two implementations of one security control is worse than one")
+
+	require.Contains(t, stack, "enforce_env_permissions() {",
+		"the surviving permission control must still exist")
+	assert.Contains(t, stack,
+		`stat -c '%a' "${env}" 2>/dev/null || stat -f '%Lp' "${env}" 2>/dev/null`,
+		"enforce_env_permissions must try both stat spellings. GNU coreutils uses -c '%a' and "+
+			"BSD/macOS uses -f '%Lp'; trying only the first makes every macOS invocation report "+
+			"an unverifiable mode and re-chmod a file that was already correct")
+}
+
+// copyIntoSandbox copies one repository file into the sandbox at a given mode.
+func copyIntoSandbox(t *testing.T, from, to string, mode os.FileMode) {
+	t.Helper()
+
+	content, err := os.ReadFile(from) //nolint:gosec // a fixed path inside the repository
+	require.NoErrorf(t, err, "reading %s for the sandbox", from)
+	require.NoErrorf(t, os.WriteFile(to, content, mode), "writing %s into the sandbox", to)
+}
+
+// runStackScript executes the real stack.sh in a disposable sandbox with every external
+// command it can reach replaced by a recording stub, and returns what happened.
+//
+// # Why the script is EXECUTED rather than read
+//
+// The property under test is a control-flow OUTCOME — which case arm a word lands on, and
+// what exit status that arm leaves — and no amount of text matching can establish it. The
+// arm being guarded here used to read `* ) help`, so `./stack.sh --buld` printed the usage
+// banner and exited 0: nothing was started, nothing was torn down, and every caller was told
+// it had worked. A grep for the word `exit` in that file finds thirty of them and says
+// nothing about whether a typo reaches one.
+//
+// # Why it is safe to run
+//
+// The sandbox is a temporary directory holding a copy of stack.sh, a copy of .env.example
+// and a copy of the compose projection, so every relative path the script resolves —
+// `.env`, `.env.example`, `scripts/kafka-provision.sh`, `${COMPOSE_FILE}` — lands inside it
+// and never in the repository. The environment is built from scratch rather than inherited,
+// so an ambient .env, a developer's KAFKA_BROKERS or an exported COMPOSE_CL cannot change
+// what is being tested. PATH puts the stub directory first, and the only names the script
+// reaches for that could touch a real host — `docker` and the provisioning script — are
+// both stubs that record their arguments and do nothing.
+//
+// The stubs are deliberately PERMISSIVE: docker exits 0 for everything and answers the
+// version probe with a Compose new enough to satisfy COMPOSE_MINIMUM_VERSION. That matters,
+// because a stub that failed would let a dispatch test pass for the wrong reason — the run
+// would abort before reaching the arm under test, and `exit 1` would look like the
+// unknown-argument refusal.
+//
+// Parameters:
+//   - t *testing.T: owns the sandbox's lifetime.
+//   - argv []string: the arguments to invoke with. An empty slice is the bare invocation,
+//     which is a case in its own right.
+//
+// Returns:
+//   - stackDispatchOutcome: the exit status, the operator-visible output, the recorded
+//     invocations and the sandbox to inspect for side effects.
+func runStackScript(t *testing.T, argv []string) stackDispatchOutcome {
+	t.Helper()
+
+	root := moduleRootDir(t)
+	sandbox := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(sandbox, "bin"), 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Join(sandbox, "scripts"), 0o750))
+
+	// The real script, copied rather than symlinked: it resolves .env, .env.example and
+	// scripts/kafka-provision.sh against the WORKING DIRECTORY, and a symlink would leave
+	// those resolving into the repository.
+	copyIntoSandbox(t, filepath.Join(root, "stack.sh"), filepath.Join(sandbox, "stack.sh"), 0o700)
+	// .env.example and the compose projection are present so that a REGRESSION IS VISIBLE.
+	// Without .env.example an accidental fall-through into the --init arm would fail for a
+	// missing template instead of creating a .env, and "no .env was created" would hold for
+	// the wrong reason.
+	copyIntoSandbox(t, filepath.Join(root, ".env.example"), filepath.Join(sandbox, ".env.example"), 0o644)
+	copyIntoSandbox(t,
+		filepath.Join(root, "docker-compose.yaml"),
+		filepath.Join(sandbox, "docker-compose.yaml"), 0o644)
+
+	log := filepath.Join(sandbox, "invocations.log")
+	require.NoError(t, os.WriteFile(log, nil, 0o600))
+
+	recorder := "#!/usr/bin/env bash\n" +
+		"printf '%s' \"$(basename \"$0\")\" >> " + shellQuote(log) + "\n" +
+		"for arg in \"$@\"; do printf ' %s' \"$arg\" >> " + shellQuote(log) + "; done\n" +
+		"printf '\\n' >> " + shellQuote(log) + "\n"
+
+	// docker: records, answers the Compose version probe with a version above the floor, and
+	// succeeds at everything else. `basename $0` is `docker`, so the recorded line reads as
+	// the command an operator would have typed.
+	dockerStub := recorder +
+		"if [ \"${1:-}\" = compose ] && [ \"${2:-}\" = version ]\n" +
+		"then\n" +
+		"  if [ \"${3:-}\" = --short ]; then printf '2.29.0\\n'; else printf 'Docker Compose version v2.29.0\\n'; fi\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 0\n"
+	require.NoError(t,
+		os.WriteFile(filepath.Join(sandbox, "bin", "docker"), []byte(dockerStub), 0o700))
+
+	// The provisioning script: records, and answers --print-interface-host with a plausible
+	// variable list so resolve_kafka_provision_interface succeeds. Any OTHER invocation is a
+	// side effect, and the assertions below say so.
+	provisionStub := recorder +
+		"if [ \"${1:-}\" = --print-interface-host ]\n" +
+		"then\n" +
+		"  printf 'KAFKA_TOPIC_PREFIX\\nKAFKA_MIN_PARTITIONS\\nKAFKA_REPLICATION_FACTOR\\n'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 0\n"
+	require.NoError(t,
+		os.WriteFile(filepath.Join(sandbox, "scripts", "kafka-provision.sh"),
+			[]byte(provisionStub), 0o700))
+
+	command := exec.Command("bash", filepath.Join(sandbox, "stack.sh")) //nolint:gosec // a copy of a repository file in a temporary directory
+	command.Args = append(command.Args, argv...)
+	command.Dir = sandbox
+	// Built from scratch rather than inherited. An ambient KAFKA_BROKERS, an exported
+	// COMPOSE_CL or a COMPOSE_PROFILES from the developer's shell would each change which
+	// branch the script takes, and the dispatcher's contract must hold without reference to
+	// any of them.
+	command.Env = []string{
+		"PATH=" + filepath.Join(sandbox, "bin") +
+			":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=" + filepath.Join(sandbox, "home"),
+	}
+
+	output, err := command.CombinedOutput()
+
+	exitCode := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		require.ErrorAsf(t, err, &exitErr,
+			"stack.sh %v could not be run at all: %v\n%s", argv, err, output)
+		exitCode = exitErr.ExitCode()
+	}
+
+	recorded, readErr := os.ReadFile(log) //nolint:gosec // a path this test wrote
+	require.NoError(t, readErr, "the invocation log must be readable")
+
+	invocations := make([]string, 0, 8)
+	for _, line := range strings.Split(string(recorded), "\n") {
+		if strings.TrimSpace(line) != "" {
+			invocations = append(invocations, strings.TrimSpace(line))
+		}
+	}
+
+	return stackDispatchOutcome{
+		exitCode:    exitCode,
+		output:      string(output),
+		invocations: invocations,
+		sandbox:     sandbox,
+	}
+}
+
+// assertStackChangedNothing is the zero-side-effect half of the dispatch contract.
+//
+// "Nothing was started, stopped or changed" is a claim the script PRINTS, and a printed claim
+// is worth exactly as much as the check behind it. Three things are asserted, each of which
+// the sandbox is arranged to make observable:
+//
+//   - No Compose subcommand ran. The version probes are excluded because they are read-only
+//     and happen before any arm is chosen; anything else — `up`, `down`, `pull`, `ps` — is an
+//     action on the host.
+//   - The provisioning script was not RUN, only interrogated. `--print-interface-host` prints
+//     a variable list and exits; any other invocation creates topics, mints SCRAM credentials
+//     and rewrites ACLs.
+//   - No .env was created. The sandbox holds a .env.example precisely so that a fall-through
+//     into the --init arm would produce one.
+//
+// TestStackScript_TheDispatchHarnessCanSeeSideEffects proves all three are observable, so a
+// failure of this helper means the dispatcher acted rather than that the harness went blind.
+func assertStackChangedNothing(t *testing.T, outcome stackDispatchOutcome) {
+	t.Helper()
+
+	assert.Emptyf(t, outcome.composeSubcommands(),
+		"no Compose subcommand may run: the script printed that nothing was started, stopped "+
+			"or changed, and a compose invocation is exactly how it would have been.\n"+
+			"recorded: %v", outcome.invocations)
+
+	for _, call := range outcome.provisioningInvocations() {
+		assert.Equalf(t, "kafka-provision.sh --print-interface-host", call,
+			"the provisioning script may only be INTERROGATED for its variable list here. Any "+
+				"other invocation creates topics, mints SCRAM credentials and rewrites ACLs on "+
+				"whatever broker the environment points at.\nrecorded: %v", outcome.invocations)
+	}
+
+	_, err := os.Stat(filepath.Join(outcome.sandbox, ".env"))
+	assert.Truef(t, os.IsNotExist(err),
+		"no .env may be created: the sandbox holds a .env.example, so an accidental "+
+			"fall-through into the --init arm would generate one — with a PostgreSQL password "+
+			"and two Kafka credentials in it")
+}
+
+// TestStackScript_TheDispatchHarnessCanSeeSideEffects is the non-vacuity guard for the two
+// tests above, and it is not optional.
+//
+// Every assertion in assertStackChangedNothing is an assertion that something did NOT happen,
+// and such an assertion passes just as readily against a harness that cannot see the thing at
+// all — a stub that was never on PATH, a log that was never written, a sandbox the script
+// never ran in. So the same harness is pointed at two subcommands whose side effects are not
+// in question, and required to observe them:
+//
+//   - `--down` must reach Compose. It is one line in the dispatcher and touches nothing else.
+//   - `--init` must create a .env. It is the one subcommand whose entire purpose is to write
+//     that file.
+//
+// If either of these stops being observed, the "changed nothing" assertions above have become
+// vacuous and this test is what says so.
+func TestStackScript_TheDispatchHarnessCanSeeSideEffects(t *testing.T) {
+	t.Run("a teardown reaches Compose", func(t *testing.T) {
+		outcome := runStackScript(t, []string{"--down"})
+
+		require.Equalf(t, 0, outcome.exitCode,
+			"the stubbed teardown must succeed, or this guard is measuring an aborted run "+
+				"instead of an observed side effect.\n--- output ---\n%s", outcome.output)
+
+		acting := outcome.composeSubcommands()
+		require.NotEmptyf(t, acting,
+			"the harness must OBSERVE a compose subcommand for --down. It did not, which means "+
+				"the docker stub was not reached — and every \"no compose subcommand ran\" "+
+				"assertion in this file is therefore vacuous.\nrecorded: %v", outcome.invocations)
+
+		joined := strings.Join(acting, "\n")
+		assert.Contains(t, joined, " down",
+			"the observed subcommand must be the teardown itself.\nrecorded: %v", acting)
+	})
+
+	t.Run("an initialisation creates the environment file", func(t *testing.T) {
+		outcome := runStackScript(t, []string{"--init"})
+
+		require.Equalf(t, 0, outcome.exitCode,
+			"the stubbed --init must succeed.\n--- output ---\n%s", outcome.output)
+
+		info, err := os.Stat(filepath.Join(outcome.sandbox, ".env"))
+		require.NoErrorf(t, err,
+			"the harness must OBSERVE the .env --init creates. It did not, which means the "+
+				"\"no .env was created\" assertions elsewhere in this file are vacuous")
+
+		// While the file is in hand: the mode is the one property of it that is a security
+		// boundary rather than a convenience, and --init is the only thing that creates it.
+		assert.Equalf(t, os.FileMode(0o600), info.Mode().Perm(),
+			"a generated .env holds the PostgreSQL password and both Kafka credentials, so it "+
+				"must be private from the first byte")
+	})
+}
+
+// TestStackScript_TheUsageBannerSucceeds is the other half of MIN-12: the three invocations
+// that ask for the banner must SUCCEED, and must equally change nothing.
+//
+// A bare invocation is read as a request for help, which is why the script's own comment
+// calls it out: a wrapper that runs `./stack.sh --help` to check the script is present must
+// not see a failure. Making the unknown-argument arm exit 1 is only correct if these three
+// stay at 0 — otherwise the fix trades a silent success for a spurious failure, and the
+// dispatcher would have to be read to know which.
+func TestStackScript_TheUsageBannerSucceeds(t *testing.T) {
+	requests := []struct {
+		name string
+		argv []string
+	}{
+		{name: "the long flag", argv: []string{"--help"}},
+		{name: "the short flag", argv: []string{"-h"}},
+		{name: "a bare invocation", argv: nil},
+		{name: "an explicitly empty argument", argv: []string{""}},
+	}
+
+	// Every subcommand the banner advertises, so that a flag deleted from the dispatcher
+	// without being deleted from the banner — or the reverse — is caught here rather than by
+	// an operator following documentation into the unknown-argument arm.
+	advertised := []string{
+		"--pull, -p", "--up,-u", "--build,-b", "--down,-d",
+		"--purge", "--restart,-r", "--init,-i",
+	}
+
+	for _, request := range requests {
+		t.Run(request.name, func(t *testing.T) {
+			outcome := runStackScript(t, request.argv)
+
+			require.Equalf(t, 0, outcome.exitCode,
+				"stack.sh %v must exit 0: printing what was asked for is not an error, and a "+
+					"wrapper that runs it to check the script is present must not see a "+
+					"failure.\n--- output ---\n%s", request.argv, outcome.output)
+
+			assert.Contains(t, outcome.output, "Usage:", "the banner must be printed")
+			for _, flag := range advertised {
+				assert.Containsf(t, outcome.output, flag,
+					"the usage banner must document %q; a subcommand the dispatcher accepts and "+
+						"the banner omits is undiscoverable, and one the banner advertises and "+
+						"the dispatcher rejects sends the operator into the refusal arm", flag)
+			}
+
+			// The banner must NOT claim a failure. This is the specific confusion the old
+			// `* ) help` arm created in reverse: help and refusal printed the identical text.
+			assert.NotContainsf(t, outcome.output, "unrecognised argument",
+				"a deliberate request for help must not be reported as a mistake")
+
+			assertStackChangedNothing(t, outcome)
+		})
+	}
+}
+
+// TestStackScript_AnUnrecognisedArgumentFailsAndChangesNothing is MIN-12, and it is the
+// executable half of a fix that until now existed only as a case arm and a comment.
+//
+// # The defect
+//
+// The catch-all arm read `* ) help`, sharing the SUCCESS path with `--help`. So
+// `./stack.sh --buld` printed the usage banner and exited 0. Nothing was pulled, built,
+// started, stopped or purged, and the caller was told it had worked. A CI job or a
+// provisioning wrapper that mistyped a subcommand recorded success against a stack that had
+// never started — and every other failure in this script is loud: `--down` without an
+// environment file exits 1, a broker that never becomes healthy exits non-zero, a purge
+// without consent refuses. The typo was the sole silent one.
+//
+// # Why this test exists
+//
+// The fix is four lines of shell inside a `case`, which is exactly the kind of edit that a
+// later refactor merges back into the arm above it without anyone noticing. The finding is
+// blunt about the consequence: "a typo can regress to green/no-op". So the contract is
+// pinned by running the script, on a sandbox where a side effect WOULD be observable, and
+// asserting all three halves of it — the status, the diagnostic that names the argument, and
+// the absence of any action.
+//
+// The typos are chosen to be the ones an operator actually makes: a transposed character, a
+// missing pair of dashes, the wrong case, a single-letter flag that was never defined, and a
+// value-looking word. Each one lands on the same arm, and each must fail.
+func TestStackScript_AnUnrecognisedArgumentFailsAndChangesNothing(t *testing.T) {
+	mistakes := []struct {
+		name string
+		argv []string
+	}{
+		{name: "a transposed character", argv: []string{"--buld"}},
+		{name: "the dashes were forgotten", argv: []string{"up"}},
+		{name: "the wrong case", argv: []string{"--UP"}},
+		{name: "a short flag that was never defined", argv: []string{"-x"}},
+		{name: "a subcommand from a different tool", argv: []string{"start"}},
+		{name: "an argument that only looks like a flag", argv: []string{"---up"}},
+	}
+
+	for _, mistake := range mistakes {
+		t.Run(mistake.name, func(t *testing.T) {
+			outcome := runStackScript(t, mistake.argv)
+
+			require.Equalf(t, 1, outcome.exitCode,
+				"stack.sh %v must exit 1. This arm used to be `* ) help`, which shares the "+
+					"success path with --help, so a mistyped subcommand printed the usage banner "+
+					"and returned 0 — a CI job or provisioning wrapper then recorded SUCCESS "+
+					"against a stack that had never started.\n--- output ---\n%s",
+				mistake.argv, outcome.output)
+
+			// The argument is named back, because the mistake is usually one transposed
+			// character and an operator reading a wall of usage text does not always see
+			// which word of theirs was not understood.
+			assert.Containsf(t, outcome.output, mistake.argv[0],
+				"the refusal must NAME the argument that was not understood; the usage banner "+
+					"alone leaves the operator to spot their own typo in it")
+			assert.Containsf(t, outcome.output, "unrecognised argument",
+				"the refusal must say what went wrong in words, not only in an exit status")
+			assert.Containsf(t, outcome.output, "Nothing was started, stopped or changed",
+				"the refusal must state that the host is untouched: the operator's next question "+
+					"after a non-zero exit is whether they now need to clean something up")
+
+			// Usage is still printed. Refusing and then explaining is the point; refusing in
+			// silence would be a regression of a different kind.
+			assert.Containsf(t, outcome.output, "Usage:",
+				"the refusal must still print the usage banner, so the operator can see the "+
+					"subcommand they meant")
+
+			assertStackChangedNothing(t, outcome)
+		})
+	}
+}
+
+// stackDispatchOutcome is everything one sanitized stack.sh run produced.
+type stackDispatchOutcome struct {
+	// exitCode is the status the script left, which for this dispatcher is the whole
+	// contract: it is what a CI job or a provisioning wrapper reads.
+	exitCode int
+	// output is stdout and stderr combined, colour escapes included, exactly as an operator
+	// sees it.
+	output string
+	// invocations is one line per stubbed external command, in the order they ran, so a
+	// side effect is observable rather than inferred.
+	invocations []string
+	// sandbox is the working directory the run had, so a test can look for files it created.
+	sandbox string
+}
+
+// composeSubcommands returns the recorded compose invocations that asked Compose to DO
+// something, discarding the two version probes resolve_compose_cl makes before any
+// subcommand runs.
+//
+// The distinction is the whole point of the dispatch tests. `docker compose version` is
+// read-only and unavoidable — it is how the script decides whether Compose is usable at all
+// — while `docker compose ... down` or `... up -d` changes the host. Filtering the probes
+// here rather than in each caller keeps "nothing was started, stopped or changed" a single
+// readable assertion.
+func (outcome stackDispatchOutcome) composeSubcommands() []string {
+	acting := make([]string, 0, len(outcome.invocations))
+
+	for _, line := range outcome.invocations {
+		if !strings.HasPrefix(line, "docker ") {
+			continue
+		}
+		// The probe, in both of its forms: `docker compose version` and, when that
+		// succeeds, `docker compose version --short`.
+		if line == "docker compose version" || line == "docker compose version --short" {
+			continue
+		}
+
+		acting = append(acting, line)
+	}
+
+	return acting
+}
+
+// provisioningInvocations returns the recorded calls to the provisioning script.
+func (outcome stackDispatchOutcome) provisioningInvocations() []string {
+	calls := make([]string, 0, len(outcome.invocations))
+
+	for _, line := range outcome.invocations {
+		if strings.HasPrefix(line, "kafka-provision.sh") {
+			calls = append(calls, line)
+		}
+	}
+
+	return calls
 }

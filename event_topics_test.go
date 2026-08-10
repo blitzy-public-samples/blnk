@@ -120,8 +120,8 @@ type eventCatalogueEntry struct {
 // balances, then identities, then the two events that motivate the one extra category.
 var eventCatalogue = []eventCatalogueEntry{
 	// The seven transaction lifecycle events. All seven originate in
-	// getEventFromStatus, which is the transaction event-string vocabulary and which
-	// relocates into event_topics.go when the legacy transport is retired.
+	// getEventFromStatus, the transaction event-string vocabulary, which now lives in
+	// event_topics.go — relocated out of the legacy transport ahead of its retirement.
 	{
 		eventType:       "transaction.queued",
 		vocabularyKey:   "transaction.queued",
@@ -1663,18 +1663,26 @@ func TestEventTopicsSource_ImportsNoKafkaClient(t *testing.T) {
 	}
 }
 
-// TestEventTopicsSource_RecordsTheSunsetRelocationOfGetEventFromStatus protects the
-// receiving half of the sunset procedure.
+// TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary protects the receiving half
+// of the sunset procedure, now that the relocation has been performed.
 //
-// getEventFromStatus must be relocated into event_topics.go before webhooks.go is deleted,
-// because it produces seven of the thirteen event strings — the vocabulary this file routes.
-// That fact lives in a comment, so nothing but a test can stop it being deleted, and losing
-// it means a future sunset deletes the vocabulary along with its host file.
+// getEventFromStatus produces seven of the thirteen event strings — the vocabulary this file
+// routes — and it used to be declared in webhooks.go, the file the sunset deletes. STEP 1 of
+// that procedure required moving it out FIRST, and it has been moved here. This test is the
+// guard on the result, and it asserts the invariant in both directions:
 //
-// The test also asserts the function is NOT yet declared here: a premature relocation would
-// be a duplicate declaration in package blnk and would fail the build outright, so this
-// assertion exists to name the reason rather than to catch it late.
-func TestEventTopicsSource_RecordsTheSunsetRelocationOfGetEventFromStatus(t *testing.T) {
+//   - It IS declared in event_topics.go, exactly once. A relocation that got reverted, or a
+//     merge that dropped the moved declaration, would otherwise only surface as a build
+//     failure in whichever file still called it.
+//   - It is NOT declared in webhooks.go. A relocation that ADDED without REMOVING would be a
+//     duplicate declaration in package blnk and would fail the build outright — which is why
+//     the previous version of this test asserted the function was absent here. That
+//     assertion has been inverted rather than deleted: the risk it named is real, it has
+//     simply moved to the other side of the move.
+//
+// The documentation record is asserted too, because the reason this function lives beside
+// topic resolution rather than beside a transport is a fact only a comment carries.
+func TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary(t *testing.T) {
 	parsed := parseEventTopicsSource(t)
 
 	var comments strings.Builder
@@ -1683,36 +1691,47 @@ func TestEventTopicsSource_RecordsTheSunsetRelocationOfGetEventFromStatus(t *tes
 	}
 	documentation := comments.String()
 
-	// Each fragment is one half of the record: the symbol that must move, the fact that it
-	// must outlive its host file, and the pointer to where the ordered procedure is kept.
-	// Losing any one of them leaves a reader with no way back to the other two.
+	// Each fragment is one part of the record: the symbol, the fact that it had to outlive
+	// its former host, and the pointer to where the ordered procedure is kept. Losing any one
+	// of them leaves a reader with no way back to the other two.
 	//
 	// Each is checked with strings.Contains behind assert.True rather than assert.Contains so
 	// that a failure reports the missing fragment instead of dumping the whole file's
 	// documentation — roughly twenty thousand characters — into the test output.
 	for _, fragment := range []string{
 		"getEventFromStatus",
-		"must outlive that file",
-		"sunset block at the foot of webhooks.go",
+		"outlive the transport that once hosted it",
+		"sunset procedure at the foot of webhooks.go",
 	} {
 		assert.True(t, strings.Contains(documentation, fragment),
-			"event_topics.go's documentation must still contain %q; it is the only record that getEventFromStatus must be moved here before webhooks.go is deleted", fragment)
+			"event_topics.go's documentation must still contain %q; it is the only record of why the transaction event vocabulary lives here rather than beside a transport", fragment)
 	}
 
+	declarations := 0
 	for _, declaration := range parsed.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
 		if !ok {
 			continue
 		}
 
-		assert.NotEqual(t, "getEventFromStatus", function.Name.Name,
-			"getEventFromStatus must stay declared only in webhooks.go until the dual-delivery window closes; a second declaration in package blnk breaks the build")
+		if function.Name.Name == "getEventFromStatus" {
+			declarations++
+		}
 	}
 
-	// It must still be reachable from its current home, which is what the transaction
-	// producer call site depends on.
+	assert.Equal(t, 1, declarations,
+		"getEventFromStatus must be declared exactly once in event_topics.go: it was relocated here from webhooks.go ahead of that file's deletion, and it is the vocabulary that decides which topic a transaction event is published to")
+
+	// AND NOT IN ITS FORMER HOME. Two declarations in package blnk would not compile, so this
+	// asserts the move was a move rather than a copy — and it is the assertion that fails if
+	// someone restores the old declaration while merging.
+	assert.NotContains(t, readRepoFile(t, "webhooks.go"), "func getEventFromStatus(",
+		"webhooks.go must no longer declare getEventFromStatus; the relocation is STEP 1 of the sunset procedure and a second declaration in package blnk breaks the build")
+
+	// It must still behave identically from its new home, which is what the transaction
+	// producer call sites depend on.
 	assert.Equal(t, "transaction.applied", getEventFromStatus(StatusApplied),
-		"the event vocabulary must remain callable from its declaration site in webhooks.go")
+		"the event vocabulary must remain callable, and unchanged, from event_topics.go")
 	assert.Equal(t, "transaction.unknown", getEventFromStatus(StatusCommit),
 		"and the deliberately preserved COMMIT fall-through must be untouched")
 }

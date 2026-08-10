@@ -1060,3 +1060,1166 @@ func TestSecretDelivery_RefusesSymlinksAndWritesAtomically(t *testing.T) {
 				"security property is how they diverge, and only one of them was reachable")
 	})
 }
+
+// ---------------------------------------------------------------------------
+// The created / grown / unchanged summary must report only what it confirmed
+// ---------------------------------------------------------------------------
+
+// topicSummaryStub builds a Kafka CLI stub whose TOPIC LISTING is controllable, which is what
+// makes the provisioning summary's classification observable without a broker.
+//
+// The existing stubbedKafkaCLI answers `--describe` and nothing else, because the tests it serves
+// are about a credential probe. The summary is decided by a different question — does the topic
+// EXIST before this run — and the script now asks that with `--list`, so this stub answers both:
+// a list whose contents and exit status the caller chooses, and a describe that always returns a
+// geometry matching what the run asks for, so the geometry check is satisfied rather than merely
+// survived.
+//
+// # Making the listing FAIL requires care, because readiness uses it too
+//
+// The script waits for the broker by calling `kafka-topics --list` until it succeeds, so a stub
+// that refuses every listing never gets past readiness and the summary is never reached. That is
+// itself the reason an unreadable pre-state is rare in practice — readiness has already proved the
+// listing works once. It is not impossible: a broker can become unreadable AFTER readiness, mid-run,
+// through an election or a metadata refresh, which is exactly the transient that used to be
+// reported as a creation.
+//
+// So failAfter reproduces that shape rather than a broker that was never reachable: the first
+// `failAfter` listings succeed, and every later one fails.
+//
+// Parameters:
+//   - failAfter int: how many listings succeed before the rest fail. Zero or negative means every
+//     listing succeeds.
+//   - listed []string: the topics the list reports when it succeeds.
+//
+// Returns:
+//   - string: the directory to put first on PATH.
+func topicSummaryStub(t *testing.T, failAfter int, listed []string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "list-calls")
+
+	stub := "#!/usr/bin/env bash\n" +
+		"if [[ \"$(basename \"$0\")\" == kafka-topics ]]; then\n" +
+		"  for arg in \"$@\"; do\n" +
+		"    if [[ \"$arg\" == --list ]]; then\n" +
+		"      printf 'x' >> " + counter + "\n" +
+		"      calls=$(wc -c < " + counter + ")\n" +
+		"      if ((" + strconv.Itoa(failAfter) + " > 0 && calls > " + strconv.Itoa(failAfter) + ")); then\n" +
+		"        printf 'Error while executing topic command: broker not available\\n' >&2\n" +
+		"        exit 1\n" +
+		"      fi\n" +
+		"      printf '%s' " + shellQuote(strings.Join(listed, "\n")) + "\n" +
+		"      [[ -n " + shellQuote(strings.Join(listed, "\n")) + " ]] && printf '\\n'\n" +
+		"      exit 0\n" +
+		"    fi\n" +
+		"  done\n" +
+		"  for arg in \"$@\"; do\n" +
+		"    if [[ \"$arg\" == --describe ]]; then\n" +
+		"      printf 'Topic: stub\\tTopicId: stub\\tPartitionCount: 6\\tReplicationFactor: 1\\tConfigs: \\n'\n" +
+		"      exit 0\n" +
+		"    fi\n" +
+		"  done\n" +
+		"fi\n" +
+		// A determinate "no credential yet" answer, so the credential arms take their ordinary
+		// fresh-broker path and the run reaches the summary this test is about.
+		"if [[ \"$(basename \"$0\")\" == kafka-configs ]]; then\n" +
+		"  users=no; describe=no\n" +
+		"  for arg in \"$@\"; do\n" +
+		"    [[ \"$arg\" == users ]] && users=yes\n" +
+		"    [[ \"$arg\" == --describe ]] && describe=yes\n" +
+		"  done\n" +
+		"  if [[ $users == yes && $describe == yes ]]; then\n" +
+		"    printf 'Configs for user-principal '\"'\"'stub'\"'\"' are \\n'\n" +
+		"    exit 0\n" +
+		"  fi\n" +
+		"fi\n" +
+		"exit 0\n"
+
+	for _, name := range []string{"kafka-topics", "kafka-configs", "kafka-acls"} {
+		require.NoError(t,
+			os.WriteFile(filepath.Join(dir, name), []byte(stub), 0o700),
+			"writing the %s stub", name)
+	}
+
+	return dir
+}
+
+// readinessListings is how many `kafka-topics --list` calls the script makes before it starts
+// assuring topics: exactly one, the readiness probe that waits for the broker to accept an
+// authenticated request. A stub that fails every listing after this many describes a broker that
+// was reachable at readiness and unreadable by the time each topic's pre-state was probed.
+//
+// Counted from the script's own invocations rather than read off the source: a stub that logged
+// every call recorded nine listings in a full run — one readiness probe and one per topic in the
+// eight-topic catalogue — with the first topic's `--create` arriving as the second call overall.
+const readinessListings = 1
+
+// allProvisionedTopics is the frozen eight-topic catalogue the script assures, in the order it
+// assures them: the four category topics, then their dead-letter siblings.
+var allProvisionedTopics = []string{
+	"blnk.transactions", "blnk.balances", "blnk.identities", "blnk.system",
+	"blnk.transactions.dlt", "blnk.balances.dlt", "blnk.identities.dlt", "blnk.system.dlt",
+}
+
+// TestKafkaProvisionScript_SummaryReportsOnlyConfirmedActions is finding F-10, executed.
+//
+// # What the summary is for, and what it was doing instead
+//
+// The closing line answers a question the geometry table cannot: not "is the catalogue correct
+// now" but "was it correct when this run started". `created: 8` on a deployment that has been
+// publishing for weeks means the catalogue was lost and silently rebuilt — and with it every
+// offset — which is an incident, and which the daily outbox-versus-offset reconciliation in
+// docs/kafka-operations.md relies on being able to detect. A count that is inferred rather than
+// confirmed cannot carry that weight.
+//
+// Three things made it inferred:
+//
+//	the pre-state came from `topic_geometry`, which answers empty both for an absent topic and
+//	for one the broker could not describe for a moment, so an EXISTING topic was reported as
+//	created by this run;
+//
+//	`SUMMARY_GROWN` was appended BEFORE the alter, so a topic stayed counted as grown by this run
+//	even when the alter failed and the re-read showed another provisioner had grown it;
+//
+//	and `unchanged` was the total minus the other two, so a topic counted in both — which the
+//	independent appends allowed — made it NEGATIVE.
+//
+// # What is asserted
+//
+// The three classifications this can reach without a broker, each from a stub whose answers are
+// unambiguous, plus the arithmetic property that makes the line trustworthy: the counts sum to
+// the catalogue size, and none of them is negative.
+func TestKafkaProvisionScript_SummaryReportsOnlyConfirmedActions(t *testing.T) {
+	// summaryCount extracts one count from the closing summary.
+	summaryCount := func(t *testing.T, output, label string) int {
+		t.Helper()
+
+		pattern := regexp.MustCompile(label + `\s*:\s*(\d+)`)
+		match := pattern.FindStringSubmatch(output)
+		require.NotNilf(t, match, "the summary must report %q; output was:\n%s", label, output)
+
+		value, err := strconv.Atoi(match[1])
+		require.NoError(t, err)
+
+		return value
+	}
+
+	t.Run("a catalogue that already exists is unchanged, not created", func(t *testing.T) {
+		stubDir := topicSummaryStub(t, 0, allProvisionedTopics)
+
+		output, _, _ := runProvisioningScript(t, stubDir, nil)
+
+		require.Contains(t, output, "topics are present with a verified geometry",
+			"the run must reach its summary; output was:\n%s", output)
+		assert.Equal(t, 0, summaryCount(t, output, "created"),
+			"every topic was listed before the run, so nothing was created by it")
+		assert.Equal(t, 0, summaryCount(t, output, "grown"))
+		assert.Equal(t, len(allProvisionedTopics), summaryCount(t, output, "unchanged"),
+			"and every one of them is unchanged")
+		assert.NotContains(t, output, "raced     :",
+			"nothing raced, so the raced line must not appear at all — an empty class printed "+
+				"every run is a line that stops being read")
+	})
+
+	t.Run("a genuinely absent catalogue is created", func(t *testing.T) {
+		stubDir := topicSummaryStub(t, 0, nil)
+
+		output, _, _ := runProvisioningScript(t, stubDir, nil)
+
+		require.Contains(t, output, "topics are present with a verified geometry",
+			"the run must reach its summary; output was:\n%s", output)
+		assert.Equal(t, len(allProvisionedTopics), summaryCount(t, output, "created"),
+			"the list reported nothing before the run, so this run created the catalogue — the "+
+				"claim the summary exists to be able to make")
+		assert.Equal(t, 0, summaryCount(t, output, "unchanged"))
+	})
+
+	t.Run("an unreadable pre-state is raced, never created", func(t *testing.T) {
+		// THE FINDING'S FIRST BULLET. Readiness gets its two listings and the broker then stops
+		// answering them, so whether each topic existed is not this run's to report. Every topic
+		// is still verified — the describe answers a geometry — so the run succeeds and the
+		// catalogue is confirmed correct; what it must not do is claim to have built it.
+		stubDir := topicSummaryStub(t, readinessListings, allProvisionedTopics)
+
+		output, _, _ := runProvisioningScript(t, stubDir, nil)
+
+		require.Contains(t, output, "topics are present with a verified geometry",
+			"an unreadable pre-state must not fail the run — the geometry is still verified; "+
+				"output was:\n%s", output)
+		assert.Equal(t, 0, summaryCount(t, output, "created"),
+			"a topic whose existence could not be established must NOT be reported as created by "+
+				"this run: that is the reading an operator acts on as a lost catalogue")
+		assert.Equal(t, 0, summaryCount(t, output, "grown"))
+		assert.Equal(t, 0, summaryCount(t, output, "unchanged"))
+		assert.Equal(t, len(allProvisionedTopics), summaryCount(t, output, "raced"),
+			"it belongs to the class that names the uncertainty instead of resolving it")
+		assert.Contains(t, output, "re-run to confirm",
+			"and the line must say what to do about it")
+	})
+
+	t.Run("the counts partition the catalogue in every case", func(t *testing.T) {
+		// The arithmetic property, which is what made `unchanged` able to go negative: the four
+		// classes must be mutually exclusive and jointly exhaustive. Asserted over all three
+		// stubs so no single classification can satisfy it by accident.
+		for name, stub := range map[string]string{
+			"existing":   topicSummaryStub(t, 0, allProvisionedTopics),
+			"absent":     topicSummaryStub(t, 0, nil),
+			"unreadable": topicSummaryStub(t, readinessListings, allProvisionedTopics),
+		} {
+			t.Run(name, func(t *testing.T) {
+				output, _, _ := runProvisioningScript(t, stub, nil)
+				require.Contains(t, output, "topics are present with a verified geometry",
+					"output was:\n%s", output)
+
+				total := 0
+				for _, label := range []string{"created", "grown", "unchanged"} {
+					count := summaryCount(t, output, label)
+					assert.GreaterOrEqualf(t, count, 0, "%s must never be negative", label)
+					total += count
+				}
+
+				if strings.Contains(output, "raced     :") {
+					total += summaryCount(t, output, "raced")
+				}
+
+				assert.Equalf(t, len(allProvisionedTopics), total,
+					"the classes must partition the catalogue: %d topics were assured, and the "+
+						"counts add to %d. A topic counted twice, or in none of them, is how the "+
+						"unchanged figure came to be computed as a negative number",
+					len(allProvisionedTopics), total)
+			})
+		}
+	})
+}
+
+// growthSummaryStub builds a stub whose topic starts UNDER-PARTITIONED and reaches the target once
+// an alter has been seen, so the grown / raced distinction is observable without a broker.
+//
+// The describe answer is stateful because the distinction being tested is temporal: what the
+// summary may claim depends on whether the growth this run requested is the growth that happened.
+// A marker file written by the alter is what separates "before" from "after".
+//
+// kafka-get-offsets is stubbed to report every partition at offset zero, which makes each topic
+// provably EMPTY and therefore growable without KAFKA_ALLOW_PARTITION_GROWTH. That keeps this test
+// about the summary rather than about the consent gate, which has its own coverage.
+//
+// Parameters:
+//   - alterExit int: the exit status of `kafka-topics --alter`. Zero is this run growing the topic;
+//     non-zero with the marker still written is another provisioner having grown it first, which is
+//     the race the script tolerates and the summary must not claim as its own work.
+//
+// Returns:
+//   - string: the directory to put first on PATH.
+func growthSummaryStub(t *testing.T, alterExit int) string {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	// THE MARKER IS PER TOPIC. A single shared marker made the first topic's alter change the
+	// describe answer for all eight, so seven of them looked already-correct and the test measured
+	// one growth instead of eight — the stub, not the script, deciding the outcome.
+	topics := "#!/usr/bin/env bash\n" +
+		"topic=\"\"\n" +
+		"previous=\"\"\n" +
+		"for arg in \"$@\"; do\n" +
+		"  [[ \"$previous\" == --topic ]] && topic=\"$arg\"\n" +
+		"  previous=\"$arg\"\n" +
+		"done\n" +
+		"marker=" + filepath.Join(dir, "grown-") + "\"${topic}\"\n" +
+		"for arg in \"$@\"; do\n" +
+		"  if [[ \"$arg\" == --list ]]; then\n" +
+		"    printf '%s\\n' " + shellQuote(strings.Join(allProvisionedTopics, "\n")) + "\n" +
+		"    exit 0\n" +
+		"  fi\n" +
+		"done\n" +
+		"for arg in \"$@\"; do\n" +
+		"  if [[ \"$arg\" == --alter ]]; then\n" +
+		"    : > \"$marker\"\n" +
+		"    exit " + strconv.Itoa(alterExit) + "\n" +
+		"  fi\n" +
+		"done\n" +
+		"for arg in \"$@\"; do\n" +
+		"  if [[ \"$arg\" == --describe ]]; then\n" +
+		"    if [[ -f \"$marker\" ]]; then\n" +
+		"      printf 'Topic: stub\\tTopicId: stub\\tPartitionCount: 6\\tReplicationFactor: 1\\tConfigs: \\n'\n" +
+		"    else\n" +
+		"      printf 'Topic: stub\\tTopicId: stub\\tPartitionCount: 3\\tReplicationFactor: 1\\tConfigs: \\n'\n" +
+		"    fi\n" +
+		"    exit 0\n" +
+		"  fi\n" +
+		"done\n" +
+		"exit 0\n"
+
+	offsets := "#!/usr/bin/env bash\n" +
+		"topic=\"\"\n" +
+		"while [[ $# -gt 0 ]]; do\n" +
+		"  if [[ \"$1\" == --topic ]]; then topic=\"$2\"; fi\n" +
+		"  shift\n" +
+		"done\n" +
+		"for partition in 0 1 2 3 4 5; do printf '%s:%s:0\\n' \"$topic\" \"$partition\"; done\n" +
+		"exit 0\n"
+
+	configs := "#!/usr/bin/env bash\n" +
+		"users=no; describe=no\n" +
+		"for arg in \"$@\"; do\n" +
+		"  [[ \"$arg\" == users ]] && users=yes\n" +
+		"  [[ \"$arg\" == --describe ]] && describe=yes\n" +
+		"done\n" +
+		"if [[ $users == yes && $describe == yes ]]; then\n" +
+		"  printf 'Configs for user-principal '\"'\"'stub'\"'\"' are \\n'\n" +
+		"fi\n" +
+		"exit 0\n"
+
+	for name, body := range map[string]string{
+		"kafka-topics":      topics,
+		"kafka-configs":     configs,
+		"kafka-acls":        "#!/usr/bin/env bash\nexit 0\n",
+		"kafka-get-offsets": offsets,
+	} {
+		require.NoError(t,
+			os.WriteFile(filepath.Join(dir, name), []byte(body), 0o700),
+			"writing the %s stub", name)
+	}
+
+	return dir
+}
+
+// TestKafkaProvisionScript_GrownIsClaimedOnlyWhenThisRunGrewIt is the finding's second bullet,
+// executed.
+//
+// SUMMARY_GROWN used to be appended at the moment the script DECIDED to grow a topic, several lines
+// before the alter was attempted. The alter failing is not an error here and must not be — two
+// provisioners racing is an ordinary state, and the loser is told the topic already has the
+// partitions it wanted — but the topic stayed counted as grown BY THIS RUN either way. The two arms
+// below are the same code path with the same observable end state and different authorship, which
+// is precisely the distinction the summary is read for.
+func TestKafkaProvisionScript_GrownIsClaimedOnlyWhenThisRunGrewIt(t *testing.T) {
+	summaryCount := func(t *testing.T, output, label string) int {
+		t.Helper()
+
+		match := regexp.MustCompile(label + `\s*:\s*(\d+)`).FindStringSubmatch(output)
+		require.NotNilf(t, match, "the summary must report %q; output was:\n%s", label, output)
+
+		value, err := strconv.Atoi(match[1])
+		require.NoError(t, err)
+
+		return value
+	}
+
+	t.Run("an alter this run made and confirmed is grown", func(t *testing.T) {
+		output, _, _ := runProvisioningScript(t, growthSummaryStub(t, 0), nil)
+
+		require.Contains(t, output, "topics are present with a verified geometry",
+			"output was:\n%s", output)
+		assert.Equal(t, len(allProvisionedTopics), summaryCount(t, output, "grown"),
+			"this run requested the growth, the alter succeeded, and the re-read confirmed the "+
+				"target was reached — which is the only combination that earns the claim")
+		assert.Equal(t, 0, summaryCount(t, output, "created"))
+		assert.Equal(t, 0, summaryCount(t, output, "unchanged"))
+	})
+
+	t.Run("an alter another provisioner won is raced, not grown", func(t *testing.T) {
+		output, _, _ := runProvisioningScript(t, growthSummaryStub(t, 1), nil)
+
+		require.Contains(t, output, "topics are present with a verified geometry",
+			"a lost race must not fail the run: the topic has the partitions this run wanted, "+
+				"which is success; output was:\n%s", output)
+		assert.Contains(t, output, "another provisioner grew it",
+			"the run must say what it observed")
+		assert.Equal(t, 0, summaryCount(t, output, "grown"),
+			"the alter FAILED and the partitions arrived by another hand, so this run did not "+
+				"grow anything. Counting it as grown was the defect: the append happened before "+
+				"the alter and nothing withdrew it")
+		assert.Equal(t, len(allProvisionedTopics), summaryCount(t, output, "raced"),
+			"it belongs to the class that reports another actor rather than crediting this one")
+	})
+}
+
+// TestKafkaOperationsRunbook_TeachesArgvFreeCredentialCreation pins the runbook away from an
+// example that leaked the credential it was creating.
+//
+// The "Adding a runtime SCRAM user" section showed:
+//
+//	docker compose exec kafka .../kafka-configs.sh --alter \
+//	  --add-config "SCRAM-SHA-512=[iterations=4096,password=$NEW_PASSWORD]" ...
+//
+// which places a broker password in the argv of two processes at once — the host's docker client
+// and kafka-configs.sh in the container. /proc/<pid>/cmdline is mode 444 on Linux, so every
+// account on the host could read it for as long as the command ran, and it landed in shell
+// history besides.
+//
+// Worse than the example was the advice under it, which recommended preferring "a
+// --command-config-style properties file". That does not work for SCRAM: kafka-configs.sh
+// normalises the mechanism name out of a properties file and rejects its own input with
+// `Invalid credential property SCRAM_SHA_512=[...]`, verified against apache/kafka:3.9.2. An
+// operator following the guidance hit an error the guidance did not predict.
+//
+// The section now feeds the password on stdin, which removes the host-side exposure entirely,
+// records why a config file is not the answer so nobody re-derives it, and points at the API path
+// where the question does not arise at all.
+func TestKafkaOperationsRunbook_TeachesArgvFreeCredentialCreation(t *testing.T) {
+	runbook := readRepoFile(t, filepath.Join("docs", "kafka-operations.md"))
+
+	section := "### Adding a runtime SCRAM user"
+	start := strings.Index(runbook, section)
+	require.Greaterf(t, start, 0, "docs/kafka-operations.md must document adding a runtime SCRAM user")
+	end := strings.Index(runbook[start+len(section):], "\n### ")
+	require.Greater(t, end, 0, "the section must be bounded by the next heading")
+	body := runbook[start : start+len(section)+end]
+
+	// THE INLINE PASSWORD ARGUMENT MUST NOT COME BACK.
+	assert.NotContains(t, body, "password=$NEW_PASSWORD]",
+		"the runbook must not show a password interpolated into --add-config: that places it in "+
+			"argv, and /proc/<pid>/cmdline is mode 444 — readable by every account on the host")
+
+	// THE STDIN MECHANISM MUST BE THE ONE SHOWN.
+	assert.Contains(t, body, `printf '%s\n' "$NEW_PASSWORD" | docker compose exec -T kafka`,
+		"the password must be fed to the container on stdin, so it appears in no command line on "+
+			"the host — neither the shell's nor the docker client's")
+	assert.Contains(t, body, "read -r pw",
+		"the container-side shell must read the password from stdin rather than receive it as an "+
+			"argument")
+	assert.Contains(t, body, "read -rs NEW_PASSWORD",
+		"the runbook must show the password being read without echo, so it stays out of the "+
+			"terminal and out of shell history")
+	assert.Contains(t, body, "unset NEW_PASSWORD",
+		"and being dropped from the shell afterwards")
+
+	// THE DEAD END MUST BE RECORDED, so the next reader does not spend the afternoon rediscovering
+	// that the obvious fix is the one that cannot work.
+	assert.Contains(t, body, "Invalid credential property SCRAM_SHA_512",
+		"the runbook must record that --add-config-file cannot express a SCRAM credential, and "+
+			"quote the error it produces, because it is the natural thing to reach for and it "+
+			"fails in a way that does not explain itself")
+	assert.NotContains(t, body, "prefer a `--command-config`-style properties file",
+		"that advice was wrong — a properties file cannot carry a SCRAM credential — and must "+
+			"not be restored")
+
+	// AND THE PATH WHERE THE PROBLEM DOES NOT EXIST MUST BE NAMED.
+	assert.Contains(t, body, "AlterUserScramCredentials",
+		"the runbook must point at the API path, which sends the credential over the Kafka "+
+			"protocol from inside the server process and therefore has no command line at all")
+}
+
+// TestKafkaProvisionScript_ReportsExactlyWhatItDidToTheCatalogue is MIN-13, executed.
+//
+// # What the summary is for
+//
+// `kafka-topics --create --if-not-exists` makes creation idempotent by making it
+// INDISTINGUISHABLE: an existing topic and a freshly created one both leave exit 0 and both
+// land in the same reconciliation. So a run whose catalogue had been lost and silently rebuilt
+// printed output identical to a run where nothing had changed — eight topics, the right
+// partition counts, and no hint that every offset had just restarted from zero. The daily
+// outbox-versus-offset reconciliation in docs/kafka-operations.md cannot be performed without
+// knowing the difference: it compares outbox rows against broker offsets, and a recreated
+// topic invalidates the comparison silently.
+//
+// The dispositions are the answer to that, and their whole value is that they are EXACT. Two
+// properties therefore have to hold together, and neither implies the other:
+//
+//   - The four buckets sum to the catalogue size, so no topic is unaccounted for.
+//   - Each topic is in the bucket that describes what happened to it, so a count cannot be
+//     right for the wrong reasons.
+//
+// # Why every case is a full run
+//
+// The dispositions are decided by comparisons across separate CLI invocations — a describe
+// before the create against a describe after it, a partition count read, altered and re-read —
+// so no static reading of the script can establish them. Each case below starts the stubbed
+// broker in a different state and requires the exact totals, the exact names, and the final
+// state of the broker itself.
+func TestKafkaProvisionScript_ReportsExactlyWhatItDidToTheCatalogue(t *testing.T) {
+	// Derived from the same source the script derives it from — the category list — rather
+	// than written down. The script's own comment says the count follows EVENT_CATEGORIES so
+	// that adding a category leaves no stale number behind, and a test carrying a literal 8
+	// would be exactly that stale number.
+	catalogue := AllTopicsWithDeadLettersForPrefix(DefaultTopicPrefix)
+	require.NotEmpty(t, catalogue, "the topic catalogue must not be empty")
+
+	t.Run("an absent catalogue is reported as created, every topic named", func(t *testing.T) {
+		// The case that matters most operationally: this is what a rebuilt catalogue looks
+		// like, and reporting it as "unchanged" is what made a lost catalogue invisible.
+		stub := newKafkaCatalogueStub(t, alterSucceeds, topicsAreEmpty)
+
+		outcome := runCatalogueProvisioning(t, stub, nil)
+		require.Truef(t, outcome.succeeded,
+			"provisioning an absent catalogue must succeed.\n--- output ---\n%s", outcome.output)
+
+		parsed := outcome.dispositions(t)
+		assert.Equal(t, len(catalogue), parsed.total, "every catalogue topic must be reported")
+		assert.Equalf(t, len(catalogue), parsed.created,
+			"every topic was absent and had to be created, so created must be %d. A run that "+
+				"rebuilt the catalogue and reported it as unchanged is indistinguishable from "+
+				"one that found it already correct — and every offset restarted from zero.\n"+
+				"--- output ---\n%s", len(catalogue), outcome.output)
+		assert.Zero(t, parsed.grown, "nothing existed to grow")
+		assert.Zero(t, parsed.unchanged, "nothing existed to leave unchanged")
+		assert.Zero(t, parsed.refused, "nothing existed to refuse")
+		assert.ElementsMatchf(t, catalogue, parsed.createdNamed,
+			"the created bucket must NAME each topic, not only count them: the count answers "+
+				"\"how many\" and the operator's next question is \"which\"")
+
+		// The broker must actually be where the summary says. A summary that is right about a
+		// catalogue the run failed to build is the worse of the two failures.
+		for _, topic := range catalogue {
+			assert.Equalf(t, 6, stub.partitionsOf(t, topic),
+				"%s must exist at the configured partition count", topic)
+		}
+	})
+
+	t.Run("a correct catalogue is reported as unchanged, with nothing named", func(t *testing.T) {
+		stub := newKafkaCatalogueStub(t, alterSucceeds, topicsAreEmpty)
+		stub.seedCatalogue(t, 6, catalogue)
+
+		outcome := runCatalogueProvisioning(t, stub, nil)
+		require.Truef(t, outcome.succeeded,
+			"provisioning an already-correct catalogue must succeed.\n--- output ---\n%s",
+			outcome.output)
+
+		parsed := outcome.dispositions(t)
+		assert.Equal(t, len(catalogue), parsed.total)
+		assert.Zerof(t, parsed.created,
+			"nothing was created. The create call is still ISSUED — --if-not-exists makes it a "+
+				"no-op — so a disposition derived from that call's exit status rather than from "+
+				"the probe before it would report every topic as created here.\n--- output ---\n%s",
+			outcome.output)
+		assert.Zero(t, parsed.grown, "the geometry was already correct")
+		assert.Equal(t, len(catalogue), parsed.unchanged, "every topic was already correct")
+		assert.Zero(t, parsed.refused)
+		assert.Empty(t, parsed.createdNamed)
+		assert.Empty(t, parsed.grownNamed)
+
+		// And the run must not have printed a refusal section, because there was nothing to
+		// refuse. A bucket that appears on a healthy run is noise in the one output an
+		// operator reads at a glance.
+		assert.NotContains(t, outcome.output, "Left under-partitioned",
+			"a healthy catalogue must not print an under-partitioned section")
+	})
+
+	t.Run("an under-partitioned empty catalogue is reported as grown", func(t *testing.T) {
+		stub := newKafkaCatalogueStub(t, alterSucceeds, topicsAreEmpty)
+		stub.seedCatalogue(t, 3, catalogue)
+
+		outcome := runCatalogueProvisioning(t, stub, nil)
+		require.Truef(t, outcome.succeeded,
+			"growing an empty under-partitioned catalogue must succeed.\n--- output ---\n%s",
+			outcome.output)
+
+		parsed := outcome.dispositions(t)
+		assert.Zero(t, parsed.created, "the topics existed")
+		assert.Equalf(t, len(catalogue), parsed.grown,
+			"every topic was below the configured count and provably empty, so every one was "+
+				"grown.\n--- output ---\n%s", outcome.output)
+		assert.Zero(t, parsed.unchanged)
+		assert.Zero(t, parsed.refused, "an EMPTY topic is the one case growth is always allowed")
+		assert.ElementsMatch(t, catalogue, parsed.grownNamed)
+
+		for _, topic := range catalogue {
+			assert.Equalf(t, 6, stub.partitionsOf(t, topic),
+				"%s must have reached the configured partition count", topic)
+		}
+	})
+
+	t.Run("losing a race to another provisioner is raced, and still succeeds", func(t *testing.T) {
+		// Two provisioners run against one broker routinely: the compose kafka-init one-shot
+		// and a manual `make kafka_provision`. The loser's alter fails, and it fails with a
+		// message that says the topic ALREADY has that many partitions — so the topic is
+		// correct and the run must not treat it as a failure.
+		//
+		// The disposition is `raced` rather than `grown`, and that is the deliberate answer of
+		// TestKafkaProvisionScript_GrownIsClaimedOnlyWhenThisRunGrewIt: the summary is what an
+		// operator reads to learn what THIS invocation did, so a run must not claim an alter it
+		// did not issue. The catalogue is still fully accounted for, because `raced` is one of
+		// the classes the identity below sums, and the per-topic line names what happened.
+		stub := newKafkaCatalogueStub(t, alterLosesARace, topicsAreEmpty)
+		stub.seedCatalogue(t, 3, catalogue)
+
+		outcome := runCatalogueProvisioning(t, stub, nil)
+		require.Truef(t, outcome.succeeded,
+			"a lost growth race must NOT fail the run: the topic is at the target count, which "+
+				"is the outcome that was wanted. Failing here would make a bring-up flaky in "+
+				"exactly the configuration the stack ships — compose's one-shot and the makefile "+
+				"target against one broker.\n--- output ---\n%s", outcome.output)
+
+		assert.Containsf(t, outcome.output, "another provisioner grew it",
+			"the run must SAY the topic was grown by someone else. It is the difference between "+
+				"a benign race and an alter this run performed, and the audit trail needs the "+
+				"distinction.\n--- output ---\n%s", outcome.output)
+
+		parsed := outcome.dispositions(t)
+		assert.Equalf(t, len(catalogue), parsed.raced,
+			"the alter was another provisioner's, so this run must not claim it: the topics "+
+				"belong to the class that names the uncertainty rather than resolving it")
+		assert.ElementsMatch(t, catalogue, parsed.racedNamed,
+			"and the raced line must name them, so a reader can re-run to confirm")
+		assert.Zerof(t, parsed.grown,
+			"`grown` is a claim about what THIS invocation did, and the summary is the only "+
+				"record of that; a run that claims an alter it did not issue makes the audit "+
+				"trail unusable for the one question it answers")
+		assert.Zero(t, parsed.created)
+		assert.Zero(t, parsed.unchanged)
+		assert.Zero(t, parsed.refused)
+
+		for _, topic := range catalogue {
+			assert.Equalf(t, 6, stub.partitionsOf(t, topic),
+				"%s must be at the configured count after the race", topic)
+		}
+	})
+
+	t.Run("a refused growth is its own disposition and is not counted as unchanged", func(t *testing.T) {
+		// The misclassification the finding names. A topic that holds records is deliberately
+		// left under-partitioned, and the run still succeeds — an under-partitioned topic is a
+		// throughput limit, not an outage. Reporting it as "unchanged" is what makes the
+		// deliberate refusal indistinguishable from a catalogue that needed nothing.
+		stub := newKafkaCatalogueStub(t, alterSucceeds, topicsHoldRecords)
+		stub.seedCatalogue(t, 3, catalogue)
+
+		outcome := runCatalogueProvisioning(t, stub, nil)
+		require.Truef(t, outcome.succeeded,
+			"a refused growth must not fail the run.\n--- output ---\n%s", outcome.output)
+
+		parsed := outcome.dispositions(t)
+		assert.Equalf(t, len(catalogue), parsed.refused,
+			"every topic held records and growth was not permitted, so every one belongs in the "+
+				"under-partitioned bucket.\n--- output ---\n%s", outcome.output)
+		assert.Zerof(t, parsed.unchanged,
+			"a refused growth is NOT \"unchanged\". Folding the two together printed "+
+				"\"created=0 grown=0 unchanged=8\" for a catalogue in which every topic was "+
+				"stuck at 3 partitions against a configured 6, with the only trace a per-topic "+
+				"warning several screens up.\n--- output ---\n%s", outcome.output)
+		assert.Zero(t, parsed.created)
+		assert.Zero(t, parsed.grown)
+		assert.ElementsMatch(t, catalogue, parsed.refusedNamed)
+
+		// The closing summary — the one place the catalogue is shown as a whole — must
+		// name them with the remedy, because nothing else will ever report this.
+		assert.Containsf(t, outcome.output, "Left under-partitioned",
+			"the closing summary must name the under-partitioned topics: no alert fires for a "+
+				"throughput ceiling, no consumer errors, and the next run refuses it just as "+
+				"quietly.\n--- output ---\n%s", outcome.output)
+		assert.Contains(t, outcome.output, "KAFKA_ALLOW_PARTITION_GROWTH=true",
+			"the refusal must carry the remedy that overrides it")
+		assert.Contains(t, outcome.output, "KAFKA_MIN_PARTITIONS",
+			"the refusal must carry the remedy that accepts the current count")
+
+		// Nothing was grown on the broker either. The summary and the broker must agree.
+		for _, topic := range catalogue {
+			assert.Equalf(t, 3, stub.partitionsOf(t, topic),
+				"%s must be left at its original partition count", topic)
+		}
+	})
+
+	t.Run("an indeterminate record state refuses growth rather than guessing", func(t *testing.T) {
+		// The offsets tool failed, so emptiness could not be proven. That is not evidence of
+		// emptiness, and growing on the assumption would re-map ledger keys — silently, with
+		// nothing failing to say the ordering guarantee had stopped holding.
+		stub := newKafkaCatalogueStub(t, alterSucceeds, recordStateIsUnknown)
+		stub.seedCatalogue(t, 3, catalogue)
+
+		outcome := runCatalogueProvisioning(t, stub, nil)
+		require.Truef(t, outcome.succeeded,
+			"an indeterminate record state must not fail the run.\n--- output ---\n%s",
+			outcome.output)
+
+		parsed := outcome.dispositions(t)
+		assert.Equal(t, len(catalogue), parsed.refused,
+			"an unprovable emptiness must be refused, not guessed")
+		assert.Zero(t, parsed.grown)
+		assert.Contains(t, outcome.output, "COULD NOT BE DETERMINED",
+			"the run must say WHY it declined, so the operator can fix the probe")
+
+		for _, topic := range catalogue {
+			assert.Equalf(t, 3, stub.partitionsOf(t, topic),
+				"%s must be left alone when emptiness could not be proven", topic)
+		}
+	})
+
+	t.Run("explicit consent grows a topic that holds records", func(t *testing.T) {
+		// The override, so the refusal above is proven to be a decision rather than an
+		// inability. Without this arm a script that could never grow a non-empty topic under
+		// any circumstances would pass the refusal case too.
+		stub := newKafkaCatalogueStub(t, alterSucceeds, topicsHoldRecords)
+		stub.seedCatalogue(t, 3, catalogue)
+
+		outcome := runCatalogueProvisioning(t, stub,
+			map[string]string{"KAFKA_ALLOW_PARTITION_GROWTH": "true"})
+		require.Truef(t, outcome.succeeded,
+			"a consented growth must succeed.\n--- output ---\n%s", outcome.output)
+
+		parsed := outcome.dispositions(t)
+		assert.Equal(t, len(catalogue), parsed.grown,
+			"consent was given, so every under-partitioned topic was grown")
+		assert.Zero(t, parsed.refused, "nothing is refused once consent is given")
+		assert.Contains(t, outcome.output, "ordering of existing events is not preserved",
+			"the consented growth must still WARN what was traded away: the operator consented "+
+				"to a re-mapping, and the run is the record of when it happened")
+
+		for _, topic := range catalogue {
+			assert.Equalf(t, 6, stub.partitionsOf(t, topic), "%s must have been grown", topic)
+		}
+	})
+
+	t.Run("an over-partitioned catalogue is left alone and reported, never shrunk", func(t *testing.T) {
+		stub := newKafkaCatalogueStub(t, alterSucceeds, topicsAreEmpty)
+		stub.seedCatalogue(t, 12, catalogue)
+
+		outcome := runCatalogueProvisioning(t, stub, nil)
+		require.Truef(t, outcome.succeeded,
+			"more partitions than configured is not an error.\n--- output ---\n%s", outcome.output)
+
+		parsed := outcome.dispositions(t)
+		assert.Zero(t, parsed.created)
+		assert.Zerof(t, parsed.grown,
+			"a topic above the configured count must not be touched at all: Kafka cannot reduce "+
+				"a partition count, and reducing one would move ledger keys between partitions")
+		assert.Equal(t, len(catalogue), parsed.unchanged)
+		assert.Contains(t, outcome.output, "more than the configured",
+			"the excess must be reported so configuration and reality can be reconciled")
+
+		for _, topic := range catalogue {
+			assert.Equalf(t, 12, stub.partitionsOf(t, topic),
+				"%s must keep its partitions; no alter may be attempted", topic)
+		}
+
+		// No alter was ISSUED, which is the property behind "never shrunk". Kafka would refuse
+		// it, so an attempt would merely be a noisy failure — but the script must not make one.
+		for _, invocation := range outcome.invocations {
+			assert.NotContainsf(t, invocation, "--alter --topic",
+				"no partition alter may be issued for an over-partitioned catalogue: %s",
+				invocation)
+		}
+	})
+
+	t.Run("an alter that genuinely fails is fatal", func(t *testing.T) {
+		// The other side of the race case. When the alter fails AND the topic is still below
+		// the target, the topic is wrong and the run must say so rather than report a geometry
+		// it does not have.
+		stub := newKafkaCatalogueStub(t, alterIsRefused, topicsAreEmpty)
+		stub.seedCatalogue(t, 3, catalogue)
+
+		outcome := runCatalogueProvisioning(t, stub, nil)
+		require.Falsef(t, outcome.succeeded,
+			"an alter that failed and left the topic under-partitioned must fail the run: the "+
+				"catalogue does not have the geometry this script exists to guarantee.\n"+
+				"--- output ---\n%s", outcome.output)
+		assert.Contains(t, outcome.output, "could not grow topic",
+			"the failure must name what could not be done")
+		assert.Contains(t, outcome.output, "Alter authority",
+			"the failure must name the likely cause, which is an authorization gap")
+	})
+}
+
+// catalogueStubMode names how the stubbed `kafka-topics --alter` behaves.
+type catalogueStubMode string
+
+const (
+	// alterSucceeds is the ordinary growth: the alter is accepted and the topic reaches the
+	// target partition count.
+	alterSucceeds catalogueStubMode = "grow"
+	// alterLosesARace is the concurrent-provisioner case. The topic reaches the target — some
+	// other provisioner got there first — and the alter still reports failure, which is what
+	// Kafka does when it is asked to grow a topic that already has that many partitions.
+	alterLosesARace catalogueStubMode = "race"
+	// alterIsRefused is an authorization failure: the alter fails and the topic does NOT reach
+	// the target. This one must be fatal.
+	alterIsRefused catalogueStubMode = "fail"
+)
+
+// catalogueRecordState names what the stubbed `kafka-get-offsets` reports.
+type catalogueRecordState string
+
+const (
+	// topicsAreEmpty makes every partition report latest offset zero, which is the only state
+	// in which growing a topic cannot re-map an existing key.
+	topicsAreEmpty catalogueRecordState = "empty"
+	// topicsHoldRecords makes every partition report a non-zero latest offset.
+	topicsHoldRecords catalogueRecordState = "records"
+	// recordStateIsUnknown makes the offsets tool fail, which is neither proof of emptiness nor
+	// proof of records and must be treated as the former's absence.
+	recordStateIsUnknown catalogueRecordState = "unknown"
+)
+
+// kafkaCatalogueStub is a stubbed broker: a directory of recording CLI stubs plus the mutable
+// topic state they read and write between invocations.
+//
+// # Why the state is a directory of files
+//
+// The dispositions under test are all differences between two moments — a topic that did not
+// exist before the create and does after, a partition count that was three and is now six —
+// and the script observes each of them with a SEPARATE process invocation. A stub that
+// answered from a fixed table could not model that: `--describe` before the create and
+// `--describe` after it have to give different answers, and the only thing shared between two
+// stub processes is the filesystem. One file per topic holding its partition count, absent
+// when the topic does not exist, is the smallest thing that does it.
+type kafkaCatalogueStub struct {
+	// binDir goes at the front of PATH.
+	binDir string
+	// stateDir holds one `<topic>.partitions` file per existing topic.
+	stateDir string
+	// log is the file every stub invocation appends its argv to.
+	log string
+	// alter is how `--alter` behaves.
+	alter catalogueStubMode
+	// records is what the offsets tool reports.
+	records catalogueRecordState
+	// replication is the factor `--describe` reports, so the run can be held to a real
+	// observed value rather than the configured one.
+	replication int
+}
+
+// catalogueOutcome is one provisioning run against a stubbed broker.
+type catalogueOutcome struct {
+	// output is stdout and stderr combined.
+	output string
+	// succeeded is whether the script exited zero.
+	succeeded bool
+	// invocations is every stubbed CLI call, in order.
+	invocations []string
+	// stub is the broker it ran against, so a test can read the final topic state.
+	stub kafkaCatalogueStub
+}
+
+// catalogueDisposition is the four-way verdict the script prints about what it DID to the
+// catalogue, parsed back out of its own output.
+type catalogueDisposition struct {
+	total     int
+	created   int
+	grown     int
+	unchanged int
+	// refused is the "under-partitioned" bucket, which is printed only when non-empty.
+	refused int
+	// refusedNamed are the topic names listed beside that bucket.
+	refusedNamed []string
+	// raced is the class that names an uncertainty rather than resolving it: an unreadable
+	// pre-state, an alter another provisioner won, or an accepted alter that has not converged.
+	raced int
+	// racedNamed are the topic names listed beside it.
+	racedNamed []string
+	// createdNamed and grownNamed are likewise the names, so a count cannot pass while the
+	// list beside it is wrong.
+	createdNamed []string
+	grownNamed   []string
+}
+
+// newKafkaCatalogueStub writes a stubbed Kafka CLI that models a real topic catalogue.
+//
+// Four tools are stubbed, because the disposition logic reaches all four: kafka-topics for
+// list, describe, create and alter; kafka-configs so the credential probe answers "present"
+// and no principal is rewritten; kafka-acls so grants succeed; and kafka-get-offsets, WITHOUT
+// which topic_record_state answers "unknown" for every topic and the growth gate refuses
+// everything — which would make the grown case unreachable and the refused case pass for the
+// wrong reason.
+//
+// Parameters:
+//   - t *testing.T: owns the temporary directories.
+//   - alter catalogueStubMode: how `--alter` behaves.
+//   - records catalogueRecordState: what the offsets tool reports.
+//
+// Returns:
+//   - kafkaCatalogueStub: the stub, ready to seed and run.
+func newKafkaCatalogueStub(
+	t *testing.T,
+	alter catalogueStubMode,
+	records catalogueRecordState,
+) kafkaCatalogueStub {
+	t.Helper()
+
+	root := t.TempDir()
+	stub := kafkaCatalogueStub{
+		binDir:      filepath.Join(root, "bin"),
+		stateDir:    filepath.Join(root, "state"),
+		log:         filepath.Join(root, "invocations.log"),
+		alter:       alter,
+		records:     records,
+		replication: 1,
+	}
+
+	require.NoError(t, os.MkdirAll(stub.binDir, 0o750))
+	require.NoError(t, os.MkdirAll(stub.stateDir, 0o750))
+	require.NoError(t, os.WriteFile(stub.log, nil, 0o600))
+
+	// Every stub opens with the same recorder, so an assertion can be made about a call that
+	// was or was not issued as well as about the summary it produced.
+	recorder := "#!/usr/bin/env bash\n" +
+		"printf '%s' \"$(basename \"$0\")\" >> \"$STUB_LOG\"\n" +
+		"for arg in \"$@\"; do printf ' %s' \"$arg\" >> \"$STUB_LOG\"; done\n" +
+		"printf '\\n' >> \"$STUB_LOG\"\n"
+
+	// kafka-topics: the state machine. The geometry line is Kafka's own format, because
+	// topic_geometry parses PartitionCount and ReplicationFactor out of it with a regular
+	// expression and a shape it cannot read is a fatal "geometry could not be read".
+	topics := recorder +
+		"mode=\"\"; topic=\"\"; parts=\"\"\n" +
+		"args=(\"$@\")\n" +
+		"for ((i=0;i<${#args[@]};i++)); do\n" +
+		"  case \"${args[i]}\" in\n" +
+		"    --describe) mode=describe ;;\n" +
+		"    --create) mode=create ;;\n" +
+		"    --alter) mode=alter ;;\n" +
+		"    --list) mode=list ;;\n" +
+		"    --topic) topic=\"${args[i+1]}\" ;;\n" +
+		"    --partitions) parts=\"${args[i+1]}\" ;;\n" +
+		"  esac\n" +
+		"done\n" +
+		"state=\"$STUB_STATE/${topic}.partitions\"\n" +
+		"case \"$mode\" in\n" +
+		"  list)\n" +
+		"    ls \"$STUB_STATE\" 2>/dev/null | sed 's/\\.partitions$//'\n" +
+		"    exit 0 ;;\n" +
+		"  describe)\n" +
+		"    if [ -f \"$state\" ]; then\n" +
+		"      printf 'Topic: %s\\tTopicId: AAAAAAAAAAAAAAAAAAAAAA\\tPartitionCount: %s\\tReplicationFactor: %s\\tConfigs: \\n' \\\n" +
+		"        \"$topic\" \"$(cat \"$state\")\" \"$STUB_REPLICATION\"\n" +
+		"      exit 0\n" +
+		"    fi\n" +
+		// A topic that does not exist: Kafka exits non-zero with a stack trace, and
+		// topic_geometry guards the call and reads the empty answer as absence.
+		"    printf 'Error while executing topic command : Topic %s does not exist\\n' \"$topic\" >&2\n" +
+		"    exit 1 ;;\n" +
+		"  create)\n" +
+		// --if-not-exists semantics: an existing topic is a no-op at exit 0, whatever its
+		// partition count. Reproducing that is what makes the "created" probe meaningful.
+		"    [ -f \"$state\" ] || printf '%s' \"$parts\" > \"$state\"\n" +
+		"    exit 0 ;;\n" +
+		"  alter)\n" +
+		"    case \"$STUB_ALTER_MODE\" in\n" +
+		"      grow) printf '%s' \"$parts\" > \"$state\"; exit 0 ;;\n" +
+		"      race)\n" +
+		// The other provisioner already grew it, and Kafka reports the alter as a failure.
+		"        printf '%s' \"$parts\" > \"$state\"\n" +
+		"        printf 'Error: Topic currently has %s partitions, which is higher than the requested\\n' \"$parts\" >&2\n" +
+		"        exit 1 ;;\n" +
+		"      *)\n" +
+		"        printf 'Error: Authorization failed: Alter on the topic resource\\n' >&2\n" +
+		"        exit 1 ;;\n" +
+		"    esac ;;\n" +
+		"esac\n" +
+		"exit 0\n"
+
+	// kafka-configs: the credential probe answers PRESENT, so no principal is generated or
+	// rotated. That keeps this file's subject the catalogue rather than the credentials, which
+	// TestKafkaProvisionScript_CredentialProbeIsAPredicate already owns.
+	configs := recorder +
+		"users=no; describe=no\n" +
+		"for arg in \"$@\"; do\n" +
+		"  [ \"$arg\" = users ] && users=yes\n" +
+		"  [ \"$arg\" = --describe ] && describe=yes\n" +
+		"done\n" +
+		"if [ $users = yes ] && [ $describe = yes ]\n" +
+		"then\n" +
+		"  printf 'SCRAM credential configs for user-principal are SCRAM-SHA-512=iterations=8192\\n'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 0\n"
+
+	acls := recorder + "exit 0\n"
+
+	// kafka-get-offsets: `topic:partition:offset` per line, which is the shape
+	// topic_record_state parses. A failing tool is how "unknown" is produced, because that is
+	// how it happens for real — an unreachable broker or a principal without Describe.
+	offsets := recorder +
+		"if [ \"$STUB_RECORD_STATE\" = unknown ]\n" +
+		"then\n" +
+		"  printf 'Error: could not read offsets\\n' >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"topic=\"\"\n" +
+		"args=(\"$@\")\n" +
+		"for ((i=0;i<${#args[@]};i++)); do [ \"${args[i]}\" = --topic ] && topic=\"${args[i+1]}\"; done\n" +
+		"offset=0\n" +
+		"[ \"$STUB_RECORD_STATE\" = records ] && offset=17\n" +
+		"for partition in 0 1 2; do printf '%s:%s:%s\\n' \"$topic\" \"$partition\" \"$offset\"; done\n" +
+		"exit 0\n"
+
+	for name, body := range map[string]string{
+		"kafka-topics":      topics,
+		"kafka-configs":     configs,
+		"kafka-acls":        acls,
+		"kafka-get-offsets": offsets,
+	} {
+		require.NoErrorf(t,
+			os.WriteFile(filepath.Join(stub.binDir, name), []byte(body), 0o700),
+			"writing the %s stub", name)
+	}
+
+	return stub
+}
+
+// seedCatalogue makes the given topics exist at a partition count, so a run can start from a
+// catalogue that is already correct, already under-partitioned, or over-partitioned.
+func (stub kafkaCatalogueStub) seedCatalogue(t *testing.T, partitions int, topics []string) {
+	t.Helper()
+
+	for _, topic := range topics {
+		require.NoError(t, os.WriteFile(
+			filepath.Join(stub.stateDir, topic+".partitions"),
+			[]byte(strconv.Itoa(partitions)), 0o600))
+	}
+}
+
+// partitionsOf reports a topic's partition count on the stubbed broker, or -1 when the topic
+// does not exist. It is how a test checks that the broker ended up where the summary says.
+func (stub kafkaCatalogueStub) partitionsOf(t *testing.T, topic string) int {
+	t.Helper()
+
+	raw, err := os.ReadFile(filepath.Join(stub.stateDir, topic+".partitions")) //nolint:gosec // a path this test wrote
+	if os.IsNotExist(err) {
+		return -1
+	}
+	require.NoErrorf(t, err, "reading the stubbed state of %s", topic)
+
+	count, convErr := strconv.Atoi(strings.TrimSpace(string(raw)))
+	require.NoErrorf(t, convErr, "the stubbed state of %s must be a number", topic)
+
+	return count
+}
+
+// runCatalogueProvisioning executes the real scripts/kafka-provision.sh against a stubbed
+// broker and returns what it printed and did.
+//
+// The environment is built from scratch, as in runProvisioningScript, so an ambient .env or a
+// developer's KAFKA_* variables cannot decide the outcome. The sample subscriber is skipped
+// by default: it needs a credential destination, and it is not what these cases are about.
+func runCatalogueProvisioning(
+	t *testing.T,
+	stub kafkaCatalogueStub,
+	extra map[string]string,
+) catalogueOutcome {
+	t.Helper()
+
+	root := moduleRootDir(t)
+
+	environment := map[string]string{
+		"PATH": stub.binDir + ":/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME": t.TempDir(),
+		// The stub's own channel, read by the four CLI stubs and by nothing in the script.
+		"STUB_LOG":          stub.log,
+		"STUB_STATE":        stub.stateDir,
+		"STUB_ALTER_MODE":   string(stub.alter),
+		"STUB_RECORD_STATE": string(stub.records),
+		"STUB_REPLICATION":  strconv.Itoa(stub.replication),
+
+		"KAFKA_BOOTSTRAP_SERVER": "stub:9092",
+		"KAFKA_SASL_ADMIN_USER":  "admin",
+		// #nosec G101 -- a literal for a stubbed broker that is never contacted.
+		"KAFKA_SASL_ADMIN_SECRET": "AdminSecretForTheStubbedBroker0123456789",
+		// #nosec G101 -- likewise.
+		"KAFKA_PRODUCER_SECRET":        "ProducerSecretForTheStubbedBroker0123456",
+		"KAFKA_SKIP_SAMPLE_SUBSCRIBER": "true",
+
+		"KAFKA_PROVISION_TIMEOUT_SECONDS":       "5",
+		"KAFKA_PROVISION_POLL_INTERVAL_SECONDS": "1",
+		// One replica, matched by the stub's reported factor, so require_topic_replication is
+		// satisfied by an OBSERVED value rather than skipped.
+		"KAFKA_REPLICATION_FACTOR": "1",
+	}
+	for key, value := range extra {
+		if value == "" {
+			delete(environment, key)
+
+			continue
+		}
+
+		environment[key] = value
+	}
+
+	command := exec.Command("bash", filepath.Join(root, "scripts", "kafka-provision.sh")) //nolint:gosec // a fixed path inside the repository
+	command.Dir = root
+	command.Env = make([]string, 0, len(environment))
+	for key, value := range environment {
+		command.Env = append(command.Env, key+"="+value)
+	}
+
+	output, err := command.CombinedOutput()
+
+	recorded, readErr := os.ReadFile(stub.log) //nolint:gosec // a path this test wrote
+	require.NoError(t, readErr, "the stub invocation log must be readable")
+
+	invocations := make([]string, 0, 64)
+	for _, line := range strings.Split(string(recorded), "\n") {
+		if strings.TrimSpace(line) != "" {
+			invocations = append(invocations, strings.TrimSpace(line))
+		}
+	}
+
+	return catalogueOutcome{
+		output:      string(output),
+		succeeded:   err == nil,
+		invocations: invocations,
+		stub:        stub,
+	}
+}
+
+// dispositionSummaryPattern reads the four buckets back out of the script's own output.
+//
+// Parsed from the rendered line rather than computed alongside the script, because the finding
+// is about what the AUDIT TRAIL says: an operator reads these numbers, and a count that is
+// right internally and wrong on screen is the defect.
+var (
+	dispositionTotalPattern   = regexp.MustCompile(`all (\d+) topics are present with a verified geometry`)
+	dispositionCreatedPattern = regexp.MustCompile(`created\s+: (\d+)(?: \(([^)]*)\))?`)
+	dispositionGrownPattern   = regexp.MustCompile(`grown\s+: (\d+)(?: \(([^)]*)\))?`)
+	// A SIGN IS ACCEPTED here deliberately. "unchanged" is the one bucket that is computed by
+	// subtraction rather than counted, so a bucket that stops being subtracted — or one that is
+	// subtracted twice — renders as a negative number. Matching only digits would report that
+	// as "the run printed no unchanged disposition", which sends a reader looking for a missing
+	// line instead of at the arithmetic. Read the sign, then refuse it below.
+	dispositionUnchangedPattern = regexp.MustCompile(`unchanged\s+: (-?\d+)`)
+	dispositionRefusedPattern   = regexp.MustCompile(`under-partitioned : (\d+) \(([^)]*)\)`)
+	// The class that ABSTAINS. It is printed only when it is non-empty — an empty class printed
+	// every run is a line that stops being read — so it is optional here, and it has to be in
+	// the accounting identity below or a raced topic is in no bucket at all and the four figures
+	// silently stop summing to the catalogue.
+	dispositionRacedPattern = regexp.MustCompile(`raced\s+: (\d+) \(([^)]*)\)`)
+)
+
+// dispositions parses the created / grown / unchanged / under-partitioned line.
+func (outcome catalogueOutcome) dispositions(t *testing.T) catalogueDisposition {
+	t.Helper()
+
+	parsed := catalogueDisposition{}
+
+	readCount := func(pattern *regexp.Regexp, label string, required bool) (int, []string) {
+		match := pattern.FindStringSubmatch(outcome.output)
+		if match == nil {
+			require.Falsef(t, required,
+				"the run must print a %q disposition; the summary is the audit trail this "+
+					"whole mechanism exists to produce.\n--- output ---\n%s", label, outcome.output)
+
+			return 0, nil
+		}
+
+		count, err := strconv.Atoi(match[1])
+		require.NoErrorf(t, err, "the %q count must be a number, got %q", label, match[1])
+
+		var named []string
+		if len(match) > 2 && strings.TrimSpace(match[2]) != "" {
+			named = strings.Fields(match[2])
+		}
+
+		return count, named
+	}
+
+	parsed.total, _ = readCount(dispositionTotalPattern, "total", true)
+	parsed.created, parsed.createdNamed = readCount(dispositionCreatedPattern, "created", true)
+	parsed.grown, parsed.grownNamed = readCount(dispositionGrownPattern, "grown", true)
+	parsed.unchanged, _ = readCount(dispositionUnchangedPattern, "unchanged", true)
+	parsed.refused, parsed.refusedNamed = readCount(dispositionRefusedPattern, "under-partitioned", false)
+	parsed.raced, parsed.racedNamed = readCount(dispositionRacedPattern, "raced", false)
+
+	// Held for EVERY case rather than restated in each. A bucket cannot be negative and the
+	// four cannot sum to anything but the catalogue size: either failure means a topic is
+	// counted twice or not at all, and the summary is then not a record of anything.
+	require.GreaterOrEqualf(t, parsed.unchanged, 0,
+		"the unchanged bucket is computed by subtraction, and a negative value means a "+
+			"disposition is being subtracted that was never added, or added twice.\n"+
+			"--- output ---\n%s", outcome.output)
+	require.Equalf(t, parsed.total,
+		parsed.created+parsed.grown+parsed.unchanged+parsed.refused+parsed.raced,
+		"created + grown + unchanged + under-partitioned + raced must equal the catalogue size, "+
+			"or some topic's disposition is unaccounted for.\n--- output ---\n%s", outcome.output)
+
+	return parsed
+}

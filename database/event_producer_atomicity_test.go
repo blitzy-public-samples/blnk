@@ -693,21 +693,111 @@ func TestFinalizeBulkTransactionBatchWithEvent_RefusesAConflictingOutcome(t *tes
 		"a second, different outcome must be refused rather than overwriting the first")
 }
 
-// TestFinalizeBulkTransactionBatchWithEvent_ReportsAnUncoordinatedBatch drives the one
-// degradation the design allows, and pins the code the producer branches on.
-func TestFinalizeBulkTransactionBatchWithEvent_ReportsAnUncoordinatedBatch(t *testing.T) {
+// TestFinalizeBulkTransactionBatchWithEvent_AdoptsAnUncoordinatedBatch is the replacement for
+// the last standalone capture on a producer that has state to be atomic with.
+//
+// A batch whose start-of-batch coordinator write failed used to be reported as ErrNotFound
+// here, and the producer then captured its outcome with a single insert standing outside any
+// transaction — so bulk_transaction.<status> was at-most-once for the whole life of a
+// deployment that had suffered one database blip at the wrong moment. The finalise now ADOPTS
+// such a batch: it writes the terminal coordinator row inside the same transaction as the
+// outcome event, so the two commit together and requirement R-2 holds for this producer
+// unconditionally.
+func TestFinalizeBulkTransactionBatchWithEvent_AdoptsAnUncoordinatedBatch(t *testing.T) {
 	ds := openRealTestDB(t)
+	ctx := context.Background()
 
 	batchID := coordinatedTestBatchID(t, ds)
-	_, err := ds.FinalizeBulkTransactionBatchWithEvent(context.Background(), batchID,
+	event := bulkOutcomeRow(batchID, "applied")
+
+	performed, err := ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID,
+		&model.BulkTransactionBatch{
+			BatchID:          batchID,
+			Status:           model.BulkBatchStatusApplied,
+			TransactionCount: 7,
+		},
+		event)
+
+	require.NoError(t, err,
+		"an unrecorded batch is adopted rather than refused: refusing it sends the producer to a "+
+			"capture that stands outside every transaction")
+	assert.True(t, performed, "the adoption recorded the outcome, so it counts as work performed")
+
+	// BOTH ROWS, or neither. The point of adoption is that the outcome record and its event
+	// share one commit, so the assertion has to be that both landed.
+	var storedStatus string
+	var storedCount int
+	var storedEventID string
+	require.NoError(t, ds.Conn.QueryRowContext(ctx, `
+		SELECT status, transaction_count, event_id
+		FROM blnk.bulk_transaction_batches WHERE batch_id = $1
+	`, batchID).Scan(&storedStatus, &storedCount, &storedEventID))
+
+	assert.Equal(t, model.BulkBatchStatusApplied, storedStatus,
+		"the adopted row is written already-terminal")
+	assert.Equal(t, 7, storedCount, "and carries the outcome the producer computed")
+	assert.Equal(t, event.EventID, storedEventID,
+		"the event id is recorded so the outcome and its event stay joinable")
+
+	var events int
+	require.NoError(t, ds.Conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM blnk.event_outbox WHERE event_id = $1`, event.EventID).Scan(&events))
+	assert.Equal(t, 1, events, "the outcome event committed with the adopted row")
+}
+
+// TestFinalizeBulkTransactionBatchWithEvent_AdoptionIsIdempotent covers the retry of an
+// adoption whose acknowledgement was lost.
+//
+// The event id is derived from the batch, so a second attempt must recognise the outcome it
+// already recorded and stop rather than write a second, differently-identified event for one
+// batch outcome.
+func TestFinalizeBulkTransactionBatchWithEvent_AdoptionIsIdempotent(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	batchID := coordinatedTestBatchID(t, ds)
+	outcome := &model.BulkTransactionBatch{
+		BatchID: batchID, Status: model.BulkBatchStatusApplied, TransactionCount: 2,
+	}
+
+	performed, err := ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID, outcome,
+		bulkOutcomeRow(batchID, "applied"))
+	require.NoError(t, err)
+	require.True(t, performed)
+
+	performed, err = ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID, outcome,
+		bulkOutcomeRow(batchID, "applied"))
+	require.NoError(t, err, "the repeat finds the outcome already recorded and reports success")
+	assert.False(t, performed, "and reports that it performed no transition")
+
+	var events int
+	require.NoError(t, ds.Conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM blnk.event_outbox WHERE event_id = $1`,
+		bulkOutcomeRow(batchID, "applied").EventID).Scan(&events))
+	assert.Equal(t, 1, events, "one batch outcome must produce exactly one event")
+}
+
+// TestFinalizeBulkTransactionBatchWithEvent_RefusesAConflictingAdoptedOutcome keeps adoption
+// from overwriting an answer somebody else already recorded.
+func TestFinalizeBulkTransactionBatchWithEvent_RefusesAConflictingAdoptedOutcome(t *testing.T) {
+	ds := openRealTestDB(t)
+	ctx := context.Background()
+
+	batchID := coordinatedTestBatchID(t, ds)
+	_, err := ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID,
 		&model.BulkTransactionBatch{BatchID: batchID, Status: model.BulkBatchStatusApplied},
 		bulkOutcomeRow(batchID, "applied"))
+	require.NoError(t, err)
 
-	require.Error(t, err)
+	_, err = ds.FinalizeBulkTransactionBatchWithEvent(ctx, batchID,
+		&model.BulkTransactionBatch{BatchID: batchID, Status: model.BulkBatchStatusFailed},
+		bulkOutcomeRow(batchID, "failed"))
+
+	require.Error(t, err, "two different outcomes for one batch must not both be accepted")
 	var apiErr apierror.APIError
 	require.True(t, errors.As(err, &apiErr))
-	assert.Equal(t, apierror.ErrNotFound, apiErr.Code,
-		"the producer distinguishes this from every other failure in order to fall back rather than lose the outcome")
+	assert.Equal(t, apierror.ErrConflict, apiErr.Code,
+		"the caller is told the state disagrees rather than silently having its answer discarded")
 }
 
 // TestFinalizeBulkTransactionBatchWithEvent_RefusesANonTerminalOutcome keeps the coordinator's

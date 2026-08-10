@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1382,6 +1383,209 @@ func TestKubernetesWorkloads_AreHardened(t *testing.T) {
 				workload.manifest, workload.container, image)
 		}
 	})
+
+	// The placeholder above is necessary but not sufficient, and this subtest is the
+	// difference between the two.
+	//
+	// # What was still wrong
+	//
+	// Kubernetes does not validate image references at admission. It accepts
+	// `blnk:REPLACE_WITH_PINNED_DIGEST` as a perfectly well-formed reference, admits the
+	// object, schedules the pod, and the problem surfaces only when the kubelet tries to
+	// pull. So the operator's feedback was an ImagePullBackOff several seconds AFTER an
+	// apply that reported success — on a Deployment that is by then partially rolled out,
+	// with the previous ReplicaSet scaling down and the new one unable to start. The
+	// placeholder made the failure certain; it did not make it early, and "certain but
+	// late" is what turns a thirty-second fix into an incident.
+	//
+	// # Why this is a script rather than more manifest
+	//
+	// Nothing expressible inside a manifest fails before admission: an absent `image` key
+	// is rejected by the API server, but it is also rejected by `kubectl create
+	// --dry-run=client`, which would break the static validation this repository already
+	// runs over the whole folder. The gate therefore has to live outside the YAML, and it
+	// has to be runnable with no cluster and no kubeconfig so CI can run it too.
+	t.Run("a preflight gate refuses an unresolved image before any apply", func(t *testing.T) {
+		script := filepath.Join(root, "scripts", "k8s-preflight.sh")
+
+		st, err := os.Stat(script)
+		require.NoError(t, err,
+			"scripts/k8s-preflight.sh must exist: it is what converts a pull-time "+
+				"ImagePullBackOff into a pre-apply refusal")
+		assert.NotZerof(t, st.Mode().Perm()&0o111,
+			"scripts/k8s-preflight.sh must be committed executable (mode %04o); a gate "+
+				"an operator has to remember to invoke through `bash` is a gate that gets "+
+				"skipped", st.Mode().Perm())
+
+		// EXECUTED, not merely read. A text assertion here would pass against a script
+		// whose logic was inverted, and the whole value of this file is its exit status.
+		manifests := filepath.Join(root, "infrastructure", "k8s-manifests")
+
+		refuse := exec.Command(script, manifests)
+		refuse.Env = append(os.Environ(), "NO_COLOR=1")
+		refusedOutput, refuseErr := refuse.CombinedOutput()
+
+		require.Errorf(t, refuseErr,
+			"the preflight must FAIL against the committed tree, which carries the "+
+				"placeholder by design. A gate that passes here would let the "+
+				"placeholder reach a cluster.\n--- output ---\n%s", refusedOutput)
+		assert.Contains(t, string(refusedOutput), "UNRESOLVED application-image placeholder",
+			"the refusal must name the placeholder as the reason, so the operator knows "+
+				"what to resolve rather than only that something failed")
+		assert.Contains(t, string(refusedOutput), "--render",
+			"the refusal must carry the remedy; a gate that reports a problem without "+
+				"the fix relocates the guesswork rather than removing it")
+
+		// And it must ACCEPT a resolved tree, or it is unusable and will be bypassed.
+		// The digest here is syntactically valid and refers to nothing: the gate checks
+		// the SHAPE of the reference and never contacts a registry, which is what keeps
+		// it runnable in CI with no network.
+		rendered := filepath.Join(t.TempDir(), "rendered")
+		const fakeDigest = "ghcr.io/blnkfinance/blnk@sha256:" +
+			"1111111111111111111111111111111111111111111111111111111111111111"
+
+		accept := exec.Command(script, "--render", rendered, manifests)
+		accept.Env = append(os.Environ(), "NO_COLOR=1", "BLNK_IMAGE="+fakeDigest)
+		acceptedOutput, acceptErr := accept.CombinedOutput()
+
+		require.NoErrorf(t, acceptErr,
+			"the preflight must PASS once the image is resolved to a digest, otherwise "+
+				"there is no way to deploy and the gate gets removed rather than "+
+				"satisfied.\n--- output ---\n%s", acceptedOutput)
+
+		// The rendered tree must actually carry the digest, and must not have left the
+		// `blnk:` prefix stranded in front of it.
+		for _, name := range []string{"server-deployment.yaml", "worker-deployment.yaml"} {
+			body, readErr := os.ReadFile(filepath.Join(rendered, name))
+			require.NoError(t, readErr)
+			assert.NotContainsf(t, string(body), "REPLACE_WITH_PINNED_DIGEST",
+				"%s: rendering must resolve every placeholder occurrence, not the first", name)
+			assert.NotContainsf(t, string(body), "blnk:"+fakeDigest,
+				"%s: the `blnk:` prefix must not survive in front of the resolved "+
+					"reference, which would produce an unpullable image", name)
+			assert.Containsf(t, string(body), fakeDigest,
+				"%s: the rendered manifest must carry the supplied digest", name)
+		}
+
+		// Rendering must be a COPY. An in-place edit would leave a digest in the working
+		// tree that must never be committed, and the next `git status` would invite
+		// exactly that.
+		for _, name := range []string{"server-deployment.yaml", "worker-deployment.yaml"} {
+			body, readErr := os.ReadFile(filepath.Join(manifests, name))
+			require.NoError(t, readErr)
+			assert.Containsf(t, string(body), "REPLACE_WITH_PINNED_DIGEST",
+				"%s: --render must not modify the SOURCE tree; the committed manifests "+
+					"must keep their placeholder", name)
+			assert.NotContainsf(t, string(body), fakeDigest,
+				"%s: --render leaked a resolved digest into the committed tree", name)
+		}
+	})
+
+	// A SHAPE assertion on the one manifest that can silently corrupt a metadata log.
+	//
+	// # What must never exist, and what may
+	//
+	// A SINGLETON kafka-data PersistentVolumeClaim used to exist here, generated by
+	// Kompose. A PVC is ONE claim bound to ONE volume, and ReadWriteOnce means one node may
+	// mount it at a time — while this StatefulSet runs three replicas, each of which needs
+	// its own KRaft metadata log and its own partition segments. Three brokers sharing one
+	// claim either fail to schedule onto separate nodes or, far worse, write concurrently
+	// into a single log directory, which corrupts the metadata log rather than reporting an
+	// error. Nothing ever mounted it either, so applying the folder simply provisioned an
+	// idle volume for someone to find later.
+	//
+	// What is forbidden is therefore the SINGLETON, not the file. A claim whose name is one
+	// of the per-ordinal names Kubernetes derives from the template —
+	// <template>-<statefulset>-<ordinal>, i.e. kafka-data-kafka-0/-1/-2 — is not shared by
+	// anything: the StatefulSet ADOPTS the existing object instead of creating a second, and
+	// pre-provisioning them is the only way to bind a particular PersistentVolume, a named
+	// local disk or a restored snapshot to a particular broker, which one template cannot
+	// express. That is why this file may exist and why pg-data's presence beside
+	// postgres-statefulset.yaml is not the asymmetry it looks like.
+	//
+	// So this asserts SHAPE rather than absence, which is also strictly stronger: an absence
+	// assertion passes on a file that exists with the wrong shape, while this one catches the
+	// singleton, a name no pod will ever ask for, an access mode that contradicts the
+	// template, and a size that silently disagrees with it.
+	t.Run("kafka storage is per-pod only, with no standalone claim to share", func(t *testing.T) {
+		manifests := filepath.Join(root, "infrastructure", "k8s-manifests")
+
+		// And the positive half FIRST: the template is the ONLY declaration the cluster needs,
+		// so it is what everything else is checked against.
+		sts := readYAMLFile(t, filepath.Join(manifests, "kafka-statefulset.yaml"))
+		spec, ok := sts["spec"].(map[string]interface{})
+		require.True(t, ok, "kafka-statefulset.yaml must have a spec")
+
+		templates, ok := spec["volumeClaimTemplates"].([]interface{})
+		require.Truef(t, ok && len(templates) > 0,
+			"kafka-statefulset.yaml must declare volumeClaimTemplates: it is the ONLY "+
+				"declaration of the broker's storage, and without it each pod would get an "+
+				"emptyDir and lose its metadata on every reschedule")
+
+		first, ok := templates[0].(map[string]interface{})
+		require.True(t, ok)
+		meta, ok := first["metadata"].(map[string]interface{})
+		require.True(t, ok, "the claim template must carry metadata")
+		assert.Equal(t, "kafka-data", meta["name"],
+			"the template name is what Kubernetes prefixes onto each ordinal to make "+
+				"kafka-data-kafka-0/-1/-2, and alerts/blnk-kafka-alerts.yml plus the "+
+				"prometheus infra rule match that name pattern")
+
+		// EVERY STANDALONE CLAIM, if the optional pre-provisioning file is present at all,
+		// must be one of the names the template derives. Anything else is a claim no pod will
+		// ever mount, and a claim named `kafka-data` alone is the singleton three brokers
+		// would share.
+		claims := filepath.Join(manifests, "kafka-data-persistentvolumeclaim.yaml")
+		if _, statErr := os.Stat(claims); os.IsNotExist(statErr) {
+			// Equally valid: the StatefulSet creates the same claims itself from the template.
+			return
+		}
+
+		replicas, ok := spec["replicas"].(int)
+		require.Truef(t, ok, "kafka-statefulset.yaml must declare an integer replica count")
+
+		permitted := map[string]bool{}
+		for ordinal := 0; ordinal < replicas; ordinal++ {
+			permitted[fmt.Sprintf("kafka-data-kafka-%d", ordinal)] = true
+		}
+
+		templateSpec, ok := first["spec"].(map[string]interface{})
+		require.True(t, ok, "the claim template must carry a spec")
+
+		found := map[string]bool{}
+		for _, claim := range readYAMLDocuments(t, claims) {
+			if claim["kind"] != "PersistentVolumeClaim" {
+				continue
+			}
+
+			claimMeta, isMap := claim["metadata"].(map[string]interface{})
+			require.True(t, isMap, "every claim must carry metadata")
+			name, _ := claimMeta["name"].(string)
+
+			assert.Truef(t, permitted[name],
+				"kafka-data-persistentvolumeclaim.yaml declares a claim named %q. Only the "+
+					"names Kubernetes derives from the template are adoptable — "+
+					"kafka-data-kafka-0..%d — and a claim named anything else is either the "+
+					"SINGLETON three brokers would share into one KRaft metadata log, or an "+
+					"idle volume no pod will ever mount",
+				name, replicas-1)
+			found[name] = true
+
+			claimSpec, isMap := claim["spec"].(map[string]interface{})
+			require.Truef(t, isMap, "%s must carry a spec", name)
+			assert.Equalf(t, templateSpec["accessModes"], claimSpec["accessModes"],
+				"%s must match the template's access mode, or the StatefulSet refuses to "+
+					"adopt it and the pod stays Pending with no explanation of why", name)
+			assert.Equalf(t, templateSpec["resources"], claimSpec["resources"],
+				"%s must request the same storage as the template, or a broker's retention "+
+					"budget silently differs from the one MAJ-19 derived", name)
+		}
+
+		assert.Len(t, found, replicas,
+			"pre-provisioning is all-or-nothing per ordinal: a partial set leaves the "+
+				"remaining brokers on claims the StatefulSet creates with the template's "+
+				"defaults, which is the asymmetry this file exists to avoid")
+	})
 }
 
 // TestKubernetesConfig_ProjectsCredentialsFromSecrets is the SEC-01 and SEC-07 guard.
@@ -1804,12 +2008,35 @@ func TestPodDisruptionBudgets_GovernEachWorkloadExactlyOnce(t *testing.T) {
 	claimed := map[string][]string{}
 	var budgets int
 
+	// Every budget's selector, and every workload's pod labels, collected in the same pass so
+	// the two can be matched afterwards. A selector that matches no workload is the OTHER
+	// silent shape this file's own documentation warns about: admitted, zero expected pods,
+	// nothing protected.
+	type labelledObject struct {
+		description string
+		namespace   string
+		labels      map[string]interface{}
+	}
+
+	var (
+		budgetSelectors []labelledObject
+		workloads       []labelledObject
+	)
+
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".yaml") {
 			continue
 		}
 
 		for _, document := range readYAMLDocuments(t, filepath.Join(manifestDir, entry.Name())) {
+			if podLabels, namespace, isWorkload := workloadPodLabels(document); isWorkload {
+				workloads = append(workloads, labelledObject{
+					description: workloadDescription(entry.Name(), document),
+					namespace:   namespace,
+					labels:      podLabels,
+				})
+			}
+
 			if document["kind"] != "PodDisruptionBudget" {
 				continue
 			}
@@ -1835,12 +2062,41 @@ func TestPodDisruptionBudgets_GovernEachWorkloadExactlyOnce(t *testing.T) {
 			fingerprint := fmt.Sprintf("%s|%v", metadata["namespace"], labels)
 			claimed[fingerprint] = append(claimed[fingerprint],
 				fmt.Sprintf("%s (%s)", name, entry.Name()))
+
+			budgetNamespace, _ := metadata["namespace"].(string)
+			budgetSelectors = append(budgetSelectors, labelledObject{
+				description: fmt.Sprintf("%s (%s)", name, entry.Name()),
+				namespace:   budgetNamespace,
+				labels:      labels,
+			})
 		}
 	}
 
 	require.NotZero(t, budgets,
 		"the manifest folder must ship PodDisruptionBudgets; without them a single node drain "+
 			"can take every replica of a role")
+
+	require.NotEmpty(t, workloads,
+		"no workload was found to match the budgets against, which means this comparison is "+
+			"vacuous rather than that the budgets are correct")
+
+	for _, budget := range budgetSelectors {
+		var governed []string
+
+		for _, workload := range workloads {
+			if budget.namespace == workload.namespace && labelsSatisfy(workload.labels, budget.labels) {
+				governed = append(governed, workload.description)
+			}
+		}
+
+		assert.NotEmptyf(t, governed,
+			"budget %s selects %v in namespace %q and no workload in this folder carries those "+
+				"pod labels. Such a budget is ADMITTED and reports zero expected pods, so it "+
+				"protects nothing while reading in review as though it did — the same silent "+
+				"shape as the duplication above. Check the selector against the workload's "+
+				"spec.template.metadata.labels",
+			budget.description, budget.labels, budget.namespace)
+	}
 
 	for fingerprint, owners := range claimed {
 		assert.Lenf(t, owners, 1,
@@ -1850,5 +2106,515 @@ func TestPodDisruptionBudgets_GovernEachWorkloadExactlyOnce(t *testing.T) {
 				"these pods during a node drain is whichever was consulted. Keep the one whose "+
 				"name and location state its purpose and delete the other, or give them "+
 				"non-overlapping selectors", fingerprint, len(owners), owners)
+	}
+}
+
+// workloadPodLabels returns the pod-template labels of a workload document.
+//
+// Only the kinds whose pods an eviction can remove are considered, because those are the only
+// ones a PodDisruptionBudget can govern.
+//
+// Parameters:
+//   - document map[string]interface{}: one decoded manifest document.
+//
+// Returns:
+//   - map[string]interface{}: the pod-template labels.
+//   - string: the workload's namespace.
+//   - bool: whether the document was a workload with pod labels at all.
+func workloadPodLabels(document map[string]interface{}) (map[string]interface{}, string, bool) {
+	switch document["kind"] {
+	case "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet":
+	default:
+		return nil, "", false
+	}
+
+	metadata, _ := document["metadata"].(map[string]interface{})
+	namespace, _ := metadata["namespace"].(string)
+
+	spec, isMap := document["spec"].(map[string]interface{})
+	if !isMap {
+		return nil, "", false
+	}
+
+	template, isMap := spec["template"].(map[string]interface{})
+	if !isMap {
+		return nil, "", false
+	}
+
+	templateMetadata, isMap := template["metadata"].(map[string]interface{})
+	if !isMap {
+		return nil, "", false
+	}
+
+	labels, isMap := templateMetadata["labels"].(map[string]interface{})
+	if !isMap || len(labels) == 0 {
+		return nil, "", false
+	}
+
+	return labels, namespace, true
+}
+
+// workloadDescription renders a workload as "kind/name (file)" for a failure message.
+//
+// Parameters:
+//   - fileName string: the manifest file.
+//   - document map[string]interface{}: the workload document.
+//
+// Returns:
+//   - string: the description.
+func workloadDescription(fileName string, document map[string]interface{}) string {
+	metadata, _ := document["metadata"].(map[string]interface{})
+	name, _ := metadata["name"].(string)
+
+	return fmt.Sprintf("%v/%s (%s)", document["kind"], name, fileName)
+}
+
+// labelsSatisfy reports whether every label in a selector is present with the same value in a
+// workload's pod labels, which is what matchLabels means.
+//
+// Parameters:
+//   - podLabels map[string]interface{}: the workload's pod-template labels.
+//   - selector map[string]interface{}: the budget's matchLabels.
+//
+// Returns:
+//   - bool: whether the selector matches.
+func labelsSatisfy(podLabels, selector map[string]interface{}) bool {
+	for key, want := range selector {
+		got, present := podLabels[key]
+		if !present || fmt.Sprint(got) != fmt.Sprint(want) {
+			return false
+		}
+	}
+
+	return len(selector) > 0
+}
+
+// eventStreamingEnvTagPattern extracts the environment variable name from an envconfig tag
+// in config/config.go, restricted to the four families this feature owns.
+//
+// Reading the tags rather than a written-down list is the whole point: a list would be a
+// second copy of the contract, and a second copy is what let eleven documented knobs go
+// unforwarded while every file involved read correctly on its own.
+var eventStreamingEnvTagPattern = regexp.MustCompile(
+	`envconfig:"((?:KAFKA|RELAY|WEBHOOK|EVENT)_[A-Z0-9_]+)"`,
+)
+
+// eventStreamingEnvTags returns every environment variable name config/config.go resolves in
+// the Kafka, relay, webhook-window and event-metrics families.
+//
+// WEBHOOK_DEPRECATION_START_DATE is excluded because it is DERIVED rather than read: the
+// window's opening instant is computed from the sunset date, and config.go carries no
+// envconfig tag for it.
+func eventStreamingEnvTags(t *testing.T) []string {
+	t.Helper()
+
+	source := readRepoFile(t, filepath.Join("config", "config.go"))
+
+	seen := make(map[string]struct{})
+	for _, match := range eventStreamingEnvTagPattern.FindAllStringSubmatch(source, -1) {
+		if strings.HasPrefix(match[1], "WEBHOOK_DEPRECATION_START") {
+			continue
+		}
+
+		seen[match[1]] = struct{}{}
+	}
+
+	require.NotEmpty(t, seen, "config/config.go must declare event-streaming envconfig tags")
+
+	tags := make([]string, 0, len(seen))
+	for tag := range seen {
+		tags = append(tags, tag)
+	}
+
+	return tags
+}
+
+// workerExemptEventStreamingEnv is every event-streaming variable the WORKER service does not
+// receive, each with the reason it does not.
+//
+// It is a declared table rather than an inferred difference so that adding a knob to
+// config.go forces a DECISION about the worker instead of defaulting to silence in either
+// direction: forget to forward one it needs and the test fails, forward one it cannot use and
+// the test fails too. Both mistakes have shipped in this file, in both directions.
+//
+// The role's boundary is ProcessRole.PublishesEvents, an allowlist naming only the server. So
+// the worker builds the no-op publisher, opens no broker connection and administers nothing —
+// while still CAPTURING events into the outbox inside the ledger transaction, which is why the
+// four keys it does receive are the four capture reads.
+var workerExemptEventStreamingEnv = map[string]string{
+	"KAFKA_SUBSCRIBER_BROKERS":        "only credential issuance reports it, and only the server serves that endpoint",
+	"KAFKA_KEY_SCOPE_ENFORCEMENT":     "the same: it gates issuance, which this role does not serve",
+	"KAFKA_KEY_SCOPE_GATEWAY_BROKERS": "the addresses issuance reports under that declaration",
+	"KAFKA_HISTORICAL_TOPIC_PREFIXES": "a new row's topic is composed from the CONFIGURED prefix alone, so the " +
+		"historical list can never decide whether an insert is accepted; only the publisher, the " +
+		"dead-letter write and replay read stored topics, and all three run in the server",
+	"KAFKA_SASL_USER":                             "this role opens no broker connection, so it presents no credential",
+	"KAFKA_SASL_SECRET":                           "the same",
+	"KAFKA_SASL_ADMIN_USER":                       "topic assurance, provisioning, ACL management and offset reads all run in the server",
+	"KAFKA_SASL_ADMIN_SECRET":                     "the same",
+	"KAFKA_TLS_ENABLED":                           "no broker connection to secure",
+	"KAFKA_TLS_CA_FILE":                           "the same",
+	"KAFKA_TLS_CERT_FILE":                         "the same",
+	"KAFKA_TLS_KEY_FILE":                          "the same",
+	"KAFKA_TLS_SERVER_NAME":                       "the same",
+	"KAFKA_TLS_INSECURE_SKIP_VERIFY":              "the same",
+	"KAFKA_INSECURE_LOCAL_DEV":                    "the same",
+	"KAFKA_MIN_PARTITIONS":                        "topic assurance runs in the server, before its relay starts",
+	"KAFKA_REPLICATION_FACTOR":                    "the same",
+	"KAFKA_ALLOW_PARTITION_GROWTH":                "the same",
+	"KAFKA_ALLOW_ADMIN_PRODUCER":                  "it governs how a PUBLISHER authenticates, and this role builds none",
+	"RELAY_RETRY_BASE_BACKOFF_MS":                 "only a relay waits between attempts, and only the server runs one",
+	"RELAY_RETRY_MAX_BACKOFF_MS":                  "the same",
+	"RELAY_EVENT_RETENTION_DAYS":                  "the retention sweeper runs in the server",
+	"RELAY_EVENT_RETENTION_BATCH_SIZE":            "the same",
+	"RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP": "the same",
+	"RELAY_REPAIR_BATCH_SIZE": "the repair sweep runs inside the relay's own tick, and only the " +
+		"server hosts a relay. The worker's capture path writes a row and commits; nothing it " +
+		"does reads how a later sweep is batched",
+	"RELAY_REPAIR_MAX_BATCHES_PER_TICK": "the same: it bounds a sweep the worker never performs",
+	"RELAY_REPAIR_CONCURRENCY": "the same, and it mirrors the publish loop's width, " +
+		"which is a relay-only structure",
+	"RELAY_SUBSCRIBER_METRICS_BUDGET": "the consumer-lag collector needs an admin client, which only the server builds",
+	"EVENT_METRICS_SUBSCRIBER_BUDGET": "the same ceiling under its other published spelling",
+}
+
+// composeServiceEnvironment returns a service's environment block as a map, preserving a nil
+// value for compose's pass-through form.
+//
+// The nil is the load-bearing part. `BLNK_X:` with nothing after the colon copies the variable
+// from .env when it is set there and leaves it ENTIRELY ABSENT when it is not, whereas
+// `BLNK_X: ${BLNK_X:-}` sets it to the empty string — and because applyPrefixedEnvAliases
+// decides on os.LookupEnv, presence rather than non-emptiness, an empty prefixed value WINS
+// over the bare name and blanks it. So the two forms are not interchangeable and this map has
+// to be able to tell them apart.
+func composeServiceEnvironment(t *testing.T, composeFile, service string) map[string]interface{} {
+	t.Helper()
+
+	services := composeServices(t, filepath.Join(moduleRootDir(t), composeFile), composeFile)
+
+	definition, isMap := services[service].(map[string]interface{})
+	require.Truef(t, isMap, "%s must define the %s service", composeFile, service)
+
+	environment, isMap := definition["environment"].(map[string]interface{})
+	require.Truef(t, isMap, "%s: the %s service must declare an environment map", composeFile, service)
+
+	return environment
+}
+
+// eventStreamingKeysOf returns the sorted event-streaming environment keys one service
+// receives in one Compose file, under either spelling.
+func eventStreamingKeysOf(t *testing.T, composeFile, service string) []string {
+	t.Helper()
+
+	environment := composeServiceEnvironment(t, composeFile, service)
+
+	keys := make([]string, 0, len(environment))
+	for key := range environment {
+		trimmed := strings.TrimPrefix(key, "BLNK_")
+		if !strings.HasPrefix(trimmed, "KAFKA_") &&
+			!strings.HasPrefix(trimmed, "RELAY_") &&
+			!strings.HasPrefix(trimmed, "WEBHOOK_") &&
+			!strings.HasPrefix(trimmed, "EVENT_") {
+			continue
+		}
+
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+
+	return keys
+}
+
+// TestCompose_ForwardsEveryEventStreamingKnobTheApplicationResolves is M-10, executed.
+//
+// # The defect
+//
+// config/config.go resolves a knob, .env.example documents it, and nothing forwarded it into
+// the container. Eleven were in that state at once — KAFKA_ALLOW_ADMIN_PRODUCER, the four TLS
+// certificate settings, the three retention settings, and both spellings of the consumer-lag
+// budget — plus BLNK_KAFKA_SUBSCRIBER_BROKERS, which was documented as resolvable under the
+// prefix and forwarded under neither name.
+//
+// The symptom is silence in the direction that reads as success: an operator sets the key in
+// .env, `docker compose up` accepts it, the container never sees it, the application applies
+// its default, and nothing anywhere reports a problem. For a retention period that means no
+// sweeping; for a TLS certificate path it means an unauthenticated client against a broker
+// that accepts both; for the admin-producer switch it means the escape hatch cannot be closed
+// or opened deliberately.
+//
+// # Why this is derived from config.go rather than listed here
+//
+// A list in a test is a second copy of the contract, and the reason eleven knobs drifted is
+// that every copy of the contract read correctly on its own. The tags in config.go are the one
+// definition every other file is a projection of, so this test reads them and compares.
+func TestCompose_ForwardsEveryEventStreamingKnobTheApplicationResolves(t *testing.T) {
+	tags := eventStreamingEnvTags(t)
+
+	for _, composeFile := range composeFiles {
+		t.Run(composeFile, func(t *testing.T) {
+			serverEnv := composeServiceEnvironment(t, composeFile, "server")
+
+			t.Run("the server receives every knob under both of its names", func(t *testing.T) {
+				for _, tag := range tags {
+					_, bare := serverEnv[tag]
+					assert.Truef(t, bare,
+						"%s: the server service must forward %s. config/config.go resolves it and "+
+							".env.example documents it, so an operator who sets it in .env and sees "+
+							"compose accept the bring-up has no way to learn it never reached the "+
+							"process", composeFile, tag)
+
+					_, alias := serverEnv["BLNK_"+tag]
+					assert.Truef(t, alias,
+						"%s: the server service must also forward BLNK_%s. config/config.go "+
+							"documents every one of these keys as resolvable under the BLNK_ prefix, "+
+							"with the prefixed form winning when both are set; a promise that holds "+
+							"for a host-run binary and not for the compose stack is worse than no "+
+							"promise", composeFile, tag)
+				}
+			})
+
+			t.Run("every prefixed alias uses the pass-through form", func(t *testing.T) {
+				// ONLY THE ALIASES OF THIS FAMILY. A top-level setting whose envconfig tag
+				// already carries the prefix — BLNK_ENABLE_OBSERVABILITY,
+				// BLNK_METRICS_BEARER_TOKEN — is resolved by envconfig itself under that one
+				// name, so `${...:-default}` is the right form for it and shipping a default
+				// is the point. The pass-through requirement is specific to the names
+				// applyPrefixedEnvAliases overlays ON TOP OF a bare name.
+				aliases := make(map[string]struct{}, len(tags))
+				for _, tag := range tags {
+					aliases["BLNK_"+tag] = struct{}{}
+				}
+
+				for key, value := range serverEnv {
+					if _, isAlias := aliases[key]; !isAlias {
+						continue
+					}
+
+					assert.Nilf(t, value,
+						"%s: %s must have NOTHING after its colon. `${...}` would set it to the "+
+							"empty string, and applyPrefixedEnvAliases decides on presence rather "+
+							"than non-emptiness — so an empty prefixed value WINS over the bare name "+
+							"and blanks it, disabling the very key it was meant to forward. Got %#v",
+						composeFile, key, value)
+				}
+			})
+
+			t.Run("the worker receives what capture reads and nothing more", func(t *testing.T) {
+				workerEnv := composeServiceEnvironment(t, composeFile, "worker")
+
+				for _, tag := range tags {
+					_, forwarded := workerEnv[tag]
+					reason, exempt := workerExemptEventStreamingEnv[tag]
+
+					switch {
+					case exempt:
+						// LEAST PRIVILEGE, ASSERTED IN THE OTHER DIRECTION. Forwarding a key
+						// this role cannot use is not harmless: for a credential it widens
+						// what a compromise of the process is worth, and for anything else it
+						// implies the role honours a setting it never reads.
+						assert.Falsef(t, forwarded,
+							"%s: the worker service must NOT forward %s — %s", composeFile, tag, reason)
+						_, aliasForwarded := workerEnv["BLNK_"+tag]
+						assert.Falsef(t, aliasForwarded,
+							"%s: nor BLNK_%s, for the same reason — %s", composeFile, tag, reason)
+					default:
+						assert.Truef(t, forwarded,
+							"%s: the worker service must forward %s, or record it in "+
+								"workerExemptEventStreamingEnv with the reason it does not. The "+
+								"worker CAPTURES events into the outbox inside the ledger "+
+								"transaction, so a capture-relevant knob it cannot see is a row "+
+								"written with the wrong destination or the wrong retry budget",
+							composeFile, tag)
+						_, aliasForwarded := workerEnv["BLNK_"+tag]
+						assert.Truef(t, aliasForwarded,
+							"%s: and BLNK_%s, so the prefixed spelling works in both roles",
+							composeFile, tag)
+					}
+				}
+			})
+		})
+	}
+}
+
+// TestCompose_BothProjectionsForwardTheSameEventStreamingKeys asserts the production and
+// development Compose files agree, key for key and role for role.
+//
+// They are edited by hand, in step, and the development one is the copy a contributor reaches
+// for — so a knob added to only one of them produces a stack that behaves differently from the
+// one CI and production run, which is the hardest kind of difference to attribute.
+func TestCompose_BothProjectionsForwardTheSameEventStreamingKeys(t *testing.T) {
+	require.Len(t, composeFiles, 2, "this comparison assumes exactly two projections")
+
+	for _, service := range []string{"server", "worker"} {
+		t.Run(service, func(t *testing.T) {
+			first := eventStreamingKeysOf(t, composeFiles[0], service)
+			second := eventStreamingKeysOf(t, composeFiles[1], service)
+
+			assert.Equal(t, first, second,
+				"%s and %s must forward the SAME event-streaming keys to %s; a key in one and not "+
+					"the other makes the development stack behave differently from the one CI and "+
+					"production run", composeFiles[0], composeFiles[1], service)
+		})
+	}
+}
+
+// TestRelayTarget_RequiresAnActuallyUsableBrokerList is the M-15 guard.
+//
+// # What was wrong
+//
+// `make run_relay` decided whether blnk.json counted as a configured broker source with
+//
+//	grep -q '"brokers"' "${CONFIG_FILE}"
+//
+// and `"kafka": { "brokers": [] }` contains that string. So an empty array passed the check, the
+// target announced the file as its configuration source and started the server — which then
+// resolved no writer, ran no event relay, and left every captured event sitting in
+// blnk.event_outbox at status `pending` while the HTTP API answered normally and every probe
+// stayed green. The whole purpose of the broker check is to refuse exactly that state before it
+// starts, so a check that a declared-but-empty array satisfies is worse than none: it converts a
+// loud misconfiguration into a silent one.
+//
+// `"brokers": [""]` and `"brokers": ["  "]` are the same defect wearing a different hat — a blank
+// string is not a broker, and kafka-go would fail to dial it just as surely.
+//
+// # Why this is asserted behaviourally and not only textually
+//
+// The text assertion pins the fix; the exec assertion pins the BEHAVIOUR, and only the second
+// one would notice a JSON expression that was subtly wrong — a jq filter that returned a
+// non-empty array as false, say, or a python snippet that raised on a missing "kafka" key and
+// was read as success. Both halves are here because the textual one still runs where `make` is
+// not on PATH.
+func TestRelayTarget_RequiresAnActuallyUsableBrokerList(t *testing.T) {
+	root := moduleRootDir(t)
+	makefile := readRepoFile(t, "makefile")
+
+	// COMMENTS ARE STRIPPED BEFORE THE ABSENCE IS ASSERTED, the same rule
+	// event_loadtest_contract_test.go applies for the same reason. The rationale comment above
+	// the replacement target deliberately QUOTES the old `grep -q '"brokers"'` form while
+	// explaining why it was wrong, and prose that names a removed construct must not be able to
+	// fail an assertion about code.
+	recipes := make([]string, 0, 64)
+	for _, line := range strings.Split(makefile, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		recipes = append(recipes, line)
+	}
+	executable := strings.Join(recipes, "\n")
+
+	assert.NotContains(t, executable, `grep -q '"brokers"'`,
+		"makefile: a substring test for \"brokers\" is satisfied by an EMPTY array, which is "+
+			"the misconfiguration the check exists to refuse. Parse the array instead")
+	assert.Contains(t, executable, "BROKER_ARRAY_DECLARED",
+		"makefile: run_server_relay must delegate the broker-array question to something that "+
+			"actually parses JSON")
+
+	// AND IT MUST NOT DO SO WITH $(MAKE). GNU make executes any recipe line containing $(MAKE)
+	// even under -n, so that a sub-make can print its own commands. run_server_relay's recipe is
+	// a single backslash-continued line ending in `exec ./blnk start`, so a $(MAKE) anywhere in
+	// it turns `make -n run_relay` into a real server start. That is not cosmetic: the server
+	// hosts the event relay, the relay claims blnk.event_outbox rows, and the event and outbox
+	// suites require it to be DOWN. The first version of this fix had exactly that bug.
+	relayRecipe := executable
+	if start := strings.Index(relayRecipe, "\nrun_server_relay:\n"); start >= 0 {
+		relayRecipe = relayRecipe[start:]
+		if end := strings.Index(relayRecipe, "\nexec ./"); end >= 0 {
+			relayRecipe = relayRecipe[:end]
+		}
+	}
+	assert.NotContains(t, relayRecipe, "$(MAKE)",
+		"makefile: run_server_relay must not invoke $(MAKE). Make runs such a line even under "+
+			"-n, so `make -n run_relay` would reach `exec ./blnk start` and actually start a "+
+			"server. Expand a variable instead")
+
+	if _, err := exec.LookPath("make"); err != nil {
+		t.Skip("make is not on PATH; the textual assertions above still applied")
+	}
+
+	// Each shape, and the answer the relay target depends on. rc 0 means "declared and
+	// usable", any non-zero means "do not treat this file as a broker source".
+	for _, shape := range []struct {
+		name    string
+		config  string
+		usable  bool
+		because string
+	}{
+		{
+			name:    "empty array",
+			config:  `{"kafka":{"brokers":[]}}`,
+			usable:  false,
+			because: "this is the original defect: the key is present and there is no broker",
+		},
+		{
+			name:    "single blank entry",
+			config:  `{"kafka":{"brokers":[""]}}`,
+			usable:  false,
+			because: "an empty string is not an address kafka-go can dial",
+		},
+		{
+			name:    "whitespace-only entry",
+			config:  `{"kafka":{"brokers":["   "]}}`,
+			usable:  false,
+			because: "whitespace is not an address either, and trims to nothing",
+		},
+		{
+			name:    "no brokers key",
+			config:  `{"kafka":{}}`,
+			usable:  false,
+			because: "the kafka block exists but declares no brokers",
+		},
+		{
+			name:    "no kafka block",
+			config:  `{}`,
+			usable:  false,
+			because: "a config file with no kafka block declares no brokers",
+		},
+		{
+			name:    "brokers is a string, not an array",
+			config:  `{"kafka":{"brokers":"a:9092"}}`,
+			usable:  false,
+			because: "the field is []string; a bare string is malformed and must not be guessed at",
+		},
+		{
+			name:    "not JSON at all",
+			config:  `this is not json`,
+			usable:  false,
+			because: "an unparseable file must not be reported as a configured source",
+		},
+		{
+			name:    "one real broker",
+			config:  `{"kafka":{"brokers":["kafka:9092"]}}`,
+			usable:  true,
+			because: "this is the case the relay target must accept",
+		},
+		{
+			name:    "a blank entry alongside a real one",
+			config:  `{"kafka":{"brokers":["","kafka:9092"]}}`,
+			usable:  true,
+			because: "one usable address is enough to bootstrap; kafka-go discovers the rest",
+		},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "blnk.json")
+			require.NoError(t, os.WriteFile(path, []byte(shape.config), 0o600))
+
+			cmd := exec.Command("make", "--no-print-directory", "-s",
+				"_brokers_declared_in_file", "CONFIG_FILE="+path)
+			cmd.Dir = root
+			output, err := cmd.CombinedOutput()
+
+			if shape.usable {
+				assert.NoErrorf(t, err,
+					"%s must be reported as a usable broker source (%s).\n--- output ---\n%s",
+					shape.config, shape.because, output)
+				return
+			}
+			assert.Errorf(t, err,
+				"%s must NOT be reported as a usable broker source (%s). Accepting it starts a "+
+					"server whose relay never runs, with events accumulating in the outbox "+
+					"behind a healthy-looking API.\n--- output ---\n%s",
+				shape.config, shape.because, output)
+		})
 	}
 }

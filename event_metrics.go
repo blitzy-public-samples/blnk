@@ -62,26 +62,28 @@ limitations under the License.
 // the cost of the queries behind it. Collecting far more often than the scrape would spend
 // database and broker round trips producing values nothing reads.
 //
-// # Where this must be started
+// # Where this is started
 //
-// In the SERVER role, in cmd/server.go, immediately alongside the existing lineage outbox
-// processor, using the same construct / start / defer-stop shape that file already applies
-// to LineageOutboxProcessor and the chain processor:
-//
-//	collector := blnk.NewBlnkEventMetricsCollector(b.blnk, deadLetterService, kafkaAdmin)
-//	collector.Start(ctx)
-//	defer collector.Stop()
+// In the SERVER role, by startEventMetricsCollector in cmd/server.go, alongside the
+// existing lineage outbox processor and using the same construct / start / stop shape that
+// file already applies to LineageOutboxProcessor and the chain processor. That function
+// owns the wiring — the dead-letter service, the Kafka admin client and the measurement
+// budget — and returns the stop closure the server's shutdown path calls.
 //
 // The server role rather than the worker role, for the same reason the lineage relay lives
 // there: it is where the outbox background work already runs, and hosting it here avoids
 // adding a fourth asynq server. Starting it in BOTH roles would be actively wrong — two
 // collectors would write the same gauges from two processes and each would zero the other's
-// series as stale.
+// series as stale. Across REPLICAS of the server role the same hazard is answered by the
+// event maintenance lease, which cmd/server.go evaluates before starting the collector, so
+// that one replica maintains the gauges while the others leave them alone; a replica that
+// cannot reach the database to evaluate the lease says so and runs ungated rather than
+// leaving the gauges unmaintained.
 //
-// Until that call exists those gauges have no maintainer and none of the thirteen rules in
-// alerts/blnk-kafka-alerts.yml can fire, which is the precise defect this file was added
-// to fix. NewBlnkEventMetricsCollector is deliberately a one-liner so the wiring cannot
-// pair one instance's datasource with another's admin client.
+// Without that call these gauges would have no maintainer and none of the thirteen rules in
+// alerts/blnk-kafka-alerts.yml could fire, which is the defect this file exists to prevent.
+// NewBlnkEventMetricsCollector is deliberately a one-liner so the wiring cannot pair one
+// instance's datasource with another's admin client.
 package blnk
 
 import (
@@ -145,11 +147,15 @@ const (
 	// independent of the page size and of the registry's growth.
 	lagMeasurementConcurrency = 8
 
-	// outboxBacklogCountWindow is the window the backlog gauge passes to the per-status
-	// count. It bounds ONLY the dispatched count, which the gauge never reads; pending and
-	// processing are always exact and complete, which is what a backlog gauge requires
-	// (PERF-P04).
-	outboxBacklogCountWindow = 24 * time.Hour
+	// outboxBacklogCountWindow WAS RETIRED HERE (PERF-M05).
+	//
+	// It was the twenty-four-hour window the backlog gauge passed to the per-status count, and
+	// its own comment said the window bounded only the dispatched count "which the gauge never
+	// reads". That was accurate and was the problem: the gauge paid for an exact count of a
+	// day of dispatched history — 43.2 million index entries at the target rate — every
+	// fifteen seconds, and discarded it. There is no window to name any more, because
+	// CountUnresolvedEventOutbox does not take one: every status the gauge reads is counted in
+	// full and for all time, which is what a backlog gauge requires.
 
 	// lagReadingTTL is how long a consumer-lag reading is exported after it was taken.
 	//
@@ -203,6 +209,8 @@ const (
 	collectionRevocations       = "subscriber_revocations"
 	collectionSubscriberLag     = "subscriber_lag"
 	collectionSubscriberListing = "subscriber_listing"
+	collectionSettlement        = "subscriber_settlement"
+	collectionAccessResidue     = "subscriber_access_residue"
 )
 
 // lagReading is one retained consumer-lag reading and when it was taken.
@@ -219,15 +227,23 @@ type lagReading struct {
 // cost of observing the backlog grow with the backlog — worst exactly when the system is
 // already struggling.
 type eventMetricsOutboxStore interface {
-	// CountEventOutboxByStatus returns a status-keyed count of outbox rows. A status
-	// with no rows is ABSENT from the map rather than present with a zero, which is what
-	// makes the two-value read below mandatory.
+	// CountUnresolvedEventOutbox returns a status-keyed count of every NON-DISPATCHED
+	// status, exact and complete for all time. A status with no rows is ABSENT from the map
+	// rather than present with a zero, which is what makes the two-value read below
+	// mandatory.
 	//
-	// The window bounds ONLY the dispatched count (PERF-P04), which this collector never
-	// reads: the backlog gauge is the sum of pending and processing, both of which are
-	// counted exactly and in full however short the window — a row pending for three days
-	// must still appear in the backlog it is the point of.
-	CountEventOutboxByStatus(ctx context.Context, since time.Time) (map[string]int64, error)
+	// IT TAKES NO WINDOW, and that is why this collector uses it (PERF-M05). It used to
+	// call CountEventOutboxByStatus with a twenty-four-hour window and a comment saying the
+	// window bounded only the dispatched count, "which this collector never reads" — which
+	// was true, and meant every collection paid for an exact count of 43.2 million
+	// dispatched index entries at the target rate to produce a number that was thrown away.
+	// Fifteen seconds apart, that is a scan that never stops running.
+	//
+	// Every figure this collector publishes comes from a non-dispatched status: the backlog
+	// gauge is pending plus processing, and the two repair backlogs are `failed` and
+	// `webhook_pending`. All four are counted in full here, which the gauges require — a row
+	// pending for three days must still appear in the backlog it is the point of.
+	CountUnresolvedEventOutbox(ctx context.Context) (map[string]int64, error)
 }
 
 // eventMetricsSubscriberStore is the registry surface the lag gauge needs.
@@ -785,6 +801,20 @@ type EventMetricsReport struct {
 	// processing rows.
 	PendingBacklog int64
 
+	// DeadLetterRepairBacklog and LegacyWebhookRepairBacklog are the two REPAIR backlogs
+	// published to metrics.EventRepairBacklog, taken from the same per-status aggregate
+	// PendingBacklog comes from.
+	//
+	// They are DISJOINT from PendingBacklog rather than a subset of it: a row owing a
+	// `<topic>.dlt` write is `failed` and a row owing a legacy webhook enqueue is
+	// `webhook_pending`, and neither status is counted by the pending gauge. Carried on the
+	// report as well as on the gauge so the collector's own log line states them, which is
+	// what makes them visible on a deployment with no metrics exporter configured.
+	//
+	// SUNSET: LegacyWebhookRepairBacklog goes with the dual-delivery branch.
+	DeadLetterRepairBacklog    int64
+	LegacyWebhookRepairBacklog int64
+
 	// DeadLetterAge is the dead-letter age report, when that collection succeeded.
 	DeadLetterAge DeadLetterAgeReport
 
@@ -925,6 +955,8 @@ type EventMetricsReport struct {
 func (r EventMetricsReport) LogFields() logrus.Fields {
 	return logrus.Fields{
 		"pending_backlog":           r.PendingBacklog,
+		"dlt_repair_backlog":        r.DeadLetterRepairBacklog,
+		"webhook_repair_backlog":    r.LegacyWebhookRepairBacklog,
 		"dead_letter_age":           r.DeadLetterAge.OldestAge().String(),
 		"dlt_outstanding":           r.DeadLetterAge.Outstanding,
 		"dlt_rows_scanned":          r.DeadLetterAge.Scanned,
@@ -1018,12 +1050,13 @@ func (c *EventMetricsCollector) collectOutboxBacklog(ctx context.Context, report
 	call, cancel := c.callContext(ctx)
 	defer cancel()
 
-	// The window bounds ONLY the dispatched count, which this gauge never reads: pending and
-	// processing are always counted in full, so the backlog stays exact however much dispatched
-	// history has accumulated behind it.
-	counts, err := c.outbox.CountEventOutboxByStatus(call, time.Now().UTC().Add(-outboxBacklogCountWindow))
+	// THE UNRESOLVED INVENTORY ONLY, and no window (PERF-M05). Every status this gauge reads
+	// is non-dispatched, so it is counted exactly and in full here, and the dispatched history
+	// this collector never looked at is not counted at all — which removes a 43.2-million-entry
+	// index scan from every fifteen-second tick at the target rate.
+	counts, err := c.outbox.CountUnresolvedEventOutbox(call)
 	if err != nil {
-		report.Failures = append(report.Failures, fmt.Errorf("counting the event outbox by status: %w", err))
+		report.Failures = append(report.Failures, fmt.Errorf("counting the unresolved event outbox: %w", err))
 		recordCollectionFailure(ctx, collectionOutboxBacklog)
 
 		return
@@ -1031,6 +1064,27 @@ func (c *EventMetricsCollector) collectOutboxBacklog(ctx context.Context, report
 
 	backlog := counts[model.EventOutboxStatusPending] + counts[model.EventOutboxStatusProcessing]
 	report.PendingBacklog = backlog
+
+	// THE REPAIR BACKLOGS, from the counts already in hand (PERF-M06). No second query: the
+	// aggregate above counts every non-dispatched status exactly and in full, and these two
+	// statuses ARE the two repair legs' owed work.
+	//
+	// They are NOT part of `backlog` above and never were, which is the gap this closes. That
+	// gauge is pending plus processing, and a row owing a dead-letter write is `failed` while a
+	// row owing a legacy webhook enqueue is `webhook_pending` — so a repair backlog of half a
+	// million rows read as a drained outbox on every dashboard while the dead-letter age alert
+	// fired. See metrics.EventRepairBacklog.
+	report.DeadLetterRepairBacklog = counts[model.EventOutboxStatusFailed]
+	report.LegacyWebhookRepairBacklog = counts[model.EventOutboxStatusWebhookPending]
+
+	if metrics.EventRepairBacklog != nil {
+		// Recorded including the zeros, for the same reason the pending gauge is: a cleared
+		// backlog must publish 0 rather than leave the previous reading standing.
+		metrics.EventRepairBacklog.Record(ctx, report.DeadLetterRepairBacklog,
+			otelmetric.WithAttributes(attribute.String("leg", repairLegDeadLetter)))
+		metrics.EventRepairBacklog.Record(ctx, report.LegacyWebhookRepairBacklog,
+			otelmetric.WithAttributes(attribute.String("leg", repairLegLegacyWebhook)))
+	}
 
 	if metrics.OutboxPendingBacklog == nil {
 		return
@@ -1173,6 +1227,12 @@ func (c *EventMetricsCollector) collectSubscriberSettlement(ctx context.Context,
 	if err != nil {
 		report.Failures = append(report.Failures,
 			fmt.Errorf("counting outstanding subscriber settlement obligations: %w", err))
+		// Counted as well as reported. A caller inspecting the report sees this failure; a
+		// dashboard does not, and every gauge above simply keeps its previous value — so
+		// without the counter a settlement backlog that stopped being measurable is
+		// indistinguishable from one that stopped growing. EventMetricsCollectionFailing says
+		// that SOMETHING is failing; this attribute is what says which dependency.
+		recordCollectionFailure(ctx, collectionSettlement)
 
 		return
 	}
@@ -1726,6 +1786,16 @@ func (c *EventMetricsCollector) publishSweepCoverage(
 // publishSweepCoverage, because the reason decides the remediation and only 'budget' is
 // answered by configuration. Summing the reasons away recovers this number.
 //
+// # THE BUDGET IS PUBLISHED BESIDE IT, and that is what makes headroom portable
+//
+// Headroom is budget minus registry size. The registry size had a series and the budget did not,
+// so the documented query named the DEFAULT as a literal — `200 - blnk_subscribers_registered` —
+// which is wrong on every deployment that raised it, and wrong in the direction that matters: a
+// deployment running 1000 was shown exhaustion eight hundred subscribers early. Exporting the
+// CONFIGURED value from this same call turns the query into a difference of two series and makes
+// it true everywhere. It is published on every tick for the same reason the size is: a level
+// written only when a sweep ran cannot be told apart from a stopped collector.
+//
 // Parameters:
 //   - ctx context.Context: passed to the instrument.
 //   - report *EventMetricsReport: read for the registry size, already counted.
@@ -1735,6 +1805,15 @@ func (c *EventMetricsCollector) publishCoverage(ctx context.Context, report *Eve
 	// would take down the process it is observing.
 	if metrics.SubscribersRegistered != nil {
 		metrics.SubscribersRegistered.Record(ctx, report.SubscribersRegistered)
+	}
+
+	if metrics.SubscriberMeasurementBudget != nil {
+		// THE SAME FIELD THE SWEEP BOUNDS ITSELF BY, read rather than re-derived, so the
+		// exported number cannot disagree with the behaviour it describes. NewEventMetrics
+		// Collector seeds it from DefaultSubscriberMetricsBudget and WithSubscriberBudget
+		// refuses a non-positive override, so what is published is always the figure
+		// collectSubscriberLag will stop at.
+		metrics.SubscriberMeasurementBudget.Record(ctx, int64(c.subscriberBudget))
 	}
 }
 
@@ -2134,6 +2213,12 @@ func (c *EventMetricsCollector) collectSubscriberAccessResidue(ctx context.Conte
 	if err != nil {
 		report.Failures = append(report.Failures,
 			fmt.Errorf("counting unaccounted subscriber access: %w", err))
+		// Counted as well as reported, and this collection is the one where it matters most:
+		// the figures it publishes are unaccounted BROKER ACCESS, so "the last four readings
+		// were zero and the query has been failing since" must not look like "nothing is
+		// unaccounted for". ResidueMeasured carries that to a caller holding the report; this
+		// counter carries it to whoever is only watching the metrics.
+		recordCollectionFailure(ctx, collectionAccessResidue)
 
 		return
 	}

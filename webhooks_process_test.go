@@ -33,13 +33,14 @@ limitations under the License.
 // measured against; deleting it LATER leaves a test file with nothing to compile against.
 //
 // WHAT MUST NOT GO WITH IT. Two behaviours asserted here outlive this file because the
-// symbols that own them do: the NewWebhook envelope, which relocates to event_outbox.go and
-// IS the payload every LedgerEvent carries, and the getEventFromStatus vocabulary, which
-// relocates to event_topics.go. Their coverage lives on where they land — event_outbox_test.go
-// and event_topics_test.go — so the sunset deletion loses no assertion about either. The
-// getEventFromStatus tests at the foot of this file are deliberate duplicates of that
-// vocabulary from the payload contract's side, kept here for as long as this file is the home
-// of the contract.
+// symbols that own them do — and both symbols have ALREADY MOVED: the NewWebhook envelope,
+// which IS the payload every LedgerEvent carries, now lives in event_outbox.go, and the
+// getEventFromStatus vocabulary now lives in event_topics.go. Their coverage lives where they
+// landed — TestEventOutboxSource_HoldsTheRelocatedPayloadContract and
+// TestEventTopicsSource_HoldsTheRelocatedTransactionVocabulary each guard the declaration and
+// the invariant in both directions — so the sunset deletion loses no assertion about either.
+// The getEventFromStatus tests at the foot of this file are deliberate duplicates of that
+// vocabulary from the transport's side, and they go with this file.
 //
 // Nothing in this file may assert /hooks behaviour. The webhook asynq QUEUE is shared with
 // transaction hooks and TypeSense indexing and survives the sunset untouched; only the
@@ -53,6 +54,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -170,6 +172,21 @@ func legacyWebhookUniqueQueueName(t *testing.T, prefix string) string {
 // in its output would explain. The cleanup also empties and removes the queue, so a failed
 // assertion does not leave tasks behind for the next run to trip over.
 //
+// # Why the cleanup's own errors are asserted
+//
+// The three cleanup calls used to discard their errors to `_`. That made the cleanup a
+// statement of intent rather than a fact: a Redis that had gone away, an authentication
+// failure, or a queue asynq declined to delete all left tasks and the queue itself behind
+// while reporting nothing. The cost lands on a LATER test — this package shares one Redis
+// with every other clone on the host, and a leftover queue is exactly the contamination the
+// unique per-clone queue names exist to prevent. A cleanup that cannot fail cannot be relied
+// on, so each call is now asserted with the same discipline listLegacyPendingTasks applies to
+// listing: ErrQueueNotFound is legitimate, because asynq creates a queue lazily on first
+// enqueue and several of these tests deliberately enqueue nothing; every other error fails.
+//
+// assert rather than require, because a cleanup that stops at its first problem hides the
+// rest, and all three of these are worth knowing about together.
+//
 // Parameters:
 //   - t *testing.T: the test owning the inspector.
 //   - addr string: the Redis address, from legacyWebhookRedisAddr.
@@ -182,13 +199,78 @@ func newLegacyWebhookInspector(t *testing.T, addr, queueName string) *asynq.Insp
 
 	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: addr})
 	t.Cleanup(func() {
-		_, _ = inspector.DeleteAllPendingTasks(queueName)
-		_, _ = inspector.DeleteAllCompletedTasks(queueName)
-		_ = inspector.DeleteQueue(queueName, true)
+		_, err := inspector.DeleteAllPendingTasks(queueName)
+		assertLegacyQueueCleanupSucceeded(t, err, "delete the pending tasks of", queueName)
+
+		_, err = inspector.DeleteAllCompletedTasks(queueName)
+		assertLegacyQueueCleanupSucceeded(t, err, "delete the completed tasks of", queueName)
+
+		// force=true, so a non-empty queue is deleted rather than refused; ErrQueueNotEmpty
+		// therefore cannot be the reason this fails and is not tolerated below.
+		err = inspector.DeleteQueue(queueName, true)
+		assertLegacyQueueCleanupSucceeded(t, err, "delete", queueName)
+
 		assert.NoError(t, inspector.Close(), "the inspector's Redis connection must be released")
 	})
 
 	return inspector
+}
+
+// legacyQueueMissing reports whether err is asynq saying the queue does not exist.
+//
+// # Why one of the two shapes is matched on its message
+//
+// asynq v0.25.1 reports the same condition two different ways, and only one of them is
+// reachable through a sentinel. DeleteQueue and the List*Tasks family translate it to the
+// exported asynq.ErrQueueNotFound (inspector.go:228,244), so errors.Is answers for them. The
+// DeleteAll*Tasks family returns what its RDB layer produced untranslated (inspector.go:532),
+// and that is errors.E(errors.Internal, &errors.QueueNotFoundError{…}) from asynq's INTERNAL
+// errors package (internal/rdb/inspect.go:451) — a type this module cannot import and one that
+// does not wrap the exported sentinel. There is no exported discriminator for that call path.
+//
+// The message match is therefore the only observation available, and it is made as narrow as
+// possible: the rendered error must name THIS queue as not existing, so an internal error about
+// anything else — a Redis command failure, a permission problem — still fails the cleanup. The
+// asynq version is named above so that an upgrade which adds a sentinel is a prompt to delete
+// this half rather than a silent inheritance.
+//
+// Parameters:
+//   - err error: the error to classify; must not be nil.
+//   - queueName string: the queue the caller was operating on.
+//
+// Returns:
+//   - bool: true when err means only that the queue has never existed.
+func legacyQueueMissing(err error, queueName string) bool {
+	if errors.Is(err, asynq.ErrQueueNotFound) {
+		return true
+	}
+
+	return strings.Contains(err.Error(), fmt.Sprintf("queue %q does not exist", queueName))
+}
+
+// assertLegacyQueueCleanupSucceeded fails the test unless err is nil or the queue simply
+// never existed.
+//
+// A missing queue is legitimate here and expected often: asynq creates a queue lazily on first
+// enqueue, and several of these tests exist precisely to prove that NOTHING was enqueued.
+//
+// Parameters:
+//   - t *testing.T: the test, for Helper and failure reporting.
+//   - err error: the error the cleanup call returned.
+//   - action string: what was being attempted, for the failure message.
+//   - queueName string: the queue involved.
+func assertLegacyQueueCleanupSucceeded(t *testing.T, err error, action, queueName string) {
+	t.Helper()
+
+	if err == nil || legacyQueueMissing(err, queueName) {
+		return
+	}
+
+	assert.Failf(t, "queue cleanup failed",
+		"could not %s queue %q: %v. The queue and its tasks are left behind on a Redis this "+
+			"package SHARES with every other clone on the host, so the next run of any test "+
+			"that inspects a queue may see them",
+		action, queueName, err)
 }
 
 // listLegacyPendingTasks lists a queue's pending tasks, accepting ONLY "the queue does not

@@ -12,3 +12,10 @@ CLAUDE.md
 __pycache__
 tests/loadtest/*.json
 tests/loadtest/*.ndjson
+
+# Rendered Kubernetes manifests, produced by `make k8s_render` / scripts/k8s-preflight.sh
+# --render. These are COPIES of infrastructure/k8s-manifests with the application image
+# resolved to a concrete digest, and they must never be committed: the committed manifests
+# deliberately carry an unresolvable placeholder so that an apply cannot silently run a
+# build other than the one intended. A digest checked in here would defeat that.
+/rendered/

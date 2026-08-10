@@ -40,7 +40,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,18 +81,23 @@ func subscribersRequest(t *testing.T, method, target string) *httptest.ResponseR
 // refused me" from "the route prefix is missing from the authorization
 // middleware" — a real failure mode for a new prefix, and one that would make
 // every test here pass for the wrong reason.
+//
+// The diagnostics are SANITISED because this helper is used on the credential route as well as on
+// the read routes: an assertion expecting a refusal renders its message when the request
+// SUCCEEDED, and a successful credential response carries a plaintext SASL password. Decoding
+// still runs against the untouched body, so nothing about what is asserted changes.
 func assertSubscribersErrorCode(t *testing.T, recorder *httptest.ResponseRecorder, status int, code string) {
 	t.Helper()
 
-	require.Equal(t, status, recorder.Code, "body: %s", recorder.Body.String())
+	require.Equal(t, status, recorder.Code, safeResponseBody(recorder))
 
 	var body struct {
 		ErrorDetail struct {
 			Code string `json:"code"`
 		} `json:"error_detail"`
 	}
-	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body), "body: %s", recorder.Body.String())
-	assert.Equal(t, code, body.ErrorDetail.Code, "body: %s", recorder.Body.String())
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body), safeResponseBody(recorder))
+	assert.Equal(t, code, body.ErrorDetail.Code, safeResponseBody(recorder))
 }
 
 // TestSubscriberRoutes_RequireTheMasterKey pins the gate on every route in the
@@ -189,6 +196,91 @@ func TestSubscriberRoute_AcceptsAGeneratedIdentifier(t *testing.T) {
 	assertSubscribersErrorCode(t, recorder, http.StatusNotFound, "SUBSCRIBER_NOT_FOUND")
 }
 
+// subscribersSlowWorkDrainBudget bounds how long a subtest waits for an ABANDONED
+// issuance goroutine to exit after it has been released.
+//
+// The wait itself is the point — see parkedIssuance — and this is only its ceiling.
+// It is generous because the released goroutine has nothing left to do but return,
+// so anything approaching this value means it never observed the release at all.
+const subscribersSlowWorkDrainBudget = 5 * time.Second
+
+// parkedIssuance builds an issuance fake that BLOCKS until this subtest releases it,
+// and guarantees the released goroutine is gone before the subtest ends.
+//
+// # Why the fakes here must park rather than sleep
+//
+// issueWithinBudget abandons work that overruns its budget: it returns while the
+// goroutine is still running. A fake that stood in for that overrun by sleeping for a
+// fixed duration — a bare `<-time.After(time.Minute)` was what these tests used —
+// leaves a goroutine parked for the remaining lifetime of the TEST BINARY, holding
+// everything it captured. A leaked goroutine is not a harmless one: `go test -race`
+// accounts for every live goroutine, a panic dump lists it against whichever test
+// happens to be running when the dump is taken, and one leaked per subtest is how a
+// package comes to exhaust its own scheduler.
+//
+// # Why it parks on this channel and NOT on the context it is handed
+//
+// issueWithinBudget passes the work the SAME context it selects on. Work that
+// returned as soon as that context was done would make both of those select arms
+// ready at once, and `completed` would then come out true or false depending on the
+// scheduler — turning the property under test into a coin flip. The release channel
+// is an input this subtest controls, so the abandonment is deterministic.
+//
+// # What the cleanup adds
+//
+// Releasing and then WAITING makes the abandonment observable rather than merely
+// tolerated: the work is proven to have been left running at the moment
+// issueWithinBudget returned, and proven to be gone before the subtest ends. The wait
+// is bounded because an unbounded one would hang the whole binary — taking every
+// unrelated package with it and reporting nothing, since a killed binary loses its
+// buffered output.
+//
+// The returned started channel closes when the work is entered. Asserting on it is
+// what separates "the work was abandoned" from "the work was never invoked", which
+// are different behaviours with the same observable result at the call site.
+func parkedIssuance(t *testing.T) (
+	issue func(context.Context, string) (blnk.SubscriberCredential, error),
+	started <-chan struct{},
+	hasFinished func() bool,
+) {
+	t.Helper()
+
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	begun := make(chan struct{})
+
+	t.Cleanup(func() {
+		close(release)
+
+		select {
+		case <-finished:
+		case <-time.After(subscribersSlowWorkDrainBudget):
+			t.Errorf("the abandoned issuance work did not exit within %s of being released, so it "+
+				"is still holding whatever it captured", subscribersSlowWorkDrainBudget)
+		}
+	})
+
+	issue = func(context.Context, string) (blnk.SubscriberCredential, error) {
+		defer close(finished)
+		close(begun)
+
+		<-release
+
+		return blnk.SubscriberCredential{}, nil
+	}
+
+	hasFinished = func() bool {
+		select {
+		case <-finished:
+			return true
+		default:
+			return false
+		}
+	}
+
+	return issue, begun, hasFinished
+}
+
 // TestIssueWithinBudget_AnswersOnTimeWhenTheIssuanceOverrunsIt is C-23, and it is
 // the only place the ceiling can be asserted as a property of the request.
 //
@@ -216,21 +308,13 @@ func TestIssueWithinBudget_AnswersOnTimeWhenTheIssuanceOverrunsIt(t *testing.T) 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	started := make(chan struct{})
-	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
+	// Blocks past the budget, standing in for an issuance that is still compensating on
+	// its own detached context.
+	issue, started, _ := parkedIssuance(t)
 
 	began := time.Now()
 
-	credential, err, completed := issueWithinBudget(ctx, "sub_9f1c8a72",
-		func(context.Context, string) (blnk.SubscriberCredential, error) {
-			close(started)
-			// Blocks past the budget, standing in for an issuance that is still
-			// compensating on its own detached context.
-			<-release
-
-			return blnk.SubscriberCredential{}, nil
-		})
+	credential, err, completed := issueWithinBudget(ctx, "sub_9f1c8a72", issue)
 
 	<-started
 
@@ -297,14 +381,27 @@ func TestIssueWithinBudget_ReturnsTheIssuanceWhenItFinishesInTime(t *testing.T) 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		_, _, completed := issueWithinBudget(ctx, "sub_9f1c8a72",
-			func(context.Context, string) (blnk.SubscriberCredential, error) {
-				<-time.After(time.Minute)
+		// The slow work parks until this subtest releases it, and its exit is waited for.
+		issue, started, hasFinished := parkedIssuance(t)
 
-				return blnk.SubscriberCredential{}, nil
-			})
+		_, _, completed := issueWithinBudget(ctx, "sub_9f1c8a72", issue)
 
-		assert.False(t, completed)
+		assert.False(t, completed,
+			"a caller that has already gone away must not be waited for")
+
+		// The premise: the work really did start. Without this the subtest would pass
+		// against an implementation that never invoked the work at all, which is a
+		// different behaviour with the same observable result at the call site.
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("the issuance work was never started, so nothing was abandoned and this " +
+				"subtest is asserting the wrong property")
+		}
+
+		assert.False(t, hasFinished(),
+			"the work had already finished when issueWithinBudget returned, so it was WAITED "+
+				"for rather than abandoned")
 	})
 }
 
@@ -1100,7 +1197,11 @@ func TestSubscribersAPI_CRUDThroughTheRealRouter(t *testing.T) {
 		enforced, ok := read["enforced_access"].(map[string]interface{})
 		require.True(t, ok, "every subscriber response carries enforced_access: %s", w.Body.String())
 		assert.Equal(t, false, enforced["partition_key_prefix_enforced"],
-			"this field may never be true: Kafka has no message-key authorization dimension")
+			"false for a subscriber that recorded no prefix: there is no key boundary to keep, "+
+				"which is a different state from a boundary nobody keeps")
+		assert.Equal(t, true, enforced["broker_record_access"],
+			"and such a subscriber holds topic Read, so its records come from the broker directly")
+		assert.Equal(t, false, enforced["gateway_delivery_required"])
 		assert.Empty(t, enforced["partition_key_prefix"],
 			"a subscriber with no recorded prefix has nothing here: this field is what a consumer "+
 				"FILTERS on, so a sentinel standing for \"no restriction\" would be a filter matching "+
@@ -1143,8 +1244,10 @@ func TestSubscribersAPI_CRUDThroughTheRealRouter(t *testing.T) {
 // TestSubscribersAPI_RecordsAndReturnsTheKeyScope is the F-05 contract at the HTTP boundary.
 //
 // A subscriber registered WITH a key scope must be accepted, and every response about it must
-// carry the scope beside the statement that the broker does not enforce it. The adjacency is
-// the property: the scope alone would read as a limit on the credential's reach.
+// carry the scope beside the component that enforces it. The adjacency is the property: the scope
+// alone reads as a limit the credential itself carries, and it is not — the credential is refused
+// record access at the broker and the records arrive through Blnk's stream gateway, which is what
+// applies the prefix.
 func TestSubscribersAPI_RecordsAndReturnsTheKeyScope(t *testing.T) {
 	router := subscribersRouter(t, true)
 	subscriberID := uniqueSubscriberID()
@@ -1172,15 +1275,146 @@ func TestSubscribersAPI_RecordsAndReturnsTheKeyScope(t *testing.T) {
 	require.True(t, ok, "body: %s", w.Body.String())
 	assert.Equal(t, keyScope, enforced["partition_key_prefix"],
 		"and the scope must appear in enforced_access, which is where a consumer reads it")
-	assert.Equal(t, false, enforced["partition_key_prefix_enforced"],
-		"BESIDE the statement that the broker does not keep it — the two cannot be read apart")
+	assert.Equal(t, true, enforced["partition_key_prefix_enforced"],
+		"BESIDE the statement that it IS kept — the two cannot be read apart, and a false here "+
+			"was the declaration that a recorded boundary was the subscriber's own problem")
+	assert.Equal(t, string(coremodel.KeyScopeEnforcementGateway),
+		enforced["partition_key_prefix_enforced_by"],
+		"and the component is named, because 'enforced' without one is unverifiable")
 
-	// The enforced dimensions must remain exactly the two the broker evaluates. A key entry
-	// here would assert an ACL that cannot exist.
+	// THE TRANSPORT INSTRUCTION, which is the field a broken integration turns on: a client that
+	// read false here would point a consumer at a broker that refuses its fetches.
+	assert.Equal(t, true, enforced["gateway_delivery_required"])
+	assert.Equal(t, false, enforced["broker_record_access"],
+		"and its complement states why: no topic Read binding exists for a key-scoped principal")
+
+	// The key dimension joins the ENFORCED list for a subscriber that recorded a prefix, and
+	// nothing is left in the unenforced one.
 	dimensions, ok := enforced["enforced_by"].([]interface{})
 	require.True(t, ok)
-	assert.NotContains(t, dimensions, "partition_key")
-	assert.NotContains(t, dimensions, "partition_key_prefix")
+	assert.Contains(t, dimensions, "partition_key")
+	assert.Empty(t, enforced["not_enforced_by"],
+		"no dimension of this subscriber's access is enforced by nobody")
+}
+
+// TestIssueKafkaCredentials_DoesNotRefuseAKeyScopedSubscriber is the F-1 contract at the HTTP
+// boundary as this build actually ships it: a key-scoped row is ISSUABLE, and the endpoint never
+// answers the refusal that a build without an enforcement point would.
+//
+// # Why the refusal is not the contract here
+//
+// Kafka's authorizer has no message-key dimension, so a credential carrying topic Read for a
+// key-scoped row would read every record on every granted topic — other ledgers' and other
+// subscribers' included. Two answers to that were tried and both failed. Disclosing the
+// limitation in a 200 body is not a boundary, because the party asked to apply the filter is the
+// party holding the credential. Refusing outright with 409 SUBSCRIBER_ISOLATION_UNENFORCEABLE is
+// not one either: it withdrew a capability the registry is explicitly designed to hold, leaving a
+// key-scoped subscriber with no credential and no delivery path at all.
+//
+// What ships instead is a NARROWER GRANT plus an enforcing delivery path. A key-scoped principal
+// is provisioned with Describe and no topic Read — the broker refuses its every direct fetch —
+// and its records are read with Blnk's own credential and filtered per record by the subscriber
+// stream gateway at GET /subscribers/{subscriber_id}/events. streamGatewayEnforcesKeyScope
+// records that this binary contains that component, so requireProvisionableKeyScope has nothing
+// to refuse; its refusal path stays reachable, and tested, for a build in which no enforcement
+// point exists.
+//
+// # What this asserts, and why at this layer
+//
+// The service layer owns the enforcement semantics — that Read is withheld, that the withholding
+// is verified against the bindings actually sent, that the response declares the enforcement
+// point — and event_subscriber_test.go covers them against a live broker. What belongs HERE is
+// the boundary: that the endpoint does not answer the superseded conflict for a row the gateway
+// enforces, that it reaches the registry rather than refusing ahead of it, and that an issuance
+// which cannot complete leaves nothing behind and discloses nothing.
+//
+// The registry read of the same state — the prefix reported together with the component that
+// enforces it — is TestSubscribersAPI_RecordsAndReturnsTheKeyScope.
+//
+// The harness configures brokers deliberately — with none, issuance answers
+// EVENT_KAFKA_UNAVAILABLE (503) before the row is ever read, and nothing about the row would be
+// exercised. That ordering is itself covered by
+// TestIssueKafkaCredentials_RefusesBeforeTheRegistryWhenNoBrokerIsConfigured.
+//
+// It also configures NO admin SASL credentials, which is what makes the outcome here a broker-side
+// failure rather than a completed issuance: this test asserts that the row was accepted and the
+// broker round trip attempted, not that a principal was created. Completing one requires a real
+// cluster and appears in TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnce.
+func TestIssueKafkaCredentials_DoesNotRefuseAKeyScopedSubscriber(t *testing.T) {
+	router, datasource := setupSubscribersRouter(t, subscribersHarness{
+		masterKey: true,
+		brokers:   []string{"127.0.0.1:9092"},
+	})
+
+	subscriberID := uniqueSubscriberID()
+
+	// A row in the state under test: a recorded prefix, no credential yet. The credential
+	// reference is cleared so the outcome cannot be confused with a re-issuance conflict.
+	stored := subscribersFixtureRow(subscriberID)
+	keyScope := "ldg_9f2c"
+	stored.PartitionKeyPrefix = &keyScope
+	stored.CredentialReference = nil
+	stored.CredentialIssuedAt = nil
+
+	const claimToken = "claim-token-for-the-key-scoped-issuance"
+
+	// REQUIRED, both of them, and that is the first half of the property: the request must reach
+	// the provisioning fence and then the row. A build that refused a key-scoped subscriber ahead
+	// of the registry would leave these unmet, and AssertExpectations below is what says so.
+	datasource.On("ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything).
+		Return(claimToken, nil).Once()
+	datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(stored, nil).Once()
+	// The fence's heartbeat and its release run on their own schedules, so both are permitted
+	// rather than required.
+	datasource.On("RenewSubscriberProvisioningFence",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	datasource.On("ReleaseSubscriberProvisioningFence",
+		mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	// PERMITTED, NOT EXPECTED, and never reached here — it is registered only so that an
+	// environment in which the broker round trip somehow completed would fail on the assertion
+	// below rather than panicking inside the mock on a call it has no answer for.
+	datasource.On("RecordSubscriberCredentialIfUnchanged",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(nil).Maybe()
+
+	recorder := subscribersServe(t, router, subscribersCall{
+		method: http.MethodPost, path: "/subscribers/" + subscriberID + "/kafka-credentials",
+	})
+	body := recorder.Body.String()
+
+	// THE SUPERSEDED REFUSAL IS NOT THE ANSWER. Asserted on the code as well as the status,
+	// because a client branches on the code and because another conflict — a concurrent
+	// re-issuance, say — would be a legitimate 409 that this assertion must not read as the
+	// isolation refusal returning.
+	require.NotEqual(t, http.StatusConflict, recorder.Code,
+		"a key-scoped row is issuable in a build that contains the stream gateway: the grant is "+
+			"narrowed to Describe and the records are delivered key-filtered, so there is nothing "+
+			"here to refuse. body: %s", body)
+	assert.NotContains(t, body, string(apierror.ErrSubscriberIsolationUnenforceable),
+		"SUBSCRIBER_ISOLATION_UNENFORCEABLE says NOTHING enforces the prefix; this binary links "+
+			"the component that does, and that guard is reached only where one is absent")
+
+	// AND THE ISSUANCE WAS ATTEMPTED AT THE BROKER, which is what proves the row was accepted
+	// rather than skipped. It fails because the harness holds no admin SASL credential, and a
+	// 503 is the honest answer to that: nothing was created, and a retry against a reachable,
+	// authenticated cluster is exactly what would succeed.
+	require.Equal(t, http.StatusServiceUnavailable, recorder.Code,
+		"the row was accepted, so the next step is the broker, and this harness cannot "+
+			"authenticate to one. body: %s", body)
+	assert.Contains(t, body, string(apierror.ErrSubscriberProvisioningFailed),
+		"and the typed code names provisioning rather than the request or the row, because "+
+			"neither is what failed")
+
+	assert.NotContains(t, body, `"password"`,
+		"A FAILED ISSUANCE CARRIES NO SECRET: the credential is never marshalled on this path")
+	assert.NotContains(t, body, keyScope,
+		"and it does not echo the prefix into the body, which is caller-supplied text")
+
+	// NOTHING WAS WRITTEN. The broker round trip precedes the issuance record, so a failure there
+	// cannot leave the registry describing a credential no subscriber holds.
+	datasource.AssertNotCalled(t, "RecordSubscriberCredentialIfUnchanged",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	datasource.AssertExpectations(t)
 }
 
 // TestSubscribersAPI_RefusesAnUngrantableTopic covers the grant validation at the boundary.
@@ -1673,9 +1907,11 @@ func TestSubscribersAPI_WebhookSubscriptionNeverReturnsTheSigningSecret(t *testi
 //	THE AUTHORIZATION RESOURCE MAP. A master-key request never consults it: the auth
 //	middleware matches the master key and returns before getResourceFromPath is called, so
 //	a master-key-only reachability test passes even with "subscribers" missing from
-//	middleware.pathToResource — the state in which every request to the surface is aborted
-//	with ErrAuthUnknownResource. Proving the map needs secure mode AND a valid non-master
-//	key, which needs a datasource that can answer GetAPIKey without a database row.
+//	middleware.pathToResource — the state in which every request to the surface from a
+//	NON-MASTER principal is aborted with ErrAuthUnknownResource, which in a secure
+//	deployment is every integration. Proving the map needs secure mode AND a valid
+//	non-master key, which needs a datasource that can answer GetAPIKey without a
+//	database row.
 //
 //	THAT THE GATE SHORT-CIRCUITS. "Refused with AUTH_MASTER_KEY_REQUIRED" and "refused
 //	before any registry work" are different claims. The second one is only observable by
@@ -1785,6 +2021,24 @@ func setupSubscribersRouter(
 			Add(20 * 24 * time.Hour).UTC().Format(time.RFC3339)
 	}
 
+	// RESTORED WHEN THE TEST ENDS. config.ConfigStore is a process-global atomic.Value, so a
+	// broker list, a master key or a sunset date installed here is read by every later test in
+	// the package that calls config.Fetch — including the ones asserting the unconfigured or
+	// insecure posture, which then fail somewhere that never mentioned Kafka. Saving and
+	// restoring is the established idiom; see the same block in newEventsAPIOverMockDatasource.
+	previousConfiguration := config.ConfigStore.Load()
+	t.Cleanup(func() {
+		if previousConfiguration != nil {
+			config.ConfigStore.Store(previousConfiguration)
+
+			return
+		}
+
+		// An atomic.Value cannot be emptied, so a process that held nothing before this test
+		// is returned to a configuration that carries nothing rather than left holding this one.
+		config.ConfigStore.Store(&config.Configuration{})
+	})
+
 	config.MockConfig(configuration)
 
 	fetched, err := config.Fetch()
@@ -1796,6 +2050,18 @@ func setupSubscribersRouter(
 
 	datasource := new(mocks.MockDataSource)
 
+	// THE MOCK IS HANDED OVER UNWRAPPED, and the wrapper it replaced is gone rather than
+	// retired. This harness used to interpose a synchronised datasource plus a barrier
+	// middleware so a non-master request could be ordered ahead of the background last-used
+	// update the authentication middleware starts for it — scaffolding that existed only
+	// because the middleware read c.Request from INSIDE that goroutine, racing otelgin's
+	// deferred restore.
+	//
+	// That race was fixed at its cause: the middleware now captures the request context and the
+	// key id on the request goroutine and runs the update on a detached bounded context
+	// (context.WithoutCancel), so nothing here has to schedule around it. A test that needs to
+	// OBSERVE the update joins it through expectEventsAPIKeyLookup / requireEventsLastUsedTouch
+	// in events_api_test.go — same package, one implementation of that join.
 	service, err := blnk.NewBlnk(datasource)
 	require.NoError(t, err, "the service container must be constructible over the mock store")
 
@@ -1884,13 +2150,22 @@ func subscribersServe(
 	return recorder
 }
 
-// subscribersEveryRoute is the whole surface: the six registry routes and the four
-// deprecated webhook-subscription ones.
+// subscribersEveryRoute is the whole MASTER-KEY-GATED surface: the six registry routes and
+// the four deprecated webhook-subscription ones.
 //
 // It is a function rather than a package-level slice so that each caller gets its own
 // copy and cannot mutate a shared table. The bodies are the smallest ones each route
 // binds, because these tables drive tests about AUTHORIZATION: a request must fail on the
 // gate rather than on its body, or the assertion moves to a different property.
+//
+// GET /subscribers/:subscriber_id/events IS DELIBERATELY ABSENT, and it must stay absent.
+// It is the DATA PLANE — the enforcement point for a subscriber's partition-key prefix —
+// and it is authenticated by the SUBSCRIBER's own SASL secret rather than by an operator's
+// master key, so a table asserting ErrAuthMasterKeyRequired for every entry would be
+// asserting a gate that route correctly does not have. Its own authorization properties are
+// covered by TestSubscribersAPI_StreamRouteResolvesToTheSubscribersResource and
+// TestSubscribersAPI_StreamAuthenticatesWithTheSubscribersOwnSecret, which assert both
+// halves: the prefix resolves for it, and reaching it is not the same as being served by it.
 func subscribersEveryRoute(subscriberID string) []subscribersCall {
 	webhookPath := webhookSubscriptionPath(subscriberID)
 
@@ -1953,6 +2228,270 @@ func subscribersFixtureRow(subscriberID string) *coremodel.EventSubscriber {
 	}
 }
 
+// TestSubscribersAPI_ACorrectlyScopedKeyIsAdmittedAndRefusedByTheHandlersGate is the
+// AUTHORIZED-CALLER half of the two-file registration proof, and it is the half that was
+// missing.
+//
+// # Why the unrelated-scope test is not enough on its own
+//
+// TestSubscribersAPI_AuthorizationResourceIsRegistered above drives every route with a key
+// scoped to ANOTHER feature. That refusal proves the prefix resolves and names the scope it
+// resolves to, and it stops there — by construction, because the request is refused by the
+// MIDDLEWARE. Everything past that point is untested by it:
+//
+//   - Whether a caller granted exactly `subscribers:<action>` is ADMITTED. A permission check
+//     that refused the correct scope — an action table off by one entry, a scope comparison that
+//     never matches — would leave every route unusable by every non-master principal, and the
+//     unrelated-scope test would still pass, because it EXPECTS a refusal.
+//   - Whether the ENDPOINT'S OWN master-key gate then refuses. AUTH_MASTER_KEY_REQUIRED is the
+//     only code that proves a request traversed the entire chain and was stopped last by the
+//     handler. A route that forgot its gate would answer 200, or reach the registry, and again
+//     the unrelated-scope test would notice nothing: its request never got that far.
+//   - Whether the gate refuses BEFORE doing work. A gate that fires after the service call has
+//     started is not a gate, and on the credential route it would mint a credential for a caller
+//     it was about to refuse.
+//
+// # Why this could not be written before
+//
+// A correctly scoped key is exactly the path that spawns the authentication middleware's
+// fire-and-forget last-used update, and that goroutine races otelgin's deferred restore of
+// c.Request — a PRE-EXISTING production race, reproducible on /ledgers and every resource older
+// than this feature. The harness now joins each request with its own background work through
+// expectEventsAPIKeyLookup and requireEventsLastUsedTouch, which is a happens-before edge
+// rather than a delay, so the path is testable without the race being reported against this file
+// and without pretending it does not exist.
+//
+// Every assertion names a CODE, never a status: AUTH_UNKNOWN_RESOURCE,
+// AUTH_INSUFFICIENT_PERMISSIONS and AUTH_MASTER_KEY_REQUIRED all resolve to 403, so a
+// status-only assertion passes in all three of the failure modes above.
+func TestSubscribersAPI_ACorrectlyScopedKeyIsAdmittedAndRefusedByTheHandlersGate(t *testing.T) {
+	subscriberID := uniqueSubscriberID()
+
+	// The action each method maps to in middleware.methodToAction. The scope granted below is
+	// built from it, so a key is granted EXACTLY what the route requires and nothing more: a
+	// wildcard would pass even if the method mapped to the wrong action.
+	actionForMethod := map[string]middleware.Action{
+		http.MethodGet:    middleware.ActionRead,
+		http.MethodPost:   middleware.ActionWrite,
+		http.MethodPut:    middleware.ActionWrite,
+		http.MethodDelete: middleware.ActionDelete,
+	}
+
+	for _, call := range subscribersEveryRoute(subscriberID) {
+		target := call
+
+		t.Run(target.method+" "+target.path, func(t *testing.T) {
+			router, datasource := setupSubscribersRouter(t, subscribersHarness{secure: true})
+
+			action, mapped := actionForMethod[target.method]
+			require.Truef(t, mapped, "no action is mapped for %s, so no scope can be granted",
+				target.method)
+
+			scope := middleware.BuildScope(middleware.ResourceSubscribers, action)
+			key := subscribersTestAPIKey(scope)
+
+			// The two calls the authentication middleware makes for a non-master credential,
+			// programmed together with the join that orders the second one against the call-log
+			// read further down. The barrier that used to provide that ordering was removed with
+			// the c.Request race it existed for — see the note on setupSubscribersRouter — so the
+			// join is what keeps this test's read off testify's internals while a goroutine is
+			// still appending to them.
+			touched := expectSubscribersAPIKeyLookup(datasource, key)
+
+			target.key = key.Key
+			recorder := subscribersServe(t, router, target)
+
+			var body struct {
+				ErrorDetail apierror.APIError `json:"error_detail"`
+			}
+			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body),
+				"the refusal must be a typed error body; got %q", recorder.Body.String())
+
+			require.NotEqual(t, apierror.ErrAuthUnknownResource, body.ErrorDetail.Code,
+				"%s %s RESOLVES TO NO AUTHORIZATION RESOURCE, so the middleware aborts every "+
+					"request to it from every non-master principal. Add \"subscribers\" to pathToResource "+
+					"in api/middleware/auth.go", target.method, target.path)
+
+			require.NotEqualf(t, apierror.ErrAuthInsufficientPermissions, body.ErrorDetail.Code,
+				"A KEY GRANTED EXACTLY %q WAS REFUSED ON PERMISSIONS. Either %s %s resolves to a "+
+					"different resource, or the method maps to a different action than %q — and "+
+					"either way no non-master principal can ever use this route, however it is "+
+					"scoped. message: %s",
+				scope, target.method, target.path, action, body.ErrorDetail.Message)
+
+			// THE ASSERTION THIS TEST EXISTS FOR. Only a request that passed authentication AND
+			// the permission check reaches the handler, and only the handler's own gate answers
+			// this code. A route that forgot the gate would answer 200 or 4xx-with-another-code
+			// here.
+			assertErrorCode(t, recorder,
+				http.StatusForbidden, apierror.ErrAuthMasterKeyRequired)
+
+			// THE CREDENTIAL WAS ADMITTED, which the audit write is the observable proof of: the
+			// middleware performs it only for a principal it authenticated and permitted, so its
+			// arrival says the refusal below came from the HANDLER rather than from authentication.
+			// It is also the join that makes the call-log read that follows safe.
+			requireSubscribersLastUsedTouch(t, touched)
+
+			// AND IT REFUSED BEFORE DOING ANY WORK. A fully authorised non-master caller must
+			// learn only that the master key is required — never whether a subscriber exists,
+			// and on the credential route never at the cost of a credential actually being
+			// minted at the broker for a caller about to be refused.
+			reached := subscribersRepositoryCallsExcludingAuth(datasource)
+			assert.Emptyf(t, reached,
+				"the gate must refuse before touching the registry; %s %s reached %v",
+				target.method, target.path, reached)
+
+			datasource.AssertExpectations(t)
+		})
+	}
+}
+
+// subscribersAssertSecretAbsent requires that a corpus does not contain the one-time password,
+// without handing testify either the secret or the text containing it.
+//
+// # Why this is not assert.NotContains
+//
+// testify renders BOTH operands when an assertion fails, so
+// assert.NotContains(t, body, password) prints the plaintext SCRAM password into the build log
+// on exactly the run where the leak is real. CI logs are retained, searchable, and readable by
+// more people and for far longer than the HTTP response ever was — so the assertion written to
+// prove the secret is never disclosed would become the widest disclosure of it, and a credential
+// cannot be un-leaked afterwards. The corpus is no safer to print: by hypothesis it contains the
+// secret.
+//
+// So the comparison happens in Go and only a BOOLEAN reaches testify. The failure message says
+// WHICH corpus and at what offset, which is what a reader needs to find the leak in the code, and
+// carries neither the secret nor the text around it.
+//
+// Parameters:
+//   - t *testing.T: the test.
+//   - corpus string: the text that must not contain the secret. Never printed.
+//   - secret string: the live one-time password. Never printed.
+//   - what string: a description of the corpus, printed on failure.
+func subscribersAssertSecretAbsent(t *testing.T, corpus, secret, what string) {
+	t.Helper()
+
+	// An empty secret would make every Index call return 0 and every assertion below fail for a
+	// reason that has nothing to do with disclosure, so the fixture's own precondition is
+	// checked rather than assumed.
+	require.NotEmpty(t, secret,
+		"the secret under test is empty, so %s cannot be checked for it", what)
+
+	offset := strings.Index(corpus, secret)
+	assert.Falsef(t, offset >= 0,
+		"THE ONE-TIME PASSWORD APPEARS IN %s, at byte offset %d of %d. Neither the secret nor the "+
+			"text containing it is printed here, deliberately: this assertion exists to prove the "+
+			"plaintext is never disclosed, and rendering it into a retained build log to report the "+
+			"failure would disclose it more widely than the leak under test. Reproduce locally and "+
+			"inspect that value directly.",
+		what, offset, len(corpus))
+}
+
+// subscribersBackgroundTouchTimeout bounds the wait for the middleware's background last-used
+// update. A safety valve rather than a delay: in a correct run the update lands in microseconds.
+// It matches eventsBackgroundTouchTimeout deliberately — one grace period for one mechanism.
+const subscribersBackgroundTouchTimeout = 5 * time.Second
+
+// expectSubscribersAPIKeyLookup programs the two datasource calls the authentication middleware
+// makes for a non-master credential, and returns a channel that reports when the second has been
+// RECORDED.
+//
+// # Why the channel exists
+//
+// The middleware answers the request and updates last_used_at on a goroutine that outlives the
+// response, and that goroutine appends to testify's call log. Any assertion that reads the log —
+// subscribersRepositoryCallsExcludingAuth below — is therefore reading a slice another goroutine
+// may still be writing, which `go test -race` reports as a data race and which is one, not an
+// artefact of the detector.
+//
+// A gin middleware used to serialise this by waiting after c.Next(). It was removed with the
+// production race it was scheduling around (see the note on setupSubscribersRouter), and removing
+// it left this file's readers with nothing ordering them. The channel is what replaces it: the
+// signal is sent from testify's own Run hook, which fires AFTER the call has been appended, so a
+// receive on it establishes a happens-before edge covering the append. No scheduling is
+// influenced and nothing is guessed at.
+//
+// UpdateLastUsed is expected STRICTLY, exactly once and on the key that was admitted, for the
+// same reason it is in api/events_api_test.go: `.Maybe()` hides both the update being dropped
+// altogether and the update being made for a different key id.
+//
+// Parameters:
+//   - datasource *mocks.MockDataSource: the datasource to program.
+//   - key *coremodel.APIKey: the principal the lookup resolves to.
+//
+// Returns:
+//   - <-chan struct{}: signalled once the background last-used update has been recorded.
+//     Buffered, so the production goroutine never blocks on a test channel.
+func expectSubscribersAPIKeyLookup(
+	datasource *mocks.MockDataSource, key *coremodel.APIKey,
+) <-chan struct{} {
+	touched := make(chan struct{}, 1)
+
+	datasource.On("GetAPIKey", mock.Anything, key.Key).Return(key, nil)
+	datasource.On("UpdateLastUsed", mock.Anything, key.APIKeyID).
+		Run(func(mock.Arguments) {
+			select {
+			case touched <- struct{}{}:
+			default:
+			}
+		}).
+		Return(nil).
+		Once()
+
+	return touched
+}
+
+// requireSubscribersLastUsedTouch joins an authenticated request with the background last-used
+// update the middleware starts for it, and FAILS if that update never happens.
+//
+// Parameters:
+//   - t *testing.T: the test, FAILED when the update does not arrive.
+//   - touched <-chan struct{}: the channel expectSubscribersAPIKeyLookup returns.
+func requireSubscribersLastUsedTouch(t *testing.T, touched <-chan struct{}) {
+	t.Helper()
+
+	select {
+	case <-touched:
+	case <-time.After(subscribersBackgroundTouchTimeout):
+		t.Fatalf(
+			"the authentication middleware did not update the API key's last-used timestamp "+
+				"within %s. It fires that update on a goroutine for every non-master credential it "+
+				"admits, so either the request was not authenticated as expected or the update was "+
+				"removed — and a test that proceeded here would be asserting on a call log another "+
+				"goroutine may still be writing to", subscribersBackgroundTouchTimeout,
+		)
+	}
+}
+
+// subscribersRepositoryCallsExcludingAuth names every datasource method a request reached apart
+// from the two the authentication middleware itself makes.
+//
+// GetAPIKey and UpdateLastUsed are authentication's own work and are present on every
+// non-master request by definition, so counting them would make "reached nothing" impossible to
+// express. Everything else is the handler's, and on a refused request there must be none of it.
+//
+// THE CALLER MUST HAVE JOINED THE BACKGROUND UPDATE FIRST — requireSubscribersLastUsedTouch —
+// because the log this reads is appended to from that goroutine. Reading it while the goroutine
+// is live is a data race on testify's internals, and the join, not a delay, is what orders them.
+//
+// Parameters:
+//   - datasource *mocks.MockDataSource: the store behind the router.
+//
+// Returns:
+//   - []string: the method names reached, in call order, excluding authentication's own.
+func subscribersRepositoryCallsExcludingAuth(datasource *mocks.MockDataSource) []string {
+	reached := make([]string, 0, len(datasource.Calls))
+	for _, recorded := range datasource.Calls {
+		if recorded.Method == "GetAPIKey" || recorded.Method == "UpdateLastUsed" {
+			continue
+		}
+
+		reached = append(reached, recorded.Method)
+	}
+
+	return reached
+}
+
 // TestSubscribersAPI_AuthorizationResourceIsRegistered is the decisive test for the
 // "subscribers" authorization resource, and it is the only one in this package that can be.
 //
@@ -1962,8 +2501,11 @@ func subscribersFixtureRow(subscriberID string) *coremodel.EventSubscriber {
 // ResourceSubscribers, and api/middleware/auth.go maps the first path segment to it in
 // pathToResource. Make only the first edit and getResourceFromPath returns the empty
 // resource, at which point the middleware ABORTS every request to the prefix with
-// ErrAuthUnknownResource — including the master key's. The surface is then completely
-// unreachable, and nothing in the ordinary suite notices.
+// ErrAuthUnknownResource — every request, that is, from an authenticated NON-MASTER caller.
+// The master key is deliberately excepted by the middleware itself, which matches it and
+// returns on at api/middleware/auth.go:232-238 before any resource is resolved. The surface is
+// therefore unreachable by every integration principal while remaining reachable by the one
+// credential an operator is likeliest to try, and nothing in the ordinary suite notices.
 //
 // # Why a master-key test cannot see it
 //
@@ -1982,15 +2524,21 @@ func subscribersFixtureRow(subscriberID string) *coremodel.EventSubscriber {
 // and would authorise this surface under that feature's scope with nothing failing. The
 // scope named in the message is what pins the mapping's TARGET.
 //
-// This path is also chosen because of what it does NOT touch. A CORRECTLY scoped non-master
-// key passes HasPermission, and the middleware then spawns a background goroutine that reads
+// This path is also chosen for what it does NOT touch. A CORRECTLY scoped non-master key
+// passes HasPermission, and the middleware then spawns a background goroutine that reads
 // c.Request after the handler may already have returned (api/middleware/auth.go:285-286) —
 // which races with otelgin's deferred restore of the same field, because gin recycles its
 // contexts through a pool. That race is PRE-EXISTING production behaviour, reproducible on
 // /ledgers and every other resource that predates this feature, and it has nothing to do with
-// this prefix; it is out of scope for this test file and is recorded here rather than worked
-// around silently. Driving the refused-on-permissions path proves the same property without
-// depending on it: the middleware aborts before the goroutine exists.
+// this prefix. Refused-on-permissions reaches the map without ever creating that goroutine,
+// so this test proves the mapping's TARGET while depending on none of it.
+//
+// The correctly-scoped path IS driven, separately, by
+// TestSubscribersAPI_ACorrectlyScopedKeyIsAdmittedAndRefusedByTheHandlersGate, which joins each
+// request to its own background update through eventsSynchronizedDatasource and
+// requireEventsLastUsedTouch — a happens-before edge rather than a delay. The two tests answer
+// different questions: this one asks whether the prefix resolves to the right resource, that one
+// asks whether a key granted exactly that resource is admitted and then stopped by the handler.
 //
 // Every assertion names a CODE and never a status, because ErrAuthUnknownResource,
 // ErrAuthInsufficientPermissions and ErrAuthMasterKeyRequired all resolve to 403.
@@ -2039,7 +2587,7 @@ func TestSubscribersAPI_AuthorizationResourceIsRegistered(t *testing.T) {
 				// the two codes share a status.
 				require.NotEqual(t, apierror.ErrAuthUnknownResource, body.ErrorDetail.Code,
 					"%s %s RESOLVES TO NO AUTHORIZATION RESOURCE, so the middleware aborts "+
-						"every request to it — master key included. Add \"subscribers\" to "+
+						"every request to it from every non-master principal. Add \"subscribers\" to "+
 						"pathToResource in api/middleware/auth.go; declaring "+
 						"ResourceSubscribers in scope.go alone is not enough",
 					target.method, target.path)
@@ -2873,16 +3421,29 @@ func TestIssueKafkaCredentials_AnswersAtTheCeilingWhenProvisioningStalls(t *test
 	subscriberID := uniqueSubscriberID()
 
 	release := make(chan time.Time)
-	// RELEASED UNCONDITIONALLY. Closing a channel makes every pending receive return, so the
-	// stalled call finishes and its goroutine exits however this test ends.
-	defer close(release)
+	// RELEASED EXACTLY ONCE, whether this test reaches its join or fails before it. Closing a
+	// channel makes every pending receive return, so the stalled call always finishes and its
+	// goroutine always exits; the Once is what lets the join at the end of this test release the
+	// stall explicitly while a deferred safety net still covers an early failure.
+	var releaseOnce sync.Once
+	releaseStall := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseStall()
 
 	// The provisioning claim is the FIRST store call issuance makes, which is what keeps the
 	// stall to exactly one method: the service returns before registering its compensation
 	// when the claim fails, so nothing else is reached on the way out.
+	//
+	// The error it eventually returns is the one the REAL repository returns for a claim it could
+	// not take — an internal-server-class APIError, exactly as database.ClaimSubscriberForProvisioning
+	// builds — rather than a bare error. It changes nothing about the response asserted below,
+	// which comes from the ceiling and not from this error, and it makes the abandoned attempt
+	// take the path a real one takes: the service reclassifies a spent budget at the registry as a
+	// timeout and says so, which is what requireAbandonedIssuanceSettled waits for at the end.
 	datasource.On("ClaimSubscriberForProvisioning", mock.Anything, subscriberID, mock.Anything).
 		WaitUntil(release).
-		Return("", fmt.Errorf("the provisioning claim was abandoned"))
+		Return("", apierror.NewAPIError(apierror.ErrInternalServer,
+			"Failed to claim the subscriber for provisioning",
+			fmt.Errorf("the provisioning claim was abandoned")))
 
 	logs := logtest.NewGlobal()
 	defer logs.Reset()
@@ -2935,6 +3496,73 @@ func TestIssueKafkaCredentials_AnswersAtTheCeilingWhenProvisioningStalls(t *test
 	assert.True(t, timeoutLogged,
 		"an abandoned issuance must say so in the log: it is the only record that work may "+
 			"still be running after the response was written")
+
+	// JOIN THE ABANDONED ATTEMPT BEFORE THIS TEST ENDS.
+	//
+	// Everything above is about the REQUEST, and the request is over. What is still running is
+	// the issuance goroutine, parked in the stalled store call. Releasing it and walking away —
+	// which is what a bare `defer close(release)` amounted to — lets it wake up inside whatever
+	// test runs next: it writes a Warn line through the GLOBAL logrus logger, and the global test
+	// hook installed here is never uninstalled, so that line lands in this hook after Reset has
+	// cleared it and in every hook a later test installs. A later test that scans the global log
+	// then sees an entry no request of its own produced, and fails somewhere else entirely.
+	//
+	// So the stall is released HERE, explicitly, and the attempt is waited for.
+	releaseStall()
+	requireAbandonedIssuanceSettled(t, logs)
+}
+
+// subscribersAbandonedIssuanceMarker is the last thing an abandoned issuance does.
+//
+// The service classifies a budget spent on the provisioning claim as a timeout and says so at
+// Warn before returning; nothing it does afterwards touches anything a test owns. That makes this
+// line the completion signal, and asserting on it is worth doing in its own right: it is the only
+// record that an attempt which had already been answered for went on to release its claim, and it
+// is what an operator correlates with the request's own line.
+const subscribersAbandonedIssuanceMarker = "ran out of time at the registry"
+
+// subscribersAbandonedIssuanceTimeout bounds the wait for that line.
+//
+// It is generous because it is never reached in a correct run — the attempt is already released
+// and has one classification left to perform — and because reaching it means the attempt did not
+// finish, which is a real leak rather than a slow machine.
+const subscribersAbandonedIssuanceTimeout = 10 * time.Second
+
+// requireAbandonedIssuanceSettled waits for an abandoned credential issuance to finish, and FAILS
+// if it never does.
+//
+// The wait is a poll of the global log hook rather than a channel, because the goroutine being
+// waited for is started inside the handler by issueWithinBudget and is deliberately unobservable
+// from outside: the handler hands the service call a context and a callback and keeps no handle,
+// which is exactly what lets the request answer at its ceiling. The hook is mutex-protected, so
+// polling it while the attempt is still writing to it is safe.
+//
+// Parameters:
+//   - t *testing.T: the test, FAILED when the abandoned attempt does not settle.
+//   - logs *logtest.Hook: the global hook the attempt writes its closing line to.
+func requireAbandonedIssuanceSettled(t *testing.T, logs *logtest.Hook) {
+	t.Helper()
+
+	deadline := time.Now().Add(subscribersAbandonedIssuanceTimeout)
+	for {
+		for _, entry := range logs.AllEntries() {
+			if strings.Contains(entry.Message, subscribersAbandonedIssuanceMarker) {
+				return
+			}
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"the abandoned issuance did not report its own outcome within %s. It is released "+
+					"by now, so either it is still running — and will write to the global logger "+
+					"and to this hook after this test has ended, inside whichever test runs next "+
+					"— or it stopped classifying a spent budget at the registry as a timeout",
+				subscribersAbandonedIssuanceTimeout,
+			)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // TestIssueKafkaCredentials_RefusesBeforeTheRegistryWhenNoBrokerIsConfigured pins the
@@ -3243,7 +3871,7 @@ func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnc
 		if recorder.Code != http.StatusNoContent && recorder.Code != http.StatusOK {
 			t.Errorf("cleanup: deregistering %s answered %d, so a live SCRAM principal and its "+
 				"ACL bindings may have been left at the broker: %s",
-				subscriberID, recorder.Code, recorder.Body.String())
+				subscriberID, recorder.Code, safeResponseBody(recorder))
 		}
 	})
 
@@ -3256,8 +3884,13 @@ func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnc
 	})
 	elapsed := time.Since(started)
 
+	// SANITISED, and this is the assertion that made it necessary: the message renders only when
+	// the status is NOT 200, which is precisely the regression — a handler answering 500 while
+	// still marshalling the credential — that would write a real SASL password into CI output.
+	// The assertions below that forbid a secret in the body cannot help, because a failed
+	// require aborts before they run.
 	require.Equal(t, http.StatusOK, recorder.Code,
-		"a successful issuance answers 200. body: %s", recorder.Body.String())
+		"a successful issuance answers 200. %s", safeResponseBody(recorder))
 
 	var credential model.KafkaCredentialsResponse
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &credential))
@@ -3305,24 +3938,26 @@ func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnc
 
 		t.Run("the password is absent from a subsequent "+name, func(t *testing.T) {
 			later := subscribersServe(t, router, call)
-			require.Equal(t, http.StatusOK, later.Code, "body: %s", later.Body.String())
+			require.Equal(t, http.StatusOK, later.Code, safeResponseBody(later))
 
-			assert.NotContains(t, later.Body.String(), password,
-				"THE PASSWORD IS RETURNED ONCE AND IS NOT RETRIEVABLE. Nothing persisted it, "+
-					"so nothing can read it back; a hit here means a field was added that can")
+			// The corpus is checked WITHOUT handing testify the secret; see
+			// subscribersAssertSecretAbsent for why that distinction is not pedantry.
+			subscribersAssertSecretAbsent(t, later.Body.String(), password,
+				"the body of a subsequent "+name+" (the password is returned ONCE and nothing "+
+					"persisted it, so a hit here means a field was added that can read it back)")
 			assert.NotContains(t, later.Body.String(), `"password"`,
 				"and no read shape carries the key at all")
 		})
 	}
 
 	// 4. THE SECRET IS NEVER LOGGED, and neither is the persisted reference.
-	for _, entry := range logs.AllEntries() {
-		assert.NotContains(t, entry.Message, password,
-			"no log message may carry the one-time password")
+	for index, entry := range logs.AllEntries() {
+		subscribersAssertSecretAbsent(t, entry.Message, password,
+			fmt.Sprintf("the message of log entry %d", index))
 
 		for field, value := range entry.Data {
-			assert.NotContains(t, fmt.Sprintf("%v", value), password,
-				"and no log FIELD may either; %q carried it", field)
+			subscribersAssertSecretAbsent(t, fmt.Sprintf("%v", value), password,
+				fmt.Sprintf("log entry %d, field %q", index, field))
 		}
 	}
 
@@ -3340,11 +3975,12 @@ func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnc
 		reference, isString := call.Arguments[3].(string)
 		require.True(t, isString, "the reference is persisted as text")
 		assert.NotEmpty(t, reference, "something must identify the issuance")
-		assert.NotEqual(t, password, reference,
-			"THE REFERENCE IS NOT THE PASSWORD. Storing the plaintext under another name is "+
-				"the exact failure this posture exists to prevent")
-		assert.NotContains(t, reference, password,
-			"and it must not embed it either")
+		assert.Falsef(t, reference == password,
+			"THE REFERENCE IS THE PASSWORD. Storing the plaintext under another name is the exact "+
+				"failure this posture exists to prevent. The value is not printed: it is the live "+
+				"secret. It is %d bytes, as is the password.", len(reference))
+		subscribersAssertSecretAbsent(t, reference, password,
+			"the persisted credential reference")
 
 		issuedAt, isTime := call.Arguments[4].(time.Time)
 		require.True(t, isTime, "the issuance instant is persisted")
@@ -3352,8 +3988,8 @@ func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnc
 			"an issuance with no recorded instant cannot be reconciled against the broker")
 
 		for index, argument := range call.Arguments {
-			assert.NotContains(t, fmt.Sprintf("%v", argument), password,
-				"argument %d of the credential record carries the plaintext", index)
+			subscribersAssertSecretAbsent(t, fmt.Sprintf("%v", argument), password,
+				fmt.Sprintf("argument %d of the persisted credential record", index))
 		}
 	}
 	require.True(t, recorded,
@@ -3416,9 +4052,13 @@ func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnc
 			method: http.MethodPost, path: "/subscribers/" + secondID + "/kafka-credentials",
 		})
 
+		// SANITISED for the mirror-image reason: this message renders only when the status IS
+		// 200, so the body is a successful credential response and the plaintext password is
+		// certainly in it. The two NotContains assertions below are the real checks, and they
+		// run only if this require passes.
 		require.NotEqual(t, http.StatusOK, failed.Code,
 			"an issuance the registry could not record is not a success: the caller would hold "+
-				"a password Blnk has no record of. body: %s", failed.Body.String())
+				"a password Blnk has no record of. %s", safeResponseBody(failed))
 		assert.NotContains(t, failed.Body.String(), `"password"`,
 			"and NO SECRET may ride out on the error body")
 		assert.NotContains(t, failed.Body.String(), blnk.RedactedSecretPlaceholder,
@@ -3505,6 +4145,174 @@ func TestSubscribersAPI_NoPersistedShapeCanCarryAPlaintextSecret(t *testing.T) {
 	})
 }
 
+// TestSubscribersAPI_NoFailureDiagnosticCanCarryTheIssuedSecret is the other half of that
+// posture: the response shape may carry a plaintext exactly once, and nothing this suite WRITES
+// may.
+//
+// # What was wrong
+//
+// Assertions about the credential endpoint passed the whole response body into their failure
+// message. A failure message renders only when the assertion fails, which is the case where the
+// body is not what the test assumed — and for the two mirror-image shapes on this endpoint that is
+// precisely when the body holds a real password. `require.Equal(t, 200, code, "…body: %s")` renders
+// when the status is NOT 200, so a handler that answered 500 while still marshalling the credential
+// disclosed it; `require.NotEqual(t, 200, code, "…body: %s")` renders when the status IS 200, so the
+// body is a successful credential response and disclosure is certain. Both had an assertion on the
+// next line forbidding a secret in the body, and neither ever reached it: a failed require aborts.
+//
+// CI output is durable and broadly readable, so a secret written there is disclosed however
+// carefully the endpoint behaves afterwards — which is the one-time-issuance posture undone by its
+// own test suite.
+//
+// # Why the helper is asserted rather than the call sites
+//
+// Every diagnostic on this endpoint now renders through safeResponseBody, so the property worth
+// pinning is the helper's: given a real credential response, the password does not appear in what
+// it returns, and the fields that make a diagnostic worth having do. Asserting that once is
+// stronger than grepping the call sites, because a new assertion added later inherits it.
+func TestSubscribersAPI_NoFailureDiagnosticCanCarryTheIssuedSecret(t *testing.T) {
+	const plaintext = "a-real-looking-sasl-password-8f3b1c"
+
+	credentialResponse := func(t *testing.T) *httptest.ResponseRecorder {
+		t.Helper()
+
+		recorder := httptest.NewRecorder()
+		recorder.Code = http.StatusOK
+		payload, err := json.Marshal(model.KafkaCredentialsResponse{
+			Brokers:          []string{"localhost:9092"},
+			BrokerEndpoint:   "localhost:9092",
+			AuthorizedTopics: []string{"blnk.transactions"},
+			ConsumerGroupID:  "blnk-sub-group",
+			Username:         "blnk-sub-principal",
+			Password:         plaintext,
+			Mechanism:        "SCRAM-SHA-512",
+		})
+		require.NoError(t, err)
+		recorder.Body.Write(payload)
+
+		return recorder
+	}
+
+	t.Run("the issued password never reaches a diagnostic", func(t *testing.T) {
+		recorder := credentialResponse(t)
+
+		rendered := safeResponseBody(recorder)
+
+		assert.NotContains(t, rendered, plaintext,
+			"the plaintext SASL password must not appear in a failure message: CI output is "+
+				"durable, and a disclosed credential is disclosed whatever the endpoint does next")
+		assert.Contains(t, rendered, `"password"`,
+			"the KEY stays, so a reader can see that the body was credential-shaped rather than "+
+				"wondering whether the field was missing")
+		assert.Contains(t, rendered, "withheld",
+			"and the value says it was withheld rather than looking empty, which would read as a "+
+				"handler defect")
+	})
+
+	t.Run("everything a diagnostic is for survives", func(t *testing.T) {
+		rendered := safeResponseBody(credentialResponse(t))
+
+		assert.Contains(t, rendered, "status=200",
+			"the status is the first thing a reader needs and it is not in the body at all")
+		for _, kept := range []string{
+			"blnk.transactions",  // the grant, which is what most assertions here are about
+			"blnk-sub-group",     // the consumer group
+			"blnk-sub-principal", // the derived principal
+			"SCRAM-SHA-512",      // the mechanism
+			"localhost:9092",     // where the subscriber was told to connect
+		} {
+			assert.Containsf(t, rendered, kept,
+				"%q is not a secret and is exactly what makes the diagnostic useful; withholding "+
+					"the whole body instead would trade one problem for another", kept)
+		}
+	})
+
+	t.Run("a secret nested anywhere is withheld too", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		recorder.Code = http.StatusInternalServerError
+		recorder.Body.WriteString(
+			`{"items":[{"sasl_password":"` + plaintext + `","username":"u"}],` +
+				`"meta":{"admin_secret":"` + plaintext + `","API_TOKEN":"` + plaintext + `"},` +
+				`"credential_reference":"sha256:abc123"}`)
+
+		rendered := safeResponseBody(recorder)
+
+		assert.NotContains(t, rendered, plaintext,
+			"a secret inside an array element or a nested object is the same disclosure; the scrub "+
+				"walks the whole decoded value, and matches the key case-insensitively")
+		assert.Contains(t, rendered, "sha256:abc123",
+			"credential_reference is the NON-REVERSIBLE reference the registry stores precisely so "+
+				"it can be shown, and withholding it would remove the field that identifies which "+
+				"issuance a diagnostic is about")
+	})
+
+	t.Run("a body that is not JSON is withheld entirely", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		recorder.Code = http.StatusBadGateway
+		recorder.Body.WriteString("upstream failure: password=" + plaintext)
+
+		rendered := safeResponseBody(recorder)
+
+		assert.NotContains(t, rendered, plaintext,
+			"there is no structure to sanitise in a plain-text body, so it is withheld rather than "+
+				"printed and hoped over")
+		assert.Contains(t, rendered, "not JSON",
+			"and the reason is stated, with a byte count, so the diagnostic is still actionable")
+		assert.Contains(t, rendered, "status=502")
+	})
+
+	t.Run("an empty body is reported as empty", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		recorder.Code = http.StatusNoContent
+
+		assert.Equal(t, "status=204 body=<empty>", safeResponseBody(recorder),
+			"an empty body is a fact worth reporting plainly: a 204 with a body would be the "+
+				"defect, and this is how a reader tells the two apart")
+	})
+
+	// AND THE CALL SITES ACTUALLY USE IT. A sanitiser nothing calls is decorative, and the
+	// idiom it replaces — `"...body: %s", recorder.Body.String()` — is the one every other
+	// assertion in this suite is written with, so it will be reached for again by anyone adding
+	// a case here. The region asserted on is the end-to-end issuance test, which is the only
+	// test in the file that holds a REAL password, plus the surface's shared error helper,
+	// which is used on the credential route as well as on the read routes.
+	t.Run("no diagnostic in the issuance test renders a raw body", func(t *testing.T) {
+		source, err := os.ReadFile("subscribers_api_test.go")
+		require.NoError(t, err, "this test reads its own file")
+
+		const anchor = "func TestIssueKafkaCredentials_ReturnsTheConnectionDetailsAndTheSecretExactlyOnce"
+		start := strings.Index(string(source), anchor)
+		require.Positive(t, start, "the end-to-end issuance test must exist under its own name")
+		end := strings.Index(string(source)[start:], "\n// TestSubscribersAPI_NoPersistedShape")
+		require.Positive(t, end, "the region must be bounded by the test that follows it")
+		region := string(source)[start : start+end]
+
+		// A raw body used as an assertion SUBJECT is fine and necessary — several assertions
+		// here check that a later read carries no password, which requires the untouched
+		// bytes. What must not appear is a raw body as a MESSAGE ARGUMENT, because that is
+		// what gets written out on failure. The region is whitespace-collapsed first so a
+		// wrapped call is matched the same as a single-line one.
+		collapsed := strings.Join(strings.Fields(region), " ")
+		diagnostic := regexp.MustCompile(`%s"[^)]*\.Body\.String\(\)`)
+
+		assert.Empty(t, diagnostic.FindAllString(collapsed, -1),
+			"every diagnostic in the end-to-end issuance test must render through "+
+				"safeResponseBody: this is the one test that holds a real SASL password, and a "+
+				"raw body in a failure message writes it to durable CI output")
+		assert.Contains(t, region, "safeResponseBody(",
+			"and it must still print something, or a failure becomes unfixable")
+
+		helper := string(source)[strings.Index(string(source), "func assertSubscribersErrorCode("):]
+		if closing := strings.Index(helper, "\n}\n"); closing > 0 {
+			helper = helper[:closing]
+		}
+		assert.Empty(t, diagnostic.FindAllString(strings.Join(strings.Fields(helper), " "), -1),
+			"assertSubscribersErrorCode is used on the credential route too, where its message "+
+				"renders because the request SUCCEEDED — so the body it would print is a "+
+				"credential response")
+	})
+}
+
 // TestSubscribersAPI_TypedCodesResolveToIntendedStatuses pins the status catalogue this
 // surface answers from.
 //
@@ -3554,5 +4362,363 @@ func TestSubscribersAPI_TypedCodesResolveToIntendedStatuses(t *testing.T) {
 			"AUTH_UNKNOWN_RESOURCE and AUTH_MASTER_KEY_REQUIRED both answer 403, so a "+
 				"status-only assertion cannot tell \"the gate refused me\" from \"the route "+
 				"prefix is missing from pathToResource and the surface does not exist\"")
+	})
+}
+
+// ---------------------------------------------------------------------------------------
+// The subscriber event stream — GET /subscribers/:subscriber_id/events
+//
+// # What this section owns, and what it deliberately leaves to the root package
+//
+// The gateway's filtering rule is exhaustively covered by event_stream_gateway_test.go, and
+// the broker half of the boundary — that a key-scoped principal's direct fetch is REFUSED by
+// Kafka's own authorizer — by event_isolation_integration_test.go against a live broker.
+//
+// What only this package can prove is the HTTP contract of the one data-plane route in the
+// subscriber surface: that the new path resolves for the authorization middleware at all, that
+// it is authenticated by the subscriber's secret rather than by an operator's master key, that
+// the secret is refused on a channel this deployment has not established as confidential, and
+// that a malformed cursor is refused rather than substituted.
+// ---------------------------------------------------------------------------------------
+
+// streamAPITestSecret is the plaintext the fixture row's credential reference is derived from.
+//
+// The reference is DERIVED here rather than written as a literal, because that is what the
+// gateway does to authenticate: it re-derives from the presented secret and compares in
+// constant time. A hand-written reference would make every positive case below fail and every
+// negative case pass for the wrong reason.
+const streamAPITestSecret = "the-secret-this-subscriber-was-issued"
+
+// streamAPIProvisionedRow returns a fixture row whose credential reference matches
+// streamAPITestSecret, optionally confined to a partition-key prefix.
+func streamAPIProvisionedRow(t *testing.T, subscriberID, keyPrefix string) *coremodel.EventSubscriber {
+	t.Helper()
+
+	row := subscribersFixtureRow(subscriberID)
+
+	reference, err := coremodel.DeriveCredentialReference(row.KafkaPrincipal, streamAPITestSecret)
+	require.NoError(t, err, "deriving the fixture's credential reference")
+	row.CredentialReference = &reference
+
+	if keyPrefix != "" {
+		row.PartitionKeyPrefix = &keyPrefix
+	}
+
+	return row
+}
+
+// streamAPIPath builds a well-formed stream request path for the subscriber's first granted
+// topic.
+func streamAPIPath(subscriberID string, query string) string {
+	topic := coremodel.SubscriberGrantableTopics(coremodel.DefaultEventTopicPrefix)[0]
+
+	path := fmt.Sprintf("/subscribers/%s/events?topic=%s", subscriberID, topic)
+	if query != "" {
+		path += "&" + query
+	}
+
+	return path
+}
+
+// streamAPIServe performs one stream request, optionally presenting a subscriber secret.
+//
+// The secret travels in a HEADER, which is the contract: a query string is written to access
+// logs, proxy logs and browser history by default, and this value is a live password.
+func streamAPIServe(
+	t *testing.T,
+	router *gin.Engine,
+	path, secret, principal, peer string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+
+	request := httptest.NewRequest(http.MethodGet, path, nil)
+
+	if secret != "" {
+		request.Header.Set("X-Blnk-Subscriber-Secret", secret)
+	}
+	if principal != "" {
+		request.Header.Set("X-Blnk-Subscriber-Principal", principal)
+	}
+
+	request.RemoteAddr = peer
+	if request.RemoteAddr == "" {
+		request.RemoteAddr = "127.0.0.1:54321"
+	}
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	return recorder
+}
+
+// TestSubscribersAPI_StreamRouteResolvesToTheSubscribersResource is the hard-blocker check for
+// the new path, and it is the same one every route on this surface needs.
+//
+// getResourceFromPath returns an EMPTY resource for an unmapped first path segment and the
+// middleware then aborts with ErrAuthUnknownResource — so a route whose prefix is missing from
+// pathToResource rejects every caller, master key included, and does so with a 403 that looks
+// like an ordinary permissions refusal. Registering the stream under /subscribers rather than
+// under a new prefix is what avoids that, and this asserts it rather than assuming it.
+//
+// The assertion is on the CODE and not the status, because ErrAuthUnknownResource and
+// ErrAuthInsufficientPermissions both resolve to 403 — which is precisely why the failure this
+// guards against is easy to miss.
+func TestSubscribersAPI_StreamRouteResolvesToTheSubscribersResource(t *testing.T) {
+	subscriberID := uniqueSubscriberID()
+	router, datasource := setupSubscribersRouter(t, subscribersHarness{secure: true})
+
+	// Scoped to another feature on purpose: what is under test is that the path RESOLVES and
+	// to what, not that this key may use it.
+	key := subscribersTestAPIKey(
+		middleware.BuildScope(middleware.ResourceLedgers, middleware.ActionAll))
+	datasource.On("GetAPIKey", mock.Anything, key.Key).Return(key, nil)
+
+	request := httptest.NewRequest(http.MethodGet, streamAPIPath(subscriberID, ""), nil)
+	request.Header.Set(middleware.KeyHeader, key.Key)
+	request.RemoteAddr = "127.0.0.1:54321"
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusForbidden, recorder.Code, "body: %s", recorder.Body.String())
+
+	var body struct {
+		ErrorDetail apierror.APIError `json:"error_detail"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
+
+	require.NotEqual(t, apierror.ErrAuthUnknownResource, body.ErrorDetail.Code,
+		"GET /subscribers/:id/events RESOLVES TO NO AUTHORIZATION RESOURCE, so the middleware "+
+			"aborts every request to it — including one carrying a correct subscriber secret. The "+
+			"route must stay under the /subscribers prefix, or \"events\" must be mapped as well")
+	assert.Equal(t, apierror.ErrAuthInsufficientPermissions, body.ErrorDetail.Code,
+		"a key scoped to another resource must be refused on PERMISSIONS, which is what proves the "+
+			"path resolved and was then judged")
+}
+
+// TestSubscribersAPI_StreamAuthenticatesWithTheSubscribersOwnSecret is the data-plane contract.
+//
+// # Why this route is not master-key gated, and why that is safe
+//
+// Every other route under /subscribers is an OPERATOR action. This one is the path a
+// SUBSCRIBER's own records take, because a key-scoped subscriber is granted Describe and no
+// Read at the broker and cannot fetch them itself. Gating it on the master key would mean
+// handing every subscriber Blnk's master credential.
+//
+// So it is authenticated by the subscriber's SASL secret, and the four cases below are the
+// whole of that contract: reaching the route without the master key is allowed, and being
+// SERVED by it requires the credential. The last case is the one that proves authentication
+// SUCCEEDED — it gets as far as the broker read and fails there, because this harness has no
+// broker.
+func TestSubscribersAPI_StreamAuthenticatesWithTheSubscribersOwnSecret(t *testing.T) {
+	subscriberID := uniqueSubscriberID()
+	row := streamAPIProvisionedRow(t, subscriberID, "")
+
+	t.Run("no master key is required to reach it, and no secret is refused", func(t *testing.T) {
+		// masterKey FALSE, which is what every other route on this surface answers
+		// ErrAuthMasterKeyRequired to. This one must not.
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: false})
+		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil).Maybe()
+
+		recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, ""), "", "", "")
+
+		assertErrorCode(t, recorder, http.StatusUnauthorized, apierror.ErrSubscriberCredentialInvalid)
+		assert.NotEqual(t, http.StatusForbidden, recorder.Code,
+			"a data-plane route must not answer ErrAuthMasterKeyRequired: a subscriber does not "+
+				"hold the master key and never should")
+	})
+
+	t.Run("the wrong secret is refused with the same answer", func(t *testing.T) {
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
+		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil)
+
+		recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, ""), "not-the-secret", "", "")
+
+		assertErrorCode(t, recorder, http.StatusUnauthorized, apierror.ErrSubscriberCredentialInvalid)
+		assert.NotContains(t, recorder.Body.String(), streamAPITestSecret,
+			"and the refusal discloses nothing about the credential it compared against")
+	})
+
+	t.Run("a topic outside the grant is refused after authentication", func(t *testing.T) {
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
+		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil)
+
+		// A REAL grantable topic that this row is not granted. The row holds the first of the
+		// grantable topics; this is the second, so the refusal is the row's grant rather than
+		// the topic catalogue.
+		other := coremodel.SubscriberGrantableTopics(coremodel.DefaultEventTopicPrefix)[1]
+		path := fmt.Sprintf("/subscribers/%s/events?topic=%s", subscriberID, other)
+
+		recorder := streamAPIServe(t, router, path, streamAPITestSecret, "", "")
+
+		assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrSubscriberTopicNotGranted)
+		assert.Contains(t, recorder.Body.String(), other,
+			"the refusal names the topic, which is safe: the caller sent it and can read its own "+
+				"grant through GET /subscribers/{id}")
+	})
+
+	t.Run("the correct secret reaches the broker read", func(t *testing.T) {
+		// NO BROKERS in this harness, so a request that authenticates and authorises correctly
+		// must fail at the READ and nowhere earlier. That is what makes this the positive
+		// authentication assertion: a 503 here can only be reached past both gates.
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
+		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil)
+
+		recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, ""), streamAPITestSecret, "", "")
+
+		assertErrorCode(t, recorder, http.StatusServiceUnavailable, apierror.ErrKafkaUnavailable)
+		assert.NotContains(t, recorder.Body.String(), "records",
+			"an unavailable stream must not be answered with an empty page: a client would read "+
+				"that as 'caught up' and advance nothing")
+
+		datasource.AssertCalled(t, "GetEventSubscriberByID", mock.Anything, subscriberID)
+	})
+
+	t.Run("a foreign principal is refused even with the right secret", func(t *testing.T) {
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
+		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil)
+
+		recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, ""),
+			streamAPITestSecret, "blnk-sub-somebody-else", "")
+
+		assertErrorCode(t, recorder, http.StatusUnauthorized, apierror.ErrSubscriberCredentialInvalid)
+	})
+}
+
+// TestSubscribersAPI_StreamRefusesAnInsecureTransport is the mirror of the credential
+// endpoint's gate, and the exposure runs the other way.
+//
+// Issuance is refused over a non-confidential channel because the RESPONSE carries a one-time
+// password. This route is refused because the REQUEST does, in a header, on every poll for as
+// long as the subscriber runs — so a plaintext consumer discloses a live credential
+// continuously rather than once.
+//
+// The store is the witness that the gate fires FIRST: a transport refusal after the registry
+// read would have already accepted the secret off the wire.
+func TestSubscribersAPI_StreamRefusesAnInsecureTransport(t *testing.T) {
+	subscriberID := uniqueSubscriberID()
+	router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
+
+	// 192.0.2.1 is httptest's default and is a documentation address, deliberately NOT
+	// loopback. No TLS was terminated in this process and no proxy is declared, so none of the
+	// three confidential channels applies.
+	recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, ""),
+		streamAPITestSecret, "", "192.0.2.1:12345")
+
+	assertErrorCode(t, recorder, http.StatusForbidden, apierror.ErrSubscriberInsecureTransport)
+	assert.Empty(t, datasource.Calls,
+		"the transport gate must refuse before the registry is read; a refusal afterwards has "+
+			"already taken the subscriber's live secret off a channel nobody established as "+
+			"confidential")
+}
+
+// TestSubscribersAPI_StreamRefusesAMalformedRequest draws the line between the parameters that
+// are CLAMPED and the ones that are refused.
+//
+// A page size or a wait out of range is clamped, because a caller asking for more than the
+// ceiling is expressing a throughput preference and the response reports what was actually
+// read. A value that is not a number at all is a client defect, and serving the default for
+// `offset=abc` would silently re-read from wherever the default points — duplicate processing
+// at best, skipped events at worst, with nothing in the response to say so.
+func TestSubscribersAPI_StreamRefusesAMalformedRequest(t *testing.T) {
+	subscriberID := uniqueSubscriberID()
+
+	for name, query := range map[string]string{
+		"a non-numeric offset":      "offset=abc",
+		"a non-numeric partition":   "partition=first",
+		"a non-numeric limit":       "limit=lots",
+		"a non-numeric wait":        "max_wait_ms=forever",
+		"an unrecognised parameter": "offsett=100",
+	} {
+		t.Run(name, func(t *testing.T) {
+			router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
+
+			recorder := streamAPIServe(t, router, streamAPIPath(subscriberID, query),
+				streamAPITestSecret, "", "")
+
+			require.Equal(t, http.StatusBadRequest, recorder.Code, "body: %s", recorder.Body.String())
+			assert.Empty(t, datasource.Calls,
+				"a malformed request must be refused in memory, before the registry is read")
+		})
+	}
+
+	t.Run("a request naming no topic is refused as a missing parameter", func(t *testing.T) {
+		router, datasource := setupSubscribersRouter(t, subscribersHarness{masterKey: true})
+		row := streamAPIProvisionedRow(t, subscriberID, "")
+		datasource.On("GetEventSubscriberByID", mock.Anything, subscriberID).Return(row, nil)
+
+		recorder := streamAPIServe(t, router, "/subscribers/"+subscriberID+"/events",
+			streamAPITestSecret, "", "")
+
+		assertErrorCode(t, recorder, http.StatusBadRequest, apierror.ErrGenMissingParameter)
+	})
+}
+
+// TestSubscriberEventStreamResponse_ProjectsThePageWithoutReEncodingTheEnvelope pins the wire
+// projection, which is the one piece of the stream contract that lives in this package.
+//
+// Two properties, and both are the kind that only fail in production. The envelope must be
+// EMBEDDED rather than re-encoded, or a subscriber comparing a record read here against the
+// same record read from the topic finds two different payloads. And an empty page must be `[]`
+// rather than `null`, because a caught-up subscriber is the ordinary steady state and every
+// client would otherwise have to special-case it.
+func TestSubscriberEventStreamResponse_ProjectsThePageWithoutReEncodingTheEnvelope(t *testing.T) {
+	// Keys out of alphabetical order and an integer beyond float64's exact range: both survive
+	// a byte copy and neither survives a decode-and-re-encode.
+	envelope := `{"schema_version":1,"event_id":"9f1c","payload":{"amount":9007199254740993}}`
+	stamp := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+
+	page := blnk.SubscriberStreamPage{
+		SubscriberID:     "sub_0f6e2c8a",
+		Topic:            "blnk.transactions",
+		Partition:        3,
+		Records:          []blnk.SubscriberStreamRecord{{Offset: 41, Partition: 3, Key: "ldg_acme", Timestamp: stamp, Value: []byte(envelope)}},
+		NextOffset:       42,
+		HighWatermark:    99,
+		LogStartOffset:   7,
+		RecordsScanned:   5,
+		RecordsWithheld:  4,
+		Truncated:        true,
+		KeyScope:         "ldg_acme",
+		KeyScopeEnforced: true,
+	}
+
+	body, err := json.Marshal(subscriberEventStreamResponse(page))
+	require.NoError(t, err)
+
+	assert.Contains(t, string(body), `"event":`+envelope,
+		"the envelope must be EMBEDDED byte for byte. A re-marshal would reorder the keys and "+
+			"turn 9007199254740993 into 9007199254740992, so a subscriber comparing this against "+
+			"the same record read from the topic would find two different events")
+
+	var decoded map[string]interface{}
+	require.NoError(t, json.Unmarshal(body, &decoded))
+
+	for _, key := range []string{
+		"subscriber_id", "topic", "partition", "records", "next_offset", "high_watermark",
+		"log_start_offset", "records_scanned", "records_withheld", "truncated",
+		"key_scope", "key_scope_enforced",
+	} {
+		assert.Contains(t, decoded, key, "the response must carry %q", key)
+	}
+
+	assert.Equal(t, float64(42), decoded["next_offset"])
+	assert.Equal(t, float64(4), decoded["records_withheld"],
+		"the withheld count is what makes an empty page legible as a working filter rather than "+
+			"a broken feed")
+
+	t.Run("an empty page is [] and not null", func(t *testing.T) {
+		empty, err := json.Marshal(subscriberEventStreamResponse(blnk.SubscriberStreamPage{}))
+		require.NoError(t, err)
+
+		assert.Contains(t, string(empty), `"records":[]`,
+			"a caught-up subscriber is the ordinary state; null would force every client to "+
+				"special-case it")
+		assert.NotContains(t, string(empty), `"key_scope":`,
+			"and a subscriber with no prefix omits the scope rather than reporting an empty one, "+
+				"which as a filter would match nothing")
+		assert.Contains(t, string(empty), `"key_scope_enforced":false`,
+			"while the boolean is always present, so a client can branch on it without first "+
+				"testing whether the scope string is empty")
 	})
 }

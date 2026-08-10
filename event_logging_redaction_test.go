@@ -19,6 +19,7 @@ package blnk
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/blnkfinance/blnk/config"
 	"github.com/blnkfinance/blnk/internal/logsafe"
 	"github.com/blnkfinance/blnk/model"
 )
@@ -247,4 +249,139 @@ func TestEventPipelineLogging_NoSiteUsesLogrusWithError(t *testing.T) {
 				strings.Join(offending, "\n"))
 		})
 	}
+}
+
+// credentialConfigurationFields names every configuration field that holds a credential,
+// by its Go path in config.Configuration.
+//
+// It exists so that TestConfiguredCredentials_CannotSurviveALogLine can be complete rather
+// than illustrative. The test walks the configuration tree, and any field that looks like a
+// credential and is absent from this map fails it — so adding a credential to the
+// configuration forces a decision here instead of quietly arriving unredacted.
+//
+// A field is listed with false when its name reads like a credential but its value is not
+// one; there are none today, and the entry form exists so that a routing field named
+// "…Key" can be classified with a reason rather than by weakening the redaction rule.
+var credentialConfigurationFields = map[string]bool{
+	".AwsSecretAccessKey":        true,
+	".Server.SecretKey":          true,
+	".Server.MetricsBearerToken": true,
+	".TypeSenseKey":              true,
+	".TokenizationSecret":        true,
+	".Kafka.SASLSecret":          true,
+	".Kafka.SASLAdminSecret":     true,
+}
+
+// TestConfiguredCredentials_CannotSurviveALogLine is the guard that ties redaction to THIS
+// deployment's own credentials rather than to a hand-written list of plausible key names.
+//
+// The inputs are read from config.Configuration's envconfig tags, so the test follows a
+// rename of a variable automatically, and a rename to a spelling redaction does not
+// recognise fails here instead of leaking in production. That matters because a dependency
+// error routinely quotes the setting it rejected: a Kafka client reports the property it
+// could not authenticate with, and a Postgres driver quotes the DSN back.
+func TestConfiguredCredentials_CannotSurviveALogLine(t *testing.T) {
+	t.Parallel()
+
+	discovered := credentialEnvironmentVariables(t, reflect.TypeOf(config.Configuration{}), "")
+
+	require.NotEmpty(t, discovered,
+		"the walk found no credential fields at all, which means it is broken rather than that none exist")
+	require.Contains(t, discovered, "KAFKA_SASL_ADMIN_SECRET",
+		"the admin credential this feature introduces must be among the fields under test")
+
+	const value = "sUp3r-s3cr3t-v4lu3"
+
+	for _, variable := range discovered {
+		t.Run(variable, func(t *testing.T) {
+			t.Parallel()
+
+			redacted := logsafe.Cause(fmt.Errorf(
+				"authentication failed for connection settings %s=%s", variable, value))
+
+			assert.NotContains(t, redacted, value,
+				"a configured credential must not survive redaction: %s", redacted)
+			assert.Contains(t, redacted, variable+"="+logsafe.Placeholder,
+				"and the variable name must survive so the line names what failed: %s", redacted)
+		})
+	}
+}
+
+// credentialEnvironmentVariables walks a configuration struct and returns the environment
+// variable name of every field that holds a credential.
+//
+// Classification is by the field's GO name, which is deliberately a different signal from
+// the environment-variable spelling that redaction matches on — a test that classified by
+// the same signal it is testing would agree with the implementation by construction and
+// prove nothing.
+//
+// Parameters:
+//   - t *testing.T: the test, failed when a credential-looking field is unclassified.
+//   - structType reflect.Type: the struct to walk.
+//   - path string: the Go path accumulated so far, empty at the root.
+//
+// Returns:
+//   - []string: the environment variable names of the credential-bearing fields.
+func credentialEnvironmentVariables(t *testing.T, structType reflect.Type, path string) []string {
+	t.Helper()
+
+	if structType.Kind() == reflect.Ptr {
+		structType = structType.Elem()
+	}
+
+	if structType.Kind() != reflect.Struct {
+		return nil
+	}
+
+	variables := make([]string, 0, 8)
+
+	for index := 0; index < structType.NumField(); index++ {
+		field := structType.Field(index)
+		fieldPath := path + "." + field.Name
+
+		if fieldNameReadsAsCredential(field.Name) {
+			isCredential, classified := credentialConfigurationFields[fieldPath]
+			require.True(t, classified,
+				"configuration field %s reads as a credential and is unclassified: add it to "+
+					"credentialConfigurationFields, true when its value is a secret", fieldPath)
+
+			if isCredential {
+				variable := field.Tag.Get("envconfig")
+				require.NotEmpty(t, variable,
+					"credential field %s carries no envconfig tag, so nothing names it in a log line",
+					fieldPath)
+				variables = append(variables, variable)
+			}
+		}
+
+		fieldType := field.Type
+		if fieldType.Kind() == reflect.Ptr {
+			fieldType = fieldType.Elem()
+		}
+
+		if fieldType.Kind() == reflect.Struct && fieldType != structType {
+			variables = append(variables, credentialEnvironmentVariables(t, fieldType, fieldPath)...)
+		}
+	}
+
+	return variables
+}
+
+// fieldNameReadsAsCredential reports whether a Go field name says the field holds a secret.
+//
+// Parameters:
+//   - name string: the exported field name.
+//
+// Returns:
+//   - bool: whether the name names a credential.
+func fieldNameReadsAsCredential(name string) bool {
+	lowered := strings.ToLower(name)
+
+	for _, word := range []string{"secret", "password", "token", "credential", "apikey"} {
+		if strings.Contains(lowered, word) {
+			return true
+		}
+	}
+
+	return strings.HasSuffix(lowered, "key")
 }

@@ -159,26 +159,33 @@ func (l *Blnk) checkBalanceMonitors(ctx context.Context, updatedBalance *model.B
 				// durable before the first attempt, so a process that dies in the window still
 				// loses the alert.
 				//
-				// THIS IS NOT THE ONLY SUCH CASE, and saying it was is a claim this comment
-				// used to make. There are exactly THREE post-commit captures in this
-				// repository, they are at-most-once for the same structural reason, and each
-				// is documented as an exception to requirement R-2 rather than as an instance
-				// of it:
+				// THIS IS NOT THE ONLY SUCH SITE, and saying it was is a claim this comment
+				// used to make. Three places in this repository spend a bounded budget on a
+				// capture whose mutation has already committed — that is the SITE set, and it
+				// is NOT the same thing as the set of event types a subscriber must treat as
+				// at-most-once. Conflating the two is how this comment once asserted that a
+				// coalesced batch's events were an exception to requirement R-2 when they are
+				// not:
 				//
 				//   1. balance.monitor — this call site. The balance movement that met the
 				//      condition committed under another transaction.
-				//   2. bulk_transaction.<status> — sendBulkTransactionWebhook. A batch
-				//      summary belongs to no single mutation and there is no batch-spanning
-				//      transaction to join.
+				//   2. bulk_transaction.<status> — finalizeBulkBatchOutcome's retry loop. The
+				//      batch's member transactions are durable before the summary is written.
+				//      The summary is nonetheless ATOMIC with the batch's terminal coordinator
+				//      record, including for a batch whose start was never recorded, which the
+				//      repository adopts into that same transaction.
 				//   3. The status-derived transaction.* events of a COALESCED batch —
-				//      postTransactionActions' fallback. Its writer is called from
-				//      transaction_coalescing.go, which AAP §0.6.2 freezes.
+				//      postTransactionActions' fallback. These are NOT at-most-once: the
+				//      coalescing writer derives the same rows and inserts them inside its own
+				//      transaction (resolveBatchEventOutboxes), and the derived event id makes
+				//      this site's copy a recognised duplicate that is suppressed. The site
+				//      exists so a transaction the writer did not record still gets an event.
 				//
-				// All three spend the same bounded budget and log every attempt, and
-				// docs/event-streaming.md states the set and what it costs a subscriber —
-				// along with the system.error escalation that makes an exhausted budget
-				// visible rather than silent. Every OTHER event type carries the full
-				// transactional guarantee.
+				// PublishEventDurably states both sets side by side, the constant
+				// PostCommitEventCaptureContract declares the event-type set once, and
+				// docs/event-streaming.md publishes it with the narrow condition under which
+				// each member is reached — along with the system.error escalation that makes an
+				// exhausted budget visible rather than silent.
 				//
 				// ctx is passed through rather than detached because the only caller —
 				// runTransactionPostCommitWorkWithHooks in transaction_execution.go — already

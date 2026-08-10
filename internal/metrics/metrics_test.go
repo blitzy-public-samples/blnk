@@ -109,6 +109,9 @@ var (
 	_ metric.Int64Counter     = EventsDeadLetteredTotal
 	_ metric.Float64Gauge     = DLTOldestMessageAgeSeconds
 	_ metric.Int64Gauge       = OutboxPendingBacklog
+	_ metric.Int64Gauge       = EventRepairBacklog
+	_ metric.Int64Counter     = EventRepairsCompletedTotal
+	_ metric.Int64Gauge       = EventRepairSaturated
 
 	// The two lag instruments are ASYNCHRONOUS, and the distinction this guard enforces
 	// is the whole cardinality fix rather than a stylistic preference. A synchronous
@@ -233,6 +236,9 @@ func eventStreamingInstruments() []namedInstrument {
 		{"SubscriberConsumerLag", SubscriberConsumerLag},
 		{"ConsumerLagUnmeasuredPartitions", ConsumerLagUnmeasuredPartitions},
 		{"OutboxPendingBacklog", OutboxPendingBacklog},
+		{"EventRepairBacklog", EventRepairBacklog},
+		{"EventRepairsCompletedTotal", EventRepairsCompletedTotal},
+		{"EventRepairSaturated", EventRepairSaturated},
 		{"EventsPurgedTotal", EventsPurgedTotal},
 		{"SubscriberRevocationsPending", SubscriberRevocationsPending},
 		{"OldestSubscriberRevocationAgeSeconds", OldestSubscriberRevocationAgeSeconds},
@@ -248,12 +254,15 @@ func eventStreamingInstruments() []namedInstrument {
 		{"OldestSubscriberRevocationFailureAgeSeconds", OldestSubscriberRevocationFailureAgeSeconds},
 		{"SubscribersUnmeasured", SubscribersUnmeasured},
 		{"SubscribersRegistered", SubscribersRegistered},
+		{"SubscriberMeasurementBudget", SubscriberMeasurementBudget},
 		{"ConsumerLagInventoryComplete", ConsumerLagInventoryComplete},
 		{"SubscriberLagPassAgeSeconds", SubscriberLagPassAgeSeconds},
 		{"SubscriberLagCoveredSubscribers", SubscriberLagCoveredSubscribers},
 		{"EventMetricsCollectionFailuresTotal", EventMetricsCollectionFailuresTotal},
 		{"EventMetricsLastCollectionAgeSeconds", EventMetricsLastCollectionAgeSeconds},
 		{"EventMetricsLastSuccessAgeSeconds", EventMetricsLastSuccessAgeSeconds},
+		{"SubscriberStreamRecordsDelivered", SubscriberStreamRecordsDelivered},
+		{"SubscriberStreamRecordsWithheld", SubscriberStreamRecordsWithheld},
 	}
 }
 
@@ -397,6 +406,9 @@ func TestEventStreamingInstruments_DeclaredKindsMatchTheirInstrumentType(t *test
 		{"SubscriberConsumerLag", SubscriberConsumerLag, (*metric.Int64ObservableGauge)(nil)},
 		{"ConsumerLagUnmeasuredPartitions", ConsumerLagUnmeasuredPartitions, (*metric.Int64ObservableGauge)(nil)},
 		{"OutboxPendingBacklog", OutboxPendingBacklog, (*metric.Int64Gauge)(nil)},
+		{"EventRepairBacklog", EventRepairBacklog, (*metric.Int64Gauge)(nil)},
+		{"EventRepairsCompletedTotal", EventRepairsCompletedTotal, (*metric.Int64Counter)(nil)},
+		{"EventRepairSaturated", EventRepairSaturated, (*metric.Int64Gauge)(nil)},
 		{"EventsPurgedTotal", EventsPurgedTotal, (*metric.Int64Counter)(nil)},
 		{"SubscriberRevocationsPending", SubscriberRevocationsPending, (*metric.Int64Gauge)(nil)},
 		{
@@ -444,6 +456,14 @@ func TestEventStreamingInstruments_DeclaredKindsMatchTheirInstrumentType(t *test
 		},
 		{"SubscribersUnmeasured", SubscribersUnmeasured, (*metric.Int64Gauge)(nil)},
 		{"SubscribersRegistered", SubscribersRegistered, (*metric.Int64Gauge)(nil)},
+		{
+			// A LEVEL, not a total: the budget is reconfigurable, and the headroom query
+			// subtracts the registry size from it, so a counter here would accumulate the
+			// configured value on every tick and read as headroom that only ever grows.
+			"SubscriberMeasurementBudget",
+			SubscriberMeasurementBudget,
+			(*metric.Int64Gauge)(nil),
+		},
 		{"ConsumerLagInventoryComplete", ConsumerLagInventoryComplete, (*metric.Int64Gauge)(nil)},
 		{"SubscriberLagPassAgeSeconds", SubscriberLagPassAgeSeconds, (*metric.Float64Gauge)(nil)},
 		{
@@ -469,6 +489,19 @@ func TestEventStreamingInstruments_DeclaredKindsMatchTheirInstrumentType(t *test
 			"EventMetricsLastSuccessAgeSeconds",
 			EventMetricsLastSuccessAgeSeconds,
 			(*metric.Float64ObservableGauge)(nil),
+		},
+		{
+			// COUNTERS, and the kind decides whether the pair is readable at all: both are
+			// per-record events and the reading is their RATE, which a gauge would destroy by
+			// keeping only whatever value happened to be current at scrape time.
+			"SubscriberStreamRecordsDelivered",
+			SubscriberStreamRecordsDelivered,
+			(*metric.Int64Counter)(nil),
+		},
+		{
+			"SubscriberStreamRecordsWithheld",
+			SubscriberStreamRecordsWithheld,
+			(*metric.Int64Counter)(nil),
 		},
 	}
 
@@ -1095,6 +1128,16 @@ func recordEveryEventInstrument(ctx context.Context) {
 
 	OutboxPendingBacklog.Record(ctx, 7)
 
+	// The three REPAIR instruments, recorded under BOTH legs because the attribute domain is
+	// closed at two and the assertions below read the exported key set. Recording one leg would
+	// let the other's spelling drift.
+	for _, leg := range []string{"dead_letter", "legacy_webhook"} {
+		attributes := metric.WithAttributes(attribute.String("leg", leg))
+		EventRepairBacklog.Record(ctx, 12, attributes)
+		EventRepairsCompletedTotal.Add(ctx, 4, attributes)
+		EventRepairSaturated.Record(ctx, 1, attributes)
+	}
+
 	EventsPurgedTotal.Add(ctx, 3)
 
 	SubscriberRevocationsPending.Record(ctx, 2)
@@ -1123,6 +1166,9 @@ func recordEveryEventInstrument(ctx context.Context) {
 		attribute.String("reason", "budget"),
 	))
 	SubscribersRegistered.Record(ctx, 3)
+	// The configured budget, published beside the size so headroom is a difference of two
+	// series rather than a literal that is wrong wherever the budget was raised.
+	SubscriberMeasurementBudget.Record(ctx, 200)
 	ConsumerLagInventoryComplete.Record(ctx, 0)
 	SubscriberLagPassAgeSeconds.Record(ctx, 12)
 	SubscriberLagCoveredSubscribers.Record(ctx, 2)
@@ -1135,6 +1181,16 @@ func recordEveryEventInstrument(ctx context.Context) {
 		attribute.String("collection", "outbox_backlog"),
 	))
 	RecordEventMetricsCollection(time.Now().Add(-30*time.Second), true)
+
+	// THE GATEWAY PAIR, recorded together and with the SAME attribute tuple, because they are
+	// read together: the whole diagnostic value of the withheld count is as a proportion of the
+	// delivered one, and two different tuples could not be divided by each other in a query.
+	streamAttributes := metric.WithAttributes(
+		attribute.String("topic", "blnk.transactions"),
+		attribute.Bool("key_scoped", true),
+	)
+	SubscriberStreamRecordsDelivered.Add(ctx, 4, streamAttributes)
+	SubscriberStreamRecordsWithheld.Add(ctx, 6, streamAttributes)
 }
 
 // collectScopeMetrics collects one snapshot and returns the metrics of the "blnk"
@@ -1269,6 +1325,21 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 			description: "Number of event outbox rows not yet published to Kafka",
 		},
 		{
+			name:        "blnk.events.repair.backlog",
+			unit:        "{event}",
+			description: "Event outbox rows a repair leg still owes, by leg",
+		},
+		{
+			name:        "blnk.events.repair.completed.total",
+			unit:        "{event}",
+			description: "Event outbox rows repaired to their destination, by leg",
+		},
+		{
+			name:        "blnk.events.repair.saturated",
+			unit:        "{state}",
+			description: "1 when a repair pass spent its whole per-tick budget with work outstanding, by leg",
+		},
+		{
 			name:        "blnk.events.purged.total",
 			unit:        "{event}",
 			description: "Terminal event outbox rows deleted by the retention sweep",
@@ -1352,6 +1423,15 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 				"and the measurement budget's headroom is visible before it is exhausted",
 		},
 		{
+			// The other half of that headroom. Exported because the query used to name the
+			// DEFAULT as a literal, which is wrong on every deployment that raised the budget.
+			name: "blnk.subscribers.measurement_budget",
+			unit: "{subscriber}",
+			description: "Subscribers one consumer-lag sweep may measure, as configured, so headroom is a " +
+				"difference of two series rather than a literal that is wrong wherever the " +
+				"budget was raised",
+		},
+		{
 			name:        "blnk.kafka.consumer_lag_inventory_complete",
 			unit:        "{status}",
 			description: "1 when the last lag sweep measured every registered subscriber, 0 when it did not",
@@ -1383,6 +1463,20 @@ func TestEventStreamingInstruments_ExportedDescriptors(t *testing.T) {
 			name:        "blnk.event_metrics.last_success_age_seconds",
 			unit:        "s",
 			description: "Seconds since the periodic event-metrics collector last completed a collection with no failures",
+		},
+		// THE GATEWAY PAIR. The unit is {record} on both, because the pair is only meaningful
+		// read together — a delivered rate beside a withheld rate is what says whether the
+		// partition-key boundary is filtering anything — and a unit divergence would put the
+		// two on different exported series names.
+		{
+			name:        "blnk.subscriber_stream.records.delivered",
+			unit:        "{record}",
+			description: "Records the subscriber stream gateway returned to a subscriber, by topic and whether the subscriber is key-scoped",
+		},
+		{
+			name:        "blnk.subscriber_stream.records.withheld",
+			unit:        "{record}",
+			description: "Records the subscriber stream gateway excluded because the subscriber's partition-key prefix does not admit them, by topic and whether the subscriber is key-scoped",
 		},
 	}
 
@@ -1587,6 +1681,15 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 		// Deliberately unattributed: one process has one outbox backlog, so a label
 		// would add cardinality without adding information.
 		{metric: "blnk.outbox.pending", keys: nil},
+		// The three REPAIR instruments all carry `leg` and nothing else. The label is
+		// necessary — the two legs fill under different conditions and have different
+		// remedies, so a summed backlog would tell an operator neither which one is owed nor
+		// which knob to reach for — and it is CLOSED at two values, so it adds no unbounded
+		// cardinality. Nothing else is attributed: a topic or an event-type breakdown would
+		// multiply the series by a dimension no repair decision is made on.
+		{metric: "blnk.events.repair.backlog", keys: []string{"leg"}},
+		{metric: "blnk.events.repair.completed.total", keys: []string{"leg"}},
+		{metric: "blnk.events.repair.saturated", keys: []string{"leg"}},
 		// The coverage boolean is one fact about one sweep, so it carries nothing. A
 		// per-subscriber breakdown would defeat its purpose: the whole reason it exists is
 		// that an unmeasured subscriber has no series of its own to attribute anything to.
@@ -1622,6 +1725,8 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 		// The registry size, unattributed, so the unmeasured count above reads as a
 		// proportion of it.
 		{metric: "blnk.subscribers.registered", keys: nil},
+		// The configured sweep budget, one number per process, so it carries no label either.
+		{metric: "blnk.subscribers.measurement_budget", keys: nil},
 		// The lag sweep's own progress, one pass per process, so neither carries a label.
 		{metric: "blnk.kafka.consumer_lag.pass_age_seconds", keys: nil},
 		{metric: "blnk.kafka.consumer_lag.covered_subscribers", keys: nil},
@@ -1642,6 +1747,21 @@ func TestEventStreamingInstruments_ExportedAttributeKeys(t *testing.T) {
 		// to separate a stuck pass from a busy one, and that question has no per-subject
 		// breakdown.
 		{metric: "blnk.subscribers.obligations_settled.total", keys: nil},
+		// THE GATEWAY PAIR, and the two keys are the whole contract. topic is what makes a
+		// withheld rate readable per stream; key_scoped is what separates the subscribers the
+		// filter applies to from the ones it does not, so a zero withheld count can be
+		// interpreted rather than merely observed. Subscriber identity is deliberately ABSENT:
+		// an id is caller-chosen and unbounded, and one series per subscriber would accumulate
+		// for the life of the process — the lag gauges carry it only because a lag figure is
+		// meaningless without it and they have an explicit budget.
+		{
+			metric: "blnk.subscriber_stream.records.delivered",
+			keys:   []string{"topic", "key_scoped"},
+		},
+		{
+			metric: "blnk.subscriber_stream.records.withheld",
+			keys:   []string{"topic", "key_scoped"},
+		},
 	}
 
 	require.Len(t, cases, len(eventStreamingInstruments()),

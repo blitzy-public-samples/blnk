@@ -29,7 +29,7 @@ services:
       # Not a verbosity switch. Each role registers its metrics endpoint only when
       # the OpenTelemetry SDK was set up, and the SDK is set up only when this is
       # true (cmd/server.go initializeRouter, cmd/workers.go monitoring server).
-      # With it false there is NO /metrics route, every scrape 404s, and the eight
+      # With it false there is NO /metrics route, every scrape 404s, and the 13
       # rules in alerts/blnk-kafka-alerts.yml can never fire because their series
       # are never recorded.
       #
@@ -91,15 +91,39 @@ services:
       # "kafka:9092" — reachable on this compose network and nowhere else — so
       # reporting it to a subscriber would return an endpoint it cannot dial. The
       # broker advertises its EXTERNAL listener as localhost:9092, published on the
-      # host below, and that is what a subscriber connects to. Issuance refuses with
-      # 503 rather than falling back when this is empty.
+      # host below, and that is what a subscriber connects to. It is an OPTIONAL OVERRIDE:
+      # left empty, issuance falls back to KAFKA_BROKERS and warns that it is handing out
+      # an internal address, so a 200 is not by itself proof the endpoint is dialable.
+      # Issuance is refused with 503 SUBSCRIBER_BROKERS_NOT_CONFIGURED only when NEITHER
+      # list is set.
       KAFKA_SUBSCRIBER_BROKERS: ${KAFKA_SUBSCRIBER_BROKERS:-localhost:9092}
+      # WHETHER ANYTHING IN FRONT OF THE BROKERS AUTHORISES RECORD KEYS. "none", the
+      # shipped value, means nothing does — and because Kafka's authorizer has no
+      # message-key dimension, credential issuance then REFUSES a subscriber that records
+      # a partition_key_prefix rather than handing out a credential whose declared
+      # boundary nothing keeps. Set "broker_gateway", together with a gateway list below
+      # that is non-empty AND different from KAFKA_BROKERS, only when you operate a
+      # component that really evaluates keys; Blnk validates and routes to that
+      # declaration, it does not implement it.
+      KAFKA_KEY_SCOPE_ENFORCEMENT: ${KAFKA_KEY_SCOPE_ENFORCEMENT:-none}
+      # The addresses that component listens on, reported to a key-scoped subscriber in
+      # place of KAFKA_SUBSCRIBER_BROKERS so the credential names the endpoint that
+      # enforces its scope. Ignored unless the mode above is broker_gateway.
+      KAFKA_KEY_SCOPE_GATEWAY_BROKERS: ${KAFKA_KEY_SCOPE_GATEWAY_BROKERS:-}
       KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-blnk}
       # The namespaces this deployment USED TO own, so a KAFKA_TOPIC_PREFIX rename does
       # not strand the events captured before it. Empty in every stack that has never
       # renamed. See .env.example for what listing a prefix does and why the list is
-      # drained rather than accumulated. NOT passed to the worker: that role publishes
-      # nothing, so it resolves no writer.
+      # drained rather than accumulated.
+      #
+      # NOT passed to the worker, and the reason is narrower than "that role publishes
+      # nothing". Capture DOES consult the owned-prefix set: database/event_outbox.go
+      # validates a row's destination topic against it at insert. But a NEW row's topic is
+      # composed by TopicForEvent from the CONFIGURED prefix alone, so a historical name
+      # cannot arrive on an insert and the historical list can never decide whether one is
+      # accepted. Only the publisher, the dead-letter write and replay read stored topics,
+      # and all three run in the server. Forwarding it to the worker would add no
+      # capability and would imply the role honours a setting it cannot reach.
       KAFKA_HISTORICAL_TOPIC_PREFIXES: ${KAFKA_HISTORICAL_TOPIC_PREFIXES:-}
       # Steady-state producer principal — the identity Blnk publishes ledger events
       # as, and deliberately NOT the administrator. A publisher authenticating as the
@@ -142,13 +166,27 @@ services:
       # hence the acknowledgement here; it is warned about on every configuration
       # load so its presence in a real deployment cannot go unnoticed.
       #
-      # KAFKA_TLS_CA_FILE and the other certificate settings are deliberately NOT
-      # plumbed through: they name paths inside the container, so using them means
-      # adding a mount for the material anyway, and a variable that cannot work
-      # without an accompanying edit here is better absent than half-wired.
       KAFKA_TLS_ENABLED: ${KAFKA_TLS_ENABLED:-false}
       KAFKA_INSECURE_LOCAL_DEV: ${KAFKA_INSECURE_LOCAL_DEV:-false}
       KAFKA_TLS_INSECURE_SKIP_VERIFY: ${KAFKA_TLS_INSECURE_SKIP_VERIFY:-false}
+      # THE CERTIFICATE PATHS ARE FORWARDED, AND A MOUNT IS STILL YOUR JOB. These four
+      # were once left out on the reasoning that they name paths INSIDE the container,
+      # so setting one means adding a volume for the material anyway. The path part is
+      # true and the conclusion was not: with the variable unforwarded, an operator who
+      # adds the mount has no way to point the client at it, and one who sets the key in
+      # .env gets silence rather than an error. Forwarding them leaves exactly one step
+      # to take deliberately — mount the CA, certificate and key under a path you name
+      # here — instead of two, one of which is invisible.
+      #
+      # Empty is the shipped value for all four, which selects the system trust store
+      # and no client certificate. KAFKA_TLS_SERVER_NAME overrides the name verified in
+      # the broker's certificate and is for the case where you connect through an
+      # address that does not appear in it; leave it empty otherwise, because setting it
+      # wrongly is indistinguishable from disabling verification.
+      KAFKA_TLS_CA_FILE: ${KAFKA_TLS_CA_FILE:-}
+      KAFKA_TLS_CERT_FILE: ${KAFKA_TLS_CERT_FILE:-}
+      KAFKA_TLS_KEY_FILE: ${KAFKA_TLS_KEY_FILE:-}
+      KAFKA_TLS_SERVER_NAME: ${KAFKA_TLS_SERVER_NAME:-}
       # Topic geometry, shared with scripts/kafka-provision.sh. The replication factor
       # is 1 here because a single-broker KRaft cluster cannot satisfy 3; the Kubernetes
       # manifests supply 3 through this same variable. Partition growth stays off:
@@ -157,6 +195,15 @@ services:
       KAFKA_MIN_PARTITIONS: ${KAFKA_MIN_PARTITIONS:-6}
       KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-1}
       KAFKA_ALLOW_PARTITION_GROWTH: ${KAFKA_ALLOW_PARTITION_GROWTH:-false}
+      # THE ESCAPE HATCH THAT LETS THE PUBLISHER BORROW THE ADMINISTRATIVE CREDENTIAL,
+      # forwarded so it can be turned on when it is genuinely needed and so its default
+      # is visible here rather than only in Go. False is the shipped value and the right
+      # one: publishing as the administrator means every ledger event is produced by the
+      # identity that creates topics, mints SCRAM credentials and rewrites ACLs, so a
+      # leaked producer credential becomes a compromise of the cluster's access model.
+      # Set it true only for a deployment mid-upgrade that has not yet provisioned a
+      # producer principal; it warns on every publisher construction while it is set.
+      KAFKA_ALLOW_ADMIN_PRODUCER: ${KAFKA_ALLOW_ADMIN_PRODUCER:-false}
       # The 30-day dual-delivery window. Give either end and the other is derived, so
       # "exactly 30 days" is a property of the code and not of your arithmetic. Both
       # may be left empty only while KAFKA_BROKERS is empty.
@@ -171,6 +218,48 @@ services:
       RELAY_MAX_RETRY_ATTEMPTS: ${RELAY_MAX_RETRY_ATTEMPTS:-5}
       RELAY_RETRY_BASE_BACKOFF_MS: ${RELAY_RETRY_BASE_BACKOFF_MS:-1000}
       RELAY_RETRY_MAX_BACKOFF_MS: ${RELAY_RETRY_MAX_BACKOFF_MS:-30000}
+      # OUTBOX RETENTION, and it is OFF by shipped default. Zero days means "keep
+      # everything", which is the only safe default for a destructive sweep over
+      # ledger-adjacent evidence: the correct period depends on jurisdiction, audit
+      # programme and any legal hold in force, none of which this file can know. Set the
+      # period deliberately, and read the purge-capacity line the relay logs at start-up
+      # against your event arrival rate — a capacity below arrivals means the table grows
+      # without bound however short the period is.
+      RELAY_EVENT_RETENTION_DAYS: ${RELAY_EVENT_RETENTION_DAYS:-0}
+      # How fast retention is enforced once it is on. These two DO have correct answers,
+      # so they are defaulted rather than left to mean "off": a batch size of zero would
+      # delete nothing at all, which is a silently broken sweeper rather than a disabled
+      # one. The per-sweep ceiling is what stops one sweep attempting an entire
+      # historical backlog on a live relay.
+      RELAY_EVENT_RETENTION_BATCH_SIZE: ${RELAY_EVENT_RETENTION_BATCH_SIZE:-1000}
+      RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP: ${RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP:-2000}
+      # THE REPAIR SWEEP'S THREE DIMENSIONS, forwarded because .env.example documents them and
+      # config/config.go resolves them: an operator who sets one and sees the bring-up succeed
+      # would otherwise have no way to learn it never reached the process. BATCH_SIZE is the
+      # lease-footprint factor — every row in a batch needs its own Kafka write and the whole
+      # batch must finish inside the 30-second claim lease. MAX_BATCHES_PER_TICK is the
+      # throughput factor, bounded so a large repair backlog cannot starve the publish loop it
+      # shares a tick with. CONCURRENCY mirrors the publish loop's width, and ordering is not at
+      # risk because rows are grouped by the same message key the publisher hashes. Zero or
+      # negative in any of the three takes the default; there is deliberately no way to switch
+      # repair off, because a deployment that stopped repairing would silently keep events that
+      # reached no topic at all.
+      RELAY_REPAIR_BATCH_SIZE: ${RELAY_REPAIR_BATCH_SIZE:-100}
+      RELAY_REPAIR_MAX_BATCHES_PER_TICK: ${RELAY_REPAIR_MAX_BATCHES_PER_TICK:-25}
+      RELAY_REPAIR_CONCURRENCY: ${RELAY_REPAIR_CONCURRENCY:-8}
+      # TWO PUBLISHED SPELLINGS OF ONE CEILING: how many subscriber registry rows a
+      # single consumer-lag sweep may measure. Each subscriber measured costs two broker
+      # round trips per authorised topic and one exported gauge series per topic, which is
+      # why there is a ceiling at all. Both names are forwarded because both are
+      # documented, and config.setRelayDefaults reconciles them onto one value and reports
+      # the disagreement when they differ.
+      #
+      # EACH FALLS BACK TO THE OTHER before falling back to the shipped 200, in the same
+      # nested form the producer pair above uses. Shipping a flat default for both would
+      # make setting ONE of them look like a disagreement between two explicit values, and
+      # start-up would warn about a conflict the operator did not create.
+      RELAY_SUBSCRIBER_METRICS_BUDGET: ${RELAY_SUBSCRIBER_METRICS_BUDGET:-${EVENT_METRICS_SUBSCRIBER_BUDGET:-200}}
+      EVENT_METRICS_SUBSCRIBER_BUDGET: ${EVENT_METRICS_SUBSCRIBER_BUDGET:-${RELAY_SUBSCRIBER_METRICS_BUDGET:-200}}
       #
       # THE BLNK_-PREFIXED ALIASES.
       #
@@ -191,8 +280,11 @@ services:
       #
       # Do not add a `${...}` to any line below.
       BLNK_KAFKA_BROKERS:
+      BLNK_KAFKA_SUBSCRIBER_BROKERS:
       BLNK_KAFKA_TOPIC_PREFIX:
       BLNK_KAFKA_HISTORICAL_TOPIC_PREFIXES:
+      BLNK_KAFKA_KEY_SCOPE_ENFORCEMENT:
+      BLNK_KAFKA_KEY_SCOPE_GATEWAY_BROKERS:
       BLNK_KAFKA_SASL_USER:
       BLNK_KAFKA_SASL_SECRET:
       BLNK_KAFKA_SASL_ADMIN_USER:
@@ -200,13 +292,26 @@ services:
       BLNK_KAFKA_TLS_ENABLED:
       BLNK_KAFKA_INSECURE_LOCAL_DEV:
       BLNK_KAFKA_TLS_INSECURE_SKIP_VERIFY:
+      BLNK_KAFKA_TLS_CA_FILE:
+      BLNK_KAFKA_TLS_CERT_FILE:
+      BLNK_KAFKA_TLS_KEY_FILE:
+      BLNK_KAFKA_TLS_SERVER_NAME:
       BLNK_KAFKA_MIN_PARTITIONS:
       BLNK_KAFKA_REPLICATION_FACTOR:
       BLNK_KAFKA_ALLOW_PARTITION_GROWTH:
+      BLNK_KAFKA_ALLOW_ADMIN_PRODUCER:
       BLNK_WEBHOOK_DEPRECATION_SUNSET_DATE:
       BLNK_RELAY_MAX_RETRY_ATTEMPTS:
       BLNK_RELAY_RETRY_BASE_BACKOFF_MS:
       BLNK_RELAY_RETRY_MAX_BACKOFF_MS:
+      BLNK_RELAY_EVENT_RETENTION_DAYS:
+      BLNK_RELAY_EVENT_RETENTION_BATCH_SIZE:
+      BLNK_RELAY_EVENT_RETENTION_MAX_BATCHES_PER_SWEEP:
+      BLNK_RELAY_REPAIR_BATCH_SIZE:
+      BLNK_RELAY_REPAIR_MAX_BATCHES_PER_TICK:
+      BLNK_RELAY_REPAIR_CONCURRENCY:
+      BLNK_RELAY_SUBSCRIBER_METRICS_BUDGET:
+      BLNK_EVENT_METRICS_SUBSCRIBER_BUDGET:
       # Log verbosity, in the same pass-through form and for the same reason. It is
       # forwarded because several of the event pipeline's diagnostics are per-event and
       # therefore emitted at DEBUG on purpose — the successful-publish lines in the relay
@@ -302,7 +407,7 @@ services:
       # Not a verbosity switch. Each role registers its metrics endpoint only when
       # the OpenTelemetry SDK was set up, and the SDK is set up only when this is
       # true (cmd/server.go initializeRouter, cmd/workers.go monitoring server).
-      # With it false there is NO /metrics route, every scrape 404s, and the eight
+      # With it false there is NO /metrics route, every scrape 404s, and the 13
       # rules in alerts/blnk-kafka-alerts.yml can never fire because their series
       # are never recorded.
       #
@@ -337,41 +442,44 @@ services:
       # counts and error rates.
       BLNK_METRICS_BEARER_TOKEN: ${BLNK_METRICS_BEARER_TOKEN:-}
       # ---------------------------------------------------------------------
-      # The same event-streaming configuration the server receives, with ONE deliberate
-      # difference: no administrative credential. The worker publishes events too —
-      # transaction.rejected is emitted from its rejection handler — so it needs the
-      # same topics and the same PRODUCER principal, and both processes read one .env
-      # so they cannot disagree about either. See the server service above for what
-      # each key does.
+      # FOUR EVENT-STREAMING KEYS, AND NO CREDENTIAL OF ANY KIND. `blnk workers`
+      # resolves to ProcessRoleWorker, and ProcessRole.PublishesEvents is an allowlist
+      # naming only the server — so this process builds the NO-OP publisher, opens no
+      # broker connection and administers nothing. What it DOES do is CAPTURE:
+      # transaction.rejected reaches blnk.event_outbox through RejectTransaction's
+      # post-transaction actions, inside the same database transaction as the rejection,
+      # and the relay in the server role publishes that row later.
       #
-      # KAFKA_SASL_ADMIN_USER AND KAFKA_SASL_ADMIN_SECRET ARE ABSENT ON PURPOSE. The
-      # worker performs no administrative work whatsoever: topic assurance, subscriber
-      # credential provisioning, ACL management and the offset reads behind consumer-lag
-      # measurement all run in the SERVER role, which is where the admin client is
-      # built. Handing a process a cluster-superuser credential it never uses only
-      # widens what a compromise of that process is worth. If a future change gives the
-      # worker administrative work, add the pair back in the same change that adds the
-      # work — not in advance.
+      # So the four keys below are exactly what CAPTURE reads, and each is here for a
+      # reason that survives the role having no producer:
+      #
+      #   KAFKA_BROKERS                    capture is gated on it being non-empty
+      #   KAFKA_TOPIC_PREFIX              composes the destination topic stamped on the row
+      #   WEBHOOK_DEPRECATION_SUNSET_DATE the dual-delivery decision, which this role acts on
+      #   RELAY_MAX_RETRY_ATTEMPTS        stamped on the row as its per-row retry budget
+      #
+      # EVERY CREDENTIAL IS ABSENT ON PURPOSE — the producer pair as well as the
+      # administrative pair. A credential that is not in this environment is not in
+      # `docker inspect`, not in /proc/<pid>/environ and not in a crash dump, and this
+      # role would never present either one. If a future change gives the worker
+      # publishing or administrative work, add the pair it needs in the same change that
+      # adds the work — not in advance.
+      #
+      # See the server service above for what each key does in full.
       KAFKA_BROKERS: ${KAFKA_BROKERS:-}
       KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-blnk}
-      # The producer pair, resolved exactly as the server resolves it. The administrative
-      # pair is DELIBERATELY ABSENT from this service: the worker publishes and never
-      # administers, so it needs no authority to create topics, mint credentials or rewrite
-      # ACLs. Only cmd/server.go builds an admin client — for topic assurance before the
-      # relay starts, and for the offset reads behind reconciliation — so handing the
-      # superuser credential to a second process would widen the credential's exposure for
-      # no capability it uses. config.KafkaConfig accepts an empty admin pair; what it
-      # refuses is a HALF-configured one.
       WEBHOOK_DEPRECATION_SUNSET_DATE: ${WEBHOOK_DEPRECATION_SUNSET_DATE:-}
       RELAY_MAX_RETRY_ATTEMPTS: ${RELAY_MAX_RETRY_ATTEMPTS:-5}
-      # NOTHING ELSE. Every Kafka credential, every piece of TLS material and the
-      # topic geometry are ABSENT from this role on purpose: `blnk workers` resolves to
-      # the worker process role, which selects the no-op publisher before the broker
-      # list is even read, so it opens no broker connection and administers nothing. A
-      # credential that is not in this environment is not in `docker inspect`, not in
-      # /proc/<pid>/environ and not in a crash dump. The four keys above ARE applied
-      # here, because capture is gated on the broker list and the row's topic and
-      # max_attempts are resolved where the row is written.
+      # NOTHING ELSE, and the omissions are a list this file is checked against rather
+      # than an accident. Every Kafka credential and every piece of TLS material: this
+      # role opens no broker connection. The topic geometry and the partition-growth
+      # switch: topic assurance runs in the server, before its relay starts. The
+      # key-scope declaration and the subscriber-facing broker list: only credential
+      # issuance reads them, and only the server serves that endpoint. The retry
+      # BACKOFFS, the retention settings and the consumer-lag budgets: only a relay waits
+      # between attempts, only the server sweeps, and only the server measures lag. And
+      # KAFKA_HISTORICAL_TOPIC_PREFIXES, because a new row's topic is composed from the
+      # CONFIGURED prefix alone — see the server service for the full reasoning.
       # The BLNK_-prefixed aliases of exactly the four keys above, in compose's
       # pass-through form. See the server service for why there is no `${...}` after
       # these colons and what breaks if one is added.
@@ -545,20 +653,34 @@ services:
   #   can authenticate anyone at all, so an image below that floor cannot be
   #   bootstrapped and local bring-up fails outright rather than degrading.
   #
-  #   SECURITY. 3.9.2 is the version this stack is TESTED against and is patched for
-  #   CVE-2026-33558, under which the NetworkClient renders whole requests and responses
-  #   at DEBUG level so that SASL credentials, SCRAM salts and salted passwords are
-  #   recoverable from a log file. Every release from 0.11.0 up to but not including
-  #   3.9.2, and 4.0.0, is affected.
+  #   SECURITY. 4.3.1 is the release this stack is TESTED against and it clears every
+  #   advisory floor below. Four advisories bear on this image; three have ranges firm
+  #   enough to pin against and the highest of those floors is 4.2.0. .env.example
+  #   carries the full per-advisory table at KAFKA_IMAGE, including what each one does
+  #   and why it does or does not reach this deployment. In short: CVE-2026-33558
+  #   (<=3.9.1, 4.0.0) leaks SCRAM credentials through DEBUG-level NetworkClient
+  #   logging and is the one that reaches this stack hardest, because provisioning calls
+  #   AlterUserScramCredentials; CVE-2026-35554 (<=3.9.1, <=4.0.1, <=4.1.1) misroutes
+  #   producer records to the wrong topic silently; CVE-2026-33557 (4.1.0-4.1.1) needs
+  #   OAUTHBEARER, which this stack does not enable; and CVE-2026-41115 is named there
+  #   without a range because none was verified.
   #
   # NO "SAFE UPGRADE TARGET" IS NAMED HERE, deliberately. A version written into a
   # comment as the safe one is correct on the day it is written and wrong from the next
   # advisory onward, and a stale recommendation is worse than none because it is read as
   # current: this comment previously named 4.0.1, which a later advisory superseded.
-  # What is durable is the FUNCTIONAL FLOOR above, the tested pin below, and where to
-  # check — https://kafka.apache.org/cve-list. Any move off the pin means re-running the
-  # SCRAM bootstrap, the KRaft formatting and the ACL enforcement checks, because those
-  # are what this stack depends on and what a major version can change.
+  # What is durable is the FUNCTIONAL FLOOR above, the per-advisory table in
+  # .env.example, the tested pin below, and where to check —
+  # https://kafka.apache.org/cve-list. Any move off the pin means re-running the SCRAM
+  # bootstrap, the KRaft formatting and the ACL enforcement checks, because those are
+  # what this stack depends on and what a major version can change. All three were
+  # re-run for this pin.
+  #
+  # PINNED BY DIGEST rather than by tag, and it is the SAME digest
+  # infrastructure/k8s-manifests/kafka-statefulset.yaml pins. A tag is a mutable
+  # pointer, so two machines pulling this file weeks apart can run different bytes with
+  # no diff to show for it; a digest cannot. Pinning both to one digest is what makes
+  # this stack a rehearsal of the deployed broker rather than an approximation of it.
   #
   # Keep this default in step with KAFKA_IMAGE in .env.example.
   kafka:
@@ -567,7 +689,7 @@ services:
     # Kafka is not part of the default stack because Blnk's documented steady state is an
     # empty KAFKA_BROKERS and a no-op publisher. Starting a broker, formatting KRaft storage
     # and provisioning the topic catalogue on every "docker compose up" imposed that cost — and,
-    # through the depends_on conditions on server and worker, that FAILURE MODE — on every
+    # through the depends_on conditions on the server, that FAILURE MODE — on every
     # deployment, including the ones that never publish an event.
     #
     #   docker compose up                                 -> no Kafka at all
@@ -580,7 +702,7 @@ services:
     # Blnk ignores; setting KAFKA_BROKERS without the profile gives a relay retrying against
     # nothing. .env.example says so at both keys.
     profiles: ["kafka"]
-    image: ${KAFKA_IMAGE:-apache/kafka:3.9.2}
+    image: ${KAFKA_IMAGE:-apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837}
     container_name: ${KAFKA_CONTAINER:-kafka}
     restart: on-failure
     ports:
@@ -598,7 +720,7 @@ services:
       # The container side is 29092 rather than 9092 because ONE listener cannot
       # advertise two addresses. Kafka answers every client with the advertised address
       # of the listener it connected on, so the in-network listener must advertise
-      # kafka:9092 — what server, worker and kafka-init dial — while the host listener
+      # kafka:9092 — what the server and kafka-init dial — while the host listener
       # must advertise the host address. Hence two listeners on two ports, of which only
       # the host one is published. Publishing 9092 straight through would hand a host
       # client the unresolvable name "kafka" and the port would be useless.
@@ -801,20 +923,27 @@ services:
   # to be published. Both go to blnk.system, which also catches an event type no
   # mapping recognises, keeping it durable and replayable.
   #
-  # blnk.system is GRANTABLE, like the other three. The sample principal below is
-  # therefore granted four category topics, which is what SUBSCRIBER_GRANTABLE_CATEGORIES
-  # in scripts/kafka-provision.sh resolves to when no explicit topic list is supplied.
-  # Granting it is a deliberate per-subscriber decision rather than a default, because it
-  # also carries system.error's verbatim error text; withholding the category outright was
-  # tried and was worse, since it made ledger.created unreachable to everyone. See
-  # docs/event-streaming.md for what the grant discloses.
+  # blnk.system is GRANTABLE, like the other three — and it is NOT in the sample
+  # principal's default grant. Those are two different lists in
+  # scripts/kafka-provision.sh and the distinction is the point:
+  # SUBSCRIBER_GRANTABLE_CATEGORIES is all four, the allowlist any explicit
+  # KAFKA_SAMPLE_SUBSCRIBER_TOPICS is checked against, while
+  # SAMPLE_SUBSCRIBER_DEFAULT_CATEGORIES is the three the sample actually receives when no
+  # list is supplied. The provisioning summary reports blnk.system as "grantable,
+  # withheld" for exactly that reason.
+  #
+  # Granting it is therefore a deliberate per-subscriber decision, because it also carries
+  # system.error's verbatim internal error text; withholding the category outright was
+  # tried and was worse, since it made ledger.created unreachable to everyone. Name it in
+  # KAFKA_SAMPLE_SUBSCRIBER_TOPICS to include it. See docs/event-streaming.md for what the
+  # grant discloses.
   kafka-init:
     # The SAME profile as the kafka service above, and it has to be the same one: provisioning
     # a broker that is not running cannot succeed, and a broker with no topics is one the relay
     # cannot publish to. Selecting one without the other is not a configuration this stack
     # offers. See the kafka service for what the profile buys and how to select it.
     profiles: ["kafka"]
-    image: ${KAFKA_IMAGE:-apache/kafka:3.9.2}
+    image: ${KAFKA_IMAGE:-apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837}
     # restart: on-failure WITH A BOUND, never "always" and never uncapped: the script is
     # idempotent and exits 0 on a run that changes nothing, so a retry is worth having
     # for the transient case - a broker that passed its healthcheck a moment before it
@@ -822,7 +951,7 @@ services:
     #
     # THE CAP IS WHAT MAKES A PERMANENT FAILURE TERMINAL. Uncapped, a misconfiguration
     # this script refuses - a bad credential, an impossible replication factor, a
-    # rejected variable - restarted for ever, and because server and worker gate on
+    # rejected variable - restarted for ever, and because the server gates on
     # this service COMPLETING, "docker compose up" never returned and never reported
     # anything either: the stack sat in a pending state with the real reason buried in a
     # log that grew a fresh copy of itself every few seconds. Three attempts is enough
@@ -859,18 +988,21 @@ services:
       KAFKA_SCRAM_ITERATIONS: ${KAFKA_SCRAM_ITERATIONS:-4096}
       # The PRODUCER principal Blnk publishes as: Write and Describe on every Blnk-owned
       # topic, no Read anywhere, and nothing at cluster scope. Provisioned here and read
-      # by the server and worker above through the same two variables, so the credential
+      # by the server above through the same two variables, so the credential
       # that is minted and the credential that authenticates are one value.
       #
-      # The secret is generated on the FIRST run and printed once, then preserved. Set it
-      # in .env (stack.sh --init does) to pin a known one, which is what lets the server
-      # and worker read it at all: a generated one exists only in this container's log.
+      # A GENERATED secret is written into the mode-0600 file named by
+      # KAFKA_PRODUCER_SECRET_FILE below and is NEVER PRINTED — the run reports the path
+      # only. With neither a supplied secret nor a destination file the script SKIPS the
+      # producer principal rather than printing a password into this container's log. Once
+      # written it is preserved. Set it in .env (stack.sh --init does) to pin a known one,
+      # which is what lets the server read it at all.
       KAFKA_PRODUCER_USER: ${KAFKA_PRODUCER_USER:-blnk-producer}
       KAFKA_PRODUCER_SECRET: ${KAFKA_PRODUCER_SECRET:-}
       # THE SAME PAIR UNDER THE NAMES THE APPLICATION RESOLVES FIRST, and it must be here
       # rather than only above. scripts/kafka-provision.sh reads KAFKA_SASL_USER /
       # KAFKA_SASL_SECRET before falling back to KAFKA_PRODUCER_*, exactly as
-      # config.KafkaConfig and the server and worker services do. Omitting them here would let
+      # config.KafkaConfig and the server service does. Omitting them here would let
       # a .env that sets only KAFKA_SASL_* mint one principal on the broker while the
       # application authenticated as another - a SASL handshake failure with two
       # correct-looking configurations. Empty defaults, so nothing is a shipped credential and
@@ -969,7 +1101,8 @@ services:
       # Where a GENERATED producer password is written, mode 0600. Without it the script has
       # nowhere to deliver one and skips the principal entirely rather than printing it into
       # this container's log — so a stack relying on generation got no producer at all, and the
-      # server and worker then refuse to construct their publisher.
+      # server then refuses to construct its publisher. The worker is unaffected: its role does
+      # not publish, so it resolves to the no-op publisher and needs no producer credential.
       KAFKA_PRODUCER_SECRET_FILE: ${KAFKA_PRODUCER_SECRET_FILE:-}
 
       # The two skip and rotate flags for the sample subscriber, symmetric with the producer's

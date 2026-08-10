@@ -1488,33 +1488,56 @@ func TestNullableTime_TurnsTheZeroInstantIntoSQLNull(t *testing.T) {
 //
 // # What is asserted
 //
-// The predicate, and the two answers it produces. Both arrive as zero rows affected, and
+// The predicate, and the two answers it produces. Both are refusals of the same write, and
 // telling them apart is the point: answering "not found" for a subscriber that plainly
 // exists sends an operator looking for the wrong problem.
+//
+// # RACE-01: and both answers come from ONE statement
+//
+// The refusal used to be classified by a SECOND, unlocked read — `SELECT 1` against the
+// subscriber id — issued after the UPDATE reported zero rows affected. That read saw a
+// different snapshot from the one the write was refused against, so a concurrent delete, a
+// delete-and-recreate, or a URL cleared in between produced a typed code and an operator
+// remedy describing a state that had never been refused.
+//
+// Every case below therefore expects exactly ONE round trip, and the expectations are what
+// enforce that: sqlmock fails on an unexpected call, so reintroducing a follow-up probe
+// breaks these tests rather than passing them quietly. The statement text is asserted to
+// carry both `FOR UPDATE` — the lock that makes the classification a snapshot rather than a
+// guess — and the `webhook_url IS NULL` predicate that is the invariant itself.
 func TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURLAtTheRepository(t *testing.T) {
-	t.Run("the statement carries the webhook_url predicate", func(t *testing.T) {
-		db, mock := newSQLMock(t)
+	t.Run("the statement carries the webhook_url predicate under a row lock", func(t *testing.T) {
+		db, mock, captured := newCapturingSQLMock(t)
 		source := Datasource{Conn: db}
 
-		mock.ExpectExec(regexp.QuoteMeta("webhook_url IS NULL")).
-			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery("").
+			WillReturnRows(sqlmock.NewRows([]string{"stamped"}).AddRow(true))
 
 		require.NoError(t, source.MarkSubscriberMigrated(context.Background(), "acme_prod", time.Now()),
 			"a row with no recorded URL is stamped normally")
 		require.NoError(t, mock.ExpectationsWereMet(),
-			"the UPDATE must narrow on webhook_url IS NULL; without it the repository writes the "+
+			"the statement must narrow on webhook_url IS NULL; without it the repository writes the "+
 				"self-contradicting row this test exists to prevent")
+
+		require.Len(t, *captured, 1, "the write and its classification are one round trip")
+		issued := (*captured)[0]
+		assert.Contains(t, issued, "webhook_url IS NULL",
+			"without the predicate the repository writes the self-contradicting row this test "+
+				"exists to prevent")
+		assert.Contains(t, issued, "FOR UPDATE",
+			"the candidate row is locked, so a concurrent session cannot change the state this "+
+				"statement is about to classify")
+		assert.Contains(t, issued, "UPDATE blnk.event_subscribers")
 	})
 
 	t.Run("a row that still holds a URL is a conflict, not a success", func(t *testing.T) {
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
-		// Zero rows affected, and the row exists: the predicate declined it.
-		mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_subscribers")).
-			WillReturnResult(sqlmock.NewResult(0, 0))
-		mock.ExpectQuery(regexp.QuoteMeta("SELECT 1")).
-			WillReturnRows(sqlmock.NewRows([]string{"?column?"}).AddRow(1))
+		// The row exists — one row comes back — and the stamp did not land, because the
+		// statement's own predicate declined it. No second read is made or expected.
+		mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_subscribers")).
+			WillReturnRows(sqlmock.NewRows([]string{"stamped"}).AddRow(false))
 
 		err := source.MarkSubscriberMigrated(context.Background(), "acme_prod", time.Now())
 		require.Error(t, err, "stamping alone on a row with a live URL must be refused")
@@ -1534,10 +1557,11 @@ func TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURLAtTheRepository(t *
 		db, mock := newSQLMock(t)
 		source := Datasource{Conn: db}
 
-		mock.ExpectExec(regexp.QuoteMeta("UPDATE blnk.event_subscribers")).
-			WillReturnResult(sqlmock.NewResult(0, 0))
-		mock.ExpectQuery(regexp.QuoteMeta("SELECT 1")).
-			WillReturnError(sql.ErrNoRows)
+		// No rows at all: the LOCKED read matched nothing, which is the not-found. It is now
+		// observed by the same statement that would have written, rather than by a probe that
+		// could see a row created or destroyed in between.
+		mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_subscribers")).
+			WillReturnRows(sqlmock.NewRows([]string{"stamped"}))
 
 		err := source.MarkSubscriberMigrated(context.Background(), "acme_prod", time.Now())
 		require.Error(t, err)
@@ -1546,6 +1570,25 @@ func TestMarkSubscriberMigrated_RefusesARowThatStillHoldsAURLAtTheRepository(t *
 		require.ErrorAs(t, err, &apiErr)
 		assert.Equal(t, apierror.ErrSubscriberNotFound, apiErr.Code,
 			"a subscriber that does not exist must not be reported as a state conflict")
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("a failed statement is neither refusal", func(t *testing.T) {
+		db, mock := newSQLMock(t)
+		source := Datasource{Conn: db}
+
+		mock.ExpectQuery(regexp.QuoteMeta("UPDATE blnk.event_subscribers")).
+			WillReturnError(errors.New("dial tcp: connection refused"))
+
+		err := source.MarkSubscriberMigrated(context.Background(), "acme_prod", time.Now())
+		require.Error(t, err)
+
+		var apiErr apierror.APIError
+		require.ErrorAs(t, err, &apiErr)
+		assert.Equal(t, apierror.ErrInternalServer, apiErr.Code,
+			"'we could not tell you' is a third fact, and collapsing it into either refusal would "+
+				"invent a state nobody observed")
+		assertNoDatabaseDetailLeak(t, err)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
 }
